@@ -171,10 +171,10 @@ impl AnthropicRuntimeClient {
         if std::env::var("NEURON_DEBUG").is_ok() {
             eprintln!("[DEBUG] stream_message connected, reading events...");
         }
-        let mut stdout = io::stdout();
+        let mut render_buf = crate::stream_buffer::SyncRenderBuffer::new();
         let mut sink = io::sink();
         let out: &mut dyn Write = if self.emit_output {
-            &mut stdout
+            &mut render_buf
         } else {
             &mut sink
         };

@@ -410,7 +410,7 @@ pub fn run_power(api_key: &str, user_input: &str) -> String {
                          Write complete, production-ready code.\n\nTask: {input}"
                     )
                 })];
-                match azure_call(&key, &model, &msgs, 6000) {
+                match azure_call(&key, &model, &msgs, 2000) {
                     Ok(r) => {
                         eprintln!(
                             "[power] ✓ {} done ({} tokens)",
@@ -461,7 +461,7 @@ pub fn run_power(api_key: &str, user_input: &str) -> String {
                          Write complete, production-ready code.\n\nTask: {input}"
                     )
                 })];
-                match openrouter_call(&api_key, &or_model, &msgs, 6000) {
+                match openrouter_call(&api_key, &or_model, &msgs, 2000) {
                     Ok(r) => {
                         eprintln!(
                             "[power] ✓ {} done ({} tokens)",
@@ -495,23 +495,42 @@ pub fn run_power(api_key: &str, user_input: &str) -> String {
         return user_input.to_string();
     }
 
-    // Merge with dedicated agent (this is the only sequential step)
+    // Fast path: single result — no merge needed
+    if results.len() == 1 {
+        let r = &results[0];
+        return format!(
+            "[POWER MODE — SINGLE MODEL]\n\
+             Only one model produced a solution. Using output from {}.\n\n\
+             {}\n\n\
+             Execute this code using your tools (write_file, bash, etc.).\n\
+             Original task: {user_input}\n",
+            r.model, r.content
+        );
+    }
+
+    // Compress each solution to fit merge budget
+    let merge_budget = 3000usize;
+    let per_solution_budget = merge_budget / results.len();
     let mut merge_content = String::from(
-        "You are a merge agent. Below are solutions from multiple AI models for the same task.\n\
-         COMBINE the BEST PARTS from each into ONE final solution:\n\
-         - Take the best algorithms\n- Take the best naming and structure\n\
-         - Take the best error handling\n\
-         Produce ONE final, merged implementation.\n\n"
+        "You are a merge agent. Below are solutions from multiple AI models.\n\
+         COMBINE the BEST PARTS into ONE concise solution (max 150 lines):\n\
+         - Pick best algorithm\n- Pick best structure\n- Pick best error handling\n\
+         Produce ONE merged implementation. Be concise.\n\n"
     );
     for r in &results {
-        merge_content.push_str(&format!("=== SOLUTION FROM {} ===\n{}\n\n", r.model, r.content));
+        let compressed = crate::token_budget::compress_tool_result(
+            &r.model,
+            &r.content,
+            per_solution_budget,
+        );
+        merge_content.push_str(&format!("=== {} ===\n{}\n\n", r.model, compressed));
     }
-    merge_content.push_str(&format!("ORIGINAL TASK: {user_input}\n"));
+    merge_content.push_str(&format!("TASK: {user_input}\n"));
 
-    log_phase(mode, color, &format!("\x1b[2mMerging with {}...\x1b[0m", Models::merge()));
+    log_phase(mode, color, &format!("Merging with {}...", Models::merge()));
     let merge_msgs = vec![serde_json::json!({"role": "user", "content": merge_content})];
 
-    match azure_call(api_key, Models::merge(), &merge_msgs, 8000) {
+    match azure_call(api_key, Models::merge(), &merge_msgs, 3000) {
         Ok(r) => {
             log_ok(mode, color, &r.model, r.tokens);
             format!(
