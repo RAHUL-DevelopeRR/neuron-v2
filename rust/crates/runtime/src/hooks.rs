@@ -737,7 +737,7 @@ fn format_hook_failure(command: &str, code: i32, stdout: Option<&str>, stderr: &
 
 fn shell_command(command: &str) -> CommandWithStdin {
     #[cfg(windows)]
-    let mut command_builder = {
+    let command_builder = {
         let mut command_builder = Command::new("cmd");
         command_builder.arg("/C").arg(command);
         CommandWithStdin::new(command_builder)
@@ -839,6 +839,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn allows_exit_code_zero_and_captures_stdout() {
         let runner = HookRunner::new(RuntimeHookConfig::new(
             vec![shell_snippet("printf 'pre ok'")],
@@ -852,6 +853,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn denies_exit_code_two() {
         let runner = HookRunner::new(RuntimeHookConfig::new(
             vec![shell_snippet("printf 'blocked by hook'; exit 2")],
@@ -888,6 +890,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn parses_pre_hook_permission_override_and_updated_input() {
         let runner = HookRunner::new(RuntimeHookConfig::new(
             vec![shell_snippet(
@@ -909,6 +912,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn runs_post_tool_use_failure_hooks() {
         // given
         let runner = HookRunner::new(RuntimeHookConfig::new(
@@ -955,6 +959,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn executes_hooks_in_configured_order() {
         // given
         let runner = HookRunner::new(RuntimeHookConfig::new(
@@ -1040,6 +1045,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn malformed_nonempty_hook_output_reports_explicit_diagnostic_with_previews() {
         let runner = HookRunner::new(RuntimeHookConfig::new(
             vec![shell_snippet(
@@ -1065,6 +1071,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn abort_signal_cancels_long_running_hook_and_reports_progress() {
         let runner = HookRunner::new(RuntimeHookConfig::new(
             vec![shell_snippet("sleep 5")],

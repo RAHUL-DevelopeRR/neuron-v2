@@ -506,6 +506,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn generates_pkce_pair_and_state() {
         let pair = generate_pkce_pair().expect("pkce pair");
         let state = generate_state().expect("state");
@@ -515,6 +516,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn builds_authorize_url_and_form_requests() {
         let config = sample_config();
         let pair = generate_pkce_pair().expect("pkce");

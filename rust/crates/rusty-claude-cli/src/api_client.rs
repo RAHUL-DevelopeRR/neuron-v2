@@ -3,9 +3,9 @@
 //! AnthropicRuntimeClient, auth resolution, and error formatting.
 
 use super::*;
+use api::{self, AuthSource};
 use std::env;
 use std::io::{self, Write};
-use api::{self, AuthSource};
 
 pub(crate) struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
@@ -366,7 +366,10 @@ pub(crate) fn format_user_visible_api_error(session_id: &str, error: &api::ApiEr
     }
 }
 
-pub(crate) fn format_context_window_blocked_error(session_id: &str, error: &api::ApiError) -> String {
+pub(crate) fn format_context_window_blocked_error(
+    session_id: &str,
+    error: &api::ApiError,
+) -> String {
     let mut lines = vec![
         "Context window blocked".to_string(),
         "  Failure class    context_window_blocked".to_string(),
@@ -494,7 +497,9 @@ pub(crate) fn collect_tool_results(summary: &runtime::TurnSummary) -> Vec<serde_
         .collect()
 }
 
-pub(crate) fn collect_prompt_cache_events(summary: &runtime::TurnSummary) -> Vec<serde_json::Value> {
+pub(crate) fn collect_prompt_cache_events(
+    summary: &runtime::TurnSummary,
+) -> Vec<serde_json::Value> {
     summary
         .prompt_cache_events
         .iter()
@@ -798,7 +803,10 @@ pub(crate) fn response_to_events(
     Ok(events)
 }
 
-pub(crate) fn push_prompt_cache_record(client: &ApiProviderClient, events: &mut Vec<AssistantEvent>) {
+pub(crate) fn push_prompt_cache_record(
+    client: &ApiProviderClient,
+    events: &mut Vec<AssistantEvent>,
+) {
     // `ApiProviderClient::take_last_prompt_cache_record` is a pass-through
     // to the Anthropic variant and returns `None` for OpenAI-compat /
     // xAI variants, which do not have a prompt cache. So this helper
@@ -823,4 +831,3 @@ pub(crate) fn prompt_cache_record_to_runtime_event(
         token_drop: cache_break.token_drop,
     })
 }
-

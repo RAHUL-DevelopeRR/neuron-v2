@@ -1,0 +1,11 @@
+{
+  "name": "neuron-workspace",
+  "private": true,
+  "workspaces": [
+    "ui/react-tui"
+  ],
+  "scripts": {
+    "tui": "npm --workspace @neuron/react-tui run dev",
+    "tui:build": "npm --workspace @neuron/react-tui run build"
+  }
+}

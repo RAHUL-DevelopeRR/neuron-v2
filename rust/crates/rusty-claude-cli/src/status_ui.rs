@@ -3,10 +3,10 @@
 //! Extracted from main.rs.
 
 use super::*;
-use std::io::{self, Write};
-use std::env;
-use std::path::PathBuf;
 use crate::brand::*;
+use std::env;
+use std::io::{self, Write};
+use std::path::PathBuf;
 
 pub(crate) fn render_repl_help() -> String {
     [
@@ -47,12 +47,12 @@ pub(crate) fn render_repl_help() -> String {
 // everything at a glance without scrolling.
 
 pub(crate) fn render_shortcuts_panel() -> String {
-    let bc = "\x1b[38;2;100;100;100m";    // border / chrome gray
-    let hd = "\x1b[1;38;2;65;105;195m";   // heading blue
-    let ky = "\x1b[1;38;2;240;160;40m";    // key gold
-    let ds = "\x1b[38;2;160;160;170m";     // description muted
-    let dm = "\x1b[2m";                     // dim
-    let r  = "\x1b[0m";                     // reset
+    let bc = "\x1b[38;2;100;100;100m"; // border / chrome gray
+    let hd = "\x1b[1;38;2;65;105;195m"; // heading blue
+    let ky = "\x1b[1;38;2;240;160;40m"; // key gold
+    let ds = "\x1b[38;2;160;160;170m"; // description muted
+    let dm = "\x1b[2m"; // dim
+    let r = "\x1b[0m"; // reset
 
     // Unicode box-drawing provides a polished, terminal-safe frame
     // that renders cleanly in Windows Terminal, iTerm2, and VS Code.
@@ -78,9 +78,7 @@ pub(crate) fn render_shortcuts_panel() -> String {
     };
 
     // Color-formatted key-description pair.
-    let kv = |key: &str, desc: &str| -> String {
-        format!("{ky}{key:<14}{r} {ds}{desc}{r}")
-    };
+    let kv = |key: &str, desc: &str| -> String { format!("{ky}{key:<14}{r} {ds}{desc}{r}") };
 
     let title_line = format!(
         "  {bc}\u{2502}{r}  {hd}\u{2328}  NeuronCLI Shortcuts{r}{}  {bc}\u{2502}{r}",
@@ -92,55 +90,52 @@ pub(crate) fn render_shortcuts_panel() -> String {
         title_line,
         sep.clone(),
         blank.clone(),
-        row(
-            &format!("{hd}Navigation{r}"),
-            &format!("{hd}Session{r}"),
-        ),
+        row(&format!("{hd}Navigation{r}"), &format!("{hd}Session{r}")),
         row(
             &format!("{dm}{}{r}", "\u{2500}".repeat(14)),
             &format!("{dm}{}{r}", "\u{2500}".repeat(14)),
         ),
-        row(&kv("Up/Down",     "History"),         &kv("/compact",  "Compress ctx")),
-        row(&kv("Ctrl+R",      "Search"),          &kv("/clear",    "Reset session")),
-        row(&kv("Tab",         "Complete"),         &kv("/resume",   "Resume prev")),
-        row(&kv("Ctrl+C",      "Cancel"),           &kv("/export",   "Export session")),
+        row(&kv("Up/Down", "History"), &kv("/compact", "Compress ctx")),
+        row(&kv("Ctrl+R", "Search"), &kv("/clear", "Reset session")),
+        row(&kv("Tab", "Complete"), &kv("/resume", "Resume prev")),
+        row(&kv("Ctrl+C", "Cancel"), &kv("/export", "Export session")),
         blank.clone(),
-        row(
-            &format!("{hd}Input{r}"),
-            &format!("{hd}Workspace{r}"),
-        ),
+        row(&format!("{hd}Input{r}"), &format!("{hd}Workspace{r}")),
         row(
             &format!("{dm}{}{r}", "\u{2500}".repeat(14)),
             &format!("{dm}{}{r}", "\u{2500}".repeat(14)),
         ),
-        row(&kv("Ctrl+D",      "Exit"),            &kv("/status",   "Show status")),
-        row(&kv("Ctrl+J",      "Newline"),          &kv("/diff",     "Show changes")),
-        row(&kv("Shift+Enter", "Newline"),          &kv("/init",     "NEURON.md")),
-        row(&kv("!cmd",        "Shell cmd"),        &kv("/commit",   "Commit")),
+        row(&kv("Ctrl+D", "Exit"), &kv("/status", "Show status")),
+        row(&kv("Ctrl+J", "Newline"), &kv("/diff", "Show changes")),
+        row(&kv("Shift+Enter", "Newline"), &kv("/init", "NEURON.md")),
+        row(&kv("!cmd", "Shell cmd"), &kv("/commit", "Commit")),
         blank.clone(),
-        row(
-            &format!("{hd}Modes{r}"),
-            &format!("{hd}Info{r}"),
-        ),
+        row(&format!("{hd}Modes{r}"), &format!("{hd}Info{r}")),
         row(
             &format!("{dm}{}{r}", "\u{2500}".repeat(14)),
             &format!("{dm}{}{r}", "\u{2500}".repeat(14)),
         ),
-        row(&kv("/plan",       "Plan mode"),        &kv("/cost",     "Token usage")),
-        row(&kv("/model",      "Switch model"),     &kv("/doctor",   "Health check")),
-        row(&kv("/permissions","Set perms"),         &kv("/version",  "Show version")),
-        row(&kv("?",           "This panel"),        &kv("/help",     "Full cmd list")),
+        row(&kv("/plan", "Plan mode"), &kv("/cost", "Token usage")),
+        row(
+            &kv("/model", "Switch model"),
+            &kv("/doctor", "Health check"),
+        ),
+        row(
+            &kv("/permissions", "Set perms"),
+            &kv("/version", "Show version"),
+        ),
+        row(&kv("?", "This panel"), &kv("/help", "Full cmd list")),
         blank.clone(),
-        row(
-            &format!("{hd}Orchestration{r}"),
-            &format!("{hd}{r}"),
-        ),
+        row(&format!("{hd}Orchestration{r}"), &format!("{hd}{r}")),
         row(
             &format!("{dm}{}{r}", "\u{2500}".repeat(14)),
             &format!("{dm}{}{r}", "\u{2500}".repeat(14)),
         ),
-        row(&kv("/divide",     "Multi-file split"), &kv("/chain",    "Arch>Code>Review")),
-        row(&kv("/power",      "Ensemble merge"),   &kv("",          "")),
+        row(
+            &kv("/divide", "Multi-file split"),
+            &kv("/chain", "Arch>Code>Review"),
+        ),
+        row(&kv("/power", "Ensemble merge"), &kv("", "")),
         blank,
         bot,
     ]
@@ -154,7 +149,7 @@ pub(crate) fn render_shortcuts_panel() -> String {
 
 pub(crate) fn run_shell_escape(cmd: &str) {
     let dm = "\x1b[2m";
-    let r  = "\x1b[0m";
+    let r = "\x1b[0m";
     let gn = "\x1b[38;2;45;140;60m";
     let rd = "\x1b[31m";
 
@@ -203,7 +198,11 @@ pub(crate) fn run_shell_escape(cmd: &str) {
 //   "[edit] > "        (workspace-write)
 //   "[auto] > "        (auto-allow)
 
-pub(crate) fn mode_aware_prompt(mode: &PermissionMode, plan_mode: bool, orchestration_mode: Option<&str>) -> String {
+pub(crate) fn mode_aware_prompt(
+    mode: &PermissionMode,
+    plan_mode: bool,
+    orchestration_mode: Option<&str>,
+) -> String {
     if plan_mode {
         return "[plan] > ".to_string();
     }
@@ -448,7 +447,10 @@ pub(crate) fn format_sandbox_report(status: &runtime::SandboxStatus) -> String {
     )
 }
 
-pub(crate) fn format_commit_preflight_report(branch: Option<&str>, summary: GitWorkspaceSummary) -> String {
+pub(crate) fn format_commit_preflight_report(
+    branch: Option<&str>,
+    summary: GitWorkspaceSummary,
+) -> String {
     format!(
         "Commit
   Result           ready
@@ -543,7 +545,9 @@ pub(crate) fn print_help_topic(topic: LocalHelpTopic) {
     println!("{}", render_help_topic(topic));
 }
 
-pub(crate) fn print_acp_status(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn print_acp_status(
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
     let message = "ACP/Zed editor integration is not implemented in neuron yet. `neuron acp serve` is only a discoverability alias today; it does not launch a daemon or Zed-specific protocol endpoint. Use the normal terminal surfaces for now and track ROADMAP #76 for real ACP support.";
     match output_format {
         CliOutputFormat::Text => {
@@ -576,7 +580,9 @@ pub(crate) fn print_acp_status(output_format: CliOutputFormat) -> Result<(), Box
     Ok(())
 }
 
-pub(crate) fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+pub(crate) fn render_config_report(
+    section: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let loader = ConfigLoader::default_for(&cwd);
     let discovered = loader.discover();
@@ -763,4 +769,3 @@ pub(crate) fn init_claude_md() -> Result<String, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     Ok(initialize_repo(&cwd)?.render())
 }
-

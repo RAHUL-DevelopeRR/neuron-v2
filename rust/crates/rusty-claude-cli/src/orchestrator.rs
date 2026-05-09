@@ -25,8 +25,16 @@ pub struct OrchestratorError {
 impl fmt::Display for OrchestratorError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.status {
-            Some(s) => write!(f, "[{}] {} returned {}: {}", self.provider, self.model, s, self.message),
-            None => write!(f, "[{}] {} error: {}", self.provider, self.model, self.message),
+            Some(s) => write!(
+                f,
+                "[{}] {} returned {}: {}",
+                self.provider, self.model, s, self.message
+            ),
+            None => write!(
+                f,
+                "[{}] {} error: {}",
+                self.provider, self.model, self.message
+            ),
         }
     }
 }
@@ -61,22 +69,27 @@ impl Models {
     }
 
     // ── Chain mode roles ──
-    pub fn architect() -> &'static str { "Kimi-K2.5" }
-    pub fn coder()     -> &'static str { "FW-DeepSeek-V3.2" }
-    pub fn reviewer()  -> &'static str { "FW-MiniMax-M2.5" }
+    pub fn architect() -> &'static str {
+        "Kimi-K2.5"
+    }
+    pub fn coder() -> &'static str {
+        "FW-DeepSeek-V3.2"
+    }
+    pub fn reviewer() -> &'static str {
+        "FW-MiniMax-M2.5"
+    }
 
     /// Merge agent — used by /power to combine ensemble outputs
-    pub fn merge() -> &'static str { "model-router" }
+    pub fn merge() -> &'static str {
+        "model-router"
+    }
 }
 
 // ── API versions to try ─────────────────────────────────────
 
 /// Azure API versions in priority order.
 /// Newer versions support more models; older ones are more stable.
-const API_VERSIONS: &[&str] = &[
-    "2024-10-21",
-    "2025-01-01-preview",
-];
+const API_VERSIONS: &[&str] = &["2024-10-21", "2025-01-01-preview"];
 
 // ── Azure host resolution ───────────────────────────────────
 
@@ -84,19 +97,16 @@ const API_VERSIONS: &[&str] = &[
 /// Strips `/openai/v1` suffix if present so we can construct
 /// both deployment-specific and v1-compatible URLs.
 fn azure_host_root() -> String {
-    let raw = env::var("AZURE_OPENAI_ENDPOINT").unwrap_or_else(|_| {
-        "https://rahul-mok8ryyn-eastus2.services.ai.azure.com/openai/v1".to_string()
-    });
+    let raw = env::var("AZURE_OPENAI_ENDPOINT").unwrap_or_default();
     raw.trim_end_matches('/')
         .trim_end_matches("/v1")
         .trim_end_matches("/openai")
         .to_string()
 }
 
-/// Get the API key from env or fallback to embedded key.
+/// Get the Azure API key from the environment.
 pub fn azure_api_key() -> String {
-    env::var("AZURE_OPENAI_API_KEY")
-        .unwrap_or_else(|_| crate::deobfuscate_key())
+    env::var("AZURE_OPENAI_API_KEY").unwrap_or_default()
 }
 
 // ── HTTP client singleton ───────────────────────────────────
@@ -117,14 +127,16 @@ fn build_client(timeout_secs: u64) -> Result<reqwest::blocking::Client, Orchestr
 
 /// Parse a chat completion response body.
 /// Handles both standard `content` and reasoning models' `reasoning_content`.
-fn parse_response(body: &str, model: &str, provider: &'static str) -> Result<ModelResponse, OrchestratorError> {
-    let parsed: serde_json::Value = serde_json::from_str(body).map_err(|e| {
-        OrchestratorError {
-            provider,
-            model: model.to_string(),
-            status: None,
-            message: format!("JSON parse error: {e}"),
-        }
+fn parse_response(
+    body: &str,
+    model: &str,
+    provider: &'static str,
+) -> Result<ModelResponse, OrchestratorError> {
+    let parsed: serde_json::Value = serde_json::from_str(body).map_err(|e| OrchestratorError {
+        provider,
+        model: model.to_string(),
+        status: None,
+        message: format!("JSON parse error: {e}"),
     })?;
 
     // Check for API-level error in body
@@ -146,9 +158,7 @@ fn parse_response(body: &str, model: &str, provider: &'static str) -> Result<Mod
         .or_else(|| msg["reasoning_content"].as_str())
         .unwrap_or("")
         .to_string();
-    let tokens = parsed["usage"]["total_tokens"]
-        .as_u64()
-        .unwrap_or(0) as u32;
+    let tokens = parsed["usage"]["total_tokens"].as_u64().unwrap_or(0) as u32;
 
     Ok(ModelResponse {
         model: model.to_string(),
@@ -295,26 +305,20 @@ pub fn openrouter_call(
 // ── Logging helpers ─────────────────────────────────────────
 
 /// Print a colored orchestration status line to stderr.
-pub fn log_phase(mode: &str, color: &str, msg: &str) {
-    eprintln!("{color}[{mode}]\x1b[0m {msg}");
+pub fn log_phase(mode: &str, _color: &str, msg: &str) {
+    eprintln!("[{mode}] {msg}");
 }
 
-pub fn log_ok(mode: &str, color: &str, model: &str, tokens: u32) {
-    eprintln!(
-        "{color}[{mode}]\x1b[0m \x1b[32m✓\x1b[0m {model} done ({tokens} tokens)"
-    );
+pub fn log_ok(mode: &str, _color: &str, model: &str, tokens: u32) {
+    eprintln!("[{mode}] OK {model} ({tokens} tokens)");
 }
 
-pub fn log_fail(mode: &str, color: &str, model: &str, err: &OrchestratorError) {
-    eprintln!(
-        "{color}[{mode}]\x1b[0m \x1b[31m✗\x1b[0m {model} failed: {err}"
-    );
+pub fn log_fail(mode: &str, _color: &str, model: &str, err: &OrchestratorError) {
+    eprintln!("[{mode}] FAIL {model}: {err}");
 }
 
-pub fn log_skip(mode: &str, color: &str, model: &str, reason: &str) {
-    eprintln!(
-        "{color}[{mode}]\x1b[0m \x1b[33m⊘\x1b[0m {model} skipped: {reason}"
-    );
+pub fn log_skip(mode: &str, _color: &str, model: &str, reason: &str) {
+    eprintln!("[{mode}] SKIP {model}: {reason}");
 }
 
 // ── Chain mode orchestration ────────────────────────────────
@@ -322,11 +326,15 @@ pub fn log_skip(mode: &str, color: &str, model: &str, reason: &str) {
 /// Execute the chain pipeline: Architect → Coder → Reviewer.
 /// Returns the combined output from all 3 models to feed into the main runtime.
 pub fn run_chain(api_key: &str, user_input: &str) -> String {
-    let color = "\x1b[35m";
+    let color = "";
     let mode = "chain";
 
     // Phase 1: Architect
-    log_phase(mode, color, &format!("\x1b[2mPhase 1: {} (architect)...\x1b[0m", Models::architect()));
+    log_phase(
+        mode,
+        color,
+        &format!("Phase 1: {} (architect)...", Models::architect()),
+    );
     let arch_msgs = vec![serde_json::json!({
         "role": "user",
         "content": format!(
@@ -337,30 +345,56 @@ pub fn run_chain(api_key: &str, user_input: &str) -> String {
         )
     })];
     let arch_result = match azure_call(api_key, Models::architect(), &arch_msgs, 4000) {
-        Ok(r) => { log_ok(mode, color, &r.model, r.tokens); r.content }
-        Err(e) => { log_fail(mode, color, Models::architect(), &e); format!("(architect unavailable) Task: {user_input}") }
+        Ok(r) => {
+            log_ok(mode, color, &r.model, r.tokens);
+            r.content
+        }
+        Err(e) => {
+            log_fail(mode, color, Models::architect(), &e);
+            format!("(architect unavailable) Task: {user_input}")
+        }
     };
 
     // Phase 2: Coder
-    log_phase(mode, color, &format!("\x1b[2mPhase 2: {} (coder)...\x1b[0m", Models::coder()));
+    log_phase(
+        mode,
+        color,
+        &format!("Phase 2: {} (coder)...", Models::coder()),
+    );
     let code_msgs = vec![
         serde_json::json!({"role": "system", "content": "You are an expert coder. Implement the architect's design with clean, production-quality code. Include error handling, type hints, docstrings."}),
         serde_json::json!({"role": "user", "content": format!("ARCHITECTURE DESIGN:\n{arch_result}\n\nORIGINAL TASK:\n{user_input}\n\nImplement this now. Write complete, working code files.")}),
     ];
     let code_result = match azure_call(api_key, Models::coder(), &code_msgs, 8000) {
-        Ok(r) => { log_ok(mode, color, &r.model, r.tokens); r.content }
-        Err(e) => { log_fail(mode, color, Models::coder(), &e); arch_result.clone() }
+        Ok(r) => {
+            log_ok(mode, color, &r.model, r.tokens);
+            r.content
+        }
+        Err(e) => {
+            log_fail(mode, color, Models::coder(), &e);
+            arch_result.clone()
+        }
     };
 
     // Phase 3: Reviewer
-    log_phase(mode, color, &format!("\x1b[2mPhase 3: {} (reviewer)...\x1b[0m", Models::reviewer()));
+    log_phase(
+        mode,
+        color,
+        &format!("Phase 3: {} (reviewer)...", Models::reviewer()),
+    );
     let review_msgs = vec![
         serde_json::json!({"role": "system", "content": "You are a senior code reviewer. Review the code below. Find bugs, security issues, missing error handling. Output the FIXED final code."}),
         serde_json::json!({"role": "user", "content": format!("ARCHITECTURE:\n{arch_result}\n\nCODE TO REVIEW:\n{code_result}\n\nReview and output the hardened, fixed code.")}),
     ];
     let review_result = match azure_call(api_key, Models::reviewer(), &review_msgs, 8000) {
-        Ok(r) => { log_ok(mode, color, &r.model, r.tokens); r.content }
-        Err(e) => { log_fail(mode, color, Models::reviewer(), &e); code_result.clone() }
+        Ok(r) => {
+            log_ok(mode, color, &r.model, r.tokens);
+            r.content
+        }
+        Err(e) => {
+            log_fail(mode, color, Models::reviewer(), &e);
+            code_result.clone()
+        }
     };
 
     format!(
@@ -372,7 +406,9 @@ pub fn run_chain(api_key: &str, user_input: &str) -> String {
          Execute the REVIEWER's final output using your tools (write_file, bash, etc.).\n\
          Write the files exactly as the reviewer specified.\n\
          Original task: {user_input}\n",
-        Models::architect(), Models::coder(), Models::reviewer()
+        Models::architect(),
+        Models::coder(),
+        Models::reviewer()
     )
 }
 
@@ -381,7 +417,7 @@ pub fn run_chain(api_key: &str, user_input: &str) -> String {
 /// Execute the power ensemble: 3 Azure + 1 OpenRouter agents → merge.
 /// Returns the merged output to feed into the main runtime.
 pub fn run_power(api_key: &str, user_input: &str) -> String {
-    let color = "\x1b[31m";
+    let color = "";
     let mode = "power";
 
     let azure_models = Models::cheap_azure();
@@ -399,10 +435,7 @@ pub fn run_power(api_key: &str, user_input: &str) -> String {
 
         handles.push(std::thread::spawn(move || {
             let _result = std::panic::catch_unwind(|| {
-                eprintln!(
-                    "[power] Agent {}/{}: {} (Azure)...",
-                    idx, total, model
-                );
+                eprintln!("[power] Agent {}/{}: {} (Azure)", idx, total, model);
                 let msgs = vec![serde_json::json!({
                     "role": "user",
                     "content": format!(
@@ -412,23 +445,17 @@ pub fn run_power(api_key: &str, user_input: &str) -> String {
                 })];
                 match azure_call(&key, &model, &msgs, 2000) {
                     Ok(r) => {
-                        eprintln!(
-                            "[power] ✓ {} done ({} tokens)",
-                            r.model, r.tokens
-                        );
+                        eprintln!("[power] OK {} ({})", r.model, r.tokens);
                         Some(r)
                     }
                     Err(e) => {
-                        eprintln!(
-                            "[power] ✗ {} failed: {e}",
-                            model
-                        );
+                        eprintln!("[power] FAIL {}: {}", model, e);
                         None
                     }
                 }
             });
             _result.unwrap_or_else(|_| {
-                eprintln!("[power] ✗ {} crashed unexpectedly", model);
+                eprintln!("[power] CRASH {} crashed unexpectedly", model);
                 None
             })
         }));
@@ -436,7 +463,6 @@ pub fn run_power(api_key: &str, user_input: &str) -> String {
 
     // OpenRouter 4th agent (parallel with Azure agents)
     {
-        let key = api_key.to_string();
         let input = user_input.to_string();
         let or_model = Models::openrouter_free().to_string();
         let or_key = crate::auth::ensure_api_key();
@@ -444,14 +470,11 @@ pub fn run_power(api_key: &str, user_input: &str) -> String {
         handles.push(std::thread::spawn(move || {
             let _result = std::panic::catch_unwind(|| {
                 eprintln!(
-                    "[power] Agent {}/{}: {} (OpenRouter)...",
+                    "[power] Agent {}/{}: {} (OpenRouter)",
                     total, total, or_model
                 );
                 let Some(api_key) = or_key else {
-                    eprintln!(
-                        "[power] ⊘ {} skipped: no auth",
-                        or_model
-                    );
+                    eprintln!("[power] SKIP {}: no auth", or_model);
                     return None;
                 };
                 let msgs = vec![serde_json::json!({
@@ -463,23 +486,17 @@ pub fn run_power(api_key: &str, user_input: &str) -> String {
                 })];
                 match openrouter_call(&api_key, &or_model, &msgs, 2000) {
                     Ok(r) => {
-                        eprintln!(
-                            "[power] ✓ {} done ({} tokens)",
-                            r.model, r.tokens
-                        );
+                        eprintln!("[power] OK {} ({})", r.model, r.tokens);
                         Some(r)
                     }
                     Err(e) => {
-                        eprintln!(
-                            "[power] ⊘ {} skipped: {e}",
-                            or_model
-                        );
+                        eprintln!("[power] SKIP {}: {}", or_model, e);
                         None
                     }
                 }
             });
             _result.unwrap_or_else(|_| {
-                eprintln!("[power] ⊘ {} crashed unexpectedly", or_model);
+                eprintln!("[power] CRASH {} crashed unexpectedly", or_model);
                 None
             })
         }));
@@ -515,14 +532,11 @@ pub fn run_power(api_key: &str, user_input: &str) -> String {
         "You are a merge agent. Below are solutions from multiple AI models.\n\
          COMBINE the BEST PARTS into ONE concise solution (max 150 lines):\n\
          - Pick best algorithm\n- Pick best structure\n- Pick best error handling\n\
-         Produce ONE merged implementation. Be concise.\n\n"
+         Produce ONE merged implementation. Be concise.\n\n",
     );
     for r in &results {
-        let compressed = crate::token_budget::compress_tool_result(
-            &r.model,
-            &r.content,
-            per_solution_budget,
-        );
+        let compressed =
+            crate::token_budget::compress_tool_result(&r.model, &r.content, per_solution_budget);
         merge_content.push_str(&format!("=== {} ===\n{}\n\n", r.model, compressed));
     }
     merge_content.push_str(&format!("TASK: {user_input}\n"));

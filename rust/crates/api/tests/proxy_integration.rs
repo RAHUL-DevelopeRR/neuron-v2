@@ -42,9 +42,9 @@ fn proxy_config_from_env_reads_uppercase_proxy_vars() {
     let _http = EnvVarGuard::set("HTTP_PROXY", Some("http://proxy.corp:3128"));
     let _https = EnvVarGuard::set("HTTPS_PROXY", Some("http://secure.corp:3129"));
     let _no = EnvVarGuard::set("NO_PROXY", Some("localhost,127.0.0.1"));
-    let _http_lower = EnvVarGuard::set("http_proxy", None);
-    let _https_lower = EnvVarGuard::set("https_proxy", None);
-    let _no_lower = EnvVarGuard::set("no_proxy", None);
+    let _http_lower = (!cfg!(windows)).then(|| EnvVarGuard::set("http_proxy", None));
+    let _https_lower = (!cfg!(windows)).then(|| EnvVarGuard::set("https_proxy", None));
+    let _no_lower = (!cfg!(windows)).then(|| EnvVarGuard::set("no_proxy", None));
 
     // when
     let config = ProxyConfig::from_env();
@@ -130,9 +130,9 @@ fn build_client_with_env_proxy_config_succeeds() {
     let _http = EnvVarGuard::set("HTTP_PROXY", Some("http://proxy.corp:3128"));
     let _https = EnvVarGuard::set("HTTPS_PROXY", Some("http://secure.corp:3129"));
     let _no = EnvVarGuard::set("NO_PROXY", Some("localhost"));
-    let _http_lower = EnvVarGuard::set("http_proxy", None);
-    let _https_lower = EnvVarGuard::set("https_proxy", None);
-    let _no_lower = EnvVarGuard::set("no_proxy", None);
+    let _http_lower = (!cfg!(windows)).then(|| EnvVarGuard::set("http_proxy", None));
+    let _https_lower = (!cfg!(windows)).then(|| EnvVarGuard::set("https_proxy", None));
+    let _no_lower = (!cfg!(windows)).then(|| EnvVarGuard::set("no_proxy", None));
     let config = ProxyConfig::from_env();
 
     // when
@@ -158,8 +158,8 @@ fn build_client_with_proxy_url_config_succeeds() {
 fn proxy_config_from_env_prefers_uppercase_over_lowercase() {
     // given
     let _lock = env_lock();
-    let _http_upper = EnvVarGuard::set("HTTP_PROXY", Some("http://upper.corp:3128"));
     let _http_lower = EnvVarGuard::set("http_proxy", Some("http://lower.corp:3128"));
+    let _http_upper = EnvVarGuard::set("HTTP_PROXY", Some("http://upper.corp:3128"));
     let _https = EnvVarGuard::set("HTTPS_PROXY", None);
     let _https_lower = EnvVarGuard::set("https_proxy", None);
     let _no = EnvVarGuard::set("NO_PROXY", None);

@@ -1435,7 +1435,7 @@ mod tests {
         let worker = registry.create(cwd, &[], true);
 
         // After create the worker is Spawning — state file should exist
-        let state_path = cwd_path.join(".claw").join("worker-state.json");
+        let state_path = cwd_path.join(".neuron").join("worker-state.json");
         assert!(
             state_path.exists(),
             "state file should exist after worker creation"

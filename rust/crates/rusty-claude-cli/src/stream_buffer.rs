@@ -5,7 +5,7 @@
 //! behind, old frames are coalesced.
 
 use std::io::{self, Write};
-use std::sync::mpsc::{channel, Sender, Receiver, TryRecvError};
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 

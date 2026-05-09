@@ -3,11 +3,11 @@
 //! Extracted from main.rs: DiagnosticLevel, DiagnosticCheck, DoctorReport,
 //! render_doctor_report, run_doctor, and all check_*_health functions.
 
+use super::*;
+use runtime::{self, ConfigLoader};
+use serde_json::{json, Map, Value};
 use std::env;
 use std::path::Path;
-use serde_json::{json, Map, Value};
-use runtime::{self, ConfigLoader};
-use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DiagnosticLevel {
@@ -224,7 +224,9 @@ pub(crate) fn run_doctor(output_format: CliOutputFormat) -> Result<(), Box<dyn s
 /// This is the file-based worker observability surface: `push_event()` in `worker_boot.rs`
 /// atomically writes state transitions here so external observers (neuron, orchestrators)
 /// can poll current `WorkerStatus` without needing an HTTP route on the opencode binary.
-pub(crate) fn run_worker_state(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn run_worker_state(
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let state_path = cwd.join(".neuron").join("worker-state.json");
     if !state_path.exists() {
@@ -645,7 +647,10 @@ pub(crate) fn check_sandbox_health(status: &runtime::SandboxStatus) -> Diagnosti
     ]))
 }
 
-pub(crate) fn check_system_health(cwd: &Path, config: Option<&runtime::RuntimeConfig>) -> DiagnosticCheck {
+pub(crate) fn check_system_health(
+    cwd: &Path,
+    config: Option<&runtime::RuntimeConfig>,
+) -> DiagnosticCheck {
     let default_model = config.and_then(runtime::RuntimeConfig::model);
     let mut details = vec![
         format!("OS               {} {}", env::consts::OS, env::consts::ARCH),
@@ -673,4 +678,3 @@ pub(crate) fn check_system_health(cwd: &Path, config: Option<&runtime::RuntimeCo
         ("default_model".to_string(), json!(default_model)),
     ]))
 }
-

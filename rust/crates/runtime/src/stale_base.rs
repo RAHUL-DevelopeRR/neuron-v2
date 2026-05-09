@@ -27,9 +27,9 @@ pub enum BaseCommitSource {
 /// Falls back to legacy `.claw-base` for backward compatibility.
 pub fn read_claw_base_file(cwd: &Path) -> Option<String> {
     let path = cwd.join(".neuron-base");
-    let content = std::fs::read_to_string(&path).ok().or_else(|| {
-        std::fs::read_to_string(cwd.join(".claw-base")).ok()
-    })?;
+    let content = std::fs::read_to_string(&path)
+        .ok()
+        .or_else(|| std::fs::read_to_string(cwd.join(".claw-base")).ok())?;
     let trimmed = content.trim();
     if trimmed.is_empty() {
         None

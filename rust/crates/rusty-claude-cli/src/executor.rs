@@ -3,8 +3,8 @@
 //! Extracted from main.rs.
 
 use super::*;
-use std::io::{self, Write};
 use std::env;
+use std::io::{self, Write};
 
 pub(crate) struct CliPermissionPrompter {
     current_mode: PermissionMode,
@@ -290,6 +290,8 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "      Diagnose local auth, config, workspace, and sandbox health"
     )?;
+    writeln!(out, "  npm run tui -- [-- --model MODEL]")?;
+    writeln!(out, "      Launch the optional React/Ink terminal frontend")?;
     writeln!(out, "  neuron acp [serve]")?;
     writeln!(
         out,
@@ -305,7 +307,10 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  neuron agents")?;
     writeln!(out, "  neuron mcp")?;
     writeln!(out, "  neuron skills")?;
-    writeln!(out, "  neuron system-prompt [--cwd PATH] [--date YYYY-MM-DD]")?;
+    writeln!(
+        out,
+        "  neuron system-prompt [--cwd PATH] [--date YYYY-MM-DD]"
+    )?;
     writeln!(out, "  neuron init")?;
     writeln!(
         out,
@@ -416,4 +421,3 @@ pub(crate) fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn s
     }
     Ok(())
 }
-

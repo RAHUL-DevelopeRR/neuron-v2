@@ -1,3 +1,9 @@
+#![allow(
+    dead_code,
+    unused_imports,
+    clippy::case_sensitive_file_extension_comparisons
+)]
+
 mod hooks;
 #[cfg(test)]
 pub mod test_isolation;
@@ -306,7 +312,7 @@ impl PluginTool {
 
     pub fn execute(&self, input: &Value) -> Result<String, PluginError> {
         let input_json = input.to_string();
-        let mut process = Command::new(&self.command);
+        let mut process = plugin_command(&self.command);
         process
             .args(&self.args)
             .stdin(Stdio::piped())
@@ -345,6 +351,16 @@ impl PluginTool {
                 }
             )))
         }
+    }
+}
+
+fn plugin_command(command: &str) -> Command {
+    if cfg!(windows) && command.ends_with(".sh") {
+        let mut process = Command::new("sh");
+        process.arg(command);
+        process
+    } else {
+        Command::new(command)
     }
 }
 
@@ -2084,7 +2100,11 @@ fn run_lifecycle_commands(
 
     for command in commands {
         let mut process = if Path::new(command).exists() {
-            if cfg!(windows) {
+            if cfg!(windows) && command.ends_with(".sh") {
+                let mut process = Command::new("sh");
+                process.arg(command);
+                process
+            } else if cfg!(windows) {
                 let mut process = Command::new("cmd");
                 process.arg("/C").arg(command);
                 process
@@ -3400,6 +3420,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn plugin_registry_runs_initialize_and_shutdown_for_enabled_plugins() {
         let _guard = env_guard();
         let config_home = temp_dir("lifecycle-home");
@@ -3424,6 +3445,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn aggregates_and_executes_plugin_tools() {
         let _guard = env_guard();
         let config_home = temp_dir("tool-home");
@@ -3569,6 +3591,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn plugin_lifecycle_handles_parallel_execution() {
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
         use std::sync::Arc;

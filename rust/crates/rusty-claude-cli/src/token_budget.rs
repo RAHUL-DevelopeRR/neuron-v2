@@ -159,7 +159,7 @@ mod tests {
         });
 
         let budget = TokenBudget::new();
-        let mut msgs_vec = Vec::from(msgs);
+        let msgs_vec = Vec::from(msgs);
         let mut deque = VecDeque::from(msgs_vec);
         budget.fit_messages(&mut deque);
 

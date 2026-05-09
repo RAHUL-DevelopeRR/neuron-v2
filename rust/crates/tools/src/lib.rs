@@ -1,3 +1,5 @@
+#![allow(clippy::map_unwrap_or)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -11,22 +13,22 @@ use api::{
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
-    check_freshness, dedupe_superseded_commit_events, edit_file, execute_bash, glob_search,
-    grep_search, load_system_prompt,
+    check_freshness, dedupe_superseded_commit_events, edit_file_in_workspace, execute_bash,
+    glob_search, grep_search, load_system_prompt,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
-    read_file,
+    read_file_in_workspace,
     summary_compression::compress_summary_text,
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
     worker_boot::{WorkerReadySnapshot, WorkerRegistry, WorkerTaskReceipt},
-    write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
-    BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
-    GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName,
-    LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode,
-    PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError, Session, TaskPacket,
-    ToolError, ToolExecutor,
+    write_file_in_workspace, ApiClient, ApiRequest, AssistantEvent, BashCommandInput,
+    BashCommandOutput, BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage,
+    ConversationRuntime, GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
+    LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole,
+    PermissionMode, PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError,
+    Session, TaskPacket, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -403,7 +405,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["command"],
                 "additionalProperties": false
             }),
-            required_permission: PermissionMode::DangerFullAccess,
+            required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
             name: "read_file",
@@ -1839,8 +1841,8 @@ fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> 
 }
 
 /// Classify bash command permission based on command type and path.
-/// ROADMAP #50: Read-only commands targeting CWD paths get `WorkspaceWrite`,
-/// all others remain `DangerFullAccess`.
+/// ROADMAP #50: read-only commands targeting CWD paths get `ReadOnly`, all
+/// others remain `DangerFullAccess`.
 fn classify_bash_permission(command: &str) -> PermissionMode {
     // Read-only commands that are safe when targeting workspace paths
     const READ_ONLY_COMMANDS: &[&str] = &[
@@ -1870,7 +1872,7 @@ fn classify_bash_permission(command: &str) -> PermissionMode {
         return PermissionMode::DangerFullAccess;
     }
 
-    PermissionMode::WorkspaceWrite
+    PermissionMode::ReadOnly
 }
 
 /// Check if command has dangerous paths (outside workspace).
@@ -1988,8 +1990,7 @@ fn git_ref_exists(reference: &str) -> bool {
     Command::new("git")
         .args(["rev-parse", "--verify", "--quiet", reference])
         .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|output| output.status.success())
 }
 
 fn git_stdout(args: &[&str]) -> Option<String> {
@@ -2061,22 +2062,32 @@ fn branch_divergence_output(
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_read_file(input: ReadFileInput) -> Result<String, String> {
-    to_pretty_json(read_file(&input.path, input.offset, input.limit).map_err(io_to_string)?)
+    let workspace_root = std::env::current_dir().map_err(|error| error.to_string())?;
+    to_pretty_json(
+        read_file_in_workspace(&input.path, input.offset, input.limit, &workspace_root)
+            .map_err(io_to_string)?,
+    )
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_write_file(input: WriteFileInput) -> Result<String, String> {
-    to_pretty_json(write_file(&input.path, &input.content).map_err(io_to_string)?)
+    let workspace_root = std::env::current_dir().map_err(|error| error.to_string())?;
+    to_pretty_json(
+        write_file_in_workspace(&input.path, &input.content, &workspace_root)
+            .map_err(io_to_string)?,
+    )
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_edit_file(input: EditFileInput) -> Result<String, String> {
+    let workspace_root = std::env::current_dir().map_err(|error| error.to_string())?;
     to_pretty_json(
-        edit_file(
+        edit_file_in_workspace(
             &input.path,
             &input.old_string,
             &input.new_string,
             input.replace_all.unwrap_or(false),
+            &workspace_root,
         )
         .map_err(io_to_string)?,
     )
@@ -5744,7 +5755,9 @@ fn config_file_for_scope(scope: ConfigScope) -> Result<PathBuf, String> {
 }
 
 fn config_home_dir() -> Result<PathBuf, String> {
-    if let Ok(path) = std::env::var("NEURON_CONFIG_HOME").or_else(|_| std::env::var("CLAW_CONFIG_HOME")) {
+    if let Ok(path) =
+        std::env::var("NEURON_CONFIG_HOME").or_else(|_| std::env::var("CLAW_CONFIG_HOME"))
+    {
         return Ok(PathBuf::from(path));
     }
     let home = std::env::var("HOME")
@@ -5935,15 +5948,13 @@ fn command_exists(command: &str) -> bool {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+            .is_ok_and(|status| status.success())
     } else {
         std::process::Command::new("sh")
             .arg("-lc")
             .arg(format!("command -v {command} >/dev/null 2>&1"))
             .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+            .is_ok_and(|status| status.success())
     }
 }
 
@@ -6234,6 +6245,49 @@ mod tests {
             .fold(PermissionPolicy::new(mode), |policy, spec| {
                 policy.with_tool_requirement(spec.name, spec.required_permission)
             })
+    }
+
+    #[test]
+    fn file_tools_reject_paths_outside_workspace() {
+        let _guard = env_guard();
+        let root = temp_path("workspace-boundary-root");
+        let outside = temp_path("workspace-boundary-outside.txt");
+        fs::create_dir_all(&root).expect("workspace root");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let result = execute_tool(
+            "write_file",
+            &json!({ "path": outside.to_string_lossy(), "content": "outside" }),
+        );
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_file(&outside);
+
+        assert!(result.is_err(), "outside write should be blocked");
+        assert!(
+            result.unwrap_err().contains("escapes workspace boundary"),
+            "error should explain workspace boundary"
+        );
+    }
+
+    #[test]
+    fn read_only_bash_allows_safe_commands_and_blocks_mutations() {
+        let policy = permission_policy_for_mode(PermissionMode::ReadOnly);
+        let registry = GlobalToolRegistry::builtin().with_enforcer(PermissionEnforcer::new(policy));
+
+        let safe = registry.execute("bash", &json!({ "command": "pwd", "timeout": 1000 }));
+        assert!(safe.is_ok(), "read-only bash command should run: {safe:?}");
+
+        let denied = registry.execute("bash", &json!({ "command": "rm scratch.txt" }));
+        assert!(denied.is_err(), "mutating bash command should be blocked");
+        assert!(
+            denied
+                .unwrap_err()
+                .contains("requires 'danger-full-access' permission"),
+            "denial should come from dynamic bash classification"
+        );
     }
 
     #[test]

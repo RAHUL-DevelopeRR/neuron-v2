@@ -1,3 +1,9 @@
+#![allow(
+    clippy::collapsible_match,
+    clippy::duration_suboptimal_units,
+    clippy::map_unwrap_or
+)]
+
 mod client;
 mod error;
 mod http_client;

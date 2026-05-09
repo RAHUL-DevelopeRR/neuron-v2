@@ -84,7 +84,7 @@ pub fn build_http_client_with(config: &ProxyConfig) -> Result<reqwest::Client, A
     let mut builder = reqwest::Client::builder()
         .no_proxy()
         .connect_timeout(std::time::Duration::from_secs(30))
-        .timeout(std::time::Duration::from_secs(300));
+        .timeout(std::time::Duration::from_mins(5));
 
     let no_proxy = config
         .no_proxy

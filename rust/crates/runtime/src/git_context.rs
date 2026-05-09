@@ -171,18 +171,37 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn returns_none_for_non_git_directory() {
         // given
         let _guard = env_lock();
         ensure_valid_cwd();
+        let original_git_dir = std::env::var_os("GIT_DIR");
+        let original_git_work_tree = std::env::var_os("GIT_WORK_TREE");
+        let original_git_ceiling = std::env::var_os("GIT_CEILING_DIRECTORIES");
+        std::env::remove_var("GIT_DIR");
+        std::env::remove_var("GIT_WORK_TREE");
         let root = temp_dir("non-git");
         fs::create_dir_all(&root).expect("create dir");
+        std::env::set_var("GIT_CEILING_DIRECTORIES", &root);
 
         // when
         let context = GitContext::detect(&root);
 
         // then
         assert!(context.is_none());
+        match original_git_dir {
+            Some(value) => std::env::set_var("GIT_DIR", value),
+            None => std::env::remove_var("GIT_DIR"),
+        }
+        match original_git_work_tree {
+            Some(value) => std::env::set_var("GIT_WORK_TREE", value),
+            None => std::env::remove_var("GIT_WORK_TREE"),
+        }
+        match original_git_ceiling {
+            Some(value) => std::env::set_var("GIT_CEILING_DIRECTORIES", value),
+            None => std::env::remove_var("GIT_CEILING_DIRECTORIES"),
+        }
         fs::remove_dir_all(root).expect("cleanup");
     }
 

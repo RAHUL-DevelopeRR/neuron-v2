@@ -57,7 +57,8 @@ impl QuotaState {
 
     /// Remaining Azure tokens for today.
     pub fn remaining(&self) -> u32 {
-        self.daily_limit.saturating_sub(self.azure_output_tokens_used)
+        self.daily_limit
+            .saturating_sub(self.azure_output_tokens_used)
     }
 
     /// Whether the daily Azure quota has been exhausted.
@@ -141,9 +142,9 @@ mod tests {
     fn record_usage_saturates_quota() {
         let mut q = QuotaState::default();
         q.daily_limit = 100;
-        assert!(q.record_azure_usage(50));   // still available
+        assert!(q.record_azure_usage(50)); // still available
         assert_eq!(q.remaining(), 50);
-        assert!(!q.record_azure_usage(60));  // exhausted
+        assert!(!q.record_azure_usage(60)); // exhausted
         assert!(q.is_azure_exhausted());
     }
 

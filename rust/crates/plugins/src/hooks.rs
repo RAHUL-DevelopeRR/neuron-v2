@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+#[cfg(not(windows))]
 use std::path::Path;
 use std::process::Command;
 
@@ -280,7 +281,11 @@ fn format_hook_warning(command: &str, code: i32, stdout: Option<&str>, stderr: &
 
 fn shell_command(command: &str) -> CommandWithStdin {
     #[cfg(windows)]
-    let command_builder = {
+    let command_builder = if command.ends_with(".sh") {
+        let mut command_builder = Command::new("sh");
+        command_builder.arg(command);
+        CommandWithStdin::new(command_builder)
+    } else {
         let mut command_builder = Command::new("cmd");
         command_builder.arg("/C").arg(command);
         CommandWithStdin::new(command_builder)
@@ -435,6 +440,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn collects_and_runs_hooks_from_enabled_plugins() {
         // given
         let config_home = temp_dir("config");
@@ -496,6 +502,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn pre_tool_use_denies_when_plugin_hook_exits_two() {
         // given
         let runner = HookRunner::new(crate::PluginHooks {

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -244,10 +244,14 @@ impl ConfigLoader {
             || PathBuf::from(".claw.json"),
             |parent| parent.join(".claw.json"),
         );
-        vec![
+        let mut entries = vec![
             ConfigEntry {
                 source: ConfigSource::User,
                 path: user_legacy_path,
+            },
+            ConfigEntry {
+                source: ConfigSource::User,
+                path: self.legacy_config_home().join("settings.json"),
             },
             ConfigEntry {
                 source: ConfigSource::User,
@@ -259,13 +263,34 @@ impl ConfigLoader {
             },
             ConfigEntry {
                 source: ConfigSource::Project,
+                path: self.cwd.join(".neuron.json"),
+            },
+            ConfigEntry {
+                source: ConfigSource::Project,
                 path: self.cwd.join(".claw").join("settings.json"),
+            },
+            ConfigEntry {
+                source: ConfigSource::Project,
+                path: self.cwd.join(".neuron").join("settings.json"),
             },
             ConfigEntry {
                 source: ConfigSource::Local,
                 path: self.cwd.join(".claw").join("settings.local.json"),
             },
-        ]
+            ConfigEntry {
+                source: ConfigSource::Local,
+                path: self.cwd.join(".neuron").join("settings.local.json"),
+            },
+        ];
+        let mut seen = BTreeSet::new();
+        entries.retain(|entry| seen.insert((entry.source, entry.path.clone())));
+        entries
+    }
+
+    fn legacy_config_home(&self) -> PathBuf {
+        self.config_home
+            .parent()
+            .map_or_else(|| PathBuf::from(".claw"), |parent| parent.join(".claw"))
     }
 
     pub fn load(&self) -> Result<RuntimeConfig, ConfigError> {
@@ -558,10 +583,11 @@ impl RuntimePluginConfig {
 #[must_use]
 /// Returns the default per-user config directory used by the runtime.
 pub fn default_config_home() -> PathBuf {
-    std::env::var_os("CLAW_CONFIG_HOME")
+    std::env::var_os("NEURON_CONFIG_HOME")
+        .or_else(|| std::env::var_os("CLAW_CONFIG_HOME"))
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claw")))
-        .unwrap_or_else(|| PathBuf::from(".claw"))
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".neuron")))
+        .unwrap_or_else(|| PathBuf::from(".neuron"))
 }
 
 impl RuntimeHookConfig {

@@ -9,7 +9,11 @@ const STARTER_CLAW_JSON: &str = concat!(
     "}\n",
 );
 const GITIGNORE_COMMENT: &str = "# NeuronCLI local artifacts";
-const GITIGNORE_ENTRIES: [&str; 3] = [".neuron/settings.local.json", ".neuron/sessions/", ".neuronhip/"];
+const GITIGNORE_ENTRIES: [&str; 3] = [
+    ".neuron/settings.local.json",
+    ".neuron/sessions/",
+    ".neuronhip/",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InitStatus {
@@ -388,7 +392,8 @@ mod tests {
         let root = temp_dir();
         fs::create_dir_all(&root).expect("create root");
         fs::write(root.join("NEURON.md"), "custom guidance\n").expect("write existing neuron md");
-        fs::write(root.join(".gitignore"), ".neuron/settings.local.json\n").expect("write gitignore");
+        fs::write(root.join(".gitignore"), ".neuron/settings.local.json\n")
+            .expect("write gitignore");
 
         let first = initialize_repo(&root).expect("first init should succeed");
         assert!(first

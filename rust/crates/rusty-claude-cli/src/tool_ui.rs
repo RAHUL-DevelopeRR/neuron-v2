@@ -3,8 +3,8 @@
 //! Every function that renders a tool invocation or its result lives here.
 //! Extracted from the main module for maintainability.
 
-use std::path::Path;
 use crate::brand::*;
+use std::path::Path;
 
 pub fn format_tool_call_start(name: &str, input: &str) -> String {
     let parsed: serde_json::Value =
@@ -43,8 +43,12 @@ pub fn format_tool_call_start(name: &str, input: &str) -> String {
                     .unwrap_or_default()
             )
         }
-        "glob_search" | "Glob" => format_search_start(&format!("{ICON_SEARCH} {BLUE}Glob{R}"), &parsed),
-        "grep_search" | "Grep" => format_search_start(&format!("{ICON_SEARCH} {BLUE}Grep{R}"), &parsed),
+        "glob_search" | "Glob" => {
+            format_search_start(&format!("{ICON_SEARCH} {BLUE}Glob{R}"), &parsed)
+        }
+        "grep_search" | "Grep" => {
+            format_search_start(&format!("{ICON_SEARCH} {BLUE}Grep{R}"), &parsed)
+        }
         "web_search" | "WebSearch" => {
             let query = parsed
                 .get("query")
@@ -119,7 +123,11 @@ pub fn display_clean_path(raw: &str) -> String {
     if let Ok(cwd) = std::env::current_dir() {
         if let Ok(rel) = Path::new(cleaned).strip_prefix(&cwd) {
             let rel_str = rel.display().to_string();
-            return if rel_str.is_empty() { ".".to_string() } else { rel_str };
+            return if rel_str.is_empty() {
+                ".".to_string()
+            } else {
+                rel_str
+            };
         }
     }
     cleaned.to_string()
@@ -148,18 +156,24 @@ pub fn format_patch_preview(old_value: &str, new_value: &str) -> Option<String> 
     let removed = old_lines.len();
     let added = new_lines.len();
     if removed > 0 && added > 0 {
-        lines.push(format!("{DIM}{removed} line{} removed, {added} added{R}", if removed == 1 { "" } else { "s" }));
+        lines.push(format!(
+            "{DIM}{removed} line{} removed, {added} added{R}",
+            if removed == 1 { "" } else { "s" }
+        ));
     } else if removed > 0 {
-        lines.push(format!("{DIM}{removed} line{} removed{R}", if removed == 1 { "" } else { "s" }));
+        lines.push(format!(
+            "{DIM}{removed} line{} removed{R}",
+            if removed == 1 { "" } else { "s" }
+        ));
     } else if added > 0 {
-        lines.push(format!("{DIM}{added} line{} added{R}", if added == 1 { "" } else { "s" }));
+        lines.push(format!(
+            "{DIM}{added} line{} added{R}",
+            if added == 1 { "" } else { "s" }
+        ));
     }
     // Show up to 3 removed lines with red minus prefix
     for line in old_lines.iter().take(3) {
-        lines.push(format!(
-            "{RED}- {}{R}",
-            truncate_for_summary(line, 80)
-        ));
+        lines.push(format!("{RED}- {}{R}", truncate_for_summary(line, 80)));
     }
     let old_remaining = old_lines.len().saturating_sub(3);
     if old_remaining > 0 {
@@ -167,16 +181,17 @@ pub fn format_patch_preview(old_value: &str, new_value: &str) -> Option<String> 
     }
     // Show up to 3 added lines with green plus prefix
     for line in new_lines.iter().take(3) {
-        lines.push(format!(
-            "{GREEN}+ {}{R}",
-            truncate_for_summary(line, 80)
-        ));
+        lines.push(format!("{GREEN}+ {}{R}", truncate_for_summary(line, 80)));
     }
     let new_remaining = new_lines.len().saturating_sub(3);
     if new_remaining > 0 {
         lines.push(format!("{DIM}  ... {new_remaining} more added{R}"));
     }
-    if lines.is_empty() { None } else { Some(lines.join("\n")) }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
 }
 
 pub fn format_bash_call(parsed: &serde_json::Value) -> String {
@@ -189,7 +204,8 @@ pub fn format_bash_call(parsed: &serde_json::Value) -> String {
     } else {
         format!(
             "{}{} $ {} {}",
-            crate::brand::BG_CODE, crate::brand::WHITE,
+            crate::brand::BG_CODE,
+            crate::brand::WHITE,
             truncate_for_summary(command, 160),
             crate::brand::R
         )
@@ -205,7 +221,11 @@ pub fn first_visible_line(text: &str) -> &str {
 pub fn format_bash_result(icon: &str, parsed: &serde_json::Value) -> String {
     use std::fmt::Write as _;
 
-    let mut lines = vec![format!("{icon} {}{BOLD}bash{}{R}", crate::brand::BLUE, crate::brand::R)];
+    let mut lines = vec![format!(
+        "{icon} {}{BOLD}bash{}{R}",
+        crate::brand::BLUE,
+        crate::brand::R
+    )];
     if let Some(task_id) = parsed
         .get("backgroundTaskId")
         .and_then(|value| value.as_str())
@@ -299,8 +319,16 @@ pub fn format_structured_patch_preview(parsed: &serde_json::Value) -> Option<Str
         let lines = hunk.get("lines")?.as_array()?;
         for line in lines.iter().filter_map(|value| value.as_str()).take(6) {
             match line.chars().next() {
-                Some('+') => preview.push(format!("{GREEN}{line}{R}", GREEN=crate::brand::GREEN, R=crate::brand::R)),
-                Some('-') => preview.push(format!("{RED}{line}{R}", RED=crate::brand::RED, R=crate::brand::R)),
+                Some('+') => preview.push(format!(
+                    "{GREEN}{line}{R}",
+                    GREEN = crate::brand::GREEN,
+                    R = crate::brand::R
+                )),
+                Some('-') => preview.push(format!(
+                    "{RED}{line}{R}",
+                    RED = crate::brand::RED,
+                    R = crate::brand::R
+                )),
                 _ => preview.push(line.to_string()),
             }
         }
@@ -336,8 +364,20 @@ pub fn format_edit_result(icon: &str, parsed: &serde_json::Value) -> String {
     });
 
     match preview {
-        Some(preview) => format!("{icon} {ICON_EDIT} {ORANGE}{BOLD}Edited {path}{suffix}{R}\n{preview}", ICON_EDIT=crate::brand::ICON_EDIT, ORANGE=crate::brand::ORANGE, BOLD=crate::brand::BOLD, R=crate::brand::R),
-        None => format!("{icon} {ICON_EDIT} {ORANGE}{BOLD}Edited {path}{suffix}{R}", ICON_EDIT=crate::brand::ICON_EDIT, ORANGE=crate::brand::ORANGE, BOLD=crate::brand::BOLD, R=crate::brand::R),
+        Some(preview) => format!(
+            "{icon} {ICON_EDIT} {ORANGE}{BOLD}Edited {path}{suffix}{R}\n{preview}",
+            ICON_EDIT = crate::brand::ICON_EDIT,
+            ORANGE = crate::brand::ORANGE,
+            BOLD = crate::brand::BOLD,
+            R = crate::brand::R
+        ),
+        None => format!(
+            "{icon} {ICON_EDIT} {ORANGE}{BOLD}Edited {path}{suffix}{R}",
+            ICON_EDIT = crate::brand::ICON_EDIT,
+            ORANGE = crate::brand::ORANGE,
+            BOLD = crate::brand::BOLD,
+            R = crate::brand::R
+        ),
     }
 }
 

@@ -48,9 +48,12 @@ pub enum AuthError {
 
 impl AuthError {
     fn is_retryable(&self) -> bool {
-        matches!(self,
-            Self::NetworkError(_) | Self::Timeout |
-            Self::ExchangeFailed(_) | Self::ValidationFailed(429 | 500..=599)
+        matches!(
+            self,
+            Self::NetworkError(_)
+                | Self::Timeout
+                | Self::ExchangeFailed(_)
+                | Self::ValidationFailed(429 | 500..=599)
         )
     }
 
@@ -75,7 +78,9 @@ impl std::fmt::Display for AuthError {
 }
 
 impl From<io::Error> for AuthError {
-    fn from(e: io::Error) -> Self { Self::IoError(e) }
+    fn from(e: io::Error) -> Self {
+        Self::IoError(e)
+    }
 }
 
 // ──────────────────────────── PKCE Session ────────────────────────────
@@ -103,7 +108,11 @@ impl PkceSession {
             general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize())
         };
 
-        Self { verifier, challenge, created_at: Instant::now() }
+        Self {
+            verifier,
+            challenge,
+            created_at: Instant::now(),
+        }
     }
 
     fn is_expired(&self) -> bool {
@@ -162,8 +171,11 @@ fn validate_key_live(key: &str) -> Result<KeyHealth, AuthError> {
         .header("Authorization", format!("Bearer {}", key.trim()))
         .send()
         .map_err(|e| {
-            if e.is_timeout() { AuthError::Timeout }
-            else { AuthError::NetworkError(e.to_string()) }
+            if e.is_timeout() {
+                AuthError::Timeout
+            } else {
+                AuthError::NetworkError(e.to_string())
+            }
         })?;
 
     match res.status().as_u16() {
@@ -188,14 +200,20 @@ fn exchange_with_retry(code: &str, session: &PkceSession) -> Result<String, Auth
     for attempt in 0..=MAX_EXCHANGE_RETRIES {
         if attempt > 0 {
             let delay = calculate_backoff(attempt);
-            eprintln!("  \x1b[90m[RETRY] Attempt {}/{} in {:.1}s...\x1b[0m",
-                attempt + 1, MAX_EXCHANGE_RETRIES + 1, delay.as_secs_f64());
+            eprintln!(
+                "  \x1b[90m[RETRY] Attempt {}/{} in {:.1}s...\x1b[0m",
+                attempt + 1,
+                MAX_EXCHANGE_RETRIES + 1,
+                delay.as_secs_f64()
+            );
             thread::sleep(delay);
         }
 
         match try_exchange(code, &session.verifier) {
             Ok(key) => return Ok(key),
-            Err(e) if e.is_retryable() => { last_err = e; }
+            Err(e) if e.is_retryable() => {
+                last_err = e;
+            }
             Err(e) => return Err(e),
         }
     }
@@ -220,20 +238,28 @@ fn try_exchange(code: &str, verifier: &str) -> Result<String, AuthError> {
         .json(&payload)
         .send()
         .map_err(|e| {
-            if e.is_timeout() { AuthError::Timeout }
-            else { AuthError::NetworkError(e.to_string()) }
+            if e.is_timeout() {
+                AuthError::Timeout
+            } else {
+                AuthError::NetworkError(e.to_string())
+            }
         })?;
 
     let status = res.status().as_u16();
     if status == 200 {
-        let exchange: ExchangeResponse = res.json()
+        let exchange: ExchangeResponse = res
+            .json()
             .map_err(|e| AuthError::ExchangeFailed(format!("bad response: {e}")))?;
         Ok(exchange.key)
     } else if matches!(status, 429 | 500..=599) {
-        Err(AuthError::ExchangeFailed(format!("status {status} (retryable)")))
+        Err(AuthError::ExchangeFailed(format!(
+            "status {status} (retryable)"
+        )))
     } else {
         let body = res.text().unwrap_or_default();
-        Err(AuthError::ExchangeFailed(format!("status {status}: {body}")))
+        Err(AuthError::ExchangeFailed(format!(
+            "status {status}: {body}"
+        )))
     }
 }
 
@@ -265,9 +291,14 @@ impl CallbackServer {
         while Instant::now() < deadline {
             match listener.accept() {
                 Ok((stream, addr)) => {
-                    if !addr.ip().is_loopback() { continue; }
+                    if !addr.ip().is_loopback() {
+                        continue;
+                    }
                     match self.handle_request(stream) {
-                        Ok(code) => { let _ = sender.send(Ok(code)); return; }
+                        Ok(code) => {
+                            let _ = sender.send(Ok(code));
+                            return;
+                        }
                         Err(_) => continue,
                     }
                 }
@@ -283,7 +314,9 @@ impl CallbackServer {
         stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
         let mut reader = BufReader::new(stream.try_clone().map_err(AuthError::IoError)?);
         let mut request_line = String::new();
-        reader.read_line(&mut request_line).map_err(AuthError::IoError)?;
+        reader
+            .read_line(&mut request_line)
+            .map_err(AuthError::IoError)?;
 
         // Handle OPTIONS (CORS preflight)
         if request_line.starts_with("OPTIONS") {
@@ -360,8 +393,10 @@ pub fn ensure_api_key() -> Option<String> {
     match resolve_credential() {
         Ok(secure) => {
             let key = secure.expose().to_string();
-            println!("  \x1b[92m\x1b[1m[OK]\x1b[0m Key loaded (fingerprint: {})\x1b[0m",
-                vault::key_fingerprint(&key));
+            println!(
+                "  \x1b[92m\x1b[1m[OK]\x1b[0m Key loaded (fingerprint: {})\x1b[0m",
+                vault::key_fingerprint(&key)
+            );
             Some(key)
         }
         Err(e) => {
@@ -517,12 +552,17 @@ fn validate_and_store(key: &str) -> Result<SecureString, AuthError> {
 
     // Store in encrypted vault
     let vpath = vault::vault_path();
-    vault::encrypt_and_store(trimmed, &vpath)
-        .map_err(|e| AuthError::VaultCorrupted(e))?;
+    vault::encrypt_and_store(trimmed, &vpath).map_err(|e| AuthError::VaultCorrupted(e))?;
     vault::record_health_check();
 
-    println!("  \x1b[92m\x1b[1m[OK] API key encrypted and saved to {}\x1b[0m", vpath.display());
-    println!("  \x1b[92m\x1b[1m     Fingerprint: {}\x1b[0m", vault::key_fingerprint(trimmed));
+    println!(
+        "  \x1b[92m\x1b[1m[OK] API key encrypted and saved to {}\x1b[0m",
+        vpath.display()
+    );
+    println!(
+        "  \x1b[92m\x1b[1m     Fingerprint: {}\x1b[0m",
+        vault::key_fingerprint(trimmed)
+    );
     println!("  \x1b[92m\x1b[1m     You won't be asked again.\x1b[0m\n");
 
     Ok(SecureString::new(trimmed.to_string()))
@@ -537,7 +577,10 @@ pub fn check_trust(cwd: &std::path::Path) -> bool {
         .join("trusted_dirs.txt");
 
     if let Ok(content) = fs::read_to_string(&trust_file) {
-        if content.lines().any(|l| l.trim() == cwd.display().to_string()) {
+        if content
+            .lines()
+            .any(|l| l.trim() == cwd.display().to_string())
+        {
             return true;
         }
     }
@@ -550,7 +593,11 @@ pub fn check_trust(cwd: &std::path::Path) -> bool {
 
     let mut input = String::new();
     if io::stdin().read_line(&mut input).is_ok() && input.trim() == "1" {
-        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&trust_file) {
+        if let Ok(mut f) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&trust_file)
+        {
             let _ = writeln!(f, "{}", cwd.display());
         }
         println!("  \x1b[38;2;45;140;60m\x1b[1m✓\x1b[0m Directory trusted.\n");

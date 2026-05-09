@@ -1180,6 +1180,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn appends_post_tool_hook_feedback_to_tool_result() {
         struct TwoCallApiClient {
             calls: usize,

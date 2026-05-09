@@ -3,19 +3,19 @@
 //! Progress UI for bughunter, ultraplan, commit, PR, and issue commands.
 
 use super::*;
-use std::sync::{Arc, Mutex, mpsc};
+use crate::brand::*;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Instant;
-use crate::brand::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InternalPromptProgressState {
-    command_label: &'static str,
-    task_label: String,
-    step: usize,
-    phase: String,
-    detail: Option<String>,
-    saw_final_text: bool,
+    pub(crate) command_label: &'static str,
+    pub(crate) task_label: String,
+    pub(crate) step: usize,
+    pub(crate) phase: String,
+    pub(crate) detail: Option<String>,
+    pub(crate) saw_final_text: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -384,13 +384,16 @@ pub(crate) fn build_runtime_with_plugin_state(
     }
     let RuntimePluginState {
         feature_config,
-        tool_registry,
+        mut tool_registry,
         plugin_registry,
         mcp_state,
     } = runtime_plugin_state;
     plugin_registry.initialize()?;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
+    tool_registry.set_enforcer(runtime::permission_enforcer::PermissionEnforcer::new(
+        policy.clone(),
+    ));
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         AnthropicRuntimeClient::new(
@@ -453,4 +456,3 @@ impl runtime::HookProgressReporter for CliHookProgressReporter {
         }
     }
 }
-

@@ -907,7 +907,8 @@ fn break_inline_bullets(text: &str) -> String {
                 // Look back: if prev char is not newline, insert one
                 let prev = result.chars().rev().nth(1);
                 if prev.is_some_and(|c| c != '\n') {
-                    result.insert(result.len() - 1, '\n');
+                    let bullet_start = result.len() - bullet.len_utf8();
+                    result.insert(bullet_start, '\n');
                 }
             }
         }

@@ -42,33 +42,33 @@ pub const NEURON_LOGO: &str = "\x1b[1;38;2;65;105;195mN\x1b[38;2;200;50;40me\x1b
 // on every terminal, every OS, every font.  Premium, minimal, consistent.
 
 /// Green checkmark indicator
-pub const ICON_OK: &str = "\x1b[38;2;45;140;60m\u{2713}\x1b[0m";         // ✓
+pub const ICON_OK: &str = "\x1b[38;2;45;140;60m\u{2713}\x1b[0m"; // ✓
 /// Red cross indicator
-pub const ICON_ERR: &str = "\x1b[38;2;200;50;40m\u{2717}\x1b[0m";        // ✗
+pub const ICON_ERR: &str = "\x1b[38;2;200;50;40m\u{2717}\x1b[0m"; // ✗
 /// Blue filled circle (active)
-pub const ICON_ACTIVE: &str = "\x1b[38;2;65;105;195m\u{25CF}\x1b[0m";    // ●
+pub const ICON_ACTIVE: &str = "\x1b[38;2;65;105;195m\u{25CF}\x1b[0m"; // ●
 /// Dim empty circle (inactive)
 pub const ICON_INACTIVE: &str = "\x1b[38;2;136;136;136m\u{25CB}\x1b[0m"; // ○
 /// Orange right-pointing triangle (action/arrow)
-pub const ICON_ARROW: &str = "\x1b[38;2;240;160;40m\u{25B8}\x1b[0m";     // ▸
+pub const ICON_ARROW: &str = "\x1b[38;2;240;160;40m\u{25B8}\x1b[0m"; // ▸
 /// Blue small diamond
-pub const ICON_DIAMOND: &str = "\x1b[38;2;65;105;195m\u{25C6}\x1b[0m";   // ◆
+pub const ICON_DIAMOND: &str = "\x1b[38;2;65;105;195m\u{25C6}\x1b[0m"; // ◆
 /// Cyan file indicator (replaces 📄)
-pub const ICON_FILE: &str = "\x1b[38;2;90;200;250m\u{25A0}\x1b[0m";      // ■
+pub const ICON_FILE: &str = "\x1b[38;2;90;200;250m\u{25A0}\x1b[0m"; // ■
 /// Green write indicator (replaces ✏️)
-pub const ICON_WRITE: &str = "\x1b[38;2;45;140;60m\u{25B6}\x1b[0m";      // ▶
+pub const ICON_WRITE: &str = "\x1b[38;2;45;140;60m\u{25B6}\x1b[0m"; // ▶
 /// Orange edit indicator (replaces 📝)
-pub const ICON_EDIT: &str = "\x1b[38;2;240;160;40m\u{25C8}\x1b[0m";      // ◈
+pub const ICON_EDIT: &str = "\x1b[38;2;240;160;40m\u{25C8}\x1b[0m"; // ◈
 /// Blue search indicator (replaces 🔎)
-pub const ICON_SEARCH: &str = "\x1b[38;2;65;105;195m\u{25C9}\x1b[0m";    // ◉
+pub const ICON_SEARCH: &str = "\x1b[38;2;65;105;195m\u{25C9}\x1b[0m"; // ◉
 /// Orange web indicator (replaces 🌐)
-pub const ICON_WEB: &str = "\x1b[38;2;240;160;40m\u{25CE}\x1b[0m";       // ◎
+pub const ICON_WEB: &str = "\x1b[38;2;240;160;40m\u{25CE}\x1b[0m"; // ◎
 /// Blue thinking indicator (replaces 🧠)
-pub const ICON_THINK: &str = "\x1b[38;2;65;105;195m\u{25E6}\x1b[0m";     // ◦
+pub const ICON_THINK: &str = "\x1b[38;2;65;105;195m\u{25E6}\x1b[0m"; // ◦
 /// Green done indicator (replaces ✨)
-pub const ICON_DONE: &str = "\x1b[38;2;45;140;60m\u{2714}\x1b[0m";       // ✔
+pub const ICON_DONE: &str = "\x1b[38;2;45;140;60m\u{2714}\x1b[0m"; // ✔
 /// Orange command/bash indicator (replaces $)
-pub const ICON_CMD: &str = "\x1b[38;2;240;160;40m\u{25B8}\x1b[0m";       // ▸
+pub const ICON_CMD: &str = "\x1b[38;2;240;160;40m\u{25B8}\x1b[0m"; // ▸
 
 // ── Semantic formatting helpers ──────────────────────────────────────────────
 

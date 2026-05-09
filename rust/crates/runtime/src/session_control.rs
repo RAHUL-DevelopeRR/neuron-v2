@@ -32,8 +32,14 @@ impl SessionStore {
     pub fn from_cwd(cwd: impl AsRef<Path>) -> Result<Self, SessionControlError> {
         let cwd = cwd.as_ref();
         // Use .neuron as primary, fall back to .claw for existing sessions
-        let neuron_root = cwd.join(".neuron").join("sessions").join(workspace_fingerprint(cwd));
-        let claw_root = cwd.join(".claw").join("sessions").join(workspace_fingerprint(cwd));
+        let neuron_root = cwd
+            .join(".neuron")
+            .join("sessions")
+            .join(workspace_fingerprint(cwd));
+        let claw_root = cwd
+            .join(".claw")
+            .join("sessions")
+            .join(workspace_fingerprint(cwd));
         // Migrate: if .claw exists but .neuron doesn't, use .claw for compat
         let sessions_root = if neuron_root.exists() || !claw_root.exists() {
             neuron_root
@@ -201,10 +207,7 @@ impl SessionStore {
     }
 
     fn legacy_sessions_root(&self) -> Option<PathBuf> {
-        self.sessions_root
-            .parent()
-            .filter(|parent| parent.file_name().is_some_and(|name| name == "sessions"))
-            .map(Path::to_path_buf)
+        Some(self.workspace_root.join(".claw").join("sessions"))
     }
 
     fn validate_loaded_session(

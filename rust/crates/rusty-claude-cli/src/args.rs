@@ -3,9 +3,10 @@
 //! CliAction, CliOutputFormat, parse_args, and all parse_* helpers.
 
 use super::*;
-use std::path::{Path, PathBuf};
 use std::env;
+use std::path::{Path, PathBuf};
 
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CliAction {
     DumpManifests {
         output_format: CliOutputFormat,
@@ -522,7 +523,10 @@ pub(crate) fn removed_auth_surface_error(command_name: &str) -> String {
     )
 }
 
-pub(crate) fn parse_acp_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
+pub(crate) fn parse_acp_args(
+    args: &[String],
+    output_format: CliOutputFormat,
+) -> Result<CliAction, String> {
     match args {
         [] => Ok(CliAction::Acp { output_format }),
         [subcommand] if subcommand == "serve" => Ok(CliAction::Acp { output_format }),
@@ -827,7 +831,7 @@ pub(crate) fn default_permission_mode() -> PermissionMode {
         .and_then(normalize_permission_mode)
         .map(permission_mode_from_label)
         .or_else(config_permission_mode_for_current_dir)
-        .unwrap_or(PermissionMode::DangerFullAccess)
+        .unwrap_or(PermissionMode::WorkspaceWrite)
 }
 
 pub(crate) fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {
@@ -907,7 +911,10 @@ pub(crate) fn parse_system_prompt_args(
     })
 }
 
-pub(crate) fn parse_export_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
+pub(crate) fn parse_export_args(
+    args: &[String],
+    output_format: CliOutputFormat,
+) -> Result<CliAction, String> {
     let mut session_reference = LATEST_SESSION_REFERENCE.to_string();
     let mut output_path: Option<PathBuf> = None;
     let mut index = 0;
@@ -989,7 +996,10 @@ pub(crate) fn parse_dump_manifests_args(
     })
 }
 
-pub(crate) fn parse_resume_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
+pub(crate) fn parse_resume_args(
+    args: &[String],
+    output_format: CliOutputFormat,
+) -> Result<CliAction, String> {
     let (session_path, command_tokens): (PathBuf, &[String]) = match args.first() {
         None => (PathBuf::from(LATEST_SESSION_REFERENCE), &[]),
         Some(first) if looks_like_slash_command_token(first) => {

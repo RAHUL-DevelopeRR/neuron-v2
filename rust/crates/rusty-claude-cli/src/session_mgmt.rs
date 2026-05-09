@@ -55,7 +55,9 @@ pub fn create_managed_session_handle(
     })
 }
 
-pub fn resolve_session_reference(reference: &str) -> Result<SessionHandle, Box<dyn std::error::Error>> {
+pub fn resolve_session_reference(
+    reference: &str,
+) -> Result<SessionHandle, Box<dyn std::error::Error>> {
     let handle = current_session_store()?
         .resolve_reference(reference)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
@@ -65,7 +67,9 @@ pub fn resolve_session_reference(reference: &str) -> Result<SessionHandle, Box<d
     })
 }
 
-pub fn resolve_managed_session_path(session_id: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+pub fn resolve_managed_session_path(
+    session_id: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     current_session_store()?
         .resolve_managed_path(session_id)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
@@ -150,7 +154,10 @@ pub fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn st
     lines.push(box_separator(w));
 
     if sessions.is_empty() {
-        lines.push(box_row(&format!("{DIM}No managed sessions saved yet.{R}"), w));
+        lines.push(box_row(
+            &format!("{DIM}No managed sessions saved yet.{R}"),
+            w,
+        ));
         lines.push(box_bottom(w));
         return Ok(lines.join("\n"));
     }

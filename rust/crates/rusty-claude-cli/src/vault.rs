@@ -20,8 +20,12 @@ const KDF_ITERATIONS: u32 = 100_000;
 pub struct SecureString(String);
 
 impl SecureString {
-    pub fn new(s: String) -> Self { Self(s) }
-    pub fn expose(&self) -> &str { &self.0 }
+    pub fn new(s: String) -> Self {
+        Self(s)
+    }
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
 }
 
 impl std::fmt::Debug for SecureString {
@@ -92,8 +96,8 @@ fn derive_vault_key(salt: &[u8]) -> [u8; 32] {
 
 fn compute_integrity(version: u8, salt: &[u8], nonce: &[u8], ciphertext: &[u8]) -> Vec<u8> {
     let fp = machine_fingerprint();
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(fp.as_bytes())
-        .expect("HMAC accepts any key size");
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(fp.as_bytes()).expect("HMAC accepts any key size");
     mac.update(&[version]);
     mac.update(salt);
     mac.update(nonce);
@@ -106,8 +110,7 @@ pub fn encrypt_and_store(key: &str, path: &Path) -> Result<(), String> {
     rand::thread_rng().fill_bytes(&mut salt);
 
     let mut vault_key = derive_vault_key(&salt);
-    let cipher = Aes256Gcm::new_from_slice(&vault_key)
-        .map_err(|e| format!("cipher init: {e}"))?;
+    let cipher = Aes256Gcm::new_from_slice(&vault_key).map_err(|e| format!("cipher init: {e}"))?;
     vault_key.zeroize();
 
     let mut nonce_bytes = [0u8; 12];
@@ -168,10 +171,18 @@ pub fn decrypt_from_vault(path: &Path) -> Result<SecureString, String> {
         return Err("vault was created on a different machine".into());
     }
 
-    let salt = B64.decode(&vault.salt).map_err(|e| format!("salt b64: {e}"))?;
-    let nonce_bytes = B64.decode(&vault.nonce).map_err(|e| format!("nonce b64: {e}"))?;
-    let ciphertext = B64.decode(&vault.ciphertext).map_err(|e| format!("ct b64: {e}"))?;
-    let stored_integrity = B64.decode(&vault.integrity).map_err(|e| format!("hmac b64: {e}"))?;
+    let salt = B64
+        .decode(&vault.salt)
+        .map_err(|e| format!("salt b64: {e}"))?;
+    let nonce_bytes = B64
+        .decode(&vault.nonce)
+        .map_err(|e| format!("nonce b64: {e}"))?;
+    let ciphertext = B64
+        .decode(&vault.ciphertext)
+        .map_err(|e| format!("ct b64: {e}"))?;
+    let stored_integrity = B64
+        .decode(&vault.integrity)
+        .map_err(|e| format!("hmac b64: {e}"))?;
 
     // Verify integrity before decryption
     let expected = compute_integrity(vault.version, &salt, &nonce_bytes, &ciphertext);
@@ -180,8 +191,7 @@ pub fn decrypt_from_vault(path: &Path) -> Result<SecureString, String> {
     }
 
     let mut vault_key = derive_vault_key(&salt);
-    let cipher = Aes256Gcm::new_from_slice(&vault_key)
-        .map_err(|e| format!("cipher init: {e}"))?;
+    let cipher = Aes256Gcm::new_from_slice(&vault_key).map_err(|e| format!("cipher init: {e}"))?;
     vault_key.zeroize();
 
     let nonce = Nonce::from_slice(&nonce_bytes);
@@ -205,7 +215,9 @@ pub fn needs_health_check() -> bool {
     let path = health_check_path();
     match fs::metadata(&path) {
         Ok(meta) => {
-            let age = meta.modified().ok()
+            let age = meta
+                .modified()
+                .ok()
                 .and_then(|t| t.elapsed().ok())
                 .unwrap_or(std::time::Duration::MAX);
             age > std::time::Duration::from_secs(86400)
@@ -216,8 +228,14 @@ pub fn needs_health_check() -> bool {
 
 pub fn record_health_check() {
     let path = health_check_path();
-    let _ = fs::write(&path, format!("{}", SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()));
+    let _ = fs::write(
+        &path,
+        format!(
+            "{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        ),
+    );
 }

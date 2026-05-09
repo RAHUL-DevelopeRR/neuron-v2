@@ -17,14 +17,25 @@ const MAX_FILES: usize = 150;
 const MAX_MAP_CHARS: usize = 6_000;
 /// File extensions we know how to extract symbols from.
 const SUPPORTED_EXTENSIONS: &[&str] = &[
-    "rs", "py", "js", "ts", "tsx", "jsx", "go", "java", "rb", "c", "cpp", "h", "hpp",
-    "toml", "yaml", "yml", "json", "md",
+    "rs", "py", "js", "ts", "tsx", "jsx", "go", "java", "rb", "c", "cpp", "h", "hpp", "toml",
+    "yaml", "yml", "json", "md",
 ];
 
 /// Directories to always skip.
 const SKIP_DIRS: &[&str] = &[
-    ".git", "node_modules", "target", "dist", "build", "__pycache__",
-    ".neuron", ".claw", ".venv", "venv", ".tox", "vendor", ".next",
+    ".git",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "__pycache__",
+    ".neuron",
+    ".claw",
+    ".venv",
+    "venv",
+    ".tox",
+    "vendor",
+    ".next",
 ];
 
 /// A single file entry in the repo map.
@@ -85,11 +96,7 @@ impl RepoMap {
             let line = if entry.symbols.is_empty() {
                 format!("  {}\n", entry.relative_path)
             } else {
-                format!(
-                    "  {} — {}\n",
-                    entry.relative_path,
-                    entry.symbols.join(", ")
-                )
+                format!("  {} — {}\n", entry.relative_path, entry.symbols.join(", "))
             };
             if output.len() + line.len() > MAX_MAP_CHARS {
                 output.push_str("  … (truncated)\n");
@@ -158,8 +165,8 @@ fn walk_dir(
 
             // Only extract symbols for source code files (skip configs/docs)
             let symbols = match ext {
-                "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "go" | "java" | "rb" | "c"
-                | "cpp" | "h" | "hpp" => extract_symbols(&path, ext),
+                "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "go" | "java" | "rb" | "c" | "cpp"
+                | "h" | "hpp" => extract_symbols(&path, ext),
                 "toml" | "yaml" | "yml" => extract_config_keys(&path, ext),
                 _ => Vec::new(),
             };
@@ -229,9 +236,21 @@ fn extract_symbols(path: &Path, ext: &str) -> Vec<String> {
 fn extract_rust_symbol(line: &str) -> Option<String> {
     // Match common Rust declaration patterns
     let prefixes = [
-        "pub fn ", "fn ", "pub struct ", "struct ", "pub enum ", "enum ",
-        "pub trait ", "trait ", "impl ", "pub mod ", "mod ", "pub(crate) fn ",
-        "pub(crate) struct ", "pub(crate) enum ", "pub(crate) mod ",
+        "pub fn ",
+        "fn ",
+        "pub struct ",
+        "struct ",
+        "pub enum ",
+        "enum ",
+        "pub trait ",
+        "trait ",
+        "impl ",
+        "pub mod ",
+        "mod ",
+        "pub(crate) fn ",
+        "pub(crate) struct ",
+        "pub(crate) enum ",
+        "pub(crate) mod ",
     ];
     for prefix in &prefixes {
         if line.starts_with(prefix) {
@@ -334,7 +353,9 @@ fn extract_go_symbol(line: &str) -> Option<String> {
 }
 
 fn extract_generic_symbol(line: &str) -> Option<String> {
-    if (line.starts_with("public ") || line.starts_with("private ") || line.starts_with("protected "))
+    if (line.starts_with("public ")
+        || line.starts_with("private ")
+        || line.starts_with("protected "))
         && (line.contains(" class ") || line.contains(" void ") || line.contains(" int "))
     {
         // Java/C# style — just grab the method/class name
