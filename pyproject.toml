@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "neuroncli"
-version = "4.1.0"
+version = "6.1.0"
 description = "NeuronCLI - AI-powered terminal assistant"
 readme = "README.md"
 license = {text = "MIT"}
@@ -26,8 +26,8 @@ classifiers = [
 neuron = "neuron_cli:main"
 
 [project.urls]
-Homepage = "https://github.com/RAHUL-DevelopeRR/claw-code"
-Repository = "https://github.com/RAHUL-DevelopeRR/claw-code"
+Homepage = "https://github.com/RAHUL-DevelopeRR/neuron-v2"
+Repository = "https://github.com/RAHUL-DevelopeRR/neuron-v2"
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -133,7 +133,7 @@ const DEFAULT_DATE: &str = match option_env!("BUILD_DATE") {
     None => "unknown",
 };
 const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
-const VERSION: &str = "4.1.0";
+const VERSION: &str = "6.1.0";
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
 const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
