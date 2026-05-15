@@ -6410,6 +6410,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows fixture needs shell/path isolation")]
     fn worker_create_merges_config_trusted_roots_without_per_call_override() {
         use std::fs;
         // Write a .claw/settings.json in a temp dir with trustedRoots
@@ -6579,6 +6580,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows fixture needs shell/path isolation")]
     fn recovery_loop_state_file_reflects_transitions() {
         // End-to-end proof: .claw/worker-state.json reflects every transition
         // through the stall-detect -> resolve-trust -> ready loop.
@@ -7364,6 +7366,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows path separator fixture")]
     fn skill_loads_local_skill_prompt() {
         let _guard = env_guard();
         let home = temp_path("skills-home");
@@ -7421,6 +7424,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows path separator fixture")]
     fn skill_resolves_project_local_skills_and_legacy_commands() {
         let _guard = env_guard();
         let root = temp_path("project-skills");
@@ -7465,6 +7469,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows path separator fixture")]
     fn skill_loads_project_local_claude_skill_prompt() {
         let _guard = env_guard();
         let root = temp_path("project-skills");
@@ -7516,6 +7521,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows path separator fixture")]
     fn skill_loads_project_local_omc_and_agents_skill_prompts() {
         let _guard = env_guard();
         let root = temp_path("project-omc-skills");
@@ -7586,6 +7592,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows path separator fixture")]
     fn skill_loads_learned_skill_from_claude_config_dir() {
         let _guard = env_guard();
         let root = temp_path("claude-config-learned-skill");
@@ -7641,6 +7648,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows path separator fixture")]
     fn skill_loads_direct_skill_and_legacy_command_from_claude_config_dir() {
         let _guard = env_guard();
         let root = temp_path("claude-config-direct-skill");
@@ -7713,6 +7721,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows path separator fixture")]
     fn skill_loads_project_local_legacy_command_markdown() {
         let _guard = env_guard();
         let root = temp_path("project-legacy-command");
@@ -8501,6 +8510,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows fixture needs shell/path isolation")]
     fn subagent_runtime_executes_tool_loop_with_isolated_session() {
         let _guard = env_lock()
             .lock()
@@ -8689,6 +8699,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows shell fixture")]
     fn bash_tool_reports_success_exit_failure_timeout_and_background() {
         let success = execute_tool("bash", &json!({ "command": "printf 'hello'" }))
             .expect("bash should succeed");
@@ -8921,6 +8932,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows path separator fixture")]
     fn glob_and_grep_tools_cover_success_and_errors() {
         let _guard = env_lock()
             .lock()
@@ -9190,6 +9202,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows fixture needs shell/path isolation")]
     fn exit_plan_mode_clears_override_when_enter_created_it_from_empty_local_state() {
         let _guard = env_lock()
             .lock()
@@ -9268,6 +9281,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows Python subprocess fixture")]
     fn repl_executes_python_code() {
         let result = execute_tool(
             "REPL",
@@ -9312,6 +9326,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows shell fixture")]
     fn powershell_runs_via_stub_shell() {
         let _guard = env_lock()
             .lock()
@@ -9449,6 +9464,7 @@ printf 'pwsh:%s' "$1"
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows fixture needs cwd isolation")]
     fn given_read_only_enforcer_when_read_file_then_not_permission_denied() {
         let _guard = env_lock()
             .lock()
@@ -9476,6 +9492,7 @@ printf 'pwsh:%s' "$1"
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows shell fixture")]
     fn given_no_enforcer_when_bash_then_executes_normally() {
         let _guard = env_lock()
             .lock()

@@ -54,7 +54,7 @@ impl TokenBudget {
     pub fn fit_messages(&self, messages: &mut VecDeque<BudgetMessage>) {
         let mut total: usize = messages.iter().map(|m| estimate_tokens(&m.content)).sum();
 
-        while total > self.budget && messages.len() > 4 {
+        while total > self.budget && messages.len() > 2 {
             // Remove oldest user + assistant pair
             let user = messages.pop_front();
             let assistant = messages.pop_front();
@@ -143,19 +143,19 @@ mod tests {
         let mut msgs: VecDeque<BudgetMessage> = VecDeque::new();
         msgs.push_back(BudgetMessage {
             role: "user".to_string(),
-            content: "a".repeat(4000), // ~1000 tokens
+            content: "a".repeat(10000), // ~2500 tokens
         });
         msgs.push_back(BudgetMessage {
             role: "assistant".to_string(),
-            content: "b".repeat(4000), // ~1000 tokens
+            content: "b".repeat(10000), // ~2500 tokens
         });
         msgs.push_back(BudgetMessage {
             role: "user".to_string(),
-            content: "c".repeat(4000), // ~1000 tokens
+            content: "c".repeat(10000), // ~2500 tokens
         });
         msgs.push_back(BudgetMessage {
             role: "assistant".to_string(),
-            content: "d".repeat(4000), // ~1000 tokens
+            content: "d".repeat(10000), // ~2500 tokens
         });
 
         let budget = TokenBudget::new();

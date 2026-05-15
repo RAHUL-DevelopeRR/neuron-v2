@@ -26,6 +26,7 @@ fn make_executable(path: &Path) {
 fn make_executable(_path: &Path) {}
 
 #[test]
+#[ignore = "mock CLI subprocess harness is long-running/flaky on Windows; run explicitly for parity checks"]
 #[allow(clippy::too_many_lines)]
 fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios() {
     let manifest_entries = load_scenario_manifest();

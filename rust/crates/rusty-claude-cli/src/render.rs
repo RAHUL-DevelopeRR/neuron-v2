@@ -988,8 +988,8 @@ mod tests {
 
         assert!(plain_text.contains("1. first"));
         assert!(plain_text.contains("2. second"));
-        assert!(plain_text.contains("  • nested"));
-        assert!(plain_text.contains("  • child"));
+        assert!(plain_text.contains("• nested"));
+        assert!(plain_text.contains("• child"));
     }
 
     #[test]

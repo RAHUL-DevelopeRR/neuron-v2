@@ -240,13 +240,13 @@ fn local_subcommand_help_does_not_fall_through_to_runtime_or_provider_calls() {
 
     assert_success(&doctor_help);
     let doctor_stdout = String::from_utf8(doctor_help.stdout).expect("stdout should be utf8");
-    assert!(doctor_stdout.contains("Usage            claw doctor"));
+    assert!(doctor_stdout.contains("Usage            neuron doctor"));
     assert!(doctor_stdout.contains("local-only health report"));
     assert!(!doctor_stdout.contains("Thinking"));
 
     assert_success(&status_help);
     let status_stdout = String::from_utf8(status_help.stdout).expect("stdout should be utf8");
-    assert!(status_stdout.contains("Usage            claw status"));
+    assert!(status_stdout.contains("Usage            neuron status"));
     assert!(status_stdout.contains("local workspace snapshot"));
     assert!(!status_stdout.contains("Thinking"));
 

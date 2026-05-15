@@ -1442,6 +1442,14 @@ mod tests {
         std::env::temp_dir().join(format!("runtime-mcp-stdio-{nanos}-{unique_id}"))
     }
 
+    fn python_command() -> String {
+        if cfg!(windows) {
+            "python".to_string()
+        } else {
+            "python3".to_string()
+        }
+    }
+
     #[cfg(unix)]
     fn make_executable(path: &Path) {
         use std::os::unix::fs::PermissionsExt;
@@ -1788,7 +1796,7 @@ mod tests {
         env: BTreeMap<String, String>,
     ) -> crate::mcp_client::McpStdioTransport {
         crate::mcp_client::McpStdioTransport {
-            command: "python3".to_string(),
+            command: python_command(),
             args: vec![script_path.to_string_lossy().into_owned()],
             env,
             tool_call_timeout_ms: None,
@@ -1837,7 +1845,7 @@ mod tests {
         ScopedMcpServerConfig {
             scope: ConfigSource::Local,
             config: McpServerConfig::Stdio(McpStdioServerConfig {
-                command: "python3".to_string(),
+                command: python_command(),
                 args: vec![script_path.to_string_lossy().into_owned()],
                 env,
                 tool_call_timeout_ms: None,
@@ -2211,6 +2219,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn manager_discovers_tools_from_stdio_config() {
         let runtime = Builder::new_current_thread()
             .enable_all()
@@ -2241,6 +2250,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn manager_routes_tool_calls_to_correct_server() {
         let runtime = Builder::new_current_thread()
             .enable_all()
@@ -2303,6 +2313,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn manager_times_out_slow_tool_calls() {
         let runtime = Builder::new_current_thread()
             .enable_all()
@@ -2317,7 +2328,7 @@ mod tests {
                 ScopedMcpServerConfig {
                     scope: ConfigSource::Local,
                     config: McpServerConfig::Stdio(McpStdioServerConfig {
-                        command: "python3".to_string(),
+                        command: python_command(),
                         args: vec![script_path.to_string_lossy().into_owned()],
                         env: BTreeMap::from([(
                             "MCP_TOOL_CALL_DELAY_MS".to_string(),
@@ -2358,6 +2369,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn manager_surfaces_parse_errors_from_tool_calls() {
         let runtime = Builder::new_current_thread()
             .enable_all()
@@ -2370,7 +2382,7 @@ mod tests {
                 ScopedMcpServerConfig {
                     scope: ConfigSource::Local,
                     config: McpServerConfig::Stdio(McpStdioServerConfig {
-                        command: "python3".to_string(),
+                        command: python_command(),
                         args: vec![script_path.to_string_lossy().into_owned()],
                         env: BTreeMap::from([(
                             "MCP_INVALID_TOOL_CALL_RESPONSE".to_string(),
@@ -2534,6 +2546,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn given_tool_call_disconnects_once_when_calling_twice_then_manager_resets_and_next_call_succeeds(
     ) {
         let runtime = Builder::new_current_thread()
@@ -2622,6 +2635,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn manager_lists_and_reads_resources_from_stdio_servers() {
         let runtime = Builder::new_current_thread()
             .enable_all()
@@ -2828,6 +2842,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn manager_shutdown_terminates_spawned_children_and_is_idempotent() {
         let runtime = Builder::new_current_thread()
             .enable_all()
@@ -2852,6 +2867,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn manager_reuses_spawned_server_between_discovery_and_call() {
         let runtime = Builder::new_current_thread()
             .enable_all()

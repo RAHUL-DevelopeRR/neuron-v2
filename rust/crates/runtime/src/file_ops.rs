@@ -30,7 +30,7 @@ fn is_binary_file(path: &Path) -> io::Result<bool> {
 /// the workspace boundary (e.g. via `../` traversal or symlink).
 #[allow(dead_code)]
 fn validate_workspace_boundary(resolved: &Path, workspace_root: &Path) -> io::Result<()> {
-    if !resolved.starts_with(workspace_root) {
+    if !path_starts_with_normalized(resolved, workspace_root) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
@@ -41,6 +41,34 @@ fn validate_workspace_boundary(resolved: &Path, workspace_root: &Path) -> io::Re
         ));
     }
     Ok(())
+}
+
+fn path_starts_with_normalized(path: &Path, root: &Path) -> bool {
+    if path.starts_with(root) {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        let normalize = |value: &Path| {
+            value
+                .to_string_lossy()
+                .trim_start_matches("\\\\?\\")
+                .replace('/', "\\")
+                .to_ascii_lowercase()
+        };
+        let path = normalize(path);
+        let mut root = normalize(root);
+        if !root.ends_with('\\') {
+            root.push('\\');
+        }
+        path == root.trim_end_matches('\\') || path.starts_with(&root)
+    }
+
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 /// Text payload returned by file-reading operations.

@@ -22,7 +22,7 @@ pub fn resolve_provider(requested_model: &str) -> (String, String, String, &'sta
         ) {
             if !azure_key.is_empty() && !azure_base.is_empty() {
                 let azure_model =
-                    env::var("AZURE_OPENAI_MODEL").unwrap_or_else(|_| requested_model.to_string());
+                    env::var("AZURE_OPENAI_MODEL").unwrap_or_else(|_| "Kimi-K2.5".to_string());
 
                 if azure_api_probe(&azure_key, &azure_base) {
                     eprintln!(
@@ -60,7 +60,8 @@ pub fn resolve_provider(requested_model: &str) -> (String, String, String, &'sta
             return (
                 openrouter_key,
                 "https://openrouter.ai/api/v1".to_string(),
-                env::var("OPENROUTER_MODEL").unwrap_or_else(|_| requested_model.to_string()),
+                env::var("OPENROUTER_MODEL")
+                    .unwrap_or_else(|_| "qwen/qwen3-coder-480b-a35b-instruct:free".to_string()),
                 "openrouter",
             );
         }
@@ -69,7 +70,8 @@ pub fn resolve_provider(requested_model: &str) -> (String, String, String, &'sta
         return (
             openrouter_key,
             "https://openrouter.ai/api/v1".to_string(),
-            env::var("OPENROUTER_MODEL").unwrap_or_else(|_| requested_model.to_string()),
+            env::var("OPENROUTER_MODEL")
+                .unwrap_or_else(|_| "qwen/qwen3-coder-480b-a35b-instruct:free".to_string()),
             "openrouter",
         );
     }

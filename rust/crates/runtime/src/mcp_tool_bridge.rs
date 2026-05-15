@@ -339,6 +339,14 @@ mod tests {
         }
     }
 
+    fn python_command() -> String {
+        if cfg!(windows) {
+            "python".to_string()
+        } else {
+            "python3".to_string()
+        }
+    }
+
     #[cfg(unix)]
     fn make_executable(path: &Path) {
         use std::os::unix::fs::PermissionsExt;
@@ -453,7 +461,7 @@ mod tests {
         ScopedMcpServerConfig {
             scope: ConfigSource::Local,
             config: McpServerConfig::Stdio(McpStdioServerConfig {
-                command: "python3".to_string(),
+                command: python_command(),
                 args: vec![script_path.to_string_lossy().into_owned()],
                 env: BTreeMap::from([
                     ("MCP_SERVER_LABEL".to_string(), server_name.to_string()),
@@ -578,6 +586,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn given_connected_server_with_manager_when_calling_tool_then_it_returns_live_result() {
         let script_path = write_bridge_mcp_server_script();
         let root = script_path.parent().expect("script parent");
@@ -821,6 +830,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn call_tool_payload_structure() {
         let script_path = write_bridge_mcp_server_script();
         let root = script_path.parent().expect("script parent");

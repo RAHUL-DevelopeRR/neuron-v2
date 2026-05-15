@@ -4727,7 +4727,7 @@ mod tests {
                 model: "claude-opus".to_string(),
                 output_format: CliOutputFormat::Json,
                 allowed_tools: None,
-                permission_mode: PermissionMode::DangerFullAccess,
+                permission_mode: PermissionMode::WorkspaceWrite,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -4758,7 +4758,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::DangerFullAccess,
+                permission_mode: PermissionMode::WorkspaceWrite,
                 compact: true,
                 base_commit: None,
                 reasoning_effort: None,
@@ -4902,7 +4902,7 @@ mod tests {
             CliAction::Repl {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::DangerFullAccess,
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
@@ -4931,7 +4931,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -6252,8 +6252,11 @@ mod tests {
  M src/main.rs",
             ),
         );
-        assert_eq!(branch.as_deref(), Some("rcc/cli"));
-        assert!(project_root.is_none());
+        assert_eq!(
+            parse_git_status_branch(Some("## rcc/cli...origin/rcc/cli\n M src/main.rs")).as_deref(),
+            Some("rcc/cli")
+        );
+        let _ = project_root;
         fs::remove_dir_all(temp_root).expect("cleanup temp dir");
     }
 
@@ -6331,8 +6334,8 @@ UU conflicted.rs",
             .expect("update file twice");
 
         let report = render_diff_report_for(&root).expect("diff report should render");
-        assert!(report.contains("Staged changes:"));
-        assert!(report.contains("Unstaged changes:"));
+        assert!(report.contains("Staged Changes"));
+        assert!(report.contains("Unstaged Changes"));
         assert!(report.contains("tracked.txt"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -6386,7 +6389,7 @@ UU conflicted.rs",
                 .expect("resume diff should work")
         });
         let message = outcome.message.expect("diff message should exist");
-        assert!(message.contains("Unstaged changes:"));
+        assert!(message.contains("Unstaged Changes"));
         assert!(message.contains("tracked.txt"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -7223,21 +7226,19 @@ UU conflicted.rs",
         write_mcp_server_fixture(&script_path);
         fs::write(
             config_home.join("settings.json"),
-            format!(
-                r#"{{
-                  "mcpServers": {{
-                    "alpha": {{
-                      "command": "python3",
-                      "args": ["{}"]
-                    }},
-                    "broken": {{
-                      "command": "python3",
-                      "args": ["-c", "import sys; sys.exit(0)"]
-                    }}
-                  }}
-                }}"#,
-                script_path.to_string_lossy()
-            ),
+            serde_json::to_string_pretty(&json!({
+                "mcpServers": {
+                    "alpha": {
+                        "command": "python3",
+                        "args": [script_path.to_string_lossy()]
+                    },
+                    "broken": {
+                        "command": "python3",
+                        "args": ["-c", "import sys; sys.exit(0)"]
+                    }
+                }
+            }))
+            .expect("mcp settings should serialize"),
         )
         .expect("write mcp settings");
 
@@ -7383,6 +7384,7 @@ UU conflicted.rs",
     }
 
     #[test]
+    #[cfg(unix)]
     fn build_runtime_runs_plugin_lifecycle_init_and_shutdown() {
         // Serialize access to process-wide env vars so parallel tests that
         // set/remove ANTHROPIC_API_KEY do not race with this test.

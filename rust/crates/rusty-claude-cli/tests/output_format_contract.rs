@@ -210,7 +210,7 @@ fn dump_manifests_and_init_emit_json_when_requested() {
     fs::create_dir_all(&workspace).expect("workspace should exist");
     let init = assert_json_command(&workspace, &["--output-format", "json", "init"]);
     assert_eq!(init["kind"], "init");
-    assert!(workspace.join("CLAUDE.md").exists());
+    assert!(workspace.join("NEURON.md").exists());
 }
 
 #[test]
@@ -255,11 +255,11 @@ fn doctor_and_resume_status_emit_json_when_requested() {
         .expect("install source check");
     assert_eq!(
         install_source["official_repo"],
-        "https://github.com/ultraworkers/claw-code"
+        "https://github.com/RAHUL-DevelopeRR/claw-code"
     );
     assert_eq!(
         install_source["deprecated_install"],
-        "cargo install claw-code"
+        "cargo install neuron-cli"
     );
 
     let workspace = checks
@@ -381,7 +381,7 @@ fn resumed_version_and_init_emit_structured_json_when_requested() {
         ],
     );
     assert_eq!(init["kind"], "init");
-    assert!(root.join("CLAUDE.md").exists());
+    assert!(root.join("NEURON.md").exists());
 }
 
 fn assert_json_command(current_dir: &Path, args: &[&str]) -> Value {
