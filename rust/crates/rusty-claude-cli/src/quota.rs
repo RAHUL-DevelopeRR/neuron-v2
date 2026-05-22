@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// Daily output token limit for the Azure GPT-5.5 free tier.
+/// Daily output token limit for Azure AI Foundry deployments.
 /// When exhausted, `resolve_provider()` falls back to OpenRouter free.
 pub const DAILY_AZURE_TOKEN_LIMIT: u32 = 44_000;
 

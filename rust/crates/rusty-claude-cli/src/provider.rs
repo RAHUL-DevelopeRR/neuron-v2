@@ -7,14 +7,39 @@ use api::{detect_provider_kind, ProviderKind};
 use std::env;
 
 /// Resolves the LLM provider in priority order:
-///   1. Azure AI Foundry, when explicitly configured
-///   2. Environment overrides (OPENAI_API_KEY + OPENAI_BASE_URL already set)
-///   3. OpenRouter free tier (fallback)
+///   1. Auth server proxy (localhost:19284) — keyless Azure via session token
+///   2. Azure AI Foundry raw env vars (fallback if auth server unavailable)
+///   3. Environment overrides (OPENAI_API_KEY + OPENAI_BASE_URL already set)
+///   4. OpenRouter free tier (fallback)
 ///
 /// Returns (api_key, base_url, model, provider_label) tuple.
 pub fn resolve_provider(requested_model: &str) -> (String, String, String, &'static str) {
-    // Priority 1: Azure AI Foundry, only when the user explicitly provides credentials.
     let quota = crate::quota::QuotaState::load();
+
+    // Priority 1a: Gateway server — CLI authenticates via session token,
+    // server holds all provider API keys. No raw API key on the client.
+    if !quota.is_azure_exhausted() {
+        if let Some(session) = try_auth_server_session() {
+            let gateway_base = env::var("NEURON_GATEWAY_URL")
+                .unwrap_or_else(|_| "http://localhost:19284".to_string());
+            let model =
+                env::var("AZURE_OPENAI_MODEL").unwrap_or_else(|_| "Kimi-K2.5".to_string());
+            eprintln!(
+                "\x1b[32m\u{2713}\x1b[0m NeuronCLI Gateway \u{2192} {} \u{00b7} Quota: {}",
+                model,
+                quota.display_compact()
+            );
+            // Use the gateway's /v1 endpoint — openai_compat appends /chat/completions
+            return (
+                session,
+                format!("{}/v1", gateway_base),
+                model,
+                "azure",
+            );
+        }
+    }
+
+    // Priority 1b: Azure AI Foundry raw env vars (direct, no auth server)
     if !quota.is_azure_exhausted() {
         if let (Ok(azure_key), Ok(azure_base)) = (
             env::var("AZURE_OPENAI_API_KEY"),
@@ -61,7 +86,7 @@ pub fn resolve_provider(requested_model: &str) -> (String, String, String, &'sta
                 openrouter_key,
                 "https://openrouter.ai/api/v1".to_string(),
                 env::var("OPENROUTER_MODEL")
-                    .unwrap_or_else(|_| "qwen/qwen3-coder-480b-a35b-instruct:free".to_string()),
+                    .unwrap_or_else(|_| "qwen/qwen3-coder:free".to_string()),
                 "openrouter",
             );
         }
@@ -71,7 +96,7 @@ pub fn resolve_provider(requested_model: &str) -> (String, String, String, &'sta
             openrouter_key,
             "https://openrouter.ai/api/v1".to_string(),
             env::var("OPENROUTER_MODEL")
-                .unwrap_or_else(|_| "qwen/qwen3-coder-480b-a35b-instruct:free".to_string()),
+                .unwrap_or_else(|_| "qwen/qwen3-coder:free".to_string()),
             "openrouter",
         );
     }
@@ -81,7 +106,8 @@ pub fn resolve_provider(requested_model: &str) -> (String, String, String, &'sta
     std::process::exit(1);
 }
 
-/// Quick non-blocking probe to check if the Azure endpoint is reachable.
+/// Quick non-blocking probe to check if the Azure AI Foundry endpoint is reachable.
+/// Uses the Models-as-a-Service path: /models/chat/completions
 pub fn azure_api_probe(api_key: &str, base_url: &str) -> bool {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -90,26 +116,104 @@ pub fn azure_api_probe(api_key: &str, base_url: &str) -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
-    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    // Azure AI Foundry MaaS uses /models/chat/completions (NOT /chat/completions)
+    let url = format!(
+        "{}/models/chat/completions?api-version=2024-05-01-preview",
+        base_url.trim_end_matches('/')
+    );
     let body = serde_json::json!({
         "model": "Kimi-K2.5",
         "messages": [{"role": "user", "content": "ping"}],
-        "max_completion_tokens": 1
+        "max_tokens": 1
     });
     match client
         .post(&url)
         .header("content-type", "application/json")
-        .header("api-key", api_key)
-        .bearer_auth(api_key)
+        .header("Authorization", format!("Bearer {}", api_key))
         .json(&body)
         .send()
     {
         Ok(resp) => {
             let status = resp.status().as_u16();
-            status == 200 || status == 429 || status == 400 || status == 401
+            // 200=ok, 429=rate-limited (still reachable), 400=bad request (model alive)
+            status == 200 || status == 429 || status == 400
         }
         Err(_) => false,
     }
+}
+
+/// Try to obtain a session token from the NeuronCLI Gateway Server.
+/// The server holds all provider API keys. Client only gets a session token.
+/// Returns `Some(session_token)` if the gateway is running and responds.
+/// Returns `None` if the server is unreachable (falls through to other providers).
+fn try_auth_server_session() -> Option<String> {
+    // Gateway server URL — localhost for dev, zero-x.live for production
+    let gateway_base = env::var("NEURON_GATEWAY_URL")
+        .unwrap_or_else(|_| "http://localhost:19284".to_string());
+
+    // Check for cached session token first
+    let session_path = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".neuroncli")
+        .join("session.json");
+
+    if let Ok(content) = std::fs::read_to_string(&session_path) {
+        if let Ok(cached) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(token) = cached["session_token"].as_str() {
+                if !token.is_empty() {
+                    // Verify session is still valid
+                    let client = reqwest::blocking::Client::builder()
+                        .timeout(std::time::Duration::from_secs(2))
+                        .build()
+                        .ok()?;
+                    let resp = client
+                        .get(format!("{}/auth/session", gateway_base))
+                        .header("Authorization", format!("Bearer {}", token))
+                        .send()
+                        .ok()?;
+                    if resp.status().is_success() {
+                        return Some(token.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // No cached session — try to create one
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .ok()?;
+
+    let fingerprint = format!(
+        "{}-{}",
+        env::var("USERNAME").or_else(|_| env::var("USER")).unwrap_or_else(|_| "unknown".into()),
+        env::var("COMPUTERNAME").or_else(|_| env::var("HOSTNAME")).unwrap_or_else(|_| "unknown".into())
+    );
+
+    let resp = client
+        .post(format!("{}/auth/session", gateway_base))
+        .json(&serde_json::json!({
+            "machine_fingerprint": fingerprint,
+            "version": "6.2.4"
+        }))
+        .send()
+        .ok()?;
+
+    if !resp.status().is_success() {
+        return None;
+    }
+
+    let body: serde_json::Value = resp.json().ok()?;
+    let token = body["session_token"].as_str()?.to_string();
+
+    // Cache the session
+    if let Some(parent) = session_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&session_path, serde_json::to_string_pretty(&body).unwrap_or_default());
+
+    Some(token)
 }
 
 pub fn provider_label(kind: ProviderKind) -> &'static str {

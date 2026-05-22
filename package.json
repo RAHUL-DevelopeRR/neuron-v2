@@ -1,11 +1,65 @@
 {
-  "name": "neuron-workspace",
-  "private": true,
-  "workspaces": [
-    "ui/react-tui"
-  ],
+  "name": "neuron-cli-app",
+  "version": "6.2.4",
+  "description": "NeuronCLI — AI coding agent. Rust engine + React/Ink TUI. Powered by Azure AI Foundry.",
+  "private": false,
+  "type": "module",
+  "bin": {
+    "neuron": "bin/cli.js"
+  },
   "scripts": {
-    "tui": "npm --workspace @neuron/react-tui run dev",
-    "tui:build": "npm --workspace @neuron/react-tui run build"
+    "dev": "tsx ui/react-tui/src/index.tsx",
+    "build:tui": "cd ui/react-tui && npx tsc -p tsconfig.json",
+    "build": "npm run build:tui",
+    "check": "cd ui/react-tui && npx tsc -p tsconfig.json --noEmit",
+    "start": "node bin/cli.js",
+    "prepublishOnly": "npm run build"
+  },
+  "files": [
+    "bin/",
+    "ui/react-tui/dist/",
+    "ui/react-tui/src/",
+    "ui/react-tui/package.json",
+    "ui/react-tui/tsconfig.json",
+    "neuron_cli/neuron.exe",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "neuron",
+    "neuroncli",
+    "cli",
+    "ai",
+    "coding-agent",
+    "terminal",
+    "tui",
+    "react",
+    "ink",
+    "kimi",
+    "deepseek",
+    "azure",
+    "openrouter"
+  ],
+  "author": "RAHUL-DevelopeRR <rahultech72216@gmail.com>",
+  "license": "MIT",
+  "homepage": "https://zero-x.live/neuroncli",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/RAHUL-DevelopeRR/neuron-v2"
+  },
+  "dependencies": {
+    "ink": "^5.1.0",
+    "react": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.7",
+    "@types/react": "^18.3.18",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  },
+  "os": ["win32"],
+  "cpu": ["x64"],
+  "engines": {
+    "node": ">=18.0.0"
   }
 }

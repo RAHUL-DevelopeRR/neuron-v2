@@ -198,7 +198,9 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
     // to the OpenAI-compat client pointed at DashScope's /compatible-mode/v1.
     // Uses the OpenAi provider kind because DashScope speaks the OpenAI REST
     // shape — only the base URL and auth env var differ.
-    if canonical.starts_with("qwen/") || canonical.starts_with("qwen-") {
+    if (canonical.starts_with("qwen/") || canonical.starts_with("qwen-"))
+        && !canonical.ends_with(":free")
+    {
         return Some(ProviderMetadata {
             provider: ProviderKind::OpenAi,
             auth_env: "DASHSCOPE_API_KEY",
@@ -214,6 +216,22 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             auth_env: "DASHSCOPE_API_KEY",
             base_url_env: "DASHSCOPE_BASE_URL",
             default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
+        });
+    }
+    // Azure AI Foundry deployment names — these are the exact model names
+    // from Azure's MaaS dashboard. Route to OpenAI-compat using Azure creds.
+    // Matches: Kimi-K2.5, Kimi-K2.6, DeepSeek-V4-Flash, FW-DeepSeek-V3.2,
+    // FW-MiniMax-M2.5, model-router, and any future Azure deployments.
+    if canonical.starts_with("Kimi-")
+        || canonical.starts_with("FW-")
+        || canonical.starts_with("DeepSeek-")
+        || canonical == "model-router"
+    {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "AZURE_OPENAI_API_KEY",
+            base_url_env: "AZURE_OPENAI_ENDPOINT",
+            default_base_url: "https://models.inference.ai.azure.com",
         });
     }
     None

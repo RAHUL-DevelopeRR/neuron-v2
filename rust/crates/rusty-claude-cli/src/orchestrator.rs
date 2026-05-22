@@ -65,7 +65,7 @@ impl Models {
 
     /// OpenRouter free-tier model (4th agent in /power mode)
     pub fn openrouter_free() -> &'static str {
-        "qwen/qwen3-235b-a22b:free"
+        "qwen/qwen3-coder:free"
     }
 
     // ── Chain mode roles ──
@@ -168,15 +168,14 @@ fn parse_response(
     })
 }
 
-// ── Azure API call ──────────────────────────────────────────
-
 /// Call an Azure AI Foundry deployment.
 ///
-/// Uses a **dual-URL strategy** (no model-specific params):
-/// 1. Try `/openai/deployments/{name}/chat/completions` (standard Azure)
-/// 2. Fallback to `/openai/v1/chat/completions` with `model` in body
+/// Uses the **Models-as-a-Service** endpoint:
+///   `{host}/models/chat/completions?api-version=2024-05-01-preview`
+/// with model name in the request body and Bearer auth.
 ///
-/// Both use `max_tokens` only (universally supported).
+/// This is the correct path for Azure AI Foundry (confirmed working).
+/// The old `/openai/deployments/{name}/chat/completions` returns 404.
 pub fn azure_call(
     api_key: &str,
     model: &str,
@@ -186,50 +185,27 @@ pub fn azure_call(
     let host = azure_host_root();
     let client = build_client(120)?;
 
-    // Universal body — same for every model
+    // Body with model name — required for MaaS endpoint
     let body = serde_json::json!({
+        "model": model,
         "messages": messages,
         "max_tokens": max_tokens,
     });
 
-    // Strategy 1: Deployment-specific URL (try each API version)
-    for api_ver in API_VERSIONS {
-        let url = format!(
-            "{}/openai/deployments/{}/chat/completions?api-version={}",
-            host, model, api_ver
-        );
-        match client
-            .post(&url)
-            .header("content-type", "application/json")
-            .header("api-key", api_key)
-            .json(&body)
-            .send()
-        {
-            Ok(r) if r.status().as_u16() == 200 => {
-                let text = r.text().unwrap_or_default();
-                let mut resp = parse_response(&text, model, "deploy")?;
-                resp.strategy = "deploy";
-                return Ok(resp);
-            }
-            Ok(r) if r.status().as_u16() == 404 => continue, // try next version
-            _ => continue,
-        }
-    }
-
-    // Strategy 2: /openai/v1 with model in body (OpenAI-compat)
-    let mut body_v1 = body.clone();
-    body_v1["model"] = serde_json::json!(model);
-    let v1_url = format!("{}/openai/v1/chat/completions", host);
+    // Azure AI Foundry MaaS endpoint (confirmed working)
+    let url = format!(
+        "{}/models/chat/completions?api-version=2024-05-01-preview",
+        host
+    );
 
     let resp = client
-        .post(&v1_url)
+        .post(&url)
         .header("content-type", "application/json")
-        .header("api-key", api_key)
-        .bearer_auth(api_key)
-        .json(&body_v1)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .json(&body)
         .send()
         .map_err(|e| OrchestratorError {
-            provider: "azure-v1",
+            provider: "azure-maas",
             model: model.to_string(),
             status: None,
             message: format!("Network error: {e}"),
@@ -240,15 +216,15 @@ pub fn azure_call(
 
     if status != 200 {
         return Err(OrchestratorError {
-            provider: "azure-v1",
+            provider: "azure-maas",
             model: model.to_string(),
             status: Some(status),
             message: text.chars().take(300).collect(),
         });
     }
 
-    let mut result = parse_response(&text, model, "v1")?;
-    result.strategy = "v1";
+    let mut result = parse_response(&text, model, "azure-maas")?;
+    result.strategy = "azure-maas";
     Ok(result)
 }
 

@@ -1,3 +1,10 @@
+/**
+ * Neuron TUI Theme — Design system for the React/Ink terminal interface.
+ *
+ * Adapted from the Rust brand.rs color system and the opencode Go TUI palette.
+ * Uses AdaptiveColor for dark/light terminal backgrounds.
+ */
+
 export type AdaptiveColor = {
   dark: string;
   light: string;
@@ -16,34 +23,56 @@ export type NeuronTheme = {
   background: AdaptiveColor;
   panel: AdaptiveColor;
   border: AdaptiveColor;
+  // Brand-specific colors matching brand.rs
+  brandBlue: AdaptiveColor;
+  brandRed: AdaptiveColor;
+  brandOrange: AdaptiveColor;
+  brandGreen: AdaptiveColor;
+  brandCyan: AdaptiveColor;
 };
 
-// Adapted from the local opencode Go TUI theme palette in
-// opencode/internal/tui/theme/opencode.go. Kept as data instead of copied Go
-// code so the React/Ink frontend can share the same visual language.
-export const opencodeTheme: NeuronTheme = {
-  primary: {dark: '#fab283', light: '#3b7dd8'},
-  secondary: {dark: '#5c9cf5', light: '#7b5bb6'},
-  accent: {dark: '#9d7cd8', light: '#d68c27'},
-  error: {dark: '#e06c75', light: '#d1383d'},
-  warning: {dark: '#f5a742', light: '#d68c27'},
-  success: {dark: '#7fd88f', light: '#3d9a57'},
-  info: {dark: '#56b6c2', light: '#318795'},
-  text: {dark: '#e0e0e0', light: '#2a2a2a'},
-  muted: {dark: '#6a6a6a', light: '#8a8a8a'},
-  background: {dark: '#212121', light: '#f8f8f8'},
-  panel: {dark: '#252525', light: '#f0f0f0'},
-  border: {dark: '#4b4c5c', light: '#d3d3d3'}
+// Direct mapping from brand.rs ANSI true-color values
+export const neuronTheme: NeuronTheme = {
+  primary: { dark: '#4169C3', light: '#3b7dd8' },     // BLUE
+  secondary: { dark: '#5c9cf5', light: '#7b5bb6' },
+  accent: { dark: '#F0A028', light: '#d68c27' },       // ORANGE
+  error: { dark: '#C83228', light: '#d1383d' },         // RED
+  warning: { dark: '#F0A028', light: '#d68c27' },
+  success: { dark: '#2D8C3C', light: '#3d9a57' },      // GREEN
+  info: { dark: '#5AC8FA', light: '#318795' },          // CYAN
+  text: { dark: '#DCDCE6', light: '#2a2a2a' },          // WHITE
+  muted: { dark: '#888888', light: '#8a8a8a' },         // DIM
+  background: { dark: '#121218', light: '#f8f8f8' },
+  panel: { dark: '#1a1a24', light: '#f0f0f0' },
+  border: { dark: '#4169C3', light: '#d3d3d3' },        // Blue borders
+  // Brand colors (exact match to brand.rs)
+  brandBlue: { dark: '#4169C3', light: '#4169C3' },
+  brandRed: { dark: '#C83228', light: '#C83228' },
+  brandOrange: { dark: '#F0A028', light: '#F0A028' },
+  brandGreen: { dark: '#2D8C3C', light: '#2D8C3C' },
+  brandCyan: { dark: '#5AC8FA', light: '#5AC8FA' },
 };
+
+// Legacy alias for compatibility
+export const opencodeTheme = neuronTheme;
 
 export const icons = {
   mark: '⌬',
   check: '✓',
-  error: '✖',
+  error: '✗',
   warning: '⚠',
-  loading: '⟳'
-};
+  loading: '⟳',
+  arrow: '▸',
+  diamond: '◆',
+  dot: '●',
+  ring: '○',
+  block: '█',
+} as const;
 
+/**
+ * Resolve an AdaptiveColor to a hex string for the current terminal mode.
+ * Defaults to dark mode since most developer terminals are dark.
+ */
 export function color(token: AdaptiveColor, mode: 'dark' | 'light' = 'dark'): string {
   return token[mode];
 }

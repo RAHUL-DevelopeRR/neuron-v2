@@ -89,11 +89,22 @@ pub(crate) enum CliAction {
         reasoning_effort: Option<String>,
         allow_broad_cwd: bool,
     },
+    Auth {
+        action: AuthAction,
+        output_format: CliOutputFormat,
+    },
     HelpTopic(LocalHelpTopic),
     // prompt-mode formatting is only supported for non-interactive runs
     Help {
         output_format: CliOutputFormat,
     },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AuthAction {
+    Status,
+    Reset,
+    Login,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -398,7 +409,9 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
         }
         "system-prompt" => parse_system_prompt_args(&rest[1..], output_format),
         "acp" => parse_acp_args(&rest[1..], output_format),
-        "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
+        "auth" => parse_auth_args(&rest[1..], output_format),
+        "login" => Ok(CliAction::Auth { action: AuthAction::Login, output_format }),
+        "logout" => Err("logout is not needed. Use `neuron auth reset` to clear credentials.".to_string()),
         "init" => Ok(CliAction::Init { output_format }),
         "export" => parse_export_args(&rest[1..], output_format),
         "prompt" => {
@@ -517,10 +530,20 @@ pub(crate) fn bare_slash_command_guidance(command_name: &str) -> Option<String> 
     Some(guidance)
 }
 
-pub(crate) fn removed_auth_surface_error(command_name: &str) -> String {
-    format!(
-        "`neuron {command_name}` has been removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead."
-    )
+pub(crate) fn parse_auth_args(
+    args: &[String],
+    output_format: CliOutputFormat,
+) -> Result<CliAction, String> {
+    let subcommand = args.first().map(String::as_str).unwrap_or("status");
+    let action = match subcommand {
+        "status" | "info" => AuthAction::Status,
+        "reset" | "clear" => AuthAction::Reset,
+        "login" | "connect" => AuthAction::Login,
+        other => return Err(format!(
+            "unknown auth subcommand: `{other}`. Use `neuron auth status`, `neuron auth reset`, or `neuron auth login`."
+        )),
+    };
+    Ok(CliAction::Auth { action, output_format })
 }
 
 pub(crate) fn parse_acp_args(
@@ -745,9 +768,35 @@ pub(crate) fn levenshtein_distance(left: &str, right: &str) -> usize {
 
 pub(crate) fn resolve_model_alias(model: &str) -> &str {
     match model {
+        // ── Azure AI Foundry mode aliases (primary path) ──────────
+        // Default: fast agentic coding with tool-calling
+        "default" | "kimi" => "Kimi-K2.5",
+        // Power: strongest agentic reasoning (DeepSeek V4 Flash)
+        "power" | "deepseek" | "ds" => "DeepSeek-V4-Flash",
+        // Max: latest Kimi reasoning model
+        "max" | "reasoning" | "kimi2.6" => "Kimi-K2.6",
+        // Code: code-specialized DeepSeek
+        "code" | "coder" | "deepseek-v3" => "FW-DeepSeek-V3.2",
+        // Fast: quick responses
+        "fast" | "flash" => "DeepSeek-V4-Flash",
+        // MiniMax: alternate provider
+        "minimax" | "mm" => "FW-MiniMax-M2.5",
+        // Model Router: Azure's intelligent model selector
+        "router" | "auto" => "model-router",
+        // GPT-5 family (Azure AI Foundry deployments)
+        "gpt5" | "gpt-5.5" | "gpt55" => "gpt-5.5-2",
+        "gpt54" | "gpt-5.4" | "gpt-5.4-pro" => "gpt-5.4-pro",
+        "gpt54m" | "gpt-5.4-mini" => "gpt-5.4-mini",
+        "codex" | "codex-max" | "gpt-5.1-codex" => "gpt-5.1-codex-max",
+        // OpenRouter free fallback
+        "free" | "qwen" | "qwen3" => "qwen/qwen3-coder:free",
+
+        // ── Claude model aliases (kept for Anthropic API key users) ──
         "opus" => "claude-opus-4-6",
         "sonnet" => "claude-sonnet-4-6",
         "haiku" => "claude-haiku-4-5-20251213",
+
+        // Pass through any explicit model name
         _ => model,
     }
 }

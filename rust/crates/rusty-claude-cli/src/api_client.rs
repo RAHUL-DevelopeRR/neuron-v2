@@ -49,34 +49,45 @@ impl AnthropicRuntimeClient {
         // session-scoped prompt cache on the Anthropic path; the
         // prompt cache is Anthropic-only so non-Anthropic variants
         // skip it.
-        let resolved_model = api::resolve_model_alias(&model);
-        let client = match detect_provider_kind(&resolved_model) {
-            ProviderKind::Anthropic => {
-                let auth = resolve_cli_auth_source()?;
-                let inner = AnthropicClient::from_auth(auth)
-                    .with_base_url(api::read_base_url())
-                    .with_prompt_cache(PromptCache::new(session_id));
-                ApiProviderClient::Anthropic(inner)
-            }
-            ProviderKind::Xai | ProviderKind::OpenAi => {
-                // The api crate's `ProviderClient::from_model_with_anthropic_auth`
-                // with `None` for the anthropic auth routes via
-                // `detect_provider_kind` and builds an
-                // `OpenAiCompatClient::from_env` with the matching
-                // `OpenAiCompatConfig` (openai / xai / dashscope).
-                // That reads the correct API-key env var and BASE_URL
-                // override internally, so this one call covers OpenAI,
-                // OpenRouter, xAI, DashScope, Ollama, and any other
-                // OpenAI-compat endpoint users configure via
-                // `OPENAI_BASE_URL` / `XAI_BASE_URL` / `DASHSCOPE_BASE_URL`.
-                ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
-            }
+        // ── Step 1: Resolve provider (auth server → azure → openrouter) ──
+        // This sets api_key and base_url from the auth server session or
+        // env vars, then injects them into OPENAI_API_KEY / OPENAI_BASE_URL
+        // so the api crate's `from_env()` picks them up.
+        let (api_key, base_url, resolved_model_name, _provider_label) =
+            crate::provider::resolve_provider(&model);
+
+        // Inject credentials so `OpenAiCompatClient::from_env` finds them
+        if !api_key.is_empty() {
+            env::set_var("OPENAI_API_KEY", &api_key);
+        }
+        if !base_url.is_empty() {
+            env::set_var("OPENAI_BASE_URL", &base_url);
+        }
+
+        let resolved_model = api::resolve_model_alias(&resolved_model_name);
+
+        // When resolve_provider returned a non-Anthropic provider (azure/openrouter/openai),
+        // we MUST use the OpenAI-compat path regardless of what detect_provider_kind thinks.
+        // detect_provider_kind might still say "Anthropic" for unrecognized model names,
+        // but we already have valid credentials injected into OPENAI_API_KEY.
+        let use_anthropic = _provider_label == "anthropic"
+            || (api_key.is_empty()
+                && detect_provider_kind(&resolved_model) == ProviderKind::Anthropic);
+
+        let client = if use_anthropic {
+            let auth = resolve_cli_auth_source()?;
+            let inner = AnthropicClient::from_auth(auth)
+                .with_base_url(api::read_base_url())
+                .with_prompt_cache(PromptCache::new(session_id));
+            ApiProviderClient::Anthropic(inner)
+        } else {
+            ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
         };
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
             client,
             session_id: session_id.to_string(),
-            model,
+            model: resolved_model_name,
             enable_tools,
             emit_output,
             allowed_tools,
@@ -664,6 +675,17 @@ pub(crate) fn slash_command_completion_candidates_with_sessions(
         "/export ",
         "/issue ",
         "/model ",
+        // Azure AI Foundry modes (primary)
+        "/model default",
+        "/model power",
+        "/model max",
+        "/model code",
+        "/model fast",
+        "/model free",
+        "/model kimi",
+        "/model deepseek",
+        "/model minimax",
+        // Claude aliases (for Anthropic API users)
         "/model opus",
         "/model sonnet",
         "/model haiku",

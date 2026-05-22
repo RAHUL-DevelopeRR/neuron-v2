@@ -118,12 +118,22 @@ use tools::{
     execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
 };
 
-const DEFAULT_MODEL: &str = "claude-opus-4-6";
+const DEFAULT_MODEL: &str = "Kimi-K2.5";
 fn max_tokens_for_model(model: &str) -> u32 {
+    // ── Claude models ──
     if model.contains("opus") {
         32_000
-    } else {
+    } else if model.contains("sonnet") || model.contains("claude") {
         64_000
+    }
+    // ── Azure AI Foundry models ──
+    else if model.contains("K2.6") || model.contains("DeepSeek-V4") {
+        64_000
+    } else if model.contains("DeepSeek-V3") || model.contains("qwen3-coder") {
+        32_000
+    } else {
+        // Kimi-K2.5 (default), FW-MiniMax-M2.5, haiku, others
+        32_000
     }
 }
 // Build-time constants injected by build.rs (fall back to static values when
@@ -133,7 +143,7 @@ const DEFAULT_DATE: &str = match option_env!("BUILD_DATE") {
     None => "unknown",
 };
 const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
-const VERSION: &str = "6.1.0";
+const VERSION: &str = "6.2.4";
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
 const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
@@ -362,8 +372,141 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             reasoning_effort,
             allow_broad_cwd,
         )?,
+        CliAction::Auth { action, output_format } => run_auth_command(action, output_format)?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
+    }
+    Ok(())
+}
+
+// -- Auth subcommands (neuron auth status|reset|login) --
+
+fn run_auth_command(
+    action: args::AuthAction,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::brand::*;
+    match action {
+        args::AuthAction::Status => {
+            let vpath = vault::vault_path();
+            let quota = crate::quota::QuotaState::load();
+
+            if output_format == CliOutputFormat::Json {
+                let vault_exists = vpath.exists();
+                let fingerprint = if vault_exists {
+                    vault::decrypt_from_vault(&vpath)
+                        .ok()
+                        .map(|k| vault::key_fingerprint(k.expose()))
+                } else {
+                    None
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "kind": "auth-status",
+                        "vault_path": vpath.display().to_string(),
+                        "vault_exists": vault_exists,
+                        "key_fingerprint": fingerprint,
+                        "quota": {
+                            "date": quota.date,
+                            "used": quota.azure_output_tokens_used,
+                            "limit": quota.daily_limit,
+                            "exhausted": quota.is_azure_exhausted(),
+                        },
+                    }))?
+                );
+            } else {
+                println!("\n  {BOLD}{WHITE}Neuron Auth Status{R}\n");
+                println!("  {DIM}Vault:{R}  {}", vpath.display());
+                if vpath.exists() {
+                    match vault::decrypt_from_vault(&vpath) {
+                        Ok(key) => {
+                            println!(
+                                "  {DIM}Key:{R}    {GREEN}✓{R} {}",
+                                vault::key_fingerprint(key.expose())
+                            );
+                        }
+                        Err(e) => {
+                            println!("  {DIM}Key:{R}    {RED}✗{R} {e}");
+                        }
+                    }
+                } else {
+                    println!("  {DIM}Key:{R}    {DIM}(no vault found){R}");
+                }
+
+                // Provider info
+                if let Ok(azure_key) = env::var("AZURE_OPENAI_API_KEY") {
+                    if !azure_key.is_empty() {
+                        let azure_ep = env::var("AZURE_OPENAI_ENDPOINT").unwrap_or_default();
+                        let azure_model =
+                            env::var("AZURE_OPENAI_MODEL").unwrap_or_else(|_| "Kimi-K2.5".into());
+                        println!(
+                            "  {DIM}Azure:{R}  {GREEN}✓{R} {azure_model} @ {azure_ep}"
+                        );
+                    }
+                }
+                if let Ok(or_key) = env::var("OPENROUTER_API_KEY") {
+                    if !or_key.is_empty() {
+                        println!(
+                            "  {DIM}OpenRouter:{R} {GREEN}✓{R} key set"
+                        );
+                    }
+                }
+
+                println!(
+                    "  {DIM}Quota:{R}  {} ({})",
+                    quota.display_compact(),
+                    quota.date
+                );
+                println!();
+            }
+        }
+        args::AuthAction::Reset => {
+            let vpath = vault::vault_path();
+            let qpath = vpath.parent().unwrap_or(Path::new(".")).join("quota.json");
+            let hpath = vault::health_check_path();
+
+            let mut deleted = Vec::new();
+            if vpath.exists() {
+                vault::delete_vault(&vpath);
+                deleted.push("vault.enc");
+            }
+            if qpath.exists() {
+                let _ = fs::remove_file(&qpath);
+                deleted.push("quota.json");
+            }
+            if hpath.exists() {
+                let _ = fs::remove_file(&hpath);
+                deleted.push("vault.health");
+            }
+
+            if output_format == CliOutputFormat::Json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "kind": "auth-reset",
+                        "deleted": deleted,
+                    }))?
+                );
+            } else if deleted.is_empty() {
+                println!("  {DIM}Nothing to reset — no credentials found.{R}");
+            } else {
+                println!(
+                    "  {GREEN}✓{R} Reset complete. Deleted: {}",
+                    deleted.join(", ")
+                );
+                println!("  {DIM}Run `neuron` to re-authenticate.{R}");
+            }
+        }
+        args::AuthAction::Login => {
+            // Trigger the PKCE flow directly
+            if let Some(_key) = auth::ensure_api_key() {
+                println!("  {GREEN}✓{R} Authentication successful.");
+            } else {
+                eprintln!("  {RED}✗{R} Authentication failed or cancelled.");
+                std::process::exit(1);
+            }
+        }
     }
     Ok(())
 }
@@ -1310,13 +1453,15 @@ fn run_stale_base_preflight(flag_value: Option<&str>) {
 }
 
 fn configure_provider_for_model(model: String) -> String {
-    if detect_provider_kind(&model) == ProviderKind::Anthropic {
-        return model;
-    }
-
+    // Always resolve through the provider chain (auth server → Azure → OpenRouter)
+    // regardless of model name. This ensures credentials are always injected.
     let (api_key, base_url, resolved_model, _provider_label) = resolve_provider(&model);
-    std::env::set_var("OPENAI_API_KEY", api_key);
-    std::env::set_var("OPENAI_BASE_URL", base_url);
+    if !api_key.is_empty() {
+        std::env::set_var("OPENAI_API_KEY", &api_key);
+    }
+    if !base_url.is_empty() {
+        std::env::set_var("OPENAI_BASE_URL", &base_url);
+    }
     resolved_model
 }
 
@@ -1982,200 +2127,188 @@ impl LiveCli {
     }
 
     fn startup_banner(&self) -> String {
+        // ── Option 3: Block █ borders — premium, no box-drawing chars ──
+        // Faithfully ported from neuron_banner_fixed.py Option 3.
+        // Uses brand::strip_ansi_len() for ANSI-aware padding (the core fix).
+        use crate::brand::*;
+
         let cwd = env::current_dir().map_or_else(
             |_| "<unknown>".to_string(),
             |path| {
                 let s = path.display().to_string();
-                if s.len() > 35 {
-                    format!("...{}", &s[s.len() - 32..])
+                if s.len() > 50 {
+                    format!("~/{}", s.rsplit_once(['/', '\\']).map_or(&*s, |p| p.1))
                 } else {
                     s
                 }
             },
         );
-        let username = env::var("USERNAME")
-            .or_else(|_| env::var("USER"))
-            .unwrap_or_else(|_| "Developer".to_string());
         let model_short = self.model.split('/').last().unwrap_or(&self.model);
-        let provider = if std::env::var("OPENAI_BASE_URL").map_or(false, |u| u.contains("azure")) {
-            "Azure"
-        } else {
-            "OpenRouter"
-        };
-        let version = VERSION;
         let quota = crate::quota::QuotaState::load();
         let quota_str = quota.display_compact();
 
-        // -- Brand colors --
-        use crate::brand::*;
-        let b = BLUE; // border
-        let o = ORANGE; // accent
-        let g = GREEN; // success
-        let d = DIM; // dim
-        let w = WHITE; // bright
-        let s = SOFT; // soft white
-        let bd = BOLD;
-        let r = R;
-        let ng = NEURON_LOGO;
-
-        // Build repo map status
-        let repo_status = {
-            let cwd_path = env::current_dir().unwrap_or_default();
-            let map = crate::repo_map::RepoMap::build(&cwd_path);
-            map.status_line()
+        // Resolve the actual provider label from the struct field or env.
+        // Check OPENAI_BASE_URL to detect OpenRouter (configure_provider_for_model
+        // injects OpenRouter creds into OPENAI_API_KEY, so we can't rely on that alone).
+        let provider_label = if let Ok(azure_key) = env::var("AZURE_OPENAI_API_KEY") {
+            if !azure_key.is_empty() && !quota.is_azure_exhausted() {
+                "Azure"
+            } else {
+                "OpenRouter"
+            }
+        } else if env::var("OPENAI_BASE_URL")
+            .map_or(false, |u| u.contains("openrouter.ai"))
+            || self.model.ends_with(":free")
+            || self.model.ends_with(":beta")
+            || self.model.ends_with(":extended")
+        {
+            "OpenRouter"
+        } else if env::var("OPENAI_API_KEY").map_or(false, |k| !k.is_empty()) {
+            "OpenAI"
+        } else {
+            "OpenRouter"
         };
 
-        // -- Clean box layout with ASCII borders --
-        let w_left = 38; // left panel inner width
-        let w_right = 34; // right panel inner width
+        // ── Block-character letter definitions (8 cols × 5 rows each) ──
+        // N (blue)
+        let letter_n_upper: &[&str] = &[
+            "██▄   ██",
+            "████  ██",
+            "██ ██ ██",
+            "██  ████",
+            "██   ▀██",
+        ];
+        // e (red)
+        let letter_e: &[&str] = &[
+            "        ",
+            "  ▄██▄  ",
+            " █▄▄▄█▀ ",
+            " █▀▀▀▀  ",
+            "  ▀██▀  ",
+        ];
+        // u (orange)
+        let letter_u: &[&str] = &[
+            "        ",
+            " ██  ██ ",
+            " ██  ██ ",
+            " ██  ██ ",
+            "  ▀██▀  ",
+        ];
+        // r (orange)
+        let letter_r: &[&str] = &[
+            "        ",
+            " ██▄▄▄  ",
+            " ███▀▀  ",
+            " ██     ",
+            " ██     ",
+        ];
+        // o (green)
+        let letter_o: &[&str] = &[
+            "        ",
+            "  ▄██▄  ",
+            " ██  ██ ",
+            " ██  ██ ",
+            "  ▀██▀  ",
+        ];
+        // n (green)
+        let letter_n_lower: &[&str] = &[
+            "        ",
+            " ██▄▄█  ",
+            " ██  ██ ",
+            " ██  ██ ",
+            " ██  ██ ",
+        ];
+
+        let letters: &[(&[&str], &str)] = &[
+            (letter_n_upper, BLUE),
+            (letter_e, RED),
+            (letter_u, ORANGE),
+            (letter_r, ORANGE),
+            (letter_o, GREEN),
+            (letter_n_lower, GREEN),
+        ];
+
+        // ── Colorize: paint block chars (█▄▀▓▒░▐▟▙▜▛) with color, spaces stay plain ──
+        fn colorize_row(row: &str, color: &str) -> String {
+            let mut out = String::new();
+            for ch in row.chars() {
+                if "█▄▀▓▒░▐▟▙▜▛".contains(ch) {
+                    out.push_str("\x1b[1m");
+                    out.push_str(color);
+                    out.push(ch);
+                    out.push_str("\x1b[0m");
+                } else {
+                    out.push(ch);
+                }
+            }
+            out
+        }
+
+        // ── Compose logo: join all letters side-by-side with 1-char gap ──
+        let mut logo_lines = Vec::new();
+        for row_idx in 0..5 {
+            let mut parts = Vec::new();
+            for (rows, color) in letters {
+                parts.push(colorize_row(rows[row_idx], color));
+            }
+            logo_lines.push(parts.join(" "));
+        }
+
+        // ── ANSI-aware padding helper (same logic as Python pad_right) ──
+        fn pad_right(s: &str, total_visible: usize) -> String {
+            let current = crate::brand::strip_ansi_len(s);
+            if current < total_visible {
+                format!("{}{}", s, " ".repeat(total_visible - current))
+            } else {
+                s.to_string()
+            }
+        }
+
+        // ── Build the banner ──
+        let w: usize = 60; // inner visible width
+        let b = BLUE;
+        let d = DIM;
+        let r = R;
+        let bd = BOLD;
 
         let mut lines = Vec::new();
 
-        // Header line
-        lines.push(format!(
-            "  {b}>{r} {ng} {d}CLI v{ver}{r} {b}---{r} {d}Powered by{r} {s}@{r} {d}zero-x.live{r}",
-            ver = version,
-        ));
-
-        // Top border
-        lines.push(format!(
-            "  {b}+{left}+{right}+{r}",
-            left = "-".repeat(w_left),
-            right = "-".repeat(w_right),
-        ));
+        // Top border: solid block row
+        lines.push(format!("  {bd}{b}{bar}{r}", bar = "█".repeat(w + 2)));
 
         // Empty row
-        lines.push(format!(
-            "  {b}|{r}{ls}{b}|{r}{rs}{b}|{r}",
-            ls = " ".repeat(w_left),
-            rs = " ".repeat(w_right),
-        ));
+        lines.push(format!("  {bd}{b}█{r}{sp}{bd}{b}█{r}", sp = " ".repeat(w)));
 
-        // Welcome + Tips heading
-        let welcome = format!("{w}{bd}Welcome back, {user}!{r}", user = username);
-        let tips = format!("{o}{bd}Tips for getting started{r}");
-        lines.push(format!(
-            "  {b}|{r}  {welcome}{wpad}{b}|{r}  {tips}{tpad}{b}|{r}",
-            wpad = " ".repeat(w_left.saturating_sub(brand::strip_ansi_len(&welcome) + 2)),
-            tpad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&tips) + 2)),
-        ));
+        // Logo rows
+        for logo_row in &logo_lines {
+            let content = format!("  {}", logo_row);
+            let padded = pad_right(&content, w);
+            lines.push(format!("  {bd}{b}█{r}{padded}{bd}{b}█{r}"));
+        }
 
-        // Tips content
-        let tip1 = format!("{d}Run{r} {o}/init{r} {d}to create a NEURON.md{r}");
-        lines.push(format!(
-            "  {b}|{r}{ls}{b}|{r}  {tip1}{tpad}{b}|{r}",
-            ls = " ".repeat(w_left),
-            tpad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&tip1) + 2)),
-        ));
+        // Empty row after logo
+        lines.push(format!("  {bd}{b}█{r}{sp}{bd}{b}█{r}", sp = " ".repeat(w)));
 
-        let tip2 = format!("{d}file with project context{r}");
-        lines.push(format!(
-            "  {b}|{r}   {s}*{r}        {s}.{r}        {s}*{r}   {hpad}{b}|{r}  {tip2}{tpad}{b}|{r}",
-            hpad = " ".repeat(w_left.saturating_sub(27)),
-            tpad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&tip2) + 2)),
-        ));
-
-        let tip3 = format!("{d}instructions for Neuron...{r}");
-        lines.push(format!(
-            "  {b}|{r}  {s}.{r}  {b}\\--\\{r}    {b}/--/{r}  {s}.{r}   {hpad}{b}|{r}  {tip3}{tpad}{b}|{r}",
-            hpad = " ".repeat(w_left.saturating_sub(27)),
-            tpad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&tip3) + 2)),
-        ));
-
-        // Helix center rows + what's new
-        let whatsnew = format!("{o}{bd}What's new{r}");
-        lines.push(format!(
-            "  {b}|{r} {s}*{r}    {b}\\--{o}X{RED}----{o}X{b}--/{r}    {s}*{r}   {hpad}{b}|{r}{rpad}{b}|{r}",
-            RED=RED, hpad = " ".repeat(w_left.saturating_sub(30)),
-            rpad = " ".repeat(w_right),
-        ));
-
-        lines.push(format!(
-            "  {b}|{r} {s}.{r}  {g}/{b}--/{r}  {s}.  .{r}  {b}\\--{g}\\{r}  {s}.{r}  {hpad}{b}|{r}  {whatsnew}{wpad}{b}|{r}",
-            hpad = " ".repeat(w_left.saturating_sub(30)),
-            wpad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&whatsnew) + 2)),
-        ));
-
-        // What's new items
-        let news = [
-            format!("{d}- 44K token/day Azure quota{r}"),
-            format!("{d}- OpenRouter free fallback{r}"),
-            format!("{d}- {repo_status}{r}"),
-            format!("{d}/release-notes for more{r}"),
-        ];
-
-        lines.push(format!(
-            "  {b}|{r}    {RED}X{b}--/{r}   {s}.  .{r}   {b}\\--{RED}X{r}   {hpad}{b}|{r}  {n}{npad}{b}|{r}",
-            RED=RED, hpad = " ".repeat(w_left.saturating_sub(30)),
-            n = news[0], npad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&news[0]) + 2)),
-        ));
-
-        lines.push(format!(
-            "  {b}|{r} {s}.{r}  {g}\\{b}--/{r}  {s}.  .{r}  {b}\\--{g}/{r}  {s}.{r}  {hpad}{b}|{r}  {n}{npad}{b}|{r}",
-            hpad = " ".repeat(w_left.saturating_sub(30)),
-            n = news[1], npad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&news[1]) + 2)),
-        ));
-
-        lines.push(format!(
-            "  {b}|{r} {s}*{r}    {b}\\--{o}X{RED}----{o}X{b}--/{r}    {s}*{r}   {hpad}{b}|{r}  {n}{npad}{b}|{r}",
-            RED=RED, hpad = " ".repeat(w_left.saturating_sub(30)),
-            n = news[2], npad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&news[2]) + 2)),
-        ));
-
-        lines.push(format!(
-            "  {b}|{r}  {s}.{r}  {b}\\---{r}    {b}\\--/{r}  {s}.{r}   {hpad}{b}|{r}  {n}{npad}{b}|{r}",
-            hpad = " ".repeat(w_left.saturating_sub(27)),
-            n = news[3], npad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&news[3]) + 2)),
-        ));
-
-        // Neuron branding row
-        lines.push(format!(
-            "  {b}|{r}   {s}*{r}     {ng}     {s}*{r}     {hpad}{b}|{r}{rpad}{b}|{r}",
-            hpad = " ".repeat(w_left.saturating_sub(27)),
-            rpad = " ".repeat(w_right),
-        ));
-
-        // @ zero-x.live
-        lines.push(format!(
-            "  {b}|{r}      {s}@{r} {d}zero-x.live{r}          {hpad}{b}|{r}{rpad}{b}|{r}",
-            hpad = " ".repeat(w_left.saturating_sub(33)),
-            rpad = " ".repeat(w_right),
-        ));
-
-        // Model info
-        let model_info = format!(
-            "{g}{ms}{r} {d}.{r} {b}{prov}{r} {d}. Quota: {qs}{r}",
-            ms = model_short,
-            prov = provider,
-            qs = quota_str
+        // Info line: model · provider · quota
+        let info_line = format!(
+            "   {GREEN}{model}{r} {d}·{r} {b}{prov}{r} {d}· Quota:{r} {ORANGE}{qs}{r}",
+            model = model_short,
+            prov = provider_label,
+            qs = quota_str,
         );
-        lines.push(format!(
-            "  {b}|{r}  {model_info}{mpad}{b}|{r}{rpad}{b}|{r}",
-            mpad = " ".repeat(w_left.saturating_sub(brand::strip_ansi_len(&model_info) + 2)),
-            rpad = " ".repeat(w_right),
-        ));
+        let padded_info = pad_right(&info_line, w);
+        lines.push(format!("  {bd}{b}█{r}{padded_info}{bd}{b}█{r}"));
 
-        // CWD
-        let cwd_line = format!("{d}{cwd}{r}");
-        lines.push(format!(
-            "  {b}|{r}  {cwd_line}{cpad}{b}|{r}{rpad}{b}|{r}",
-            cpad = " ".repeat(w_left.saturating_sub(brand::strip_ansi_len(&cwd_line) + 2)),
-            rpad = " ".repeat(w_right),
-        ));
+        // CWD line
+        let cwd_line = format!("   {d}{cwd}{r}");
+        let padded_cwd = pad_right(&cwd_line, w);
+        lines.push(format!("  {bd}{b}█{r}{padded_cwd}{bd}{b}█{r}"));
 
         // Empty row
-        lines.push(format!(
-            "  {b}|{r}{ls}{b}|{r}{rs}{b}|{r}",
-            ls = " ".repeat(w_left),
-            rs = " ".repeat(w_right),
-        ));
+        lines.push(format!("  {bd}{b}█{r}{sp}{bd}{b}█{r}", sp = " ".repeat(w)));
 
         // Bottom border
-        lines.push(format!(
-            "  {b}+{left}+{right}+{r}",
-            left = "-".repeat(w_left),
-            right = "-".repeat(w_right),
-        ));
+        lines.push(format!("  {bd}{b}{bar}{r}", bar = "█".repeat(w + 2)));
 
         lines.join("\n")
     }

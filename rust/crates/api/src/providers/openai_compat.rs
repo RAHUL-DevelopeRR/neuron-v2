@@ -438,6 +438,8 @@ impl OpenAiSseParser {
 struct StreamState {
     model: String,
     message_started: bool,
+    thinking_started: bool,
+    thinking_closed: bool,
     text_started: bool,
     text_finished: bool,
     finished: bool,
@@ -451,6 +453,8 @@ impl StreamState {
         Self {
             model,
             message_started: false,
+            thinking_started: false,
+            thinking_closed: false,
             text_started: false,
             text_finished: false,
             finished: false,
@@ -494,23 +498,45 @@ impl StreamState {
         }
 
         for choice in chunk.choices {
-            let content = choice
-                .delta
-                .content
-                .or(choice.delta.reasoning_content)
-                .filter(|value| !value.is_empty());
+            // Handle reasoning_content separately — render as thinking (greyed/indented)
+            if let Some(reasoning) = choice.delta.reasoning_content.filter(|v| !v.is_empty()) {
+                if !self.thinking_started {
+                    self.thinking_started = true;
+                    events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                        index: 0,
+                        content_block: OutputContentBlock::Thinking {
+                            thinking: String::new(),
+                            signature: None,
+                        },
+                    }));
+                }
+                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                    index: 0,
+                    delta: ContentBlockDelta::ThinkingDelta { thinking: reasoning },
+                }));
+            }
+
+            // Handle actual content — render as normal text
+            let content = choice.delta.content.filter(|value| !value.is_empty());
             if let Some(content) = content {
+                // Close thinking block if transitioning from thinking to text
+                if self.thinking_started && !self.thinking_closed {
+                    self.thinking_closed = true;
+                    events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                        index: 0,
+                    }));
+                }
                 if !self.text_started {
                     self.text_started = true;
                     events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
-                        index: 0,
+                        index: 1,
                         content_block: OutputContentBlock::Text {
                             text: String::new(),
                         },
                     }));
                 }
                 events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-                    index: 0,
+                    index: 1,
                     delta: ContentBlockDelta::TextDelta { text: content },
                 }));
             }
@@ -804,7 +830,18 @@ pub fn is_reasoning_model(model: &str) -> bool {
 /// Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
 /// The prefix is used only to select transport; the backend expects the
 /// bare model id.
+///
+/// **Exception**: OpenRouter-style model IDs like `qwen/qwen3-coder:free`
+/// use the `provider/model` format as the actual identifier. We detect these
+/// by the presence of `:free`, `:beta`, or `:extended` suffixes and preserve
+/// the full model string so OpenRouter receives the correct model ID.
 fn strip_routing_prefix(model: &str) -> &str {
+    // OpenRouter model IDs use "provider/model:tag" format where the full
+    // string IS the model ID (e.g. "qwen/qwen3-coder:free").
+    // Never strip these — OpenRouter rejects the bare model name without prefix.
+    if model.ends_with(":free") || model.ends_with(":beta") || model.ends_with(":extended") {
+        return model;
+    }
     if let Some(pos) = model.find('/') {
         let prefix = &model[..pos];
         // Only strip if the prefix before "/" is a known routing prefix,
@@ -1335,6 +1372,14 @@ fn chat_completions_endpoint(base_url: &str) -> String {
     let trimmed = base_url.trim_end_matches('/');
     if trimmed.ends_with("/chat/completions") {
         trimmed.to_string()
+    } else if trimmed.contains("localhost:19284/auth/azure") {
+        // NeuronCLI auth server proxy — route to /auth/azure/proxy
+        "http://localhost:19284/auth/azure/proxy".to_string()
+    } else if trimmed.contains("services.ai.azure.com")
+        || trimmed.contains("inference.ai.azure.com")
+    {
+        // Azure AI Foundry MaaS uses /models/chat/completions path
+        format!("{trimmed}/models/chat/completions?api-version=2024-05-01-preview")
     } else {
         format!("{trimmed}/chat/completions")
     }

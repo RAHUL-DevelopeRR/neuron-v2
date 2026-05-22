@@ -1,0 +1,8 @@
+{
+  "$schema": "./neuron-schema.json",
+  "lsp": {
+    "gopls": {
+      "command": "gopls"
+    }
+  }
+}
