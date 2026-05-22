@@ -21,7 +21,7 @@ pub fn resolve_provider(requested_model: &str) -> (String, String, String, &'sta
     if !quota.is_azure_exhausted() {
         if let Some(session) = try_auth_server_session() {
             let gateway_base = env::var("NEURON_GATEWAY_URL")
-                .unwrap_or_else(|_| "http://localhost:19284".to_string());
+                .unwrap_or_else(|_| "https://api.zero-x.live".to_string());
             let model =
                 env::var("AZURE_OPENAI_MODEL").unwrap_or_else(|_| "Kimi-K2.5".to_string());
             eprintln!(
@@ -149,7 +149,7 @@ pub fn azure_api_probe(api_key: &str, base_url: &str) -> bool {
 fn try_auth_server_session() -> Option<String> {
     // Gateway server URL — localhost for dev, zero-x.live for production
     let gateway_base = env::var("NEURON_GATEWAY_URL")
-        .unwrap_or_else(|_| "http://localhost:19284".to_string());
+        .unwrap_or_else(|_| "https://api.zero-x.live".to_string());
 
     // Check for cached session token first
     let session_path = dirs::home_dir()

@@ -257,7 +257,7 @@ func setProviderDefaults() {
 	// ═══════════════════════════════════════════════════════
 	gatewayURL := os.Getenv("NEURON_GATEWAY_URL")
 	if gatewayURL == "" {
-		gatewayURL = "https://zero-x.live/neuroncli/auth"
+		gatewayURL = "https://api.zero-x.live"
 	}
 	_ = gatewayURL // used by provider at runtime
 	// Always set Neuron provider as available — the gateway holds the keys

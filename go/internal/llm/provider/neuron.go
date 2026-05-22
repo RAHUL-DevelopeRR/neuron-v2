@@ -33,9 +33,8 @@ type NeuronClient struct {
 func newNeuronClient(opts providerClientOptions) *NeuronClient {
 	gatewayURL := os.Getenv("NEURON_GATEWAY_URL")
 	if gatewayURL == "" {
-		// Default: localhost for dev (same machine as server.js)
-		// For production zero-x.live, set NEURON_GATEWAY_URL=https://zero-x.live/neuroncli
-		gatewayURL = "http://localhost:19284"
+		// Default: production Cloudflare Worker gateway
+		gatewayURL = "https://api.zero-x.live"
 	}
 
 	client := &NeuronClient{

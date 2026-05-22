@@ -51,7 +51,7 @@ type ModelResponse struct {
 func gatewayURL() string {
 	url := os.Getenv("NEURON_GATEWAY_URL")
 	if url == "" {
-		url = "https://zero-x.live/neuroncli/auth"
+		url = "https://api.zero-x.live"
 	}
 	return url
 }
