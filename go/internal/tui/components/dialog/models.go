@@ -126,6 +126,9 @@ func (m *modelDialogCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.switchProvider(1)
 			}
 		case key.Matches(msg, modelKeys.Enter):
+			if len(m.models) == 0 {
+				return m, util.CmdHandler(CloseModelDialogMsg{})
+			}
 			util.ReportInfo(fmt.Sprintf("selected model: %s", m.models[m.selectedIdx].Name))
 			return m, util.CmdHandler(ModelSelectedMsg{Model: m.models[m.selectedIdx]})
 		case key.Matches(msg, modelKeys.Escape):
@@ -141,6 +144,9 @@ func (m *modelDialogCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // moveSelectionUp moves the selection up or wraps to bottom
 func (m *modelDialogCmp) moveSelectionUp() {
+	if len(m.models) == 0 {
+		return
+	}
 	if m.selectedIdx > 0 {
 		m.selectedIdx--
 	} else {
@@ -156,6 +162,9 @@ func (m *modelDialogCmp) moveSelectionUp() {
 
 // moveSelectionDown moves the selection down or wraps to top
 func (m *modelDialogCmp) moveSelectionDown() {
+	if len(m.models) == 0 {
+		return
+	}
 	if m.selectedIdx < len(m.models)-1 {
 		m.selectedIdx++
 	} else {
@@ -188,6 +197,13 @@ func (m *modelDialogCmp) switchProvider(offset int) {
 func (m *modelDialogCmp) View() string {
 	t := theme.CurrentTheme()
 	baseStyle := styles.BaseStyle()
+	if len(m.models) == 0 {
+		return baseStyle.Padding(1, 2).
+			Border(lipgloss.RoundedBorder()).
+			BorderBackground(t.Background()).
+			BorderForeground(t.TextMuted()).
+			Render("No models available")
+	}
 
 	// Capitalize first letter of provider name
 	providerName := strings.ToUpper(string(m.provider)[:1]) + string(m.provider[1:])
@@ -272,10 +288,17 @@ func (m *modelDialogCmp) setupModels() {
 	cfg := config.Get()
 	modelInfo := GetSelectedModel(cfg)
 	m.availableProviders = getEnabledProviders(cfg)
+	if len(m.availableProviders) == 0 {
+		m.availableProviders = []models.ModelProvider{models.ProviderNeuron}
+	}
 	m.hScrollPossible = len(m.availableProviders) > 1
 
 	m.provider = modelInfo.Provider
 	m.hScrollOffset = findProviderIndex(m.availableProviders, m.provider)
+	if m.hScrollOffset < 0 {
+		m.hScrollOffset = 0
+		m.provider = m.availableProviders[0]
+	}
 
 	m.setupModelsForProvider(m.provider)
 }
@@ -284,7 +307,10 @@ func GetSelectedModel(cfg *config.Config) models.Model {
 
 	agentCfg := cfg.Agents[config.AgentCoder]
 	selectedModelId := agentCfg.Model
-	return models.SupportedModels[selectedModelId]
+	if model, ok := models.SupportedModels[selectedModelId]; ok {
+		return model
+	}
+	return models.SupportedModels[models.NeuronKimiK25]
 }
 
 func getEnabledProviders(cfg *config.Config) []models.ModelProvider {
@@ -333,7 +359,7 @@ func (m *modelDialogCmp) setupModelsForProvider(provider models.ModelProvider) {
 	m.scrollOffset = 0
 
 	// Try to select the current model if it belongs to this provider
-	if provider == models.SupportedModels[selectedModelId].Provider {
+	if selectedModel, ok := models.SupportedModels[selectedModelId]; ok && provider == selectedModel.Provider {
 		for i, model := range m.models {
 			if model.ID == selectedModelId {
 				m.selectedIdx = i

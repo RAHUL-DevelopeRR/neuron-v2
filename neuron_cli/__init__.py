@@ -1,8 +1,9 @@
-"""NeuronCLI - Python shim for the Rust binary."""
+"""NeuronCLI - Python shim for the bundled native binary."""
 
 from __future__ import annotations
 
 import os
+import platform as _platform
 import subprocess
 import sys
 from pathlib import Path
@@ -12,9 +13,28 @@ def _find_binary() -> Path:
     """Locate the embedded neuron binary inside the installed package."""
     pkg_dir = Path(__file__).resolve().parent
     binary_name = "neuron.exe" if sys.platform == "win32" else "neuron"
-    candidate = pkg_dir / binary_name
-    if candidate.exists():
-        return candidate
+
+    platform_name = {
+        "win32": "windows",
+        "darwin": "darwin",
+        "linux": "linux",
+    }.get(sys.platform, sys.platform)
+    machine = _platform.machine().lower()
+    arch = {
+        "x86_64": "amd64",
+        "amd64": "amd64",
+        "aarch64": "arm64",
+        "arm64": "arm64",
+    }.get(machine, machine)
+    ext = ".exe" if sys.platform == "win32" else ""
+
+    candidates = [
+        pkg_dir / "bin" / f"neuron-{platform_name}-{arch}{ext}",
+        pkg_dir / binary_name,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
     # Fallback: search PATH (useful during development)
     for path_dir in os.get_exec_path():
         candidate = Path(path_dir) / binary_name
@@ -83,10 +103,10 @@ def _ensure_scripts_on_path() -> None:
 
 
 def main() -> None:
-    """Invoke the Rust neuron binary with forwarded argv."""
+    """Invoke the native neuron binary with forwarded argv."""
     _ensure_scripts_on_path()
     binary = _find_binary()
-    # Replace sys.argv[0] with the actual binary path so the Rust CLI
+    # Replace sys.argv[0] with the actual binary path so the native CLI
     # sees correct program name in --version / help text.
     args = [str(binary), *sys.argv[1:]]
     # os.execv on Windows does not reliably inherit console std streams,

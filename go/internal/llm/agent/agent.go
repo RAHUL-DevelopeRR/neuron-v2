@@ -220,7 +220,7 @@ func (a *agent) Run(ctx context.Context, sessionID string, content string, attac
 		if result.Error != nil && !errors.Is(result.Error, ErrRequestCancelled) && !errors.Is(result.Error, context.Canceled) {
 			logging.ErrorPersist(result.Error.Error())
 		}
-		logging.Debug("Request completed", "sessionID", sessionID)
+		logging.Info("Request completed", "sessionID", sessionID)
 		a.activeRequests.Delete(sessionID)
 		cancel()
 		a.Publish(pubsub.CreatedEvent, result)
@@ -453,22 +453,46 @@ func (a *agent) processEvent(ctx context.Context, sessionID string, assistantMsg
 	switch event.Type {
 	case provider.EventThinkingDelta:
 		assistantMsg.AppendReasoningContent(event.Content)
-		return a.messages.Update(ctx, *assistantMsg)
+		// Throttle DB writes — accumulate in memory, persist every 100ms
+		tm := time.Unix(assistantMsg.UpdatedAt, 0)
+		if time.Since(tm) > 100*time.Millisecond {
+			assistantMsg.UpdatedAt = time.Now().Unix()
+			return a.messages.Update(ctx, *assistantMsg)
+		}
 	case provider.EventContentDelta:
 		assistantMsg.AppendContent(event.Content)
-		return a.messages.Update(ctx, *assistantMsg)
+		// Throttle DB writes — accumulate in memory, persist every 100ms
+		tm := time.Unix(assistantMsg.UpdatedAt, 0)
+		if time.Since(tm) > 100*time.Millisecond {
+			assistantMsg.UpdatedAt = time.Now().Unix()
+			return a.messages.Update(ctx, *assistantMsg)
+		}
 	case provider.EventToolUseStart:
 		assistantMsg.AddToolCall(*event.ToolCall)
 		return a.messages.Update(ctx, *assistantMsg)
-	// TODO: see how to handle this
-	// case provider.EventToolUseDelta:
-	// 	tm := time.Unix(assistantMsg.UpdatedAt, 0)
-	// 	assistantMsg.AppendToolCallInput(event.ToolCall.ID, event.ToolCall.Input)
-	// 	if time.Since(tm) > 1000*time.Millisecond {
-	// 		err := a.messages.Update(ctx, *assistantMsg)
-	// 		assistantMsg.UpdatedAt = time.Now().Unix()
-	// 		return err
-	// 	}
+	case provider.EventToolUseDelta:
+		// Get tool call ID from event or from the last unfinished tool call
+		toolCallID := ""
+		inputDelta := event.Content
+		if event.ToolCall != nil {
+			toolCallID = event.ToolCall.ID
+			inputDelta = event.ToolCall.Input
+		} else {
+			// NeuronCLI provider sends Content only, no ToolCall pointer
+			for _, tc := range assistantMsg.ToolCalls() {
+				if !tc.Finished {
+					toolCallID = tc.ID
+				}
+			}
+		}
+		if toolCallID != "" && inputDelta != "" {
+			assistantMsg.AppendToolCallInput(toolCallID, inputDelta)
+			tm := time.Unix(assistantMsg.UpdatedAt, 0)
+			if time.Since(tm) > 500*time.Millisecond {
+				assistantMsg.UpdatedAt = time.Now().Unix()
+				return a.messages.Update(ctx, *assistantMsg)
+			}
+		}
 	case provider.EventToolUseStop:
 		assistantMsg.FinishToolCall(event.ToolCall.ID)
 		return a.messages.Update(ctx, *assistantMsg)

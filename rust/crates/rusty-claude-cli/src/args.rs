@@ -410,8 +410,13 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "system-prompt" => parse_system_prompt_args(&rest[1..], output_format),
         "acp" => parse_acp_args(&rest[1..], output_format),
         "auth" => parse_auth_args(&rest[1..], output_format),
-        "login" => Ok(CliAction::Auth { action: AuthAction::Login, output_format }),
-        "logout" => Err("logout is not needed. Use `neuron auth reset` to clear credentials.".to_string()),
+        "login" => Ok(CliAction::Auth {
+            action: AuthAction::Login,
+            output_format,
+        }),
+        "logout" => {
+            Err("logout is not needed. Use `neuron auth reset` to clear credentials.".to_string())
+        }
         "init" => Ok(CliAction::Init { output_format }),
         "export" => parse_export_args(&rest[1..], output_format),
         "prompt" => {
@@ -543,7 +548,10 @@ pub(crate) fn parse_auth_args(
             "unknown auth subcommand: `{other}`. Use `neuron auth status`, `neuron auth reset`, or `neuron auth login`."
         )),
     };
-    Ok(CliAction::Auth { action, output_format })
+    Ok(CliAction::Auth {
+        action,
+        output_format,
+    })
 }
 
 pub(crate) fn parse_acp_args(
@@ -771,14 +779,12 @@ pub(crate) fn resolve_model_alias(model: &str) -> &str {
         // ── Azure AI Foundry mode aliases (primary path) ──────────
         // Default: fast agentic coding with tool-calling
         "default" | "kimi" => "Kimi-K2.5",
-        // Power: strongest agentic reasoning (DeepSeek V4 Flash)
-        "power" | "deepseek" | "ds" => "DeepSeek-V4-Flash",
+        // Power/Fast: strongest quick agentic reasoning (DeepSeek V4 Flash)
+        "power" | "deepseek" | "ds" | "fast" | "flash" => "DeepSeek-V4-Flash",
         // Max: latest Kimi reasoning model
         "max" | "reasoning" | "kimi2.6" => "Kimi-K2.6",
         // Code: code-specialized DeepSeek
         "code" | "coder" | "deepseek-v3" => "FW-DeepSeek-V3.2",
-        // Fast: quick responses
-        "fast" | "flash" => "DeepSeek-V4-Flash",
         // MiniMax: alternate provider
         "minimax" | "mm" => "FW-MiniMax-M2.5",
         // Model Router: Azure's intelligent model selector

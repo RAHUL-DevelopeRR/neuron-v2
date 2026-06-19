@@ -6,13 +6,16 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/opencode-ai/opencode/internal/config"
 	"github.com/opencode-ai/opencode/internal/diff"
 	"github.com/opencode-ai/opencode/internal/history"
+	"github.com/opencode-ai/opencode/internal/message"
 	"github.com/opencode-ai/opencode/internal/pubsub"
 	"github.com/opencode-ai/opencode/internal/session"
+	"github.com/opencode-ai/opencode/internal/tui/components/terminal"
 	"github.com/opencode-ai/opencode/internal/tui/styles"
 	"github.com/opencode-ai/opencode/internal/tui/theme"
 )
@@ -21,42 +24,91 @@ type sidebarCmp struct {
 	width, height int
 	session       session.Session
 	history       history.Service
+	diffRatio     float64
 	modFiles      map[string]struct {
 		additions int
 		removals  int
 	}
+
+	// New panels
+	diffPanel     *diffPanelCmp
+	terminalPanel *terminalPanelCmp
+}
+
+type sidebarKeyMap struct {
+	DiffTaller     key.Binding
+	TerminalTaller key.Binding
+}
+
+var sidebarKeys = sidebarKeyMap{
+	DiffTaller: key.NewBinding(
+		key.WithKeys("ctrl+up"),
+		key.WithHelp("ctrl+up", "taller diff"),
+	),
+	TerminalTaller: key.NewBinding(
+		key.WithKeys("ctrl+down"),
+		key.WithHelp("ctrl+down", "taller terminal"),
+	),
 }
 
 func (m *sidebarCmp) Init() tea.Cmd {
-	if m.history != nil {
+	var cmds []tea.Cmd
+
+	// History subscription only makes sense when a session exists
+	if m.history != nil && m.session.ID != "" {
 		ctx := context.Background()
-		// Subscribe to file events
 		filesCh := m.history.Subscribe(ctx)
 
-		// Initialize the modified files map
 		m.modFiles = make(map[string]struct {
 			additions int
 			removals  int
 		})
 
-		// Load initial files and calculate diffs
 		m.loadModifiedFiles(ctx)
 
-		// Return a command that will send file events to the Update method
-		return func() tea.Msg {
+		if m.diffPanel != nil {
+			m.diffPanel.Init()
+		}
+
+		cmds = append(cmds, func() tea.Msg {
 			return <-filesCh
+		})
+	} else {
+		// Initialize modFiles map even without session
+		m.modFiles = make(map[string]struct {
+			additions int
+			removals  int
+		})
+		if m.diffPanel != nil {
+			m.diffPanel.Init()
 		}
 	}
-	return nil
+
+	return tea.Batch(cmds...)
 }
 
 func (m *sidebarCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case SessionSelectedMsg:
+		wasEmpty := m.session.ID == ""
 		if msg.ID != m.session.ID {
 			m.session = msg
 			ctx := context.Background()
 			m.loadModifiedFiles(ctx)
+			if m.diffPanel != nil {
+				m.diffPanel.sessionID = msg.ID
+				m.diffPanel.rebuildDiff(ctx)
+			}
+			// Start history subscription on first session assignment
+			if wasEmpty && m.history != nil {
+				filesCh := m.history.Subscribe(ctx)
+				return m, func() tea.Msg {
+					return <-filesCh
+				}
+			}
+		}
+		if m.terminalPanel != nil {
+			m.terminalPanel.Update(msg)
 		}
 	case pubsub.Event[session.Session]:
 		if msg.Type == pubsub.UpdatedEvent {
@@ -66,41 +118,168 @@ func (m *sidebarCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case pubsub.Event[history.File]:
 		if msg.Payload.SessionID == m.session.ID {
-			// Process the individual file change instead of reloading all files
 			ctx := context.Background()
 			m.processFileChanges(ctx, msg.Payload)
 
-			// Return a command to continue receiving events
+			if m.diffPanel != nil {
+				m.diffPanel.rebuildDiff(ctx)
+			}
+
 			return m, func() tea.Msg {
 				ctx := context.Background()
 				filesCh := m.history.Subscribe(ctx)
 				return <-filesCh
 			}
 		}
+	case terminal.TerminalOutputMsg:
+		if m.terminalPanel != nil {
+			_, cmd := m.terminalPanel.Update(msg)
+			return m, cmd
+		}
+	case terminal.TerminalClosedMsg:
+		if m.terminalPanel != nil {
+			_, cmd := m.terminalPanel.Update(msg)
+			return m, cmd
+		}
+	case terminal.TerminalFocusMsg:
+		if m.terminalPanel != nil {
+			_, cmd := m.terminalPanel.Update(msg)
+			return m, cmd
+		}
+	case terminal.TerminalRefreshMsg:
+		if m.terminalPanel != nil {
+			_, cmd := m.terminalPanel.Update(msg)
+			return m, cmd
+		}
+	case tea.MouseMsg:
+		switch msg.Type {
+		case tea.MouseWheelUp, tea.MouseWheelDown:
+			if m.mouseInTerminal(msg.Y) && m.terminalPanel != nil {
+				_, cmd := m.terminalPanel.Update(msg)
+				return m, cmd
+			}
+			if m.diffPanel != nil {
+				if msg.Type == tea.MouseWheelUp {
+					m.diffPanel.ScrollUp(3)
+				} else {
+					m.diffPanel.ScrollDown(3)
+				}
+			}
+		}
+	case tea.KeyMsg:
+		if key.Matches(msg, sidebarKeys.DiffTaller) {
+			m.resizeDiff(0.05)
+			return m, nil
+		}
+		if key.Matches(msg, sidebarKeys.TerminalTaller) {
+			m.resizeDiff(-0.05)
+			return m, nil
+		}
+		// When the terminal is focused, forward all keys to it
+		if m.terminalPanel != nil && m.terminalPanel.IsFocused() {
+			// Intercept [R] for refresh when terminal is focused but not typing
+			_, cmd := m.terminalPanel.Update(msg)
+			return m, cmd
+		}
+		if m.diffPanel != nil {
+			_, cmd := m.diffPanel.Update(msg)
+			return m, cmd
+		}
+	case pubsub.Event[message.Message]:
+		// Extract bash tool results and forward to terminal panel
+		if m.terminalPanel != nil && msg.Payload.Role == message.User {
+			for _, result := range msg.Payload.ToolResults() {
+				if result.Content != "" {
+					m.terminalPanel.AddOutput("", result.Content, result.IsError)
+				}
+			}
+		}
 	}
 	return m, nil
 }
 
+func (m *sidebarCmp) CapturesKeys() bool {
+	return m.terminalPanel != nil && m.terminalPanel.IsFocused()
+}
+
 func (m *sidebarCmp) View() string {
 	baseStyle := styles.BaseStyle()
+	t := theme.CurrentTheme()
 
-	return baseStyle.
-		Width(m.width).
-		PaddingLeft(4).
-		PaddingRight(2).
-		Height(m.height - 1).
-		Render(
-			lipgloss.JoinVertical(
-				lipgloss.Top,
-				header(m.width),
-				" ",
-				m.sessionSection(),
-				" ",
-				lspsConfigured(m.width),
-				" ",
-				m.modifiedFiles(),
-			),
-		)
+	contentWidth := max(1, m.width-6) // padding left 4 + right 2
+
+	// ── Section 1: Banner (Center alignment — same as splash screen) ──
+	bannerLogo := logo(contentWidth)
+	if m.height < 18 {
+		bannerLogo = logo(min(contentWidth, 33))
+	}
+	bannerSection := lipgloss.JoinVertical(
+		lipgloss.Center,
+		bannerLogo,
+		repo(contentWidth),
+		"",
+		cwd(contentWidth),
+	)
+	bannerHeight := lipgloss.Height(bannerSection)
+
+	// ── Horizontal divider ──
+	divider := baseStyle.
+		Width(contentWidth).
+		Foreground(t.TextMuted()).
+		Render(strings.Repeat("─", contentWidth))
+	dividerHeight := 1
+
+	// ── Remaining height for panels ──
+	remainingHeight := m.height - bannerHeight - (dividerHeight * 2) - 1
+	if remainingHeight < 4 {
+		remainingHeight = 4
+	}
+
+	diffHeight, termHeight := m.panelHeights(remainingHeight)
+
+	// ── Section 2: Diff View ──
+	var diffView string
+	if m.diffPanel != nil {
+		m.diffPanel.SetSize(contentWidth, diffHeight)
+		diffView = clipContent(m.diffPanel.View(), contentWidth, diffHeight)
+	} else {
+		diffView = baseStyle.
+			Width(contentWidth).
+			MaxWidth(contentWidth).
+			Height(diffHeight).
+			MaxHeight(diffHeight).
+			Foreground(t.TextMuted()).
+			Render("CHANGES\n  No file changes")
+	}
+
+	// ── Section 3: Terminal status ──
+	var termView string
+	if m.terminalPanel != nil {
+		m.terminalPanel.SetSize(contentWidth, termHeight)
+		termView = clipContent(m.terminalPanel.View(), contentWidth, termHeight)
+	} else {
+		termView = baseStyle.
+			Width(contentWidth).
+			MaxWidth(contentWidth).
+			Height(termHeight).
+			MaxHeight(termHeight).
+			Foreground(t.TextMuted()).
+			Render("Terminal\n  Waiting for commands...")
+	}
+
+	// ── Assemble using Place (not Width/Height) to protect banner ──
+	content := lipgloss.JoinVertical(
+		lipgloss.Top,
+		bannerSection,
+		divider,
+		diffView,
+		divider,
+		termView,
+	)
+
+	// Use PaddingLeft/Right via Place offset, not Width constraint
+	padded := baseStyle.PaddingLeft(4).PaddingRight(2).Render(content)
+	return lipgloss.Place(m.width, m.height, lipgloss.Left, lipgloss.Top, padded)
 }
 
 func (m *sidebarCmp) sessionSection() string {
@@ -235,10 +414,72 @@ func (m *sidebarCmp) GetSize() (int, int) {
 	return m.width, m.height
 }
 
+func (m *sidebarCmp) BindingKeys() []key.Binding {
+	return []key.Binding{
+		sidebarKeys.DiffTaller,
+		sidebarKeys.TerminalTaller,
+	}
+}
+
+func (m *sidebarCmp) resizeDiff(delta float64) {
+	m.diffRatio += delta
+	if m.diffRatio < 0.25 {
+		m.diffRatio = 0.25
+	}
+	if m.diffRatio > 0.80 {
+		m.diffRatio = 0.80
+	}
+}
+
+func (m *sidebarCmp) panelHeights(available int) (int, int) {
+	available = max(0, available)
+	if available == 0 {
+		return 0, 0
+	}
+	ratio := m.diffRatio
+	if ratio <= 0 {
+		ratio = 0.60
+	}
+	minDiff := 3
+	minTerm := 3
+	if available < minDiff+minTerm {
+		minTerm = min(2, max(0, available/3))
+		minDiff = max(0, available-minTerm)
+	}
+	diffHeight := int(float64(available) * ratio)
+	diffHeight = max(minDiff, min(diffHeight, available-minTerm))
+	return diffHeight, available - diffHeight
+}
+
+func (m *sidebarCmp) mouseInTerminal(y int) bool {
+	contentWidth := max(1, m.width-6)
+	bannerLogo := logo(contentWidth)
+	if m.height < 18 {
+		bannerLogo = logo(min(contentWidth, 33))
+	}
+	bannerSection := lipgloss.JoinVertical(
+		lipgloss.Center,
+		bannerLogo,
+		repo(contentWidth),
+		"",
+		cwd(contentWidth),
+	)
+	remainingHeight := m.height - lipgloss.Height(bannerSection) - 3
+	if remainingHeight < 4 {
+		remainingHeight = 4
+	}
+	diffHeight, _ := m.panelHeights(remainingHeight)
+	terminalStart := lipgloss.Height(bannerSection) + 2 + diffHeight
+	return y >= terminalStart
+}
+
 func NewSidebarCmp(session session.Session, history history.Service) tea.Model {
 	return &sidebarCmp{
-		session: session,
-		history: history,
+		session:       session,
+		history:       history,
+		diffRatio:     0.60,
+		diffPanel:     NewDiffPanel(session.ID, history),
+		terminalPanel: NewTerminalPanel(),
 	}
 }
 
@@ -375,4 +616,40 @@ func getDisplayPath(path string) string {
 	workingDir := config.WorkingDirectory()
 	displayPath := strings.TrimPrefix(path, workingDir)
 	return strings.TrimPrefix(displayPath, "/")
+}
+
+// clipContent clips a multi-line string to exactly cols visual width and rows
+// lines. Lines beyond rows are dropped. Lines wider than cols are truncated
+// rune-by-rune. If there are fewer lines than rows, empty lines are appended.
+// This prevents panels from overflowing their allocated region on resize.
+func clipContent(s string, cols, rows int) string {
+	if cols < 1 {
+		cols = 1
+	}
+	if rows < 1 {
+		rows = 1
+	}
+	lines := strings.Split(s, "\n")
+	result := make([]string, rows)
+	for i := 0; i < rows; i++ {
+		if i < len(lines) {
+			line := lines[i]
+			if lipgloss.Width(line) > cols {
+				runes := []rune(line)
+				w := 0
+				cut := len(runes)
+				for j, _ := range runes {
+					w++
+					if w > cols {
+						cut = j
+						break
+					}
+				}
+				result[i] = string(runes[:cut])
+			} else {
+				result[i] = line
+			}
+		}
+	}
+	return strings.Join(result, "\n")
 }

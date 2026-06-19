@@ -33,6 +33,7 @@ type keyMap struct {
 	Filepicker    key.Binding
 	Models        key.Binding
 	SwitchTheme   key.Binding
+	SwitchCWD     key.Binding
 }
 
 type startCompactSessionMsg struct{}
@@ -77,6 +78,11 @@ var keys = keyMap{
 	SwitchTheme: key.NewBinding(
 		key.WithKeys("ctrl+t"),
 		key.WithHelp("ctrl+t", "switch theme"),
+	),
+
+	SwitchCWD: key.NewBinding(
+		key.WithKeys("ctrl+g"),
+		key.WithHelp("ctrl+g", "switch directory"),
 	),
 }
 
@@ -136,8 +142,13 @@ type appModel struct {
 	showMultiArgumentsDialog bool
 	multiArgumentsDialog     dialog.MultiArgumentsDialogCmp
 
+	showCWDDialog bool
+	cwdDialog     dialog.CWDDialog
+
 	isCompacting      bool
 	compactingMessage string
+
+	showReasoning bool
 }
 
 func (a appModel) Init() tea.Cmd {
@@ -163,6 +174,10 @@ func (a appModel) Init() tea.Cmd {
 	cmds = append(cmds, cmd)
 	cmd = a.themeDialog.Init()
 	cmds = append(cmds, cmd)
+	if a.cwdDialog != nil {
+		cmd = a.cwdDialog.Init()
+		cmds = append(cmds, cmd)
+	}
 
 	// Check if we should show the init dialog
 	cmds = append(cmds, func() tea.Msg {
@@ -184,6 +199,10 @@ func (a appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		// Guard against minimize (0x0) or very small terminals
+		if msg.Width < 10 || msg.Height < 5 {
+			return a, nil // Skip rendering until terminal is restored
+		}
 		msg.Height -= 1 // Make space for the status bar
 		a.width, a.height = msg.Width, msg.Height
 
@@ -316,7 +335,9 @@ func (a appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Start the summarization process
 		return a, func() tea.Msg {
 			ctx := context.Background()
-			a.app.CoderAgent.Summarize(ctx, a.selectedSession.ID)
+			if a.app.CoderAgent != nil {
+				a.app.CoderAgent.Summarize(ctx, a.selectedSession.ID)
+			}
 			return nil
 		}
 
@@ -333,6 +354,9 @@ func (a appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.isCompacting = false
 			return a, util.ReportInfo("Session summarization complete")
 		} else if payload.Done && payload.Type == agent.AgentEventTypeResponse && a.selectedSession.ID != "" {
+			if a.app.CoderAgent == nil {
+				break
+			}
 			model := a.app.CoderAgent.Model()
 			contextWindow := model.ContextWindow
 			tokens := a.selectedSession.CompletionTokens + a.selectedSession.PromptTokens
@@ -359,6 +383,9 @@ func (a appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case dialog.ModelSelectedMsg:
 		a.showModelDialog = false
 
+		if a.app.CoderAgent == nil {
+			return a, util.ReportWarn("Agent is still initializing...")
+		}
 		model, err := a.app.CoderAgent.Update(config.AgentCoder, msg.Model.ID)
 		if err != nil {
 			return a, util.ReportError(err)
@@ -373,10 +400,8 @@ func (a appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case dialog.CloseInitDialogMsg:
 		a.showInitDialog = false
 		if msg.Initialize {
-			// Run the initialization command
 			for _, cmd := range a.commands {
 				if cmd.ID == "init" {
-					// Mark the project as initialized
 					if err := config.MarkProjectInitialized(); err != nil {
 						return a, util.ReportError(err)
 					}
@@ -384,12 +409,42 @@ func (a appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		} else {
-			// Mark the project as initialized without running the command
 			if err := config.MarkProjectInitialized(); err != nil {
 				return a, util.ReportError(err)
 			}
 		}
 		return a, nil
+
+	case dialog.ShowCWDDialogMsg:
+		a.cwdDialog = dialog.NewCWDDialogCmp()
+		a.showCWDDialog = true
+		return a, a.cwdDialog.Init()
+
+	case dialog.CloseCWDDialogMsg:
+		a.showCWDDialog = false
+		return a, nil
+
+	case dialog.SwitchCWDMsg:
+		a.showCWDDialog = false
+		if err := a.app.SwitchWorkingDirectory(context.Background(), msg.NewPath); err != nil {
+			return a, util.ReportError(err)
+		}
+
+		a.selectedSession = session.Session{}
+		a.status = core.NewStatusCmp(a.app.LSPClients)
+		a.pages[page.ChatPage] = page.NewChatPage(a.app)
+		a.loadedPages[page.ChatPage] = false
+		var cmds []tea.Cmd
+		if a.currentPage == page.ChatPage {
+			cmds = append(cmds, a.pages[page.ChatPage].Init())
+			a.loadedPages[page.ChatPage] = true
+			if sizable, ok := a.pages[page.ChatPage].(layout.Sizeable); ok {
+				cmds = append(cmds, sizable.SetSize(a.width, a.height))
+			}
+		}
+		cmds = append(cmds, a.status.Init())
+		cmds = append(cmds, util.ReportInfo("Switched workspace to: "+config.WorkingDirectory()))
+		return a, tea.Batch(cmds...)
 
 	case chat.SessionSelectedMsg:
 		a.selectedSession = msg
@@ -450,125 +505,134 @@ func (a appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return a, cmd
 		}
 
-		switch {
+		if !a.pageCapturesKeys() {
+			switch {
 
-		case key.Matches(msg, keys.Quit):
-			a.showQuit = !a.showQuit
-			if a.showHelp {
-				a.showHelp = false
-			}
-			if a.showSessionDialog {
-				a.showSessionDialog = false
-			}
-			if a.showCommandDialog {
-				a.showCommandDialog = false
-			}
-			if a.showFilepicker {
-				a.showFilepicker = false
-				a.filepicker.ToggleFilepicker(a.showFilepicker)
-			}
-			if a.showModelDialog {
-				a.showModelDialog = false
-			}
-			if a.showMultiArgumentsDialog {
-				a.showMultiArgumentsDialog = false
-			}
-			return a, nil
-		case key.Matches(msg, keys.SwitchSession):
-			if a.currentPage == page.ChatPage && !a.showQuit && !a.showPermissions && !a.showCommandDialog {
-				// Load sessions and show the dialog
-				sessions, err := a.app.Sessions.List(context.Background())
-				if err != nil {
-					return a, util.ReportError(err)
-				}
-				if len(sessions) == 0 {
-					return a, util.ReportWarn("No sessions available")
-				}
-				a.sessionDialog.SetSessions(sessions)
-				a.showSessionDialog = true
-				return a, nil
-			}
-			return a, nil
-		case key.Matches(msg, keys.Commands):
-			if a.currentPage == page.ChatPage && !a.showQuit && !a.showPermissions && !a.showSessionDialog && !a.showThemeDialog && !a.showFilepicker {
-				// Show commands dialog
-				if len(a.commands) == 0 {
-					return a, util.ReportWarn("No commands available")
-				}
-				a.commandDialog.SetCommands(a.commands)
-				a.showCommandDialog = true
-				return a, nil
-			}
-			return a, nil
-		case key.Matches(msg, keys.Models):
-			if a.showModelDialog {
-				a.showModelDialog = false
-				return a, nil
-			}
-			if a.currentPage == page.ChatPage && !a.showQuit && !a.showPermissions && !a.showSessionDialog && !a.showCommandDialog {
-				a.showModelDialog = true
-				return a, nil
-			}
-			return a, nil
-		case key.Matches(msg, keys.SwitchTheme):
-			if !a.showQuit && !a.showPermissions && !a.showSessionDialog && !a.showCommandDialog {
-				// Show theme switcher dialog
-				a.showThemeDialog = true
-				// Theme list is dynamically loaded by the dialog component
-				return a, a.themeDialog.Init()
-			}
-			return a, nil
-		case key.Matches(msg, returnKey) || key.Matches(msg):
-			if msg.String() == quitKey {
-				if a.currentPage == page.LogsPage {
-					return a, a.moveToPage(page.ChatPage)
-				}
-			} else if !a.filepicker.IsCWDFocused() {
-				if a.showQuit {
-					a.showQuit = !a.showQuit
-					return a, nil
-				}
+			case key.Matches(msg, keys.Quit):
+				a.showQuit = !a.showQuit
 				if a.showHelp {
-					a.showHelp = !a.showHelp
-					return a, nil
+					a.showHelp = false
 				}
-				if a.showInitDialog {
-					a.showInitDialog = false
-					// Mark the project as initialized without running the command
-					if err := config.MarkProjectInitialized(); err != nil {
-						return a, util.ReportError(err)
-					}
-					return a, nil
+				if a.showSessionDialog {
+					a.showSessionDialog = false
+				}
+				if a.showCommandDialog {
+					a.showCommandDialog = false
 				}
 				if a.showFilepicker {
 					a.showFilepicker = false
 					a.filepicker.ToggleFilepicker(a.showFilepicker)
+				}
+				if a.showModelDialog {
+					a.showModelDialog = false
+				}
+				if a.showMultiArgumentsDialog {
+					a.showMultiArgumentsDialog = false
+				}
+				return a, nil
+			case key.Matches(msg, keys.SwitchSession):
+				if a.currentPage == page.ChatPage && !a.showQuit && !a.showPermissions && !a.showCommandDialog {
+					// Load sessions and show the dialog
+					sessions, err := a.app.Sessions.List(context.Background())
+					if err != nil {
+						return a, util.ReportError(err)
+					}
+					if len(sessions) == 0 {
+						return a, util.ReportWarn("No sessions available")
+					}
+					a.sessionDialog.SetSessions(sessions)
+					a.showSessionDialog = true
 					return a, nil
 				}
-				if a.currentPage == page.LogsPage {
-					return a, a.moveToPage(page.ChatPage)
-				}
-			}
-		case key.Matches(msg, keys.Logs):
-			return a, a.moveToPage(page.LogsPage)
-		case key.Matches(msg, keys.Help):
-			if a.showQuit {
 				return a, nil
-			}
-			a.showHelp = !a.showHelp
-			return a, nil
-		case key.Matches(msg, helpEsc):
-			if a.app.CoderAgent.IsBusy() {
+			case key.Matches(msg, keys.Commands):
+				if a.currentPage == page.ChatPage && !a.showQuit && !a.showPermissions && !a.showSessionDialog && !a.showThemeDialog && !a.showFilepicker {
+					// Show commands dialog
+					if len(a.commands) == 0 {
+						return a, util.ReportWarn("No commands available")
+					}
+					a.commandDialog.SetCommands(a.commands)
+					a.showCommandDialog = true
+					return a, nil
+				}
+				return a, nil
+			case key.Matches(msg, keys.Models):
+				if a.showModelDialog {
+					a.showModelDialog = false
+					return a, nil
+				}
+				if a.currentPage == page.ChatPage && !a.showQuit && !a.showPermissions && !a.showSessionDialog && !a.showCommandDialog {
+					a.showModelDialog = true
+					return a, a.modelDialog.Init()
+				}
+				return a, nil
+			case key.Matches(msg, keys.SwitchTheme):
+				if !a.showQuit && !a.showPermissions && !a.showSessionDialog && !a.showCommandDialog {
+					// Show theme switcher dialog
+					a.showThemeDialog = true
+					// Theme list is dynamically loaded by the dialog component
+					return a, a.themeDialog.Init()
+				}
+				return a, nil
+			case key.Matches(msg, returnKey) || key.Matches(msg):
+				if msg.String() == quitKey {
+					if a.currentPage == page.LogsPage {
+						return a, a.moveToPage(page.ChatPage)
+					}
+				} else if !a.filepicker.IsCWDFocused() {
+					if a.showQuit {
+						a.showQuit = !a.showQuit
+						return a, nil
+					}
+					if a.showHelp {
+						a.showHelp = !a.showHelp
+						return a, nil
+					}
+					if a.showInitDialog {
+						a.showInitDialog = false
+						// Mark the project as initialized without running the command
+						if err := config.MarkProjectInitialized(); err != nil {
+							return a, util.ReportError(err)
+						}
+						return a, nil
+					}
+					if a.showFilepicker {
+						a.showFilepicker = false
+						a.filepicker.ToggleFilepicker(a.showFilepicker)
+						return a, nil
+					}
+					if a.currentPage == page.LogsPage {
+						return a, a.moveToPage(page.ChatPage)
+					}
+				}
+			case key.Matches(msg, keys.Logs):
+				return a, a.moveToPage(page.LogsPage)
+			case key.Matches(msg, keys.Help):
 				if a.showQuit {
 					return a, nil
 				}
 				a.showHelp = !a.showHelp
 				return a, nil
+			case key.Matches(msg, helpEsc):
+				if a.app.CoderAgent != nil && a.app.CoderAgent.IsBusy() {
+					if a.showQuit {
+						return a, nil
+					}
+					a.showHelp = !a.showHelp
+					return a, nil
+				}
+			case key.Matches(msg, keys.Filepicker):
+				a.showFilepicker = !a.showFilepicker
+				a.filepicker.ToggleFilepicker(a.showFilepicker)
+				return a, nil
+			case key.Matches(msg, keys.SwitchCWD):
+				if !a.showQuit && !a.showPermissions && !a.showCWDDialog {
+					a.cwdDialog = dialog.NewCWDDialogCmp()
+					a.showCWDDialog = true
+					return a, a.cwdDialog.Init()
+				}
+				return a, nil
 			}
-		case key.Matches(msg, keys.Filepicker):
-			a.showFilepicker = !a.showFilepicker
-			a.filepicker.ToggleFilepicker(a.showFilepicker)
-			return a, nil
 		}
 	default:
 		f, filepickerCmd := a.filepicker.Update(msg)
@@ -650,7 +714,15 @@ func (a appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		d, themeCmd := a.themeDialog.Update(msg)
 		a.themeDialog = d.(dialog.ThemeDialog)
 		cmds = append(cmds, themeCmd)
-		// Only block key messages send all other messages down
+		if _, ok := msg.(tea.KeyMsg); ok {
+			return a, tea.Batch(cmds...)
+		}
+	}
+
+	if a.showCWDDialog && a.cwdDialog != nil {
+		d, cwdCmd := a.cwdDialog.Update(msg)
+		a.cwdDialog = d.(dialog.CWDDialog)
+		cmds = append(cmds, cwdCmd)
 		if _, ok := msg.(tea.KeyMsg); ok {
 			return a, tea.Batch(cmds...)
 		}
@@ -677,8 +749,21 @@ func (a *appModel) findCommand(id string) (dialog.Command, bool) {
 	return dialog.Command{}, false
 }
 
+func (a *appModel) pageCapturesKeys() bool {
+	if a.showQuit || a.showPermissions || a.showHelp || a.showSessionDialog ||
+		a.showCommandDialog || a.showModelDialog || a.showInitDialog ||
+		a.showFilepicker || a.showThemeDialog || a.showMultiArgumentsDialog ||
+		a.showCWDDialog {
+		return false
+	}
+	if capturer, ok := a.pages[a.currentPage].(layout.KeyCapturer); ok {
+		return capturer.CapturesKeys()
+	}
+	return false
+}
+
 func (a *appModel) moveToPage(pageID page.PageID) tea.Cmd {
-	if a.app.CoderAgent.IsBusy() {
+	if a.app.CoderAgent != nil && a.app.CoderAgent.IsBusy() {
 		// For now we don't move to any page if the agent is busy
 		return util.ReportWarn("Agent is busy, please wait...")
 	}
@@ -775,7 +860,7 @@ func (a appModel) View() string {
 		if a.currentPage == page.LogsPage {
 			bindings = append(bindings, logsKeyReturnKey)
 		}
-		if !a.app.CoderAgent.IsBusy() {
+		if a.app.CoderAgent == nil || !a.app.CoderAgent.IsBusy() {
 			bindings = append(bindings, helpEsc)
 		}
 		a.help.SetBindings(bindings)
@@ -895,6 +980,21 @@ func (a appModel) View() string {
 		)
 	}
 
+	if a.showCWDDialog && a.cwdDialog != nil {
+		overlay := a.cwdDialog.View()
+		row := lipgloss.Height(appView) / 2
+		row -= lipgloss.Height(overlay) / 2
+		col := lipgloss.Width(appView) / 2
+		col -= lipgloss.Width(overlay) / 2
+		appView = layout.PlaceOverlay(
+			col,
+			row,
+			overlay,
+			appView,
+			true,
+		)
+	}
+
 	return appView
 }
 
@@ -912,8 +1012,10 @@ func New(app *app.App) tea.Model {
 		permissions:   dialog.NewPermissionDialogCmp(),
 		initDialog:    dialog.NewInitDialogCmp(),
 		themeDialog:   dialog.NewThemeDialogCmp(),
+		cwdDialog:     dialog.NewCWDDialogCmp(),
 		app:           app,
 		commands:      []dialog.Command{},
+		showReasoning: true,
 		pages: map[page.PageID]tea.Model{
 			page.ChatPage: page.NewChatPage(app),
 			page.LogsPage: page.NewLogsPage(),
@@ -957,8 +1059,8 @@ If there are Cursor rules (in .cursor/rules/ or .cursorrules) or Copilot rules (
 
 	model.RegisterCommand(dialog.Command{
 		ID:          "power",
-		Title:       "⚡ Power Mode",
-		Description: "Run 3 models in parallel (Kimi + DeepSeek + MiniMax) → merge best parts",
+		Title:       "Power Mode",
+		Description: "Run 3 models in parallel (Kimi + DeepSeek + MiniMax), then merge best parts",
 		Handler: func(cmd dialog.Command) tea.Cmd {
 			return util.CmdHandler(dialog.ShowMultiArgumentsDialogMsg{
 				CommandID: "power",
@@ -970,8 +1072,8 @@ If there are Cursor rules (in .cursor/rules/ or .cursorrules) or Copilot rules (
 
 	model.RegisterCommand(dialog.Command{
 		ID:          "chain",
-		Title:       "🔗 Chain Mode",
-		Description: "Pipeline: Architect (Kimi) → Coder (DeepSeek) → Reviewer (MiniMax)",
+		Title:       "Chain Mode",
+		Description: "Pipeline: Architect (Kimi), Coder (DeepSeek), Reviewer (MiniMax)",
 		Handler: func(cmd dialog.Command) tea.Cmd {
 			return util.CmdHandler(dialog.ShowMultiArgumentsDialogMsg{
 				CommandID: "chain",
@@ -983,7 +1085,7 @@ If there are Cursor rules (in .cursor/rules/ or .cursorrules) or Copilot rules (
 
 	model.RegisterCommand(dialog.Command{
 		ID:          "divide",
-		Title:       "📂 Divide Mode",
+		Title:       "Divide Mode",
 		Description: "Split task into per-file sub-agents with integration step",
 		Handler: func(cmd dialog.Command) tea.Cmd {
 			return util.CmdHandler(dialog.ShowMultiArgumentsDialogMsg{
@@ -991,6 +1093,29 @@ If there are Cursor rules (in .cursor/rules/ or .cursorrules) or Copilot rules (
 				Content:   "$task",
 				ArgNames:  []string{"task"},
 			})
+		},
+	})
+
+	model.RegisterCommand(dialog.Command{
+		ID:          "reasoning",
+		Title:       "Toggle Reasoning",
+		Description: "Show/hide model thinking process in chat",
+		Handler: func(cmd dialog.Command) tea.Cmd {
+			model.showReasoning = !model.showReasoning
+			state := "ON ✓"
+			if !model.showReasoning {
+				state = "OFF ✗"
+			}
+			return util.ReportInfo(fmt.Sprintf("Reasoning display: %s", state))
+		},
+	})
+
+	model.RegisterCommand(dialog.Command{
+		ID:          "cwd",
+		Title:       "Switch Working Directory",
+		Description: "Change the workspace directory (ctrl+g)",
+		Handler: func(cmd dialog.Command) tea.Cmd {
+			return util.CmdHandler(dialog.ShowCWDDialogMsg{})
 		},
 	})
 

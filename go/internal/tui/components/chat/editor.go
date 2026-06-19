@@ -16,6 +16,7 @@ import (
 	"github.com/opencode-ai/opencode/internal/logging"
 	"github.com/opencode-ai/opencode/internal/message"
 	"github.com/opencode-ai/opencode/internal/session"
+	"github.com/opencode-ai/opencode/internal/tui/clipboard"
 	"github.com/opencode-ai/opencode/internal/tui/components/dialog"
 	"github.com/opencode-ai/opencode/internal/tui/layout"
 	"github.com/opencode-ai/opencode/internal/tui/styles"
@@ -36,6 +37,7 @@ type editorCmp struct {
 type EditorKeyMaps struct {
 	Send       key.Binding
 	OpenEditor key.Binding
+	PasteImage key.Binding
 }
 
 type bluredEditorKeyMaps struct {
@@ -57,6 +59,10 @@ var editorMaps = EditorKeyMaps{
 	OpenEditor: key.NewBinding(
 		key.WithKeys("ctrl+e"),
 		key.WithHelp("ctrl+e", "open editor"),
+	),
+	PasteImage: key.NewBinding(
+		key.WithKeys("ctrl+y"),
+		key.WithHelp("ctrl+y", "paste image"),
 	),
 }
 
@@ -120,7 +126,7 @@ func (m *editorCmp) Init() tea.Cmd {
 }
 
 func (m *editorCmp) send() tea.Cmd {
-	if m.app.CoderAgent.IsSessionBusy(m.session.ID) {
+	if m.app.CoderAgent != nil && m.app.CoderAgent.IsSessionBusy(m.session.ID) {
 		return util.ReportWarn("Agent is working, please wait...")
 	}
 
@@ -162,6 +168,13 @@ func (m *editorCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 		m.attachments = append(m.attachments, msg.Attachment)
+	case EditorFocusMsg:
+		if bool(msg) {
+			m.textarea.Focus()
+		} else {
+			m.textarea.Blur()
+		}
+		return m, nil
 	case tea.KeyMsg:
 		if key.Matches(msg, DeleteKeyMaps.AttachmentDeleteMode) {
 			m.deleteMode = true
@@ -189,10 +202,16 @@ func (m *editorCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if key.Matches(msg, editorMaps.OpenEditor) {
-			if m.app.CoderAgent.IsSessionBusy(m.session.ID) {
+			if m.app.CoderAgent != nil && m.app.CoderAgent.IsSessionBusy(m.session.ID) {
 				return m, util.ReportWarn("Agent is working, please wait...")
 			}
 			return m, m.openEditor()
+		}
+		if key.Matches(msg, editorMaps.PasteImage) {
+			if len(m.attachments) >= maxAttachments {
+				return m, util.ReportWarn(fmt.Sprintf("cannot add more than %d images", maxAttachments))
+			}
+			return m, pasteClipboardImage()
 		}
 		if key.Matches(msg, DeleteKeyMaps.Escape) {
 			m.deleteMode = false
@@ -214,6 +233,16 @@ func (m *editorCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	m.textarea, cmd = m.textarea.Update(msg)
 	return m, cmd
+}
+
+func pasteClipboardImage() tea.Cmd {
+	return func() tea.Msg {
+		attachment, err := clipboard.ReadImageAttachment()
+		if err != nil {
+			return util.InfoMsg{Type: util.InfoTypeWarn, Msg: err.Error()}
+		}
+		return dialog.AttachmentAddedMsg{Attachment: attachment}
+	}
 }
 
 func (m *editorCmp) View() string {
@@ -239,9 +268,8 @@ func (m *editorCmp) View() string {
 func (m *editorCmp) SetSize(width, height int) tea.Cmd {
 	m.width = width
 	m.height = height
-	m.textarea.SetWidth(width - 3) // account for the prompt and padding right
-	m.textarea.SetHeight(height)
-	m.textarea.SetWidth(width)
+	m.textarea.SetWidth(max(1, width-3)) // account for the prompt and padding right
+	m.textarea.SetHeight(max(1, height))
 	return nil
 }
 

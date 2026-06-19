@@ -84,99 +84,156 @@ Models are served through the NeuronCLI Gateway (zero-x.live) — no API keys ne
 			}
 			cwd = c
 		}
-		_, err := config.Load(cwd, debug)
-		if err != nil {
-			return err
+
+		// Non-interactive mode: sequential init (must complete before output)
+		if prompt != "" {
+			_, err := config.Load(cwd, debug)
+			if err != nil {
+				return err
+			}
+			conn, err := db.Connect()
+			if err != nil {
+				return err
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			application, err := app.New(ctx, conn)
+			if err != nil {
+				return err
+			}
+			defer application.Shutdown()
+			// Agent is created async — wait for it in non-interactive mode
+			if err := application.WaitForAgent(); err != nil {
+				return fmt.Errorf("agent initialization failed: %w", err)
+			}
+			initMCPTools(ctx, application)
+			return application.RunNonInteractive(ctx, prompt, outputFormat, quiet)
 		}
 
-		// Connect DB, this will also run migrations
-		conn, err := db.Connect()
-		if err != nil {
-			return err
-		}
+		// ━━━ Interactive mode: show TUI FIRST, init in background ━━━
+		zone.NewGlobal()
+		program := tea.NewProgram(
+			tui.NewLazy(cwd, debug),
+			tea.WithAltScreen(),
+			tea.WithMouseCellMotion(),
+		)
 
-		// Create main context for the application
+		// Background initialization — TUI is already rendering
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		app, err := app.New(ctx, conn)
-		if err != nil {
-			logging.Error("Failed to create app: %v", err)
-			return err
-		}
-		// Defer shutdown here so it runs for both interactive and non-interactive modes
-		defer app.Shutdown()
-
-		// Initialize MCP tools early for both modes
-		initMCPTools(ctx, app)
-
-		// Non-interactive mode
-		if prompt != "" {
-			// Run non-interactive flow using the App method
-			return app.RunNonInteractive(ctx, prompt, outputFormat, quiet)
-		}
-
-		// Interactive mode
-		// Set up the TUI
-		zone.NewGlobal()
-		program := tea.NewProgram(
-			tui.New(app),
-			tea.WithAltScreen(),
-		)
-
-		// Setup the subscriptions, this will send services events to the TUI
-		ch, cancelSubs := setupSubscriptions(app, ctx)
-
-		// Create a context for the TUI message handler
-		tuiCtx, tuiCancel := context.WithCancel(ctx)
+		var application *app.App
+		var cancelSubs func()
+		var tuiCancel context.CancelFunc
 		var tuiWg sync.WaitGroup
-		tuiWg.Add(1)
 
-		// Set up message handling for the TUI
 		go func() {
-			defer tuiWg.Done()
-			defer logging.RecoverPanic("TUI-message-handler", func() {
+			defer logging.RecoverPanic("background-init", func() {
 				attemptTUIRecovery(program)
 			})
 
-			for {
-				select {
-				case <-tuiCtx.Done():
-					logging.Info("TUI message handler shutting down")
-					return
-				case msg, ok := <-ch:
-					if !ok {
-						logging.Info("TUI message channel closed")
-						return
-					}
-					program.Send(msg)
-				}
+			initStart := time.Now()
+			totalSteps := 5
+
+			// Step 1: Config
+			program.Send(tui.InitProgressMsg{Step: 1, Total: totalSteps, Message: "Loading configuration..."})
+			stepStart := time.Now()
+			logging.Info("Background init: loading config...")
+			_, err := config.Load(cwd, debug)
+			if err != nil {
+				program.Send(tui.InitErrorMsg{Err: err})
+				return
 			}
+			logging.Info("Background init: config loaded", "step_ms", time.Since(stepStart).Milliseconds(), "total_ms", time.Since(initStart).Milliseconds())
+
+			// Step 2: Database
+			program.Send(tui.InitProgressMsg{Step: 2, Total: totalSteps, Message: "Connecting to database..."})
+			stepStart = time.Now()
+			logging.Info("Background init: connecting to database...")
+			conn, err := db.Connect()
+			if err != nil {
+				program.Send(tui.InitErrorMsg{Err: err})
+				return
+			}
+			logging.Info("Background init: database connected", "step_ms", time.Since(stepStart).Milliseconds(), "total_ms", time.Since(initStart).Milliseconds())
+
+			// Step 3: App creation (includes LSP goroutine launch + agent creation)
+			program.Send(tui.InitProgressMsg{Step: 3, Total: totalSteps, Message: "Creating app & agent..."})
+			stepStart = time.Now()
+			logging.Info("Background init: creating app...")
+			var appErr error
+			application, appErr = app.New(ctx, conn)
+			if appErr != nil {
+				program.Send(tui.InitErrorMsg{Err: appErr})
+				return
+			}
+			logging.Info("Background init: app created", "step_ms", time.Since(stepStart).Milliseconds(), "total_ms", time.Since(initStart).Milliseconds())
+
+			// Step 4: MCP tools (non-blocking)
+			program.Send(tui.InitProgressMsg{Step: 4, Total: totalSteps, Message: "Starting MCP tools..."})
+			stepStart = time.Now()
+			initMCPTools(ctx, application)
+			logging.Info("Background init: MCP tools started", "step_ms", time.Since(stepStart).Milliseconds(), "total_ms", time.Since(initStart).Milliseconds())
+
+			// Step 5: Subscriptions
+			program.Send(tui.InitProgressMsg{Step: 5, Total: totalSteps, Message: "Wiring event subscriptions..."})
+			stepStart = time.Now()
+			var ch <-chan tea.Msg
+			ch, cancelSubs = setupSubscriptions(application, ctx)
+
+			tuiCtx, tc := context.WithCancel(ctx)
+			tuiCancel = tc
+			tuiWg.Add(1)
+
+			go func() {
+				defer tuiWg.Done()
+				defer logging.RecoverPanic("TUI-message-handler", func() {
+					attemptTUIRecovery(program)
+				})
+				for {
+					select {
+					case <-tuiCtx.Done():
+						return
+					case msg, ok := <-ch:
+						if !ok {
+							return
+						}
+						program.Send(msg)
+					}
+				}
+			}()
+			logging.Info("Background init: subscriptions wired", "step_ms", time.Since(stepStart).Milliseconds(), "total_ms", time.Since(initStart).Milliseconds())
+
+			logging.Info("Background init: COMPLETE", "total_ms", time.Since(initStart).Milliseconds())
+
+			// Tell TUI that app is ready
+			program.Send(tui.AppReadyMsg{App: application})
 		}()
 
 		// Cleanup function for when the program exits
 		cleanup := func() {
-			// Shutdown the app
-			app.Shutdown()
-
-			// Cancel subscriptions first
-			cancelSubs()
-
-			// Then cancel TUI message handler
-			tuiCancel()
-
-			// Wait for TUI message handler to finish
+			if application != nil {
+				application.Shutdown()
+			}
+			if cancelSubs != nil {
+				cancelSubs()
+			}
+			if tuiCancel != nil {
+				tuiCancel()
+			}
 			tuiWg.Wait()
-
-			logging.Info("All goroutines cleaned up")
 		}
 
-		// Run the TUI
+		// Run the TUI (appears IMMEDIATELY)
 		result, err := program.Run()
 		cleanup()
 
+		// Explicit terminal cleanup for Windows — prevents prompt overlap
+		fmt.Print("\033[?1049l") // Exit alt screen
+		fmt.Print("\033[H\033[2J") // Clear screen + reset cursor
+		fmt.Print("\033[?25h") // Show cursor
+
 		if err != nil {
-			logging.Error("TUI error: %v", err)
 			return fmt.Errorf("TUI error: %v", err)
 		}
 
@@ -258,7 +315,21 @@ func setupSubscriptions(app *app.App, parentCtx context.Context) (chan tea.Msg, 
 	setupSubscriber(ctx, &wg, "sessions", app.Sessions.Subscribe, ch)
 	setupSubscriber(ctx, &wg, "messages", app.Messages.Subscribe, ch)
 	setupSubscriber(ctx, &wg, "permissions", app.Permissions.Subscribe, ch)
-	setupSubscriber(ctx, &wg, "coderAgent", app.CoderAgent.Subscribe, ch)
+
+	// CoderAgent is created asynchronously — wait for it then subscribe
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer logging.RecoverPanic("subscription-coderAgent-deferred", nil)
+
+		// Wait for agent to be ready
+		if err := app.WaitForAgent(); err != nil {
+			logging.Error("CoderAgent init failed, skipping subscription", "error", err)
+			return
+		}
+		// Now safe to subscribe
+		setupSubscriber(ctx, &wg, "coderAgent", app.CoderAgent.Subscribe, ch)
+	}()
 
 	cleanupFunc := func() {
 		logging.Info("Cancelling all subscriptions")

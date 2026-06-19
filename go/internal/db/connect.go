@@ -64,5 +64,11 @@ func Connect() (*sql.DB, error) {
 		logging.Error("Failed to apply migrations", "error", err)
 		return nil, fmt.Errorf("failed to apply migrations: %w", err)
 	}
+
+	// Compact WAL to speed up future opens
+	if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		logging.Warn("WAL checkpoint failed", "error", err)
+	}
+
 	return db, nil
 }

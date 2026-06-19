@@ -165,27 +165,39 @@ func renderAssistantMessage(
 			)
 		}
 	}
-	if content != "" || (finished && finishData.Reason == message.FinishReasonEndTurn) {
-		if content == "" {
-			content = "*Finished without output*"
+
+	// Determine what text to render for this assistant message.
+	// Priority: content > thinking > streaming placeholder
+	displayContent := content
+	if displayContent == "" && thinking && thinkingContent != "" {
+		// Model is in thinking/reasoning phase — show reasoning with indicator
+		thinkingLabel := baseStyle.
+			Width(width - 1).
+			Foreground(t.TextMuted()).
+			Italic(true).
+			Render("💭 Reasoning...")
+		displayContent = thinkingContent
+		info = append([]string{thinkingLabel}, info...)
+	}
+
+	if displayContent != "" || (finished && finishData.Reason == message.FinishReasonEndTurn) {
+		if displayContent == "" {
+			displayContent = "✅ *Task completed — see tool results above*"
 		}
 		if isSummary {
 			info = append(info, baseStyle.Width(width-1).Foreground(t.TextMuted()).Render(" (summary)"))
 		}
 
-		content = renderMessage(content, false, true, width, info...)
+		renderedContent := renderMessage(displayContent, false, true, width, info...)
 		messages = append(messages, uiMessage{
 			ID:          msg.ID,
 			messageType: assistantMessageType,
 			position:    position,
-			height:      lipgloss.Height(content),
-			content:     content,
+			height:      lipgloss.Height(renderedContent),
+			content:     renderedContent,
 		})
 		position += messages[0].height
 		position++ // for the space
-	} else if thinking && thinkingContent != "" {
-		// Render the thinking content
-		content = renderMessage(thinkingContent, false, msg.ID == focusedUIMessageId, width)
 	}
 
 	for i, toolCall := range msg.ToolCalls() {
@@ -560,8 +572,11 @@ func renderToolMessage(
 		Render(fmt.Sprintf("%s: ", toolName(toolCall.Name)))
 
 	if !toolCall.Finished {
-		// Get a brief description of what the tool is doing
 		toolAction := getToolAction(toolCall.Name)
+		params := renderToolParams(width-2-lipgloss.Width(toolNameText), toolCall)
+		if strings.TrimSpace(params) != "" {
+			toolAction = params
+		}
 
 		progressText := baseStyle.
 			Width(width - 2 - lipgloss.Width(toolNameText)).

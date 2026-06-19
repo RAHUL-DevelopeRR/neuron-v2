@@ -35,7 +35,8 @@ func TestGetContextFromPaths(t *testing.T) {
 	createTestFiles(t, tmpDir, testFiles)
 
 	context := getContextFromPaths()
-	expectedContext := fmt.Sprintf("# From:%s/file.txt\nfile.txt: test content\n# From:%s/directory/file_a.txt\ndirectory/file_a.txt: test content\n# From:%s/directory/file_b.txt\ndirectory/file_b.txt: test content\n# From:%s/directory/file_c.txt\ndirectory/file_c.txt: test content", tmpDir, tmpDir, tmpDir, tmpDir)
+	slashTmpDir := filepath.ToSlash(tmpDir)
+	expectedContext := fmt.Sprintf("# From:%s/file.txt\nfile.txt: test content\n# From:%s/directory/file_a.txt\ndirectory/file_a.txt: test content\n# From:%s/directory/file_b.txt\ndirectory/file_b.txt: test content\n# From:%s/directory/file_c.txt\ndirectory/file_c.txt: test content", slashTmpDir, slashTmpDir, slashTmpDir, slashTmpDir)
 	assert.Equal(t, expectedContext, context)
 }
 

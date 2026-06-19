@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -231,13 +232,9 @@ func setDefaults(debug bool) {
 	viper.SetDefault("tui.theme", "neuron")
 	viper.SetDefault("autoCompact", true)
 
-	// Set default shell from environment or fallback to /bin/bash
-	shellPath := os.Getenv("SHELL")
-	if shellPath == "" {
-		shellPath = "/bin/bash"
-	}
+	shellPath, shellArgs := defaultShellConfig()
 	viper.SetDefault("shell.path", shellPath)
-	viper.SetDefault("shell.args", []string{"-l"})
+	viper.SetDefault("shell.args", shellArgs)
 
 	if debug {
 		viper.SetDefault("debug", true)
@@ -246,6 +243,30 @@ func setDefaults(debug bool) {
 		viper.SetDefault("debug", false)
 		viper.SetDefault("log.level", defaultLogLevel)
 	}
+}
+
+func defaultShellConfig() (string, []string) {
+	if shellPath := strings.TrimSpace(os.Getenv("NEURON_SHELL_PATH")); shellPath != "" {
+		return shellPath, strings.Fields(os.Getenv("NEURON_SHELL_ARGS"))
+	}
+
+	if runtime.GOOS == "windows" {
+		if ps, err := exec.LookPath("pwsh.exe"); err == nil {
+			return ps, []string{"-NoLogo"}
+		}
+		if ps, err := exec.LookPath("powershell.exe"); err == nil {
+			return ps, []string{"-NoLogo"}
+		}
+		if comspec := strings.TrimSpace(os.Getenv("COMSPEC")); comspec != "" {
+			return comspec, nil
+		}
+		return "cmd.exe", nil
+	}
+
+	if shellPath := strings.TrimSpace(os.Getenv("SHELL")); shellPath != "" {
+		return shellPath, []string{"-l"}
+	}
+	return "/bin/sh", nil
 }
 
 // setProviderDefaults configures LLM provider defaults based on provider provided by
@@ -299,6 +320,13 @@ func setProviderDefaults() {
 		if viper.GetString("providers.copilot.apiKey") == "" {
 			viper.Set("providers.copilot.apiKey", apiKey)
 		}
+	}
+
+	// NeuronCLI is gateway-first. Local BYOK credentials should make their
+	// providers available in the model switcher, but they should not silently
+	// replace the zero-x.live gateway default unless the user explicitly opts in.
+	if !strings.EqualFold(os.Getenv("NEURON_PREFER_BYOK"), "true") {
+		return
 	}
 
 	// Use this order to set the default models
@@ -924,6 +952,31 @@ func WorkingDirectory() string {
 		panic("config not loaded")
 	}
 	return cfg.WorkingDir
+}
+
+// SetWorkingDirectory updates the working directory at runtime.
+// Used when switching workspaces via the CWD dialog.
+func SetWorkingDirectory(dir string) error {
+	if cfg == nil {
+		panic("config not loaded")
+	}
+	cleaned := filepath.Clean(strings.Trim(strings.TrimSpace(dir), "\"'"))
+	if cleaned == "" || cleaned == "." {
+		return fmt.Errorf("working directory cannot be empty")
+	}
+	abs, err := filepath.Abs(cleaned)
+	if err != nil {
+		return fmt.Errorf("failed to resolve working directory: %w", err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return fmt.Errorf("failed to access working directory: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("working directory is not a directory: %s", abs)
+	}
+	cfg.WorkingDir = abs
+	return nil
 }
 
 func UpdateAgentModel(agentName AgentName, modelID models.ModelID) error {

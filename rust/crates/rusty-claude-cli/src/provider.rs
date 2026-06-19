@@ -22,20 +22,14 @@ pub fn resolve_provider(requested_model: &str) -> (String, String, String, &'sta
         if let Some(session) = try_auth_server_session() {
             let gateway_base = env::var("NEURON_GATEWAY_URL")
                 .unwrap_or_else(|_| "https://api.zero-x.live".to_string());
-            let model =
-                env::var("AZURE_OPENAI_MODEL").unwrap_or_else(|_| "Kimi-K2.5".to_string());
+            let model = env::var("AZURE_OPENAI_MODEL").unwrap_or_else(|_| "Kimi-K2.5".to_string());
             eprintln!(
                 "\x1b[32m\u{2713}\x1b[0m NeuronCLI Gateway \u{2192} {} \u{00b7} Quota: {}",
                 model,
                 quota.display_compact()
             );
             // Use the gateway's /v1 endpoint — openai_compat appends /chat/completions
-            return (
-                session,
-                format!("{}/v1", gateway_base),
-                model,
-                "azure",
-            );
+            return (session, format!("{}/v1", gateway_base), model, "azure");
         }
     }
 
@@ -95,8 +89,7 @@ pub fn resolve_provider(requested_model: &str) -> (String, String, String, &'sta
         return (
             openrouter_key,
             "https://openrouter.ai/api/v1".to_string(),
-            env::var("OPENROUTER_MODEL")
-                .unwrap_or_else(|_| "qwen/qwen3-coder:free".to_string()),
+            env::var("OPENROUTER_MODEL").unwrap_or_else(|_| "qwen/qwen3-coder:free".to_string()),
             "openrouter",
         );
     }
@@ -148,8 +141,8 @@ pub fn azure_api_probe(api_key: &str, base_url: &str) -> bool {
 /// Returns `None` if the server is unreachable (falls through to other providers).
 fn try_auth_server_session() -> Option<String> {
     // Gateway server URL — localhost for dev, zero-x.live for production
-    let gateway_base = env::var("NEURON_GATEWAY_URL")
-        .unwrap_or_else(|_| "https://api.zero-x.live".to_string());
+    let gateway_base =
+        env::var("NEURON_GATEWAY_URL").unwrap_or_else(|_| "https://api.zero-x.live".to_string());
 
     // Check for cached session token first
     let session_path = dirs::home_dir()
@@ -187,8 +180,12 @@ fn try_auth_server_session() -> Option<String> {
 
     let fingerprint = format!(
         "{}-{}",
-        env::var("USERNAME").or_else(|_| env::var("USER")).unwrap_or_else(|_| "unknown".into()),
-        env::var("COMPUTERNAME").or_else(|_| env::var("HOSTNAME")).unwrap_or_else(|_| "unknown".into())
+        env::var("USERNAME")
+            .or_else(|_| env::var("USER"))
+            .unwrap_or_else(|_| "unknown".into()),
+        env::var("COMPUTERNAME")
+            .or_else(|_| env::var("HOSTNAME"))
+            .unwrap_or_else(|_| "unknown".into())
     );
 
     let resp = client
@@ -211,7 +208,10 @@ fn try_auth_server_session() -> Option<String> {
     if let Some(parent) = session_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(&session_path, serde_json::to_string_pretty(&body).unwrap_or_default());
+    let _ = std::fs::write(
+        &session_path,
+        serde_json::to_string_pretty(&body).unwrap_or_default(),
+    );
 
     Some(token)
 }

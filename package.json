@@ -1,6 +1,6 @@
 {
   "name": "neuron-cli-app",
-  "version": "6.2.4",
+  "version": "6.2.5",
   "description": "NeuronCLI — AI coding agent. Rust engine + React/Ink TUI. Powered by Azure AI Foundry.",
   "private": false,
   "type": "module",
@@ -21,7 +21,9 @@
     "ui/react-tui/src/",
     "ui/react-tui/package.json",
     "ui/react-tui/tsconfig.json",
+    "neuron_cli/bin/",
     "neuron_cli/neuron.exe",
+    "neuron_cli/neuron",
     "README.md",
     "LICENSE"
   ],
@@ -57,8 +59,6 @@
     "tsx": "^4.19.2",
     "typescript": "^5.7.3"
   },
-  "os": ["win32"],
-  "cpu": ["x64"],
   "engines": {
     "node": ">=18.0.0"
   }

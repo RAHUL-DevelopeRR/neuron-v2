@@ -26,20 +26,79 @@ type SessionClearedMsg struct{}
 
 type EditorFocusMsg bool
 
-func header(width int) string {
-	return lipgloss.JoinVertical(
-		lipgloss.Top,
-		logo(width),
-		repo(width),
-		"",
-		cwd(width),
-	)
+// logo renders the original Neuron block banner.
+// Keep the glyphs as real UTF-8 block characters; the earlier broken header
+// came from mojibake literals, not from the brand mark itself.
+func logo(width int) string {
+	if width < 10 {
+		return ""
+	}
+
+	t := theme.CurrentTheme()
+	colors := []lipgloss.TerminalColor{
+		t.Primary(),
+		t.Secondary(),
+		t.Accent(),
+		t.Success(),
+		t.Warning(),
+		t.Info(),
+	}
+
+	if width < 34 {
+		var compact strings.Builder
+		for i, r := range "NEURON" {
+			style := lipgloss.NewStyle().Foreground(colors[i]).Bold(true)
+			compact.WriteString(style.Render(string(r)))
+		}
+		return compact.String()
+	}
+
+	letterSlices := []struct{ col0, col1, col2 string }{
+		{" █▄ █", " █ ██", " █  █"},
+		{" ████", " █▄▄ ", " ████"},
+		{" █  █", " █  █", " ▀██▀"},
+		{" ███▄", " █▀▀▄", " █  █"},
+		{" ▄██▄", " █  █", " ▀██▀"},
+		{" █▄ █", " █ ██", " █  █"},
+	}
+
+	var rows [3]string
+	for i, letter := range letterSlices {
+		style := lipgloss.NewStyle().Foreground(colors[i]).Bold(true)
+		rows[0] += style.Render(letter.col0)
+		rows[1] += style.Render(letter.col1)
+		rows[2] += style.Render(letter.col2)
+	}
+
+	return rows[0] + "\n" + rows[1] + "\n" + rows[2]
+}
+
+func repo(width int) string {
+	t := theme.CurrentTheme()
+	gatewayInfo := fmt.Sprintf("NeuronCLI %s  |  zero-x.live gateway", version.Version)
+
+	return styles.BaseStyle().
+		Foreground(t.TextMuted()).
+		Width(width).
+		Align(lipgloss.Center).
+		Render(gatewayInfo)
+}
+
+func cwd(width int) string {
+	cwdStr := fmt.Sprintf("cwd: %s", config.WorkingDirectory())
+	cwdStr = ansi.Truncate(cwdStr, width, "...")
+	t := theme.CurrentTheme()
+
+	return styles.BaseStyle().
+		Foreground(t.TextMuted()).
+		Width(width).
+		Render(cwdStr)
 }
 
 func lspsConfigured(width int) string {
 	cfg := config.Get()
 	title := "LSP Configuration"
-	title = ansi.Truncate(title, width, "…")
+	title = ansi.Truncate(title, width, "...")
 
 	t := theme.CurrentTheme()
 	baseStyle := styles.BaseStyle()
@@ -50,22 +109,24 @@ func lspsConfigured(width int) string {
 		Bold(true).
 		Render(title)
 
-	// Get LSP names and sort them for consistent ordering
 	var lspNames []string
 	for name := range cfg.LSP {
 		lspNames = append(lspNames, name)
 	}
 	sort.Strings(lspNames)
+	if len(lspNames) == 0 {
+		return ""
+	}
 
 	var lspViews []string
 	for _, name := range lspNames {
 		lsp := cfg.LSP[name]
 		lspName := baseStyle.
 			Foreground(t.Text()).
-			Render(fmt.Sprintf("• %s", name))
+			Render(fmt.Sprintf("  %s", name))
 
 		cmd := lsp.Command
-		cmd = ansi.Truncate(cmd, width-lipgloss.Width(lspName)-3, "…")
+		cmd = ansi.Truncate(cmd, width-lipgloss.Width(lspName)-3, "...")
 
 		lspPath := baseStyle.
 			Foreground(t.TextMuted()).
@@ -96,56 +157,4 @@ func lspsConfigured(width int) string {
 				),
 			),
 		)
-}
-
-// neuronBannerMultiColor renders NEURON in colored block characters using raw ANSI codes.
-// Bypasses lipgloss width calculation entirely because █ (U+2588) has ambiguous cell width
-// that lipgloss miscalculates, causing garbled rendering in Windows Terminal.
-// Colors: N=blue(#4169C3) E=red(#C83228) U=orange(#F0A028) R=orange(#F0A028) O=green(#2D8C3C) N=green(#2D8C3C)
-func neuronBannerMultiColor() string {
-	// Raw ANSI color codes (same as Rust brand.rs)
-	b := "\x1b[1;38;2;65;105;195m"  // blue bold
-	r := "\x1b[1;38;2;200;50;40m"   // red bold
-	o := "\x1b[1;38;2;240;160;40m"  // orange bold
-	g := "\x1b[1;38;2;45;140;60m"   // green bold
-	x := "\x1b[0m"                   // reset
-
-	// Each row is hand-built with per-letter colors embedded directly.
-	// Letters: N(blue) E(red) U(orange) R(orange) O(green) N(green)
-	// Using ▀▄ half-blocks for compact 3-row banner that avoids width issues.
-	rows := []string{
-		b + "█▄ █" + x + " " + r + "████" + x + " " + o + "█  █" + x + " " + o + "███▄" + x + " " + g + "▄██▄" + x + " " + g + "█▄ █" + x,
-		b + "█ ██" + x + " " + r + "█▄▄ " + x + " " + o + "█  █" + x + " " + o + "█▀▀▄" + x + " " + g + "█  █" + x + " " + g + "█ ██" + x,
-		b + "█  █" + x + " " + r + "████" + x + " " + o + "▀██▀" + x + " " + o + "█  █" + x + " " + g + "▀██▀" + x + " " + g + "█  █" + x,
-	}
-
-	return strings.Join(rows, "\n")
-}
-
-func logo(width int) string {
-	banner := neuronBannerMultiColor()
-	// Don't use lipgloss Width/Align for the banner — it miscalculates █/▀/▄ widths.
-	// Just return the raw ANSI banner as-is; the parent layout handles positioning.
-	return banner
-}
-
-func repo(width int) string {
-	t := theme.CurrentTheme()
-	gatewayInfo := fmt.Sprintf("%s NeuronCLI %s  •  zero-x.live gateway", styles.NeuronIcon, version.Version)
-
-	return styles.BaseStyle().
-		Foreground(t.TextMuted()).
-		Width(width).
-		Align(lipgloss.Center).
-		Render(gatewayInfo)
-}
-
-func cwd(width int) string {
-	cwd := fmt.Sprintf("cwd: %s", config.WorkingDirectory())
-	t := theme.CurrentTheme()
-
-	return styles.BaseStyle().
-		Foreground(t.TextMuted()).
-		Width(width).
-		Render(cwd)
 }

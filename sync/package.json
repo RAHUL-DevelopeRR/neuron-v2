@@ -1,0 +1,17 @@
+{
+  "name": "neuron-sync",
+  "version": "1.0.0",
+  "description": "Neuron Sync — Auth, persistent chat history, and cross-platform sync powered by Supabase",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.0"
+  },
+  "devDependencies": {
+    "vite": "^6.3.0"
+  }
+}

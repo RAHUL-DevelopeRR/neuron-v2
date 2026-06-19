@@ -9,7 +9,9 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/opencode-ai/opencode/internal/llm/models"
@@ -21,42 +23,99 @@ import (
 // NeuronCLI gateway provider — routes through zero-x.live auth server.
 // No API keys are stored or needed on the client. The gateway holds all secrets.
 
-type NeuronClient struct {
-	gatewayURL   string
-	sessionToken string
-	model        models.Model
-	maxTokens    int64
-	systemMsg    string
-	httpClient   *http.Client
+// Shared session cache — all NeuronClient instances share one session token.
+// The token is cached to disk and fetched asynchronously to avoid blocking TUI startup.
+var (
+	sharedSessionOnce  sync.Once
+	sharedSessionCh    = make(chan struct{}) // closed when session is ready
+	sharedSessionToken string
+	sharedGatewayURL   string
+)
+
+type sessionCache struct {
+	SessionToken string `json:"session_token"`
+	Token        string `json:"token,omitempty"`
+	UserID       string `json:"user_id,omitempty"`
+	Plan         string `json:"plan,omitempty"`
+	GatewayURL   string `json:"gateway_url,omitempty"`
+	Timestamp    int64  `json:"timestamp"`
+	ExpiresAt    int64  `json:"expires_at,omitempty"`
 }
 
-func newNeuronClient(opts providerClientOptions) *NeuronClient {
-	gatewayURL := os.Getenv("NEURON_GATEWAY_URL")
-	if gatewayURL == "" {
-		// Default: production Cloudflare Worker gateway
-		gatewayURL = "https://api.zero-x.live"
+func getSessionCachePath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".neuroncli", "session.json")
+}
+
+func getLegacySessionCachePath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".neuron", "session_cache.json")
+}
+
+func loadCachedSession() string {
+	for _, path := range []string{getSessionCachePath(), getLegacySessionCachePath()} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var cache sessionCache
+		if err := json.Unmarshal(data, &cache); err != nil {
+			continue
+		}
+		token := cache.SessionToken
+		if token == "" {
+			token = cache.Token
+		}
+		if token == "" {
+			continue
+		}
+		if cache.ExpiresAt > 0 && time.Now().Unix() > cache.ExpiresAt {
+			continue
+		}
+		if cache.ExpiresAt == 0 && time.Now().Unix()-cache.Timestamp > 12*60*60 {
+			continue
+		}
+		return token
 	}
-
-	client := &NeuronClient{
-		gatewayURL: gatewayURL,
-		model:      opts.model,
-		maxTokens:  opts.maxTokens,
-		systemMsg:  opts.systemMessage,
-		httpClient: &http.Client{Timeout: 120 * time.Second},
-	}
-
-	// Create session on initialization
-	client.createSession()
-	return client
+	return ""
 }
 
-type neuronSessionResponse struct {
-	SessionToken string   `json:"session_token"`
-	Models       []string `json:"models"`
-	Error        string   `json:"error"`
+func saveCachedSession(session neuronSessionResponse, gatewayURL string) {
+	cachePath := getSessionCachePath()
+	os.MkdirAll(filepath.Dir(cachePath), 0755)
+	data, _ := json.MarshalIndent(sessionCache{
+		SessionToken: session.SessionToken,
+		UserID:       session.UserID,
+		Plan:         session.Plan,
+		GatewayURL:   gatewayURL,
+		Timestamp:    time.Now().Unix(),
+		ExpiresAt:    session.ExpiresAt,
+	}, "", "  ")
+	os.WriteFile(cachePath, data, 0644)
 }
 
-func (c *NeuronClient) createSession() {
+// initSharedSession starts the async session fetch. Call once at startup.
+func initSharedSession(gatewayURL string) {
+	sharedSessionOnce.Do(func() {
+		sharedGatewayURL = gatewayURL
+
+		// Try disk cache first (instant, no network)
+		if cached := loadCachedSession(); cached != "" {
+			sharedSessionToken = cached
+			logging.Info("NeuronCLI session loaded from cache (instant)")
+			close(sharedSessionCh)
+			return
+		}
+
+		// Fetch async — don't block TUI rendering
+		go func() {
+			defer close(sharedSessionCh)
+			fetchGatewaySession(gatewayURL)
+		}()
+	})
+}
+
+func fetchGatewaySession(gatewayURL string) {
 	hostname, _ := os.Hostname()
 	fingerprint := fmt.Sprintf("%s-%s", os.Getenv("USERNAME"), hostname)
 	if fingerprint == "-" {
@@ -65,16 +124,17 @@ func (c *NeuronClient) createSession() {
 
 	body, _ := json.Marshal(map[string]string{
 		"machine_fingerprint": fingerprint,
-		"version":            "6.2.5",
+		"version":             "6.2.5",
 	})
 
-	resp, err := c.httpClient.Post(
-		c.gatewayURL+"/auth/session",
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Post(
+		gatewayURL+"/auth/session",
 		"application/json",
 		bytes.NewReader(body),
 	)
 	if err != nil {
-		logging.Warn("NeuronCLI gateway unreachable", "url", c.gatewayURL, "error", err)
+		logging.Warn("NeuronCLI gateway unreachable", "url", gatewayURL, "error", err)
 		return
 	}
 	defer resp.Body.Close()
@@ -86,13 +146,56 @@ func (c *NeuronClient) createSession() {
 	}
 
 	if session.SessionToken != "" {
-		c.sessionToken = session.SessionToken
+		sharedSessionToken = session.SessionToken
+		saveCachedSession(session, gatewayURL)
 		logging.Info("NeuronCLI gateway session created",
 			"token", session.SessionToken[:16]+"...",
 			"models", len(session.Models))
 	} else {
 		logging.Warn("Gateway returned no session token", "error", session.Error)
 	}
+}
+
+// waitForSession blocks until the async session fetch completes.
+// Called lazily on first send/stream, NOT during startup.
+func waitForSession() string {
+	<-sharedSessionCh
+	return sharedSessionToken
+}
+
+type NeuronClient struct {
+	gatewayURL string
+	model      models.Model
+	maxTokens  int64
+	systemMsg  string
+	httpClient *http.Client
+}
+
+func newNeuronClient(opts providerClientOptions) *NeuronClient {
+	gatewayURL := os.Getenv("NEURON_GATEWAY_URL")
+	if gatewayURL == "" {
+		gatewayURL = "https://api.zero-x.live"
+	}
+
+	// Start async session fetch (idempotent via sync.Once)
+	initSharedSession(gatewayURL)
+
+	return &NeuronClient{
+		gatewayURL: gatewayURL,
+		model:      opts.model,
+		maxTokens:  opts.maxTokens,
+		systemMsg:  opts.systemMessage,
+		httpClient: &http.Client{Timeout: 120 * time.Second},
+	}
+}
+
+type neuronSessionResponse struct {
+	SessionToken string   `json:"session_token"`
+	Models       []string `json:"models"`
+	UserID       string   `json:"user_id"`
+	Plan         string   `json:"plan"`
+	ExpiresAt    int64    `json:"expires_at"`
+	Error        string   `json:"error"`
 }
 
 // Converts our internal message format to OpenAI-compatible format for the gateway
@@ -108,25 +211,91 @@ func (c *NeuronClient) buildMessages(msgs []message.Message) []map[string]interf
 	}
 
 	for _, msg := range msgs {
-		role := "user"
-		if msg.Role == message.Assistant {
-			role = "assistant"
-		}
+		// Collect parts by type
+		var textParts []string
+		var binaryParts []message.BinaryContent
+		var toolCalls []message.ToolCall
+		var toolResults []message.ToolResult
 
-		// Build content from parts
-		var contentParts []string
 		for _, part := range msg.Parts {
 			switch p := part.(type) {
 			case message.TextContent:
-				contentParts = append(contentParts, p.Text)
+				textParts = append(textParts, p.Text)
+			case message.BinaryContent:
+				binaryParts = append(binaryParts, p)
+			case message.ToolCall:
+				toolCalls = append(toolCalls, p)
+			case message.ToolResult:
+				toolResults = append(toolResults, p)
 			}
 		}
 
-		if len(contentParts) > 0 {
-			result = append(result, map[string]interface{}{
-				"role":    role,
-				"content": strings.Join(contentParts, "\n"),
-			})
+		switch msg.Role {
+		case message.Assistant:
+			entry := map[string]interface{}{
+				"role": "assistant",
+			}
+			if len(textParts) > 0 {
+				entry["content"] = strings.Join(textParts, "\n")
+			}
+			if len(toolCalls) > 0 {
+				var tcList []map[string]interface{}
+				for _, tc := range toolCalls {
+					tcList = append(tcList, map[string]interface{}{
+						"id":   tc.ID,
+						"type": "function",
+						"function": map[string]interface{}{
+							"name":      tc.Name,
+							"arguments": tc.Input,
+						},
+					})
+				}
+				entry["tool_calls"] = tcList
+			}
+			result = append(result, entry)
+
+		case message.Tool:
+			// Each tool result must be a separate message with role=tool
+			for _, tr := range toolResults {
+				// Truncate large tool results to save tokens
+				content := tr.Content
+				if len(content) > 4000 {
+					content = content[:2000] + "\n\n... [truncated] ...\n\n" + content[len(content)-1000:]
+				}
+				result = append(result, map[string]interface{}{
+					"role":         "tool",
+					"tool_call_id": tr.ToolCallID,
+					"content":      content,
+				})
+			}
+
+		default: // user
+			if len(binaryParts) > 0 {
+				content := make([]map[string]interface{}, 0, len(binaryParts)+1)
+				if len(textParts) > 0 {
+					content = append(content, map[string]interface{}{
+						"type": "text",
+						"text": strings.Join(textParts, "\n"),
+					})
+				}
+				for _, binaryContent := range binaryParts {
+					content = append(content, map[string]interface{}{
+						"type": "image_url",
+						"image_url": map[string]interface{}{
+							"url": binaryContent.String(models.ProviderOpenAI),
+						},
+					})
+				}
+				result = append(result, map[string]interface{}{
+					"role":    "user",
+					"content": content,
+				})
+			} else if len(textParts) > 0 {
+				result = append(result, map[string]interface{}{
+					"role":    "user",
+					"content": strings.Join(textParts, "\n"),
+				})
+			}
 		}
 	}
 
@@ -142,7 +311,11 @@ func (c *NeuronClient) buildToolDefs(toolList []tools.BaseTool) []map[string]int
 			"function": map[string]interface{}{
 				"name":        info.Name,
 				"description": info.Description,
-				"parameters":  info.Parameters,
+				"parameters": map[string]interface{}{
+					"type":       "object",
+					"properties": info.Parameters,
+					"required":   info.Required,
+				},
 			},
 		}
 		defs = append(defs, def)
@@ -151,7 +324,9 @@ func (c *NeuronClient) buildToolDefs(toolList []tools.BaseTool) []map[string]int
 }
 
 func (c *NeuronClient) send(ctx context.Context, msgs []message.Message, toolList []tools.BaseTool) (*ProviderResponse, error) {
-	if c.sessionToken == "" {
+	// Lazy: wait for async session (instant if cached)
+	sessionToken := waitForSession()
+	if sessionToken == "" {
 		return nil, fmt.Errorf("no gateway session — is the NeuronCLI server running at %s?", c.gatewayURL)
 	}
 
@@ -170,7 +345,7 @@ func (c *NeuronClient) send(ctx context.Context, msgs []message.Message, toolLis
 		c.gatewayURL+"/v1/chat/completions",
 		bytes.NewReader(bodyBytes))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.sessionToken)
+	req.Header.Set("Authorization", "Bearer "+sessionToken)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -181,8 +356,9 @@ func (c *NeuronClient) send(ctx context.Context, msgs []message.Message, toolLis
 	var result struct {
 		Choices []struct {
 			Message struct {
-				Content   string `json:"content"`
-				ToolCalls []struct {
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
+				ToolCalls        []struct {
 					ID       string `json:"id"`
 					Function struct {
 						Name      string `json:"name"`
@@ -221,7 +397,11 @@ func (c *NeuronClient) send(ctx context.Context, msgs []message.Message, toolLis
 
 	if len(result.Choices) > 0 {
 		choice := result.Choices[0]
+		// Use content if available, fall back to reasoning_content for reasoning models
 		response.Content = choice.Message.Content
+		if response.Content == "" && choice.Message.ReasoningContent != "" {
+			response.Content = choice.Message.ReasoningContent
+		}
 
 		for _, tc := range choice.Message.ToolCalls {
 			response.ToolCalls = append(response.ToolCalls, message.ToolCall{
@@ -250,7 +430,9 @@ func (c *NeuronClient) stream(ctx context.Context, msgs []message.Message, toolL
 	go func() {
 		defer close(ch)
 
-		if c.sessionToken == "" {
+		// Lazy: wait for async session (instant if cached)
+		sessionToken := waitForSession()
+		if sessionToken == "" {
 			ch <- ProviderEvent{
 				Type:  EventError,
 				Error: fmt.Errorf("no gateway session — start the NeuronCLI server at %s", c.gatewayURL),
@@ -269,43 +451,106 @@ func (c *NeuronClient) stream(ctx context.Context, msgs []message.Message, toolL
 		}
 
 		bodyBytes, _ := json.Marshal(body)
-		req, _ := http.NewRequestWithContext(ctx, "POST",
-			c.gatewayURL+"/v1/chat/completions",
-			bytes.NewReader(bodyBytes))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+c.sessionToken)
-		req.Header.Set("Accept", "text/event-stream")
 
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			ch <- ProviderEvent{Type: EventError, Error: err}
-			return
+		// Retry loop for rate limits and transient errors
+		var resp *http.Response
+		for attempt := 0; attempt < 5; attempt++ {
+			bodyReader := bytes.NewReader(bodyBytes)
+			req, _ := http.NewRequestWithContext(ctx, "POST",
+				c.gatewayURL+"/v1/chat/completions",
+				bodyReader)
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+sessionToken)
+			req.Header.Set("Accept", "text/event-stream")
+
+			var err error
+			resp, err = c.httpClient.Do(req)
+			if err != nil {
+				ch <- ProviderEvent{Type: EventError, Error: err}
+				return
+			}
+
+			// Retry on 429 (rate limit)
+			if resp.StatusCode == 429 {
+				resp.Body.Close()
+				backoff := time.Duration(2<<uint(attempt)) * time.Second
+				logging.WarnPersist(fmt.Sprintf("Rate limited (429), retrying in %s... (attempt %d/5)", backoff, attempt+1))
+				select {
+				case <-ctx.Done():
+					ch <- ProviderEvent{Type: EventError, Error: ctx.Err()}
+					return
+				case <-time.After(backoff):
+					continue
+				}
+			}
+
+			// Retry on "model output" error (Azure returns this when model produces empty response)
+			if resp.StatusCode != 200 {
+				respBody, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if strings.Contains(string(respBody), "model output") {
+					backoff := time.Duration(2<<uint(attempt)) * time.Second
+					logging.WarnPersist(fmt.Sprintf("Empty model output, retrying in %s... (attempt %d/5)", backoff, attempt+1))
+					select {
+					case <-ctx.Done():
+						ch <- ProviderEvent{Type: EventError, Error: ctx.Err()}
+						return
+					case <-time.After(backoff):
+						continue
+					}
+				}
+				// Non-retryable error
+				errMsg := fmt.Sprintf("gateway returned %d: %s", resp.StatusCode, string(respBody))
+				logging.ErrorPersist(fmt.Sprintf("[NeuronClient.stream] HTTP %d | Body: %s",
+					resp.StatusCode, string(respBody[:min(500, len(respBody))])))
+				ch <- ProviderEvent{Type: EventError, Error: fmt.Errorf("%s", errMsg)}
+				return
+			}
+
+			break // success
 		}
 		defer resp.Body.Close()
 
-		if resp.StatusCode != 200 {
-			bodyBytes, _ := io.ReadAll(resp.Body)
-			errMsg := fmt.Sprintf("gateway returned %d: %s", resp.StatusCode, string(bodyBytes))
-			logging.ErrorPersist(fmt.Sprintf("[NeuronClient.stream] HTTP %d | URL: %s | Token: %s... | Body: %s",
-				resp.StatusCode,
-				c.gatewayURL+"/v1/chat/completions",
-				c.sessionToken[:min(16, len(c.sessionToken))],
-				string(bodyBytes[:min(500, len(bodyBytes))]),
-			))
-			ch <- ProviderEvent{
-				Type:  EventError,
-				Error: fmt.Errorf("%s", errMsg),
-			}
-			return
-		}
-
 		ch <- ProviderEvent{Type: EventContentStart}
 
-		scanner := bufio.NewScanner(resp.Body)
+		// Create a pipe so we can read with context cancellation.
+		// Without this, bufio.Scanner blocks forever on a stalled stream.
+		pr, pw := io.Pipe()
+		go func() {
+			defer pw.Close()
+			buf := make([]byte, 32*1024)
+			for {
+				// Set a deadline: if no data in 90s, we're stalled
+				n, err := resp.Body.Read(buf)
+				if n > 0 {
+					pw.Write(buf[:n])
+				}
+				if err != nil {
+					if err != io.EOF {
+						pw.CloseWithError(err)
+					}
+					return
+				}
+				// Check context
+				select {
+				case <-ctx.Done():
+					pw.CloseWithError(ctx.Err())
+					return
+				default:
+				}
+			}
+		}()
+
+		scanner := bufio.NewScanner(pr)
 		scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
 		var currentToolCall *message.ToolCall
 		var toolInputBuffer strings.Builder
+		var accumulatedContent strings.Builder
+		var accumulatedReasoning strings.Builder
+		var accumulatedToolCalls []message.ToolCall
+		var finalUsage TokenUsage
+		finalFinishReason := message.FinishReasonEndTurn
 
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -319,6 +564,7 @@ func (c *NeuronClient) stream(ctx context.Context, msgs []message.Message, toolL
 				// Flush any pending tool call
 				if currentToolCall != nil {
 					currentToolCall.Input = toolInputBuffer.String()
+					accumulatedToolCalls = append(accumulatedToolCalls, *currentToolCall)
 					ch <- ProviderEvent{
 						Type:     EventToolUseStop,
 						ToolCall: currentToolCall,
@@ -326,15 +572,37 @@ func (c *NeuronClient) stream(ctx context.Context, msgs []message.Message, toolL
 					currentToolCall = nil
 				}
 
-				ch <- ProviderEvent{Type: EventComplete}
+				if len(accumulatedToolCalls) > 0 {
+					finalFinishReason = message.FinishReasonToolUse
+				}
+
+				// Fall back to reasoning_content if content is empty
+				// (Kimi K2.5 sometimes returns only reasoning_content)
+				// Note: reasoning was already streamed live as EventContentDelta,
+				// so we don't emit it again here — just set finalContent for the response.
+				finalContent := accumulatedContent.String()
+				if finalContent == "" && accumulatedReasoning.Len() > 0 {
+					finalContent = accumulatedReasoning.String()
+				}
+
+				ch <- ProviderEvent{
+					Type: EventComplete,
+					Response: &ProviderResponse{
+						Content:      finalContent,
+						ToolCalls:    accumulatedToolCalls,
+						Usage:        finalUsage,
+						FinishReason: finalFinishReason,
+					},
+				}
 				return
 			}
 
 			var chunk struct {
 				Choices []struct {
 					Delta struct {
-						Content   string `json:"content"`
-						ToolCalls []struct {
+						Content          string `json:"content"`
+						ReasoningContent string `json:"reasoning_content"`
+						ToolCalls        []struct {
 							Index    int    `json:"index"`
 							ID       string `json:"id"`
 							Function struct {
@@ -361,8 +629,18 @@ func (c *NeuronClient) stream(ctx context.Context, msgs []message.Message, toolL
 
 			delta := chunk.Choices[0].Delta
 
+			// Reasoning content — stored separately, shown as status indicator
+			if delta.ReasoningContent != "" {
+				accumulatedReasoning.WriteString(delta.ReasoningContent)
+				ch <- ProviderEvent{
+					Type:    EventThinkingDelta,
+					Content: delta.ReasoningContent,
+				}
+			}
+
 			// Text content
 			if delta.Content != "" {
+				accumulatedContent.WriteString(delta.Content)
 				ch <- ProviderEvent{
 					Type:    EventContentDelta,
 					Content: delta.Content,
@@ -375,6 +653,7 @@ func (c *NeuronClient) stream(ctx context.Context, msgs []message.Message, toolL
 					// New tool call starting — flush previous if any
 					if currentToolCall != nil {
 						currentToolCall.Input = toolInputBuffer.String()
+						accumulatedToolCalls = append(accumulatedToolCalls, *currentToolCall)
 						ch <- ProviderEvent{
 							Type:     EventToolUseStop,
 							ToolCall: currentToolCall,
@@ -401,21 +680,56 @@ func (c *NeuronClient) stream(ctx context.Context, msgs []message.Message, toolL
 				}
 			}
 
+			// Finish reason
+			if chunk.Choices[0].FinishReason != nil {
+				switch *chunk.Choices[0].FinishReason {
+				case "stop":
+					finalFinishReason = message.FinishReasonEndTurn
+				case "tool_calls":
+					finalFinishReason = message.FinishReasonToolUse
+				case "length":
+					finalFinishReason = message.FinishReasonMaxTokens
+				}
+			}
+
 			// Usage info
 			if chunk.Usage != nil {
-				// We'll send this with the complete event
+				finalUsage = TokenUsage{
+					InputTokens:  chunk.Usage.PromptTokens,
+					OutputTokens: chunk.Usage.CompletionTokens,
+				}
 			}
 		}
 
 		// If we got here without [DONE], still complete
 		if currentToolCall != nil {
 			currentToolCall.Input = toolInputBuffer.String()
+			accumulatedToolCalls = append(accumulatedToolCalls, *currentToolCall)
 			ch <- ProviderEvent{
 				Type:     EventToolUseStop,
 				ToolCall: currentToolCall,
 			}
 		}
-		ch <- ProviderEvent{Type: EventComplete}
+		if len(accumulatedToolCalls) > 0 {
+			finalFinishReason = message.FinishReasonToolUse
+		}
+		finalContent := accumulatedContent.String()
+		if finalContent == "" && accumulatedReasoning.Len() > 0 {
+			finalContent = accumulatedReasoning.String()
+			ch <- ProviderEvent{
+				Type:    EventContentDelta,
+				Content: finalContent,
+			}
+		}
+		ch <- ProviderEvent{
+			Type: EventComplete,
+			Response: &ProviderResponse{
+				Content:      finalContent,
+				ToolCalls:    accumulatedToolCalls,
+				Usage:        finalUsage,
+				FinishReason: finalFinishReason,
+			},
+		}
 	}()
 
 	return ch

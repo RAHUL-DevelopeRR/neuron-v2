@@ -69,7 +69,7 @@ func NewSpinner(message string) *Spinner {
 		message: message,
 	}
 
-	prog := tea.NewProgram(model, tea.WithOutput(os.Stderr), tea.WithoutCatchPanics())
+	prog := tea.NewProgram(model, tea.WithOutput(os.Stderr), tea.WithoutCatchPanics(), tea.WithInput(nil))
 
 	return &Spinner{
 		model:  s,

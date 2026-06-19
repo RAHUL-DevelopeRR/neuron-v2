@@ -13,6 +13,7 @@ import (
 	"github.com/opencode-ai/opencode/internal/session"
 	"github.com/opencode-ai/opencode/internal/tui/components/chat"
 	"github.com/opencode-ai/opencode/internal/tui/components/dialog"
+	"github.com/opencode-ai/opencode/internal/tui/components/terminal"
 	"github.com/opencode-ai/opencode/internal/tui/layout"
 	"github.com/opencode-ai/opencode/internal/tui/util"
 )
@@ -27,12 +28,18 @@ type chatPage struct {
 	session              session.Session
 	completionDialog     dialog.CompletionDialog
 	showCompletionDialog bool
+	focusTerminal        bool // true = terminal has focus, false = editor has focus
 }
 
 type ChatKeyMap struct {
 	ShowCompletionDialog key.Binding
 	NewSession           key.Binding
 	Cancel               key.Binding
+	ToggleTerminal       key.Binding
+	ChatWider            key.Binding
+	SidebarWider         key.Binding
+	ConversationTaller   key.Binding
+	EditorTaller         key.Binding
 }
 
 var keyMap = ChatKeyMap{
@@ -47,6 +54,26 @@ var keyMap = ChatKeyMap{
 	Cancel: key.NewBinding(
 		key.WithKeys("esc"),
 		key.WithHelp("esc", "cancel"),
+	),
+	ToggleTerminal: key.NewBinding(
+		key.WithKeys("ctrl+x"),
+		key.WithHelp("ctrl+x", "toggle terminal focus"),
+	),
+	ChatWider: key.NewBinding(
+		key.WithKeys("alt+right"),
+		key.WithHelp("alt+right", "wider chat"),
+	),
+	SidebarWider: key.NewBinding(
+		key.WithKeys("alt+left"),
+		key.WithHelp("alt+left", "wider sidebar"),
+	),
+	ConversationTaller: key.NewBinding(
+		key.WithKeys("alt+up"),
+		key.WithHelp("alt+up", "taller chat"),
+	),
+	EditorTaller: key.NewBinding(
+		key.WithKeys("alt+down"),
+		key.WithHelp("alt+down", "taller editor"),
 	),
 }
 
@@ -73,10 +100,10 @@ func (p *chatPage) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case dialog.CommandRunCustomMsg:
 		// Check if the agent is busy before executing custom commands
-		if p.app.CoderAgent.IsBusy() {
+		if p.app.CoderAgent != nil && p.app.CoderAgent.IsBusy() {
 			return p, util.ReportWarn("Agent is busy, please wait before executing a command...")
 		}
-		
+
 		// Process the command content with arguments if any
 		content := msg.Content
 		if msg.Args != nil {
@@ -86,35 +113,52 @@ func (p *chatPage) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				content = strings.ReplaceAll(content, placeholder, value)
 			}
 		}
-		
+
 		// Handle custom command execution
 		cmd := p.sendMessage(content, nil)
 		if cmd != nil {
 			return p, cmd
 		}
 	case chat.SessionSelectedMsg:
-		if p.session.ID == "" {
-			cmd := p.setSidebar()
-			if cmd != nil {
-				cmds = append(cmds, cmd)
-			}
-		}
+		// Sidebar already exists from startup — just update session.
+		// The SessionSelectedMsg will flow through layout.Update() to the
+		// sidebar, which will update its session, diff panel, etc.
 		p.session = msg
 	case tea.KeyMsg:
+		switch {
+		case key.Matches(msg, keyMap.ToggleTerminal):
+			p.focusTerminal = !p.focusTerminal
+			return p, tea.Batch(
+				util.CmdHandler(chat.EditorFocusMsg(!p.focusTerminal)),
+				util.CmdHandler(terminal.TerminalFocusMsg{Focused: p.focusTerminal}),
+			)
+		case key.Matches(msg, keyMap.ChatWider):
+			return p, p.layout.ResizeHorizontal(0.04)
+		case key.Matches(msg, keyMap.SidebarWider):
+			return p, p.layout.ResizeHorizontal(-0.04)
+		case key.Matches(msg, keyMap.ConversationTaller):
+			return p, p.layout.ResizeVertical(0.04)
+		case key.Matches(msg, keyMap.EditorTaller):
+			return p, p.layout.ResizeVertical(-0.04)
+		}
+
+		if p.focusTerminal {
+			break
+		}
+
 		switch {
 		case key.Matches(msg, keyMap.ShowCompletionDialog):
 			p.showCompletionDialog = true
 			// Continue sending keys to layout->chat
 		case key.Matches(msg, keyMap.NewSession):
 			p.session = session.Session{}
+			p.focusTerminal = false
 			return p, tea.Batch(
-				p.clearSidebar(),
+				util.CmdHandler(chat.EditorFocusMsg(true)),
 				util.CmdHandler(chat.SessionClearedMsg{}),
 			)
 		case key.Matches(msg, keyMap.Cancel):
-			if p.session.ID != "" {
-				// Cancel the current session's generation process
-				// This allows users to interrupt long-running operations
+			if p.session.ID != "" && p.app.CoderAgent != nil {
 				p.app.CoderAgent.Cancel(p.session.ID)
 				return p, nil
 			}
@@ -140,19 +184,15 @@ func (p *chatPage) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return p, tea.Batch(cmds...)
 }
 
-func (p *chatPage) setSidebar() tea.Cmd {
-	sidebarContainer := layout.NewContainer(
-		chat.NewSidebarCmp(p.session, p.app.History),
-		layout.WithPadding(1, 1, 1, 1),
-	)
-	return tea.Batch(p.layout.SetRightPanel(sidebarContainer), sidebarContainer.Init())
-}
-
-func (p *chatPage) clearSidebar() tea.Cmd {
-	return p.layout.ClearRightPanel()
-}
-
 func (p *chatPage) sendMessage(text string, attachments []message.Attachment) tea.Cmd {
+	// Wait for agent to be ready (near-instant with repomap guard)
+	if !p.app.IsAgentReady() {
+		return util.ReportWarn("Agent is initializing, please wait a moment...")
+	}
+	if p.app.CoderAgent == nil {
+		return util.ReportError(p.app.WaitForAgent())
+	}
+
 	var cmds []tea.Cmd
 	if p.session.ID == "" {
 		session, err := p.app.Sessions.Create(context.Background(), "New Session")
@@ -161,10 +201,8 @@ func (p *chatPage) sendMessage(text string, attachments []message.Attachment) te
 		}
 
 		p.session = session
-		cmd := p.setSidebar()
-		if cmd != nil {
-			cmds = append(cmds, cmd)
-		}
+		// Sidebar already exists — SessionSelectedMsg flows through
+		// layout.Update() to update the sidebar's session and diff panel
 		cmds = append(cmds, util.CmdHandler(chat.SessionSelectedMsg(session)))
 	}
 
@@ -181,6 +219,10 @@ func (p *chatPage) SetSize(width, height int) tea.Cmd {
 
 func (p *chatPage) GetSize() (int, int) {
 	return p.layout.GetSize()
+}
+
+func (p *chatPage) CapturesKeys() bool {
+	return p.focusTerminal
 }
 
 func (p *chatPage) View() string {
@@ -224,6 +266,13 @@ func NewChatPage(app *app.App) tea.Model {
 		chat.NewEditorCmp(app),
 		layout.WithBorder(true, false, false, false),
 	)
+
+	// Sidebar visible from startup — diff panel + real terminal
+	sidebarContainer := layout.NewContainer(
+		chat.NewSidebarCmp(session.Session{}, app.History),
+		layout.WithPadding(1, 1, 1, 1),
+	)
+
 	return &chatPage{
 		app:              app,
 		editor:           editorContainer,
@@ -232,6 +281,7 @@ func NewChatPage(app *app.App) tea.Model {
 		layout: layout.NewSplitPane(
 			layout.WithLeftPanel(messagesContainer),
 			layout.WithBottomPanel(editorContainer),
+			layout.WithRightPanel(sidebarContainer),
 		),
 	}
 }

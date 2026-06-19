@@ -464,6 +464,7 @@ impl StreamState {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn ingest_chunk(&mut self, chunk: ChatCompletionChunk) -> Result<Vec<StreamEvent>, ApiError> {
         let mut events = Vec::new();
         if !self.message_started {
@@ -512,7 +513,9 @@ impl StreamState {
                 }
                 events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
                     index: 0,
-                    delta: ContentBlockDelta::ThinkingDelta { thinking: reasoning },
+                    delta: ContentBlockDelta::ThinkingDelta {
+                        thinking: reasoning,
+                    },
                 }));
             }
 
@@ -834,7 +837,7 @@ pub fn is_reasoning_model(model: &str) -> bool {
 /// **Exception**: OpenRouter-style model IDs like `qwen/qwen3-coder:free`
 /// use the `provider/model` format as the actual identifier. We detect these
 /// by the presence of `:free`, `:beta`, or `:extended` suffixes and preserve
-/// the full model string so OpenRouter receives the correct model ID.
+/// the full model string so `OpenRouter` receives the correct model ID.
 fn strip_routing_prefix(model: &str) -> &str {
     // OpenRouter model IDs use "provider/model:tag" format where the full
     // string IS the model ID (e.g. "qwen/qwen3-coder:free").

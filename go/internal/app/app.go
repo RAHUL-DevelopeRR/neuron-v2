@@ -14,6 +14,7 @@ import (
 	"github.com/opencode-ai/opencode/internal/format"
 	"github.com/opencode-ai/opencode/internal/history"
 	"github.com/opencode-ai/opencode/internal/llm/agent"
+	"github.com/opencode-ai/opencode/internal/llm/prompt"
 	"github.com/opencode-ai/opencode/internal/logging"
 	"github.com/opencode-ai/opencode/internal/lsp"
 	"github.com/opencode-ai/opencode/internal/message"
@@ -37,6 +38,28 @@ type App struct {
 	watcherCancelFuncs []context.CancelFunc
 	cancelFuncsMutex   sync.Mutex
 	watcherWG          sync.WaitGroup
+
+	// agentReady is closed when CoderAgent is initialized.
+	agentReady chan struct{}
+	agentErr   error
+}
+
+// WaitForAgent blocks until the CoderAgent is ready. Returns the agent
+// init error if it failed. In practice this returns near-instantly after
+// the repomap guard was added, but it guarantees correctness.
+func (app *App) WaitForAgent() error {
+	<-app.agentReady
+	return app.agentErr
+}
+
+// IsAgentReady returns true if the CoderAgent has finished initialization.
+func (app *App) IsAgentReady() bool {
+	select {
+	case <-app.agentReady:
+		return true
+	default:
+		return false
+	}
 }
 
 func New(ctx context.Context, conn *sql.DB) (*App, error) {
@@ -51,6 +74,7 @@ func New(ctx context.Context, conn *sql.DB) (*App, error) {
 		History:     files,
 		Permissions: permission.NewPermissionService(),
 		LSPClients:  make(map[string]*lsp.Client),
+		agentReady:  make(chan struct{}),
 	}
 
 	// Initialize theme based on configuration
@@ -59,23 +83,29 @@ func New(ctx context.Context, conn *sql.DB) (*App, error) {
 	// Initialize LSP clients in the background
 	go app.initLSPClients(ctx)
 
-	var err error
-	app.CoderAgent, err = agent.NewAgent(
-		config.AgentCoder,
-		app.Sessions,
-		app.Messages,
-		agent.CoderAgentTools(
-			app.Permissions,
+	// Initialize CoderAgent in the background — this calls
+	// prompt.GetAgentPrompt which builds the repomap. With the
+	// repomap guard, this completes in <1s for most workspaces.
+	go func() {
+		defer close(app.agentReady)
+		var err error
+		app.CoderAgent, err = agent.NewAgent(
+			config.AgentCoder,
 			app.Sessions,
 			app.Messages,
-			app.History,
-			app.LSPClients,
-		),
-	)
-	if err != nil {
-		logging.Error("Failed to create coder agent", err)
-		return nil, err
-	}
+			agent.CoderAgentTools(
+				app.Permissions,
+				app.Sessions,
+				app.Messages,
+				app.History,
+				app.LSPClients,
+			),
+		)
+		if err != nil {
+			logging.Error("Failed to create coder agent", err)
+			app.agentErr = err
+		}
+	}()
 
 	return app, nil
 }
@@ -148,10 +178,17 @@ func (a *App) RunNonInteractive(ctx context.Context, prompt string, outputFormat
 	}
 
 	// Get the text content from the response
+	// For reasoning models (e.g. Kimi-K2.5), output may be in ReasoningContent instead of Content
 	content := "No content available"
+	contentSource := "none"
 	if result.Message.Content().String() != "" {
 		content = result.Message.Content().String()
+		contentSource = "Content"
+	} else if result.Message.ReasoningContent().String() != "" {
+		content = result.Message.ReasoningContent().String()
+		contentSource = "ReasoningContent"
 	}
+	logging.Info("[NON-INTERACTIVE] About to print output", "contentSource", contentSource, "contentLen", len(content))
 
 	fmt.Println(format.FormatOutput(content, outputFormat))
 
@@ -162,19 +199,61 @@ func (a *App) RunNonInteractive(ctx context.Context, prompt string, outputFormat
 
 // Shutdown performs a clean shutdown of the application
 func (app *App) Shutdown() {
+	app.shutdownWorkspaceServices()
+}
+
+// SwitchWorkingDirectory restarts workspace-scoped services so the next model
+// request and LSP operation use the new directory rather than stale context.
+func (app *App) SwitchWorkingDirectory(ctx context.Context, dir string) error {
+	if app.CoderAgent.IsBusy() {
+		return fmt.Errorf("cannot switch directory while the agent is busy")
+	}
+
+	if err := config.SetWorkingDirectory(dir); err != nil {
+		return err
+	}
+	prompt.ResetWorkspaceCaches()
+
+	app.shutdownWorkspaceServices()
+	go app.initLSPClients(ctx)
+
+	coderAgent, err := agent.NewAgent(
+		config.AgentCoder,
+		app.Sessions,
+		app.Messages,
+		agent.CoderAgentTools(
+			app.Permissions,
+			app.Sessions,
+			app.Messages,
+			app.History,
+			app.LSPClients,
+		),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to recreate coder agent: %w", err)
+	}
+	app.CoderAgent = coderAgent
+	return nil
+}
+
+func (app *App) shutdownWorkspaceServices() {
 	// Cancel all watcher goroutines
 	app.cancelFuncsMutex.Lock()
-	for _, cancel := range app.watcherCancelFuncs {
+	cancelFuncs := app.watcherCancelFuncs
+	app.watcherCancelFuncs = nil
+	app.cancelFuncsMutex.Unlock()
+
+	for _, cancel := range cancelFuncs {
 		cancel()
 	}
-	app.cancelFuncsMutex.Unlock()
 	app.watcherWG.Wait()
 
 	// Perform additional cleanup for LSP clients
-	app.clientsMutex.RLock()
+	app.clientsMutex.Lock()
 	clients := make(map[string]*lsp.Client, len(app.LSPClients))
 	maps.Copy(clients, app.LSPClients)
-	app.clientsMutex.RUnlock()
+	app.LSPClients = make(map[string]*lsp.Client)
+	app.clientsMutex.Unlock()
 
 	for name, client := range clients {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

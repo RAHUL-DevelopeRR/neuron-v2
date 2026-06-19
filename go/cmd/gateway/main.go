@@ -78,8 +78,12 @@ func loadConfig() ServerConfig {
 
 type Session struct {
 	Token       string    `json:"session_token"`
+	UserID      string    `json:"user_id"`
+	Plan        string    `json:"plan"`
 	Fingerprint string    `json:"machine_fingerprint"`
+	Version     string    `json:"version"`
 	CreatedAt   time.Time `json:"created_at"`
+	ExpiresAt   time.Time `json:"expires_at"`
 	QuotaUsed   int64     `json:"quota_used"`
 }
 
@@ -104,6 +108,16 @@ type Backend struct {
 }
 
 func resolveBackend(model string) Backend {
+	normalized := strings.ToLower(model)
+
+	if (strings.Contains(normalized, "qwen/") || strings.Contains(normalized, ":free")) && serverCfg.OpenRouterAPIKey != "" {
+		return Backend{
+			URL:    "https://openrouter.ai/api/v1/chat/completions",
+			APIKey: serverCfg.OpenRouterAPIKey,
+			Name:   "openrouter",
+		}
+	}
+
 	// Priority 1: Azure AI Foundry (if configured)
 	if serverCfg.AzureAPIKey != "" {
 		return Backend{
@@ -129,12 +143,12 @@ func resolveBackend(model string) Backend {
 // ── Available Models ────────────────────────────────────────
 
 var availableModels = []map[string]interface{}{
+	{"id": "model-router", "name": "Model Router", "provider": "azure"},
 	{"id": "Kimi-K2.5", "name": "Kimi K2.5", "provider": "azure"},
 	{"id": "Kimi-K2.6", "name": "Kimi K2.6", "provider": "azure"},
 	{"id": "FW-DeepSeek-V3.2", "name": "DeepSeek V3.2", "provider": "azure"},
 	{"id": "FW-MiniMax-M2.5", "name": "MiniMax M2.5", "provider": "azure"},
 	{"id": "gpt-5.5", "name": "GPT-5.5", "provider": "azure"},
-	{"id": "model-router", "name": "Model Router", "provider": "azure"},
 	{"id": "Codex-Max", "name": "Codex Max", "provider": "azure"},
 	{"id": "qwen/qwen3-coder-480b-a35b-instruct:free", "name": "Qwen3 Coder (Free)", "provider": "openrouter"},
 }
@@ -157,24 +171,57 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 func handleSession(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
+	if r.Method == http.MethodGet {
+		session, ok := sessionFromRequest(r)
+		if !ok {
+			jsonError(w, "missing or invalid session token", http.StatusUnauthorized)
+			return
+		}
+		json.NewEncoder(w).Encode(sessionResponse(session))
+		return
+	}
+	if r.Method != http.MethodPost {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	var req struct {
 		Fingerprint string `json:"machine_fingerprint"`
 		Version     string `json:"version"`
+		UserID      string `json:"user_id"`
+		Plan        string `json:"plan"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
+	if req.UserID == "" {
+		req.UserID = r.Header.Get("x-zero-x-user-id")
+	}
+	if req.UserID == "" {
+		req.UserID = "anonymous"
+	}
+	if req.Plan == "" {
+		req.Plan = "free"
+	}
 
 	token := generateToken()
 	session := &Session{
 		Token:       token,
+		UserID:      req.UserID,
+		Plan:        req.Plan,
 		Fingerprint: req.Fingerprint,
+		Version:     req.Version,
 		CreatedAt:   time.Now(),
+		ExpiresAt:   time.Now().Add(12 * time.Hour),
 	}
 
 	sessionsMu.Lock()
 	sessions[token] = session
 	sessionsMu.Unlock()
 
-	// Determine available backend
+	json.NewEncoder(w).Encode(sessionResponse(session))
+	log.Printf("[SESSION] Created for %s user=%s plan=%s (v%s)", req.Fingerprint, req.UserID, req.Plan, req.Version)
+}
+
+func sessionResponse(session *Session) map[string]interface{} {
 	backend := resolveBackend("")
 	providerName := "none"
 	if backend.Name != "" {
@@ -186,17 +233,20 @@ func handleSession(w http.ResponseWriter, r *http.Request) {
 		modelIDs[i] = m["id"].(string)
 	}
 
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"session_token": token,
+	return map[string]interface{}{
+		"session_token": session.Token,
+		"user_id":       session.UserID,
+		"plan":          session.Plan,
+		"expires_at":    session.ExpiresAt.Unix(),
 		"models":        modelIDs,
 		"provider":      providerName,
 		"quota": map[string]interface{}{
 			"daily_limit": DailyQuotaLimit,
-			"used":        0,
-			"remaining":   DailyQuotaLimit,
+			"used":        session.QuotaUsed,
+			"remaining":   max(int64(0), DailyQuotaLimit-session.QuotaUsed),
 		},
-	})
-	log.Printf("[SESSION] Created for %s (v%s) → backend: %s", req.Fingerprint, req.Version, providerName)
+		"dashboard_url": "https://zero-x.live/dashboard/usage",
+	}
 }
 
 func handleModels(w http.ResponseWriter, r *http.Request) {
@@ -207,6 +257,12 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	session, ok := sessionFromRequest(r)
+	if !ok {
+		jsonError(w, "missing or invalid session token", http.StatusUnauthorized)
+		return
+	}
+
 	// Read body
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -241,7 +297,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		proxyReq.Header.Set("Accept", "text/event-stream")
 	}
 
-	log.Printf("[PROXY] %s → %s via %s (stream=%v)", model, backend.URL, backend.Name, isStream)
+	log.Printf("[PROXY] %s -> %s via %s (stream=%v)", model, backend.URL, backend.Name, isStream)
 
 	client := &http.Client{Timeout: 180 * time.Second}
 	resp, err := client.Do(proxyReq)
@@ -258,9 +314,8 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			w.Header().Add(k, vv)
 		}
 	}
-	w.WriteHeader(resp.StatusCode)
-
 	if isStream {
+		w.WriteHeader(resp.StatusCode)
 		flusher, ok := w.(http.Flusher)
 		buf := make([]byte, 4096)
 		for {
@@ -276,10 +331,17 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		io.Copy(w, resp.Body)
+		respBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			jsonError(w, "failed to read backend response", 502)
+			return
+		}
+		recordUsageFromBody(session, respBody)
+		w.WriteHeader(resp.StatusCode)
+		w.Write(respBody)
 	}
 
-	log.Printf("[DONE] %s → %d via %s", model, resp.StatusCode, backend.Name)
+	log.Printf("[DONE] %s -> %d via %s", model, resp.StatusCode, backend.Name)
 }
 
 // ── OpenRouter Callback (for PKCE auth flow) ────────────────
@@ -323,6 +385,77 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // ── Helpers ─────────────────────────────────────────────────
 
+func handleUsage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	session, ok := sessionFromRequest(r)
+	if !ok {
+		jsonError(w, "missing or invalid session token", http.StatusUnauthorized)
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"user_id": session.UserID,
+		"plan":    session.Plan,
+		"quota": map[string]interface{}{
+			"daily_limit": DailyQuotaLimit,
+			"used":        session.QuotaUsed,
+			"remaining":   max(int64(0), DailyQuotaLimit-session.QuotaUsed),
+		},
+		"dashboard_url": "https://zero-x.live/dashboard/usage",
+	})
+}
+
+func handlePlan(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	session, ok := sessionFromRequest(r)
+	if !ok {
+		jsonError(w, "missing or invalid session token", http.StatusUnauthorized)
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"user_id":       session.UserID,
+		"plan":          session.Plan,
+		"dashboard_url": "https://zero-x.live/dashboard/plan",
+	})
+}
+
+func sessionFromRequest(r *http.Request) (*Session, bool) {
+	auth := r.Header.Get("Authorization")
+	token := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+	if token == "" || token == auth {
+		return nil, false
+	}
+	sessionsMu.RLock()
+	defer sessionsMu.RUnlock()
+	session, ok := sessions[token]
+	if !ok || time.Now().After(session.ExpiresAt) {
+		return nil, false
+	}
+	return session, true
+}
+
+func recordUsageFromBody(session *Session, body []byte) {
+	var parsed struct {
+		Usage struct {
+			PromptTokens     int64 `json:"prompt_tokens"`
+			CompletionTokens int64 `json:"completion_tokens"`
+			TotalTokens      int64 `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return
+	}
+	used := parsed.Usage.TotalTokens
+	if used == 0 {
+		used = parsed.Usage.PromptTokens + parsed.Usage.CompletionTokens
+	}
+	if used == 0 {
+		return
+	}
+	sessionsMu.Lock()
+	session.QuotaUsed += used
+	sessionsMu.Unlock()
+}
+
 func jsonError(w http.ResponseWriter, msg string, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
@@ -348,8 +481,17 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	// Auth routes (the paths the client hits)
+	// Unified production-style routes.
+	mux.HandleFunc("/auth/session", corsMiddleware(handleSession))
+	mux.HandleFunc("/auth/usage", corsMiddleware(handleUsage))
+	mux.HandleFunc("/auth/plan", corsMiddleware(handlePlan))
+	mux.HandleFunc("/v1/chat/completions", corsMiddleware(handleChatCompletions))
+	mux.HandleFunc("/models", corsMiddleware(handleModels))
+
+	// Legacy local routes kept for older clients and reverse-proxy prefixes.
 	mux.HandleFunc("/neuroncli/auth/auth/session", corsMiddleware(handleSession))
+	mux.HandleFunc("/neuroncli/auth/auth/usage", corsMiddleware(handleUsage))
+	mux.HandleFunc("/neuroncli/auth/auth/plan", corsMiddleware(handlePlan))
 	mux.HandleFunc("/neuroncli/auth/v1/chat/completions", corsMiddleware(handleChatCompletions))
 	mux.HandleFunc("/neuroncli/auth/models", corsMiddleware(handleModels))
 	mux.HandleFunc("/neuroncli/callback", corsMiddleware(handleCallback))

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -14,6 +15,10 @@ import (
 
 	"github.com/opencode-ai/opencode/internal/config"
 )
+
+func isWindows() bool {
+	return runtime.GOOS == "windows"
+}
 
 type PersistentShell struct {
 	cmd          *exec.Cmd
@@ -74,13 +79,21 @@ func newPersistentShell(cwd string) *PersistentShell {
 	if shellPath == "" {
 		shellPath = os.Getenv("SHELL")
 		if shellPath == "" {
-			shellPath = "/bin/bash"
+			if isWindows() {
+				shellPath = "cmd.exe"
+			} else {
+				shellPath = "/bin/bash"
+			}
 		}
 	}
 	
 	// Default shell args
 	if len(shellArgs) == 0 {
-		shellArgs = []string{"-l"}
+		if isWindows() {
+			shellArgs = []string{"/Q", "/K"}
+		} else {
+			shellArgs = []string{"-l"}
+		}
 	}
 
 	cmd := exec.Command(shellPath, shellArgs...)
@@ -269,8 +282,15 @@ func (s *PersistentShell) killChildren() {
 }
 
 func (s *PersistentShell) Exec(ctx context.Context, command string, timeoutMs int) (string, string, int, bool, error) {
-	if !s.isAlive {
-		return "", "Shell is not alive", 1, false, errors.New("shell is not alive")
+	// On Windows, ALWAYS use execDirect. The persistent shell sends Unix syntax
+	// (eval, /dev/null, $?, pgrep, SIGTERM) through cmd.exe which silently fails.
+	if isWindows() {
+		return execDirect(ctx, command, timeoutMs)
+	}
+
+	if s == nil || !s.isAlive {
+		// Persistent shell failed. Fall back to direct exec.
+		return execDirect(ctx, command, timeoutMs)
 	}
 
 	timeout := time.Duration(timeoutMs) * time.Millisecond
@@ -324,4 +344,39 @@ func fileSize(path string) int64 {
 		return 0
 	}
 	return info.Size()
+}
+
+// execDirect runs a command directly via exec.Command (no persistent shell).
+// Used as fallback on Windows where the persistent bash shell doesn't work.
+func execDirect(ctx context.Context, command string, timeoutMs int) (string, string, int, bool, error) {
+	timeout := time.Duration(timeoutMs) * time.Millisecond
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	var cmd *exec.Cmd
+	if isWindows() {
+		cmd = exec.CommandContext(ctx, "cmd.exe", "/C", command)
+	} else {
+		cmd = exec.CommandContext(ctx, "/bin/sh", "-c", command)
+	}
+	cmd.Dir = config.WorkingDirectory()
+
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	interrupted := ctx.Err() != nil
+	exitCode := 0
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else if interrupted {
+			exitCode = 143
+		} else {
+			return "", err.Error(), 1, false, err
+		}
+	}
+
+	return stdout.String(), stderr.String(), exitCode, interrupted, nil
 }

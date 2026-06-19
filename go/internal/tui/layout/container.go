@@ -1,6 +1,8 @@
 package layout
 
 import (
+	"strings"
+
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -12,6 +14,11 @@ type Container interface {
 	Sizeable
 	Bindings
 }
+
+type KeyCapturer interface {
+	CapturesKeys() bool
+}
+
 type container struct {
 	width  int
 	height int
@@ -36,6 +43,23 @@ func (c *container) Init() tea.Cmd {
 }
 
 func (c *container) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if mouseMsg, ok := msg.(tea.MouseMsg); ok {
+		contentWidth, contentHeight := c.contentSize()
+		local := mouseMsg
+		local.X -= c.paddingLeft
+		local.Y -= c.paddingTop
+		if c.borderLeft {
+			local.X--
+		}
+		if c.borderTop {
+			local.Y--
+		}
+		if local.X < 0 || local.Y < 0 || local.X >= contentWidth || local.Y >= contentHeight {
+			return c, nil
+		}
+		msg = local
+	}
+
 	u, cmd := c.content.Update(msg)
 	c.content = u
 	return c, cmd
@@ -43,6 +67,10 @@ func (c *container) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (c *container) View() string {
 	t := theme.CurrentTheme()
+	if !c.borderTop && !c.borderRight && !c.borderBottom && !c.borderLeft {
+		return c.renderBorderless()
+	}
+
 	style := lipgloss.NewStyle()
 	width := c.width
 	height := c.height
@@ -78,36 +106,63 @@ func (c *container) View() string {
 	return style.Render(c.content.View())
 }
 
+func (c *container) renderBorderless() string {
+	if c.width <= 0 || c.height <= 0 {
+		return ""
+	}
+
+	lines := make([]string, 0)
+	blank := strings.Repeat(" ", c.width)
+	for i := 0; i < c.paddingTop; i++ {
+		lines = append(lines, blank)
+	}
+
+	leftPad := strings.Repeat(" ", c.paddingLeft)
+	rightPad := strings.Repeat(" ", c.paddingRight)
+	content := c.content.View()
+	if content != "" {
+		for _, line := range strings.Split(content, "\n") {
+			lines = append(lines, leftPad+line+rightPad)
+		}
+	}
+
+	for i := 0; i < c.paddingBottom; i++ {
+		lines = append(lines, blank)
+	}
+
+	return lipgloss.Place(c.width, c.height, lipgloss.Left, lipgloss.Top, strings.Join(lines, "\n"))
+}
+
 func (c *container) SetSize(width, height int) tea.Cmd {
 	c.width = width
 	c.height = height
 
 	// If the content implements Sizeable, adjust its size to account for padding and borders
 	if sizeable, ok := c.content.(Sizeable); ok {
-		// Calculate horizontal space taken by padding and borders
-		horizontalSpace := c.paddingLeft + c.paddingRight
-		if c.borderLeft {
-			horizontalSpace++
-		}
-		if c.borderRight {
-			horizontalSpace++
-		}
-
-		// Calculate vertical space taken by padding and borders
-		verticalSpace := c.paddingTop + c.paddingBottom
-		if c.borderTop {
-			verticalSpace++
-		}
-		if c.borderBottom {
-			verticalSpace++
-		}
-
-		// Set content size with adjusted dimensions
-		contentWidth := max(0, width-horizontalSpace)
-		contentHeight := max(0, height-verticalSpace)
+		contentWidth, contentHeight := c.contentSize()
 		return sizeable.SetSize(contentWidth, contentHeight)
 	}
 	return nil
+}
+
+func (c *container) contentSize() (int, int) {
+	horizontalSpace := c.paddingLeft + c.paddingRight
+	if c.borderLeft {
+		horizontalSpace++
+	}
+	if c.borderRight {
+		horizontalSpace++
+	}
+
+	verticalSpace := c.paddingTop + c.paddingBottom
+	if c.borderTop {
+		verticalSpace++
+	}
+	if c.borderBottom {
+		verticalSpace++
+	}
+
+	return max(0, c.width-horizontalSpace), max(0, c.height-verticalSpace)
 }
 
 func (c *container) GetSize() (int, int) {
@@ -119,6 +174,13 @@ func (c *container) BindingKeys() []key.Binding {
 		return b.BindingKeys()
 	}
 	return []key.Binding{}
+}
+
+func (c *container) CapturesKeys() bool {
+	if capturer, ok := c.content.(KeyCapturer); ok {
+		return capturer.CapturesKeys()
+	}
+	return false
 }
 
 type ContainerOption func(*container)

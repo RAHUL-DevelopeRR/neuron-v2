@@ -52,12 +52,28 @@ type RepoMap struct {
 	TotalSymbols int
 }
 
+// MaxDirsScanned caps the total number of directories visited to prevent
+// unbounded scans on huge workspaces (e.g. user home directory).
+const MaxDirsScanned = 500
+
 // Build constructs a RepoMap by walking the workspace directory.
+// Returns an empty RepoMap if the workspace is too large or is the user's
+// home directory (which contains Downloads, AppData, etc.).
 func Build(workspaceRoot string) *RepoMap {
+	// Guard: skip home directory — scanning it takes minutes
+	if home, err := os.UserHomeDir(); err == nil {
+		cleanRoot := filepath.Clean(workspaceRoot)
+		cleanHome := filepath.Clean(home)
+		if cleanRoot == cleanHome {
+			return &RepoMap{Root: workspaceRoot}
+		}
+	}
+
 	entries := make(map[string]*FileEntry)
 	fileCount := 0
+	dirCount := 0
 
-	walkDir(workspaceRoot, workspaceRoot, entries, &fileCount)
+	walkDir(workspaceRoot, workspaceRoot, entries, &fileCount, &dirCount)
 
 	totalSymbols := 0
 	sortedEntries := make([]FileEntry, 0, len(entries))
@@ -112,14 +128,20 @@ func (rm *RepoMap) StatusLine() string {
 }
 
 // walkDir recursively walks directories, collecting file entries.
-func walkDir(root, current string, entries map[string]*FileEntry, fileCount *int) {
+// Aborts when fileCount exceeds MaxFiles or dirCount exceeds MaxDirsScanned.
+func walkDir(root, current string, entries map[string]*FileEntry, fileCount *int, dirCount *int) {
+	if *dirCount >= MaxDirsScanned {
+		return
+	}
+	*dirCount++
+
 	dirEntries, err := os.ReadDir(current)
 	if err != nil {
 		return
 	}
 
 	for _, de := range dirEntries {
-		if *fileCount >= MaxFiles {
+		if *fileCount >= MaxFiles || *dirCount >= MaxDirsScanned {
 			return
 		}
 
@@ -130,7 +152,7 @@ func walkDir(root, current string, entries map[string]*FileEntry, fileCount *int
 			if SkipDirs[name] || strings.HasPrefix(name, ".") {
 				continue
 			}
-			walkDir(root, path, entries, fileCount)
+			walkDir(root, path, entries, fileCount, dirCount)
 		} else if de.Type().IsRegular() {
 			ext := strings.TrimPrefix(filepath.Ext(name), ".")
 			if !SupportedExtensions[ext] {

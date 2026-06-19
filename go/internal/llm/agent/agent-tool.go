@@ -23,17 +23,27 @@ const (
 )
 
 type AgentParams struct {
-	Prompt string `json:"prompt"`
+	Prompt       string `json:"prompt"`
+	Description  string `json:"description,omitempty"`
+	SubagentType string `json:"subagent_type,omitempty"`
 }
 
 func (b *agentTool) Info() tools.ToolInfo {
 	return tools.ToolInfo{
 		Name:        AgentToolName,
-		Description: "Launch a new agent that has access to the following tools: GlobTool, GrepTool, LS, View. When you are searching for a keyword or file and are not confident that you will find the right match on the first try, use the Agent tool to perform the search for you. For example:\n\n- If you are searching for a keyword like \"config\" or \"logger\", or for questions like \"which file does X?\", the Agent tool is strongly recommended\n- If you want to read a specific file path, use the View or GlobTool tool instead of the Agent tool, to find the match more quickly\n- If you are searching for a specific class definition like \"class Foo\", use the GlobTool tool instead, to find the match more quickly\n\nUsage notes:\n1. Launch multiple agents concurrently whenever possible, to maximize performance; to do that, use a single message with multiple tool uses\n2. When the agent is done, it will return a single message back to you. The result returned by the agent is not visible to the user. To show the user the result, you should send a text message back to the user with a concise summary of the result.\n3. Each agent invocation is stateless. You will not be able to send additional messages to the agent, nor will the agent be able to communicate with you outside of its final report. Therefore, your prompt should contain a highly detailed task description for the agent to perform autonomously and you should specify exactly what information the agent should return back to you in its final and only message to you.\n4. The agent's outputs should generally be trusted\n5. IMPORTANT: The agent can not use Bash, Replace, Edit, so can not modify files. If you want to use these tools, use them directly instead of going through the agent.",
+		Description: "Launch a focused background sub-agent for a specific piece of work. The sub-agent has read/search tools only: GlobTool, GrepTool, LS, Sourcegraph, and View. Use it to investigate files, map a subsystem, compare approaches, or verify a change without flooding the main conversation context.\n\nUsage notes:\n1. Pick a clear subagent_type such as explore, plan, verify, review, or docs.\n2. The prompt must be detailed and self-contained because each sub-agent is stateless.\n3. Spawn multiple sub-agents in one assistant turn when the work can be split by subsystem or question.\n4. The sub-agent returns one final report. Summarize useful findings to the user yourself.\n5. Sub-agents cannot edit files or run Bash; use normal tools for mutations.",
 		Parameters: map[string]any{
 			"prompt": map[string]any{
 				"type":        "string",
 				"description": "The task for the agent to perform",
+			},
+			"description": map[string]any{
+				"type":        "string",
+				"description": "Short human-readable label for the delegated work",
+			},
+			"subagent_type": map[string]any{
+				"type":        "string",
+				"description": "Specialization hint such as explore, plan, verify, review, or docs",
 			},
 		},
 		Required: []string{"prompt"},
@@ -48,6 +58,12 @@ func (b *agentTool) Run(ctx context.Context, call tools.ToolCall) (tools.ToolRes
 	if params.Prompt == "" {
 		return tools.NewTextErrorResponse("prompt is required"), nil
 	}
+	if params.SubagentType == "" {
+		params.SubagentType = "explore"
+	}
+	if params.Description == "" {
+		params.Description = fmt.Sprintf("%s sub-agent", params.SubagentType)
+	}
 
 	sessionID, messageID := tools.GetContextValues(ctx)
 	if sessionID == "" || messageID == "" {
@@ -59,12 +75,14 @@ func (b *agentTool) Run(ctx context.Context, call tools.ToolCall) (tools.ToolRes
 		return tools.ToolResponse{}, fmt.Errorf("error creating agent: %s", err)
 	}
 
-	session, err := b.sessions.CreateTaskSession(ctx, call.ID, sessionID, "New Agent Session")
+	sessionTitle := fmt.Sprintf("%s: %s", params.SubagentType, params.Description)
+	session, err := b.sessions.CreateTaskSession(ctx, call.ID, sessionID, sessionTitle)
 	if err != nil {
 		return tools.ToolResponse{}, fmt.Errorf("error creating session: %s", err)
 	}
 
-	done, err := agent.Run(ctx, session.ID, params.Prompt)
+	prompt := fmt.Sprintf("You are a %s sub-agent.\n\nTask: %s\n\n%s", params.SubagentType, params.Description, params.Prompt)
+	done, err := agent.Run(ctx, session.ID, prompt)
 	if err != nil {
 		return tools.ToolResponse{}, fmt.Errorf("error generating agent: %s", err)
 	}
@@ -93,7 +111,7 @@ func (b *agentTool) Run(ctx context.Context, call tools.ToolCall) (tools.ToolRes
 	if err != nil {
 		return tools.ToolResponse{}, fmt.Errorf("error saving parent session: %s", err)
 	}
-	return tools.NewTextResponse(response.Content().String()), nil
+	return tools.NewTextResponse(fmt.Sprintf("[%s sub-agent] %s", params.SubagentType, response.Content().String())), nil
 }
 
 func NewAgentTool(

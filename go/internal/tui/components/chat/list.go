@@ -10,6 +10,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/opencode-ai/opencode/internal/app"
 	"github.com/opencode-ai/opencode/internal/message"
 	"github.com/opencode-ai/opencode/internal/pubsub"
@@ -87,6 +88,14 @@ func (m *messagesCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.currentMsgID = ""
 		m.rendering = false
 		return m, nil
+
+	case tea.MouseMsg:
+		switch msg.Type {
+		case tea.MouseWheelUp:
+			m.viewport.LineUp(3)
+		case tea.MouseWheelDown:
+			m.viewport.LineDown(3)
+		}
 
 	case tea.KeyMsg:
 		if key.Matches(msg, messageKeys.PageUp) || key.Matches(msg, messageKeys.PageDown) ||
@@ -169,6 +178,9 @@ func (m *messagesCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *messagesCmp) IsAgentWorking() bool {
+	if m.app.CoderAgent == nil {
+		return false
+	}
 	return m.app.CoderAgent.IsSessionBusy(m.session.ID)
 }
 
@@ -278,35 +290,64 @@ func (m *messagesCmp) View() string {
 			)
 	}
 	if len(m.messages) == 0 {
-		content := baseStyle.
-			Width(m.width).
-			Height(m.height - 1).
-			Render(
-				m.initialScreen(),
-			)
-
-		return baseStyle.
-			Width(m.width).
-			Render(
-				lipgloss.JoinVertical(
-					lipgloss.Top,
-					content,
-					"",
-					m.help(),
-				),
-			)
+		// Use lipgloss.Place() instead of .Width().Height().Render().
+		// Place() positions content without measuring/truncating individual
+		// lines, which is critical because the block-character banner
+		// (U+2588 etc.) has ambiguous cell width that .Width() miscalculates.
+		// This is the same approach used in lazy.go splash screen.
+		content := lipgloss.JoinVertical(
+			lipgloss.Top,
+			m.initialScreen(),
+			"",
+			m.help(),
+		)
+		return lipgloss.Place(m.width, m.height, lipgloss.Left, lipgloss.Top, content)
 	}
+
+	// Safety: if messages exist but viewport is empty, force re-render.
+	// This catches race conditions where message events arrive before
+	// the layout has set the component width.
+	if m.viewport.TotalLineCount() == 0 && len(m.messages) > 0 && m.width > 0 {
+		m.rerender()
+		m.viewport.GotoBottom()
+	}
+
+	// Render viewport with scrollbar
+	viewportContent := m.viewport.View()
+	scrollbar := m.renderScrollbar()
+	if scrollbar != "" {
+		viewportContent = lipgloss.JoinHorizontal(lipgloss.Top, viewportContent, scrollbar)
+	}
+	header := m.messageHeader()
+	parts := []string{}
+	if header != "" {
+		parts = append(parts, header)
+	}
+	parts = append(parts, viewportContent, m.working(), m.help())
 
 	return baseStyle.
 		Width(m.width).
 		Render(
 			lipgloss.JoinVertical(
 				lipgloss.Top,
-				m.viewport.View(),
-				m.working(),
-				m.help(),
+				parts...,
 			),
 		)
+}
+
+func (m *messagesCmp) messageHeader() string {
+	if m.width < 10 {
+		return ""
+	}
+	return lipgloss.JoinVertical(
+		lipgloss.Center,
+		logo(m.width),
+		repo(m.width),
+	)
+}
+
+func (m *messagesCmp) messageHeaderHeight() int {
+	return lipgloss.Height(m.messageHeader())
 }
 
 func hasToolsWithoutResponse(messages []message.Message) bool {
@@ -357,6 +398,8 @@ func (m *messagesCmp) working() string {
 			task = "Waiting for tool response..."
 		} else if hasUnfinishedToolCalls(m.messages) {
 			task = "Building tool call..."
+		} else if lastMessage.IsThinking() {
+			task = "Thinking..."
 		} else if !lastMessage.IsFinished() {
 			task = "Generating..."
 		}
@@ -377,7 +420,7 @@ func (m *messagesCmp) help() string {
 
 	text := ""
 
-	if m.app.CoderAgent.IsBusy() {
+	if m.app.CoderAgent != nil && m.app.CoderAgent.IsBusy() {
 		text += lipgloss.JoinHorizontal(
 			lipgloss.Left,
 			baseStyle.Foreground(t.TextMuted()).Bold(true).Render("press "),
@@ -395,21 +438,88 @@ func (m *messagesCmp) help() string {
 			baseStyle.Foreground(t.TextMuted()).Bold(true).Render(" and enter to add a new line"),
 		)
 	}
+	text += lipgloss.JoinHorizontal(
+		lipgloss.Left,
+		baseStyle.Foreground(t.TextMuted()).Bold(true).Render(" | "),
+		baseStyle.Foreground(t.Text()).Bold(true).Render("pgup/pgdn"),
+		baseStyle.Foreground(t.TextMuted()).Bold(true).Render(" scroll"),
+		baseStyle.Foreground(t.TextMuted()).Bold(true).Render(" | "),
+		baseStyle.Foreground(t.Text()).Bold(true).Render("alt+arrows"),
+		baseStyle.Foreground(t.TextMuted()).Bold(true).Render(" resize"),
+	)
+	if m.width > 0 {
+		text = ansi.Truncate(text, m.width, "...")
+	}
 	return baseStyle.
 		Width(m.width).
 		Render(text)
 }
 
-func (m *messagesCmp) initialScreen() string {
-	baseStyle := styles.BaseStyle()
+func (m *messagesCmp) renderScrollbar() string {
+	totalLines := m.viewport.TotalLineCount()
+	visibleLines := m.viewport.Height
+	if totalLines <= visibleLines || visibleLines <= 0 {
+		return "" // No scrollbar needed
+	}
 
-	return baseStyle.Width(m.width).Render(
-		lipgloss.JoinVertical(
-			lipgloss.Top,
-			header(m.width),
-			"",
-			lspsConfigured(m.width),
-		),
+	t := theme.CurrentTheme()
+
+	// Calculate thumb position and size
+	thumbSize := max(1, visibleLines*visibleLines/totalLines)
+	scrollRange := totalLines - visibleLines
+	if scrollRange <= 0 {
+		return ""
+	}
+	thumbPos := m.viewport.YOffset * (visibleLines - thumbSize) / scrollRange
+	if thumbPos < 0 {
+		thumbPos = 0
+	}
+	if thumbPos+thumbSize > visibleLines {
+		thumbPos = visibleLines - thumbSize
+	}
+
+	trackStyle := lipgloss.NewStyle().Foreground(t.TextMuted())
+	thumbStyle := lipgloss.NewStyle().Foreground(t.Primary())
+
+	var bar string
+	for i := 0; i < visibleLines; i++ {
+		if i > 0 {
+			bar += "\n"
+		}
+		if i >= thumbPos && i < thumbPos+thumbSize {
+			bar += thumbStyle.Render("┃")
+		} else {
+			bar += trackStyle.Render("│")
+		}
+	}
+	return bar
+}
+
+func (m *messagesCmp) initialScreen() string {
+	// Banner rendered with Center alignment to match the splash screen
+	// (lazy.go). The block chars in logo() have ambiguous widths that
+	// break with Width() constraints — use JoinVertical(Center) instead.
+	bannerSection := lipgloss.JoinVertical(
+		lipgloss.Center,
+		"",
+		logo(m.width),
+		"",
+		repo(m.width),
+	)
+
+	// Info section with standard left-aligned text
+	infoSection := lipgloss.JoinVertical(
+		lipgloss.Left,
+		cwd(m.width),
+		"",
+		lspsConfigured(m.width),
+	)
+
+	return lipgloss.JoinVertical(
+		lipgloss.Left,
+		bannerSection,
+		"",
+		infoSection,
 	)
 }
 
@@ -422,12 +532,17 @@ func (m *messagesCmp) rerender() {
 
 func (m *messagesCmp) SetSize(width, height int) tea.Cmd {
 	if m.width == width && m.height == height {
+		// Even if dimensions match, rerender if we have messages but
+		// empty viewport (catches the sidebar-add race condition).
+		if len(m.messages) > 0 && m.viewport.TotalLineCount() == 0 {
+			m.rerender()
+		}
 		return nil
 	}
 	m.width = width
 	m.height = height
-	m.viewport.Width = width
-	m.viewport.Height = height - 2
+	m.viewport.Width = max(1, width-1) // Reserve 1 col for scrollbar
+	m.viewport.Height = max(1, height-m.messageHeaderHeight()-2)
 	m.attachments.Width = width + 40
 	m.attachments.Height = 3
 	m.rerender()

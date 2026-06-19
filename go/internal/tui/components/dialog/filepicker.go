@@ -2,7 +2,6 @@ package dialog
 
 import (
 	"fmt"
-	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -19,15 +18,15 @@ import (
 	"github.com/opencode-ai/opencode/internal/logging"
 	"github.com/opencode-ai/opencode/internal/message"
 	"github.com/opencode-ai/opencode/internal/tui/image"
+	"github.com/opencode-ai/opencode/internal/tui/media"
 	"github.com/opencode-ai/opencode/internal/tui/styles"
 	"github.com/opencode-ai/opencode/internal/tui/theme"
 	"github.com/opencode-ai/opencode/internal/tui/util"
 )
 
 const (
-	maxAttachmentSize = int64(5 * 1024 * 1024) // 5MB
-	downArrow         = "down"
-	upArrow           = "up"
+	downArrow = "down"
+	upArrow   = "up"
 )
 
 type FilePrickerKeyMap struct {
@@ -229,31 +228,16 @@ func (f *filepickerCmp) addAttachmentToMessage() (tea.Model, tea.Cmd) {
 	}
 
 	selectedFilePath := f.selectedFile
-	if !isExtSupported(selectedFilePath) {
+	if !media.IsSupportedImage(selectedFilePath) {
 		logging.ErrorPersist("Unsupported file")
 		return f, nil
 	}
 
-	isFileLarge, err := image.ValidateFileSize(selectedFilePath, maxAttachmentSize)
+	attachment, err := media.AttachmentFromFile(selectedFilePath)
 	if err != nil {
-		logging.ErrorPersist("unable to read the image")
+		logging.ErrorPersist(err.Error())
 		return f, nil
 	}
-	if isFileLarge {
-		logging.ErrorPersist("file too large, max 5MB")
-		return f, nil
-	}
-
-	content, err := os.ReadFile(selectedFilePath)
-	if err != nil {
-		logging.ErrorPersist("Unable read selected file")
-		return f, nil
-	}
-
-	mimeBufferSize := min(512, len(content))
-	mimeType := http.DetectContentType(content[:mimeBufferSize])
-	fileName := filepath.Base(selectedFilePath)
-	attachment := message.Attachment{FilePath: selectedFilePath, FileName: fileName, MimeType: mimeType, Content: content}
 	f.selectedFile = ""
 	return f, util.CmdHandler(AttachmentAddedMsg{attachment})
 }
@@ -392,7 +376,7 @@ func (f *filepickerCmp) getCurrentFileBelowCursor() {
 
 	dir := f.dirs[f.cursor]
 	filename := dir.Name()
-	if !dir.IsDir() && isExtSupported(filename) {
+	if !dir.IsDir() && media.IsSupportedImage(filename) {
 		fullPath := f.cwdDetails.directory + "/" + dir.Name()
 
 		go func() {
@@ -443,7 +427,7 @@ func readDir(path string, showHidden bool) []os.DirEntry {
 		for _, dirEntry := range dirEntries {
 			isHidden, _ := IsHidden(dirEntry.Name())
 			if !isHidden {
-				if dirEntry.IsDir() || isExtSupported(dirEntry.Name()) {
+				if dirEntry.IsDir() || media.IsSupportedImage(dirEntry.Name()) {
 					sanitizedDirEntries = append(sanitizedDirEntries, dirEntry)
 				}
 			}
@@ -463,9 +447,4 @@ func readDir(path string, showHidden bool) []os.DirEntry {
 
 func IsHidden(file string) (bool, error) {
 	return strings.HasPrefix(file, "."), nil
-}
-
-func isExtSupported(path string) bool {
-	ext := strings.ToLower(filepath.Ext(path))
-	return (ext == ".jpg" || ext == ".jpeg" || ext == ".webp" || ext == ".png")
 }

@@ -48,9 +48,24 @@ func GetAgentPrompt(agentName config.AgentName, provider models.ModelProvider) s
 var (
 	onceContext    sync.Once
 	contextContent string
+	promptMu       sync.Mutex
 )
 
+// ResetWorkspaceCaches forces project context and repo-map content to be
+// rebuilt after the active workspace changes.
+func ResetWorkspaceCaches() {
+	promptMu.Lock()
+	defer promptMu.Unlock()
+	onceContext = sync.Once{}
+	contextContent = ""
+	onceRepoMap = sync.Once{}
+	repoMapContent = ""
+}
+
 func getContextFromPaths() string {
+	promptMu.Lock()
+	defer promptMu.Unlock()
+
 	onceContext.Do(func() {
 		var (
 			cfg          = config.Get()
@@ -65,71 +80,38 @@ func getContextFromPaths() string {
 }
 
 func processContextPaths(workDir string, paths []string) string {
-	var (
-		wg       sync.WaitGroup
-		resultCh = make(chan string)
-	)
-
-	// Track processed files to avoid duplicates
 	processedFiles := make(map[string]bool)
-	var processedMutex sync.Mutex
+	results := make([]string, 0)
 
 	for _, path := range paths {
-		wg.Add(1)
-		go func(p string) {
-			defer wg.Done()
-
-			if strings.HasSuffix(p, "/") {
-				filepath.WalkDir(filepath.Join(workDir, p), func(path string, d os.DirEntry, err error) error {
-					if err != nil {
-						return err
-					}
-					if !d.IsDir() {
-						// Check if we've already processed this file (case-insensitive)
-						processedMutex.Lock()
-						lowerPath := strings.ToLower(path)
-						if !processedFiles[lowerPath] {
-							processedFiles[lowerPath] = true
-							processedMutex.Unlock()
-
-							if result := processFile(path); result != "" {
-								resultCh <- result
-							}
-						} else {
-							processedMutex.Unlock()
+		if strings.HasSuffix(path, "/") {
+			_ = filepath.WalkDir(filepath.Join(workDir, path), func(path string, d os.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+				if !d.IsDir() {
+					lowerPath := strings.ToLower(path)
+					if !processedFiles[lowerPath] {
+						processedFiles[lowerPath] = true
+						if result := processFile(path); result != "" {
+							results = append(results, result)
 						}
 					}
-					return nil
-				})
-			} else {
-				fullPath := filepath.Join(workDir, p)
-
-				// Check if we've already processed this file (case-insensitive)
-				processedMutex.Lock()
-				lowerPath := strings.ToLower(fullPath)
-				if !processedFiles[lowerPath] {
-					processedFiles[lowerPath] = true
-					processedMutex.Unlock()
-
-					result := processFile(fullPath)
-					if result != "" {
-						resultCh <- result
-					}
-				} else {
-					processedMutex.Unlock()
 				}
+				return nil
+			})
+			continue
+		}
+
+		fullPath := filepath.Join(workDir, path)
+		lowerPath := strings.ToLower(fullPath)
+		if !processedFiles[lowerPath] {
+			processedFiles[lowerPath] = true
+			result := processFile(fullPath)
+			if result != "" {
+				results = append(results, result)
 			}
-		}(path)
-	}
-
-	go func() {
-		wg.Wait()
-		close(resultCh)
-	}()
-
-	results := make([]string, 0)
-	for result := range resultCh {
-		results = append(results, result)
+		}
 	}
 
 	return strings.Join(results, "\n")
@@ -140,7 +122,7 @@ func processFile(filePath string) string {
 	if err != nil {
 		return ""
 	}
-	return "# From:" + filePath + "\n" + string(content)
+	return "# From:" + filepath.ToSlash(filePath) + "\n" + string(content)
 }
 
 // Repo map — Windsurf Cascade equivalent
@@ -150,6 +132,9 @@ var (
 )
 
 func getRepoMapContext() string {
+	promptMu.Lock()
+	defer promptMu.Unlock()
+
 	onceRepoMap.Do(func() {
 		cfg := config.Get()
 		workDir := cfg.WorkingDir

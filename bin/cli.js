@@ -4,12 +4,12 @@
  * NeuronCLI — Universal Launcher
  *
  * This is the npm bin entry point. It:
- * 1. Locates the bundled Rust binary (neuron.exe / neuron)
- * 2. Forwards all CLI arguments to the Rust engine
+ * 1. Locates the bundled native binary (neuron.exe / neuron)
+ * 2. Forwards all CLI arguments to the native engine
  * 3. Handles --tui flag to launch the React/Ink TUI instead
  *
  * Install: npm install -g @anthropic-ai/neuron
- * Usage:   neuron [args]          — launches Rust CLI
+ * Usage:   neuron [args]          — launches native CLI
  *          neuron --tui           — launches React TUI preview
  *          neuron --version       — shows version
  *          neuron auth status     — shows auth state
@@ -25,24 +25,44 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const ROOT = resolve(__dirname, "..");
 
-// ── Locate the Rust binary ───────────────────────────────────
+// ── Locate the native binary ─────────────────────────────────
+
+function goPlatform() {
+  if (platform === "win32") return "windows";
+  if (platform === "darwin") return "darwin";
+  return platform;
+}
+
+function goArch() {
+  if (arch === "x64") return "amd64";
+  return arch;
+}
 
 function findBinary() {
   const binaryName = platform === "win32" ? "neuron.exe" : "neuron";
+  const platformBinary = `neuron-${goPlatform()}-${goArch()}${platform === "win32" ? ".exe" : ""}`;
 
-  // 1. Check bundled location (inside npm package)
+  // 1. Check bundled platform-specific location (inside npm package).
+  const bundledPlatform = join(ROOT, "neuron_cli", "bin", platformBinary);
+  if (existsSync(bundledPlatform)) return bundledPlatform;
+
+  // 2. Check legacy bundled location.
   const bundled = join(ROOT, "neuron_cli", binaryName);
   if (existsSync(bundled)) return bundled;
 
-  // 2. Check build output (development)
+  // 3. Check Go build output (development).
+  const goBuild = join(ROOT, "go", binaryName);
+  if (existsSync(goBuild)) return goBuild;
+
+  // 4. Check Rust build output (development).
   const devBuild = join(ROOT, "rust", "target", "release", binaryName);
   if (existsSync(devBuild)) return devBuild;
 
-  // 3. Check debug build
+  // 5. Check debug build.
   const debugBuild = join(ROOT, "rust", "target", "debug", binaryName);
   if (existsSync(debugBuild)) return debugBuild;
 
-  // 4. Check PATH
+  // 6. Check PATH.
   const pathDirs = (env.PATH || "").split(platform === "win32" ? ";" : ":");
   for (const dir of pathDirs) {
     const candidate = join(dir, binaryName);
@@ -52,14 +72,16 @@ function findBinary() {
   console.error(`
   ✗ NeuronCLI binary not found.
 
-  The Rust binary '${binaryName}' was not found in:
-    • ${join(ROOT, "neuron_cli")}
-    • ${join(ROOT, "rust", "target", "release")}
-    • System PATH
+  The native binary '${binaryName}' was not found in:
+    - ${join(ROOT, "neuron_cli", "bin")}
+    - ${join(ROOT, "neuron_cli")}
+    - ${join(ROOT, "go")}
+    - ${join(ROOT, "rust", "target", "release")}
+    - System PATH
 
   To fix:
     pip install neuroncli        (includes pre-built binary)
-    cd rust && cargo build --release   (build from source)
+    cd go && go build -o ${binaryName} main.go   (build from source)
   `);
   process.exit(1);
 }
@@ -68,7 +90,7 @@ function findBinary() {
 
 const args = process.argv.slice(2);
 
-// --tui flag → launch React TUI instead of Rust CLI
+// --tui flag → launch React TUI instead of native CLI
 if (args.includes("--tui")) {
   const tuiArgs = args.filter((a) => a !== "--tui");
 
@@ -91,7 +113,7 @@ if (args.includes("--tui")) {
     process.exit(1);
   }
 } else {
-  // Default: launch Rust binary
+  // Default: launch native binary
   const binary = findBinary();
   const child = spawn(binary, args, {
     stdio: "inherit",
