@@ -16,6 +16,7 @@ import (
 	"github.com/opencode-ai/opencode/internal/pubsub"
 	"github.com/opencode-ai/opencode/internal/session"
 	"github.com/opencode-ai/opencode/internal/tui/components/dialog"
+	"github.com/opencode-ai/opencode/internal/tui/components/terminal"
 	"github.com/opencode-ai/opencode/internal/tui/styles"
 	"github.com/opencode-ai/opencode/internal/tui/theme"
 	"github.com/opencode-ai/opencode/internal/tui/util"
@@ -37,6 +38,7 @@ type messagesCmp struct {
 	spinner       spinner.Model
 	rendering     bool
 	attachments   viewport.Model
+	focused       bool
 }
 type renderFinishedMsg struct{}
 
@@ -74,6 +76,14 @@ func (m *messagesCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 	switch msg := msg.(type) {
 	case dialog.ThemeChangedMsg:
+		m.rerender()
+		return m, nil
+	case PaneFocusMsg:
+		m.focused = msg.Pane == PaneChat
+		m.rerender()
+		return m, nil
+	case terminal.TerminalFocusMsg:
+		m.focused = !msg.Focused
 		m.rerender()
 		return m, nil
 	case SessionSelectedMsg:
@@ -276,6 +286,7 @@ func (m *messagesCmp) renderView() {
 
 func (m *messagesCmp) View() string {
 	baseStyle := styles.BaseStyle()
+	header := m.messageHeader()
 
 	if m.rendering {
 		return baseStyle.
@@ -283,6 +294,7 @@ func (m *messagesCmp) View() string {
 			Render(
 				lipgloss.JoinVertical(
 					lipgloss.Top,
+					header,
 					"Loading...",
 					m.working(),
 					m.help(),
@@ -290,13 +302,9 @@ func (m *messagesCmp) View() string {
 			)
 	}
 	if len(m.messages) == 0 {
-		// Use lipgloss.Place() instead of .Width().Height().Render().
-		// Place() positions content without measuring/truncating individual
-		// lines, which is critical because the block-character banner
-		// (U+2588 etc.) has ambiguous cell width that .Width() miscalculates.
-		// This is the same approach used in lazy.go splash screen.
 		content := lipgloss.JoinVertical(
 			lipgloss.Top,
+			header,
 			m.initialScreen(),
 			"",
 			m.help(),
@@ -318,7 +326,6 @@ func (m *messagesCmp) View() string {
 	if scrollbar != "" {
 		viewportContent = lipgloss.JoinHorizontal(lipgloss.Top, viewportContent, scrollbar)
 	}
-	header := m.messageHeader()
 	parts := []string{}
 	if header != "" {
 		parts = append(parts, header)
@@ -339,8 +346,22 @@ func (m *messagesCmp) messageHeader() string {
 	if m.width < 10 {
 		return ""
 	}
+	t := theme.CurrentTheme()
+	label := "CHAT"
+	color := t.TextMuted()
+	if m.focused {
+		label = "CHAT [ACTIVE]"
+		color = t.Primary()
+	}
+	title := styles.BaseStyle().
+		Width(m.width).
+		Foreground(color).
+		Background(t.BackgroundSecondary()).
+		Bold(true).
+		Render(label)
 	return lipgloss.JoinVertical(
 		lipgloss.Center,
+		title,
 		logo(m.width),
 		repo(m.width),
 	)
@@ -496,30 +517,11 @@ func (m *messagesCmp) renderScrollbar() string {
 }
 
 func (m *messagesCmp) initialScreen() string {
-	// Banner rendered with Center alignment to match the splash screen
-	// (lazy.go). The block chars in logo() have ambiguous widths that
-	// break with Width() constraints — use JoinVertical(Center) instead.
-	bannerSection := lipgloss.JoinVertical(
-		lipgloss.Center,
-		"",
-		logo(m.width),
-		"",
-		repo(m.width),
-	)
-
-	// Info section with standard left-aligned text
-	infoSection := lipgloss.JoinVertical(
+	return lipgloss.JoinVertical(
 		lipgloss.Left,
 		cwd(m.width),
 		"",
 		lspsConfigured(m.width),
-	)
-
-	return lipgloss.JoinVertical(
-		lipgloss.Left,
-		bannerSection,
-		"",
-		infoSection,
 	)
 }
 
@@ -598,5 +600,6 @@ func NewMessagesCmp(app *app.App) tea.Model {
 		viewport:      vp,
 		spinner:       s,
 		attachments:   attachmets,
+		focused:       true,
 	}
 }

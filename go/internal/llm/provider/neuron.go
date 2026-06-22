@@ -9,11 +9,11 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/opencode-ai/opencode/internal/auth"
 	"github.com/opencode-ai/opencode/internal/llm/models"
 	"github.com/opencode-ai/opencode/internal/llm/tools"
 	"github.com/opencode-ai/opencode/internal/logging"
@@ -32,66 +32,32 @@ var (
 	sharedGatewayURL   string
 )
 
-type sessionCache struct {
-	SessionToken string `json:"session_token"`
-	Token        string `json:"token,omitempty"`
-	UserID       string `json:"user_id,omitempty"`
-	Plan         string `json:"plan,omitempty"`
-	GatewayURL   string `json:"gateway_url,omitempty"`
-	Timestamp    int64  `json:"timestamp"`
-	ExpiresAt    int64  `json:"expires_at,omitempty"`
-}
-
-func getSessionCachePath() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".neuroncli", "session.json")
-}
-
-func getLegacySessionCachePath() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".neuron", "session_cache.json")
-}
-
 func loadCachedSession() string {
-	for _, path := range []string{getSessionCachePath(), getLegacySessionCachePath()} {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		var cache sessionCache
-		if err := json.Unmarshal(data, &cache); err != nil {
-			continue
-		}
-		token := cache.SessionToken
-		if token == "" {
-			token = cache.Token
-		}
-		if token == "" {
-			continue
-		}
-		if cache.ExpiresAt > 0 && time.Now().Unix() > cache.ExpiresAt {
-			continue
-		}
-		if cache.ExpiresAt == 0 && time.Now().Unix()-cache.Timestamp > 12*60*60 {
-			continue
-		}
-		return token
+	cache, _, ok := auth.LoadSession()
+	if !ok {
+		return ""
 	}
-	return ""
+	return cache.SessionToken
 }
 
 func saveCachedSession(session neuronSessionResponse, gatewayURL string) {
-	cachePath := getSessionCachePath()
-	os.MkdirAll(filepath.Dir(cachePath), 0755)
-	data, _ := json.MarshalIndent(sessionCache{
+	cache := auth.SessionCache{
 		SessionToken: session.SessionToken,
 		UserID:       session.UserID,
+		Email:        session.Email,
+		Name:         session.Name,
+		ImageURL:     session.ImageURL,
 		Plan:         session.Plan,
 		GatewayURL:   gatewayURL,
+		Provider:     session.Provider,
 		Timestamp:    time.Now().Unix(),
 		ExpiresAt:    session.ExpiresAt,
-	}, "", "  ")
-	os.WriteFile(cachePath, data, 0644)
+		Quota:        session.Quota,
+		Usage:        session.Usage,
+	}
+	if err := auth.SaveSession(cache); err != nil {
+		logging.Warn("Failed to cache NeuronCLI session", "error", err)
+	}
 }
 
 // initSharedSession starts the async session fetch. Call once at startup.
@@ -190,12 +156,18 @@ func newNeuronClient(opts providerClientOptions) *NeuronClient {
 }
 
 type neuronSessionResponse struct {
-	SessionToken string   `json:"session_token"`
-	Models       []string `json:"models"`
-	UserID       string   `json:"user_id"`
-	Plan         string   `json:"plan"`
-	ExpiresAt    int64    `json:"expires_at"`
-	Error        string   `json:"error"`
+	SessionToken string     `json:"session_token"`
+	Models       []string   `json:"models"`
+	UserID       string     `json:"user_id"`
+	Email        string     `json:"email"`
+	Name         string     `json:"name"`
+	ImageURL     string     `json:"image_url"`
+	Plan         string     `json:"plan"`
+	Provider     string     `json:"provider"`
+	ExpiresAt    int64      `json:"expires_at"`
+	Quota        auth.Quota `json:"quota"`
+	Usage        auth.Usage `json:"usage"`
+	Error        string     `json:"error"`
 }
 
 // Converts our internal message format to OpenAI-compatible format for the gateway

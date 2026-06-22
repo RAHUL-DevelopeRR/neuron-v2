@@ -442,6 +442,47 @@ func renderToolParams(paramWidth int, toolCall message.ToolCall) string {
 	return params
 }
 
+func renderToolInputBlock(toolCall message.ToolCall, width int) string {
+	t := theme.CurrentTheme()
+	baseStyle := styles.BaseStyle()
+	content := ""
+
+	switch toolCall.Name {
+	case tools.BashToolName:
+		var params tools.BashParams
+		if err := json.Unmarshal([]byte(toolCall.Input), &params); err == nil && strings.TrimSpace(params.Command) != "" {
+			content = "$ " + params.Command
+			if params.Timeout > 0 {
+				content += fmt.Sprintf("\ntimeout: %dms", params.Timeout)
+			}
+		}
+	case agent.AgentToolName:
+		var params agent.AgentParams
+		if err := json.Unmarshal([]byte(toolCall.Input), &params); err == nil && strings.TrimSpace(params.Prompt) != "" {
+			content = params.Prompt
+		}
+	}
+
+	if strings.TrimSpace(content) == "" {
+		content = strings.TrimSpace(toolCall.Input)
+	}
+	if strings.TrimSpace(content) == "" {
+		return ""
+	}
+
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		lines[i] = ansi.Truncate(line, max(1, width-4), "...")
+	}
+	return baseStyle.
+		Width(width).
+		Foreground(t.Text()).
+		Background(t.BackgroundDarker()).
+		PaddingLeft(1).
+		PaddingRight(1).
+		Render(strings.Join(lines, "\n"))
+}
+
 func truncateHeight(content string, height int) string {
 	lines := strings.Split(content, "\n")
 	if len(lines) > height {
@@ -614,6 +655,9 @@ func renderToolMessage(
 			Render(params)
 
 		parts = append(parts, lipgloss.JoinHorizontal(lipgloss.Left, toolNameText, formattedParams))
+		if inputBlock := renderToolInputBlock(toolCall, width-2); inputBlock != "" {
+			parts = append(parts, inputBlock)
+		}
 	} else {
 		prefix := baseStyle.
 			Foreground(t.TextMuted()).

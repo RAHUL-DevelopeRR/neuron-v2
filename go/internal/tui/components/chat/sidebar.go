@@ -2,6 +2,7 @@ package chat
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -9,9 +10,12 @@ import (
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/opencode-ai/opencode/internal/config"
 	"github.com/opencode-ai/opencode/internal/diff"
 	"github.com/opencode-ai/opencode/internal/history"
+	"github.com/opencode-ai/opencode/internal/llm/agent"
+	"github.com/opencode-ai/opencode/internal/llm/tools"
 	"github.com/opencode-ai/opencode/internal/message"
 	"github.com/opencode-ai/opencode/internal/pubsub"
 	"github.com/opencode-ai/opencode/internal/session"
@@ -25,14 +29,25 @@ type sidebarCmp struct {
 	session       session.Session
 	history       history.Service
 	diffRatio     float64
+	focusTerminal bool
 	modFiles      map[string]struct {
 		additions int
 		removals  int
 	}
+	toolTimeline []toolTimelineEntry
+	toolIndex    map[string]int
 
 	// New panels
 	diffPanel     *diffPanelCmp
 	terminalPanel *terminalPanelCmp
+}
+
+type toolTimelineEntry struct {
+	id      string
+	name    string
+	summary string
+	status  string
+	isError bool
 }
 
 type sidebarKeyMap struct {
@@ -81,6 +96,11 @@ func (m *sidebarCmp) Init() tea.Cmd {
 		})
 		if m.diffPanel != nil {
 			m.diffPanel.Init()
+		}
+	}
+	if m.terminalPanel != nil {
+		if cmd := m.terminalPanel.startShell(); cmd != nil {
+			cmds = append(cmds, cmd)
 		}
 	}
 
@@ -142,6 +162,10 @@ func (m *sidebarCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 	case terminal.TerminalFocusMsg:
+		m.focusTerminal = msg.Focused
+		if m.diffPanel != nil {
+			m.diffPanel.SetFocus(!msg.Focused)
+		}
 		if m.terminalPanel != nil {
 			_, cmd := m.terminalPanel.Update(msg)
 			return m, cmd
@@ -186,8 +210,12 @@ func (m *sidebarCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 	case pubsub.Event[message.Message]:
-		// Extract bash tool results and forward to terminal panel
-		if m.terminalPanel != nil && msg.Payload.Role == message.User {
+		if msg.Payload.SessionID == m.session.ID {
+			m.recordToolCalls(msg.Payload.ToolCalls())
+			m.recordToolResults(msg.Payload.ToolResults())
+		}
+		// Extract tool results and forward to terminal panel if this panel opts into it.
+		if m.terminalPanel != nil && msg.Payload.Role == message.Tool {
 			for _, result := range msg.Payload.ToolResults() {
 				if result.Content != "" {
 					m.terminalPanel.AddOutput("", result.Content, result.IsError)
@@ -230,7 +258,16 @@ func (m *sidebarCmp) View() string {
 	dividerHeight := 1
 
 	// ── Remaining height for panels ──
-	remainingHeight := m.height - bannerHeight - (dividerHeight * 2) - 1
+	timelineHeight := 4
+	if len(m.toolTimeline) > 3 && m.height >= 26 {
+		timelineHeight = 6
+	}
+	if m.height < 20 {
+		timelineHeight = 3
+	}
+	timelineView := clipContent(m.commandTimelineView(contentWidth, timelineHeight), contentWidth, timelineHeight)
+
+	remainingHeight := m.height - bannerHeight - timelineHeight - (dividerHeight * 3) - 1
 	if remainingHeight < 4 {
 		remainingHeight = 4
 	}
@@ -271,6 +308,8 @@ func (m *sidebarCmp) View() string {
 	content := lipgloss.JoinVertical(
 		lipgloss.Top,
 		bannerSection,
+		divider,
+		timelineView,
 		divider,
 		diffView,
 		divider,
@@ -451,6 +490,171 @@ func (m *sidebarCmp) panelHeights(available int) (int, int) {
 	return diffHeight, available - diffHeight
 }
 
+func (m *sidebarCmp) commandTimelineView(width, height int) string {
+	t := theme.CurrentTheme()
+	baseStyle := styles.BaseStyle()
+	title := baseStyle.
+		Width(width).
+		Foreground(t.Primary()).
+		Background(t.BackgroundSecondary()).
+		Bold(true).
+		Render("COMMAND TIMELINE")
+
+	if height <= 1 {
+		return title
+	}
+
+	lineHeight := height - 1
+	if len(m.toolTimeline) == 0 {
+		empty := baseStyle.
+			Width(width).
+			Height(lineHeight).
+			Foreground(t.TextMuted()).
+			Italic(true).
+			Render("  Waiting for tool calls")
+		return lipgloss.JoinVertical(lipgloss.Top, title, empty)
+	}
+
+	start := max(0, len(m.toolTimeline)-lineHeight)
+	rows := make([]string, 0, lineHeight)
+	for _, item := range m.toolTimeline[start:] {
+		statusColor := t.TextMuted()
+		switch item.status {
+		case "running":
+			statusColor = t.Primary()
+		case "done":
+			statusColor = t.Success()
+		case "error":
+			statusColor = t.Error()
+		}
+		name := baseStyle.Foreground(statusColor).Bold(true).Render(item.name)
+		status := baseStyle.Foreground(statusColor).Render(item.status)
+		summaryWidth := max(1, width-lipgloss.Width(name)-lipgloss.Width(status)-4)
+		summary := baseStyle.
+			Foreground(t.Text()).
+			Render(ansi.Truncate(item.summary, summaryWidth, "..."))
+		rows = append(rows, baseStyle.Width(width).Render(name+" "+summary+" "+status))
+	}
+	return lipgloss.JoinVertical(lipgloss.Top, title, strings.Join(rows, "\n"))
+}
+
+func (m *sidebarCmp) recordToolCalls(calls []message.ToolCall) {
+	if len(calls) == 0 {
+		return
+	}
+	if m.toolIndex == nil {
+		m.toolIndex = make(map[string]int)
+	}
+	for _, call := range calls {
+		name := toolName(call.Name)
+		summary := summaryForToolCall(call)
+		status := "running"
+		if call.Finished {
+			status = "sent"
+		}
+		if idx, ok := m.toolIndex[call.ID]; ok && idx < len(m.toolTimeline) {
+			m.toolTimeline[idx].name = name
+			m.toolTimeline[idx].summary = summary
+			m.toolTimeline[idx].status = status
+			continue
+		}
+		m.toolIndex[call.ID] = len(m.toolTimeline)
+		m.toolTimeline = append(m.toolTimeline, toolTimelineEntry{
+			id:      call.ID,
+			name:    name,
+			summary: summary,
+			status:  status,
+		})
+	}
+	m.trimTimeline()
+}
+
+func (m *sidebarCmp) recordToolResults(results []message.ToolResult) {
+	if len(results) == 0 || m.toolIndex == nil {
+		return
+	}
+	for _, result := range results {
+		idx, ok := m.toolIndex[result.ToolCallID]
+		if !ok || idx >= len(m.toolTimeline) {
+			continue
+		}
+		m.toolTimeline[idx].isError = result.IsError
+		if result.IsError {
+			m.toolTimeline[idx].status = "error"
+		} else {
+			m.toolTimeline[idx].status = "done"
+		}
+	}
+}
+
+func (m *sidebarCmp) trimTimeline() {
+	const maxEntries = 80
+	if len(m.toolTimeline) <= maxEntries {
+		return
+	}
+	m.toolTimeline = append([]toolTimelineEntry(nil), m.toolTimeline[len(m.toolTimeline)-maxEntries:]...)
+	m.toolIndex = make(map[string]int, len(m.toolTimeline))
+	for i, item := range m.toolTimeline {
+		m.toolIndex[item.id] = i
+	}
+}
+
+func summaryForToolCall(call message.ToolCall) string {
+	switch call.Name {
+	case tools.BashToolName:
+		var params tools.BashParams
+		if err := json.Unmarshal([]byte(call.Input), &params); err == nil && strings.TrimSpace(params.Command) != "" {
+			return "$ " + oneLine(params.Command)
+		}
+	case agent.AgentToolName:
+		var params agent.AgentParams
+		if err := json.Unmarshal([]byte(call.Input), &params); err == nil && strings.TrimSpace(params.Prompt) != "" {
+			return oneLine(params.Prompt)
+		}
+	case tools.EditToolName:
+		var params tools.EditParams
+		if err := json.Unmarshal([]byte(call.Input), &params); err == nil && strings.TrimSpace(params.FilePath) != "" {
+			return removeWorkingDirPrefix(params.FilePath)
+		}
+	case tools.WriteToolName:
+		var params tools.WriteParams
+		if err := json.Unmarshal([]byte(call.Input), &params); err == nil && strings.TrimSpace(params.FilePath) != "" {
+			return removeWorkingDirPrefix(params.FilePath)
+		}
+	case tools.ViewToolName:
+		var params tools.ViewParams
+		if err := json.Unmarshal([]byte(call.Input), &params); err == nil && strings.TrimSpace(params.FilePath) != "" {
+			return removeWorkingDirPrefix(params.FilePath)
+		}
+	case tools.GrepToolName:
+		var params tools.GrepParams
+		if err := json.Unmarshal([]byte(call.Input), &params); err == nil && strings.TrimSpace(params.Pattern) != "" {
+			return oneLine(params.Pattern)
+		}
+	case tools.GlobToolName:
+		var params tools.GlobParams
+		if err := json.Unmarshal([]byte(call.Input), &params); err == nil && strings.TrimSpace(params.Pattern) != "" {
+			return oneLine(params.Pattern)
+		}
+	case tools.LSToolName:
+		var params tools.LSParams
+		if err := json.Unmarshal([]byte(call.Input), &params); err == nil {
+			if strings.TrimSpace(params.Path) == "" {
+				return "."
+			}
+			return removeWorkingDirPrefix(params.Path)
+		}
+	}
+	if strings.TrimSpace(call.Input) == "" {
+		return "preparing"
+	}
+	return oneLine(call.Input)
+}
+
+func oneLine(value string) string {
+	return strings.Join(strings.Fields(value), " ")
+}
+
 func (m *sidebarCmp) mouseInTerminal(y int) bool {
 	contentWidth := max(1, m.width-6)
 	bannerLogo := logo(contentWidth)
@@ -464,12 +668,19 @@ func (m *sidebarCmp) mouseInTerminal(y int) bool {
 		"",
 		cwd(contentWidth),
 	)
-	remainingHeight := m.height - lipgloss.Height(bannerSection) - 3
+	timelineHeight := 4
+	if len(m.toolTimeline) > 3 && m.height >= 26 {
+		timelineHeight = 6
+	}
+	if m.height < 20 {
+		timelineHeight = 3
+	}
+	remainingHeight := m.height - lipgloss.Height(bannerSection) - timelineHeight - 4
 	if remainingHeight < 4 {
 		remainingHeight = 4
 	}
 	diffHeight, _ := m.panelHeights(remainingHeight)
-	terminalStart := lipgloss.Height(bannerSection) + 2 + diffHeight
+	terminalStart := lipgloss.Height(bannerSection) + timelineHeight + 3 + diffHeight
 	return y >= terminalStart
 }
 
@@ -478,6 +689,7 @@ func NewSidebarCmp(session session.Session, history history.Service) tea.Model {
 		session:       session,
 		history:       history,
 		diffRatio:     0.60,
+		toolIndex:     make(map[string]int),
 		diffPanel:     NewDiffPanel(session.ID, history),
 		terminalPanel: NewTerminalPanel(),
 	}

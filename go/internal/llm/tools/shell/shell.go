@@ -66,16 +66,16 @@ func GetPersistentShell(workingDir string) *PersistentShell {
 func newPersistentShell(cwd string) *PersistentShell {
 	// Get shell configuration from config
 	cfg := config.Get()
-	
+
 	// Default to environment variable if config is not set or nil
 	var shellPath string
 	var shellArgs []string
-	
+
 	if cfg != nil {
 		shellPath = cfg.Shell.Path
 		shellArgs = cfg.Shell.Args
 	}
-	
+
 	if shellPath == "" {
 		shellPath = os.Getenv("SHELL")
 		if shellPath == "" {
@@ -86,7 +86,7 @@ func newPersistentShell(cwd string) *PersistentShell {
 			}
 		}
 	}
-	
+
 	// Default shell args
 	if len(shellArgs) == 0 {
 		if isWindows() {
@@ -353,12 +353,8 @@ func execDirect(ctx context.Context, command string, timeoutMs int) (string, str
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	var cmd *exec.Cmd
-	if isWindows() {
-		cmd = exec.CommandContext(ctx, "cmd.exe", "/C", command)
-	} else {
-		cmd = exec.CommandContext(ctx, "/bin/sh", "-c", command)
-	}
+	shellPath, shellArgs := oneShotShellCommand(command)
+	cmd := exec.CommandContext(ctx, shellPath, shellArgs...)
 	cmd.Dir = config.WorkingDirectory()
 
 	var stdout, stderr strings.Builder
@@ -379,4 +375,44 @@ func execDirect(ctx context.Context, command string, timeoutMs int) (string, str
 	}
 
 	return stdout.String(), stderr.String(), exitCode, interrupted, nil
+}
+
+func oneShotShellCommand(command string) (string, []string) {
+	cfg := config.Get()
+	var configuredPath string
+	var configuredArgs []string
+	if cfg != nil {
+		configuredPath = strings.TrimSpace(cfg.Shell.Path)
+		configuredArgs = append([]string(nil), cfg.Shell.Args...)
+	}
+
+	if isWindows() {
+		if configuredPath != "" {
+			base := strings.ToLower(filepath.Base(configuredPath))
+			switch {
+			case strings.Contains(base, "pwsh"), strings.Contains(base, "powershell"):
+				return configuredPath, append(configuredArgs, "-NoProfile", "-Command", command)
+			case strings.Contains(base, "cmd"):
+				return configuredPath, append(configuredArgs, "/D", "/C", command)
+			}
+		}
+		if ps, err := exec.LookPath("pwsh.exe"); err == nil {
+			return ps, []string{"-NoLogo", "-NoProfile", "-Command", command}
+		}
+		if ps, err := exec.LookPath("powershell.exe"); err == nil {
+			return ps, []string{"-NoLogo", "-NoProfile", "-Command", command}
+		}
+		if comspec := os.Getenv("COMSPEC"); comspec != "" {
+			return comspec, []string{"/D", "/C", command}
+		}
+		return "cmd.exe", []string{"/D", "/C", command}
+	}
+
+	if configuredPath != "" {
+		return configuredPath, append(configuredArgs, "-c", command)
+	}
+	if shell := os.Getenv("SHELL"); shell != "" {
+		return shell, []string{"-lc", command}
+	}
+	return "/bin/sh", []string{"-c", command}
 }

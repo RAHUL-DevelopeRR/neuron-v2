@@ -463,9 +463,9 @@ func (m *Model) renderTitleBar(t theme.Theme) string {
 
 	helpStyle := lipgloss.NewStyle().
 		Foreground(t.TextMuted())
-	helpText := "ctrl+x terminal"
+	helpText := "ctrl+x terminal  pgup/pgdn scroll"
 	if m.focused {
-		helpText = "ctrl+x editor"
+		helpText = "ctrl+x editor  pgup/pgdn scroll"
 	}
 	helpLabel := helpStyle.Render(helpText)
 

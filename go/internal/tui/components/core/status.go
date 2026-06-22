@@ -7,6 +7,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/opencode-ai/opencode/internal/auth"
 	"github.com/opencode-ai/opencode/internal/config"
 	"github.com/opencode-ai/opencode/internal/llm/models"
 	"github.com/opencode-ai/opencode/internal/lsp"
@@ -113,7 +114,7 @@ func formatTokensAndCost(tokens, contextWindow int64, cost float64) string {
 		formattedTokens = fmt.Sprintf("%s(%d%%)", styles.WarningIcon, int(percentage))
 	}
 
-	return fmt.Sprintf("Context: %s, Cost: %s", formattedTokens, formattedCost)
+	return fmt.Sprintf("Ctx %s  Cost %s", formattedTokens, formattedCost)
 }
 
 func (m statusCmp) View() string {
@@ -124,10 +125,11 @@ func (m statusCmp) View() string {
 		model = models.SupportedModels[models.NeuronKimiK25]
 	}
 
-	// Initialize the help widget
-	status := getHelpWidget()
+	help := getHelpWidget()
+	modelChip := m.model()
+	authChip := m.authChip()
 
-	tokenInfoWidth := 0
+	tokenInfo := ""
 	if m.session.ID != "" {
 		totalTokens := m.session.PromptTokens + m.session.CompletionTokens
 		tokens := formatTokensAndCost(totalTokens, model.ContextWindow, m.session.Cost)
@@ -138,20 +140,25 @@ func (m statusCmp) View() string {
 		if percentage > 80 {
 			tokensStyle = tokensStyle.Background(t.Warning())
 		}
-		tokenInfoWidth = lipgloss.Width(tokens) + 2
-		status += tokensStyle.Render(tokens)
+		tokenInfo = tokensStyle.Render(tokens)
 	}
 
 	diagnostics := styles.Padded().
 		Background(t.BackgroundDarker()).
 		Render(m.projectDiagnostics())
 
-	availableWidht := max(0, m.width-lipgloss.Width(helpWidget)-lipgloss.Width(m.model())-lipgloss.Width(diagnostics)-tokenInfoWidth)
+	fixedWidth := lipgloss.Width(help) + lipgloss.Width(tokenInfo) + lipgloss.Width(authChip) + lipgloss.Width(diagnostics) + lipgloss.Width(modelChip)
+	availableWidth := max(0, m.width-fixedWidth)
+	status := help
+	if tokenInfo != "" {
+		status += tokenInfo
+	}
+	status += authChip
 
 	if m.info.Msg != "" {
 		infoStyle := styles.Padded().
 			Foreground(t.Background()).
-			Width(availableWidht)
+			Width(availableWidth)
 
 		switch m.info.Type {
 		case util.InfoTypeInfo:
@@ -162,7 +169,7 @@ func (m statusCmp) View() string {
 			infoStyle = infoStyle.Background(t.Error())
 		}
 
-		infoWidth := availableWidht - 10
+		infoWidth := availableWidth - 10
 		// Truncate message if it's longer than available width
 		msg := m.info.Msg
 		if len(msg) > infoWidth && infoWidth > 0 {
@@ -173,12 +180,12 @@ func (m statusCmp) View() string {
 		status += styles.Padded().
 			Foreground(t.Text()).
 			Background(t.BackgroundSecondary()).
-			Width(availableWidht).
+			Width(availableWidth).
 			Render("")
 	}
 
 	status += diagnostics
-	status += m.model()
+	status += modelChip
 	return status
 }
 
@@ -287,6 +294,44 @@ func (m statusCmp) model() string {
 		Background(t.Secondary()).
 		Foreground(t.Background()).
 		Render(model.Name)
+}
+
+func (m statusCmp) authChip() string {
+	t := theme.CurrentTheme()
+	cache, _, ok := auth.LoadSession()
+	if !ok {
+		return styles.Padded().
+			Background(t.BackgroundDarker()).
+			Foreground(t.Warning()).
+			Render("Auth local")
+	}
+	plan := strings.ToUpper(cache.Plan)
+	if plan == "" {
+		plan = "FREE"
+	}
+	label := "Plan " + plan
+	if cache.Quota.DailyLimit > 0 {
+		used := cache.Quota.Used
+		if used == 0 && cache.Usage.TokensUsed > 0 {
+			used = cache.Usage.TokensUsed
+		}
+		label = fmt.Sprintf("%s %s/%s", label, shortCount(used), shortCount(cache.Quota.DailyLimit))
+	}
+	return styles.Padded().
+		Background(t.BackgroundSecondary()).
+		Foreground(t.Accent()).
+		Render(label)
+}
+
+func shortCount(v int64) string {
+	switch {
+	case v >= 1_000_000:
+		return fmt.Sprintf("%.1fM", float64(v)/1_000_000)
+	case v >= 1_000:
+		return fmt.Sprintf("%.0fK", float64(v)/1_000)
+	default:
+		return fmt.Sprintf("%d", v)
+	}
 }
 
 func NewStatusCmp(lspClients map[string]*lsp.Client) StatusCmp {

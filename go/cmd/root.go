@@ -229,9 +229,9 @@ Models are served through the NeuronCLI Gateway (zero-x.live) — no API keys ne
 		cleanup()
 
 		// Explicit terminal cleanup for Windows — prevents prompt overlap
-		fmt.Print("\033[?1049l") // Exit alt screen
+		fmt.Print("\033[?1049l")   // Exit alt screen
 		fmt.Print("\033[H\033[2J") // Clear screen + reset cursor
-		fmt.Print("\033[?25h") // Show cursor
+		fmt.Print("\033[?25h")     // Show cursor
 
 		if err != nil {
 			return fmt.Errorf("TUI error: %v", err)
@@ -362,6 +362,8 @@ func Execute() {
 }
 
 func init() {
+	rootCmd.AddCommand(newAuthCommand())
+
 	rootCmd.Flags().BoolP("help", "h", false, "Help")
 	rootCmd.Flags().BoolP("version", "v", false, "Version")
 	rootCmd.Flags().BoolP("debug", "d", false, "Debug")

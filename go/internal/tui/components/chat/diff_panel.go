@@ -9,6 +9,7 @@ import (
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/opencode-ai/opencode/internal/config"
 	"github.com/opencode-ai/opencode/internal/diff"
 	"github.com/opencode-ai/opencode/internal/history"
@@ -19,12 +20,15 @@ import (
 
 // diffPanelCmp shows a scrollable unified diff of all modified files.
 type diffPanelCmp struct {
-	width, height int
-	history       history.Service
-	sessionID     string
-	scrollOffset  int
-	diffLines     []string // pre-rendered diff lines
-	fileList      []string // sorted file paths
+	width, height  int
+	history        history.Service
+	sessionID      string
+	scrollOffset   int
+	diffLines      []string // pre-rendered diff lines
+	fileList       []string // sorted file paths
+	focused        bool
+	totalAdditions int
+	totalRemovals  int
 }
 
 func NewDiffPanel(sessionID string, history history.Service) *diffPanelCmp {
@@ -33,6 +37,7 @@ func NewDiffPanel(sessionID string, history history.Service) *diffPanelCmp {
 		sessionID: sessionID,
 		diffLines: []string{},
 		fileList:  []string{},
+		focused:   true,
 	}
 }
 
@@ -117,8 +122,19 @@ func (d *diffPanelCmp) View() string {
 		}
 	}
 
-	visible := d.diffLines[start:end]
+	contentWidth := d.width
+	hasScrollbar := len(d.diffLines) > visibleHeight
+	if hasScrollbar {
+		contentWidth = max(1, d.width-1)
+	}
+	visible := append([]string(nil), d.diffLines[start:end]...)
+	for i, line := range visible {
+		visible[i] = ansi.Truncate(line, contentWidth, "...")
+	}
 	content := strings.Join(visible, "\n")
+	if hasScrollbar {
+		content = lipgloss.JoinHorizontal(lipgloss.Top, content, renderPanelScrollbar(visibleHeight, len(d.diffLines), start))
+	}
 
 	return lipgloss.JoinVertical(lipgloss.Top,
 		d.titleBarWithPosition(start+1, len(d.diffLines), visibleHeight),
@@ -136,13 +152,26 @@ func (d *diffPanelCmp) SetSize(width, height int) {
 	}
 }
 
+func (d *diffPanelCmp) SetFocus(focused bool) {
+	d.focused = focused
+}
+
 func (d *diffPanelCmp) titleBar() string {
 	t := theme.CurrentTheme()
+	color := t.TextMuted()
+	if d.focused {
+		color = t.Primary()
+	}
+	stats := "CHANGES"
+	if len(d.fileList) > 0 {
+		stats = fmt.Sprintf("CHANGES %d files +%d -%d", len(d.fileList), d.totalAdditions, d.totalRemovals)
+	}
 	return styles.BaseStyle().
 		Width(d.width).
-		Foreground(t.Primary()).
+		Foreground(color).
+		Background(t.BackgroundSecondary()).
 		Bold(true).
-		Render("CHANGES")
+		Render(ansi.Truncate(stats, d.width, "..."))
 }
 
 func (d *diffPanelCmp) titleBarWithPosition(start, total, visibleHeight int) string {
@@ -151,14 +180,23 @@ func (d *diffPanelCmp) titleBarWithPosition(start, total, visibleHeight int) str
 	}
 	t := theme.CurrentTheme()
 	baseStyle := styles.BaseStyle()
-	title := baseStyle.Foreground(t.Primary()).Bold(true).Render("CHANGES")
+	color := t.TextMuted()
+	if d.focused {
+		color = t.Primary()
+	}
+	titleText := "CHANGES"
+	if len(d.fileList) > 0 {
+		titleText = fmt.Sprintf("CHANGES %d files +%d -%d", len(d.fileList), d.totalAdditions, d.totalRemovals)
+	}
 	position := baseStyle.Foreground(t.TextMuted()).Render(fmt.Sprintf("%d/%d", start, total))
+	title := baseStyle.Foreground(color).Bold(true).Render(ansi.Truncate(titleText, max(1, d.width-lipgloss.Width(position)-1), "..."))
 	spacerWidth := d.width - lipgloss.Width(title) - lipgloss.Width(position)
 	if spacerWidth < 1 {
 		spacerWidth = 1
 	}
 	return baseStyle.
 		Width(d.width).
+		Background(t.BackgroundSecondary()).
 		Render(title + strings.Repeat(" ", spacerWidth) + position)
 }
 
@@ -174,6 +212,33 @@ func (d *diffPanelCmp) clampScroll() {
 	if d.scrollOffset > maxScroll {
 		d.scrollOffset = maxScroll
 	}
+}
+
+func renderPanelScrollbar(viewHeight, totalLines, start int) string {
+	if viewHeight < 1 || totalLines <= viewHeight {
+		return ""
+	}
+	thumbSize := max(1, viewHeight*viewHeight/totalLines)
+	scrollRange := max(1, totalLines-viewHeight)
+	thumbPos := start * (viewHeight - thumbSize) / scrollRange
+	if thumbPos+thumbSize > viewHeight {
+		thumbPos = viewHeight - thumbSize
+	}
+	t := theme.CurrentTheme()
+	trackStyle := lipgloss.NewStyle().Foreground(t.TextMuted())
+	thumbStyle := lipgloss.NewStyle().Foreground(t.Primary())
+	var sb strings.Builder
+	for i := 0; i < viewHeight; i++ {
+		if i > 0 {
+			sb.WriteByte('\n')
+		}
+		if i >= thumbPos && i < thumbPos+thumbSize {
+			sb.WriteString(thumbStyle.Render("|"))
+		} else {
+			sb.WriteString(trackStyle.Render(" "))
+		}
+	}
+	return sb.String()
 }
 
 func (d *diffPanelCmp) rebuildDiff(ctx context.Context) {
@@ -196,6 +261,8 @@ func (d *diffPanelCmp) rebuildDiff(ctx context.Context) {
 
 	d.diffLines = nil
 	d.fileList = nil
+	d.totalAdditions = 0
+	d.totalRemovals = 0
 
 	// Collect files with changes
 	type fileChange struct {
@@ -245,6 +312,8 @@ func (d *diffPanelCmp) rebuildDiff(ctx context.Context) {
 
 	for _, fc := range changes {
 		d.fileList = append(d.fileList, fc.path)
+		d.totalAdditions += fc.additions
+		d.totalRemovals += fc.removals
 
 		// File header line
 		addStr := baseStyle.Foreground(t.Success()).Render(fmt.Sprintf("+%d", fc.additions))

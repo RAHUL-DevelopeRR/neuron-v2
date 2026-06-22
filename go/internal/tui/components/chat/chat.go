@@ -26,6 +26,15 @@ type SessionClearedMsg struct{}
 
 type EditorFocusMsg bool
 
+type PaneFocusMsg struct {
+	Pane string
+}
+
+const (
+	PaneChat     = "chat"
+	PaneTerminal = "terminal"
+)
+
 // logo renders the original Neuron block banner.
 // Keep the glyphs as real UTF-8 block characters; the earlier broken header
 // came from mojibake literals, not from the brand mark itself.

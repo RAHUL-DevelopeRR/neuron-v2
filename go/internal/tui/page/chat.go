@@ -128,8 +128,13 @@ func (p *chatPage) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch {
 		case key.Matches(msg, keyMap.ToggleTerminal):
 			p.focusTerminal = !p.focusTerminal
+			focusedPane := chat.PaneChat
+			if p.focusTerminal {
+				focusedPane = chat.PaneTerminal
+			}
 			return p, tea.Batch(
 				util.CmdHandler(chat.EditorFocusMsg(!p.focusTerminal)),
+				util.CmdHandler(chat.PaneFocusMsg{Pane: focusedPane}),
 				util.CmdHandler(terminal.TerminalFocusMsg{Focused: p.focusTerminal}),
 			)
 		case key.Matches(msg, keyMap.ChatWider):
@@ -155,6 +160,8 @@ func (p *chatPage) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			p.focusTerminal = false
 			return p, tea.Batch(
 				util.CmdHandler(chat.EditorFocusMsg(true)),
+				util.CmdHandler(chat.PaneFocusMsg{Pane: chat.PaneChat}),
+				util.CmdHandler(terminal.TerminalFocusMsg{Focused: false}),
 				util.CmdHandler(chat.SessionClearedMsg{}),
 			)
 		case key.Matches(msg, keyMap.Cancel):
@@ -249,6 +256,7 @@ func (p *chatPage) View() string {
 
 func (p *chatPage) BindingKeys() []key.Binding {
 	bindings := layout.KeyMapToSlice(keyMap)
+	bindings = append(bindings, p.layout.BindingKeys()...)
 	bindings = append(bindings, p.messages.BindingKeys()...)
 	bindings = append(bindings, p.editor.BindingKeys()...)
 	return bindings
