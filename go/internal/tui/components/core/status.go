@@ -128,6 +128,7 @@ func (m statusCmp) View() string {
 	help := getHelpWidget()
 	modelChip := m.model()
 	authChip := m.authChip()
+	themeChip := m.themeChip()
 
 	tokenInfo := ""
 	if m.session.ID != "" {
@@ -147,13 +148,14 @@ func (m statusCmp) View() string {
 		Background(t.BackgroundDarker()).
 		Render(m.projectDiagnostics())
 
-	fixedWidth := lipgloss.Width(help) + lipgloss.Width(tokenInfo) + lipgloss.Width(authChip) + lipgloss.Width(diagnostics) + lipgloss.Width(modelChip)
+	fixedWidth := lipgloss.Width(help) + lipgloss.Width(tokenInfo) + lipgloss.Width(authChip) + lipgloss.Width(themeChip) + lipgloss.Width(diagnostics) + lipgloss.Width(modelChip)
 	availableWidth := max(0, m.width-fixedWidth)
 	status := help
 	if tokenInfo != "" {
 		status += tokenInfo
 	}
 	status += authChip
+	status += themeChip
 
 	if m.info.Msg != "" {
 		infoStyle := styles.Padded().
@@ -301,15 +303,18 @@ func (m statusCmp) authChip() string {
 	cache, _, ok := auth.LoadSession()
 	if !ok {
 		return styles.Padded().
-			Background(t.BackgroundDarker()).
-			Foreground(t.Warning()).
-			Render("Auth local")
+			Background(t.Warning()).
+			Foreground(t.Background()).
+			Render("Sign in")
 	}
 	plan := strings.ToUpper(cache.Plan)
 	if plan == "" {
 		plan = "FREE"
 	}
 	label := "Plan " + plan
+	if cache.UserID == "" && cache.Email == "" && cache.Name == "" {
+		label = "Guest " + plan
+	}
 	if cache.Quota.DailyLimit > 0 {
 		used := cache.Quota.Used
 		if used == 0 && cache.Usage.TokensUsed > 0 {
@@ -320,6 +325,18 @@ func (m statusCmp) authChip() string {
 	return styles.Padded().
 		Background(t.BackgroundSecondary()).
 		Foreground(t.Accent()).
+		Render(label)
+}
+
+func (m statusCmp) themeChip() string {
+	t := theme.CurrentTheme()
+	label := "Theme " + theme.CurrentThemeName()
+	if count := len(theme.AvailableThemes()); count > 1 {
+		label = fmt.Sprintf("%s/%d", label, count)
+	}
+	return styles.Padded().
+		Background(t.BackgroundDarker()).
+		Foreground(t.Secondary()).
 		Render(label)
 }
 

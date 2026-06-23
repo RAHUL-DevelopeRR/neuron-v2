@@ -10,6 +10,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/vt"
 	"github.com/opencode-ai/opencode/internal/tui/styles"
 	"github.com/opencode-ai/opencode/internal/tui/theme"
@@ -467,23 +468,39 @@ func (m *Model) renderTitleBar(t theme.Theme) string {
 	if m.focused {
 		helpText = "ctrl+x editor  pgup/pgdn scroll"
 	}
-	helpLabel := helpStyle.Render(helpText)
 
-	// Calculate spacing between title and help label
 	titleWidth := lipgloss.Width(title)
-	helpWidth := lipgloss.Width(helpLabel)
-	spacerWidth := m.width - titleWidth - helpWidth
-	if spacerWidth < 1 {
-		spacerWidth = 1
+	if titleWidth > m.width {
+		title = ansi.Truncate(title, m.width, "")
+		titleWidth = lipgloss.Width(title)
 	}
 
-	spacer := strings.Repeat(" ", spacerWidth)
+	helpLabel := ""
+	if m.width-titleWidth > 4 {
+		helpWidth := m.width - titleWidth - 1
+		helpLabel = helpStyle.Render(ansi.Truncate(helpText, helpWidth, "..."))
+	}
+
+	spacerWidth := m.width - titleWidth - lipgloss.Width(helpLabel)
+	if helpLabel != "" && spacerWidth > 0 {
+		spacerWidth--
+	}
+	if spacerWidth < 0 {
+		spacerWidth = 0
+	}
+
+	line := title + strings.Repeat(" ", spacerWidth)
+	if helpLabel != "" {
+		line += " " + helpLabel
+	}
+	line = padTerminalLine(ansi.Truncate(line, m.width, ""), m.width)
 
 	barStyle := lipgloss.NewStyle().
 		Width(m.width).
+		MaxWidth(m.width).
 		Background(t.BackgroundSecondary())
 
-	return barStyle.Render(title + spacer + helpLabel)
+	return barStyle.Render(line)
 }
 
 // renderScreen extracts visible lines from the emulator and scrollback.
@@ -499,7 +516,11 @@ func (m *Model) renderScreen(maxHeight int) string {
 	m.mu.Unlock()
 
 	if len(allLines) == 0 {
-		return ""
+		lines := make([]string, maxHeight)
+		for i := range lines {
+			lines[i] = strings.Repeat(" ", m.width)
+		}
+		return strings.Join(lines, "\n")
 	}
 
 	totalLines := len(allLines)
@@ -534,6 +555,11 @@ func (m *Model) renderScreen(maxHeight int) string {
 			}
 			lines[i] = string(runes[:cut])
 		}
+		lines[i] = padTerminalLine(lines[i], contentWidth)
+	}
+
+	for len(lines) < maxHeight {
+		lines = append(lines, strings.Repeat(" ", contentWidth))
 	}
 
 	content := strings.Join(lines, "\n")
@@ -545,6 +571,17 @@ func (m *Model) renderScreen(maxHeight int) string {
 	// Build scrollbar column
 	scrollbar := renderScrollbar(maxHeight, totalLines, start)
 	return lipgloss.JoinHorizontal(lipgloss.Top, content, scrollbar)
+}
+
+func padTerminalLine(line string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	lineWidth := lipgloss.Width(line)
+	if lineWidth >= width {
+		return line
+	}
+	return line + strings.Repeat(" ", width-lineWidth)
 }
 
 func (m *Model) ScrollUp(lines int) {

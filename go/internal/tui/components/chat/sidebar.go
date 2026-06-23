@@ -11,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/opencode-ai/opencode/internal/auth"
 	"github.com/opencode-ai/opencode/internal/config"
 	"github.com/opencode-ai/opencode/internal/diff"
 	"github.com/opencode-ai/opencode/internal/history"
@@ -34,8 +35,10 @@ type sidebarCmp struct {
 		additions int
 		removals  int
 	}
-	toolTimeline []toolTimelineEntry
-	toolIndex    map[string]int
+	toolTimeline          []toolTimelineEntry
+	toolIndex             map[string]int
+	timelineExpanded      bool
+	timelineSelectedIndex int
 
 	// New panels
 	diffPanel     *diffPanelCmp
@@ -46,13 +49,18 @@ type toolTimelineEntry struct {
 	id      string
 	name    string
 	summary string
+	detail  string
+	output  string
 	status  string
 	isError bool
 }
 
 type sidebarKeyMap struct {
-	DiffTaller     key.Binding
-	TerminalTaller key.Binding
+	DiffTaller            key.Binding
+	TerminalTaller        key.Binding
+	ToggleCommandDetails  key.Binding
+	PreviousCommandDetail key.Binding
+	NextCommandDetail     key.Binding
 }
 
 var sidebarKeys = sidebarKeyMap{
@@ -63,6 +71,18 @@ var sidebarKeys = sidebarKeyMap{
 	TerminalTaller: key.NewBinding(
 		key.WithKeys("ctrl+down"),
 		key.WithHelp("ctrl+down", "taller terminal"),
+	),
+	ToggleCommandDetails: key.NewBinding(
+		key.WithKeys("ctrl+]"),
+		key.WithHelp("ctrl+]", "expand command"),
+	),
+	PreviousCommandDetail: key.NewBinding(
+		key.WithKeys("ctrl+left"),
+		key.WithHelp("ctrl+left", "previous command"),
+	),
+	NextCommandDetail: key.NewBinding(
+		key.WithKeys("ctrl+right"),
+		key.WithHelp("ctrl+right", "next command"),
 	),
 }
 
@@ -205,6 +225,18 @@ func (m *sidebarCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			_, cmd := m.terminalPanel.Update(msg)
 			return m, cmd
 		}
+		if key.Matches(msg, sidebarKeys.ToggleCommandDetails) {
+			m.toggleTimelineDetails()
+			return m, nil
+		}
+		if key.Matches(msg, sidebarKeys.PreviousCommandDetail) {
+			m.selectTimelineEntry(-1)
+			return m, nil
+		}
+		if key.Matches(msg, sidebarKeys.NextCommandDetail) {
+			m.selectTimelineEntry(1)
+			return m, nil
+		}
 		if m.diffPanel != nil {
 			_, cmd := m.diffPanel.Update(msg)
 			return m, cmd
@@ -257,6 +289,15 @@ func (m *sidebarCmp) View() string {
 		Render(strings.Repeat("─", contentWidth))
 	dividerHeight := 1
 
+	accountHeight := 7
+	if m.height < 34 {
+		accountHeight = 5
+	}
+	if m.height < 24 {
+		accountHeight = 3
+	}
+	accountView := clipContent(m.accountBoard(contentWidth, accountHeight), contentWidth, accountHeight)
+
 	// ── Remaining height for panels ──
 	timelineHeight := 4
 	if len(m.toolTimeline) > 3 && m.height >= 26 {
@@ -265,9 +306,12 @@ func (m *sidebarCmp) View() string {
 	if m.height < 20 {
 		timelineHeight = 3
 	}
+	if m.timelineExpanded && len(m.toolTimeline) > 0 && m.height >= 28 {
+		timelineHeight = min(10, max(timelineHeight, m.height/4))
+	}
 	timelineView := clipContent(m.commandTimelineView(contentWidth, timelineHeight), contentWidth, timelineHeight)
 
-	remainingHeight := m.height - bannerHeight - timelineHeight - (dividerHeight * 3) - 1
+	remainingHeight := m.height - bannerHeight - accountHeight - timelineHeight - (dividerHeight * 4) - 1
 	if remainingHeight < 4 {
 		remainingHeight = 4
 	}
@@ -309,6 +353,8 @@ func (m *sidebarCmp) View() string {
 		lipgloss.Top,
 		bannerSection,
 		divider,
+		accountView,
+		divider,
 		timelineView,
 		divider,
 		diffView,
@@ -319,6 +365,90 @@ func (m *sidebarCmp) View() string {
 	// Use PaddingLeft/Right via Place offset, not Width constraint
 	padded := baseStyle.PaddingLeft(4).PaddingRight(2).Render(content)
 	return lipgloss.Place(m.width, m.height, lipgloss.Left, lipgloss.Top, padded)
+}
+
+func (m *sidebarCmp) accountBoard(width, height int) string {
+	t := theme.CurrentTheme()
+	baseStyle := styles.BaseStyle()
+	cache, _, ok := auth.LoadSession()
+
+	themeCount := len(theme.AvailableThemes())
+	titleText := "PROFILE / USAGE"
+	if themeCount > 1 {
+		titleText = fmt.Sprintf("%s  theme %s (%d)", titleText, theme.CurrentThemeName(), themeCount)
+	}
+	title := baseStyle.
+		Width(width).
+		Foreground(t.Secondary()).
+		Background(t.BackgroundSecondary()).
+		Bold(true).
+		Render(ansi.Truncate(titleText, width, "..."))
+	if height <= 1 {
+		return title
+	}
+
+	if !ok {
+		signIn := baseStyle.
+			Width(width).
+			Foreground(t.Warning()).
+			Render("  Not signed in")
+		action := baseStyle.
+			Width(width).
+			Foreground(t.TextMuted()).
+			Render(ansi.Truncate("  Run: neuron auth login", width, "..."))
+		return lipgloss.JoinVertical(lipgloss.Top, title, signIn, action)
+	}
+
+	name := auth.DisplayName(cache)
+	if isGuestSession(cache) {
+		name = "Guest session"
+	}
+	plan := strings.ToUpper(cache.Plan)
+	if plan == "" {
+		plan = "FREE"
+	}
+	used := cache.Quota.Used
+	if used == 0 && cache.Usage.TokensUsed > 0 {
+		used = cache.Usage.TokensUsed
+	}
+	limit := cache.Quota.DailyLimit
+	if limit == 0 {
+		limit = auth.PlanLimit(cache.Plan)
+	}
+	remaining := cache.Quota.Remaining
+	if remaining == 0 && limit > 0 {
+		remaining = max(int64(0), limit-used)
+	}
+
+	identityLine := baseStyle.
+		Width(width).
+		Foreground(t.Text()).
+		Render(ansi.Truncate("  "+name+" | "+plan, width, "..."))
+	usageLine := baseStyle.
+		Width(width).
+		Foreground(t.Accent()).
+		Render(ansi.Truncate(fmt.Sprintf("  Usage %s/%s  left %s", compactCount(used), compactCount(limit), compactCount(remaining)), width, "..."))
+	barLine := baseStyle.
+		Width(width).
+		Foreground(t.Success()).
+		Render("  " + usageBar(width-4, used, limit))
+	mediaLine := baseStyle.
+		Width(width).
+		Foreground(t.TextMuted()).
+		Render(ansi.Truncate("  ctrl+f image file  ctrl+y paste image  ctrl+v paste text", width, "..."))
+	themeLine := baseStyle.
+		Width(width).
+		Foreground(t.TextMuted()).
+		Render(ansi.Truncate("  ctrl+t themes  alt+arrows resize panes", width, "..."))
+
+	lines := []string{title, identityLine, usageLine}
+	if height >= 5 {
+		lines = append(lines, barLine, mediaLine)
+	}
+	if height >= 7 {
+		lines = append(lines, themeLine)
+	}
+	return lipgloss.JoinVertical(lipgloss.Top, lines...)
 }
 
 func (m *sidebarCmp) sessionSection() string {
@@ -457,6 +587,9 @@ func (m *sidebarCmp) BindingKeys() []key.Binding {
 	return []key.Binding{
 		sidebarKeys.DiffTaller,
 		sidebarKeys.TerminalTaller,
+		sidebarKeys.ToggleCommandDetails,
+		sidebarKeys.PreviousCommandDetail,
+		sidebarKeys.NextCommandDetail,
 	}
 }
 
@@ -493,18 +626,36 @@ func (m *sidebarCmp) panelHeights(available int) (int, int) {
 func (m *sidebarCmp) commandTimelineView(width, height int) string {
 	t := theme.CurrentTheme()
 	baseStyle := styles.BaseStyle()
+	titleText := "COMMAND TIMELINE"
+	if len(m.toolTimeline) > 0 {
+		titleText += "  ctrl+] expand"
+		if m.timelineExpanded {
+			titleText += "  ctrl+left/right"
+		}
+	}
 	title := baseStyle.
 		Width(width).
 		Foreground(t.Primary()).
 		Background(t.BackgroundSecondary()).
 		Bold(true).
-		Render("COMMAND TIMELINE")
+		Render(ansi.Truncate(titleText, width, "..."))
 
 	if height <= 1 {
 		return title
 	}
 
-	lineHeight := height - 1
+	detailLines := []string{}
+	detailHeight := 0
+	selectedIndex := m.selectedTimelineIndex()
+	if m.timelineExpanded && selectedIndex >= 0 && height >= 4 {
+		detailHeight = min(4, height-2)
+		detailLines = m.timelineDetailLines(m.toolTimeline[selectedIndex], width, detailHeight)
+	}
+
+	lineHeight := height - 1 - detailHeight
+	if lineHeight < 0 {
+		lineHeight = 0
+	}
 	if len(m.toolTimeline) == 0 {
 		empty := baseStyle.
 			Width(width).
@@ -516,8 +667,17 @@ func (m *sidebarCmp) commandTimelineView(width, height int) string {
 	}
 
 	start := max(0, len(m.toolTimeline)-lineHeight)
+	if m.timelineExpanded && selectedIndex >= 0 && lineHeight > 0 {
+		start = min(start, selectedIndex)
+		if selectedIndex >= start+lineHeight {
+			start = selectedIndex - lineHeight + 1
+		}
+		start = max(0, start)
+	}
 	rows := make([]string, 0, lineHeight)
-	for _, item := range m.toolTimeline[start:] {
+	end := min(len(m.toolTimeline), start+lineHeight)
+	for idx := start; idx < end; idx++ {
+		item := m.toolTimeline[idx]
 		statusColor := t.TextMuted()
 		switch item.status {
 		case "running":
@@ -529,13 +689,125 @@ func (m *sidebarCmp) commandTimelineView(width, height int) string {
 		}
 		name := baseStyle.Foreground(statusColor).Bold(true).Render(item.name)
 		status := baseStyle.Foreground(statusColor).Render(item.status)
-		summaryWidth := max(1, width-lipgloss.Width(name)-lipgloss.Width(status)-4)
+		prefix := "  "
+		if m.timelineExpanded && idx == selectedIndex {
+			prefix = "> "
+		}
+		summaryWidth := max(1, width-lipgloss.Width(prefix)-lipgloss.Width(name)-lipgloss.Width(status)-4)
 		summary := baseStyle.
 			Foreground(t.Text()).
 			Render(ansi.Truncate(item.summary, summaryWidth, "..."))
-		rows = append(rows, baseStyle.Width(width).Render(name+" "+summary+" "+status))
+		rows = append(rows, baseStyle.Width(width).Render(prefix+name+" "+summary+" "+status))
 	}
-	return lipgloss.JoinVertical(lipgloss.Top, title, strings.Join(rows, "\n"))
+	parts := []string{title}
+	if len(rows) > 0 {
+		parts = append(parts, strings.Join(rows, "\n"))
+	}
+	if len(detailLines) > 0 {
+		parts = append(parts, strings.Join(detailLines, "\n"))
+	}
+	return lipgloss.JoinVertical(lipgloss.Top, parts...)
+}
+
+func (m *sidebarCmp) selectedTimelineIndex() int {
+	if len(m.toolTimeline) == 0 {
+		return -1
+	}
+	if m.timelineSelectedIndex < 0 || m.timelineSelectedIndex >= len(m.toolTimeline) {
+		m.timelineSelectedIndex = len(m.toolTimeline) - 1
+	}
+	return m.timelineSelectedIndex
+}
+
+func (m *sidebarCmp) toggleTimelineDetails() {
+	if len(m.toolTimeline) == 0 {
+		return
+	}
+	if m.timelineSelectedIndex < 0 || m.timelineSelectedIndex >= len(m.toolTimeline) {
+		m.timelineSelectedIndex = len(m.toolTimeline) - 1
+	}
+	m.timelineExpanded = !m.timelineExpanded
+}
+
+func (m *sidebarCmp) selectTimelineEntry(delta int) {
+	if len(m.toolTimeline) == 0 {
+		return
+	}
+	if m.timelineSelectedIndex < 0 || m.timelineSelectedIndex >= len(m.toolTimeline) {
+		m.timelineSelectedIndex = len(m.toolTimeline) - 1
+	}
+	m.timelineSelectedIndex += delta
+	if m.timelineSelectedIndex < 0 {
+		m.timelineSelectedIndex = 0
+	}
+	if m.timelineSelectedIndex >= len(m.toolTimeline) {
+		m.timelineSelectedIndex = len(m.toolTimeline) - 1
+	}
+	m.timelineExpanded = true
+}
+
+func (m *sidebarCmp) timelineDetailLines(item toolTimelineEntry, width, height int) []string {
+	if height <= 0 {
+		return nil
+	}
+	t := theme.CurrentTheme()
+	baseStyle := styles.BaseStyle()
+	header := baseStyle.
+		Width(width).
+		Foreground(t.Secondary()).
+		Render(ansi.Truncate("  [-] "+item.name+" command details", width, "..."))
+	lines := []string{header}
+	if height == 1 {
+		return lines
+	}
+
+	detail := strings.TrimSpace(item.detail)
+	if detail == "" {
+		detail = strings.TrimSpace(item.summary)
+	}
+	if detail == "" {
+		detail = "No command payload yet"
+	}
+	lines = append(lines, wrapTimelineText("$ "+detail, width, height-len(lines))...)
+	if len(lines) >= height || strings.TrimSpace(item.output) == "" {
+		return lines[:min(len(lines), height)]
+	}
+	output := "=> " + oneLine(item.output)
+	lines = append(lines, wrapTimelineText(output, width, height-len(lines))...)
+	return lines[:min(len(lines), height)]
+}
+
+func wrapTimelineText(text string, width, maxLines int) []string {
+	if maxLines <= 0 {
+		return nil
+	}
+	width = max(1, width)
+	available := max(1, width-2)
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		return []string{strings.Repeat(" ", width)}
+	}
+	lines := make([]string, 0, maxLines)
+	current := ""
+	for _, word := range words {
+		next := word
+		if current != "" {
+			next = current + " " + word
+		}
+		if lipgloss.Width(next) > available && current != "" {
+			lines = append(lines, padVisualLine("  "+ansi.Truncate(current, available, "..."), width))
+			current = word
+			if len(lines) == maxLines {
+				return lines
+			}
+			continue
+		}
+		current = next
+	}
+	if len(lines) < maxLines && current != "" {
+		lines = append(lines, padVisualLine("  "+ansi.Truncate(current, available, "..."), width))
+	}
+	return lines
 }
 
 func (m *sidebarCmp) recordToolCalls(calls []message.ToolCall) {
@@ -548,6 +820,7 @@ func (m *sidebarCmp) recordToolCalls(calls []message.ToolCall) {
 	for _, call := range calls {
 		name := toolName(call.Name)
 		summary := summaryForToolCall(call)
+		detail := detailForToolCall(call)
 		status := "running"
 		if call.Finished {
 			status = "sent"
@@ -555,6 +828,7 @@ func (m *sidebarCmp) recordToolCalls(calls []message.ToolCall) {
 		if idx, ok := m.toolIndex[call.ID]; ok && idx < len(m.toolTimeline) {
 			m.toolTimeline[idx].name = name
 			m.toolTimeline[idx].summary = summary
+			m.toolTimeline[idx].detail = detail
 			m.toolTimeline[idx].status = status
 			continue
 		}
@@ -563,8 +837,12 @@ func (m *sidebarCmp) recordToolCalls(calls []message.ToolCall) {
 			id:      call.ID,
 			name:    name,
 			summary: summary,
+			detail:  detail,
 			status:  status,
 		})
+		if m.timelineSelectedIndex < 0 || m.timelineSelectedIndex == len(m.toolTimeline)-2 {
+			m.timelineSelectedIndex = len(m.toolTimeline) - 1
+		}
 	}
 	m.trimTimeline()
 }
@@ -584,6 +862,9 @@ func (m *sidebarCmp) recordToolResults(results []message.ToolResult) {
 		} else {
 			m.toolTimeline[idx].status = "done"
 		}
+		if strings.TrimSpace(result.Content) != "" {
+			m.toolTimeline[idx].output = result.Content
+		}
 	}
 }
 
@@ -596,6 +877,9 @@ func (m *sidebarCmp) trimTimeline() {
 	m.toolIndex = make(map[string]int, len(m.toolTimeline))
 	for i, item := range m.toolTimeline {
 		m.toolIndex[item.id] = i
+	}
+	if m.timelineSelectedIndex >= len(m.toolTimeline) {
+		m.timelineSelectedIndex = len(m.toolTimeline) - 1
 	}
 }
 
@@ -651,6 +935,32 @@ func summaryForToolCall(call message.ToolCall) string {
 	return oneLine(call.Input)
 }
 
+func detailForToolCall(call message.ToolCall) string {
+	switch call.Name {
+	case tools.BashToolName:
+		var params tools.BashParams
+		if err := json.Unmarshal([]byte(call.Input), &params); err == nil && strings.TrimSpace(params.Command) != "" {
+			return strings.TrimSpace(params.Command)
+		}
+	case agent.AgentToolName:
+		var params agent.AgentParams
+		if err := json.Unmarshal([]byte(call.Input), &params); err == nil && strings.TrimSpace(params.Prompt) != "" {
+			return strings.TrimSpace(params.Prompt)
+		}
+	}
+	input := strings.TrimSpace(call.Input)
+	if input == "" {
+		return ""
+	}
+	var payload any
+	if err := json.Unmarshal([]byte(input), &payload); err == nil {
+		if pretty, err := json.MarshalIndent(payload, "", "  "); err == nil {
+			return string(pretty)
+		}
+	}
+	return input
+}
+
 func oneLine(value string) string {
 	return strings.Join(strings.Fields(value), " ")
 }
@@ -675,23 +985,34 @@ func (m *sidebarCmp) mouseInTerminal(y int) bool {
 	if m.height < 20 {
 		timelineHeight = 3
 	}
-	remainingHeight := m.height - lipgloss.Height(bannerSection) - timelineHeight - 4
+	if m.timelineExpanded && len(m.toolTimeline) > 0 && m.height >= 28 {
+		timelineHeight = min(10, max(timelineHeight, m.height/4))
+	}
+	accountHeight := 7
+	if m.height < 34 {
+		accountHeight = 5
+	}
+	if m.height < 24 {
+		accountHeight = 3
+	}
+	remainingHeight := m.height - lipgloss.Height(bannerSection) - accountHeight - timelineHeight - 5
 	if remainingHeight < 4 {
 		remainingHeight = 4
 	}
 	diffHeight, _ := m.panelHeights(remainingHeight)
-	terminalStart := lipgloss.Height(bannerSection) + timelineHeight + 3 + diffHeight
+	terminalStart := lipgloss.Height(bannerSection) + accountHeight + timelineHeight + 4 + diffHeight
 	return y >= terminalStart
 }
 
 func NewSidebarCmp(session session.Session, history history.Service) tea.Model {
 	return &sidebarCmp{
-		session:       session,
-		history:       history,
-		diffRatio:     0.60,
-		toolIndex:     make(map[string]int),
-		diffPanel:     NewDiffPanel(session.ID, history),
-		terminalPanel: NewTerminalPanel(),
+		session:               session,
+		history:               history,
+		diffRatio:             0.60,
+		toolIndex:             make(map[string]int),
+		timelineSelectedIndex: -1,
+		diffPanel:             NewDiffPanel(session.ID, history),
+		terminalPanel:         NewTerminalPanel(),
 	}
 }
 
@@ -830,6 +1151,45 @@ func getDisplayPath(path string) string {
 	return strings.TrimPrefix(displayPath, "/")
 }
 
+func isGuestSession(cache auth.SessionCache) bool {
+	return strings.TrimSpace(cache.UserID) == "" &&
+		strings.TrimSpace(cache.Email) == "" &&
+		strings.TrimSpace(cache.Name) == ""
+}
+
+func compactCount(v int64) string {
+	switch {
+	case v >= 1_000_000:
+		return fmt.Sprintf("%.1fM", float64(v)/1_000_000)
+	case v >= 1_000:
+		return fmt.Sprintf("%.0fK", float64(v)/1_000)
+	default:
+		return fmt.Sprintf("%d", v)
+	}
+}
+
+func usageBar(width int, used, limit int64) string {
+	if width < 8 {
+		width = 8
+	}
+	if width > 32 {
+		width = 32
+	}
+	if limit <= 0 {
+		return "[" + strings.Repeat("-", width-2) + "]"
+	}
+	ratio := float64(used) / float64(limit)
+	if ratio < 0 {
+		ratio = 0
+	}
+	if ratio > 1 {
+		ratio = 1
+	}
+	inner := width - 2
+	filled := int(float64(inner) * ratio)
+	return "[" + strings.Repeat("=", filled) + strings.Repeat("-", inner-filled) + "]"
+}
+
 // clipContent clips a multi-line string to exactly cols visual width and rows
 // lines. Lines beyond rows are dropped. Lines wider than cols are truncated
 // rune-by-rune. If there are fewer lines than rows, empty lines are appended.
@@ -862,6 +1222,18 @@ func clipContent(s string, cols, rows int) string {
 				result[i] = line
 			}
 		}
+		result[i] = padVisualLine(result[i], cols)
 	}
 	return strings.Join(result, "\n")
+}
+
+func padVisualLine(line string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	lineWidth := lipgloss.Width(line)
+	if lineWidth >= width {
+		return line
+	}
+	return line + strings.Repeat(" ", width-lineWidth)
 }
