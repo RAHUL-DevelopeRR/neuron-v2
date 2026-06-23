@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/x/xpty"
+	"github.com/opencode-ai/opencode/internal/tui/termcolor"
 )
 
 // PTY wraps a pseudo-terminal with its associated shell process.
@@ -29,7 +30,7 @@ func NewPTY(cols, rows int, cwd, shell string, args []string) (*PTY, error) {
 	shell, args = shellCommand(shell, args)
 	cmd := exec.Command(shell, args...)
 	cmd.Dir = cwd
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color", "COLORTERM=truecolor")
+	cmd.Env = termcolor.Env(os.Environ())
 
 	if err := p.Start(cmd); err != nil {
 		p.Close()

@@ -17,6 +17,7 @@ import (
 	"github.com/opencode-ai/opencode/internal/logging"
 	"github.com/opencode-ai/opencode/internal/pubsub"
 	"github.com/opencode-ai/opencode/internal/tui"
+	"github.com/opencode-ai/opencode/internal/tui/termcolor"
 	"github.com/opencode-ai/opencode/internal/version"
 	"github.com/spf13/cobra"
 )
@@ -111,6 +112,7 @@ Models are served through the NeuronCLI Gateway (zero-x.live) — no API keys ne
 		}
 
 		// ━━━ Interactive mode: show TUI FIRST, init in background ━━━
+		termcolor.ForceInteractive()
 		zone.NewGlobal()
 		program := tea.NewProgram(
 			tui.NewLazy(cwd, debug),

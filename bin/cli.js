@@ -25,6 +25,32 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const ROOT = resolve(__dirname, "..");
 
+function truthy(value) {
+  if (!value) return false;
+  const normalized = String(value).trim().toLowerCase();
+  return normalized !== "0" && normalized !== "false" && normalized !== "no";
+}
+
+function tuiEnvironment() {
+  const next = { ...env };
+
+  if (truthy(next.NEURON_NO_COLOR)) {
+    return next;
+  }
+
+  delete next.NO_COLOR;
+  next.CLICOLOR = "1";
+  next.CLICOLOR_FORCE = "1";
+  next.FORCE_COLOR = "3";
+  next.COLORTERM = "truecolor";
+
+  if (!next.TERM || String(next.TERM).toLowerCase() === "dumb" || platform === "win32") {
+    next.TERM = "xterm-256color";
+  }
+
+  return next;
+}
+
 // ── Locate the native binary ─────────────────────────────────
 
 function goPlatform() {
@@ -101,7 +127,7 @@ if (args.includes("--tui")) {
       const child = spawn("npx", ["tsx", tuiEntry, ...tuiArgs], {
         stdio: "inherit",
         shell: true,
-        env: { ...env },
+        env: tuiEnvironment(),
       });
       child.on("exit", (code) => process.exit(code || 0));
     } else {
@@ -117,7 +143,7 @@ if (args.includes("--tui")) {
   const binary = findBinary();
   const child = spawn(binary, args, {
     stdio: "inherit",
-    env: { ...env },
+    env: tuiEnvironment(),
   });
 
   child.on("error", (err) => {

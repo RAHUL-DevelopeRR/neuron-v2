@@ -33,8 +33,9 @@ func RegisterTheme(name string, theme Theme) {
 
 	globalManager.themes[name] = theme
 
-	// If this is the first theme, make it the default
-	if globalManager.currentName == "" {
+	// Neuron should be the first visible theme during lazy startup. Full config
+	// loading can still override this once the app has initialized.
+	if globalManager.currentName == "" || name == "neuron" {
 		globalManager.currentName = name
 	}
 }
