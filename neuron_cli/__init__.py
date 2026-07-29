@@ -1,118 +1,155 @@
-"""NeuronCLI - Python shim for the bundled native binary."""
+"""NeuronCLI Python launcher for the native Go binary."""
 
 from __future__ import annotations
 
+import hashlib
+import importlib.metadata
 import os
 import platform as _platform
+import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 
-def _find_binary() -> Path:
-    """Locate the embedded neuron binary inside the installed package."""
-    pkg_dir = Path(__file__).resolve().parent
-    binary_name = "neuron.exe" if sys.platform == "win32" else "neuron"
+RELEASE_REPOSITORY = os.environ.get("NEURON_RELEASE_REPOSITORY", "RAHUL-DevelopeRR/neuron-v2")
 
-    platform_name = {
+
+def _version() -> str:
+    try:
+        return importlib.metadata.version("neuroncli")
+    except importlib.metadata.PackageNotFoundError:
+        return "6.3.0"
+
+
+def _platform_name() -> str:
+    return {
         "win32": "windows",
         "darwin": "darwin",
         "linux": "linux",
     }.get(sys.platform, sys.platform)
+
+
+def _arch() -> str:
     machine = _platform.machine().lower()
-    arch = {
+    return {
         "x86_64": "amd64",
         "amd64": "amd64",
         "aarch64": "arm64",
         "arm64": "arm64",
     }.get(machine, machine)
-    ext = ".exe" if sys.platform == "win32" else ""
 
+
+def _binary_name() -> str:
+    return "neuron.exe" if sys.platform == "win32" else "neuron"
+
+
+def _release_binary_name() -> str:
+    ext = ".exe" if sys.platform == "win32" else ""
+    return f"neuron-{_platform_name()}-{_arch()}{ext}"
+
+
+def _release_url(asset: str) -> str:
+    return f"https://github.com/{RELEASE_REPOSITORY}/releases/download/v{_version()}/{asset}"
+
+
+def _cache_dir() -> Path:
+    if sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    else:
+        base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return base / "neuroncli" / "bin" / _version() / f"{sys.platform}-{_arch()}"
+
+
+def _download(url: str, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with urllib.request.urlopen(url, timeout=30) as response:
+        with target.open("wb") as file:
+            shutil.copyfileobj(response, file)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _verify_checksum(asset: str, path: Path) -> None:
+    checksum_file = _cache_dir() / "checksums.txt"
+    _download(_release_url("checksums.txt"), checksum_file)
+    expected = ""
+    for line in checksum_file.read_text(encoding="utf-8").splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[-1] == asset:
+            expected = parts[0].lower()
+            break
+    if not expected:
+        raise RuntimeError(f"checksum entry for {asset} not found")
+    actual = _sha256(path)
+    if actual != expected:
+        raise RuntimeError(f"checksum mismatch for {asset}")
+
+
+def _download_release_binary() -> Path | None:
+    if os.environ.get("NEURON_DISABLE_DOWNLOAD", "").lower() in {"1", "true", "yes"}:
+        return None
+    target = _cache_dir() / _binary_name()
+    if target.exists():
+        return target
+    asset = _release_binary_name()
+    tmp = target.with_suffix(target.suffix + ".download")
+    try:
+        _download(_release_url(asset), tmp)
+        _verify_checksum(asset, tmp)
+        tmp.replace(target)
+        if sys.platform != "win32":
+            target.chmod(0o755)
+        return target
+    except (urllib.error.URLError, RuntimeError) as err:
+        raise RuntimeError(f"failed to download {asset}: {err}") from err
+
+
+def _find_binary() -> Path:
+    pkg_dir = Path(__file__).resolve().parent
     candidates = [
-        pkg_dir / "bin" / f"neuron-{platform_name}-{arch}{ext}",
-        pkg_dir / binary_name,
+        pkg_dir / "bin" / _binary_name(),
+        pkg_dir / "bin" / _release_binary_name(),
+        pkg_dir / _binary_name(),
     ]
     for candidate in candidates:
         if candidate.exists():
             return candidate
-    # Fallback: search PATH (useful during development)
     for path_dir in os.get_exec_path():
-        candidate = Path(path_dir) / binary_name
+        candidate = Path(path_dir) / _binary_name()
         if candidate.exists():
             return candidate
+    downloaded = _download_release_binary()
+    if downloaded and downloaded.exists():
+        return downloaded
     raise RuntimeError(
-        f"NeuronCLI binary '{binary_name}' not found inside package or PATH. "
-        "Try reinstalling: pip install --force-reinstall neuroncli"
+        f"NeuronCLI binary '{_binary_name()}' was not found for {sys.platform}/{_arch()}. "
+        "Try reinstalling with: pipx install neuroncli"
     )
 
 
 def _ensure_scripts_on_path() -> None:
-    """Ensure pip's Scripts directory is on PATH.
-
-    On Windows, `pip install` puts the `neuron` entry-point into
-    `<python>/Scripts/` but that directory is often NOT on the user's
-    PATH, so `neuron` fails with "command not found" after install.
-
-    This function detects the situation and patches the user's PATH
-    for the current process (and optionally persists it).
-    """
     if sys.platform != "win32":
         return
-
     scripts_dir = Path(sys.executable).parent / "Scripts"
-    if not scripts_dir.exists():
-        return
-
-    scripts_str = str(scripts_dir)
-    current_path = os.environ.get("PATH", "")
-    if scripts_str.lower() in current_path.lower():
-        return  # Already on PATH
-
-    # Patch for current process
-    os.environ["PATH"] = scripts_str + os.pathsep + current_path
-
-    # Try to persist to user PATH via setx (best-effort, silent fail)
-    try:
-        # Read current user PATH from registry
-        import winreg
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            r"Environment",
-            0,
-            winreg.KEY_READ,
-        ) as key:
-            try:
-                user_path, _ = winreg.QueryValueEx(key, "Path")
-            except FileNotFoundError:
-                user_path = ""
-
-        if scripts_str.lower() not in user_path.lower():
-            new_path = scripts_str + os.pathsep + user_path if user_path else scripts_str
-            subprocess.run(
-                ["setx", "PATH", new_path],
-                capture_output=True,
-                check=False,
-            )
-            print(
-                f"\033[32m✓\033[0m Added {scripts_str} to user PATH. "
-                "Restart your terminal for the change to take effect.",
-                file=sys.stderr,
-            )
-    except Exception:
-        pass  # Non-critical — PATH is patched for current process at minimum
+    if scripts_dir.exists() and str(scripts_dir).lower() not in os.environ.get("PATH", "").lower():
+        os.environ["PATH"] = str(scripts_dir) + os.pathsep + os.environ.get("PATH", "")
 
 
 def main() -> None:
-    """Invoke the native neuron binary with forwarded argv."""
     _ensure_scripts_on_path()
     binary = _find_binary()
-    # Replace sys.argv[0] with the actual binary path so the native CLI
-    # sees correct program name in --version / help text.
-    args = [str(binary), *sys.argv[1:]]
-    # os.execv on Windows does not reliably inherit console std streams,
-    # which silently swallows output for --version / --help.  Use
-    # subprocess.run instead and forward the child's exit code.
-    result = subprocess.run(args, check=False)
+    env = os.environ.copy()
+    env.setdefault("NEURON_INSTALL_SOURCE", "pypi")
+    result = subprocess.run([str(binary), *sys.argv[1:]], check=False, env=env)
     sys.exit(result.returncode)
 
 

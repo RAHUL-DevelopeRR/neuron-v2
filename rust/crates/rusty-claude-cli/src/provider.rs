@@ -192,7 +192,7 @@ fn try_auth_server_session() -> Option<String> {
         .post(format!("{}/auth/session", gateway_base))
         .json(&serde_json::json!({
             "machine_fingerprint": fingerprint,
-            "version": "6.2.4"
+            "version": "6.3.0"
         }))
         .send()
         .ok()?;
@@ -248,10 +248,16 @@ mod tests {
         let original_key = std::env::var("OPENAI_API_KEY").ok();
         let original_url = std::env::var("OPENAI_BASE_URL").ok();
         let original_model = std::env::var("NEURON_MODEL").ok();
+        let original_gateway = std::env::var("NEURON_GATEWAY_URL").ok();
+        let original_azure_key = std::env::var("AZURE_OPENAI_API_KEY").ok();
+        let original_azure_endpoint = std::env::var("AZURE_OPENAI_ENDPOINT").ok();
 
         std::env::set_var("OPENAI_API_KEY", "test-key");
         std::env::remove_var("OPENAI_BASE_URL");
         std::env::remove_var("NEURON_MODEL");
+        std::env::set_var("NEURON_GATEWAY_URL", "http://127.0.0.1:9");
+        std::env::remove_var("AZURE_OPENAI_API_KEY");
+        std::env::remove_var("AZURE_OPENAI_ENDPOINT");
 
         let (key, base_url, model, label) = resolve_provider("gpt-4o-mini");
 
@@ -271,6 +277,18 @@ mod tests {
         match original_model {
             Some(value) => std::env::set_var("NEURON_MODEL", value),
             None => std::env::remove_var("NEURON_MODEL"),
+        }
+        match original_gateway {
+            Some(value) => std::env::set_var("NEURON_GATEWAY_URL", value),
+            None => std::env::remove_var("NEURON_GATEWAY_URL"),
+        }
+        match original_azure_key {
+            Some(value) => std::env::set_var("AZURE_OPENAI_API_KEY", value),
+            None => std::env::remove_var("AZURE_OPENAI_API_KEY"),
+        }
+        match original_azure_endpoint {
+            Some(value) => std::env::set_var("AZURE_OPENAI_ENDPOINT", value),
+            None => std::env::remove_var("AZURE_OPENAI_ENDPOINT"),
         }
     }
 }

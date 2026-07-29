@@ -1,0 +1,15 @@
+{
+  "name": "@zero-x/neuron-darwin-arm64",
+  "version": "6.3.0",
+  "description": "NeuronCLI native binary for macOS arm64",
+  "license": "MIT",
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "bin": {
+    "neuron": "bin/neuron"
+  },
+  "files": ["bin/"],
+  "publishConfig": {
+    "access": "public"
+  }
+}

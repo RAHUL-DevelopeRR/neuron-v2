@@ -1,29 +1,31 @@
 #!/usr/bin/env node
 
 /**
- * NeuronCLI — Universal Launcher
+ * NeuronCLI universal npm launcher.
  *
- * This is the npm bin entry point. It:
- * 1. Locates the bundled native binary (neuron.exe / neuron)
- * 2. Forwards all CLI arguments to the native engine
- * 3. Handles --tui flag to launch the React/Ink TUI instead
- *
- * Install: npm install -g @anthropic-ai/neuron
- * Usage:   neuron [args]          — launches native CLI
- *          neuron --tui           — launches React TUI preview
- *          neuron --version       — shows version
- *          neuron auth status     — shows auth state
+ * Resolution order:
+ * 1. Optional platform package, e.g. @zero-x/neuron-win32-x64.
+ * 2. Local development builds.
+ * 3. GitHub Release binary cache, verified against checksums.txt.
  */
 
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { createWriteStream, existsSync, mkdirSync, readFileSync, chmodSync, renameSync } from "node:fs";
+import { tmpdir, homedir } from "node:os";
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { platform, arch, env } from "node:process";
+import { platform, arch, env, exit } from "node:process";
+import { get as httpsGet } from "node:https";
+import { createRequire } from "node:module";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const ROOT = resolve(__dirname, "..");
+const require = createRequire(import.meta.url);
+const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
+
+const RELEASE_REPO = env.NEURON_RELEASE_REPOSITORY || "RAHUL-DevelopeRR/neuron-v2";
 
 function truthy(value) {
   if (!value) return false;
@@ -33,25 +35,18 @@ function truthy(value) {
 
 function tuiEnvironment() {
   const next = { ...env };
-
-  if (truthy(next.NEURON_NO_COLOR)) {
-    return next;
-  }
-
+  if (truthy(next.NEURON_NO_COLOR)) return next;
   delete next.NO_COLOR;
   next.CLICOLOR = "1";
   next.CLICOLOR_FORCE = "1";
   next.FORCE_COLOR = "3";
   next.COLORTERM = "truecolor";
-
   if (!next.TERM || String(next.TERM).toLowerCase() === "dumb" || platform === "win32") {
     next.TERM = "xterm-256color";
   }
-
+  next.NEURON_INSTALL_SOURCE ||= "npm";
   return next;
 }
-
-// ── Locate the native binary ─────────────────────────────────
 
 function goPlatform() {
   if (platform === "win32") return "windows";
@@ -64,98 +59,194 @@ function goArch() {
   return arch;
 }
 
-function findBinary() {
-  const binaryName = platform === "win32" ? "neuron.exe" : "neuron";
-  const platformBinary = `neuron-${goPlatform()}-${goArch()}${platform === "win32" ? ".exe" : ""}`;
+function npmArch() {
+  if (arch === "x64") return "x64";
+  if (arch === "arm64") return "arm64";
+  return arch;
+}
 
-  // 1. Check bundled platform-specific location (inside npm package).
-  const bundledPlatform = join(ROOT, "neuron_cli", "bin", platformBinary);
-  if (existsSync(bundledPlatform)) return bundledPlatform;
+function platformPackageName() {
+  return `@zero-x/neuron-${platform}-${npmArch()}`;
+}
 
-  // 2. Check legacy bundled location.
-  const bundled = join(ROOT, "neuron_cli", binaryName);
-  if (existsSync(bundled)) return bundled;
+function binaryName() {
+  return platform === "win32" ? "neuron.exe" : "neuron";
+}
 
-  // 3. Check Go build output (development).
-  const goBuild = join(ROOT, "go", binaryName);
-  if (existsSync(goBuild)) return goBuild;
+function releaseBinaryName() {
+  return `neuron-${goPlatform()}-${goArch()}${platform === "win32" ? ".exe" : ""}`;
+}
 
-  // 4. Check Rust build output (development).
-  const devBuild = join(ROOT, "rust", "target", "release", binaryName);
-  if (existsSync(devBuild)) return devBuild;
+function findPlatformPackageBinary() {
+  try {
+    const packageJSON = require.resolve(`${platformPackageName()}/package.json`);
+    const candidate = join(dirname(packageJSON), "bin", binaryName());
+    if (existsSync(candidate)) return candidate;
+  } catch {
+    // Optional package not installed on this platform.
+  }
+  return "";
+}
 
-  // 5. Check debug build.
-  const debugBuild = join(ROOT, "rust", "target", "debug", binaryName);
-  if (existsSync(debugBuild)) return debugBuild;
+function findGoBinary() {
+  const candidate = join(ROOT, "go", binaryName());
+  return existsSync(candidate) ? candidate : "";
+}
 
-  // 6. Check PATH.
-  const pathDirs = (env.PATH || "").split(platform === "win32" ? ";" : ":");
-  for (const dir of pathDirs) {
-    const candidate = join(dir, binaryName);
+function findLegacyBinary() {
+  const candidates = [
+    join(ROOT, "neuron_cli", "bin", releaseBinaryName()),
+    join(ROOT, "neuron_cli", binaryName()),
+    join(ROOT, "rust", "target", "release", binaryName()),
+    join(ROOT, "rust", "target", "debug", binaryName()),
+  ];
+  for (const candidate of candidates) {
     if (existsSync(candidate)) return candidate;
   }
-
-  console.error(`
-  ✗ NeuronCLI binary not found.
-
-  The native binary '${binaryName}' was not found in:
-    - ${join(ROOT, "neuron_cli", "bin")}
-    - ${join(ROOT, "neuron_cli")}
-    - ${join(ROOT, "go")}
-    - ${join(ROOT, "rust", "target", "release")}
-    - System PATH
-
-  To fix:
-    pip install neuroncli        (includes pre-built binary)
-    cd go && go build -o ${binaryName} main.go   (build from source)
-  `);
-  process.exit(1);
+  return "";
 }
 
-// ── Main ─────────────────────────────────────────────────────
+function cacheDir() {
+  const base =
+    env.XDG_CACHE_HOME ||
+    (platform === "win32"
+      ? env.LOCALAPPDATA || join(homedir(), "AppData", "Local")
+      : join(homedir(), ".cache"));
+  return join(base, "neuroncli", "bin", pkg.version, `${platform}-${npmArch()}`);
+}
 
-const args = process.argv.slice(2);
+function releaseURL(asset) {
+  return `https://github.com/${RELEASE_REPO}/releases/download/v${pkg.version}/${asset}`;
+}
 
-// --tui flag → launch React TUI instead of native CLI
-if (args.includes("--tui")) {
-  const tuiArgs = args.filter((a) => a !== "--tui");
+function download(url, target) {
+  return new Promise((resolveDownload, reject) => {
+    mkdirSync(dirname(target), { recursive: true });
+    const request = httpsGet(url, (response) => {
+      if ([301, 302, 303, 307, 308].includes(response.statusCode || 0) && response.headers.location) {
+        response.resume();
+        download(response.headers.location, target).then(resolveDownload, reject);
+        return;
+      }
+      if ((response.statusCode || 0) >= 400) {
+        response.resume();
+        reject(new Error(`download failed: ${response.statusCode} ${response.statusMessage}`));
+        return;
+      }
+      const file = createWriteStream(target);
+      response.pipe(file);
+      file.on("finish", () => file.close(resolveDownload));
+      file.on("error", reject);
+    });
+    request.on("error", reject);
+  });
+}
 
-  // Dynamic import of tsx to run the React TUI
-  try {
-    const tuiEntry = join(ROOT, "ui", "react-tui", "src", "index.tsx");
-    if (existsSync(tuiEntry)) {
-      const child = spawn("npx", ["tsx", tuiEntry, ...tuiArgs], {
-        stdio: "inherit",
-        shell: true,
-        env: tuiEnvironment(),
-      });
-      child.on("exit", (code) => process.exit(code || 0));
-    } else {
-      console.error("  ✗ React TUI not found. Run: npm run build:tui");
-      process.exit(1);
-    }
-  } catch (err) {
-    console.error("  ✗ Failed to launch TUI:", err.message);
-    process.exit(1);
+function sha256(path) {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+async function verifyChecksum(asset, path) {
+  const checksums = join(tmpdir(), `neuroncli-${pkg.version}-checksums.txt`);
+  await download(releaseURL("checksums.txt"), checksums);
+  const line = readFileSync(checksums, "utf8")
+    .split(/\r?\n/)
+    .find((entry) => entry.includes(asset));
+  if (!line) throw new Error(`checksum entry for ${asset} not found`);
+  const expected = line.trim().split(/\s+/)[0].toLowerCase();
+  const actual = sha256(path);
+  if (actual !== expected) {
+    throw new Error(`checksum mismatch for ${asset}`);
   }
-} else {
-  // Default: launch native binary
-  const binary = findBinary();
-  const child = spawn(binary, args, {
-    stdio: "inherit",
-    env: tuiEnvironment(),
-  });
+}
 
-  child.on("error", (err) => {
-    console.error(`  ✗ Failed to start NeuronCLI: ${err.message}`);
-    process.exit(1);
-  });
+async function downloadReleaseBinary() {
+  if (truthy(env.NEURON_DISABLE_DOWNLOAD)) return "";
+  const dir = cacheDir();
+  const target = join(dir, binaryName());
+  if (existsSync(target)) return target;
+  const asset = releaseBinaryName();
+  const tmp = join(dir, `${asset}.download`);
+  await download(releaseURL(asset), tmp);
+  await verifyChecksum(asset, tmp);
+  renameSync(tmp, target);
+  if (platform !== "win32") chmodSync(target, 0o755);
+  return target;
+}
 
-  child.on("exit", (code, signal) => {
-    if (signal) {
-      process.kill(process.pid, signal);
-    } else {
-      process.exit(code || 0);
+async function findBinary() {
+  return findPlatformPackageBinary() || findGoBinary() || findLegacyBinary() || (await downloadReleaseBinary());
+}
+
+function hasGoSource() {
+  return existsSync(join(ROOT, "go", "go.mod")) && existsSync(join(ROOT, "go", "main.go"));
+}
+
+async function run() {
+  const args = process.argv.slice(2);
+  if (args.includes("--tui")) {
+    const tuiArgs = args.filter((a) => a !== "--tui");
+    const tuiEntry = join(ROOT, "ui", "react-tui", "src", "index.tsx");
+    if (!existsSync(tuiEntry)) {
+      console.error("Neuron React TUI source is not included in this package.");
+      exit(1);
     }
+    const child = spawn("npx", ["tsx", tuiEntry, ...tuiArgs], {
+      stdio: "inherit",
+      shell: true,
+      env: tuiEnvironment(),
+    });
+    child.on("exit", (code) => exit(code || 0));
+    return;
+  }
+
+  const localBinary = findPlatformPackageBinary() || findGoBinary();
+  if (!localBinary && hasGoSource() && !truthy(env.NEURON_DISABLE_GO_RUN)) {
+    const child = spawn("go", ["run", ".", ...args], {
+      cwd: join(ROOT, "go"),
+      stdio: "inherit",
+      env: tuiEnvironment(),
+    });
+    child.on("exit", (code, signal) => {
+      if (signal) process.kill(process.pid, signal);
+      exit(code || 0);
+    });
+    child.on("error", (err) => {
+      console.error(`Failed to run local Go source: ${err.message}`);
+      exit(1);
+    });
+    return;
+  }
+
+  const binary = localBinary || findLegacyBinary() || (await downloadReleaseBinary());
+  if (!binary) {
+    console.error(`
+NeuronCLI native binary was not found for ${platform}/${arch}.
+
+Tried:
+  - ${platformPackageName()}
+  - local Go/Rust development builds
+  - GitHub Release asset ${releaseBinaryName()}
+
+Run:
+  neuron doctor
+  npm install -g @zero-x/neuron
+`);
+    exit(1);
+  }
+
+  const child = spawn(binary, args, { stdio: "inherit", env: tuiEnvironment() });
+  child.on("error", (err) => {
+    console.error(`Failed to start NeuronCLI: ${err.message}`);
+    exit(1);
+  });
+  child.on("exit", (code, signal) => {
+    if (signal) process.kill(process.pid, signal);
+    exit(code || 0);
   });
 }
+
+run().catch((err) => {
+  console.error(`NeuronCLI launcher error: ${err.message}`);
+  exit(1);
+});

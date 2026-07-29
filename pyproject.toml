@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "neuroncli"
-version = "6.2.5"
+version = "6.3.0"
 description = "NeuronCLI - AI-powered terminal assistant"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 requires-python = ">=3.8"
 authors = [
     {name = "RAHUL-DevelopeRR"},
@@ -15,7 +15,6 @@ authors = [
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: MacOS",
     "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
@@ -36,4 +35,4 @@ where = ["."]
 include = ["neuron_cli*"]
 
 [tool.setuptools.package-data]
-neuron_cli = ["neuron.exe", "neuron", "bin/*"]
+neuron_cli = ["bin/*"]

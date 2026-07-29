@@ -365,6 +365,8 @@ func Execute() {
 
 func init() {
 	rootCmd.AddCommand(newAuthCommand())
+	rootCmd.AddCommand(newDoctorCommand())
+	rootCmd.AddCommand(newUpdateCommand())
 
 	rootCmd.Flags().BoolP("help", "h", false, "Help")
 	rootCmd.Flags().BoolP("version", "v", false, "Version")

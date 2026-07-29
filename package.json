@@ -1,7 +1,7 @@
 {
-  "name": "neuron-cli-app",
-  "version": "6.2.5",
-  "description": "NeuronCLI — AI coding agent. Rust engine + React/Ink TUI. Powered by Azure AI Foundry.",
+  "name": "@zero-x/neuron",
+  "version": "6.3.0",
+  "description": "NeuronCLI - AI coding agent. Go runtime + terminal TUI. Powered by zero-x.live.",
   "private": false,
   "type": "module",
   "bin": {
@@ -17,16 +17,12 @@
   },
   "files": [
     "bin/",
-    "ui/react-tui/dist/",
-    "ui/react-tui/src/",
-    "ui/react-tui/package.json",
-    "ui/react-tui/tsconfig.json",
-    "neuron_cli/bin/",
-    "neuron_cli/neuron.exe",
-    "neuron_cli/neuron",
     "README.md",
     "LICENSE"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "keywords": [
     "neuron",
     "neuroncli",
@@ -35,8 +31,6 @@
     "coding-agent",
     "terminal",
     "tui",
-    "react",
-    "ink",
     "kimi",
     "deepseek",
     "azure",
@@ -52,6 +46,13 @@
   "dependencies": {
     "ink": "^5.1.0",
     "react": "^18.3.1"
+  },
+  "optionalDependencies": {
+    "@zero-x/neuron-darwin-arm64": "6.3.0",
+    "@zero-x/neuron-darwin-x64": "6.3.0",
+    "@zero-x/neuron-linux-arm64": "6.3.0",
+    "@zero-x/neuron-linux-x64": "6.3.0",
+    "@zero-x/neuron-win32-x64": "6.3.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.7",
