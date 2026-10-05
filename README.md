@@ -15,6 +15,10 @@ cargo build --release -p rusty-claude-cli
 
 On Windows, run `target\release\neuron.exe`. Login opens the Zero-X account page and saves an encrypted gateway session locally. Provider keys stay on the gateway. Login requires the updated Zero-X gateway and account database migrations to be deployed.
 
+## Install from package registries
+
+Install the released CLI with `npm install --global @zero-x/neuron` or `python -m pip install neuroncli`, then run `neuron auth login`. Package installers download the matching versioned native binary from GitHub Releases and verify its SHA-256 checksum. The initial download requires GitHub Releases access.
+
 For an existing gateway session in automation:
 
 ```sh
