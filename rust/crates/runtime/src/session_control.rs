@@ -31,15 +31,16 @@ impl SessionStore {
     /// The on-disk layout becomes `<cwd>/.neuron/sessions/<workspace_hash>/`.
     pub fn from_cwd(cwd: impl AsRef<Path>) -> Result<Self, SessionControlError> {
         let cwd = cwd.as_ref();
+        let workspace_root = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
         // Use .neuron as primary, fall back to .claw for existing sessions
-        let neuron_root = cwd
+        let neuron_root = workspace_root
             .join(".neuron")
             .join("sessions")
-            .join(workspace_fingerprint(cwd));
-        let claw_root = cwd
+            .join(workspace_fingerprint(&workspace_root));
+        let claw_root = workspace_root
             .join(".claw")
             .join("sessions")
-            .join(workspace_fingerprint(cwd));
+            .join(workspace_fingerprint(&workspace_root));
         // Migrate: if .claw exists but .neuron doesn't, use .claw for compat
         let sessions_root = if neuron_root.exists() || !claw_root.exists() {
             neuron_root
@@ -49,7 +50,7 @@ impl SessionStore {
         fs::create_dir_all(&sessions_root)?;
         Ok(Self {
             sessions_root,
-            workspace_root: cwd.to_path_buf(),
+            workspace_root,
         })
     }
 
@@ -779,6 +780,25 @@ mod tests {
             store_b.sessions_dir(),
             "session directories must differ across workspaces"
         );
+        fs::remove_dir_all(base).expect("temp dir should clean up");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_store_from_cwd_resolves_symlinked_workspace_paths() {
+        use std::os::unix::fs::symlink;
+
+        let base = temp_dir();
+        let workspace = base.join("workspace");
+        let alias = base.join("workspace-alias");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        symlink(&workspace, &alias).expect("workspace alias should be created");
+
+        let direct = SessionStore::from_cwd(&workspace).expect("direct store should build");
+        let through_alias = SessionStore::from_cwd(&alias).expect("alias store should build");
+
+        assert_eq!(direct.sessions_dir(), through_alias.sessions_dir());
+        assert_eq!(direct.workspace_root(), through_alias.workspace_root());
         fs::remove_dir_all(base).expect("temp dir should clean up");
     }
 
