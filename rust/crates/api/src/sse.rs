@@ -162,10 +162,7 @@ mod tests {
         let second = b"lo\"}}\n\n";
 
         assert_eq!(
-            parser
-                .push(first)
-                .expect("first chunk should buffer")
-                .len(),
+            parser.push(first).expect("first chunk should buffer").len(),
             0
         );
         let events = parser.push(second).expect("second chunk should parse");
