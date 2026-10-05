@@ -1,5 +1,5 @@
 import React, {useMemo, useState} from 'react';
-import {Box, Newline, Text, useInput} from 'ink';
+import {Box, Newline, Text, useApp, useInput} from 'ink';
 import {color, icons, opencodeTheme} from './theme.js';
 
 type AppProps = {
@@ -18,17 +18,18 @@ const commands = [
 ] as const;
 
 export function App({
-  model = process.env.NEURON_MODEL ?? 'claude-opus-4-6',
+  model = process.env.NEURON_MODEL ?? 'auto',
   permissionMode = process.env.NEURON_PERMISSION_MODE ?? 'workspace-write',
   workspace = process.cwd()
 }: AppProps): React.ReactElement {
   const [showHelp, setShowHelp] = useState(false);
   const [status, setStatus] = useState('ready');
+  const {exit} = useApp();
 
   useInput((input) => {
     if (input === 'q') {
       setStatus('quit requested');
-      process.exitCode = 0;
+      exit();
       return;
     }
     if (input === '?' || input === 'h') {

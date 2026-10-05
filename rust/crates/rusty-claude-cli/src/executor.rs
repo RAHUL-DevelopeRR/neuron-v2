@@ -251,6 +251,11 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "neuron v{VERSION}")?;
     writeln!(out)?;
     writeln!(out, "Usage:")?;
+    writeln!(out, "  neuron auth <login|logout|status>")?;
+    writeln!(
+        out,
+        "      Connect your Zero-X account to the coding gateway"
+    )?;
     writeln!(
         out,
         "  neuron [--model MODEL] [--allowedTools TOOL[,TOOL...]]"

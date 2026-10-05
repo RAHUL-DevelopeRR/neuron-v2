@@ -1,6 +1,6 @@
 //! LLM provider resolution and connectivity probing.
 //!
-//! Determines which API backend to use: Azure AI Foundry, OpenRouter, or a custom endpoint.
+//! Resolves the account gateway and explicit provider overrides.
 
 use crate::brand::*;
 use api::{detect_provider_kind, ProviderKind};
@@ -9,10 +9,15 @@ use std::env;
 /// Resolves the LLM provider in priority order:
 ///   1. Azure AI Foundry, when explicitly configured
 ///   2. Environment overrides (OPENAI_API_KEY + OPENAI_BASE_URL already set)
-///   3. OpenRouter free tier (fallback)
+///   3. Zero-X account gateway
 ///
 /// Returns (api_key, base_url, model, provider_label) tuple.
-pub fn resolve_provider(requested_model: &str) -> (String, String, String, &'static str) {
+pub fn resolve_provider(
+    requested_model: &str,
+) -> Result<(String, String, String, &'static str), std::io::Error> {
+    if env::var("NEURON_TOKEN").is_ok_and(|token| !token.trim().is_empty()) {
+        return gateway_provider(requested_model);
+    }
     // Priority 1: Azure AI Foundry, only when the user explicitly provides credentials.
     let quota = crate::quota::QuotaState::load();
     if !quota.is_azure_exhausted() {
@@ -30,7 +35,7 @@ pub fn resolve_provider(requested_model: &str) -> (String, String, String, &'sta
                         azure_model,
                         quota.display_compact()
                     );
-                    return (azure_key, azure_base, azure_model, "azure");
+                    return Ok((azure_key, azure_base, openai_model(&azure_model), "azure"));
                 }
                 eprintln!(
                     "\x1b[33m\u{26a0}\x1b[0m Azure unavailable \u{2013} falling back to OpenRouter"
@@ -50,35 +55,52 @@ pub fn resolve_provider(requested_model: &str) -> (String, String, String, &'sta
             let url = env::var("OPENAI_BASE_URL")
                 .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
             let model = env::var("NEURON_MODEL").unwrap_or_else(|_| requested_model.to_string());
-            return (key, url, model, "openai");
+            return Ok((key, url, openai_model(&model), "openai"));
         }
     }
 
-    // Priority 3: OpenRouter free (via existing PKCE auth)
+    // Local OpenAI-compatible servers may deliberately require no credential.
+    if let Ok(url) = env::var("OPENAI_BASE_URL") {
+        let parsed = reqwest::Url::parse(&url).map_err(std::io::Error::other)?;
+        if matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "::1")) {
+            return Ok((String::new(), url, openai_model(requested_model), "openai"));
+        }
+    }
+
+    // Direct OpenRouter remains available when explicitly configured.
     if let Ok(openrouter_key) = env::var("OPENROUTER_API_KEY") {
         if !openrouter_key.is_empty() {
-            return (
+            return Ok((
                 openrouter_key,
                 "https://openrouter.ai/api/v1".to_string(),
-                env::var("OPENROUTER_MODEL")
-                    .unwrap_or_else(|_| "qwen/qwen3-coder-480b-a35b-instruct:free".to_string()),
+                openai_model(
+                    &env::var("OPENROUTER_MODEL")
+                        .unwrap_or_else(|_| "qwen/qwen3-coder-480b-a35b-instruct:free".to_string()),
+                ),
                 "openrouter",
-            );
+            ));
         }
     }
-    if let Some(openrouter_key) = crate::auth::ensure_api_key() {
-        return (
-            openrouter_key,
-            "https://openrouter.ai/api/v1".to_string(),
-            env::var("OPENROUTER_MODEL")
-                .unwrap_or_else(|_| "qwen/qwen3-coder-480b-a35b-instruct:free".to_string()),
-            "openrouter",
-        );
-    }
+    gateway_provider(requested_model)
+}
 
-    // Nothing works
-    eprintln!("\x1b[31m\u{2717}\x1b[0m No API provider available. Set OPENAI_API_KEY or authenticate via neuron auth.");
-    std::process::exit(1);
+fn gateway_provider(
+    requested_model: &str,
+) -> Result<(String, String, String, &'static str), std::io::Error> {
+    let token = crate::auth::ensure_gateway_token()?;
+    let base = crate::auth::gateway_base_url()?;
+    let model = env::var("NEURON_MODEL").unwrap_or_else(|_| requested_model.to_string());
+    // Force OpenAI transport even for catalog IDs that resemble another provider.
+    let model = openai_model(&model);
+    Ok((token.expose().to_string(), base, model, "zero-x"))
+}
+
+fn openai_model(model: &str) -> String {
+    if model.starts_with("openai/") {
+        model.to_string()
+    } else {
+        format!("openai/{model}")
+    }
 }
 
 /// Quick non-blocking probe to check if the Azure endpoint is reachable.
@@ -106,7 +128,7 @@ pub fn azure_api_probe(api_key: &str, base_url: &str) -> bool {
     {
         Ok(resp) => {
             let status = resp.status().as_u16();
-            status == 200 || status == 429 || status == 400 || status == 401
+            status == 200 || status == 429
         }
         Err(_) => false,
     }
@@ -137,6 +159,19 @@ mod tests {
     }
 
     #[test]
+    fn compatible_transport_prefix_preserves_vendor_model_ids() {
+        assert_eq!(
+            super::openai_model("qwen/qwen3-coder:free"),
+            "openai/qwen/qwen3-coder:free"
+        );
+        assert_eq!(
+            super::openai_model("claude-sonnet-4-6"),
+            "openai/claude-sonnet-4-6"
+        );
+        assert_eq!(super::openai_model("openai/auto"), "openai/auto");
+    }
+
+    #[test]
     fn openai_env_resolution_respects_requested_model() {
         let _guard = env_lock()
             .lock()
@@ -149,11 +184,11 @@ mod tests {
         std::env::remove_var("OPENAI_BASE_URL");
         std::env::remove_var("NEURON_MODEL");
 
-        let (key, base_url, model, label) = resolve_provider("gpt-4o-mini");
+        let (key, base_url, model, label) = resolve_provider("gpt-4o-mini").unwrap();
 
         assert_eq!(key, "test-key");
         assert_eq!(base_url, "https://api.openai.com/v1");
-        assert_eq!(model, "gpt-4o-mini");
+        assert_eq!(model, "openai/gpt-4o-mini");
         assert_eq!(label, "openai");
 
         match original_key {

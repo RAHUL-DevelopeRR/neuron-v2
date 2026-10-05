@@ -2915,7 +2915,7 @@ fn summarize_web_fetch(
 
 fn extract_title(content: &str, raw_body: &str, content_type: &str) -> Option<String> {
     if content_type.contains("html") {
-        let lowered = raw_body.to_lowercase();
+        let lowered = raw_body.to_ascii_lowercase();
         if let Some(start) = lowered.find("<title>") {
             let after = start + "<title>".len();
             if let Some(end_rel) = lowered[after..].find("</title>") {
@@ -7106,6 +7106,40 @@ mod tests {
     }
 
     #[test]
+    fn web_fetch_title_preserves_unicode_byte_offsets() {
+        let html = "İ<TITLE>É 🦀</TITLE>";
+        assert_eq!(
+            super::extract_title("", html, "text/html"),
+            Some("É 🦀".to_string())
+        );
+    }
+
+    #[test]
+    fn http_test_server_drop_preserves_failures_without_double_panic() {
+        let failed_server = || TestServer {
+            addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            shutdown: None,
+            handle: Some(thread::spawn(|| panic!("server fixture failure"))),
+        };
+        let ordinary = std::panic::catch_unwind(|| drop(failed_server()))
+            .expect_err("server failure must fail its test");
+        assert_eq!(
+            ordinary.downcast_ref::<&str>(),
+            Some(&"server fixture failure")
+        );
+
+        let primary = std::panic::catch_unwind(|| {
+            let _server = failed_server();
+            panic!("primary fetch failure");
+        })
+        .expect_err("primary failure must remain observable");
+        assert_eq!(
+            primary.downcast_ref::<&str>(),
+            Some(&"primary fetch failure")
+        );
+    }
+
+    #[test]
     fn web_search_extracts_and_filters_results() {
         // Serialize env-var mutation so this test cannot race with the sibling
         // web_search_handles_generic_links_and_invalid_base_url test that also
@@ -7860,29 +7894,32 @@ mod tests {
         assert!(captured_job.allowed_tools.contains("read_file"));
         assert!(!captured_job.allowed_tools.contains("Agent"));
 
-        let normalized = execute_tool(
-            "Agent",
-            &json!({
-                "description": "Verify the branch",
-                "prompt": "Check tests.",
-                "subagent_type": "explorer"
-            }),
+        let normalized = execute_agent_with_spawn(
+            AgentInput {
+                description: "Verify the branch".to_string(),
+                prompt: "Check tests.".to_string(),
+                subagent_type: Some("explorer".to_string()),
+                name: None,
+                model: None,
+            },
+            |_| Ok(()),
         )
         .expect("Agent should normalize built-in aliases");
-        let normalized_output: serde_json::Value =
-            serde_json::from_str(&normalized).expect("valid json");
+        let normalized_output = serde_json::to_value(normalized).expect("valid json");
         assert_eq!(normalized_output["subagentType"], "Explore");
 
-        let named = execute_tool(
-            "Agent",
-            &json!({
-                "description": "Review the branch",
-                "prompt": "Inspect diff.",
-                "name": "Ship Audit!!!"
-            }),
+        let named = execute_agent_with_spawn(
+            AgentInput {
+                description: "Review the branch".to_string(),
+                prompt: "Inspect diff.".to_string(),
+                subagent_type: None,
+                name: Some("Ship Audit!!!".to_string()),
+                model: None,
+            },
+            |_| Ok(()),
         )
         .expect("Agent should normalize explicit names");
-        let named_output: serde_json::Value = serde_json::from_str(&named).expect("valid json");
+        let named_output = serde_json::to_value(named).expect("valid json");
         assert_eq!(named_output["name"], "ship-audit");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -9312,6 +9349,7 @@ mod tests {
 
     #[test]
     fn given_timeout_ms_when_repl_blocks_then_returns_timeout_error() {
+        let _guard = env_guard();
         let result = execute_tool(
             "REPL",
             &json!({
@@ -9703,6 +9741,13 @@ printf 'pwsh:%s' "$1"
 
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).expect("blocking test stream");
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(20)))
+                            .expect("test stream read timeout");
+                        stream
+                            .set_write_timeout(Some(Duration::from_secs(20)))
+                            .expect("test stream write timeout");
                         let mut buffer = [0_u8; 4096];
                         let size = stream.read(&mut buffer).expect("read request");
                         let request = String::from_utf8_lossy(&buffer[..size]).into_owned();
@@ -9737,7 +9782,11 @@ printf 'pwsh:%s' "$1"
                 let _ = tx.send(());
             }
             if let Some(handle) = self.handle.take() {
-                handle.join().expect("join test server");
+                if let Err(error) = handle.join() {
+                    if !thread::panicking() {
+                        std::panic::resume_unwind(error);
+                    }
+                }
             }
         }
     }

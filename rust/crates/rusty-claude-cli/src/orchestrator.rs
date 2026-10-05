@@ -5,7 +5,7 @@
 //! - `/power`  — Parallel ensemble + merge agent
 //! - `/divide` — Per-file task splitting (prompt-only, uses main runtime)
 //!
-//! Supports Azure AI Foundry deployments and OpenRouter free-tier models.
+//! Uses the configured Zero-X gateway, with explicit Azure/OpenRouter overrides.
 //! All API calls use a universal parameter set — no model-specific code.
 
 use std::env;
@@ -54,33 +54,50 @@ pub struct ModelResponse {
 
 /// Deployment names for orchestration roles.
 /// All names match Azure AI Foundry deployment dashboard exactly.
-/// Every model here has been verified working via automated test suite.
 pub struct Models;
 
 impl Models {
     /// Cheap Azure models for parallel agents in /power mode
     pub fn cheap_azure() -> &'static [&'static str] {
+        if env::var_os("NEURON_API_BASE").is_some() {
+            return &["auto", "auto", "auto"];
+        }
         &["Kimi-K2.5", "FW-DeepSeek-V3.2", "FW-MiniMax-M2.5"]
     }
 
     /// OpenRouter free-tier model (4th agent in /power mode)
     pub fn openrouter_free() -> &'static str {
+        if env::var_os("NEURON_API_BASE").is_some() {
+            return "auto";
+        }
         "qwen/qwen3-235b-a22b:free"
     }
 
     // ── Chain mode roles ──
     pub fn architect() -> &'static str {
+        if env::var_os("NEURON_API_BASE").is_some() {
+            return "auto";
+        }
         "Kimi-K2.5"
     }
     pub fn coder() -> &'static str {
+        if env::var_os("NEURON_API_BASE").is_some() {
+            return "auto";
+        }
         "FW-DeepSeek-V3.2"
     }
     pub fn reviewer() -> &'static str {
+        if env::var_os("NEURON_API_BASE").is_some() {
+            return "auto";
+        }
         "FW-MiniMax-M2.5"
     }
 
     /// Merge agent — used by /power to combine ensemble outputs
     pub fn merge() -> &'static str {
+        if env::var_os("NEURON_API_BASE").is_some() {
+            return "auto";
+        }
         "model-router"
     }
 }
@@ -158,10 +175,18 @@ fn parse_response(
         .or_else(|| msg["reasoning_content"].as_str())
         .unwrap_or("")
         .to_string();
+    if content.is_empty() {
+        return Err(OrchestratorError {
+            provider,
+            model: model.to_string(),
+            status: None,
+            message: "Provider returned no assistant content".into(),
+        });
+    }
     let tokens = parsed["usage"]["total_tokens"].as_u64().unwrap_or(0) as u32;
 
     Ok(ModelResponse {
-        model: model.to_string(),
+        model: parsed["model"].as_str().unwrap_or(model).to_string(),
         content,
         tokens,
         strategy: provider,
@@ -183,6 +208,9 @@ pub fn azure_call(
     messages: &[serde_json::Value],
     max_tokens: u32,
 ) -> Result<ModelResponse, OrchestratorError> {
+    if env::var_os("NEURON_API_BASE").is_some() {
+        return gateway_call(messages, max_tokens);
+    }
     let host = azure_host_root();
     let client = build_client(120)?;
 
@@ -262,16 +290,68 @@ pub fn openrouter_call(
     messages: &[serde_json::Value],
     max_tokens: u32,
 ) -> Result<ModelResponse, OrchestratorError> {
+    if env::var_os("NEURON_API_BASE").is_some() {
+        return gateway_call(messages, max_tokens);
+    }
+    compatible_call(
+        api_key,
+        model,
+        messages,
+        max_tokens,
+        "https://openrouter.ai/api/v1/chat/completions",
+        "openrouter",
+    )
+}
+
+fn gateway_call(
+    messages: &[serde_json::Value],
+    max_tokens: u32,
+) -> Result<ModelResponse, OrchestratorError> {
+    let auth_error = |error: std::io::Error| OrchestratorError {
+        provider: "zero-x",
+        model: "auto".into(),
+        status: None,
+        message: error.to_string(),
+    };
+    let base = crate::auth::gateway_base_url().map_err(auth_error)?;
+    let token = crate::auth::cached_gateway_token()
+        .map_err(auth_error)?
+        .ok_or_else(|| {
+            auth_error(std::io::Error::other(
+                "Sign in with `neuron auth login` before orchestration",
+            ))
+        })?;
+    let model = env::var("NEURON_MODEL").unwrap_or_else(|_| "auto".into());
+    let model = model.strip_prefix("openai/").unwrap_or(&model);
+    compatible_call(
+        token.expose(),
+        model,
+        messages,
+        max_tokens.min(8192),
+        &format!("{}/chat/completions", base.trim_end_matches('/')),
+        "zero-x",
+    )
+}
+
+fn compatible_call(
+    api_key: &str,
+    model: &str,
+    messages: &[serde_json::Value],
+    max_tokens: u32,
+    endpoint: &str,
+    provider: &'static str,
+) -> Result<ModelResponse, OrchestratorError> {
     let client = build_client(90)?;
 
     let body = serde_json::json!({
         "model": model,
         "messages": messages,
         "max_tokens": max_tokens,
+        "stream": false,
     });
 
     let resp = client
-        .post("https://openrouter.ai/api/v1/chat/completions")
+        .post(endpoint)
         .header("content-type", "application/json")
         .header("authorization", format!("Bearer {}", api_key))
         .header("HTTP-Referer", "https://zero-x.live")
@@ -279,7 +359,7 @@ pub fn openrouter_call(
         .json(&body)
         .send()
         .map_err(|e| OrchestratorError {
-            provider: "openrouter",
+            provider,
             model: model.to_string(),
             status: None,
             message: format!("Network error: {e}"),
@@ -290,16 +370,14 @@ pub fn openrouter_call(
 
     if status != 200 {
         return Err(OrchestratorError {
-            provider: "openrouter",
+            provider,
             model: model.to_string(),
             status: Some(status),
             message: text.chars().take(200).collect(),
         });
     }
 
-    let mut result = parse_response(&text, model, "openrouter")?;
-    result.strategy = "openrouter";
-    Ok(result)
+    parse_response(&text, model, provider)
 }
 
 // ── Logging helpers ─────────────────────────────────────────
@@ -325,7 +403,7 @@ pub fn log_skip(mode: &str, _color: &str, model: &str, reason: &str) {
 
 /// Execute the chain pipeline: Architect → Coder → Reviewer.
 /// Returns the combined output from all 3 models to feed into the main runtime.
-pub fn run_chain(api_key: &str, user_input: &str) -> String {
+pub fn run_chain(api_key: &str, user_input: &str) -> Result<String, OrchestratorError> {
     let color = "";
     let mode = "chain";
 
@@ -351,7 +429,7 @@ pub fn run_chain(api_key: &str, user_input: &str) -> String {
         }
         Err(e) => {
             log_fail(mode, color, Models::architect(), &e);
-            format!("(architect unavailable) Task: {user_input}")
+            return Err(e);
         }
     };
 
@@ -372,7 +450,7 @@ pub fn run_chain(api_key: &str, user_input: &str) -> String {
         }
         Err(e) => {
             log_fail(mode, color, Models::coder(), &e);
-            arch_result.clone()
+            return Err(e);
         }
     };
 
@@ -393,13 +471,13 @@ pub fn run_chain(api_key: &str, user_input: &str) -> String {
         }
         Err(e) => {
             log_fail(mode, color, Models::reviewer(), &e);
-            code_result.clone()
+            return Err(e);
         }
     };
 
-    format!(
-        "[CHAIN MODE — 3 MODELS COMPLETED]\n\
-         Three specialized models have processed this task:\n\n\
+    Ok(format!(
+        "[CHAIN MODE: 3 PHASES COMPLETED]\n\
+         Architect, coder, and reviewer phases processed this task:\n\n\
          === ARCHITECT ({}) ===\n{arch_result}\n\n\
          === CODER ({}) ===\n{code_result}\n\n\
          === REVIEWER ({}) ===\n{review_result}\n\n\
@@ -409,14 +487,14 @@ pub fn run_chain(api_key: &str, user_input: &str) -> String {
         Models::architect(),
         Models::coder(),
         Models::reviewer()
-    )
+    ))
 }
 
 // ── Power mode orchestration ────────────────────────────────
 
 /// Execute the power ensemble: 3 Azure + 1 OpenRouter agents → merge.
 /// Returns the merged output to feed into the main runtime.
-pub fn run_power(api_key: &str, user_input: &str) -> String {
+pub fn run_power(api_key: &str, user_input: &str) -> Result<String, OrchestratorError> {
     let color = "";
     let mode = "power";
 
@@ -435,7 +513,12 @@ pub fn run_power(api_key: &str, user_input: &str) -> String {
 
         handles.push(std::thread::spawn(move || {
             let _result = std::panic::catch_unwind(|| {
-                eprintln!("[power] Agent {}/{}: {} (Azure)", idx, total, model);
+                let provider = if env::var_os("NEURON_API_BASE").is_some() {
+                    "Zero-X"
+                } else {
+                    "Azure"
+                };
+                eprintln!("[power] Agent {}/{}: {} ({provider})", idx, total, model);
                 let msgs = vec![serde_json::json!({
                     "role": "user",
                     "content": format!(
@@ -465,12 +548,21 @@ pub fn run_power(api_key: &str, user_input: &str) -> String {
     {
         let input = user_input.to_string();
         let or_model = Models::openrouter_free().to_string();
-        let or_key = crate::auth::ensure_api_key();
+        let or_key = if env::var_os("NEURON_API_BASE").is_some() {
+            Some(String::new())
+        } else {
+            env::var("OPENROUTER_API_KEY").ok()
+        };
 
         handles.push(std::thread::spawn(move || {
             let _result = std::panic::catch_unwind(|| {
+                let provider = if env::var_os("NEURON_API_BASE").is_some() {
+                    "Zero-X"
+                } else {
+                    "OpenRouter"
+                };
                 eprintln!(
-                    "[power] Agent {}/{}: {} (OpenRouter)",
+                    "[power] Agent {}/{}: {} ({provider})",
                     total, total, or_model
                 );
                 let Some(api_key) = or_key else {
@@ -509,20 +601,27 @@ pub fn run_power(api_key: &str, user_input: &str) -> String {
         .collect();
 
     if results.is_empty() {
-        return user_input.to_string();
+        return Err(OrchestratorError {
+            provider: "orchestrator",
+            model: String::new(),
+            status: None,
+            message:
+                "All parallel agents failed; check gateway credentials and provider availability"
+                    .into(),
+        });
     }
 
     // Fast path: single result — no merge needed
     if results.len() == 1 {
         let r = &results[0];
-        return format!(
+        return Ok(format!(
             "[POWER MODE — SINGLE MODEL]\n\
              Only one model produced a solution. Using output from {}.\n\n\
              {}\n\n\
              Execute this code using your tools (write_file, bash, etc.).\n\
              Original task: {user_input}\n",
             r.model, r.content
-        );
+        ));
     }
 
     // Compress each solution to fit merge budget
@@ -547,25 +646,20 @@ pub fn run_power(api_key: &str, user_input: &str) -> String {
     match azure_call(api_key, Models::merge(), &merge_msgs, 3000) {
         Ok(r) => {
             log_ok(mode, color, &r.model, r.tokens);
-            format!(
-                "[POWER MODE — {} MODELS MERGED]\n\
-                 Multiple models generated solutions IN PARALLEL, a merge agent combined the best parts.\n\n\
+            Ok(format!(
+                "[POWER MODE: {} AGENTS MERGED]\n\
+                 Parallel agents generated solutions, then a merge phase combined the results.\n\n\
                  === MERGED RESULT ===\n{}\n\n\
                  Execute this merged code using your tools (write_file, bash, etc.).\n\
                  Write the files exactly as specified.\n\
                  Original task: {user_input}\n",
-                results.len(), r.content
-            )
+                results.len(),
+                r.content
+            ))
         }
         Err(e) => {
             log_fail(mode, color, Models::merge(), &e);
-            // Fallback: use the first successful result
-            format!(
-                "[POWER MODE — FALLBACK]\n\
-                 Merge failed, using best single output from {}.\n\n\
-                 {}\n\nExecute this code. Original task: {user_input}\n",
-                results[0].model, results[0].content
-            )
+            Err(e)
         }
     }
 }
@@ -589,4 +683,88 @@ pub fn build_divide_prompt(user_input: &str) -> String {
          5. Summary of files created and how they connect.\n\n\
          User's request: {user_input}\n"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn orchestration_adapter_posts_gateway_session_and_reports_actual_model() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    result => panic!("Expected phase request: {result:?}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line.trim_end(), "POST /v1/chat/completions HTTP/1.1");
+            let mut length = 0;
+            let mut authorized = false;
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                let lower = line.to_ascii_lowercase();
+                if let Some(value) = lower.strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+                if lower.trim_end() == "authorization: bearer ses_012345678901234567890123456789" {
+                    authorized = true;
+                }
+            }
+            assert!(authorized);
+            let mut body = vec![0u8; length];
+            reader.read_exact(&mut body).unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(request["model"], "auto");
+            assert_eq!(request["stream"], false);
+            let response = r#"{"model":"@cf/actual-model","choices":[{"message":{"content":"phase complete"}}],"usage":{"total_tokens":12}}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+        });
+        let response = compatible_call(
+            "ses_012345678901234567890123456789",
+            "auto",
+            &[serde_json::json!({"role":"user","content":"plan the task"})],
+            8192,
+            &endpoint,
+            "zero-x",
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(response.model, "@cf/actual-model");
+        assert_eq!(response.content, "phase complete");
+        assert!(parse_response("{}", "auto", "zero-x").is_err());
+        assert!(parse_response(
+            r#"{"error":{"message":"quota exceeded"}}"#,
+            "auto",
+            "zero-x"
+        )
+        .is_err());
+    }
 }

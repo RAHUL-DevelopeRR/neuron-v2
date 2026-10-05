@@ -62,12 +62,14 @@ impl SseParser {
             .windows(2)
             .position(|window| window == b"\n\n")
             .map(|position| (position, 2))
-            .or_else(|| {
+            .into_iter()
+            .chain(
                 self.buffer
                     .windows(4)
                     .position(|window| window == b"\r\n\r\n")
-                    .map(|position| (position, 4))
-            })?;
+                    .map(|position| (position, 4)),
+            )
+            .min_by_key(|(position, _)| *position)?;
 
         let (position, separator_len) = separator;
         let frame = self

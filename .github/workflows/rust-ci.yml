@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+      - ux-audit-fixes
+      - 'codex/**'
       - 'gaebal/**'
       - 'omx-issue-*'
     paths:
@@ -17,9 +19,12 @@ on:
       - ROADMAP.md
       - docs/**
       - rust/**
+      - ui/react-tui/**
+      - package.json
+      - package-lock.json
+      - neuron_cli/**
+      - pyproject.toml
   pull_request:
-    branches:
-      - main
     paths:
       - .github/workflows/rust-ci.yml
       - .github/scripts/check_doc_source_of_truth.py
@@ -31,6 +36,11 @@ on:
       - ROADMAP.md
       - docs/**
       - rust/**
+      - ui/react-tui/**
+      - package.json
+      - package-lock.json
+      - neuron_cli/**
+      - pyproject.toml
   workflow_dispatch:
 
 concurrency:
@@ -59,6 +69,21 @@ jobs:
       - name: Check docs and metadata for stale branding
         run: python .github/scripts/check_doc_source_of_truth.py
 
+  react-tui:
+    name: React TUI
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run tui:build
+
   fmt:
     name: cargo fmt
     runs-on: ubuntu-latest
@@ -75,15 +100,22 @@ jobs:
 
   test-workspace:
     name: cargo test --workspace
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-14]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust -> target
       - name: Run workspace tests
-        run: cargo test --workspace
+        run: cargo test --workspace -- --test-threads=1
 
   clippy-workspace:
     name: cargo clippy --workspace
@@ -97,4 +129,4 @@ jobs:
         with:
           workspaces: rust -> target
       - name: Run workspace clippy
-        run: cargo clippy --workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings

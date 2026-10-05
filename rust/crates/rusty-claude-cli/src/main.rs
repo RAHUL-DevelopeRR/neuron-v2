@@ -118,9 +118,15 @@ use tools::{
     execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
 };
 
-const DEFAULT_MODEL: &str = "claude-opus-4-6";
+const DEFAULT_MODEL: &str = "auto";
 fn max_tokens_for_model(model: &str) -> u32 {
-    if model.contains("opus") {
+    if env::var_os("NEURON_API_BASE").is_some()
+        || model == "auto"
+        || model == "openai/auto"
+        || model.starts_with("openai/@cf/")
+    {
+        8192
+    } else if model.contains("opus") {
         32_000
     } else {
         64_000
@@ -244,6 +250,9 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "auth") {
+        return auth::run_auth_command(&args[1..]);
+    }
     match parse_args(&args)? {
         CliAction::DumpManifests {
             output_format,
@@ -308,7 +317,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // The provider always dictates the model â€” when Azure is up we
             // use gpt-5.5, when falling back to OpenRouter we MUST switch
             // to the free-tier model regardless of what the user passed.
-            let effective_model = configure_provider_for_model(model);
+            let effective_model = configure_provider_for_model(model)?;
             // Only consume piped stdin as prompt context when the permission
             // mode is fully unattended. In modes where the permission
             // prompter may invoke CliPermissionPrompter::decide(), stdin
@@ -1309,15 +1318,27 @@ fn run_stale_base_preflight(flag_value: Option<&str>) {
     }
 }
 
-fn configure_provider_for_model(model: String) -> String {
-    if detect_provider_kind(&model) == ProviderKind::Anthropic {
-        return model;
+fn configure_provider_for_model(model: String) -> Result<String, Box<dyn std::error::Error>> {
+    if auth::cached_gateway_token()?.is_none() {
+        if model == DEFAULT_MODEL && resolve_cli_auth_source().is_ok() {
+            return Ok("claude-opus-4-6".to_string());
+        }
+        let kind = detect_provider_kind(&model);
+        if (kind == ProviderKind::Anthropic && resolve_cli_auth_source().is_ok())
+            || (kind == ProviderKind::Xai
+                && env::var("XAI_API_KEY").is_ok_and(|key| !key.is_empty()))
+        {
+            return Ok(model);
+        }
     }
 
-    let (api_key, base_url, resolved_model, _provider_label) = resolve_provider(&model);
+    let (api_key, base_url, resolved_model, provider_label) = resolve_provider(&model)?;
+    if provider_label == "zero-x" {
+        std::env::set_var("NEURON_API_BASE", &base_url);
+    }
     std::env::set_var("OPENAI_API_KEY", api_key);
     std::env::set_var("OPENAI_BASE_URL", base_url);
-    resolved_model
+    Ok(resolved_model)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -1337,7 +1358,7 @@ fn run_repl(
         std::process::exit(1);
     }
 
-    let resolved_model = configure_provider_for_model(resolve_repl_model(model));
+    let resolved_model = configure_provider_for_model(resolve_repl_model(model))?;
 
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
     cli.set_reasoning_effort(reasoning_effort);
@@ -2297,8 +2318,8 @@ impl LiveCli {
             let api_key = orchestrator::azure_api_key();
             effective_input = match mode.as_str() {
                 "divide" => orchestrator::build_divide_prompt(input),
-                "chain" => orchestrator::run_chain(&api_key, input),
-                "power" => orchestrator::run_power(&api_key, input),
+                "chain" => orchestrator::run_chain(&api_key, input)?,
+                "power" => orchestrator::run_power(&api_key, input)?,
                 _ => input.to_string(),
             };
             effective_input.as_str()
@@ -2686,14 +2707,12 @@ impl LiveCli {
                     _ => {
                         self.orchestration_mode = Some("power".to_string());
                         eprintln!(
-                            "\x1b[31m[power]\x1b[0m \x1b[1mPower mode ON\x1b[0m \x1b[2m-- ensemble merge (maximum quality)\x1b[0m"
+                            "\x1b[31m[power]\x1b[0m \x1b[1mPower mode ON\x1b[0m \x1b[2m-- parallel proposals and merge\x1b[0m"
                         );
                         eprintln!(
-                            "  \x1b[2mAll models generate the same module simultaneously.\x1b[0m"
+                            "  \x1b[2mAgents draft alternative solutions in parallel.\x1b[0m"
                         );
-                        eprintln!(
-                            "  \x1b[2mA merge agent combines the BEST PARTS from each.\x1b[0m"
-                        );
+                        eprintln!("  \x1b[2mA merge phase combines the candidate results.\x1b[0m");
                         eprintln!("  \x1b[2mType /power off to deactivate.\x1b[0m");
                     }
                 }
@@ -2807,6 +2826,11 @@ impl LiveCli {
         };
 
         let model = resolve_model_alias_with_config(&model);
+        let model = if self.model.starts_with("openai/") && !model.starts_with("openai/") {
+            format!("openai/{model}")
+        } else {
+            model
+        };
 
         if model == self.model {
             println!(
@@ -6517,25 +6541,24 @@ UU conflicted.rs",
 
     #[test]
     fn latest_session_alias_resolves_most_recent_managed_session() {
-        let _guard = cwd_guard();
         let workspace = temp_workspace("latest-session-alias");
         std::fs::create_dir_all(&workspace).expect("workspace should create");
-        let previous = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&workspace).expect("switch cwd");
+        let store = runtime::SessionStore::from_cwd(&workspace).expect("session store");
 
-        let older = create_managed_session_handle("session-older").expect("older handle");
+        let older = store.create_handle("session-older");
         Session::new()
             .with_persistence_path(older.path.clone())
             .save_to_path(&older.path)
             .expect("older session should save");
         std::thread::sleep(Duration::from_millis(20));
-        let newer = create_managed_session_handle("session-newer").expect("newer handle");
+        let newer = store.create_handle("session-newer");
         Session::new()
             .with_persistence_path(newer.path.clone())
             .save_to_path(&newer.path)
             .expect("newer session should save");
 
-        let resolved = resolve_session_reference("latest").expect("latest session should resolve");
+        let resolved = crate::session_mgmt::resolve_session_reference_in_store(&store, "latest")
+            .expect("latest session should resolve");
         assert_eq!(
             resolved
                 .path
@@ -6544,7 +6567,6 @@ UU conflicted.rs",
             newer.path.canonicalize().expect("newer path should exist")
         );
 
-        std::env::set_current_dir(previous).expect("restore cwd");
         std::fs::remove_dir_all(workspace).expect("workspace should clean up");
     }
 
@@ -7224,16 +7246,17 @@ UU conflicted.rs",
         fs::create_dir_all(&workspace).expect("workspace");
         let script_path = workspace.join("fixture-mcp.py");
         write_mcp_server_fixture(&script_path);
+        let python_command = if cfg!(windows) { "python" } else { "python3" };
         fs::write(
             config_home.join("settings.json"),
             serde_json::to_string_pretty(&json!({
                 "mcpServers": {
                     "alpha": {
-                        "command": "python3",
+                        "command": python_command,
                         "args": [script_path.to_string_lossy()]
                     },
                     "broken": {
-                        "command": "python3",
+                        "command": python_command,
                         "args": ["-c", "import sys; sys.exit(0)"]
                     }
                 }

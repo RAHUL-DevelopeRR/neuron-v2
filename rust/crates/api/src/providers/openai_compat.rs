@@ -389,15 +389,15 @@ impl MessageStream {
                 return Ok(None);
             }
 
-            match self.response.chunk().await? {
-                Some(chunk) => {
-                    for parsed in self.parser.push(&chunk)? {
-                        self.pending.extend(self.state.ingest_chunk(parsed)?);
-                    }
+            if let Some(chunk) = self.response.chunk().await? {
+                for parsed in self.parser.push(&chunk)? {
+                    self.pending.extend(self.state.ingest_chunk(parsed)?);
                 }
-                None => {
-                    self.done = true;
+            } else {
+                for parsed in self.parser.finish()? {
+                    self.pending.extend(self.state.ingest_chunk(parsed)?);
                 }
+                self.done = true;
             }
         }
     }
@@ -430,6 +430,17 @@ impl OpenAiSseParser {
         }
 
         Ok(events)
+    }
+
+    fn finish(&mut self) -> Result<Vec<ChatCompletionChunk>, ApiError> {
+        let trailing = std::mem::take(&mut self.buffer);
+        Ok(parse_sse_frame(
+            &String::from_utf8_lossy(&trailing),
+            &self.provider,
+            &self.model,
+        )?
+        .into_iter()
+        .collect())
     }
 }
 
@@ -559,6 +570,22 @@ impl StreamState {
     fn finish(&mut self) -> Result<Vec<StreamEvent>, ApiError> {
         if self.finished {
             return Ok(Vec::new());
+        }
+        if !self.tool_calls.is_empty() {
+            if self.stop_reason.as_deref() != Some("tool_use") {
+                return Err(ApiError::InvalidSseFrame(
+                    "Tool stream ended without a tool_calls finish reason",
+                ));
+            }
+            if self.tool_calls.values().any(|call| {
+                call.name.as_ref().is_none_or(String::is_empty)
+                    || !serde_json::from_str::<Value>(&call.arguments)
+                        .is_ok_and(|value| value.is_object())
+            }) {
+                return Err(ApiError::InvalidSseFrame(
+                    "Tool stream ended with an incomplete function name or arguments",
+                ));
+            }
         }
         self.finished = true;
 
@@ -695,7 +722,7 @@ struct ChatMessage {
     role: String,
     #[serde(default)]
     content: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     tool_calls: Vec<ResponseToolCall>,
 }
 
@@ -809,7 +836,7 @@ fn strip_routing_prefix(model: &str) -> &str {
         let prefix = &model[..pos];
         // Only strip if the prefix before "/" is a known routing prefix,
         // not if "/" appears in the middle of the model name for other reasons.
-        if matches!(prefix, "openai" | "xai" | "grok" | "qwen" | "kimi") {
+        if matches!(prefix, "openai" | "xai" | "grok" | "kimi") {
             &model[pos + 1..]
         } else {
             model
@@ -1236,12 +1263,14 @@ fn next_sse_frame(buffer: &mut Vec<u8>) -> Option<String> {
         .windows(2)
         .position(|window| window == b"\n\n")
         .map(|position| (position, 2))
-        .or_else(|| {
+        .into_iter()
+        .chain(
             buffer
                 .windows(4)
                 .position(|window| window == b"\r\n\r\n")
-                .map(|position| (position, 4))
-        })?;
+                .map(|position| (position, 4)),
+        )
+        .min_by_key(|(position, _)| *position)?;
 
     let (position, separator_len) = separator;
     let frame = buffer.drain(..position + separator_len).collect::<Vec<_>>();
@@ -1419,6 +1448,52 @@ impl StringExt for String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stream_parser_flushes_eof_and_preserves_mixed_frame_order() {
+        let mut parser = super::OpenAiSseParser::with_context("zero-x", "auto");
+        let first = r#"{"id":"first","choices":[{"delta":{"content":"one"}}]}"#;
+        let second = r#"{"id":"second","choices":[{"delta":{"content":"two"}}]}"#;
+        let final_chunk = r#"{"id":"final","choices":[{"delta":{},"finish_reason":"stop"}]}"#;
+        let chunks = parser
+            .push(format!("data: {first}\r\n\r\ndata: {second}\n\ndata: {final_chunk}").as_bytes())
+            .unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].id, "first");
+        assert_eq!(chunks[1].id, "second");
+        assert_eq!(parser.finish().unwrap()[0].id, "final");
+        assert!(parser.finish().unwrap().is_empty());
+        assert_eq!(
+            super::strip_routing_prefix("qwen/qwen3-coder:free"),
+            "qwen/qwen3-coder:free"
+        );
+        assert_eq!(
+            super::strip_routing_prefix("openai/qwen/qwen3-coder:free"),
+            "qwen/qwen3-coder:free"
+        );
+    }
+
+    #[test]
+    fn tool_stream_requires_explicit_completion_before_execution() {
+        let mut state = super::StreamState::new("auto".into());
+        let chunk = serde_json::from_value(serde_json::json!({
+            "id": "tool", "choices": [{"delta": {"tool_calls": [{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{}"}}]}}]
+        })).unwrap();
+        state.ingest_chunk(chunk).unwrap();
+        assert!(state.finish().is_err());
+        let completed = serde_json::from_value(serde_json::json!({
+            "id": "tool", "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
+        }))
+        .unwrap();
+        state.ingest_chunk(completed).unwrap();
+        let events = state.finish().unwrap();
+        assert!(events.iter().any(|event| matches!(event, crate::types::StreamEvent::MessageDelta(delta) if delta.delta.stop_reason.as_deref() == Some("tool_use"))));
+        let mut malformed = super::StreamState::new("auto".into());
+        let chunk = serde_json::from_value(serde_json::json!({
+            "id": "tool", "choices": [{"delta": {"tool_calls": [{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\"path\":"}}]}, "finish_reason":"tool_calls"}]
+        })).unwrap();
+        malformed.ingest_chunk(chunk).unwrap();
+        assert!(malformed.finish().is_err());
+    }
     use super::{
         build_chat_completion_request, chat_completions_endpoint, is_reasoning_model,
         normalize_finish_reason, openai_tool_choice, parse_tool_arguments, OpenAiCompatClient,

@@ -34,4 +34,4 @@ where = ["."]
 include = ["neuron_cli*"]
 
 [tool.setuptools.package-data]
-neuron_cli = ["neuron.exe"]
+neuron_cli = ["neuron.exe", "neuron"]

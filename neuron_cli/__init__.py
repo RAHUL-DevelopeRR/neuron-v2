@@ -18,7 +18,8 @@ def _find_binary() -> Path:
     # Fallback: search PATH (useful during development)
     for path_dir in os.get_exec_path():
         candidate = Path(path_dir) / binary_name
-        if candidate.exists():
+        # The pip console script is also named neuron; finding it would recurse.
+        if candidate.is_file() and candidate.resolve() != Path(sys.argv[0]).resolve():
             return candidate
     raise RuntimeError(
         f"NeuronCLI binary '{binary_name}' not found inside package or PATH. "

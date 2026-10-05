@@ -4,6 +4,7 @@
 
 use super::*;
 use api::{self, AuthSource};
+use std::collections::BTreeMap;
 use std::env;
 use std::io::{self, Write};
 
@@ -181,7 +182,7 @@ impl AnthropicRuntimeClient {
         let renderer = TerminalRenderer::new();
         let mut markdown_stream = MarkdownStreamState::default();
         let mut events = Vec::new();
-        let mut pending_tool: Option<(String, String, String)> = None;
+        let mut pending_tools = BTreeMap::<u32, (String, String, String)>::new();
         let mut block_has_thinking_summary = false;
         let mut saw_stop = false;
         let mut received_any_event = false;
@@ -223,7 +224,8 @@ impl AnthropicRuntimeClient {
 
             match event {
                 ApiStreamEvent::MessageStart(start) => {
-                    for block in start.message.content {
+                    for (index, block) in start.message.content.into_iter().enumerate() {
+                        let mut pending_tool = None;
                         push_output_block(
                             block,
                             out,
@@ -232,9 +234,17 @@ impl AnthropicRuntimeClient {
                             true,
                             &mut block_has_thinking_summary,
                         )?;
+                        if let Some(tool) = pending_tool {
+                            pending_tools.insert(
+                                u32::try_from(index)
+                                    .map_err(|error| RuntimeError::new(error.to_string()))?,
+                                tool,
+                            );
+                        }
                     }
                 }
                 ApiStreamEvent::ContentBlockStart(start) => {
+                    let mut pending_tool = None;
                     push_output_block(
                         start.content_block,
                         out,
@@ -243,6 +253,9 @@ impl AnthropicRuntimeClient {
                         true,
                         &mut block_has_thinking_summary,
                     )?;
+                    if let Some(tool) = pending_tool {
+                        pending_tools.insert(start.index, tool);
+                    }
                 }
                 ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
                     ContentBlockDelta::TextDelta { text } => {
@@ -259,7 +272,7 @@ impl AnthropicRuntimeClient {
                         }
                     }
                     ContentBlockDelta::InputJsonDelta { partial_json } => {
-                        if let Some((_, _, input)) = &mut pending_tool {
+                        if let Some((_, _, input)) = pending_tools.get_mut(&delta.index) {
                             input.push_str(&partial_json);
                         }
                     }
@@ -271,14 +284,14 @@ impl AnthropicRuntimeClient {
                     }
                     ContentBlockDelta::SignatureDelta { .. } => {}
                 },
-                ApiStreamEvent::ContentBlockStop(_) => {
+                ApiStreamEvent::ContentBlockStop(stop) => {
                     block_has_thinking_summary = false;
                     if let Some(rendered) = markdown_stream.flush(&renderer) {
                         write!(out, "{rendered}")
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
                     }
-                    if let Some((id, name, input)) = pending_tool.take() {
+                    if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
                         if let Some(progress_reporter) = &self.progress_reporter {
                             progress_reporter.mark_tool_phase(&name, &input);
                         }
@@ -304,13 +317,26 @@ impl AnthropicRuntimeClient {
             }
         }
 
+        if !pending_tools.is_empty() {
+            return Err(RuntimeError::new(
+                "Stream ended before all tool argument blocks completed",
+            ));
+        }
+        if !saw_stop
+            && events
+                .iter()
+                .any(|event| matches!(event, AssistantEvent::ToolUse { .. }))
+        {
+            return Err(RuntimeError::new(
+                "Stream ended before the tool message completed",
+            ));
+        }
         push_prompt_cache_record(&self.client, &mut events);
 
         if !saw_stop
-            && events.iter().any(|event| {
-                matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
-                    || matches!(event, AssistantEvent::ToolUse { .. })
-            })
+            && events
+                .iter()
+                .any(|event| matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty()))
         {
             events.push(AssistantEvent::MessageStop);
         }
