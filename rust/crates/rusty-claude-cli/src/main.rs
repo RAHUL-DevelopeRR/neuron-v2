@@ -7701,7 +7701,13 @@ mod dump_manifests_tests {
             "error message should mention missing manifest sources: {error_msg}"
         );
         assert!(
-            error_msg.contains(&root.display().to_string()),
+            error_msg.contains(
+                &root
+                    .canonicalize()
+                    .expect("root exists")
+                    .display()
+                    .to_string()
+            ),
             "error message should contain the resolved repo root path: {error_msg}"
         );
         assert!(
