@@ -21,7 +21,7 @@ pub struct SessionStore {
     /// Resolved root of the session namespace, e.g.
     /// `/home/user/project/.claw/sessions/a1b2c3d4e5f60718/`.
     sessions_root: PathBuf,
-    /// The canonical workspace path that was fingerprinted.
+    /// Workspace root used to resolve relative session references.
     workspace_root: PathBuf,
 }
 
@@ -31,16 +31,19 @@ impl SessionStore {
     /// The on-disk layout becomes `<cwd>/.neuron/sessions/<workspace_hash>/`.
     pub fn from_cwd(cwd: impl AsRef<Path>) -> Result<Self, SessionControlError> {
         let cwd = cwd.as_ref();
-        let workspace_root = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        #[cfg(target_os = "macos")]
+        let storage_root = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        #[cfg(not(target_os = "macos"))]
+        let storage_root = cwd.to_path_buf();
         // Use .neuron as primary, fall back to .claw for existing sessions
-        let neuron_root = workspace_root
+        let neuron_root = storage_root
             .join(".neuron")
             .join("sessions")
-            .join(workspace_fingerprint(&workspace_root));
-        let claw_root = workspace_root
+            .join(workspace_fingerprint(&storage_root));
+        let claw_root = storage_root
             .join(".claw")
             .join("sessions")
-            .join(workspace_fingerprint(&workspace_root));
+            .join(workspace_fingerprint(&storage_root));
         // Migrate: if .claw exists but .neuron doesn't, use .claw for compat
         let sessions_root = if neuron_root.exists() || !claw_root.exists() {
             neuron_root
@@ -50,7 +53,7 @@ impl SessionStore {
         fs::create_dir_all(&sessions_root)?;
         Ok(Self {
             sessions_root,
-            workspace_root,
+            workspace_root: cwd.to_path_buf(),
         })
     }
 
@@ -783,7 +786,7 @@ mod tests {
         fs::remove_dir_all(base).expect("temp dir should clean up");
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     #[test]
     fn session_store_from_cwd_resolves_symlinked_workspace_paths() {
         use std::os::unix::fs::symlink;
@@ -798,7 +801,6 @@ mod tests {
         let through_alias = SessionStore::from_cwd(&alias).expect("alias store should build");
 
         assert_eq!(direct.sessions_dir(), through_alias.sessions_dir());
-        assert_eq!(direct.workspace_root(), through_alias.workspace_root());
         fs::remove_dir_all(base).expect("temp dir should clean up");
     }
 

@@ -4593,7 +4593,7 @@ impl ApiClient for ProviderRuntimeClient {
 
         let runtime = &self.runtime;
         let chain = &self.chain;
-        let mut last_error: Option<ApiError> = None;
+        let mut last_error = None;
         for (index, entry) in chain.iter().enumerate() {
             let message_request = MessageRequest {
                 model: entry.model.clone(),
@@ -4631,7 +4631,7 @@ impl ApiClient for ProviderRuntimeClient {
 async fn stream_with_provider(
     client: &ProviderClient,
     message_request: &MessageRequest,
-) -> Result<Vec<AssistantEvent>, ApiError> {
+) -> Result<Vec<AssistantEvent>, Box<ApiError>> {
     let mut stream = client.stream_message(message_request).await?;
     let mut events = Vec::new();
     let mut pending_tools: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
@@ -6582,15 +6582,16 @@ mod tests {
     #[test]
     #[cfg_attr(windows, ignore = "Windows fixture needs shell/path isolation")]
     fn recovery_loop_state_file_reflects_transitions() {
-        // End-to-end proof: .claw/worker-state.json reflects every transition
+        // End-to-end proof: .neuron/worker-state.json reflects every transition
         // through the stall-detect -> resolve-trust -> ready loop.
         use std::fs;
+        let _guard = env_guard();
 
         // Use a real temp CWD so state file can be written
         let worktree = temp_path("recovery-loop-state");
         fs::create_dir_all(&worktree).expect("create worktree");
         let cwd = worktree.to_str().expect("utf-8").to_string();
-        let state_path = worktree.join(".claw").join("worker-state.json");
+        let state_path = worktree.join(".neuron").join("worker-state.json");
 
         // 1. Create worker WITHOUT trusted_roots
         let created = execute_tool("WorkerCreate", &json!({"cwd": cwd}))
@@ -8554,6 +8555,8 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = temp_path("subagent-input.txt");
         std::fs::write(&path, "hello from child").expect("write input file");
+        let original_dir = std::env::current_dir().expect("current directory");
+        std::env::set_current_dir(std::env::temp_dir()).expect("set temp workspace");
 
         let mut runtime = ConversationRuntime::new(
             Session::new(),
@@ -8566,9 +8569,9 @@ mod tests {
             vec![String::from("system prompt")],
         );
 
-        let summary = runtime
-            .run_turn("Inspect the delegated file", None)
-            .expect("subagent loop should succeed");
+        let summary = runtime.run_turn("Inspect the delegated file", None);
+        std::env::set_current_dir(original_dir).expect("restore current directory");
+        let summary = summary.expect("subagent loop should succeed");
 
         assert_eq!(
             final_assistant_text(&summary),
@@ -9513,8 +9516,11 @@ printf 'pwsh:%s' "$1"
         let file = root.join("readable.txt");
         fs::write(&file, "content\n").expect("write test file");
 
+        let original_dir = std::env::current_dir().expect("current directory");
+        std::env::set_current_dir(&root).expect("set workspace root");
         let registry = read_only_registry();
         let result = registry.execute("read_file", &json!({ "path": file.display().to_string() }));
+        std::env::set_current_dir(original_dir).expect("restore current directory");
         assert!(result.is_ok(), "read_file should be allowed: {result:?}");
 
         let _ = fs::remove_dir_all(root);
