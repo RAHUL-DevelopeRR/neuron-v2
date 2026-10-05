@@ -191,6 +191,6 @@ mod tests {
         let mut buf = SyncRenderBuffer::new();
         let big = "x".repeat(BUFFER_FLUSH_THRESHOLD + 100);
         buf.append(&big).unwrap();
-        assert!(buf.buffer.is_empty()); // flushed due to size
+        assert_eq!(buf.buffer, ""); // flushed due to size
     }
 }

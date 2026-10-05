@@ -285,12 +285,9 @@ pub(crate) fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn check_auth_health() -> DiagnosticCheck {
-    let api_key_present = env::var("ANTHROPIC_API_KEY")
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty());
-    let auth_token_present = env::var("ANTHROPIC_AUTH_TOKEN")
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty());
+    let api_key_present = env::var("ANTHROPIC_API_KEY").is_ok_and(|value| !value.trim().is_empty());
+    let auth_token_present =
+        env::var("ANTHROPIC_AUTH_TOKEN").is_ok_and(|value| !value.trim().is_empty());
     let env_details = format!(
         "Environment       api_key={} auth_token={}",
         if api_key_present { "present" } else { "absent" },

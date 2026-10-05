@@ -3742,7 +3742,7 @@ fn render_prompt_history_report(entries: &[PromptHistoryEntry], limit: usize) ->
         "Prompt history".to_string(),
         format!("  Total            {total}"),
         format!("  Showing          {} most recent", shown.len()),
-        format!("  Reverse search   Ctrl-R in the REPL"),
+        "  Reverse search   Ctrl-R in the REPL".to_string(),
         String::new(),
     ];
     for (offset, entry) in shown.iter().enumerate() {
@@ -7089,7 +7089,7 @@ UU conflicted.rs",
         )
         .expect("tool block should accumulate");
 
-        assert!(events.is_empty());
+        assert_eq!(events, []);
         assert_eq!(
             pending_tool,
             Some(("tool-1".to_string(), "read_file".to_string(), String::new(),))

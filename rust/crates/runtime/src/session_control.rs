@@ -32,7 +32,10 @@ impl SessionStore {
     pub fn from_cwd(cwd: impl AsRef<Path>) -> Result<Self, SessionControlError> {
         let cwd = cwd.as_ref();
         #[cfg(target_os = "macos")]
-        let storage_root = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        let storage_root = {
+            fs::create_dir_all(cwd)?;
+            fs::canonicalize(cwd)?
+        };
         #[cfg(not(target_os = "macos"))]
         let storage_root = cwd.to_path_buf();
         // Use .neuron as primary, fall back to .claw for existing sessions
@@ -797,6 +800,8 @@ mod tests {
         fs::create_dir_all(&workspace).expect("workspace should exist");
         symlink(&workspace, &alias).expect("workspace alias should be created");
 
+        let workspace = workspace.join("new-project");
+        let alias = alias.join("new-project");
         let direct = SessionStore::from_cwd(&workspace).expect("direct store should build");
         let through_alias = SessionStore::from_cwd(&alias).expect("alias store should build");
 
