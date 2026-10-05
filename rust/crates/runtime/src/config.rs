@@ -1486,7 +1486,7 @@ mod tests {
         // then
         let chain = loaded.provider_fallbacks();
         assert_eq!(chain.primary(), None);
-        assert!(chain.fallbacks().is_empty());
+        assert_eq!(chain.fallbacks().len(), 0);
         assert!(chain.is_empty());
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -1534,7 +1534,7 @@ mod tests {
             .expect("config should load");
 
         // then
-        assert!(loaded.trusted_roots().is_empty());
+        assert_eq!(loaded.trusted_roots().len(), 0);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

@@ -577,20 +577,28 @@ fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
         std::env::current_dir()?.join(path)
     };
 
-    if let Ok(canonical) = candidate.canonicalize() {
-        return Ok(canonical);
-    }
-
-    if let Some(parent) = candidate.parent() {
-        let canonical_parent = parent
-            .canonicalize()
-            .unwrap_or_else(|_| parent.to_path_buf());
-        if let Some(name) = candidate.file_name() {
-            return Ok(canonical_parent.join(name));
+    let mut ancestor = candidate.as_path();
+    let mut missing = Vec::new();
+    loop {
+        match ancestor.canonicalize() {
+            Ok(mut canonical) => {
+                for name in missing.into_iter().rev() {
+                    canonical.push(name);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if fs::symlink_metadata(ancestor).is_ok() {
+                    return Err(error);
+                }
+                missing.push(ancestor.file_name().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "Cannot resolve missing path")
+                })?);
+                ancestor = ancestor.parent().ok_or(error)?;
+            }
+            Err(error) => return Err(error),
         }
     }
-
-    Ok(candidate)
 }
 
 /// Read a file with workspace boundary enforcement.
@@ -683,7 +691,8 @@ mod tests {
 
     use super::{
         edit_file, expand_braces, glob_search, grep_search, is_symlink_escape, read_file,
-        read_file_in_workspace, write_file, GrepSearchInput, MAX_WRITE_SIZE,
+        read_file_in_workspace, write_file, write_file_in_workspace, GrepSearchInput,
+        MAX_WRITE_SIZE,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -750,6 +759,32 @@ mod tests {
         let result =
             read_file_in_workspace(inside.to_string_lossy().as_ref(), None, None, &workspace);
         assert!(result.is_ok());
+
+        let nested = workspace.join("missing/parents/new.txt");
+        let output = write_file_in_workspace(nested.to_string_lossy().as_ref(), "new", &workspace)
+            .expect("new nested file should remain inside the canonical workspace");
+        assert_eq!(
+            std::path::PathBuf::from(output.file_path),
+            nested.canonicalize().unwrap()
+        );
+
+        let escape = workspace.join("missing/../../outside-new.txt");
+        assert!(
+            write_file_in_workspace(escape.to_string_lossy().as_ref(), "unsafe", &workspace)
+                .is_err()
+        );
+
+        #[cfg(unix)]
+        {
+            let target = temp_path("missing-symlink-target.txt");
+            let link = workspace.join("dangling-link.txt");
+            std::os::unix::fs::symlink(&target, &link).expect("create dangling symlink");
+            assert!(
+                write_file_in_workspace(link.to_string_lossy().as_ref(), "unsafe", &workspace)
+                    .is_err()
+            );
+            assert!(!target.exists());
+        }
 
         // Reading outside workspace should fail
         let outside = temp_path("outside-boundary.txt");

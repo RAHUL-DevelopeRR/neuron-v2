@@ -122,7 +122,10 @@ fn login() -> io::Result<SecureString> {
                         eprintln!("Zero-X gateway session saved. Return to your terminal.");
                         return Ok(SecureString::new(token));
                     }
-                    Err(_) => respond(&mut stream, false),
+                    Err(error) => {
+                        eprintln!("Rejected Neuron callback: {error}");
+                        respond(&mut stream, false);
+                    }
                 }
             }
             Ok(_) => {}
@@ -167,12 +170,7 @@ fn receive_callback(stream: &mut TcpStream, state: &str, port: u16) -> io::Resul
         }
     }
     if headers.get("host") != Some(&format!("127.0.0.1:{port}"))
-        || !headers.get("origin").is_some_and(|origin| {
-            matches!(
-                origin.as_str(),
-                "https://zero-x.live" | "https://www.zero-x.live"
-            )
-        })
+        || !trusted_callback_origin(&headers)
         || !headers.get("content-type").is_some_and(|value| {
             value.split(';').next() == Some("application/x-www-form-urlencoded")
         })
@@ -210,6 +208,23 @@ fn receive_callback(stream: &mut TcpStream, state: &str, port: u16) -> io::Resul
         .ok_or_else(|| io::Error::other("Missing session token"))?;
     validate_token(&token)?;
     Ok(token)
+}
+
+fn trusted_callback_origin(headers: &std::collections::HashMap<String, String>) -> bool {
+    if headers.get("origin").is_some_and(|origin| {
+        matches!(
+            origin.as_str(),
+            "https://zero-x.live" | "https://www.zero-x.live"
+        )
+    }) {
+        return true;
+    }
+    headers.get("referer").is_some_and(|referer| {
+        Url::parse(referer).is_ok_and(|url| {
+            url.scheme() == "https"
+                && matches!(url.host_str(), Some("zero-x.live" | "www.zero-x.live"))
+        })
+    })
 }
 
 fn respond(stream: &mut TcpStream, success: bool) {
@@ -313,6 +328,18 @@ mod tests {
         assert!(validate_gateway_base("http://example.com/v1").is_err());
         assert!(validate_gateway_base("https://user:secret@example.com/v1").is_err());
         assert!(validate_gateway_base("https://example.com/v1?redirect=other").is_err());
+    }
+
+    #[test]
+    fn callback_accepts_origin_or_same_site_referer() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert(
+            "referer".to_string(),
+            "https://zero-x.live/neuroncli/login/".to_string(),
+        );
+        assert!(trusted_callback_origin(&headers));
+        headers.insert("referer".to_string(), "https://attacker.test/".to_string());
+        assert!(!trusted_callback_origin(&headers));
     }
 
     fn callback(method: &str, origin: &str, body: &str) -> io::Result<String> {

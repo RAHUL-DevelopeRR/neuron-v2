@@ -747,7 +747,7 @@ mod tests {
 
         // then
         assert!(result.is_ok());
-        assert!(result.warnings.is_empty());
+        assert_eq!(result.warnings.len(), 0);
     }
 
     #[test]

@@ -7871,7 +7871,7 @@ mod tests {
         assert_eq!(manifest.name, "ship-audit");
         assert_eq!(manifest.subagent_type.as_deref(), Some("Explore"));
         assert_eq!(manifest.status, "running");
-        assert!(!manifest.created_at.is_empty());
+        assert_ne!(manifest.created_at, "");
         assert!(manifest.started_at.is_some());
         assert!(manifest.completed_at.is_none());
         let contents = std::fs::read_to_string(&manifest.output_file).expect("agent file exists");
@@ -8917,7 +8917,7 @@ mod tests {
 
         let read_error = execute_tool("read_file", &json!({ "path": "missing.txt" }))
             .expect_err("missing file should fail");
-        assert!(!read_error.is_empty());
+        assert_ne!(read_error, "");
 
         let edit_once = execute_tool(
             "edit_file",
@@ -9000,7 +9000,7 @@ mod tests {
 
         let glob_error = execute_tool("glob_search", &json!({ "pattern": "[" }))
             .expect_err("invalid glob should fail");
-        assert!(!glob_error.is_empty());
+        assert_ne!(glob_error, "");
 
         let grep_content = execute_tool(
             "grep_search",
@@ -9038,7 +9038,7 @@ mod tests {
             &json!({ "pattern": "(alpha", "path": "nested" }),
         )
         .expect_err("invalid regex should fail");
-        assert!(!grep_error.is_empty());
+        assert_ne!(grep_error, "");
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
@@ -9416,7 +9416,7 @@ printf 'pwsh:%s' "$1"
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
         assert_eq!(output["stdout"], "pwsh:Write-Output hello");
-        assert!(output["stderr"].as_str().expect("stderr").is_empty());
+        assert_eq!(output["stderr"].as_str().expect("stderr"), "");
 
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
         assert!(background_output["backgroundTaskId"].as_str().is_some());
