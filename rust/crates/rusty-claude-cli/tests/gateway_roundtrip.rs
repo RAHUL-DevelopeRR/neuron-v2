@@ -21,6 +21,7 @@ fn serve_gateway_roundtrip(listener: &TcpListener) {
                 result => panic!("Expected gateway request: {result:?}"),
             }
         };
+        stream.set_nonblocking(false).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();

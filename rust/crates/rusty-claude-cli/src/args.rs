@@ -324,6 +324,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
         // command line, read stdin as the prompt and dispatch as a one-shot Prompt
         // rather than starting the interactive REPL (which would consume the pipe and
         // print the startup banner, then exit without sending anything to the API).
+        #[cfg(not(test))]
         if !std::io::stdin().is_terminal() {
             let mut buf = String::new();
             let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf);
