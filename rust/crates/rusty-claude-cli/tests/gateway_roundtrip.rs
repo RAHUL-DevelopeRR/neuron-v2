@@ -100,6 +100,12 @@ fn gateway_default_model_preserves_parallel_tool_calls_and_file_results() {
     let workspace =
         std::env::temp_dir().join(format!("neuron-gateway-test-{}", std::process::id()));
     fs::create_dir_all(workspace.join("home")).unwrap();
+    fs::create_dir_all(workspace.join("config")).unwrap();
+    fs::write(
+        workspace.join("config/settings.json"),
+        r#"{"defaultMcpServers":false}"#,
+    )
+    .unwrap();
     fs::write(workspace.join("fixture.txt"), "gateway fixture\n").unwrap();
     fs::write(workspace.join("second.txt"), "second fixture\n").unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_neuron"));
@@ -137,7 +143,8 @@ fn gateway_default_model_preserves_parallel_tool_calls_and_file_results() {
             let _ = child.kill();
             let output = child.wait_with_output().unwrap();
             panic!(
-                "Gateway roundtrip timed out: {}",
+                "Gateway roundtrip timed out; stdout: {}; stderr: {}",
+                String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
         }

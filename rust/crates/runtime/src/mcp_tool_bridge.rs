@@ -398,6 +398,8 @@ mod tests {
             "    if request is None:",
             "        break",
             "    method = request['method']",
+            "    if method == 'notifications/initialized':",
+            "        continue",
             "    log(method)",
             "    if method == 'initialize':",
             "        send_message({",
