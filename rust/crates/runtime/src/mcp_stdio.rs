@@ -18,9 +18,7 @@ use crate::mcp_lifecycle_hardened::{
     McpDegradedReport, McpErrorSurface, McpFailedServer, McpLifecyclePhase,
 };
 
-#[cfg(all(test, not(windows)))]
-const MCP_INITIALIZE_TIMEOUT_MS: u64 = 200;
-#[cfg(all(test, windows))]
+#[cfg(test)]
 const MCP_INITIALIZE_TIMEOUT_MS: u64 = 3_000;
 #[cfg(not(test))]
 const MCP_INITIALIZE_TIMEOUT_MS: u64 = 10_000;
@@ -2469,10 +2467,13 @@ mod tests {
                     config: McpServerConfig::Stdio(McpStdioServerConfig {
                         command: python_command(),
                         args: python_script_args(&script_path),
-                        env: BTreeMap::from([(
-                            "MCP_TOOL_CALL_DELAY_MS".to_string(),
-                            "200".to_string(),
-                        )]),
+                        env: BTreeMap::from([
+                            ("MCP_TOOL_CALL_DELAY_MS".to_string(), "200".to_string()),
+                            (
+                                "NEURON_MCP_FRAMING".to_string(),
+                                "content-length".to_string(),
+                            ),
+                        ]),
                         tool_call_timeout_ms: Some(25),
                     }),
                 },
@@ -2523,10 +2524,16 @@ mod tests {
                     config: McpServerConfig::Stdio(McpStdioServerConfig {
                         command: python_command(),
                         args: python_script_args(&script_path),
-                        env: BTreeMap::from([(
-                            "MCP_INVALID_TOOL_CALL_RESPONSE".to_string(),
-                            "1".to_string(),
-                        )]),
+                        env: BTreeMap::from([
+                            (
+                                "MCP_INVALID_TOOL_CALL_RESPONSE".to_string(),
+                                "1".to_string(),
+                            ),
+                            (
+                                "NEURON_MCP_FRAMING".to_string(),
+                                "content-length".to_string(),
+                            ),
+                        ]),
                         tool_call_timeout_ms: Some(1_000),
                     }),
                 },

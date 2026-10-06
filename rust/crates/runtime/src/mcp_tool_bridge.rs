@@ -468,6 +468,10 @@ mod tests {
                 env: BTreeMap::from([
                     ("MCP_SERVER_LABEL".to_string(), server_name.to_string()),
                     (
+                        "NEURON_MCP_FRAMING".to_string(),
+                        "content-length".to_string(),
+                    ),
+                    (
                         "MCP_LOG_PATH".to_string(),
                         log_path.to_string_lossy().into_owned(),
                     ),
