@@ -91,18 +91,18 @@ def _download_binary() -> Path:
 
 
 def _find_binary() -> Path:
-    """Locate an embedded or PATH binary, downloading it when needed."""
+    """Locate this package's binary, with an explicit development override."""
+    override = os.environ.get("NEURON_BINARY_PATH")
+    if override:
+        candidate = Path(override).expanduser().resolve()
+        if not candidate.is_file() or candidate == Path(sys.argv[0]).resolve():
+            raise RuntimeError("NEURON_BINARY_PATH must point to a native Neuron binary.")
+        return candidate
     pkg_dir = Path(__file__).resolve().parent
     binary_name = "neuron.exe" if sys.platform == "win32" else "neuron"
     candidate = pkg_dir / binary_name
     if candidate.is_file():
         return candidate
-    # Fallback: search PATH (useful during development)
-    for path_dir in os.get_exec_path():
-        candidate = Path(path_dir) / binary_name
-        # The pip console script is also named neuron; finding it would recurse.
-        if candidate.is_file() and candidate.resolve() != Path(sys.argv[0]).resolve():
-            return candidate
     return _download_binary()
 
 

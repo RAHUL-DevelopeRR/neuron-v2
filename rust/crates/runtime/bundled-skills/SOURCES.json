@@ -1,0 +1,17 @@
+{
+  "ponytail": {
+    "repository": "https://github.com/DietrichGebert/ponytail",
+    "commit": "cd765194f5e625d2f96e80e63df1c1af0b03705b",
+    "license": "MIT"
+  },
+  "antislop": {
+    "repository": "https://github.com/miqdadbadjuber/anti-slop",
+    "commit": "388cbe3b6c37d5175b9f460015bb092ef9e34894",
+    "license": "MIT"
+  },
+  "gstack": {
+    "repository": "https://github.com/garrytan/gstack",
+    "commit": "857466ff8b93c0575bc9e46cf2838d1962077d8f",
+    "license": "MIT"
+  }
+}

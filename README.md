@@ -17,7 +17,7 @@ On Windows, run `target\release\neuron.exe`. Login opens the Zero-X account page
 
 ## Install from package registries
 
-Install the released CLI with `npm install --global @zero-x/neuron` or `python -m pip install neuroncli`, then run `neuron auth login`. Package installers download the matching versioned native binary from GitHub Releases and verify its SHA-256 checksum. The initial download requires GitHub Releases access.
+Install the released CLI with `npm install --global @zero-x.live/neuron` or `python -m pip install neuroncli`, then run `neuron auth login`. Package installers download the matching versioned native binary from GitHub Releases and verify its SHA-256 checksum. The initial download requires GitHub Releases access.
 
 For an existing gateway session in automation:
 
@@ -29,6 +29,11 @@ export NEURON_TOKEN=ses_your_gateway_session
 Use `neuron auth status` to inspect credential availability and `neuron auth logout` to revoke the session. Gateway credentials expire; sign in again when the gateway returns 401. Available models come from the server's configured catalog. Free provider quotas and availability are determined by those providers and server configuration.
 
 Advanced direct-provider use remains available through `OPENAI_API_KEY` and `OPENAI_BASE_URL`, or explicit Anthropic credentials and an Anthropic model. Do not embed provider credentials in distributed clients.
+
+Ponytail, AntiSlop and the gstack router are included in every new conversation.
+Their companion skills are embedded in the native binary. See
+[default skills and integrations](docs/DEFAULT_INTEGRATIONS.md) for custom skills,
+plugins, MCP servers and optional browser control.
 
 ## Verification
 

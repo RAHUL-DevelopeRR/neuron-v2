@@ -8,7 +8,7 @@ const directory = path.dirname(fileURLToPath(import.meta.url));
 const binary = path.join(directory, 'native', process.platform === 'win32' ? 'neuron.exe' : 'neuron');
 
 if (!existsSync(binary)) {
-  console.error('NeuronCLI binary is missing. Reinstall @zero-x/neuron to download the matching release.');
+  console.error('NeuronCLI binary is missing. Reinstall @zero-x.live/neuron to download the matching release.');
   process.exit(1);
 }
 

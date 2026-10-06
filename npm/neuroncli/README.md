@@ -1,9 +1,9 @@
-# @zero-x/neuron
+# @zero-x.live/neuron
 
 Install the Neuron terminal coding agent with Node.js 22.14 or later:
 
 ```sh
-npm install --global @zero-x/neuron
+npm install --global @zero-x.live/neuron
 neuron auth login
 neuron
 ```

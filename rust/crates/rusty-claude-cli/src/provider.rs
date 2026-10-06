@@ -19,13 +19,13 @@ pub fn resolve_provider(
         return gateway_provider(requested_model);
     }
     // Priority 1: Azure AI Foundry, only when the user explicitly provides credentials.
-    let quota = crate::quota::QuotaState::load();
-    if !quota.is_azure_exhausted() {
-        if let (Ok(azure_key), Ok(azure_base)) = (
-            env::var("AZURE_OPENAI_API_KEY"),
-            env::var("AZURE_OPENAI_ENDPOINT"),
-        ) {
-            if !azure_key.is_empty() && !azure_base.is_empty() {
+    if let (Ok(azure_key), Ok(azure_base)) = (
+        env::var("AZURE_OPENAI_API_KEY"),
+        env::var("AZURE_OPENAI_ENDPOINT"),
+    ) {
+        if !azure_key.trim().is_empty() && !azure_base.trim().is_empty() {
+            let quota = crate::quota::QuotaState::load();
+            if !quota.is_azure_exhausted() {
                 let azure_model =
                     env::var("AZURE_OPENAI_MODEL").unwrap_or_else(|_| "Kimi-K2.5".to_string());
 
@@ -37,16 +37,14 @@ pub fn resolve_provider(
                     );
                     return Ok((azure_key, azure_base, openai_model(&azure_model), "azure"));
                 }
+                eprintln!("\x1b[33m\u{26a0}\x1b[0m Azure unavailable \u{2013} using fallback");
+            } else {
                 eprintln!(
-                    "\x1b[33m\u{26a0}\x1b[0m Azure unavailable \u{2013} falling back to OpenRouter"
+                    "\x1b[33m\u{26a0}\x1b[0m Azure daily quota exhausted ({}) \u{2013} using fallback",
+                    quota.display_compact()
                 );
             }
         }
-    } else {
-        eprintln!(
-            "\x1b[33m\u{26a0}\x1b[0m Azure daily quota exhausted ({}) \u{2013} using fallback",
-            quota.display_compact()
-        );
     }
 
     // Priority 2: Explicit OpenAI-compatible override.

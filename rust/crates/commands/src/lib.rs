@@ -2108,6 +2108,7 @@ enum DefinitionSource {
     UserClaw,
     UserCodex,
     UserClaude,
+    Bundled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -2115,6 +2116,7 @@ enum DefinitionScope {
     Project,
     UserConfigHome,
     UserHome,
+    Bundled,
 }
 
 impl DefinitionScope {
@@ -2123,6 +2125,7 @@ impl DefinitionScope {
             Self::Project => "Project roots",
             Self::UserConfigHome => "User config roots",
             Self::UserHome => "User home roots",
+            Self::Bundled => "Bundled defaults",
         }
     }
 }
@@ -2135,6 +2138,7 @@ impl DefinitionSource {
             }
             Self::UserClawConfigHome | Self::UserCodexHome => DefinitionScope::UserConfigHome,
             Self::UserClaw | Self::UserCodex | Self::UserClaude => DefinitionScope::UserHome,
+            Self::Bundled => DefinitionScope::Bundled,
         }
     }
 
@@ -2863,6 +2867,13 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         );
     }
 
+    push_unique_skill_root(
+        &mut roots,
+        DefinitionSource::UserClawConfigHome,
+        ConfigLoader::default_for(cwd).config_home().join("skills"),
+        SkillOrigin::SkillsDir,
+    );
+
     if let Ok(claw_config_home) = env::var("CLAW_CONFIG_HOME") {
         let claw_config_home = PathBuf::from(claw_config_home);
         push_unique_skill_root(
@@ -2970,11 +2981,28 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         );
     }
 
+    if let Ok(bundle) =
+        runtime::default_skills::bundled_skill_root(ConfigLoader::default_for(cwd).config_home())
+    {
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::Bundled,
+            bundle.clone(),
+            SkillOrigin::SkillsDir,
+        );
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::Bundled,
+            bundle.join("gstack"),
+            SkillOrigin::SkillsDir,
+        );
+    }
+
     roots
 }
 
 fn install_skill(source: &str, cwd: &Path) -> std::io::Result<InstalledSkill> {
-    let registry_root = default_skill_install_root()?;
+    let registry_root = default_skill_install_root();
     install_skill_into(source, cwd, &registry_root)
 }
 
@@ -3023,20 +3051,17 @@ fn install_skill_into(
     })
 }
 
-fn default_skill_install_root() -> std::io::Result<PathBuf> {
+fn default_skill_install_root() -> PathBuf {
+    if let Some(neuron_config_home) = env::var_os("NEURON_CONFIG_HOME") {
+        return PathBuf::from(neuron_config_home).join("skills");
+    }
     if let Ok(claw_config_home) = env::var("CLAW_CONFIG_HOME") {
-        return Ok(PathBuf::from(claw_config_home).join("skills"));
+        return PathBuf::from(claw_config_home).join("skills");
     }
     if let Ok(codex_home) = env::var("CODEX_HOME") {
-        return Ok(PathBuf::from(codex_home).join("skills"));
+        return PathBuf::from(codex_home).join("skills");
     }
-    if let Some(home) = env::var_os("HOME") {
-        return Ok(PathBuf::from(home).join(".claw").join("skills"));
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "unable to resolve a skills install root; set CLAW_CONFIG_HOME or HOME",
-    ))
+    ConfigLoader::default_for(".").config_home().join("skills")
 }
 
 fn resolve_skill_install_source(source: &str, cwd: &Path) -> std::io::Result<SkillInstallSource> {
@@ -3480,6 +3505,7 @@ fn render_skills_report(skills: &[SkillSummary]) -> String {
         DefinitionScope::Project,
         DefinitionScope::UserConfigHome,
         DefinitionScope::UserHome,
+        DefinitionScope::Bundled,
     ] {
         let group = skills
             .iter()
@@ -3906,6 +3932,7 @@ fn definition_source_id(source: DefinitionSource) -> &'static str {
         DefinitionSource::UserClaw | DefinitionSource::UserCodex | DefinitionSource::UserClaude => {
             "user_claw"
         }
+        DefinitionSource::Bundled => "bundled",
     }
 }
 
@@ -5136,6 +5163,37 @@ mod tests {
             resolve_skill_path(&workspace, "/handoff").expect("legacy command should resolve"),
             legacy_commands.join("handoff.md")
         );
+    }
+
+    #[test]
+    fn bundled_skills_resolve_without_a_checkout_and_project_skills_override_them() {
+        let _guard = env_guard();
+        let workspace = temp_dir("bundled-registry");
+        let original = std::env::var_os("NEURON_CONFIG_HOME");
+        std::env::set_var("NEURON_CONFIG_HOME", workspace.join("config"));
+        fs::create_dir_all(&workspace).expect("workspace");
+
+        for name in runtime::default_skills::DEFAULT_SKILL_NAMES {
+            let path = resolve_skill_path(&workspace, name).expect("embedded skill resolves");
+            assert!(path.is_file());
+        }
+        let skills = load_skills_from_roots(&super::discover_skill_roots(&workspace))
+            .expect("registry loads");
+        assert!(skills.iter().any(
+            |skill| skill.name == "gstack-review" && skill.source == DefinitionSource::Bundled
+        ));
+        let report = render_skills_report(&skills);
+        assert!(report.contains("Bundled defaults:"));
+        assert!(report.contains("gstack-review"));
+
+        let project_skills = workspace.join(".claw").join("skills");
+        write_skill(&project_skills, "ponytail", "Project Ponytail override");
+        assert_eq!(
+            resolve_skill_path(&workspace, "ponytail").unwrap(),
+            project_skills.join("ponytail").join("SKILL.md")
+        );
+        restore_env_var("NEURON_CONFIG_HOME", original);
+        fs::remove_dir_all(workspace).expect("cleanup");
     }
 
     #[test]

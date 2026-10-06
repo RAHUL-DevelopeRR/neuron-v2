@@ -439,12 +439,17 @@ pub fn load_system_prompt(
 ) -> Result<Vec<String>, PromptBuildError> {
     let cwd = cwd.into();
     let project_context = ProjectContext::discover_with_git(&cwd, current_date.into())?;
-    let config = ConfigLoader::default_for(&cwd).load()?;
-    Ok(SystemPromptBuilder::new()
+    let loader = ConfigLoader::default_for(&cwd);
+    let config = loader.load()?;
+    let defaults = crate::default_skills::default_skill_sections(&config, loader.config_home())?;
+    let mut builder = SystemPromptBuilder::new()
         .with_os(os_name, os_version)
         .with_project_context(project_context)
-        .with_runtime_config(config)
-        .build())
+        .with_runtime_config(config);
+    for section in defaults {
+        builder = builder.append_section(section);
+    }
+    Ok(builder.build())
 }
 
 fn render_config_section(config: &RuntimeConfig) -> String {
@@ -827,6 +832,10 @@ mod tests {
 
         assert!(prompt.contains("Project rules"));
         assert!(prompt.contains("permissionMode"));
+        assert!(prompt.contains("# Neuron default skills"));
+        assert!(prompt.contains("# Ponytail"));
+        assert!(prompt.contains("# AntiSlop (Neuron adapter)"));
+        assert!(prompt.contains("# Gstack routing (Neuron adapter)"));
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
