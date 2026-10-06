@@ -20,14 +20,21 @@ Updated: 2026-10-06
   - Deterministic `RoutingEngine` with capability matching and fallback logic (`src/router.js`).
   - Request and attempt correlation IDs (`req_*`, `att_*`) integrated into `src/chat-handler.js`.
   - Database observability migration (`migrations/20261006050000_gateway_observability.sql`).
+  - Dynamic provider and model catalog schema migration (`migrations/20261006060000_dynamic_provider_catalog.sql`).
   - Phase 1 architecture verification suite (`check-phase1-architecture.mjs`).
-- Executed live end-to-end manual external user verification (`test-external-user-flow.mjs`):
-  - Session creation via `/auth/session` and validation via `/auth/session`.
-  - Model catalog discovery via `/v1/models`.
-  - `neuron doctor` gateway authentication verification.
-  - Non-interactive streaming inference via Neuron CLI (`target/release/neuron.exe`).
-  - Autonomous multi-turn tool execution (`read_file` round-trip).
-  - Secret isolation audit confirming zero platform key leakage.
+- Integrated and verified live provider credentials on server side:
+  - Groq Cloud: Status 200 (`openai/gpt-oss-120b`, `openai/gpt-oss-20b`, `qwen/qwen3.8-27b`).
+  - Google Gemini / AI Studio: Status 200 (`gemini-2.5-flash`, `gemini-2.5-pro`).
+  - OpenRouter: Status 200 (`cohere/north-mini-code:free`).
+  - NVIDIA NIM: Status 200 (`meta/llama-3.2-11b-vision-instruct`, `deepseek-ai/deepseek-coder-6.7b-instruct`).
+- Executed full live multi-provider end-to-end application creation verification (`run-live-end-to-end-app-creation.mjs`):
+  - Session creation via `/auth/session` and verification via `/auth/session`.
+  - Model catalog dynamic resolution serving 8 active models across 4 providers.
+  - `neuron doctor` gateway authentication verified.
+  - Live streaming completion verified with Gemini Flash.
+  - Application created in workspace and verified via Neuron CLI tool execution (`read_file`).
+  - Application test suite executed and passed (`test_app.js`).
+  - Secret isolation audit verified zero platform key leakage.
 
 ## Current state
 
@@ -39,7 +46,7 @@ Updated: 2026-10-06
 ## Next steps
 
 1. Merge PR #3 and cut `v6.2.5` release tag for `neuron-v2`.
-2. Deploy Zero-X gateway Phase 1 observability migration and updated Worker to staging/production via Cloudflare Wrangler.
+2. Deploy Zero-X gateway Phase 1 observability and dynamic catalog migrations to staging/production via Cloudflare Wrangler.
 3. Add Cloudflare Hyperdrive connection pooling and Cloudflare Queues for asynchronous attempt ingestion (Phase 2).
 4. Integrate Stripe billing webhooks and customer credit ledger (Phase 3).
 5. Implement encrypted Customer BYOK for enterprise team seats (Phase 4).
