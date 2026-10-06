@@ -7216,6 +7216,11 @@ UU conflicted.rs",
         fs::create_dir_all(&workspace).expect("workspace");
         fs::create_dir_all(&source_root).expect("source root");
         write_plugin_fixture(&source_root, "hook-runtime-demo", true, false);
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{"defaultMcpServers":false}"#,
+        )
+        .expect("disable external MCPs in plugin fixture");
 
         let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
         manager
@@ -7250,6 +7255,7 @@ UU conflicted.rs",
         fs::write(
             config_home.join("settings.json"),
             serde_json::to_string_pretty(&json!({
+                "defaultMcpServers": false,
                 "mcpServers": {
                     "alpha": {
                         "command": python_command,
@@ -7363,6 +7369,7 @@ UU conflicted.rs",
         fs::write(
             config_home.join("settings.json"),
             r#"{
+              "defaultMcpServers": false,
               "mcpServers": {
                 "remote": {
                   "url": "https://example.test/mcp"
@@ -7422,6 +7429,11 @@ UU conflicted.rs",
         fs::create_dir_all(&workspace).expect("workspace");
         fs::create_dir_all(&source_root).expect("source root");
         write_plugin_fixture(&source_root, "lifecycle-runtime-demo", false, true);
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{"defaultMcpServers":false}"#,
+        )
+        .expect("disable external MCPs in lifecycle fixture");
 
         let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
         let install = manager
