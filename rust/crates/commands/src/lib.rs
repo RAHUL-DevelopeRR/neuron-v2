@@ -3847,6 +3847,7 @@ fn render_mcp_usage_json(unexpected: Option<&str>) -> Value {
 
 fn config_source_label(source: ConfigSource) -> &'static str {
     match source {
+        ConfigSource::Bundled => "bundled",
         ConfigSource::User => "user",
         ConfigSource::Project => "project",
         ConfigSource::Local => "local",
@@ -3982,6 +3983,7 @@ fn skill_summary_json(skill: &SkillSummary) -> Value {
 
 fn config_source_id(source: ConfigSource) -> &'static str {
     match source {
+        ConfigSource::Bundled => "bundled",
         ConfigSource::User => "user",
         ConfigSource::Project => "project",
         ConfigSource::Local => "local",
@@ -5448,7 +5450,9 @@ mod tests {
         let loader = ConfigLoader::new(&workspace, &config_home);
         let list = super::render_mcp_report_for(&loader, &workspace, None)
             .expect("mcp list report should render");
-        assert!(list.contains("Configured servers 2"));
+        assert!(list.contains("Configured servers 4"));
+        assert!(list.contains("codebase-memory"));
+        assert!(list.contains("playwright"));
         assert!(list.contains("alpha"));
         assert!(list.contains("stdio"));
         assert!(list.contains("project"));
@@ -5527,15 +5531,18 @@ mod tests {
             render_mcp_report_json_for(&loader, &workspace, None).expect("mcp list json render");
         assert_eq!(list["kind"], "mcp");
         assert_eq!(list["action"], "list");
-        assert_eq!(list["configured_servers"], 2);
+        assert_eq!(list["configured_servers"], 4);
         assert_eq!(list["servers"][0]["name"], "alpha");
         assert_eq!(list["servers"][0]["transport"]["id"], "stdio");
         assert_eq!(list["servers"][0]["details"]["command"], "uvx");
-        assert_eq!(list["servers"][1]["name"], "remote");
-        assert_eq!(list["servers"][1]["scope"]["id"], "local");
-        assert_eq!(list["servers"][1]["transport"]["id"], "ws");
+        assert_eq!(list["servers"][1]["name"], "codebase-memory");
+        assert_eq!(list["servers"][1]["scope"]["id"], "bundled");
+        assert_eq!(list["servers"][2]["name"], "playwright");
+        assert_eq!(list["servers"][3]["name"], "remote");
+        assert_eq!(list["servers"][3]["scope"]["id"], "local");
+        assert_eq!(list["servers"][3]["transport"]["id"], "ws");
         assert_eq!(
-            list["servers"][1]["details"]["url"],
+            list["servers"][3]["details"]["url"],
             "wss://remote.example/mcp"
         );
 

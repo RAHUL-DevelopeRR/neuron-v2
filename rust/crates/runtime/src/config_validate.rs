@@ -201,6 +201,14 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "defaultSkills",
         expected: FieldType::Bool,
     },
+    FieldSpec {
+        name: "defaultMcpServers",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "disabledMcpServers",
+        expected: FieldType::StringArray,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[

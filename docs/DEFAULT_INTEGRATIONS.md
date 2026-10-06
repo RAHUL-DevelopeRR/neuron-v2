@@ -4,7 +4,8 @@ Every new Neuron system prompt contains the full Ponytail and AntiSlop core
 instructions and the gstack router. The Skill tool and `/skills list` expose the
 bundled companions: `antislop-ui`, `antislop-copywriting`, `antislop-code`,
 `antislop-human`, `antislop-layoutmobile`, `gstack-investigate`, `gstack-review`,
-`gstack-qa`, `gstack-qa-only` and `gstack-ship`.
+`gstack-qa`, `gstack-qa-only`, `gstack-ship` and `agent-reach`. Agent Reach's full
+instructions are also active in every new system prompt.
 
 Instructions are embedded in the native executable, then materialized under a
 content-addressed `bundled-skills` directory in the runtime config home. npm and
@@ -25,19 +26,22 @@ their skill directories with `/skills install` instead.
 
 ## MCP and browser control
 
-`mcpServers` in `settings.json` configures real MCP processes or remote endpoints.
-`/mcp list` shows configuration; actual initialization and tool discovery must
-succeed before the model uses those tools. No preset name creates a server by
-itself. For Microsoft's official browser server, install Node.js and configure:
+CodebaseMap (`DeusData/codebase-memory-mcp`, npm version `0.11.0`) and Microsoft's
+Playwright MCP (`0.0.83`) are configured by default. npm installs their actual
+dependencies alongside Neuron; the launcher passes absolute installed entry paths
+to avoid downloading packages while a chat initializes. Standalone/PyPI binaries
+use pinned `npx -y` commands, requiring Node.js and npm. On Windows, this fallback
+runs through `cmd.exe` so `npx.cmd` resolves correctly.
+
+`mcpServers` in `settings.json` overrides any default by server name and configures
+additional processes or remote endpoints. `/mcp list` shows effective configuration
+with a `bundled` source for defaults. Actual initialization and tool discovery must
+succeed before the model uses those tools. To disable both builtins, configure
+`{"defaultMcpServers": false}`. To disable individual servers, configure:
 
 ```json
 {
-  "mcpServers": {
-    "playwright": {
-      "command": "npx",
-      "args": ["@playwright/mcp@latest"]
-    }
-  }
+  "disabledMcpServers": ["playwright", "codebase-memory"]
 }
 ```
 
@@ -48,18 +52,29 @@ launch command or endpoint, and a model capable of interpreting its observations
 Neuron forwards discovered MCP tools to the model; it does not bundle a desktop
 automation service or certify a model's computer-use capability.
 
-## Agent Reach and CodebaseMap
+## Agent Reach
 
-[Agent Reach](https://github.com/Panniantong/Agent-Reach) is a CLI toolkit that can
-configure additional integrations. It is not itself an MCP transport. Follow its
+[Agent Reach](https://github.com/Panniantong/Agent-Reach) routing instructions are
+embedded and active on every conversation turn, together with its seven platform
+references. The bundle uses upstream's English skill, MIT license and source
+commit `a19a171fa980a0785849596492e0af4db800c82f`. Its host adapter checks actual
+CLI availability and uses the operating system's temporary directory.
+Maintainers can refresh just this project with
+`python scripts/vendor-default-skills.py --project=agent-reach`.
+
+Agent Reach is a CLI toolkit that can configure additional integrations. It is
+not itself an MCP transport. Its instructions do not install channel executables
+or supply authenticated browser sessions. Follow its
 [official installation instructions](https://github.com/Panniantong/Agent-Reach/blob/main/docs/install.md),
 then run `agent-reach doctor` to verify the installed channels. Neuron can invoke
 available CLI tools through its command tool. Do not configure `agent-reach` as a
 stdio MCP process unless a separately identified server implements that protocol.
 
-CodebaseMap requires the exact project/server URL and its documented command or
-endpoint. Its runtime status remains pending until that server is configured and
-discovered. This prevents the model from claiming unavailable mapping tools.
+CodebaseMap's default implementation is the official
+[Codebase Memory MCP](https://github.com/DeusData/codebase-memory-mcp). Its mapping
+and graph tools are available after successful MCP initialization. Configure a
+native `codebase-memory-mcp` executable under that server name to avoid the npm
+wrapper when using a standalone binary.
 
 Skills remain active as instructions throughout the conversation. Instructions
 do not install integration runtimes, supply provider credentials, or bypass the

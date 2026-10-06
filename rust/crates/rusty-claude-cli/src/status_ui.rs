@@ -602,6 +602,7 @@ pub(crate) fn render_config_report(
     ];
     for entry in discovered {
         let source = match entry.source {
+            ConfigSource::Bundled => "bundled",
             ConfigSource::User => "user",
             ConfigSource::Project => "project",
             ConfigSource::Local => "local",
@@ -679,6 +680,7 @@ pub(crate) fn render_config_json(
         .iter()
         .map(|e| {
             let source = match e.source {
+                ConfigSource::Bundled => "bundled",
                 ConfigSource::User => "user",
                 ConfigSource::Project => "project",
                 ConfigSource::Local => "local",

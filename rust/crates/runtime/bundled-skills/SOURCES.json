@@ -13,5 +13,10 @@
     "repository": "https://github.com/garrytan/gstack",
     "commit": "857466ff8b93c0575bc9e46cf2838d1962077d8f",
     "license": "MIT"
+  },
+  "agent-reach": {
+    "repository": "https://github.com/Panniantong/Agent-Reach",
+    "commit": "a19a171fa980a0785849596492e0af4db800c82f",
+    "license": "MIT"
   }
 }

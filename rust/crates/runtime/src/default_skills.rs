@@ -21,6 +21,7 @@ pub const DEFAULT_SKILL_NAMES: &[&str] = &[
     "gstack-qa",
     "gstack-qa-only",
     "gstack-ship",
+    "agent-reach",
 ];
 
 /// Embedded instructions remain available in an installed binary, outside a checkout.
@@ -75,15 +76,17 @@ pub fn default_skill_sections(
         instruction("ponytail/SKILL.md"),
         instruction("antislop/SKILL.md"),
         instruction("gstack/SKILL.md"),
+        instruction("agent-reach/SKILL.md"),
         format!("# Gstack routing (Neuron adapter)\nUse gstack-investigate for debugging; gstack-review for code review; gstack-qa for authorized repair and verification; gstack-qa-only for read-only QA; gstack-ship for authorized release work. Their actual upstream workflows are bundled. Preserve evidence, verification gates and permission boundaries. Use Neuron's available tools in place of host-specific tools. Skip upstream onboarding, telemetry, external-helper scripts and Conductor/GBrain bookkeeping when those dependencies are absent. Missing browser automation or helper tools must be reported and never counted as a passed check.\n\nBundle root: {}\nUpstream gstack references: {}\n\nAvailable bundled skills: {}. Use the Skill tool to load their full instructions. User/project skill files can override these names.", root.display(), root.join("gstack").display(), DEFAULT_SKILL_NAMES.join(", ")),
     ];
-    for name in ["agent-reach", "codebase-map", "computer-use", "playwright"] {
+    sections.push("Agent Reach instructions are active. Agent Reach is a CLI toolkit; verify `agent-reach doctor --json` before using an installed backend. Its skill does not make the CLI available by itself.".to_string());
+    for name in ["codebase-memory", "computer-use", "playwright"] {
         let status = if config.mcp().get(name).is_some() {
             "configured; verify MCP discovery/initialization before use"
         } else {
             "pending; no MCP server command or URL has been configured"
         };
-        sections.push(format!("Integration preset {name}: {status}. Agent Reach's Panniantong project is a CLI toolkit; do not invent an MCP launch command. CodebaseMap's exact server must be supplied. Playwright controls a browser, not the desktop. Full computer use requires a separately installed local computer-use server and a model that can interpret its observations."));
+        sections.push(format!("Integration preset {name}: {status}. CodebaseMap uses DeusData/codebase-memory-mcp. Prefer its discovered mapping and graph tools for code exploration. Playwright controls a browser, not the desktop. Full computer use requires a separately installed local computer-use server and a model that can interpret its observations."));
     }
     Ok(sections)
 }
@@ -105,7 +108,8 @@ mod tests {
         assert!(sections.contains("# Ponytail"));
         assert!(sections.contains("R-38"));
         assert!(sections.contains("gstack-investigate"));
-        assert!(sections.contains("Integration preset agent-reach: pending"));
+        assert!(sections.contains("Agent Reach instructions are active"));
+        assert!(sections.contains("Integration preset codebase-memory: configured"));
         let bundle = bundled_skill_root(&config_home).unwrap();
         assert!(
             fs::read_to_string(bundle.join("gstack/review/checklist.md"))
