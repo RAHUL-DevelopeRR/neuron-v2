@@ -801,6 +801,7 @@ struct ErrorEnvelope {
 struct ErrorBody {
     #[serde(rename = "type")]
     error_type: Option<String>,
+    code: Option<String>,
     message: Option<String>,
 }
 
@@ -1386,9 +1387,19 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
     let request_id = request_id_from_headers(response.headers());
     let body = response.text().await.unwrap_or_default();
     let parsed_error = serde_json::from_str::<ErrorEnvelope>(&body).ok();
-    let retryable = is_retryable_status(status);
+    let error_code = parsed_error
+        .as_ref()
+        .and_then(|error| error.error.code.as_deref());
+    let retryable = is_retryable_response(status, error_code);
 
-    let suggested_action = suggested_action_for_status(status);
+    let suggested_action = if error_code == Some("insufficient_quota") {
+        Some(
+            "Wait until the daily Neuron quota resets or reduce the prompt size and output limit"
+                .to_string(),
+        )
+    } else {
+        suggested_action_for_status(status)
+    };
 
     Err(ApiError::Api {
         status,
@@ -1407,6 +1418,10 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
 
 const fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 409 | 429 | 500 | 502 | 503 | 504)
+}
+
+fn is_retryable_response(status: reqwest::StatusCode, error_code: Option<&str>) -> bool {
+    is_retryable_status(status) && error_code != Some("insufficient_quota")
 }
 
 /// Generate a suggested user action based on the HTTP status code and error context.
@@ -1448,6 +1463,18 @@ impl StringExt for String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn quota_exhaustion_is_not_retried_as_a_rate_limit() {
+        assert!(!super::is_retryable_response(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            Some("insufficient_quota")
+        ));
+        assert!(super::is_retryable_response(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            None
+        ));
+    }
+
     #[test]
     fn stream_parser_flushes_eof_and_preserves_mixed_frame_order() {
         let mut parser = super::OpenAiSseParser::with_context("zero-x", "auto");

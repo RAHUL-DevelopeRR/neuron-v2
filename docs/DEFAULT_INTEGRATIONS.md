@@ -34,7 +34,10 @@ use pinned `npx -y` commands, requiring Node.js and npm. On Windows, this fallba
 runs through `cmd.exe` so `npx.cmd` resolves correctly.
 
 `mcpServers` in `settings.json` overrides any default by server name and configures
-additional processes or remote endpoints. `/mcp list` shows effective configuration
+additional processes or remote endpoints. Stdio servers use MCP's newline-delimited
+JSON-RPC framing by default. For a legacy Content-Length server, set
+`env.NEURON_MCP_FRAMING` to `content-length` in that server's config. Neuron sends
+`notifications/initialized` after a successful initialize response. `/mcp list` shows effective configuration
 with a `bundled` source for defaults. Actual initialization and tool discovery must
 succeed before the model uses those tools. To disable both builtins, configure
 `{"defaultMcpServers": false}`. To disable individual servers, configure:

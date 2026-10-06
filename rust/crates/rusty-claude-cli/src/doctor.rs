@@ -288,10 +288,17 @@ pub(crate) fn check_auth_health() -> DiagnosticCheck {
     let api_key_present = env::var("ANTHROPIC_API_KEY").is_ok_and(|value| !value.trim().is_empty());
     let auth_token_present =
         env::var("ANTHROPIC_AUTH_TOKEN").is_ok_and(|value| !value.trim().is_empty());
+    let gateway_token_present = super::auth::cached_gateway_token().ok().flatten().is_some();
+    let supported_auth_present = api_key_present || auth_token_present || gateway_token_present;
     let env_details = format!(
-        "Environment       api_key={} auth_token={}",
+        "Environment       api_key={} auth_token={} gateway_token={}",
         if api_key_present { "present" } else { "absent" },
         if auth_token_present {
+            "present"
+        } else {
+            "absent"
+        },
+        if gateway_token_present {
             "present"
         } else {
             "absent"
@@ -301,13 +308,13 @@ pub(crate) fn check_auth_health() -> DiagnosticCheck {
     match load_oauth_credentials() {
         Ok(Some(token_set)) => DiagnosticCheck::new(
             "Auth",
-            if api_key_present || auth_token_present {
+            if supported_auth_present {
                 DiagnosticLevel::Ok
             } else {
                 DiagnosticLevel::Warn
             },
-            if api_key_present || auth_token_present {
-                "supported auth env vars are configured; legacy saved OAuth is ignored"
+            if supported_auth_present {
+                "supported auth credentials are configured; legacy saved OAuth is ignored"
             } else {
                 "legacy saved OAuth credentials are present but unsupported"
             },
@@ -336,6 +343,7 @@ pub(crate) fn check_auth_health() -> DiagnosticCheck {
         .with_data(Map::from_iter([
             ("api_key_present".to_string(), json!(api_key_present)),
             ("auth_token_present".to_string(), json!(auth_token_present)),
+            ("gateway_token_present".to_string(), json!(gateway_token_present)),
             ("legacy_saved_oauth_present".to_string(), json!(true)),
             (
                 "legacy_saved_oauth_expires_at".to_string(),
@@ -349,13 +357,13 @@ pub(crate) fn check_auth_health() -> DiagnosticCheck {
         ])),
         Ok(None) => DiagnosticCheck::new(
             "Auth",
-            if api_key_present || auth_token_present {
+            if supported_auth_present {
                 DiagnosticLevel::Ok
             } else {
                 DiagnosticLevel::Warn
             },
-            if api_key_present || auth_token_present {
-                "supported auth env vars are configured"
+            if supported_auth_present {
+                "supported auth credentials are configured"
             } else {
                 "no supported auth env vars were found"
             },
@@ -364,6 +372,7 @@ pub(crate) fn check_auth_health() -> DiagnosticCheck {
         .with_data(Map::from_iter([
             ("api_key_present".to_string(), json!(api_key_present)),
             ("auth_token_present".to_string(), json!(auth_token_present)),
+            ("gateway_token_present".to_string(), json!(gateway_token_present)),
             ("legacy_saved_oauth_present".to_string(), json!(false)),
             ("legacy_saved_oauth_expires_at".to_string(), Value::Null),
             ("legacy_refresh_token_present".to_string(), json!(false)),
@@ -377,6 +386,7 @@ pub(crate) fn check_auth_health() -> DiagnosticCheck {
         .with_data(Map::from_iter([
             ("api_key_present".to_string(), json!(api_key_present)),
             ("auth_token_present".to_string(), json!(auth_token_present)),
+            ("gateway_token_present".to_string(), json!(gateway_token_present)),
             ("legacy_saved_oauth_present".to_string(), Value::Null),
             ("legacy_saved_oauth_expires_at".to_string(), Value::Null),
             ("legacy_refresh_token_present".to_string(), Value::Null),

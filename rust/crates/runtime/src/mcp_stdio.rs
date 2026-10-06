@@ -18,13 +18,17 @@ use crate::mcp_lifecycle_hardened::{
     McpDegradedReport, McpErrorSurface, McpFailedServer, McpLifecyclePhase,
 };
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 const MCP_INITIALIZE_TIMEOUT_MS: u64 = 200;
+#[cfg(all(test, windows))]
+const MCP_INITIALIZE_TIMEOUT_MS: u64 = 3_000;
 #[cfg(not(test))]
 const MCP_INITIALIZE_TIMEOUT_MS: u64 = 10_000;
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 300;
+#[cfg(all(test, windows))]
+const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 3_000;
 #[cfg(not(test))]
 const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 30_000;
 
@@ -1013,6 +1017,28 @@ impl McpServerManager {
         )
     }
 
+    async fn send_initialized_notification(
+        &mut self,
+        server_name: &str,
+    ) -> Result<(), McpServerManagerError> {
+        let process = self
+            .server_mut(server_name)?
+            .process
+            .as_mut()
+            .ok_or_else(|| McpServerManagerError::InvalidResponse {
+                server_name: server_name.to_string(),
+                method: "initialize",
+                details: "server process missing after initialize".to_string(),
+            })?;
+        Self::run_process_request(
+            server_name,
+            "notifications/initialized",
+            MCP_INITIALIZE_TIMEOUT_MS,
+            process.notify_initialized(),
+        )
+        .await
+    }
+
     async fn run_process_request<T, F>(
         server_name: &str,
         method: &'static str,
@@ -1132,6 +1158,11 @@ impl McpServerManager {
                 return Err(error);
             }
 
+            if let Err(error) = self.send_initialized_notification(server_name).await {
+                self.reset_server(server_name).await?;
+                return Err(error);
+            }
+
             let server = self.server_mut(server_name)?;
             server.initialized = true;
             return Ok(());
@@ -1144,6 +1175,7 @@ pub struct McpStdioProcess {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    newline_delimited: bool,
 }
 
 impl McpStdioProcess {
@@ -1170,6 +1202,10 @@ impl McpStdioProcess {
             child,
             stdin,
             stdout: BufReader::new(stdout),
+            newline_delimited: !transport
+                .env
+                .get("NEURON_MCP_FRAMING")
+                .is_some_and(|framing| framing.eq_ignore_ascii_case("content-length")),
         })
     }
 
@@ -1249,13 +1285,38 @@ impl McpStdioProcess {
     pub async fn write_jsonrpc_message<T: Serialize>(&mut self, message: &T) -> io::Result<()> {
         let body = serde_json::to_vec(message)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        self.write_frame(&body).await
+        if self.newline_delimited {
+            self.write_all(&body).await?;
+            self.write_all(b"\n").await?;
+            self.flush().await
+        } else {
+            self.write_frame(&body).await
+        }
     }
 
     pub async fn read_jsonrpc_message<T: DeserializeOwned>(&mut self) -> io::Result<T> {
-        let payload = self.read_frame().await?;
+        let payload = if self.newline_delimited {
+            let mut line = String::new();
+            if self.stdout.read_line(&mut line).await? == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "MCP stdio stream closed while reading JSON-RPC line",
+                ));
+            }
+            line.into_bytes()
+        } else {
+            self.read_frame().await?
+        };
         serde_json::from_slice(&payload)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
+    pub async fn notify_initialized(&mut self) -> io::Result<()> {
+        self.write_jsonrpc_message(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }))
+        .await
     }
 
     pub async fn send_request<T: Serialize>(
@@ -1444,9 +1505,17 @@ mod tests {
 
     fn python_command() -> String {
         if cfg!(windows) {
-            "python".to_string()
+            "py".to_string()
         } else {
             "python3".to_string()
+        }
+    }
+
+    fn python_script_args(path: &Path) -> Vec<String> {
+        if cfg!(windows) {
+            vec!["-3".to_string(), path.to_string_lossy().into_owned()]
+        } else {
+            vec![path.to_string_lossy().into_owned()]
         }
     }
 
@@ -1661,6 +1730,7 @@ mod tests {
             "import json, os, sys, time",
             "",
             "LABEL = os.environ.get('MCP_SERVER_LABEL', 'server')",
+            "NEWLINE = os.environ.get('NEURON_MCP_FRAMING', 'jsonl') != 'content-length'",
             "LOG_PATH = os.environ.get('MCP_LOG_PATH')",
             "EXIT_AFTER_TOOLS_LIST = os.environ.get('MCP_EXIT_AFTER_TOOLS_LIST') == '1'",
             "FAIL_ONCE_MODE = os.environ.get('MCP_FAIL_ONCE_MODE')",
@@ -1682,6 +1752,9 @@ mod tests {
             "    return True",
             "",
             "def read_message():",
+            "    if NEWLINE:",
+            "        line = sys.stdin.readline()",
+            "        return json.loads(line) if line else None",
             "    header = b''",
             r"    while not header.endswith(b'\r\n\r\n'):",
             "        chunk = sys.stdin.buffer.read(1)",
@@ -1696,6 +1769,10 @@ mod tests {
             "    return json.loads(payload.decode())",
             "",
             "def send_message(message):",
+            "    if NEWLINE:",
+            "        sys.stdout.write(json.dumps(message) + '\\n')",
+            "        sys.stdout.flush()",
+            "        return",
             "    payload = json.dumps(message).encode()",
             r"    sys.stdout.buffer.write(f'Content-Length: {len(payload)}\r\n\r\n'.encode() + payload)",
             "    sys.stdout.buffer.flush()",
@@ -1706,6 +1783,8 @@ mod tests {
             "        break",
             "    method = request['method']",
             "    log(method)",
+            "    if method == 'notifications/initialized':",
+            "        continue",
             "    if method == 'initialize':",
             "        if FAIL_ONCE_MODE == 'initialize_hang' and should_fail_once():",
             "            log('initialize-hang')",
@@ -1793,11 +1872,16 @@ mod tests {
 
     fn script_transport_with_env(
         script_path: &Path,
-        env: BTreeMap<String, String>,
+        extra_env: BTreeMap<String, String>,
     ) -> crate::mcp_client::McpStdioTransport {
+        let mut env = BTreeMap::from([(
+            "NEURON_MCP_FRAMING".to_string(),
+            "content-length".to_string(),
+        )]);
+        env.extend(extra_env);
         crate::mcp_client::McpStdioTransport {
             command: python_command(),
-            args: vec![script_path.to_string_lossy().into_owned()],
+            args: python_script_args(script_path),
             env,
             tool_call_timeout_ms: None,
         }
@@ -1837,6 +1921,10 @@ mod tests {
         let mut env = BTreeMap::from([
             ("MCP_SERVER_LABEL".to_string(), label.to_string()),
             (
+                "NEURON_MCP_FRAMING".to_string(),
+                "content-length".to_string(),
+            ),
+            (
                 "MCP_LOG_PATH".to_string(),
                 log_path.to_string_lossy().into_owned(),
             ),
@@ -1846,7 +1934,7 @@ mod tests {
             scope: ConfigSource::Local,
             config: McpServerConfig::Stdio(McpStdioServerConfig {
                 command: python_command(),
-                args: vec![script_path.to_string_lossy().into_owned()],
+                args: python_script_args(script_path),
                 env,
                 tool_call_timeout_ms: None,
             }),
@@ -2250,6 +2338,53 @@ mod tests {
     }
 
     #[test]
+    fn manager_uses_jsonl_by_default_for_handshake_discovery_and_tool_call() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_manager_mcp_server_script();
+            let root = script_path.parent().expect("script parent");
+            let log_path = root.join("jsonl.log");
+            let mut server = manager_server_config(&script_path, "jsonl", &log_path);
+            let McpServerConfig::Stdio(stdio) = &mut server.config else {
+                panic!("stdio server config");
+            };
+            stdio.env.remove("NEURON_MCP_FRAMING");
+            let servers = BTreeMap::from([("jsonl".to_string(), server)]);
+            let mut manager = McpServerManager::from_servers(&servers);
+
+            let tools = manager.discover_tools().await.expect("discover tools");
+            assert_eq!(tools.len(), 1);
+            let result = manager
+                .call_tool(
+                    &mcp_tool_name("jsonl", "echo"),
+                    Some(json!({"text": "ready"})),
+                )
+                .await
+                .expect("call JSONL tool");
+            assert_eq!(
+                result.result.unwrap().structured_content.unwrap()["echoed"],
+                "ready"
+            );
+            manager.shutdown().await.expect("shutdown");
+
+            let log = fs::read_to_string(&log_path).expect("read protocol log");
+            assert_eq!(
+                log.lines().collect::<Vec<_>>(),
+                [
+                    "initialize",
+                    "notifications/initialized",
+                    "tools/list",
+                    "tools/call"
+                ]
+            );
+            cleanup_script(&script_path);
+        });
+    }
+
+    #[test]
     #[cfg(unix)]
     fn manager_routes_tool_calls_to_correct_server() {
         let runtime = Builder::new_current_thread()
@@ -2329,7 +2464,7 @@ mod tests {
                     scope: ConfigSource::Local,
                     config: McpServerConfig::Stdio(McpStdioServerConfig {
                         command: python_command(),
-                        args: vec![script_path.to_string_lossy().into_owned()],
+                        args: python_script_args(&script_path),
                         env: BTreeMap::from([(
                             "MCP_TOOL_CALL_DELAY_MS".to_string(),
                             "200".to_string(),
@@ -2383,7 +2518,7 @@ mod tests {
                     scope: ConfigSource::Local,
                     config: McpServerConfig::Stdio(McpStdioServerConfig {
                         command: python_command(),
-                        args: vec![script_path.to_string_lossy().into_owned()],
+                        args: python_script_args(&script_path),
                         env: BTreeMap::from([(
                             "MCP_INVALID_TOOL_CALL_RESPONSE".to_string(),
                             "1".to_string(),

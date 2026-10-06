@@ -5917,7 +5917,15 @@ mod tests {
         // Inject dummy credentials so LiveCli can construct without real Anthropic key
         std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-banner-test");
         let root = temp_dir();
+        let config_home = temp_dir();
         fs::create_dir_all(&root).expect("root dir");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{"defaultMcpServers":false}"#,
+        )
+        .expect("settings should disable default MCP servers");
+        std::env::set_var("NEURON_CONFIG_HOME", &config_home);
 
         let banner = with_current_dir(&root, || {
             LiveCli::new(
@@ -5934,7 +5942,9 @@ mod tests {
         assert!(banner.contains("What's new"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
+        fs::remove_dir_all(config_home).expect("cleanup config home");
         std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("NEURON_CONFIG_HOME");
     }
 
     #[test]
@@ -7251,7 +7261,22 @@ UU conflicted.rs",
         fs::create_dir_all(&workspace).expect("workspace");
         let script_path = workspace.join("fixture-mcp.py");
         write_mcp_server_fixture(&script_path);
-        let python_command = if cfg!(windows) { "python" } else { "python3" };
+        let python_command = if cfg!(windows) { "py" } else { "python3" };
+        let python_args = if cfg!(windows) {
+            vec!["-3".to_string()]
+        } else {
+            Vec::new()
+        };
+        let alpha_args = [
+            python_args.clone(),
+            vec![script_path.to_string_lossy().into_owned()],
+        ]
+        .concat();
+        let broken_args = [
+            python_args,
+            vec!["-c".to_string(), "import sys; sys.exit(0)".to_string()],
+        ]
+        .concat();
         fs::write(
             config_home.join("settings.json"),
             serde_json::to_string_pretty(&json!({
@@ -7259,11 +7284,12 @@ UU conflicted.rs",
                 "mcpServers": {
                     "alpha": {
                         "command": python_command,
-                        "args": [script_path.to_string_lossy()]
+                        "args": alpha_args,
+                        "env": {"NEURON_MCP_FRAMING": "content-length"}
                     },
                     "broken": {
                         "command": python_command,
-                        "args": ["-c", "import sys; sys.exit(0)"]
+                        "args": broken_args
                     }
                 }
             }))
@@ -7559,6 +7585,8 @@ fn write_mcp_server_fixture(script_path: &Path) {
             "    request = read_message()",
             "    if request is None:",
             "        break",
+            "    if 'id' not in request:",
+            "        continue",
             "    method = request['method']",
             "    if method == 'initialize':",
             "        send_message({",
