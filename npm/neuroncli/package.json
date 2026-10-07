@@ -1,0 +1,30 @@
+{
+  "name": "@zero-x.live/neuron",
+  "version": "6.2.5",
+  "description": "Neuron coding agent for the terminal",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "neuron": "bin/neuron.js"
+  },
+  "files": [
+    "bin/neuron.js",
+    "scripts/install.js",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/install.js"
+  },
+  "engines": {
+    "node": ">=22.14"
+  },
+  "dependencies": {
+    "codebase-memory-mcp": "0.11.0",
+    "@playwright/mcp": "0.0.83"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/RAHUL-DevelopeRR/neuron-v2.git"
+  },
+  "homepage": "https://github.com/RAHUL-DevelopeRR/neuron-v2#readme"
+}

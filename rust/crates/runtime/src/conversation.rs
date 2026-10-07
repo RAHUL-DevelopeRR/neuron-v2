@@ -1495,7 +1495,12 @@ mod tests {
 
     #[cfg(windows)]
     fn shell_snippet(script: &str) -> String {
-        script.replace('\'', "\"")
+        let command = script.strip_prefix("printf '").expect("printf fixture");
+        let (message, remainder) = command.split_once('\'').expect("quoted fixture message");
+        match remainder.strip_prefix("; exit ") {
+            Some(code) => format!("echo {message}& exit /b {code}"),
+            None => format!("echo {message}"),
+        }
     }
 
     #[cfg(not(windows))]

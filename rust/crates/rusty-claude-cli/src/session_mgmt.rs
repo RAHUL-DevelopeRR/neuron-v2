@@ -58,7 +58,14 @@ pub fn create_managed_session_handle(
 pub fn resolve_session_reference(
     reference: &str,
 ) -> Result<SessionHandle, Box<dyn std::error::Error>> {
-    let handle = current_session_store()?
+    resolve_session_reference_in_store(&current_session_store()?, reference)
+}
+
+pub fn resolve_session_reference_in_store(
+    store: &runtime::SessionStore,
+    reference: &str,
+) -> Result<SessionHandle, Box<dyn std::error::Error>> {
+    let handle = store
         .resolve_reference(reference)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     Ok(SessionHandle {

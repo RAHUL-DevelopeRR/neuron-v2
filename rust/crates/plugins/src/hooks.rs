@@ -522,11 +522,18 @@ mod tests {
     #[test]
     fn propagates_plugin_hook_failures() {
         // given
+        #[cfg(windows)]
+        let (failure_hook, later_hook) = (
+            "echo broken plugin hook & exit /b 1",
+            "echo later plugin hook",
+        );
+        #[cfg(not(windows))]
+        let (failure_hook, later_hook) = (
+            "printf 'broken plugin hook'; exit 1",
+            "printf 'later plugin hook'",
+        );
         let runner = HookRunner::new(crate::PluginHooks {
-            pre_tool_use: vec![
-                "printf 'broken plugin hook'; exit 1".to_string(),
-                "printf 'later plugin hook'".to_string(),
-            ],
+            pre_tool_use: vec![failure_hook.to_string(), later_hook.to_string()],
             post_tool_use: Vec::new(),
             post_tool_use_failure: Vec::new(),
         });

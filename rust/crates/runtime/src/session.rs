@@ -1232,7 +1232,7 @@ mod tests {
             restored.messages[0],
             ConversationMessage::user_text("legacy")
         );
-        assert!(!restored.session_id.is_empty());
+        assert_ne!(restored.session_id, "");
     }
 
     #[test]

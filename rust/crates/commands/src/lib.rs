@@ -2108,6 +2108,7 @@ enum DefinitionSource {
     UserClaw,
     UserCodex,
     UserClaude,
+    Bundled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -2115,6 +2116,7 @@ enum DefinitionScope {
     Project,
     UserConfigHome,
     UserHome,
+    Bundled,
 }
 
 impl DefinitionScope {
@@ -2123,6 +2125,7 @@ impl DefinitionScope {
             Self::Project => "Project roots",
             Self::UserConfigHome => "User config roots",
             Self::UserHome => "User home roots",
+            Self::Bundled => "Bundled defaults",
         }
     }
 }
@@ -2135,6 +2138,7 @@ impl DefinitionSource {
             }
             Self::UserClawConfigHome | Self::UserCodexHome => DefinitionScope::UserConfigHome,
             Self::UserClaw | Self::UserCodex | Self::UserClaude => DefinitionScope::UserHome,
+            Self::Bundled => DefinitionScope::Bundled,
         }
     }
 
@@ -2863,6 +2867,13 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         );
     }
 
+    push_unique_skill_root(
+        &mut roots,
+        DefinitionSource::UserClawConfigHome,
+        ConfigLoader::default_for(cwd).config_home().join("skills"),
+        SkillOrigin::SkillsDir,
+    );
+
     if let Ok(claw_config_home) = env::var("CLAW_CONFIG_HOME") {
         let claw_config_home = PathBuf::from(claw_config_home);
         push_unique_skill_root(
@@ -2970,11 +2981,28 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         );
     }
 
+    if let Ok(bundle) =
+        runtime::default_skills::bundled_skill_root(ConfigLoader::default_for(cwd).config_home())
+    {
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::Bundled,
+            bundle.clone(),
+            SkillOrigin::SkillsDir,
+        );
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::Bundled,
+            bundle.join("gstack"),
+            SkillOrigin::SkillsDir,
+        );
+    }
+
     roots
 }
 
 fn install_skill(source: &str, cwd: &Path) -> std::io::Result<InstalledSkill> {
-    let registry_root = default_skill_install_root()?;
+    let registry_root = default_skill_install_root();
     install_skill_into(source, cwd, &registry_root)
 }
 
@@ -3023,20 +3051,17 @@ fn install_skill_into(
     })
 }
 
-fn default_skill_install_root() -> std::io::Result<PathBuf> {
+fn default_skill_install_root() -> PathBuf {
+    if let Some(neuron_config_home) = env::var_os("NEURON_CONFIG_HOME") {
+        return PathBuf::from(neuron_config_home).join("skills");
+    }
     if let Ok(claw_config_home) = env::var("CLAW_CONFIG_HOME") {
-        return Ok(PathBuf::from(claw_config_home).join("skills"));
+        return PathBuf::from(claw_config_home).join("skills");
     }
     if let Ok(codex_home) = env::var("CODEX_HOME") {
-        return Ok(PathBuf::from(codex_home).join("skills"));
+        return PathBuf::from(codex_home).join("skills");
     }
-    if let Some(home) = env::var_os("HOME") {
-        return Ok(PathBuf::from(home).join(".claw").join("skills"));
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "unable to resolve a skills install root; set CLAW_CONFIG_HOME or HOME",
-    ))
+    ConfigLoader::default_for(".").config_home().join("skills")
 }
 
 fn resolve_skill_install_source(source: &str, cwd: &Path) -> std::io::Result<SkillInstallSource> {
@@ -3480,6 +3505,7 @@ fn render_skills_report(skills: &[SkillSummary]) -> String {
         DefinitionScope::Project,
         DefinitionScope::UserConfigHome,
         DefinitionScope::UserHome,
+        DefinitionScope::Bundled,
     ] {
         let group = skills
             .iter()
@@ -3821,6 +3847,7 @@ fn render_mcp_usage_json(unexpected: Option<&str>) -> Value {
 
 fn config_source_label(source: ConfigSource) -> &'static str {
     match source {
+        ConfigSource::Bundled => "bundled",
         ConfigSource::User => "user",
         ConfigSource::Project => "project",
         ConfigSource::Local => "local",
@@ -3906,6 +3933,7 @@ fn definition_source_id(source: DefinitionSource) -> &'static str {
         DefinitionSource::UserClaw | DefinitionSource::UserCodex | DefinitionSource::UserClaude => {
             "user_claw"
         }
+        DefinitionSource::Bundled => "bundled",
     }
 }
 
@@ -3955,6 +3983,7 @@ fn skill_summary_json(skill: &SkillSummary) -> Value {
 
 fn config_source_id(source: ConfigSource) -> &'static str {
     match source {
+        ConfigSource::Bundled => "bundled",
         ConfigSource::User => "user",
         ConfigSource::Project => "project",
         ConfigSource::Local => "local",
@@ -5139,6 +5168,37 @@ mod tests {
     }
 
     #[test]
+    fn bundled_skills_resolve_without_a_checkout_and_project_skills_override_them() {
+        let _guard = env_guard();
+        let workspace = temp_dir("bundled-registry");
+        let original = std::env::var_os("NEURON_CONFIG_HOME");
+        std::env::set_var("NEURON_CONFIG_HOME", workspace.join("config"));
+        fs::create_dir_all(&workspace).expect("workspace");
+
+        for name in runtime::default_skills::DEFAULT_SKILL_NAMES {
+            let path = resolve_skill_path(&workspace, name).expect("embedded skill resolves");
+            assert!(path.is_file());
+        }
+        let skills = load_skills_from_roots(&super::discover_skill_roots(&workspace))
+            .expect("registry loads");
+        assert!(skills.iter().any(
+            |skill| skill.name == "gstack-review" && skill.source == DefinitionSource::Bundled
+        ));
+        let report = render_skills_report(&skills);
+        assert!(report.contains("Bundled defaults:"));
+        assert!(report.contains("gstack-review"));
+
+        let project_skills = workspace.join(".claw").join("skills");
+        write_skill(&project_skills, "ponytail", "Project Ponytail override");
+        assert_eq!(
+            resolve_skill_path(&workspace, "ponytail").unwrap(),
+            project_skills.join("ponytail").join("SKILL.md")
+        );
+        restore_env_var("NEURON_CONFIG_HOME", original);
+        fs::remove_dir_all(workspace).expect("cleanup");
+    }
+
+    #[test]
     fn renders_skills_reports_as_json() {
         let workspace = temp_dir("skills-json-workspace");
         let project_skills = workspace.join(".codex").join("skills");
@@ -5390,7 +5450,9 @@ mod tests {
         let loader = ConfigLoader::new(&workspace, &config_home);
         let list = super::render_mcp_report_for(&loader, &workspace, None)
             .expect("mcp list report should render");
-        assert!(list.contains("Configured servers 2"));
+        assert!(list.contains("Configured servers 4"));
+        assert!(list.contains("codebase-memory"));
+        assert!(list.contains("playwright"));
         assert!(list.contains("alpha"));
         assert!(list.contains("stdio"));
         assert!(list.contains("project"));
@@ -5469,15 +5531,18 @@ mod tests {
             render_mcp_report_json_for(&loader, &workspace, None).expect("mcp list json render");
         assert_eq!(list["kind"], "mcp");
         assert_eq!(list["action"], "list");
-        assert_eq!(list["configured_servers"], 2);
+        assert_eq!(list["configured_servers"], 4);
         assert_eq!(list["servers"][0]["name"], "alpha");
         assert_eq!(list["servers"][0]["transport"]["id"], "stdio");
         assert_eq!(list["servers"][0]["details"]["command"], "uvx");
-        assert_eq!(list["servers"][1]["name"], "remote");
-        assert_eq!(list["servers"][1]["scope"]["id"], "local");
-        assert_eq!(list["servers"][1]["transport"]["id"], "ws");
+        assert_eq!(list["servers"][1]["name"], "codebase-memory");
+        assert_eq!(list["servers"][1]["scope"]["id"], "bundled");
+        assert_eq!(list["servers"][2]["name"], "playwright");
+        assert_eq!(list["servers"][3]["name"], "remote");
+        assert_eq!(list["servers"][3]["scope"]["id"], "local");
+        assert_eq!(list["servers"][3]["transport"]["id"], "ws");
         assert_eq!(
-            list["servers"][1]["details"]["url"],
+            list["servers"][3]["details"]["url"],
             "wss://remote.example/mcp"
         );
 

@@ -869,12 +869,13 @@ mod tests {
 
     #[test]
     fn propagates_other_non_zero_statuses_as_failures() {
+        let failure_hook = if cfg!(windows) {
+            "echo warning hook & exit /b 1"
+        } else {
+            "printf 'warning hook'; exit 1"
+        };
         let runner = HookRunner::from_feature_config(&RuntimeFeatureConfig::default().with_hooks(
-            RuntimeHookConfig::new(
-                vec![shell_snippet("printf 'warning hook'; exit 1")],
-                Vec::new(),
-                Vec::new(),
-            ),
+            RuntimeHookConfig::new(vec![shell_snippet(failure_hook)], Vec::new(), Vec::new()),
         ));
 
         // given
@@ -933,13 +934,21 @@ mod tests {
     #[test]
     fn stops_running_failure_hooks_after_failure() {
         // given
+        let (broken_hook, later_hook) = if cfg!(windows) {
+            (
+                "echo broken failure hook & exit /b 1",
+                "echo later failure hook",
+            )
+        } else {
+            (
+                "printf 'broken failure hook'; exit 1",
+                "printf 'later failure hook'",
+            )
+        };
         let runner = HookRunner::new(RuntimeHookConfig::new(
             Vec::new(),
             Vec::new(),
-            vec![
-                shell_snippet("printf 'broken failure hook'; exit 1"),
-                shell_snippet("printf 'later failure hook'"),
-            ],
+            vec![shell_snippet(broken_hook), shell_snippet(later_hook)],
         ));
 
         // when
@@ -1023,11 +1032,13 @@ mod tests {
     #[test]
     fn stops_running_hooks_after_failure() {
         // given
+        let (broken_hook, later_hook) = if cfg!(windows) {
+            ("echo broken & exit /b 1", "echo later")
+        } else {
+            ("printf 'broken'; exit 1", "printf 'later'")
+        };
         let runner = HookRunner::new(RuntimeHookConfig::new(
-            vec![
-                shell_snippet("printf 'broken'; exit 1"),
-                shell_snippet("printf 'later'"),
-            ],
+            vec![shell_snippet(broken_hook), shell_snippet(later_hook)],
             Vec::new(),
             Vec::new(),
         ));

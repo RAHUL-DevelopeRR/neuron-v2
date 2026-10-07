@@ -19,6 +19,8 @@ mod compact;
 mod config;
 pub mod config_validate;
 mod conversation;
+mod default_skill_files;
+pub mod default_skills;
 mod file_ops;
 mod git_context;
 pub mod green_contract;

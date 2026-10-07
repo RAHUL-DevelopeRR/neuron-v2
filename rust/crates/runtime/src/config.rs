@@ -12,6 +12,7 @@ pub const CLAW_SETTINGS_SCHEMA_NAME: &str = "SettingsSchema";
 /// Origin of a loaded settings file in the configuration precedence chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ConfigSource {
+    Bundled,
     User,
     Project,
     Local,
@@ -324,6 +325,36 @@ impl ConfigLoader {
             eprintln!("warning: {warning}");
         }
 
+        if optional_bool(&merged, "defaultMcpServers", "merged settings")? != Some(false) {
+            for (name, package, entry_variable) in [
+                (
+                    "codebase-memory",
+                    "codebase-memory-mcp@0.11.0",
+                    "NEURON_CODEBASE_MCP_ENTRY",
+                ),
+                (
+                    "playwright",
+                    "@playwright/mcp@0.0.83",
+                    "NEURON_PLAYWRIGHT_MCP_ENTRY",
+                ),
+            ] {
+                mcp_servers
+                    .entry(name.to_string())
+                    .or_insert_with(|| ScopedMcpServerConfig {
+                        scope: ConfigSource::Bundled,
+                        config: McpServerConfig::Stdio(default_mcp_stdio_config(
+                            package,
+                            entry_variable,
+                        )),
+                    });
+            }
+        }
+        for name in optional_string_array(&merged, "disabledMcpServers", "merged settings")?
+            .unwrap_or_default()
+        {
+            mcp_servers.remove(&name);
+        }
+
         let merged_value = JsonValue::Object(merged.clone());
 
         let feature_config = RuntimeFeatureConfig {
@@ -347,6 +378,37 @@ impl ConfigLoader {
             loaded_entries,
             feature_config,
         })
+    }
+}
+
+fn default_mcp_stdio_config(package: &str, entry_variable: &str) -> McpStdioServerConfig {
+    let entry = std::env::var_os(entry_variable)
+        .map(PathBuf::from)
+        .filter(|path| path.is_file());
+    let (command, args) = if let Some(entry) = entry {
+        (
+            std::env::var("NEURON_MCP_NODE").unwrap_or_else(|_| "node".to_string()),
+            vec![entry.to_string_lossy().into_owned()],
+        )
+    } else if cfg!(windows) {
+        (
+            "cmd.exe".to_string(),
+            ["/d", "/s", "/c", "npx", "-y", package]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        )
+    } else {
+        (
+            "npx".to_string(),
+            ["-y", package].into_iter().map(str::to_string).collect(),
+        )
+    };
+    McpStdioServerConfig {
+        command,
+        args,
+        env: BTreeMap::new(),
+        tool_call_timeout_ms: Some(120_000),
     }
 }
 
@@ -586,7 +648,11 @@ pub fn default_config_home() -> PathBuf {
     std::env::var_os("NEURON_CONFIG_HOME")
         .or_else(|| std::env::var_os("CLAW_CONFIG_HOME"))
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".neuron")))
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|home| PathBuf::from(home).join(".neuron"))
+        })
         .unwrap_or_else(|| PathBuf::from(".neuron"))
 }
 
@@ -1395,6 +1461,57 @@ mod tests {
     }
 
     #[test]
+    fn default_mcp_servers_allow_overrides_and_explicit_disable() {
+        let root = temp_dir();
+        let config_home = root.join("config");
+        fs::create_dir_all(&config_home).unwrap();
+        let loader = ConfigLoader::new(&root, &config_home);
+        let config = loader.load().unwrap();
+        for (name, package) in [
+            ("codebase-memory", "codebase-memory-mcp@0.11.0"),
+            ("playwright", "@playwright/mcp@0.0.83"),
+        ] {
+            let server = config.mcp().get(name).unwrap();
+            assert_eq!(server.scope, ConfigSource::Bundled);
+            let McpServerConfig::Stdio(stdio) = &server.config else {
+                panic!("stdio default");
+            };
+            assert_eq!(stdio.args.last().map(String::as_str), Some(package));
+            assert_eq!(stdio.command, if cfg!(windows) { "cmd.exe" } else { "npx" });
+        }
+        let settings = config_home.join("settings.json");
+        fs::write(&settings, r#"{"mcpServers":{"playwright":{"command":"custom-browser","args":[]}},"disabledMcpServers":["codebase-memory"]}"#).unwrap();
+        let overridden = loader.load().unwrap();
+        assert!(overridden.mcp().get("codebase-memory").is_none());
+        let server = overridden.mcp().get("playwright").unwrap();
+        assert_eq!(server.scope, ConfigSource::User);
+        let McpServerConfig::Stdio(stdio) = &server.config else {
+            panic!("stdio override");
+        };
+        assert_eq!(stdio.command, "custom-browser");
+        fs::write(&settings, r#"{"defaultMcpServers":false}"#).unwrap();
+        assert_eq!(
+            loader.load().unwrap().mcp().servers(),
+            &std::collections::BTreeMap::new()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn packaged_mcp_uses_existing_absolute_entry_without_npx() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).unwrap();
+        let entry = root.join("cli.js");
+        fs::write(&entry, "// package entry\n").unwrap();
+        std::env::set_var("NEURON_TEST_MCP_ENTRY", &entry);
+        let config = super::default_mcp_stdio_config("unused@1.0.0", "NEURON_TEST_MCP_ENTRY");
+        std::env::remove_var("NEURON_TEST_MCP_ENTRY");
+        assert_eq!(config.args, vec![entry.to_string_lossy().into_owned()]);
+        assert_ne!(config.command, "npx");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn parses_sandbox_config() {
         let root = temp_dir();
         let cwd = root.join("project");
@@ -1486,7 +1603,7 @@ mod tests {
         // then
         let chain = loaded.provider_fallbacks();
         assert_eq!(chain.primary(), None);
-        assert!(chain.fallbacks().is_empty());
+        assert_eq!(chain.fallbacks().len(), 0);
         assert!(chain.is_empty());
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -1534,7 +1651,7 @@ mod tests {
             .expect("config should load");
 
         // then
-        assert!(loaded.trusted_roots().is_empty());
+        assert_eq!(loaded.trusted_roots().len(), 0);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

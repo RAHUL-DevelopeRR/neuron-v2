@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::SystemTime;
 
 use aes_gcm::aead::{Aead, KeyInit};
@@ -50,21 +51,19 @@ pub fn vault_path() -> PathBuf {
     home.join(".neuroncli").join("vault.enc")
 }
 
-pub fn key_fingerprint(key: &str) -> String {
-    let hash = Sha256::digest(key.as_bytes());
-    let hex_part = hex::encode(&hash[..8]);
-    let prefix = if key.len() > 6 { &key[..6] } else { "sk-???" };
-    format!("{prefix}...:{hex_part}")
-}
-
 fn machine_fingerprint() -> String {
-    let machine_id = machine_id().unwrap_or_else(|| "unknown-machine".to_string());
-    let username = std::env::var("USERNAME")
-        .or_else(|_| std::env::var("USER"))
-        .unwrap_or_else(|_| "unknown-user".to_string());
-    let input = format!("{machine_id}:{username}:neuroncli-vault-v1");
-    let hash = Sha256::digest(input.as_bytes());
-    hex::encode(&hash[..16])
+    static FINGERPRINT: OnceLock<String> = OnceLock::new();
+    FINGERPRINT
+        .get_or_init(|| {
+            let machine_id = machine_id().unwrap_or_else(|| "unknown-machine".to_string());
+            let username = std::env::var("USERNAME")
+                .or_else(|_| std::env::var("USER"))
+                .unwrap_or_else(|_| "unknown-user".to_string());
+            let input = format!("{machine_id}:{username}:neuroncli-vault-v1");
+            let hash = Sha256::digest(input.as_bytes());
+            hex::encode(&hash[..16])
+        })
+        .clone()
 }
 
 fn machine_id() -> Option<String> {
@@ -177,6 +176,9 @@ pub fn decrypt_from_vault(path: &Path) -> Result<SecureString, String> {
     let nonce_bytes = B64
         .decode(&vault.nonce)
         .map_err(|e| format!("nonce b64: {e}"))?;
+    if salt.len() != 16 || nonce_bytes.len() != 12 {
+        return Err("invalid vault salt or nonce length".into());
+    }
     let ciphertext = B64
         .decode(&vault.ciphertext)
         .map_err(|e| format!("ct b64: {e}"))?;
@@ -203,39 +205,24 @@ pub fn decrypt_from_vault(path: &Path) -> Result<SecureString, String> {
     Ok(SecureString::new(key))
 }
 
-pub fn delete_vault(path: &Path) {
-    let _ = fs::remove_file(path);
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-pub fn health_check_path() -> PathBuf {
-    vault_path().with_extension("health")
-}
-
-pub fn needs_health_check() -> bool {
-    let path = health_check_path();
-    match fs::metadata(&path) {
-        Ok(meta) => {
-            let age = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.elapsed().ok())
-                .unwrap_or(std::time::Duration::MAX);
-            age > std::time::Duration::from_secs(86400)
-        }
-        Err(_) => true,
+    #[test]
+    fn stored_gateway_token_roundtrips_and_malformed_nonce_is_rejected() {
+        let path =
+            std::env::temp_dir().join(format!("neuron-vault-test-{}.enc", std::process::id()));
+        let token = "ses_012345678901234567890123456789";
+        encrypt_and_store(token, &path).unwrap();
+        assert_eq!(decrypt_from_vault(&path).unwrap().expose(), token);
+        let mut stored: VaultFile =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        stored.nonce = B64.encode([0u8; 11]);
+        fs::write(&path, serde_json::to_string(&stored).unwrap()).unwrap();
+        assert!(decrypt_from_vault(&path)
+            .unwrap_err()
+            .contains("nonce length"));
+        fs::remove_file(path).unwrap();
     }
-}
-
-pub fn record_health_check() {
-    let path = health_check_path();
-    let _ = fs::write(
-        &path,
-        format!(
-            "{}",
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-        ),
-    );
 }

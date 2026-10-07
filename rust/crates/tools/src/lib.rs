@@ -2915,7 +2915,7 @@ fn summarize_web_fetch(
 
 fn extract_title(content: &str, raw_body: &str, content_type: &str) -> Option<String> {
     if content_type.contains("html") {
-        let lowered = raw_body.to_lowercase();
+        let lowered = raw_body.to_ascii_lowercase();
         if let Some(start) = lowered.find("<title>") {
             let after = start + "<title>".len();
             if let Some(end_rel) = lowered[after..].find("</title>") {
@@ -4593,7 +4593,7 @@ impl ApiClient for ProviderRuntimeClient {
 
         let runtime = &self.runtime;
         let chain = &self.chain;
-        let mut last_error: Option<ApiError> = None;
+        let mut last_error = None;
         for (index, entry) in chain.iter().enumerate() {
             let message_request = MessageRequest {
                 model: entry.model.clone(),
@@ -4631,7 +4631,7 @@ impl ApiClient for ProviderRuntimeClient {
 async fn stream_with_provider(
     client: &ProviderClient,
     message_request: &MessageRequest,
-) -> Result<Vec<AssistantEvent>, ApiError> {
+) -> Result<Vec<AssistantEvent>, Box<ApiError>> {
     let mut stream = client.stream_message(message_request).await?;
     let mut events = Vec::new();
     let mut pending_tools: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
@@ -6582,15 +6582,16 @@ mod tests {
     #[test]
     #[cfg_attr(windows, ignore = "Windows fixture needs shell/path isolation")]
     fn recovery_loop_state_file_reflects_transitions() {
-        // End-to-end proof: .claw/worker-state.json reflects every transition
+        // End-to-end proof: .neuron/worker-state.json reflects every transition
         // through the stall-detect -> resolve-trust -> ready loop.
         use std::fs;
+        let _guard = env_guard();
 
         // Use a real temp CWD so state file can be written
         let worktree = temp_path("recovery-loop-state");
         fs::create_dir_all(&worktree).expect("create worktree");
         let cwd = worktree.to_str().expect("utf-8").to_string();
-        let state_path = worktree.join(".claw").join("worker-state.json");
+        let state_path = worktree.join(".neuron").join("worker-state.json");
 
         // 1. Create worker WITHOUT trusted_roots
         let created = execute_tool("WorkerCreate", &json!({"cwd": cwd}))
@@ -7103,6 +7104,40 @@ mod tests {
         )
         .expect_err("invalid URL should fail");
         assert!(error.contains("relative URL without a base") || error.contains("invalid"));
+    }
+
+    #[test]
+    fn web_fetch_title_preserves_unicode_byte_offsets() {
+        let html = "İ<TITLE>É 🦀</TITLE>";
+        assert_eq!(
+            super::extract_title("", html, "text/html"),
+            Some("É 🦀".to_string())
+        );
+    }
+
+    #[test]
+    fn http_test_server_drop_preserves_failures_without_double_panic() {
+        let failed_server = || TestServer {
+            addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            shutdown: None,
+            handle: Some(thread::spawn(|| panic!("server fixture failure"))),
+        };
+        let ordinary = std::panic::catch_unwind(|| drop(failed_server()))
+            .expect_err("server failure must fail its test");
+        assert_eq!(
+            ordinary.downcast_ref::<&str>(),
+            Some(&"server fixture failure")
+        );
+
+        let primary = std::panic::catch_unwind(|| {
+            let _server = failed_server();
+            panic!("primary fetch failure");
+        })
+        .expect_err("primary failure must remain observable");
+        assert_eq!(
+            primary.downcast_ref::<&str>(),
+            Some(&"primary fetch failure")
+        );
     }
 
     #[test]
@@ -7836,7 +7871,7 @@ mod tests {
         assert_eq!(manifest.name, "ship-audit");
         assert_eq!(manifest.subagent_type.as_deref(), Some("Explore"));
         assert_eq!(manifest.status, "running");
-        assert!(!manifest.created_at.is_empty());
+        assert_ne!(manifest.created_at, "");
         assert!(manifest.started_at.is_some());
         assert!(manifest.completed_at.is_none());
         let contents = std::fs::read_to_string(&manifest.output_file).expect("agent file exists");
@@ -7860,29 +7895,32 @@ mod tests {
         assert!(captured_job.allowed_tools.contains("read_file"));
         assert!(!captured_job.allowed_tools.contains("Agent"));
 
-        let normalized = execute_tool(
-            "Agent",
-            &json!({
-                "description": "Verify the branch",
-                "prompt": "Check tests.",
-                "subagent_type": "explorer"
-            }),
+        let normalized = execute_agent_with_spawn(
+            AgentInput {
+                description: "Verify the branch".to_string(),
+                prompt: "Check tests.".to_string(),
+                subagent_type: Some("explorer".to_string()),
+                name: None,
+                model: None,
+            },
+            |_| Ok(()),
         )
         .expect("Agent should normalize built-in aliases");
-        let normalized_output: serde_json::Value =
-            serde_json::from_str(&normalized).expect("valid json");
+        let normalized_output = serde_json::to_value(normalized).expect("valid json");
         assert_eq!(normalized_output["subagentType"], "Explore");
 
-        let named = execute_tool(
-            "Agent",
-            &json!({
-                "description": "Review the branch",
-                "prompt": "Inspect diff.",
-                "name": "Ship Audit!!!"
-            }),
+        let named = execute_agent_with_spawn(
+            AgentInput {
+                description: "Review the branch".to_string(),
+                prompt: "Inspect diff.".to_string(),
+                subagent_type: None,
+                name: Some("Ship Audit!!!".to_string()),
+                model: None,
+            },
+            |_| Ok(()),
         )
         .expect("Agent should normalize explicit names");
-        let named_output: serde_json::Value = serde_json::from_str(&named).expect("valid json");
+        let named_output = serde_json::to_value(named).expect("valid json");
         assert_eq!(named_output["name"], "ship-audit");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -8517,6 +8555,8 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = temp_path("subagent-input.txt");
         std::fs::write(&path, "hello from child").expect("write input file");
+        let original_dir = std::env::current_dir().expect("current directory");
+        std::env::set_current_dir(std::env::temp_dir()).expect("set temp workspace");
 
         let mut runtime = ConversationRuntime::new(
             Session::new(),
@@ -8529,9 +8569,9 @@ mod tests {
             vec![String::from("system prompt")],
         );
 
-        let summary = runtime
-            .run_turn("Inspect the delegated file", None)
-            .expect("subagent loop should succeed");
+        let summary = runtime.run_turn("Inspect the delegated file", None);
+        std::env::set_current_dir(original_dir).expect("restore current directory");
+        let summary = summary.expect("subagent loop should succeed");
 
         assert_eq!(
             final_assistant_text(&summary),
@@ -8877,7 +8917,7 @@ mod tests {
 
         let read_error = execute_tool("read_file", &json!({ "path": "missing.txt" }))
             .expect_err("missing file should fail");
-        assert!(!read_error.is_empty());
+        assert_ne!(read_error, "");
 
         let edit_once = execute_tool(
             "edit_file",
@@ -8960,7 +9000,7 @@ mod tests {
 
         let glob_error = execute_tool("glob_search", &json!({ "pattern": "[" }))
             .expect_err("invalid glob should fail");
-        assert!(!glob_error.is_empty());
+        assert_ne!(glob_error, "");
 
         let grep_content = execute_tool(
             "grep_search",
@@ -8998,7 +9038,7 @@ mod tests {
             &json!({ "pattern": "(alpha", "path": "nested" }),
         )
         .expect_err("invalid regex should fail");
-        assert!(!grep_error.is_empty());
+        assert_ne!(grep_error, "");
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
@@ -9236,8 +9276,9 @@ mod tests {
         assert_eq!(exit_output["changed"], true);
         assert_eq!(exit_output["currentLocalMode"], serde_json::Value::Null);
 
-        let local_settings = std::fs::read_to_string(cwd.join(".claw").join("settings.local.json"))
-            .expect("local settings after exit");
+        let local_settings =
+            std::fs::read_to_string(cwd.join(".neuron").join("settings.local.json"))
+                .expect("local settings after exit");
         let local_settings_json: serde_json::Value =
             serde_json::from_str(&local_settings).expect("valid settings json");
         assert_eq!(
@@ -9312,6 +9353,7 @@ mod tests {
 
     #[test]
     fn given_timeout_ms_when_repl_blocks_then_returns_timeout_error() {
+        let _guard = env_guard();
         let result = execute_tool(
             "REPL",
             &json!({
@@ -9374,7 +9416,7 @@ printf 'pwsh:%s' "$1"
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
         assert_eq!(output["stdout"], "pwsh:Write-Output hello");
-        assert!(output["stderr"].as_str().expect("stderr").is_empty());
+        assert_eq!(output["stderr"].as_str().expect("stderr"), "");
 
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
         assert!(background_output["backgroundTaskId"].as_str().is_some());
@@ -9474,8 +9516,11 @@ printf 'pwsh:%s' "$1"
         let file = root.join("readable.txt");
         fs::write(&file, "content\n").expect("write test file");
 
+        let original_dir = std::env::current_dir().expect("current directory");
+        std::env::set_current_dir(&root).expect("set workspace root");
         let registry = read_only_registry();
         let result = registry.execute("read_file", &json!({ "path": file.display().to_string() }));
+        std::env::set_current_dir(original_dir).expect("restore current directory");
         assert!(result.is_ok(), "read_file should be allowed: {result:?}");
 
         let _ = fs::remove_dir_all(root);
@@ -9703,6 +9748,13 @@ printf 'pwsh:%s' "$1"
 
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).expect("blocking test stream");
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(20)))
+                            .expect("test stream read timeout");
+                        stream
+                            .set_write_timeout(Some(Duration::from_secs(20)))
+                            .expect("test stream write timeout");
                         let mut buffer = [0_u8; 4096];
                         let size = stream.read(&mut buffer).expect("read request");
                         let request = String::from_utf8_lossy(&buffer[..size]).into_owned();
@@ -9737,7 +9789,11 @@ printf 'pwsh:%s' "$1"
                 let _ = tx.send(());
             }
             if let Some(handle) = self.handle.take() {
-                handle.join().expect("join test server");
+                if let Err(error) = handle.join() {
+                    if !thread::panicking() {
+                        std::panic::resume_unwind(error);
+                    }
+                }
             }
         }
     }

@@ -197,6 +197,18 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "trustedRoots",
         expected: FieldType::StringArray,
     },
+    FieldSpec {
+        name: "defaultSkills",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "defaultMcpServers",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "disabledMcpServers",
+        expected: FieldType::StringArray,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[
@@ -747,7 +759,7 @@ mod tests {
 
         // then
         assert!(result.is_ok());
-        assert!(result.warnings.is_empty());
+        assert_eq!(result.warnings.len(), 0);
     }
 
     #[test]
