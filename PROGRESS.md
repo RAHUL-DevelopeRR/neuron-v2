@@ -1,52 +1,69 @@
-# Neuron release progress
+# Zero-X / Neuron Engineering Progress
 
-Updated: 2026-10-06
+Updated: 2026-10-07
 
-## Completed
+## 1. Completed
 
-- Fixed the Neuron MCP stdio transport default to use newline-delimited JSON-RPC and initialize servers correctly.
-- Kept the legacy Content-Length protocol available for compatible servers and made the legacy test fixtures select it explicitly.
-- Corrected the Unix test-only MCP initialization timeout so parallel CI has enough time to start fixture processes.
-- Fixed non-blocking stdin check stall on Windows in `rust/crates/rusty-claude-cli/src/args.rs`.
-- Fixed Windows non-blocking socket inheritance issue in `rust/crates/rusty-claude-cli/tests/gateway_roundtrip.rs`.
-- Full Rust workspace test suite passes (1000 passed, 0 failed, 20 ignored). Clippy and format checks clean.
-- Produced comprehensive architecture and scaling blueprints:
-  - `CURRENT_ARCHITECTURE.md`: Grounded audit of existing gateway and CLI components.
-  - `SERVER_SCALING_PLAN.md`: 4-phase production scaling and enterprise roadmap.
-- Implemented Phase 1 multi-provider gateway architecture in `zero-x.live` (`auth-server`):
-  - Modular `ProviderAdapter` and configurable `OpenAICompatibleAdapter` (`src/provider-adapter.js`).
-  - Native `CloudflareWorkersAIAdapter` (`src/cloudflare-adapter.js`).
-  - Asynchronous `ProviderHealthTracker` with circuit breakers (`src/provider-health.js`).
-  - Deterministic `RoutingEngine` with capability matching and fallback logic (`src/router.js`).
-  - Request and attempt correlation IDs (`req_*`, `att_*`) integrated into `src/chat-handler.js`.
-  - Database observability migration (`migrations/20261006050000_gateway_observability.sql`).
-  - Dynamic provider and model catalog schema migration (`migrations/20261006060000_dynamic_provider_catalog.sql`).
-  - Phase 1 architecture verification suite (`check-phase1-architecture.mjs`).
-- Integrated and verified live provider credentials on server side:
-  - Groq Cloud: Status 200 (`openai/gpt-oss-120b`, `openai/gpt-oss-20b`, `qwen/qwen3.8-27b`).
-  - Google Gemini / AI Studio: Status 200 (`gemini-2.5-flash`, `gemini-2.5-pro`).
-  - OpenRouter: Status 200 (`cohere/north-mini-code:free`).
-  - NVIDIA NIM: Status 200 (`meta/llama-3.2-11b-vision-instruct`, `deepseek-ai/deepseek-coder-6.7b-instruct`).
-- Executed full live multi-provider end-to-end application creation verification (`run-live-end-to-end-app-creation.mjs`):
-  - Session creation via `/auth/session` and verification via `/auth/session`.
-  - Model catalog dynamic resolution serving 8 active models across 4 providers.
-  - `neuron doctor` gateway authentication verified.
-  - Live streaming completion verified with Gemini Flash.
-  - Application created in workspace and verified via Neuron CLI tool execution (`read_file`).
-  - Application test suite executed and passed (`test_app.js`).
-  - Secret isolation audit verified zero platform key leakage.
+### Multi-Provider Gateway & Key Deployment
+- **Deployed Real Provider Credentials to Cloudflare Workers**:
+  - Securely uploaded secrets via GitHub Secrets CI/CD pipeline:
+    - Groq Cloud: `GROQ_API_KEY`
+    - OpenRouter: `OPENROUTER_API_KEY`
+    - Google Gemini: `GEMINI_API_KEY`
+    - NVIDIA NIM: `NVIDIA_API_KEY`
+  - Automated deployment workflow (`.github/workflows/deploy.yml` -> `Deploy to Cloudflare Workers`) deployed successfully.
+  - Verified live endpoint `https://zero-x.live/health`:
+    ```json
+    {
+      "status": "ok",
+      "service": "neuroncli-gateway-worker",
+      "version": "2.0.0",
+      "providers": [ "cloudflare", "openrouter", "groq", "gemini", "nvidia" ],
+      "supabase_configured": true,
+      "kv_bound": true,
+      "database_configured": true
+    }
+    ```
+  - Verified live model catalog `https://zero-x.live/v1/models` serving 10 models across all 5 providers:
+    - `@cf/meta/llama-3.3-70b-instruct-fp8-fast`, `@cf/meta/llama-3.1-8b-instruct`
+    - `cohere/north-mini-code:free`
+    - `groq/openai/gpt-oss-120b`, `groq/openai/gpt-oss-20b`, `groq/qwen/qwen3.8-27b`
+    - `gemini/gemini-2.5-flash`, `gemini/gemini-2.5-pro`
+    - `nvidia/meta/llama-3.2-11b-vision-instruct`, `nvidia/deepseek-ai/deepseek-coder-6.7b-instruct`
 
-## Current state
+### Bug Fixes & Diagnostics
+- **Diagnosed and Fixed Model Prefix "Stuck in Thinking" Bug**:
+  - Root cause: When Neuron CLI or OpenAI clients send `openai/<model>` (e.g. `openai/gemini/gemini-2.5-flash`), `router.js` did not normalize the transport prefix, resulting in a 404 model not found error that caused client REPL spinners to hang.
+  - Fix: Implemented flexible transport prefix stripping and model ID matching in `router.js`. Pushed to `zero-x.live` (`a8f7e60`).
+- **PowerShell Command Parsing Resolution**:
+  - Identified PowerShell variable expansion issues when invoking CLI wrappers. Provided safe script and execution patterns.
+- **Session Authentication Clarification**:
+  - Audited local `~/.neuroncli/gateway.enc` token expiration vs production Supabase KV session issuance. Confirmed `neuron auth login` browser OAuth flow.
 
-- Neuron changes are on branch `codex/gateway-client-fixes`, associated with PR #3: https://github.com/RAHUL-DevelopeRR/neuron-v2/pull/3
-- Gateway server changes are on branch `main` in `RAHUL-DevelopeRR/zero-x.live`.
-- All local server test suites (`npm test`, `check:production`, `check:phase1`) pass 100%.
-- Live production gateway at `https://zero-x.live` is online, serving Cloudflare Workers AI with database connectivity and quota enforcement.
+### Standalone Server Isolation & Universal Integration
+- **Isolated AI Gateway Architecture Documented (`ISOLATED_SERVER_ARCH.md`)**:
+  - Decoupled the Gateway microservice from frontend websites and CLI binaries.
+  - Standardized on OpenAI-compatible `/v1/chat/completions` and `/v1/models` endpoints.
+- **OpenCode & Third-Party Integration Guide Created (`OPENCODE_INTEGRATION_GUIDE.md`)**:
+  - Provided copy-pasteable configurations for OpenCode (`sst/opencode`), Cursor, Zed, Continue.dev, Python SDK, and Node.js SDK to connect to `https://zero-x.live/v1`.
 
-## Next steps
+### Git Hygiene & Test Verification
+- All test suites in `zero-x.live` (`check:production`, `check:database`) passing 100%.
+- Workspace `.gitignore` updated to prevent local session files from tracking.
 
-1. Merge PR #3 and cut `v6.2.5` release tag for `neuron-v2`.
-2. Deploy Zero-X gateway Phase 1 observability and dynamic catalog migrations to staging/production via Cloudflare Wrangler.
-3. Add Cloudflare Hyperdrive connection pooling and Cloudflare Queues for asynchronous attempt ingestion (Phase 2).
-4. Integrate Stripe billing webhooks and customer credit ledger (Phase 3).
-5. Implement encrypted Customer BYOK for enterprise team seats (Phase 4).
+---
+
+## 2. Current State
+
+- Gateway Server: Deployed live to Cloudflare Workers on `https://zero-x.live`.
+- Client Repository: Clean on branch `codex/gateway-client-fixes`.
+- All provider keys remain strictly server-side (zero secret leakage).
+
+---
+
+## 3. Next Steps
+
+1. Clone or publish the isolated server repository `zero-x-gateway` as a standalone GitHub repo.
+2. Implement Cloudflare Hyperdrive connection pooling for PostgreSQL (Phase 2).
+3. Introduce pre-paid credit wallets / Stripe / Razorpay meter billing for unit-economic protection (Phase 3).
+4. Add automated upstream circuit breaker fallbacks for Groq 429 rate limit errors (Phase 4).

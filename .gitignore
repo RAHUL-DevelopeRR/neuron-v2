@@ -55,3 +55,4 @@ dist/
 node_modules/
 ui/react-tui/dist/
 neuron_cli/neuron
+.neuron/
