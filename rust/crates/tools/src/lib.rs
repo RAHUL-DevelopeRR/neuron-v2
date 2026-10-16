@@ -382,18 +382,132 @@ fn permission_mode_from_plugin(value: &str) -> Result<PermissionMode, String> {
     }
 }
 
+/// Description of the `bash` tool, naming the shell that actually runs.
+#[cfg(windows)]
+const BASH_TOOL_DESCRIPTION: &str = "Execute a command in the current workspace with Windows cmd.exe (`cmd.exe /D /S /C`): use cmd syntax (`dir`, `type`, `set`, `%VAR%`, `&&`); POSIX tools work only if they are on PATH, and the PowerShell tool runs PowerShell syntax. Read-only commands run directly; anything else (writes, builds, installs, network) asks the user for approval unless the session runs in danger-full-access mode. stdin is empty. Default timeout 120000 ms (max 600000); on timeout the whole process tree is killed.";
+#[cfg(not(windows))]
+const BASH_TOOL_DESCRIPTION: &str = "Execute a command in the current workspace with POSIX sh (`sh -lc`). Read-only commands run directly; anything else (writes, builds, installs, network) asks the user for approval unless the session runs in danger-full-access mode. stdin is empty. Default timeout 120000 ms (max 600000); on timeout the whole process tree is killed.";
+
+/// Tools that exist but are not advertised to the model by default: they
+/// only keep in-memory bookkeeping (tasks, teams, crons, workers), are
+/// placeholders (LSP, built-in MCP), or are niche. `ToolSearch` finds them
+/// and activates their schema for the rest of the session.
+const DEFERRED_TOOL_NAMES: &[&str] = &[
+    "TaskCreate",
+    "RunTaskPacket",
+    "TaskGet",
+    "TaskList",
+    "TaskStop",
+    "TaskUpdate",
+    "TaskOutput",
+    "WorkerCreate",
+    "WorkerGet",
+    "WorkerObserve",
+    "WorkerResolveTrust",
+    "WorkerAwaitReady",
+    "WorkerSendPrompt",
+    "WorkerRestart",
+    "WorkerTerminate",
+    "WorkerObserveCompletion",
+    "TeamCreate",
+    "TeamDelete",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "LSP",
+    "ListMcpResources",
+    "ReadMcpResource",
+    "McpAuth",
+    "MCP",
+    "RemoteTrigger",
+];
+
+/// Test-only tools that are never advertised or searchable.
+const HIDDEN_TOOL_NAMES: &[&str] = &["TestingPermission"];
+
+/// How a built-in tool is offered to the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolAdvertisement {
+    /// Sent with every request.
+    Default,
+    /// Discoverable through `ToolSearch`, then sent for the rest of the session.
+    Deferred,
+    /// Never offered (test fixtures).
+    Hidden,
+}
+
+/// Advertisement class of a built-in tool.
+#[must_use]
+pub fn tool_advertisement(name: &str) -> ToolAdvertisement {
+    if HIDDEN_TOOL_NAMES.contains(&name) {
+        ToolAdvertisement::Hidden
+    } else if DEFERRED_TOOL_NAMES.contains(&name) {
+        ToolAdvertisement::Deferred
+    } else {
+        ToolAdvertisement::Default
+    }
+}
+
+fn activated_deferred_tools() -> &'static std::sync::Mutex<BTreeSet<String>> {
+    static ACTIVATED: std::sync::OnceLock<std::sync::Mutex<BTreeSet<String>>> =
+        std::sync::OnceLock::new();
+    ACTIVATED.get_or_init(|| std::sync::Mutex::new(BTreeSet::new()))
+}
+
+fn is_deferred_tool_activated(name: &str) -> bool {
+    activated_deferred_tools()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(name)
+}
+
+fn activate_deferred_tools<'a>(names: impl IntoIterator<Item = &'a str>) {
+    let mut activated = activated_deferred_tools()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for name in names {
+        if tool_advertisement(name) == ToolAdvertisement::Deferred {
+            activated.insert(name.to_string());
+        }
+    }
+}
+
+/// Built-in tools sent to the model: default tools plus deferred tools that
+/// `ToolSearch` activated, or exactly the explicitly allowed ones.
+fn advertised_builtin_specs(allowed_tools: Option<&BTreeSet<String>>) -> Vec<ToolSpec> {
+    mvp_tool_specs()
+        .into_iter()
+        .filter(|spec| match allowed_tools {
+            Some(allowed) => {
+                allowed.contains(spec.name)
+                    && tool_advertisement(spec.name) != ToolAdvertisement::Hidden
+            }
+            None => match tool_advertisement(spec.name) {
+                ToolAdvertisement::Default => true,
+                ToolAdvertisement::Deferred => is_deferred_tool_activated(spec.name),
+                ToolAdvertisement::Hidden => false,
+            },
+        })
+        .collect()
+}
+
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "bash",
-            description: "Execute a shell command in the current workspace.",
+            description: BASH_TOOL_DESCRIPTION,
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" },
-                    "timeout": { "type": "integer", "minimum": 1 },
+                    "timeout": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 600_000,
+                        "description": "Timeout in milliseconds (default 120000, max 600000)"
+                    },
                     "description": { "type": "string" },
                     "run_in_background": { "type": "boolean" },
                     "dangerouslyDisableSandbox": { "type": "boolean" },
@@ -409,13 +523,21 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read_file",
-            description: "Read a text file from the workspace.",
+            description: "Read a text file from the workspace. Returns at most 2000 lines per call (lines longer than 2000 characters are cut) plus the file's total line count; use offset to continue reading.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
-                    "offset": { "type": "integer", "minimum": 0 },
-                    "limit": { "type": "integer", "minimum": 1 }
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "0-based line to start from"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Maximum lines to return (default 2000)"
+                    }
                 },
                 "required": ["path"],
                 "additionalProperties": false
@@ -424,7 +546,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "write_file",
-            description: "Write a text file in the workspace.",
+            description: "Create or overwrite a text file in the workspace with the given content. Returns a short summary (path, bytes, lines, created or overwritten). Prefer edit_file for changes to existing files.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -438,7 +560,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit_file",
-            description: "Replace text in a workspace file.",
+            description: "Replace old_string with new_string in a workspace file and return a compact diff. old_string must match exactly once unless replace_all is true (the error lists the matching lines); `\\n` in old_string also matches Windows CRLF line endings, which are preserved.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -454,7 +576,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "glob_search",
-            description: "Find files by glob pattern.",
+            description: "Find files by glob pattern (`**` spans directories). Skips .git, node_modules, target, dist, build and .gitignore'd paths unless the pattern points into them; searching outside the workspace needs approval.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -468,7 +590,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "grep_search",
-            description: "Search file contents with a regex pattern.",
+            description: "Search file contents with a regex pattern. Skips .git, node_modules, target, dist, build and .gitignore'd paths below the search path; searching outside the workspace needs approval.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -495,7 +617,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "WebFetch",
             description:
-                "Fetch a URL, convert it into readable text, and answer a prompt about it.",
+                "Fetch an http(s) URL and return its readable text (up to 20000 characters) for answering the prompt. Local, private and link-local addresses are blocked; a domain not yet approved in this session needs user approval unless the session runs in danger-full-access mode.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -714,19 +836,24 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "PowerShell",
-            description: "Execute a PowerShell command with optional timeout.",
+            description: "Execute a PowerShell command (pwsh when installed, otherwise Windows PowerShell; -NoProfile -NonInteractive). Read-only cmdlets such as Get-Content, Get-ChildItem and Select-String run directly; anything else asks the user for approval unless the session runs in danger-full-access mode. Default timeout 120000 ms (max 600000); on timeout the process tree is killed.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" },
-                    "timeout": { "type": "integer", "minimum": 1 },
+                    "timeout": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 600_000,
+                        "description": "Timeout in milliseconds (default 120000, max 600000)"
+                    },
                     "description": { "type": "string" },
                     "run_in_background": { "type": "boolean" }
                 },
                 "required": ["command"],
                 "additionalProperties": false
             }),
-            required_permission: PermissionMode::DangerFullAccess,
+            required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
             name: "AskUserQuestion",
