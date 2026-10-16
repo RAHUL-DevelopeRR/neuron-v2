@@ -1,6 +1,6 @@
 {
   "name": "@zero-x.live/neuron",
-  "version": "6.2.5",
+  "version": "6.3.0",
   "description": "Neuron coding agent for the terminal, powered by the Zero-X gateway",
   "keywords": [
     "ai",

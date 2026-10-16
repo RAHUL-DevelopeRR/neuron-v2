@@ -175,7 +175,7 @@ try {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       machine_fingerprint: 'external-user-pc-uuid-98765',
-      version: '6.2.5'
+      version: '6.3.0'
     })
   });
   assert.equal(sessionRes.status, 200, 'Session creation failed');

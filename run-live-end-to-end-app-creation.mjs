@@ -53,7 +53,7 @@ try {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       machine_fingerprint: 'external-dev-machine-uuid-1234',
-      version: '6.2.5'
+      version: '6.3.0'
     })
   });
   assert.equal(sessionRes.status, 200);

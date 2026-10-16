@@ -27,7 +27,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import urlopen
 
-PACKAGE_VERSION = "6.2.5"
+PACKAGE_VERSION = "6.3.0"
 REPOSITORY = "https://github.com/RAHUL-DevelopeRR/neuron-v2"
 DEFAULT_DOWNLOAD_BASE = f"{REPOSITORY}/releases/download"
 CHECKSUM_TIMEOUT_SECONDS = 30
