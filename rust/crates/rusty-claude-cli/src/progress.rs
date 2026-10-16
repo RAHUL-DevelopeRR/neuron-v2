@@ -459,7 +459,12 @@ fn assemble_conversation_runtime(
         ),
         runtime::context_manager::ContextPolicy::from_env(),
     );
-    register_subagent_parent(&model, permission_mode);
+    register_subagent_parent(
+        &model,
+        permission_mode,
+        &feature_config,
+        allowed_tools.as_ref(),
+    );
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         AnthropicRuntimeClient::new(
@@ -497,16 +502,38 @@ pub(crate) fn estimate_tool_schema_tokens(definitions: &[ToolDefinition]) -> usi
 }
 
 /// Lets sub-agents spawned by the `Agent` tool inherit the parent's resolved
-/// model, permission mode and provider credentials.
-fn register_subagent_parent(model: &str, permission_mode: PermissionMode) {
+/// model and provider credentials, and never more authority than the parent:
+/// its permission mode, permission rules, tool hooks and tool allow-list.
+fn register_subagent_parent(
+    model: &str,
+    permission_mode: PermissionMode,
+    feature_config: &runtime::RuntimeFeatureConfig,
+    allowed_tools: Option<&AllowedToolSet>,
+) {
+    tools::set_subagent_parent_context(subagent_parent_context_for(
+        model,
+        permission_mode,
+        feature_config,
+        allowed_tools,
+    ));
+}
+
+fn subagent_parent_context_for(
+    model: &str,
+    permission_mode: PermissionMode,
+    feature_config: &runtime::RuntimeFeatureConfig,
+    allowed_tools: Option<&AllowedToolSet>,
+) -> tools::SubagentParentContext {
     let factory: tools::SubagentClientFactory = Arc::new(|model: &str| {
         crate::api_client::build_provider_client(model, None).map_err(|error| error.to_string())
     });
-    tools::set_subagent_parent_context(tools::SubagentParentContext {
-        model: model.to_string(),
-        permission_mode,
+    tools::SubagentParentContext {
+        permission_rules: feature_config.permission_rules().clone(),
+        hooks: feature_config.hooks().clone(),
+        allowed_tools: allowed_tools.cloned(),
         client_factory: Some(factory),
-    });
+        ..tools::SubagentParentContext::new(model, permission_mode)
+    }
 }
 
 /// Reads the `maxIterations` setting. (The JSON value type is not nameable
@@ -772,6 +799,52 @@ mod shared_state_tests {
         );
 
         shutdown_shared_runtime_state();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn subagents_inherit_the_parent_rules_hooks_and_tool_allow_list() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "neuron-subagent-parent-{}-{nanos}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        let config_home = root.join("config");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{"defaultMcpServers":false,"permissions":{"deny":["bash(git push:*)"],"ask":["write_file"]},"hooks":{"PreToolUse":["audit-hook"]}}"#,
+        )
+        .expect("settings");
+        let config = ConfigLoader::new(&workspace, &config_home)
+            .load()
+            .expect("settings load");
+        let allowed: crate::AllowedToolSet = ["read_file".to_string(), "bash".to_string()]
+            .into_iter()
+            .collect();
+
+        let context = super::subagent_parent_context_for(
+            "openai/groq/openai/gpt-oss-120b",
+            runtime::PermissionMode::DangerFullAccess,
+            config.feature_config(),
+            Some(&allowed),
+        );
+
+        assert_eq!(context.model, "openai/groq/openai/gpt-oss-120b");
+        assert_eq!(
+            context.permission_mode,
+            runtime::PermissionMode::DangerFullAccess
+        );
+        assert_eq!(context.permission_rules.deny(), ["bash(git push:*)"]);
+        assert_eq!(context.permission_rules.ask(), ["write_file"]);
+        assert_eq!(context.hooks.pre_tool_use(), ["audit-hook"]);
+        assert_eq!(context.allowed_tools.as_ref(), Some(&allowed));
+        assert!(context.client_factory.is_some());
         let _ = fs::remove_dir_all(root);
     }
 

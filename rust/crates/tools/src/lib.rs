@@ -3497,16 +3497,41 @@ const SUBAGENT_UNKNOWN_MODEL_OUTPUT: u32 = 8_192;
 pub type SubagentClientFactory =
     std::sync::Arc<dyn Fn(&str) -> Result<ProviderClient, String> + Send + Sync>;
 
-/// What a sub-agent inherits from the session that spawned it.
+/// What a sub-agent inherits from the session that spawned it. A sub-agent
+/// never runs with more than its parent: the same permission mode, the same
+/// allow/deny/ask rules, the same tool hooks, and at most the parent's tools.
 #[derive(Clone)]
 pub struct SubagentParentContext {
     /// The parent's resolved model id (including any transport prefix).
     pub model: String,
-    /// The parent's permission mode; sub-agents never run with more.
+    /// The parent's permission mode.
     pub permission_mode: PermissionMode,
+    /// The parent's configured permission rules (`permissions.allow/deny/ask`).
+    pub permission_rules: runtime::RuntimePermissionRuleConfig,
+    /// The parent's `PreToolUse` / `PostToolUse` hooks (settings and plugins).
+    pub hooks: runtime::RuntimeHookConfig,
+    /// The parent's tool allow-list (`--allowedTools`, plan mode). `None`
+    /// means every tool; a sub-agent's own tool set is intersected with it.
+    pub allowed_tools: Option<BTreeSet<String>>,
     /// Builds provider clients with the parent's credentials. When `None`,
     /// clients are built from the environment.
     pub client_factory: Option<SubagentClientFactory>,
+}
+
+impl SubagentParentContext {
+    /// A parent context with no rules, hooks or tool restrictions beyond the
+    /// permission mode.
+    #[must_use]
+    pub fn new(model: impl Into<String>, permission_mode: PermissionMode) -> Self {
+        Self {
+            model: model.into(),
+            permission_mode,
+            permission_rules: runtime::RuntimePermissionRuleConfig::default(),
+            hooks: runtime::RuntimeHookConfig::default(),
+            allowed_tools: None,
+            client_factory: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for SubagentParentContext {
@@ -3514,6 +3539,9 @@ impl std::fmt::Debug for SubagentParentContext {
         f.debug_struct("SubagentParentContext")
             .field("model", &self.model)
             .field("permission_mode", &self.permission_mode)
+            .field("permission_rules", &self.permission_rules)
+            .field("hooks", &self.hooks)
+            .field("allowed_tools", &self.allowed_tools)
             .field("client_factory", &self.client_factory.is_some())
             .finish()
     }
@@ -3566,6 +3594,45 @@ fn parent_cancellation_token() -> Option<runtime::CancellationToken> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
+}
+
+/// Sub-agents that outlived the `Agent` tool's wait and keep running in the
+/// background, by agent id.
+fn background_subagents() -> &'static std::sync::Mutex<BTreeMap<String, runtime::CancellationToken>>
+{
+    static AGENTS: std::sync::OnceLock<
+        std::sync::Mutex<BTreeMap<String, runtime::CancellationToken>>,
+    > = std::sync::OnceLock::new();
+    AGENTS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+fn track_background_subagent(agent_id: &str, cancel: runtime::CancellationToken) {
+    background_subagents()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(agent_id.to_string(), cancel);
+}
+
+fn forget_background_subagent(agent_id: &str) {
+    background_subagents()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(agent_id);
+}
+
+/// Asks every sub-agent still running in the background (after the `Agent`
+/// tool stopped waiting for it) to stop. The CLI calls this on Ctrl-C and
+/// when the session ends. Returns how many were signalled.
+pub fn cancel_background_subagents() -> usize {
+    let agents = std::mem::take(
+        &mut *background_subagents()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    for cancel in agents.values() {
+        cancel.cancel();
+    }
+    agents.len()
 }
 
 /// The `Agent` tool result: the manifest plus the sub-agent's final text.
@@ -3629,10 +3696,12 @@ fn wait_for_agent(
                     );
                 }
                 if Instant::now() >= deadline {
+                    // Still reachable by Ctrl-C and session end.
+                    track_background_subagent(&manifest.agent_id, child_cancel.clone());
                     break (
                         None,
                         Some(format!(
-                            "Sub-agent still running after {}s; it continues in the background. Read {} later for its result.",
+                            "Sub-agent still running after {}s; it continues in the background until it finishes, the user presses Ctrl-C, or the session ends. Read {} later for its result.",
                             timeout.as_secs(),
                             manifest.output_file
                         )),
@@ -3692,7 +3761,12 @@ where
         .unwrap_or_else(|| slugify_agent_name(&input.description));
     let created_at = iso8601_now();
     let system_prompt = build_agent_system_prompt(&normalized_subagent_type)?;
-    let allowed_tools = allowed_tools_for_subagent(&normalized_subagent_type);
+    let allowed_tools = restrict_to_parent_tools(
+        allowed_tools_for_subagent(&normalized_subagent_type),
+        subagent_parent_context()
+            .and_then(|context| context.allowed_tools)
+            .as_ref(),
+    );
 
     let output_contents = format!(
         "# Agent Task
@@ -3789,6 +3863,7 @@ fn spawn_agent_job_with_completion(
                     }
                 }
             };
+            forget_background_subagent(&job.manifest.agent_id);
             if let Some(completion) = completion {
                 let _ = completion.send(report);
             }
@@ -3833,28 +3908,68 @@ fn build_agent_runtime(
         .model
         .clone()
         .unwrap_or_else(|| resolve_agent_model(None));
-    let allowed_tools = job.allowed_tools.clone();
+    let api_client = SubagentApiClient::new(&model, job.allowed_tools.clone())?;
+    Ok(assemble_agent_runtime(
+        api_client,
+        &model,
+        job.allowed_tools.clone(),
+        job.system_prompt.clone(),
+    ))
+}
+
+/// Wires a sub-agent runtime around `api_client` with the inherited
+/// permission policy, hooks and tool set.
+fn assemble_agent_runtime<C: ApiClient>(
+    api_client: C,
+    model: &str,
+    allowed_tools: BTreeSet<String>,
+    system_prompt: Vec<String>,
+) -> ConversationRuntime<C, SubagentToolExecutor> {
     let tool_schema_tokens = subagent_tool_schema_tokens(&allowed_tools);
-    let api_client = SubagentApiClient::new(&model, allowed_tools.clone())?;
     let permission_policy = agent_permission_policy();
     let tool_executor = SubagentToolExecutor::new(allowed_tools)
         .with_enforcer(PermissionEnforcer::new(permission_policy.clone()));
     let context_manager = runtime::context_manager::ContextManager::new(
         runtime::context_manager::ContextBudget::for_model(
-            &model,
-            subagent_max_tokens(&model),
+            model,
+            subagent_max_tokens(model),
             tool_schema_tokens,
         ),
         runtime::context_manager::ContextPolicy::from_env(),
     );
-    Ok(ConversationRuntime::new(
+    ConversationRuntime::new_with_features(
         Session::new(),
         api_client,
         tool_executor,
         permission_policy,
-        job.system_prompt.clone(),
+        system_prompt,
+        &subagent_feature_config(),
     )
-    .with_context_manager(context_manager))
+    .with_context_manager(context_manager)
+}
+
+/// Runtime features a sub-agent inherits: the parent's tool hooks, so
+/// security hooks also see sub-agent tool calls.
+fn subagent_feature_config() -> runtime::RuntimeFeatureConfig {
+    runtime::RuntimeFeatureConfig::default().with_hooks(
+        subagent_parent_context()
+            .map(|context| context.hooks)
+            .unwrap_or_default(),
+    )
+}
+
+/// A sub-agent's tools, limited to the parent's allow-list when it has one.
+fn restrict_to_parent_tools(
+    tools: BTreeSet<String>,
+    parent_allowed: Option<&BTreeSet<String>>,
+) -> BTreeSet<String> {
+    match parent_allowed {
+        Some(parent_allowed) => tools
+            .into_iter()
+            .filter(|tool| parent_allowed.contains(tool))
+            .collect(),
+        None => tools,
+    }
 }
 
 /// `max_tokens` for sub-agent requests, from the shared capability registry
@@ -3999,15 +4114,26 @@ impl ApiClient for SubagentApiClient {
                     );
                     last_error = Some(error);
                 }
-                Some(Err(error)) => return Err(RuntimeError::new(error.to_string())),
+                Some(Err(error)) => return Err(subagent_api_error(&error)),
             }
         }
 
-        Err(RuntimeError::new(last_error.map_or_else(
-            || String::from("provider chain exhausted with no attempts"),
-            |error| error.to_string(),
-        )))
+        Err(last_error.map_or_else(
+            || RuntimeError::new("provider chain exhausted with no attempts"),
+            |error| subagent_api_error(&error),
+        ))
     }
+}
+
+/// Keeps a context-window rejection typed so the sub-agent runtime can
+/// shrink its context and retry once.
+fn subagent_api_error(error: &ApiError) -> RuntimeError {
+    let kind = if error.is_context_window_failure() {
+        runtime::RuntimeErrorKind::ContextWindowExceeded
+    } else {
+        runtime::RuntimeErrorKind::Other
+    };
+    RuntimeError::with_kind(kind, error.to_string())
 }
 
 fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String> {
@@ -4129,31 +4255,45 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
     tools.into_iter().map(str::to_string).collect()
 }
 
-/// Permission policy for sub-agents: the parent's permission mode, never
-/// more. Without a registered parent the sub-agent is read-only.
+/// Permission policy for sub-agents: the parent's permission mode and its
+/// allow/deny/ask rules, never more. Without a registered parent the
+/// sub-agent is read-only.
 fn agent_permission_policy() -> PermissionPolicy {
-    agent_permission_policy_for(
-        subagent_parent_context()
-            .map_or(PermissionMode::ReadOnly, |context| context.permission_mode),
-    )
+    match subagent_parent_context() {
+        Some(context) => {
+            agent_permission_policy_for(context.permission_mode, &context.permission_rules)
+        }
+        None => agent_permission_policy_for(
+            PermissionMode::ReadOnly,
+            &runtime::RuntimePermissionRuleConfig::default(),
+        ),
+    }
 }
 
-fn agent_permission_policy_for(mode: PermissionMode) -> PermissionPolicy {
-    mvp_tool_specs()
-        .into_iter()
-        .fold(PermissionPolicy::new(mode), |policy, spec| {
-            policy.with_tool_requirement(spec.name, spec.required_permission)
-        })
+fn agent_permission_policy_for(
+    mode: PermissionMode,
+    rules: &runtime::RuntimePermissionRuleConfig,
+) -> PermissionPolicy {
+    mvp_tool_specs().into_iter().fold(
+        PermissionPolicy::new(mode).with_permission_rules(rules),
+        |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
+    )
 }
 
 #[cfg(test)]
 mod subagent_inheritance_tests {
     use super::{
-        agent_permission_policy, clear_subagent_parent_context, resolve_agent_model,
-        set_subagent_parent_context, subagent_max_tokens, wait_for_agent, workspace_agent_store,
-        AgentCompletion, AgentOutput, SubagentParentContext,
+        agent_permission_policy, assemble_agent_runtime, cancel_background_subagents,
+        clear_subagent_parent_context, resolve_agent_model, restrict_to_parent_tools,
+        set_subagent_parent_context, subagent_api_error, subagent_feature_config,
+        subagent_max_tokens, wait_for_agent, workspace_agent_store, AgentCompletion, AgentOutput,
+        SubagentParentContext,
     };
-    use runtime::{CancellationToken, PermissionMode};
+    use runtime::{
+        ApiClient, ApiRequest, AssistantEvent, CancellationToken, ContentBlock, PermissionMode,
+        RuntimeError, RuntimeErrorKind, RuntimeHookConfig, RuntimePermissionRuleConfig,
+    };
+    use std::collections::BTreeSet;
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::Duration;
 
@@ -4165,11 +4305,162 @@ mod subagent_inheritance_tests {
     }
 
     fn register_parent(model: &str, permission_mode: PermissionMode) {
+        set_subagent_parent_context(SubagentParentContext::new(model, permission_mode));
+    }
+
+    fn tools(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(ToString::to_string).collect()
+    }
+
+    /// Requests one tool call, then answers with text.
+    struct OneToolCallApi {
+        tool: &'static str,
+        input: String,
+        calls: usize,
+    }
+
+    impl ApiClient for OneToolCallApi {
+        fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            self.calls += 1;
+            Ok(if self.calls == 1 {
+                vec![
+                    AssistantEvent::ToolUse {
+                        id: "child-1".to_string(),
+                        name: self.tool.to_string(),
+                        input: self.input.clone(),
+                    },
+                    AssistantEvent::MessageStop,
+                ]
+            } else {
+                vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ]
+            })
+        }
+    }
+
+    /// Runs one sub-agent turn that makes a single tool call and returns
+    /// that call's `(output, is_error)`.
+    fn run_child_tool_call(tool: &'static str, input: &str) -> (String, bool) {
+        let mut runtime = assemble_agent_runtime(
+            OneToolCallApi {
+                tool,
+                input: input.to_string(),
+                calls: 0,
+            },
+            "openai/auto",
+            tools(&[tool]),
+            vec!["system".to_string()],
+        );
+        let summary = runtime.run_turn("delegated", None).expect("child turn");
+        let ContentBlock::ToolResult {
+            output, is_error, ..
+        } = &summary.tool_results[0].blocks[0]
+        else {
+            panic!("expected a tool result");
+        };
+        (output.clone(), *is_error)
+    }
+
+    #[test]
+    fn parent_deny_rules_block_the_same_call_inside_a_subagent() {
+        let _guard = parent_context_lock();
+        // Even with the parent in danger-full-access (where Agent runs
+        // without a prompt), its deny rules still apply to the child.
         set_subagent_parent_context(SubagentParentContext {
-            model: model.to_string(),
-            permission_mode,
-            client_factory: None,
+            permission_rules: RuntimePermissionRuleConfig::new(
+                Vec::new(),
+                vec!["bash(echo neuron-subagent-deny:*)".to_string()],
+                Vec::new(),
+            ),
+            ..SubagentParentContext::new("openai/auto", PermissionMode::DangerFullAccess)
         });
+
+        let policy = agent_permission_policy();
+        assert!(matches!(
+            policy.authorize(
+                "bash",
+                r#"{"command":"echo neuron-subagent-deny now"}"#,
+                None
+            ),
+            runtime::PermissionOutcome::Deny { .. }
+        ));
+        assert_eq!(
+            policy.authorize("bash", r#"{"command":"echo fine"}"#, None),
+            runtime::PermissionOutcome::Allow
+        );
+
+        let (output, is_error) =
+            run_child_tool_call("bash", r#"{"command":"echo neuron-subagent-deny now"}"#);
+        clear_subagent_parent_context();
+        assert!(is_error);
+        assert!(output.contains("denied by rule"), "{output}");
+    }
+
+    #[test]
+    fn parent_hooks_run_for_subagent_tool_calls() {
+        let _guard = parent_context_lock();
+        let hooks = RuntimeHookConfig::new(vec!["exit 2".to_string()], Vec::new(), Vec::new());
+        set_subagent_parent_context(SubagentParentContext {
+            hooks: hooks.clone(),
+            ..SubagentParentContext::new("openai/auto", PermissionMode::DangerFullAccess)
+        });
+        assert_eq!(subagent_feature_config().hooks(), &hooks);
+
+        let (output, is_error) = run_child_tool_call("read_file", r#"{"path":"Cargo.toml"}"#);
+        clear_subagent_parent_context();
+        assert!(is_error);
+        assert!(output.contains("PreToolUse hook denied"), "{output}");
+    }
+
+    #[test]
+    fn subagent_tools_never_exceed_the_parent_allow_list() {
+        let general = super::allowed_tools_for_subagent("general-purpose");
+        assert!(general.contains("bash") && general.contains("write_file"));
+
+        let parent = tools(&["read_file", "grep_search", "Agent"]);
+        assert_eq!(
+            restrict_to_parent_tools(general.clone(), Some(&parent)),
+            tools(&["grep_search", "read_file"])
+        );
+        assert_eq!(restrict_to_parent_tools(general.clone(), None), general);
+    }
+
+    #[test]
+    fn subagent_context_overflow_errors_stay_typed() {
+        let overflow = subagent_api_error(&api::ApiError::ContextWindowExceeded {
+            model: "m".to_string(),
+            estimated_input_tokens: 10,
+            requested_output_tokens: 10,
+            estimated_total_tokens: 20,
+            context_window_tokens: 15,
+        });
+        assert_eq!(overflow.kind(), RuntimeErrorKind::ContextWindowExceeded);
+        let other = subagent_api_error(&api::ApiError::Io(std::io::Error::other("reset")));
+        assert_eq!(other.kind(), RuntimeErrorKind::Other);
+    }
+
+    #[test]
+    fn timed_out_subagents_can_be_cancelled_later() {
+        let dir = std::env::temp_dir();
+        let (_pending_tx, pending_rx) = std::sync::mpsc::channel::<AgentCompletion>();
+        let child = CancellationToken::new();
+        let mut timed_out_manifest = manifest(&dir);
+        timed_out_manifest.agent_id = "agent-background-test".to_string();
+
+        let timed_out = wait_for_agent(
+            timed_out_manifest,
+            &pending_rx,
+            Duration::from_millis(10),
+            None,
+            &child,
+        );
+        assert!(timed_out.result.is_none());
+        assert!(!child.is_cancelled(), "a timeout leaves it running");
+
+        assert!(cancel_background_subagents() >= 1);
+        assert!(child.is_cancelled(), "Ctrl-C or session end stops it");
     }
 
     #[test]
