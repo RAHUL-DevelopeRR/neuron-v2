@@ -3710,4 +3710,81 @@ mod tests {
         // Cleanup
         let _ = fs::remove_dir_all(base_dir);
     }
+
+    /// A plugin tool that runs `script` through the platform shell.
+    fn shell_plugin_tool(script: &str) -> PluginTool {
+        let (command, mut args) = if cfg!(windows) {
+            ("cmd.exe", vec!["/D".to_string(), "/C".to_string()])
+        } else {
+            ("sh", vec!["-c".to_string()])
+        };
+        args.push(script.to_string());
+        PluginTool::new(
+            "shell-demo@external",
+            "shell-demo",
+            PluginToolDefinition {
+                name: "shell_demo".to_string(),
+                description: None,
+                input_schema: serde_json::json!({ "type": "object" }),
+            },
+            command,
+            args,
+            PluginToolPermission::ReadOnly,
+            None,
+        )
+    }
+
+    #[test]
+    fn plugin_tools_time_out_and_their_process_tree_is_terminated() {
+        assert_eq!(
+            subprocess::DEFAULT_PLUGIN_TOOL_TIMEOUT,
+            std::time::Duration::from_secs(120)
+        );
+        assert_eq!(
+            subprocess::DEFAULT_HOOK_TIMEOUT,
+            std::time::Duration::from_secs(60)
+        );
+        let tool = shell_plugin_tool(if cfg!(windows) {
+            "ping -n 30 127.0.0.1 >NUL & echo late"
+        } else {
+            "sleep 30; echo late"
+        });
+        let started = std::time::Instant::now();
+        let error = tool
+            .execute_with_timeout(
+                &serde_json::json!({}),
+                std::time::Duration::from_millis(300),
+            )
+            .expect_err("a plugin tool that outlives its timeout must fail");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "the plugin tool must be killed promptly, took {:?}",
+            started.elapsed()
+        );
+        let message = error.to_string();
+        assert!(message.contains("timed out after 300 ms"), "{message}");
+        assert!(message.contains("shell_demo"), "{message}");
+    }
+
+    #[test]
+    fn plugin_tools_do_not_inherit_zero_x_credentials() {
+        let _guard = env_guard();
+        std::env::set_var("NEURON_TOKEN", "nzx_plugin_tool_token");
+        std::env::set_var("PLUGINS_TOOL_SCRUB_SESSION", "ses_plugin_tool_session");
+        std::env::set_var("PLUGINS_TOOL_SCRUB_KEEP", "keep-me");
+        let tool = shell_plugin_tool(if cfg!(windows) {
+            "echo token=%NEURON_TOKEN% session=%PLUGINS_TOOL_SCRUB_SESSION% keep=%PLUGINS_TOOL_SCRUB_KEEP%"
+        } else {
+            "echo token=${NEURON_TOKEN:-unset} session=${PLUGINS_TOOL_SCRUB_SESSION:-unset} keep=$PLUGINS_TOOL_SCRUB_KEEP"
+        });
+        let output = tool.execute(&serde_json::json!({}));
+        std::env::remove_var("NEURON_TOKEN");
+        std::env::remove_var("PLUGINS_TOOL_SCRUB_SESSION");
+        std::env::remove_var("PLUGINS_TOOL_SCRUB_KEEP");
+
+        let output = output.expect("plugin tool runs");
+        assert!(!output.contains("nzx_plugin_tool_token"), "{output}");
+        assert!(!output.contains("ses_plugin_tool_session"), "{output}");
+        assert!(output.contains("keep=keep-me"), "{output}");
+    }
 }

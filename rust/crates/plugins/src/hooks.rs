@@ -529,6 +529,36 @@ mod tests {
     }
 
     #[test]
+    fn plugin_hooks_do_not_inherit_zero_x_credentials() {
+        let _guard = crate::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("NEURON_SESSION_TOKEN", "ses_plugin_hook_session");
+        std::env::set_var("PLUGINS_HOOK_SCRUB_KEY", "nzx_plugin_hook_key");
+        std::env::set_var("PLUGINS_HOOK_SCRUB_KEEP", "keep-me");
+        #[cfg(windows)]
+        let hook = "echo session=%NEURON_SESSION_TOKEN% key=%PLUGINS_HOOK_SCRUB_KEY% keep=%PLUGINS_HOOK_SCRUB_KEEP%";
+        #[cfg(not(windows))]
+        let hook = "printf 'session=%s key=%s keep=%s' \"${NEURON_SESSION_TOKEN:-unset}\" \"${PLUGINS_HOOK_SCRUB_KEY:-unset}\" \"$PLUGINS_HOOK_SCRUB_KEEP\"";
+        let runner = HookRunner::new(crate::PluginHooks {
+            pre_tool_use: vec![hook.to_string()],
+            post_tool_use: Vec::new(),
+            post_tool_use_failure: Vec::new(),
+        });
+
+        let result = runner.run_pre_tool_use("Bash", r#"{"command":"pwd"}"#);
+        std::env::remove_var("NEURON_SESSION_TOKEN");
+        std::env::remove_var("PLUGINS_HOOK_SCRUB_KEY");
+        std::env::remove_var("PLUGINS_HOOK_SCRUB_KEEP");
+
+        let output = result.messages().join("\n");
+        assert!(!result.is_failed(), "{output}");
+        assert!(!output.contains("ses_plugin_hook_session"), "{output}");
+        assert!(!output.contains("nzx_plugin_hook_key"), "{output}");
+        assert!(output.contains("keep=keep-me"), "{output}");
+    }
+
+    #[test]
     #[cfg(unix)]
     fn generated_hook_scripts_are_executable() {
         use std::os::unix::fs::PermissionsExt;
