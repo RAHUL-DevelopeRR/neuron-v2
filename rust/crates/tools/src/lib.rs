@@ -2821,6 +2821,7 @@ fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
     let started = Instant::now();
     let request_url = normalize_fetch_url(&input.url)?;
     let request_url = reqwest::Url::parse(&request_url).map_err(|error| error.to_string())?;
+    web_fetch::ensure_gated_host(&input.url, &request_url)?;
     let page = web_fetch::fetch(request_url)?;
 
     let code = page.status.as_u16();

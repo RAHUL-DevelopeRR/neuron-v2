@@ -276,6 +276,10 @@ fn web_fetch_refuses_local_private_and_non_http_targets() {
         "http://192.168.1.1/",
         "http://2130706433/",
         "file:///etc/passwd",
+        // Spellings whose fetched host could differ from the approved one.
+        "https://docs%2Ers/guide",
+        "https:docs.rs/",
+        "https:\\\\docs.rs/",
     ] {
         let error = execute_tool("WebFetch", &json!({ "url": url, "prompt": "read" }))
             .expect_err("local targets must be refused");

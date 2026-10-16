@@ -188,6 +188,35 @@ pub(crate) fn validate_fetch_target(url: &Url) -> Result<Vec<SocketAddr>, String
     }
 }
 
+/// Refuses `url` (parsed from `raw`, the URL the model asked for) when the
+/// host it would be fetched from differs from the host the permission gate
+/// judged ([`runtime::url_host`], which approves domains per session). The
+/// two parsers agree on ordinary URLs; on unusual spellings (backslashes,
+/// percent-encoded or internationalized hosts, numeric IPv4 forms, missing
+/// slashes) a request must not reach a host other than the approved one.
+pub(crate) fn ensure_gated_host(raw: &str, url: &Url) -> Result<(), String> {
+    if !matches!(url.scheme(), "http" | "https") {
+        // Refused by `validate_fetch_target` with a clearer message.
+        return Ok(());
+    }
+    let fetched = url.host_str().map(|host| {
+        host.strip_prefix('[')
+            .and_then(|inner| inner.strip_suffix(']'))
+            .unwrap_or(host)
+            .to_ascii_lowercase()
+    });
+    let gated = runtime::url_host(raw);
+    if gated.is_some() && gated == fetched {
+        return Ok(());
+    }
+    Err(format!(
+        "WebFetch refused `{raw}`: the host it would be fetched from (`{}`) is not the host the URL appears to name (`{}`). Retry with a plain URL such as https://{}/path",
+        fetched.as_deref().unwrap_or("none"),
+        gated.as_deref().unwrap_or("none"),
+        fetched.as_deref().unwrap_or("example.com"),
+    ))
+}
+
 enum UrlHost<'a> {
     Ip(IpAddr),
     Domain(&'a str),
@@ -533,8 +562,8 @@ pub(crate) fn bound_text(text: &str) -> (String, Option<usize>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        blocked_address_reason, bound_text, decode_entities, html_to_readable_text,
-        is_binary_content_type, validate_fetch_target, MAX_FETCH_TEXT_CHARS,
+        blocked_address_reason, bound_text, decode_entities, ensure_gated_host,
+        html_to_readable_text, is_binary_content_type, validate_fetch_target, MAX_FETCH_TEXT_CHARS,
     };
     use reqwest::Url;
     use std::net::IpAddr;
@@ -597,6 +626,44 @@ mod tests {
             .expect_err("file")
             .contains("not `file:`"));
         assert!(check("http://8.8.8.8/").is_ok());
+    }
+
+    #[test]
+    fn fetched_host_must_be_the_gated_host() {
+        let check = |raw: &str| ensure_gated_host(raw, &Url::parse(raw).expect("url"));
+        // The permission gate and the URL parser agree on the host.
+        assert_eq!(
+            runtime::url_host("https://other.example.net\\@docs.example.org/").as_deref(),
+            Some("other.example.net")
+        );
+        assert_eq!(
+            Url::parse("https://other.example.net\\@docs.example.org/")
+                .expect("url")
+                .host_str(),
+            Some("other.example.net")
+        );
+        assert!(check("https://other.example.net\\@docs.example.org/").is_ok());
+        for raw in [
+            "https://docs.example.org/guide?q=1",
+            "http://user:pw@docs.example.org:8080/x",
+            "HTTPS://Docs.Example.ORG/",
+            "https://docs.exa\tmple.org/",
+            "https://[2606:4700::6810:84e5]/",
+            "https://8.8.8.8/",
+        ] {
+            assert!(check(raw).is_ok(), "{raw}");
+        }
+        // Spellings where the two could disagree are refused.
+        for raw in [
+            "https://docs%2Eexample.org/",
+            "https://b\u{fc}cher.example/",
+            "https://134744072/",
+            "https:docs.example.org/",
+            "https:\\\\other.example.net/",
+        ] {
+            let error = check(raw).expect_err(raw);
+            assert!(error.contains("WebFetch refused"), "{raw}: {error}");
+        }
     }
 
     #[test]

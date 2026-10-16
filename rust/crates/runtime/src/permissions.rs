@@ -810,14 +810,26 @@ fn protected_config_reason(path: &str) -> Option<String> {
 }
 
 /// Host of an `http(s)` URL, lowercased and without port or credentials.
+///
+/// Follows the WHATWG URL rules that the fetcher's parser applies, so the
+/// host approved here is the host that is fetched: tabs and newlines are
+/// dropped, leading and trailing control characters and spaces are
+/// trimmed, and `\` ends the authority like `/` does
+/// (`https://a.example\@b.example/` is a request to `a.example`).
+/// `WebFetch` additionally refuses a URL whose parsed host differs from this
+/// one (for example percent-encoded or internationalized host names).
 #[must_use]
 pub fn url_host(url: &str) -> Option<String> {
-    let trimmed = url.trim();
-    let lowered = trimmed.to_ascii_lowercase();
+    let cleaned: String = url
+        .trim_matches(|ch: char| ch <= ' ')
+        .chars()
+        .filter(|ch| !matches!(ch, '\t' | '\n' | '\r'))
+        .collect();
+    let lowered = cleaned.to_ascii_lowercase();
     let rest = lowered
         .strip_prefix("https://")
         .or_else(|| lowered.strip_prefix("http://"))?;
-    let authority = rest.split(['/', '?', '#']).next()?;
+    let authority = rest.split(['/', '\\', '?', '#']).next()?;
     let host_port = authority.rsplit('@').next()?;
     let host = if let Some(bracketed) = host_port.strip_prefix('[') {
         bracketed.split(']').next()?.to_string()
@@ -1554,6 +1566,20 @@ mod tests {
             1,
             "approved domain must not prompt again"
         );
+        // `\` ends the authority, as in the fetcher's URL parser, so this
+        // names other.example.net, which has not been approved.
+        assert!(matches!(
+            policy.authorize(
+                "WebFetch",
+                &fetch("https://other.example.net\\@docs.rs/"),
+                Some(&mut prompter)
+            ),
+            PermissionOutcome::Deny { .. }
+        ));
+        assert_eq!(
+            prompter.seen[1].session_prefixes,
+            vec!["other.example.net".to_string()]
+        );
         assert!(matches!(
             policy.authorize(
                 "WebFetch",
@@ -1704,6 +1730,19 @@ mod tests {
             Some("example.com")
         );
         assert_eq!(url_host("https://[::1]:3000/").as_deref(), Some("::1"));
+        // WHATWG URL rules, as the fetcher applies them.
+        assert_eq!(
+            url_host("https://other.example.net\\@docs.example.org/").as_deref(),
+            Some("other.example.net")
+        );
+        assert_eq!(
+            url_host("https://a@b@docs.example.org/").as_deref(),
+            Some("docs.example.org")
+        );
+        assert_eq!(
+            url_host("  https://docs.exa\tmple.org\n/x ").as_deref(),
+            Some("docs.example.org")
+        );
         assert_eq!(url_host("file:///etc/passwd"), None);
         assert_eq!(url_host("ftp://example.com"), None);
     }
