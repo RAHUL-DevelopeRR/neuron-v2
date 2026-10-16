@@ -38,7 +38,9 @@ pub use providers::{
     model_token_limit, preflight_message_request, resolve_model_alias, ModelTokenLimit,
     ProviderKind,
 };
-pub use retry::{RetryNotice, RetryObserver, MAX_TOTAL_BACKOFF};
+pub use retry::{
+    RetryNotice, RetryObserver, CAPACITY_MAX_WAIT, CAPACITY_TOTAL_BACKOFF, MAX_TOTAL_BACKOFF,
+};
 pub use sse::{parse_frame, SseParser};
 pub use types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,

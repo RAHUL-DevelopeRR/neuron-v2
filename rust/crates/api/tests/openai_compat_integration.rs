@@ -181,10 +181,186 @@ async fn retry_after_longer_than_the_budget_ends_retries_immediately() {
     let error = gateway_client(server.base_url(), observer)
         .send_message(&sample_request(false))
         .await
-        .expect_err("a 120s Retry-After does not fit the 60s budget");
+        .expect_err("a 120s Retry-After exceeds the 90s capacity wait cap");
 
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
     assert!(error.to_string().contains("retry in 120s"), "{error}");
+    assert_eq!(state.lock().await.len(), 1);
+    assert!(notices.lock().unwrap().is_empty());
+}
+
+type Recorded<T> = Arc<StdMutex<Vec<T>>>;
+
+fn counting_observer() -> (
+    RetryObserver,
+    Recorded<RetryNotice>,
+    Recorded<std::time::Duration>,
+) {
+    let (observer, notices) = recording_observer();
+    let ticks = Arc::new(StdMutex::new(Vec::new()));
+    let sink = Arc::clone(&ticks);
+    let observer = observer.with_countdown(move |_, remaining| {
+        sink.lock().unwrap().push(remaining);
+    });
+    (observer, notices, ticks)
+}
+
+fn gateway_error_reply(status: &str, code: &str, retry_after: u64) -> String {
+    let body = json!({"error": {
+        "message": format!("gateway says {code}"),
+        "type": "server_error",
+        "code": code,
+        "retry_after_seconds": retry_after,
+    }})
+    .to_string();
+    http_response_with_headers(
+        status,
+        "application/json",
+        &body,
+        &[("retry-after", &retry_after.to_string())],
+    )
+}
+
+/// Zero-X capacity waits get their own budget: the standard one here is
+/// too small for even one wait, yet both shared-pool waits are honoured
+/// (scaled down from the real 90 s per wait / 180 s total).
+#[tokio::test]
+async fn zero_x_capacity_waits_use_the_capacity_budget_and_count_down() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let server = spawn_server(
+        state.clone(),
+        vec![
+            gateway_error_reply("503 Service Unavailable", "capacity_exhausted", 2),
+            gateway_error_reply("429 Too Many Requests", "rate_limited", 1),
+            http_response("200 OK", "application/json", COMPLETION_BODY),
+        ],
+    )
+    .await;
+    let (observer, notices, ticks) = counting_observer();
+    let client = gateway_client(server.base_url(), observer)
+        .with_max_total_backoff(std::time::Duration::from_millis(500))
+        .with_capacity_retry_budget(
+            std::time::Duration::from_millis(2_500),
+            std::time::Duration::from_millis(3_500),
+        );
+
+    let started = std::time::Instant::now();
+    client
+        .send_message(&sample_request(false))
+        .await
+        .expect("both capacity waits fit the capacity budget");
+
+    assert!(started.elapsed() >= std::time::Duration::from_secs(3));
+    assert_eq!(state.lock().await.len(), 3);
+    let notices = notices.lock().unwrap().clone();
+    let delays = notices
+        .iter()
+        .map(|notice| notice.delay)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        delays,
+        vec![
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(1)
+        ]
+    );
+    assert_eq!(notices[0].reason, "capacity_exhausted");
+    assert_eq!(notices[1].reason, "rate_limited");
+    // One countdown tick per second of waiting, ending at zero each time.
+    assert_eq!(
+        *ticks.lock().unwrap(),
+        vec![
+            std::time::Duration::from_secs(1),
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO
+        ]
+    );
+}
+
+#[tokio::test]
+async fn capacity_budget_applies_only_to_zero_x_capacity_waits() {
+    let short = std::time::Duration::from_millis(500);
+    let wait_cap = std::time::Duration::from_millis(1_500);
+    let total = std::time::Duration::from_millis(10_000);
+
+    // A capacity wait longer than the per-wait cap ends the retries.
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let server = spawn_server(
+        state.clone(),
+        vec![
+            gateway_error_reply("503 Service Unavailable", "capacity_exhausted", 2),
+            http_response("200 OK", "application/json", COMPLETION_BODY),
+        ],
+    )
+    .await;
+    let (observer, notices) = recording_observer();
+    gateway_client(server.base_url(), observer)
+        .with_max_total_backoff(short)
+        .with_capacity_retry_budget(wait_cap, total)
+        .send_message(&sample_request(false))
+        .await
+        .expect_err("a 2s wait exceeds the 1.5s cap");
+    assert_eq!(state.lock().await.len(), 1);
+    assert!(notices.lock().unwrap().is_empty());
+
+    // Other transient gateway errors keep the standard budget.
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let server = spawn_server(
+        state.clone(),
+        vec![
+            gateway_error_reply("502 Bad Gateway", "upstream_error", 1),
+            http_response("200 OK", "application/json", COMPLETION_BODY),
+        ],
+    )
+    .await;
+    let (observer, notices) = recording_observer();
+    gateway_client(server.base_url(), observer)
+        .with_max_total_backoff(short)
+        .with_capacity_retry_budget(wait_cap, total)
+        .send_message(&sample_request(false))
+        .await
+        .expect_err("upstream_error keeps the 0.5s standard budget");
+    assert_eq!(state.lock().await.len(), 1);
+    assert!(notices.lock().unwrap().is_empty());
+
+    // Terminal codes are never retried, whatever the budget.
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let server = spawn_server(
+        state.clone(),
+        vec![
+            gateway_error_reply("429 Too Many Requests", "insufficient_quota", 1),
+            http_response("200 OK", "application/json", COMPLETION_BODY),
+        ],
+    )
+    .await;
+    let (observer, notices) = recording_observer();
+    gateway_client(server.base_url(), observer)
+        .with_capacity_retry_budget(wait_cap, total)
+        .send_message(&sample_request(false))
+        .await
+        .expect_err("insufficient_quota is final");
+    assert_eq!(state.lock().await.len(), 1);
+    assert!(notices.lock().unwrap().is_empty());
+
+    // Other providers keep the standard budget for rate limits.
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let server = spawn_server(
+        state.clone(),
+        vec![
+            gateway_error_reply("429 Too Many Requests", "rate_limited", 1),
+            http_response("200 OK", "application/json", COMPLETION_BODY),
+        ],
+    )
+    .await;
+    let (observer, notices) = recording_observer();
+    OpenAiCompatClient::new("sk-test", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url())
+        .with_max_total_backoff(short)
+        .with_capacity_retry_budget(wait_cap, total)
+        .with_retry_observer(Some(observer))
+        .send_message(&sample_request(false))
+        .await
+        .expect_err("OpenAI keeps the standard budget");
     assert_eq!(state.lock().await.len(), 1);
     assert!(notices.lock().unwrap().is_empty());
 }

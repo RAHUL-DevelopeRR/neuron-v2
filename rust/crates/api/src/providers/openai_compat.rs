@@ -10,7 +10,8 @@ use serde_json::{json, Value};
 use crate::error::{ApiError, GatewayError, GatewayErrorCode};
 use crate::http_client::build_http_client_or_default;
 use crate::retry::{
-    plan_retry_delay, retry_after_from_headers, RetryNotice, RetryObserver, MAX_TOTAL_BACKOFF,
+    retry_after_from_headers, RetryBudget, RetryNotice, RetryObserver, CAPACITY_MAX_WAIT,
+    CAPACITY_TOTAL_BACKOFF, MAX_TOTAL_BACKOFF,
 };
 use crate::types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
@@ -246,6 +247,8 @@ pub struct OpenAiCompatClient {
     initial_backoff: Duration,
     max_backoff: Duration,
     max_total_backoff: Duration,
+    /// Budget for Zero-X `capacity_exhausted` / `rate_limited` waits.
+    capacity_budget: RetryBudget,
     retry_observer: Option<RetryObserver>,
     usage_observer: Option<UsageObserver>,
 }
@@ -289,6 +292,10 @@ impl OpenAiCompatClient {
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
             max_total_backoff: MAX_TOTAL_BACKOFF,
+            capacity_budget: RetryBudget {
+                total: CAPACITY_TOTAL_BACKOFF,
+                max_wait: Some(CAPACITY_MAX_WAIT),
+            },
             retry_observer: Some(RetryObserver::stderr()),
             usage_observer: None,
         }
@@ -336,6 +343,19 @@ impl OpenAiCompatClient {
     #[must_use]
     pub fn with_max_total_backoff(mut self, max_total_backoff: Duration) -> Self {
         self.max_total_backoff = max_total_backoff;
+        self
+    }
+
+    /// Replaces the budget for Zero-X `capacity_exhausted` and
+    /// `rate_limited` waits (default: each `Retry-After` up to
+    /// [`CAPACITY_MAX_WAIT`], [`CAPACITY_TOTAL_BACKOFF`] in total). Other
+    /// failures and other providers keep [`Self::with_max_total_backoff`].
+    #[must_use]
+    pub fn with_capacity_retry_budget(mut self, max_wait: Duration, total: Duration) -> Self {
+        self.capacity_budget = RetryBudget {
+            total,
+            max_wait: Some(max_wait),
+        };
         self
     }
 
@@ -414,7 +434,9 @@ impl OpenAiCompatClient {
     /// Sends `request`, retrying transient failures. Non-retryable errors
     /// (quota, credits, plan, region, suspension, invalid session, bad
     /// request) return immediately. `Retry-After` is honoured and the total
-    /// sleep across retries never exceeds `max_total_backoff`.
+    /// sleep across retries never exceeds `max_total_backoff`, except while
+    /// the Zero-X gateway reports `capacity_exhausted` or `rate_limited`,
+    /// which uses the larger capacity budget.
     async fn send_with_retry(
         &self,
         request: &MessageRequest,
@@ -449,20 +471,26 @@ impl OpenAiCompatClient {
             }
             let retry_after = failure.retry_after.or_else(|| failure.error.retry_after());
             let backoff = self.jittered_backoff_for_attempt(attempts)?;
-            let Some(delay) = plan_retry_delay(retry_after, backoff, slept, self.max_total_backoff)
+            let Some(delay) =
+                self.retry_budget_for(&failure.error)
+                    .plan(retry_after, backoff, slept)
             else {
                 return Err(exhausted(failure.error));
             };
-            if let Some(observer) = &self.retry_observer {
-                observer.notify(&RetryNotice {
-                    provider: self.config.provider_name.to_string(),
-                    retry: attempts,
-                    max_retries: self.max_retries,
-                    delay,
-                    reason: retry_reason(&failure.error),
-                });
+            let notice = RetryNotice {
+                provider: self.config.provider_name.to_string(),
+                retry: attempts,
+                max_retries: self.max_retries,
+                delay,
+                reason: retry_reason(&failure.error),
+            };
+            match &self.retry_observer {
+                Some(observer) => {
+                    observer.notify(&notice);
+                    observer.wait(&notice, delay).await;
+                }
+                None => tokio::time::sleep(delay).await,
             }
-            tokio::time::sleep(delay).await;
             slept += delay;
         }
     }
@@ -483,6 +511,26 @@ impl OpenAiCompatClient {
             .send()
             .await
             .map_err(ApiError::from)
+    }
+
+    /// The capacity budget for the Zero-X gateway's shared-pool waits
+    /// (`capacity_exhausted`, `rate_limited`); the standard one otherwise.
+    fn retry_budget_for(&self, error: &ApiError) -> RetryBudget {
+        let capacity_wait = self.config.is_zero_x()
+            && error
+                .gateway_error()
+                .and_then(GatewayError::code_kind)
+                .is_some_and(|code| {
+                    matches!(
+                        code,
+                        GatewayErrorCode::CapacityExhausted | GatewayErrorCode::RateLimited
+                    )
+                });
+        if capacity_wait {
+            self.capacity_budget
+        } else {
+            RetryBudget::standard(self.max_total_backoff)
+        }
     }
 
     fn backoff_for_attempt(&self, attempt: u32) -> Result<Duration, ApiError> {
