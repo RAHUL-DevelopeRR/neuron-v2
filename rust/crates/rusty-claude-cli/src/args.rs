@@ -528,9 +528,22 @@ pub(crate) fn removed_auth_surface_error(command_name: &str) -> String {
     )
 }
 
+/// Global flags whose next argument is their value (so it is never mistaken
+/// for a subcommand).
+const VALUE_FLAGS: &[&str] = &[
+    "--model",
+    "--output-format",
+    "--permission-mode",
+    "--base-commit",
+    "--reasoning-effort",
+    "--allowedTools",
+    "--allowed-tools",
+];
+
 /// Removes `--provider <id>` / `--provider=<id>` from `args` and returns the
-/// remaining arguments with the parsed choice. Scanning stops at `-p`,
-/// whose trailing words are prompt text.
+/// remaining arguments with the parsed choice. Scanning stops where prompt
+/// text begins: at `-p`, at a `prompt` subcommand, and at `--`; place
+/// `--provider` before those.
 pub(crate) fn extract_provider_flag(
     args: &[String],
 ) -> Result<(Vec<String>, Option<crate::provider::ProviderId>), String> {
@@ -539,7 +552,8 @@ pub(crate) fn extract_provider_flag(
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
-        if arg == "-p" {
+        let is_flag_value = index > 0 && VALUE_FLAGS.contains(&args[index - 1].as_str());
+        if arg == "-p" || arg == "--" || (arg == "prompt" && !is_flag_value) {
             remaining.extend_from_slice(&args[index..]);
             break;
         }
@@ -1101,10 +1115,38 @@ mod provider_flag_tests {
         assert_eq!(rest, strings(&["--model", "gpt-4o"]));
         assert_eq!(provider, Some(ProviderId::OpenAi));
 
-        let (rest, provider) =
-            extract_provider_flag(&strings(&["prompt", "hi", "--provider=zero-x"])).unwrap();
-        assert_eq!(rest, strings(&["prompt", "hi"]));
+        let (rest, provider) = extract_provider_flag(&strings(&[
+            "--provider=zero-x",
+            "--compact",
+            "prompt",
+            "hi",
+        ]))
+        .unwrap();
+        assert_eq!(rest, strings(&["--compact", "prompt", "hi"]));
         assert_eq!(provider, Some(ProviderId::ZeroX));
+    }
+
+    #[test]
+    fn prompt_subcommand_words_are_prompt_text() {
+        let words = strings(&["prompt", "explain", "the", "--provider", "flag"]);
+        let (rest, provider) = extract_provider_flag(&words).unwrap();
+        assert_eq!(rest, words);
+        assert_eq!(provider, None);
+
+        let words = strings(&["--", "--provider", "flag"]);
+        assert_eq!(extract_provider_flag(&words).unwrap(), (words, None));
+
+        // `prompt` as a flag value is not the subcommand.
+        let (rest, provider) = extract_provider_flag(&strings(&[
+            "--model",
+            "prompt",
+            "--provider",
+            "local",
+            "doctor",
+        ]))
+        .unwrap();
+        assert_eq!(rest, strings(&["--model", "prompt", "doctor"]));
+        assert_eq!(provider, Some(ProviderId::Local));
     }
 
     #[test]
