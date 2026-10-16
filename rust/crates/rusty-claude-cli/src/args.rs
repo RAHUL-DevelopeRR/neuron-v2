@@ -500,6 +500,10 @@ pub(crate) fn bare_slash_command_guidance(command_name: &str) -> Option<String> 
             | "init"
             | "prompt"
             | "export"
+            // Handled by `removed_auth_surface_error`, which points at
+            // `neuron auth login|logout`.
+            | "login"
+            | "logout"
     ) {
         return None;
     }
@@ -520,8 +524,44 @@ pub(crate) fn bare_slash_command_guidance(command_name: &str) -> Option<String> 
 
 pub(crate) fn removed_auth_surface_error(command_name: &str) -> String {
     format!(
-        "`neuron {command_name}` has been removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead."
+        "`neuron {command_name}` has moved: run `neuron auth {command_name}` for your Zero-X account. For Anthropic directly, set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead."
     )
+}
+
+/// Removes `--provider <id>` / `--provider=<id>` from `args` and returns the
+/// remaining arguments with the parsed choice. Scanning stops at `-p`,
+/// whose trailing words are prompt text.
+pub(crate) fn extract_provider_flag(
+    args: &[String],
+) -> Result<(Vec<String>, Option<crate::provider::ProviderId>), String> {
+    let mut remaining = Vec::with_capacity(args.len());
+    let mut provider = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "-p" {
+            remaining.extend_from_slice(&args[index..]);
+            break;
+        }
+        let value = if arg == "--provider" {
+            index += 1;
+            Some(
+                args.get(index)
+                    .ok_or_else(|| "missing value for --provider".to_string())?
+                    .as_str(),
+            )
+        } else {
+            arg.strip_prefix("--provider=")
+        };
+        match value {
+            Some(value) => {
+                provider = Some(crate::provider::parse_provider_id(value, "--provider")?);
+            }
+            None => remaining.push(arg.clone()),
+        }
+        index += 1;
+    }
+    Ok((remaining, provider))
 }
 
 pub(crate) fn parse_acp_args(
@@ -1042,4 +1082,42 @@ pub(crate) fn parse_resume_args(
         commands,
         output_format,
     })
+}
+
+#[cfg(test)]
+mod provider_flag_tests {
+    use super::extract_provider_flag;
+    use crate::provider::ProviderId;
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn provider_flag_is_removed_and_parsed_in_both_spellings() {
+        let (rest, provider) =
+            extract_provider_flag(&strings(&["--provider", "openai", "--model", "gpt-4o"]))
+                .unwrap();
+        assert_eq!(rest, strings(&["--model", "gpt-4o"]));
+        assert_eq!(provider, Some(ProviderId::OpenAi));
+
+        let (rest, provider) =
+            extract_provider_flag(&strings(&["prompt", "hi", "--provider=zero-x"])).unwrap();
+        assert_eq!(rest, strings(&["prompt", "hi"]));
+        assert_eq!(provider, Some(ProviderId::ZeroX));
+    }
+
+    #[test]
+    fn provider_flag_errors_are_actionable_and_prompt_text_is_untouched() {
+        assert!(extract_provider_flag(&strings(&["--provider"]))
+            .unwrap_err()
+            .contains("missing value"));
+        assert!(extract_provider_flag(&strings(&["--provider", "claude"]))
+            .unwrap_err()
+            .contains("expected one of"));
+        let (rest, provider) =
+            extract_provider_flag(&strings(&["-p", "explain", "--provider", "flags"])).unwrap();
+        assert_eq!(rest, strings(&["-p", "explain", "--provider", "flags"]));
+        assert_eq!(provider, None);
+    }
 }
