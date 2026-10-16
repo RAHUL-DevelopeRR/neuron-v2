@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::{Debug, Formatter};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{OnceLock, PoisonError, RwLock};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
@@ -127,6 +127,36 @@ impl OpenAiCompatConfig {
     }
 }
 
+/// Callback told the token usage of every completed request, streamed or
+/// not (for example to track a provider's daily quota).
+#[derive(Clone)]
+pub struct UsageObserver(Arc<dyn Fn(&Usage) + Send + Sync>);
+
+impl UsageObserver {
+    pub fn new(observer: impl Fn(&Usage) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(observer))
+    }
+
+    pub fn notify(&self, usage: &Usage) {
+        (self.0)(usage);
+    }
+}
+
+impl Debug for UsageObserver {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str("UsageObserver(..)")
+    }
+}
+
+/// Two observers are equal when they are the same callback.
+impl PartialEq for UsageObserver {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for UsageObserver {}
+
 /// An OpenAI-compatible endpoint chosen by the caller, with its credential
 /// held in memory instead of the process environment (where every child
 /// process would inherit it).
@@ -135,6 +165,7 @@ pub struct OpenAiCompatEndpoint {
     pub config: OpenAiCompatConfig,
     pub base_url: String,
     api_key: String,
+    usage_observer: Option<UsageObserver>,
 }
 
 impl OpenAiCompatEndpoint {
@@ -148,12 +179,26 @@ impl OpenAiCompatEndpoint {
             config,
             base_url: base_url.into(),
             api_key: api_key.into(),
+            usage_observer: None,
         }
+    }
+
+    /// Reports the usage of every completed request made through clients
+    /// built from this endpoint.
+    #[must_use]
+    pub fn with_usage_observer(mut self, observer: UsageObserver) -> Self {
+        self.usage_observer = Some(observer);
+        self
     }
 
     #[must_use]
     pub fn api_key(&self) -> &str {
         &self.api_key
+    }
+
+    #[must_use]
+    pub fn usage_observer(&self) -> Option<&UsageObserver> {
+        self.usage_observer.as_ref()
     }
 }
 
@@ -163,6 +208,7 @@ impl Debug for OpenAiCompatEndpoint {
             .field("provider", &self.config.provider_name)
             .field("base_url", &self.base_url)
             .field("api_key", &"<redacted>")
+            .field("usage_observer", &self.usage_observer.is_some())
             .finish()
     }
 }
@@ -201,6 +247,7 @@ pub struct OpenAiCompatClient {
     max_backoff: Duration,
     max_total_backoff: Duration,
     retry_observer: Option<RetryObserver>,
+    usage_observer: Option<UsageObserver>,
 }
 
 /// A failed HTTP exchange plus the `Retry-After` the server sent with it.
@@ -243,14 +290,17 @@ impl OpenAiCompatClient {
             max_backoff: DEFAULT_MAX_BACKOFF,
             max_total_backoff: MAX_TOTAL_BACKOFF,
             retry_observer: Some(RetryObserver::stderr()),
+            usage_observer: None,
         }
     }
 
     /// Client for an explicitly chosen endpoint (no environment lookups).
     #[must_use]
     pub fn from_endpoint(endpoint: &OpenAiCompatEndpoint) -> Self {
-        Self::new(endpoint.api_key.clone(), endpoint.config)
-            .with_base_url(endpoint.base_url.clone())
+        let mut client = Self::new(endpoint.api_key.clone(), endpoint.config)
+            .with_base_url(endpoint.base_url.clone());
+        client.usage_observer.clone_from(&endpoint.usage_observer);
+        client
     }
 
     pub fn from_env(config: OpenAiCompatConfig) -> Result<Self, ApiError> {
@@ -336,6 +386,9 @@ impl OpenAiCompatClient {
         if normalized.request_id.is_none() {
             normalized.request_id = request_id;
         }
+        if let Some(observer) = &self.usage_observer {
+            observer.notify(&normalized.usage);
+        }
         Ok(normalized)
     }
 
@@ -354,6 +407,7 @@ impl OpenAiCompatClient {
             pending: VecDeque::new(),
             done: false,
             state: StreamState::new(request.model.clone()),
+            usage_observer: self.usage_observer.clone(),
         })
     }
 
@@ -518,6 +572,7 @@ pub struct MessageStream {
     pending: VecDeque<StreamEvent>,
     done: bool,
     state: StreamState,
+    usage_observer: Option<UsageObserver>,
 }
 
 impl MessageStream {
@@ -539,7 +594,16 @@ impl MessageStream {
                         model: self.state.model.clone(),
                     });
                 }
-                self.pending.extend(self.state.finish()?);
+                let finished = self.state.finish()?;
+                if let Some(observer) = &self.usage_observer {
+                    // `finish` yields the final usage exactly once.
+                    for event in &finished {
+                        if let StreamEvent::MessageDelta(delta) = event {
+                            observer.notify(&delta.usage);
+                        }
+                    }
+                }
+                self.pending.extend(finished);
                 if let Some(event) = self.pending.pop_front() {
                     return Ok(Some(event));
                 }

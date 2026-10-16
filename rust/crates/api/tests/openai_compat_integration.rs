@@ -8,7 +8,7 @@ use api::{
     ContentBlockStopEvent, GatewayErrorCode, InputContentBlock, InputMessage, MessageDeltaEvent,
     MessageRequest, OpenAiCompatClient, OpenAiCompatConfig, OpenAiCompatEndpoint,
     OutputContentBlock, ProviderClient, RetryNotice, RetryObserver, StreamEvent, ToolChoice,
-    ToolDefinition,
+    ToolDefinition, UsageObserver,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -363,6 +363,64 @@ async fn provider_client_uses_explicit_endpoint_instead_of_environment() {
     );
     let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
     assert_eq!(body["model"], json!("auto"));
+}
+
+#[tokio::test]
+async fn endpoint_usage_observer_sees_streamed_and_unstreamed_usage() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let sse = concat!(
+        "data: {\"id\":\"chatcmpl_usage\",\"model\":\"Kimi-K2.5\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+        "data: {\"id\":\"chatcmpl_usage\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"id\":\"chatcmpl_usage\",\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":4}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![
+            http_response("200 OK", "application/json", COMPLETION_BODY),
+            http_response("200 OK", "text/event-stream", sse),
+        ],
+    )
+    .await;
+    let observed = Arc::new(StdMutex::new(Vec::new()));
+    let sink = Arc::clone(&observed);
+    let endpoint = OpenAiCompatEndpoint::new(
+        OpenAiCompatConfig::openai(),
+        server.base_url(),
+        "azure-test-key",
+    )
+    .with_usage_observer(UsageObserver::new(move |usage| {
+        sink.lock().unwrap().push(usage.output_tokens);
+    }));
+    let client =
+        ProviderClient::from_model_with_endpoint("openai/Kimi-K2.5", None, Some(&endpoint))
+            .expect("explicit endpoint needs no environment");
+    let request = MessageRequest {
+        model: "openai/Kimi-K2.5".to_string(),
+        ..sample_request(false)
+    };
+
+    client
+        .send_message(&request)
+        .await
+        .expect("request should succeed");
+    assert_eq!(*observed.lock().unwrap(), vec![1]);
+
+    let mut stream = client
+        .stream_message(&request)
+        .await
+        .expect("stream should start");
+    while stream
+        .next_event()
+        .await
+        .expect("event should parse")
+        .is_some()
+    {}
+    assert_eq!(
+        *observed.lock().unwrap(),
+        vec![1, 4],
+        "the final usage of a stream is reported exactly once"
+    );
 }
 
 #[tokio::test]
