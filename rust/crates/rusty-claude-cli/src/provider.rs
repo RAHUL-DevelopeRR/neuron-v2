@@ -13,10 +13,13 @@
 //! process environment, so tool subprocesses never inherit them.
 
 use std::env;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::{OnceLock, PoisonError, RwLock};
 
 use crate::brand::*;
 use api::{detect_provider_kind, OpenAiCompatConfig, OpenAiCompatEndpoint, ProviderKind};
+use serde_json::Value;
 
 /// The default `--model` value: let the provider pick.
 pub const AUTO_MODEL: &str = "auto";
@@ -296,17 +299,53 @@ fn is_loopback_url(url: &str) -> bool {
     })
 }
 
+/// The settings key `"provider"`, read straight from the discovered settings
+/// files (later files win, as in the merged config). Reading the raw JSON
+/// instead of the validated config means a broken unrelated key can never
+/// silently drop the choice, and a typo here is reported with its file.
+/// Files that are missing or not JSON objects are left to the config loader
+/// to report.
 fn settings_provider() -> Result<Option<ProviderId>, String> {
     let Ok(cwd) = env::current_dir() else {
         return Ok(None);
     };
-    let Ok(config) = runtime::ConfigLoader::default_for(&cwd).load() else {
-        return Ok(None);
-    };
-    match config.get("provider").and_then(|value| value.as_str()) {
-        Some(value) if !value.trim().is_empty() => {
-            parse_provider_id(value, "settings \"provider\"").map(Some)
+    let files = runtime::ConfigLoader::default_for(&cwd)
+        .discover()
+        .into_iter()
+        .filter_map(|entry| {
+            fs::read_to_string(&entry.path)
+                .ok()
+                .map(|text| (entry.path, text))
+        });
+    provider_from_settings(files)
+}
+
+fn provider_from_settings(
+    files: impl IntoIterator<Item = (PathBuf, String)>,
+) -> Result<Option<ProviderId>, String> {
+    let mut last = None;
+    for (path, text) in files {
+        let Ok(Value::Object(mut object)) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        match object.remove("provider") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(value)) => last = Some((path, value)),
+            Some(_) => {
+                return Err(format!(
+                    "settings \"provider\" in {} must be a string, one of {}",
+                    path.display(),
+                    ProviderId::names()
+                ))
+            }
         }
+    }
+    match last {
+        Some((path, value)) if !value.trim().is_empty() => parse_provider_id(
+            &value,
+            &format!("settings \"provider\" in {}", path.display()),
+        )
+        .map(Some),
         _ => Ok(None),
     }
 }
@@ -317,8 +356,13 @@ fn gather_inputs(requested_model: &str) -> Result<ProviderInputs, Box<dyn std::e
     let env_choice = non_empty_env("NEURON_PROVIDER")
         .map(|value| parse_provider_id(&value, "NEURON_PROVIDER"))
         .transpose()?;
-    let settings_choice = settings_provider()?;
     let flag = provider_flag();
+    // Settings only matter when no higher-precedence choice was made.
+    let settings_choice = if neuron_token || flag.is_some() || env_choice.is_some() {
+        None
+    } else {
+        settings_provider()?
+    };
     let explicit = flag.or(env_choice).or(settings_choice);
     // Only consult (and migrate) the stored login when it can matter.
     let stored_login =
@@ -464,11 +508,9 @@ fn activate(
                     .unwrap_or_else(|| DEFAULT_AZURE_MODEL.to_string()),
             );
             active.base_url = Some(base.clone());
-            Some(OpenAiCompatEndpoint::new(
-                OpenAiCompatConfig::openai(),
-                base,
-                key,
-            ))
+            Some(azure_endpoint(base, key, |output_tokens| {
+                crate::quota::QuotaState::load().record_azure_usage(output_tokens);
+            }))
         }
         ProviderId::Anthropic => {
             if let Err(error) = crate::api_client::resolve_cli_auth_source() {
@@ -525,6 +567,20 @@ fn load_catalog_checked(
             Ok(credential)
         }
     }
+}
+
+/// The Azure endpoint. Every completed request reports its output tokens to
+/// `record`, which keeps the daily quota (`~/.neuroncli/quota.json`) behind
+/// the banner and the Azure-to-fallback switch up to date without exporting
+/// the endpoint into the environment.
+fn azure_endpoint(
+    base: String,
+    key: String,
+    record: impl Fn(u32) + Send + Sync + 'static,
+) -> OpenAiCompatEndpoint {
+    OpenAiCompatEndpoint::new(OpenAiCompatConfig::openai(), base, key).with_usage_observer(
+        api::UsageObserver::new(move |usage| record(usage.output_tokens)),
+    )
 }
 
 /// Ambient Azure is used only when its daily quota is left and the endpoint
@@ -777,6 +833,81 @@ mod tests {
         assert_eq!(ProviderId::parse("ZeroX"), Some(ProviderId::ZeroX));
         let error = parse_provider_id("opnai", "--provider").unwrap_err();
         assert!(error.contains("zero-x|openai|openrouter|azure|anthropic|xai|local"));
+    }
+
+    fn settings(files: &[(&str, &str)]) -> Result<Option<ProviderId>, String> {
+        provider_from_settings(
+            files
+                .iter()
+                .map(|(path, text)| (PathBuf::from(path), (*text).to_string())),
+        )
+    }
+
+    #[test]
+    fn settings_provider_reads_the_last_file_that_sets_it() {
+        assert_eq!(
+            settings(&[
+                ("user/settings.json", r#"{"provider":"openai","model":"x"}"#),
+                ("project/.neuron/settings.json", r#"{"provider":"local"}"#),
+                ("project/.neuron/settings.local.json", r#"{"hooks":{}}"#),
+            ]),
+            Ok(Some(ProviderId::Local))
+        );
+        // Unrelated keys, broken files and blank values do not matter.
+        assert_eq!(
+            settings(&[
+                ("a.json", r#"{"defaultMcpServers":false,"unknownKey":1}"#),
+                ("b.json", "{not json"),
+                ("c.json", r#"{"provider":"  "}"#),
+            ]),
+            Ok(None)
+        );
+        // An overridden typo in a lower-precedence file is harmless.
+        assert_eq!(
+            settings(&[
+                ("user.json", r#"{"provider":"opnai"}"#),
+                ("project.json", r#"{"provider":"zero-x"}"#),
+            ]),
+            Ok(Some(ProviderId::ZeroX))
+        );
+    }
+
+    #[test]
+    fn settings_provider_typos_name_the_file() {
+        let error = settings(&[("cfg/settings.json", r#"{"provider":"opnai"}"#)]).unwrap_err();
+        assert!(error.contains("unknown provider 'opnai'"), "{error}");
+        assert!(error.contains("cfg/settings.json"), "{error}");
+        assert!(error.contains("zero-x|openai"), "{error}");
+        let error = settings(&[("cfg/settings.json", r#"{"provider":7}"#)]).unwrap_err();
+        assert!(error.contains("must be a string"), "{error}");
+    }
+
+    #[test]
+    fn azure_endpoint_reports_output_tokens_for_the_daily_quota() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let recorded = Arc::new(AtomicU32::new(0));
+        let sink = Arc::clone(&recorded);
+        let endpoint = azure_endpoint(
+            "https://example.openai.azure.com/openai/v1".to_string(),
+            "azure-key".to_string(),
+            move |tokens| {
+                sink.fetch_add(tokens, Ordering::SeqCst);
+            },
+        );
+        let observer = endpoint
+            .usage_observer()
+            .expect("Azure requests feed the quota");
+        for output_tokens in [7, 5] {
+            observer.notify(&api::Usage {
+                input_tokens: 100,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                output_tokens,
+            });
+        }
+        assert_eq!(recorded.load(Ordering::SeqCst), 12);
     }
 
     #[test]
