@@ -1,12 +1,17 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::fmt::{Debug, Formatter};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{OnceLock, PoisonError, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::error::ApiError;
+use crate::error::{ApiError, GatewayError, GatewayErrorCode};
 use crate::http_client::build_http_client_or_default;
+use crate::retry::{
+    plan_retry_delay, retry_after_from_headers, RetryNotice, RetryObserver, MAX_TOTAL_BACKOFF,
+};
 use crate::types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
     InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent, MessageRequest,
@@ -19,11 +24,17 @@ use super::{preflight_message_request, Provider, ProviderFuture};
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_DASHSCOPE_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+pub const DEFAULT_ZERO_X_BASE_URL: &str = "https://zero-x.live/v1";
+/// Provider name of the Zero-X gateway configuration.
+pub const ZERO_X_PROVIDER_NAME: &str = "Zero-X";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(128);
+const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(32);
 const DEFAULT_MAX_RETRIES: u32 = 8;
+/// The gateway already fails over between upstream pools, so the client only
+/// retries transient gateway errors a couple of times (contract §5).
+const ZERO_X_MAX_RETRIES: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenAiCompatConfig {
@@ -41,6 +52,7 @@ pub struct OpenAiCompatConfig {
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
 const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY"];
 const DASHSCOPE_ENV_VARS: &[&str] = &["DASHSCOPE_API_KEY"];
+const ZERO_X_ENV_VARS: &[&str] = &["NEURON_TOKEN"];
 
 // Provider-specific request body size limits in bytes
 const XAI_MAX_REQUEST_BODY_BYTES: usize = 52_428_800; // 50MB
@@ -85,15 +97,97 @@ impl OpenAiCompatConfig {
         }
     }
 
+    /// The Zero-X gateway (`docs/GATEWAY_CONTRACT.md`): `OpenAI` wire format,
+    /// actionable error envelopes and a short transient-only retry policy.
+    #[must_use]
+    pub const fn zero_x() -> Self {
+        Self {
+            provider_name: ZERO_X_PROVIDER_NAME,
+            api_key_env: "NEURON_TOKEN",
+            base_url_env: "NEURON_API_BASE",
+            default_base_url: DEFAULT_ZERO_X_BASE_URL,
+            max_request_body_bytes: OPENAI_MAX_REQUEST_BODY_BYTES,
+        }
+    }
+
+    #[must_use]
+    pub fn is_zero_x(self) -> bool {
+        self.provider_name == ZERO_X_PROVIDER_NAME
+    }
+
     #[must_use]
     pub fn credential_env_vars(self) -> &'static [&'static str] {
         match self.provider_name {
             "xAI" => XAI_ENV_VARS,
             "OpenAI" => OPENAI_ENV_VARS,
             "DashScope" => DASHSCOPE_ENV_VARS,
+            ZERO_X_PROVIDER_NAME => ZERO_X_ENV_VARS,
             _ => &[],
         }
     }
+}
+
+/// An OpenAI-compatible endpoint chosen by the caller, with its credential
+/// held in memory instead of the process environment (where every child
+/// process would inherit it).
+#[derive(Clone, PartialEq, Eq)]
+pub struct OpenAiCompatEndpoint {
+    pub config: OpenAiCompatConfig,
+    pub base_url: String,
+    api_key: String,
+}
+
+impl OpenAiCompatEndpoint {
+    #[must_use]
+    pub fn new(
+        config: OpenAiCompatConfig,
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+    ) -> Self {
+        Self {
+            config,
+            base_url: base_url.into(),
+            api_key: api_key.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn api_key(&self) -> &str {
+        &self.api_key
+    }
+}
+
+impl Debug for OpenAiCompatEndpoint {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenAiCompatEndpoint")
+            .field("provider", &self.config.provider_name)
+            .field("base_url", &self.base_url)
+            .field("api_key", &"<redacted>")
+            .finish()
+    }
+}
+
+fn installed_endpoint_slot() -> &'static RwLock<Option<OpenAiCompatEndpoint>> {
+    static SLOT: OnceLock<RwLock<Option<OpenAiCompatEndpoint>>> = OnceLock::new();
+    SLOT.get_or_init(|| RwLock::new(None))
+}
+
+/// Installs (or clears) the process-wide OpenAI-compatible endpoint that
+/// [`crate::ProviderClient`] uses for OpenAI-kind models instead of reading
+/// `OPENAI_API_KEY` / `OPENAI_BASE_URL` from the environment.
+pub fn install_openai_compat_endpoint(endpoint: Option<OpenAiCompatEndpoint>) {
+    *installed_endpoint_slot()
+        .write()
+        .unwrap_or_else(PoisonError::into_inner) = endpoint;
+}
+
+/// The endpoint installed with [`install_openai_compat_endpoint`], if any.
+#[must_use]
+pub fn installed_openai_compat_endpoint() -> Option<OpenAiCompatEndpoint> {
+    installed_endpoint_slot()
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +199,23 @@ pub struct OpenAiCompatClient {
     max_retries: u32,
     initial_backoff: Duration,
     max_backoff: Duration,
+    max_total_backoff: Duration,
+    retry_observer: Option<RetryObserver>,
+}
+
+/// A failed HTTP exchange plus the `Retry-After` the server sent with it.
+struct HttpFailure {
+    error: Box<ApiError>,
+    retry_after: Option<Duration>,
+}
+
+impl From<ApiError> for HttpFailure {
+    fn from(error: ApiError) -> Self {
+        Self {
+            error: Box::new(error),
+            retry_after: None,
+        }
+    }
 }
 
 impl OpenAiCompatClient {
@@ -123,10 +234,23 @@ impl OpenAiCompatClient {
             api_key: api_key.into(),
             config,
             base_url: read_base_url(config),
-            max_retries: DEFAULT_MAX_RETRIES,
+            max_retries: if config.is_zero_x() {
+                ZERO_X_MAX_RETRIES
+            } else {
+                DEFAULT_MAX_RETRIES
+            },
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
+            max_total_backoff: MAX_TOTAL_BACKOFF,
+            retry_observer: Some(RetryObserver::stderr()),
         }
+    }
+
+    /// Client for an explicitly chosen endpoint (no environment lookups).
+    #[must_use]
+    pub fn from_endpoint(endpoint: &OpenAiCompatEndpoint) -> Self {
+        Self::new(endpoint.api_key.clone(), endpoint.config)
+            .with_base_url(endpoint.base_url.clone())
     }
 
     pub fn from_env(config: OpenAiCompatConfig) -> Result<Self, ApiError> {
@@ -158,6 +282,26 @@ impl OpenAiCompatClient {
         self
     }
 
+    /// Caps the total time spent sleeping between retries of one request.
+    #[must_use]
+    pub fn with_max_total_backoff(mut self, max_total_backoff: Duration) -> Self {
+        self.max_total_backoff = max_total_backoff;
+        self
+    }
+
+    /// Replaces the retry progress callback (`None` silences it). The
+    /// default prints one line per retry to stderr.
+    #[must_use]
+    pub fn with_retry_observer(mut self, observer: Option<RetryObserver>) -> Self {
+        self.retry_observer = observer;
+        self
+    }
+
+    #[must_use]
+    pub const fn provider_config(&self) -> OpenAiCompatConfig {
+        self.config
+    }
+
     pub async fn send_message(
         &self,
         request: &MessageRequest,
@@ -175,32 +319,14 @@ impl OpenAiCompatClient {
         // full deserialization so the user sees the actual error, not a cryptic
         // "missing field 'id'" parse failure.
         if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&body) {
-            if let Some(err_obj) = raw.get("error") {
-                let msg = err_obj
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("provider returned an error")
-                    .to_string();
-                let code = err_obj
-                    .get("code")
-                    .and_then(serde_json::Value::as_u64)
-                    .map(|c| c as u16);
-                return Err(ApiError::Api {
-                    status: reqwest::StatusCode::from_u16(code.unwrap_or(400))
-                        .unwrap_or(reqwest::StatusCode::BAD_REQUEST),
-                    error_type: err_obj
-                        .get("type")
-                        .and_then(|t| t.as_str())
-                        .map(str::to_owned),
-                    message: Some(msg),
-                    request_id,
-                    body,
-                    retryable: false,
-                    suggested_action: suggested_action_for_status(
-                        reqwest::StatusCode::from_u16(code.unwrap_or(400))
-                            .unwrap_or(reqwest::StatusCode::BAD_REQUEST),
-                    ),
-                });
+            if let Some(error) = embedded_error(
+                &raw,
+                &body,
+                request_id.clone(),
+                self.config.provider_name,
+                "provider returned an error",
+            ) {
+                return Err(error);
             }
         }
         let payload = serde_json::from_str::<ChatCompletionResponse>(&body).map_err(|error| {
@@ -231,35 +357,60 @@ impl OpenAiCompatClient {
         })
     }
 
+    /// Sends `request`, retrying transient failures. Non-retryable errors
+    /// (quota, credits, plan, region, suspension, invalid session, bad
+    /// request) return immediately. `Retry-After` is honoured and the total
+    /// sleep across retries never exceeds `max_total_backoff`.
     async fn send_with_retry(
         &self,
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
         let mut attempts = 0;
+        let mut slept = Duration::ZERO;
 
-        let last_error = loop {
+        loop {
             attempts += 1;
-            let retryable_error = match self.send_raw_request(request).await {
-                Ok(response) => match expect_success(response).await {
+            let failure = match self.send_raw_request(request).await {
+                Ok(response) => match expect_success(response, self.config).await {
                     Ok(response) => return Ok(response),
-                    Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => error,
-                    Err(error) => return Err(error),
+                    Err(failure) => failure,
                 },
-                Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => error,
-                Err(error) => return Err(error),
+                Err(error) => HttpFailure::from(error),
             };
-
-            if attempts > self.max_retries {
-                break retryable_error;
+            if !failure.error.is_retryable() {
+                return Err(*failure.error);
             }
-
-            tokio::time::sleep(self.jittered_backoff_for_attempt(attempts)?).await;
-        };
-
-        Err(ApiError::RetriesExhausted {
-            attempts,
-            last_error: Box::new(last_error),
-        })
+            let exhausted = |error: Box<ApiError>| {
+                if attempts == 1 {
+                    *error
+                } else {
+                    ApiError::RetriesExhausted {
+                        attempts,
+                        last_error: error,
+                    }
+                }
+            };
+            if attempts > self.max_retries {
+                return Err(exhausted(failure.error));
+            }
+            let retry_after = failure.retry_after.or_else(|| failure.error.retry_after());
+            let backoff = self.jittered_backoff_for_attempt(attempts)?;
+            let Some(delay) = plan_retry_delay(retry_after, backoff, slept, self.max_total_backoff)
+            else {
+                return Err(exhausted(failure.error));
+            };
+            if let Some(observer) = &self.retry_observer {
+                observer.notify(&RetryNotice {
+                    provider: self.config.provider_name.to_string(),
+                    retry: attempts,
+                    max_retries: self.max_retries,
+                    delay,
+                    reason: retry_reason(&failure.error),
+                });
+            }
+            tokio::time::sleep(delay).await;
+            slept += delay;
+        }
     }
 
     async fn send_raw_request(
@@ -382,6 +533,12 @@ impl MessageStream {
             }
 
             if self.done {
+                if self.state.is_truncated(self.parser.saw_done) {
+                    return Err(ApiError::StreamTruncated {
+                        provider: self.parser.provider.clone(),
+                        model: self.state.model.clone(),
+                    });
+                }
                 self.pending.extend(self.state.finish()?);
                 if let Some(event) = self.pending.pop_front() {
                     return Ok(Some(event));
@@ -408,6 +565,8 @@ struct OpenAiSseParser {
     buffer: Vec<u8>,
     provider: String,
     model: String,
+    /// Whether the `data: [DONE]` sentinel has been seen.
+    saw_done: bool,
 }
 
 impl OpenAiSseParser {
@@ -416,6 +575,7 @@ impl OpenAiSseParser {
             buffer: Vec::new(),
             provider: provider.into(),
             model: model.into(),
+            saw_done: false,
         }
     }
 
@@ -424,9 +584,10 @@ impl OpenAiSseParser {
         let mut events = Vec::new();
 
         while let Some(frame) = next_sse_frame(&mut self.buffer) {
-            if let Some(event) = parse_sse_frame(&frame, &self.provider, &self.model)? {
-                events.push(event);
-            }
+            self.accept(
+                parse_sse_frame(&frame, &self.provider, &self.model)?,
+                &mut events,
+            );
         }
 
         Ok(events)
@@ -434,14 +595,33 @@ impl OpenAiSseParser {
 
     fn finish(&mut self) -> Result<Vec<ChatCompletionChunk>, ApiError> {
         let trailing = std::mem::take(&mut self.buffer);
-        Ok(parse_sse_frame(
+        let mut events = Vec::new();
+        let frame = parse_sse_frame(
             &String::from_utf8_lossy(&trailing),
             &self.provider,
             &self.model,
-        )?
-        .into_iter()
-        .collect())
+        )?;
+        self.accept(frame, &mut events);
+        Ok(events)
     }
+
+    fn accept(&mut self, frame: SseFrame, events: &mut Vec<ChatCompletionChunk>) {
+        match frame {
+            SseFrame::Chunk(chunk) => events.push(chunk),
+            SseFrame::Done => self.saw_done = true,
+            SseFrame::Skip => {}
+        }
+    }
+}
+
+/// One decoded SSE frame.
+#[derive(Debug)]
+enum SseFrame {
+    /// Comment, keep-alive or empty frame.
+    Skip,
+    /// The `data: [DONE]` sentinel.
+    Done,
+    Chunk(ChatCompletionChunk),
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -526,9 +706,10 @@ impl StreamState {
                 }));
             }
 
-            for tool_call in choice.delta.tool_calls {
-                let state = self.tool_calls.entry(tool_call.index).or_default();
-                state.apply(tool_call);
+            for (position, tool_call) in choice.delta.tool_calls.into_iter().enumerate() {
+                let index = self.resolve_tool_call_index(&tool_call, position);
+                let state = self.tool_calls.entry(index).or_default();
+                state.apply(index, tool_call);
                 let block_index = state.block_index();
                 if !state.started {
                     if let Some(start_event) = state.start_event()? {
@@ -565,6 +746,46 @@ impl StreamState {
         }
 
         Ok(events)
+    }
+
+    /// `OpenAI` marks every streamed tool call with `index`; Gemini's
+    /// compatibility endpoint omits it and sends parallel calls as separate
+    /// items of one chunk. Without an index, reuse the slot of a call with
+    /// the same id, otherwise use the item's position in the chunk (moving
+    /// past slots already owned by a different call id).
+    fn resolve_tool_call_index(&self, tool_call: &DeltaToolCall, position: usize) -> u32 {
+        if let Some(index) = tool_call.index {
+            return index;
+        }
+        let position = u32::try_from(position).unwrap_or(u32::MAX);
+        let Some(id) = tool_call.id.as_deref() else {
+            return position;
+        };
+        if let Some((index, _)) = self
+            .tool_calls
+            .iter()
+            .find(|(_, state)| state.id.as_deref() == Some(id))
+        {
+            return *index;
+        }
+        let slot_taken = self
+            .tool_calls
+            .get(&position)
+            .is_some_and(|state| state.id.as_deref().is_some_and(|existing| existing != id));
+        if slot_taken {
+            self.tool_calls
+                .keys()
+                .next_back()
+                .map_or(position, |last| last.saturating_add(1))
+        } else {
+            position
+        }
+    }
+
+    /// A stream that delivered content but neither a `finish_reason` nor
+    /// `[DONE]` was cut off mid-reply.
+    fn is_truncated(&self, saw_done: bool) -> bool {
+        self.message_started && !self.finished && !saw_done && self.stop_reason.is_none()
     }
 
     fn finish(&mut self) -> Result<Vec<StreamEvent>, ApiError> {
@@ -650,8 +871,8 @@ struct ToolCallState {
 }
 
 impl ToolCallState {
-    fn apply(&mut self, tool_call: DeltaToolCall) {
-        self.openai_index = tool_call.index;
+    fn apply(&mut self, index: u32, tool_call: DeltaToolCall) {
+        self.openai_index = index;
         if let Some(id) = tool_call.id {
             self.id = Some(id);
         }
@@ -776,8 +997,10 @@ struct ChunkDelta {
 
 #[derive(Debug, Deserialize)]
 struct DeltaToolCall {
+    /// Absent on Gemini's OpenAI-compatible stream; see
+    /// [`StreamState::resolve_tool_call_index`].
     #[serde(default)]
-    index: u32,
+    index: Option<u32>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
@@ -790,19 +1013,6 @@ struct DeltaFunction {
     name: Option<String>,
     #[serde(default)]
     arguments: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ErrorEnvelope {
-    error: ErrorBody,
-}
-
-#[derive(Debug, Deserialize)]
-struct ErrorBody {
-    #[serde(rename = "type")]
-    error_type: Option<String>,
-    code: Option<String>,
-    message: Option<String>,
 }
 
 /// Returns true for models known to reject tuning parameters like temperature,
@@ -1203,7 +1413,7 @@ fn openai_tool_choice(tool_choice: &ToolChoice) -> Value {
 }
 
 fn should_request_stream_usage(config: OpenAiCompatConfig) -> bool {
-    matches!(config.provider_name, "OpenAI")
+    matches!(config.provider_name, "OpenAI" | ZERO_X_PROVIDER_NAME)
 }
 
 fn normalize_response(
@@ -1279,14 +1489,10 @@ fn next_sse_frame(buffer: &mut Vec<u8>) -> Option<String> {
     Some(String::from_utf8_lossy(&frame[..frame_len]).into_owned())
 }
 
-fn parse_sse_frame(
-    frame: &str,
-    provider: &str,
-    model: &str,
-) -> Result<Option<ChatCompletionChunk>, ApiError> {
+fn parse_sse_frame(frame: &str, provider: &str, model: &str) -> Result<SseFrame, ApiError> {
     let trimmed = frame.trim();
     if trimmed.is_empty() {
-        return Ok(None);
+        return Ok(SseFrame::Skip);
     }
 
     let mut data_lines = Vec::new();
@@ -1299,45 +1505,75 @@ fn parse_sse_frame(
         }
     }
     if data_lines.is_empty() {
-        return Ok(None);
+        return Ok(SseFrame::Skip);
     }
     let payload = data_lines.join("\n");
     if payload == "[DONE]" {
-        return Ok(None);
+        return Ok(SseFrame::Done);
     }
     // Some backends embed an error object in a data: frame instead of using an
     // HTTP error status. Surface the error message directly rather than letting
     // ChatCompletionChunk deserialization fail with a cryptic 'missing field' error.
     if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&payload) {
-        if let Some(err_obj) = raw.get("error") {
-            let msg = err_obj
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("provider returned an error in stream")
-                .to_string();
-            let code = err_obj
-                .get("code")
-                .and_then(serde_json::Value::as_u64)
-                .map(|c| c as u16);
-            let status = reqwest::StatusCode::from_u16(code.unwrap_or(400))
-                .unwrap_or(reqwest::StatusCode::BAD_REQUEST);
-            return Err(ApiError::Api {
-                status,
-                error_type: err_obj
-                    .get("type")
-                    .and_then(|t| t.as_str())
-                    .map(str::to_owned),
-                message: Some(msg),
-                request_id: None,
-                body: payload.clone(),
-                retryable: false,
-                suggested_action: suggested_action_for_status(status),
-            });
+        if let Some(error) = embedded_error(
+            &raw,
+            &payload,
+            None,
+            provider,
+            "provider returned an error in stream",
+        ) {
+            return Err(error);
         }
     }
     serde_json::from_str::<ChatCompletionChunk>(&payload)
-        .map(Some)
+        .map(SseFrame::Chunk)
         .map_err(|error| ApiError::json_deserialize(provider, model, &payload, error))
+}
+
+/// Converts an `{"error": ...}` object delivered with a 2xx status (or in a
+/// streamed `data:` frame) into an error. Returns `None` when `raw` is not an
+/// error envelope.
+fn embedded_error(
+    raw: &Value,
+    payload: &str,
+    request_id: Option<String>,
+    provider: &str,
+    fallback_message: &str,
+) -> Option<ApiError> {
+    let error = raw.get("error").filter(|value| !value.is_null())?;
+    let code = error.get("code");
+    let status = code
+        .and_then(Value::as_u64)
+        .and_then(|code| u16::try_from(code).ok())
+        .or_else(|| {
+            code.and_then(Value::as_str)
+                .and_then(GatewayErrorCode::parse)
+                .map(GatewayErrorCode::default_status)
+        })
+        .and_then(|code| reqwest::StatusCode::from_u16(code).ok())
+        .unwrap_or(reqwest::StatusCode::BAD_REQUEST);
+    if let Some(gateway) = GatewayError::from_value(status, raw) {
+        if provider == ZERO_X_PROVIDER_NAME || gateway.has_actionable_hints() {
+            return Some(ApiError::Gateway(Box::new(
+                gateway.with_request_id_fallback(request_id),
+            )));
+        }
+    }
+    Some(ApiError::Api {
+        status,
+        error_type: error.get("type").and_then(Value::as_str).map(str::to_owned),
+        message: Some(
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or(fallback_message)
+                .to_string(),
+        ),
+        request_id,
+        body: payload.to_string(),
+        retryable: false,
+        suggested_action: suggested_action_for_status(status),
+    })
 }
 
 fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
@@ -1378,42 +1614,90 @@ fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Strin
         .map(ToOwned::to_owned)
 }
 
-async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response, ApiError> {
+async fn expect_success(
+    response: reqwest::Response,
+    config: OpenAiCompatConfig,
+) -> Result<reqwest::Response, HttpFailure> {
     let status = response.status();
     if status.is_success() {
         return Ok(response);
     }
 
     let request_id = request_id_from_headers(response.headers());
+    let retry_after = retry_after_from_headers(response.headers());
     let body = response.text().await.unwrap_or_default();
-    let parsed_error = serde_json::from_str::<ErrorEnvelope>(&body).ok();
-    let error_code = parsed_error
-        .as_ref()
-        .and_then(|error| error.error.code.as_deref());
-    let retryable = is_retryable_response(status, error_code);
+    Err(HttpFailure {
+        error: Box::new(error_from_response(
+            status,
+            request_id,
+            retry_after,
+            body,
+            config,
+        )),
+        retry_after,
+    })
+}
 
-    let suggested_action = if error_code == Some("insufficient_quota") {
-        Some(
-            "Wait until the daily Neuron quota resets or reduce the prompt size and output limit"
-                .to_string(),
-        )
-    } else {
-        suggested_action_for_status(status)
+/// Builds the error for a non-2xx response. Zero-X responses (and any
+/// response carrying gateway hints such as `upgrade_url`) become
+/// [`ApiError::Gateway`]; everything else keeps the generic shape.
+fn error_from_response(
+    status: reqwest::StatusCode,
+    request_id: Option<String>,
+    retry_after: Option<Duration>,
+    body: String,
+    config: OpenAiCompatConfig,
+) -> ApiError {
+    let parsed = GatewayError::from_body(status, &body);
+    let is_gateway = config.is_zero_x()
+        || parsed
+            .as_ref()
+            .is_some_and(GatewayError::has_actionable_hints);
+    if is_gateway {
+        let mut error = parsed
+            .unwrap_or_else(|| GatewayError::from_status(status))
+            .with_request_id_fallback(request_id)
+            .with_retry_after_fallback(retry_after);
+        // Older gateway builds answer `{"error": "Invalid or expired
+        // session"}` without a code; any 401 there means the same thing.
+        if config.is_zero_x() && status == reqwest::StatusCode::UNAUTHORIZED && error.code.is_none()
+        {
+            error.code = Some(GatewayErrorCode::InvalidSession.as_str().to_string());
+        }
+        return ApiError::Gateway(Box::new(error));
+    }
+
+    let (error_type, message, code) = match parsed {
+        Some(error) => (
+            error.error_type,
+            Some(error.message).filter(|message| !message.is_empty()),
+            error.code,
+        ),
+        None => (None, None, None),
     };
-
-    Err(ApiError::Api {
+    ApiError::Api {
         status,
-        error_type: parsed_error
-            .as_ref()
-            .and_then(|error| error.error.error_type.clone()),
-        message: parsed_error
-            .as_ref()
-            .and_then(|error| error.error.message.clone()),
+        error_type,
+        message,
         request_id,
         body,
-        retryable,
-        suggested_action,
-    })
+        retryable: is_retryable_response(status, code.as_deref()),
+        suggested_action: suggested_action_for_status(status),
+    }
+}
+
+/// Short reason for a retry progress line.
+fn retry_reason(error: &ApiError) -> String {
+    match error {
+        ApiError::Gateway(error) => error
+            .code
+            .clone()
+            .unwrap_or_else(|| error.status.to_string()),
+        ApiError::Api { status, .. } => status.to_string(),
+        ApiError::Http(error) if error.is_timeout() => "request timed out".to_string(),
+        ApiError::Http(_) => "connection failed".to_string(),
+        other => other.safe_failure_class().to_string(),
+    }
 }
 
 const fn is_retryable_status(status: reqwest::StatusCode) -> bool {
@@ -1521,6 +1805,197 @@ mod tests {
         malformed.ingest_chunk(chunk).unwrap();
         assert!(malformed.finish().is_err());
     }
+    /// Gemini's OpenAI-compatible stream sends two parallel calls as two
+    /// items of one chunk and omits `index`. Before the fix both items
+    /// landed in slot 0 and their arguments were concatenated into one
+    /// invalid-JSON call.
+    #[test]
+    fn gemini_parallel_tool_calls_without_index_stay_separate() {
+        let mut state = super::StreamState::new("gemini/gemini-2.5-flash".into());
+        let chunk = serde_json::from_value(serde_json::json!({
+            "id": "gemini",
+            "choices": [{"delta": {"role": "assistant", "tool_calls": [
+                {"id": "call_a", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"a.txt\"}"}},
+                {"id": "call_b", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"b.txt\"}"}}
+            ]}, "finish_reason": "tool_calls"}]
+        }))
+        .unwrap();
+        let mut events = state.ingest_chunk(chunk).unwrap();
+        events.extend(state.finish().unwrap());
+
+        let starts = events
+            .iter()
+            .filter_map(|event| match event {
+                crate::types::StreamEvent::ContentBlockStart(start) => match &start.content_block {
+                    crate::types::OutputContentBlock::ToolUse { id, .. } => {
+                        Some((start.index, id.clone()))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            starts,
+            vec![(1, "call_a".to_string()), (2, "call_b".to_string())]
+        );
+        let arguments = |index: u32| {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    crate::types::StreamEvent::ContentBlockDelta(delta) if delta.index == index => {
+                        match &delta.delta {
+                            crate::types::ContentBlockDelta::InputJsonDelta { partial_json } => {
+                                Some(partial_json.clone())
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+                .collect::<String>()
+        };
+        assert_eq!(arguments(1), r#"{"path":"a.txt"}"#);
+        assert_eq!(arguments(2), r#"{"path":"b.txt"}"#);
+    }
+
+    #[test]
+    fn index_less_calls_in_later_chunks_get_their_own_slot() {
+        let mut state = super::StreamState::new("gemini".into());
+        for (id, path) in [("call_a", "a.txt"), ("call_b", "b.txt")] {
+            let chunk = serde_json::from_value(serde_json::json!({
+                "id": "gemini",
+                "choices": [{"delta": {"tool_calls": [
+                    {"id": id, "function": {"name": "read_file", "arguments": format!("{{\"path\":\"{path}\"}}")}}
+                ]}}]
+            }))
+            .unwrap();
+            state.ingest_chunk(chunk).unwrap();
+        }
+        assert_eq!(state.tool_calls.len(), 2);
+        assert_eq!(state.tool_calls[&0].id.as_deref(), Some("call_a"));
+        assert_eq!(state.tool_calls[&1].id.as_deref(), Some("call_b"));
+    }
+
+    #[test]
+    fn stream_without_finish_reason_or_done_is_truncated() {
+        let mut state = super::StreamState::new("auto".into());
+        let chunk = serde_json::from_value(serde_json::json!({
+            "id": "partial", "choices": [{"delta": {"content": "half a rep"}}]
+        }))
+        .unwrap();
+        state.ingest_chunk(chunk).unwrap();
+        assert!(state.is_truncated(false));
+        assert!(!state.is_truncated(true), "[DONE] marks a complete stream");
+
+        let finished = serde_json::from_value(serde_json::json!({
+            "id": "partial", "choices": [{"delta": {}, "finish_reason": "stop"}]
+        }))
+        .unwrap();
+        state.ingest_chunk(finished).unwrap();
+        assert!(
+            !state.is_truncated(false),
+            "finish_reason completes a stream"
+        );
+
+        let empty = super::StreamState::new("auto".into());
+        assert!(
+            !empty.is_truncated(false),
+            "a stream with no data frames falls back to the non-streaming path"
+        );
+    }
+
+    #[test]
+    fn sse_parser_records_the_done_sentinel() {
+        let mut parser = super::OpenAiSseParser::with_context("Zero-X", "auto");
+        parser
+            .push(b"data: {\"id\":\"x\",\"choices\":[]}\n\n")
+            .unwrap();
+        assert!(!parser.saw_done);
+        parser.push(b"data: [DONE]\n\n").unwrap();
+        assert!(parser.saw_done);
+    }
+
+    #[test]
+    fn zero_x_responses_become_actionable_gateway_errors() {
+        let quota = super::error_from_response(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            Some("req_header".to_string()),
+            None,
+            r#"{"error":{"message":"Daily quota reached","code":"insufficient_quota","resets_at":"2026-10-17T00:00:00Z","upgrade_url":"https://zero-x.live/pricing"}}"#.to_string(),
+            OpenAiCompatConfig::zero_x(),
+        );
+        assert!(!quota.is_retryable());
+        let gateway = quota.gateway_error().expect("gateway error");
+        assert_eq!(gateway.request_id.as_deref(), Some("req_header"));
+
+        let legacy_401 = super::error_from_response(
+            reqwest::StatusCode::UNAUTHORIZED,
+            None,
+            None,
+            r#"{"error":"Invalid or expired session"}"#.to_string(),
+            OpenAiCompatConfig::zero_x(),
+        );
+        assert!(legacy_401.is_invalid_session());
+        assert!(legacy_401
+            .to_string()
+            .starts_with(crate::error::INVALID_SESSION_MESSAGE));
+
+        let html_502 = super::error_from_response(
+            reqwest::StatusCode::BAD_GATEWAY,
+            None,
+            Some(std::time::Duration::from_secs(3)),
+            "<html>bad gateway</html>".to_string(),
+            OpenAiCompatConfig::zero_x(),
+        );
+        assert!(html_502.is_retryable());
+        assert_eq!(
+            html_502.retry_after(),
+            Some(std::time::Duration::from_secs(3))
+        );
+
+        // Other providers keep the generic error unless the body carries
+        // gateway hints.
+        let openai = super::error_from_response(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            None,
+            None,
+            r#"{"error":{"message":"Rate limit","type":"requests","code":"rate_limit_exceeded"}}"#
+                .to_string(),
+            OpenAiCompatConfig::openai(),
+        );
+        assert!(matches!(openai, ApiError::Api { .. }));
+        assert!(openai.is_retryable());
+    }
+
+    #[test]
+    fn zero_x_config_uses_the_short_gateway_retry_policy() {
+        let client = OpenAiCompatClient::new("ses_x", OpenAiCompatConfig::zero_x());
+        assert_eq!(client.max_retries, super::ZERO_X_MAX_RETRIES);
+        assert_eq!(client.max_total_backoff, crate::retry::MAX_TOTAL_BACKOFF);
+        let openai = OpenAiCompatClient::new("sk", OpenAiCompatConfig::openai());
+        assert_eq!(openai.max_retries, super::DEFAULT_MAX_RETRIES);
+        assert_eq!(
+            OpenAiCompatConfig::zero_x().credential_env_vars(),
+            &["NEURON_TOKEN"]
+        );
+    }
+
+    #[test]
+    fn endpoint_debug_output_redacts_the_credential() {
+        let endpoint = super::OpenAiCompatEndpoint::new(
+            OpenAiCompatConfig::zero_x(),
+            "https://zero-x.live/v1",
+            "ses_supersecret0123456789",
+        );
+        let rendered = format!("{endpoint:?}");
+        assert!(!rendered.contains("supersecret"));
+        assert!(rendered.contains("<redacted>"));
+        let client = OpenAiCompatClient::from_endpoint(&endpoint);
+        assert_eq!(client.base_url(), "https://zero-x.live/v1");
+        assert_eq!(client.provider_config(), OpenAiCompatConfig::zero_x());
+    }
+
     use super::{
         build_chat_completion_request, chat_completions_endpoint, is_reasoning_model,
         normalize_finish_reason, openai_tool_choice, parse_tool_arguments, OpenAiCompatClient,

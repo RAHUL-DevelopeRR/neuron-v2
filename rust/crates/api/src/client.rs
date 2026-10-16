@@ -1,7 +1,9 @@
 use crate::error::ApiError;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 use crate::providers::anthropic::{self, AnthropicClient, AuthSource};
-use crate::providers::openai_compat::{self, OpenAiCompatClient, OpenAiCompatConfig};
+use crate::providers::openai_compat::{
+    self, OpenAiCompatClient, OpenAiCompatConfig, OpenAiCompatEndpoint,
+};
 use crate::providers::{self, ProviderKind};
 use crate::types::{MessageRequest, MessageResponse, StreamEvent};
 
@@ -22,8 +24,30 @@ impl ProviderClient {
         model: &str,
         anthropic_auth: Option<AuthSource>,
     ) -> Result<Self, ApiError> {
+        Self::from_model_with_endpoint(
+            model,
+            anthropic_auth,
+            openai_compat::installed_openai_compat_endpoint().as_ref(),
+        )
+    }
+
+    /// Like [`ProviderClient::from_model_with_anthropic_auth`], but OpenAI-kind
+    /// models use `endpoint` (credential and base URL passed explicitly)
+    /// instead of `OPENAI_API_KEY` / `OPENAI_BASE_URL` when it is given.
+    pub fn from_model_with_endpoint(
+        model: &str,
+        anthropic_auth: Option<AuthSource>,
+        endpoint: Option<&OpenAiCompatEndpoint>,
+    ) -> Result<Self, ApiError> {
         let resolved_model = providers::resolve_model_alias(model);
-        match providers::detect_provider_kind(&resolved_model) {
+        let kind = match (endpoint, providers::metadata_for_model(&resolved_model)) {
+            (Some(_), None) => ProviderKind::OpenAi,
+            _ => providers::detect_provider_kind(&resolved_model),
+        };
+        if let (ProviderKind::OpenAi, Some(endpoint)) = (kind, endpoint) {
+            return Ok(Self::OpenAi(OpenAiCompatClient::from_endpoint(endpoint)));
+        }
+        match kind {
             ProviderKind::Anthropic => Ok(Self::Anthropic(match anthropic_auth {
                 Some(auth) => AnthropicClient::from_auth(auth),
                 None => AnthropicClient::from_env()?,
@@ -208,6 +232,31 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    #[test]
+    fn explicit_endpoint_routes_unprefixed_and_openai_models_without_env_credentials() {
+        let _lock = env_lock();
+        let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
+        let _base = EnvVarGuard::set("OPENAI_BASE_URL", None);
+        let endpoint = crate::OpenAiCompatEndpoint::new(
+            crate::OpenAiCompatConfig::zero_x(),
+            "http://127.0.0.1:9/v1",
+            "ses_endpoint0123456789abcdefghij",
+        );
+
+        for model in ["openai/auto", "auto", "groq/openai/gpt-oss-120b"] {
+            let client = ProviderClient::from_model_with_endpoint(model, None, Some(&endpoint))
+                .unwrap_or_else(|error| panic!("{model}: {error}"));
+            match client {
+                ProviderClient::OpenAi(client) => {
+                    assert_eq!(client.base_url(), "http://127.0.0.1:9/v1");
+                }
+                other => panic!("{model} should use the endpoint, got {other:?}"),
+            }
+        }
+        // Without an endpoint the environment is still required.
+        assert!(ProviderClient::from_model_with_endpoint("openai/auto", None, None).is_err());
     }
 
     #[test]

@@ -233,6 +233,12 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     {
         return ProviderKind::OpenAi;
     }
+    // An explicitly installed OpenAI-compatible endpoint (e.g. the Zero-X
+    // gateway) plays the same role as `OPENAI_BASE_URL` without exporting
+    // its credential into the environment.
+    if openai_compat::installed_openai_compat_endpoint().is_some() {
+        return ProviderKind::OpenAi;
+    }
     if anthropic::has_auth_from_env_or_saved().unwrap_or(false) {
         return ProviderKind::Anthropic;
     }
@@ -295,7 +301,12 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
             max_output_tokens: 16_384,
             context_window_tokens: 256_000,
         }),
-        _ => None,
+        // Gateway catalog models (registered from `GET /v1/models`) and the
+        // runtime's verified fallback table.
+        _ => runtime::model_registry::lookup(&canonical).map(|capability| ModelTokenLimit {
+            max_output_tokens: capability.max_output_tokens,
+            context_window_tokens: capability.context_window,
+        }),
     }
 }
 
@@ -726,6 +737,43 @@ mod tests {
             }
             other => panic!("expected context-window preflight failure, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn token_limits_and_preflight_consult_the_runtime_model_registry() {
+        // A gateway catalog model the static table does not know.
+        let model = "openai/test-catalog/registry-limits-model";
+        runtime::model_registry::register([runtime::model_registry::ModelCapability::new(
+            "test-catalog/registry-limits-model",
+            4_096,
+            1_024,
+            true,
+        )]);
+
+        let limit = model_token_limit(model).expect("registered model has limits");
+        assert_eq!(limit.context_window_tokens, 4_096);
+        assert_eq!(limit.max_output_tokens, 1_024);
+        assert_eq!(max_tokens_for_model(model), 1_024);
+
+        let request = MessageRequest {
+            model: model.to_string(),
+            max_tokens: 1_024,
+            messages: vec![InputMessage::user_text("x".repeat(20_000))],
+            ..Default::default()
+        };
+        let error = preflight_message_request(&request)
+            .expect_err("oversized gateway requests should be blocked locally");
+        assert!(matches!(
+            error,
+            ApiError::ContextWindowExceeded {
+                context_window_tokens: 4_096,
+                ..
+            }
+        ));
+
+        // Built-in fallbacks (verified free models) also apply.
+        let gemini = model_token_limit("openai/gemini/gemini-2.5-flash").expect("fallback");
+        assert_eq!(gemini.context_window_tokens, 1_048_576);
     }
 
     #[test]

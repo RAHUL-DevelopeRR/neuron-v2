@@ -1,5 +1,10 @@
 use crate::error::ApiError;
 
+/// `User-Agent` sent by every client built here (`neuron/<version>`).
+/// Providers that set their own identity header (the Anthropic request
+/// profile) still override it per request.
+pub const USER_AGENT: &str = concat!("neuron/", env!("CARGO_PKG_VERSION"));
+
 const HTTP_PROXY_KEYS: [&str; 2] = ["HTTP_PROXY", "http_proxy"];
 const HTTPS_PROXY_KEYS: [&str; 2] = ["HTTPS_PROXY", "https_proxy"];
 const NO_PROXY_KEYS: [&str; 2] = ["NO_PROXY", "no_proxy"];
@@ -82,6 +87,7 @@ pub fn build_http_client_or_default() -> reqwest::Client {
 /// proxy so a single value can route every outbound request.
 pub fn build_http_client_with(config: &ProxyConfig) -> Result<reqwest::Client, ApiError> {
     let mut builder = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
         .no_proxy()
         .connect_timeout(std::time::Duration::from_secs(30))
         .timeout(std::time::Duration::from_mins(5));
