@@ -1607,12 +1607,11 @@ fn check_awk_args(args: &[Word]) -> Result<(), String> {
             match name {
                 "source" => {
                     program_seen = true;
-                    let program = match value {
-                        Some(value) => value,
-                        None => {
-                            index += 1;
-                            args.get(index - 1).map_or("", |word| word.text.as_str())
-                        }
+                    let program = if let Some(value) = value {
+                        value
+                    } else {
+                        index += 1;
+                        args.get(index - 1).map_or("", |word| word.text.as_str())
                     };
                     check_awk_program(program)?;
                 }
@@ -1718,7 +1717,7 @@ fn classify_xargs(args: &[Word], context: &mut Context<'_>) -> Result<(), String
 /// Whether the argument `arg` (conservatively) passes the option `flag`.
 ///
 /// Matches the exact option, an attached `=value`, abbreviations of long
-/// options (getopt_long and git's option parser accept unambiguous prefixes
+/// options (`getopt_long` and git's option parser accept unambiguous prefixes
 /// such as `--ext` for `--ext-diff`), and short options inside a cluster or
 /// with an attached value (`-nO`, `-Ovim` for `-O`). Used to find options
 /// that make a command unsafe, where a false match only costs a prompt.
