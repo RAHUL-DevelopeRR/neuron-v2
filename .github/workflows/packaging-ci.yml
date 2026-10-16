@@ -1,0 +1,247 @@
+name: Packaging CI
+
+# Exercises what users install: the Python launcher, the npm wrapper (unit tests
+# and a packed tarball), install.sh and install.ps1, all against a local fake
+# release server (tests/fake_release.py), plus the third-party notices
+# generator. Nothing here publishes or downloads a real Neuron release.
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/packaging-ci.yml
+      - .github/workflows/release.yml
+      - install.sh
+      - install.ps1
+      - neuron_cli/**
+      - pyproject.toml
+      - npm/neuroncli/**
+      - tests/fake_release.py
+      - tests/test_packaged_launcher.py
+      - tests/test_install_scripts.py
+      - tests/test_npm_package.py
+      - tests/test_packaging_metadata.py
+      - tests/third_party_notices.test.mjs
+      - scripts/generate-third-party-notices.mjs
+      - LICENSE
+      - NOTICE
+      - README.md
+      - USAGE.md
+      - PUBLISHING.md
+      - CHANGELOG.md
+      - SECURITY.md
+      - CONTRIBUTING.md
+      - docs/**
+      - rust/Cargo.toml
+      - rust/Cargo.lock
+      - rust/crates/runtime/bundled-skills/**
+  push:
+    branches:
+      - ux-audit-fixes
+      - main
+    paths:
+      - .github/workflows/packaging-ci.yml
+      - .github/workflows/release.yml
+      - install.sh
+      - install.ps1
+      - neuron_cli/**
+      - pyproject.toml
+      - npm/neuroncli/**
+      - tests/fake_release.py
+      - tests/test_packaged_launcher.py
+      - tests/test_install_scripts.py
+      - tests/test_npm_package.py
+      - tests/test_packaging_metadata.py
+      - tests/third_party_notices.test.mjs
+      - scripts/generate-third-party-notices.mjs
+      - LICENSE
+      - NOTICE
+      - README.md
+      - USAGE.md
+      - PUBLISHING.md
+      - CHANGELOG.md
+      - SECURITY.md
+      - CONTRIBUTING.md
+      - docs/**
+      - rust/Cargo.toml
+      - rust/Cargo.lock
+      - rust/crates/runtime/bundled-skills/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: packaging-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The fake release serves this version; it only has to be a valid semver.
+  SMOKE_VERSION: 6.3.0
+
+jobs:
+  metadata:
+    name: Manifests, licenses and docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check versions, license files, release assets and doc links
+        run: python -m unittest -v tests.test_packaging_metadata
+      - name: Check install.sh syntax (bash and dash)
+        run: |
+          bash -n install.sh
+          dash -n install.sh
+
+  python-launcher:
+    name: Python launcher (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+        python: ['3.12']
+        include:
+          - os: ubuntu-latest
+            python: '3.9'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Launcher tests (fake release server)
+        run: python -m unittest -v tests.test_packaged_launcher
+
+  installers:
+    name: Install scripts (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Installer tests (fake release server)
+        env:
+          # Lets the Windows run exercise install.sh through Git Bash as well. usr\bin\bash.exe,
+          # not the bin\bash.exe wrapper, which puts MSYS directories ahead of the test's PATH.
+          NEURON_TEST_BASH: ${{ runner.os == 'Windows' && 'C:\Program Files\Git\usr\bin\bash.exe' || '' }}
+        run: python -m unittest -v tests.test_install_scripts
+
+      - name: Smoke-test curl | sh against a fake release
+        if: runner.os != 'Windows'
+        run: |
+          root="$RUNNER_TEMP/releases"
+          python tests/fake_release.py stage --root "$root" --version "$SMOKE_VERSION"
+          cp install.sh "$root/"
+          python tests/fake_release.py serve --root "$root" --port-file "$RUNNER_TEMP/port" &
+          server=$!
+          trap 'kill "$server"' EXIT
+          for _ in $(seq 100); do [ -s "$RUNNER_TEMP/port" ] && break; sleep 0.1; done
+          base="http://127.0.0.1:$(cat "$RUNNER_TEMP/port")"
+          curl -fsSL "$base/install.sh" \
+            | NEURON_DOWNLOAD_BASE="$base" NEURON_RELEASES_API="$base/repos/neuron/releases/latest" \
+              NEURON_INSTALL_DIR="$RUNNER_TEMP/bin" sh
+          "$RUNNER_TEMP/bin/neuron" --version | tee /dev/stderr | grep -Fx "neuron-dummy $SMOKE_VERSION"
+
+      - name: Smoke-test irm | iex against a fake release
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'releases'
+          $portFile = Join-Path $env:RUNNER_TEMP 'port'
+          python tests/fake_release.py stage --root $root --version $env:SMOKE_VERSION
+          Copy-Item install.ps1 $root
+          $server = Start-Process python -ArgumentList @('tests/fake_release.py', 'serve', '--root', $root, '--port-file', $portFile) -PassThru -NoNewWindow
+          try {
+            for ($i = 0; $i -lt 100 -and -not ((Test-Path $portFile) -and (Get-Content $portFile))) { Start-Sleep -Milliseconds 100 }
+            $base = "http://127.0.0.1:$(Get-Content $portFile)"
+            $env:NEURON_DOWNLOAD_BASE = $base
+            $env:NEURON_RELEASES_API = "$base/repos/neuron/releases/latest"
+            foreach ($powershell in 'powershell', 'pwsh') {
+              $env:NEURON_INSTALL_DIR = Join-Path $env:RUNNER_TEMP "bin-$powershell"
+              & $powershell -NoProfile -NonInteractive -Command "irm '$base/install.ps1' | iex"
+              if ($LASTEXITCODE -ne 0) { throw "$powershell install failed" }
+              $output = (& (Join-Path $env:NEURON_INSTALL_DIR 'neuron.exe') --version | Out-String).Trim()
+              Write-Host "$powershell -> $output"
+              if ($output -ne "neuron-dummy $env:SMOKE_VERSION") { throw "unexpected output from $powershell install: $output" }
+            }
+          } finally {
+            Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Parse install.ps1 (Windows PowerShell 5.1)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path install.ps1), [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors; throw 'install.ps1 does not parse in Windows PowerShell' }
+
+      - name: Parse install.ps1 (PowerShell 7)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path install.ps1), [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors; throw 'install.ps1 does not parse in PowerShell 7' }
+
+  npm-wrapper:
+    name: npm wrapper (${{ matrix.os }}, Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+        node: ['24']
+        include:
+          - os: ubuntu-latest
+            node: '22'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Launcher and download tests (node --test)
+        working-directory: npm/neuroncli
+        run: npm test
+      - name: Third-party notices generator tests
+        run: node --test tests/third_party_notices.test.mjs
+      - name: npm pack, install the tarball and run it against a fake release
+        env:
+          NEURON_TEST_NPM_PACK: '1'
+        run: python -m unittest -v tests.test_npm_package
+
+  notices:
+    name: Third-party notices
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Fetch crate sources for every target
+        run: cargo fetch --locked --manifest-path rust/Cargo.toml
+      - name: Generate THIRD_PARTY_NOTICES.md
+        run: |
+          node scripts/generate-third-party-notices.mjs --output "$RUNNER_TEMP/THIRD_PARTY_NOTICES.md"
+          grep -q '^## Rust crates' "$RUNNER_TEMP/THIRD_PARTY_NOTICES.md"
+          grep -q '^## Bundled skills' "$RUNNER_TEMP/THIRD_PARTY_NOTICES.md"
+          if grep -q '^### Crates without license metadata' "$RUNNER_TEMP/THIRD_PARTY_NOTICES.md"; then
+            echo "::error::a dependency has no license metadata; review it before release"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: THIRD_PARTY_NOTICES.md
+          path: ${{ runner.temp }}/THIRD_PARTY_NOTICES.md
+          if-no-files-found: error
