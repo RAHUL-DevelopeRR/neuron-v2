@@ -5,7 +5,7 @@
 //! model call: the context window from the shared model registry minus the
 //! output reserve, the tool schemas and the system prompt.
 
-use runtime::context_manager::{estimate_text_tokens, truncate_head_tail};
+use runtime::context_manager::{estimate_text_tokens, truncate_head_tail, ASCII_CHARS_PER_TOKEN};
 
 /// Estimates the token count of `text` (UTF-8 aware; see
 /// [`runtime::context_manager::estimate_text_tokens`]).
@@ -19,9 +19,10 @@ pub fn compress_tool_result(name: &str, output: &str, max_tokens: usize) -> Stri
     if estimate_tokens(output) <= max_tokens {
         return output.to_string();
     }
-    // Four ASCII characters per token; non-ASCII text is truncated further
+    // ASCII_CHARS_PER_TOKEN characters per token; non-ASCII text is truncated further
     // below if the first cut is still over budget.
-    let mut compressed = truncate_head_tail(output, max_tokens.saturating_mul(4));
+    let mut compressed =
+        truncate_head_tail(output, max_tokens.saturating_mul(ASCII_CHARS_PER_TOKEN));
     if estimate_tokens(&compressed) > max_tokens {
         compressed = truncate_head_tail(output, max_tokens);
     }
@@ -49,7 +50,7 @@ mod tests {
     #[test]
     fn estimate_tokens_counts_ascii_and_unicode() {
         assert_eq!(estimate_tokens("hello"), 2);
-        assert_eq!(estimate_tokens("a".repeat(100).as_str()), 25);
+        assert_eq!(estimate_tokens("a".repeat(99).as_str()), 33);
         assert_eq!(estimate_tokens("日本"), 2);
     }
 
@@ -69,7 +70,7 @@ mod tests {
     #[test]
     fn has_no_fixed_input_ceiling() {
         // A large tool result within its own budget is returned untouched.
-        let output = "x".repeat(400_000);
+        let output = "x".repeat(100_000 * ASCII_CHARS_PER_TOKEN);
         assert_eq!(compress_tool_result("bash", &output, 100_000), output);
     }
 }

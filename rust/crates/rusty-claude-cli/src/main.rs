@@ -605,6 +605,15 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
             && io::stdin().is_terminal()
             && io::stdout().is_terminal()
         {
+            let process_args = env::args().skip(1).collect::<Vec<_>>();
+            let unapplied = repl_loop::unapplied_resume_launch_flags(&process_args);
+            if !unapplied.is_empty() {
+                eprintln!(
+                    "error: {}",
+                    repl_loop::unapplied_resume_flags_message(&unapplied, &session_reference)
+                );
+                std::process::exit(2);
+            }
             let launched = repl_loop::launch(repl_loop::ReplLaunch {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
@@ -1855,7 +1864,8 @@ fn mcp_annotation_flag(tool: &McpTool, key: &str) -> bool {
 
 /// Watches for Ctrl-C while a turn runs. The first press cancels the turn's
 /// [`runtime::CancellationToken`] (model stream, tool loop, sub-agents) and
-/// aborts running hooks; a second press force-quits.
+/// aborts running hooks; a second press asks the REPL to save and quit once
+/// the turn unwinds (see [`repl_loop::request_force_quit`]).
 struct HookAbortMonitor {
     stop_tx: Option<Sender<()>>,
     join_handle: Option<JoinHandle<()>>,
@@ -1879,26 +1889,19 @@ impl HookAbortMonitor {
             };
 
             runtime.block_on(async move {
-                let mut wait_for_stop = tokio::task::spawn_blocking(move || {
+                let wait_for_stop = tokio::task::spawn_blocking(move || {
                     let _ = stop_rx.recv();
                 });
-                let mut presses = 0_u32;
-                loop {
-                    tokio::select! {
-                        result = tokio::signal::ctrl_c() => {
-                            if result.is_err() {
-                                break;
-                            }
-                            presses += 1;
-                            if repl_loop::handle_turn_interrupt(presses, &cancel, &abort_signal)
-                                == repl_loop::InterruptAction::ForceQuit
-                            {
-                                std::process::exit(130);
-                            }
-                        }
-                        _ = &mut wait_for_stop => break,
-                    }
-                }
+                repl_loop::watch_turn_interrupts(
+                    tokio::signal::ctrl_c,
+                    async {
+                        let _ = wait_for_stop.await;
+                    },
+                    &cancel,
+                    &abort_signal,
+                    repl_loop::request_force_quit,
+                )
+                .await;
             });
         })
     }

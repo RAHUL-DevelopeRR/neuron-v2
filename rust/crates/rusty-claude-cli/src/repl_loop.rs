@@ -9,6 +9,7 @@ use super::*;
 use runtime::context_manager::{ContextBudget, ContextManager, ContextPolicy, ContextSnapshot};
 use runtime::{CancellationToken, HookAbortSignal, SessionCompaction, TurnOutcome, TurnSummary};
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// What the REPL does after handling one line of input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,12 +79,38 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 pub(crate) enum InterruptAction {
     /// The turn was asked to stop; keep waiting for it.
     Cancelled,
-    /// A second press: quit immediately.
+    /// A second press: save the session and exit once the turn unwinds.
     ForceQuit,
 }
 
-/// First Ctrl-C during a turn cancels it (model stream, tools between calls,
-/// hooks); a second one force-quits.
+/// Set by a second Ctrl-C during a turn: the REPL saves the session, stops
+/// MCP servers and plugins, and exits as soon as the turn has unwound.
+static FORCE_QUIT: AtomicBool = AtomicBool::new(false);
+/// How long a force quit waits for the turn to unwind (a tool that ignores
+/// cancellation) before exiting without cleanup.
+const FORCE_QUIT_GRACE: Duration = Duration::from_secs(5);
+
+/// Whether a second Ctrl-C asked the REPL to exit.
+pub(crate) fn force_quit_requested() -> bool {
+    FORCE_QUIT.load(Ordering::SeqCst)
+}
+
+/// Asks the REPL to exit after the current turn unwinds. A watchdog exits
+/// anyway when that takes longer than [`FORCE_QUIT_GRACE`].
+pub(crate) fn request_force_quit() {
+    if FORCE_QUIT.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    thread::spawn(|| {
+        thread::sleep(FORCE_QUIT_GRACE);
+        eprintln!("\nThe turn did not stop in time; exiting without cleanup.");
+        std::process::exit(130);
+    });
+}
+
+/// First Ctrl-C during a turn cancels it (model stream, tools, hooks and
+/// sub-agents, including ones left running in the background by an earlier
+/// turn); a second one quits after saving.
 pub(crate) fn handle_turn_interrupt(
     presses: u32,
     cancel: &CancellationToken,
@@ -92,13 +119,56 @@ pub(crate) fn handle_turn_interrupt(
     if presses <= 1 {
         cancel.cancel();
         hook_abort.abort();
+        tools::cancel_background_subagents();
         eprintln!(
-            "\n\x1b[33m\u{25a0}\x1b[0m Interrupting\u{2026} \x1b[2m(press Ctrl-C again to force quit)\x1b[0m"
+            "\n\x1b[33m\u{25a0}\x1b[0m Interrupting\u{2026} \x1b[2m(press Ctrl-C again to quit)\x1b[0m"
         );
         InterruptAction::Cancelled
     } else {
-        eprintln!("\nForce quit.");
+        cancel.cancel();
+        eprintln!("\nQuitting: saving the session first\u{2026}");
         InterruptAction::ForceQuit
+    }
+}
+
+/// Feeds every Ctrl-C press from `next_press` through
+/// [`handle_turn_interrupt`] until `stop` resolves (the turn ended) or the
+/// signal source fails. `on_force_quit` runs on a second press.
+pub(crate) async fn watch_turn_interrupts<P, F>(
+    mut next_press: P,
+    stop: impl std::future::Future<Output = ()>,
+    cancel: &CancellationToken,
+    hook_abort: &HookAbortSignal,
+    mut on_force_quit: impl FnMut(),
+) where
+    P: FnMut() -> F,
+    F: std::future::Future<Output = io::Result<()>>,
+{
+    tokio::pin!(stop);
+    let mut presses = 0_u32;
+    loop {
+        tokio::select! {
+            result = next_press() => {
+                if result.is_err() {
+                    break;
+                }
+                presses += 1;
+                if handle_turn_interrupt(presses, cancel, hook_abort) == InterruptAction::ForceQuit {
+                    on_force_quit();
+                }
+            }
+            () = &mut stop => break,
+        }
+    }
+}
+
+/// Shuts the shared MCP servers and plugins down however `launch` returns,
+/// including early errors.
+struct SharedStateShutdown;
+
+impl Drop for SharedStateShutdown {
+    fn drop(&mut self) {
+        crate::progress::shutdown_shared_runtime_state();
     }
 }
 
@@ -142,6 +212,46 @@ pub(crate) fn describe_turn_outcome(summary: &TurnSummary) -> Option<String> {
     (!notes.is_empty()).then(|| notes.join("\n"))
 }
 
+/// Flags that change how an interactive session runs (model, permissions,
+/// tools, workspace checks). The argument parser does not hand them to
+/// `--resume` yet, so an interactive resume refuses them instead of silently
+/// running with defaults, which could be wider than what was asked for.
+const RESUME_LAUNCH_FLAGS: &[&str] = &[
+    "--model",
+    "--permission-mode",
+    "--dangerously-skip-permissions",
+    "--allowedTools",
+    "--allowed-tools",
+    "--reasoning-effort",
+    "--allow-broad-cwd",
+    "--base-commit",
+];
+
+/// Launch flags present in the process arguments (`--flag` or `--flag=value`)
+/// that an interactive `--resume` would not apply.
+pub(crate) fn unapplied_resume_launch_flags(args: &[String]) -> Vec<&'static str> {
+    RESUME_LAUNCH_FLAGS
+        .iter()
+        .copied()
+        .filter(|flag| {
+            args.iter().any(|arg| {
+                arg == flag
+                    || arg
+                        .strip_prefix(flag)
+                        .is_some_and(|rest| rest.starts_with('='))
+            })
+        })
+        .collect()
+}
+
+/// Explains why an interactive resume with launch flags was refused.
+pub(crate) fn unapplied_resume_flags_message(flags: &[&str], session: &str) -> String {
+    let flags = flags.join(", ");
+    format!(
+        "neuron --resume cannot apply {flags} to an interactive session yet, and will not continue with different settings than requested. Start `neuron` with those flags and run `/resume {session}` instead."
+    )
+}
+
 /// Options for starting an interactive session.
 pub(crate) struct ReplLaunch {
     pub model: String,
@@ -165,6 +275,8 @@ pub(crate) fn launch(options: ReplLaunch) -> Result<(), Box<dyn std::error::Erro
         std::process::exit(1);
     }
 
+    // From here on MCP servers may be running: stop them on every exit path.
+    let shutdown = SharedStateShutdown;
     let resolved_model = configure_provider_for_model(resolve_repl_model(options.model))?;
     let mut cli = LiveCli::new(
         resolved_model,
@@ -185,7 +297,15 @@ pub(crate) fn launch(options: ReplLaunch) -> Result<(), Box<dyn std::error::Erro
     }
 
     let result = run_loop(&mut cli, &mut editor);
-    crate::progress::shutdown_shared_runtime_state();
+    // Sub-agents left running in the background must not outlive the session.
+    tools::cancel_background_subagents();
+    drop(shutdown);
+    if force_quit_requested() {
+        if let Err(error) = &result {
+            eprintln!("error: {error}");
+        }
+        std::process::exit(130);
+    }
     result
 }
 
@@ -238,7 +358,9 @@ fn run_loop(
                 if !matches!(input.trim(), "" | "?" | "??") {
                     editor.push_history(input.clone());
                 }
-                if dispatch_line(cli, &input, &mut io::stderr()) == ReplStep::Exit {
+                if dispatch_line(cli, &input, &mut io::stderr()) == ReplStep::Exit
+                    || force_quit_requested()
+                {
                     break;
                 }
             }
@@ -465,8 +587,8 @@ fn group_digits(value: usize) -> String {
 mod tests {
     use super::{
         context_command_argument, describe_turn_outcome, dispatch_line, group_digits,
-        handle_turn_interrupt, render_context_report, ContextReport, InterruptAction, ReplBackend,
-        ReplStep,
+        handle_turn_interrupt, render_context_report, watch_turn_interrupts, ContextReport,
+        InterruptAction, ReplBackend, ReplStep,
     };
     use runtime::context_manager::{ContextBudget, ContextManager, ContextPolicy};
     use runtime::{
@@ -551,6 +673,58 @@ mod tests {
         );
     }
 
+    fn current_thread_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+    }
+
+    #[test]
+    fn monitored_ctrl_c_reaches_the_turn_token_and_a_second_press_quits() {
+        let cancel = CancellationToken::new();
+        let hooks = HookAbortSignal::new();
+        let mut presses_left = 2_u32;
+        let mut force_quits = 0_u32;
+
+        current_thread_runtime().block_on(watch_turn_interrupts(
+            || {
+                let press = if presses_left > 0 {
+                    presses_left -= 1;
+                    Ok(())
+                } else {
+                    Err(std::io::Error::other("signal source closed"))
+                };
+                std::future::ready(press)
+            },
+            std::future::pending(),
+            &cancel,
+            &hooks,
+            || force_quits += 1,
+        ));
+
+        assert!(cancel.is_cancelled(), "the first press cancels the turn");
+        assert!(hooks.is_aborted(), "and aborts running hooks");
+        assert_eq!(force_quits, 1, "the second press asks to quit");
+    }
+
+    #[test]
+    fn interrupt_monitor_stops_with_the_turn_without_cancelling() {
+        let cancel = CancellationToken::new();
+        let hooks = HookAbortSignal::new();
+
+        current_thread_runtime().block_on(watch_turn_interrupts(
+            std::future::pending::<std::io::Result<()>>,
+            std::future::ready(()),
+            &cancel,
+            &hooks,
+            || panic!("no press, no quit"),
+        ));
+
+        assert!(!cancel.is_cancelled());
+        assert!(!hooks.is_aborted());
+    }
+
     fn summary(outcome: TurnOutcome, pruned: usize) -> TurnSummary {
         TurnSummary {
             assistant_messages: Vec::new(),
@@ -624,12 +798,69 @@ mod tests {
 
         assert!(rendered.contains("Context window   131,072 tokens"));
         assert!(rendered.contains("Output reserve   32,000 tokens"));
-        assert!(rendered.contains("Estimated used   ~1,004 tokens"));
+        // 4,000 ASCII chars at 3 chars/token plus 4 tokens of message overhead.
+        assert!(
+            rendered.contains("Estimated used   ~1,338 tokens"),
+            "{rendered}"
+        );
         assert!(rendered.contains("Last compaction  #2 \u{00b7} 31 messages summarized"));
         assert!(rendered.contains("input 1,234,567"));
         let json = super::context_report_json(&report);
         assert_eq!(json["context_window"], 131_072);
         assert_eq!(json["last_compaction"]["removed_messages"], 31);
+    }
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn interactive_resume_refuses_launch_flags_it_cannot_apply_in_either_order() {
+        use super::{unapplied_resume_flags_message, unapplied_resume_launch_flags};
+
+        assert_eq!(
+            unapplied_resume_launch_flags(&args(&[
+                "--permission-mode",
+                "read-only",
+                "--resume",
+                "s.jsonl"
+            ])),
+            vec!["--permission-mode"]
+        );
+        assert_eq!(
+            unapplied_resume_launch_flags(&args(&[
+                "--resume",
+                "s.jsonl",
+                "--permission-mode=read-only"
+            ])),
+            vec!["--permission-mode"]
+        );
+        assert_eq!(
+            unapplied_resume_launch_flags(&args(&[
+                "--allowedTools",
+                "read_file",
+                "--resume",
+                "s.jsonl",
+                "--model",
+                "groq/openai/gpt-oss-120b",
+            ])),
+            vec!["--model", "--allowedTools"]
+        );
+        assert_eq!(
+            unapplied_resume_launch_flags(&args(&[
+                "--resume=s.jsonl",
+                "--dangerously-skip-permissions"
+            ])),
+            vec!["--dangerously-skip-permissions"]
+        );
+        assert!(unapplied_resume_launch_flags(&args(&["--resume", "s.jsonl"])).is_empty());
+        assert!(
+            unapplied_resume_launch_flags(&args(&["--resume", "--modelling.jsonl"])).is_empty()
+        );
+
+        let message = unapplied_resume_flags_message(&["--permission-mode"], "s.jsonl");
+        assert!(message.contains("--permission-mode"));
+        assert!(message.contains("/resume s.jsonl"));
     }
 
     #[test]
