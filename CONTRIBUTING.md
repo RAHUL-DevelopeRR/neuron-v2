@@ -47,7 +47,7 @@ Some tests change process-wide environment variables; if you see flaky failures,
 **Packaging** (from the repository root; Python 3.9 or later and Node.js 22.14 or later):
 
 ```sh
-python -m unittest discover -s tests -v            # launchers, installers, metadata, porting workspace
+python -m unittest discover -s tests -v            # launchers, installers, release workflow, metadata, porting workspace
 cd npm/neuroncli && npm test && cd ../..           # npm launcher (node --test)
 node --test tests/third_party_notices.test.mjs     # notices generator
 NEURON_TEST_NPM_PACK=1 python -m unittest tests.test_npm_package -v   # npm pack + install; needs registry access
@@ -57,8 +57,8 @@ The packaging tests run the real launchers and installers against a local fake r
 server (`tests/fake_release.py`) serving a small dummy `neuron`. On Windows the dummy
 is compiled with the .NET Framework `csc.exe` that ships with Windows; set
 `NEURON_TEST_BASH` to Git for Windows' `usr\bin\bash.exe` to also run the `install.sh`
-tests there. The porting workspace tests write session files to `.port_sessions/`,
-which is ignored.
+and release workflow step tests there. The porting workspace tests write session
+files to `.port_sessions/` in the repository root; delete that directory afterwards.
 
 To try an installer by hand against the fake server:
 
