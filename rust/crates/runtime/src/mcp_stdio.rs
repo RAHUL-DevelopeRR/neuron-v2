@@ -1181,21 +1181,27 @@ pub struct McpStdioProcess {
     newline_delimited: bool,
 }
 
+/// Builds the command that starts a stdio MCP server.
+///
+/// Inherited Zero-X credentials never reach MCP servers; variables the user
+/// configured for this server are applied afterwards and win.
+fn stdio_server_command(transport: &McpStdioTransport) -> Command {
+    let mut command = Command::new(&transport.command);
+    command
+        .args(&transport.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    for key in plugins::subprocess::credential_env_keys() {
+        command.env_remove(key);
+    }
+    apply_env(&mut command, &transport.env);
+    command
+}
+
 impl McpStdioProcess {
     pub fn spawn(transport: &McpStdioTransport) -> io::Result<Self> {
-        let mut command = Command::new(&transport.command);
-        command
-            .args(&transport.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
-        // Inherited Zero-X credentials never reach MCP servers; variables the
-        // user configured for this server are applied afterwards and win.
-        for key in plugins::subprocess::credential_env_keys() {
-            command.env_remove(key);
-        }
-        apply_env(&mut command, &transport.env);
-
+        let mut command = stdio_server_command(transport);
         let mut child = command.spawn()?;
         let stdin = child
             .stdin
@@ -3133,6 +3139,47 @@ mod tests {
                 .tool_call_timeout_ms("custom")
                 .expect("known server"),
             5_000
+        );
+    }
+
+    #[test]
+    fn stdio_servers_do_not_inherit_zero_x_credentials() {
+        let _guard = crate::test_env_lock();
+        std::env::set_var("NEURON_SESSION_TOKEN", "ses_mcp_scrub_session");
+        std::env::set_var("MCP_SCRUB_TEST_API_KEY", "nzx_mcp_scrub_key");
+        std::env::set_var("MCP_SCRUB_TEST_KEEP", "keep-me");
+        let transport = crate::mcp_client::McpStdioTransport {
+            command: "unused".to_string(),
+            args: Vec::new(),
+            // A credential the user configured for this server explicitly.
+            env: BTreeMap::from([("NEURON_TOKEN".to_string(), "nzx_configured".to_string())]),
+            tool_call_timeout_ms: None,
+        };
+        let command = super::stdio_server_command(&transport);
+        std::env::remove_var("NEURON_SESSION_TOKEN");
+        std::env::remove_var("MCP_SCRUB_TEST_API_KEY");
+        std::env::remove_var("MCP_SCRUB_TEST_KEEP");
+
+        let envs = command
+            .as_std()
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(envs.get("NEURON_SESSION_TOKEN"), Some(&None), "{envs:?}");
+        assert_eq!(envs.get("MCP_SCRUB_TEST_API_KEY"), Some(&None), "{envs:?}");
+        assert_eq!(
+            envs.get("NEURON_TOKEN"),
+            Some(&Some("nzx_configured".to_string())),
+            "explicitly configured server env wins: {envs:?}"
+        );
+        assert!(
+            !envs.contains_key("MCP_SCRUB_TEST_KEEP"),
+            "other variables are inherited untouched: {envs:?}"
         );
     }
 }
