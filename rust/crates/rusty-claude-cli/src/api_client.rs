@@ -165,6 +165,31 @@ pub(crate) fn classify_stream_read_error(session_id: &str, error: &api::ApiError
     }
 }
 
+/// Stop reason reported for tool calls the provider closed without
+/// completing them (the output token limit cut them off).
+const OUTPUT_LIMIT_STOP_REASON: &str = "max_tokens";
+
+/// Whether a stream error means the provider ended the message while
+/// tool-call blocks were still open. The OpenAI-compatible stream reports a
+/// tool call that ends with a finish reason other than `tool_calls` (such as
+/// `length`) as an invalid frame once the body is complete. Retrying the
+/// identical request would hit the same output limit again, so this is not
+/// an interruption.
+pub(crate) fn ends_unterminated_tool_call(error: &api::ApiError, tool_blocks_open: bool) -> bool {
+    tool_blocks_open && matches!(error, api::ApiError::InvalidSseFrame(_))
+}
+
+/// Terminal line for a tool call that was cut off at the output limit.
+fn format_cut_off_tool_call(name: &str, input: &str) -> String {
+    if serde_json::from_str::<serde_json::Value>(input).is_ok() {
+        format_tool_call_start(name, input)
+    } else {
+        format!(
+            "\x1b[33m\u{26a0}\x1b[0m `{name}` call was cut off at the output token limit \u{2014} not run; the model will be asked to split it into smaller steps"
+        )
+    }
+}
+
 pub(crate) struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
     client: ApiProviderClient,
@@ -383,6 +408,8 @@ impl AnthropicRuntimeClient {
         let mut block_has_thinking_summary = false;
         let mut saw_stop = false;
         let mut received_any_event = false;
+        let mut stop_reason: Option<String> = None;
+        let mut tool_calls_cut_off = false;
         let render_error =
             |error: io::Error| StreamFailure::Fatal(RuntimeError::new(error.to_string()));
 
@@ -397,6 +424,13 @@ impl AnthropicRuntimeClient {
                 () = cancel.cancelled() => return Err(StreamFailure::Cancelled),
                 result = tokio::time::timeout(deadline, stream.next_event()) => match result {
                     Ok(Ok(next)) => next,
+                    Ok(Err(error)) if ends_unterminated_tool_call(&error, !pending_tools.is_empty()) => {
+                        // Deterministic (the output limit cut the call off):
+                        // hand the partial calls to the runtime instead of
+                        // retrying the identical request.
+                        tool_calls_cut_off = true;
+                        None
+                    }
                     Ok(Err(error)) => return Err(classify_stream_read_error(&self.session_id, &error)),
                     Err(_elapsed) if received_any_event => {
                         return Err(StreamFailure::Idle { waited: self.timeouts.idle })
@@ -501,8 +535,9 @@ impl AnthropicRuntimeClient {
                 }
                 ApiStreamEvent::MessageDelta(delta) => {
                     events.push(AssistantEvent::Usage(delta.usage.token_usage()));
-                    if let Some(stop_reason) = delta.delta.stop_reason {
-                        events.push(AssistantEvent::StopReason(stop_reason));
+                    if let Some(reason) = delta.delta.stop_reason {
+                        stop_reason = Some(reason.clone());
+                        events.push(AssistantEvent::StopReason(reason));
                     }
                 }
                 ApiStreamEvent::MessageStop(_) => {
@@ -517,6 +552,34 @@ impl AnthropicRuntimeClient {
             }
         }
 
+        if !pending_tools.is_empty()
+            && (tool_calls_cut_off || runtime::is_truncation_stop_reason(stop_reason.as_deref()))
+        {
+            // The output limit cut the tool call(s) off. Report them with a
+            // truncation stop reason: the runtime runs none whose arguments are
+            // incomplete and tells the model to split the work instead.
+            if let Some(rendered) = markdown_stream.flush(&renderer) {
+                write!(out, "{rendered}")
+                    .and_then(|()| out.flush())
+                    .map_err(render_error)?;
+            }
+            for (id, name, input) in std::mem::take(&mut pending_tools).into_values() {
+                writeln!(out, "\n{}", format_cut_off_tool_call(&name, &input))
+                    .and_then(|()| out.flush())
+                    .map_err(render_error)?;
+                events.push(AssistantEvent::ToolUse { id, name, input });
+            }
+            if !runtime::is_truncation_stop_reason(stop_reason.as_deref()) {
+                events.push(AssistantEvent::StopReason(
+                    OUTPUT_LIMIT_STOP_REASON.to_string(),
+                ));
+            }
+            if !saw_stop {
+                events.push(AssistantEvent::MessageStop);
+            }
+            push_prompt_cache_record(&self.client, &mut events);
+            return Ok(events);
+        }
         if !pending_tools.is_empty() {
             return Err(StreamFailure::Interrupted {
                 detail: "stream ended before all tool argument blocks completed".to_string(),
@@ -1067,18 +1130,21 @@ pub(crate) fn prompt_cache_record_to_runtime_event(
 #[cfg(test)]
 mod stream_resilience_tests {
     use super::{
-        classify_stream_read_error, response_to_events, AnthropicRuntimeClient, StreamFailure,
-        StreamTimeouts, DEFAULT_FIRST_TOKEN_TIMEOUT, DEFAULT_POST_TOOL_FIRST_TOKEN_TIMEOUT,
-        DEFAULT_STREAM_IDLE_TIMEOUT,
+        classify_stream_read_error, ends_unterminated_tool_call, response_to_events,
+        AnthropicRuntimeClient, StreamFailure, StreamTimeouts, DEFAULT_FIRST_TOKEN_TIMEOUT,
+        DEFAULT_POST_TOOL_FIRST_TOKEN_TIMEOUT, DEFAULT_STREAM_IDLE_TIMEOUT,
     };
     use crate::{ApiProviderClient, MessageResponse};
     use api::{OpenAiCompatClient, OpenAiCompatConfig, OutputContentBlock, Usage};
     use runtime::{
-        ApiClient, ApiRequest, AssistantEvent, CancellationToken, ConversationMessage,
-        RuntimeErrorKind,
+        ApiClient, ApiRequest, AssistantEvent, CancellationToken, ContentBlock,
+        ConversationMessage, ConversationRuntime, PermissionMode, PermissionPolicy,
+        RuntimeErrorKind, Session, StaticToolExecutor,
     };
+    use std::cell::Cell;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -1093,6 +1159,9 @@ mod stream_resilience_tests {
         StallAfterFirstChunk,
         /// Answer with a complete stream cut off by the output limit.
         TruncatedText,
+        /// First answer: a tool call whose arguments the output limit cut
+        /// off (`finish_reason: "length"`); later answers: plain text.
+        TruncatedToolCallThenText,
     }
 
     struct FakeGateway {
@@ -1131,6 +1200,15 @@ mod stream_resilience_tests {
 
     fn sse_chunk(value: &serde_json::Value) -> String {
         format!("data: {value}\n\n")
+    }
+
+    fn write_sse_body(stream: &mut TcpStream, body: &str) {
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.flush();
     }
 
     fn spawn_gateway(behavior: Behavior) -> FakeGateway {
@@ -1172,12 +1250,47 @@ mod stream_resilience_tests {
                             "data: [DONE]\n\n".to_string(),
                         ]
                         .concat();
-                        let _ = write!(
-                            stream,
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                            body.len()
-                        );
-                        let _ = stream.flush();
+                        write_sse_body(&mut stream, &body);
+                    }
+                    Behavior::TruncatedToolCallThenText if counter.load(Ordering::SeqCst) == 1 => {
+                        let body = [
+                            sse_chunk(&serde_json::json!({
+                                "id": "t", "model": "m",
+                                "choices": [{"delta": {"content": "Writing the file."}}]
+                            })),
+                            sse_chunk(&serde_json::json!({
+                                "id": "t", "model": "m",
+                                "choices": [{"delta": {"tool_calls": [{
+                                    "index": 0, "id": "call_big", "type": "function",
+                                    "function": {
+                                        "name": "write_file",
+                                        "arguments": "{\"path\":\"big.txt\",\"content\":\"line 1\\nline 2"
+                                    }
+                                }]}}]
+                            })),
+                            sse_chunk(&serde_json::json!({
+                                "id": "t",
+                                "choices": [{"delta": {}, "finish_reason": "length"}]
+                            })),
+                            "data: [DONE]\n\n".to_string(),
+                        ]
+                        .concat();
+                        write_sse_body(&mut stream, &body);
+                    }
+                    Behavior::TruncatedToolCallThenText => {
+                        let body = [
+                            sse_chunk(&serde_json::json!({
+                                "id": "t", "model": "m",
+                                "choices": [{"delta": {"content": "I will use smaller edits."}}]
+                            })),
+                            sse_chunk(&serde_json::json!({
+                                "id": "t",
+                                "choices": [{"delta": {}, "finish_reason": "stop"}]
+                            })),
+                            "data: [DONE]\n\n".to_string(),
+                        ]
+                        .concat();
+                        write_sse_body(&mut stream, &body);
                     }
                 }
                 holder.lock().expect("hold").push(stream);
@@ -1339,6 +1452,84 @@ mod stream_resilience_tests {
     }
 
     #[test]
+    fn tool_call_cut_off_by_the_output_limit_is_reported_not_retried() {
+        let gateway = spawn_gateway(Behavior::TruncatedToolCallThenText);
+        let mut client = client_for(&gateway, fast_timeouts());
+
+        let events = client
+            .stream(request(false))
+            .expect("a cut-off tool call is a response, not a stream failure");
+
+        assert_eq!(
+            gateway.connections.load(Ordering::SeqCst),
+            1,
+            "deterministic truncation must not resend the request"
+        );
+        let tool_inputs = events
+            .iter()
+            .filter_map(|event| match event {
+                AssistantEvent::ToolUse { id, name, input } => {
+                    Some((id.as_str(), name.as_str(), input.as_str()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tool_inputs,
+            vec![(
+                "call_big",
+                "write_file",
+                "{\"path\":\"big.txt\",\"content\":\"line 1\\nline 2"
+            )]
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AssistantEvent::StopReason(reason) if runtime::is_truncation_stop_reason(Some(reason))
+        )));
+        assert_eq!(events.last(), Some(&AssistantEvent::MessageStop));
+    }
+
+    #[test]
+    fn cut_off_tool_call_is_not_executed_and_the_model_is_asked_to_split_it() {
+        let gateway = spawn_gateway(Behavior::TruncatedToolCallThenText);
+        let client = client_for(&gateway, fast_timeouts());
+        let executed = Rc::new(Cell::new(false));
+        let executed_flag = Rc::clone(&executed);
+        let tools = StaticToolExecutor::new().register("write_file", move |_| {
+            executed_flag.set(true);
+            Ok("written".to_string())
+        });
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            client,
+            tools,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            Vec::new(),
+        );
+
+        let summary = runtime
+            .run_turn("write a large file", None)
+            .expect("the turn recovers from the cut-off call");
+
+        assert!(!executed.get(), "a truncated tool call must never run");
+        assert_eq!(gateway.connections.load(Ordering::SeqCst), 2);
+        assert_eq!(summary.tool_results.len(), 1);
+        let ContentBlock::ToolResult {
+            output, is_error, ..
+        } = &summary.tool_results[0].blocks[0]
+        else {
+            panic!("expected a tool result block");
+        };
+        assert!(*is_error);
+        assert!(output.contains("NOT executed"), "{output}");
+        assert!(output.contains("smaller"), "{output}");
+        assert_eq!(
+            super::final_assistant_text(&summary),
+            "I will use smaller edits."
+        );
+    }
+
+    #[test]
     fn stream_errors_are_classified_by_type() {
         let interrupted = classify_stream_read_error(
             "s",
@@ -1346,6 +1537,16 @@ mod stream_resilience_tests {
         );
         assert!(matches!(interrupted, StreamFailure::Interrupted { .. }));
         assert!(interrupted.is_retryable());
+        // With tool-call blocks still open the same error is an output-limit
+        // cut-off, which the stream reports as a truncated response instead.
+        let cut_off =
+            api::ApiError::InvalidSseFrame("Tool stream ended without a tool_calls finish reason");
+        assert!(ends_unterminated_tool_call(&cut_off, true));
+        assert!(!ends_unterminated_tool_call(&cut_off, false));
+        assert!(!ends_unterminated_tool_call(
+            &api::ApiError::Io(std::io::Error::other("connection reset")),
+            true
+        ));
 
         let io = classify_stream_read_error(
             "s",

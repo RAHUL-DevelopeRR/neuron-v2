@@ -86,9 +86,9 @@ pub use config_validate::{
 };
 pub use conversation::{
     auto_compaction_threshold_from_env, auto_compaction_threshold_override_from_env,
-    resolve_max_iterations, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
-    ConversationRuntime, PromptCacheEvent, RuntimeError, RuntimeErrorKind, StaticToolExecutor,
-    ToolError, ToolExecutor, TurnOutcome, TurnSummary, DEFAULT_MAX_ITERATIONS,
+    is_truncation_stop_reason, resolve_max_iterations, ApiClient, ApiRequest, AssistantEvent,
+    AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError, RuntimeErrorKind,
+    StaticToolExecutor, ToolError, ToolExecutor, TurnOutcome, TurnSummary, DEFAULT_MAX_ITERATIONS,
     INTERRUPTED_TOOL_RESULT, MAX_ITERATIONS_ENV_VAR,
 };
 pub use file_ops::{

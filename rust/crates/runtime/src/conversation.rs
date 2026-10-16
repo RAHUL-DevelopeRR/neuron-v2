@@ -1131,7 +1131,10 @@ fn parse_auto_compaction_threshold(value: Option<&str>) -> u32 {
         .unwrap_or(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)
 }
 
-fn is_truncation_stop_reason(stop_reason: Option<&str>) -> bool {
+/// Whether a provider stop reason means the output token limit cut the
+/// response off (`max_tokens`, `length`, ...).
+#[must_use]
+pub fn is_truncation_stop_reason(stop_reason: Option<&str>) -> bool {
     stop_reason.is_some_and(|reason| {
         TRUNCATED_STOP_REASONS
             .iter()
