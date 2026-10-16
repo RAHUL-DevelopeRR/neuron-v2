@@ -1,5 +1,9 @@
 # Neuron Architecture V2 — Production AI Coding Agent
 
+> Design document. The "current state" below describes Neuron before 6.3.0; see the
+> [changelog](../CHANGELOG.md) for what has shipped (for example the context manager,
+> on-demand skill loading and bounded tool subprocesses).
+
 ## Executive Summary
 
 **Current state**: Token usage explodes exponentially (~17K merge tokens), terminal freezes during subprocess execution, streaming is unbuffered causing rerender storms, full repository injected into every prompt.

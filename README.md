@@ -98,8 +98,9 @@ neuron auth logout    # revokes the session on the gateway and deletes the local
 ```
 
 Login waits for the browser callback on a random `127.0.0.1` port and stores the
-session under `~/.neuroncli/`. The file is obfuscated rather than strongly encrypted,
-so protect that directory like a password file; the
+session in the operating system's credential store on macOS and Windows. On Linux (or
+when that store is unavailable) it goes to `~/.neuroncli/credentials.json`, readable
+only by you; protect that directory like a password file. The
 [security policy](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/SECURITY.md#how-neuron-handles-credentials)
 explains what to do if it leaks. On CI and machines without a browser,
 create a personal API key (`nzx_…`) in the Zero-X dashboard and pass it with
@@ -138,10 +139,12 @@ top-ups are also sold. Prices and current limits are at
 
 You can bypass the gateway with a provider account of your own: for example
 `OPENAI_API_KEY` (plus `OPENAI_BASE_URL` for any OpenAI-compatible endpoint, including
-a local model server), `ANTHROPIC_API_KEY`, `XAI_API_KEY`, `DASHSCOPE_API_KEY` or
+a local model server), `ANTHROPIC_API_KEY`, `XAI_API_KEY`, Azure AI Foundry or
 `OPENROUTER_API_KEY`. OpenRouter is available only this way. While you are signed in
 to Zero-X the gateway stays the default; a provider key is used when you select that
-provider or when you are not signed in. See
+provider (`--provider`, `NEURON_PROVIDER` or the `provider` setting) or when you are
+not signed in. Neuron prints which provider and credential it uses when it starts.
+See
 [Bring your own key](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/USAGE.md#bring-your-own-key).
 
 ## Privacy
@@ -170,8 +173,9 @@ neuron --permission-mode read-only       # read and search only
 ```
 
 Neuron asks you to trust a directory before working in it. The default permission
-mode, `workspace-write`, lets it read and edit files and asks before it runs shell
-commands or other tools that need full access. The
+mode, `workspace-write`, lets it read and edit files in the workspace and run shell
+commands that only read; it asks before any other command, before fetching from a new
+web domain and before other tools that need full access. The
 [usage guide](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/USAGE.md) covers
 commands, slash commands, permission modes, models, sessions and configuration.
 
@@ -179,6 +183,7 @@ commands, slash commands, permission modes, models, sessions and configuration.
 
 - [Usage guide](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/USAGE.md)
 - [Default skills and integrations](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/docs/DEFAULT_INTEGRATIONS.md)
+  (bundled skills are listed in the system prompt and loaded on demand)
 - [Security policy](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/SECURITY.md)
 - [Contributing](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/CONTRIBUTING.md)
 - [Release runbook](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/PUBLISHING.md)

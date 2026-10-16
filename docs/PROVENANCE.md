@@ -8,7 +8,7 @@ summary, not legal advice.
 
 | Part | Origin | License | Notes |
 | --- | --- | --- | --- |
-| `rust/` workspace, including the `rusty-claude-cli` crate that builds `neuron` | [Claw Code](https://github.com/ultraworkers/claw-code), modified since | MIT, "Copyright (c) 2026 UltraWorkers and Claw Code contributors" | Zero-X login, the encrypted session vault, branding and gateway routing were added here. Crate and module names (`rusty-claude-cli`, `claw` settings paths) are inherited. |
+| `rust/` workspace, including the `rusty-claude-cli` crate that builds `neuron` | [Claw Code](https://github.com/ultraworkers/claw-code), modified since | MIT, "Copyright (c) 2026 UltraWorkers and Claw Code contributors" | Zero-X login and credential storage, branding and gateway routing were added here. Crate and module names (`rusty-claude-cli`, `claw` settings paths) are inherited. |
 | `src/`, `tests/test_porting_workspace.py` | Claw Code's Python porting workspace | MIT (as above) | See [reference data snapshots](#reference-data-snapshots). |
 | `PARITY.md`, `PHILOSOPHY.md`, `ROADMAP.md` and other parity documents | Claw Code | MIT (as above) | Describe the upstream project and its `claw` commands. |
 | `rust/crates/runtime/bundled-skills/` | Four third-party skill projects, pinned in `SOURCES.json` | MIT each; texts in `licenses/` and embedded in the binary | See [bundled skills](#bundled-skills). |

@@ -41,22 +41,27 @@ published release are never rebuilt or replaced.
   `## X.Y.Z (YYYY-MM-DD)`. The release notes are taken from that section.
 - Run the checks from [CONTRIBUTING.md](CONTRIBUTING.md#checks): Rust fmt, clippy and
   tests, the Python and Node packaging tests, and the notices generator.
-- Check that the docs describe the binary you are about to ship. Parts of the README,
-  [USAGE.md](USAGE.md) and [SECURITY.md](SECURITY.md) were written against the 6.3.0
-  plan in [docs/GATEWAY_CONTRACT.md](docs/GATEWAY_CONTRACT.md) (section 5). Build the
-  release candidate and confirm each of these works; if one does not, remove or
-  caveat it in the docs before tagging:
-  - `neuron auth login --with-token` (reads a key from standard input), `neuron auth
-    status` and `neuron auth logout`, and `NEURON_TOKEN` accepting a personal API key
-    (`nzx_…`) as well as a session token;
+- Check that the docs describe the binary you are about to ship. The README,
+  [USAGE.md](USAGE.md) and [SECURITY.md](SECURITY.md) describe the 6.3.0 behavior
+  that `rusty-claude-cli/tests/gateway_roundtrip.rs` exercises against a fake gateway
+  and that was exercised live against a local gateway during integration. On the
+  release candidate, confirm at least:
+  - `neuron auth login` (browser and `--with-token`), `neuron auth status` and
+    `neuron auth logout`, with the login kept in the OS credential store on macOS
+    and Windows and in `~/.neuroncli/credentials.json` (mode 0600) on Linux;
+  - `NEURON_TOKEN` with a session token and with a personal API key (`nzx_…`);
   - `neuron usage`, and `/usage`, `/upgrade`, `/login` and `/logout` in a session;
   - `/model` listing the gateway catalog, and `--provider` or the `provider` setting
     choosing a bring-your-own-key provider while signed in;
-  - the gateway error handling in [USAGE.md](USAGE.md#plans-usage-and-limits) (which
-    errors stop and which are retried at most twice);
-  - credential scrubbing: the session token is not exported into the environment, and
-    `NEURON_TOKEN` and provider keys are removed from the environment of shell
-    commands, hooks and MCP servers. Until that ships, SECURITY.md must not claim it.
+  - the gateway error handling in [USAGE.md](USAGE.md#plans-usage-and-limits):
+    terminal codes stop at once, `capacity_exhausted` and `rate_limited` wait up to
+    90 seconds per retry (180 seconds in total) with a countdown, other transient
+    errors retry at most twice within 60 seconds;
+  - credential scrubbing: the session token is not exported into the environment,
+    and `NEURON_TOKEN` and other `ses_`/`nzx_` values are removed from the
+    environment of shell commands, hooks and MCP servers;
+  - `neuron system-prompt` in an empty directory stays under 10,000 characters (the
+    bundled skills are listed, not pasted).
 
 ## 2. Merge
 

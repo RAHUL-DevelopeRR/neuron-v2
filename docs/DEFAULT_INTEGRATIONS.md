@@ -1,11 +1,19 @@
 # Default skills and integrations
 
-Every new Neuron system prompt contains the full Ponytail and AntiSlop core
-instructions and the gstack router. The Skill tool and `/skills list` expose the
-bundled companions: `antislop-ui`, `antislop-copywriting`, `antislop-code`,
-`antislop-human`, `antislop-layoutmobile`, `gstack-investigate`, `gstack-review`,
-`gstack-qa`, `gstack-qa-only`, `gstack-ship` and `agent-reach`. Agent Reach's full
-instructions are also active in every new system prompt.
+Neuron bundles fourteen skills: `ponytail`, `antislop` and its companions
+`antislop-ui`, `antislop-copywriting`, `antislop-code`, `antislop-human` and
+`antislop-layoutmobile`, the `gstack` router with `gstack-investigate`,
+`gstack-review`, `gstack-qa`, `gstack-qa-only` and `gstack-ship`, and `agent-reach`.
+
+They are loaded on demand. The system prompt carries only a short section: how to load
+a skill, the safety boundaries that apply to all of them, a summary of the always-on
+Ponytail and AntiSlop rules (under 1,500 characters), and one line per skill with its
+purpose and when to load it. When a task needs a skill's workflow, the model calls the
+Skill tool with the skill's name and receives the full `SKILL.md`. The four texts
+earlier releases pasted into every request (Ponytail, AntiSlop, the gstack router and
+Agent Reach) alone are over 60,000 characters, about 16,000 tokens. `/skills list`
+shows the bundled skills, and tests keep the default system prompt for an empty
+repository under 10,000 characters.
 
 Instructions are embedded in the native executable, then materialized under a
 content-addressed `bundled-skills` directory in the runtime config home. npm and
@@ -18,6 +26,8 @@ identifiers in `SOURCES.json`. Maintainers refresh them with
 updated files. `--manifest-only` regenerates the file list without network access.
 
 Project and user skills take precedence over bundled names in the Skill tool.
+Instructions do not install integration runtimes, supply provider credentials, or
+bypass the user's tool permissions.
 Install a local skill with `/skills install <directory-with-SKILL.md>`.
 Defaults can be disabled in `settings.json` with `{"defaultSkills": false}`.
 Plugins remain configurable with `/plugins install`, `/plugins enable` and
@@ -39,7 +49,12 @@ JSON-RPC framing by default. For a legacy Content-Length server, set
 `env.NEURON_MCP_FRAMING` to `content-length` in that server's config. Neuron sends
 `notifications/initialized` after a successful initialize response. `/mcp list` shows effective configuration
 with a `bundled` source for defaults. Actual initialization and tool discovery must
-succeed before the model uses those tools. To disable both builtins, configure
+succeed before the model uses those tools. MCP server tools (`mcp__<server>__<tool>`)
+are not sent with every request: the model finds them with `ToolSearch` (by keyword
+or `select:<name>`), after which their schemas are offered for the rest of the
+session, and the `MCPTool` wrapper can call any of them by name. An explicit
+`--allowedTools` list still offers exactly the tools it names. To disable both
+builtins, configure
 `{"defaultMcpServers": false}`. To disable individual servers, configure:
 
 ```json
@@ -58,8 +73,8 @@ automation service or certify a model's computer-use capability.
 ## Agent Reach
 
 [Agent Reach](https://github.com/Panniantong/Agent-Reach) routing instructions are
-embedded and active on every conversation turn, together with its seven platform
-references. The bundle uses upstream's English skill, MIT license and source
+embedded, together with its seven platform references, and load when the model asks
+for the `agent-reach` skill. The bundle uses upstream's English skill, MIT license and source
 commit `a19a171fa980a0785849596492e0af4db800c82f`. Its host adapter checks actual
 CLI availability and uses the operating system's temporary directory.
 Maintainers can refresh just this project with
@@ -79,7 +94,6 @@ and graph tools are available after successful MCP initialization. Configure a
 native `codebase-memory-mcp` executable under that server name to avoid the npm
 wrapper when using a standalone binary.
 
-Skills remain active as instructions throughout the conversation. Instructions
-do not install integration runtimes, supply provider credentials, or bypass the
-user's tool permissions. The gstack adapter preserves investigation and validation
+A loaded skill stays in the conversation like any other tool result (until the
+history is compacted). The gstack adapter preserves investigation and validation
 gates while skipping upstream onboarding, telemetry and unavailable host helpers.

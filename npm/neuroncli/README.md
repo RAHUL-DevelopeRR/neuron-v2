@@ -43,7 +43,7 @@ Behind a proxy on Node 24+, set `NODE_USE_ENV_PROXY=1` together with
 ## Default integrations
 
 Ponytail, antislop, gstack and Agent Reach instructions are embedded in the
-binary. The Codebase Memory and Playwright MCP servers are installed with this
+binary and loaded on demand. The Codebase Memory and Playwright MCP servers are installed with this
 package and enabled by default. Agent Reach's CLI channels need their own setup;
 Playwright provides browser control, while desktop control needs a separately
 configured MCP server. See

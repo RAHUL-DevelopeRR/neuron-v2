@@ -30,10 +30,10 @@ Neuron uses your Zero-X account unless you choose another provider.
 
 | Command | What it does |
 | --- | --- |
-| `neuron auth login` | Opens the Zero-X sign-in page in your browser and waits for the callback on a random `127.0.0.1` port. The callback's state and origin are checked, and the session is stored under `~/.neuroncli/`; protect that directory like a password file ([SECURITY.md](SECURITY.md#how-neuron-handles-credentials)). |
-| `neuron auth login --with-token` | Reads a credential from standard input instead of opening a browser, for CI and remote machines. Use a personal API key (`nzx_…`) from the Zero-X dashboard. |
-| `neuron auth status` | Shows whether a gateway credential is available. |
-| `neuron auth logout` | Revokes the session on the gateway and deletes the local copy. |
+| `neuron auth login` | Opens the Zero-X sign-in page in your browser and waits for the callback on a random `127.0.0.1` port (`--no-browser` prints the URL instead). The callback's state and origin are checked. The session is stored in the OS credential store on macOS and Windows, otherwise in `~/.neuroncli/credentials.json` (owner-only); see [SECURITY.md](SECURITY.md#how-neuron-handles-credentials). |
+| `neuron auth login --with-token` | Reads a credential from standard input instead of opening a browser, for CI and remote machines. Use a personal API key (`nzx_…`) from the Zero-X dashboard, or a session token (`ses_…`). |
+| `neuron auth status` | Checks the credential with the gateway and prints where it came from, the plan, the expiry and today's usage. |
+| `neuron auth logout` | Revokes a session on the gateway and deletes the local copy (API keys are revoked in the dashboard). |
 
 Inside a session, `/login` and `/logout` run the same flows.
 
@@ -43,9 +43,11 @@ printf '%s' "$ZEROX_API_KEY" | neuron auth login --with-token
 ```
 
 You can also set `NEURON_TOKEN` to a key or session for a single process; it takes
-precedence over the stored login and is not saved. `neuron auth logout` does not clear
-it, so unset it yourself. `NEURON_API_BASE` changes the gateway URL (default
-`https://zero-x.live/v1`).
+precedence over the stored login and over any provider choice, and is not saved.
+Neuron removes it (and any other `ses_…` or `nzx_…` value) from the environment of the
+commands, hooks and MCP servers it starts. `neuron auth logout` does not clear it, so
+unset it yourself. `NEURON_API_BASE` changes the gateway URL (default
+`https://zero-x.live/v1`; plain HTTP is accepted only for a loopback address).
 
 Sessions expire after 30 days by default. If the gateway answers `invalid_session`,
 the credential expired or was revoked: run `neuron auth login` again. Revoking all
@@ -65,9 +67,10 @@ Neuron reports gateway limits with the reason and what to do next:
 | Error | Meaning | What Neuron does |
 | --- | --- | --- |
 | `insufficient_quota` | Daily request or token cap reached | Stops and shows the reset time and the upgrade link. No retry. |
-| `rate_limited` | Too many requests per minute, or too many at once | Waits for the `Retry-After` time and retries, at most twice. |
-| `capacity_exhausted` | The shared free pool for this model is used up | Waits for the given delay and retries, at most twice. |
-| `upstream_error`, `upstream_timeout` | The upstream provider failed or stalled; an `upstream_error` is not counted against your daily requests | Retries at most twice. |
+| `rate_limited` | Too many requests per minute, or too many at once | Waits for the `Retry-After` time and retries, at most twice; each wait may be up to 90 seconds and all of them up to 180 seconds, shown as a countdown. |
+| `capacity_exhausted` | The shared free pool for this model is used up | Same as `rate_limited`. A longer wait than that stops with the error. |
+| `upstream_error`, `upstream_timeout`, `service_unavailable` | The upstream provider failed or stalled, or the gateway is briefly unavailable; the gateway refunds most of these requests | Retries at most twice, waiting at most 60 seconds in total. |
+| `model_not_found` | The model id is not in the catalog | Stops; pick one from `/model`. |
 | `upgrade_required` | The model is not in your plan | Stops and shows the upgrade link. |
 | `insufficient_credits` | Paid capacity needed, credit balance too low | Stops and shows the upgrade link. |
 | `region_unavailable` | The free pool is not offered in your region | Stops; choose another model. |
@@ -85,18 +88,34 @@ neuron --model gemini/gemini-2.5-flash
 ```
 
 Inside a session, `/model` shows the active model and the catalog, and
-`/model <id>` switches. The list comes from the gateway (`GET /v1/models`) and marks
-models that are unavailable to you with the reason: not in your plan, not offered in
-your region, or not configured on the gateway. `auto` picks a tool-capable model whose
-context window fits the request. `NEURON_MODEL` sets the model for a process.
+`/model <id>` switches. The list comes from the gateway (`GET /v1/models`, cached for
+10 minutes in `~/.neuroncli/catalog.json`) and marks models that are unavailable to
+you with the reason: not in your plan, not offered in your region, or not configured
+on the gateway. `auto` picks a tool-capable model whose context window fits the
+request. `NEURON_MODEL` sets the model for a process.
+
+Free pools have small per-minute token budgets, so the first request of a session is
+kept small: the system prompt lists the bundled skills by name and the model loads a
+skill's instructions only when it needs them, and MCP server tools are offered
+through `ToolSearch` instead of with every request. In a one-file repository the first
+request is about 17,000 characters (roughly 4,500 tokens).
 
 ## Permission modes
 
-| Mode | Neuron may | Needs your approval |
+| Mode | Neuron may, without asking | Needs your approval |
 | --- | --- | --- |
-| `read-only` | Read and search files | Nothing else is allowed |
-| `workspace-write` (default) | Read, search and edit files in the workspace | Shell commands, sub-agents, MCP tools and other full-access tools |
-| `danger-full-access` | Everything, without asking | Nothing |
+| `read-only` | Read and search files in the workspace, run read-only shell commands | Nothing else is allowed |
+| `workspace-write` (default) | The above, plus edit files in the workspace | Other shell commands, searches or writes outside the workspace, writes to `.git` or Neuron settings, fetches from a new domain, sub-agents, and MCP and other tools that need full access |
+| `danger-full-access` | Everything | Nothing |
+
+A shell command (bash or PowerShell) counts as read-only only when every command in
+the line is a known read-only program with safe arguments, writes nowhere except
+`/dev/null` and names no path outside the workspace; pipes, `&&`, redirections and
+substitutions are all checked. When Neuron asks, it shows the tool, the mode it needs,
+the reason and the input, and runs the call only if you answer `y`. `neuron prompt`
+reads the answer from standard input, so with no input (or anything but `y`) the call
+is denied. `permissions` rules in settings can allow or deny tools and command
+prefixes in advance, for example `{"permissions": {"allow": ["bash(git:*)"]}}`.
 
 Choose the mode with `--permission-mode MODE`, switch inside a session with
 `/permissions MODE`, or set a default in settings:
@@ -116,9 +135,15 @@ Interactive turns are saved to `.neuron/sessions/<session-id>.jsonl` in the proj
 
 ```sh
 neuron --resume latest                         # continue the newest session
+neuron --resume latest --permission-mode read-only   # ...with different launch flags
 neuron --resume latest /status /diff           # run resume-safe commands without the REPL
 neuron export conversation.md                  # write the latest session as Markdown
 ```
+
+On a terminal, `--resume` without slash commands continues the session interactively.
+`--model`, `--permission-mode`, `--allowedTools`, `--reasoning-effort` and the other
+launch flags apply to it whether you put them before or after `--resume`; without
+`--model` it continues on the model the session used.
 
 Inside a session: `/session list`, `/session switch <id>`, `/resume <path>`,
 `/compact` to shrink history, `/clear` to start over.
@@ -152,17 +177,29 @@ Set the key for the provider you want to use:
 | --- | --- |
 | OpenAI or any OpenAI-compatible endpoint | `OPENAI_API_KEY`, optional `OPENAI_BASE_URL` |
 | Local OpenAI-compatible server | `OPENAI_BASE_URL=http://127.0.0.1:<port>/v1` (no key needed) |
-| Anthropic | `ANTHROPIC_API_KEY`, with an Anthropic model |
-| xAI | `XAI_API_KEY` |
-| Alibaba DashScope | `DASHSCOPE_API_KEY` |
+| Anthropic | `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_TOKEN`), with `auto` or a `claude-*` model |
+| xAI | `XAI_API_KEY`, with a `grok-*` model |
 | OpenRouter | `OPENROUTER_API_KEY` (OpenRouter is only available with your own key) |
 | Azure AI Foundry | `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_MODEL` |
 
-When you are signed in to Zero-X, the gateway stays the default and keys in the
-environment are ignored until you select their provider with `--provider` or the
-`provider` setting. When you are not signed in, a configured key is used directly.
-Requests then go straight to that provider under your account and its terms; Zero-X
-limits and credits do not apply.
+Neuron picks the provider in this order and names it, with the credential source, on
+startup:
+
+1. `NEURON_TOKEN` in the environment: the Zero-X gateway.
+2. An explicit choice: `--provider NAME`, then `NEURON_PROVIDER`, then the `provider`
+   setting. Names: `zero-x`, `openai`, `openrouter`, `azure`, `anthropic`, `xai`,
+   `local`. A misspelled name is an error that names the file or flag.
+3. Your stored Zero-X login.
+4. Keys in the environment, in this order: Anthropic (for `auto` or `claude-*`
+   models), xAI (for `grok-*` models), Azure (while its daily quota lasts and the
+   endpoint answers), OpenAI, a loopback `OPENAI_BASE_URL`, OpenRouter.
+5. Otherwise Neuron asks you to run `neuron auth login`.
+
+So while you are signed in to Zero-X, keys in the environment are ignored until you
+select their provider. Requests then go straight to that provider under your account
+and its terms; Zero-X limits and credits do not apply. The key stays in memory and is
+not exported to the commands Neuron runs (keys you exported yourself are, of course,
+already in their environment).
 
 ## Configuration files
 
@@ -172,8 +209,22 @@ limits and credits do not apply.
 | `.neuron/settings.json` | Project settings, safe to commit |
 | `.neuron/settings.local.json` | Your overrides for this project; keep it out of version control |
 
-Later files override earlier ones. `/config` shows the merged result. Default skills
-and MCP servers are configured as described in
+Later files override earlier ones. `/config` shows the merged result. Settings are
+checked when they load: an unknown key or a value of the wrong type is an error that
+names the file, the line and the closest known key. Commonly used keys:
+
+| Key | Purpose |
+| --- | --- |
+| `model` | Default model |
+| `permissionMode` | Default permission mode |
+| `permissions` | `allow`, `ask` and `deny` rules for individual tools |
+| `provider` | Provider to use (see [Bring your own key](#bring-your-own-key)) |
+| `maxIterations` | Model calls allowed in one turn (default 50); `NEURON_MAX_ITERATIONS` overrides it |
+| `hooks` | Commands run before and after tool calls |
+| `mcpServers`, `defaultMcpServers`, `disabledMcpServers` | MCP servers |
+| `defaultSkills` | `false` leaves the bundled skills out of the system prompt |
+
+Default skills and MCP servers are described in
 [default integrations](docs/DEFAULT_INTEGRATIONS.md).
 
 ## Environment variables
@@ -183,7 +234,11 @@ and MCP servers are configured as described in
 | `NEURON_TOKEN` | neuron | Gateway credential for this process |
 | `NEURON_API_BASE` | neuron | Gateway URL (default `https://zero-x.live/v1`) |
 | `NEURON_MODEL` | neuron | Model for this process |
+| `NEURON_PROVIDER` | neuron | Provider for this process (see [Bring your own key](#bring-your-own-key)) |
+| `NEURON_MAX_ITERATIONS` | neuron | Model calls allowed in one turn (default 50) |
 | `NEURON_CONFIG_HOME` | neuron | Settings directory (default `~/.neuron`) |
+| `NEURON_HOME` | neuron | Directory for the login file and caches (default `~/.neuroncli`); setting it also keeps the login out of the OS credential store |
+| `NEURON_CREDENTIAL_STORE` | neuron | `file` or `keychain`: force where the login is kept |
 | `NEURON_VERSION` | install.sh, install.ps1 | Release to install (default: latest) |
 | `NEURON_INSTALL_DIR` | install.sh, install.ps1 | Install directory |
 | `NEURON_BINARY_PATH` | npm and pip launchers | Run this binary instead of the downloaded one |
@@ -200,10 +255,11 @@ and MCP servers are configured as described in
 | npm | `npm install --global @zero-x.live/neuron@latest` | `npm uninstall --global @zero-x.live/neuron` |
 | pip | `pipx upgrade neuroncli` or `pip install --upgrade neuroncli` | `pipx uninstall neuroncli` or `pip uninstall neuroncli` |
 
-Neuron keeps your login in `~/.neuroncli/` and your settings in `~/.neuron/`; the
-launchers cache binaries in `~/.cache/neuroncli` (Linux), `~/Library/Caches/neuroncli`
+Neuron keeps your login in the OS credential store or `~/.neuroncli/`, and your
+settings in `~/.neuron/`; the launchers cache binaries in `~/.cache/neuroncli` (Linux), `~/Library/Caches/neuroncli`
 (macOS) or `%LOCALAPPDATA%\neuroncli` (Windows). Run `neuron auth logout` before
-deleting them so the session is revoked on the gateway too.
+deleting them so the session is revoked on the gateway and removed from the
+credential store too.
 
 ## Troubleshooting
 
