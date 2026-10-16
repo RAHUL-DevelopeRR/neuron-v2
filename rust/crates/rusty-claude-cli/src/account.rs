@@ -234,6 +234,8 @@ pub fn run_usage_command(args: &[String]) -> Result<(), Box<dyn std::error::Erro
 /// `/upgrade` and `neuron upgrade [--no-browser]`: prints the pricing URL
 /// and opens it when running in an interactive terminal.
 pub fn upgrade(open_browser: bool) -> String {
+    // Model availability changes with the plan: refetch the catalog.
+    crate::gateway_catalog::invalidate_cache();
     let url = pricing_url();
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
     let opened = open_browser && interactive && webbrowser::open(&url).is_ok();

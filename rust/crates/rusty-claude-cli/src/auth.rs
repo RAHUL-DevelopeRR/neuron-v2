@@ -651,6 +651,10 @@ fn refresh_stored_metadata(credential: &GatewayCredential, info: &SessionInfo) {
     if credential.plan == info.plan && credential.expires_at == info.expires_at {
         return;
     }
+    if credential.plan.is_some() && credential.plan != info.plan {
+        // Model availability is per plan; refetch the catalog next time.
+        crate::gateway_catalog::invalidate_cache();
+    }
     let mut stored = StoredCredential::new(credential.token.clone());
     stored.plan.clone_from(&info.plan);
     stored.expires_at = info.expires_at;

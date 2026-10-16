@@ -78,10 +78,22 @@ impl LiveCli {
     }
 }
 
+/// The session's catalog, fetched again with the session's gateway
+/// credential when it was dropped (after `/upgrade` or a plan change).
+fn session_catalog() -> Option<std::sync::Arc<crate::gateway_catalog::Catalog>> {
+    active_provider().filter(|active| active.id == ProviderId::ZeroX)?;
+    if let Some(catalog) = crate::gateway_catalog::current() {
+        return Some(catalog);
+    }
+    let endpoint = api::installed_openai_compat_endpoint()?;
+    crate::gateway_catalog::load(&endpoint.base_url, Some(endpoint.api_key()))
+        .map_err(|error| eprintln!("warning: {error}"))
+        .ok()
+}
+
 /// Catalog listing appended to `/model` when the session runs on Zero-X.
 pub(crate) fn gateway_model_listing(current_model: &str) -> Option<String> {
-    active_provider().filter(|active| active.id == ProviderId::ZeroX)?;
-    let catalog = crate::gateway_catalog::current()?;
+    let catalog = session_catalog()?;
     Some(crate::gateway_catalog::render_model_list(
         &catalog,
         current_model,
@@ -91,7 +103,6 @@ pub(crate) fn gateway_model_listing(current_model: &str) -> Option<String> {
 /// Warning for `/model <id>` on Zero-X when the id is unknown or not
 /// available on the user's plan.
 pub(crate) fn gateway_model_warning(model: &str) -> Option<String> {
-    active_provider().filter(|active| active.id == ProviderId::ZeroX)?;
-    let catalog = crate::gateway_catalog::current()?;
+    let catalog = session_catalog()?;
     crate::gateway_catalog::model_choice_warning(&catalog, model)
 }

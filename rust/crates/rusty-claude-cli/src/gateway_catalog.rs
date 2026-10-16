@@ -6,13 +6,14 @@
 //! know each gateway model's window, output budget and tool support.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 use std::time::Duration;
 
 use api::GatewayError;
 use runtime::model_registry::{self, ModelCapability};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::gateway_http::{self, string_field, u64_field, GatewayHttpError};
 
@@ -21,7 +22,8 @@ pub const CACHE_TTL: Duration = Duration::from_secs(600);
 /// The catalog is fetched on startup, so keep the wait short.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 const CATALOG_FILE: &str = "catalog.json";
-const CACHE_VERSION: u64 = 1;
+/// Version 2 keys the cache by [`credential_key`].
+const CACHE_VERSION: u64 = 2;
 
 /// One `data[]` entry of `GET /v1/models`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,8 +103,26 @@ impl CatalogModel {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Catalog {
     pub base_url: String,
+    /// [`credential_key`] of the caller it was fetched for: `available` is
+    /// computed per caller plan (contract §3.2).
+    pub credential_key: String,
     pub fetched_at: u64,
     pub models: Vec<CatalogModel>,
+}
+
+/// Identifies whose catalog this is without storing the credential: a
+/// truncated, domain-separated SHA-256 of the token, or `anonymous`.
+pub fn credential_key(token: Option<&str>) -> String {
+    token.map_or_else(
+        || "anonymous".to_string(),
+        |token| {
+            let digest = Sha256::new()
+                .chain_update(b"neuron-catalog-cache\0")
+                .chain_update(token.as_bytes())
+                .finalize();
+            hex::encode(&digest[..8])
+        },
+    )
 }
 
 impl Catalog {
@@ -189,16 +209,20 @@ pub fn invalidate_cache() {
 /// then the network, then a stale disk cache. Registers it into the model
 /// registry. A 401 is reported as [`CatalogError::InvalidSession`].
 pub fn load(base_url: &str, token: Option<&str>) -> Result<Arc<Catalog>, CatalogError> {
-    if let Some(catalog) = current().filter(|catalog| catalog.base_url == base_url) {
+    let key = credential_key(token);
+    if let Some(catalog) =
+        current().filter(|catalog| catalog.base_url == base_url && catalog.credential_key == key)
+    {
         return Ok(catalog);
     }
     let now = crate::clock::now_unix();
-    let cached = read_cache(base_url, token.is_some());
+    let path = cache_path();
+    let cached = read_cache(&path, base_url, &key);
     let catalog = match cached {
         Some(catalog) if now.saturating_sub(catalog.fetched_at) < CACHE_TTL.as_secs() => catalog,
         cached => match fetch(base_url, token, now) {
             Ok((catalog, raw)) => {
-                write_cache(&catalog, &raw, token.is_some());
+                write_cache(&path, &catalog, &raw);
                 catalog
             }
             Err(GatewayHttpError::InvalidSession(error)) => {
@@ -228,6 +252,7 @@ fn fetch(
     Ok((
         Catalog {
             base_url: base_url.to_string(),
+            credential_key: credential_key(token),
             fetched_at: now,
             models,
         },
@@ -235,30 +260,32 @@ fn fetch(
     ))
 }
 
-fn read_cache(base_url: &str, authenticated: bool) -> Option<Catalog> {
-    let value = serde_json::from_str::<Value>(&fs::read_to_string(cache_path()).ok()?).ok()?;
+/// The cached catalog, only when it was fetched from `base_url` for the
+/// caller identified by `key`.
+fn read_cache(path: &Path, base_url: &str, key: &str) -> Option<Catalog> {
+    let value = serde_json::from_str::<Value>(&fs::read_to_string(path).ok()?).ok()?;
     if u64_field(&value, "version") != Some(CACHE_VERSION)
         || value.get("base_url").and_then(Value::as_str) != Some(base_url)
-        || value.get("authenticated").and_then(Value::as_bool) != Some(authenticated)
+        || value.get("credential").and_then(Value::as_str) != Some(key)
     {
         return None;
     }
     Some(Catalog {
         base_url: base_url.to_string(),
+        credential_key: key.to_string(),
         fetched_at: u64_field(&value, "fetched_at")?,
         models: parse_catalog(&value).ok()?,
     })
 }
 
-fn write_cache(catalog: &Catalog, raw: &Value, authenticated: bool) {
-    let path = cache_path();
+fn write_cache(path: &Path, catalog: &Catalog, raw: &Value) {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
     let document = json!({
         "version": CACHE_VERSION,
         "base_url": catalog.base_url,
-        "authenticated": authenticated,
+        "credential": catalog.credential_key,
         "fetched_at": catalog.fetched_at,
         "data": raw,
     });
@@ -445,9 +472,52 @@ mod tests {
     fn sample_catalog() -> Catalog {
         Catalog {
             base_url: "http://127.0.0.1:1/v1".into(),
+            credential_key: credential_key(None),
             fetched_at: crate::clock::now_unix(),
             models: parse_catalog(&sample_value()).unwrap(),
         }
+    }
+
+    #[test]
+    fn credential_keys_tell_callers_apart_without_revealing_the_token() {
+        let token = "ses_012345678901234567890123456789";
+        let key = credential_key(Some(token));
+        assert_eq!(key, credential_key(Some(token)), "stable across runs");
+        assert_eq!(key.len(), 16);
+        assert!(key.bytes().all(|byte| byte.is_ascii_hexdigit()), "{key}");
+        assert_ne!(
+            key,
+            credential_key(Some("ses_another0123456789abcdefghijk"))
+        );
+        assert_eq!(credential_key(None), "anonymous");
+    }
+
+    #[test]
+    fn disk_cache_is_only_reused_for_the_same_gateway_and_credential() {
+        let dir =
+            std::env::temp_dir().join(format!("neuron-catalog-cache-unit-{}", std::process::id()));
+        let path = dir.join(CATALOG_FILE);
+        let mine = credential_key(Some("ses_012345678901234567890123456789"));
+        let catalog = Catalog {
+            credential_key: mine.clone(),
+            ..sample_catalog()
+        };
+        write_cache(&path, &catalog, &sample_value()["data"]);
+
+        let cached = read_cache(&path, &catalog.base_url, &mine).expect("same caller");
+        assert_eq!(cached.models, catalog.models);
+        assert_eq!(cached.credential_key, mine);
+        assert!(read_cache(&path, &catalog.base_url, &credential_key(None)).is_none());
+        assert!(read_cache(
+            &path,
+            &catalog.base_url,
+            &credential_key(Some("nzx_otherkey0123456789ab"))
+        )
+        .is_none());
+        assert!(read_cache(&path, "https://other.example/v1", &mine).is_none());
+        let stored = fs::read_to_string(&path).unwrap();
+        assert!(!stored.contains("ses_"), "the token is never written");
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
