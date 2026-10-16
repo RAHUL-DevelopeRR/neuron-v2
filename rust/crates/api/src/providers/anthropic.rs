@@ -15,6 +15,7 @@ use telemetry::{AnalyticsEvent, AnthropicRequestProfile, ClientIdentity, Session
 use crate::error::ApiError;
 use crate::http_client::build_http_client_or_default;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
+use crate::retry::{plan_retry_delay, retry_after_from_headers, MAX_TOTAL_BACKOFF};
 
 use super::{
     anthropic_missing_credentials, model_token_limit, resolve_model_alias, Provider, ProviderFuture,
@@ -28,6 +29,12 @@ const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(128);
 const DEFAULT_MAX_RETRIES: u32 = 8;
+
+/// Request profile identifying Neuron (`user-agent: neuron/<version>`)
+/// instead of the telemetry crate's upstream default.
+fn neuron_request_profile() -> AnthropicRequestProfile {
+    AnthropicRequestProfile::new(ClientIdentity::new("neuron", env!("CARGO_PKG_VERSION")))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthSource {
@@ -134,7 +141,7 @@ impl AnthropicClient {
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
-            request_profile: AnthropicRequestProfile::default(),
+            request_profile: neuron_request_profile(),
             session_tracer: None,
             prompt_cache: None,
             last_prompt_cache_record: Arc::new(Mutex::new(None)),
@@ -150,7 +157,7 @@ impl AnthropicClient {
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
-            request_profile: AnthropicRequestProfile::default(),
+            request_profile: neuron_request_profile(),
             session_tracer: None,
             prompt_cache: None,
             last_prompt_cache_record: Arc::new(Mutex::new(None)),
@@ -404,9 +411,11 @@ impl AnthropicClient {
     ) -> Result<reqwest::Response, ApiError> {
         let mut attempts = 0;
         let mut last_error: Option<ApiError>;
+        let mut slept = Duration::ZERO;
 
         loop {
             attempts += 1;
+            let mut retry_after = None;
             if let Some(session_tracer) = &self.session_tracer {
                 session_tracer.record_http_request_started(
                     attempts,
@@ -415,7 +424,11 @@ impl AnthropicClient {
                     Map::new(),
                 );
             }
-            match self.send_raw_request(request).await {
+            let sent = self.send_raw_request(request).await;
+            if let Ok(response) = &sent {
+                retry_after = retry_after_from_headers(response.headers());
+            }
+            match sent {
                 Ok(response) => match expect_success(response).await {
                     Ok(response) => {
                         if let Some(session_tracer) = &self.session_tracer {
@@ -454,7 +467,15 @@ impl AnthropicClient {
                 break;
             }
 
-            tokio::time::sleep(self.jittered_backoff_for_attempt(attempts)?).await;
+            // Honour `Retry-After` and keep the total wait across retries
+            // within MAX_TOTAL_BACKOFF instead of sleeping for minutes.
+            let backoff = self.jittered_backoff_for_attempt(attempts)?;
+            let Some(delay) = plan_retry_delay(retry_after, backoff, slept, MAX_TOTAL_BACKOFF)
+            else {
+                break;
+            };
+            tokio::time::sleep(delay).await;
+            slept += delay;
         }
 
         Err(ApiError::RetriesExhausted {

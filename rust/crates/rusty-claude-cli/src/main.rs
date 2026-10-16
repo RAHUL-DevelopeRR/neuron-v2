@@ -39,12 +39,18 @@
     clippy::many_single_char_names,
     clippy::wildcard_imports
 )]
+mod account;
 mod api_client;
 mod args;
 mod auth;
 mod brand;
+mod clock;
+mod credentials;
 mod doctor;
 mod executor;
+mod gateway_catalog;
+mod gateway_http;
+mod gateway_repl;
 mod init;
 mod input;
 mod orchestrator;
@@ -250,8 +256,13 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
-    if args.first().is_some_and(|arg| arg == "auth") {
-        return auth::run_auth_command(&args[1..]);
+    let (args, provider_choice) = extract_provider_flag(&args)?;
+    provider::set_provider_flag(provider_choice);
+    match args.first().map(String::as_str) {
+        Some("auth") => return auth::run_auth_command(&args[1..]),
+        Some("usage") => return account::run_usage_command(&args[1..]),
+        Some("upgrade") => return account::run_upgrade_command(&args[1..]),
+        _ => {}
     }
     match parse_args(&args)? {
         CliAction::DumpManifests {
@@ -1318,27 +1329,12 @@ fn run_stale_base_preflight(flag_value: Option<&str>) {
     }
 }
 
+/// Selects the provider (see `provider.rs` for the precedence), hands its
+/// credential to the API client in memory and prints one startup line. The
+/// credential is never exported into the environment, so tool, MCP and hook
+/// subprocesses cannot inherit it.
 fn configure_provider_for_model(model: String) -> Result<String, Box<dyn std::error::Error>> {
-    if auth::cached_gateway_token()?.is_none() {
-        if model == DEFAULT_MODEL && resolve_cli_auth_source().is_ok() {
-            return Ok("claude-opus-4-6".to_string());
-        }
-        let kind = detect_provider_kind(&model);
-        if (kind == ProviderKind::Anthropic && resolve_cli_auth_source().is_ok())
-            || (kind == ProviderKind::Xai
-                && env::var("XAI_API_KEY").is_ok_and(|key| !key.is_empty()))
-        {
-            return Ok(model);
-        }
-    }
-
-    let (api_key, base_url, resolved_model, provider_label) = resolve_provider(&model)?;
-    if provider_label == "zero-x" {
-        std::env::set_var("NEURON_API_BASE", &base_url);
-    }
-    std::env::set_var("OPENAI_API_KEY", api_key);
-    std::env::set_var("OPENAI_BASE_URL", base_url);
-    Ok(resolved_model)
+    provider::configure_provider(&model)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -2018,14 +2014,20 @@ impl LiveCli {
             .or_else(|_| env::var("USER"))
             .unwrap_or_else(|_| "Developer".to_string());
         let model_short = self.model.split('/').last().unwrap_or(&self.model);
-        let provider = if std::env::var("OPENAI_BASE_URL").map_or(false, |u| u.contains("azure")) {
-            "Azure"
-        } else {
-            "OpenRouter"
-        };
+        let active = provider::active_provider();
+        let provider = active.as_ref().map_or_else(
+            || provider::active_provider_name(&self.model),
+            |active| active.id.display_name().to_string(),
+        );
         let version = VERSION;
-        let quota = crate::quota::QuotaState::load();
-        let quota_str = quota.display_compact();
+        // Plan for the gateway, the local daily quota for Azure.
+        let quota_str = match &active {
+            Some(active) if active.id == provider::ProviderId::Azure => {
+                crate::quota::QuotaState::load().display_compact()
+            }
+            Some(active) => active.plan.clone().unwrap_or_else(|| "-".to_string()),
+            None => "-".to_string(),
+        };
 
         // -- Brand colors --
         use crate::brand::*;
@@ -2119,8 +2121,8 @@ impl LiveCli {
 
         // What's new items
         let news = [
-            format!("{d}- 44K token/day Azure quota{r}"),
-            format!("{d}- OpenRouter free fallback{r}"),
+            format!("{d}- Zero-X model catalog: /model{r}"),
+            format!("{d}- Plan usage: /usage, /upgrade{r}"),
             format!("{d}- {repo_status}{r}"),
             format!("{d}/release-notes for more{r}"),
         ];
@@ -2165,7 +2167,7 @@ impl LiveCli {
 
         // Model info
         let model_info = format!(
-            "{g}{ms}{r} {d}.{r} {b}{prov}{r} {d}. Quota: {qs}{r}",
+            "{g}{ms}{r} {d}.{r} {b}{prov}{r} {d}. Plan: {qs}{r}",
             ms = model_short,
             prov = provider,
             qs = quota_str
@@ -2202,13 +2204,16 @@ impl LiveCli {
     }
 
     fn repl_completion_candidates(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        Ok(slash_command_completion_candidates_with_sessions(
-            &self.model,
-            Some(&self.session.id),
-            list_managed_sessions()?
-                .into_iter()
-                .map(|session| session.id)
-                .collect(),
+        // On Zero-X, `/model` completes catalog ids instead of Anthropic aliases.
+        Ok(gateway_catalog::adjust_model_completions(
+            slash_command_completion_candidates_with_sessions(
+                &self.model,
+                Some(&self.session.id),
+                list_managed_sessions()?
+                    .into_iter()
+                    .map(|session| session.id)
+                    .collect(),
+            ),
         ))
     }
 
@@ -2573,10 +2578,11 @@ impl LiveCli {
                 println!("{}", format_cost_report(usage));
                 false
             }
-            SlashCommand::Login
-            | SlashCommand::Logout
-            | SlashCommand::Vim
-            | SlashCommand::Upgrade
+            SlashCommand::Login => self.gateway_login()?,
+            SlashCommand::Logout => Self::gateway_logout(),
+            SlashCommand::Usage { .. } => Self::gateway_usage(),
+            SlashCommand::Upgrade => Self::gateway_upgrade(),
+            SlashCommand::Vim
             | SlashCommand::Share
             | SlashCommand::Feedback
             | SlashCommand::Files
@@ -2597,7 +2603,6 @@ impl LiveCli {
             | SlashCommand::Tasks { .. }
             | SlashCommand::Theme { .. }
             | SlashCommand::Voice { .. }
-            | SlashCommand::Usage { .. }
             | SlashCommand::Rename { .. }
             | SlashCommand::Copy { .. }
             | SlashCommand::Hooks { .. }
@@ -2822,6 +2827,9 @@ impl LiveCli {
                     self.runtime.usage().turns(),
                 )
             );
+            if let Some(listing) = gateway_repl::gateway_model_listing(&self.model) {
+                println!("\n{listing}");
+            }
             return Ok(false);
         };
 
@@ -2831,6 +2839,9 @@ impl LiveCli {
         } else {
             model
         };
+        if let Some(warning) = gateway_repl::gateway_model_warning(&model) {
+            eprintln!("{warning}");
+        }
 
         if model == self.model {
             println!(

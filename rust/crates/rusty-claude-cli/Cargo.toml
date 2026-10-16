@@ -36,6 +36,17 @@ constant_time_eq = "0.3"
 hex = "0.4"
 dirs = "6"
 
+# OS credential stores only on platforms whose native backend needs no extra
+# system libraries. Linux (and anything else) uses the 0600 credentials file,
+# so CI builds there never pull in D-Bus/secret-service.
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+keyring = { version = "3.6", default-features = false, features = ["apple-native", "windows-native"] }
+
+# The account's home from directory services (getpwuid_r), so a run with an
+# overridden HOME never touches the real login Keychain item.
+[target.'cfg(target_os = "macos")'.dependencies]
+nix = { version = "0.29", default-features = false, features = ["user"] }
+
 [lints]
 workspace = true
 

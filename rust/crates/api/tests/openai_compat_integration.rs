@@ -5,14 +5,423 @@ use std::sync::{Mutex as StdMutex, OnceLock};
 
 use api::{
     ApiError, ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent,
-    ContentBlockStopEvent, InputContentBlock, InputMessage, MessageDeltaEvent, MessageRequest,
-    OpenAiCompatClient, OpenAiCompatConfig, OutputContentBlock, ProviderClient, StreamEvent,
-    ToolChoice, ToolDefinition,
+    ContentBlockStopEvent, GatewayErrorCode, InputContentBlock, InputMessage, MessageDeltaEvent,
+    MessageRequest, OpenAiCompatClient, OpenAiCompatConfig, OpenAiCompatEndpoint,
+    OutputContentBlock, ProviderClient, RetryNotice, RetryObserver, StreamEvent, ToolChoice,
+    ToolDefinition, UsageObserver,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+
+const COMPLETION_BODY: &str = "{\"id\":\"chatcmpl_gw\",\"model\":\"auto\",\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"ok\",\"tool_calls\":[]},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}";
+
+fn recording_observer() -> (RetryObserver, Arc<StdMutex<Vec<RetryNotice>>>) {
+    let notices = Arc::new(StdMutex::new(Vec::new()));
+    let sink = Arc::clone(&notices);
+    let observer = RetryObserver::new(move |notice: &RetryNotice| {
+        sink.lock().unwrap().push(notice.clone());
+    });
+    (observer, notices)
+}
+
+fn gateway_client(base_url: String, observer: RetryObserver) -> OpenAiCompatClient {
+    OpenAiCompatClient::new(
+        "ses_012345678901234567890123456789",
+        OpenAiCompatConfig::zero_x(),
+    )
+    .with_base_url(base_url)
+    .with_retry_observer(Some(observer))
+}
+
+#[tokio::test]
+async fn zero_x_insufficient_quota_is_never_retried() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let quota = r#"{"error":{"message":"Daily request limit reached for the Free plan","type":"insufficient_quota","code":"insufficient_quota","request_id":"req_quota","upgrade_url":"https://zero-x.live/pricing","resets_at":"2026-10-17T00:00:00Z"}}"#;
+    let server = spawn_server(
+        state.clone(),
+        vec![
+            http_response_with_headers(
+                "429 Too Many Requests",
+                "application/json",
+                quota,
+                &[("retry-after", "0")],
+            ),
+            http_response("200 OK", "application/json", COMPLETION_BODY),
+        ],
+    )
+    .await;
+    let (observer, notices) = recording_observer();
+
+    let error = gateway_client(server.base_url(), observer)
+        .send_message(&sample_request(false))
+        .await
+        .expect_err("quota exhaustion must surface immediately");
+
+    let gateway = error.gateway_error().expect("gateway envelope");
+    assert_eq!(
+        gateway.code_kind(),
+        Some(GatewayErrorCode::InsufficientQuota)
+    );
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("resets at 2026-10-17T00:00:00Z"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("upgrade: https://zero-x.live/pricing"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("request req_quota"), "{rendered}");
+    assert_eq!(state.lock().await.len(), 1, "no retry may be sent");
+    assert!(notices.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn zero_x_capacity_exhausted_waits_for_retry_after_then_succeeds() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let busy = r#"{"error":{"message":"The shared free pool is busy","type":"server_error","code":"capacity_exhausted","retry_after_seconds":1,"upgrade_url":"https://zero-x.live/pricing"}}"#;
+    let server = spawn_server(
+        state.clone(),
+        vec![
+            http_response_with_headers(
+                "503 Service Unavailable",
+                "application/json",
+                busy,
+                &[("retry-after", "1")],
+            ),
+            http_response("200 OK", "application/json", COMPLETION_BODY),
+        ],
+    )
+    .await;
+    let (observer, notices) = recording_observer();
+
+    let started = std::time::Instant::now();
+    let response = gateway_client(server.base_url(), observer)
+        .send_message(&sample_request(false))
+        .await
+        .expect("retry after the advertised delay should succeed");
+
+    assert_eq!(response.total_tokens(), 4);
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(1),
+        "Retry-After must be honoured"
+    );
+    let captured = state.lock().await;
+    assert_eq!(captured.len(), 2);
+    assert_eq!(
+        captured[0].headers.get("user-agent").map(String::as_str),
+        Some(api::USER_AGENT)
+    );
+    let notices = notices.lock().unwrap();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].delay, std::time::Duration::from_secs(1));
+    assert_eq!(notices[0].reason, "capacity_exhausted");
+    assert_eq!(notices[0].provider, "Zero-X");
+    assert_eq!(notices[0].max_retries, 2);
+}
+
+#[tokio::test]
+async fn zero_x_retries_transient_gateway_errors_at_most_twice() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let upstream = r#"{"error":{"message":"Upstream failed after failover","type":"server_error","code":"upstream_error","request_id":"req_up"}}"#;
+    let failure = http_response_with_headers(
+        "502 Bad Gateway",
+        "application/json",
+        upstream,
+        &[("retry-after", "0")],
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![
+            failure.clone(),
+            failure.clone(),
+            failure,
+            http_response("200 OK", "application/json", COMPLETION_BODY),
+        ],
+    )
+    .await;
+    let (observer, notices) = recording_observer();
+
+    let error = gateway_client(server.base_url(), observer)
+        .send_message(&sample_request(false))
+        .await
+        .expect_err("three upstream failures exhaust the gateway retry budget");
+
+    match &error {
+        ApiError::RetriesExhausted { attempts, .. } => assert_eq!(*attempts, 3),
+        other => panic!("expected RetriesExhausted, got {other:?}"),
+    }
+    assert_eq!(error.request_id(), Some("req_up"));
+    assert_eq!(state.lock().await.len(), 3);
+    assert_eq!(notices.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn retry_after_longer_than_the_budget_ends_retries_immediately() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let limited = r#"{"error":{"message":"Too many requests","type":"rate_limit_error","code":"rate_limited","retry_after_seconds":120}}"#;
+    let server = spawn_server(
+        state.clone(),
+        vec![
+            http_response_with_headers(
+                "429 Too Many Requests",
+                "application/json",
+                limited,
+                &[("retry-after", "120")],
+            ),
+            http_response("200 OK", "application/json", COMPLETION_BODY),
+        ],
+    )
+    .await;
+    let (observer, notices) = recording_observer();
+
+    let started = std::time::Instant::now();
+    let error = gateway_client(server.base_url(), observer)
+        .send_message(&sample_request(false))
+        .await
+        .expect_err("a 120s Retry-After does not fit the 60s budget");
+
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert!(error.to_string().contains("retry in 120s"), "{error}");
+    assert_eq!(state.lock().await.len(), 1);
+    assert!(notices.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn overflowing_retry_after_header_ends_retries_without_panicking() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let exhausted = r#"{"error":{"message":"All upstream capacity is busy","type":"capacity_exhausted","code":"capacity_exhausted"}}"#;
+    let server = spawn_server(
+        state.clone(),
+        vec![
+            http_response_with_headers(
+                "503 Service Unavailable",
+                "application/json",
+                exhausted,
+                &[("retry-after", "99999999999999999999")],
+            ),
+            http_response("200 OK", "application/json", COMPLETION_BODY),
+        ],
+    )
+    .await;
+    let (observer, notices) = recording_observer();
+
+    let error = gateway_client(server.base_url(), observer)
+        .send_message(&sample_request(false))
+        .await
+        .expect_err("a delay that overflows Duration never fits the budget");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("All upstream capacity is busy"),
+        "{message}"
+    );
+    assert!(!message.contains("retry in"), "{message}");
+    assert_eq!(state.lock().await.len(), 1);
+    assert!(notices.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn stream_cut_off_without_finish_reason_or_done_is_truncated() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let sse = "data: {\"id\":\"cut\",\"model\":\"auto\",\"choices\":[{\"delta\":{\"content\":\"Half of the ans\"}}]}\n\n";
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "text/event-stream", sse)],
+    )
+    .await;
+    let (observer, _) = recording_observer();
+
+    let mut stream = gateway_client(server.base_url(), observer)
+        .stream_message(&sample_request(false))
+        .await
+        .expect("stream should start");
+    let error = loop {
+        match stream.next_event().await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("a truncated stream must not end cleanly"),
+            Err(error) => break error,
+        }
+    };
+    assert!(
+        matches!(error, ApiError::StreamTruncated { ref provider, .. } if provider == "Zero-X"),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn every_provider_honours_retry_after_on_retryable_errors() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let server = spawn_server(
+        state.clone(),
+        vec![
+            http_response_with_headers(
+                "429 Too Many Requests",
+                "application/json",
+                r#"{"error":{"message":"Rate limit reached","type":"requests","code":"rate_limit_exceeded"}}"#,
+                &[("retry-after", "1")],
+            ),
+            http_response("200 OK", "application/json", COMPLETION_BODY),
+        ],
+    )
+    .await;
+    let (observer, notices) = recording_observer();
+    // Tiny exponential backoff: only Retry-After can explain a 1s wait.
+    let client = OpenAiCompatClient::new("sk-test", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url())
+        .with_retry_policy(
+            3,
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(2),
+        )
+        .with_retry_observer(Some(observer));
+
+    let started = std::time::Instant::now();
+    client
+        .send_message(&sample_request(false))
+        .await
+        .expect("retry after the advertised delay should succeed");
+
+    assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+    assert_eq!(state.lock().await.len(), 2);
+    let notices = notices.lock().unwrap();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].delay, std::time::Duration::from_secs(1));
+    assert_eq!(notices[0].provider, "OpenAI");
+}
+
+#[tokio::test]
+async fn total_backoff_is_capped_instead_of_retrying_for_minutes() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let busy = http_response("503 Service Unavailable", "application/json", "{}");
+    let server = spawn_server(state.clone(), vec![busy.clone(), busy.clone(), busy]).await;
+    let (observer, notices) = recording_observer();
+    let client = OpenAiCompatClient::new("sk-test", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url())
+        .with_retry_policy(
+            8,
+            std::time::Duration::from_millis(30),
+            std::time::Duration::from_millis(30),
+        )
+        .with_max_total_backoff(std::time::Duration::from_millis(50))
+        .with_retry_observer(Some(observer));
+
+    let error = client
+        .send_message(&sample_request(false))
+        .await
+        .expect_err("the backoff budget runs out before eight retries");
+
+    // Each sleep is at least 30ms and the budget is 50ms, so at most two
+    // retries fit; the last one is clamped to whatever budget remains.
+    let notices = notices.lock().unwrap().clone();
+    let slept: std::time::Duration = notices.iter().map(|notice| notice.delay).sum();
+    assert!(slept <= std::time::Duration::from_millis(50), "{slept:?}");
+    assert!((1..=2).contains(&notices.len()), "{notices:?}");
+    let requests = state.lock().await.len();
+    assert_eq!(requests, notices.len() + 1);
+    match error {
+        ApiError::RetriesExhausted { attempts, .. } => {
+            assert_eq!(attempts as usize, requests);
+        }
+        other => panic!("expected RetriesExhausted, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn provider_client_uses_explicit_endpoint_instead_of_environment() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "application/json", COMPLETION_BODY)],
+    )
+    .await;
+    let endpoint = OpenAiCompatEndpoint::new(
+        OpenAiCompatConfig::zero_x(),
+        format!("{}/v1", server.base_url()),
+        "ses_explicit0123456789abcdefghij",
+    );
+
+    let client = ProviderClient::from_model_with_endpoint("openai/auto", None, Some(&endpoint))
+        .expect("explicit endpoint needs no environment");
+    assert!(matches!(client, ProviderClient::OpenAi(_)));
+    client
+        .send_message(&MessageRequest {
+            model: "openai/auto".to_string(),
+            ..sample_request(false)
+        })
+        .await
+        .expect("request should succeed");
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("captured request");
+    assert_eq!(request.path, "/v1/chat/completions");
+    assert_eq!(
+        request.headers.get("authorization").map(String::as_str),
+        Some("Bearer ses_explicit0123456789abcdefghij")
+    );
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+    assert_eq!(body["model"], json!("auto"));
+}
+
+#[tokio::test]
+async fn endpoint_usage_observer_sees_streamed_and_unstreamed_usage() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let sse = concat!(
+        "data: {\"id\":\"chatcmpl_usage\",\"model\":\"Kimi-K2.5\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+        "data: {\"id\":\"chatcmpl_usage\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"id\":\"chatcmpl_usage\",\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":4}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![
+            http_response("200 OK", "application/json", COMPLETION_BODY),
+            http_response("200 OK", "text/event-stream", sse),
+        ],
+    )
+    .await;
+    let observed = Arc::new(StdMutex::new(Vec::new()));
+    let sink = Arc::clone(&observed);
+    let endpoint = OpenAiCompatEndpoint::new(
+        OpenAiCompatConfig::openai(),
+        server.base_url(),
+        "azure-test-key",
+    )
+    .with_usage_observer(UsageObserver::new(move |usage| {
+        sink.lock().unwrap().push(usage.output_tokens);
+    }));
+    let client =
+        ProviderClient::from_model_with_endpoint("openai/Kimi-K2.5", None, Some(&endpoint))
+            .expect("explicit endpoint needs no environment");
+    let request = MessageRequest {
+        model: "openai/Kimi-K2.5".to_string(),
+        ..sample_request(false)
+    };
+
+    client
+        .send_message(&request)
+        .await
+        .expect("request should succeed");
+    assert_eq!(*observed.lock().unwrap(), vec![1]);
+
+    let mut stream = client
+        .stream_message(&request)
+        .await
+        .expect("stream should start");
+    while stream
+        .next_event()
+        .await
+        .expect("event should parse")
+        .is_some()
+    {}
+    assert_eq!(
+        *observed.lock().unwrap(),
+        vec![1, 4],
+        "the final usage of a stream is reported exactly once"
+    );
+}
 
 #[tokio::test]
 async fn send_message_uses_openai_compatible_endpoint_and_auth() {

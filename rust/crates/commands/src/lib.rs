@@ -302,16 +302,30 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: false,
     },
     SlashCommandSpec {
+        name: "login",
+        aliases: &[],
+        summary: "Sign in to your Zero-X account in the browser",
+        argument_hint: None,
+        resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "logout",
+        aliases: &[],
+        summary: "Sign out of Zero-X and remove the stored login",
+        argument_hint: None,
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "upgrade",
         aliases: &[],
-        summary: "Check for and install CLI updates",
+        summary: "Open Zero-X plans to upgrade your account",
         argument_hint: None,
         resume_supported: false,
     },
     SlashCommandSpec {
         name: "usage",
         aliases: &[],
-        summary: "Show detailed API usage statistics",
+        summary: "Show Zero-X plan usage, limits and credits",
         argument_hint: None,
         resume_supported: true,
     },
@@ -1404,12 +1418,13 @@ pub fn validate_slash_command_input(
             validate_no_args(command, &args)?;
             SlashCommand::Doctor
         }
-        "login" | "logout" => {
-            return Err(command_error(
-                "This auth flow was removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead.",
-                command,
-                "",
-            ));
+        "login" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Login
+        }
+        "logout" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Logout
         }
         "vim" => {
             validate_no_args(command, &args)?;
@@ -1908,7 +1923,7 @@ fn slash_command_category(name: &str) -> &'static str {
         | "stickers" | "language" | "profile" | "max-tokens" | "temperature" | "system-prompt"
         | "api-key" | "terminal-setup" | "notifications" | "telemetry" | "providers" | "env"
         | "project" | "reasoning" | "budget" | "rate-limit" | "workspace" | "reset" | "ide"
-        | "desktop" | "upgrade" => "Config",
+        | "desktop" | "upgrade" | "login" | "logout" => "Config",
         "debug-tool-call" | "doctor" | "sandbox" | "diagnostics" | "tool-details" | "changelog"
         | "metrics" => "Debug",
         _ => "Tools",
@@ -4650,11 +4665,22 @@ mod tests {
     }
 
     #[test]
-    fn removed_login_and_logout_commands_report_env_auth_guidance() {
-        let login_error = parse_error_message("/login");
-        assert!(login_error.contains("ANTHROPIC_API_KEY"));
-        let logout_error = parse_error_message("/logout");
-        assert!(logout_error.contains("ANTHROPIC_AUTH_TOKEN"));
+    fn login_and_logout_commands_run_the_gateway_flow() {
+        assert_eq!(SlashCommand::parse("/login"), Ok(Some(SlashCommand::Login)));
+        assert_eq!(
+            SlashCommand::parse("/logout"),
+            Ok(Some(SlashCommand::Logout))
+        );
+        assert_eq!(
+            SlashCommand::parse("/upgrade"),
+            Ok(Some(SlashCommand::Upgrade))
+        );
+        assert_eq!(
+            SlashCommand::parse("/usage"),
+            Ok(Some(SlashCommand::Usage { scope: None }))
+        );
+        let error = parse_error_message("/login now");
+        assert!(error.contains("Unexpected arguments for /login."));
     }
 
     #[test]
@@ -4698,9 +4724,10 @@ mod tests {
         assert!(help.contains("/agents [list|help]"));
         assert!(help.contains("/skills [list|install <path>|help|<skill> [args]]"));
         assert!(help.contains("aliases: /skill"));
-        assert!(!help.contains("/login"));
-        assert!(!help.contains("/logout"));
-        assert_eq!(slash_command_specs().len(), 139);
+        assert!(help.contains("/login"));
+        assert!(help.contains("/logout"));
+        assert!(help.contains("Sign in to your Zero-X account in the browser"));
+        assert_eq!(slash_command_specs().len(), 141);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 
