@@ -789,3 +789,172 @@ fn stored_login_wins_over_ambient_openai_key_unless_provider_is_explicit() {
     );
     assert_bearer(&gateway.last_chat(), "sk-ambient-openai-key");
 }
+
+#[test]
+#[ignore = "needs runtime/src/config_validate.rs to accept the top-level \"provider\" key (cross-package request); every strict ConfigLoader::load rejects it today"]
+fn settings_provider_selects_the_provider_and_typos_name_the_file() {
+    let gateway = gateway_with_chat(|_, _| text_reply("answered"));
+    let workspace = Workspace::new("settings-provider");
+    workspace.store_login(STORED_TOKEN);
+    let settings = workspace.root.join("config/settings.json");
+
+    // The settings choice beats the stored login and is named on startup.
+    fs::write(
+        &settings,
+        r#"{"defaultMcpServers":false,"provider":"openai"}"#,
+    )
+    .unwrap();
+    let mut chosen = workspace.command(&gateway);
+    chosen
+        .env("OPENAI_API_KEY", "sk-ambient-openai-key")
+        .env("OPENAI_BASE_URL", &gateway.base)
+        .args(prompt_args("hello"));
+    let output = run(chosen, None);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains(
+            "Provider: OpenAI · credential: OPENAI_API_KEY · selected by settings \"provider\""
+        ),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(stdout(&output).trim(), "answered");
+    assert_bearer(&gateway.last_chat(), "sk-ambient-openai-key");
+
+    // A typo is an actionable error naming the file, not a silent fallback
+    // to the stored login.
+    fs::write(
+        &settings,
+        r#"{"defaultMcpServers":false,"provider":"opnai"}"#,
+    )
+    .unwrap();
+    let chats_before = gateway.count("POST", "/v1/chat/completions");
+    let mut typo = workspace.command(&gateway);
+    typo.args(prompt_args("hello"));
+    let output = run(typo, None);
+    assert!(!output.status.success());
+    let errors = stderr(&output);
+    assert!(errors.contains("unknown provider 'opnai'"), "{errors}");
+    assert!(errors.contains("settings.json"), "{errors}");
+    assert!(errors.contains("expected one of zero-x|openai"), "{errors}");
+    assert!(!errors.contains("Provider: Zero-X"), "{errors}");
+    assert_eq!(gateway.count("POST", "/v1/chat/completions"), chats_before);
+}
+
+#[test]
+fn doctor_sends_the_stored_login_to_the_server_only_when_asked() {
+    let gateway = gateway_with_chat(|_, _| text_reply("unused"));
+    let workspace = Workspace::new("doctor-online");
+    workspace.store_login(STORED_TOKEN);
+    let auth_check = |output: &Output| {
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("{error}: {}", stdout(output)));
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "auth")
+            .unwrap()
+            .clone()
+    };
+
+    // Piped output (scripts, test harnesses): signed in, not sent anywhere.
+    let mut offline = workspace.command(&gateway);
+    offline.args(["--output-format", "json", "doctor"]);
+    let auth = auth_check(&run(offline, None));
+    assert_eq!(auth["gateway_session"], "not_checked");
+    assert_eq!(gateway.count("GET", "/auth/session"), 0);
+
+    let mut online = workspace.command(&gateway);
+    online
+        .env("NEURON_DOCTOR_ONLINE", "1")
+        .args(["--output-format", "json", "doctor"]);
+    let auth = auth_check(&run(online, None));
+    assert_eq!(auth["gateway_session"], "valid");
+    assert_eq!(gateway.count("GET", "/auth/session"), 1);
+    let session_check = gateway
+        .requests()
+        .into_iter()
+        .find(|request| request.path == "/auth/session")
+        .unwrap();
+    assert_bearer(&session_check, STORED_TOKEN);
+}
+
+#[test]
+fn expired_stored_login_prints_the_login_instruction_once() {
+    let gateway = gateway_with_chat(|_, _| text_reply("unused"));
+    let workspace = Workspace::new("expired-stored");
+    fs::write(
+        workspace.neuron_home().join("credentials.json"),
+        serde_json::json!({"version": 1, "token": STORED_TOKEN, "expires_at": 1_000_u64, "plan": "free", "saved_at": 0}).to_string(),
+    )
+    .unwrap();
+    let mut command = workspace.command(&gateway);
+    command.args(prompt_args("hello"));
+    let output = run(command, None);
+
+    assert!(!output.status.success());
+    let errors = stderr(&output);
+    assert_eq!(
+        errors
+            .matches("Your Zero-X session expired or was revoked — run neuron auth login")
+            .count(),
+        1,
+        "{errors}"
+    );
+    assert_eq!(gateway.count("POST", "/v1/chat/completions"), 0);
+}
+
+#[test]
+fn prompt_subcommand_text_may_mention_the_provider_flag() {
+    let gateway = gateway_with_chat(|_, _| text_reply("explained"));
+    let workspace = Workspace::new("prompt-words");
+    let mut command = workspace.command(&gateway);
+    command.env("NEURON_TOKEN", SESSION_TOKEN).args([
+        "--compact",
+        "--permission-mode",
+        "read-only",
+        "prompt",
+        "explain",
+        "the",
+        "--provider",
+        "flag",
+    ]);
+    let output = run(command, None);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), "explained");
+    let body = gateway.last_chat().body;
+    assert!(body.contains("explain the --provider flag"), "{body}");
+}
+
+#[test]
+fn catalog_cache_is_per_credential_and_dropped_by_upgrade() {
+    const OTHER_TOKEN: &str = "ses_othercaller0123456789abcdefgh";
+    let gateway = gateway_with_chat(|_, _| text_reply("cached"));
+    let workspace = Workspace::new("catalog-key");
+    let prompt_as = |token: &str| {
+        let mut command = workspace.command(&gateway);
+        command
+            .env("NEURON_TOKEN", token)
+            .args(prompt_args("hello"));
+        let output = run(command, None);
+        assert!(output.status.success(), "{}", stderr(&output));
+    };
+
+    prompt_as(SESSION_TOKEN);
+    prompt_as(SESSION_TOKEN);
+    assert_eq!(gateway.count("GET", "/v1/models"), 1);
+    // Availability is per caller: another credential fetches its own list.
+    prompt_as(OTHER_TOKEN);
+    assert_eq!(gateway.count("GET", "/v1/models"), 2);
+    let cache = fs::read_to_string(workspace.neuron_home().join("catalog.json")).unwrap();
+    assert!(!cache.contains(OTHER_TOKEN) && !cache.contains(SESSION_TOKEN));
+
+    // Upgrading changes the plan, so the cached availability is dropped.
+    let mut upgrade = workspace.command(&gateway);
+    upgrade.args(["upgrade", "--no-browser"]);
+    assert!(run(upgrade, None).status.success());
+    prompt_as(OTHER_TOKEN);
+    assert_eq!(gateway.count("GET", "/v1/models"), 3);
+}
