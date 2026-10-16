@@ -56,3 +56,6 @@ node_modules/
 ui/react-tui/dist/
 neuron_cli/neuron
 .neuron/
+
+# Session files written by tests/test_porting_workspace.py (python -m src.main)
+.port_sessions/

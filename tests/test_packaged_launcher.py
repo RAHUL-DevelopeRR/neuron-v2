@@ -62,9 +62,13 @@ class PackagedLauncherTests(unittest.TestCase):
             launcher, "_download_binary", return_value=binary
         ) as download, patch.object(sys, "argv", argv):
             if os.name == "posix":
-                with patch.object(launcher.os, "execv") as execv:
+                # A real exec never returns; the mock must not either.
+                with patch.object(launcher.os, "execv", side_effect=SystemExit(0)) as execv, patch.object(
+                    launcher, "_run_child"
+                ) as run, self.assertRaises(SystemExit):
                     launcher.main()
                 execv.assert_called_once_with(str(binary), expected_args)
+                run.assert_not_called()
             else:
                 with patch.object(launcher, "_run_child", return_value=7) as run, self.assertRaises(SystemExit) as result:
                     launcher.main()
