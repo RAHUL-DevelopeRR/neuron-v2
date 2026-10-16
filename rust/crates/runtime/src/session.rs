@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -77,6 +77,10 @@ pub struct SessionPromptEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionPersistence {
     path: PathBuf,
+    /// The file on disk differs from memory (malformed records were skipped
+    /// or the transcript was repaired on load): the next write rewrites the
+    /// whole file instead of appending to it.
+    rewrite_before_append: bool,
 }
 
 /// Persisted conversational state for the runtime and CLI session manager.
@@ -235,7 +239,10 @@ impl Session {
 
     #[must_use]
     pub fn with_persistence_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.persistence = Some(SessionPersistence { path: path.into() });
+        self.persistence = Some(SessionPersistence {
+            path: path.into(),
+            rewrite_before_append: false,
+        });
         self
     }
 
@@ -290,7 +297,12 @@ impl Session {
             Err(_) | Ok(_) => Self::from_jsonl(&contents)?,
         };
         session.load_diagnostics.transcript_repair = normalize_messages(&mut session.messages);
-        Ok(session.with_persistence_path(path.to_path_buf()))
+        let rewrite_before_append = session.load_diagnostics.has_warnings();
+        let mut session = session.with_persistence_path(path.to_path_buf());
+        if let Some(persistence) = session.persistence.as_mut() {
+            persistence.rewrite_before_append = rewrite_before_append;
+        }
+        Ok(session)
     }
 
     /// Diagnostics recorded by [`Session::load_from_path`].
@@ -312,7 +324,13 @@ impl Session {
     pub fn push_message(&mut self, message: ConversationMessage) -> Result<(), SessionError> {
         self.touch();
         self.messages.push(message);
-        let persist_result = {
+        let persist_result = if self.take_pending_rewrite() {
+            let rewritten = self.persist_snapshot();
+            if rewritten.is_err() {
+                self.set_pending_rewrite();
+            }
+            rewritten
+        } else {
             let message_ref = self.messages.last().ok_or_else(|| {
                 SessionError::Format("message was just pushed but missing".to_string())
             })?;
@@ -323,6 +341,20 @@ impl Session {
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Returns (and clears) whether the file must be rewritten before the
+    /// next append because it no longer matches memory.
+    fn take_pending_rewrite(&mut self) -> bool {
+        self.persistence
+            .as_mut()
+            .is_some_and(|persistence| std::mem::take(&mut persistence.rewrite_before_append))
+    }
+
+    fn set_pending_rewrite(&mut self) {
+        if let Some(persistence) = self.persistence.as_mut() {
+            persistence.rewrite_before_append = true;
+        }
     }
 
     pub fn push_user_text(&mut self, text: impl Into<String>) -> Result<(), SessionError> {
@@ -546,6 +578,13 @@ impl Session {
             text: text.into(),
         };
         self.prompt_history.push(entry);
+        if self.take_pending_rewrite() {
+            let rewritten = self.persist_snapshot();
+            if rewritten.is_err() {
+                self.set_pending_rewrite();
+            }
+            return rewritten;
+        }
         let entry_ref = self.prompt_history.last().expect("entry was just pushed");
         self.append_persisted_prompt_entry(entry_ref)
     }
@@ -581,7 +620,7 @@ impl Session {
             return Ok(());
         }
 
-        let mut file = OpenOptions::new().append(true).open(path)?;
+        let mut file = open_for_record_append(path)?;
         writeln!(file, "{}", message_record(message).render())?;
         Ok(())
     }
@@ -600,7 +639,7 @@ impl Session {
             return Ok(());
         }
 
-        let mut file = OpenOptions::new().append(true).open(path)?;
+        let mut file = open_for_record_append(path)?;
         writeln!(file, "{}", entry.to_jsonl_record().render())?;
         Ok(())
     }
@@ -1186,6 +1225,23 @@ fn generate_session_id() -> String {
     format!("session-{millis}-{counter}")
 }
 
+/// Opens a JSONL file for appending one record. When the file does not end
+/// with a newline (a crash cut the last record off), a newline is written
+/// first so the new record does not merge into the partial one.
+fn open_for_record_append(path: &Path) -> Result<fs::File, SessionError> {
+    let mut file = OpenOptions::new().read(true).append(true).open(path)?;
+    let len = file.metadata()?.len();
+    if len > 0 {
+        file.seek(SeekFrom::Start(len - 1))?;
+        let mut last = [0_u8; 1];
+        file.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            file.write_all(b"\n")?;
+        }
+    }
+    Ok(file)
+}
+
 fn write_atomic(path: &Path, contents: &str) -> Result<(), SessionError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -1274,7 +1330,8 @@ mod tests {
     };
     use crate::json::JsonValue;
     use crate::usage::TokenUsage;
-    use std::fs;
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1605,6 +1662,72 @@ mod tests {
         assert!(diagnostics
             .warning_message()
             .is_some_and(|message| message.contains("skipped 2 malformed record(s)")));
+    }
+
+    #[test]
+    fn first_write_after_a_lossy_load_rewrites_the_file_cleanly() {
+        // given a session whose last record was cut off by a crash (no
+        // trailing newline)
+        let path = temp_session_path("truncated-tail");
+        let contents = [
+            r#"{"type":"session_meta","version":1,"session_id":"tail","created_at_ms":1,"updated_at_ms":2}"#,
+            r#"{"type":"message","message":{"role":"user","blocks":[{"type":"text","text":"first"}]}}"#,
+            r#"{"type":"message","message":{"role":"assistant","blocks":[{"type":"te"#,
+        ]
+        .join("\n");
+        fs::write(&path, contents).expect("write session");
+        let mut session = Session::load_from_path(&path).expect("tolerant load");
+        assert_eq!(session.load_diagnostics().skipped_records, 1);
+
+        // when the next message is recorded
+        session.push_user_text("second").expect("append");
+
+        // then the file holds both messages and no malformed record
+        let restored = Session::load_from_path(&path).expect("reload");
+        assert_eq!(restored.load_diagnostics().skipped_records, 0);
+        assert_eq!(
+            restored.messages,
+            vec![
+                ConversationMessage::user_text("first"),
+                ConversationMessage::user_text("second"),
+            ]
+        );
+        // and later messages are appended normally again
+        session.push_user_text("third").expect("append");
+        let restored = Session::load_from_path(&path).expect("reload");
+        fs::remove_file(&path).expect("cleanup");
+        assert_eq!(restored.messages.len(), 3);
+        assert_eq!(restored.load_diagnostics().skipped_records, 0);
+    }
+
+    #[test]
+    fn append_never_merges_into_a_partial_last_line() {
+        // given a cleanly loaded session whose file later lost its tail
+        let path = temp_session_path("partial-append");
+        let mut session = Session::new().with_persistence_path(path.clone());
+        session.push_user_text("first").expect("append");
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open session");
+        file.write_all(br#"{"type":"message","message":{"role":"assis"#)
+            .expect("partial record");
+        drop(file);
+
+        // when
+        session.push_user_text("second").expect("append");
+
+        // then only the partial record is lost, never the new message
+        let restored = Session::load_from_path(&path).expect("reload");
+        fs::remove_file(&path).expect("cleanup");
+        assert_eq!(restored.load_diagnostics().skipped_records, 1);
+        assert_eq!(
+            restored.messages,
+            vec![
+                ConversationMessage::user_text("first"),
+                ConversationMessage::user_text("second"),
+            ]
+        );
     }
 
     #[test]
