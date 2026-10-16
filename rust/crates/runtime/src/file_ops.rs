@@ -1,4 +1,7 @@
+mod walk;
+
 use std::cmp::Reverse;
+use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -7,13 +10,32 @@ use std::time::Instant;
 use glob::Pattern;
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
-use walkdir::WalkDir;
+
+pub use walk::DEFAULT_SKIPPED_DIRS;
 
 /// Maximum file size that can be read (10 MB).
 const MAX_READ_SIZE: u64 = 10 * 1024 * 1024;
 
 /// Maximum file size that can be written (10 MB).
 const MAX_WRITE_SIZE: usize = 10 * 1024 * 1024;
+
+/// Lines returned by `read_file` when the caller gives no `limit`.
+pub const DEFAULT_READ_LINE_LIMIT: usize = 2_000;
+
+/// Characters kept per line by `read_file`; longer lines are cut.
+pub const MAX_READ_LINE_CHARS: usize = 2_000;
+
+/// Maximum diff lines (context included) returned by `edit_file`.
+const MAX_DIFF_LINES: usize = 160;
+
+/// Maximum characters of the textual diff returned by `edit_file`.
+const MAX_DIFF_CHARS: usize = 12_000;
+
+/// Context lines around each change in `edit_file` diffs.
+const DIFF_CONTEXT_LINES: usize = 3;
+
+/// Match locations reported when `old_string` is ambiguous.
+const MAX_REPORTED_MATCH_LINES: usize = 20;
 
 /// Check whether a file appears to contain binary content by examining
 /// the first chunk for NUL bytes.
@@ -83,6 +105,17 @@ pub struct TextFilePayload {
     pub start_line: usize,
     #[serde(rename = "totalLines")]
     pub total_lines: usize,
+    /// Number of lines cut to [`MAX_READ_LINE_CHARS`] characters.
+    #[serde(rename = "truncatedLines", default, skip_serializing_if = "is_zero")]
+    pub truncated_lines: usize,
+    /// How to read the rest of the file when the window does not reach the end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// Output envelope for the `read_file` tool.
@@ -93,7 +126,8 @@ pub struct ReadFileOutput {
     pub file: TextFilePayload,
 }
 
-/// Structured patch hunk emitted by write and edit operations.
+/// Structured patch hunk emitted by edit operations (unified-diff lines
+/// prefixed with ` `, `-` or `+`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StructuredPatchHunk {
     #[serde(rename = "oldStart")]
@@ -107,41 +141,39 @@ pub struct StructuredPatchHunk {
     pub lines: Vec<String>,
 }
 
-/// Output envelope for full-file write operations.
+/// Compact summary returned by full-file writes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WriteFileOutput {
+    /// `create` for a new file, `update` when an existing file was overwritten.
     #[serde(rename = "type")]
     pub kind: String,
     #[serde(rename = "filePath")]
     pub file_path: String,
-    pub content: String,
-    #[serde(rename = "structuredPatch")]
-    pub structured_patch: Vec<StructuredPatchHunk>,
-    #[serde(rename = "originalFile")]
-    pub original_file: Option<String>,
-    #[serde(rename = "gitDiff")]
-    pub git_diff: Option<serde_json::Value>,
+    pub bytes: usize,
+    pub lines: usize,
+    pub summary: String,
 }
 
-/// Output envelope for targeted string-replacement edits.
+/// Output envelope for targeted string-replacement edits: a bounded unified
+/// diff instead of the whole file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EditFileOutput {
     #[serde(rename = "filePath")]
     pub file_path: String,
-    #[serde(rename = "oldString")]
-    pub old_string: String,
-    #[serde(rename = "newString")]
-    pub new_string: String,
-    #[serde(rename = "originalFile")]
-    pub original_file: String,
-    #[serde(rename = "structuredPatch")]
-    pub structured_patch: Vec<StructuredPatchHunk>,
-    #[serde(rename = "userModified")]
-    pub user_modified: bool,
     #[serde(rename = "replaceAll")]
     pub replace_all: bool,
-    #[serde(rename = "gitDiff")]
-    pub git_diff: Option<serde_json::Value>,
+    /// Number of occurrences replaced.
+    pub replacements: usize,
+    /// Line endings of the file (`lf` or `crlf`), preserved on write.
+    #[serde(rename = "lineEnding")]
+    pub line_ending: String,
+    /// Unified diff of the change (bounded).
+    pub diff: String,
+    #[serde(rename = "structuredPatch")]
+    pub structured_patch: Vec<StructuredPatchHunk>,
+    /// Whether the diff was cut to stay compact.
+    #[serde(rename = "diffTruncated")]
+    pub diff_truncated: bool,
 }
 
 /// Result of a glob-based filename search.
@@ -200,6 +232,10 @@ pub struct GrepSearchOutput {
 }
 
 /// Reads a text file and returns a line-windowed payload.
+///
+/// Without `limit` at most [`DEFAULT_READ_LINE_LIMIT`] lines are returned,
+/// with a hint naming the `offset` that continues the read. Lines longer than
+/// [`MAX_READ_LINE_CHARS`] characters are cut.
 pub fn read_file(
     path: &str,
     offset: Option<usize>,
@@ -231,10 +267,34 @@ pub fn read_file(
     let content = fs::read_to_string(&absolute_path)?;
     let lines: Vec<&str> = content.lines().collect();
     let start_index = offset.unwrap_or(0).min(lines.len());
-    let end_index = limit.map_or(lines.len(), |limit| {
-        start_index.saturating_add(limit).min(lines.len())
+    let window = limit.unwrap_or(DEFAULT_READ_LINE_LIMIT);
+    let end_index = start_index.saturating_add(window).min(lines.len());
+
+    let mut truncated_lines = 0;
+    let selected = lines[start_index..end_index]
+        .iter()
+        .map(|line| {
+            let length = line.chars().count();
+            if length > MAX_READ_LINE_CHARS {
+                truncated_lines += 1;
+                let kept = line.chars().take(MAX_READ_LINE_CHARS).collect::<String>();
+                format!("{kept}… [line truncated: {length} characters]")
+            } else {
+                (*line).to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let hint = (end_index < lines.len()).then(|| {
+        format!(
+            "Showing lines {}-{} of {}. Call read_file with offset={} to continue.",
+            start_index + 1,
+            end_index,
+            lines.len(),
+            end_index
+        )
     });
-    let selected = lines[start_index..end_index].join("\n");
 
     Ok(ReadFileOutput {
         kind: String::from("text"),
@@ -244,11 +304,13 @@ pub fn read_file(
             num_lines: end_index.saturating_sub(start_index),
             start_line: start_index.saturating_add(1),
             total_lines: lines.len(),
+            truncated_lines,
+            hint,
         },
     })
 }
 
-/// Replaces a file's contents and returns patch metadata.
+/// Replaces a file's contents and returns a compact summary.
 pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
     if content.len() > MAX_WRITE_SIZE {
         return Err(io::Error::new(
@@ -262,27 +324,85 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
     }
 
     let absolute_path = normalize_path_allow_missing(path)?;
-    let original_file = fs::read_to_string(&absolute_path).ok();
+    let existed = absolute_path.is_file();
     if let Some(parent) = absolute_path.parent() {
         fs::create_dir_all(parent)?;
     }
     fs::write(&absolute_path, content)?;
 
+    let file_path = absolute_path.to_string_lossy().into_owned();
+    let lines = content.lines().count();
+    let summary = format!(
+        "{} {file_path} ({lines} lines, {} bytes)",
+        if existed { "Overwrote" } else { "Created" },
+        content.len()
+    );
     Ok(WriteFileOutput {
-        kind: if original_file.is_some() {
+        kind: if existed {
             String::from("update")
         } else {
             String::from("create")
         },
-        file_path: absolute_path.to_string_lossy().into_owned(),
-        content: content.to_owned(),
-        structured_patch: make_patch(original_file.as_deref().unwrap_or(""), content),
-        original_file,
-        git_diff: None,
+        file_path,
+        bytes: content.len(),
+        lines,
+        summary,
     })
 }
 
-/// Performs an in-file string replacement and returns patch metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineEnding {
+    Lf,
+    Crlf,
+}
+
+impl LineEnding {
+    fn detect(text: &str) -> Self {
+        let crlf = text.matches("\r\n").count();
+        let lf = text.matches('\n').count();
+        if crlf > 0 && crlf * 2 >= lf {
+            Self::Crlf
+        } else {
+            Self::Lf
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Lf => "lf",
+            Self::Crlf => "crlf",
+        }
+    }
+
+    /// Rewrites `text`'s line breaks in this style.
+    fn apply(self, text: &str) -> String {
+        let normalized = text.replace("\r\n", "\n");
+        match self {
+            Self::Lf => normalized,
+            Self::Crlf => normalized.replace('\n', "\r\n"),
+        }
+    }
+}
+
+/// Byte offsets of every non-overlapping occurrence of `needle`.
+fn match_offsets(haystack: &str, needle: &str) -> Vec<usize> {
+    haystack
+        .match_indices(needle)
+        .map(|(offset, _)| offset)
+        .collect()
+}
+
+fn line_number_at(text: &str, offset: usize) -> usize {
+    text[..offset].matches('\n').count() + 1
+}
+
+/// Performs an in-file string replacement and returns a compact diff.
+///
+/// `old_string` written with `\n` line breaks also matches a CRLF file, and
+/// the replacement is written with the file's own line endings. When
+/// `old_string` occurs more than once and `replace_all` is false the edit is
+/// refused with the match count and line numbers, instead of silently
+/// changing the first occurrence.
 pub fn edit_file(
     path: &str,
     old_string: &str,
@@ -291,39 +411,270 @@ pub fn edit_file(
 ) -> io::Result<EditFileOutput> {
     let absolute_path = normalize_path(path)?;
     let original_file = fs::read_to_string(&absolute_path)?;
+    if old_string.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "old_string must not be empty; use write_file to create or replace a whole file",
+        ));
+    }
     if old_string == new_string {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "old_string and new_string must differ",
         ));
     }
-    if !original_file.contains(old_string) {
+
+    let line_ending = LineEnding::detect(&original_file);
+    let (needle, mut offsets) = {
+        let exact = match_offsets(&original_file, old_string);
+        let adapted = line_ending.apply(old_string);
+        if exact.is_empty() && adapted != old_string {
+            let adapted_offsets = match_offsets(&original_file, &adapted);
+            (adapted, adapted_offsets)
+        } else {
+            (old_string.to_string(), exact)
+        }
+    };
+    if offsets.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "old_string not found in file",
+            "old_string not found in file (check whitespace and indentation, or re-read the file)",
         ));
     }
+    if offsets.len() > 1 && !replace_all {
+        let lines = offsets
+            .iter()
+            .take(MAX_REPORTED_MATCH_LINES)
+            .map(|offset| line_number_at(&original_file, *offset).to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = if offsets.len() > MAX_REPORTED_MATCH_LINES {
+            ", ..."
+        } else {
+            ""
+        };
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "old_string matches {} times (lines {lines}{more}); include more surrounding context to make it unique, or set replace_all to true",
+                offsets.len()
+            ),
+        ));
+    }
+    if !replace_all {
+        offsets.truncate(1);
+    }
 
-    let updated = if replace_all {
-        original_file.replace(old_string, new_string)
+    let replacement = if line_ending == LineEnding::Crlf || new_string.contains("\r\n") {
+        line_ending.apply(new_string)
     } else {
-        original_file.replacen(old_string, new_string, 1)
+        new_string.to_string()
     };
+    let mut updated = String::with_capacity(original_file.len());
+    let mut cursor = 0;
+    for offset in &offsets {
+        updated.push_str(&original_file[cursor..*offset]);
+        updated.push_str(&replacement);
+        cursor = offset + needle.len();
+    }
+    updated.push_str(&original_file[cursor..]);
     fs::write(&absolute_path, &updated)?;
 
+    let file_path = absolute_path.to_string_lossy().into_owned();
+    let (structured_patch, diff, diff_truncated) =
+        build_edit_diff(&file_path, &original_file, &offsets, &needle, &replacement);
     Ok(EditFileOutput {
-        file_path: absolute_path.to_string_lossy().into_owned(),
-        old_string: old_string.to_owned(),
-        new_string: new_string.to_owned(),
-        original_file: original_file.clone(),
-        structured_patch: make_patch(&original_file, &updated),
-        user_modified: false,
+        file_path,
         replace_all,
-        git_diff: None,
+        replacements: offsets.len(),
+        line_ending: line_ending.label().to_string(),
+        diff,
+        structured_patch,
+        diff_truncated,
     })
 }
 
+/// A change in original-line coordinates: lines `start..end` are replaced by
+/// `new_lines`.
+struct LineChange {
+    start: usize,
+    end: usize,
+    new_lines: Vec<String>,
+}
+
+fn strip_line_break(line: &str) -> &str {
+    line.strip_suffix('\n')
+        .map_or(line, |rest| rest.strip_suffix('\r').unwrap_or(rest))
+}
+
+/// Builds bounded unified-diff hunks for replacing `needle` at `offsets`
+/// (ascending, non-overlapping) with `replacement`.
+fn build_edit_diff(
+    file_path: &str,
+    original: &str,
+    offsets: &[usize],
+    needle: &str,
+    replacement: &str,
+) -> (Vec<StructuredPatchHunk>, String, bool) {
+    let mut line_starts = vec![0];
+    line_starts.extend(original.match_indices('\n').map(|(index, _)| index + 1));
+    let original_lines = original
+        .split_inclusive('\n')
+        .map(|line| strip_line_break(line).to_string())
+        .collect::<Vec<_>>();
+    let line_count = original_lines.len();
+    let line_of = |offset: usize| {
+        (line_starts.partition_point(|start| *start <= offset) - 1)
+            .min(line_count.saturating_sub(1))
+    };
+    let line_end = |line: usize| line_starts.get(line + 1).copied().unwrap_or(original.len());
+    // Last original line touched by a replacement at `offset`. When the match
+    // ends with a line break that the replacement drops, the following line
+    // is joined onto the replacement, so it changes too.
+    let last_line_of = |offset: usize| {
+        let mut last = line_of(offset + needle.len() - 1);
+        if needle.ends_with('\n') && !replacement.ends_with('\n') && last + 1 < line_count {
+            last += 1;
+        }
+        last
+    };
+
+    // Group replacements whose line ranges touch and rebuild each group.
+    let mut changes: Vec<LineChange> = Vec::new();
+    let mut index = 0;
+    while index < offsets.len() {
+        let start = line_of(offsets[index]);
+        let mut last = last_line_of(offsets[index]);
+        let mut members = vec![offsets[index]];
+        index += 1;
+        while index < offsets.len() && line_of(offsets[index]) <= last {
+            last = last.max(last_line_of(offsets[index]));
+            members.push(offsets[index]);
+            index += 1;
+        }
+        let block_end = line_end(last);
+        let mut rebuilt = String::new();
+        let mut cursor = line_starts[start];
+        for offset in &members {
+            rebuilt.push_str(&original[cursor..*offset]);
+            rebuilt.push_str(replacement);
+            cursor = offset + needle.len();
+        }
+        rebuilt.push_str(&original[cursor..block_end]);
+        changes.push(LineChange {
+            start,
+            end: last + 1,
+            new_lines: rebuilt
+                .split_inclusive('\n')
+                .map(|line| strip_line_break(line).to_string())
+                .collect(),
+        });
+    }
+
+    // Merge changes whose context windows overlap into hunks.
+    let mut hunks = Vec::new();
+    let mut line_delta: isize = 0;
+    let mut position = 0;
+    while position < changes.len() {
+        let hunk_start = changes[position].start.saturating_sub(DIFF_CONTEXT_LINES);
+        let mut group_end = position + 1;
+        while group_end < changes.len()
+            && changes[group_end].start.saturating_sub(DIFF_CONTEXT_LINES)
+                <= changes[group_end - 1].end + DIFF_CONTEXT_LINES
+        {
+            group_end += 1;
+        }
+        let hunk_end = (changes[group_end - 1].end + DIFF_CONTEXT_LINES).min(line_count);
+        let new_start = isize::try_from(hunk_start).unwrap_or(isize::MAX) + line_delta;
+        let mut hunk = StructuredPatchHunk {
+            old_start: hunk_start + 1,
+            old_lines: hunk_end - hunk_start,
+            new_start: usize::try_from(new_start).unwrap_or(0) + 1,
+            new_lines: 0,
+            lines: Vec::new(),
+        };
+        let mut cursor = hunk_start;
+        for change in &changes[position..group_end] {
+            for line in &original_lines[cursor..change.start] {
+                hunk.lines.push(format!(" {line}"));
+            }
+            for line in &original_lines[change.start..change.end] {
+                hunk.lines.push(format!("-{line}"));
+            }
+            for line in &change.new_lines {
+                hunk.lines.push(format!("+{line}"));
+            }
+            line_delta += isize::try_from(change.new_lines.len()).unwrap_or(0)
+                - isize::try_from(change.end - change.start).unwrap_or(0);
+            cursor = change.end;
+        }
+        for line in &original_lines[cursor..hunk_end] {
+            hunk.lines.push(format!(" {line}"));
+        }
+        hunk.new_lines = hunk
+            .lines
+            .iter()
+            .filter(|line| !line.starts_with('-'))
+            .count();
+        hunks.push(hunk);
+        position = group_end;
+    }
+
+    bound_hunks(file_path, hunks)
+}
+
+/// Caps the hunks at [`MAX_DIFF_LINES`] lines and the text at
+/// [`MAX_DIFF_CHARS`] characters.
+fn bound_hunks(
+    file_path: &str,
+    hunks: Vec<StructuredPatchHunk>,
+) -> (Vec<StructuredPatchHunk>, String, bool) {
+    let mut kept = Vec::new();
+    let mut budget = MAX_DIFF_LINES;
+    let mut omitted = 0;
+    for mut hunk in hunks {
+        if budget == 0 {
+            omitted += hunk.lines.len();
+            continue;
+        }
+        if hunk.lines.len() > budget {
+            omitted += hunk.lines.len() - budget;
+            hunk.lines.truncate(budget);
+        }
+        budget -= hunk.lines.len();
+        kept.push(hunk);
+    }
+
+    let mut diff = format!("--- {file_path}\n+++ {file_path}\n");
+    for hunk in &kept {
+        let _ = writeln!(
+            diff,
+            "@@ -{},{} +{},{} @@",
+            hunk.old_start, hunk.old_lines, hunk.new_start, hunk.new_lines
+        );
+        for line in &hunk.lines {
+            diff.push_str(line);
+            diff.push('\n');
+        }
+    }
+    let mut truncated = omitted > 0;
+    if diff.chars().count() > MAX_DIFF_CHARS {
+        diff = diff.chars().take(MAX_DIFF_CHARS).collect();
+        truncated = true;
+    }
+    if truncated {
+        let _ = writeln!(
+            diff,
+            "… diff truncated ({omitted} more lines); re-read the file to see the full result"
+        );
+    }
+    (kept, diff, truncated)
+}
+
 /// Expands a glob pattern and returns matching filenames.
+///
+/// The walk skips [`DEFAULT_SKIPPED_DIRS`] and `.gitignore`d paths unless the
+/// pattern's literal prefix points inside them.
 pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOutput> {
     let started = Instant::now();
     let base_dir = path
@@ -331,24 +682,38 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
         .transpose()?
         .unwrap_or(std::env::current_dir()?);
     let search_pattern = if Path::new(pattern).is_absolute() {
-        pattern.to_owned()
+        PathBuf::from(pattern)
     } else {
-        base_dir.join(pattern).to_string_lossy().into_owned()
+        base_dir.join(pattern)
     };
 
     // The `glob` crate does not support brace expansion ({a,b,c}).
     // Expand braces into multiple patterns so patterns like
     // `Assets/**/*.{cs,uxml,uss}` work correctly.
-    let expanded = expand_braces(&search_pattern);
+    let expanded = expand_braces(&search_pattern.to_string_lossy());
 
     let mut seen = std::collections::HashSet::new();
     let mut matches = Vec::new();
-    for pat in &expanded {
-        let entries = glob::glob(pat)
+    let mut walk_truncated = false;
+    for candidate in &expanded {
+        let (root, rest) = walk::split_glob_root(Path::new(candidate));
+        let Some(rest) = rest else {
+            let literal = root;
+            if literal.is_file() && seen.insert(literal.clone()) {
+                matches.push(literal);
+            }
+            continue;
+        };
+        let compiled = Pattern::new(&rest)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        for entry in entries.flatten() {
-            if entry.is_file() && seen.insert(entry.clone()) {
-                matches.push(entry);
+        let (files, truncated) = walk::collect_workspace_files(&root);
+        walk_truncated |= truncated;
+        for file in files {
+            let Ok(relative) = file.strip_prefix(&root) else {
+                continue;
+            };
+            if walk::glob_matches(&compiled, relative) && seen.insert(file.clone()) {
+                matches.push(file);
             }
         }
     }
@@ -360,7 +725,7 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
             .map(Reverse)
     });
 
-    let truncated = matches.len() > 100;
+    let truncated = matches.len() > 100 || walk_truncated;
     let filenames = matches
         .into_iter()
         .take(100)
@@ -376,6 +741,9 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
 }
 
 /// Runs a regex search over workspace files with optional context lines.
+///
+/// Like [`glob_search`], the walk skips [`DEFAULT_SKIPPED_DIRS`] and
+/// `.gitignore`d paths below the search root.
 pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     let base_path = input
         .path
@@ -407,7 +775,7 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     let mut content_lines = Vec::new();
     let mut total_matches = 0usize;
 
-    for file_path in collect_search_files(&base_path)? {
+    for file_path in collect_search_files(&base_path) {
         if !matches_optional_filters(&file_path, glob_filter.as_ref(), file_type) {
             continue;
         }
@@ -485,19 +853,8 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     })
 }
 
-fn collect_search_files(base_path: &Path) -> io::Result<Vec<PathBuf>> {
-    if base_path.is_file() {
-        return Ok(vec![base_path.to_path_buf()]);
-    }
-
-    let mut files = Vec::new();
-    for entry in WalkDir::new(base_path) {
-        let entry = entry.map_err(|error| io::Error::other(error.to_string()))?;
-        if entry.file_type().is_file() {
-            files.push(entry.path().to_path_buf());
-        }
-    }
-    Ok(files)
+fn collect_search_files(base_path: &Path) -> Vec<PathBuf> {
+    walk::collect_workspace_files(base_path).0
 }
 
 fn matches_optional_filters(
@@ -541,24 +898,6 @@ fn apply_limit<T>(
         truncated.then_some(explicit_limit),
         (offset_value > 0).then_some(offset_value),
     )
-}
-
-fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
-    let mut lines = Vec::new();
-    for line in original.lines() {
-        lines.push(format!("-{line}"));
-    }
-    for line in updated.lines() {
-        lines.push(format!("+{line}"));
-    }
-
-    vec![StructuredPatchHunk {
-        old_start: 1,
-        old_lines: original.lines().count(),
-        new_start: 1,
-        new_lines: updated.lines().count(),
-        lines,
-    }]
 }
 
 fn normalize_path(path: &str) -> io::Result<PathBuf> {
@@ -898,5 +1237,228 @@ mod tests {
             "should match .rs and .toml but not .txt"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn fresh_dir(name: &str) -> std::path::PathBuf {
+        let dir = temp_path(name);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn edit_matches_lf_old_string_in_crlf_file_and_keeps_crlf() {
+        let dir = fresh_dir("crlf-edit");
+        let path = dir.join("windows.txt");
+        std::fs::write(&path, "first line\r\nsecond line\r\nthird line\r\n").expect("write");
+
+        let output = edit_file(
+            path.to_string_lossy().as_ref(),
+            "second line\nthird line",
+            "second LINE\nthird LINE\nfourth line",
+            false,
+        )
+        .expect("LF old_string should match CRLF file");
+
+        let written = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(
+            written,
+            "first line\r\nsecond LINE\r\nthird LINE\r\nfourth line\r\n"
+        );
+        assert_eq!(output.line_ending, "crlf");
+        assert_eq!(output.replacements, 1);
+        assert!(output.diff.contains("-second line"));
+        assert!(output.diff.contains("+fourth line"));
+        assert!(!output.diff.contains('\r'));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn edit_refuses_ambiguous_matches_with_count_and_lines() {
+        let dir = fresh_dir("multi-match");
+        let path = dir.join("dupes.rs");
+        std::fs::write(&path, "let x = 1;\nfoo();\nlet y = 2;\nfoo();\nfoo();\n").expect("write");
+
+        let error = edit_file(path.to_string_lossy().as_ref(), "foo();", "bar();", false)
+            .expect_err("ambiguous edit must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        let message = error.to_string();
+        assert!(message.contains("matches 3 times"), "{message}");
+        assert!(message.contains("lines 2, 4, 5"), "{message}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("unchanged"),
+            "let x = 1;\nfoo();\nlet y = 2;\nfoo();\nfoo();\n"
+        );
+
+        let all = edit_file(path.to_string_lossy().as_ref(), "foo();", "bar();", true)
+            .expect("replace_all edits every match");
+        assert_eq!(all.replacements, 3);
+        assert!(!std::fs::read_to_string(&path)
+            .expect("read")
+            .contains("foo"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn edit_returns_a_compact_bounded_diff() {
+        let dir = fresh_dir("compact-diff");
+        let path = dir.join("big.txt");
+        let content = (1..=5_000)
+            .map(|n| format!("line number {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, &content).expect("write");
+
+        let output = edit_file(
+            path.to_string_lossy().as_ref(),
+            "line number 2500\n",
+            "line number 2500 (edited)\n",
+            false,
+        )
+        .expect("edit");
+
+        assert!(
+            output.diff.len() < 1_000,
+            "diff too large: {}",
+            output.diff.len()
+        );
+        assert!(
+            output.diff.contains("@@ -2497,7 +2497,7 @@"),
+            "{}",
+            output.diff
+        );
+        assert!(output.diff.contains(" line number 2497"));
+        assert!(output.diff.contains("-line number 2500"));
+        assert!(output.diff.contains("+line number 2500 (edited)"));
+        assert!(!output.diff.contains("line number 1\n"));
+        assert_eq!(output.structured_patch.len(), 1);
+        let json = serde_json::to_string(&output).expect("serialize");
+        assert!(json.len() < 3_000, "edit output must not echo the file");
+
+        let replaced_everywhere =
+            edit_file(path.to_string_lossy().as_ref(), "line number", "row", true)
+                .expect("replace all");
+        assert_eq!(replaced_everywhere.replacements, 5_000);
+        assert!(replaced_everywhere.diff_truncated);
+        assert!(replaced_everywhere.diff.chars().count() <= 12_200);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn edit_diff_accounts_for_joined_lines_and_rejects_empty_old_string() {
+        let dir = fresh_dir("joined-diff");
+        let path = dir.join("join.txt");
+        std::fs::write(&path, "a\nb\nc\n").expect("write");
+        let output = edit_file(path.to_string_lossy().as_ref(), "a\n", "x", false).expect("edit");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "xb\nc\n");
+        let hunk = &output.structured_patch[0];
+        assert_eq!(hunk.lines, vec!["-a", "-b", "+xb", " c"]);
+        assert_eq!((hunk.old_lines, hunk.new_lines), (3, 2));
+
+        let error = edit_file(path.to_string_lossy().as_ref(), "", "y", false)
+            .expect_err("empty old_string");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn write_returns_a_compact_summary() {
+        let dir = fresh_dir("write-summary");
+        let path = dir.join("out.txt");
+        let created = write_file(path.to_string_lossy().as_ref(), "one\ntwo\n").expect("create");
+        assert_eq!(created.kind, "create");
+        assert_eq!(created.bytes, 8);
+        assert_eq!(created.lines, 2);
+        assert!(created.summary.starts_with("Created"));
+
+        let big = "payload line\n".repeat(1_000);
+        let updated = write_file(path.to_string_lossy().as_ref(), &big).expect("overwrite");
+        assert_eq!(updated.kind, "update");
+        assert_eq!(updated.lines, 1_000);
+        assert!(updated.summary.starts_with("Overwrote"));
+        let json = serde_json::to_string(&updated).expect("serialize");
+        assert!(
+            !json.contains("payload line"),
+            "write output must not echo content"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_defaults_to_2000_lines_with_continuation_hint_and_cuts_long_lines() {
+        let dir = fresh_dir("read-limits");
+        let path = dir.join("long.txt");
+        let mut lines = (1..=2_500).map(|n| format!("line {n}")).collect::<Vec<_>>();
+        lines[9] = "x".repeat(5_000);
+        std::fs::write(&path, lines.join("\r\n")).expect("write");
+
+        let first = read_file(path.to_string_lossy().as_ref(), None, None).expect("read");
+        assert_eq!(first.file.num_lines, 2_000);
+        assert_eq!(first.file.total_lines, 2_500);
+        assert_eq!(first.file.truncated_lines, 1);
+        let hint = first.file.hint.as_deref().expect("hint");
+        assert!(hint.contains("offset=2000"), "{hint}");
+        assert!(first
+            .file
+            .content
+            .contains("[line truncated: 5000 characters]"));
+        assert!(!first.file.content.contains('\r'));
+
+        let rest = read_file(path.to_string_lossy().as_ref(), Some(2_000), None).expect("read");
+        assert_eq!(rest.file.num_lines, 500);
+        assert_eq!(rest.file.start_line, 2_001);
+        assert!(rest.file.hint.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn glob_and_grep_skip_build_dirs_and_gitignored_paths() {
+        let dir = fresh_dir("skip-dirs");
+        for sub in [
+            "src",
+            "node_modules/lib",
+            "target/debug",
+            "generated",
+            ".git",
+        ] {
+            std::fs::create_dir_all(dir.join(sub)).expect("dir");
+        }
+        for file in [
+            "src/app.js",
+            "node_modules/lib/index.js",
+            "target/debug/build.js",
+            "generated/schema.js",
+        ] {
+            std::fs::write(dir.join(file), "needle\n").expect("file");
+        }
+        std::fs::write(dir.join(".gitignore"), "generated/\n").expect("gitignore");
+
+        let globbed = glob_search("**/*.js", Some(dir.to_string_lossy().as_ref())).expect("glob");
+        assert_eq!(globbed.num_files, 1, "{:?}", globbed.filenames);
+        assert!(globbed.filenames[0].ends_with("app.js"));
+
+        let explicit = glob_search("node_modules/**/*.js", Some(dir.to_string_lossy().as_ref()))
+            .expect("explicit glob");
+        assert_eq!(explicit.num_files, 1, "{:?}", explicit.filenames);
+
+        let grep_output = grep_search(&GrepSearchInput {
+            pattern: String::from("needle"),
+            path: Some(dir.to_string_lossy().into_owned()),
+            glob: None,
+            output_mode: Some(String::from("files_with_matches")),
+            before: None,
+            after: None,
+            context_short: None,
+            context: None,
+            line_numbers: None,
+            case_insensitive: None,
+            file_type: None,
+            head_limit: None,
+            offset: None,
+            multiline: None,
+        })
+        .expect("grep");
+        assert_eq!(grep_output.num_files, 1, "{:?}", grep_output.filenames);
+        assert!(grep_output.filenames[0].ends_with("app.js"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
