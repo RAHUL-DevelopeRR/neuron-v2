@@ -19,6 +19,7 @@ pub mod cancel;
 mod compact;
 mod config;
 pub mod config_validate;
+pub mod context_manager;
 mod conversation;
 mod default_skill_files;
 pub mod default_skills;
@@ -55,6 +56,7 @@ pub mod summary_compression;
 pub mod task_packet;
 pub mod task_registry;
 pub mod team_cron_registry;
+pub mod transcript;
 #[cfg(test)]
 mod trust_resolver;
 mod usage;
@@ -63,9 +65,12 @@ pub mod worker_boot;
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};
+pub use cancel::CancellationToken;
 pub use compact::{
-    compact_session, estimate_session_tokens, format_compact_summary,
-    get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
+    compact_session, compact_session_to_token_budget, compact_session_with_policy,
+    estimate_session_tokens, format_compact_summary, get_compact_continuation_message,
+    should_compact, CompactionConfig, CompactionResult, TokenCompaction, AUTO_CONTINUE_PREFIX,
+    DEFAULT_MAX_SUMMARY_TOKENS, DERIVED_CONTEXT_NOTE,
 };
 pub use config::{
     ConfigEntry, ConfigError, ConfigLoader, ConfigSource, McpConfigCollection,
@@ -80,9 +85,11 @@ pub use config_validate::{
     DiagnosticKind, ValidationResult,
 };
 pub use conversation::{
-    auto_compaction_threshold_from_env, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
-    ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolError,
-    ToolExecutor, TurnSummary,
+    auto_compaction_threshold_from_env, auto_compaction_threshold_override_from_env,
+    is_truncation_stop_reason, resolve_max_iterations, ApiClient, ApiRequest, AssistantEvent,
+    AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError, RuntimeErrorKind,
+    StaticToolExecutor, ToolError, ToolExecutor, TurnOutcome, TurnSummary, DEFAULT_MAX_ITERATIONS,
+    INTERRUPTED_TOOL_RESULT, MAX_ITERATIONS_ENV_VAR,
 };
 pub use file_ops::{
     edit_file, edit_file_in_workspace, glob_search, grep_search, read_file, read_file_in_workspace,
@@ -161,7 +168,7 @@ pub use sandbox::{
 };
 pub use session::{
     ContentBlock, ConversationMessage, MessageRole, Session, SessionCompaction, SessionError,
-    SessionFork, SessionPromptEntry,
+    SessionFork, SessionLoadDiagnostics, SessionPromptEntry,
 };
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use stale_base::{

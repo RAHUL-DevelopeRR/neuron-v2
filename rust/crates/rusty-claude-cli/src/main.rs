@@ -58,6 +58,7 @@ mod progress;
 mod provider;
 mod quota;
 mod render;
+mod repl_loop;
 mod repo_map;
 mod reports;
 mod session_mgmt;
@@ -125,18 +126,27 @@ use tools::{
 };
 
 const DEFAULT_MODEL: &str = "auto";
+/// Output budget (`max_tokens`) requested per model call. Models known to the
+/// shared capability registry (gateway catalog or verified built-ins) request
+/// their advertised output limit capped at 32K; unknown models get 8K. The
+/// gateway pseudo-models (`auto`, `default`) are resolved per request to an
+/// upstream we cannot see (possibly a small free tier), so they stay at 8K.
 fn max_tokens_for_model(model: &str) -> u32 {
-    if env::var_os("NEURON_API_BASE").is_some()
-        || model == "auto"
-        || model == "openai/auto"
-        || model.starts_with("openai/@cf/")
-    {
-        8192
-    } else if model.contains("opus") {
-        32_000
+    const REGISTERED_OUTPUT_CAP: u32 = 32_000;
+    const UNKNOWN_MODEL_OUTPUT: u32 = 8_192;
+    let cap = if matches!(
+        runtime::model_registry::normalize_model_id(model).as_str(),
+        "auto" | "default"
+    ) {
+        UNKNOWN_MODEL_OUTPUT
     } else {
-        64_000
-    }
+        REGISTERED_OUTPUT_CAP
+    };
+    runtime::model_registry::lookup(model)
+        .or_else(|| runtime::model_registry::lookup(&api::resolve_model_alias(model)))
+        .map_or(UNKNOWN_MODEL_OUTPUT, |capability| {
+            capability.max_output_tokens.min(cap)
+        })
 }
 // Build-time constants injected by build.rs (fall back to static values when
 // build.rs hasn't run, e.g. in doc-test or unusual toolchain environments).
@@ -149,8 +159,6 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
 const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
-const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
-const INITIAL_STREAM_TIMEOUT: Duration = Duration::from_secs(60);
 const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
 const LEGACY_SESSION_EXTENSION: &str = "json";
 const OFFICIAL_REPO_URL: &str = "https://github.com/RAHUL-DevelopeRR/claw-code";
@@ -589,8 +597,49 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
         }
     };
     let resolved_path = handle.path.clone();
+    if let Some(warning) = session.load_diagnostics().warning_message() {
+        let warning = format!("session {}: {warning}", resolved_path.display());
+        if output_format == CliOutputFormat::Json {
+            eprintln!(
+                "{}",
+                serde_json::json!({ "type": "warning", "warning": warning })
+            );
+        } else {
+            eprintln!("warning: {warning}");
+        }
+    }
 
     if commands.is_empty() {
+        // `neuron --resume <id>` on a terminal continues the conversation in
+        // the REPL; piped or JSON invocations keep the scriptable summary.
+        if output_format == CliOutputFormat::Text
+            && io::stdin().is_terminal()
+            && io::stdout().is_terminal()
+        {
+            let process_args = env::args().skip(1).collect::<Vec<_>>();
+            let unapplied = repl_loop::unapplied_resume_launch_flags(&process_args);
+            if !unapplied.is_empty() {
+                eprintln!(
+                    "error: {}",
+                    repl_loop::unapplied_resume_flags_message(&unapplied, &session_reference)
+                );
+                std::process::exit(2);
+            }
+            let launched = repl_loop::launch(repl_loop::ReplLaunch {
+                model: DEFAULT_MODEL.to_string(),
+                allowed_tools: None,
+                permission_mode: default_permission_mode(),
+                base_commit: None,
+                reasoning_effort: None,
+                allow_broad_cwd: false,
+                resume: Some(resolved_path.display().to_string()),
+            });
+            if let Err(error) = launched {
+                eprintln!("error: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
         if output_format == CliOutputFormat::Json {
             println!(
                 "{}",
@@ -638,6 +687,19 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                     eprintln!("/{cmd_root} is not yet implemented in this build");
                 }
                 std::process::exit(2);
+            }
+            if cmd_root == "context" {
+                let report = repl_loop::saved_session_context_report(&session);
+                if output_format == CliOutputFormat::Json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&repl_loop::context_report_json(&report))
+                            .expect("context report json")
+                    );
+                } else {
+                    println!("{}", repl_loop::render_context_report(&report));
+                }
+                continue;
             }
         }
         let command = match SlashCommand::parse(raw_command) {
@@ -1346,122 +1408,18 @@ fn run_repl(
     reasoning_effort: Option<String>,
     allow_broad_cwd: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
-    run_stale_base_preflight(base_commit.as_deref());
-
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    if !crate::auth::check_trust(&cwd) {
-        std::process::exit(1);
-    }
-
-    let resolved_model = configure_provider_for_model(resolve_repl_model(model))?;
-
-    let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
-    cli.set_reasoning_effort(reasoning_effort);
-    let mut editor =
-        input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
-    println!();
-    println!("{}", cli.startup_banner());
-    println!("{}", format_connected_line(&cli.model));
-
-    // â”€â”€ Persistent footer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    // Shows model, session, and the ? hint so the user knows how
-    // to discover shortcuts without reading the manual.
-    {
-        let dm = "\x1b[2m";
-        let r = "\x1b[0m";
-        let bc = "\x1b[38;2;100;100;100m";
-        let model_s = cli.model.split('/').last().unwrap_or(&cli.model);
-        let session_short = &cli.session.id[..6.min(cli.session.id.len())];
-        println!(
-            "\n{bc}{}{r}\n  {dm}? for shortcuts{r}                       {dm}{model_s} \u{00b7} session {session_short}{r}\n",
-            "\u{2500}".repeat(74),
-        );
-    }
-
-    // â”€â”€ Main REPL loop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    // Input is dispatched through a priority chain:
-    //   1. "?"             â†’ local shortcuts panel  (no API call)
-    //   2. "!<cmd>"        â†’ shell escape           (no API call)
-    //   3. "/exit","/quit" â†’ exit
-    //   4. "/<cmd>"        â†’ slash-command dispatch  (local)
-    //   5. bare skill      â†’ skill prompt            (API call)
-    //   6. everything else â†’ direct LLM prompt       (API call)
-    loop {
-        // Update prompt to reflect current permission mode.
-        editor.set_prompt(&mode_aware_prompt(
-            &cli.permission_mode,
-            cli.plan_mode,
-            cli.orchestration_mode.as_deref(),
-        ));
-        editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
-
-        match editor.read_line()? {
-            input::ReadOutcome::Submit(input) => {
-                let trimmed = input.trim().to_string();
-                if trimmed.is_empty() {
-                    continue;
-                }
-
-                // â”€â”€ Priority 1: "?" â†’ local shortcuts panel â”€â”€â”€â”€â”€â”€
-                if trimmed == "?" || trimmed == "??" {
-                    println!("{}", render_shortcuts_panel());
-                    continue;
-                }
-
-                // â”€â”€ Priority 2: "!<cmd>" â†’ shell escape â”€â”€â”€â”€â”€â”€â”€â”€â”€
-                if let Some(shell_cmd) = trimmed.strip_prefix('!') {
-                    let shell_cmd = shell_cmd.trim();
-                    if !shell_cmd.is_empty() {
-                        run_shell_escape(shell_cmd);
-                    }
-                    continue;
-                }
-
-                // â”€â”€ Priority 3: exit â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-                if matches!(trimmed.as_str(), "/exit" | "/quit") {
-                    cli.persist_session()?;
-                    break;
-                }
-
-                // â”€â”€ Priority 4: slash-command dispatch â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-                match SlashCommand::parse(&trimmed) {
-                    Ok(Some(command)) => {
-                        if cli.handle_repl_command(command)? {
-                            cli.persist_session()?;
-                        }
-                        continue;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        eprintln!("{error}");
-                        continue;
-                    }
-                }
-
-                // â”€â”€ Priority 5: bare-word skill dispatch â”€â”€â”€â”€â”€â”€â”€â”€â”€
-                let cwd = std::env::current_dir().unwrap_or_default();
-                if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &trimmed) {
-                    editor.push_history(input);
-                    cli.record_prompt_history(&trimmed);
-                    cli.run_turn(&prompt)?;
-                    continue;
-                }
-
-                // â”€â”€ Priority 6: forward to LLM â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-                editor.push_history(input);
-                cli.record_prompt_history(&trimmed);
-                cli.run_turn(&trimmed)?;
-            }
-            input::ReadOutcome::Cancel => {}
-            input::ReadOutcome::Exit => {
-                cli.persist_session()?;
-                break;
-            }
-        }
-    }
-
-    Ok(())
+    // The loop itself lives in `repl_loop`: it renders turn and slash-command
+    // failures (and panics) instead of propagating them, so one failed
+    // request never ends the session.
+    repl_loop::launch(repl_loop::ReplLaunch {
+        model,
+        allowed_tools,
+        permission_mode,
+        base_commit,
+        reasoning_effort,
+        allow_broad_cwd,
+        resume: None,
+    })
 }
 
 struct LiveCli {
@@ -1900,6 +1858,10 @@ fn mcp_annotation_flag(tool: &McpTool, key: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Watches for Ctrl-C while a turn runs. The first press cancels the turn's
+/// [`runtime::CancellationToken`] (model stream, tool loop, sub-agents) and
+/// aborts running hooks; a second press asks the REPL to save and quit once
+/// the turn unwinds (see [`repl_loop::request_force_quit`]).
 struct HookAbortMonitor {
     stop_tx: Option<Sender<()>>,
     join_handle: Option<JoinHandle<()>>,
@@ -1907,6 +1869,13 @@ struct HookAbortMonitor {
 
 impl HookAbortMonitor {
     fn spawn(abort_signal: runtime::HookAbortSignal) -> Self {
+        Self::spawn_for_turn(abort_signal, runtime::CancellationToken::new())
+    }
+
+    fn spawn_for_turn(
+        abort_signal: runtime::HookAbortSignal,
+        cancel: runtime::CancellationToken,
+    ) -> Self {
         Self::spawn_with_waiter(abort_signal, move |stop_rx, abort_signal| {
             let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1919,15 +1888,16 @@ impl HookAbortMonitor {
                 let wait_for_stop = tokio::task::spawn_blocking(move || {
                     let _ = stop_rx.recv();
                 });
-
-                tokio::select! {
-                    result = tokio::signal::ctrl_c() => {
-                        if result.is_ok() {
-                            abort_signal.abort();
-                        }
-                    }
-                    _ = wait_for_stop => {}
-                }
+                repl_loop::watch_turn_interrupts(
+                    tokio::signal::ctrl_c,
+                    async {
+                        let _ = wait_for_stop.await;
+                    },
+                    &cancel,
+                    &abort_signal,
+                    repl_loop::request_force_quit,
+                )
+                .await;
             });
         })
     }
@@ -2217,15 +2187,19 @@ impl LiveCli {
         ))
     }
 
+    /// Readies the live runtime for one turn. The runtime (and with it the
+    /// HTTP client, MCP servers and plugins) is reused across turns; it is
+    /// rebuilt only when the tool set, permission mode, output mode or model
+    /// changed, or the shared MCP/plugin state was reloaded. Installs a fresh
+    /// cancellation token and hook-abort signal and returns the Ctrl-C
+    /// monitor guarding the turn.
     fn prepare_turn_runtime(
-        &self,
+        &mut self,
         emit_output: bool,
-    ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
-        // â”€â”€ Plan mode: structurally strip write tools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        // Instead of asking the LLM "please don't write", we physically
-        // remove write tools from the tool list.  The LLM never sees
-        // bash, write_file, or edit_file â€” it can only read and search.
-        // This is the Claude Code approach: structural gating, not prompting.
+    ) -> Result<HookAbortMonitor, Box<dyn std::error::Error>> {
+        // Plan mode structurally strips write tools: instead of asking the
+        // model not to write, bash, write_file and edit_file are removed from
+        // the tool list so it can only read and search.
         let effective_tools = if self.plan_mode {
             let mut read_only: std::collections::BTreeSet<String> =
                 std::collections::BTreeSet::new();
@@ -2237,22 +2211,44 @@ impl LiveCli {
             self.allowed_tools.clone()
         };
 
-        let hook_abort_signal = runtime::HookAbortSignal::new();
-        let runtime = build_runtime(
-            self.runtime.session().clone(),
-            &self.session.id,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            emit_output,
-            effective_tools,
-            self.permission_mode,
-            None,
-        )?
-        .with_hook_abort_signal(hook_abort_signal.clone());
-        let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
+        let needs_rebuild = {
+            let client = self.runtime.api_client();
+            client.allowed_tools() != effective_tools.as_ref()
+                || client.emit_output() != emit_output
+                || client.model() != self.model
+                || self.runtime.permission_policy().active_mode() != self.permission_mode
+                || !progress::runtime_uses_current_shared_state(&self.runtime)
+        };
+        if needs_rebuild {
+            let reasoning_effort = self
+                .runtime
+                .api_client()
+                .reasoning_effort()
+                .map(ToOwned::to_owned);
+            let mut runtime = build_runtime(
+                self.runtime.session().clone(),
+                &self.session.id,
+                self.model.clone(),
+                self.system_prompt.clone(),
+                true,
+                emit_output,
+                effective_tools,
+                self.permission_mode,
+                None,
+            )?;
+            runtime
+                .api_client_mut()
+                .set_reasoning_effort(reasoning_effort);
+            self.replace_runtime(runtime)?;
+        }
 
-        Ok((runtime, hook_abort_monitor))
+        let cancel = runtime::CancellationToken::new();
+        let hook_abort_signal = runtime::HookAbortSignal::new();
+        self.runtime.set_cancellation_token(cancel.clone());
+        self.runtime
+            .set_hook_abort_signal(hook_abort_signal.clone());
+        tools::set_subagent_cancellation_token(cancel.clone());
+        Ok(HookAbortMonitor::spawn_for_turn(hook_abort_signal, cancel))
     }
 
     fn replace_runtime(&mut self, runtime: BuiltRuntime) -> Result<(), Box<dyn std::error::Error>> {
@@ -2332,7 +2328,7 @@ impl LiveCli {
             input
         };
 
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
+        let hook_abort_monitor = self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         let spinner_label = if self.plan_mode {
@@ -2353,17 +2349,33 @@ impl LiveCli {
             &mut stdout,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(actual_input, Some(&mut permission_prompter));
+        let result = self
+            .runtime
+            .run_turn(actual_input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
+        // Every message was appended to the session file as it was produced;
+        // rewriting the full snapshot keeps disk and memory identical however
+        // the turn ended (including failures and interruptions).
+        let persisted = self.persist_session();
         match result {
             Ok(summary) => {
-                self.replace_runtime(runtime)?;
-                spinner.finish("Done", TerminalRenderer::new().color_theme(), &mut stdout)?;
+                let renderer = TerminalRenderer::new();
+                let theme = renderer.color_theme();
+                match &summary.outcome {
+                    runtime::TurnOutcome::Cancelled { .. } => {
+                        spinner.fail("Interrupted", theme, &mut stdout)?;
+                    }
+                    runtime::TurnOutcome::LoopDetected { .. } => {
+                        spinner.fail("Stopped", theme, &mut stdout)?;
+                    }
+                    runtime::TurnOutcome::Completed | runtime::TurnOutcome::OutputTruncated => {
+                        spinner.finish("Done", theme, &mut stdout)?;
+                    }
+                }
                 println!();
 
-                // â”€â”€ Record Azure quota usage â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-                // Persist output token count to ~/.neuroncli/quota.json
-                // so the banner shows accurate usage across sessions.
+                // Persist output token count to ~/.neuroncli/quota.json so the
+                // banner shows accurate Azure usage across sessions.
                 if std::env::var("OPENAI_BASE_URL").map_or(false, |u| u.contains("azure")) {
                     let mut quota = crate::quota::QuotaState::load();
                     quota.record_azure_usage(summary.usage.output_tokens as u32);
@@ -2375,16 +2387,21 @@ impl LiveCli {
                         format_auto_compaction_notice(event.removed_message_count)
                     );
                 }
-                self.persist_session()?;
+                if let Some(notice) = repl_loop::describe_turn_outcome(&summary) {
+                    println!("{notice}");
+                }
+                persisted?;
                 Ok(())
             }
             Err(error) => {
-                runtime.shutdown_plugins()?;
                 spinner.fail(
                     "Request failed",
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
+                if let Err(persist_error) = persisted {
+                    eprintln!("warning: failed to save the session: {persist_error}");
+                }
                 Err(Box::new(error))
             }
         }
@@ -2396,40 +2413,47 @@ impl LiveCli {
         output_format: CliOutputFormat,
         compact: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        match output_format {
+        let result = match output_format {
             CliOutputFormat::Text if compact => self.run_prompt_compact(input),
             CliOutputFormat::Text => self.run_turn(input),
             CliOutputFormat::Json => self.run_prompt_json(input),
-        }
+        };
+        // One-shot mode: the shared MCP servers and plugins end with the turn.
+        progress::shutdown_shared_runtime_state();
+        result
+    }
+
+    /// Runs one non-interactive turn on the live runtime and persists the
+    /// session whether or not the turn succeeded.
+    fn run_one_shot_turn(
+        &mut self,
+        input: &str,
+    ) -> Result<runtime::TurnSummary, Box<dyn std::error::Error>> {
+        let hook_abort_monitor = self.prepare_turn_runtime(false)?;
+        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let result = self.runtime.run_turn(input, Some(&mut permission_prompter));
+        hook_abort_monitor.stop();
+        self.persist_session()?;
+        Ok(result?)
     }
 
     fn run_prompt_compact(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter));
-        hook_abort_monitor.stop();
-        let summary = result?;
-        self.replace_runtime(runtime)?;
-        self.persist_session()?;
+        let summary = self.run_one_shot_turn(input)?;
         let final_text = final_assistant_text(&summary);
         println!("{final_text}");
         Ok(())
     }
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter));
-        hook_abort_monitor.stop();
-        let summary = result?;
-        self.replace_runtime(runtime)?;
-        self.persist_session()?;
+        let summary = self.run_one_shot_turn(input)?;
         println!(
             "{}",
             json!({
                 "message": final_assistant_text(&summary),
                 "model": self.model,
                 "iterations": summary.iterations,
+                "outcome": repl_loop::turn_outcome_label(&summary.outcome),
+                "stop_reason": summary.stop_reason,
                 "auto_compaction": summary.auto_compaction.map(|event| json!({
                     "removed_messages": event.removed_message_count,
                     "notice": format_auto_compaction_notice(event.removed_message_count),

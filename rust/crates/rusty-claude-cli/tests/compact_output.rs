@@ -9,7 +9,7 @@ use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[test]
-#[ignore = "mock CLI subprocess hangs on Windows; run explicitly after harness fix"]
+#[ignore = "on Windows the binary reads the real profile's credential store until the USERPROFILE-scoped store (WP-A1) lands; passes with it, run explicitly"]
 fn compact_flag_prints_only_final_assistant_text_without_tool_call_details() {
     // given a workspace pointed at the mock Anthropic service and a fixture file
     // that the read_file_roundtrip scenario will fetch through a tool call
@@ -77,7 +77,7 @@ fn compact_flag_prints_only_final_assistant_text_without_tool_call_details() {
 }
 
 #[test]
-#[ignore = "mock CLI subprocess hangs on Windows; run explicitly after harness fix"]
+#[ignore = "on Windows the binary reads the real profile's credential store until the USERPROFILE-scoped store (WP-A1) lands; passes with it, run explicitly"]
 fn compact_flag_streaming_text_only_emits_final_message_text() {
     // given a workspace pointed at the mock Anthropic service running the
     // streaming_text scenario which only emits a single assistant text block
@@ -134,6 +134,12 @@ fn run_claw(
     base_url: &str,
     args: &[&str],
 ) -> Output {
+    // Keep the default MCP servers (spawned through npx) out of the harness.
+    fs::write(
+        config_home.join("settings.json"),
+        r#"{"defaultMcpServers":false}"#,
+    )
+    .expect("harness settings should write");
     let mut command = Command::new(env!("CARGO_BIN_EXE_neuron"));
     command
         .current_dir(cwd)
@@ -142,9 +148,14 @@ fn run_claw(
         .env("ANTHROPIC_BASE_URL", base_url)
         .env("CLAW_CONFIG_HOME", config_home)
         .env("HOME", home)
+        .env("USERPROFILE", home)
         .env("NO_COLOR", "1")
         .env("PATH", "/usr/bin:/bin")
         .args(args);
+    // Windows networking needs SystemRoot even in a cleared environment.
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        command.env("SystemRoot", system_root);
+    }
     command.output().expect("claw should launch")
 }
 

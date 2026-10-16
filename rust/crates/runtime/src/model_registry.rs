@@ -102,6 +102,12 @@ pub fn context_window_or_default(model: &str) -> u32 {
     lookup(model).map_or(DEFAULT_CONTEXT_WINDOW, |cap| cap.context_window)
 }
 
+/// Output-token limit for `model`, or [`DEFAULT_MAX_OUTPUT_TOKENS`] when unknown.
+#[must_use]
+pub fn max_output_tokens_or_default(model: &str) -> u32 {
+    lookup(model).map_or(DEFAULT_MAX_OUTPUT_TOKENS, |cap| cap.max_output_tokens)
+}
+
 /// Built-in limits for models verified against their providers on 2026-10-16.
 /// Gateway catalog data always takes precedence over this table.
 #[must_use]
@@ -122,6 +128,10 @@ pub fn builtin_fallback(model: &str) -> Option<ModelCapability> {
         "nvidia/nvidia/nemotron-3-super-120b-a12b" => (262_144, 65_536, true),
         "@cf/meta/llama-3.3-70b-instruct-fp8-fast" => (24_000, 8_192, true),
         "@cf/openai/gpt-oss-120b" => (128_000, 32_768, true),
+        // Provider-native models reached without the gateway (direct API keys).
+        "claude-opus-4-6" => (200_000, 32_000, true),
+        "claude-sonnet-4-6" | "claude-haiku-4-5-20251213" => (200_000, 64_000, true),
+        "grok-3" | "grok-3-mini" => (131_072, 64_000, true),
         _ => return None,
     };
     Some(ModelCapability::new(

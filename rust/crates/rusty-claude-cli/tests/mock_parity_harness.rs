@@ -26,7 +26,7 @@ fn make_executable(path: &Path) {
 fn make_executable(_path: &Path) {}
 
 #[test]
-#[ignore = "mock CLI subprocess harness is long-running/flaky on Windows; run explicitly for parity checks"]
+#[ignore = "long-running subprocess harness; on Windows it also needs the USERPROFILE-scoped credential store (WP-A1), and the bash approval scenarios still expect bash to require danger-full-access"]
 #[allow(clippy::too_many_lines)]
 fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios() {
     let manifest_entries = load_scenario_manifest();
@@ -291,6 +291,11 @@ impl HarnessWorkspace {
         fs::create_dir_all(&self.root)?;
         fs::create_dir_all(&self.config_home)?;
         fs::create_dir_all(&self.home)?;
+        // Keep the default MCP servers (spawned through npx) out of the harness.
+        fs::write(
+            self.config_home.join("settings.json"),
+            r#"{"defaultMcpServers":false}"#,
+        )?;
         Ok(())
     }
 }
@@ -330,6 +335,7 @@ fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) ->
         .env("ANTHROPIC_BASE_URL", base_url)
         .env("CLAW_CONFIG_HOME", &workspace.config_home)
         .env("HOME", &workspace.home)
+        .env("USERPROFILE", &workspace.home)
         .env("NO_COLOR", "1")
         .env("PATH", "/usr/bin:/bin")
         .args([
@@ -345,6 +351,16 @@ fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) ->
     }
     if let Some((key, value)) = case.extra_env {
         command.env(key, value);
+    }
+    // Windows networking needs SystemRoot even in a cleared environment.
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        command.env("SystemRoot", system_root);
+    }
+    // `/usr/bin:/bin` means nothing on Windows: keep the real PATH so the
+    // bash tool can find a POSIX shell (Git for Windows).
+    #[cfg(windows)]
+    if let Some(path) = std::env::var_os("PATH") {
+        command.env("PATH", path);
     }
     if let Some(session_id) = case.resume_session {
         command.args(["--resume", session_id]);
@@ -471,6 +487,7 @@ fn prepare_plugin_fixture(workspace: &HarnessWorkspace) {
     fs::write(
         workspace.config_home.join("settings.json"),
         json!({
+            "defaultMcpServers": false,
             "enabledPlugins": {
                 "parity-plugin@external": true
             },
@@ -510,7 +527,11 @@ fn assert_read_file_roundtrip(workspace: &HarnessWorkspace, run: &ScenarioRun) {
     let output = run.response["tool_results"][0]["output"]
         .as_str()
         .expect("tool output");
-    assert!(output.contains(&workspace.root.join("fixture.txt").display().to_string()));
+    assert!(
+        reported_file_path(output)
+            .is_some_and(|path| same_path(&path, &workspace.root.join("fixture.txt"))),
+        "{output}"
+    );
     assert!(output.contains("alpha parity line"));
 }
 
@@ -542,9 +563,11 @@ fn assert_write_file_allowed(workspace: &HarnessWorkspace, run: &ScenarioRun) {
         run.response["tool_uses"][0]["name"],
         Value::String("write_file".to_string())
     );
+    // The reported path uses the platform's separator.
     assert!(run.response["message"]
         .as_str()
         .expect("message text")
+        .replace('\\', "/")
         .contains("generated/output.txt"));
     let generated = workspace.root.join("generated").join("output.txt");
     let contents = fs::read_to_string(&generated).expect("generated file should exist");
@@ -890,4 +913,24 @@ fn unique_temp_dir(label: &str) -> PathBuf {
         "claw-mock-parity-{label}-{}-{millis}-{counter}",
         std::process::id()
     ))
+}
+
+/// The `file.filePath` a `read_file` result reports.
+fn reported_file_path(output: &str) -> Option<String> {
+    serde_json::from_str::<Value>(output)
+        .ok()?
+        .pointer("/file/filePath")?
+        .as_str()
+        .map(ToOwned::to_owned)
+}
+
+/// Whether a path a tool reported names `expected`. Tools report canonical
+/// paths, which on Windows carry the `\\?\` verbatim prefix.
+fn same_path(reported: &str, expected: &Path) -> bool {
+    fn plain(path: &Path) -> PathBuf {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let text = canonical.display().to_string();
+        PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text))
+    }
+    plain(Path::new(reported)) == plain(expected)
 }

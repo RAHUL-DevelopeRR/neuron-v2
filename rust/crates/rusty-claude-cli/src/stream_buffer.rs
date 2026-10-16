@@ -99,8 +99,13 @@ impl StreamBuffer {
 
 /// Synchronous wrapper that buffers markdown-rendered output.
 /// Used inside the existing streaming loop to batch `write_all` calls.
+///
+/// Bytes written through [`io::Write`] may split a UTF-8 sequence across two
+/// calls; the incomplete tail is held back until the rest arrives so
+/// multi-byte characters (emoji, CJK) are never garbled.
 pub struct SyncRenderBuffer {
     buffer: String,
+    pending_bytes: Vec<u8>,
     last_flush: Instant,
     frame_interval: Duration,
     stdout: io::Stdout,
@@ -110,10 +115,47 @@ impl SyncRenderBuffer {
     pub fn new() -> Self {
         Self {
             buffer: String::with_capacity(1024),
+            pending_bytes: Vec::new(),
             last_flush: Instant::now(),
             frame_interval: Duration::from_millis(FRAME_INTERVAL_MS),
             stdout: io::stdout(),
         }
+    }
+
+    /// Appends raw bytes, decoding complete UTF-8 sequences and keeping an
+    /// incomplete trailing sequence for the next call. Invalid bytes become
+    /// U+FFFD.
+    fn push_bytes(&mut self, bytes: &[u8]) {
+        self.pending_bytes.extend_from_slice(bytes);
+        let mut consumed = 0;
+        loop {
+            match std::str::from_utf8(&self.pending_bytes[consumed..]) {
+                Ok(text) => {
+                    self.buffer.push_str(text);
+                    consumed = self.pending_bytes.len();
+                    break;
+                }
+                Err(error) => {
+                    let valid_end = consumed + error.valid_up_to();
+                    self.buffer.push_str(
+                        std::str::from_utf8(&self.pending_bytes[consumed..valid_end])
+                            .unwrap_or_default(),
+                    );
+                    match error.error_len() {
+                        // Incomplete sequence at the end: wait for more bytes.
+                        None => {
+                            consumed = valid_end;
+                            break;
+                        }
+                        Some(invalid_len) => {
+                            self.buffer.push(char::REPLACEMENT_CHARACTER);
+                            consumed = valid_end + invalid_len;
+                        }
+                    }
+                }
+            }
+        }
+        self.pending_bytes.drain(..consumed);
     }
 
     /// Append content. Flushes automatically based on timer or size.
@@ -144,35 +186,36 @@ impl SyncRenderBuffer {
 
 impl io::Write for SyncRenderBuffer {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.buffer.push_str(&String::from_utf8_lossy(buf));
+        self.push_bytes(buf);
         let should_flush = self.last_flush.elapsed() >= self.frame_interval
             || self.buffer.len() >= BUFFER_FLUSH_THRESHOLD;
         if should_flush {
-            self.flush()?;
+            SyncRenderBuffer::flush(self)?;
         }
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        if !self.buffer.is_empty() {
-            self.stdout.write_all(self.buffer.as_bytes())?;
-            self.stdout.flush()?;
-            self.buffer.clear();
-            self.last_flush = Instant::now();
-        }
-        Ok(())
+        SyncRenderBuffer::flush(self)
     }
 }
 
 impl Drop for SyncRenderBuffer {
     fn drop(&mut self) {
-        let _ = self.flush();
+        if !self.pending_bytes.is_empty() {
+            // A sequence that never completed: render it lossily.
+            let tail = String::from_utf8_lossy(&self.pending_bytes).into_owned();
+            self.buffer.push_str(&tail);
+            self.pending_bytes.clear();
+        }
+        let _ = SyncRenderBuffer::flush(self);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
     use std::thread;
     use std::time::Duration;
 
@@ -192,5 +235,24 @@ mod tests {
         let big = "x".repeat(BUFFER_FLUSH_THRESHOLD + 100);
         buf.append(&big).unwrap();
         assert_eq!(buf.buffer, ""); // flushed due to size
+    }
+
+    #[test]
+    fn utf8_sequences_split_across_writes_are_reassembled() {
+        let mut buf = SyncRenderBuffer::new();
+        // Keep the timer from flushing mid-test.
+        buf.frame_interval = Duration::from_secs(3_600);
+        let text = "é🙂日";
+        let bytes = text.as_bytes();
+        for chunk in bytes.chunks(1) {
+            buf.write_all(chunk).expect("write");
+        }
+        assert_eq!(buf.buffer, text);
+        assert_eq!(buf.pending_bytes, Vec::<u8>::new());
+
+        buf.buffer.clear();
+        buf.write_all(&[b'a', 0xFF, b'b']).expect("write");
+        assert_eq!(buf.buffer, "a\u{FFFD}b");
+        buf.buffer.clear();
     }
 }
