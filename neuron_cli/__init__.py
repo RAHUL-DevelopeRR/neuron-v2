@@ -14,7 +14,6 @@ Environment:
 from __future__ import annotations
 
 import hashlib
-import importlib.metadata
 import ipaddress
 import os
 import platform
@@ -40,10 +39,14 @@ class LauncherError(Exception):
 
 
 def _package_version() -> str:
-    try:
-        return importlib.metadata.version("neuroncli")
-    except importlib.metadata.PackageNotFoundError:
-        return PACKAGE_VERSION
+    """The release this launcher runs, spelled like its tag (``v<version>``).
+
+    Not importlib.metadata: it returns the PEP 440 normal form (``6.4.0rc1``),
+    while tags and asset URLs use the semver spelling (``v6.4.0-rc.1``). The
+    release workflow and tests/test_packaging_metadata.py keep PACKAGE_VERSION
+    equal to the version in pyproject.toml.
+    """
+    return PACKAGE_VERSION
 
 
 def _release_asset(system: Optional[str] = None, machine: Optional[str] = None) -> str:

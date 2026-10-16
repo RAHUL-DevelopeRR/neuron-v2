@@ -146,6 +146,29 @@ class PackagedLauncherTests(unittest.TestCase):
             self.assertEqual(seen[name], expected, name)
             self.assertEqual(signal.getsignal(getattr(signal, name)), before[name], name)
 
+    def test_prerelease_versions_download_the_semver_tagged_release(self) -> None:
+        # importlib.metadata would report 6.4.0rc1; the tag and assets are v6.4.0-rc.1.
+        launcher = self.launcher
+        version = "6.4.0-rc.1"
+        asset = launcher._release_asset()
+        releases = self.root / "releases"
+        fake_release.stage_release(releases, version, asset, b"prerelease neuron")
+        with fake_release.FakeReleaseServer(releases) as server, patch.object(
+            launcher, "PACKAGE_VERSION", version
+        ), patch.dict(
+            os.environ,
+            {"NEURON_BINARY_PATH": "", "NEURON_CACHE_DIR": str(self.cache), "NEURON_DOWNLOAD_BASE": server.base_url},
+        ):
+            binary = launcher._find_binary()
+            requested = server.paths()
+        self.assertEqual(requested, [f"/v{version}/{asset}.sha256", f"/v{version}/{asset}"])
+        self.assertEqual(binary, self.cache / version / asset)
+        self.assertEqual(binary.read_bytes(), b"prerelease neuron")
+
+    def test_package_version_is_the_tag_spelling_not_the_installed_metadata(self) -> None:
+        with patch("importlib.metadata.version", return_value="6.4.0rc1"):
+            self.assertEqual(self.launcher._package_version(), self.launcher.PACKAGE_VERSION)
+
     def test_cached_binary_requires_a_valid_sidecar(self) -> None:
         launcher = self.launcher
         asset = "neuron-linux-x64"
