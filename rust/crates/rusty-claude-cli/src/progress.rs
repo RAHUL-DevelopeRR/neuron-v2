@@ -511,6 +511,10 @@ fn register_subagent_parent(model: &str, permission_mode: PermissionMode) {
 
 /// Reads the `maxIterations` setting. (The JSON value type is not nameable
 /// outside the runtime crate, hence the closure.)
+///
+/// Settings validation (`runtime::config_validate`) still rejects the key as
+/// unknown, so today this only takes effect once that schema accepts it;
+/// `NEURON_MAX_ITERATIONS` works regardless.
 #[allow(clippy::redundant_closure_for_method_calls)]
 fn max_iterations_setting(runtime_config: &runtime::RuntimeConfig) -> Option<usize> {
     runtime_config

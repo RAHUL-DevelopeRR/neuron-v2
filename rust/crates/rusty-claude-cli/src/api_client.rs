@@ -158,11 +158,26 @@ pub(crate) fn classify_stream_read_error(session_id: &str, error: &api::ApiError
             if error.is_retryable() {
                 StreamFailure::Interrupted { detail }
             } else {
-                StreamFailure::Fatal(RuntimeError::new(detail))
+                fatal_api_error(session_id, error)
             }
         }
         _ => StreamFailure::Interrupted { detail },
     }
+}
+
+/// A provider error that resending the identical request will not fix.
+/// Context-window rejections keep a typed kind so the runtime can shrink the
+/// context and retry once.
+pub(crate) fn fatal_api_error(session_id: &str, error: &api::ApiError) -> StreamFailure {
+    let kind = if error.is_context_window_failure() {
+        RuntimeErrorKind::ContextWindowExceeded
+    } else {
+        RuntimeErrorKind::Other
+    };
+    StreamFailure::Fatal(RuntimeError::with_kind(
+        kind,
+        format_user_visible_api_error(session_id, error),
+    ))
 }
 
 /// Stop reason reported for tool calls the provider closed without
@@ -378,11 +393,7 @@ impl AnthropicRuntimeClient {
             () = cancel.cancelled() => return Err(StreamFailure::Cancelled),
             result = tokio::time::timeout(first_token_timeout, self.client.stream_message(message_request)) => match result {
                 Ok(Ok(stream)) => stream,
-                Ok(Err(error)) => {
-                    return Err(StreamFailure::Fatal(RuntimeError::new(
-                        format_user_visible_api_error(&self.session_id, &error),
-                    )))
-                }
+                Ok(Err(error)) => return Err(fatal_api_error(&self.session_id, &error)),
                 Err(_elapsed) => {
                     return Err(StreamFailure::FirstTokenTimeout {
                         waited: first_token_timeout,
@@ -618,12 +629,8 @@ impl AnthropicRuntimeClient {
         let response = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(StreamFailure::Cancelled),
-            response = self.client.send_message(&fallback_request) => response.map_err(|error| {
-                StreamFailure::Fatal(RuntimeError::new(format_user_visible_api_error(
-                    &self.session_id,
-                    &error,
-                )))
-            })?,
+            response = self.client.send_message(&fallback_request) => response
+                .map_err(|error| fatal_api_error(&self.session_id, &error))?,
         };
         let mut events = response_to_events(response, out).map_err(StreamFailure::Fatal)?;
         push_prompt_cache_record(&self.client, &mut events);
@@ -1566,8 +1573,43 @@ mod stream_resilience_tests {
                 suggested_action: None,
             },
         );
-        assert!(matches!(quota, StreamFailure::Fatal(_)));
+        assert!(
+            matches!(&quota, StreamFailure::Fatal(error) if error.kind() == RuntimeErrorKind::Other)
+        );
         assert!(!quota.is_retryable());
+
+        // Context overflow is fatal for the stream but typed, so the runtime
+        // can shrink the context and retry once.
+        let overflow = classify_stream_read_error(
+            "s",
+            &api::ApiError::ContextWindowExceeded {
+                model: "m".to_string(),
+                estimated_input_tokens: 140_000,
+                requested_output_tokens: 8_192,
+                estimated_total_tokens: 148_192,
+                context_window_tokens: 131_072,
+            },
+        );
+        assert!(matches!(
+            &overflow,
+            StreamFailure::Fatal(error) if error.kind() == RuntimeErrorKind::ContextWindowExceeded
+        ));
+        let rejected_by_provider = classify_stream_read_error(
+            "s",
+            &api::ApiError::Api {
+                status: reqwest::StatusCode::BAD_REQUEST,
+                error_type: Some("context_length_exceeded".to_string()),
+                message: Some("This model's maximum context length is 131072 tokens".to_string()),
+                request_id: None,
+                body: String::new(),
+                retryable: false,
+                suggested_action: None,
+            },
+        );
+        assert!(matches!(
+            rejected_by_provider.into_runtime_error().kind(),
+            RuntimeErrorKind::ContextWindowExceeded
+        ));
         assert_eq!(
             StreamFailure::Interrupted {
                 detail: "x".to_string()

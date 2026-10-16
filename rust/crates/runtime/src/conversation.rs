@@ -144,6 +144,10 @@ pub enum RuntimeErrorKind {
     MaxIterations,
     /// Reading or writing the session file failed.
     Session,
+    /// The provider rejected the request because the input does not fit the
+    /// model's context window. The runtime shrinks the context and retries
+    /// once before reporting it.
+    ContextWindowExceeded,
 }
 
 /// Error returned when a conversation turn cannot be completed.
@@ -234,6 +238,7 @@ struct TurnProgress {
     pruned_tool_results: usize,
     stop_reason: Option<String>,
     auto_continued: bool,
+    recovered_from_overflow: bool,
 }
 
 /// Coordinates the model loop, tool execution, hooks, and session updates.
@@ -530,7 +535,7 @@ where
                 let error = RuntimeError::with_kind(
                     RuntimeErrorKind::MaxIterations,
                     format!(
-                        "conversation loop exceeded the maximum number of iterations ({}); stopping this turn. Raise the limit with the `maxIterations` setting or {MAX_ITERATIONS_ENV_VAR}.",
+                        "conversation loop exceeded the maximum number of iterations ({}); stopping this turn. Raise the limit with the {MAX_ITERATIONS_ENV_VAR} environment variable (for example {MAX_ITERATIONS_ENV_VAR}=100).",
                         self.max_iterations
                     ),
                 );
@@ -556,6 +561,19 @@ where
                             interrupted_tool_calls: 0,
                         },
                     ));
+                }
+                Err(error)
+                    if error.kind() == RuntimeErrorKind::ContextWindowExceeded
+                        && !progress.recovered_from_overflow =>
+                {
+                    // The provider counted more tokens than the estimate:
+                    // shrink the context and retry once.
+                    progress.recovered_from_overflow = true;
+                    if self.recover_from_context_overflow(&mut progress)? {
+                        continue;
+                    }
+                    self.record_turn_failed(progress.iterations, &error);
+                    return Err(error);
                 }
                 Err(error) => {
                     self.record_turn_failed(progress.iterations, &error);
@@ -669,7 +687,10 @@ where
                         ));
                     }
                     verdict => {
-                        let mut result = self.execute_tool_use(
+                        let ExecutedToolCall {
+                            message: mut result,
+                            interrupted,
+                        } = self.execute_tool_use(
                             progress.iterations,
                             tool_use_id,
                             tool_name,
@@ -685,6 +706,20 @@ where
                             );
                         }
                         self.record_tool_result(progress.iterations, result, &mut progress)?;
+                        if interrupted {
+                            let remaining = self.push_synthetic_results(
+                                progress.iterations,
+                                &pending_tool_uses[index + 1..],
+                                INTERRUPTED_TOOL_RESULT,
+                                &mut progress,
+                            )?;
+                            return Ok(self.finish_turn(
+                                progress,
+                                TurnOutcome::Cancelled {
+                                    interrupted_tool_calls: remaining + 1,
+                                },
+                            ));
+                        }
                     }
                 }
             }
@@ -693,6 +728,10 @@ where
 
     /// Runs permission checks, hooks and the tool itself for one tool call
     /// and returns the (capped) result message.
+    ///
+    /// The pre-hook and the permission prompt can block for a while, so the
+    /// cancellation token is checked again once they return: a call the user
+    /// interrupted meanwhile is never started.
     fn execute_tool_use(
         &mut self,
         iteration: usize,
@@ -700,7 +739,7 @@ where
         tool_name: &str,
         input: &str,
         prompter: Option<&mut dyn PermissionPrompter>,
-    ) -> ConversationMessage {
+    ) -> ExecutedToolCall {
         let pre_hook_result = self.run_pre_tool_use_hook(tool_name, input);
         let effective_input = pre_hook_result
             .updated_input()
@@ -740,7 +779,9 @@ where
             )
         };
 
+        let interrupted = self.cancel.is_cancelled();
         let (output, is_error) = match permission_outcome {
+            PermissionOutcome::Allow if interrupted => (INTERRUPTED_TOOL_RESULT.to_string(), true),
             PermissionOutcome::Allow => {
                 self.record_tool_started(iteration, tool_name);
                 let (mut output, mut is_error) = match self.tool_executor.execute_with_cancellation(
@@ -773,12 +814,15 @@ where
                 true,
             ),
         };
-        ConversationMessage::tool_result(
-            tool_use_id,
-            tool_name,
-            self.context_manager.cap_tool_result(output),
-            is_error,
-        )
+        ExecutedToolCall {
+            message: ConversationMessage::tool_result(
+                tool_use_id,
+                tool_name,
+                self.context_manager.cap_tool_result(output),
+                is_error,
+            ),
+            interrupted,
+        }
     }
 
     fn record_tool_result(
@@ -828,6 +872,26 @@ where
         progress.compacted_messages += preparation.compacted_messages;
         self.record_context_prepared(progress.iterations, &preparation);
         self.session.persist_snapshot().map_err(session_error)
+    }
+
+    /// Shrinks the session after the provider reported a context overflow.
+    /// Returns `false` when nothing could be removed (retrying is pointless).
+    fn recover_from_context_overflow(
+        &mut self,
+        progress: &mut TurnProgress,
+    ) -> Result<bool, RuntimeError> {
+        let preparation = self
+            .context_manager
+            .recover_from_overflow(&mut self.session, &self.system_prompt);
+        if !preparation.changed() {
+            return Ok(false);
+        }
+        progress.pruned_tool_results +=
+            preparation.pruned_tool_results + preparation.truncated_recent_tool_results;
+        progress.compacted_messages += preparation.compacted_messages;
+        self.record_context_prepared(progress.iterations, &preparation);
+        self.session.persist_snapshot().map_err(session_error)?;
+        Ok(true)
     }
 
     fn finish_turn(&mut self, progress: TurnProgress, outcome: TurnOutcome) -> TurnSummary {
@@ -1084,8 +1148,12 @@ fn session_error(error: crate::session::SessionError) -> RuntimeError {
 }
 
 /// Resolves the per-turn model-call cap: `NEURON_MAX_ITERATIONS` wins over the
-/// `maxIterations` setting, which wins over [`DEFAULT_MAX_ITERATIONS`].
+/// configured value, which wins over [`DEFAULT_MAX_ITERATIONS`].
 /// Non-positive or unparsable values are ignored.
+///
+/// The CLI passes the `maxIterations` settings key as `configured`. Settings
+/// validation does not accept that key yet, so until it does the environment
+/// variable is the only documented way to change the cap.
 #[must_use]
 pub fn resolve_max_iterations(configured: Option<usize>) -> usize {
     parse_max_iterations(
@@ -1208,6 +1276,14 @@ fn tool_call_signature(tool_name: &str, input: &str) -> String {
     let canonical_input = serde_json::from_str::<Value>(input)
         .map_or_else(|_| input.trim().to_string(), |value| value.to_string());
     format!("{tool_name}\u{0}{canonical_input}")
+}
+
+/// The result of one tool call, and whether the turn was cancelled before
+/// the tool could start (while its pre-hook or permission prompt ran).
+#[derive(Debug)]
+struct ExecutedToolCall {
+    message: ConversationMessage,
+    interrupted: bool,
 }
 
 #[derive(Debug)]
@@ -2395,12 +2471,15 @@ mod resilience_tests {
     use super::{
         parse_max_iterations, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
         ConversationRuntime, RuntimeError, RuntimeErrorKind, StaticToolExecutor, ToolExecutor,
-        TurnOutcome, DEFAULT_MAX_ITERATIONS, INTERRUPTED_TOOL_RESULT,
+        TurnOutcome, DEFAULT_MAX_ITERATIONS, INTERRUPTED_TOOL_RESULT, MAX_ITERATIONS_ENV_VAR,
     };
     use crate::cancel::CancellationToken;
     use crate::compact::AUTO_CONTINUE_PREFIX;
     use crate::context_manager::{ContextBudget, ContextManager, ContextPolicy};
-    use crate::permissions::{PermissionMode, PermissionPolicy};
+    use crate::permissions::{
+        PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
+        PermissionRequest,
+    };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
     use crate::transcript::unanswered_tool_use_ids;
     use std::cell::RefCell;
@@ -2601,6 +2680,117 @@ mod resilience_tests {
         );
     }
 
+    fn long_session(exchanges: usize) -> Session {
+        let mut session = Session::new();
+        for index in 0..exchanges {
+            session
+                .push_user_text(format!("question {index}: {}", "context ".repeat(400)))
+                .expect("push");
+            session
+                .push_message(ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: format!("answer {index}: {}", "detail ".repeat(400)),
+                }]))
+                .expect("push");
+        }
+        session
+    }
+
+    fn overflow_error() -> RuntimeError {
+        RuntimeError::with_kind(
+            RuntimeErrorKind::ContextWindowExceeded,
+            "context_length_exceeded: prompt is too long",
+        )
+    }
+
+    #[test]
+    fn provider_context_overflow_shrinks_the_context_and_retries_once() {
+        let api = ScriptedApi::new(vec![
+            Err(overflow_error()),
+            Ok(vec![text("fits now"), AssistantEvent::MessageStop]),
+        ]);
+        let mut runtime = runtime_with(long_session(12), api, StaticToolExecutor::new());
+
+        let summary = runtime
+            .run_turn("latest request", None)
+            .expect("one overflow is recovered");
+
+        assert_eq!(summary.outcome, TurnOutcome::Completed);
+        let requests = &runtime.api_client().requests;
+        assert_eq!(requests.len(), 2);
+        let before = crate::context_manager::estimate_messages_tokens(&requests[0].messages);
+        let after = crate::context_manager::estimate_messages_tokens(&requests[1].messages);
+        assert!(after * 2 <= before, "before={before} after={after}");
+        assert!(summary.auto_compaction.is_some());
+        // The latest request survives compaction verbatim.
+        assert!(requests[1].messages.iter().any(|message| message
+            .blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Text { text } if text.contains("latest request")))));
+    }
+
+    #[test]
+    fn repeated_context_overflow_is_reported_instead_of_looping() {
+        let api = ScriptedApi::new(vec![Err(overflow_error()), Err(overflow_error())]);
+        let mut runtime = runtime_with(long_session(12), api, StaticToolExecutor::new());
+
+        let error = runtime
+            .run_turn("latest request", None)
+            .expect_err("a second overflow ends the turn");
+
+        assert_eq!(error.kind(), RuntimeErrorKind::ContextWindowExceeded);
+        assert_eq!(runtime.api_client().requests.len(), 2);
+    }
+
+    #[test]
+    fn ctrl_c_during_the_permission_prompt_never_starts_the_tool() {
+        struct CancelWhileAsking {
+            cancel: CancellationToken,
+        }
+        impl PermissionPrompter for CancelWhileAsking {
+            fn decide(&mut self, _request: &PermissionRequest) -> PermissionPromptDecision {
+                // The user presses Ctrl-C while the prompt waits, then the
+                // prompt returns "allow" anyway.
+                self.cancel.cancel();
+                PermissionPromptDecision::Allow
+            }
+        }
+        let token = CancellationToken::new();
+        let api = ScriptedApi::new(vec![Ok(vec![
+            tool_call("a", "bash", r#"{"command":"rm -rf build"}"#),
+            tool_call("b", "bash", r#"{"command":"ls"}"#),
+            AssistantEvent::MessageStop,
+        ])]);
+        let tools = StaticToolExecutor::new().register("bash", |_| panic!("must not run"));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            api,
+            tools,
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite)
+                .with_tool_requirement("bash", PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_cancellation_token(token.clone());
+        let mut prompter = CancelWhileAsking { cancel: token };
+
+        let summary = runtime
+            .run_turn("clean up", Some(&mut prompter))
+            .expect("cancellation is not an error");
+
+        assert_eq!(
+            summary.outcome,
+            TurnOutcome::Cancelled {
+                interrupted_tool_calls: 2
+            }
+        );
+        assert_eq!(
+            tool_results(runtime.session()),
+            vec![
+                ("a".to_string(), INTERRUPTED_TOOL_RESULT.to_string(), true),
+                ("b".to_string(), INTERRUPTED_TOOL_RESULT.to_string(), true),
+            ]
+        );
+    }
+
     #[test]
     fn doom_loop_guard_warns_once_then_stops_the_turn() {
         struct RepeatingApi {
@@ -2675,6 +2865,10 @@ mod resilience_tests {
 
         assert_eq!(error.kind(), RuntimeErrorKind::MaxIterations);
         assert!(error.to_string().contains("(5)"));
+        // Only advertise knobs that work: settings validation does not
+        // accept `maxIterations` yet.
+        assert!(error.to_string().contains(MAX_ITERATIONS_ENV_VAR));
+        assert!(!error.to_string().contains("maxIterations"));
         assert_eq!(runtime.api_client().calls, 5);
         assert_eq!(
             unanswered_tool_use_ids(&runtime.session().messages),

@@ -46,11 +46,18 @@ const TOOL_BLOCK_OVERHEAD_TOKENS: usize = 12;
 /// [`truncate_head_tail`]; the marker itself is never longer than this.
 const OMISSION_MARKER_RESERVE: usize = 40;
 
+/// ASCII characters per estimated token. English prose averages about four
+/// characters per token, but code, JSON and tool output (the bulk of an agent
+/// transcript) tokenize closer to three, so three keeps the estimate on the
+/// safe side of the provider's real count.
+pub const ASCII_CHARS_PER_TOKEN: usize = 3;
+
 /// Estimates the token footprint of `text`.
 ///
-/// ASCII is counted at four characters per token. Every non-ASCII character
-/// (CJK, emoji, accented letters) is counted as a full token, which
-/// over-estimates most scripts slightly and therefore errs on the safe side.
+/// ASCII is counted at [`ASCII_CHARS_PER_TOKEN`] characters per token. Every
+/// non-ASCII character (CJK, emoji, accented letters) is counted as a full
+/// token, which over-estimates most scripts slightly and therefore errs on
+/// the safe side.
 #[must_use]
 pub fn estimate_text_tokens(text: &str) -> usize {
     let (ascii, other) = text.chars().fold((0_usize, 0_usize), |(ascii, other), ch| {
@@ -60,7 +67,7 @@ pub fn estimate_text_tokens(text: &str) -> usize {
             (ascii, other + 1)
         }
     });
-    ascii.div_ceil(4) + other
+    ascii.div_ceil(ASCII_CHARS_PER_TOKEN) + other
 }
 
 /// Estimates the token footprint of one content block.
@@ -405,6 +412,52 @@ impl ContextManager {
         preparation.tokens_after = tokens;
         preparation
     }
+
+    /// Shrinks `session` after the provider rejected a request as too long
+    /// (its tokenizer counted more than the estimate): prunes the older tool
+    /// results, compacts to a tail of at most half the transcript's estimated
+    /// size (bounded by the input budget), and shortens even the most recent
+    /// tool results when that is still too large. Unlike
+    /// [`Self::prepare_session`] this ignores the threshold.
+    pub fn recover_from_overflow(
+        &self,
+        session: &mut Session,
+        system_prompt: &[String],
+    ) -> ContextPreparation {
+        let snapshot = self.snapshot(&session.messages, system_prompt);
+        let mut preparation = ContextPreparation {
+            tokens_before: snapshot.estimated_tokens,
+            tokens_after: snapshot.estimated_tokens,
+            ..ContextPreparation::default()
+        };
+        let target = snapshot.estimated_tokens.min(snapshot.input_budget) / 2;
+
+        preparation.pruned_tool_results = self.prune_old_tool_results(&mut session.messages);
+        let result = compact_session_with_policy(
+            session,
+            TokenCompaction {
+                min_recent_messages: 1,
+                recent_tokens_budget: target.saturating_mul(self.policy.retained_tail_percent)
+                    / 100,
+                max_summary_tokens: (target / 5).clamp(MIN_SUMMARY_TOKENS, MAX_SUMMARY_TOKENS),
+            },
+        );
+        if result.removed_message_count > 0 {
+            preparation.compacted_messages = result.removed_message_count;
+            *session = result.compacted_session;
+        }
+        let mut tokens = estimate_messages_tokens(&session.messages);
+        if tokens > target {
+            preparation.truncated_recent_tool_results = prune_tool_results(
+                &mut session.messages,
+                0,
+                self.policy.pruned_tool_result_chars,
+            );
+            tokens = estimate_messages_tokens(&session.messages);
+        }
+        preparation.tokens_after = tokens;
+        preparation
+    }
 }
 
 /// Shortens every tool result except the `keep_recent` most recent ones to at
@@ -445,16 +498,21 @@ pub fn prune_tool_results(
 mod tests {
     use super::{
         estimate_messages_tokens, estimate_text_tokens, omission_marker, prune_tool_results,
-        truncate_head_tail, ContextBudget, ContextManager, ContextPolicy,
+        truncate_head_tail, ContextBudget, ContextManager, ContextPolicy, ASCII_CHARS_PER_TOKEN,
         DEFAULT_MAX_TOOL_RESULT_CHARS,
     };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
     #[test]
     fn estimates_ascii_and_unicode_conservatively() {
+        assert_eq!(ASCII_CHARS_PER_TOKEN, 3);
         assert_eq!(estimate_text_tokens(""), 0);
-        assert_eq!(estimate_text_tokens("abcd"), 1);
-        assert_eq!(estimate_text_tokens("abcde"), 2);
+        assert_eq!(estimate_text_tokens("abc"), 1);
+        assert_eq!(estimate_text_tokens("abcd"), 2);
+        assert_eq!(estimate_text_tokens("abcdef"), 2);
+        assert_eq!(estimate_text_tokens("abcdefg"), 3);
+        // Typical code / JSON tool output: 3 chars per token, not 4.
+        assert_eq!(estimate_text_tokens(&r#"{"k":1}"#.repeat(300)), 700);
         // Each non-ASCII scalar counts as a full token.
         assert_eq!(estimate_text_tokens("日本語"), 3);
         assert_eq!(estimate_text_tokens("🙂🙂"), 2);
@@ -531,17 +589,48 @@ mod tests {
             output_reserve: 1_000,
             tool_schema_tokens: 0,
         };
-        let manager = ContextManager::new(budget, ContextPolicy::default());
-        let mut session = Session::new();
-        // Each message: 4 overhead + 1 token per 4 ASCII chars.
+        // Every tool result is prunable, so crossing the threshold is visible.
+        let manager = ContextManager::new(
+            budget,
+            ContextPolicy {
+                keep_recent_tool_results: 0,
+                ..ContextPolicy::default()
+            },
+        );
         let threshold = manager.threshold_tokens(budget.input_budget(0));
         assert_eq!(threshold, 7_200);
-        let below = (threshold - 5) * 4;
-        session.messages = vec![ConversationMessage::user_text("a".repeat(below))];
-        assert_eq!(estimate_messages_tokens(&session.messages), threshold - 1);
-        let untouched = manager.prepare_session(&mut session, &[]);
-        assert!(!untouched.changed());
+        // A transcript whose estimate is exactly `tokens`: fixed overhead plus
+        // one token per ASCII_CHARS_PER_TOKEN characters of tool output.
+        let session_of = |tokens: usize| {
+            let messages_with = |output: String| {
+                vec![
+                    ConversationMessage::user_text("go"),
+                    ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                        id: "t1".to_string(),
+                        name: "read_file".to_string(),
+                        input: "{}".to_string(),
+                    }]),
+                    ConversationMessage::tool_result("t1", "read_file", output, false),
+                ]
+            };
+            let fixed = estimate_messages_tokens(&messages_with(String::new()));
+            let mut session = Session::new();
+            session.messages = messages_with("a".repeat((tokens - fixed) * ASCII_CHARS_PER_TOKEN));
+            assert_eq!(estimate_messages_tokens(&session.messages), tokens);
+            session
+        };
+
+        let mut below = session_of(threshold - 1);
+        let untouched = manager.prepare_session(&mut below, &[]);
+        assert!(!untouched.changed(), "one token below the threshold");
         assert_eq!(untouched.tokens_before, threshold - 1);
+
+        let mut at_limit = session_of(threshold);
+        let pruned = manager.prepare_session(&mut at_limit, &[]);
+        assert!(pruned.changed(), "exactly at the threshold acts");
+        assert_eq!(pruned.tokens_before, threshold);
+        assert_eq!(pruned.pruned_tool_results, 1);
+        assert!(pruned.tokens_after < threshold);
     }
 
     #[test]
@@ -552,6 +641,9 @@ mod tests {
             tool_schema_tokens: 0,
         };
         let manager = ContextManager::new(budget, ContextPolicy::default());
+        // Six results of ~6K tokens: 36K is over the 28.8K threshold, the four
+        // most recent alone (24K) are not.
+        let result_chars = 6_000 * ASCII_CHARS_PER_TOKEN;
         let mut session = Session::new();
         session
             .messages
@@ -567,7 +659,7 @@ mod tests {
             session.messages.push(ConversationMessage::tool_result(
                 format!("t{index}"),
                 "read_file",
-                format!("{index}").repeat(24_000),
+                format!("{index}").repeat(result_chars),
                 false,
             ));
         }
@@ -586,7 +678,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(outputs[0] <= 2_000 && outputs[1] <= 2_000);
-        assert!(outputs[2..].iter().all(|len| *len == 24_000));
+        assert!(outputs[2..].iter().all(|len| *len == result_chars));
     }
 
     #[test]
