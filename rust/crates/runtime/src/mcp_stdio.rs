@@ -30,6 +30,9 @@ const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 3_000;
 #[cfg(not(test))]
 const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 30_000;
 
+/// `tools/call` timeout used when a server config sets no `toolCallTimeoutMs`.
+pub(crate) const MCP_TOOL_CALL_TIMEOUT_MS: u64 = 120_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum JsonRpcId {
@@ -765,7 +768,9 @@ impl McpServerManager {
                     server_name: server_name.to_string(),
                 })?;
         match &server.bootstrap.transport {
-            McpClientTransport::Stdio(transport) => Ok(transport.resolved_tool_call_timeout_ms()),
+            McpClientTransport::Stdio(transport) => Ok(transport
+                .tool_call_timeout_ms
+                .unwrap_or(MCP_TOOL_CALL_TIMEOUT_MS)),
             other => Err(McpServerManagerError::InvalidResponse {
                 server_name: server_name.to_string(),
                 method: "tools/call",
@@ -1184,6 +1189,11 @@ impl McpStdioProcess {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+        // Inherited Zero-X credentials never reach MCP servers; variables the
+        // user configured for this server are applied afterwards and win.
+        for key in plugins::subprocess::credential_env_keys() {
+            command.env_remove(key);
+        }
         apply_env(&mut command, &transport.env);
 
         let mut child = command.spawn()?;
@@ -3092,5 +3102,37 @@ mod tests {
 
             cleanup_script(&script_path);
         });
+    }
+
+    #[test]
+    fn tool_calls_default_to_a_120_second_timeout_unless_configured() {
+        let stdio = |timeout: Option<u64>| ScopedMcpServerConfig {
+            scope: ConfigSource::Local,
+            config: McpServerConfig::Stdio(McpStdioServerConfig {
+                command: "unused".to_string(),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                tool_call_timeout_ms: timeout,
+            }),
+        };
+        let servers = BTreeMap::from([
+            ("default".to_string(), stdio(None)),
+            ("custom".to_string(), stdio(Some(5_000))),
+        ]);
+        let manager = McpServerManager::from_servers(&servers);
+
+        assert_eq!(
+            manager
+                .tool_call_timeout_ms("default")
+                .expect("known server"),
+            super::MCP_TOOL_CALL_TIMEOUT_MS
+        );
+        assert_eq!(super::MCP_TOOL_CALL_TIMEOUT_MS, 120_000);
+        assert_eq!(
+            manager
+                .tool_call_timeout_ms("custom")
+                .expect("known server"),
+            5_000
+        );
     }
 }
