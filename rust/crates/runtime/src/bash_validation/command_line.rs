@@ -1286,13 +1286,17 @@ fn classify_program(
             check_args(context)?;
             let writes = args.iter().any(|arg| {
                 let text = arg.text.as_str();
-                text == "--output"
-                    || text.starts_with("--output=")
+                option_matches(text, "--output")
                     || (text.starts_with('-') && !text.starts_with("--") && text.contains('o'))
                     || text.to_ascii_lowercase().starts_with("/o")
             });
             if writes {
                 Err("`sort -o` writes a file".to_string())
+            } else if args
+                .iter()
+                .any(|arg| option_matches(&arg.text, "--compress-program"))
+            {
+                Err("`sort --compress-program` runs a program".to_string())
             } else {
                 Ok(())
             }
@@ -1549,28 +1553,118 @@ fn skip_delimited(chars: &[char], mut index: usize, delimiter: char) -> usize {
     index
 }
 
+/// Long awk options that load program code, libraries or extensions from
+/// files, or write files (`gawk -i inplace` rewrites its inputs; profiles,
+/// pretty-printed programs and variable dumps go to files). getopt accepts
+/// unambiguous abbreviations, so prefixes of these names are refused too.
+const AWK_UNSAFE_LONG_OPTIONS: &[&str] = &[
+    "file",
+    "include",
+    "load",
+    "exec",
+    "pretty-print",
+    "profile",
+    "dump-variables",
+    "debug",
+];
+
+/// Short awk options with the same effects as [`AWK_UNSAFE_LONG_OPTIONS`]
+/// (`-W` passes implementation options such as `-W exec=FILE`).
+const AWK_UNSAFE_SHORT_OPTIONS: &[char] = &['f', 'i', 'l', 'E', 'o', 'p', 'd', 'D', 'W'];
+
+fn check_awk_program(program: &str) -> Result<(), String> {
+    match AWK_UNSAFE.iter().find(|token| program.contains(*token)) {
+        Some(token) => Err(format!(
+            "awk program uses `{token}`, which can run commands or write files"
+        )),
+        None => Ok(()),
+    }
+}
+
 fn check_awk_args(args: &[Word]) -> Result<(), String> {
+    let unsafe_option = |option: &str| {
+        Err(format!(
+            "`awk {option}` loads code from a file or writes files, which cannot be inspected"
+        ))
+    };
     let mut program_seen = false;
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        index += 1;
         let text = arg.text.as_str();
-        if text == "-f" || text.starts_with("--file") {
-            return Err("`awk -f` runs a program that cannot be inspected".to_string());
+        if text == "--" {
+            if !program_seen {
+                if let Some(program) = args.get(index) {
+                    check_awk_program(&program.text)?;
+                }
+            }
+            return Ok(());
         }
-        if text == "-v" || text == "-F" {
-            iter.next();
+        if let Some(long) = text.strip_prefix("--") {
+            let (name, value) = long
+                .split_once('=')
+                .map_or((long, None), |(name, value)| (name, Some(value)));
+            match name {
+                "source" => {
+                    program_seen = true;
+                    let program = match value {
+                        Some(value) => value,
+                        None => {
+                            index += 1;
+                            args.get(index - 1).map_or("", |word| word.text.as_str())
+                        }
+                    };
+                    check_awk_program(program)?;
+                }
+                "assign" | "field-separator" => {
+                    if value.is_none() {
+                        index += 1;
+                    }
+                }
+                _ if AWK_UNSAFE_LONG_OPTIONS
+                    .iter()
+                    .any(|unsafe_name| !name.is_empty() && unsafe_name.starts_with(name)) =>
+                {
+                    return unsafe_option(text);
+                }
+                _ => {}
+            }
             continue;
         }
-        if text.starts_with('-') {
+        if let Some(cluster) = text.strip_prefix('-').filter(|cluster| !cluster.is_empty()) {
+            for (position, flag) in cluster.char_indices() {
+                let rest = &cluster[position + flag.len_utf8()..];
+                match flag {
+                    // The rest of the cluster (or the next word) is the value.
+                    'F' | 'v' => {
+                        if rest.is_empty() {
+                            index += 1;
+                        }
+                        break;
+                    }
+                    // Program text given with -e is checked like the inline program.
+                    'e' => {
+                        program_seen = true;
+                        let program = if rest.is_empty() {
+                            index += 1;
+                            args.get(index - 1).map_or("", |word| word.text.as_str())
+                        } else {
+                            rest
+                        };
+                        check_awk_program(program)?;
+                        break;
+                    }
+                    flag if AWK_UNSAFE_SHORT_OPTIONS.contains(&flag) => {
+                        return unsafe_option(text);
+                    }
+                    _ => {}
+                }
+            }
             continue;
         }
         if !program_seen {
             program_seen = true;
-            if let Some(token) = AWK_UNSAFE.iter().find(|token| text.contains(*token)) {
-                return Err(format!(
-                    "awk program uses `{token}`, which can run commands or write files"
-                ));
-            }
+            check_awk_program(text)?;
         }
     }
     Ok(())
@@ -1621,18 +1715,48 @@ fn classify_xargs(args: &[Word], context: &mut Context<'_>) -> Result<(), String
     }
 }
 
+/// Whether the argument `arg` (conservatively) passes the option `flag`.
+///
+/// Matches the exact option, an attached `=value`, abbreviations of long
+/// options (getopt_long and git's option parser accept unambiguous prefixes
+/// such as `--ext` for `--ext-diff`), and short options inside a cluster or
+/// with an attached value (`-nO`, `-Ovim` for `-O`). Used to find options
+/// that make a command unsafe, where a false match only costs a prompt.
+fn option_matches(arg: &str, flag: &str) -> bool {
+    if arg == flag || arg.starts_with(&format!("{flag}=")) {
+        return true;
+    }
+    if let Some(long_flag) = flag.strip_prefix("--") {
+        let Some(long_arg) = arg.strip_prefix("--") else {
+            return false;
+        };
+        let name = long_arg.split('=').next().unwrap_or(long_arg);
+        return !name.is_empty() && long_flag.starts_with(name);
+    }
+    let (Some(short_flag), Some(cluster)) = (flag.strip_prefix('-'), arg.strip_prefix('-')) else {
+        return false;
+    };
+    !cluster.starts_with('-') && short_flag.chars().all(|ch| cluster.contains(ch))
+}
+
 #[allow(clippy::too_many_lines)]
 fn check_git_args(args: &[Word]) -> Result<(), String> {
+    const FOREIGN_GIT_DIR: &str =
+        "`git --git-dir`/`--bare` use a repository whose config is not write-protected and may run programs";
     let mut index = 0;
     // Global options before the subcommand.
     while let Some(arg) = args.get(index) {
         let text = arg.text.as_str();
         match text {
-            "-C" | "--git-dir" | "--work-tree" | "--namespace" => index += 2,
+            // An explicitly named (or bare) git directory need not be `.git`,
+            // so its config (core.fsmonitor, diff drivers, ...) can have been
+            // written without approval.
+            "--git-dir" | "--bare" => return Err(FOREIGN_GIT_DIR.to_string()),
+            _ if text.starts_with("--git-dir=") => return Err(FOREIGN_GIT_DIR.to_string()),
+            "-C" | "--work-tree" | "--namespace" => index += 2,
             "--no-pager"
             | "-P"
             | "--no-optional-locks"
-            | "--bare"
             | "--literal-pathspecs"
             | "--no-replace-objects" => index += 1,
             "-c" | "--config-env" | "--exec-path" => {
@@ -1641,10 +1765,7 @@ fn check_git_args(args: &[Word]) -> Result<(), String> {
             _ if text.starts_with("-c") || text.starts_with("--config-env") => {
                 return Err("`git -c` can redefine programs git runs".to_string())
             }
-            _ if text.starts_with("--git-dir=")
-                || text.starts_with("--work-tree=")
-                || text.starts_with("--namespace=") =>
-            {
+            _ if text.starts_with("--work-tree=") || text.starts_with("--namespace=") => {
                 index += 1;
             }
             "--version" | "--help" | "version" | "help" => return Ok(()),
@@ -1661,7 +1782,14 @@ fn check_git_args(args: &[Word]) -> Result<(), String> {
         .iter()
         .map(|arg| arg.text.as_str())
         .collect();
+    // Dangerous options are matched leniently (abbreviations, attached
+    // values, short-option clusters); options that make a command read-only
+    // are matched exactly.
     let has = |flags: &[&str]| {
+        rest.iter()
+            .any(|arg| flags.iter().any(|flag| option_matches(arg, flag)))
+    };
+    let has_exact = |flags: &[&str]| {
         rest.iter().any(|arg| {
             flags
                 .iter()
@@ -1697,7 +1825,7 @@ fn check_git_args(args: &[Word]) -> Result<(), String> {
                 "--track",
                 "--no-track",
             ]) && (positional() == 0
-                || has(&[
+                || has_exact(&[
                     "--list",
                     "-l",
                     "--contains",
@@ -1710,7 +1838,7 @@ fn check_git_args(args: &[Word]) -> Result<(), String> {
         "tag" => {
             !has(&[
                 "-d", "--delete", "-a", "-s", "-u", "-f", "--force", "-m", "-F",
-            ]) && (positional() == 0 || has(&["-l", "--list", "--contains", "--points-at"]))
+            ]) && (positional() == 0 || has_exact(&["-l", "--list", "--contains", "--points-at"]))
         }
         "remote" => {
             rest.is_empty()
@@ -1718,14 +1846,25 @@ fn check_git_args(args: &[Word]) -> Result<(), String> {
                 || rest == ["--verbose"]
                 || rest.first() == Some(&"get-url")
         }
-        "config" => has(&[
-            "--get",
-            "--get-all",
-            "--get-regexp",
-            "--list",
-            "-l",
-            "--get-urlmatch",
-        ]),
+        "config" => {
+            has_exact(&[
+                "--get",
+                "--get-all",
+                "--get-regexp",
+                "--list",
+                "-l",
+                "--get-urlmatch",
+            ]) && !has(&[
+                "-e",
+                "--edit",
+                "--add",
+                "--unset",
+                "--unset-all",
+                "--replace-all",
+                "--rename-section",
+                "--remove-section",
+            ])
+        }
         "stash" => matches!(rest.first(), Some(&"list" | &"show")),
         "worktree" => rest.first() == Some(&"list"),
         "reflog" => rest.is_empty() || rest.first() == Some(&"show"),
@@ -2131,6 +2270,52 @@ mod tests {
         assert_escalates("env FOO=1 ls");
         assert_escalates("FOO=bar ls");
         assert_escalates("GIT_EXTERNAL_DIFF=./evil git diff");
+    }
+
+    #[test]
+    fn option_spellings_that_load_code_or_write_files_escalate() {
+        // awk: program files, includes, extensions, output files and
+        // program text passed through options.
+        assert_escalates("gawk -i inplace '{ print }' notes.txt");
+        assert_escalates("gawk --include=./lib.awk '{ print }' notes.txt");
+        assert_escalates("gawk -l ./ext.so 'BEGIN { }'");
+        assert_escalates("awk -fprog.awk notes.txt");
+        assert_escalates("awk -bf prog.awk notes.txt");
+        assert_escalates("gawk --fil=prog.awk notes.txt");
+        assert_escalates("gawk -o out.awk '{ print }' notes.txt");
+        assert_escalates("gawk --profile=prof.out '{ print }' notes.txt");
+        assert_escalates("gawk -W exec=prog.awk");
+        assert_escalates("gawk --source='BEGIN { system(\"rm x\") }' notes.txt");
+        assert_escalates("gawk -e 'BEGIN { system(\"rm x\") }' notes.txt");
+        assert_escalates("gawk -e'BEGIN { system(\"rm x\") }' notes.txt");
+        assert_read_only("awk -F: '{ print $1 }' notes.txt");
+        assert_read_only("awk -F, -v limit=3 'NR <= limit' data.csv");
+        assert_read_only("gawk -e '{ print $2 }' data.txt");
+        assert_read_only("awk --posix '{ print }' data.txt");
+
+        // git: abbreviated long options, attached values and clusters.
+        assert_escalates("git grep -Ovim todo");
+        assert_escalates("git grep -nO todo");
+        assert_escalates("git grep --open-files=vim todo");
+        assert_escalates("git diff --ext");
+        assert_escalates("git log -p --outp=patch.txt");
+        assert_escalates("git branch -vd old-branch");
+        assert_escalates("git config --get user.name --edit");
+        assert_escalates("git --git-dir=evil status");
+        assert_escalates("git --git-dir evil log");
+        assert_escalates("git --bare log");
+        assert_read_only("git grep -n todo");
+        assert_read_only("git log --no-ext-diff -p");
+        assert_read_only("git log --output-indicator-new=+ -p");
+        assert_read_only("git config --get user.name");
+        assert_read_only("git branch -vv");
+        assert_read_only("git -C src status");
+
+        // sort: abbreviated --output and the compression helper program.
+        assert_escalates("sort --out=sorted.txt names.txt");
+        assert_escalates("sort --compress-program=./evil names.txt");
+        assert_escalates("sort --compress=gzip names.txt");
+        assert_read_only("sort -rn names.txt");
     }
 
     #[test]
