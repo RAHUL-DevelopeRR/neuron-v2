@@ -8,7 +8,8 @@ that download those binaries.
 
 Order of operations: **merge, tag, verify the assets, publish to npm and PyPI by hand
 (or with an explicit switch), deprecate old builds.** Registry publishing never
-happens before the public release assets have been checked.
+happens before the public release assets have been checked, and the assets of a
+published release are never rebuilt or replaced.
 
 ## One-time setup
 
@@ -40,6 +41,22 @@ happens before the public release assets have been checked.
   `## X.Y.Z (YYYY-MM-DD)`. The release notes are taken from that section.
 - Run the checks from [CONTRIBUTING.md](CONTRIBUTING.md#checks): Rust fmt, clippy and
   tests, the Python and Node packaging tests, and the notices generator.
+- Check that the docs describe the binary you are about to ship. Parts of the README,
+  [USAGE.md](USAGE.md) and [SECURITY.md](SECURITY.md) were written against the 6.3.0
+  plan in [docs/GATEWAY_CONTRACT.md](docs/GATEWAY_CONTRACT.md) (section 5). Build the
+  release candidate and confirm each of these works; if one does not, remove or
+  caveat it in the docs before tagging:
+  - `neuron auth login --with-token` (reads a key from standard input), `neuron auth
+    status` and `neuron auth logout`, and `NEURON_TOKEN` accepting a personal API key
+    (`nzx_…`) as well as a session token;
+  - `neuron usage`, and `/usage`, `/upgrade`, `/login` and `/logout` in a session;
+  - `/model` listing the gateway catalog, and `--provider` or the `provider` setting
+    choosing a bring-your-own-key provider while signed in;
+  - the gateway error handling in [USAGE.md](USAGE.md#plans-usage-and-limits) (which
+    errors stop and which are retried at most twice);
+  - credential scrubbing: the session token is not exported into the environment, and
+    `NEURON_TOKEN` and provider keys are removed from the environment of shell
+    commands, hooks and MCP servers. Until that ships, SECURITY.md must not claim it.
 
 ## 2. Merge
 
@@ -61,16 +78,23 @@ The tag push starts the release workflow:
 
 | Job | What it does |
 | --- | --- |
-| `metadata` | Checks that the tag and every manifest carry the same version |
-| `build` | Builds and smoke-tests `neuron` for linux-x64, linux-arm64 (`ubuntu-24.04-arm`), macos-arm64, macos-x64 and windows-x64, writes `<asset>.sha256`, and attests build provenance |
+| `metadata` | Checks that the tag and every manifest carry the same version, and whether the tag's release is already published |
+| `build` | Builds and smoke-tests `neuron` for linux-x64 and linux-arm64 (on Ubuntu 22.04: `ubuntu-22.04` and `ubuntu-22.04-arm`; fails if a binary needs a glibc newer than 2.35), macos-arm64, macos-x64 and windows-x64, and writes `<asset>.sha256` |
+| `attest` | Records GitHub build provenance for the five binaries |
 | `notices` | Generates `THIRD_PARTY_NOTICES.md` from `cargo metadata` |
-| `release` | Writes `SHA256SUMS`, creates a draft release with all assets, checks the uploaded list, then publishes the release |
+| `release` | Writes `SHA256SUMS`, creates a draft release with all assets, checks the uploaded list, then publishes the release without marking it "Latest" |
 | `readiness` | HEAD-checks every public asset URL and verifies the downloaded files against `SHA256SUMS` |
 | `install-check` | Installs from the public release with `install.sh` (Linux x64 and arm64, macOS) and with `irm \| iex` (Windows PowerShell 5.1), then runs `neuron --version` |
-| `publish-npm`, `publish-pypi` | Run only after `readiness` and `install-check`, and only when enabled (see below) |
+| `promote` | Marks the release "Latest" once `install-check` passes, unless it is a prerelease, was withdrawn (marked as a prerelease) or a newer release is already latest. `install.sh`, `install.ps1` and the `releases/latest` links move to the new version only at this point |
+| `package-npm`, `package-pypi` | Pack the npm tarball, or build the wheel and sdist, and install them against the live release. They have no OIDC token, and the npm install runs with `--ignore-scripts` followed by an `npm rebuild` of this package only |
+| `publish-npm`, `publish-pypi` | Hold the trusted-publishing OIDC token. They check out nothing and install nothing; they check that the files are the ones the package job tested (SHA-256) and upload them. They run only when enabled (see below) |
 
-A manual run (Actions, Release, Run workflow) on a branch only builds the binaries; on
-a tag it re-runs the release and can publish.
+Each binary is built from the tag once. When a run on a tag finds the tag's release
+already published (a later manual run, or a re-run), it skips `build`, `attest`,
+`notices` and `release`, leaves the public assets and checksums alone, and goes on to
+`readiness`, `install-check`, `promote` and whichever publish jobs are switched on. A
+draft left by a failed run is not public, so its assets are rebuilt and replaced. A
+manual run (Actions, Release, Run workflow) on a branch only builds the binaries.
 
 ## 4. Verify the assets
 
@@ -94,6 +118,10 @@ On a clean machine of each kind you can reach, install with the documented comma
 then run `neuron --version`, `neuron auth login`, a short prompt through the gateway
 and `/usage`.
 
+Once `promote` has passed, `gh release view --repo RAHUL-DevelopeRR/neuron-v2` (no tag)
+shows the new version. If `promote` did not run or skipped the release, mark it latest
+yourself when you are satisfied: `gh release edit v6.3.0 --latest`.
+
 ## 5. Publish to npm
 
 Either dispatch the workflow on the tag (Actions, Release, Run workflow, "Use workflow
@@ -103,20 +131,23 @@ from" `v6.3.0`, tick `publish_npm`), or publish from a maintainer machine:
 git switch --detach v6.3.0
 cd npm/neuroncli
 npm pack
-npm install --global ./zero-x.live-neuron-6.3.0.tgz   # downloads the release binary
+# --ignore-scripts: dependency install scripts never run where your npm login is
+npm install --global --ignore-scripts ./zero-x.live-neuron-6.3.0.tgz
+npm rebuild --global @zero-x.live/neuron   # this package's postinstall: downloads the binary
 neuron --version
-npm publish --access public                            # asks for your 2FA code
+npm publish ./zero-x.live-neuron-6.3.0.tgz --access public   # asks for your 2FA code
 ```
 
-The dispatched job also installs the packed tarball against the live release before it
-publishes, and publishes prereleases (`6.4.0-rc.1`) under the `next` tag.
+The dispatched run does not rebuild or re-upload anything on the published release:
+`package-npm` packs and tests the tarball, then `publish-npm` publishes exactly that
+file. Prereleases (`6.4.0-rc.1`) go to the `next` dist-tag.
 
 ## 6. Publish to PyPI (paused)
 
 When PyPI access is back and the trusted publisher is configured, dispatch the workflow
-on the tag with `publish_pypi` ticked. The job builds the sdist and wheel, checks that
-the wheel contains only the launcher and its license files, installs it against the
-live release, and uploads. By hand:
+on the tag with `publish_pypi` ticked. `package-pypi` builds the sdist and wheel,
+checks that the wheel contains only the launcher and its license files and installs it
+against the live release; `publish-pypi` then uploads those exact files. By hand:
 
 ```sh
 python -m build && python -m twine check --strict dist/*
@@ -146,6 +177,9 @@ installable when pinned exactly, so existing pins keep working.
 
 - Do not delete a release, its assets or its tag once npm or PyPI packages for that
   version exist: the launchers download that exact version's assets.
+- Do not replace its assets either; the workflow refuses to. A checksum that changes
+  after publication looks like tampering to everyone who verified the old one.
 - Mark it as a prerelease (`gh release edit vX.Y.Z --prerelease`) so `install.sh` and
-  `install.ps1`, which follow `releases/latest`, go back to the previous release.
+  `install.ps1`, which follow `releases/latest`, go back to the previous release; if
+  that one is not marked latest again, run `gh release edit vX.Y.W --latest` for it.
 - `npm deprecate` the bad version and yank it on PyPI, then ship a fixed patch release.

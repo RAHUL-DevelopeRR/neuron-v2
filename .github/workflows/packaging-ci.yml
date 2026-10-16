@@ -20,6 +20,7 @@ on:
       - tests/test_install_scripts.py
       - tests/test_npm_package.py
       - tests/test_packaging_metadata.py
+      - tests/test_release_workflow.py
       - tests/third_party_notices.test.mjs
       - scripts/generate-third-party-notices.mjs
       - LICENSE
@@ -51,6 +52,7 @@ on:
       - tests/test_install_scripts.py
       - tests/test_npm_package.py
       - tests/test_packaging_metadata.py
+      - tests/test_release_workflow.py
       - tests/third_party_notices.test.mjs
       - scripts/generate-third-party-notices.mjs
       - LICENSE
@@ -89,6 +91,8 @@ jobs:
           python-version: '3.12'
       - name: Check versions, license files, release assets and doc links
         run: python -m unittest -v tests.test_packaging_metadata
+      - name: Check the release workflow (structure, and its release-state, upload and latest steps under bash)
+        run: python -m unittest -v tests.test_release_workflow
       - name: Check install.sh syntax (bash and dash)
         run: |
           bash -n install.sh

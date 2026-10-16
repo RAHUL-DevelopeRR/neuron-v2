@@ -142,20 +142,16 @@ class PackagingMetadataTests(unittest.TestCase):
         self.assertIn("neuron-windows-x64.exe", launchers["install.ps1"])
         for part in ("linux", "macos", "x64", "arm64"):
             self.assertIn(part, launchers["install.sh"])
-        for runner in ("ubuntu-24.04-arm", "actions/attest-build-provenance", "SHA256SUMS", "THIRD_PARTY_NOTICES.md"):
-            self.assertIn(runner, release)
+        for required in ("aarch64-unknown-linux-gnu", "actions/attest-build-provenance", "SHA256SUMS", "THIRD_PARTY_NOTICES.md"):
+            self.assertIn(required, release)
 
-    def test_publishing_stays_gated_behind_explicit_switches(self) -> None:
+    def test_linux_glibc_floor_matches_the_readme(self) -> None:
         release = read(".github/workflows/release.yml")
-        for job, switch, flag in (
-            ("publish-npm", "inputs.publish_npm", "vars.ENABLE_NPM_PUBLISH == 'true'"),
-            ("publish-pypi", "inputs.publish_pypi", "vars.ENABLE_PYPI_PUBLISH == 'true'"),
-        ):
-            with self.subTest(job=job):
-                block = release.split(f"\n  {job}:", 1)[1].split("\n  publish-", 1)[0]
-                self.assertIn("needs: [metadata, readiness, install-check]", block)
-                self.assertIn(switch, block)
-                self.assertIn(flag, block)
+        floor = re.search(r"MAX_GLIBC: '([0-9.]+)'", release)
+        assert floor is not None, "release.yml must enforce a glibc floor"
+        self.assertIn(f"glibc {floor.group(1)} or later", read("README.md"))
+        for runner in ("ubuntu-22.04", "ubuntu-22.04-arm"):
+            self.assertRegex(release, rf"(?m)^\s+runner: {re.escape(runner)}$")
 
     def test_changelog_leads_with_the_next_or_current_version(self) -> None:
         # The release notes come from the section named after the tag (release.yml).

@@ -3,11 +3,21 @@ name: Release
 # Tag push (vX.Y.Z): build every target, attest provenance, attach the
 # binaries, per-asset .sha256 files, SHA256SUMS, THIRD_PARTY_NOTICES.md and the
 # install scripts to a GitHub release, then verify the public asset URLs and
-# install from them on Linux (x64, arm64), macOS and Windows.
+# install from them on Linux (x64, arm64), macOS and Windows. The release is
+# published without the "Latest" mark and becomes latest (which is what
+# install.sh and install.ps1 follow) only after those checks pass.
+#
+# The assets of a published release are never rebuilt or replaced. A run on a
+# tag whose release is already published skips build, attest, notices and
+# release, and only verifies, installs from and publishes the existing assets;
+# that is how npm or PyPI publishing is done after the fact (see PUBLISHING.md).
+#
 # Registry publishing runs only after that verification and only when
 # explicitly enabled: repository variables ENABLE_NPM_PUBLISH /
 # ENABLE_PYPI_PUBLISH for tag pushes, or the publish_* inputs for a manual run
-# on a tag. A manual run on a branch only builds artifacts. See PUBLISHING.md.
+# on a tag. Packages are built and tested in jobs without an OIDC token; the
+# publish jobs hold the token, install nothing and upload exactly the tested
+# files. A manual run on a branch only builds artifacts.
 
 on:
   push:
@@ -45,6 +55,8 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
       is_release: ${{ steps.version.outputs.is_release }}
       prerelease: ${{ steps.version.outputs.prerelease }}
+      release_state: ${{ steps.state.outputs.release_state }}
+      build: ${{ steps.state.outputs.build }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -75,26 +87,54 @@ jobs:
           print(f'version {version}, release={is_release}')
           PY
 
+      - name: Look up an existing release for the tag
+        id: state
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IS_RELEASE: ${{ steps.version.outputs.is_release }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          # none: build and create a draft. draft: build and replace the draft's assets,
+          # which are not public yet. published: leave the assets alone and verify them.
+          state=none
+          if [ "$IS_RELEASE" = "true" ] &&
+            draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [ "$draft" = "true" ]; then state=draft; else state=published; fi
+          fi
+          build=true
+          if [ "$state" = "published" ]; then
+            build=false
+            echo "::notice::$TAG is already published, so its assets are not rebuilt. This run verifies them, installs from them and publishes the packages that are switched on."
+          fi
+          echo "release_state=$state" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "release state: $state, build: $build"
+
   build:
     name: build-${{ matrix.name }}
     needs: metadata
+    if: needs.metadata.outputs.build == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    # No OIDC token here: crate build scripts run in this job. The attest job signs
+    # the uploaded binaries.
     permissions:
       contents: read
-      id-token: write
-      attestations: write
     strategy:
       fail-fast: false
       matrix:
         include:
+          # Linux builds run on Ubuntu 22.04 so the binaries need at most glibc 2.35
+          # (Ubuntu 22.04, Debian 12 and newer); the glibc check below enforces that.
+          # Before GitHub retires the 22.04 images, move to a glibc-pinned build (for
+          # example cargo-zigbuild with a .2.35 target suffix).
           - name: linux-x64
-            runner: ubuntu-24.04
+            runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             bin: neuron
             asset: neuron-linux-x64
           - name: linux-arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             bin: neuron
             asset: neuron-linux-arm64
@@ -162,17 +202,22 @@ jobs:
             "$binary" --version
           fi
 
-      - name: Report the minimum glibc version
+      - name: Check the minimum glibc version
         if: startsWith(matrix.name, 'linux-')
+        env:
+          # README.md (Supported platforms) states this floor; change both together.
+          MAX_GLIBC: '2.35'
         run: |
-          floor="$(objdump -T "dist/${{ matrix.asset }}" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n 1)"
-          echo "${{ matrix.asset }} requires ${floor:-an unknown glibc}" | tee -a "$GITHUB_STEP_SUMMARY"
-
-      - name: Attest build provenance
-        if: needs.metadata.outputs.is_release == 'true'
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-path: dist/${{ matrix.asset }}
+          floor="$(objdump -T "dist/${{ matrix.asset }}" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -uV | tail -n 1)"
+          echo "${{ matrix.asset }} requires glibc ${floor:-(unknown)}" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ -z "$floor" ]; then
+            echo "::error::could not read the glibc symbol versions of ${{ matrix.asset }}"
+            exit 1
+          fi
+          if [ "$(printf '%s\n%s\n' "$floor" "$MAX_GLIBC" | sort -V | tail -n 1)" != "$MAX_GLIBC" ]; then
+            echo "::error::${{ matrix.asset }} needs glibc $floor, newer than the supported floor $MAX_GLIBC"
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
@@ -180,9 +225,40 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  attest:
+    name: Attest build provenance
+    needs: [metadata, build]
+    if: needs.metadata.outputs.is_release == 'true' && needs.metadata.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: neuron-*
+          path: dist
+          merge-multiple: true
+      - name: Check the binaries against their checksums
+        run: |
+          cd dist
+          for asset in $RELEASE_ASSETS; do
+            sha256sum --check --strict "$asset.sha256"
+          done
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/neuron-linux-x64
+            dist/neuron-linux-arm64
+            dist/neuron-macos-arm64
+            dist/neuron-macos-x64
+            dist/neuron-windows-x64.exe
+
   notices:
     name: Third-party notices
     needs: metadata
+    if: needs.metadata.outputs.build == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -205,8 +281,8 @@ jobs:
 
   release:
     name: GitHub release
-    needs: [metadata, build, notices]
-    if: needs.metadata.outputs.is_release == 'true'
+    needs: [metadata, build, attest, notices]
+    if: needs.metadata.outputs.is_release == 'true' && needs.metadata.outputs.build == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -258,7 +334,13 @@ jobs:
 
       - name: Upload assets to a draft release
         run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
+          if draft="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [ "$draft" != "true" ]; then
+              # Published checksums must never change under users; ship a new patch version instead.
+              echo "::error::$TAG is already published and its assets are never replaced"
+              exit 1
+            fi
+            # A draft left by an earlier failed run is not public, so its assets can be replaced.
             gh release upload "$TAG" dist/* --clobber
           else
             flags=(--draft --verify-tag --title "Neuron $VERSION" --notes-file notes.md)
@@ -276,12 +358,20 @@ jobs:
             exit 1
           fi
 
-      - name: Publish the release
-        run: gh release edit "$TAG" --draft=false
+      - name: Publish the release without marking it latest
+        # Draft assets cannot be downloaded publicly, so the release is published here for
+        # the readiness and install checks; the promote job marks it latest after them.
+        run: gh release edit "$TAG" --draft=false --latest=false
 
   readiness:
     name: Release readiness
     needs: [metadata, release]
+    # Also runs when release was skipped because the tag's release is already published.
+    if: >-
+      ${{ !cancelled() && needs.metadata.result == 'success' &&
+      needs.metadata.outputs.is_release == 'true' &&
+      (needs.release.result == 'success' ||
+       (needs.release.result == 'skipped' && needs.metadata.outputs.build == 'false')) }}
     runs-on: ubuntu-latest
     env:
       TAG: ${{ needs.metadata.outputs.tag }}
@@ -329,6 +419,7 @@ jobs:
   install-check:
     name: Install from the release (${{ matrix.os }})
     needs: [metadata, readiness]
+    if: ${{ !cancelled() && needs.readiness.result == 'success' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -356,71 +447,166 @@ jobs:
           Write-Host $output
           if ($output -notmatch [regex]::Escape($env:VERSION)) { throw "neuron --version did not report $env:VERSION" }
 
+  promote:
+    name: Mark the release as latest
+    needs: [metadata, install-check]
+    # Prereleases never become latest.
+    if: >-
+      ${{ !cancelled() && needs.install-check.result == 'success' &&
+      needs.metadata.outputs.prerelease == 'false' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.metadata.outputs.tag }}
+      VERSION: ${{ needs.metadata.outputs.version }}
+    steps:
+      - name: Mark the release as latest unless it was withdrawn or a newer one is
+        run: |
+          if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isPrerelease --jq .isPrerelease)" = "true" ]; then
+            # PUBLISHING.md: a broken release is withdrawn by marking it a prerelease.
+            echo "::notice::$TAG is marked as a prerelease and does not become latest"
+            exit 0
+          fi
+          current="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || true)"
+          if [ -n "$current" ] && [ "$current" != "$TAG" ]; then
+            newest="$(printf '%s\n%s\n' "${current#v}" "$VERSION" | sort -V | tail -n 1)"
+            if [ "$newest" != "$VERSION" ]; then
+              echo "::notice::$current is newer than $TAG and stays the latest release"
+              exit 0
+            fi
+          fi
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --latest
+          echo "$TAG is now the latest release" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  package-npm:
+    name: Pack and test the npm package
+    needs: [metadata, install-check]
+    if: >-
+      ${{ !cancelled() && needs.install-check.result == 'success' &&
+      ((github.event_name == 'workflow_dispatch' && inputs.publish_npm) ||
+       (github.event_name == 'push' && vars.ENABLE_NPM_PUBLISH == 'true')) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tarball: ${{ steps.pack.outputs.tarball }}
+      sha256: ${{ steps.pack.outputs.sha256 }}
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Pack the package
+        id: pack
+        working-directory: npm/neuroncli
+        run: |
+          mkdir -p "$RUNNER_TEMP/npm-dist"
+          npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP/npm-dist"
+          tarball="zero-x.live-neuron-$VERSION.tgz"
+          sha256="$(sha256sum "$RUNNER_TEMP/npm-dist/$tarball" | cut -d ' ' -f 1)"
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+          echo "$sha256  $tarball"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-package
+          path: ${{ runner.temp }}/npm-dist/${{ steps.pack.outputs.tarball }}
+          if-no-files-found: error
+      - name: Install the packed tarball against the live release
+        env:
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+        run: |
+          # --ignore-scripts keeps the dependencies' install scripts out of the release
+          # pipeline; npm rebuild then runs only this package's postinstall (the binary download).
+          prefix="$RUNNER_TEMP/global"
+          npm install --global --prefix "$prefix" --ignore-scripts --no-audit --no-fund "$RUNNER_TEMP/npm-dist/$TARBALL"
+          npm rebuild --global --prefix "$prefix" --foreground-scripts @zero-x.live/neuron
+          test -f "$prefix/lib/node_modules/@zero-x.live/neuron/bin/native/neuron.sha256"
+          "$prefix/bin/neuron" --version | tee /dev/stderr | grep -F "$VERSION"
+
   publish-npm:
     name: Publish npm package
-    needs: [metadata, readiness, install-check]
+    needs: [metadata, package-npm]
     if: >-
-      needs.metadata.outputs.is_release == 'true' &&
+      ${{ !cancelled() && needs.package-npm.result == 'success' &&
       ((github.event_name == 'workflow_dispatch' && inputs.publish_npm) ||
-       (github.event_name == 'push' && vars.ENABLE_NPM_PUBLISH == 'true'))
+       (github.event_name == 'push' && vars.ENABLE_NPM_PUBLISH == 'true')) }}
     runs-on: ubuntu-latest
     environment:
       name: npm
       url: https://www.npmjs.com/package/@zero-x.live/neuron
+    # This job holds the npm trusted-publishing OIDC token, so it has no checkout,
+    # installs nothing and runs no lifecycle scripts: it publishes the tested tarball.
     permissions:
-      contents: read
       id-token: write
     env:
-      VERSION: ${{ needs.metadata.outputs.version }}
+      TARBALL: ${{ needs.package-npm.outputs.tarball }}
+      EXPECTED_SHA256: ${{ needs.package-npm.outputs.sha256 }}
+      PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
           registry-url: https://registry.npmjs.org
-      - name: Use npm with trusted publishing support
-        run: npm install --global npm@^11.5.1
-      - name: Install the packed tarball against the live release
-        working-directory: npm/neuroncli
+      - name: Check that the bundled npm supports trusted publishing
         run: |
-          npm pack --pack-destination "$RUNNER_TEMP"
-          npm install --global --prefix "$RUNNER_TEMP/global" "$RUNNER_TEMP"/zero-x.live-neuron-"$VERSION".tgz
-          "$RUNNER_TEMP/global/bin/neuron" --version | tee /dev/stderr | grep -F "$VERSION"
-      - name: Publish
-        working-directory: npm/neuroncli
-        run: |
-          if [ "${{ needs.metadata.outputs.prerelease }}" = "true" ]; then
-            npm publish --access public --tag next
-          else
-            npm publish --access public
+          current="$(npm --version)"
+          if [ "$(printf '%s\n%s\n' 11.5.1 "$current" | sort -V | head -n 1)" != 11.5.1 ]; then
+            echo "::error::npm $current predates trusted publishing (11.5.1)"
+            exit 1
           fi
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-package
+          path: dist
+      - name: Check that this is the tarball that was tested
+        run: echo "$EXPECTED_SHA256  dist/$TARBALL" | sha256sum --check --strict
+      - name: Publish
+        run: |
+          tag=latest
+          if [ "$PRERELEASE" = "true" ]; then tag=next; fi
+          npm publish "dist/$TARBALL" --access public --tag "$tag" --ignore-scripts
 
-  publish-pypi:
-    name: Publish PyPI package
-    needs: [metadata, readiness, install-check]
+  package-pypi:
+    name: Build and test the PyPI package
+    needs: [metadata, install-check]
     if: >-
-      needs.metadata.outputs.is_release == 'true' &&
+      ${{ !cancelled() && needs.install-check.result == 'success' &&
       ((github.event_name == 'workflow_dispatch' && inputs.publish_pypi) ||
-       (github.event_name == 'push' && vars.ENABLE_PYPI_PUBLISH == 'true'))
+       (github.event_name == 'push' && vars.ENABLE_PYPI_PUBLISH == 'true')) }}
     runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/p/neuroncli
     permissions:
       contents: read
-      id-token: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
     env:
       VERSION: ${{ needs.metadata.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - name: Build source and wheel distributions
+        id: build
         run: |
           python -m pip install --upgrade build twine
           python -m build --sdist --wheel
           python -m twine check --strict dist/*
+          echo "digest=$(sha256sum dist/* | sha256sum | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+          sha256sum dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pypi-dists
+          path: dist/*
+          if-no-files-found: error
       - name: Check that the wheel is a pure-Python launcher with license files
         run: |
           python - <<'PY'
@@ -438,5 +624,35 @@ jobs:
           python -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/pip" install dist/*.whl
           "$RUNNER_TEMP/venv/bin/neuron" --version | tee /dev/stderr | grep -F "$VERSION"
+
+  publish-pypi:
+    name: Publish PyPI package
+    needs: [metadata, package-pypi]
+    if: >-
+      ${{ !cancelled() && needs.package-pypi.result == 'success' &&
+      ((github.event_name == 'workflow_dispatch' && inputs.publish_pypi) ||
+       (github.event_name == 'push' && vars.ENABLE_PYPI_PUBLISH == 'true')) }}
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/neuroncli
+    # Holds the PyPI trusted-publishing OIDC token: it only uploads the tested files.
+    permissions:
+      id-token: write
+    env:
+      EXPECTED_DIGEST: ${{ needs.package-pypi.outputs.digest }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: pypi-dists
+          path: dist
+      - name: Check that these are the distributions that were tested
+        run: |
+          actual="$(sha256sum dist/* | sha256sum | cut -d ' ' -f 1)"
+          if [ "$actual" != "$EXPECTED_DIGEST" ]; then
+            echo "::error::the downloaded distributions differ from the tested ones"
+            sha256sum dist/*
+            exit 1
+          fi
       - name: Publish
         uses: pypa/gh-action-pypi-publish@release/v1

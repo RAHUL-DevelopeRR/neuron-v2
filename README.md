@@ -75,13 +75,16 @@ cargo build --release -p rusty-claude-cli
 
 | Platform | Release asset |
 | --- | --- |
-| Linux x64 (glibc) | `neuron-linux-x64` |
-| Linux arm64 (glibc) | `neuron-linux-arm64` |
+| Linux x64, glibc 2.35 or later | `neuron-linux-x64` |
+| Linux arm64, glibc 2.35 or later | `neuron-linux-arm64` |
 | macOS, Apple silicon | `neuron-macos-arm64` |
 | macOS, Intel | `neuron-macos-x64` |
 | Windows x64 | `neuron-windows-x64.exe` (Windows on Arm runs it under emulation) |
 
-musl-based Linux such as Alpine is not supported. The binaries are not code-signed or
+glibc 2.35 or later means Ubuntu 22.04, Debian 12, Fedora 36 or newer. On older
+distributions (for example Ubuntu 20.04, Debian 11 or RHEL 9) the binary may not
+start; the installers check that before they install anything, and you can build
+from source instead. musl-based Linux such as Alpine is not supported. The binaries are not code-signed or
 notarized. Each release lists SHA-256 checksums (`SHA256SUMS`, plus a `.sha256` file
 per binary) and GitHub build provenance, which you can check with
 `gh attestation verify neuron-linux-x64 --repo RAHUL-DevelopeRR/neuron-v2`.
