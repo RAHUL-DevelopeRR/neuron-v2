@@ -295,6 +295,8 @@ const SESSION_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GatewaySessionCheck {
     NotSignedIn,
+    /// Signed in, but the credential was not sent to the server (why).
+    NotChecked(&'static str),
     Valid(super::auth::SessionInfo),
     Invalid,
     Unreachable(String),
@@ -304,6 +306,7 @@ impl GatewaySessionCheck {
     fn label(&self) -> &'static str {
         match self {
             Self::NotSignedIn => "signed_out",
+            Self::NotChecked(_) => "not_checked",
             Self::Valid(_) => "valid",
             Self::Invalid => "invalid",
             Self::Unreachable(_) => "unverified",
@@ -314,6 +317,11 @@ impl GatewaySessionCheck {
         let source = source.map_or_else(String::new, |source| format!(" ({source})"));
         match self {
             Self::NotSignedIn => "Zero-X           signed out; run `neuron auth login`".to_string(),
+            Self::NotChecked(reason) => {
+                format!(
+                    "Zero-X           signed in{source}; not verified with the server ({reason})"
+                )
+            }
             Self::Valid(info) => {
                 let mut detail = format!("Zero-X           session valid{source}");
                 if let Some(plan) = &info.plan {
@@ -335,6 +343,31 @@ impl GatewaySessionCheck {
     }
 }
 
+/// Truthy unless unset, empty, `0`, `false`, `no` or `off`.
+fn env_flag(key: &str) -> bool {
+    env::var(key).is_ok_and(|value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        )
+    })
+}
+
+/// Whether doctor may send the credential to the gateway to validate it:
+/// never with `NEURON_DOCTOR_OFFLINE`, always with `NEURON_DOCTOR_ONLINE`,
+/// otherwise only when a person is watching (a terminal on stdout or
+/// stderr). Scripted runs and test harnesses therefore never send a
+/// developer's stored login anywhere.
+fn online_check_policy(offline: bool, online: bool, interactive: bool) -> Result<(), &'static str> {
+    if offline {
+        Err("NEURON_DOCTOR_OFFLINE is set")
+    } else if online || interactive {
+        Ok(())
+    } else {
+        Err("non-interactive run; set NEURON_DOCTOR_ONLINE=1 to check with the server")
+    }
+}
+
 /// Validates the active Zero-X credential with the server (read-only: the
 /// stored login is not migrated or modified).
 pub(crate) fn check_gateway_session() -> (GatewaySessionCheck, Option<String>) {
@@ -346,6 +379,13 @@ pub(crate) fn check_gateway_session() -> (GatewaySessionCheck, Option<String>) {
         }
     };
     let source = Some(credential.source.describe());
+    if let Err(reason) = online_check_policy(
+        env_flag("NEURON_DOCTOR_OFFLINE"),
+        env_flag("NEURON_DOCTOR_ONLINE"),
+        std::io::stdout().is_terminal() || std::io::stderr().is_terminal(),
+    ) {
+        return (GatewaySessionCheck::NotChecked(reason), source);
+    }
     let base = match super::auth::gateway_base_url() {
         Ok(base) => base,
         Err(error) => return (GatewaySessionCheck::Unreachable(error.to_string()), source),
@@ -862,6 +902,31 @@ mod gateway_doctor_tests {
             "{detail}"
         );
         assert_eq!(check.data["gateway_plan"], json!("pro"));
+    }
+
+    #[test]
+    fn server_check_needs_a_terminal_or_an_explicit_opt_in() {
+        assert_eq!(online_check_policy(false, false, true), Ok(()));
+        assert_eq!(online_check_policy(false, true, false), Ok(()));
+        assert!(online_check_policy(false, false, false)
+            .unwrap_err()
+            .contains("NEURON_DOCTOR_ONLINE=1"));
+        assert_eq!(
+            online_check_policy(true, true, true),
+            Err("NEURON_DOCTOR_OFFLINE is set"),
+            "offline always wins"
+        );
+
+        let check = with_gateway_session(
+            DiagnosticCheck::new("Auth", DiagnosticLevel::Ok, "ok"),
+            &GatewaySessionCheck::NotChecked("non-interactive run"),
+            Some("stored login, credentials file"),
+        );
+        assert_eq!(check.level, DiagnosticLevel::Ok);
+        assert_eq!(check.data["gateway_session"], json!("not_checked"));
+        assert!(check.details.last().unwrap().contains(
+            "signed in (stored login, credentials file); not verified with the server (non-interactive run)"
+        ));
     }
 
     #[test]
