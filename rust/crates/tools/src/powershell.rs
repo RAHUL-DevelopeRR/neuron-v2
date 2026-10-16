@@ -152,6 +152,28 @@ mod tests {
     }
 
     #[test]
+    fn powershell_children_do_not_inherit_zero_x_credentials() {
+        if detect_powershell().is_err() {
+            eprintln!("skipping: PowerShell is not installed");
+            return;
+        }
+        std::env::set_var("TOOLS_PS_SCRUB_SECRET", "nzx_ps_scrub_secret");
+        std::env::set_var("TOOLS_PS_SCRUB_KEEP", "keep-ps");
+        let output = execute(
+            "Write-Output \"secret=$env:TOOLS_PS_SCRUB_SECRET keep=$env:TOOLS_PS_SCRUB_KEEP\"",
+            Some(60_000),
+            false,
+            &CancellationToken::new(),
+        );
+        std::env::remove_var("TOOLS_PS_SCRUB_SECRET");
+        std::env::remove_var("TOOLS_PS_SCRUB_KEEP");
+
+        let output = output.expect("PowerShell runs");
+        assert!(!output.stdout.contains("nzx_ps_scrub_secret"), "{output:?}");
+        assert!(output.stdout.contains("keep=keep-ps"), "{output:?}");
+    }
+
+    #[test]
     fn timeout_kills_powershell_and_reports_interruption() {
         if detect_powershell().is_err() {
             eprintln!("skipping: PowerShell is not installed");

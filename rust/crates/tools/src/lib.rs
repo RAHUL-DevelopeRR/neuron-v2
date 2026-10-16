@@ -738,7 +738,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "ToolSearch",
-            description: "Search for deferred or specialized tools by exact name or keywords.",
+            description: "Find tools that are not offered by default (task, team and cron bookkeeping, worker control, LSP, the built-in MCP registry, remote triggers) by keywords or exact name (`select:Name,Other`). Matching tools are offered from the next request on.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
