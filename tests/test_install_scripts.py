@@ -231,6 +231,13 @@ class InstallShTests(unittest.TestCase):
         self.assertIn("may not be published", result.stderr)
         self.assertIn("releases", result.stderr)
 
+    def test_network_failure_is_not_reported_as_a_missing_release(self) -> None:
+        result = self.run_installer(NEURON_VERSION=VERSION, NEURON_DOWNLOAD_BASE=fake_release.unused_loopback_url())
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Check your network", result.stderr)
+        self.assertNotIn("may not be published", result.stderr)
+        self.assertFalse(self.installed().exists())
+
     def test_rejects_insecure_download_base_and_invalid_versions(self) -> None:
         insecure = self.run_installer(NEURON_VERSION=VERSION, NEURON_DOWNLOAD_BASE="http://downloads.example.com")
         self.assertEqual(insecure.returncode, 1)
@@ -374,6 +381,12 @@ class InstallPs1Tests(unittest.TestCase):
         self.assertEqual(insecure.returncode, 1)
         self.assertIn("must be an HTTPS URL", insecure.stdout)
 
+    def test_network_failure_is_not_reported_as_a_missing_release(self) -> None:
+        result = self.run_installer("-Version", VERSION, NEURON_DOWNLOAD_BASE=fake_release.unused_loopback_url())
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Check your network", result.stdout)
+        self.assertNotIn("may not be published", result.stdout)
+
     def test_unsupported_architecture_is_rejected(self) -> None:
         environment = {"PROCESSOR_ARCHITECTURE": "x86", "PROCESSOR_ARCHITEW6432": ""}  # 32-bit host
         result = self.run_installer("-Version", VERSION, **environment)
@@ -404,6 +417,29 @@ class InstallPs1Tests(unittest.TestCase):
         )
         self.assertIn("caught-install-error", result.stdout)
         self.assertIn("host-still-running", result.stdout)
+
+    def test_invoke_expression_install_leaves_the_session_preferences_alone(self) -> None:
+        fake_release.stage_release(self.releases, VERSION, self.ASSET)
+        command = (
+            "$ErrorActionPreference = 'Continue'; "
+            f"Get-Content -Raw '{INSTALL_PS1}' | Invoke-Expression; "
+            "\"preference=$ErrorActionPreference\"; "
+            "try { $null -eq $neuronUndefinedVariable | Out-Null; 'strict=off' } catch { 'strict=on' }"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+            env=self.environment(NEURON_VERSION=VERSION),
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+        self.assertIn(f"Installing Neuron {VERSION}", result.stdout, result.stderr)
+        self.assertTrue(self.installed().is_file(), result.stdout + result.stderr)
+        # -AddToPath cannot be passed through iex; the hint shows the script-block form.
+        self.assertIn("[scriptblock]::Create(", result.stdout)
+        self.assertIn("preference=Continue", result.stdout)
+        self.assertIn("strict=off", result.stdout)
 
     @unittest.skipUnless(os.environ.get("GITHUB_ACTIONS") == "true", "changes the user PATH; runs only on CI runners")
     def test_add_to_path_updates_the_user_path_once(self) -> None:

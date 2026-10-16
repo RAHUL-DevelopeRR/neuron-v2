@@ -225,18 +225,31 @@ URL="${DOWNLOAD_BASE}/v${VERSION}/${ASSET}"
 say "${BOLD}Installing Neuron ${VERSION} (${TARGET})${RESET}"
 info "from ${URL}"
 
-if ! fetch "${URL}.sha256" "${TMP_DIR}/${ASSET}.sha256"; then
-    die "could not download ${URL}.sha256.
+# fetch_or_die URL OUTPUT: an HTTP error status (curl 22, wget 8) means the asset is
+# missing; anything else is a network problem.
+fetch_or_die() {
+    status=0
+    fetch "$1" "$2" || status=$?
+    case "${status}" in
+        0) return 0 ;;
+        22 | 8)
+            die "could not download $1 (HTTP error).
     Neuron ${VERSION} may not be published for ${TARGET}; see https://github.com/${REPOSITORY}/releases"
-fi
+            ;;
+        *)
+            die "could not download $1 (${DOWNLOADER} exit ${status}).
+    Check your network or proxy settings (HTTPS_PROXY) and retry."
+            ;;
+    esac
+}
+
+fetch_or_die "${URL}.sha256" "${TMP_DIR}/${ASSET}.sha256"
 EXPECTED="$(awk 'NR == 1 {print tolower($1)}' "${TMP_DIR}/${ASSET}.sha256")"
 if ! printf '%s\n' "${EXPECTED}" | grep -Eq '^[0-9a-f]{64}$'; then
     die "${URL}.sha256 does not contain a SHA-256 checksum."
 fi
 
-if ! fetch "${URL}" "${TMP_DIR}/${ASSET}"; then
-    die "could not download ${URL}."
-fi
+fetch_or_die "${URL}" "${TMP_DIR}/${ASSET}"
 ACTUAL="$(sha256_of "${TMP_DIR}/${ASSET}")"
 if [ "${ACTUAL}" != "${EXPECTED}" ]; then
     die "checksum mismatch for ${ASSET}: expected ${EXPECTED}, got ${ACTUAL}. Nothing was installed."

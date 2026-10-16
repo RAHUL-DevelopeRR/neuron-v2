@@ -33,9 +33,8 @@ param(
     [switch]$AddToPath
 )
 
-Set-StrictMode -Version 2.0
-$ErrorActionPreference = 'Stop'
-
+# Strict mode and 'Stop' are set inside Install-Neuron, not here: under `irm | iex`
+# this scope is the caller's session, which must keep its own preferences.
 $NeuronRepository = 'RAHUL-DevelopeRR/neuron-v2'
 $NeuronAsset = 'neuron-windows-x64.exe'
 $InvokedAsFile = $MyInvocation.MyCommand.CommandType -eq 'ExternalScript'
@@ -49,15 +48,27 @@ function Test-AllowedUrl([string]$Url) {
     return $Url -match '^http://(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(/|$)'
 }
 
-function Get-NeuronDownload([string]$Url, [string]$OutFile) {
-    $previous = $ProgressPreference
+function Get-HttpStatus($ErrorRecord) {
+    # WebException (Windows PowerShell 5.1) and HttpResponseException (PowerShell 7+) both expose Response.
+    $exception = $ErrorRecord.Exception
+    if (($exception.PSObject.Properties.Name -contains 'Response') -and $exception.Response) {
+        try { return [int]$exception.Response.StatusCode } catch { return 0 }
+    }
+    return 0
+}
+
+function Get-NeuronDownload([string]$Url, [string]$OutFile, [string]$Version) {
+    # Local to this function: hides the progress bar, which slows Invoke-WebRequest down in 5.1.
     $ProgressPreference = 'SilentlyContinue'
     try {
         Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing
     } catch {
-        throw "could not download ${Url}: $($_.Exception.Message)"
-    } finally {
-        $ProgressPreference = $previous
+        $status = Get-HttpStatus $_
+        if ($status -eq 404) {
+            throw "${Url} returned HTTP 404. Neuron $Version may not be published for Windows; see https://github.com/$NeuronRepository/releases"
+        }
+        if ($status -gt 0) { throw "downloading ${Url} failed with HTTP ${status}. Try again later." }
+        throw "could not download ${Url}: $($_.Exception.Message). Check your network or proxy settings and retry."
     }
 }
 
@@ -125,6 +136,8 @@ function Add-UserPathEntry([string]$Directory) {
 }
 
 function Install-Neuron {
+    Set-StrictMode -Version 2.0
+    $ErrorActionPreference = 'Stop'
     Assert-SupportedPlatform
     if ($PSVersionTable.PSVersion.Major -lt 6) {
         [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
@@ -156,18 +169,14 @@ function Install-Neuron {
     New-Item -ItemType Directory -Path $work | Out-Null
     try {
         $checksumFile = Join-Path $work "$NeuronAsset.sha256"
-        try {
-            Get-NeuronDownload "$url.sha256" $checksumFile
-        } catch {
-            throw "$($_.Exception.Message). Neuron $resolved may not be published for Windows; see https://github.com/$NeuronRepository/releases"
-        }
+        Get-NeuronDownload "$url.sha256" $checksumFile $resolved
         $checksumText = [System.IO.File]::ReadAllText($checksumFile).Trim()
         $expected = ''
         if ($checksumText) { $expected = ($checksumText -split '\s+')[0].ToLowerInvariant() }
         if ($expected -notmatch '^[0-9a-f]{64}$') { throw "$url.sha256 does not contain a SHA-256 checksum." }
 
         $download = Join-Path $work $NeuronAsset
-        Get-NeuronDownload $url $download
+        Get-NeuronDownload $url $download $resolved
         $actual = (Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash.ToLowerInvariant()
         if ($actual -ne $expected) {
             throw "checksum mismatch for ${NeuronAsset}: expected $expected, got $actual. Nothing was installed."
@@ -221,7 +230,12 @@ function Install-Neuron {
         $env:Path = "$env:Path;$target"
     } else {
         Write-Warn "$target is not on your PATH."
-        Write-Detail 'Rerun with -AddToPath to add it to your user PATH, or run neuron by its full path.'
+        if ($InvokedAsFile) {
+            Write-Detail 'Rerun with -AddToPath to add it to your user PATH, or run neuron by its full path.'
+        } else {
+            Write-Detail 'To add it to your user PATH, rerun the installer with -AddToPath:'
+            Write-Detail "  & ([scriptblock]::Create((irm https://github.com/$NeuronRepository/releases/latest/download/install.ps1))) -AddToPath"
+        }
         $run = "& '$destination'"
     }
 
