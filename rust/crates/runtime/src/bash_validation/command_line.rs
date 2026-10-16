@@ -1120,7 +1120,6 @@ const PLAIN_READ_ONLY_PROGRAMS: &[&str] = &[
     "which",
     "whoami",
     "uname",
-    "hostname",
     "id",
     "groups",
     "du",
@@ -1331,6 +1330,40 @@ fn classify_program(
         "awk" | "gawk" | "mawk" | "nawk" => {
             check_args(context)?;
             check_awk_args(args)
+        }
+        "hostname" => {
+            // With a name (or -F/-b) `hostname` sets the host name.
+            const QUERY_FLAGS: &[&str] = &[
+                "-s",
+                "-f",
+                "-d",
+                "-i",
+                "-I",
+                "-a",
+                "-A",
+                "-y",
+                "-V",
+                "-h",
+                "--short",
+                "--fqdn",
+                "--long",
+                "--domain",
+                "--ip-address",
+                "--all-ip-addresses",
+                "--alias",
+                "--all-fqdns",
+                "--nis",
+                "--version",
+                "--help",
+            ];
+            if args
+                .iter()
+                .all(|arg| QUERY_FLAGS.contains(&arg.text.as_str()))
+            {
+                Ok(())
+            } else {
+                Err("`hostname` with these arguments changes the host name".to_string())
+            }
         }
         "xargs" => classify_xargs(args, context),
         "git" => {
@@ -2091,6 +2124,10 @@ mod tests {
         assert_escalates("git config user.name Evil");
         assert_escalates("xargs rm");
         assert_escalates("date -s '2020-01-01'");
+        assert_escalates("hostname evil-box");
+        assert_escalates("hostname -F /etc/hostname");
+        assert_read_only("hostname");
+        assert_read_only("hostname -f");
         assert_escalates("env FOO=1 ls");
         assert_escalates("FOO=bar ls");
         assert_escalates("GIT_EXTERNAL_DIFF=./evil git diff");
