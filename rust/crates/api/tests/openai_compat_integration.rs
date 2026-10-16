@@ -190,6 +190,40 @@ async fn retry_after_longer_than_the_budget_ends_retries_immediately() {
 }
 
 #[tokio::test]
+async fn overflowing_retry_after_header_ends_retries_without_panicking() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let exhausted = r#"{"error":{"message":"All upstream capacity is busy","type":"capacity_exhausted","code":"capacity_exhausted"}}"#;
+    let server = spawn_server(
+        state.clone(),
+        vec![
+            http_response_with_headers(
+                "503 Service Unavailable",
+                "application/json",
+                exhausted,
+                &[("retry-after", "99999999999999999999")],
+            ),
+            http_response("200 OK", "application/json", COMPLETION_BODY),
+        ],
+    )
+    .await;
+    let (observer, notices) = recording_observer();
+
+    let error = gateway_client(server.base_url(), observer)
+        .send_message(&sample_request(false))
+        .await
+        .expect_err("a delay that overflows Duration never fits the budget");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("All upstream capacity is busy"),
+        "{message}"
+    );
+    assert!(!message.contains("retry in"), "{message}");
+    assert_eq!(state.lock().await.len(), 1);
+    assert!(notices.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn stream_cut_off_without_finish_reason_or_done_is_truncated() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let sse = "data: {\"id\":\"cut\",\"model\":\"auto\",\"choices\":[{\"delta\":{\"content\":\"Half of the ans\"}}]}\n\n";

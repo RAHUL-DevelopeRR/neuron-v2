@@ -624,7 +624,10 @@ impl GatewayError {
     #[must_use]
     pub fn with_retry_after_fallback(mut self, retry_after: Option<Duration>) -> Self {
         if self.retry_after_seconds.is_none() {
-            self.retry_after_seconds = retry_after.map(|delay| delay.as_secs());
+            // A saturated header value is not a meaningful delay to show.
+            self.retry_after_seconds = retry_after
+                .filter(|delay| *delay != Duration::MAX)
+                .map(|delay| delay.as_secs());
         }
         self
     }

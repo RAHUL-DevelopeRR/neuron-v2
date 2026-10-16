@@ -495,6 +495,38 @@ async fn anthropic_retries_honour_retry_after() {
 }
 
 #[tokio::test]
+async fn anthropic_overflowing_retry_after_ends_retries_without_panicking() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let server = spawn_server(
+        state.clone(),
+        vec![
+            http_response_with_headers(
+                "503 Service Unavailable",
+                "application/json",
+                "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"overloaded\"}}",
+                &[("retry-after", "99999999999999999999")],
+            ),
+            http_response(
+                "200 OK",
+                "application/json",
+                "{\"id\":\"msg_never\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-7-sonnet-latest\",\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}",
+            ),
+        ],
+    )
+    .await;
+
+    let client = ApiClient::new("test-key")
+        .with_base_url(server.base_url())
+        .with_retry_policy(2, Duration::from_millis(1), Duration::from_millis(2));
+
+    client
+        .send_message(&sample_request(false))
+        .await
+        .expect_err("a delay that overflows Duration never fits the budget");
+    assert_eq!(state.lock().await.len(), 1);
+}
+
+#[tokio::test]
 async fn provider_client_dispatches_anthropic_requests() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let server = spawn_server(

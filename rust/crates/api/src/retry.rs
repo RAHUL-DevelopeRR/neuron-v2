@@ -70,10 +70,14 @@ impl Debug for RetryObserver {
 
 /// Parses a `Retry-After` header given in (possibly fractional) seconds.
 /// HTTP-date values are ignored so the caller falls back to its backoff.
+/// A delay too large for [`Duration`] (or infinite) saturates to
+/// [`Duration::MAX`], which never fits the retry budget and so ends the
+/// retry loop instead of panicking.
 pub(crate) fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
     let seconds = value.trim().parse::<f64>().ok()?;
-    (seconds.is_finite() && seconds >= 0.0).then(|| Duration::from_secs_f64(seconds))
+    // `>=` is false for NaN, so only non-negative numbers get through.
+    (seconds >= 0.0).then(|| Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX))
 }
 
 /// Chooses the next sleep: the server's `Retry-After` when present, otherwise
@@ -117,6 +121,33 @@ mod tests {
             "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap(),
         );
         assert_eq!(retry_after_from_headers(&headers), None);
+    }
+
+    #[test]
+    fn huge_or_odd_retry_after_values_never_panic() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        for huge in ["99999999999999999999", "1e300", "inf"] {
+            headers.insert(reqwest::header::RETRY_AFTER, huge.parse().unwrap());
+            assert_eq!(
+                retry_after_from_headers(&headers),
+                Some(Duration::MAX),
+                "{huge}"
+            );
+        }
+        for rejected in ["-5", "NaN", "-inf"] {
+            headers.insert(reqwest::header::RETRY_AFTER, rejected.parse().unwrap());
+            assert_eq!(retry_after_from_headers(&headers), None, "{rejected}");
+        }
+        // A saturated delay never fits the budget, so the retry loop ends.
+        assert_eq!(
+            plan_retry_delay(
+                Some(Duration::MAX),
+                Duration::from_secs(1),
+                Duration::ZERO,
+                MAX_TOTAL_BACKOFF
+            ),
+            None
+        );
     }
 
     #[test]
