@@ -3481,12 +3481,189 @@ fn parse_skill_frontmatter_value(contents: &str, key: &str) -> Option<String> {
     None
 }
 
-const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
 const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
+/// Model sub-agents use when no parent context was registered (library use).
+const FALLBACK_AGENT_MODEL: &str = "auto";
+/// How long the `Agent` tool waits for a sub-agent before returning its
+/// partial status (the sub-agent keeps running in the background).
+const DEFAULT_AGENT_TIMEOUT: Duration = Duration::from_secs(600);
+const AGENT_TIMEOUT_ENV_VAR: &str = "NEURON_SUBAGENT_TIMEOUT_SECS";
+const AGENT_WAIT_POLL: Duration = Duration::from_millis(200);
+const SUBAGENT_REGISTERED_OUTPUT_CAP: u32 = 32_000;
+const SUBAGENT_UNKNOWN_MODEL_OUTPUT: u32 = 8_192;
 
-fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
-    execute_agent_with_spawn(input, spawn_agent_job)
+/// Builds a provider client for a model id using the parent's credentials.
+pub type SubagentClientFactory =
+    std::sync::Arc<dyn Fn(&str) -> Result<ProviderClient, String> + Send + Sync>;
+
+/// What a sub-agent inherits from the session that spawned it.
+#[derive(Clone)]
+pub struct SubagentParentContext {
+    /// The parent's resolved model id (including any transport prefix).
+    pub model: String,
+    /// The parent's permission mode; sub-agents never run with more.
+    pub permission_mode: PermissionMode,
+    /// Builds provider clients with the parent's credentials. When `None`,
+    /// clients are built from the environment.
+    pub client_factory: Option<SubagentClientFactory>,
+}
+
+impl std::fmt::Debug for SubagentParentContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubagentParentContext")
+            .field("model", &self.model)
+            .field("permission_mode", &self.permission_mode)
+            .field("client_factory", &self.client_factory.is_some())
+            .finish()
+    }
+}
+
+fn subagent_parent_slot() -> &'static std::sync::RwLock<Option<SubagentParentContext>> {
+    static SLOT: std::sync::OnceLock<std::sync::RwLock<Option<SubagentParentContext>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+fn subagent_cancel_slot() -> &'static std::sync::Mutex<Option<runtime::CancellationToken>> {
+    static SLOT: std::sync::OnceLock<std::sync::Mutex<Option<runtime::CancellationToken>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Registers the parent session's model, permission mode and credentials for
+/// sub-agents spawned by the `Agent` tool.
+pub fn set_subagent_parent_context(context: SubagentParentContext) {
+    *subagent_parent_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(context);
+}
+
+/// Forgets the registered parent context.
+pub fn clear_subagent_parent_context() {
+    *subagent_parent_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+fn subagent_parent_context() -> Option<SubagentParentContext> {
+    subagent_parent_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Installs the parent turn's cancellation token: cancelling it stops a
+/// sub-agent the `Agent` tool is waiting for.
+pub fn set_subagent_cancellation_token(token: runtime::CancellationToken) {
+    *subagent_cancel_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token);
+}
+
+fn parent_cancellation_token() -> Option<runtime::CancellationToken> {
+    subagent_cancel_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// The `Agent` tool result: the manifest plus the sub-agent's final text.
+#[derive(Debug, Clone, Serialize)]
+struct AgentToolResult {
+    #[serde(flatten)]
+    manifest: AgentOutput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
+
+/// How a sub-agent run ended, reported back to the waiting `Agent` tool.
+#[derive(Debug, Clone)]
+struct AgentCompletion {
+    final_text: Option<String>,
+    error: Option<String>,
+}
+
+/// Runs a sub-agent and, by default, waits for it to finish so its final
+/// text is returned in the tool result. After the timeout (or when the
+/// parent turn is cancelled) the current status is returned instead.
+fn execute_agent(input: AgentInput) -> Result<AgentToolResult, String> {
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let child_cancel = runtime::CancellationToken::new();
+    let child_cancel_for_job = child_cancel.clone();
+    let manifest = execute_agent_with_spawn(input, move |job| {
+        spawn_agent_job_with_completion(job, child_cancel_for_job, Some(done_tx))
+    })?;
+    // A token that is already cancelled belongs to an earlier turn (the runtime
+    // never starts a tool once its own turn is cancelled), so ignore it.
+    let parent_cancel = parent_cancellation_token().filter(|token| !token.is_cancelled());
+    Ok(wait_for_agent(
+        manifest,
+        &done_rx,
+        agent_timeout(),
+        parent_cancel.as_ref(),
+        &child_cancel,
+    ))
+}
+
+fn wait_for_agent(
+    manifest: AgentOutput,
+    done_rx: &std::sync::mpsc::Receiver<AgentCompletion>,
+    timeout: Duration,
+    parent_cancel: Option<&runtime::CancellationToken>,
+    child_cancel: &runtime::CancellationToken,
+) -> AgentToolResult {
+    let deadline = Instant::now() + timeout;
+    let (completion, note) = loop {
+        match done_rx.recv_timeout(AGENT_WAIT_POLL) {
+            Ok(completion) => break (Some(completion), None),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break (None, None),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if parent_cancel.is_some_and(runtime::CancellationToken::is_cancelled) {
+                    child_cancel.cancel();
+                    break (
+                        None,
+                        Some("Cancelled by the user; the sub-agent was asked to stop.".to_string()),
+                    );
+                }
+                if Instant::now() >= deadline {
+                    break (
+                        None,
+                        Some(format!(
+                            "Sub-agent still running after {}s; it continues in the background. Read {} later for its result.",
+                            timeout.as_secs(),
+                            manifest.output_file
+                        )),
+                    );
+                }
+            }
+        }
+    };
+    let latest = read_agent_manifest(&manifest.manifest_file).unwrap_or(manifest);
+    let (result, error_note) = completion.map_or((None, None), |completion| {
+        (completion.final_text, completion.error)
+    });
+    AgentToolResult {
+        manifest: latest,
+        result: result.filter(|text| !text.trim().is_empty()),
+        note: note.or(error_note),
+    }
+}
+
+fn read_agent_manifest(path: &str) -> Option<AgentOutput> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| serde_json::from_str(&contents).ok())
+}
+
+fn agent_timeout() -> Duration {
+    std::env::var(AGENT_TIMEOUT_ENV_VAR)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map_or(DEFAULT_AGENT_TIMEOUT, Duration::from_secs)
 }
 
 fn execute_agent_with_spawn<F>(input: AgentInput, spawn_fn: F) -> Result<AgentOutput, String>
@@ -3569,62 +3746,268 @@ where
     Ok(manifest)
 }
 
-fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
+fn spawn_agent_job_with_completion(
+    job: AgentJob,
+    cancel: runtime::CancellationToken,
+    completion: Option<std::sync::mpsc::Sender<AgentCompletion>>,
+) -> Result<(), String> {
     let thread_name = format!("clawd-agent-{}", job.manifest.agent_id);
     std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
-            let result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_agent_job(&job)));
-            match result {
-                Ok(Ok(())) => {}
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_agent_job(&job, &cancel)
+            }));
+            let report = match result {
+                Ok(Ok(final_text)) => AgentCompletion {
+                    final_text: Some(final_text),
+                    error: None,
+                },
                 Ok(Err(error)) => {
-                    let _ =
-                        persist_agent_terminal_state(&job.manifest, "failed", None, Some(error));
-                }
-                Err(_) => {
                     let _ = persist_agent_terminal_state(
                         &job.manifest,
                         "failed",
                         None,
-                        Some(String::from("sub-agent thread panicked")),
+                        Some(error.clone()),
                     );
+                    AgentCompletion {
+                        final_text: None,
+                        error: Some(error),
+                    }
                 }
+                Err(_) => {
+                    let error = String::from("sub-agent thread panicked");
+                    let _ = persist_agent_terminal_state(
+                        &job.manifest,
+                        "failed",
+                        None,
+                        Some(error.clone()),
+                    );
+                    AgentCompletion {
+                        final_text: None,
+                        error: Some(error),
+                    }
+                }
+            };
+            if let Some(completion) = completion {
+                let _ = completion.send(report);
             }
         })
         .map(|_| ())
         .map_err(|error| error.to_string())
 }
 
-fn run_agent_job(job: &AgentJob) -> Result<(), String> {
-    let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
+/// Runs the sub-agent turn; returns its final text on success.
+fn run_agent_job(job: &AgentJob, cancel: &runtime::CancellationToken) -> Result<String, String> {
+    let mut runtime = build_agent_runtime(job)?
+        .with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS)
+        .with_cancellation_token(cancel.clone());
     let summary = runtime
         .run_turn(job.prompt.clone(), None)
         .map_err(|error| error.to_string())?;
     let final_text = final_assistant_text(&summary);
-    persist_agent_terminal_state(&job.manifest, "completed", Some(final_text.as_str()), None)
+    match &summary.outcome {
+        runtime::TurnOutcome::Cancelled { .. } => {
+            Err(String::from("sub-agent cancelled by the user"))
+        }
+        runtime::TurnOutcome::LoopDetected { tool_name, repeats } => Err(format!(
+            "sub-agent stopped after repeating `{tool_name}` {repeats} times"
+        )),
+        runtime::TurnOutcome::Completed | runtime::TurnOutcome::OutputTruncated => {
+            persist_agent_terminal_state(
+                &job.manifest,
+                "completed",
+                Some(final_text.as_str()),
+                None,
+            )?;
+            Ok(final_text)
+        }
+    }
 }
 
 fn build_agent_runtime(
     job: &AgentJob,
-) -> Result<ConversationRuntime<ProviderRuntimeClient, SubagentToolExecutor>, String> {
+) -> Result<ConversationRuntime<SubagentApiClient, SubagentToolExecutor>, String> {
     let model = job
         .manifest
         .model
         .clone()
-        .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string());
+        .unwrap_or_else(|| resolve_agent_model(None));
     let allowed_tools = job.allowed_tools.clone();
-    let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
+    let tool_schema_tokens = subagent_tool_schema_tokens(&allowed_tools);
+    let api_client = SubagentApiClient::new(&model, allowed_tools.clone())?;
     let permission_policy = agent_permission_policy();
     let tool_executor = SubagentToolExecutor::new(allowed_tools)
         .with_enforcer(PermissionEnforcer::new(permission_policy.clone()));
+    let context_manager = runtime::context_manager::ContextManager::new(
+        runtime::context_manager::ContextBudget::for_model(
+            &model,
+            subagent_max_tokens(&model),
+            tool_schema_tokens,
+        ),
+        runtime::context_manager::ContextPolicy::from_env(),
+    );
     Ok(ConversationRuntime::new(
         Session::new(),
         api_client,
         tool_executor,
         permission_policy,
         job.system_prompt.clone(),
-    ))
+    )
+    .with_context_manager(context_manager))
+}
+
+/// `max_tokens` for sub-agent requests, from the shared capability registry
+/// (capped at 32K), or 8K for unknown models.
+fn subagent_max_tokens(model: &str) -> u32 {
+    // Gateway pseudo-models route to an unknown upstream: stay conservative.
+    let cap = if matches!(
+        runtime::model_registry::normalize_model_id(model).as_str(),
+        "auto" | "default"
+    ) {
+        SUBAGENT_UNKNOWN_MODEL_OUTPUT
+    } else {
+        SUBAGENT_REGISTERED_OUTPUT_CAP
+    };
+    runtime::model_registry::lookup(model)
+        .or_else(|| runtime::model_registry::lookup(&resolve_model_alias(model)))
+        .map_or(SUBAGENT_UNKNOWN_MODEL_OUTPUT, |capability| {
+            capability.max_output_tokens.min(cap)
+        })
+}
+
+fn subagent_tool_schema_tokens(allowed_tools: &BTreeSet<String>) -> usize {
+    let definitions = tool_specs_for_allowed_tools(Some(allowed_tools))
+        .into_iter()
+        .map(|spec| {
+            json!({
+                "name": spec.name,
+                "description": spec.description,
+                "input_schema": spec.input_schema,
+            })
+        })
+        .collect::<Vec<_>>();
+    runtime::context_manager::estimate_text_tokens(&Value::Array(definitions).to_string())
+}
+
+/// Model client for sub-agents: inherits the parent's credentials through the
+/// registered client factory, honors configured provider fallbacks, takes
+/// `max_tokens` from the shared registry and observes cancellation.
+struct SubagentApiClient {
+    inner: ProviderRuntimeClient,
+}
+
+impl SubagentApiClient {
+    fn new(model: &str, allowed_tools: BTreeSet<String>) -> Result<Self, String> {
+        let Some(factory) = subagent_parent_context().and_then(|context| context.client_factory)
+        else {
+            // No parent credentials registered: build clients from the
+            // environment like any other provider client.
+            return Ok(Self {
+                inner: ProviderRuntimeClient::new(model.to_string(), allowed_tools)?,
+            });
+        };
+        let mut chain = vec![subagent_provider_entry(model, &factory)?];
+        for fallback_model in load_provider_fallback_config().fallbacks() {
+            match subagent_provider_entry(fallback_model, &factory) {
+                Ok(entry) => chain.push(entry),
+                Err(error) => {
+                    if std::env::var("NEURON_DEBUG").is_ok() {
+                        eprintln!(
+                            "warning: skipping unavailable fallback provider {fallback_model}: {error}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            inner: ProviderRuntimeClient {
+                runtime: tokio::runtime::Runtime::new().map_err(|error| error.to_string())?,
+                chain,
+                allowed_tools,
+            },
+        })
+    }
+}
+
+fn subagent_provider_entry(
+    model: &str,
+    factory: &SubagentClientFactory,
+) -> Result<ProviderEntry, String> {
+    Ok(ProviderEntry {
+        model: resolve_model_alias(model),
+        client: factory(model)?,
+    })
+}
+
+impl ApiClient for SubagentApiClient {
+    fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        self.stream_with_cancellation(request, &runtime::CancellationToken::new())
+    }
+
+    fn stream_with_cancellation(
+        &mut self,
+        request: ApiRequest,
+        cancel: &runtime::CancellationToken,
+    ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        let tools = tool_specs_for_allowed_tools(Some(&self.inner.allowed_tools))
+            .into_iter()
+            .map(|spec| ToolDefinition {
+                name: spec.name.to_string(),
+                description: Some(spec.description.to_string()),
+                input_schema: spec.input_schema,
+            })
+            .collect::<Vec<_>>();
+        let messages = convert_messages(&request.messages);
+        let system =
+            (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n"));
+        let tool_choice = (!self.inner.allowed_tools.is_empty()).then_some(ToolChoice::Auto);
+
+        let runtime = &self.inner.runtime;
+        let chain = &self.inner.chain;
+        let mut last_error = None;
+        for (index, entry) in chain.iter().enumerate() {
+            let message_request = MessageRequest {
+                model: entry.model.clone(),
+                max_tokens: subagent_max_tokens(&entry.model),
+                messages: messages.clone(),
+                system: system.clone(),
+                tools: (!tools.is_empty()).then(|| tools.clone()),
+                tool_choice: tool_choice.clone(),
+                stream: true,
+                ..Default::default()
+            };
+            let attempt = runtime.block_on(async {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => None,
+                    result = stream_with_provider(&entry.client, &message_request) => Some(result),
+                }
+            });
+            match attempt {
+                None => {
+                    return Err(RuntimeError::with_kind(
+                        runtime::RuntimeErrorKind::Cancelled,
+                        "sub-agent request cancelled",
+                    ))
+                }
+                Some(Ok(events)) => return Ok(events),
+                Some(Err(error)) if error.is_retryable() && index + 1 < chain.len() => {
+                    eprintln!(
+                        "provider {} failed with retryable error, falling back: {error}",
+                        entry.model
+                    );
+                    last_error = Some(error);
+                }
+                Some(Err(error)) => return Err(RuntimeError::new(error.to_string())),
+            }
+        }
+
+        Err(RuntimeError::new(last_error.map_or_else(
+            || String::from("provider chain exhausted with no attempts"),
+            |error| error.to_string(),
+        )))
+    }
 }
 
 fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String> {
@@ -3642,12 +4025,27 @@ fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String>
     Ok(prompt)
 }
 
+/// Resolves the sub-agent model. A model requested by the tool call is used
+/// only when the capability registry knows it (models hallucinate ids);
+/// otherwise the parent's resolved model is inherited. The parent's
+/// transport prefix (e.g. `openai/` for the gateway) is preserved.
 fn resolve_agent_model(model: Option<&str>) -> String {
-    model
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .unwrap_or(DEFAULT_AGENT_MODEL)
-        .to_string()
+    let parent_model = subagent_parent_context()
+        .map_or_else(|| FALLBACK_AGENT_MODEL.to_string(), |context| context.model);
+    let Some(requested) = model.map(str::trim).filter(|model| !model.is_empty()) else {
+        return parent_model;
+    };
+    let candidate = match parent_model.split_once('/') {
+        Some(("openai", _)) if !requested.starts_with("openai/") => format!("openai/{requested}"),
+        _ => requested.to_string(),
+    };
+    // Look the id up exactly as it will be sent: through the gateway
+    // transport a provider-native id (e.g. a bare Claude id) is not routable.
+    if candidate == parent_model || runtime::model_registry::lookup(&candidate).is_some() {
+        candidate
+    } else {
+        parent_model
+    }
 }
 
 fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
@@ -3731,11 +4129,197 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
     tools.into_iter().map(str::to_string).collect()
 }
 
+/// Permission policy for sub-agents: the parent's permission mode, never
+/// more. Without a registered parent the sub-agent is read-only.
 fn agent_permission_policy() -> PermissionPolicy {
-    mvp_tool_specs().into_iter().fold(
-        PermissionPolicy::new(PermissionMode::DangerFullAccess),
-        |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
+    agent_permission_policy_for(
+        subagent_parent_context()
+            .map_or(PermissionMode::ReadOnly, |context| context.permission_mode),
     )
+}
+
+fn agent_permission_policy_for(mode: PermissionMode) -> PermissionPolicy {
+    mvp_tool_specs()
+        .into_iter()
+        .fold(PermissionPolicy::new(mode), |policy, spec| {
+            policy.with_tool_requirement(spec.name, spec.required_permission)
+        })
+}
+
+#[cfg(test)]
+mod subagent_inheritance_tests {
+    use super::{
+        agent_permission_policy, clear_subagent_parent_context, resolve_agent_model,
+        set_subagent_parent_context, subagent_max_tokens, wait_for_agent, workspace_agent_store,
+        AgentCompletion, AgentOutput, SubagentParentContext,
+    };
+    use runtime::{CancellationToken, PermissionMode};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::time::Duration;
+
+    fn parent_context_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn register_parent(model: &str, permission_mode: PermissionMode) {
+        set_subagent_parent_context(SubagentParentContext {
+            model: model.to_string(),
+            permission_mode,
+            client_factory: None,
+        });
+    }
+
+    #[test]
+    fn subagents_inherit_the_parent_model_instead_of_a_hardcoded_default() {
+        let _guard = parent_context_lock();
+        register_parent(
+            "openai/gemini/gemini-2.5-flash",
+            PermissionMode::WorkspaceWrite,
+        );
+
+        assert_eq!(resolve_agent_model(None), "openai/gemini/gemini-2.5-flash");
+        // Unknown (hallucinated) ids fall back to the parent's model.
+        assert_eq!(
+            resolve_agent_model(Some("claude-opus-4-6-turbo")),
+            "openai/gemini/gemini-2.5-flash"
+        );
+        // Provider-native ids are not routable through the gateway transport.
+        assert_eq!(
+            resolve_agent_model(Some("claude-opus-4-6")),
+            "openai/gemini/gemini-2.5-flash"
+        );
+        // Known catalog ids are honored with the parent's transport prefix.
+        assert_eq!(
+            resolve_agent_model(Some("groq/openai/gpt-oss-120b")),
+            "openai/groq/openai/gpt-oss-120b"
+        );
+
+        // A direct (non-gateway) parent may pick a known native model.
+        register_parent("claude-sonnet-4-6", PermissionMode::WorkspaceWrite);
+        assert_eq!(
+            resolve_agent_model(Some("claude-opus-4-6")),
+            "claude-opus-4-6"
+        );
+
+        clear_subagent_parent_context();
+        assert_eq!(resolve_agent_model(None), "auto");
+    }
+
+    #[test]
+    fn subagents_never_escalate_beyond_the_parent_permission_mode() {
+        let _guard = parent_context_lock();
+        register_parent("openai/auto", PermissionMode::WorkspaceWrite);
+        assert_eq!(
+            agent_permission_policy().active_mode(),
+            PermissionMode::WorkspaceWrite
+        );
+        register_parent("openai/auto", PermissionMode::ReadOnly);
+        assert_eq!(
+            agent_permission_policy().active_mode(),
+            PermissionMode::ReadOnly
+        );
+        clear_subagent_parent_context();
+        assert_eq!(
+            agent_permission_policy().active_mode(),
+            PermissionMode::ReadOnly
+        );
+    }
+
+    #[test]
+    fn subagent_max_tokens_come_from_the_shared_registry() {
+        assert_eq!(
+            subagent_max_tokens("openai/gemini/gemini-2.5-flash"),
+            32_000
+        );
+        assert_eq!(subagent_max_tokens("groq/qwen/qwen3.8-27b"), 16_384);
+        assert_eq!(subagent_max_tokens("vendor/unknown-model"), 8_192);
+        assert_eq!(subagent_max_tokens("openai/auto"), 8_192);
+    }
+
+    #[test]
+    fn agent_store_lives_under_the_workspace_neuron_directory() {
+        let workspace = std::path::Path::new("/work/project");
+        assert_eq!(
+            workspace_agent_store(workspace),
+            workspace.join(".neuron").join("agents")
+        );
+    }
+
+    fn manifest(dir: &std::path::Path) -> AgentOutput {
+        AgentOutput {
+            agent_id: "agent-test".to_string(),
+            name: "test".to_string(),
+            description: "test".to_string(),
+            subagent_type: Some("Explore".to_string()),
+            model: Some("openai/auto".to_string()),
+            status: "running".to_string(),
+            output_file: dir.join("agent-test.md").display().to_string(),
+            manifest_file: dir.join("missing-manifest.json").display().to_string(),
+            created_at: "0".to_string(),
+            started_at: None,
+            completed_at: None,
+            lane_events: Vec::new(),
+            current_blocker: None,
+            derived_state: "working".to_string(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn agent_tool_waits_for_the_final_text_and_reports_timeouts_and_cancellation() {
+        let dir = std::env::temp_dir();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        done_tx
+            .send(AgentCompletion {
+                final_text: Some("Found 3 call sites.".to_string()),
+                error: None,
+            })
+            .expect("send");
+        let finished = wait_for_agent(
+            manifest(&dir),
+            &done_rx,
+            Duration::from_secs(5),
+            None,
+            &CancellationToken::new(),
+        );
+        assert_eq!(finished.result.as_deref(), Some("Found 3 call sites."));
+        let json = serde_json::to_value(&finished).expect("serializes");
+        assert_eq!(json["result"], "Found 3 call sites.");
+        assert_eq!(json["agentId"], "agent-test");
+
+        let (_pending_tx, pending_rx) = std::sync::mpsc::channel::<AgentCompletion>();
+        let timed_out = wait_for_agent(
+            manifest(&dir),
+            &pending_rx,
+            Duration::from_millis(10),
+            None,
+            &CancellationToken::new(),
+        );
+        assert!(timed_out.result.is_none());
+        assert!(timed_out
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("still running")));
+
+        let parent = CancellationToken::new();
+        parent.cancel();
+        let child = CancellationToken::new();
+        let cancelled = wait_for_agent(
+            manifest(&dir),
+            &pending_rx,
+            Duration::from_secs(5),
+            Some(&parent),
+            &child,
+        );
+        assert!(child.is_cancelled(), "child is told to stop");
+        assert!(cancelled
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("Cancelled")));
+    }
 }
 
 fn write_agent_manifest(manifest: &AgentOutput) -> Result<(), String> {
@@ -5000,15 +5584,18 @@ fn canonical_tool_token(value: &str) -> String {
     canonical
 }
 
+/// Sub-agent task files and manifests live in `<workspace>/.neuron/agents`
+/// (next to `.neuron/sessions`); `CLAWD_AGENT_STORE` overrides the location.
 fn agent_store_dir() -> Result<std::path::PathBuf, String> {
     if let Ok(path) = std::env::var("CLAWD_AGENT_STORE") {
         return Ok(std::path::PathBuf::from(path));
     }
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    if let Some(workspace_root) = cwd.ancestors().nth(2) {
-        return Ok(workspace_root.join(".clawd-agents"));
-    }
-    Ok(cwd.join(".clawd-agents"))
+    Ok(workspace_agent_store(&cwd))
+}
+
+fn workspace_agent_store(workspace: &Path) -> std::path::PathBuf {
+    workspace.join(".neuron").join("agents")
 }
 
 fn make_agent_id() -> String {
