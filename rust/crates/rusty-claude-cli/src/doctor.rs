@@ -668,21 +668,13 @@ pub(crate) fn check_install_source_health() -> DiagnosticCheck {
         format!("Official repo     {NEURON_REPO_URL}"),
         format!("npm               {npm_install}"),
         format!("PyPI              {pip_install}"),
-        format!(
-            "Deprecated crate  `{DEPRECATED_INSTALL_COMMAND}` installs a deprecated stub and does not provide the `neuron` binary"
-        ),
+        format!("Install scripts   install.sh / install.ps1 from {NEURON_REPO_URL}/releases"),
     ])
     .with_data(Map::from_iter([
-        // `official_repo` stays on the shared constant until the help text
-        // and its contract test move to neuron-v2 (cross-package change).
-        ("official_repo".to_string(), json!(OFFICIAL_REPO_URL)),
+        ("official_repo".to_string(), json!(NEURON_REPO_URL)),
         ("repository".to_string(), json!(NEURON_REPO_URL)),
         ("npm_package".to_string(), json!(NPM_PACKAGE)),
         ("pypi_package".to_string(), json!(PYPI_PACKAGE)),
-        (
-            "deprecated_install".to_string(),
-            json!(DEPRECATED_INSTALL_COMMAND),
-        ),
         (
             "recommended_install".to_string(),
             json!(format!("{npm_install} or {pip_install}")),

@@ -162,9 +162,6 @@ const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
 const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
 const LEGACY_SESSION_EXTENSION: &str = "json";
-const OFFICIAL_REPO_URL: &str = "https://github.com/RAHUL-DevelopeRR/claw-code";
-const OFFICIAL_REPO_SLUG: &str = "RAHUL-DevelopeRR/claw-code";
-const DEPRECATED_INSTALL_COMMAND: &str = "cargo install neuron-cli";
 const LATEST_SESSION_REFERENCE: &str = "latest";
 const SESSION_REFERENCE_ALIASES: &[&str] = &[LATEST_SESSION_REFERENCE, "last", "recent"];
 const CLI_OPTION_SUGGESTIONS: &[&str] = &[
@@ -6092,8 +6089,14 @@ mod tests {
         assert!(help.contains("neuron mcp"));
         assert!(help.contains("neuron skills"));
         assert!(help.contains("neuron /skills"));
-        assert!(help.contains("RAHUL-DevelopeRR/claw-code"));
-        assert!(help.contains("cargo install neuron-cli"));
+        assert!(help.contains("https://github.com/RAHUL-DevelopeRR/neuron-v2"));
+        assert!(help.contains("npm install -g @zero-x.live/neuron"));
+        assert!(help.contains("pipx install neuroncli"));
+        assert!(help.contains("install.sh"));
+        assert!(!help.contains("claw-code"));
+        assert!(!help.contains("cargo install neuron-cli"));
+        assert!(help.contains("--provider NAME"));
+        assert!(help.contains("--reasoning-effort LEVEL"));
         assert!(!help.contains("neuron login"));
         assert!(!help.contains("neuron logout"));
     }

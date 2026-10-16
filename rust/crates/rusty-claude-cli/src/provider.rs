@@ -91,7 +91,7 @@ impl ProviderId {
         }
     }
 
-    fn names() -> String {
+    pub(crate) fn names() -> String {
         Self::ALL
             .iter()
             .map(|id| id.as_str())

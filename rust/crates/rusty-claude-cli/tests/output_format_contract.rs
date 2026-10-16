@@ -252,12 +252,13 @@ fn doctor_and_resume_status_emit_json_when_requested() {
         .expect("install source check");
     assert_eq!(
         install_source["official_repo"],
-        "https://github.com/RAHUL-DevelopeRR/claw-code"
+        "https://github.com/RAHUL-DevelopeRR/neuron-v2"
     );
     assert_eq!(
-        install_source["deprecated_install"],
-        "cargo install neuron-cli"
+        install_source["recommended_install"],
+        "npm install -g @zero-x.live/neuron or pip install neuroncli"
     );
+    assert!(install_source.get("deprecated_install").is_none());
 
     let workspace = checks
         .iter()

@@ -232,7 +232,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "plugin",
         aliases: &["plugins", "marketplace"],
-        summary: "Manage Claw Code plugins",
+        summary: "Manage Neuron plugins",
         argument_hint: Some(
             "[list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]",
         ),
@@ -4788,7 +4788,7 @@ mod tests {
 
         // then
         assert!(help.contains("/plugin"));
-        assert!(help.contains("Summary          Manage Claw Code plugins"));
+        assert!(help.contains("Summary          Manage Neuron plugins"));
         assert!(help.contains("Aliases          /plugins, /marketplace"));
         assert!(help.contains("Category         Tools"));
     }

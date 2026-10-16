@@ -302,11 +302,6 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "      Show ACP/Zed editor integration status (currently unsupported; aliases: --acp, -acp)"
     )?;
-    writeln!(out, "      Source of truth: {OFFICIAL_REPO_SLUG}")?;
-    writeln!(
-        out,
-        "      Warning: do not `{DEPRECATED_INSTALL_COMMAND}` (deprecated stub)"
-    )?;
     writeln!(out, "  neuron dump-manifests [--manifests-dir PATH]")?;
     writeln!(out, "  neuron bootstrap-plan")?;
     writeln!(out, "  neuron agents")?;
@@ -346,6 +341,15 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
         "  --dangerously-skip-permissions  Skip all permission checks"
+    )?;
+    writeln!(
+        out,
+        "  --provider NAME            Choose the model provider: {}",
+        crate::provider::ProviderId::names()
+    )?;
+    writeln!(
+        out,
+        "  --reasoning-effort LEVEL   low, medium or high, for models that support it"
     )?;
     writeln!(out, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)")?;
     writeln!(
@@ -399,14 +403,16 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  neuron mcp show my-server")?;
     writeln!(out, "  neuron /skills")?;
     writeln!(out, "  neuron doctor")?;
-    writeln!(out, "  source of truth: {OFFICIAL_REPO_URL}")?;
-    writeln!(
-        out,
-        "  do not run `{DEPRECATED_INSTALL_COMMAND}` — it installs a deprecated stub"
-    )?;
     writeln!(out, "  neuron init")?;
     writeln!(out, "  neuron export")?;
     writeln!(out, "  neuron export conversation.md")?;
+    writeln!(out)?;
+    writeln!(out, "Install and update:")?;
+    writeln!(
+        out,
+        "  npm install -g {NPM_PACKAGE}, pipx install {PYPI_PACKAGE}, or install.sh / install.ps1 from {NEURON_REPO_URL}/releases"
+    )?;
+    writeln!(out, "  Source: {NEURON_REPO_URL}")?;
     Ok(())
 }
 
