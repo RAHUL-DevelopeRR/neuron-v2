@@ -1,394 +1,299 @@
-#!/usr/bin/env bash
-# Claw Code installer
+#!/bin/sh
+# Neuron installer for Linux and macOS.
 #
-# Detects the host OS, verifies the Rust toolchain (rustc + cargo),
-# builds the `claw` binary from the `rust/` workspace, and runs a
-# post-install verification step. Supports Linux, macOS, and WSL.
+# Downloads a prebuilt `neuron` binary from GitHub Releases, verifies it
+# against the release's SHA-256 file, and installs it into a bin directory.
 #
-# Usage:
-#   ./install.sh                # debug build (fast, default)
-#   ./install.sh --release      # optimized release build
-#   ./install.sh --no-verify    # skip post-install verification
-#   ./install.sh --help         # print usage
+#   curl -fsSL https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/latest/download/install.sh | sh
+#   curl -fsSL .../install.sh | sh -s -- --version 6.3.0 --install-dir "$HOME/bin"
 #
-# Environment overrides:
-#   CLAW_BUILD_PROFILE=debug|release   same as --release toggle
-#   CLAW_SKIP_VERIFY=1                 same as --no-verify
+# Environment:
+#   NEURON_VERSION         release to install, e.g. 6.3.0 (default: latest release)
+#   NEURON_INSTALL_DIR     install directory (default: $HOME/.local/bin)
+#   NEURON_DOWNLOAD_BASE   release download base URL (default: GitHub Releases);
+#                          must be HTTPS unless it points at a loopback host
+#   NEURON_RELEASES_API    URL of the "latest release" JSON (default: GitHub API)
+#   GITHUB_TOKEN           optional token for the GitHub API rate limit
+#
+# Windows: use install.ps1 from PowerShell instead.
 
-set -euo pipefail
+set -eu
 
-# ---------------------------------------------------------------------------
-# Pretty printing
-# ---------------------------------------------------------------------------
+REPOSITORY="RAHUL-DevelopeRR/neuron-v2"
+DEFAULT_DOWNLOAD_BASE="https://github.com/${REPOSITORY}/releases/download"
+DEFAULT_RELEASES_API="https://api.github.com/repos/${REPOSITORY}/releases/latest"
+SUPPORTED="Linux (x64, arm64), macOS (arm64, x64) and Windows (x64)"
 
-if [ -t 1 ] && command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; then
-    COLOR_RESET="$(tput sgr0)"
-    COLOR_BOLD="$(tput bold)"
-    COLOR_DIM="$(tput dim)"
-    COLOR_RED="$(tput setaf 1)"
-    COLOR_GREEN="$(tput setaf 2)"
-    COLOR_YELLOW="$(tput setaf 3)"
-    COLOR_BLUE="$(tput setaf 4)"
-    COLOR_CYAN="$(tput setaf 6)"
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+    BOLD="$(printf '\033[1m')"
+    RED="$(printf '\033[31m')"
+    GREEN="$(printf '\033[32m')"
+    YELLOW="$(printf '\033[33m')"
+    RESET="$(printf '\033[0m')"
 else
-    COLOR_RESET=""
-    COLOR_BOLD=""
-    COLOR_DIM=""
-    COLOR_RED=""
-    COLOR_GREEN=""
-    COLOR_YELLOW=""
-    COLOR_BLUE=""
-    COLOR_CYAN=""
+    BOLD=""
+    RED=""
+    GREEN=""
+    YELLOW=""
+    RESET=""
 fi
 
-CURRENT_STEP=0
-TOTAL_STEPS=6
-
-step() {
-    CURRENT_STEP=$((CURRENT_STEP + 1))
-    printf '\n%s[%d/%d]%s %s%s%s\n' \
-        "${COLOR_BLUE}" "${CURRENT_STEP}" "${TOTAL_STEPS}" "${COLOR_RESET}" \
-        "${COLOR_BOLD}" "$1" "${COLOR_RESET}"
+say() { printf '%s\n' "$*" >&2; }
+info() { printf '  %s\n' "$*" >&2; }
+warn() { printf '%swarning:%s %s\n' "${YELLOW}" "${RESET}" "$*" >&2; }
+die() {
+    printf '%serror:%s %s\n' "${RED}" "${RESET}" "$*" >&2
+    exit 1
 }
 
-info()  { printf '%s  ->%s %s\n' "${COLOR_CYAN}" "${COLOR_RESET}" "$1"; }
-ok()    { printf '%s  ok%s %s\n' "${COLOR_GREEN}" "${COLOR_RESET}" "$1"; }
-warn()  { printf '%s  warn%s %s\n' "${COLOR_YELLOW}" "${COLOR_RESET}" "$1"; }
-error() { printf '%s  error%s %s\n' "${COLOR_RED}" "${COLOR_RESET}" "$1" 1>&2; }
-
-print_banner() {
-    printf '%s' "${COLOR_BOLD}"
+usage() {
     cat <<'EOF'
-   ____  _                   ____          _
-  / ___|| |  __ _ __      __ / ___|___   __| | ___
- | |    | | / _` |\ \ /\ / /| |   / _ \ / _` |/ _ \
- | |___ | || (_| | \ V  V / | |__| (_) | (_| |  __/
-  \____||_| \__,_|  \_/\_/   \____\___/ \__,_|\___|
-EOF
-    printf '%s\n' "${COLOR_RESET}"
-    printf '%sClaw Code installer%s\n' "${COLOR_DIM}" "${COLOR_RESET}"
-}
+Install the Neuron coding agent from GitHub Releases.
 
-print_usage() {
-    cat <<'EOF'
-Usage: ./install.sh [options]
+Usage: install.sh [--version VERSION] [--install-dir DIR] [--help]
 
 Options:
-  --release       Build the optimized release profile (slower, smaller binary).
-  --debug         Build the debug profile (default, faster compile).
-  --no-verify     Skip the post-install verification step.
-  -h, --help      Show this help text and exit.
+  --version VERSION    Release to install, e.g. 6.3.0 (default: latest)
+  --install-dir DIR    Directory for the neuron binary (default: ~/.local/bin)
+  -h, --help           Show this help
 
-Environment overrides:
-  CLAW_BUILD_PROFILE   debug | release
-  CLAW_SKIP_VERIFY     set to 1 to skip verification
+Environment: NEURON_VERSION, NEURON_INSTALL_DIR, NEURON_DOWNLOAD_BASE,
+NEURON_RELEASES_API, GITHUB_TOKEN.
 EOF
 }
 
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
-
-BUILD_PROFILE="${CLAW_BUILD_PROFILE:-debug}"
-SKIP_VERIFY="${CLAW_SKIP_VERIFY:-0}"
+VERSION="${NEURON_VERSION:-}"
+INSTALL_DIR="${NEURON_INSTALL_DIR:-}"
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --release)
-            BUILD_PROFILE="release"
+        --version)
+            [ "$#" -ge 2 ] || die "--version needs a value"
+            VERSION="$2"
+            shift 2
             ;;
-        --debug)
-            BUILD_PROFILE="debug"
+        --version=*)
+            VERSION="${1#--version=}"
+            shift
             ;;
-        --no-verify)
-            SKIP_VERIFY="1"
+        --install-dir)
+            [ "$#" -ge 2 ] || die "--install-dir needs a value"
+            INSTALL_DIR="$2"
+            shift 2
             ;;
-        -h|--help)
-            print_usage
+        --install-dir=*)
+            INSTALL_DIR="${1#--install-dir=}"
+            shift
+            ;;
+        -h | --help)
+            usage
             exit 0
             ;;
         *)
-            error "unknown argument: $1"
-            print_usage
-            exit 2
+            usage >&2
+            die "unknown argument: $1"
             ;;
     esac
-    shift
 done
 
-case "${BUILD_PROFILE}" in
-    debug|release) ;;
-    *)
-        error "invalid build profile: ${BUILD_PROFILE} (expected debug or release)"
-        exit 2
-        ;;
-esac
+if [ -z "${INSTALL_DIR}" ]; then
+    [ -n "${HOME:-}" ] || die "HOME is not set; pass --install-dir or set NEURON_INSTALL_DIR"
+    INSTALL_DIR="${HOME}/.local/bin"
+fi
+if [ "${INSTALL_DIR}" != "/" ]; then
+    INSTALL_DIR="${INSTALL_DIR%/}"
+fi
 
-# ---------------------------------------------------------------------------
-# Troubleshooting hints
-# ---------------------------------------------------------------------------
+# --- platform ---------------------------------------------------------------
 
-print_troubleshooting() {
-    cat <<EOF
-
-${COLOR_BOLD}Troubleshooting${COLOR_RESET}
-${COLOR_DIM}---------------${COLOR_RESET}
-
-  ${COLOR_BOLD}1. Rust toolchain missing${COLOR_RESET}
-     Install Rust via rustup:
-       curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-     Then reload your shell or run:
-       source "\$HOME/.cargo/env"
-
-  ${COLOR_BOLD}2. Linux: missing system packages${COLOR_RESET}
-     The build needs git, pkg-config, and OpenSSL headers.
-     Debian/Ubuntu:
-       sudo apt-get update && sudo apt-get install -y \\
-         git pkg-config libssl-dev ca-certificates build-essential
-     Fedora/RHEL:
-       sudo dnf install -y git pkgconf-pkg-config openssl-devel gcc
-     Arch:
-       sudo pacman -S --needed git pkgconf openssl base-devel
-
-  ${COLOR_BOLD}3. macOS: missing Xcode CLT${COLOR_RESET}
-     Install the command line tools:
-       xcode-select --install
-
-  ${COLOR_BOLD}4. Windows users${COLOR_RESET}
-     Run this script from inside a WSL distro (Ubuntu/Debian recommended).
-     Native Windows builds are not supported by this installer.
-
-  ${COLOR_BOLD}5. Build fails partway through${COLOR_RESET}
-     Try a clean build:
-       cd rust && cargo clean && cargo build --workspace
-     If the failure mentions ring/openssl, double check step 2.
-
-  ${COLOR_BOLD}6. 'claw' not found after install${COLOR_RESET}
-     The binary lives at:
-       rust/target/${BUILD_PROFILE}/claw
-     Add it to your PATH or invoke it with the full path.
-
-EOF
-}
-
-trap 'rc=$?; if [ "$rc" -ne 0 ]; then error "installation failed (exit ${rc})"; print_troubleshooting; fi' EXIT
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-require_cmd() {
-    command -v "$1" >/dev/null 2>&1
-}
-
-# ---------------------------------------------------------------------------
-# Step 1: detect OS / arch / WSL
-# ---------------------------------------------------------------------------
-
-print_banner
-step "Detecting host environment"
-
-UNAME_S="$(uname -s 2>/dev/null || echo unknown)"
-UNAME_M="$(uname -m 2>/dev/null || echo unknown)"
-OS_FAMILY="unknown"
-IS_WSL="0"
-
-case "${UNAME_S}" in
-    Linux*)
-        OS_FAMILY="linux"
-        if grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; then
-            IS_WSL="1"
+detect_target() {
+    os="$(uname -s 2>/dev/null || echo unknown)"
+    arch="$(uname -m 2>/dev/null || echo unknown)"
+    case "${os}" in
+        Linux) os_part="linux" ;;
+        Darwin) os_part="macos" ;;
+        MINGW* | MSYS* | CYGWIN* | Windows_NT)
+            die "this is a Windows shell (${os}). Install from PowerShell instead:
+    irm https://github.com/${REPOSITORY}/releases/latest/download/install.ps1 | iex"
+            ;;
+        *) die "unsupported operating system: ${os}. Neuron publishes binaries for ${SUPPORTED}." ;;
+    esac
+    case "${arch}" in
+        x86_64 | amd64) arch_part="x64" ;;
+        aarch64 | arm64) arch_part="arm64" ;;
+        *) die "unsupported CPU architecture: ${arch} on ${os}. Neuron publishes binaries for ${SUPPORTED}." ;;
+    esac
+    if [ "${os_part}" = "macos" ] && [ "${arch_part}" = "x64" ]; then
+        # A shell running under Rosetta reports x86_64 on Apple silicon.
+        if [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" = "1" ]; then
+            arch_part="arm64"
         fi
-        ;;
-    Darwin*)
-        OS_FAMILY="macos"
-        ;;
-    MINGW*|MSYS*|CYGWIN*)
-        OS_FAMILY="windows-shell"
-        ;;
-esac
+    fi
+    if [ "${os_part}" = "linux" ] && command -v ldd >/dev/null 2>&1; then
+        if ldd --version 2>&1 | grep -qi musl; then
+            die "musl-based Linux (for example Alpine) is not supported; Neuron's Linux binaries need glibc."
+        fi
+    fi
+    printf '%s-%s\n' "${os_part}" "${arch_part}"
+}
 
-info "uname:        ${UNAME_S} ${UNAME_M}"
-info "os family:    ${OS_FAMILY}"
-if [ "${IS_WSL}" = "1" ]; then
-    info "wsl:          yes"
+# --- downloads --------------------------------------------------------------
+
+is_allowed_url() {
+    case "$1" in
+        https://*) return 0 ;;
+        http://127.0.0.1:* | http://127.0.0.1/* | http://localhost:* | http://localhost/*) return 0 ;;
+        http://\[::1\]:* | http://\[::1\]/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+if command -v curl >/dev/null 2>&1; then
+    DOWNLOADER="curl"
+elif command -v wget >/dev/null 2>&1; then
+    DOWNLOADER="wget"
+else
+    die "neither curl nor wget is installed; install one of them and retry."
 fi
 
-case "${OS_FAMILY}" in
-    linux|macos)
-        ok "supported platform detected"
-        ;;
-    windows-shell)
-        error "Detected a native Windows shell (MSYS/Cygwin/MinGW)."
-        error "Please re-run this script from inside a WSL distribution."
-        exit 1
+# fetch URL OUTPUT [HEADER]
+fetch() {
+    if [ "${DOWNLOADER}" = "curl" ]; then
+        if [ -n "${3:-}" ]; then
+            curl --fail --silent --show-error --location --retry 3 --connect-timeout 20 -H "$3" -o "$2" "$1"
+        else
+            curl --fail --silent --show-error --location --retry 3 --connect-timeout 20 -o "$2" "$1"
+        fi
+    else
+        if [ -n "${3:-}" ]; then
+            wget --quiet --tries=3 --timeout=30 --header="$3" -O "$2" "$1"
+        else
+            wget --quiet --tries=3 --timeout=30 -O "$2" "$1"
+        fi
+    fi
+}
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        die "neither sha256sum nor shasum is installed; cannot verify the download."
+    fi
+}
+
+resolve_latest_version() {
+    api="${NEURON_RELEASES_API:-${DEFAULT_RELEASES_API}}"
+    is_allowed_url "${api}" || die "NEURON_RELEASES_API must be an HTTPS URL (or loopback HTTP): ${api}"
+    header=""
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        header="Authorization: Bearer ${GITHUB_TOKEN}"
+    fi
+    if ! fetch "${api}" "${TMP_DIR}/latest.json" "${header}"; then
+        die "could not look up the latest Neuron release at ${api}.
+    Set NEURON_VERSION (for example NEURON_VERSION=6.3.0) to skip the lookup."
+    fi
+    tag="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${TMP_DIR}/latest.json" | head -n 1)"
+    [ -n "${tag}" ] || die "the latest-release response from ${api} has no tag_name; set NEURON_VERSION."
+    printf '%s\n' "${tag#v}"
+}
+
+# --- main -------------------------------------------------------------------
+
+TARGET="$(detect_target)"
+ASSET="neuron-${TARGET}"
+
+DOWNLOAD_BASE="${NEURON_DOWNLOAD_BASE:-${DEFAULT_DOWNLOAD_BASE}}"
+DOWNLOAD_BASE="${DOWNLOAD_BASE%/}"
+is_allowed_url "${DOWNLOAD_BASE}" || die "NEURON_DOWNLOAD_BASE must be an HTTPS URL (or loopback HTTP): ${DOWNLOAD_BASE}"
+
+TMP_DIR="$(mktemp -d 2>/dev/null || mktemp -d -t neuron-install)"
+trap 'rm -rf "${TMP_DIR}"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if [ -z "${VERSION}" ]; then
+    VERSION="$(resolve_latest_version)"
+fi
+VERSION="${VERSION#v}"
+if ! printf '%s\n' "${VERSION}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+    die "invalid version: ${VERSION} (expected something like 6.3.0)"
+fi
+
+URL="${DOWNLOAD_BASE}/v${VERSION}/${ASSET}"
+say "${BOLD}Installing Neuron ${VERSION} (${TARGET})${RESET}"
+info "from ${URL}"
+
+if ! fetch "${URL}.sha256" "${TMP_DIR}/${ASSET}.sha256"; then
+    die "could not download ${URL}.sha256.
+    Neuron ${VERSION} may not be published for ${TARGET}; see https://github.com/${REPOSITORY}/releases"
+fi
+EXPECTED="$(awk 'NR == 1 {print tolower($1)}' "${TMP_DIR}/${ASSET}.sha256")"
+if ! printf '%s\n' "${EXPECTED}" | grep -Eq '^[0-9a-f]{64}$'; then
+    die "${URL}.sha256 does not contain a SHA-256 checksum."
+fi
+
+if ! fetch "${URL}" "${TMP_DIR}/${ASSET}"; then
+    die "could not download ${URL}."
+fi
+ACTUAL="$(sha256_of "${TMP_DIR}/${ASSET}")"
+if [ "${ACTUAL}" != "${EXPECTED}" ]; then
+    die "checksum mismatch for ${ASSET}: expected ${EXPECTED}, got ${ACTUAL}. Nothing was installed."
+fi
+info "verified SHA-256 ${ACTUAL}"
+
+chmod 755 "${TMP_DIR}/${ASSET}"
+if ! VERSION_OUTPUT="$("${TMP_DIR}/${ASSET}" --version 2>&1)"; then
+    printf '%s\n' "${VERSION_OUTPUT}" >&2
+    die "the downloaded binary does not run on this system. Nothing was installed."
+fi
+
+mkdir -p "${INSTALL_DIR}" 2>/dev/null || die "cannot create ${INSTALL_DIR}; choose another directory with --install-dir."
+DESTINATION="${INSTALL_DIR}/neuron"
+STAGED="${INSTALL_DIR}/.neuron.$$.tmp"
+if ! cp "${TMP_DIR}/${ASSET}" "${STAGED}" 2>/dev/null; then
+    rm -f "${STAGED}"
+    die "cannot write to ${INSTALL_DIR}; choose another directory with --install-dir."
+fi
+chmod 755 "${STAGED}"
+mv -f "${STAGED}" "${DESTINATION}"
+
+say "${GREEN}Installed${RESET} ${DESTINATION}"
+info "$(printf '%s\n' "${VERSION_OUTPUT}" | head -n 1)"
+
+case ":${PATH:-}:" in
+    *":${INSTALL_DIR}:"* | *":${INSTALL_DIR}/:"*)
+        RESOLVED="$(command -v neuron 2>/dev/null || true)"
+        if [ -n "${RESOLVED}" ] && [ "${RESOLVED}" != "${DESTINATION}" ]; then
+            warn "another neuron at ${RESOLVED} comes first on PATH and runs instead of ${DESTINATION}."
+            info "Remove it (for example: pip uninstall neuroncli, or npm uninstall -g @zero-x.live/neuron) or reorder PATH."
+        fi
+        RUN="neuron"
         ;;
     *)
-        error "Unsupported or unknown OS: ${UNAME_S}"
-        error "Supported: Linux, macOS, and Windows via WSL."
-        exit 1
+        warn "${INSTALL_DIR} is not on your PATH."
+        case "$(basename "${SHELL:-sh}")" in
+            zsh) PROFILE="\$HOME/.zshrc" ;;
+            bash) PROFILE="\$HOME/.bashrc" ;;
+            fish) PROFILE="" ;;
+            *) PROFILE="\$HOME/.profile" ;;
+        esac
+        if [ -n "${PROFILE}" ]; then
+            info "Add this line to ${PROFILE}, then open a new terminal:"
+            info "  export PATH=\"${INSTALL_DIR}:\$PATH\""
+        else
+            info "Add it with: fish_add_path ${INSTALL_DIR}"
+        fi
+        RUN="${DESTINATION}"
         ;;
 esac
 
-# ---------------------------------------------------------------------------
-# Step 2: locate the Rust workspace
-# ---------------------------------------------------------------------------
+cat >&2 <<EOF
 
-step "Locating the Rust workspace"
+Next steps:
+  ${RUN} auth login     # sign in to Zero-X (a free plan is available)
+  ${RUN}                # start a session in your project directory
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-RUST_DIR="${SCRIPT_DIR}/rust"
-
-if [ ! -d "${RUST_DIR}" ]; then
-    error "Could not find rust/ workspace next to install.sh"
-    error "Expected: ${RUST_DIR}"
-    exit 1
-fi
-
-if [ ! -f "${RUST_DIR}/Cargo.toml" ]; then
-    error "Missing ${RUST_DIR}/Cargo.toml — repository layout looks unexpected."
-    exit 1
-fi
-
-ok "workspace at ${RUST_DIR}"
-
-# ---------------------------------------------------------------------------
-# Step 3: prerequisite checks
-# ---------------------------------------------------------------------------
-
-step "Checking prerequisites"
-
-MISSING_PREREQS=0
-
-if require_cmd rustc; then
-    RUSTC_VERSION="$(rustc --version 2>/dev/null || echo 'unknown')"
-    ok "rustc found: ${RUSTC_VERSION}"
-else
-    error "rustc not found in PATH"
-    MISSING_PREREQS=1
-fi
-
-if require_cmd cargo; then
-    CARGO_VERSION="$(cargo --version 2>/dev/null || echo 'unknown')"
-    ok "cargo found: ${CARGO_VERSION}"
-else
-    error "cargo not found in PATH"
-    MISSING_PREREQS=1
-fi
-
-if require_cmd git; then
-    ok "git found:  $(git --version 2>/dev/null || echo 'unknown')"
-else
-    warn "git not found — some workflows (login, session export) may degrade"
-fi
-
-if [ "${OS_FAMILY}" = "linux" ]; then
-    if require_cmd pkg-config; then
-        ok "pkg-config found"
-    else
-        warn "pkg-config not found — may be required for OpenSSL-linked crates"
-    fi
-fi
-
-if [ "${OS_FAMILY}" = "macos" ]; then
-    if ! require_cmd cc && ! xcode-select -p >/dev/null 2>&1; then
-        warn "Xcode command line tools not detected — run: xcode-select --install"
-    fi
-fi
-
-if [ "${MISSING_PREREQS}" -ne 0 ]; then
-    error "Missing required tools. See troubleshooting below."
-    exit 1
-fi
-
-# ---------------------------------------------------------------------------
-# Step 4: build the workspace
-# ---------------------------------------------------------------------------
-
-step "Building the claw workspace (${BUILD_PROFILE})"
-
-CARGO_FLAGS=("build" "--workspace")
-if [ "${BUILD_PROFILE}" = "release" ]; then
-    CARGO_FLAGS+=("--release")
-fi
-
-info "running: cargo ${CARGO_FLAGS[*]}"
-info "this may take a few minutes on the first build"
-
-(
-    cd "${RUST_DIR}"
-    CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}" cargo "${CARGO_FLAGS[@]}"
-)
-
-CLAW_BIN="${RUST_DIR}/target/${BUILD_PROFILE}/claw"
-
-if [ ! -x "${CLAW_BIN}" ]; then
-    error "Expected binary not found at ${CLAW_BIN}"
-    error "The build reported success but the binary is missing — check cargo output above."
-    exit 1
-fi
-
-ok "built ${CLAW_BIN}"
-
-# ---------------------------------------------------------------------------
-# Step 5: post-install verification
-# ---------------------------------------------------------------------------
-
-step "Verifying the installed binary"
-
-if [ "${SKIP_VERIFY}" = "1" ]; then
-    warn "verification skipped (--no-verify or CLAW_SKIP_VERIFY=1)"
-else
-    info "running: claw --version"
-    if VERSION_OUT="$("${CLAW_BIN}" --version 2>&1)"; then
-        ok "claw --version -> ${VERSION_OUT}"
-    else
-        error "claw --version failed:"
-        printf '%s\n' "${VERSION_OUT}" 1>&2
-        exit 1
-    fi
-
-    info "running: claw --help (smoke test)"
-    if "${CLAW_BIN}" --help >/dev/null 2>&1; then
-        ok "claw --help responded"
-    else
-        error "claw --help failed"
-        exit 1
-    fi
-fi
-
-# ---------------------------------------------------------------------------
-# Step 6: next steps
-# ---------------------------------------------------------------------------
-
-step "Next steps"
-
-cat <<EOF
-${COLOR_GREEN}Claw Code is built and ready.${COLOR_RESET}
-
-  Binary:  ${COLOR_BOLD}${CLAW_BIN}${COLOR_RESET}
-  Profile: ${BUILD_PROFILE}
-
-Try it out:
-
-  ${COLOR_DIM}# interactive REPL${COLOR_RESET}
-  ${CLAW_BIN}
-
-  ${COLOR_DIM}# one-shot prompt${COLOR_RESET}
-  ${CLAW_BIN} prompt "summarize this repository"
-
-  ${COLOR_DIM}# health check (run /doctor inside the REPL)${COLOR_RESET}
-  ${CLAW_BIN}
-  /doctor
-
-Authentication:
-
-  export ANTHROPIC_API_KEY="sk-ant-..."
-  ${COLOR_DIM}# or use OAuth:${COLOR_RESET}
-  ${CLAW_BIN} login
-
-For deeper docs, see USAGE.md and rust/README.md.
+Docs: https://github.com/${REPOSITORY}#readme
 EOF
-
-# clear the failure trap on clean exit
-trap - EXIT
