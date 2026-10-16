@@ -3,10 +3,10 @@
 //! The login (a `ses_` session token or an `nzx_` API key, plus its expiry
 //! and plan) is kept in the OS credential store on macOS and Windows. On
 //! Linux, when the keychain is unavailable, or when the Neuron home is
-//! overridden (`NEURON_HOME`, a non-default `HOME`), it is written to
-//! `~/.neuroncli/credentials.json` with owner-only permissions and a
-//! one-time warning. `NEURON_CREDENTIAL_STORE=file|keychain` forces a
-//! backend.
+//! overridden (`NEURON_HOME`, or a `HOME`/`USERPROFILE` that is not the OS
+//! account's home), it is written to `~/.neuroncli/credentials.json` with
+//! owner-only permissions and a one-time warning.
+//! `NEURON_CREDENTIAL_STORE=file|keychain` forces a backend.
 //!
 //! Reading never fails hard: a corrupt or foreign entry produces a warning
 //! and is treated as "signed out". An existing legacy `gateway.enc` is
@@ -31,19 +31,51 @@ const CREDENTIALS_FILE: &str = "credentials.json";
 const LEGACY_VAULT_FILE: &str = "gateway.enc";
 const RECORD_VERSION: u32 = 1;
 
-/// `~/.neuroncli`, or `NEURON_HOME` when set. `HOME`/`USERPROFILE` are
-/// honoured before the OS profile lookup so a test (or a portable install)
-/// can isolate every file Neuron writes.
+/// `~/.neuroncli`, or `NEURON_HOME` when set (the supported way to isolate
+/// every file Neuron writes).
 pub fn neuron_home() -> PathBuf {
     non_empty_env("NEURON_HOME").map_or_else(|| user_home().join(".neuroncli"), PathBuf::from)
 }
 
+/// The user's home as this process sees it: `$HOME` on Unix (like `dirs`
+/// and every other tool), `USERPROFILE` on Windows. Windows falls back to
+/// `HOME` only when `USERPROFILE` is absent (a cleared environment), so a
+/// `HOME` set for Emacs, Cygwin or MSYS does not move Neuron's files away
+/// from the profile where earlier releases kept them.
 fn user_home() -> PathBuf {
-    non_empty_env("HOME")
-        .or_else(|| non_empty_env("USERPROFILE"))
-        .map(PathBuf::from)
-        .or_else(dirs::home_dir)
-        .unwrap_or_else(|| PathBuf::from("."))
+    home_from_env(
+        cfg!(windows),
+        non_empty_env("USERPROFILE"),
+        non_empty_env("HOME"),
+    )
+    .or_else(dirs::home_dir)
+    .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn home_from_env(
+    windows: bool,
+    userprofile: Option<String>,
+    home: Option<String>,
+) -> Option<PathBuf> {
+    if windows { userprofile.or(home) } else { home }.map(PathBuf::from)
+}
+
+/// The OS account's home, independent of the environment: the profile
+/// folder on Windows, the directory-services (passwd) entry on macOS. Only
+/// those platforms have a keychain this decision protects.
+#[cfg(target_os = "macos")]
+fn account_home() -> Option<PathBuf> {
+    nix::unistd::User::from_uid(nix::unistd::getuid())
+        .ok()
+        .flatten()
+        .map(|user| user.dir)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn account_home() -> Option<PathBuf> {
+    // Windows: SHGetKnownFolderPath(FOLDERID_Profile), not the environment.
+    // Elsewhere there is no keychain, so the answer does not matter.
+    dirs::home_dir()
 }
 
 fn non_empty_env(key: &str) -> Option<String> {
@@ -52,13 +84,21 @@ fn non_empty_env(key: &str) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
-/// Whether the Neuron home differs from the OS user profile. An overridden
-/// home keeps credentials inside it rather than in the shared OS keychain.
+/// Whether the Neuron home differs from the OS account's home (`NEURON_HOME`,
+/// or a `HOME`/`USERPROFILE` pointed elsewhere, as test harnesses do). An
+/// overridden home keeps credentials in its own file rather than in the
+/// account-wide OS keychain, so an isolated run never reads, uses or deletes
+/// the real login.
 fn home_is_overridden() -> bool {
-    if non_empty_env("NEURON_HOME").is_some() {
-        return true;
-    }
-    dirs::home_dir().is_none_or(|profile| !same_path(&user_home(), &profile))
+    is_overridden(
+        non_empty_env("NEURON_HOME").is_some(),
+        &user_home(),
+        account_home().as_deref(),
+    )
+}
+
+fn is_overridden(neuron_home_set: bool, home: &Path, account_home: Option<&Path>) -> bool {
+    neuron_home_set || account_home.is_none_or(|account| !same_path(home, account))
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -622,6 +662,52 @@ pub(crate) mod tests {
     }
 
     const TOKEN: &str = "ses_012345678901234567890123456789";
+
+    #[test]
+    fn windows_prefers_userprofile_over_an_unrelated_home() {
+        let some = |value: &str| Some(value.to_string());
+        // An Emacs/Cygwin HOME does not move the Windows profile files.
+        assert_eq!(
+            home_from_env(true, some(r"C:\Users\dev"), some(r"D:\home")),
+            Some(PathBuf::from(r"C:\Users\dev"))
+        );
+        // A cleared environment with only HOME (test harnesses) still isolates.
+        assert_eq!(
+            home_from_env(true, None, some(r"C:\tmp\home")),
+            Some(PathBuf::from(r"C:\tmp\home"))
+        );
+        // Unix honours HOME only.
+        assert_eq!(
+            home_from_env(false, some("/ignored"), some("/home/dev")),
+            Some(PathBuf::from("/home/dev"))
+        );
+        assert_eq!(home_from_env(false, some("/ignored"), None), None);
+    }
+
+    #[test]
+    fn only_the_account_home_shares_the_os_keychain() {
+        let account = Path::new("/Users/dev");
+        assert!(!is_overridden(
+            false,
+            Path::new("/Users/dev/"),
+            Some(account)
+        ));
+        // A temp HOME (macOS test harnesses) uses the file store instead.
+        assert!(is_overridden(
+            false,
+            Path::new("/tmp/harness/home"),
+            Some(account)
+        ));
+        assert!(is_overridden(true, Path::new("/Users/dev"), Some(account)));
+        assert!(is_overridden(false, Path::new("/Users/dev"), None));
+        if cfg!(windows) {
+            assert!(!is_overridden(
+                false,
+                Path::new(r"c:\users\DEV"),
+                Some(Path::new(r"C:\Users\dev"))
+            ));
+        }
+    }
 
     #[test]
     fn token_classification_accepts_sessions_and_api_keys_only() {

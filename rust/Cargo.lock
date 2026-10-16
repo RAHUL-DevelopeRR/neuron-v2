@@ -1826,6 +1826,7 @@ dependencies = [
  "hmac",
  "keyring",
  "mock-anthropic-service",
+ "nix",
  "pbkdf2",
  "plugins",
  "pulldown-cmark",
