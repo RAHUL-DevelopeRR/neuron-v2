@@ -1216,6 +1216,16 @@ pub fn build_chat_completion_request(
     for message in &request.messages {
         messages.extend(translate_message(message, wire_model));
     }
+    // The gateway routes to upstreams that reject the non-standard
+    // `is_error` field on tool messages (Groq answers 400 to every request
+    // that carries a tool result), so it never goes to Zero-X.
+    if config.is_zero_x() {
+        for message in &mut messages {
+            if let Some(object) = message.as_object_mut() {
+                object.remove("is_error");
+            }
+        }
+    }
     // Sanitize: drop any `role:"tool"` message that does not have a valid
     // paired `role:"assistant"` with a `tool_calls` entry carrying the same
     // `id` immediately before it (directly or as part of a run of tool
@@ -2736,6 +2746,57 @@ mod tests {
         assert!(
             translated3[0].get("is_error").is_none(),
             "dashscope/kimi-k2.5 must NOT include is_error field"
+        );
+    }
+
+    #[test]
+    fn zero_x_requests_never_carry_is_error_on_tool_messages() {
+        use crate::types::{InputContentBlock, InputMessage, ToolResultContentBlock};
+
+        let request = MessageRequest {
+            model: "auto".to_string(),
+            max_tokens: 100,
+            messages: vec![
+                InputMessage {
+                    role: "assistant".to_string(),
+                    content: vec![InputContentBlock::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "bash".to_string(),
+                        input: serde_json::json!({"command": "node test.js"}),
+                    }],
+                },
+                InputMessage {
+                    role: "user".to_string(),
+                    content: vec![InputContentBlock::ToolResult {
+                        tool_use_id: "call_1".to_string(),
+                        content: vec![ToolResultContentBlock::Text {
+                            text: "exit code 1".to_string(),
+                        }],
+                        is_error: true,
+                    }],
+                },
+            ],
+            stream: false,
+            ..Default::default()
+        };
+        let tool_message = |config| {
+            build_chat_completion_request(&request, config)["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|message| message["role"] == "tool")
+                .cloned()
+                .unwrap()
+        };
+
+        let gateway = tool_message(OpenAiCompatConfig::zero_x());
+        assert!(gateway.get("is_error").is_none(), "{gateway}");
+        assert_eq!(gateway["tool_call_id"], json!("call_1"));
+        assert_eq!(gateway["content"], json!("exit code 1"));
+        // Other OpenAI-compatible endpoints keep it.
+        assert_eq!(
+            tool_message(OpenAiCompatConfig::openai())["is_error"],
+            json!(true)
         );
     }
 

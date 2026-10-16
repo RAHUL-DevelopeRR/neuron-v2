@@ -415,6 +415,10 @@ fn gateway_default_model_preserves_parallel_tool_calls_and_file_results() {
             ])
         } else {
             let messages = body["messages"].as_array().unwrap();
+            // Groq, behind the gateway, rejects the non-standard field.
+            assert!(messages
+                .iter()
+                .all(|message| message.get("is_error").is_none()));
             for (id, content) in [
                 ("call_read", "gateway fixture"),
                 ("call_second", "second fixture"),
