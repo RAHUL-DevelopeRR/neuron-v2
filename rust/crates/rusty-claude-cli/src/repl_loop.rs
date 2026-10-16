@@ -212,44 +212,30 @@ pub(crate) fn describe_turn_outcome(summary: &TurnSummary) -> Option<String> {
     (!notes.is_empty()).then(|| notes.join("\n"))
 }
 
-/// Flags that change how an interactive session runs (model, permissions,
-/// tools, workspace checks). The argument parser does not hand them to
-/// `--resume` yet, so an interactive resume refuses them instead of silently
-/// running with defaults, which could be wider than what was asked for.
-const RESUME_LAUNCH_FLAGS: &[&str] = &[
-    "--model",
-    "--permission-mode",
-    "--dangerously-skip-permissions",
-    "--allowedTools",
-    "--allowed-tools",
-    "--reasoning-effort",
-    "--allow-broad-cwd",
-    "--base-commit",
-];
-
-/// Launch flags present in the process arguments (`--flag` or `--flag=value`)
-/// that an interactive `--resume` would not apply.
-pub(crate) fn unapplied_resume_launch_flags(args: &[String]) -> Vec<&'static str> {
-    RESUME_LAUNCH_FLAGS
-        .iter()
-        .copied()
-        .filter(|flag| {
-            args.iter().any(|arg| {
-                arg == flag
-                    || arg
-                        .strip_prefix(flag)
-                        .is_some_and(|rest| rest.starts_with('='))
-            })
-        })
-        .collect()
-}
-
-/// Explains why an interactive resume with launch flags was refused.
-pub(crate) fn unapplied_resume_flags_message(flags: &[&str], session: &str) -> String {
-    let flags = flags.join(", ");
-    format!(
-        "neuron --resume cannot apply {flags} to an interactive session yet, and will not continue with different settings than requested. Start `neuron` with those flags and run `/resume {session}` instead."
-    )
+/// How `neuron --resume <session>` continues interactively: the launch
+/// flags given with it, the session's stored model when no `--model` was
+/// given, and the configured permission mode when none was given.
+pub(crate) fn resume_launch(
+    launch: ResumeLaunchOptions,
+    stored_model: Option<&str>,
+    resume: String,
+) -> ReplLaunch {
+    let model = launch
+        .model
+        .or_else(|| stored_model.map(ToOwned::to_owned))
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    ReplLaunch {
+        model,
+        allowed_tools: launch.allowed_tools,
+        permission_mode: launch
+            .permission_mode
+            .unwrap_or_else(default_permission_mode),
+        base_commit: launch.base_commit,
+        reasoning_effort: launch.reasoning_effort,
+        allow_broad_cwd: launch.allow_broad_cwd,
+        resume: Some(resume),
+    }
 }
 
 /// Options for starting an interactive session.
@@ -590,11 +576,14 @@ mod tests {
         handle_turn_interrupt, render_context_report, watch_turn_interrupts, ContextReport,
         InterruptAction, ReplBackend, ReplStep,
     };
+    use crate::{CliAction, ResumeLaunchOptions, DEFAULT_MODEL};
     use runtime::context_manager::{ContextBudget, ContextManager, ContextPolicy};
+    use runtime::PermissionMode;
     use runtime::{
         CancellationToken, ConversationMessage, HookAbortSignal, SessionCompaction, TokenUsage,
         TurnOutcome, TurnSummary,
     };
+    use std::path::PathBuf;
 
     /// Fake backend: every prompt fails, `/boom` panics, `/quit` exits.
     #[derive(Default)]
@@ -814,57 +803,108 @@ mod tests {
         values.iter().map(ToString::to_string).collect()
     }
 
+    fn resume_options(values: &[&str]) -> (PathBuf, ResumeLaunchOptions) {
+        match crate::parse_args(&args(values)).expect("resume args parse") {
+            CliAction::ResumeSession {
+                session_path,
+                launch,
+                ..
+            } => (session_path, launch),
+            other => panic!("expected a resume action, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn interactive_resume_refuses_launch_flags_it_cannot_apply_in_either_order() {
-        use super::{unapplied_resume_flags_message, unapplied_resume_launch_flags};
+    fn resume_carries_launch_flags_given_in_either_order() {
+        let flags_first = resume_options(&[
+            "--model",
+            "groq/openai/gpt-oss-120b",
+            "--permission-mode",
+            "read-only",
+            "--allowedTools",
+            "read_file,grep_search",
+            "--reasoning-effort",
+            "high",
+            "--base-commit",
+            "abc123",
+            "--allow-broad-cwd",
+            "--resume",
+            "s.jsonl",
+        ]);
+        let flags_last = resume_options(&[
+            "--resume",
+            "s.jsonl",
+            "--model=groq/openai/gpt-oss-120b",
+            "--permission-mode=read-only",
+            "--allowedTools=read_file,grep_search",
+            "--reasoning-effort=high",
+            "--base-commit=abc123",
+            "--allow-broad-cwd",
+        ]);
+        assert_eq!(flags_first, flags_last);
+        let (session, launch) = flags_first;
+        assert_eq!(session, PathBuf::from("s.jsonl"));
+        assert_eq!(launch.model.as_deref(), Some("groq/openai/gpt-oss-120b"));
+        assert_eq!(launch.permission_mode, Some(PermissionMode::ReadOnly));
+        assert_eq!(
+            launch.allowed_tools,
+            Some(
+                ["read_file", "grep_search"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            )
+        );
+        assert_eq!(launch.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(launch.base_commit.as_deref(), Some("abc123"));
+        assert!(launch.allow_broad_cwd);
 
-        assert_eq!(
-            unapplied_resume_launch_flags(&args(&[
-                "--permission-mode",
-                "read-only",
-                "--resume",
-                "s.jsonl"
-            ])),
-            vec!["--permission-mode"]
-        );
-        assert_eq!(
-            unapplied_resume_launch_flags(&args(&[
-                "--resume",
-                "s.jsonl",
-                "--permission-mode=read-only"
-            ])),
-            vec!["--permission-mode"]
-        );
-        assert_eq!(
-            unapplied_resume_launch_flags(&args(&[
-                "--allowedTools",
-                "read_file",
-                "--resume",
-                "s.jsonl",
-                "--model",
-                "groq/openai/gpt-oss-120b",
-            ])),
-            vec!["--model", "--allowedTools"]
-        );
-        assert_eq!(
-            unapplied_resume_launch_flags(&args(&[
-                "--resume=s.jsonl",
-                "--dangerously-skip-permissions"
-            ])),
-            vec!["--dangerously-skip-permissions"]
-        );
-        assert_eq!(
-            unapplied_resume_launch_flags(&args(&["--resume", "s.jsonl"])),
-            Vec::<&str>::new()
-        );
-        assert_eq!(
-            unapplied_resume_launch_flags(&args(&["--resume", "--modelling.jsonl"])),
-            Vec::<&str>::new()
-        );
+        let (_, skip) = resume_options(&["--resume=s.jsonl", "--dangerously-skip-permissions"]);
+        assert_eq!(skip.permission_mode, Some(PermissionMode::DangerFullAccess));
 
-        let message = unapplied_resume_flags_message(&["--permission-mode"], "s.jsonl");
-        assert!(message.contains("--permission-mode"));
-        assert!(message.contains("/resume s.jsonl"));
+        // No flags: nothing is overridden, and a session file whose name
+        // starts like a flag is still the session.
+        let (session, none) = resume_options(&["--resume", "--modelling.jsonl"]);
+        assert_eq!(session, PathBuf::from("--modelling.jsonl"));
+        assert_eq!(none, ResumeLaunchOptions::default());
+    }
+
+    #[test]
+    fn interactive_resume_honours_flags_and_falls_back_to_the_stored_model() {
+        let explicit = super::resume_launch(
+            ResumeLaunchOptions {
+                model: Some("openai/gpt-4.1".to_string()),
+                permission_mode: Some(PermissionMode::ReadOnly),
+                allowed_tools: Some(["read_file".to_string()].into_iter().collect()),
+                reasoning_effort: Some("low".to_string()),
+                base_commit: Some("abc123".to_string()),
+                allow_broad_cwd: true,
+            },
+            Some("openai/auto"),
+            "s.jsonl".to_string(),
+        );
+        assert_eq!(explicit.model, "openai/gpt-4.1");
+        assert_eq!(explicit.permission_mode, PermissionMode::ReadOnly);
+        assert_eq!(
+            explicit.allowed_tools,
+            Some(["read_file".to_string()].into_iter().collect())
+        );
+        assert_eq!(explicit.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(explicit.base_commit.as_deref(), Some("abc123"));
+        assert!(explicit.allow_broad_cwd);
+        assert_eq!(explicit.resume.as_deref(), Some("s.jsonl"));
+
+        let stored = super::resume_launch(
+            ResumeLaunchOptions::default(),
+            Some("groq/openai/gpt-oss-120b"),
+            "s.jsonl".to_string(),
+        );
+        assert_eq!(stored.model, "groq/openai/gpt-oss-120b");
+        assert_eq!(stored.allowed_tools, None);
+        assert!(!stored.allow_broad_cwd);
+
+        let legacy = super::resume_launch(ResumeLaunchOptions::default(), None, "s".into());
+        assert_eq!(legacy.model, DEFAULT_MODEL);
     }
 
     #[test]

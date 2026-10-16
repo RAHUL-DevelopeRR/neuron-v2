@@ -44,6 +44,7 @@ pub(crate) enum CliAction {
         session_path: PathBuf,
         commands: Vec<String>,
         output_format: CliOutputFormat,
+        launch: ResumeLaunchOptions,
     },
     Status {
         model: String,
@@ -96,6 +97,19 @@ pub(crate) enum CliAction {
     },
 }
 
+/// Launch flags given with `--resume` (before or after it), applied when the
+/// resumed session continues interactively. `None` means "not given": the
+/// session's stored model and the configured permission mode apply.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ResumeLaunchOptions {
+    pub model: Option<String>,
+    pub permission_mode: Option<PermissionMode>,
+    pub allowed_tools: Option<AllowedToolSet>,
+    pub reasoning_effort: Option<String>,
+    pub base_commit: Option<String>,
+    pub allow_broad_cwd: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalHelpTopic {
     Status,
@@ -125,6 +139,8 @@ impl CliOutputFormat {
 #[allow(clippy::too_many_lines)]
 pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut model = DEFAULT_MODEL.to_string();
+    // Only an explicit --model; `model` falls back to the default.
+    let mut model_flag: Option<String> = None;
     let mut output_format = CliOutputFormat::Text;
     let mut permission_mode_override = None;
     let mut wants_help = false;
@@ -175,10 +191,12 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --model".to_string())?;
                 model = resolve_model_alias_with_config(value);
+                model_flag = Some(model.clone());
                 index += 2;
             }
             flag if flag.starts_with("--model=") => {
                 model = resolve_model_alias_with_config(&flag[8..]);
+                model_flag = Some(model.clone());
                 index += 1;
             }
             "--output-format" => {
@@ -353,7 +371,18 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
         });
     }
     if rest.first().map(String::as_str) == Some("--resume") {
-        return parse_resume_args(&rest[1..], output_format);
+        return parse_resume_args(
+            &rest[1..],
+            output_format,
+            ResumeLaunchOptions {
+                model: model_flag,
+                permission_mode: permission_mode_override,
+                allowed_tools,
+                reasoning_effort,
+                base_commit,
+                allow_broad_cwd,
+            },
+        );
     }
     if let Some(action) = parse_local_help_action(&rest) {
         return action;
@@ -1054,6 +1083,7 @@ pub(crate) fn parse_dump_manifests_args(
 pub(crate) fn parse_resume_args(
     args: &[String],
     output_format: CliOutputFormat,
+    launch: ResumeLaunchOptions,
 ) -> Result<CliAction, String> {
     let (session_path, command_tokens): (PathBuf, &[String]) = match args.first() {
         None => (PathBuf::from(LATEST_SESSION_REFERENCE), &[]),
@@ -1095,6 +1125,7 @@ pub(crate) fn parse_resume_args(
         session_path,
         commands,
         output_format,
+        launch,
     })
 }
 

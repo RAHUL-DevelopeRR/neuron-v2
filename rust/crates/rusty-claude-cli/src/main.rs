@@ -303,7 +303,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             session_path,
             commands,
             output_format,
-        } => resume_session(&session_path, &commands, output_format),
+            launch,
+        } => resume_session(&session_path, &commands, output_format, launch),
         CliAction::Status {
             model,
             permission_mode,
@@ -575,7 +576,12 @@ fn version_json_value() -> serde_json::Value {
 }
 
 #[allow(clippy::too_many_lines)]
-fn resume_session(session_path: &Path, commands: &[String], output_format: CliOutputFormat) {
+fn resume_session(
+    session_path: &Path,
+    commands: &[String],
+    output_format: CliOutputFormat,
+    launch: ResumeLaunchOptions,
+) {
     let session_reference = session_path.display().to_string();
     let (handle, session) = match load_session_reference(&session_reference) {
         Ok(loaded) => loaded,
@@ -614,24 +620,11 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
             && io::stdin().is_terminal()
             && io::stdout().is_terminal()
         {
-            let process_args = env::args().skip(1).collect::<Vec<_>>();
-            let unapplied = repl_loop::unapplied_resume_launch_flags(&process_args);
-            if !unapplied.is_empty() {
-                eprintln!(
-                    "error: {}",
-                    repl_loop::unapplied_resume_flags_message(&unapplied, &session_reference)
-                );
-                std::process::exit(2);
-            }
-            let launched = repl_loop::launch(repl_loop::ReplLaunch {
-                model: DEFAULT_MODEL.to_string(),
-                allowed_tools: None,
-                permission_mode: default_permission_mode(),
-                base_commit: None,
-                reasoning_effort: None,
-                allow_broad_cwd: false,
-                resume: Some(resolved_path.display().to_string()),
-            });
+            let launched = repl_loop::launch(repl_loop::resume_launch(
+                launch,
+                session.model.as_deref(),
+                resolved_path.display().to_string(),
+            ));
             if let Err(error) = launched {
                 eprintln!("error: {error}");
                 std::process::exit(1);
@@ -5669,6 +5662,7 @@ mod tests {
                 session_path: PathBuf::from("session.jsonl"),
                 commands: vec!["/compact".to_string()],
                 output_format: CliOutputFormat::Text,
+                launch: crate::ResumeLaunchOptions::default(),
             }
         );
     }
@@ -5681,6 +5675,7 @@ mod tests {
                 session_path: PathBuf::from("latest"),
                 commands: vec![],
                 output_format: CliOutputFormat::Text,
+                launch: crate::ResumeLaunchOptions::default(),
             }
         );
         assert_eq!(
@@ -5690,6 +5685,7 @@ mod tests {
                 session_path: PathBuf::from("latest"),
                 commands: vec!["/status".to_string()],
                 output_format: CliOutputFormat::Text,
+                launch: crate::ResumeLaunchOptions::default(),
             }
         );
     }
@@ -5713,6 +5709,7 @@ mod tests {
                     "/cost".to_string(),
                 ],
                 output_format: CliOutputFormat::Text,
+                launch: crate::ResumeLaunchOptions::default(),
             }
         );
     }
@@ -5744,6 +5741,7 @@ mod tests {
                     "/clear --confirm".to_string(),
                 ],
                 output_format: CliOutputFormat::Text,
+                launch: crate::ResumeLaunchOptions::default(),
             }
         );
     }
@@ -5763,6 +5761,7 @@ mod tests {
                 session_path: PathBuf::from("session.jsonl"),
                 commands: vec!["/export /tmp/notes.txt".to_string(), "/status".to_string()],
                 output_format: CliOutputFormat::Text,
+                launch: crate::ResumeLaunchOptions::default(),
             }
         );
     }
