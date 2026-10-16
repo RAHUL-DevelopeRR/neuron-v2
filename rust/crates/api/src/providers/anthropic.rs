@@ -30,6 +30,12 @@ const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(128);
 const DEFAULT_MAX_RETRIES: u32 = 8;
 
+/// Request profile identifying Neuron (`user-agent: neuron/<version>`)
+/// instead of the telemetry crate's upstream default.
+fn neuron_request_profile() -> AnthropicRequestProfile {
+    AnthropicRequestProfile::new(ClientIdentity::new("neuron", env!("CARGO_PKG_VERSION")))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthSource {
     None,
@@ -135,7 +141,7 @@ impl AnthropicClient {
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
-            request_profile: AnthropicRequestProfile::default(),
+            request_profile: neuron_request_profile(),
             session_tracer: None,
             prompt_cache: None,
             last_prompt_cache_record: Arc::new(Mutex::new(None)),
@@ -151,7 +157,7 @@ impl AnthropicClient {
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
-            request_profile: AnthropicRequestProfile::default(),
+            request_profile: neuron_request_profile(),
             session_tracer: None,
             prompt_cache: None,
             last_prompt_cache_record: Arc::new(Mutex::new(None)),
