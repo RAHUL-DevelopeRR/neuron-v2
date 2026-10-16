@@ -15,7 +15,7 @@ PROJECTS = {
 }
 AGENT_REACH_ADAPTER = """## Neuron host adapter
 
-Agent Reach's routing instructions are active on every conversation turn. Use
+Agent Reach's routing instructions apply once this skill is loaded. Use
 the appropriate documented route for internet research when its tools are
 available. This is a skill and CLI toolkit, not an MCP server. Verify executable
 availability before running doctor or platform commands; do not invent a stdio

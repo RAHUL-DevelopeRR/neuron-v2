@@ -265,7 +265,12 @@ impl GlobalToolRegistry {
         let runtime = self
             .runtime_tools
             .iter()
-            .filter(|tool| allowed_tools.is_none_or(|allowed| allowed.contains(tool.name.as_str())))
+            .filter(|tool| match allowed_tools {
+                Some(allowed) => allowed.contains(tool.name.as_str()),
+                None => {
+                    !is_deferred_runtime_tool(&tool.name) || is_deferred_tool_activated(&tool.name)
+                }
+            })
             .map(|tool| ToolDefinition {
                 name: tool.name.clone(),
                 description: tool.description.clone(),
@@ -330,9 +335,14 @@ impl GlobalToolRegistry {
         let query = query.trim().to_string();
         let normalized_query = normalize_tool_search_query(&query);
         let matches = search_tool_specs(&query, max_results.max(1), &self.searchable_tool_specs());
-        // Deferred built-ins that were found are advertised from the next
-        // request on.
+        // Deferred built-ins and MCP tools that were found are advertised
+        // from the next request on.
         activate_deferred_tools(matches.iter().map(String::as_str));
+        activate_names(
+            matches.iter().filter(|name| {
+                is_deferred_runtime_tool(name) && self.has_runtime_tool(name.as_str())
+            }),
+        );
 
         ToolSearchOutput {
             matches,
@@ -486,6 +496,22 @@ fn is_deferred_tool_activated(name: &str) -> bool {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .contains(name)
+}
+
+/// Tools discovered from MCP servers (`mcp__<server>__<tool>`). Their
+/// schemas stay out of requests until `ToolSearch` finds them; the
+/// `MCPTool` wrapper can call any of them by qualified name meanwhile.
+fn is_deferred_runtime_tool(name: &str) -> bool {
+    name.starts_with("mcp__")
+}
+
+fn activate_names<'a>(names: impl IntoIterator<Item = &'a String>) {
+    let mut activated = activated_deferred_tools()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for name in names {
+        activated.insert(name.clone());
+    }
 }
 
 fn activate_deferred_tools<'a>(names: impl IntoIterator<Item = &'a str>) {
@@ -738,7 +764,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "ToolSearch",
-            description: "Find tools that are not offered by default (task, team and cron bookkeeping, worker control, LSP, the built-in MCP registry, remote triggers) by keywords or exact name (`select:Name,Other`). Matching tools are offered from the next request on.",
+            description: "Find tools that are not offered by default (MCP server tools named `mcp__<server>__<tool>`, task, team and cron bookkeeping, worker control, LSP, the built-in MCP registry, remote triggers) by keywords or exact name (`select:Name,Other`). Matching tools are offered from the next request on.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -8280,6 +8306,60 @@ mod tests {
             std::env::remove_var("HOME");
         }
         fs::remove_dir_all(home).expect("temp home should clean up");
+    }
+
+    /// The system prompt lists bundled skills by name only, so the Skill
+    /// tool must return each one's full instructions from the embedded bundle.
+    #[test]
+    fn skill_tool_loads_every_bundled_default_skill() {
+        let _guard = env_guard();
+        let root = temp_path("bundled-skill-load");
+        let keys = [
+            "NEURON_CONFIG_HOME",
+            "CLAW_CONFIG_HOME",
+            "CODEX_HOME",
+            "CLAUDE_CONFIG_DIR",
+            "HOME",
+        ];
+        let saved = keys.map(|key| (key, std::env::var_os(key)));
+        for key in keys {
+            std::env::remove_var(key);
+        }
+        std::env::set_var("NEURON_CONFIG_HOME", root.join("config"));
+        std::env::set_var("HOME", root.join("home"));
+
+        let mut loaded = Vec::new();
+        for name in runtime::default_skills::DEFAULT_SKILL_NAMES {
+            let output: serde_json::Value = execute_tool("Skill", &json!({ "skill": name }))
+                .map(|result| serde_json::from_str(&result).expect("valid json"))
+                .unwrap_or_else(|error| panic!("{name} should load: {error}"));
+            let prompt = output["prompt"].as_str().expect("prompt").to_string();
+            assert!(
+                prompt
+                    .lines()
+                    .any(|line| line.trim_end() == format!("name: {name}")),
+                "{name} returned its own SKILL.md"
+            );
+            loaded.push((*name, prompt));
+        }
+        let body = |name: &str| {
+            loaded
+                .iter()
+                .find(|(loaded_name, _)| *loaded_name == name)
+                .map(|(_, prompt)| prompt.as_str())
+                .expect("loaded")
+        };
+        assert!(body("ponytail").contains("# Ponytail"));
+        assert!(body("antislop").contains("R-38"));
+        assert!(body("gstack-review").len() > 10_000);
+
+        for (key, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

@@ -472,7 +472,7 @@ fn render_config_section(config: &RuntimeConfig) -> String {
     let mut lines = vec!["# Runtime config".to_string()];
     if config.loaded_entries().is_empty() {
         lines.extend(prepend_bullets(vec![
-            "No Claw Code settings files loaded.".to_string()
+            "No Neuron settings files loaded.".to_string()
         ]));
         return lines.join("\n");
     }
@@ -849,9 +849,47 @@ mod tests {
         assert!(prompt.contains("Project rules"));
         assert!(prompt.contains("permissionMode"));
         assert!(prompt.contains("# Neuron default skills"));
-        assert!(prompt.contains("# Ponytail"));
-        assert!(prompt.contains("# AntiSlop (Neuron adapter)"));
-        assert!(prompt.contains("# Gstack routing (Neuron adapter)"));
+        assert!(prompt.contains("- ponytail: "));
+        assert!(prompt.contains("- gstack-investigate: "));
+        // Skill bodies load on demand through the Skill tool.
+        assert!(!prompt.contains("# AntiSlop (Neuron adapter)"));
+        assert!(!prompt.contains("# Gstack routing (Neuron adapter)"));
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    /// The system prompt is sent with every request; free gateway pools
+    /// accept a few thousand tokens per minute, so its default size is a
+    /// budget (about 2,500 tokens at 4 characters per token).
+    #[test]
+    fn default_system_prompt_for_an_empty_repo_stays_within_budget() {
+        const DEFAULT_PROMPT_BUDGET_CHARS: usize = 10_000;
+        let root = temp_dir();
+        let config_home = root.join("config-home");
+        fs::create_dir_all(&root).expect("workspace");
+
+        let _guard = env_lock();
+        let original_config_home = std::env::var_os("NEURON_CONFIG_HOME");
+        std::env::set_var("NEURON_CONFIG_HOME", &config_home);
+        let prompt = super::load_system_prompt(&root, "2026-03-31", "linux", "6.8")
+            .expect("system prompt should load")
+            .join("\n\n");
+        match original_config_home {
+            Some(value) => std::env::set_var("NEURON_CONFIG_HOME", value),
+            None => std::env::remove_var("NEURON_CONFIG_HOME"),
+        }
+
+        // Machine-specific paths do not count against the budget.
+        let bundle = crate::default_skills::bundled_skill_root(&config_home).expect("bundle");
+        let measured = prompt
+            .replace(&bundle.display().to_string(), "")
+            .replace(&root.display().to_string(), "");
+        let size = measured.chars().count();
+        assert!(
+            size <= DEFAULT_PROMPT_BUDGET_CHARS,
+            "default system prompt grew to {size} chars"
+        );
+        assert!(prompt.contains("# Neuron default skills"));
+        assert!(!prompt.contains("You are a lazy senior developer"));
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 

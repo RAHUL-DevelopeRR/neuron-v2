@@ -234,6 +234,56 @@ fn tool_search_activates_deferred_tools_for_later_requests() {
     assert!(advertised_names(&registry).contains("WorkerObserveCompletion"));
 }
 
+#[test]
+fn mcp_tools_stay_deferred_until_tool_search_finds_them() {
+    // Only this test registers mcp__deferral_probe__*.
+    let registry = GlobalToolRegistry::builtin()
+        .with_runtime_tools(vec![
+            super::RuntimeToolDefinition {
+                name: "mcp__deferral_probe__navigate".to_string(),
+                description: Some("Open a page in the probe browser".to_string()),
+                input_schema: json!({ "type": "object" }),
+                required_permission: PermissionMode::ReadOnly,
+            },
+            super::RuntimeToolDefinition {
+                name: "mcp__deferral_probe__click".to_string(),
+                description: Some("Click an element in the probe browser".to_string()),
+                input_schema: json!({ "type": "object" }),
+                required_permission: PermissionMode::ReadOnly,
+            },
+            super::RuntimeToolDefinition {
+                name: "MCPTool".to_string(),
+                description: Some("Call a configured MCP tool".to_string()),
+                input_schema: json!({ "type": "object" }),
+                required_permission: PermissionMode::DangerFullAccess,
+            },
+        ])
+        .expect("runtime tools register");
+    let names = advertised_names(&registry);
+    assert!(names.contains("MCPTool"), "the wrapper stays advertised");
+    assert!(!names.contains("mcp__deferral_probe__navigate"));
+    assert!(!names.contains("mcp__deferral_probe__click"));
+    assert!(registry.has_runtime_tool("mcp__deferral_probe__navigate"));
+
+    let found = registry.search("select:mcp__deferral_probe__navigate", 5, None, None);
+    assert_eq!(
+        found.matches,
+        vec!["mcp__deferral_probe__navigate".to_string()]
+    );
+    let names = advertised_names(&registry);
+    assert!(names.contains("mcp__deferral_probe__navigate"));
+    assert!(!names.contains("mcp__deferral_probe__click"));
+
+    // An explicit allow-list still advertises a listed MCP tool.
+    let allowed = BTreeSet::from(["mcp__deferral_probe__click".to_string()]);
+    let listed = registry
+        .definitions(Some(&allowed))
+        .into_iter()
+        .map(|definition| definition.name)
+        .collect::<Vec<_>>();
+    assert_eq!(listed, vec!["mcp__deferral_probe__click".to_string()]);
+}
+
 /// Serves `responses` (one per connection, in order) on a loopback port.
 fn serve(responses: Vec<String>) -> (String, thread::JoinHandle<Vec<String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture server");
