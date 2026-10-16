@@ -291,6 +291,11 @@ impl HarnessWorkspace {
         fs::create_dir_all(&self.root)?;
         fs::create_dir_all(&self.config_home)?;
         fs::create_dir_all(&self.home)?;
+        // Keep the default MCP servers (spawned through npx) out of the harness.
+        fs::write(
+            self.config_home.join("settings.json"),
+            r#"{"defaultMcpServers":false}"#,
+        )?;
         Ok(())
     }
 }
@@ -330,6 +335,7 @@ fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) ->
         .env("ANTHROPIC_BASE_URL", base_url)
         .env("CLAW_CONFIG_HOME", &workspace.config_home)
         .env("HOME", &workspace.home)
+        .env("USERPROFILE", &workspace.home)
         .env("NO_COLOR", "1")
         .env("PATH", "/usr/bin:/bin")
         .args([
@@ -345,6 +351,10 @@ fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) ->
     }
     if let Some((key, value)) = case.extra_env {
         command.env(key, value);
+    }
+    // Windows networking needs SystemRoot even in a cleared environment.
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        command.env("SystemRoot", system_root);
     }
     if let Some(session_id) = case.resume_session {
         command.args(["--resume", session_id]);
@@ -471,6 +481,7 @@ fn prepare_plugin_fixture(workspace: &HarnessWorkspace) {
     fs::write(
         workspace.config_home.join("settings.json"),
         json!({
+            "defaultMcpServers": false,
             "enabledPlugins": {
                 "parity-plugin@external": true
             },
