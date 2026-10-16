@@ -31,7 +31,13 @@ pub fn parse_timestamp(text: &str) -> Option<u64> {
     let year = date_parts.next()?.parse::<i64>().ok()?;
     let month = date_parts.next()?.parse::<u32>().ok()?;
     let day = date_parts.next()?.parse::<u32>().ok()?;
-    if date_parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    // RFC 3339 years are four digits; the bound also keeps the day
+    // arithmetic below far from overflow for hostile server input.
+    if date_parts.next().is_some()
+        || !(1..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+    {
         return None;
     }
 
@@ -75,11 +81,18 @@ fn split_offset(time: &str) -> Option<(&str, i64)> {
         let (clock, offset) = time.split_at(sign_at);
         let sign = if offset.starts_with('-') { -1 } else { 1 };
         let digits = offset[1..].replace(':', "");
-        if digits.len() != 4 {
+        // ASCII digits only, so the byte slicing below is on char boundaries.
+        if digits.len() != 4 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
             return None;
         }
-        let hours = digits[..2].parse::<i64>().ok()?;
-        let minutes = digits[2..].parse::<i64>().ok()?;
+        let hours = digits[..2]
+            .parse::<i64>()
+            .ok()
+            .filter(|hours| *hours <= 23)?;
+        let minutes = digits[2..]
+            .parse::<i64>()
+            .ok()
+            .filter(|minutes| *minutes <= 59)?;
         return Some((clock, sign * (hours * 3_600 + minutes * 60)));
     }
     Some((time, 0))
@@ -170,6 +183,21 @@ mod tests {
         assert_eq!(parse_timestamp("2024-02-29T12:00:00Z"), Some(1_709_208_000));
         assert_eq!(parse_timestamp("not a date"), None);
         assert_eq!(parse_timestamp("2026-13-01T00:00:00Z"), None);
+    }
+
+    #[test]
+    fn hostile_timestamps_are_rejected_without_panicking() {
+        // Byte 2 of the offset digits falls inside the two-byte 'é'.
+        assert_eq!(parse_timestamp("2026-10-17T00:00:00+1\u{e9}2"), None);
+        assert_eq!(parse_timestamp("2026-10-17T00:00:00+\u{e9}\u{e9}"), None);
+        assert_eq!(parse_timestamp("2026-10-17T00:00:00+99:99"), None);
+        assert_eq!(parse_timestamp("999999999999999-01-01T00:00:00Z"), None);
+        assert_eq!(parse_timestamp("-9223372036854775808-01-01"), None);
+        assert_eq!(parse_timestamp("0000-01-01"), None);
+        assert_eq!(
+            parse_timestamp("9999-12-31T23:59:59Z"),
+            Some(253_402_300_799)
+        );
     }
 
     #[test]
