@@ -162,7 +162,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 // top-level help instead. Subcommands that consume their own
                 // args (agents, mcp, plugins, skills) and local help-topic
                 // subcommands (status, sandbox, doctor) must NOT be intercepted
-                // here â€” they handle --help in their own dispatch paths.
+                // here — they handle --help in their own dispatch paths.
                 wants_help = true;
                 index += 1;
             }

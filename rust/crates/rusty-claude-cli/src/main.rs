@@ -333,8 +333,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             }
-            // â”€â”€ Resolve provider (Azure primary â†’ OpenRouter fallback) â”€â”€
-            // The provider always dictates the model â€” when Azure is up we
+            // ── Resolve provider (Azure primary → OpenRouter fallback) ──
+            // The provider always dictates the model — when Azure is up we
             // use gpt-5.5, when falling back to OpenRouter we MUST switch
             // to the free-tier model regardless of what the user passed.
             let effective_model = configure_provider_for_model(model)?;
@@ -664,7 +664,7 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
     let mut session = session;
     for raw_command in commands {
         // Intercept spec commands that have no parse arm before calling
-        // SlashCommand::parse â€” they return Err(SlashCommandParseError) which
+        // SlashCommand::parse — they return Err(SlashCommandParseError) which
         // formats as the confusing circular "Did you mean /X?" message.
         // STUB_COMMANDS covers both completions-filtered stubs and parse-less
         // spec entries; treat both as unsupported in resume mode.
@@ -2273,7 +2273,7 @@ impl LiveCli {
             effective_input = plan_mode::wrap_post_plan_prompt(input, self.permission_mode);
             effective_input.as_str()
         } else if let Some(ref mode) = self.orchestration_mode {
-            // â”€â”€ Orchestration mode â€” delegates to orchestrator module â”€â”€
+            // ── Orchestration mode — delegates to orchestrator module ──
             let api_key = orchestrator::azure_api_key();
             effective_input = match mode.as_str() {
                 "divide" => orchestrator::build_divide_prompt(input),
@@ -2637,7 +2637,7 @@ impl LiveCli {
                 }
                 false
             }
-            // â”€â”€ Orchestration modes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            // ── Orchestration modes ─────────────────────────────
             SlashCommand::Divide { task } => {
                 match task.as_deref().map(str::trim) {
                     Some("off") => {
@@ -3422,7 +3422,7 @@ fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Erro
 
     let mut output = String::new();
 
-    // â”€â”€ Color codes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── Color codes ─────────────────────────────────────────
     let r = "\x1b[0m"; // reset
     let add = "\x1b[32m"; // green
     let del = "\x1b[31m"; // red
@@ -3443,7 +3443,7 @@ fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Erro
         for line in raw.lines() {
             if line.starts_with("diff --git") {
                 file_count += 1;
-                // Extract filename: "diff --git a/foo.rs b/foo.rs" â†’ "foo.rs"
+                // Extract filename: "diff --git a/foo.rs b/foo.rs" → "foo.rs"
                 let fname = line.rsplit(" b/").next().unwrap_or(line);
                 buf.push_str(&format!("\n  {hdr}━━━ {fname} ━━━{r}\n"));
             } else if line.starts_with("---") || line.starts_with("+++") {
@@ -4095,7 +4095,7 @@ fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let mut prompt = load_system_prompt(cwd.clone(), DEFAULT_DATE, env::consts::OS, "unknown")?;
 
-    // â”€â”€ Cascade: inject codebase context into system prompt â”€â”€
+    // ── Cascade: inject codebase context into system prompt ──
     let repo_map = crate::repo_map::RepoMap::build(&cwd);
     if repo_map.total_files > 0 {
         prompt.push(repo_map.render());
@@ -6175,7 +6175,7 @@ mod tests {
         assert!(status.contains("Session          session.jsonl"));
         assert!(status.contains("Config files     loaded 2/3"));
         assert!(status.contains("Memory files     4"));
-        assert!(status.contains("Suggested flow   /status â†’ /diff â†’ /commit"));
+        assert!(status.contains("Suggested flow   /status → /diff → /commit"));
     }
 
     #[test]
@@ -7201,7 +7201,7 @@ UU conflicted.rs",
             AssistantEvent::TextDelta(text) if text == "Final answer"
         ));
         let rendered = String::from_utf8(out).expect("utf8");
-        assert!(rendered.contains("â–¶ Thinking (6 chars hidden)"));
+        assert!(rendered.contains("▶ Thinking (6 chars hidden)"));
         assert!(!rendered.contains("step 1"));
     }
 

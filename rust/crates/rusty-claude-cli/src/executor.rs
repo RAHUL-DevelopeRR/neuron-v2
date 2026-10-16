@@ -402,7 +402,7 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  source of truth: {OFFICIAL_REPO_URL}")?;
     writeln!(
         out,
-        "  do not run `{DEPRECATED_INSTALL_COMMAND}` â€” it installs a deprecated stub"
+        "  do not run `{DEPRECATED_INSTALL_COMMAND}` — it installs a deprecated stub"
     )?;
     writeln!(out, "  neuron init")?;
     writeln!(out, "  neuron export")?;

@@ -41,7 +41,7 @@ pub(crate) fn render_repl_help() -> String {
     )
 }
 
-// â”€â”€ Shortcuts panel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Shortcuts panel ─────────────────────────────────────────────────
 // Rendered when the user types `?` at the prompt.  Modeled after
 // Claude Code's compact two-column layout so power users can scan
 // everything at a glance without scrolling.
@@ -142,7 +142,7 @@ pub(crate) fn render_shortcuts_panel() -> String {
     .join("\n")
 }
 
-// â”€â”€ Shell escape â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Shell escape ────────────────────────────────────────────────────
 // When the user types `!<command>` at the prompt, execute it directly
 // in the system shell.  This mirrors Claude Code's `!` prefix behavior
 // and avoids burning LLM tokens on simple shell operations.
@@ -184,7 +184,7 @@ pub(crate) fn run_shell_escape(cmd: &str) {
     }
 }
 
-// â”€â”€ Mode-aware prompt â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Mode-aware prompt ───────────────────────────────────────────────
 // Dynamically generates the input prompt string to show the current
 // permission mode, mirroring how Claude Code displays the active mode.
 //
@@ -375,7 +375,7 @@ pub(crate) fn format_status_report(
   Session          {}
   Config files     loaded {}/{}
   Memory files     {}
-  Suggested flow   /status â†’ /diff â†’ /commit",
+  Suggested flow   /status → /diff → /commit",
             context.cwd.display(),
             context
                 .project_root
@@ -469,7 +469,7 @@ pub(crate) fn format_commit_skipped_report() -> String {
   Result           skipped
   Reason           no workspace changes
   Action           create a git commit from the current workspace changes
-  Next             /status to inspect context Â· /diff to inspect repo changes"
+  Next             /status to inspect context · /diff to inspect repo changes"
         .to_string()
 }
 
@@ -517,26 +517,26 @@ pub(crate) fn render_help_topic(topic: LocalHelpTopic) -> String {
   Usage            neuron status
   Purpose          show the local workspace snapshot without entering the REPL
   Output           model, permissions, git state, config files, and sandbox status
-  Related          /status Â· neuron --resume latest /status"
+  Related          /status · neuron --resume latest /status"
             .to_string(),
         LocalHelpTopic::Sandbox => "Sandbox
   Usage            neuron sandbox
   Purpose          inspect the resolved sandbox and isolation state for the current directory
   Output           namespace, network, filesystem, and fallback details
-  Related          /sandbox Â· neuron status"
+  Related          /sandbox · neuron status"
             .to_string(),
         LocalHelpTopic::Doctor => "Doctor
   Usage            neuron doctor
   Purpose          diagnose local auth, config, workspace, sandbox, and build metadata
   Output           local-only health report; no provider request or session resume required
-  Related          /doctor Â· neuron --resume latest /doctor"
+  Related          /doctor · neuron --resume latest /doctor"
             .to_string(),
         LocalHelpTopic::Acp => "ACP / Zed
   Usage            neuron acp [serve]
-  Aliases          neuron --acp Â· neuron -acp
+  Aliases          neuron --acp · neuron -acp
   Purpose          explain the current editor-facing ACP/Zed launch contract without starting the runtime
   Status           discoverability only; `serve` is a status alias and does not launch a daemon yet
-  Related          ROADMAP #64a (discoverability) Â· ROADMAP #76 (real ACP support) Â· neuron --help"
+  Related          ROADMAP #64a (discoverability) · ROADMAP #76 (real ACP support) · neuron --help"
             .to_string(),
     }
 }

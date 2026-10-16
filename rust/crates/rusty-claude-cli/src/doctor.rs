@@ -236,7 +236,7 @@ pub(crate) fn run_worker_state(
         // Let the error propagate to main() which will format it correctly
         // (prose for text mode, JSON envelope for --output-format json).
         return Err(format!(
-            "no worker state file found at {} â€” run a worker first",
+            "no worker state file found at {} — run a worker first",
             state_path.display()
         )
         .into());
@@ -724,7 +724,7 @@ pub(crate) fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck
         format!("Git state        {}", context.git_summary.headline()),
         format!("Changed files    {}", context.git_summary.changed_files),
         format!(
-            "Memory files     {} Â· config files loaded {}/{}",
+            "Memory files     {} · config files loaded {}/{}",
             context.memory_file_count, context.loaded_config_files, context.discovered_config_files
         ),
     ])

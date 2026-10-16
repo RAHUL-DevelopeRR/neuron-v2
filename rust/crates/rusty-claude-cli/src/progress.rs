@@ -251,27 +251,27 @@ pub(crate) fn format_internal_prompt_progress_line(
     {
         status_bits.push(detail.to_string());
     }
-    let status = status_bits.join(" Â· ");
+    let status = status_bits.join(" · ");
     match event {
         InternalPromptProgressEvent::Started => {
             format!(
-                "ðŸ§­ {} status Â· planning started Â· {status}",
+                "🧭 {} status · planning started · {status}",
                 snapshot.command_label
             )
         }
         InternalPromptProgressEvent::Update => {
-            format!("â€¦ {} status Â· {status}", snapshot.command_label)
+            format!("… {} status · {status}", snapshot.command_label)
         }
         InternalPromptProgressEvent::Heartbeat => format!(
-            "â€¦ {} heartbeat Â· {elapsed_seconds}s elapsed Â· {status}",
+            "… {} heartbeat · {elapsed_seconds}s elapsed · {status}",
             snapshot.command_label
         ),
         InternalPromptProgressEvent::Complete => format!(
-            "âœ” {} status Â· completed Â· {elapsed_seconds}s elapsed Â· {} steps total",
+            "✔ {} status · completed · {elapsed_seconds}s elapsed · {} steps total",
             snapshot.command_label, snapshot.step
         ),
         InternalPromptProgressEvent::Failed => format!(
-            "âœ˜ {} status Â· failed Â· {elapsed_seconds}s elapsed Â· {}",
+            "✘ {} status · failed · {elapsed_seconds}s elapsed · {}",
             snapshot.command_label,
             error.unwrap_or("unknown error")
         ),

@@ -856,10 +856,10 @@ pub(crate) const STUB_COMMANDS: &[&str] = &[
     "tag",
     "output-style",
     "add-dir",
-    // Spec entries with no parse arm â€” produce circular "Did you mean" error
+    // Spec entries with no parse arm — produce circular "Did you mean" error
     // without this guard. Adding here routes them to the proper unsupported
     // message and excludes them from REPL completions / help.
-    // NOTE: do NOT add "stats", "tokens", "cache" â€” they are implemented.
+    // NOTE: do NOT add "stats", "tokens", "cache" — they are implemented.
     "allowed-tools",
     "bookmarks",
     "workspace",
@@ -1020,11 +1020,11 @@ pub(crate) fn render_thinking_block_summary(
     redacted: bool,
 ) -> Result<(), RuntimeError> {
     let summary = if redacted {
-        "\nâ–¶ Thinking block hidden by provider\n".to_string()
+        "\n▶ Thinking block hidden by provider\n".to_string()
     } else if let Some(char_count) = char_count {
-        format!("\nâ–¶ Thinking ({char_count} chars hidden)\n")
+        format!("\n▶ Thinking ({char_count} chars hidden)\n")
     } else {
-        "\nâ–¶ Thinking hidden\n".to_string()
+        "\n▶ Thinking hidden\n".to_string()
     };
     write!(out, "{summary}")
         .and_then(|()| out.flush())
