@@ -7,8 +7,19 @@
 //! - `sedValidation` — validate sed expressions before execution
 //! - `pathValidation` — detect suspicious path patterns
 //! - `commandSemantics` — classify command intent
+//!
+//! Permission decisions use [`classify_shell_command`] /
+//! [`classify_powershell_command`], which inspect the whole command line
+//! rather than only its first word.
+
+mod command_line;
 
 use std::path::Path;
+
+pub use command_line::{
+    classify_powershell_command, classify_shell_command, path_is_within, render_prefix,
+    CommandClassification, ShellDialect, ShellSegment,
+};
 
 use crate::permissions::PermissionMode;
 

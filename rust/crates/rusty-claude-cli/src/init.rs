@@ -388,6 +388,26 @@ mod tests {
     }
 
     #[test]
+    fn initialized_neuron_md_is_loaded_as_project_instructions() {
+        let root = temp_dir();
+        fs::create_dir_all(root.join("rust")).expect("create rust dir");
+        fs::write(root.join("rust").join("Cargo.toml"), "[workspace]\n").expect("write cargo");
+        initialize_repo(&root).expect("init should succeed");
+
+        let context = runtime::ProjectContext::discover(&root, "2026-10-16")
+            .expect("project context should load");
+        let neuron_md = context
+            .instruction_files
+            .iter()
+            .find(|file| file.path.ends_with("NEURON.md"))
+            .expect("the NEURON.md written by /init must be discovered");
+        assert!(neuron_md.content.contains("# NEURON.md"));
+        assert!(neuron_md.content.contains("Languages: Rust."));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
     fn initialize_repo_is_idempotent_and_preserves_existing_files() {
         let root = temp_dir();
         fs::create_dir_all(&root).expect("create root");

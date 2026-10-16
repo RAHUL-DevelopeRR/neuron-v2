@@ -13,8 +13,10 @@ use api::{
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
-    check_freshness, dedupe_superseded_commit_events, edit_file_in_workspace, execute_bash,
-    glob_search, grep_search, load_system_prompt,
+    bash_validation::{classify_powershell_command, classify_shell_command, ShellDialect},
+    cancel::CancellationToken,
+    check_freshness, dedupe_superseded_commit_events, edit_file_in_workspace,
+    execute_bash_with_cancel, glob_search, grep_search, load_system_prompt,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
@@ -245,11 +247,16 @@ impl GlobalToolRegistry {
         Ok(Some(allowed))
     }
 
+    /// Tool schemas sent to the model.
+    ///
+    /// Without an allow-list only the default built-in tools are advertised,
+    /// plus deferred tools that `ToolSearch` activated in this session; stub
+    /// and bookkeeping tools stay behind `ToolSearch`. An explicit allow-list
+    /// advertises exactly the listed tools.
     #[must_use]
     pub fn definitions(&self, allowed_tools: Option<&BTreeSet<String>>) -> Vec<ToolDefinition> {
-        let builtin = mvp_tool_specs()
+        let builtin = advertised_builtin_specs(allowed_tools)
             .into_iter()
-            .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
             .map(|spec| ToolDefinition {
                 name: spec.name.to_string(),
                 description: Some(spec.description.to_string()),
@@ -323,6 +330,9 @@ impl GlobalToolRegistry {
         let query = query.trim().to_string();
         let normalized_query = normalize_tool_search_query(&query);
         let matches = search_tool_specs(&query, max_results.max(1), &self.searchable_tool_specs());
+        // Deferred built-ins that were found are advertised from the next
+        // request on.
+        activate_deferred_tools(matches.iter().map(String::as_str));
 
         ToolSearchOutput {
             matches,
@@ -339,8 +349,25 @@ impl GlobalToolRegistry {
     }
 
     pub fn execute(&self, name: &str, input: &Value) -> Result<String, String> {
+        self.execute_with_cancel(name, input, &CancellationToken::new())
+    }
+
+    /// Like [`Self::execute`], but `bash`, `PowerShell` and `REPL` stop when
+    /// `cancel` fires, killing the command's whole process tree and
+    /// returning the output captured so far.
+    pub fn execute_with_cancel(
+        &self,
+        name: &str,
+        input: &Value,
+        cancel: &CancellationToken,
+    ) -> Result<String, String> {
         if mvp_tool_specs().iter().any(|spec| spec.name == name) {
-            return execute_tool_with_enforcer(self.enforcer.as_ref(), name, input);
+            return execute_tool_with_enforcer_and_cancel(
+                self.enforcer.as_ref(),
+                name,
+                input,
+                cancel,
+            );
         }
         self.plugin_tools
             .iter()
@@ -351,7 +378,7 @@ impl GlobalToolRegistry {
     }
 
     fn searchable_tool_specs(&self) -> Vec<SearchableToolSpec> {
-        let builtin = deferred_tool_specs()
+        let builtin = searchable_builtin_specs()
             .into_iter()
             .map(|spec| SearchableToolSpec {
                 name: spec.name.to_string(),
@@ -382,18 +409,132 @@ fn permission_mode_from_plugin(value: &str) -> Result<PermissionMode, String> {
     }
 }
 
+/// Description of the `bash` tool, naming the shell that actually runs.
+#[cfg(windows)]
+const BASH_TOOL_DESCRIPTION: &str = "Execute a command in the current workspace with Windows cmd.exe (`cmd.exe /D /S /C`): use cmd syntax (`dir`, `type`, `set`, `%VAR%`, `&&`); POSIX tools work only if they are on PATH, and the PowerShell tool runs PowerShell syntax. Read-only commands run directly; anything else (writes, builds, installs, network) asks the user for approval in workspace-write mode, is denied in read-only mode, and runs directly in danger-full-access mode. stdin is empty. Default timeout 120000 ms (max 600000); on timeout the whole process tree is killed.";
+#[cfg(not(windows))]
+const BASH_TOOL_DESCRIPTION: &str = "Execute a command in the current workspace with POSIX sh (`sh -lc`). Read-only commands run directly; anything else (writes, builds, installs, network) asks the user for approval in workspace-write mode, is denied in read-only mode, and runs directly in danger-full-access mode. stdin is empty. Default timeout 120000 ms (max 600000); on timeout the whole process tree is killed.";
+
+/// Tools that exist but are not advertised to the model by default: they
+/// only keep in-memory bookkeeping (tasks, teams, crons, workers), are
+/// placeholders (LSP, built-in MCP), or are niche. `ToolSearch` finds them
+/// and activates their schema for the rest of the session.
+const DEFERRED_TOOL_NAMES: &[&str] = &[
+    "TaskCreate",
+    "RunTaskPacket",
+    "TaskGet",
+    "TaskList",
+    "TaskStop",
+    "TaskUpdate",
+    "TaskOutput",
+    "WorkerCreate",
+    "WorkerGet",
+    "WorkerObserve",
+    "WorkerResolveTrust",
+    "WorkerAwaitReady",
+    "WorkerSendPrompt",
+    "WorkerRestart",
+    "WorkerTerminate",
+    "WorkerObserveCompletion",
+    "TeamCreate",
+    "TeamDelete",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "LSP",
+    "ListMcpResources",
+    "ReadMcpResource",
+    "McpAuth",
+    "MCP",
+    "RemoteTrigger",
+];
+
+/// Test-only tools that are never advertised or searchable.
+const HIDDEN_TOOL_NAMES: &[&str] = &["TestingPermission"];
+
+/// How a built-in tool is offered to the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolAdvertisement {
+    /// Sent with every request.
+    Default,
+    /// Discoverable through `ToolSearch`, then sent for the rest of the session.
+    Deferred,
+    /// Never offered (test fixtures).
+    Hidden,
+}
+
+/// Advertisement class of a built-in tool.
+#[must_use]
+pub fn tool_advertisement(name: &str) -> ToolAdvertisement {
+    if HIDDEN_TOOL_NAMES.contains(&name) {
+        ToolAdvertisement::Hidden
+    } else if DEFERRED_TOOL_NAMES.contains(&name) {
+        ToolAdvertisement::Deferred
+    } else {
+        ToolAdvertisement::Default
+    }
+}
+
+fn activated_deferred_tools() -> &'static std::sync::Mutex<BTreeSet<String>> {
+    static ACTIVATED: std::sync::OnceLock<std::sync::Mutex<BTreeSet<String>>> =
+        std::sync::OnceLock::new();
+    ACTIVATED.get_or_init(|| std::sync::Mutex::new(BTreeSet::new()))
+}
+
+fn is_deferred_tool_activated(name: &str) -> bool {
+    activated_deferred_tools()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(name)
+}
+
+fn activate_deferred_tools<'a>(names: impl IntoIterator<Item = &'a str>) {
+    let mut activated = activated_deferred_tools()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for name in names {
+        if tool_advertisement(name) == ToolAdvertisement::Deferred {
+            activated.insert(name.to_string());
+        }
+    }
+}
+
+/// Built-in tools sent to the model: default tools plus deferred tools that
+/// `ToolSearch` activated, or exactly the explicitly allowed ones.
+fn advertised_builtin_specs(allowed_tools: Option<&BTreeSet<String>>) -> Vec<ToolSpec> {
+    mvp_tool_specs()
+        .into_iter()
+        .filter(|spec| match allowed_tools {
+            Some(allowed) => {
+                allowed.contains(spec.name)
+                    && tool_advertisement(spec.name) != ToolAdvertisement::Hidden
+            }
+            None => match tool_advertisement(spec.name) {
+                ToolAdvertisement::Default => true,
+                ToolAdvertisement::Deferred => is_deferred_tool_activated(spec.name),
+                ToolAdvertisement::Hidden => false,
+            },
+        })
+        .collect()
+}
+
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "bash",
-            description: "Execute a shell command in the current workspace.",
+            description: BASH_TOOL_DESCRIPTION,
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" },
-                    "timeout": { "type": "integer", "minimum": 1 },
+                    "timeout": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 600_000,
+                        "description": "Timeout in milliseconds (default 120000, max 600000)"
+                    },
                     "description": { "type": "string" },
                     "run_in_background": { "type": "boolean" },
                     "dangerouslyDisableSandbox": { "type": "boolean" },
@@ -409,13 +550,21 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read_file",
-            description: "Read a text file from the workspace.",
+            description: "Read a text file from the workspace. Returns at most 2000 lines per call (lines longer than 2000 characters are cut) plus the file's total line count; use offset to continue reading.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
-                    "offset": { "type": "integer", "minimum": 0 },
-                    "limit": { "type": "integer", "minimum": 1 }
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "0-based line to start from"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Maximum lines to return (default 2000)"
+                    }
                 },
                 "required": ["path"],
                 "additionalProperties": false
@@ -424,7 +573,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "write_file",
-            description: "Write a text file in the workspace.",
+            description: "Create or overwrite a text file in the workspace with the given content. Returns a short summary (path, bytes, lines, created or overwritten). Prefer edit_file for changes to existing files.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -438,7 +587,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit_file",
-            description: "Replace text in a workspace file.",
+            description: "Replace old_string with new_string in a workspace file and return a compact diff. old_string must match exactly once unless replace_all is true (the error lists the matching lines); `\\n` in old_string also matches Windows CRLF line endings, which are preserved.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -454,7 +603,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "glob_search",
-            description: "Find files by glob pattern.",
+            description: "Find files by glob pattern (`**` spans directories). Skips .git, node_modules, target, dist, build and .gitignore'd paths unless the pattern points into them; searching outside the workspace needs approval.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -468,7 +617,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "grep_search",
-            description: "Search file contents with a regex pattern.",
+            description: "Search file contents with a regex pattern. Skips .git, node_modules, target, dist, build and .gitignore'd paths below the search path; searching outside the workspace needs approval.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -495,7 +644,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "WebFetch",
             description:
-                "Fetch a URL, convert it into readable text, and answer a prompt about it.",
+                "Fetch an http(s) URL and return its readable text (up to 20000 characters) for answering the prompt. Local, private and link-local addresses are blocked; a domain not yet approved in this session needs user approval unless the session runs in danger-full-access mode.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -589,7 +738,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "ToolSearch",
-            description: "Search for deferred or specialized tools by exact name or keywords.",
+            description: "Find tools that are not offered by default (task, team and cron bookkeeping, worker control, LSP, the built-in MCP registry, remote triggers) by keywords or exact name (`select:Name,Other`). Matching tools are offered from the next request on.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -654,7 +803,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "Config",
-            description: "Get or set Claude Code settings.",
+            description: "Get or set Neuron settings such as theme, model or verbose. permissions.* and hooks cannot be changed with this tool.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -714,19 +863,24 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "PowerShell",
-            description: "Execute a PowerShell command with optional timeout.",
+            description: "Execute a PowerShell command (pwsh when installed, otherwise Windows PowerShell; -NoProfile -NonInteractive). Read-only cmdlets such as Get-Content, Get-ChildItem and Select-String run directly; anything else asks the user for approval in workspace-write mode and is denied in read-only mode. Default timeout 120000 ms (max 600000); on timeout the process tree is killed.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" },
-                    "timeout": { "type": "integer", "minimum": 1 },
+                    "timeout": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 600_000,
+                        "description": "Timeout in milliseconds (default 120000, max 600000)"
+                    },
                     "description": { "type": "string" },
                     "run_in_background": { "type": "boolean" }
                 },
                 "required": ["command"],
                 "additionalProperties": false
             }),
-            required_permission: PermissionMode::DangerFullAccess,
+            required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
             name: "AskUserQuestion",
@@ -747,7 +901,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TaskCreate",
-            description: "Create a background task that runs in a separate subprocess.",
+            description: "Record a task (prompt and description) in this session's in-memory task registry. Bookkeeping only: nothing runs the task.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -761,7 +915,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "RunTaskPacket",
-            description: "Create a background task from a structured task packet.",
+            description: "Record a task from a structured task packet in this session's in-memory task registry. Bookkeeping only: nothing runs the task.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -793,7 +947,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TaskGet",
-            description: "Get the status and details of a background task by ID.",
+            description: "Get a task recorded in this session's in-memory task registry by ID.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -806,7 +960,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TaskList",
-            description: "List all background tasks and their current status.",
+            description: "List the tasks recorded in this session's in-memory task registry.",
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -816,7 +970,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TaskStop",
-            description: "Stop a running background task by ID.",
+            description: "Mark a recorded task as stopped in the in-memory task registry.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -829,7 +983,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TaskUpdate",
-            description: "Send a message or update to a running background task.",
+            description: "Append a message to a task recorded in the in-memory task registry.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -843,7 +997,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TaskOutput",
-            description: "Retrieve the output produced by a background task.",
+            description: "Read the output stored for a task in the in-memory task registry.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -856,7 +1010,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "WorkerCreate",
-            description: "Create a coding worker boot session with trust-gate and prompt-delivery guards.",
+            description: "Create a coding-worker boot record with trust-gate and prompt-delivery guards. It tracks an external worker's state in memory and does not start a process.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -997,7 +1151,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TeamCreate",
-            description: "Create a team of sub-agents for parallel task execution.",
+            description: "Group recorded tasks under a named team in the in-memory registry. Bookkeeping only: no sub-agents are started.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1021,7 +1175,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TeamDelete",
-            description: "Delete a team and stop all its running tasks.",
+            description: "Mark a team as deleted in the in-memory registry.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1034,7 +1188,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "CronCreate",
-            description: "Create a scheduled recurring task.",
+            description: "Record a cron schedule entry in this session's in-memory registry. Neuron does not run scheduled entries.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1049,7 +1203,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "CronDelete",
-            description: "Delete a scheduled recurring task by ID.",
+            description: "Remove a cron entry from the in-memory registry by ID.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1062,7 +1216,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "CronList",
-            description: "List all scheduled recurring tasks.",
+            description: "List the cron entries recorded in this session's in-memory registry.",
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -1072,7 +1226,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "LSP",
-            description: "Query Language Server Protocol for code intelligence (symbols, references, diagnostics).",
+            description: "Query a registered language server for symbols, references or diagnostics. No language server is registered by default, so calls fail unless one was set up.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1089,7 +1243,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "ListMcpResources",
-            description: "List available resources from connected MCP servers.",
+            description: "List resources of the built-in MCP registry. Configured MCP servers are not in it: their resources are reached through ListMcpResourcesTool and their tools appear as mcp__<server>__<tool>.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1101,7 +1255,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "ReadMcpResource",
-            description: "Read a specific resource from an MCP server by URI.",
+            description: "Read a resource from the built-in MCP registry by URI. Configured MCP servers are reached through ReadMcpResourceTool instead.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1115,7 +1269,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "McpAuth",
-            description: "Authenticate with an MCP server that requires OAuth or credentials.",
+            description: "Report the connection state of a server in the built-in MCP registry. It does not perform OAuth or store credentials.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1144,7 +1298,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "MCP",
-            description: "Execute a tool provided by a connected MCP server.",
+            description: "Call a tool through the built-in MCP registry. Configured MCP servers are called directly as mcp__<server>__<tool> (or through MCPTool) instead.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1192,10 +1346,30 @@ pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
     execute_tool_with_enforcer(None, name, input)
 }
 
+/// Like [`execute_tool`], but `bash`, `PowerShell` and `REPL` stop (and kill
+/// their whole process tree) when `cancel` fires.
+pub fn execute_tool_with_cancel(
+    name: &str,
+    input: &Value,
+    cancel: &CancellationToken,
+) -> Result<String, String> {
+    execute_tool_with_enforcer_and_cancel(None, name, input, cancel)
+}
+
 fn execute_tool_with_enforcer(
     enforcer: Option<&PermissionEnforcer>,
     name: &str,
     input: &Value,
+) -> Result<String, String> {
+    execute_tool_with_enforcer_and_cancel(enforcer, name, input, &CancellationToken::new())
+}
+
+#[allow(clippy::too_many_lines)]
+fn execute_tool_with_enforcer_and_cancel(
+    enforcer: Option<&PermissionEnforcer>,
+    name: &str,
+    input: &Value,
+    cancel: &CancellationToken,
 ) -> Result<String, String> {
     match name {
         "bash" => {
@@ -1203,7 +1377,7 @@ fn execute_tool_with_enforcer(
             let bash_input: BashCommandInput = from_value(input)?;
             let classified_mode = classify_bash_permission(&bash_input.command);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
-            run_bash(bash_input)
+            run_bash(&bash_input, cancel)
         }
         "read_file" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
@@ -1225,13 +1399,19 @@ fn execute_tool_with_enforcer(
             maybe_enforce_permission_check(enforcer, name, input)?;
             from_value::<GrepSearchInput>(input).and_then(run_grep_search)
         }
-        "WebFetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
+        "WebFetch" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<WebFetchInput>(input).and_then(run_web_fetch)
+        }
         "WebSearch" => from_value::<WebSearchInput>(input).and_then(run_web_search),
         "TodoWrite" => from_value::<TodoWriteInput>(input).and_then(run_todo_write),
         "Skill" => from_value::<SkillInput>(input).and_then(run_skill),
         "Agent" => from_value::<AgentInput>(input).and_then(run_agent),
         "ToolSearch" => from_value::<ToolSearchInput>(input).and_then(run_tool_search),
-        "NotebookEdit" => from_value::<NotebookEditInput>(input).and_then(run_notebook_edit),
+        "NotebookEdit" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<NotebookEditInput>(input).and_then(run_notebook_edit)
+        }
         "Sleep" => from_value::<SleepInput>(input).and_then(run_sleep),
         "SendUserMessage" | "Brief" => from_value::<BriefInput>(input).and_then(run_brief),
         "Config" => from_value::<ConfigInput>(input).and_then(run_config),
@@ -1240,13 +1420,16 @@ fn execute_tool_with_enforcer(
         "StructuredOutput" => {
             from_value::<StructuredOutputInput>(input).and_then(run_structured_output)
         }
-        "REPL" => from_value::<ReplInput>(input).and_then(run_repl),
+        "REPL" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<ReplInput>(input).and_then(|repl| run_repl(repl, cancel))
+        }
         "PowerShell" => {
             // Parse input to get the command for permission classification
             let ps_input: PowerShellInput = from_value(input)?;
             let classified_mode = classify_powershell_permission(&ps_input.command);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
-            run_powershell(ps_input)
+            run_powershell(ps_input, cancel)
         }
         "AskUserQuestion" => {
             from_value::<AskUserQuestionInput>(input).and_then(run_ask_user_question)
@@ -1840,79 +2023,23 @@ fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> 
     serde_json::from_value(input.clone()).map_err(|error| error.to_string())
 }
 
-/// Classify bash command permission based on command type and path.
-/// ROADMAP #50: read-only commands targeting CWD paths get `ReadOnly`, all
-/// others remain `DangerFullAccess`.
+/// Permission a `bash` command line needs, judged over every simple command
+/// it contains: `ReadOnly` only when each one is an allowlisted read-only
+/// program with safe arguments that stays inside the workspace, otherwise
+/// `DangerFullAccess` (which prompts in workspace-write mode).
 fn classify_bash_permission(command: &str) -> PermissionMode {
-    // Read-only commands that are safe when targeting workspace paths
-    const READ_ONLY_COMMANDS: &[&str] = &[
-        "cat", "head", "tail", "less", "more", "ls", "ll", "dir", "find", "test", "[", "[[",
-        "grep", "rg", "awk", "sed", "file", "stat", "readlink", "wc", "sort", "uniq", "cut", "tr",
-        "pwd", "echo", "printf",
-    ];
-
-    // Get the base command (first word before any args or pipes)
-    let base_cmd = command.split_whitespace().next().unwrap_or("");
-    let base_cmd = base_cmd.split('|').next().unwrap_or("").trim();
-    let base_cmd = base_cmd.split(';').next().unwrap_or("").trim();
-    let base_cmd = base_cmd.split('>').next().unwrap_or("").trim();
-    let base_cmd = base_cmd.split('<').next().unwrap_or("").trim();
-
-    // Check if it's a read-only command
-    let cmd_name = base_cmd.split('/').next_back().unwrap_or(base_cmd);
-    let is_read_only = READ_ONLY_COMMANDS.contains(&cmd_name);
-
-    if !is_read_only {
-        return PermissionMode::DangerFullAccess;
-    }
-
-    // Check if any path argument is outside workspace
-    // Simple heuristic: check for absolute paths not starting with CWD
-    if has_dangerous_paths(command) {
-        return PermissionMode::DangerFullAccess;
-    }
-
-    PermissionMode::ReadOnly
+    let workspace = std::env::current_dir().ok();
+    classify_shell_command(command, ShellDialect::host(), workspace.as_deref()).required_mode()
 }
 
-/// Check if command has dangerous paths (outside workspace).
-fn has_dangerous_paths(command: &str) -> bool {
-    // Look for absolute paths
-    let tokens: Vec<&str> = command.split_whitespace().collect();
-
-    for token in tokens {
-        // Skip flags/options
-        if token.starts_with('-') {
-            continue;
-        }
-
-        // Check for absolute paths
-        if token.starts_with('/') || token.starts_with("~/") {
-            // Check if it's within CWD
-            let path =
-                PathBuf::from(token.replace('~', &std::env::var("HOME").unwrap_or_default()));
-            if let Ok(cwd) = std::env::current_dir() {
-                if !path.starts_with(&cwd) {
-                    return true; // Path outside workspace
-                }
-            }
-        }
-
-        // Check for parent directory traversal that escapes workspace
-        if token.contains("../..") || token.starts_with("../") && !token.starts_with("./") {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn run_bash(input: BashCommandInput) -> Result<String, String> {
+fn run_bash(input: &BashCommandInput, cancel: &CancellationToken) -> Result<String, String> {
     if let Some(output) = workspace_test_branch_preflight(&input.command) {
         return serde_json::to_string_pretty(&output).map_err(|error| error.to_string());
     }
-    serde_json::to_string_pretty(&execute_bash(input).map_err(|error| error.to_string())?)
-        .map_err(|error| error.to_string())
+    serde_json::to_string_pretty(
+        &execute_bash_with_cancel(input, cancel).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn workspace_test_branch_preflight(command: &str) -> Option<BashCommandOutput> {
@@ -2157,84 +2284,19 @@ fn run_structured_output(input: StructuredOutputInput) -> Result<String, String>
     to_pretty_json(execute_structured_output(input)?)
 }
 
-fn run_repl(input: ReplInput) -> Result<String, String> {
-    to_pretty_json(execute_repl(input)?)
+fn run_repl(input: ReplInput, cancel: &CancellationToken) -> Result<String, String> {
+    to_pretty_json(execute_repl(input, cancel)?)
 }
 
-/// Classify `PowerShell` command permission based on command type and path.
-/// ROADMAP #50: Read-only commands targeting CWD paths get `WorkspaceWrite`,
-/// all others remain `DangerFullAccess`.
+/// Permission a `PowerShell` command line needs, judged over every statement
+/// and pipeline element (see [`classify_bash_permission`]).
 fn classify_powershell_permission(command: &str) -> PermissionMode {
-    // Read-only commands that are safe when targeting workspace paths
-    const READ_ONLY_COMMANDS: &[&str] = &[
-        "Get-Content",
-        "Get-ChildItem",
-        "Test-Path",
-        "Get-Item",
-        "Get-ItemProperty",
-        "Get-FileHash",
-        "Select-String",
-    ];
-
-    // Check if command starts with a read-only cmdlet
-    let cmd_lower = command.trim().to_lowercase();
-    let is_read_only_cmd = READ_ONLY_COMMANDS
-        .iter()
-        .any(|cmd| cmd_lower.starts_with(&cmd.to_lowercase()));
-
-    if !is_read_only_cmd {
-        return PermissionMode::DangerFullAccess;
-    }
-
-    // Check if the path is within workspace (CWD or subdirectory)
-    // Extract path from command - look for -Path or positional parameter
-    let path = extract_powershell_path(command);
-    match path {
-        Some(p) if is_within_workspace(&p) => PermissionMode::WorkspaceWrite,
-        _ => PermissionMode::DangerFullAccess,
-    }
+    let workspace = std::env::current_dir().ok();
+    classify_powershell_command(command, workspace.as_deref()).required_mode()
 }
 
-/// Extract the path argument from a `PowerShell` command.
-fn extract_powershell_path(command: &str) -> Option<String> {
-    // Look for -Path parameter
-    if let Some(idx) = command.to_lowercase().find("-path") {
-        let after_path = &command[idx + 5..];
-        let path = after_path.split_whitespace().next()?;
-        return Some(path.trim_matches('"').trim_matches('\'').to_string());
-    }
-
-    // Look for positional path parameter (after command name)
-    let parts: Vec<&str> = command.split_whitespace().collect();
-    if parts.len() >= 2 {
-        // Skip the cmdlet name and take the first argument
-        let first_arg = parts[1];
-        // Check if it looks like a path (contains \, /, or .)
-        if first_arg.contains(['\\', '/', '.']) {
-            return Some(first_arg.trim_matches('"').trim_matches('\'').to_string());
-        }
-    }
-
-    None
-}
-
-/// Check if a path is within the current workspace.
-fn is_within_workspace(path: &str) -> bool {
-    let path = PathBuf::from(path);
-
-    // If path is absolute, check if it starts with CWD
-    if path.is_absolute() {
-        if let Ok(cwd) = std::env::current_dir() {
-            return path.starts_with(&cwd);
-        }
-    }
-
-    // Relative paths are assumed to be within workspace
-    !path.starts_with("/") && !path.starts_with("\\") && !path.starts_with("..")
-}
-
-fn run_powershell(input: PowerShellInput) -> Result<String, String> {
-    to_pretty_json(execute_powershell(input).map_err(|error| error.to_string())?)
+fn run_powershell(input: PowerShellInput, cancel: &CancellationToken) -> Result<String, String> {
+    to_pretty_json(execute_powershell(input, cancel).map_err(|error| error.to_string())?)
 }
 
 fn to_pretty_json<T: serde::Serialize>(value: T) -> Result<String, String> {
@@ -2757,30 +2819,22 @@ struct SearchHit {
 
 fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
     let started = Instant::now();
-    let client = build_http_client()?;
     let request_url = normalize_fetch_url(&input.url)?;
-    let response = client
-        .get(request_url.clone())
-        .send()
-        .map_err(|error| error.to_string())?;
+    let request_url = reqwest::Url::parse(&request_url).map_err(|error| error.to_string())?;
+    web_fetch::ensure_gated_host(&input.url, &request_url)?;
+    let page = web_fetch::fetch(request_url)?;
 
-    let status = response.status();
-    let final_url = response.url().to_string();
-    let code = status.as_u16();
-    let code_text = status.canonical_reason().unwrap_or("Unknown").to_string();
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
+    let code = page.status.as_u16();
+    let code_text = page
+        .status
+        .canonical_reason()
+        .unwrap_or("Unknown")
         .to_string();
-    let body = response.text().map_err(|error| error.to_string())?;
-    let bytes = body.len();
-    let normalized = normalize_fetched_content(&body, &content_type);
-    let result = summarize_web_fetch(&final_url, &input.prompt, &normalized, &body, &content_type);
+    let final_url = page.final_url.to_string();
+    let result = render_web_fetch_result(&final_url, &input.prompt, &page);
 
     Ok(WebFetchOutput {
-        bytes,
+        bytes: page.bytes,
         code,
         code_text,
         result,
@@ -2882,35 +2936,62 @@ fn build_search_url(query: &str) -> Result<reqwest::Url, String> {
 
 fn normalize_fetched_content(body: &str, content_type: &str) -> String {
     if content_type.contains("html") {
-        html_to_text(body)
+        web_fetch::html_to_readable_text(body)
     } else {
         body.trim().to_string()
     }
 }
 
-fn summarize_web_fetch(
-    url: &str,
-    prompt: &str,
-    content: &str,
-    raw_body: &str,
-    content_type: &str,
-) -> String {
-    let lower_prompt = prompt.to_lowercase();
-    let compact = collapse_whitespace(content);
+/// Text handed to the model: where the content came from, the page title,
+/// the prompt it should answer, and up to
+/// [`web_fetch::MAX_FETCH_TEXT_CHARS`] characters of readable text.
+fn render_web_fetch_result(url: &str, prompt: &str, page: &web_fetch::FetchedPage) -> String {
+    let mut lines = vec![format!(
+        "Fetched {url} (HTTP {}{})",
+        page.status.as_u16(),
+        if page.content_type.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", page.content_type)
+        }
+    )];
+    if let Some(target) = &page.cross_host_redirect {
+        lines.push(format!(
+            "The server redirected to a different host: {target}\nThe redirect was not followed. To read it, call WebFetch again with that URL (a domain not yet approved in this session needs the user's approval)."
+        ));
+        return lines.join("\n");
+    }
+    if web_fetch::is_binary_content_type(&page.content_type) {
+        lines.push(format!(
+            "The response is binary ({} bytes) and is not shown as text.",
+            page.bytes
+        ));
+        return lines.join("\n");
+    }
 
-    let detail = if lower_prompt.contains("title") {
-        extract_title(content, raw_body, content_type).map_or_else(
-            || preview_text(&compact, 600),
-            |title| format!("Title: {title}"),
-        )
-    } else if lower_prompt.contains("summary") || lower_prompt.contains("summarize") {
-        preview_text(&compact, 900)
+    let content = normalize_fetched_content(&page.body, &page.content_type);
+    if page.content_type.contains("html") {
+        if let Some(title) = extract_title("", &page.body, &page.content_type) {
+            lines.push(format!("Title: {title}"));
+        }
+    }
+    lines.push(format!("Prompt: {prompt}"));
+    let (text, total_chars) = web_fetch::bound_text(&content);
+    lines.push(String::new());
+    lines.push(if text.is_empty() {
+        "(no readable text)".to_string()
     } else {
-        let preview = preview_text(&compact, 900);
-        format!("Prompt: {prompt}\nContent preview:\n{preview}")
-    };
-
-    format!("Fetched {url}\n{detail}")
+        text
+    });
+    if let Some(total) = total_chars {
+        lines.push(format!(
+            "\n[Content truncated: showing the first {} of {total} characters.]",
+            web_fetch::MAX_FETCH_TEXT_CHARS
+        ));
+    } else if page.body_truncated {
+        lines.push("\n[The response body was larger than 5 MB; only the start was read.]".into());
+    }
+    lines.join("\n")
 }
 
 fn extract_title(content: &str, raw_body: &str, content_type: &str) -> Option<String> {
@@ -2979,14 +3060,6 @@ fn decode_html_entities(input: &str) -> String {
 
 fn collapse_whitespace(input: &str) -> String {
     input.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn preview_text(input: &str, max_chars: usize) -> String {
-    if input.chars().count() <= max_chars {
-        return input.to_string();
-    }
-    let shortened = input.chars().take(max_chars).collect::<String>();
-    format!("{}…", shortened.trim_end())
 }
 
 fn extract_search_hits(html: &str) -> Vec<SearchHit> {
@@ -5756,14 +5829,16 @@ fn execute_tool_search(input: ToolSearchInput) -> ToolSearchOutput {
     GlobalToolRegistry::builtin().search(&input.query, input.max_results.unwrap_or(5), None, None)
 }
 
-fn deferred_tool_specs() -> Vec<ToolSpec> {
+/// Built-in tools `ToolSearch` can find: everything except the core file and
+/// shell tools (always advertised) and hidden test fixtures.
+fn searchable_builtin_specs() -> Vec<ToolSpec> {
     mvp_tool_specs()
         .into_iter()
         .filter(|spec| {
             !matches!(
                 spec.name,
                 "bash" | "read_file" | "write_file" | "edit_file" | "glob_search" | "grep_search"
-            )
+            ) && tool_advertisement(spec.name) != ToolAdvertisement::Hidden
         })
         .collect()
 }
@@ -6178,6 +6253,11 @@ fn execute_config(input: ConfigInput) -> Result<ConfigOutput, String> {
     if setting.is_empty() {
         return Err(String::from("setting must not be empty"));
     }
+    if input.value.is_some() {
+        if let Some(reason) = protected_config_setting_reason(setting) {
+            return Err(reason);
+        }
+    }
     let Some(spec) = supported_config_setting(setting) else {
         return Ok(ConfigOutput {
             success: false,
@@ -6218,6 +6298,21 @@ fn execute_config(input: ConfigInput) -> Result<ConfigOutput, String> {
             error: None,
         })
     }
+}
+
+/// Settings the model may read but never change through the Config tool:
+/// `permissions.*` decides what tools may do without asking, and `hooks`
+/// run arbitrary commands, so only the user may edit them.
+fn protected_config_setting_reason(setting: &str) -> Option<String> {
+    let root = setting.split('.').next().unwrap_or(setting).trim();
+    let protected = ["permissions", "permissionMode", "hooks"]
+        .iter()
+        .any(|name| root.eq_ignore_ascii_case(name));
+    protected.then(|| {
+        format!(
+            "The Config tool cannot change `{setting}`: permission and hook settings decide what tools may run without approval, so only the user can change them (edit the settings file directly, or start Neuron with --permission-mode)."
+        )
+    })
 }
 
 const PERMISSION_DEFAULT_MODE_PATH: &[&str] = &["permissions", "defaultMode"];
@@ -6374,56 +6469,43 @@ fn execute_structured_output(
     })
 }
 
-fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
+fn execute_repl(input: ReplInput, cancel: &CancellationToken) -> Result<ReplOutput, String> {
     if input.code.trim().is_empty() {
         return Err(String::from("code must not be empty"));
     }
     let runtime = resolve_repl_runtime(&input.language)?;
     let started = Instant::now();
     let mut process = Command::new(runtime.program);
-    process
-        .args(runtime.args)
-        .arg(&input.code)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+    process.args(runtime.args).arg(&input.code);
+    plugins::subprocess::scrub_credential_env(&mut process);
 
-    let output = if let Some(timeout_ms) = input.timeout_ms {
-        let mut child = process.spawn().map_err(|error| error.to_string())?;
-        loop {
-            if child
-                .try_wait()
-                .map_err(|error| error.to_string())?
-                .is_some()
-            {
-                break child
-                    .wait_with_output()
-                    .map_err(|error| error.to_string())?;
-            }
-            if started.elapsed() >= Duration::from_millis(timeout_ms) {
-                child.kill().map_err(|error| error.to_string())?;
-                child
-                    .wait_with_output()
-                    .map_err(|error| error.to_string())?;
-                return Err(format!(
-                    "REPL execution exceeded timeout of {timeout_ms} ms"
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(10));
+    let timeout_ms = runtime::effective_bash_timeout_ms(input.timeout_ms);
+    let output = plugins::subprocess::run_bounded(
+        &mut process,
+        None,
+        Some(Duration::from_millis(timeout_ms)),
+        &|| cancel.is_cancelled(),
+    )
+    .map_err(|error| error.to_string())?;
+    match output.termination {
+        plugins::subprocess::Termination::TimedOut => {
+            return Err(format!(
+                "REPL execution exceeded timeout of {timeout_ms} ms; the process tree was terminated"
+            ));
         }
-    } else {
-        process
-            .spawn()
-            .map_err(|error| error.to_string())?
-            .wait_with_output()
-            .map_err(|error| error.to_string())?
-    };
+        plugins::subprocess::Termination::Cancelled => {
+            return Err(String::from(
+                "REPL execution was cancelled; the process tree was terminated",
+            ));
+        }
+        plugins::subprocess::Termination::Exited => {}
+    }
 
     Ok(ReplOutput {
         language: input.language,
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        exit_code: output.status.code().unwrap_or(1),
+        exit_code: output.exit_code().unwrap_or(1),
         duration_ms: started.elapsed().as_millis(),
     })
 }
@@ -6791,31 +6873,20 @@ fn iso8601_timestamp() -> String {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn execute_powershell(input: PowerShellInput) -> std::io::Result<runtime::BashCommandOutput> {
+fn execute_powershell(
+    input: PowerShellInput,
+    cancel: &CancellationToken,
+) -> std::io::Result<runtime::BashCommandOutput> {
     let _ = &input.description;
     if let Some(output) = workspace_test_branch_preflight(&input.command) {
         return Ok(output);
     }
-    let shell = detect_powershell_shell()?;
-    execute_shell_command(
-        shell,
+    powershell::execute(
         &input.command,
         input.timeout,
-        input.run_in_background,
+        input.run_in_background.unwrap_or(false),
+        cancel,
     )
-}
-
-fn detect_powershell_shell() -> std::io::Result<&'static str> {
-    if command_exists("pwsh") {
-        Ok("pwsh")
-    } else if command_exists("powershell") {
-        Ok("powershell")
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "PowerShell executable not found (expected `pwsh` or `powershell` in PATH)",
-        ))
-    }
 }
 
 fn command_exists(command: &str) -> bool {
@@ -6834,138 +6905,6 @@ fn command_exists(command: &str) -> bool {
             .status()
             .is_ok_and(|status| status.success())
     }
-}
-
-#[allow(clippy::too_many_lines)]
-fn execute_shell_command(
-    shell: &str,
-    command: &str,
-    timeout: Option<u64>,
-    run_in_background: Option<bool>,
-) -> std::io::Result<runtime::BashCommandOutput> {
-    if run_in_background.unwrap_or(false) {
-        let child = std::process::Command::new(shell)
-            .arg("-NoProfile")
-            .arg("-NonInteractive")
-            .arg("-Command")
-            .arg(command)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
-        return Ok(runtime::BashCommandOutput {
-            stdout: String::new(),
-            stderr: String::new(),
-            raw_output_path: None,
-            interrupted: false,
-            is_image: None,
-            background_task_id: Some(child.id().to_string()),
-            backgrounded_by_user: Some(true),
-            assistant_auto_backgrounded: Some(false),
-            dangerously_disable_sandbox: None,
-            return_code_interpretation: None,
-            no_output_expected: Some(true),
-            structured_content: None,
-            persisted_output_path: None,
-            persisted_output_size: None,
-            sandbox_status: None,
-        });
-    }
-
-    let mut process = std::process::Command::new(shell);
-    process
-        .arg("-NoProfile")
-        .arg("-NonInteractive")
-        .arg("-Command")
-        .arg(command);
-    process
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    if let Some(timeout_ms) = timeout {
-        let mut child = process.spawn()?;
-        let started = Instant::now();
-        loop {
-            if let Some(status) = child.try_wait()? {
-                let output = child.wait_with_output()?;
-                return Ok(runtime::BashCommandOutput {
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                    raw_output_path: None,
-                    interrupted: false,
-                    is_image: None,
-                    background_task_id: None,
-                    backgrounded_by_user: None,
-                    assistant_auto_backgrounded: None,
-                    dangerously_disable_sandbox: None,
-                    return_code_interpretation: status
-                        .code()
-                        .filter(|code| *code != 0)
-                        .map(|code| format!("exit_code:{code}")),
-                    no_output_expected: Some(output.stdout.is_empty() && output.stderr.is_empty()),
-                    structured_content: None,
-                    persisted_output_path: None,
-                    persisted_output_size: None,
-                    sandbox_status: None,
-                });
-            }
-            if started.elapsed() >= Duration::from_millis(timeout_ms) {
-                let _ = child.kill();
-                let output = child.wait_with_output()?;
-                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-                let stderr = if stderr.trim().is_empty() {
-                    format!("Command exceeded timeout of {timeout_ms} ms")
-                } else {
-                    format!(
-                        "{}
-Command exceeded timeout of {timeout_ms} ms",
-                        stderr.trim_end()
-                    )
-                };
-                return Ok(runtime::BashCommandOutput {
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr,
-                    raw_output_path: None,
-                    interrupted: true,
-                    is_image: None,
-                    background_task_id: None,
-                    backgrounded_by_user: None,
-                    assistant_auto_backgrounded: None,
-                    dangerously_disable_sandbox: None,
-                    return_code_interpretation: Some(String::from("timeout")),
-                    no_output_expected: Some(false),
-                    structured_content: None,
-                    persisted_output_path: None,
-                    persisted_output_size: None,
-                    sandbox_status: None,
-                });
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    let output = process.output()?;
-    Ok(runtime::BashCommandOutput {
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        raw_output_path: None,
-        interrupted: false,
-        is_image: None,
-        background_task_id: None,
-        backgrounded_by_user: None,
-        assistant_auto_backgrounded: None,
-        dangerously_disable_sandbox: None,
-        return_code_interpretation: output
-            .status
-            .code()
-            .filter(|code| *code != 0)
-            .map(|code| format!("exit_code:{code}")),
-        no_output_expected: Some(output.stdout.is_empty() && output.stderr.is_empty()),
-        structured_content: None,
-        persisted_output_path: None,
-        persisted_output_size: None,
-        sandbox_status: None,
-    })
 }
 
 fn resolve_cell_index(
@@ -7027,6 +6966,10 @@ fn parse_skill_description(contents: &str) -> Option<String> {
 
 pub mod lane_completion;
 pub mod pdf_extract;
+mod powershell;
+#[cfg(test)]
+mod safety_tests;
+mod web_fetch;
 
 #[cfg(test)]
 mod tests {
@@ -7912,6 +7855,8 @@ mod tests {
 
     #[test]
     fn web_fetch_returns_prompt_aware_summary() {
+        // The fixture server listens on loopback, which WebFetch blocks.
+        super::web_fetch::allow_loopback_on_this_thread();
         let server = TestServer::spawn(Arc::new(|request_line: &str| {
             assert!(request_line.starts_with("GET /page "));
             HttpResponse::html(
@@ -7952,6 +7897,7 @@ mod tests {
 
     #[test]
     fn web_fetch_supports_plain_text_and_rejects_invalid_url() {
+        super::web_fetch::allow_loopback_on_this_thread();
         let server = TestServer::spawn(Arc::new(|request_line: &str| {
             assert!(request_line.starts_with("GET /plain "));
             HttpResponse::text(200, "OK", "plain text response")
@@ -9739,6 +9685,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn file_tools_cover_read_write_and_edit_behaviors() {
         let _guard = env_lock()
             .lock()
@@ -9766,7 +9713,13 @@ mod tests {
         let write_update_output: serde_json::Value =
             serde_json::from_str(&write_update).expect("json");
         assert_eq!(write_update_output["type"], "update");
-        assert_eq!(write_update_output["originalFile"], "alpha\nbeta\nalpha\n");
+        // Writes return a compact summary instead of echoing the file.
+        assert!(write_update_output.get("originalFile").is_none());
+        assert!(write_update_output.get("content").is_none());
+        assert_eq!(write_update_output["lines"], 3);
+        assert!(write_update_output["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.starts_with("Overwrote")));
 
         let read_full = execute_tool("read_file", &json!({ "path": "nested/demo.txt" }))
             .expect("read full should succeed");
@@ -10013,21 +9966,41 @@ mod tests {
         let get_output: serde_json::Value = serde_json::from_str(&get).expect("json");
         assert_eq!(get_output["value"], false);
 
-        let set = execute_tool(
-            "Config",
-            &json!({"setting": "permissions.defaultMode", "value": "plan"}),
-        )
-        .expect("set config");
+        let set = execute_tool("Config", &json!({"setting": "model", "value": "sonnet"}))
+            .expect("set config");
         let set_output: serde_json::Value = serde_json::from_str(&set).expect("json");
         assert_eq!(set_output["operation"], "set");
-        assert_eq!(set_output["newValue"], "plan");
+        assert_eq!(set_output["newValue"], "sonnet");
 
         let invalid = execute_tool(
             "Config",
-            &json!({"setting": "permissions.defaultMode", "value": "bogus"}),
+            &json!({"setting": "editorMode", "value": "bogus"}),
         )
         .expect_err("invalid config value should error");
         assert!(invalid.contains("Invalid value"));
+
+        // Permission and hook settings are the user's: the model may read
+        // them but never change them.
+        for (setting, value) in [
+            ("permissions.defaultMode", json!("dontAsk")),
+            ("permissions.allow", json!("bash")),
+            ("hooks", json!("echo pwned")),
+            ("hooks.PreToolUse", json!("curl https://evil.example")),
+        ] {
+            let rejected = execute_tool("Config", &json!({"setting": setting, "value": value}))
+                .expect_err("protected setting must be rejected");
+            assert!(
+                rejected.contains("cannot change") && rejected.contains("only the user"),
+                "{setting}: {rejected}"
+            );
+        }
+        let settings_file = cwd.join(".neuron").join("settings.local.json");
+        let written = std::fs::read_to_string(&settings_file).unwrap_or_default();
+        assert!(!written.contains("dontAsk"), "{written}");
+        let read_back = execute_tool("Config", &json!({"setting": "permissions.defaultMode"}))
+            .expect("reading permissions.defaultMode stays allowed");
+        let read_back: serde_json::Value = serde_json::from_str(&read_back).expect("json");
+        assert_eq!(read_back["operation"], "get");
 
         let unknown =
             execute_tool("Config", &json!({"setting": "nope"})).expect("unknown setting result");
@@ -10263,7 +10236,7 @@ mod tests {
         std::fs::write(
             &script,
             r#"#!/bin/sh
-while [ "$1" != "-Command" ] && [ $# -gt 0 ]; do shift; done
+while [ "$1" != "-EncodedCommand" ] && [ $# -gt 0 ]; do shift; done
 shift
 printf 'pwsh:%s' "$1"
 "#,
@@ -10293,7 +10266,14 @@ printf 'pwsh:%s' "$1"
         let _ = std::fs::remove_dir_all(dir);
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
-        assert_eq!(output["stdout"], "pwsh:Write-Output hello");
+        // The command travels base64-encoded, so quoting cannot mangle it.
+        assert_eq!(
+            output["stdout"],
+            format!(
+                "pwsh:{}",
+                super::powershell::encode_command("Write-Output hello")
+            )
+        );
         assert_eq!(output["stderr"].as_str().expect("stderr"), "");
 
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
