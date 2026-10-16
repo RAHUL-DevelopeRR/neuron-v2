@@ -791,7 +791,6 @@ fn stored_login_wins_over_ambient_openai_key_unless_provider_is_explicit() {
 }
 
 #[test]
-#[ignore = "needs runtime/src/config_validate.rs to accept the top-level \"provider\" key (cross-package request); every strict ConfigLoader::load rejects it today"]
 fn settings_provider_selects_the_provider_and_typos_name_the_file() {
     let gateway = gateway_with_chat(|_, _| text_reply("answered"));
     let workspace = Workspace::new("settings-provider");
@@ -839,6 +838,59 @@ fn settings_provider_selects_the_provider_and_typos_name_the_file() {
     assert!(errors.contains("expected one of zero-x|openai"), "{errors}");
     assert!(!errors.contains("Provider: Zero-X"), "{errors}");
     assert_eq!(gateway.count("POST", "/v1/chat/completions"), chats_before);
+}
+
+#[test]
+fn settings_max_iterations_caps_the_model_calls_of_a_turn() {
+    // The model asks for a tool on every call, so only the cap ends the turn.
+    let gateway = gateway_with_chat(|_, index| {
+        Reply::sse(&[
+            serde_json::json!({"id":"loop","model":"auto","choices":[{"delta":{"tool_calls":[{"index":0,"id":format!("call_{index}"),"function":{"name":"read_file","arguments":"{\"path\":\"fixture.txt\"}"}}]}}]}),
+            serde_json::json!({"id":"loop","choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+        ])
+    });
+    let workspace = Workspace::new("settings-max-iterations");
+    fs::write(
+        workspace.root.join("fixture.txt"),
+        "loop fixture
+",
+    )
+    .unwrap();
+    fs::write(
+        workspace.root.join("config/settings.json"),
+        r#"{"defaultMcpServers":false,"maxIterations":3}"#,
+    )
+    .unwrap();
+
+    let mut command = workspace.command(&gateway);
+    command
+        .env("NEURON_TOKEN", SESSION_TOKEN)
+        .args(prompt_args("keep reading"));
+    let output = run(command, None);
+
+    let errors = stderr(&output);
+    assert!(!output.status.success(), "{errors}");
+    assert!(
+        errors.contains("maximum number of iterations (3)"),
+        "{errors}"
+    );
+    assert!(!errors.contains("unknown key"), "{errors}");
+    assert_eq!(gateway.count("POST", "/v1/chat/completions"), 3);
+
+    // The environment variable still overrides the setting.
+    let mut command = workspace.command(&gateway);
+    command
+        .env("NEURON_TOKEN", SESSION_TOKEN)
+        .env("NEURON_MAX_ITERATIONS", "2")
+        .args(prompt_args("keep reading"));
+    let output = run(command, None);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("maximum number of iterations (2)"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(gateway.count("POST", "/v1/chat/completions"), 5);
 }
 
 #[test]

@@ -209,6 +209,14 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "disabledMcpServers",
         expected: FieldType::StringArray,
     },
+    FieldSpec {
+        name: "provider",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "maxIterations",
+        expected: FieldType::Number,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[
@@ -760,6 +768,28 @@ mod tests {
         // then
         assert!(result.is_ok());
         assert_eq!(result.warnings.len(), 0);
+    }
+
+    #[test]
+    fn accepts_provider_and_max_iterations_and_type_checks_them() {
+        let source = r#"{"provider": "openai", "maxIterations": 12}"#;
+        let parsed = JsonValue::parse(source).expect("valid json");
+        let object = parsed.as_object().expect("object");
+        let result = validate_config_file(object, source, &test_path());
+        assert!(result.is_ok(), "{:?}", result.errors);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+
+        let source = r#"{"provider": 7, "maxIterations": "12"}"#;
+        let parsed = JsonValue::parse(source).expect("valid json");
+        let object = parsed.as_object().expect("object");
+        let result = validate_config_file(object, source, &test_path());
+        let mut fields = result
+            .errors
+            .iter()
+            .map(|diagnostic| diagnostic.field.as_str())
+            .collect::<Vec<_>>();
+        fields.sort_unstable();
+        assert_eq!(fields, vec!["maxIterations", "provider"]);
     }
 
     #[test]

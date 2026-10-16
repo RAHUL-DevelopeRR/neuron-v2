@@ -535,7 +535,7 @@ where
                 let error = RuntimeError::with_kind(
                     RuntimeErrorKind::MaxIterations,
                     format!(
-                        "conversation loop exceeded the maximum number of iterations ({}); stopping this turn. Raise the limit with the {MAX_ITERATIONS_ENV_VAR} environment variable (for example {MAX_ITERATIONS_ENV_VAR}=100).",
+                        "conversation loop exceeded the maximum number of iterations ({}); stopping this turn. Raise the limit with the {MAX_ITERATIONS_ENV_VAR} environment variable (for example {MAX_ITERATIONS_ENV_VAR}=100) or the \"maxIterations\" setting.",
                         self.max_iterations
                     ),
                 );
@@ -1151,9 +1151,7 @@ fn session_error(error: crate::session::SessionError) -> RuntimeError {
 /// configured value, which wins over [`DEFAULT_MAX_ITERATIONS`].
 /// Non-positive or unparsable values are ignored.
 ///
-/// The CLI passes the `maxIterations` settings key as `configured`. Settings
-/// validation does not accept that key yet, so until it does the environment
-/// variable is the only documented way to change the cap.
+/// The CLI passes the `maxIterations` settings key as `configured`.
 #[must_use]
 pub fn resolve_max_iterations(configured: Option<usize>) -> usize {
     parse_max_iterations(
@@ -2865,10 +2863,9 @@ mod resilience_tests {
 
         assert_eq!(error.kind(), RuntimeErrorKind::MaxIterations);
         assert!(error.to_string().contains("(5)"));
-        // Only advertise knobs that work: settings validation does not
-        // accept `maxIterations` yet.
+        // Both knobs that change the cap are named.
         assert!(error.to_string().contains(MAX_ITERATIONS_ENV_VAR));
-        assert!(!error.to_string().contains("maxIterations"));
+        assert!(error.to_string().contains("\"maxIterations\" setting"));
         assert_eq!(runtime.api_client().calls, 5);
         assert_eq!(
             unanswered_tool_use_ids(&runtime.session().messages),
