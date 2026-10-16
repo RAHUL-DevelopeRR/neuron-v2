@@ -120,6 +120,11 @@ call by what it actually does, and sends far smaller requests.
   `--help` lists `--provider` and `--reasoning-effort`.
 - Azure turns were counted twice against the local daily quota.
 - `/plan off` restores the previous permission mode.
+- Requests to the Zero-X gateway no longer carry the non-standard `is_error` field on
+  tool results, which made Groq reject every request after the first tool call.
+- Code in the terminal keeps its punctuation (`[...values]` was shown as `[…values]`).
+- `/login`, `/logout`, `/usage`, `/upgrade`, `/plan` and `/exit` appear in `/help` and
+  completion, and `neuron --resume latest /usage` prints the account report.
 
 ### Installation and packaging
 
