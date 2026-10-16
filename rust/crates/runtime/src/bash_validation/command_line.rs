@@ -9,6 +9,7 @@
 //! (substitutions, `%VAR%` expansion in `cmd.exe`, script blocks in
 //! `PowerShell`) requires escalation.
 
+use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
 use crate::permissions::PermissionMode;
@@ -1196,8 +1197,11 @@ fn classify_program(
     let name = name.as_str();
     let echo_like = matches!(name, "echo" | "printf" | "test" | "[" | "[[");
 
-    let check_args = |context: &Context<'_>| -> Result<(), String> {
-        for arg in args {
+    // Checks the arguments for expansions and paths outside the workspace.
+    // The arguments at `code` (sed scripts, awk programs) are code rather
+    // than file names, so only the expansion check applies to them.
+    let check_args_except = |context: &Context<'_>, code: &[usize]| -> Result<(), String> {
+        for (index, arg) in args.iter().enumerate() {
             if arg.expanded {
                 if echo_like {
                     continue;
@@ -1206,6 +1210,9 @@ fn classify_program(
                     "argument `{}` uses a variable expansion whose value is unknown",
                     arg.text
                 ));
+            }
+            if code.contains(&index) {
+                continue;
             }
             if let Some(problem) = path_problem(&arg.text, false, context) {
                 return Err(problem);
@@ -1220,6 +1227,7 @@ fn classify_program(
         }
         Ok(())
     };
+    let check_args = |context: &Context<'_>| check_args_except(context, &[]);
 
     if name == "file"
         && args
@@ -1243,14 +1251,8 @@ fn classify_program(
     match name {
         "cd" | "chdir" => {
             check_args(context)?;
-            if let Some(target) = args.iter().find(|arg| !arg.text.starts_with('-')) {
-                let mut next_bases = Vec::new();
-                for base in &context.bases {
-                    next_bases.push(normalize_lexically(&base.join(&target.text)));
-                }
-                context.bases.extend(next_bases);
-            }
-            Ok(())
+            let cdpath = std::env::var_os("CDPATH");
+            track_cd(args, context, cdpath.as_deref())
         }
         "date" | "time" => {
             check_args(context)?;
@@ -1279,8 +1281,14 @@ fn classify_program(
             }
         }
         "sed" | "gsed" => {
-            check_args(context)?;
-            check_sed_args(args)
+            let scripts = check_sed_args(args)?;
+            check_args_except(context, &scripts.script_args)?;
+            // Files read by the scripts' `r`/`R` commands.
+            scripts
+                .read_files
+                .iter()
+                .find_map(|file| path_problem(file, false, context))
+                .map_or(Ok(()), Err)
         }
         "sort" => {
             check_args(context)?;
@@ -1332,8 +1340,8 @@ fn classify_program(
             }
         }
         "awk" | "gawk" | "mawk" | "nawk" => {
-            check_args(context)?;
-            check_awk_args(args)
+            let programs = check_awk_args(args)?;
+            check_args_except(context, &programs)
         }
         "hostname" => {
             // With a name (or -F/-b) `hostname` sets the host name.
@@ -1378,69 +1386,277 @@ fn classify_program(
     }
 }
 
-fn check_sed_args(args: &[Word]) -> Result<(), String> {
-    let mut scripts = Vec::new();
-    let mut explicit_script = false;
-    let mut iter = args.iter().peekable();
-    let mut positional_seen = false;
-    while let Some(arg) = iter.next() {
-        let text = arg.text.as_str();
-        if text == "--in-place" || text.starts_with("--in-place=") {
-            return Err("`sed --in-place` edits files".to_string());
+/// Follows a `cd` so that later relative paths in the line are also checked
+/// from its destination. A `cd` whose destination is not spelled out in the
+/// command escalates: in POSIX shells `cd`, `cd --` and `cd -P` go to `$HOME`
+/// and `cd -` to `$OLDPWD`, and a relative directory can be found through
+/// `CDPATH` (`cdpath`, the variable's value) instead of the current one.
+fn track_cd(
+    args: &[Word],
+    context: &mut Context<'_>,
+    cdpath: Option<&OsStr>,
+) -> Result<(), String> {
+    let target = if context.dialect == ShellDialect::Cmd {
+        // cmd.exe switches start with `/` (`cd /d D:\src`); without a
+        // directory `cd` only prints the current one.
+        match args.iter().find(|arg| !arg.text.starts_with('/')) {
+            Some(target) => target.text.as_str(),
+            None => return Ok(()),
         }
-        if text == "-f" || text == "--file" || text.starts_with("--file=") {
-            return Err("`sed -f` runs a script that cannot be inspected".to_string());
-        }
-        if text == "-e" || text == "--expression" {
-            if let Some(script) = iter.next() {
-                scripts.push(script.text.clone());
+    } else {
+        let mut options_done = false;
+        let mut target = None;
+        for arg in args {
+            let text = arg.text.as_str();
+            if !options_done && text == "--" {
+                options_done = true;
+            } else if options_done || text == "-" || !text.starts_with('-') {
+                target = Some(text);
+                break;
             }
-            explicit_script = true;
-            continue;
         }
-        if let Some(script) = text.strip_prefix("--expression=") {
-            scripts.push(script.to_string());
-            explicit_script = true;
-            continue;
+        let Some(target) = target else {
+            return Err(
+                "`cd` without a directory changes to the home directory, outside the workspace"
+                    .to_string(),
+            );
+        };
+        if cdpath_may_redirect(target, cdpath) {
+            return Err(format!(
+                "`cd {target}` may follow CDPATH to a directory outside the workspace"
+            ));
         }
-        if text.starts_with("--") {
-            continue;
-        }
-        if text.starts_with('-') && text.len() > 1 {
-            let flags = &text[1..];
-            if flags.contains('i') {
-                return Err("`sed -i` edits files in place".to_string());
-            }
-            if flags.contains('f') {
-                return Err("`sed -f` runs a script that cannot be inspected".to_string());
-            }
-            if let Some(position) = flags.find('e') {
-                let rest = &flags[position + 1..];
-                if rest.is_empty() {
-                    if let Some(script) = iter.next() {
-                        scripts.push(script.text.clone());
-                    }
-                } else {
-                    scripts.push(rest.to_string());
-                }
-                explicit_script = true;
-            }
-            continue;
-        }
-        if !explicit_script && !positional_seen {
-            scripts.push(text.to_string());
-        }
-        positional_seen = true;
+        target
+    };
+    if target == "-" {
+        return Err(
+            "`cd -` returns to the previous directory, which may be outside the workspace"
+                .to_string(),
+        );
     }
-    for script in &scripts {
-        sed_script_is_read_only(script)?;
-    }
+    add_cd_bases(context, target);
     Ok(())
 }
 
+fn add_cd_bases(context: &mut Context<'_>, target: &str) {
+    let next_bases: Vec<PathBuf> = context
+        .bases
+        .iter()
+        .map(|base| normalize_lexically(&base.join(target)))
+        .collect();
+    context.bases.extend(next_bases);
+}
+
+/// Whether a POSIX `cd target` searches `CDPATH`: it does for a relative
+/// directory whose first component is neither `.` nor `..` when the
+/// variable is set and not empty.
+fn cdpath_may_redirect(target: &str, cdpath: Option<&OsStr>) -> bool {
+    let first_component = target.split('/').next().unwrap_or_default();
+    cdpath.is_some_and(|value| !value.is_empty())
+        && !target.is_empty()
+        && !target.starts_with('/')
+        && !matches!(first_component, "." | "..")
+}
+
+/// GNU sed's long options. `getopt_long` accepts any unambiguous prefix
+/// (`--exp` for `--expression`), so options are resolved against this list.
+const SED_LONG_OPTIONS: &[&str] = &[
+    "binary",
+    "debug",
+    "expression",
+    "file",
+    "follow-symlinks",
+    "help",
+    "in-place",
+    "line-length",
+    "null-data",
+    "posix",
+    "quiet",
+    "regexp-extended",
+    "sandbox",
+    "separate",
+    "silent",
+    "unbuffered",
+    "version",
+    "zero-terminated",
+];
+
+/// sed short options that take no value and neither write files nor run
+/// commands (`-a` is BSD's "delay opening `w` files", whose `w` commands are
+/// rejected anyway).
+const SED_SAFE_SHORT_FLAGS: &[char] = &['n', 'r', 'E', 's', 'u', 'z', 'b', 'a'];
+
+const SED_IN_PLACE: &str = "`sed -i`/`--in-place` edits files in place";
+const SED_SCRIPT_FILE: &str = "`sed -f`/`--file` runs a script that cannot be inspected";
+
+/// Whether `value` is a plain line length for `sed -l N`.
+fn is_sed_line_length(value: &str) -> bool {
+    !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit())
+}
+
+/// What [`check_sed_args`] found in a read-only sed invocation.
+struct SedScripts {
+    /// Positions of the arguments that carry scripts (code, not file names).
+    script_args: Vec<usize>,
+    /// Files the scripts read with `r`/`R`, to be checked like paths.
+    read_files: Vec<String>,
+}
+
+/// Collects every sed script in `args` and checks that each one is
+/// read-only. Options are parsed the way GNU and BSD sed parse them
+/// (abbreviated long options, short-option clusters, attached or detached
+/// values, `--`); any option that is not known to be harmless escalates.
+#[allow(clippy::too_many_lines)]
+fn check_sed_args(args: &[Word]) -> Result<SedScripts, String> {
+    // Scripts given with -e/--expression: (position of the argument carrying
+    // the script, script text).
+    let mut scripts: Vec<(usize, String)> = Vec::new();
+    let mut explicit_script = false;
+    let mut first_operand = None;
+    let mut options_done = false;
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        let position = index;
+        index += 1;
+        let text = arg.text.as_str();
+        let is_option = !options_done && text.len() > 1 && text.starts_with('-');
+        if !is_option {
+            first_operand.get_or_insert(position);
+            continue;
+        }
+        if text == "--" {
+            options_done = true;
+            continue;
+        }
+        if let Some(long) = text.strip_prefix("--") {
+            let (name, value) = long
+                .split_once('=')
+                .map_or((long, None), |(name, value)| (name, Some(value)));
+            let candidates: Vec<&str> = if SED_LONG_OPTIONS.contains(&name) {
+                vec![name]
+            } else {
+                SED_LONG_OPTIONS
+                    .iter()
+                    .copied()
+                    .filter(|option| option.starts_with(name))
+                    .collect()
+            };
+            if candidates.contains(&"in-place") {
+                return Err(SED_IN_PLACE.to_string());
+            }
+            if candidates.contains(&"file") {
+                return Err(SED_SCRIPT_FILE.to_string());
+            }
+            match candidates.as_slice() {
+                [] => return Err(format!("sed option `{text}` is not known to be read-only")),
+                ["expression"] => {
+                    if let Some(value) = value {
+                        scripts.push((position, value.to_string()));
+                    } else if let Some(word) = args.get(index) {
+                        scripts.push((index, word.text.clone()));
+                        index += 1;
+                    }
+                    explicit_script = true;
+                }
+                ["line-length"] => {
+                    let length = value.or_else(|| {
+                        index += 1;
+                        args.get(index - 1).map(|word| word.text.as_str())
+                    });
+                    if !length.is_some_and(is_sed_line_length) {
+                        return Err("`sed --line-length` expects a number".to_string());
+                    }
+                }
+                _ if candidates.contains(&"expression") || candidates.contains(&"line-length") => {
+                    return Err(format!("sed option `{text}` is ambiguous"));
+                }
+                _ => {}
+            }
+            continue;
+        }
+        let cluster = &text[1..];
+        for (offset, flag) in cluster.char_indices() {
+            let rest = &cluster[offset + flag.len_utf8()..];
+            match flag {
+                flag if SED_SAFE_SHORT_FLAGS.contains(&flag) => {}
+                // The rest of the cluster, or else the next word, is a script.
+                'e' => {
+                    if !rest.is_empty() {
+                        scripts.push((position, rest.to_string()));
+                    } else if let Some(word) = args.get(index) {
+                        scripts.push((index, word.text.clone()));
+                        index += 1;
+                    }
+                    explicit_script = true;
+                    break;
+                }
+                // GNU `-l N` sets the line length; the value must be a number
+                // so that the following word is not mistaken for the script.
+                'l' => {
+                    let length = if rest.is_empty() {
+                        index += 1;
+                        args.get(index - 1).map(|word| word.text.as_str())
+                    } else {
+                        Some(rest)
+                    };
+                    if !length.is_some_and(is_sed_line_length) {
+                        return Err("`sed -l` expects a number".to_string());
+                    }
+                    break;
+                }
+                // GNU `-i[SUFFIX]`, BSD `-i SUFFIX` and `-I SUFFIX`.
+                'i' | 'I' => return Err(SED_IN_PLACE.to_string()),
+                'f' => return Err(SED_SCRIPT_FILE.to_string()),
+                other => {
+                    return Err(format!(
+                        "sed option `-{other}` is not known to be read-only"
+                    ))
+                }
+            }
+        }
+    }
+    // GNU sed permutes its arguments; BSD sed stops parsing options at the
+    // first operand, after which every word is a file. Words whose role
+    // differs between the two are checked both as scripts and as paths, so
+    // only scripts given before the first operand are exempt from the path
+    // checks.
+    let before_operands = |position: usize| first_operand.is_none_or(|first| position < first);
+    let mut found = SedScripts {
+        script_args: scripts
+            .iter()
+            .map(|(position, _)| *position)
+            .filter(|position| before_operands(*position))
+            .collect(),
+        read_files: Vec::new(),
+    };
+    if let Some(first) = first_operand {
+        // Without -e/--expression the first operand is the script; after an
+        // -e it is a file; with an -e only later it may be either.
+        if !scripts.iter().any(|(position, _)| *position < first) {
+            scripts.push((first, args[first].text.clone()));
+            if !explicit_script {
+                found.script_args.push(first);
+            }
+        }
+    }
+    for (position, script) in scripts {
+        if args[position].expanded {
+            return Err(format!(
+                "sed script `{}` uses a variable expansion whose value is unknown",
+                args[position].text
+            ));
+        }
+        found.read_files.extend(sed_script_is_read_only(&script)?);
+    }
+    Ok(found)
+}
+
 /// Parses a sed script and rejects commands that write files (`w`, `W`, the
-/// `w` flag of `s`) or execute commands (`e`, the `e` flag of `s`).
-fn sed_script_is_read_only(script: &str) -> Result<(), String> {
+/// `w` flag of `s`) or execute commands (`e`, the `e` flag of `s`). Returns
+/// the files the script reads with `r`/`R`, whose names run to the end of
+/// the line.
+fn sed_script_is_read_only(script: &str) -> Result<Vec<String>, String> {
+    let mut read_files = Vec::new();
     let chars: Vec<char> = script.chars().collect();
     let mut index = 0;
     let unsafe_command = |command: char| {
@@ -1493,16 +1709,21 @@ fn sed_script_is_read_only(script: &str) -> Result<(), String> {
                     index += 1;
                 }
             }
-            ':' | 'b' | 't' | 'T' | 'r' | 'R' | 'v' => {
-                // Label or (read-only) file name runs to the end of the command.
+            ':' | 'b' | 't' | 'T' | 'v' => {
+                // A label runs to the end of the command.
                 while index < chars.len() && !matches!(chars[index], ';' | '\n') {
                     index += 1;
                 }
             }
-            'a' | 'i' | 'c' => {
-                // Text runs to the end of the line.
+            'r' | 'R' | 'a' | 'i' | 'c' => {
+                // Text, or the name of the file to read, runs to the end of
+                // the line (`;` included).
+                let start = index;
                 while index < chars.len() && chars[index] != '\n' {
                     index += 1;
+                }
+                if matches!(command, 'r' | 'R') {
+                    read_files.push(sed_read_file(command, &chars[start..index])?);
                 }
             }
             's' => {
@@ -1535,7 +1756,22 @@ fn sed_script_is_read_only(script: &str) -> Result<(), String> {
             }
         }
     }
-    Ok(())
+    Ok(read_files)
+}
+
+/// The file read by a sed `r`/`R` command whose argument (up to the end of
+/// the line) is `argument`. A name containing `;` is refused: sed reads it
+/// as part of the name, but a reader that stops there would check another
+/// file than the one sed opens.
+fn sed_read_file(command: char, argument: &[char]) -> Result<String, String> {
+    let file: String = argument.iter().collect();
+    let file = file.trim_start();
+    if file.contains(';') {
+        return Err(format!(
+            "sed `{command}` file name `{file}` contains `;`, which sed implementations read differently"
+        ));
+    }
+    Ok(file.to_string())
 }
 
 /// Returns the index just past the next unescaped `delimiter`.
@@ -1553,10 +1789,46 @@ fn skip_delimited(chars: &[char], mut index: usize, delimiter: char) -> usize {
     index
 }
 
+/// gawk's long options (other awks accept a subset). `getopt_long` accepts
+/// any unambiguous prefix, so options are resolved against this list.
+const AWK_LONG_OPTIONS: &[&str] = &[
+    "assign",
+    "bignum",
+    "characters-as-bytes",
+    "copyright",
+    "csv",
+    "debug",
+    "dump-variables",
+    "exec",
+    "field-separator",
+    "file",
+    "gen-pot",
+    "help",
+    "include",
+    "lint",
+    "lint-old",
+    "load",
+    "locale",
+    "non-decimal-data",
+    "no-optimize",
+    "optimize",
+    "parsedebug",
+    "persist",
+    "posix",
+    "pretty-print",
+    "profile",
+    "re-interval",
+    "sandbox",
+    "source",
+    "traditional",
+    "use-lc-numeric",
+    "version",
+];
+
 /// Long awk options that load program code, libraries or extensions from
 /// files, or write files (`gawk -i inplace` rewrites its inputs; profiles,
-/// pretty-printed programs and variable dumps go to files). getopt accepts
-/// unambiguous abbreviations, so prefixes of these names are refused too.
+/// pretty-printed programs, variable dumps and persistent memory go to
+/// files), or whose value handling is not modelled (`--locale`).
 const AWK_UNSAFE_LONG_OPTIONS: &[&str] = &[
     "file",
     "include",
@@ -1566,74 +1838,137 @@ const AWK_UNSAFE_LONG_OPTIONS: &[&str] = &[
     "profile",
     "dump-variables",
     "debug",
+    "persist",
+    "locale",
 ];
 
 /// Short awk options with the same effects as [`AWK_UNSAFE_LONG_OPTIONS`]
 /// (`-W` passes implementation options such as `-W exec=FILE`).
-const AWK_UNSAFE_SHORT_OPTIONS: &[char] = &['f', 'i', 'l', 'E', 'o', 'p', 'd', 'D', 'W'];
+const AWK_UNSAFE_SHORT_OPTIONS: &[char] = &['f', 'i', 'l', 'E', 'o', 'p', 'd', 'D', 'W', 'T', 'Z'];
+
+/// Short awk options that take no value and change only how input is read
+/// or how the program is interpreted.
+const AWK_SAFE_SHORT_FLAGS: &[char] = &[
+    'b', 'c', 'C', 'g', 'h', 'k', 'M', 'n', 'N', 'O', 'P', 'r', 's', 'S', 't', 'V',
+];
 
 fn check_awk_program(program: &str) -> Result<(), String> {
-    match AWK_UNSAFE.iter().find(|token| program.contains(*token)) {
-        Some(token) => Err(format!(
+    if let Some(token) = AWK_UNSAFE.iter().find(|token| program.contains(*token)) {
+        return Err(format!(
             "awk program uses `{token}`, which can run commands or write files"
-        )),
-        None => Ok(()),
+        ));
     }
+    if program.contains("ARGV") {
+        return Err(
+            "awk program uses `ARGV`, which can make it read files not named on the command line"
+                .to_string(),
+        );
+    }
+    if let Some(directive) = awk_at_directive(program) {
+        return Err(format!(
+            "awk program uses `{directive}`, which loads code from a file or extension or calls a function by a computed name"
+        ));
+    }
+    Ok(())
 }
 
-fn check_awk_args(args: &[Word]) -> Result<(), String> {
+/// The first gawk `@` construct in `program`: the `@include`, `@load` and
+/// `@namespace` directives, or an indirect call `@name(...)`, whose callee
+/// (which may be a built-in such as `system`) is chosen at run time. Any `@`
+/// followed by an identifier counts, so text such as `/user@host/` is
+/// refused too; that only costs a prompt.
+fn awk_at_directive(program: &str) -> Option<String> {
+    program.match_indices('@').find_map(|(position, _)| {
+        let after = program[position + 1..].trim_start();
+        let name: String = after
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+            .collect();
+        name.starts_with(|ch: char| ch.is_ascii_alphabetic() || ch == '_')
+            .then(|| format!("@{name}"))
+    })
+}
+
+/// Checks the options and program text of an awk invocation and returns the
+/// positions of the arguments that carry program text (code, not file
+/// names). Options are parsed the way gawk parses them (abbreviated long
+/// options, short-option clusters, attached or detached values, `--`); any
+/// option that is not known to be harmless escalates.
+#[allow(clippy::too_many_lines)]
+fn check_awk_args(args: &[Word]) -> Result<Vec<usize>, String> {
     let unsafe_option = |option: &str| {
         Err(format!(
             "`awk {option}` loads code from a file or writes files, which cannot be inspected"
         ))
     };
-    let mut program_seen = false;
+    // Programs given with -e/--source: (position of the argument carrying
+    // the program, program text).
+    let mut programs: Vec<(usize, &str)> = Vec::new();
+    let mut program_given = false;
+    let mut first_operand = None;
     let mut index = 0;
     while let Some(arg) = args.get(index) {
+        let position = index;
         index += 1;
         let text = arg.text.as_str();
         if text == "--" {
-            if !program_seen {
-                if let Some(program) = args.get(index) {
-                    check_awk_program(&program.text)?;
-                }
+            if index < args.len() {
+                first_operand.get_or_insert(index);
             }
-            return Ok(());
+            break;
         }
         if let Some(long) = text.strip_prefix("--") {
             let (name, value) = long
                 .split_once('=')
                 .map_or((long, None), |(name, value)| (name, Some(value)));
-            match name {
-                "source" => {
-                    program_seen = true;
-                    let program = if let Some(value) = value {
-                        value
-                    } else {
+            let candidates: Vec<&str> = if AWK_LONG_OPTIONS.contains(&name) {
+                vec![name]
+            } else {
+                AWK_LONG_OPTIONS
+                    .iter()
+                    .copied()
+                    .filter(|option| option.starts_with(name))
+                    .collect()
+            };
+            if candidates
+                .iter()
+                .any(|candidate| AWK_UNSAFE_LONG_OPTIONS.contains(candidate))
+            {
+                return unsafe_option(text);
+            }
+            match candidates.as_slice() {
+                [] => return Err(format!("awk option `{text}` is not known to be read-only")),
+                ["source"] => {
+                    program_given = true;
+                    if let Some(value) = value {
+                        programs.push((position, value));
+                    } else if let Some(word) = args.get(index) {
+                        programs.push((index, word.text.as_str()));
                         index += 1;
-                        args.get(index - 1).map_or("", |word| word.text.as_str())
-                    };
-                    check_awk_program(program)?;
+                    }
                 }
-                "assign" | "field-separator" => {
+                ["assign" | "field-separator"] => {
                     if value.is_none() {
                         index += 1;
                     }
                 }
-                _ if AWK_UNSAFE_LONG_OPTIONS
-                    .iter()
-                    .any(|unsafe_name| !name.is_empty() && unsafe_name.starts_with(name)) =>
+                _ if candidates.iter().any(|candidate| {
+                    matches!(*candidate, "source" | "assign" | "field-separator")
+                }) =>
                 {
-                    return unsafe_option(text);
+                    return Err(format!("awk option `{text}` is ambiguous"));
                 }
                 _ => {}
             }
             continue;
         }
         if let Some(cluster) = text.strip_prefix('-').filter(|cluster| !cluster.is_empty()) {
-            for (position, flag) in cluster.char_indices() {
-                let rest = &cluster[position + flag.len_utf8()..];
+            for (offset, flag) in cluster.char_indices() {
+                let rest = &cluster[offset + flag.len_utf8()..];
                 match flag {
+                    flag if AWK_SAFE_SHORT_FLAGS.contains(&flag) => {}
+                    // `-L[value]`: an optional value attached to the flag.
+                    'L' => break,
                     // The rest of the cluster (or the next word) is the value.
                     'F' | 'v' => {
                         if rest.is_empty() {
@@ -1643,30 +1978,62 @@ fn check_awk_args(args: &[Word]) -> Result<(), String> {
                     }
                     // Program text given with -e is checked like the inline program.
                     'e' => {
-                        program_seen = true;
-                        let program = if rest.is_empty() {
+                        program_given = true;
+                        if !rest.is_empty() {
+                            programs.push((position, rest));
+                        } else if let Some(word) = args.get(index) {
+                            programs.push((index, word.text.as_str()));
                             index += 1;
-                            args.get(index - 1).map_or("", |word| word.text.as_str())
-                        } else {
-                            rest
-                        };
-                        check_awk_program(program)?;
+                        }
                         break;
                     }
                     flag if AWK_UNSAFE_SHORT_OPTIONS.contains(&flag) => {
                         return unsafe_option(text);
                     }
-                    _ => {}
+                    other => {
+                        return Err(format!(
+                            "awk option `-{other}` is not known to be read-only"
+                        ))
+                    }
                 }
             }
             continue;
         }
-        if !program_seen {
-            program_seen = true;
-            check_awk_program(text)?;
+        // Options after the first operand are still checked, since some
+        // awks permute their arguments.
+        first_operand.get_or_insert(position);
+    }
+    // gawk stops parsing options at the first operand, after which every
+    // word is an input file or assignment; awks that permute their arguments
+    // keep reading options. Words whose role differs between the two are
+    // checked both as programs and as paths, so only programs given before
+    // the first operand are exempt from the path checks.
+    let before_operands = |position: usize| first_operand.is_none_or(|first| position < first);
+    let mut positions: Vec<usize> = programs
+        .iter()
+        .map(|(position, _)| *position)
+        .filter(|position| before_operands(*position))
+        .collect();
+    if let Some(first) = first_operand {
+        // Without -e/--source the first operand is the program; after one it
+        // is an input file; with one only later it may be either.
+        if !programs.iter().any(|(position, _)| *position < first) {
+            programs.push((first, args[first].text.as_str()));
+            if !program_given {
+                positions.push(first);
+            }
         }
     }
-    Ok(())
+    for (position, program) in programs {
+        if args[position].expanded {
+            return Err(format!(
+                "awk program `{}` uses a variable expansion whose value is unknown",
+                args[position].text
+            ));
+        }
+        check_awk_program(program)?;
+    }
+    Ok(positions)
 }
 
 fn classify_xargs(args: &[Word], context: &mut Context<'_>) -> Result<(), String> {
@@ -1981,6 +2348,9 @@ fn classify_powershell_program(
         }
         return Ok(());
     }
+    if matches!(name.as_str(), "cd" | "chdir" | "sl" | "set-location") {
+        return track_powershell_cd(args, context);
+    }
     // Native programs run from PowerShell follow the shared rules (cmd-style
     // option and path handling).
     let mut native = Context {
@@ -1990,6 +2360,54 @@ fn classify_powershell_program(
         bases: context.bases.clone(),
     };
     classify_program(program, args, &mut native).map_err(|reason| format!("{reason} (PowerShell)"))
+}
+
+/// `Set-Location` (`cd`, `chdir`, `sl`) in `PowerShell`: the destination is
+/// checked like any path and followed for later relative paths. Without a
+/// destination `PowerShell` 7 goes to the home directory, and `cd -`/`cd +`
+/// move through the location history, so those escalate.
+fn track_powershell_cd(args: &[Word], context: &mut Context<'_>) -> Result<(), String> {
+    let mut target = None;
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        index += 1;
+        if arg.expanded {
+            return Err(format!(
+                "`cd {}` uses a variable whose value is unknown",
+                arg.text
+            ));
+        }
+        let lowered = arg.text.to_ascii_lowercase();
+        match lowered.as_str() {
+            "-" | "+" => {
+                return Err(format!(
+                    "`cd {}` moves through the location history, which may leave the workspace",
+                    arg.text
+                ))
+            }
+            "-path" | "-literalpath" => {
+                target = args.get(index).map(|word| word.text.as_str());
+                break;
+            }
+            "-stackname" => index += 1,
+            _ if lowered.starts_with('-') => {}
+            _ => {
+                target = Some(arg.text.as_str());
+                break;
+            }
+        }
+    }
+    let Some(target) = target else {
+        return Err(
+            "`cd` without a directory changes to the home directory, outside the workspace"
+                .to_string(),
+        );
+    };
+    if let Some(problem) = path_problem(target, false, context) {
+        return Err(problem);
+    }
+    add_cd_bases(context, target);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2107,10 +2525,11 @@ fn starts_with_normalized(path: &Path, root: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_powershell_command, classify_shell_command, path_is_within, render_prefix,
-        CommandClassification, ShellDialect,
+        cdpath_may_redirect, classify_powershell_command, classify_shell_command, path_is_within,
+        render_prefix, CommandClassification, ShellDialect,
     };
     use crate::permissions::PermissionMode;
+    use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
 
     fn workspace() -> PathBuf {
@@ -2272,7 +2691,7 @@ mod tests {
     }
 
     #[test]
-    fn option_spellings_that_load_code_or_write_files_escalate() {
+    fn awk_option_and_program_spellings_that_load_code_or_write_files_escalate() {
         // awk: program files, includes, extensions, output files and
         // program text passed through options.
         assert_escalates("gawk -i inplace '{ print }' notes.txt");
@@ -2292,6 +2711,90 @@ mod tests {
         assert_read_only("gawk -e '{ print $2 }' data.txt");
         assert_read_only("awk --posix '{ print }' data.txt");
 
+        // awk: gawk directives and indirect calls inside the program text.
+        assert_escalates("gawk '@include \"evil.awk\"' README.md");
+        assert_escalates("awk '@load \"rwarray\"; BEGIN{}'");
+        assert_escalates("awk '@load \"foo\"' f");
+        assert_escalates("gawk '@namespace \"x\"; { print }' f");
+        assert_escalates("gawk 'BEGIN { f = \"sys\" \"tem\"; @f(\"id\") }'");
+        assert_escalates("gawk -e '@ include \"evil.awk\"' f");
+        assert_read_only("awk '/[a-z]+@[a-z]+/ { print }' contacts.txt");
+
+        // awk: abbreviated long options, value-taking options and ARGV.
+        assert_escalates("gawk --sou='BEGIN { system(\"id\") }' f");
+        assert_escalates("gawk --sour 'BEGIN { system(\"id\") }' f");
+        assert_escalates("gawk --as x=1 'BEGIN { system(\"id\") }'");
+        assert_escalates("gawk -Lv 'BEGIN { system(\"id\") }'");
+        assert_escalates("gawk --inc=lib.awk '{ print }' f");
+        assert_escalates("gawk --pers '{ print }' f");
+        assert_escalates("awk -q '{ print }' f");
+        assert_escalates("awk --unknown '{ print }' f");
+        assert_escalates("awk '{ print }' notes.txt -f evil.awk");
+        assert_escalates("awk 'BEGIN { ARGV[ARGC++] = \"/etc/shadow\" } { print }'");
+        assert_escalates("awk \"$PROGRAM\" notes.txt");
+        assert_escalates("awk '/TODO/ { print }' /etc/passwd");
+        assert_read_only("gawk --lint --re-interval '{ print }' notes.txt");
+        assert_read_only("gawk --assign=x=1 --field-sep : '{ print x, $1 }' notes.txt");
+        assert_read_only("awk -- '{ print }' notes.txt");
+        assert_read_only("awk '/TODO/ { print FILENAME }' src/main.rs");
+        assert_escalates("gawk '{ print }' -e /etc/shadow");
+        assert_escalates("gawk '{ print }' --source=/etc/shadow");
+        assert_escalates("awk /etc/shadow -e '{ print }'");
+        assert_escalates("awk '{ print }' -F /etc/shadow");
+        assert_read_only("gawk -e '/TODO/ { print }' src/main.rs");
+    }
+
+    #[test]
+    fn sed_option_and_script_spellings_that_write_or_run_escalate() {
+        // sed: abbreviated long options and options that take a value.
+        assert_escalates("sed --e='1e touch /tmp/pwned' README.md");
+        assert_escalates("sed --exp='1e id' README.md");
+        assert_escalates("sed --expr '1e id' README.md");
+        assert_escalates("sed --i 's/a/b/' README.md");
+        assert_escalates("sed --in-pl 's/a/b/' README.md");
+        assert_escalates("sed --in-place=.bak 's/a/b/' README.md");
+        assert_escalates("sed --fil=x.sed README.md");
+        assert_escalates("sed --f x.sed README.md");
+        assert_escalates("sed -l 5 '1w /tmp/evil' README.md");
+        assert_escalates("sed -l5 '1w /tmp/evil' README.md");
+        assert_escalates("sed --line-length 5 '1w /tmp/evil' README.md");
+        assert_escalates("sed --line=5 '1w /tmp/evil' README.md");
+        assert_escalates("sed -l 's/a/b/' README.md");
+        assert_escalates("sed -I .bak 's/a/b/' README.md");
+        assert_escalates("sed -nE -s -f x.sed README.md");
+        assert_escalates("sed -x 's/a/b/' README.md");
+        assert_escalates("sed --nonsense 's/a/b/' README.md");
+        assert_escalates("sed -- '1e id' README.md");
+        assert_escalates("sed -n -- -n README.md");
+        assert_read_only("sed -l 5 -n l README.md");
+        assert_read_only("sed --line-length=80 -n l README.md");
+        assert_read_only("sed --quiet --regexp-extended 's/(a)/\\1/p' README.md");
+        assert_read_only("sed --qu -n 's/a/b/p' README.md");
+        assert_read_only("sed --expression='s/a/b/' --exp 's/c/d/' README.md");
+        assert_read_only("sed -es/i/j/ README.md");
+        assert_read_only("sed -nEe 's/x/y/p' README.md");
+        assert_read_only("sed -n p -- -file-with-dash");
+
+        // sed: files read by `r`/`R` are checked like paths; scripts are not.
+        assert_escalates("sed '1r /etc/shadow' README.md");
+        assert_escalates("sed -e 'R ../secret.txt' README.md");
+        assert_escalates("sed '1r notes.txt; 1e id' README.md");
+        assert_escalates("sed -n \"$SCRIPT\" README.md");
+        assert_escalates("sed -n '/x/p' /etc/passwd");
+        assert_read_only("sed '1r notes.txt' README.md");
+        assert_read_only("sed -n '/fn main/,/^}/p' src/main.rs");
+        assert_read_only("sed --expression=/TODO/p -n src/main.rs");
+        // Words that GNU sed (permuting) and BSD sed (stopping at the first
+        // operand) read differently are checked both as scripts and paths.
+        assert_escalates("sed /etc/shadow -e p");
+        assert_escalates("sed p -e /etc/shadow");
+        assert_escalates("sed p --expression=/etc/shadow");
+        assert_read_only("sed -n -e 's/x/y/p' notes.txt");
+        assert_read_only("sed -e /TODO/p src/main.rs");
+    }
+
+    #[test]
+    fn git_and_sort_option_spellings_that_run_programs_or_write_files_escalate() {
         // git: abbreviated long options, attached values and clusters.
         assert_escalates("git grep -Ovim todo");
         assert_escalates("git grep -nO todo");
@@ -2351,6 +2854,22 @@ mod tests {
         assert_read_only(&format!("cat {}", inside.display()).replace('\\', "/"));
         assert_read_only("cat src/../Cargo.toml");
         assert_read_only("cd src && ls");
+        // A `cd` whose destination is not spelled out leaves the workspace.
+        assert_escalates("cd ; cat .ssh/id_rsa");
+        assert_escalates("cd && grep key .aws/credentials");
+        assert_escalates("cd && cat .ssh/id_rsa");
+        assert_escalates("cd -- && cat .ssh/id_rsa");
+        assert_escalates("cd -P && cat .ssh/id_rsa");
+        assert_escalates("cd - && cat secret.txt");
+        assert_escalates("cd ~ && cat .ssh/id_rsa");
+        assert_escalates("cd $HOME && cat .ssh/id_rsa");
+        assert_escalates("cd src/../.. && cat secret.txt");
+        assert_read_only("cd -P src && ls");
+        assert_read_only("cd -- src && ls");
+        assert!(!cmd("cd - && type secret.txt").is_read_only());
+        assert!(cmd("cd").is_read_only(), "cmd.exe `cd` only prints");
+        assert!(cmd("cd /d src && dir").is_read_only());
+        assert!(!cmd("cd /d .. && type secret.txt").is_read_only());
         assert!(!cmd("type C:\\Windows\\win.ini").is_read_only());
         assert!(
             cmd("dir /s /b").is_read_only(),
@@ -2424,10 +2943,33 @@ mod tests {
         assert!(!classify("Invoke-WebRequest https://evil.example").is_read_only());
         assert!(!classify("Write-Output \"$(Remove-Item x)\"").is_read_only());
         assert!(classify("Write-Output 'literal $(not run)'").is_read_only());
+        // Set-Location is followed; a destination that is not spelled out
+        // (home, location history) escalates.
+        assert!(classify("cd src; Get-ChildItem").is_read_only());
+        assert!(classify("Set-Location -Path src; Get-Content main.rs").is_read_only());
+        assert!(!classify("cd; Get-Content .ssh\\id_rsa").is_read_only());
+        assert!(!classify("cd -; Get-Content secret.txt").is_read_only());
+        assert!(!classify("sl +; Get-Content secret.txt").is_read_only());
+        assert!(!classify("cd ~; Get-Content .ssh\\id_rsa").is_read_only());
+        assert!(!classify("cd $HOME; Get-Content .ssh\\id_rsa").is_read_only());
+        assert!(!classify("cd ..; Get-Content secret.txt").is_read_only());
+        assert!(!classify("cd src; Get-Content ..\\..\\secret.txt").is_read_only());
         assert_eq!(
             classify("Remove-Item build").approval_prefixes(),
             vec![vec!["remove-item".to_string(), "build".to_string()]]
         );
+    }
+
+    #[test]
+    fn cd_through_cdpath_is_detected() {
+        let cdpath = Some(OsStr::new("/home/user"));
+        assert!(cdpath_may_redirect(".ssh", cdpath));
+        assert!(cdpath_may_redirect("src/deep", cdpath));
+        assert!(!cdpath_may_redirect("./src", cdpath));
+        assert!(!cdpath_may_redirect("../src", cdpath));
+        assert!(!cdpath_may_redirect("/abs/dir", cdpath));
+        assert!(!cdpath_may_redirect(".ssh", None));
+        assert!(!cdpath_may_redirect(".ssh", Some(OsStr::new(""))));
     }
 
     #[test]
