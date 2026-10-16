@@ -853,9 +853,13 @@ mod tests {
             ])),
             vec!["--dangerously-skip-permissions"]
         );
-        assert!(unapplied_resume_launch_flags(&args(&["--resume", "s.jsonl"])).is_empty());
-        assert!(
-            unapplied_resume_launch_flags(&args(&["--resume", "--modelling.jsonl"])).is_empty()
+        assert_eq!(
+            unapplied_resume_launch_flags(&args(&["--resume", "s.jsonl"])),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            unapplied_resume_launch_flags(&args(&["--resume", "--modelling.jsonl"])),
+            Vec::<&str>::new()
         );
 
         let message = unapplied_resume_flags_message(&["--permission-mode"], "s.jsonl");
