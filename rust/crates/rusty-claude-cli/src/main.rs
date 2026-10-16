@@ -1236,6 +1236,15 @@ fn run_resume_command(
                 })),
             })
         }
+        // The account report reads the gateway, not the saved session.
+        SlashCommand::Usage { .. } => {
+            let report = crate::account::usage_report()?;
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                json: Some(serde_json::json!({ "kind": "usage", "message": report })),
+                message: Some(report),
+            })
+        }
         SlashCommand::Bughunter { .. }
         | SlashCommand::Commit { .. }
         | SlashCommand::Pr { .. }
@@ -1273,7 +1282,6 @@ fn run_resume_command(
         | SlashCommand::Tasks { .. }
         | SlashCommand::Theme { .. }
         | SlashCommand::Voice { .. }
-        | SlashCommand::Usage { .. }
         | SlashCommand::Rename { .. }
         | SlashCommand::Copy { .. }
         | SlashCommand::Hooks { .. }

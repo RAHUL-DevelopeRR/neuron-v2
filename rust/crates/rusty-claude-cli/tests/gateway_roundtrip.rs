@@ -659,6 +659,38 @@ fn neuron_usage_renders_the_account_from_the_gateway() {
 }
 
 #[test]
+fn resumed_usage_command_reads_the_account_from_the_gateway() {
+    let gateway = gateway_with_chat(|_, _| text_reply("saved"));
+    let workspace = Workspace::new("resume-usage");
+    // A prompt run leaves a saved session to resume.
+    let mut prompt = workspace.command(&gateway);
+    prompt
+        .env("NEURON_TOKEN", SESSION_TOKEN)
+        .args(prompt_args("hello"));
+    let output = run(prompt, None);
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let mut resumed = workspace.command(&gateway);
+    resumed
+        .env("NEURON_TOKEN", SESSION_TOKEN)
+        .args(["--resume", "latest", "/usage"]);
+    let output = run(resumed, None);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report = stdout(&output);
+    assert!(report.contains("Zero-X usage"), "{report}");
+    assert!(report.contains("Requests today   42 / 100"), "{report}");
+    assert!(!stderr(&output).contains("not yet implemented"));
+    let account = gateway
+        .requests()
+        .into_iter()
+        .filter(|request| request.path == "/api/account")
+        .collect::<Vec<_>>();
+    assert_eq!(account.len(), 1);
+    assert_bearer(&account[0], SESSION_TOKEN);
+}
+
+#[test]
 fn auth_login_with_token_status_and_logout_lifecycle() {
     let gateway = gateway_with_chat(|_, _| text_reply("unused"));
     let workspace = Workspace::new("auth");

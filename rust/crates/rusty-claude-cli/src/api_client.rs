@@ -819,15 +819,11 @@ pub(crate) fn collect_prompt_cache_events(
 /// in this build. Used to filter both REPL completions and help output so the
 /// discovery surface only shows commands that actually work (ROADMAP #39).
 pub(crate) const STUB_COMMANDS: &[&str] = &[
-    "login",
-    "logout",
     "vim",
-    "upgrade",
     "share",
     "feedback",
     "files",
     "fast",
-    "exit",
     "summary",
     "desktop",
     "brief",
@@ -839,12 +835,10 @@ pub(crate) const STUB_COMMANDS: &[&str] = &[
     "security-review",
     "keybindings",
     "privacy-settings",
-    "plan",
     "review",
     "tasks",
     "theme",
     "voice",
-    "usage",
     "rename",
     "copy",
     "hooks",
