@@ -47,14 +47,14 @@ binary. The Codebase Memory and Playwright MCP servers are installed with this
 package and enabled by default. Agent Reach's CLI channels need their own setup;
 Playwright provides browser control, while desktop control needs a separately
 configured MCP server. See
-[default integrations](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/ux-audit-fixes/docs/DEFAULT_INTEGRATIONS.md)
+[default integrations](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/docs/DEFAULT_INTEGRATIONS.md)
 to override or disable them.
 
 ## More
 
-- [Usage guide](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/ux-audit-fixes/USAGE.md)
+- [Usage guide](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/USAGE.md)
 - [Plans and pricing](https://zero-x.live/pricing)
-- [Security policy](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/ux-audit-fixes/SECURITY.md)
+- [Security policy](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/SECURITY.md)
 
 MIT licensed; see `LICENSE` and `NOTICE`. Prompts and code you send are
 processed by third-party model providers.
