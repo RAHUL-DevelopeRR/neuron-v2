@@ -218,6 +218,84 @@ async fn stream_cut_off_without_finish_reason_or_done_is_truncated() {
 }
 
 #[tokio::test]
+async fn every_provider_honours_retry_after_on_retryable_errors() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let server = spawn_server(
+        state.clone(),
+        vec![
+            http_response_with_headers(
+                "429 Too Many Requests",
+                "application/json",
+                r#"{"error":{"message":"Rate limit reached","type":"requests","code":"rate_limit_exceeded"}}"#,
+                &[("retry-after", "1")],
+            ),
+            http_response("200 OK", "application/json", COMPLETION_BODY),
+        ],
+    )
+    .await;
+    let (observer, notices) = recording_observer();
+    // Tiny exponential backoff: only Retry-After can explain a 1s wait.
+    let client = OpenAiCompatClient::new("sk-test", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url())
+        .with_retry_policy(
+            3,
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(2),
+        )
+        .with_retry_observer(Some(observer));
+
+    let started = std::time::Instant::now();
+    client
+        .send_message(&sample_request(false))
+        .await
+        .expect("retry after the advertised delay should succeed");
+
+    assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+    assert_eq!(state.lock().await.len(), 2);
+    let notices = notices.lock().unwrap();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].delay, std::time::Duration::from_secs(1));
+    assert_eq!(notices[0].provider, "OpenAI");
+}
+
+#[tokio::test]
+async fn total_backoff_is_capped_instead_of_retrying_for_minutes() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let busy = http_response("503 Service Unavailable", "application/json", "{}");
+    let server = spawn_server(state.clone(), vec![busy.clone(), busy.clone(), busy]).await;
+    let (observer, notices) = recording_observer();
+    let client = OpenAiCompatClient::new("sk-test", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url())
+        .with_retry_policy(
+            8,
+            std::time::Duration::from_millis(30),
+            std::time::Duration::from_millis(30),
+        )
+        .with_max_total_backoff(std::time::Duration::from_millis(50))
+        .with_retry_observer(Some(observer));
+
+    let error = client
+        .send_message(&sample_request(false))
+        .await
+        .expect_err("the backoff budget runs out before eight retries");
+
+    // Each sleep is at least 30ms and the budget is 50ms, so at most two
+    // retries fit; the last one is clamped to whatever budget remains.
+    let notices = notices.lock().unwrap().clone();
+    let slept: std::time::Duration = notices.iter().map(|notice| notice.delay).sum();
+    assert!(slept <= std::time::Duration::from_millis(50), "{slept:?}");
+    assert!((1..=2).contains(&notices.len()), "{notices:?}");
+    let requests = state.lock().await.len();
+    assert_eq!(requests, notices.len() + 1);
+    match error {
+        ApiError::RetriesExhausted { attempts, .. } => {
+            assert_eq!(attempts as usize, requests);
+        }
+        other => panic!("expected RetriesExhausted, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn provider_client_uses_explicit_endpoint_instead_of_environment() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let server = spawn_server(

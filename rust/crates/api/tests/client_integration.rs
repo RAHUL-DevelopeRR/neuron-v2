@@ -458,6 +458,43 @@ async fn retries_retryable_failures_before_succeeding() {
 }
 
 #[tokio::test]
+async fn anthropic_retries_honour_retry_after() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let server = spawn_server(
+        state.clone(),
+        vec![
+            http_response_with_headers(
+                "429 Too Many Requests",
+                "application/json",
+                "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}",
+                &[("retry-after", "1")],
+            ),
+            http_response(
+                "200 OK",
+                "application/json",
+                "{\"id\":\"msg_retry_after\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Recovered\"}],\"model\":\"claude-3-7-sonnet-latest\",\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}",
+            ),
+        ],
+    )
+    .await;
+
+    // Millisecond backoff: only the server's Retry-After explains a 1s wait.
+    let client = ApiClient::new("test-key")
+        .with_base_url(server.base_url())
+        .with_retry_policy(2, Duration::from_millis(1), Duration::from_millis(2));
+
+    let started = std::time::Instant::now();
+    let response = client
+        .send_message(&sample_request(false))
+        .await
+        .expect("retry should eventually succeed");
+
+    assert_eq!(response.total_tokens(), 5);
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    assert_eq!(state.lock().await.len(), 2);
+}
+
+#[tokio::test]
 async fn provider_client_dispatches_anthropic_requests() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let server = spawn_server(
