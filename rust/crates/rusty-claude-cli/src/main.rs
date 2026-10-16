@@ -48,6 +48,7 @@ mod executor;
 mod init;
 mod input;
 mod orchestrator;
+mod plan_mode;
 mod progress;
 mod provider;
 mod quota;
@@ -764,7 +765,7 @@ impl GitWorkspaceSummary {
                 details.push(format!("{} conflicted", self.conflicted_files));
             }
             format!(
-                "dirty Â· {} files Â· {}",
+                "dirty · {} files · {}",
                 self.changed_files,
                 details.join(", ")
             )
@@ -2257,61 +2258,18 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        // â”€â”€ Plan-mode prompt wrapping â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        // When plan mode is active, wrap the user's prompt with strict
-        // instructions that produce an architecture plan, NOT full code.
+        // Plan-mode prompt wrapping: while plan mode is active the user's
+        // prompt is wrapped with instructions that produce an architecture
+        // plan, not full code (see `plan_mode`).
         let effective_input: String;
         let actual_input = if self.plan_mode {
-            effective_input = format!(
-                "[PLAN MODE â€” RESEARCH FIRST, THEN PLAN]\n\
-                 You are in plan mode. Follow this two-phase workflow:\n\n\
-                 PHASE 1 â€” RESEARCH:\n\
-                 Use read_file, glob_search, grep_search to explore the codebase.\n\
-                 Understand existing patterns, file structure, and dependencies.\n\
-                 Read NEURON.md or README.md if they exist.\n\
-                 Do NOT skip this â€” your plan quality depends on real context.\n\n\
-                 PHASE 2 â€” STRUCTURED PLAN:\n\
-                 After researching, produce a detailed implementation plan:\n\n\
-                 ## Goal\n\
-                 What we are building and why (2-3 sentences).\n\n\
-                 ## Current State\n\
-                 What exists now â€” relevant files, patterns, tech stack found.\n\n\
-                 ## Architecture\n\
-                 For EACH file (new or modified):\n\
-                 ### `filename`\n\
-                 - Purpose: what this file does\n\
-                 - Key functions/components to create or modify\n\
-                 - How it connects to other files (data flow)\n\n\
-                 ## Implementation Steps\n\
-                 Numbered, detailed steps. Each step should explain:\n\
-                 - What to do\n\
-                 - Why this approach (design rationale)\n\
-                 - Edge cases to handle\n\n\
-                 ## Dependencies\n\
-                 Packages needed with versions.\n\n\
-                 ## Risks & Edge Cases\n\
-                 What could go wrong, browser compat, error handling.\n\n\
-                 ## Verification\n\
-                 Specific test steps to validate the implementation.\n\n\
-                 RULES:\n\
-                 - Do NOT generate full file contents\n\
-                 - Code snippets max 3-5 lines (illustrative only)\n\
-                 - Be detailed in WHAT and WHY, not in raw code\n\n\
-                 User's request: {}\n",
-                input
-            );
+            effective_input = plan_mode::wrap_plan_prompt(input);
             effective_input.as_str()
         } else if self.plan_just_exited {
-            // First prompt after /plan off â€” clear the LLM's context
+            // First prompt after /plan off: tell the model which permission
+            // mode is active again.
             self.plan_just_exited = false;
-            effective_input = format!(
-                "[PLAN MODE ENDED â€” FULL ACCESS RESTORED]\n\
-                 Plan mode has been turned OFF. You now have full write access.\n\
-                 You can and SHOULD use write_file, bash, and all tools to implement.\n\
-                 Execute the changes directly â€” do not ask for permission.\n\n\
-                 User's request: {}\n",
-                input
-            );
+            effective_input = plan_mode::wrap_post_plan_prompt(input, self.permission_mode);
             effective_input.as_str()
         } else if let Some(ref mode) = self.orchestration_mode {
             // â”€â”€ Orchestration mode â€” delegates to orchestrator module â”€â”€
@@ -2614,10 +2572,10 @@ impl LiveCli {
                 eprintln!("{cmd_name} is not yet implemented in this build.");
                 false
             }
-            // â”€â”€ /plan [on|off] â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-            // Toggles read-only plan mode.  In plan mode the agent can
-            // analyze the codebase, search files, and create plans but
-            // is restricted from modifying files or executing commands.
+            // /plan [on|off]: toggles read-only plan mode. In plan mode the
+            // agent can analyze the codebase, search files, and create plans
+            // but cannot modify files or execute commands. /plan off restores
+            // the permission mode that was active before /plan on.
             SlashCommand::Plan { mode } => {
                 match mode.as_deref().map(str::trim) {
                     Some("on") | None => {
@@ -2625,7 +2583,7 @@ impl LiveCli {
                             eprintln!("\x1b[33m[plan]\x1b[0m Plan mode is already active.");
                         } else {
                             self.plan_mode = true;
-                            self.permission_mode = PermissionMode::ReadOnly;
+                            self.permission_mode = plan_mode::enter_plan_mode(self.permission_mode);
                             eprintln!("\x1b[33m[plan]\x1b[0m \x1b[1mPlan mode ON\x1b[0m");
                             eprintln!(
                                 "  \x1b[2mThe agent will generate architecture plans, not full code.\x1b[0m"
@@ -2641,9 +2599,10 @@ impl LiveCli {
                         } else {
                             self.plan_mode = false;
                             self.plan_just_exited = true;
-                            self.permission_mode = PermissionMode::DangerFullAccess;
+                            self.permission_mode = plan_mode::exit_plan_mode(self.permission_mode);
                             eprintln!(
-                                "\x1b[32m>\x1b[0m \x1b[1mPlan mode OFF\x1b[0m \x1b[2m-- full access restored\x1b[0m"
+                                "\x1b[32m>\x1b[0m \x1b[1mPlan mode OFF\x1b[0m \x1b[2m-- permission mode restored to {}\x1b[0m",
+                                self.permission_mode.as_str()
                             );
                             eprintln!(
                                 "  \x1b[2mType \"execute the plan\" to implement it now.\x1b[0m"
@@ -3446,8 +3405,8 @@ fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Erro
 
     let render_colored_diff = |raw: &str, label: &str| -> String {
         let mut buf = String::new();
-        let border = format!("{bc}â”€{r}").repeat(30);
-        buf.push_str(&format!("\n  {hdr}â–¸ {label}{r}\n  {border}\n"));
+        let border = format!("{bc}─{r}").repeat(30);
+        buf.push_str(&format!("\n  {hdr}▸ {label}{r}\n  {border}\n"));
 
         let mut file_count = 0u32;
         let mut adds = 0u32;
@@ -3458,7 +3417,7 @@ fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Erro
                 file_count += 1;
                 // Extract filename: "diff --git a/foo.rs b/foo.rs" â†’ "foo.rs"
                 let fname = line.rsplit(" b/").next().unwrap_or(line);
-                buf.push_str(&format!("\n  {hdr}â”â”â” {fname} â”â”â”{r}\n"));
+                buf.push_str(&format!("\n  {hdr}━━━ {fname} ━━━{r}\n"));
             } else if line.starts_with("---") || line.starts_with("+++") {
                 // Skip raw --- a/file / +++ b/file (redundant with above)
             } else if line.starts_with("@@") {
@@ -3491,7 +3450,7 @@ fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Erro
 
         // Summary line
         buf.push_str(&format!(
-            "\n  {bc}â”€{r} {add}+{adds}{r} {del}-{dels}{r} in {file_count} file{}\n",
+            "\n  {bc}─{r} {add}+{adds}{r} {del}-{dels}{r} in {file_count} file{}\n",
             if file_count == 1 { "" } else { "s" }
         ));
         buf
@@ -3821,7 +3780,7 @@ fn truncate_for_prompt(value: &str, limit: usize) -> String {
         value.trim().to_string()
     } else {
         let truncated = value.chars().take(limit).collect::<String>();
-        format!("{}\nâ€¦[truncated]", truncated.trim_end())
+        format!("{}\n…[truncated]", truncated.trim_end())
     }
 }
 
@@ -4101,7 +4060,7 @@ fn short_tool_id(id: &str) -> String {
         return id.to_string();
     }
     let prefix: String = id.chars().take(12).collect();
-    format!("{prefix}â€¦")
+    format!("{prefix}…")
 }
 
 fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -5415,7 +5374,7 @@ mod tests {
         assert!(markdown.contains("How do I list files?"));
         assert!(markdown.contains("## 2. Assistant"));
         assert!(markdown.contains("**Tool call** `bash`"));
-        assert!(markdown.contains("toolu_abcdefâ€¦"));
+        assert!(markdown.contains("toolu_abcdef…"));
         assert!(markdown.contains("ls -la"));
         assert!(markdown.contains("## 3. Tool"));
         assert!(markdown.contains("**Tool result** `bash`"));
@@ -5479,7 +5438,7 @@ mod tests {
         let trimmed_short = short_tool_id(short);
 
         // then
-        assert_eq!(trimmed_long, "toolu_01ABCDâ€¦");
+        assert_eq!(trimmed_long, "toolu_01ABCD…");
         assert_eq!(trimmed_short, "tool_1");
     }
 
@@ -6178,8 +6137,9 @@ mod tests {
         assert!(status.contains("Cwd              /tmp/project"));
         assert!(status.contains("Project root     /tmp"));
         assert!(status.contains("Git branch       main"));
-        assert!(status
-            .contains("Git state        dirty Â· 3 files Â· 1 staged, 1 unstaged, 1 untracked"));
+        assert!(
+            status.contains("Git state        dirty · 3 files · 1 staged, 1 unstaged, 1 untracked")
+        );
         assert!(status.contains("Changed files    3"));
         assert!(status.contains("Staged           1"));
         assert!(status.contains("Unstaged         1"));
@@ -6203,7 +6163,7 @@ mod tests {
         let preflight = format_commit_preflight_report(Some("feature/ux"), summary);
         assert!(preflight.contains("Result           ready"));
         assert!(preflight.contains("Branch           feature/ux"));
-        assert!(preflight.contains("Workspace        dirty Â· 2 files Â· 1 staged, 1 unstaged"));
+        assert!(preflight.contains("Workspace        dirty · 2 files · 1 staged, 1 unstaged"));
         assert!(preflight
             .contains("Action           create a git commit from the current workspace changes"));
     }
@@ -6328,7 +6288,7 @@ UU conflicted.rs",
         );
         assert_eq!(
             summary.headline(),
-            "dirty Â· 4 files Â· 2 staged, 2 unstaged, 1 untracked, 1 conflicted"
+            "dirty · 4 files · 2 staged, 2 unstaged, 1 untracked, 1 conflicted"
         );
     }
 
