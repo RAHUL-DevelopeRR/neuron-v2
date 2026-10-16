@@ -189,6 +189,10 @@ impl SystemPromptBuilder {
                 self.os_name.as_deref().unwrap_or("unknown"),
                 self.os_version.as_deref().unwrap_or("unknown")
             ),
+            format!(
+                "Shell used by the bash tool: {}",
+                crate::bash::bash_tool_shell_description()
+            ),
         ]));
         lines.join("\n")
     }
@@ -199,6 +203,22 @@ impl SystemPromptBuilder {
 pub fn prepend_bullets(items: Vec<String>) -> Vec<String> {
     items.into_iter().map(|item| format!(" - {item}")).collect()
 }
+
+/// Instruction file names checked in every directory from the filesystem root
+/// down to the working directory: Neuron-native files first, then the
+/// `AGENTS.md` convention, then Claude Code compatibility files.
+const INSTRUCTION_FILE_CANDIDATES: &[&[&str]] = &[
+    &["NEURON.md"],
+    &["NEURON.local.md"],
+    &[".neuron", "NEURON.md"],
+    &["AGENTS.md"],
+    &["CLAUDE.md"],
+    &["CLAUDE.local.md"],
+    &[".neuron", "CLAUDE.md"],
+    &[".neuron", "instructions.md"],
+    &[".claw", "CLAUDE.md"],
+    &[".claw", "instructions.md"],
+];
 
 fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
     let mut directories = Vec::new();
@@ -211,15 +231,11 @@ fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
 
     let mut files = Vec::new();
     for dir in directories {
-        for candidate in [
-            dir.join("CLAUDE.md"),
-            dir.join("CLAUDE.local.md"),
-            dir.join(".neuron").join("CLAUDE.md"),
-            dir.join(".neuron").join("instructions.md"),
-            dir.join(".claw").join("CLAUDE.md"),
-            dir.join(".claw").join("instructions.md"),
-        ] {
-            push_context_file(&mut files, candidate)?;
+        for candidate in INSTRUCTION_FILE_CANDIDATES {
+            let path = candidate
+                .iter()
+                .fold(dir.clone(), |path, component| path.join(component));
+            push_context_file(&mut files, path)?;
         }
     }
     Ok(dedupe_instruction_files(files))
@@ -295,7 +311,7 @@ fn render_project_context(project_context: &ProjectContext) -> String {
     ];
     if !project_context.instruction_files.is_empty() {
         bullets.push(format!(
-            "Claude instruction files discovered: {}.",
+            "Project instruction files discovered: {}.",
             project_context.instruction_files.len()
         ));
     }
@@ -912,5 +928,68 @@ mod tests {
         assert!(rendered.contains("# Claude instructions"));
         assert!(rendered.contains("scope: /tmp/project"));
         assert!(rendered.contains("Project rules"));
+    }
+
+    #[test]
+    fn discovers_neuron_and_agents_instruction_files_before_compat_files() {
+        let root = temp_dir();
+        let nested = root.join("service");
+        fs::create_dir_all(nested.join(".neuron")).expect("nested neuron dir");
+        fs::write(root.join("AGENTS.md"), "root agents guide").expect("write agents");
+        fs::write(nested.join("NEURON.md"), "neuron project guide").expect("write neuron");
+        fs::write(nested.join(".neuron").join("NEURON.md"), "neuron dot guide")
+            .expect("write dot neuron");
+        fs::write(nested.join("CLAUDE.md"), "claude compat guide").expect("write claude");
+
+        let context = ProjectContext::discover(&nested, "2026-10-16").expect("context should load");
+        let contents = context
+            .instruction_files
+            .iter()
+            .map(|file| file.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            contents,
+            vec![
+                "root agents guide",
+                "neuron project guide",
+                "neuron dot guide",
+                "claude compat guide"
+            ]
+        );
+        let rendered = render_instruction_files(&context.instruction_files);
+        assert!(rendered.contains("## NEURON.md"));
+        assert!(rendered.contains("## AGENTS.md"));
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn neuron_md_respects_the_instruction_size_caps() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+        fs::write(root.join("NEURON.md"), "n".repeat(9_000)).expect("write neuron");
+        fs::write(root.join("AGENTS.md"), "a".repeat(9_000)).expect("write agents");
+        fs::write(root.join("CLAUDE.md"), "c".repeat(9_000)).expect("write claude");
+        fs::write(root.join("CLAUDE.local.md"), "l".repeat(9_000)).expect("write local");
+
+        let context = ProjectContext::discover(&root, "2026-10-16").expect("context should load");
+        let rendered = render_instruction_files(&context.instruction_files);
+        assert!(rendered.contains("[truncated]"));
+        let instruction_chars = rendered
+            .chars()
+            .filter(|ch| matches!(ch, 'n' | 'a' | 'c' | 'l'))
+            .count();
+        assert!(
+            instruction_chars <= 12_000 + 200,
+            "total budget exceeded: {instruction_chars}"
+        );
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn environment_section_names_the_bash_tool_shell() {
+        let prompt = SystemPromptBuilder::new().with_os("linux", "6.8").render();
+        assert!(prompt.contains("Shell used by the bash tool: "));
+        let expected = if cfg!(windows) { "cmd.exe" } else { "sh -lc" };
+        assert!(prompt.contains(expected));
     }
 }
