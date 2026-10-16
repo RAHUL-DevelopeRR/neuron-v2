@@ -406,7 +406,14 @@ impl PermissionPolicy {
                 }
             }
             "glob_search" | "grep_search" => {
-                let outside = ["path", "pattern"].iter().find_map(|key| {
+                // A glob's `pattern` names files, so its literal directory
+                // prefix is checked too; grep's `pattern` is a regex.
+                let keys: &[&str] = if tool_name == "glob_search" {
+                    &["path", "pattern"]
+                } else {
+                    &["path"]
+                };
+                let outside = keys.iter().find_map(|key| {
                     let value = input_field(input, &[key])?;
                     let candidate = if *key == "pattern" {
                         literal_glob_prefix(&value)
@@ -1642,6 +1649,33 @@ mod tests {
             read_only.authorize("glob_search", &local_glob, None),
             PermissionOutcome::Allow
         );
+        let absolute_glob = serde_json::json!({ "pattern": "/etc/**/*.conf" }).to_string();
+        assert!(matches!(
+            read_only.authorize("glob_search", &absolute_glob, None),
+            PermissionOutcome::Deny { .. }
+        ));
+
+        // grep's pattern is a regex, not a path: route strings and `../`
+        // inside it do not leave the workspace.
+        for pattern in [
+            "/v1/chat/completions",
+            "\\.\\./\\.\\./x",
+            "../config",
+            "/etc/passwd",
+        ] {
+            let regex = serde_json::json!({ "pattern": pattern }).to_string();
+            assert_eq!(
+                read_only.authorize("grep_search", &regex, None),
+                PermissionOutcome::Allow,
+                "{pattern}"
+            );
+            let in_src = serde_json::json!({ "pattern": pattern, "path": "src" }).to_string();
+            assert_eq!(
+                read_only.authorize("grep_search", &in_src, None),
+                PermissionOutcome::Allow,
+                "{pattern}"
+            );
+        }
     }
 
     #[test]
