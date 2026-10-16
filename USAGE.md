@@ -30,7 +30,7 @@ Neuron uses your Zero-X account unless you choose another provider.
 
 | Command | What it does |
 | --- | --- |
-| `neuron auth login` | Opens the Zero-X sign-in page in your browser and waits for the callback on a random `127.0.0.1` port. The callback's state and origin are checked, and the session is stored encrypted under `~/.neuroncli/`. |
+| `neuron auth login` | Opens the Zero-X sign-in page in your browser and waits for the callback on a random `127.0.0.1` port. The callback's state and origin are checked, and the session is stored under `~/.neuroncli/`; protect that directory like a password file ([SECURITY.md](SECURITY.md#how-neuron-handles-credentials)). |
 | `neuron auth login --with-token` | Reads a credential from standard input instead of opening a browser, for CI and remote machines. Use a personal API key (`nzx_…`) from the Zero-X dashboard. |
 | `neuron auth status` | Shows whether a gateway credential is available. |
 | `neuron auth logout` | Revokes the session on the gateway and deletes the local copy. |

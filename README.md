@@ -98,7 +98,10 @@ neuron auth logout    # revokes the session on the gateway and deletes the local
 ```
 
 Login waits for the browser callback on a random `127.0.0.1` port and stores the
-session, encrypted, under `~/.neuroncli/`. On CI and machines without a browser,
+session under `~/.neuroncli/`. The file is obfuscated rather than strongly encrypted,
+so protect that directory like a password file; the
+[security policy](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/SECURITY.md#how-neuron-handles-credentials)
+explains what to do if it leaks. On CI and machines without a browser,
 create a personal API key (`nzx_…`) in the Zero-X dashboard and pass it with
 `neuron auth login --with-token` or the `NEURON_TOKEN` environment variable. See
 [Sign in](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/USAGE.md#sign-in)

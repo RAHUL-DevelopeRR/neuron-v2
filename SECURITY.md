@@ -32,22 +32,29 @@ Security fixes are released as a new patch version; upgrade to get them.
   Google, Cloudflare and other upstream providers live only on the gateway. The CLI,
   the npm package and the Python package do not contain them.
 - **Your Zero-X session.** `neuron auth login` stores a session token (`ses_…`) in
-  `~/.neuroncli/gateway.enc`. The file is encrypted with a key derived from the
-  machine and user identity. That stops the file from working when copied to another
-  machine; it does not protect it from other software running under your account.
-  Treat the directory as secret. Sessions expire (30 days by default), `neuron auth
-  logout` revokes the current one, and the Zero-X dashboard can revoke every session at
-  once.
+  `~/.neuroncli/gateway.enc`. The token is encrypted, but the key is derived from your
+  machine ID and user name, and the derived value is written into the same file. The
+  encryption is therefore obfuscation, not protection: anyone who can read the file can
+  recover the token, on your machine or on any other. Treat `~/.neuroncli` like a
+  password file. On Linux and macOS Neuron makes the file readable only by you (mode
+  0600); on Windows it relies on the permissions of your user profile. Keep the
+  directory out of shared backups, synced folders, container images and support
+  bundles.
+- **If the session file leaks**, run `neuron auth logout` on that machine, which deletes
+  the file and revokes that session on the gateway. If you are not sure which session
+  leaked, revoke every session from the Zero-X dashboard. Sessions also expire on their
+  own (30 days by default).
 - **Personal API keys** (`nzx_…`) are for CI and headless machines. Keep them in your
   CI secret store, never in a repository, and revoke them in the dashboard when no
   longer needed. They can call the model API and read usage, but cannot create keys
   or change billing.
-- **Environment variables.** `NEURON_TOKEN` and bring-your-own provider keys such as
-  `OPENAI_API_KEY` are read from the environment. Neuron does not export your gateway
-  session into the environment and removes credential variables from the environment
-  of the shell commands, hooks and MCP servers it starts. Other programs you run in the
-  same shell can still read variables you set there yourself.
-- **Provider keys you bring** are sent only to the provider they belong to.
+- **Environment variables and subprocesses.** `NEURON_TOKEN` and bring-your-own
+  provider keys such as `OPENAI_API_KEY` are read from the environment; Neuron does not
+  save them. The shell commands, hooks and MCP servers that Neuron starts run as you,
+  so treat any credential in Neuron's environment, and the session file above, as
+  readable by the code they run, and approve commands with that in mind (see
+  [Running untrusted code](#running-untrusted-code)).
+- **Provider keys you bring** are sent only to the endpoint you configured for them.
 
 ## Running untrusted code
 
@@ -65,6 +72,9 @@ environments.
   `.sha256` file, the release has `SHA256SUMS`, and every binary has a GitHub build
   provenance attestation:
   `gh attestation verify <file> --repo RAHUL-DevelopeRR/neuron-v2`.
+- The assets and checksums of a published release are never rebuilt or replaced; a
+  fix ships as a new version. A checksum that does not match is therefore worth
+  reporting.
 - `install.sh`, `install.ps1` and both package launchers verify the SHA-256 checksum
   before a binary is installed or cached, and refuse non-HTTPS download mirrors.
 - The binaries are not yet code-signed (Windows) or notarized (macOS).
