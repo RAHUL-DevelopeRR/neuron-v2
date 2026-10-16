@@ -139,11 +139,34 @@ detect_target() {
 
 # --- downloads --------------------------------------------------------------
 
+# is_allowed_url URL: HTTPS, or plain HTTP to a loopback host (tests and local mirrors).
 is_allowed_url() {
     case "$1" in
+        https://*) rest="${1#https://}" ;;
+        http://*) rest="${1#http://}" ;;
+        *) return 1 ;;
+    esac
+    authority="${rest%%/*}"
+    case "${authority}" in
+        # userinfo: for http://127.0.0.1:x@evil.example/ curl contacts evil.example
+        *@*) return 1 ;;
+    esac
+    case "$1" in
         https://*) return 0 ;;
-        http://127.0.0.1:* | http://127.0.0.1/* | http://localhost:* | http://localhost/*) return 0 ;;
-        http://\[::1\]:* | http://\[::1\]/*) return 0 ;;
+    esac
+    case "${authority}" in
+        \[*) host="${authority%%]*}]" ;;
+        *) host="${authority%%:*}" ;;
+    esac
+    port="${authority#"${host}"}"
+    case "${port}" in
+        "") ;;
+        : | :*[!0-9]*) return 1 ;;
+        :*) ;;
+        *) return 1 ;;
+    esac
+    case "${host}" in
+        127.0.0.1 | localhost | "[::1]") return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -156,21 +179,38 @@ else
     die "neither curl nor wget is installed; install one of them and retry."
 fi
 
-# fetch URL OUTPUT [HEADER]
+# fetch URL OUTPUT
 fetch() {
     if [ "${DOWNLOADER}" = "curl" ]; then
-        if [ -n "${3:-}" ]; then
-            curl --fail --silent --show-error --location --retry 3 --connect-timeout 20 -H "$3" -o "$2" "$1"
-        else
-            curl --fail --silent --show-error --location --retry 3 --connect-timeout 20 -o "$2" "$1"
-        fi
+        curl --fail --silent --show-error --location --retry 3 --connect-timeout 20 -o "$2" "$1"
     else
-        if [ -n "${3:-}" ]; then
-            wget --quiet --tries=3 --timeout=30 --header="$3" -O "$2" "$1"
-        else
-            wget --quiet --tries=3 --timeout=30 -O "$2" "$1"
-        fi
+        wget --quiet --tries=3 --timeout=30 -O "$2" "$1"
     fi
+}
+
+# fetch_releases_api URL OUTPUT: GITHUB_TOKEN (for the API rate limit) is sent only to
+# api.github.com, and through a curl config on stdin so it never shows up in argv.
+fetch_releases_api() {
+    case "$1" in
+        https://api.github.com/*) ;;
+        *)
+            fetch "$1" "$2"
+            return
+            ;;
+    esac
+    case "${GITHUB_TOKEN:-}" in
+        "" | *[!A-Za-z0-9_.-]*)
+            fetch "$1" "$2"
+            return
+            ;;
+    esac
+    if [ "${DOWNLOADER}" != "curl" ]; then
+        # wget would need the token on its command line; the anonymous limit will do.
+        fetch "$1" "$2"
+        return
+    fi
+    printf 'header = "Authorization: Bearer %s"\n' "${GITHUB_TOKEN}" |
+        curl --fail --silent --show-error --location --retry 3 --connect-timeout 20 --config - -o "$2" "$1"
 }
 
 sha256_of() {
@@ -186,11 +226,7 @@ sha256_of() {
 resolve_latest_version() {
     api="${NEURON_RELEASES_API:-${DEFAULT_RELEASES_API}}"
     is_allowed_url "${api}" || die "NEURON_RELEASES_API must be an HTTPS URL (or loopback HTTP): ${api}"
-    header=""
-    if [ -n "${GITHUB_TOKEN:-}" ]; then
-        header="Authorization: Bearer ${GITHUB_TOKEN}"
-    fi
-    if ! fetch "${api}" "${TMP_DIR}/latest.json" "${header}"; then
+    if ! fetch_releases_api "${api}" "${TMP_DIR}/latest.json"; then
         die "could not look up the latest Neuron release at ${api}.
     Set NEURON_VERSION (for example NEURON_VERSION=6.3.0) to skip the lookup."
     fi
@@ -209,7 +245,8 @@ DOWNLOAD_BASE="${DOWNLOAD_BASE%/}"
 is_allowed_url "${DOWNLOAD_BASE}" || die "NEURON_DOWNLOAD_BASE must be an HTTPS URL (or loopback HTTP): ${DOWNLOAD_BASE}"
 
 TMP_DIR="$(mktemp -d 2>/dev/null || mktemp -d -t neuron-install)"
-trap 'rm -rf "${TMP_DIR}"' EXIT
+STAGED=""
+trap 'rm -rf "${TMP_DIR}"; if [ -n "${STAGED}" ]; then rm -f "${STAGED}"; fi' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
@@ -256,25 +293,31 @@ if [ "${ACTUAL}" != "${EXPECTED}" ]; then
 fi
 info "verified SHA-256 ${ACTUAL}"
 
-chmod 755 "${TMP_DIR}/${ASSET}"
-# </dev/null: under `curl | sh` stdin is the rest of this script.
-if ! VERSION_OUTPUT="$("${TMP_DIR}/${ASSET}" --version </dev/null 2>&1)"; then
-    printf '%s\n' "${VERSION_OUTPUT}" >&2
-    die "the downloaded binary does not run on this system. Nothing was installed."
-fi
-
+# Stage and self-check inside the install directory, not the temporary directory:
+# /tmp is often mounted noexec, and the final rename stays on one filesystem.
 mkdir -p "${INSTALL_DIR}" 2>/dev/null || die "cannot create ${INSTALL_DIR}; choose another directory with --install-dir."
 DESTINATION="${INSTALL_DIR}/neuron"
 STAGED="${INSTALL_DIR}/.neuron.$$.tmp"
 if ! cp "${TMP_DIR}/${ASSET}" "${STAGED}" 2>/dev/null; then
-    rm -f "${STAGED}"
     die "cannot write to ${INSTALL_DIR}; choose another directory with --install-dir."
 fi
 chmod 755 "${STAGED}"
+# </dev/null: under `curl | sh` stdin is the rest of this script.
+if ! VERSION_OUTPUT="$("${STAGED}" --version </dev/null 2>&1)"; then
+    printf '%s\n' "${VERSION_OUTPUT}" >&2
+    die "the downloaded binary does not run on this system (or ${INSTALL_DIR} is on a noexec mount). Nothing was installed."
+fi
 mv -f "${STAGED}" "${DESTINATION}"
+STAGED=""
 
+# The release binary prints a report whose second line is "  Version  X.Y.Z".
+REPORTED="$(printf '%s\n' "${VERSION_OUTPUT}" | sed -n 's/^[[:space:]]*Version[[:space:]][[:space:]]*\([^[:space:]][^[:space:]]*\).*/\1/p' | head -n 1)"
 say "${GREEN}Installed${RESET} ${DESTINATION}"
-info "$(printf '%s\n' "${VERSION_OUTPUT}" | head -n 1)"
+if [ -n "${REPORTED}" ]; then
+    info "neuron ${REPORTED}"
+else
+    info "$(printf '%s\n' "${VERSION_OUTPUT}" | head -n 1)"
+fi
 
 case ":${PATH:-}:" in
     *":${INSTALL_DIR}:"* | *":${INSTALL_DIR}/:"*)

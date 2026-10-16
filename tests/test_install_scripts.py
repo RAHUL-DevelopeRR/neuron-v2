@@ -31,6 +31,45 @@ FAILING_BINARY = b"#!/bin/sh\necho 'cannot execute binary file' >&2\nexit 3\n"
 # Reads stdin to the end, as a binary that probes the terminal might.
 STDIN_READING_BINARY = b"#!/bin/sh\ncat >/dev/null\necho 'neuron-dummy stdin-reader'\n"
 
+# Reports the path it was started from.
+WHERE_BINARY = b'#!/bin/sh\necho "ran-from $0"\n'
+
+GITHUB_TOKEN = "ghs_fakeTokenForTests123"
+
+# Stands in for curl on api.github.com (records argv and the config read from stdin)
+# and hands every other URL to the real curl.
+FAKE_CURL = r"""#!/bin/sh
+out=""
+url=""
+previous=""
+for argument in "$@"; do
+    if [ "$previous" = "-o" ]; then out="$argument"; fi
+    previous="$argument"
+    url="$argument"
+done
+case "$url" in
+    https://api.github.com/*)
+        printf '%s\n' "$*" >> "$FAKE_CURL_ARGV"
+        case " $* " in
+            *" --config - "*) cat >> "$FAKE_CURL_STDIN" ;;
+        esac
+        printf '{"tag_name": "v%s"}\n' "$FAKE_CURL_LATEST" > "$out"
+        exit 0
+        ;;
+esac
+own_dir="${0%/*}"
+remaining=""
+old_ifs="$IFS"
+IFS=:
+for entry in $PATH; do
+    if [ "$entry" != "$own_dir" ]; then remaining="${remaining:+$remaining:}$entry"; fi
+done
+IFS="$old_ifs"
+PATH="$remaining"
+export PATH
+exec curl "$@"
+"""
+
 
 def posix_dummy(version: str) -> bytes:
     return fake_release.POSIX_DUMMY.format(version=version).encode()
@@ -95,6 +134,8 @@ class InstallShTests(unittest.TestCase):
             environment["FAKE_UNAME_S"], environment["FAKE_UNAME_M"] = uname
             environment["PATH"] = os.pathsep.join([str(self.fakebin), environment.get("PATH", "")])
         environment.update(env)
+        for key in [key for key, value in environment.items() if value == ""]:
+            del environment[key]  # "" means unset (install.sh treats both alike)
         shell = shell or install_sh_shells()[0]
         command = [shell, str(INSTALL_SH), *args]
         if on_path:
@@ -254,6 +295,66 @@ class InstallShTests(unittest.TestCase):
         self.assertNotIn("may not be published", result.stderr)
         self.assertFalse(self.installed().exists())
 
+    def test_rejects_userinfo_and_lookalike_loopback_hosts(self) -> None:
+        for base in (
+            "http://127.0.0.1:x@evil.example/",
+            "http://127.0.0.1@evil.example",
+            "http://localhost.evil.example",
+            "http://127.0.0.1.evil.example:8000",
+            "http://[::1].evil.example",
+            "http://127.0.0.1:80x",
+            "https://user@mirror.example",
+        ):
+            with self.subTest(base=base):
+                result = self.run_installer(NEURON_VERSION=VERSION, NEURON_DOWNLOAD_BASE=base)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("must be an HTTPS URL", result.stderr)
+        self.assertEqual(self.server.paths(), [])
+
+    def test_github_token_reaches_only_the_github_api_and_never_argv(self) -> None:
+        fake_release.write_executable(self.fakebin / "curl", FAKE_CURL.encode())
+        fake_release.stage_release(self.releases, VERSION, "neuron-linux-x64", posix_dummy(VERSION))
+        argv_log, stdin_log = self.root / "curl-argv", self.root / "curl-stdin"
+        argv_log.touch()
+        stdin_log.touch()
+        result = self.run_installer(
+            GITHUB_TOKEN=GITHUB_TOKEN,
+            NEURON_RELEASES_API="",  # empty means the default, https://api.github.com/...
+            FAKE_CURL_ARGV=shell_path(argv_log),
+            FAKE_CURL_STDIN=shell_path(stdin_log),
+            FAKE_CURL_LATEST=VERSION,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = argv_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(calls), 1, calls)
+        self.assertIn("https://api.github.com/repos/RAHUL-DevelopeRR/neuron-v2/releases/latest", calls[0])
+        self.assertNotIn(GITHUB_TOKEN, calls[0])
+        self.assertEqual(stdin_log.read_text(encoding="utf-8"), f'header = "Authorization: Bearer {GITHUB_TOKEN}"\n')
+        self.assertEqual(self.server.paths(), [f"/v{VERSION}/neuron-linux-x64.sha256", f"/v{VERSION}/neuron-linux-x64"])
+        self.assertEqual(self.server.authorization, [None, None])
+
+    def test_github_token_is_not_sent_to_another_releases_api(self) -> None:
+        fake_release.stage_release(self.releases, VERSION, "neuron-linux-x64", posix_dummy(VERSION))
+        result = self.run_installer(GITHUB_TOKEN=GITHUB_TOKEN)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.server.paths()[0], "/repos/neuron/releases/latest")
+        self.assertEqual(self.server.authorization, [None, None, None])
+
+    def test_self_check_runs_the_binary_from_the_install_directory(self) -> None:
+        # The temporary directory may be mounted noexec; the binary has to run from the install directory anyway.
+        fake_release.stage_release(self.releases, VERSION, "neuron-linux-x64", WHERE_BINARY)
+        result = self.run_installer(NEURON_VERSION=VERSION)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"ran-from {shell_path(self.install_dir)}/.neuron.", result.stderr)
+        self.assertEqual(sorted(entry.name for entry in self.install_dir.iterdir()), ["neuron"])
+
+    def test_reports_the_version_line_of_the_release_binary(self) -> None:
+        fake_release.stage_release(self.releases, VERSION, "neuron-linux-x64", posix_dummy(VERSION))
+        result = self.run_installer(NEURON_VERSION=VERSION, NEURON_DUMMY_VERSION_REPORT="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"\n  neuron {VERSION}\n", result.stderr)
+        self.assertNotIn("\n  NeuronCLI\n", result.stderr)
+
     def test_rejects_insecure_download_base_and_invalid_versions(self) -> None:
         insecure = self.run_installer(NEURON_VERSION=VERSION, NEURON_DOWNLOAD_BASE="http://downloads.example.com")
         self.assertEqual(insecure.returncode, 1)
@@ -402,6 +503,94 @@ class InstallPs1Tests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("Check your network", result.stdout)
         self.assertNotIn("may not be published", result.stdout)
+
+    def test_userinfo_in_the_download_base_is_rejected(self) -> None:
+        for base in ("http://127.0.0.1:x@evil.example/", "https://user@mirror.example"):
+            with self.subTest(base=base):
+                result = self.run_installer("-Version", VERSION, NEURON_DOWNLOAD_BASE=base)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("must be an HTTPS URL", result.stdout)
+        self.assertEqual(self.server.paths(), [])
+
+    def test_github_token_is_not_sent_to_another_releases_api(self) -> None:
+        fake_release.stage_release(self.releases, VERSION, self.ASSET)
+        result = self.run_installer(GITHUB_TOKEN=GITHUB_TOKEN)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.server.paths()[0], "/repos/neuron/releases/latest")
+        self.assertEqual(self.server.authorization, [None, None, None])
+
+    def test_github_token_is_meant_only_for_the_github_api(self) -> None:
+        cases = {
+            "https://api.github.com/repos/RAHUL-DevelopeRR/neuron-v2/releases/latest": "True",
+            "https://api.github.com.evil.example/releases/latest": "False",
+            "https://api.github.com@evil.example/releases/latest": "False",
+            "http://api.github.com/releases/latest": "False",
+            "https://mirror.example/releases/latest": "False",
+            "not a url": "False",
+        }
+        body = "\n".join(f"'{url}=' + (Test-GitHubApiUrl '{url}')" for url in cases)
+        result = self.run_functions(["Test-GitHubApiUrl"], body)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [f"{url}={expected}" for url, expected in cases.items()])
+
+    def test_reports_the_version_line_of_the_release_binary(self) -> None:
+        fake_release.stage_release(self.releases, VERSION, self.ASSET)
+        result = self.run_installer("-Version", VERSION, NEURON_DUMMY_VERSION_REPORT="1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertIn(f"  neuron {VERSION}", lines)
+        self.assertNotIn("  NeuronCLI", lines)
+
+    def test_a_failed_replacement_restores_the_previous_binary(self) -> None:
+        folder = self.root / "replace"
+        folder.mkdir()
+        destination, source = folder / "neuron.exe", folder / "download.exe"
+        destination.write_text("previous", encoding="ascii")
+        source.write_text("new", encoding="ascii")
+        body = f"""
+$script:moves = 0
+function Move-Item {{
+    param([string]$LiteralPath, [string]$Destination, [switch]$Force)
+    $script:moves++
+    # The second move puts the download in place; fail it as an antivirus lock would.
+    if ($script:moves -eq 2) {{ throw 'The process cannot access the file because it is being used by another process.' }}
+    Microsoft.PowerShell.Management\\Move-Item -LiteralPath $LiteralPath -Destination $Destination -Force:$Force
+}}
+try {{ Install-NeuronBinary '{source}' '{destination}'; 'no error' }} catch {{ "error: $($_.Exception.Message)" }}
+"""
+        result = self.run_functions(["Install-NeuronBinary"], body)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("error: could not install", result.stdout)
+        self.assertIn("The previous version was kept.", result.stdout)
+        self.assertEqual(destination.read_text(encoding="ascii"), "previous")
+        self.assertFalse(Path(f"{destination}.old").exists())
+
+    def run_functions(self, names: List[str], body: str) -> subprocess.CompletedProcess:
+        """Defines the named install.ps1 functions (from its AST) and runs `body` with them."""
+        script = self.root / "functions.ps1"
+        quoted = ", ".join(f"'{name}'" for name in names)
+        script.write_text(
+            f"""$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version 2.0
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile('{INSTALL_PS1}', [ref]$null, [ref]$parseErrors)
+foreach ($name in @({quoted})) {{
+    $definition = $ast.Find({{ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }}, $true)
+    if (-not $definition) {{ throw "install.ps1 has no function $name" }}
+    . ([scriptblock]::Create($definition.Extent.Text))
+}}
+{body}
+""",
+            encoding="utf-8",
+        )
+        return subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script)],
+            env=self.environment(),
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
 
     def test_unsupported_architecture_is_rejected(self) -> None:
         environment = {"PROCESSOR_ARCHITECTURE": "x86", "PROCESSOR_ARCHITEW6432": ""}  # 32-bit host

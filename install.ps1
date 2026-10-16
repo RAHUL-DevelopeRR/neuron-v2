@@ -44,8 +44,17 @@ function Write-Detail([string]$Message) { Write-Host "  $Message" }
 function Write-Warn([string]$Message) { Write-Host "warning: $Message" -ForegroundColor Yellow }
 
 function Test-AllowedUrl([string]$Url) {
+    # No userinfo: in http://127.0.0.1:x@evil.example/ the host contacted is evil.example.
+    if ($Url -match '^https?://[^/]*@') { return $false }
     if ($Url -match '^https://') { return $true }
     return $Url -match '^http://(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(/|$)'
+}
+
+function Test-GitHubApiUrl([string]$Url) {
+    # GITHUB_TOKEN is only ever sent to the GitHub API, never to a mirror.
+    $uri = $null
+    if (-not [System.Uri]::TryCreate($Url, [System.UriKind]::Absolute, [ref]$uri)) { return $false }
+    return ($uri.Scheme -eq 'https') -and ($uri.Host -eq 'api.github.com') -and (-not $uri.UserInfo)
 }
 
 function Get-HttpStatus($ErrorRecord) {
@@ -96,7 +105,7 @@ function Resolve-NeuronVersion([string]$Requested) {
     if (-not $api) { $api = "https://api.github.com/repos/$NeuronRepository/releases/latest" }
     if (-not (Test-AllowedUrl $api)) { throw "NEURON_RELEASES_API must be an HTTPS URL (or loopback HTTP): $api" }
     $headers = @{ 'Accept' = 'application/vnd.github+json' }
-    if ($env:GITHUB_TOKEN) { $headers['Authorization'] = "Bearer $($env:GITHUB_TOKEN)" }
+    if ($env:GITHUB_TOKEN -and (Test-GitHubApiUrl $api)) { $headers['Authorization'] = "Bearer $($env:GITHUB_TOKEN)" }
     try {
         $release = Invoke-RestMethod -Uri $api -Headers $headers -UseBasicParsing
     } catch {
@@ -133,6 +142,39 @@ function Add-UserPathEntry([string]$Directory) {
     [System.Environment]::SetEnvironmentVariable($marker, '1', 'User')
     [System.Environment]::SetEnvironmentVariable($marker, $null, 'User')
     return $true
+}
+
+function Install-NeuronBinary([string]$Source, [string]$Destination) {
+    # A running neuron.exe cannot be overwritten, but it can be renamed.
+    $previous = "$Destination.old"
+    $hadPrevious = Test-Path -LiteralPath $Destination
+    if ($hadPrevious) {
+        Remove-Item -LiteralPath $previous -Force -ErrorAction SilentlyContinue
+        Move-Item -LiteralPath $Destination -Destination $previous -Force
+    }
+    try {
+        Move-Item -LiteralPath $Source -Destination $Destination -Force
+    } catch {
+        $reason = $_.Exception.Message
+        if (-not $hadPrevious) { throw "could not install ${Destination}: $reason" }
+        try {
+            Move-Item -LiteralPath $previous -Destination $Destination -Force
+        } catch {
+            throw "could not install ${Destination}: $reason. The previous version is at $previous; rename it back to neuron.exe."
+        }
+        throw "could not install ${Destination}: $reason. The previous version was kept."
+    }
+    Remove-Item -LiteralPath $previous -Force -ErrorAction SilentlyContinue
+}
+
+function Get-ReportedVersion([string]$VersionOutput) {
+    # The release binary prints a report whose second line is "  Version  X.Y.Z".
+    $lines = @($VersionOutput -split "`r?`n" | Where-Object { $_.Trim() })
+    foreach ($line in $lines) {
+        if ($line -match '^\s*Version\s+(\S+)') { return "neuron $($Matches[1])" }
+    }
+    if ($lines.Count -gt 0) { return $lines[0].Trim() }
+    return $null
 }
 
 function Install-Neuron {
@@ -200,21 +242,14 @@ function Install-Neuron {
 
         New-Item -ItemType Directory -Path $target -Force | Out-Null
         $destination = Join-Path $target 'neuron.exe'
-        if (Test-Path -LiteralPath $destination) {
-            # A running neuron.exe cannot be overwritten, but it can be renamed.
-            $previous = "$destination.old"
-            Remove-Item -LiteralPath $previous -Force -ErrorAction SilentlyContinue
-            Move-Item -LiteralPath $destination -Destination $previous -Force
-        }
-        Move-Item -LiteralPath $download -Destination $destination -Force
-        Remove-Item -LiteralPath "$destination.old" -Force -ErrorAction SilentlyContinue
+        Install-NeuronBinary $download $destination
     } finally {
         Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
     }
 
     Write-Host "Installed $destination" -ForegroundColor Green
-    $firstLine = ($versionOutput -split "`r?`n" | Where-Object { $_ } | Select-Object -First 1)
-    if ($firstLine) { Write-Detail $firstLine }
+    $reported = Get-ReportedVersion $versionOutput
+    if ($reported) { Write-Detail $reported }
 
     $run = 'neuron'
     if (Test-PathEntry $env:Path $target) {

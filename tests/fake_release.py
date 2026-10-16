@@ -10,9 +10,10 @@ and ``<asset>.sha256`` in the release format ``<sha256>  <asset>``. ``serve``
 serves DIR over HTTP on 127.0.0.1 until it is killed, answering
 ``/releases/latest`` with ``{"tag_name": "v<newest staged version>"}``.
 
-The dummy binary prints ``neuron-dummy <version>`` for ``--version`` and its
-arguments otherwise, prints ``pid=<pid>`` when ``$NEURON_DUMMY_PID`` is set (POSIX),
-and exits with ``$NEURON_DUMMY_EXIT`` (default 0).
+The dummy binary prints ``neuron-dummy <version>`` for ``--version`` (or the real
+binary's ``NeuronCLI`` / ``Version`` report when ``$NEURON_DUMMY_VERSION_REPORT`` is
+set) and its arguments otherwise, prints ``pid=<pid>`` when ``$NEURON_DUMMY_PID`` is
+set (POSIX), and exits with ``$NEURON_DUMMY_EXIT`` (default 0).
 """
 
 from __future__ import annotations
@@ -32,7 +33,11 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 POSIX_DUMMY = """#!/bin/sh
-if [ "${{1:-}}" = "--version" ]; then
+if [ "${{1:-}}" = "--version" ] && [ -n "${{NEURON_DUMMY_VERSION_REPORT:-}}" ]; then
+    echo "NeuronCLI"
+    echo "  Version          {version}"
+    echo "  Build date       2026-01-01"
+elif [ "${{1:-}}" = "--version" ]; then
     echo "neuron-dummy {version}"
 else
     echo "neuron-dummy args: $*"
@@ -46,7 +51,11 @@ exit "${{NEURON_DUMMY_EXIT:-0}}"
 WINDOWS_DUMMY = """using System;
 class NeuronDummy {{
     static int Main(string[] args) {{
-        if (args.Length > 0 && args[0] == "--version") {{
+        if (args.Length > 0 && args[0] == "--version" && !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("NEURON_DUMMY_VERSION_REPORT"))) {{
+            Console.WriteLine("NeuronCLI");
+            Console.WriteLine("  Version          {version}");
+            Console.WriteLine("  Build date       2026-01-01");
+        }} else if (args.Length > 0 && args[0] == "--version") {{
             Console.WriteLine("neuron-dummy {version}");
         }} else {{
             Console.WriteLine("neuron-dummy args: " + string.Join(" ", args));
@@ -155,6 +164,7 @@ class FakeReleaseServer:
         self.root = Path(root)
         self.latest_tag = latest_tag
         self.requests: List[Tuple[str, str]] = []
+        self.authorization: List[Optional[str]] = []  # Authorization header of each request
         self._lock = threading.Lock()
         server = self
 
@@ -166,6 +176,7 @@ class FakeReleaseServer:
                 path = self.path.split("?", 1)[0]
                 with server._lock:
                     server.requests.append((self.command, path))
+                    server.authorization.append(self.headers.get("Authorization"))
                 if path.endswith("/releases/latest"):
                     tag = server.latest_tag or server.newest_tag()
                     if tag is None:
