@@ -2332,13 +2332,6 @@ impl LiveCli {
                 }
                 println!();
 
-                // Persist output token count to ~/.neuroncli/quota.json so the
-                // banner shows accurate Azure usage across sessions.
-                if std::env::var("OPENAI_BASE_URL").map_or(false, |u| u.contains("azure")) {
-                    let mut quota = crate::quota::QuotaState::load();
-                    quota.record_azure_usage(summary.usage.output_tokens as u32);
-                }
-
                 if let Some(event) = summary.auto_compaction {
                     println!(
                         "{}",
