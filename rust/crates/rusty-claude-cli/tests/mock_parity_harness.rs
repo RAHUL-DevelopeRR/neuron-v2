@@ -26,7 +26,6 @@ fn make_executable(path: &Path) {
 fn make_executable(_path: &Path) {}
 
 #[test]
-#[ignore = "long-running subprocess harness; on Windows it also needs the USERPROFILE-scoped credential store (WP-A1), and the bash approval scenarios still expect bash to require danger-full-access"]
 #[allow(clippy::too_many_lines)]
 fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios() {
     let manifest_entries = load_scenario_manifest();
@@ -656,7 +655,7 @@ fn assert_bash_stdout_roundtrip(_: &HarnessWorkspace, run: &ScenarioRun) {
         .contains("alpha from bash"));
 }
 
-fn assert_bash_permission_prompt_approved(_: &HarnessWorkspace, run: &ScenarioRun) {
+fn assert_bash_permission_prompt_approved(workspace: &HarnessWorkspace, run: &ScenarioRun) {
     assert!(run.stdout.contains("Permission approval required"));
     assert!(run.stdout.contains("Approve this tool call? [y/N]:"));
     assert_eq!(run.response["iterations"], Value::from(2));
@@ -676,9 +675,10 @@ fn assert_bash_permission_prompt_approved(_: &HarnessWorkspace, run: &ScenarioRu
         .as_str()
         .expect("message text")
         .contains("approved and executed"));
+    assert!(workspace.root.join("approved.txt").is_file());
 }
 
-fn assert_bash_permission_prompt_denied(_: &HarnessWorkspace, run: &ScenarioRun) {
+fn assert_bash_permission_prompt_denied(workspace: &HarnessWorkspace, run: &ScenarioRun) {
     assert!(run.stdout.contains("Permission approval required"));
     assert!(run.stdout.contains("Approve this tool call? [y/N]:"));
     assert_eq!(run.response["iterations"], Value::from(2));
@@ -694,6 +694,7 @@ fn assert_bash_permission_prompt_denied(_: &HarnessWorkspace, run: &ScenarioRun)
         .as_str()
         .expect("message text")
         .contains("denied as expected"));
+    assert!(!workspace.root.join("denied.txt").exists());
 }
 
 fn assert_plugin_tool_roundtrip(_: &HarnessWorkspace, run: &ScenarioRun) {

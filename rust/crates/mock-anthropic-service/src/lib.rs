@@ -420,6 +420,8 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
                 &[r#"{"command":"printf 'alpha from bash'","timeout":1000}"#],
             ),
         },
+        // The approval scenarios write a file (`tee`): read-only commands
+        // such as a bare `printf` run without a prompt in workspace-write.
         Scenario::BashPermissionPromptApproved => match latest_tool_result(request) {
             Some((tool_output, is_error)) => {
                 if is_error {
@@ -434,7 +436,9 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
             None => tool_use_sse(
                 "toolu_bash_prompt_allow",
                 "bash",
-                &[r#"{"command":"printf 'approved via prompt'","timeout":1000}"#],
+                &[
+                    r#"{"command":"printf 'approved via prompt' | tee approved.txt","timeout":1000}"#,
+                ],
             ),
         },
         Scenario::BashPermissionPromptDenied => match latest_tool_result(request) {
@@ -444,7 +448,7 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
             None => tool_use_sse(
                 "toolu_bash_prompt_deny",
                 "bash",
-                &[r#"{"command":"printf 'should not run'","timeout":1000}"#],
+                &[r#"{"command":"printf 'should not run' | tee denied.txt","timeout":1000}"#],
             ),
         },
         Scenario::PluginToolRoundtrip => match latest_tool_result(request) {
@@ -592,7 +596,7 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
                 "msg_bash_prompt_allow_tool",
                 "toolu_bash_prompt_allow",
                 "bash",
-                json!({"command": "printf 'approved via prompt'", "timeout": 1000}),
+                json!({"command": "printf 'approved via prompt' | tee approved.txt", "timeout": 1000}),
             ),
         },
         Scenario::BashPermissionPromptDenied => match latest_tool_result(request) {
@@ -604,7 +608,7 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
                 "msg_bash_prompt_deny_tool",
                 "toolu_bash_prompt_deny",
                 "bash",
-                json!({"command": "printf 'should not run'", "timeout": 1000}),
+                json!({"command": "printf 'should not run' | tee denied.txt", "timeout": 1000}),
             ),
         },
         Scenario::PluginToolRoundtrip => match latest_tool_result(request) {
