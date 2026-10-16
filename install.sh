@@ -257,7 +257,8 @@ fi
 info "verified SHA-256 ${ACTUAL}"
 
 chmod 755 "${TMP_DIR}/${ASSET}"
-if ! VERSION_OUTPUT="$("${TMP_DIR}/${ASSET}" --version 2>&1)"; then
+# </dev/null: under `curl | sh` stdin is the rest of this script.
+if ! VERSION_OUTPUT="$("${TMP_DIR}/${ASSET}" --version </dev/null 2>&1)"; then
     printf '%s\n' "${VERSION_OUTPUT}" >&2
     die "the downloaded binary does not run on this system. Nothing was installed."
 fi

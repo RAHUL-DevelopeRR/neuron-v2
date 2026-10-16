@@ -28,6 +28,9 @@ esac
 
 FAILING_BINARY = b"#!/bin/sh\necho 'cannot execute binary file' >&2\nexit 3\n"
 
+# Reads stdin to the end, as a binary that probes the terminal might.
+STDIN_READING_BINARY = b"#!/bin/sh\ncat >/dev/null\necho 'neuron-dummy stdin-reader'\n"
+
 
 def posix_dummy(version: str) -> bytes:
     return fake_release.POSIX_DUMMY.format(version=version).encode()
@@ -77,6 +80,7 @@ class InstallShTests(unittest.TestCase):
         on_path: bool = False,
         shadow: Optional[Path] = None,
         shell: Optional[str] = None,
+        piped: bool = False,
         **env: str,
     ) -> subprocess.CompletedProcess:
         environment = clean_environment()
@@ -102,8 +106,12 @@ class InstallShTests(unittest.TestCase):
             environment["NEURON_TEST_PATH_PREFIX"] = ":".join(prefix)
             script = 'PATH="$NEURON_TEST_PATH_PREFIX:$PATH"; export PATH; exec "$NEURON_TEST_SHELL" "$0" "$@"'
             command = [shell, "-c", script, str(INSTALL_SH), *args]
+        if piped:
+            # Like `curl -fsSL .../install.sh | sh -s -- ARGS`: the script arrives on stdin.
+            command = [shell, "-s", "--", *args]
         return subprocess.run(
             command,
+            input=INSTALL_SH.read_text(encoding="utf-8") if piped else None,
             env=environment,
             capture_output=True,
             text=True,
@@ -224,6 +232,14 @@ class InstallShTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("does not run on this system", result.stderr)
         self.assertFalse(self.installed().exists())
+
+    def test_piped_install_is_not_cut_short_by_a_binary_that_reads_stdin(self) -> None:
+        fake_release.stage_release(self.releases, VERSION, "neuron-linux-x64", STDIN_READING_BINARY)
+        result = self.run_installer(piped=True, NEURON_VERSION=VERSION)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Installed", result.stderr)
+        self.assertIn("Next steps:", result.stderr)
+        self.assertEqual(self.installed().read_bytes(), STDIN_READING_BINARY)
 
     def test_unpublished_version_points_at_the_releases_page(self) -> None:
         result = self.run_installer(NEURON_VERSION="9.9.9")
