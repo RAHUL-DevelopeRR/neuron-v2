@@ -6503,13 +6503,14 @@ UU conflicted.rs",
 
     #[test]
     fn managed_sessions_default_to_jsonl_and_resolve_legacy_json() {
-        let _guard = cwd_guard();
+        // The store is built for the workspace instead of switching the
+        // process cwd: on Windows a child process another test spawns
+        // meanwhile would inherit that cwd and keep the directory busy.
         let workspace = temp_workspace("session-resolution");
         std::fs::create_dir_all(&workspace).expect("workspace should create");
-        let previous = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&workspace).expect("switch cwd");
+        let store = crate::session_mgmt::session_store_in(&workspace).expect("store");
 
-        let handle = create_managed_session_handle("session-alpha").expect("jsonl handle");
+        let handle = store.create_handle("session-alpha");
         assert!(handle.path.ends_with("session-alpha.jsonl"));
 
         let legacy_path = workspace.join(".claw/sessions/legacy.json");
@@ -6525,7 +6526,8 @@ UU conflicted.rs",
             .save_to_path(&legacy_path)
             .expect("legacy session should save");
 
-        let resolved = resolve_session_reference("legacy").expect("legacy session should resolve");
+        let resolved = crate::session_mgmt::resolve_session_reference_in_store(&store, "legacy")
+            .expect("legacy session should resolve");
         assert_eq!(
             resolved
                 .path
@@ -6536,7 +6538,6 @@ UU conflicted.rs",
                 .expect("legacy path should exist")
         );
 
-        std::env::set_current_dir(previous).expect("restore cwd");
         std::fs::remove_dir_all(workspace).expect("workspace should clean up");
     }
 
@@ -6573,13 +6574,14 @@ UU conflicted.rs",
 
     #[test]
     fn load_session_reference_rejects_workspace_mismatch() {
-        let _guard = cwd_guard();
+        // Loads through workspace B's store instead of switching the process
+        // cwd, which raced other tests (a child process spawned meanwhile
+        // inherited the cwd and kept workspace B from being deleted).
         let workspace_a = temp_workspace("session-mismatch-a");
         let workspace_b = temp_workspace("session-mismatch-b");
         std::fs::create_dir_all(&workspace_a).expect("workspace a should create");
         std::fs::create_dir_all(&workspace_b).expect("workspace b should create");
-        let previous = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&workspace_b).expect("switch cwd");
+        let store_b = crate::session_mgmt::session_store_in(&workspace_b).expect("store");
 
         let session_path = workspace_a.join(".neuron/sessions/legacy-cross.jsonl");
         std::fs::create_dir_all(
@@ -6594,8 +6596,11 @@ UU conflicted.rs",
             .save_to_path(&session_path)
             .expect("session should save");
 
-        let error = crate::load_session_reference(&session_path.display().to_string())
-            .expect_err("mismatched workspace should fail");
+        let error = crate::session_mgmt::load_session_reference_in_store(
+            &store_b,
+            &session_path.display().to_string(),
+        )
+        .expect_err("mismatched workspace should fail");
         assert!(
             error.to_string().contains("session workspace mismatch"),
             "unexpected error: {error}"
@@ -6613,7 +6618,6 @@ UU conflicted.rs",
             "expected originating workspace in error: {error}"
         );
 
-        std::env::set_current_dir(previous).expect("restore cwd");
         std::fs::remove_dir_all(workspace_a).expect("workspace a should clean up");
         std::fs::remove_dir_all(workspace_b).expect("workspace b should clean up");
     }

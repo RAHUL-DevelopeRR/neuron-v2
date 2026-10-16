@@ -37,8 +37,12 @@ pub fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
 }
 
 pub fn current_session_store() -> Result<runtime::SessionStore, Box<dyn std::error::Error>> {
-    let cwd = env::current_dir()?;
-    runtime::SessionStore::from_cwd(&cwd).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+    session_store_in(&env::current_dir()?)
+}
+
+/// The session store of the workspace at `cwd`.
+pub fn session_store_in(cwd: &Path) -> Result<runtime::SessionStore, Box<dyn std::error::Error>> {
+    runtime::SessionStore::from_cwd(cwd).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
 
 pub fn new_cli_session() -> Result<Session, Box<dyn std::error::Error>> {
@@ -117,7 +121,14 @@ pub fn latest_managed_session() -> Result<ManagedSessionSummary, Box<dyn std::er
 pub fn load_session_reference(
     reference: &str,
 ) -> Result<(SessionHandle, Session), Box<dyn std::error::Error>> {
-    let loaded = current_session_store()?
+    load_session_reference_in_store(&current_session_store()?, reference)
+}
+
+pub fn load_session_reference_in_store(
+    store: &runtime::SessionStore,
+    reference: &str,
+) -> Result<(SessionHandle, Session), Box<dyn std::error::Error>> {
+    let loaded = store
         .load_session(reference)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     Ok((
