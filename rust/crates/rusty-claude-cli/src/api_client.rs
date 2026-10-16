@@ -4,9 +4,166 @@
 
 use super::*;
 use api::{self, AuthSource};
+use runtime::{CancellationToken, RuntimeErrorKind};
 use std::collections::BTreeMap;
 use std::env;
 use std::io::{self, Write};
+
+/// Default time to wait for the first stream event of a fresh request.
+pub(crate) const DEFAULT_FIRST_TOKEN_TIMEOUT: Duration = Duration::from_secs(90);
+/// Default time to wait for the first stream event after tool results.
+pub(crate) const DEFAULT_POST_TOOL_FIRST_TOKEN_TIMEOUT: Duration = Duration::from_secs(60);
+/// Longest tolerated gap between two stream events once streaming started.
+pub(crate) const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Overrides both first-token timeouts (seconds).
+pub(crate) const FIRST_TOKEN_TIMEOUT_ENV_VAR: &str = "NEURON_FIRST_TOKEN_TIMEOUT_SECS";
+/// A stalled or interrupted request is retried once.
+const MAX_STREAM_ATTEMPTS: usize = 2;
+
+/// Deadlines applied while consuming a model stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StreamTimeouts {
+    pub first_token: Duration,
+    pub post_tool_first_token: Duration,
+    pub idle: Duration,
+}
+
+impl Default for StreamTimeouts {
+    fn default() -> Self {
+        Self {
+            first_token: DEFAULT_FIRST_TOKEN_TIMEOUT,
+            post_tool_first_token: DEFAULT_POST_TOOL_FIRST_TOKEN_TIMEOUT,
+            idle: DEFAULT_STREAM_IDLE_TIMEOUT,
+        }
+    }
+}
+
+impl StreamTimeouts {
+    /// Defaults with `NEURON_FIRST_TOKEN_TIMEOUT_SECS` applied to both
+    /// first-token deadlines when it holds a positive integer.
+    pub(crate) fn from_env() -> Self {
+        Self::from_override(env::var(FIRST_TOKEN_TIMEOUT_ENV_VAR).ok().as_deref())
+    }
+
+    pub(crate) fn from_override(value: Option<&str>) -> Self {
+        let mut timeouts = Self::default();
+        if let Some(seconds) = value
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .filter(|seconds| *seconds > 0)
+        {
+            timeouts.first_token = Duration::from_secs(seconds);
+            timeouts.post_tool_first_token = Duration::from_secs(seconds);
+        }
+        timeouts
+    }
+
+    pub(crate) fn first_token_for(self, after_tool_results: bool) -> Duration {
+        if after_tool_results {
+            self.post_tool_first_token
+        } else {
+            self.first_token
+        }
+    }
+}
+
+/// Why consuming one model stream failed. Retry decisions match on this type,
+/// never on error text.
+#[derive(Debug)]
+pub(crate) enum StreamFailure {
+    /// No stream event arrived before the first-token deadline.
+    FirstTokenTimeout {
+        waited: Duration,
+        after_tool_results: bool,
+    },
+    /// Streaming started but then went silent for longer than the idle limit.
+    Idle { waited: Duration },
+    /// The stream broke off before the response completed (connection reset,
+    /// truncated SSE body, provider stream error).
+    Interrupted { detail: String },
+    /// The turn was cancelled while waiting.
+    Cancelled,
+    /// A failure that retrying the same request will not fix.
+    Fatal(RuntimeError),
+}
+
+impl StreamFailure {
+    pub(crate) fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::FirstTokenTimeout { .. } | Self::Idle { .. } | Self::Interrupted { .. }
+        )
+    }
+
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Self::FirstTokenTimeout {
+                waited,
+                after_tool_results: true,
+            } => format!(
+                "The model did not respond within {}s after the tool results",
+                waited.as_secs()
+            ),
+            Self::FirstTokenTimeout { waited, .. } => format!(
+                "The model did not start responding within {}s",
+                waited.as_secs()
+            ),
+            Self::Idle { waited } => format!(
+                "The model stream stalled (no data for {}s)",
+                waited.as_secs()
+            ),
+            Self::Interrupted { detail } => {
+                format!("The response stream was interrupted ({detail})")
+            }
+            Self::Cancelled => "Request cancelled".to_string(),
+            Self::Fatal(error) => error.to_string(),
+        }
+    }
+
+    pub(crate) fn into_runtime_error(self) -> RuntimeError {
+        let kind = match &self {
+            Self::FirstTokenTimeout { .. } | Self::Idle { .. } => RuntimeErrorKind::Timeout,
+            Self::Interrupted { .. } => RuntimeErrorKind::StreamInterrupted,
+            Self::Cancelled => RuntimeErrorKind::Cancelled,
+            Self::Fatal(_) => RuntimeErrorKind::Other,
+        };
+        match self {
+            Self::Fatal(error) => error,
+            Self::Cancelled => RuntimeError::with_kind(kind, "request cancelled by user"),
+            other => RuntimeError::with_kind(
+                kind,
+                format!(
+                    "{} (after one retry). The provider may be overloaded; try again, or switch models with /model.",
+                    other.describe()
+                ),
+            ),
+        }
+    }
+}
+
+/// Classifies an error returned while reading the stream. Provider status
+/// errors keep their own retry semantics (`is_retryable`); transport-level
+/// failures, including truncated streams, are treated as interruptions.
+pub(crate) fn classify_stream_read_error(session_id: &str, error: &api::ApiError) -> StreamFailure {
+    let detail = format_user_visible_api_error(session_id, error);
+    match error {
+        api::ApiError::Api { .. }
+        | api::ApiError::RetriesExhausted { .. }
+        | api::ApiError::MissingCredentials { .. }
+        | api::ApiError::ContextWindowExceeded { .. }
+        | api::ApiError::ExpiredOAuthToken
+        | api::ApiError::Auth(_)
+        | api::ApiError::InvalidApiKeyEnv(_)
+        | api::ApiError::BackoffOverflow { .. }
+        | api::ApiError::RequestBodySizeExceeded { .. } => {
+            if error.is_retryable() {
+                StreamFailure::Interrupted { detail }
+            } else {
+                StreamFailure::Fatal(RuntimeError::new(detail))
+            }
+        }
+        _ => StreamFailure::Interrupted { detail },
+    }
+}
 
 pub(crate) struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
@@ -19,6 +176,45 @@ pub(crate) struct AnthropicRuntimeClient {
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
     reasoning_effort: Option<String>,
+    timeouts: StreamTimeouts,
+}
+
+/// Builds the provider client for `model`, routing Anthropic models through
+/// the CLI auth source (and `ANTHROPIC_BASE_URL`) and everything else through
+/// the OpenAI-compatible client configured from the environment.
+pub(crate) fn build_provider_client(
+    model: &str,
+    session_id: Option<&str>,
+) -> Result<ApiProviderClient, Box<dyn std::error::Error>> {
+    // Dispatch to the correct provider at construction time.
+    // `ApiProviderClient` (exposed by the api crate as `ProviderClient`) is
+    // an enum over Anthropic / xAI / OpenAI variants, where xAI and OpenAI
+    // both use the OpenAI-compat wire format. `detect_provider_kind` is
+    // consulted so model-name prefix routing (`openai/`, `gpt-`, `grok`,
+    // `qwen/`) wins over env-var presence.
+    //
+    // For Anthropic we build the client directly so `api::read_base_url()`
+    // (ANTHROPIC_BASE_URL, required by the mock-server harness) applies, and
+    // attach a session-scoped prompt cache when a session id is known.
+    let resolved_model = api::resolve_model_alias(model);
+    Ok(match detect_provider_kind(&resolved_model) {
+        ProviderKind::Anthropic => {
+            let auth = resolve_cli_auth_source()?;
+            let inner = AnthropicClient::from_auth(auth).with_base_url(api::read_base_url());
+            let inner = match session_id {
+                Some(session_id) => inner.with_prompt_cache(PromptCache::new(session_id)),
+                None => inner,
+            };
+            ApiProviderClient::Anthropic(inner)
+        }
+        // `from_model_with_anthropic_auth(.., None)` builds an
+        // `OpenAiCompatClient::from_env` with the matching config (openai /
+        // xai / dashscope), covering OpenAI, OpenRouter, xAI, DashScope,
+        // Ollama and the Zero-X gateway.
+        ProviderKind::Xai | ProviderKind::OpenAi => {
+            ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
+        }
+    })
 }
 
 impl AnthropicRuntimeClient {
@@ -31,48 +227,7 @@ impl AnthropicRuntimeClient {
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        // Dispatch to the correct provider at construction time.
-        // `ApiProviderClient` (exposed by the api crate as
-        // `ProviderClient`) is an enum over Anthropic / xAI / OpenAI
-        // variants, where xAI and OpenAI both use the OpenAI-compat
-        // wire format under the hood. We consult
-        // `detect_provider_kind(&resolved_model)` so model-name prefix
-        // routing (`openai/`, `gpt-`, `grok`, `qwen/`) wins over
-        // env-var presence.
-        //
-        // For Anthropic we build the client directly instead of going
-        // through `ApiProviderClient::from_model_with_anthropic_auth`
-        // so we can explicitly apply `api::read_base_url()` â€” that
-        // reads `ANTHROPIC_BASE_URL` and is required for the local
-        // mock-server test harness
-        // (`crates/rusty-claude-cli/tests/compact_output.rs`) to point
-        // neuron at its fake Anthropic endpoint. We also attach a
-        // session-scoped prompt cache on the Anthropic path; the
-        // prompt cache is Anthropic-only so non-Anthropic variants
-        // skip it.
-        let resolved_model = api::resolve_model_alias(&model);
-        let client = match detect_provider_kind(&resolved_model) {
-            ProviderKind::Anthropic => {
-                let auth = resolve_cli_auth_source()?;
-                let inner = AnthropicClient::from_auth(auth)
-                    .with_base_url(api::read_base_url())
-                    .with_prompt_cache(PromptCache::new(session_id));
-                ApiProviderClient::Anthropic(inner)
-            }
-            ProviderKind::Xai | ProviderKind::OpenAi => {
-                // The api crate's `ProviderClient::from_model_with_anthropic_auth`
-                // with `None` for the anthropic auth routes via
-                // `detect_provider_kind` and builds an
-                // `OpenAiCompatClient::from_env` with the matching
-                // `OpenAiCompatConfig` (openai / xai / dashscope).
-                // That reads the correct API-key env var and BASE_URL
-                // override internally, so this one call covers OpenAI,
-                // OpenRouter, xAI, DashScope, Ollama, and any other
-                // OpenAI-compat endpoint users configure via
-                // `OPENAI_BASE_URL` / `XAI_BASE_URL` / `DASHSCOPE_BASE_URL`.
-                ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
-            }
-        };
+        let client = build_provider_client(&model, Some(session_id))?;
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
             client,
@@ -84,11 +239,48 @@ impl AnthropicRuntimeClient {
             tool_registry,
             progress_reporter,
             reasoning_effort: None,
+            timeouts: StreamTimeouts::from_env(),
         })
     }
 
     pub fn set_reasoning_effort(&mut self, effort: Option<String>) {
         self.reasoning_effort = effort;
+    }
+
+    pub fn reasoning_effort(&self) -> Option<&str> {
+        self.reasoning_effort.as_deref()
+    }
+
+    pub fn emit_output(&self) -> bool {
+        self.emit_output
+    }
+
+    pub fn allowed_tools(&self) -> Option<&AllowedToolSet> {
+        self.allowed_tools.as_ref()
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub fn set_timeouts(&mut self, timeouts: StreamTimeouts) {
+        self.timeouts = timeouts;
+    }
+
+    fn message_request(&self, request: &ApiRequest) -> MessageRequest {
+        MessageRequest {
+            model: self.model.clone(),
+            max_tokens: max_tokens_for_model(&self.model),
+            messages: convert_messages(&request.messages),
+            system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
+            tools: self
+                .enable_tools
+                .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
+            tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
+            stream: true,
+            reasoning_effort: self.reasoning_effort.clone(),
+            ..Default::default()
+        }
     }
 }
 
@@ -101,74 +293,79 @@ pub(crate) fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiEr
 }
 
 impl ApiClient for AnthropicRuntimeClient {
-    #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        self.stream_with_cancellation(request, &CancellationToken::new())
+    }
+
+    fn stream_with_cancellation(
+        &mut self,
+        request: ApiRequest,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<AssistantEvent>, RuntimeError> {
         if let Some(progress_reporter) = &self.progress_reporter {
             progress_reporter.mark_model_phase();
         }
-        let is_post_tool = request_ends_with_tool_result(&request);
-        let message_request = MessageRequest {
-            model: self.model.clone(),
-            max_tokens: max_tokens_for_model(&self.model),
-            messages: convert_messages(&request.messages),
-            system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
-            tools: self
-                .enable_tools
-                .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
-            tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
-            stream: true,
-            reasoning_effort: self.reasoning_effort.clone(),
-            ..Default::default()
-        };
+        let after_tool_results = request_ends_with_tool_result(&request);
+        let message_request = self.message_request(&request);
 
         self.runtime.block_on(async {
-            // When resuming after tool execution, apply a stall timeout on the
-            // first stream event.  If the model does not respond within the
-            // deadline we drop the stalled connection and re-send the request as
-            // a continuation nudge (one retry only).
-            let max_attempts: usize = if is_post_tool { 2 } else { 1 };
-
-            for attempt in 1..=max_attempts {
-                let result = self
-                    .consume_stream(&message_request, is_post_tool && attempt == 1)
-                    .await;
-                match result {
+            let mut attempt = 1;
+            loop {
+                match self
+                    .consume_stream(&message_request, after_tool_results, cancel)
+                    .await
+                {
                     Ok(events) => return Ok(events),
-                    Err(error)
-                        if error.to_string().contains("post-tool stall")
-                            && attempt < max_attempts =>
-                    {
-                        // Stalled after tool completion â€” nudge the model by
-                        // re-sending the same request.
+                    Err(failure) if failure.is_retryable() && attempt < MAX_STREAM_ATTEMPTS => {
+                        // A stalled or broken stream is retried once with the
+                        // same request; typed failures decide, not messages.
+                        eprintln!(
+                            "\n\u{26a0} {} \u{2014} retrying once\u{2026}",
+                            failure.describe()
+                        );
+                        attempt += 1;
                     }
-                    Err(error) => return Err(error),
+                    Err(failure) => return Err(failure.into_runtime_error()),
                 }
             }
-
-            Err(RuntimeError::new("post-tool continuation nudge exhausted"))
         })
     }
 }
 
 impl AnthropicRuntimeClient {
-    /// Consume a single streaming response, optionally applying a stall
-    /// timeout on the first event for post-tool continuations.
+    /// Consumes a single streaming response. The first-token deadline covers
+    /// connecting and the first event; afterwards every gap between events is
+    /// bounded by the idle timeout. Both waits race the cancellation token.
     #[allow(clippy::too_many_lines)]
     async fn consume_stream(
         &self,
         message_request: &MessageRequest,
-        apply_stall_timeout: bool,
-    ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        after_tool_results: bool,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<AssistantEvent>, StreamFailure> {
         if std::env::var("NEURON_DEBUG").is_ok() {
             eprintln!("[DEBUG] sending stream_message to API...");
         }
-        let mut stream = self
-            .client
-            .stream_message(message_request)
-            .await
-            .map_err(|error| {
-                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-            })?;
+        let started = Instant::now();
+        let first_token_timeout = self.timeouts.first_token_for(after_tool_results);
+        let mut stream = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(StreamFailure::Cancelled),
+            result = tokio::time::timeout(first_token_timeout, self.client.stream_message(message_request)) => match result {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(error)) => {
+                    return Err(StreamFailure::Fatal(RuntimeError::new(
+                        format_user_visible_api_error(&self.session_id, &error),
+                    )))
+                }
+                Err(_elapsed) => {
+                    return Err(StreamFailure::FirstTokenTimeout {
+                        waited: first_token_timeout,
+                        after_tool_results,
+                    })
+                }
+            },
+        };
         if std::env::var("NEURON_DEBUG").is_ok() {
             eprintln!("[DEBUG] stream_message connected, reading events...");
         }
@@ -186,35 +383,31 @@ impl AnthropicRuntimeClient {
         let mut block_has_thinking_summary = false;
         let mut saw_stop = false;
         let mut received_any_event = false;
+        let render_error =
+            |error: io::Error| StreamFailure::Fatal(RuntimeError::new(error.to_string()));
 
         loop {
-            let next = if !received_any_event {
-                // Apply a timeout on the first event for ALL streams.
-                // Post-tool continuations get a tight 10s deadline;
-                // initial streams get a generous 60s to account for
-                // cold-start latency on Azure/OpenRouter.
-                let deadline = if apply_stall_timeout {
-                    POST_TOOL_STALL_TIMEOUT
-                } else {
-                    INITIAL_STREAM_TIMEOUT
-                };
-                match tokio::time::timeout(deadline, stream.next_event()).await {
-                    Ok(inner) => inner.map_err(|error| {
-                        RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                    })?,
-                    Err(_elapsed) => {
-                        let message = if apply_stall_timeout {
-                            format!("The model is taking longer than expected after tool execution ({}s). Retrying...", deadline.as_secs())
-                        } else {
-                            format!("Connection timed out after {}s. The API may be slow or unreachable. Retrying...", deadline.as_secs())
-                        };
-                        return Err(RuntimeError::new(message));
-                    }
-                }
+            let deadline = if received_any_event {
+                self.timeouts.idle
             } else {
-                stream.next_event().await.map_err(|error| {
-                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                })?
+                first_token_timeout.saturating_sub(started.elapsed())
+            };
+            let next = tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(StreamFailure::Cancelled),
+                result = tokio::time::timeout(deadline, stream.next_event()) => match result {
+                    Ok(Ok(next)) => next,
+                    Ok(Err(error)) => return Err(classify_stream_read_error(&self.session_id, &error)),
+                    Err(_elapsed) if received_any_event => {
+                        return Err(StreamFailure::Idle { waited: self.timeouts.idle })
+                    }
+                    Err(_elapsed) => {
+                        return Err(StreamFailure::FirstTokenTimeout {
+                            waited: first_token_timeout,
+                            after_tool_results,
+                        })
+                    }
+                },
             };
 
             let Some(event) = next else {
@@ -233,11 +426,13 @@ impl AnthropicRuntimeClient {
                             &mut pending_tool,
                             true,
                             &mut block_has_thinking_summary,
-                        )?;
+                        )
+                        .map_err(StreamFailure::Fatal)?;
                         if let Some(tool) = pending_tool {
                             pending_tools.insert(
-                                u32::try_from(index)
-                                    .map_err(|error| RuntimeError::new(error.to_string()))?,
+                                u32::try_from(index).map_err(|error| {
+                                    StreamFailure::Fatal(RuntimeError::new(error.to_string()))
+                                })?,
                                 tool,
                             );
                         }
@@ -252,7 +447,8 @@ impl AnthropicRuntimeClient {
                         &mut pending_tool,
                         true,
                         &mut block_has_thinking_summary,
-                    )?;
+                    )
+                    .map_err(StreamFailure::Fatal)?;
                     if let Some(tool) = pending_tool {
                         pending_tools.insert(start.index, tool);
                     }
@@ -266,7 +462,7 @@ impl AnthropicRuntimeClient {
                             if let Some(rendered) = markdown_stream.push(&renderer, &text) {
                                 write!(out, "{rendered}")
                                     .and_then(|()| out.flush())
-                                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                                    .map_err(render_error)?;
                             }
                             events.push(AssistantEvent::TextDelta(text));
                         }
@@ -278,7 +474,8 @@ impl AnthropicRuntimeClient {
                     }
                     ContentBlockDelta::ThinkingDelta { .. } => {
                         if !block_has_thinking_summary {
-                            render_thinking_block_summary(out, None, false)?;
+                            render_thinking_block_summary(out, None, false)
+                                .map_err(StreamFailure::Fatal)?;
                             block_has_thinking_summary = true;
                         }
                     }
@@ -289,7 +486,7 @@ impl AnthropicRuntimeClient {
                     if let Some(rendered) = markdown_stream.flush(&renderer) {
                         write!(out, "{rendered}")
                             .and_then(|()| out.flush())
-                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                            .map_err(render_error)?;
                     }
                     if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
                         if let Some(progress_reporter) = &self.progress_reporter {
@@ -298,19 +495,22 @@ impl AnthropicRuntimeClient {
                         // Display tool call now that input is fully accumulated
                         writeln!(out, "\n{}", format_tool_call_start(&name, &input))
                             .and_then(|()| out.flush())
-                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                            .map_err(render_error)?;
                         events.push(AssistantEvent::ToolUse { id, name, input });
                     }
                 }
                 ApiStreamEvent::MessageDelta(delta) => {
                     events.push(AssistantEvent::Usage(delta.usage.token_usage()));
+                    if let Some(stop_reason) = delta.delta.stop_reason {
+                        events.push(AssistantEvent::StopReason(stop_reason));
+                    }
                 }
                 ApiStreamEvent::MessageStop(_) => {
                     saw_stop = true;
                     if let Some(rendered) = markdown_stream.flush(&renderer) {
                         write!(out, "{rendered}")
                             .and_then(|()| out.flush())
-                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                            .map_err(render_error)?;
                     }
                     events.push(AssistantEvent::MessageStop);
                 }
@@ -318,18 +518,18 @@ impl AnthropicRuntimeClient {
         }
 
         if !pending_tools.is_empty() {
-            return Err(RuntimeError::new(
-                "Stream ended before all tool argument blocks completed",
-            ));
+            return Err(StreamFailure::Interrupted {
+                detail: "stream ended before all tool argument blocks completed".to_string(),
+            });
         }
         if !saw_stop
             && events
                 .iter()
                 .any(|event| matches!(event, AssistantEvent::ToolUse { .. }))
         {
-            return Err(RuntimeError::new(
-                "Stream ended before the tool message completed",
-            ));
+            return Err(StreamFailure::Interrupted {
+                detail: "stream ended before the tool message completed".to_string(),
+            });
         }
         push_prompt_cache_record(&self.client, &mut events);
 
@@ -348,17 +548,21 @@ impl AnthropicRuntimeClient {
             return Ok(events);
         }
 
-        let response = self
-            .client
-            .send_message(&MessageRequest {
-                stream: false,
-                ..message_request.clone()
-            })
-            .await
-            .map_err(|error| {
-                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-            })?;
-        let mut events = response_to_events(response, out)?;
+        let fallback_request = MessageRequest {
+            stream: false,
+            ..message_request.clone()
+        };
+        let response = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(StreamFailure::Cancelled),
+            response = self.client.send_message(&fallback_request) => response.map_err(|error| {
+                StreamFailure::Fatal(RuntimeError::new(format_user_visible_api_error(
+                    &self.session_id,
+                    &error,
+                )))
+            })?,
+        };
+        let mut events = response_to_events(response, out).map_err(StreamFailure::Fatal)?;
         push_prompt_cache_record(&self.client, &mut events);
         Ok(events)
     }
@@ -574,7 +778,6 @@ pub(crate) const STUB_COMMANDS: &[&str] = &[
     "rename",
     "copy",
     "hooks",
-    "context",
     "color",
     "effort",
     "branch",
@@ -825,6 +1028,9 @@ pub(crate) fn response_to_events(
     }
 
     events.push(AssistantEvent::Usage(response.usage.token_usage()));
+    if let Some(stop_reason) = response.stop_reason {
+        events.push(AssistantEvent::StopReason(stop_reason));
+    }
     events.push(AssistantEvent::MessageStop);
     Ok(events)
 }
@@ -856,4 +1062,354 @@ pub(crate) fn prompt_cache_record_to_runtime_event(
         current_cache_read_input_tokens: cache_break.current_cache_read_input_tokens,
         token_drop: cache_break.token_drop,
     })
+}
+
+#[cfg(test)]
+mod stream_resilience_tests {
+    use super::{
+        classify_stream_read_error, response_to_events, AnthropicRuntimeClient, StreamFailure,
+        StreamTimeouts, DEFAULT_FIRST_TOKEN_TIMEOUT, DEFAULT_POST_TOOL_FIRST_TOKEN_TIMEOUT,
+        DEFAULT_STREAM_IDLE_TIMEOUT,
+    };
+    use crate::{ApiProviderClient, MessageResponse};
+    use api::{OpenAiCompatClient, OpenAiCompatConfig, OutputContentBlock, Usage};
+    use runtime::{
+        ApiClient, ApiRequest, AssistantEvent, CancellationToken, ConversationMessage,
+        RuntimeErrorKind,
+    };
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    /// How the fake gateway answers each connection.
+    #[derive(Clone, Copy)]
+    enum Behavior {
+        /// Read the request and never answer.
+        Hang,
+        /// Answer with headers and one chunk, then go silent.
+        StallAfterFirstChunk,
+        /// Answer with a complete stream cut off by the output limit.
+        TruncatedText,
+    }
+
+    struct FakeGateway {
+        base_url: String,
+        connections: Arc<AtomicUsize>,
+        _held: Arc<Mutex<Vec<TcpStream>>>,
+    }
+
+    fn read_request(stream: &mut TcpStream) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        while let Ok(read) = stream.read(&mut chunk) {
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            let text = String::from_utf8_lossy(&buffer);
+            if let Some(header_end) = text.find("\r\n\r\n") {
+                let length = text[..header_end]
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if buffer.len() >= header_end + 4 + length {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn sse_chunk(value: &serde_json::Value) -> String {
+        format!("data: {value}\n\n")
+    }
+
+    fn spawn_gateway(behavior: Behavior) -> FakeGateway {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base_url = format!("http://{}/v1", listener.local_addr().expect("addr"));
+        let connections = Arc::new(AtomicUsize::new(0));
+        let held = Arc::new(Mutex::new(Vec::new()));
+        let counter = Arc::clone(&connections);
+        let holder = Arc::clone(&held);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                counter.fetch_add(1, Ordering::SeqCst);
+                read_request(&mut stream);
+                match behavior {
+                    Behavior::Hang => {}
+                    Behavior::StallAfterFirstChunk => {
+                        let first = sse_chunk(&serde_json::json!({
+                            "id": "t", "model": "m",
+                            "choices": [{"delta": {"content": "partial"}}]
+                        }));
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{first}\r\n",
+                            first.len()
+                        );
+                        let _ = stream.flush();
+                    }
+                    Behavior::TruncatedText => {
+                        let body = [
+                            sse_chunk(&serde_json::json!({
+                                "id": "t", "model": "m",
+                                "choices": [{"delta": {"content": "cut off"}}]
+                            })),
+                            sse_chunk(&serde_json::json!({
+                                "id": "t",
+                                "choices": [{"delta": {}, "finish_reason": "length"}]
+                            })),
+                            "data: [DONE]\n\n".to_string(),
+                        ]
+                        .concat();
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.flush();
+                    }
+                }
+                holder.lock().expect("hold").push(stream);
+            }
+        });
+        FakeGateway {
+            base_url,
+            connections,
+            _held: held,
+        }
+    }
+
+    fn client_for(gateway: &FakeGateway, timeouts: StreamTimeouts) -> AnthropicRuntimeClient {
+        let client = OpenAiCompatClient::new("test-key", OpenAiCompatConfig::openai())
+            .with_base_url(gateway.base_url.clone())
+            .with_retry_policy(0, Duration::from_millis(1), Duration::from_millis(1));
+        AnthropicRuntimeClient {
+            runtime: tokio::runtime::Runtime::new().expect("tokio"),
+            client: ApiProviderClient::OpenAi(client),
+            session_id: "stream-test".to_string(),
+            model: "openai/test-model".to_string(),
+            enable_tools: false,
+            emit_output: false,
+            allowed_tools: None,
+            tool_registry: tools::GlobalToolRegistry::builtin(),
+            progress_reporter: None,
+            reasoning_effort: None,
+            timeouts,
+        }
+    }
+
+    fn request(after_tool: bool) -> ApiRequest {
+        let mut messages = vec![ConversationMessage::user_text("hi")];
+        if after_tool {
+            messages.push(ConversationMessage::tool_result("t1", "bash", "ok", false));
+        }
+        ApiRequest {
+            system_prompt: Vec::new(),
+            messages,
+        }
+    }
+
+    fn fast_timeouts() -> StreamTimeouts {
+        StreamTimeouts {
+            first_token: Duration::from_millis(300),
+            post_tool_first_token: Duration::from_millis(200),
+            idle: Duration::from_millis(300),
+        }
+    }
+
+    #[test]
+    fn timeouts_default_and_env_override() {
+        let defaults = StreamTimeouts::from_override(None);
+        assert_eq!(defaults.first_token, DEFAULT_FIRST_TOKEN_TIMEOUT);
+        assert_eq!(defaults.first_token, Duration::from_secs(90));
+        assert_eq!(
+            defaults.post_tool_first_token,
+            DEFAULT_POST_TOOL_FIRST_TOKEN_TIMEOUT
+        );
+        assert_eq!(defaults.post_tool_first_token, Duration::from_secs(60));
+        assert_eq!(defaults.idle, DEFAULT_STREAM_IDLE_TIMEOUT);
+        assert_eq!(defaults.idle, Duration::from_secs(120));
+        let overridden = StreamTimeouts::from_override(Some(" 30 "));
+        assert_eq!(overridden.first_token, Duration::from_secs(30));
+        assert_eq!(overridden.post_tool_first_token, Duration::from_secs(30));
+        assert_eq!(StreamTimeouts::from_override(Some("0")), defaults);
+        assert_eq!(StreamTimeouts::from_override(Some("soon")), defaults);
+        assert_eq!(defaults.first_token_for(true), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn stalled_first_token_is_retried_once_then_reported_as_typed_timeout() {
+        let gateway = spawn_gateway(Behavior::Hang);
+        let mut client = client_for(&gateway, fast_timeouts());
+
+        let error = client
+            .stream(request(false))
+            .expect_err("a silent gateway must time out");
+
+        assert_eq!(error.kind(), RuntimeErrorKind::Timeout);
+        assert!(error.to_string().contains("after one retry"), "{error}");
+        assert_eq!(gateway.connections.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn post_tool_requests_use_the_post_tool_deadline() {
+        let gateway = spawn_gateway(Behavior::Hang);
+        let mut client = client_for(
+            &gateway,
+            StreamTimeouts {
+                first_token: Duration::from_secs(30),
+                post_tool_first_token: Duration::from_millis(150),
+                idle: Duration::from_secs(30),
+            },
+        );
+        let started = Instant::now();
+        let error = client
+            .stream(request(true))
+            .expect_err("post-tool stall times out");
+        assert_eq!(error.kind(), RuntimeErrorKind::Timeout);
+        assert!(
+            error.to_string().contains("after the tool results"),
+            "{error}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn idle_gap_between_events_is_bounded() {
+        let gateway = spawn_gateway(Behavior::StallAfterFirstChunk);
+        let mut client = client_for(&gateway, fast_timeouts());
+
+        let error = client
+            .stream(request(false))
+            .expect_err("a stalled stream must time out");
+
+        assert_eq!(error.kind(), RuntimeErrorKind::Timeout);
+        assert!(error.to_string().contains("stalled"), "{error}");
+        assert_eq!(gateway.connections.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn cancellation_aborts_a_waiting_stream_promptly() {
+        let gateway = spawn_gateway(Behavior::Hang);
+        let mut client = client_for(
+            &gateway,
+            StreamTimeouts {
+                first_token: Duration::from_secs(60),
+                post_tool_first_token: Duration::from_secs(60),
+                idle: Duration::from_secs(60),
+            },
+        );
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            trigger.cancel();
+        });
+        let started = Instant::now();
+
+        let error = client
+            .stream_with_cancellation(request(false), &cancel)
+            .expect_err("cancelled");
+
+        assert_eq!(error.kind(), RuntimeErrorKind::Cancelled);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(gateway.connections.load(Ordering::SeqCst), 1, "no retry");
+    }
+
+    #[test]
+    fn stop_reason_is_propagated_from_the_stream() {
+        let gateway = spawn_gateway(Behavior::TruncatedText);
+        let mut client = client_for(&gateway, fast_timeouts());
+
+        let events = client.stream(request(false)).expect("stream completes");
+
+        assert!(events.contains(&AssistantEvent::StopReason("length".to_string())));
+        assert!(events.contains(&AssistantEvent::TextDelta("cut off".to_string())));
+    }
+
+    #[test]
+    fn stream_errors_are_classified_by_type() {
+        let interrupted = classify_stream_read_error(
+            "s",
+            &api::ApiError::InvalidSseFrame("Tool stream ended without a tool_calls finish reason"),
+        );
+        assert!(matches!(interrupted, StreamFailure::Interrupted { .. }));
+        assert!(interrupted.is_retryable());
+
+        let io = classify_stream_read_error(
+            "s",
+            &api::ApiError::Io(std::io::Error::other("connection reset")),
+        );
+        assert!(io.is_retryable());
+
+        let quota = classify_stream_read_error(
+            "s",
+            &api::ApiError::Api {
+                status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                error_type: Some("insufficient_quota".to_string()),
+                message: Some("daily cap reached".to_string()),
+                request_id: None,
+                body: String::new(),
+                retryable: false,
+                suggested_action: None,
+            },
+        );
+        assert!(matches!(quota, StreamFailure::Fatal(_)));
+        assert!(!quota.is_retryable());
+        assert_eq!(
+            StreamFailure::Interrupted {
+                detail: "x".to_string()
+            }
+            .into_runtime_error()
+            .kind(),
+            RuntimeErrorKind::StreamInterrupted
+        );
+    }
+
+    #[test]
+    fn non_streaming_fallback_reports_stop_reason() {
+        let response = MessageResponse {
+            id: "msg".to_string(),
+            kind: "message".to_string(),
+            role: "assistant".to_string(),
+            content: vec![OutputContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+            model: "m".to_string(),
+            stop_reason: Some("max_tokens".to_string()),
+            stop_sequence: None,
+            usage: Usage::default(),
+            request_id: None,
+        };
+        let events = response_to_events(response, &mut std::io::sink()).expect("events");
+        assert!(events.contains(&AssistantEvent::StopReason("max_tokens".to_string())));
+        assert_eq!(events.last(), Some(&AssistantEvent::MessageStop));
+    }
+
+    #[test]
+    fn max_tokens_follow_the_shared_registry() {
+        assert_eq!(
+            crate::max_tokens_for_model("openai/gemini/gemini-2.5-flash"),
+            32_000
+        );
+        assert_eq!(crate::max_tokens_for_model("groq/qwen/qwen3.8-27b"), 16_384);
+        assert_eq!(crate::max_tokens_for_model("claude-opus-4-6"), 32_000);
+        assert_eq!(
+            crate::max_tokens_for_model("openai/@cf/meta/llama-3.3-70b-instruct-fp8-fast"),
+            8_192
+        );
+        assert_eq!(crate::max_tokens_for_model("openai/auto"), 8_192);
+        assert_eq!(crate::max_tokens_for_model("vendor/unknown"), 8_192);
+    }
 }

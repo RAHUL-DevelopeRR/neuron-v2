@@ -336,6 +336,12 @@ pub(crate) fn describe_tool_progress(name: &str, input: &str) -> String {
     }
 }
 
+/// Builds a conversation runtime that shares the process-wide MCP servers,
+/// plugin registry and tool registry (see [`shared_runtime_plugin_state`]).
+///
+/// The returned [`BuiltRuntime`] does not own that shared state: dropping or
+/// replacing it never shuts MCP servers or plugins down. The REPL and one-shot
+/// paths call [`shutdown_shared_runtime_state`] when the process is done.
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_runtime(
@@ -349,8 +355,10 @@ pub(crate) fn build_runtime(
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
-    let runtime_plugin_state = build_runtime_plugin_state()?;
-    build_runtime_with_plugin_state(
+    let shared = shared_runtime_plugin_state()?;
+    let plugin_registry = shared.state.plugin_registry.clone();
+    let mcp_state = shared.state.mcp_state.clone();
+    let runtime = assemble_conversation_runtime(
         session,
         session_id,
         model,
@@ -360,14 +368,24 @@ pub(crate) fn build_runtime(
         allowed_tools,
         permission_mode,
         progress_reporter,
-        runtime_plugin_state,
-    )
+        shared.state,
+        shared.max_iterations_setting,
+    )?;
+    Ok(BuiltRuntime {
+        runtime: Some(runtime),
+        plugin_registry,
+        plugins_active: false,
+        mcp_state,
+        mcp_active: false,
+    })
 }
 
+/// Builds a runtime that owns `runtime_plugin_state`: plugins are initialized
+/// here and shut down (with the MCP servers) when the runtime is dropped.
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_runtime_with_plugin_state(
-    mut session: Session,
+    session: Session,
     session_id: &str,
     model: String,
     system_prompt: Vec<String>,
@@ -378,6 +396,41 @@ pub(crate) fn build_runtime_with_plugin_state(
     progress_reporter: Option<InternalPromptProgressReporter>,
     runtime_plugin_state: RuntimePluginState,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
+    runtime_plugin_state.plugin_registry.initialize()?;
+    let plugin_registry = runtime_plugin_state.plugin_registry.clone();
+    let mcp_state = runtime_plugin_state.mcp_state.clone();
+    let runtime = assemble_conversation_runtime(
+        session,
+        session_id,
+        model,
+        system_prompt,
+        enable_tools,
+        emit_output,
+        allowed_tools,
+        permission_mode,
+        progress_reporter,
+        runtime_plugin_state,
+        None,
+    )?;
+    Ok(BuiltRuntime::new(runtime, plugin_registry, mcp_state))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_arguments)]
+fn assemble_conversation_runtime(
+    mut session: Session,
+    session_id: &str,
+    model: String,
+    system_prompt: Vec<String>,
+    enable_tools: bool,
+    emit_output: bool,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+    progress_reporter: Option<InternalPromptProgressReporter>,
+    runtime_plugin_state: RuntimePluginState,
+    max_iterations_setting: Option<usize>,
+) -> Result<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
+{
     // Persist the model in session metadata so resumed sessions can report it.
     if session.model.is_none() {
         session.model = Some(model.clone());
@@ -385,15 +438,28 @@ pub(crate) fn build_runtime_with_plugin_state(
     let RuntimePluginState {
         feature_config,
         mut tool_registry,
-        plugin_registry,
+        plugin_registry: _,
         mcp_state,
     } = runtime_plugin_state;
-    plugin_registry.initialize()?;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
     tool_registry.set_enforcer(runtime::permission_enforcer::PermissionEnforcer::new(
         policy.clone(),
     ));
+    let tool_schema_tokens = if enable_tools {
+        estimate_tool_schema_tokens(&filter_tool_specs(&tool_registry, allowed_tools.as_ref()))
+    } else {
+        0
+    };
+    let context_manager = runtime::context_manager::ContextManager::new(
+        runtime::context_manager::ContextBudget::for_model(
+            &model,
+            max_tokens_for_model(&model),
+            tool_schema_tokens,
+        ),
+        runtime::context_manager::ContextPolicy::from_env(),
+    );
+    register_subagent_parent(&model, permission_mode);
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         AnthropicRuntimeClient::new(
@@ -414,11 +480,188 @@ pub(crate) fn build_runtime_with_plugin_state(
         policy,
         system_prompt,
         &feature_config,
-    );
+    )
+    .with_context_manager(context_manager)
+    .with_max_iterations(runtime::resolve_max_iterations(max_iterations_setting));
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
-    Ok(BuiltRuntime::new(runtime, plugin_registry, mcp_state))
+    Ok(runtime)
+}
+
+/// Estimated tokens of the tool definitions sent with every request.
+pub(crate) fn estimate_tool_schema_tokens(definitions: &[ToolDefinition]) -> usize {
+    serde_json::to_string(definitions).map_or(0, |serialized| {
+        runtime::context_manager::estimate_text_tokens(&serialized)
+    })
+}
+
+/// Lets sub-agents spawned by the `Agent` tool inherit the parent's resolved
+/// model, permission mode and provider credentials.
+fn register_subagent_parent(model: &str, permission_mode: PermissionMode) {
+    let factory: tools::SubagentClientFactory = Arc::new(|model: &str| {
+        crate::api_client::build_provider_client(model, None).map_err(|error| error.to_string())
+    });
+    tools::set_subagent_parent_context(tools::SubagentParentContext {
+        model: model.to_string(),
+        permission_mode,
+        client_factory: Some(factory),
+    });
+}
+
+/// Reads the `maxIterations` setting. (The JSON value type is not nameable
+/// outside the runtime crate, hence the closure.)
+#[allow(clippy::redundant_closure_for_method_calls)]
+fn max_iterations_setting(runtime_config: &runtime::RuntimeConfig) -> Option<usize> {
+    runtime_config
+        .get("maxIterations")
+        .and_then(|value| value.as_i64())
+        .and_then(|value| usize::try_from(value).ok())
+}
+
+/// Identity of the configuration the shared plugin state was built from.
+/// Any change (settings files, MCP servers, installed or enabled plugins)
+/// triggers a rebuild on the next [`build_runtime`].
+#[derive(Debug, Clone, PartialEq)]
+struct SharedPluginStateKey {
+    cwd: PathBuf,
+    config_home: PathBuf,
+    config: runtime::RuntimeConfig,
+    plugins: PluginRegistry,
+}
+
+struct SharedRuntimePluginState {
+    key: SharedPluginStateKey,
+    generation: u64,
+    feature_config: runtime::RuntimeFeatureConfig,
+    tool_registry: GlobalToolRegistry,
+    plugin_registry: PluginRegistry,
+    mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+    max_iterations_setting: Option<usize>,
+}
+
+impl SharedRuntimePluginState {
+    fn handle(&self) -> SharedPluginStateHandle {
+        SharedPluginStateHandle {
+            generation: self.generation,
+            state: RuntimePluginState {
+                feature_config: self.feature_config.clone(),
+                tool_registry: self.tool_registry.clone(),
+                plugin_registry: self.plugin_registry.clone(),
+                mcp_state: self.mcp_state.clone(),
+            },
+            max_iterations_setting: self.max_iterations_setting,
+        }
+    }
+
+    fn shutdown(self) {
+        if let Err(error) = self.plugin_registry.shutdown() {
+            eprintln!("warning: plugin shutdown failed: {error}");
+        }
+        if let Some(mcp_state) = self.mcp_state {
+            if let Err(error) = mcp_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .shutdown()
+            {
+                eprintln!("warning: MCP shutdown failed: {error}");
+            }
+        }
+    }
+}
+
+/// Clones of the shared plugin state for one runtime.
+struct SharedPluginStateHandle {
+    generation: u64,
+    state: RuntimePluginState,
+    max_iterations_setting: Option<usize>,
+}
+
+thread_local! {
+    static SHARED_PLUGIN_STATE: std::cell::RefCell<Option<SharedRuntimePluginState>> =
+        const { std::cell::RefCell::new(None) };
+    static SHARED_PLUGIN_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// MCP servers, plugins and tool registry for the current workspace, built
+/// once and reused by every runtime of this REPL session. Rebuilt only when
+/// the configuration or plugin set changed, or after
+/// [`shutdown_shared_runtime_state`] (explicit reload).
+fn shared_runtime_plugin_state() -> Result<SharedPluginStateHandle, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    shared_runtime_plugin_state_with(&cwd, &loader)
+}
+
+fn shared_runtime_plugin_state_with(
+    cwd: &Path,
+    loader: &ConfigLoader,
+) -> Result<SharedPluginStateHandle, Box<dyn std::error::Error>> {
+    let runtime_config = loader.load()?;
+    let plugins = build_plugin_manager(cwd, loader, &runtime_config).plugin_registry()?;
+    let key = SharedPluginStateKey {
+        cwd: cwd.to_path_buf(),
+        config_home: loader.config_home().to_path_buf(),
+        config: runtime_config.clone(),
+        plugins,
+    };
+    SHARED_PLUGIN_STATE.with(|slot| {
+        if let Some(existing) = slot.borrow().as_ref().filter(|state| state.key == key) {
+            return Ok(existing.handle());
+        }
+        if let Some(stale) = slot.borrow_mut().take() {
+            stale.shutdown();
+        }
+        let state = build_runtime_plugin_state_with_loader(cwd, loader, &runtime_config)?;
+        state.plugin_registry.initialize()?;
+        let generation = SHARED_PLUGIN_GENERATION.with(|counter| {
+            counter.set(counter.get() + 1);
+            counter.get()
+        });
+        let shared = SharedRuntimePluginState {
+            key,
+            generation,
+            feature_config: state.feature_config,
+            tool_registry: state.tool_registry,
+            plugin_registry: state.plugin_registry,
+            mcp_state: state.mcp_state,
+            max_iterations_setting: max_iterations_setting(&runtime_config),
+        };
+        let handle = shared.handle();
+        *slot.borrow_mut() = Some(shared);
+        Ok(handle)
+    })
+}
+
+/// Shuts down the shared MCP servers and plugins. The next [`build_runtime`]
+/// rebuilds them, so this doubles as an explicit reload.
+pub(crate) fn shutdown_shared_runtime_state() {
+    if let Some(state) = SHARED_PLUGIN_STATE.with(|slot| slot.borrow_mut().take()) {
+        state.shutdown();
+    }
+}
+
+/// Whether `runtime` still uses the live shared MCP/plugin state. Returns
+/// `false` after the shared state was rebuilt (configuration change) or shut
+/// down (explicit reload), so the caller rebuilds instead of talking to
+/// stopped MCP servers. Runtimes that own their plugin state are always
+/// current.
+pub(crate) fn runtime_uses_current_shared_state(runtime: &BuiltRuntime) -> bool {
+    if runtime.plugins_active || runtime.mcp_active {
+        return true;
+    }
+    SHARED_PLUGIN_STATE.with(|slot| {
+        let slot = slot.borrow();
+        let Some(shared) = slot.as_ref() else {
+            return false;
+        };
+        let same_mcp = match (&shared.mcp_state, &runtime.mcp_state) {
+            (Some(current), Some(mine)) => Arc::ptr_eq(current, mine),
+            (None, None) => true,
+            _ => false,
+        };
+        same_mcp && shared.plugin_registry == runtime.plugin_registry
+    })
 }
 
 pub(crate) struct CliHookProgressReporter;
@@ -454,5 +697,88 @@ impl runtime::HookProgressReporter for CliHookProgressReporter {
                 event_name = event.as_str()
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod shared_state_tests {
+    use super::{
+        estimate_tool_schema_tokens, runtime_uses_current_shared_state,
+        shared_runtime_plugin_state_with, shutdown_shared_runtime_state,
+    };
+    use runtime::ConfigLoader;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn plugin_and_mcp_state_is_built_once_and_rebuilt_only_on_change_or_reload() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "neuron-shared-state-{}-{nanos}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        let config_home = root.join("config");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{"defaultMcpServers":false}"#,
+        )
+        .expect("settings");
+        let loader = ConfigLoader::new(&workspace, &config_home);
+
+        let first = shared_runtime_plugin_state_with(&workspace, &loader).expect("first build");
+        let second = shared_runtime_plugin_state_with(&workspace, &loader).expect("reuse");
+        assert_eq!(first.generation, second.generation, "reused across turns");
+
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{"defaultMcpServers":false,"model":"sonnet"}"#,
+        )
+        .expect("settings change");
+        let third = shared_runtime_plugin_state_with(&workspace, &loader).expect("rebuild");
+        assert_ne!(
+            second.generation, third.generation,
+            "config change rebuilds"
+        );
+
+        // A runtime built on the current state is current until a reload.
+        let built = crate::BuiltRuntime {
+            runtime: None,
+            plugin_registry: third.state.plugin_registry.clone(),
+            plugins_active: false,
+            mcp_state: third.state.mcp_state.clone(),
+            mcp_active: false,
+        };
+        assert!(runtime_uses_current_shared_state(&built));
+
+        shutdown_shared_runtime_state();
+        assert!(
+            !runtime_uses_current_shared_state(&built),
+            "a reloaded state makes live runtimes stale"
+        );
+        let fourth = shared_runtime_plugin_state_with(&workspace, &loader).expect("reload");
+        assert_ne!(
+            third.generation, fourth.generation,
+            "explicit reload rebuilds"
+        );
+
+        shutdown_shared_runtime_state();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tool_schema_estimate_grows_with_the_tool_set() {
+        let registry = tools::GlobalToolRegistry::builtin();
+        let all = estimate_tool_schema_tokens(&registry.definitions(None));
+        let one = estimate_tool_schema_tokens(
+            &registry.definitions(Some(&["read_file".to_string()].into_iter().collect())),
+        );
+        assert!(one > 0);
+        assert!(all > one * 5, "all={all} one={one}");
     }
 }
