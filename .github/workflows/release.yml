@@ -2,7 +2,8 @@ name: Release
 
 # Tag push (vX.Y.Z): build every target, attest provenance, attach the
 # binaries, per-asset .sha256 files, SHA256SUMS, THIRD_PARTY_NOTICES.md and the
-# install scripts to a GitHub release, then verify the public asset URLs.
+# install scripts to a GitHub release, then verify the public asset URLs and
+# install from them on Linux (x64, arm64), macOS and Windows.
 # Registry publishing runs only after that verification and only when
 # explicitly enabled: repository variables ENABLE_NPM_PUBLISH /
 # ENABLE_PYPI_PUBLISH for tag pushes, or the publish_* inputs for a manual run
@@ -325,15 +326,39 @@ jobs:
           done < SHA256SUMS
           sha256sum --check --strict SHA256SUMS
 
-      - name: Install with install.sh from the release
+  install-check:
+    name: Install from the release (${{ matrix.os }})
+    needs: [metadata, readiness]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14, windows-2022]
+    env:
+      TAG: ${{ needs.metadata.outputs.tag }}
+      VERSION: ${{ needs.metadata.outputs.version }}
+    steps:
+      - name: Install with install.sh
+        if: runner.os != 'Windows'
         run: |
           curl --fail --silent --show-error --location "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/install.sh" \
             | NEURON_VERSION="$VERSION" NEURON_INSTALL_DIR="$RUNNER_TEMP/bin" sh
           "$RUNNER_TEMP/bin/neuron" --version | tee /dev/stderr | grep -F "$VERSION"
 
+      - name: Install with install.ps1 (Windows PowerShell 5.1)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $env:NEURON_VERSION = $env:VERSION
+          $env:NEURON_INSTALL_DIR = Join-Path $env:RUNNER_TEMP 'neuron-bin'
+          irm "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:TAG/install.ps1" | iex
+          $output = & (Join-Path $env:NEURON_INSTALL_DIR 'neuron.exe') --version | Out-String
+          Write-Host $output
+          if ($output -notmatch [regex]::Escape($env:VERSION)) { throw "neuron --version did not report $env:VERSION" }
+
   publish-npm:
     name: Publish npm package
-    needs: [metadata, readiness]
+    needs: [metadata, readiness, install-check]
     if: >-
       needs.metadata.outputs.is_release == 'true' &&
       ((github.event_name == 'workflow_dispatch' && inputs.publish_npm) ||
@@ -353,7 +378,6 @@ jobs:
         with:
           node-version: '24'
           registry-url: https://registry.npmjs.org
-          package-manager-cache: false
       - name: Use npm with trusted publishing support
         run: npm install --global npm@^11.5.1
       - name: Install the packed tarball against the live release
@@ -373,7 +397,7 @@ jobs:
 
   publish-pypi:
     name: Publish PyPI package
-    needs: [metadata, readiness]
+    needs: [metadata, readiness, install-check]
     if: >-
       needs.metadata.outputs.is_release == 'true' &&
       ((github.event_name == 'workflow_dispatch' && inputs.publish_pypi) ||
@@ -397,6 +421,18 @@ jobs:
           python -m pip install --upgrade build twine
           python -m build --sdist --wheel
           python -m twine check --strict dist/*
+      - name: Check that the wheel is a pure-Python launcher with license files
+        run: |
+          python - <<'PY'
+          import glob, zipfile
+          (wheel,) = glob.glob('dist/*-py3-none-any.whl')
+          names = zipfile.ZipFile(wheel).namelist()
+          unexpected = [name for name in names if not (name.endswith('.py') or '.dist-info/' in name)]
+          licenses = {name.rsplit('/', 1)[-1] for name in names if '.dist-info/licenses/' in name}
+          if unexpected or not {'LICENSE', 'NOTICE'} <= licenses:
+              raise SystemExit(f'::error::unexpected wheel contents {unexpected}; license files {sorted(licenses)}')
+          print('\n'.join(names))
+          PY
       - name: Install the wheel against the live release
         run: |
           python -m venv "$RUNNER_TEMP/venv"
