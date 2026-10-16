@@ -256,7 +256,10 @@ impl TerminalRenderer {
         let mut code_buffer = String::new();
         let mut in_code_block = false;
 
-        for event in Parser::new_ext(&normalized, Options::all()) {
+        // No smart punctuation: tool output and file contents are rendered
+        // as Markdown too, and `[...values]` must not turn into `[…values]`.
+        let options = Options::all().difference(Options::ENABLE_SMART_PUNCTUATION);
+        for event in Parser::new_ext(&normalized, options) {
             self.render_event(
                 event,
                 &mut state,
@@ -953,6 +956,21 @@ mod tests {
         assert!(markdown_output.contains("• item"));
         assert!(markdown_output.contains("code"));
         assert!(markdown_output.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn keeps_code_punctuation_literal() {
+        let terminal_renderer = TerminalRenderer::new();
+        let plain_text = strip_ansi(
+            &terminal_renderer
+                .render_markdown("const sorted = [...values].sort(); it's \"quoted\" -- here"),
+        );
+
+        assert!(plain_text.contains("[...values]"), "{plain_text}");
+        assert!(
+            plain_text.contains("it's \"quoted\" -- here"),
+            "{plain_text}"
+        );
     }
 
     #[test]
