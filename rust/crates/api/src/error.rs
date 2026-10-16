@@ -449,6 +449,13 @@ pub enum GatewayErrorCode {
     CapacityExhausted,
     UpstreamError,
     UpstreamTimeout,
+    /// Contract v1.1: the requested model id is not in the catalog.
+    ModelNotFound,
+    /// Contract v1.1/v1.2: the gateway cannot serve the request right now
+    /// (for example a session it could not index); safe to retry.
+    ServiceUnavailable,
+    /// Contract v1.1: a personal API key used where only a session works.
+    ApiKeyNotAllowed,
 }
 
 impl GatewayErrorCode {
@@ -467,6 +474,9 @@ impl GatewayErrorCode {
             "capacity_exhausted" => Self::CapacityExhausted,
             "upstream_error" => Self::UpstreamError,
             "upstream_timeout" => Self::UpstreamTimeout,
+            "model_not_found" => Self::ModelNotFound,
+            "service_unavailable" => Self::ServiceUnavailable,
+            "api_key_not_allowed" => Self::ApiKeyNotAllowed,
             _ => return None,
         })
     }
@@ -486,6 +496,9 @@ impl GatewayErrorCode {
             Self::CapacityExhausted => "capacity_exhausted",
             Self::UpstreamError => "upstream_error",
             Self::UpstreamTimeout => "upstream_timeout",
+            Self::ModelNotFound => "model_not_found",
+            Self::ServiceUnavailable => "service_unavailable",
+            Self::ApiKeyNotAllowed => "api_key_not_allowed",
         }
     }
 
@@ -500,6 +513,7 @@ impl GatewayErrorCode {
                 | Self::CapacityExhausted
                 | Self::UpstreamError
                 | Self::UpstreamTimeout
+                | Self::ServiceUnavailable
         )
     }
 
@@ -511,9 +525,13 @@ impl GatewayErrorCode {
             Self::InvalidRequest | Self::ContextLengthExceeded => 400,
             Self::InvalidSession => 401,
             Self::InsufficientCredits => 402,
-            Self::UpgradeRequired | Self::RegionUnavailable | Self::AccountSuspended => 403,
+            Self::UpgradeRequired
+            | Self::RegionUnavailable
+            | Self::AccountSuspended
+            | Self::ApiKeyNotAllowed => 403,
+            Self::ModelNotFound => 404,
             Self::InsufficientQuota | Self::RateLimited => 429,
-            Self::CapacityExhausted => 503,
+            Self::CapacityExhausted | Self::ServiceUnavailable => 503,
             Self::UpstreamError => 502,
             Self::UpstreamTimeout => 504,
         }
@@ -666,9 +684,11 @@ impl GatewayError {
     #[must_use]
     pub fn failure_class(&self) -> &'static str {
         match self.code_kind() {
-            Some(GatewayErrorCode::InvalidSession | GatewayErrorCode::AccountSuspended) => {
-                "provider_auth"
-            }
+            Some(
+                GatewayErrorCode::InvalidSession
+                | GatewayErrorCode::AccountSuspended
+                | GatewayErrorCode::ApiKeyNotAllowed,
+            ) => "provider_auth",
             Some(GatewayErrorCode::ContextLengthExceeded) => "context_window",
             Some(
                 GatewayErrorCode::InsufficientQuota
@@ -683,7 +703,9 @@ impl GatewayError {
             Some(
                 GatewayErrorCode::InvalidRequest
                 | GatewayErrorCode::UpstreamError
-                | GatewayErrorCode::UpstreamTimeout,
+                | GatewayErrorCode::UpstreamTimeout
+                | GatewayErrorCode::ModelNotFound
+                | GatewayErrorCode::ServiceUnavailable,
             ) => "provider_error",
             None => match self.status.as_u16() {
                 401 | 403 => "provider_auth",
@@ -802,6 +824,8 @@ mod gateway_error_tests {
             "invalid_session",
             "invalid_request",
             "context_length_exceeded",
+            "model_not_found",
+            "api_key_not_allowed",
         ] {
             let body = format!(r#"{{"error":{{"message":"no","code":"{code}"}}}}"#);
             // Even with a normally-retryable status the code wins.
@@ -814,6 +838,7 @@ mod gateway_error_tests {
             "capacity_exhausted",
             "upstream_error",
             "upstream_timeout",
+            "service_unavailable",
         ] {
             let body = format!(r#"{{"error":{{"message":"busy","code":"{code}"}}}}"#);
             let error = GatewayError::from_body(status(503), &body).unwrap();
