@@ -1,11 +1,33 @@
 import assert from 'node:assert/strict';
 import {execSync} from 'node:child_process';
-import {readFileSync} from 'node:fs';
+import {readdirSync, readFileSync} from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import {test} from 'node:test';
-import {LauncherError, assetFor, binaryLocations, cacheRoot, downloadBase, parseChecksum} from '../lib/binary.js';
+import {setTimeout as delay} from 'node:timers/promises';
+import {LauncherError, assetFor, binaryLocations, cacheRoot, downloadBase, downloadBinary, parseChecksum} from '../lib/binary.js';
 import {exitCodeForSignal, listenedSignals, shouldForwardSignal} from '../lib/signals.js';
-import {PACKAGE_ROOT, REPO_ROOT} from './helpers.js';
+import {PACKAGE_ROOT, REPO_ROOT, sha256, tempDir} from './helpers.js';
+
+const ASSET = 'neuron-linux-x64';
+
+/** An HTTP server on 127.0.0.1 whose handler may stream slowly or stall; returns its URL. */
+async function slowServer(t, handler) {
+  const server = http.createServer(handler);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => {
+    server.closeAllConnections(); // stalled responses would keep close() waiting
+    return new Promise((resolve) => server.close(resolve));
+  });
+  return `http://127.0.0.1:${server.address().port}`;
+}
+
+function download(t, base, idleTimeoutMs) {
+  const directory = tempDir(t);
+  const destination = path.join(directory, 'neuron');
+  const done = downloadBinary({destination, url: `${base}/v1.0.0/${ASSET}`, version: '1.0.0', asset: ASSET, idleTimeoutMs});
+  return {directory, destination, done};
+}
 
 test('every published platform maps to its release asset', () => {
   const cases = [
@@ -88,4 +110,59 @@ test('npm pack includes the launcher, license files and nothing from test/', () 
     assert.ok(files.includes(expected), `${expected} missing from ${files.join(', ')}`);
   }
   assert.ok(!files.some((file) => file.startsWith('test/') || file.startsWith('bin/native')), files.join(', '));
+});
+
+test('a slow download succeeds while data keeps arriving', async (t) => {
+  const chunks = Array.from({length: 8}, (_, index) => Buffer.alloc(1024, index));
+  const data = Buffer.concat(chunks);
+  const base = await slowServer(t, async (request, response) => {
+    if (request.url.endsWith('.sha256')) {
+      response.end(`${sha256(data)}  ${ASSET}
+`);
+      return;
+    }
+    response.writeHead(200, {'content-length': data.length});
+    for (const chunk of chunks) {
+      response.write(chunk);
+      await delay(150);
+    }
+    response.end();
+  });
+  const started = Date.now();
+  const {destination, done} = download(t, base, 500);
+  assert.equal(await done, destination);
+  assert.ok(Date.now() - started >= 1000, 'the whole transfer took longer than the idle timeout');
+  assert.deepEqual(readFileSync(destination), data);
+});
+
+test('a download that stops sending data fails as a network error and leaves nothing behind', async (t) => {
+  const base = await slowServer(t, (request, response) => {
+    if (request.url.endsWith('.sha256')) {
+      response.end(`${'a'.repeat(64)}  ${ASSET}
+`);
+      return;
+    }
+    response.writeHead(200, {'content-length': 4096});
+    response.write(Buffer.alloc(1024)); // and then nothing
+  });
+  const {directory, done} = download(t, base, 300);
+  await assert.rejects(done, (error) => {
+    assert.ok(error instanceof LauncherError, error);
+    assert.equal(error.kind, 'network');
+    assert.match(error.message, /was interrupted: timed out \(no data received for 0\.3 s\)/);
+    return true;
+  });
+  assert.deepEqual(readdirSync(directory), []);
+});
+
+test('a server that never answers times out with an actionable message', async (t) => {
+  const base = await slowServer(t, () => {}); // accepts the connection, never responds
+  const {done} = download(t, base, 300);
+  await assert.rejects(done, (error) => {
+    assert.ok(error instanceof LauncherError, error);
+    assert.equal(error.kind, 'network');
+    assert.match(error.message, /Could not download Neuron 1\.0\.0 .*timed out/);
+    assert.match(error.message, /NEURON_BINARY_PATH/);
+    return true;
+  });
 });

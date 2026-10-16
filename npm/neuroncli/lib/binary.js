@@ -19,8 +19,9 @@ export const REPOSITORY = 'https://github.com/RAHUL-DevelopeRR/neuron-v2';
 export const DEFAULT_DOWNLOAD_BASE = `${REPOSITORY}/releases/download`;
 export const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-const CHECKSUM_TIMEOUT_MS = 30_000;
-const BINARY_TIMEOUT_MS = 300_000;
+// A download fails only when no data arrives for this long (connecting, waiting for
+// the response, or between body chunks), however slow the link is overall.
+export const IDLE_TIMEOUT_MS = 60_000;
 const SUPPORTED = 'Linux x64/arm64, macOS arm64/x64 and Windows x64';
 
 const ASSETS = new Map([
@@ -118,15 +119,33 @@ export function isVerified(binary) {
 }
 
 function describeFailure(error) {
-  if (error?.name === 'TimeoutError') return 'timed out';
+  if (error?.name === 'TimeoutError') return `timed out (${error.message})`;
   const cause = error?.cause;
   return cause?.code || cause?.message || error?.message || String(error);
 }
 
-async function request(url, version, timeoutMs) {
+/**
+ * An abort signal that fires when `touch()` has not been called for `ms`
+ * milliseconds. Call `clear()` when the transfer is over.
+ */
+export function idleTimeout(ms) {
+  const controller = new AbortController();
+  let timer;
+  const touch = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      controller.abort(new DOMException(`no data received for ${ms / 1000} s`, 'TimeoutError'));
+    }, ms);
+  };
+  touch();
+  return {signal: controller.signal, touch, clear: () => clearTimeout(timer)};
+}
+
+async function request(url, version, idle) {
   let response;
   try {
-    response = await fetch(url, {redirect: 'follow', signal: AbortSignal.timeout(timeoutMs)});
+    response = await fetch(url, {redirect: 'follow', signal: idle.signal});
+    idle.touch();
   } catch (error) {
     throw new LauncherError(
       `Could not download Neuron ${version} from ${url}: ${describeFailure(error)}. ` +
@@ -159,21 +178,50 @@ function replace(temporary, destination) {
   }
 }
 
-/** Downloads `url` to `destination` after checking it against `url.sha256`. */
-export async function downloadBinary({destination, url, version, asset, platform = process.platform, log = () => {}}) {
+async function fetchChecksum(url, version, idleTimeoutMs) {
+  const idle = idleTimeout(idleTimeoutMs);
+  try {
+    const response = await request(url, version, idle);
+    try {
+      return parseChecksum(await response.text());
+    } catch (error) {
+      throw new LauncherError(`Downloading ${url} was interrupted: ${describeFailure(error)}. Try again.`, {
+        cause: error,
+        kind: 'network',
+      });
+    }
+  } finally {
+    idle.clear();
+  }
+}
+
+/**
+ * Downloads `url` to `destination` after checking it against `url.sha256`.
+ * `idleTimeoutMs` bounds each wait for data, not the whole transfer.
+ */
+export async function downloadBinary({
+  destination,
+  url,
+  version,
+  asset,
+  platform = process.platform,
+  log = () => {},
+  idleTimeoutMs = IDLE_TIMEOUT_MS,
+}) {
   mkdirSync(path.dirname(destination), {recursive: true});
   log(`Downloading Neuron ${version} (${asset}) to ${path.dirname(destination)} ...`);
-  const checksumResponse = await request(`${url}.sha256`, version, CHECKSUM_TIMEOUT_MS);
-  const expected = parseChecksum(await checksumResponse.text());
+  const expected = await fetchChecksum(`${url}.sha256`, version, idleTimeoutMs);
   if (!expected) throw new LauncherError(`${url}.sha256 does not contain a SHA-256 checksum.`, {kind: 'integrity'});
 
   const temporary = `${destination}.${process.pid}.${Date.now()}.tmp`;
   const sidecarTemporary = `${temporary}.sha256`;
+  const idle = idleTimeout(idleTimeoutMs);
   try {
-    const response = await request(url, version, BINARY_TIMEOUT_MS);
+    const response = await request(url, version, idle);
     const hash = createHash('sha256');
     const tap = new Transform({
       transform(chunk, _encoding, callback) {
+        idle.touch();
         hash.update(chunk);
         callback(null, chunk);
       },
@@ -201,6 +249,7 @@ export async function downloadBinary({destination, url, version, asset, platform
     replace(sidecarTemporary, `${destination}.sha256`);
     return destination;
   } finally {
+    idle.clear();
     rmSync(temporary, {force: true});
     rmSync(sidecarTemporary, {force: true});
   }
