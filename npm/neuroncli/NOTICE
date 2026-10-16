@@ -1,0 +1,72 @@
+Neuron (https://github.com/RAHUL-DevelopeRR/neuron-v2)
+Copyright (c) 2026 RAHUL S / Zero-X
+
+Neuron is distributed under the MIT License; see LICENSE.
+
+Provenance
+----------
+
+Neuron is derived from Claw Code (https://github.com/ultraworkers/claw-code),
+which is distributed under the MIT License:
+
+    Copyright (c) 2026 UltraWorkers and Claw Code contributors
+
+The Rust workspace under rust/ (including the rusty-claude-cli crate that builds
+the `neuron` binary), the Python porting workspace under src/ and tests/, and
+the parity documents were imported from Claw Code and have since been modified.
+The Claw Code copyright and permission notice is reproduced in LICENSE and must
+be kept in all copies or substantial portions of the software. See
+docs/PROVENANCE.md for the code lineage.
+
+Bundled third-party skills
+--------------------------
+
+The native binary embeds instruction bundles ("skills") from the following
+projects. Each is distributed under the MIT License. The pinned upstream commits
+are recorded in rust/crates/runtime/bundled-skills/SOURCES.json, and the full
+license texts are kept in rust/crates/runtime/bundled-skills/licenses/ and are
+embedded in the binary next to the skills. Neuron adds host-adapter sections to
+some of these skills; those additions are not part of the upstream projects.
+
+  ponytail      https://github.com/DietrichGebert/ponytail
+                MIT License, Copyright (c) 2026 DietrichGebert
+                licenses/ponytail.txt
+
+  antislop      https://github.com/miqdadbadjuber/anti-slop
+                MIT License, Copyright (c) 2026 Miqdad Badjuber (antislop)
+                licenses/antislop.txt
+
+  gstack        https://github.com/garrytan/gstack
+                MIT License, Copyright (c) 2026 Garry Tan
+                licenses/gstack.txt
+
+  agent-reach   https://github.com/Panniantong/Agent-Reach
+                MIT License, Copyright (c) 2025 Agent Eyes
+                licenses/agent-reach.txt
+
+Rust crate dependencies
+-----------------------
+
+The native binary statically links Rust crates published on crates.io under
+their own licenses (mostly MIT and/or Apache-2.0; also ISC, BSD, BSL-1.0, Zlib,
+Unicode-3.0, CDLA-Permissive-2.0 and MPL-2.0). Every GitHub release attaches
+THIRD_PARTY_NOTICES.md, which lists each crate, version, license and repository
+and reproduces the license and notice files shipped with each crate. Generate it
+locally with:
+
+    node scripts/generate-third-party-notices.mjs
+
+npm package dependencies
+------------------------
+
+The npm package @zero-x.live/neuron installs, but does not bundle,
+codebase-memory-mcp (MIT License) and @playwright/mcp (Apache License 2.0).
+npm installs them with their own license files.
+
+Trademarks and affiliation
+--------------------------
+
+Neuron and Zero-X are not affiliated with or endorsed by UltraWorkers, Anthropic,
+OpenAI, Google, Groq, Cloudflare, NVIDIA, OpenRouter, or any other model
+provider. Product and model names are trademarks of their respective owners and
+are used only to identify compatible services.

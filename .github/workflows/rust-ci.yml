@@ -22,8 +22,7 @@ on:
       - ui/react-tui/**
       - package.json
       - package-lock.json
-      - neuron_cli/**
-      - pyproject.toml
+  # Launchers, installers and package manifests: see packaging-ci.yml.
   pull_request:
     paths:
       - .github/workflows/rust-ci.yml
@@ -39,8 +38,6 @@ on:
       - ui/react-tui/**
       - package.json
       - package-lock.json
-      - neuron_cli/**
-      - pyproject.toml
   workflow_dispatch:
 
 concurrency:

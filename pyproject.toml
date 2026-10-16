@@ -1,22 +1,26 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "neuroncli"
 version = "6.2.5"
-description = "NeuronCLI - AI-powered terminal assistant"
+description = "Neuron - terminal coding agent powered by the Zero-X gateway"
 readme = "README.md"
-license = {text = "MIT"}
-requires-python = ">=3.8"
+license = "MIT"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.9"
 authors = [
-    {name = "RAHUL-DevelopeRR"},
+    {name = "RAHUL S / Zero-X"},
 ]
+keywords = ["ai", "coding-agent", "cli", "terminal", "neuron", "zero-x"]
 classifiers = [
     "Development Status :: 4 - Beta",
+    "Environment :: Console",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
     "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Rust",
     "Topic :: Software Development",
@@ -28,10 +32,9 @@ neuron = "neuron_cli:main"
 [project.urls]
 Homepage = "https://github.com/RAHUL-DevelopeRR/neuron-v2"
 Repository = "https://github.com/RAHUL-DevelopeRR/neuron-v2"
+Issues = "https://github.com/RAHUL-DevelopeRR/neuron-v2/issues"
+Pricing = "https://zero-x.live/pricing"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["neuron_cli*"]
-
-[tool.setuptools.package-data]
-neuron_cli = ["neuron.exe", "neuron"]

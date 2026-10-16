@@ -1,6 +1,11 @@
 # @zero-x.live/neuron
 
-Install the Neuron terminal coding agent with Node.js 22.14 or later:
+Neuron is a terminal coding agent. It reads your project, edits files and runs
+commands with your permission, and talks to models through the Zero-X gateway
+(free plan included) or your own provider key.
+
+Requires Node.js 22.14 or later on Linux (x64, arm64, glibc), macOS (Apple
+silicon, Intel) or Windows (x64).
 
 ```sh
 npm install --global @zero-x.live/neuron
@@ -8,8 +13,48 @@ neuron auth login
 neuron
 ```
 
-The installer downloads the native binary for Windows x64, Linux x64, or macOS Apple silicon from the matching GitHub release and checks its SHA-256 file. The first install requires access to GitHub Releases. Provider credentials stay on the Neuron gateway.
+## How the binary is installed
 
-See the [NeuronCLI repository](https://github.com/RAHUL-DevelopeRR/neuron-v2) for supported systems and gateway setup.
+Neuron is a native Rust program. This package contains a small launcher:
 
-Ponytail, antislop, gstack and Agent Reach instructions are embedded in the binary. Codebase Memory and Playwright MCP dependencies are installed with this package and enabled by default. Agent Reach's CLI channels require their own setup; Playwright provides browser control, while desktop control requires a separately configured MCP server. See [integration settings](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/ux-audit-fixes/docs/DEFAULT_INTEGRATIONS.md) for overrides and disabling defaults.
+- `postinstall` downloads `neuron-<platform>` for this exact package version
+  from the project's GitHub Releases and checks it against the release's
+  SHA-256 file before installing it next to the launcher.
+- If install scripts were skipped (`npm install --ignore-scripts`) or the
+  download failed because of the network, the first `neuron` run downloads and
+  verifies it instead. If the package directory is read-only, the binary goes
+  to the user cache (`%LOCALAPPDATA%\neuroncli`, `~/Library/Caches/neuroncli` or
+  `~/.cache/neuroncli`), shared with the Python package.
+- After that, `neuron` starts without network access. Ctrl+C reaches Neuron
+  itself, and the launcher exits with Neuron's exit code.
+
+Environment variables:
+
+| Variable | Purpose |
+| --- | --- |
+| `NEURON_SKIP_DOWNLOAD=1` | Skip the download during `postinstall`. |
+| `NEURON_BINARY_PATH` | Run this native binary instead (development builds). |
+| `NEURON_CACHE_DIR` | Cache directory for downloaded binaries. |
+| `NEURON_DOWNLOAD_BASE` | Release mirror base URL (HTTPS, or loopback HTTP for testing). |
+
+Behind a proxy on Node 24+, set `NODE_USE_ENV_PROXY=1` together with
+`HTTPS_PROXY` so the download goes through it.
+
+## Default integrations
+
+Ponytail, antislop, gstack and Agent Reach instructions are embedded in the
+binary. The Codebase Memory and Playwright MCP servers are installed with this
+package and enabled by default. Agent Reach's CLI channels need their own setup;
+Playwright provides browser control, while desktop control needs a separately
+configured MCP server. See
+[default integrations](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/docs/DEFAULT_INTEGRATIONS.md)
+to override or disable them.
+
+## More
+
+- [Usage guide](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/USAGE.md)
+- [Plans and pricing](https://zero-x.live/pricing)
+- [Security policy](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/SECURITY.md)
+
+MIT licensed; see `LICENSE` and `NOTICE`. Prompts and code you send are
+processed by third-party model providers.
