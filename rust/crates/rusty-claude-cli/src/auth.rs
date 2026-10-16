@@ -171,11 +171,19 @@ pub fn credential_for_session() -> io::Result<GatewayCredential> {
     login(LoginOptions::default())
 }
 
-/// Prints the invalid-session message; in a terminal, offers to sign in again.
+/// The session is dead: in a terminal, says so and offers to sign in again.
+/// Otherwise (or when the offer is declined) returns the invalid-session
+/// message as the error, which the caller prints exactly once.
 pub fn recover_invalid_session() -> io::Result<GatewayCredential> {
-    eprintln!("{}", api::INVALID_SESSION_MESSAGE);
-    if interactive() && confirm("Sign in again now? [Y/n] ") {
-        return login(LoginOptions::default());
+    if interactive() {
+        eprintln!("{}", api::INVALID_SESSION_MESSAGE);
+        if confirm("Sign in again now? [Y/n] ") {
+            return login(LoginOptions::default());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "not signed in; run `neuron auth login` when you are ready",
+        ));
     }
     Err(io::Error::new(
         io::ErrorKind::PermissionDenied,
