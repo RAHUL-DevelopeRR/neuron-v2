@@ -5,6 +5,7 @@
 )]
 
 mod hooks;
+pub mod subprocess;
 #[cfg(test)]
 pub mod test_isolation;
 
@@ -311,13 +312,20 @@ impl PluginTool {
     }
 
     pub fn execute(&self, input: &Value) -> Result<String, PluginError> {
+        self.execute_with_timeout(input, subprocess::DEFAULT_PLUGIN_TOOL_TIMEOUT)
+    }
+
+    /// Runs the plugin tool, killing its process tree once `timeout` elapses.
+    pub fn execute_with_timeout(
+        &self,
+        input: &Value,
+        timeout: std::time::Duration,
+    ) -> Result<String, PluginError> {
         let input_json = input.to_string();
         let mut process = plugin_command(&self.command);
+        subprocess::scrub_credential_env(&mut process);
         process
             .args(&self.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
             .env("CLAWD_PLUGIN_ID", &self.plugin_id)
             .env("CLAWD_PLUGIN_NAME", &self.plugin_name)
             .env("CLAWD_TOOL_NAME", &self.definition.name)
@@ -328,14 +336,21 @@ impl PluginTool {
                 .env("CLAWD_PLUGIN_ROOT", root.display().to_string());
         }
 
-        let mut child = process.spawn()?;
-        if let Some(stdin) = child.stdin.as_mut() {
-            use std::io::Write as _;
-            stdin.write_all(input_json.as_bytes())?;
+        let output = subprocess::run_bounded(
+            &mut process,
+            Some(input_json.as_bytes()),
+            Some(timeout),
+            &|| false,
+        )?;
+        if output.timed_out() {
+            return Err(PluginError::CommandFailed(format!(
+                "plugin tool `{}` from `{}` timed out after {} ms and was terminated",
+                self.definition.name,
+                self.plugin_id,
+                timeout.as_millis()
+            )));
         }
-
-        let output = child.wait_with_output()?;
-        if output.status.success() {
+        if output.success() {
             Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -345,13 +360,20 @@ impl PluginTool {
                 self.plugin_id,
                 self.command,
                 if stderr.is_empty() {
-                    format!("exit status {}", output.status)
+                    describe_exit(&output)
                 } else {
                     stderr
                 }
             )))
         }
     }
+}
+
+fn describe_exit(output: &subprocess::BoundedOutput) -> String {
+    output.status.map_or_else(
+        || "terminated without an exit status".to_string(),
+        |status| format!("exit status {status}"),
+    )
 }
 
 fn plugin_command(command: &str) -> Command {
@@ -2125,9 +2147,20 @@ fn run_lifecycle_commands(
         if let Some(root) = &metadata.root {
             process.current_dir(root);
         }
-        let output = process.output()?;
+        subprocess::scrub_credential_env(&mut process);
+        let timeout = subprocess::DEFAULT_PLUGIN_TOOL_TIMEOUT;
+        let output = subprocess::run_bounded(&mut process, None, Some(timeout), &|| false)?;
 
-        if !output.status.success() {
+        if output.timed_out() {
+            return Err(PluginError::CommandFailed(format!(
+                "plugin `{}` {} timed out after {} ms for `{}`",
+                metadata.id,
+                phase,
+                timeout.as_millis(),
+                command
+            )));
+        }
+        if !output.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             return Err(PluginError::CommandFailed(format!(
                 "plugin `{}` {} failed for `{}`: {}",
@@ -2135,7 +2168,7 @@ fn run_lifecycle_commands(
                 phase,
                 command,
                 if stderr.is_empty() {
-                    format!("exit status {}", output.status)
+                    describe_exit(&output)
                 } else {
                     stderr
                 }

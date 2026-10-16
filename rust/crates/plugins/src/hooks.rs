@@ -5,7 +5,7 @@ use std::process::Command;
 
 use serde_json::json;
 
-use crate::{PluginError, PluginHooks, PluginRegistry};
+use crate::{subprocess, PluginError, PluginHooks, PluginRegistry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookEvent {
@@ -185,9 +185,6 @@ impl HookRunner {
         payload: &str,
     ) -> HookCommandOutcome {
         let mut child = shell_command(command);
-        child.stdin(std::process::Stdio::piped());
-        child.stdout(std::process::Stdio::piped());
-        child.stderr(std::process::Stdio::piped());
         child.env("HOOK_EVENT", event.as_str());
         child.env("HOOK_TOOL_NAME", tool_name);
         child.env("HOOK_TOOL_INPUT", tool_input);
@@ -197,11 +194,18 @@ impl HookRunner {
         }
 
         match child.output_with_stdin(payload.as_bytes()) {
+            Ok(output) if output.timed_out() => HookCommandOutcome::Failed {
+                message: format!(
+                    "{} hook `{command}` timed out after {} ms while handling `{tool_name}` and was terminated",
+                    event.as_str(),
+                    subprocess::DEFAULT_HOOK_TIMEOUT.as_millis()
+                ),
+            },
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
                 let message = (!stdout.is_empty()).then_some(stdout);
-                match output.status.code() {
+                match output.exit_code() {
                     Some(0) => HookCommandOutcome::Allow { message },
                     Some(2) => HookCommandOutcome::Deny { message },
                     Some(code) => HookCommandOutcome::Failed {
@@ -286,9 +290,7 @@ fn shell_command(command: &str) -> CommandWithStdin {
         command_builder.arg(command);
         CommandWithStdin::new(command_builder)
     } else {
-        let mut command_builder = Command::new("cmd");
-        command_builder.arg("/C").arg(command);
-        CommandWithStdin::new(command_builder)
+        CommandWithStdin::new(subprocess::windows_cmd_command(command))
     };
 
     #[cfg(not(windows))]
@@ -310,23 +312,9 @@ struct CommandWithStdin {
 }
 
 impl CommandWithStdin {
-    fn new(command: Command) -> Self {
+    fn new(mut command: Command) -> Self {
+        subprocess::scrub_credential_env(&mut command);
         Self { command }
-    }
-
-    fn stdin(&mut self, cfg: std::process::Stdio) -> &mut Self {
-        self.command.stdin(cfg);
-        self
-    }
-
-    fn stdout(&mut self, cfg: std::process::Stdio) -> &mut Self {
-        self.command.stdout(cfg);
-        self
-    }
-
-    fn stderr(&mut self, cfg: std::process::Stdio) -> &mut Self {
-        self.command.stderr(cfg);
-        self
     }
 
     fn env<K, V>(&mut self, key: K, value: V) -> &mut Self
@@ -338,34 +326,21 @@ impl CommandWithStdin {
         self
     }
 
-    fn output_with_stdin(&mut self, stdin: &[u8]) -> std::io::Result<std::process::Output> {
-        let mut child = self.command.spawn()?;
-        if let Some(mut child_stdin) = child.stdin.take() {
-            use std::io::Write as _;
-            // Tolerate BrokenPipe: a hook script that runs to completion
-            // (or exits early without reading stdin) closes its stdin
-            // before the parent finishes writing the JSON payload, and
-            // the kernel raises EPIPE on the parent's write_all. That is
-            // not a hook failure — the child still exited cleanly and we
-            // still need to wait_with_output() to capture stdout/stderr
-            // and the real exit code. Other write errors (e.g. EIO,
-            // permission, OOM) still propagate.
-            //
-            // This was the root cause of the Linux CI flake on
-            // hooks::tests::collects_and_runs_hooks_from_enabled_plugins
-            // (ROADMAP #25, runs 24120271422 / 24120538408 / 24121392171
-            // / 24121776826): the test hook scripts run in microseconds
-            // and the parent's stdin write races against child exit.
-            // macOS pipes happen to buffer the small payload before the
-            // child exits; Linux pipes do not, so the race shows up
-            // deterministically on ubuntu runners.
-            match child_stdin.write_all(stdin) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
-                Err(error) => return Err(error),
-            }
-        }
-        child.wait_with_output()
+    /// Runs the hook with `stdin` as its payload, draining stdout/stderr
+    /// concurrently and killing the process tree after the hook timeout.
+    ///
+    /// The payload is written from a helper thread that tolerates
+    /// `BrokenPipe`: a hook script that exits without reading stdin is not a
+    /// failure (ROADMAP #25: the Linux CI flake on
+    /// `collects_and_runs_hooks_from_enabled_plugins` was the parent's
+    /// `write_all` racing the child's exit).
+    fn output_with_stdin(&mut self, stdin: &[u8]) -> std::io::Result<subprocess::BoundedOutput> {
+        subprocess::run_bounded(
+            &mut self.command,
+            Some(stdin),
+            Some(subprocess::DEFAULT_HOOK_TIMEOUT),
+            &|| false,
+        )
     }
 }
 
