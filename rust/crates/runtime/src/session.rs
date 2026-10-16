@@ -274,7 +274,8 @@ impl Session {
     /// Malformed JSONL records are skipped and counted instead of failing the
     /// whole load, and the transcript is normalized (see
     /// [`crate::transcript::normalize_messages`]). Both are reported through
-    /// [`Session::load_diagnostics`] and a warning on stderr.
+    /// [`Session::load_diagnostics`] so callers can warn where it matters (for
+    /// example when resuming), not on every listing.
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, SessionError> {
         let path = path.as_ref();
         let contents = fs::read_to_string(path)?;
@@ -289,9 +290,6 @@ impl Session {
             Err(_) | Ok(_) => Self::from_jsonl(&contents)?,
         };
         session.load_diagnostics.transcript_repair = normalize_messages(&mut session.messages);
-        if let Some(warning) = session.load_diagnostics.warning_message() {
-            eprintln!("warning: session {}: {warning}", path.display());
-        }
         Ok(session.with_persistence_path(path.to_path_buf()))
     }
 

@@ -896,6 +896,11 @@ where
     }
 
     #[must_use]
+    pub fn permission_policy(&self) -> &PermissionPolicy {
+        &self.permission_policy
+    }
+
+    #[must_use]
     pub fn api_client(&self) -> &C {
         &self.api_client
     }
