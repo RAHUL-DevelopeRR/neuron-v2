@@ -334,6 +334,40 @@ fn web_fetch_validates_every_redirect_hop() {
 }
 
 #[test]
+fn web_fetch_reports_redirects_to_another_host_instead_of_following_them() {
+    super::web_fetch::allow_loopback_on_this_thread();
+    // The fixture listens on 127.0.0.1 and redirects to `localhost`, a
+    // different host name (like an approved domain's open redirect). The
+    // target is never contacted.
+    let (base, server) = serve(vec![http_response(
+        "302 Found",
+        "Location: http://localhost:9/leak?data=secret\r\n",
+        "",
+    )]);
+
+    let output = parse(
+        &execute_tool(
+            "WebFetch",
+            &json!({ "url": format!("{base}/redirect"), "prompt": "read" }),
+        )
+        .expect("a cross-host redirect is reported"),
+    );
+    let result = output["result"].as_str().expect("result text");
+    assert!(
+        result.contains("redirected to a different host"),
+        "{result}"
+    );
+    assert!(result.contains("/leak?data=secret"), "{result}");
+    assert!(result.contains("call WebFetch again"), "{result}");
+    assert_eq!(output["code"], 302);
+    // Only the original request was made.
+    assert_eq!(
+        server.join().expect("server thread"),
+        vec!["GET /redirect HTTP/1.1"]
+    );
+}
+
+#[test]
 fn web_fetch_returns_readable_text_up_to_20000_characters() {
     super::web_fetch::allow_loopback_on_this_thread();
     let body = format!(

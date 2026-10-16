@@ -2954,6 +2954,12 @@ fn render_web_fetch_result(url: &str, prompt: &str, page: &web_fetch::FetchedPag
             format!(", {}", page.content_type)
         }
     )];
+    if let Some(target) = &page.cross_host_redirect {
+        lines.push(format!(
+            "The server redirected to a different host: {target}\nThe redirect was not followed. To read it, call WebFetch again with that URL (a domain not yet approved in this session needs the user's approval)."
+        ));
+        return lines.join("\n");
+    }
     if web_fetch::is_binary_content_type(&page.content_type) {
         lines.push(format!(
             "The response is binary ({} bytes) and is not shown as text.",

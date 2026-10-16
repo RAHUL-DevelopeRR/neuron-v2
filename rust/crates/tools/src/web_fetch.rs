@@ -7,6 +7,12 @@
 //! connection is pinned to the addresses that were validated, so a DNS answer
 //! cannot change between the check and the request, and redirects are
 //! followed manually so each `Location` is validated the same way.
+//!
+//! Redirects are followed only within the requested host (`www.` added or
+//! removed counts as the same host). A redirect to another host is reported
+//! instead of followed, so the model fetches it explicitly and the new
+//! domain goes through the same session approval as any other: an approved
+//! domain's open redirect cannot carry a request to an unapproved one.
 
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
@@ -36,6 +42,9 @@ pub(crate) struct FetchedPage {
     pub body: String,
     pub bytes: usize,
     pub body_truncated: bool,
+    /// Where the server redirected to, when that is another host (the
+    /// redirect is reported, not followed).
+    pub cross_host_redirect: Option<Url>,
 }
 
 #[cfg(test)]
@@ -220,7 +229,22 @@ fn client_for(url: &Url, addresses: &[SocketAddr]) -> Result<Client, String> {
     builder.build().map_err(|error| error.to_string())
 }
 
-/// Fetches `url`, following up to ten redirects, validating every hop.
+/// Whether two URLs name the same host, ignoring case and a leading `www.`.
+fn same_host(left: &Url, right: &Url) -> bool {
+    let normalized = |url: &Url| {
+        url.host_str().map(|host| {
+            let host = host.trim_end_matches('.').to_ascii_lowercase();
+            host.strip_prefix("www.")
+                .map(str::to_string)
+                .unwrap_or(host)
+        })
+    };
+    normalized(left).is_some() && normalized(left) == normalized(right)
+}
+
+/// Fetches `url`, following up to ten same-host redirects and validating
+/// every hop. A redirect to another host is validated and then reported in
+/// [`FetchedPage::cross_host_redirect`] instead of being followed.
 pub(crate) fn fetch(url: Url) -> Result<FetchedPage, String> {
     let mut current = url;
     for _ in 0..=MAX_REDIRECTS {
@@ -237,9 +261,23 @@ pub(crate) fn fetch(url: Url) -> Result<FetchedPage, String> {
                 .get(reqwest::header::LOCATION)
                 .and_then(|value| value.to_str().ok())
             {
-                current = current
+                let next = current
                     .join(location)
                     .map_err(|error| format!("invalid redirect location `{location}`: {error}"))?;
+                if !same_host(&current, &next) {
+                    // Refuse blocked targets outright; report public ones.
+                    validate_fetch_target(&next)?;
+                    return Ok(FetchedPage {
+                        final_url: current,
+                        status,
+                        content_type: String::new(),
+                        body: String::new(),
+                        bytes: 0,
+                        body_truncated: false,
+                        cross_host_redirect: Some(next),
+                    });
+                }
+                current = next;
                 continue;
             }
         }
@@ -266,6 +304,7 @@ pub(crate) fn fetch(url: Url) -> Result<FetchedPage, String> {
             bytes: raw.len(),
             body: String::from_utf8_lossy(&raw).into_owned(),
             body_truncated,
+            cross_host_redirect: None,
         });
     }
     Err(format!("too many redirects (more than {MAX_REDIRECTS})"))
