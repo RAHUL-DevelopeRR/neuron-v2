@@ -9,6 +9,7 @@
 //! (substitutions, `%VAR%` expansion in `cmd.exe`, script blocks in
 //! `PowerShell`) requires escalation.
 
+use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
@@ -1439,10 +1440,11 @@ fn track_cd(
 }
 
 fn add_cd_bases(context: &mut Context<'_>, target: &str) {
+    let target = dialect_path(target, context.dialect);
     let next_bases: Vec<PathBuf> = context
         .bases
         .iter()
-        .map(|base| normalize_lexically(&base.join(target)))
+        .map(|base| normalize_lexically(&base.join(target.as_ref())))
         .collect();
     context.bases.extend(next_bases);
 }
@@ -2444,6 +2446,8 @@ fn path_problem(text: &str, expanded: bool, context: &Context<'_>) -> Option<Str
     let Some(workspace) = context.workspace else {
         return Some(format!("`{text}` may be outside the workspace"));
     };
+    let candidate = dialect_path(candidate, context.dialect);
+    let candidate = candidate.as_ref();
     let resolved_candidates: Vec<PathBuf> = if candidate.starts_with('~') {
         let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
         else {
@@ -2469,6 +2473,18 @@ fn path_problem(text: &str, expanded: bool, context: &Context<'_>) -> Option<Str
         None
     } else {
         Some(format!("`{text}` is outside the workspace"))
+    }
+}
+
+/// `cmd.exe` and `PowerShell` treat `\` as a path separator on every host
+/// (pwsh on Linux and macOS included), while `Path` splits on `\` only on
+/// Windows. Spell such paths with `/` so `..\..\x` resolves the same way
+/// everywhere.
+fn dialect_path(text: &str, dialect: ShellDialect) -> Cow<'_, str> {
+    if dialect == ShellDialect::Cmd && text.contains('\\') {
+        Cow::Owned(text.replace('\\', "/"))
+    } else {
+        Cow::Borrowed(text)
     }
 }
 
@@ -2525,10 +2541,11 @@ fn starts_with_normalized(path: &Path, root: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        cdpath_may_redirect, classify_powershell_command, classify_shell_command, path_is_within,
-        render_prefix, CommandClassification, ShellDialect,
+        cdpath_may_redirect, classify_powershell_command, classify_shell_command, dialect_path,
+        path_is_within, render_prefix, CommandClassification, ShellDialect,
     };
     use crate::permissions::PermissionMode;
+    use std::borrow::Cow;
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
 
@@ -2958,6 +2975,26 @@ mod tests {
             classify("Remove-Item build").approval_prefixes(),
             vec![vec!["remove-item".to_string(), "build".to_string()]]
         );
+    }
+
+    #[test]
+    fn backslash_paths_are_separators_for_cmd_and_powershell_on_every_host() {
+        // pwsh on Linux/macOS accepts `\` as a separator, so `..\..\x` must
+        // not look like one file name inside the workspace there.
+        assert_eq!(
+            dialect_path("..\\..\\secret.txt", ShellDialect::Cmd),
+            "../../secret.txt"
+        );
+        assert_eq!(dialect_path("src\\deep", ShellDialect::Cmd), "src/deep");
+        assert_eq!(
+            dialect_path("a\\b", ShellDialect::Posix),
+            "a\\b",
+            "POSIX keeps backslashes as literal characters"
+        );
+        assert!(matches!(
+            dialect_path("src/main.rs", ShellDialect::Cmd),
+            Cow::Borrowed(_)
+        ));
     }
 
     #[test]

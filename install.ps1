@@ -81,6 +81,20 @@ function Get-NeuronDownload([string]$Url, [string]$OutFile, [string]$Version) {
     }
 }
 
+# .NET directly instead of Get-FileHash: that cmdlet lives in an auto-loaded module and is missing
+# when PSModulePath is unset or locked down (minimal environments, some CI and kiosk setups).
+function Get-NeuronSha256([string]$Path) {
+    $stream = [System.IO.File]::OpenRead($Path)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha256.ComputeHash($stream)
+    } finally {
+        $sha256.Dispose()
+        $stream.Dispose()
+    }
+    return ([System.BitConverter]::ToString($hash) -replace '-', '').ToLowerInvariant()
+}
+
 function Assert-SupportedPlatform {
     if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
         throw "install.ps1 is for Windows. On Linux and macOS run: curl -fsSL https://github.com/$NeuronRepository/releases/latest/download/install.sh | sh"
@@ -219,7 +233,7 @@ function Install-Neuron {
 
         $download = Join-Path $work $NeuronAsset
         Get-NeuronDownload $url $download $resolved
-        $actual = (Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash.ToLowerInvariant()
+        $actual = Get-NeuronSha256 $download
         if ($actual -ne $expected) {
             throw "checksum mismatch for ${NeuronAsset}: expected $expected, got $actual. Nothing was installed."
         }
