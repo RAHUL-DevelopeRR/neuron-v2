@@ -7,8 +7,8 @@ use api::{
     ApiError, ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent,
     ContentBlockStopEvent, GatewayErrorCode, InputContentBlock, InputMessage, MessageDeltaEvent,
     MessageRequest, OpenAiCompatClient, OpenAiCompatConfig, OpenAiCompatEndpoint,
-    OutputContentBlock, ProviderClient, RetryNotice, RetryObserver, StreamEvent, ToolChoice,
-    ToolDefinition, UsageObserver,
+    OutputContentBlock, ProviderClient, RetryNotice, RetryObserver, RetryProgress, StreamEvent,
+    ToolChoice, ToolDefinition, UsageObserver,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -363,6 +363,50 @@ async fn capacity_budget_applies_only_to_zero_x_capacity_waits() {
         .expect_err("OpenAI keeps the standard budget");
     assert_eq!(state.lock().await.len(), 1);
     assert!(notices.lock().unwrap().is_empty());
+}
+
+/// A caller that sends a model call again (the CLI after a stream timeout)
+/// passes the same `RetryProgress`: the retry count and budget continue,
+/// and the waits are reported so the caller's deadline can leave them out.
+#[tokio::test]
+async fn retry_progress_carries_the_retry_count_across_sends() {
+    use std::time::Duration;
+
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let busy = gateway_error_reply("503 Service Unavailable", "capacity_exhausted", 1);
+    let server = spawn_server(state.clone(), vec![busy.clone(), busy.clone(), busy]).await;
+    let (observer, notices) = recording_observer();
+    let client = gateway_client(server.base_url(), observer);
+    let progress = RetryProgress::new();
+    let request = sample_request(true);
+
+    // Dropped in the middle of the second wait, as a caller's deadline is.
+    let first = tokio::time::timeout(
+        Duration::from_millis(1500),
+        client.stream_message_with_progress(&request, &progress),
+    )
+    .await;
+    assert!(first.is_err(), "still waiting before the third request");
+    assert_eq!(progress.attempts(), 2);
+    assert!(progress.can_resend());
+    let waited = progress.waited();
+    assert!(
+        waited >= Duration::from_millis(1400) && waited < Duration::from_secs(3),
+        "{waited:?}"
+    );
+
+    let error = client
+        .stream_message_with_progress(&request, &progress)
+        .await
+        .expect_err("the third request is the last one the limit allows");
+    match &error {
+        ApiError::RetriesExhausted { attempts, .. } => assert_eq!(*attempts, 3),
+        other => panic!("expected RetriesExhausted, got {other:?}"),
+    }
+    assert_eq!(state.lock().await.len(), 3);
+    assert_eq!(progress.retries(), 2);
+    assert!(!progress.can_resend());
+    assert_eq!(notices.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]

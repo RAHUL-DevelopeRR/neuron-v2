@@ -3,7 +3,7 @@
 //! AnthropicRuntimeClient, auth resolution, and error formatting.
 
 use super::*;
-use api::{self, AuthSource};
+use api::{self, AuthSource, RetryProgress};
 use runtime::{CancellationToken, RuntimeErrorKind};
 use std::collections::BTreeMap;
 use std::env;
@@ -17,8 +17,9 @@ pub(crate) const DEFAULT_POST_TOOL_FIRST_TOKEN_TIMEOUT: Duration = Duration::fro
 pub(crate) const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Overrides both first-token timeouts (seconds).
 pub(crate) const FIRST_TOKEN_TIMEOUT_ENV_VAR: &str = "NEURON_FIRST_TOKEN_TIMEOUT_SECS";
-/// A stalled or interrupted request is retried once.
-const MAX_STREAM_ATTEMPTS: usize = 2;
+/// A stalled or interrupted request is retried once, and only while the
+/// provider client's own retry limit allows another request.
+const MAX_STREAM_ATTEMPTS: u32 = 2;
 
 /// Deadlines applied while consuming a model stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,7 +120,9 @@ impl StreamFailure {
         }
     }
 
-    pub(crate) fn into_runtime_error(self) -> RuntimeError {
+    /// The error reported for this failure after `retries` retries of the
+    /// model call (the provider client's and the stream retry together).
+    pub(crate) fn into_runtime_error(self, retries: u32) -> RuntimeError {
         let kind = match &self {
             Self::FirstTokenTimeout { .. } | Self::Idle { .. } => RuntimeErrorKind::Timeout,
             Self::Interrupted { .. } => RuntimeErrorKind::StreamInterrupted,
@@ -129,13 +132,66 @@ impl StreamFailure {
         match self {
             Self::Fatal(error) => error,
             Self::Cancelled => RuntimeError::with_kind(kind, "request cancelled by user"),
-            other => RuntimeError::with_kind(
-                kind,
-                format!(
-                    "{} (after one retry). The provider may be overloaded; try again, or switch models with /model.",
-                    other.describe()
-                ),
-            ),
+            other => {
+                let after = match retries {
+                    0 => String::new(),
+                    1 => " (after one retry)".to_string(),
+                    retries => format!(" (after {retries} retries)"),
+                };
+                RuntimeError::with_kind(
+                    kind,
+                    format!(
+                        "{}{after}. The provider may be overloaded; try again, or switch models with /model.",
+                        other.describe()
+                    ),
+                )
+            }
+        }
+    }
+}
+
+/// The first-token deadline of one request, measured in active time: the
+/// waits the provider client spends between its own retries (honouring
+/// `Retry-After`) do not count, so a capacity wait is never cut short and
+/// the deadline restarts with each new request the client sends.
+struct FirstTokenClock<'a> {
+    progress: &'a RetryProgress,
+    started: Instant,
+    waited_before: Duration,
+    budget: Duration,
+}
+
+impl<'a> FirstTokenClock<'a> {
+    fn start(progress: &'a RetryProgress, budget: Duration) -> Self {
+        Self {
+            progress,
+            started: Instant::now(),
+            waited_before: progress.waited(),
+            budget,
+        }
+    }
+
+    /// Time since the start that was not spent waiting between retries.
+    fn elapsed(&self) -> Duration {
+        let paused = self.progress.waited().saturating_sub(self.waited_before);
+        self.started.elapsed().saturating_sub(paused)
+    }
+
+    fn remaining(&self) -> Duration {
+        self.budget.saturating_sub(self.elapsed())
+    }
+
+    /// Resolves once the active time reaches the budget.
+    async fn expired(&self) {
+        loop {
+            let remaining = self.remaining();
+            if remaining.is_zero() {
+                return;
+            }
+            // Active time grows at most as fast as wall time, so sleeping
+            // for what remains never passes the deadline. When a retry wait
+            // fell into the sleep, time remains and the loop sleeps again.
+            tokio::time::sleep(remaining).await;
         }
     }
 }
@@ -349,14 +405,22 @@ impl ApiClient for AnthropicRuntimeClient {
         let message_request = self.message_request(&request);
 
         self.runtime.block_on(async {
+            // One retry state for the whole model call: the stream retry
+            // below continues the provider client's retry count and budget
+            // instead of starting a fresh one.
+            let progress = RetryProgress::new();
             let mut attempt = 1;
             loop {
                 match self
-                    .consume_stream(&message_request, after_tool_results, cancel)
+                    .consume_stream(&message_request, after_tool_results, cancel, &progress)
                     .await
                 {
                     Ok(events) => return Ok(events),
-                    Err(failure) if failure.is_retryable() && attempt < MAX_STREAM_ATTEMPTS => {
+                    Err(failure)
+                        if failure.is_retryable()
+                            && attempt < MAX_STREAM_ATTEMPTS
+                            && progress.can_resend() =>
+                    {
                         // A stalled or broken stream is retried once with the
                         // same request; typed failures decide, not messages.
                         eprintln!(
@@ -365,7 +429,10 @@ impl ApiClient for AnthropicRuntimeClient {
                         );
                         attempt += 1;
                     }
-                    Err(failure) => return Err(failure.into_runtime_error()),
+                    Err(failure) => {
+                        let retries = progress.retries().max(attempt - 1);
+                        return Err(failure.into_runtime_error(retries));
+                    }
                 }
             }
         })
@@ -374,33 +441,35 @@ impl ApiClient for AnthropicRuntimeClient {
 
 impl AnthropicRuntimeClient {
     /// Consumes a single streaming response. The first-token deadline covers
-    /// connecting and the first event; afterwards every gap between events is
-    /// bounded by the idle timeout. Both waits race the cancellation token.
+    /// connecting and the first event, leaving out the provider client's
+    /// waits between retries (see [`FirstTokenClock`]); afterwards every gap
+    /// between events is bounded by the idle timeout. Both waits race the
+    /// cancellation token. `progress` carries the model call's retry state.
     #[allow(clippy::too_many_lines)]
     async fn consume_stream(
         &self,
         message_request: &MessageRequest,
         after_tool_results: bool,
         cancel: &CancellationToken,
+        progress: &RetryProgress,
     ) -> Result<Vec<AssistantEvent>, StreamFailure> {
         if std::env::var("NEURON_DEBUG").is_ok() {
             eprintln!("[DEBUG] sending stream_message to API...");
         }
-        let started = Instant::now();
         let first_token_timeout = self.timeouts.first_token_for(after_tool_results);
+        let clock = FirstTokenClock::start(progress, first_token_timeout);
+        let first_token_failure = || StreamFailure::FirstTokenTimeout {
+            waited: first_token_timeout,
+            after_tool_results,
+        };
         let mut stream = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(StreamFailure::Cancelled),
-            result = tokio::time::timeout(first_token_timeout, self.client.stream_message(message_request)) => match result {
-                Ok(Ok(stream)) => stream,
-                Ok(Err(error)) => return Err(fatal_api_error(&self.session_id, &error)),
-                Err(_elapsed) => {
-                    return Err(StreamFailure::FirstTokenTimeout {
-                        waited: first_token_timeout,
-                        after_tool_results,
-                    })
-                }
+            result = self.client.stream_message_with_progress(message_request, progress) => match result {
+                Ok(stream) => stream,
+                Err(error) => return Err(fatal_api_error(&self.session_id, &error)),
             },
+            () = clock.expired() => return Err(first_token_failure()),
         };
         if std::env::var("NEURON_DEBUG").is_ok() {
             eprintln!("[DEBUG] stream_message connected, reading events...");
@@ -428,7 +497,7 @@ impl AnthropicRuntimeClient {
             let deadline = if received_any_event {
                 self.timeouts.idle
             } else {
-                first_token_timeout.saturating_sub(started.elapsed())
+                clock.remaining()
             };
             let next = tokio::select! {
                 biased;
@@ -446,12 +515,7 @@ impl AnthropicRuntimeClient {
                     Err(_elapsed) if received_any_event => {
                         return Err(StreamFailure::Idle { waited: self.timeouts.idle })
                     }
-                    Err(_elapsed) => {
-                        return Err(StreamFailure::FirstTokenTimeout {
-                            waited: first_token_timeout,
-                            after_tool_results,
-                        })
-                    }
+                    Err(_elapsed) => return Err(first_token_failure()),
                 },
             };
 
@@ -1163,12 +1227,71 @@ mod stream_resilience_tests {
         /// First answer: a tool call whose arguments the output limit cut
         /// off (`finish_reason: "length"`); later answers: plain text.
         TruncatedToolCallThenText,
+        /// One step per connection, in order; the last step repeats.
+        Scripted(&'static [Step]),
+    }
+
+    /// One answer of a [`Behavior::Scripted`] gateway.
+    #[derive(Clone, Copy)]
+    enum Step {
+        /// `503 capacity_exhausted` with this `Retry-After` (seconds).
+        Capacity(&'static str),
+        /// Read the request and never answer.
+        Hang,
+        /// A complete text answer.
+        Text,
     }
 
     struct FakeGateway {
         base_url: String,
         connections: Arc<AtomicUsize>,
+        /// When each connection was accepted.
+        accepted: Arc<Mutex<Vec<Instant>>>,
         _held: Arc<Mutex<Vec<TcpStream>>>,
+    }
+
+    impl FakeGateway {
+        /// Time between the starts of consecutive requests.
+        fn gaps(&self) -> Vec<Duration> {
+            let accepted = self.accepted.lock().expect("accepted");
+            accepted
+                .windows(2)
+                .map(|pair| pair[1].duration_since(pair[0]))
+                .collect()
+        }
+    }
+
+    fn write_capacity_exhausted(stream: &mut TcpStream, retry_after: &str) {
+        let body = serde_json::json!({"error": {
+            "message": "The shared free pool is busy",
+            "type": "server_error",
+            "code": "capacity_exhausted",
+            "param": null,
+            "request_id": "req_capacity"
+        }})
+        .to_string();
+        let _ = write!(
+            stream,
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nRetry-After: {retry_after}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.flush();
+    }
+
+    fn write_text_answer(stream: &mut TcpStream, text: &str) {
+        let body = [
+            sse_chunk(&serde_json::json!({
+                "id": "t", "model": "m",
+                "choices": [{"delta": {"content": text}}]
+            })),
+            sse_chunk(&serde_json::json!({
+                "id": "t",
+                "choices": [{"delta": {}, "finish_reason": "stop"}]
+            })),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        write_sse_body(stream, &body);
     }
 
     fn read_request(stream: &mut TcpStream) {
@@ -1216,16 +1339,26 @@ mod stream_resilience_tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let base_url = format!("http://{}/v1", listener.local_addr().expect("addr"));
         let connections = Arc::new(AtomicUsize::new(0));
+        let accepted = Arc::new(Mutex::new(Vec::new()));
         let held = Arc::new(Mutex::new(Vec::new()));
         let counter = Arc::clone(&connections);
+        let accepted_at = Arc::clone(&accepted);
         let holder = Arc::clone(&held);
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
-                counter.fetch_add(1, Ordering::SeqCst);
+                accepted_at.lock().expect("accepted").push(Instant::now());
+                let index = counter.fetch_add(1, Ordering::SeqCst);
                 read_request(&mut stream);
                 match behavior {
                     Behavior::Hang => {}
+                    Behavior::Scripted(steps) => match steps.get(index).or(steps.last()).copied() {
+                        Some(Step::Capacity(retry_after)) => {
+                            write_capacity_exhausted(&mut stream, retry_after);
+                        }
+                        Some(Step::Text) => write_text_answer(&mut stream, "after the wait"),
+                        Some(Step::Hang) | None => {}
+                    },
                     Behavior::StallAfterFirstChunk => {
                         let first = sse_chunk(&serde_json::json!({
                             "id": "t", "model": "m",
@@ -1300,17 +1433,40 @@ mod stream_resilience_tests {
         FakeGateway {
             base_url,
             connections,
+            accepted,
             _held: held,
         }
     }
 
+    /// A client allowing two provider retries (the Zero-X limit); the stream
+    /// retry counts as one of them.
     fn client_for(gateway: &FakeGateway, timeouts: StreamTimeouts) -> AnthropicRuntimeClient {
         let client = OpenAiCompatClient::new("test-key", OpenAiCompatConfig::openai())
             .with_base_url(gateway.base_url.clone())
-            .with_retry_policy(0, Duration::from_millis(1), Duration::from_millis(1));
+            .with_retry_policy(2, Duration::from_millis(1), Duration::from_millis(1))
+            .with_retry_observer(None);
+        runtime_client(ApiProviderClient::OpenAi(client), timeouts)
+    }
+
+    /// A Zero-X gateway client with its default retry policy (two retries,
+    /// capacity waits honoured).
+    fn zero_x_client_for(
+        gateway: &FakeGateway,
+        timeouts: StreamTimeouts,
+    ) -> AnthropicRuntimeClient {
+        let client = OpenAiCompatClient::new("ses_test", OpenAiCompatConfig::zero_x())
+            .with_base_url(gateway.base_url.clone())
+            .with_retry_observer(None);
+        runtime_client(ApiProviderClient::OpenAi(client), timeouts)
+    }
+
+    fn runtime_client(
+        client: ApiProviderClient,
+        timeouts: StreamTimeouts,
+    ) -> AnthropicRuntimeClient {
         AnthropicRuntimeClient {
             runtime: tokio::runtime::Runtime::new().expect("tokio"),
-            client: ApiProviderClient::OpenAi(client),
+            client,
             session_id: "stream-test".to_string(),
             model: "openai/test-model".to_string(),
             enable_tools: false,
@@ -1374,6 +1530,87 @@ mod stream_resilience_tests {
         assert_eq!(error.kind(), RuntimeErrorKind::Timeout);
         assert!(error.to_string().contains("after one retry"), "{error}");
         assert_eq!(gateway.connections.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn no_stream_retry_when_the_client_allows_no_retries() {
+        let gateway = spawn_gateway(Behavior::Hang);
+        let client = OpenAiCompatClient::new("test-key", OpenAiCompatConfig::openai())
+            .with_base_url(gateway.base_url.clone())
+            .with_retry_policy(0, Duration::from_millis(1), Duration::from_millis(1))
+            .with_retry_observer(None);
+        let mut client = runtime_client(ApiProviderClient::OpenAi(client), fast_timeouts());
+
+        let error = client
+            .stream(request(false))
+            .expect_err("a silent gateway must time out");
+
+        assert_eq!(error.kind(), RuntimeErrorKind::Timeout);
+        assert!(!error.to_string().contains("retry"), "{error}");
+        assert_eq!(gateway.connections.load(Ordering::SeqCst), 1);
+    }
+
+    /// The failed live run: after the tool results the gateway asked for
+    /// longer waits than the first-token deadline (36 s and 58 s against
+    /// 60 s, scaled down here). Each wait must run in full, and the deadline
+    /// must not send extra requests on top of the gateway's two retries.
+    #[test]
+    fn capacity_waits_do_not_count_against_the_first_token_deadline() {
+        static STEPS: &[Step] = &[Step::Capacity("0.6"), Step::Capacity("0.9"), Step::Text];
+        let gateway = spawn_gateway(Behavior::Scripted(STEPS));
+        let mut client = zero_x_client_for(&gateway, fast_timeouts());
+
+        let events = client
+            .stream(request(true))
+            .expect("the third request answers");
+
+        assert!(events.contains(&AssistantEvent::TextDelta("after the wait".to_string())));
+        assert_eq!(gateway.connections.load(Ordering::SeqCst), 3);
+        let gaps = gateway.gaps();
+        assert!(gaps[0] >= Duration::from_millis(600), "{gaps:?}");
+        assert!(gaps[1] >= Duration::from_millis(900), "{gaps:?}");
+    }
+
+    #[test]
+    fn stream_retry_is_not_sent_once_the_gateway_retries_are_used() {
+        static STEPS: &[Step] = &[Step::Capacity("0.4"), Step::Capacity("0.4"), Step::Hang];
+        let gateway = spawn_gateway(Behavior::Scripted(STEPS));
+        let mut client = zero_x_client_for(&gateway, fast_timeouts());
+
+        let error = client
+            .stream(request(false))
+            .expect_err("the third request never answers");
+
+        assert_eq!(error.kind(), RuntimeErrorKind::Timeout);
+        assert!(error.to_string().contains("after 2 retries"), "{error}");
+        // Give a resend, if one were sent, time to arrive.
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(gateway.connections.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn stream_retry_continues_the_gateway_retry_count() {
+        static STEPS: &[Step] = &[
+            Step::Hang,
+            Step::Capacity("0.4"),
+            Step::Capacity("0.4"),
+            Step::Text,
+        ];
+        let gateway = spawn_gateway(Behavior::Scripted(STEPS));
+        let mut client = zero_x_client_for(&gateway, fast_timeouts());
+
+        let error = client
+            .stream(request(false))
+            .expect_err("the stream retry and one gateway retry use the limit");
+
+        assert!(error.to_string().contains("after 3 attempts"), "{error}");
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            gateway.connections.load(Ordering::SeqCst),
+            3,
+            "one request and two retries in total"
+        );
+        assert!(gateway.gaps()[1] >= Duration::from_millis(400));
     }
 
     #[test]
@@ -1601,14 +1838,14 @@ mod stream_resilience_tests {
             },
         );
         assert!(matches!(
-            rejected_by_provider.into_runtime_error().kind(),
+            rejected_by_provider.into_runtime_error(0).kind(),
             RuntimeErrorKind::ContextWindowExceeded
         ));
         assert_eq!(
             StreamFailure::Interrupted {
                 detail: "x".to_string()
             }
-            .into_runtime_error()
+            .into_runtime_error(1)
             .kind(),
             RuntimeErrorKind::StreamInterrupted
         );

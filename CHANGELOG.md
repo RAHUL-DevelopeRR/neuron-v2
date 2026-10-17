@@ -70,7 +70,10 @@ call by what it actually does, and sends far smaller requests.
   returns to the prompt; a second Ctrl+C quits. A failed turn or slash command no
   longer ends the session. Provider context-overflow errors are recovered by compacting.
 - Stream timeouts: first token 90 seconds (`NEURON_FIRST_TOKEN_TIMEOUT_SECS`), 60
-  seconds after a tool result, 120 seconds idle, with one retry.
+  seconds after a tool result, 120 seconds idle, with one retry. Waits for
+  `Retry-After` between retries do not count toward the first-token timeout, and the
+  stream retry is one of the provider's retries, so a Zero-X model call sends at most
+  three requests.
 - A turn makes at most 50 model calls by default (`maxIterations` setting,
   `NEURON_MAX_ITERATIONS`), and repeated identical tool calls are stopped.
 - Sub-agents use the parent's model, credentials, permission mode, permission rules,

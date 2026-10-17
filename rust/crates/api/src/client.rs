@@ -5,6 +5,7 @@ use crate::providers::openai_compat::{
     self, OpenAiCompatClient, OpenAiCompatConfig, OpenAiCompatEndpoint,
 };
 use crate::providers::{self, ProviderKind};
+use crate::retry::RetryProgress;
 use crate::types::{MessageRequest, MessageResponse, StreamEvent};
 
 #[allow(clippy::large_enum_variant)]
@@ -123,13 +124,25 @@ impl ProviderClient {
         &self,
         request: &MessageRequest,
     ) -> Result<MessageStream, ApiError> {
+        self.stream_message_with_progress(request, &RetryProgress::new())
+            .await
+    }
+
+    /// Like [`Self::stream_message`], continuing the retry count and budget
+    /// recorded in `progress`: a caller that sends the same model call again
+    /// passes the same progress, so the provider's retry limit covers both.
+    pub async fn stream_message_with_progress(
+        &self,
+        request: &MessageRequest,
+        progress: &RetryProgress,
+    ) -> Result<MessageStream, ApiError> {
         match self {
             Self::Anthropic(client) => client
-                .stream_message(request)
+                .stream_message_with_progress(request, progress)
                 .await
                 .map(MessageStream::Anthropic),
             Self::Xai(client) | Self::OpenAi(client) => client
-                .stream_message(request)
+                .stream_message_with_progress(request, progress)
                 .await
                 .map(MessageStream::OpenAiCompat),
         }

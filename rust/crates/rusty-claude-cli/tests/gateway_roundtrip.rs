@@ -25,6 +25,8 @@ struct Recorded {
     path: String,
     authorization: Option<String>,
     body: String,
+    /// When the request arrived.
+    at: Instant,
 }
 
 impl Recorded {
@@ -122,6 +124,19 @@ impl FakeGateway {
             .count()
     }
 
+    /// Time between the arrivals of consecutive chat requests.
+    fn chat_gaps(&self) -> Vec<Duration> {
+        let chats = self
+            .requests()
+            .into_iter()
+            .filter(|request| request.path == "/v1/chat/completions")
+            .collect::<Vec<_>>();
+        chats
+            .windows(2)
+            .map(|pair| pair[1].at.duration_since(pair[0].at))
+            .collect()
+    }
+
     fn last_chat(&self) -> Recorded {
         self.requests()
             .into_iter()
@@ -175,6 +190,7 @@ fn serve(stream: TcpStream, requests: &Mutex<Vec<Recorded>>, responder: &Respond
         path,
         authorization,
         body: String::from_utf8(body).unwrap(),
+        at: Instant::now(),
     };
     let reply = {
         let mut log = requests.lock().unwrap();
@@ -589,6 +605,85 @@ fn capacity_exhausted_honours_retry_after_then_completes() {
         errors.contains("Zero-X capacity_exhausted; retrying in 1s (retry 1 of 2)"),
         "{errors}"
     );
+}
+
+fn capacity_exhausted(retry_after: u64) -> Reply {
+    Reply::json(
+        "503 Service Unavailable",
+        &serde_json::json!({"error": {
+            "message": "The shared free pool is busy",
+            "type": "server_error",
+            "code": "capacity_exhausted",
+            "retry_after_seconds": retry_after,
+            "upgrade_url": "https://zero-x.live/pricing"
+        }}),
+    )
+    .with_header("Retry-After", &retry_after.to_string())
+}
+
+/// The failed live run, scaled down: after a tool result the gateway asked
+/// for waits of 36 s and 58 s, longer than the 60 s first-token deadline
+/// left for them. Here the deadline is 1 s and the waits 2 s and 3 s. Every
+/// wait must run in full and the model call must send at most three
+/// requests (one and two retries).
+#[test]
+fn capacity_waits_after_a_tool_result_outlast_the_first_token_deadline() {
+    let gateway = gateway_with_chat(|_, index| match index {
+        0 => Reply::sse(&[
+            serde_json::json!({"id":"t","model":"auto","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_read","function":{"name":"read_file","arguments":"{\"path\":\"fixture.txt\"}"}}]}}]}),
+            serde_json::json!({"id":"t","choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+        ]),
+        1 => capacity_exhausted(2),
+        2 => capacity_exhausted(3),
+        _ => text_reply("Done after the pool freed up."),
+    });
+    let workspace = Workspace::new("capacity-after-tool");
+    fs::write(workspace.root.join("fixture.txt"), "gateway fixture\n").unwrap();
+    let mut command = workspace.command(&gateway);
+    command
+        .env("NEURON_TOKEN", SESSION_TOKEN)
+        .env("NEURON_FIRST_TOKEN_TIMEOUT_SECS", "1")
+        .args(prompt_args("Read fixture.txt"));
+    let output = run(command, None);
+
+    let errors = stderr(&output);
+    assert!(output.status.success(), "{errors}");
+    assert_eq!(stdout(&output).trim(), "Done after the pool freed up.");
+    assert_eq!(gateway.count("POST", "/v1/chat/completions"), 4, "{errors}");
+    let gaps = gateway.chat_gaps();
+    assert!(gaps[1] >= Duration::from_secs(2), "{gaps:?}");
+    assert!(gaps[2] >= Duration::from_secs(3), "{gaps:?}");
+    assert!(
+        errors.contains("Zero-X capacity_exhausted; retrying in 3s (retry 2 of 2)"),
+        "{errors}"
+    );
+    assert!(!errors.contains("did not respond within"), "{errors}");
+    assert!(!errors.contains("retrying once"), "{errors}");
+}
+
+/// Waits longer than the first-token deadline on the first request: the
+/// gateway's two retries are sent after each full wait, and no stream retry
+/// is added once they are used.
+#[test]
+fn capacity_retries_end_after_two_without_a_stream_retry() {
+    let gateway = gateway_with_chat(|_, _| capacity_exhausted(2));
+    let workspace = Workspace::new("capacity-exhausted");
+    let mut command = workspace.command(&gateway);
+    command
+        .env("NEURON_TOKEN", SESSION_TOKEN)
+        .env("NEURON_FIRST_TOKEN_TIMEOUT_SECS", "1")
+        .args(prompt_args("hello"));
+    let output = run(command, None);
+
+    let errors = stderr(&output);
+    assert!(!output.status.success(), "{errors}");
+    assert!(errors.contains("The shared free pool is busy"), "{errors}");
+    assert_eq!(gateway.count("POST", "/v1/chat/completions"), 3, "{errors}");
+    for gap in gateway.chat_gaps() {
+        assert!(gap >= Duration::from_secs(2), "{gap:?}");
+    }
+    assert!(!errors.contains("did not start responding"), "{errors}");
+    assert!(!errors.contains("retrying once"), "{errors}");
 }
 
 #[test]

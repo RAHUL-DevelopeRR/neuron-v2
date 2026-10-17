@@ -77,6 +77,11 @@ Neuron reports gateway limits with the reason and what to do next:
 | `context_length_exceeded` | No available model fits the request | Stops; shorten the prompt or `/compact` the session. |
 | `invalid_session` | The credential expired or was revoked | Stops and asks you to run `neuron auth login`. |
 
+Waits between retries do not count toward the first-token timeout (90 seconds, 60
+after tool results). A response that times out or breaks off is sent once more only
+while the retry limit above still allows a request, so one model call sends at most
+three requests to the gateway.
+
 The free plan's limits and the providers behind it are described in the
 [README](README.md#plans-and-limits).
 

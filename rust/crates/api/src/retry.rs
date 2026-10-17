@@ -3,8 +3,8 @@
 
 use std::fmt::{Debug, Formatter};
 use std::io::{IsTerminal, Write};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 /// Upper bound on the total time a single request may spend sleeping
 /// between retries, across every attempt. A `Retry-After` that does not fit
@@ -48,6 +48,142 @@ impl RetryBudget {
     ) -> Option<Duration> {
         plan_retry_delay(retry_after, backoff, spent, self.total)
             .filter(|delay| self.max_wait.is_none_or(|max| *delay <= max))
+    }
+}
+
+/// Retry state of one model call, shared by every request sent for it.
+///
+/// A caller that sends the call again itself (for example after a stream
+/// timeout) passes the same progress back, so the provider's retry count and
+/// sleep budget continue where they stopped instead of starting over. The
+/// caller can also read how long the client has waited between retries, so
+/// a response deadline can leave those waits out.
+#[derive(Debug, Clone, Default)]
+pub struct RetryProgress {
+    state: Arc<Mutex<ProgressState>>,
+}
+
+#[derive(Debug, Default)]
+struct ProgressState {
+    /// Requests sent so far.
+    attempts: u32,
+    /// Retry limit of the client that sent them; `None` before the first.
+    max_retries: Option<u32>,
+    /// Retry budget spent: the planned delays of the waits so far.
+    slept: Duration,
+    /// Wall time of the finished waits.
+    waited: Duration,
+    /// When the wait in progress started.
+    waiting_since: Option<Instant>,
+}
+
+impl RetryProgress {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn state(&self) -> MutexGuard<'_, ProgressState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Requests sent so far, retries included.
+    #[must_use]
+    pub fn attempts(&self) -> u32 {
+        self.state().attempts
+    }
+
+    /// Requests sent after the first one.
+    #[must_use]
+    pub fn retries(&self) -> u32 {
+        self.attempts().saturating_sub(1)
+    }
+
+    /// Whether the client's retry limit still allows another request (true
+    /// before the first one).
+    #[must_use]
+    pub fn can_resend(&self) -> bool {
+        let state = self.state();
+        state
+            .max_retries
+            .is_none_or(|max_retries| state.attempts <= max_retries)
+    }
+
+    /// Wall time spent waiting between retries, including a wait that is
+    /// still in progress.
+    #[must_use]
+    pub fn waited(&self) -> Duration {
+        let state = self.state();
+        state.waited
+            + state
+                .waiting_since
+                .map_or(Duration::ZERO, |since| since.elapsed())
+    }
+
+    /// Records a request about to be sent and returns its 1-based number.
+    pub(crate) fn start_attempt(&self, max_retries: u32) -> u32 {
+        let mut state = self.state();
+        state.attempts = state.attempts.saturating_add(1);
+        state.max_retries = Some(max_retries);
+        state.attempts
+    }
+
+    /// Retry budget already spent.
+    pub(crate) fn slept(&self) -> Duration {
+        self.state().slept
+    }
+
+    /// Sleeps for `delay` before a retry, reporting through `observer` when
+    /// one is given, and records the wait.
+    pub(crate) async fn wait(
+        &self,
+        delay: Duration,
+        observer: Option<(&RetryObserver, &RetryNotice)>,
+    ) {
+        let mut wait = self.begin_wait(delay);
+        match observer {
+            Some((observer, notice)) => {
+                observer.notify(notice);
+                observer.wait(notice, delay).await;
+            }
+            None => tokio::time::sleep(delay).await,
+        }
+        wait.completed = true;
+    }
+
+    /// Marks the start of a wait of `delay`. It ends when the guard drops,
+    /// also when the request is dropped in the middle of it.
+    fn begin_wait(&self, delay: Duration) -> RetryWait<'_> {
+        self.state().waiting_since = Some(Instant::now());
+        RetryWait {
+            progress: self,
+            delay,
+            completed: false,
+        }
+    }
+}
+
+/// A wait between retries in progress (see [`RetryProgress::begin_wait`]).
+struct RetryWait<'a> {
+    progress: &'a RetryProgress,
+    delay: Duration,
+    /// The whole delay was waited.
+    completed: bool,
+}
+
+impl Drop for RetryWait<'_> {
+    fn drop(&mut self) {
+        let mut state = self.progress.state();
+        if let Some(since) = state.waiting_since.take() {
+            let elapsed = since.elapsed();
+            state.waited += elapsed;
+            // A wait cut short spends only the part that elapsed.
+            state.slept += if self.completed {
+                self.delay
+            } else {
+                elapsed.min(self.delay)
+            };
+        }
     }
 }
 
@@ -352,6 +488,51 @@ mod tests {
         );
         assert_eq!(capacity.plan(Some(secs(1)), backoff, secs(180)), None);
         assert_eq!(capacity.plan(None, secs(32), secs(170)), Some(secs(10)));
+    }
+
+    #[test]
+    fn progress_counts_requests_against_the_retry_limit() {
+        use super::RetryProgress;
+        let progress = RetryProgress::new();
+        assert!(progress.can_resend(), "nothing sent yet");
+        assert_eq!(progress.retries(), 0);
+
+        assert_eq!(progress.start_attempt(2), 1);
+        assert_eq!(progress.start_attempt(2), 2);
+        assert!(progress.can_resend());
+        let shared = progress.clone();
+        assert_eq!(shared.start_attempt(2), 3);
+        assert_eq!(progress.attempts(), 3, "clones share the state");
+        assert_eq!(progress.retries(), 2);
+        assert!(!progress.can_resend(), "one request and two retries");
+    }
+
+    #[test]
+    fn progress_records_waits_including_one_in_progress() {
+        use super::RetryProgress;
+        let progress = RetryProgress::new();
+        assert_eq!(progress.waited(), Duration::ZERO);
+        {
+            let _wait = progress.begin_wait(Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(30));
+            assert!(progress.waited() >= Duration::from_millis(30));
+        }
+        let waited = progress.waited();
+        assert!(waited >= Duration::from_millis(30));
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(progress.waited(), waited, "no wait in progress");
+        // A wait cut short spends only the part that elapsed.
+        assert!(progress.slept() >= Duration::from_millis(30));
+        assert!(progress.slept() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn progress_wait_spends_the_planned_delay() {
+        use super::RetryProgress;
+        let progress = RetryProgress::new();
+        progress.wait(Duration::from_millis(40), None).await;
+        assert_eq!(progress.slept(), Duration::from_millis(40));
+        assert!(progress.waited() >= Duration::from_millis(40));
     }
 
     #[test]

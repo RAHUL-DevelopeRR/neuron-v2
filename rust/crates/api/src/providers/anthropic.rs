@@ -15,7 +15,7 @@ use telemetry::{AnalyticsEvent, AnthropicRequestProfile, ClientIdentity, Session
 use crate::error::ApiError;
 use crate::http_client::build_http_client_or_default;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
-use crate::retry::{plan_retry_delay, retry_after_from_headers, MAX_TOTAL_BACKOFF};
+use crate::retry::{plan_retry_delay, retry_after_from_headers, RetryProgress, MAX_TOTAL_BACKOFF};
 
 use super::{
     anthropic_missing_credentials, model_token_limit, resolve_model_alias, Provider, ProviderFuture,
@@ -304,7 +304,9 @@ impl AnthropicClient {
 
         self.preflight_message_request(&request).await?;
 
-        let http_response = self.send_with_retry(&request).await?;
+        let http_response = self
+            .send_with_retry(&request, &RetryProgress::new())
+            .await?;
         let request_id = request_id_from_headers(http_response.headers());
         let body = http_response.text().await.map_err(ApiError::from)?;
         let mut response = serde_json::from_str::<MessageResponse>(&body).map_err(|error| {
@@ -347,9 +349,20 @@ impl AnthropicClient {
         &self,
         request: &MessageRequest,
     ) -> Result<MessageStream, ApiError> {
+        self.stream_message_with_progress(request, &RetryProgress::new())
+            .await
+    }
+
+    /// Like [`Self::stream_message`], continuing the retry count and budget
+    /// recorded in `progress` (see [`RetryProgress`]).
+    pub async fn stream_message_with_progress(
+        &self,
+        request: &MessageRequest,
+        progress: &RetryProgress,
+    ) -> Result<MessageStream, ApiError> {
         self.preflight_message_request(request).await?;
         let response = self
-            .send_with_retry(&request.clone().with_streaming())
+            .send_with_retry(&request.clone().with_streaming(), progress)
             .await?;
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
@@ -408,13 +421,13 @@ impl AnthropicClient {
     async fn send_with_retry(
         &self,
         request: &MessageRequest,
+        progress: &RetryProgress,
     ) -> Result<reqwest::Response, ApiError> {
-        let mut attempts = 0;
+        let mut attempts;
         let mut last_error: Option<ApiError>;
-        let mut slept = Duration::ZERO;
 
         loop {
-            attempts += 1;
+            attempts = progress.start_attempt(self.max_retries);
             let mut retry_after = None;
             if let Some(session_tracer) = &self.session_tracer {
                 session_tracer.record_http_request_started(
@@ -470,12 +483,12 @@ impl AnthropicClient {
             // Honour `Retry-After` and keep the total wait across retries
             // within MAX_TOTAL_BACKOFF instead of sleeping for minutes.
             let backoff = self.jittered_backoff_for_attempt(attempts)?;
-            let Some(delay) = plan_retry_delay(retry_after, backoff, slept, MAX_TOTAL_BACKOFF)
+            let Some(delay) =
+                plan_retry_delay(retry_after, backoff, progress.slept(), MAX_TOTAL_BACKOFF)
             else {
                 break;
             };
-            tokio::time::sleep(delay).await;
-            slept += delay;
+            progress.wait(delay, None).await;
         }
 
         Err(ApiError::RetriesExhausted {

@@ -10,8 +10,8 @@ use serde_json::{json, Value};
 use crate::error::{ApiError, GatewayError, GatewayErrorCode};
 use crate::http_client::build_http_client_or_default;
 use crate::retry::{
-    retry_after_from_headers, RetryBudget, RetryNotice, RetryObserver, CAPACITY_MAX_WAIT,
-    CAPACITY_TOTAL_BACKOFF, MAX_TOTAL_BACKOFF,
+    retry_after_from_headers, RetryBudget, RetryNotice, RetryObserver, RetryProgress,
+    CAPACITY_MAX_WAIT, CAPACITY_TOTAL_BACKOFF, MAX_TOTAL_BACKOFF,
 };
 use crate::types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
@@ -381,7 +381,9 @@ impl OpenAiCompatClient {
             ..request.clone()
         };
         preflight_message_request(&request)?;
-        let response = self.send_with_retry(&request).await?;
+        let response = self
+            .send_with_retry(&request, &RetryProgress::new())
+            .await?;
         let request_id = request_id_from_headers(response.headers());
         let body = response.text().await.map_err(ApiError::from)?;
         // Some backends return {"error":{"message":"...","type":"...","code":...}}
@@ -416,9 +418,20 @@ impl OpenAiCompatClient {
         &self,
         request: &MessageRequest,
     ) -> Result<MessageStream, ApiError> {
+        self.stream_message_with_progress(request, &RetryProgress::new())
+            .await
+    }
+
+    /// Like [`Self::stream_message`], continuing the retry count and budget
+    /// recorded in `progress` (see [`RetryProgress`]).
+    pub async fn stream_message_with_progress(
+        &self,
+        request: &MessageRequest,
+        progress: &RetryProgress,
+    ) -> Result<MessageStream, ApiError> {
         preflight_message_request(request)?;
         let response = self
-            .send_with_retry(&request.clone().with_streaming())
+            .send_with_retry(&request.clone().with_streaming(), progress)
             .await?;
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
@@ -436,16 +449,15 @@ impl OpenAiCompatClient {
     /// request) return immediately. `Retry-After` is honoured and the total
     /// sleep across retries never exceeds `max_total_backoff`, except while
     /// the Zero-X gateway reports `capacity_exhausted` or `rate_limited`,
-    /// which uses the larger capacity budget.
+    /// which uses the larger capacity budget. Requests and waits already
+    /// recorded in `progress` count against the same limits.
     async fn send_with_retry(
         &self,
         request: &MessageRequest,
+        progress: &RetryProgress,
     ) -> Result<reqwest::Response, ApiError> {
-        let mut attempts = 0;
-        let mut slept = Duration::ZERO;
-
         loop {
-            attempts += 1;
+            let attempts = progress.start_attempt(self.max_retries);
             let failure = match self.send_raw_request(request).await {
                 Ok(response) => match expect_success(response, self.config).await {
                     Ok(response) => return Ok(response),
@@ -473,7 +485,7 @@ impl OpenAiCompatClient {
             let backoff = self.jittered_backoff_for_attempt(attempts)?;
             let Some(delay) =
                 self.retry_budget_for(&failure.error)
-                    .plan(retry_after, backoff, slept)
+                    .plan(retry_after, backoff, progress.slept())
             else {
                 return Err(exhausted(failure.error));
             };
@@ -484,14 +496,11 @@ impl OpenAiCompatClient {
                 delay,
                 reason: retry_reason(&failure.error),
             };
-            match &self.retry_observer {
-                Some(observer) => {
-                    observer.notify(&notice);
-                    observer.wait(&notice, delay).await;
-                }
-                None => tokio::time::sleep(delay).await,
-            }
-            slept += delay;
+            let observer = self
+                .retry_observer
+                .as_ref()
+                .map(|observer| (observer, &notice));
+            progress.wait(delay, observer).await;
         }
     }
 

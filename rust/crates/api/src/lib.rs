@@ -39,7 +39,8 @@ pub use providers::{
     ProviderKind,
 };
 pub use retry::{
-    RetryNotice, RetryObserver, CAPACITY_MAX_WAIT, CAPACITY_TOTAL_BACKOFF, MAX_TOTAL_BACKOFF,
+    RetryNotice, RetryObserver, RetryProgress, CAPACITY_MAX_WAIT, CAPACITY_TOTAL_BACKOFF,
+    MAX_TOTAL_BACKOFF,
 };
 pub use sse::{parse_frame, SseParser};
 pub use types::{
