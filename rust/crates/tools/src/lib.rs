@@ -4305,6 +4305,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "WebFetch",
             "WebSearch",
             "ToolSearch",
+            "Skill",
             "TodoWrite",
             "StructuredOutput",
             "SendUserMessage",
@@ -4329,6 +4330,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "glob_search",
             "grep_search",
             "ToolSearch",
+            "Skill",
         ],
         _ => vec![
             "bash",
@@ -9416,6 +9418,26 @@ mod tests {
         assert!(verification.contains("bash"));
         assert!(verification.contains("PowerShell"));
         assert!(!verification.contains("write_file"));
+    }
+
+    /// Every sub-agent gets the default system prompt, whose skill index
+    /// only names the bundled skills; their text loads through the Skill
+    /// tool, so each sub-agent type needs it.
+    #[test]
+    fn every_subagent_type_can_load_the_skills_its_prompt_lists() {
+        for subagent_type in [
+            "general-purpose",
+            "Explore",
+            "Plan",
+            "Verification",
+            "claw-guide",
+            "statusline-setup",
+        ] {
+            assert!(
+                allowed_tools_for_subagent(subagent_type).contains("Skill"),
+                "{subagent_type} cannot load skills"
+            );
+        }
     }
 
     #[derive(Debug)]
