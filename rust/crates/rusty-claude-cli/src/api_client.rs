@@ -786,6 +786,18 @@ pub(crate) fn format_context_window_blocked_error(
                 ));
             }
         }
+        api::ApiError::Gateway(gateway) => {
+            // Written for the user (for example the free per-minute token
+            // budget the prompt went over), so shown in full, with the
+            // upgrade link when a paid pool would take the request.
+            let detail = gateway.message.trim();
+            if !detail.is_empty() {
+                lines.push(format!("  Detail           {detail}"));
+            }
+            if let Some(upgrade_url) = &gateway.upgrade_url {
+                lines.push(format!("  Upgrade          {upgrade_url}"));
+            }
+        }
         _ => {}
     }
 

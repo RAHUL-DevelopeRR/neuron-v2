@@ -4405,6 +4405,43 @@ mod tests {
         );
     }
 
+    /// Contract v1.2: a prompt above the free per-minute token budget is a
+    /// `context_length_exceeded` whose message names the budget, with
+    /// `upgrade_url` when a paid pool would take it.
+    #[test]
+    fn gateway_context_length_errors_show_the_budget_message_and_upgrade_link() {
+        let message = "This request is too large for the free per-minute token budget (120,000 tokens, prompt plus max_tokens). Shorten the conversation or lower max_tokens, or upgrade for paid capacity.";
+        let body = serde_json::json!({"error": {
+            "message": message,
+            "type": "invalid_request_error",
+            "code": "context_length_exceeded",
+            "param": null,
+            "request_id": "req_budget",
+            "upgrade_url": "https://zero-x.live/pricing"
+        }})
+        .to_string();
+        let gateway = api::GatewayError::from_body(reqwest::StatusCode::BAD_REQUEST, &body)
+            .expect("gateway error body");
+        let error = ApiError::Gateway(Box::new(gateway));
+        assert!(error.is_context_window_failure());
+
+        let rendered = format_user_visible_api_error("session-budget", &error);
+        assert!(rendered.contains("context_window_blocked"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("Detail           {message}")),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Upgrade          https://zero-x.live/pricing"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Trace            req_budget"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Compact          /compact"), "{rendered}");
+    }
+
     fn temp_dir() -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
 
