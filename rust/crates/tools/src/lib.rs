@@ -8772,7 +8772,6 @@ mod tests {
             },
         )
         .expect("Agent should succeed");
-        std::env::remove_var("CLAWD_AGENT_STORE");
 
         assert_eq!(manifest.name, "ship-audit");
         assert_eq!(manifest.subagent_type.as_deref(), Some("Explore"));
@@ -8828,6 +8827,16 @@ mod tests {
         .expect("Agent should normalize explicit names");
         let named_output = serde_json::to_value(named).expect("valid json");
         assert_eq!(named_output["name"], "ship-audit");
+        // Every manifest of this test goes to the test store, not to the
+        // working directory's `.neuron/agents`.
+        for output in [&normalized_output, &named_output] {
+            let manifest_file = output["manifestFile"].as_str().expect("manifest path");
+            assert!(
+                std::path::Path::new(manifest_file).starts_with(&dir),
+                "{manifest_file}"
+            );
+        }
+        std::env::remove_var("CLAWD_AGENT_STORE");
         let _ = std::fs::remove_dir_all(dir);
     }
 
