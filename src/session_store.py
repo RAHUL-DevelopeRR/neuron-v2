@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -14,10 +15,17 @@ class StoredSession:
 
 
 DEFAULT_SESSION_DIR = Path('.port_sessions')
+# Overrides DEFAULT_SESSION_DIR (the tests point it at a temporary directory).
+SESSION_DIR_ENV = 'PORT_SESSIONS_DIR'
+
+
+def default_session_dir() -> Path:
+    override = os.environ.get(SESSION_DIR_ENV)
+    return Path(override) if override else DEFAULT_SESSION_DIR
 
 
 def save_session(session: StoredSession, directory: Path | None = None) -> Path:
-    target_dir = directory or DEFAULT_SESSION_DIR
+    target_dir = directory or default_session_dir()
     target_dir.mkdir(parents=True, exist_ok=True)
     path = target_dir / f'{session.session_id}.json'
     path.write_text(json.dumps(asdict(session), indent=2))
@@ -25,7 +33,7 @@ def save_session(session: StoredSession, directory: Path | None = None) -> Path:
 
 
 def load_session(session_id: str, directory: Path | None = None) -> StoredSession:
-    target_dir = directory or DEFAULT_SESSION_DIR
+    target_dir = directory or default_session_dir()
     data = json.loads((target_dir / f'{session_id}.json').read_text())
     return StoredSession(
         session_id=data['session_id'],

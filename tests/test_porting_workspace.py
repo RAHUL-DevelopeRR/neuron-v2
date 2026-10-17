@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -9,7 +11,30 @@ from src.commands import PORTED_COMMANDS
 from src.parity_audit import run_parity_audit
 from src.port_manifest import build_port_manifest
 from src.query_engine import QueryEnginePort
+from src.session_store import SESSION_DIR_ENV
 from src.tools import PORTED_TOOLS
+
+# Sessions persisted by these tests (in this process and in the CLI
+# subprocesses, which inherit the environment) go to a temporary directory
+# instead of `.port_sessions/` in the working tree.
+_SESSION_DIR: tempfile.TemporaryDirectory[str] | None = None
+_PREVIOUS_SESSION_DIR: str | None = None
+
+
+def setUpModule() -> None:
+    global _SESSION_DIR, _PREVIOUS_SESSION_DIR
+    _SESSION_DIR = tempfile.TemporaryDirectory(prefix='port-sessions-')
+    _PREVIOUS_SESSION_DIR = os.environ.get(SESSION_DIR_ENV)
+    os.environ[SESSION_DIR_ENV] = _SESSION_DIR.name
+
+
+def tearDownModule() -> None:
+    if _PREVIOUS_SESSION_DIR is None:
+        os.environ.pop(SESSION_DIR_ENV, None)
+    else:
+        os.environ[SESSION_DIR_ENV] = _PREVIOUS_SESSION_DIR
+    if _SESSION_DIR is not None:
+        _SESSION_DIR.cleanup()
 
 
 class PortingWorkspaceTests(unittest.TestCase):
@@ -163,7 +188,9 @@ class PortingWorkspaceTests(unittest.TestCase):
         from src.runtime import PortRuntime
 
         session = PortRuntime().bootstrap_session('review MCP tool', limit=5)
-        session_id = Path(session.persisted_session_path).stem
+        persisted = Path(session.persisted_session_path)
+        self.assertEqual(persisted.parent.resolve(), Path(os.environ[SESSION_DIR_ENV]).resolve())
+        session_id = persisted.stem
         result = subprocess.run(
             [sys.executable, '-m', 'src.main', 'load-session', session_id],
             check=True,

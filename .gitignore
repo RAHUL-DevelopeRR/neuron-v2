@@ -56,3 +56,5 @@ node_modules/
 ui/react-tui/dist/
 neuron_cli/neuron
 .neuron/
+# Python porting workspace sessions (src/session_store.py)
+.port_sessions/

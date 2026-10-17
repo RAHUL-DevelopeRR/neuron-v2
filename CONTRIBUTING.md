@@ -57,8 +57,8 @@ The packaging tests run the real launchers and installers against a local fake r
 server (`tests/fake_release.py`) serving a small dummy `neuron`. On Windows the dummy
 is compiled with the .NET Framework `csc.exe` that ships with Windows; set
 `NEURON_TEST_BASH` to Git for Windows' `usr\bin\bash.exe` to also run the `install.sh`
-and release workflow step tests there. The porting workspace tests write session
-files to `.port_sessions/` in the repository root; delete that directory afterwards.
+and release workflow step tests there. The porting workspace tests write their session
+files to a temporary directory (`PORT_SESSIONS_DIR`), not to `.port_sessions/`.
 
 To try an installer by hand against the fake server:
 
