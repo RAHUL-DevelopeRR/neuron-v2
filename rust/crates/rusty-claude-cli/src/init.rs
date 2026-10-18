@@ -1,10 +1,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Shared project defaults written by `neuron init`. `acceptEdits` resolves
+/// to workspace-write, the CLI default, which still asks before commands that
+/// are not read-only; a repository file must never grant full access.
 const STARTER_CLAW_JSON: &str = concat!(
     "{\n",
     "  \"permissions\": {\n",
-    "    \"defaultMode\": \"dontAsk\"\n",
+    "    \"defaultMode\": \"acceptEdits\"\n",
     "  }\n",
     "}\n",
 );
@@ -371,11 +374,20 @@ mod tests {
             concat!(
                 "{\n",
                 "  \"permissions\": {\n",
-                "    \"defaultMode\": \"dontAsk\"\n",
+                "    \"defaultMode\": \"acceptEdits\"\n",
                 "  }\n",
                 "}\n",
             )
         );
+        // The starter must resolve to the CLI default, never to full access.
+        let config = runtime::ConfigLoader::new(&root, root.join("missing-home"))
+            .load()
+            .expect("starter settings load");
+        assert_eq!(
+            config.permission_mode(),
+            Some(runtime::ResolvedPermissionMode::WorkspaceWrite)
+        );
+        assert!(config.ignored_project_settings().is_empty());
         let gitignore = fs::read_to_string(root.join(".gitignore")).expect("read gitignore");
         assert!(gitignore.contains(".neuron/settings.local.json"));
         assert!(gitignore.contains(".neuron/sessions/"));

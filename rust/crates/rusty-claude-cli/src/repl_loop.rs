@@ -268,7 +268,7 @@ pub(crate) fn launch(options: ReplLaunch) -> Result<(), Box<dyn std::error::Erro
         resolved_model,
         true,
         options.allowed_tools,
-        options.permission_mode,
+        crate::args::permission_mode_after_trust(options.permission_mode),
     )?;
     cli.set_reasoning_effort(options.reasoning_effort);
     let mut editor =

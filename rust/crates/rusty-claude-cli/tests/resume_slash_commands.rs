@@ -144,7 +144,11 @@ fn resumed_config_command_loads_settings_files_end_to_end() {
             "/config",
             "model",
         ],
-        &[("CLAW_CONFIG_HOME", config_home.to_str().expect("utf8 path"))],
+        &[
+            ("CLAW_CONFIG_HOME", config_home.to_str().expect("utf8 path")),
+            // Workspace settings only apply to a trusted workspace.
+            ("NEURON_TRUST_WORKSPACE", "1"),
+        ],
     );
 
     // then

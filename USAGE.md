@@ -232,6 +232,24 @@ names the file, the line and the closest known key. Commonly used keys:
 Default skills and MCP servers are described in
 [default integrations](docs/DEFAULT_INTEGRATIONS.md).
 
+### Workspace trust
+
+A cloned repository's own settings files (`.neuron.json`, `.neuron/settings*.json`
+and the `.claw` equivalents) can run commands, so Neuron applies them only once you
+trust the directory. The first time you start Neuron in a directory it asks; your
+answer is saved in `~/.neuroncli/trusted_dirs.txt` (under `NEURON_HOME` if set).
+A directory is also trusted when it sits under a `trustedRoots` entry in **your user
+settings**; a repository cannot list itself. For headless runs, set
+`NEURON_TRUST_WORKSPACE=1` only for checkouts you trust.
+
+Until a directory is trusted, its settings keep only what restricts Neuron:
+`permissions.deny` (added to your own deny rules), a read-only `defaultMode` or
+`permissionMode`, and `"defaultMcpServers": false` or `"defaultSkills": false`.
+Hooks, MCP servers, allow and ask rules, model, aliases, provider and the other keys
+are ignored, with a warning naming them. Even in a trusted directory, settings files
+cannot set a full-access permission mode; pass `--permission-mode danger-full-access`
+or put it in your user settings.
+
 ## Environment variables
 
 | Variable | Used by | Purpose |
