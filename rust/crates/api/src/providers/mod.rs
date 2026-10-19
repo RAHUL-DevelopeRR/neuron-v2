@@ -458,10 +458,21 @@ pub(crate) fn load_dotenv_file(
 }
 
 /// Look up `key` in a `.env` file located in the current working directory.
-/// Returns `None` when the file is missing, the key is absent, or the value
-/// is empty.
+/// Returns `None` when the workspace is not trusted, the file is missing,
+/// the key is absent, or the value is empty.
 pub(crate) fn dotenv_value(key: &str) -> Option<String> {
     let cwd = std::env::current_dir().ok()?;
+    let trusted = runtime::ConfigLoader::default_for(&cwd).workspace_is_trusted();
+    dotenv_value_in(&cwd, key, trusted)
+}
+
+/// A cloned repository's `.env` could supply its own API key, sending the
+/// user's prompts and code to an account its author can read, so the file
+/// only counts once the user has trusted the workspace.
+fn dotenv_value_in(cwd: &std::path::Path, key: &str, workspace_trusted: bool) -> Option<String> {
+    if !workspace_trusted {
+        return None;
+    }
     let values = load_dotenv_file(&cwd.join(".env"))?;
     values.get(key).filter(|value| !value.is_empty()).cloned()
 }
@@ -480,9 +491,9 @@ mod tests {
 
     use super::{
         anthropic_missing_credentials, anthropic_missing_credentials_hint, detect_provider_kind,
-        load_dotenv_file, max_tokens_for_model, max_tokens_for_model_with_override,
-        model_token_limit, parse_dotenv, preflight_message_request, resolve_model_alias,
-        ProviderKind,
+        dotenv_value_in, load_dotenv_file, max_tokens_for_model,
+        max_tokens_for_model_with_override, model_token_limit, parse_dotenv,
+        preflight_message_request, resolve_model_alias, ProviderKind,
     };
 
     /// Serializes every test in this module that mutates process-wide
@@ -905,6 +916,32 @@ NO_EQUALS_LINE
         assert_eq!(values.get("EMPTY_VALUE").map(String::as_str), Some(""));
         assert!(!values.contains_key("NO_EQUALS_LINE"));
         assert!(!values.contains_key("# this is a comment"));
+    }
+
+    #[test]
+    fn dotenv_credentials_only_count_in_a_trusted_workspace() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "api-dotenv-trust-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_root).expect("temp dir");
+        std::fs::write(
+            temp_root.join(".env"),
+            "OPENAI_API_KEY=sk-from-a-cloned-repo\n",
+        )
+        .expect("write .env");
+
+        assert_eq!(dotenv_value_in(&temp_root, "OPENAI_API_KEY", false), None);
+        assert_eq!(
+            dotenv_value_in(&temp_root, "OPENAI_API_KEY", true).as_deref(),
+            Some("sk-from-a-cloned-repo")
+        );
+
+        std::fs::remove_dir_all(&temp_root).expect("cleanup");
     }
 
     #[test]

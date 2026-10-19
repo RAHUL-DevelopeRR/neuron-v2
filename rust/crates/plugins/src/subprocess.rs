@@ -3,8 +3,9 @@
 //! servers).
 //!
 //! The helpers cover three concerns:
-//! - credential scrubbing: Zero-X session tokens and API keys must never leak
-//!   into tool subprocesses ([`scrub_credential_env`]);
+//! - credential scrubbing: Zero-X session tokens, provider API keys and other
+//!   secret-looking variables must never leak into tool subprocesses, whose
+//!   output reaches the model ([`scrub_credential_env`]);
 //! - bounded execution: stdout and stderr are drained concurrently so a chatty
 //!   child cannot dead-lock on a full pipe, and a timeout or cancellation
 //!   request terminates the child ([`run_bounded`]);
@@ -19,8 +20,25 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-/// Environment variables that always carry Zero-X credentials.
-pub const CREDENTIAL_ENV_VARS: &[&str] = &["NEURON_TOKEN", "NEURON_SESSION_TOKEN"];
+/// Environment variables that always carry Zero-X or upstream-provider
+/// credentials.
+pub const CREDENTIAL_ENV_VARS: &[&str] = &[
+    "NEURON_TOKEN",
+    "NEURON_SESSION_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "OPENAI_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "XAI_API_KEY",
+    "GROK_API_KEY",
+    "DASHSCOPE_API_KEY",
+    "OPENROUTER_API_KEY",
+];
+
+/// Name suffixes that mark any other variable as a secret (`GITHUB_TOKEN`,
+/// `STRIPE_SECRET`, `MISTRAL_API_KEY`); matched after a `_` or as the whole
+/// name, ignoring case.
+pub const CREDENTIAL_ENV_SUFFIXES: &[&str] = &["API_KEY", "TOKEN", "SECRET"];
 
 /// Value prefixes of Zero-X credentials (`ses_` CLI sessions, `nzx_` API keys).
 pub const CREDENTIAL_VALUE_PREFIXES: &[&str] = &["ses_", "nzx_"];
@@ -63,13 +81,18 @@ pub fn windows_cmd_command(command: &str) -> Command {
     prepared
 }
 
-/// Returns `true` when an environment variable holds a Zero-X credential.
+/// Returns `true` when an environment variable holds a credential: a known
+/// Zero-X or provider variable, a secret-looking name, or a Zero-X value.
 #[must_use]
 pub fn is_credential_env(key: &OsStr, value: &OsStr) -> bool {
-    let key = key.to_string_lossy();
-    if CREDENTIAL_ENV_VARS
-        .iter()
-        .any(|name| key.eq_ignore_ascii_case(name))
+    let key = key.to_string_lossy().to_ascii_uppercase();
+    if CREDENTIAL_ENV_VARS.contains(&key.as_str())
+        || CREDENTIAL_ENV_SUFFIXES.iter().any(|suffix| {
+            key == *suffix
+                || key
+                    .strip_suffix(suffix)
+                    .is_some_and(|stem| stem.ends_with('_'))
+        })
     {
         return true;
     }
@@ -88,7 +111,7 @@ pub fn credential_env_keys() -> Vec<OsString> {
         .collect()
 }
 
-/// Removes inherited Zero-X credentials from the child's environment.
+/// Removes inherited credentials from the child's environment.
 ///
 /// Call this before applying explicitly configured variables so that a value
 /// the user deliberately configured for a child (for example in an MCP server
@@ -395,27 +418,66 @@ mod tests {
     }
 
     #[test]
+    fn detects_provider_keys_and_secret_looking_names() {
+        for key in [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "OPENAI_API_KEY",
+            "AZURE_OPENAI_API_KEY",
+            "XAI_API_KEY",
+            "GROK_API_KEY",
+            "DASHSCOPE_API_KEY",
+            "OPENROUTER_API_KEY",
+            "MISTRAL_API_KEY",
+            "GITHUB_TOKEN",
+            "stripe_secret",
+            "API_KEY",
+        ] {
+            assert!(
+                is_credential_env(OsStr::new(key), OsStr::new("plain-value")),
+                "{key}"
+            );
+        }
+        for key in [
+            "PATH",
+            "HOME",
+            "TOKENIZERS_PARALLELISM",
+            "SECRETARY",
+            "KEYBOARD_LAYOUT",
+            "MYTOKEN",
+        ] {
+            assert!(
+                !is_credential_env(OsStr::new(key), OsStr::new("plain-value")),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
     fn scrubbed_children_do_not_inherit_credentials_but_keep_other_vars() {
         std::env::set_var("PLUGINS_SCRUB_TEST_SECRET", "nzx_scrub_test_secret");
+        std::env::set_var("PLUGINS_SCRUB_TEST_API_KEY", "sk-plain-provider-key");
         std::env::set_var("PLUGINS_SCRUB_TEST_KEEP", "keep-me");
         assert!(credential_env_keys()
             .iter()
             .any(|key| key == "PLUGINS_SCRUB_TEST_SECRET"));
 
         let script = if cfg!(windows) {
-            "echo secret=%PLUGINS_SCRUB_TEST_SECRET% keep=%PLUGINS_SCRUB_TEST_KEEP%"
+            "echo secret=%PLUGINS_SCRUB_TEST_SECRET% key=%PLUGINS_SCRUB_TEST_API_KEY% keep=%PLUGINS_SCRUB_TEST_KEEP%"
         } else {
-            "echo secret=${PLUGINS_SCRUB_TEST_SECRET:-unset} keep=$PLUGINS_SCRUB_TEST_KEEP"
+            "echo secret=${PLUGINS_SCRUB_TEST_SECRET:-unset} key=${PLUGINS_SCRUB_TEST_API_KEY:-unset} keep=$PLUGINS_SCRUB_TEST_KEEP"
         };
         let mut command = shell(script);
         scrub_credential_env(&mut command);
         let output = run_bounded(&mut command, None, Some(Duration::from_secs(20)), &|| false)
             .expect("child should run");
         std::env::remove_var("PLUGINS_SCRUB_TEST_SECRET");
+        std::env::remove_var("PLUGINS_SCRUB_TEST_API_KEY");
         std::env::remove_var("PLUGINS_SCRUB_TEST_KEEP");
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(!stdout.contains("nzx_scrub_test_secret"), "{stdout}");
+        assert!(!stdout.contains("sk-plain-provider-key"), "{stdout}");
         assert!(stdout.contains("keep=keep-me"), "{stdout}");
     }
 

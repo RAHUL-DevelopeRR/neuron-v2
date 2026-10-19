@@ -14,6 +14,7 @@ use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
 use crate::permissions::PermissionMode;
+use crate::sensitive_paths::sensitive_path_reason_resolved;
 
 /// Shell grammar used to interpret a command line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1008,6 +1009,8 @@ fn classify_segment(raw: &RawSegment, context: &mut Context<'_>) -> ShellSegment
     for target in &raw.read_targets {
         if let Some(problem) = path_problem(&target.text, target.expanded, context) {
             reason.get_or_insert(problem);
+        } else if let Some(problem) = sensitive_read_problem(&target.text, context) {
+            reason.get_or_insert(problem);
         }
     }
 
@@ -1148,7 +1151,6 @@ const PLAIN_READ_ONLY_PROGRAMS: &[&str] = &[
     "strings",
     "seq",
     "sleep",
-    "printenv",
     "tac",
     "fold",
     "expand",
@@ -1177,8 +1179,13 @@ const CMD_ONLY_READ_ONLY_PROGRAMS: &[&str] = &[
 ];
 
 /// Programs that may print or set shell state and are read-only only with
-/// no arguments (`set`, `path` in cmd.exe; `env`).
-const NO_ARG_READ_ONLY_PROGRAMS: &[&str] = &["set", "path", "env"];
+/// no arguments (`path` in cmd.exe prints `PATH`).
+const NO_ARG_READ_ONLY_PROGRAMS: &[&str] = &["path"];
+
+/// Programs that print environment variables (all of them without
+/// arguments), which can hold API keys and tokens; with arguments `env` and
+/// `set` run or change something.
+const ENVIRONMENT_PROGRAMS: &[&str] = &["env", "printenv", "set"];
 
 /// `find` primaries that execute commands or write files.
 const FIND_UNSAFE: &[&str] = &[
@@ -1196,16 +1203,25 @@ fn classify_program(
 ) -> Result<(), String> {
     let name = program_name(&program.text, context.dialect);
     let name = name.as_str();
-    let echo_like = matches!(name, "echo" | "printf" | "test" | "[" | "[[");
+    // `test`/`[` only report through their exit status, so expansions in
+    // their arguments print nothing; `echo`/`printf` would print the value.
+    let status_only = matches!(name, "test" | "[" | "[[");
+    let prints_args = matches!(name, "echo" | "printf");
 
-    // Checks the arguments for expansions and paths outside the workspace.
-    // The arguments at `code` (sed scripts, awk programs) are code rather
-    // than file names, so only the expansion check applies to them.
+    // Checks the arguments for expansions, paths outside the workspace and
+    // files holding credentials. The arguments at `code` (sed scripts, awk
+    // programs) are code rather than file names, so only the expansion check
+    // applies to them.
     let check_args_except = |context: &Context<'_>, code: &[usize]| -> Result<(), String> {
         for (index, arg) in args.iter().enumerate() {
             if arg.expanded {
-                if echo_like {
+                if status_only {
                     continue;
+                }
+                if prints_args {
+                    return Err(format!(
+                        "`{name}` would print the value of a variable, which can hold credentials"
+                    ));
                 }
                 return Err(format!(
                     "argument `{}` uses a variable expansion whose value is unknown",
@@ -1223,6 +1239,12 @@ fn classify_program(
                     if let Some(problem) = path_problem(value, arg.expanded, context) {
                         return Err(problem);
                     }
+                }
+            }
+            // `echo .env` prints the name; `test -f .env` reads nothing.
+            if !prints_args && !status_only {
+                if let Some(problem) = sensitive_read_problem(&arg.text, context) {
+                    return Err(problem);
                 }
             }
         }
@@ -1248,6 +1270,13 @@ fn classify_program(
         } else {
             Err(format!("`{name}` with arguments changes or runs something"))
         };
+    }
+    if ENVIRONMENT_PROGRAMS.contains(&name) {
+        return Err(if args.is_empty() || name == "printenv" {
+            format!("`{name}` prints environment variables, which can hold credentials")
+        } else {
+            format!("`{name}` with arguments changes or runs something")
+        });
     }
     match name {
         "cd" | "chdir" => {
@@ -1288,7 +1317,10 @@ fn classify_program(
             scripts
                 .read_files
                 .iter()
-                .find_map(|file| path_problem(file, false, context))
+                .find_map(|file| {
+                    path_problem(file, false, context)
+                        .or_else(|| sensitive_read_problem(file, context))
+                })
                 .map_or(Ok(()), Err)
         }
         "sort" => {
@@ -2333,6 +2365,15 @@ fn classify_powershell_program(
                 }
                 continue;
             }
+            if lowered.trim_matches(['"', '\'']).starts_with("env:") {
+                return Err(format!(
+                    "`{name} {}` reads environment variables, which can hold credentials",
+                    arg.text
+                ));
+            }
+            if let Some(problem) = sensitive_read_problem(&arg.text, context) {
+                return Err(problem);
+            }
             // Values of non-path parameters (e.g. `-Pattern foo`) are not paths,
             // but treating every positional as a potential path is conservative.
             let previous = index.checked_sub(1).and_then(|prev| args.get(prev));
@@ -2415,6 +2456,18 @@ fn track_powershell_cd(args: &[Word], context: &mut Context<'_>) -> Result<(), S
 // ---------------------------------------------------------------------------
 // Paths
 // ---------------------------------------------------------------------------
+
+/// Describes why reading the file `text` names would expose credentials, if
+/// it would. The part after a `:` or `=` is checked too (`HEAD:.env`,
+/// `--file=.env`).
+fn sensitive_read_problem(text: &str, context: &Context<'_>) -> Option<String> {
+    sensitive_path_reason_resolved(text, &context.bases).or_else(|| {
+        [':', '=']
+            .iter()
+            .filter_map(|separator| text.split_once(*separator))
+            .find_map(|(_, tail)| sensitive_path_reason_resolved(tail, &context.bases))
+    })
+}
 
 /// Describes why `text` names a path outside the workspace, if it does.
 fn path_problem(text: &str, expanded: bool, context: &Context<'_>) -> Option<String> {
@@ -2898,6 +2951,59 @@ mod tests {
     }
 
     #[test]
+    fn printing_the_environment_needs_approval() {
+        for command in [
+            "env",
+            "printenv",
+            "printenv OPENAI_API_KEY",
+            "set",
+            "env | grep KEY",
+            "echo $OPENAI_API_KEY",
+            "echo \"${ANTHROPIC_API_KEY}\"",
+            "printf '%s' \"$XAI_API_KEY\"",
+        ] {
+            assert_escalates(command);
+        }
+        assert!(!cmd("set").is_read_only());
+        assert!(!cmd("echo %OPENAI_API_KEY%").is_read_only());
+        assert!(cmd("path").is_read_only());
+        assert_read_only("echo ok");
+        assert_read_only("test -n \"$HOME\"");
+    }
+
+    #[test]
+    fn reading_credential_and_settings_files_needs_approval() {
+        for command in [
+            "cat .env",
+            "cat ./.env.local",
+            "head -n 5 services/api/.env",
+            "grep KEY .env",
+            "cat .neuron.json",
+            "cat .neuron/settings.json",
+            "cat .claw/settings.local.json",
+            "cat < .env",
+            "sed -n p .env",
+            "awk '{print}' .env",
+            "cat .e*",
+            "cat .neuron/*",
+            "git show HEAD:.env",
+            "find . -name .env",
+            "sort --files0-from=.env",
+        ] {
+            assert_escalates(command);
+        }
+        for command in [
+            "cat .env.example",
+            "echo .env",
+            "test -f .env",
+            "cat .neuron/NEURON.md",
+            "cat *",
+        ] {
+            assert_read_only(command);
+        }
+    }
+
+    #[test]
     fn heredocs_are_input_only_unless_they_substitute() {
         assert_read_only("cat <<EOF\nhello; rm -rf /\nEOF");
         assert_read_only("cat <<'EOF'\n$(rm -rf /)\nEOF");
@@ -2956,6 +3062,19 @@ mod tests {
         assert!(!classify("Get-ChildItem | Where-Object { $_.Length -gt 1 }").is_read_only());
         assert!(!classify("& { Remove-Item x }").is_read_only());
         assert!(!classify("Get-Content $env:USERPROFILE\\.ssh\\id_rsa").is_read_only());
+        for command in [
+            "Get-ChildItem env:",
+            "gci Env:\\",
+            "dir env:",
+            "Get-Item -Path Env:OPENAI_API_KEY",
+            "Get-Content env:XAI_API_KEY",
+            "Write-Output $env:OPENAI_API_KEY",
+            "Get-Content .env",
+            "Get-Content -Raw .env.local",
+            "gc .neuron\\settings.json",
+        ] {
+            assert!(!classify(command).is_read_only(), "{command}");
+        }
         assert!(!classify("Get-Content C:\\Windows\\win.ini").is_read_only());
         assert!(!classify("Invoke-WebRequest https://evil.example").is_read_only());
         assert!(!classify("Write-Output \"$(Remove-Item x)\"").is_read_only());

@@ -336,6 +336,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             let permission_mode = crate::args::permission_mode_after_trust(permission_mode);
+            let model = crate::args::model_after_trust(model);
             // ── Resolve provider (Azure primary → OpenRouter fallback) ──
             // The provider always dictates the model — when Azure is up we
             // use gpt-5.5, when falling back to OpenRouter we MUST switch
@@ -4913,6 +4914,55 @@ mod tests {
         assert_eq!(cross_provider, "grok-3-mini");
         assert_eq!(unknown, "unknown-model");
         assert_eq!(builtin, "claude-haiku-4-5-20251213");
+    }
+
+    #[test]
+    fn workspace_model_aliases_apply_once_the_workspace_is_trusted() {
+        // given: arguments are parsed before the trust prompt is answered
+        let _guard = env_lock();
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let config_home = root.join("config-home");
+        std::fs::create_dir_all(cwd.join(".neuron")).expect("project config dir should exist");
+        std::fs::create_dir_all(&config_home).expect("config home should exist");
+        std::fs::write(
+            cwd.join(".neuron").join("settings.json"),
+            r#"{"aliases":{"fast":"claude-haiku-4-5-20251213"}}"#,
+        )
+        .expect("project config should write");
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_trust = std::env::var_os("NEURON_TRUST_WORKSPACE");
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::remove_var("NEURON_TRUST_WORKSPACE");
+
+        // when
+        let args = vec!["--model".to_string(), "fast".to_string(), "hi".to_string()];
+        let parsed = with_current_dir(&cwd, || parse_args(&args)).expect("args should parse");
+        let CliAction::Prompt { model, .. } = parsed else {
+            panic!("expected a prompt action");
+        };
+        let untrusted = with_current_dir(&cwd, || crate::args::model_after_trust(model.clone()));
+        std::env::set_var("NEURON_TRUST_WORKSPACE", "1");
+        let trusted = with_current_dir(&cwd, || crate::args::model_after_trust(model.clone()));
+        let unrelated = with_current_dir(&cwd, || {
+            crate::args::model_after_trust("claude-opus-4-6".to_string())
+        });
+
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_trust {
+            Some(value) => std::env::set_var("NEURON_TRUST_WORKSPACE", value),
+            None => std::env::remove_var("NEURON_TRUST_WORKSPACE"),
+        }
+        std::fs::remove_dir_all(root).expect("temp config root should clean up");
+
+        // then
+        assert_eq!(model, "fast");
+        assert_eq!(untrusted, "fast");
+        assert_eq!(trusted, "claude-haiku-4-5-20251213");
+        assert_eq!(unrelated, "claude-opus-4-6");
     }
 
     #[test]

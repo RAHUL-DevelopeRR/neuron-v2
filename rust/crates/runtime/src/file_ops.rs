@@ -11,6 +11,8 @@ use glob::Pattern;
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 
+use crate::sensitive_paths::sensitive_path_reason;
+
 pub use walk::DEFAULT_SKIPPED_DIRS;
 
 /// Maximum file size that can be read (10 MB).
@@ -779,6 +781,11 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
         if !matches_optional_filters(&file_path, glob_filter.as_ref(), file_type) {
             continue;
         }
+        // Naming a credential file as `path` is a read the user approved; a
+        // directory search leaves them out.
+        if file_path != base_path && is_sensitive_search_file(&base_path, &file_path) {
+            continue;
+        }
 
         let Ok(file_contents) = fs::read_to_string(&file_path) else {
             continue;
@@ -855,6 +862,18 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
 
 fn collect_search_files(base_path: &Path) -> Vec<PathBuf> {
     walk::collect_workspace_files(base_path).0
+}
+
+/// Whether a file found under `base_path` holds credentials, judged by its
+/// path below the search root and, for a symlink, by its target.
+fn is_sensitive_search_file(base_path: &Path, file_path: &Path) -> bool {
+    let relative = file_path.strip_prefix(base_path).unwrap_or(file_path);
+    if sensitive_path_reason(&relative.to_string_lossy()).is_some() {
+        return true;
+    }
+    fs::symlink_metadata(file_path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+        && fs::canonicalize(file_path)
+            .is_ok_and(|target| sensitive_path_reason(&target.to_string_lossy()).is_some())
 }
 
 fn matches_optional_filters(
@@ -1459,6 +1478,50 @@ mod tests {
         .expect("grep");
         assert_eq!(grep_output.num_files, 1, "{:?}", grep_output.filenames);
         assert!(grep_output.filenames[0].ends_with("app.js"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn directory_grep_skips_credential_files_unless_named() {
+        let dir = temp_path("grep-sensitive");
+        std::fs::create_dir_all(dir.join(".neuron")).expect("settings dir");
+        std::fs::write(dir.join("app.rs"), "const API_KEY_NAME: &str = \"x\";\n").expect("app");
+        std::fs::write(dir.join(".env"), "OPENAI_API_KEY=sk-grep-secret\n").expect("env");
+        std::fs::write(
+            dir.join(".neuron").join("settings.local.json"),
+            "{\"env\":{\"XAI_API_KEY\":\"xai-grep-secret\"}}\n",
+        )
+        .expect("settings");
+        let grep = |path: &std::path::Path| {
+            grep_search(&GrepSearchInput {
+                pattern: String::from("API_KEY"),
+                path: Some(path.to_string_lossy().into_owned()),
+                glob: None,
+                output_mode: Some(String::from("content")),
+                before: None,
+                after: None,
+                context_short: None,
+                context: None,
+                line_numbers: None,
+                case_insensitive: None,
+                file_type: None,
+                head_limit: None,
+                offset: None,
+                multiline: None,
+            })
+            .expect("grep")
+        };
+
+        let directory = grep(&dir);
+        assert_eq!(directory.num_files, 1, "{:?}", directory.filenames);
+        let content = directory.content.unwrap_or_default();
+        assert!(content.contains("API_KEY_NAME"), "{content}");
+        assert!(!content.contains("sk-grep-secret"), "{content}");
+        assert!(!content.contains("xai-grep-secret"), "{content}");
+
+        // Naming the file is a read the permission layer asked about.
+        let named = grep(&dir.join(".env"));
+        assert!(named.content.unwrap_or_default().contains("sk-grep-secret"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }
