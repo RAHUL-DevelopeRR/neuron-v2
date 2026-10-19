@@ -684,7 +684,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "WebSearch",
-            description: "Search the web for current information and return cited results.",
+            description: "Search the web for current information and return cited results. The query is sent to an external search service, so web searches need user approval (once per session) unless the session runs in danger-full-access mode.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1429,7 +1429,10 @@ fn execute_tool_with_enforcer_and_cancel(
             maybe_enforce_permission_check(enforcer, name, input)?;
             from_value::<WebFetchInput>(input).and_then(run_web_fetch)
         }
-        "WebSearch" => from_value::<WebSearchInput>(input).and_then(run_web_search),
+        "WebSearch" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<WebSearchInput>(input).and_then(run_web_search)
+        }
         "TodoWrite" => from_value::<TodoWriteInput>(input).and_then(run_todo_write),
         "Skill" => from_value::<SkillInput>(input).and_then(run_skill),
         "Agent" => from_value::<AgentInput>(input).and_then(run_agent),
@@ -7787,6 +7790,22 @@ mod tests {
 
         // then
         assert!(error.contains("requires workspace-write permission"));
+    }
+
+    #[test]
+    fn global_tool_registry_asks_before_web_search() {
+        // given
+        let policy = permission_policy_for_mode(PermissionMode::WorkspaceWrite)
+            .with_session_approvals(runtime::SessionApprovals::isolated());
+        let registry = GlobalToolRegistry::builtin().with_enforcer(PermissionEnforcer::new(policy));
+
+        // when
+        let error = registry
+            .execute("WebSearch", &json!({ "query": "rust error E0502" }))
+            .expect_err("an unapproved web search should not run");
+
+        // then
+        assert!(error.contains("search service"), "{error}");
     }
 
     #[test]

@@ -5,6 +5,7 @@
 use super::*;
 use std::env;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CliAction {
@@ -138,6 +139,7 @@ impl CliOutputFormat {
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
+    *MODEL_ARG.lock().unwrap_or_else(PoisonError::into_inner) = None;
     let mut model = DEFAULT_MODEL.to_string();
     // Only an explicit --model; `model` falls back to the default.
     let mut model_flag: Option<String> = None;
@@ -190,12 +192,12 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --model".to_string())?;
-                model = resolve_model_alias_with_config(value);
+                model = resolve_model_arg(value);
                 model_flag = Some(model.clone());
                 index += 2;
             }
             flag if flag.starts_with("--model=") => {
-                model = resolve_model_alias_with_config(&flag[8..]);
+                model = resolve_model_arg(&flag[8..]);
                 model_flag = Some(model.clone());
                 index += 1;
             }
@@ -845,6 +847,31 @@ pub(crate) fn resolve_model_alias_with_config(model: &str) -> String {
         return resolve_model_alias(&resolved).to_string();
     }
     resolve_model_alias(trimmed).to_string()
+}
+
+/// The `--model` value as typed and the name it resolved to while arguments
+/// were parsed, which happens before the trust prompt.
+static MODEL_ARG: Mutex<Option<(String, String)>> = Mutex::new(None);
+
+fn resolve_model_arg(value: &str) -> String {
+    let resolved = resolve_model_alias_with_config(value);
+    *MODEL_ARG.lock().unwrap_or_else(PoisonError::into_inner) =
+        Some((value.to_string(), resolved.clone()));
+    resolved
+}
+
+/// Re-resolves a `--model` alias after the trust prompt: arguments are parsed
+/// before it, while workspace aliases only apply to a trusted workspace. A
+/// model that did not come from `--model` is kept.
+pub(crate) fn model_after_trust(resolved: String) -> String {
+    let recorded = MODEL_ARG
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    match recorded {
+        Some((typed, parsed)) if parsed == resolved => resolve_model_alias_with_config(&typed),
+        _ => resolved,
+    }
 }
 
 pub(crate) fn config_alias_for_current_dir(alias: &str) -> Option<String> {

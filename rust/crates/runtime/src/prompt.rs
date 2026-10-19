@@ -1,12 +1,11 @@
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::config::{
     ConfigError, ConfigLoader, ProjectSettingsAction, ResolvedPermissionMode, RuntimeConfig,
 };
-use crate::git_context::GitContext;
+use crate::git_context::{git_command, has_repository_filter_drivers, GitContext};
 
 /// Errors raised while assembling the final system prompt.
 #[derive(Debug)]
@@ -44,6 +43,11 @@ pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDA
 pub const FRONTIER_MODEL_NAME: &str = "Claude Opus 4.6";
 const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
 const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
+/// The git snapshots are taken once per session and sent to the provider with
+/// every request, so they list file names only and stay small; the model runs
+/// `git status`/`git diff` through its tools for current state and contents.
+const MAX_GIT_STATUS_CHARS: usize = 2_000;
+const MAX_GIT_DIFF_STAT_CHARS: usize = 2_000;
 
 /// Contents of an instruction file included in prompt construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,7 +61,9 @@ pub struct ContextFile {
 pub struct ProjectContext {
     pub cwd: PathBuf,
     pub current_date: String,
+    /// `git status --short --branch`, uncapped (the prompt caps it).
     pub git_status: Option<String>,
+    /// `git diff --stat` of staged and unstaged changes, never their contents.
     pub git_diff: Option<String>,
     pub git_context: Option<GitContext>,
     pub instruction_files: Vec<ContextFile>,
@@ -84,9 +90,24 @@ impl ProjectContext {
         cwd: impl Into<PathBuf>,
         current_date: impl Into<String>,
     ) -> std::io::Result<Self> {
+        let cwd = cwd.into();
+        let workspace_trusted = ConfigLoader::default_for(&cwd).workspace_is_trusted();
+        Self::discover_with_git_for(cwd, current_date, workspace_trusted)
+    }
+
+    /// In an untrusted workspace git ignores repository config that runs
+    /// programs, and status/diff (which read the working tree) are skipped
+    /// when the repository defines filter drivers.
+    fn discover_with_git_for(
+        cwd: PathBuf,
+        current_date: impl Into<String>,
+        workspace_trusted: bool,
+    ) -> std::io::Result<Self> {
         let mut context = Self::discover(cwd, current_date)?;
-        context.git_status = read_git_status(&context.cwd);
-        context.git_diff = read_git_diff(&context.cwd);
+        if workspace_trusted || !has_repository_filter_drivers(&context.cwd) {
+            context.git_status = read_git_status(&context.cwd, workspace_trusted);
+            context.git_diff = read_git_diff_stat(&context.cwd, workspace_trusted);
+        }
         context.git_context = GitContext::detect(&context.cwd);
         Ok(context)
     }
@@ -255,16 +276,8 @@ fn push_context_file(files: &mut Vec<ContextFile>, path: PathBuf) -> std::io::Re
     }
 }
 
-fn read_git_status(cwd: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .args(["--no-optional-locks", "status", "--short", "--branch"])
-        .current_dir(cwd)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8(output.stdout).ok()?;
+fn read_git_status(cwd: &Path, workspace_trusted: bool) -> Option<String> {
+    let stdout = read_git_output(cwd, workspace_trusted, &["status", "--short", "--branch"])?;
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
         None
@@ -273,15 +286,31 @@ fn read_git_status(cwd: &Path) -> Option<String> {
     }
 }
 
-fn read_git_diff(cwd: &Path) -> Option<String> {
+/// Per-file change counts of staged and unstaged changes. External diff
+/// programs and textconv filters stay off: only the counts are wanted.
+fn read_git_diff_stat(cwd: &Path, workspace_trusted: bool) -> Option<String> {
     let mut sections = Vec::new();
 
-    let staged = read_git_output(cwd, &["diff", "--cached"])?;
+    let staged = read_git_output(
+        cwd,
+        workspace_trusted,
+        &[
+            "diff",
+            "--cached",
+            "--stat",
+            "--no-ext-diff",
+            "--no-textconv",
+        ],
+    )?;
     if !staged.trim().is_empty() {
         sections.push(format!("Staged changes:\n{}", staged.trim_end()));
     }
 
-    let unstaged = read_git_output(cwd, &["diff"])?;
+    let unstaged = read_git_output(
+        cwd,
+        workspace_trusted,
+        &["diff", "--stat", "--no-ext-diff", "--no-textconv"],
+    )?;
     if !unstaged.trim().is_empty() {
         sections.push(format!("Unstaged changes:\n{}", unstaged.trim_end()));
     }
@@ -293,16 +322,37 @@ fn read_git_diff(cwd: &Path) -> Option<String> {
     }
 }
 
-fn read_git_output(cwd: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
+fn read_git_output(cwd: &Path, workspace_trusted: bool, args: &[&str]) -> Option<String> {
+    let output = git_command(cwd, workspace_trusted)
         .args(args)
-        .current_dir(cwd)
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
     String::from_utf8(output.stdout).ok()
+}
+
+/// Keeps the leading whole lines of `text` that fit in `max_chars` and says
+/// how many were left out.
+fn cap_lines(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let mut kept = Vec::new();
+    let mut used = 0;
+    for line in &lines {
+        let cost = line.chars().count() + 1;
+        if used + cost > max_chars {
+            break;
+        }
+        used += cost;
+        kept.push(*line);
+    }
+    let omitted = lines.len() - kept.len();
+    kept.push("");
+    kept.join("\n") + &format!("... {omitted} more lines omitted")
 }
 
 fn render_project_context(project_context: &ProjectContext) -> String {
@@ -320,8 +370,11 @@ fn render_project_context(project_context: &ProjectContext) -> String {
     lines.extend(prepend_bullets(bullets));
     if let Some(status) = &project_context.git_status {
         lines.push(String::new());
-        lines.push("Git status snapshot:".to_string());
-        lines.push(status.clone());
+        lines.push(
+            "Git status snapshot (taken at session start; run `git status` for the current state):"
+                .to_string(),
+        );
+        lines.push(cap_lines(status, MAX_GIT_STATUS_CHARS));
     }
     if let Some(ref gc) = project_context.git_context {
         if !gc.recent_commits.is_empty() {
@@ -334,8 +387,11 @@ fn render_project_context(project_context: &ProjectContext) -> String {
     }
     if let Some(diff) = &project_context.git_diff {
         lines.push(String::new());
-        lines.push("Git diff snapshot:".to_string());
-        lines.push(diff.clone());
+        lines.push(
+            "Git diff summary (taken at session start; run `git diff` to see the changes):"
+                .to_string(),
+        );
+        lines.push(cap_lines(diff, MAX_GIT_DIFF_STAT_CHARS));
     }
     if let Some(git_context) = &project_context.git_context {
         let rendered = git_context.render();
@@ -791,52 +847,143 @@ mod tests {
 
         assert!(rendered.contains("Recent commits (last 5):"));
         assert!(rendered.contains("first commit"));
-        assert!(rendered.contains("Git status snapshot:"));
+        assert!(rendered.contains("Git status snapshot (taken at session start"));
         assert!(rendered.contains("## main"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
-    #[test]
-    fn discover_with_git_includes_diff_snapshot_for_tracked_changes() {
-        let _guard = env_lock();
-        ensure_valid_cwd();
+    fn git(root: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("git should run");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn committed_repo() -> PathBuf {
         let root = temp_dir();
         fs::create_dir_all(&root).expect("root dir");
-        std::process::Command::new("git")
-            .args(["init", "--quiet"])
-            .current_dir(&root)
-            .status()
-            .expect("git init should run");
-        std::process::Command::new("git")
-            .args(["config", "user.email", "tests@example.com"])
-            .current_dir(&root)
-            .status()
-            .expect("git config email should run");
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Runtime Prompt Tests"])
-            .current_dir(&root)
-            .status()
-            .expect("git config name should run");
+        git(&root, &["init", "--quiet"]);
+        git(&root, &["config", "user.email", "tests@example.com"]);
+        git(&root, &["config", "user.name", "Runtime Prompt Tests"]);
         fs::write(root.join("tracked.txt"), "hello\n").expect("write tracked file");
-        std::process::Command::new("git")
-            .args(["add", "tracked.txt"])
-            .current_dir(&root)
-            .status()
-            .expect("git add should run");
-        std::process::Command::new("git")
-            .args(["commit", "-m", "init", "--quiet"])
-            .current_dir(&root)
-            .status()
-            .expect("git commit should run");
-        fs::write(root.join("tracked.txt"), "hello\nworld\n").expect("rewrite tracked file");
+        git(&root, &["add", "tracked.txt"]);
+        git(&root, &["commit", "-m", "init", "--quiet"]);
+        root
+    }
+
+    #[test]
+    fn discover_with_git_summarizes_the_diff_without_its_contents() {
+        let _guard = env_lock();
+        ensure_valid_cwd();
+        let root = committed_repo();
+        fs::write(
+            root.join("tracked.txt"),
+            "hello\nOPENAI_API_KEY=sk-diff-secret-value\n",
+        )
+        .expect("rewrite tracked file");
 
         let context =
             ProjectContext::discover_with_git(&root, "2026-03-31").expect("context should load");
+        let rendered = SystemPromptBuilder::new()
+            .with_project_context(context.clone())
+            .render();
 
-        let diff = context.git_diff.expect("git diff should be present");
+        let diff = context
+            .git_diff
+            .expect("git diff summary should be present");
         assert!(diff.contains("Unstaged changes:"));
         assert!(diff.contains("tracked.txt"));
+        assert!(diff.contains("1 insertion"), "{diff}");
+        assert!(!diff.contains("sk-diff-secret-value"), "{diff}");
+        assert!(rendered.contains("Git diff summary (taken at session start"));
+        assert!(!rendered.contains("sk-diff-secret-value"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rendered_git_snapshots_are_capped() {
+        let many_files = (0..500)
+            .map(|index| format!("?? some/deeply/nested/untracked-file-{index:04}.txt"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let many_stats = (0..500)
+            .map(|index| format!(" src/module_{index:04}.rs | 12 ++++++------"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let context = ProjectContext {
+            cwd: PathBuf::from("/repo"),
+            current_date: "2026-10-18".to_string(),
+            git_status: Some(format!("## main\n{many_files}")),
+            git_diff: Some(format!("Unstaged changes:\n{many_stats}")),
+            git_context: None,
+            instruction_files: Vec::new(),
+        };
+
+        let rendered = SystemPromptBuilder::new()
+            .with_project_context(context)
+            .build()
+            .into_iter()
+            .find(|section| section.starts_with("# Project context"))
+            .expect("project context section");
+
+        assert!(rendered.contains("## main"));
+        assert!(rendered.contains("untracked-file-0000.txt"));
+        assert!(!rendered.contains("untracked-file-0499.txt"));
+        assert!(!rendered.contains("module_0499.rs"));
+        assert_eq!(rendered.matches("more lines omitted").count(), 2);
+        assert!(rendered.len() < 4_600, "rendered {} bytes", rendered.len());
+    }
+
+    #[test]
+    fn untrusted_workspace_git_snapshot_does_not_run_the_repository_fsmonitor() {
+        let _guard = env_lock();
+        ensure_valid_cwd();
+        let root = committed_repo();
+        git(&root, &["config", "core.fsmonitor", "touch fsmonitor-ran"]);
+        let marker = root.join("fsmonitor-ran");
+
+        // The hook is real: a trusted workspace honours repository config.
+        ProjectContext::discover_with_git_for(root.clone(), "2026-10-18", true)
+            .expect("context should load");
+        assert!(marker.exists(), "fsmonitor hook should run when trusted");
+        fs::remove_file(&marker).expect("remove marker");
+
+        let context = ProjectContext::discover_with_git_for(root.clone(), "2026-10-18", false)
+            .expect("context should load");
+
+        assert!(
+            !marker.exists(),
+            "fsmonitor hook ran in an untrusted workspace"
+        );
+        let status = context.git_status.expect("status should still be read");
+        assert!(status.starts_with("## "), "{status}");
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn untrusted_workspace_with_repository_filter_drivers_skips_working_tree_reads() {
+        let _guard = env_lock();
+        ensure_valid_cwd();
+        let root = committed_repo();
+        fs::write(root.join(".gitattributes"), "*.txt filter=evil\n").expect("write attributes");
+        git(&root, &["config", "filter.evil.clean", "touch filter-ran"]);
+        fs::write(root.join("tracked.txt"), "HELLO\n").expect("rewrite tracked file");
+
+        let context = ProjectContext::discover_with_git_for(root.clone(), "2026-10-18", false)
+            .expect("context should load");
+
+        assert!(!root.join("filter-ran").exists());
+        assert!(context.git_status.is_none());
+        assert!(context.git_diff.is_none());
+        assert!(
+            context.git_context.is_some(),
+            "branch and commits are still read"
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

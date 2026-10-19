@@ -263,7 +263,9 @@ pub(crate) fn launch(options: ReplLaunch) -> Result<(), Box<dyn std::error::Erro
 
     // From here on MCP servers may be running: stop them on every exit path.
     let shutdown = SharedStateShutdown;
-    let resolved_model = configure_provider_for_model(resolve_repl_model(options.model))?;
+    let resolved_model = configure_provider_for_model(resolve_repl_model(
+        crate::args::model_after_trust(options.model),
+    ))?;
     let mut cli = LiveCli::new(
         resolved_model,
         true,

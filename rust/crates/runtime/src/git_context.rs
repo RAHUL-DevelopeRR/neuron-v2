@@ -17,17 +17,63 @@ pub struct GitContext {
 }
 
 const MAX_RECENT_COMMITS: usize = 5;
+const MAX_RENDERED_STAGED_FILES: usize = 20;
+
+/// `-c` overrides for git commands Neuron runs by itself (never the model's
+/// shell commands) when the repository's own `.git/config` is not trusted:
+/// it can name an fsmonitor hook or a signature verifier for git to run.
+const UNTRUSTED_GIT_CONFIG: &[&str] = &[
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "log.showSignature=false",
+];
+
+/// A `git` command in `cwd` that takes no optional locks and, unless the
+/// workspace is trusted, ignores repository config that runs programs.
+pub(crate) fn git_command(cwd: &Path, workspace_trusted: bool) -> Command {
+    let mut command = Command::new("git");
+    command.arg("--no-optional-locks");
+    if !workspace_trusted {
+        command.args(UNTRUSTED_GIT_CONFIG);
+    }
+    command.current_dir(cwd);
+    command
+}
+
+/// Whether repository or worktree config defines filter drivers. Their
+/// `clean`/`process` commands run whenever git reads a changed working-tree
+/// file, which `-c` cannot switch off without knowing the driver names.
+/// Reading config runs nothing; any failure counts as "yes".
+pub(crate) fn has_repository_filter_drivers(cwd: &Path) -> bool {
+    let Ok(output) = Command::new("git")
+        .args(["config", "--show-scope", "--get-regexp", r"^filter\."])
+        .current_dir(cwd)
+        .output()
+    else {
+        return true;
+    };
+    match output.status.code() {
+        // `git config --get-regexp` exits 1 when nothing matches.
+        Some(1) => false,
+        Some(0) => String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| matches!(line.split('\t').next(), Some("local" | "worktree"))),
+        _ => true,
+    }
+}
 
 impl GitContext {
     /// Detect the git context from the given working directory.
     ///
     /// Returns `None` when the directory is not inside a git repository.
+    /// Repository config that runs programs is ignored (see
+    /// [`UNTRUSTED_GIT_CONFIG`]); these commands never need it.
     #[must_use]
     pub fn detect(cwd: &Path) -> Option<Self> {
         // Quick gate: is this a git repo at all?
-        let rev_parse = Command::new("git")
+        let rev_parse = git_command(cwd, false)
             .args(["rev-parse", "--is-inside-work-tree"])
-            .current_dir(cwd)
             .output()
             .ok()?;
         if !rev_parse.status.success() {
@@ -61,8 +107,14 @@ impl GitContext {
         if !self.staged_files.is_empty() {
             lines.push(String::new());
             lines.push("Staged files:".to_string());
-            for file in &self.staged_files {
+            for file in self.staged_files.iter().take(MAX_RENDERED_STAGED_FILES) {
                 lines.push(format!("  {file}"));
+            }
+            if self.staged_files.len() > MAX_RENDERED_STAGED_FILES {
+                lines.push(format!(
+                    "  ... and {} more",
+                    self.staged_files.len() - MAX_RENDERED_STAGED_FILES
+                ));
             }
         }
 
@@ -71,9 +123,8 @@ impl GitContext {
 }
 
 fn read_branch(cwd: &Path) -> Option<String> {
-    let output = Command::new("git")
+    let output = git_command(cwd, false)
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(cwd)
         .output()
         .ok()?;
     if !output.status.success() {
@@ -89,16 +140,14 @@ fn read_branch(cwd: &Path) -> Option<String> {
 }
 
 fn read_recent_commits(cwd: &Path) -> Vec<GitCommitEntry> {
-    let output = Command::new("git")
+    let output = git_command(cwd, false)
         .args([
-            "--no-optional-locks",
             "log",
             "--oneline",
             "-n",
             &MAX_RECENT_COMMITS.to_string(),
             "--no-decorate",
         ])
-        .current_dir(cwd)
         .output()
         .ok();
     let Some(output) = output else {
@@ -125,9 +174,8 @@ fn read_recent_commits(cwd: &Path) -> Vec<GitCommitEntry> {
 }
 
 fn read_staged_files(cwd: &Path) -> Vec<String> {
-    let output = Command::new("git")
-        .args(["--no-optional-locks", "diff", "--cached", "--name-only"])
-        .current_dir(cwd)
+    let output = git_command(cwd, false)
+        .args(["diff", "--cached", "--name-only"])
         .output()
         .ok();
     let Some(output) = output else {

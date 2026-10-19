@@ -10,6 +10,7 @@ use crate::bash_validation::{
     CommandClassification, ShellDialect,
 };
 use crate::config::RuntimePermissionRuleConfig;
+use crate::sensitive_paths::sensitive_path_reason_resolved;
 
 /// Permission level assigned to a tool invocation or runtime session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -352,8 +353,9 @@ impl PermissionPolicy {
 
     /// Requirement of a concrete call: the tool's static requirement, raised
     /// by what the input does (shell commands that are not read-only, file
-    /// searches outside the workspace, writes to configuration that controls
-    /// permissions or executed hooks, fetches from unapproved domains).
+    /// searches outside the workspace, reads of files holding credentials,
+    /// writes to configuration that controls permissions or executed hooks,
+    /// fetches from unapproved domains, web searches not yet approved).
     #[must_use]
     pub fn required_mode_for_input(&self, tool_name: &str, input: &str) -> PermissionMode {
         self.assess(tool_name, input).required_mode
@@ -371,6 +373,7 @@ impl PermissionPolicy {
 
     /// Computes the input-dependent requirement of a tool call.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn assess(&self, tool_name: &str, input: &str) -> ToolCallAssessment {
         let static_mode = self.required_mode_for(tool_name);
         let mut assessment = ToolCallAssessment {
@@ -428,6 +431,21 @@ impl PermissionPolicy {
                         format!("searching `{path}` reaches outside the workspace"),
                     );
                 }
+                // Directory searches skip credential files; naming one reads it.
+                if tool_name == "grep_search" {
+                    if let Some(reason) = input_field(input, &["path"]).and_then(|path| {
+                        sensitive_path_reason_resolved(&path, workspace.as_slice())
+                    }) {
+                        escalate(&mut assessment, reason);
+                    }
+                }
+            }
+            "read_file" => {
+                if let Some(reason) = input_field(input, &["path", "file_path", "filePath"])
+                    .and_then(|path| sensitive_path_reason_resolved(&path, workspace.as_slice()))
+                {
+                    escalate(&mut assessment, reason);
+                }
             }
             "write_file" | "edit_file" | "NotebookEdit" => {
                 if let Some(path) =
@@ -457,9 +475,23 @@ impl PermissionPolicy {
                     None => escalate(&mut assessment, format!("`{url}` is not an http(s) URL")),
                 }
             }
+            "WebSearch" => {
+                // The query goes to an external search service.
+                let scope = vec![tool_name.to_string()];
+                if self.session.prefixes(tool_name).contains(&scope) {
+                    assessment.session_approved = true;
+                } else {
+                    escalate(
+                        &mut assessment,
+                        "web searches send the query to an external search service and have not been approved in this session"
+                            .to_string(),
+                    );
+                }
+                assessment.session_prefixes = vec![scope];
+            }
             _ => {}
         }
-        if assessment.session_approved && tool_name == "WebFetch" {
+        if assessment.session_approved && matches!(tool_name, "WebFetch" | "WebSearch") {
             assessment.required_mode = static_mode;
         }
         assessment
@@ -1378,8 +1410,82 @@ mod tests {
             .with_tool_requirement("glob_search", PermissionMode::ReadOnly)
             .with_tool_requirement("write_file", PermissionMode::WorkspaceWrite)
             .with_tool_requirement("WebFetch", PermissionMode::ReadOnly)
+            .with_tool_requirement("WebSearch", PermissionMode::ReadOnly)
+            .with_tool_requirement("read_file", PermissionMode::ReadOnly)
             .with_workspace_root(std::env::temp_dir().join("neuron-permissions-workspace"))
             .with_session_approvals(SessionApprovals::isolated())
+    }
+
+    #[test]
+    fn reading_env_files_and_neuron_settings_needs_approval() {
+        let policy = workspace_policy(PermissionMode::WorkspaceWrite);
+        let read = |path: &str| serde_json::json!({ "path": path }).to_string();
+        let grep = |path: &str| serde_json::json!({ "pattern": "KEY", "path": path }).to_string();
+
+        assert_eq!(
+            policy.authorize("read_file", &read("src/main.rs"), None),
+            PermissionOutcome::Allow
+        );
+        assert_eq!(
+            policy.authorize("read_file", &read(".env.example"), None),
+            PermissionOutcome::Allow
+        );
+        for (tool, input) in [
+            ("read_file", read(".env")),
+            ("read_file", read("services/api/.env.local")),
+            ("read_file", read(".neuron/settings.local.json")),
+            ("read_file", read(".claw.json")),
+            ("grep_search", grep(".env")),
+            ("grep_search", grep(".neuron/settings.json")),
+        ] {
+            let PermissionOutcome::Deny { reason } = policy.authorize(tool, &input, None) else {
+                panic!("{tool} {input} should need approval");
+            };
+            assert!(reason.contains("credentials"), "{reason}");
+        }
+
+        let mut prompter = ScriptedPrompter::new(vec![PermissionPromptDecision::Allow]);
+        assert_eq!(
+            policy.authorize("read_file", &read(".env"), Some(&mut prompter)),
+            PermissionOutcome::Allow
+        );
+        assert_eq!(prompter.seen.len(), 1);
+        assert!(prompter.seen[0].session_prefixes.is_empty());
+    }
+
+    #[test]
+    fn web_search_needs_approval_like_web_fetch() {
+        let search = serde_json::json!({ "query": "rust error E0502" }).to_string();
+        let policy = workspace_policy(PermissionMode::WorkspaceWrite);
+
+        let PermissionOutcome::Deny { reason } = policy.authorize("WebSearch", &search, None)
+        else {
+            panic!("an unapproved web search should not run without a prompt");
+        };
+        assert!(reason.contains("search service"), "{reason}");
+
+        let mut prompter = ScriptedPrompter::new(vec![PermissionPromptDecision::AllowForSession]);
+        assert_eq!(
+            policy.authorize("WebSearch", &search, Some(&mut prompter)),
+            PermissionOutcome::Allow
+        );
+        assert_eq!(prompter.seen[0].session_prefixes, vec!["WebSearch"]);
+        let other = serde_json::json!({ "query": "tokio select" }).to_string();
+        assert_eq!(
+            policy.authorize("WebSearch", &other, None),
+            PermissionOutcome::Allow
+        );
+
+        let read_only = workspace_policy(PermissionMode::ReadOnly);
+        assert!(matches!(
+            read_only.authorize("WebSearch", &search, None),
+            PermissionOutcome::Deny { .. }
+        ));
+        let danger = workspace_policy(PermissionMode::DangerFullAccess);
+        assert_eq!(
+            danger.authorize("WebSearch", &search, None),
+            PermissionOutcome::Allow
+        );
     }
 
     #[test]
