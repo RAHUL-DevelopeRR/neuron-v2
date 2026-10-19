@@ -387,7 +387,7 @@ mod tests {
             config.permission_mode(),
             Some(runtime::ResolvedPermissionMode::WorkspaceWrite)
         );
-        assert!(config.ignored_project_settings().is_empty());
+        assert_eq!(config.ignored_project_settings(), []);
         let gitignore = fs::read_to_string(root.join(".gitignore")).expect("read gitignore");
         assert!(gitignore.contains(".neuron/settings.local.json"));
         assert!(gitignore.contains(".neuron/sessions/"));
