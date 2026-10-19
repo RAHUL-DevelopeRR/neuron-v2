@@ -696,35 +696,28 @@ pub fn run_auth_command(args: &[String]) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+/// Asks once per directory whether to trust it. Trusting also lets the
+/// directory's own settings files run hooks, start MCP servers and change
+/// permissions; until then the config loader ignores those keys.
 pub fn check_trust(cwd: &std::path::Path) -> bool {
-    let trust_file = vault::vault_path()
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join("trusted_dirs.txt");
-    if fs::read_to_string(&trust_file).is_ok_and(|content| {
-        content
-            .lines()
-            .any(|line| line.trim() == cwd.display().to_string())
-    }) {
+    // Same decision as the config loader: trust store, environment, or a
+    // `trustedRoots` entry in user settings.
+    if runtime::ConfigLoader::default_for(cwd).workspace_is_trusted() {
         return true;
     }
     println!(
-        "\nNeuronCLI can read, write, and execute commands in:\n{}",
+        "\nNeuronCLI can read, write, and execute commands in:\n{}\nTrusting it also lets this directory's settings files run hooks, start MCP servers and change permissions.",
         cwd.display()
     );
     print!("Press 1 to trust this directory: ");
     let _ = io::stdout().flush();
     let mut input = String::new();
     if io::stdin().read_line(&mut input).is_ok() && input.trim() == "1" {
-        if let Some(parent) = trust_file.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if let Ok(mut file) = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&trust_file)
-        {
-            let _ = writeln!(file, "{}", cwd.display());
+        if let Err(error) = runtime::workspace_trust::record_trusted_workspace(cwd) {
+            eprintln!(
+                "warning: could not save trust for {}: {error}",
+                cwd.display()
+            );
         }
         return true;
     }

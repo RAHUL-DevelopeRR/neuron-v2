@@ -261,6 +261,10 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // The trust prompt and the config loader must read the same trust store.
+    runtime::workspace_trust::set_trust_store_path(
+        credentials::neuron_home().join("trusted_dirs.txt"),
+    );
     let args: Vec<String> = env::args().skip(1).collect();
     let (args, provider_choice) = extract_provider_flag(&args)?;
     provider::set_provider_flag(provider_choice);
@@ -331,6 +335,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             }
+            let permission_mode = crate::args::permission_mode_after_trust(permission_mode);
             // ── Resolve provider (Azure primary → OpenRouter fallback) ──
             // The provider always dictates the model — when Azure is up we
             // use gpt-5.5, when falling back to OpenRouter we MUST switch
@@ -4880,7 +4885,10 @@ mod tests {
         .expect("project config should write");
 
         let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_trust = std::env::var_os("NEURON_TRUST_WORKSPACE");
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        // Workspace aliases only apply to a trusted workspace.
+        std::env::set_var("NEURON_TRUST_WORKSPACE", "1");
 
         // when
         let direct = with_current_dir(&cwd, || resolve_model_alias_with_config("fast"));
@@ -4892,6 +4900,10 @@ mod tests {
         match original_config_home {
             Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
             None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_trust {
+            Some(value) => std::env::set_var("NEURON_TRUST_WORKSPACE", value),
+            None => std::env::remove_var("NEURON_TRUST_WORKSPACE"),
         }
         std::fs::remove_dir_all(root).expect("temp config root should clean up");
 

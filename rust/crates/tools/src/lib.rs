@@ -7262,14 +7262,19 @@ mod tests {
     #[cfg_attr(windows, ignore = "Windows fixture needs shell/path isolation")]
     fn worker_create_merges_config_trusted_roots_without_per_call_override() {
         use std::fs;
-        // Write a .claw/settings.json in a temp dir with trustedRoots
+        // trustedRoots come from user settings: a worktree's own settings file
+        // cannot vouch for itself.
+        let _guard = env_guard();
         let worktree = temp_path("config-trust-worktree");
-        let claw_dir = worktree.join(".claw");
-        fs::create_dir_all(&claw_dir).expect("create .claw dir");
+        let config_home = temp_path("config-trust-home");
+        fs::create_dir_all(&worktree).expect("create worktree");
+        fs::create_dir_all(&config_home).expect("create config home");
         // Use the actual OS temp dir so the worktree path matches the allowlist
         let tmp_root = std::env::temp_dir().to_str().expect("utf-8").to_string();
-        let settings = format!("{{\"trustedRoots\": [\"{tmp_root}\"]}}");
-        fs::write(claw_dir.join("settings.json"), settings).expect("write settings");
+        let settings = json!({ "trustedRoots": [tmp_root] }).to_string();
+        fs::write(config_home.join("settings.json"), settings).expect("write settings");
+        let original_config_home = std::env::var_os("NEURON_CONFIG_HOME");
+        std::env::set_var("NEURON_CONFIG_HOME", &config_home);
 
         // WorkerCreate with no per-call trusted_roots — config should supply them
         let cwd = worktree.to_str().expect("valid utf-8").to_string();
@@ -7279,17 +7284,22 @@ mod tests {
                 "cwd": cwd
                 // trusted_roots intentionally omitted
             }),
-        )
-        .expect("WorkerCreate should succeed");
+        );
+        match original_config_home {
+            Some(value) => std::env::set_var("NEURON_CONFIG_HOME", value),
+            None => std::env::remove_var("NEURON_CONFIG_HOME"),
+        }
+        let created = created.expect("WorkerCreate should succeed");
         let output: serde_json::Value = serde_json::from_str(&created).expect("json");
 
-        // worktree is under /tmp, so config roots auto-resolve trust
+        // worktree is under the temp dir, so config roots auto-resolve trust
         assert_eq!(
             output["trust_auto_resolve"], true,
-            "config-level trustedRoots should auto-resolve trust without per-call override"
+            "user-level trustedRoots should auto-resolve trust without per-call override"
         );
 
         fs::remove_dir_all(&worktree).ok();
+        fs::remove_dir_all(&config_home).ok();
     }
 
     #[test]

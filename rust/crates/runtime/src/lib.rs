@@ -61,6 +61,7 @@ pub mod transcript;
 mod trust_resolver;
 mod usage;
 pub mod worker_boot;
+pub mod workspace_trust;
 
 pub use bash::{
     bash_tool_shell_description, effective_bash_timeout_ms, execute_bash, execute_bash_with_cancel,
@@ -76,12 +77,13 @@ pub use compact::{
     DEFAULT_MAX_SUMMARY_TOKENS, DERIVED_CONTEXT_NOTE,
 };
 pub use config::{
-    ConfigEntry, ConfigError, ConfigLoader, ConfigSource, McpConfigCollection,
-    McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
-    McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
+    ConfigEntry, ConfigError, ConfigLoader, ConfigSource, IgnoredProjectSettings,
+    McpConfigCollection, McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig,
+    McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
+    McpWebSocketServerConfig, OAuthConfig, ProjectSettingsAction, ProjectTrust,
     ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
     RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
-    CLAW_SETTINGS_SCHEMA_NAME,
+    CLAW_SETTINGS_SCHEMA_NAME, UNTRUSTED_WORKSPACE_KEYS,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,

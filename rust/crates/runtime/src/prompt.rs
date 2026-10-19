@@ -3,7 +3,9 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::config::{ConfigError, ConfigLoader, RuntimeConfig};
+use crate::config::{
+    ConfigError, ConfigLoader, ProjectSettingsAction, ResolvedPermissionMode, RuntimeConfig,
+};
 use crate::git_context::GitContext;
 
 /// Errors raised while assembling the final system prompt.
@@ -468,6 +470,9 @@ pub fn load_system_prompt(
     Ok(builder.build())
 }
 
+/// Summarises the loaded settings without their values. Settings can hold MCP
+/// tokens, auth headers and env values, and the system prompt is sent to every
+/// upstream provider on every request.
 fn render_config_section(config: &RuntimeConfig) -> String {
     let mut lines = vec!["# Runtime config".to_string()];
     if config.loaded_entries().is_empty() {
@@ -477,15 +482,43 @@ fn render_config_section(config: &RuntimeConfig) -> String {
         return lines.join("\n");
     }
 
-    lines.extend(prepend_bullets(
-        config
-            .loaded_entries()
-            .iter()
-            .map(|entry| format!("Loaded {:?}: {}", entry.source, entry.path.display()))
-            .collect(),
-    ));
-    lines.push(String::new());
-    lines.push(config.as_json().render());
+    let mut bullets: Vec<String> = config
+        .loaded_entries()
+        .iter()
+        .map(|entry| {
+            let restricted = config.ignored_project_settings().iter().any(|ignored| {
+                ignored.path == entry.path
+                    && ignored.action == ProjectSettingsAction::DroppedUntrusted
+            });
+            format!(
+                "Loaded {:?}{}: {}",
+                entry.source,
+                if restricted {
+                    " (restricted: workspace not trusted)"
+                } else {
+                    ""
+                },
+                entry.path.display()
+            )
+        })
+        .collect();
+    if let Some(model) = config.model() {
+        bullets.push(format!("Configured model: {model}"));
+    }
+    if let Some(mode) = config.permission_mode() {
+        let label = match mode {
+            ResolvedPermissionMode::ReadOnly => "read-only",
+            ResolvedPermissionMode::WorkspaceWrite => "workspace-write",
+            ResolvedPermissionMode::DangerFullAccess => "danger-full-access",
+        };
+        bullets.push(format!("Configured permission mode: {label}"));
+    }
+    let servers: Vec<&str> = config.mcp().servers().keys().map(String::as_str).collect();
+    if !servers.is_empty() {
+        bullets.push(format!("MCP servers: {}", servers.join(", ")));
+    }
+    bullets.push("Setting values are not included.".to_string());
+    lines.extend(prepend_bullets(bullets));
     lines.join("\n")
 }
 
@@ -824,8 +857,12 @@ mod tests {
         let previous = std::env::current_dir().expect("cwd");
         let original_home = std::env::var("HOME").ok();
         let original_claw_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_neuron_home = std::env::var_os("NEURON_HOME");
         std::env::set_var("HOME", &root);
         std::env::set_var("CLAW_CONFIG_HOME", root.join("missing-home"));
+        // Workspace settings only apply once the workspace is trusted.
+        std::env::set_var("NEURON_HOME", root.join("neuron-home"));
+        crate::workspace_trust::record_trusted_workspace(&root).expect("trust workspace");
         std::env::set_current_dir(&root).expect("change cwd");
         let prompt = super::load_system_prompt(&root, "2026-03-31", "linux", "6.8")
             .expect("system prompt should load")
@@ -845,9 +882,13 @@ mod tests {
         } else {
             std::env::remove_var("CLAW_CONFIG_HOME");
         }
+        match original_neuron_home {
+            Some(value) => std::env::set_var("NEURON_HOME", value),
+            None => std::env::remove_var("NEURON_HOME"),
+        }
 
         assert!(prompt.contains("Project rules"));
-        assert!(prompt.contains("permissionMode"));
+        assert!(prompt.contains("Configured permission mode: workspace-write"));
         assert!(prompt.contains("# Neuron default skills"));
         assert!(prompt.contains("- ponytail: "));
         assert!(prompt.contains("- gstack-investigate: "));
@@ -920,8 +961,38 @@ mod tests {
         assert!(prompt.contains("# Project context"));
         assert!(prompt.contains("# Claude instructions"));
         assert!(prompt.contains("Project rules"));
-        assert!(prompt.contains("permissionMode"));
+        assert!(prompt.contains("Configured permission mode: workspace-write"));
+        assert!(!prompt.contains("\"permissionMode\""));
         assert!(prompt.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn config_section_never_includes_setting_values() {
+        let root = temp_dir();
+        fs::create_dir_all(root.join(".neuron")).expect("neuron dir");
+        fs::write(
+            root.join(".neuron").join("settings.json"),
+            r#"{"model":"auto","env":{"API_TOKEN":"env-secret-123"},"defaultMcpServers":false,"mcpServers":{"remote":{"type":"http","url":"https://mcp.example.com","headers":{"Authorization":"Bearer header-secret-456"}},"local":{"command":"tool","env":{"KEY":"stdio-secret-789"}}}}"#,
+        )
+        .expect("write settings");
+
+        let config = ConfigLoader::new(&root, root.join("missing-home"))
+            .load()
+            .expect("config should load");
+        let section = super::render_config_section(&config);
+
+        assert!(section.contains("Configured model: auto"));
+        assert!(section.contains("MCP servers: local, remote"));
+        for secret in [
+            "env-secret-123",
+            "header-secret-456",
+            "stdio-secret-789",
+            "Authorization",
+        ] {
+            assert!(!section.contains(secret), "config section leaked {secret}");
+        }
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

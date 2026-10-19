@@ -908,14 +908,34 @@ pub(crate) fn permission_mode_from_resolved(mode: ResolvedPermissionMode) -> Per
     }
 }
 
+/// Set when a permission mode came from settings or the built-in default
+/// rather than `--permission-mode` or the environment, so it can be resolved
+/// again once the workspace trust prompt has been answered.
+static PERMISSION_MODE_FROM_DEFAULTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub(crate) fn default_permission_mode() -> PermissionMode {
-    env::var("RUSTY_CLAUDE_PERMISSION_MODE")
+    if let Some(mode) = env::var("RUSTY_CLAUDE_PERMISSION_MODE")
         .ok()
         .as_deref()
         .and_then(normalize_permission_mode)
         .map(permission_mode_from_label)
-        .or_else(config_permission_mode_for_current_dir)
-        .unwrap_or(PermissionMode::WorkspaceWrite)
+    {
+        return mode;
+    }
+    PERMISSION_MODE_FROM_DEFAULTS.store(true, std::sync::atomic::Ordering::Relaxed);
+    config_permission_mode_for_current_dir().unwrap_or(PermissionMode::WorkspaceWrite)
+}
+
+/// Re-resolves a permission mode that came from defaults after the trust
+/// prompt: arguments are parsed before it, while workspace settings only
+/// apply to a trusted workspace. An explicit flag or env value is kept.
+pub(crate) fn permission_mode_after_trust(resolved: PermissionMode) -> PermissionMode {
+    if PERMISSION_MODE_FROM_DEFAULTS.load(std::sync::atomic::Ordering::Relaxed) {
+        default_permission_mode()
+    } else {
+        resolved
+    }
 }
 
 pub(crate) fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {

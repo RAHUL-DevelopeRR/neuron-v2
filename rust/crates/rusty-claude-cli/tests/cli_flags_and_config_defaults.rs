@@ -151,6 +151,8 @@ fn config_command_loads_defaults_from_standard_config_locations() {
     // when
     let output = command_in(&temp_dir)
         .env("CLAW_CONFIG_HOME", &config_home)
+        // Workspace settings only apply to a trusted workspace.
+        .env("NEURON_TRUST_WORKSPACE", "1")
         .args([
             "--resume",
             session_path.to_str().expect("utf8 path"),

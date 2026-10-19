@@ -309,15 +309,28 @@ fn settings_provider() -> Result<Option<ProviderId>, String> {
     let Ok(cwd) = env::current_dir() else {
         return Ok(None);
     };
-    let files = runtime::ConfigLoader::default_for(&cwd)
+    provider_from_settings(provider_settings_files(
+        &runtime::ConfigLoader::default_for(&cwd),
+    ))
+}
+
+/// Settings files allowed to choose the provider: user settings always, and
+/// workspace files only once the workspace is trusted, so a cloned repository
+/// cannot pick which of the user's credentials receive the conversation.
+fn provider_settings_files(loader: &runtime::ConfigLoader) -> Vec<(PathBuf, String)> {
+    let trusted = loader.workspace_is_trusted();
+    loader
         .discover()
         .into_iter()
+        .filter(|entry| {
+            trusted || (entry.source == runtime::ConfigSource::User && entry.path.is_absolute())
+        })
         .filter_map(|entry| {
             fs::read_to_string(&entry.path)
                 .ok()
                 .map(|text| (entry.path, text))
-        });
-    provider_from_settings(files)
+        })
+        .collect()
 }
 
 fn provider_from_settings(
@@ -841,6 +854,42 @@ mod tests {
                 .iter()
                 .map(|(path, text)| (PathBuf::from(path), (*text).to_string())),
         )
+    }
+
+    #[test]
+    fn untrusted_workspace_cannot_choose_the_provider() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("neuron-provider-trust-{nanos}"));
+        let cwd = root.join("repo");
+        let home = root.join("home").join(".neuron");
+        fs::create_dir_all(&cwd).expect("repo");
+        fs::create_dir_all(&home).expect("home");
+        fs::write(cwd.join(".neuron.json"), r#"{"provider":"openrouter"}"#).expect("repo settings");
+
+        let untrusted = runtime::ConfigLoader::new(&cwd, &home)
+            .with_project_trust(runtime::ProjectTrust::Untrusted);
+        assert_eq!(
+            provider_from_settings(provider_settings_files(&untrusted)),
+            Ok(None)
+        );
+
+        fs::write(home.join("settings.json"), r#"{"provider":"openai"}"#).expect("user settings");
+        assert_eq!(
+            provider_from_settings(provider_settings_files(&untrusted)),
+            Ok(Some(ProviderId::OpenAi))
+        );
+
+        let trusted = runtime::ConfigLoader::new(&cwd, &home)
+            .with_project_trust(runtime::ProjectTrust::Trusted);
+        assert_eq!(
+            provider_from_settings(provider_settings_files(&trusted)),
+            Ok(Some(ProviderId::OpenRouter))
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
