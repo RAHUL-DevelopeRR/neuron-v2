@@ -1450,7 +1450,7 @@ mod tests {
             PermissionOutcome::Allow
         );
         assert_eq!(prompter.seen.len(), 1);
-        assert!(prompter.seen[0].session_prefixes.is_empty());
+        assert_eq!(prompter.seen[0].session_prefixes, [] as [String; 0]);
     }
 
     #[test]
