@@ -553,9 +553,11 @@ pub(crate) fn bare_slash_command_guidance(command_name: &str) -> Option<String> 
     Some(guidance)
 }
 
+/// `neuron login` / `neuron logout` run before argument parsing (`auth::auth_alias`); they only
+/// reach the parser when global options come first, which they do not take.
 pub(crate) fn removed_auth_surface_error(command_name: &str) -> String {
     format!(
-        "`neuron {command_name}` has moved: run `neuron auth {command_name}` for your Zero-X account. For Anthropic directly, set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead."
+        "`{command_name}` takes no global options: run `neuron {command_name}` (or `neuron auth {command_name}`) on its own for your Zero-X account. For Anthropic directly, set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead."
     )
 }
 

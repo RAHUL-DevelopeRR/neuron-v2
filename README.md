@@ -92,12 +92,14 @@ per binary) and GitHub build provenance, which you can check with
 ## Sign in
 
 ```sh
-neuron auth login     # opens zero-x.live in your browser
+neuron login          # shows a code; approve it on neuron.zero-x.live/device
 neuron auth status
-neuron auth logout    # revokes the session on the gateway and deletes the local copy
+neuron logout         # revokes the session on the gateway and deletes the local copy
 ```
 
-Login waits for the browser callback on a random `127.0.0.1` port and stores the
+Login prints a link and a short code and opens the link in your browser when it can.
+Approve the code there (or on any other device, such as your phone) and Neuron
+continues on its own; no local port is opened, so it also works over SSH. It stores the
 session in the operating system's credential store on macOS and Windows. On Linux (or
 when that store is unavailable) it goes to `~/.neuroncli/credentials.json`, readable
 only by you; protect that directory like a password file. The

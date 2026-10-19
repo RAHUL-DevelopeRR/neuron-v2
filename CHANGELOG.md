@@ -12,11 +12,19 @@ call by what it actually does, and sends far smaller requests.
 
 ### Zero-X gateway and sign-in
 
-- `neuron auth login` (browser callback on a random loopback port, `--no-browser`
-  prints the URL), `neuron auth login --with-token` (reads a `ses_` session or `nzx_`
-  API key from standard input), `neuron auth status` (checks the credential with the
-  gateway and prints plan, expiry and today's usage) and `neuron auth logout` (revokes
-  the session on the gateway). `/login` and `/logout` run the same flows in a session.
+- `neuron login` signs in with a device code: it prints
+  `https://neuron.zero-x.live/device` and a short code, opens the browser when the
+  machine has one (never over SSH, in containers or with `--no-browser` /
+  `NEURON_NO_BROWSER`), and polls until the code is approved on that page. No local port
+  is opened, so it works over SSH, in WSL and in containers. The answer from the gateway
+  is checked before anything is printed (code format, an https link on a Zero-X host),
+  and only a CLI session is accepted from it. This replaces the browser callback on a
+  loopback port.
+- `neuron login --with-token` (reads a `ses_` session or `nzx_` API key from standard
+  input), `neuron auth status` (checks the credential with the gateway and prints plan,
+  expiry and today's usage) and `neuron logout` (revokes the session on the gateway).
+  `neuron auth login|logout` still work. `/login` and `/logout` run the same flows in a
+  session.
 - The login is kept in the macOS Keychain or Windows Credential Manager, otherwise in
   `~/.neuroncli/credentials.json` (owner-only) with a one-time warning; isolated homes
   (`NEURON_HOME`, a redirected `HOME`/`USERPROFILE`) never touch the OS store, and

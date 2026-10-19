@@ -30,12 +30,16 @@ Neuron uses your Zero-X account unless you choose another provider.
 
 | Command | What it does |
 | --- | --- |
-| `neuron auth login` | Opens the Zero-X sign-in page in your browser and waits for the callback on a random `127.0.0.1` port (`--no-browser` prints the URL instead). The callback's state and origin are checked. The session is stored in the OS credential store on macOS and Windows, otherwise in `~/.neuroncli/credentials.json` (owner-only); see [SECURITY.md](SECURITY.md#how-neuron-handles-credentials). |
-| `neuron auth login --with-token` | Reads a credential from standard input instead of opening a browser, for CI and remote machines. Use a personal API key (`nzx_…`) from the Zero-X dashboard, or a session token (`ses_…`). |
+| `neuron login` (or `neuron auth login`) | Prints a link, <https://neuron.zero-x.live/device>, and a short code such as `BDWP-HQPK`, and opens the link in your browser when this machine has one. Approve the code there while signed in to Zero-X (on this machine or any other device, such as your phone), and Neuron continues on its own. Nothing listens on a local port, so this works over SSH, in WSL and in containers; `--no-browser` (or `NEURON_NO_BROWSER=1`) only skips opening the browser. The code expires after 10 minutes. The session is stored in the OS credential store on macOS and Windows, otherwise in `~/.neuroncli/credentials.json` (owner-only); see [SECURITY.md](SECURITY.md#how-neuron-handles-credentials). |
+| `neuron login --with-token` | Reads a credential from standard input instead, for CI. Use a personal API key (`nzx_…`) from the Zero-X dashboard, or a session token (`ses_…`). |
 | `neuron auth status` | Checks the credential with the gateway and prints where it came from, the plan, the expiry and today's usage. |
-| `neuron auth logout` | Revokes a session on the gateway and deletes the local copy (API keys are revoked in the dashboard). |
+| `neuron logout` (or `neuron auth logout`) | Revokes a session on the gateway and deletes the local copy (API keys are revoked in the dashboard). |
 
 Inside a session, `/login` and `/logout` run the same flows.
+
+Only approve a code you started yourself: the approval page shows which device asked
+and where from, and warns when that differs from your browser's location. Zero-X never
+asks you to enter a code sent by email, chat or phone.
 
 ```sh
 # CI: keep the key in your CI secret store, never in the repository

@@ -46,6 +46,7 @@ mod auth;
 mod brand;
 mod clock;
 mod credentials;
+mod device_login;
 mod doctor;
 mod executor;
 mod gateway_catalog;
@@ -268,6 +269,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     let (args, provider_choice) = extract_provider_flag(&args)?;
     provider::set_provider_flag(provider_choice);
+    if let Some(auth_args) = auth::auth_alias(&args) {
+        return auth::run_auth_command(auth_args);
+    }
     match args.first().map(String::as_str) {
         Some("auth") => return auth::run_auth_command(&args[1..]),
         Some("usage") => return account::run_usage_command(&args[1..]),
@@ -5102,10 +5106,14 @@ mod tests {
     }
 
     #[test]
-    fn removed_login_and_logout_subcommands_error_helpfully() {
-        let login = parse_args(&["login".to_string()]).expect_err("login should be removed");
+    fn login_and_logout_after_global_options_error_helpfully() {
+        // `neuron login` itself runs before parsing (auth::auth_alias); the parser only sees
+        // it after global options, which it does not take.
+        let login = parse_args(&["login".to_string()]).expect_err("login is not a parser action");
+        assert!(login.contains("run `neuron login`"));
         assert!(login.contains("ANTHROPIC_API_KEY"));
-        let logout = parse_args(&["logout".to_string()]).expect_err("logout should be removed");
+        let logout =
+            parse_args(&["logout".to_string()]).expect_err("logout is not a parser action");
         assert!(logout.contains("ANTHROPIC_AUTH_TOKEN"));
         assert_eq!(
             parse_args(&["doctor".to_string()]).expect("doctor should parse"),

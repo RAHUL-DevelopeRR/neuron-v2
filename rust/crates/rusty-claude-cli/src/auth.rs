@@ -1,15 +1,9 @@
-//! Zero-X sign-in: browser loopback login, headless token login, session
-//! lifecycle (`/auth/session`), logout and `neuron auth status`.
+//! Zero-X sign-in: device-code login (`device_login.rs`), headless token
+//! login, session lifecycle (`/auth/session`), logout and `neuron auth status`.
 
 use std::env;
-use std::fs;
-use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::io::{self, BufRead, IsTerminal, Write};
 
-use base64::{engine::general_purpose, Engine as _};
-use rand::RngCore;
 use reqwest::Url;
 use serde_json::Value;
 use zeroize::Zeroizing;
@@ -17,14 +11,14 @@ use zeroize::Zeroizing;
 use crate::credentials::{
     classify_token, CredentialLocation, CredentialStore, StoredCredential, TokenKind,
 };
+use crate::device_login::{self, ClientInfo, HttpTransport, SystemClock, TerminalObserver};
 use crate::gateway_http::{self, GatewayHttpError, ACCOUNT_TIMEOUT};
-use crate::vault::{self, SecureString};
+use crate::vault::SecureString;
 
 pub const GATEWAY_BASE_URL: &str = api::DEFAULT_ZERO_X_BASE_URL;
-const LOGIN_URL: &str = "https://zero-x.live/neuroncli/login/";
-const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 const AUTH_USAGE: &str =
-    "Usage: neuron auth <login [--no-browser | --with-token] | logout | status>";
+    "Usage: neuron login [--no-browser | --with-token] | neuron logout | neuron auth status\n\
+     (`neuron auth login|logout|status` also work)";
 
 pub fn gateway_base_url() -> io::Result<String> {
     let base = env::var("NEURON_API_BASE").unwrap_or_else(|_| GATEWAY_BASE_URL.to_string());
@@ -264,17 +258,10 @@ pub fn fetch_session(
     Ok(parse_session_info(&value, crate::clock::now_unix()))
 }
 
-fn auth_url(callback: &str, state: &str) -> String {
-    let mut url = Url::parse(LOGIN_URL).expect("fixed login URL");
-    url.query_pairs_mut()
-        .append_pair("callback_url", callback)
-        .append_pair("state", state);
-    url.into()
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoginOptions {
-    /// Open the sign-in page in the default browser (`--no-browser` clears it).
+    /// Try to open the sign-in page in a browser (`--no-browser` clears it).
+    /// The link and code are printed either way.
     pub open_browser: bool,
 }
 
@@ -284,93 +271,28 @@ impl Default for LoginOptions {
     }
 }
 
-/// Browser login through a loopback callback on an OS-assigned port.
+/// Device-code sign-in: prints a link and a short code, opens the browser
+/// when this machine has one, and polls Zero-X until the code is approved on
+/// <https://neuron.zero-x.live/device>. No local port is opened.
 pub fn login(options: LoginOptions) -> io::Result<GatewayCredential> {
     let base = gateway_base_url()?;
-    // Bind before opening the browser.
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    listener.set_nonblocking(true)?;
-    let port = listener.local_addr()?.port();
-    let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    let state = general_purpose::URL_SAFE_NO_PAD.encode(bytes);
-    let url = auth_url(&format!("http://127.0.0.1:{port}/callback"), &state);
-    if options.open_browser {
-        eprintln!("Sign in to your Zero-X account in the browser.\n{url}");
-        if webbrowser::open(&url).is_err() {
-            eprintln!("Could not open a browser; open the URL above to continue.");
-        }
-    } else {
-        eprintln!(
-            "Open this URL in a browser on this machine to sign in:\n{url}\n\
-             Over SSH, forward the callback port first (ssh -L {port}:127.0.0.1:{port} <host>), \
-             or use `neuron auth login --with-token`."
-        );
-    }
-    let store = CredentialStore::open_default();
-    let token = accept_login(
-        &listener,
-        &state,
-        port,
-        Instant::now() + LOGIN_TIMEOUT,
-        |token| {
-            store
-                .save(&StoredCredential::new(token.clone()))
-                .map(|_| ())
-                .map_err(io::Error::other)
-        },
+    let allowed =
+        device_login::browser_allowed(options.open_browser, &|name| env::var(name).ok(), &|path| {
+            std::path::Path::new(path).exists()
+        });
+    let open_browser = |link: &str| allowed && webbrowser::open(link).is_ok();
+    // Ctrl-C ends the process here; the full-screen UI passes its own cancel check.
+    let clock = SystemClock::new(&|| false);
+    let grant = device_login::run(
+        &base,
+        &HttpTransport,
+        &clock,
+        &TerminalObserver,
+        &ClientInfo::current(),
+        &open_browser,
     )?;
-    eprintln!("Zero-X sign-in received. Return to your terminal.");
-    finish_login(&store, &base, token)
-}
-
-/// Waits for the browser's form POST on `listener` (non-blocking, so the
-/// deadline is checked between polls), validates it, lets `persist` store
-/// the token and answers the browser.
-pub(crate) fn accept_login(
-    listener: &TcpListener,
-    state: &str,
-    port: u16,
-    deadline: Instant,
-    mut persist: impl FnMut(&SecureString) -> io::Result<()>,
-) -> io::Result<SecureString> {
-    while Instant::now() < deadline {
-        match listener.accept() {
-            Ok((mut stream, address)) if address.ip().is_loopback() => {
-                // Accepted sockets inherit the listener's non-blocking mode on
-                // some platforms (Windows, BSDs). Reads must block, honouring
-                // the timeouts set in receive_callback, or a request that has
-                // not fully arrived yet fails with WouldBlock.
-                let received = stream
-                    .set_nonblocking(false)
-                    .and_then(|()| receive_callback(&mut stream, state, port));
-                match received {
-                    Ok(token) => {
-                        let token = SecureString::new(token);
-                        if let Err(error) = persist(&token) {
-                            respond(&mut stream, false);
-                            return Err(error);
-                        }
-                        respond(&mut stream, true);
-                        return Ok(token);
-                    }
-                    Err(error) => {
-                        eprintln!("Rejected Neuron callback: {error}");
-                        respond(&mut stream, false);
-                    }
-                }
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(50));
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::TimedOut,
-        "Sign-in timed out. Run `neuron auth login` again",
-    ))
+    let store = CredentialStore::open_default();
+    finish_login(&store, &base, grant.token)
 }
 
 /// Records session metadata after the token is stored and reports where.
@@ -438,108 +360,6 @@ fn login_with_token(input: &mut dyn BufRead, prompt: bool) -> io::Result<Gateway
     let base = gateway_base_url()?;
     let store = CredentialStore::open_default();
     finish_login(&store, &base, SecureString::new(token.to_string()))
-}
-
-fn receive_callback(stream: &mut TcpStream, state: &str, port: u16) -> io::Result<String> {
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let mut reader = BufReader::new(stream.try_clone()?.take(16_384));
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
-    if line.trim_end() != "POST /callback HTTP/1.1" {
-        return Err(io::Error::other("Expected POST /callback"));
-    }
-    let mut headers = std::collections::HashMap::new();
-    loop {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            return Err(io::Error::other("Incomplete callback headers"));
-        }
-        if line == "\r\n" {
-            break;
-        }
-        let (name, value) = line
-            .split_once(':')
-            .ok_or_else(|| io::Error::other("Invalid header"))?;
-        if headers
-            .insert(name.to_ascii_lowercase(), value.trim().to_string())
-            .is_some()
-        {
-            return Err(io::Error::other("Duplicate callback header"));
-        }
-    }
-    if headers.get("host") != Some(&format!("127.0.0.1:{port}"))
-        || !trusted_callback_origin(&headers)
-        || !headers.get("content-type").is_some_and(|value| {
-            value.split(';').next() == Some("application/x-www-form-urlencoded")
-        })
-        || headers.contains_key("transfer-encoding")
-    {
-        return Err(io::Error::other("Invalid callback origin or content type"));
-    }
-    let length: usize = headers
-        .get("content-length")
-        .and_then(|value| value.parse().ok())
-        .filter(|length| *length <= 8192)
-        .ok_or_else(|| io::Error::other("Invalid callback length"))?;
-    let mut body = vec![0u8; length];
-    reader.read_exact(&mut body)?;
-    let body = std::str::from_utf8(&body).map_err(io::Error::other)?;
-    let mut parsed = Url::parse("http://localhost/").expect("fixed form URL");
-    parsed.set_query(Some(body));
-    let mut fields = std::collections::HashMap::new();
-    for (name, value) in parsed.query_pairs() {
-        if fields
-            .insert(name.into_owned(), value.into_owned())
-            .is_some()
-        {
-            return Err(io::Error::other("Duplicate callback field"));
-        }
-    }
-    let received_state = fields
-        .get("state")
-        .ok_or_else(|| io::Error::other("Missing callback state"))?;
-    if !constant_time_eq::constant_time_eq(received_state.as_bytes(), state.as_bytes()) {
-        return Err(io::Error::other("Callback state mismatch"));
-    }
-    let token = fields
-        .remove("session_token")
-        .ok_or_else(|| io::Error::other("Missing session token"))?;
-    // The browser handoff only ever carries CLI session tokens.
-    if classify_token(&token) != Ok(TokenKind::Session) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Invalid gateway session token",
-        ));
-    }
-    Ok(token)
-}
-
-fn trusted_callback_origin(headers: &std::collections::HashMap<String, String>) -> bool {
-    if headers.get("origin").is_some_and(|origin| {
-        matches!(
-            origin.as_str(),
-            "https://zero-x.live" | "https://www.zero-x.live"
-        )
-    }) {
-        return true;
-    }
-    headers.get("referer").is_some_and(|referer| {
-        Url::parse(referer).is_ok_and(|url| {
-            url.scheme() == "https"
-                && matches!(url.host_str(), Some("zero-x.live" | "www.zero-x.live"))
-        })
-    })
-}
-
-fn respond(stream: &mut TcpStream, success: bool) {
-    let (status, body) = if success {
-        ("200 OK", "<!doctype html><title>Neuron connected</title><h1>Neuron connected</h1><p>Your Zero-X session is saved. Close this tab and return to your terminal.</p>")
-    } else {
-        ("400 Bad Request", "<!doctype html><title>Sign-in failed</title><h1>Sign-in failed</h1><p>Return to Zero-X and try the handoff again.</p>")
-    };
-    let response = format!("HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\n\r\n{body}", body.len());
-    let _ = stream.write_all(response.as_bytes());
 }
 
 /// Signs out: revokes the session on the server when possible and removes
@@ -663,6 +483,13 @@ fn refresh_stored_metadata(credential: &GatewayCredential, info: &SessionInfo) {
     }
 }
 
+/// `neuron login …` and `neuron logout` are the short forms of
+/// `neuron auth login …` and `neuron auth logout`: returns the arguments for
+/// [`run_auth_command`] when `args` is one of them.
+pub fn auth_alias(args: &[String]) -> Option<&[String]> {
+    matches!(args.first().map(String::as_str), Some("login" | "logout")).then_some(args)
+}
+
 pub fn run_auth_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     match args.first().map(String::as_str) {
         Some("login") => {
@@ -738,153 +565,21 @@ mod tests {
     }
 
     #[test]
-    fn callback_accepts_origin_or_same_site_referer() {
-        let mut headers = std::collections::HashMap::new();
-        headers.insert(
-            "referer".to_string(),
-            "https://zero-x.live/neuroncli/login/".to_string(),
-        );
-        assert!(trusted_callback_origin(&headers));
-        headers.insert("referer".to_string(), "https://attacker.test/".to_string());
-        assert!(!trusted_callback_origin(&headers));
-    }
-
-    fn callback(method: &str, origin: &str, body: &str) -> io::Result<String> {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let port = listener.local_addr()?.port();
-        let mut client = TcpStream::connect(listener.local_addr()?)?;
-        write!(client, "{method} /callback HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {origin}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}", body.len())?;
-        let (mut stream, _) = listener.accept()?;
-        receive_callback(&mut stream, "expected-state", port)
-    }
-
-    #[test]
-    fn handoff_requires_post_origin_state_and_gateway_token() {
-        let token = "ses_012345678901234567890123456789";
-        let body = format!("state=expected-state&session_token={token}");
+    fn login_and_logout_work_without_the_auth_prefix() {
+        let args = |list: &[&str]| list.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(auth_alias(&args(&["login"])), Some(&args(&["login"])[..]));
         assert_eq!(
-            callback("POST", "https://zero-x.live", &body).unwrap(),
-            token
+            auth_alias(&args(&["login", "--no-browser"])),
+            Some(&args(&["login", "--no-browser"])[..])
         );
-        assert!(callback("GET", "https://zero-x.live", &body).is_err());
-        assert!(callback("POST", "https://attacker.test", &body).is_err());
-        assert!(callback(
-            "POST",
-            "https://zero-x.live",
-            &body.replace("expected-state", "wrong-state")
-        )
-        .is_err());
-        assert!(callback(
-            "POST",
-            "https://zero-x.live",
-            &format!("{body}&state=expected-state")
-        )
-        .is_err());
-        assert!(callback(
-            "POST",
-            "https://zero-x.live",
-            "state=expected-state&session_token=sk-provider-secret"
-        )
-        .is_err());
-        // API keys are never delivered through the browser handoff.
-        assert!(callback(
-            "POST",
-            "https://zero-x.live",
-            "state=expected-state&session_token=nzx_0123456789abcdefghij"
-        )
-        .is_err());
-    }
-
-    /// Drives the real acceptor through a non-blocking listener. The fake
-    /// browser connects, waits, and only then sends its form POST, so a
-    /// socket left non-blocking after `accept` would fail with WouldBlock
-    /// instead of reading the request.
-    #[test]
-    fn loopback_acceptor_reads_a_delayed_browser_post_from_a_nonblocking_listener() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let token = "ses_abcdefghijklmnopqrstuvwxyz012345";
-
-        let browser = thread::spawn(move || {
-            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-            // Let the acceptor pick up the connection before any byte arrives.
-            thread::sleep(Duration::from_millis(400));
-            let body = format!("state=loopback-state&session_token={token}");
-            write!(
-                stream,
-                "POST /callback HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: https://zero-x.live\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n",
-                body.len()
-            )
-            .unwrap();
-            stream.flush().unwrap();
-            thread::sleep(Duration::from_millis(100));
-            stream.write_all(body.as_bytes()).unwrap();
-            let mut response = String::new();
-            stream.read_to_string(&mut response).unwrap();
-            response
-        });
-
-        let mut persisted = Vec::new();
-        let received = accept_login(
-            &listener,
-            "loopback-state",
-            port,
-            Instant::now() + Duration::from_secs(20),
-            |token| {
-                persisted.push(token.expose().to_string());
-                Ok(())
-            },
-        )
-        .expect("acceptor should read the delayed POST");
-
-        assert_eq!(received.expose(), token);
-        assert_eq!(persisted, vec![token.to_string()]);
-        let response = browser.join().unwrap();
-        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-        assert!(response.contains("Neuron connected"));
-    }
-
-    #[test]
-    fn acceptor_reports_persist_failures_to_the_browser() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let browser = thread::spawn(move || {
-            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-            let body = "state=s&session_token=ses_012345678901234567890123456789";
-            write!(stream, "POST /callback HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: https://zero-x.live\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
-            let mut response = String::new();
-            stream.read_to_string(&mut response).unwrap();
-            response
-        });
-        let error = accept_login(
-            &listener,
-            "s",
-            port,
-            Instant::now() + Duration::from_secs(20),
-            |_| Err(io::Error::other("disk full")),
-        )
-        .unwrap_err();
-        assert_eq!(error.to_string(), "disk full");
-        assert!(browser.join().unwrap().starts_with("HTTP/1.1 400"));
-    }
-
-    #[test]
-    fn acceptor_times_out_without_a_callback() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let error = accept_login(&listener, "s", 1, Instant::now(), |_| Ok(())).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-    }
-
-    #[test]
-    fn browser_url_encodes_random_loopback_callback() {
-        let url = Url::parse(&auth_url("http://127.0.0.1:42137/callback", "abc-def")).unwrap();
-        assert_eq!(url.path(), "/neuroncli/login/");
-        let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
-        assert_eq!(query["callback_url"], "http://127.0.0.1:42137/callback");
-        assert_eq!(query["state"], "abc-def");
+        assert_eq!(auth_alias(&args(&["logout"])), Some(&args(&["logout"])[..]));
+        assert_eq!(
+            auth_alias(&args(&["status"])),
+            None,
+            "`neuron status` stays the REPL command"
+        );
+        assert_eq!(auth_alias(&args(&["prompt", "login"])), None);
+        assert_eq!(auth_alias(&[]), None);
     }
 
     #[test]
