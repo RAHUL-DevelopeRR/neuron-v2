@@ -789,6 +789,90 @@ fn resumed_usage_command_reads_the_account_from_the_gateway() {
     assert_bearer(&account[0], SESSION_TOKEN);
 }
 
+/// `neuron login` signs in through the device flow: it prints the link and code, polls the
+/// token endpoint and stores the session, without any local callback port.
+#[test]
+fn login_signs_in_through_the_device_flow() {
+    let origin = Arc::new(Mutex::new(String::new()));
+    let gateway = {
+        let origin = Arc::clone(&origin);
+        FakeGateway::spawn(move |request, _| {
+            let origin = origin.lock().unwrap().clone();
+            match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/auth/device/code") => Reply::json(
+                    "200 OK",
+                    &serde_json::json!({
+                        "device_code": format!("zdc_{}", "A".repeat(43)), "user_code": "BDWP-HQPK",
+                        "verification_uri": format!("{origin}/neuroncli/device/"),
+                        "verification_uri_complete": format!("{origin}/neuroncli/device/?user_code=BDWP-HQPK"),
+                        "expires_in": 600, "interval": 5
+                    }),
+                ),
+                ("POST", "/auth/device/token") => Reply::json(
+                    "200 OK",
+                    &serde_json::json!({"access_token": SESSION_TOKEN, "token_type": "Bearer", "plan": "free"}),
+                ),
+                ("GET", "/auth/session") => Reply::json(
+                    "200 OK",
+                    &serde_json::json!({"plan": "free", "email": "dev@example.com", "expires_at": "2099-01-01T00:00:00Z"}),
+                ),
+                _ => Reply::json(
+                    "404 Not Found",
+                    &serde_json::json!({"error": {"code": "not_found"}}),
+                ),
+            }
+        })
+    };
+    *origin.lock().unwrap() = gateway.base.trim_end_matches("/v1").to_string();
+    let workspace = Workspace::new("device-login");
+    let credentials = workspace.neuron_home().join("credentials.json");
+
+    let mut login = workspace.command(&gateway);
+    login
+        .args(["login", "--no-browser"])
+        .env("NEURON_NO_BROWSER", "1");
+    let output = run(login, None);
+    let log = stderr(&output);
+    assert!(output.status.success(), "{log}");
+    assert!(log.contains("Enter code  BDWP-HQPK"), "{log}");
+    assert!(log.contains("/neuroncli/device/"), "{log}");
+    assert!(log.contains("Signed in to Zero-X (plan free)"), "{log}");
+    assert!(!log.contains(SESSION_TOKEN), "the session is never printed");
+    let stored: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&credentials).unwrap()).unwrap();
+    assert_eq!(stored["token"], SESSION_TOKEN);
+
+    let requests = gateway.requests();
+    let code = requests
+        .iter()
+        .find(|request| request.path == "/auth/device/code")
+        .unwrap();
+    assert_eq!(code.json()["client_id"], "neuron-cli");
+    assert!(
+        code.authorization.is_none(),
+        "asking for a code needs no credential"
+    );
+    let poll = requests
+        .iter()
+        .find(|request| request.path == "/auth/device/token")
+        .unwrap();
+    assert_eq!(
+        poll.json()["grant_type"],
+        "urn:ietf:params:oauth:grant-type:device_code"
+    );
+    assert!(
+        poll.at.duration_since(code.at) >= Duration::from_secs(4),
+        "the first poll waits for the interval"
+    );
+    assert_bearer(
+        requests
+            .iter()
+            .find(|request| request.path == "/auth/session")
+            .unwrap(),
+        SESSION_TOKEN,
+    );
+}
+
 #[test]
 fn auth_login_with_token_status_and_logout_lifecycle() {
     let gateway = gateway_with_chat(|_, _| text_reply("unused"));
