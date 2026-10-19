@@ -66,7 +66,7 @@ pub(crate) fn report_repl_error(message: &str, out: &mut impl Write) {
     );
 }
 
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     payload
         .downcast_ref::<&str>()
         .map(ToString::to_string)
@@ -447,11 +447,17 @@ fn context_command_argument(line: &str) -> Option<&str> {
 
 impl LiveCli {
     fn print_context(&self, argument: &str) -> Result<(), Box<dyn std::error::Error>> {
+        println!("{}", self.context_command(argument)?);
+        Ok(())
+    }
+
+    /// What `/context [show]` shows.
+    pub(crate) fn context_command(
+        &self,
+        argument: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
         match argument {
-            "" | "show" => {
-                println!("{}", self.context_report());
-                Ok(())
-            }
+            "" | "show" => Ok(self.context_report()),
             "clear" => Err(
                 "/context clear is not supported; use /compact to summarize or /clear --confirm to start fresh"
                     .into(),

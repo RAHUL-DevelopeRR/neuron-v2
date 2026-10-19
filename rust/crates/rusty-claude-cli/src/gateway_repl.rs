@@ -87,7 +87,7 @@ fn session_catalog() -> Option<std::sync::Arc<crate::gateway_catalog::Catalog>> 
     }
     let endpoint = api::installed_openai_compat_endpoint()?;
     crate::gateway_catalog::load(&endpoint.base_url, Some(endpoint.api_key()))
-        .map_err(|error| eprintln!("warning: {error}"))
+        .map_err(|error| runtime::ui_hooks::notice(&format!("warning: {error}")))
         .ok()
 }
 

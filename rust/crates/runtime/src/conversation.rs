@@ -396,6 +396,11 @@ where
     }
 
     #[must_use]
+    pub fn hook_abort_signal(&self) -> &HookAbortSignal {
+        &self.hook_abort_signal
+    }
+
+    #[must_use]
     pub fn with_hook_progress_reporter(
         mut self,
         hook_progress_reporter: Box<dyn HookProgressReporter>,

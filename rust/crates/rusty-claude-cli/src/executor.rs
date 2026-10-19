@@ -90,6 +90,18 @@ impl<'a> ChannelPermissionPrompter<'a> {
             next_id: 0,
         }
     }
+
+    /// Numbers this prompter's requests after `last_id`, so a late answer to an earlier
+    /// turn's request never matches one of this turn's.
+    pub(crate) fn numbered_after(mut self, last_id: u64) -> Self {
+        self.next_id = last_id;
+        self
+    }
+
+    /// The id of the last request sent (or the starting point when none was).
+    pub(crate) fn last_id(&self) -> u64 {
+        self.next_id
+    }
 }
 
 impl runtime::PermissionPrompter for ChannelPermissionPrompter<'_> {

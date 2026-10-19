@@ -920,7 +920,7 @@ fn break_inline_bullets(text: &str) -> String {
     result
 }
 
-fn strip_ansi(input: &str) -> String {
+pub(crate) fn strip_ansi(input: &str) -> String {
     let mut output = String::new();
     let mut chars = input.chars().peekable();
 

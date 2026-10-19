@@ -48,6 +48,7 @@ mod clock;
 mod credentials;
 mod device_login;
 mod doctor;
+mod engine;
 mod executor;
 mod gateway_catalog;
 mod gateway_http;
@@ -1976,6 +1977,23 @@ impl LiveCli {
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::with_output(
+            model,
+            enable_tools,
+            allowed_tools,
+            permission_mode,
+            TurnOutput::Ansi,
+        )
+    }
+
+    /// [`Self::new`] whose turns show on `output` instead of the terminal.
+    fn with_output(
+        model: String,
+        enable_tools: bool,
+        allowed_tools: Option<AllowedToolSet>,
+        permission_mode: PermissionMode,
+        output: TurnOutput,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt()?;
         let session_state = new_cli_session()?;
         let session = create_managed_session_handle(&session_state.session_id)?;
@@ -1985,7 +2003,7 @@ impl LiveCli {
             model.clone(),
             system_prompt.clone(),
             enable_tools,
-            true,
+            output,
             allowed_tools.clone(),
             permission_mode,
             None,
@@ -2241,6 +2259,16 @@ impl LiveCli {
         &mut self,
         output: impl Into<TurnOutput>,
     ) -> Result<HookAbortMonitor, Box<dyn std::error::Error>> {
+        self.prepare_turn_runtime_watching(output, None)
+    }
+
+    /// [`Self::prepare_turn_runtime`] whose monitor watches `presses` (Ctrl-C keys read
+    /// by the full-screen UI) instead of the Ctrl-C signal, when given.
+    fn prepare_turn_runtime_watching(
+        &mut self,
+        output: impl Into<TurnOutput>,
+        presses: Option<repl_loop::InterruptPresses>,
+    ) -> Result<HookAbortMonitor, Box<dyn std::error::Error>> {
         let output = output.into();
         // Plan mode structurally strips write tools: instead of asking the
         // model not to write, bash, write_file and edit_file are removed from
@@ -2293,7 +2321,12 @@ impl LiveCli {
         self.runtime
             .set_hook_abort_signal(hook_abort_signal.clone());
         tools::set_subagent_cancellation_token(cancel.clone());
-        Ok(HookAbortMonitor::spawn_for_turn(hook_abort_signal, cancel))
+        Ok(match presses {
+            None => HookAbortMonitor::spawn_for_turn(hook_abort_signal, cancel),
+            Some(presses) => {
+                HookAbortMonitor::spawn_for_ui_turn(hook_abort_signal, cancel, presses)
+            }
+        })
     }
 
     fn replace_runtime(&mut self, runtime: BuiltRuntime) -> Result<(), Box<dyn std::error::Error>> {
@@ -2756,23 +2789,24 @@ impl LiveCli {
     }
 
     fn print_status(&self) {
+        println!("{}", self.status_report());
+    }
+
+    fn status_report(&self) -> String {
         let cumulative = self.runtime.usage().cumulative_usage();
         let latest = self.runtime.usage().current_turn_usage();
-        println!(
-            "{}",
-            format_status_report(
-                &self.model,
-                StatusUsage {
-                    message_count: self.runtime.session().messages.len(),
-                    turns: self.runtime.usage().turns(),
-                    latest,
-                    cumulative,
-                    estimated_tokens: self.runtime.estimated_tokens(),
-                },
-                self.permission_mode.as_str(),
-                &status_context(Some(&self.session.path)).expect("status context should load"),
-            )
-        );
+        format_status_report(
+            &self.model,
+            StatusUsage {
+                message_count: self.runtime.session().messages.len(),
+                turns: self.runtime.usage().turns(),
+                latest,
+                cumulative,
+                estimated_tokens: self.runtime.estimated_tokens(),
+            },
+            self.permission_mode.as_str(),
+            &status_context(Some(&self.session.path)).expect("status context should load"),
+        )
     }
 
     fn record_prompt_history(&mut self, prompt: &str) {
@@ -2788,7 +2822,9 @@ impl LiveCli {
         };
         self.prompt_history.push(entry);
         if let Err(error) = self.runtime.session_mut().push_prompt_entry(prompt) {
-            eprintln!("warning: failed to persist prompt history: {error}");
+            runtime::ui_hooks::notice(&format!(
+                "warning: failed to persist prompt history: {error}"
+            ));
         }
     }
 
@@ -2853,12 +2889,7 @@ impl LiveCli {
             return Ok(false);
         };
 
-        let model = resolve_model_alias_with_config(&model);
-        let model = if self.model.starts_with("openai/") && !model.starts_with("openai/") {
-            format!("openai/{model}")
-        } else {
-            model
-        };
+        let model = self.resolve_model_choice(&model);
         if let Some(warning) = gateway_repl::gateway_model_warning(&model) {
             eprintln!("{warning}");
         }
@@ -2896,6 +2927,17 @@ impl LiveCli {
             format_model_switch_report(&previous, &model, message_count)
         );
         Ok(true)
+    }
+
+    /// The model id `/model <model>` switches to: aliases resolved, and kept on the
+    /// OpenAI-compatible route when the current model uses it.
+    fn resolve_model_choice(&self, model: &str) -> String {
+        let model = resolve_model_alias_with_config(model);
+        if self.model.starts_with("openai/") && !model.starts_with("openai/") {
+            format!("openai/{model}")
+        } else {
+            model
+        }
     }
 
     fn set_permissions(
@@ -2966,7 +3008,12 @@ impl LiveCli {
             None,
         )?;
         self.replace_runtime(runtime)?;
-        println!(
+        println!("{}", self.session_cleared_report(&previous_session));
+        Ok(true)
+    }
+
+    fn session_cleared_report(&self, previous_session: &SessionHandle) -> String {
+        format!(
             "Session cleared\n  Mode             fresh session\n  Previous session {}\n  Resume previous  /resume {}\n  Preserved model  {}\n  Permission mode  {}\n  New session      {}\n  Session file     {}",
             previous_session.id,
             previous_session.id,
@@ -2974,8 +3021,7 @@ impl LiveCli {
             self.permission_mode.as_str(),
             self.session.id,
             self.session.path.display(),
-        );
-        Ok(true)
+        )
     }
 
     fn print_cost(&self) {
@@ -4513,14 +4559,14 @@ mod tests {
         );
     }
 
-    fn env_lock() -> MutexGuard<'static, ()> {
+    pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn with_current_dir<T>(cwd: &Path, f: impl FnOnce() -> T) -> T {
+    pub(crate) fn with_current_dir<T>(cwd: &Path, f: impl FnOnce() -> T) -> T {
         let _guard = cwd_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
