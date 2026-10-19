@@ -87,6 +87,60 @@ pub fn sensitive_path_reason_resolved(path: &str, bases: &[PathBuf]) -> Option<S
         })
 }
 
+/// Directories never descended into while scanning for sensitive files: VCS
+/// metadata and dependency/build caches. A recursive content read normally
+/// skips `node_modules`/`target` anyway, and credential files living inside
+/// them are vanishingly rare, so pruning them keeps the scan cheap.
+const SCAN_SKIP_DIRS: &[&str] = &[".git", ".hg", ".svn", ".jj", "node_modules", "target"];
+
+/// How many directory entries [`directory_tree_sensitive_reason`] inspects
+/// before giving up. A `.env` or settings file normally sits at or near a tree
+/// root, so this is only reached in very large trees, which are then treated as
+/// clean (a recursive read over them is not forced to prompt on size alone).
+const MAX_SCAN_ENTRIES: usize = 50_000;
+
+/// The display path of the first credential or settings file found anywhere
+/// beneath any of `roots`, or `None` when none is found (also when the trees
+/// are unreadable or larger than [`MAX_SCAN_ENTRIES`]).
+///
+/// Used to gate recursive content reads — `grep -r`, `rg --hidden`,
+/// `git grep`, `find ... | xargs cat` and the like — which read files without
+/// ever naming them on the command line, so [`sensitive_path_reason`] on the
+/// arguments alone cannot see what they would expose.
+#[must_use]
+pub fn directory_tree_sensitive_reason(roots: &[PathBuf]) -> Option<String> {
+    let mut stack: Vec<PathBuf> = roots.to_vec();
+    let mut scanned = 0usize;
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            scanned += 1;
+            if scanned > MAX_SCAN_ENTRIES {
+                return None;
+            }
+            let is_dir = entry.file_type().is_ok_and(|file_type| file_type.is_dir());
+            let path = entry.path();
+            if is_dir {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !SCAN_SKIP_DIRS
+                    .iter()
+                    .any(|skip| name.eq_ignore_ascii_case(skip))
+                {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if sensitive_path_reason(&path.to_string_lossy()).is_some() {
+                return Some(path.display().to_string());
+            }
+        }
+    }
+    None
+}
+
 fn is_env_file(name: &str) -> bool {
     if has_glob(name) {
         return ENV_FILE_SAMPLES
@@ -152,7 +206,9 @@ fn glob_matches_from(pattern: &[char], name: &[char]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{sensitive_path_reason, sensitive_path_reason_resolved};
+    use super::{
+        directory_tree_sensitive_reason, sensitive_path_reason, sensitive_path_reason_resolved,
+    };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -244,5 +300,32 @@ mod tests {
         assert!(sensitive_path_reason_resolved("plain.txt", std::slice::from_ref(&root)).is_none());
 
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn directory_tree_scan_finds_nested_credentials_and_skips_vcs_dirs() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("runtime-tree-scan-{nanos}"));
+        fs::create_dir_all(root.join("src").join("deep")).expect("nested dirs");
+        fs::write(root.join("src").join("main.rs"), "fn main() {}").expect("write rs");
+
+        // A clean tree reports nothing.
+        assert!(directory_tree_sensitive_reason(std::slice::from_ref(&root)).is_none());
+
+        // A `.env` buried below the root is still found.
+        fs::write(root.join("src").join("deep").join(".env"), "KEY=sk-test").expect("write env");
+        assert!(directory_tree_sensitive_reason(std::slice::from_ref(&root)).is_some());
+
+        // A credential hidden only inside a pruned VCS directory is not scanned.
+        let clean = std::env::temp_dir().join(format!("runtime-tree-scan-git-{nanos}"));
+        fs::create_dir_all(clean.join(".git")).expect("git dir");
+        fs::write(clean.join(".git").join(".env"), "KEY=sk-test").expect("write env in git");
+        assert!(directory_tree_sensitive_reason(std::slice::from_ref(&clean)).is_none());
+
+        fs::remove_dir_all(root).expect("cleanup");
+        fs::remove_dir_all(clean).expect("cleanup git");
     }
 }

@@ -14,7 +14,7 @@ use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
 use crate::permissions::PermissionMode;
-use crate::sensitive_paths::sensitive_path_reason_resolved;
+use crate::sensitive_paths::{directory_tree_sensitive_reason, sensitive_path_reason_resolved};
 
 /// Shell grammar used to interpret a command line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1259,6 +1259,16 @@ fn classify_program(
     {
         return Err("`file -C` writes a compiled magic file".to_string());
     }
+    // A recursive `grep` reads every file under a directory, dotfiles included,
+    // so it can print `.env` without ever naming it.
+    if matches!(name, "grep" | "egrep" | "fgrep") {
+        check_args(context)?;
+        return if grep_is_recursive(args) {
+            recursive_content_read_problem(args, context).map_or(Ok(()), Err)
+        } else {
+            Ok(())
+        };
+    }
     if PLAIN_READ_ONLY_PROGRAMS.contains(&name)
         || (context.dialect == ShellDialect::Cmd && CMD_ONLY_READ_ONLY_PROGRAMS.contains(&name))
     {
@@ -1367,10 +1377,16 @@ fn classify_program(
                 .iter()
                 .any(|arg| arg.text == "--pre" || arg.text.starts_with("--pre="))
             {
-                Err("`rg --pre` runs a preprocessor command".to_string())
-            } else {
-                Ok(())
+                return Err("`rg --pre` runs a preprocessor command".to_string());
             }
+            // Plain `rg` honours `.gitignore` and skips dotfiles; told to search
+            // hidden or ignored files it can reach `.env` and settings files.
+            if rg_exposes_hidden_or_ignored(args) {
+                if let Some(problem) = recursive_content_read_problem(args, context) {
+                    return Err(problem);
+                }
+            }
+            Ok(())
         }
         "awk" | "gawk" | "mawk" | "nawk" => {
             let programs = check_awk_args(args)?;
@@ -1413,7 +1429,8 @@ fn classify_program(
         "xargs" => classify_xargs(args, context),
         "git" => {
             check_args(context)?;
-            check_git_args(args)
+            check_git_args(args)?;
+            git_runtime_problem(args, context)
         }
         _ => Err(format!("`{name}` is not a known read-only command")),
     }
@@ -2110,9 +2127,223 @@ fn classify_xargs(args: &[Word], context: &mut Context<'_>) -> Result<(), String
         Some(program) if program.expanded => {
             Err("xargs runs a program named by a variable expansion".to_string())
         }
-        Some(program) => classify_program(program, &args[index + 1..], context)
-            .map_err(|reason| format!("xargs runs a command that is not read-only: {reason}")),
+        Some(program) => {
+            classify_program(program, &args[index + 1..], context).map_err(|reason| {
+                format!("xargs runs a command that is not read-only: {reason}")
+            })?;
+            // The file list comes from stdin (typically `find`), so a content
+            // reader under `xargs` can print any file the list names, `.env`
+            // included, without ever naming it on the command line.
+            if is_content_reader(&program_name(&program.text, context.dialect)) {
+                if let Some(problem) = recursive_content_read_problem(&[], context) {
+                    return Err(problem);
+                }
+            }
+            Ok(())
+        }
     }
+}
+
+/// Programs that print the contents of the files given to them. Fed a file
+/// list from `find` through `xargs`, they can read any file the list names
+/// (`.env` included); programs that report only metadata or counts (`wc`,
+/// `stat`, `ls`, ...) are deliberately absent.
+const CONTENT_READERS: &[&str] = &[
+    "cat", "head", "tail", "less", "more", "nl", "tac", "od", "hexdump", "xxd", "strings", "grep",
+    "egrep", "fgrep", "rg", "jq", "cut", "fold", "rev", "base64", "column", "paste", "sed", "gsed",
+    "awk", "gawk", "mawk", "nawk",
+];
+
+fn is_content_reader(name: &str) -> bool {
+    CONTENT_READERS.contains(&name)
+}
+
+/// Whether a `grep`/`egrep`/`fgrep` invocation searches directories
+/// recursively (`-r`/`-R`/`--recursive`/`--dereference-recursive`, an `r`/`R`
+/// in a short-option cluster, or `-d recurse`/`--directories=recurse`). A
+/// recursive search reads every file under the directory, dotfiles included.
+fn grep_is_recursive(args: &[Word]) -> bool {
+    let flag_recurse = args.iter().any(|arg| {
+        let text = arg.text.as_str();
+        matches!(
+            text,
+            "-r" | "-R" | "--recursive" | "--dereference-recursive"
+        ) || (text.len() > 1
+            && text.starts_with('-')
+            && !text.starts_with("--")
+            && text[1..].chars().all(|ch| ch.is_ascii_alphanumeric())
+            && text.contains(['r', 'R']))
+            || text == "--directories=recurse"
+    });
+    let dir_recurse = args.windows(2).any(|pair| {
+        matches!(pair[0].text.as_str(), "-d" | "--directories") && pair[1].text == "recurse"
+    });
+    flag_recurse || dir_recurse
+}
+
+/// Whether an `rg` invocation is told to search files it skips by default:
+/// hidden files (`.env`) via `--hidden`, or ignored files via the
+/// `-u`/`-uu`/`-uuu` unrestricted levels and the `--no-ignore*`/`--unrestricted`
+/// options. Plain `rg` honours `.gitignore` and skips dotfiles.
+fn rg_exposes_hidden_or_ignored(args: &[Word]) -> bool {
+    args.iter().any(|arg| {
+        let text = arg.text.as_str();
+        matches!(
+            text,
+            "--hidden"
+                | "--no-ignore"
+                | "--no-ignore-vcs"
+                | "--no-ignore-dot"
+                | "--no-ignore-global"
+                | "--no-ignore-parent"
+                | "--no-ignore-files"
+                | "--unrestricted"
+        ) || (text.len() > 1
+            && text.starts_with('-')
+            && !text.starts_with("--")
+            && text[1..].chars().all(|ch| ch == 'u'))
+    })
+}
+
+/// Directories a recursive read would range over: existing directory operands
+/// (resolved against the `cd`-tracked bases), or every base when none is named.
+fn recursive_read_roots(args: &[Word], context: &Context<'_>) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for arg in args {
+        if arg.expanded || arg.text.starts_with('-') {
+            continue;
+        }
+        let text = dialect_path(arg.text.trim_matches(['"', '\'']), context.dialect);
+        let candidate = Path::new(text.as_ref());
+        let resolved: Vec<PathBuf> = if candidate.is_absolute() {
+            vec![candidate.to_path_buf()]
+        } else {
+            context
+                .bases
+                .iter()
+                .map(|base| base.join(candidate))
+                .collect()
+        };
+        roots.extend(resolved.into_iter().filter(|path| path.is_dir()));
+    }
+    if roots.is_empty() {
+        context.bases.clone()
+    } else {
+        roots
+    }
+}
+
+/// Approval reason when a command reads file content across a whole directory
+/// tree (so the files are never named on the command line) and a searched
+/// directory holds a credential or settings file. Without a workspace the read
+/// cannot be bounded, so it always escalates.
+fn recursive_content_read_problem(args: &[Word], context: &Context<'_>) -> Option<String> {
+    if context.workspace.is_none() {
+        return Some("a recursive content read cannot be bounded without a workspace".to_string());
+    }
+    let roots = recursive_read_roots(args, context);
+    directory_tree_sensitive_reason(&roots).map(|found| {
+        format!(
+            "a recursive read of a directory containing `{found}` could expose credentials; name the files to read instead"
+        )
+    })
+}
+
+/// The git subcommand and the arguments after it, skipping the global options
+/// before it. Mirrors the global-option handling of [`check_git_args`], which
+/// has already rejected the unsafe ones (`-c`, `--git-dir`, ...) by the time
+/// this runs; returns `None` when there is no subcommand.
+fn git_subcommand(args: &[Word]) -> Option<(&str, &[Word])> {
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        let text = arg.text.as_str();
+        match text {
+            "-C" | "--work-tree" | "--namespace" => index += 2,
+            "--no-pager"
+            | "-P"
+            | "--no-optional-locks"
+            | "--literal-pathspecs"
+            | "--no-replace-objects" => index += 1,
+            _ if text.starts_with("--work-tree=") || text.starts_with("--namespace=") => index += 1,
+            _ if text.starts_with('-') => return None,
+            _ => break,
+        }
+    }
+    let subcommand = args.get(index)?;
+    Some((subcommand.text.as_str(), &args[index + 1..]))
+}
+
+/// Extra approval conditions for the read-only `git` subcommands: repository
+/// config that makes git run programs (fsmonitor/filter/textconv — see
+/// [`crate::git_context::repository_program_config_reason`]) and content reads
+/// that print credential files from the working tree or history without naming
+/// them (`git grep`, `git log -p`, `git show`, `git diff`).
+fn git_runtime_problem(args: &[Word], context: &Context<'_>) -> Result<(), String> {
+    let Some((subcommand, rest)) = git_subcommand(args) else {
+        return Ok(());
+    };
+    let suppresses_patch = rest.iter().any(|arg| {
+        matches!(
+            arg.text.as_str(),
+            "--stat"
+                | "--numstat"
+                | "--shortstat"
+                | "--summary"
+                | "--name-only"
+                | "--name-status"
+                | "--compact-summary"
+                | "-s"
+                | "--no-patch"
+        ) || arg.text.starts_with("--dirstat")
+    });
+    let has_patch_flag = rest.iter().any(|arg| {
+        matches!(
+            arg.text.as_str(),
+            "-p" | "-u" | "--patch" | "--patch-with-stat" | "--patch-with-raw"
+        )
+    });
+    // Subcommands that read working-tree content or build diffs run the config
+    // programs above; metadata-only ones (rev-parse, ls-files, config, ...) do
+    // not.
+    let runs_program_config = matches!(
+        subcommand,
+        "status"
+            | "diff"
+            | "diff-files"
+            | "diff-index"
+            | "diff-tree"
+            | "show"
+            | "grep"
+            | "blame"
+            | "annotate"
+            | "stash"
+            | "whatchanged"
+    ) || (subcommand == "log" && has_patch_flag);
+    if runs_program_config {
+        if let Some(key) = context
+            .workspace
+            .and_then(crate::git_context::repository_program_config_reason)
+        {
+            return Err(format!(
+                "the repository config sets `{key}`, a program git would run for `git {subcommand}`"
+            ));
+        }
+    }
+    // Output that carries file content: `git grep` prints matching lines from
+    // tracked files; patch output prints changed file content from the tree or
+    // history. Either can include a credential file that is never named.
+    let prints_file_content = subcommand == "grep"
+        || (matches!(
+            subcommand,
+            "show" | "diff" | "diff-tree" | "diff-index" | "diff-files"
+        ) && !suppresses_patch)
+        || (matches!(subcommand, "log" | "whatchanged") && has_patch_flag && !suppresses_patch);
+    if prints_file_content {
+        if let Some(problem) = recursive_content_read_problem(&[], context) {
+            return Err(problem);
+        }
+    }
+    Ok(())
 }
 
 /// Whether the argument `arg` (conservatively) passes the option `flag`.
@@ -2344,6 +2575,24 @@ const POWERSHELL_READ_ONLY: &[&str] = &[
     "get-host",
 ];
 
+/// Parameters of the read-only `PowerShell` cmdlets whose following token is a
+/// value that is not a path but can look like one (a regex, wildcard, delimiter
+/// or date format), so it must not be checked as a path. Listed without the
+/// leading `-`. Path-valued parameters (`-Path`, `-LiteralPath`, `-FilePath`)
+/// are deliberately absent, and so is every switch: the token after anything
+/// not in this list is still path-checked.
+const POWERSHELL_VALUE_PARAMETERS: &[&str] = &[
+    "pattern",
+    "filter",
+    "include",
+    "exclude",
+    "delimiter",
+    "format",
+    "uformat",
+    "encoding",
+    "context",
+];
+
 fn classify_powershell_program(
     program: &Word,
     args: &[Word],
@@ -2374,15 +2623,17 @@ fn classify_powershell_program(
             if let Some(problem) = sensitive_read_problem(&arg.text, context) {
                 return Err(problem);
             }
-            // Values of non-path parameters (e.g. `-Pattern foo`) are not paths,
-            // but treating every positional as a potential path is conservative.
+            // Skip the outside-workspace path check only for the value of a
+            // parameter known to take a non-path value (`-Pattern foo`,
+            // `-Filter *.rs`); the token after a bare switch (`-Raw`) or a
+            // path-valued parameter (`-Path`) is a real path and is still
+            // checked, so `Get-Content -Raw C:\elsewhere\secret` escalates.
             let previous = index.checked_sub(1).and_then(|prev| args.get(prev));
-            let is_named_value = previous.is_some_and(|prev| {
+            let follows_value_parameter = previous.is_some_and(|prev| {
                 let prev = prev.text.to_ascii_lowercase();
-                prev.starts_with('-')
-                    && !matches!(prev.as_str(), "-path" | "-literalpath" | "-filepath")
+                POWERSHELL_VALUE_PARAMETERS.contains(&prev.trim_start_matches('-'))
             });
-            if is_named_value {
+            if follows_value_parameter {
                 continue;
             }
             if let Some(problem) = path_problem(&arg.text, false, context) {
@@ -2600,7 +2851,21 @@ mod tests {
     use crate::permissions::PermissionMode;
     use std::borrow::Cow;
     use std::ffi::OsStr;
+    use std::fs;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// A fresh, empty temporary directory for a test.
+    fn fresh_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("neuron-classifier-{label}-{nanos}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
 
     fn workspace() -> PathBuf {
         std::env::temp_dir().join("neuron-classifier-workspace")
@@ -3138,5 +3403,152 @@ mod tests {
             Path::new("/workspace/project/../other"),
             root
         ));
+    }
+
+    #[test]
+    fn recursive_reads_gate_on_sensitive_files_in_the_tree() {
+        let root = fresh_dir("recursive");
+        fs::create_dir_all(root.join("src")).expect("src dir");
+        fs::write(root.join("src").join("main.rs"), "fn main() {}").expect("write rs");
+        let classify =
+            |command: &str| classify_shell_command(command, ShellDialect::Posix, Some(&root));
+
+        // Recursive reads that range over the whole tree.
+        let whole_tree = [
+            "grep -r secret .",
+            "grep -rn todo",
+            "rg --hidden pattern",
+            "rg -uu pattern .",
+            "find . -type f | xargs cat",
+            "git grep todo",
+            "git log -p",
+            "git show",
+        ];
+        // Reads that never gate: not recursive, or do not print file content.
+        let never_gated = [
+            "grep todo src/main.rs",
+            "rg pattern",
+            "cat src/main.rs",
+            "find . -name '*.rs'",
+            "find . -type f | xargs wc -l",
+            "git log --oneline",
+            "git diff --stat",
+        ];
+
+        // A clean tree: everything stays read-only.
+        for command in whole_tree.iter().chain(never_gated.iter()) {
+            assert!(classify(command).is_read_only(), "clean tree: {command}");
+        }
+
+        // A credential file at the tree root gates the recursive reads only.
+        fs::write(root.join(".env"), "OPENAI_API_KEY=sk-test").expect("write env");
+        for command in whole_tree {
+            assert!(
+                !classify(command).is_read_only(),
+                "escalates with .env: {command}"
+            );
+        }
+        for command in never_gated {
+            assert!(
+                classify(command).is_read_only(),
+                "still read-only with .env: {command}"
+            );
+        }
+
+        // A recursive read scoped to a clean subdirectory stays read-only even
+        // though the root holds a `.env`; it gates once the subdir holds one.
+        assert!(classify("grep -rn todo src").is_read_only(), "clean subdir");
+        fs::write(root.join("src").join(".env.local"), "KEY=sk").expect("write nested env");
+        assert!(
+            !classify("grep -rn todo src").is_read_only(),
+            "subdir with .env.local"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn powershell_switch_values_are_still_path_checked() {
+        let root = fresh_dir("powershell");
+        fs::create_dir_all(root.join("src")).expect("src dir");
+        fs::write(root.join("src").join("main.rs"), "fn main() {}").expect("write rs");
+        let classify = |command: &str| classify_powershell_command(command, Some(&root));
+
+        // The token after a bare switch is a real path and is checked: an
+        // outside-workspace path escalates even behind `-Raw`/`-TotalCount`, and
+        // behind a switch that is not the one before the path (`-CaseSensitive`).
+        assert!(!classify("Get-Content -Raw C:\\elsewhere\\secret").is_read_only());
+        assert!(!classify("Get-Content -TotalCount 5 ..\\..\\secret").is_read_only());
+        assert!(
+            !classify("Select-String -CaseSensitive todo C:\\elsewhere\\secret").is_read_only()
+        );
+
+        // In-workspace paths behind a switch stay read-only.
+        assert!(classify("Get-Content -Raw src\\main.rs").is_read_only());
+
+        // Values of non-path parameters are not mistaken for paths, so a regex
+        // or wildcard that looks like a path does not falsely escalate.
+        assert!(classify("Select-String -Pattern 'C:/evil/regex' src\\main.rs").is_read_only());
+        assert!(classify("Get-ChildItem -Filter *.rs -Recurse").is_read_only());
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn git_content_commands_gate_on_repo_config_programs() {
+        let root = fresh_dir("git-config");
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "--quiet", "--initial-branch=main"]);
+        git(&["config", "user.email", "tests@example.com"]);
+        git(&["config", "user.name", "Classifier Tests"]);
+        fs::write(root.join("a.txt"), "a\n").expect("write a");
+        git(&["add", "a.txt"]);
+        git(&["commit", "-m", "init", "--quiet"]);
+        let classify =
+            |command: &str| classify_shell_command(command, ShellDialect::Posix, Some(&root));
+
+        // A repo whose config names no such program: these stay read-only.
+        for command in [
+            "git status",
+            "git diff",
+            "git log --oneline",
+            "git diff --stat",
+        ] {
+            assert!(classify(command).is_read_only(), "clean repo: {command}");
+        }
+
+        // A content filter driver in local config makes git run a program while
+        // reading the working tree, so status and diff require approval.
+        git(&["config", "filter.redact.clean", "cat"]);
+        for command in ["git status", "git diff"] {
+            assert!(
+                !classify(command).is_read_only(),
+                "filter config: {command}"
+            );
+        }
+        git(&["config", "--unset", "filter.redact.clean"]);
+
+        // `core.fsmonitor=false` disables the hook, so it is not a program.
+        git(&["config", "core.fsmonitor", "false"]);
+        assert!(
+            classify("git status").is_read_only(),
+            "fsmonitor=false is ignored"
+        );
+        // A real fsmonitor hook does gate.
+        git(&["config", "core.fsmonitor", "/opt/fsmonitor-hook"]);
+        assert!(
+            !classify("git status").is_read_only(),
+            "fsmonitor hook gates"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }
