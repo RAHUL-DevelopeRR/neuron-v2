@@ -1731,13 +1731,13 @@ mod tests {
             loaded.permission_mode(),
             Some(ResolvedPermissionMode::ReadOnly)
         );
-        assert!(loaded.permission_rules().allow().is_empty());
+        assert_eq!(loaded.permission_rules().allow(), [] as [String; 0]);
         assert_eq!(
             loaded.permission_rules().deny(),
             &["read_file(secret)".to_string(), "Bash(rm -rf)".to_string()]
         );
-        assert!(loaded.permission_rules().ask().is_empty());
-        assert!(loaded.trusted_roots().is_empty());
+        assert_eq!(loaded.permission_rules().ask(), [] as [String; 0]);
+        assert_eq!(loaded.trusted_roots(), [] as [String; 0]);
         let ignored = loaded.ignored_project_settings();
         assert_eq!(ignored.len(), 1);
         assert_eq!(ignored[0].action, ProjectSettingsAction::DroppedUntrusted);
@@ -1793,7 +1793,7 @@ mod tests {
             trusted.permission_mode(),
             Some(ResolvedPermissionMode::WorkspaceWrite)
         );
-        assert!(trusted.ignored_project_settings().is_empty());
+        assert_eq!(trusted.ignored_project_settings(), []);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
