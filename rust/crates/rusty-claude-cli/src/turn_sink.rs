@@ -1,0 +1,388 @@
+//! Where a turn's visible output goes. The agent loop calls a [`TurnSink`] instead of
+//! printing, so the same turn can render to the line terminal ([`AnsiSink`], byte for
+//! byte what Neuron always printed), to nowhere (one-shot JSON output, sub-agents), or to
+//! the full-screen UI as structured [`UiEvent`]s ([`ChannelSink`]) that it draws itself.
+
+// A turn's output goes through a TurnSink or runtime::ui_hooks, so a full-screen UI can own
+// the terminal.
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+
+use std::io::{self, Write};
+use std::sync::mpsc::Sender;
+use std::sync::Arc;
+
+use neuron_tui::protocol::UiEvent;
+
+use crate::render::{MarkdownStreamState, TerminalRenderer};
+use crate::stream_buffer::SyncRenderBuffer;
+use crate::tool_ui::{format_tool_call_start, format_tool_result};
+
+/// The visible parts of a turn, in the order they happen.
+pub(crate) trait TurnSink: Send {
+    /// A streamed piece of assistant text (Markdown).
+    fn text_delta(&mut self, text: &str) -> io::Result<()>;
+    /// A complete, non-streamed text block.
+    fn text_block(&mut self, text: &str) -> io::Result<()>;
+    /// The current text block ended: render anything still buffered.
+    fn end_block(&mut self) -> io::Result<()>;
+    /// A reasoning block started (`chars` when the block is complete, `redacted` when the
+    /// provider hides it).
+    fn reasoning_started(&mut self, chars: Option<usize>, redacted: bool) -> io::Result<()>;
+    /// Streamed reasoning text. The line terminal keeps it hidden.
+    fn reasoning_delta(&mut self, text: &str) -> io::Result<()>;
+    /// A tool call with its complete input; `cut_off` when the output limit truncated it.
+    fn tool_call(&mut self, id: &str, name: &str, input: &str, cut_off: bool) -> io::Result<()>;
+    /// A tool's result or error.
+    fn tool_result(&mut self, name: &str, output: &str, is_error: bool) -> io::Result<()>;
+}
+
+/// How a runtime shows its turns.
+#[derive(Debug, Clone, Default)]
+pub(crate) enum TurnOutput {
+    /// Nothing is shown (JSON output, compaction, sub-agents).
+    #[default]
+    Silent,
+    /// ANSI to the terminal, as the line REPL always did.
+    Ansi,
+    /// Structured events for the full-screen UI.
+    Channel(Arc<Sender<UiEvent>>),
+}
+
+/// Two outputs are the same when a runtime built for one can serve the other: the same
+/// mode and, for the UI, the same channel.
+impl PartialEq for TurnOutput {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Silent, Self::Silent) | (Self::Ansi, Self::Ansi) => true,
+            (Self::Channel(left), Self::Channel(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+}
+
+impl From<bool> for TurnOutput {
+    /// `emit_output`: `true` is the terminal, `false` is silent.
+    fn from(emit_output: bool) -> Self {
+        if emit_output {
+            Self::Ansi
+        } else {
+            Self::Silent
+        }
+    }
+}
+
+impl TurnOutput {
+    pub(crate) fn channel(events: Sender<UiEvent>) -> Self {
+        Self::Channel(Arc::new(events))
+    }
+
+    pub(crate) fn is_visible(&self) -> bool {
+        !matches!(self, Self::Silent)
+    }
+
+    /// A sink for one model response. The terminal one renders through a synchronized
+    /// output buffer so a frame is never drawn half-written.
+    pub(crate) fn stream_sink(&self) -> Box<dyn TurnSink> {
+        match self {
+            Self::Silent => Box::new(SilentSink),
+            Self::Ansi => Box::new(AnsiSink::new(SyncRenderBuffer::new())),
+            Self::Channel(events) => Box::new(ChannelSink::new(Sender::clone(events))),
+        }
+    }
+
+    /// A sink for tool results, which the terminal prints straight to stdout. Built once
+    /// per executor: the terminal renderer loads its syntax themes when created.
+    pub(crate) fn tool_sink(&self) -> Box<dyn TurnSink> {
+        match self {
+            Self::Silent => Box::new(SilentSink),
+            Self::Ansi => Box::new(AnsiSink::new(io::stdout())),
+            Self::Channel(events) => Box::new(ChannelSink::new(Sender::clone(events))),
+        }
+    }
+}
+
+/// Renders Markdown to ANSI on `out`, exactly as the line REPL prints a turn.
+pub(crate) struct AnsiSink<W: Write> {
+    out: W,
+    renderer: TerminalRenderer,
+    markdown: MarkdownStreamState,
+}
+
+impl<W: Write> AnsiSink<W> {
+    pub(crate) fn new(out: W) -> Self {
+        Self {
+            out,
+            renderer: TerminalRenderer::new(),
+            markdown: MarkdownStreamState::default(),
+        }
+    }
+
+    fn write_flushed(&mut self, text: &str) -> io::Result<()> {
+        write!(self.out, "{text}")?;
+        self.out.flush()
+    }
+}
+
+impl<W: Write + Send> TurnSink for AnsiSink<W> {
+    fn text_delta(&mut self, text: &str) -> io::Result<()> {
+        match self.markdown.push(&self.renderer, text) {
+            Some(rendered) => self.write_flushed(&rendered),
+            None => Ok(()),
+        }
+    }
+
+    fn text_block(&mut self, text: &str) -> io::Result<()> {
+        let rendered = self.renderer.markdown_to_ansi(text);
+        self.write_flushed(&rendered)
+    }
+
+    fn end_block(&mut self) -> io::Result<()> {
+        match self.markdown.flush(&self.renderer) {
+            Some(rendered) => self.write_flushed(&rendered),
+            None => Ok(()),
+        }
+    }
+
+    fn reasoning_started(&mut self, chars: Option<usize>, redacted: bool) -> io::Result<()> {
+        let summary = if redacted {
+            "\n\u{25b6} Thinking block hidden by provider\n".to_string()
+        } else if let Some(chars) = chars {
+            format!("\n\u{25b6} Thinking ({chars} chars hidden)\n")
+        } else {
+            "\n\u{25b6} Thinking hidden\n".to_string()
+        };
+        self.write_flushed(&summary)
+    }
+
+    fn reasoning_delta(&mut self, _text: &str) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn tool_call(&mut self, _id: &str, name: &str, input: &str, cut_off: bool) -> io::Result<()> {
+        let line = if cut_off {
+            crate::api_client::format_cut_off_tool_call(name, input)
+        } else {
+            format_tool_call_start(name, input)
+        };
+        writeln!(self.out, "\n{line}")?;
+        self.out.flush()
+    }
+
+    fn tool_result(&mut self, name: &str, output: &str, is_error: bool) -> io::Result<()> {
+        let markdown = format_tool_result(name, output, is_error);
+        self.renderer.stream_markdown(&markdown, &mut self.out)
+    }
+}
+
+/// Shows nothing.
+pub(crate) struct SilentSink;
+
+impl TurnSink for SilentSink {
+    fn text_delta(&mut self, _text: &str) -> io::Result<()> {
+        Ok(())
+    }
+    fn text_block(&mut self, _text: &str) -> io::Result<()> {
+        Ok(())
+    }
+    fn end_block(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+    fn reasoning_started(&mut self, _chars: Option<usize>, _redacted: bool) -> io::Result<()> {
+        Ok(())
+    }
+    fn reasoning_delta(&mut self, _text: &str) -> io::Result<()> {
+        Ok(())
+    }
+    fn tool_call(
+        &mut self,
+        _id: &str,
+        _name: &str,
+        _input: &str,
+        _cut_off: bool,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+    fn tool_result(&mut self, _name: &str, _output: &str, _is_error: bool) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Sends structured events to the full-screen UI. A closed UI is an error, so the turn
+/// stops instead of running on with nobody watching.
+pub(crate) struct ChannelSink {
+    events: Sender<UiEvent>,
+    /// Text was sent since the last [`UiEvent::TextBlockEnd`].
+    text_open: bool,
+}
+
+impl ChannelSink {
+    pub(crate) fn new(events: Sender<UiEvent>) -> Self {
+        Self {
+            events,
+            text_open: false,
+        }
+    }
+
+    fn send(&self, event: UiEvent) -> io::Result<()> {
+        self.events
+            .send(event)
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "the Neuron UI closed"))
+    }
+}
+
+impl TurnSink for ChannelSink {
+    fn text_delta(&mut self, text: &str) -> io::Result<()> {
+        self.text_open = true;
+        self.send(UiEvent::TextDelta {
+            text: text.to_string(),
+        })
+    }
+
+    fn text_block(&mut self, text: &str) -> io::Result<()> {
+        self.text_delta(text)?;
+        self.end_block()
+    }
+
+    /// Blocks of every kind end with this call; the UI hears only about text blocks.
+    fn end_block(&mut self) -> io::Result<()> {
+        if !std::mem::take(&mut self.text_open) {
+            return Ok(());
+        }
+        self.send(UiEvent::TextBlockEnd)
+    }
+
+    fn reasoning_started(&mut self, chars: Option<usize>, redacted: bool) -> io::Result<()> {
+        self.send(UiEvent::ReasoningStarted { chars, redacted })
+    }
+
+    fn reasoning_delta(&mut self, text: &str) -> io::Result<()> {
+        self.send(UiEvent::ReasoningDelta {
+            text: text.to_string(),
+        })
+    }
+
+    fn tool_call(&mut self, id: &str, name: &str, input: &str, cut_off: bool) -> io::Result<()> {
+        self.send(UiEvent::ToolCallStarted {
+            id: id.to_string(),
+            name: name.to_string(),
+            input: input.to_string(),
+            cut_off,
+        })
+    }
+
+    fn tool_result(&mut self, name: &str, output: &str, is_error: bool) -> io::Result<()> {
+        self.send(UiEvent::ToolResult {
+            name: name.to_string(),
+            output: output.to_string(),
+            is_error,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    /// The ANSI sink reproduces what the turn loop printed before sinks existed: the same
+    /// renderer, the same separators, the same thinking summaries.
+    #[test]
+    fn ansi_sink_matches_the_previous_terminal_output() {
+        let renderer = TerminalRenderer::new();
+        let mut expected = String::new();
+        let mut markdown = MarkdownStreamState::default();
+        for chunk in ["Hello **wor", "ld**\n\n", "- item\n"] {
+            if let Some(rendered) = markdown.push(&renderer, chunk) {
+                expected.push_str(&rendered);
+            }
+        }
+        if let Some(rendered) = markdown.flush(&renderer) {
+            expected.push_str(&rendered);
+        }
+        expected.push_str("\n\u{25b6} Thinking (42 chars hidden)\n");
+        expected.push_str(&format!(
+            "\n{}\n",
+            format_tool_call_start("read_file", r#"{"path":"src/main.rs"}"#)
+        ));
+        expected.push_str(&renderer.markdown_to_ansi("Done."));
+
+        let mut out = Vec::new();
+        {
+            let mut sink = AnsiSink::new(&mut out);
+            for chunk in ["Hello **wor", "ld**\n\n", "- item\n"] {
+                sink.text_delta(chunk).unwrap();
+            }
+            sink.end_block().unwrap();
+            sink.reasoning_started(Some(42), false).unwrap();
+            sink.reasoning_delta("never shown on the terminal").unwrap();
+            sink.tool_call("toolu_1", "read_file", r#"{"path":"src/main.rs"}"#, false)
+                .unwrap();
+            sink.text_block("Done.").unwrap();
+        }
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
+    }
+
+    #[test]
+    fn channel_sink_sends_structured_events_and_fails_when_the_ui_closes() {
+        let (tx, rx) = mpsc::channel();
+        let mut sink = ChannelSink::new(tx);
+        sink.text_delta("Hi").unwrap();
+        sink.reasoning_started(None, false).unwrap();
+        sink.reasoning_delta("thinking out loud").unwrap();
+        sink.tool_call("toolu_1", "bash", r#"{"command":"ls"}"#, true)
+            .unwrap();
+        sink.tool_result("bash", "a.txt", false).unwrap();
+        sink.end_block().unwrap();
+        sink.end_block().unwrap();
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        assert_eq!(
+            events,
+            vec![
+                UiEvent::TextDelta { text: "Hi".into() },
+                UiEvent::ReasoningStarted {
+                    chars: None,
+                    redacted: false
+                },
+                UiEvent::ReasoningDelta {
+                    text: "thinking out loud".into()
+                },
+                UiEvent::ToolCallStarted {
+                    id: "toolu_1".into(),
+                    name: "bash".into(),
+                    input: r#"{"command":"ls"}"#.into(),
+                    cut_off: true,
+                },
+                UiEvent::ToolResult {
+                    name: "bash".into(),
+                    output: "a.txt".into(),
+                    is_error: false
+                },
+                UiEvent::TextBlockEnd,
+            ]
+        );
+        drop(rx);
+        let error = sink.text_delta("anyone?").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn output_modes_map_from_the_old_emit_flag() {
+        assert!(matches!(TurnOutput::from(true), TurnOutput::Ansi));
+        assert!(matches!(TurnOutput::from(false), TurnOutput::Silent));
+        assert!(!TurnOutput::Silent.is_visible());
+        let (tx, _rx) = mpsc::channel();
+        let channel = TurnOutput::channel(tx.clone());
+        assert!(channel.is_visible());
+        assert_eq!(
+            channel,
+            channel.clone(),
+            "a runtime keeps serving its own UI"
+        );
+        assert_ne!(
+            channel,
+            TurnOutput::channel(tx),
+            "another UI gets a new runtime"
+        );
+        assert_ne!(channel, TurnOutput::Ansi);
+    }
+}

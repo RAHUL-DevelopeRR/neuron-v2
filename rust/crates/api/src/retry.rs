@@ -258,18 +258,27 @@ impl RetryObserver {
     }
 
     /// Progress on stderr. On a terminal the notice is one line that counts
-    /// down to the retry; otherwise (logs, pipes) it is printed once.
+    /// down to the retry; otherwise (logs, pipes) it is printed once. While a
+    /// full-screen UI owns the terminal (`runtime::ui_hooks`), the notice goes
+    /// to it instead, without the in-place countdown.
     #[must_use]
     pub fn stderr() -> Self {
         if !std::io::stderr().is_terminal() {
-            return Self::new(|notice| eprintln!("{}", notice.render()));
+            return Self::new(|notice| runtime::ui_hooks::notice(&notice.render()));
         }
         Self::new(|notice| {
+            if runtime::ui_hooks::notice_handler_installed() {
+                runtime::ui_hooks::notice(&notice.render());
+                return;
+            }
             let mut stderr = std::io::stderr().lock();
             let _ = write!(stderr, "\r\x1b[2K{}", notice.render());
             let _ = stderr.flush();
         })
         .with_countdown(|notice, remaining| {
+            if runtime::ui_hooks::notice_handler_installed() {
+                return;
+            }
             let mut stderr = std::io::stderr().lock();
             let line = notice.render_remaining(remaining);
             let _ = if remaining.is_zero() {

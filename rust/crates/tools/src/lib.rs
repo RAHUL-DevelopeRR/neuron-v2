@@ -1537,11 +1537,10 @@ fn maybe_enforce_permission_check_with_mode(
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
-fn run_ask_user_question(input: AskUserQuestionInput) -> Result<String, String> {
+/// Asks on the terminal: prints the question (and numbered options) and reads one line.
+fn ask_on_terminal(input: &AskUserQuestionInput) -> Result<String, String> {
     use std::io::{self, BufRead, Write};
 
-    // Display the question to the user via stdout
     let stdout = io::stdout();
     let stdin = io::stdin();
     let mut out = stdout.lock();
@@ -1558,12 +1557,25 @@ fn run_ask_user_question(input: AskUserQuestionInput) -> Result<String, String> 
     }
     out.flush().map_err(|e| e.to_string())?;
 
-    // Read user response from stdin
     let mut response = String::new();
     stdin
         .lock()
         .read_line(&mut response)
         .map_err(|e| e.to_string())?;
+    Ok(response)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_ask_user_question(input: AskUserQuestionInput) -> Result<String, String> {
+    // A full-screen UI answers through runtime::ui_hooks; otherwise the terminal prompt.
+    let response = match runtime::ui_hooks::ask_handler() {
+        Some(ask) => ask(&runtime::ui_hooks::UserQuestion {
+            question: input.question.clone(),
+            options: input.options.clone(),
+        })
+        .map_err(|e| e.to_string())?,
+        None => ask_on_terminal(&input)?,
+    };
     let response = response.trim().to_string();
 
     // If options were provided, resolve the numeric choice
@@ -4130,9 +4142,9 @@ impl SubagentApiClient {
                 Ok(entry) => chain.push(entry),
                 Err(error) => {
                     if std::env::var("NEURON_DEBUG").is_ok() {
-                        eprintln!(
+                        runtime::ui_hooks::notice(&format!(
                             "warning: skipping unavailable fallback provider {fallback_model}: {error}"
-                        );
+                        ));
                     }
                 }
             }
@@ -4210,10 +4222,10 @@ impl ApiClient for SubagentApiClient {
                 }
                 Some(Ok(events)) => return Ok(events),
                 Some(Err(error)) if error.is_retryable() && index + 1 < chain.len() => {
-                    eprintln!(
+                    runtime::ui_hooks::notice(&format!(
                         "provider {} failed with retryable error, falling back: {error}",
                         entry.model
-                    );
+                    ));
                     last_error = Some(error);
                 }
                 Some(Err(error)) => return Err(subagent_api_error(&error)),
@@ -5522,9 +5534,9 @@ impl ProviderRuntimeClient {
                 Ok(entry) => chain.push(entry),
                 Err(error) => {
                     if std::env::var("NEURON_DEBUG").is_ok() {
-                        eprintln!(
+                        runtime::ui_hooks::notice(&format!(
                             "warning: skipping unavailable fallback provider {fallback_model}: {error}"
-                        );
+                        ));
                     }
                 }
             }
@@ -5589,10 +5601,10 @@ impl ApiClient for ProviderRuntimeClient {
             match attempt {
                 Ok(events) => return Ok(events),
                 Err(error) if error.is_retryable() && index + 1 < chain.len() => {
-                    eprintln!(
+                    runtime::ui_hooks::notice(&format!(
                         "provider {} failed with retryable error, falling back: {error}",
                         entry.model
-                    );
+                    ));
                     last_error = Some(error);
                 }
                 Err(error) => return Err(RuntimeError::new(error.to_string())),

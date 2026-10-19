@@ -1,3 +1,6 @@
+// Output to the user goes through crate::ui_hooks, so a full-screen UI can own the terminal.
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+
 use std::ffi::OsStr;
 use std::fmt::Write as FmtWrite;
 use std::io::Write;
@@ -705,8 +708,10 @@ fn format_invalid_hook_output(
 fn report_hook_locally(label: &str, command: &str, problem: &str, stderr: &str) {
     let command = bounded_hook_preview(command).unwrap_or_else(|| "<empty>".to_string());
     match bounded_hook_preview(stderr) {
-        Some(stderr) => eprintln!("warning: {label} `{command}` {problem}; stderr: {stderr}"),
-        None => eprintln!("warning: {label} `{command}` {problem}"),
+        Some(stderr) => crate::ui_hooks::notice(&format!(
+            "warning: {label} `{command}` {problem}; stderr: {stderr}"
+        )),
+        None => crate::ui_hooks::notice(&format!("warning: {label} `{command}` {problem}")),
     }
 }
 

@@ -69,6 +69,7 @@ mod status_ui;
 mod stream_buffer;
 mod token_budget;
 mod tool_ui;
+mod turn_sink;
 mod vault;
 
 use std::collections::BTreeSet;
@@ -126,6 +127,7 @@ use tool_ui::*;
 use tools::{
     execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
 };
+use turn_sink::{TurnOutput, TurnSink};
 
 const DEFAULT_MODEL: &str = "auto";
 /// Output budget (`max_tokens`) requested per model call. Models known to the
@@ -1885,6 +1887,24 @@ impl HookAbortMonitor {
         abort_signal: runtime::HookAbortSignal,
         cancel: runtime::CancellationToken,
     ) -> Self {
+        Self::spawn_watching(abort_signal, cancel, None)
+    }
+
+    /// [`Self::spawn_for_turn`] for a turn under the full-screen UI, whose Ctrl-C arrives
+    /// as a key press instead of a signal.
+    fn spawn_for_ui_turn(
+        abort_signal: runtime::HookAbortSignal,
+        cancel: runtime::CancellationToken,
+        presses: repl_loop::InterruptPresses,
+    ) -> Self {
+        Self::spawn_watching(abort_signal, cancel, Some(presses))
+    }
+
+    fn spawn_watching(
+        abort_signal: runtime::HookAbortSignal,
+        cancel: runtime::CancellationToken,
+        presses: Option<repl_loop::InterruptPresses>,
+    ) -> Self {
         Self::spawn_with_waiter(abort_signal, move |stop_rx, abort_signal| {
             let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1897,16 +1917,31 @@ impl HookAbortMonitor {
                 let wait_for_stop = tokio::task::spawn_blocking(move || {
                     let _ = stop_rx.recv();
                 });
-                repl_loop::watch_turn_interrupts(
-                    tokio::signal::ctrl_c,
-                    async {
-                        let _ = wait_for_stop.await;
-                    },
-                    &cancel,
-                    &abort_signal,
-                    repl_loop::request_force_quit,
-                )
-                .await;
+                let turn_ended = async {
+                    let _ = wait_for_stop.await;
+                };
+                match presses {
+                    None => {
+                        repl_loop::watch_turn_interrupts(
+                            tokio::signal::ctrl_c,
+                            turn_ended,
+                            &cancel,
+                            &abort_signal,
+                            repl_loop::request_force_quit,
+                        )
+                        .await;
+                    }
+                    Some(presses) => {
+                        repl_loop::watch_turn_interrupts(
+                            || presses.next_press(),
+                            turn_ended,
+                            &cancel,
+                            &abort_signal,
+                            repl_loop::request_force_quit,
+                        )
+                        .await;
+                    }
+                }
             });
         })
     }
@@ -2204,8 +2239,9 @@ impl LiveCli {
     /// monitor guarding the turn.
     fn prepare_turn_runtime(
         &mut self,
-        emit_output: bool,
+        output: impl Into<TurnOutput>,
     ) -> Result<HookAbortMonitor, Box<dyn std::error::Error>> {
+        let output = output.into();
         // Plan mode structurally strips write tools: instead of asking the
         // model not to write, bash, write_file and edit_file are removed from
         // the tool list so it can only read and search.
@@ -2223,7 +2259,7 @@ impl LiveCli {
         let needs_rebuild = {
             let client = self.runtime.api_client();
             client.allowed_tools() != effective_tools.as_ref()
-                || client.emit_output() != emit_output
+                || *client.output() != output
                 || client.model() != self.model
                 || self.runtime.permission_policy().active_mode() != self.permission_mode
                 || !progress::runtime_uses_current_shared_state(&self.runtime)
@@ -2240,7 +2276,7 @@ impl LiveCli {
                 self.model.clone(),
                 self.system_prompt.clone(),
                 true,
-                emit_output,
+                output,
                 effective_tools,
                 self.permission_mode,
                 None,
@@ -7174,7 +7210,7 @@ UU conflicted.rs",
             OutputContentBlock::Text {
                 text: "# Heading".to_string(),
             },
-            &mut out,
+            &mut crate::turn_sink::AnsiSink::new(&mut out),
             &mut events,
             &mut pending_tool,
             false,
@@ -7200,7 +7236,7 @@ UU conflicted.rs",
                 name: "read_file".to_string(),
                 input: json!({}),
             },
-            &mut out,
+            &mut crate::turn_sink::AnsiSink::new(&mut out),
             &mut events,
             &mut pending_tool,
             true,
@@ -7239,7 +7275,7 @@ UU conflicted.rs",
                 },
                 request_id: None,
             },
-            &mut out,
+            &mut crate::turn_sink::AnsiSink::new(&mut out),
         )
         .expect("response conversion should succeed");
 
@@ -7274,7 +7310,7 @@ UU conflicted.rs",
                 },
                 request_id: None,
             },
-            &mut out,
+            &mut crate::turn_sink::AnsiSink::new(&mut out),
         )
         .expect("response conversion should succeed");
 
@@ -7313,7 +7349,7 @@ UU conflicted.rs",
                 },
                 request_id: None,
             },
-            &mut out,
+            &mut crate::turn_sink::AnsiSink::new(&mut out),
         )
         .expect("response conversion should succeed");
 
@@ -7769,10 +7805,11 @@ fn write_mcp_server_fixture(script_path: &Path) {
 
 #[cfg(test)]
 mod sandbox_report_tests {
-    use super::{format_sandbox_report, HookAbortMonitor};
+    use super::{format_sandbox_report, repl_loop, HookAbortMonitor};
     use runtime::HookAbortSignal;
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn sandbox_report_renders_expected_fields() {
@@ -7820,6 +7857,29 @@ mod sandbox_report_tests {
         monitor.stop();
 
         assert!(abort_signal.is_aborted());
+    }
+
+    #[test]
+    fn ui_turn_monitor_turns_a_key_press_into_an_interrupt() {
+        let abort_signal = HookAbortSignal::new();
+        let cancel = runtime::CancellationToken::new();
+        let presses = repl_loop::InterruptPresses::default();
+        let monitor = HookAbortMonitor::spawn_for_ui_turn(
+            abort_signal.clone(),
+            cancel.clone(),
+            presses.clone(),
+        );
+
+        // One press only: a second would start the force-quit watchdog.
+        presses.press();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !cancel.is_cancelled() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        monitor.stop();
+
+        assert!(cancel.is_cancelled(), "the key press cancels the turn");
+        assert!(abort_signal.is_aborted(), "and aborts running hooks");
     }
 }
 

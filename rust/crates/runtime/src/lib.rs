@@ -60,6 +60,7 @@ pub mod team_cron_registry;
 pub mod transcript;
 #[cfg(test)]
 mod trust_resolver;
+pub mod ui_hooks;
 mod usage;
 pub mod worker_boot;
 pub mod workspace_trust;
