@@ -63,6 +63,57 @@ pub(crate) fn has_repository_filter_drivers(cwd: &Path) -> bool {
     }
 }
 
+/// Regex (for `git config --get-regexp`) matching the config keys that name a
+/// program git runs while producing status or diffs.
+const PROGRAM_CONFIG_REGEX: &str = r"^(core\.fsmonitor|filter\..*\.(clean|smudge|process)|diff\.external|diff\..*\.(command|textconv))$";
+
+/// A program the repository's own `.git/config` (local or worktree scope) tells
+/// git to run while producing status or diffs: an fsmonitor hook, a content
+/// filter driver (`clean`/`smudge`/`process`), or a textconv/external diff
+/// program. The model's own `git status`/`git diff`/`git log -p` run verbatim,
+/// so in an untrusted repo this config would execute without the safe overrides
+/// Neuron applies to its own git commands (see [`git_command`]).
+///
+/// Returns the first such config key, or `None` when none is defined — also on
+/// any git failure, since the git command itself would then fail rather than
+/// run the program, and global/system scope is the user's own, not the repo's.
+/// Reading config runs nothing.
+#[must_use]
+pub(crate) fn repository_program_config_reason(cwd: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args([
+            "config",
+            "--show-scope",
+            "--get-regexp",
+            PROGRAM_CONFIG_REGEX,
+        ])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| {
+            let (scope, rest) = line.split_once('\t')?;
+            if !matches!(scope, "local" | "worktree") {
+                return None;
+            }
+            let (key, value) = rest.split_once(' ').unwrap_or((rest, ""));
+            // `core.fsmonitor=false`/empty disables it; only a set hook matters.
+            if key.eq_ignore_ascii_case("core.fsmonitor")
+                && matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "" | "false" | "0"
+                )
+            {
+                return None;
+            }
+            Some(key.to_string())
+        })
+}
+
 impl GitContext {
     /// Detect the git context from the given working directory.
     ///
