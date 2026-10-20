@@ -55,7 +55,7 @@ async function realLibraryPath(): Promise<string | null> {
 
 let workDir: string
 beforeEach(() => {
-  workDir = mkdtempSync(path.join(tmpdir(), 'freebuff-render-lib-'))
+  workDir = mkdtempSync(path.join(tmpdir(), 'neuron-tui-render-lib-'))
 })
 afterEach(() => {
   rmSync(workDir, { recursive: true, force: true })
@@ -149,7 +149,7 @@ describe('ensureRenderLibrary', () => {
     expect(error).toBeInstanceOf(RenderLibraryLoadError)
     const message = (error as Error).message
     expect(message).toStartWith(
-      'Freebuff could not load its terminal renderer.',
+      'Neuron could not load its terminal renderer.',
     )
     expect(message).toContain('mounted noexec')
     expect(message).toContain('TMPDIR')

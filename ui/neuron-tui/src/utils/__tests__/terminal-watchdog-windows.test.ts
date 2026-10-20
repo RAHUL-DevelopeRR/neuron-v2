@@ -15,7 +15,7 @@ import {
 import type { WindowsWatchdogInspection } from '../terminal-watchdog'
 
 const TMP = 'C:\\Temp'
-const DISARM = `${TMP}\\codebuff-watchdog-disarm-4242-abc123`
+const DISARM = `${TMP}\\neuron-tui-watchdog-disarm-4242-abc123`
 
 function scripts(overrides: { ownerStartOverride?: string } = {}) {
   return buildWindowsWatchdogScripts({
@@ -39,7 +39,7 @@ describe('Windows watchdog scripts', () => {
     const { watchdogScript } = scripts()
     expect(watchdogScript).toContain('Get-Process -Id 4242')
     expect(watchdogScript).toContain(
-      '$o.StartTime.ToFileTimeUtc() - __FREEBUFF_OWNER_START__',
+      '$o.StartTime.ToFileTimeUtc() - __NEURON_TUI_OWNER_START__',
     )
     // The only wait is on the identity-checked handle...
     expect(watchdogScript).toContain('if ($w) { try { $w.WaitForExit() }')
@@ -71,7 +71,7 @@ describe('Windows watchdog scripts', () => {
       '$t = (Get-Process -Id 4242 -ErrorAction Stop).StartTime.ToFileTimeUtc(); ',
     )
     expect(bootstrapScript).toContain(
-      ".Replace('__FREEBUFF_OWNER_START__', [string]$t)",
+      ".Replace('__NEURON_TUI_OWNER_START__', [string]$t)",
     )
   })
 
@@ -113,8 +113,8 @@ describe('inspectWindowsWatchdogMarkers', () => {
   test('a pid file whose owner died but whose watchdog runs is an orphan', () => {
     const { deps, removed } = fakeTmp(
       {
-        'codebuff-watchdog-disarm-100-aaa.pid': { content: '900 100' },
-        'codebuff-watchdog-disarm-100-aaa.armed': { content: 'armed' },
+        'neuron-tui-watchdog-disarm-100-aaa.pid': { content: '900 100' },
+        'neuron-tui-watchdog-disarm-100-aaa.armed': { content: 'armed' },
       },
       [900],
     )
@@ -129,7 +129,7 @@ describe('inspectWindowsWatchdogMarkers', () => {
 
   test('a live owner means a concurrent session, not a leak', () => {
     const { deps } = fakeTmp(
-      { 'codebuff-watchdog-disarm-200-bbb.pid': { content: '901 200' } },
+      { 'neuron-tui-watchdog-disarm-200-bbb.pid': { content: '901 200' } },
       [200, 901],
     )
     expect(inspectWindowsWatchdogMarkers(deps).active).toBe(1)
@@ -138,8 +138,8 @@ describe('inspectWindowsWatchdogMarkers', () => {
   test('files of a watchdog that is provably gone are swept', () => {
     const { deps, removed } = fakeTmp(
       {
-        'codebuff-watchdog-disarm-300-ccc.pid': { content: '902 300' },
-        'codebuff-watchdog-disarm-300-ccc.armed': { content: 'armed' },
+        'neuron-tui-watchdog-disarm-300-ccc.pid': { content: '902 300' },
+        'neuron-tui-watchdog-disarm-300-ccc.armed': { content: 'armed' },
       },
       [],
     )
@@ -147,37 +147,37 @@ describe('inspectWindowsWatchdogMarkers', () => {
     expect(result.orphaned).toBe(0)
     expect(result.legacyStale).toBe(0)
     expect(removed.sort()).toEqual([
-      'codebuff-watchdog-disarm-300-ccc.armed',
-      'codebuff-watchdog-disarm-300-ccc.pid',
+      'neuron-tui-watchdog-disarm-300-ccc.armed',
+      'neuron-tui-watchdog-disarm-300-ccc.pid',
     ])
   })
 
   test('an older-format marker with a dead owner is counted once, then swept', () => {
     const { deps, removed } = fakeTmp(
-      { 'codebuff-watchdog-disarm-400-ddd.armed': { content: 'armed' } },
+      { 'neuron-tui-watchdog-disarm-400-ddd.armed': { content: 'armed' } },
       [],
     )
     expect(inspectWindowsWatchdogMarkers(deps).legacyStale).toBe(1)
-    expect(removed).toEqual(['codebuff-watchdog-disarm-400-ddd.armed'])
+    expect(removed).toEqual(['neuron-tui-watchdog-disarm-400-ddd.armed'])
   })
 
   test('only disarm files an hour past a dead owner are swept', () => {
     const { deps, removed } = fakeTmp(
       {
-        'codebuff-watchdog-disarm-500-eee': { ageMs: 2 * HOUR },
-        'codebuff-watchdog-disarm-501-fff': { ageMs: 60_000 },
-        'codebuff-watchdog-disarm-502-ggg': { ageMs: 2 * HOUR },
+        'neuron-tui-watchdog-disarm-500-eee': { ageMs: 2 * HOUR },
+        'neuron-tui-watchdog-disarm-501-fff': { ageMs: 60_000 },
+        'neuron-tui-watchdog-disarm-502-ggg': { ageMs: 2 * HOUR },
         'unrelated-file.armed': {},
       },
       [502],
     )
     inspectWindowsWatchdogMarkers(deps)
-    expect(removed).toEqual(['codebuff-watchdog-disarm-500-eee'])
+    expect(removed).toEqual(['neuron-tui-watchdog-disarm-500-eee'])
   })
 
   test("this process's own files are never judged", () => {
     const { deps, removed } = fakeTmp(
-      { 'codebuff-watchdog-disarm-1-hhh.pid': { content: '903 1' } },
+      { 'neuron-tui-watchdog-disarm-1-hhh.pid': { content: '903 1' } },
       [903],
     )
     expect(inspectWindowsWatchdogMarkers(deps)).toEqual({

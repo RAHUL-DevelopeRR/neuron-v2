@@ -17,7 +17,7 @@ let tempDir = ''
 
 describe('writeFileAtomic', () => {
   beforeEach(() => {
-    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codebuff-atomic-'))
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'neuron-tui-atomic-'))
   })
 
   afterEach(() => {
@@ -75,7 +75,7 @@ describe('writeFileAtomic', () => {
 
 describe('writeFileAtomicAsync', () => {
   beforeEach(() => {
-    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codebuff-atomic-async-'))
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'neuron-tui-atomic-async-'))
   })
 
   afterEach(() => {
@@ -208,7 +208,7 @@ describe('durability', () => {
   let recorder: ReturnType<typeof recordingFs>
 
   beforeEach(() => {
-    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codebuff-atomic-fsync-'))
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'neuron-tui-atomic-fsync-'))
     recorder = recordingFs()
     setAtomicWriteFsForTesting(recorder.fs)
   })

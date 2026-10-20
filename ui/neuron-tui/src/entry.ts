@@ -4,6 +4,9 @@
 // engine runs tools), so the entry point only starts the UI.
 // See ui/neuron-tui/PORTING.md.
 
+// First, so it captures PATH before the direnv import changes it.
+import './engine/startup-env'
+
 await import('./index')
 
 export {}

@@ -2,7 +2,7 @@
 // See ui/neuron-tui/PORTING.md.
 import { AGENT_MODES } from '../utils/constants'
 
-import type { SkillsMap } from '@codebuff/common/types/skill'
+import type { SkillsMap } from '@neuron-tui/common/types/skill'
 
 export interface SlashCommand {
   id: string

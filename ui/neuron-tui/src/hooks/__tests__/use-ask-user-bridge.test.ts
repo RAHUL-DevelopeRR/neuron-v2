@@ -1,4 +1,4 @@
-import { AskUserBridge } from '@codebuff/common/utils/ask-user-bridge'
+import { AskUserBridge } from '@neuron-tui/common/utils/ask-user-bridge'
 import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test'
 
 

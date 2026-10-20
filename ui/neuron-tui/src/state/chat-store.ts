@@ -4,7 +4,7 @@ import { castDraft, enableMapSet } from 'immer'
 import { create } from 'zustand'
 import { immer } from 'zustand/middleware/immer'
 
-import { AGENT_MODES, IS_FREEBUFF } from '../utils/constants'
+import { AGENT_MODES } from '../utils/constants'
 import { clamp } from '../utils/math'
 import { loadModePreference, saveModePreference } from '../utils/settings'
 
@@ -195,7 +195,7 @@ const initialState: ChatStoreState = {
   isChainInProgress: false,
   slashSelectedIndex: 0,
   agentSelectedIndex: 0,
-  agentMode: IS_FREEBUFF ? ('LITE' as const) : loadModePreference(),
+  agentMode: loadModePreference(),
   hasReceivedPlanResponse: false,
   lastMessageMode: null,
   runState: null,
@@ -282,14 +282,12 @@ export const useChatStore = create<ChatStore>()(
 
     setAgentMode: (mode) =>
       set((state) => {
-        if (IS_FREEBUFF) return
         state.agentMode = mode
         saveModePreference(mode)
       }),
 
     toggleAgentMode: () =>
       set((state) => {
-        if (IS_FREEBUFF) return
         const currentIndex = AGENT_MODES.indexOf(state.agentMode)
         const nextIndex = (currentIndex + 1) % AGENT_MODES.length
         state.agentMode = AGENT_MODES[nextIndex]

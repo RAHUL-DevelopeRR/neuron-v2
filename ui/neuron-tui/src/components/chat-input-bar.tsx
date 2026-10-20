@@ -3,7 +3,7 @@
 import {
   isShallowScanRoot,
   SHALLOW_SCAN_MAX_DEPTH,
-} from '@codebuff/common/project-file-tree'
+} from '@neuron-tui/common/project-file-tree'
 import React from 'react'
 
 import { AgentModeToggle } from './agent-mode-toggle'

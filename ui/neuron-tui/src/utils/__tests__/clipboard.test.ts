@@ -1,6 +1,6 @@
 import { execSync } from 'child_process'
 
-import { createMockTimers } from '@codebuff/common/testing/mocks/timers'
+import { createMockTimers } from '@neuron-tui/common/testing/mocks/timers'
 import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test'
 
 import {
@@ -15,7 +15,7 @@ import {
 } from '../clipboard'
 import { logger } from '../logger'
 
-import type { MockTimers } from '@codebuff/common/testing/mocks/timers'
+import type { MockTimers } from '@neuron-tui/common/testing/mocks/timers'
 
 /**
  * Tests for clipboard.ts functionality.

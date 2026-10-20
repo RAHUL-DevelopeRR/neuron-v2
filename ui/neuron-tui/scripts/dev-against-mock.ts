@@ -79,7 +79,7 @@ Object.assign(env, {
   // Logins go to a file in the temp home, never the OS keychain.
   NEURON_CREDENTIAL_STORE: 'file',
   NEURON_NO_BROWSER: '1',
-  FREEBUFF_CONFIG_DIR: path.join(home, 'tui'),
+  NEURON_TUI_CONFIG_DIR: path.join(home, 'tui'),
   NEURON_BIN: neuronBin,
 })
 const gateway = signedOut ? startFakeGateway() : null

@@ -20,7 +20,6 @@ import * as path from 'path'
 import { serializeConversation } from './copy-conversation'
 import { getCurrentChatId, getProjectRoot } from '../project-files'
 import { useChatStore } from '../state/chat-store'
-import { IS_FREEBUFF } from '../utils/constants'
 import { getSystemMessage } from '../utils/message-history'
 import { serializeForPersistence } from '../utils/safe-json'
 import { writeFileAtomicAsync } from '../utils/write-file-atomic'
@@ -55,7 +54,7 @@ export type ExportResult =
 /**
  * Serialize the conversation and write it to disk. `rawArg` is the optional
  * user-supplied filename, resolved relative to the project root; empty means
- * the default `freebuff-chat-<chatId>.md` in the project root.
+ * the default `neuron-chat-<chatId>.md` in the project root.
  */
 export async function exportConversation(
   messages: ChatMessage[],
@@ -66,7 +65,7 @@ export async function exportConversation(
     const projectRoot = deps.getProjectRoot()
     const fileName =
       rawArg.trim() ||
-      `${IS_FREEBUFF ? 'freebuff' : 'codebuff'}-chat-${deps.getCurrentChatId()}.md`
+      `neuron-chat-${deps.getCurrentChatId()}.md`
     const filePath = path.resolve(projectRoot, fileName)
 
     // path.resolve honors absolute paths and `..`, so without this check

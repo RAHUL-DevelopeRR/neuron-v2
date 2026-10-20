@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'bun:test'
-import { withTimeoutOr } from '@codebuff/common/util/promise'
+import { withTimeoutOr } from '@neuron-tui/common/util/promise'
 
 import {
   getGlobalOscTimeout,

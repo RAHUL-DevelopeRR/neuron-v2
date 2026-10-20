@@ -2,7 +2,7 @@ import type { BaseEnv, ProcessEnv } from './types/contracts/env'
 
 /**
  * Test-only helpers for process env snapshots.
- * Keep production code using `@codebuff/common/env-process`.
+ * Keep production code using `@neuron-tui/common/env-process`.
  */
 export const createTestBaseEnv = (
   overrides: Partial<BaseEnv> = {},
@@ -55,20 +55,18 @@ export const createTestProcessEnv = (
   // Editor preferences
   VISUAL: undefined,
   EDITOR: undefined,
-  CODEBUFF_CLI_EDITOR: undefined,
-  CODEBUFF_EDITOR: undefined,
+  NEURON_TUI_EDITOR: undefined,
+  NEURON_EDITOR: undefined,
 
   // Theme preferences
   OPEN_TUI_THEME: undefined,
   OPENTUI_THEME: undefined,
 
   // Codebuff CLI-specific
-  CODEBUFF_IS_BINARY: undefined,
-  CODEBUFF_CLI_VERSION: undefined,
-  CODEBUFF_CLI_TARGET: undefined,
-  CODEBUFF_RG_PATH: undefined,
-  CODEBUFF_WASM_DIR: undefined,
-  CODEBUFF_TRUSTED_AGENT_PUBLISHERS: undefined,
+  NEURON_TUI_IS_BINARY: undefined,
+  NEURON_TUI_VERSION: undefined,
+  NEURON_TUI_TARGET: undefined,
+  NEURON_TUI_RG_PATH: undefined,
 
   // Build/CI flags
   VERBOSE: undefined,

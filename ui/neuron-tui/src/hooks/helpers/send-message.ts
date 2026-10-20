@@ -1,6 +1,6 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
 // See ui/neuron-tui/PORTING.md.
-import { getErrorObject } from '@codebuff/common/util/error'
+import { getErrorObject } from '@neuron-tui/common/util/error'
 
 import { getProjectRoot } from '../../project-files'
 import { useChatStore } from '../../state/chat-store'

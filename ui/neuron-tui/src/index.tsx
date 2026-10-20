@@ -8,7 +8,7 @@
 import fs from 'fs'
 import os from 'os'
 
-import { getProjectFileTree } from '@codebuff/common/project-file-tree'
+import { getProjectFileTree } from '@neuron-tui/common/project-file-tree'
 import {
   createCliRenderer,
   resolveRenderLib,
@@ -50,7 +50,7 @@ import { installTerminalProtocolController } from './utils/terminal-protocol-con
 import { detectTerminalTheme } from './utils/terminal-color-detection'
 import { setOscDetectedTheme } from './utils/theme-system'
 
-import type { FileTreeNode } from '@codebuff/common/util/file'
+import type { FileTreeNode } from '@neuron-tui/common/util/file'
 
 // Configure TanStack Query's focusManager for terminal environments
 // This is required because there's no browser visibility API in terminal apps

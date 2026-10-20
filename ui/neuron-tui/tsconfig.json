@@ -19,7 +19,7 @@
     "types": ["bun"],
     "baseUrl": ".",
     "paths": {
-      "@codebuff/common/*": ["./src/vendor/common/*"]
+      "@neuron-tui/common/*": ["./src/vendor/common/*"]
     }
   },
   "include": ["src/**/*", "scripts/**/*.ts", "test/**/*.ts"],

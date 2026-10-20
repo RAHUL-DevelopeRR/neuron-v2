@@ -33,8 +33,8 @@ export type ParsedArgs = {
 
 export function loadPackageVersion(): string {
   const env = getCliEnv()
-  if (env.CODEBUFF_CLI_VERSION) {
-    return env.CODEBUFF_CLI_VERSION
+  if (env.NEURON_TUI_VERSION) {
+    return env.NEURON_TUI_VERSION
   }
 
   try {
@@ -59,8 +59,8 @@ export function parseArgs({
   const program = new Command()
 
   program
-    .name('codebuff')
-    .description('Codebuff CLI - AI-powered coding assistant')
+    .name('neuron')
+    .description('Neuron: an AI coding agent in your terminal')
     .version(version, '-v, --version', 'Print the CLI version')
     .option(
       '--clear-logs',

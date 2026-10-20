@@ -1,6 +1,6 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: env vars
 // that only fed removed features are gone. See ui/neuron-tui/PORTING.md.
-import { createTestBaseEnv } from '@codebuff/common/testing-env-process'
+import { createTestBaseEnv } from '@neuron-tui/common/testing-env-process'
 
 import type { CliEnv } from '../types/env'
 
@@ -34,15 +34,14 @@ export const createTestCliEnv = (overrides: Partial<CliEnv> = {}): CliEnv => ({
   JB_IDE_CONFIG_DIR: undefined,
   VISUAL: undefined,
   EDITOR: undefined,
-  CODEBUFF_CLI_EDITOR: undefined,
-  CODEBUFF_EDITOR: undefined,
+  NEURON_TUI_EDITOR: undefined,
+  NEURON_EDITOR: undefined,
   OPEN_TUI_THEME: undefined,
   OPENTUI_THEME: undefined,
-  CODEBUFF_IS_BINARY: undefined,
-  CODEBUFF_CLI_VERSION: undefined,
-  CODEBUFF_CLI_TARGET: undefined,
-  CODEBUFF_RG_PATH: undefined,
-  CODEBUFF_TRUSTED_AGENT_PUBLISHERS: undefined,
-  CODEBUFF_SCROLL_MULTIPLIER: undefined,
+  NEURON_TUI_IS_BINARY: undefined,
+  NEURON_TUI_VERSION: undefined,
+  NEURON_TUI_TARGET: undefined,
+  NEURON_TUI_RG_PATH: undefined,
+  NEURON_TUI_SCROLL_MULTIPLIER: undefined,
   ...overrides,
 })

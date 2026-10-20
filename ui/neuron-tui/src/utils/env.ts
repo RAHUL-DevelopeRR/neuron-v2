@@ -7,7 +7,7 @@
  * process env with CLI-specific vars for terminal/IDE detection.
  */
 
-import { getBaseEnv } from '@codebuff/common/env-process'
+import { getBaseEnv } from '@neuron-tui/common/env-process'
 
 import type { CliEnv } from '../types/env'
 
@@ -71,25 +71,23 @@ export const getCliEnv = (): CliEnv => ({
   // Editor preferences
   VISUAL: process.env.VISUAL,
   EDITOR: process.env.EDITOR,
-  CODEBUFF_CLI_EDITOR: process.env.CODEBUFF_CLI_EDITOR,
-  CODEBUFF_EDITOR: process.env.CODEBUFF_EDITOR,
+  NEURON_TUI_EDITOR: process.env.NEURON_TUI_EDITOR,
+  NEURON_EDITOR: process.env.NEURON_EDITOR,
 
   // Theme preferences
   OPEN_TUI_THEME: process.env.OPEN_TUI_THEME,
   OPENTUI_THEME: process.env.OPENTUI_THEME,
 
   // Binary build configuration
-  CODEBUFF_IS_BINARY: process.env.CODEBUFF_IS_BINARY,
-  CODEBUFF_CLI_VERSION: process.env.CODEBUFF_CLI_VERSION,
-  CODEBUFF_CLI_TARGET: process.env.CODEBUFF_CLI_TARGET,
-  CODEBUFF_RG_PATH: process.env.CODEBUFF_RG_PATH,
-  CODEBUFF_TRUSTED_AGENT_PUBLISHERS:
-    process.env.CODEBUFF_TRUSTED_AGENT_PUBLISHERS,
-  CODEBUFF_SCROLL_MULTIPLIER: process.env.CODEBUFF_SCROLL_MULTIPLIER,
-  CODEBUFF_PERF_TEST: process.env.CODEBUFF_PERF_TEST,
-  CODEBUFF_LAUNCHER_PID: process.env.CODEBUFF_LAUNCHER_PID,
-  CODEBUFF_NO_TERMINAL_WATCHDOG: process.env.CODEBUFF_NO_TERMINAL_WATCHDOG,
-  FREEBUFF_CONFIG_DIR: process.env.FREEBUFF_CONFIG_DIR,
+  NEURON_TUI_IS_BINARY: process.env.NEURON_TUI_IS_BINARY,
+  NEURON_TUI_VERSION: process.env.NEURON_TUI_VERSION,
+  NEURON_TUI_TARGET: process.env.NEURON_TUI_TARGET,
+  NEURON_TUI_RG_PATH: process.env.NEURON_TUI_RG_PATH,
+  NEURON_TUI_SCROLL_MULTIPLIER: process.env.NEURON_TUI_SCROLL_MULTIPLIER,
+  NEURON_TUI_PERF_TEST: process.env.NEURON_TUI_PERF_TEST,
+  NEURON_TUI_LAUNCHER_PID: process.env.NEURON_TUI_LAUNCHER_PID,
+  NEURON_TUI_NO_TERMINAL_WATCHDOG: process.env.NEURON_TUI_NO_TERMINAL_WATCHDOG,
+  NEURON_TUI_CONFIG_DIR: process.env.NEURON_TUI_CONFIG_DIR,
 
   TZ: process.env.TZ,
   HTTPS_PROXY: process.env.HTTPS_PROXY,

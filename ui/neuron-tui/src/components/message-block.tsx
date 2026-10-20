@@ -165,7 +165,7 @@ export const MessageBlock = memo(({
     },
     {
       logLevel: 'debug',
-      enabled: getCliEnv().CODEBUFF_PERF_TEST === 'true',
+      enabled: getCliEnv().NEURON_TUI_PERF_TEST === 'true',
     },
   )
 

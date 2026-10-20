@@ -1,4 +1,4 @@
-import { pluralize } from '@codebuff/common/util/string'
+import { pluralize } from '@neuron-tui/common/util/string'
 import { useMemo } from 'react'
 
 

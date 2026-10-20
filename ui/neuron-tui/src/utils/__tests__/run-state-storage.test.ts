@@ -31,7 +31,7 @@ afterAll(() => {
 })
 
 // Mock the project-files module
-const mockProjectDataDir = path.join(TEST_ROOT, 'codebuff-test-project')
+const mockProjectDataDir = path.join(TEST_ROOT, 'neuron-tui-test-project')
 const mockCurrentChatDir = path.join(
   mockProjectDataDir,
   'chats',
@@ -134,7 +134,7 @@ describe('live chat state provider', () => {
   // Point persistence at a temp dir via the explicit test override — module
   // seams (mock.module, HOME, spyOn on auth) are unreliable across bun test
   // files and platforms.
-  const chatDir = path.join(TEST_ROOT, 'codebuff-test-live-chatdir')
+  const chatDir = path.join(TEST_ROOT, 'neuron-tui-test-live-chatdir')
 
   const testRunState = (marker: string): RunState =>
     ({
@@ -223,7 +223,7 @@ describe('live chat state provider', () => {
 })
 
 describe('atomic save and resilient load', () => {
-  const chatDir = path.join(TEST_ROOT, 'codebuff-test-resilient-chatdir')
+  const chatDir = path.join(TEST_ROOT, 'neuron-tui-test-resilient-chatdir')
 
   const runState = { output: { type: 'error', message: 'x' } } as RunState
   const messages: ChatMessage[] = [
@@ -294,7 +294,7 @@ describe('atomic save and resilient load', () => {
 })
 
 describe('scheduleCheckpointSave (async, coalescing)', () => {
-  const chatDir = path.join(TEST_ROOT, 'codebuff-test-checkpoint-chatdir')
+  const chatDir = path.join(TEST_ROOT, 'neuron-tui-test-checkpoint-chatdir')
 
   const runState = (marker: string) =>
     ({ output: { type: 'error', message: marker } }) as unknown as RunState
@@ -374,8 +374,8 @@ describe('chat switches while saves are pending', () => {
   // be resolved at write time from the mutable current chat id, so a pending
   // write from chat A could land in chat B's directory after a /new or
   // /history resume rotated the id in between.
-  const chatDirA = path.join(TEST_ROOT, 'codebuff-test-switch-chat-a')
-  const chatDirB = path.join(TEST_ROOT, 'codebuff-test-switch-chat-b')
+  const chatDirA = path.join(TEST_ROOT, 'neuron-tui-test-switch-chat-a')
+  const chatDirB = path.join(TEST_ROOT, 'neuron-tui-test-switch-chat-b')
 
   const runState = (marker: string) =>
     ({ output: { type: 'error', message: marker } }) as unknown as RunState
@@ -499,7 +499,7 @@ describe('chat switches while saves are pending', () => {
 })
 
 describe('poisoned payload persistence', () => {
-  const chatDir = path.join(TEST_ROOT, 'codebuff-test-poisoned-chatdir')
+  const chatDir = path.join(TEST_ROOT, 'neuron-tui-test-poisoned-chatdir')
 
   const messages: ChatMessage[] = [
     {
@@ -579,7 +579,7 @@ describe('poisoned payload persistence', () => {
  * that, and both of them are one-way doors unless the bytes are kept.
  */
 describe('a transcript is never destroyed', () => {
-  const chatDir = path.join(TEST_ROOT, 'codebuff-test-nulled-chatdir')
+  const chatDir = path.join(TEST_ROOT, 'neuron-tui-test-nulled-chatdir')
 
   const runState = { output: { type: 'error', message: 'x' } } as RunState
   const messages: ChatMessage[] = [

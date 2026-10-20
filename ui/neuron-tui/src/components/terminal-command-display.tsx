@@ -1,4 +1,4 @@
-import { sanitizeTerminalOutput } from '@codebuff/common/util/terminal-safe-text'
+import { sanitizeTerminalOutput } from '@neuron-tui/common/util/terminal-safe-text'
 import { TextAttributes } from '@opentui/core'
 import { useState } from 'react'
 

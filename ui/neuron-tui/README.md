@@ -7,16 +7,17 @@ protocol of `neuron engine --stdio` (`src/engine/`).
 
 What was taken out of Freebuff, and why, is in [PORTING.md](PORTING.md).
 
-## Status (P3)
+## Status (P4: rebranded, not yet packaged)
 
 The UI starts `neuron engine --stdio` in the project folder and runs real
 turns through it: streamed text, tool calls and results, and permission
 prompts. It also covers the Zero-X sign-in (`/login`, with the device code
-shown in the UI), the model picker (`/model`) and a status footer. The Neuron
-branding and packaging are P4 (see [PORTING.md](PORTING.md)).
+shown in the UI), the model picker (`/model`) and a status footer. It carries
+Neuron's name and logo. Shipping it in the npm and PyPI packages is the rest
+of P4 (see [PORTING.md](PORTING.md)).
 
 It finds the engine through `NEURON_BIN`, then a `neuron` binary beside the
-UI, then PATH. `--model`, `--provider`, `--permission-mode`,
+UI, then the PATH it started with. `--model`, `--provider`, `--permission-mode`,
 `--allow-broad-cwd` and `--dangerously-skip-permissions` pass through to the
 engine.
 
@@ -62,5 +63,5 @@ against a local fake gateway instead, to try the sign-in, `/model` and
 `bun test src/engine/__tests__/engine.integration.test.ts`.
 
 Settings, chat history and logs go to `~/.neuron/tui` (override with an
-absolute `FREEBUFF_CONFIG_DIR`). `NEURON_TUI_ENV=dev` logs to
+absolute `NEURON_TUI_CONFIG_DIR`). `NEURON_TUI_ENV=dev` logs to
 `<project>/debug/cli.jsonl` instead of the chat folder.

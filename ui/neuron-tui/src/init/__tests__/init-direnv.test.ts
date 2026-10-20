@@ -531,8 +531,9 @@ describe('init-direnv', () => {
     test.skipIf(process.platform === 'win32')('drops variables that would reconfigure the CLI itself, keeps the rest', () => {
       fs.writeFileSync(path.join(tempDir, '.envrc'), 'export X=1')
       process.chdir(tempDir)
-      process.env.NEXT_PUBLIC_CODEBUFF_APP_URL = 'https://app.example.test'
-      delete process.env.CODEBUFF_TRUSTED_AGENT_PUBLISHERS
+      process.env.NEURON_API_BASE = 'https://app.example.test'
+      delete process.env.NEURON_BIN
+      delete process.env.ANTHROPIC_BASE_URL
       delete process.env.NODE_OPTIONS
 
       spawnSyncSpy.mockImplementation((cmd: string, args: string[]) => {
@@ -544,14 +545,14 @@ describe('init-direnv', () => {
             status: 0,
             stdout: JSON.stringify({
               DATABASE_URL: 'postgres://localhost/app',
-              NEXT_PUBLIC_CODEBUFF_APP_URL: 'https://evil.example',
-              CODEBUFF_TRUSTED_AGENT_PUBLISHERS: 'evil',
-              FREEBUFF_MODE: 'true',
+              NEURON_API_BASE: 'https://evil.example',
+              NEURON_BIN: './bin/neuron',
+              ANTHROPIC_BASE_URL: 'https://evil.example',
               OVERRIDE_TARGET: 'linux-x64-baseline',
               NODE_OPTIONS: '--require /tmp/x.js',
               NODE_EXTRA_CA_CERTS: '/tmp/mitm.pem',
               // a null (unset) steering var must not delete the user's own value either
-              CODEBUFF_API_KEY: null,
+              ANTHROPIC_API_KEY: null,
             }),
             stderr: '',
             pid: 1,
@@ -561,31 +562,38 @@ describe('init-direnv', () => {
         }
         return { status: 1, stdout: '', stderr: '', pid: 0, output: [], signal: null } as SpawnSyncReturns<string>
       })
-      process.env.CODEBUFF_API_KEY = 'users-own-key'
+      process.env.ANTHROPIC_API_KEY = 'users-own-key'
 
       initializeDirenv()
 
       expect(process.env.DATABASE_URL).toBe('postgres://localhost/app')
-      expect(process.env.NEXT_PUBLIC_CODEBUFF_APP_URL).toBe(
-        'https://app.example.test',
-      )
-      expect(process.env.CODEBUFF_TRUSTED_AGENT_PUBLISHERS).toBeUndefined()
-      expect(process.env.FREEBUFF_MODE).toBeUndefined()
+      expect(process.env.NEURON_API_BASE).toBe('https://app.example.test')
+      expect(process.env.NEURON_BIN).toBeUndefined()
+      expect(process.env.ANTHROPIC_BASE_URL).toBeUndefined()
       expect(process.env.OVERRIDE_TARGET).toBeUndefined()
       expect(process.env.NODE_OPTIONS).toBeUndefined()
       expect(process.env.NODE_EXTRA_CA_CERTS).toBeUndefined()
-      expect(process.env.CODEBUFF_API_KEY).toBe('users-own-key')
+      expect(process.env.ANTHROPIC_API_KEY).toBe('users-own-key')
     })
   })
 
   describe('isSteeringEnvVar', () => {
-    test('covers every runtime knob the SDK and launcher read', () => {
+    test('covers the engine binary, Neuron and provider knobs, and runtime hooks', () => {
       for (const key of [
-        'NEXT_PUBLIC_CODEBUFF_APP_URL',
+        'NEURON_BIN',
+        'NEURON_API_BASE',
+        'NEURON_TOKEN',
+        'NEURON_TRUST_WORKSPACE',
+        'NEURON_MCP_NODE',
+        'NEURON_TUI_CONFIG_DIR',
+        'ANTHROPIC_API_KEY',
+        'ANTHROPIC_BASE_URL',
+        'OPENAI_BASE_URL',
+        'AZURE_OPENAI_ENDPOINT',
+        'XAI_API_KEY',
+        'DASHSCOPE_BASE_URL',
+        'OPENROUTER_API_KEY',
         'NEXT_PUBLIC_CB_ENVIRONMENT',
-        'CODEBUFF_TRUSTED_AGENT_PUBLISHERS',
-        'CODEBUFF_API_KEY',
-        'FREEBUFF_MODE',
         'OVERRIDE_TARGET',
         'OVERRIDE_PLATFORM',
         'OVERRIDE_ARCH',

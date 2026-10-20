@@ -8,7 +8,7 @@
  * Usage:
  * - Import `getBaseEnv` for base OS-level vars only
  * - Import `getProcessEnv` for the full ProcessEnv (base + extensions)
- * - In tests, use `@codebuff/common/testing-env-process`
+ * - In tests, use `@neuron-tui/common/testing-env-process`
  */
 
 import type { BaseEnv, ProcessEnv } from './types/contracts/env'
@@ -67,21 +67,18 @@ export const getProcessEnv = (): ProcessEnv => ({
   // Editor preferences
   VISUAL: process.env.VISUAL,
   EDITOR: process.env.EDITOR,
-  CODEBUFF_CLI_EDITOR: process.env.CODEBUFF_CLI_EDITOR,
-  CODEBUFF_EDITOR: process.env.CODEBUFF_EDITOR,
+  NEURON_TUI_EDITOR: process.env.NEURON_TUI_EDITOR,
+  NEURON_EDITOR: process.env.NEURON_EDITOR,
 
   // Theme preferences
   OPEN_TUI_THEME: process.env.OPEN_TUI_THEME,
   OPENTUI_THEME: process.env.OPENTUI_THEME,
 
   // Codebuff CLI-specific
-  CODEBUFF_IS_BINARY: process.env.CODEBUFF_IS_BINARY,
-  CODEBUFF_CLI_VERSION: process.env.CODEBUFF_CLI_VERSION,
-  CODEBUFF_CLI_TARGET: process.env.CODEBUFF_CLI_TARGET,
-  CODEBUFF_RG_PATH: process.env.CODEBUFF_RG_PATH,
-  CODEBUFF_WASM_DIR: process.env.CODEBUFF_WASM_DIR,
-  CODEBUFF_TRUSTED_AGENT_PUBLISHERS:
-    process.env.CODEBUFF_TRUSTED_AGENT_PUBLISHERS,
+  NEURON_TUI_IS_BINARY: process.env.NEURON_TUI_IS_BINARY,
+  NEURON_TUI_VERSION: process.env.NEURON_TUI_VERSION,
+  NEURON_TUI_TARGET: process.env.NEURON_TUI_TARGET,
+  NEURON_TUI_RG_PATH: process.env.NEURON_TUI_RG_PATH,
 
   // Build/CI flags
   VERBOSE: process.env.VERBOSE,

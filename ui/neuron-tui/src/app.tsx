@@ -19,7 +19,7 @@ import { findGitRoot } from './utils/git'
 
 import type { MultilineInputHandle } from './components/multiline-input'
 import type { AgentMode } from './utils/constants'
-import type { FileTreeNode } from '@codebuff/common/util/file'
+import type { FileTreeNode } from '@neuron-tui/common/util/file'
 
 interface AppProps {
   initialPrompt: string | null

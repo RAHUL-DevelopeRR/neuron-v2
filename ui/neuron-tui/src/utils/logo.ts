@@ -1,29 +1,31 @@
 // Derived from Codebuff/Freebuff cli/src/login/constants.ts and utils.ts
 // (Apache-2.0); modified for Neuron: only the logo art and its sheen helpers
-// are kept, without the login flow and its Codebuff/Freebuff URLs. The logo
-// itself is replaced by the rebrand (P4). See ui/neuron-tui/PORTING.md.
+// are kept, without the login flow and its Codebuff/Freebuff URLs, and the
+// logo is now Neuron's. See ui/neuron-tui/PORTING.md.
 
-// Codebuff ASCII Logo - compact version for 80-width terminals
-const LOGO_CODEBUFF = `
-  ██████╗ ██████╗ ██████╗ ███████╗██████╗ ██╗   ██╗███████╗███████╗
- ██╔════╝██╔═══██╗██╔══██╗██╔════╝██╔══██╗██║   ██║██╔════╝██╔════╝
- ██║     ██║   ██║██║  ██║█████╗  ██████╔╝██║   ██║█████╗  █████╗
- ██║     ██║   ██║██║  ██║██╔══╝  ██╔══██╗██║   ██║██╔══╝  ██╔══╝
- ╚██████╗╚██████╔╝██████╔╝███████╗██████╔╝╚██████╔╝██║     ██║
-  ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝╚═════╝  ╚═════╝ ╚═╝     ╚═╝
+// Neuron ASCII logo, in the block style of the logo it replaces; 54 columns
+// wide, so it fits the full-logo slot (70+ columns).
+export const LOGO = `
+ ███╗   ██╗███████╗██╗   ██╗██████╗  ██████╗ ███╗   ██╗
+ ████╗  ██║██╔════╝██║   ██║██╔══██╗██╔═══██╗████╗  ██║
+ ██╔██╗ ██║█████╗  ██║   ██║██████╔╝██║   ██║██╔██╗ ██║
+ ██║╚██╗██║██╔══╝  ██║   ██║██╔══██╗██║   ██║██║╚██╗██║
+ ██║ ╚████║███████╗╚██████╔╝██║  ██║╚██████╔╝██║ ╚████║
+ ╚═╝  ╚═══╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝
 `
 
-const LOGO_SMALL_CODEBUFF = `
-  ██████╗ ██████╗
- ██╔════╝ ██╔══██╗
- ██║      ██████╔╝
- ██║      ██╔══██╗
- ╚██████╗ ██████╔╝
-  ╚═════╝ ╚═════╝
+// The N alone, for narrower terminals.
+export const LOGO_SMALL = `
+ ███╗   ██╗
+ ████╗  ██║
+ ██╔██╗ ██║
+ ██║╚██╗██║
+ ██║ ╚████║
+ ╚═╝  ╚═══╝
 `
 
-export const LOGO = LOGO_CODEBUFF
-export const LOGO_SMALL = LOGO_SMALL_CODEBUFF
+/** What the logo collapses to when even the small one does not fit. */
+export const TEXT_LOGO = 'NEURON'
 
 // Shadow/border characters that receive the sheen animation effect
 export const SHADOW_CHARS = new Set([

@@ -2,13 +2,8 @@
 // See ui/neuron-tui/PORTING.md.
 import type { ToolName } from '../types/agent-run'
 
-/**
- * Freebuff's build flag (the free-only variant). Neuron always runs the
- * standard UI: the free-mode session, catalog and billing paths it selected
- * are gone, and what remains of it only picks Freebuff/Codebuff wording that
- * the rebrand (P4) replaces. Pinned false so no env var can turn it on.
- */
-export const IS_FREEBUFF = false as boolean
+/** The command users type to start this UI (in messages such as "run X --continue"). */
+export const CLI_COMMAND = 'neuron'
 
 // Agent IDs that should not be rendered in the CLI UI. Matched as substrings
 // so both bundled ids ('context-pruner') and publisher-qualified ids
@@ -157,7 +152,7 @@ const HARNESS_MODE_IDS = {
  */
 export const AGENT_MODE_TO_ID = {
   DEFAULT: HARNESS_MODE_IDS[CLI_HARNESS].DEFAULT,
-  LITE: IS_FREEBUFF ? 'base2-free' : HARNESS_MODE_IDS[CLI_HARNESS].LITE,
+  LITE: HARNESS_MODE_IDS[CLI_HARNESS].LITE,
   MAX: 'base2-max',
   PLAN: 'base2-plan',
 } as const

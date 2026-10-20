@@ -61,7 +61,6 @@ import { useMessageBlockStore } from './state/message-block-store'
 import { stopActiveRun } from './utils/active-run'
 import { showClipboardMessage } from './utils/clipboard'
 import { readClipboardImage } from './utils/clipboard-image'
-import { IS_FREEBUFF } from './utils/constants'
 import { getSystemMessage } from './utils/message-history'
 import { getInputModeConfig } from './utils/input-modes'
 import {
@@ -91,7 +90,7 @@ import type { CommandResult } from './commands/command-registry'
 import type { MultilineInputHandle } from './components/multiline-input'
 import type { MatchedSlashCommand } from './hooks/use-suggestion-engine'
 import type { AgentMode } from './utils/constants'
-import type { FileTreeNode } from '@codebuff/common/util/file'
+import type { FileTreeNode } from '@neuron-tui/common/util/file'
 import type { BoxRenderable, ScrollBoxRenderable } from '@opentui/core'
 
 export const Chat = ({
@@ -117,11 +116,9 @@ export const Chat = ({
   const chatSessionId = useChatStore((state) => state.chatSessionId)
   useEffect(() => setTodoPanelOpen(false), [chatSessionId])
 
-  // First-time onboarding: show clickable starter prompts until the user
-  // submits their first prompt ever (persisted in settings). Freebuff only.
-  const [showSuggestedPrompts, setShowSuggestedPrompts] = useState(
-    () => IS_FREEBUFF && !hasSubmittedFirstPrompt(),
-  )
+  // Freebuff's first-run starter prompts are off: they suggested Freebuff's
+  // own tasks. The component stays for a Neuron set later.
+  const [showSuggestedPrompts, setShowSuggestedPrompts] = useState(false)
 
   // Subscribe to ask_user bridge to trigger form display
   useAskUserBridge()
@@ -531,10 +528,10 @@ export const Chat = ({
         })
     }
 
-    globalThis.addEventListener('codebuff:send-followup', handleFollowupClick)
+    globalThis.addEventListener('neuron:send-followup', handleFollowupClick)
     return () => {
       globalThis.removeEventListener(
-        'codebuff:send-followup',
+        'neuron:send-followup',
         handleFollowupClick,
       )
     }
@@ -1259,7 +1256,7 @@ export const Chat = ({
             flexDirection: 'column',
             gap: 0,
             shouldFill: true,
-            justifyContent: IS_FREEBUFF ? 'flex-start' : 'flex-end',
+            justifyContent: 'flex-end',
             backgroundColor: 'transparent',
             paddingLeft: 1,
             paddingRight: 2,

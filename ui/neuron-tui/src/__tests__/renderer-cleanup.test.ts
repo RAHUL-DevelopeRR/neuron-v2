@@ -74,7 +74,7 @@ async function runFixture(
     '100',
     '-y',
     '20',
-    `FREEBUFF_CONFIG_DIR=${configDir} ` +
+    `NEURON_TUI_CONFIG_DIR=${configDir} ` +
       (mode === 'launcher-disconnect'
         ? `node ${LAUNCHER_FIXTURE} observe ${FIXTURE}`
         : `bun ${FIXTURE} ${mode}`),

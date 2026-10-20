@@ -43,7 +43,7 @@ export const AgentBranchItem = memo((props: AgentBranchItemProps) => {
   } = props
   useWhyDidYouUpdateById('AgentBranchItem', agentId ?? '', props, {
     logLevel: 'debug',
-    enabled: getCliEnv().CODEBUFF_PERF_TEST === 'true',
+    enabled: getCliEnv().NEURON_TUI_PERF_TEST === 'true',
   })
   const theme = useTheme()
 

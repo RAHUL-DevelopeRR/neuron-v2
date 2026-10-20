@@ -1,10 +1,8 @@
 import * as ignore from 'ignore'
 
-export const PROJECT_IGNORE_FILES = [
-  '.gitignore',
-  '.codebuffignore',
-  '.manicodeignore',
-] as const
+// The engine honours .gitignore only, so the UI's file picker does too
+// (Codebuff also read .codebuffignore and .manicodeignore).
+export const PROJECT_IGNORE_FILES = ['.gitignore'] as const
 
 export type DirIgnore = { base: string; ig: ignore.Ignore }
 

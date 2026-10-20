@@ -100,30 +100,37 @@ export function getDirenvExport(envrcDir: string): Record<string, string | null>
 }
 
 /**
- * Variables a repository's `.envrc` may NOT set on the CLI's own process.
+ * Variables a repository's `.envrc` may NOT set on the UI's own process.
  *
  * The direnv import exists so the agent's terminal commands see the user's
  * project environment. But it runs at startup, into the same `process.env`
- * the CLI and SDK read their own configuration from — so a cloned repo could
- * point the launcher's binary download and the credential-bearing API plane
- * at another host (`NEXT_PUBLIC_CODEBUFF_APP_URL`, the F-2 / Chain F vector
- * in the September assessment), trust its own registry publisher
- * (`CODEBUFF_TRUSTED_AGENT_PUBLISHERS`), pick which binary the launcher
- * installs (`OVERRIDE_*`), preload code into Node (`NODE_OPTIONS`), or make a
- * MITM proxy trusted (`NODE_EXTRA_CA_CERTS`, `NODE_TLS_REJECT_UNAUTHORIZED`).
+ * the UI reads its configuration from and starts the engine with. So a cloned
+ * repo could otherwise:
+ * - run its own program as the engine (`NEURON_BIN`), or as an MCP server
+ *   (`NEURON_MCP_NODE`, `NEURON_*_MCP_ENTRY`);
+ * - send the Zero-X session to another host (`NEURON_API_BASE`), swap the
+ *   login (`NEURON_TOKEN`), or trust its own workspace
+ *   (`NEURON_TRUST_WORKSPACE`);
+ * - route prompts, and the code in them, to an account or endpoint it controls
+ *   (`ANTHROPIC_API_KEY`, `OPENAI_BASE_URL`, ...);
+ * - preload code into Node or Bun (`NODE_OPTIONS`), or make a MITM proxy
+ *   trusted (`NODE_EXTRA_CA_CERTS`, `NODE_TLS_REJECT_UNAUTHORIZED`).
  * `direnv allow` is consent to the repo's env for the repo's tooling, not to
  * reconfigure the agent that is about to run in it. Anything matching here is
  * dropped from the import and named in one warning; the user's real shell
- * environment is untouched, so setting these deliberately still works.
+ * environment is untouched, so setting these deliberately still works. (A
+ * `PATH` change is imported, but the engine binary is looked up on the PATH
+ * from before the import: see engine/startup-env.ts.)
  *
- * Prefix matches are deliberate: every product/env knob in `sdk/src/types/env.ts`
- * and `cli/src/utils/env.ts` lives under one of these prefixes, and a new knob
- * must not need a new entry here to be protected.
+ * Prefix matches are deliberate: every Neuron knob (the engine's and this
+ * UI's `NEURON_TUI_*`) and every provider's lives under one of these
+ * prefixes, so a new knob needs no new entry here to be protected.
  * @internal
  */
 export const STEERING_ENV_VAR_PATTERNS: readonly RegExp[] = [
-  /^CODEBUFF_/,
-  /^FREEBUFF_/,
+  /^NEURON_/,
+  // The providers the engine can use: credentials, endpoints, models.
+  /^(ANTHROPIC|OPENAI|AZURE_OPENAI|XAI|GROK|DASHSCOPE|OPENROUTER|MISTRAL|CLAWD)_/,
   /^NEXT_PUBLIC_/,
   /^OVERRIDE_(TARGET|PLATFORM|ARCH)$/,
   /^NODE_OPTIONS$/,

@@ -7,7 +7,7 @@
  * their own name and the generic tool row.
  */
 
-import type { ToolResultOutput } from '@codebuff/common/types/messages/content-part'
+import type { ToolResultOutput } from '@neuron-tui/common/types/messages/content-part'
 
 export interface MappedToolCall {
   /** The renderer's tool name (a Freebuff tool name, or Neuron's own). */

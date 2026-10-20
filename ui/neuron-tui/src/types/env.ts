@@ -9,7 +9,7 @@
  * - Binary build configuration
  */
 
-import type { BaseEnv } from '@codebuff/common/types/contracts/env'
+import type { BaseEnv } from '@neuron-tui/common/types/contracts/env'
 
 /**
  * CLI-specific env vars for terminal/IDE detection and editor preferences.
@@ -69,29 +69,28 @@ export type CliEnv = BaseEnv & {
   // Editor preferences
   VISUAL?: string
   EDITOR?: string
-  CODEBUFF_CLI_EDITOR?: string
-  CODEBUFF_EDITOR?: string
+  NEURON_TUI_EDITOR?: string
+  NEURON_EDITOR?: string
 
   // Theme preferences
   OPEN_TUI_THEME?: string
   OPENTUI_THEME?: string
 
   // Codebuff CLI-specific (set during binary build)
-  CODEBUFF_IS_BINARY?: string
-  CODEBUFF_CLI_VERSION?: string
-  CODEBUFF_CLI_TARGET?: string
-  CODEBUFF_RG_PATH?: string
+  NEURON_TUI_IS_BINARY?: string
+  NEURON_TUI_VERSION?: string
+  NEURON_TUI_TARGET?: string
+  NEURON_TUI_RG_PATH?: string
   // Comma-separated registry publishers whose agents may run executable
   // handleSteps on this machine; read by the SDK (sdk/src/agent-publisher-trust.ts)
-  CODEBUFF_TRUSTED_AGENT_PUBLISHERS?: string
-  CODEBUFF_SCROLL_MULTIPLIER?: string
-  CODEBUFF_PERF_TEST?: string
-  CODEBUFF_LAUNCHER_PID?: string
+  NEURON_TUI_SCROLL_MULTIPLIER?: string
+  NEURON_TUI_PERF_TEST?: string
+  NEURON_TUI_LAUNCHER_PID?: string
   // Set to 1/true to suppress the terminal-reset watchdog on machines where
   // the PowerShell process shape conflicts with endpoint-security policy.
-  CODEBUFF_NO_TERMINAL_WATCHDOG?: string
+  NEURON_TUI_NO_TERMINAL_WATCHDOG?: string
   /** Absolute per-process override for isolated CLI settings and transcripts. */
-  FREEBUFF_CONFIG_DIR?: string
+  NEURON_TUI_CONFIG_DIR?: string
 
   // Read only for presence/shape by the client environment descriptor
   // (utils/client-environment.ts); never sent raw.

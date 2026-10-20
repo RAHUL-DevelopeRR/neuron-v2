@@ -13,7 +13,7 @@ import {
   PROJECT_IGNORE_FILES,
 } from './util/project-ignore'
 
-import type { CodebuffFileSystem } from './types/filesystem'
+import type { ProjectFileSystem } from './types/filesystem'
 import type { DirectoryNode, FileTreeNode } from './util/file'
 import type { DirIgnore } from './util/project-ignore'
 
@@ -31,7 +31,7 @@ function logFileTreeError(
   error: unknown,
 ): void {
   // Only log in debug mode to avoid noisy output
-  if (!process.env.DEBUG && !process.env.CODEBUFF_DEBUG) {
+  if (!process.env.DEBUG && !process.env.NEURON_TUI_DEBUG) {
     return
   }
 
@@ -89,7 +89,7 @@ export function isShallowScanRoot(
 export async function getProjectFileTree(params: {
   projectRoot: string
   maxFiles?: number
-  fs: CodebuffFileSystem
+  fs: ProjectFileSystem
   /**
    * Gitignore-style patterns skipped during the walk, on top of the defaults,
    * so what they hide is never counted against `maxFiles`.
@@ -203,7 +203,7 @@ export async function getProjectFileTree(params: {
 
 async function parseGitignoreWithMode(params: {
   fullDirPath: string
-  fs: CodebuffFileSystem
+  fs: ProjectFileSystem
   throwOnReadError: boolean
 }): Promise<ignore.Ignore> {
   const { fullDirPath, fs, throwOnReadError } = params
@@ -242,7 +242,7 @@ async function parseGitignoreWithMode(params: {
 
 export async function parseGitignore(params: {
   fullDirPath: string
-  fs: CodebuffFileSystem
+  fs: ProjectFileSystem
 }): Promise<ignore.Ignore> {
   return parseGitignoreWithMode({ ...params, throwOnReadError: false })
 }
@@ -305,7 +305,7 @@ export function getLastReadFilePaths(
 export async function isFileIgnored(params: {
   filePath: string
   projectRoot: string
-  fs: CodebuffFileSystem
+  fs: ProjectFileSystem
   /** Allow the env template past built-in rules while strictly applying project rules. */
   allowEnvTemplate?: boolean
 }): Promise<boolean> {

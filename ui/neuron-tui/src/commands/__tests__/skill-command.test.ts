@@ -12,7 +12,7 @@ import { buildSkillPrompt } from '../prompt-builders'
 import { routeUserPrompt } from '../router'
 
 import type { RouterParams } from '../command-registry'
-import type { SkillDefinition } from '@codebuff/common/types/skill'
+import type { SkillDefinition } from '@neuron-tui/common/types/skill'
 
 const TEST_SKILL: SkillDefinition = {
   name: 'release-notes',

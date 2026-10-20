@@ -66,14 +66,14 @@ const SCENARIOS: Scenario[] = [
   ...OPT_OUT_VALUES.map((value): Scenario => ({
     key: `optout-${value}`,
     mode: 'hang',
-    env: { CODEBUFF_NO_TERMINAL_WATCHDOG: value },
+    env: { NEURON_TUI_NO_TERMINAL_WATCHDOG: value },
     kill: true,
     expectWrite: false,
   })),
   {
     key: 'optout-noise',
     mode: 'hang',
-    env: { CODEBUFF_NO_TERMINAL_WATCHDOG: '0' },
+    env: { NEURON_TUI_NO_TERMINAL_WATCHDOG: '0' },
     kill: true,
     expectWrite: true,
   },
@@ -134,11 +134,11 @@ function listTmp(): string[] {
 
 /**
  * Disarm files a fixture left in the temp dir (Windows watchdog only; POSIX
- * never creates one). Named codebuff-watchdog-disarm-<pid>-<random>.
+ * never creates one). Named neuron-tui-watchdog-disarm-<pid>-<random>.
  */
 function findDisarmFiles(pid: number | undefined, names = listTmp()): string[] {
   return names.filter((name) =>
-    name.startsWith(`codebuff-watchdog-disarm-${pid}-`),
+    name.startsWith(`neuron-tui-watchdog-disarm-${pid}-`),
   )
 }
 
@@ -160,7 +160,7 @@ function startRun(scenario: Scenario, index: number): Run {
   // one `.armed` marker) now that every fixture runs at the same time.
   const ttyPath = join(tempDir, `${index}-${scenario.key}.out`)
   const childEnv = { ...process.env }
-  delete childEnv.CODEBUFF_NO_TERMINAL_WATCHDOG
+  delete childEnv.NEURON_TUI_NO_TERMINAL_WATCHDOG
   const child = spawn(process.execPath, [FIXTURE, scenario.mode, ttyPath], {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: { ...childEnv, ...scenario.env },
@@ -359,7 +359,7 @@ describe('terminal watchdog (fixture processes)', () => {
   })
 
   test.each(OPT_OUT_VALUES)(
-    'never arms when CODEBUFF_NO_TERMINAL_WATCHDOG=%s',
+    'never arms when NEURON_TUI_NO_TERMINAL_WATCHDOG=%s',
     (value) => {
       const run = runFor(`optout-${value}`)
       expect(run.ready).toBe(true)

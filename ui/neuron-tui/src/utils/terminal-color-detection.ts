@@ -12,7 +12,7 @@
 import { openSync, closeSync, writeSync, constants } from 'fs'
 
 import { getCliEnv } from './env'
-import { withTimeoutOr } from '@codebuff/common/util/promise'
+import { withTimeoutOr } from '@neuron-tui/common/util/promise'
 
 import type { CliEnv } from '../types/env'
 

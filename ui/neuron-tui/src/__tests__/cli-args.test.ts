@@ -6,7 +6,7 @@ import { describe, test, expect } from 'bun:test'
 import { parseArgs } from '../cli-args'
 
 const parse = (...args: string[]) =>
-  parseArgs({ argv: ['node', 'codebuff', ...args], version: '1.0.0' })
+  parseArgs({ argv: ['node', 'neuron', ...args], version: '1.0.0' })
 
 describe('CLI argument parsing', () => {
   test('joins the remaining words into the initial prompt', () => {

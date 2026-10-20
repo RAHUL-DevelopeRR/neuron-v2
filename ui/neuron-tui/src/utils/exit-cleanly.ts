@@ -2,7 +2,7 @@
 // longer flushes analytics, client logs, ad engagement or survey pings, ends a
 // Freebuff session, or settles a sponsored run. It shuts the engine down
 // instead. See ui/neuron-tui/PORTING.md.
-import { withTimeoutOr } from '@codebuff/common/util/promise'
+import { withTimeoutOr } from '@neuron-tui/common/util/promise'
 
 import { getNeuronEngineClient } from '../engine/neuron-engine-client'
 

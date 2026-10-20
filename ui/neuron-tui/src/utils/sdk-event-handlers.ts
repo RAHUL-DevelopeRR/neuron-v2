@@ -35,7 +35,7 @@ import type { MessageUpdater } from './message-updater'
 import type { StreamController } from '../hooks/stream-state'
 import type { StreamStatus } from '../hooks/use-message-queue'
 import type { ContentBlock, ToolContentBlock } from '../types/chat'
-import type { Logger } from '@codebuff/common/types/contracts/logger'
+import type { Logger } from '@neuron-tui/common/types/contracts/logger'
 import type {
   PrintModeError,
   PrintModeEvent as SDKEvent,
@@ -44,7 +44,7 @@ import type {
   PrintModeSubagentStart,
   PrintModeToolCall,
   PrintModeToolResult,
-} from '@codebuff/common/types/print-mode'
+} from '@neuron-tui/common/types/print-mode'
 import type { ToolName } from '../types/agent-run'
 import type { MutableRefObject } from 'react'
 

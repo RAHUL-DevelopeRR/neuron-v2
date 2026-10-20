@@ -32,7 +32,7 @@ replaced it, and what is left for later milestones.
 | Agents, skills, agent store | Bundled agents (`agents/`, `scripts/prebuild-agents.ts`, `test/setup-agents-artifact.ts`). `.agents/` loading and its trust gate (`agent-dir-trust.ts`, `--trust-agents`), mcp.json. Agent validation before each send. `--agent`, `/publish` (store, mutation, screens). `/init`, which wrote Codebuff's `knowledge.md` and the `.agents/types` templates. | Codebuff's agent system and agent store. The engine owns Neuron's agents and skills. `utils/local-agent-registry.ts` and `utils/skill-registry.ts` remain as empty registries until the engine reports them. |
 | Ads | `src/ads/` (10 files). Display, inline and response ad cards, the sponsor dock and its panel, partner rows (`ad-banner`, `partner-ad-line`, `use-gravity-ad`, `use-dock-panel`, `use-partner-suggestion`, `use-composer-intent`). Ad positions and lazy response ads, the ad client identity, the ad trace context in the chat store, and the `allowInlineAds` marker on messages. `/ads:*`. The `gravity_index` tool renderer and the Gravity link references in `render_ui`. Every `noteAd*` call (event handlers, message queue, composer, router), and the ad-rotation activity tracking. | Codebuff's ad network. |
 | Sponsored proposals and runs | `utils/sponsored-*` (17 files), the sponsored-run store and proposal hook, the proposal block and dock, and the account prompt. The sponsored turn in the chat runtime and the send path. The sponsored project-identity marker that `setProjectRoot` wrote into every Git project. The profile/sponsored survey box, its store, machine and keys. | Advertiser-run tasks and surveys: Codebuff services. |
-| Free-mode waiting room and session queue | The Freebuff session: store, API, display, identity, relaunch, instance owner, device key, chat admission and capacity wait. The model catalog, store, directory and the 1,900-line model selector. Streak, referral, premium reset and Freebucks. The Freebuff chat header, footer, controls, session summary and paused-plan notice. `/model`, `/reasoning`, `/end-session`, `/dashboard`. The Freebuff picks in settings. `IS_FREEBUFF` is pinned to `false` (see below). | Freebuff's hosted free-capacity service. Neuron's model picker comes from the engine in P3. The message queue for prompts sent during a turn is kept: it is UI, not the waiting room. |
+| Free-mode waiting room and session queue | The Freebuff session: store, API, display, identity, relaunch, instance owner, device key, chat admission and capacity wait. The model catalog, store, directory and the 1,900-line model selector. Streak, referral, premium reset and Freebucks. The Freebuff chat header, footer, controls, session summary and paused-plan notice. `/model`, `/reasoning`, `/end-session`, `/dashboard`. The Freebuff picks in settings. The `IS_FREEBUFF` build flag (removed in the rebrand, see below). | Freebuff's hosted free-capacity service. Neuron's model picker comes from the engine in P3. The message queue for prompts sent during a turn is kept: it is UI, not the waiting room. |
 | Codebuff login, credits and billing | `login/` (5 files): login flow, plain login, Discord invite. The login modal, auth query and state hooks, login polling, the keychain token store, `utils/auth.ts`, `utils/codebuff-api.ts` and the fingerprint. Usage and subscription queries, monitors and banners. The out-of-credits and subscription-limit input modes. Credits in the message footer and run completion. The Codebuff credit, free-mode, rate-limit and session-gate error classifiers (`utils/error-handling.ts`). `/login`, `/logout`, `/usage`, `/subscribe`, and the `login` and `publish` CLI commands. The post-login Discord banner. | Sign-in comes from the engine (device code, P3), and tokens stay in Rust. |
 | BYOK | `utils/byok.ts`, `/byok`, the BYOK connection store, BYOK pinning in the send path and settings, and the BYOK label in the status bar. | Providers and keys are configured in the engine. |
 | Telemetry | PostHog analytics and all 24 `trackEvent` calls. The Axiom log shipper and the logger's analytics mirroring. The engagement heartbeat, Windows helper-process census and terminal-health reports, client-environment probe, fatal-crash report, persistent anonymous id, input-typing profile, survey events, SDK trace writer and AI-SDK warning logger. Feedback (`/feedback`, its store and components): it was sent to Codebuff. The Codebuff backend health poller (`connection-monitor`). | Codebuff telemetry. The logger now writes only to a local file: the chat's `log.jsonl`, or `<project>/debug/cli.jsonl` with `NEURON_TUI_ENV=dev`. |
@@ -73,16 +73,68 @@ rewritten for what remains:
 | `src/utils/runtime-env.ts` | `IS_DEV`, `IS_TEST` and `IS_CI`, which came from Codebuff's env schema. |
 | `src/utils/tool-display.ts`, `src/utils/logo.ts` | Display helpers kept from removed modules (`codebuff-client.ts`, `login/`). |
 | `src/utils/exit-cleanly.ts` | Exit now runs local cleanup, then a bounded engine `shutdown`. |
-| `src/utils/config-dir.ts` | Settings, chat history and logs now go to `~/.neuron/tui`. Freebuff used `~/.config/manicode`, which Codebuff itself still writes. `FREEBUFF_CONFIG_DIR` still overrides it. |
+| `src/utils/config-dir.ts` | Settings, chat history and logs now go to `~/.neuron/tui`. Freebuff used `~/.config/manicode`, which Codebuff itself still writes. `NEURON_TUI_CONFIG_DIR` still overrides it. |
 | `scripts/run-tests.ts` | `bun run test` without `find`, so it works on Windows. |
 | `scripts/dev-against-mock.ts` | P2: `bun run dev:mock [prompt]` runs the UI against the real engine and the mock Anthropic service (`PARITY_SCENARIO:<name>` prompts), in a throwaway home and workspace. No account or network is needed. With `--signed-out` (P3), the engine starts signed out against `scripts/fake-zero-x-gateway.ts`, which approves a `/login` at the first poll and serves a two-model catalog. Logins go to a file in the temp home, never the OS keychain. |
 | `test/setup-env.ts` | Test preload: runtime flags only, no Codebuff service env. |
 
-`IS_FREEBUFF` (`src/utils/constants.ts`) is pinned to `false`, so no env var can
-turn back on the paths it gated. Its remaining 22 uses only choose
-Freebuff/Codebuff wording, which the rebrand removes.
+## Rebrand (P4)
 
-## Behaviour today (P3)
+- `IS_FREEBUFF` is gone. Each of its uses kept the branch Neuron already ran
+  (`false`), so behaviour did not change.
+- Users now see Neuron's names:
+  - a new NEURON block logo in `utils/logo.ts`;
+  - "Neuron will run commands on your behalf", and "You started Neuron in a
+    subdirectory…";
+  - `neuron` in `--help`, the terminal title, the exit hint
+    (`neuron --continue <id>`, from `CLI_COMMAND`) and `neuron-chat-<id>.md`
+    exports;
+  - the renderer-library error messages.
+- The help banner had kept Codebuff's billing line ("/subscribe · /usage · 1
+  credit = 1 cent") and hid `/model`. Now it lists `/model` and `/login` in
+  place of `@agents` (Freebuff's agent store).
+- Env vars are renamed to `NEURON_TUI_*`: `CONFIG_DIR`, `VERSION`, `IS_BINARY`,
+  `TARGET`, `RG_PATH`, `SCROLL_MULTIPLIER`, `PERF_TEST`, `LAUNCHER_PID`,
+  `NO_TERMINAL_WATCHDOG`, `RUN_TMUX_TESTS` and `DEBUG`. `NEURON_TUI_EDITOR`
+  replaces `CODEBUFF_CLI_EDITOR`, and `NEURON_EDITOR` replaces `CODEBUFF_EDITOR`.
+  The agent-store and SDK knobs (`CODEBUFF_TRUSTED_AGENT_PUBLISHERS`,
+  `CODEBUFF_API_KEY`, `CODEBUFF_WASM_DIR`, ...) are gone.
+- Internal names are renamed too:
+  - the alias `@codebuff/common` → `@neuron-tui/common`;
+  - `codebuff:send-followup` → `neuron:send-followup`;
+  - the watchdog's `neuron-tui-watchdog-disarm-*` files and
+    `__NEURON_TUI_OWNER_START__` token;
+  - the `.neuron-tui-native-bundle.json` receipt;
+  - `neuron-tui-clipboard-images`;
+  - `CodebuffFileSystem` → `ProjectFileSystem`.
+- The `@` file picker reads `.gitignore` only, as the engine does. It no longer
+  reads `.codebuffignore` or `.manicodeignore`.
+- What stays: the "Derived from Codebuff/Freebuff" headers and the LICENSE and
+  NOTICE files (Apache-2.0 attribution), comments about where code came from,
+  and `codebuff/<agent>@<version>` ids in tests of the id parser.
+
+### A repository's `.envrc` can no longer steer the engine
+
+Freebuff imports a project's direnv environment at startup (`init/init-direnv.ts`)
+and drops the variables that would reconfigure the CLI itself. P2 made the UI
+start the engine with its environment. So the drop list was Codebuff's
+(`CODEBUFF_*`, `FREEBUFF_*`, `NEXT_PUBLIC_*`), and a cloned repo could have
+done any of these:
+
+- set `NEURON_BIN` to run its own program as the engine;
+- set `NEURON_API_BASE` to send the Zero-X session to its own host;
+- set a provider key or base URL to route prompts elsewhere.
+
+The list now drops `NEURON_*` (the engine's and this UI's knobs) and the
+providers' prefixes (`ANTHROPIC_`, `OPENAI_`, `AZURE_OPENAI_`, `XAI_`,
+`GROK_`, `DASHSCOPE_`, `OPENROUTER_`, `MISTRAL_`, `CLAWD_`). It still imports
+`PATH`, so the agent's commands see the project's tools. The `neuron` binary,
+though, is looked up on the PATH from before the import
+(`engine/startup-env.ts`), so a repo can't put its own `neuron` first.
+`HTTPS_PROXY` stays importable, as upstream chose; TLS trust variables stay
+blocked.
+
+## Behaviour today (P4, before packaging)
 
 - `bun run dev` starts the UI and, once a project folder is known, the engine
   in it. The status bar says "starting the engine..." until `ready`.
@@ -105,6 +157,8 @@ Freebuff/Codebuff wording, which the rebrand removes.
   - Opening the session after a sign-in took about 40 s on the debug build,
     most of it starting MCP servers. The panel says "Starting your session…"
     meanwhile.
+  - After the rebrand, `streaming_text` shows the NEURON logo, "Neuron will
+    run commands on your behalf", and the footer with live token counts.
 - `!cmd` and `/bash` show "Shell commands (!) are not available in this build of
   the Neuron UI yet."
 - These slash commands are the UI's own: `help`, `new`, `copy`, `export`,
@@ -127,17 +181,14 @@ Freebuff/Codebuff wording, which the rebrand removes.
 - **Still open from P3:**
   - Decide whether `!cmd` runs in the UI or in the engine.
   - `@tanstack/react-query` is still mounted in `index.tsx`, but nothing uses
-    it now: the model list polls with a timer. It can go in P4.
+    it now: the model list polls with a timer. Removing it changes the
+    lockfile, so it waits for a dependency pass.
+  - The agent modes (DEFAULT, LITE, MAX, PLAN; the `< DEFAULT` toggle, the mode
+    divider, `--lite`/`--max`/`--plan`) change only how the UI presents a turn.
+    The engine ignores them. Hide them, or map PLAN to the engine's plan mode.
   - The engine's signed-out notice says "Sign in with `neuron auth login` ...",
     which is the terminal's wording; the sign-in panel says `/login`.
-- **P4 (rebrand and packaging):**
-  - Remove the Codebuff/Freebuff names users can see: the logo in
-    `utils/logo.ts`, "Codebuff will run commands on your behalf", the program
-    name in `--help`, `IS_FREEBUFF` wording, and export file names.
-  - Rename the internal ones: the `@codebuff/common` alias, `CODEBUFF_*`/
-    `FREEBUFF_*` env vars, the `codebuff:send-followup` event, the
-    `.freebuff-native-bundle.json` receipt, and the `codebuff`/`freebuff` names
-    in direnv's steering list.
+- **P4 packaging:**
   - `bun build --compile` per release target. Freebuff's
     `cli/scripts/build-binary.ts` shows how it embedded the OpenTUI native
     library.
@@ -157,3 +208,7 @@ Freebuff/Codebuff wording, which the rebrand removes.
   - In a folder under a git repo, Freebuff's banner offers to switch to the git
     root, even when that root is the home folder, which the engine then refuses
     as too broad.
+  - The engine gets the UI's environment after the direnv import, minus the
+    blocked variables. Its own lookups on PATH (`node`/`npx` for MCP servers)
+    can therefore find a project's tools first, as they would in a shell that
+    loaded direnv.

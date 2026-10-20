@@ -5,7 +5,7 @@
 // Codebuff SDK. Neuron's engine owns skills, so the cache starts empty and is
 // filled only by tests until the engine reports its skills.
 
-import type { SkillDefinition, SkillsMap } from '@codebuff/common/types/skill'
+import type { SkillDefinition, SkillsMap } from '@neuron-tui/common/types/skill'
 
 let skillsCache: SkillsMap = {}
 

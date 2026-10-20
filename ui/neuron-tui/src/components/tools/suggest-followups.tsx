@@ -347,7 +347,7 @@ export const SuggestFollowupsComponent = defineToolComponent({
     const handleSendFollowup = (prompt: string, index: number) => {
       // This gets called from the FollowupCard component
       // The actual logic is handled via the global followup handler
-      const event = new CustomEvent('codebuff:send-followup', {
+      const event = new CustomEvent('neuron:send-followup', {
         detail: { prompt, index, toolCallId },
       })
       globalThis.dispatchEvent(event)

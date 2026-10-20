@@ -80,8 +80,6 @@ export type BaseEnv = {
  * Used by agent-runtime and server code.
  */
 export type CiEnv = BaseCiEnv & {
-  CODEBUFF_GITHUB_TOKEN?: string
-  CODEBUFF_API_KEY?: string
   EVAL_RESULTS_EMAIL?: string
 }
 
@@ -117,22 +115,18 @@ export type ProcessEnv = BaseEnv & {
   // Editor preferences
   VISUAL?: string
   EDITOR?: string
-  CODEBUFF_CLI_EDITOR?: string
-  CODEBUFF_EDITOR?: string
+  NEURON_TUI_EDITOR?: string
+  NEURON_EDITOR?: string
 
   // Theme preferences
   OPEN_TUI_THEME?: string
   OPENTUI_THEME?: string
 
   // Codebuff CLI-specific (set during binary build)
-  CODEBUFF_IS_BINARY?: string
-  CODEBUFF_CLI_VERSION?: string
-  CODEBUFF_CLI_TARGET?: string
-  CODEBUFF_RG_PATH?: string
-  CODEBUFF_WASM_DIR?: string
-  // Comma-separated registry publishers whose agents may run executable
-  // handleSteps on this machine (see sdk/src/agent-publisher-trust.ts)
-  CODEBUFF_TRUSTED_AGENT_PUBLISHERS?: string
+  NEURON_TUI_IS_BINARY?: string
+  NEURON_TUI_VERSION?: string
+  NEURON_TUI_TARGET?: string
+  NEURON_TUI_RG_PATH?: string
 
   // Build/CI flags
   VERBOSE?: string

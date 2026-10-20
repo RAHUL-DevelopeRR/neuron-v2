@@ -10,14 +10,14 @@ import { execSync } from 'child_process'
  * This checks both that tmux is installed AND that it can actually run
  * (e.g., the tmux server socket directory exists and is accessible).
  *
- * Returns false on CI unless CODEBUFF_RUN_TMUX_TESTS=1 explicitly opts into
+ * Returns false on CI unless NEURON_TUI_RUN_TMUX_TESTS=1 explicitly opts into
  * running deterministic tmux tests in a known terminal environment.
  */
 export function isTmuxAvailable(): boolean {
   // Skip on CI - tmux integration tests need a real terminal environment
   if (
     (process.env.CI === 'true' || process.env.CI === '1') &&
-    process.env.CODEBUFF_RUN_TMUX_TESTS !== '1'
+    process.env.NEURON_TUI_RUN_TMUX_TESTS !== '1'
   ) {
     return false
   }
@@ -27,7 +27,7 @@ export function isTmuxAvailable(): boolean {
     execSync('which tmux', { stdio: 'pipe' })
     // Then verify tmux can actually run by creating and killing a test session
     // This will fail if tmux server can't start (e.g., no socket directory on CI)
-    execSync('tmux new-session -d -s __codebuff_tmux_check__ && tmux kill-session -t __codebuff_tmux_check__', {
+    execSync('tmux new-session -d -s __neuron_tui_tmux_check__ && tmux kill-session -t __neuron_tui_tmux_check__', {
       stdio: 'pipe',
       timeout: 5000,
     })

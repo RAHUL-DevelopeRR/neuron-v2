@@ -3,7 +3,6 @@ import { TextAttributes } from '@opentui/core'
 
 import { useTheme } from '../hooks/use-theme'
 import { useTerminalDimensions } from '../hooks/use-terminal-dimensions'
-import { IS_FREEBUFF } from '../utils/constants'
 
 const SECTIONS = [
   {
@@ -11,7 +10,7 @@ const SECTIONS = [
     rows: [
       ['/', 'Commands'],
       ['@files', 'Mention files'],
-      ['@agents', 'Use an agent'],
+      ['/login', 'Sign in to Zero-X'],
       ['Ctrl+J', 'New line'],
       ['Opt+Enter', 'New line'],
       ['/bash', 'Shell command'],
@@ -24,7 +23,7 @@ const SECTIONS = [
       ['←', 'History (empty input)'],
       ['↑ / ↓', 'Prompts (empty input)'],
       ['/new', 'New chat'],
-      ['/model', 'Model / reasoning'],
+      ['/model', 'Pick the model'],
       ['Ctrl+Q', 'Edit queued messages'],
     ],
   },
@@ -48,7 +47,7 @@ export const HelpBanner = () => {
   const width = Math.max(16, terminalWidth - 4)
   const columnWidth = Math.min(37, width)
   const columns = Math.max(1, Math.floor((width + 2) / (columnWidth + 2)))
-  const contentRows = Math.ceil(SECTIONS.length / columns) * 8 - 1 + (IS_FREEBUFF ? 0 : 2)
+  const contentRows = Math.ceil(SECTIONS.length / columns) * 8 - 1
   return (
     <box
       style={{
@@ -100,9 +99,7 @@ export const HelpBanner = () => {
               >
                 {section.title}
               </text>
-              {section.rows
-                .filter(([key]) => IS_FREEBUFF || key !== '/model')
-                .map(([key, description]) => (
+              {section.rows.map(([key, description]) => (
                   <box key={key} style={{ flexDirection: 'row' }}>
                     <text
                       style={{ fg: theme.primary, width: 11, flexShrink: 0 }}
@@ -125,11 +122,6 @@ export const HelpBanner = () => {
             </box>
           ))}
         </box>
-        {!IS_FREEBUFF && (
-          <text style={{ fg: theme.muted, marginTop: 1 }}>
-            /subscribe · /usage · 1 credit = 1 cent
-          </text>
-        )}
       </scrollbox>
     </box>
   )

@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events'
 import { Writable } from 'node:stream'
 
-import { createMockTimers } from '@codebuff/common/testing/mocks/timers'
+import { createMockTimers } from '@neuron-tui/common/testing/mocks/timers'
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 
 import {
@@ -18,7 +18,7 @@ import {
 import { logger } from '../logger'
 
 import type { ChildProcess } from 'node:child_process'
-import type { MockTimers } from '@codebuff/common/testing/mocks/timers'
+import type { MockTimers } from '@neuron-tui/common/testing/mocks/timers'
 
 type SpawnSyncResult = ReturnType<
   typeof import('node:child_process').spawnSync

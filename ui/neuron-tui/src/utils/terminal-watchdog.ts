@@ -185,7 +185,7 @@ function psQuote(value: string): string {
  * Placeholder the bootstrap replaces with the owner's creation time (a Windows
  * FILETIME) before launching the grandchild. Only digits ever replace it.
  */
-const OWNER_START_TOKEN = '__FREEBUFF_OWNER_START__'
+const OWNER_START_TOKEN = '__NEURON_TUI_OWNER_START__'
 
 /** Two reads of one creation time agree exactly; 1ms of slack absorbs rounding. */
 const OWNER_START_TOLERANCE_TICKS = 10_000
@@ -308,10 +308,10 @@ function spawnWindowsWatchdog(options: {
 
 // ------------------------------------------------ leaked-watchdog inspection
 
-const WATCHDOG_FILE_PREFIX = 'codebuff-watchdog-disarm-'
-const PID_FILE_PATTERN = /^codebuff-watchdog-disarm-(\d+)-[a-z0-9]+\.pid$/
-const ARMED_MARKER_PATTERN = /^codebuff-watchdog-disarm-(\d+)-[a-z0-9]+\.armed$/
-const DISARM_FILE_PATTERN = /^codebuff-watchdog-disarm-(\d+)-[a-z0-9]+$/
+const WATCHDOG_FILE_PREFIX = 'neuron-tui-watchdog-disarm-'
+const PID_FILE_PATTERN = /^neuron-tui-watchdog-disarm-(\d+)-[a-z0-9]+\.pid$/
+const ARMED_MARKER_PATTERN = /^neuron-tui-watchdog-disarm-(\d+)-[a-z0-9]+\.armed$/
+const DISARM_FILE_PATTERN = /^neuron-tui-watchdog-disarm-(\d+)-[a-z0-9]+$/
 
 /** The file a watchdog keeps for exactly as long as it runs. */
 export function windowsWatchdogPidPath(disarmPath: string): string {
@@ -502,7 +502,7 @@ const isTruthy = (value: string | undefined): boolean =>
  * terminal modes. No-op when stdout isn't a TTY (unless an explicit ttyPath
  * is injected, e.g. in tests), or if already started.
  *
- * Also a no-op when CODEBUFF_NO_TERMINAL_WATCHDOG is set. This remains an
+ * Also a no-op when NEURON_TUI_NO_TERMINAL_WATCHDOG is set. This remains an
  * explicit escape hatch for Windows endpoint-security policies that reject the
  * out-of-job PowerShell grandchild used by the recovery path.
  *
@@ -527,7 +527,7 @@ export function startTerminalWatchdog(options?: {
 }): void {
   if (watchdog) return
   const env = getCliEnv()
-  if (isTruthy(env.CODEBUFF_NO_TERMINAL_WATCHDOG)) return
+  if (isTruthy(env.NEURON_TUI_NO_TERMINAL_WATCHDOG)) return
   if (!options?.ttyPath && !process.stdout.isTTY) return
 
   const reportFailure = options?.reportFailure ?? reportTerminalWatchdogFailure
@@ -541,7 +541,7 @@ export function startTerminalWatchdog(options?: {
       if (inspect && !admitWindowsWatchdog(inspect)) return
       const disarmPath = path.join(
         os.tmpdir(),
-        `codebuff-watchdog-disarm-${process.pid}-${Math.random().toString(36).slice(2)}`,
+        `neuron-tui-watchdog-disarm-${process.pid}-${Math.random().toString(36).slice(2)}`,
       )
       const armedPath = options?.ttyPath
         ? `${options.ttyPath}.armed`

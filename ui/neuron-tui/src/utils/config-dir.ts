@@ -14,11 +14,11 @@ import { getCliEnv } from './env'
  * read the config dir without import cycles.
  */
 export const getConfigDir = (): string => {
-  const configuredDir = getCliEnv().FREEBUFF_CONFIG_DIR
+  const configuredDir = getCliEnv().NEURON_TUI_CONFIG_DIR
   if (configuredDir) {
     if (!path.isAbsolute(configuredDir)) {
       throw new Error(
-        'FREEBUFF_CONFIG_DIR must be an absolute path so CLI settings cannot be written relative to the current project.',
+        'NEURON_TUI_CONFIG_DIR must be an absolute path so CLI settings cannot be written relative to the current project.',
       )
     }
     return configuredDir

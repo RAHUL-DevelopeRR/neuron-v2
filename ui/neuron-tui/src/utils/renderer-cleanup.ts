@@ -205,7 +205,7 @@ export function installProcessCleanupHandlers(cliRenderer: CliRenderer): void {
   // A broad `taskkill node.exe` can kill the launcher process without
   // killing its Bun child. Polling avoids Bun's Windows behavior of terminating
   // before JavaScript can handle a broken IPC channel or inherited pipe.
-  const launcherPid = Number(getCliEnv().CODEBUFF_LAUNCHER_PID)
+  const launcherPid = Number(getCliEnv().NEURON_TUI_LAUNCHER_PID)
   if (
     Number.isInteger(launcherPid) &&
     launcherPid > 0 &&

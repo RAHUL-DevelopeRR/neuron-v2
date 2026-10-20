@@ -16,7 +16,7 @@ export interface ClipboardImageResult {
  * Get a temp directory for clipboard images
  */
 function getClipboardTempDir(): string {
-  const tempDir = path.join(os.tmpdir(), 'codebuff-clipboard-images')
+  const tempDir = path.join(os.tmpdir(), 'neuron-tui-clipboard-images')
   if (!existsSync(tempDir)) {
     mkdirSync(tempDir, { recursive: true })
   }

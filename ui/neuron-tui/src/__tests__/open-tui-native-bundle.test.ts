@@ -182,7 +182,7 @@ describe('OpenTUI native bundle recovery', () => {
       'missing integrity receipt',
       (packageDir: string) => {
         writeCompleteBundle(packageDir, CURRENT_VERSION)
-        rmSync(join(packageDir, '.freebuff-native-bundle.json'))
+        rmSync(join(packageDir, '.neuron-tui-native-bundle.json'))
       },
     ],
     [
@@ -190,7 +190,7 @@ describe('OpenTUI native bundle recovery', () => {
       (packageDir: string) => {
         writeCompleteBundle(packageDir, CURRENT_VERSION)
         writeFileSync(
-          join(packageDir, '.freebuff-native-bundle.json'),
+          join(packageDir, '.neuron-tui-native-bundle.json'),
           '{invalid',
         )
       },

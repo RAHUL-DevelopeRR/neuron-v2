@@ -4,7 +4,7 @@ import type fs from 'fs'
  *
  * Compatible with `fs.promises` from the `'fs'` module.
  */
-export type CodebuffFileSystem = Pick<
+export type ProjectFileSystem = Pick<
   typeof fs.promises,
   'mkdir' | 'readdir' | 'readFile' | 'stat' | 'unlink' | 'writeFile'
 >

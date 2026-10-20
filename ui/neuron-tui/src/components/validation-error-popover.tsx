@@ -1,6 +1,6 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
 // See ui/neuron-tui/PORTING.md.
-import { pluralize } from '@codebuff/common/util/string'
+import { pluralize } from '@neuron-tui/common/util/string'
 import React, { useState } from 'react'
 
 import { Button } from './button'

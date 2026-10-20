@@ -9,13 +9,13 @@ import {
   IMAGE_EXTENSIONS_PATTERN,
   getImageMimeType,
   isProviderSupportedImageMediaType,
-} from '@codebuff/common/constants/images'
+} from '@neuron-tui/common/constants/images'
 import { Jimp } from 'jimp'
 
 import { logger } from './logger'
 
 // Re-export all image constants for backwards compatibility
-export * from '@codebuff/common/constants/images'
+export * from '@neuron-tui/common/constants/images'
 
 export interface ImageUploadResult {
   success: boolean

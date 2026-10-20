@@ -4,7 +4,7 @@
  * conversation; the UI only renders what it reports (see src/engine/).
  */
 
-export type { ToolName } from '@codebuff/common/tools/constants'
+export type { ToolName } from '@neuron-tui/common/tools/constants'
 
 /** A text part of a user prompt. */
 export type TextContent = {

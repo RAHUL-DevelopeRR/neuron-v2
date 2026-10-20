@@ -29,6 +29,7 @@ import {
   type ReadyEvent,
   type UiEvent,
 } from './protocol'
+import { STARTUP_PATH } from './startup-env'
 
 const READY_TIMEOUT_MS = 60_000
 const SHUTDOWN_GRACE_MS = 5_000
@@ -59,12 +60,14 @@ const exeName = (name: string) =>
 
 /**
  * Where the `neuron` binary is: `NEURON_BIN`, else beside this UI's own
- * executable (the packaged layout), else on PATH.
+ * executable (the packaged layout), else on the PATH this process started
+ * with (a project's `.envrc` can't change either; see startup-env.ts).
  */
 export function resolveNeuronBinary(
   env: NodeJS.ProcessEnv = process.env,
   execPath: string = process.execPath,
-  which: (name: string) => string | null = (name) => Bun.which(name),
+  which: (name: string) => string | null = (name) =>
+    Bun.which(name, STARTUP_PATH === undefined ? undefined : { PATH: STARTUP_PATH }),
 ): string | null {
   const fromEnv = env.NEURON_BIN?.trim()
   if (fromEnv) return fromEnv

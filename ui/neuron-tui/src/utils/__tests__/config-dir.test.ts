@@ -9,29 +9,29 @@ ensureCliTestEnv()
 
 const { getConfigDir } = await import('../config-dir')
 
-const originalConfigDir = process.env.FREEBUFF_CONFIG_DIR
+const originalConfigDir = process.env.NEURON_TUI_CONFIG_DIR
 
 afterEach(() => {
   if (originalConfigDir === undefined) {
-    delete process.env.FREEBUFF_CONFIG_DIR
+    delete process.env.NEURON_TUI_CONFIG_DIR
   } else {
-    process.env.FREEBUFF_CONFIG_DIR = originalConfigDir
+    process.env.NEURON_TUI_CONFIG_DIR = originalConfigDir
   }
 })
 
 describe('getConfigDir', () => {
-  test('uses an absolute FREEBUFF_CONFIG_DIR override', () => {
-    const isolatedDir = path.join(os.tmpdir(), 'freebuff-cli-config-test')
-    process.env.FREEBUFF_CONFIG_DIR = isolatedDir
+  test('uses an absolute NEURON_TUI_CONFIG_DIR override', () => {
+    const isolatedDir = path.join(os.tmpdir(), 'neuron-tui-cli-config-test')
+    process.env.NEURON_TUI_CONFIG_DIR = isolatedDir
 
     expect(getConfigDir()).toBe(isolatedDir)
   })
 
-  test('rejects a relative FREEBUFF_CONFIG_DIR override', () => {
-    process.env.FREEBUFF_CONFIG_DIR = 'relative-settings'
+  test('rejects a relative NEURON_TUI_CONFIG_DIR override', () => {
+    process.env.NEURON_TUI_CONFIG_DIR = 'relative-settings'
 
     expect(() => getConfigDir()).toThrow(
-      'FREEBUFF_CONFIG_DIR must be an absolute path',
+      'NEURON_TUI_CONFIG_DIR must be an absolute path',
     )
   })
 })

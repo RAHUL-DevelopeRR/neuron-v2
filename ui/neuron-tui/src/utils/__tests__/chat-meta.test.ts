@@ -42,7 +42,7 @@ function writeMessagesFile(messages: ChatMessage[]): void {
 
 describe('chat-meta', () => {
   beforeEach(() => {
-    chatDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codebuff-meta-'))
+    chatDir = fs.mkdtempSync(path.join(os.tmpdir(), 'neuron-tui-meta-'))
     setChatDirOverrideForTesting(chatDir)
   })
 

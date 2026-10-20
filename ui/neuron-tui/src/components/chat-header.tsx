@@ -4,7 +4,6 @@ import { useLogo } from '../hooks/use-logo'
 import { useSheenAnimation } from '../hooks/use-sheen-animation'
 import { useTerminalDimensions } from '../hooks/use-terminal-dimensions'
 import { useTheme } from '../hooks/use-theme'
-import { IS_FREEBUFF } from '../utils/constants'
 import { openFileAtPath } from '../utils/open-file'
 import { formatCwd } from '../utils/path-helpers'
 import { getLogoAccentColor, getLogoBlockColor } from '../utils/theme-system'
@@ -57,8 +56,7 @@ export const ChatHeader = memo(function ChatHeader({
         {logoComponent}
       </box>
       <text style={{ wrapMode: 'word', marginBottom: 1, fg: theme.foreground }}>
-        {IS_FREEBUFF ? 'Freebuff' : 'Codebuff'} will run commands on your behalf
-        to help you build.
+        Neuron will run commands on your behalf to help you build.
       </text>
       <text style={{ wrapMode: 'word', marginBottom: 1, fg: theme.foreground }}>
         Directory{' '}
