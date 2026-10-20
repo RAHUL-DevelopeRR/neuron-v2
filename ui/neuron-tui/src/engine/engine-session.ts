@@ -42,6 +42,10 @@ export function handleEngineEvent(event: UiEvent): void {
       return
     case 'status':
       engine.setStatus(event)
+      if (event.signed_in) engine.setSignIn(null)
+      return
+    case 'sign_in_code':
+      engine.setSignIn(event)
       return
     case 'models':
       engine.setModels(event)
@@ -53,6 +57,9 @@ export function handleEngineEvent(event: UiEvent): void {
       engine.enqueuePermission(event)
       return
     case 'notice':
+      // During a sign-in the only notice is its success ("Signed in to
+      // Zero-X ..."); the engine then opens the session, which takes a while.
+      if (engine.signIn && !engine.signIn.approved) engine.markSignInApproved()
       if (event.message.startsWith(QUESTION_PREFIX)) {
         engine.setPendingQuestion(event.message)
       }
@@ -64,9 +71,11 @@ export function handleEngineEvent(event: UiEvent): void {
       }
       return
     case 'turn_finished':
-      // Nothing waits for an answer once the turn is over.
+      // Nothing waits for an answer once the turn is over (a `/login` ends
+      // with one too, signed in or not).
       engine.clearPermissions()
       engine.setPendingQuestion(null)
+      engine.setSignIn(null)
       return
     default:
       return

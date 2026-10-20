@@ -1,11 +1,13 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
 // Freebuff variant and the login/publish commands, --agent and --trust-agents
-// (Codebuff login, agent store and repository .agents loading) are gone.
+// (Codebuff login, agent store and repository .agents loading) are gone, and
+// the engine's launch flags (--model, --provider, ...) pass through to it.
 // See ui/neuron-tui/PORTING.md.
 import { createRequire } from 'module'
 
 import { Command } from 'commander'
 
+import type { EngineLaunchOptions } from './engine/neuron-engine-client'
 import type { AgentMode } from './utils/constants'
 import { getCliEnv } from './utils/env'
 
@@ -18,6 +20,15 @@ export type ParsedArgs = {
   continueId?: string | null
   cwd?: string
   initialMode?: AgentMode
+  /** Flags for `neuron engine --stdio`; the engine checks them. */
+  engine: Pick<
+    EngineLaunchOptions,
+    | 'model'
+    | 'provider'
+    | 'permissionMode'
+    | 'allowBroadCwd'
+    | 'dangerouslySkipPermissions'
+  >
 }
 
 export function loadPackageVersion(): string {
@@ -67,6 +78,20 @@ export function parseArgs({
     .option('--free', 'Start in LITE mode (deprecated alias)')
     .option('--max', 'Start in MAX mode')
     .option('--plan', 'Start in PLAN mode')
+    .option('--model <model>', 'Model for the session (an alias like opus, or a full name)')
+    .option('--provider <name>', 'Provider to use instead of the configured one')
+    .option(
+      '--permission-mode <mode>',
+      'read-only, workspace-write or danger-full-access',
+    )
+    .option(
+      '--allow-broad-cwd',
+      'Run from a very broad folder (such as your home folder)',
+    )
+    .option(
+      '--dangerously-skip-permissions',
+      'Run every tool call without asking',
+    )
     .helpOption('-h, --help', 'Show this help message')
     .argument('[prompt...]', 'Initial prompt to send to the agent')
     .allowExcessArguments(true)
@@ -94,5 +119,12 @@ export function parseArgs({
         : null,
     cwd: options.cwd,
     initialMode,
+    engine: {
+      model: options.model,
+      provider: options.provider,
+      permissionMode: options.permissionMode,
+      allowBroadCwd: options.allowBroadCwd || undefined,
+      dangerouslySkipPermissions: options.dangerouslySkipPermissions || undefined,
+    },
   }
 }

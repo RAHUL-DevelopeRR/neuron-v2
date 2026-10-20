@@ -4,12 +4,19 @@
 // bash_permission_prompt_approved, write_file_allowed, read_file_roundtrip,
 // grep_chunk_assembly, multi_tool_turn_roundtrip, token_cost_reporting, ...).
 //
+// `bun run dev:mock --signed-out` starts the engine signed out of Zero-X
+// against a local fake gateway (fake-zero-x-gateway.ts) instead, to try the
+// sign-in panel, /login, /model and /logout. Its approval comes at the first
+// poll; prompts after it fail, since the fake has no chat endpoint.
+//
 // Needs `cargo build -p rusty-claude-cli -p mock-anthropic-service` in rust/,
 // or NEURON_BIN and NEURON_MOCK_BIN. Everything (engine config, UI settings,
 // chat history, the workspace) lives in a temp folder that is removed on exit.
 import fs from 'fs'
 import os from 'os'
 import path from 'path'
+
+import { startFakeGateway } from './fake-zero-x-gateway'
 
 const exe = (name: string) => (process.platform === 'win32' ? `${name}.exe` : name)
 const repoRoot = path.resolve(import.meta.dir, '../../..')
@@ -26,6 +33,10 @@ for (const [label, file] of [
     process.exit(1)
   }
 }
+
+const args = process.argv.slice(2)
+const signedOut = args[0] === '--signed-out'
+if (signedOut) args.shift()
 
 const mock = Bun.spawn([mockBin], { stdout: 'pipe', stderr: 'ignore' })
 const reader = mock.stdout.getReader()
@@ -63,18 +74,28 @@ for (const name of passThrough) {
 Object.assign(env, {
   HOME: home,
   USERPROFILE: home,
-  ANTHROPIC_API_KEY: 'mock-service-key',
-  ANTHROPIC_BASE_URL: baseUrl,
   NEURON_CONFIG_HOME: path.join(home, 'config'),
+  NEURON_HOME: path.join(home, 'neuron'),
+  // Logins go to a file in the temp home, never the OS keychain.
+  NEURON_CREDENTIAL_STORE: 'file',
+  NEURON_NO_BROWSER: '1',
   FREEBUFF_CONFIG_DIR: path.join(home, 'tui'),
   NEURON_BIN: neuronBin,
 })
+const gateway = signedOut ? startFakeGateway() : null
+if (gateway) {
+  env.NEURON_API_BASE = gateway.base
+} else {
+  env.ANTHROPIC_API_KEY = 'mock-service-key'
+  env.ANTHROPIC_BASE_URL = baseUrl
+}
 
 const ui = Bun.spawn(
-  [process.execPath, 'run', path.join(import.meta.dir, '..', 'src', 'entry.ts'), ...process.argv.slice(2)],
+  [process.execPath, 'run', path.join(import.meta.dir, '..', 'src', 'entry.ts'), ...args],
   { cwd: workspace, env, stdio: ['inherit', 'inherit', 'inherit'] },
 )
 const code = await ui.exited
 mock.kill()
+gateway?.stop()
 fs.rmSync(home, { recursive: true, force: true })
 process.exit(code)

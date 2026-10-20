@@ -7,13 +7,18 @@ protocol of `neuron engine --stdio` (`src/engine/`).
 
 What was taken out of Freebuff, and why, is in [PORTING.md](PORTING.md).
 
-## Status (P2)
+## Status (P3)
 
 The UI starts `neuron engine --stdio` in the project folder and runs real
 turns through it: streamed text, tool calls and results, and permission
-prompts. Sign-in, the model picker, the token footer and the Neuron branding
-are P3 and P4 (see [PORTING.md](PORTING.md)). It finds the engine through
-`NEURON_BIN`, then a `neuron` binary beside the UI, then PATH.
+prompts. It also covers the Zero-X sign-in (`/login`, with the device code
+shown in the UI), the model picker (`/model`) and a status footer. The Neuron
+branding and packaging are P4 (see [PORTING.md](PORTING.md)).
+
+It finds the engine through `NEURON_BIN`, then a `neuron` binary beside the
+UI, then PATH. `--model`, `--provider`, `--permission-mode`,
+`--allow-broad-cwd` and `--dangerously-skip-permissions` pass through to the
+engine.
 
 ## Requirements
 
@@ -51,7 +56,9 @@ pass `--cwd <dir>` to open another project.
 service, with no account or network, in a throwaway home folder. It needs
 `cargo build -p rusty-claude-cli -p mock-anthropic-service` in `rust/` first.
 Prompts like `PARITY_SCENARIO:bash_permission_prompt_approved` pick a scripted
-turn. The same binaries run
+turn. `bun run dev:mock --signed-out /login` starts signed out of Zero-X
+against a local fake gateway instead, to try the sign-in, `/model` and
+`/logout`; the fake approves the sign-in at once. The same binaries run
 `bun test src/engine/__tests__/engine.integration.test.ts`.
 
 Settings, chat history and logs go to `~/.neuron/tui` (override with an

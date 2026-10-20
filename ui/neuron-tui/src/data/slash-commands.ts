@@ -19,6 +19,11 @@ export interface SlashCommand {
    * instead of executing a command. Useful for agent shortcuts.
    */
   insertText?: string
+  /**
+   * Run by the engine: the UI has no handler, so the router forwards it as a
+   * `slash` command.
+   */
+  engineCommand?: boolean
 }
 
 // Generate mode commands from the AGENT_MODES constant
@@ -110,6 +115,54 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
     label: 'image',
     description: 'Attach an image file (or Ctrl+V to paste from clipboard)',
     aliases: ['img', 'attach'],
+  },
+  {
+    id: 'model',
+    label: 'model',
+    description: 'Pick the model (or /model <name> to switch at once)',
+  },
+  // The engine runs these; the router forwards commands it has no handler for.
+  {
+    id: 'login',
+    label: 'login',
+    engineCommand: true,
+    description: 'Sign in to Zero-X in your browser',
+  },
+  {
+    id: 'logout',
+    label: 'logout',
+    engineCommand: true,
+    description: 'Sign out of Zero-X',
+  },
+  {
+    id: 'status',
+    label: 'status',
+    engineCommand: true,
+    description: 'Session status: model, permissions, context',
+  },
+  {
+    id: 'cost',
+    label: 'cost',
+    engineCommand: true,
+    description: 'Token usage for this session',
+  },
+  {
+    id: 'context',
+    label: 'context',
+    engineCommand: true,
+    description: 'What fills the context window',
+  },
+  {
+    id: 'compact',
+    label: 'compact',
+    engineCommand: true,
+    description: 'Summarize the conversation to free up context',
+  },
+  {
+    id: 'permissions',
+    label: 'permissions',
+    engineCommand: true,
+    description: 'Show or change the permission mode',
   },
   ...MODE_COMMANDS,
   {

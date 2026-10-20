@@ -264,14 +264,25 @@ describe('command-registry', () => {
       ])
 
       // Commands with insertText are UI-only shortcuts that insert text into
-      // the input field instead of executing a command.
-      const executableCommands = SLASH_COMMANDS.filter((cmd) => !cmd.insertText)
+      // the input field instead of executing a command. The engine's commands
+      // have no UI handler: the router forwards them.
+      const executableCommands = SLASH_COMMANDS.filter(
+        (cmd) => !cmd.insertText && !cmd.engineCommand,
+      )
 
       for (const slashCommand of executableCommands) {
         expect(registered.has(slashCommand.id)).toBe(true)
         for (const alias of slashCommand.aliases ?? []) {
           expect(registered.has(alias)).toBe(true)
         }
+      }
+    })
+
+    test("the engine's commands have no UI handler, so they reach the engine", () => {
+      const engineCommands = SLASH_COMMANDS.filter((cmd) => cmd.engineCommand)
+      expect(engineCommands.map((cmd) => cmd.id)).toContain('login')
+      for (const command of engineCommands) {
+        expect(findCommand(command.id)).toBeUndefined()
       }
     })
 

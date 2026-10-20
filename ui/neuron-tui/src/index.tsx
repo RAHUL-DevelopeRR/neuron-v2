@@ -101,6 +101,7 @@ async function main(): Promise<void> {
     continueId,
     cwd,
     initialMode,
+    engine: engineFlags,
   } = parseArgs()
 
   await initializeApp({ cwd })
@@ -128,7 +129,11 @@ async function main(): Promise<void> {
     ? loadMostRecentChatState(continueId ?? undefined)?.runState?.sessionId
     : undefined
   if (!showProjectPicker) {
-    void startEngineSession({ cwd: projectRoot, resume: resumeSession })
+    void startEngineSession({
+      ...engineFlags,
+      cwd: projectRoot,
+      resume: resumeSession,
+    })
   }
 
   const AppRoot = () => {
@@ -166,7 +171,7 @@ async function main(): Promise<void> {
         // Save to recent projects list
         saveRecentProject(newProjectPath)
         // The engine works in one folder: restart it in the new one.
-        void startEngineSession({ cwd: newProjectPath })
+        void startEngineSession({ ...engineFlags, cwd: newProjectPath })
         // Update local state
         setCurrentProjectRoot(newProjectPath)
         // Reset file tree state to trigger reload

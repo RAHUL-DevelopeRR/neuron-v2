@@ -19,8 +19,8 @@ import type { UiEvent } from './protocol'
 export interface TurnEventSink {
   handle(event: UiEvent): void
   /**
-   * Close the calls that never got a result: the engine sends none for a call
-   * that was denied or blocked by policy. Call once, when the turn ends.
+   * Close the calls that never got a result (older engines sent none for a
+   * denied or blocked call). Call once, when the turn ends.
    */
   finish(): void
 }
@@ -30,8 +30,9 @@ type OpenCall = { id: string; name: string; toolName: string }
 export function createTurnEventSink(state: EventHandlerState): TurnEventSink {
   const chunk = createStreamChunkHandler(state)
   const sdk = createEventHandler(state)
-  // A result names its tool but not its call, so results are matched to the
-  // oldest open call of the same tool, which is the engine's order.
+  // Results carry their call's id. Older engines named only the tool, so
+  // without an id a result goes to the oldest open call of that tool, which is
+  // the engine's order.
   const open: OpenCall[] = []
 
   const close = (call: OpenCall, output: string, isError: boolean) =>
@@ -83,10 +84,13 @@ export function createTurnEventSink(state: EventHandlerState): TurnEventSink {
           return
         }
         case 'tool_result': {
-          const index = open.findIndex((call) => call.name === event.name)
+          const index = event.id
+            ? open.findIndex((call) => call.id === event.id)
+            : open.findIndex((call) => call.name === event.name)
           if (index < 0) {
-            state.logger.warn(
-              { tool: event.name },
+            // A cut-off call was closed when it started; its result is no news.
+            state.logger.debug(
+              { tool: event.name, id: event.id },
               '[engine] tool_result without an open call',
             )
             return

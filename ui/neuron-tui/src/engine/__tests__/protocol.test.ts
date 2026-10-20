@@ -109,10 +109,10 @@ describe('UI events (engine -> UI)', () => {
   })
 
   test('an event type this UI does not know is reported, not thrown', () => {
-    expect(parseUiEventLine('{"type":"sign_in_code","url":"x"}')).toEqual({
+    expect(parseUiEventLine('{"type":"from_the_future","url":"x"}')).toEqual({
       ok: false,
       reason: 'unknown_type',
-      type: 'sign_in_code',
+      type: 'from_the_future',
     })
   })
 
@@ -132,6 +132,7 @@ describe('UI events (engine -> UI)', () => {
     const all: Record<UiEventType, true> = {
       ready: true,
       status: true,
+      sign_in_code: true,
       models: true,
       text_delta: true,
       text_block_end: true,

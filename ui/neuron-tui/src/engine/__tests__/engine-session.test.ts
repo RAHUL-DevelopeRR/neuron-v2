@@ -5,10 +5,10 @@ import {
   summarizePermissionInput,
 } from '../../components/permission-prompt'
 import { useChatStore } from '../../state/chat-store'
-import { useEngineStore } from '../../state/engine-store'
+import { needsSignIn, useEngineStore } from '../../state/engine-store'
 import { handleEngineEvent, setEngineTurnActive } from '../engine-session'
 
-import type { PermissionView } from '../protocol'
+import type { PermissionView, SignInCodeEvent, StatusEvent } from '../protocol'
 
 const STATUS = {
   type: 'status' as const,
@@ -87,6 +87,63 @@ describe('handleEngineEvent', () => {
     setEngineTurnActive(true)
     handleEngineEvent({ type: 'error', message: 'rate limited' })
     expect(systemLines()).toEqual(['Error: unknown model opus-9'])
+  })
+})
+
+describe('sign-in', () => {
+  // The engine's signed-out stage: no session until /login.
+  const SIGNED_OUT: StatusEvent = {
+    ...STATUS,
+    session_id: '',
+    git: null,
+    signed_in: false,
+    account: null,
+  }
+  const CODE: SignInCodeEvent = {
+    type: 'sign_in_code',
+    url: 'https://zero-x.live/device',
+    url_complete: 'https://zero-x.live/device?code=BCDF-GHJK',
+    user_code: 'BCDF-GHJK',
+    expires_in_secs: 600,
+    browser_opened: true,
+  }
+
+  test('only the signed-out stage needs a sign-in', () => {
+    expect(needsSignIn(SIGNED_OUT)).toBe(true)
+    // An API-key provider is not signed in to Zero-X, but has a session.
+    expect(needsSignIn({ ...SIGNED_OUT, session_id: 'session-1' })).toBe(false)
+    // Engines before sign-in support sent neither field.
+    expect(needsSignIn(STATUS)).toBe(false)
+    expect(needsSignIn(null)).toBe(false)
+  })
+
+  test('a device code shows until its sign-in is approved and the session is up', () => {
+    handleEngineEvent({ type: 'ready', protocol: 1, version: 'x' })
+    handleEngineEvent(SIGNED_OUT)
+    handleEngineEvent(CODE)
+    expect(useEngineStore.getState().signIn).toMatchObject({
+      user_code: 'BCDF-GHJK',
+      approved: false,
+    })
+    handleEngineEvent({ type: 'notice', message: 'Signed in to Zero-X (plan pro).' })
+    expect(useEngineStore.getState().signIn?.approved).toBe(true)
+    handleEngineEvent({ type: 'turn_finished' })
+    expect(useEngineStore.getState().signIn).toBeNull()
+  })
+
+  test('a signed-in status ends the sign-in too; a cancelled one ends at turn_finished', () => {
+    handleEngineEvent(CODE)
+    handleEngineEvent({
+      ...STATUS,
+      signed_in: true,
+      account: { email: null, plan: 'pro', source: 'stored login', expires_at: null },
+    })
+    expect(useEngineStore.getState().signIn).toBeNull()
+
+    handleEngineEvent(CODE)
+    handleEngineEvent({ type: 'error', message: 'Sign-in cancelled.' })
+    handleEngineEvent({ type: 'turn_finished' })
+    expect(useEngineStore.getState().signIn).toBeNull()
   })
 })
 

@@ -63,6 +63,17 @@ export interface ModelInfo {
   tiers: string[]
 }
 
+/** The Zero-X login, as the UI may show it. Never carries the token. */
+export interface AccountInfo {
+  /** Known right after a sign-in in this engine; not stored with the login. */
+  email: string | null
+  plan: string | null
+  /** Where the login comes from: `NEURON_TOKEN`, or the stored login and where it is kept. */
+  source: string
+  /** When the session expires (Unix seconds), when the gateway said. */
+  expires_at: number | null
+}
+
 // ---------------------------------------------------------------- Engine → UI
 
 /** The first event: the engine is ready for commands. */
@@ -91,6 +102,28 @@ export interface StatusEvent {
   context_percent: number
   /** `null` outside a git repository. */
   git: GitStatus | null
+  /**
+   * A usable Zero-X login: `NEURON_TOKEN`, or a stored session that has not
+   * expired. Added after protocol 1 shipped: absent from older engines.
+   */
+  signed_in?: boolean
+  /** The login, also when its session expired; `null` when there is none. */
+  account?: AccountInfo | null
+}
+
+/**
+ * `/login` started a device sign-in: open `url` (or `url_complete`, which has
+ * the code filled in) and enter `user_code`. The engine waits for approval; an
+ * `interrupt` cancels it. A notice and a `status` follow, then `turn_finished`.
+ */
+export interface SignInCodeEvent {
+  type: 'sign_in_code'
+  url: string
+  url_complete: string | null
+  user_code: string
+  expires_in_secs: number
+  /** The engine opened `url_complete` (or `url`) in the browser. */
+  browser_opened: boolean
 }
 
 /**
@@ -143,12 +176,15 @@ export interface ToolCallStartedEvent {
 }
 
 /**
- * A tool's result (or error). It names the tool, not the call id. A call that
- * is denied or blocked by policy gets no result: close open rows at
+ * A tool call's result as the model sees it. Current engines send one for
+ * every call: one that ran, was denied or blocked by a hook, or never started.
+ * `id` is the `tool_call_started` id. Older engines sent no `id` and no result
+ * for a denied call, so the UI still matches by name and closes open rows at
  * `turn_finished`.
  */
 export interface ToolResultEvent {
   type: 'tool_result'
+  id?: string
   name: string
   output: string
   is_error: boolean
@@ -190,6 +226,7 @@ export interface ErrorEvent {
 export type UiEvent =
   | ReadyEvent
   | StatusEvent
+  | SignInCodeEvent
   | ModelsEvent
   | TextDeltaEvent
   | TextBlockEndEvent
@@ -209,6 +246,7 @@ export type UiEventType = UiEvent['type']
 export const UI_EVENT_TYPES: readonly UiEventType[] = [
   'ready',
   'status',
+  'sign_in_code',
   'models',
   'text_delta',
   'text_block_end',

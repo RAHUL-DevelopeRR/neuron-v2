@@ -5,6 +5,7 @@ import type { EngineConnection } from '../engine/neuron-engine-client'
 import type {
   ModelsEvent,
   PermissionRequestedEvent,
+  SignInCodeEvent,
   StatusEvent,
   UsageEvent,
 } from '../engine/protocol'
@@ -30,6 +31,11 @@ export interface EngineStoreState {
    * takes the next submit as its answer, even while the turn runs.
    */
   pendingQuestion: string | null
+  /**
+   * The device code of a `/login` in progress, until it ends. `approved` once
+   * the engine said the sign-in worked and is opening the session.
+   */
+  signIn: (SignInCodeEvent & { receivedAt: number; approved: boolean }) | null
 
   setConnection: (connection: EngineConnection, error?: string | null) => void
   setReady: (version: string) => void
@@ -41,7 +47,18 @@ export interface EngineStoreState {
   resolvePermission: (id: number) => void
   clearPermissions: () => void
   setPendingQuestion: (question: string | null) => void
+  setSignIn: (code: SignInCodeEvent | null, receivedAt?: number) => void
+  markSignInApproved: () => void
   reset: () => void
+}
+
+/**
+ * The engine runs but has no session until a Zero-X sign-in: its signed-out
+ * stage reports `signed_in: false` with no session id. (A provider with its
+ * own API key is also not signed in to Zero-X, but it has a session.)
+ */
+export function needsSignIn(status: StatusEvent | null): boolean {
+  return status !== null && status.signed_in === false && status.session_id === ''
 }
 
 const initial = {
@@ -53,6 +70,7 @@ const initial = {
   usage: null,
   permissionQueue: [] as PermissionRequestedEvent[],
   pendingQuestion: null,
+  signIn: null,
 }
 
 export const useEngineStore = create<EngineStoreState>()(
@@ -65,6 +83,7 @@ export const useEngineStore = create<EngineStoreState>()(
         if (connection === 'exited') {
           state.permissionQueue = []
           state.pendingQuestion = null
+          state.signIn = null
         }
       }),
     setReady: (version) =>
@@ -104,6 +123,14 @@ export const useEngineStore = create<EngineStoreState>()(
     setPendingQuestion: (question) =>
       set((state) => {
         state.pendingQuestion = question
+      }),
+    setSignIn: (code, receivedAt = Date.now()) =>
+      set((state) => {
+        state.signIn = code ? { ...code, receivedAt, approved: false } : null
+      }),
+    markSignInApproved: () =>
+      set((state) => {
+        if (state.signIn) state.signIn.approved = true
       }),
     reset: () => set(() => ({ ...initial })),
   })),

@@ -12,6 +12,7 @@ import { randomUUID } from 'node:crypto'
 
 import { useCallback, useEffect, useRef } from 'react'
 
+import { engineAttachments } from '../engine/attachments'
 import { setEngineTurnActive, whenEngineStarted } from '../engine/engine-session'
 import {
   getNeuronEngineClient,
@@ -491,11 +492,11 @@ export const useSendMessage = ({
         turnSink = createTurnEventSink(eventHandlerState)
         const sink = turnSink
         setEngineTurnActive(true)
-        // Attachments are still inlined into the prompt text (as Freebuff
-        // did); P3 sends them as Submit.attachments.
+        // Files and text are inlined into the prompt (as Freebuff did);
+        // images go as attachments (see engine/attachments.ts).
         const outcome = await runTurn(
           getEngine(),
-          { text: effectivePrompt },
+          { text: effectivePrompt, attachments: engineAttachments(attachments) },
           (event) => sink.handle(event),
         )
         sink.finish()

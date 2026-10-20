@@ -271,6 +271,47 @@ describe('useSendMessage with the engine client', () => {
     }
   })
 
+  test('results with ids reach their own call, in any order', async () => {
+    const fake = new FakeEngine()
+    engine = fake
+    const { setup, root } = await mountHost()
+    const run = sendMessageFromHost!({ content: 'two', agentMode: 'DEFAULT' })
+    try {
+      await waitFor('submit', () => fake.submits.length === 1)
+      for (const id of ['call-a', 'call-b']) {
+        fake.emit({
+          type: 'tool_call_started',
+          id,
+          name: 'bash',
+          input: JSON.stringify({ command: `echo ${id}` }),
+          cut_off: false,
+        })
+      }
+      for (const id of ['call-b', 'call-a']) {
+        fake.emit({
+          type: 'tool_result',
+          id,
+          name: 'bash',
+          output: JSON.stringify({ stdout: `out ${id}`, stderr: '' }),
+          is_error: false,
+        })
+      }
+      fake.emit({ type: 'turn_finished' })
+      await run
+
+      const tools = (useChatStore.getState().messages.at(-1)!.blocks ?? []).filter(
+        (block) => block.type === 'tool',
+      ) as any[]
+      expect(tools.map((tool) => [tool.toolCallId, tool.output])).toEqual([
+        ['call-a', 'out call-a'],
+        ['call-b', 'out call-b'],
+      ])
+    } finally {
+      flushSync(() => root.unmount())
+      setup.renderer.destroy()
+    }
+  })
+
   test('a call the engine never answers (denied) is closed when the turn ends', async () => {
     const fake = new FakeEngine()
     engine = fake

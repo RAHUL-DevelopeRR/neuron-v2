@@ -12,6 +12,7 @@ import {
   buildPlanPrompt,
   buildReviewPrompt,
 } from './prompt-builders'
+import { whenEngineStarted } from '../engine/engine-session'
 import { getNeuronEngineClient, runExchange } from '../engine/neuron-engine-client'
 import { getProjectRoot } from '../project-files'
 import { useChatStore } from '../state/chat-store'
@@ -384,11 +385,14 @@ export async function routeUserPrompt(
   saveToHistory(trimmed)
   setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false })
 
+  // An engine command typed while the engine boots (`/login` right at start)
+  // waits for it; prompts wait in sendMessage, behind their user bubble.
+  if (isSlashCommand(trimmed)) await whenEngineStarted()
   const engine = getNeuronEngineClient()
   const engineReady = engine.connection === 'ready'
 
-  // A slash command the UI does not have is the engine's (/compact, /status,
-  // /model, /permissions, ...). It runs after any turn in progress, and its
+  // A slash command the UI does not have is the engine's (/login, /compact,
+  // /status, /permissions, ...). It runs after any turn in progress, and its
   // report comes back as a notice.
   if (isSlashCommand(trimmed) && engineReady) {
     const [command = '', ...args] = trimmed.slice(1).trim().split(/\s+/)

@@ -2,8 +2,9 @@
 // (display, inline, dock, partner rows), sponsored proposals and runs, the
 // Freebuff session header/controls/footer, BYOK, Codebuff login, credits and
 // subscription banners, feedback, publishing, the profile survey and every
-// analytics event are gone. The engine's permission requests open a dialog
-// above the input. See ui/neuron-tui/PORTING.md.
+// analytics event are gone. The engine's permission requests, sign-in and model
+// picker open panels above the input, and its status shows in a footer line
+// below it. See ui/neuron-tui/PORTING.md.
 import { HelpBanner } from './components/help-banner'
 import {
   useCallback,
@@ -23,7 +24,10 @@ import { QueuePanel } from './components/queue-panel'
 import { ReviewScreen } from './components/review-screen'
 import { MessageWithAgents } from './components/message-with-agents'
 import { PendingBashMessage } from './components/pending-bash-message'
+import { EngineFooter } from './components/engine-footer'
+import { ModelPicker } from './components/model-picker'
 import { PermissionPrompt } from './components/permission-prompt'
+import { SignInPanel } from './components/sign-in-panel'
 import { StatusBar } from './components/status-bar'
 import {
   SuggestedPrompts,
@@ -109,6 +113,7 @@ export const Chat = ({
   const headerRef = useRef<BoxRenderable | null>(null)
   const [isHeaderVisible, setIsHeaderVisible] = useState(true)
   const [todoPanelOpen, setTodoPanelOpen] = useState(false)
+  const [modelPickerOpen, setModelPickerOpen] = useState(false)
   const chatSessionId = useChatStore((state) => state.chatSessionId)
   useEffect(() => setTodoPanelOpen(false), [chatSessionId])
 
@@ -654,6 +659,7 @@ export const Chat = ({
       }
 
       if (result.openTodoPanel) setTodoPanelOpen(true)
+      if (result.openModelPicker) setModelPickerOpen(true)
     },
     [queuedCount, setMessages],
   )
@@ -1101,6 +1107,7 @@ export const Chat = ({
     disabled:
       askUserState !== null ||
       permissionRequest !== null ||
+      modelPickerOpen ||
       reviewMode ||
       queuePanelOpen ||
       todoPanelOpen,
@@ -1318,11 +1325,19 @@ export const Chat = ({
           />
         )}
 
+        <SignInPanel width={separatorWidth} />
+
         {permissionRequest ? (
           <PermissionPrompt
             key={`permission-${permissionRequest.id}`}
             request={permissionRequest}
             width={separatorWidth}
+          />
+        ) : modelPickerOpen ? (
+          <ModelPicker
+            onClose={() => setModelPickerOpen(false)}
+            width={separatorWidth}
+            maxVisibleRows={isCompactHeight ? 4 : 8}
           />
         ) : reviewMode ? (
           <ReviewScreen
@@ -1406,6 +1421,8 @@ export const Chat = ({
             />
           </>
         )}
+
+        <EngineFooter width={separatorWidth} />
       </box>
     </box>
   )

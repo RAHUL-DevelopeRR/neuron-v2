@@ -57,12 +57,17 @@ rewritten for what remains:
 | `src/engine/neuron-engine-client.ts` | The `NeuronEngineClient` interface (`start`, `submit`, `slash`, `setModel`, `listModels`, `interrupt`, `replyToPermission`, `subscribe`, `onExit`, `shutdown`) and `engineArgs()` for `neuron engine --stdio` and its flags. It also has `runExchange()`/`runTurn()`. They run one exchange at a time per engine, so each `turn_finished` ends the right one, and resolve with the turn's `error`. |
 | `src/engine/stdio-engine-client.ts` | P2: `StdioEngineClient` spawns `neuron engine --stdio`. It writes `ClientMessage` lines, reads `UiEvent` lines and sends stderr to the log file. `start()` resolves at `ready`. It rejects with the engine's `error` event, or its last `error:` stderr line (some launch checks print only that), or the exit code. Unknown event types are logged, not fatal. `resolveNeuronBinary()` tries `NEURON_BIN`, then a `neuron` beside the UI binary, then PATH. |
 | `src/engine/engine-session.ts` | P2: starts the engine in the project folder at launch, or after the project picker. It restarts it on a project switch, and resumes the saved engine session with `--continue`. It routes events that belong to no turn into the stores: `ready`, `status`, `usage`, `models`, permission requests, notices (an `AskUserQuestion` notice waits for the next submit), and errors outside a turn. A prompt sent while the engine boots waits for the start (`whenEngineStarted`). |
-| `src/engine/turn-events.ts` | P2: feeds a turn's events into Freebuff's handlers (`createStreamChunkHandler`/`createEventHandler`). `text_delta` becomes text; `reasoning_delta` becomes a reasoning chunk. Tool calls and results become `tool_call`/`tool_result` blocks. `tool_result` carries only the tool name, so results are matched to calls first-in-first-out by name. A call that never gets a result (denied, or blocked by policy) is closed at `turn_finished`. |
+| `src/engine/turn-events.ts` | P2: feeds a turn's events into Freebuff's handlers (`createStreamChunkHandler`/`createEventHandler`). `text_delta` becomes text; `reasoning_delta` becomes a reasoning chunk. Tool calls and results become `tool_call`/`tool_result` blocks. A result is matched to its call by `id`. Engines before the sign-in work sent no `id`; for those, results are matched first-in-first-out by tool name. A call left without a result (those engines sent none for a denied call) is closed at `turn_finished`. |
 | `src/engine/tool-mapping.ts` | P2: Neuron tool names and inputs mapped onto Freebuff's renderers: `bash`/`PowerShell`→`run_terminal_command`, `read_file`→`read_files`, `write_file`, `edit_file`→`str_replace`, `glob_search`→`glob`, `grep_search`→`code_search`, `WebFetch`→`read_url`, `WebSearch`→`web_search`, `TodoWrite`→`write_todos`, `Skill`→`skill`. The engine's JSON tool outputs become what those renderers read. Windows `\\?\` path prefixes are stripped for display. Other tools keep their name and input. |
-| `src/state/engine-store.ts` | P2: connection state, engine version, last `status` (model, mode, session, git, context %), `usage`, `models`, the permission queue and a pending question. |
+| `src/state/engine-store.ts` | P2: connection state, engine version, last `status` (model, mode, session, git, context %, Zero-X login), `usage`, `models`, the permission queue and a pending question. P3 adds the device code of a `/login` in progress, and `needsSignIn()`. The engine's signed-out stage is a `status` with `signed_in: false` and no session id; an API-key provider also has `signed_in: false`, but it has a session. |
+| `src/components/sign-in-panel.tsx` | P3: above the input. In the signed-out stage it says to type `/login`. During a `/login` it shows the link, the code and a countdown, and Esc cancels (an engine interrupt). After approval it says "Starting your session…" until the engine's session is up. The engine opens the browser and keeps the token; the UI only sees the code. |
+| `src/components/model-picker.tsx` | P3: `/model` lists the engine's catalog (`list_models`, refreshed every 30 s while open; only the Zero-X gateway has one). Unavailable models are greyed with the reason and can't be picked. `/model <name>` switches without it. |
+| `src/components/engine-footer.tsx` | P3: one line under the input: model, permission mode (and plan mode), an untrusted-folder warning, git branch and counts, ↑/↓ tokens for the session, context %, and the Zero-X plan or an expired login. Parts that don't fit are dropped from the end. |
+| `src/engine/attachments.ts` | P3: images go to the engine as `Submit.attachments`. Before, they were dropped and only "See attached image(s)" was sent. Files, folders and pasted text stay inlined into the prompt as Freebuff did, because the engine would only list their paths. |
 | `src/components/permission-prompt.tsx` | P2: the permission dialog. `y` allows once, `a` allows for the session (only when the engine offers prefixes), `n` denies, `e` denies with a note. Keys are ignored for 300 ms so a keystroke meant for the input can't answer it. The chat input is disabled while a request waits. |
 | `src/hooks/use-send-message.ts` | Rewritten around `runTurn()`. It keeps the UI half: user bubble, AI message shell, timer, interrupts (they call `engine.interrupt()`), queue state and transcript checkpoints. It saves the engine session id in `RunState`. |
-| `src/commands/router.ts` | P2: a slash command the UI doesn't know goes to the engine when it is running (its own commands, such as `/status`, `/cost` and `/context`). Its notices and errors show as system lines. `/new` also clears the engine session. |
+| `src/commands/router.ts` | P2: a slash command the UI doesn't know goes to the engine when it is running (its own commands, such as `/login`, `/status`, `/cost` and `/context`). One typed while the engine boots waits for it. Its notices and errors show as system lines. `/new` also clears the engine session. The slash menu lists the engine's commands with `engineCommand: true`. |
+| `src/cli-args.ts` | P3: `--model`, `--provider`, `--permission-mode`, `--allow-broad-cwd` and `--dangerously-skip-permissions` pass through to `neuron engine --stdio`. |
 | `src/types/agent-run.ts` | Local versions of the SDK types the UI read: `RunState` (what `--continue` saves, with the engine session id), `MessageContent`, `ToolName`. |
 | `src/utils/user-shell.ts` | `!cmd` runner stub. It fails with a message shown in the bash bubble. |
 | `src/utils/runtime-env.ts` | `IS_DEV`, `IS_TEST` and `IS_CI`, which came from Codebuff's env schema. |
@@ -70,37 +75,48 @@ rewritten for what remains:
 | `src/utils/exit-cleanly.ts` | Exit now runs local cleanup, then a bounded engine `shutdown`. |
 | `src/utils/config-dir.ts` | Settings, chat history and logs now go to `~/.neuron/tui`. Freebuff used `~/.config/manicode`, which Codebuff itself still writes. `FREEBUFF_CONFIG_DIR` still overrides it. |
 | `scripts/run-tests.ts` | `bun run test` without `find`, so it works on Windows. |
-| `scripts/dev-against-mock.ts` | P2: `bun run dev:mock [prompt]` runs the UI against the real engine and the mock Anthropic service (`PARITY_SCENARIO:<name>` prompts), in a throwaway home and workspace. No account or network is needed. |
+| `scripts/dev-against-mock.ts` | P2: `bun run dev:mock [prompt]` runs the UI against the real engine and the mock Anthropic service (`PARITY_SCENARIO:<name>` prompts), in a throwaway home and workspace. No account or network is needed. With `--signed-out` (P3), the engine starts signed out against `scripts/fake-zero-x-gateway.ts`, which approves a `/login` at the first poll and serves a two-model catalog. Logins go to a file in the temp home, never the OS keychain. |
 | `test/setup-env.ts` | Test preload: runtime flags only, no Codebuff service env. |
 
 `IS_FREEBUFF` (`src/utils/constants.ts`) is pinned to `false`, so no env var can
 turn back on the paths it gated. Its remaining 22 uses only choose
 Freebuff/Codebuff wording, which the rebrand removes.
 
-## Behaviour today (P2)
+## Behaviour today (P3)
 
 - `bun run dev` starts the UI and, once a project folder is known, the engine
   in it. The status bar says "starting the engine..." until `ready`.
 - A prompt runs a real engine turn. Streamed text, reasoning, tool calls and
   their results render with Freebuff's blocks. Permission requests open the
-  permission dialog. Usage and status land in the engine store; the footer
-  that shows them is P3.
+  permission dialog. The footer shows the engine's status and usage.
+- Signed out of Zero-X, the engine still starts. The sign-in panel asks for
+  `/login`, which shows the device code and link until the sign-in is approved.
+  `/logout` signs out. `/model` opens the model picker.
 - If the engine cannot start, its reason shows in the chat and the status bar.
-  Examples: no `neuron` binary, not signed in, or a too-broad folder. A send
-  then ends with "The Neuron engine is not running: <reason>".
-- Checked by hand with `bun run dev:mock` on Windows. `streaming_text` renders
-  the streamed reply, and `bash_permission_prompt_approved` opens the
-  permission dialog, with `tee` offered for the session.
+  Examples: no `neuron` binary, or a too-broad folder. A send then ends with
+  "The Neuron engine is not running: <reason>".
+- Checked by hand with `bun run dev:mock` on Windows:
+  - `streaming_text` renders the streamed reply.
+  - `bash_permission_prompt_approved` opens the permission dialog, with `tee`
+    offered for the session.
+  - `--signed-out /login` shows the code `BCDF-GHJK` and its link. After the
+    fake approval, the footer reads `openai/auto · workspace-write · untrusted
+    folder · ctx 0% · Zero-X pro`.
+  - Opening the session after a sign-in took about 40 s on the debug build,
+    most of it starting MCP servers. The panel says "Starting your session…"
+    meanwhile.
 - `!cmd` and `/bash` show "Shell commands (!) are not available in this build of
   the Neuron UI yet."
 - These slash commands are the UI's own: `help`, `new`, `copy`, `export`,
   `bash`, `image`, `history`, `queue`, `todo`, `interview`, `plan`, `review`,
   `theme:toggle`, `exit`, `mode:*` and `skill:*`. Any other goes to the engine.
-- Typecheck is clean, and `bun run test` gives 2,219 passing tests, 0 failures
+- Typecheck is clean, and `bun run test` gives 2,238 passing tests, 0 failures
   and 24 skipped.
-  `src/engine/__tests__/engine.integration.test.ts` passes 4 tests against
-  the real engine and the mock service. It is not part of `bun run test`,
-  because it needs the Rust binaries and takes about 90 s on a debug build.
+- `src/engine/__tests__/engine.integration.test.ts` passes 5 tests against the
+  real engine: 4 turns against the mock service, and the signed-out start,
+  `/login`, catalog and `/logout` against the fake gateway. It is not part of
+  `bun run test`, because it needs the Rust binaries and takes about 3 minutes
+  on a debug build.
 - Of the skips, 7 POSIX-only cases skip on Windows: direnv export, directory
   fsync, chmod, and a concurrent atomic rename. The rest are upstream skips,
   mostly tmux. Freebuff's CI ran on Linux, so these never ran on Windows
@@ -108,20 +124,12 @@ Freebuff/Codebuff wording, which the rebrand removes.
 
 ## Left for later
 
-- **P3:**
-  - Sign-in screen. It needs the engine to start while signed out and to send
-    the device code as an event; today a signed-out engine sends one `error`
-    and exits.
-  - Model picker from `list_models`/`models`, and footer (git, ↑/↓ tokens,
-    context %) from the engine store.
-  - `utils/format-token-count.ts` is kept for the footer.
-  - `@tanstack/react-query` is kept and still mounted in `index.tsx`, for the
-    model-list polling.
-  - Send attachments as `Submit.attachments`. Today they are inlined into the
-    prompt as Freebuff did.
+- **Still open from P3:**
   - Decide whether `!cmd` runs in the UI or in the engine.
-  - Pass `--model`, `--provider` and `--permission-mode` through to the
-    engine. The UI starts it with none, so the engine's defaults apply.
+  - `@tanstack/react-query` is still mounted in `index.tsx`, but nothing uses
+    it now: the model list polls with a timer. It can go in P4.
+  - The engine's signed-out notice says "Sign in with `neuron auth login` ...",
+    which is the terminal's wording; the sign-in panel says `/login`.
 - **P4 (rebrand and packaging):**
   - Remove the Codebuff/Freebuff names users can see: the logo in
     `utils/logo.ts`, "Codebuff will run commands on your behalf", the program
@@ -143,9 +151,6 @@ Freebuff/Codebuff wording, which the rebrand removes.
     the command line. I could not type into the terminal: keyboard input, the
     permission keys and Ctrl-C exit in a real Windows terminal are covered only
     by unit tests so far.
-  - The engine's `tool_result` has no call id, so two calls of the same tool in
-    one turn are matched first-in-first-out. A denied call gets no result
-    event; it shows "No result" when the turn ends.
   - Some launch checks (a too-broad folder, bad flags) print `error: ...` on
     stderr and exit without the `error` event the protocol promises. The client
     falls back to that line.

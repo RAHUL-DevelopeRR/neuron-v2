@@ -52,4 +52,33 @@ describe('CLI argument parsing', () => {
     expect(parse('--plan').initialMode).toBe('PLAN')
     expect(parse('--lite', '--plan').initialMode).toBe('PLAN')
   })
+
+  test('engine flags pass through, and are absent when not given', () => {
+    expect(
+      parse(
+        '--model', 'opus',
+        '--provider', 'anthropic',
+        '--permission-mode', 'read-only',
+        '--allow-broad-cwd',
+        '--dangerously-skip-permissions',
+        'fix it',
+      ),
+    ).toMatchObject({
+      initialPrompt: 'fix it',
+      engine: {
+        model: 'opus',
+        provider: 'anthropic',
+        permissionMode: 'read-only',
+        allowBroadCwd: true,
+        dangerouslySkipPermissions: true,
+      },
+    })
+    expect(parse().engine).toEqual({
+      model: undefined,
+      provider: undefined,
+      permissionMode: undefined,
+      allowBroadCwd: undefined,
+      dangerouslySkipPermissions: undefined,
+    })
+  })
 })

@@ -58,6 +58,7 @@ export type CommandResult = {
   openReviewScreen?: boolean
   openQueuePanel?: boolean
   openTodoPanel?: boolean
+  openModelPicker?: boolean
   preSelectAgents?: string[]
 } | void
 
@@ -424,6 +425,28 @@ const ALL_COMMANDS: CommandDefinition[] = [
       params.saveToHistory(params.inputValue.trim())
       clearInput(params)
       return { openTodoPanel: true }
+    },
+  }),
+  // `/model` opens the picker; `/model <name>` switches at once (providers
+  // without a catalog have nothing to pick from).
+  defineCommandWithArgs({
+    name: 'model',
+    handler: (params, args): CommandResult => {
+      const name = args.trim()
+      params.saveToHistory(params.inputValue.trim())
+      clearInput(params)
+      const engine = getNeuronEngineClient()
+      if (engine.connection !== 'ready') {
+        params.setMessages((prev) => [
+          ...prev,
+          getSystemMessage('The Neuron engine is not running, so the model cannot change.'),
+        ])
+        return undefined
+      }
+      if (!name) return { openModelPicker: true }
+      params.setMessages((prev) => [...prev, getUserMessage(`/model ${name}`)])
+      engine.setModel(name)
+      return undefined
     },
   }),
 ]
