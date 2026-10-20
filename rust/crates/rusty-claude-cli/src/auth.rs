@@ -11,7 +11,9 @@ use zeroize::Zeroizing;
 use crate::credentials::{
     classify_token, CredentialLocation, CredentialStore, StoredCredential, TokenKind,
 };
-use crate::device_login::{self, ClientInfo, HttpTransport, SystemClock, TerminalObserver};
+use crate::device_login::{
+    self, ClientInfo, DeviceLoginObserver, HttpTransport, SystemClock, TerminalObserver,
+};
 use crate::gateway_http::{self, GatewayHttpError, ACCOUNT_TIMEOUT};
 use crate::vault::SecureString;
 
@@ -275,24 +277,35 @@ impl Default for LoginOptions {
 /// when this machine has one, and polls Zero-X until the code is approved on
 /// <https://neuron.zero-x.live/device>. No local port is opened.
 pub fn login(options: LoginOptions) -> io::Result<GatewayCredential> {
+    // Ctrl-C ends the process here; the full-screen UI passes its own cancel check.
+    login_with(options, &TerminalObserver, &|| false).map(|(credential, _email)| credential)
+}
+
+/// [`login`] that shows the code through `observer` and gives up when `cancelled` turns
+/// true. Also returns the account's email when the gateway sent it.
+pub fn login_with(
+    options: LoginOptions,
+    observer: &dyn DeviceLoginObserver,
+    cancelled: &dyn Fn() -> bool,
+) -> io::Result<(GatewayCredential, Option<String>)> {
     let base = gateway_base_url()?;
     let allowed =
         device_login::browser_allowed(options.open_browser, &|name| env::var(name).ok(), &|path| {
             std::path::Path::new(path).exists()
         });
     let open_browser = |link: &str| allowed && webbrowser::open(link).is_ok();
-    // Ctrl-C ends the process here; the full-screen UI passes its own cancel check.
-    let clock = SystemClock::new(&|| false);
+    let clock = SystemClock::new(cancelled);
     let grant = device_login::run(
         &base,
         &HttpTransport,
         &clock,
-        &TerminalObserver,
+        observer,
         &ClientInfo::current(),
         &open_browser,
     )?;
     let store = CredentialStore::open_default();
-    finish_login(&store, &base, grant.token)
+    let credential = finish_login(&store, &base, grant.token)?;
+    Ok((credential, grant.email))
 }
 
 /// Records session metadata after the token is stored and reports where.
@@ -316,12 +329,14 @@ fn finish_login(
             ));
         }
         Err(error) => {
-            eprintln!("warning: signed in, but the session details are unavailable ({error})");
+            runtime::ui_hooks::notice(&format!(
+                "warning: signed in, but the session details are unavailable ({error})"
+            ));
         }
     }
     let location = store.save(&stored).map_err(io::Error::other)?;
     crate::gateway_catalog::invalidate_cache();
-    eprintln!("{}", describe_login(&stored, location));
+    runtime::ui_hooks::notice(&describe_login(&stored, location));
     Ok(GatewayCredential {
         token,
         kind,
@@ -374,24 +389,31 @@ pub fn logout() {
                 Some(loaded.credential.token.expose()),
                 ACCOUNT_TIMEOUT,
             ) {
-                Ok(()) => eprintln!("Zero-X session revoked."),
+                Ok(()) => runtime::ui_hooks::notice("Zero-X session revoked."),
                 Err(error) if error.is_invalid_session() => {}
-                Err(error) => eprintln!(
+                Err(error) => runtime::ui_hooks::notice(&format!(
                     "warning: could not revoke the session on Zero-X ({error}); it expires on its own"
-                ),
+                )),
             },
             Ok(_) => {}
-            Err(error) => eprintln!("warning: skipping server sign-out: {error}"),
+            Err(error) => {
+                runtime::ui_hooks::notice(&format!("warning: skipping server sign-out: {error}"));
+            }
         }
     }
     for warning in store.clear() {
-        eprintln!("warning: {warning}");
+        runtime::ui_hooks::notice(&format!("warning: {warning}"));
     }
     crate::gateway_catalog::invalidate_cache();
-    println!("Signed out of Zero-X.");
+    // Stdout on the terminal; a UI that took over notices (and may own stdout) hears it.
+    if runtime::ui_hooks::notice_handler_installed() {
+        runtime::ui_hooks::notice("Signed out of Zero-X.");
+    } else {
+        println!("Signed out of Zero-X.");
+    }
     if env::var("NEURON_TOKEN").is_ok_and(|token| !token.trim().is_empty()) {
-        eprintln!(
-            "NEURON_TOKEN is still set in this shell; unset it to stop using that credential."
+        runtime::ui_hooks::notice(
+            "NEURON_TOKEN is still set in this shell; unset it to stop using that credential.",
         );
     }
 }

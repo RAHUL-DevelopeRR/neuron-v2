@@ -8,7 +8,9 @@
 //!
 //! There is no trust prompt: like a one-shot prompt with piped input, an untrusted
 //! workspace runs without its own settings, hooks and MCP servers
-//! (`UiEvent::Status::workspace_trusted` tells the UI).
+//! (`UiEvent::Status::workspace_trusted` tells the UI). There is no sign-in prompt either:
+//! when Zero-X is the provider and nobody is signed in (or the session ended), the engine
+//! starts signed out (`Status::signed_in` is false) and `/login` signs in from the UI.
 
 // Stdout carries only the protocol.
 #![deny(clippy::print_stdout, clippy::print_stderr)]
@@ -125,12 +127,15 @@ fn start(args: &[String]) -> Result<EngineHandle, String> {
             ));
         }
     }
-    let model = args.model.as_deref().map_or_else(
+    let requested = resolve_repl_model(args.model.as_deref().map_or_else(
         || DEFAULT_MODEL.to_string(),
         resolve_model_alias_with_config,
-    );
-    let model = configure_provider_for_model(resolve_repl_model(model))
-        .map_err(|error| error.to_string())?;
+    ));
+    // Signed out of Zero-X (or the session ended): start anyway, and the UI signs in.
+    let (model, signed_out) = match start_provider(&requested).map_err(|error| error.to_string())? {
+        ProviderStart::Ready(model) => (model, None),
+        ProviderStart::SignInRequired(reason) => (requested, Some(reason)),
+    };
     let permission_mode = args.permission_mode.unwrap_or_else(default_permission_mode);
     let allowed_tools = normalize_allowed_tools(&args.allowed_tools)?;
     crate::engine::spawn(EngineOptions {
@@ -139,6 +144,7 @@ fn start(args: &[String]) -> Result<EngineHandle, String> {
         permission_mode,
         reasoning_effort: args.reasoning_effort,
         resume: args.resume,
+        signed_out,
     })
 }
 

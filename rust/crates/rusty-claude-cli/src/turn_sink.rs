@@ -32,8 +32,20 @@ pub(crate) trait TurnSink: Send {
     fn reasoning_delta(&mut self, text: &str) -> io::Result<()>;
     /// A tool call with its complete input; `cut_off` when the output limit truncated it.
     fn tool_call(&mut self, id: &str, name: &str, input: &str, cut_off: bool) -> io::Result<()>;
-    /// A tool's result or error.
+    /// A tool's result or error, as the tool returned it (calls that ran only).
     fn tool_result(&mut self, name: &str, output: &str, is_error: bool) -> io::Result<()>;
+    /// A tool call's final result as the model sees it, for every call: ran, denied,
+    /// blocked or never started. The line terminal shows results through
+    /// [`Self::tool_result`] and ignores this.
+    fn tool_call_finished(
+        &mut self,
+        _id: &str,
+        _name: &str,
+        _output: &str,
+        _is_error: bool,
+    ) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// How a runtime shows its turns.
@@ -270,8 +282,20 @@ impl TurnSink for ChannelSink {
         })
     }
 
-    fn tool_result(&mut self, name: &str, output: &str, is_error: bool) -> io::Result<()> {
+    /// The UI hears results from [`Self::tool_call_finished`], which covers every call.
+    fn tool_result(&mut self, _name: &str, _output: &str, _is_error: bool) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn tool_call_finished(
+        &mut self,
+        id: &str,
+        name: &str,
+        output: &str,
+        is_error: bool,
+    ) -> io::Result<()> {
         self.send(UiEvent::ToolResult {
+            id: id.to_string(),
             name: name.to_string(),
             output: output.to_string(),
             is_error,
@@ -332,6 +356,8 @@ mod tests {
         sink.tool_call("toolu_1", "bash", r#"{"command":"ls"}"#, true)
             .unwrap();
         sink.tool_result("bash", "a.txt", false).unwrap();
+        sink.tool_call_finished("toolu_1", "bash", "a.txt", false)
+            .unwrap();
         sink.end_block().unwrap();
         sink.end_block().unwrap();
         let events: Vec<UiEvent> = rx.try_iter().collect();
@@ -353,6 +379,7 @@ mod tests {
                     cut_off: true,
                 },
                 UiEvent::ToolResult {
+                    id: "toolu_1".into(),
                     name: "bash".into(),
                     output: "a.txt".into(),
                     is_error: false
