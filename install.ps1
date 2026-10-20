@@ -4,8 +4,10 @@
 
 .DESCRIPTION
     Downloads neuron-windows-x64.exe from GitHub Releases, verifies it against
-    the release's SHA-256 file, and installs it as neuron.exe. Works in Windows
-    PowerShell 5.1 and PowerShell 7+.
+    the release's SHA-256 file, and installs it as neuron.exe. Beside it goes
+    neuron-tui.exe, the full-screen UI that neuron opens in a terminal; nothing
+    about the UI fails the install (without it, neuron runs its line REPL).
+    Works in Windows PowerShell 5.1 and PowerShell 7+.
 
         irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/latest/download/install.ps1 | iex
 
@@ -24,7 +26,7 @@
 
 .NOTES
     Environment: NEURON_VERSION, NEURON_INSTALL_DIR, NEURON_DOWNLOAD_BASE (HTTPS, or loopback HTTP
-    for testing), NEURON_RELEASES_API, GITHUB_TOKEN.
+    for testing), NEURON_RELEASES_API, GITHUB_TOKEN, NEURON_NO_TUI (1 skips the full-screen UI).
 #>
 [CmdletBinding()]
 param(
@@ -37,6 +39,7 @@ param(
 # this scope is the caller's session, which must keep its own preferences.
 $NeuronRepository = 'RAHUL-DevelopeRR/neuron-v2'
 $NeuronAsset = 'neuron-windows-x64.exe'
+$NeuronUiAsset = 'neuron-tui-windows-x64.exe'
 $InvokedAsFile = $MyInvocation.MyCommand.CommandType -eq 'ExternalScript'
 
 function Write-Step([string]$Message) { Write-Host $Message }
@@ -174,11 +177,42 @@ function Install-NeuronBinary([string]$Source, [string]$Destination) {
         try {
             Move-Item -LiteralPath $previous -Destination $Destination -Force
         } catch {
-            throw "could not install ${Destination}: $reason. The previous version is at $previous; rename it back to neuron.exe."
+            throw "could not install ${Destination}: $reason. The previous version is at $previous; rename it back to $(Split-Path -Leaf $Destination)."
         }
         throw "could not install ${Destination}: $reason. The previous version was kept."
     }
     Remove-Item -LiteralPath $previous -Force -ErrorAction SilentlyContinue
+}
+
+# The full-screen UI, verified and self-checked like neuron.exe. Any failure is a warning: neuron
+# runs its line REPL without it.
+function Install-NeuronUi([string]$Base, [string]$Version, [string]$Work, [string]$Target) {
+    $url = "$Base/v$Version/$NeuronUiAsset"
+    try {
+        $checksumFile = Join-Path $Work "$NeuronUiAsset.sha256"
+        Get-NeuronDownload "$url.sha256" $checksumFile $Version
+        $checksumText = [System.IO.File]::ReadAllText($checksumFile).Trim()
+        $expected = ''
+        if ($checksumText) { $expected = ($checksumText -split '\s+')[0].ToLowerInvariant() }
+        if ($expected -notmatch '^[0-9a-f]{64}$') { throw "$url.sha256 does not contain a SHA-256 checksum." }
+        $download = Join-Path $Work $NeuronUiAsset
+        Get-NeuronDownload $url $download $Version
+        if ((Get-NeuronSha256 $download) -ne $expected) { throw "checksum mismatch for $NeuronUiAsset" }
+        $preference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            & $download --version 2>&1 | Out-Null
+            $exit = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $preference
+        }
+        if ($exit -ne 0) { throw "neuron-tui.exe does not run on this system (exit $exit)" }
+        $destination = Join-Path $Target 'neuron-tui.exe'
+        Install-NeuronBinary $download $destination
+        Write-Detail "installed $destination"
+    } catch {
+        Write-Warn "the full-screen UI was not installed ($($_.Exception.Message)); neuron uses its line REPL. Rerun the installer to try again."
+    }
 }
 
 function Get-ReportedVersion([string]$VersionOutput) {
@@ -257,6 +291,13 @@ function Install-Neuron {
         New-Item -ItemType Directory -Path $target -Force | Out-Null
         $destination = Join-Path $target 'neuron.exe'
         Install-NeuronBinary $download $destination
+
+        if (@('', '0', 'false', 'no') -contains "$env:NEURON_NO_TUI".Trim().ToLowerInvariant()) {
+            Write-Detail 'installing the full-screen UI (neuron-tui.exe) ...'
+            Install-NeuronUi $base $resolved $work $target
+        } else {
+            Write-Detail 'NEURON_NO_TUI is set; skipped the full-screen UI.'
+        }
     } finally {
         Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
     }

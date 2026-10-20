@@ -51,6 +51,7 @@ mod doctor;
 mod engine;
 mod engine_stdio;
 mod executor;
+mod full_screen;
 mod gateway_catalog;
 mod gateway_http;
 mod gateway_repl;
@@ -180,6 +181,7 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--dangerously-skip-permissions",
     "--allowedTools",
     "--allowed-tools",
+    "--no-tui",
     "--resume",
     "--acp",
     "-acp",
@@ -273,6 +275,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     let (args, provider_choice) = extract_provider_flag(&args)?;
     provider::set_provider_flag(provider_choice);
+    let (args, no_tui) = full_screen::extract_no_tui_flag(args);
     if let Some(auth_args) = auth::auth_alias(&args) {
         return auth::run_auth_command(auth_args);
     }
@@ -399,14 +402,33 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             base_commit,
             reasoning_effort,
             allow_broad_cwd,
-        } => run_repl(
-            model,
-            allowed_tools,
-            permission_mode,
-            base_commit,
-            reasoning_effort,
-            allow_broad_cwd,
-        )?,
+        } => {
+            // On a terminal with the full-screen UI installed, it takes the
+            // REPL's place (`--no-tui` or NEURON_NO_TUI keeps the REPL).
+            if let Some(ui) = full_screen::ui_binary(no_tui) {
+                let launch = full_screen::UiLaunch {
+                    model: crate::args::typed_model_arg(),
+                    provider: provider::provider_flag(),
+                    permission_mode,
+                    allowed_tools: allowed_tools.as_ref(),
+                    reasoning_effort: reasoning_effort.as_deref(),
+                    allow_broad_cwd,
+                    base_commit: base_commit.as_deref(),
+                };
+                if let Some(ui_args) = full_screen::ui_args(&launch) {
+                    let code = full_screen::run_ui(&ui, &ui_args)?;
+                    std::process::exit(code);
+                }
+            }
+            run_repl(
+                model,
+                allowed_tools,
+                permission_mode,
+                base_commit,
+                reasoning_effort,
+                allow_broad_cwd,
+            )?;
+        }
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
     }

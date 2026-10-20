@@ -855,6 +855,15 @@ pub(crate) fn resolve_model_alias_with_config(model: &str) -> String {
 /// were parsed, which happens before the trust prompt.
 static MODEL_ARG: Mutex<Option<(String, String)>> = Mutex::new(None);
 
+/// `--model` as the user typed it, when this run had one.
+pub(crate) fn typed_model_arg() -> Option<String> {
+    MODEL_ARG
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .map(|(typed, _)| typed.clone())
+}
+
 fn resolve_model_arg(value: &str) -> String {
     let resolved = resolve_model_alias_with_config(value);
     *MODEL_ARG.lock().unwrap_or_else(PoisonError::into_inner) =

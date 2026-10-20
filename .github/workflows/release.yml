@@ -43,8 +43,11 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Each target ships `neuron` and `neuron-tui` (the full-screen UI that `neuron`
+  # opens on a terminal, compiled from ui/neuron-tui with Bun).
   RELEASE_ASSETS: >-
     neuron-linux-x64 neuron-linux-arm64 neuron-macos-arm64 neuron-macos-x64 neuron-windows-x64.exe
+    neuron-tui-linux-x64 neuron-tui-linux-arm64 neuron-tui-macos-arm64 neuron-tui-macos-x64 neuron-tui-windows-x64.exe
 
 jobs:
   metadata:
@@ -133,27 +136,36 @@ jobs:
             target: x86_64-unknown-linux-gnu
             bin: neuron
             asset: neuron-linux-x64
+            ui_asset: neuron-tui-linux-x64
           - name: linux-arm64
             runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             bin: neuron
             asset: neuron-linux-arm64
+            ui_asset: neuron-tui-linux-arm64
           - name: macos-arm64
             runner: macos-14
             target: aarch64-apple-darwin
             bin: neuron
             asset: neuron-macos-arm64
+            ui_asset: neuron-tui-macos-arm64
           - name: macos-x64
             # Cross-compiled on Apple silicon; smoke-tested under Rosetta 2 when available.
             runner: macos-14
             target: x86_64-apple-darwin
             bin: neuron
             asset: neuron-macos-x64
+            ui_asset: neuron-tui-macos-x64
+            # Bun cross-compiles the UI too (ui/neuron-tui/scripts/build-binary.ts).
+            bun_target: bun-darwin-x64
+            bun_platform: darwin
+            bun_arch: x64
           - name: windows-x64
             runner: windows-2022
             target: x86_64-pc-windows-msvc
             bin: neuron.exe
             asset: neuron-windows-x64.exe
+            ui_asset: neuron-tui-windows-x64.exe
     steps:
       - uses: actions/checkout@v4
 
@@ -188,19 +200,47 @@ jobs:
           print(f'{digest}  {path.name}')
           PY
 
-      - name: Smoke-test the binary
+      - uses: oven-sh/setup-bun@v2
+        with:
+          # ui/neuron-tui/package.json pins the same version (engines, packageManager).
+          bun-version: 1.3.14
+
+      - name: Install the UI's dependencies
+        working-directory: ui/neuron-tui
+        run: bun install --frozen-lockfile
+
+      - name: Build the full-screen UI and its checksum
+        working-directory: ui/neuron-tui
+        shell: bash
+        env:
+          # Empty except for cross-compiled targets.
+          OVERRIDE_TARGET: ${{ matrix.bun_target }}
+          OVERRIDE_PLATFORM: ${{ matrix.bun_platform }}
+          OVERRIDE_ARCH: ${{ matrix.bun_arch }}
+        run: |
+          bun run build:binary "${{ needs.metadata.outputs.version }}" --outfile="../../dist/${{ matrix.ui_asset }}"
+          python - "../../dist/${{ matrix.ui_asset }}" <<'PY'
+          import hashlib, pathlib, sys
+          path = pathlib.Path(sys.argv[1])
+          digest = hashlib.sha256(path.read_bytes()).hexdigest()
+          path.with_name(path.name + '.sha256').write_text(f'{digest}  {path.name}\n', encoding='ascii', newline='\n')
+          print(f'{digest}  {path.name}')
+          PY
+
+      - name: Smoke-test the binaries
         shell: bash
         run: |
-          binary="dist/${{ matrix.asset }}"
-          if [ "${{ matrix.name }}" = "macos-x64" ]; then
-            if arch -x86_64 /usr/bin/true 2>/dev/null; then
-              arch -x86_64 "$binary" --version
+          for binary in "dist/${{ matrix.asset }}" "dist/${{ matrix.ui_asset }}"; do
+            if [ "${{ matrix.name }}" = "macos-x64" ]; then
+              if arch -x86_64 /usr/bin/true 2>/dev/null; then
+                arch -x86_64 "$binary" --version
+              else
+                echo "::notice::Rosetta 2 is not available on this runner; skipping the x64 smoke test"
+              fi
             else
-              echo "::notice::Rosetta 2 is not available on this runner; skipping the x64 smoke test"
+              "$binary" --version
             fi
-          else
-            "$binary" --version
-          fi
+          done
 
       - name: Check the minimum glibc version
         if: startsWith(matrix.name, 'linux-')
@@ -208,16 +248,18 @@ jobs:
           # README.md (Supported platforms) states this floor; change both together.
           MAX_GLIBC: '2.35'
         run: |
-          floor="$(objdump -T "dist/${{ matrix.asset }}" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -uV | tail -n 1)"
-          echo "${{ matrix.asset }} requires glibc ${floor:-(unknown)}" | tee -a "$GITHUB_STEP_SUMMARY"
-          if [ -z "$floor" ]; then
-            echo "::error::could not read the glibc symbol versions of ${{ matrix.asset }}"
-            exit 1
-          fi
-          if [ "$(printf '%s\n%s\n' "$floor" "$MAX_GLIBC" | sort -V | tail -n 1)" != "$MAX_GLIBC" ]; then
-            echo "::error::${{ matrix.asset }} needs glibc $floor, newer than the supported floor $MAX_GLIBC"
-            exit 1
-          fi
+          for asset in "${{ matrix.asset }}" "${{ matrix.ui_asset }}"; do
+            floor="$(objdump -T "dist/$asset" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -uV | tail -n 1)"
+            echo "$asset requires glibc ${floor:-(unknown)}" | tee -a "$GITHUB_STEP_SUMMARY"
+            if [ -z "$floor" ]; then
+              echo "::error::could not read the glibc symbol versions of $asset"
+              exit 1
+            fi
+            if [ "$(printf '%s\n%s\n' "$floor" "$MAX_GLIBC" | sort -V | tail -n 1)" != "$MAX_GLIBC" ]; then
+              echo "::error::$asset needs glibc $floor, newer than the supported floor $MAX_GLIBC"
+              exit 1
+            fi
+          done
 
       - uses: actions/upload-artifact@v4
         with:
@@ -254,6 +296,11 @@ jobs:
             dist/neuron-macos-arm64
             dist/neuron-macos-x64
             dist/neuron-windows-x64.exe
+            dist/neuron-tui-linux-x64
+            dist/neuron-tui-linux-arm64
+            dist/neuron-tui-macos-arm64
+            dist/neuron-tui-macos-x64
+            dist/neuron-tui-windows-x64.exe
 
   notices:
     name: Third-party notices
@@ -268,11 +315,18 @@ jobs:
           node-version: '24'
       - name: Fetch crate sources for every target
         run: cargo fetch --locked --manifest-path rust/Cargo.toml
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - name: Install the full-screen UI's npm packages (their licenses go in the notices)
+        working-directory: ui/neuron-tui
+        run: bun install --frozen-lockfile --production
       - name: Generate THIRD_PARTY_NOTICES.md
         run: |
           mkdir -p dist
           node scripts/generate-third-party-notices.mjs --output dist/THIRD_PARTY_NOTICES.md
           grep -q '^## Rust crates' dist/THIRD_PARTY_NOTICES.md
+          grep -q '^## Full-screen UI' dist/THIRD_PARTY_NOTICES.md
       - uses: actions/upload-artifact@v4
         with:
           name: THIRD_PARTY_NOTICES.md
@@ -435,6 +489,7 @@ jobs:
           curl --fail --silent --show-error --location "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/install.sh" \
             | NEURON_VERSION="$VERSION" NEURON_INSTALL_DIR="$RUNNER_TEMP/bin" sh
           "$RUNNER_TEMP/bin/neuron" --version | tee /dev/stderr | grep -F "$VERSION"
+          "$RUNNER_TEMP/bin/neuron-tui" --version | tee /dev/stderr | grep -Fx "$VERSION"
 
       - name: Install with install.ps1 (Windows PowerShell 5.1)
         if: runner.os == 'Windows'
@@ -446,6 +501,9 @@ jobs:
           $output = & (Join-Path $env:NEURON_INSTALL_DIR 'neuron.exe') --version | Out-String
           Write-Host $output
           if ($output -notmatch [regex]::Escape($env:VERSION)) { throw "neuron --version did not report $env:VERSION" }
+          $ui = (& (Join-Path $env:NEURON_INSTALL_DIR 'neuron-tui.exe') --version | Out-String).Trim()
+          Write-Host $ui
+          if ($ui -ne $env:VERSION) { throw "neuron-tui --version reported '$ui', not $env:VERSION" }
 
   promote:
     name: Mark the release as latest

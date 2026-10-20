@@ -7,12 +7,78 @@ import {test} from 'node:test';
 import {
   RELEASE_TARGETS,
   collectDependencies,
+  collectNpmPackages,
   findLicenseFiles,
   mergePackages,
   parseArgs,
   readBundledSkills,
+  readUi,
   renderNotices,
 } from '../scripts/generate-third-party-notices.mjs';
+
+/** A UI package with node_modules: a -> b (nested), optional c (installed), optional d (not). */
+function uiFixture(t) {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'notices-ui-'));
+  t.after(() => rmSync(root, {recursive: true, force: true}));
+  const write = (file, value) => {
+    mkdirSync(path.dirname(path.join(root, file)), {recursive: true});
+    writeFileSync(path.join(root, file), typeof value === 'string' ? value : JSON.stringify(value));
+  };
+  write('package.json', {name: 'neuron-tui', license: 'Apache-2.0', dependencies: {a: '1.0.0'}, devDependencies: {dev: '1.0.0'}});
+  write('LICENSE', 'Apache text');
+  write('NOTICE', 'Codebuff notice');
+  write('node_modules/a/package.json', {
+    name: 'a',
+    version: '1.0.0',
+    license: 'MIT',
+    repository: {url: 'git+https://github.com/x/a.git'},
+    dependencies: {b: '2.0.0'},
+    optionalDependencies: {c: '1.0.0', d: '1.0.0'},
+  });
+  write('node_modules/a/LICENSE', 'MIT text');
+  write('node_modules/a/node_modules/b/package.json', {name: 'b', version: '2.0.0', licenses: [{type: 'ISC'}]});
+  write('node_modules/c/package.json', {name: 'c', version: '1.0.0', license: 'MIT'});
+  write('node_modules/c/LICENSE.md', 'MIT text\r\n');
+  write('node_modules/dev/package.json', {name: 'dev', version: '1.0.0', license: 'GPL-3.0'});
+  return root;
+}
+
+test('the UI notices cover its production npm closure, nested and optional packages', (t) => {
+  const root = uiFixture(t);
+  const packages = collectNpmPackages(root);
+  assert.deepEqual(
+    packages.map((pkg) => [pkg.name, pkg.version, pkg.license]),
+    [['a', '1.0.0', 'MIT'], ['b', '2.0.0', 'ISC'], ['c', '1.0.0', 'MIT']],
+  );
+  assert.equal(packages[0].repository, 'https://github.com/x/a');
+
+  const document = renderNotices({
+    rootName: 'rusty-claude-cli',
+    rootVersion: '1.0.0',
+    targets: ['x86_64-unknown-linux-gnu'],
+    packages: [],
+    skills: [],
+    licenseFiles: () => [],
+    includeTexts: true,
+    ui: {...readUi(root), path: 'ui/neuron-tui'},
+  });
+  assert.match(document, /## Full-screen UI \(`neuron-tui`\)/);
+  assert.match(document, /Apache License 2\.0/);
+  assert.match(document, /### npm packages \(3\)/);
+  assert.match(document, /\| a \| 1\.0\.0 \| MIT \| https:\/\/github\.com\/x\/a \|/);
+  assert.match(document, /### ui\/neuron-tui\/NOTICE\n\n```text\nCodebuff notice\n```/);
+  // a's LICENSE and c's LICENSE.md share one block after CRLF normalisation.
+  assert.match(document, /#### LICENSE, LICENSE\.md\n\nUsed by: a 1\.0\.0, c 1\.0\.0/);
+  assert.match(document, /- b 2\.0\.0: ISC/);
+  assert.doesNotMatch(document, /GPL-3\.0/);
+});
+
+test('a UI without node_modules is an error, not a silent omission', (t) => {
+  const root = uiFixture(t);
+  rmSync(path.join(root, 'node_modules'), {recursive: true, force: true});
+  assert.throws(() => collectNpmPackages(root), /bun install --frozen-lockfile/);
+  assert.equal(parseArgs(['--no-ui']).uiDir, null);
+});
 
 function crate(root, name, version, fields = {}, files = {}) {
   const directory = path.join(root, `${name}-${version}`);

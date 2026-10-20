@@ -282,7 +282,7 @@ pub fn set_provider_flag(provider: Option<ProviderId>) {
     *flag_slot().write().unwrap_or_else(PoisonError::into_inner) = provider;
 }
 
-fn provider_flag() -> Option<ProviderId> {
+pub(crate) fn provider_flag() -> Option<ProviderId> {
     *flag_slot().read().unwrap_or_else(PoisonError::into_inner)
 }
 

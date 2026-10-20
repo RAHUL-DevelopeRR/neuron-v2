@@ -9,6 +9,11 @@
 // sign-in panel, /login, /model and /logout. Its approval comes at the first
 // poll; prompts after it fail, since the fake has no chat endpoint.
 //
+// `--compiled` runs bin/neuron-tui (from `bun run build:binary`) instead of
+// the source, to check the binary. `--via-neuron` runs a bare `neuron`, which
+// should hand the terminal to that binary (NEURON_TUI_BIN), as an installed
+// Neuron does; it takes no prompt. Flags go before the prompt.
+//
 // Needs `cargo build -p rusty-claude-cli -p mock-anthropic-service` in rust/,
 // or NEURON_BIN and NEURON_MOCK_BIN. Everything (engine config, UI settings,
 // chat history, the workspace) lives in a temp folder that is removed on exit.
@@ -35,8 +40,15 @@ for (const [label, file] of [
 }
 
 const args = process.argv.slice(2)
-const signedOut = args[0] === '--signed-out'
-if (signedOut) args.shift()
+const flags = new Set<string>()
+while (['--signed-out', '--compiled', '--via-neuron'].includes(args[0] ?? '')) flags.add(args.shift()!)
+if (flags.has('--via-neuron')) flags.add('--compiled')
+const signedOut = flags.has('--signed-out')
+const compiledBin = path.join(import.meta.dir, '..', 'bin', exe('neuron-tui'))
+if (flags.has('--compiled') && !fs.existsSync(compiledBin)) {
+  console.error(`${compiledBin} not found. Run \`bun run build:binary <version>\` first.`)
+  process.exit(1)
+}
 
 const mock = Bun.spawn([mockBin], { stdout: 'pipe', stderr: 'ignore' })
 const reader = mock.stdout.getReader()
@@ -82,6 +94,7 @@ Object.assign(env, {
   NEURON_TUI_CONFIG_DIR: path.join(home, 'tui'),
   NEURON_BIN: neuronBin,
 })
+if (flags.has('--via-neuron')) env.NEURON_TUI_BIN = compiledBin
 const gateway = signedOut ? startFakeGateway() : null
 if (gateway) {
   env.NEURON_API_BASE = gateway.base
@@ -91,7 +104,11 @@ if (gateway) {
 }
 
 const ui = Bun.spawn(
-  [process.execPath, 'run', path.join(import.meta.dir, '..', 'src', 'entry.ts'), ...args],
+  flags.has('--via-neuron')
+    ? [neuronBin]
+    : flags.has('--compiled')
+    ? [compiledBin, ...args]
+    : [process.execPath, 'run', path.join(import.meta.dir, '..', 'src', 'entry.ts'), ...args],
   { cwd: workspace, env, stdio: ['inherit', 'inherit', 'inherit'] },
 )
 const code = await ui.exited

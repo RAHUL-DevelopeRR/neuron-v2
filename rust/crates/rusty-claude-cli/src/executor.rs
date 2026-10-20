@@ -465,6 +465,10 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)")?;
     writeln!(
         out,
+        "  --no-tui                   Use the line REPL even where the full-screen UI is installed (or set NEURON_NO_TUI=1)"
+    )?;
+    writeln!(
+        out,
         "  --version, -V              Print version and build information locally"
     )?;
     writeln!(out)?;

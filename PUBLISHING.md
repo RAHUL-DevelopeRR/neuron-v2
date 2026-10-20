@@ -103,10 +103,13 @@ manual run (Actions, Release, Run workflow) on a branch only builds the binaries
 
 ## 4. Verify the assets
 
-The release must have these 14 assets:
+The release must have these 24 assets:
 
 - `neuron-linux-x64`, `neuron-linux-arm64`, `neuron-macos-arm64`, `neuron-macos-x64`,
   `neuron-windows-x64.exe`
+- the full-screen UI for each target: `neuron-tui-linux-x64`, `neuron-tui-linux-arm64`,
+  `neuron-tui-macos-arm64`, `neuron-tui-macos-x64`, `neuron-tui-windows-x64.exe`
+  (built from `ui/neuron-tui` with Bun in the same build job)
 - one `.sha256` file for each of them
 - `SHA256SUMS`, `THIRD_PARTY_NOTICES.md`, `install.sh`, `install.ps1`
 

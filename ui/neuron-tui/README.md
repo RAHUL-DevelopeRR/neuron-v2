@@ -7,19 +7,30 @@ protocol of `neuron engine --stdio` (`src/engine/`).
 
 What was taken out of Freebuff, and why, is in [PORTING.md](PORTING.md).
 
-## Status (P4: rebranded, not yet packaged)
+## Status (P4)
 
 The UI starts `neuron engine --stdio` in the project folder and runs real
 turns through it: streamed text, tool calls and results, and permission
 prompts. It also covers the Zero-X sign-in (`/login`, with the device code
-shown in the UI), the model picker (`/model`) and a status footer. It carries
-Neuron's name and logo. Shipping it in the npm and PyPI packages is the rest
-of P4 (see [PORTING.md](PORTING.md)).
+shown in the UI), the model picker (`/model`) and a status footer, under
+Neuron's name and logo.
 
-It finds the engine through `NEURON_BIN`, then a `neuron` binary beside the
-UI, then the PATH it started with. `--model`, `--provider`, `--permission-mode`,
+Releases ship it as `neuron-tui-<target>` beside `neuron-<target>`. On a
+terminal, a bare `neuron` starts it (`--no-tui` or `NEURON_NO_TUI=1` keeps the
+line REPL). See [PORTING.md](PORTING.md) for the packaging.
+
+It finds the engine through `NEURON_BIN` (which `neuron` sets to itself), then
+a `neuron` binary beside the UI, then the PATH it started with. `--model`,
+`--provider`, `--permission-mode`, `--allowedTools`, `--reasoning-effort`,
 `--allow-broad-cwd` and `--dangerously-skip-permissions` pass through to the
 engine.
+
+```bash
+bun run build:binary 6.3.0
+```
+
+`bun run build:binary <version>` writes `bin/neuron-tui` (`.exe` on Windows)
+for this machine.
 
 ## Requirements
 

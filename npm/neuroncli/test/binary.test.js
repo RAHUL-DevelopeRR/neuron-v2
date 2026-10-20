@@ -6,6 +6,7 @@ import path from 'node:path';
 import {test} from 'node:test';
 import {setTimeout as delay} from 'node:timers/promises';
 import {LauncherError, assetFor, binaryLocations, cacheRoot, downloadBase, downloadBinary, parseChecksum} from '../lib/binary.js';
+import {wantsFullScreenUi} from '../lib/full-screen.js';
 import {exitCodeForSignal, listenedSignals, shouldForwardSignal} from '../lib/signals.js';
 import {PACKAGE_ROOT, REPO_ROOT, sha256, tempDir} from './helpers.js';
 
@@ -43,6 +44,43 @@ test('every published platform maps to its release asset', () => {
   }
   assert.throws(() => assetFor('freebsd', 'x64'), (error) => error instanceof LauncherError && error.kind === 'platform');
   assert.throws(() => assetFor('linux', 'x64', {musl: true}), /musl/);
+});
+
+test('the full-screen UI has an asset beside every CLI asset', () => {
+  const cases = [
+    ['win32', 'x64', 'neuron-tui-windows-x64.exe'],
+    ['win32', 'arm64', 'neuron-tui-windows-x64.exe'],
+    ['linux', 'x64', 'neuron-tui-linux-x64'],
+    ['linux', 'arm64', 'neuron-tui-linux-arm64'],
+    ['darwin', 'arm64', 'neuron-tui-macos-arm64'],
+    ['darwin', 'x64', 'neuron-tui-macos-x64'],
+  ];
+  for (const [platform, arch, asset] of cases) {
+    assert.equal(assetFor(platform, arch, {musl: false, component: 'ui'}), asset, `${platform}-${arch}`);
+  }
+  const [packaged, cached] = binaryLocations({
+    root: '/pkg',
+    version: '6.3.0',
+    asset: 'neuron-tui-windows-x64.exe',
+    env: {NEURON_CACHE_DIR: '/cache'},
+    platform: 'win32',
+    component: 'ui',
+  });
+  assert.equal(packaged, path.join('/pkg', 'bin', 'native', 'neuron-tui.exe'));
+  assert.equal(cached, path.join(path.resolve('/cache'), '6.3.0', 'neuron-tui-windows-x64.exe'));
+});
+
+test('the UI is wanted only for a bare launch on a terminal', () => {
+  const tty = {env: {}, interactive: true};
+  assert.equal(wantsFullScreenUi([], tty), true);
+  assert.equal(wantsFullScreenUi(['--model', 'opus', '--permission-mode', 'read-only', '--allow-broad-cwd'], tty), true);
+  assert.equal(wantsFullScreenUi(['--provider=anthropic'], tty), true);
+  assert.equal(wantsFullScreenUi([], {env: {}, interactive: false}), false);
+  assert.equal(wantsFullScreenUi([], {env: {NEURON_NO_TUI: '1'}, interactive: true}), false);
+  assert.equal(wantsFullScreenUi([], {env: {NEURON_NO_TUI: '0'}, interactive: true}), true);
+  for (const args of [['--no-tui'], ['fix the bug'], ['-p', 'hi'], ['status'], ['--help'], ['--version'], ['--model', 'opus', 'prompt']]) {
+    assert.equal(wantsFullScreenUi(args, tty), false, args.join(' '));
+  }
 });
 
 test('download base must be HTTPS or loopback HTTP', () => {
@@ -106,7 +144,7 @@ test('the package ships LICENSE and NOTICE identical to the repository copies', 
 test('npm pack includes the launcher, license files and nothing from test/', () => {
   const output = execSync('npm pack --dry-run --json --ignore-scripts', {cwd: PACKAGE_ROOT, encoding: 'utf8'});
   const files = JSON.parse(output)[0].files.map((file) => file.path.replace(/\\/g, '/')).sort();
-  for (const expected of ['LICENSE', 'NOTICE', 'README.md', 'bin/neuron.js', 'lib/binary.js', 'lib/signals.js', 'package.json', 'scripts/install.js']) {
+  for (const expected of ['LICENSE', 'NOTICE', 'README.md', 'bin/neuron.js', 'lib/binary.js', 'lib/full-screen.js', 'lib/signals.js', 'package.json', 'scripts/install.js']) {
     assert.ok(files.includes(expected), `${expected} missing from ${files.join(', ')}`);
   }
   assert.ok(!files.some((file) => file.startsWith('test/') || file.startsWith('bin/native')), files.join(', '));

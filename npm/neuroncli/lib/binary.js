@@ -1,7 +1,10 @@
-// Locates, downloads and verifies the native Neuron binary for this package.
+// Locates, downloads and verifies the native binaries for this package: the
+// `neuron` CLI and engine, and `neuron-tui`, its full-screen UI (the "ui"
+// component), which `neuron` starts in place of its line REPL on a terminal.
 //
 // Layout (shared with the Python launcher's cache):
 //   <package>/bin/native/neuron[.exe] (+ .sha256)        written by postinstall
+//   <package>/bin/native/neuron-tui[.exe] (+ .sha256)
 //   <cache>/neuroncli/<version>/<asset> (+ .sha256)      fallback when the package
 //                                                         directory is read-only
 // A binary counts as installed only when its .sha256 sidecar exists; the
@@ -34,6 +37,18 @@ const ASSETS = new Map([
   ['darwin-x64', 'neuron-macos-x64'],
 ]);
 
+// The UI's asset for each platform is the CLI's with `neuron-tui-` for `neuron-`.
+export const COMPONENTS = {
+  neuron: {file: 'neuron', label: 'Neuron', assetPrefix: 'neuron-'},
+  ui: {file: 'neuron-tui', label: "Neuron's full-screen UI", assetPrefix: 'neuron-tui-'},
+};
+
+function component(name) {
+  const found = COMPONENTS[name];
+  if (!found) throw new LauncherError(`Unknown component: ${name}`);
+  return found;
+}
+
 /**
  * An error whose message is meant for the user (printed without a stack).
  * `kind` is 'network' for transient download failures that a later run may
@@ -59,8 +74,13 @@ function isMuslLinux() {
   }
 }
 
-export function assetFor(platform = process.platform, arch = process.arch, {musl = platform === 'linux' && isMuslLinux()} = {}) {
-  const asset = ASSETS.get(`${platform}-${arch}`);
+export function assetFor(
+  platform = process.platform,
+  arch = process.arch,
+  {musl = platform === 'linux' && isMuslLinux(), component: name = 'neuron'} = {},
+) {
+  const cliAsset = ASSETS.get(`${platform}-${arch}`);
+  const asset = cliAsset && component(name).assetPrefix + cliAsset.slice('neuron-'.length);
   if (!asset) {
     throw new LauncherError(
       `Neuron does not publish a binary for ${platform} ${arch}. Supported: ${SUPPORTED}. ` +
@@ -99,8 +119,16 @@ export function cacheRoot(env = process.env, platform = process.platform) {
 }
 
 /** Candidate install locations, in preference order. */
-export function binaryLocations({root = PACKAGE_ROOT, version, asset, env = process.env, platform = process.platform}) {
-  const name = platform === 'win32' ? 'neuron.exe' : 'neuron';
+export function binaryLocations({
+  root = PACKAGE_ROOT,
+  version,
+  asset,
+  env = process.env,
+  platform = process.platform,
+  component: componentName = 'neuron',
+}) {
+  const {file} = component(componentName);
+  const name = platform === 'win32' ? `${file}.exe` : file;
   return [path.join(root, 'bin', 'native', name), path.join(cacheRoot(env, platform), version, asset)];
 }
 
@@ -207,9 +235,10 @@ export async function downloadBinary({
   platform = process.platform,
   log = () => {},
   idleTimeoutMs = IDLE_TIMEOUT_MS,
+  label = 'Neuron',
 }) {
   mkdirSync(path.dirname(destination), {recursive: true});
-  log(`Downloading Neuron ${version} (${asset}) to ${path.dirname(destination)} ...`);
+  log(`Downloading ${label} ${version} (${asset}) to ${path.dirname(destination)} ...`);
   const expected = await fetchChecksum(`${url}.sha256`, version, idleTimeoutMs);
   if (!expected) throw new LauncherError(`${url}.sha256 does not contain a SHA-256 checksum.`, {kind: 'integrity'});
 
@@ -259,9 +288,23 @@ function isPermissionError(error) {
   return ['EACCES', 'EPERM', 'EROFS'].includes(error?.code);
 }
 
+/** The verified installed binary of `component`, or null (nothing is downloaded). */
+export function installedBinary({
+  root = PACKAGE_ROOT,
+  env = process.env,
+  platform = process.platform,
+  arch = process.arch,
+  component: componentName = 'neuron',
+} = {}) {
+  const version = packageVersion(root);
+  const asset = assetFor(platform, arch, {component: componentName});
+  return binaryLocations({root, version, asset, env, platform, component: componentName}).find(isVerified) ?? null;
+}
+
 /**
  * Returns a verified binary path, downloading the release asset on demand.
  * `log` receives progress lines (the launcher prints them to stderr).
+ * `component` is 'neuron' (the default) or 'ui'.
  */
 export async function ensureBinary({
   root = PACKAGE_ROOT,
@@ -269,18 +312,20 @@ export async function ensureBinary({
   platform = process.platform,
   arch = process.arch,
   log = () => {},
+  component: componentName = 'neuron',
 } = {}) {
   const version = packageVersion(root);
-  const asset = assetFor(platform, arch);
-  const locations = binaryLocations({root, version, asset, env, platform});
+  const asset = assetFor(platform, arch, {component: componentName});
+  const locations = binaryLocations({root, version, asset, env, platform, component: componentName});
   const installed = locations.find(isVerified);
   if (installed) return installed;
 
+  const {label} = component(componentName);
   const url = `${downloadBase(env)}/v${version}/${asset}`;
   let permissionError;
   for (const destination of locations) {
     try {
-      return await downloadBinary({destination, url, version, asset, platform, log});
+      return await downloadBinary({destination, url, version, asset, platform, log, label});
     } catch (error) {
       if (!isPermissionError(error)) throw error;
       permissionError = error;

@@ -62,6 +62,13 @@ The npm and pip packages are small launchers. The first run downloads the binary
 the package's exact version, verifies it and caches it; later runs start without
 network access. Ctrl+C goes to Neuron, and the launcher exits with Neuron's exit code.
 
+On a terminal, `neuron` with no prompt opens the full-screen UI, `neuron-tui`. The
+installers put it beside `neuron`, and the launchers fetch it the same way, verified
+by checksum. `neuron --no-tui` (or `NEURON_NO_TUI=1`) keeps the line REPL. Without
+the UI, for example after a failed download, `neuron` runs the line REPL as
+before. Prompts (`neuron "fix the test"`, `neuron -p ...`) and subcommands never
+start it.
+
 **From source**
 
 ```sh
@@ -73,13 +80,13 @@ cargo build --release -p rusty-claude-cli
 
 ### Supported platforms
 
-| Platform | Release asset |
+| Platform | Release assets |
 | --- | --- |
-| Linux x64, glibc 2.35 or later | `neuron-linux-x64` |
-| Linux arm64, glibc 2.35 or later | `neuron-linux-arm64` |
-| macOS, Apple silicon | `neuron-macos-arm64` |
-| macOS, Intel | `neuron-macos-x64` |
-| Windows x64 | `neuron-windows-x64.exe` (Windows on Arm runs it under emulation) |
+| Linux x64, glibc 2.35 or later | `neuron-linux-x64`, `neuron-tui-linux-x64` |
+| Linux arm64, glibc 2.35 or later | `neuron-linux-arm64`, `neuron-tui-linux-arm64` |
+| macOS, Apple silicon | `neuron-macos-arm64`, `neuron-tui-macos-arm64` |
+| macOS, Intel | `neuron-macos-x64`, `neuron-tui-macos-x64` |
+| Windows x64 | `neuron-windows-x64.exe`, `neuron-tui-windows-x64.exe` (Windows on Arm runs them under emulation) |
 
 glibc 2.35 or later means Ubuntu 22.04, Debian 12, Fedora 36 or newer. On older
 distributions (for example Ubuntu 20.04, Debian 11 or RHEL 9) the binary may not

@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 // npm entry point: runs the native Neuron binary for this package version,
 // downloading and verifying it on first use when postinstall did not run
-// (for example `npm install --ignore-scripts`).
+// (for example `npm install --ignore-scripts`). On a terminal, a bare `neuron`
+// opens the full-screen UI: the launcher has `neuron-tui` ready (downloading
+// it too if needed) and tells `neuron` where it is (NEURON_TUI_BIN). Without
+// it, `neuron` runs its line REPL as before.
 //
 // The launcher sets process.exitCode instead of calling process.exit():
 // exiting while fetch handles are still closing aborts Node on Windows.
@@ -11,6 +14,7 @@ import {existsSync, statSync} from 'node:fs';
 import {createRequire} from 'node:module';
 import path from 'node:path';
 import {LauncherError, ensureBinary} from '../lib/binary.js';
+import {wantsFullScreenUi} from '../lib/full-screen.js';
 import {exitCodeForSignal, isInteractive, listenedSignals, shouldForwardSignal} from '../lib/signals.js';
 
 function report(error) {
@@ -28,6 +32,21 @@ async function resolveBinary() {
     return candidate;
   }
   return ensureBinary({log: (line) => process.stderr.write(`${line}\n`)});
+}
+
+/** The UI binary for this run, or null: not wanted here, or it could not be had. */
+async function resolveUi(argv) {
+  // A UI the user points at is passed on as it is.
+  if (process.env.NEURON_TUI_BIN) return null;
+  const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+  if (!wantsFullScreenUi(argv, {env: process.env, interactive})) return null;
+  try {
+    return await ensureBinary({component: 'ui', log: (line) => process.stderr.write(`${line}\n`)});
+  } catch (error) {
+    const message = error instanceof LauncherError ? error.message : String(error?.message || error);
+    process.stderr.write(`neuron: the full-screen UI is not available (${message}); using the line REPL.\n`);
+    return null;
+  }
 }
 
 function childEnvironment() {
@@ -57,7 +76,12 @@ async function main() {
     return;
   }
 
-  const child = spawn(binary, process.argv.slice(2), {stdio: 'inherit', env: childEnvironment()});
+  const argv = process.argv.slice(2);
+  const env = childEnvironment();
+  const ui = await resolveUi(argv);
+  if (ui) env.NEURON_TUI_BIN = ui;
+
+  const child = spawn(binary, argv, {stdio: 'inherit', env});
   const signals = listenedSignals();
   const relay = (signal) => {
     if (!shouldForwardSignal(signal, {interactive: isInteractive()})) return;

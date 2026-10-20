@@ -26,6 +26,8 @@ export type ParsedArgs = {
     | 'model'
     | 'provider'
     | 'permissionMode'
+    | 'allowedTools'
+    | 'reasoningEffort'
     | 'allowBroadCwd'
     | 'dangerouslySkipPermissions'
   >
@@ -84,6 +86,8 @@ export function parseArgs({
       '--permission-mode <mode>',
       'read-only, workspace-write or danger-full-access',
     )
+    .option('--allowedTools <tools>', 'Comma-separated tools the agent may use')
+    .option('--reasoning-effort <level>', 'Reasoning effort for models that support it')
     .option(
       '--allow-broad-cwd',
       'Run from a very broad folder (such as your home folder)',
@@ -123,6 +127,13 @@ export function parseArgs({
       model: options.model,
       provider: options.provider,
       permissionMode: options.permissionMode,
+      allowedTools: options.allowedTools
+        ? String(options.allowedTools)
+            .split(',')
+            .map((tool) => tool.trim())
+            .filter(Boolean)
+        : undefined,
+      reasoningEffort: options.reasoningEffort,
       allowBroadCwd: options.allowBroadCwd || undefined,
       dangerouslySkipPermissions: options.dangerouslySkipPermissions || undefined,
     },

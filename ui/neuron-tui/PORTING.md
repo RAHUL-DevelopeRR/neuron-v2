@@ -134,7 +134,43 @@ though, is looked up on the PATH from before the import
 `HTTPS_PROXY` stays importable, as upstream chose; TLS trust variables stay
 blocked.
 
-## Behaviour today (P4, before packaging)
+## Packaging (P4)
+
+- `bun run build:binary <version>` (`scripts/build-binary.ts`, from Freebuff's)
+  compiles the UI into `bin/neuron-tui[.exe]`. It embeds this platform's OpenTUI
+  native library and bakes in `NEURON_TUI_VERSION`/`NEURON_TUI_TARGET`. A
+  project's `.env` and `bunfig.toml` are never read. `OVERRIDE_TARGET`,
+  `OVERRIDE_PLATFORM` and `OVERRIDE_ARCH` cross-compile (`release.yml` builds
+  macOS x64 on Apple silicon). On Windows the binary is about 114 MB, most of
+  it the Bun runtime.
+- `release.yml` builds `neuron-tui-<target>` in each target's build job, beside
+  `neuron-<target>`. It writes the `.sha256`, smoke-tests `--version`, checks the
+  Linux glibc floor, attests provenance, lists the asset in `SHA256SUMS`, and
+  checks `neuron-tui --version` after each install.
+  `THIRD_PARTY_NOTICES.md` gains a "Full-screen UI" section: this package's
+  LICENSE and NOTICE, and the licenses of the 190 npm packages compiled into it.
+- `neuron` (Rust, `full_screen.rs`) starts the UI in place of its line REPL
+  when stdin and stdout are terminals and `neuron-tui` sits beside it (or at
+  `NEURON_TUI_BIN`). It passes its REPL flags on (`--model`, `--provider`,
+  `--permission-mode`, `--allowedTools`, `--reasoning-effort`,
+  `--allow-broad-cwd`) and sets `NEURON_BIN` to itself, so the UI runs it as the
+  engine. `--no-tui`, `NEURON_NO_TUI=1` or `--base-commit` keep the REPL. On Unix
+  `neuron` execs the UI. On Windows it waits for it, with the console's Ctrl-C and
+  Ctrl-Break marked handled, so the parent is not killed under the UI.
+- The installers put `neuron-tui` beside `neuron`. The npm and pip launchers
+  keep it verified and cached like `neuron`: postinstall fetches it, and a
+  terminal launch fetches it on demand. They pass its path as `NEURON_TUI_BIN`.
+  A failure about the UI is a warning, never a failed install or launch: `neuron`
+  then runs its REPL. `NEURON_NO_TUI=1` skips the download.
+- `bun run dev:mock --compiled` runs the compiled UI against the mock, and
+  `--via-neuron` runs a bare `neuron` to check the hand-off. Both were checked by
+  hand on Windows: the binary loads its renderer and runs a turn, and a bare
+  `neuron` opens it with itself as the engine.
+- CI (`rust-ci.yml`, job `neuron-tui`) typechecks, tests and compiles the UI on
+  Ubuntu and Windows. `ui/react-tui` (the Ink prototype) and the root npm
+  workspace that held it are gone.
+
+## Behaviour today (P4)
 
 - `bun run dev` starts the UI and, once a project folder is known, the engine
   in it. The status bar says "starting the engine..." until `ready`.
@@ -188,12 +224,12 @@ blocked.
     The engine ignores them. Hide them, or map PLAN to the engine's plan mode.
   - The engine's signed-out notice says "Sign in with `neuron auth login` ...",
     which is the terminal's wording; the sign-in panel says `/login`.
-- **P4 packaging:**
-  - `bun build --compile` per release target. Freebuff's
-    `cli/scripts/build-binary.ts` shows how it embedded the OpenTUI native
-    library.
+- **After P4:**
   - Bring back a reset-sequence sync test for Neuron's own launcher (the old
     one checked `release-core/launcher.js`).
+  - The release build of the UI runs only in `release.yml`. A tagged release
+    is its first full test on Linux and macOS: the Linux glibc floor for the
+    Bun binary, the macOS x64 cross-compile, and the install checks.
 - **Known issues:**
   - `writeFileAtomicAsync` can fail with `EPERM` on Windows when two renames
     target the same file at once. Checkpoint saves coalesce, so it is unlikely

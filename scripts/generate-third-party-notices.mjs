@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Builds THIRD_PARTY_NOTICES.md for the native `neuron` binary.
+// Builds THIRD_PARTY_NOTICES.md for the native `neuron` binary and the
+// full-screen UI, `neuron-tui`, released beside it.
 //
 // The crate list comes from `cargo metadata --format-version 1 --offline` and
 // covers the non-dev dependency graph of the rusty-claude-cli package for every
@@ -7,15 +8,19 @@
 // source directory in the local cargo registry, so run `cargo fetch --locked`
 // first on a machine that has never built the workspace.
 //
+// The UI's npm packages are the production dependency closure of
+// ui/neuron-tui/package.json, read from its node_modules: run
+// `bun install --frozen-lockfile` there first (or pass --no-ui).
+//
 // Usage:
 //   node scripts/generate-third-party-notices.mjs [--output FILE|-]
 //     [--manifest-path rust/Cargo.toml] [--package rusty-claude-cli]
 //     [--target TRIPLE]... [--metadata FILE]... [--skills-dir DIR]
-//     [--no-license-texts] [--online]
+//     [--ui-dir ui/neuron-tui | --no-ui] [--no-license-texts] [--online]
 
 import {execFileSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
-import {existsSync, readdirSync, readFileSync, statSync, writeFileSync} from 'node:fs';
+import {existsSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync} from 'node:fs';
 import path from 'node:path';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 
@@ -41,6 +46,8 @@ Options:
   --target TRIPLE        Release target to include; repeatable (default: all release targets)
   --metadata FILE        Read cargo metadata JSON from FILE instead of running cargo; repeatable
   --skills-dir DIR       Bundled skills directory (default rust/crates/runtime/bundled-skills)
+  --ui-dir DIR           The full-screen UI package (default ui/neuron-tui; needs its node_modules)
+  --no-ui                Leave the full-screen UI out
   --no-license-texts     List crates without reproducing license files
   --online               Allow cargo to use the network (default --offline)
   -h, --help             Show this help
@@ -55,6 +62,7 @@ export function parseArgs(argv) {
     targets: [],
     metadataFiles: [],
     skillsDir: path.join(REPO_ROOT, 'rust', 'crates', 'runtime', 'bundled-skills'),
+    uiDir: path.join(REPO_ROOT, 'ui', 'neuron-tui'),
     licenseTexts: true,
     offline: true,
     help: false,
@@ -90,6 +98,13 @@ export function parseArgs(argv) {
       case '--skills-dir':
         options.skillsDir = path.resolve(valueFor(index, argument));
         index += 1;
+        break;
+      case '--ui-dir':
+        options.uiDir = path.resolve(valueFor(index, argument));
+        index += 1;
+        break;
+      case '--no-ui':
+        options.uiDir = null;
         break;
       case '--no-license-texts':
         options.licenseTexts = false;
@@ -185,6 +200,156 @@ export function findLicenseFiles(pkg) {
   });
 }
 
+/** The directory of npm package `name` as Node resolves it from `from`, without leaving `root`. */
+function resolveNpmPackage(name, from, root) {
+  let directory = from;
+  for (;;) {
+    const candidate = path.join(directory, 'node_modules', name);
+    if (existsSync(path.join(candidate, 'package.json'))) return realpathSync(candidate);
+    if (path.resolve(directory) === path.resolve(root)) return null;
+    const parent = path.dirname(directory);
+    if (parent === directory) return null;
+    directory = parent;
+  }
+}
+
+function npmLicense(manifest) {
+  if (typeof manifest.license === 'string') return manifest.license;
+  if (manifest.license?.type) return manifest.license.type;
+  if (Array.isArray(manifest.licenses)) {
+    const types = manifest.licenses.map((entry) => (typeof entry === 'string' ? entry : entry?.type)).filter(Boolean);
+    if (types.length > 0) return types.join(' OR ');
+  }
+  return 'UNKNOWN';
+}
+
+function npmRepository(manifest) {
+  const repository = typeof manifest.repository === 'string' ? manifest.repository : manifest.repository?.url;
+  if (repository) {
+    return repository
+      .replace(/^git\+/, '')
+      .replace(/^git:\/\//, 'https://')
+      .replace(/^github:/, 'https://github.com/')
+      .replace(/\.git$/, '');
+  }
+  return manifest.homepage || `https://www.npmjs.com/package/${manifest.name}`;
+}
+
+/**
+ * The npm packages compiled into the UI: the closure of `dependencies` (and of
+ * the `optionalDependencies` that are installed, such as this platform's
+ * OpenTUI native package) from `uiDir/package.json`, read from node_modules.
+ */
+export function collectNpmPackages(uiDir) {
+  const manifest = JSON.parse(readFileSync(path.join(uiDir, 'package.json'), 'utf8'));
+  if (!existsSync(path.join(uiDir, 'node_modules'))) {
+    throw new Error(`${path.join(uiDir, 'node_modules')} is missing; run \`bun install --frozen-lockfile\` in ${uiDir} (or pass --no-ui)`);
+  }
+  const queue = Object.keys(manifest.dependencies ?? {}).map((name) => ({name, from: uiDir, optional: false, by: manifest.name}));
+  const byDirectory = new Map();
+  while (queue.length > 0) {
+    const {name, from, optional, by} = queue.shift();
+    const directory = resolveNpmPackage(name, from, uiDir);
+    if (!directory) {
+      if (optional) continue;
+      throw new Error(`${name}, a dependency of ${by}, is not installed in ${uiDir}`);
+    }
+    if (byDirectory.has(directory)) continue;
+    const pkg = JSON.parse(readFileSync(path.join(directory, 'package.json'), 'utf8'));
+    byDirectory.set(directory, {
+      name: pkg.name,
+      version: pkg.version,
+      license: npmLicense(pkg),
+      repository: npmRepository(pkg),
+      directory,
+    });
+    for (const dependency of Object.keys(pkg.dependencies ?? {})) {
+      queue.push({name: dependency, from: directory, optional: false, by: pkg.name});
+    }
+    for (const dependency of Object.keys(pkg.optionalDependencies ?? {})) {
+      queue.push({name: dependency, from: directory, optional: true, by: pkg.name});
+    }
+  }
+  const unique = new Map();
+  for (const pkg of byDirectory.values()) unique.set(`${pkg.name}@${pkg.version}`, pkg);
+  return [...unique.values()].sort(
+    (left, right) => left.name.localeCompare(right.name) || left.version.localeCompare(right.version, undefined, {numeric: true}),
+  );
+}
+
+/** License and notice files in a directory, as `[{name, text}]`. */
+export function licenseFilesIn(directory) {
+  if (!directory || !existsSync(directory)) return [];
+  return readdirSync(directory)
+    .filter((name) => LICENSE_FILE_PATTERN.test(name))
+    .filter((name) => statSync(path.join(directory, name)).isFile())
+    .sort()
+    .map((name) => ({name, text: readFileSync(path.join(directory, name), 'utf8').replace(/\r\n?/g, '\n').trim()}));
+}
+
+/** The UI section's data, or null without a UI directory. */
+export function readUi(uiDir) {
+  if (!uiDir) return null;
+  const manifest = JSON.parse(readFileSync(path.join(uiDir, 'package.json'), 'utf8'));
+  return {
+    path: path.relative(REPO_ROOT, uiDir).split(path.sep).join('/') || '.',
+    license: manifest.license,
+    ownFiles: licenseFilesIn(uiDir),
+    packages: collectNpmPackages(uiDir),
+  };
+}
+
+function renderUi(ui, includeTexts) {
+  const lines = [
+    '',
+    '## Full-screen UI (`neuron-tui`)',
+    '',
+    `\`neuron-tui\` is compiled from \`${ui.path}\` with Bun. That code is derived from the Codebuff/Freebuff`,
+    `CLI and is under the ${ui.license === 'Apache-2.0' ? 'Apache License 2.0' : ui.license}; its license and notice files are reproduced below.`,
+    'The binary also contains the Bun runtime (MIT, with the components listed in',
+    'https://github.com/oven-sh/bun/blob/main/LICENSE.md) and these npm packages:',
+    '',
+    `### npm packages (${ui.packages.length})`,
+    '',
+    '| Package | Version | License | Repository |',
+    '| --- | --- | --- | --- |',
+  ];
+  for (const pkg of ui.packages) {
+    lines.push(`| ${escapeCell(pkg.name)} | ${escapeCell(pkg.version)} | ${escapeCell(pkg.license)} | ${escapeCell(pkg.repository)} |`);
+  }
+  if (!includeTexts) return lines;
+
+  for (const file of ui.ownFiles) {
+    lines.push('', `### ${ui.path}/${file.name}`, '', fence(file.text));
+  }
+  const groups = new Map();
+  const withoutFiles = [];
+  for (const pkg of ui.packages) {
+    const files = licenseFilesIn(pkg.directory);
+    if (files.length === 0) {
+      withoutFiles.push(pkg);
+      continue;
+    }
+    for (const file of files) {
+      const key = createHash('sha256').update(file.text).digest('hex');
+      if (!groups.has(key)) groups.set(key, {text: file.text, names: new Set(), users: []});
+      const group = groups.get(key);
+      group.names.add(file.name);
+      group.users.push(`${pkg.name} ${pkg.version}`);
+    }
+  }
+  lines.push('', '### npm license and notice texts', '', 'Identical texts are listed once with every package that ships them.');
+  for (const group of [...groups.values()].sort((left, right) => left.users[0].localeCompare(right.users[0]))) {
+    lines.push('', `#### ${[...group.names].sort().join(', ')}`, '', `Used by: ${group.users.join(', ')}`, '', fence(group.text));
+  }
+  if (withoutFiles.length > 0) {
+    lines.push('', '#### npm packages that ship no license file', '');
+    lines.push('The standard text of the SPDX license named for each package applies.', '');
+    for (const pkg of withoutFiles) lines.push(`- ${pkg.name} ${pkg.version}: ${pkg.license}`);
+  }
+  return lines;
+}
+
 /** Merges several dependency lists (one per target) into a sorted, de-duplicated list. */
 export function mergePackages(lists) {
   const merged = new Map();
@@ -228,7 +393,7 @@ export function readBundledSkills(skillsDir) {
  * Renders the notices document. `packages` must already be merged and sorted;
  * `licenseFiles(pkg)` returns `[{name, text}]` for a package.
  */
-export function renderNotices({rootName, rootVersion, targets, packages, skills, licenseFiles, includeTexts}) {
+export function renderNotices({rootName, rootVersion, targets, packages, skills, licenseFiles, includeTexts, ui = null}) {
   const lines = [
     '# Third-party notices',
     '',
@@ -291,6 +456,7 @@ export function renderNotices({rootName, rootVersion, targets, packages, skills,
       lines.push('', `### Bundled skill: ${skill.name}`, '', fence(skill.text));
     }
   }
+  if (ui) lines.push(...renderUi(ui, includeTexts));
   lines.push('');
   return lines.join('\n');
 }
@@ -311,6 +477,7 @@ export function generate(options) {
     skills: readBundledSkills(options.skillsDir),
     licenseFiles: findLicenseFiles,
     includeTexts: options.licenseTexts,
+    ui: readUi(options.uiDir),
   });
 }
 
