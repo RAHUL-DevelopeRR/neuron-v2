@@ -115,6 +115,7 @@ mod tests {
             },
             ask.clone(),
             UiEvent::ToolResult {
+                id: "toolu_1".into(),
                 name: "bash".into(),
                 output: "denied".into(),
                 is_error: true,

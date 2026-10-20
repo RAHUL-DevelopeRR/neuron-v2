@@ -103,6 +103,18 @@ pub trait ToolExecutor {
     ) -> Result<String, ToolError> {
         self.execute(tool_name, input)
     }
+
+    /// Every tool call's final result, as the model will see it: one that ran, one that
+    /// was denied or blocked by a hook, and one that never started (interrupted, cut off
+    /// at the output limit, stopped by the loop guard). The default does nothing.
+    fn tool_call_finished(
+        &mut self,
+        _tool_use_id: &str,
+        _tool_name: &str,
+        _output: &str,
+        _is_error: bool,
+    ) {
+    }
 }
 
 /// Error returned when a tool invocation fails locally.
@@ -840,6 +852,16 @@ where
             .push_message(result_message.clone())
             .map_err(session_error)?;
         self.record_tool_finished(iteration, &result_message);
+        if let Some(ContentBlock::ToolResult {
+            tool_use_id,
+            tool_name,
+            output,
+            is_error,
+        }) = result_message.blocks.first()
+        {
+            self.tool_executor
+                .tool_call_finished(tool_use_id, tool_name, output, *is_error);
+        }
         progress.tool_results.push(result_message);
         Ok(())
     }
@@ -2616,6 +2638,97 @@ mod resilience_tests {
         assert_eq!(
             unanswered_tool_use_ids(&restored.messages),
             Vec::<String>::new()
+        );
+    }
+
+    /// A UI closes each tool call's row from `tool_call_finished`: it hears calls that ran,
+    /// were denied, or never started.
+    #[test]
+    fn the_executor_hears_every_tool_calls_final_result() {
+        type Finished = Rc<RefCell<Vec<(String, String, String, bool)>>>;
+        struct Recording {
+            inner: StaticToolExecutor,
+            finished: Finished,
+        }
+        impl ToolExecutor for Recording {
+            fn execute(
+                &mut self,
+                tool_name: &str,
+                input: &str,
+            ) -> Result<String, super::ToolError> {
+                self.inner.execute(tool_name, input)
+            }
+            fn tool_call_finished(&mut self, id: &str, name: &str, output: &str, is_error: bool) {
+                self.finished.borrow_mut().push((
+                    id.to_string(),
+                    name.to_string(),
+                    output.to_string(),
+                    is_error,
+                ));
+            }
+        }
+        struct DenyOne;
+        impl PermissionPrompter for DenyOne {
+            fn decide(&mut self, request: &PermissionRequest) -> PermissionPromptDecision {
+                if request.tool_name == "denied" {
+                    PermissionPromptDecision::Deny {
+                        reason: "not this one".to_string(),
+                    }
+                } else {
+                    PermissionPromptDecision::Allow
+                }
+            }
+        }
+
+        let token = CancellationToken::new();
+        let cancel_from_tool = token.clone();
+        let api = ScriptedApi::new(vec![Ok(vec![
+            tool_call("1", "ran", "{}"),
+            tool_call("2", "denied", "{}"),
+            tool_call("3", "stops", "{}"),
+            tool_call("4", "never", "{}"),
+            AssistantEvent::MessageStop,
+        ])]);
+        let finished = Finished::default();
+        let tools = Recording {
+            inner: StaticToolExecutor::new()
+                .register("ran", |_| Ok("ok".to_string()))
+                .register("stops", move |_| {
+                    cancel_from_tool.cancel();
+                    Ok("stopped".to_string())
+                })
+                .register("never", |_| panic!("cancelled tools must not run")),
+            finished: Rc::clone(&finished),
+        };
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            api,
+            tools,
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .with_cancellation_token(token);
+
+        runtime
+            .run_turn("go", Some(&mut DenyOne))
+            .expect("cancellation is not an error");
+
+        let row = |id: &str, name: &str, output: &str, is_error| {
+            (
+                id.to_string(),
+                name.to_string(),
+                output.to_string(),
+                is_error,
+            )
+        };
+        assert_eq!(
+            *finished.borrow(),
+            vec![
+                row("1", "ran", "ok", false),
+                row("2", "denied", "not this one", true),
+                row("3", "stops", "stopped", false),
+                row("4", "never", INTERRUPTED_TOOL_RESULT, true),
+            ]
         );
     }
 

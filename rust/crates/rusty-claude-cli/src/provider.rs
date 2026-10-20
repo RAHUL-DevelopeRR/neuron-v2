@@ -431,10 +431,37 @@ pub fn configure_provider(requested_model: &str) -> Result<String, Box<dyn std::
     let inputs = gather_inputs(requested_model)?;
     let selection = select_provider(&inputs, &azure_usable);
     let active = activate(selection, requested_model)?;
+    Ok(install_active(active))
+}
+
+/// How [`start_provider`] went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderStart {
+    /// Configured, as [`configure_provider`] does; the model to use.
+    Ready(String),
+    /// Zero-X was selected but its login is missing, expired or rejected: a UI that can
+    /// sign the user in starts without a provider and calls this again afterwards.
+    SignInRequired(String),
+}
+
+/// [`configure_provider`] for a UI that can run the sign-in itself.
+pub fn start_provider(requested_model: &str) -> Result<ProviderStart, Box<dyn std::error::Error>> {
+    let inputs = gather_inputs(requested_model)?;
+    let selection = select_provider(&inputs, &azure_usable);
+    let zero_x = selection.provider == ProviderId::ZeroX;
+    match activate(selection, requested_model) {
+        Ok(active) => Ok(ProviderStart::Ready(install_active(active))),
+        Err(error) if zero_x => Ok(ProviderStart::SignInRequired(error.to_string())),
+        Err(error) => Err(error),
+    }
+}
+
+/// Makes `active` the process's provider, prints its startup line and returns its model.
+fn install_active(active: ActiveProvider) -> String {
     eprintln!("{}", active.startup_line());
     let model = active.model.clone();
     set_active_provider(active);
-    Ok(model)
+    model
 }
 
 fn activate(

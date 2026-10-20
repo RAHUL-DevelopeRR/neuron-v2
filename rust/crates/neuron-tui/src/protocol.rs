@@ -62,6 +62,18 @@ pub struct ModelInfo {
     pub tiers: Vec<String>,
 }
 
+/// The Zero-X login, as the UI may show it. Never carries the token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountInfo {
+    /// Known right after a sign-in in this engine; not stored with the login.
+    pub email: Option<String>,
+    pub plan: Option<String>,
+    /// Where the login comes from: `NEURON_TOKEN`, or the stored login and where it is kept.
+    pub source: String,
+    /// When the session expires (Unix seconds), when the gateway said.
+    pub expires_at: Option<u64>,
+}
+
 /// Engine → UI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -87,6 +99,23 @@ pub enum UiEvent {
         context_percent: u32,
         /// `None` outside a git repository.
         git: Option<GitStatus>,
+        /// A usable Zero-X login: `NEURON_TOKEN`, or a stored session that has not expired.
+        #[serde(default)]
+        signed_in: bool,
+        /// The login, also when its session expired; `None` when there is none.
+        #[serde(default)]
+        account: Option<AccountInfo>,
+    },
+    /// `/login` started a device sign-in: open `url` (or `url_complete`, which has the code
+    /// filled in) and enter `user_code`. The engine waits for the approval; an interrupt
+    /// cancels it. A notice and a `Status` follow when it is done, then `TurnFinished`.
+    SignInCode {
+        url: String,
+        url_complete: Option<String>,
+        user_code: String,
+        expires_in_secs: u64,
+        /// The engine opened `url_complete` (or `url`) in the browser.
+        browser_opened: bool,
     },
     /// Answer to [`EngineCommand::ListModels`]. Empty when the provider has no catalog
     /// (only the Zero-X gateway publishes one).
@@ -114,8 +143,12 @@ pub enum UiEvent {
         input: String,
         cut_off: bool,
     },
-    /// A tool's result (or error).
+    /// A tool call's result as the model sees it, for every call: one that ran (`is_error`
+    /// when it failed), one denied or blocked by a hook, and one that never started
+    /// (interrupted, cut off). `id` is the [`UiEvent::ToolCallStarted`] id.
     ToolResult {
+        #[serde(default)]
+        id: String,
         name: String,
         output: String,
         is_error: bool,
@@ -238,6 +271,36 @@ mod tests {
             serde_json::from_value::<PermissionReply>(json).unwrap(),
             reply
         );
+    }
+
+    /// Fields added after protocol 1 shipped read as their defaults from older engines.
+    #[test]
+    fn later_fields_default_when_absent() {
+        let result: UiEvent = serde_json::from_str(
+            r#"{"type":"tool_result","name":"bash","output":"ok","is_error":false}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            UiEvent::ToolResult {
+                id: String::new(),
+                name: "bash".into(),
+                output: "ok".into(),
+                is_error: false,
+            }
+        );
+        let status: UiEvent = serde_json::from_str(
+            r#"{"type":"status","model":"m","permission_mode":"read-only","session_id":"s","cwd":".","workspace_trusted":false,"plan_mode":false,"context_percent":0,"git":null}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            status,
+            UiEvent::Status {
+                signed_in: false,
+                account: None,
+                ..
+            }
+        ));
     }
 
     /// The stdio transport's input lines: a top-level `kind`, then the command's own

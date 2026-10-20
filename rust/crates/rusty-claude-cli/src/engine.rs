@@ -31,9 +31,10 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 use super::*;
+use crate::device_login::{DeviceCode, DeviceLoginObserver};
 use neuron_tui::protocol::{
-    Attachment, EngineCommand, GitStatus, ModelInfo, PermissionReply, TokenCounts, UiEvent,
-    PROTOCOL_VERSION,
+    AccountInfo, Attachment, EngineCommand, GitStatus, ModelInfo, PermissionReply, TokenCounts,
+    UiEvent, PROTOCOL_VERSION,
 };
 use repl_loop::InterruptPresses;
 use runtime::ui_hooks::{self, UserQuestion};
@@ -47,14 +48,20 @@ const ANSWER_CANCEL_POLL: Duration = Duration::from_millis(250);
 
 /// How the engine starts. The launcher runs the line REPL's checks first (workspace trust,
 /// provider selection), on the terminal, before the UI takes it over.
+#[derive(Debug, Clone)]
 pub(crate) struct EngineOptions {
-    /// The model to use, as `configure_provider_for_model` resolved it.
+    /// The model to use, as `configure_provider_for_model` resolved it; with `signed_out`,
+    /// the model asked for.
     pub(crate) model: String,
     pub(crate) allowed_tools: Option<AllowedToolSet>,
     pub(crate) permission_mode: PermissionMode,
     pub(crate) reasoning_effort: Option<String>,
     /// A saved session to continue instead of starting a fresh one.
     pub(crate) resume: Option<String>,
+    /// Why the provider could not start without a Zero-X sign-in
+    /// ([`ProviderStart::SignInRequired`]). The engine then starts signed out: it answers
+    /// `/login`, and starts the provider and the session after it.
+    pub(crate) signed_out: Option<String>,
 }
 
 /// Why the engine stopped. The session is saved either way.
@@ -111,20 +118,14 @@ pub(crate) fn spawn(options: EngineOptions) -> Result<EngineHandle, String> {
         .name("neuron-engine".to_string())
         .spawn(move || {
             let _hooks = UiHooks::install(&events_tx, &engine_shared);
-            let exit = match Engine::start(options, events_tx, replies_rx, engine_shared) {
-                Ok(mut engine) => {
-                    // Before `spawn` returns, so `Ready` is always the first event.
-                    engine.announce();
-                    let _ = ready_tx.send(Ok(()));
-                    let exit = engine.serve(&queue_rx);
-                    engine.close();
-                    exit
-                }
-                Err(message) => {
-                    let _ = ready_tx.send(Err(message));
-                    EngineExit::Shutdown
-                }
-            };
+            let exit = run_engine(
+                options,
+                &events_tx,
+                replies_rx,
+                &engine_shared,
+                &queue_rx,
+                &ready_tx,
+            );
             // Sub-agents left running in the background must not outlive the session.
             tools::cancel_background_subagents();
             progress::shutdown_shared_runtime_state();
@@ -156,6 +157,294 @@ pub(crate) fn spawn(options: EngineOptions) -> Result<EngineHandle, String> {
         events: events_rx,
         threads: Some((commands, engine)),
     })
+}
+
+/// The engine thread: when the provider needs a sign-in, a signed-out stage until `/login`
+/// succeeds, then the engine. Reports on `ready` once, before `spawn` returns, so `Ready`
+/// is always the first event.
+fn run_engine(
+    mut options: EngineOptions,
+    events: &Sender<UiEvent>,
+    replies: Receiver<PermissionReply>,
+    shared: &Arc<Shared>,
+    queue: &Receiver<EngineCommand>,
+    ready: &Sender<Result<(), String>>,
+) -> EngineExit {
+    let Some(reason) = options.signed_out.take() else {
+        let started = open_cli(&options, events).and_then(|(cli, output)| {
+            let mut engine = Engine::new(cli, output, Sender::clone(events), replies, shared);
+            if let Some(reference) = &options.resume {
+                engine
+                    .continue_saved_session(reference)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(engine)
+        });
+        return match started {
+            Ok(mut engine) => {
+                engine.announce();
+                let _ = ready.send(Ok(()));
+                let exit = engine.serve(queue);
+                engine.close();
+                exit
+            }
+            Err(message) => {
+                let _ = ready.send(Err(message));
+                EngineExit::Shutdown
+            }
+        };
+    };
+
+    let mut signed_out = SignedOut {
+        options,
+        events,
+        shared,
+        email: None,
+    };
+    signed_out.announce(&reason);
+    let _ = ready.send(Ok(()));
+    let mut replies = Some(replies);
+    loop {
+        let Some(model) = signed_out.serve(queue) else {
+            return EngineExit::Shutdown;
+        };
+        signed_out.options.model = model;
+        let (cli, output) = match open_cli(&signed_out.options, events) {
+            Ok(opened) => opened,
+            Err(message) => {
+                signed_out.fail(&message);
+                continue;
+            }
+        };
+        let Some(replies) = replies.take() else {
+            return EngineExit::Shutdown;
+        };
+        let mut engine = Engine::new(cli, output, Sender::clone(events), replies, shared);
+        engine.account_email = signed_out.email.take();
+        engine.refresh_account();
+        if let Some(reference) = &signed_out.options.resume {
+            if let Err(error) = engine.continue_saved_session(reference) {
+                engine.send(UiEvent::Error {
+                    message: format!("could not continue {reference}: {error}"),
+                });
+            }
+        }
+        // The end of the `/login` that got here.
+        engine.finish_turn();
+        let exit = engine.serve(queue);
+        engine.close();
+        return exit;
+    }
+}
+
+/// The live CLI the engine runs, showing its turns on the UI.
+fn open_cli(
+    options: &EngineOptions,
+    events: &Sender<UiEvent>,
+) -> Result<(LiveCli, TurnOutput), String> {
+    let output = TurnOutput::channel(Sender::clone(events));
+    let mut cli = LiveCli::with_output(
+        options.model.clone(),
+        true,
+        options.allowed_tools.clone(),
+        options.permission_mode,
+        output.clone(),
+    )
+    .map_err(|error| error.to_string())?;
+    cli.set_reasoning_effort(options.reasoning_effort.clone());
+    Ok((cli, output))
+}
+
+/// The engine before a Zero-X sign-in: no provider, no session. `/login` signs in and
+/// starts them; `SetModel` picks the model they will use; prompts and other slash commands
+/// are refused until then.
+struct SignedOut<'a> {
+    options: EngineOptions,
+    events: &'a Sender<UiEvent>,
+    shared: &'a Shared,
+    /// From the sign-in, for the engine's account view.
+    email: Option<String>,
+}
+
+impl SignedOut<'_> {
+    fn announce(&self, reason: &str) {
+        self.send(UiEvent::Ready {
+            protocol: PROTOCOL_VERSION,
+            version: VERSION.to_string(),
+        });
+        if let Some(reason) = plain_notice(reason) {
+            self.send(UiEvent::Notice { message: reason });
+        }
+        self.send_status();
+    }
+
+    /// Runs commands until a sign-in starts the provider (its model) or the engine stops.
+    fn serve(&mut self, queue: &Receiver<EngineCommand>) -> Option<String> {
+        while let Ok(command) = queue.recv() {
+            if self.shared.closing.load(Ordering::SeqCst) {
+                return None;
+            }
+            match command {
+                EngineCommand::Shutdown => return None,
+                EngineCommand::Slash { command, .. } => {
+                    match command.trim().trim_start_matches('/') {
+                        "exit" | "quit" => return None,
+                        "login" => match self.login() {
+                            Ok(model) => return Some(model),
+                            Err(message) => self.fail(&message),
+                        },
+                        "logout" => {
+                            crate::auth::logout();
+                            self.email = None;
+                            self.finish();
+                        }
+                        name => self.fail(&format!(
+                            "/{name} needs a session: sign in to Zero-X first with /login."
+                        )),
+                    }
+                }
+                EngineCommand::Submit { .. } => {
+                    self.fail("Sign in to Zero-X first: /login.");
+                }
+                EngineCommand::SetModel { model } if !model.trim().is_empty() => {
+                    self.options.model = resolve_model_alias_with_config(model.trim());
+                    self.send_status();
+                }
+                EngineCommand::SetModel { .. } | EngineCommand::Interrupt => {}
+                EngineCommand::ListModels => self.send(UiEvent::Models {
+                    current: self.options.model.clone(),
+                    models: Vec::new(),
+                }),
+            }
+        }
+        None
+    }
+
+    /// Signs in, then starts the provider the sign-in was missing for.
+    fn login(&mut self) -> Result<String, String> {
+        let (_credential, email) = sign_in(self.events, self.shared)?;
+        self.email = email;
+        match start_provider(&self.options.model).map_err(|error| error.to_string())? {
+            ProviderStart::Ready(model) => Ok(model),
+            ProviderStart::SignInRequired(reason) => Err(reason),
+        }
+    }
+
+    /// Ends a refused or failed command: the error, `TurnFinished`, the footer.
+    fn fail(&self, message: &str) {
+        self.send(UiEvent::Error {
+            message: message.to_string(),
+        });
+        self.finish();
+    }
+
+    fn finish(&self) {
+        self.send(UiEvent::TurnFinished);
+        self.send_status();
+    }
+
+    fn send_status(&self) {
+        let account = AccountState::read(self.email.as_deref());
+        self.send(status_event(
+            &self.options.model,
+            self.options.permission_mode,
+            "",
+            false,
+            0,
+            &account,
+        ));
+    }
+
+    fn send(&self, event: UiEvent) {
+        let _ = self.events.send(event);
+    }
+}
+
+/// The device sign-in: a [`UiEvent::SignInCode`] for the UI, then the wait for its
+/// approval, which an interrupt or shutdown cancels.
+fn sign_in(
+    events: &Sender<UiEvent>,
+    shared: &Shared,
+) -> Result<(crate::auth::GatewayCredential, Option<String>), String> {
+    let cancel = CancellationToken::new();
+    let running = RunningTurn::start(shared, None);
+    running.watch(cancel.clone(), HookAbortSignal::new());
+    let cancelled = || cancel.is_cancelled();
+    crate::auth::login_with(
+        crate::auth::LoginOptions::default(),
+        &SignInObserver { events },
+        &cancelled,
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Shows the device code on the UI.
+struct SignInObserver<'a> {
+    events: &'a Sender<UiEvent>,
+}
+
+impl DeviceLoginObserver for SignInObserver<'_> {
+    fn show_code(&self, code: &DeviceCode, browser_opened: bool) {
+        let _ = self.events.send(UiEvent::SignInCode {
+            url: code.verification_uri.clone(),
+            url_complete: code.verification_uri_complete.clone(),
+            user_code: code.user_code.clone(),
+            expires_in_secs: code.expires_in.as_secs(),
+            browser_opened,
+        });
+    }
+
+    fn waiting(&self, _remaining: Duration) {}
+}
+
+/// The Zero-X login as the footer shows it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AccountState {
+    signed_in: bool,
+    info: Option<AccountInfo>,
+}
+
+impl AccountState {
+    /// The login (never its token): `NEURON_TOKEN`, else the stored one. `email` is what
+    /// the last sign-in in this engine reported.
+    fn read(email: Option<&str>) -> Self {
+        match crate::auth::current_credential() {
+            Ok(Some(credential)) => Self {
+                signed_in: !credential.is_expired(crate::clock::now_unix()),
+                info: Some(AccountInfo {
+                    email: email.map(str::to_string),
+                    plan: credential.plan.clone(),
+                    source: credential.source.describe(),
+                    expires_at: credential.expires_at,
+                }),
+            },
+            _ => Self::default(),
+        }
+    }
+}
+
+/// The footer's `Status`; git and the workspace's trust are read now.
+fn status_event(
+    model: &str,
+    permission_mode: PermissionMode,
+    session_id: &str,
+    plan_mode: bool,
+    context_percent: u32,
+    account: &AccountState,
+) -> UiEvent {
+    let cwd = env::current_dir().unwrap_or_default();
+    UiEvent::Status {
+        model: model.to_string(),
+        permission_mode: permission_mode.as_str().to_string(),
+        session_id: session_id.to_string(),
+        workspace_trusted: ConfigLoader::default_for(&cwd).workspace_is_trusted(),
+        git: runtime::workspace_git_status(&cwd).map(|status| git_status(&status)),
+        cwd: cwd.display().to_string(),
+        plan_mode,
+        context_percent,
+        signed_in: account.signed_in,
+        account: account.info.clone(),
+    }
 }
 
 /// What the command thread needs to reach the engine thread's turn.
@@ -204,8 +493,10 @@ struct RunningTurn<'a> {
 }
 
 impl<'a> RunningTurn<'a> {
-    fn start(shared: &'a Shared, presses: InterruptPresses) -> Self {
-        *lock(&shared.presses) = Some(presses);
+    /// `presses` reach a turn's interrupt monitor; without them (a sign-in) an interrupt
+    /// cancels the token given to [`Self::watch`].
+    fn start(shared: &'a Shared, presses: Option<InterruptPresses>) -> Self {
+        *lock(&shared.presses) = presses;
         Self { shared }
     }
 
@@ -237,6 +528,8 @@ fn forward_commands(
             EngineCommand::Interrupt => {
                 if let Some(presses) = lock(&shared.presses).as_ref() {
                     presses.press();
+                } else if let Some((cancel, _)) = lock(&shared.turn).as_ref() {
+                    cancel.cancel();
                 }
             }
             EngineCommand::Submit { text, attachments } => {
@@ -426,42 +719,37 @@ struct Engine {
     shared: Arc<Shared>,
     /// The last permission request's id: ids never repeat within the engine.
     last_permission_id: u64,
+    /// The Zero-X login, read at start and after `/login` and `/logout`.
+    account: AccountState,
+    /// The email the last sign-in in this engine reported.
+    account_email: Option<String>,
     /// The UI stopped listening.
     ui_closed: bool,
 }
 
 impl Engine {
-    fn start(
-        options: EngineOptions,
+    fn new(
+        cli: LiveCli,
+        output: TurnOutput,
         events: Sender<UiEvent>,
         replies: Receiver<PermissionReply>,
-        shared: Arc<Shared>,
-    ) -> Result<Self, String> {
-        let output = TurnOutput::channel(Sender::clone(&events));
-        let mut cli = LiveCli::with_output(
-            options.model,
-            true,
-            options.allowed_tools,
-            options.permission_mode,
-            output.clone(),
-        )
-        .map_err(|error| error.to_string())?;
-        cli.set_reasoning_effort(options.reasoning_effort);
-        let mut engine = Self {
+        shared: &Arc<Shared>,
+    ) -> Self {
+        Self {
             cli,
             output,
             events,
             replies,
-            shared,
+            shared: Arc::clone(shared),
             last_permission_id: 0,
+            account: AccountState::read(None),
+            account_email: None,
             ui_closed: false,
-        };
-        if let Some(reference) = options.resume {
-            engine
-                .continue_saved_session(&reference)
-                .map_err(|error| error.to_string())?;
         }
-        Ok(engine)
+    }
+
+    fn refresh_account(&mut self) {
+        self.account = AccountState::read(self.account_email.as_deref());
     }
 
     /// Runs queued commands until shutdown. A failure or panic in one command is reported
@@ -580,7 +868,7 @@ impl Engine {
     fn run_turn(&mut self, input: &str) -> Result<(TurnSummary, TokenUsage), String> {
         let shared = Arc::clone(&self.shared);
         let presses = InterruptPresses::default();
-        let running = RunningTurn::start(&shared, presses.clone());
+        let running = RunningTurn::start(&shared, Some(presses.clone()));
         let monitor = self
             .cli
             .prepare_turn_runtime_watching(self.output.clone(), Some(presses))
@@ -694,6 +982,8 @@ impl Engine {
                 self.persist();
             }
             SlashCommand::Plan { mode } => self.plan(mode.as_deref())?,
+            SlashCommand::Login => self.login()?,
+            SlashCommand::Logout => self.logout(),
             SlashCommand::Unknown(name) => return Err(format_unknown_slash_command(&name).into()),
             other => {
                 return Err(format!(
@@ -722,21 +1012,58 @@ impl Engine {
     }
 
     fn send_status(&mut self) {
-        let cwd = env::current_dir().unwrap_or_default();
-        let workspace_trusted = ConfigLoader::default_for(&cwd).workspace_is_trusted();
-        let git = runtime::workspace_git_status(&cwd).map(|status| git_status(&status));
         let context_percent =
             u32::try_from(self.cli.runtime.context_snapshot().used_percent()).unwrap_or(u32::MAX);
-        self.send(UiEvent::Status {
-            model: self.cli.model.clone(),
-            permission_mode: self.cli.permission_mode.as_str().to_string(),
-            session_id: self.cli.session.id.clone(),
-            cwd: cwd.display().to_string(),
-            workspace_trusted,
-            plan_mode: self.cli.plan_mode,
+        let status = status_event(
+            &self.cli.model,
+            self.cli.permission_mode,
+            &self.cli.session.id,
+            self.cli.plan_mode,
             context_percent,
-            git,
-        });
+            &self.account,
+        );
+        self.send(status);
+    }
+
+    /// `/login`: the device sign-in. A session on the Zero-X gateway switches to the new
+    /// login at once (as the line REPL's `/login` does).
+    fn login(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let (credential, email) = sign_in(&self.events, &self.shared)?;
+        self.account_email = email;
+        self.refresh_account();
+        let Some(active) = active_provider().filter(|active| active.id == ProviderId::ZeroX) else {
+            self.notice(
+                "Signed in. This session uses another provider; restart neuron (or pass --provider zero-x) to use the Zero-X gateway.",
+            );
+            return Ok(());
+        };
+        let base = active
+            .base_url
+            .clone()
+            .unwrap_or_else(|| crate::auth::GATEWAY_BASE_URL.to_string());
+        api::install_openai_compat_endpoint(Some(api::OpenAiCompatEndpoint::new(
+            api::OpenAiCompatConfig::zero_x(),
+            base.clone(),
+            credential.token.expose(),
+        )));
+        if let Err(error) = crate::gateway_catalog::load(&base, Some(credential.token.expose())) {
+            self.notice(&format!("warning: {error}"));
+        }
+        let session = self.cli.runtime.session().clone();
+        let session_id = self.cli.session.id.clone();
+        self.rebuild_runtime(session, &session_id)?;
+        self.notice("This session now uses your new Zero-X login.");
+        Ok(())
+    }
+
+    /// `/logout`: revokes and removes the stored login.
+    fn logout(&mut self) {
+        crate::auth::logout();
+        self.account_email = None;
+        self.refresh_account();
+        if active_provider().is_some_and(|active| active.id == ProviderId::ZeroX) {
+            self.notice("Requests in this session will fail until you run /login again.");
+        }
     }
 
     /// The gateway catalog's models, available ones first; none on other providers.
@@ -1207,6 +1534,11 @@ mod tests {
             ("ANTHROPIC_AUTH_TOKEN", None),
             ("ANTHROPIC_BASE_URL", Some(OsStr::new(&base_url))),
             ("NEURON_CONFIG_HOME", Some(config_home.as_os_str())),
+            // The login is read for the footer: an empty store of its own, never the
+            // real keychain.
+            ("NEURON_HOME", Some(config_home.as_os_str())),
+            ("NEURON_CREDENTIAL_STORE", Some(OsStr::new("file"))),
+            ("NEURON_TOKEN", None),
         ]);
 
         with_current_dir(&workspace, || drive_engine(&workspace));
@@ -1225,6 +1557,7 @@ mod tests {
             permission_mode: PermissionMode::WorkspaceWrite,
             reasoning_effort: None,
             resume: None,
+            signed_out: None,
         })
         .expect("the engine starts");
 
@@ -1242,6 +1575,8 @@ mod tests {
                 permission_mode,
                 plan_mode: false,
                 git: Some(git),
+                signed_in: false,
+                account: None,
                 ..
             } => {
                 assert_eq!(model, "claude-sonnet-4-6");
@@ -1314,6 +1649,7 @@ mod tests {
         let turn = turn_events(&engine.events);
         match without_notices(&turn).as_slice() {
             [UiEvent::ToolResult {
+                id,
                 name,
                 output,
                 is_error: false,
@@ -1322,6 +1658,7 @@ mod tests {
                 cumulative,
                 estimated: false,
             }, UiEvent::TurnFinished] => {
+                assert_eq!(id, "toolu_bash_prompt_allow", "the call's id");
                 assert_eq!(name, "bash");
                 assert!(output.contains("approved via prompt"), "{output}");
                 assert_eq!(text, "bash approved and executed: approved via prompt");
@@ -1341,7 +1678,7 @@ mod tests {
             other => panic!("expected the footer status after the turn, got {other:?}"),
         }
 
-        // Denied: it does not run and the model hears why.
+        // Denied: it does not run, the UI gets its result, and the model hears why.
         clear_session(&engine);
         let denied = submit_bash_needing_approval(&engine, "bash_permission_prompt_denied");
         assert_eq!(denied, approved + 1, "request ids never repeat");
@@ -1354,9 +1691,16 @@ mod tests {
             .unwrap();
         let turn = turn_events(&engine.events);
         match without_notices(&turn).as_slice() {
-            [UiEvent::TextDelta { text }, UiEvent::TextBlockEnd, UiEvent::Usage {
+            [UiEvent::ToolResult {
+                id,
+                is_error: true,
+                output,
+                ..
+            }, UiEvent::TextDelta { text }, UiEvent::TextBlockEnd, UiEvent::Usage {
                 turn, cumulative, ..
             }, UiEvent::TurnFinished] => {
+                assert_eq!(id, "toolu_bash_prompt_deny");
+                assert_eq!(output, "tool 'bash' denied by user approval prompt");
                 assert!(
                     text.starts_with("bash denied as expected: ")
                         && text.contains("denied by user approval prompt"),
@@ -1389,7 +1733,8 @@ mod tests {
         assert!(
             matches!(
                 without_notices(&turn).as_slice(),
-                [UiEvent::Usage { .. }, UiEvent::TurnFinished]
+                [UiEvent::ToolResult { id, is_error: true, output, .. }, UiEvent::Usage { .. }, UiEvent::TurnFinished]
+                    if id == "toolu_bash_prompt_allow" && output.contains("interrupted")
             ),
             "{turn:?}"
         );
@@ -1467,7 +1812,11 @@ mod tests {
         assert!(
             matches!(
                 without_notices(&turn).as_slice(),
-                [UiEvent::Usage { .. }, UiEvent::TurnFinished]
+                [
+                    UiEvent::ToolResult { is_error: true, .. },
+                    UiEvent::Usage { .. },
+                    UiEvent::TurnFinished
+                ]
             ),
             "{turn:?}"
         );
@@ -1502,6 +1851,9 @@ mod tests {
             ("ANTHROPIC_API_KEY", None),
             ("ANTHROPIC_AUTH_TOKEN", None),
             ("NEURON_CONFIG_HOME", Some(config_home.as_os_str())),
+            ("NEURON_HOME", Some(config_home.as_os_str())),
+            ("NEURON_CREDENTIAL_STORE", Some(OsStr::new("file"))),
+            ("NEURON_TOKEN", None),
         ]);
         let started = with_current_dir(&workspace, || {
             spawn(EngineOptions {
@@ -1510,6 +1862,7 @@ mod tests {
                 permission_mode: PermissionMode::ReadOnly,
                 reasoning_effort: None,
                 resume: None,
+                signed_out: None,
             })
         });
         let Err(message) = started else {
