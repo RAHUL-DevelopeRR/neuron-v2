@@ -1,210 +1,55 @@
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { Command } from 'commander'
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the tests
+// now exercise parseArgs itself; the Freebuff variant, `login`, `--agent` and
+// `--trust-agents` they covered were removed. See ui/neuron-tui/PORTING.md.
+import { describe, test, expect } from 'bun:test'
 
 import { parseArgs } from '../cli-args'
 
-describe('CLI Argument Parsing', () => {
-  let originalArgv: string[]
+const parse = (...args: string[]) =>
+  parseArgs({ argv: ['node', 'codebuff', ...args], version: '1.0.0' })
 
-  beforeEach(() => {
-    originalArgv = process.argv
-  })
-
-  afterEach(() => {
-    process.argv = originalArgv
-  })
-
-  function parseTestArgs(args: string[]) {
-    process.argv = ['node', 'codecane', ...args]
-
-    const program = new Command()
-    program
-      .name('codecane')
-      .version('1.0.0', '-v, --version', 'Print the CLI version')
-      .option('--agent <agent-id>', 'Specify which agent to use')
-      .option('--clear-logs', 'Remove any existing CLI log files')
-      .argument('[prompt...]', 'Initial prompt to send')
-      .allowExcessArguments(true)
-      .exitOverride() // Prevent process.exit in tests
-
-    try {
-      program.parse(process.argv)
-    } catch (error) {
-      // Commander throws on --help, --version in exitOverride mode
-      if (error instanceof Error && error.message.includes('(outputHelp)')) {
-        return { help: true }
-      }
-      if (
-        error instanceof Error &&
-        (error.message.includes('(version)') || error.message.includes('1.0.0'))
-      ) {
-        return { version: true }
-      }
-      throw error
-    }
-
-    const options = program.opts()
-    const promptArgs = program.args
-
-    return {
-      agent: options.agent,
-      clearLogs: options.clearLogs || false,
-      initialPrompt: promptArgs.length > 0 ? promptArgs.join(' ') : null,
-    }
-  }
-
-  test('parses --agent flag correctly', () => {
-    const result = parseTestArgs([
-      '--agent',
-      'file-picker',
+describe('CLI argument parsing', () => {
+  test('joins the remaining words into the initial prompt', () => {
+    expect(parse('find', 'all', 'TypeScript', 'files').initialPrompt).toBe(
       'find all TypeScript files',
-    ])
-    expect(result.agent).toBe('file-picker')
-    expect(result.initialPrompt).toBe('find all TypeScript files')
+    )
   })
 
-  test('parses --agent with full agent ID', () => {
-    const result = parseTestArgs([
-      '--agent',
-      'codebuff/base-lite@1.0.0',
-      'hello',
-    ])
-    expect(result.agent).toBe('codebuff/base-lite@1.0.0')
-    expect(result.initialPrompt).toBe('hello')
+  test('has no initial prompt without arguments', () => {
+    const result = parse()
+    expect(result.initialPrompt).toBeNull()
+    expect(result.clearLogs).toBe(false)
+    expect(result.continue).toBe(false)
+    expect(result.initialMode).toBeUndefined()
   })
 
-  test('works without --agent flag (defaults to base)', () => {
-    const result = parseTestArgs(['create a new component'])
-    expect(result.agent).toBeUndefined()
-    expect(result.initialPrompt).toBe('create a new component')
-  })
-
-  test('parses --clear-logs flag', () => {
-    const result = parseTestArgs(['--clear-logs', 'hello'])
+  test('parses --clear-logs beside a prompt', () => {
+    const result = parse('--clear-logs', 'hello')
     expect(result.clearLogs).toBe(true)
     expect(result.initialPrompt).toBe('hello')
   })
 
-  test('handles multiple flags together', () => {
-    const result = parseTestArgs([
-      '--agent',
-      'reviewer',
-      '--clear-logs',
-      'review my code',
-    ])
-    expect(result.agent).toBe('reviewer')
-    expect(result.clearLogs).toBe(true)
-    expect(result.initialPrompt).toBe('review my code')
+  test('parses --cwd before or after the prompt', () => {
+    expect(parse('--cwd', '/tmp', 'hi').cwd).toBe('/tmp')
+    expect(parse('hi', '--cwd', '/tmp').cwd).toBe('/tmp')
   })
 
-  test('handles prompt with no flags', () => {
-    const result = parseTestArgs(['this is a test prompt'])
-    expect(result.agent).toBeUndefined()
-    expect(result.clearLogs).toBe(false)
-    expect(result.initialPrompt).toBe('this is a test prompt')
-  })
-
-  test('handles empty arguments', () => {
-    const result = parseTestArgs([])
-    expect(result.agent).toBeUndefined()
-    expect(result.clearLogs).toBe(false)
-    expect(result.initialPrompt).toBeNull()
-  })
-
-  test('handles multi-word prompt', () => {
-    const result = parseTestArgs([
-      '--agent',
-      'base',
-      'fix the bug in auth.ts file',
-    ])
-    expect(result.agent).toBe('base')
-    expect(result.initialPrompt).toBe('fix the bug in auth.ts file')
-  })
-
-  test('handles --help flag', () => {
-    const result = parseTestArgs(['--help'])
-    expect(result.help).toBe(true)
-  })
-
-  test('handles -h flag', () => {
-    const result = parseTestArgs(['-h'])
-    expect(result.help).toBe(true)
-  })
-
-  test('handles --version flag', () => {
-    const result = parseTestArgs(['--version'])
-    expect(result.version).toBe(true)
-  })
-
-  test('handles -v flag', () => {
-    const result = parseTestArgs(['-v'])
-    expect(result.version).toBe(true)
-  })
-})
-
-describe('Freebuff CLI Argument Parsing', () => {
-  test('accepts login as a command, not an unexpected argument', () => {
-    const result = parseArgs({
-      argv: ['node', 'freebuff', 'login'],
-      isFreebuff: true,
-      version: '1.0.0',
+  test('parses --continue with and without a conversation id', () => {
+    expect(parse('--continue')).toMatchObject({
+      continue: true,
+      continueId: null,
     })
-
-    expect(result.initialPrompt).toBeNull()
-    expect(result.command).toBe('login')
-    expect(result.initialMode).toBe('LITE')
-  })
-
-  test('allows cwd before the login command', () => {
-    const result = parseArgs({
-      argv: ['node', 'freebuff', '--cwd', '/tmp', 'login'],
-      isFreebuff: true,
-      version: '1.0.0',
+    expect(parse('--continue', 'chat-42')).toMatchObject({
+      continue: true,
+      continueId: 'chat-42',
     })
-
-    expect(result.cwd).toBe('/tmp')
-    expect(result.command).toBe('login')
-    expect(result.initialPrompt).toBeNull()
   })
 
-  test('allows cwd after the login command', () => {
-    const result = parseArgs({
-      argv: ['node', 'freebuff', 'login', '--cwd', '/tmp'],
-      isFreebuff: true,
-      version: '1.0.0',
-    })
-
-    expect(result.cwd).toBe('/tmp')
-    expect(result.command).toBe('login')
-    expect(result.initialPrompt).toBeNull()
-  })
-
-  test('parses --trust-agents and defaults it to false', () => {
-    expect(
-      parseArgs({
-        argv: ['node', 'freebuff', '--trust-agents'],
-        isFreebuff: true,
-        version: '1.0.0',
-      }).trustAgents,
-    ).toBe(true)
-    expect(
-      parseArgs({
-        argv: ['node', 'freebuff'],
-        isFreebuff: true,
-        version: '1.0.0',
-      }).trustAgents,
-    ).toBe(false)
-  })
-})
-
-describe('Codebuff --trust-agents', () => {
-  test('parses --trust-agents alongside a prompt', () => {
-    const result = parseArgs({
-      argv: ['node', 'codebuff', '--trust-agents', 'fix', 'it'],
-      isFreebuff: false,
-      version: '1.0.0',
-    })
-    expect(result.trustAgents).toBe(true)
-    expect(result.initialPrompt).toBe('fix it')
+  test('mode flags pick the initial mode, the last one winning', () => {
+    expect(parse('--lite').initialMode).toBe('LITE')
+    expect(parse('--free').initialMode).toBe('LITE')
+    expect(parse('--max').initialMode).toBe('MAX')
+    expect(parse('--plan').initialMode).toBe('PLAN')
+    expect(parse('--lite', '--plan').initialMode).toBe('PLAN')
   })
 })

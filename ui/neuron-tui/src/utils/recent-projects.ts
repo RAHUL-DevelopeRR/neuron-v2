@@ -1,7 +1,9 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import fs from 'fs'
 import path from 'path'
 
-import { getConfigDir } from './auth'
+import { getConfigDir } from './config-dir'
 import { logger } from './logger'
 
 const MAX_RECENT_PROJECTS = 10

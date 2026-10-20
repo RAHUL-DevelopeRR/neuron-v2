@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
+// sponsored-proposal case is gone. See ui/neuron-tui/PORTING.md.
 import { describe, expect, test } from 'bun:test'
 
 import {
@@ -193,31 +195,6 @@ describe('processBlocks', () => {
       expect(calls[0].handler).toBe('onSingleBlock')
       expect((calls[0].args[0] as TextContentBlock).content).toBe('hello')
       expect(calls[0].args[1]).toBe(0)
-    })
-
-    // COD-376. A sponsored proposal is one card and never groups with its
-    // neighbours, so it falls through to `onSingleBlock` like text and html.
-    // Asserted rather than assumed: the fall-through is the default branch,
-    // which means nothing here names this block type -- and a future grouping
-    // rule added above it would swallow it silently.
-    test('a sponsored-proposal block falls through to onSingleBlock', () => {
-      const { handlers, calls } = createMockHandlers()
-      const proposal = {
-        type: 'sponsored-proposal',
-        target: 'acme/deploys',
-        proposal: {
-          _id: 'p1',
-          advertiser_id: 'adv',
-          state: 'offered',
-          advertiser_name: 'Acme Deploys',
-          headline: 'h',
-          body: 'b',
-        },
-      } as ContentBlock
-
-      expect(processBlocks([proposal], handlers)).toEqual(['single-0'])
-      expect(calls).toHaveLength(1)
-      expect(calls[0].handler).toBe('onSingleBlock')
     })
   })
 

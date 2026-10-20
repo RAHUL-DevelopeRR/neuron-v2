@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { TextAttributes } from '@opentui/core'
 import { memo, useCallback, useMemo, type ReactNode } from 'react'
 import React from 'react'
@@ -23,7 +25,6 @@ import {
 } from '../utils/markdown-renderer'
 
 import type { ChatMessage } from '../types/chat'
-import type { FeedbackCategory } from '@codebuff/common/constants/feedback'
 
 interface AgentChildrenGridProps {
   agentChildren: ChatMessage[]
@@ -117,29 +118,15 @@ export const MessageWithAgents = memo(
         })),
       )
 
-    const { onToggleCollapsed, onBuildFast, onBuildMax, onBuildLite, onFeedback, onCloseFeedback } =
+    const { onToggleCollapsed, onBuildFast, onBuildMax, onBuildLite } =
       useMessageBlockStore(
         useShallow((state) => ({
           onToggleCollapsed: state.callbacks.onToggleCollapsed,
           onBuildFast: state.callbacks.onBuildFast,
           onBuildMax: state.callbacks.onBuildMax,
           onBuildLite: state.callbacks.onBuildLite,
-          onFeedback: state.callbacks.onFeedback,
-          onCloseFeedback: state.callbacks.onCloseFeedback,
         })),
       )
-
-    // Memoize onOpenFeedback to prevent unnecessary re-renders
-    const onOpenFeedback = useCallback(
-      (options?: {
-        category?: FeedbackCategory
-        footerMessage?: string
-        errors?: Array<{ id: string; message: string }>
-      }) => {
-        onFeedback(message.id, options)
-      },
-      [onFeedback, message.id],
-    )
 
     const contentBoxStyle = useMemo(
       () => ({
@@ -261,7 +248,6 @@ export const MessageWithAgents = memo(
                   timestamp={message.timestamp}
                   isComplete={message.isComplete}
                   completionTime={message.completionTime}
-                  credits={message.credits}
                   timerStartTime={timerStartTime}
                   textColor={textColor}
                   timestampColor={timestampColor}
@@ -272,11 +258,8 @@ export const MessageWithAgents = memo(
                   onBuildFast={onBuildFast}
                   onBuildMax={onBuildMax}
                   onBuildLite={onBuildLite}
-                  onFeedback={onFeedback}
-                  onCloseFeedback={onCloseFeedback}
                   validationErrors={message.validationErrors}
                   userError={message.userError}
-                  onOpenFeedback={onOpenFeedback}
                   attachments={message.attachments}
                   textAttachments={message.textAttachments}
                   fileAttachments={message.fileAttachments}
@@ -297,7 +280,6 @@ export const MessageWithAgents = memo(
                 timestamp={message.timestamp}
                 isComplete={message.isComplete}
                 completionTime={message.completionTime}
-                credits={message.credits}
                 timerStartTime={timerStartTime}
                 textColor={textColor}
                 timestampColor={timestampColor}
@@ -308,11 +290,8 @@ export const MessageWithAgents = memo(
                 onBuildFast={onBuildFast}
                 onBuildMax={onBuildMax}
                 onBuildLite={onBuildLite}
-                onFeedback={onFeedback}
-                onCloseFeedback={onCloseFeedback}
                 validationErrors={message.validationErrors}
                 userError={message.userError}
-                onOpenFeedback={onOpenFeedback}
                 attachments={message.attachments}
                 textAttachments={message.textAttachments}
                 fileAttachments={message.fileAttachments}

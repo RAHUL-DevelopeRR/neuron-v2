@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the fixture
+// spawns the bun running the test (NEURON_TUI_TEST_BUN). See ui/neuron-tui/PORTING.md.
 import { spawn } from 'child_process'
 import path from 'path'
 
@@ -41,7 +43,10 @@ test('the CLI exits cleanly when its package launcher disappears', async () => {
     const child = spawn(
       'node',
       [LAUNCHER_FIXTURE, 'observe', RENDERER_FIXTURE],
-      { stdio: ['ignore', 'pipe', 'pipe'] },
+      {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, NEURON_TUI_TEST_BUN: process.execPath },
+      },
     )
     let output = ''
     let exit: { code: number | null; signal: NodeJS.Signals | null } | undefined

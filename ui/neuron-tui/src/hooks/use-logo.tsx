@@ -1,7 +1,8 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import React, { useMemo } from 'react'
 
-import { LOGO, LOGO_SMALL, SHADOW_CHARS } from '../login/constants'
-import { parseLogoLines } from '../login/utils'
+import { LOGO, LOGO_SMALL, SHADOW_CHARS, parseLogoLines } from '../utils/logo'
 import { IS_FREEBUFF } from '../utils/constants'
 
 interface UseLogoOptions {

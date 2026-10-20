@@ -1,5 +1,7 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 /** Types of banners that can appear at the top of the chat */
-export type TopBannerType = 'homeDir' | 'gitRoot' | 'discord' | null
+export type TopBannerType = 'homeDir' | 'gitRoot' | null
 
 export type InputValue = {
   text: string

@@ -1,9 +1,9 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { mkdirSync, readdirSync, statSync } from 'fs'
 import path from 'path'
 
-import { getConfigDir } from './utils/auth'
-import { IS_FREEBUFF } from './utils/constants'
-import { ensureSponsoredProjectIdentity } from './utils/sponsored-project-identity'
+import { getConfigDir } from './utils/config-dir'
 
 let projectRoot: string | undefined
 let currentChatId: string | undefined
@@ -14,11 +14,6 @@ function ensureChatDirectory(dir: string) {
 
 export function setProjectRoot(dir: string) {
   projectRoot = dir
-  // Project selection is the normal lifecycle owner for the workspace
-  // identity. Sponsored polling only ever reads this marker. Freebuff writes
-  // it in every Git project, because an in-place sponsored offer is keyed to
-  // the folder rather than to `owner/repo` (#3989).
-  ensureSponsoredProjectIdentity(dir, { everyRepository: IS_FREEBUFF })
   return projectRoot
 }
 

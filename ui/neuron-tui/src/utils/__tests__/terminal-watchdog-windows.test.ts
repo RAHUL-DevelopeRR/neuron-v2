@@ -1,6 +1,7 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import path from 'path'
 
-import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
 import { describe, expect, test } from 'bun:test'
 
 import {
@@ -228,7 +229,7 @@ describe('admitWindowsWatchdog', () => {
     ).toBe(true)
     expect(reports).toEqual([
       [
-        AnalyticsEvent.CLI_HELPER_OUTLIVED_PARENT,
+        'cli.helper_outlived_parent',
         { kind: 'terminal_watchdog', count: 2, legacyStale: 1, active: 1 },
       ],
     ])
@@ -248,8 +249,8 @@ describe('admitWindowsWatchdog', () => {
       ),
     ).toBe(false)
     expect(reports.map(([event]) => event)).toEqual([
-      AnalyticsEvent.CLI_HELPER_OUTLIVED_PARENT,
-      AnalyticsEvent.CLI_HELPER_PROCESS_FLOOD,
+      'cli.helper_outlived_parent',
+      'cli.helper_process_flood',
     ])
     expect(reports[1]![1]).toMatchObject({
       kind: 'terminal_watchdog',

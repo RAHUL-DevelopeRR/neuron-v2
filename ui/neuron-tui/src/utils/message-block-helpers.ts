@@ -1,7 +1,9 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { sanitizeTerminalOutput } from '@codebuff/common/util/terminal-safe-text'
 import { isEqual } from 'lodash'
 
-import { formatToolOutput } from './codebuff-client'
+import { formatToolOutput } from './tool-display'
 import {
   shouldCollapseByDefault,
   shouldCollapseForParent,

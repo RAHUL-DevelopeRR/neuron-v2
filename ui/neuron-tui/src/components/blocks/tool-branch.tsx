@@ -1,10 +1,12 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { sanitizeTerminalOutput } from '@codebuff/common/util/terminal-safe-text'
 import { memo, useCallback } from 'react'
 
 import { ContentWithMarkdown } from './content-with-markdown'
 import { useTheme } from '../../hooks/use-theme'
 import { useChatStore } from '../../state/chat-store'
-import { getToolDisplayInfo } from '../../utils/codebuff-client'
+import { getToolDisplayInfo } from '../../utils/tool-display'
 import { shouldCollapseToolByDefault } from '../../utils/constants'
 import { renderToolComponent } from '../tools/registry'
 import { ToolCallItem } from '../tools/tool-call-item'

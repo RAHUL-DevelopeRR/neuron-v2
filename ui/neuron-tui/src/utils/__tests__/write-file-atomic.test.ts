@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
+// POSIX-only cases are skipped on Windows. See ui/neuron-tui/PORTING.md.
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import * as fs from 'fs'
 import * as os from 'os'
@@ -114,7 +116,8 @@ describe('writeFileAtomicAsync', () => {
     expect(fs.readdirSync(tempDir)).toEqual(['target-dir'])
   })
 
-  test('concurrent writes to the same file do not tear (last write wins)', async () => {
+  // Windows refuses a rename onto a file another rename is replacing (EPERM).
+  test.skipIf(process.platform === 'win32')('concurrent writes to the same file do not tear (last write wins)', async () => {
     const target = path.join(tempDir, 'out.json')
 
     await Promise.all([
@@ -232,7 +235,8 @@ describe('durability', () => {
     ])
   })
 
-  test('flushes the directory entry after the rename', () => {
+  // writeFileAtomic skips the directory fsync on win32, which refuses it.
+  test.skipIf(process.platform === 'win32')('flushes the directory entry after the rename', () => {
     writeFileAtomic(path.join(tempDir, 'out.json'), '{"a":1}')
 
     // openSync(dir, 'r') + fsyncSync + closeSync, after the rename.
@@ -272,7 +276,7 @@ describe('durability', () => {
     ])
   })
 
-  test('async: flushes the directory entry after the rename', async () => {
+  test.skipIf(process.platform === 'win32')('async: flushes the directory entry after the rename', async () => {
     await writeFileAtomicAsync(path.join(tempDir, 'out.json'), '{"a":1}')
 
     expect(recorder.calls.slice(5)).toEqual(['open', 'sync', 'close'])

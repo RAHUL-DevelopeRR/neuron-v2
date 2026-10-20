@@ -1,6 +1,8 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import type { ContentBlock } from '../../types/chat'
 import type { ChatTheme } from '../../types/theme-system'
-import type { ToolName } from '@codebuff/sdk'
+import type { ToolName } from '../../types/agent-run'
 import type { ReactNode } from 'react'
 
 export type ToolBlock = Extract<ContentBlock, { type: 'tool' }>

@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { createTestRenderer } from '@opentui/core/testing'
 import { createRoot, flushSync } from '@opentui/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -57,13 +59,6 @@ test('/todo takes over the composer during streaming and Escape restores it with
         consumeInitialPrompt={() => null}
         fileTree={[]}
         inputRef={inputRef}
-        setIsAuthenticated={() => {}}
-        setUser={() => {}}
-        logoutMutation={
-          {} as React.ComponentProps<typeof Chat>['logoutMutation']
-        }
-        authStatus="ok"
-        freebuffSession={null}
       />
     )
   }

@@ -1,6 +1,8 @@
-import type { SponsoredProposalRow } from '@codebuff/common/ads/sponsored-proposal-view'
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
+// sponsored-proposal block, inline-ad marker and per-message credits are
+// gone. See ui/neuron-tui/PORTING.md.
 import type { ChatTheme } from './theme-system'
-import type { ToolName } from '@codebuff/sdk'
+import type { ToolName } from './agent-run'
 import type { ReactNode } from 'react'
 
 /**
@@ -141,79 +143,6 @@ export type FileAttachment = {
   note?: string
 }
 
-/**
- * A sponsored proposal, in the transcript (COD-376).
- *
- * A BLOCK rather than an `HtmlContentBlock`: html blocks are not serializable
- * and this one has to survive being written to and read back from history like
- * every other block. It carries the ROW and nothing derived -- every label,
- * every action and both destination gates come from
- * `@codebuff/common/ads/sponsored-proposal-view`, so the terminal card and the
- * web card cannot drift.
- *
- * ACCEPT ARRIVED IN PHASE 2 (COD-339) and runs LOCALLY, in a git worktree on
- * this machine, under the COD-336 boundary. It is reached by
- * `/ads:accept-proposal`, which opens the consent below rather than starting
- * anything.
- */
-export type SponsoredProposalContentBlock = {
-  type: 'sponsored-proposal'
-  /** The proposal row, as `activeProposal` projects it. */
-  proposal: SponsoredProposalRow & { _id: string; advertiser_id: string }
-  /** `owner/name` -- what the offer is about, and what a decline is keyed to. */
-  target: string
-  /**
-   * The consent screen, open, with everything it names.
-   *
-   * The whole of it is known BEFORE the accept, which is what lets a refusal
-   * write nothing at all. The procedure is the exact reviewed text the preview
-   * route returned, whose SHA-256 the Accept binds -- so what the user can read
-   * here is what runs. There is no branch: an in-place run edits `folder`.
-   */
-  consent?: {
-    advertiserName: string
-    headline: string
-    body: string
-    folder: string
-    procedure: string
-    /** Minted for this review and carried into the accept. */
-    runId: string
-  }
-  /** Which consent choice the caret is on. Reset every time it opens. */
-  consentIndex?: number
-  /** The consent's reviewed procedure is expanded ("View steps"). */
-  procedureOpen?: boolean
-  /**
-   * The run behind this card has a verdict and the user has moved on: the
-   * dock goes back to display ads. The card stays in history, and
-   * `/ads:undo` still works.
-   */
-  dockReleased?: boolean
-  /**
-   * A local run was started from THIS card.
-   *
-   * Distinct from `proposal.state`: an accept leaves the row readable as
-   * `offered` until the first poll, and `sponsoredProposalAwaitsVerdict` has to
-   * know a run exists before the row admits it -- otherwise the poll drops to
-   * the offer cadence at exactly the moment watching starts to matter.
-   */
-  runStarted?: boolean
-  /** The four-item channel menu is open. */
-  menuOpen?: boolean
-  /** "Why this?" is expanded. */
-  whyOpen?: boolean
-  /** A control is in flight; every control reads it, so a second press is inert. */
-  busy?: boolean
-  /**
-   * The latest poll could not establish whether this row is still current.
-   * The card remains visible as context, but proposal-specific controls pause
-   * until a successful refresh clears this marker.
-   */
-  refreshUnavailable?: boolean
-  /** Answered, and standing down. Kept in place so history stays honest. */
-  answered?: boolean
-}
-
 export type ContentBlock =
   | AgentContentBlock
   | AgentListContentBlock
@@ -221,7 +150,6 @@ export type ContentBlock =
   | HtmlContentBlock
   | ImageContentBlock
   | ModeDividerContentBlock
-  | SponsoredProposalContentBlock
   | TextContentBlock
   | ToolContentBlock
   | PlanContentBlock
@@ -236,9 +164,6 @@ export type AgentMessage = {
 export type ChatMessageMetadata = {
   /** Working directory where a bash command was executed */
   bashCwd?: string
-  /** UI-only marker for a response created in this process. Restored messages
-   * strip it so ads are never fetched retroactively into settled history. */
-  allowInlineAds?: boolean
   /** Whether this message/agent is collapsed in the UI */
   isCollapsed?: boolean
   /** Whether the user manually opened this collapsed item */
@@ -256,7 +181,6 @@ export type ChatMessage = {
   parentId?: string
   agent?: AgentMessage
   isCompletion?: boolean
-  credits?: number
   completionTime?: string
   isComplete?: boolean
   metadata?: ChatMessageMetadata
@@ -279,10 +203,4 @@ export function isTextBlock(block: ContentBlock): block is TextContentBlock {
 
 export function isImageBlock(block: ContentBlock): block is ImageContentBlock {
   return block.type === 'image'
-}
-
-export function isSponsoredProposalBlock(
-  block: ContentBlock,
-): block is SponsoredProposalContentBlock {
-  return block.type === 'sponsored-proposal'
 }

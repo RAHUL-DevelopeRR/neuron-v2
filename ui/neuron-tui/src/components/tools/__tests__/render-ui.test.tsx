@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
+// gravity_index (ad network) link case is gone. See ui/neuron-tui/PORTING.md.
 import { describe, expect, test } from 'bun:test'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
@@ -45,30 +47,6 @@ describe('RenderUIComponent', () => {
     expect(renderToStaticMarkup(<>{result.content}</>)).toContain(
       'Open preview',
     )
-  })
-
-  test('does not render an unresolved Gravity reference', () => {
-    const result = RenderUIComponent.render(
-      createToolBlock({
-        widget: {
-          type: 'button',
-          text: 'Get your Resend API key',
-          link: {
-            source: 'gravity_index',
-            search_id: 'search-1',
-            service_slug: 'resend',
-          },
-        },
-      }),
-      chatThemes.light,
-      {
-        availableWidth: 80,
-        indentationOffset: 0,
-        labelWidth: 10,
-      },
-    )
-
-    expect(result.content).toBeNull()
   })
 
   test('returns no content for unsupported widgets', () => {

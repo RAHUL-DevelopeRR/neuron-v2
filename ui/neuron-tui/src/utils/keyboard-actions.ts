@@ -1,10 +1,7 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { getInputModeConfig, type InputMode } from './input-modes'
-import { profileSurveyInputForKey } from './profile-survey-machine'
 import { isPlainEnterKey } from './terminal-enter-detection'
-import type {
-  ProfileSurveyInput,
-  ProfileSurveyKeyContext,
-} from './profile-survey-machine'
 import type { KeyEvent } from '@opentui/core'
 
 
@@ -21,9 +18,6 @@ export type ChatKeyboardState = {
   // Stream state
   isStreaming: boolean
   isWaitingForResponse: boolean
-
-  // Feedback mode
-  feedbackMode: boolean
 
   // Focus state
   focusedAgentId: string | null
@@ -54,34 +48,6 @@ export type ChatKeyboardState = {
   // Exit handler state
   nextCtrlCWillExit: boolean
 
-  /**
-   * The sponsor dock's detail panel (COD-457).
-   *
-   * `dockExpandable` is the sticky experiment arm: false in control, and then
-   * the chord resolves to `none` exactly as it did before this issue.
-   * `dockPanelOpen` is what makes Escape mean "close the panel" — and ONLY
-   * while it is true. `useKeyboard` is a global listener, so a panel that
-   * listened for Escape on its own would close AND interrupt the stream on one
-   * keypress; routing it through this resolver is what keeps Escape's six
-   * existing meanings intact the moment the panel is shut.
-   */
-  dockExpandable: boolean
-  dockPanelOpen: boolean
-  /**
-   * A sponsored PROPOSAL holds the dock (#3989's flow on the CLI). Ctrl+O then
-   * opens the proposal's details instead of the display ad's panel -- the
-   * dock holds one ad at a time, so the chord has one meaning at a time -- and
-   * it does so in both COD-457 arms, because a proposal is not part of that
-   * experiment. Escape is not claimed here: an open proposal disables chat's
-   * keyboard outright and owns its own Escape.
-   */
-  sponsoredDockActive?: boolean
-  /**
-   * The profile survey box (COD-779), when it is on screen; null/undefined
-   * when it is not, and then it claims nothing. Read fresh from
-   * `profile-survey-store` on every key by `useChatKeyboard`.
-   */
-  profileSurvey?: ProfileSurveyKeyContext | null
 }
 
 /**
@@ -91,8 +57,6 @@ export type ChatKeyboardState = {
 export type ChatKeyboardAction =
   // Mode actions
   | { type: 'exit-input-mode' }
-  | { type: 'exit-feedback-mode' }
-  | { type: 'clear-feedback-input' }
 
   // Input actions
   | { type: 'clear-input' }
@@ -144,17 +108,6 @@ export type ChatKeyboardAction =
   // Paste action (dispatcher checks clipboard content to route to image or text handler)
   | { type: 'paste' }
 
-  // Out of credits action
-  | { type: 'open-buy-credits' }
-
-  // Sponsor dock (COD-457)
-  | { type: 'toggle-dock-panel' }
-  | { type: 'close-dock-panel' }
-  | { type: 'toggle-sponsored-dock' }
-
-  // Profile survey box (COD-779)
-  | { type: 'profile-survey'; input: ProfileSurveyInput }
-
   // No action needed
   | { type: 'show-help' }
   | { type: 'open-chat-history' }
@@ -186,80 +139,6 @@ export function resolveChatKeyboardAction(
   // History pages from an empty draft or from the entry it last recalled.
   const inHistoryDraft =
     state.inputValue.length === 0 || state.lastEditDueToNav
-
-  // Priority 0: Out of credits mode - Enter opens buy credits page
-  if (state.inputMode === 'outOfCredits') {
-    if (isEnter) {
-      return { type: 'open-buy-credits' }
-    }
-    // Allow Escape or Ctrl+C to exit out-of-credits mode (return to normal input)
-    if (isEscape || isCtrlC) {
-      return { type: 'exit-input-mode' }
-    }
-    // Block most other inputs in this mode
-    return { type: 'none' }
-  }
-
-  // Priority 1: Feedback mode - block global keys except Escape/Ctrl-C/Ctrl-V
-  if (state.feedbackMode) {
-    if (isEscape) {
-      return { type: 'exit-feedback-mode' }
-    }
-    if (isCtrlC) {
-      return state.inputValue.length === 0
-        ? { type: 'exit-feedback-mode' }
-        : { type: 'clear-feedback-input' }
-    }
-    if (isCtrlV) {
-      return { type: 'paste' }
-    }
-    return { type: 'none' }
-  }
-
-  // Priority 1.5: The sponsor dock's detail panel (COD-457).
-  //
-  // Escape is claimed here and NOWHERE ELSE, and only while the panel is
-  // actually open — so with it shut, Escape keeps every one of the six
-  // meanings below untouched, which is the acceptance criterion. It sits above
-  // priority 2 and priority 4 deliberately: a user pressing Escape at an open
-  // panel means "close this", not "exit the mode" and not "interrupt the run".
-  // It sits BELOW the out-of-credits and feedback takeovers, which own the
-  // whole keyboard while they are up.
-  //
-  // The chord is Ctrl+O: verified unclaimed across every `useKeyboard`
-  // consumer and inert in the composer (`getPrintableKeySequence` returns null
-  // for any modified key). In the control arm `dockExpandable` is false and
-  // both branches fall through to `none`, so the chord does nothing at all.
-  const isDockChord =
-    key.ctrl && key.name === 'o' && !key.meta && !key.option && !key.shift
-  if (state.sponsoredDockActive && isDockChord) {
-    return { type: 'toggle-sponsored-dock' }
-  }
-  if (state.dockExpandable) {
-    if (isEscape && state.dockPanelOpen) {
-      return { type: 'close-dock-panel' }
-    }
-    if (isDockChord) {
-      return { type: 'toggle-dock-panel' }
-    }
-  }
-
-  // Priority 1.75: The profile survey box (COD-779), only while it is on
-  // screen AND the draft is empty in default mode. It claims a digit naming
-  // an option, Enter on a multi-select, ← (back) and Esc (not now) — so while
-  // it is up, Esc means "not now" rather than "interrupt the run", and ←
-  // means "back" rather than "chat history". Ctrl+C still interrupts. Any
-  // other key falls through and starts a prompt, which closes the box. The
-  // composer's intercept (`chat-input-key-intercept.ts`) asks the same
-  // function, so the two layers never disagree about a key.
-  if (
-    state.profileSurvey &&
-    state.inputMode === 'default' &&
-    state.inputValue.length === 0
-  ) {
-    const input = profileSurveyInputForKey(key, state.profileSurvey)
-    if (input) return { type: 'profile-survey', input }
-  }
 
   // Priority 2: Non-default input mode escape
   // Escape should exit the current mode BEFORE interrupting streams
@@ -473,7 +352,6 @@ export function createDefaultChatKeyboardState(): ChatKeyboardState {
     cursorPosition: 0,
     isStreaming: false,
     isWaitingForResponse: false,
-    feedbackMode: false,
     focusedAgentId: null,
     slashMenuActive: false,
     mentionMenuActive: false,
@@ -488,7 +366,5 @@ export function createDefaultChatKeyboardState(): ChatKeyboardState {
     historyNavDownEnabled: false,
     lastEditDueToNav: false,
     nextCtrlCWillExit: false,
-    dockExpandable: false,
-    dockPanelOpen: false,
   }
 }

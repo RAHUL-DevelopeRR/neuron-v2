@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { describe, test, expect, mock, beforeEach } from 'bun:test'
 
 import { useChatStore } from '../../state/chat-store'
@@ -29,7 +31,6 @@ describe('bash command', () => {
       inputValue: '/bash',
       isChainInProgressRef: { current: false },
       isStreaming: false,
-      logoutMutation: {} as RouterParams['logoutMutation'],
       streamMessageIdRef: { current: null },
       addToQueue: mock(() => {}),
       clearMessages: mock(() => {}),
@@ -39,9 +40,7 @@ describe('bash command', () => {
       setCanProcessQueue: mock(() => {}),
       setInputFocused: mock(() => {}),
       setInputValue: mock(() => {}),
-      setIsAuthenticated: mock(() => {}),
       setMessages: mock(() => {}),
-      setUser: mock(() => {}),
       ...overrides,
     })
 
@@ -295,7 +294,6 @@ describe('bash command', () => {
       inputValue: '/bash',
       isChainInProgressRef: { current: false },
       isStreaming: false,
-      logoutMutation: {} as RouterParams['logoutMutation'],
       streamMessageIdRef: { current: null },
       addToQueue: mock(() => {}),
       clearMessages: mock(() => {}),
@@ -305,9 +303,7 @@ describe('bash command', () => {
       setCanProcessQueue: mock(() => {}),
       setInputFocused: mock(() => {}),
       setInputValue: mock(() => {}),
-      setIsAuthenticated: mock(() => {}),
       setMessages: mock(() => {}),
-      setUser: mock(() => {}),
       ...overrides,
     })
 

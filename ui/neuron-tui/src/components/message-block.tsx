@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { TextAttributes } from '@opentui/core'
 import { memo, useState } from 'react'
 
@@ -16,7 +18,6 @@ import { getCliEnv } from '../utils/env'
 import { type MarkdownPalette } from '../utils/markdown-renderer'
 import { formatCwd } from '../utils/path-helpers'
 
-import type { FeedbackCategory } from '@codebuff/common/constants/feedback'
 
 import type {
   ContentBlock,
@@ -37,7 +38,6 @@ interface MessageBlockProps {
   timestamp: string
   isComplete?: boolean
   completionTime?: string
-  credits?: number
   timerStartTime: number | null
   textColor?: ThemeColor
   timestampColor: string
@@ -48,16 +48,9 @@ interface MessageBlockProps {
   onBuildFast: () => void
   onBuildMax: () => void
   onBuildLite: () => void
-  onFeedback?: (messageId: string) => void
-  onCloseFeedback?: () => void
   validationErrors?: Array<{ id: string; message: string }>
   /** Runtime error to display in UI but NOT send to LLM */
   userError?: string
-  onOpenFeedback?: (options?: {
-    category?: FeedbackCategory
-    footerMessage?: string
-    errors?: Array<{ id: string; message: string }>
-  }) => void
   attachments?: ImageAttachment[]
   textAttachments?: TextAttachment[]
   fileAttachments?: FileAttachment[]
@@ -121,7 +114,6 @@ export const MessageBlock = memo(({
   timestamp,
   isComplete,
   completionTime,
-  credits,
   timerStartTime,
   textColor,
   timestampColor,
@@ -132,11 +124,8 @@ export const MessageBlock = memo(({
   onBuildFast,
   onBuildMax,
   onBuildLite,
-  onFeedback,
-  onCloseFeedback,
   validationErrors,
   userError,
-  onOpenFeedback,
   attachments,
   textAttachments,
   fileAttachments,
@@ -160,7 +149,6 @@ export const MessageBlock = memo(({
       timestamp,
       isComplete,
       completionTime,
-      credits,
       timerStartTime,
       textColor,
       timestampColor,
@@ -171,10 +159,7 @@ export const MessageBlock = memo(({
       onBuildFast,
       onBuildMax,
       onBuildLite,
-      onFeedback,
-      onCloseFeedback,
       validationErrors,
-      onOpenFeedback,
       metadata,
       isLastMessage,
     },
@@ -266,7 +251,6 @@ export const MessageBlock = memo(({
           <box style={{ paddingTop: 1, paddingBottom: 1 }}>
             <ValidationErrorPopover
               errors={validationErrors}
-              onOpenFeedback={onOpenFeedback}
               onClose={() => setShowValidationPopover(false)}
             />
           </box>
@@ -335,10 +319,7 @@ export const MessageBlock = memo(({
           isLoading={isLoading}
           isComplete={isComplete}
           completionTime={completionTime}
-          credits={credits}
           timerStartTime={timerStartTime}
-          onFeedback={onFeedback}
-          onCloseFeedback={onCloseFeedback}
         />
       )}
     </box>

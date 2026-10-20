@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { spawn } from 'child_process'
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
@@ -7,7 +9,6 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
 
 import { TERMINAL_RESET_SEQUENCES } from '../utils/terminal-reset-sequences'
 import { classifyTerminalWatchdogSpawnFailure } from '../utils/terminal-watchdog'
-import { sanitizeWindowsCliVersion } from '../utils/windows-terminal-health'
 
 import type { ChildProcess } from 'child_process'
 
@@ -269,7 +270,7 @@ const runFor = (key: string): Run => {
 }
 
 describe('terminal watchdog', () => {
-  test('bounds watchdog failure telemetry labels', () => {
+  test('classifies watchdog spawn failures into bounded labels', () => {
     expect(
       classifyTerminalWatchdogSpawnFailure(
         Object.assign(new Error('private path'), { code: 'ENOENT' }),
@@ -278,8 +279,6 @@ describe('terminal watchdog', () => {
     expect(
       classifyTerminalWatchdogSpawnFailure(new Error('private text')),
     ).toBe('unknown')
-    expect(sanitizeWindowsCliVersion('0.0.142')).toBe('0.0.142')
-    expect(sanitizeWindowsCliVersion('private/path')).toBe('unknown')
   })
 })
 

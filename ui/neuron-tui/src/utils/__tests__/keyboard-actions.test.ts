@@ -1,3 +1,6 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
+// feedback, usage and out-of-credits mode cases went with those modes.
+// See ui/neuron-tui/PORTING.md.
 import { describe, test, expect } from 'bun:test'
 
 import {
@@ -57,47 +60,13 @@ describe('resolveChatKeyboardAction', () => {
       })
     })
 
-    test('escape in usage mode exits mode', () => {
+    test('escape in image mode exits mode', () => {
       const state: ChatKeyboardState = {
         ...defaultState,
-        inputMode: 'usage',
+        inputMode: 'image',
       }
       expect(resolveChatKeyboardAction(escapeKey, state)).toEqual({
         type: 'exit-input-mode',
-      })
-    })
-  })
-
-  describe('feedback mode', () => {
-    test('escape in feedback mode exits feedback', () => {
-      const state: ChatKeyboardState = {
-        ...defaultState,
-        feedbackMode: true,
-      }
-      expect(resolveChatKeyboardAction(escapeKey, state)).toEqual({
-        type: 'exit-feedback-mode',
-      })
-    })
-
-    test('ctrl-c in feedback mode with empty input exits feedback', () => {
-      const state: ChatKeyboardState = {
-        ...defaultState,
-        feedbackMode: true,
-        inputValue: '',
-      }
-      expect(resolveChatKeyboardAction(ctrlC, state)).toEqual({
-        type: 'exit-feedback-mode',
-      })
-    })
-
-    test('ctrl-c in feedback mode with text clears input', () => {
-      const state: ChatKeyboardState = {
-        ...defaultState,
-        feedbackMode: true,
-        inputValue: 'some feedback',
-      }
-      expect(resolveChatKeyboardAction(ctrlC, state)).toEqual({
-        type: 'clear-feedback-input',
       })
     })
   })
@@ -672,25 +641,6 @@ describe('resolveChatKeyboardAction', () => {
       })
     })
 
-    test('Ctrl+T blocked in feedback mode', () => {
-      const state: ChatKeyboardState = {
-        ...defaultState,
-        feedbackMode: true,
-      }
-      expect(resolveChatKeyboardAction(ctrlT, state)).toEqual({
-        type: 'none',
-      })
-    })
-
-    test('Ctrl+T blocked in outOfCredits mode', () => {
-      const state: ChatKeyboardState = {
-        ...defaultState,
-        inputMode: 'outOfCredits',
-      }
-      expect(resolveChatKeyboardAction(ctrlT, state)).toEqual({
-        type: 'none',
-      })
-    })
   })
 })
 

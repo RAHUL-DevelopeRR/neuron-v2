@@ -1,24 +1,18 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 /**
  * Chat view adapter for connection status, queue presentation, and exit handling.
+ *
+ * Freebuff polled the Codebuff backend's health endpoint for `isConnected`.
+ * Neuron's UI talks only to its local engine; until P2 reports the engine's
+ * state, the UI counts as connected.
  */
 
-import { RECONNECTION_MESSAGE_DURATION_MS } from '@codebuff/sdk'
-import { useQueryClient } from '@tanstack/react-query'
-import { useCallback, useEffect, useState, useTransition } from 'react'
-
-import { authQueryKeys } from './use-auth-query'
-import { useConnectionStatus } from './use-connection-status'
 import { useExitHandler } from './use-exit-handler'
 import { useQueueControls } from './use-queue-controls'
 import { useQueueUi } from './use-queue-ui'
-import { useTimeout } from './use-timeout'
 import { useChatRuntime } from '../contexts/chat-runtime-context'
 import { useChatStore } from '../state/chat-store'
-import { setConnectionMonitorBusy } from '../utils/connection-monitor'
-import {
-  sponsoredTurnHoldsQueue,
-  useSponsoredRunStore,
-} from '../state/sponsored-run-store'
 
 import type { QueuedMessage, StreamStatus } from './use-message-queue'
 import type { PendingAttachment } from '../types/store'
@@ -74,39 +68,9 @@ export function useChatStreaming({
   terminalWidth,
   separatorWidth,
 }: UseChatStreamingOptions): UseChatStreamingReturn {
-  const queryClient = useQueryClient()
-  const [, startUiTransition] = useTransition()
   const runtime = useChatRuntime()
-
-  // Reconnection state
-  const [showReconnectionMessage, setShowReconnectionMessage] = useState(false)
-  const reconnectionTimeout = useTimeout()
-
-  // Reconnection handler
-  const handleReconnection = useCallback(
-    (isInitialConnection: boolean) => {
-      queryClient.invalidateQueries({ queryKey: authQueryKeys.all })
-
-      startUiTransition(() => {
-        if (!isInitialConnection) {
-          setShowReconnectionMessage(true)
-          reconnectionTimeout.setTimeout(
-            'reconnection-message',
-            () => {
-              startUiTransition(() => {
-                setShowReconnectionMessage(false)
-              })
-            },
-            RECONNECTION_MESSAGE_DURATION_MS,
-          )
-        }
-      })
-    },
-    [queryClient, reconnectionTimeout, startUiTransition],
-  )
-
-  // Connection status
-  const isConnected = useConnectionStatus(handleReconnection)
+  const isConnected = true
+  const showReconnectionMessage = false
 
   const {
     timerStartTime,
@@ -122,22 +86,9 @@ export function useChatStreaming({
     clearQueue,
   } = runtime
 
-  // A plain message sent now joins the running task. Not during a sponsored
-  // turn: it has no steering mailbox, so messages wait in the queue.
+  // A plain message sent now joins the running task.
   const isChainInProgress = useChatStore((state) => state.isChainInProgress)
-  const sponsoredHoldsQueue = useSponsoredRunStore((state) =>
-    sponsoredTurnHoldsQueue(state.snapshot),
-  )
-  const steersRun =
-    (isStreaming || isChainInProgress) && !sponsoredHoldsQueue
-
-  // A turn in flight already proves the backend is reachable — its own success (or failure)
-  // is better evidence than a dedicated probe racing it for sockets/CPU. Pause the shared
-  // connection monitor's polling for the duration and let it resume right after.
-  useEffect(() => {
-    setConnectionMonitorBusy(isStreaming || isChainInProgress)
-    return () => setConnectionMonitorBusy(false)
-  }, [isStreaming, isChainInProgress])
+  const steersRun = isStreaming || isChainInProgress
 
   // Queue UI
   const {

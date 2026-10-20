@@ -1,12 +1,13 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
+// feedback, credits, sponsor-dock and profile-survey key paths and the
+// ad-rotation activity reporting are gone. See ui/neuron-tui/PORTING.md.
 import { statSync } from 'fs'
 
 import { useKeyboard } from '@opentui/react'
-import { useCallback, useRef } from 'react'
+import { useCallback } from 'react'
 
 import { useChatStore } from '../state/chat-store'
-import { getProfileSurveyKeyContext } from '../state/profile-survey-store'
 import { getProjectRoot } from '../project-files'
-import { reportActivity } from '../utils/activity-tracker'
 import { hasClipboardImage, readClipboardText, readClipboardFilePath, getImageFilePathFromText } from '../utils/clipboard-image'
 import { isImageFile } from '../utils/image-handler'
 import {
@@ -16,11 +17,7 @@ import {
 } from '../utils/keyboard-actions'
 import { markReturnKeySeenForKey } from '../utils/terminal-enter-detection'
 
-import type { ProfileSurveyInput } from '../utils/profile-survey-machine'
 import type { KeyEvent } from '@opentui/core'
-
-// Throttle interval for keyboard activity reporting (ms)
-const KEYBOARD_ACTIVITY_THROTTLE_MS = 1000
 
 /**
  * Handlers for chat keyboard actions.
@@ -29,8 +26,6 @@ const KEYBOARD_ACTIVITY_THROTTLE_MS = 1000
 export type ChatKeyboardHandlers = {
   // Mode handlers
   onExitInputMode: () => void
-  onExitFeedbackMode: () => void
-  onClearFeedbackInput: () => void
 
   // Input handlers
   onClearInput: () => void
@@ -91,18 +86,6 @@ export type ChatKeyboardHandlers = {
 
   // Toggle all handler
   onToggleAll: () => void
-
-  // Out of credits handler
-  onOpenBuyCredits: () => void
-
-  // Sponsor dock (COD-457)
-  onToggleDockPanel: () => void
-  onCloseDockPanel: () => void
-  /** Ctrl+O while a sponsored proposal holds the dock: open its details. */
-  onToggleSponsoredDock?: () => void
-
-  /** A key the profile survey box claimed (COD-779). */
-  onProfileSurveyInput?: (input: ProfileSurveyInput) => void
 }
 
 /**
@@ -137,12 +120,6 @@ function dispatchAction(
       return true
     case 'exit-input-mode':
       handlers.onExitInputMode()
-      return true
-    case 'exit-feedback-mode':
-      handlers.onExitFeedbackMode()
-      return true
-    case 'clear-feedback-input':
-      handlers.onClearFeedbackInput()
       return true
     case 'clear-input':
       handlers.onClearInput()
@@ -221,15 +198,6 @@ function dispatchAction(
       handlers.onBashHistoryDown()
       return true
     case 'paste': {
-      const survey = getProfileSurveyKeyContext()
-      const draft = useChatStore.getState()
-      if (
-        survey?.question.sponsoredKind === 'text' && survey.textEditing &&
-        draft.inputMode === 'default' && !draft.inputValue
-      ) {
-        handlers.onProfileSurveyInput?.({ type: 'text', text: readClipboardText() ?? '', now: Date.now() })
-        return true
-      }
       const cwd = getProjectRoot() ?? process.cwd()
       
       // First, check if clipboard contains a copied file (e.g., from Finder)
@@ -287,21 +255,6 @@ function dispatchAction(
     case 'toggle-all':
       handlers.onToggleAll()
       return true
-    case 'open-buy-credits':
-      handlers.onOpenBuyCredits()
-      return true
-    case 'toggle-dock-panel':
-      handlers.onToggleDockPanel()
-      return true
-    case 'close-dock-panel':
-      handlers.onCloseDockPanel()
-      return true
-    case 'toggle-sponsored-dock':
-      handlers.onToggleSponsoredDock?.()
-      return true
-    case 'profile-survey':
-      handlers.onProfileSurveyInput?.(action.input)
-      return true
     case 'none':
       return false
   }
@@ -320,28 +273,16 @@ function dispatchAction(
  * - History navigation
  * - Agent mode toggle
  * - Exit handling
- *
- * For feedback mode, the hook respects the feedbackMode state and routes
- * escape/ctrl-c appropriately.
  */
 export function useChatKeyboard({
   state,
   handlers,
   disabled = false,
 }: UseChatKeyboardOptions): void {
-  const lastKeyboardActivityRef = useRef<number>(0)
-
   useKeyboard(
     useCallback(
       (key: KeyEvent) => {
         if (disabled) return
-
-        // Report keyboard activity for activity-aware features (throttled)
-        const now = Date.now()
-        if (now - lastKeyboardActivityRef.current > KEYBOARD_ACTIVITY_THROTTLE_MS) {
-          lastKeyboardActivityRef.current = now
-          reportActivity()
-        }
 
         markReturnKeySeenForKey(key)
 
@@ -353,7 +294,6 @@ export function useChatKeyboard({
           cursorPosition: draft.cursorPosition,
           inputMode: draft.inputMode,
           lastEditDueToNav: draft.lastEditDueToNav,
-          profileSurvey: getProfileSurveyKeyContext(),
         })
         const handled = dispatchAction(action, handlers)
 

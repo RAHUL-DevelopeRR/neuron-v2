@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { TextAttributes } from '@opentui/core'
 import { useCallback, useEffect, useState } from 'react'
 
@@ -5,8 +7,6 @@ import { defineToolComponent } from './types'
 import { useTerminalDimensions } from '../../hooks/use-terminal-dimensions'
 import { useTheme } from '../../hooks/use-theme'
 import { getLatestFollowupToolCallId, useChatStore } from '../../state/chat-store'
-import { useFreebuffSessionStore } from '../../state/freebuff-session-store'
-import { IS_FREEBUFF } from '../../utils/constants'
 import { Button } from '../button'
 
 import type { ToolRenderConfig } from './types'
@@ -225,9 +225,6 @@ const SuggestFollowupsItem = ({
 }: SuggestFollowupsItemProps) => {
   const theme = useTheme()
   const inputFocused = useChatStore((state) => state.inputFocused)
-  const isFreebuffSessionOver = useFreebuffSessionStore(
-    (state) => IS_FREEBUFF && state.session?.status === 'ended',
-  )
   const setSuggestedFollowups = useChatStore(
     (state) => state.setSuggestedFollowups,
   )
@@ -310,7 +307,7 @@ const SuggestFollowupsItem = ({
             isHovered={hoveredIndex === index}
             onSendFollowup={onSendFollowup}
             onHover={setHoveredIndex}
-            disabled={!inputFocused || isFreebuffSessionOver}
+            disabled={!inputFocused}
             labelColumnWidth={labelColumnWidth}
           />
         ))}

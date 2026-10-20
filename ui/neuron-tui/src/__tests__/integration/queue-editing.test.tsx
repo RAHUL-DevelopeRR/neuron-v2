@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test'
 import { createTestRenderer } from '@opentui/core/testing'
 import { createRoot, flushSync } from '@opentui/react'
@@ -124,11 +126,6 @@ const mountChatQueue = async ({
           }
           isCompactHeight={false}
           isNarrowWidth
-          feedbackMode={false}
-          handleExitFeedback={() => {}}
-          publishMode={false}
-          handleExitPublish={() => {}}
-          handlePublish={async () => {}}
           handleSubmit={async () => {}}
           onPaste={() => {}}
           onInterruptStream={() => {}}

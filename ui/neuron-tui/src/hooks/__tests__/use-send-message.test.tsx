@@ -1,3 +1,6 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the run
+// lifecycle is driven through a fake engine client instead of the Codebuff
+// SDK's client.run(). See ui/neuron-tui/PORTING.md.
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
@@ -8,32 +11,67 @@ import { createRoot, flushSync } from '@opentui/react'
 import React, { useEffect, useRef } from 'react'
 
 import { useSendMessage } from '../use-send-message'
+import {
+  EngineNotConnectedError,
+  getNeuronEngineClient,
+  type EngineExit,
+  type NeuronEngineClient,
+} from '../../engine/neuron-engine-client'
 import { setProjectRoot, tryGetProjectRoot } from '../../project-files'
 import { useChatStore } from '../../state/chat-store'
 import { stopActiveRun } from '../../utils/active-run'
 import { setChatDirOverrideForTesting } from '../../utils/run-state-storage'
 
-import type { RunState } from '@codebuff/sdk'
+import type {
+  Attachment,
+  EngineCommand,
+  PermissionReply,
+  ReadyEvent,
+  UiEvent,
+} from '../../engine/protocol'
 import type { SendMessageFn } from '../../types/contracts/send-message'
 import type { ElapsedTimeTracker } from '../use-elapsed-time'
 
-type RunCall = {
-  runConfig: any
-  resolve: (state: RunState) => void
-  reject: (error: unknown) => void
+/** An engine that records commands and emits whatever the test tells it to. */
+class FakeEngine implements NeuronEngineClient {
+  readonly connection = 'ready' as const
+  submits: Array<{ text: string; attachments: Attachment[] }> = []
+  interrupts = 0
+  private listeners = new Set<(event: UiEvent) => void>()
+
+  start(): Promise<ReadyEvent> {
+    return Promise.resolve({ type: 'ready', protocol: 1, version: 'test' })
+  }
+  send(_command: EngineCommand): void {}
+  submit(text: string, attachments: Attachment[] = []): void {
+    this.submits.push({ text, attachments })
+  }
+  slash(): void {}
+  setModel(): void {}
+  listModels(): void {}
+  interrupt(): void {
+    this.interrupts++
+  }
+  replyToPermission(_reply: PermissionReply): void {}
+  subscribe(listener: (event: UiEvent) => void): () => void {
+    this.listeners.add(listener)
+    return () => this.listeners.delete(listener)
+  }
+  onExit(_listener: (exit: EngineExit) => void): () => void {
+    return () => {}
+  }
+  shutdown(): Promise<EngineExit> {
+    return Promise.resolve({ code: 0, signal: null })
+  }
+  emit(event: UiEvent): void {
+    for (const listener of [...this.listeners]) listener(event)
+  }
 }
 
 let sendMessageFromHost: SendMessageFn | null = null
-let runCalls: RunCall[] = []
+let engine: NeuronEngineClient
 let testRoot: string
 let originalProjectRoot: string
-
-const fakeClient = {
-  run: (runConfig: any) =>
-    new Promise<RunState>((resolve, reject) => {
-      runCalls.push({ runConfig, resolve, reject })
-    }),
-}
 
 const makeTimer = (): ElapsedTimeTracker => ({
   start: () => {},
@@ -67,8 +105,7 @@ const Host = () => {
     resumeQueue: () => {},
     requeueMessageAtFront: () => {},
     continueChat: false,
-    subscriptionData: null,
-    getClient: async () => fakeClient as any,
+    getEngine: () => engine,
   })
 
   useEffect(() => {
@@ -87,27 +124,12 @@ const waitFor = async (label: string, predicate: () => boolean) => {
   throw new Error(`Timed out waiting for ${label}`)
 }
 
-const makeRunState = (marker: string): RunState =>
-  ({
-    traceSessionId: `trace-${marker}`,
-    sessionState: {
-      mainAgentState: { messageHistory: [] },
-    },
-    output: {
-      type: 'error',
-      message: 'Session ended before this response completed.',
-    },
-  }) as unknown as RunState
-
-const settlePendingRuns = () => {
-  for (const call of runCalls) {
-    call.resolve(makeRunState('cleanup'))
-  }
-}
+const savedMessages = () =>
+  JSON.parse(fs.readFileSync(path.join(testRoot, 'chat-messages.json'), 'utf8'))
 
 beforeEach(() => {
   sendMessageFromHost = null
-  runCalls = []
+  engine = getNeuronEngineClient()
   testRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'use-send-message-'))
   originalProjectRoot = tryGetProjectRoot() ?? process.cwd()
   setProjectRoot(process.cwd())
@@ -131,94 +153,97 @@ const mountHost = async () => {
   return { setup, root }
 }
 
-describe('useSendMessage continuation state', () => {
-  test('persists the final streamed text and completion state before returning', async () => {
+describe('useSendMessage with the engine client', () => {
+  test('without an engine the turn ends with the not-connected error, and is saved', async () => {
+    const { setup, root } = await mountHost()
+    try {
+      await sendMessageFromHost!({ content: 'hello', agentMode: 'DEFAULT' })
+
+      const messages = useChatStore.getState().messages
+      expect(
+        messages.some((m) => m.variant === 'user' && m.content === 'hello'),
+      ).toBe(true)
+      const ai = messages.at(-1)!
+      expect(ai.variant).toBe('ai')
+      expect(ai.isComplete).toBe(true)
+      expect(ai.userError).toContain(new EngineNotConnectedError().message)
+      expect(useChatStore.getState().isChainInProgress).toBe(false)
+      expect(savedMessages().at(-1).userError).toContain('not connected')
+    } finally {
+      flushSync(() => root.unmount())
+      setup.renderer.destroy()
+    }
+  })
+
+  test('a turn submits the prompt and completes at turn_finished', async () => {
+    const fake = new FakeEngine()
+    engine = fake
     const { setup, root } = await mountHost()
     const run = sendMessageFromHost!({
-      content: 'finish',
+      content: 'fix the test',
       agentMode: 'DEFAULT',
     })
-
     try {
-      await waitFor('SDK run', () => runCalls.length === 1)
-      const finalText = 'Finished the cache TTL change. All 14 tests pass.'
-      const finalState = {
-        ...makeRunState('completed'),
-        output: { type: 'lastMessage', value: [] },
-      } as RunState
-      // Return immediately after the last chunk, before the 100ms UI batch
-      // flush. The live screen and a resumed chat must retain the same answer.
-      runCalls[0].runConfig.handleStreamChunk(finalText)
-      runCalls[0].resolve(finalState)
+      await waitFor('submit', () => fake.submits.length === 1)
+      expect(fake.submits[0]).toEqual({ text: 'fix the test', attachments: [] })
+      expect(useChatStore.getState().isChainInProgress).toBe(true)
+
+      fake.emit({ type: 'turn_finished' })
       await run
 
-      const saved = JSON.parse(
-        fs.readFileSync(path.join(testRoot, 'chat-messages.json'), 'utf8'),
-      ).at(-1)
-      expect(saved.blocks).toContainEqual({
-        type: 'text',
-        textType: 'text',
-        content: finalText,
-      })
-      expect(saved.isComplete).toBe(true)
-      expect(saved.metadata.runState).toEqual(finalState)
+      const ai = useChatStore.getState().messages.at(-1)!
+      expect(ai.isComplete).toBe(true)
+      expect(ai.userError).toBeUndefined()
+      expect(useChatStore.getState().runState?.output?.type).toBe('lastMessage')
+      expect(useChatStore.getState().isChainInProgress).toBe(false)
     } finally {
-      settlePendingRuns()
+      fake.emit({ type: 'turn_finished' })
       await run
       flushSync(() => root.unmount())
       setup.renderer.destroy()
     }
   })
 
-  test('follow-ups inherit rejected and aborted run snapshots without stale replacement', async () => {
+  test('an engine error event is shown when its turn finishes', async () => {
+    const fake = new FakeEngine()
+    engine = fake
     const { setup, root } = await mountHost()
-    const runs: Promise<void>[] = []
-
+    const run = sendMessageFromHost!({ content: 'go', agentMode: 'DEFAULT' })
     try {
-      runs.push(
-        sendMessageFromHost!({ content: 'first', agentMode: 'DEFAULT' }),
+      await waitFor('submit', () => fake.submits.length === 1)
+      fake.emit({ type: 'error', message: 'provider rejected the request' })
+      fake.emit({ type: 'turn_finished' })
+      await run
+
+      expect(useChatStore.getState().messages.at(-1)!.userError).toBe(
+        'provider rejected the request',
       )
-      await waitFor('first SDK run', () => runCalls.length === 1)
-
-      const rejectedSnapshot = makeRunState('failed')
-      runCalls[0].runConfig.onStateSnapshot(rejectedSnapshot)
-      runCalls[0].reject(new Error('network failed'))
-      await runs[0]
-
-      runs.push(
-        sendMessageFromHost!({ content: 'after error', agentMode: 'DEFAULT' }),
-      )
-      await waitFor('second SDK run', () => runCalls.length === 2)
-
-      expect(runCalls[1].runConfig.previousRun).toBe(rejectedSnapshot)
-
-      const abortedSnapshot = makeRunState('interrupted')
-      runCalls[1].runConfig.onStateSnapshot(abortedSnapshot)
-      stopActiveRun('user-interrupt')
-
-      runs.push(
-        sendMessageFromHost!({ content: 'after abort', agentMode: 'DEFAULT' }),
-      )
-      await waitFor('third SDK run', () => runCalls.length === 3)
-
-      expect(runCalls[2].runConfig.previousRun).toBe(abortedSnapshot)
-
-      const finalState = makeRunState('final')
-      runCalls[2].resolve(finalState)
-      await runs[2]
-
-      runCalls[1].resolve(makeRunState('late'))
-      await runs[1]
-
-      runs.push(
-        sendMessageFromHost!({ content: 'after late', agentMode: 'DEFAULT' }),
-      )
-      await waitFor('fourth SDK run', () => runCalls.length === 4)
-
-      expect(runCalls[3].runConfig.previousRun).toBe(finalState)
+      expect(useChatStore.getState().runState?.output).toEqual({
+        type: 'error',
+        message: 'provider rejected the request',
+      })
     } finally {
-      settlePendingRuns()
-      await Promise.all(runs)
+      flushSync(() => root.unmount())
+      setup.renderer.destroy()
+    }
+  })
+
+  test('stopping the run interrupts the engine turn', async () => {
+    const fake = new FakeEngine()
+    engine = fake
+    const { setup, root } = await mountHost()
+    const run = sendMessageFromHost!({
+      content: 'long task',
+      agentMode: 'DEFAULT',
+    })
+    try {
+      await waitFor('submit', () => fake.submits.length === 1)
+      stopActiveRun('user-interrupt')
+      expect(fake.interrupts).toBe(1)
+      expect(useChatStore.getState().isChainInProgress).toBe(false)
+    } finally {
+      fake.emit({ type: 'turn_finished' })
+      await run
       flushSync(() => root.unmount())
       setup.renderer.destroy()
     }

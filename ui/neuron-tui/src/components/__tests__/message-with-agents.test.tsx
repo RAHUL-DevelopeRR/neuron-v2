@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
@@ -86,18 +88,6 @@ const defaultCallbacks = {
   onBuildFast: () => {},
   onBuildMax: () => {},
   onBuildLite: () => {},
-  onFeedback: () => {},
-  onCloseFeedback: () => {},
-  onAdClick: () => {},
-  onAdImpression: () => {},
-  onResponseAdsNeeded: () => {},
-  onSponsoredProposalMenu: () => {},
-  onSponsoredProposalDisclose: () => {},
-  onSponsoredProposalAccept: () => {},
-  onSponsoredProposalConsent: () => {},
-  onSponsoredProposalProcedure: () => {},
-  onSponsoredProposalUndo: () => {},
-  onSponsoredProposalControl: () => {},
 }
 
 const initializeStore = (overrides: {
@@ -115,7 +105,6 @@ const initializeStore = (overrides: {
       isWaitingForResponse: overrides.isWaitingForResponse ?? false,
       timerStartTime: overrides.timerStartTime ?? null,
       availableWidth: overrides.availableWidth ?? 80,
-      responseAds: {},
     },
     callbacks: defaultCallbacks,
   })
@@ -203,26 +192,12 @@ describe('MessageBlockStore', () => {
       const mockBuildFast = () => {}
       const mockBuildMax = () => {}
       const mockBuildFree = () => {}
-      const mockFeedback = () => {}
-      const mockCloseFeedback = () => {}
 
       useMessageBlockStore.getState().setCallbacks({
         onToggleCollapsed: mockToggle,
         onBuildFast: mockBuildFast,
         onBuildMax: mockBuildMax,
         onBuildLite: mockBuildFree,
-        onFeedback: mockFeedback,
-        onCloseFeedback: mockCloseFeedback,
-        onAdClick: () => {},
-        onAdImpression: () => {},
-        onResponseAdsNeeded: () => {},
-  onSponsoredProposalMenu: () => {},
-  onSponsoredProposalDisclose: () => {},
-  onSponsoredProposalAccept: () => {},
-  onSponsoredProposalConsent: () => {},
-  onSponsoredProposalProcedure: () => {},
-  onSponsoredProposalUndo: () => {},
-  onSponsoredProposalControl: () => {},
       })
 
       const state = useMessageBlockStore.getState()
@@ -230,8 +205,6 @@ describe('MessageBlockStore', () => {
       expect(state.callbacks.onBuildFast).toBe(mockBuildFast)
       expect(state.callbacks.onBuildMax).toBe(mockBuildMax)
       expect(state.callbacks.onBuildLite).toBe(mockBuildFree)
-      expect(state.callbacks.onFeedback).toBe(mockFeedback)
-      expect(state.callbacks.onCloseFeedback).toBe(mockCloseFeedback)
     })
 
     test('callbacks are independent from context', () => {
@@ -273,18 +246,6 @@ describe('MessageBlockStore', () => {
         onBuildFast: mockFn,
         onBuildMax: mockFn,
         onBuildLite: mockFn,
-        onFeedback: mockFn,
-        onCloseFeedback: mockFn,
-        onAdClick: mockFn,
-        onAdImpression: mockFn,
-        onResponseAdsNeeded: mockFn,
-        onSponsoredProposalMenu: mockFn,
-        onSponsoredProposalDisclose: mockFn,
-        onSponsoredProposalAccept: mockFn,
-        onSponsoredProposalConsent: mockFn,
-        onSponsoredProposalProcedure: mockFn,
-        onSponsoredProposalUndo: mockFn,
-        onSponsoredProposalControl: mockFn,
       })
 
       useMessageBlockStore.getState().reset()
@@ -499,26 +460,6 @@ describe('callback invocation', () => {
     storedCallback('test-message-id')
 
     expect(toggleCalledWith).toBe('test-message-id')
-  })
-
-  test('onFeedback callback receives messageId and options', () => {
-    let feedbackMessageId: string | undefined
-    let feedbackOptions: object | undefined
-    const mockFeedback = (messageId: string, options?: object) => {
-      feedbackMessageId = messageId
-      feedbackOptions = options
-    }
-
-    useMessageBlockStore.getState().setCallbacks({
-      ...defaultCallbacks,
-      onFeedback: mockFeedback,
-    })
-
-    const storedCallback = useMessageBlockStore.getState().callbacks.onFeedback
-    storedCallback('msg-123', { category: 'app_bug' })
-
-    expect(feedbackMessageId).toBe('msg-123')
-    expect(feedbackOptions).toEqual({ category: 'app_bug' })
   })
 })
 

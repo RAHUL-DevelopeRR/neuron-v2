@@ -1,23 +1,27 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 {
-  "extends": "../tsconfig.base.json",
-  "ts-node": {
-    "esm": true
-  },
   "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2023", "DOM"],
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "strict": true,
+    "noImplicitReturns": true,
+    "esModuleInterop": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
     "jsx": "react-jsx",
     "jsxImportSource": "@opentui/react",
-    "outDir": "./dist",
-    "declaration": true,
-    "declarationMap": true,
-    "esModuleInterop": true,
-    "skipLibCheck": true,
-    "preserveSymlinks": false,
+    "types": ["bun"],
     "baseUrl": ".",
     "paths": {
-      "@codebuff/sdk": ["../sdk/src/index.ts"],
-      "@codebuff/common/*": ["../common/src/*"]
+      "@codebuff/common/*": ["./src/vendor/common/*"]
     }
   },
-  "include": ["src/**/*", "scripts/**/*.ts"],
+  "include": ["src/**/*", "scripts/**/*.ts", "test/**/*.ts"],
   "exclude": ["node_modules", "dist"]
 }

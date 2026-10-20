@@ -1,5 +1,5 @@
-import { IS_FREEBUFF } from './constants'
-
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 // Input mode types and configurations
 // To add a new mode:
 // 1. Add it to the InputMode type
@@ -13,11 +13,8 @@ export type InputMode =
   | 'review'
   | 'interview'
   | 'skill'
-  | 'usage'
   | 'image'
   | 'help'
-  | 'outOfCredits'
-  | 'subscriptionLimit'
 
 // Theme color keys that are valid color values (must match ChatTheme keys)
 export type ThemeColorKey =
@@ -123,16 +120,6 @@ export const INPUT_MODE_CONFIGS: Record<InputMode, InputModeConfig> = {
     disableSlashSuggestions: true,
     blockKeyboardExit: false,
   },
-  usage: {
-    icon: null,
-    label: null,
-    color: 'foreground',
-    placeholder: 'enter a coding task or / for commands',
-    widthAdjustment: 0,
-    showAgentModeToggle: true,
-    disableSlashSuggestions: false,
-    blockKeyboardExit: false,
-  },
   image: {
     icon: '📎',
     label: null,
@@ -153,33 +140,6 @@ export const INPUT_MODE_CONFIGS: Record<InputMode, InputModeConfig> = {
     disableSlashSuggestions: false,
     blockKeyboardExit: false,
   },
-  outOfCredits: {
-    icon: null,
-    label: null,
-    color: 'warning',
-    placeholder: '',
-    widthAdjustment: 0,
-    showAgentModeToggle: false,
-    disableSlashSuggestions: true,
-    blockKeyboardExit: false,
-  },
-  subscriptionLimit: {
-    icon: null,
-    label: null,
-    color: 'warning',
-    placeholder: '',
-    widthAdjustment: 0,
-    showAgentModeToggle: false,
-    disableSlashSuggestions: true,
-    blockKeyboardExit: true, // User must click "Continue with credits" or wait for reset
-  },
-}
-
-// In Freebuff, never show the agent mode toggle
-if (IS_FREEBUFF) {
-  for (const key of Object.keys(INPUT_MODE_CONFIGS) as InputMode[]) {
-    INPUT_MODE_CONFIGS[key].showAgentModeToggle = false
-  }
 }
 
 export function getInputModeConfig(mode: InputMode): InputModeConfig {

@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the child
+// no longer needs Codebuff's web env. See ui/neuron-tui/PORTING.md.
 import { describe, expect, test } from 'bun:test'
 
 describe('/new command', () => {
@@ -72,14 +74,6 @@ describe('/new command', () => {
       env: {
         ...process.env,
         NODE_ENV: 'test',
-        NEXT_PUBLIC_CB_ENVIRONMENT: 'test',
-        NEXT_PUBLIC_CODEBUFF_APP_URL: 'https://app.codebuff.test',
-        NEXT_PUBLIC_SUPPORT_EMAIL: 'support@codebuff.test',
-        NEXT_PUBLIC_POSTHOG_API_KEY: 'phc_test_key',
-        NEXT_PUBLIC_POSTHOG_HOST_URL: 'https://posthog.codebuff.test',
-        NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: 'pk_test_123',
-        NEXT_PUBLIC_STRIPE_CUSTOMER_PORTAL: 'https://stripe.codebuff.test',
-        NEXT_PUBLIC_WEB_PORT: '3000',
       },
       stderr: 'pipe',
       stdout: 'pipe',

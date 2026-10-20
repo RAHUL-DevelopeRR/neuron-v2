@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { castDraft, enableMapSet } from 'immer'
 import { create } from 'zustand'
 import { immer } from 'zustand/middleware/immer'
@@ -9,9 +11,7 @@ import { loadModePreference, saveModePreference } from '../utils/settings'
 import type { ChatMessage, ContentBlock } from '../types/chat'
 import type { AgentMode } from '../utils/constants'
 import type { InputMode } from '../utils/input-modes'
-import type { RunState } from '@codebuff/sdk'
-import type { AdTraceContext } from '@codebuff/common/ads/trace-context'
-import { adTraceContextFromRunState } from '@codebuff/common/ads/trace-context'
+import type { RunState } from '../types/agent-run'
 
 // Import types from the types/store module to avoid circular dependencies
 import type {
@@ -71,16 +71,7 @@ export type ChatStoreState = {
   agentMode: AgentMode
   hasReceivedPlanResponse: boolean
   lastMessageMode: AgentMode | null
-  sessionCreditsUsed: number
   runState: RunState | null
-  /**
-   * The ad trace pointer (ids only) for the conversation's LAST FINISHED run,
-   * completed or interrupted. Kept apart from `runState` because an
-   * interrupted run is never adopted there, yet it did create a root run on
-   * the server: pointing past it is what keeps the next prompt's lookup from
-   * selecting the interrupted run instead.
-   */
-  adTraceContext: AdTraceContext | null
   /** The currently active top banner, or null if none */
   activeTopBanner: TopBannerType
   inputMode: InputMode
@@ -89,11 +80,6 @@ export type ChatStoreState = {
    *  other mode exit reset it without extra bookkeeping. */
   pendingSkillName: string | null
   isRetrying: boolean
-  /** True while the current retry wait is a server capacity deferral (free
-   *  mode shed under high demand) rather than a stream recovery — the status
-   *  bar says "high demand" instead of a generic "retrying". Cleared with
-   *  isRetrying. */
-  isCapacityWait: boolean
   askUserState: AskUserState
   pendingAttachments: PendingAttachment[]
   pendingBashMessages: PendingBashMessage[]
@@ -156,10 +142,7 @@ type ChatStoreActions = {
   toggleAgentMode: () => void
   setHasReceivedPlanResponse: (value: boolean) => void
   setLastMessageMode: (mode: AgentMode | null) => void
-  addSessionCredits: (credits: number) => void
   setRunState: (runState: RunState | null) => void
-  /** Advance `adTraceContext` past a run that finished without being adopted. */
-  noteFinishedRunForAdTrace: (runState: RunState) => void
   setActiveTopBanner: (banner: TopBannerType) => void
   closeTopBanner: () => void
   setInputMode: (mode: InputMode) => void
@@ -168,9 +151,6 @@ type ChatStoreActions = {
    *  'skill' mode with a null skill is never representable via this path. */
   enterSkillMode: (skillName: string) => void
   setIsRetrying: (retrying: boolean) => void
-  /** Mark the current wait as a free-mode capacity deferral (implies
-   *  isRetrying). Cleared by setIsRetrying(false). */
-  noteCapacityDeferral: () => void
   setAskUserState: (state: AskUserState) => void
   updateAskUserAnswer: (questionIndex: number, optionIndex: number) => void
   updateAskUserOtherText: (questionIndex: number, text: string) => void
@@ -218,14 +198,11 @@ const initialState: ChatStoreState = {
   agentMode: IS_FREEBUFF ? ('LITE' as const) : loadModePreference(),
   hasReceivedPlanResponse: false,
   lastMessageMode: null,
-  sessionCreditsUsed: 0,
   runState: null,
-  adTraceContext: null,
   activeTopBanner: null,
   inputMode: 'default' as InputMode,
   pendingSkillName: null as string | null,
   isRetrying: false,
-  isCapacityWait: false,
   askUserState: null,
   pendingAttachments: [],
   pendingBashMessages: [],
@@ -329,21 +306,9 @@ export const useChatStore = create<ChatStore>()(
         state.lastMessageMode = mode
       }),
 
-    addSessionCredits: (credits) =>
-      set((state) => {
-        state.sessionCreditsUsed += credits
-      }),
-
     setRunState: (runState) =>
       set((state) => {
         state.runState = runState ? castDraft(runState) : null
-        state.adTraceContext = adTraceContextFromRunState(runState)
-      }),
-
-    noteFinishedRunForAdTrace: (runState) =>
-      set((state) => {
-        state.adTraceContext =
-          adTraceContextFromRunState(runState) ?? state.adTraceContext
       }),
 
     setActiveTopBanner: (banner) =>
@@ -378,15 +343,6 @@ export const useChatStore = create<ChatStore>()(
     setIsRetrying: (retrying) =>
       set((state) => {
         state.isRetrying = retrying
-        // Any transition (fresh generic retry, or the wait ending) supersedes
-        // a capacity flavor; only noteCapacityDeferral re-establishes it.
-        state.isCapacityWait = false
-      }),
-
-    noteCapacityDeferral: () =>
-      set((state) => {
-        state.isRetrying = true
-        state.isCapacityWait = true
       }),
 
     setAskUserState: (askUserState) =>
@@ -567,16 +523,13 @@ export const useChatStore = create<ChatStore>()(
         state.agentMode = initialState.agentMode
         state.hasReceivedPlanResponse = initialState.hasReceivedPlanResponse
         state.lastMessageMode = initialState.lastMessageMode
-        state.sessionCreditsUsed = initialState.sessionCreditsUsed
         state.runState = initialState.runState
           ? castDraft(initialState.runState)
           : null
-        state.adTraceContext = initialState.adTraceContext
         state.activeTopBanner = initialState.activeTopBanner
         state.inputMode = initialState.inputMode
         state.pendingSkillName = initialState.pendingSkillName
         state.isRetrying = initialState.isRetrying
-        state.isCapacityWait = initialState.isCapacityWait
         state.askUserState = initialState.askUserState
         state.pendingAttachments = []
         state.pendingBashMessages = []

@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: env vars
+// that only fed removed features are gone. See ui/neuron-tui/PORTING.md.
 /**
  * CLI environment helper for dependency injection.
  *
@@ -85,19 +87,9 @@ export const getCliEnv = (): CliEnv => ({
     process.env.CODEBUFF_TRUSTED_AGENT_PUBLISHERS,
   CODEBUFF_SCROLL_MULTIPLIER: process.env.CODEBUFF_SCROLL_MULTIPLIER,
   CODEBUFF_PERF_TEST: process.env.CODEBUFF_PERF_TEST,
-  CODEBUFF_TRACE: process.env.CODEBUFF_TRACE,
   CODEBUFF_LAUNCHER_PID: process.env.CODEBUFF_LAUNCHER_PID,
-  CODEBUFF_LAUNCHER_VERSION: process.env.CODEBUFF_LAUNCHER_VERSION,
-  CODEBUFF_SHIP_LOGS: process.env.CODEBUFF_SHIP_LOGS,
   CODEBUFF_NO_TERMINAL_WATCHDOG: process.env.CODEBUFF_NO_TERMINAL_WATCHDOG,
-  CODEBUFF_TRUST_AGENT_DIRS: process.env.CODEBUFF_TRUST_AGENT_DIRS,
-  FREEBUFF_MODE: process.env.FREEBUFF_MODE,
   FREEBUFF_CONFIG_DIR: process.env.FREEBUFF_CONFIG_DIR,
-  // `bun run dev:agentic-ads cli` only: force one LOCAL campaign on the offer
-  // route. Honoured only by a backend whose own environment names the same
-  // campaign (`common/src/ads/local-agentic-test.ts`).
-  TEST_AGENTIC_ADS: process.env.TEST_AGENTIC_ADS,
-  TEST_AGENTIC_ADS_CAMPAIGN: process.env.TEST_AGENTIC_ADS_CAMPAIGN,
 
   TZ: process.env.TZ,
   HTTPS_PROXY: process.env.HTTPS_PROXY,

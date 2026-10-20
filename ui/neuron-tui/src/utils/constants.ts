@@ -1,16 +1,14 @@
-import type { ToolName } from '@codebuff/sdk'
-
-import { getCliEnv } from './env'
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
+import type { ToolName } from '../types/agent-run'
 
 /**
- * Freebuff build-time flag. When true, the CLI is built as Freebuff (free-only variant).
- * Injected via --define at compile time; enables dead-code elimination by the bundler.
+ * Freebuff's build flag (the free-only variant). Neuron always runs the
+ * standard UI: the free-mode session, catalog and billing paths it selected
+ * are gone, and what remains of it only picks Freebuff/Codebuff wording that
+ * the rebrand (P4) replaces. Pinned false so no env var can turn it on.
  */
-export const IS_FREEBUFF = getCliEnv().FREEBUFF_MODE === 'true'
-
-/** Message shown when the user ends a freebuff session early. */
-export const END_SESSION_MESSAGE =
-  'Ending session. Your next message starts a new one; /model changes the model.'
+export const IS_FREEBUFF = false as boolean
 
 // Agent IDs that should not be rendered in the CLI UI. Matched as substrings
 // so both bundled ids ('context-pruner') and publisher-qualified ids
@@ -166,20 +164,3 @@ export const AGENT_MODE_TO_ID = {
 
 export type AgentMode = keyof typeof AGENT_MODE_TO_ID
 export const AGENT_MODES = Object.keys(AGENT_MODE_TO_ID) as AgentMode[]
-
-/**
- * Maps CLI agent mode to cost mode for billing.
- *
- * Freebuff's LITE maps to 'free' cost mode (session gate, rate limits, 0 credits
- * for allowlisted agent+model combos). Regular Codebuff's LITE maps to 'lite' —
- * a normal paid mode (charges credits, no session gate, no country restrictions).
- */
-export const AGENT_MODE_TO_COST_MODE = {
-  DEFAULT: 'normal',
-  LITE: IS_FREEBUFF ? 'free' : 'lite',
-  MAX: 'max',
-  PLAN: 'normal',
-} as const satisfies Record<
-  AgentMode,
-  'free' | 'lite' | 'normal' | 'max' | 'experimental' | 'ask'
->

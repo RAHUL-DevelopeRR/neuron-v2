@@ -1,7 +1,13 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import React, { useCallback, useEffect, useState } from 'react'
 
-import { SHADOW_CHARS, SHEEN_STEP, SHEEN_INTERVAL_MS } from '../login/constants'
-import { getSheenColor } from '../login/utils'
+import {
+  SHADOW_CHARS,
+  SHEEN_STEP,
+  SHEEN_INTERVAL_MS,
+  getSheenColor,
+} from '../utils/logo'
 
 interface UseSheenAnimationParams {
   enabled?: boolean

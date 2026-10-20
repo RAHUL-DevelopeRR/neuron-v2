@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
+// sponsored-proposal block is gone. See ui/neuron-tui/PORTING.md.
 import { TextAttributes } from '@opentui/core'
 import React, { memo, type ReactNode } from 'react'
 
@@ -153,12 +155,6 @@ export const SingleBlock = memo(
             availableWidth={availableWidth}
           />
         )
-      }
-
-      case 'sponsored-proposal': {
-        // Drawn in the DOCK, not here: the block is the proposal's state, and
-        // the dock above the composer is its one slot (`chat.tsx`).
-        return null
       }
 
       case 'image': {

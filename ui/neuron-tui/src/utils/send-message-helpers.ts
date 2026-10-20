@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
+// inline-ad marker on new responses is gone. See ui/neuron-tui/PORTING.md.
 /**
  * Message-level helpers for send-message logic.
  * These functions operate on ChatMessage objects, not raw blocks.
@@ -43,7 +45,6 @@ export const createAiMessageShell = (messageId: string): ChatMessage => ({
   content: '',
   blocks: [],
   timestamp: formatTimestamp(),
-  metadata: { allowInlineAds: true },
 })
 
 export const createErrorMessage = (content: string): ChatMessage => ({
@@ -74,10 +75,6 @@ export const sanitizeRestoredMessages = (
 ): ChatMessage[] =>
   messages.map((message) => {
     let restoredMessage = message
-    if (message.metadata?.allowInlineAds) {
-      const { allowInlineAds: _, ...metadata } = message.metadata
-      restoredMessage = { ...message, metadata }
-    }
 
     if (restoredMessage.blocks) {
       const blocks = stripHiddenAgentBlocks(restoredMessage.blocks)

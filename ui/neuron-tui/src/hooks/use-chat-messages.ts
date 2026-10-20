@@ -1,3 +1,6 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: rows
+// holding a sponsored proposal are no longer filtered out (there are none).
+// See ui/neuron-tui/PORTING.md.
 /**
  * Extracted chat messages hook.
  * Handles message tree building, pagination, and collapse state management.
@@ -229,24 +232,9 @@ export function useChatMessages({
     }, 0)
   }, [setMessages])
 
-  // Build message tree from flat messages array. A row that exists only to
-  // HOLD a sponsored proposal's state is not drawn: the proposal renders in
-  // the dock above the composer, one slot for one ad, and a second copy in the
-  // transcript would be an ad scrolling past twice.
+  // Build message tree from flat messages array.
   const { tree: messageTree, topLevelMessages } = useMemo(
-    () =>
-      buildMessageTree(
-        messages.filter(
-          (message) =>
-            !(
-              message.content === '' &&
-              message.blocks?.length &&
-              message.blocks.every(
-                (block) => block.type === 'sponsored-proposal',
-              )
-            ),
-        ),
-      ),
+    () => buildMessageTree(messages),
     [messages],
   )
 

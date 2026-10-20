@@ -1,8 +1,5 @@
-import { freebuffChatNeedsAdmission } from '../state/freebuff-chat-store'
-import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
-import { runTerminalCommand } from '@codebuff/sdk'
-
-
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import {
   dispatchSkillPrompt,
   findCommand,
@@ -15,21 +12,13 @@ import {
   buildPlanPrompt,
   buildReviewPrompt,
 } from './prompt-builders'
-import { noteUserTurnForAdClickReturn } from '../ads/click-return'
-import { noteAdUserSend } from '../ads/ad-signals'
 import { getProjectRoot } from '../project-files'
 import { useChatStore } from '../state/chat-store'
-import { useFreebuffSessionStore } from '../state/freebuff-session-store'
-import { trackEvent } from '../utils/analytics'
-import { hasSelectedByokConnection, isByokSetupOpen } from '../utils/byok'
 import {
   buildBashHistoryMessages,
   createRunTerminalToolResult,
 } from '../utils/bash-messages'
 import { showClipboardMessage } from '../utils/clipboard'
-import { IS_FREEBUFF } from '../utils/constants'
-import { getSystemProcessEnv } from '../utils/env'
-import { terminalCommandBroker } from '../utils/terminal-command-broker'
 import { getSystemMessage, getUserMessage } from '../utils/message-history'
 import { getSkillByName } from '../utils/skill-registry'
 import { pushSteeringMessage } from '../utils/steering-buffer'
@@ -39,6 +28,7 @@ import {
   hasProcessingImages,
   validateAndAddImage,
 } from '../utils/pending-attachments'
+import { runUserShellCommand } from '../utils/user-shell'
 
 /**
  * Run a bash command with automatic ghost/direct mode selection.
@@ -56,7 +46,6 @@ export function runBashCommand(command: string) {
   const ghost = streamingAgents.size > 0 || isChainInProgress
   const id = crypto.randomUUID()
   const commandCwd = process.cwd()
-  const startTime = Date.now()
 
   if (ghost) {
     // Ghost mode: add to pending messages
@@ -81,33 +70,8 @@ export function runBashCommand(command: string) {
     setMessages((prev) => [...prev, assistantMessage])
   }
 
-  runTerminalCommand({
-    command,
-    process_type: 'SYNC',
-    cwd: commandCwd,
-    timeout_seconds: -1,
-    env: getSystemProcessEnv(),
-    terminalCommandBroker,
-  })
-    .then(([{ value }]) => {
-      const stdout = 'stdout' in value ? value.stdout || '' : ''
-      const stderr = 'stderr' in value ? value.stderr || '' : ''
-      const exitCode = 'exitCode' in value ? (value.exitCode ?? 0) : 0
-
-      // Track terminal command completion
-      const durationMs = Date.now() - startTime
-      trackEvent(AnalyticsEvent.TERMINAL_COMMAND_COMPLETED, {
-        command: command.split(' ')[0], // Just the command name, not args
-        exitCode,
-        success: exitCode === 0,
-        ghost,
-        durationMs,
-        hasStdout: stdout.length > 0,
-        hasStderr: stderr.length > 0,
-        stdoutLength: stdout.length,
-        stderrLength: stderr.length,
-      })
-
+  runUserShellCommand({ command, cwd: commandCwd })
+    .then(({ stdout, stderr, exitCode }) => {
       if (ghost) {
         updatePendingBashMessage(id, {
           stdout,
@@ -157,21 +121,6 @@ export function runBashCommand(command: string) {
     .catch((error) => {
       const errorMessage =
         error instanceof Error ? error.message : String(error)
-
-      // Track terminal command completion with error
-      const durationMs = Date.now() - startTime
-      trackEvent(AnalyticsEvent.TERMINAL_COMMAND_COMPLETED, {
-        command: command.split(' ')[0], // Just the command name, not args
-        exitCode: 1,
-        success: false,
-        ghost,
-        durationMs,
-        hasStdout: false,
-        hasStderr: true,
-        stdoutLength: 0,
-        stderrLength: errorMessage.length,
-        isException: true,
-      })
 
       if (ghost) {
         updatePendingBashMessage(id, {
@@ -278,40 +227,12 @@ export async function routeUserPrompt(
   const inputMode = useChatStore.getState().inputMode
   const setInputMode = useChatStore.getState().setInputMode
   const pendingAttachments = useChatStore.getState().pendingAttachments
-  const pendingImages = pendingAttachments.filter((a) => a.kind === 'image')
 
   const trimmed = inputValue.trim()
   // Allow empty messages if there are pending attachments (images or text).
   // Skill mode also accepts an empty submit: it means "run the skill as-is".
   const hasAttachments = pendingAttachments.length > 0
   if (!trimmed && !hasAttachments && inputMode !== 'skill') return
-
-  // COD-694: a submitted prompt is the CLI's "came back after an ad click".
-  noteUserTurnForAdClickReturn()
-  // COD-757: `attn.sinceSend` and the engagement records' send flags.
-  noteAdUserSend()
-
-  // DAU signal: one un-sampled event per user-submitted prompt. The CLI's
-  // distinct id resolves to the canonical codebuff user id (anonymous id is
-  // aliased to the real user id on login), matching the web and chat surfaces
-  // so combined DAU is a single unique-users query. Freebuff-only: codebuff
-  // CLI usage is intentionally excluded.
-  if (IS_FREEBUFF) {
-    const freebuffSession = useFreebuffSessionStore.getState().session
-    trackEvent(AnalyticsEvent.MESSAGE_SENT, {
-      surface: 'cli',
-      accessTier:
-        freebuffSession && 'accessTier' in freebuffSession
-          ? freebuffSession.accessTier
-          : 'unknown',
-      mode: agentMode,
-      inputMode,
-      inputLength: trimmed.length,
-      isSlashCommand: isSlashCommand(trimmed),
-      isBashCommand: trimmed.startsWith('!'),
-      hasImages: pendingImages.length > 0,
-    })
-  }
 
   // Handle bash mode commands
   if (inputMode === 'bash') {
@@ -442,39 +363,10 @@ export async function routeUserPrompt(
   if (parsedCommand) {
     const commandDef = findCommand(parsedCommand.command)
     if (commandDef) {
-      const argsLength = parsedCommand.args.length
-      const analyticsPayload = {
-        command: commandDef.name,
-        hasArgs: argsLength > 0,
-        argsLength,
-        agentMode,
-        ...(parsedCommand.implicitCommand ? { implicitCommand: true } : {}),
-      }
-
-      trackEvent(AnalyticsEvent.SLASH_COMMAND_USED, analyticsPayload)
-
       // The command handler (via defineCommand/defineCommandWithArgs factories)
       // is responsible for validating and handling args
       return await commandDef.handler(params, parsedCommand.args)
     }
-  }
-
-  // BYOK setup opened from a Freebuff wall holds no session, so a prompt has
-  // nowhere to run until a connection is selected. Keep the text in the input
-  // rather than consuming it.
-  if (
-    IS_FREEBUFF &&
-    isByokSetupOpen() &&
-    !hasSelectedByokConnection() &&
-    !isSlashCommand(trimmed)
-  ) {
-    setMessages((prev) => [
-      ...prev,
-      getSystemMessage(
-        'Select a BYOK connection first: `/byok add …`, then `/byok select <name>`. `/byok off` returns to Freebuff.',
-      ),
-    ])
-    return
   }
 
   // Regular message or unknown slash command - send to agent
@@ -505,11 +397,6 @@ export async function routeUserPrompt(
     // non-empty queue (steering would deliver this text ahead of earlier
     // submissions), and the window where no run is accepting steering.
     const canSteer =
-      !(
-        IS_FREEBUFF &&
-        !hasSelectedByokConnection() &&
-        freebuffChatNeedsAdmission()
-      ) &&
       !hasAttachments &&
       !isSlashCommand(trimmed) &&
       useChatStore.getState().pendingBashMessages.length === 0 &&
@@ -540,14 +427,6 @@ export async function routeUserPrompt(
 
   // Unknown slash command - show error
   if (isSlashCommand(trimmed)) {
-    // Track invalid/unknown command (only log command name, not full input for privacy)
-    const attemptedCmd = trimmed.slice(1).split(/\s+/)[0]?.toLowerCase() || ''
-    trackEvent(AnalyticsEvent.INVALID_COMMAND, {
-      attemptedCommand: attemptedCmd,
-      inputLength: trimmed.length,
-      agentMode,
-    })
-
     setMessages((prev) => [
       ...prev,
       getUserMessage(trimmed),

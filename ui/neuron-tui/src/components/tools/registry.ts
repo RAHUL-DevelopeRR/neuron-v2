@@ -1,7 +1,8 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { ApplyPatchComponent } from './apply-patch'
 import { CodeSearchComponent } from './code-search'
 import { GlobComponent } from './glob'
-import { GravityIndexComponent } from './gravity-index'
 import { ListDirectoryComponent } from './list-directory'
 import { ReadDocsComponent } from './read-docs'
 import { ReadFilesComponent } from './read-files'
@@ -24,7 +25,7 @@ import type {
   ToolBlock,
 } from './types'
 import type { ChatTheme } from '../../types/theme-system'
-import type { ToolName } from '@codebuff/sdk'
+import type { ToolName } from '../../types/agent-run'
 
 /**
  * Registry of all tool-specific UI components.
@@ -34,7 +35,6 @@ const toolComponentRegistry = new Map<ToolName, ToolComponent>([
   [ApplyPatchComponent.toolName, ApplyPatchComponent],
   [CodeSearchComponent.toolName, CodeSearchComponent],
   [GlobComponent.toolName, GlobComponent],
-  [GravityIndexComponent.toolName, GravityIndexComponent],
   [ListDirectoryComponent.toolName, ListDirectoryComponent],
   [RunTerminalCommandComponent.toolName, RunTerminalCommandComponent],
   [ReadDocsComponent.toolName, ReadDocsComponent],

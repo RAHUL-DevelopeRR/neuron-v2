@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import * as fs from 'fs'
 import path from 'path'
 import { randomUUID } from 'node:crypto'
@@ -16,7 +18,7 @@ import { classifyStringifyError, serializeForPersistence } from './safe-json'
 import { writeFileAtomic, writeFileAtomicAsync } from './write-file-atomic'
 
 import type { ChatMessage } from '../types/chat'
-import type { RunState } from '@codebuff/sdk'
+import type { RunState } from '../types/agent-run'
 
 const RUN_STATE_FILENAME = 'run-state.json'
 

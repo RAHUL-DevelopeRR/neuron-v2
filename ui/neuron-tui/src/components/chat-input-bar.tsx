@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import {
   isShallowScanRoot,
   SHALLOW_SCAN_MAX_DEPTH,
@@ -8,27 +10,15 @@ import { AgentModeToggle } from './agent-mode-toggle'
 import { Button } from './button'
 import { ClickableTitleBox } from './clickable-title-box'
 import { MultipleChoiceForm } from './ask-user'
-import { FeedbackContainer } from './feedback-container'
 import { InputModeBanner } from './input-mode-banner'
 import { MultilineInput, type MultilineInputHandle } from './multiline-input'
-import { OutOfCreditsBanner } from './out-of-credits-banner'
-import { PublishContainer } from './publish-container'
-import { SponsoredAccountPrompt } from './sponsored-account-prompt'
 import { SuggestionMenu, type SuggestionItem } from './suggestion-menu'
 import { useAskUserBridge } from '../hooks/use-ask-user-bridge'
 import { useEvent } from '../hooks/use-event'
-import { getProjectRoot, tryGetProjectRoot } from '../project-files'
+import { tryGetProjectRoot } from '../project-files'
 import { useChatStore } from '../state/chat-store'
-import { useSponsoredRunStore } from '../state/sponsored-run-store'
 import { shouldInterceptChatInputKey } from '../utils/chat-input-key-intercept'
-import {
-  dispatchProfileSurveyInput,
-  getProfileSurveyKeyContext,
-} from '../state/profile-survey-store'
-import { readClipboardText } from '../utils/clipboard-image'
 import { getInputModeConfig } from '../utils/input-modes'
-import { recordTypedInput } from '../utils/input-profile'
-import { sponsoredRunFor } from '../utils/sponsored-run'
 import { BORDER_CHARS } from '../utils/ui-constants'
 
 import type { useTheme } from '../hooks/use-theme'
@@ -77,15 +67,6 @@ interface ChatInputBarProps {
   isCompactHeight: boolean
   isNarrowWidth: boolean
 
-  // Feedback mode
-  feedbackMode: boolean
-  handleExitFeedback: () => void
-
-  // Publish mode
-  publishMode: boolean
-  handleExitPublish: () => void
-  handlePublish: (agentIds: string[]) => Promise<void>
-
   // Handlers
   handleSubmit: () => Promise<void>
   onPaste: (fallbackText?: string) => void
@@ -121,11 +102,6 @@ export const ChatInputBar = ({
   onQueuePreviewClick,
   isCompactHeight,
   isNarrowWidth,
-  feedbackMode,
-  handleExitFeedback,
-  publishMode,
-  handleExitPublish,
-  handlePublish,
   handleSubmit,
   onPaste,
   onInterruptStream,
@@ -151,9 +127,6 @@ export const ChatInputBar = ({
       }
     : baseModeConfig
   const askUserState = useChatStore((state) => state.askUserState)
-  const sponsoredAccountAsk = useSponsoredRunStore(
-    (state) => state.snapshot?.account ?? null,
-  )
   const hasAnyPreview = hasSuggestionMenu
 
   // In the home directory (or an ancestor) the file tree is only scanned a few
@@ -185,76 +158,9 @@ export const ChatInputBar = ({
         lastEditDueToNav: draft.lastEditDueToNav,
         cursorPosition: draft.cursorPosition,
         inputLength: draft.inputValue.length,
-        profileSurvey: getProfileSurveyKeyContext(),
       })
     },
   )
-
-  const handleSurveyPaste = useEvent((fallbackText?: string) => {
-    const context = getProfileSurveyKeyContext()
-    const draft = useChatStore.getState()
-    if (
-      context?.question.sponsoredKind === 'text' &&
-      context.textEditing &&
-      draft.inputMode === 'default' &&
-      !draft.inputValue
-    ) {
-      dispatchProfileSurveyInput({
-        type: 'text',
-        text: fallbackText ?? readClipboardText() ?? '',
-        now: Date.now(),
-      })
-      return
-    }
-    onPaste(fallbackText)
-  })
-
-  // A sponsored run waiting on the user's sign-in or key takes the composer's
-  // place, as ask_user does; the run continues once it is answered. Ahead of
-  // every other mode: the chat keyboard is off while it waits, so a banner
-  // drawn instead would leave nothing that can answer it.
-  if (sponsoredAccountAsk) {
-    return (
-      <SponsoredAccountPrompt
-        ask={sponsoredAccountAsk}
-        onAnswer={(answer) =>
-          sponsoredRunFor(getProjectRoot()).answerAccountStep(answer)
-        }
-        onInterrupt={onInterruptStream}
-      />
-    )
-  }
-
-  if (feedbackMode) {
-    return (
-      <FeedbackContainer
-        inputRef={inputRef}
-        onExitFeedback={handleExitFeedback}
-        width={separatorWidth}
-      />
-    )
-  }
-
-  if (publishMode) {
-    return (
-      <PublishContainer
-        inputRef={inputRef}
-        onExitPublish={handleExitPublish}
-        onPublish={handlePublish}
-        width={separatorWidth}
-      />
-    )
-  }
-
-  // Out of credits mode: replace entire input with out-of-credits banner
-  if (inputMode === 'outOfCredits') {
-    return <OutOfCreditsBanner />
-  }
-
-  // Subscription limit mode: show only the limit banner (no input box)
-  if (inputMode === 'subscriptionLimit') {
-    return <InputModeBanner />
-  }
 
   const handleFormSubmit = (
     answers: { question: string; answer: string }[],
@@ -438,11 +344,10 @@ export const ChatInputBar = ({
             value={inputValue}
             onChange={setInputValue}
             onSubmit={handleSubmit}
-            onPaste={handleSurveyPaste}
-            onTypedText={recordTypedInput}
+            onPaste={onPaste}
             onKeyIntercept={handleKeyIntercept}
             placeholder={effectivePlaceholder}
-            focused={inputFocused && !feedbackMode}
+            focused={inputFocused}
             maxHeight={compactMaxHeight}
             ref={inputRef}
             cursorPosition={cursorPosition}
@@ -535,11 +440,10 @@ export const ChatInputBar = ({
                 value={inputValue}
                 onChange={setInputValue}
                 onSubmit={handleSubmit}
-                onPaste={handleSurveyPaste}
-                onTypedText={recordTypedInput}
+                onPaste={onPaste}
                 onKeyIntercept={handleKeyIntercept}
                 placeholder={effectivePlaceholder}
-                focused={inputFocused && !feedbackMode}
+                focused={inputFocused}
                 maxHeight={Math.floor(terminalHeight / 2)}
                 ref={inputRef}
                 cursorPosition={cursorPosition}

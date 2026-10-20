@@ -1,10 +1,9 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { enableMapSet } from 'immer'
 import { create } from 'zustand'
 import { immer } from 'zustand/middleware/immer'
 
-import type { FeedbackCategory } from '@codebuff/common/constants/feedback'
-
-import type { AdResponse } from '../hooks/use-gravity-ad'
 import type { ChatMessage } from '../types/chat'
 import type { ChatTheme } from '../types/theme-system'
 import type { MarkdownPalette } from '../utils/markdown-renderer'
@@ -38,12 +37,6 @@ export interface MessageBlockContext {
   timerStartTime: number | null
   /** Available width for rendering message content. */
   availableWidth: number
-  /**
-   * Ads to intersperse inside assistant responses, keyed by message id.
-   * Populated by the Chat component from the ads hook; empty when ads are
-   * disabled or hidden.
-   */
-  responseAds: Record<string, AdResponse[]>
 }
 
 /**
@@ -55,51 +48,6 @@ export interface MessageBlockCallbacks {
   onBuildFast: () => void
   onBuildMax: () => void
   onBuildLite: () => void
-  onFeedback: (
-    messageId: string,
-    options?: {
-      category?: FeedbackCategory
-      footerMessage?: string
-      errors?: Array<{ id: string; message: string }>
-    },
-  ) => void
-  onCloseFeedback: () => void
-  /** Record a click on an interspersed response ad. */
-  onAdClick: (ad: AdResponse) => void
-  /** Record an impression for an interspersed response ad. */
-  onAdImpression: (ad: AdResponse) => void
-  /** Ensure the response has fetched ads for every currently eligible slot. */
-  onResponseAdsNeeded: (messageId: string, count: number) => void
-  /**
-   * Sponsored proposals (COD-376). Beside `responseAds` because they share a
-   * transcript and nothing else -- a display ad is a link out, a proposal is an
-   * offer to do work in this repository, and the two have different controls.
-   *
-   * Keyed by TARGET (`owner/name`), never by message: a repository has one live
-   * offer, and declining it in one place must not leave it standing in another.
-   *
-   * ACCEPT IS TWO CALLBACKS, not one, and that is the COD-336 consent gate
-   * expressed in the type. `onSponsoredProposalAccept` OPENS the consent and
-   * writes nothing anywhere; `onSponsoredProposalConsent` carries the user's
-   * answer to it, and only `true` starts a run. A single "accept" callback
-   * would be a control that runs an advertiser's procedure on one keypress,
-   * which is exactly the pattern this channel exists not to be.
-   */
-  onSponsoredProposalMenu: (target: string, open: boolean) => void
-  onSponsoredProposalDisclose: (target: string, open: boolean) => void
-  /** Open the consent screen. Starts nothing, writes nothing. */
-  onSponsoredProposalAccept: (target: string) => void
-  /** The consent's answer. `false` refuses and leaves the row `offered`. */
-  onSponsoredProposalConsent: (target: string, approved: boolean) => void
-  /** Expand or collapse the consent's reviewed procedure ("View steps"). */
-  onSponsoredProposalProcedure: (target: string, open: boolean) => void
-  /** Put back the files the run changed (`/ads:undo`, and the dock's Undo). */
-  onSponsoredProposalUndo: () => void
-  /** Dismiss, report, never-this-advertiser, or the channel opt-out. */
-  onSponsoredProposalControl: (
-    target: string,
-    control: 'dismiss' | 'report' | 'never-advertiser' | 'opt-out',
-  ) => void
 }
 
 interface MessageBlockStoreState {
@@ -129,7 +77,6 @@ interface MessageBlockStoreActions {
 type MessageBlockStore = MessageBlockStoreState & MessageBlockStoreActions
 
 const noop = () => {}
-const noopFeedback: MessageBlockCallbacks['onFeedback'] = () => {}
 
 const initialContext: MessageBlockContext = {
   readOnly: false,
@@ -139,7 +86,6 @@ const initialContext: MessageBlockContext = {
   isWaitingForResponse: false,
   timerStartTime: null,
   availableWidth: 80,
-  responseAds: {},
 }
 
 const initialCallbacks: MessageBlockCallbacks = {
@@ -147,18 +93,6 @@ const initialCallbacks: MessageBlockCallbacks = {
   onBuildFast: noop,
   onBuildMax: noop,
   onBuildLite: noop,
-  onFeedback: noopFeedback,
-  onCloseFeedback: noop,
-  onAdClick: noop,
-  onAdImpression: noop,
-  onResponseAdsNeeded: noop,
-  onSponsoredProposalMenu: noop,
-  onSponsoredProposalDisclose: noop,
-  onSponsoredProposalAccept: noop,
-  onSponsoredProposalConsent: noop,
-  onSponsoredProposalProcedure: noop,
-  onSponsoredProposalUndo: noop,
-  onSponsoredProposalControl: noop,
 }
 
 const initialState: MessageBlockStoreState = {

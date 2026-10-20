@@ -1,8 +1,10 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { extractImagePaths, processImageFile } from './image-handler'
 import { logger } from './logger'
 
 import type { PendingImageAttachment } from '../types/store'
-import type { MessageContent } from '@codebuff/sdk'
+import type { MessageContent } from '../types/agent-run'
 
 // Converts pending images + inline references into SDK-ready message content.
 export type ProcessedImagePart = {

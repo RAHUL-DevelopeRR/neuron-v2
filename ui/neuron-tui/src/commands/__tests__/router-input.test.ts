@@ -1,3 +1,6 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: examples use
+// commands that still exist (/init, /login, /usage, /feedback were removed).
+// See ui/neuron-tui/PORTING.md.
 import { describe, test, expect } from 'bun:test'
 
 import { SLASH_COMMANDS } from '../../data/slash-commands'
@@ -74,8 +77,8 @@ describe('router-utils', () => {
 
   describe('parseCommandInput', () => {
     test('returns command info for exact slashless matches', () => {
-      expect(parseCommandInput('init')).toEqual({
-        command: 'init',
+      expect(parseCommandInput('help')).toEqual({
+        command: 'help',
         args: '',
         implicitCommand: true,
       })
@@ -87,8 +90,8 @@ describe('router-utils', () => {
     })
 
     test('is case-insensitive and trims whitespace for slashless matches', () => {
-      expect(parseCommandInput('INIT')).toEqual({
-        command: 'init',
+      expect(parseCommandInput('HELP')).toEqual({
+        command: 'help',
         args: '',
         implicitCommand: true,
       })
@@ -100,19 +103,19 @@ describe('router-utils', () => {
     })
 
     test('returns null for slashless commands with arguments', () => {
-      expect(parseCommandInput('init something')).toBe(null)
+      expect(parseCommandInput('help something')).toBe(null)
       expect(parseCommandInput('new my message')).toBe(null)
     })
 
     test('returns null for commands not configured for slashless invocation', () => {
-      expect(parseCommandInput('usage')).toBe(null)
+      expect(parseCommandInput('history')).toBe(null)
       expect(parseCommandInput('bash')).toBe(null)
-      expect(parseCommandInput('feedback')).toBe(null)
+      expect(parseCommandInput('review')).toBe(null)
     })
 
     test('distinguishes slashed and slashless invocation', () => {
-      expect(parseCommandInput('/init')).toEqual({
-        command: 'init',
+      expect(parseCommandInput('/help')).toEqual({
+        command: 'help',
         args: '',
         implicitCommand: false,
       })
@@ -131,10 +134,10 @@ describe('router-utils', () => {
     })
 
     test('commands with implicitCommand are configured correctly', () => {
-      const initCmd = SLASH_COMMANDS.find((cmd) => cmd.id === 'init')
+      const helpCmd = SLASH_COMMANDS.find((cmd) => cmd.id === 'help')
       const newCmd = SLASH_COMMANDS.find((cmd) => cmd.id === 'new')
 
-      expect(initCmd?.implicitCommand).toBe(true)
+      expect(helpCmd?.implicitCommand).toBe(true)
       expect(newCmd?.implicitCommand).toBe(true)
     })
 
@@ -152,16 +155,14 @@ describe('router-utils', () => {
 
   describe('slash commands only work with / prefix', () => {
     const slashCommands = [
-      'login',
-      'logout',
-      'usage',
-      'credits',
+      'help',
+      'history',
       'exit',
       'clear',
       'new',
-      'init',
       'bash',
-      'feedback',
+      'review',
+      'queue',
     ]
 
     for (const cmd of slashCommands) {
@@ -196,19 +197,19 @@ describe('router-utils', () => {
 describe('command-registry', () => {
   describe('findCommand', () => {
     test('finds command by name', () => {
-      const login = findCommand('login')
-      expect(login).toBeDefined()
-      expect(login?.name).toBe('login')
+      const help = findCommand('help')
+      expect(help).toBeDefined()
+      expect(help?.name).toBe('help')
 
-      const usage = findCommand('usage')
-      expect(usage).toBeDefined()
-      expect(usage?.name).toBe('usage')
+      const history = findCommand('history')
+      expect(history).toBeDefined()
+      expect(history?.name).toBe('history')
     })
 
     test('finds command by alias', () => {
-      const credits = findCommand('credits')
-      expect(credits).toBeDefined()
-      expect(credits?.name).toBe('usage')
+      const chats = findCommand('chats')
+      expect(chats).toBeDefined()
+      expect(chats?.name).toBe('history')
 
       const modelDefault = findCommand('model:default')
       expect(modelDefault).toBeDefined()
@@ -218,9 +219,9 @@ describe('command-registry', () => {
       expect(quit).toBeDefined()
       expect(quit?.name).toBe('exit')
 
-      const signin = findCommand('signin')
-      expect(signin).toBeDefined()
-      expect(signin?.name).toBe('login')
+      const questionMark = findCommand('?')
+      expect(questionMark).toBeDefined()
+      expect(questionMark?.name).toBe('help')
     })
 
     test('returns undefined for unknown command', () => {
@@ -229,9 +230,9 @@ describe('command-registry', () => {
     })
 
     test('is case insensitive', () => {
-      expect(findCommand('LOGIN')?.name).toBe('login')
-      expect(findCommand('UsAgE')?.name).toBe('usage')
-      expect(findCommand('CREDITS')?.name).toBe('usage')
+      expect(findCommand('HELP')?.name).toBe('help')
+      expect(findCommand('HiStOrY')?.name).toBe('history')
+      expect(findCommand('CHATS')?.name).toBe('history')
     })
   })
 

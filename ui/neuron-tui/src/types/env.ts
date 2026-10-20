@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: env vars
+// that only fed removed features are gone. See ui/neuron-tui/PORTING.md.
 /**
  * CLI-specific environment variable types.
  *
@@ -84,24 +86,12 @@ export type CliEnv = BaseEnv & {
   CODEBUFF_TRUSTED_AGENT_PUBLISHERS?: string
   CODEBUFF_SCROLL_MULTIPLIER?: string
   CODEBUFF_PERF_TEST?: string
-  CODEBUFF_TRACE?: string
   CODEBUFF_LAUNCHER_PID?: string
-  // npm wrapper version that spawned this binary (cli/release-core/launcher.js)
-  CODEBUFF_LAUNCHER_VERSION?: string
-  // Toggle for mirroring CLI logs to the server's /api/logs sink (Axiom).
-  CODEBUFF_SHIP_LOGS?: string
   // Set to 1/true to suppress the terminal-reset watchdog on machines where
   // the PowerShell process shape conflicts with endpoint-security policy.
   CODEBUFF_NO_TERMINAL_WATCHDOG?: string
-  // Set to 1/true to load repository `.agents` files and mcp.json without the
-  // interactive trust prompt (CI opt-in; see utils/agent-dir-trust.ts).
-  CODEBUFF_TRUST_AGENT_DIRS?: string
-  FREEBUFF_MODE?: string
   /** Absolute per-process override for isolated CLI settings and transcripts. */
   FREEBUFF_CONFIG_DIR?: string
-  /** Local agentic-ads harness only (`scripts/local-agentic-ads`). */
-  TEST_AGENTIC_ADS?: string
-  TEST_AGENTIC_ADS_CAMPAIGN?: string
 
   // Read only for presence/shape by the client environment descriptor
   // (utils/client-environment.ts); never sent raw.

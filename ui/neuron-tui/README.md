@@ -1,84 +1,47 @@
-# @codebuff/cli
+# neuron-tui
 
-A Terminal User Interface (TUI) package built with OpenTUI and React.
+Neuron's full-screen terminal UI: a port of the Codebuff/Freebuff CLI
+(Apache-2.0, see `LICENSE` and `NOTICE`), built on OpenTUI and React. The Rust
+`neuron` binary stays the engine; this UI talks to it over the JSON-lines
+protocol of `neuron engine --stdio` (`src/engine/`).
 
-## Installation
+What was taken out of Freebuff, and why, is in [PORTING.md](PORTING.md).
+
+## Status (P1)
+
+The UI builds, typechecks, passes its tests and starts to the chat screen. It
+is **not connected to the engine yet**: `src/engine/neuron-engine-client.ts`
+is a typed stub, so a sent message ends with "The Neuron engine is not
+connected yet". The bridge is P2.
+
+## Requirements
+
+Bun 1.3.14.
+
+## Commands
+
+Run these from this folder (`ui/neuron-tui`):
 
 ```bash
 bun install
 ```
 
-## Development
+```bash
+bun run typecheck
+```
 
-Run the TUI in development mode:
+```bash
+bun run test
+```
 
 ```bash
 bun run dev
 ```
 
-## Testing
+`bun run test` runs every `*.test.ts(x)` under `src/` except
+`*.integration.test.*`. `bun run dev` starts the UI in the current folder;
+pass `--cwd <dir>` to open another project.
 
-Run the test suite:
-
-```bash
-bun test
-```
-
-### Interactive E2E Testing
-
-For testing interactive CLI features, install tmux:
-
-```bash
-# macOS
-brew install tmux
-
-# Ubuntu/Debian
-sudo apt-get install tmux
-
-# Windows (via WSL)
-wsl --install
-sudo apt-get install tmux
-```
-
-Then run the proof-of-concept:
-
-```bash
-bun run test:tmux-poc
-```
-
-**Note:** When sending input to the CLI via tmux, you must use bracketed paste mode. Standard `send-keys` drops characters.
-
-```bash
-# ❌ Broken: tmux send-keys -t session "hello"
-# ✅ Works:  tmux send-keys -t session $'\e[200~hello\e[201~'
-```
-
-See [tmux.knowledge.md](tmux.knowledge.md) for comprehensive tmux documentation and [src/__tests__/README.md](src/__tests__/README.md) for testing documentation.
-
-## Build
-
-Build the package:
-
-```bash
-bun run build
-```
-
-## Run
-
-Run the built TUI:
-
-```bash
-bun run start
-```
-
-Or use the binary directly:
-
-```bash
-codebuff-tui
-```
-
-## Features
-
-- Built with OpenTUI for modern terminal interfaces
-- Uses React for declarative component-based UI
-- TypeScript support out of the box
+Settings, chat history and logs go to `~/.neuron/tui` (override with an
+absolute `FREEBUFF_CONFIG_DIR`). `NEURON_TUI_ENV=dev` logs to
+`<project>/debug/cli.jsonl` instead of the chat folder.

@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: env vars
+// that only fed removed features are gone. See ui/neuron-tui/PORTING.md.
 import { createTestBaseEnv } from '@codebuff/common/testing-env-process'
 
 import type { CliEnv } from '../types/env'
@@ -42,6 +44,5 @@ export const createTestCliEnv = (overrides: Partial<CliEnv> = {}): CliEnv => ({
   CODEBUFF_RG_PATH: undefined,
   CODEBUFF_TRUSTED_AGENT_PUBLISHERS: undefined,
   CODEBUFF_SCROLL_MULTIPLIER: undefined,
-  FREEBUFF_MODE: undefined,
   ...overrides,
 })

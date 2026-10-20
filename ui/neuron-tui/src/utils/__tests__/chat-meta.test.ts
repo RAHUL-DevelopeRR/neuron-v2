@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import * as fs from 'fs'
 import * as os from 'os'
@@ -16,7 +18,7 @@ import {
 } from '../run-state-storage'
 
 import type { ChatMessage } from '../../types/chat'
-import type { RunState } from '@codebuff/sdk'
+import type { RunState } from '../../types/agent-run'
 
 let chatDir = ''
 

@@ -1,11 +1,8 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the login,
+// logout, usage, feedback and publish command cases went with those commands.
+// See ui/neuron-tui/PORTING.md.
 import { describe, test, expect, mock } from 'bun:test'
 
-import { useFeedbackStore } from '../../state/feedback-store'
-import {
-  registerActiveRun,
-  stopActiveRun,
-  type ActiveRunStopReason,
-} from '../../utils/active-run'
 import {
   COMMAND_REGISTRY,
   defineCommand,
@@ -31,7 +28,6 @@ describe('command factory pattern', () => {
       inputValue: '/test',
       isChainInProgressRef: { current: false },
       isStreaming: false,
-      logoutMutation: {} as RouterParams['logoutMutation'],
       streamMessageIdRef: { current: null },
       addToQueue: mock(() => {}),
       clearMessages: mock(() => {}),
@@ -41,9 +37,7 @@ describe('command factory pattern', () => {
       setCanProcessQueue: mock(() => {}),
       setInputFocused: mock(() => {}),
       setInputValue: mock(() => {}),
-      setIsAuthenticated: mock(() => {}),
       setMessages: mock(() => {}),
-      setUser: mock(() => {}),
       ...overrides,
     }) as RouterParams
 
@@ -164,7 +158,7 @@ describe('command factory pattern', () => {
     })
 
     test('expected commands ignore args', () => {
-      const expectedNoArgs = ['login', 'logout', 'exit', 'usage', 'init']
+      const expectedNoArgs = ['help', 'copy', 'exit', 'history', 'queue', 'todo']
       for (const name of expectedNoArgs) {
         const cmd = COMMAND_REGISTRY.find((c) => c.name === name)
         expect(cmd, `Command ${name} should exist`).toBeDefined()
@@ -177,11 +171,13 @@ describe('command factory pattern', () => {
     test('expected commands accept args', () => {
       // mode:* commands also accept args now
       const expectedWithArgs = [
-        'feedback',
         'bash',
         'image',
-        'publish',
         'new',
+        'export',
+        'plan',
+        'review',
+        'interview',
         'mode:default',
         'mode:max',
         'mode:plan',
@@ -205,33 +201,6 @@ describe('command factory pattern', () => {
           cmd.acceptsArgs,
           `Mode command ${cmd.name} should accept args`,
         ).toBe(true)
-      }
-    })
-  })
-
-  describe('cancellation reasons', () => {
-    test('/logout stops the owned run before starting logout', () => {
-      const reasons: ActiveRunStopReason[] = []
-      registerActiveRun('logout-run', (reason) => reasons.push(reason))
-      const mutate = mock(() => {})
-      const logoutCmd = COMMAND_REGISTRY.find((command) =>
-        command.aliases.includes('signout'),
-      )
-
-      try {
-        logoutCmd?.handler(
-          createMockParams({
-            logoutMutation: {
-              mutate,
-            } as unknown as RouterParams['logoutMutation'],
-          }),
-          '',
-        )
-
-        expect(reasons).toEqual(['logout'])
-        expect(mutate).toHaveBeenCalledTimes(1)
-      } finally {
-        stopActiveRun('process-exit')
       }
     })
   })
@@ -294,56 +263,6 @@ describe('command factory pattern', () => {
       // Should disable queue and NOT send message
       expect(setCanProcessQueue).toHaveBeenCalledWith(false)
       expect(sendMessage).not.toHaveBeenCalled()
-    })
-  })
-
-  describe('feedback command arg handling', () => {
-    test('pre-populates feedback text when args are provided', () => {
-      const feedbackCmd = COMMAND_REGISTRY.find((c) => c.name === 'feedback')
-      expect(feedbackCmd).toBeDefined()
-
-      // Reset the feedback store
-      useFeedbackStore.getState().reset()
-
-      const params = createMockParams({ inputValue: '/feedback my bug report' })
-      feedbackCmd!.handler(params, 'my bug report')
-
-      // Check that feedback text was pre-populated
-      const state = useFeedbackStore.getState()
-      expect(state.feedbackText).toBe('my bug report')
-      expect(state.feedbackCursor).toBe('my bug report'.length)
-    })
-
-    test('opens feedback mode without pre-populating when no args', () => {
-      const feedbackCmd = COMMAND_REGISTRY.find((c) => c.name === 'feedback')
-      expect(feedbackCmd).toBeDefined()
-
-      // Reset the feedback store
-      useFeedbackStore.getState().reset()
-
-      const params = createMockParams({ inputValue: '/feedback' })
-      const result = feedbackCmd!.handler(params, '')
-
-      // Should return openFeedbackMode
-      expect(result).toEqual({ openFeedbackMode: true })
-
-      // Feedback text should remain empty
-      const state = useFeedbackStore.getState()
-      expect(state.feedbackText).toBe('')
-    })
-
-    test('returns openFeedbackMode even with args', () => {
-      const feedbackCmd = COMMAND_REGISTRY.find((c) => c.name === 'feedback')
-      expect(feedbackCmd).toBeDefined()
-
-      // Reset the feedback store
-      useFeedbackStore.getState().reset()
-
-      const params = createMockParams({ inputValue: '/feedback test' })
-      const result = feedbackCmd!.handler(params, 'test')
-
-      // Should still return openFeedbackMode
-      expect(result).toEqual({ openFeedbackMode: true })
     })
   })
 })

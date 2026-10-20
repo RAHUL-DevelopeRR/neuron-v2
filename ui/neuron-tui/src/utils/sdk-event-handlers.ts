@@ -1,10 +1,7 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the ad
+// signal calls are gone and the SDK types come from local modules.
+// See ui/neuron-tui/PORTING.md.
 import { match } from 'ts-pattern'
-
-import {
-  noteAdStreamChunk,
-  noteAdToolCall,
-  noteAdToolResult,
-} from '../ads/ad-signals'
 
 import {
   appendTextToRootStream,
@@ -48,7 +45,7 @@ import type {
   PrintModeToolCall,
   PrintModeToolResult,
 } from '@codebuff/common/types/print-mode'
-import type { ToolName } from '@codebuff/sdk'
+import type { ToolName } from '../types/agent-run'
 import type { MutableRefObject } from 'react'
 
 export type SetStreamingAgentsFn = (
@@ -531,7 +528,7 @@ const handleStreamError = (state: EventHandlerState, event: PrintModeError) => {
 // nested-update counter before throwing, so dropping one render notification is
 // harmless: the next update renders the latest state. A missed repaint is
 // always better than killing the run, so a failing UI update is logged (with
-// its stack, to Axiom) and the run continues.
+// its stack, to the local log) and the run continues.
 
 const MAX_UI_HANDLER_FAILURE_LOGS_PER_RUN = 3
 const uiHandlerFailures = new WeakMap<EventHandlerState, number>()
@@ -608,8 +605,6 @@ const handleStreamChunk = (
   }
 
   ensureStreaming(state)
-  // COD-757: the turn's time to first token (one null check after the first).
-  noteAdStreamChunk()
   // Content is flowing (again) — clear any stream-interrupted retry status.
   // Terminal paths (run completion, error, abort) already reset it in
   // use-send-message/send-message, so the indicator can't outlive its run.
@@ -649,23 +644,8 @@ const handleSdkEvent = (state: EventHandlerState, event: SDKEvent): void => {
   return match(event)
     .with({ type: 'subagent_start' }, (e) => handleSubagentStart(state, e))
     .with({ type: 'subagent_finish' }, (e) => handleSubagentFinish(state, e))
-    .with({ type: 'tool_call' }, (e) => {
-      // COD-757: the tool's category, and an agent shell command for the
-      // post-click adoption watch. In memory only; never throws.
-      noteAdToolCall(
-        e.toolName,
-        e.toolName === 'run_terminal_command' &&
-          typeof e.input?.command === 'string'
-          ? e.input.command
-          : undefined,
-      )
-      return handleToolCall(state, e)
-    })
-    .with({ type: 'tool_result' }, (e) => {
-      // COD-757: a failed result's error CLASS only, never its text.
-      noteAdToolResult(e.output)
-      return handleToolResult(state, e)
-    })
+    .with({ type: 'tool_call' }, (e) => handleToolCall(state, e))
+    .with({ type: 'tool_result' }, (e) => handleToolResult(state, e))
     .with({ type: 'finish' }, (e) => handleFinish(state, e))
     .with({ type: 'error' }, (e) => handleStreamError(state, e))
     .otherwise(() => undefined)

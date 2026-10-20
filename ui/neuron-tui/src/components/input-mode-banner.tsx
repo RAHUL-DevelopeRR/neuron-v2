@@ -1,9 +1,8 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import React from 'react'
-import { IS_FREEBUFF } from '../utils/constants'
 
 import { PendingAttachmentsBanner } from './pending-attachments-banner'
-import { SubscriptionLimitBanner } from './subscription-limit-banner'
-import { UsageBanner } from './usage-banner'
 import { useChatStore } from '../state/chat-store'
 
 /**
@@ -21,8 +20,6 @@ const BANNER_REGISTRY: Record<
 > = {
   default: () => <PendingAttachmentsBanner />,
   image: () => <PendingAttachmentsBanner />,
-  ...(IS_FREEBUFF ? {} : { usage: ({ showTime }: { showTime: number }) => <UsageBanner showTime={showTime} /> }),
-  ...(IS_FREEBUFF ? {} : { subscriptionLimit: () => <SubscriptionLimitBanner /> }),
 }
 
 /**
@@ -35,21 +32,11 @@ const BANNER_REGISTRY: Record<
 export const InputModeBanner = () => {
   const inputMode = useChatStore((state) => state.inputMode)
 
-  const [usageBannerShowTime, setUsageBannerShowTime] = React.useState(() =>
-    Date.now(),
-  )
-
-  React.useEffect(() => {
-    if (inputMode === 'usage') {
-      setUsageBannerShowTime(Date.now())
-    }
-  }, [inputMode])
-
   const renderBanner = BANNER_REGISTRY[inputMode]
 
   if (!renderBanner) {
     return null
   }
 
-  return <>{renderBanner({ showTime: usageBannerShowTime })}</>
+  return <>{renderBanner({ showTime: Date.now() })}</>
 }

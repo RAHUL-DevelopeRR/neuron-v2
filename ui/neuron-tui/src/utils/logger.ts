@@ -1,37 +1,19 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { appendFileSync, existsSync, mkdirSync, unlinkSync } from 'fs'
 import path, { dirname } from 'path'
 import { format as stringFormat } from 'util'
 
-import { env, IS_DEV, IS_TEST, IS_CI } from '@codebuff/common/env'
-import { createAnalyticsDispatcher } from '@codebuff/common/util/analytics-dispatcher'
-import { getAnalyticsEventId } from '@codebuff/common/util/analytics-log'
-import { getAxiomOnlyLogEvent } from '@codebuff/common/util/axiom-only-log'
-import {
-  isFullTelemetryEnabled,
-  summarizeAnalyticsValue,
-} from '@codebuff/common/util/analytics-sampling'
 import { pino } from 'pino'
 
-import {
-  flushAnalytics,
-  logError,
-  setAnalyticsErrorLogger,
-  trackEvent,
-} from './analytics'
-import { enqueueClientLog } from './log-shipper'
 import { getCurrentChatDir, getProjectRoot } from '../project-files'
-
-import type { LogRecordInput } from '@codebuff/common/schemas/logs'
+import { IS_CI, IS_DEV, IS_TEST } from './runtime-env'
 
 /** Name of the per-chat debug log file written in production builds */
 export const CHAT_LOG_FILENAME = 'log.jsonl'
 
 export interface LoggerContext {
-  userId?: string
-  userEmail?: string
   clientSessionId?: string
-  fingerprintId?: string
-  clientRequestId?: string
   [key: string]: any // Allow for future extensions
 }
 
@@ -42,10 +24,6 @@ let pinoLogger: any = undefined
 
 const loggingLevels = ['info', 'debug', 'warn', 'error', 'fatal'] as const
 type LogLevel = (typeof loggingLevels)[number]
-const analyticsDispatcher = createAnalyticsDispatcher({
-  envName: env.NEXT_PUBLIC_CB_ENVIRONMENT,
-  bufferWhenNoUser: true,
-})
 
 /**
  * Safely stringify an object, handling circular references.
@@ -125,7 +103,7 @@ export function clearLogFile(): void {
   pinoLogger = undefined
 }
 
-function sendAnalyticsAndLog(
+function writeLog(
   level: LogLevel,
   data: any,
   msg?: string,
@@ -152,79 +130,6 @@ function sendAnalyticsAndLog(
   const normalizedData = isStringOnly ? undefined : data
   const normalizedMsg = isStringOnly ? (data as string) : msg
   const includeData = normalizedData != null && !isEmptyObject(normalizedData)
-  const axiomOnlyLogEvent = getAxiomOnlyLogEvent(normalizedData)
-
-  const toTrack = {
-    ...(includeData ? { data: normalizedData } : {}),
-    level,
-    loggerContext,
-    msg: stringFormat(normalizedMsg, ...args),
-  }
-
-  logAsErrorIfNeeded(toTrack)
-
-  if (!IS_DEV && includeData && typeof normalizedData === 'object') {
-    const analyticsPayloads = analyticsDispatcher.process({
-      data: normalizedData,
-      level,
-      msg: stringFormat(normalizedMsg ?? '', ...args),
-      fallbackUserId: loggerContext.userId,
-    })
-
-    analyticsPayloads.forEach((payload) => {
-      trackEvent(payload.event, payload.properties)
-    })
-  }
-
-  // Mirror the log/event into the server-side Axiom logs sink via /api/logs
-  // (in addition to PostHog). Best-effort and batched; skip noisy debug logs
-  // and anything before we know who the user is.
-  if (
-    !IS_DEV &&
-    !IS_TEST &&
-    !IS_CI &&
-    loggerContext.userId &&
-    level !== 'debug'
-  ) {
-    const analyticsEventId =
-      includeData && typeof normalizedData === 'object'
-        ? getAnalyticsEventId(normalizedData)
-        : null
-    // Mirror the PostHog path's redaction: only ship raw payloads for errors or
-    // when full telemetry is enabled; otherwise ship a summary. Keeps PII/data
-    // volume symmetric across the two sinks.
-    const includeRawData =
-      isFullTelemetryEnabled({
-        distinctId: loggerContext.userId,
-        properties: loggerContext,
-      }) ||
-      level === 'error' ||
-      level === 'fatal'
-    const shipData = axiomOnlyLogEvent
-      ? axiomOnlyLogEvent.data
-      : includeData
-        ? includeRawData
-          ? normalizedData
-          : summarizeAnalyticsValue(normalizedData)
-        : undefined
-    const record: LogRecordInput = {
-      timestamp: new Date().toISOString(),
-      level,
-      event:
-        axiomOnlyLogEvent?.event ??
-        (analyticsEventId ? String(analyticsEventId) : undefined),
-      message: stringFormat(normalizedMsg ?? '', ...args),
-      client_session_id:
-        (axiomOnlyLogEvent?.data.client_session_id as string | undefined) ??
-        loggerContext.clientSessionId,
-      client_request_id:
-        (axiomOnlyLogEvent?.data.client_request_id as string | undefined) ??
-        loggerContext.clientRequestId,
-      fingerprint_id: loggerContext.fingerprintId,
-      data: shipData,
-    }
-    enqueueClientLog(record)
-  }
 
   // In dev mode, use appendFileSync for real-time logging (Bun has issues with pino sync)
   // In prod mode, use pino for better performance
@@ -248,53 +153,16 @@ function sendAnalyticsAndLog(
   }
 }
 
-function logAsErrorIfNeeded(toTrack: {
-  data?: any
-  level: LogLevel
-  loggerContext: LoggerContext
-  msg: string
-}) {
-  if (toTrack.level === 'error' || toTrack.level === 'fatal') {
-    logError(
-      new Error(toTrack.msg),
-      toTrack.loggerContext.userId ?? 'unknown',
-      { ...(toTrack.data ?? {}), context: toTrack.loggerContext },
-    )
-    flushAnalytics()
-  }
-}
-
 /**
- * Wrapper around Pino logger.
- *
- * To also send to Posthog, set data.eventId to type AnalyticsEvent
- *
- * e.g. logger.info({eventId: AnalyticsEvent.SOME_EVENT, field: value}, 'some message')
+ * Wrapper around Pino logger. Writes to a local file only: the chat's
+ * log.jsonl, or <project>/debug/cli.jsonl when NEURON_TUI_ENV=dev.
  */
 export const logger: Record<LogLevel, pino.LogFn> = Object.fromEntries(
   loggingLevels.map((level) => {
     return [
       level,
       (data: any, msg?: string, ...args: any[]) =>
-        sendAnalyticsAndLog(level, data, msg, ...args),
+        writeLog(level, data, msg, ...args),
     ]
   }),
 ) as Record<LogLevel, pino.LogFn>
-
-setAnalyticsErrorLogger((error, context) => {
-  const err =
-    error instanceof Error ? error : new Error(typeof error === 'string' ? error : 'Unknown analytics error')
-
-  logger.warn(
-    {
-      analyticsError: true,
-      error: {
-        name: err.name,
-        message: err.message,
-        stack: err.stack,
-      },
-      context,
-    },
-    '[analytics] error',
-  )
-})

@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
+// chmod case is skipped on Windows. See ui/neuron-tui/PORTING.md.
 import { describe, test, expect, afterAll, beforeEach, afterEach } from 'bun:test'
 import * as fs from 'fs'
 import * as path from 'path'
@@ -14,7 +16,7 @@ import {
   settleCheckpointSave,
 } from '../run-state-storage'
 import type { ChatMessage } from '../../types/chat'
-import type { RunState } from '@codebuff/sdk'
+import type { RunState } from '../../types/agent-run'
 
 /** Every directory below hangs off a root this run owns. They were fixed
  *  `os.tmpdir()/codebuff-test-*` paths that `beforeEach` deletes recursively,
@@ -692,7 +694,8 @@ describe('a transcript is never destroyed', () => {
     ).toHaveLength(0)
   })
 
-  test('refuses to resume rather than hand back a state that would overwrite unreadable bytes', () => {
+  // chmod does not make a directory read-only on Windows.
+  test.skipIf(process.platform === 'win32')('refuses to resume rather than hand back a state that would overwrite unreadable bytes', () => {
     saveChatState(runState, messages)
     // A file we can neither parse nor move aside (its directory is read-only,
     // so the quarantine rename fails). A rename would still have *replaced*

@@ -1,45 +1,18 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: exit no
+// longer flushes analytics, client logs, ad engagement or survey pings, ends a
+// Freebuff session, or settles a sponsored run. It shuts the engine down
+// instead. See ui/neuron-tui/PORTING.md.
 import { withTimeoutOr } from '@codebuff/common/util/promise'
-import { flushAdEngagementOnExit } from '../ads/use-ad-engagement'
-import { flushAnalytics } from './analytics'
-import { IS_FREEBUFF } from './constants'
-import { stopEngagementTracking } from './engagement'
-import { useFreebuffSessionStore } from '../state/freebuff-session-store'
-import { drainClientLogs } from './log-shipper'
-import { settleInterruptedSponsoredRun } from './sponsored-run-exit'
-import { flushSurveyEventsOnExit } from './survey-events'
+
+import { getNeuronEngineClient } from '../engine/neuron-engine-client'
 
 const EXIT_CLEANUP_TIMEOUT_MS = 1_000
 
 type ExitCliDependencies = {
-  isFreebuff: boolean
   cleanupLocal: () => void
-  stopEngagementTracking: () => void
-  flushAnalytics: () => Promise<void>
-  drainClientLogs: () => Promise<void>
-  /**
-   * Send every live ad engagement record (COD-757) as `window_close`. A
-   * transcript ad stays mounted all session, so without this its record
-   * depended on a checkpoint having already gone out.
-   */
-  flushAdEngagement: () => Promise<void>
-  /** Survey funnel pings (COD-837): an open survey reports `abandoned`. */
-  flushSurveyEvents?: () => Promise<void>
-  endFreebuffSession: () => Promise<void>
-  /**
-   * Bring a sponsored run to a TERMINAL state, and say what it left behind.
-   *
-   * COD-339 acceptance 6, and the one interrupt question with no web
-   * equivalent: on Cloud the run is remote and closing the tab leaves it to
-   * finish, while here it is a process on the user's own machine that is about
-   * to stop existing. Two things must not survive it -- a row stuck on
-   * `running` forever, and a directory the user cannot account for.
-   *
-   * Resolves to the notice, or null when there was no run.
-   */
-  settleSponsoredRun: () => Promise<string | null>
-  /** Where that notice goes once the alternate screen has been restored. */
-  writeNotice: (text: string) => void
-  waitForRemoteCleanup: (tasks: Promise<void>[]) => Promise<void>
+  /** Ask the engine to save and stop (`EngineCommand::Shutdown`). */
+  shutdownEngine: () => Promise<void>
+  waitForCleanup: (tasks: Promise<void>[]) => Promise<void>
   exit: (code: number) => void
 }
 
@@ -63,54 +36,20 @@ export function createExitCliCleanly(deps: ExitCliDependencies) {
     // Start on the next microtask so exitPromise is assigned before any cleanup
     // callback can re-enter this function.
     exitPromise = Promise.resolve().then(async () => {
-      // STARTED BEFORE THE SCREEN IS TORN DOWN, awaited after. The abort and
-      // the state report are the parts that must begin immediately; the notice
-      // is printed once the terminal is back on its main screen, where the user
-      // will still be able to read it after we exit.
-      const sponsored = Promise.resolve()
-        .then(deps.settleSponsoredRun)
-        .catch(() => null)
-      // Also STARTED BEFORE THE TEARDOWN: tearing the renderer down unmounts
-      // every ad card, which stamps each live record with a pending `unmount`
-      // exit that `closeAll` then keeps, so a quit would never read as
-      // `window_close`. Called synchronously so `closeAll` runs now; only the
-      // transport is awaited below.
-      let adEngagement: Promise<void>
-      try {
-        adEngagement = Promise.resolve(deps.flushAdEngagement()).catch(
-          () => {},
-        )
-      } catch {
-        adEngagement = Promise.resolve()
-      }
       try {
         deps.cleanupLocal()
       } catch {
         // Cleanup is best-effort; never strand the process in a half-exited UI.
       }
-      if (deps.isFreebuff) {
-        try {
-          deps.stopEngagementTracking()
-        } catch {}
-      }
 
-      const remoteTasks = [
-        Promise.resolve().then(deps.flushAnalytics),
-        Promise.resolve().then(deps.drainClientLogs),
-        adEngagement,
+      const tasks = [
         Promise.resolve()
-          .then(deps.flushSurveyEvents)
+          .then(deps.shutdownEngine)
           .catch(() => {}),
-        sponsored.then((notice) => {
-          if (notice) deps.writeNotice(notice)
-        }),
       ]
-      if (deps.isFreebuff) {
-        remoteTasks.push(Promise.resolve().then(deps.endFreebuffSession))
-      }
 
       try {
-        await deps.waitForRemoteCleanup(remoteTasks)
+        await deps.waitForCleanup(tasks)
       } finally {
         deps.exit(exitCode)
       }
@@ -121,26 +60,11 @@ export function createExitCliCleanly(deps: ExitCliDependencies) {
 }
 
 export const exitCliCleanly = createExitCliCleanly({
-  isFreebuff: IS_FREEBUFF,
   cleanupLocal: () => localExitCleanup?.(),
-  stopEngagementTracking,
-  flushAnalytics,
-  drainClientLogs,
-  flushAdEngagement: () => flushAdEngagementOnExit(),
-  flushSurveyEvents: flushSurveyEventsOnExit,
-  endFreebuffSession: () => useFreebuffSessionStore.getState().releaseSlot(),
-  settleSponsoredRun: settleInterruptedSponsoredRun,
-  // `process.stdout.write`, not the logger and not the renderer: the renderer is
-  // gone by now, and a line about a directory that exists on the user's disk is
-  // the one thing on the way out that they actually have to act on.
-  writeNotice: (text) => {
-    try {
-      process.stdout.write(`\n${text}\n`)
-    } catch {
-      // A closed stdout is not a reason to fail an exit.
-    }
+  shutdownEngine: async () => {
+    await getNeuronEngineClient().shutdown()
   },
-  waitForRemoteCleanup: async (tasks) => {
+  waitForCleanup: async (tasks) => {
     await withTimeoutOr(
       Promise.allSettled(tasks),
       EXIT_CLEANUP_TIMEOUT_MS,

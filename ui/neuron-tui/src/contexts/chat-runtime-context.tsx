@@ -1,12 +1,5 @@
-import {
-  freebuffChatAdmissionMayStart,
-  useFreebuffChatAdmission,
-} from '../hooks/use-freebuff-chat-admission'
-import {
-  useFreebuffChatStore,
-  freebuffChatNeedsAdmission,
-  requestFreebuffChatAdmission,
-} from '../state/freebuff-chat-store'
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import {
   createContext,
   useCallback,
@@ -16,34 +9,14 @@ import {
   useRef,
 } from 'react'
 
-import { useAgentValidation } from '../hooks/use-agent-validation'
 import { useElapsedTime } from '../hooks/use-elapsed-time'
-import { holdsLiveFreebuffSlot } from '../utils/freebuff-session-api'
 import {
   useMessageQueue,
   type QueuedMessage,
   type StreamStatus,
 } from '../hooks/use-message-queue'
 import { useSendMessage } from '../hooks/use-send-message'
-import {
-  useSubscriptionQuery,
-  type SubscriptionResponse,
-} from '../hooks/use-subscription-query'
 import { useChatStore } from '../state/chat-store'
-import { useFreebuffSessionStore } from '../state/freebuff-session-store'
-import {
-  sponsoredTurnHoldsQueue,
-  useSponsoredRunStore,
-} from '../state/sponsored-run-store'
-import { useByokSelectionStore } from '../utils/byok'
-import { IS_FREEBUFF } from '../utils/constants'
-import { logger } from '../utils/logger'
-import { getSystemMessage } from '../utils/message-history'
-import { setPendingSponsoredBrief } from '../utils/sponsored-brief'
-import {
-  currentSponsoredRun,
-  sponsoredVerdictNotice,
-} from '../utils/sponsored-run'
 import {
   applyActiveRunQueuePolicy,
   registerActiveRunStopHandler,
@@ -82,14 +55,13 @@ export interface ChatRuntime {
   registerScrollToLatest: (callback: () => void) => () => void
   sendMessage: SendMessageFn
   clearMessages: () => void
-  subscriptionData: SubscriptionResponse | null | undefined
 }
 
 const ChatRuntimeContext = createContext<ChatRuntime | null>(null)
 
 /**
  * Owns everything tied to the active chat run. It remains mounted while
- * history and Freebuff session-gate views replace the Chat surface.
+ * the history view replaces the Chat surface.
  */
 export const ChatRuntimeProvider = ({
   agentId,
@@ -133,38 +105,6 @@ export const ChatRuntimeProvider = ({
     }
   }, [askUserState, mainAgentTimer])
 
-  const freebuffSession = useFreebuffSessionStore((state) => state.session)
-  const hasSelectedByokConnection = useByokSelectionStore(
-    (state) => state.selected !== undefined,
-  )
-  const chatAdmission = useFreebuffChatStore((s) => s.admission)
-  const nextModel = useFreebuffChatStore((s) => s.nextModel)
-  const pickerOpen = useFreebuffChatStore((s) => s.pickerOpen)
-  const freebuffSessionOver =
-    IS_FREEBUFF &&
-    !hasSelectedByokConnection &&
-    (!holdsLiveFreebuffSlot(freebuffSession) ||
-      chatAdmission !== null ||
-      pickerOpen ||
-      (freebuffSession?.status === 'active' &&
-        nextModel !== null &&
-        nextModel !== freebuffSession.model))
-  // An accepted sponsored task runs NEXT, ahead of anything the user queued
-  // after approving it, and nothing they type steers it: it has no steering
-  // mailbox, so their messages land in this queue and wait for its verdict.
-  const sponsoredSnapshot = useSponsoredRunStore((state) => state.snapshot)
-  const sponsoredHold = sponsoredTurnHoldsQueue(sponsoredSnapshot)
-  const sendBlocked = freebuffSessionOver || sponsoredHold
-
-  useEffect(() => {
-    if (freebuffSessionOver) {
-      logger.info(
-        {},
-        '[chat-runtime] Freebuff session over; holding queued messages until rejoin',
-      )
-    }
-  }, [freebuffSessionOver])
-
   const queue = useMessageQueue(
     (message) =>
       sendMessageRef.current?.({
@@ -174,7 +114,6 @@ export const ChatRuntimeProvider = ({
       }) ?? Promise.resolve(),
     isChainInProgressRef,
     activeAgentStreamsRef,
-    { sendBlocked },
   )
 
   // The module-level stop entry point keeps this callback for the runtime's
@@ -192,14 +131,6 @@ export const ChatRuntimeProvider = ({
     () =>
       registerActiveRunStopHandler((reason) => {
         applyActiveRunQueuePolicy(reason, queueControlRef.current)
-        if (
-          reason === 'new-chat' ||
-          reason === 'history-resume' ||
-          reason === 'logout' ||
-          reason === 'session-transition'
-        ) {
-          useFreebuffChatStore.setState({ admission: null, pickerOpen: false })
-        }
       }),
     [],
   )
@@ -217,10 +148,12 @@ export const ChatRuntimeProvider = ({
     }
   }, [])
 
-  const { validate: validateAgents } = useAgentValidation()
-  const { data: subscriptionData } = useSubscriptionQuery({
-    refetchInterval: 60 * 1000,
-  })
+  // Freebuff validated local `.agents/` definitions with the Codebuff
+  // backend before each send. The engine owns agents, so nothing to check.
+  const validateBeforeSend = useCallback(
+    async () => ({ success: true, errors: [] }),
+    [],
+  )
   const { sendMessage, clearMessages } = useSendMessage({
     inputRef,
     activeSubagentsRef,
@@ -228,7 +161,7 @@ export const ChatRuntimeProvider = ({
     setStreamStatus: queue.setStreamStatus,
     setCanProcessQueue: queue.setCanProcessQueue,
     agentId,
-    onBeforeMessageSend: validateAgents,
+    onBeforeMessageSend: validateBeforeSend,
     mainAgentTimer,
     scrollToLatest,
     onTimerEvent: () => {},
@@ -239,67 +172,9 @@ export const ChatRuntimeProvider = ({
     pauseQueue: queue.pauseQueue,
     continueChat,
     continueChatId,
-    subscriptionData,
   })
 
-  useFreebuffChatAdmission(
-    IS_FREEBUFF &&
-      !hasSelectedByokConnection &&
-      freebuffChatAdmissionMayStart({
-        chainInProgress: isChainInProgress,
-        streamStatus: queue.streamStatus,
-        queuedCount: queue.queuedMessages.length,
-        queuePaused: queue.queuePaused,
-      }),
-  )
-
   sendMessageRef.current = sendMessage
-
-  // START THE ACCEPTED SPONSORED TURN once the conversation is free. It is a
-  // turn IN this conversation (#3989): it streams into the transcript through
-  // the ordinary send path, which is what holds the chain -- and so the queue
-  // -- until it has a verdict. `starting` guards the await between reading the
-  // plan and the send taking the chain, which a re-render could otherwise
-  // enter twice.
-  const sponsoredStarting = useRef(false)
-  useEffect(() => {
-    if (sponsoredSnapshot?.phase !== 'queued') return
-    if (isChainInProgress || queue.streamStatus !== 'idle') return
-    if (sponsoredStarting.current) return
-    const run = currentSponsoredRun()
-    if (!run) return
-    sponsoredStarting.current = true
-    void (async () => {
-      try {
-        const plan = await run.startTurn()
-        if (!plan) return
-        await sendMessageRef.current?.({
-          content: '',
-          agentMode,
-          sponsored: {
-            plan,
-            anchor: getSystemMessage(
-              `SPONSORED · ${plan.advertiserName} is working in this folder. Messages you send now will wait until it finishes.`,
-            ),
-            onSettled: (result) => {
-              void run.settleTurn(result).then((brief) => {
-                setPendingSponsoredBrief(brief)
-                const snapshot = run.state
-                useChatStore
-                  .getState()
-                  .setMessages((prev) => [
-                    ...prev,
-                    getSystemMessage(sponsoredVerdictNotice(snapshot)),
-                  ])
-              })
-            },
-          },
-        })
-      } finally {
-        sponsoredStarting.current = false
-      }
-    })()
-  }, [sponsoredSnapshot, isChainInProgress, queue.streamStatus, agentMode])
 
   const value: ChatRuntime = {
     mainAgentTimer,
@@ -311,15 +186,7 @@ export const ChatRuntimeProvider = ({
     queuedMessages: queue.queuedMessages,
     queuePaused: queue.queuePaused,
     streamMessageIdRef: queue.streamMessageIdRef,
-    addToQueue: (content, attachments) => {
-      queue.addToQueue(content, attachments)
-      if (
-        IS_FREEBUFF &&
-        !hasSelectedByokConnection &&
-        freebuffChatNeedsAdmission()
-      )
-        requestFreebuffChatAdmission()
-    },
+    addToQueue: queue.addToQueue,
     addToQueueFront: queue.addToQueueFront,
     editQueuedMessage: queue.editQueuedMessage,
     removeQueuedMessage: queue.removeQueuedMessage,
@@ -335,7 +202,6 @@ export const ChatRuntimeProvider = ({
     registerScrollToLatest,
     sendMessage,
     clearMessages,
-    subscriptionData,
   }
 
   return (

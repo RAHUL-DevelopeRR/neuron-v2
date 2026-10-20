@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: completion
+// metadata no longer carries credits. See ui/neuron-tui/PORTING.md.
 import { describe, expect, test, beforeEach, afterEach } from 'bun:test'
 
 import {
@@ -204,13 +206,13 @@ describe('createBatchedMessageUpdater', () => {
     updater.updateAiMessage((msg) => ({ ...msg, content: 'updated' }))
 
     // markComplete should flush + apply completion
-    updater.markComplete({ credits: 0.5 })
+    updater.markComplete({ completionTime: '7s' })
 
     // Should have 2 calls: flush + markComplete
     expect(setMessagesCallCount).toBe(2)
     expect(state[0].content).toBe('updated')
     expect(state[0].isComplete).toBe(true)
-    expect(state[0].credits).toBe(0.5)
+    expect(state[0].completionTime).toBe('7s')
   })
 
   test('setError flushes pending updates and preserves existing content and blocks', () => {

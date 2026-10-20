@@ -1,12 +1,9 @@
 #!/usr/bin/env bun
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
+// Windows terminal-command broker that ran the SDK's shell tools is gone (the
+// engine runs tools), so the entry point only starts the UI.
+// See ui/neuron-tui/PORTING.md.
 
-import {
-  isTerminalCommandBrokerInvocation,
-  serveTerminalCommandBroker,
-} from './utils/terminal-command-broker'
+await import('./index')
 
-if (isTerminalCommandBrokerInvocation(process.argv)) {
-  await serveTerminalCommandBroker()
-} else {
-  await import('./index')
-}
+export {}

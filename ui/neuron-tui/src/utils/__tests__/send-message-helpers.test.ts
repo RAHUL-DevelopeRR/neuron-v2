@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
+// inline-ad marker cases are gone. See ui/neuron-tui/PORTING.md.
 import { describe, test, expect } from 'bun:test'
 
 import {
@@ -216,7 +218,7 @@ describe('createAiMessageShell', () => {
     expect(message.variant).toBe('ai')
     expect(message.content).toBe('')
     expect(message.blocks).toEqual([])
-    expect(message.metadata?.allowInlineAds).toBe(true)
+    expect(message.metadata).toBeUndefined()
   })
 })
 
@@ -1724,17 +1726,6 @@ describe('sanitizeRestoredMessages', () => {
     const [result] = sanitizeRestoredMessages([message])
 
     expect(result).toBe(message)
-  })
-
-  test('strips the live inline-ad marker from restored responses', () => {
-    const [result] = sanitizeRestoredMessages([
-      streamedShell({
-        isComplete: true,
-        metadata: { allowInlineAds: true, userOpened: true },
-      }),
-    ])
-
-    expect(result.metadata).toEqual({ userOpened: true })
   })
 
   test('drops persisted hidden agent blocks (context-pruner)', () => {

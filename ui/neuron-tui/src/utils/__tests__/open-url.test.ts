@@ -1,11 +1,13 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: sample URLs
+// are neutral. See ui/neuron-tui/PORTING.md.
 import { describe, expect, test } from 'bun:test'
 
 import { isOpenableWebUrl, safeOpen } from '../open-url'
 
 describe('isOpenableWebUrl', () => {
   test('accepts absolute http(s) URLs', () => {
-    expect(isOpenableWebUrl('https://codebuff.com/usage')).toBe(true)
-    expect(isOpenableWebUrl('https://greptile.com?click=1&x=%20y')).toBe(true)
+    expect(isOpenableWebUrl('https://example.com/usage')).toBe(true)
+    expect(isOpenableWebUrl('https://example.org?click=1&x=%20y')).toBe(true)
     expect(isOpenableWebUrl('http://localhost:3000/login?code=abc')).toBe(true)
   })
 
@@ -19,7 +21,7 @@ describe('isOpenableWebUrl', () => {
       'data:text/html,<script>1</script>',
       'mailto:a@b.c',
       '//evil.example/x',
-      'codebuff.com',
+      'example.com',
     ]) {
       expect(isOpenableWebUrl(url)).toBe(false)
     }

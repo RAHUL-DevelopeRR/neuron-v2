@@ -1,52 +1,13 @@
-import { loadSkills as sdkLoadSkills } from '@codebuff/sdk'
-
-import { getProjectRoot } from '../project-files'
-import { logger } from './logger'
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
+//
+// Freebuff loaded skills from ~/.agents/skills and the project through the
+// Codebuff SDK. Neuron's engine owns skills, so the cache starts empty and is
+// filled only by tests until the engine reports its skills.
 
 import type { SkillDefinition, SkillsMap } from '@codebuff/common/types/skill'
 
-// ============================================================================
-// Skills cache (loaded via SDK at startup)
-// ============================================================================
-
 let skillsCache: SkillsMap = {}
-/** Set once a load succeeded, so a count of 0 can be told from "not loaded yet". */
-let skillsLoaded = false
-
-/**
- * Initialize the skill registry by loading skills via the SDK.
- * This must be called at CLI startup.
- * 
- * Skills are loaded from:
- * - ~/.agents/skills/ (global)
- * - {projectRoot}/.agents/skills/ (project, overrides global)
- */
-export async function initializeSkillRegistry(): Promise<void> {
-  const cwd = getProjectRoot() || process.cwd()
-
-  try {
-    // Load skills from both global (~/.agents/skills) and project directories
-    // The SDK handles merging, with project skills overriding global ones.
-    //
-    // includeHomeSkills is opt-in and defaults to false, because a server
-    // embedding the SDK must never read a home directory (it would be the
-    // SERVER's). The CLI is the case the flag exists for: it runs on the
-    // user's own machine, so those really are their skills.
-    skillsCache = await sdkLoadSkills({
-      cwd,
-      verbose: false,
-      includeHomeSkills: true,
-    })
-    skillsLoaded = true
-  } catch (error) {
-    logger.warn({ error }, 'Failed to load skills')
-    skillsCache = {}
-  }
-}
-
-// ============================================================================
-// Skills access
-// ============================================================================
 
 /**
  * Get all loaded skills.
@@ -62,21 +23,12 @@ export function getSkillByName(name: string): SkillDefinition | undefined {
   return skillsCache[name]
 }
 
-/** Whether a skill load has succeeded this process. */
-export function isSkillRegistryLoaded(): boolean {
-  return skillsLoaded
-}
-
 /**
  * Get the number of loaded skills.
  */
 export function getSkillCount(): number {
   return Object.keys(skillsCache).length
 }
-
-// ============================================================================
-// UI/Display utilities
-// ============================================================================
 
 // ============================================================================
 // Testing utilities
@@ -87,7 +39,6 @@ export function getSkillCount(): number {
  */
 export function __resetSkillRegistryForTests(): void {
   skillsCache = {}
-  skillsLoaded = false
 }
 
 /**

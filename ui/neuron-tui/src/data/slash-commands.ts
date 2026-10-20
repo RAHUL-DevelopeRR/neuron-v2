@@ -1,7 +1,8 @@
-import { AGENT_MODES, IS_FREEBUFF } from '../utils/constants'
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
+import { AGENT_MODES } from '../utils/constants'
 
 import type { SkillsMap } from '@codebuff/common/types/skill'
-
 
 export interface SlashCommand {
   id: string
@@ -20,35 +21,13 @@ export interface SlashCommand {
   insertText?: string
 }
 
-// Generate mode commands from the AGENT_MODES constant (excluded in Freebuff)
-const MODE_COMMANDS: SlashCommand[] = IS_FREEBUFF
-  ? []
-  : AGENT_MODES.map((mode) => ({
-      id: `mode:${mode.toLowerCase()}`,
-      label: `mode:${mode.toLowerCase()}`,
-      description: `Switch to ${mode} mode`,
-      aliases: [`model:${mode.toLowerCase()}`],
-    }))
-
-const FREEBUFF_REMOVED_COMMAND_IDS = new Set([
-  'ads:enable',
-  'ads:disable',
-  'usage',
-  'subscribe',
-  'agent:gpt-5',
-  'image',
-  'publish',
-  'init',
-])
-
-const FREEBUFF_ONLY_COMMAND_IDS = new Set([
-  'byok',
-  'plan',
-  'end-session',
-  'model',
-  'reasoning',
-  'dashboard',
-])
+// Generate mode commands from the AGENT_MODES constant
+const MODE_COMMANDS: SlashCommand[] = AGENT_MODES.map((mode) => ({
+  id: `mode:${mode.toLowerCase()}`,
+  label: `mode:${mode.toLowerCase()}`,
+  description: `Switch to ${mode} mode`,
+  aliases: [`model:${mode.toLowerCase()}`],
+}))
 
 const ALL_SLASH_COMMANDS: SlashCommand[] = [
   {
@@ -56,28 +35,6 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
     label: 'help',
     description: 'Display keyboard shortcuts and tips',
     aliases: ['h', '?'],
-    implicitCommand: true,
-  },
-  {
-    id: 'diagnostics',
-    label: 'diagnostics',
-    description: 'Show local CLI resource usage and terminal tool process IDs',
-    aliases: ['diag', 'processes'],
-  },
-  {
-    id: 'ads:enable',
-    label: 'ads:enable',
-    description: 'Enable contextual ads',
-  },
-  {
-    id: 'ads:disable',
-    label: 'ads:disable',
-    description: 'Disable contextual ads',
-  },
-  {
-    id: 'init',
-    label: 'init',
-    description: 'Create a starter knowledge.md file',
     implicitCommand: true,
   },
   // {
@@ -90,18 +47,6 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
   //   label: 'redo',
   //   description: 'Redo the most recent undone change',
   // },
-  {
-    id: 'usage',
-    label: 'usage',
-    description: 'View credits and subscription quota',
-    aliases: ['credits'],
-  },
-  {
-    id: 'subscribe',
-    label: 'subscribe',
-    description: 'Subscribe to get more usage',
-    aliases: ['strong', 'sub', 'buy-credits'],
-  },
   {
     id: 'interview',
     label: 'interview',
@@ -155,23 +100,6 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
     aliases: ['export-chat'],
   },
   {
-    id: 'agent:gpt-5',
-    label: 'agent:gpt-5',
-    description: 'Spawn the GPT-5 agent to help solve complex problems',
-    insertText: '@GPT-5 Agent ',
-  },
-  // {
-  //   id: 'agent:opus',
-  //   label: 'agent:opus',
-  //   description: 'Spawn the Opus agent to help solve any problem',
-  //   insertText: '@Opus Agent ',
-  // },
-  {
-    id: 'feedback',
-    label: 'feedback',
-    description: IS_FREEBUFF ? 'Share general feedback about Freebuff' : 'Share general feedback about Codebuff',
-  },
-  {
     id: 'bash',
     label: 'bash',
     description: 'Enter bash mode ("!" at beginning enters bash mode)',
@@ -184,50 +112,10 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
     aliases: ['img', 'attach'],
   },
   ...MODE_COMMANDS,
-  // {
-  //   id: 'publish',
-  //   label: 'publish',
-  //   description: 'Publish agents to the agent store',
-  // },
   {
     id: 'theme:toggle',
     label: 'theme:toggle',
     description: 'Toggle between light and dark mode',
-  },
-  {
-    id: 'byok',
-    label: 'byok',
-    description: 'Manage direct OpenRouter or OpenAI-compatible inference',
-    aliases: ['provider'],
-  },
-  {
-    id: 'model',
-    label: 'model',
-    description: 'Choose the model for your next message',
-  },
-  {
-    id: 'reasoning',
-    label: 'reasoning',
-    description: 'Choose reasoning effort for your next message model',
-    aliases: ['effort', 'think'],
-  },
-  {
-    id: 'end-session',
-    label: 'end-session',
-    description: 'End your current session',
-  },
-  {
-    id: 'dashboard',
-    label: 'dashboard',
-    description: 'Open your usage, streak and account dashboard in the browser',
-    aliases: ['usage', 'stats', 'streak'],
-  },
-  {
-    id: 'logout',
-    label: 'logout',
-    description: 'Sign out of your session',
-    aliases: ['signout'],
-    implicitCommand: true,
   },
   {
     id: 'exit',
@@ -238,11 +126,7 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
   },
 ]
 
-export const SLASH_COMMANDS = IS_FREEBUFF
-  ? ALL_SLASH_COMMANDS.filter(
-      (cmd) => !FREEBUFF_REMOVED_COMMAND_IDS.has(cmd.id),
-    )
-  : ALL_SLASH_COMMANDS.filter((cmd) => !FREEBUFF_ONLY_COMMAND_IDS.has(cmd.id))
+export const SLASH_COMMANDS = ALL_SLASH_COMMANDS
 
 export const SLASHLESS_COMMAND_IDS = new Set(
   SLASH_COMMANDS.filter((cmd) => cmd.implicitCommand).map((cmd) =>

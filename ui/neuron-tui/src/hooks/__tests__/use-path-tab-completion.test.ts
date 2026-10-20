@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
+// relative-path cases use native separators. See ui/neuron-tui/PORTING.md.
 import { mkdirSync, mkdtempSync, rmSync } from 'fs'
 import os from 'os'
 import path from 'path'
@@ -30,6 +32,9 @@ const isAbsolutePath = (searchQuery: string): boolean => {
 const isCompleteDirectory = (completed: string): boolean => {
   return completed.endsWith('/')
 }
+
+// The cases below are written with '/'; on Windows the helper splits on '\\'.
+const native = (posixPath: string) => posixPath.split('/').join(path.sep)
 
 // Helper to convert absolute completion back to relative for display
 const toRelativePath = (
@@ -101,19 +106,19 @@ describe('usePathTabCompletion - completion result detection', () => {
 describe('usePathTabCompletion - relative path conversion', () => {
   describe('toRelativePath', () => {
     test('converts absolute completion to relative when within currentPath', () => {
-      const currentPath = '/home/user/projects'
-      const completed = '/home/user/projects/myproject'
+      const currentPath = native('/home/user/projects')
+      const completed = native('/home/user/projects/myproject')
       
       const result = toRelativePath(completed, currentPath)
       expect(result).toBe('myproject')
     })
 
     test('converts nested path correctly', () => {
-      const currentPath = '/home/user'
-      const completed = '/home/user/Documents/work'
+      const currentPath = native('/home/user')
+      const completed = native('/home/user/Documents/work')
       
       const result = toRelativePath(completed, currentPath)
-      expect(result).toBe('Documents/work')
+      expect(result).toBe(native('Documents/work'))
     })
 
     test('returns null when completion is not under currentPath', () => {
@@ -134,8 +139,8 @@ describe('usePathTabCompletion - relative path conversion', () => {
     })
 
     test('handles paths with trailing separators correctly', () => {
-      const currentPath = '/home/user'
-      const completed = '/home/user/test'
+      const currentPath = native('/home/user')
+      const completed = native('/home/user/test')
       
       const result = toRelativePath(completed, currentPath)
       expect(result).toBe('test')

@@ -1,3 +1,6 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
+// post-login Discord banner is gone, so this covers the git-root banner.
+// See ui/neuron-tui/PORTING.md.
 import { afterEach, beforeAll, expect, test } from 'bun:test'
 import { createTestRenderer } from '@opentui/core/testing'
 import { createRoot, flushSync } from '@opentui/react'
@@ -10,13 +13,17 @@ beforeAll(initializeThemeStore)
 afterEach(() => useChatStore.getState().setActiveTopBanner(null))
 
 test.each([100, 48])(
-  'the post-login Discord banner shows the invite and its link at %s columns',
+  'the git-root banner offers to switch to the repository root at %s columns',
   async (width) => {
-    useChatStore.getState().setActiveTopBanner('discord')
+    useChatStore.getState().setActiveTopBanner('gitRoot')
     const setup = await createTestRenderer({ width, height: 12 })
     const root = createRoot(setup.renderer)
     try {
-      flushSync(() => root.render(<TopBanner />))
+      flushSync(() =>
+        root.render(
+          <TopBanner gitRoot="/work/repo" onSwitchToGitRoot={() => {}} />,
+        ),
+      )
       await setup.renderOnce()
       const frame = setup.captureCharFrame()
       // word-wrapped at the narrow width, so compare with the borders, the close
@@ -25,10 +32,8 @@ test.each([100, 48])(
         .replace(/[│─╭╮╰╯┌┐└┘]/g, ' ')
         .replace(/\s+/g, ' ')
         .replace(/ x /g, ' ')
-      expect(text).toContain(
-        'Talk directly with our team and 7,000+ community members on Discord:',
-      )
-      expect(text).toContain('discord.gg/yXG3w7wxfs')
+      expect(text).toContain('in a subdirectory of a git repo.')
+      expect(text).toContain('Switch to git root')
     } finally {
       flushSync(() => root.unmount())
       setup.renderer.destroy()

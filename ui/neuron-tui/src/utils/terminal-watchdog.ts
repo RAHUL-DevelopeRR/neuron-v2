@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 /**
  * Sacrificial watchdog process that resets the terminal if the CLI dies
  * without running its own cleanup (SIGKILL, native crash, group kill).
@@ -79,15 +81,8 @@ import {
 import os from 'os'
 import path from 'path'
 
-import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
-
 import { TERMINAL_RESET_SEQUENCES } from './terminal-reset-sequences'
 import { getCliEnv } from './env'
-import { trackHelperProcess } from './helper-process-telemetry'
-import {
-  reportCliProcessHealth,
-  reportWindowsTerminalFailure,
-} from './windows-terminal-health'
 
 import type { ChildProcess } from 'child_process'
 
@@ -123,9 +118,21 @@ export function classifyTerminalWatchdogSpawnFailure(
   return 'unknown'
 }
 
-function reportTerminalWatchdogFailure(failure: TerminalWatchdogFailure): void {
-  reportWindowsTerminalFailure(AnalyticsEvent.TERMINAL_WATCHDOG_FAILED, failure)
-}
+// Freebuff shipped watchdog failures and helper-process anomalies to its
+// analytics backend. Neuron keeps no telemetry: the default reporters do
+// nothing, and tests inject their own to observe what the watchdog saw.
+function reportTerminalWatchdogFailure(_failure: TerminalWatchdogFailure): void {}
+
+export type WatchdogHealthEvent =
+  | 'cli.helper_outlived_parent'
+  | 'cli.helper_process_flood'
+
+export type WatchdogHealthReport = (
+  event: WatchdogHealthEvent,
+  data: Record<string, string | number | boolean | undefined>,
+) => void
+
+const ignoreHealthReport: WatchdogHealthReport = () => {}
 
 function clearArmMonitor(): void {
   if (armMonitor) clearTimeout(armMonitor)
@@ -459,7 +466,7 @@ export function inspectWindowsWatchdogMarkers(
  */
 export function admitWindowsWatchdog(
   inspect: () => WindowsWatchdogInspection = inspectWindowsWatchdogMarkers,
-  report: typeof reportCliProcessHealth = reportCliProcessHealth,
+  report: WatchdogHealthReport = ignoreHealthReport,
 ): boolean {
   let inspection: WindowsWatchdogInspection
   try {
@@ -468,7 +475,7 @@ export function admitWindowsWatchdog(
     return true
   }
   if (inspection.orphaned > 0 || inspection.legacyStale > 0) {
-    report(AnalyticsEvent.CLI_HELPER_OUTLIVED_PARENT, {
+    report('cli.helper_outlived_parent', {
       kind: 'terminal_watchdog',
       count: inspection.orphaned,
       legacyStale: inspection.legacyStale,
@@ -477,7 +484,7 @@ export function admitWindowsWatchdog(
   }
   const live = inspection.active + inspection.orphaned
   if (live < MAX_CONCURRENT_WINDOWS_WATCHDOGS) return true
-  report(AnalyticsEvent.CLI_HELPER_PROCESS_FLOOD, {
+  report('cli.helper_process_flood', {
     kind: 'terminal_watchdog',
     scope: 'machine',
     live,
@@ -588,10 +595,6 @@ export function startTerminalWatchdog(options?: {
     // loop open — the CLI must still be able to exit naturally. stdin is a
     // Socket at runtime; its unref isn't in the Writable type.
     child.unref()
-    // POSIX: the watchdog itself, alive for our whole life. Windows: only the
-    // short-lived bootstrap. Either way more than a couple live at once is a
-    // leak, and the census reports it.
-    trackHelperProcess('terminal_watchdog', child)
     child.stdin?.on('error', () => {})
     ;(child.stdin as { unref?: () => void } | null)?.unref?.()
     watchdog = child

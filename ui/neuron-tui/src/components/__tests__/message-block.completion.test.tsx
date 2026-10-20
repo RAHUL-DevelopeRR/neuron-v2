@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: credits are
+// no longer shown. See ui/neuron-tui/PORTING.md.
 import { describe, test, expect } from 'bun:test'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
@@ -30,7 +32,6 @@ const baseProps = {
   timestamp: '12:00',
   isComplete: false,
   completionTime: undefined,
-  credits: undefined,
   timerStartTime: null,
   textColor: theme.foreground,
   timestampColor: theme.muted,
@@ -52,18 +53,17 @@ const baseProps = {
 }
 
 describe('MessageBlock completion time', () => {
-  test('renders completion time and credits when complete', () => {
+  test('renders completion time, and no credits line, when complete', () => {
     const markup = renderToStaticMarkup(
       <MessageBlock
         {...baseProps}
         isComplete={true}
         completionTime="7s"
-        credits={3}
       />,
     )
 
     expect(markup).toContain('7s')
-    expect(markup).toContain('3 credits')
+    expect(markup).not.toContain('credit')
   })
 
   test('omits completion line when not complete', () => {
@@ -72,33 +72,9 @@ describe('MessageBlock completion time', () => {
         {...baseProps}
         isComplete={false}
         completionTime="7s"
-        credits={3}
       />,
     )
 
     expect(markup).not.toContain('7s')
-    expect(markup).not.toContain('3 credits')
-  })
-
-  test('pluralizes credit label correctly', () => {
-    const singularMarkup = renderToStaticMarkup(
-      <MessageBlock
-        {...baseProps}
-        isComplete={true}
-        completionTime="7s"
-        credits={1}
-      />,
-    )
-    expect(singularMarkup).toContain('1 credit')
-
-    const pluralMarkup = renderToStaticMarkup(
-      <MessageBlock
-        {...baseProps}
-        isComplete={true}
-        completionTime="7s"
-        credits={4}
-      />,
-    )
-    expect(pluralMarkup).toContain('4 credits')
   })
 })

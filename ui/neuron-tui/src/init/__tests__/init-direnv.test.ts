@@ -1,3 +1,6 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
+// direnv-export cases are skipped on Windows, and sample URLs are neutral.
+// See ui/neuron-tui/PORTING.md.
 import { describe, test, expect, beforeEach, afterEach, mock, spyOn } from 'bun:test'
 import type { SpawnSyncReturns } from 'child_process'
 import fs from 'fs'
@@ -381,7 +384,8 @@ describe('init-direnv', () => {
       spawnSyncSpy.mockRestore()
     })
 
-    test('sets environment variables from direnv export', () => {
+    // direnv is POSIX-only: isDirenvAvailable() is false on win32.
+    test.skipIf(process.platform === 'win32')('sets environment variables from direnv export', () => {
       fs.writeFileSync(path.join(tempDir, '.envrc'), 'export TEST_VAR=test_value')
       process.chdir(tempDir)
 
@@ -414,7 +418,7 @@ describe('init-direnv', () => {
       expect(process.env.TEST_VAR).toBe('test_value')
     })
 
-    test('unsets environment variables when direnv returns null', () => {
+    test.skipIf(process.platform === 'win32')('unsets environment variables when direnv returns null', () => {
       fs.writeFileSync(path.join(tempDir, '.envrc'), 'unset OLD_VAR')
       process.chdir(tempDir)
       process.env.OLD_VAR = 'should_be_removed'
@@ -524,10 +528,10 @@ describe('init-direnv', () => {
       expect(process.env.SHOULD_NOT_SET).toBeUndefined()
     })
 
-    test('drops variables that would reconfigure the CLI itself, keeps the rest', () => {
+    test.skipIf(process.platform === 'win32')('drops variables that would reconfigure the CLI itself, keeps the rest', () => {
       fs.writeFileSync(path.join(tempDir, '.envrc'), 'export X=1')
       process.chdir(tempDir)
-      process.env.NEXT_PUBLIC_CODEBUFF_APP_URL = 'https://codebuff.com'
+      process.env.NEXT_PUBLIC_CODEBUFF_APP_URL = 'https://app.example.test'
       delete process.env.CODEBUFF_TRUSTED_AGENT_PUBLISHERS
       delete process.env.NODE_OPTIONS
 
@@ -562,7 +566,9 @@ describe('init-direnv', () => {
       initializeDirenv()
 
       expect(process.env.DATABASE_URL).toBe('postgres://localhost/app')
-      expect(process.env.NEXT_PUBLIC_CODEBUFF_APP_URL).toBe('https://codebuff.com')
+      expect(process.env.NEXT_PUBLIC_CODEBUFF_APP_URL).toBe(
+        'https://app.example.test',
+      )
       expect(process.env.CODEBUFF_TRUSTED_AGENT_PUBLISHERS).toBeUndefined()
       expect(process.env.FREEBUFF_MODE).toBeUndefined()
       expect(process.env.OVERRIDE_TARGET).toBeUndefined()

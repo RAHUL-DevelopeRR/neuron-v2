@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
+// free-mode capacity-wait cases went with that state. See ui/neuron-tui/PORTING.md.
 import { describe, test, expect } from 'bun:test'
 
 import { getStatusIndicatorState } from '../../utils/status-indicator-state'
@@ -50,26 +52,6 @@ describe('StatusIndicator state logic', () => {
         streamStatus: 'streaming',
       })
       expect(state.kind).toBe('retrying')
-    })
-
-    test('returns capacityWait when the retry is a capacity deferral', () => {
-      const state = getStatusIndicatorState({
-        ...baseArgs,
-        isRetrying: true,
-        isCapacityWait: true,
-        streamStatus: 'waiting',
-      })
-      expect(state.kind).toBe('capacityWait')
-    })
-
-    test('ignores isCapacityWait unless a retry is actually in progress', () => {
-      const state = getStatusIndicatorState({
-        ...baseArgs,
-        isRetrying: false,
-        isCapacityWait: true,
-        streamStatus: 'waiting',
-      })
-      expect(state.kind).toBe('waiting')
     })
 
     test('returns retrying state when message send is retrying', () => {

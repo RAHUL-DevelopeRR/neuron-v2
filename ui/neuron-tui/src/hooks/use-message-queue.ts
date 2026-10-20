@@ -1,6 +1,7 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { useCallback, useEffect, useRef, useState } from 'react'
 
-import { noteAdQueuedCount } from '../ads/ad-signals'
 import { logger } from '../utils/logger'
 
 import type { PendingAttachment } from '../types/store'
@@ -25,8 +26,7 @@ export const useMessageQueue = (
   isChainInProgressRef: React.MutableRefObject<boolean>,
   activeAgentStreamsRef: React.MutableRefObject<number>,
   opts: {
-    /** External hold on dequeuing (e.g. the freebuff session ended and new
-     *  requests would be rejected). Queued messages are kept, not dropped;
+    /** External hold on dequeuing. Queued messages are kept, not dropped;
      *  processing resumes automatically when this flips back to false. */
     sendBlocked?: boolean
     /** Test seam for the stuck-lock watchdog. */
@@ -63,8 +63,6 @@ export const useMessageQueue = (
    *  dequeue) sees the same queue the user just acted on. */
   const writeQueue = useCallback((next: QueuedMessage[]) => {
     queuedMessagesRef.current = next
-    // COD-757: the queue length rides the ad client context as a bucket.
-    noteAdQueuedCount(next.length)
     setQueuedMessages(next)
   }, [])
 

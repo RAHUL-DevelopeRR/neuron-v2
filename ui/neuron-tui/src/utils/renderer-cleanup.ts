@@ -1,20 +1,15 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { execFile } from 'child_process'
 
 import { resetTerminalTitle } from './terminal-title'
 import { stopActiveRun } from './active-run'
-import { IS_FREEBUFF } from './constants'
 import { getCliEnv } from './env'
 import { exitCliCleanly, registerExitCleanup } from './exit-cleanly'
-import { recordFatalCrashSync } from './fatal-crash-report'
-import { holdsLiveFreebuffSlot } from './freebuff-session-api'
-import { isLauncherUpdateTermination } from './launcher-update-restart'
-import { logger } from './logger'
-import { trackHelperProcess } from './helper-process-telemetry'
 import { flushLiveChatState } from './run-state-storage'
 import { reportFatalErrorSync, writeTerminalControlSync } from './terminal-io'
 import { TERMINAL_RESET_SEQUENCES } from './terminal-reset-sequences'
 import { stopTerminalWatchdog } from './terminal-watchdog'
-import { useFreebuffSessionStore } from '../state/freebuff-session-store'
 
 import type { CliRenderer } from '@opentui/core'
 
@@ -42,18 +37,9 @@ let renderer: CliRenderer | null = null
 let handlersInstalled = false
 let cleanupStarted = false
 
-function isProcessRunningSync(pid: number): boolean {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === 'EPERM'
-  }
-}
-
 function isProcessRunning(pid: number, onResult: (running: boolean) => void) {
   if (process.platform === 'win32') {
-    const probe = execFile(
+    execFile(
       'tasklist',
       ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'],
       // Bounded: a probe hung on a saturated machine would otherwise stall the
@@ -68,7 +54,6 @@ function isProcessRunning(pid: number, onResult: (running: boolean) => void) {
         onResult(new RegExp(`(?:^|\\D)${pid}(?:\\D|$)`).test(stdout))
       },
     )
-    trackHelperProcess('launcher_probe', probe)
     return
   }
 
@@ -181,15 +166,6 @@ function cleanup(): boolean {
 
 /** Restore the terminal, report a fatal error synchronously, and exit. */
 export function exitCliWithFatalError(label: string, error: unknown): never {
-  // Before teardown, while the store still says whether an hour is live. The
-  // next launch ships this as `cli.fatal_crash` (see fatal-crash-report.ts).
-  let heldFreebuffSession = false
-  try {
-    heldFreebuffSession =
-      IS_FREEBUFF &&
-      holdsLiveFreebuffSlot(useFreebuffSessionStore.getState().session)
-  } catch {}
-  recordFatalCrashSync(label, error, { heldFreebuffSession })
   const resetCompletedSynchronously = cleanup() || resetTerminalState()
   if (resetCompletedSynchronously) {
     stopTerminalWatchdog()
@@ -222,28 +198,11 @@ export function installProcessCleanupHandlers(cliRenderer: CliRenderer): void {
     void exitCliCleanly()
   }
 
-  // A signal from OUTSIDE the app — the terminal window closed (SIGHUP), a
-  // kill/shutdown (SIGTERM), the npm launcher gone — is not the user choosing
-  // to end their Freebuff hour. It is usually how they get out of a CLI that
-  // froze or went blank. Ending the hour there was a pure loss: no early-end
-  // refund settles, and a multi-session (`cli:`) relaunch is never covered by
-  // the earlier debit, so the next launch bought the same hour again ("the CLI
-  // crashed ... when manually opened again the Freebucks are deducted"). Keep
-  // the hour exactly as a crash does: the live record survives, and the next
-  // launch resumes it (consumeCrashedFreebuffSession). Quitting from inside
-  // the app (Ctrl+C, /exit) still ends it.
-  const handleExternalExit = () => {
-    if (IS_FREEBUFF) {
-      try {
-        useFreebuffSessionStore.getState().keepSlotForResume()
-      } catch {
-        // Never let session bookkeeping block the exit.
-      }
-    }
-    handleExitRequest()
-  }
+  // A signal from outside the app: the terminal window closed (SIGHUP), a
+  // kill/shutdown (SIGTERM), or the launcher gone.
+  const handleExternalExit = handleExitRequest
 
-  // A broad `taskkill node.exe` can kill the package's Node launcher without
+  // A broad `taskkill node.exe` can kill the launcher process without
   // killing its Bun child. Polling avoids Bun's Windows behavior of terminating
   // before JavaScript can handle a broken IPC channel or inherited pipe.
   const launcherPid = Number(getCliEnv().CODEBUFF_LAUNCHER_PID)
@@ -266,33 +225,8 @@ export function installProcessCleanupHandlers(cliRenderer: CliRenderer): void {
     launcherMonitor.unref()
   }
 
-  // SIGTERM - Default kill signal (e.g., `kill <pid>`), and the launcher's
-  // update restart. For the latter, keep the Freebuff session the user may
-  // have just paid for so the relaunched binary resumes it.
-  process.on('SIGTERM', () => {
-    if (
-      IS_FREEBUFF &&
-      process.platform !== 'win32' &&
-      isLauncherUpdateTermination({
-        launcherPid,
-        parentPid: process.ppid,
-        isProcessRunning: isProcessRunningSync,
-      })
-    ) {
-      const { session } = useFreebuffSessionStore.getState()
-      useFreebuffSessionStore.getState().keepSlotForRelaunch()
-      if (holdsLiveFreebuffSlot(session)) {
-        logger.info(
-          {
-            metric: 'freebuff_session_kept_for_update_restart',
-            model: session && 'model' in session ? session.model : undefined,
-          },
-          '[freebuff-session] launcher update restart; keeping the session for the relaunch',
-        )
-      }
-    }
-    handleExternalExit()
-  })
+  // SIGTERM - Default kill signal (e.g., `kill <pid>`)
+  process.on('SIGTERM', handleExternalExit)
 
   // SIGHUP - Terminal hangup (e.g., closing the terminal window)
   process.on('SIGHUP', handleExternalExit)

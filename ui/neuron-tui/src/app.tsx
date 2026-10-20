@@ -1,36 +1,28 @@
-import { isRetryableStatusCode, getErrorStatusCode } from '@codebuff/sdk'
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
+// Codebuff login modal and auth queries, BYOK selection, and the Freebuff
+// model catalog and session gate are gone. Sign-in comes from the engine (P3).
+// See ui/neuron-tui/PORTING.md.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useShallow } from 'zustand/react/shallow'
 
 import { Chat } from './chat'
 import { ChatHistoryScreen } from './components/chat-history-screen'
 import { ChatRuntimeProvider } from './contexts/chat-runtime-context'
-import { LoginModal } from './components/login-modal'
 import { ProjectPickerScreen } from './components/project-picker-screen'
-import { useAuthQuery } from './hooks/use-auth-query'
-import { useAuthState } from './hooks/use-auth-state'
-import { useFreebuffModelCatalog } from './hooks/use-freebuff-model-catalog'
-import { useFreebuffSession } from './hooks/use-freebuff-session'
 import { useTerminalFocus } from './hooks/use-terminal-focus'
 import { getProjectRoot, startNewChat } from './project-files'
 import { useChatHistoryStore } from './state/chat-history-store'
 import { stopActiveRun } from './utils/active-run'
 import { useChatStore } from './state/chat-store'
 import type { TopBannerType } from './types/store'
-import { IS_FREEBUFF } from './utils/constants'
-import { useByokSelectionStore } from './utils/byok'
 import { findGitRoot } from './utils/git'
 
 import type { MultilineInputHandle } from './components/multiline-input'
 import type { AgentMode } from './utils/constants'
-import type { AuthStatus } from './utils/status-indicator-state'
 import type { FileTreeNode } from '@codebuff/common/util/file'
 
 interface AppProps {
   initialPrompt: string | null
-  agentId?: string
-  requireAuth: boolean | null
-  hasInvalidCredentials: boolean
   fileTree: FileTreeNode[]
   continueChat: boolean
   continueChatId?: string
@@ -41,9 +33,6 @@ interface AppProps {
 
 export const App = ({
   initialPrompt,
-  agentId,
-  requireAuth,
-  hasInvalidCredentials,
   fileTree,
   continueChat,
   continueChatId,
@@ -51,9 +40,6 @@ export const App = ({
   showProjectPicker,
   onProjectChange,
 }: AppProps) => {
-  const hasSelectedByokConnection = useByokSelectionStore(
-    (state) => state.selected !== undefined,
-  )
   const inputRef = useRef<MultilineInputHandle | null>(null)
   const initialPromptConsumedRef = useRef(false)
   const consumeInitialPrompt = useCallback(() => {
@@ -93,25 +79,6 @@ export const App = ({
   useTerminalFocus({
     onFocusChange: setInputFocused,
     onSupportDetected: handleSupportDetected,
-  })
-
-  // Get auth query for network status tracking
-  const authQuery = useAuthQuery({
-    enabled: !(IS_FREEBUFF && hasSelectedByokConnection),
-  })
-
-  const {
-    isAuthenticated,
-    setIsAuthenticated,
-    setUser,
-    handleLoginSuccess,
-    logoutMutation,
-  } = useAuthState({
-    requireAuth,
-    skipAuth: IS_FREEBUFF && hasSelectedByokConnection,
-    inputRef,
-    setInputFocused,
-    resetChatStore,
   })
 
   const projectRoot = getProjectRoot()
@@ -200,50 +167,12 @@ export const App = ({
   const effectiveContinueChat = continueRequested
   const effectiveContinueChatId = resumeChatId ?? continueChatId
 
-  // Derive auth reachability + retrying state from authQuery error
-  const authError = authQuery.error
-  const authErrorStatusCode = authError
-    ? getErrorStatusCode(authError)
-    : undefined
-
-  let authStatus: AuthStatus = 'ok'
-  if (authQuery.isError && authErrorStatusCode !== undefined) {
-    if (isRetryableStatusCode(authErrorStatusCode)) {
-      // Retryable errors (408 timeout, 429 rate limit, 5xx server errors)
-      authStatus = 'retrying'
-    } else if (authErrorStatusCode >= 500) {
-      // Non-retryable server errors (unlikely but possible future codes)
-      authStatus = 'unreachable'
-    }
-    // 4xx client errors (401, 403, etc.) keep 'ok' - network is fine, just auth failed
-  }
-
   // Render project picker FIRST when at home directory or outside a project.
-  // This deliberately precedes the login/auth and free-session gates so the
-  // user always gets to pick a working directory before anything else — auth
-  // failures or a banned freebuff session would otherwise replace the
-  // picker mid-flash and look like being kicked out of the app.
   if (showProjectPicker) {
     return (
       <ProjectPickerScreen
         onSelectProject={onProjectChange}
         initialPath={projectRoot}
-      />
-    )
-  }
-
-  // Render login modal when not authenticated AND auth service is reachable
-  // Don't show login modal during network outages OR while retrying
-  if (
-    requireAuth !== null &&
-    isAuthenticated === false &&
-    !(IS_FREEBUFF && hasSelectedByokConnection) &&
-    authStatus === 'ok'
-  ) {
-    return (
-      <LoginModal
-        onLoginSuccess={handleLoginSuccess}
-        hasInvalidCredentials={hasInvalidCredentials}
       />
     )
   }
@@ -254,15 +183,10 @@ export const App = ({
     <AuthedSurface
       runtimeKey={chatSessionId}
       consumeInitialPrompt={consumeInitialPrompt}
-      agentId={agentId}
       fileTree={fileTree}
       inputRef={inputRef}
-      setIsAuthenticated={setIsAuthenticated}
-      setUser={setUser}
-      logoutMutation={logoutMutation}
       continueChat={effectiveContinueChat}
       continueChatId={effectiveContinueChatId}
-      authStatus={authStatus}
       initialMode={initialMode}
       gitRoot={gitRoot}
       onSwitchToGitRoot={handleSwitchToGitRoot}
@@ -277,17 +201,10 @@ export const App = ({
 interface AuthedSurfaceProps {
   runtimeKey: string
   consumeInitialPrompt: () => string | null
-  agentId?: string
   fileTree: FileTreeNode[]
   inputRef: React.MutableRefObject<MultilineInputHandle | null>
-  setIsAuthenticated: React.Dispatch<React.SetStateAction<boolean | null>>
-  setUser: React.Dispatch<
-    React.SetStateAction<import('./utils/auth').User | null>
-  >
-  logoutMutation: ReturnType<typeof useAuthState>['logoutMutation']
   continueChat: boolean
   continueChatId: string | undefined
-  authStatus: AuthStatus
   initialMode: AgentMode | undefined
   gitRoot: string | null | undefined
   onSwitchToGitRoot: () => void
@@ -297,35 +214,16 @@ interface AuthedSurfaceProps {
   onNewChat: () => void
 }
 
-/**
- * Rendered only after auth is confirmed. Owns the freebuff session gate
- * so `useFreebuffSession` runs exactly once per authed session (not before
- * we have a token).
- */
+/** Owns the chat runtime for one chat identity. */
 const AuthedSurface = (props: AuthedSurfaceProps) => {
-  const hasSelectedByokConnection = useByokSelectionStore(
-    (state) => state.selected !== undefined,
-  )
-  // Before the session: its first request waits for the first catalog.
-  useFreebuffModelCatalog({ enabled: !hasSelectedByokConnection })
-  const { session, lastRefund, refundPending } = useFreebuffSession({
-    enabled: !hasSelectedByokConnection,
-  })
-
   return (
     <ChatRuntimeProvider
       key={props.runtimeKey}
-      agentId={props.agentId}
       inputRef={props.inputRef}
       continueChat={props.continueChat}
       continueChatId={props.continueChatId}
     >
-      <AuthedSurfaceRoutes
-        {...props}
-        session={session}
-        lastRefund={lastRefund}
-        refundPending={refundPending}
-      />
+      <AuthedSurfaceRoutes {...props} />
     </ChatRuntimeProvider>
   )
 }
@@ -334,10 +232,6 @@ export const AuthedSurfaceRoutes = ({
   consumeInitialPrompt,
   fileTree,
   inputRef,
-  setIsAuthenticated,
-  setUser,
-  logoutMutation,
-  authStatus,
   initialMode,
   gitRoot,
   onSwitchToGitRoot,
@@ -345,16 +239,9 @@ export const AuthedSurfaceRoutes = ({
   onSelectChat,
   onCancelChatHistory,
   onNewChat,
-  session,
-  lastRefund,
-  refundPending,
-}: AuthedSurfaceProps & {
-  session: ReturnType<typeof useFreebuffSession>['session']
-  lastRefund: ReturnType<typeof useFreebuffSession>['lastRefund']
-  refundPending: boolean
-}) => {
-  // Local history is readable independently of model admission. Keep this
-  // inside the runtime so browsing never tears down a running session.
+}: AuthedSurfaceProps) => {
+  // Keep history inside the runtime so browsing never tears down a running
+  // session.
   if (showChatHistory) {
     return (
       <ChatHistoryScreen
@@ -370,16 +257,9 @@ export const AuthedSurfaceRoutes = ({
       consumeInitialPrompt={consumeInitialPrompt}
       fileTree={fileTree}
       inputRef={inputRef}
-      setIsAuthenticated={setIsAuthenticated}
-      setUser={setUser}
-      logoutMutation={logoutMutation}
-      authStatus={authStatus}
       initialMode={initialMode}
       gitRoot={gitRoot}
       onSwitchToGitRoot={onSwitchToGitRoot}
-      freebuffSession={session}
-      freebuffLastRefund={lastRefund}
-      freebuffRefundPending={refundPending}
     />
   )
 }

@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the fixture
+// spawns the bun running the test (NEURON_TUI_TEST_BUN). See ui/neuron-tui/PORTING.md.
 const { spawn, spawnSync } = require('child_process')
 const { existsSync, readFileSync, rmSync } = require('fs')
 const { tmpdir } = require('os')
@@ -59,8 +61,10 @@ if (mode === 'launch') {
   const launcher = spawn(process.execPath, [__filename, 'launch'], {
     stdio: 'inherit',
   })
+  // This fixture runs under node, so the test hands over the bun that runs
+  // it: a bare 'bun' cannot be spawned where bun is installed as a .cmd shim.
   const cli = spawn(
-    'bun',
+    process.env.NEURON_TUI_TEST_BUN || 'bun',
     [
       rendererFixture,
       'launcher-disconnect',

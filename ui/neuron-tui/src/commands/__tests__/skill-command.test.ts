@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 
 import { useChatStore } from '../../state/chat-store'
@@ -27,7 +29,6 @@ const createMockParams = (overrides: Partial<RouterParams> = {}): RouterParams =
     inputValue: '',
     isChainInProgressRef: { current: false },
     isStreaming: false,
-    logoutMutation: {} as RouterParams['logoutMutation'],
     streamMessageIdRef: { current: null },
     addToQueue: mock(() => {}),
     clearMessages: mock(() => {}),
@@ -37,9 +38,7 @@ const createMockParams = (overrides: Partial<RouterParams> = {}): RouterParams =
     setCanProcessQueue: mock(() => {}),
     setInputFocused: mock(() => {}),
     setInputValue: mock(() => {}),
-    setIsAuthenticated: mock(() => {}),
     setMessages: mock(() => {}),
-    setUser: mock(() => {}),
     ...overrides,
   }) as RouterParams
 

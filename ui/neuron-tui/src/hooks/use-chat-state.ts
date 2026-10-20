@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 /**
  * Extracted chat state management hook.
  * Encapsulates view-facing Zustand subscriptions and derived state.
@@ -52,7 +54,6 @@ export interface UseChatStateReturn {
 
   // Retry state
   isRetrying: boolean
-  isCapacityWait: boolean
 
   // Pending bash messages
   pendingBashMessages: PendingBashMessage[]
@@ -86,7 +87,6 @@ export function useChatState(): UseChatStateReturn {
     setAgentMode,
     toggleAgentMode,
     isRetrying,
-    isCapacityWait,
   } = useChatStore(
     useShallow((store) => ({
       inputValue: store.inputValue,
@@ -108,7 +108,6 @@ export function useChatState(): UseChatStateReturn {
       setAgentMode: store.setAgentMode,
       toggleAgentMode: store.toggleAgentMode,
       isRetrying: store.isRetrying,
-      isCapacityWait: store.isCapacityWait,
     })),
   )
 
@@ -157,7 +156,6 @@ export function useChatState(): UseChatStateReturn {
 
     // Retry state
     isRetrying,
-    isCapacityWait,
 
     // Pending bash messages
     pendingBashMessages,
