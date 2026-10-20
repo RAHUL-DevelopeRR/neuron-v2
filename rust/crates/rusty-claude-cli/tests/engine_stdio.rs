@@ -258,6 +258,10 @@ fn stdio_engine_runs_turns_over_json_lines() {
     assert_eq!(status["model"], "claude-sonnet-4-6");
     assert_eq!(status["permission_mode"], "workspace-write");
     assert_eq!(status["signed_in"], false, "no Zero-X login: {status}");
+    assert_eq!(
+        status["sign_in_required"], false,
+        "an Anthropic key needs none"
+    );
     assert_eq!(status["account"], Value::Null);
 
     // A line that is not a message is skipped with a notice; the engine keeps going.
@@ -496,6 +500,8 @@ fn stdio_engine_signs_in_from_the_ui() {
     assert_eq!(engine.next()["type"], "ready");
     let status = engine.next_of("status");
     assert_eq!(status["signed_in"], false, "{status}");
+    assert_eq!(status["sign_in_required"], true, "{status}");
+    assert_eq!(status["session_id"], "");
     assert_eq!(status["account"], Value::Null);
 
     // Prompts wait for the sign-in; so do commands that need a session.
@@ -540,7 +546,10 @@ fn stdio_engine_signs_in_from_the_ui() {
     let signing_in = engine.until("turn_finished");
     assert_eq!(
         main_events(&signing_in),
-        vec![json!({"type": "turn_finished"})],
+        vec![
+            json!({"type": "session_starting"}),
+            json!({"type": "turn_finished"}),
+        ],
         "{signing_in:?}"
     );
     assert!(
@@ -551,6 +560,7 @@ fn stdio_engine_signs_in_from_the_ui() {
     );
     let status = engine.next_of("status");
     assert_eq!(status["signed_in"], true, "{status}");
+    assert_eq!(status["sign_in_required"], false, "{status}");
     assert_eq!(status["account"]["email"], EMAIL);
     assert_eq!(status["account"]["plan"], "pro");
     assert!(
@@ -597,6 +607,10 @@ fn stdio_engine_signs_in_from_the_ui() {
     );
     let status = engine.next_of("status");
     assert_eq!(status["signed_in"], false, "{status}");
+    assert_eq!(
+        status["sign_in_required"], true,
+        "the gateway session needs a login again: {status}"
+    );
     assert_eq!(status["account"], Value::Null);
 
     engine.end_input();

@@ -283,11 +283,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some("auth") => return auth::run_auth_command(&args[1..]),
         Some("usage") => return account::run_usage_command(&args[1..]),
         Some("upgrade") => return account::run_upgrade_command(&args[1..]),
-        // Hidden: the engine for a UI in another process, as JSON lines.
-        Some("engine") if engine_stdio::wants_stdio_engine(&args[1..]) => {
-            return engine_stdio::run_engine_command(&args[1..]);
-        }
         _ => {}
+    }
+    // Hidden: the engine for a UI in another process, as JSON lines.
+    if let Some(engine_args) = engine_stdio::stdio_engine_args(&args) {
+        return engine_stdio::run_engine_command(&engine_args);
     }
     match parse_args(&args)? {
         CliAction::DumpManifests {

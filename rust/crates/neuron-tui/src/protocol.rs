@@ -100,12 +100,21 @@ pub enum UiEvent {
         /// `None` outside a git repository.
         git: Option<GitStatus>,
         /// A usable Zero-X login: `NEURON_TOKEN`, or a stored session that has not expired.
+        /// Other providers do not need one, so this alone says nothing about the session.
         #[serde(default)]
         signed_in: bool,
+        /// The session cannot run until the user signs in to Zero-X (`/login`): the engine
+        /// started signed out, or the session is on Zero-X and has no usable login.
+        #[serde(default)]
+        sign_in_required: bool,
         /// The login, also when its session expired; `None` when there is none.
         #[serde(default)]
         account: Option<AccountInfo>,
     },
+    /// After a sign-in from the signed-out start: the engine is opening the session
+    /// (plugins, MCP servers), which can take a while. `TurnFinished` and a `Status` with
+    /// the session follow, or an `Error`.
+    SessionStarting,
     /// `/login` started a device sign-in: open `url` (or `url_complete`, which has the code
     /// filled in) and enter `user_code`. The engine waits for the approval; an interrupt
     /// cancels it. A notice and a `Status` follow when it is done, then `TurnFinished`.
@@ -297,6 +306,7 @@ mod tests {
             status,
             UiEvent::Status {
                 signed_in: false,
+                sign_in_required: false,
                 account: None,
                 ..
             }

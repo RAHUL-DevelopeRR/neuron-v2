@@ -23,10 +23,24 @@ use std::io::{BufRead, BufReader};
 const USAGE: &str = "usage: neuron engine --stdio [--model MODEL] [--permission-mode MODE] \
 [--allowedTools TOOLS] [--reasoning-effort low|medium|high] [--resume SESSION] [--allow-broad-cwd]";
 
-/// Whether `args` (after `engine`) ask for the stdio engine. Anything else is left to the
-/// usual parsing, where `neuron engine ...` is a prompt.
-pub(crate) fn wants_stdio_engine(args: &[String]) -> bool {
-    args.iter().any(|arg| arg == "--stdio")
+/// The stdio engine's flags when `args` ask for it: `[flags] engine [flags]` with
+/// `--stdio` among them, so the engine's flags may come before `engine` as global options
+/// do. `None` leaves `args` to the usual parsing, where `neuron engine ...` is a prompt
+/// (`neuron fix the engine --stdio flag` is one).
+pub(crate) fn stdio_engine_args(args: &[String]) -> Option<Vec<String>> {
+    args.iter()
+        .enumerate()
+        .filter(|(_, arg)| *arg == "engine")
+        .find_map(|(position, _)| {
+            let before = &args[..position];
+            parse_flags(before).ok()?;
+            let flags = before
+                .iter()
+                .chain(&args[position + 1..])
+                .cloned()
+                .collect::<Vec<_>>();
+            flags.iter().any(|flag| flag == "--stdio").then_some(flags)
+        })
 }
 
 /// Runs the stdio engine until its input ends.
@@ -65,6 +79,14 @@ struct EngineArgs {
 }
 
 fn parse_engine_args(args: &[String]) -> Result<EngineArgs, String> {
+    let parsed = parse_flags(args)?;
+    if !parsed.stdio {
+        return Err(format!("`neuron engine` needs --stdio\n{USAGE}"));
+    }
+    Ok(parsed)
+}
+
+fn parse_flags(args: &[String]) -> Result<EngineArgs, String> {
     let mut parsed = EngineArgs::default();
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
@@ -106,9 +128,6 @@ fn parse_engine_args(args: &[String]) -> Result<EngineArgs, String> {
                 ))
             }
         }
-    }
-    if !parsed.stdio {
-        return Err(format!("`neuron engine` needs --stdio\n{USAGE}"));
     }
     Ok(parsed)
 }
@@ -227,7 +246,7 @@ fn write_event(output: &mut impl Write, event: &UiEvent) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_engine_args, read_messages, write_event, EngineArgs};
+    use super::{parse_engine_args, read_messages, stdio_engine_args, write_event, EngineArgs};
     use neuron_tui::protocol::{EngineCommand, PermissionDecision, PermissionReply, UiEvent};
     use runtime::PermissionMode;
     use std::sync::mpsc;
@@ -280,6 +299,26 @@ mod tests {
             let error = parse_engine_args(&args(bad)).expect_err("rejected");
             assert!(error.contains(why), "{bad:?}: {error}");
         }
+    }
+
+    /// The engine's flags may come before `engine`; a prompt that mentions it stays a
+    /// prompt.
+    #[test]
+    fn finds_the_engine_with_its_flags_on_either_side() {
+        let engine = |values: &[&str]| stdio_engine_args(&args(values));
+        assert_eq!(engine(&["engine", "--stdio"]), Some(args(&["--stdio"])));
+        assert_eq!(
+            engine(&["--model", "opus", "engine", "--stdio", "--allow-broad-cwd"]),
+            Some(args(&["--model", "opus", "--stdio", "--allow-broad-cwd"]))
+        );
+        assert_eq!(
+            engine(&["--model", "engine", "engine", "--stdio"]),
+            Some(args(&["--model", "engine", "--stdio"])),
+            "a model named engine is a value, not the subcommand"
+        );
+        assert_eq!(engine(&["fix", "the", "engine", "--stdio", "flag"]), None);
+        assert_eq!(engine(&["engine", "is", "slow"]), None);
+        assert_eq!(engine(&["--model", "opus", "explain", "this"]), None);
     }
 
     #[test]

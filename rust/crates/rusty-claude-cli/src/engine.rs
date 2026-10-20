@@ -209,6 +209,7 @@ fn run_engine(
             return EngineExit::Shutdown;
         };
         signed_out.options.model = model;
+        signed_out.send(UiEvent::SessionStarting);
         let (cli, output) = match open_cli(&signed_out.options, events) {
             Ok(opened) => opened,
             Err(message) => {
@@ -352,6 +353,7 @@ impl SignedOut<'_> {
             false,
             0,
             &account,
+            true,
         ));
     }
 
@@ -431,6 +433,7 @@ fn status_event(
     plan_mode: bool,
     context_percent: u32,
     account: &AccountState,
+    sign_in_required: bool,
 ) -> UiEvent {
     let cwd = env::current_dir().unwrap_or_default();
     UiEvent::Status {
@@ -443,6 +446,7 @@ fn status_event(
         plan_mode,
         context_percent,
         signed_in: account.signed_in,
+        sign_in_required,
         account: account.info.clone(),
     }
 }
@@ -1014,6 +1018,9 @@ impl Engine {
     fn send_status(&mut self) {
         let context_percent =
             u32::try_from(self.cli.runtime.context_snapshot().used_percent()).unwrap_or(u32::MAX);
+        // A session on the gateway needs the login; other providers do not.
+        let sign_in_required = !self.account.signed_in
+            && active_provider().is_some_and(|active| active.id == ProviderId::ZeroX);
         let status = status_event(
             &self.cli.model,
             self.cli.permission_mode,
@@ -1021,6 +1028,7 @@ impl Engine {
             self.cli.plan_mode,
             context_percent,
             &self.account,
+            sign_in_required,
         );
         self.send(status);
     }
@@ -1576,6 +1584,7 @@ mod tests {
                 plan_mode: false,
                 git: Some(git),
                 signed_in: false,
+                sign_in_required: false,
                 account: None,
                 ..
             } => {
