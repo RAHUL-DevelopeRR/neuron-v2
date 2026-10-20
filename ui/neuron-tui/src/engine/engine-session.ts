@@ -47,6 +47,10 @@ export function handleEngineEvent(event: UiEvent): void {
     case 'sign_in_code':
       engine.setSignIn(event)
       return
+    case 'session_starting':
+      // The sign-in worked; the panel says the session is starting.
+      engine.markSignInApproved()
+      return
     case 'models':
       engine.setModels(event)
       return
@@ -58,7 +62,7 @@ export function handleEngineEvent(event: UiEvent): void {
       return
     case 'notice':
       // During a sign-in the only notice is its success ("Signed in to
-      // Zero-X ..."); the engine then opens the session, which takes a while.
+      // Zero-X ..."), so engines without `session_starting` are read from it.
       if (engine.signIn && !engine.signIn.approved) engine.markSignInApproved()
       if (event.message.startsWith(QUESTION_PREFIX)) {
         engine.setPendingQuestion(event.message)

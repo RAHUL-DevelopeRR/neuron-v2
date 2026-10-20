@@ -59,8 +59,8 @@ rewritten for what remains:
 | `src/engine/engine-session.ts` | P2: starts the engine in the project folder at launch, or after the project picker. It restarts it on a project switch, and resumes the saved engine session with `--continue`. It routes events that belong to no turn into the stores: `ready`, `status`, `usage`, `models`, permission requests, notices (an `AskUserQuestion` notice waits for the next submit), and errors outside a turn. A prompt sent while the engine boots waits for the start (`whenEngineStarted`). |
 | `src/engine/turn-events.ts` | P2: feeds a turn's events into Freebuff's handlers (`createStreamChunkHandler`/`createEventHandler`). `text_delta` becomes text; `reasoning_delta` becomes a reasoning chunk. Tool calls and results become `tool_call`/`tool_result` blocks. A result is matched to its call by `id`. Engines before the sign-in work sent no `id`; for those, results are matched first-in-first-out by tool name. A call left without a result (those engines sent none for a denied call) is closed at `turn_finished`. |
 | `src/engine/tool-mapping.ts` | P2: Neuron tool names and inputs mapped onto Freebuff's renderers: `bash`/`PowerShell`→`run_terminal_command`, `read_file`→`read_files`, `write_file`, `edit_file`→`str_replace`, `glob_search`→`glob`, `grep_search`→`code_search`, `WebFetch`→`read_url`, `WebSearch`→`web_search`, `TodoWrite`→`write_todos`, `Skill`→`skill`. The engine's JSON tool outputs become what those renderers read. Windows `\\?\` path prefixes are stripped for display. Other tools keep their name and input. |
-| `src/state/engine-store.ts` | P2: connection state, engine version, last `status` (model, mode, session, git, context %, Zero-X login), `usage`, `models`, the permission queue and a pending question. P3 adds the device code of a `/login` in progress, and `needsSignIn()`. The engine's signed-out stage is a `status` with `signed_in: false` and no session id; an API-key provider also has `signed_in: false`, but it has a session. |
-| `src/components/sign-in-panel.tsx` | P3: above the input. In the signed-out stage it says to type `/login`. During a `/login` it shows the link, the code and a countdown, and Esc cancels (an engine interrupt). After approval it says "Starting your session…" until the engine's session is up. The engine opens the browser and keeps the token; the UI only sees the code. |
+| `src/state/engine-store.ts` | P2: connection state, engine version, last `status` (model, mode, session, git, context %, Zero-X login), `usage`, `models`, the permission queue and a pending question. P3 adds the device code of a `/login` in progress, and `needsSignIn()`. The engine's signed-out stage is a `status` with `signed_in: false` and no session id; an API-key provider also has `signed_in: false`, but it has a session. Engines that send `status.sign_in_required` decide it directly. |
+| `src/components/sign-in-panel.tsx` | P3: above the input. In the signed-out stage it says to type `/login`. During a `/login` it shows the link, the code and a countdown, and Esc cancels (an engine interrupt). After approval (the `session_starting` event, or the success notice from engines without it) it says "Starting your session…" until the engine's session is up. The engine opens the browser and keeps the token; the UI only sees the code. |
 | `src/components/model-picker.tsx` | P3: `/model` lists the engine's catalog (`list_models`, refreshed every 30 s while open; only the Zero-X gateway has one). Unavailable models are greyed with the reason and can't be picked. `/model <name>` switches without it. |
 | `src/components/engine-footer.tsx` | P3: one line under the input: model, permission mode (and plan mode), an untrusted-folder warning, git branch and counts, ↑/↓ tokens for the session, context %, and the Zero-X plan or an expired login. Parts that don't fit are dropped from the end. |
 | `src/engine/attachments.ts` | P3: images go to the engine as `Submit.attachments`. Before, they were dropped and only "See attached image(s)" was sent. Files, folders and pasted text stay inlined into the prompt as Freebuff did, because the engine would only list their paths. |
@@ -238,9 +238,11 @@ blocked.
     the command line. I could not type into the terminal: keyboard input, the
     permission keys and Ctrl-C exit in a real Windows terminal are covered only
     by unit tests so far.
-  - Some launch checks (a too-broad folder, bad flags) print `error: ...` on
-    stderr and exit without the `error` event the protocol promises. The client
-    falls back to that line.
+  - A launch refusal (a too-broad folder) arrives as the protocol's `error`
+    event on stdout, and the client reads stdout to its end before it handles
+    the exit. An older engine build seemed to print it only on stderr. The client
+    still falls back to the last `error:` stderr line, in case an event never
+    comes.
   - In a folder under a git repo, Freebuff's banner offers to switch to the git
     root, even when that root is the home folder, which the engine then refuses
     as too broad.

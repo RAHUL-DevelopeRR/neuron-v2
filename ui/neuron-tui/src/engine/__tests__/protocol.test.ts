@@ -133,6 +133,7 @@ describe('UI events (engine -> UI)', () => {
       ready: true,
       status: true,
       sign_in_code: true,
+      session_starting: true,
       models: true,
       text_delta: true,
       text_block_end: true,

@@ -53,12 +53,15 @@ export interface EngineStoreState {
 }
 
 /**
- * The engine runs but has no session until a Zero-X sign-in: its signed-out
- * stage reports `signed_in: false` with no session id. (A provider with its
- * own API key is also not signed in to Zero-X, but it has a session.)
+ * Prompts need a Zero-X sign-in first. Engines that send `sign_in_required`
+ * say so. Older ones are read from their signed-out stage: `signed_in: false`
+ * with no session id (a provider with its own API key is also not signed in
+ * to Zero-X, but it has a session).
  */
 export function needsSignIn(status: StatusEvent | null): boolean {
-  return status !== null && status.signed_in === false && status.session_id === ''
+  if (status === null) return false
+  if (status.sign_in_required !== undefined) return status.sign_in_required
+  return status.signed_in === false && status.session_id === ''
 }
 
 const initial = {

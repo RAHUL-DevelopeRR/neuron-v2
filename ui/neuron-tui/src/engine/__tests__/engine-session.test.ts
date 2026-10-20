@@ -108,6 +108,22 @@ describe('sign-in', () => {
     browser_opened: true,
   }
 
+  test('sign_in_required decides when the engine sends it', () => {
+    expect(needsSignIn({ ...STATUS, signed_in: false, sign_in_required: true })).toBe(true)
+    // A Zero-X session after /logout still has its session id.
+    expect(needsSignIn({ ...STATUS, session_id: 'session-1', sign_in_required: true })).toBe(true)
+    // Even the old signed-out shape follows the explicit field.
+    expect(needsSignIn({ ...SIGNED_OUT, sign_in_required: false })).toBe(false)
+  })
+
+  test('session_starting marks the sign-in approved', () => {
+    handleEngineEvent(CODE)
+    handleEngineEvent({ type: 'session_starting' })
+    expect(useEngineStore.getState().signIn?.approved).toBe(true)
+    handleEngineEvent({ type: 'turn_finished' })
+    expect(useEngineStore.getState().signIn).toBeNull()
+  })
+
   test('only the signed-out stage needs a sign-in', () => {
     expect(needsSignIn(SIGNED_OUT)).toBe(true)
     // An API-key provider is not signed in to Zero-X, but has a session.

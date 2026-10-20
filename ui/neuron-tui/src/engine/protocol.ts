@@ -109,6 +109,21 @@ export interface StatusEvent {
   signed_in?: boolean
   /** The login, also when its session expired; `null` when there is none. */
   account?: AccountInfo | null
+  /**
+   * Prompts need a Zero-X sign-in first: the engine's signed-out stage, or a
+   * Zero-X session without a usable login (after `/logout`). False for a
+   * provider with its own API key. Absent from engines before it.
+   */
+  sign_in_required?: boolean
+}
+
+/**
+ * After a successful `/login` from the signed-out stage, right before the
+ * engine opens the session (which starts MCP servers and can take a while).
+ * `turn_finished` and a `status` follow, or an `error`.
+ */
+export interface SessionStartingEvent {
+  type: 'session_starting'
 }
 
 /**
@@ -227,6 +242,7 @@ export type UiEvent =
   | ReadyEvent
   | StatusEvent
   | SignInCodeEvent
+  | SessionStartingEvent
   | ModelsEvent
   | TextDeltaEvent
   | TextBlockEndEvent
@@ -247,6 +263,7 @@ export const UI_EVENT_TYPES: readonly UiEventType[] = [
   'ready',
   'status',
   'sign_in_code',
+  'session_starting',
   'models',
   'text_delta',
   'text_block_end',
