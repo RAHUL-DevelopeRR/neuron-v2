@@ -1,0 +1,140 @@
+/**
+ * The UI's one engine: started for the chosen project folder, restarted when
+ * the folder changes, shut down on exit. Every event it sends outside a turn's
+ * transcript lands here: footer status, models, usage, permission requests,
+ * notices (shown as system lines) and errors that belong to no turn.
+ */
+
+import { useChatStore } from '../state/chat-store'
+import { useEngineStore } from '../state/engine-store'
+import { logger } from '../utils/logger'
+import { getSystemMessage } from '../utils/message-history'
+import {
+  getNeuronEngineClient,
+  setNeuronEngineClient,
+  type EngineLaunchOptions,
+} from './neuron-engine-client'
+import { StdioEngineClient } from './stdio-engine-client'
+
+import type { UiEvent } from './protocol'
+
+/** AskUserQuestion reaches the UI as a notice with this prefix. */
+export const QUESTION_PREFIX = 'Question:'
+
+let turnActive = false
+
+/** While a turn runs, its own error is shown on its message instead. */
+export function setEngineTurnActive(active: boolean): void {
+  turnActive = active
+}
+
+function showSystemMessage(text: string): void {
+  useChatStore
+    .getState()
+    .setMessages((prev) => [...prev, getSystemMessage(text)])
+}
+
+export function handleEngineEvent(event: UiEvent): void {
+  const engine = useEngineStore.getState()
+  switch (event.type) {
+    case 'ready':
+      engine.setReady(event.version)
+      return
+    case 'status':
+      engine.setStatus(event)
+      return
+    case 'models':
+      engine.setModels(event)
+      return
+    case 'usage':
+      engine.setUsage(event)
+      return
+    case 'permission_requested':
+      engine.enqueuePermission(event)
+      return
+    case 'notice':
+      if (event.message.startsWith(QUESTION_PREFIX)) {
+        engine.setPendingQuestion(event.message)
+      }
+      showSystemMessage(event.message)
+      return
+    case 'error':
+      if (!turnActive && engine.connection === 'ready') {
+        showSystemMessage(`Error: ${event.message}`)
+      }
+      return
+    case 'turn_finished':
+      // Nothing waits for an answer once the turn is over.
+      engine.clearPermissions()
+      engine.setPendingQuestion(null)
+      return
+    default:
+      return
+  }
+}
+
+let pendingStart: Promise<void> | null = null
+
+/**
+ * Starts (or restarts) the engine in `launch.cwd`. Never throws: a failed
+ * start is recorded in the engine store and shown in the chat.
+ */
+export function startEngineSession(launch: EngineLaunchOptions): Promise<void> {
+  const start = launchEngineSession(launch)
+  pendingStart = start
+  void start.finally(() => {
+    if (pendingStart === start) pendingStart = null
+  })
+  return start
+}
+
+/**
+ * Resolves once a start in progress has finished, ready or failed, so a
+ * prompt sent while the engine boots (`neuron "fix it"`) waits for it.
+ */
+export function whenEngineStarted(): Promise<void> {
+  return pendingStart ?? Promise.resolve()
+}
+
+async function launchEngineSession(launch: EngineLaunchOptions): Promise<void> {
+  const previous = getNeuronEngineClient()
+  if (previous.connection === 'ready' || previous.connection === 'starting') {
+    await previous.shutdown().catch(() => undefined)
+  }
+
+  const client = new StdioEngineClient({
+    onStderr: (line) => logger.debug({ line }, '[engine] stderr'),
+    onUnknownLine: (line, reason) =>
+      logger.warn({ reason, line: line.slice(0, 500) }, '[engine] unexpected stdout line'),
+  })
+  setNeuronEngineClient(client)
+  const engine = useEngineStore.getState()
+  engine.reset()
+  engine.setConnection('starting', null)
+
+  client.subscribe(handleEngineEvent)
+  client.onExit((exit) => {
+    if (getNeuronEngineClient() !== client) return
+    const wasReady = useEngineStore.getState().connection === 'ready'
+    const reason =
+      client.lastError ?? `The Neuron engine stopped (exit code ${exit.code}).`
+    useEngineStore.getState().setConnection('exited', reason)
+    // A failed start is reported by the catch below; this is a later stop.
+    if (wasReady && exit.code !== 0) showSystemMessage(reason)
+  })
+
+  try {
+    await client.start(launch)
+  } catch (error) {
+    if (getNeuronEngineClient() !== client) return
+    const message = error instanceof Error ? error.message : String(error)
+    useEngineStore.getState().setConnection('exited', message)
+    showSystemMessage(message)
+  }
+}
+
+export async function stopEngineSession(): Promise<void> {
+  await getNeuronEngineClient()
+    .shutdown()
+    .catch(() => undefined)
+}

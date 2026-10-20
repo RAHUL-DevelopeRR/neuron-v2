@@ -12,8 +12,10 @@ import {
   buildPlanPrompt,
   buildReviewPrompt,
 } from './prompt-builders'
+import { getNeuronEngineClient, runExchange } from '../engine/neuron-engine-client'
 import { getProjectRoot } from '../project-files'
 import { useChatStore } from '../state/chat-store'
+import { useEngineStore } from '../state/engine-store'
 import {
   buildBashHistoryMessages,
   createRunTerminalToolResult,
@@ -382,6 +384,44 @@ export async function routeUserPrompt(
   saveToHistory(trimmed)
   setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false })
 
+  const engine = getNeuronEngineClient()
+  const engineReady = engine.connection === 'ready'
+
+  // A slash command the UI does not have is the engine's (/compact, /status,
+  // /model, /permissions, ...). It runs after any turn in progress, and its
+  // report comes back as a notice.
+  if (isSlashCommand(trimmed) && engineReady) {
+    const [command = '', ...args] = trimmed.slice(1).trim().split(/\s+/)
+    setMessages((prev) => [...prev, getUserMessage(trimmed)])
+    runExchange(engine, () => engine.slash(command, args.join(' ')), () => {}).catch(
+      (error) =>
+        setMessages((prev) => [
+          ...prev,
+          getSystemMessage(error instanceof Error ? error.message : String(error)),
+        ]),
+    )
+    return
+  }
+
+  // The engine asked a question (AskUserQuestion) and takes the next submit
+  // as its answer, even while the turn is still running.
+  const pendingQuestion = useEngineStore.getState().pendingQuestion
+  if (pendingQuestion && engineReady && trimmed) {
+    useEngineStore.getState().setPendingQuestion(null)
+    setMessages((prev) => [...prev, getUserMessage(trimmed)])
+    try {
+      engine.submit(trimmed)
+    } catch (error) {
+      setMessages((prev) => [
+        ...prev,
+        getSystemMessage(error instanceof Error ? error.message : String(error)),
+      ])
+    }
+    setInputFocused(true)
+    inputRef.current?.focus()
+    return
+  }
+
   if (
     isStreaming ||
     streamMessageIdRef.current ||
@@ -425,7 +465,7 @@ export async function routeUserPrompt(
     return
   }
 
-  // Unknown slash command - show error
+  // Unknown slash command and no engine to run it - show error
   if (isSlashCommand(trimmed)) {
     setMessages((prev) => [
       ...prev,

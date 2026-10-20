@@ -12,14 +12,17 @@ import { randomUUID } from 'node:crypto'
 
 import { useCallback, useEffect, useRef } from 'react'
 
+import { setEngineTurnActive, whenEngineStarted } from '../engine/engine-session'
 import {
   getNeuronEngineClient,
   runTurn,
   type NeuronEngineClient,
 } from '../engine/neuron-engine-client'
+import { createTurnEventSink } from '../engine/turn-events'
 import { setCurrentChatId } from '../project-files'
 import { createStreamController } from './stream-state'
 import { useChatStore } from '../state/chat-store'
+import { useEngineStore } from '../state/engine-store'
 import { createEventHandlerState } from '../utils/create-event-handler-state'
 import { logger } from '../utils/logger'
 import { clearActiveRun, registerActiveRun } from '../utils/active-run'
@@ -444,6 +447,7 @@ export const useSendMessage = ({
         runChatDir,
       )
 
+      let turnSink: ReturnType<typeof createTurnEventSink> | null = null
       try {
         const promptWithBashContext = bashContextForPrompt
           ? bashContextForPrompt + finalContent
@@ -453,9 +457,8 @@ export const useSendMessage = ({
           messageContent,
         )
 
-        // The handler state the chat's renderers read from. P2 maps the
-        // engine's UiEvents onto it (text and reasoning chunks, tool calls and
-        // results, usage) in the onEvent callback below.
+        // The handler state the chat's renderers read from; the turn sink
+        // feeds the engine's events into it.
         const eventHandlerState = createEventHandlerState({
           isActive: () => !abortController.signal.aborted && runChatIsCurrent(),
           streamRefs,
@@ -480,18 +483,29 @@ export const useSendMessage = ({
           },
           '[send-message] Submitting turn to the engine',
         )
-        // P2: attachments go to the engine as Submit.attachments (file,
-        // folder, image paths) instead of being inlined into the prompt.
+        // A prompt sent while the engine boots waits for it.
+        await whenEngineStarted()
+        if (abortController.signal.aborted) {
+          throw new Error('Stopped before the engine was ready')
+        }
+        turnSink = createTurnEventSink(eventHandlerState)
+        const sink = turnSink
+        setEngineTurnActive(true)
+        // Attachments are still inlined into the prompt text (as Freebuff
+        // did); P3 sends them as Submit.attachments.
         const outcome = await runTurn(
           getEngine(),
           { text: effectivePrompt },
-          (_event) => {
-            void eventHandlerState
-          },
+          (event) => sink.handle(event),
         )
+        sink.finish()
 
         const runState: RunState = {
           ...latestRunStateSnapshot,
+          // The engine's session, so `--continue` can resume it.
+          sessionId:
+            useEngineStore.getState().status?.session_id ??
+            latestRunStateSnapshot.sessionId,
           output: outcome.error
             ? { type: 'error', message: outcome.error }
             : { type: 'lastMessage' },
@@ -556,6 +570,8 @@ export const useSendMessage = ({
           logger.debug({ error }, '[send-message] Ignoring error after abort')
         }
       } finally {
+        turnSink?.finish()
+        setEngineTurnActive(false)
         releaseRunOwnership()
         // If this run was aborted, the abort handler already released the chain lock
         // and queue processing state. Don't touch shared state here to avoid

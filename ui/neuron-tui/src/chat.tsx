@@ -2,7 +2,8 @@
 // (display, inline, dock, partner rows), sponsored proposals and runs, the
 // Freebuff session header/controls/footer, BYOK, Codebuff login, credits and
 // subscription banners, feedback, publishing, the profile survey and every
-// analytics event are gone. See ui/neuron-tui/PORTING.md.
+// analytics event are gone. The engine's permission requests open a dialog
+// above the input. See ui/neuron-tui/PORTING.md.
 import { HelpBanner } from './components/help-banner'
 import {
   useCallback,
@@ -22,6 +23,7 @@ import { QueuePanel } from './components/queue-panel'
 import { ReviewScreen } from './components/review-screen'
 import { MessageWithAgents } from './components/message-with-agents'
 import { PendingBashMessage } from './components/pending-bash-message'
+import { PermissionPrompt } from './components/permission-prompt'
 import { StatusBar } from './components/status-bar'
 import {
   SuggestedPrompts,
@@ -48,6 +50,7 @@ import { useSuggestionEngine } from './hooks/use-suggestion-engine'
 import { getProjectRoot } from './project-files'
 import { useChatHistoryStore } from './state/chat-history-store'
 import { useChatStore } from './state/chat-store'
+import { useEngineStore } from './state/engine-store'
 import { useQueuePanelStore } from './state/queue-panel-store'
 import { useReviewStore } from './state/review-store'
 import { useMessageBlockStore } from './state/message-block-store'
@@ -228,6 +231,10 @@ export const Chat = ({
   const inputMode = useChatStore((state) => state.inputMode)
   const setInputMode = useChatStore((state) => state.setInputMode)
   const askUserState = useChatStore((state) => state.askUserState)
+  // A tool call waiting for approval takes the composer's place.
+  const permissionRequest = useEngineStore(
+    (state) => state.permissionQueue[0] ?? null,
+  )
 
   // Get loaded skills for slash commands
   const loadedSkills = useMemo(() => getLoadedSkills(), [])
@@ -1093,6 +1100,7 @@ export const Chat = ({
     // keyboard turns chat's handling off while it is up.
     disabled:
       askUserState !== null ||
+      permissionRequest !== null ||
       reviewMode ||
       queuePanelOpen ||
       todoPanelOpen,
@@ -1197,7 +1205,7 @@ export const Chat = ({
     isConnected,
     showReconnectionMessage,
     isRetrying,
-    isAskUserActive: askUserState !== null,
+    isAskUserActive: askUserState !== null || permissionRequest !== null,
   })
   const hasStatusIndicatorContent = statusIndicatorState.kind !== 'idle'
 
@@ -1310,7 +1318,13 @@ export const Chat = ({
           />
         )}
 
-        {reviewMode ? (
+        {permissionRequest ? (
+          <PermissionPrompt
+            key={`permission-${permissionRequest.id}`}
+            request={permissionRequest}
+            width={separatorWidth}
+          />
+        ) : reviewMode ? (
           <ReviewScreen
             onSelectOption={handleReviewOptionSelect}
             onCustom={handleReviewCustom}

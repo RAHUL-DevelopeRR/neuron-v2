@@ -154,7 +154,7 @@ const mountHost = async () => {
 }
 
 describe('useSendMessage with the engine client', () => {
-  test('without an engine the turn ends with the not-connected error, and is saved', async () => {
+  test('without a running engine the turn ends with the not-running error, and is saved', async () => {
     const { setup, root } = await mountHost()
     try {
       await sendMessageFromHost!({ content: 'hello', agentMode: 'DEFAULT' })
@@ -168,7 +168,7 @@ describe('useSendMessage with the engine client', () => {
       expect(ai.isComplete).toBe(true)
       expect(ai.userError).toContain(new EngineNotConnectedError().message)
       expect(useChatStore.getState().isChainInProgress).toBe(false)
-      expect(savedMessages().at(-1).userError).toContain('not connected')
+      expect(savedMessages().at(-1).userError).toContain('not running')
     } finally {
       flushSync(() => root.unmount())
       setup.renderer.destroy()
@@ -222,6 +222,76 @@ describe('useSendMessage with the engine client', () => {
         type: 'error',
         message: 'provider rejected the request',
       })
+    } finally {
+      flushSync(() => root.unmount())
+      setup.renderer.destroy()
+    }
+  })
+
+  test('engine events become text and tool blocks the renderers know', async () => {
+    const fake = new FakeEngine()
+    engine = fake
+    const { setup, root } = await mountHost()
+    const run = sendMessageFromHost!({ content: 'run it', agentMode: 'DEFAULT' })
+    try {
+      await waitFor('submit', () => fake.submits.length === 1)
+      // The engine's own lines for the approved-bash scenario.
+      fake.emit({
+        type: 'tool_call_started',
+        id: 'toolu_bash_prompt_allow',
+        name: 'bash',
+        input: JSON.stringify({
+          command: "printf 'approved via prompt' | tee approved.txt",
+          timeout: 1000,
+        }),
+        cut_off: false,
+      })
+      fake.emit({
+        type: 'tool_result',
+        name: 'bash',
+        output: JSON.stringify({ stdout: 'approved via prompt', stderr: '', interrupted: false }),
+        is_error: false,
+      })
+      fake.emit({ type: 'text_delta', text: 'bash approved and executed' })
+      fake.emit({ type: 'text_block_end' })
+      fake.emit({ type: 'turn_finished' })
+      await run
+
+      const blocks = useChatStore.getState().messages.at(-1)!.blocks ?? []
+      const tool = blocks.find((block) => block.type === 'tool') as any
+      expect(tool.toolName).toBe('run_terminal_command')
+      expect(tool.toolCallId).toBe('toolu_bash_prompt_allow')
+      expect(tool.input.command).toBe("printf 'approved via prompt' | tee approved.txt")
+      expect(tool.output).toBe('approved via prompt')
+      const text = blocks.find((block) => block.type === 'text') as any
+      expect(text.content).toBe('bash approved and executed')
+    } finally {
+      flushSync(() => root.unmount())
+      setup.renderer.destroy()
+    }
+  })
+
+  test('a call the engine never answers (denied) is closed when the turn ends', async () => {
+    const fake = new FakeEngine()
+    engine = fake
+    const { setup, root } = await mountHost()
+    const run = sendMessageFromHost!({ content: 'try', agentMode: 'DEFAULT' })
+    try {
+      await waitFor('submit', () => fake.submits.length === 1)
+      fake.emit({
+        type: 'tool_call_started',
+        id: 'toolu_bash_prompt_deny',
+        name: 'bash',
+        input: '{"command":"printf x | tee denied.txt"}',
+        cut_off: false,
+      })
+      fake.emit({ type: 'turn_finished' })
+      await run
+
+      const tool = (useChatStore.getState().messages.at(-1)!.blocks ?? []).find(
+        (block) => block.type === 'tool',
+      ) as any
+      expect(tool.output).toContain('No result')
     } finally {
       flushSync(() => root.unmount())
       setup.renderer.destroy()

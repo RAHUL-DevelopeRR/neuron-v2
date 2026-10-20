@@ -1,7 +1,8 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
 // Freebuff session countdown and fill, BYOK label, context usage from the SDK
 // run state, "End session" button and capacity-wait line are gone. The engine
-// footer (git, tokens, context %) is P3. See ui/neuron-tui/PORTING.md.
+// footer (git, tokens, context %) is P3. The not-connected line now names the
+// engine's state. See ui/neuron-tui/PORTING.md.
 import { TextAttributes } from '@opentui/core'
 import React, { useEffect, useState } from 'react'
 
@@ -10,6 +11,7 @@ import { ScrollToBottomButton } from './scroll-to-bottom-button'
 import { ShimmerText } from './shimmer-text'
 
 import { useTheme } from '../hooks/use-theme'
+import { useEngineStore } from '../state/engine-store'
 import { formatElapsedTime } from '../utils/format-elapsed-time'
 
 import type { StatusIndicatorState } from '../utils/status-indicator-state'
@@ -62,6 +64,8 @@ export const StatusBar = ({
   onStop,
 }: StatusBarProps) => {
   const theme = useTheme()
+  const engineConnection = useEngineStore((state) => state.connection)
+  const engineError = useEngineStore((state) => state.error)
   const [elapsedSeconds, setElapsedSeconds] = useState(0)
 
   // Show timer when actively working (streaming or waiting for response) or paused (ask_user)
@@ -115,9 +119,17 @@ export const StatusBar = ({
         return <ShimmerText text="retrying..." primaryColor={theme.warning} />
 
       case 'connecting':
-        // The connection monitor starts optimistic; this state means a check failed.
-        return (
-          <span fg={theme.warning}>Can't reach the engine. Retrying…</span>
+        // The engine is starting, or is not running (and why).
+        return engineConnection === 'starting' ? (
+          <ShimmerText
+            text="starting the engine..."
+            interval={SHIMMER_INTERVAL_MS}
+            primaryColor={theme.secondary}
+          />
+        ) : (
+          <span fg={theme.warning}>
+            {engineError ?? 'The Neuron engine is not running.'}
+          </span>
         )
 
       case 'waiting':

@@ -7,12 +7,13 @@ protocol of `neuron engine --stdio` (`src/engine/`).
 
 What was taken out of Freebuff, and why, is in [PORTING.md](PORTING.md).
 
-## Status (P1)
+## Status (P2)
 
-The UI builds, typechecks, passes its tests and starts to the chat screen. It
-is **not connected to the engine yet**: `src/engine/neuron-engine-client.ts`
-is a typed stub, so a sent message ends with "The Neuron engine is not
-connected yet". The bridge is P2.
+The UI starts `neuron engine --stdio` in the project folder and runs real
+turns through it: streamed text, tool calls and results, and permission
+prompts. Sign-in, the model picker, the token footer and the Neuron branding
+are P3 and P4 (see [PORTING.md](PORTING.md)). It finds the engine through
+`NEURON_BIN`, then a `neuron` binary beside the UI, then PATH.
 
 ## Requirements
 
@@ -38,9 +39,20 @@ bun run test
 bun run dev
 ```
 
+```bash
+bun run dev:mock PARITY_SCENARIO:streaming_text
+```
+
 `bun run test` runs every `*.test.ts(x)` under `src/` except
 `*.integration.test.*`. `bun run dev` starts the UI in the current folder;
 pass `--cwd <dir>` to open another project.
+
+`bun run dev:mock` runs the UI against the real engine and the mock Anthropic
+service, with no account or network, in a throwaway home folder. It needs
+`cargo build -p rusty-claude-cli -p mock-anthropic-service` in `rust/` first.
+Prompts like `PARITY_SCENARIO:bash_permission_prompt_approved` pick a scripted
+turn. The same binaries run
+`bun test src/engine/__tests__/engine.integration.test.ts`.
 
 Settings, chat history and logs go to `~/.neuron/tui` (override with an
 absolute `FREEBUFF_CONFIG_DIR`). `NEURON_TUI_ENV=dev` logs to

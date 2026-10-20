@@ -54,34 +54,53 @@ rewritten for what remains:
 | File | Role |
 |---|---|
 | `src/engine/protocol.ts` | TypeScript mirror of `rust/crates/neuron-tui/src/protocol.rs`: `UiEvent` and `EngineCommand` (serde `type`), `ClientMessage`, `Attachment` and `PermissionDecision` (serde `kind`), `PermissionReply`, `PROTOCOL_VERSION`. Fields that are `Option` in Rust are `T \| null`, since serde writes them as `null`. Also the JSON-lines codec: `encodeClientMessage`, `parseUiEventLine` (unknown event types are reported, not thrown) and `JsonLineSplitter`. Its tests use the JSON from the Rust serde tests. |
-| `src/engine/neuron-engine-client.ts` | The `NeuronEngineClient` interface P2 implements (`start`, `submit`, `slash`, `setModel`, `listModels`, `interrupt`, `replyToPermission`, `subscribe`, `onExit`, `shutdown`), `engineArgs()` for `neuron engine --stdio` and its flags, and `runTurn()`, which submits and resolves at `turn_finished`. The P1 client is never connected: commands throw `EngineNotConnectedError`. |
-| `src/hooks/use-send-message.ts` | Rewritten around `runTurn()`. It keeps the UI half: user bubble, AI message shell, timer, interrupts (they call `engine.interrupt()`), queue state and transcript checkpoints. |
-| `src/types/agent-run.ts` | Local versions of the SDK types the UI read: `RunState` (what `--continue` saves; P2 adds the engine session id), `MessageContent`, `ToolName`. |
+| `src/engine/neuron-engine-client.ts` | The `NeuronEngineClient` interface (`start`, `submit`, `slash`, `setModel`, `listModels`, `interrupt`, `replyToPermission`, `subscribe`, `onExit`, `shutdown`) and `engineArgs()` for `neuron engine --stdio` and its flags. It also has `runExchange()`/`runTurn()`. They run one exchange at a time per engine, so each `turn_finished` ends the right one, and resolve with the turn's `error`. |
+| `src/engine/stdio-engine-client.ts` | P2: `StdioEngineClient` spawns `neuron engine --stdio`. It writes `ClientMessage` lines, reads `UiEvent` lines and sends stderr to the log file. `start()` resolves at `ready`. It rejects with the engine's `error` event, or its last `error:` stderr line (some launch checks print only that), or the exit code. Unknown event types are logged, not fatal. `resolveNeuronBinary()` tries `NEURON_BIN`, then a `neuron` beside the UI binary, then PATH. |
+| `src/engine/engine-session.ts` | P2: starts the engine in the project folder at launch, or after the project picker. It restarts it on a project switch, and resumes the saved engine session with `--continue`. It routes events that belong to no turn into the stores: `ready`, `status`, `usage`, `models`, permission requests, notices (an `AskUserQuestion` notice waits for the next submit), and errors outside a turn. A prompt sent while the engine boots waits for the start (`whenEngineStarted`). |
+| `src/engine/turn-events.ts` | P2: feeds a turn's events into Freebuff's handlers (`createStreamChunkHandler`/`createEventHandler`). `text_delta` becomes text; `reasoning_delta` becomes a reasoning chunk. Tool calls and results become `tool_call`/`tool_result` blocks. `tool_result` carries only the tool name, so results are matched to calls first-in-first-out by name. A call that never gets a result (denied, or blocked by policy) is closed at `turn_finished`. |
+| `src/engine/tool-mapping.ts` | P2: Neuron tool names and inputs mapped onto Freebuff's renderers: `bash`/`PowerShell`→`run_terminal_command`, `read_file`→`read_files`, `write_file`, `edit_file`→`str_replace`, `glob_search`→`glob`, `grep_search`→`code_search`, `WebFetch`→`read_url`, `WebSearch`→`web_search`, `TodoWrite`→`write_todos`, `Skill`→`skill`. The engine's JSON tool outputs become what those renderers read. Windows `\\?\` path prefixes are stripped for display. Other tools keep their name and input. |
+| `src/state/engine-store.ts` | P2: connection state, engine version, last `status` (model, mode, session, git, context %), `usage`, `models`, the permission queue and a pending question. |
+| `src/components/permission-prompt.tsx` | P2: the permission dialog. `y` allows once, `a` allows for the session (only when the engine offers prefixes), `n` denies, `e` denies with a note. Keys are ignored for 300 ms so a keystroke meant for the input can't answer it. The chat input is disabled while a request waits. |
+| `src/hooks/use-send-message.ts` | Rewritten around `runTurn()`. It keeps the UI half: user bubble, AI message shell, timer, interrupts (they call `engine.interrupt()`), queue state and transcript checkpoints. It saves the engine session id in `RunState`. |
+| `src/commands/router.ts` | P2: a slash command the UI doesn't know goes to the engine when it is running (its own commands, such as `/status`, `/cost` and `/context`). Its notices and errors show as system lines. `/new` also clears the engine session. |
+| `src/types/agent-run.ts` | Local versions of the SDK types the UI read: `RunState` (what `--continue` saves, with the engine session id), `MessageContent`, `ToolName`. |
 | `src/utils/user-shell.ts` | `!cmd` runner stub. It fails with a message shown in the bash bubble. |
 | `src/utils/runtime-env.ts` | `IS_DEV`, `IS_TEST` and `IS_CI`, which came from Codebuff's env schema. |
 | `src/utils/tool-display.ts`, `src/utils/logo.ts` | Display helpers kept from removed modules (`codebuff-client.ts`, `login/`). |
 | `src/utils/exit-cleanly.ts` | Exit now runs local cleanup, then a bounded engine `shutdown`. |
 | `src/utils/config-dir.ts` | Settings, chat history and logs now go to `~/.neuron/tui`. Freebuff used `~/.config/manicode`, which Codebuff itself still writes. `FREEBUFF_CONFIG_DIR` still overrides it. |
 | `scripts/run-tests.ts` | `bun run test` without `find`, so it works on Windows. |
+| `scripts/dev-against-mock.ts` | P2: `bun run dev:mock [prompt]` runs the UI against the real engine and the mock Anthropic service (`PARITY_SCENARIO:<name>` prompts), in a throwaway home and workspace. No account or network is needed. |
 | `test/setup-env.ts` | Test preload: runtime flags only, no Codebuff service env. |
 
 `IS_FREEBUFF` (`src/utils/constants.ts`) is pinned to `false`, so no env var can
 turn back on the paths it gated. Its remaining 22 uses only choose
 Freebuff/Codebuff wording, which the rebrand removes.
 
-## Behaviour today (P1)
+## Behaviour today (P2)
 
-- `bun run dev` starts the UI to the empty chat screen (project picker at the
-  home directory, git-root banner in a subfolder).
-- Sending a message shows the user bubble, then "The Neuron engine is not
-  connected yet: this UI build has no engine bridge." as the turn's error.
+- `bun run dev` starts the UI and, once a project folder is known, the engine
+  in it. The status bar says "starting the engine..." until `ready`.
+- A prompt runs a real engine turn. Streamed text, reasoning, tool calls and
+  their results render with Freebuff's blocks. Permission requests open the
+  permission dialog. Usage and status land in the engine store; the footer
+  that shows them is P3.
+- If the engine cannot start, its reason shows in the chat and the status bar.
+  Examples: no `neuron` binary, not signed in, or a too-broad folder. A send
+  then ends with "The Neuron engine is not running: <reason>".
+- Checked by hand with `bun run dev:mock` on Windows. `streaming_text` renders
+  the streamed reply, and `bash_permission_prompt_approved` opens the
+  permission dialog, with `tee` offered for the session.
 - `!cmd` and `/bash` show "Shell commands (!) are not available in this build of
   the Neuron UI yet."
-- These slash commands remain: `help`, `new`, `copy`, `export`, `bash`, `image`,
-  `history`, `queue`, `todo`, `interview`, `plan`, `review`, `theme:toggle`,
-  `exit`, `mode:*` and `skill:*`.
-- Typecheck is clean, and `bun run test` gives 2,190 passing tests, 0 failures
+- These slash commands are the UI's own: `help`, `new`, `copy`, `export`,
+  `bash`, `image`, `history`, `queue`, `todo`, `interview`, `plan`, `review`,
+  `theme:toggle`, `exit`, `mode:*` and `skill:*`. Any other goes to the engine.
+- Typecheck is clean, and `bun run test` gives 2,219 passing tests, 0 failures
   and 24 skipped.
+  `src/engine/__tests__/engine.integration.test.ts` passes 4 tests against
+  the real engine and the mock service. It is not part of `bun run test`,
+  because it needs the Rust binaries and takes about 90 s on a debug build.
 - Of the skips, 7 POSIX-only cases skip on Windows: direnv export, directory
   fsync, chmod, and a concurrent atomic rename. The rest are upstream skips,
   mostly tmux. Freebuff's CI ran on Linux, so these never ran on Windows
@@ -89,22 +108,20 @@ Freebuff/Codebuff wording, which the rebrand removes.
 
 ## Left for later
 
-- **P2 (engine bridge):**
-  - Implement `NeuronEngineClient`: spawn `neuron engine --stdio`, write
-    `ClientMessage` lines, read `UiEvent` lines (stderr carries logs).
-  - In `use-send-message.ts`, map events onto the existing handler state from
-    `createEventHandlerState`, in the `runTurn` `onEvent` callback.
-  - Map Neuron tool names to Freebuff renderers, and build the permission
-    dialog.
-  - Send attachments as `Submit.attachments`. Today they are inlined into the
-    prompt as Freebuff did.
-  - Record the engine session id in `RunState` so `--continue` resumes it.
-  - Decide whether `!cmd` runs in the UI or in the engine.
 - **P3:**
-  - Sign-in screen, model picker, footer (git, ↑/↓ tokens, context %).
+  - Sign-in screen. It needs the engine to start while signed out and to send
+    the device code as an event; today a signed-out engine sends one `error`
+    and exits.
+  - Model picker from `list_models`/`models`, and footer (git, ↑/↓ tokens,
+    context %) from the engine store.
   - `utils/format-token-count.ts` is kept for the footer.
   - `@tanstack/react-query` is kept and still mounted in `index.tsx`, for the
     model-list polling.
+  - Send attachments as `Submit.attachments`. Today they are inlined into the
+    prompt as Freebuff did.
+  - Decide whether `!cmd` runs in the UI or in the engine.
+  - Pass `--model`, `--provider` and `--permission-mode` through to the
+    engine. The UI starts it with none, so the engine's defaults apply.
 - **P4 (rebrand and packaging):**
   - Remove the Codebuff/Freebuff names users can see: the logo in
     `utils/logo.ts`, "Codebuff will run commands on your behalf", the program
@@ -122,6 +139,16 @@ Freebuff/Codebuff wording, which the rebrand removes.
   - `writeFileAtomicAsync` can fail with `EPERM` on Windows when two renames
     target the same file at once. Checkpoint saves coalesce, so it is unlikely
     but possible.
-  - In my launch check the UI drew the chat screen, but I could not type into
-    the terminal: keyboard input and Ctrl-C exit in a real Windows terminal are
-    covered only by unit tests so far.
+  - In my launch checks the UI drew the chat screen and ran prompts given on
+    the command line. I could not type into the terminal: keyboard input, the
+    permission keys and Ctrl-C exit in a real Windows terminal are covered only
+    by unit tests so far.
+  - The engine's `tool_result` has no call id, so two calls of the same tool in
+    one turn are matched first-in-first-out. A denied call gets no result
+    event; it shows "No result" when the turn ends.
+  - Some launch checks (a too-broad folder, bad flags) print `error: ...` on
+    stderr and exit without the `error` event the protocol promises. The client
+    falls back to that line.
+  - In a folder under a git repo, Freebuff's banner offers to switch to the git
+    root, even when that root is the home folder, which the engine then refuses
+    as too broad.

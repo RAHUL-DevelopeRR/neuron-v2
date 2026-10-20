@@ -11,6 +11,7 @@ import {
   buildSkillPrompt,
 } from './prompt-builders'
 import { runBashCommand } from './router'
+import { getNeuronEngineClient, runExchange } from '../engine/neuron-engine-client'
 import { useThemeStore } from '../hooks/use-theme'
 import { startNewChat } from '../project-files'
 import { useChatStore } from '../state/chat-store'
@@ -231,6 +232,13 @@ const ALL_COMMANDS: CommandDefinition[] = [
       params.setMessages(() => [])
       params.clearMessages()
       startNewChat()
+      // The engine keeps its own conversation: clear it too.
+      const engine = getNeuronEngineClient()
+      if (engine.connection === 'ready') {
+        runExchange(engine, () => engine.slash('clear', ''), () => {}).catch(
+          () => undefined,
+        )
+      }
       params.saveToHistory(params.inputValue.trim())
       clearInput(params)
       // If user provided a message, send it as the first message in the new chat

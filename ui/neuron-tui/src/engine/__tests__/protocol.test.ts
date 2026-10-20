@@ -3,9 +3,9 @@ import { describe, expect, test } from 'bun:test'
 import {
   EngineNotConnectedError,
   engineArgs,
-  getNeuronEngineClient,
   runTurn,
 } from '../neuron-engine-client'
+import { StdioEngineClient } from '../stdio-engine-client'
 import {
   JsonLineSplitter,
   UI_EVENT_TYPES,
@@ -203,10 +203,11 @@ describe('engine client', () => {
     ])
   })
 
-  test('the P1 client is not connected: start and turns reject', async () => {
-    const client = getNeuronEngineClient()
+  test('a client that is not running refuses commands but stops cleanly', async () => {
+    const client = new StdioEngineClient({ resolveBinary: () => null })
     expect(client.connection).toBe('not_started')
-    await expect(client.start()).rejects.toBeInstanceOf(EngineNotConnectedError)
+    expect(() => client.submit('hello')).toThrow(EngineNotConnectedError)
+    await expect(client.start()).rejects.toThrow('Could not find the `neuron` binary')
     await expect(
       runTurn(client, { text: 'hello' }, () => {}),
     ).rejects.toBeInstanceOf(EngineNotConnectedError)

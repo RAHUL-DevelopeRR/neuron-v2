@@ -24,6 +24,7 @@ import React from 'react'
 
 import { App } from './app'
 import { parseArgs } from './cli-args'
+import { startEngineSession } from './engine/engine-session'
 import { initializeApp } from './init/init-app'
 import { getProjectRoot, setProjectRoot } from './project-files'
 import { getConfigDir } from './utils/config-dir'
@@ -35,6 +36,7 @@ import {
   sweepLeakedRenderLibraryCopies,
 } from './utils/opentui-native-library'
 import { trimOversizedChatLogs } from './utils/chat-history'
+import { loadMostRecentChatState } from './utils/run-state-storage'
 import { clearLogFile, logger } from './utils/logger'
 import { shouldShowProjectPicker } from './utils/project-picker'
 import { saveRecentProject } from './utils/recent-projects'
@@ -120,6 +122,15 @@ async function main(): Promise<void> {
 
   const queryClient = createQueryClient()
 
+  // The engine runs in the project folder, so it starts once one is chosen.
+  // `--continue` resumes the engine session the chat was saved with.
+  const resumeSession = continueChat
+    ? loadMostRecentChatState(continueId ?? undefined)?.runState?.sessionId
+    : undefined
+  if (!showProjectPicker) {
+    void startEngineSession({ cwd: projectRoot, resume: resumeSession })
+  }
+
   const AppRoot = () => {
     const [fileTree, setFileTree] = React.useState<FileTreeNode[]>([])
     const [currentProjectRoot, setCurrentProjectRoot] =
@@ -154,6 +165,8 @@ async function main(): Promise<void> {
         setProjectRoot(newProjectPath)
         // Save to recent projects list
         saveRecentProject(newProjectPath)
+        // The engine works in one folder: restart it in the new one.
+        void startEngineSession({ cwd: newProjectPath })
         // Update local state
         setCurrentProjectRoot(newProjectPath)
         // Reset file tree state to trigger reload

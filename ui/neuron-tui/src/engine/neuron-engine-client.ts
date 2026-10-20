@@ -1,15 +1,13 @@
 /**
  * The UI's handle on the Neuron engine: `neuron engine --stdio`, spoken over
  * JSON lines (see ./protocol.ts and rust/crates/neuron-tui/src/protocol.rs).
- *
- * P1 (this file today): the interface the chat codes against, the launch
- * arguments, and a stub that is never connected, so the UI builds and starts
- * without an engine. P2 replaces the stub with a client that spawns the
- * engine, writes {@link ClientMessage} lines to its stdin and reads
- * {@link UiEvent} lines from its stdout (logs arrive on stderr).
+ * The chat codes against {@link NeuronEngineClient}; the process-wide client
+ * is a {@link StdioEngineClient} (./stdio-engine-client.ts).
  *
  * Tokens stay in the engine: nothing here reads or forwards credentials.
  */
+
+import { StdioEngineClient } from './stdio-engine-client'
 
 import type {
   Attachment,
@@ -88,50 +86,13 @@ export interface NeuronEngineClient {
 }
 
 export class EngineNotConnectedError extends Error {
-  constructor() {
+  constructor(readonly reason?: string) {
     super(
-      'The Neuron engine is not connected yet: this UI build has no engine bridge.',
+      reason
+        ? `The Neuron engine is not running: ${reason}`
+        : 'The Neuron engine is not running.',
     )
     this.name = 'EngineNotConnectedError'
-  }
-}
-
-/** The P1 client: never connects, so every command fails the same way. */
-class UnconnectedEngineClient implements NeuronEngineClient {
-  readonly connection: EngineConnection = 'not_started'
-
-  start(): Promise<ReadyEvent> {
-    return Promise.reject(new EngineNotConnectedError())
-  }
-  send(_command: EngineCommand): void {
-    throw new EngineNotConnectedError()
-  }
-  submit(text: string, attachments: Attachment[] = []): void {
-    this.send({ type: 'submit', text, attachments })
-  }
-  slash(command: string, args = ''): void {
-    this.send({ type: 'slash', command, args })
-  }
-  setModel(model: string): void {
-    this.send({ type: 'set_model', model })
-  }
-  listModels(): void {
-    this.send({ type: 'list_models' })
-  }
-  interrupt(): void {
-    // Nothing is running without an engine.
-  }
-  replyToPermission(_reply: PermissionReply): void {
-    throw new EngineNotConnectedError()
-  }
-  subscribe(_listener: (event: UiEvent) => void): () => void {
-    return () => {}
-  }
-  onExit(_listener: (exit: EngineExit) => void): () => void {
-    return () => {}
-  }
-  shutdown(): Promise<EngineExit> {
-    return Promise.resolve({ code: 0, signal: null })
   }
 }
 
@@ -151,49 +112,83 @@ export class EngineExitedError extends Error {
   }
 }
 
+// Each engine runs one exchange that ends in `turn_finished` at a time (a
+// prompt's turn, a slash command), so a `turn_finished` always belongs to the
+// exchange waiting for it.
+const exchangeTails = new WeakMap<NeuronEngineClient, Promise<unknown>>()
+
 /**
- * Submits a prompt and resolves at the turn's `turn_finished`, passing every
- * event before it to `onEvent`. Rejects when the submit fails (with the P1
- * stub: {@link EngineNotConnectedError}) or the engine exits mid-turn.
+ * Sends a command that the engine ends with `turn_finished` (a submit, a
+ * slash command) once the exchanges before it are over, passing every event
+ * of its own exchange to `onEvent`. Resolves at its `turn_finished`; rejects
+ * when sending fails (for example {@link EngineNotConnectedError}) or the
+ * engine exits first.
  */
+export function runExchange(
+  engine: NeuronEngineClient,
+  send: () => void,
+  onEvent: (event: UiEvent) => void,
+): Promise<TurnOutcome> {
+  const previous = exchangeTails.get(engine) ?? Promise.resolve()
+  const run = previous.then(
+    () =>
+      new Promise<TurnOutcome>((resolve, reject) => {
+        let error: string | null = null
+        const cleanup = () => {
+          unsubscribe()
+          unsubscribeExit()
+        }
+        const unsubscribe = engine.subscribe((event) => {
+          onEvent(event)
+          if (event.type === 'error') error = event.message
+          if (event.type === 'turn_finished') {
+            cleanup()
+            resolve({ error })
+          }
+        })
+        const unsubscribeExit = engine.onExit((exit) => {
+          cleanup()
+          reject(new EngineExitedError(exit))
+        })
+        try {
+          send()
+        } catch (sendError) {
+          cleanup()
+          reject(sendError)
+        }
+      }),
+  )
+  exchangeTails.set(
+    engine,
+    run.catch(() => undefined),
+  )
+  return run
+}
+
+/** Runs a prompt's turn: {@link runExchange} with a `submit`. */
 export function runTurn(
   engine: NeuronEngineClient,
   turn: { text: string; attachments?: Attachment[] },
   onEvent: (event: UiEvent) => void,
 ): Promise<TurnOutcome> {
-  return new Promise((resolve, reject) => {
-    let error: string | null = null
-    const cleanup = () => {
-      unsubscribe()
-      unsubscribeExit()
-    }
-    const unsubscribe = engine.subscribe((event) => {
-      onEvent(event)
-      if (event.type === 'error') error = event.message
-      if (event.type === 'turn_finished') {
-        cleanup()
-        resolve({ error })
-      }
-    })
-    const unsubscribeExit = engine.onExit((exit) => {
-      cleanup()
-      reject(new EngineExitedError(exit))
-    })
-    try {
-      engine.submit(turn.text, turn.attachments ?? [])
-    } catch (submitError) {
-      cleanup()
-      reject(submitError)
-    }
-  })
+  return runExchange(
+    engine,
+    () => engine.submit(turn.text, turn.attachments ?? []),
+    onEvent,
+  )
 }
 
 let client: NeuronEngineClient | null = null
 
 /** The process-wide engine client. */
 export function getNeuronEngineClient(): NeuronEngineClient {
-  client ??= new UnconnectedEngineClient()
+  client ??= new StdioEngineClient()
   return client
+}
+
+/** Replace the process-wide client (a restart in another folder). */
+export function setNeuronEngineClient(next: NeuronEngineClient): void {
+  client = next
 }
 
 /** Test seam: install a fake client (or `null` to go back to the default). */

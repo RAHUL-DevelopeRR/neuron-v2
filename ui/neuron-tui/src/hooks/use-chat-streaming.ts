@@ -4,8 +4,7 @@
  * Chat view adapter for connection status, queue presentation, and exit handling.
  *
  * Freebuff polled the Codebuff backend's health endpoint for `isConnected`.
- * Neuron's UI talks only to its local engine; until P2 reports the engine's
- * state, the UI counts as connected.
+ * Neuron's UI talks only to its local engine: connected means it is ready.
  */
 
 import { useExitHandler } from './use-exit-handler'
@@ -13,6 +12,7 @@ import { useQueueControls } from './use-queue-controls'
 import { useQueueUi } from './use-queue-ui'
 import { useChatRuntime } from '../contexts/chat-runtime-context'
 import { useChatStore } from '../state/chat-store'
+import { useEngineStore } from '../state/engine-store'
 
 import type { QueuedMessage, StreamStatus } from './use-message-queue'
 import type { PendingAttachment } from '../types/store'
@@ -69,7 +69,7 @@ export function useChatStreaming({
   separatorWidth,
 }: UseChatStreamingOptions): UseChatStreamingReturn {
   const runtime = useChatRuntime()
-  const isConnected = true
+  const isConnected = useEngineStore((state) => state.connection === 'ready')
   const showReconnectionMessage = false
 
   const {
