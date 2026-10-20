@@ -2,10 +2,16 @@
 //!
 //! The engine runs a turn on its own thread and reports everything the user should see as
 //! [`UiEvent`]s; the UI sends [`EngineCommand`]s and answers permission requests with
-//! [`PermissionReply`]. Everything is plain data (serde-serialisable), so the engine could
-//! also run in another process later without changing this contract.
+//! [`PermissionReply`]. Everything is plain data (serde-serialisable): `neuron engine
+//! --stdio` speaks the same contract as JSON lines, [`ClientMessage`]s in and [`UiEvent`]s
+//! out, starting with [`UiEvent::Ready`].
 
 use serde::{Deserialize, Serialize};
+
+/// The contract's version, sent in [`UiEvent::Ready`]. Bumped when a change would break a
+/// UI written against the previous version (new event kinds do not count: a UI ignores
+/// events it does not know).
+pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Token counts as the provider reported them (or estimated before it did).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,10 +36,64 @@ pub struct PermissionView {
     pub session_prefixes: Vec<String>,
 }
 
+/// The workspace's git state, for the footer.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitStatus {
+    /// The branch, `detached HEAD`, or `None` when git could not tell.
+    pub branch: Option<String>,
+    /// Changed paths in all: staged, unstaged, untracked and conflicted ones.
+    pub changed: usize,
+    pub staged: usize,
+    pub unstaged: usize,
+    pub untracked: usize,
+    pub conflicted: usize,
+}
+
+/// One model the user can switch to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelInfo {
+    pub id: String,
+    pub display_name: Option<String>,
+    /// Whether the user's plan can use it now; `unavailable_reason` says why not.
+    pub available: bool,
+    pub unavailable_reason: Option<String>,
+    pub context_window: Option<u32>,
+    /// Plan tiers that include it (`free`, `pro`, ...).
+    pub tiers: Vec<String>,
+}
+
 /// Engine → UI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UiEvent {
+    /// The first event: the engine is ready for commands.
+    Ready {
+        /// [`PROTOCOL_VERSION`] of the engine.
+        protocol: u32,
+        /// The Neuron version.
+        version: String,
+    },
+    /// What the footer shows. Sent after `Ready`, after every `TurnFinished`, and after a
+    /// model switch.
+    Status {
+        model: String,
+        permission_mode: String,
+        session_id: String,
+        cwd: String,
+        /// Untrusted workspaces run without their own settings, hooks and MCP servers.
+        workspace_trusted: bool,
+        plan_mode: bool,
+        /// Estimated share of the model's input budget the conversation uses.
+        context_percent: u32,
+        /// `None` outside a git repository.
+        git: Option<GitStatus>,
+    },
+    /// Answer to [`EngineCommand::ListModels`]. Empty when the provider has no catalog
+    /// (only the Zero-X gateway publishes one).
+    Models {
+        current: String,
+        models: Vec<ModelInfo>,
+    },
     /// A streamed piece of assistant text (Markdown, not yet rendered).
     TextDelta { text: String },
     /// The current text block ended.
@@ -98,6 +158,8 @@ pub enum EngineCommand {
     Slash { command: String, args: String },
     /// Switch the model for the next turn.
     SetModel { model: String },
+    /// Ask for the models the user can switch to ([`UiEvent::Models`]).
+    ListModels,
     /// Interrupt the running turn (a second one quits after saving, like Ctrl-C twice).
     Interrupt,
     /// Save and stop.
@@ -121,6 +183,16 @@ pub enum PermissionDecision {
 pub struct PermissionReply {
     pub id: u64,
     pub decision: PermissionDecision,
+}
+
+/// One input line of `neuron engine --stdio`: a command, or an answer to a permission
+/// request. `{"kind":"command","type":"submit","text":"hi","attachments":[]}`,
+/// `{"kind":"permission_reply","id":1,"decision":{"kind":"allow_once"}}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ClientMessage {
+    Command(EngineCommand),
+    PermissionReply(PermissionReply),
 }
 
 #[cfg(test)]
@@ -166,5 +238,44 @@ mod tests {
             serde_json::from_value::<PermissionReply>(json).unwrap(),
             reply
         );
+    }
+
+    /// The stdio transport's input lines: a top-level `kind`, then the command's own
+    /// `type` (or the reply's fields) beside it.
+    #[test]
+    fn client_messages_are_flat_tagged_json_lines() {
+        let line = r#"{"kind":"command","type":"submit","text":"hi","attachments":[]}"#;
+        assert_eq!(
+            serde_json::from_str::<ClientMessage>(line).unwrap(),
+            ClientMessage::Command(EngineCommand::Submit {
+                text: "hi".into(),
+                attachments: Vec::new(),
+            })
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientMessage>(r#"{"kind":"command","type":"interrupt"}"#)
+                .unwrap(),
+            ClientMessage::Command(EngineCommand::Interrupt)
+        );
+        let reply = r#"{"kind":"permission_reply","id":3,"decision":{"kind":"allow_once"}}"#;
+        assert_eq!(
+            serde_json::from_str::<ClientMessage>(reply).unwrap(),
+            ClientMessage::PermissionReply(PermissionReply {
+                id: 3,
+                decision: PermissionDecision::AllowOnce,
+            })
+        );
+        let message = ClientMessage::Command(EngineCommand::Slash {
+            command: "model".into(),
+            args: "opus".into(),
+        });
+        let json = serde_json::to_value(&message).unwrap();
+        assert_eq!(json["kind"], "command");
+        assert_eq!(json["type"], "slash");
+        assert_eq!(
+            serde_json::from_value::<ClientMessage>(json).unwrap(),
+            message
+        );
+        assert!(serde_json::from_str::<ClientMessage>(r#"{"type":"submit"}"#).is_err());
     }
 }

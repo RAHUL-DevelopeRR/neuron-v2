@@ -83,7 +83,9 @@ fn run(
                     message: "Interrupting".into(),
                 });
             }
-            EngineCommand::Slash { .. } | EngineCommand::SetModel { .. } => {}
+            EngineCommand::Slash { .. }
+            | EngineCommand::SetModel { .. }
+            | EngineCommand::ListModels => {}
         }
     }
     log

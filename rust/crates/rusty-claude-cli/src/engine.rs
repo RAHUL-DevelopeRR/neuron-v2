@@ -8,12 +8,17 @@
 //! everything else waits in the engine's queue.
 //!
 //! What the UI sees:
+//! - first [`UiEvent::Ready`] (the protocol version), then [`UiEvent::Status`] for the
+//!   footer;
 //! - a prompt ([`EngineCommand::Submit`]): the turn's text, reasoning, tool calls and
 //!   results, permission requests, notices, then [`UiEvent::Usage`] and
 //!   [`UiEvent::TurnFinished`]; a failed turn sends [`UiEvent::Error`] before
 //!   `TurnFinished` instead of `Usage`;
 //! - a slash command: its report as a notice (or an `Error`), then `TurnFinished`;
-//! - [`EngineCommand::SetModel`]: the switch report as a notice, or an `Error`;
+//! - after every `TurnFinished`, a fresh `Status`;
+//! - [`EngineCommand::SetModel`]: the switch report as a notice and a `Status`, or an
+//!   `Error`;
+//! - [`EngineCommand::ListModels`]: one [`UiEvent::Models`];
 //! - `runtime::ui_hooks` notices from anywhere in the process, as notices;
 //! - an `AskUserQuestion` from the agent, as a notice starting with "Question:" whose
 //!   answer is the next submitted text (a `Submit` while the question waits never starts a
@@ -26,7 +31,10 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 use super::*;
-use neuron_tui::protocol::{Attachment, EngineCommand, PermissionReply, TokenCounts, UiEvent};
+use neuron_tui::protocol::{
+    Attachment, EngineCommand, GitStatus, ModelInfo, PermissionReply, TokenCounts, UiEvent,
+    PROTOCOL_VERSION,
+};
 use repl_loop::InterruptPresses;
 use runtime::ui_hooks::{self, UserQuestion};
 use runtime::{CancellationToken, HookAbortSignal, TurnSummary};
@@ -105,6 +113,8 @@ pub(crate) fn spawn(options: EngineOptions) -> Result<EngineHandle, String> {
             let _hooks = UiHooks::install(&events_tx, &engine_shared);
             let exit = match Engine::start(options, events_tx, replies_rx, engine_shared) {
                 Ok(mut engine) => {
+                    // Before `spawn` returns, so `Ready` is always the first event.
+                    engine.announce();
                     let _ = ready_tx.send(Ok(()));
                     let exit = engine.serve(&queue_rx);
                     engine.close();
@@ -364,6 +374,32 @@ fn usage_since(before: TokenUsage, after: TokenUsage) -> TokenUsage {
     }
 }
 
+/// The footer's view of `git status --short --branch` output.
+fn git_status(status: &str) -> GitStatus {
+    let summary = parse_git_workspace_summary(Some(status));
+    GitStatus {
+        branch: git_branch(status),
+        changed: summary.changed_files,
+        staged: summary.staged_files,
+        unstaged: summary.unstaged_files,
+        untracked: summary.untracked_files,
+        conflicted: summary.conflicted_files,
+    }
+}
+
+/// The branch from the `## ...` header; a repository without commits says
+/// `## No commits yet on main` (`## Initial commit on main` before git 2.15).
+fn git_branch(status: &str) -> Option<String> {
+    let header = status.lines().next()?.strip_prefix("## ")?;
+    match header
+        .strip_prefix("No commits yet on ")
+        .or_else(|| header.strip_prefix("Initial commit on "))
+    {
+        Some(branch) => Some(branch.trim().to_string()),
+        None => parse_git_status_branch(Some(status)),
+    }
+}
+
 fn token_counts(usage: TokenUsage) -> TokenCounts {
     TokenCounts {
         input: u64::from(usage.input_tokens),
@@ -444,7 +480,7 @@ impl Engine {
                             repl_loop::panic_message(payload.as_ref())
                         ),
                     });
-                    self.send(UiEvent::TurnFinished);
+                    self.finish_turn();
                     self.persist();
                     Step::Continue
                 }
@@ -470,7 +506,10 @@ impl Engine {
             EngineCommand::Slash { command, args } => return self.slash(&command, &args),
             EngineCommand::SetModel { model } if model.trim().is_empty() => self.model_report(),
             EngineCommand::SetModel { model } => match self.switch_model(&model) {
-                Ok(()) => self.persist(),
+                Ok(()) => {
+                    self.persist();
+                    self.send_status();
+                }
                 Err(error) => self.send(UiEvent::Error {
                     message: error.to_string(),
                 }),
@@ -478,6 +517,7 @@ impl Engine {
             // The command thread hands interrupts to the running turn; one that gets here
             // found nothing to interrupt.
             EngineCommand::Interrupt => {}
+            EngineCommand::ListModels => self.list_models(),
             EngineCommand::Shutdown => return Step::Stop,
         }
         Step::Continue
@@ -486,7 +526,7 @@ impl Engine {
     fn submit(&mut self, text: &str, attachments: &[Attachment]) {
         let line = text.trim();
         if line.is_empty() && attachments.is_empty() {
-            self.send(UiEvent::TurnFinished);
+            self.finish_turn();
             return;
         }
         self.cli.record_prompt_history(line);
@@ -498,7 +538,7 @@ impl Engine {
             Ok((summary, usage)) => self.report_turn(&summary, usage),
             Err(message) => self.send(UiEvent::Error { message }),
         }
-        self.send(UiEvent::TurnFinished);
+        self.finish_turn();
     }
 
     /// The prompt with the attached paths listed after it; the model reads them with its
@@ -613,7 +653,7 @@ impl Engine {
                 message: error.to_string(),
             });
         }
-        self.send(UiEvent::TurnFinished);
+        self.finish_turn();
         Step::Continue
     }
 
@@ -664,6 +704,63 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// `Ready`, then the footer's first `Status`.
+    fn announce(&mut self) {
+        self.send(UiEvent::Ready {
+            protocol: PROTOCOL_VERSION,
+            version: VERSION.to_string(),
+        });
+        self.send_status();
+    }
+
+    /// Ends a prompt or a slash command: `TurnFinished`, then the footer's new `Status`.
+    fn finish_turn(&mut self) {
+        self.send(UiEvent::TurnFinished);
+        self.send_status();
+    }
+
+    fn send_status(&mut self) {
+        let cwd = env::current_dir().unwrap_or_default();
+        let workspace_trusted = ConfigLoader::default_for(&cwd).workspace_is_trusted();
+        let git = runtime::workspace_git_status(&cwd).map(|status| git_status(&status));
+        let context_percent =
+            u32::try_from(self.cli.runtime.context_snapshot().used_percent()).unwrap_or(u32::MAX);
+        self.send(UiEvent::Status {
+            model: self.cli.model.clone(),
+            permission_mode: self.cli.permission_mode.as_str().to_string(),
+            session_id: self.cli.session.id.clone(),
+            cwd: cwd.display().to_string(),
+            workspace_trusted,
+            plan_mode: self.cli.plan_mode,
+            context_percent,
+            git,
+        });
+    }
+
+    /// The gateway catalog's models, available ones first; none on other providers.
+    fn list_models(&mut self) {
+        let models = gateway_repl::session_catalog()
+            .map(|catalog| {
+                catalog
+                    .sorted()
+                    .into_iter()
+                    .map(|model| ModelInfo {
+                        id: model.id.clone(),
+                        display_name: model.display_name.clone(),
+                        available: model.available,
+                        unavailable_reason: model.unavailable_reason.clone(),
+                        context_window: model.context_window,
+                        tiers: model.tiers.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.send(UiEvent::Models {
+            current: self.cli.model.clone(),
+            models,
+        });
     }
 
     fn model_report(&mut self) {
@@ -879,11 +976,13 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
-    use super::{plain_notice, question_notice, spawn, EngineExit, EngineHandle, EngineOptions};
+    use super::{
+        git_status, plain_notice, question_notice, spawn, EngineExit, EngineHandle, EngineOptions,
+    };
     use crate::tests::{env_lock, with_current_dir};
     use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
     use neuron_tui::protocol::{
-        EngineCommand, PermissionDecision, PermissionReply, TokenCounts, UiEvent,
+        EngineCommand, PermissionDecision, PermissionReply, TokenCounts, UiEvent, PROTOCOL_VERSION,
     };
     use runtime::ui_hooks::{self, UserQuestion};
     use runtime::PermissionMode;
@@ -958,27 +1057,32 @@ mod tests {
         }
     }
 
+    /// Events up to `TurnFinished`, and the `Status` that always follows it.
     fn turn_events(events: &Receiver<UiEvent>) -> Vec<UiEvent> {
-        events_until(events, |event| *event == UiEvent::TurnFinished)
+        let mut turn = events_until(events, |event| *event == UiEvent::TurnFinished);
+        turn.extend(events_until(events, |event| {
+            matches!(event, UiEvent::Status { .. })
+        }));
+        turn
     }
 
-    /// The next notice containing `needle`, skipping other notices.
+    /// The next notice containing `needle`, skipping other notices and footer updates.
     fn expect_notice(events: &Receiver<UiEvent>, needle: &str) -> String {
         loop {
             match next_event(events) {
                 UiEvent::Notice { message } if message.contains(needle) => return message,
-                UiEvent::Notice { .. } => {}
+                UiEvent::Notice { .. } | UiEvent::Status { .. } => {}
                 other => panic!("expected a notice with {needle:?}, got {other:?}"),
             }
         }
     }
 
-    /// The events without notices: the hooks are process-wide, so a test running alongside
-    /// may add notices of its own.
+    /// The events without notices and footer updates: the hooks are process-wide, so a test
+    /// running alongside may add notices of its own.
     fn without_notices(events: &[UiEvent]) -> Vec<UiEvent> {
         events
             .iter()
-            .filter(|event| !matches!(event, UiEvent::Notice { .. }))
+            .filter(|event| !matches!(event, UiEvent::Notice { .. } | UiEvent::Status { .. }))
             .cloned()
             .collect()
     }
@@ -1089,6 +1193,14 @@ mod tests {
             r#"{"defaultMcpServers":false}"#,
         )
         .expect("settings");
+        // Its own repository, so the footer's git state does not depend on where the
+        // temporary directory lives.
+        let git_init = std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&workspace)
+            .status()
+            .expect("git runs");
+        assert!(git_init.success(), "git init");
         let base_url = server.base_url();
         let vars = EnvVars::set(&[
             ("ANTHROPIC_API_KEY", Some(OsStr::new("test-engine-key"))),
@@ -1115,6 +1227,30 @@ mod tests {
             resume: None,
         })
         .expect("the engine starts");
+
+        // First the protocol version, then the footer.
+        assert_eq!(
+            next_event(&engine.events),
+            UiEvent::Ready {
+                protocol: PROTOCOL_VERSION,
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            }
+        );
+        let untracked_at_start = match next_event(&engine.events) {
+            UiEvent::Status {
+                model,
+                permission_mode,
+                plan_mode: false,
+                git: Some(git),
+                ..
+            } => {
+                assert_eq!(model, "claude-sonnet-4-6");
+                assert_eq!(permission_mode, "workspace-write");
+                assert_eq!(git.branch.as_deref(), Some("main"), "{git:?}");
+                git.untracked
+            }
+            other => panic!("expected the footer status, got {other:?}"),
+        };
 
         // Notices from anywhere in the process reach the UI, as plain text.
         ui_hooks::notice("\n\x1b[33m!\x1b[0m engine-test notice\n");
@@ -1196,6 +1332,14 @@ mod tests {
             other => panic!("unexpected approved turn: {other:?}"),
         }
         assert!(workspace.join("approved.txt").exists());
+        match turn.last() {
+            Some(UiEvent::Status { git: Some(git), .. }) => assert_eq!(
+                git.untracked,
+                untracked_at_start + 1,
+                "the footer sees the new file: {git:?}"
+            ),
+            other => panic!("expected the footer status after the turn, got {other:?}"),
+        }
 
         // Denied: it does not run and the model hears why.
         clear_session(&engine);
@@ -1291,6 +1435,28 @@ mod tests {
             .unwrap();
         let switched = expect_notice(&engine.events, "Model updated");
         assert!(switched.contains("claude-opus"), "{switched}");
+        match events_until(&engine.events, |event| {
+            matches!(event, UiEvent::Status { .. })
+        })
+        .pop()
+        {
+            Some(UiEvent::Status { model, .. }) => assert!(model.contains("claude-opus")),
+            other => panic!("expected the footer status, got {other:?}"),
+        }
+
+        // Only the Zero-X gateway publishes a model catalog.
+        engine.commands.send(EngineCommand::ListModels).unwrap();
+        match events_until(&engine.events, |event| {
+            matches!(event, UiEvent::Models { .. })
+        })
+        .pop()
+        {
+            Some(UiEvent::Models { current, models }) => {
+                assert!(current.contains("claude-opus"), "{current}");
+                assert!(models.is_empty(), "{models:?}");
+            }
+            other => panic!("expected the model list, got {other:?}"),
+        }
 
         // Shutdown while a turn waits for approval: the turn stops, the session is saved,
         // the hooks go back to the terminal and the event channel closes.
@@ -1357,6 +1523,29 @@ mod tests {
         drop(vars);
         let _ = fs::remove_dir_all(&workspace);
         let _ = fs::remove_dir_all(&config_home);
+    }
+
+    #[test]
+    fn the_footer_reads_git_status_headers() {
+        let status = "## main...origin/main [ahead 1]\nM  src/lib.rs\n M README.md\n?? new.txt";
+        let git = git_status(status);
+        assert_eq!(git.branch.as_deref(), Some("main"));
+        assert_eq!(
+            (git.changed, git.staged, git.unstaged, git.untracked),
+            (3, 1, 1, 1)
+        );
+        assert_eq!(
+            git_status("## No commits yet on trunk").branch.as_deref(),
+            Some("trunk")
+        );
+        assert_eq!(
+            git_status("## Initial commit on master").branch.as_deref(),
+            Some("master")
+        );
+        assert_eq!(
+            git_status("## HEAD (no branch)").branch.as_deref(),
+            Some("detached HEAD")
+        );
     }
 
     #[test]

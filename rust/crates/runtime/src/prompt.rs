@@ -276,6 +276,19 @@ fn push_context_file(files: &mut Vec<ContextFile>, path: PathBuf) -> std::io::Re
     }
 }
 
+/// `git status --short --branch` for `cwd`, with the safeguards of
+/// [`ProjectContext::discover_with_git`]: in an untrusted workspace repository config
+/// that runs programs is ignored, and nothing runs when the repository defines filter
+/// drivers. `None` outside a repository.
+#[must_use]
+pub fn workspace_git_status(cwd: &Path) -> Option<String> {
+    let workspace_trusted = ConfigLoader::default_for(cwd).workspace_is_trusted();
+    if !workspace_trusted && has_repository_filter_drivers(cwd) {
+        return None;
+    }
+    read_git_status(cwd, workspace_trusted)
+}
+
 fn read_git_status(cwd: &Path, workspace_trusted: bool) -> Option<String> {
     let stdout = read_git_output(cwd, workspace_trusted, &["status", "--short", "--branch"])?;
     let trimmed = stdout.trim();

@@ -80,7 +80,7 @@ impl LiveCli {
 
 /// The session's catalog, fetched again with the session's gateway
 /// credential when it was dropped (after `/upgrade` or a plan change).
-fn session_catalog() -> Option<std::sync::Arc<crate::gateway_catalog::Catalog>> {
+pub(crate) fn session_catalog() -> Option<std::sync::Arc<crate::gateway_catalog::Catalog>> {
     active_provider().filter(|active| active.id == ProviderId::ZeroX)?;
     if let Some(catalog) = crate::gateway_catalog::current() {
         return Some(catalog);
