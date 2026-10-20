@@ -201,26 +201,34 @@ describe.skipIf(!haveBinaries)('neuron engine --stdio', () => {
     try {
       await client.start({ cwd: workspaceFor('sign-in') })
       await until('the first status', () => statuses.length > 0)
+      expect(statuses[0]!.sign_in_required).toBe(true)
       expect(needsSignIn(statuses[0]!)).toBe(true)
 
       const refused = await runTurn(client, { text: 'hello' }, () => {})
       expect(refused.error).toContain('/login')
 
       const codes: SignInCodeEvent[] = []
+      const order: string[] = []
       const login = await runExchange(
         client,
         () => client.slash('login'),
         (event) => {
           if (event.type === 'sign_in_code') codes.push(event)
+          if (event.type === 'sign_in_code' || event.type === 'session_starting' || event.type === 'turn_finished') {
+            order.push(event.type)
+          }
         },
       )
       expect(login.error).toBeNull()
       expect(codes).toHaveLength(1)
       expect(codes[0]!.user_code).toBe(FAKE_USER_CODE)
       expect(codes[0]!.browser_opened).toBe(false)
+      // The session opens between the approval and the end of /login.
+      expect(order).toEqual(['sign_in_code', 'session_starting', 'turn_finished'])
 
       await until('a signed-in status', () => statuses.at(-1)?.signed_in === true)
       const signedIn = statuses.at(-1)!
+      expect(signedIn.sign_in_required).toBe(false)
       expect(needsSignIn(signedIn)).toBe(false)
       expect(signedIn.account?.plan).toBe('pro')
 
