@@ -219,8 +219,6 @@ export function buildWindowsWatchdogScripts(options: {
    * real one — exactly what a reused pid looks like from the watchdog's side.
    */
   ownerStartOverride?: string
-  /** Where the grandchild runs (see windowsWatchdogSpawnOptions). */
-  workingDirectory?: string
 }): { bootstrapScript: string; watchdogScript: string } {
   const { ownerPid } = options
   // The payload rides as a numeric byte array, which keeps the script free of
@@ -275,26 +273,24 @@ export function buildWindowsWatchdogScripts(options: {
     options.ownerStartOverride !== undefined
       ? String(Math.trunc(Number(options.ownerStartOverride)) || 0)
       : `(Get-Process -Id ${ownerPid} -ErrorAction Stop).StartTime.ToFileTimeUtc()`
-  const workingDirectory = options.workingDirectory
-    ? ` -WorkingDirectory ${psQuote(options.workingDirectory)}`
-    : ''
   const bootstrapScript =
     `$t = ${ownerStart}; ` +
     `Start-Process -FilePath ${psQuote(options.powershell)} ` +
-    `-ArgumentList (${psQuote(watchdogArgs)}.Replace('${OWNER_START_TOKEN}', [string]$t)) -NoNewWindow` +
-    workingDirectory
+    `-ArgumentList (${psQuote(watchdogArgs)}.Replace('${OWNER_START_TOKEN}', [string]$t)) -NoNewWindow`
   return { bootstrapScript, watchdogScript }
 }
 
 /**
- * Where and with what environment the PowerShell bootstrap (and through
- * Start-Process, the watchdog) runs. Not in the user's project: PowerShell
- * keeps per-user caches (ModuleAnalysisCache, StartupProfileData) under
- * `%LOCALAPPDATA%\Microsoft\Windows\PowerShell`, and when LOCALAPPDATA is
+ * Where and with what environment the PowerShell bootstrap runs; the watchdog
+ * it starts with Start-Process inherits both. Not in the user's project:
+ * PowerShell keeps per-user caches (ModuleAnalysisCache, StartupProfileData)
+ * under `%LOCALAPPDATA%\Microsoft\Windows\PowerShell`, and when LOCALAPPDATA is
  * missing from the environment it was handed that path is relative, so they
  * landed in the project root as `Microsoft/Windows/PowerShell/...`. The temp
- * directory is the working directory, the module analysis cache is pointed at
- * a file there, and a missing LOCALAPPDATA becomes the temp directory too.
+ * directory is the working directory, and a missing LOCALAPPDATA becomes the
+ * temp directory too. The module analysis cache itself stays where PowerShell
+ * keeps it: a fresh one is rebuilt over every installed module at start, which
+ * took the watchdog past its arming deadline on machines with many modules.
  */
 export function windowsWatchdogSpawnOptions(
   baseEnv: NodeJS.ProcessEnv = process.env,
@@ -304,10 +300,6 @@ export function windowsWatchdogSpawnOptions(
     cwd: tmpDir,
     env: {
       ...baseEnv,
-      PSModuleAnalysisCachePath: path.join(
-        tmpDir,
-        'neuron-tui-powershell-ModuleAnalysisCache',
-      ),
       ...(!baseEnv.LOCALAPPDATA && { LOCALAPPDATA: tmpDir }),
     },
   }
@@ -329,7 +321,6 @@ function spawnWindowsWatchdog(options: {
     armedPath: options.armedPath,
     powershell,
     ownerStartOverride: options.ownerStartOverride,
-    workingDirectory: cwd,
   })
 
   return spawn(
