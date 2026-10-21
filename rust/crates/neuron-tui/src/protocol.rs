@@ -60,6 +60,13 @@ pub struct ModelInfo {
     pub context_window: Option<u32>,
     /// Plan tiers that include it (`free`, `pro`, ...).
     pub tiers: Vec<String>,
+    /// The gateway's view now: `available`, `degraded`, `busy` or `blurred`
+    /// (not usable until `available_again_at`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// When a `blurred` model is back (ISO 8601).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_again_at: Option<String>,
 }
 
 /// The Zero-X login, as the UI may show it. Never carries the token.

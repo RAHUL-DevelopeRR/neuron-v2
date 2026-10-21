@@ -407,6 +407,13 @@ pub fn openai_model(model: &str) -> String {
     }
 }
 
+/// The model as people should see it: without the `openai/` routing prefix of
+/// [`openai_model`], which picks a client and is not part of its name (the
+/// gateway's catalog ids have none).
+pub fn shown_model(model: &str) -> &str {
+    model.strip_prefix("openai/").unwrap_or(model)
+}
+
 fn requested_or(requested: &str, fallback: impl FnOnce() -> String) -> String {
     if requested == AUTO_MODEL {
         fallback()
@@ -697,6 +704,7 @@ pub fn active_provider_name(model: &str) -> String {
 
 pub fn format_connected_line(model: &str) -> String {
     let provider = active_provider_name(model);
+    let model = shown_model(model);
     format!("{GREEN}{BOLD}\u{2713}{R} {DIM}Connected:{R} {BLUE}{BOLD}{model}{R} {DIM}via{R} {ORANGE}{provider}{R}")
 }
 
@@ -730,6 +738,11 @@ mod tests {
             "openai/claude-sonnet-4-6"
         );
         assert_eq!(openai_model("openai/auto"), "openai/auto");
+        assert_eq!(
+            shown_model(&openai_model("groq/openai/gpt-oss-120b")),
+            "groq/openai/gpt-oss-120b"
+        );
+        assert_eq!(shown_model("claude-sonnet-4-6"), "claude-sonnet-4-6");
     }
 
     #[test]

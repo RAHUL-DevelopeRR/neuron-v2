@@ -917,6 +917,18 @@ fn auth_login_with_token_status_and_logout_lifecycle() {
     assert!(report.contains("Requests today   42 / 100"), "{report}");
     assert!(!report.contains(SESSION_TOKEN));
 
+    // The same as JSON, with the format flag after `auth status` this time.
+    let mut status = workspace.command(&gateway);
+    status.args(["auth", "status", "--output-format", "json"]);
+    let output = run(status, None);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let json = stdout(&output);
+    assert!(!json.contains(SESSION_TOKEN));
+    let report: serde_json::Value = serde_json::from_str(&json).expect("JSON status");
+    assert_eq!(report["signed_in"], true);
+    assert_eq!(report["session"], "valid");
+    assert_eq!(report["account"]["requests_today"], 42);
+
     let mut logout = workspace.command(&gateway);
     logout.args(["auth", "logout"]);
     let output = run(logout, None);
@@ -928,8 +940,16 @@ fn auth_login_with_token_status_and_logout_lifecycle() {
     let mut status = workspace.command(&gateway);
     status.args(["auth", "status"]);
     let output = run(status, None);
-    assert!(output.status.success());
+    // Signed out is a failure for scripts that check before they run.
+    assert_eq!(output.status.code(), Some(1));
     assert!(stdout(&output).contains("Signed out of Zero-X"));
+
+    let mut status = workspace.command(&gateway);
+    status.args(["--output-format", "json", "auth", "status"]);
+    let output = run(status, None);
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("JSON status");
+    assert_eq!(report["signed_in"], false);
 }
 
 #[test]
@@ -942,7 +962,7 @@ fn corrupt_credentials_warn_and_logout_still_succeeds() {
     let mut status = workspace.command(&gateway);
     status.args(["auth", "status"]);
     let output = run(status, None);
-    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     assert!(stdout(&output).contains("Signed out of Zero-X"));
     assert!(stderr(&output).contains("Ignoring unreadable credential file"));
 

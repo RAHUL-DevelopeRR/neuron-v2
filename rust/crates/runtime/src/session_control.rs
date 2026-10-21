@@ -54,6 +54,7 @@ impl SessionStore {
             claw_root
         };
         fs::create_dir_all(&sessions_root)?;
+        ignore_in_git(sessions_root.parent().unwrap_or(&sessions_root));
         Ok(Self {
             sessions_root,
             workspace_root: cwd.to_path_buf(),
@@ -300,6 +301,19 @@ impl SessionStore {
             sessions.push(summary);
         }
         Ok(())
+    }
+}
+
+/// Keeps the session transcripts out of the user's `git status`: a `.gitignore`
+/// of `*` in the sessions folder (written once; an existing one is left alone).
+/// Best-effort: a read-only workspace still gets its sessions.
+fn ignore_in_git(sessions_dir: &Path) {
+    let ignore = sessions_dir.join(".gitignore");
+    if !ignore.exists() {
+        let _ = fs::write(
+            ignore,
+            "# Neuron session transcripts; they stay on this machine.\n*\n",
+        );
     }
 }
 
@@ -596,6 +610,24 @@ mod tests {
             .save_to_path(&handle.path)
             .expect("session should persist");
         session
+    }
+
+    #[test]
+    fn session_transcripts_stay_out_of_git() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("workspace");
+        let store = SessionStore::from_cwd(&root).expect("store");
+        let ignore = root.join(".neuron").join("sessions").join(".gitignore");
+        let rules = fs::read_to_string(&ignore).expect("the sessions folder ignores itself");
+        assert!(rules.lines().any(|line| line == "*"), "{rules}");
+        assert!(store
+            .sessions_dir()
+            .starts_with(root.join(".neuron").join("sessions")));
+
+        fs::write(&ignore, "mine\n").expect("edit");
+        SessionStore::from_cwd(&root).expect("store again");
+        assert_eq!(fs::read_to_string(&ignore).unwrap(), "mine\n", "left alone");
+        let _ = fs::remove_dir_all(root);
     }
 
     fn wait_for_next_millisecond() {

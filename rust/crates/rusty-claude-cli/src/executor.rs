@@ -362,7 +362,10 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "neuron v{VERSION}")?;
     writeln!(out)?;
     writeln!(out, "Usage:")?;
-    writeln!(out, "  neuron auth <login|logout|status>")?;
+    writeln!(
+        out,
+        "  neuron auth <login|logout|status> [--output-format text|json]"
+    )?;
     writeln!(
         out,
         "      Connect your Zero-X account to the coding gateway"
@@ -371,7 +374,10 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "  neuron [--model MODEL] [--allowedTools TOOL[,TOOL...]]"
     )?;
-    writeln!(out, "      Start the interactive REPL")?;
+    writeln!(
+        out,
+        "      Start the full-screen UI on a terminal (the line REPL with --no-tui, or without neuron-tui)"
+    )?;
     writeln!(
         out,
         "  neuron [--model MODEL] [--output-format text|json] prompt TEXT"
@@ -406,8 +412,6 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "      Diagnose local auth, config, workspace, and sandbox health"
     )?;
-    writeln!(out, "  npm run tui -- [-- --model MODEL]")?;
-    writeln!(out, "      Launch the optional React/Ink terminal frontend")?;
     writeln!(out, "  neuron acp [serve]")?;
     writeln!(
         out,
@@ -466,6 +470,10 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
         "  --no-tui                   Use the line REPL even where the full-screen UI is installed (or set NEURON_NO_TUI=1)"
+    )?;
+    writeln!(
+        out,
+        "  --continue [CHAT]          Reopen a chat in the full-screen UI (the latest, or CHAT)"
     )?;
     writeln!(
         out,

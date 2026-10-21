@@ -47,6 +47,8 @@ impl Default for ColorTheme {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Spinner {
     frame_index: usize,
+    /// For output that is not a terminal: no animation, and the end lines as text.
+    plain: bool,
 }
 
 impl Spinner {
@@ -57,12 +59,25 @@ impl Spinner {
         Self::default()
     }
 
+    /// For a file or a pipe: [`Self::tick`] draws nothing, and the end lines carry no
+    /// colours or cursor moves.
+    #[must_use]
+    pub fn plain() -> Self {
+        Self {
+            plain: true,
+            ..Self::default()
+        }
+    }
+
     pub fn tick(
         &mut self,
         label: &str,
         theme: &ColorTheme,
         out: &mut impl Write,
     ) -> io::Result<()> {
+        if self.plain {
+            return Ok(());
+        }
         let frame = Self::FRAMES[self.frame_index % Self::FRAMES.len()];
         self.frame_index += 1;
         queue!(
@@ -85,6 +100,10 @@ impl Spinner {
         out: &mut impl Write,
     ) -> io::Result<()> {
         self.frame_index = 0;
+        if self.plain {
+            writeln!(out, "\u{2714} {label}")?;
+            return out.flush();
+        }
         execute!(
             out,
             MoveToColumn(0),
@@ -103,6 +122,10 @@ impl Spinner {
         out: &mut impl Write,
     ) -> io::Result<()> {
         self.frame_index = 0;
+        if self.plain {
+            writeln!(out, "\u{2718} {label}")?;
+            return out.flush();
+        }
         execute!(
             out,
             MoveToColumn(0),

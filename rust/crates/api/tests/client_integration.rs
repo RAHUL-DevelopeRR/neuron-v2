@@ -232,7 +232,8 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
                 && event.action == "message_usage"
                 && event.properties.get("request_id") == Some(&json!("req_profile_123"))
                 && event.properties.get("total_tokens") == Some(&json!(7))
-                && event.properties.get("estimated_cost_usd") == Some(&json!("$0.0001"))
+                // claude-3-7-sonnet at $3 / $15 per million tokens: $0.0000264.
+                && event.properties.get("estimated_cost_usd") == Some(&json!("$0.0000"))
     ));
     assert!(matches!(
         &events[5],

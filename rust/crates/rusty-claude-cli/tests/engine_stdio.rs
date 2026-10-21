@@ -569,10 +569,9 @@ fn stdio_engine_signs_in_from_the_ui() {
             .is_some_and(|source| source.starts_with("stored login")),
         "{status}"
     );
-    assert!(
-        status["model"]
-            .as_str()
-            .is_some_and(|model| model.starts_with("openai/")),
+    // The gateway's default model, shown without the `openai/` routing prefix.
+    assert_eq!(
+        status["model"], "auto",
         "the session runs on the gateway: {status}"
     );
     assert!(

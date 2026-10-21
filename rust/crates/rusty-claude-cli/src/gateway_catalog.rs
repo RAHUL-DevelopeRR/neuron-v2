@@ -36,6 +36,11 @@ pub struct CatalogModel {
     pub tiers: Vec<String>,
     pub available: bool,
     pub unavailable_reason: Option<String>,
+    /// How the gateway sees it now: `available`, `degraded`, `busy` or `blurred`
+    /// (greyed out until `available_again_at`).
+    pub status: Option<String>,
+    /// When a `blurred` model can be used again (ISO 8601).
+    pub available_again_at: Option<String>,
 }
 
 impl CatalogModel {
@@ -69,6 +74,8 @@ impl CatalogModel {
                 .and_then(Value::as_bool)
                 .unwrap_or(true),
             unavailable_reason: string_field(value, "unavailable_reason"),
+            status: string_field(value, "status"),
+            available_again_at: string_field(value, "available_again_at"),
             id,
         })
     }
@@ -403,12 +410,23 @@ pub fn check_model(catalog: &Catalog, model: &str) -> ModelCheck {
 
 /// Warning to print for a `/model <id>` choice, if any.
 pub fn model_choice_warning(catalog: &Catalog, model: &str) -> Option<String> {
-    match check_model(catalog, model) {
+    let check = check_model(catalog, model);
+    let model = crate::provider::shown_model(model);
+    match check {
         ModelCheck::Available => None,
-        ModelCheck::Unavailable { reason } => Some(format!(
-            "warning: {model} is not available on your Zero-X plan ({reason}); requests will fail until you upgrade: {}",
-            crate::account::pricing_url()
-        )),
+        ModelCheck::Unavailable { reason } => Some(match reason.as_str() {
+            // Not a plan matter: this gateway has no provider set up for it.
+            "not_configured" => format!(
+                "warning: {model} is not configured on this Zero-X gateway; requests will fail. Pick another with /model."
+            ),
+            "region_unavailable" => format!(
+                "warning: {model} is not available in your region; requests will fail. Pick another with /model."
+            ),
+            _ => format!(
+                "warning: {model} is not available on your Zero-X plan ({reason}); requests will fail until you upgrade: {}",
+                crate::account::pricing_url()
+            ),
+        }),
         ModelCheck::Unknown { suggestions } => {
             let mut message = format!(
                 "warning: {model} is not in the Zero-X catalog; requests may fail. Run /model to list models."
@@ -589,6 +607,35 @@ mod tests {
         assert!(model_choice_warning(&catalog, "claude-opus-4-6")
             .unwrap()
             .contains("not in the Zero-X catalog"));
+    }
+
+    #[test]
+    fn model_status_is_kept_and_unconfigured_models_are_not_a_plan_matter() {
+        let models = parse_catalog(&serde_json::json!({"data": [
+            {"id": "gemini/gemini-2.5-flash", "available": true, "status": "blurred",
+             "available_again_at": "2026-10-22T06:59:59.693Z"},
+            {"id": "openai/gpt-5", "available": false, "unavailable_reason": "not_configured"},
+        ]}))
+        .unwrap();
+        assert_eq!(models[0].status.as_deref(), Some("blurred"));
+        assert_eq!(
+            models[0].available_again_at.as_deref(),
+            Some("2026-10-22T06:59:59.693Z")
+        );
+        let catalog = Catalog {
+            models,
+            ..sample_catalog()
+        };
+        let warning = model_choice_warning(&catalog, "openai/openai/gpt-5").unwrap();
+        assert!(
+            warning.contains("not configured on this Zero-X gateway"),
+            "{warning}"
+        );
+        assert!(!warning.contains("upgrade"), "{warning}");
+        assert!(
+            warning.starts_with("warning: openai/gpt-5 "),
+            "no routing prefix: {warning}"
+        );
     }
 
     #[test]

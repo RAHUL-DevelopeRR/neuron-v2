@@ -21,7 +21,7 @@ pub fn pricing_url() -> String {
 }
 
 /// The parts of `GET /api/account` the CLI renders.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct AccountSummary {
     pub email: Option<String>,
     pub plan_id: Option<String>,

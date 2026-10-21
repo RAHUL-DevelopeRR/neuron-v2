@@ -162,7 +162,7 @@ fn execute_with_cancel_stops_a_running_bash_command() {
     let output = parse(
         &GlobalToolRegistry::builtin()
             .execute_with_cancel("bash", &json!({ "command": command }), &token)
-            .expect("a cancelled command still returns its output"),
+            .expect_err("a cancelled command is an error result that keeps its output"),
     );
     canceller.join().expect("canceller thread");
     assert_eq!(output["interrupted"], true, "{output}");

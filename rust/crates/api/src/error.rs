@@ -734,7 +734,7 @@ impl Display for GatewayError {
         if let Some(resets_at) = &self.resets_at {
             write!(f, "; resets at {resets_at}")?;
         } else if let Some(seconds) = self.retry_after_seconds {
-            write!(f, "; retry in {seconds}s")?;
+            write!(f, "; retry in {}", describe_wait(seconds))?;
         }
         if let Some(upgrade_url) = &self.upgrade_url {
             write!(f, "; upgrade: {upgrade_url}")?;
@@ -743,6 +743,22 @@ impl Display for GatewayError {
             write!(f, "; request {request_id}")?;
         }
         Ok(())
+    }
+}
+
+/// A wait as people read it: `45s`, `12m`, `14h 45m`.
+#[must_use]
+pub fn describe_wait(seconds: u64) -> String {
+    match seconds {
+        0..=89 => format!("{seconds}s"),
+        90..=3599 => format!("{}m", (seconds + 30) / 60),
+        _ => {
+            let minutes = (seconds + 30) / 60;
+            match minutes % 60 {
+                0 => format!("{}h", minutes / 60),
+                rest => format!("{}h {rest}m", minutes / 60),
+            }
+        }
     }
 }
 
@@ -1096,5 +1112,13 @@ mod tests {
         assert_eq!(error.safe_failure_class(), "provider_auth");
         assert!(!error.is_retryable());
         assert_eq!(error.request_id(), None);
+    }
+
+    #[test]
+    fn retry_waits_read_as_hours_and_minutes() {
+        assert_eq!(super::describe_wait(45), "45s");
+        assert_eq!(super::describe_wait(120), "2m");
+        assert_eq!(super::describe_wait(3_600), "1h");
+        assert_eq!(super::describe_wait(53_094), "14h 45m");
     }
 }

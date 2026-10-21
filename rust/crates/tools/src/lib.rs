@@ -2074,13 +2074,24 @@ fn classify_bash_permission(command: &str) -> PermissionMode {
 }
 
 fn run_bash(input: &BashCommandInput, cancel: &CancellationToken) -> Result<String, String> {
-    if let Some(output) = workspace_test_branch_preflight(&input.command) {
-        return serde_json::to_string_pretty(&output).map_err(|error| error.to_string());
+    let output = match workspace_test_branch_preflight(&input.command) {
+        Some(output) => output,
+        None => execute_bash_with_cancel(input, cancel).map_err(|error| error.to_string())?,
+    };
+    shell_tool_result(&output)
+}
+
+/// Serializes a shell run. A run that failed (non-zero exit, timeout,
+/// cancellation, blocked) is returned as the error so its tool result is
+/// flagged `is_error`; the error text is the same JSON envelope, so the
+/// model still sees stdout, stderr and `returnCodeInterpretation`.
+fn shell_tool_result(output: &BashCommandOutput) -> Result<String, String> {
+    let rendered = to_pretty_json(output)?;
+    if output.failed() {
+        Err(rendered)
+    } else {
+        Ok(rendered)
     }
-    serde_json::to_string_pretty(
-        &execute_bash_with_cancel(input, cancel).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())
 }
 
 fn workspace_test_branch_preflight(command: &str) -> Option<BashCommandOutput> {
@@ -2337,7 +2348,7 @@ fn classify_powershell_permission(command: &str) -> PermissionMode {
 }
 
 fn run_powershell(input: PowerShellInput, cancel: &CancellationToken) -> Result<String, String> {
-    to_pretty_json(execute_powershell(input, cancel).map_err(|error| error.to_string())?)
+    shell_tool_result(&execute_powershell(input, cancel).map_err(|error| error.to_string())?)
 }
 
 fn to_pretty_json<T: serde::Serialize>(value: T) -> Result<String, String> {
@@ -3601,7 +3612,7 @@ const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
 const FALLBACK_AGENT_MODEL: &str = "auto";
 /// How long the `Agent` tool waits for a sub-agent before returning its
 /// partial status (the sub-agent keeps running in the background).
-const DEFAULT_AGENT_TIMEOUT: Duration = Duration::from_secs(600);
+const DEFAULT_AGENT_TIMEOUT: Duration = Duration::from_mins(10);
 const AGENT_TIMEOUT_ENV_VAR: &str = "NEURON_SUBAGENT_TIMEOUT_SECS";
 const AGENT_WAIT_POLL: Duration = Duration::from_millis(200);
 const SUBAGENT_REGISTERED_OUTPUT_CAP: u32 = 32_000;
@@ -7141,7 +7152,10 @@ mod tests {
         let policy = permission_policy_for_mode(PermissionMode::ReadOnly);
         let registry = GlobalToolRegistry::builtin().with_enforcer(PermissionEnforcer::new(policy));
 
-        let safe = registry.execute("bash", &json!({ "command": "pwd", "timeout": 1000 }));
+        // cmd.exe has no `pwd` (and a failing command is an error result);
+        // its bare `cd` prints the directory the same way.
+        let print_cwd = if cfg!(windows) { "cd" } else { "pwd" };
+        let safe = registry.execute("bash", &json!({ "command": print_cwd, "timeout": 10_000 }));
         assert!(safe.is_ok(), "read-only bash command should run: {safe:?}");
 
         let denied = registry.execute("bash", &json!({ "command": "rm scratch.txt" }));
@@ -9723,8 +9737,9 @@ mod tests {
         assert_eq!(success_output["stdout"], "hello");
         assert_eq!(success_output["interrupted"], false);
 
+        // Failures are error results that still carry the structured output.
         let failure = execute_tool("bash", &json!({ "command": "printf 'oops' >&2; exit 7" }))
-            .expect("bash failure should still return structured output");
+            .expect_err("a non-zero exit is an error result");
         let failure_output: serde_json::Value = serde_json::from_str(&failure).expect("json");
         assert_eq!(failure_output["returnCodeInterpretation"], "exit_code:7");
         assert!(failure_output["stderr"]
@@ -9733,7 +9748,7 @@ mod tests {
             .contains("oops"));
 
         let timeout = execute_tool("bash", &json!({ "command": "sleep 1", "timeout": 10 }))
-            .expect("bash timeout should return output");
+            .expect_err("a timed-out command is an error result");
         let timeout_output: serde_json::Value = serde_json::from_str(&timeout).expect("json");
         assert_eq!(timeout_output["interrupted"], true);
         assert_eq!(timeout_output["returnCodeInterpretation"], "timeout");
@@ -9750,6 +9765,45 @@ mod tests {
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
         assert!(background_output["backgroundTaskId"].as_str().is_some());
         assert_eq!(background_output["noOutputExpected"], true);
+    }
+
+    /// A failing command (`node --test` exiting 1, say) must not look like a
+    /// success: the result is an error, and the model still gets the output
+    /// and the exit code.
+    #[test]
+    fn bash_non_zero_exit_is_an_error_result_that_keeps_the_output() {
+        let command = if cfg!(windows) {
+            "echo partial-out & echo failing-test 1>&2 & exit /b 3"
+        } else {
+            "echo partial-out; echo failing-test >&2; exit 3"
+        };
+        let failure = execute_tool("bash", &json!({ "command": command, "timeout": 20_000 }))
+            .expect_err("a non-zero exit is an error result");
+        let output: serde_json::Value = serde_json::from_str(&failure).expect("json envelope");
+        assert_eq!(
+            output["returnCodeInterpretation"], "exit_code:3",
+            "{output}"
+        );
+        assert!(
+            output["stdout"]
+                .as_str()
+                .is_some_and(|stdout| stdout.contains("partial-out")),
+            "{output}"
+        );
+        assert!(
+            output["stderr"]
+                .as_str()
+                .is_some_and(|stderr| stderr.contains("failing-test")),
+            "{output}"
+        );
+
+        let success = execute_tool(
+            "bash",
+            &json!({ "command": "echo fine", "timeout": 20_000 }),
+        )
+        .expect("a zero exit is a normal result");
+        let output: serde_json::Value = serde_json::from_str(&success).expect("json envelope");
+        assert!(output["returnCodeInterpretation"].is_null(), "{output}");
     }
 
     #[test]
@@ -9775,7 +9829,7 @@ mod tests {
             "bash",
             &json!({ "command": "cargo test --workspace --all-targets" }),
         )
-        .expect("preflight should return structured output");
+        .expect_err("a blocked command is an error result with structured output");
         let output_json: serde_json::Value = serde_json::from_str(&output).expect("json");
         assert_eq!(
             output_json["returnCodeInterpretation"],
@@ -9821,11 +9875,14 @@ mod tests {
         run_git(&root, &["checkout", "feature/targeted-tests"]);
         std::env::set_current_dir(&root).expect("set cwd");
 
+        // The command itself may fail (the repo has no Cargo.toml), which is
+        // an error result carrying the same envelope; only the preflight
+        // matters here.
         let output = execute_tool(
             "bash",
             &json!({ "command": "printf 'targeted ok'; cargo test -p runtime stale_branch" }),
         )
-        .expect("targeted commands should still execute");
+        .unwrap_or_else(std::convert::identity);
         let output_json: serde_json::Value = serde_json::from_str(&output).expect("json");
         assert_ne!(
             output_json["returnCodeInterpretation"],

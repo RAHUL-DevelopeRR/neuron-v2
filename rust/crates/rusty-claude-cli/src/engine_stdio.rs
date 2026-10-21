@@ -45,6 +45,8 @@ pub(crate) fn stdio_engine_args(args: &[String]) -> Option<Vec<String>> {
 
 /// Runs the stdio engine until its input ends.
 pub(crate) fn run_engine_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    // `ready` must not wait for the MCP servers.
+    crate::progress::set_mcp_startup(crate::progress::McpStartup::Background);
     let handle = match start(args) {
         Ok(handle) => handle,
         Err(message) => {

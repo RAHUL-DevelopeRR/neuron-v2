@@ -75,7 +75,7 @@ mod tool_ui;
 mod turn_sink;
 mod vault;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -118,9 +118,9 @@ use runtime::{
     load_system_prompt, pricing_for_model, resolve_expected_base, resolve_sandbox_status,
     ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
     ContentBlock, ConversationMessage, ConversationRuntime, McpServer, McpServerManager,
-    McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode, PermissionPolicy,
-    ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage,
-    ToolError, ToolExecutor, UsageTracker,
+    McpServerSpec, McpTool, MessageRole, PermissionMode, PermissionPolicy, ProjectContext,
+    PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolError,
+    ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -182,6 +182,7 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--allowedTools",
     "--allowed-tools",
     "--no-tui",
+    "--continue",
     "--resume",
     "--acp",
     "-acp",
@@ -215,17 +216,80 @@ fn main() {
                     "error": message,
                 })
             );
-        } else if message.contains("`neuron --help`") {
-            eprintln!("error: {message}");
-        } else {
+        } else if error.downcast_ref::<UsageError>().is_some()
+            && !message.contains("`neuron --help`")
+        {
             eprintln!(
                 "error: {message}
 
 Run `neuron --help` for usage."
             );
+        } else {
+            // A failure while running (a turn, the network, a tool) is not a usage
+            // question.
+            eprintln!("error: {message}");
         }
         std::process::exit(1);
     }
+}
+
+/// A command line that doesn't parse: `main` adds the pointer to `neuron --help`.
+#[derive(Debug)]
+struct UsageError(String);
+
+impl std::fmt::Display for UsageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UsageError {}
+
+/// The `--output-format json` answer of a turn that failed: the error, and what the turn
+/// had done by then (text, tool calls and their results).
+fn failed_turn_json(error: &str, model: &str, messages: &[ConversationMessage]) -> Value {
+    let blocks = || messages.iter().flat_map(|message| message.blocks.iter());
+    let text = messages
+        .iter()
+        .filter(|message| message.role == MessageRole::Assistant)
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    let tool_uses = blocks()
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, name, input } => {
+                Some(json!({ "id": id, "name": name, "input": input }))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let tool_results = blocks()
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                tool_name,
+                output,
+                is_error,
+            } => Some(json!({
+                "tool_use_id": tool_use_id,
+                "tool_name": tool_name,
+                "output": output,
+                "is_error": is_error,
+            })),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "type": "error",
+        "error": error,
+        "model": model,
+        "message": text,
+        "tool_uses": tool_uses,
+        "tool_results": tool_results,
+    })
 }
 
 /// Read piped stdin content when stdin is not a terminal.
@@ -273,23 +337,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         credentials::neuron_home().join("trusted_dirs.txt"),
     );
     let args: Vec<String> = env::args().skip(1).collect();
-    let (args, provider_choice) = extract_provider_flag(&args)?;
+    let (args, provider_choice) = extract_provider_flag(&args).map_err(UsageError)?;
     provider::set_provider_flag(provider_choice);
     let (args, no_tui) = full_screen::extract_no_tui_flag(args);
-    if let Some(auth_args) = auth::auth_alias(&args) {
-        return auth::run_auth_command(auth_args);
-    }
-    match args.first().map(String::as_str) {
-        Some("auth") => return auth::run_auth_command(&args[1..]),
-        Some("usage") => return account::run_usage_command(&args[1..]),
-        Some("upgrade") => return account::run_upgrade_command(&args[1..]),
-        _ => {}
+    let (args, continue_chat) = full_screen::extract_continue_flag(args);
+    // `auth`, `login`, `logout`, `usage` and `upgrade`, also after global flags.
+    if let Some(command) = auth::account_command(&args) {
+        return auth::run_account_command(&command);
     }
     // Hidden: the engine for a UI in another process, as JSON lines.
     if let Some(engine_args) = engine_stdio::stdio_engine_args(&args) {
         return engine_stdio::run_engine_command(&engine_args);
     }
-    match parse_args(&args)? {
+    let action = parse_args(&args).map_err(UsageError)?;
+    if continue_chat.is_some() && !matches!(action, CliAction::Repl { .. }) {
+        return Err(full_screen::CONTINUE_NEEDS_UI.into());
+    }
+    match action {
         CliAction::DumpManifests {
             output_format,
             manifests_dir,
@@ -343,6 +407,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             enforce_broad_cwd_policy(allow_broad_cwd, output_format)?;
             run_stale_base_preflight(base_commit.as_deref());
+            progress::set_mcp_startup(McpStartup::WaitWithoutBundled);
             // Workspace trust check (skip when stdin is piped so we don't consume the pipe)
             if std::io::stdin().is_terminal() {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -379,7 +444,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             cli.set_reasoning_effort(reasoning_effort);
             // Print a condensed welcome banner for one-shot mode so the user
             // sees model info and quota even when not in the REPL.
-            if output_format == CliOutputFormat::Text && !compact {
+            // Not to a file or a pipe: there it is noise around the answer.
+            if output_format == CliOutputFormat::Text && !compact && io::stdout().is_terminal() {
                 println!("{}", cli.startup_banner());
                 println!("{}", format_connected_line(&cli.model));
                 println!();
@@ -414,11 +480,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     reasoning_effort: reasoning_effort.as_deref(),
                     allow_broad_cwd,
                     base_commit: base_commit.as_deref(),
+                    continue_chat: continue_chat.clone(),
                 };
                 if let Some(ui_args) = full_screen::ui_args(&launch) {
                     let code = full_screen::run_ui(&ui, &ui_args)?;
                     std::process::exit(code);
                 }
+            }
+            if continue_chat.is_some() {
+                return Err(full_screen::CONTINUE_NEEDS_UI.into());
             }
             run_repl(
                 model,
@@ -1447,6 +1517,7 @@ fn run_repl(
     reasoning_effort: Option<String>,
     allow_broad_cwd: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    progress::set_mcp_startup(McpStartup::Background);
     // The loop itself lives in `repl_loop`: it renders turn and slash-command
     // failures (and panics) instead of propagating them, so one failed
     // request never ends the session.
@@ -1493,6 +1564,9 @@ struct RuntimeMcpState {
     manager: McpServerManager,
     pending_servers: Vec<String>,
     degraded_report: Option<runtime::McpDegradedReport>,
+    /// A stand-in while the servers start in the background ([`BackgroundMcp`]): it has
+    /// no tools yet, and calls say so.
+    starting: bool,
 }
 
 struct BuiltRuntime {
@@ -1601,15 +1675,57 @@ struct ReadMcpResourceRequest {
 
 impl RuntimeMcpState {
     fn new(
-        runtime_config: &runtime::RuntimeConfig,
+        servers: &BTreeMap<String, runtime::ScopedMcpServerConfig>,
     ) -> Result<Option<(Self, runtime::McpToolDiscoveryReport)>, Box<dyn std::error::Error>> {
-        let mut manager = McpServerManager::from_runtime_config(runtime_config);
+        let Some(mut state) = Self::not_started(servers)? else {
+            return Ok(None);
+        };
+        let discovery = state
+            .start(None)
+            .expect("a start without a cancel signal always finishes");
+        Ok(Some((state, discovery)))
+    }
+
+    /// The configured servers, none of them started yet; `None` when there are none.
+    fn not_started(
+        servers: &BTreeMap<String, runtime::ScopedMcpServerConfig>,
+    ) -> Result<Option<Self>, Box<dyn std::error::Error>> {
+        let manager = McpServerManager::from_servers(servers);
         if manager.server_names().is_empty() && manager.unsupported_servers().is_empty() {
             return Ok(None);
         }
+        Ok(Some(Self {
+            runtime: tokio::runtime::Runtime::new()?,
+            manager,
+            pending_servers: Vec::new(),
+            degraded_report: None,
+            starting: false,
+        }))
+    }
 
-        let runtime = tokio::runtime::Runtime::new()?;
-        let discovery = runtime.block_on(manager.discover_tools_best_effort());
+    /// Starts the servers and lists their tools. `None` when `cancel` fired first; the
+    /// servers started so far are stopped then.
+    fn start(
+        &mut self,
+        cancel: Option<&tokio::sync::Notify>,
+    ) -> Option<runtime::McpToolDiscoveryReport> {
+        let (runtime, manager) = (&self.runtime, &mut self.manager);
+        let discovery = match cancel {
+            None => runtime.block_on(manager.discover_tools_best_effort()),
+            Some(cancel) => {
+                let finished = runtime.block_on(async {
+                    tokio::select! {
+                        discovery = manager.discover_tools_best_effort() => Some(discovery),
+                        () = cancel.notified() => None,
+                    }
+                });
+                let Some(discovery) = finished else {
+                    let _ = self.shutdown();
+                    return None;
+                };
+                discovery
+            }
+        };
         let pending_servers = discovery
             .failed_servers
             .iter()
@@ -1629,7 +1745,8 @@ impl RuntimeMcpState {
             .map(|tool| tool.qualified_name.clone())
             .collect::<Vec<_>>();
         let failed_server_names = pending_servers.iter().cloned().collect::<BTreeSet<_>>();
-        let working_servers = manager
+        let working_servers = self
+            .manager
             .server_names()
             .into_iter()
             .filter(|server_name| !failed_server_names.contains(server_name))
@@ -1666,7 +1783,7 @@ impl RuntimeMcpState {
                     }
                 }))
                 .collect::<Vec<_>>();
-        let degraded_report = (!failed_servers.is_empty()).then(|| {
+        self.degraded_report = (!failed_servers.is_empty()).then(|| {
             runtime::McpDegradedReport::new(
                 working_servers,
                 failed_servers,
@@ -1674,16 +1791,18 @@ impl RuntimeMcpState {
                 available_tools,
             )
         });
+        self.pending_servers = pending_servers;
+        Some(discovery)
+    }
 
-        Ok(Some((
-            Self {
-                runtime,
-                manager,
-                pending_servers,
-                degraded_report,
-            },
-            discovery,
-        )))
+    /// The error for a call that came before the servers finished starting.
+    fn still_starting(&self) -> Result<(), ToolError> {
+        if self.starting {
+            return Err(ToolError::new(
+                "the MCP servers are still starting; try again in a moment",
+            ));
+        }
+        Ok(())
     }
 
     fn shutdown(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -1708,6 +1827,7 @@ impl RuntimeMcpState {
         qualified_tool_name: &str,
         arguments: Option<serde_json::Value>,
     ) -> Result<String, ToolError> {
+        self.still_starting()?;
         let response = self
             .runtime
             .block_on(self.manager.call_tool(qualified_tool_name, arguments))
@@ -1728,6 +1848,7 @@ impl RuntimeMcpState {
     }
 
     fn list_resources_for_server(&mut self, server_name: &str) -> Result<String, ToolError> {
+        self.still_starting()?;
         let result = self
             .runtime
             .block_on(self.manager.list_resources(server_name))
@@ -1740,6 +1861,7 @@ impl RuntimeMcpState {
     }
 
     fn list_resources_for_all_servers(&mut self) -> Result<String, ToolError> {
+        self.still_starting()?;
         let mut resources = Vec::new();
         let mut failures = Vec::new();
 
@@ -1776,6 +1898,7 @@ impl RuntimeMcpState {
     }
 
     fn read_resource(&mut self, server_name: &str, uri: &str) -> Result<String, ToolError> {
+        self.still_starting()?;
         let result = self
             .runtime
             .block_on(self.manager.read_resource(server_name, uri))
@@ -1789,9 +1912,9 @@ impl RuntimeMcpState {
 }
 
 fn build_runtime_mcp_state(
-    runtime_config: &runtime::RuntimeConfig,
+    servers: &BTreeMap<String, runtime::ScopedMcpServerConfig>,
 ) -> Result<RuntimePluginStateBuildOutput, Box<dyn std::error::Error>> {
-    let Some((mcp_state, discovery)) = RuntimeMcpState::new(runtime_config)? else {
+    let Some((mcp_state, discovery)) = RuntimeMcpState::new(servers)? else {
         return Ok((None, Vec::new()));
     };
 
@@ -1805,6 +1928,139 @@ fn build_runtime_mcp_state(
     }
 
     Ok((Some(Arc::new(Mutex::new(mcp_state))), runtime_tools))
+}
+
+/// MCP servers starting on a thread of their own, so neither the engine's `ready` nor
+/// the first turn waits for them (a first `npx -y` install takes tens of seconds). Until
+/// then the runtime has a stand-in state and only the MCP wrapper tools; the started
+/// servers and their tools replace it on the next turn (see
+/// `progress::runtime_uses_current_shared_state`).
+struct BackgroundMcp {
+    shared: Arc<BackgroundMcpShared>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+struct BackgroundMcpShared {
+    outcome: Mutex<BackgroundMcpOutcome>,
+    cancel: tokio::sync::Notify,
+}
+
+enum BackgroundMcpOutcome {
+    Starting,
+    Started(Box<RuntimeMcpState>, Vec<RuntimeToolDefinition>),
+    Failed(String),
+    /// Taken by [`BackgroundMcp::take_finished`], or stopped by [`BackgroundMcp::stop`].
+    Done,
+}
+
+/// How long [`BackgroundMcp::stop`] waits for the servers started so far to stop.
+const BACKGROUND_MCP_STOP_WAIT: Duration = Duration::from_secs(3);
+
+impl BackgroundMcp {
+    fn start(servers: BTreeMap<String, runtime::ScopedMcpServerConfig>) -> Self {
+        let shared = Arc::new(BackgroundMcpShared {
+            outcome: Mutex::new(BackgroundMcpOutcome::Starting),
+            cancel: tokio::sync::Notify::new(),
+        });
+        let worker = Arc::clone(&shared);
+        let spawned = thread::Builder::new()
+            .name("neuron-mcp-start".to_string())
+            .spawn(move || {
+                let finished = match RuntimeMcpState::not_started(&servers) {
+                    Ok(Some(mut state)) => state.start(Some(&worker.cancel)).map(|discovery| {
+                        // All the runtime tools: they replace the stand-in's.
+                        let mut tools = discovery
+                            .tools
+                            .iter()
+                            .map(mcp_runtime_tool_definition)
+                            .collect::<Vec<_>>();
+                        tools.extend(mcp_wrapper_tool_definitions());
+                        BackgroundMcpOutcome::Started(Box::new(state), tools)
+                    }),
+                    Ok(None) => Some(BackgroundMcpOutcome::Failed(
+                        "no MCP servers to start".to_string(),
+                    )),
+                    Err(error) => Some(BackgroundMcpOutcome::Failed(error.to_string())),
+                };
+                let mut outcome = worker.lock();
+                match finished {
+                    Some(finished) if matches!(*outcome, BackgroundMcpOutcome::Starting) => {
+                        *outcome = finished;
+                    }
+                    // Stopped while starting: nobody will take these servers.
+                    Some(BackgroundMcpOutcome::Started(mut state, _)) => {
+                        drop(outcome);
+                        let _ = state.shutdown();
+                    }
+                    _ => {}
+                }
+            });
+        let thread = match spawned {
+            Ok(thread) => Some(thread),
+            Err(error) => {
+                *shared.lock() = BackgroundMcpOutcome::Failed(error.to_string());
+                None
+            }
+        };
+        Self { shared, thread }
+    }
+
+    /// The started servers with their tools, or why they could not start; `None` while
+    /// they are still starting, and after the first answer.
+    fn take_finished(
+        &self,
+    ) -> Option<Result<(RuntimeMcpState, Vec<RuntimeToolDefinition>), String>> {
+        let mut outcome = self.shared.lock();
+        match std::mem::replace(&mut *outcome, BackgroundMcpOutcome::Done) {
+            BackgroundMcpOutcome::Started(state, tools) => Some(Ok((*state, tools))),
+            BackgroundMcpOutcome::Failed(error) => Some(Err(error)),
+            starting @ BackgroundMcpOutcome::Starting => {
+                *outcome = starting;
+                None
+            }
+            BackgroundMcpOutcome::Done => None,
+        }
+    }
+
+    /// Stops the start, or the started servers nobody took, and waits a little for them.
+    fn stop(mut self) {
+        let unclaimed = std::mem::replace(&mut *self.shared.lock(), BackgroundMcpOutcome::Done);
+        if let BackgroundMcpOutcome::Started(mut state, _) = unclaimed {
+            let _ = state.shutdown();
+        }
+        // A stored permit: the start may not be waiting on it yet.
+        self.shared.cancel.notify_one();
+        if let Some(thread) = self.thread.take() {
+            let deadline = Instant::now() + BACKGROUND_MCP_STOP_WAIT;
+            while !thread.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
+impl BackgroundMcpShared {
+    fn lock(&self) -> std::sync::MutexGuard<'_, BackgroundMcpOutcome> {
+        self.outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// The configured MCP servers without the bundled defaults (codebase-memory, playwright).
+fn mcp_servers_without_bundled(
+    runtime_config: &runtime::RuntimeConfig,
+) -> BTreeMap<String, runtime::ScopedMcpServerConfig> {
+    runtime_config
+        .mcp()
+        .servers()
+        .iter()
+        .filter(|(_, server)| server.scope != ConfigSource::Bundled)
+        .map(|(name, server)| (name.clone(), server.clone()))
+        .collect()
 }
 
 fn mcp_runtime_tool_definition(tool: &runtime::ManagedMcpTool) -> RuntimeToolDefinition {
@@ -2391,8 +2647,12 @@ impl LiveCli {
         };
 
         let hook_abort_monitor = self.prepare_turn_runtime(true)?;
-        let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
+        let mut spinner = if stdout.is_terminal() {
+            Spinner::new()
+        } else {
+            Spinner::plain()
+        };
         let spinner_label = if self.plan_mode {
             "\x1b[38;2;65;105;195m\u{25E6}\x1b[0m Planning..."
         } else if self.orchestration_mode.is_some() {
@@ -2500,12 +2760,25 @@ impl LiveCli {
     }
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let summary = self.run_one_shot_turn(input)?;
+        let before = self.runtime.session().messages.len();
+        let summary = match self.run_one_shot_turn(input) {
+            Ok(summary) => summary,
+            Err(error) => {
+                // What the turn did before it failed: a script must not mistake a
+                // failed run that already ran tools for one that did nothing.
+                let messages = self.runtime.session().messages.get(before..).unwrap_or(&[]);
+                println!(
+                    "{}",
+                    failed_turn_json(&error.to_string(), shown_model(&self.model), messages)
+                );
+                return Err(error);
+            }
+        };
         println!(
             "{}",
             json!({
                 "message": final_assistant_text(&summary),
-                "model": self.model,
+                "model": shown_model(&self.model),
                 "iterations": summary.iterations,
                 "outcome": repl_loop::turn_outcome_label(&summary.outcome),
                 "stop_reason": summary.stop_reason,
@@ -2522,12 +2795,15 @@ impl LiveCli {
                     "cache_creation_input_tokens": summary.usage.cache_creation_input_tokens,
                     "cache_read_input_tokens": summary.usage.cache_read_input_tokens,
                 },
+                // Gateway and other non-Claude models have no price list here: 0, and
+                // `estimated_cost_known` says the estimate is missing, not free.
                 "estimated_cost": format_usd(
-                    summary.usage.estimate_cost_usd_with_pricing(
-                        pricing_for_model(&self.model)
-                            .unwrap_or_else(runtime::ModelPricing::default_sonnet_tier)
-                    ).total_cost_usd()
-                )
+                    summary
+                        .usage
+                        .estimate_cost_usd_for_model(&self.model)
+                        .map_or(0.0, runtime::UsageCostEstimate::total_cost_usd)
+                ),
+                "estimated_cost_known": pricing_for_model(&self.model).is_some()
             })
         );
         Ok(())
@@ -4233,6 +4509,18 @@ fn build_runtime_plugin_state_with_loader(
     loader: &ConfigLoader,
     runtime_config: &runtime::RuntimeConfig,
 ) -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
+    build_runtime_plugin_state_starting_mcp(cwd, loader, runtime_config, McpStartup::Wait)
+        .map(|(state, _)| state)
+}
+
+/// [`build_runtime_plugin_state_with_loader`] with the MCP servers started as `startup`
+/// says; the [`BackgroundMcp`] is there when they start in the background.
+fn build_runtime_plugin_state_starting_mcp(
+    cwd: &Path,
+    loader: &ConfigLoader,
+    runtime_config: &runtime::RuntimeConfig,
+    startup: McpStartup,
+) -> Result<(RuntimePluginState, Option<BackgroundMcp>), Box<dyn std::error::Error>> {
     let plugin_manager = build_plugin_manager(cwd, loader, runtime_config);
     let plugin_registry = plugin_manager.plugin_registry()?;
     let plugin_hook_config =
@@ -4241,15 +4529,38 @@ fn build_runtime_plugin_state_with_loader(
         .feature_config()
         .clone()
         .with_hooks(runtime_config.hooks().merged(&plugin_hook_config));
-    let (mcp_state, runtime_tools) = build_runtime_mcp_state(runtime_config)?;
+    let servers = match startup {
+        McpStartup::WaitWithoutBundled => mcp_servers_without_bundled(runtime_config),
+        McpStartup::Wait | McpStartup::Background => runtime_config.mcp().servers().clone(),
+    };
+    let stand_in = match startup {
+        McpStartup::Background => {
+            RuntimeMcpState::not_started(&servers)?.filter(|state| !state.server_names().is_empty())
+        }
+        McpStartup::Wait | McpStartup::WaitWithoutBundled => None,
+    };
+    let (mcp_state, runtime_tools, background) = if let Some(mut stand_in) = stand_in {
+        stand_in.starting = true;
+        (
+            Some(Arc::new(Mutex::new(stand_in))),
+            mcp_wrapper_tool_definitions(),
+            Some(BackgroundMcp::start(servers)),
+        )
+    } else {
+        let (mcp_state, runtime_tools) = build_runtime_mcp_state(&servers)?;
+        (mcp_state, runtime_tools, None)
+    };
     let tool_registry = GlobalToolRegistry::with_plugin_tools(plugin_registry.aggregated_tools()?)?
         .with_runtime_tools(runtime_tools)?;
-    Ok(RuntimePluginState {
-        feature_config,
-        tool_registry,
-        plugin_registry,
-        mcp_state,
-    })
+    Ok((
+        RuntimePluginState {
+            feature_config,
+            tool_registry,
+            plugin_registry,
+            mcp_state,
+        },
+        background,
+    ))
 }
 
 fn build_plugin_manager(
@@ -4302,30 +4613,30 @@ fn runtime_hook_config_from_plugin_hooks(hooks: PluginHooks) -> runtime::Runtime
 #[cfg(test)]
 mod tests {
     use super::{
-        build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
-        collect_session_prompt_history, create_managed_session_handle, describe_tool_progress,
-        filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
-        format_commit_skipped_report, format_compact_report, format_connected_line,
-        format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
-        format_issue_report, format_model_report, format_model_switch_report,
-        format_permissions_report, format_permissions_switch_report, format_pr_report,
-        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
-        format_ultraplan_report, format_unknown_slash_command,
+        build_runtime_plugin_state_starting_mcp, build_runtime_plugin_state_with_loader,
+        build_runtime_with_plugin_state, collect_session_prompt_history,
+        create_managed_session_handle, describe_tool_progress, filter_tool_specs,
+        format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
+        format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
+        format_internal_prompt_progress_line, format_issue_report, format_model_report,
+        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
+        format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
+        format_tool_result, format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
-        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
-        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
-        parse_history_count, permission_policy, print_help_to, push_output_block,
-        render_config_report, render_diff_report, render_diff_report_for, render_memory_report,
-        render_prompt_history_report, render_repl_help, render_resume_usage,
+        mcp_servers_without_bundled, merge_prompt_with_stdin, normalize_permission_mode,
+        parse_args, parse_export_args, parse_git_status_branch, parse_git_status_metadata_for,
+        parse_git_workspace_summary, parse_history_count, permission_policy, print_help_to,
+        push_output_block, render_config_report, render_diff_report, render_diff_report_for,
+        render_memory_report, render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
         resolve_repl_model, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, status_context,
         summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_no_args,
-        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
-        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        PromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
-        STUB_COMMANDS,
+        write_mcp_server_fixture, BackgroundMcp, CliAction, CliOutputFormat, CliToolExecutor,
+        GitWorkspaceSummary, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
+        LocalHelpTopic, McpStartup, PromptHistoryEntry, SlashCommand, StatusUsage,
+        BACKGROUND_MCP_STOP_WAIT, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -4343,7 +4654,7 @@ mod tests {
     use std::process::Command;
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::thread;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use tools::GlobalToolRegistry;
 
     fn registry_with_plugin_tool() -> GlobalToolRegistry {
@@ -5216,8 +5527,8 @@ mod tests {
 
     #[test]
     fn login_and_logout_after_global_options_error_helpfully() {
-        // `neuron login` itself runs before parsing (auth::auth_alias); the parser only sees
-        // it after global options, which it does not take.
+        // `neuron login` itself runs before parsing (auth::account_command); this is what
+        // the parser says if it ever sees it.
         let login = parse_args(&["login".to_string()]).expect_err("login is not a parser action");
         assert!(login.contains("run `neuron login`"));
         assert!(login.contains("ANTHROPIC_API_KEY"));
@@ -7479,12 +7790,7 @@ UU conflicted.rs",
         fs::create_dir_all(&workspace).expect("workspace");
         let script_path = workspace.join("fixture-mcp.py");
         write_mcp_server_fixture(&script_path);
-        let python_command = if cfg!(windows) { "py" } else { "python3" };
-        let python_args = if cfg!(windows) {
-            vec!["-3".to_string()]
-        } else {
-            Vec::new()
-        };
+        let (python_command, python_args) = fixture_python();
         let alpha_args = [
             python_args.clone(),
             vec![script_path.to_string_lossy().into_owned()],
@@ -7599,6 +7905,186 @@ UU conflicted.rs",
                 .shutdown()
                 .expect("mcp shutdown should succeed");
         }
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    /// The Python that runs the MCP server fixture: the `py -3` launcher on Windows, or
+    /// `python` where only that is installed.
+    fn fixture_python() -> (&'static str, Vec<String>) {
+        if !cfg!(windows) {
+            return ("python3", Vec::new());
+        }
+        if Command::new("py").arg("--version").output().is_ok() {
+            ("py", vec!["-3".to_string()])
+        } else {
+            ("python", Vec::new())
+        }
+    }
+
+    #[test]
+    fn a_failed_json_turn_reports_what_it_did_first() {
+        let messages = vec![
+            ConversationMessage {
+                role: MessageRole::Assistant,
+                blocks: vec![
+                    ContentBlock::Text {
+                        text: "Running the tests.".to_string(),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "t1".to_string(),
+                        name: "bash".to_string(),
+                        input: r#"{"command":"cargo test"}"#.to_string(),
+                    },
+                ],
+                usage: None,
+            },
+            ConversationMessage {
+                role: MessageRole::Tool,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".to_string(),
+                    tool_name: "bash".to_string(),
+                    output: "exit_code:1".to_string(),
+                    is_error: true,
+                }],
+                usage: None,
+            },
+        ];
+        let report = super::failed_turn_json("gateway returned 503", "auto", &messages);
+        assert_eq!(report["type"], "error");
+        assert_eq!(report["error"], "gateway returned 503");
+        assert_eq!(report["message"], "Running the tests.");
+        assert_eq!(report["tool_uses"][0]["name"], "bash");
+        assert_eq!(report["tool_results"][0]["is_error"], true);
+    }
+
+    /// A workspace whose settings configure the fixture server `alpha` only.
+    fn workspace_with_fixture_mcp_server() -> (PathBuf, PathBuf) {
+        let config_home = temp_dir();
+        let workspace = temp_dir();
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let script_path = workspace.join("fixture-mcp.py");
+        write_mcp_server_fixture(&script_path);
+        let (command, mut args) = fixture_python();
+        args.push(script_path.to_string_lossy().into_owned());
+        fs::write(
+            config_home.join("settings.json"),
+            json!({
+                "defaultMcpServers": false,
+                "mcpServers": {
+                    "alpha": {
+                        "command": command,
+                        "args": args,
+                        "env": {"NEURON_MCP_FRAMING": "content-length"}
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write mcp settings");
+        (config_home, workspace)
+    }
+
+    #[test]
+    fn mcp_servers_started_in_the_background_join_once_they_are_up() {
+        let (config_home, workspace) = workspace_with_fixture_mcp_server();
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let runtime_config = loader.load().expect("runtime config should load");
+        let (state, background) = build_runtime_plugin_state_starting_mcp(
+            &workspace,
+            &loader,
+            &runtime_config,
+            McpStartup::Background,
+        )
+        .expect("runtime plugin state should build at once");
+        let background = background.expect("the servers start in the background");
+
+        // Until then: the wrapper tools, and a stand-in that says the servers are starting.
+        let tools = state
+            .tool_registry
+            .definitions(None)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        assert!(tools.contains(&"MCPTool".to_string()));
+        assert!(!tools.contains(&"mcp__alpha__echo".to_string()));
+        let mut executor = CliToolExecutor::new(
+            None,
+            false,
+            state.tool_registry.clone(),
+            state.mcp_state.clone(),
+        );
+        let early = executor
+            .execute(
+                "MCPTool",
+                r#"{"qualifiedName":"mcp__alpha__echo","arguments":{"text":"early"}}"#,
+            )
+            .expect_err("no MCP tool runs before the servers started");
+        assert!(early.to_string().contains("still starting"), "{early}");
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let (mut started, tools) = loop {
+            if let Some(finished) = background.take_finished() {
+                break finished.expect("the fixture server starts");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the fixture server never started"
+            );
+            thread::sleep(Duration::from_millis(50));
+        };
+        assert!(
+            tools.iter().any(|tool| tool.name == "mcp__alpha__echo"),
+            "the started server's tools come with it"
+        );
+        assert!(!started.starting);
+        assert!(background.take_finished().is_none(), "taken once");
+        started.shutdown().expect("mcp shutdown should succeed");
+        background.stop();
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn stopping_a_background_mcp_start_returns_promptly() {
+        let (config_home, workspace) = workspace_with_fixture_mcp_server();
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let runtime_config = loader.load().expect("runtime config should load");
+        let background = BackgroundMcp::start(runtime_config.mcp().servers().clone());
+        let stopping = Instant::now();
+        background.stop();
+        assert!(
+            stopping.elapsed() < BACKGROUND_MCP_STOP_WAIT + Duration::from_secs(1),
+            "stop waits at most {BACKGROUND_MCP_STOP_WAIT:?}"
+        );
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn one_shot_runs_leave_out_the_bundled_mcp_servers() {
+        let config_home = temp_dir();
+        let workspace = temp_dir();
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(
+            config_home.join("settings.json"),
+            json!({"mcpServers": {"mine": {"command": "my-server"}}}).to_string(),
+        )
+        .expect("write mcp settings");
+        let runtime_config = ConfigLoader::new(&workspace, &config_home)
+            .load()
+            .expect("runtime config should load");
+        assert!(
+            runtime_config.mcp().servers().contains_key("playwright"),
+            "the bundled defaults are on"
+        );
+        let servers = mcp_servers_without_bundled(&runtime_config);
+        assert_eq!(servers.keys().collect::<Vec<_>>(), vec!["mine"]);
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(workspace);

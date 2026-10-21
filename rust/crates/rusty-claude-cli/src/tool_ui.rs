@@ -76,6 +76,16 @@ pub fn format_tool_call_start(name: &str, input: &str) -> String {
 pub fn format_tool_result(name: &str, output: &str, is_error: bool) -> String {
     let icon = if is_error { ICON_ERR } else { ICON_OK };
 
+    // A failed command keeps its envelope (exit code, stdout, stderr): show it like a
+    // finished one, with the error icon.
+    if is_error && matches!(name, "bash" | "Bash" | "PowerShell") {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(output) {
+            if parsed.get("stdout").is_some() || parsed.get("stderr").is_some() {
+                return format_bash_result(icon, &parsed);
+            }
+        }
+    }
+
     if is_error {
         let summary = truncate_for_summary(output.trim(), 160);
         return if summary.is_empty() {

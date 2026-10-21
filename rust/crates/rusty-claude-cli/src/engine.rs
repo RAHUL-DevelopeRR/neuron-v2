@@ -313,7 +313,7 @@ impl SignedOut<'_> {
                 }
                 EngineCommand::SetModel { .. } | EngineCommand::Interrupt => {}
                 EngineCommand::ListModels => self.send(UiEvent::Models {
-                    current: self.options.model.clone(),
+                    current: shown_model(&self.options.model).to_string(),
                     models: Vec::new(),
                 }),
             }
@@ -414,7 +414,10 @@ impl AccountState {
             Ok(Some(credential)) => Self {
                 signed_in: !credential.is_expired(crate::clock::now_unix()),
                 info: Some(AccountInfo {
-                    email: email.map(str::to_string),
+                    // This engine's sign-in, else the one stored with the login.
+                    email: email
+                        .map(str::to_string)
+                        .or_else(|| credential.email.clone()),
                     plan: credential.plan.clone(),
                     source: credential.source.describe(),
                     expires_at: credential.expires_at,
@@ -437,7 +440,7 @@ fn status_event(
 ) -> UiEvent {
     let cwd = env::current_dir().unwrap_or_default();
     UiEvent::Status {
-        model: model.to_string(),
+        model: shown_model(model).to_string(),
         permission_mode: permission_mode.as_str().to_string(),
         session_id: session_id.to_string(),
         workspace_trusted: ConfigLoader::default_for(&cwd).workspace_is_trusted(),
@@ -1088,12 +1091,14 @@ impl Engine {
                         unavailable_reason: model.unavailable_reason.clone(),
                         context_window: model.context_window,
                         tiers: model.tiers.clone(),
+                        status: model.status.clone(),
+                        available_again_at: model.available_again_at.clone(),
                     })
                     .collect()
             })
             .unwrap_or_default();
         self.send(UiEvent::Models {
-            current: self.cli.model.clone(),
+            current: shown_model(&self.cli.model).to_string(),
             models,
         });
     }

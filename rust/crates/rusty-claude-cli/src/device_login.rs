@@ -65,6 +65,8 @@ pub enum DeviceLoginError {
     Invalid(String),
     /// The gateway could not be reached when the sign-in started.
     Unavailable(String),
+    /// The gateway is limiting sign-in attempts (HTTP 429); seconds to wait, when it said.
+    RateLimited(Option<u64>),
 }
 
 impl std::fmt::Display for DeviceLoginError {
@@ -79,6 +81,15 @@ impl std::fmt::Display for DeviceLoginError {
             ),
             Self::Invalid(message) => write!(f, "Sign-in failed: {message}"),
             Self::Unavailable(message) => write!(f, "Could not reach Zero-X: {message}"),
+            Self::RateLimited(Some(seconds)) => write!(
+                f,
+                "Zero-X is limiting sign-in attempts; try again in {}.",
+                api::describe_wait(*seconds)
+            ),
+            Self::RateLimited(None) => write!(
+                f,
+                "Zero-X is limiting sign-in attempts; try again in a minute."
+            ),
         }
     }
 }
@@ -92,6 +103,7 @@ impl From<DeviceLoginError> for std::io::Error {
             DeviceLoginError::Expired => std::io::ErrorKind::TimedOut,
             DeviceLoginError::Cancelled => std::io::ErrorKind::Interrupted,
             DeviceLoginError::Unavailable(_) => std::io::ErrorKind::ConnectionRefused,
+            DeviceLoginError::RateLimited(_) => std::io::ErrorKind::WouldBlock,
             DeviceLoginError::Unsupported | DeviceLoginError::Invalid(_) => {
                 std::io::ErrorKind::InvalidData
             }
@@ -173,6 +185,9 @@ pub fn request_code(
         .map_err(DeviceLoginError::Unavailable)?;
     if status == 404 || status == 405 {
         return Err(DeviceLoginError::Unsupported);
+    }
+    if status == 429 {
+        return Err(DeviceLoginError::RateLimited(retry_after_seconds(&value)));
     }
     if !(200..300).contains(&status) {
         return Err(DeviceLoginError::Unavailable(error_message(
@@ -269,6 +284,21 @@ fn error_message(value: &Value, fallback: &str) -> String {
         .and_then(|error| error.get("message").or(Some(error)))
         .and_then(Value::as_str)
         .map_or_else(|| fallback.to_string(), str::to_string)
+}
+
+/// `retry_after` (or `retry_after_seconds`), in the error object or at the top.
+fn retry_after_seconds(value: &Value) -> Option<u64> {
+    let read = |value: &Value| {
+        ["retry_after", "retry_after_seconds"]
+            .iter()
+            .find_map(|key| value.get(*key).and_then(Value::as_f64))
+    };
+    value
+        .get("error")
+        .and_then(read)
+        .or_else(|| read(value))
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+        .map(|seconds| seconds.ceil() as u64)
 }
 
 fn error_code(value: &Value) -> Option<&str> {
@@ -848,6 +878,33 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, DeviceLoginError::Unsupported);
+    }
+
+    #[test]
+    fn a_rate_limited_sign_in_says_how_long_to_wait() {
+        let limited = |body: Value| {
+            run(
+                BASE,
+                &Script::new(vec![Ok((429, body))]),
+                &FakeClock::new(),
+                &seen(),
+                &client(),
+                &|_| false,
+            )
+            .unwrap_err()
+        };
+        let error = limited(json!({"error": {"code": "rate_limited", "retry_after": 125}}));
+        assert_eq!(error, DeviceLoginError::RateLimited(Some(125)));
+        assert_eq!(
+            error.to_string(),
+            "Zero-X is limiting sign-in attempts; try again in 2m."
+        );
+        let error = limited(json!({"error": "too many requests"}));
+        assert!(
+            error.to_string().contains("try again in a minute"),
+            "{error}"
+        );
+        assert!(!error.to_string().contains("Could not reach"), "{error}");
     }
 
     #[test]

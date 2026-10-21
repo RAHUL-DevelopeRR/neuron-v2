@@ -150,6 +150,9 @@ pub struct StoredCredential {
     /// Unix seconds after which the server no longer accepts the token.
     pub expires_at: Option<u64>,
     pub plan: Option<String>,
+    /// The account's email, as the gateway reported it, so a later session can show
+    /// who is signed in.
+    pub email: Option<String>,
     pub saved_at: u64,
 }
 
@@ -159,6 +162,7 @@ impl StoredCredential {
             token,
             expires_at: None,
             plan: None,
+            email: None,
             saved_at: crate::clock::now_unix(),
         }
     }
@@ -173,6 +177,7 @@ impl StoredCredential {
             token: self.token.expose().to_string(),
             expires_at: self.expires_at,
             plan: self.plan.clone(),
+            email: self.email.clone(),
             saved_at: self.saved_at,
         };
         Zeroizing::new(serde_json::to_string_pretty(&record).expect("record serializes"))
@@ -192,6 +197,7 @@ impl StoredCredential {
             token: SecureString::new(std::mem::take(&mut record.token)),
             expires_at: record.expires_at,
             plan: record.plan.take(),
+            email: record.email.take(),
             saved_at: record.saved_at,
         })
     }
@@ -205,6 +211,8 @@ struct CredentialRecord {
     expires_at: Option<u64>,
     #[serde(default)]
     plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
     #[serde(default)]
     saved_at: u64,
 }

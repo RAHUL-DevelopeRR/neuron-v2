@@ -7,7 +7,7 @@
 // the terminal.
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
@@ -97,6 +97,9 @@ impl TurnOutput {
     pub(crate) fn stream_sink(&self) -> Box<dyn TurnSink> {
         match self {
             Self::Silent => Box::new(SilentSink),
+            Self::Ansi if !io::stdout().is_terminal() => {
+                Box::new(AnsiSink::new(StripAnsi::new(io::stdout())))
+            }
             Self::Ansi => Box::new(AnsiSink::new(SyncRenderBuffer::new())),
             Self::Channel(events) => Box::new(ChannelSink::new(Sender::clone(events))),
         }
@@ -107,9 +110,69 @@ impl TurnOutput {
     pub(crate) fn tool_sink(&self) -> Box<dyn TurnSink> {
         match self {
             Self::Silent => Box::new(SilentSink),
+            Self::Ansi if !io::stdout().is_terminal() => {
+                Box::new(AnsiSink::new(StripAnsi::new(io::stdout())))
+            }
             Self::Ansi => Box::new(AnsiSink::new(io::stdout())),
             Self::Channel(events) => Box::new(ChannelSink::new(Sender::clone(events))),
         }
+    }
+}
+
+/// Writes to `inner` without terminal escape sequences (colours, cursor moves, titles):
+/// a turn printed to a file or a pipe should be text.
+pub(crate) struct StripAnsi<W: Write> {
+    inner: W,
+    state: StripState,
+}
+
+#[derive(Clone, Copy)]
+enum StripState {
+    Text,
+    Escape,
+    Csi,
+    Osc,
+    OscEscape,
+    Charset,
+}
+
+impl<W: Write> StripAnsi<W> {
+    pub(crate) fn new(inner: W) -> Self {
+        Self {
+            inner,
+            state: StripState::Text,
+        }
+    }
+}
+
+impl<W: Write> Write for StripAnsi<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut text = Vec::with_capacity(buf.len());
+        for &byte in buf {
+            self.state = match (self.state, byte) {
+                (StripState::Text, 0x1b) => StripState::Escape,
+                (StripState::Text, byte) => {
+                    text.push(byte);
+                    StripState::Text
+                }
+                (StripState::Escape, b'[') => StripState::Csi,
+                (StripState::Escape, b']') => StripState::Osc,
+                (StripState::Escape, b'(' | b')') => StripState::Charset,
+                // ESC 7, ESC 8 and the other two-byte sequences.
+                (StripState::Escape | StripState::Charset | StripState::OscEscape, _)
+                | (StripState::Csi, 0x40..=0x7e)
+                | (StripState::Osc, 0x07) => StripState::Text,
+                (StripState::Csi, _) => StripState::Csi,
+                (StripState::Osc, 0x1b) => StripState::OscEscape,
+                (StripState::Osc, _) => StripState::Osc,
+            };
+        }
+        self.inner.write_all(&text)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -239,6 +302,14 @@ impl ChannelSink {
         self.events
             .send(event)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "the Neuron UI closed"))
+    }
+}
+
+/// A response cut short (an interrupt, a failed stream) still ends its text block, so
+/// the UI never glues the next block onto it.
+impl Drop for ChannelSink {
+    fn drop(&mut self) {
+        let _ = self.end_block();
     }
 }
 
@@ -390,6 +461,40 @@ mod tests {
         drop(rx);
         let error = sink.text_delta("anyone?").unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn output_to_a_file_or_pipe_has_no_escape_sequences() {
+        let mut out = StripAnsi::new(Vec::new());
+        write!(
+            out,
+            "\x1b[38;2;65;105;195m\u{25E6}\x1b[0m Thinking\x1b7\x1b[2K\x1b8 done\x1b]0;title\x07 \x1b(Bok"
+        )
+        .unwrap();
+        // Split across writes, as a stream arrives.
+        out.write_all(b"\x1b[1").unwrap();
+        out.write_all(b"m bold\x1b[0m").unwrap();
+        assert_eq!(
+            String::from_utf8(out.inner).unwrap(),
+            "\u{25E6} Thinking done ok bold"
+        );
+    }
+
+    #[test]
+    fn a_response_cut_short_still_ends_its_text_block() {
+        let (tx, rx) = mpsc::channel();
+        let mut sink = ChannelSink::new(tx);
+        sink.text_delta("partial ans").unwrap();
+        drop(sink);
+        assert_eq!(
+            rx.try_iter().collect::<Vec<_>>(),
+            vec![
+                UiEvent::TextDelta {
+                    text: "partial ans".into()
+                },
+                UiEvent::TextBlockEnd,
+            ]
+        );
     }
 
     #[test]
