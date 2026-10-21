@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { TextAttributes } from '@opentui/core'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {

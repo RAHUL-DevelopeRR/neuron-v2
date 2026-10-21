@@ -6,3 +6,5 @@ bin
 *.log
 .DS_Store
 debug/
+# Temp files `bun build --compile` leaves when it cannot replace a running binary.
+*.bun-build

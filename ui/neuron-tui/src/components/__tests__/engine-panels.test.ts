@@ -91,6 +91,7 @@ describe('model picker', () => {
         detail: 'zx-fast · 131.1K context · free',
         available: true,
         current: true,
+        marker: null,
       },
       {
         id: 'zx-big',
@@ -98,9 +99,71 @@ describe('model picker', () => {
         detail: 'zx-big · 262.1K context · Pro plan only',
         available: false,
         current: false,
+        marker: null,
       },
     ])
     expect(modelRows(null)).toEqual([])
+  })
+
+  test('the current model matches with the engine’s openai/ wire prefix too', () => {
+    const rows = modelRows({ ...MODELS, current: 'openai/zx-fast' })
+    expect(rows.map((row) => row.current)).toEqual([true, false])
+  })
+
+  test('gateway reason codes read as words; not_configured is not a plan upgrade', () => {
+    const model = MODELS.models[1]!
+    const reasons = (reason: string | null) =>
+      modelRows({
+        ...MODELS,
+        models: [
+          { ...model, display_name: null, context_window: null, unavailable_reason: reason },
+        ],
+      })[0]!.detail
+    expect(reasons('not_configured')).toBe('not configured on this gateway')
+    expect(reasons('upgrade_required')).toBe('needs a plan upgrade')
+    expect(reasons('region_unavailable')).toBe('not available in your region')
+    expect(reasons(null)).toBe('not on your plan')
+  })
+
+  describe('gateway health', () => {
+    const NOW = Date.parse('2026-10-21T10:00:00Z')
+    const withStatus = (
+      status: 'available' | 'degraded' | 'busy' | 'blurred' | null | undefined,
+      availableAgainAt: string | null = null,
+    ): ModelsEvent => ({
+      ...MODELS,
+      models: [{ ...MODELS.models[0]!, status, available_again_at: availableAgainAt }],
+    })
+
+    test('a blurred model is greyed until it is back, with the time left', () => {
+      const [row] = modelRows(withStatus('blurred', '2026-10-21T13:20:00Z'), NOW)
+      expect(row!.available).toBe(false)
+      expect(row!.detail).toBe('zx-fast · 131.1K context · back in 3h 20m')
+      expect(row!.marker).toBeNull()
+    })
+
+    test('a blurred model without a return time is just unavailable', () => {
+      const [row] = modelRows(withStatus('blurred'), NOW)
+      expect(row!.available).toBe(false)
+      expect(row!.detail).toBe('zx-fast · 131.1K context · temporarily unavailable')
+    })
+
+    test('a blurred model whose time has passed can be picked again', () => {
+      const [row] = modelRows(withStatus('blurred', '2026-10-21T09:59:00Z'), NOW)
+      expect(row!.available).toBe(true)
+      expect(row!.detail).toBe('zx-fast · 131.1K context · free')
+    })
+
+    test('degraded and busy are marked but stay selectable', () => {
+      for (const status of ['degraded', 'busy'] as const) {
+        const [row] = modelRows(withStatus(status), NOW)
+        expect(row!.available).toBe(true)
+        expect(row!.marker).toBe(status)
+      }
+      // Older engines send no status; "available" needs no marker.
+      expect(modelRows(withStatus(undefined), NOW)[0]!.marker).toBeNull()
+      expect(modelRows(withStatus('available'), NOW)[0]!.marker).toBeNull()
+    })
   })
 
   test('the visible window keeps the focused row in view', () => {

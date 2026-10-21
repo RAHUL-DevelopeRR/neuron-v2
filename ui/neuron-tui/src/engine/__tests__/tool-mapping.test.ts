@@ -87,6 +87,19 @@ describe('mapToolResult', () => {
     ])
   })
 
+  test('a command that ran and failed still shows its output', () => {
+    // A non-zero exit is an error result carrying the command's output.
+    const output = JSON.stringify({
+      stdout: 'partial',
+      stderr: 'error: boom',
+      interrupted: false,
+      returnCodeInterpretation: 'exit_code:2',
+    })
+    expect(mapToolResult('bash', output, true)).toEqual([
+      { type: 'json', value: { stdout: 'partial', stderr: 'error: boom' } },
+    ])
+  })
+
   test('write_file reads as a created file, without the verbatim prefix', () => {
     const output = JSON.stringify({
       type: 'create',

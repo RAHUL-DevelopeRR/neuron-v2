@@ -1,15 +1,20 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
 // See ui/neuron-tui/PORTING.md.
 import { sanitizeTerminalOutput } from '@neuron-tui/common/util/terminal-safe-text'
+import { TextAttributes } from '@opentui/core'
 import { memo, useCallback } from 'react'
 
-import { ContentWithMarkdown } from './content-with-markdown'
 import { useTheme } from '../../hooks/use-theme'
 import { useChatStore } from '../../state/chat-store'
 import { getToolDisplayInfo } from '../../utils/tool-display'
 import { shouldCollapseToolByDefault } from '../../utils/constants'
+import { renderCodeText } from '../../utils/markdown-renderer'
 import { renderToolComponent } from '../tools/registry'
-import { ToolCallItem } from '../tools/tool-call-item'
+import {
+  ToolCallItem,
+  ToolFailureContext,
+  toolFailureOf,
+} from '../tools/tool-call-item'
 
 import type { ContentBlock } from '../../types/chat'
 import type { MarkdownPalette } from '../../utils/markdown-renderer'
@@ -120,13 +125,24 @@ export const ToolBranch = memo(
       },
     }
 
+    // Input and result are drawn as preformatted code, never parsed as
+    // Markdown: file contents keep their indentation, JSDoc ` * ` lines stay
+    // lines, and a ``` inside a file cannot end the block early.
     const displayContent = (
-      <ContentWithMarkdown
-        content={fullContent}
-        isStreaming={false}
-        codeBlockWidth={agentMarkdownOptions.codeBlockWidth}
-        palette={agentMarkdownOptions.palette}
-      />
+      <>
+        {renderCodeText(JSON.stringify(toolBlock.input, null, 2), {
+          ...agentMarkdownOptions,
+          lang: 'json',
+        })}
+        {toolBlock.output ? (
+          <>
+            {'\n\n'}
+            <span attributes={TextAttributes.BOLD}>Result:</span>
+            {'\n'}
+            {renderCodeText(toolBlock.output, agentMarkdownOptions)}
+          </>
+        ) : null}
+      </>
     )
 
     const renderableDisplayContent =
@@ -155,20 +171,22 @@ export const ToolBranch = memo(
 
     return (
       <box key={keyPrefix}>
-        {toolRenderConfig ? (
-          toolRenderConfig.content
-        ) : (
-          <ToolCallItem
-            name={headerName}
-            content={renderableDisplayContent}
-            isCollapsed={isCollapsed}
-            isStreaming={isStreaming}
-            streamingPreview={streamingPreview}
-            finishedPreview={finishedPreview}
-            onToggle={handleToggle}
-            titleSuffix={undefined}
-          />
-        )}
+        <ToolFailureContext.Provider value={toolFailureOf(toolBlock)}>
+          {toolRenderConfig ? (
+            toolRenderConfig.content
+          ) : (
+            <ToolCallItem
+              name={headerName}
+              content={renderableDisplayContent}
+              isCollapsed={isCollapsed}
+              isStreaming={isStreaming}
+              streamingPreview={streamingPreview}
+              finishedPreview={finishedPreview}
+              onToggle={handleToggle}
+              titleSuffix={undefined}
+            />
+          )}
+        </ToolFailureContext.Provider>
       </box>
     )
   },

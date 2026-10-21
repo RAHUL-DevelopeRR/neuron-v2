@@ -1,0 +1,20 @@
+# A bare `neuron` hands the console to the compiled UI; allow for the session
+# (a); Ctrl-C twice; neuron returns the UI's exit code. (The --continue hint
+# can't be seen here: see windows-console-check.ts.)
+wait 90000 Enter a coding task
+wait 60000 claude-opus-4-6
+sleep 500
+type PARITY_SCENARIO:bash_permission_prompt_approved
+send \r
+wait 60000 Permission needed
+sleep 600
+type a
+wait 60000 bash approved and executed
+gone 10000 Permission needed
+dump approved-for-session
+# Ctrl-C during a turn interrupts it; quit once it has ended.
+gone 30000 ■ Esc
+send \x03
+sleep 800
+send \x03
+exit 30000

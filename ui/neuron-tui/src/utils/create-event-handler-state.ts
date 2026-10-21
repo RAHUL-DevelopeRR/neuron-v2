@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import type { AgentMode } from './constants'
 import type { MessageUpdater } from './message-updater'
 import type {

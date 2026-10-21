@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { AskUserBridge } from '@neuron-tui/common/utils/ask-user-bridge'
 import { useEffect } from 'react'
 

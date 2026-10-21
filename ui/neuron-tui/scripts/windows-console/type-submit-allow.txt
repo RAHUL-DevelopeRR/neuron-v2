@@ -1,0 +1,26 @@
+# Typing, submit, the permission dialog (allow), then Ctrl-C twice to quit.
+wait 60000 Enter a coding task
+wait 60000 claude-opus-4-6
+sleep 500
+dump started
+type PARITY_SCENARIO:streaming_text
+wait 5000 PARITY_SCENARIO:streaming_text
+send \r
+wait 60000 Mock streaming says hello from the parity harness.
+dump streamed
+type PARITY_SCENARIO:bash_permission_prompt_approved
+send \r
+wait 60000 Permission needed
+dump permission-dialog
+sleep 600
+type y
+wait 60000 bash approved and executed
+gone 10000 Permission needed
+dump approved
+# Ctrl-C during a turn interrupts it; quit once it has ended.
+gone 30000 ■ Esc
+send \x03
+sleep 800
+dump after-first-ctrl-c
+send \x03
+exit 30000

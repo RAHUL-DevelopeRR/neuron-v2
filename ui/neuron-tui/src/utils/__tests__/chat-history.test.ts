@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { describe, test, expect, beforeEach, afterEach, mock } from 'bun:test'
 import * as fs from 'fs'
 import * as os from 'os'
@@ -199,5 +201,55 @@ describe('chat-history', () => {
     fs.writeFileSync(path.join(emptyDir, 'chat-messages.json'), '[]')
 
     expect(getAllChats(500, tempDataDir)).toHaveLength(0)
+  })
+
+  describe('a project with a legacy (folder-name-only) data directory', () => {
+    // tempDataDir is the project's own `projects/app-<hash>`; `legacy` is the
+    // `projects/app` every folder named `app` shared before.
+    let legacy = ''
+    const writeChatIn = (dataDir: string, chatId: string, prompt: string) => {
+      const saved = tempDataDir
+      tempDataDir = dataDir
+      try {
+        writeChat(chatId, prompt)
+      } finally {
+        tempDataDir = saved
+      }
+    }
+
+    beforeEach(() => {
+      legacy = fs.mkdtempSync(path.join(os.tmpdir(), 'neuron-tui-legacy-'))
+    })
+
+    afterEach(() => {
+      fs.rmSync(legacy, { recursive: true, force: true })
+    })
+
+    test('lists the old chats beside the new ones, each id once', () => {
+      writeChatIn(legacy, 'old-chat', 'from before the change')
+      writeChatIn(legacy, 'continued', 'legacy copy')
+      writeChat('continued', 'continued since, saved in the new directory')
+      writeChat('new-chat', 'after the change')
+
+      const chats = getAllChats(500, [tempDataDir, legacy])
+      expect(chats.map((chat) => chat.chatId).sort()).toEqual([
+        'continued',
+        'new-chat',
+        'old-chat',
+      ])
+      expect(chats.find((chat) => chat.chatId === 'continued')?.lastPrompt).toBe(
+        'continued since, saved in the new directory',
+      )
+    })
+
+    test('deleting a chat removes every copy of it', () => {
+      writeChatIn(legacy, 'continued', 'legacy copy')
+      writeChat('continued', 'new copy')
+
+      expect(deleteChatSession('continued', [tempDataDir, legacy])).toBe(true)
+      expect(fs.existsSync(path.join(tempDataDir, 'chats', 'continued'))).toBe(false)
+      expect(fs.existsSync(path.join(legacy, 'chats', 'continued'))).toBe(false)
+      expect(getAllChats(500, [tempDataDir, legacy])).toEqual([])
+    })
   })
 })

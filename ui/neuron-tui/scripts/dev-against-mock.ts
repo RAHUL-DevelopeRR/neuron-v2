@@ -9,10 +9,11 @@
 // sign-in panel, /login, /model and /logout. Its approval comes at the first
 // poll; prompts after it fail, since the fake has no chat endpoint.
 //
-// `--compiled` runs bin/neuron-tui (from `bun run build:binary`) instead of
-// the source, to check the binary. `--via-neuron` runs a bare `neuron`, which
+// `--compiled` runs bin/neuron-tui (from `bun run build:binary`), or the build
+// NEURON_TUI_BIN names, instead of the source, to check the binary. `--via-neuron` runs a bare `neuron`, which
 // should hand the terminal to that binary (NEURON_TUI_BIN), as an installed
-// Neuron does; it takes no prompt. Flags go before the prompt.
+// Neuron does; what follows goes to `neuron` (flags such as --continue, no
+// prompt). Flags go before the prompt.
 //
 // Needs `cargo build -p rusty-claude-cli -p mock-anthropic-service` in rust/,
 // or NEURON_BIN and NEURON_MOCK_BIN. Everything (engine config, UI settings,
@@ -44,7 +45,9 @@ const flags = new Set<string>()
 while (['--signed-out', '--compiled', '--via-neuron'].includes(args[0] ?? '')) flags.add(args.shift()!)
 if (flags.has('--via-neuron')) flags.add('--compiled')
 const signedOut = flags.has('--signed-out')
-const compiledBin = path.join(import.meta.dir, '..', 'bin', exe('neuron-tui'))
+// NEURON_TUI_BIN picks another build (one that is running can't be overwritten).
+const compiledBin =
+  process.env.NEURON_TUI_BIN || path.join(import.meta.dir, '..', 'bin', exe('neuron-tui'))
 if (flags.has('--compiled') && !fs.existsSync(compiledBin)) {
   console.error(`${compiledBin} not found. Run \`bun run build:binary <version>\` first.`)
   process.exit(1)
@@ -66,9 +69,14 @@ while (!baseUrl) {
 }
 reader.releaseLock()
 
-const home = fs.mkdtempSync(path.join(os.tmpdir(), 'neuron-tui-mock-'))
+// NEURON_TUI_DEV_HOME keeps one home across runs (to try `--continue`), and is
+// left in place; otherwise each run gets a fresh one that is removed after it.
+const keptHome = process.env.NEURON_TUI_DEV_HOME?.trim()
+const home = keptHome
+  ? path.resolve(keptHome)
+  : fs.mkdtempSync(path.join(os.tmpdir(), 'neuron-tui-mock-'))
 const workspace = path.join(home, 'workspace')
-fs.mkdirSync(workspace)
+fs.mkdirSync(workspace, { recursive: true })
 fs.writeFileSync(path.join(workspace, 'fixture.txt'), 'alpha parity line\nbeta line\ngamma parity line\n')
 
 // Only what a terminal and the OS need, so the user's own provider keys and
@@ -105,7 +113,7 @@ if (gateway) {
 
 const ui = Bun.spawn(
   flags.has('--via-neuron')
-    ? [neuronBin]
+    ? [neuronBin, ...args]
     : flags.has('--compiled')
     ? [compiledBin, ...args]
     : [process.execPath, 'run', path.join(import.meta.dir, '..', 'src', 'entry.ts'), ...args],
@@ -114,5 +122,14 @@ const ui = Bun.spawn(
 const code = await ui.exited
 mock.kill()
 gateway?.stop()
-fs.rmSync(home, { recursive: true, force: true })
+// The engine can hold files in the home for a few seconds after the UI exits
+// (Windows then refuses to delete them), so retry, quietly: a message here
+// would land over the UI's exit hint. A home left behind is in the temp folder.
+if (!keptHome) {
+  try {
+    fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 })
+  } catch {
+    // Left for the OS to clean up with the rest of the temp folder.
+  }
+}
 process.exit(code)

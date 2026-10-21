@@ -1,11 +1,69 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: a tool
+// result the engine marked an error draws as a failure (✗, error colour,
+// "failed" or "refused" and the reason). See ui/neuron-tui/PORTING.md.
 import { TextAttributes } from '@opentui/core'
-import React, { type ReactNode } from 'react'
+import React, { createContext, useContext, type ReactNode } from 'react'
 import stringWidth from 'string-width'
 
 import { useTheme } from '../../hooks/use-theme'
 import { Button } from '../button'
 
 import type { ChatTheme } from '../../types/theme-system'
+
+/** Why a tool call shows as failed: the engine refused it, or it ran and failed. */
+export interface ToolFailure {
+  label: 'refused' | 'failed'
+  /** The error text, without an `Error: ` prefix; `null` when there is none. */
+  reason: string | null
+}
+
+// The engine's own words for a call it would not run: the permission mode
+// ("tool 'write_file' requires workspace-write permission; current mode is
+// read-only"), a rule or hook, the user's denial, or no result at all.
+const REFUSAL_PATTERN =
+  /not allowed in read-only mode|requires '?[\w-]+'? permission|current mode is|requires approval|denied by|has been denied|the call was denied/i
+
+/** The failure to show for a tool block, or `null` for one that succeeded. */
+export function toolFailureOf(block: {
+  isError?: boolean
+  output?: string
+}): ToolFailure | null {
+  if (!block.isError) return null
+  const reason = (block.output ?? '').trim().replace(/^Error:\s*/, '')
+  return {
+    label: REFUSAL_PATTERN.test(reason) ? 'refused' : 'failed',
+    reason: reason || null,
+  }
+}
+
+/**
+ * Set by the tool row around a tool's renderer, so the shared pieces
+ * (SimpleToolCallItem, ToolCallItem, the edit header, the terminal command)
+ * draw a failed call without every renderer reading the flag itself.
+ */
+export const ToolFailureContext = createContext<ToolFailure | null>(null)
+
+export const useToolFailure = (): ToolFailure | null =>
+  useContext(ToolFailureContext)
+
+const MAX_REASON_LINES = 3
+
+/** The first lines of a failure's reason, under the tool's header. */
+export const ToolFailureReason = ({ reason }: { reason: string }) => {
+  const theme = useTheme()
+  const lines = reason.split('\n')
+  const shown =
+    lines.length > MAX_REASON_LINES
+      ? [...lines.slice(0, MAX_REASON_LINES), '…']
+      : lines
+  return (
+    <box style={{ paddingLeft: 2, width: '100%' }}>
+      <text fg={theme.muted} style={{ wrapMode: 'word' }}>
+        {shown.join('\n')}
+      </text>
+    </box>
+  )
+}
 
 interface ToolCallItemProps {
   name: string
@@ -135,13 +193,15 @@ export const SimpleToolCallItem = ({
   descriptionColor,
 }: SimpleToolCallItemProps) => {
   const theme = useTheme()
-  const bulletChar = '• '
+  const failure = useToolFailure()
+  const bulletChar = failure ? '✗ ' : '• '
+  const accent = failure ? theme.error : theme.foreground
 
-  return (
+  const row = (
     <box style={{ flexDirection: 'row', alignItems: 'center', width: '100%' }}>
       <text style={{ wrapMode: 'word' }}>
-        <span fg={theme.foreground}>{bulletChar}</span>
-        <span fg={theme.foreground} attributes={TextAttributes.BOLD}>
+        <span fg={accent}>{bulletChar}</span>
+        <span fg={accent} attributes={TextAttributes.BOLD}>
           {name}
         </span>
         <span fg={theme.foreground}> </span>
@@ -150,7 +210,16 @@ export const SimpleToolCallItem = ({
         ) : (
           description
         )}
+        {failure ? <span fg={theme.error}>{` ${failure.label}`}</span> : null}
       </text>
+    </box>
+  )
+
+  if (!failure?.reason) return row
+  return (
+    <box style={{ flexDirection: 'column', gap: 0, width: '100%' }}>
+      {row}
+      <ToolFailureReason reason={failure.reason} />
     </box>
   )
 }
@@ -167,6 +236,8 @@ export const ToolCallItem = ({
   dense = false,
 }: ToolCallItemProps) => {
   const theme = useTheme()
+  const failure = useToolFailure()
+  const accent = failure ? theme.error : theme.foreground
 
   const baseTextAttributes = theme.messageTextAttributes ?? 0
   const getAttributes = (extra: number = 0): number | undefined => {
@@ -175,7 +246,7 @@ export const ToolCallItem = ({
   }
 
   const isExpanded = !isCollapsed
-  const bulletChar = '• '
+  const bulletChar = failure ? '✗ ' : '• '
   const toggleIndicator = onToggle ? (isCollapsed ? '▸ ' : '▾ ') : ''
   const toggleLabel = onToggle ? toggleIndicator : bulletChar
   // Width in cells of the toggle label (toggle arrow or bullet). Used to align
@@ -211,18 +282,21 @@ export const ToolCallItem = ({
         >
           <text style={{ wrapMode: 'none' }}>
             <span
-              fg={theme.foreground}
+              fg={accent}
               attributes={isExpanded ? TextAttributes.BOLD : undefined}
             >
               {toggleLabel}
             </span>
-            <span fg={theme.foreground} attributes={TextAttributes.BOLD}>
+            <span fg={accent} attributes={TextAttributes.BOLD}>
               {name}
             </span>
             {titleSuffix ? (
               <span fg={theme.foreground} attributes={TextAttributes.BOLD}>
                 {` ${titleSuffix}`}
               </span>
+            ) : null}
+            {failure && !isStreaming ? (
+              <span fg={theme.error}>{` ${failure.label}`}</span>
             ) : null}
             {isStreaming ? (
               <span fg={theme.primary} attributes={TextAttributes.DIM}>

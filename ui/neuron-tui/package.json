@@ -10,6 +10,7 @@
     "start": "bun run src/entry.ts",
     "dev:mock": "bun run scripts/dev-against-mock.ts",
     "build:binary": "bun run scripts/build-binary.ts",
+    "check:console": "bun run scripts/windows-console-check.ts",
     "test": "bun run scripts/run-tests.ts",
     "typecheck": "tsc --noEmit -p ."
   },

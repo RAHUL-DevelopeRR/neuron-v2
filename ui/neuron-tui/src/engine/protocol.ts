@@ -51,16 +51,31 @@ export interface GitStatus {
   conflicted: number
 }
 
+/** The gateway's live health for a model (`status` in {@link ModelInfo}). */
+export type ModelStatus = 'available' | 'degraded' | 'busy' | 'blurred'
+
 /** One model the user can switch to. */
 export interface ModelInfo {
   id: string
   display_name: string | null
-  /** Whether the user's plan can use it now; `unavailable_reason` says why not. */
+  /**
+   * Whether the user's plan can use it now; `unavailable_reason` says why not
+   * (the gateway's `upgrade_required`, `region_unavailable`, `not_configured`,
+   * or its own words).
+   */
   available: boolean
   unavailable_reason: string | null
   context_window: number | null
   /** Plan tiers that include it (`free`, `pro`, ...). */
   tiers: string[]
+  /**
+   * The gateway's health for it: `degraded` and `busy` still work, `blurred`
+   * is out of rotation until `available_again_at`. Absent from older engines,
+   * `null` when the gateway did not say.
+   */
+  status?: ModelStatus | null
+  /** When a `blurred` model can be used again (ISO-8601), when known. */
+  available_again_at?: string | null
 }
 
 /** The Zero-X login, as the UI may show it. Never carries the token. */

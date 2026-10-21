@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 /**
  * `/copy` command — serialize the entire conversation (user + assistant text,
  * reasoning, tool calls with their inputs and outputs, sub-agents) into clean

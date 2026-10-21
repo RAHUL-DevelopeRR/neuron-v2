@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { pluralize } from '@neuron-tui/common/util/string'
 import { useKeyboard } from '@opentui/react'
 import React, { useCallback, useEffect, useMemo, useState } from 'react'

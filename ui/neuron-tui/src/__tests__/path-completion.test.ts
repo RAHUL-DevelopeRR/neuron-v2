@@ -1,3 +1,6 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: tilde
+// completion against a HOME written with either separator.
+// See ui/neuron-tui/PORTING.md.
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
 import os from 'os'
 import path from 'path'
@@ -176,6 +179,53 @@ describe('getPathCompletion', () => {
         expect(result.startsWith('~')).toBe(true)
       }
     })
+  })
+
+  describe('tilde with an injected home', () => {
+    // `tempDir` plays HOME. A forward-slash HOME (`C:/Users/me`, common under
+    // Git Bash or MSYS on Windows) used to make `~/` complete to an absolute
+    // path: the joined result has backslashes and never started with HOME.
+    const forwardSlashHome = () => tempDir.replace(/\\/g, '/')
+    const backslashHome = () => tempDir.replace(/\//g, '\\')
+
+    test('keeps the ~/ prefix with a forward-slash HOME', () => {
+      mkdirSync(path.join(tempDir, 'projects'))
+      expect(getPathCompletion('~/', forwardSlashHome())).toBe('~/projects/')
+      expect(getPathCompletion('~/pro', forwardSlashHome())).toBe('~/projects/')
+    })
+
+    test('keeps the ~ prefix for a common prefix too', () => {
+      mkdirSync(path.join(tempDir, 'project-alpha'))
+      mkdirSync(path.join(tempDir, 'project-beta'))
+      expect(getPathCompletion('~/pro', forwardSlashHome())).toBe('~/project-')
+    })
+
+    test('does not take a sibling of HOME for HOME itself', () => {
+      // HOME `<tmp>/me`, completing `~/../meg...` lands in `<tmp>/megan`,
+      // which is not under HOME and stays absolute.
+      mkdirSync(path.join(tempDir, 'me'))
+      mkdirSync(path.join(tempDir, 'megan'))
+      const home = path.join(tempDir, 'me').replace(/\\/g, '/')
+      const result = getPathCompletion('~/../meg', home)
+      expect(result).toBe(path.join(tempDir, 'megan') + path.sep)
+    })
+
+    if (process.platform === 'win32') {
+      test('keeps the ~\\ prefix with a backslash HOME', () => {
+        mkdirSync(path.join(tempDir, 'projects'))
+        expect(getPathCompletion('~\\', backslashHome())).toBe('~\\projects\\')
+        // What follows ~ keeps the separator the user typed.
+        expect(getPathCompletion('~/pro', backslashHome())).toBe('~/projects/')
+      })
+
+      test('a trailing forward slash lists inside the directory', () => {
+        mkdirSync(path.join(tempDir, 'subdir', 'nested'), { recursive: true })
+        const typed = `${path.join(tempDir, 'subdir').replace(/\\/g, '/')}/`
+        expect(getPathCompletion(typed)).toBe(
+          path.join(tempDir, 'subdir', 'nested') + path.sep,
+        )
+      })
+    }
   })
 
   describe('edge cases', () => {

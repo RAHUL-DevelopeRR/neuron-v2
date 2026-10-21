@@ -219,6 +219,8 @@ export function buildWindowsWatchdogScripts(options: {
    * real one — exactly what a reused pid looks like from the watchdog's side.
    */
   ownerStartOverride?: string
+  /** Where the grandchild runs (see windowsWatchdogSpawnOptions). */
+  workingDirectory?: string
 }): { bootstrapScript: string; watchdogScript: string } {
   const { ownerPid } = options
   // The payload rides as a numeric byte array, which keeps the script free of
@@ -273,11 +275,42 @@ export function buildWindowsWatchdogScripts(options: {
     options.ownerStartOverride !== undefined
       ? String(Math.trunc(Number(options.ownerStartOverride)) || 0)
       : `(Get-Process -Id ${ownerPid} -ErrorAction Stop).StartTime.ToFileTimeUtc()`
+  const workingDirectory = options.workingDirectory
+    ? ` -WorkingDirectory ${psQuote(options.workingDirectory)}`
+    : ''
   const bootstrapScript =
     `$t = ${ownerStart}; ` +
     `Start-Process -FilePath ${psQuote(options.powershell)} ` +
-    `-ArgumentList (${psQuote(watchdogArgs)}.Replace('${OWNER_START_TOKEN}', [string]$t)) -NoNewWindow`
+    `-ArgumentList (${psQuote(watchdogArgs)}.Replace('${OWNER_START_TOKEN}', [string]$t)) -NoNewWindow` +
+    workingDirectory
   return { bootstrapScript, watchdogScript }
+}
+
+/**
+ * Where and with what environment the PowerShell bootstrap (and through
+ * Start-Process, the watchdog) runs. Not in the user's project: PowerShell
+ * keeps per-user caches (ModuleAnalysisCache, StartupProfileData) under
+ * `%LOCALAPPDATA%\Microsoft\Windows\PowerShell`, and when LOCALAPPDATA is
+ * missing from the environment it was handed that path is relative, so they
+ * landed in the project root as `Microsoft/Windows/PowerShell/...`. The temp
+ * directory is the working directory, the module analysis cache is pointed at
+ * a file there, and a missing LOCALAPPDATA becomes the temp directory too.
+ */
+export function windowsWatchdogSpawnOptions(
+  baseEnv: NodeJS.ProcessEnv = process.env,
+  tmpDir: string = os.tmpdir(),
+): { cwd: string; env: NodeJS.ProcessEnv } {
+  return {
+    cwd: tmpDir,
+    env: {
+      ...baseEnv,
+      PSModuleAnalysisCachePath: path.join(
+        tmpDir,
+        'neuron-tui-powershell-ModuleAnalysisCache',
+      ),
+      ...(!baseEnv.LOCALAPPDATA && { LOCALAPPDATA: tmpDir }),
+    },
+  }
 }
 
 function spawnWindowsWatchdog(options: {
@@ -288,6 +321,7 @@ function spawnWindowsWatchdog(options: {
   ownerStartOverride?: string
 }): ChildProcess {
   const powershell = options.powershellPath ?? windowsPowerShellPath()
+  const { cwd, env } = windowsWatchdogSpawnOptions()
   const { bootstrapScript } = buildWindowsWatchdogScripts({
     ownerPid: process.pid,
     ttyPath: options.ttyPath,
@@ -295,12 +329,15 @@ function spawnWindowsWatchdog(options: {
     armedPath: options.armedPath,
     powershell,
     ownerStartOverride: options.ownerStartOverride,
+    workingDirectory: cwd,
   })
 
   return spawn(
     powershell,
     ['-NoProfile', '-NonInteractive', '-Command', bootstrapScript],
     {
+      cwd,
+      env,
       stdio: ['ignore', 'ignore', 'ignore'],
     },
   )

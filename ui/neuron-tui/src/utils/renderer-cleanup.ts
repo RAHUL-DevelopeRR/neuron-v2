@@ -73,7 +73,27 @@ function isProcessRunning(pid: number, onResult: (running: boolean) => void) {
  * This is especially important on Windows where signals like SIGTERM and SIGHUP
  * don't work, so we rely on the 'exit' event which is guaranteed to run.
  */
+// Resolved once the terminal is reset after teardown (the main screen is back),
+// so a last line (the --continue hint) can be printed where it stays.
+let markTerminalRestored: () => void = () => {}
+const terminalRestored = new Promise<void>((resolve) => {
+  markTerminalRestored = resolve
+})
+
+/** Resolves when the terminal has been reset after the renderer's teardown. */
+export function whenTerminalRestored(): Promise<void> {
+  return terminalRestored
+}
+
 function resetTerminalState(): boolean {
+  try {
+    return resetTerminalStateOnce()
+  } finally {
+    markTerminalRestored()
+  }
+}
+
+function resetTerminalStateOnce(): boolean {
   try {
     if (process.stdin.isTTY && process.stdin.setRawMode) {
       process.stdin.setRawMode(false)
@@ -192,7 +212,7 @@ export function installProcessCleanupHandlers(cliRenderer: CliRenderer): void {
   if (handlersInstalled) return
   handlersInstalled = true
   renderer = cliRenderer
-  registerExitCleanup(cleanup)
+  registerExitCleanup(cleanup, whenTerminalRestored)
 
   const handleExitRequest = () => {
     void exitCliCleanly()

@@ -1,8 +1,10 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
 // See ui/neuron-tui/PORTING.md.
+import { createHash } from 'crypto'
 import { mkdirSync, readdirSync, statSync } from 'fs'
 import path from 'path'
 
+import { CHAT_MESSAGES_FILENAME } from './utils/chat-meta'
 import { getConfigDir } from './utils/config-dir'
 
 let projectRoot: string | undefined
@@ -45,6 +47,20 @@ export function startNewChat() {
   return currentChatId
 }
 
+/**
+ * The name of a project's data directory: its folder name, so it stays
+ * readable, and a short hash of its full resolved path, so two repositories
+ * that share a folder name (`~/work/app`, `~/oss/app`) keep their chats and
+ * `--continue` apart. Windows paths are case-insensitive, and a shell may
+ * hand over either case, so they are lowercased first.
+ */
+export function projectDataDirName(root: string): string {
+  const resolved = path.resolve(root)
+  const key = process.platform === 'win32' ? resolved.toLowerCase() : resolved
+  const hash = createHash('sha256').update(key).digest('hex').slice(0, 8)
+  return `${path.basename(key) || 'root'}-${hash}`
+}
+
 // Get the project-specific data directory
 export function getProjectDataDir(): string {
   const root = getProjectRoot()
@@ -52,10 +68,84 @@ export function getProjectDataDir(): string {
     throw new Error('Project root not set')
   }
 
-  const baseName = path.basename(root)
-  const baseDir = path.join(getConfigDir(), 'projects', baseName)
+  return path.join(getConfigDir(), 'projects', projectDataDirName(root))
+}
 
-  return baseDir
+/**
+ * Where this project's chats were kept before they were keyed by full path:
+ * `projects/<folder name>`, shared by every folder of that name. Read only:
+ * new chats always go to {@link getProjectDataDir}.
+ */
+export function getLegacyProjectDataDir(): string | null {
+  const baseName = path.basename(getProjectRoot())
+  return baseName ? path.join(getConfigDir(), 'projects', baseName) : null
+}
+
+/**
+ * Every data directory that can hold this project's chats, newest scheme
+ * first: its own directory, then the legacy one, so chats saved before the
+ * change are still listed, resumed and continued. (A chat continued from the
+ * legacy directory is saved to the new one from then on.)
+ */
+export function getProjectDataDirs(): string[] {
+  const dirs = [getProjectDataDir()]
+  const legacy = getLegacyProjectDataDir()
+  if (legacy && !dirs.includes(legacy)) dirs.push(legacy)
+  return dirs
+}
+
+/** The chat directory `chatId` names in the first data directory that has it. */
+export function findChatDirIn(
+  dataDirs: string[],
+  chatId: string,
+): string | null {
+  const id = chatId.trim()
+  if (!id || id === '.' || id === '..' || path.basename(id) !== id) return null
+  for (const dataDir of dataDirs) {
+    const candidate = path.join(dataDir, 'chats', id)
+    try {
+      if (statSync(candidate, { throwIfNoEntry: false })?.isDirectory()) {
+        return candidate
+      }
+    } catch {
+      // Unreadable: look in the next one.
+    }
+  }
+  return null
+}
+
+/**
+ * The most recently modified chat directory across `dataDirs` that has saved
+ * messages, or `null`. A run that ended before anything was sent leaves a
+ * folder with only its log; `--continue` skips those.
+ */
+export function mostRecentChatDirIn(dataDirs: string[]): string | null {
+  let best: { fullPath: string; mtime: number } | null = null
+  for (const dataDir of dataDirs) {
+    const chatsDir = path.join(dataDir, 'chats')
+    let names: string[]
+    try {
+      if (!statSync(chatsDir, { throwIfNoEntry: false })) continue
+      names = readdirSync(chatsDir)
+    } catch {
+      continue
+    }
+    for (const name of names) {
+      const fullPath = path.join(chatsDir, name)
+      try {
+        const stat = statSync(fullPath)
+        if (!stat.isDirectory()) continue
+        const messages = path.join(fullPath, CHAT_MESSAGES_FILENAME)
+        if (!statSync(messages, { throwIfNoEntry: false })) continue
+        if (!best || stat.mtime.getTime() > best.mtime) {
+          best = { fullPath, mtime: stat.mtime.getTime() }
+        }
+      } catch {
+        // Skip entries we can't stat
+      }
+    }
+  }
+  return best?.fullPath ?? null
 }
 
 /**
@@ -64,33 +154,7 @@ export function getProjectDataDir(): string {
  */
 export function getMostRecentChatDir(): string | null {
   try {
-    const chatsDir = path.join(getProjectDataDir(), 'chats')
-    if (!statSync(chatsDir, { throwIfNoEntry: false })) {
-      return null
-    }
-
-    const chatDirs = readdirSync(chatsDir)
-      .map((name) => {
-        const fullPath = path.join(chatsDir, name)
-        try {
-          const stat = statSync(fullPath)
-          return { name, fullPath, mtime: stat.mtime }
-        } catch {
-          return null
-        }
-      })
-      .filter(
-        (item): item is { name: string; fullPath: string; mtime: Date } =>
-          item !== null && statSync(item.fullPath).isDirectory(),
-      )
-
-    if (chatDirs.length === 0) {
-      return null
-    }
-
-    // Sort by modification time, most recent first
-    chatDirs.sort((a, b) => b.mtime.getTime() - a.mtime.getTime())
-    return chatDirs[0].fullPath
+    return mostRecentChatDirIn(getProjectDataDirs())
   } catch {
     return null
   }

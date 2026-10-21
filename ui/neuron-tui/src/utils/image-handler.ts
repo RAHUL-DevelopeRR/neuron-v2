@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { readFileSync, statSync } from 'fs'
 import { homedir } from 'os'
 import path from 'path'

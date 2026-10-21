@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { describe, test, expect, beforeEach, afterEach, mock } from 'bun:test'
 import * as fs from 'fs'
 import * as os from 'os'

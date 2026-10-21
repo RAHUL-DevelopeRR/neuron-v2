@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 /**
  * `/export [filename]` command — write the entire conversation to a file, with
  * no size ceiling (unlike `/copy`, whose OSC 52 clipboard path caps at 32 KB).

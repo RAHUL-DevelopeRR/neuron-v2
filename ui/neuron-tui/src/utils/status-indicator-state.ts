@@ -38,7 +38,9 @@ export type StatusIndicatorStateArgs = {
  * Determines the status indicator state based on current context.
  *
  * State priority (highest to lowest):
- * 1. nextCtrlCWillExit - User pressed Ctrl+C once, warn about exit
+ * 1. nextCtrlCWillExit - User pressed Ctrl+C once, warn about exit. Only
+ *    while no turn runs: during one, Ctrl-C interrupts it (keyboard-actions.ts
+ *    checks the stream first), so "again to exit" would be wrong.
  * 2. statusMessage - Temporary feedback for clipboard operations
  * 3. connecting - Not connected to backend
  * 4. waiting - Waiting for AI response to start
@@ -58,7 +60,8 @@ export const getStatusIndicatorState = ({
   showReconnectionMessage = false,
   isAskUserActive = false,
 }: StatusIndicatorStateArgs): StatusIndicatorState => {
-  if (nextCtrlCWillExit) {
+  const turnRunning = streamStatus === 'waiting' || streamStatus === 'streaming'
+  if (nextCtrlCWillExit && !turnRunning) {
     return { kind: 'ctrlC' }
   }
 

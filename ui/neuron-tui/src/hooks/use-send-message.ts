@@ -13,7 +13,11 @@ import { randomUUID } from 'node:crypto'
 import { useCallback, useEffect, useRef } from 'react'
 
 import { engineAttachments } from '../engine/attachments'
-import { setEngineTurnActive, whenEngineStarted } from '../engine/engine-session'
+import {
+  inUiWording,
+  setEngineTurnActive,
+  whenEngineStarted,
+} from '../engine/engine-session'
 import {
   getNeuronEngineClient,
   runTurn,
@@ -507,8 +511,9 @@ export const useSendMessage = ({
           sessionId:
             useEngineStore.getState().status?.session_id ??
             latestRunStateSnapshot.sessionId,
+          // An expired session's error says /login, not the shell command.
           output: outcome.error
-            ? { type: 'error', message: outcome.error }
+            ? { type: 'error', message: inUiWording(outcome.error) }
             : { type: 'lastMessage' },
         }
         latestRunStateSnapshot = runState

@@ -1,5 +1,6 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
-// free-mode capacity-wait cases went with that state. See ui/neuron-tui/PORTING.md.
+// free-mode capacity-wait cases went with that state, and the Ctrl-C exit
+// warning gives way to a running turn. See ui/neuron-tui/PORTING.md.
 import { describe, test, expect } from 'bun:test'
 
 import { getStatusIndicatorState } from '../../utils/status-indicator-state'
@@ -25,10 +26,20 @@ describe('StatusIndicator state logic', () => {
         ...baseArgs,
         nextCtrlCWillExit: true,
         statusMessage: 'Some message',
-        streamStatus: 'streaming',
         isConnected: false,
       })
       expect(state.kind).toBe('ctrlC')
+    })
+
+    test('no "again to exit" while a turn runs: Ctrl-C interrupts it instead', () => {
+      for (const streamStatus of ['waiting', 'streaming'] as const) {
+        const state = getStatusIndicatorState({
+          ...baseArgs,
+          nextCtrlCWillExit: true,
+          streamStatus,
+        })
+        expect(state.kind).toBe(streamStatus)
+      }
     })
 
     test('returns clipboard state when message exists (second priority)', () => {

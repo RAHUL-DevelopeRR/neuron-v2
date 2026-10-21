@@ -188,13 +188,65 @@ blocked.
   - `bash_permission_prompt_approved` opens the permission dialog, with `tee`
     offered for the session.
   - `--signed-out /login` shows the code `BCDF-GHJK` and its link. After the
-    fake approval, the footer reads `openai/auto · workspace-write · untrusted
+    fake approval, the footer reads `auto · workspace-write · untrusted
     folder · ctx 0% · Zero-X pro`.
   - Opening the session after a sign-in took about 40 s on the debug build,
-    most of it starting MCP servers. The panel says "Starting your session…"
-    meanwhile.
+    most of it starting MCP servers. They now start in the background (see
+    below), so `ready` and the first turn no longer wait for them.
   - After the rebrand, `streaming_text` shows the NEURON logo, "Neuron will
     run commands on your behalf", and the footer with live token counts.
+- `bun run check:console` (Windows) runs the compiled UI in a real
+  pseudoconsole (ConPTY, which Windows Terminal runs programs in) and uses it
+  through key presses and resizes. The scripts are in
+  `scripts/windows-console/`, played by `ConPtyDrive.cs`, which is compiled with
+  Windows' own `csc.exe`. The checks cover:
+  - typing a prompt and Enter, the streamed reply, and a permission request
+    answered with `y` (and the command run);
+  - resizing to 60×28 (the small logo, wrapped text, a shorter placeholder) and
+    to 150×42, then a request denied with `n`;
+  - a bare `neuron` handing the console to the UI (`NEURON_TUI_BIN`), `a` (allow
+    for the session), and Ctrl-C twice ("Press Ctrl-C again to exit", then the
+    exit), with `neuron` returning the UI's exit code;
+  - `neuron --continue <chat>` reopening a saved chat (its transcript, and the
+    engine resuming its session).
+
+  All 5 pass on Windows 11. Each scenario waits for a turn to end before Ctrl-C:
+  during a turn Ctrl-C interrupts it instead. Bugs it found are fixed:
+  - The exit hint was never shown on Windows. The `process.on('exit')` listener
+    ran after the console was gone (EPIPE), and a write from the UI races its
+    renderer's teardown. When `neuron` starts the UI, the UI now leaves the hint
+    in a file (`NEURON_TUI_EXIT_MESSAGE_FILE`) and `neuron` prints it once the UI
+    has exited. Run directly, the UI prints it itself after the renderer has
+    restored the main screen. No hint for a chat nothing was asked in.
+  - `neuron --continue` was an unknown option. `neuron` now passes
+    `--continue [chat]` to the UI, and says so plainly where the UI can't run it.
+    A bare `--continue` skips chats that saved no messages.
+  - The driver's screen model is fed in a `try`, so the pseudoconsole's output
+    is always read.
+
+  The hint itself can't be checked there. Under the pseudoconsole that
+  kernel32's `CreatePseudoConsole` provides, the console ends for every process
+  in it as OpenTUI's native renderer tears down (writes fail with error 233,
+  about 6 ms after the teardown starts), so nothing printed after that arrives.
+  A classic console window and Windows Terminal 1.24 keep the console. In both,
+  a bare `neuron --continue` (with a temporary auto-exit) reopened the chat, and
+  `neuron`'s print of the hint succeeded. That was checked by hand, not by
+  `check:console`.
+- Changed after the end-to-end run against a local gateway:
+  - A failed tool (a refused write, a command that exits non-zero) shows as
+    failed or refused, in the error colour, instead of like a success.
+  - Single newlines in a reply stay line breaks, and a new text block starts a
+    new paragraph. Backslashes in Windows paths are kept. Tool output is shown
+    as plain text, not parsed as Markdown.
+  - Chats are kept per project path (`projects/<folder>-<hash>`), so two repos
+    with the same folder name no longer share `/chats` and `--continue`. Chats
+    saved before under the folder name alone are still read.
+  - The PowerShell watchdog runs in the temp folder, so its module cache never
+    lands in the project.
+  - The model picker greys out `blurred` models until `available_again_at`, marks
+    `degraded` and `busy` ones, and says "not configured on this gateway".
+  - After an interrupt, the engine's REPL wording ("press Ctrl-C again to quit")
+    is not shown; the sign-in panel's `/login` is the one sign-in instruction.
 - `!cmd` and `/bash` show "Shell commands (!) are not available in this build of
   the Neuron UI yet."
 - These slash commands are the UI's own: `help`, `new`, `copy`, `export`,
@@ -222,8 +274,6 @@ blocked.
   - The agent modes (DEFAULT, LITE, MAX, PLAN; the `< DEFAULT` toggle, the mode
     divider, `--lite`/`--max`/`--plan`) change only how the UI presents a turn.
     The engine ignores them. Hide them, or map PLAN to the engine's plan mode.
-  - The engine's signed-out notice says "Sign in with `neuron auth login` ...",
-    which is the terminal's wording; the sign-in panel says `/login`.
 - **After P4:**
   - Bring back a reset-sequence sync test for Neuron's own launcher (the old
     one checked `release-core/launcher.js`).
@@ -234,10 +284,16 @@ blocked.
   - `writeFileAtomicAsync` can fail with `EPERM` on Windows when two renames
     target the same file at once. Checkpoint saves coalesce, so it is unlikely
     but possible.
-  - In my launch checks the UI drew the chat screen and ran prompts given on
-    the command line. I could not type into the terminal: keyboard input, the
-    permission keys and Ctrl-C exit in a real Windows terminal are covered only
-    by unit tests so far.
+  - A key typed in the first moment after the UI draws, while OpenTUI still
+    reads the terminal's answers to its capability queries, can be dropped. The
+    console check saw "PARITY…" arrive as "ARITY…" once, so its scripts wait
+    for the engine's footer before typing.
+  - After the UI exits, the engine can take a few seconds to finish saving and
+    stopping (MCP servers still starting are stopped within 3 s). The UI waits
+    for it for one second.
+  - The console check covers the inbox pseudoconsole, not the Windows Terminal
+    app's own rendering (fonts, colours, its key encoding before ConPTY). See
+    above for why it can't see the exit hint.
   - A launch refusal (a too-broad folder) arrives as the protocol's `error`
     event on stdout, and the client reads stdout to its end before it handles
     the exit. An older engine build seemed to print it only on stderr. The client

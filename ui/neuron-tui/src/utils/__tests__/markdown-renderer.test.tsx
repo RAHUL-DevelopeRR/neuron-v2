@@ -1,10 +1,51 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { TextAttributes } from '@opentui/core'
+import { createTestRenderer } from '@opentui/core/testing'
+import { createRoot, flushSync } from '@opentui/react'
 import { describe, expect, test } from 'bun:test'
 import React from 'react'
 
-import { renderMarkdown, renderStreamingMarkdown } from '../markdown-renderer'
+import {
+  isPathLikeWord,
+  renderCodeText,
+  renderMarkdown,
+  renderStreamingMarkdown,
+} from '../markdown-renderer'
 
 type El = React.ReactElement<Record<string, unknown>>
+
+/** The text of rendered nodes, spans and all. */
+const textOf = (nodes: React.ReactNode[]): string =>
+  nodes
+    .map((node) => {
+      if (typeof node === 'string') return node
+      if (React.isValidElement(node)) {
+        return textOf(flattenNodes((node as El).props.children))
+      }
+      return ''
+    })
+    .join('')
+
+/** The lines OpenTUI draws for `markdown`, trailing blanks dropped. */
+async function drawn(markdown: string): Promise<string[]> {
+  const setup = await createTestRenderer({ width: 60, height: 8 })
+  const root = createRoot(setup.renderer)
+  flushSync(() => {
+    root.render(<text style={{ wrapMode: 'word' }}>{renderMarkdown(markdown)}</text>)
+  })
+  try {
+    await setup.renderOnce()
+    return setup
+      .captureCharFrame()
+      .split('\n')
+      .map((line) => line.trimEnd())
+      .filter(Boolean)
+  } finally {
+    flushSync(() => root.unmount())
+    setup.renderer.destroy()
+  }
+}
 
 const flattenNodes = (input: unknown): React.ReactNode[] => {
   const result: React.ReactNode[] = []
@@ -385,6 +426,80 @@ neuron "implement feature" --verbose
     expect(textContent).toContain('Age')
     expect(textContent).toContain('John')
     expect(textContent).toContain('30')
+  })
+
+  describe('line breaks', () => {
+    test('a single newline after a bold label is a line break', async () => {
+      expect(await drawn('**Files:**\nfoo.ts\n**Done**')).toEqual([
+        'Files:',
+        'foo.ts',
+        'Done',
+      ])
+      expect(await drawn('Updated the file.\nDone.')).toEqual([
+        'Updated the file.',
+        'Done.',
+      ])
+    })
+
+    test('soft breaks are break nodes, not newlines left in the text', () => {
+      const nodes = flattenNodes(renderMarkdown('one\ntwo'))
+      expect(nodes).toEqual(['one', '\n', 'two'])
+    })
+  })
+
+  describe('backslashes', () => {
+    const text = (markdown: string) => textOf(flattenNodes(renderMarkdown(markdown)))
+
+    test('Windows paths keep every backslash', () => {
+      expect(text('Saved to C:\\Users\\me\\.neuron now')).toBe(
+        'Saved to C:\\Users\\me\\.neuron now',
+      )
+      expect(text('See ~\\.neuron and \\.neuron')).toBe('See ~\\.neuron and \\.neuron')
+      expect(text('Run ..\\..\\build.ps1 or .\\x\\.y')).toBe(
+        'Run ..\\..\\build.ps1 or .\\x\\.y',
+      )
+      expect(text('Share \\\\server\\share\\.git')).toBe('Share \\\\server\\share\\.git')
+      // The bold still closes after a path ending in a backslash.
+      const nodes = flattenNodes(renderMarkdown('**C:\\Users\\** is home'))
+      const bold = nodes[0] as El
+      expect(bold.props.attributes).toBe(TextAttributes.BOLD)
+      expect(textOf(flattenChildren(bold.props.children))).toBe('C:\\Users\\')
+    })
+
+    test('real escapes of punctuation still work outside paths', () => {
+      expect(text('a \\*literal\\* star, snake\\_case, 1\\. not a list')).toBe(
+        'a *literal* star, snake_case, 1. not a list',
+      )
+      // A backslash before a letter or digit was never an escape.
+      expect(text('a \\d b \\1')).toBe('a \\d b \\1')
+    })
+
+    test('inline code and code blocks keep backslashes exactly', () => {
+      expect(text('Use `C:\\Users\\me\\.neuron` or `\\.x` or `\\\\`')).toBe(
+        'Use  C:\\Users\\me\\.neuron  or  \\.x  or  \\\\ ',
+      )
+      expect(text('```\nC:\\a\\.b \\* \\\\\n```')).toBe('C:\\a\\.b \\* \\\\')
+    })
+
+    test('a pipe escaped in a table cell stays an escape', () => {
+      const shown = text('| a | b |\n| - | - |\n| C:\\x\\.y | z \\| w |')
+      expect(shown).toContain('C:\\x\\.y')
+      expect(shown).toContain('z | w')
+    })
+
+    test('isPathLikeWord', () => {
+      for (const word of ['C:\\Users', '~\\.neuron', '\\.neuron', '..\\x', '(C:\\x\\.y)', 'a\\b\\.c']) {
+        expect(isPathLikeWord(word)).toBe(true)
+      }
+      for (const word of ['\\*bold\\*', 'snake\\_case', '1\\.', '\\\\n', '\\(x\\)']) {
+        expect(isPathLikeWord(word)).toBe(false)
+      }
+    })
+  })
+
+  test('renderCodeText draws text as code without parsing it', () => {
+    const nodes = flattenNodes(renderCodeText(' * not a bullet\n    indented\n# not a heading'))
+    expect(textOf(nodes)).toBe(' * not a bullet\n    indented\n# not a heading')
   })
 
   test('wraps and shows full content when table is too wide', () => {

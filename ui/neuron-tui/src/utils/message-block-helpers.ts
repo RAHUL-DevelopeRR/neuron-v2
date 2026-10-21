@@ -650,6 +650,8 @@ export const transformAskUserBlocks = (
 export interface UpdateToolBlockOptions {
   toolCallId: string
   toolOutput: unknown[]
+  /** The result is an error (the engine's `is_error`); stored on the block. */
+  isError?: boolean
 }
 
 /**
@@ -661,7 +663,8 @@ export const updateToolBlockWithOutput = (
   blocks: ContentBlock[],
   options: UpdateToolBlockOptions,
 ): ContentBlock[] => {
-  const { toolCallId, toolOutput } = options
+  const { toolCallId, toolOutput, isError } = options
+  const status = isError === undefined ? {} : { isError }
 
   return blocks.map((block) => {
     if (block.type === 'tool' && block.toolCallId === toolCallId) {
@@ -672,15 +675,17 @@ export const updateToolBlockWithOutput = (
       if (block.toolName !== 'run_terminal_command') {
         return {
           ...block,
+          ...status,
           output: sanitizeTerminalOutput(formatToolOutput(toolOutput)),
         }
       }
       const parsed = (toolOutput?.[0] as any)?.value
+      // Empty stdout and stderr is no output, not a `stdout: / stderr:` dump.
       const output =
-        parsed?.stdout || parsed?.stderr
+        typeof parsed?.stdout === 'string' || typeof parsed?.stderr === 'string'
           ? (parsed.stdout || '') + (parsed.stderr || '')
           : formatToolOutput(toolOutput)
-      return { ...block, output: sanitizeTerminalOutput(output) }
+      return { ...block, ...status, output: sanitizeTerminalOutput(output) }
     }
     if (block.type === 'agent' && block.blocks) {
       const updatedBlocks = updateToolBlockWithOutput(block.blocks, options)

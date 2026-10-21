@@ -1,6 +1,37 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: `~`
+// completions keep their `~` form whichever separator HOME uses, and a
+// trailing `/` counts as a separator on Windows. See ui/neuron-tui/PORTING.md.
 import { existsSync, readdirSync, statSync } from 'fs'
 import os from 'os'
 import path from 'path'
+
+const isWindows = process.platform === 'win32'
+
+const endsWithSeparator = (value: string): boolean =>
+  isWindows ? /[\\/]$/.test(value) : value.endsWith('/')
+
+/**
+ * `completed`, an absolute path under `homeDir`, back in the `~` form the user
+ * typed. HOME may use either separator (`C:/Users/me` from a POSIX-style HOME
+ * on Windows, where the joined path has backslashes), so both are normalized
+ * before comparing; after the `~`, the separator the user typed is kept.
+ */
+function toTildeForm(
+  completed: string,
+  inputPath: string,
+  homeDir: string,
+): string {
+  const home = path.normalize(homeDir).replace(/[\\/]+$/, '')
+  const normalized = path.normalize(completed)
+  const fold = (value: string) => (isWindows ? value.toLowerCase() : value)
+  if (!fold(normalized).startsWith(fold(home))) return completed
+  const rest = normalized.slice(home.length)
+  // `/home/meg` is not under `/home/me`.
+  if (rest && !/^[\\/]/.test(rest)) return completed
+  const typed = inputPath[1]
+  const typedSeparator = typed === '/' || typed === '\\' ? typed : null
+  return '~' + (typedSeparator ? rest.replace(/[\\/]/g, typedSeparator) : rest)
+}
 
 /**
  * Get path completions for tab completion.
@@ -13,13 +44,17 @@ import path from 'path'
  * - Multiple matches: returns common prefix (no trailing slash)
  * - No matches: returns null
  * - Hidden directories are skipped unless user typed a dot
+ *
+ * @param homeDir - The home directory `~` stands for (tests pass their own).
  */
-export function getPathCompletion(inputPath: string): string | null {
+export function getPathCompletion(
+  inputPath: string,
+  homeDir: string = os.homedir(),
+): string | null {
   if (!inputPath) return null
 
   // Expand ~ to home directory
   let expandedPath = inputPath
-  const homeDir = os.homedir()
   if (expandedPath.startsWith('~')) {
     expandedPath = path.join(homeDir, expandedPath.slice(1))
   }
@@ -29,7 +64,7 @@ export function getPathCompletion(inputPath: string): string | null {
   let parentDir: string
   let partial: string
 
-  if (expandedPath.endsWith(path.sep)) {
+  if (endsWithSeparator(expandedPath)) {
     parentDir = expandedPath
     partial = ''
   } else {
@@ -71,12 +106,11 @@ export function getPathCompletion(inputPath: string): string | null {
 
     // If exactly one match, complete to it with trailing slash
     if (matches.length === 1) {
-      let completed = path.join(parentDir, matches[0]) + path.sep
+      const completed = path.join(parentDir, matches[0]) + path.sep
       // Convert back to ~ format if it was originally using ~
-      if (inputPath.startsWith('~') && completed.startsWith(homeDir)) {
-        completed = '~' + completed.slice(homeDir.length)
-      }
-      return completed
+      return inputPath.startsWith('~')
+        ? toTildeForm(completed, inputPath, homeDir)
+        : completed
     }
 
     // Multiple matches - find common prefix
@@ -96,12 +130,11 @@ export function getPathCompletion(inputPath: string): string | null {
     if (commonLength > partial.length) {
       // Use the case from the first match
       const commonPrefix = sortedMatches[0].slice(0, commonLength)
-      let completed = path.join(parentDir, commonPrefix)
+      const completed = path.join(parentDir, commonPrefix)
       // Convert back to ~ format if it was originally using ~
-      if (inputPath.startsWith('~') && completed.startsWith(homeDir)) {
-        completed = '~' + completed.slice(homeDir.length)
-      }
-      return completed
+      return inputPath.startsWith('~')
+        ? toTildeForm(completed, inputPath, homeDir)
+        : completed
     }
 
     return null

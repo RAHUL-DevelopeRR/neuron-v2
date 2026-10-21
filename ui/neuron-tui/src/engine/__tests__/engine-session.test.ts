@@ -6,7 +6,12 @@ import {
 } from '../../components/permission-prompt'
 import { useChatStore } from '../../state/chat-store'
 import { needsSignIn, useEngineStore } from '../../state/engine-store'
-import { handleEngineEvent, setEngineTurnActive } from '../engine-session'
+import {
+  engineNotice,
+  handleEngineEvent,
+  inUiWording,
+  setEngineTurnActive,
+} from '../engine-session'
 
 import type { PermissionView, SignInCodeEvent, StatusEvent } from '../protocol'
 
@@ -87,6 +92,90 @@ describe('handleEngineEvent', () => {
     setEngineTurnActive(true)
     handleEngineEvent({ type: 'error', message: 'rate limited' })
     expect(systemLines()).toEqual(['Error: unknown model opus-9'])
+  })
+})
+
+describe('interrupt notices', () => {
+  // The engine's own lines for an interrupted turn (repl_loop.rs). Their
+  // "Ctrl-C again" hints are the line REPL's; the UI has its own.
+  const INTERRUPTING = '■ Interrupting… (press Ctrl-C again to quit)'
+
+  test('"Interrupting…" shows without the hint only while the turn stops', () => {
+    handleEngineEvent({ type: 'notice', message: 'Compacted 12 messages.' })
+    handleEngineEvent({ type: 'notice', message: INTERRUPTING })
+    expect(systemLines()).toEqual(['Compacted 12 messages.', '■ Interrupting…'])
+
+    handleEngineEvent({
+      type: 'notice',
+      message: 'Interrupted. Back at the prompt; press Ctrl-C again to exit.',
+    })
+    // The turn's message already says "[response interrupted]".
+    expect(systemLines()).toEqual(['Compacted 12 messages.', '■ Interrupting…'])
+
+    handleEngineEvent({ type: 'turn_finished' })
+    expect(systemLines()).toEqual(['Compacted 12 messages.'])
+  })
+
+  test('the tool calls an interrupt skipped are still reported, without the hint', () => {
+    handleEngineEvent({ type: 'notice', message: INTERRUPTING })
+    handleEngineEvent({
+      type: 'notice',
+      message: 'Interrupted. 2 pending tool call(s) were not run. Press Ctrl-C again to exit.',
+    })
+    handleEngineEvent({ type: 'turn_finished' })
+    expect(systemLines()).toEqual(['Interrupted. 2 pending tool call(s) were not run.'])
+  })
+
+  test('the classification itself', () => {
+    expect(engineNotice(INTERRUPTING)).toEqual({
+      kind: 'show',
+      text: '■ Interrupting…',
+      untilTurnEnd: true,
+    })
+    expect(engineNotice('Interrupted. Back at the prompt; press Ctrl-C again to exit.')).toEqual({
+      kind: 'drop',
+    })
+    expect(engineNotice('Quitting: saving the session first…')).toEqual({
+      kind: 'show',
+      text: 'Quitting: saving the session first…',
+      untilTurnEnd: false,
+    })
+  })
+})
+
+describe('sign-in wording', () => {
+  test('the signed-out reason is left to the sign-in panel, which says /login', () => {
+    handleEngineEvent({
+      type: 'notice',
+      message:
+        'Sign in with `neuron auth login` (or `neuron auth login --with-token` for CI), or set NEURON_TOKEN',
+    })
+    expect(systemLines()).toEqual([])
+  })
+
+  test('messages of a running engine say /login, not the shell command', () => {
+    expect(inUiWording('Your Zero-X session expired or was revoked — run neuron auth login')).toBe(
+      'Your Zero-X session expired or was revoked — type /login',
+    )
+    expect(
+      inUiWording(
+        'Not signed in to Zero-X. Run `neuron auth login` (or set NEURON_TOKEN) to see usage.',
+      ),
+    ).toBe('Not signed in to Zero-X. Type /login to see usage.')
+    // Where the token login is the only way, the message keeps it.
+    const tokenOnly =
+      'This Zero-X gateway does not support device sign-in yet. Use `neuron auth login --with-token`.'
+    expect(inUiWording(tokenOnly)).toBe(tokenOnly)
+    expect(inUiWording('unknown model opus-9')).toBe('unknown model opus-9')
+
+    handleEngineEvent({ type: 'ready', protocol: 1, version: 'x' })
+    handleEngineEvent({
+      type: 'error',
+      message: 'Your Zero-X session expired or was revoked — run neuron auth login',
+    })
+    expect(systemLines()).toEqual([
+      'Error: Your Zero-X session expired or was revoked — type /login',
+    ])
   })
 })
 

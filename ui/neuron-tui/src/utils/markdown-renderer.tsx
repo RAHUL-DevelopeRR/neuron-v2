@@ -1,3 +1,7 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: soft line
+// breaks render as line breaks (remark-breaks now runs), backslashes in
+// Windows paths survive, and tool data can be drawn as code without being
+// parsed. See ui/neuron-tui/PORTING.md.
 import { TextAttributes } from '@opentui/core'
 import React from 'react'
 import remarkBreaks from 'remark-breaks'
@@ -112,6 +116,87 @@ const processor = unified()
   .use(remarkBreaks)
 
 type MarkdownNode = Content | Root
+
+/**
+ * Parses and runs the transforms. remark-breaks is a transform, so `parse()`
+ * alone never applied it: a single newline inside a paragraph now becomes a
+ * `break`, as assistant text means it ("**Files:**\nfoo.ts\n**Done**" is
+ * three lines), instead of depending on a raw `\n` surviving in a text node.
+ */
+const parseMarkdown = (markdown: string): Root => {
+  const ast = processor.parse(markdown) as Root
+  // Before the transforms, while every text node still has its position.
+  applyInlineFallbackFormatting(ast, markdown)
+  return processor.runSync(ast) as Root
+}
+
+// CommonMark's ASCII punctuation, the characters a backslash can escape.
+const ESCAPABLE = /\\[!-\/:-@\[-`{-~]|\\$/
+// `C:\`, `~\`, `.\`, `..\`, `%APPDATA%\`, `$env:HOME\`, or a UNC
+// `\\server\` / `\\?\` (a second backslash, so `\\n` is not one).
+const PATH_PREFIX =
+  /^(?:[A-Za-z]:\\|(?:~|\.{1,2}|%[^%\s]+%|\$[A-Za-z_][\w:]*)\\|\\\\[A-Za-z0-9.?$][^\\\s]*\\)/
+// A backslash used as a separator (`\Users`), or before a dot-name (`\.neuron`).
+const PATH_SEPARATOR = /(?:^|[^\\])\\[A-Za-z0-9]|\\\.[A-Za-z0-9_-]/
+
+/** A word that reads as a Windows path, where every backslash is literal. */
+export const isPathLikeWord = (word: string): boolean => {
+  const core = word.replace(/^[*_~"'`(\[{<]+/, '')
+  return PATH_PREFIX.test(core) || PATH_SEPARATOR.test(core)
+}
+
+const collectLiteralRanges = (
+  node: MarkdownNode,
+  ranges: Array<[number, number]>,
+): void => {
+  if (node.type === 'code' || node.type === 'inlineCode' || node.type === 'html') {
+    const start = node.position?.start.offset
+    const end = node.position?.end.offset
+    if (start !== undefined && end !== undefined) ranges.push([start, end])
+    return
+  }
+  const children = (node as { children?: MarkdownNode[] }).children
+  if (Array.isArray(children)) {
+    for (const child of children) collectLiteralRanges(child, ranges)
+  }
+}
+
+const protectWords = (text: string): string =>
+  text.replace(/\S+/g, (word) =>
+    word.includes('\\') && ESCAPABLE.test(word) && isPathLikeWord(word)
+      ? // `\|` stays an escape: GFM tables need it to put a pipe in a cell.
+        word.replace(/\\(?!\|)/g, '\\\\')
+      : word,
+  )
+
+/**
+ * CommonMark drops a backslash before ASCII punctuation, which mangles the
+ * Windows paths assistants write: `C:\Users\me\.neuron` read as
+ * `C:\Users\me.neuron`, `~\.neuron` as `~.neuron`. In path-like words every
+ * backslash is kept (doubled before parsing); real escapes elsewhere
+ * (`\*literal\*`, `snake\_case`, `1\.`) still work, and a backslash before a
+ * letter or digit was never an escape. Code spans, code blocks and HTML are
+ * left exactly as written. Returns `null` when nothing needs protecting.
+ */
+export const protectPathBackslashes = (
+  markdown: string,
+  ast: Root,
+): string | null => {
+  if (!markdown.includes('\\')) return null
+  const ranges: Array<[number, number]> = []
+  collectLiteralRanges(ast, ranges)
+  ranges.sort((a, b) => a[0] - b[0])
+
+  let result = ''
+  let cursor = 0
+  for (const [start, end] of ranges) {
+    if (start < cursor) continue
+    result += protectWords(markdown.slice(cursor, start)) + markdown.slice(start, end)
+    cursor = end
+  }
+  result += protectWords(markdown.slice(cursor))
+  return result === markdown ? null : result
+}
 
 type InlineFallbackNode = Text | Strong | Emphasis
 
@@ -308,7 +393,21 @@ const parseInlineFallback = (value: string): InlineFallbackNode[] => {
   return nodes
 }
 
-const applyInlineFallbackFormatting = (node: MarkdownNode): void => {
+/**
+ * The source of a text node escaped an emphasis marker (`\*literal\*`): its
+ * value has a bare `*` the fallback must not read as emphasis again.
+ */
+const hasEscapedMarker = (node: Text, source: string | undefined): boolean => {
+  const start = node.position?.start.offset
+  const end = node.position?.end.offset
+  if (source === undefined || start === undefined || end === undefined) return false
+  return /\\\*/.test(source.slice(start, end))
+}
+
+const applyInlineFallbackFormatting = (
+  node: MarkdownNode,
+  source?: string,
+): void => {
   if (!node || typeof node !== 'object') {
     return
   }
@@ -321,6 +420,10 @@ const applyInlineFallbackFormatting = (node: MarkdownNode): void => {
   const nextChildren: MarkdownNode[] = []
 
   mutable.children.forEach((child) => {
+    if (child.type === 'text' && hasEscapedMarker(child, source)) {
+      nextChildren.push(child)
+      return
+    }
     if (child.type === 'text') {
       const replacements = parseInlineFallback(child.value)
       const hasChanges =
@@ -342,7 +445,7 @@ const applyInlineFallbackFormatting = (node: MarkdownNode): void => {
         return
       }
     } else {
-      applyInlineFallbackFormatting(child as MarkdownNode)
+      applyInlineFallbackFormatting(child as MarkdownNode, source)
     }
 
     nextChildren.push(child as MarkdownNode)
@@ -1014,14 +1117,30 @@ export function renderMarkdown(
     const palette = resolvePalette(options.palette)
     const codeBlockWidth = options.codeBlockWidth ?? 80
     const state = createRenderState(palette, codeBlockWidth)
-    const ast = processor.parse(markdown) as Root
-    applyInlineFallbackFormatting(ast)
+    let ast = parseMarkdown(markdown)
+    const protectedMarkdown = protectPathBackslashes(markdown, ast)
+    if (protectedMarkdown !== null) ast = parseMarkdown(protectedMarkdown)
     const nodes = renderNode(ast, state, ast.type, undefined)
     return normalizeOutput(nodes)
   } catch (error) {
     logger.error(error, 'Failed to parse markdown')
     return markdown
   }
+}
+
+/**
+ * `value` drawn exactly as a code block draws it (every line, every space)
+ * without parsing it as Markdown. For tool input and output, which are data:
+ * a file's ` * ` lines are not bullets and a ``` in it ends nothing.
+ */
+export function renderCodeText(
+  value: string,
+  options: MarkdownRenderOptions & { lang?: string } = {},
+): ReactNode {
+  const palette = resolvePalette(options.palette)
+  const state = createRenderState(palette, options.codeBlockWidth ?? 80)
+  const code: Code = { type: 'code', lang: options.lang ?? null, value }
+  return normalizeOutput(renderCodeBlock(code, state))
 }
 
 export function hasMarkdown(content: string): boolean {

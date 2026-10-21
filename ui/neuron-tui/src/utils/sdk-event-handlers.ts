@@ -459,9 +459,15 @@ const handleSpawnAgentsResult = (
   })
 }
 
+/**
+ * A tool result as Neuron's engine reports it: Codebuff's event plus the
+ * engine's `is_error` flag, which the renderers show as a failure.
+ */
+export type ToolResultWithStatus = PrintModeToolResult & { isError?: boolean }
+
 const handleToolResult = (
   state: EventHandlerState,
-  event: PrintModeToolResult,
+  event: ToolResultWithStatus,
 ) => {
   const askUserResult = (event.output?.[0] as any)?.value
   state.message.updater.updateAiMessageBlocks((blocks) =>
@@ -487,6 +493,7 @@ const handleToolResult = (
     updateToolBlockWithOutput(blocks, {
       toolCallId: event.toolCallId,
       toolOutput: event.output,
+      isError: event.isError,
     }),
   )
 

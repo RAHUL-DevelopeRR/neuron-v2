@@ -2,7 +2,8 @@
  * The UI's one engine: started for the chosen project folder, restarted when
  * the folder changes, shut down on exit. Every event it sends outside a turn's
  * transcript lands here: footer status, models, usage, permission requests,
- * notices (shown as system lines) and errors that belong to no turn.
+ * notices (shown as system lines, in the UI's words) and errors that belong
+ * to no turn.
  */
 
 import { useChatStore } from '../state/chat-store'
@@ -28,10 +29,85 @@ export function setEngineTurnActive(active: boolean): void {
   turnActive = active
 }
 
-function showSystemMessage(text: string): void {
+function showSystemMessage(text: string, id?: string): void {
+  const message = { ...getSystemMessage(text), ...(id && { id }) }
+  useChatStore.getState().setMessages((prev) => [...prev, message])
+}
+
+// ------------------------------------------------------------ engine wording
+
+// The engine words sign-in for a shell: `neuron auth login` (`--with-token`
+// for CI) or NEURON_TOKEN. In the UI the way to sign in is /login, which the
+// sign-in panel says; messages from a running engine say the same.
+// `neuron auth login --with-token` alone is kept: there it is the only way.
+const SHELL_SIGN_IN =
+  /(?:\b(run|use)\s+)?`?neuron auth login`?(?! --with-token)(?: \(or `neuron auth login --with-token` for CI\))?(?:,? or set NEURON_TOKEN| \(or set NEURON_TOKEN\))?/gi
+
+/** The signed-out reason, which the sign-in panel already answers. */
+const SIGNED_OUT_REASON = /^Sign in with `neuron auth login`/
+
+/**
+ * A running engine's message in the UI's words: sign in with `/login`, not
+ * the shell command. Not for launch failures: with no engine running, the
+ * shell is the only place to sign in.
+ */
+export function inUiWording(message: string): string {
+  return message.replace(SHELL_SIGN_IN, (_match, verb: string | undefined) =>
+    verb ? `${verb[0] === verb[0]!.toUpperCase() ? 'Type' : 'type'} /login` : '/login',
+  )
+}
+
+// The engine's interrupt notices come from its line REPL, where a second
+// Ctrl-C quits. In the UI a Ctrl-C during a turn interrupts it, and the turn's
+// message says "[response interrupted]" at once; at the prompt one Ctrl-C arms
+// "Press Ctrl-C again to exit" in the status bar and a second exits. So:
+//   "■ Interrupting… (press Ctrl-C again to quit)" shows without the hint,
+//     only while the engine is still stopping the turn: `turn_finished`
+//     removes it;
+//   "Interrupted. Back at the prompt; press Ctrl-C again to exit." is
+//     dropped: the message already says so, and its hint is wrong here;
+//   "Interrupted. N pending tool call(s) were not run. Press Ctrl-C again to
+//     exit." keeps what was not run, without the hint.
+const INTERRUPTING = /^■ Interrupting/
+const CTRL_C_HINT =
+  /\s*(?:\(press Ctrl-C again to (?:quit|exit)\)|(?:Back at the prompt; )?press Ctrl-C again to (?:quit|exit)\.?)/gi
+
+export type EngineNotice =
+  | { kind: 'drop' }
+  | { kind: 'show'; text: string; untilTurnEnd: boolean }
+
+/** How the UI shows an engine notice (see the interrupt notes above). */
+export function engineNotice(message: string): EngineNotice {
+  if (SIGNED_OUT_REASON.test(message)) return { kind: 'drop' }
+  const text = inUiWording(message).replace(CTRL_C_HINT, '').trim()
+  if (!text || text === 'Interrupted.') return { kind: 'drop' }
+  return { kind: 'show', text, untilTurnEnd: INTERRUPTING.test(text) }
+}
+
+/** Ids of notices that stop being true when the turn ends ("■ Interrupting…"). */
+const turnScopedNotices = new Set<string>()
+let turnScopedCount = 0
+
+function showTurnScopedNotice(text: string): void {
+  turnScopedCount += 1
+  const id = `sys-turn-notice-${Date.now()}-${turnScopedCount}`
+  turnScopedNotices.add(id)
+  showSystemMessage(text, id)
+}
+
+function showNotice(notice: EngineNotice): void {
+  if (notice.kind === 'drop') return
+  if (notice.untilTurnEnd) showTurnScopedNotice(notice.text)
+  else showSystemMessage(notice.text)
+}
+
+function dropTurnScopedNotices(): void {
+  if (turnScopedNotices.size === 0) return
+  const stale = new Set(turnScopedNotices)
+  turnScopedNotices.clear()
   useChatStore
     .getState()
-    .setMessages((prev) => [...prev, getSystemMessage(text)])
+    .setMessages((prev) => prev.filter((message) => !stale.has(message.id)))
 }
 
 export function handleEngineEvent(event: UiEvent): void {
@@ -66,20 +142,23 @@ export function handleEngineEvent(event: UiEvent): void {
       if (engine.signIn && !engine.signIn.approved) engine.markSignInApproved()
       if (event.message.startsWith(QUESTION_PREFIX)) {
         engine.setPendingQuestion(event.message)
+        showSystemMessage(event.message)
+        return
       }
-      showSystemMessage(event.message)
+      showNotice(engineNotice(event.message))
       return
     case 'error':
       if (!turnActive && engine.connection === 'ready') {
-        showSystemMessage(`Error: ${event.message}`)
+        showSystemMessage(`Error: ${inUiWording(event.message)}`)
       }
       return
     case 'turn_finished':
       // Nothing waits for an answer once the turn is over (a `/login` ends
-      // with one too, signed in or not).
+      // with one too, signed in or not), and "Interrupting…" is over too.
       engine.clearPermissions()
       engine.setPendingQuestion(null)
       engine.setSignIn(null)
+      dropTurnScopedNotices()
       return
     default:
       return
@@ -128,6 +207,8 @@ async function launchEngineSession(launch: EngineLaunchOptions): Promise<void> {
   client.subscribe(handleEngineEvent)
   client.onExit((exit) => {
     if (getNeuronEngineClient() !== client) return
+    // No turn runs in an engine that stopped.
+    dropTurnScopedNotices()
     const wasReady = useEngineStore.getState().connection === 'ready'
     const reason =
       client.lastError ?? `The Neuron engine stopped (exit code ${exit.code}).`

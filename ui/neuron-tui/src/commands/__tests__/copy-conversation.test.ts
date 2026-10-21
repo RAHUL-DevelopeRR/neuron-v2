@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { describe, test, expect } from 'bun:test'
 
 import { serializeConversation } from '../copy-conversation'

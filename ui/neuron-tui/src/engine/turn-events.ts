@@ -11,6 +11,7 @@ import {
   createEventHandler,
   createStreamChunkHandler,
   type EventHandlerState,
+  type ToolResultWithStatus,
 } from '../utils/sdk-event-handlers'
 import { NO_RESULT_MESSAGE, mapToolCall, mapToolResult } from './tool-mapping'
 
@@ -34,22 +35,58 @@ export function createTurnEventSink(state: EventHandlerState): TurnEventSink {
   // without an id a result goes to the oldest open call of that tool, which is
   // the engine's order.
   const open: OpenCall[] = []
+  // The engine ends every text block with `text_block_end`. Two text blocks
+  // with nothing drawn between them (text, a thinking block with no visible
+  // text, text) land in the same chat block, so the next block starts a new
+  // paragraph instead of running on: "foo.ts" + "**Done**" read as
+  // "foo.ts**Done**", one line. A tool or reasoning block in between already
+  // separates them.
+  let textBlockEnded = false
+  /** The last characters of the chat's current text block ('' when none). */
+  let textTail = ''
+  const separateTextBlocks = () => {
+    textBlockEnded = false
+    textTail = ''
+  }
 
-  const close = (call: OpenCall, output: string, isError: boolean) =>
-    sdk({
+  const close = (call: OpenCall, output: string, isError: boolean) => {
+    // `isError` reaches the tool block, so a refused write or a failed
+    // command does not read like a success.
+    const result: ToolResultWithStatus = {
       type: 'tool_result',
       toolCallId: call.id,
       toolName: call.toolName,
       output: mapToolResult(call.name, output, isError),
-    })
+      isError,
+    }
+    sdk(result)
+  }
 
   return {
     handle(event) {
       switch (event.type) {
-        case 'text_delta':
-          chunk(event.text)
+        case 'text_delta': {
+          if (!event.text) return
+          let text = event.text
+          if (textBlockEnded && textTail) {
+            const separator = textTail.endsWith('\n\n')
+              ? ''
+              : textTail.endsWith('\n')
+                ? '\n'
+                : '\n\n'
+            text = separator + text
+          }
+          textBlockEnded = false
+          textTail = (textTail + text).slice(-2)
+          chunk(text)
+          return
+        }
+        case 'text_block_end':
+          textBlockEnded = true
           return
         case 'reasoning_delta':
+          // Empty text draws no reasoning block, so it separates nothing.
+          if (event.text) separateTextBlocks()
           chunk({
             type: 'reasoning_chunk',
             agentId: '',
@@ -59,6 +96,7 @@ export function createTurnEventSink(state: EventHandlerState): TurnEventSink {
           return
         case 'reasoning_started':
           if (event.redacted) {
+            separateTextBlocks()
             chunk({
               type: 'reasoning_chunk',
               agentId: '',
@@ -68,6 +106,7 @@ export function createTurnEventSink(state: EventHandlerState): TurnEventSink {
           }
           return
         case 'tool_call_started': {
+          separateTextBlocks()
           const mapped = mapToolCall(event.name, event.input)
           sdk({
             type: 'tool_call',

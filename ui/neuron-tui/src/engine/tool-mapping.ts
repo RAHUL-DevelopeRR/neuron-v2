@@ -143,7 +143,8 @@ export function mapToolResult(
   isError: boolean,
 ): ToolResultOutput[] {
   if (TERMINAL_TOOLS.has(name)) {
-    if (isError) return json({ errorMessage: output })
+    // A command that ran and failed (non-zero exit, timeout) still has its
+    // output to show; the block's error flag marks it failed.
     const parsed = parseObject(output)
     if (parsed && (typeof parsed.stdout === 'string' || typeof parsed.stderr === 'string')) {
       return json({
@@ -151,6 +152,7 @@ export function mapToolResult(
         stderr: str(parsed.stderr) ?? '',
       })
     }
+    if (isError) return json({ errorMessage: output })
     return json({ stdout: output })
   }
 

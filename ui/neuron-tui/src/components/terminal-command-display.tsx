@@ -1,8 +1,11 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { sanitizeTerminalOutput } from '@neuron-tui/common/util/terminal-safe-text'
 import { TextAttributes } from '@opentui/core'
 import { useState } from 'react'
 
 import { Button } from './button'
+import { useToolFailure } from './tools/tool-call-item'
 import { useTerminalDimensions } from '../hooks/use-terminal-dimensions'
 import { useTheme } from '../hooks/use-theme'
 import { formatTimeout } from '../utils/format-timeout'
@@ -58,10 +61,14 @@ export const TerminalCommandDisplay = ({
       ? formatTimeout(timeoutSeconds)
       : null
 
+  // A command the engine refused or that failed (non-zero exit, timeout):
+  // its prompt turns from green to the error colour and says so.
+  const failure = useToolFailure()
+
   // Command header - shared between output and no-output cases
   const commandHeader = (
     <text style={{ wrapMode: 'word' }}>
-      <span fg={theme.success}>$ </span>
+      <span fg={failure ? theme.error : theme.success}>$ </span>
       <span fg={theme.foreground} attributes={TextAttributes.BOLD}>
         {command}
       </span>
@@ -70,6 +77,9 @@ export const TerminalCommandDisplay = ({
           {' '}({timeoutLabel})
         </span>
       )}
+      {failure ? (
+        <span fg={theme.error}>{`  ✗ ${failure.label}`}</span>
+      ) : null}
     </text>
   )
 

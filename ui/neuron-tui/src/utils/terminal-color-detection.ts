@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 /**
  * Terminal Color Detection using OSC 10/11 Escape Sequences
  *

@@ -57,6 +57,45 @@ describe('createExitCliCleanly', () => {
     expect(exitCodes).toEqual([3])
   })
 
+  test('the exit message is printed after the local cleanup, before the engine stops', async () => {
+    const events: string[] = []
+    const exitCleanly = createExitCliCleanly({
+      cleanupLocal: () => events.push('local-cleanup'),
+      printExitMessage: async () => {
+        await Promise.resolve()
+        events.push('message')
+      },
+      shutdownEngine: async () => {
+        events.push('engine-shutdown')
+      },
+      waitForCleanup: async (tasks) => {
+        await Promise.allSettled(tasks)
+      },
+      exit: (code) => events.push(`exit-${code}`),
+    })
+
+    await exitCleanly(0)
+    expect(events).toEqual(['local-cleanup', 'message', 'engine-shutdown', 'exit-0'])
+  })
+
+  test('a failing exit message never blocks the exit', async () => {
+    const exitCodes: number[] = []
+    const exitCleanly = createExitCliCleanly({
+      cleanupLocal: () => {},
+      printExitMessage: () => {
+        throw new Error('console gone')
+      },
+      shutdownEngine: async () => {},
+      waitForCleanup: async (tasks) => {
+        await Promise.allSettled(tasks)
+      },
+      exit: (code) => exitCodes.push(code),
+    })
+
+    await exitCleanly(2)
+    expect(exitCodes).toEqual([2])
+  })
+
   test('coalesces competing exit requests and keeps the first exit code', async () => {
     let finishCleanup: (() => void) | undefined
     let cleanupCalls = 0

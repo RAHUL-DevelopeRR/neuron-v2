@@ -1,3 +1,6 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: chats are
+// read from every data directory of the project (its own, then the legacy
+// folder-name-only one). See ui/neuron-tui/PORTING.md.
 import * as fs from 'fs'
 import path from 'path'
 
@@ -7,7 +10,7 @@ import {
   readChatMeta,
 } from './chat-meta'
 import { CHAT_LOG_FILENAME, logger } from './logger'
-import { getProjectDataDir } from '../project-files'
+import { getProjectDataDirs } from '../project-files'
 
 import type { ChatMessage } from '../types/chat'
 
@@ -22,8 +25,18 @@ export interface ChatHistoryEntry {
   unreadable?: boolean
 }
 
-function getChatsDir(dataDir: string = getProjectDataDir()): string {
-  return path.join(dataDir, 'chats')
+/**
+ * The `chats` directories to read: of the data directories given, or of the
+ * project's own and legacy ones (see getProjectDataDirs).
+ */
+function getChatsDirs(dataDir?: string | string[]): string[] {
+  const dataDirs =
+    dataDir === undefined
+      ? getProjectDataDirs()
+      : Array.isArray(dataDir)
+        ? dataDir
+        : [dataDir]
+  return dataDirs.map((dir) => path.join(dir, 'chats'))
 }
 
 interface ChatDirInfo {
@@ -36,36 +49,39 @@ interface ChatDirInfo {
 /**
  * List all available chats sorted by most recent first
  * @param maxChats - Maximum number of chats to load (default: 500)
+ * @param dataDir - Data directories to read, in order of preference; a chat
+ *   id found in more than one is listed once, from the first.
  */
 export function getAllChats(
   maxChats: number = 500,
-  dataDir?: string,
+  dataDir?: string | string[],
 ): ChatHistoryEntry[] {
   try {
-    const chatsDir = getChatsDir(dataDir)
-
-    if (!fs.existsSync(chatsDir)) {
-      return []
-    }
-
-    const chatDirs = fs.readdirSync(chatsDir)
-
     // First pass: get mtime for all chat directories (fast, no file reading)
     const chatDirInfos: ChatDirInfo[] = []
-    for (const chatId of chatDirs) {
-      const chatPath = path.join(chatsDir, chatId)
-      try {
-        const stat = fs.statSync(chatPath)
-        if (!stat.isDirectory()) continue
+    const seen = new Set<string>()
+    for (const chatsDir of getChatsDirs(dataDir)) {
+      if (!fs.existsSync(chatsDir)) continue
 
-        chatDirInfos.push({
-          chatId,
-          chatPath,
-          messagesPath: path.join(chatPath, CHAT_MESSAGES_FILENAME),
-          mtime: stat.mtime,
-        })
-      } catch {
-        // Skip directories we can't stat
+      for (const chatId of fs.readdirSync(chatsDir)) {
+        // A legacy chat continued since is in both; the project's own copy,
+        // which has the newer turns, wins.
+        if (seen.has(chatId)) continue
+        const chatPath = path.join(chatsDir, chatId)
+        try {
+          const stat = fs.statSync(chatPath)
+          if (!stat.isDirectory()) continue
+
+          seen.add(chatId)
+          chatDirInfos.push({
+            chatId,
+            chatPath,
+            messagesPath: path.join(chatPath, CHAT_MESSAGES_FILENAME),
+            mtime: stat.mtime,
+          })
+        } catch {
+          // Skip directories we can't stat
+        }
       }
     }
 
@@ -155,38 +171,48 @@ const MIN_LOG_AGE_MS = 14 * 24 * 60 * 60 * 1000
  * touched in 14+ days. Only debug logs are removed — chat history files are
  * untouched.
  */
-export function trimOversizedChatLogs(dataDir?: string): void {
-  let chatsDir: string
-  let chatIds: string[]
+export function trimOversizedChatLogs(dataDir?: string | string[]): void {
+  let chatsDirs: string[]
   try {
-    chatsDir = getChatsDir(dataDir)
-    chatIds = fs.readdirSync(chatsDir)
+    chatsDirs = getChatsDirs(dataDir)
   } catch {
-    return // No project root set or no chats directory yet
+    return // No project root set
   }
 
   const deleteBefore = Date.now() - MIN_LOG_AGE_MS
-  for (const chatId of chatIds) {
-    const logFile = path.join(chatsDir, chatId, CHAT_LOG_FILENAME)
+  for (const chatsDir of chatsDirs) {
+    let chatIds: string[]
     try {
-      const stats = fs.statSync(logFile, { throwIfNoEntry: false })
-      if (
-        stats &&
-        stats.size > MAX_LOG_FILE_BYTES &&
-        stats.mtimeMs < deleteBefore
-      ) {
-        fs.unlinkSync(logFile)
-      }
+      chatIds = fs.readdirSync(chatsDir)
     } catch {
-      // Ignore errors for individual files
+      continue // No chats directory yet
+    }
+    for (const chatId of chatIds) {
+      const logFile = path.join(chatsDir, chatId, CHAT_LOG_FILENAME)
+      try {
+        const stats = fs.statSync(logFile, { throwIfNoEntry: false })
+        if (
+          stats &&
+          stats.size > MAX_LOG_FILE_BYTES &&
+          stats.mtimeMs < deleteBefore
+        ) {
+          fs.unlinkSync(logFile)
+        }
+      } catch {
+        // Ignore errors for individual files
+      }
     }
   }
 }
 
 /**
- * Delete a saved chat session from local history.
+ * Delete a saved chat session from local history: from every data directory
+ * that has it, so a legacy chat continued since does not come back.
  */
-export function deleteChatSession(chatId: string, dataDir?: string): boolean {
+export function deleteChatSession(
+  chatId: string,
+  dataDir?: string | string[],
+): boolean {
   try {
     const safeChatId = chatId.trim()
     if (
@@ -199,24 +225,27 @@ export function deleteChatSession(chatId: string, dataDir?: string): boolean {
       return false
     }
 
-    const chatsDir = getChatsDir(dataDir)
-    const chatPath = path.join(chatsDir, safeChatId)
+    let deleted = false
+    for (const chatsDir of getChatsDirs(dataDir)) {
+      const chatPath = path.join(chatsDir, safeChatId)
 
-    if (!fs.existsSync(chatPath)) {
-      return false
+      if (!fs.existsSync(chatPath)) {
+        continue
+      }
+
+      const stat = fs.statSync(chatPath)
+      if (!stat.isDirectory()) {
+        logger.warn(
+          { chatId, chatPath },
+          'Refusing to delete non-directory chat path',
+        )
+        continue
+      }
+
+      fs.rmSync(chatPath, { recursive: true, force: false })
+      deleted = true
     }
-
-    const stat = fs.statSync(chatPath)
-    if (!stat.isDirectory()) {
-      logger.warn(
-        { chatId, chatPath },
-        'Refusing to delete non-directory chat path',
-      )
-      return false
-    }
-
-    fs.rmSync(chatPath, { recursive: true, force: false })
-    return true
+    return deleted
   } catch (error) {
     logger.error(
       { chatId, error: error instanceof Error ? error.message : String(error) },

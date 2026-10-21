@@ -1,0 +1,13 @@
+# One turn, then Ctrl-C twice; the chat is saved for continue-2-reopen.txt.
+wait 60000 Enter a coding task
+wait 60000 claude-opus-4-6
+sleep 500
+type PARITY_SCENARIO:streaming_text
+send \r
+wait 60000 Mock streaming says hello from the parity harness.
+# Ctrl-C during a turn interrupts it; quit once it has ended.
+gone 30000 ■ Esc
+send \x03
+sleep 800
+send \x03
+exit 30000

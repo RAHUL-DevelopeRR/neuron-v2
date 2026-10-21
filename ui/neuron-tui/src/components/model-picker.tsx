@@ -1,7 +1,9 @@
 /**
  * `/model` with no argument: the session's model, picked from the engine's
  * catalog (`list_models`, which only the Zero-X gateway publishes). Models the
- * plan can't use now are greyed with the reason and can't be picked. The list
+ * plan can't use now are greyed with the reason and can't be picked, and so
+ * are models the gateway has taken out of rotation ("blurred") until they are
+ * back; "degraded" and "busy" ones are marked but can be picked. The list
  * refreshes every 30 s while the picker is open. `/model <name>` switches
  * without it, for providers without a catalog.
  *
@@ -15,6 +17,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import { getNeuronEngineClient } from '../engine/neuron-engine-client'
 import { useTheme } from '../hooks/use-theme'
 import { useEngineStore } from '../state/engine-store'
+import { formatElapsedTime } from '../utils/format-elapsed-time'
 import { formatTokenCount } from '../utils/format-token-count'
 import { logger } from '../utils/logger'
 import { BORDER_CHARS } from '../utils/ui-constants'
@@ -27,28 +30,67 @@ export interface ModelRow {
   id: string
   label: string
   detail: string
+  /** Can be picked now: on the plan, configured, and not out of rotation. */
   available: boolean
   current: boolean
+  /** A usable model's health worth a glance ("degraded", "busy"), or `null`. */
+  marker: string | null
 }
 
-/** The picker's rows: name, then context window, plans or why it's unavailable. */
-export function modelRows(models: ModelsEvent | null): ModelRow[] {
+/** The gateway's `unavailable_reason` codes, in words. Other text is shown as sent. */
+const UNAVAILABLE_REASONS: Record<string, string> = {
+  upgrade_required: 'needs a plan upgrade',
+  region_unavailable: 'not available in your region',
+  not_configured: 'not configured on this gateway',
+}
+
+/** "back in 3h 20m" for a blurred model, from its `available_again_at`. */
+export function backInLabel(availableAgainAt: string | null | undefined, now: number): string | null {
+  if (!availableAgainAt) return null
+  const at = Date.parse(availableAgainAt)
+  if (Number.isNaN(at)) return null
+  const minutes = Math.max(1, Math.ceil((at - now) / 60_000))
+  return `back in ${formatElapsedTime(minutes * 60)}`
+}
+
+/**
+ * The engine sends `current` as the wire model, which can carry the
+ * provider's `openai/` prefix the catalog ids do not have.
+ */
+const isCurrentModel = (id: string, current: string): boolean =>
+  id === current || current === `openai/${id}`
+
+/**
+ * The picker's rows: name, then context window, plans, the gateway's health,
+ * or why it's unavailable. `now` dates a blurred model's return.
+ */
+export function modelRows(models: ModelsEvent | null, now: number = Date.now()): ModelRow[] {
   if (!models) return []
   return models.models.map((model: ModelInfo) => {
     const details: string[] = []
     if (model.display_name && model.display_name !== model.id) details.push(model.id)
     if (model.context_window) details.push(`${formatTokenCount(model.context_window)} context`)
+    // Blurred until its time has come; without a time, until the next list says otherwise.
+    const againAt = model.available_again_at ? Date.parse(model.available_again_at) : NaN
+    const blurred =
+      model.status === 'blurred' && (Number.isNaN(againAt) || againAt > now)
+    let marker: string | null = null
     if (!model.available) {
-      details.push(model.unavailable_reason ?? 'not on your plan')
-    } else if (model.tiers.length > 0) {
-      details.push(model.tiers.join(', '))
+      const reason = model.unavailable_reason
+      details.push(reason ? (UNAVAILABLE_REASONS[reason] ?? reason) : 'not on your plan')
+    } else if (blurred) {
+      details.push(backInLabel(model.available_again_at, now) ?? 'temporarily unavailable')
+    } else {
+      if (model.tiers.length > 0) details.push(model.tiers.join(', '))
+      if (model.status === 'degraded' || model.status === 'busy') marker = model.status
     }
     return {
       id: model.id,
       label: model.display_name ?? model.id,
       detail: details.join(' · '),
-      available: model.available,
-      current: model.id === models.current,
+      available: model.available && !blurred,
+      current: isCurrentModel(model.id, models.current),
+      marker,
     }
   })
 }
@@ -82,7 +124,8 @@ export const ModelPicker = ({
   const theme = useTheme()
   const models = useEngineStore((state) => state.models)
   const loaded = models !== null
-  const rows = useMemo(() => modelRows(models), [models])
+  // Each 30 s refresh is a new list, so "back in …" is dated afresh with it.
+  const rows = useMemo(() => modelRows(models, Date.now()), [models])
   const [focus, setFocus] = useState(0)
 
   // Ask now and every 30 s; until the first reply the last list (if any) shows.
@@ -175,6 +218,11 @@ export const ModelPicker = ({
                 {row.label}
               </span>
               {row.current ? <span fg={theme.success}>{'  (current)'}</span> : null}
+              {row.marker ? (
+                <span fg={theme.warning} attributes={TextAttributes.DIM}>
+                  {`  ${row.marker}`}
+                </span>
+              ) : null}
               {row.detail ? <span fg={theme.muted}>{`  ${row.detail}`}</span> : null}
             </text>
           )

@@ -10,6 +10,7 @@ import {
   inspectWindowsWatchdogMarkers,
   MAX_CONCURRENT_WINDOWS_WATCHDOGS,
   windowsWatchdogPidPath,
+  windowsWatchdogSpawnOptions,
 } from '../terminal-watchdog'
 
 import type { WindowsWatchdogInspection } from '../terminal-watchdog'
@@ -17,7 +18,9 @@ import type { WindowsWatchdogInspection } from '../terminal-watchdog'
 const TMP = 'C:\\Temp'
 const DISARM = `${TMP}\\neuron-tui-watchdog-disarm-4242-abc123`
 
-function scripts(overrides: { ownerStartOverride?: string } = {}) {
+function scripts(
+  overrides: { ownerStartOverride?: string; workingDirectory?: string } = {},
+) {
   return buildWindowsWatchdogScripts({
     ownerPid: 4242,
     disarmPath: DISARM,
@@ -82,6 +85,36 @@ describe('Windows watchdog scripts', () => {
     expect(
       scripts({ ownerStartOverride: "1; Remove-Item 'x'" }).bootstrapScript,
     ).toStartWith('$t = 0; ')
+  })
+
+  test('the grandchild starts in the given directory, not the project', () => {
+    const { bootstrapScript } = scripts({ workingDirectory: "C:\\Temp\\o'brien" })
+    expect(bootstrapScript).toEndWith(" -WorkingDirectory 'C:\\Temp\\o''brien'")
+    expect(scripts().bootstrapScript).not.toContain('-WorkingDirectory')
+  })
+})
+
+describe('windowsWatchdogSpawnOptions', () => {
+  // PowerShell's caches live under %LOCALAPPDATA%; without it the path is
+  // relative and they appeared in the project as Microsoft/Windows/PowerShell.
+  test('runs in the temp dir with the module analysis cache there', () => {
+    const { cwd, env } = windowsWatchdogSpawnOptions(
+      { LOCALAPPDATA: 'C:\\Users\\me\\AppData\\Local', PATH: 'x' },
+      TMP,
+    )
+    expect(cwd).toBe(TMP)
+    expect(env.PSModuleAnalysisCachePath).toBe(
+      path.join(TMP, 'neuron-tui-powershell-ModuleAnalysisCache'),
+    )
+    expect(env.LOCALAPPDATA).toBe('C:\\Users\\me\\AppData\\Local')
+    expect(env.PATH).toBe('x')
+  })
+
+  test('a missing LOCALAPPDATA points at the temp dir, never the cwd', () => {
+    expect(windowsWatchdogSpawnOptions({}, TMP).env.LOCALAPPDATA).toBe(TMP)
+    expect(
+      windowsWatchdogSpawnOptions({ LOCALAPPDATA: '' }, TMP).env.LOCALAPPDATA,
+    ).toBe(TMP)
   })
 })
 

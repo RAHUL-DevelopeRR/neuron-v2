@@ -1,9 +1,13 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
 import { useCallback, useEffect, useState } from 'react'
 
 import { getCurrentChatId } from '../project-files'
+import { useChatStore } from '../state/chat-store'
 import { CLI_COMMAND } from '../utils/constants'
-import { exitCliCleanly } from '../utils/exit-cleanly'
+import { exitCliCleanly, registerExitMessage } from '../utils/exit-cleanly'
 
+import type { ChatMessage } from '../types/chat'
 import type { InputValue } from '../types/store'
 
 interface UseExitHandlerOptions {
@@ -11,26 +15,25 @@ interface UseExitHandlerOptions {
   setInputValue: (value: InputValue) => void
 }
 
-let exitHandlerRegistered = false
+/**
+ * The line printed on the main screen as the UI exits; none for a chat nothing was
+ * asked in, which has nothing to continue.
+ */
+export function continueHint(
+  chatId: string | undefined,
+  messages: readonly Pick<ChatMessage, 'variant'>[],
+): string | null {
+  if (!chatId || !messages.some((message) => message.variant === 'user')) {
+    return null
+  }
+  return `\nTo continue this session later, run:\n${CLI_COMMAND} --continue ${chatId}\n`
+}
 
 function setupExitMessageHandler() {
-  if (exitHandlerRegistered) return
-  exitHandlerRegistered = true
-
-  process.on('exit', () => {
-    try {
-      const chatId = getCurrentChatId()
-      if (chatId) {
-        // This runs synchronously during the exit phase
-        // OpenTUI has already cleaned up by this point
-        process.stdout.write(
-          `\nTo continue this session later, run:\n${CLI_COMMAND} --continue ${chatId}\n`,
-        )
-      }
-    } catch {
-      // Silent fail - don't block exit
-    }
-  })
+  // exitCliCleanly prints it once the screen is restored (see exit-cleanly.ts).
+  registerExitMessage(() =>
+    continueHint(getCurrentChatId(), useChatStore.getState().messages),
+  )
 }
 
 export const useExitHandler = ({

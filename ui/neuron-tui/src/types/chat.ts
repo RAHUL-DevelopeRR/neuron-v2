@@ -44,6 +44,11 @@ export type ToolContentBlock = {
   input: any
   output?: string
   outputRaw?: unknown
+  /**
+   * The engine marked the result an error (`is_error`): a refused or denied
+   * call, a failed tool, a non-zero exit. The renderers show it as a failure.
+   */
+  isError?: boolean
   agentId?: string
   includeToolCall?: boolean
   isCollapsed?: boolean

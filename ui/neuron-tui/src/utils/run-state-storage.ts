@@ -5,9 +5,10 @@ import path from 'path'
 import { randomUUID } from 'node:crypto'
 
 import {
+  findChatDirIn,
   getCurrentChatDir,
   getMostRecentChatDir,
-  getProjectDataDir,
+  getProjectDataDirs,
 } from '../project-files'
 import {
   CHAT_MESSAGES_FILENAME,
@@ -580,16 +581,13 @@ export function loadMostRecentChatState(
     let chatDir: string | null = chatDirOverride ?? null
 
     if (!chatDir && chatId && chatId.trim().length > 0) {
-      const baseDir = path.join(getProjectDataDir(), 'chats')
-      const candidateDir = path.join(baseDir, chatId.trim())
-      if (
-        fs.existsSync(candidateDir) &&
-        fs.statSync(candidateDir).isDirectory()
-      ) {
-        chatDir = candidateDir
-      } else {
+      // The project's own directory first, then the folder-name-only one
+      // chats were saved in before (see getProjectDataDirs).
+      const dataDirs = getProjectDataDirs()
+      chatDir = findChatDirIn(dataDirs, chatId)
+      if (!chatDir) {
         logger.debug(
-          { candidateDir, chatId },
+          { dataDirs, chatId },
           'Requested chatId directory not found, falling back to most recent chat directory',
         )
       }

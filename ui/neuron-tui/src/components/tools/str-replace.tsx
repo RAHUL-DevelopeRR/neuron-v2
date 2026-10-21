@@ -1,6 +1,10 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: a refused
+// or failed edit shows as one (✗, error colour, the reason), without a diff.
+// See ui/neuron-tui/PORTING.md.
 import { TextAttributes } from '@opentui/core'
 
 import { DiffViewer } from './diff-viewer'
+import { ToolFailureReason, useToolFailure } from './tool-call-item'
 import { defineToolComponent } from './types'
 import { useTheme } from '../../hooks/use-theme'
 import {
@@ -19,16 +23,19 @@ interface EditHeaderProps {
 
 const EditHeader = ({ name, filePath }: EditHeaderProps) => {
   const theme = useTheme()
-  const bulletChar = '• '
+  const failure = useToolFailure()
+  const bulletChar = failure ? '✗ ' : '• '
+  const accent = failure ? theme.error : theme.foreground
 
   return (
     <box style={{ flexDirection: 'row', alignItems: 'center', width: '100%' }}>
       <text style={{ wrapMode: 'word' }}>
-        <span fg={theme.foreground}>{bulletChar}</span>
-        <span fg={theme.foreground} attributes={TextAttributes.BOLD}>
+        <span fg={accent}>{bulletChar}</span>
+        <span fg={accent} attributes={TextAttributes.BOLD}>
           {name}
         </span>
         {filePath ? <span fg={theme.foreground}>{` ${filePath}`}</span> : null}
+        {failure ? <span fg={theme.error}>{` ${failure.label}`}</span> : null}
       </text>
     </box>
   )
@@ -42,6 +49,15 @@ interface EditBodyProps {
 }
 
 const EditBody = ({ name, filePath, diffText, isCreate }: EditBodyProps) => {
+  const failure = useToolFailure()
+  if (failure) {
+    return (
+      <box style={{ flexDirection: 'column', gap: 0, width: '100%' }}>
+        <EditHeader name={name} filePath={filePath} />
+        {failure.reason ? <ToolFailureReason reason={failure.reason} /> : null}
+      </box>
+    )
+  }
   return (
     <box style={{ flexDirection: 'column', gap: 0, width: '100%' }}>
       <EditHeader name={name} filePath={filePath} />
