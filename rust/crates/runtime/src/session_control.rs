@@ -616,6 +616,10 @@ mod tests {
     fn session_transcripts_stay_out_of_git() {
         let root = temp_dir();
         fs::create_dir_all(&root).expect("workspace");
+        // As `from_cwd` sees it: on macOS the temp dir is a symlink it resolves
+        // (`/var/folders` is `/private/var/folders`).
+        #[cfg(target_os = "macos")]
+        let root = fs::canonicalize(&root).expect("canonical workspace");
         let store = SessionStore::from_cwd(&root).expect("store");
         let ignore = root.join(".neuron").join("sessions").join(".gitignore");
         let rules = fs::read_to_string(&ignore).expect("the sessions folder ignores itself");
