@@ -1,0 +1,34 @@
+[package]
+name = "neuron-desktop"
+version = "0.1.0"
+description = "Neuron Desktop: an IDE-like workspace on the Neuron engine"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Not part of the engine's workspace in rust/: the engine's builds and CI never
+# compile Tauri.
+[workspace]
+
+[lib]
+name = "neuron_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.5", features = [] }
+
+[dependencies]
+tauri = { version = "2.9", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+portable-pty = "0.9"
+
+# No debuginfo: a Tauri debug build is several GB with it.
+[profile.dev]
+debug = 0
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
