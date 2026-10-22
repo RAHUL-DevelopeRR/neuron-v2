@@ -114,6 +114,11 @@ pub trait ToolExecutor {
         self.execute(tool_name, input)
     }
 
+    /// A tool call is about to run: it was allowed (by the policy or the user) and its
+    /// pre-hook let it through. Calls that never run get no call. The default does
+    /// nothing.
+    fn tool_started(&mut self, _tool_use_id: &str, _tool_name: &str, _input: &str) {}
+
     /// Every tool call's final result, as the model will see it: one that ran, one that
     /// was denied or blocked by a hook, and one that never started (interrupted, cut off
     /// at the output limit, stopped by the loop guard). The default does nothing.
@@ -853,6 +858,8 @@ where
             PermissionOutcome::Allow if interrupted => (INTERRUPTED_TOOL_RESULT.to_string(), true),
             PermissionOutcome::Allow => {
                 self.record_tool_started(iteration, tool_name);
+                self.tool_executor
+                    .tool_started(tool_use_id, tool_name, &effective_input);
                 let (mut output, mut is_error) = match self.tool_executor.execute_with_cancellation(
                     tool_name,
                     &effective_input,
@@ -2740,12 +2747,14 @@ mod resilience_tests {
     }
 
     /// A UI closes each tool call's row from `tool_call_finished`: it hears calls that ran,
-    /// were denied, or never started.
+    /// were denied, or never started. `tool_started` comes only for the calls that run.
     #[test]
     fn the_executor_hears_every_tool_calls_final_result() {
         type Finished = Rc<RefCell<Vec<(String, String, String, bool)>>>;
+        type Started = Rc<RefCell<Vec<(String, String)>>>;
         struct Recording {
             inner: StaticToolExecutor,
+            started: Started,
             finished: Finished,
         }
         impl ToolExecutor for Recording {
@@ -2755,6 +2764,11 @@ mod resilience_tests {
                 input: &str,
             ) -> Result<String, super::ToolError> {
                 self.inner.execute(tool_name, input)
+            }
+            fn tool_started(&mut self, id: &str, name: &str, _input: &str) {
+                self.started
+                    .borrow_mut()
+                    .push((id.to_string(), name.to_string()));
             }
             fn tool_call_finished(&mut self, id: &str, name: &str, output: &str, is_error: bool) {
                 self.finished.borrow_mut().push((
@@ -2788,7 +2802,9 @@ mod resilience_tests {
             AssistantEvent::MessageStop,
         ])]);
         let finished = Finished::default();
+        let started = Started::default();
         let tools = Recording {
+            started: Rc::clone(&started),
             inner: StaticToolExecutor::new()
                 .register("ran", |_| Ok("ok".to_string()))
                 .register("stops", move |_| {
@@ -2826,6 +2842,13 @@ mod resilience_tests {
                 row("2", "denied", "not this one", true),
                 row("3", "stops", "stopped", false),
                 row("4", "never", INTERRUPTED_TOOL_RESULT, true),
+            ]
+        );
+        assert_eq!(
+            *started.borrow(),
+            vec![
+                ("1".to_string(), "ran".to_string()),
+                ("3".to_string(), "stops".to_string())
             ]
         );
     }

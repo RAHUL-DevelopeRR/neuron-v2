@@ -81,6 +81,77 @@ pub struct AccountInfo {
     pub expires_at: Option<u64>,
 }
 
+/// What this engine can do beyond protocol 1, in [`UiEvent::Ready`]. A UI sends the
+/// commands a feature adds only when the engine lists it: an older engine would skip
+/// them with a notice.
+pub const ENGINE_FEATURES: &[&str] = &[
+    // `capabilities` (and with `questions` on, `question` events and `answer`).
+    FEATURE_CAPABILITIES,
+    // `list_sessions`, `resume`, and `transcript` events.
+    "sessions",
+    // `trust_workspace` and `workspace_trusted`.
+    "trust_workspace",
+    // `todos`, `subagent_started` and `subagent_finished` events.
+    "todos",
+    "subagents",
+];
+
+/// The feature that adds [`EngineCommand::Capabilities`].
+pub const FEATURE_CAPABILITIES: &str = "capabilities";
+
+/// A UI capability ([`EngineCommand::Capabilities`]): questions from the agent come as
+/// [`UiEvent::Question`] instead of a notice starting with "Question:".
+pub const CAPABILITY_QUESTIONS: &str = "questions";
+
+/// One saved chat in this workspace, for a session list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub id: String,
+    /// The first prompt, on one line and shortened.
+    pub title: Option<String>,
+    pub model: Option<String>,
+    pub message_count: usize,
+    /// When it last changed (Unix milliseconds).
+    pub updated_at_ms: u64,
+    /// The session the engine runs now.
+    pub current: bool,
+    /// The branch name of a forked session.
+    pub branch: Option<String>,
+}
+
+/// One entry of a saved conversation, as a UI rebuilds its transcript from it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TranscriptEntry {
+    User {
+        text: String,
+    },
+    Assistant {
+        text: String,
+    },
+    ToolCall {
+        id: String,
+        name: String,
+        input: String,
+    },
+    ToolResult {
+        id: String,
+        name: String,
+        output: String,
+        is_error: bool,
+    },
+}
+
+/// One item of the agent's task list (its `TodoWrite` tool).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoItem {
+    pub content: String,
+    /// `pending`, `in_progress` or `completed`.
+    pub status: String,
+    /// The item in the present tense, while it is in progress.
+    pub active_form: Option<String>,
+}
+
 /// Engine → UI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -91,6 +162,9 @@ pub enum UiEvent {
         protocol: u32,
         /// The Neuron version.
         version: String,
+        /// [`ENGINE_FEATURES`]; empty from engines before them.
+        #[serde(default)]
+        features: Vec<String>,
     },
     /// What the footer shows. Sent after `Ready`, after every `TurnFinished`, and after a
     /// model switch.
@@ -183,6 +257,52 @@ pub enum UiEvent {
     TurnFinished,
     /// The turn failed; `message` is what to show.
     Error { message: String },
+    /// Answer to [`EngineCommand::ListSessions`]: this workspace's saved chats, newest
+    /// first.
+    Sessions {
+        current: String,
+        sessions: Vec<SessionSummary>,
+    },
+    /// The conversation of the session the engine now runs, for the UI to show from the
+    /// start: after `--resume`, [`EngineCommand::Resume`], `/resume` and `/clear`. Long
+    /// outputs are shortened; `truncated` when the oldest entries were left out.
+    Transcript {
+        session_id: String,
+        entries: Vec<TranscriptEntry>,
+        truncated: bool,
+    },
+    /// [`EngineCommand::TrustWorkspace`] recorded the workspace as trusted. Its own
+    /// settings, hooks and MCP servers load when the session starts, so the UI restarts
+    /// the engine (`--resume` keeps the chat) when `restart_required`.
+    WorkspaceTrusted { cwd: String, restart_required: bool },
+    /// The agent asks the user something (with [`CAPABILITY_QUESTIONS`] on). Answer with
+    /// [`EngineCommand::Answer`] and the same `id` (or a plain `Submit`).
+    Question {
+        id: u64,
+        question: String,
+        /// Choices, when the agent offered some; the answer may be one of them or free
+        /// text.
+        options: Vec<String>,
+    },
+    /// The agent's task list changed (its `TodoWrite` tool ran): the whole list.
+    Todos { items: Vec<TodoItem> },
+    /// A sub-agent started (an `Agent` tool call began running). `id` is the call's
+    /// [`UiEvent::ToolCallStarted`] id.
+    SubagentStarted {
+        id: String,
+        description: String,
+        subagent_type: Option<String>,
+    },
+    /// A sub-agent's `Agent` call ended: `status` is the sub-agent's (`completed`,
+    /// `failed`, `running` when it went on in the background, ...); `result` its final
+    /// text, `note` why it stopped early.
+    SubagentFinished {
+        id: String,
+        status: String,
+        is_error: bool,
+        result: Option<String>,
+        note: Option<String>,
+    },
 }
 
 /// A file, folder or image the user attached to a prompt.
@@ -213,6 +333,19 @@ pub enum EngineCommand {
     Interrupt,
     /// Save and stop.
     Shutdown,
+    /// What this UI handles (`features` from [`UiEvent::Ready`] lists `capabilities`):
+    /// for now [`CAPABILITY_QUESTIONS`]. Replaces what an earlier one said.
+    Capabilities { features: Vec<String> },
+    /// Answer the [`UiEvent::Question`] with this `id`. A stale id is ignored.
+    Answer { id: u64, text: String },
+    /// Ask for this workspace's saved chats ([`UiEvent::Sessions`]).
+    ListSessions,
+    /// Continue a saved chat (an id from [`UiEvent::Sessions`], a path, or `latest`):
+    /// a [`UiEvent::Transcript`] and a `Status` follow, or an `Error`.
+    Resume { session: String },
+    /// Trust the workspace, as the line REPL's trust prompt does; a
+    /// [`UiEvent::WorkspaceTrusted`] and a `Status` follow, or an `Error`.
+    TrustWorkspace,
 }
 
 /// The user's answer to a permission request.
@@ -318,6 +451,86 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Protocol 1 additions: engine features (absent from older engines), the commands
+    /// they add, and their events, as JSON lines.
+    #[test]
+    fn features_sessions_questions_and_tasks_as_json() {
+        let old: UiEvent =
+            serde_json::from_str(r#"{"type":"ready","protocol":1,"version":"6.3.0"}"#).unwrap();
+        assert_eq!(
+            old,
+            UiEvent::Ready {
+                protocol: 1,
+                version: "6.3.0".into(),
+                features: Vec::new(),
+            }
+        );
+        assert!(ENGINE_FEATURES.contains(&FEATURE_CAPABILITIES));
+
+        for (line, command) in [
+            (
+                r#"{"kind":"command","type":"capabilities","features":["questions"]}"#,
+                EngineCommand::Capabilities {
+                    features: vec![CAPABILITY_QUESTIONS.into()],
+                },
+            ),
+            (
+                r#"{"kind":"command","type":"answer","id":3,"text":"dev"}"#,
+                EngineCommand::Answer {
+                    id: 3,
+                    text: "dev".into(),
+                },
+            ),
+            (
+                r#"{"kind":"command","type":"list_sessions"}"#,
+                EngineCommand::ListSessions,
+            ),
+            (
+                r#"{"kind":"command","type":"resume","session":"latest"}"#,
+                EngineCommand::Resume {
+                    session: "latest".into(),
+                },
+            ),
+            (
+                r#"{"kind":"command","type":"trust_workspace"}"#,
+                EngineCommand::TrustWorkspace,
+            ),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<ClientMessage>(line).unwrap(),
+                ClientMessage::Command(command),
+                "{line}"
+            );
+        }
+
+        let transcript = UiEvent::Transcript {
+            session_id: "s".into(),
+            entries: vec![
+                TranscriptEntry::User { text: "hi".into() },
+                TranscriptEntry::ToolCall {
+                    id: "t".into(),
+                    name: "bash".into(),
+                    input: "{}".into(),
+                },
+            ],
+            truncated: false,
+        };
+        let json = serde_json::to_value(&transcript).unwrap();
+        assert_eq!(json["type"], "transcript");
+        assert_eq!(json["entries"][1]["kind"], "tool_call");
+        assert_eq!(serde_json::from_value::<UiEvent>(json).unwrap(), transcript);
+
+        let todos = serde_json::to_value(UiEvent::Todos {
+            items: vec![TodoItem {
+                content: "Run the tests".into(),
+                status: "in_progress".into(),
+                active_form: Some("Running the tests".into()),
+            }],
+        })
+        .unwrap();
+        assert_eq!(todos["items"][0]["active_form"], "Running the tests");
     }
 
     /// The stdio transport's input lines: a top-level `kind`, then the command's own

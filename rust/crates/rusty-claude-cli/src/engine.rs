@@ -33,12 +33,13 @@
 use super::*;
 use crate::device_login::{DeviceCode, DeviceLoginObserver};
 use neuron_tui::protocol::{
-    AccountInfo, Attachment, EngineCommand, GitStatus, ModelInfo, PermissionReply, TokenCounts,
-    UiEvent, PROTOCOL_VERSION,
+    AccountInfo, Attachment, EngineCommand, GitStatus, ModelInfo, PermissionReply, SessionSummary,
+    TokenCounts, TranscriptEntry, UiEvent, CAPABILITY_QUESTIONS, ENGINE_FEATURES, PROTOCOL_VERSION,
 };
 use repl_loop::InterruptPresses;
 use runtime::ui_hooks::{self, UserQuestion};
 use runtime::{CancellationToken, HookAbortSignal, TurnSummary};
+use runtime::{ContentBlock, MessageRole};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{MutexGuard, PoisonError};
@@ -224,10 +225,11 @@ fn run_engine(
         engine.account_email = signed_out.email.take();
         engine.refresh_account();
         if let Some(reference) = &signed_out.options.resume {
-            if let Err(error) = engine.continue_saved_session(reference) {
-                engine.send(UiEvent::Error {
+            match engine.continue_saved_session(reference) {
+                Ok(()) => engine.send_transcript(),
+                Err(error) => engine.send(UiEvent::Error {
                     message: format!("could not continue {reference}: {error}"),
-                });
+                }),
             }
         }
         // The end of the `/login` that got here.
@@ -269,10 +271,7 @@ struct SignedOut<'a> {
 
 impl SignedOut<'_> {
     fn announce(&self, reason: &str) {
-        self.send(UiEvent::Ready {
-            protocol: PROTOCOL_VERSION,
-            version: VERSION.to_string(),
-        });
+        self.send(ready_event());
         if let Some(reason) = plain_notice(reason) {
             self.send(UiEvent::Notice { message: reason });
         }
@@ -311,11 +310,28 @@ impl SignedOut<'_> {
                     self.options.model = resolve_model_alias_with_config(model.trim());
                     self.send_status();
                 }
-                EngineCommand::SetModel { .. } | EngineCommand::Interrupt => {}
+                // Capabilities and answers are the command thread's.
+                EngineCommand::SetModel { .. }
+                | EngineCommand::Interrupt
+                | EngineCommand::Capabilities { .. }
+                | EngineCommand::Answer { .. } => {}
                 EngineCommand::ListModels => self.send(UiEvent::Models {
                     current: shown_model(&self.options.model).to_string(),
                     models: Vec::new(),
                 }),
+                // The saved chats are there before a sign-in; continuing one needs it.
+                EngineCommand::ListSessions => self.send(sessions_event("")),
+                EngineCommand::Resume { .. } => {
+                    self.send(UiEvent::Error {
+                        message: "Sign in to Zero-X first (/login) to continue a chat.".into(),
+                    });
+                }
+                EngineCommand::TrustWorkspace => {
+                    for event in trust_workspace_events() {
+                        self.send(event);
+                    }
+                    self.send_status();
+                }
             }
         }
         None
@@ -454,6 +470,163 @@ fn status_event(
     }
 }
 
+/// The first event: the protocol version and what this engine adds to it.
+fn ready_event() -> UiEvent {
+    UiEvent::Ready {
+        protocol: PROTOCOL_VERSION,
+        version: VERSION.to_string(),
+        features: ENGINE_FEATURES.iter().map(ToString::to_string).collect(),
+    }
+}
+
+/// How many saved chats a session list shows, newest first.
+const SESSION_LIST_LIMIT: usize = 50;
+
+/// This workspace's saved chats; `current` is the one the engine runs (empty for none).
+/// A store that cannot be read lists none.
+fn sessions_event(current: &str) -> UiEvent {
+    let sessions = list_managed_sessions()
+        .unwrap_or_default()
+        .into_iter()
+        .take(SESSION_LIST_LIMIT)
+        .map(|session| SessionSummary {
+            current: session.id == current,
+            id: session.id,
+            title: session.title,
+            model: session.model,
+            message_count: session.message_count,
+            updated_at_ms: session.updated_at_ms,
+            branch: session.branch_name,
+        })
+        .collect();
+    UiEvent::Sessions {
+        current: current.to_string(),
+        sessions,
+    }
+}
+
+/// How much of a conversation a transcript carries: the newest entries, and no single
+/// text longer than this many characters.
+const TRANSCRIPT_ENTRY_LIMIT: usize = 400;
+const TRANSCRIPT_TEXT_LIMIT: usize = 4_000;
+
+/// `session`'s conversation as a UI rebuilds it: prompts, replies, tool calls and their
+/// results. System messages (and a compaction's summary) are left out.
+fn transcript_event(session_id: &str, session: &Session) -> UiEvent {
+    let mut entries = Vec::new();
+    for message in &session.messages {
+        for block in &message.blocks {
+            let entry = match (message.role, block) {
+                (MessageRole::User, ContentBlock::Text { text }) if !text.trim().is_empty() => {
+                    TranscriptEntry::User {
+                        text: shorten(text, TRANSCRIPT_TEXT_LIMIT),
+                    }
+                }
+                (MessageRole::Assistant, ContentBlock::Text { text })
+                    if !text.trim().is_empty() =>
+                {
+                    TranscriptEntry::Assistant {
+                        text: shorten(text, TRANSCRIPT_TEXT_LIMIT),
+                    }
+                }
+                (MessageRole::Assistant, ContentBlock::ToolUse { id, name, input }) => {
+                    TranscriptEntry::ToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: shorten_json_strings(input, TRANSCRIPT_TEXT_LIMIT),
+                    }
+                }
+                (
+                    _,
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        tool_name,
+                        output,
+                        is_error,
+                    },
+                ) => TranscriptEntry::ToolResult {
+                    id: tool_use_id.clone(),
+                    name: tool_name.clone(),
+                    output: shorten(output, TRANSCRIPT_TEXT_LIMIT),
+                    is_error: *is_error,
+                },
+                _ => continue,
+            };
+            entries.push(entry);
+        }
+    }
+    let truncated = entries.len() > TRANSCRIPT_ENTRY_LIMIT;
+    if truncated {
+        entries.drain(..entries.len() - TRANSCRIPT_ENTRY_LIMIT);
+    }
+    UiEvent::Transcript {
+        session_id: session_id.to_string(),
+        entries,
+        truncated,
+    }
+}
+
+/// `text` cut to `limit` characters, saying how much was left out.
+fn shorten(text: &str, limit: usize) -> String {
+    let count = text.chars().count();
+    if count <= limit {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(limit).collect();
+    format!("{kept}\n\u{2026} ({} more characters)", count - limit)
+}
+
+/// A tool input with its long string values shortened, so it stays valid JSON (a UI
+/// reads paths and diffs from it). Input that is not JSON is shortened as text.
+fn shorten_json_strings(input: &str, limit: usize) -> String {
+    fn walk(value: &mut serde_json::Value, limit: usize) {
+        match value {
+            serde_json::Value::String(text) if text.chars().count() > limit => {
+                *text = shorten(text, limit);
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(|item| walk(item, limit)),
+            serde_json::Value::Object(fields) => {
+                fields.values_mut().for_each(|field| walk(field, limit));
+            }
+            _ => {}
+        }
+    }
+    if input.chars().count() <= limit {
+        return input.to_string();
+    }
+    match serde_json::from_str::<serde_json::Value>(input) {
+        Ok(mut value) => {
+            walk(&mut value, limit);
+            value.to_string()
+        }
+        Err(_) => shorten(input, limit),
+    }
+}
+
+/// `TrustWorkspace`: records the working directory in the trust store, as the line REPL's
+/// trust prompt does. The workspace's own settings, hooks and MCP servers load when a
+/// session starts, so the UI restarts the engine to use them.
+fn trust_workspace_events() -> Vec<UiEvent> {
+    let cwd = env::current_dir().unwrap_or_default();
+    match runtime::workspace_trust::record_trusted_workspace(&cwd) {
+        Ok(()) => vec![
+            UiEvent::WorkspaceTrusted {
+                cwd: cwd.display().to_string(),
+                restart_required: true,
+            },
+            UiEvent::Notice {
+                message: format!(
+                    "Trusted {}. Its settings, hooks and MCP servers load when the session restarts.",
+                    cwd.display()
+                ),
+            },
+        ],
+        Err(error) => vec![UiEvent::Error {
+            message: format!("could not trust {}: {error}", cwd.display()),
+        }],
+    }
+}
+
 /// What the command thread needs to reach the engine thread's turn.
 #[derive(Default)]
 struct Shared {
@@ -465,6 +638,8 @@ struct Shared {
     /// Where the answer to the pending question goes, with the question's number.
     answer: Mutex<Option<(u64, Sender<String>)>>,
     next_question: AtomicU64,
+    /// The UI takes questions as [`UiEvent::Question`] (its `questions` capability).
+    structured_questions: AtomicBool,
     /// Shutdown was requested: commands still queued are dropped.
     closing: AtomicBool,
 }
@@ -478,6 +653,16 @@ impl Shared {
 
     fn take_answer(&self) -> Option<Sender<String>> {
         lock(&self.answer).take().map(|(_, answer)| answer)
+    }
+
+    /// The pending question's answer channel, when `id` is that question.
+    fn take_answer_to(&self, id: u64) -> Option<Sender<String>> {
+        let mut pending = lock(&self.answer);
+        if pending.as_ref().is_some_and(|(number, _)| *number == id) {
+            pending.take().map(|(_, answer)| answer)
+        } else {
+            None
+        }
     }
 
     /// Stops the running turn, without the interrupt notice: the session is closing.
@@ -556,6 +741,21 @@ fn forward_commands(
                 let _ = queue.send(EngineCommand::Shutdown);
                 return;
             }
+            // Both take effect at once, also while a turn runs.
+            EngineCommand::Capabilities { features } => {
+                let questions = features
+                    .iter()
+                    .any(|feature| feature == CAPABILITY_QUESTIONS);
+                shared
+                    .structured_questions
+                    .store(questions, Ordering::SeqCst);
+            }
+            EngineCommand::Answer { id, text } => {
+                // A stale or unknown id answers nothing.
+                if let Some(answer) = shared.take_answer_to(id) {
+                    let _ = answer.send(text);
+                }
+            }
             command => {
                 if queue.send(command).is_err() {
                     return;
@@ -597,8 +797,9 @@ fn plain_notice(message: &str) -> Option<String> {
     (!plain.is_empty()).then(|| plain.to_string())
 }
 
-/// Shows `question` as a notice and waits for the next submitted text: the answer, raw,
-/// as a user would have typed it. An interrupted turn or a closed UI gives up.
+/// Shows `question` (a [`UiEvent::Question`] when the UI takes them, else a notice) and
+/// waits for the answer: an [`EngineCommand::Answer`] with its id, or the next submitted
+/// text, raw, as a user would have typed it. An interrupted turn or a closed UI gives up.
 fn ask_the_ui(
     events: &Sender<UiEvent>,
     shared: &Shared,
@@ -618,9 +819,17 @@ fn ask_the_ui(
     };
     let closed = || io::Error::new(io::ErrorKind::BrokenPipe, "the Neuron UI closed");
 
-    let asked = events.send(UiEvent::Notice {
-        message: question_notice(question),
-    });
+    let asked = if shared.structured_questions.load(Ordering::SeqCst) {
+        events.send(UiEvent::Question {
+            id: number,
+            question: question.question.trim().to_string(),
+            options: question.options.clone().unwrap_or_default(),
+        })
+    } else {
+        events.send(UiEvent::Notice {
+            message: question_notice(question),
+        })
+    };
     if asked.is_err() {
         withdraw();
         return Err(closed());
@@ -810,12 +1019,41 @@ impl Engine {
                 }),
             },
             // The command thread hands interrupts to the running turn; one that gets here
-            // found nothing to interrupt.
-            EngineCommand::Interrupt => {}
+            // found nothing to interrupt. Capabilities and answers are the command
+            // thread's too.
+            EngineCommand::Interrupt
+            | EngineCommand::Capabilities { .. }
+            | EngineCommand::Answer { .. } => {}
             EngineCommand::ListModels => self.list_models(),
+            EngineCommand::ListSessions => {
+                let event = sessions_event(&self.cli.session.id);
+                self.send(event);
+            }
+            EngineCommand::Resume { session } => match self.resume(&session) {
+                Ok(()) => {
+                    self.persist();
+                    self.send_transcript();
+                    self.send_status();
+                }
+                Err(error) => self.send(UiEvent::Error {
+                    message: error.to_string(),
+                }),
+            },
+            EngineCommand::TrustWorkspace => {
+                for event in trust_workspace_events() {
+                    self.send(event);
+                }
+                self.send_status();
+            }
             EngineCommand::Shutdown => return Step::Stop,
         }
         Step::Continue
+    }
+
+    /// The running session's conversation, for the UI to show from the start.
+    fn send_transcript(&mut self) {
+        let event = transcript_event(&self.cli.session.id, self.cli.runtime.session());
+        self.send(event);
     }
 
     fn submit(&mut self, text: &str, attachments: &[Attachment]) {
@@ -981,13 +1219,19 @@ impl Engine {
                 self.persist();
             }
             SlashCommand::Permissions { mode } => self.permissions(mode.as_deref())?,
-            SlashCommand::Clear { confirm } => self.clear(confirm)?,
+            SlashCommand::Clear { confirm } => {
+                self.clear(confirm)?;
+                if confirm {
+                    self.send_transcript();
+                }
+            }
             SlashCommand::Resume { session_path: None } => self.notice(&render_resume_usage()),
             SlashCommand::Resume {
                 session_path: Some(reference),
             } => {
                 self.resume(&reference)?;
                 self.persist();
+                self.send_transcript();
             }
             SlashCommand::Plan { mode } => self.plan(mode.as_deref())?,
             SlashCommand::Login => self.login()?,
@@ -1004,13 +1248,14 @@ impl Engine {
         Ok(())
     }
 
-    /// `Ready`, then the footer's first `Status`.
+    /// `Ready`, then the footer's first `Status`, then the conversation of a continued
+    /// chat.
     fn announce(&mut self) {
-        self.send(UiEvent::Ready {
-            protocol: PROTOCOL_VERSION,
-            version: VERSION.to_string(),
-        });
+        self.send(ready_event());
         self.send_status();
+        if !self.cli.runtime.session().messages.is_empty() {
+            self.send_transcript();
+        }
     }
 
     /// Ends a prompt or a slash command: `TurnFinished`, then the footer's new `Status`.
@@ -1319,15 +1564,18 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::{
-        git_status, plain_notice, question_notice, spawn, EngineExit, EngineHandle, EngineOptions,
+        git_status, plain_notice, question_notice, shorten, shorten_json_strings, spawn,
+        transcript_event, EngineExit, EngineHandle, EngineOptions,
     };
     use crate::tests::{env_lock, with_current_dir};
     use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
     use neuron_tui::protocol::{
-        EngineCommand, PermissionDecision, PermissionReply, TokenCounts, UiEvent, PROTOCOL_VERSION,
+        EngineCommand, PermissionDecision, PermissionReply, TokenCounts, TranscriptEntry, UiEvent,
+        CAPABILITY_QUESTIONS, ENGINE_FEATURES, PROTOCOL_VERSION,
     };
     use runtime::ui_hooks::{self, UserQuestion};
     use runtime::PermissionMode;
+    use runtime::{ContentBlock, ConversationMessage, MessageRole, Session};
     use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1472,7 +1720,14 @@ mod tests {
                 .any(|notice| notice.starts_with("Session cleared")),
             "{cleared:?}"
         );
-        assert_eq!(without_notices(&cleared), vec![UiEvent::TurnFinished]);
+        match without_notices(&cleared).as_slice() {
+            [UiEvent::Transcript {
+                entries, truncated, ..
+            }, UiEvent::TurnFinished] => {
+                assert!(entries.is_empty() && !truncated, "the new chat is empty");
+            }
+            other => panic!("expected an empty transcript, then the end: {other:?}"),
+        }
     }
 
     /// Submits a bash scenario that needs approval and returns the permission request's id
@@ -1576,12 +1831,13 @@ mod tests {
         })
         .expect("the engine starts");
 
-        // First the protocol version, then the footer.
+        // First the protocol version and the engine's features, then the footer.
         assert_eq!(
             next_event(&engine.events),
             UiEvent::Ready {
                 protocol: PROTOCOL_VERSION,
                 version: env!("CARGO_PKG_VERSION").to_string(),
+                features: ENGINE_FEATURES.iter().map(ToString::to_string).collect(),
             }
         );
         let untracked_at_start = match next_event(&engine.events) {
@@ -1629,13 +1885,72 @@ mod tests {
             .unwrap();
         assert_eq!(asker.join().unwrap().expect("answered"), "2");
 
+        // With the `questions` capability: a Question event, answered by its id. The
+        // session list that follows is queued behind the capability, so it is in effect.
+        engine
+            .commands
+            .send(EngineCommand::Capabilities {
+                features: vec![CAPABILITY_QUESTIONS.into()],
+            })
+            .unwrap();
+        engine.commands.send(EngineCommand::ListSessions).unwrap();
+        events_until(&engine.events, |event| {
+            matches!(event, UiEvent::Sessions { .. })
+        });
+        let ask = ui_hooks::ask_handler().expect("the engine answers questions");
+        let asker = thread::spawn(move || {
+            ask(&UserQuestion {
+                question: "Which crate?".into(),
+                options: Some(vec!["api".into(), "tools".into()]),
+            })
+        });
+        let id = match next_event(&engine.events) {
+            UiEvent::Question {
+                id,
+                question,
+                options,
+            } => {
+                assert_eq!(question, "Which crate?");
+                assert_eq!(options, vec!["api".to_string(), "tools".to_string()]);
+                id
+            }
+            other => panic!("expected a question event, got {other:?}"),
+        };
+        // A stale id answers nothing; the right one does.
+        engine
+            .commands
+            .send(EngineCommand::Answer {
+                id: id + 7,
+                text: "api".into(),
+            })
+            .unwrap();
+        engine
+            .commands
+            .send(EngineCommand::Answer {
+                id,
+                text: "tools".into(),
+            })
+            .unwrap();
+        assert_eq!(asker.join().unwrap().expect("answered"), "tools");
+        engine
+            .commands
+            .send(EngineCommand::Capabilities {
+                features: Vec::new(),
+            })
+            .unwrap();
+
         // Nothing runs: the interrupt is dropped, not kept to cancel the next turn.
         engine.commands.send(EngineCommand::Interrupt).unwrap();
 
         // Streamed text, then the turn's real usage.
         engine.commands.send(scenario("streaming_text")).unwrap();
+        let streamed = turn_events(&engine.events);
+        let first_session = match streamed.last() {
+            Some(UiEvent::Status { session_id, .. }) => session_id.clone(),
+            other => panic!("expected the footer after the turn, got {other:?}"),
+        };
         assert_eq!(
-            without_notices(&turn_events(&engine.events)),
+            without_notices(&streamed),
             vec![
                 UiEvent::TextDelta {
                     text: "Mock streaming ".into()
@@ -1652,6 +1967,29 @@ mod tests {
                 UiEvent::TurnFinished,
             ]
         );
+
+        // The session list has this chat, current, titled by its first prompt.
+        engine.commands.send(EngineCommand::ListSessions).unwrap();
+        match events_until(&engine.events, |event| {
+            matches!(event, UiEvent::Sessions { .. })
+        })
+        .pop()
+        {
+            Some(UiEvent::Sessions { current, sessions }) => {
+                assert_eq!(current, first_session);
+                let listed = sessions
+                    .iter()
+                    .find(|session| session.id == first_session)
+                    .unwrap_or_else(|| panic!("the chat is listed: {sessions:?}"));
+                assert!(listed.current);
+                assert_eq!(
+                    listed.title.as_deref(),
+                    Some("PARITY_SCENARIO:streaming_text")
+                );
+                assert!(listed.message_count >= 2, "{listed:?}");
+            }
+            other => panic!("expected the session list, got {other:?}"),
+        }
 
         // A tool call that needs approval, approved: it runs.
         let approved = submit_bash_needing_approval(&engine, "bash_permission_prompt_approved");
@@ -1824,6 +2162,94 @@ mod tests {
             other => panic!("expected the model list, got {other:?}"),
         }
 
+        // Resume the first chat: its conversation for the UI, then the footer on it.
+        engine
+            .commands
+            .send(EngineCommand::Resume {
+                session: first_session.clone(),
+            })
+            .unwrap();
+        let resumed = events_until(&engine.events, |event| {
+            matches!(event, UiEvent::Status { .. })
+        });
+        match without_notices(&resumed).as_slice() {
+            [UiEvent::Transcript {
+                session_id,
+                entries,
+                truncated: false,
+            }] => {
+                assert_eq!(session_id, &first_session);
+                assert_eq!(
+                    entries.first(),
+                    Some(&TranscriptEntry::User {
+                        text: "PARITY_SCENARIO:streaming_text".into()
+                    })
+                );
+                assert!(entries.contains(&TranscriptEntry::Assistant {
+                    text: "Mock streaming says hello from the parity harness.".into()
+                }));
+                assert!(
+                    entries.iter().any(|entry| matches!(
+                        entry,
+                        TranscriptEntry::ToolCall { name, .. } if name == "bash"
+                    )),
+                    "{entries:?}"
+                );
+                assert!(
+                    entries.iter().any(|entry| matches!(
+                        entry,
+                        TranscriptEntry::ToolResult { output, is_error: false, .. }
+                            if output.contains("approved via prompt")
+                    )),
+                    "{entries:?}"
+                );
+            }
+            other => panic!("expected the transcript, got {other:?}"),
+        }
+        assert!(
+            matches!(resumed.last(), Some(UiEvent::Status { session_id, .. }) if *session_id == first_session)
+        );
+        engine
+            .commands
+            .send(EngineCommand::Resume {
+                session: "no-such-chat".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            events_until(&engine.events, |event| matches!(
+                event,
+                UiEvent::Error { .. }
+            ))
+            .pop(),
+            Some(UiEvent::Error { .. })
+        ));
+
+        // Trust the workspace: recorded, and the footer says so; settings load on restart.
+        engine.commands.send(EngineCommand::TrustWorkspace).unwrap();
+        let trusted = events_until(&engine.events, |event| {
+            matches!(event, UiEvent::Status { .. })
+        });
+        assert!(
+            trusted.iter().any(|event| matches!(
+                event,
+                UiEvent::WorkspaceTrusted {
+                    restart_required: true,
+                    ..
+                }
+            )),
+            "{trusted:?}"
+        );
+        assert!(
+            matches!(
+                trusted.last(),
+                Some(UiEvent::Status {
+                    workspace_trusted: true,
+                    ..
+                })
+            ),
+            "{trusted:?}"
+        );
+
         // Shutdown while a turn waits for approval: the turn stops, the session is saved,
         // the hooks go back to the terminal and the event channel closes.
         clear_session(&engine);
@@ -1919,6 +2345,75 @@ mod tests {
         assert_eq!(
             git_status("## HEAD (no branch)").branch.as_deref(),
             Some("detached HEAD")
+        );
+    }
+
+    /// A saved conversation as a UI rebuilds it: prompts, replies, calls and results in
+    /// order, system messages left out, long texts shortened with JSON inputs still JSON.
+    #[test]
+    fn transcripts_carry_the_conversation_a_ui_shows() {
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage {
+                role: MessageRole::System,
+                blocks: vec![ContentBlock::Text {
+                    text: "Earlier messages were summarized.".into(),
+                }],
+                usage: None,
+            },
+            ConversationMessage::user_text("write the file"),
+            ConversationMessage::assistant(vec![
+                ContentBlock::Text {
+                    text: "Writing it.".into(),
+                },
+                ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({ "path": "a.txt", "content": "x".repeat(5_000) })
+                        .to_string(),
+                },
+            ]),
+            ConversationMessage::tool_result("t1", "write_file", "y".repeat(5_000), false),
+        ];
+        let UiEvent::Transcript {
+            session_id,
+            entries,
+            truncated,
+        } = transcript_event("s1", &session)
+        else {
+            panic!("a transcript");
+        };
+        assert_eq!((session_id.as_str(), truncated), ("s1", false));
+        assert_eq!(entries.len(), 4);
+        assert_eq!(
+            entries[..2],
+            [
+                TranscriptEntry::User {
+                    text: "write the file".into()
+                },
+                TranscriptEntry::Assistant {
+                    text: "Writing it.".into()
+                },
+            ]
+        );
+        let TranscriptEntry::ToolCall { input, .. } = &entries[2] else {
+            panic!("a tool call: {:?}", entries[2]);
+        };
+        let input: serde_json::Value = serde_json::from_str(input).expect("still JSON");
+        assert_eq!(input["path"], "a.txt");
+        assert!(input["content"]
+            .as_str()
+            .unwrap()
+            .ends_with("(1000 more characters)"));
+        let TranscriptEntry::ToolResult { output, .. } = &entries[3] else {
+            panic!("a tool result: {:?}", entries[3]);
+        };
+        assert!(output.ends_with("(1000 more characters)"));
+
+        assert_eq!(shorten("short", 10), "short");
+        assert_eq!(
+            shorten_json_strings("not json", 3),
+            "not\n\u{2026} (5 more characters)"
         );
     }
 
