@@ -7,7 +7,8 @@
  * Security: it binds to 127.0.0.1 unless told otherwise, every client must
  * open with the pairing token, browser origins other than local ones are
  * refused, and remote clients cannot shut the engine down. The `fs.*` methods
- * only read inside the workspace.
+ * only read inside the workspace. Terminals (`term.open`) are only for clients
+ * on this machine, since a shell would bypass the engine's permission prompts.
  */
 
 import { timingSafeEqual } from 'crypto'
@@ -38,6 +39,16 @@ export interface HostOptions {
   /** Browser origins allowed besides local ones. */
   allowedOrigins?: string[]
   helloTimeoutMs?: number
+  /** The environment of terminals; defaults to this process's. */
+  terminalEnv?: Record<string, string | undefined>
+  /** Whether a client's address is this machine (loopback by default; tests override it). */
+  isLocal?: (address: string) => boolean
+}
+
+interface Terminal {
+  write(data: string): void
+  resize(cols: number, rows: number): void
+  close(): void
 }
 
 interface Peer {
@@ -45,6 +56,9 @@ interface Peer {
   name: string
   kind: ClientKind
   timer: ReturnType<typeof setTimeout> | null
+  /** The client connected from this machine (loopback). */
+  local: boolean
+  terminals: Map<number, { process: ReturnType<typeof Bun.spawn>; terminal: Terminal }>
 }
 
 type Socket = import('bun').ServerWebSocket<Peer>
@@ -52,6 +66,15 @@ type Socket = import('bun').ServerWebSocket<Peer>
 const MAX_FRAME_BYTES = 1_000_000
 const MAX_READ_BYTES = 512 * 1024
 const MAX_LIST_ENTRIES = 2_000
+const MAX_TERMINALS_PER_CLIENT = 4
+
+const isLoopback = (address: string) => address === '::1' || address.startsWith('127.') || address === '::ffff:127.0.0.1'
+
+/** The user's shell, as a terminal pane runs it. */
+function shellCommand(): string[] {
+  if (process.platform === 'win32') return ['powershell.exe', '-NoLogo']
+  return [process.env.SHELL || '/bin/bash', '-l']
+}
 
 export class NeuronHost {
   state: SessionState = initialSession()
@@ -59,6 +82,7 @@ export class NeuronHost {
   private sockets = new Set<Socket>()
   private server: ReturnType<typeof Bun.serve<Peer, undefined>> | null = null
   private unsubscribers: Array<() => void> = []
+  private nextTerminal = 1
 
   constructor(private readonly options: HostOptions) {
     this.unsubscribers.push(
@@ -104,7 +128,10 @@ export class NeuronHost {
         if (!host.originAllowed(request.headers.get('origin'), request.headers.get('host'))) {
           return new Response('origin not allowed', { status: 403 })
         }
-        const upgraded = server.upgrade(request, { data: { authed: false, name: '', kind: 'web', timer: null } })
+        const local = (host.options.isLocal ?? isLoopback)(server.requestIP(request)?.address ?? '')
+        const upgraded = server.upgrade(request, {
+          data: { authed: false, name: '', kind: 'web', timer: null, local, terminals: new Map() },
+        })
         return upgraded ? undefined : new Response('WebSocket upgrade required', { status: 426 })
       },
       websocket: {
@@ -121,6 +148,11 @@ export class NeuronHost {
         },
         close(socket) {
           if (socket.data.timer) clearTimeout(socket.data.timer)
+          for (const { process: child, terminal } of socket.data.terminals.values()) {
+            terminal.close()
+            child.kill()
+          }
+          socket.data.terminals.clear()
           const wasAuthed = socket.data.authed
           host.sockets.delete(socket)
           if (wasAuthed) host.broadcast({ t: 'clients', count: host.clientCount })
@@ -172,9 +204,13 @@ export class NeuronHost {
         return this.send(socket, { t: 'pong' })
       case 'send':
         return this.forward(socket, frame.message)
+      case 'term_input':
+        return socket.data.terminals.get(frame.id)?.terminal.write(frame.data)
+      case 'term_resize':
+        return socket.data.terminals.get(frame.id)?.terminal.resize(frame.cols, frame.rows)
       case 'rpc':
         try {
-          const result = await this.call(frame.method, frame.params ?? {})
+          const result = await this.call(socket, frame.method, frame.params ?? {})
           return this.send(socket, { t: 'rpc_result', id: frame.id, result })
         } catch (error) {
           return this.send(socket, { t: 'rpc_result', id: frame.id, error: error instanceof Error ? error.message : String(error) })
@@ -192,7 +228,7 @@ export class NeuronHost {
       return socket.close(4401, 'bad token')
     }
     if (socket.data.timer) clearTimeout(socket.data.timer)
-    socket.data = { authed: true, name: frame.client.name, kind: frame.client.kind, timer: null }
+    socket.data = { ...socket.data, authed: true, name: frame.client.name, kind: frame.client.kind, timer: null }
     this.send(socket, { t: 'welcome', protocol: REMOTE_PROTOCOL, host: this.info, clients: this.clientCount })
     this.send(socket, { t: 'snapshot', seq: this.seq, state: this.state })
     this.broadcast({ t: 'clients', count: this.clientCount })
@@ -213,8 +249,16 @@ export class NeuronHost {
     else if (message.type === 'slash') this.record({ type: 'local/slash', command: message.command, args: message.args })
   }
 
-  private async call(method: string, params: Record<string, unknown>): Promise<unknown> {
+  private async call(socket: Socket, method: string, params: Record<string, unknown>): Promise<unknown> {
     switch (method) {
+      case 'term.open':
+        return this.openTerminal(socket, params)
+      case 'term.close': {
+        const entry = socket.data.terminals.get(Number(params.id))
+        entry?.terminal.close()
+        entry?.process.kill()
+        return { closed: entry !== undefined }
+      }
       case 'fs.list':
         return listDirectory(this.options.root, typeof params.path === 'string' ? params.path : '.')
       case 'fs.read':
@@ -222,6 +266,33 @@ export class NeuronHost {
       default:
         throw new Error(`Unknown method ${method}.`)
     }
+  }
+
+  private openTerminal(socket: Socket, params: Record<string, unknown>): { id: number } {
+    if (!socket.data.local) throw new Error('Terminals are only available on the machine running Neuron.')
+    if (socket.data.terminals.size >= MAX_TERMINALS_PER_CLIENT) throw new Error('Too many terminals open.')
+    const size = (value: unknown, fallback: number) =>
+      Number.isSafeInteger(value) && (value as number) > 0 && (value as number) <= 1000 ? (value as number) : fallback
+    const id = this.nextTerminal++
+    const decoder = new TextDecoder()
+    const child = Bun.spawn(shellCommand(), {
+      cwd: this.options.root,
+      env: this.options.terminalEnv ?? process.env,
+      terminal: {
+        cols: size(params.cols, 80),
+        rows: size(params.rows, 24),
+        data: (_terminal: unknown, data: Uint8Array) => {
+          if (socket.readyState === 1) this.send(socket, { t: 'term_output', id, data: decoder.decode(data, { stream: true }) })
+        },
+      },
+    } as Parameters<typeof Bun.spawn>[1])
+    const terminal = (child as unknown as { terminal: Terminal }).terminal
+    socket.data.terminals.set(id, { process: child, terminal })
+    void child.exited.then((code) => {
+      socket.data.terminals.delete(id)
+      if (socket.readyState === 1) this.send(socket, { t: 'term_exit', id, code })
+    })
+    return { id }
   }
 
   async stop(): Promise<void> {

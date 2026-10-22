@@ -13,6 +13,8 @@
  *   drops the rest.
  * - A client that reconnects gets a fresh snapshot: the reduced session is
  *   small next to the events behind it, and always right.
+ * - Terminals (`term.open`) are for clients on the host's own machine only: a
+ *   shell would bypass the engine's permission prompts.
  */
 
 import type { TransportClose, EngineTransport } from './controller'
@@ -27,6 +29,9 @@ export type ClientFrame =
   | { t: 'hello'; protocol: number; token: string; client: { name: string; kind: ClientKind } }
   | { t: 'send'; message: ClientMessage }
   | { t: 'rpc'; id: number; method: string; params?: Record<string, unknown> }
+  /** Keystrokes for a terminal this client opened with `term.open`. */
+  | { t: 'term_input'; id: number; data: string }
+  | { t: 'term_resize'; id: number; cols: number; rows: number }
   | { t: 'ping' }
 
 export interface HostInfo {
@@ -41,6 +46,8 @@ export type HostFrame =
   | { t: 'snapshot'; seq: number; state: SessionState }
   | { t: 'action'; seq: number; action: SessionAction }
   | { t: 'rpc_result'; id: number; result?: unknown; error?: string }
+  | { t: 'term_output'; id: number; data: string }
+  | { t: 'term_exit'; id: number; code: number | null }
   | { t: 'clients'; count: number }
   | { t: 'error'; message: string; fatal: boolean }
   | { t: 'pong' }
@@ -83,6 +90,14 @@ export function parseClientFrame(text: string): ClientFrame | null {
             params: typeof frame.params === 'object' && frame.params !== null ? (frame.params as Record<string, unknown>) : {},
           }
         : null
+    case 'term_input':
+      return Number.isSafeInteger(frame.id) && typeof frame.data === 'string' ? { t: 'term_input', id: frame.id as number, data: frame.data } : null
+    case 'term_resize': {
+      const size = (n: unknown) => Number.isSafeInteger(n) && (n as number) > 0 && (n as number) <= 1000
+      return Number.isSafeInteger(frame.id) && size(frame.cols) && size(frame.rows)
+        ? { t: 'term_resize', id: frame.id as number, cols: frame.cols as number, rows: frame.rows as number }
+        : null
+    }
     case 'ping':
       return { t: 'ping' }
     default:
@@ -128,6 +143,7 @@ export class WebSocketTransport implements EngineTransport {
   private listeners = new Set<(action: SessionAction) => void>()
   private snapshotListeners = new Set<(state: SessionState) => void>()
   private closeListeners = new Set<(close: TransportClose) => void>()
+  private terminalListeners = new Set<(frame: Extract<HostFrame, { t: 'term_output' | 'term_exit' }>) => void>()
   private rpcs = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>()
   private nextRpc = 1
   private closedByUs = false
@@ -188,6 +204,10 @@ export class WebSocketTransport implements EngineTransport {
             for (const listener of [...this.listeners]) listener(frame.action)
             if (frame.action.type === 'ready') settle()
             break
+          case 'term_output':
+          case 'term_exit':
+            for (const listener of [...this.terminalListeners]) listener(frame)
+            break
           case 'clients':
             this.clients = frame.count
             break
@@ -238,6 +258,20 @@ export class WebSocketTransport implements EngineTransport {
         reject(error as Error)
       }
     })
+  }
+
+  /** Output and exits of the terminals this client opened (`rpc('term.open', {cols, rows})`). */
+  onTerminal(listener: (frame: Extract<HostFrame, { t: 'term_output' | 'term_exit' }>) => void): () => void {
+    this.terminalListeners.add(listener)
+    return () => this.terminalListeners.delete(listener)
+  }
+
+  terminalInput(id: number, data: string): void {
+    this.frame({ t: 'term_input', id, data })
+  }
+
+  terminalResize(id: number, cols: number, rows: number): void {
+    this.frame({ t: 'term_resize', id, cols, rows })
   }
 
   subscribe(listener: (action: SessionAction) => void): () => void {

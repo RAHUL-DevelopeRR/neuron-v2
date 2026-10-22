@@ -55,13 +55,19 @@ let engine: FakeEngine
 let root = ''
 const controllers: SessionController[] = []
 
-async function startHost() {
+async function startHost(options: { remoteOnly?: boolean } = {}) {
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'neuron-host-test-'))
   fs.mkdirSync(path.join(root, 'src'))
   fs.writeFileSync(path.join(root, 'src', 'main.rs'), 'fn main() {}\n')
   fs.writeFileSync(path.join(root, 'README.md'), '# hi\n')
   engine = new FakeEngine()
-  host = new NeuronHost({ transport: engine, token: TOKEN, root, name: 'test host' })
+  host = new NeuronHost({
+    transport: engine,
+    token: TOKEN,
+    root,
+    name: 'test host',
+    ...(options.remoteOnly && { isLocal: () => false }),
+  })
   await host.start()
   return host
 }
@@ -213,5 +219,29 @@ describe('NeuronHost', () => {
     expect(await failure(transport.rpc('fs.read', { path: '../outside.txt' }))).toMatch(/No such file|outside the workspace/)
     expect(await failure(transport.rpc('fs.list', { path: os.tmpdir() }))).toBe('That path is outside the workspace.')
     expect(await failure(transport.rpc('shell.run', { command: 'whoami' }))).toBe('Unknown method shell.run.')
+  })
+
+  test('a client on this machine gets a real terminal in the workspace', async () => {
+    await startHost()
+    const { transport } = await attach('desktop')
+    let output = ''
+    let exited: number | null | undefined
+    transport.onTerminal((frame) => {
+      if (frame.t === 'term_output') output += frame.data
+      else exited = frame.code
+    })
+    const { id } = await transport.rpc<{ id: number }>('term.open', { cols: 100, rows: 30 })
+    transport.terminalResize(id, 120, 40)
+    transport.terminalInput(id, 'echo neuron-term-$(1+1)\r')
+    await until('the echo', () => output.includes('neuron-term-2'))
+    transport.terminalInput(id, 'exit\r')
+    await until('the shell to exit', () => exited !== undefined)
+  }, 20_000)
+
+  test('a client from another machine gets no terminal', async () => {
+    await startHost({ remoteOnly: true })
+    const { transport } = await attach('mobile')
+    const failure = await transport.rpc('term.open', {}).then(() => 'opened', (error: Error) => error.message)
+    expect(failure).toBe('Terminals are only available on the machine running Neuron.')
   })
 })
