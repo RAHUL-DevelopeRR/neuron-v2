@@ -190,7 +190,7 @@ Paths are relative to `rust/crates/`. This comes from reading the code on 2026-1
 | G15 | Providers through the protocol: show, switch, store a key; catalogs beyond the gateway | desktop settings | E7 |
 | G16 | Engine-side remote: `neuron engine --share` to the relay, E2E encryption, push for approvals | mobile in production | R1–R2 |
 
-## 4. Stacks (proposed; Rahul approves the installs)
+## 4. Stacks (approved by Rahul on 2026-10-22)
 
 - **Shared client: `ui/neuron-client`.** Pure TypeScript with no runtime dependencies, in this
   branch now.
@@ -302,14 +302,25 @@ machine.
 
 - [x] The engine audit and this plan.
 - [x] `ui/neuron-client`: protocol, reducer, diffs, controller, stdio transport, host, remote
-  transport. 45 tests, including 5 against the real engine and the mock service: a turn with a
-  write, approve, deny, parallel calls, and two clients steering one engine.
-- [ ] `ui/neuron-desktop` MVP. Needs Rahul's OK on the installs.
+  transport, and PTY terminals. 48 tests, including 5 against the real engine and the mock
+  service: a turn with a write, approve, deny, parallel calls, and two clients steering one
+  engine.
+- [x] `ui/neuron-desktop` MVP (installs approved by Rahul, 2026-10-22).
   - chat with streaming, the permission dialog, tool cards with diffs
-  - a file tree, a terminal pane, the model picker, sign-in status
-  - tests against the mock engine
-- [ ] `ui/neuron-mobile` skeleton. Needs Rahul's OK on the installs.
+  - a file tree, a Changes panel, a terminal pane, the model picker, sign-in (device code), a
+    status bar
+  - 13 `bun test`s: 11 component tests, and 2 end-to-end tests of the whole app on the real engine
+    and the mock
+  - 7 `cargo test`s for `src-tauri`, one of them a real approval turn through the bridge on the
+    mock
+  - Not yet driven end to end inside the Tauri window. The app starts and its window starts the
+    engine. WebView2's DevTools port never opened on this machine, so the full turn was checked
+    in the browser build, which runs the same UI over the host.
+- [x] `ui/neuron-mobile` skeleton.
   - pair, watch, approve or deny, send, interrupt
+  - 4 `bun test`s
+  - checked in react-native-web against the mock, including a reconnect while an approval was
+    pending
 
 ### Phase E1: protocol for many front ends (engine, Rust)
 
@@ -428,8 +439,9 @@ machine.
 
 ## 8. Decisions for Rahul
 
-1. The installs for the desktop and mobile apps (section 4), and the disk space they need.
-2. Whether the PR stacks on PR #10, as now, or waits for #10 to merge into `feat/neuron-platform`.
+1. Done: the installs were approved, and the PR stacks on #10.
+2. Disk: C: is nearly full. This worktree's `rust/target` (about 1.9 GB) and
+   `ui/neuron-desktop/src-tauri/target` (about 1.4 GB) can be rebuilt.
 3. Relay: E2E encryption from day one (recommended), or TLS-only first.
 4. Connectors: gateway-hosted OAuth (recommended, so tokens never reach the user's machine), or
    OAuth done by the engine.
