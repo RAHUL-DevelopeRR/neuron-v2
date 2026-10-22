@@ -1,0 +1,261 @@
+import { describe, expect, test } from 'bun:test'
+
+import type { UiEvent } from '../src/protocol'
+import {
+  changedPaths,
+  initialSession,
+  needsSignIn,
+  openQuestion,
+  reduceSession,
+  type SessionAction,
+  type SessionState,
+  type TranscriptItem,
+} from '../src/session'
+
+const cwd = 'C:\\work\\ws'
+const status = (overrides: Record<string, unknown> = {}): UiEvent => ({
+  type: 'status',
+  model: 'claude-sonnet-4-6',
+  permission_mode: 'workspace-write',
+  session_id: 'session-1',
+  cwd,
+  workspace_trusted: false,
+  plan_mode: false,
+  context_percent: 0,
+  git: null,
+  signed_in: false,
+  sign_in_required: false,
+  account: null,
+  ...overrides,
+})
+
+const run = (actions: SessionAction[], from: SessionState = initialSession()) => actions.reduce(reduceSession, from)
+const started = () => run([{ type: 'ready', protocol: 1, version: '6.3.0' }, status()])
+const kinds = (items: TranscriptItem[]) => items.map((item) => item.kind)
+const tool = (state: SessionState, index = 0) => state.items.filter((item) => item.kind === 'tool')[index] as Extract<TranscriptItem, { kind: 'tool' }>
+
+describe('a turn', () => {
+  test('streamed text, a write, its result and the end of the turn', () => {
+    const state = run(
+      [
+        { type: 'local/submitted', text: 'PARITY_SCENARIO:write_file_allowed' },
+        {
+          type: 'tool_call_started',
+          id: 'toolu_write',
+          name: 'write_file',
+          input: '{"path":"generated/output.txt","content":"created by mock service\\n"}',
+          cut_off: false,
+        },
+        {
+          type: 'tool_result',
+          id: 'toolu_write',
+          name: 'write_file',
+          output: JSON.stringify({ type: 'create', filePath: `${cwd}\\generated\\output.txt`, bytes: 24, lines: 1, summary: 'Created output.txt' }),
+          is_error: false,
+        },
+        { type: 'text_delta', text: 'write_file ' },
+        { type: 'text_delta', text: 'succeeded' },
+        { type: 'text_block_end' },
+        { type: 'usage', turn: { input: 26, output: 11, cache_read: 0, cache_write: 0 }, cumulative: { input: 26, output: 11, cache_read: 0, cache_write: 0 }, estimated: false },
+        { type: 'turn_finished' },
+      ],
+      started(),
+    )
+    expect(state.connection).toBe('ready')
+    expect(state.version).toBe('6.3.0')
+    expect(kinds(state.items)).toEqual(['user', 'tool', 'assistant'])
+    expect(state.busy).toBe(false)
+    const write = tool(state)
+    expect(write.state).toBe('done')
+    expect(write.view.kind).toBe('write')
+    expect(write.view.target).toBe('generated/output.txt')
+    expect(write.view.diff?.lines.map((line) => line.text)).toEqual(['created by mock service'])
+    expect(write.view.output).toBe('Created output.txt')
+    expect(state.items[2]).toMatchObject({ kind: 'assistant', text: 'write_file succeeded', streaming: false })
+    expect(state.usage?.cumulative.output).toBe(11)
+    expect(changedPaths(state)).toEqual(['generated/output.txt'])
+  })
+
+  test('busy from the submit to turn_finished', () => {
+    let state = run([{ type: 'local/submitted', text: 'hi' }], started())
+    expect(state.busy).toBe(true)
+    state = run([{ type: 'turn_finished' }], state)
+    expect(state.busy).toBe(false)
+  })
+
+  test('reasoning, then text, are separate blocks', () => {
+    const state = run(
+      [
+        { type: 'reasoning_started', chars: null, redacted: false },
+        { type: 'reasoning_delta', text: 'think' },
+        { type: 'reasoning_delta', text: 'ing' },
+        { type: 'text_delta', text: 'answer' },
+        { type: 'turn_finished' },
+      ],
+      started(),
+    )
+    expect(state.items.map((item) => [item.kind, 'text' in item ? item.text : ''])).toEqual([
+      ['reasoning', 'thinking'],
+      ['assistant', 'answer'],
+    ])
+    expect(state.items.every((item) => !('streaming' in item) || !item.streaming)).toBe(true)
+  })
+
+  test('parallel calls get their results by id', () => {
+    const state = run(
+      [
+        { type: 'tool_call_started', id: 'r', name: 'read_file', input: '{"path":"fixture.txt"}', cut_off: false },
+        { type: 'tool_call_started', id: 'g', name: 'grep_search', input: '{"pattern":"parity","path":"fixture.txt"}', cut_off: false },
+        { type: 'tool_result', id: 'g', name: 'grep_search', output: '{"mode":"count","numFiles":1,"filenames":["fixture.txt"],"content":null,"numMatches":2}', is_error: false },
+        { type: 'tool_result', id: 'r', name: 'read_file', output: '{"type":"text","file":{"filePath":"fixture.txt","content":"alpha\\nbeta"}}', is_error: false },
+      ],
+      started(),
+    )
+    expect(tool(state, 0).view.output).toBe('alpha\nbeta')
+    expect(tool(state, 1).view.output).toBe('2 matches in 1 file\nfixture.txt')
+  })
+
+  test('an edit shows the diff it will make, then the one it made', () => {
+    let state = run(
+      [{ type: 'tool_call_started', id: 'e', name: 'edit_file', input: '{"path":"C:\\\\work\\\\ws\\\\src\\\\main.rs","old_string":"let a = 1;","new_string":"let a = 2;"}', cut_off: false }],
+      started(),
+    )
+    expect(tool(state).view.target).toBe('src\\main.rs')
+    expect(tool(state).view.diff?.lines.map((line) => line.kind)).toEqual(['remove', 'add'])
+    state = run(
+      [
+        {
+          type: 'tool_result',
+          id: 'e',
+          name: 'edit_file',
+          output: JSON.stringify({ filePath: 'src/main.rs', diff: '@@ -7,1 +7,1 @@\n-let a = 1;\n+let a = 2;\n', structuredPatch: [] }),
+          is_error: false,
+        },
+      ],
+      state,
+    )
+    expect(tool(state).view.diff?.lines.map((line) => [line.kind, line.oldNumber ?? line.newNumber ?? null])).toEqual([
+      ['hunk', null],
+      ['remove', 7],
+      ['add', 7],
+    ])
+  })
+})
+
+describe('permissions', () => {
+  const bash = '{"command":"printf ok | tee approved.txt","timeout":1000}'
+  const asked = () =>
+    run(
+      [
+        { type: 'local/submitted', text: 'go' },
+        { type: 'tool_call_started', id: 'b', name: 'bash', input: bash, cut_off: false },
+        {
+          type: 'permission_requested',
+          id: 1,
+          request: {
+            tool: 'bash',
+            current_mode: 'workspace-write',
+            required_mode: 'danger-full-access',
+            reason: '`tee` is not a known read-only command',
+            input: bash,
+            session_prefixes: ['tee'],
+          },
+        },
+      ],
+      started(),
+    )
+
+  test('a request attaches to the call it is for', () => {
+    const state = asked()
+    expect(state.permissions).toHaveLength(1)
+    expect(state.permissions[0].toolKey).toBe(tool(state).key)
+    expect(tool(state).state).toBe('awaiting_permission')
+    expect(tool(state).permissionId).toBe(1)
+  })
+
+  test('allowing runs the call; its result closes it', () => {
+    let state = run([{ type: 'local/permission_answered', id: 1, decision: { kind: 'allow_once' } }], asked())
+    expect(state.permissions).toEqual([])
+    expect(tool(state).state).toBe('running')
+    state = run([{ type: 'tool_result', id: 'b', name: 'bash', output: '{"stdout":"ok","stderr":""}', is_error: false }], state)
+    expect(tool(state).state).toBe('done')
+    expect(tool(state).view.output).toBe('ok')
+  })
+
+  test('denying marks the call denied, also after its error result', () => {
+    let state = run([{ type: 'local/permission_answered', id: 1, decision: { kind: 'deny', note: 'not now' } }], asked())
+    expect(tool(state).state).toBe('denied')
+    state = run([{ type: 'tool_result', id: 'b', name: 'bash', output: "tool 'bash' denied by the user: not now", is_error: true }], state)
+    expect(tool(state).state).toBe('denied')
+  })
+
+  test('another client answering closes the request here too', () => {
+    const state = run([{ type: 'local/permission_resolved', id: 1 }], asked())
+    expect(state.permissions).toEqual([])
+  })
+
+  test('the end of the turn drops requests and fails calls left open', () => {
+    const state = run([{ type: 'turn_finished' }], asked())
+    expect(state.permissions).toEqual([])
+    expect(tool(state).state).toBe('error')
+  })
+
+  test('a repeated request id is ignored', () => {
+    const state = asked()
+    expect(run([{ type: 'permission_requested', id: 1, request: state.permissions[0].request }], state).permissions).toHaveLength(1)
+  })
+})
+
+describe('the rest of the protocol', () => {
+  test('a question from the agent, answered by the next submit without a new turn', () => {
+    let state = run([{ type: 'local/submitted', text: 'plan it' }, { type: 'notice', message: 'Question: Which crate?\n  1. api\n  2. tools' }], started())
+    expect(openQuestion(state)).toBe('Which crate?\n  1. api\n  2. tools')
+    state = run([{ type: 'local/submitted', text: '2' }], state)
+    expect(openQuestion(state)).toBeNull()
+    expect(state.busy).toBe(true)
+  })
+
+  test('sign-in: the signed-out stage, the code, then the session starting', () => {
+    let state = run([{ type: 'ready', protocol: 1, version: '6.3.0' }, status({ sign_in_required: true, session_id: '' })])
+    expect(needsSignIn(state)).toBe(true)
+    state = run(
+      [
+        { type: 'local/slash', command: 'login', args: '' },
+        { type: 'sign_in_code', url: 'https://zero-x.live/device', url_complete: null, user_code: 'ABCD-1234', expires_in_secs: 600, browser_opened: false },
+      ],
+      state,
+    )
+    expect(state.signInCode?.user_code).toBe('ABCD-1234')
+    state = run([{ type: 'session_starting' }], state)
+    expect(state.signInCode).toBeNull()
+    expect(state.sessionStarting).toBe(true)
+    state = run([{ type: 'turn_finished' }, status({ signed_in: true, account: { email: null, plan: 'free', source: 'keychain', expires_at: null } })], state)
+    expect(needsSignIn(state)).toBe(false)
+    expect(state.sessionStarting).toBe(false)
+  })
+
+  test('a launch error before ready is the connection error', () => {
+    const state = run([{ type: 'error', message: 'neuron is running from a very broad directory' }])
+    expect(state.connectionError).toContain('broad directory')
+  })
+
+  test('the engine going away fails what was running', () => {
+    const state = run(
+      [{ type: 'tool_call_started', id: 'x', name: 'bash', input: '{"command":"sleep 9"}', cut_off: false }, { type: 'local/disconnected', error: 'exit code 1' }],
+      started(),
+    )
+    expect(state.connection).toBe('exited')
+    expect(state.connectionError).toBe('exit code 1')
+    expect(tool(state).state).toBe('error')
+  })
+
+  test('a result for a call this client never saw still shows', () => {
+    const state = run([{ type: 'tool_result', id: 'late', name: 'read_file', output: 'text', is_error: false }], started())
+    expect(tool(state)).toMatchObject({ id: 'late', state: 'done', output: 'text' })
+  })
+
+  test('an MCP call names its server and tool', () => {
+    const state = run([{ type: 'tool_call_started', id: 'm', name: 'mcp__playwright__browser_navigate', input: '{"url":"https://example.com"}', cut_off: false }], started())
+    expect(tool(state).view).toMatchObject({ kind: 'mcp', mcp: { server: 'playwright', tool: 'browser_navigate' } })
+  })
+})
