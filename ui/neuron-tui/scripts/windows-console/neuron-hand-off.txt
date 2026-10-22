@@ -1,6 +1,5 @@
 # A bare `neuron` hands the console to the compiled UI; allow for the session
-# (a); Ctrl-C twice; neuron returns the UI's exit code. (The --continue hint
-# can't be seen here: see windows-console-check.ts.)
+# (a); Ctrl-C twice; neuron returns the UI's exit code; the continue hint shows.
 wait 90000 Enter a coding task
 wait 60000 claude-opus-4-6
 sleep 500
@@ -18,3 +17,4 @@ send \x03
 sleep 800
 send \x03
 exit 30000
+wait 10000 neuron --continue

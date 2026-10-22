@@ -97,6 +97,11 @@ describe('chat lookup across data directories', () => {
     fs.writeFileSync(path.join(empty, 'log.jsonl'), '')
     fs.utimesSync(empty, new Date(3_000_000), new Date(3_000_000))
     expect(mostRecentChatDirIn([current, legacy])).toBe(newer)
+
+    // Nor is one where only slash commands were typed: the engine's session is empty.
+    const slashOnly = writeChat(current, 'd', '/status')
+    fs.utimesSync(slashOnly, new Date(4_000_000), new Date(4_000_000))
+    expect(mostRecentChatDirIn([current, legacy])).toBe(newer)
   })
 
   test('--continue <chatId> still opens a chat saved under the folder name only', () => {

@@ -4,7 +4,9 @@
 // deny), resizing, Ctrl-C to quit, a bare `neuron` handing the console to the
 // UI, and `neuron --continue <chat>` reopening a chat. The steps are
 // scripts/windows-console/*.txt, played by ConPtyDrive.cs, which this compiles
-// with the csc.exe that ships with Windows.
+// with the csc.exe that ships with Windows. Then two exits in a classic console
+// window (classic-console-check.ps1 with ConsoleKeys.cs): the window must
+// survive them and show the --continue hint.
 //
 //   bun run check:console
 //
@@ -64,22 +66,19 @@ const results = [
   play('neuron-hand-off.txt', ['--via-neuron']).passed,
 ]
 
-// The chat from the first run, reopened by the second (one home for both). The
-// exit hint that names it can't be read here: under the pseudoconsole Windows
-// itself provides (kernel32's CreatePseudoConsole, which this driver uses), the
-// console ends for every process in it as OpenTUI's renderer tears down, so
-// nothing printed after that arrives. A classic console window and Windows
-// Terminal keep it, and there `neuron` prints the hint once the UI has exited
-// (full_screen.rs). So the chat id comes from the saved chat instead.
+// The chat from the first run, named by its exit hint, reopened by the second
+// (one home for both). The hint must name the chat the UI saved.
 const home = path.join(work, 'home')
 fs.mkdirSync(home)
 const first = play('continue-1-chat.txt', ['--via-neuron'], { NEURON_TUI_DEV_HOME: home })
-const chat = savedChatIds(home)[0]
-results.push(first.passed && Boolean(chat))
+const chat = /neuron --continue (\S+)/.exec(first.report)?.[1]
+const named = Boolean(chat) && savedChatIds(home).includes(chat!)
+if (first.passed && !named) console.log('FAIL  the exit hint does not name the saved chat')
+results.push(first.passed && named)
 if (chat) {
   results.push(play('continue-2-reopen.txt', ['--via-neuron', '--continue', chat], { NEURON_TUI_DEV_HOME: home }).passed)
 } else {
-  console.log('FAIL  continue-1-chat.txt saved no chat')
+  console.log('FAIL  no chat id in the exit hint')
   results.push(false)
 }
 
@@ -95,6 +94,36 @@ function savedChatIds(home: string): string[] {
     }
   }
   return chats.sort((a, b) => b.mtime - a.mtime).map((chat) => chat.id)
+}
+
+// A classic console window (conhost.exe), where Windows PowerShell 5.1 and
+// cmd.exe open: quitting must leave the window alive, with the hint on it.
+// conhost used to crash there (an access violation) as the UI quit, when the
+// process lived on after its renderer's teardown and the key-up of the
+// quitting key arrived (see exit-cleanly.ts).
+for (const [mode, keys, label] of [
+  ['--via-neuron', 'PARITY_SCENARIO:streaming_text<CR>|<SLEEP>|<CC>|<CC>', 'Ctrl-C twice, through neuron'],
+  ['--compiled', 'PARITY_SCENARIO:streaming_text<CR>|<SLEEP>|/exit<CR>', '/exit, the UI on its own'],
+] as const) {
+  results.push(classic(mode, keys, label))
+}
+
+/** Runs classic-console-check.ps1: types `keys`, then checks the window and its hint. */
+function classic(mode: string, keys: string, label: string): boolean {
+  const run = Bun.spawnSync(
+    [
+      'powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+      '-File', path.join(steps, 'classic-console-check.ps1'),
+      '-Work', work, '-Bun', process.execPath, '-DevScript', devScript,
+      '-Mode', mode, '-Keys', keys, '-Expect', 'neuron --continue',
+    ],
+    { env: process.env, timeout: 200_000 },
+  )
+  const report = run.stdout.toString() + run.stderr.toString()
+  const passed = /^RESULT pass/m.test(report)
+  console.log(`${passed ? 'pass' : 'FAIL'}  classic console window: ${label}`)
+  if (!passed) console.log(report.trim())
+  return passed
 }
 
 try {

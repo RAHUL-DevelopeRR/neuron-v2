@@ -207,10 +207,15 @@ blocked.
   - a bare `neuron` handing the console to the UI (`NEURON_TUI_BIN`), `a` (allow
     for the session), and Ctrl-C twice ("Press Ctrl-C again to exit", then the
     exit), with `neuron` returning the UI's exit code;
-  - `neuron --continue <chat>` reopening a saved chat (its transcript, and the
-    engine resuming its session).
+  - the exit hint `neuron --continue <chat>`, and that command reopening the
+    chat (its transcript, and the engine resuming its session);
+  - then, in a classic console window (`conhost.exe`, where Windows PowerShell
+    5.1 and cmd.exe open), a turn and Ctrl-C twice through `neuron`, and a turn
+    and `/exit` in the UI on its own: the window must outlive the exit and show
+    the hint (`classic-console-check.ps1` with `ConsoleKeys.cs`, which attach to
+    the window's console to read it and type into it).
 
-  All 5 pass on Windows 11. Each scenario waits for a turn to end before Ctrl-C:
+  All 7 pass on Windows 11. Each scenario waits for a turn to end before Ctrl-C:
   during a turn Ctrl-C interrupts it instead. Bugs it found are fixed:
   - The exit hint was never shown on Windows. The `process.on('exit')` listener
     ran after the console was gone (EPIPE), and a write from the UI races its
@@ -221,17 +226,20 @@ blocked.
   - `neuron --continue` was an unknown option. `neuron` now passes
     `--continue [chat]` to the UI, and says so plainly where the UI can't run it.
     A bare `--continue` skips chats that saved no messages.
+  - Quitting crashed conhost.exe (an access violation, Event Log error 1000 at
+    offsets 0xcfcf and 0x68e26 of conhost 10.0.26100) in a classic console
+    window, and in the pseudoconsole Windows itself provides: the window closed,
+    and its shell with it. It happened when the process lived on after OpenTUI's
+    renderer had torn down, here waiting up to a second for the engine to stop,
+    and a key still arrived; the key-up of the Enter or Ctrl-C that asked to
+    quit is enough. A quit on a timer, with no key, never crashed. The exit now
+    stops the engine first, while the UI is still up, then tears the renderer
+    down, prints the hint and leaves (`exit-cleanly.ts`). Before: 2 crashes in 2
+    runs of the classic-window check through `neuron`; after: none in 22, direct
+    and through `neuron`, with `/exit` and with Ctrl-C twice. Windows Terminal
+    1.24 runs its own console host and was not affected.
   - The driver's screen model is fed in a `try`, so the pseudoconsole's output
     is always read.
-
-  The hint itself can't be checked there. Under the pseudoconsole that
-  kernel32's `CreatePseudoConsole` provides, the console ends for every process
-  in it as OpenTUI's native renderer tears down (writes fail with error 233,
-  about 6 ms after the teardown starts), so nothing printed after that arrives.
-  A classic console window and Windows Terminal 1.24 keep the console. In both,
-  a bare `neuron --continue` (with a temporary auto-exit) reopened the chat, and
-  `neuron`'s print of the hint succeeded. That was checked by hand, not by
-  `check:console`.
 - Changed after the end-to-end run against a local gateway:
   - A failed tool (a refused write, a command that exits non-zero) shows as
     failed or refused, in the error colour, instead of like a success.
@@ -245,8 +253,9 @@ blocked.
     lands in the project.
   - The model picker greys out `blurred` models until `available_again_at`, marks
     `degraded` and `busy` ones, and says "not configured on this gateway".
-  - After an interrupt, the engine's REPL wording ("press Ctrl-C again to quit")
-    is not shown; the sign-in panel's `/login` is the one sign-in instruction.
+  - Interrupt notices from the engine no longer carry the line REPL's "press
+    Ctrl-C again" wording, and "■ Interrupting…" lasts only until the turn ends.
+    The sign-in panel's `/login` is the one sign-in instruction.
 - `!cmd` and `/bash` show "Shell commands (!) are not available in this build of
   the Neuron UI yet."
 - These slash commands are the UI's own: `help`, `new`, `copy`, `export`,
@@ -291,9 +300,12 @@ blocked.
   - After the UI exits, the engine can take a few seconds to finish saving and
     stopping (MCP servers still starting are stopped within 3 s). The UI waits
     for it for one second.
-  - The console check covers the inbox pseudoconsole, not the Windows Terminal
-    app's own rendering (fonts, colours, its key encoding before ConPTY). See
-    above for why it can't see the exit hint.
+  - The console check covers the inbox pseudoconsole and a classic console
+    window, not the Windows Terminal app's own rendering (fonts, colours, its key
+    encoding before ConPTY).
+  - A key typed in the moment after the renderer's teardown (while the hint is
+    printed, about 0.2 s) could still meet the conhost bug above; the exit
+    leaves as soon as the hint is out.
   - A launch refusal (a too-broad folder) arrives as the protocol's `error`
     event on stdout, and the client reads stdout to its end before it handles
     the exit. An older engine build seemed to print it only on stderr. The client

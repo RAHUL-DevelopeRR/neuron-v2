@@ -1,4 +1,4 @@
-# One turn, then Ctrl-C twice; the chat is saved for continue-2-reopen.txt.
+# One turn, then Ctrl-C twice; the exit hint names the chat to continue.
 wait 60000 Enter a coding task
 wait 60000 claude-opus-4-6
 sleep 500
@@ -11,3 +11,4 @@ send \x03
 sleep 800
 send \x03
 exit 30000
+wait 10000 neuron --continue

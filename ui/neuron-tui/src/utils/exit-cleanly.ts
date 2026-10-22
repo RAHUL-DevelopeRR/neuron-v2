@@ -1,8 +1,8 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: exit no
 // longer flushes analytics, client logs, ad engagement or survey pings, ends a
 // Freebuff session, or settles a sponsored run. It shuts the engine down
-// instead, and prints the exit message (the --continue hint) once the screen is
-// restored. See ui/neuron-tui/PORTING.md.
+// instead, before the renderer's teardown, and prints the exit message (the
+// --continue hint) once the screen is restored. See ui/neuron-tui/PORTING.md.
 import { writeFileSync, writeSync } from 'fs'
 
 import { withTimeoutOr } from '@neuron-tui/common/util/promise'
@@ -65,30 +65,34 @@ export function createExitCliCleanly(deps: ExitCliDependencies) {
     // callback can re-enter this function.
     exitPromise = Promise.resolve().then(async () => {
       try {
-        deps.cleanupLocal()
-      } catch {
-        // Cleanup is best-effort; never strand the process in a half-exited UI.
-      }
-      // The exit message goes out before the engine stops, so its wait for the
-      // screen to settle never eats into the engine's bounded shutdown. Awaited
-      // only when there is one, so without it the engine shutdown starts in the
-      // same tick as before. A lost message never stops the exit.
-      if (deps.printExitMessage) {
+        // The engine stops first, while the UI is still up. In a classic
+        // Windows console window, conhost crashes (an access violation that
+        // closes the window) when this process lives on after OpenTUI's
+        // renderer has torn down and a key still arrives: the key-up of the
+        // Enter or Ctrl-C that asked to quit is enough. So after the teardown
+        // the exit only prints its message and leaves.
         try {
-          await deps.printExitMessage()
+          await deps.waitForCleanup([
+            Promise.resolve()
+              .then(deps.shutdownEngine)
+              .catch(() => {}),
+          ])
         } catch {
-          // The hint is a nicety.
+          // A stuck engine never keeps the UI open; the wait is bounded too.
         }
-      }
-
-      const tasks = [
-        Promise.resolve()
-          .then(deps.shutdownEngine)
-          .catch(() => {}),
-      ]
-
-      try {
-        await deps.waitForCleanup(tasks)
+        try {
+          deps.cleanupLocal()
+        } catch {
+          // Cleanup is best-effort; never strand the process in a half-exited UI.
+        }
+        // Awaited only when there is one. A lost message never stops the exit.
+        if (deps.printExitMessage) {
+          try {
+            await deps.printExitMessage()
+          } catch {
+            // The hint is a nicety.
+          }
+        }
       } finally {
         deps.exit(exitCode)
       }

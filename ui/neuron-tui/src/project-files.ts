@@ -1,7 +1,7 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
 // See ui/neuron-tui/PORTING.md.
 import { createHash } from 'crypto'
-import { mkdirSync, readdirSync, statSync } from 'fs'
+import { mkdirSync, readdirSync, readFileSync, statSync } from 'fs'
 import path from 'path'
 
 import { CHAT_MESSAGES_FILENAME } from './utils/chat-meta'
@@ -115,12 +115,33 @@ export function findChatDirIn(
 }
 
 /**
- * The most recently modified chat directory across `dataDirs` that has saved
- * messages, or `null`. A run that ended before anything was sent leaves a
- * folder with only its log; `--continue` skips those.
+ * Whether a saved chat has a prompt in it. Slash commands (`/status`) are saved
+ * as user messages too, but they leave the engine's session empty.
+ */
+function hasPrompt(messagesFile: string): boolean {
+  try {
+    const messages: unknown = JSON.parse(readFileSync(messagesFile, 'utf8'))
+    return (
+      Array.isArray(messages) &&
+      messages.some(
+        (message) =>
+          message?.variant === 'user' &&
+          typeof message.content === 'string' &&
+          !message.content.trim().startsWith('/'),
+      )
+    )
+  } catch {
+    return false
+  }
+}
+
+/**
+ * The most recently modified chat directory across `dataDirs` that has a
+ * prompt in it, or `null`. A run that ended before anything was asked leaves a
+ * folder with only its log, or only slash commands; `--continue` skips those.
  */
 export function mostRecentChatDirIn(dataDirs: string[]): string | null {
-  let best: { fullPath: string; mtime: number } | null = null
+  const chats: { fullPath: string; mtime: number }[] = []
   for (const dataDir of dataDirs) {
     const chatsDir = path.join(dataDir, 'chats')
     let names: string[]
@@ -135,17 +156,18 @@ export function mostRecentChatDirIn(dataDirs: string[]): string | null {
       try {
         const stat = statSync(fullPath)
         if (!stat.isDirectory()) continue
-        const messages = path.join(fullPath, CHAT_MESSAGES_FILENAME)
-        if (!statSync(messages, { throwIfNoEntry: false })) continue
-        if (!best || stat.mtime.getTime() > best.mtime) {
-          best = { fullPath, mtime: stat.mtime.getTime() }
-        }
+        chats.push({ fullPath, mtime: stat.mtime.getTime() })
       } catch {
         // Skip entries we can't stat
       }
     }
   }
-  return best?.fullPath ?? null
+  // Newest first; only as many message files are read as it takes.
+  chats.sort((a, b) => b.mtime - a.mtime)
+  const found = chats.find((chat) =>
+    hasPrompt(path.join(chat.fullPath, CHAT_MESSAGES_FILENAME)),
+  )
+  return found?.fullPath ?? null
 }
 
 /**

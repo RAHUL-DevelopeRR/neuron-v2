@@ -10,7 +10,7 @@ ensureCliTestEnv()
 const { createExitCliCleanly } = await import('../exit-cleanly')
 
 describe('createExitCliCleanly', () => {
-  test('runs local cleanup, then the bounded engine shutdown, and exits once', async () => {
+  test('runs the bounded engine shutdown, then local cleanup, and exits once', async () => {
     const events: string[] = []
     const exitCleanly = createExitCliCleanly({
       cleanupLocal: () => events.push('local-cleanup'),
@@ -29,11 +29,13 @@ describe('createExitCliCleanly', () => {
 
     await exitCleanly(7)
 
+    // The renderer's teardown comes last: in a classic Windows console, a key
+    // arriving while the process waits after it crashes conhost.
     expect(events).toEqual([
-      'local-cleanup',
       'wait-start',
       'engine-shutdown',
       'wait-finish',
+      'local-cleanup',
       'exit-7',
     ])
   })
@@ -57,7 +59,7 @@ describe('createExitCliCleanly', () => {
     expect(exitCodes).toEqual([3])
   })
 
-  test('the exit message is printed after the local cleanup, before the engine stops', async () => {
+  test('the exit message is printed after the engine stopped and the screen was restored', async () => {
     const events: string[] = []
     const exitCleanly = createExitCliCleanly({
       cleanupLocal: () => events.push('local-cleanup'),
@@ -75,7 +77,7 @@ describe('createExitCliCleanly', () => {
     })
 
     await exitCleanly(0)
-    expect(events).toEqual(['local-cleanup', 'message', 'engine-shutdown', 'exit-0'])
+    expect(events).toEqual(['engine-shutdown', 'local-cleanup', 'message', 'exit-0'])
   })
 
   test('a failing exit message never blocks the exit', async () => {
@@ -117,10 +119,13 @@ describe('createExitCliCleanly', () => {
     expect(second).toBe(first)
 
     await Promise.resolve()
-    expect(cleanupCalls).toBe(1)
+    await Promise.resolve()
+    expect(finishCleanup).toBeDefined()
+    expect(cleanupCalls).toBe(0)
     finishCleanup?.()
     await first
 
+    expect(cleanupCalls).toBe(1)
     expect(exitCodes).toEqual([0])
   })
 })
