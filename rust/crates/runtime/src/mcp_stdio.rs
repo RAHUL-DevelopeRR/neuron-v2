@@ -3427,7 +3427,7 @@ mod tests {
             report
         });
 
-        assert!(report.tools.is_empty());
+        assert_eq!(report.tools, [] as [super::ManagedMcpTool; 0]);
         assert_eq!(report.failed_servers.len(), 1);
         assert_eq!(report.failed_servers[0].server_name, "broken");
         assert!(
