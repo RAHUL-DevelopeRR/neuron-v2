@@ -113,7 +113,10 @@ function findLastIndex<T>(items: readonly T[], predicate: (item: T) => boolean):
   return -1
 }
 
-function push(state: SessionState, item: Omit<TranscriptItem, 'key'> & { key?: string }): SessionState {
+/** `Omit` for each member of a union. */
+type WithoutKey<T> = T extends unknown ? Omit<T, 'key'> : never
+
+function push(state: SessionState, item: WithoutKey<TranscriptItem>): SessionState {
   const key = `i${state.nextKey}`
   return {
     ...state,
@@ -176,8 +179,15 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
     // -------------------------------------------------------------- engine
     case 'ready':
       return { ...state, connection: 'ready', connectionError: null, version: action.version, protocol: action.protocol }
-    case 'status':
-      return { ...state, status: action, models: state.models }
+    case 'status': {
+      // `/clear` and `/resume` switch sessions; the protocol can't replay the new one's
+      // history yet, so the transcript says where the old one ended.
+      const before = state.status?.session_id
+      const next = { ...state, status: action }
+      return before && action.session_id && before !== action.session_id
+        ? push(next, { kind: 'notice', text: `New session ${action.session_id}` })
+        : next
+    }
     case 'session_starting':
       return { ...state, sessionStarting: true, signInCode: null }
     case 'sign_in_code':

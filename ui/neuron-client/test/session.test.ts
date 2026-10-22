@@ -234,6 +234,16 @@ describe('the rest of the protocol', () => {
     expect(state.sessionStarting).toBe(false)
   })
 
+  test('a switch to another session is marked in the transcript', () => {
+    let state = run([{ type: 'local/submitted', text: 'hi' }, { type: 'turn_finished' }, status()], started())
+    expect(state.items.map((item) => item.kind)).toEqual(['user'])
+    state = run([{ type: 'local/slash', command: 'clear', args: '--confirm' }, { type: 'turn_finished' }, status({ session_id: 'session-2' })], state)
+    expect(state.items.at(-1)).toMatchObject({ kind: 'notice', text: 'New session session-2' })
+    // Signed out has no session yet; the first one is not a switch.
+    const signedOut = run([{ type: 'ready', protocol: 1, version: '6.3.0' }, status({ session_id: '' }), status({ session_id: 'session-9' })])
+    expect(signedOut.items).toEqual([])
+  })
+
   test('a launch error before ready is the connection error', () => {
     const state = run([{ type: 'error', message: 'neuron is running from a very broad directory' }])
     expect(state.connectionError).toContain('broad directory')

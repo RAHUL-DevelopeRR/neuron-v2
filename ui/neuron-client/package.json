@@ -12,7 +12,12 @@
   "scripts": {
     "test": "bun test",
     "host": "bun run scripts/host.ts",
-    "host:mock": "bun run scripts/host.ts --mock"
+    "host:mock": "bun run scripts/host.ts --mock",
+    "typecheck": "tsc --noEmit -p ."
   },
-  "packageManager": "bun@1.3.14"
+  "packageManager": "bun@1.3.14",
+  "devDependencies": {
+    "@types/bun": "1.3.14",
+    "typescript": "5.9.3"
+  }
 }

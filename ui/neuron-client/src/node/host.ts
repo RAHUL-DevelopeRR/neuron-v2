@@ -80,7 +80,7 @@ export class NeuronHost {
   state: SessionState = initialSession()
   seq = 0
   private sockets = new Set<Socket>()
-  private server: ReturnType<typeof Bun.serve<Peer, undefined>> | null = null
+  private server: ReturnType<typeof Bun.serve<Peer>> | null = null
   private unsubscribers: Array<() => void> = []
   private nextTerminal = 1
 
@@ -119,7 +119,7 @@ export class NeuronHost {
   listen(): void {
     if (this.server) return
     const host = this
-    this.server = Bun.serve<Peer, undefined>({
+    this.server = Bun.serve<Peer>({
       hostname: this.options.hostname ?? '127.0.0.1',
       port: this.options.port ?? 0,
       fetch(request, server) {

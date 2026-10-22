@@ -171,9 +171,12 @@ export class StdioTransport implements EngineTransport {
 async function pumpLines(stream: ReadableStream<Uint8Array>, onLine: (line: string) => void): Promise<void> {
   const splitter = new JsonLineSplitter()
   const decoder = new TextDecoder()
+  const reader = stream.getReader()
   try {
-    for await (const chunk of stream) {
-      for (const line of splitter.push(decoder.decode(chunk, { stream: true }))) onLine(line)
+    for (;;) {
+      const { value, done } = await reader.read()
+      if (done) break
+      for (const line of splitter.push(decoder.decode(value, { stream: true }))) onLine(line)
     }
   } catch {
     // The pipe closed; the exit code says how.
