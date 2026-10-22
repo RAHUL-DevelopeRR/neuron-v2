@@ -5,7 +5,7 @@ import { TextAttributes } from '@opentui/core'
 import { useState } from 'react'
 
 import { Button } from './button'
-import { useToolFailure } from './tools/tool-call-item'
+import { failureLabel, useToolFailure } from './tools/tool-call-item'
 import { useTerminalDimensions } from '../hooks/use-terminal-dimensions'
 import { useTheme } from '../hooks/use-theme'
 import { formatTimeout } from '../utils/format-timeout'
@@ -62,7 +62,8 @@ export const TerminalCommandDisplay = ({
       : null
 
   // A command the engine refused or that failed (non-zero exit, timeout):
-  // its prompt turns from green to the error colour and says so.
+  // its prompt turns from green to the error colour and says so, with the
+  // exit code or why it stopped when the engine said.
   const failure = useToolFailure()
 
   // Command header - shared between output and no-output cases
@@ -78,7 +79,7 @@ export const TerminalCommandDisplay = ({
         </span>
       )}
       {failure ? (
-        <span fg={theme.error}>{`  ✗ ${failure.label}`}</span>
+        <span fg={theme.error}>{`  ✗ ${failureLabel(failure)}`}</span>
       ) : null}
     </text>
   )
@@ -90,6 +91,12 @@ export const TerminalCommandDisplay = ({
         {commandHeader}
         {/* Running indicator */}
         {isRunning && <text fg={theme.muted}>...</text>}
+        {/* A failure with nothing printed: say so, not a bare header. */}
+        {failure && !isRunning && (
+          <text fg={theme.muted} attributes={TextAttributes.DIM}>
+            (no output)
+          </text>
+        )}
       </box>
     )
   }

@@ -3,7 +3,9 @@ import { createTestRenderer } from '@opentui/core/testing'
 import { createRoot, flushSync } from '@opentui/react'
 import React from 'react'
 
+import { mapToolResult } from '../../../engine/tool-mapping'
 import { initializeThemeStore, useThemeStore } from '../../../hooks/use-theme'
+import { updateToolBlockWithOutput } from '../../../utils/message-block-helpers'
 import { createMarkdownPalette } from '../../../utils/theme-system'
 import { ToolBranch } from '../../blocks/tool-branch'
 import { toolFailureOf } from '../tool-call-item'
@@ -46,6 +48,7 @@ describe('toolFailureOf', () => {
     expect(toolFailureOf({ isError: true, output: REFUSED_WRITE })).toEqual({
       label: 'refused',
       reason: "tool 'write_file' requires workspace-write permission; current mode is read-only",
+      detail: null,
     })
     expect(
       toolFailureOf({
@@ -55,10 +58,120 @@ describe('toolFailureOf', () => {
     ).toBe('refused')
     expect(
       toolFailureOf({ isError: true, output: 'Error: The system cannot find the file specified.' }),
-    ).toEqual({ label: 'failed', reason: 'The system cannot find the file specified.' })
-    expect(toolFailureOf({ isError: true, output: '' })).toEqual({ label: 'failed', reason: null })
+    ).toEqual({
+      label: 'failed',
+      reason: 'The system cannot find the file specified.',
+      detail: null,
+    })
+    expect(toolFailureOf({ isError: true, output: '' })).toEqual({
+      label: 'failed',
+      reason: null,
+      detail: null,
+    })
     expect(toolFailureOf({ isError: false, output: 'Error: looks bad' })).toBeNull()
     expect(toolFailureOf({ output: 'fine' })).toBeNull()
+  })
+
+  test('a command that says how it ended failed, whatever it printed', () => {
+    expect(
+      toolFailureOf({ isError: true, output: 'permission denied by policy', exitCode: 1 }),
+    ).toEqual({ label: 'failed', reason: 'permission denied by policy', detail: 'exit code 1' })
+    expect(toolFailureOf({ isError: true, output: '', stopReason: 'timed out' })?.detail).toBe(
+      'timed out',
+    )
+  })
+})
+
+describe('a failed command says how it ended', () => {
+  /** A bash result as the engine sends it, through the chat's tool-result path. */
+  const ran = (command: string, result: Record<string, unknown>): ToolContentBlock => {
+    const [block] = updateToolBlockWithOutput(
+      [{ type: 'tool', toolCallId: 'toolu_9', toolName: 'run_terminal_command', input: { command } }],
+      {
+        toolCallId: 'toolu_9',
+        toolOutput: mapToolResult('bash', JSON.stringify(result), true),
+        isError: true,
+      },
+    )
+    return block as ToolContentBlock
+  }
+
+  test('a non-zero exit shows its code next to the command, above its output', async () => {
+    const shown = await frame(
+      ran('node fail.js', {
+        stdout: 'out-line\n',
+        stderr: 'err-line\n',
+        interrupted: false,
+        returnCodeInterpretation: 'exit_code:2',
+      }),
+    )
+    // Was "$ node fail.js  ✗ failed", with no exit code.
+    expect(shown).toContain('$ node fail.js  ✗ failed (exit code 2)')
+    expect(shown).toContain('out-line')
+    expect(shown).toContain('err-line')
+    expect(shown).not.toContain('(no output)')
+  })
+
+  test('a failed command that printed nothing says so', async () => {
+    const shown = await frame(
+      ran('findstr nothing x.txt', {
+        stdout: '',
+        stderr: '',
+        interrupted: false,
+        returnCodeInterpretation: 'exit_code:1',
+      }),
+    )
+    // Was the bare header "$ findstr nothing x.txt  ✗ failed".
+    expect(shown).toContain('$ findstr nothing x.txt  ✗ failed (exit code 1)')
+    expect(shown).toContain('(no output)')
+  })
+
+  test('a command stopped before it finished says why', async () => {
+    const killed = await frame(
+      ran('server', { stdout: '', stderr: '', interrupted: false, returnCodeInterpretation: 'killed' }),
+    )
+    expect(killed).toContain('$ server  ✗ failed (killed)')
+    expect(killed).toContain('(no output)')
+
+    const timedOut = await frame(
+      ran('sleep 100', {
+        stdout: '',
+        stderr: 'Command exceeded timeout of 1000 ms; the process tree was terminated',
+        interrupted: true,
+        returnCodeInterpretation: 'timeout',
+      }),
+    )
+    expect(timedOut).toContain('$ sleep 100  ✗ failed (timed out)')
+    expect(timedOut).toContain('Command exceeded timeout of 1000 ms')
+
+    const interrupted = await frame(
+      ran('cargo build', {
+        stdout: '',
+        stderr: '',
+        interrupted: true,
+        returnCodeInterpretation: 'cancelled',
+      }),
+    )
+    expect(interrupted).toContain('$ cargo build  ✗ failed (interrupted)')
+  })
+
+  test('a command that succeeded has no failure marks', async () => {
+    const [block] = updateToolBlockWithOutput(
+      [{ type: 'tool', toolCallId: 'toolu_10', toolName: 'run_terminal_command', input: { command: 'true' } }],
+      {
+        toolCallId: 'toolu_10',
+        toolOutput: mapToolResult(
+          'bash',
+          JSON.stringify({ stdout: '', stderr: '', interrupted: false }),
+          false,
+        ),
+        isError: false,
+      },
+    )
+    const shown = await frame(block as ToolContentBlock)
+    expect(shown).toContain('$ true')
+    expect(shown).not.toContain('✗')
+    expect(shown).not.toContain('(no output)')
   })
 })
 
@@ -148,5 +261,24 @@ describe('tool output is data, not Markdown', () => {
     }
     // Not turned into list bullets.
     expect(shown).not.toContain('- Adds two numbers.')
+  })
+
+  test('a command whose output is JSON shows it as printed', async () => {
+    // The row's output is the command's stdout and stderr; one that parsed as
+    // JSON (a number, `cat package.json`) used to be read as an empty result.
+    const printed = async (stdout: string) => {
+      const [block] = updateToolBlockWithOutput(
+        [{ type: 'tool', toolCallId: 'toolu_5', toolName: 'run_terminal_command', input: { command: 'cmd' } }],
+        {
+          toolCallId: 'toolu_5',
+          toolOutput: mapToolResult('bash', JSON.stringify({ stdout, stderr: '' }), false),
+          isError: false,
+        },
+      )
+      return frame(block as ToolContentBlock)
+    }
+    expect(await printed('42\n')).toContain('42')
+    expect(await printed('0\n')).toContain('0')
+    expect(await printed('{"name": "neuron-tui"}\n')).toContain('{"name": "neuron-tui"}')
   })
 })

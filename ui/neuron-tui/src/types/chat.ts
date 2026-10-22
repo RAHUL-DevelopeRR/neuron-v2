@@ -49,6 +49,10 @@ export type ToolContentBlock = {
    * call, a failed tool, a non-zero exit. The renderers show it as a failure.
    */
   isError?: boolean
+  /** A command's exit code, when it ran to the end and failed. */
+  exitCode?: number
+  /** Why a command stopped otherwise: "timed out", "killed", "interrupted", "blocked: …". */
+  stopReason?: string
   agentId?: string
   includeToolCall?: boolean
   isCollapsed?: boolean

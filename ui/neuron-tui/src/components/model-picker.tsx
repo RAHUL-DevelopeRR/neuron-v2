@@ -126,7 +126,10 @@ export const ModelPicker = ({
   const loaded = models !== null
   // Each 30 s refresh is a new list, so "back in …" is dated afresh with it.
   const rows = useMemo(() => modelRows(models, Date.now()), [models])
-  const [focus, setFocus] = useState(0)
+  const currentIndex = rows.findIndex((row) => row.current)
+  const currentId = currentIndex >= 0 ? rows[currentIndex]!.id : null
+  // Each open starts on the current model (the picker mounts per open).
+  const [focus, setFocus] = useState(() => Math.max(0, currentIndex))
 
   // Ask now and every 30 s; until the first reply the last list (if any) shows.
   useEffect(() => {
@@ -142,12 +145,14 @@ export const ModelPicker = ({
     return () => clearInterval(timer)
   }, [])
 
-  // Start on the current model once the list arrives.
+  // Move to the current model again whenever it changes: the list kept from
+  // the last open can name the model from before a switch, and the fresh one
+  // that replaces it moments later has as many rows. A refresh that keeps the
+  // same model leaves the focus where the user moved it. The window below
+  // follows the focus, so the row is in view.
   useEffect(() => {
-    const current = rows.findIndex((row) => row.current)
-    if (current >= 0) setFocus(current)
-    // Only when the set of models changes, not on every refresh.
-  }, [rows.length])
+    if (currentIndex >= 0) setFocus(currentIndex)
+  }, [currentId])
 
   useKeyboard(
     useCallback(

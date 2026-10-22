@@ -73,6 +73,7 @@ against a local fake gateway instead, to try the sign-in, `/model` and
 `/logout`; the fake approves the sign-in at once. The same binaries run
 `bun test src/engine/__tests__/engine.integration.test.ts`.
 
-Settings, chat history and logs go to `~/.neuron/tui` (override with an
-absolute `NEURON_TUI_CONFIG_DIR`). `NEURON_TUI_ENV=dev` logs to
+Settings, chat history and logs go to `~/.neuron/tui`, or to `tui` in
+`NEURON_HOME` when that is set (override both with an absolute
+`NEURON_TUI_CONFIG_DIR`). `NEURON_TUI_ENV=dev` logs to
 `<project>/debug/cli.jsonl` instead of the chat folder.

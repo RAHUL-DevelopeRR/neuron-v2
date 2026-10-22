@@ -685,7 +685,14 @@ export const updateToolBlockWithOutput = (
         typeof parsed?.stdout === 'string' || typeof parsed?.stderr === 'string'
           ? (parsed.stdout || '') + (parsed.stderr || '')
           : formatToolOutput(toolOutput)
-      return { ...block, ...status, output: sanitizeTerminalOutput(output) }
+      // How a failed command ended (see engine/tool-mapping.ts), for its row.
+      const exit = {
+        ...(typeof parsed?.exitCode === 'number' && { exitCode: parsed.exitCode }),
+        ...(typeof parsed?.stopReason === 'string' && {
+          stopReason: sanitizeTerminalOutput(parsed.stopReason),
+        }),
+      }
+      return { ...block, ...status, ...exit, output: sanitizeTerminalOutput(output) }
     }
     if (block.type === 'agent' && block.blocks) {
       const updatedBlocks = updateToolBlockWithOutput(block.blocks, options)

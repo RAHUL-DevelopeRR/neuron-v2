@@ -10,6 +10,7 @@ import {
   engineNotice,
   handleEngineEvent,
   inUiWording,
+  isRetryNotice,
   setEngineTurnActive,
 } from '../engine-session'
 
@@ -96,19 +97,16 @@ describe('handleEngineEvent', () => {
 })
 
 describe('interrupt notices', () => {
-  // The engine's own lines for an interrupted turn (repl_loop.rs). Their
-  // "Ctrl-C again" hints are the line REPL's; the UI has its own.
-  const INTERRUPTING = '■ Interrupting… (press Ctrl-C again to quit)'
+  // The engine's own lines for an interrupted turn (repl_loop.rs), without the
+  // line REPL's "press Ctrl-C again" hints.
+  const INTERRUPTING = '■ Interrupting…'
 
-  test('"Interrupting…" shows without the hint only while the turn stops', () => {
+  test('"Interrupting…" shows only while the turn stops', () => {
     handleEngineEvent({ type: 'notice', message: 'Compacted 12 messages.' })
     handleEngineEvent({ type: 'notice', message: INTERRUPTING })
     expect(systemLines()).toEqual(['Compacted 12 messages.', '■ Interrupting…'])
 
-    handleEngineEvent({
-      type: 'notice',
-      message: 'Interrupted. Back at the prompt; press Ctrl-C again to exit.',
-    })
+    handleEngineEvent({ type: 'notice', message: 'Interrupted.' })
     // The turn's message already says "[response interrupted]".
     expect(systemLines()).toEqual(['Compacted 12 messages.', '■ Interrupting…'])
 
@@ -116,11 +114,11 @@ describe('interrupt notices', () => {
     expect(systemLines()).toEqual(['Compacted 12 messages.'])
   })
 
-  test('the tool calls an interrupt skipped are still reported, without the hint', () => {
+  test('the tool calls an interrupt skipped are still reported', () => {
     handleEngineEvent({ type: 'notice', message: INTERRUPTING })
     handleEngineEvent({
       type: 'notice',
-      message: 'Interrupted. 2 pending tool call(s) were not run. Press Ctrl-C again to exit.',
+      message: 'Interrupted. 2 pending tool call(s) were not run.',
     })
     handleEngineEvent({ type: 'turn_finished' })
     expect(systemLines()).toEqual(['Interrupted. 2 pending tool call(s) were not run.'])
@@ -132,14 +130,83 @@ describe('interrupt notices', () => {
       text: '■ Interrupting…',
       untilTurnEnd: true,
     })
-    expect(engineNotice('Interrupted. Back at the prompt; press Ctrl-C again to exit.')).toEqual({
-      kind: 'drop',
+    expect(engineNotice('Interrupted.')).toEqual({ kind: 'drop' })
+    expect(engineNotice('Interrupted. 1 pending tool call(s) were not run.')).toEqual({
+      kind: 'show',
+      text: 'Interrupted. 1 pending tool call(s) were not run.',
+      untilTurnEnd: false,
     })
     expect(engineNotice('Quitting: saving the session first…')).toEqual({
       kind: 'show',
       text: 'Quitting: saving the session first…',
       untilTurnEnd: false,
     })
+  })
+
+  test('notices are shown as the engine words them, Ctrl-C included', () => {
+    // The UI no longer rewrites the engine's Ctrl-C wording.
+    expect(engineNotice('Press Ctrl-C again to quit.')).toEqual({
+      kind: 'show',
+      text: 'Press Ctrl-C again to quit.',
+      untilTurnEnd: false,
+    })
+  })
+})
+
+describe('retry notices', () => {
+  // The engine's own lines (api/src/retry.rs, rusty-claude-cli/src/api_client.rs).
+  const RETRY = 'Zero-X upstream_timeout; retrying in 1.3s (retry 1 of 2)'
+  const STALL_RETRY = '⚠ The model did not start responding within 90s — retrying once…'
+  const FINAL_ERROR =
+    'api failed after 3 attempts: The model did not respond in time. Retry your request. (upstream_timeout)'
+
+  beforeEach(() => {
+    handleEngineEvent({ type: 'ready', protocol: 1, version: 'x' })
+  })
+
+  test('are recognised by their wording', () => {
+    expect(isRetryNotice(RETRY)).toBe(true)
+    expect(isRetryNotice('Zero-X capacity_exhausted; retrying now (retry 2 of 2)')).toBe(true)
+    expect(isRetryNotice(STALL_RETRY)).toBe(true)
+    expect(isRetryNotice('Compacted 12 messages.')).toBe(false)
+    expect(isRetryNotice('Retry your request.')).toBe(false)
+  })
+
+  test('show while the turn retries, and stay when it then succeeds', () => {
+    setEngineTurnActive(true)
+    handleEngineEvent({ type: 'notice', message: RETRY })
+    expect(systemLines()).toEqual([RETRY])
+    handleEngineEvent({ type: 'turn_finished' })
+    setEngineTurnActive(false)
+    expect(systemLines()).toEqual([RETRY])
+  })
+
+  test('a turn that fails for good takes its retries back; its error says how many', () => {
+    setEngineTurnActive(true)
+    handleEngineEvent({ type: 'notice', message: 'Compacted 12 messages.' })
+    handleEngineEvent({ type: 'notice', message: RETRY })
+    handleEngineEvent({ type: 'notice', message: STALL_RETRY })
+    expect(systemLines()).toEqual(['Compacted 12 messages.', RETRY, STALL_RETRY])
+
+    // The turn's message shows the error; nothing "retrying" is drawn after it.
+    handleEngineEvent({ type: 'error', message: FINAL_ERROR })
+    expect(systemLines()).toEqual(['Compacted 12 messages.'])
+    // Nor a retry notice that comes after the error.
+    handleEngineEvent({ type: 'notice', message: RETRY })
+    handleEngineEvent({ type: 'turn_finished' })
+    setEngineTurnActive(false)
+    expect(systemLines()).toEqual(['Compacted 12 messages.'])
+
+    // The next turn's retries show again.
+    setEngineTurnActive(true)
+    handleEngineEvent({ type: 'notice', message: RETRY })
+    expect(systemLines()).toEqual(['Compacted 12 messages.', RETRY])
+  })
+
+  test('a retry outside a turn (a slash command) is shown before its error', () => {
+    handleEngineEvent({ type: 'notice', message: RETRY })
+    handleEngineEvent({ type: 'error', message: FINAL_ERROR })
+    expect(systemLines()).toEqual([RETRY, `Error: ${FINAL_ERROR}`])
   })
 })
 

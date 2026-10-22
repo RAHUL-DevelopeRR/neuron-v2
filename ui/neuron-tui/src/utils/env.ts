@@ -88,6 +88,7 @@ export const getCliEnv = (): CliEnv => ({
   NEURON_TUI_LAUNCHER_PID: process.env.NEURON_TUI_LAUNCHER_PID,
   NEURON_TUI_NO_TERMINAL_WATCHDOG: process.env.NEURON_TUI_NO_TERMINAL_WATCHDOG,
   NEURON_TUI_CONFIG_DIR: process.env.NEURON_TUI_CONFIG_DIR,
+  NEURON_HOME: process.env.NEURON_HOME,
 
   TZ: process.env.TZ,
   HTTPS_PROXY: process.env.HTTPS_PROXY,

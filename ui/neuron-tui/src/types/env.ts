@@ -91,6 +91,8 @@ export type CliEnv = BaseEnv & {
   NEURON_TUI_NO_TERMINAL_WATCHDOG?: string
   /** Absolute per-process override for isolated CLI settings and transcripts. */
   NEURON_TUI_CONFIG_DIR?: string
+  /** Neuron's home, shared with the engine; the UI's files go in its `tui`. */
+  NEURON_HOME?: string
 
   // Read only for presence/shape by the client environment descriptor
   // (utils/client-environment.ts); never sent raw.

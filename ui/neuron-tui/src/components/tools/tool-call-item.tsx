@@ -15,6 +15,11 @@ export interface ToolFailure {
   label: 'refused' | 'failed'
   /** The error text, without an `Error: ` prefix; `null` when there is none. */
   reason: string | null
+  /**
+   * How a failed command ended: "exit code 2", "timed out", "killed",
+   * "interrupted", "blocked: …"; `null` when the engine did not say.
+   */
+  detail: string | null
 }
 
 // The engine's own words for a call it would not run: the permission mode
@@ -27,14 +32,24 @@ const REFUSAL_PATTERN =
 export function toolFailureOf(block: {
   isError?: boolean
   output?: string
+  exitCode?: number
+  stopReason?: string
 }): ToolFailure | null {
   if (!block.isError) return null
   const reason = (block.output ?? '').trim().replace(/^Error:\s*/, '')
+  const detail =
+    block.exitCode !== undefined ? `exit code ${block.exitCode}` : (block.stopReason ?? null)
   return {
-    label: REFUSAL_PATTERN.test(reason) ? 'refused' : 'failed',
+    // A command that reports how it ended was run, whatever its output says.
+    label: detail === null && REFUSAL_PATTERN.test(reason) ? 'refused' : 'failed',
     reason: reason || null,
+    detail,
   }
 }
+
+/** The failure as its row says it: "failed", "refused", "failed (exit code 2)". */
+export const failureLabel = (failure: ToolFailure): string =>
+  failure.detail ? `${failure.label} (${failure.detail})` : failure.label
 
 /**
  * Set by the tool row around a tool's renderer, so the shared pieces
@@ -210,7 +225,7 @@ export const SimpleToolCallItem = ({
         ) : (
           description
         )}
-        {failure ? <span fg={theme.error}>{` ${failure.label}`}</span> : null}
+        {failure ? <span fg={theme.error}>{` ${failureLabel(failure)}`}</span> : null}
       </text>
     </box>
   )
@@ -296,7 +311,7 @@ export const ToolCallItem = ({
               </span>
             ) : null}
             {failure && !isStreaming ? (
-              <span fg={theme.error}>{` ${failure.label}`}</span>
+              <span fg={theme.error}>{` ${failureLabel(failure)}`}</span>
             ) : null}
             {isStreaming ? (
               <span fg={theme.primary} attributes={TextAttributes.DIM}>

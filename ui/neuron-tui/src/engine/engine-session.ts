@@ -27,6 +27,8 @@ let turnActive = false
 /** While a turn runs, its own error is shown on its message instead. */
 export function setEngineTurnActive(active: boolean): void {
   turnActive = active
+  // A new turn has neither retried nor failed yet.
+  if (active) forgetTurnRetries()
 }
 
 function showSystemMessage(text: string, id?: string): void {
@@ -57,20 +59,13 @@ export function inUiWording(message: string): string {
   )
 }
 
-// The engine's interrupt notices come from its line REPL, where a second
-// Ctrl-C quits. In the UI a Ctrl-C during a turn interrupts it, and the turn's
-// message says "[response interrupted]" at once; at the prompt one Ctrl-C arms
-// "Press Ctrl-C again to exit" in the status bar and a second exits. So:
-//   "■ Interrupting… (press Ctrl-C again to quit)" shows without the hint,
-//     only while the engine is still stopping the turn: `turn_finished`
-//     removes it;
-//   "Interrupted. Back at the prompt; press Ctrl-C again to exit." is
-//     dropped: the message already says so, and its hint is wrong here;
-//   "Interrupted. N pending tool call(s) were not run. Press Ctrl-C again to
-//     exit." keeps what was not run, without the hint.
+// The engine's interrupt notices. In the UI a Ctrl-C during a turn interrupts
+// it, and the turn's message says "[response interrupted]" at once. So:
+//   "■ Interrupting…" shows only while the engine is still stopping the turn:
+//     `turn_finished` removes it;
+//   "Interrupted." is dropped: the message already says so;
+//   "Interrupted. N pending tool call(s) were not run." shows what was not run.
 const INTERRUPTING = /^■ Interrupting/
-const CTRL_C_HINT =
-  /\s*(?:\(press Ctrl-C again to (?:quit|exit)\)|(?:Back at the prompt; )?press Ctrl-C again to (?:quit|exit)\.?)/gi
 
 export type EngineNotice =
   | { kind: 'drop' }
@@ -79,35 +74,77 @@ export type EngineNotice =
 /** How the UI shows an engine notice (see the interrupt notes above). */
 export function engineNotice(message: string): EngineNotice {
   if (SIGNED_OUT_REASON.test(message)) return { kind: 'drop' }
-  const text = inUiWording(message).replace(CTRL_C_HINT, '').trim()
+  const text = inUiWording(message).trim()
   if (!text || text === 'Interrupted.') return { kind: 'drop' }
   return { kind: 'show', text, untilTurnEnd: INTERRUPTING.test(text) }
 }
 
+// The engine's retry notices: its API client's ("Zero-X upstream_timeout;
+// retrying in 1.3s (retry 1 of 2)", api/src/retry.rs) and the retry of a
+// stalled stream ("⚠ The model did not start responding within 90s —
+// retrying once…", rusty-claude-cli/src/api_client.rs).
+const RETRY_NOTICE = /\bretrying (?:in \d|now\b|once\b)/i
+
+/** A notice that the engine is retrying the turn's request. */
+export function isRetryNotice(text: string): boolean {
+  return RETRY_NOTICE.test(text)
+}
+
+let noticeCount = 0
+
+/** Shows a notice under an id of its own, so it can be taken back. */
+function showTrackedNotice(text: string, ids: Set<string>): void {
+  noticeCount += 1
+  const id = `sys-turn-notice-${Date.now()}-${noticeCount}`
+  ids.add(id)
+  showSystemMessage(text, id)
+}
+
+function removeNotices(ids: Set<string>): void {
+  if (ids.size === 0) return
+  const stale = new Set(ids)
+  ids.clear()
+  useChatStore
+    .getState()
+    .setMessages((prev) => prev.filter((message) => !stale.has(message.id)))
+}
+
 /** Ids of notices that stop being true when the turn ends ("■ Interrupting…"). */
 const turnScopedNotices = new Set<string>()
-let turnScopedCount = 0
 
-function showTurnScopedNotice(text: string): void {
-  turnScopedCount += 1
-  const id = `sys-turn-notice-${Date.now()}-${turnScopedCount}`
-  turnScopedNotices.add(id)
-  showSystemMessage(text, id)
+/**
+ * The running turn's retry notices. The turn's message was drawn before any
+ * of them, so a turn that fails for good would show its final error above
+ * "retrying in 1.3s": once it fails they are taken back (its error says how
+ * many attempts were made), and later ones are not shown.
+ */
+const turnRetryNotices = new Set<string>()
+let turnFailed = false
+
+function forgetTurnRetries(): void {
+  turnRetryNotices.clear()
+  turnFailed = false
 }
 
 function showNotice(notice: EngineNotice): void {
   if (notice.kind === 'drop') return
-  if (notice.untilTurnEnd) showTurnScopedNotice(notice.text)
-  else showSystemMessage(notice.text)
+  if (notice.untilTurnEnd) {
+    showTrackedNotice(notice.text, turnScopedNotices)
+  } else if (turnActive && isRetryNotice(notice.text)) {
+    if (!turnFailed) showTrackedNotice(notice.text, turnRetryNotices)
+  } else {
+    showSystemMessage(notice.text)
+  }
 }
 
 function dropTurnScopedNotices(): void {
-  if (turnScopedNotices.size === 0) return
-  const stale = new Set(turnScopedNotices)
-  turnScopedNotices.clear()
-  useChatStore
-    .getState()
-    .setMessages((prev) => prev.filter((message) => !stale.has(message.id)))
+  removeNotices(turnScopedNotices)
+}
+
+/** The running turn failed for good: its retries are over. */
+function markTurnFailed(): void {
+  turnFailed = true
+  removeNotices(turnRetryNotices)
 }
 
 export function handleEngineEvent(event: UiEvent): void {
@@ -148,17 +185,21 @@ export function handleEngineEvent(event: UiEvent): void {
       showNotice(engineNotice(event.message))
       return
     case 'error':
-      if (!turnActive && engine.connection === 'ready') {
+      if (turnActive) {
+        markTurnFailed()
+      } else if (engine.connection === 'ready') {
         showSystemMessage(`Error: ${inUiWording(event.message)}`)
       }
       return
     case 'turn_finished':
       // Nothing waits for an answer once the turn is over (a `/login` ends
       // with one too, signed in or not), and "Interrupting…" is over too.
+      // A turn that ended well keeps its retry notices.
       engine.clearPermissions()
       engine.setPendingQuestion(null)
       engine.setSignIn(null)
       dropTurnScopedNotices()
+      forgetTurnRetries()
       return
     default:
       return
@@ -207,8 +248,9 @@ async function launchEngineSession(launch: EngineLaunchOptions): Promise<void> {
   client.subscribe(handleEngineEvent)
   client.onExit((exit) => {
     if (getNeuronEngineClient() !== client) return
-    // No turn runs in an engine that stopped.
+    // No turn runs in an engine that stopped; one that was running failed.
     dropTurnScopedNotices()
+    if (turnActive) markTurnFailed()
     const wasReady = useEngineStore.getState().connection === 'ready'
     const reason =
       client.lastError ?? `The Neuron engine stopped (exit code ${exit.code}).`

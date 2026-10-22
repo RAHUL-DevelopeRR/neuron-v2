@@ -137,6 +137,45 @@ const json = (value: Record<string, unknown>): ToolResultOutput[] => [
   { type: 'json', value } as ToolResultOutput,
 ]
 
+/** How a command ended when it did not succeed, for its row's "✗ failed (…)". */
+export interface CommandExit {
+  /** The exit code of a command that ran to the end. */
+  exitCode?: number
+  /** Why it stopped otherwise: "timed out", "killed", "interrupted", "blocked: …". */
+  stopReason?: string
+}
+
+/**
+ * The engine's `returnCodeInterpretation` (set only for a command that did not
+ * succeed: `exit_code:<n>`, `timeout`, `cancelled`, `killed`, `signal:<n>`,
+ * `preflight_blocked:<why>`) and `interrupted` flag, in words.
+ */
+export function commandExitOf(result: Record<string, unknown>): CommandExit {
+  const interpretation = str(result.returnCodeInterpretation)?.trim()
+  if (interpretation) {
+    const code = /^exit_code:(-?\d+)$/.exec(interpretation)
+    if (code) return { exitCode: Number(code[1]) }
+    if (interpretation === 'timeout') return { stopReason: 'timed out' }
+    if (interpretation === 'cancelled') return { stopReason: 'interrupted' }
+    if (interpretation === 'killed') return { stopReason: 'killed' }
+    const signal = /^signal:(\d+)$/.exec(interpretation)
+    if (signal) return { stopReason: `killed (signal ${signal[1]})` }
+    const blocked = /^preflight_blocked(?::(.*))?$/.exec(interpretation)
+    if (blocked) {
+      const why = blocked[1]?.replace(/_/g, ' ').trim()
+      return { stopReason: why ? `blocked: ${why}` : 'blocked' }
+    }
+    return { stopReason: interpretation.replace(/_/g, ' ') }
+  }
+  // A plain exit code field, from a result shaped otherwise.
+  for (const key of ['exitCode', 'exit_code']) {
+    const value = result[key]
+    if (typeof value === 'number' && value !== 0) return { exitCode: value }
+  }
+  if (result.interrupted === true) return { stopReason: 'interrupted' }
+  return {}
+}
+
 export function mapToolResult(
   name: string,
   output: string,
@@ -144,12 +183,14 @@ export function mapToolResult(
 ): ToolResultOutput[] {
   if (TERMINAL_TOOLS.has(name)) {
     // A command that ran and failed (non-zero exit, timeout) still has its
-    // output to show; the block's error flag marks it failed.
+    // output to show; the block's error flag marks it failed, and its exit
+    // code or why it stopped says how.
     const parsed = parseObject(output)
     if (parsed && (typeof parsed.stdout === 'string' || typeof parsed.stderr === 'string')) {
       return json({
         stdout: str(parsed.stdout) ?? '',
         stderr: str(parsed.stderr) ?? '',
+        ...commandExitOf(parsed),
       })
     }
     if (isError) return json({ errorMessage: output })
