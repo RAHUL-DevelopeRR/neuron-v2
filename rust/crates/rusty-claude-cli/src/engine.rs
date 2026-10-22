@@ -909,7 +909,8 @@ impl Engine {
         if let Some(event) = &summary.auto_compaction {
             self.notice(&format_auto_compaction_notice(event.removed_message_count));
         }
-        if let Some(notice) = repl_loop::describe_turn_outcome(summary) {
+        if let Some(notice) = repl_loop::describe_turn_outcome(summary, repl_loop::QuitHint::Hidden)
+        {
             self.notice(&notice);
         }
         self.send(UiEvent::Usage {
@@ -1077,11 +1078,12 @@ impl Engine {
         }
     }
 
-    /// The gateway catalog's models, available ones first; none on other providers.
+    /// The gateway catalog's models, available ones first, with their status as of now
+    /// (asked for again at most every 30 s); none on other providers.
     fn list_models(&mut self) {
         let models = gateway_repl::session_catalog()
             .map(|catalog| {
-                catalog
+                crate::gateway_catalog::with_session_status(&catalog)
                     .sorted()
                     .into_iter()
                     .map(|model| ModelInfo {
@@ -1733,15 +1735,20 @@ mod tests {
         let turn = turn_events(&engine.events);
         let turn_notices = notices(&turn);
         assert!(
-            turn_notices
-                .iter()
-                .any(|notice| notice.starts_with("\u{25a0} Interrupting")),
+            turn_notices.contains(&"\u{25a0} Interrupting\u{2026}"),
             "{turn:?}"
         );
         assert!(
             turn_notices
                 .iter()
                 .any(|notice| notice.starts_with("Interrupted.")),
+            "{turn:?}"
+        );
+        // The UI shows its own key hints; the line REPL's would be wrong there.
+        assert!(
+            turn_notices
+                .iter()
+                .all(|notice| !notice.contains("Ctrl-C again")),
             "{turn:?}"
         );
         assert!(
@@ -1918,10 +1925,8 @@ mod tests {
     #[test]
     fn notices_and_questions_read_as_plain_text() {
         assert_eq!(
-            plain_notice(
-                "\n\x1b[33m\u{25a0}\x1b[0m Interrupting\u{2026} \x1b[2m(press Ctrl-C again to quit)\x1b[0m"
-            ),
-            Some("\u{25a0} Interrupting\u{2026} (press Ctrl-C again to quit)".to_string())
+            plain_notice("\n\x1b[33m\u{25a0}\x1b[0m Interrupting\u{2026}"),
+            Some("\u{25a0} Interrupting\u{2026}".to_string())
         );
         assert_eq!(plain_notice("\n\x1b[0m \n"), None);
         assert_eq!(

@@ -746,19 +746,18 @@ impl Display for GatewayError {
     }
 }
 
-/// A wait as people read it: `45s`, `12m`, `14h 45m`.
+/// A wait as people read it: `45s`, `12m`, `14h 45m`. Minutes round up, so someone who
+/// waits as long as it says is never turned away again.
 #[must_use]
 pub fn describe_wait(seconds: u64) -> String {
-    match seconds {
-        0..=89 => format!("{seconds}s"),
-        90..=3599 => format!("{}m", (seconds + 30) / 60),
-        _ => {
-            let minutes = (seconds + 30) / 60;
-            match minutes % 60 {
-                0 => format!("{}h", minutes / 60),
-                rest => format!("{}h {rest}m", minutes / 60),
-            }
-        }
+    if seconds < 90 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds.div_ceil(60);
+    match (minutes / 60, minutes % 60) {
+        (0, minutes) => format!("{minutes}m"),
+        (hours, 0) => format!("{hours}h"),
+        (hours, minutes) => format!("{hours}h {minutes}m"),
     }
 }
 
@@ -1120,5 +1119,15 @@ mod tests {
         assert_eq!(super::describe_wait(120), "2m");
         assert_eq!(super::describe_wait(3_600), "1h");
         assert_eq!(super::describe_wait(53_094), "14h 45m");
+    }
+
+    #[test]
+    fn retry_waits_round_up_so_waiting_that_long_is_enough() {
+        assert_eq!(super::describe_wait(90), "2m");
+        assert_eq!(super::describe_wait(487), "9m");
+        assert_eq!(super::describe_wait(3_541), "1h");
+        assert_eq!(super::describe_wait(3_599), "1h");
+        assert_eq!(super::describe_wait(3_601), "1h 1m");
+        assert_eq!(super::describe_wait(53_041), "14h 45m");
     }
 }

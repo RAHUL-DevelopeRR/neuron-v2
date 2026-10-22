@@ -1,6 +1,6 @@
 //! Where a turn's visible output goes. The agent loop calls a [`TurnSink`] instead of
-//! printing, so the same turn can render to the line terminal ([`AnsiSink`], byte for
-//! byte what Neuron always printed), to nowhere (one-shot JSON output, sub-agents), or to
+//! printing, so the same turn can render to the line terminal or a file ([`AnsiSink`]),
+//! to nowhere (one-shot JSON output, sub-agents), or to
 //! the full-screen UI as structured [`UiEvent`]s ([`ChannelSink`]) that it draws itself.
 
 // A turn's output goes through a TurnSink or runtime::ui_hooks, so a full-screen UI can own
@@ -100,7 +100,7 @@ impl TurnOutput {
             Self::Ansi if !io::stdout().is_terminal() => {
                 Box::new(AnsiSink::new(StripAnsi::new(io::stdout())))
             }
-            Self::Ansi => Box::new(AnsiSink::new(SyncRenderBuffer::new())),
+            Self::Ansi => Box::new(AnsiSink::new(SyncRenderBuffer::new()).clearing_spinner()),
             Self::Channel(events) => Box::new(ChannelSink::new(Sender::clone(events))),
         }
     }
@@ -176,11 +176,38 @@ impl<W: Write> Write for StripAnsi<W> {
     }
 }
 
-/// Renders Markdown to ANSI on `out`, exactly as the line REPL prints a turn.
+/// Renders Markdown to ANSI on `out`, as the line REPL prints a turn. Everything it
+/// prints ends its line, so the turn's end marker (`✔ Done`) gets a line of its own.
 pub(crate) struct AnsiSink<W: Write> {
     out: W,
     renderer: TerminalRenderer,
     markdown: MarkdownStreamState,
+    /// The reasoning block being received; its summary is printed when it ends.
+    reasoning: Option<HiddenReasoning>,
+    /// The spinner's label may still be on the current line: the first write clears it.
+    clear_spinner: bool,
+}
+
+/// A reasoning block the terminal keeps hidden, counted as it arrives.
+struct HiddenReasoning {
+    /// The size `reasoning_started` gave (a complete block), else 0.
+    announced: usize,
+    /// Characters received so far.
+    received: usize,
+    redacted: bool,
+}
+
+impl HiddenReasoning {
+    fn summary(&self) -> String {
+        let chars = self.announced.max(self.received);
+        if self.redacted {
+            "\n\u{25b6} Thinking block hidden by provider\n".to_string()
+        } else if chars > 0 {
+            format!("\n\u{25b6} Thinking ({chars} chars hidden)\n")
+        } else {
+            "\n\u{25b6} Thinking hidden\n".to_string()
+        }
+    }
 }
 
 impl<W: Write> AnsiSink<W> {
@@ -189,17 +216,59 @@ impl<W: Write> AnsiSink<W> {
             out,
             renderer: TerminalRenderer::new(),
             markdown: MarkdownStreamState::default(),
+            reasoning: None,
+            clear_spinner: false,
         }
     }
 
+    /// For the terminal, where the turn's spinner was drawn on the line the output starts on.
+    #[must_use]
+    fn clearing_spinner(mut self) -> Self {
+        self.clear_spinner = true;
+        self
+    }
+
     fn write_flushed(&mut self, text: &str) -> io::Result<()> {
+        if std::mem::take(&mut self.clear_spinner) {
+            write!(self.out, "\r\x1b[2K")?;
+        }
         write!(self.out, "{text}")?;
         self.out.flush()
+    }
+
+    /// Prints the summary of a reasoning block that ended.
+    fn finish_reasoning(&mut self) -> io::Result<()> {
+        match self.reasoning.take() {
+            Some(reasoning) => self.write_flushed(&reasoning.summary()),
+            None => Ok(()),
+        }
+    }
+
+    /// Prints what is still buffered of the text block.
+    fn finish_text(&mut self) -> io::Result<()> {
+        match self.markdown.flush(&self.renderer) {
+            Some(rendered) => self.write_flushed(&rendered),
+            None => Ok(()),
+        }
+    }
+
+    fn finish_blocks(&mut self) -> io::Result<()> {
+        self.finish_text()?;
+        self.finish_reasoning()
+    }
+}
+
+/// A response cut short (an interrupt, a failed stream) still prints what it buffered and
+/// ends its line.
+impl<W: Write> Drop for AnsiSink<W> {
+    fn drop(&mut self) {
+        let _ = self.finish_blocks();
     }
 }
 
 impl<W: Write + Send> TurnSink for AnsiSink<W> {
     fn text_delta(&mut self, text: &str) -> io::Result<()> {
+        self.finish_reasoning()?;
         match self.markdown.push(&self.renderer, text) {
             Some(rendered) => self.write_flushed(&rendered),
             None => Ok(()),
@@ -207,45 +276,55 @@ impl<W: Write + Send> TurnSink for AnsiSink<W> {
     }
 
     fn text_block(&mut self, text: &str) -> io::Result<()> {
-        let rendered = self.renderer.markdown_to_ansi(text);
-        self.write_flushed(&rendered)
-    }
-
-    fn end_block(&mut self) -> io::Result<()> {
-        match self.markdown.flush(&self.renderer) {
+        self.finish_reasoning()?;
+        match self.markdown.render_block(&self.renderer, text) {
             Some(rendered) => self.write_flushed(&rendered),
             None => Ok(()),
         }
     }
 
-    fn reasoning_started(&mut self, chars: Option<usize>, redacted: bool) -> io::Result<()> {
-        let summary = if redacted {
-            "\n\u{25b6} Thinking block hidden by provider\n".to_string()
-        } else if let Some(chars) = chars {
-            format!("\n\u{25b6} Thinking ({chars} chars hidden)\n")
-        } else {
-            "\n\u{25b6} Thinking hidden\n".to_string()
-        };
-        self.write_flushed(&summary)
+    fn end_block(&mut self) -> io::Result<()> {
+        self.finish_blocks()
     }
 
-    fn reasoning_delta(&mut self, _text: &str) -> io::Result<()> {
+    fn reasoning_started(&mut self, chars: Option<usize>, redacted: bool) -> io::Result<()> {
+        self.finish_blocks()?;
+        self.reasoning = Some(HiddenReasoning {
+            announced: chars.unwrap_or(0),
+            received: 0,
+            redacted,
+        });
+        Ok(())
+    }
+
+    fn reasoning_delta(&mut self, text: &str) -> io::Result<()> {
+        let reasoning = self.reasoning.get_or_insert(HiddenReasoning {
+            announced: 0,
+            received: 0,
+            redacted: false,
+        });
+        reasoning.received += text.chars().count();
         Ok(())
     }
 
     fn tool_call(&mut self, _id: &str, name: &str, input: &str, cut_off: bool) -> io::Result<()> {
+        self.finish_blocks()?;
         let line = if cut_off {
             crate::api_client::format_cut_off_tool_call(name, input)
         } else {
             format_tool_call_start(name, input)
         };
-        writeln!(self.out, "\n{line}")?;
-        self.out.flush()
+        self.write_flushed(&format!("\n{line}\n"))
     }
 
+    /// Tool output is shown as the tool wrote it, never read as Markdown.
     fn tool_result(&mut self, name: &str, output: &str, is_error: bool) -> io::Result<()> {
-        let markdown = format_tool_result(name, output, is_error);
-        self.renderer.stream_markdown(&markdown, &mut self.out)
+        self.finish_blocks()?;
+        let mut shown = format_tool_result(name, output, is_error);
+        if !shown.ends_with('\n') {
+            shown.push('\n');
+        }
+        self.write_flushed(&shown)
     }
 }
 
@@ -379,10 +458,10 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
-    /// The ANSI sink reproduces what the turn loop printed before sinks existed: the same
-    /// renderer, the same separators, the same thinking summaries.
+    /// The ANSI sink renders with the line REPL's renderer, and every block it prints
+    /// ends its line.
     #[test]
-    fn ansi_sink_matches_the_previous_terminal_output() {
+    fn ansi_sink_prints_each_block_on_lines_of_its_own() {
         let renderer = TerminalRenderer::new();
         let mut expected = String::new();
         let mut markdown = MarkdownStreamState::default();
@@ -400,6 +479,7 @@ mod tests {
             format_tool_call_start("read_file", r#"{"path":"src/main.rs"}"#)
         ));
         expected.push_str(&renderer.markdown_to_ansi("Done."));
+        expected.push('\n');
 
         let mut out = Vec::new();
         {
@@ -414,7 +494,129 @@ mod tests {
                 .unwrap();
             sink.text_block("Done.").unwrap();
         }
-        assert_eq!(String::from_utf8(out).unwrap(), expected);
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(output, expected);
+        assert!(
+            crate::render::strip_ansi(&output).starts_with(
+                "Hello world\n\n\u{2022} item\n\n\u{25b6} Thinking (42 chars hidden)\n"
+            ),
+            "{output}"
+        );
+    }
+
+    /// What `neuron prompt ...` writes to a file or a pipe.
+    fn plain_output(write: impl FnOnce(&mut dyn TurnSink)) -> String {
+        let mut out = StripAnsi::new(Vec::new());
+        {
+            let mut sink = AnsiSink::new(&mut out);
+            write(&mut sink);
+        }
+        String::from_utf8(out.inner).unwrap()
+    }
+
+    #[test]
+    fn text_output_keeps_line_breaks_paragraphs_and_path_backslashes() {
+        let answer = "**Location:**\nC:\\Users\\x\\.neuron\\a.txt\n\nFirst paragraph: this file holds a note.\nIt continues on a second line.\n\nSecond paragraph: backslashes separate folders on Windows.";
+        let shown = "Location:\nC:\\Users\\x\\.neuron\\a.txt\n\nFirst paragraph: this file holds a note.\nIt continues on a second line.\n\nSecond paragraph: backslashes separate folders on Windows.\n";
+        // However the stream splits the answer.
+        let chunkings: [Vec<String>; 3] = [
+            vec![answer.to_string()],
+            answer.split_inclusive('\n').map(str::to_string).collect(),
+            answer.chars().map(String::from).collect(),
+        ];
+        for chunks in chunkings {
+            let printed = plain_output(|sink| {
+                for chunk in &chunks {
+                    sink.text_delta(chunk).unwrap();
+                }
+                sink.end_block().unwrap();
+            });
+            assert_eq!(printed, shown, "{} chunks", chunks.len());
+        }
+        assert_eq!(plain_output(|sink| sink.text_block(answer).unwrap()), shown);
+    }
+
+    #[test]
+    fn the_end_marker_starts_a_line_of_its_own() {
+        let theme = crate::render::ColorTheme::default();
+        let mut out = StripAnsi::new(Vec::new());
+        {
+            let mut sink = AnsiSink::new(&mut out);
+            sink.text_delta("ok").unwrap();
+            sink.end_block().unwrap();
+        }
+        crate::render::Spinner::plain()
+            .finish("Done", &theme, &mut out)
+            .unwrap();
+        assert_eq!(String::from_utf8(out.inner).unwrap(), "ok\n\u{2714} Done\n");
+
+        // Cut short: what was buffered still prints, and its line ends.
+        assert_eq!(
+            plain_output(|sink| sink.text_delta("partial ans").unwrap()),
+            "partial ans\n"
+        );
+
+        // On a terminal the spinner's label is cleared before the answer replaces it,
+        // and the answer's line ends before the marker's "go to column 0 and clear".
+        let mut out = Vec::new();
+        {
+            let mut sink = AnsiSink::new(&mut out).clearing_spinner();
+            sink.text_delta("ok").unwrap();
+            sink.end_block().unwrap();
+            sink.text_delta("more").unwrap();
+        }
+        let printed = String::from_utf8(out).unwrap();
+        assert!(printed.starts_with("\r\x1b[2K"), "{printed:?}");
+        assert_eq!(printed.matches("\r\x1b[2K").count(), 1, "{printed:?}");
+        assert!(printed.ends_with('\n'), "{printed:?}");
+    }
+
+    #[test]
+    fn tool_output_is_shown_as_written_not_as_markdown() {
+        let content = "/**\n * Adds two numbers.\n * @returns {number} the *sum*, e.g. C:\\tmp\\x.js\n */\nfunction sum(a, b) {\n  return a + b; // **not** bold\n}";
+        let read = serde_json::json!({"file": {
+            "filePath": "sum.js", "content": content,
+            "numLines": 7, "startLine": 1, "totalLines": 7
+        }})
+        .to_string();
+        let printed = plain_output(|sink| sink.tool_result("read_file", &read, false).unwrap());
+        assert!(printed.ends_with(&format!("\n{content}\n")), "{printed}");
+        assert!(!printed.contains('\u{2022}'), "no bullets: {printed}");
+
+        let bash = serde_json::json!({"stdout": format!("{content}\n"), "stderr": ""}).to_string();
+        let printed = plain_output(|sink| sink.tool_result("bash", &bash, false).unwrap());
+        assert!(printed.contains(content), "{printed}");
+
+        let sent = r#"{"attachments":null,"message":"done"}"#;
+        let printed =
+            plain_output(|sink| sink.tool_result("SendUserMessage", sent, false).unwrap());
+        assert!(
+            printed.contains("{\n  \"attachments\": null,\n  \"message\": \"done\"\n}\n"),
+            "{printed}"
+        );
+    }
+
+    #[test]
+    fn the_thinking_summary_counts_the_reasoning_received() {
+        // Streamed: the block starts empty and the text arrives in pieces.
+        let printed = plain_output(|sink| {
+            sink.reasoning_started(Some(0), false).unwrap();
+            sink.reasoning_delta("abc").unwrap();
+            sink.reasoning_delta("dé").unwrap();
+            sink.end_block().unwrap();
+            sink.text_delta("answer\n").unwrap();
+        });
+        assert_eq!(printed, "\n\u{25b6} Thinking (5 chars hidden)\nanswer\n");
+        // A complete block is not counted twice.
+        let printed = plain_output(|sink| {
+            sink.reasoning_started(Some(4), false).unwrap();
+            sink.reasoning_delta("abcd").unwrap();
+        });
+        assert_eq!(printed, "\n\u{25b6} Thinking (4 chars hidden)\n");
+        let printed = plain_output(|sink| sink.reasoning_started(None, false).unwrap());
+        assert_eq!(printed, "\n\u{25b6} Thinking hidden\n");
+        let printed = plain_output(|sink| sink.reasoning_started(None, true).unwrap());
+        assert_eq!(printed, "\n\u{25b6} Thinking block hidden by provider\n");
     }
 
     #[test]

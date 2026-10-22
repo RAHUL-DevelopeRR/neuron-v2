@@ -201,20 +201,34 @@ impl CliToolExecutor {
     pub fn execute_search_tool(&self, value: serde_json::Value) -> Result<String, ToolError> {
         let input: ToolSearchRequest = serde_json::from_value(value)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        let (pending_mcp_servers, mcp_degraded) =
-            self.mcp_state.as_ref().map_or((None, None), |state| {
-                let state = state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                (state.pending_servers(), state.degraded_report())
-            });
-        serde_json::to_string_pretty(&self.tool_registry.search(
+        let (pending_mcp_servers, mcp_degraded, mcp_starting) =
+            self.mcp_state
+                .as_ref()
+                .map_or((None, None, false), |state| {
+                    let state = state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    (
+                        state.pending_servers(),
+                        state.degraded_report(),
+                        state.is_starting(),
+                    )
+                });
+        let output = self.tool_registry.search(
             &input.query,
             input.max_results.unwrap_or(5),
             pending_mcp_servers,
             mcp_degraded,
-        ))
-        .map_err(|error| ToolError::new(error.to_string()))
+        );
+        let mut output =
+            serde_json::to_value(output).map_err(|error| ToolError::new(error.to_string()))?;
+        if mcp_starting {
+            // Like the MCP tools say: no match yet is not "no such tool".
+            output["note"] = json!(
+                "The MCP servers in pending_mcp_servers are still starting, so their tools are not searchable yet; search again in a moment."
+            );
+        }
+        serde_json::to_string_pretty(&output).map_err(|error| ToolError::new(error.to_string()))
     }
 
     pub fn execute_runtime_tool(
@@ -369,6 +383,31 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
         "      Connect your Zero-X account to the coding gateway"
+    )?;
+    writeln!(out, "  neuron login [--no-browser | --with-token]")?;
+    writeln!(
+        out,
+        "      Sign in to Zero-X (short for `neuron auth login`; --with-token reads a token from stdin)"
+    )?;
+    writeln!(out, "  neuron logout")?;
+    writeln!(
+        out,
+        "      Sign out of Zero-X (short for `neuron auth logout`)"
+    )?;
+    writeln!(out, "  neuron usage")?;
+    writeln!(
+        out,
+        "      Show your Zero-X plan, today's usage and credits"
+    )?;
+    writeln!(out, "  neuron upgrade [--no-browser]")?;
+    writeln!(out, "      Open the Zero-X plans page")?;
+    writeln!(
+        out,
+        "      (These account commands take --output-format text|json. To send a prompt that"
+    )?;
+    writeln!(
+        out,
+        "      starts with one of their names, quote it or use `neuron prompt \"...\"`.)"
     )?;
     writeln!(
         out,

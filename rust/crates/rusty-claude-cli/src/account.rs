@@ -210,35 +210,44 @@ pub fn render_usage(account: &AccountSummary, now: u64) -> String {
     lines.join("\n")
 }
 
-/// Fetches and renders the usage report for the active Zero-X credential.
-pub fn usage_report() -> Result<String, Box<dyn std::error::Error>> {
+/// Fetches the account of the active Zero-X credential.
+fn current_account() -> Result<AccountSummary, Box<dyn std::error::Error>> {
     let base = crate::auth::gateway_base_url()?;
     let credential = crate::auth::current_credential()?.ok_or(
         "Not signed in to Zero-X. Run `neuron auth login` (or set NEURON_TOKEN) to see usage.",
     )?;
-    match fetch_account(&base, &credential.token) {
-        Ok(account) => Ok(render_usage(&account, crate::clock::now_unix())),
-        Err(error) => Err(error.into()),
-    }
+    Ok(fetch_account(&base, &credential.token)?)
 }
 
-/// `neuron usage`.
-pub fn run_usage_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+/// Fetches and renders the usage report for the active Zero-X credential.
+pub fn usage_report() -> Result<String, Box<dyn std::error::Error>> {
+    Ok(render_usage(&current_account()?, crate::clock::now_unix()))
+}
+
+/// `neuron usage`; with `json`, the account as JSON.
+pub fn run_usage_command(args: &[String], json: bool) -> Result<(), Box<dyn std::error::Error>> {
     if !args.is_empty() {
         return Err("Usage: neuron usage".into());
+    }
+    if json {
+        return crate::auth::print_json(&usage_json(&current_account()?)?);
     }
     println!("{}", usage_report()?);
     Ok(())
 }
 
+fn usage_json(account: &AccountSummary) -> Result<Value, serde_json::Error> {
+    Ok(serde_json::json!({
+        "type": "usage",
+        "account": serde_json::to_value(account)?,
+        "upgrade_url": pricing_url(),
+    }))
+}
+
 /// `/upgrade` and `neuron upgrade [--no-browser]`: prints the pricing URL
 /// and opens it when running in an interactive terminal.
 pub fn upgrade(open_browser: bool) -> String {
-    // Model availability changes with the plan: refetch the catalog.
-    crate::gateway_catalog::invalidate_cache();
-    let url = pricing_url();
-    let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
-    let opened = open_browser && interactive && webbrowser::open(&url).is_ok();
+    let (url, opened) = open_pricing_page(open_browser);
     if opened {
         format!("Opening Zero-X plans: {url}")
     } else {
@@ -246,12 +255,31 @@ pub fn upgrade(open_browser: bool) -> String {
     }
 }
 
-pub fn run_upgrade_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+/// The pricing URL, and whether it opened in a browser.
+fn open_pricing_page(open_browser: bool) -> (String, bool) {
+    // Model availability changes with the plan: refetch the catalog.
+    crate::gateway_catalog::invalidate_cache();
+    let url = pricing_url();
+    let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+    let opened = open_browser && interactive && webbrowser::open(&url).is_ok();
+    (url, opened)
+}
+
+/// `neuron upgrade`; with `json`, `{"type":"upgrade","url":…,"opened":…}`.
+pub fn run_upgrade_command(args: &[String], json: bool) -> Result<(), Box<dyn std::error::Error>> {
     let open_browser = match args {
         [] => true,
         [flag] if flag == "--no-browser" => false,
         _ => return Err("Usage: neuron upgrade [--no-browser]".into()),
     };
+    if json {
+        let (url, opened) = open_pricing_page(open_browser);
+        return crate::auth::print_json(&serde_json::json!({
+            "type": "upgrade",
+            "url": url,
+            "opened": opened,
+        }));
+    }
     println!("{}", upgrade(open_browser));
     Ok(())
 }
@@ -307,6 +335,17 @@ mod tests {
         let mut busy = sample();
         busy["usage_today"]["requests"] = serde_json::json!(1950);
         assert!(render_usage(&parse_account(&busy), 0).contains("Upgrade"));
+    }
+
+    #[test]
+    fn usage_json_carries_the_account_summary() {
+        let report = usage_json(&parse_account(&sample())).expect("serializes");
+        assert_eq!(report["type"], "usage");
+        assert_eq!(report["account"]["plan_id"], "pro");
+        assert_eq!(report["account"]["requests_today"], 37);
+        assert_eq!(report["account"]["daily_tokens_limit"], 10_000_000);
+        assert_eq!(report["account"]["credit_balance_usd"], 7.42);
+        assert!(report["upgrade_url"].is_string());
     }
 
     #[test]

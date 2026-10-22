@@ -262,7 +262,7 @@ pub(crate) fn status_json_value(
 ) -> serde_json::Value {
     json!({
         "kind": "status",
-        "model": model,
+        "model": model.map(crate::provider::shown_model),
         "permission_mode": permission_mode,
         "usage": {
             "messages": usage.message_count,
@@ -341,6 +341,7 @@ pub(crate) fn format_status_report(
     permission_mode: &str,
     context: &StatusContext,
 ) -> String {
+    let model = crate::provider::shown_model(model);
     [
         format!(
             "Status
@@ -770,4 +771,46 @@ pub(crate) fn render_memory_json() -> Result<serde_json::Value, Box<dyn std::err
 pub(crate) fn init_claude_md() -> Result<String, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     Ok(initialize_repo(&cwd)?.render())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `openai/` routing prefix picks a client; it is not part of the model's name, in
+    /// the text report or the JSON one (a resumed session's stored model included).
+    #[test]
+    fn status_shows_the_model_without_its_routing_prefix() {
+        let usage = StatusUsage {
+            message_count: 0,
+            turns: 0,
+            latest: TokenUsage::default(),
+            cumulative: TokenUsage::default(),
+            estimated_tokens: 0,
+        };
+        let context = StatusContext {
+            cwd: PathBuf::from("/tmp/project"),
+            session_path: None,
+            loaded_config_files: 0,
+            discovered_config_files: 0,
+            memory_file_count: 0,
+            project_root: None,
+            git_branch: None,
+            git_summary: GitWorkspaceSummary::default(),
+            sandbox_status: runtime::SandboxStatus::default(),
+        };
+        let text = format_status_report(
+            "openai/nvidia/nvidia/nemotron-3-ultra-550b-a55b",
+            usage,
+            "workspace-write",
+            &context,
+        );
+        assert!(
+            text.contains("  Model            nvidia/nvidia/nemotron-3-ultra-550b-a55b\n"),
+            "{text}"
+        );
+        let json = status_json_value(Some("openai/auto"), usage, "workspace-write", &context);
+        assert_eq!(json["model"], "auto");
+        assert!(status_json_value(None, usage, "workspace-write", &context)["model"].is_null());
+    }
 }

@@ -6286,7 +6286,8 @@ fn resolve_attachment(path: &str) -> Result<ResolvedAttachment, String> {
     let resolved = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
     let metadata = std::fs::metadata(&resolved).map_err(|error| error.to_string())?;
     Ok(ResolvedAttachment {
-        path: resolved.display().to_string(),
+        // Without the `\\?\` prefix canonicalize adds on Windows.
+        path: runtime::display_path(&resolved),
         size: metadata.len(),
         is_image: is_image_path(&resolved),
     })

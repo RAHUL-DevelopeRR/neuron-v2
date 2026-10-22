@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt::Write as FmtWrite;
 use std::io::{self, Write};
 
@@ -5,7 +6,7 @@ use crossterm::cursor::{MoveToColumn, RestorePosition, SavePosition};
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor, Stylize};
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{execute, queue};
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, LinkType, Options, Parser, Tag, TagEnd};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
@@ -270,19 +271,19 @@ impl TerminalRenderer {
         &self.color_theme
     }
 
+    /// `markdown` as ANSI text, without trailing whitespace: a caller that prints it
+    /// ends the line itself (see [`MarkdownStreamState`]).
     #[must_use]
     pub fn render_markdown(&self, markdown: &str) -> String {
         let normalized = normalize_nested_fences(markdown);
+        let normalized = keep_path_backslashes(&normalized);
         let mut output = String::new();
         let mut state = RenderState::default();
         let mut code_language = String::new();
         let mut code_buffer = String::new();
         let mut in_code_block = false;
 
-        // No smart punctuation: tool output and file contents are rendered
-        // as Markdown too, and `[...values]` must not turn into `[…values]`.
-        let options = Options::all().difference(Options::ENABLE_SMART_PUNCTUATION);
-        for event in Parser::new_ext(&normalized, options) {
+        for event in Parser::new_ext(&normalized, markdown_options()) {
             self.render_event(
                 event,
                 &mut state,
@@ -612,20 +613,24 @@ impl TerminalRenderer {
 
         colored_output
     }
-
-    pub fn stream_markdown(&self, markdown: &str, out: &mut impl Write) -> io::Result<()> {
-        let rendered_markdown = self.markdown_to_ansi(markdown);
-        write!(out, "{rendered_markdown}")?;
-        if !rendered_markdown.ends_with('\n') {
-            writeln!(out)?;
-        }
-        out.flush()
-    }
 }
 
+/// No smart punctuation: `[...values]` must not turn into `[…values]`.
+fn markdown_options() -> Options {
+    Options::all().difference(Options::ENABLE_SMART_PUNCTUATION)
+}
+
+/// Renders a streamed text block as complete lines arrive. Each chunk is a Markdown
+/// document of its own whose rendering drops the line breaks around it, so they are put
+/// back here: every printed chunk ends its line, and a blank line in the source stays one.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MarkdownStreamState {
     pending: String,
+    /// Part of the current block was printed.
+    started: bool,
+    /// The source has a blank line after what was printed. It goes out before the next
+    /// chunk, so a block never ends on an empty line.
+    blank_line_owed: bool,
 }
 
 impl MarkdownStreamState {
@@ -633,21 +638,151 @@ impl MarkdownStreamState {
     pub fn push(&mut self, renderer: &TerminalRenderer, delta: &str) -> Option<String> {
         self.pending.push_str(delta);
         let split = find_stream_safe_boundary(&self.pending)?;
-        let ready = self.pending[..split].to_string();
-        self.pending.drain(..split);
-        Some(renderer.markdown_to_ansi(&ready))
+        let ready = self.pending.drain(..split).collect::<String>();
+        self.render_chunk(renderer, &ready)
     }
 
+    /// Ends the block: renders what is still buffered. Whatever this block printed ends
+    /// with a line break.
     #[must_use]
     pub fn flush(&mut self, renderer: &TerminalRenderer) -> Option<String> {
-        if self.pending.trim().is_empty() {
-            self.pending.clear();
-            None
-        } else {
-            let pending = std::mem::take(&mut self.pending);
-            Some(renderer.markdown_to_ansi(&pending))
-        }
+        let pending = std::mem::take(&mut self.pending);
+        let rendered = self.render_chunk(renderer, &pending);
+        self.started = false;
+        self.blank_line_owed = false;
+        rendered
     }
+
+    /// A complete block: what is still buffered and `markdown`, as one document.
+    #[must_use]
+    pub fn render_block(&mut self, renderer: &TerminalRenderer, markdown: &str) -> Option<String> {
+        self.pending.push_str(markdown);
+        self.flush(renderer)
+    }
+
+    fn render_chunk(&mut self, renderer: &TerminalRenderer, source: &str) -> Option<String> {
+        let rendered = renderer.markdown_to_ansi(source);
+        let body = rendered.trim_start_matches('\n');
+        if body.is_empty() {
+            // Blank lines: a paragraph break, once more of the block follows.
+            self.blank_line_owed |= self.started && ends_with_blank_line(source);
+            return None;
+        }
+        let mut chunk = String::with_capacity(body.len() + 2);
+        if self.started && (self.blank_line_owed || starts_with_blank_line(source)) {
+            chunk.push('\n');
+        }
+        chunk.push_str(body);
+        chunk.push('\n');
+        self.started = true;
+        self.blank_line_owed = ends_with_blank_line(source);
+        Some(chunk)
+    }
+}
+
+/// The first line of `source` is complete and blank.
+fn starts_with_blank_line(source: &str) -> bool {
+    source
+        .split_inclusive('\n')
+        .next()
+        .is_some_and(|line| line.ends_with('\n') && line.trim().is_empty())
+}
+
+/// The last line of `source` is complete and blank.
+fn ends_with_blank_line(source: &str) -> bool {
+    source
+        .strip_suffix('\n')
+        .is_some_and(|text| text.rsplit('\n').next().unwrap_or(text).trim().is_empty())
+}
+
+/// `CommonMark` reads the `\.` in `C:\Users\x\.neuron` as an escaped `.` and drops the
+/// backslash. In words that look like paths, every backslash is doubled first so the
+/// path prints as written; elsewhere `\*`, `1\.` and the other escapes still work. Code,
+/// HTML, math and autolinks are left alone: their backslashes are literal already.
+fn keep_path_backslashes(markdown: &str) -> Cow<'_, str> {
+    if !markdown.contains('\\') {
+        return Cow::Borrowed(markdown);
+    }
+    let mut literal = Parser::new_ext(markdown, markdown_options())
+        .into_offset_iter()
+        .filter_map(|(event, range)| match event {
+            Event::Code(_)
+            | Event::Html(_)
+            | Event::InlineHtml(_)
+            | Event::InlineMath(_)
+            | Event::DisplayMath(_)
+            | Event::Start(
+                Tag::CodeBlock(_)
+                | Tag::Link {
+                    link_type: LinkType::Autolink | LinkType::Email,
+                    ..
+                },
+            ) => Some(range),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    literal.sort_by_key(|range| range.start);
+
+    let mut kept = String::with_capacity(markdown.len() + 8);
+    let mut cursor = 0;
+    for range in literal {
+        let start = range.start.max(cursor);
+        let end = range.end.max(start);
+        if start == end {
+            continue;
+        }
+        double_path_backslashes(&markdown[cursor..start], &mut kept);
+        kept.push_str(&markdown[start..end]);
+        cursor = end;
+    }
+    double_path_backslashes(&markdown[cursor..], &mut kept);
+    if kept == markdown {
+        Cow::Borrowed(markdown)
+    } else {
+        Cow::Owned(kept)
+    }
+}
+
+/// Copies `text` to `out`, doubling the backslashes of its path-like words (not one
+/// before a backtick, which would open a code span).
+fn double_path_backslashes(text: &str, out: &mut String) {
+    for piece in text.split_inclusive(char::is_whitespace) {
+        let word = piece.trim_end_matches(char::is_whitespace);
+        if !is_path_like(word) {
+            out.push_str(piece);
+            continue;
+        }
+        let mut chars = word.chars().peekable();
+        while let Some(ch) = chars.next() {
+            out.push(ch);
+            if ch == '\\' && chars.peek() != Some(&'`') {
+                out.push('\\');
+            }
+        }
+        out.push_str(&piece[word.len()..]);
+    }
+}
+
+/// A word with a backslash that separates path parts rather than escaping Markdown: one
+/// before a letter or digit (`C:\Users`, `\\server`), before a dot file (`x\.neuron`,
+/// `.\.git`), or after a drive (`C:\`).
+fn is_path_like(word: &str) -> bool {
+    let bytes = word.as_bytes();
+    bytes.iter().enumerate().any(|(index, &byte)| {
+        if byte != b'\\' {
+            return false;
+        }
+        match bytes.get(index + 1) {
+            Some(next) if next.is_ascii_alphanumeric() => true,
+            Some(b'.') => index > 0 && bytes.get(index + 2).is_some_and(u8::is_ascii_alphanumeric),
+            _ => {
+                index >= 2
+                    && bytes[index - 1] == b':'
+                    && bytes[index - 2].is_ascii_alphabetic()
+                    && (index == 2 || !bytes[index - 3].is_ascii_alphanumeric())
+            }
+        }
+    })
 }
 
 fn apply_code_block_background(line: &str) -> String {
@@ -1120,6 +1255,70 @@ mod tests {
         assert!(plain_text.contains("╭─ markdown"));
         assert!(plain_text.contains("```rust"));
         assert!(plain_text.contains("fn nested()"));
+    }
+
+    #[test]
+    fn streamed_chunks_keep_line_breaks_and_paragraphs() {
+        let renderer = TerminalRenderer::new();
+        let source = "Line one\nLine two\n\n\nPara two\n\n- a\n- b\n\nlast";
+        let expected = "Line one\nLine two\n\nPara two\n\n\u{2022} a\n\u{2022} b\n\nlast\n";
+        let chunkings: [Vec<String>; 3] = [
+            vec![source.to_string()],
+            source.split_inclusive('\n').map(str::to_string).collect(),
+            source.chars().map(String::from).collect(),
+        ];
+        for chunks in chunkings {
+            let mut state = MarkdownStreamState::default();
+            let mut printed = String::new();
+            for chunk in &chunks {
+                printed.push_str(&state.push(&renderer, chunk).unwrap_or_default());
+            }
+            printed.push_str(&state.flush(&renderer).unwrap_or_default());
+            assert_eq!(strip_ansi(&printed), expected, "{} chunks", chunks.len());
+        }
+
+        // A block never starts or ends on a blank line, and the next one starts fresh.
+        let mut state = MarkdownStreamState::default();
+        assert_eq!(state.push(&renderer, "\n\n"), None);
+        assert_eq!(
+            strip_ansi(&state.push(&renderer, "hi\n\n").unwrap()),
+            "hi\n"
+        );
+        assert_eq!(state.flush(&renderer), None);
+        assert_eq!(
+            strip_ansi(&state.render_block(&renderer, "next").unwrap()),
+            "next\n"
+        );
+    }
+
+    #[test]
+    fn keeps_backslashes_of_paths_and_code_but_reads_markdown_escapes() {
+        let renderer = TerminalRenderer::new();
+        let plain = |markdown: &str| strip_ansi(&renderer.render_markdown(markdown));
+        for path in [
+            r"C:\Users\x\.neuron\a.txt",
+            r"Open .\.git or folder\.config",
+            r"\\server\share\.x",
+            r"match \d+\.\d+ here",
+            r"(see C:\)",
+        ] {
+            assert_eq!(plain(path), path);
+        }
+        assert_eq!(plain(r"**C:\_build\out**"), r"C:\_build\out");
+        // Code is literal already, so nothing is doubled there.
+        assert_eq!(plain(r"run `C:\x\.y` now"), r"run `C:\x\.y` now");
+        let block = plain("```\nC:\\x\\.y\n```");
+        assert!(block.contains("C:\\x\\.y\n"), "{block}");
+        assert!(!block.contains(r"\\"), "{block}");
+        // Markdown escapes outside paths still work.
+        assert_eq!(
+            plain(r"\*not italic\* and 1\. not a list"),
+            "*not italic* and 1. not a list"
+        );
+        assert_eq!(
+            plain(r"\_\_init\_\_.py and \\ alone"),
+            r"__init__.py and \ alone"
+        );
     }
 
     #[test]

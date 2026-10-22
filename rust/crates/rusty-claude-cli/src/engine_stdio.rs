@@ -148,10 +148,9 @@ fn start(args: &[String]) -> Result<EngineHandle, String> {
             ));
         }
     }
-    let requested = resolve_repl_model(args.model.as_deref().map_or_else(
-        || DEFAULT_MODEL.to_string(),
-        resolve_model_alias_with_config,
-    ));
+    let requested = requested_model(&args, |reference| {
+        saved_session_model(&current_session_store().ok()?, reference)
+    });
     // Signed out of Zero-X (or the session ended): start anyway, and the UI signs in.
     let (model, signed_out) = match start_provider(&requested).map_err(|error| error.to_string())? {
         ProviderStart::Ready(model) => (model, None),
@@ -167,6 +166,26 @@ fn start(args: &[String]) -> Result<EngineHandle, String> {
         resume: args.resume,
         signed_out,
     })
+}
+
+/// The model to start on: `--model`, else the one the chat `--resume` continues last ran
+/// on (as the line REPL's `--resume` does), else the default.
+fn requested_model(args: &EngineArgs, saved_model: impl FnOnce(&str) -> Option<String>) -> String {
+    let model = match (&args.model, &args.resume) {
+        (Some(model), _) => resolve_model_alias_with_config(model),
+        (None, Some(reference)) => {
+            saved_model(reference).unwrap_or_else(|| DEFAULT_MODEL.to_string())
+        }
+        (None, None) => DEFAULT_MODEL.to_string(),
+    };
+    resolve_repl_model(model)
+}
+
+/// The model stored with a saved chat. Provider setup adds the `openai/` routing prefix
+/// back where the transport needs it.
+fn saved_session_model(store: &runtime::SessionStore, reference: &str) -> Option<String> {
+    let (_, session) = load_session_reference_in_store(store, reference).ok()?;
+    session.model.filter(|model| !model.trim().is_empty())
 }
 
 /// Pumps JSON lines until the engine stops: input lines go to the engine from a reader
@@ -321,6 +340,44 @@ mod tests {
         assert_eq!(engine(&["fix", "the", "engine", "--stdio", "flag"]), None);
         assert_eq!(engine(&["engine", "is", "slow"]), None);
         assert_eq!(engine(&["--model", "opus", "explain", "this"]), None);
+    }
+
+    /// `--resume` without `--model` goes on with the model the chat was using; `--model`
+    /// still wins.
+    #[test]
+    fn a_resumed_chat_starts_on_the_model_it_was_using() {
+        let workspace =
+            std::env::temp_dir().join(format!("neuron-engine-resume-model-{}", std::process::id()));
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let store = crate::session_mgmt::session_store_in(&workspace).expect("store");
+        let handle = store.create_handle("chat-on-groq");
+        let mut session = runtime::Session::new().with_persistence_path(handle.path.clone());
+        session.model = Some("groq/openai/gpt-oss-20b".into());
+        session.save_to_path(&handle.path).expect("save");
+
+        let saved = |reference: &str| super::saved_session_model(&store, reference);
+        assert_eq!(
+            saved("chat-on-groq").as_deref(),
+            Some("groq/openai/gpt-oss-20b")
+        );
+        assert_eq!(saved("latest").as_deref(), Some("groq/openai/gpt-oss-20b"));
+        assert_eq!(saved("no-such-chat"), None);
+
+        let resumed = parse_engine_args(&args(&["--stdio", "--resume", "chat-on-groq"])).unwrap();
+        assert_eq!(
+            super::requested_model(&resumed, saved),
+            "groq/openai/gpt-oss-20b"
+        );
+        let switched = parse_engine_args(&args(&[
+            "--stdio",
+            "--resume",
+            "chat-on-groq",
+            "--model",
+            "zx-fast",
+        ]))
+        .unwrap();
+        assert_eq!(super::requested_model(&switched, saved), "zx-fast");
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 
     #[test]

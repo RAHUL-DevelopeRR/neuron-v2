@@ -301,7 +301,7 @@ pub fn read_file(
     Ok(ReadFileOutput {
         kind: String::from("text"),
         file: TextFilePayload {
-            file_path: absolute_path.to_string_lossy().into_owned(),
+            file_path: display_path(&absolute_path),
             content: selected,
             num_lines: end_index.saturating_sub(start_index),
             start_line: start_index.saturating_add(1),
@@ -332,7 +332,7 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
     }
     fs::write(&absolute_path, content)?;
 
-    let file_path = absolute_path.to_string_lossy().into_owned();
+    let file_path = display_path(&absolute_path);
     let lines = content.lines().count();
     let summary = format!(
         "{} {file_path} ({lines} lines, {} bytes)",
@@ -482,7 +482,7 @@ pub fn edit_file(
     updated.push_str(&original_file[cursor..]);
     fs::write(&absolute_path, &updated)?;
 
-    let file_path = absolute_path.to_string_lossy().into_owned();
+    let file_path = display_path(&absolute_path);
     let (structured_patch, diff, diff_truncated) =
         build_edit_diff(&file_path, &original_file, &offsets, &needle, &replacement);
     Ok(EditFileOutput {
@@ -731,7 +731,7 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
     let filenames = matches
         .into_iter()
         .take(100)
-        .map(|path| path.to_string_lossy().into_owned())
+        .map(|path| display_path(&path))
         .collect::<Vec<_>>();
 
     Ok(GlobSearchOutput {
@@ -794,7 +794,7 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
         if output_mode == "count" {
             let count = regex.find_iter(&file_contents).count();
             if count > 0 {
-                filenames.push(file_path.to_string_lossy().into_owned());
+                filenames.push(display_path(&file_path));
                 total_matches += count;
             }
             continue;
@@ -813,16 +813,17 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
             continue;
         }
 
-        filenames.push(file_path.to_string_lossy().into_owned());
+        let shown_path = display_path(&file_path);
+        filenames.push(shown_path.clone());
         if output_mode == "content" {
             for index in matched_lines {
                 let start = index.saturating_sub(input.before.unwrap_or(context));
                 let end = (index + input.after.unwrap_or(context) + 1).min(lines.len());
                 for (current, line) in lines.iter().enumerate().take(end).skip(start) {
                     let prefix = if input.line_numbers.unwrap_or(true) {
-                        format!("{}:{}:", file_path.to_string_lossy(), current + 1)
+                        format!("{shown_path}:{}:", current + 1)
                     } else {
-                        format!("{}:", file_path.to_string_lossy())
+                        format!("{shown_path}:")
                     };
                     content_lines.push(format!("{prefix}{line}"));
                 }
@@ -917,6 +918,31 @@ fn apply_limit<T>(
         truncated.then_some(explicit_limit),
         (offset_value > 0).then_some(offset_value),
     )
+}
+
+/// `path` as people write it, for tool output: without the `\\?\` verbatim prefix that
+/// `fs::canonicalize` adds on Windows (`\\?\C:\repo` is shown as `C:\repo`,
+/// `\\?\UNC\server\share` as `\\server\share`). Other paths are unchanged; the
+/// standard library adds the prefix back where a long path needs it.
+#[must_use]
+pub fn display_path(path: &Path) -> String {
+    strip_verbatim_prefix(&path.to_string_lossy())
+}
+
+fn strip_verbatim_prefix(text: &str) -> String {
+    if let Some(share) = text.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{share}");
+    }
+    match text.strip_prefix(r"\\?\") {
+        Some(rest)
+            if rest.len() >= 2
+                && rest.as_bytes()[0].is_ascii_alphabetic()
+                && rest.as_bytes()[1] == b':' =>
+        {
+            rest.to_string()
+        }
+        _ => text.to_string(),
+    }
 }
 
 fn normalize_path(path: &str) -> io::Result<PathBuf> {
@@ -1049,8 +1075,8 @@ mod tests {
 
     use super::{
         edit_file, expand_braces, glob_search, grep_search, is_symlink_escape, read_file,
-        read_file_in_workspace, write_file, write_file_in_workspace, GrepSearchInput,
-        MAX_WRITE_SIZE,
+        read_file_in_workspace, strip_verbatim_prefix, write_file, write_file_in_workspace,
+        GrepSearchInput, MAX_WRITE_SIZE,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -1059,6 +1085,74 @@ mod tests {
             .expect("time should move forward")
             .as_nanos();
         std::env::temp_dir().join(format!("clawd-native-{name}-{unique}"))
+    }
+
+    #[test]
+    fn tool_output_paths_leave_out_the_windows_verbatim_prefix() {
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\C:\repo\src\lib.rs"),
+            r"C:\repo\src\lib.rs"
+        );
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\UNC\server\share\notes.md"),
+            r"\\server\share\notes.md"
+        );
+        // Device paths and ordinary paths stay as they are.
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\Volume{1234}\file"),
+            r"\\?\Volume{1234}\file"
+        );
+        assert_eq!(strip_verbatim_prefix("/home/dev/repo"), "/home/dev/repo");
+        assert_eq!(strip_verbatim_prefix(r"C:\repo"), r"C:\repo");
+    }
+
+    #[test]
+    fn read_grep_and_glob_report_paths_as_written() {
+        let dir = temp_path("display-paths");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let file = dir.join("found.txt");
+        std::fs::write(&file, "needle here\n").expect("write");
+
+        let read = read_file(file.to_string_lossy().as_ref(), None, None).expect("read");
+        assert!(
+            !read.file.file_path.starts_with(r"\\?\"),
+            "{}",
+            read.file.file_path
+        );
+        assert!(read.file.file_path.ends_with("found.txt"));
+        let grep = grep_search(&GrepSearchInput {
+            pattern: "needle".to_string(),
+            path: Some(dir.to_string_lossy().into_owned()),
+            glob: None,
+            output_mode: Some("content".to_string()),
+            before: None,
+            after: None,
+            context_short: None,
+            context: None,
+            line_numbers: Some(true),
+            case_insensitive: None,
+            file_type: None,
+            head_limit: None,
+            offset: None,
+            multiline: None,
+        })
+        .expect("grep");
+        assert!(
+            grep.filenames.iter().all(|name| !name.starts_with(r"\\?\")),
+            "{:?}",
+            grep.filenames
+        );
+        let content = grep.content.expect("content mode");
+        assert!(!content.contains(r"\\?\"), "{content}");
+        assert!(content.ends_with("found.txt:1:needle here"), "{content}");
+        let globbed = glob_search("*.txt", Some(dir.to_string_lossy().as_ref())).expect("glob");
+        assert_eq!(globbed.filenames.len(), 1);
+        assert!(
+            !globbed.filenames[0].starts_with(r"\\?\"),
+            "{:?}",
+            globbed.filenames
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1121,9 +1215,10 @@ mod tests {
         let nested = workspace.join("missing/parents/new.txt");
         let output = write_file_in_workspace(nested.to_string_lossy().as_ref(), "new", &workspace)
             .expect("new nested file should remain inside the canonical workspace");
+        // The canonical path, as people write it (no `\\?\` on Windows).
         assert_eq!(
-            std::path::PathBuf::from(output.file_path),
-            nested.canonicalize().unwrap()
+            output.file_path,
+            super::display_path(&nested.canonicalize().unwrap())
         );
 
         let escape = workspace.join("missing/../../outside-new.txt");

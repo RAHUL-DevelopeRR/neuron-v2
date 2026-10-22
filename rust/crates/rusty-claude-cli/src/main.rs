@@ -246,7 +246,8 @@ impl std::fmt::Display for UsageError {
 impl std::error::Error for UsageError {}
 
 /// The `--output-format json` answer of a turn that failed: the error, and what the turn
-/// had done by then (text, tool calls and their results).
+/// had done by then (text, tool calls and their results, and the tokens its model calls
+/// were billed for).
 fn failed_turn_json(error: &str, model: &str, messages: &[ConversationMessage]) -> Value {
     let blocks = || messages.iter().flat_map(|message| message.blocks.iter());
     let text = messages
@@ -254,10 +255,24 @@ fn failed_turn_json(error: &str, model: &str, messages: &[ConversationMessage]) 
         .filter(|message| message.role == MessageRole::Assistant)
         .flat_map(|message| message.blocks.iter())
         .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
+            // The runtime's note closing the failed turn is not model output.
+            ContentBlock::Text { text } if !runtime::is_turn_end_note(text) => Some(text.as_str()),
             _ => None,
         })
         .collect::<String>();
+    let usage = messages.iter().filter_map(|message| message.usage).fold(
+        TokenUsage::default(),
+        |total, usage| TokenUsage {
+            input_tokens: total.input_tokens.saturating_add(usage.input_tokens),
+            output_tokens: total.output_tokens.saturating_add(usage.output_tokens),
+            cache_creation_input_tokens: total
+                .cache_creation_input_tokens
+                .saturating_add(usage.cache_creation_input_tokens),
+            cache_read_input_tokens: total
+                .cache_read_input_tokens
+                .saturating_add(usage.cache_read_input_tokens),
+        },
+    );
     let tool_uses = blocks()
         .filter_map(|block| match block {
             ContentBlock::ToolUse { id, name, input } => {
@@ -289,6 +304,12 @@ fn failed_turn_json(error: &str, model: &str, messages: &[ConversationMessage]) 
         "message": text,
         "tool_uses": tool_uses,
         "tool_results": tool_results,
+        "usage": {
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+            "cache_read_input_tokens": usage.cache_read_input_tokens,
+        },
     })
 }
 
@@ -336,6 +357,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     runtime::workspace_trust::set_trust_store_path(
         credentials::neuron_home().join("trusted_dirs.txt"),
     );
+    // MCP servers' own warnings would print over the prompt or the full-screen UI.
+    runtime::set_mcp_server_log(Some(
+        credentials::neuron_home()
+            .join("logs")
+            .join("mcp-servers.log"),
+    ));
     let args: Vec<String> = env::args().skip(1).collect();
     let (args, provider_choice) = extract_provider_flag(&args).map_err(UsageError)?;
     provider::set_provider_flag(provider_choice);
@@ -1810,8 +1837,19 @@ impl RuntimeMcpState {
         Ok(())
     }
 
+    /// Servers whose tools are missing: the ones that failed, or every server while they
+    /// start in the background.
     fn pending_servers(&self) -> Option<Vec<String>> {
-        (!self.pending_servers.is_empty()).then(|| self.pending_servers.clone())
+        let pending = if self.starting {
+            self.server_names()
+        } else {
+            self.pending_servers.clone()
+        };
+        (!pending.is_empty()).then_some(pending)
+    }
+
+    fn is_starting(&self) -> bool {
+        self.starting
     }
 
     fn degraded_report(&self) -> Option<runtime::McpDegradedReport> {
@@ -2211,6 +2249,7 @@ impl HookAbortMonitor {
                             turn_ended,
                             &cancel,
                             &abort_signal,
+                            repl_loop::QuitHint::Shown,
                             repl_loop::request_force_quit,
                         )
                         .await;
@@ -2221,6 +2260,8 @@ impl HookAbortMonitor {
                             turn_ended,
                             &cancel,
                             &abort_signal,
+                            // The full-screen UI shows its own key hints.
+                            repl_loop::QuitHint::Hidden,
                             repl_loop::request_force_quit,
                         )
                         .await;
@@ -2702,7 +2743,9 @@ impl LiveCli {
                         format_auto_compaction_notice(event.removed_message_count)
                     );
                 }
-                if let Some(notice) = repl_loop::describe_turn_outcome(&summary) {
+                if let Some(notice) =
+                    repl_loop::describe_turn_outcome(&summary, repl_loop::QuitHint::Shown)
+                {
                     println!("{notice}");
                 }
                 persisted?;
@@ -3320,7 +3363,7 @@ impl LiveCli {
             "Session cleared\n  Mode             fresh session\n  Previous session {}\n  Resume previous  /resume {}\n  Preserved model  {}\n  Permission mode  {}\n  New session      {}\n  Session file     {}",
             previous_session.id,
             previous_session.id,
-            self.model,
+            shown_model(&self.model),
             self.permission_mode.as_str(),
             self.session.id,
             self.session.path.display(),
@@ -5530,8 +5573,15 @@ mod tests {
         // `neuron login` itself runs before parsing (auth::account_command); this is what
         // the parser says if it ever sees it.
         let login = parse_args(&["login".to_string()]).expect_err("login is not a parser action");
-        assert!(login.contains("run `neuron login`"));
+        assert!(login.contains("`neuron login [--no-browser | --with-token]`"));
         assert!(login.contains("ANTHROPIC_API_KEY"));
+        // An unquoted prompt that starts with an account command's name is not guessed.
+        for word in ["login", "logout", "auth", "usage", "upgrade"] {
+            let prompt = [word, "to", "the", "server", "and", "fix", "it"].map(String::from);
+            let error = parse_args(&prompt).expect_err("ambiguous");
+            assert!(error.contains("quote it"), "{error}");
+            assert!(error.contains("neuron prompt"), "{error}");
+        }
         let logout =
             parse_args(&["logout".to_string()]).expect_err("logout is not a parser action");
         assert!(logout.contains("ANTHROPIC_AUTH_TOKEN"));
@@ -6631,8 +6681,11 @@ mod tests {
         assert!(!help.contains("cargo install neuron-cli"));
         assert!(help.contains("--provider NAME"));
         assert!(help.contains("--reasoning-effort LEVEL"));
-        assert!(!help.contains("neuron login"));
-        assert!(!help.contains("neuron logout"));
+        // The top-level account commands.
+        assert!(help.contains("neuron login [--no-browser | --with-token]"));
+        assert!(help.contains("neuron logout"));
+        assert!(help.contains("neuron usage"));
+        assert!(help.contains("neuron upgrade [--no-browser]"));
     }
 
     #[test]
@@ -7938,7 +7991,12 @@ UU conflicted.rs",
                         input: r#"{"command":"cargo test"}"#.to_string(),
                     },
                 ],
-                usage: None,
+                usage: Some(runtime::TokenUsage {
+                    input_tokens: 1_200,
+                    output_tokens: 40,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 300,
+                }),
             },
             ConversationMessage {
                 role: MessageRole::Tool,
@@ -7950,6 +8008,13 @@ UU conflicted.rs",
                 }],
                 usage: None,
             },
+            // The runtime's note closing the failed turn.
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: format!(
+                    "{}gateway returned 503]",
+                    runtime::FAILED_RESPONSE_NOTE_PREFIX
+                ),
+            }]),
         ];
         let report = super::failed_turn_json("gateway returned 503", "auto", &messages);
         assert_eq!(report["type"], "error");
@@ -7957,6 +8022,10 @@ UU conflicted.rs",
         assert_eq!(report["message"], "Running the tests.");
         assert_eq!(report["tool_uses"][0]["name"], "bash");
         assert_eq!(report["tool_results"][0]["is_error"], true);
+        // The billed model call is reported, not lost with the failure.
+        assert_eq!(report["usage"]["input_tokens"], 1_200);
+        assert_eq!(report["usage"]["output_tokens"], 40);
+        assert_eq!(report["usage"]["cache_read_input_tokens"], 300);
     }
 
     /// A workspace whose settings configure the fixture server `alpha` only.
@@ -8023,6 +8092,20 @@ UU conflicted.rs",
             )
             .expect_err("no MCP tool runs before the servers started");
         assert!(early.to_string().contains("still starting"), "{early}");
+        // ToolSearch says so too, instead of an empty answer.
+        let search: serde_json::Value = serde_json::from_str(
+            &executor
+                .execute("ToolSearch", r#"{"query":"alpha echo","max_results":5}"#)
+                .expect("tool search runs while the servers start"),
+        )
+        .expect("search output is json");
+        assert_eq!(search["pending_mcp_servers"], json!(["alpha"]), "{search}");
+        assert!(
+            search["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("still starting")),
+            "{search}"
+        );
 
         let deadline = Instant::now() + Duration::from_secs(60);
         let (mut started, tools) = loop {

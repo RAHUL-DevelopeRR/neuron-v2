@@ -755,6 +755,30 @@ fn neuron_usage_renders_the_account_from_the_gateway() {
     let output = run(upgrade, None);
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(stdout(&output).contains("https://example.test/plans"));
+
+    // Both answer `--output-format json` like the other commands.
+    let mut usage = workspace.command(&gateway);
+    usage
+        .env("NEURON_TOKEN", SESSION_TOKEN)
+        .args(["--output-format", "json", "usage"]);
+    let output = run(usage, None);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("JSON usage");
+    assert_eq!(report["type"], "usage");
+    assert_eq!(report["account"]["email"], "dev@example.com");
+    assert_eq!(report["account"]["requests_today"], 42);
+    assert!(!stdout(&output).contains(SESSION_TOKEN));
+
+    let mut upgrade = workspace.command(&gateway);
+    upgrade
+        .env("NEURON_PRICING_URL", "https://example.test/plans")
+        .args(["upgrade", "--no-browser", "--output-format=json"]);
+    let output = run(upgrade, None);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("JSON upgrade");
+    assert_eq!(report["type"], "upgrade");
+    assert_eq!(report["url"], "https://example.test/plans");
+    assert_eq!(report["opened"], false);
 }
 
 #[test]
@@ -880,7 +904,7 @@ fn auth_login_with_token_status_and_logout_lifecycle() {
     let credentials = workspace.neuron_home().join("credentials.json");
 
     let mut login = workspace.command(&gateway);
-    login.args(["auth", "login", "--with-token"]);
+    login.args(["auth", "login", "--with-token", "--output-format", "json"]);
     let output = run(login, Some(&format!("{SESSION_TOKEN}\n")));
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(
@@ -888,6 +912,10 @@ fn auth_login_with_token_status_and_logout_lifecycle() {
         "{}",
         stderr(&output)
     );
+    let report: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("JSON login");
+    assert_eq!(report["type"], "login");
+    assert_eq!(report["plan"], "free");
+    assert!(!stdout(&output).contains(SESSION_TOKEN));
     let stored: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&credentials).unwrap()).unwrap();
     assert_eq!(stored["token"], SESSION_TOKEN);
@@ -967,10 +995,14 @@ fn corrupt_credentials_warn_and_logout_still_succeeds() {
     assert!(stderr(&output).contains("Ignoring unreadable credential file"));
 
     let mut logout = workspace.command(&gateway);
-    logout.args(["auth", "logout"]);
+    logout.args(["--output-format", "json", "logout"]);
     let output = run(logout, None);
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(!credentials.exists());
+    let report: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("JSON logout");
+    assert_eq!(report["type"], "logout");
+    assert_eq!(report["signed_out"], true);
+    assert_eq!(report["session_revoked"], false, "nothing to revoke");
 
     let mut doctor = workspace.command(&gateway);
     doctor.args(["--output-format", "json", "doctor"]);

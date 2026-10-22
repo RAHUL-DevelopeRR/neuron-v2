@@ -85,8 +85,8 @@ pub(crate) enum StreamFailure {
     /// The stream broke off before the response completed (connection reset,
     /// truncated SSE body, provider stream error).
     Interrupted { detail: String },
-    /// The turn was cancelled while waiting.
-    Cancelled,
+    /// The turn was cancelled while waiting, after `partial_text` had streamed.
+    Cancelled { partial_text: String },
     /// A failure that retrying the same request will not fix.
     Fatal(RuntimeError),
 }
@@ -119,7 +119,7 @@ impl StreamFailure {
             Self::Interrupted { detail } => {
                 format!("The response stream was interrupted ({detail})")
             }
-            Self::Cancelled => "Request cancelled".to_string(),
+            Self::Cancelled { .. } => "Request cancelled".to_string(),
             Self::Fatal(error) => error.to_string(),
         }
     }
@@ -130,12 +130,19 @@ impl StreamFailure {
         let kind = match &self {
             Self::FirstTokenTimeout { .. } | Self::Idle { .. } => RuntimeErrorKind::Timeout,
             Self::Interrupted { .. } => RuntimeErrorKind::StreamInterrupted,
-            Self::Cancelled => RuntimeErrorKind::Cancelled,
+            Self::Cancelled { .. } => RuntimeErrorKind::Cancelled,
             Self::Fatal(_) => RuntimeErrorKind::Other,
         };
         match self {
             Self::Fatal(error) => error,
-            Self::Cancelled => RuntimeError::with_kind(kind, "request cancelled by user"),
+            Self::Cancelled { partial_text } => {
+                let error = RuntimeError::with_kind(kind, "request cancelled by user");
+                if partial_text.is_empty() {
+                    error
+                } else {
+                    error.with_partial_text(partial_text)
+                }
+            }
             other => {
                 let after = match retries {
                     0 => String::new(),
@@ -198,6 +205,17 @@ impl<'a> FirstTokenClock<'a> {
             tokio::time::sleep(remaining).await;
         }
     }
+}
+
+/// The text deltas streamed so far, which the user has already seen.
+fn streamed_text(events: &[AssistantEvent]) -> String {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AssistantEvent::TextDelta(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Classifies an error returned while reading the stream. Provider status
@@ -468,7 +486,7 @@ impl AnthropicRuntimeClient {
         };
         let mut stream = tokio::select! {
             biased;
-            () = cancel.cancelled() => return Err(StreamFailure::Cancelled),
+            () = cancel.cancelled() => return Err(StreamFailure::Cancelled { partial_text: String::new() }),
             result = self.client.stream_message_with_progress(message_request, progress) => match result {
                 Ok(stream) => stream,
                 Err(error) => return Err(fatal_api_error(&self.session_id, &error)),
@@ -497,7 +515,9 @@ impl AnthropicRuntimeClient {
             };
             let next = tokio::select! {
                 biased;
-                () = cancel.cancelled() => return Err(StreamFailure::Cancelled),
+                () = cancel.cancelled() => return Err(StreamFailure::Cancelled {
+                    partial_text: streamed_text(&events),
+                }),
                 result = tokio::time::timeout(deadline, stream.next_event()) => match result {
                     Ok(Ok(next)) => next,
                     Ok(Err(error)) if ends_unterminated_tool_call(&error, !pending_tools.is_empty()) => {
@@ -672,7 +692,7 @@ impl AnthropicRuntimeClient {
         };
         let response = tokio::select! {
             biased;
-            () = cancel.cancelled() => return Err(StreamFailure::Cancelled),
+            () = cancel.cancelled() => return Err(StreamFailure::Cancelled { partial_text: String::new() }),
             response = self.client.send_message(&fallback_request) => response
                 .map_err(|error| fatal_api_error(&self.session_id, &error))?,
         };
@@ -733,7 +753,10 @@ pub(crate) fn format_context_window_blocked_error(
             estimated_total_tokens,
             context_window_tokens,
         } => {
-            lines.push(format!("  Model            {model}"));
+            lines.push(format!(
+                "  Model            {}",
+                crate::provider::shown_model(model)
+            ));
             lines.push(format!(
                 "  Input estimate   ~{estimated_input_tokens} tokens (heuristic)"
             ));
@@ -1657,6 +1680,33 @@ mod stream_resilience_tests {
         assert_eq!(error.kind(), RuntimeErrorKind::Cancelled);
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(gateway.connections.load(Ordering::SeqCst), 1, "no retry");
+        assert_eq!(error.partial_text(), None, "nothing streamed");
+    }
+
+    #[test]
+    fn a_cancelled_stream_hands_back_the_text_streamed_so_far() {
+        let gateway = spawn_gateway(Behavior::StallAfterFirstChunk);
+        let mut client = client_for(
+            &gateway,
+            StreamTimeouts {
+                first_token: Duration::from_secs(60),
+                post_tool_first_token: Duration::from_secs(60),
+                idle: Duration::from_secs(60),
+            },
+        );
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            trigger.cancel();
+        });
+
+        let error = client
+            .stream_with_cancellation(request(false), &cancel)
+            .expect_err("cancelled");
+
+        assert_eq!(error.kind(), RuntimeErrorKind::Cancelled);
+        assert_eq!(error.partial_text(), Some("partial"));
     }
 
     #[test]

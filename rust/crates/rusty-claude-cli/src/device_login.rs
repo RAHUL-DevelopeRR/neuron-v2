@@ -65,6 +65,9 @@ pub enum DeviceLoginError {
     Invalid(String),
     /// The gateway could not be reached when the sign-in started.
     Unavailable(String),
+    /// The gateway answered the sign-in request with an error status (a 5xx outage, or a
+    /// refusal), with its message when it sent one.
+    GatewayError { status: u16, message: String },
     /// The gateway is limiting sign-in attempts (HTTP 429); seconds to wait, when it said.
     RateLimited(Option<u64>),
 }
@@ -81,6 +84,21 @@ impl std::fmt::Display for DeviceLoginError {
             ),
             Self::Invalid(message) => write!(f, "Sign-in failed: {message}"),
             Self::Unavailable(message) => write!(f, "Could not reach Zero-X: {message}"),
+            Self::GatewayError { status, message } => {
+                write!(
+                    f,
+                    "Zero-X answered the sign-in request with an error (HTTP {status})"
+                )?;
+                let message = message.trim().trim_end_matches('.');
+                if !message.is_empty() {
+                    write!(f, ": {message}")?;
+                }
+                if *status >= 500 {
+                    write!(f, ". Try again in a moment.")
+                } else {
+                    write!(f, ".")
+                }
+            }
             Self::RateLimited(Some(seconds)) => write!(
                 f,
                 "Zero-X is limiting sign-in attempts; try again in {}.",
@@ -104,6 +122,7 @@ impl From<DeviceLoginError> for std::io::Error {
             DeviceLoginError::Cancelled => std::io::ErrorKind::Interrupted,
             DeviceLoginError::Unavailable(_) => std::io::ErrorKind::ConnectionRefused,
             DeviceLoginError::RateLimited(_) => std::io::ErrorKind::WouldBlock,
+            DeviceLoginError::GatewayError { .. } => std::io::ErrorKind::Other,
             DeviceLoginError::Unsupported | DeviceLoginError::Invalid(_) => {
                 std::io::ErrorKind::InvalidData
             }
@@ -112,10 +131,29 @@ impl From<DeviceLoginError> for std::io::Error {
     }
 }
 
-/// `POST url` with a JSON body; returns the status and the parsed body (`Null` when the body
-/// is not JSON). `Err` is a transport failure.
+/// A gateway's answer to a `POST`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Answer {
+    pub status: u16,
+    /// The parsed body; `Null` when it is not JSON.
+    pub body: Value,
+    /// The `Retry-After` header, in seconds, when the gateway sent one.
+    pub retry_after: Option<u64>,
+}
+
+impl From<(u16, Value)> for Answer {
+    fn from((status, body): (u16, Value)) -> Self {
+        Self {
+            status,
+            body,
+            retry_after: None,
+        }
+    }
+}
+
+/// `POST url` with a JSON body. `Err` is a transport failure.
 pub trait Transport {
-    fn post_json(&self, url: &str, body: &Value) -> Result<(u16, Value), String>;
+    fn post_json(&self, url: &str, body: &Value) -> Result<Answer, String>;
 }
 
 /// Time for the polling loop. `sleep` returns early, with `false`, when the sign-in was
@@ -180,20 +218,28 @@ pub fn request_code(
         "os": client.os,
     });
     let url = gateway_http::account_url(base_url, "/auth/device/code");
-    let (status, value) = transport
+    let Answer {
+        status,
+        body: value,
+        retry_after,
+    } = transport
         .post_json(&url, &body)
         .map_err(DeviceLoginError::Unavailable)?;
     if status == 404 || status == 405 {
         return Err(DeviceLoginError::Unsupported);
     }
     if status == 429 {
-        return Err(DeviceLoginError::RateLimited(retry_after_seconds(&value)));
+        // The body's own figure first, then the standard header.
+        return Err(DeviceLoginError::RateLimited(
+            retry_after_seconds(&value).or(retry_after),
+        ));
     }
     if !(200..300).contains(&status) {
-        return Err(DeviceLoginError::Unavailable(error_message(
-            &value,
-            &format!("HTTP {status}"),
-        )));
+        // The gateway is up: it answered, with an error.
+        return Err(DeviceLoginError::GatewayError {
+            status,
+            message: error_message(&value, ""),
+        });
     }
     parse_device_code(base_url, &value)
 }
@@ -301,6 +347,16 @@ fn retry_after_seconds(value: &Value) -> Option<u64> {
         .map(|seconds| seconds.ceil() as u64)
 }
 
+/// A `Retry-After` header given in seconds (the HTTP-date form is not used by Zero-X).
+fn retry_after_header_seconds(value: &str) -> Option<u64> {
+    value
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+        .map(|seconds| seconds.ceil() as u64)
+}
+
 fn error_code(value: &Value) -> Option<&str> {
     value
         .get("error")
@@ -334,7 +390,11 @@ pub fn poll_for_grant(
         if clock.now() >= deadline {
             return Err(DeviceLoginError::Expired);
         }
-        let (status, value) = match transport.post_json(&url, &body) {
+        let Answer {
+            status,
+            body: value,
+            ..
+        } = match transport.post_json(&url, &body) {
             Ok(answer) => answer,
             Err(_) => {
                 interval = (interval * 2).min(MAX_INTERVAL);
@@ -444,7 +504,7 @@ pub fn browser_allowed(
 pub struct HttpTransport;
 
 impl Transport for HttpTransport {
-    fn post_json(&self, url: &str, body: &Value) -> Result<(u16, Value), String> {
+    fn post_json(&self, url: &str, body: &Value) -> Result<Answer, String> {
         let response = gateway_http::client(ACCOUNT_TIMEOUT)
             .map_err(|error| error.to_string())?
             .post(url)
@@ -454,8 +514,17 @@ impl Transport for HttpTransport {
             .send()
             .map_err(|error| error.to_string())?;
         let status = response.status().as_u16();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(retry_after_header_seconds);
         let text = response.text().map_err(|error| error.to_string())?;
-        Ok((status, serde_json::from_str(&text).unwrap_or(Value::Null)))
+        Ok(Answer {
+            status,
+            body: serde_json::from_str(&text).unwrap_or(Value::Null),
+            retry_after,
+        })
     }
 }
 
@@ -528,12 +597,21 @@ mod tests {
     const BASE: &str = "https://zero-x.live/v1";
 
     struct Script {
-        answers: RefCell<VecDeque<Result<(u16, Value), String>>>,
+        answers: RefCell<VecDeque<Result<Answer, String>>>,
         requests: RefCell<Vec<(String, Value)>>,
     }
 
     impl Script {
         fn new(answers: Vec<Result<(u16, Value), String>>) -> Self {
+            Self::answering(
+                answers
+                    .into_iter()
+                    .map(|answer| answer.map(Answer::from))
+                    .collect(),
+            )
+        }
+
+        fn answering(answers: Vec<Result<Answer, String>>) -> Self {
             Self {
                 answers: RefCell::new(answers.into()),
                 requests: RefCell::new(Vec::new()),
@@ -542,7 +620,7 @@ mod tests {
     }
 
     impl Transport for Script {
-        fn post_json(&self, url: &str, body: &Value) -> Result<(u16, Value), String> {
+        fn post_json(&self, url: &str, body: &Value) -> Result<Answer, String> {
             self.requests
                 .borrow_mut()
                 .push((url.to_string(), body.clone()));
@@ -895,9 +973,10 @@ mod tests {
         };
         let error = limited(json!({"error": {"code": "rate_limited", "retry_after": 125}}));
         assert_eq!(error, DeviceLoginError::RateLimited(Some(125)));
+        // Rounded up: waiting that long is enough.
         assert_eq!(
             error.to_string(),
-            "Zero-X is limiting sign-in attempts; try again in 2m."
+            "Zero-X is limiting sign-in attempts; try again in 3m."
         );
         let error = limited(json!({"error": "too many requests"}));
         assert!(
@@ -905,6 +984,71 @@ mod tests {
             "{error}"
         );
         assert!(!error.to_string().contains("Could not reach"), "{error}");
+    }
+
+    #[test]
+    fn a_rate_limit_with_only_the_retry_after_header_says_how_long_to_wait() {
+        let transport = Script::answering(vec![Ok(Answer {
+            status: 429,
+            body: json!({"error": "too many requests"}),
+            retry_after: Some(487),
+        })]);
+        let error = run(
+            BASE,
+            &transport,
+            &FakeClock::new(),
+            &seen(),
+            &client(),
+            &|_| false,
+        )
+        .unwrap_err();
+        assert_eq!(error, DeviceLoginError::RateLimited(Some(487)));
+        assert!(error.to_string().ends_with("try again in 9m."), "{error}");
+        // The body's figure wins over the header.
+        let transport = Script::answering(vec![Ok(Answer {
+            status: 429,
+            body: json!({"error": {"retry_after": 30}}),
+            retry_after: Some(487),
+        })]);
+        let error = request_code(BASE, &transport, &client()).unwrap_err();
+        assert_eq!(error, DeviceLoginError::RateLimited(Some(30)));
+        assert_eq!(retry_after_header_seconds(" 120 "), Some(120));
+        assert_eq!(retry_after_header_seconds("1.5"), Some(2));
+        assert_eq!(
+            retry_after_header_seconds("Wed, 21 Oct 2015 07:28:00 GMT"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_gateway_that_answers_with_an_error_is_not_called_unreachable() {
+        let failed = |answer: Result<(u16, Value), String>| {
+            request_code(BASE, &Script::new(vec![answer]), &client()).unwrap_err()
+        };
+        let outage = failed(Ok((
+            503,
+            json!({"error": {"message": "capacity exhausted"}}),
+        )));
+        assert_eq!(
+            outage.to_string(),
+            "Zero-X answered the sign-in request with an error (HTTP 503): capacity exhausted. Try again in a moment."
+        );
+        assert!(!outage.to_string().contains("Could not reach"), "{outage}");
+        assert_eq!(
+            failed(Ok((502, Value::Null))).to_string(),
+            "Zero-X answered the sign-in request with an error (HTTP 502). Try again in a moment."
+        );
+        assert_eq!(
+            failed(Ok((403, json!({"error": {"message": "Device sign-in is disabled."}}))))
+                .to_string(),
+            "Zero-X answered the sign-in request with an error (HTTP 403): Device sign-in is disabled."
+        );
+        // A real transport failure still says so.
+        let unreachable = failed(Err("connection refused".into()));
+        assert_eq!(
+            unreachable.to_string(),
+            "Could not reach Zero-X: connection refused"
+        );
     }
 
     #[test]

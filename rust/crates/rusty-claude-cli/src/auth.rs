@@ -386,7 +386,20 @@ fn login_with_token(input: &mut dyn BufRead, prompt: bool) -> io::Result<Gateway
 /// Signs out: revokes the session on the server when possible and removes
 /// every local copy. Always succeeds; problems are reported as warnings.
 pub fn logout() {
+    sign_out();
+    // Stdout on the terminal; a UI that took over notices (and may own stdout) hears it.
+    if runtime::ui_hooks::notice_handler_installed() {
+        runtime::ui_hooks::notice("Signed out of Zero-X.");
+    } else {
+        println!("Signed out of Zero-X.");
+    }
+    warn_about_env_token();
+}
+
+/// [`logout`] without the closing line. Returns whether the server revoked a session.
+fn sign_out() -> bool {
     let store = CredentialStore::open_default();
+    let mut revoked = false;
     if let Some(loaded) = store.load() {
         let is_session = classify_token(loaded.credential.token.expose()) == Ok(TokenKind::Session);
         match gateway_base_url() {
@@ -395,7 +408,10 @@ pub fn logout() {
                 Some(loaded.credential.token.expose()),
                 ACCOUNT_TIMEOUT,
             ) {
-                Ok(()) => runtime::ui_hooks::notice("Zero-X session revoked."),
+                Ok(()) => {
+                    revoked = true;
+                    runtime::ui_hooks::notice("Zero-X session revoked.");
+                }
                 Err(error) if error.is_invalid_session() => {}
                 Err(error) => runtime::ui_hooks::notice(&format!(
                     "warning: could not revoke the session on Zero-X ({error}); it expires on its own"
@@ -411,12 +427,11 @@ pub fn logout() {
         runtime::ui_hooks::notice(&format!("warning: {warning}"));
     }
     crate::gateway_catalog::invalidate_cache();
-    // Stdout on the terminal; a UI that took over notices (and may own stdout) hears it.
-    if runtime::ui_hooks::notice_handler_installed() {
-        runtime::ui_hooks::notice("Signed out of Zero-X.");
-    } else {
-        println!("Signed out of Zero-X.");
-    }
+    revoked
+}
+
+/// After signing out: a `NEURON_TOKEN` in the environment still signs Neuron in.
+fn warn_about_env_token() {
     if env::var("NEURON_TOKEN").is_ok_and(|token| !token.trim().is_empty()) {
         runtime::ui_hooks::notice(
             "NEURON_TOKEN is still set in this shell; unset it to stop using that credential.",
@@ -582,7 +597,9 @@ pub struct AccountCommand {
 /// Finds an account command after any global flags (`neuron --output-format json auth
 /// status`). A `--output-format` before it moves to its arguments; the other global flags
 /// don't apply to it and are dropped. `None` when the first word is not one, such as a
-/// prompt.
+/// prompt, and when what follows is not what the command takes: an unquoted prompt that
+/// starts with a command's name (`neuron --model m login to the server and fix it`) is
+/// left to the argument parser, which asks for quotes.
 pub fn account_command(args: &[String]) -> Option<AccountCommand> {
     let mut output_format = Vec::new();
     let mut index = 0;
@@ -596,6 +613,9 @@ pub fn account_command(args: &[String]) -> Option<AccountCommand> {
             }
             let mut rest = args[index + 1..].to_vec();
             rest.extend(output_format);
+            if !takes_arguments(arg, &rest) {
+                return None;
+            }
             return Some(AccountCommand {
                 name: arg.clone(),
                 args: rest,
@@ -623,6 +643,27 @@ pub fn account_command(args: &[String]) -> Option<AccountCommand> {
     None
 }
 
+/// Whether `args` are arguments account command `name` takes. A bad `--output-format`
+/// value counts: the command itself reports it.
+fn takes_arguments(name: &str, args: &[String]) -> bool {
+    let Ok((args, _)) = take_output_format(args) else {
+        return true;
+    };
+    let words = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let login_flags = |flags: &[&str]| {
+        flags
+            .iter()
+            .all(|flag| matches!(*flag, "--no-browser" | "--with-token"))
+    };
+    match (name, words.as_slice()) {
+        ("login", flags) | ("auth", ["login", flags @ ..]) => login_flags(flags),
+        ("logout" | "usage" | "upgrade", [])
+        | ("upgrade", ["--no-browser"])
+        | ("auth", [] | ["help" | "--help" | "-h" | "status" | "logout"]) => true,
+        _ => false,
+    }
+}
+
 /// Runs an account command found by [`account_command`].
 pub fn run_account_command(command: &AccountCommand) -> Result<(), Box<dyn std::error::Error>> {
     match command.name.as_str() {
@@ -632,10 +673,33 @@ pub fn run_account_command(command: &AccountCommand) -> Result<(), Box<dyn std::
             args.extend(command.args.iter().cloned());
             run_auth_command(&args)
         }
-        // Text only: a `--output-format` there is ignored.
-        "usage" => crate::account::run_usage_command(&take_output_format(&command.args)?.0),
-        _ => crate::account::run_upgrade_command(&take_output_format(&command.args)?.0),
+        "usage" => {
+            let (args, json) = take_output_format(&command.args)?;
+            crate::account::run_usage_command(&args, json)
+        }
+        _ => {
+            let (args, json) = take_output_format(&command.args)?;
+            crate::account::run_upgrade_command(&args, json)
+        }
     }
+}
+
+/// Prints an account command's `--output-format json` result.
+pub(crate) fn print_json(report: &Value) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", serde_json::to_string_pretty(report)?);
+    Ok(())
+}
+
+/// `neuron login --output-format json`: who is signed in now. Never includes the token.
+fn login_json(credential: &GatewayCredential) -> Value {
+    serde_json::json!({
+        "type": "login",
+        "signed_in": true,
+        "source": credential.source.describe(),
+        "plan": credential.plan,
+        "expires_at": credential.expires_at,
+        "email": credential.email,
+    })
 }
 
 /// Takes `--output-format json|text` (or `--output-format=…`) out of `args`.
@@ -692,16 +756,32 @@ pub fn run_auth_command(args: &[String]) -> Result<(), Box<dyn std::error::Error
                     }
                 }
             }
-            if with_token {
+            let credential = if with_token {
                 let stdin = io::stdin();
                 let prompt = stdin.is_terminal();
-                login_with_token(&mut stdin.lock(), prompt)?;
+                login_with_token(&mut stdin.lock(), prompt)?
             } else {
-                login(options)?;
+                login(options)?
+            };
+            // The sign-in steps and the result line went to stderr.
+            if json {
+                print_json(&login_json(&credential))?;
             }
+        }
+        Some("logout") if args.len() == 1 && json => {
+            let revoked = sign_out();
+            warn_about_env_token();
+            print_json(&serde_json::json!({
+                "type": "logout",
+                "signed_out": true,
+                "session_revoked": revoked,
+            }))?;
         }
         Some("logout") if args.len() == 1 => logout(),
         Some("status") if args.len() == 1 => status()?,
+        None | Some("help" | "--help" | "-h") if json => {
+            print_json(&serde_json::json!({ "kind": "help", "message": AUTH_USAGE }))?;
+        }
         None | Some("help" | "--help" | "-h") => println!("{AUTH_USAGE}"),
         _ => return Err(AUTH_USAGE.into()),
     }
@@ -821,6 +901,70 @@ mod tests {
         );
         assert_eq!(account_command(&strings(&["-p", "auth", "status"])), None);
         assert_eq!(account_command(&strings(&["--help", "auth"])), None);
+    }
+
+    #[test]
+    fn an_unquoted_prompt_that_starts_with_a_command_name_is_not_the_command() {
+        let prompt = |first: &str| {
+            let mut args = strings(&["--model", "m", first]);
+            args.extend(strings(&["to", "the", "server", "and", "fix", "it"]));
+            args
+        };
+        for name in ["auth", "login", "logout", "usage", "upgrade"] {
+            assert_eq!(account_command(&prompt(name)), None, "{name}");
+        }
+        // The commands themselves, with what they take, still are.
+        assert_eq!(
+            account_command(&strings(&["--model", "m", "login"])),
+            command("login", &[])
+        );
+        assert_eq!(
+            account_command(&strings(&[
+                "login",
+                "--with-token",
+                "--output-format",
+                "json"
+            ])),
+            command("login", &["--with-token", "--output-format", "json"])
+        );
+        assert_eq!(
+            account_command(&strings(&["--output-format", "json", "usage"])),
+            command("usage", &["--output-format", "json"])
+        );
+        assert_eq!(
+            account_command(&strings(&["upgrade", "--no-browser"])),
+            command("upgrade", &["--no-browser"])
+        );
+        assert_eq!(
+            account_command(&strings(&["auth", "login", "--no-browser"])),
+            command("auth", &["login", "--no-browser"])
+        );
+        assert_eq!(account_command(&strings(&["auth"])), command("auth", &[]));
+        assert_eq!(account_command(&strings(&["logout", "now"])), None);
+        assert_eq!(account_command(&strings(&["auth", "status", "now"])), None);
+        // A bad format value is the command's to report.
+        assert_eq!(
+            account_command(&strings(&["usage", "--output-format", "yaml"])),
+            command("usage", &["--output-format", "yaml"])
+        );
+    }
+
+    #[test]
+    fn login_json_names_the_account_but_never_the_token() {
+        let credential = GatewayCredential {
+            token: SecureString::new("ses_abcdefghijklmnopqrstuvwxyz012345".to_string()),
+            kind: TokenKind::Session,
+            source: CredentialSource::Stored(CredentialLocation::Keychain),
+            expires_at: Some(4_070_908_800),
+            plan: Some("free".to_string()),
+            email: Some("dev@example.com".to_string()),
+        };
+        let report = login_json(&credential);
+        assert_eq!(report["type"], "login");
+        assert_eq!(report["signed_in"], true);
+        assert_eq!(report["plan"], "free");
+        assert_eq!(report["expires_at"], 4_070_908_800_u64);
+        assert!(!report.to_string().contains("ses_"));
     }
 
     #[test]

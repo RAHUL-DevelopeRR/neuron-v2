@@ -93,15 +93,17 @@ pub use config_validate::{
 };
 pub use conversation::{
     auto_compaction_threshold_from_env, auto_compaction_threshold_override_from_env,
-    is_truncation_stop_reason, resolve_max_iterations, ApiClient, ApiRequest, AssistantEvent,
-    AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError, RuntimeErrorKind,
-    StaticToolExecutor, ToolError, ToolExecutor, TurnOutcome, TurnSummary, DEFAULT_MAX_ITERATIONS,
+    is_truncation_stop_reason, is_turn_end_note, resolve_max_iterations, ApiClient, ApiRequest,
+    AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
+    RuntimeErrorKind, StaticToolExecutor, ToolError, ToolExecutor, TurnOutcome, TurnSummary,
+    DEFAULT_MAX_ITERATIONS, FAILED_RESPONSE_NOTE_PREFIX, INTERRUPTED_RESPONSE_NOTE,
     INTERRUPTED_TOOL_RESULT, MAX_ITERATIONS_ENV_VAR,
 };
 pub use file_ops::{
-    edit_file, edit_file_in_workspace, glob_search, grep_search, read_file, read_file_in_workspace,
-    write_file, write_file_in_workspace, EditFileOutput, GlobSearchOutput, GrepSearchInput,
-    GrepSearchOutput, ReadFileOutput, StructuredPatchHunk, TextFilePayload, WriteFileOutput,
+    display_path, edit_file, edit_file_in_workspace, glob_search, grep_search, read_file,
+    read_file_in_workspace, write_file, write_file_in_workspace, EditFileOutput, GlobSearchOutput,
+    GrepSearchInput, GrepSearchOutput, ReadFileOutput, StructuredPatchHunk, TextFilePayload,
+    WriteFileOutput,
 };
 pub use git_context::{GitCommitEntry, GitContext};
 pub use hooks::{
@@ -127,13 +129,13 @@ pub use mcp_lifecycle_hardened::{
 };
 pub use mcp_server::{McpServer, McpServerSpec, ToolCallHandler, MCP_SERVER_PROTOCOL_VERSION};
 pub use mcp_stdio::{
-    spawn_mcp_stdio_process, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
-    ManagedMcpTool, McpDiscoveryFailure, McpInitializeClientInfo, McpInitializeParams,
-    McpInitializeResult, McpInitializeServerInfo, McpListResourcesParams, McpListResourcesResult,
-    McpListToolsParams, McpListToolsResult, McpReadResourceParams, McpReadResourceResult,
-    McpResource, McpResourceContents, McpServerManager, McpServerManagerError, McpStdioProcess,
-    McpTool, McpToolCallContent, McpToolCallParams, McpToolCallResult, McpToolDiscoveryReport,
-    UnsupportedMcpServer,
+    set_mcp_server_log, spawn_mcp_stdio_process, JsonRpcError, JsonRpcId, JsonRpcRequest,
+    JsonRpcResponse, ManagedMcpTool, McpDiscoveryFailure, McpInitializeClientInfo,
+    McpInitializeParams, McpInitializeResult, McpInitializeServerInfo, McpListResourcesParams,
+    McpListResourcesResult, McpListToolsParams, McpListToolsResult, McpReadResourceParams,
+    McpReadResourceResult, McpResource, McpResourceContents, McpServerManager,
+    McpServerManagerError, McpStdioProcess, McpTool, McpToolCallContent, McpToolCallParams,
+    McpToolCallResult, McpToolDiscoveryReport, UnsupportedMcpServer,
 };
 pub use oauth::{
     clear_oauth_credentials, code_challenge_s256, credentials_path, generate_pkce_pair,

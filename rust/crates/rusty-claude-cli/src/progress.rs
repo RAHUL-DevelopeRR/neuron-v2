@@ -435,10 +435,10 @@ fn assemble_conversation_runtime(
     max_iterations_setting: Option<usize>,
 ) -> Result<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
 {
-    // Persist the model in session metadata so resumed sessions can report it.
-    if session.model.is_none() {
-        session.model = Some(model.clone());
-    }
+    // The model the session runs on, kept in its metadata so a resumed session reports
+    // it and continues on it. Stored as people see it: provider setup on resume adds the
+    // `openai/` routing prefix again where the transport needs it.
+    session.model = Some(crate::provider::shown_model(&model).to_string());
     let RuntimePluginState {
         feature_config,
         mut tool_registry,
@@ -644,10 +644,12 @@ impl SharedRuntimePluginState {
             }
             Err(error) => {
                 if let Some(stand_in) = &self.mcp_state {
-                    stand_in
+                    let mut stand_in = stand_in
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .starting = false;
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    stand_in.starting = false;
+                    // Their tools never came: ToolSearch keeps listing them as pending.
+                    stand_in.pending_servers = stand_in.server_names();
                 }
                 runtime::ui_hooks::notice(&format!(
                     "warning: the MCP servers could not start: {error}"

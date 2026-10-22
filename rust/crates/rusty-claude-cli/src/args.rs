@@ -430,7 +430,9 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
         }
         "system-prompt" => parse_system_prompt_args(&rest[1..], output_format),
         "acp" => parse_acp_args(&rest[1..], output_format),
-        "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
+        "login" | "logout" | "auth" | "usage" | "upgrade" => {
+            Err(removed_auth_surface_error(rest[0].as_str()))
+        }
         "init" => Ok(CliAction::Init { output_format }),
         "export" => parse_export_args(&rest[1..], output_format),
         "prompt" => {
@@ -553,12 +555,28 @@ pub(crate) fn bare_slash_command_guidance(command_name: &str) -> Option<String> 
     Some(guidance)
 }
 
-/// `neuron login` / `neuron logout` run before argument parsing (`auth::account_command`), also
-/// after global options; the parser sees them only in a place they cannot be, such as a prompt.
+/// The account commands (`neuron login`, `logout`, `auth`, `usage`, `upgrade`) run before
+/// argument parsing (`auth::account_command`), also after global options. The parser sees
+/// one only with arguments it does not take, which is usually an unquoted prompt that
+/// starts with its name (`neuron --model m login to the server and fix it`): neither is
+/// guessed.
 pub(crate) fn removed_auth_surface_error(command_name: &str) -> String {
-    format!(
-        "`{command_name}` takes no global options: run `neuron {command_name}` (or `neuron auth {command_name}`) on its own for your Zero-X account. For Anthropic directly, set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead."
-    )
+    let usage = match command_name {
+        "login" => "neuron login [--no-browser | --with-token]",
+        "logout" => "neuron logout",
+        "usage" => "neuron usage",
+        "upgrade" => "neuron upgrade [--no-browser]",
+        _ => "neuron auth <login|logout|status>",
+    };
+    let mut message = format!(
+        "`{command_name}` is a Zero-X account command (`{usage}`) and takes no other arguments. To send a prompt that starts with \"{command_name}\", quote it (`neuron \"{command_name} ...\"`) or use `neuron prompt \"{command_name} ...\"`."
+    );
+    if matches!(command_name, "login" | "logout") {
+        message.push_str(
+            " For Anthropic directly, set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead.",
+        );
+    }
+    message
 }
 
 /// Global flags whose next argument is their value (so it is never mistaken
