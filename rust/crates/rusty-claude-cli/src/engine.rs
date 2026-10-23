@@ -35,11 +35,11 @@ use crate::device_login::{DeviceCode, DeviceLoginObserver};
 use crate::engine_account::{self, SharedAccountCache};
 use crate::engine_reports;
 use crate::error_detail::DetailedError;
+use crate::session_presence::{self, SessionPresence};
 use neuron_tui::protocol::{
     AccountInfo, Attachment, DefinitionInfo, EngineCommand, GitStatus, McpServerInfo, ModelInfo,
-    PermissionReply, PluginInfo, SessionRunStatus, SessionScope, SessionSummary, TokenCounts,
-    TranscriptEntry, UiEvent, CAPABILITY_QUESTIONS, CAPABILITY_REPORTS, ENGINE_FEATURES,
-    PROTOCOL_VERSION,
+    PermissionReply, PluginInfo, SessionScope, TokenCounts, TranscriptEntry, UiEvent,
+    CAPABILITY_QUESTIONS, CAPABILITY_REPORTS, ENGINE_FEATURES, PROTOCOL_VERSION,
 };
 use repl_loop::InterruptPresses;
 use runtime::ui_hooks::{self, UserQuestion};
@@ -336,7 +336,7 @@ impl SignedOut<'_> {
                     models: Vec::new(),
                 }),
                 // The saved chats are there before a sign-in; continuing one needs it.
-                EngineCommand::ListSessions { .. } => self.send(sessions_event("")),
+                EngineCommand::ListSessions { scope } => self.send(sessions_event("", scope)),
                 EngineCommand::Resume { .. } => {
                     self.send(UiEvent::Error {
                         message: "Sign in to Zero-X first (/login) to continue a chat.".into(),
@@ -517,35 +517,15 @@ fn ready_event() -> UiEvent {
     }
 }
 
-/// How many saved chats a session list shows, newest first.
-const SESSION_LIST_LIMIT: usize = 50;
-
-/// This workspace's saved chats; `current` is the one the engine runs (empty for none).
-/// A store that cannot be read lists none.
-fn sessions_event(current: &str) -> UiEvent {
-    let sessions = list_managed_sessions()
-        .unwrap_or_default()
-        .into_iter()
-        .take(SESSION_LIST_LIMIT)
-        .map(|session| SessionSummary {
-            current: session.id == current,
-            id: session.id,
-            title: session.title,
-            model: session.model,
-            message_count: session.message_count,
-            updated_at_ms: session.updated_at_ms,
-            branch: session.branch_name,
-            project: None,
-            git_branch: None,
-            run_status: SessionRunStatus::Idle,
-            failed: false,
-            client: None,
-        })
-        .collect();
+/// The saved chats in `scope` (this workspace's, or every known workspace's), newest
+/// first; `current` is the one the engine runs (empty for none). A store that cannot be
+/// read lists none.
+fn sessions_event(current: &str, scope: SessionScope) -> UiEvent {
+    let cwd = env::current_dir().unwrap_or_default();
     UiEvent::Sessions {
         current: current.to_string(),
-        sessions,
-        scope: SessionScope::Project,
+        sessions: session_presence::list(scope, current, &cwd),
+        scope,
     }
 }
 
@@ -844,6 +824,8 @@ struct Shared {
     structured_questions: AtomicBool,
     /// The UI shows reports as [`UiEvent::Report`] (its `reports` capability).
     report_panels: AtomicBool,
+    /// Which UI this is, as its capabilities named it (`terminal`, `desktop`).
+    client: Mutex<Option<String>>,
     /// Shutdown was requested: commands still queued are dropped.
     closing: AtomicBool,
 }
@@ -946,7 +928,8 @@ fn forward_commands(
                 return;
             }
             // Both take effect at once, also while a turn runs.
-            EngineCommand::Capabilities { features, .. } => {
+            EngineCommand::Capabilities { features, client } => {
+                *lock(&shared.client) = client;
                 let has = |capability: &str| features.iter().any(|feature| feature == capability);
                 shared
                     .structured_questions
@@ -1146,6 +1129,8 @@ struct Engine {
     account_email: Option<String>,
     /// The plan and usage `/api/account` reported, shared with the threads that read it.
     account_cache: SharedAccountCache,
+    /// The session this engine has open, as other Neurons' session lists see it.
+    presence: Option<SessionPresence>,
     /// The UI stopped listening.
     ui_closed: bool,
 }
@@ -1168,6 +1153,7 @@ impl Engine {
             account: AccountState::read(None),
             account_email: None,
             account_cache: SharedAccountCache::default(),
+            presence: None,
             ui_closed: false,
         }
     }
@@ -1258,8 +1244,8 @@ impl Engine {
             | EngineCommand::Capabilities { .. }
             | EngineCommand::Answer { .. } => {}
             EngineCommand::ListModels => self.list_models(),
-            EngineCommand::ListSessions { .. } => {
-                let event = sessions_event(&self.cli.session.id);
+            EngineCommand::ListSessions { scope } => {
+                let event = sessions_event(&self.cli.session.id, scope);
                 self.send(event);
             }
             EngineCommand::Resume { session } => match self.resume(&session) {
@@ -1313,12 +1299,27 @@ impl Engine {
         let prompt = self.with_attachments(prompt, attachments);
         let input = self.wrap_for_mode(&prompt);
         crate::error_detail::clear_model_call_failure();
-        match self.run_turn(&input) {
-            Ok((summary, usage)) => self.report_turn(&summary, usage),
-            Err(message) => self.send(UiEvent::Error {
-                message,
-                detail: crate::error_detail::take_model_call_failure(),
-            }),
+        self.track_session();
+        let client = lock(&self.shared.client).clone();
+        if let Some(presence) = self.presence.as_mut() {
+            presence.turn_started(client);
+        }
+        let failed = match self.run_turn(&input) {
+            Ok((summary, usage)) => {
+                self.report_turn(&summary, usage);
+                false
+            }
+            Err(message) => {
+                self.send(UiEvent::Error {
+                    message,
+                    detail: crate::error_detail::take_model_call_failure(),
+                });
+                true
+            }
+        };
+        if let Some(presence) = self.presence.as_mut() {
+            let branch = runtime::workspace_git_status(&cwd).and_then(|status| git_branch(&status));
+            presence.turn_finished(failed, branch);
         }
         self.finish_turn();
     }
@@ -1526,12 +1527,34 @@ impl Engine {
     /// `Ready`, then the footer's first `Status`, then the conversation of a continued
     /// chat.
     fn announce(&mut self) {
+        if let Ok(cwd) = env::current_dir() {
+            session_presence::record_project(&cwd);
+        }
         self.send(ready_event());
         self.send_status();
         self.announce_account();
         if !self.cli.runtime.session().messages.is_empty() {
             self.send_transcript();
         }
+    }
+
+    /// Holds the session the engine runs now as open (letting go of the one before), so
+    /// other Neurons' session lists show it.
+    fn track_session(&mut self) {
+        let id = &self.cli.session.id;
+        if self
+            .presence
+            .as_ref()
+            .is_some_and(|presence| presence.session_id() == id)
+        {
+            return;
+        }
+        self.presence = None;
+        let Some(dir) = self.cli.session.path.parent() else {
+            return;
+        };
+        let client = lock(&self.shared.client).clone();
+        self.presence = Some(SessionPresence::claim(dir, id, client));
     }
 
     /// A report in the UI's report panel, or as a notice when it has none.
@@ -1550,6 +1573,7 @@ impl Engine {
     }
 
     fn send_status(&mut self) {
+        self.track_session();
         let context_percent =
             u32::try_from(self.cli.runtime.context_snapshot().used_percent()).unwrap_or(u32::MAX);
         // A session on the gateway needs the login; other providers do not.
@@ -1861,9 +1885,9 @@ mod tests {
     use crate::tests::{env_lock, with_current_dir};
     use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
     use neuron_tui::protocol::{
-        EngineCommand, PermissionDecision, PermissionReply, SessionScope, TokenCounts,
-        TranscriptEntry, UiEvent, CAPABILITY_QUESTIONS, CAPABILITY_REPORTS, ENGINE_FEATURES,
-        PROTOCOL_VERSION,
+        EngineCommand, PermissionDecision, PermissionReply, SessionRunStatus, SessionScope,
+        TokenCounts, TranscriptEntry, UiEvent, CAPABILITY_QUESTIONS, CAPABILITY_REPORTS,
+        ENGINE_FEATURES, PROTOCOL_VERSION,
     };
     use runtime::ui_hooks::{self, UserQuestion};
     use runtime::PermissionMode;
@@ -2306,8 +2330,39 @@ mod tests {
                     Some("PARITY_SCENARIO:streaming_text")
                 );
                 assert!(listed.message_count >= 2, "{listed:?}");
+                // Where it belongs and how its turn ended; this engine's own session is
+                // not "open elsewhere".
+                assert_eq!(
+                    listed.project.as_deref(),
+                    Some(workspace.display().to_string().as_str())
+                );
+                assert_eq!(listed.run_status, SessionRunStatus::Idle);
+                assert!(!listed.failed);
+                assert_eq!(listed.git_branch.as_deref(), Some("main"));
             }
             other => panic!("expected the session list, got {other:?}"),
+        }
+        // Every project's chats: this workspace was recorded when the engine started.
+        engine
+            .commands
+            .send(EngineCommand::ListSessions {
+                scope: SessionScope::All,
+            })
+            .unwrap();
+        match events_until(&engine.events, |event| {
+            matches!(event, UiEvent::Sessions { .. })
+        })
+        .pop()
+        {
+            Some(UiEvent::Sessions {
+                scope: SessionScope::All,
+                sessions,
+                ..
+            }) => assert!(
+                sessions.iter().any(|session| session.id == first_session),
+                "{sessions:?}"
+            ),
+            other => panic!("expected every project's sessions, got {other:?}"),
         }
 
         // A tool call that needs approval, approved: it runs.

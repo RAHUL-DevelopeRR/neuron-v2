@@ -70,6 +70,7 @@ mod repl_loop;
 mod repo_map;
 mod reports;
 mod session_mgmt;
+mod session_presence;
 mod shell_pty;
 mod status_ui;
 mod stream_buffer;

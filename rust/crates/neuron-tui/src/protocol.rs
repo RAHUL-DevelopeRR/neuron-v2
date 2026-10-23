@@ -109,6 +109,7 @@ pub const ENGINE_FEATURES: &[&str] = &[
     FEATURE_ERROR_DETAILS,
     FEATURE_ACCOUNT,
     FEATURE_REPORTS,
+    FEATURE_SESSION_SCOPE,
 ];
 
 /// `report` events for the commands that show a report (`/usage`, `/init`, `/memory`,
