@@ -254,14 +254,16 @@ jobs:
           set -euo pipefail
           ext=''
           if [ "$RUNNER_OS" = Windows ]; then ext=.exe; fi
+          dir=ui/neuron-desktop/src-tauri/target/sidecar
+          mkdir -p "$dir"
           built=()
           IFS=, read -ra targets <<< "$RUST_TARGETS"
           for target in "${targets[@]}"; do
             cargo build --manifest-path rust/Cargo.toml --release --locked -p rusty-claude-cli --target "$target"
             built+=("rust/target/$target/release/neuron$ext")
+            # A universal build compiles each architecture, and tauri-build wants each one's sidecar.
+            cp "rust/target/$target/release/neuron$ext" "$dir/neuron-$target$ext"
           done
-          dir=ui/neuron-desktop/src-tauri/target/sidecar
-          mkdir -p "$dir"
           sidecar="$dir/neuron-$SIDECAR$ext"
           if [ "${#built[@]}" -gt 1 ]; then
             lipo -create -output "$sidecar" "${built[@]}"
