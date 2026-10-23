@@ -5,6 +5,12 @@
 //! [`PermissionReply`]. Everything is plain data (serde-serialisable): `neuron engine
 //! --stdio` speaks the same contract as JSON lines, [`ClientMessage`]s in and [`UiEvent`]s
 //! out, starting with [`UiEvent::Ready`].
+//!
+//! Additions after protocol 1 shipped are listed in [`UiEvent::Ready`]'s `features` (see
+//! [`ENGINE_FEATURES`]); fields they add read as their defaults from older engines.
+//! "Protocol v2" is the set of features the account, session-list, report and trust
+//! screens need: [`FEATURE_REPORTS`], [`FEATURE_ACCOUNT`], [`FEATURE_ERROR_DETAILS`],
+//! [`FEATURE_SESSION_SCOPE`], [`FEATURE_TRUST_PREVIEW`] and [`FEATURE_MODEL_IMAGES`].
 
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +73,10 @@ pub struct ModelInfo {
     /// When a `blurred` model is back (ISO 8601).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available_again_at: Option<String>,
+    /// The catalog says the model reads images ([`FEATURE_MODEL_IMAGES`]); `None` when
+    /// it does not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_images: Option<bool>,
 }
 
 /// The Zero-X login, as the UI may show it. Never carries the token.
@@ -97,6 +107,22 @@ pub const ENGINE_FEATURES: &[&str] = &[
     // `list_extensions` and `extensions`.
     "extensions",
 ];
+
+/// `report` events for the commands that show a report (`/usage`, `/init`, `/memory`,
+/// `/doctor`), when the UI takes them ([`CAPABILITY_REPORTS`]).
+pub const FEATURE_REPORTS: &str = "reports";
+/// `account` events and [`EngineCommand::RefreshAccount`].
+pub const FEATURE_ACCOUNT: &str = "account";
+/// [`ErrorDetail`] on `error` events: what a UI needs to offer a way out (sign in again,
+/// upgrade, wait).
+pub const FEATURE_ERROR_DETAILS: &str = "error_details";
+/// [`EngineCommand::ListSessions`] takes a [`SessionScope`], and [`SessionSummary`] says
+/// where each session belongs and whether it runs elsewhere.
+pub const FEATURE_SESSION_SCOPE: &str = "session_scope";
+/// [`EngineCommand::TrustPreview`] and the `trust_preview` event.
+pub const FEATURE_TRUST_PREVIEW: &str = "trust_preview";
+/// `supports_images` on models and on `status`.
+pub const FEATURE_MODEL_IMAGES: &str = "model_images";
 
 /// One configured MCP server and what it is doing now.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,7 +171,35 @@ pub const FEATURE_CAPABILITIES: &str = "capabilities";
 /// [`UiEvent::Question`] instead of a notice starting with "Question:".
 pub const CAPABILITY_QUESTIONS: &str = "questions";
 
-/// One saved chat in this workspace, for a session list.
+/// A UI capability: reports come as [`UiEvent::Report`] instead of a notice.
+pub const CAPABILITY_REPORTS: &str = "reports";
+
+/// Which saved chats [`EngineCommand::ListSessions`] lists.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionScope {
+    /// This workspace's.
+    #[default]
+    Project,
+    /// Every workspace's Neuron has run in on this device, newest first.
+    All,
+}
+
+/// What a saved chat is doing now, as far as this device can tell.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRunStatus {
+    /// No Neuron has it open.
+    #[default]
+    Idle,
+    /// Another Neuron (a terminal UI, the desktop app) has it open and is waiting for a
+    /// prompt.
+    Open,
+    /// Another Neuron is running a turn in it.
+    Running,
+}
+
+/// One saved chat, for a session list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub id: String,
@@ -159,6 +213,128 @@ pub struct SessionSummary {
     pub current: bool,
     /// The branch name of a forked session.
     pub branch: Option<String>,
+    /// The workspace folder it belongs to ([`FEATURE_SESSION_SCOPE`]).
+    #[serde(default)]
+    pub project: Option<String>,
+    /// The git branch when it last ran, when Neuron saw one.
+    #[serde(default)]
+    pub git_branch: Option<String>,
+    /// Whether another Neuron has it open or runs a turn in it. The current session is
+    /// `idle` here: this engine's own state is in `status`.
+    #[serde(default)]
+    pub run_status: SessionRunStatus,
+    /// Its last turn failed.
+    #[serde(default)]
+    pub failed: bool,
+    /// The Neuron that last ran it, as its UI named itself (`terminal`, `desktop`), when
+    /// known.
+    #[serde(default)]
+    pub client: Option<String>,
+}
+
+/// One part of a [`UiEvent::Report`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportSection {
+    pub heading: Option<String>,
+    /// GitHub-flavoured Markdown.
+    pub markdown: String,
+}
+
+/// A link a report offers (the usage dashboard, the plans page).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportLink {
+    pub label: String,
+    pub url: String,
+}
+
+/// Requests and tokens: a plan's daily limits, or what was used today.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageAmounts {
+    pub requests: Option<u64>,
+    pub tokens: Option<u64>,
+}
+
+/// The Zero-X account as the account row, the account menu and the usage panel show it
+/// ([`UiEvent::Account`]). Never carries the token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountDetails {
+    pub email: Option<String>,
+    /// The display name the account gave.
+    pub name: Option<String>,
+    /// The plan's id: `free`, `pro`, `max`, ...
+    pub plan: Option<String>,
+    /// The plan as people read it ("Pro").
+    pub plan_name: Option<String>,
+    /// Where the login comes from: `NEURON_TOKEN`, or the stored login and where it is kept.
+    pub source: String,
+    /// When the session expires (Unix seconds), when the gateway said.
+    pub expires_at: Option<u64>,
+    /// The plan's daily limits.
+    pub limits: Option<UsageAmounts>,
+    /// What was used today, from the account or the last reply's quota headers.
+    pub usage_today: Option<UsageAmounts>,
+    /// When today's usage resets (ISO 8601, UTC).
+    pub resets_at: Option<String>,
+    /// Prepaid credit, in US cents.
+    pub credit_balance_cents: Option<u64>,
+    pub suspended: bool,
+    /// The account dashboard and the plans page, to open in a browser.
+    pub dashboard_url: String,
+    pub pricing_url: String,
+    /// When the plan and usage were last read (Unix seconds); `None` when only the stored
+    /// login is known so far.
+    pub usage_updated_at: Option<u64>,
+    /// Why the plan and usage could not be read, when they could not.
+    pub usage_error: Option<String>,
+}
+
+/// What a failed request needs from the user, for a UI to offer the way out: sign in
+/// again, upgrade, wait for a reset, or retry later ([`FEATURE_ERROR_DETAILS`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorDetail {
+    /// The gateway's code (`invalid_session`, `upgrade_required`, `insufficient_quota`,
+    /// `insufficient_credits`, `rate_limited`, `capacity_exhausted`, `account_suspended`,
+    /// `context_length_exceeded`, ...), `unreachable` when the server could not be
+    /// reached, or `not_available` when it does not offer the call yet (a 404).
+    pub code: String,
+    /// The HTTP status, when there was an answer.
+    pub status: Option<u16>,
+    pub upgrade_url: Option<String>,
+    /// When a quota resets (ISO 8601, UTC).
+    pub resets_at: Option<String>,
+    pub retry_after_seconds: Option<u64>,
+}
+
+/// A hook a workspace's settings would turn on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookPreview {
+    /// `PreToolUse`, `PostToolUse` or `PostToolUseFailure`.
+    pub event: String,
+    /// The command it runs (shortened when long).
+    pub command: String,
+    /// The settings file it comes from.
+    pub source: String,
+}
+
+/// An MCP server a workspace's settings would start.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerPreview {
+    pub name: String,
+    /// `stdio`, `http`, `sse`, `ws`, `sdk` or `managed_proxy`.
+    pub transport: String,
+    /// The program it starts, or the host it connects to; never arguments, environment
+    /// or headers, which can hold secrets.
+    pub target: Option<String>,
+    pub source: String,
+}
+
+/// A permission rule a workspace's settings would add.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionRulePreview {
+    /// `allow` or `ask` (deny rules apply untrusted too).
+    pub effect: String,
+    pub rule: String,
+    pub source: String,
 }
 
 /// One entry of a saved conversation, as a UI rebuilds its transcript from it.
@@ -233,6 +409,10 @@ pub enum UiEvent {
         /// The login, also when its session expired; `None` when there is none.
         #[serde(default)]
         account: Option<AccountInfo>,
+        /// The catalog says the current model reads images ([`FEATURE_MODEL_IMAGES`]);
+        /// `None` when no catalog says. A UI hides its image-paste hint unless `true`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        supports_images: Option<bool>,
     },
     /// After a sign-in from the signed-out start: the engine is opening the session
     /// (plugins, MCP servers), which can take a while. `TurnFinished` and a `Status` with
@@ -298,12 +478,20 @@ pub enum UiEvent {
     /// The turn is over (finished, cancelled or failed).
     TurnFinished,
     /// The turn failed; `message` is what to show.
-    Error { message: String },
-    /// Answer to [`EngineCommand::ListSessions`]: this workspace's saved chats, newest
+    Error {
+        message: String,
+        /// What the failure needs from the user, when a server said
+        /// ([`FEATURE_ERROR_DETAILS`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<ErrorDetail>,
+    },
+    /// Answer to [`EngineCommand::ListSessions`]: the saved chats in `scope`, newest
     /// first.
     Sessions {
         current: String,
         sessions: Vec<SessionSummary>,
+        #[serde(default)]
+        scope: SessionScope,
     },
     /// The conversation of the session the engine now runs, for the UI to show from the
     /// start: after `--resume`, [`EngineCommand::Resume`], `/resume` and `/clear`. Long
@@ -316,7 +504,17 @@ pub enum UiEvent {
     /// [`EngineCommand::TrustWorkspace`] recorded the workspace as trusted. Its own
     /// settings, hooks and MCP servers load when the session starts, so the UI restarts
     /// the engine (`--resume` keeps the chat) when `restart_required`.
-    WorkspaceTrusted { cwd: String, restart_required: bool },
+    WorkspaceTrusted {
+        cwd: String,
+        restart_required: bool,
+        /// The folder trust was recorded for: the git root, or the folder itself.
+        #[serde(default)]
+        root: Option<String>,
+        /// Trusted for this engine only (the home folder): the UI restarts the engine
+        /// with `NEURON_TRUST_WORKSPACE=1` and asks again at the next launch.
+        #[serde(default)]
+        session_only: bool,
+    },
     /// The agent asks the user something (with [`CAPABILITY_QUESTIONS`] on). Answer with
     /// [`EngineCommand::Answer`] and the same `id` (or a plain `Submit`).
     Question {
@@ -354,6 +552,54 @@ pub enum UiEvent {
         skills: Vec<DefinitionInfo>,
         agents: Vec<DefinitionInfo>,
     },
+    /// What a report command (`/usage`, `/init`, `/memory`, `/doctor`) found, for a
+    /// scrollable panel, with [`CAPABILITY_REPORTS`] on; `TurnFinished` follows, as after
+    /// any slash command. `command` is the command's name without the slash.
+    Report {
+        command: String,
+        title: String,
+        sections: Vec<ReportSection>,
+        links: Vec<ReportLink>,
+    },
+    /// The Zero-X account ([`FEATURE_ACCOUNT`]): sent after `Ready` when there is a
+    /// login, again once the plan and usage were read, after `/login` and `/logout`,
+    /// on [`EngineCommand::RefreshAccount`], and after a turn whose quota headers changed
+    /// today's usage. `account` is `None` when there is no login.
+    Account {
+        signed_in: bool,
+        account: Option<AccountDetails>,
+    },
+    /// Answer to [`EngineCommand::TrustPreview`]: what trusting the workspace would turn
+    /// on. Reading it starts nothing.
+    TrustPreview {
+        cwd: String,
+        /// The folder trust would be recorded for: the git root, or the folder itself.
+        root: String,
+        /// `root` is the top folder of a git repository (else it is `cwd`, outside git).
+        is_git_root: bool,
+        /// Trust would last for this engine only (the home folder, or above it).
+        session_only: bool,
+        /// The workspace is trusted already.
+        trusted: bool,
+        /// The workspace's settings files.
+        settings_files: Vec<String>,
+        hooks: Vec<HookPreview>,
+        mcp_servers: Vec<McpServerPreview>,
+        permission_rules: Vec<PermissionRulePreview>,
+        /// Other settings the files would apply, by key (`env`, `model`, `sandbox`, ...).
+        other_settings: Vec<String>,
+    },
+}
+
+impl UiEvent {
+    /// An [`UiEvent::Error`] with nothing for the user to act on beyond its message.
+    #[must_use]
+    pub fn error(message: impl Into<String>) -> Self {
+        Self::Error {
+            message: message.into(),
+            detail: None,
+        }
+    }
 }
 
 /// A file, folder or image the user attached to a prompt.
@@ -385,12 +631,23 @@ pub enum EngineCommand {
     /// Save and stop.
     Shutdown,
     /// What this UI handles (`features` from [`UiEvent::Ready`] lists `capabilities`):
-    /// for now [`CAPABILITY_QUESTIONS`]. Replaces what an earlier one said.
-    Capabilities { features: Vec<String> },
+    /// [`CAPABILITY_QUESTIONS`] and [`CAPABILITY_REPORTS`]. Replaces what an earlier one
+    /// said.
+    Capabilities {
+        features: Vec<String>,
+        /// Which UI this is (`terminal`, `desktop`, ...), recorded with the sessions it
+        /// runs so other UIs can say where a session is open.
+        #[serde(default)]
+        client: Option<String>,
+    },
     /// Answer the [`UiEvent::Question`] with this `id`. A stale id is ignored.
     Answer { id: u64, text: String },
-    /// Ask for this workspace's saved chats ([`UiEvent::Sessions`]).
-    ListSessions,
+    /// Ask for the saved chats in `scope` ([`UiEvent::Sessions`]); engines without
+    /// [`FEATURE_SESSION_SCOPE`] list this workspace's whatever the scope.
+    ListSessions {
+        #[serde(default)]
+        scope: SessionScope,
+    },
     /// Continue a saved chat (an id from [`UiEvent::Sessions`], a path, or `latest`):
     /// a [`UiEvent::Transcript`] and a `Status` follow, or an `Error`.
     Resume { session: String },
@@ -399,6 +656,10 @@ pub enum EngineCommand {
     TrustWorkspace,
     /// Ask for the extensions ([`UiEvent::Extensions`]).
     ListExtensions,
+    /// Ask what trusting the workspace would turn on ([`UiEvent::TrustPreview`]).
+    TrustPreview,
+    /// Read the account's plan and usage again ([`UiEvent::Account`]).
+    RefreshAccount,
 }
 
 /// The user's answer to a permission request.
@@ -527,6 +788,7 @@ mod tests {
                 r#"{"kind":"command","type":"capabilities","features":["questions"]}"#,
                 EngineCommand::Capabilities {
                     features: vec![CAPABILITY_QUESTIONS.into()],
+                    client: None,
                 },
             ),
             (
@@ -538,7 +800,9 @@ mod tests {
             ),
             (
                 r#"{"kind":"command","type":"list_sessions"}"#,
-                EngineCommand::ListSessions,
+                EngineCommand::ListSessions {
+                    scope: SessionScope::Project,
+                },
             ),
             (
                 r#"{"kind":"command","type":"resume","session":"latest"}"#,
@@ -627,5 +891,130 @@ mod tests {
             message
         );
         assert!(serde_json::from_str::<ClientMessage>(r#"{"type":"submit"}"#).is_err());
+    }
+
+    /// Protocol v2's commands as JSON lines, and the fields they add reading as their
+    /// defaults when an older UI leaves them out.
+    #[test]
+    fn v2_commands_round_trip_as_json_lines() {
+        for (line, command) in [
+            (
+                r#"{"kind":"command","type":"list_sessions","scope":"all"}"#,
+                EngineCommand::ListSessions {
+                    scope: SessionScope::All,
+                },
+            ),
+            (
+                r#"{"kind":"command","type":"capabilities","features":["questions","reports"],"client":"desktop"}"#,
+                EngineCommand::Capabilities {
+                    features: vec![CAPABILITY_QUESTIONS.into(), CAPABILITY_REPORTS.into()],
+                    client: Some("desktop".into()),
+                },
+            ),
+            (
+                r#"{"kind":"command","type":"trust_preview"}"#,
+                EngineCommand::TrustPreview,
+            ),
+            (
+                r#"{"kind":"command","type":"refresh_account"}"#,
+                EngineCommand::RefreshAccount,
+            ),
+        ] {
+            let message = ClientMessage::Command(command);
+            assert_eq!(
+                serde_json::from_str::<ClientMessage>(line).unwrap(),
+                message,
+                "{line}"
+            );
+            let written = serde_json::to_string(&message).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ClientMessage>(&written).unwrap(),
+                message
+            );
+        }
+        assert!(serde_json::from_str::<ClientMessage>(
+            r#"{"kind":"command","type":"list_sessions","scope":"galaxy"}"#
+        )
+        .is_err());
+    }
+
+    /// Protocol v2's events survive a round trip, with the tags and field names the UIs
+    /// read.
+    #[test]
+    fn v2_events_round_trip_as_tagged_json() {
+        for event in crate::fake_engine::samples::v2_events() {
+            let json = serde_json::to_value(&event).unwrap();
+            assert_eq!(
+                serde_json::from_value::<UiEvent>(json.clone()).unwrap(),
+                event,
+                "{json}"
+            );
+        }
+
+        let quota = serde_json::to_value(crate::fake_engine::samples::quota_error()).unwrap();
+        assert_eq!(quota["type"], "error");
+        assert_eq!(quota["detail"]["code"], "insufficient_quota");
+        assert_eq!(quota["detail"]["status"], 429);
+        assert_eq!(quota["detail"]["resets_at"], "2026-10-24T00:00:00Z");
+        // A plain error has no `detail` key at all, as before.
+        let plain = serde_json::to_value(UiEvent::error("boom")).unwrap();
+        assert_eq!(
+            plain,
+            serde_json::json!({"type": "error", "message": "boom"})
+        );
+
+        let sessions =
+            serde_json::to_value(crate::fake_engine::samples::sessions(SessionScope::All)).unwrap();
+        assert_eq!(sessions["scope"], "all");
+        assert_eq!(sessions["sessions"][1]["run_status"], "running");
+        assert_eq!(sessions["sessions"][1]["client"], "terminal");
+
+        let preview = serde_json::to_value(crate::fake_engine::samples::trust_preview()).unwrap();
+        assert_eq!(preview["type"], "trust_preview");
+        assert_eq!(preview["mcp_servers"][0]["target"], "uvx");
+        assert_eq!(preview["permission_rules"][0]["effect"], "allow");
+    }
+
+    /// Fields protocol v2 added to protocol 1 events read as their defaults from older
+    /// engines.
+    #[test]
+    fn v2_fields_default_from_older_engines() {
+        let sessions: UiEvent = serde_json::from_str(
+            r#"{"type":"sessions","current":"s1","sessions":[{"id":"s1","title":null,"model":null,"message_count":2,"updated_at_ms":5,"current":true,"branch":null}]}"#,
+        )
+        .unwrap();
+        let UiEvent::Sessions {
+            scope, sessions, ..
+        } = sessions
+        else {
+            panic!("a sessions event");
+        };
+        assert_eq!(scope, SessionScope::Project);
+        assert_eq!(sessions[0].run_status, SessionRunStatus::Idle);
+        assert!(!sessions[0].failed);
+        assert_eq!(sessions[0].project, None);
+
+        let trusted: UiEvent = serde_json::from_str(
+            r#"{"type":"workspace_trusted","cwd":"/repo","restart_required":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            trusted,
+            UiEvent::WorkspaceTrusted {
+                cwd: "/repo".into(),
+                restart_required: true,
+                root: None,
+                session_only: false,
+            }
+        );
+
+        let error: UiEvent = serde_json::from_str(r#"{"type":"error","message":"x"}"#).unwrap();
+        assert_eq!(error, UiEvent::error("x"));
+
+        let model: ModelInfo = serde_json::from_str(
+            r#"{"id":"m","display_name":null,"available":true,"unavailable_reason":null,"context_window":null,"tiers":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(model.supports_images, None);
     }
 }

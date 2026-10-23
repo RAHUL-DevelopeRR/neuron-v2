@@ -34,8 +34,8 @@ use super::*;
 use crate::device_login::{DeviceCode, DeviceLoginObserver};
 use neuron_tui::protocol::{
     AccountInfo, Attachment, DefinitionInfo, EngineCommand, GitStatus, McpServerInfo, ModelInfo,
-    PermissionReply, PluginInfo, SessionSummary, TokenCounts, TranscriptEntry, UiEvent,
-    CAPABILITY_QUESTIONS, ENGINE_FEATURES, PROTOCOL_VERSION,
+    PermissionReply, PluginInfo, SessionRunStatus, SessionScope, SessionSummary, TokenCounts,
+    TranscriptEntry, UiEvent, CAPABILITY_QUESTIONS, ENGINE_FEATURES, PROTOCOL_VERSION,
 };
 use repl_loop::InterruptPresses;
 use runtime::ui_hooks::{self, UserQuestion};
@@ -230,6 +230,7 @@ fn run_engine(
                 Ok(()) => engine.send_transcript(),
                 Err(error) => engine.send(UiEvent::Error {
                     message: format!("could not continue {reference}: {error}"),
+                    detail: None,
                 }),
             }
         }
@@ -321,10 +322,11 @@ impl SignedOut<'_> {
                     models: Vec::new(),
                 }),
                 // The saved chats are there before a sign-in; continuing one needs it.
-                EngineCommand::ListSessions => self.send(sessions_event("")),
+                EngineCommand::ListSessions { .. } => self.send(sessions_event("")),
                 EngineCommand::Resume { .. } => {
                     self.send(UiEvent::Error {
                         message: "Sign in to Zero-X first (/login) to continue a chat.".into(),
+                        detail: None,
                     });
                 }
                 EngineCommand::TrustWorkspace => {
@@ -334,6 +336,11 @@ impl SignedOut<'_> {
                     self.send_status();
                 }
                 EngineCommand::ListExtensions => self.send(extensions_event()),
+                EngineCommand::TrustPreview | EngineCommand::RefreshAccount => {
+                    self.send(UiEvent::error(
+                        "This engine does not support that command yet.",
+                    ));
+                }
             }
         }
         None
@@ -353,6 +360,7 @@ impl SignedOut<'_> {
     fn fail(&self, message: &str) {
         self.send(UiEvent::Error {
             message: message.to_string(),
+            detail: None,
         });
         self.finish();
     }
@@ -469,6 +477,7 @@ fn status_event(
         signed_in: account.signed_in,
         sign_in_required,
         account: account.info.clone(),
+        supports_images: None,
     }
 }
 
@@ -499,11 +508,17 @@ fn sessions_event(current: &str) -> UiEvent {
             message_count: session.message_count,
             updated_at_ms: session.updated_at_ms,
             branch: session.branch_name,
+            project: None,
+            git_branch: None,
+            run_status: SessionRunStatus::Idle,
+            failed: false,
+            client: None,
         })
         .collect();
     UiEvent::Sessions {
         current: current.to_string(),
         sessions,
+        scope: SessionScope::Project,
     }
 }
 
@@ -615,6 +630,8 @@ fn trust_workspace_events() -> Vec<UiEvent> {
             UiEvent::WorkspaceTrusted {
                 cwd: cwd.display().to_string(),
                 restart_required: true,
+                root: None,
+                session_only: false,
             },
             UiEvent::Notice {
                 message: format!(
@@ -624,8 +641,7 @@ fn trust_workspace_events() -> Vec<UiEvent> {
             },
         ],
         Err(error) => vec![UiEvent::Error {
-            message: format!("could not trust {}: {error}", cwd.display()),
-        }],
+            message: format!("could not trust {}: {error}", cwd.display()), detail: None }],
     }
 }
 
@@ -901,7 +917,7 @@ fn forward_commands(
                 return;
             }
             // Both take effect at once, also while a turn runs.
-            EngineCommand::Capabilities { features } => {
+            EngineCommand::Capabilities { features, .. } => {
                 let questions = features
                     .iter()
                     .any(|feature| feature == CAPABILITY_QUESTIONS);
@@ -1142,6 +1158,7 @@ impl Engine {
                             "internal error: {}",
                             repl_loop::panic_message(payload.as_ref())
                         ),
+                        detail: None,
                     });
                     self.finish_turn();
                     self.persist();
@@ -1175,6 +1192,7 @@ impl Engine {
                 }
                 Err(error) => self.send(UiEvent::Error {
                     message: error.to_string(),
+                    detail: None,
                 }),
             },
             // The command thread hands interrupts to the running turn; one that gets here
@@ -1184,7 +1202,7 @@ impl Engine {
             | EngineCommand::Capabilities { .. }
             | EngineCommand::Answer { .. } => {}
             EngineCommand::ListModels => self.list_models(),
-            EngineCommand::ListSessions => {
+            EngineCommand::ListSessions { .. } => {
                 let event = sessions_event(&self.cli.session.id);
                 self.send(event);
             }
@@ -1196,6 +1214,7 @@ impl Engine {
                 }
                 Err(error) => self.send(UiEvent::Error {
                     message: error.to_string(),
+                    detail: None,
                 }),
             },
             EngineCommand::TrustWorkspace => {
@@ -1205,6 +1224,11 @@ impl Engine {
                 self.send_status();
             }
             EngineCommand::ListExtensions => self.send(extensions_event()),
+            EngineCommand::TrustPreview | EngineCommand::RefreshAccount => {
+                self.send(UiEvent::error(
+                    "This engine does not support that command yet.",
+                ));
+            }
             EngineCommand::Shutdown => return Step::Stop,
         }
         Step::Continue
@@ -1229,7 +1253,10 @@ impl Engine {
         let input = self.wrap_for_mode(&prompt);
         match self.run_turn(&input) {
             Ok((summary, usage)) => self.report_turn(&summary, usage),
-            Err(message) => self.send(UiEvent::Error { message }),
+            Err(message) => self.send(UiEvent::Error {
+                message,
+                detail: None,
+            }),
         }
         self.finish_turn();
     }
@@ -1345,6 +1372,7 @@ impl Engine {
         if let Err(error) = result {
             self.send(UiEvent::Error {
                 message: error.to_string(),
+                detail: None,
             });
         }
         self.finish_turn();
@@ -1500,6 +1528,7 @@ impl Engine {
                         tiers: model.tiers.clone(),
                         status: model.status.clone(),
                         available_again_at: model.available_again_at.clone(),
+                        supports_images: None,
                     })
                     .collect()
             })
@@ -1731,8 +1760,8 @@ mod tests {
     use crate::tests::{env_lock, with_current_dir};
     use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
     use neuron_tui::protocol::{
-        EngineCommand, PermissionDecision, PermissionReply, TokenCounts, TranscriptEntry, UiEvent,
-        CAPABILITY_QUESTIONS, ENGINE_FEATURES, PROTOCOL_VERSION,
+        EngineCommand, PermissionDecision, PermissionReply, SessionScope, TokenCounts,
+        TranscriptEntry, UiEvent, CAPABILITY_QUESTIONS, ENGINE_FEATURES, PROTOCOL_VERSION,
     };
     use runtime::ui_hooks::{self, UserQuestion};
     use runtime::PermissionMode;
@@ -2052,9 +2081,15 @@ mod tests {
             .commands
             .send(EngineCommand::Capabilities {
                 features: vec![CAPABILITY_QUESTIONS.into()],
+                client: None,
             })
             .unwrap();
-        engine.commands.send(EngineCommand::ListSessions).unwrap();
+        engine
+            .commands
+            .send(EngineCommand::ListSessions {
+                scope: SessionScope::Project,
+            })
+            .unwrap();
         events_until(&engine.events, |event| {
             matches!(event, UiEvent::Sessions { .. })
         });
@@ -2097,6 +2132,7 @@ mod tests {
             .commands
             .send(EngineCommand::Capabilities {
                 features: Vec::new(),
+                client: None,
             })
             .unwrap();
 
@@ -2130,13 +2166,20 @@ mod tests {
         );
 
         // The session list has this chat, current, titled by its first prompt.
-        engine.commands.send(EngineCommand::ListSessions).unwrap();
+        engine
+            .commands
+            .send(EngineCommand::ListSessions {
+                scope: SessionScope::Project,
+            })
+            .unwrap();
         match events_until(&engine.events, |event| {
             matches!(event, UiEvent::Sessions { .. })
         })
         .pop()
         {
-            Some(UiEvent::Sessions { current, sessions }) => {
+            Some(UiEvent::Sessions {
+                current, sessions, ..
+            }) => {
                 assert_eq!(current, first_session);
                 let listed = sessions
                     .iter()
@@ -2285,7 +2328,8 @@ mod tests {
             without_notices(&turn_events(&engine.events)),
             vec![
                 UiEvent::Error {
-                    message: "/vim is not available in the full-screen UI yet.".into()
+                    message: "/vim is not available in the full-screen UI yet.".into(),
+                    detail: None
                 },
                 UiEvent::TurnFinished,
             ]
