@@ -39,8 +39,10 @@ impl From<ConfigError> for PromptBuildError {
 
 /// Marker separating static prompt scaffolding from dynamic runtime context.
 pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__";
-/// Human-readable default frontier model name embedded into generated prompts.
-pub const FRONTIER_MODEL_NAME: &str = "Claude Opus 4.6";
+/// The environment section's heading; [`set_prompt_model`] finds the section by it.
+const ENVIRONMENT_HEADING: &str = "# Environment context";
+/// The environment line that names the model in use.
+const MODEL_LINE_PREFIX: &str = " - Model: ";
 const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
 const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
 /// The git snapshots are taken once per session and sent to the provider with
@@ -120,6 +122,8 @@ pub struct SystemPromptBuilder {
     output_style_prompt: Option<String>,
     os_name: Option<String>,
     os_version: Option<String>,
+    /// The model in use, as people read it; the prompt names no model without one.
+    model: Option<String>,
     append_sections: Vec<String>,
     project_context: Option<ProjectContext>,
     config: Option<RuntimeConfig>,
@@ -142,6 +146,14 @@ impl SystemPromptBuilder {
     pub fn with_os(mut self, os_name: impl Into<String>, os_version: impl Into<String>) -> Self {
         self.os_name = Some(os_name.into());
         self.os_version = Some(os_version.into());
+        self
+    }
+
+    /// Names the model in use in the environment section. Without it the prompt names
+    /// no model: a model told it is another one may introduce itself wrongly.
+    #[must_use]
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
         self
     }
 
@@ -202,9 +214,11 @@ impl SystemPromptBuilder {
             || "unknown".to_string(),
             |context| context.current_date.clone(),
         );
-        let mut lines = vec!["# Environment context".to_string()];
+        let mut lines = vec![ENVIRONMENT_HEADING.to_string()];
+        if let Some(model) = self.model.as_deref().and_then(model_line) {
+            lines.push(model);
+        }
         lines.extend(prepend_bullets(vec![
-            format!("Model family: {FRONTIER_MODEL_NAME}"),
             format!("Working directory: {cwd}"),
             format!("Date: {date}"),
             format!(
@@ -219,6 +233,34 @@ impl SystemPromptBuilder {
         ]));
         lines.join("\n")
     }
+}
+
+/// The environment line naming `model`, or `None` for a blank name.
+fn model_line(model: &str) -> Option<String> {
+    let model = model.trim();
+    (!model.is_empty()).then(|| format!("{MODEL_LINE_PREFIX}{model}"))
+}
+
+/// Names `model` (as people read it) in an already built prompt's environment section,
+/// replacing the model it named before; `None` leaves no model named. The prompt is
+/// built once per session and kept across model switches, so whoever builds a runtime
+/// for a model applies it.
+pub fn set_prompt_model(sections: &mut [String], model: Option<&str>) {
+    let Some(section) = sections
+        .iter_mut()
+        .find(|section| section.starts_with(ENVIRONMENT_HEADING))
+    else {
+        return;
+    };
+    let mut lines: Vec<String> = section
+        .lines()
+        .filter(|line| !line.starts_with(MODEL_LINE_PREFIX))
+        .map(str::to_string)
+        .collect();
+    if let Some(line) = model.and_then(model_line) {
+        lines.insert(1, line);
+    }
+    *section = lines.join("\n");
 }
 
 /// Formats each item as an indented bullet for prompt sections.
@@ -417,7 +459,7 @@ fn render_project_context(project_context: &ProjectContext) -> String {
 }
 
 fn render_instruction_files(files: &[ContextFile]) -> String {
-    let mut sections = vec!["# Claude instructions".to_string()];
+    let mut sections = vec!["# Project instructions".to_string()];
     let mut remaining_chars = MAX_TOTAL_INSTRUCTION_CHARS;
     for file in files {
         if remaining_chars == 0 {
@@ -646,8 +688,9 @@ fn get_actions_section() -> String {
 mod tests {
     use super::{
         collapse_blank_lines, display_context_path, normalize_instruction_content,
-        render_instruction_content, render_instruction_files, truncate_instruction_content,
-        ContextFile, ProjectContext, SystemPromptBuilder, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        render_instruction_content, render_instruction_files, set_prompt_model,
+        truncate_instruction_content, ContextFile, ProjectContext, SystemPromptBuilder,
+        SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
     use crate::config::ConfigLoader;
     use std::fs;
@@ -1119,7 +1162,7 @@ mod tests {
 
         assert!(prompt.contains("# System"));
         assert!(prompt.contains("# Project context"));
-        assert!(prompt.contains("# Claude instructions"));
+        assert!(prompt.contains("# Project instructions"));
         assert!(prompt.contains("Project rules"));
         assert!(prompt.contains("Configured permission mode: workspace-write"));
         assert!(!prompt.contains("\"permissionMode\""));
@@ -1194,7 +1237,7 @@ mod tests {
             path: PathBuf::from("/tmp/project/CLAUDE.md"),
             content: "Project rules".to_string(),
         }]);
-        assert!(rendered.contains("# Claude instructions"));
+        assert!(rendered.contains("# Project instructions"));
         assert!(rendered.contains("scope: /tmp/project"));
         assert!(rendered.contains("Project rules"));
     }
@@ -1251,6 +1294,75 @@ mod tests {
             instruction_chars <= 12_000 + 200,
             "total budget exceeded: {instruction_chars}"
         );
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    /// The prompt names the model in use, and only that one: every other model is told
+    /// nothing about which model it is, rather than a wrong name.
+    #[test]
+    fn the_prompt_names_the_model_in_use_or_none() {
+        for model in ["GLM 5.2 (glm-5.2)", "DeepSeek R1 (deepseek-r1)"] {
+            let prompt = SystemPromptBuilder::new()
+                .with_os("linux", "6.8")
+                .with_model(model)
+                .render();
+            assert!(
+                prompt.contains(&format!("\n - Model: {model}\n")),
+                "{prompt}"
+            );
+            for brand in ["Claude", "Anthropic"] {
+                assert!(!prompt.contains(brand), "{brand} in the prompt for {model}");
+            }
+        }
+        let unnamed = SystemPromptBuilder::new().with_os("linux", "6.8").render();
+        assert!(!unnamed.contains(" - Model: "), "{unnamed}");
+        assert!(!unnamed.contains("Model family"));
+
+        let mut sections = SystemPromptBuilder::new()
+            .with_os("linux", "6.8")
+            .with_model("glm-5.2")
+            .build();
+        set_prompt_model(&mut sections, Some("deepseek-r1"));
+        let switched = sections.join("\n\n");
+        assert!(switched.contains(" - Model: deepseek-r1\n"));
+        assert!(!switched.contains("glm-5.2"));
+        set_prompt_model(&mut sections, None);
+        assert!(!sections.join("\n\n").contains(" - Model: "));
+        set_prompt_model(&mut sections, Some("  "));
+        assert!(!sections.join("\n\n").contains(" - Model: "));
+    }
+
+    /// With project files and settings loaded, a GLM or DeepSeek session's prompt carries
+    /// neither brand: compatibility files keep their names only as paths.
+    #[test]
+    fn a_rendered_prompt_for_glm_and_deepseek_is_brand_clean() {
+        let root = temp_dir();
+        fs::create_dir_all(root.join(".neuron")).expect("neuron dir");
+        fs::write(root.join("NEURON.md"), "Run the tests before committing.").expect("write");
+        fs::write(
+            root.join(".neuron").join("settings.json"),
+            r#"{"permissionMode":"acceptEdits"}"#,
+        )
+        .expect("write settings");
+        let project_context =
+            ProjectContext::discover(&root, "2026-10-23").expect("context should load");
+        let config = ConfigLoader::new(&root, root.join("missing-home"))
+            .load()
+            .expect("config should load");
+        for model in ["glm-5.2", "deepseek-r1"] {
+            let prompt = SystemPromptBuilder::new()
+                .with_os("linux", "6.8")
+                .with_model(model)
+                .with_project_context(project_context.clone())
+                .with_runtime_config(config.clone())
+                .render()
+                // The temporary folder's path is the machine's, not the prompt's words.
+                .replace(&root.display().to_string(), "<workspace>");
+            assert!(prompt.contains("# Project instructions"));
+            for brand in ["Claude", "Anthropic", "claude-code"] {
+                assert!(!prompt.contains(brand), "{brand} in the prompt for {model}");
+            }
+        }
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 

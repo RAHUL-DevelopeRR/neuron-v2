@@ -155,6 +155,27 @@ impl Catalog {
     }
 }
 
+/// How the system prompt names `model`: the catalog's display name with the id, or the
+/// id alone. `None` for `auto`, which picks a model per request, so the prompt names
+/// none rather than a wrong one.
+pub fn prompt_model_name(model: &str) -> Option<String> {
+    let id = crate::provider::shown_model(model).trim();
+    if id.is_empty() || id.eq_ignore_ascii_case(crate::provider::AUTO_MODEL) {
+        return None;
+    }
+    let display = current().and_then(|catalog| {
+        catalog
+            .find(id)
+            .and_then(|entry| entry.display_name.clone())
+    });
+    Some(match display {
+        Some(name) if !name.trim().is_empty() && !name.trim().eq_ignore_ascii_case(id) => {
+            format!("{} ({id})", name.trim())
+        }
+        _ => id.to_string(),
+    })
+}
+
 /// Parses the `GET /v1/models` body.
 pub fn parse_catalog(value: &Value) -> Result<Vec<CatalogModel>, String> {
     let data = value
