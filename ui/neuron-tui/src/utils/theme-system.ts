@@ -1,6 +1,7 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: both
-// themes use NeuronCLI's brand palette (BRAND in utils/logo.ts), and the logo
-// takes its colours from utils/logo.ts. See ui/neuron-tui/PORTING.md.
+// themes use NeuronCLI's brand palette (BRAND in utils/logo.ts), borders
+// included, and the logo takes its colours from utils/logo.ts.
+// See ui/neuron-tui/PORTING.md.
 import { existsSync, readFileSync, readdirSync, statSync, watch } from 'fs'
 import { homedir } from 'os'
 import { dirname, join } from 'path'
@@ -698,7 +699,8 @@ const DEFAULT_CHAT_THEMES: Record<ThemeName, ChatTheme> = {
     foreground: '#DCDCE6',
     background: 'transparent',
     muted: '#acb3bf',
-    border: '#536175',
+    // Brand blue: 4.0:1 on black (the grey it replaces was 3.3:1).
+    border: BRAND.blue,
     surface: '#202327',
     surfaceHover: '#334155',
 
@@ -765,7 +767,9 @@ const DEFAULT_CHAT_THEMES: Record<ThemeName, ChatTheme> = {
     foreground: '#111827',
     background: 'transparent',
     muted: '#6b7280',
-    border: '#d1d5db',
+    // A lighter tint of the brand blue: 3.9:1 on white, softer than the
+    // primary blue text but as visible as a frame needs to be.
+    border: '#5B7FD0',
     surface: '#f3f4f6',
     surfaceHover: '#e5e7eb',
 

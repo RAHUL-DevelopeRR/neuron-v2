@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { fitParts, footerParts, formatGit } from '../engine-footer'
+import { MODEL_MIN_WIDTH, fitParts, footerParts, formatGit } from '../engine-footer'
 import {
   fitModelRow,
   modelRows,
@@ -314,7 +314,36 @@ describe('engine footer', () => {
     expect(fitParts(parts, 5)).toEqual([])
   })
 
-  test('at 120 columns with the token counters the plan stays and the email goes', () => {
+  test('at 120 columns a long model id is cut short before the email is dropped', () => {
+    // The e2e footer: before, the email was the first part to go.
+    const status: StatusEvent = {
+      ...STATUS,
+      model: 'nvidia/nvidia/nemotron-3-ultra-550b-a55b',
+      workspace_trusted: false,
+      git: { branch: 'main', changed: 0, staged: 0, unstaged: 0, untracked: 0, conflicted: 0 },
+      context_percent: 0,
+      account: { ...STATUS.account!, plan: 'max', email: 'rahul@zero-x.live' },
+    }
+    const usage = {
+      turn: { input: 10, output: 5, cache_read: 0, cache_write: 0 },
+      cumulative: { input: 3_600, output: 39, cache_read: 0, cache_write: 0 },
+      estimated: false,
+    }
+    // The footer box draws in the width less its 2 columns of padding.
+    const shown = fitParts(footerParts(status, usage), 118).map((part) => part.text)
+    expect(shown).toEqual([
+      'nvidia/nvidia/nemotron-3-ultra-…',
+      'workspace-write',
+      'untrusted folder',
+      'main',
+      'ctx 0%',
+      'Zero-X max',
+      'rahul@zero-x.live',
+    ])
+    expect(shown.join(' · ').length).toBeLessThanOrEqual(118)
+  })
+
+  test('the email outlasts the git and token parts, and the model is never cut below its minimum', () => {
     const status: StatusEvent = {
       ...STATUS,
       model: 'nvidia/nvidia/nemotron-3-ultra-550b-a55b',
@@ -327,12 +356,17 @@ describe('engine footer', () => {
       cumulative: { input: 19_100, output: 646, cache_read: 0, cache_write: 0 },
       estimated: false,
     }
-    // The footer box draws in the width less its 2 columns of padding.
     const shown = fitParts(footerParts(status, usage), 118).map((part) => part.text)
+    expect(shown).toContain('someone.long@example.com')
     expect(shown).toContain('Zero-X free')
-    expect(shown).toContain('↑19.1K ↓646')
-    expect(shown).not.toContain('someone.long@example.com')
-    // In their own order.
-    expect(shown.at(-1)).toBe('Zero-X free')
+    expect(shown).not.toContain('↑19.1K ↓646')
+    expect(shown[0]!.endsWith('…')).toBe(true)
+    expect(shown[0]!.length).toBeGreaterThanOrEqual(MODEL_MIN_WIDTH)
+    expect(shown.join(' · ').length).toBeLessThanOrEqual(118)
+
+    // Too narrow for the plan next to even the shortest model id: the plan goes.
+    const narrow = fitParts(footerParts(status, usage), 20).map((part) => part.text)
+    expect(narrow).toEqual(['nvidia/nvidia/nemot…'])
+    expect(fitParts(footerParts(status, usage), 5)).toEqual([])
   })
 })

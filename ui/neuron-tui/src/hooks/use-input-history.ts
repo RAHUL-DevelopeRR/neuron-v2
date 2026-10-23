@@ -1,9 +1,14 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: a `!cmd`
+// history entry reopens bash mode only when shell commands are implemented
+// (USER_SHELL_AVAILABLE); until then it comes back as the prompt it is.
+// See ui/neuron-tui/PORTING.md.
 import { useRef, useCallback, useEffect } from 'react'
 
 import {
   loadMessageHistory,
   saveMessageHistory,
 } from '../utils/message-history'
+import { USER_SHELL_AVAILABLE } from '../utils/user-shell'
 
 import type { InputValue } from '../types/store'
 import type { InputMode } from '../utils/input-modes'
@@ -17,7 +22,7 @@ function parseHistoryItem(item: string): {
   mode: InputMode
   displayText: string
 } {
-  if (item.startsWith('!') && item.length > 1) {
+  if (USER_SHELL_AVAILABLE && item.startsWith('!') && item.length > 1) {
     // It's a bash command - strip the '!' prefix for display
     return { mode: 'bash', displayText: item.slice(1) }
   }

@@ -1,4 +1,6 @@
-// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
+// cursor is the theme's colour everywhere (it was lime, #00FF00, wherever
+// COLORTERM was unset: every Windows console, in the light theme too).
 // See ui/neuron-tui/PORTING.md.
 import {
   decodePasteBytes,
@@ -28,7 +30,6 @@ import {
   isLinefeedActingAsEnter,
   markReturnKeySeenForKey,
 } from '../utils/terminal-enter-detection'
-import { supportsTruecolor } from '../utils/theme-system'
 import { calculateNewCursorPosition } from '../utils/word-wrap-utils'
 
 import type { InputValue } from '../types/store'
@@ -1225,7 +1226,9 @@ export const MultilineInput = forwardRef<
                 visible={true}
                 focused={focused}
                 shouldBlink={effectiveShouldBlinkCursor}
-                color={supportsTruecolor() ? theme.info : 'lime'}
+                // OpenTUI draws a colour name as its RGB value too ('lime'
+                // is #00FF00), so a name was no fallback for anything.
+                color={theme.info}
                 key={lastActivity}
               />
             )}

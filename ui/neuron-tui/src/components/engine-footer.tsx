@@ -5,7 +5,9 @@
  *
  * Parts that don't fit the width are dropped, least important first (see
  * {@link FooterPart.priority}): the model and the Zero-X plan stay longest,
- * the account's email goes first.
+ * then the mode, an untrusted folder and the signed-in email; the token
+ * counters go first. A long model id is cut short ("…") before any part but
+ * the token counters is dropped.
  */
 
 import React from 'react'
@@ -22,9 +24,12 @@ export interface FooterPart {
   tone: FooterTone
   /** Lower stays longer when the line is too narrow. */
   priority: number
+  /** The fewest columns it may be cut to, with "…"; unset when it is never cut. */
+  minWidth?: number
 }
 
 const SEPARATOR = ' · '
+const ELLIPSIS = '…'
 
 /** Which parts stay when they don't all fit: lowest first. */
 const PRIORITY = {
@@ -32,11 +37,20 @@ const PRIORITY = {
   account: 1,
   mode: 2,
   untrusted: 3,
-  context: 4,
-  git: 5,
-  tokens: 6,
-  email: 7,
+  email: 4,
+  context: 5,
+  git: 6,
+  tokens: 7,
 } as const
+
+/**
+ * Parts at least this important have the model id cut short to fit them;
+ * less important ones (the token counters) only take the room that is left.
+ */
+const CUT_MODEL_FOR = PRIORITY.git
+
+/** A model id is not cut below this: the provider and the start of its name. */
+export const MODEL_MIN_WIDTH = 16
 
 /** `main +1 ~2 ?3 !1`: staged, unstaged, untracked, conflicted (non-zero only). */
 export function formatGit(git: GitStatus): string {
@@ -67,7 +81,12 @@ export function footerParts(
 ): FooterPart[] {
   if (!status) return []
   const parts: FooterPart[] = [
-    { text: status.model, tone: 'normal', priority: PRIORITY.model },
+    {
+      text: status.model,
+      tone: 'normal',
+      priority: PRIORITY.model,
+      minWidth: Math.min(status.model.length, MODEL_MIN_WIDTH),
+    },
   ]
   parts.push({
     text: status.plan_mode ? `${status.permission_mode} · plan` : status.permission_mode,
@@ -118,24 +137,62 @@ export function footerParts(
   return parts
 }
 
+/** `text` in `width` columns: unchanged when it fits, else cut with "…". */
+function cut(text: string, width: number): string {
+  if (text.length <= width) return text
+  return width <= 1 ? ELLIPSIS.slice(0, width) : text.slice(0, width - 1) + ELLIPSIS
+}
+
 /**
  * The parts that fit in `width` columns with their separators, in their
  * order: the most important ones first, then each less important one that
- * still fits.
+ * still fits. A part down to the email that does not fit has the cuttable
+ * parts (the model id) cut short for it, down to their minimum.
  */
 export function fitParts(parts: FooterPart[], width: number): FooterPart[] {
   const byImportance = parts
     .map((part, index) => ({ part, index }))
     .sort((a, b) => a.part.priority - b.part.priority || a.index - b.index)
-  const kept = new Set<number>()
+  /** The width each kept part is drawn in. */
+  const kept = new Map<number, number>()
   let used = 0
-  for (const { part, index } of byImportance) {
-    const cost = (kept.size > 0 ? SEPARATOR.length : 0) + part.text.length
-    if (used + cost > width) continue
-    kept.add(index)
-    used += cost
+  const room = (index: number) => {
+    const part = parts[index]!
+    return (kept.get(index) ?? part.text.length) - (part.minWidth ?? part.text.length)
   }
-  return parts.filter((_, index) => kept.has(index))
+  for (const { part, index } of byImportance) {
+    const separator = kept.size > 0 ? SEPARATOR.length : 0
+    const full = part.text.length
+    let over = used + separator + full - width
+    if (over <= 0) {
+      kept.set(index, full)
+      used += separator + full
+      continue
+    }
+    if (part.priority > CUT_MODEL_FOR) continue
+    // The part itself (a model id alone) and the kept cuttable parts.
+    const own = full - (part.minWidth ?? full)
+    const others = [...kept.keys()].filter((other) => room(other) > 0)
+    const available = own + others.reduce((sum, other) => sum + room(other), 0)
+    if (available < over) continue
+    for (const other of others) {
+      if (over <= 0) break
+      const take = Math.min(room(other), over)
+      kept.set(other, kept.get(other)! - take)
+      used -= take
+      over -= take
+    }
+    const drawn = full - Math.max(0, over)
+    kept.set(index, drawn)
+    used += separator + drawn
+  }
+  return parts
+    .map((part, index) => ({ part, index }))
+    .filter(({ index }) => kept.has(index))
+    .map(({ part, index }) => {
+      const drawn = kept.get(index)!
+      return drawn < part.text.length ? { ...part, text: cut(part.text, drawn) } : part
+    })
 }
 
 export const EngineFooter = ({ width }: { width: number }) => {

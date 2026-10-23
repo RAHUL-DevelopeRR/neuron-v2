@@ -1,8 +1,11 @@
-// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
-// See ui/neuron-tui/PORTING.md.
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
+// terminal reset no longer blanks the window title. The exit path gives the
+// console its own title (and font) back right before the exit message
+// (exit-cleanly.ts); the process 'exit' handler and the fatal-error path do it
+// too, for exits that skip it. See ui/neuron-tui/PORTING.md.
 import { execFile } from 'child_process'
 
-import { resetTerminalTitle } from './terminal-title'
+import { restoreConsoleAtExit } from './console-guard'
 import { stopActiveRun } from './active-run'
 import { getCliEnv } from './env'
 import { exitCliCleanly, registerExitCleanup } from './exit-cleanly'
@@ -107,8 +110,6 @@ function resetTerminalStateOnce(): boolean {
     // Ignore errors - stdin may already be closed
   }
   try {
-    // Reset terminal title to default
-    resetTerminalTitle()
     if (!process.stdout.isTTY) return true
 
     // Only the first reset leaves the alternate screen: a later one (the
@@ -199,6 +200,11 @@ export function exitCliWithFatalError(label: string, error: unknown): never {
   if (resetCompletedSynchronously) {
     stopTerminalWatchdog()
   }
+  try {
+    restoreConsoleAtExit()
+  } catch {
+    // The title is a nicety; the error report is not.
+  }
   reportFatalErrorSync(label, error)
   process.exit(1)
 }
@@ -287,6 +293,12 @@ export function installProcessCleanupHandlers(cliRenderer: CliRenderer): void {
     // to repair the terminal after this process disappears.
     if (cleanup()) {
       stopTerminalWatchdog()
+    }
+    // Done already when the exit went through exitCliCleanly.
+    try {
+      restoreConsoleAtExit()
+    } catch {
+      // Best-effort at the very end.
     }
   })
 

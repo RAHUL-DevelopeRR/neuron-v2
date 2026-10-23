@@ -1,4 +1,7 @@
-// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: prompts
+// and slash commands the UI does not have go to the engine, and a `!cmd`
+// prompt is a shell command only when shell commands are implemented
+// (USER_SHELL_AVAILABLE); until then it goes to the agent like any prompt.
 // See ui/neuron-tui/PORTING.md.
 import {
   dispatchSkillPrompt,
@@ -34,7 +37,7 @@ import {
   hasProcessingImages,
   validateAndAddImage,
 } from '../utils/pending-attachments'
-import { runUserShellCommand } from '../utils/user-shell'
+import { USER_SHELL_AVAILABLE, runUserShellCommand } from '../utils/user-shell'
 
 /**
  * Run a bash command with automatic ghost/direct mode selection.
@@ -334,7 +337,7 @@ export async function routeUserPrompt(
   }
 
   // Handle bash commands from queue (starts with '!')
-  if (trimmed.startsWith('!') && trimmed.length > 1) {
+  if (USER_SHELL_AVAILABLE && trimmed.startsWith('!') && trimmed.length > 1) {
     const command = trimmed.slice(1)
     saveToHistory(trimmed)
     setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false })

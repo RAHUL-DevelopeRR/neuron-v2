@@ -1,13 +1,18 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: exit no
 // longer flushes analytics, client logs, ad engagement or survey pings, ends a
 // Freebuff session, or settles a sponsored run. It shuts the engine down
-// instead, before the renderer's teardown, and prints the exit message (the
-// --continue hint) once the screen is restored. See ui/neuron-tui/PORTING.md.
+// instead, before the renderer's teardown, gives the console its own title
+// (and font) back, and prints the exit message (the --continue hint) once the
+// screen is restored. It exits 1 when the engine crashed during the session,
+// and stops reading the keyboard once the quit is asked for.
+// See ui/neuron-tui/PORTING.md.
 import { writeFileSync, writeSync } from 'fs'
 
 import { withTimeoutOr } from '@neuron-tui/common/util/promise'
 
+import { restoreConsoleAtExit } from './console-guard'
 import { writeTerminalControlSync } from './terminal-io'
+import { engineCrashedThisSession } from '../engine/engine-session'
 import { getNeuronEngineClient } from '../engine/neuron-engine-client'
 
 const EXIT_CLEANUP_TIMEOUT_MS = 1_000
@@ -29,6 +34,21 @@ type ExitCliDependencies = {
   printExitMessage?: () => Promise<void> | void
   /** The shortest wait before the renderer's teardown, alongside the engine's stop. */
   beforeTeardown?: () => Promise<void>
+  /** Give the console its own title (and font) back, right before the message. */
+  restoreConsole?: () => void
+  /** The code to exit with for the one asked for (a crashed engine makes 0 a 1). */
+  exitCodeFor?: (requested: number) => number
+  /**
+   * Stop reading the keyboard, as soon as the quit is asked for: keys typed
+   * during the exit then stay in the console for the shell, instead of the
+   * UI swallowing the start of the user's next command.
+   */
+  stopReadingInput?: () => void
+}
+
+/** A quit that would exit 0 exits 1 after the engine crashed during the session. */
+export function exitCodeAfterSession(requested: number, engineCrashed: boolean): number {
+  return requested === 0 && engineCrashed ? 1 : requested
 }
 
 let localExitCleanup: (() => void) | undefined
@@ -66,6 +86,12 @@ export function createExitCliCleanly(deps: ExitCliDependencies) {
   return (exitCode = 0): Promise<void> => {
     if (exitPromise) return exitPromise
 
+    try {
+      deps.stopReadingInput?.()
+    } catch {
+      // The quit goes ahead either way.
+    }
+
     // Start on the next microtask so exitPromise is assigned before any cleanup
     // callback can re-enter this function.
     exitPromise = Promise.resolve().then(async () => {
@@ -95,6 +121,11 @@ export function createExitCliCleanly(deps: ExitCliDependencies) {
         } catch {
           // Cleanup is best-effort; never strand the process in a half-exited UI.
         }
+        try {
+          deps.restoreConsole?.()
+        } catch {
+          // The title is a nicety too.
+        }
         // Awaited only when there is one. A lost message never stops the exit.
         if (deps.printExitMessage) {
           try {
@@ -104,7 +135,13 @@ export function createExitCliCleanly(deps: ExitCliDependencies) {
           }
         }
       } finally {
-        deps.exit(exitCode)
+        let code = exitCode
+        try {
+          code = deps.exitCodeFor?.(exitCode) ?? exitCode
+        } catch {
+          // Exit with the code asked for.
+        }
+        deps.exit(code)
       }
     })
 
@@ -125,6 +162,13 @@ export const exitCliCleanly = createExitCliCleanly({
     )
   },
   exit: (code) => process.exit(code),
+  // The renderer stays up and in raw mode until its teardown; only the reading
+  // stops. Its teardown pauses stdin again, which is harmless.
+  stopReadingInput: () => {
+    process.stdin.pause()
+  },
+  exitCodeFor: (code) => exitCodeAfterSession(code, engineCrashedThisSession()),
+  restoreConsole: () => restoreConsoleAtExit(),
   beforeTeardown: () =>
     new Promise((resolve) => setTimeout(resolve, EXIT_TEARDOWN_MIN_WAIT_MS)),
   printExitMessage: async () => {

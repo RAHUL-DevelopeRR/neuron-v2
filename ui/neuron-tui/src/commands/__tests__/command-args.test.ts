@@ -1,9 +1,11 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the login,
-// logout, usage, feedback and publish command cases went with those commands.
-// See ui/neuron-tui/PORTING.md.
+// logout, usage, feedback and publish command cases went with those commands,
+// and /bash is checked as BASH_COMMAND (it is not registered while shell
+// commands are not implemented). See ui/neuron-tui/PORTING.md.
 import { describe, test, expect, mock } from 'bun:test'
 
 import {
+  BASH_COMMAND,
   COMMAND_REGISTRY,
   defineCommand,
   defineCommandWithArgs,
@@ -170,8 +172,8 @@ describe('command factory pattern', () => {
 
     test('expected commands accept args', () => {
       // mode:* commands also accept args now
+      expect(BASH_COMMAND.acceptsArgs).toBe(true)
       const expectedWithArgs = [
-        'bash',
         'image',
         'new',
         'export',

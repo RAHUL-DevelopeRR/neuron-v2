@@ -22,6 +22,11 @@ export interface EngineStoreState {
   version: string | null
   /** Why the engine is not running, after it failed to start or stopped. */
   error: string | null
+  /**
+   * That reason is already a line in the chat (or on the turn that was
+   * running), so the status bar does not repeat it.
+   */
+  errorInChat: boolean
   status: StatusEvent | null
   models: ModelsEvent | null
   usage: Omit<UsageEvent, 'type'> | null
@@ -43,7 +48,12 @@ export interface EngineStoreState {
    */
   signIn: (SignInCodeEvent & { receivedAt: number; approved: boolean }) | null
 
-  setConnection: (connection: EngineConnection, error?: string | null) => void
+  /** `errorInChat`: the chat already shows `error` (see {@link EngineStoreState.errorInChat}). */
+  setConnection: (
+    connection: EngineConnection,
+    error?: string | null,
+    errorInChat?: boolean,
+  ) => void
   setReady: (version: string) => void
   setStatus: (status: StatusEvent) => void
   setModels: (models: ModelsEvent) => void
@@ -76,6 +86,7 @@ const initial = {
   connection: 'not_started' as EngineConnection,
   version: null,
   error: null,
+  errorInChat: false,
   status: null,
   models: null,
   usage: null,
@@ -88,10 +99,13 @@ const initial = {
 export const useEngineStore = create<EngineStoreState>()(
   immer((set) => ({
     ...initial,
-    setConnection: (connection, error) =>
+    setConnection: (connection, error, errorInChat = false) =>
       set((state) => {
         state.connection = connection
-        if (error !== undefined) state.error = error
+        if (error !== undefined) {
+          state.error = error
+          state.errorInChat = error !== null && errorInChat
+        }
         if (connection === 'exited') {
           state.permissionQueue = []
           state.pendingQuestion = null
@@ -104,6 +118,7 @@ export const useEngineStore = create<EngineStoreState>()(
         state.connection = 'ready'
         state.version = version
         state.error = null
+        state.errorInChat = false
       }),
     setStatus: (status) =>
       set((state) => {

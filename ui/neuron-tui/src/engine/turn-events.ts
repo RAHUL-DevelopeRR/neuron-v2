@@ -11,6 +11,7 @@
 
 import { useEngineStore } from '../state/engine-store'
 import { closeNativeReasoningBlock } from '../utils/block-operations'
+import { updateToolBlockWithOutput } from '../utils/message-block-helpers'
 import {
   createEventHandler,
   createStreamChunkHandler,
@@ -56,7 +57,19 @@ export interface TurnEventSink {
 
 type OpenCall = { id: string; name: string; toolName: string }
 
-export function createTurnEventSink(state: EventHandlerState): TurnEventSink {
+export interface TurnEventSinkOptions {
+  /**
+   * Whether a tool result that arrives after the turn stopped being drawn
+   * (it was interrupted) still goes to its call's row: the engine reports how
+   * the running command ended ("interrupted", with what it printed).
+   */
+  acceptLateToolResults?: () => boolean
+}
+
+export function createTurnEventSink(
+  state: EventHandlerState,
+  options: TurnEventSinkOptions = {},
+): TurnEventSink {
   const chunk = createStreamChunkHandler(state)
   const sdk = createEventHandler(state)
   // Results carry their call's id. Older engines named only the tool, so
@@ -109,6 +122,20 @@ export function createTurnEventSink(state: EventHandlerState): TurnEventSink {
   }
 
   const close = (call: OpenCall, output: string, isError: boolean) => {
+    if (state.isActive?.() === false) {
+      // The turn was interrupted: only its row is updated, nothing that
+      // belongs to the run (streaming state, agents) any more.
+      if (options.acceptLateToolResults?.()) {
+        updater.updateAiMessageBlocks((blocks) =>
+          updateToolBlockWithOutput(blocks, {
+            toolCallId: call.id,
+            toolOutput: mapToolResult(call.name, output, isError),
+            isError,
+          }),
+        )
+      }
+      return
+    }
     // `isError` reaches the tool block, so a refused write or a failed
     // command does not read like a success.
     const result: ToolResultWithStatus = {
@@ -222,7 +249,12 @@ export function createTurnEventSink(state: EventHandlerState): TurnEventSink {
       }
     },
     finish() {
-      for (const call of open.splice(0)) close(call, NO_RESULT_MESSAGE, true)
+      // An interrupted turn's calls without a result were marked
+      // "interrupted" when it stopped: they did not fail for want of one.
+      const calls = open.splice(0)
+      if (state.isActive?.() !== false) {
+        for (const call of calls) close(call, NO_RESULT_MESSAGE, true)
+      }
       // An interrupted turn leaves its question unanswered.
       if (questionCount > 0) updater.updateAiMessageBlocks(markUnansweredQuestions)
     },

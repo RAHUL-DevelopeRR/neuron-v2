@@ -12,14 +12,21 @@ import { consoleSafeText } from '../utils/glyphs'
 import { logger } from '../utils/logger'
 import { getSystemMessage } from '../utils/message-history'
 import {
+  existingCurrentChatDir,
+  recordChatEngineSession,
+} from '../utils/run-state-storage'
+import { afterConsoleCommand } from '../utils/console-guard'
+import {
   getNeuronEngineClient,
   setNeuronEngineClient,
+  type EngineExit,
   type EngineLaunchOptions,
 } from './neuron-engine-client'
 import { QUESTION_PREFIX } from './questions'
+import { engineSessionOf, withEngineSession } from './session-run-state'
 import { StdioEngineClient } from './stdio-engine-client'
 
-import type { UiEvent } from './protocol'
+import type { StatusEvent, UiEvent } from './protocol'
 
 export { QUESTION_PREFIX }
 
@@ -168,6 +175,25 @@ function markTurnFailed(): void {
   removeNotices(turnRetryNotices)
 }
 
+/**
+ * The engine's session goes into the chat's run state as soon as the engine
+ * names it, not when a turn completes: a chat whose only turn was interrupted
+ * must still resume it on `--continue` (see session-run-state.ts).
+ */
+export function recordEngineSessionInChat(status: StatusEvent): void {
+  const session = engineSessionOf(status)
+  if (!session) return
+  const chat = useChatStore.getState()
+  if (chat.runState) {
+    const next = withEngineSession(chat.runState, session)
+    if (next !== chat.runState) chat.setRunState(next)
+  }
+  // Only a chat that is already saved (a prompt was sent) is written: an
+  // empty one stays unsaved, and no chat directory is created for it.
+  const chatDir = existingCurrentChatDir()
+  if (chatDir) recordChatEngineSession(session, chatDir)
+}
+
 export function handleEngineEvent(event: UiEvent): void {
   const engine = useEngineStore.getState()
   switch (event.type) {
@@ -176,6 +202,7 @@ export function handleEngineEvent(event: UiEvent): void {
       return
     case 'status':
       engine.setStatus(event)
+      recordEngineSessionInChat(event)
       // A revoked stored login still reads as signed in while the engine
       // waits for a sign-in: that is not the end of one.
       if (event.signed_in && !needsSignIn(event)) engine.setSignIn(null)
@@ -218,10 +245,17 @@ export function handleEngineEvent(event: UiEvent): void {
         showSystemMessage(`Error: ${inUiWording(event.message)}`)
       }
       return
+    case 'tool_result':
+      // The tool ran in the user's console: a command's cmd.exe retitled the
+      // window ("npm test"), a PowerShell changed its font. Put them back.
+      afterConsoleCommand()
+      return
     case 'turn_finished':
       // Nothing waits for an answer once the turn is over (a `/login` ends
       // with one too, signed in or not), and "Interrupting…" is over too.
-      // A turn that ended well keeps its retry notices.
+      // A turn that ended well keeps its retry notices. Its hooks ran in the
+      // console too (see tool_result).
+      afterConsoleCommand()
       engine.clearPermissions()
       engine.setPendingQuestion(null)
       engine.setSignIn(null)
@@ -275,15 +309,10 @@ async function launchEngineSession(launch: EngineLaunchOptions): Promise<void> {
   client.subscribe(handleEngineEvent)
   client.onExit((exit) => {
     if (getNeuronEngineClient() !== client) return
-    // No turn runs in an engine that stopped; one that was running failed.
-    dropTurnScopedNotices()
-    if (turnActive) markTurnFailed()
-    const wasReady = useEngineStore.getState().connection === 'ready'
-    const reason =
-      client.lastError ?? `The Neuron engine stopped (exit code ${exit.code}).`
-    useEngineStore.getState().setConnection('exited', reason)
-    // A failed start is reported by the catch below; this is a later stop.
-    if (wasReady && exit.code !== 0) showSystemMessage(reason)
+    handleEngineExit(exit, {
+      lastError: client.lastError,
+      stopRequested: client.stopRequested,
+    })
   })
 
   try {
@@ -291,9 +320,54 @@ async function launchEngineSession(launch: EngineLaunchOptions): Promise<void> {
   } catch (error) {
     if (getNeuronEngineClient() !== client) return
     const message = error instanceof Error ? error.message : String(error)
-    useEngineStore.getState().setConnection('exited', message)
+    useEngineStore.getState().setConnection('exited', message, true)
     showSystemMessage(message)
   }
+}
+
+/** The exit code of an engine that quit on its own after two interrupts. */
+const FORCED_QUIT_EXIT_CODE = 130
+
+let engineCrashed = false
+
+/**
+ * An engine stopped during this UI session without being asked to, after it
+ * was ready. The UI then exits non-zero (1), also when it was quit normally.
+ */
+export function engineCrashedThisSession(): boolean {
+  return engineCrashed
+}
+
+/** Test seam: forget an earlier crash. */
+export function resetEngineCrashForTesting(): void {
+  engineCrashed = false
+}
+
+/**
+ * The engine process ended. A stop the UI did not ask for, after the engine
+ * was ready, is said once: on the turn that was running (its message says
+ * "exited during the turn"), else as a chat line; the status bar then only
+ * says the engine is not running. A failed start is reported by its caller.
+ */
+export function handleEngineExit(
+  exit: EngineExit,
+  options: { lastError: string | null; stopRequested: boolean },
+): void {
+  // No turn runs in an engine that stopped; one that was running failed, and
+  // its message says so.
+  const turnShowsIt = turnActive && turnMessageId !== null
+  dropTurnScopedNotices()
+  if (turnActive) markTurnFailed()
+  const engine = useEngineStore.getState()
+  const wasReady = engine.connection === 'ready'
+  const reason =
+    options.lastError ?? `The Neuron engine stopped (exit code ${exit.code}).`
+  const unexpected =
+    wasReady && !options.stopRequested && (exit.code !== 0 || exit.signal !== null)
+  if (unexpected && exit.code !== FORCED_QUIT_EXIT_CODE) engineCrashed = true
+  const shownInChat = unexpected && !turnShowsIt
+  engine.setConnection('exited', reason, unexpected)
+  if (shownInChat) showSystemMessage(reason)
 }
 
 export async function stopEngineSession(): Promise<void> {
