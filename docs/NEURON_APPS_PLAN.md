@@ -301,39 +301,81 @@ machine.
 ### Phase A: this branch (draft PR)
 
 - [x] The engine audit and this plan.
-- [x] `ui/neuron-client`: protocol, reducer, diffs, controller, stdio transport, host, remote
-  transport, and PTY terminals. 48 tests, including 5 against the real engine and the mock
-  service: a turn with a write, approve, deny, parallel calls, and two clients steering one
-  engine.
-- [x] `ui/neuron-desktop` MVP (installs approved by Rahul, 2026-10-22).
-  - chat with streaming, the permission dialog, tool cards with diffs
-  - a file tree, a Changes panel, a terminal pane, the model picker, sign-in (device code), a
-    status bar
-  - 13 `bun test`s: 11 component tests, and 2 end-to-end tests of the whole app on the real engine
-    and the mock
-  - 7 `cargo test`s for `src-tauri`, one of them a real approval turn through the bridge on the
-    mock
-  - Not yet driven end to end inside the Tauri window. The app starts and its window starts the
-    engine. WebView2's DevTools port never opened on this machine, so the full turn was checked
-    in the browser build, which runs the same UI over the host.
+- [x] `ui/neuron-client`.
+  - protocol, reducer, diffs, controller, stdio transport, host, remote transport, PTY terminals
+  - E1's events and commands; on the host, `fs.search`, `git.status`/`git.diff` and
+    `engine.restart`
+  - 64 tests, 6 of them against the real engine and the mock service: a write, an approval
+    approved and one denied, parallel calls, two clients steering one engine, and chat history
+    (list, resume, restore)
+- [x] `ui/neuron-desktop`: a working desktop app (installs approved by Rahul, 2026-10-22).
+  - It matches the coding-agent desktop features users see, in Neuron's own code and look (no
+    vendor code or design copied). See "Desktop features" below.
+  - 25 `bun test`s: 22 component tests, and 3 end-to-end tests of the whole app on the real
+    engine: an approval; a write in the side panel and the tree; and chat history, a new chat
+    then back to the first.
+  - `cargo test` for `src-tauri` covers the engine bridge on the mock, workspace bounds, the PTY,
+    git scoping and safety, and recent projects.
+  - Not yet driven end to end inside the Tauri window. WebView2's DevTools port never opened on
+    this machine, so the full flows were checked in the browser build, which runs the same UI
+    over the host.
 - [x] `ui/neuron-mobile` skeleton.
-  - pair, watch, approve or deny, send, interrupt
-  - 4 `bun test`s
+  - pair; watch; approve or deny; answer the agent's questions; see the task list and sub-agents;
+    switch the computer's chat; send; interrupt
+  - 5 `bun test`s
   - checked in react-native-web against the mock, including a reconnect while an approval was
     pending
 
-### Phase E1: protocol for many front ends (engine, Rust)
+### Desktop features
 
-- `list_sessions`, then `sessions {items}`.
-- `resume {session}` from the UI.
-- `get_transcript`, so an engine can rebuild a client's view after `--resume`.
-- `trust_workspace`, after which the UI restarts the engine.
-- Structured events, keeping the notice as a fallback for older UIs:
-  - `question {id, text, options}` and `answer {id, text}`
-  - `todos {items}`
-  - `subagent_started` / `subagent_finished`
-  - `task_output` for background bash
-- Tests in `engine.rs` against the mock service, and in `ui/neuron-client`.
+- **Sidebar:**
+  - the project, and switching to another folder (with recent projects)
+  - New chat (Ctrl+N)
+  - the project's chats grouped by day and searchable; one click resumes a chat and its
+    conversation comes back
+- **Composer:**
+  - `@` file mentions, searched in the workspace and sent as attachments
+  - the slash-command menu
+  - a mode menu: read only, edit files, full access, plan
+  - the model menu, and Stop
+- **Transcript:**
+  - streamed Markdown, reasoning
+  - tool cards with diffs and diffstats
+  - the agent's questions as cards with option buttons
+  - sub-agents on their Agent calls
+  - copy buttons on replies and code
+- **Side panel (Ctrl+B):**
+  - Changes: git status of the open folder with each file's diff, or one tool call's diff
+  - Files: tree and preview
+  - Tasks: the agent's task list and its running sub-agents
+  - Terminal: a real shell
+- **Also:**
+  - approvals in a dialog: y, a, n, e
+  - trust and restart, keeping the chat
+  - Zero-X sign-in with a device code
+  - Settings (Ctrl+,): theme, the send key, reasoning, folding
+- **Still to come:**
+  - images
+  - a native folder picker (needs `tauri-plugin-dialog`, which needs Rahul's OK)
+  - several chats running at once
+  - the extensions panel (E2)
+  - a source-control pane that stages and commits (E6)
+
+### Phase E1: protocol for many front ends (engine, Rust): done
+
+- `ready.features` lists what an engine adds, so a UI sends new commands only to engines that
+  take them.
+- `list_sessions` gives `sessions` with a title (the first prompt), model, size and age. `resume`
+  continues a chat.
+- A `transcript` event comes after `--resume`, `resume`, `/resume` and `/clear`.
+- `trust_workspace` gives `workspace_trusted`. The UI then restarts the engine, which `--resume`
+  keeps on the same chat.
+- Questions are structured behind the `questions` capability: `question {id, question, options}`,
+  answered by `answer {id, text}`. Without the capability the TUI keeps the "Question:" notice.
+- `todos` after TodoWrite.
+- `subagent_started` / `subagent_finished`, from a new `tool_started` hook on the runtime's tool
+  executor.
+- Left for later: `task_output` for background bash.
 
 ### Phase E2: extensions inventory
 

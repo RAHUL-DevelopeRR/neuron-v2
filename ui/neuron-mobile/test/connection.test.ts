@@ -111,4 +111,34 @@ describe('the phone on a host', () => {
     expect(failure).toBe('The pairing token is not right.')
     expect(await connect(host!.url, '  ').catch((error: Error) => error.message)).toBe('Enter the pairing token from the Neuron host.')
   })
+
+  test("answers the agent's question and switches the computer's chat", async () => {
+    const engine = await startHost()
+    const { controller } = await connect(host!.url, 'phone-pairing-token')
+    controllers.push(controller)
+    engine.emit({ type: 'question', id: 5, question: 'Which branch?', options: ['main', 'dev'] })
+    const deadline = Date.now() + 5_000
+    const waitFor = async (label: string, ok: () => boolean) => {
+      while (!ok()) {
+        if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`)
+        await Bun.sleep(10)
+      }
+    }
+    await waitFor('the question', () => controller.getState().items.some((item) => item.kind === 'question'))
+    controller.answer(5, 'dev')
+    await waitFor('the answer', () => engine.sent.some((message) => message.kind === 'command' && message.type === 'answer'))
+    expect(engine.sent.at(-1)).toEqual({ kind: 'command', type: 'answer', id: 5, text: 'dev' })
+
+    controller.listSessions()
+    await waitFor('the chat list request', () => engine.sent.some((message) => message.kind === 'command' && message.type === 'list_sessions'))
+    engine.emit({
+      type: 'sessions',
+      current: 's',
+      sessions: [{ id: 'old', title: 'Fix the build', model: null, message_count: 3, updated_at_ms: 1, current: false, branch: null }],
+    })
+    await waitFor('the chats', () => controller.getState().sessions?.length === 1)
+    controller.resume('old')
+    await waitFor('the resume', () => engine.sent.some((message) => message.kind === 'command' && message.type === 'resume'))
+    expect(engine.sent.at(-1)).toEqual({ kind: 'command', type: 'resume', session: 'old' })
+  })
 })

@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   FlatList,
   KeyboardAvoidingView,
@@ -11,7 +11,17 @@ import {
   View,
 } from 'react-native'
 
-import { formatTokens, needsSignIn, openQuestion, type PendingPermission, type TranscriptItem } from '@neuron/client'
+import {
+  FEATURE_SESSIONS,
+  formatTokens,
+  hasFeature,
+  needsSignIn,
+  openQuestionItem,
+  type PendingPermission,
+  type SessionSummary,
+  type TodoItem,
+  type TranscriptItem,
+} from '@neuron/client'
 
 import type { Connection } from '../connection'
 import { colors, mono } from '../theme'
@@ -33,11 +43,18 @@ export function SessionScreen({ connection, onLeave }: { connection: Connection;
   const { controller, transport } = connection
   const state = useSession(controller)
   const [text, setText] = useState('')
+  const [chatsOpen, setChatsOpen] = useState(false)
   const list = useRef<FlatList<TranscriptItem>>(null)
   const status = state.status
   const permission = state.permissions[0] ?? null
-  const question = openQuestion(state)
+  const question = openQuestionItem(state)
   const ready = state.connection === 'ready'
+  const history = hasFeature(state, FEATURE_SESSIONS)
+
+  // The computer's chats, kept fresh after each turn.
+  useEffect(() => {
+    if (ready && history && !state.busy) controller.listSessions()
+  }, [controller, ready, history, state.busy, status?.session_id])
 
   const send = () => {
     if (!text.trim() || !ready) return
@@ -65,6 +82,11 @@ export function SessionScreen({ connection, onLeave }: { connection: Connection;
             {status.model}
           </Text>
         ) : null}
+        {history && (
+          <Pressable accessibilityRole="button" accessibilityLabel="Chats" onPress={() => setChatsOpen(!chatsOpen)} style={styles.leave}>
+            <Text style={styles.leaveText}>Chats</Text>
+          </Pressable>
+        )}
         <Pressable accessibilityRole="button" accessibilityLabel="Leave" onPress={onLeave} style={styles.leave}>
           <Text style={styles.leaveText}>Leave</Text>
         </Pressable>
@@ -77,19 +99,37 @@ export function SessionScreen({ connection, onLeave }: { connection: Connection;
         <Text style={[styles.banner, styles.bannerError]}>{state.connectionError ?? 'Disconnected from the Neuron host.'}</Text>
       )}
 
+      {chatsOpen && (
+        <ChatsSheet
+          sessions={state.sessions ?? []}
+          current={status?.session_id ?? null}
+          busy={state.busy}
+          onNew={() => {
+            setChatsOpen(false)
+            controller.newChat()
+          }}
+          onPick={(id) => {
+            setChatsOpen(false)
+            controller.resume(id)
+          }}
+        />
+      )}
+
       <FlatList
         ref={list}
         style={styles.transcript}
         contentContainerStyle={{ padding: 12, paddingBottom: 24 }}
         data={state.items}
         keyExtractor={(item) => item.key}
-        renderItem={({ item }) => <Row item={item} />}
+        renderItem={({ item }) => <Row item={item} onAnswer={(id, answer) => controller.answer(id, answer)} />}
         onContentSizeChange={() => list.current?.scrollToEnd({ animated: false })}
         ListEmptyComponent={<Text style={styles.empty}>Nothing in this session yet. Send a prompt, or wait for the computer to start one.</Text>}
         ListFooterComponent={state.busy ? <Text style={styles.working}>working…</Text> : undefined}
       />
 
       {permission && <PermissionSheet key={permission.id} pending={permission} onAnswer={(decision) => controller.answerPermission(permission.id, decision)} />}
+
+      {state.todos.length > 0 && <TasksStrip todos={state.todos} />}
 
       <View style={styles.composer}>
         {question && <Text style={styles.questionHint}>Answering Neuron's question</Text>}
@@ -121,7 +161,66 @@ export function SessionScreen({ connection, onLeave }: { connection: Connection;
   )
 }
 
-function Row({ item }: { item: TranscriptItem }) {
+function ChatsSheet({
+  sessions,
+  current,
+  busy,
+  onNew,
+  onPick,
+}: {
+  sessions: SessionSummary[]
+  current: string | null
+  busy: boolean
+  onNew: () => void
+  onPick: (id: string) => void
+}) {
+  const shown = sessions.filter((session) => session.message_count > 0 || session.id === current)
+  return (
+    <View style={styles.sheet} accessibilityLabel="Chats on the computer">
+      <Pressable accessibilityRole="button" style={[styles.sheetButton, styles.allow]} onPress={onNew} disabled={busy}>
+        <Text style={styles.sendText}>+ New chat</Text>
+      </Pressable>
+      <ScrollView style={{ maxHeight: 260 }}>
+        {shown.map((session) => (
+          <Pressable
+            key={session.id}
+            accessibilityRole="button"
+            style={[styles.chatRow, session.id === current && styles.chatRowCurrent]}
+            disabled={busy || session.id === current}
+            onPress={() => onPick(session.id)}
+          >
+            <Text style={styles.text} numberOfLines={1}>
+              {session.title ?? 'Untitled chat'}
+            </Text>
+            <Text style={styles.dim}>{session.message_count} messages</Text>
+          </Pressable>
+        ))}
+      </ScrollView>
+    </View>
+  )
+}
+
+function TasksStrip({ todos }: { todos: TodoItem[] }) {
+  const [open, setOpen] = useState(false)
+  const done = todos.filter((todo) => todo.status === 'completed').length
+  const now = todos.find((todo) => todo.status === 'in_progress')
+  return (
+    <Pressable accessibilityRole="button" accessibilityLabel="Tasks" style={styles.tasks} onPress={() => setOpen(!open)}>
+      <Text style={styles.tasksTitle}>
+        Tasks {done}/{todos.length}
+        {now ? <Text style={styles.dim}> · {now.active_form ?? now.content}</Text> : null}
+      </Text>
+      {open &&
+        todos.map((todo, index) => (
+          <Text key={index} style={[styles.text, todo.status === 'completed' && styles.todoDone]}>
+            {todo.status === 'completed' ? '✓' : todo.status === 'in_progress' ? '▸' : '○'} {todo.content}
+          </Text>
+        ))}
+    </Pressable>
+  )
+}
+
+function Row({ item, onAnswer }: { item: TranscriptItem; onAnswer: (id: number, answer: string) => void }) {
   switch (item.kind) {
     case 'user':
       return (
@@ -139,14 +238,15 @@ function Row({ item }: { item: TranscriptItem }) {
       return <Text style={styles.dim}>{item.streaming ? 'Thinking…' : 'Reasoned'}</Text>
     case 'tool': {
       const diff = item.view.diff
+      const subagent = item.subagent
       return (
         <View style={styles.tool}>
           <Text style={styles.toolHead} numberOfLines={2}>
-            <Text style={styles.toolVerb}>{item.view.verb} </Text>
-            <Text style={styles.toolTarget}>{item.view.target}</Text>
+            <Text style={styles.toolVerb}>{subagent ? `Sub-agent${subagent.type ? ` (${subagent.type})` : ''} ` : `${item.view.verb} `}</Text>
+            <Text style={styles.toolTarget}>{subagent?.description ?? item.view.target}</Text>
           </Text>
           <Text style={[styles.toolState, item.state === 'awaiting_permission' && { color: colors.warning }]}>
-            {TOOL_STATE[item.state]}
+            {subagent?.running ? 'working' : TOOL_STATE[item.state]}
             {diff ? `  +${diff.added} −${diff.removed}` : ''}
           </Text>
         </View>
@@ -155,8 +255,17 @@ function Row({ item }: { item: TranscriptItem }) {
     case 'question':
       return (
         <View style={styles.question}>
-          <Text style={styles.questionLabel}>Neuron asks</Text>
+          <Text style={styles.questionLabel}>{item.answered ? 'Neuron asked' : 'Neuron asks'}</Text>
           <Text style={styles.text}>{item.text}</Text>
+          {!item.answered && item.id !== undefined && (item.options?.length ?? 0) > 0 && (
+            <View style={styles.sheetButtons}>
+              {item.options!.map((option) => (
+                <Pressable key={option} accessibilityRole="button" style={styles.sheetButton} onPress={() => onAnswer(item.id!, option)}>
+                  <Text style={styles.text}>{option}</Text>
+                </Pressable>
+              ))}
+            </View>
+          )}
         </View>
       )
     case 'notice':
@@ -268,4 +377,9 @@ const styles = StyleSheet.create({
   stop: { backgroundColor: 'transparent', borderWidth: 1, borderColor: colors.warning },
   stopText: { color: colors.warning, fontWeight: '600' },
   disabled: { opacity: 0.5 },
+  chatRow: { paddingVertical: 8, paddingHorizontal: 6, borderRadius: 6 },
+  chatRowCurrent: { backgroundColor: colors.sunken },
+  tasks: { backgroundColor: colors.panel, borderTopWidth: 1, borderTopColor: colors.border, paddingHorizontal: 12, paddingVertical: 8 },
+  tasksTitle: { color: colors.warning, fontWeight: '600' },
+  todoDone: { color: colors.textDim, textDecorationLine: 'line-through' },
 })
