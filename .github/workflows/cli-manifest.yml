@@ -1,0 +1,251 @@
+name: CLI manifest
+
+# Writes releases/cli/latest.json, which the CLI's update notice (T23) and the
+# downloads page read. It describes the release that install.sh and install.ps1
+# install, the one GitHub marks "Latest", so release.yml never changes for it.
+#
+# When it runs:
+# - When Release finishes (workflow_run). release.yml publishes with the
+#   repository token, whose events start no other workflow, and marks a release
+#   latest only after its install checks, so this is the run that sees a new
+#   release. Prereleases never become latest, so they never reach the manifest.
+# - When a CLI release (vX.Y.Z) is published by hand (release: published).
+# - By hand (workflow_dispatch): a dry run unless dry_run is unchecked; `tag`
+#   describes that release instead of the latest one (rollback, see
+#   docs/RELEASING.md).
+# - On a pull request that changes this file: a dry run.
+#
+# A dry run builds and checks the manifest and keeps it as a workflow artifact.
+# Until a CLI release exists it describes a fixture release, so the same code
+# still runs. A real run then uploads it to the R2 bucket behind
+# https://zero-x.live/releases/, from a job that holds the bucket keys and runs
+# in the `release-manifests` environment. Without the keys it stops with a
+# notice.
+
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: CLI release tag to describe, e.g. v6.3.0 (default the release marked Latest)
+        required: false
+        default: ''
+      dry_run:
+        description: Build and check the manifest without uploading it
+        type: boolean
+        default: true
+  pull_request:
+    paths:
+      - .github/workflows/cli-manifest.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  # Real runs queue one after another; pull request dry runs do not wait for them.
+  group: cli-manifest-${{ github.event_name == 'pull_request' && github.ref || 'publish' }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build releases/cli/latest.json
+    if: >-
+      github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' ||
+      (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v') && !github.event.release.prerelease) ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
+    runs-on: ubuntu-latest
+    outputs:
+      dry_run: ${{ steps.mode.outputs.dry_run }}
+      version: ${{ steps.manifest.outputs.version }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG_INPUT: ${{ inputs.tag }}
+      DOWNLOAD_PAGE_URL: ${{ vars.DOWNLOAD_PAGE_URL || 'https://zero-x.live/download' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Choose dry run or upload
+        id: mode
+        env:
+          DRY_RUN_INPUT: ${{ inputs.dry_run }}
+        run: |
+          dry_run=false
+          if [ "$GITHUB_EVENT_NAME" = pull_request ] || { [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ "$DRY_RUN_INPUT" = true ]; }; then
+            dry_run=true
+          fi
+          echo "dry_run=$dry_run" >> "$GITHUB_OUTPUT"
+          echo "event $GITHUB_EVENT_NAME, dry run: $dry_run"
+
+      - name: Find the release
+        id: release
+        env:
+          DRY_RUN: ${{ steps.mode.outputs.dry_run }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/release"
+          mkdir -p "$work"
+          latest="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || true)"
+          tag="${TAG_INPUT:-$latest}"
+
+          if [ -z "$tag" ]; then
+            if [ "$DRY_RUN" != true ]; then
+              echo "::error::No release is marked Latest, so there is no CLI release to describe."
+              exit 1
+            fi
+            # Before the first CLI release: a fixture with release.yml's asset names.
+            version="$(python3 -c 'import tomllib; print(tomllib.load(open("rust/Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+            tag="v$version"
+            echo "::notice::No release is marked Latest yet, so this dry run describes a fixture release $tag."
+            jq -n --arg tag "$tag" --arg url "https://github.com/$GITHUB_REPOSITORY/releases/tag/$tag" \
+              '{tagName: $tag, isDraft: false, isPrerelease: false, publishedAt: (now | todate), url: $url}' > "$work/release.json"
+            for name in neuron-linux-x64 neuron-linux-arm64 neuron-macos-arm64 neuron-macos-x64 neuron-windows-x64.exe \
+              neuron-tui-linux-x64 neuron-tui-linux-arm64 neuron-tui-macos-arm64 neuron-tui-macos-x64 neuron-tui-windows-x64.exe \
+              install.sh install.ps1 THIRD_PARTY_NOTICES.md; do
+              printf '%s  %s\n' "$(printf 'fixture %s' "$name" | sha256sum | cut -d ' ' -f 1)" "$name"
+            done > "$work/SHA256SUMS"
+            exit 0
+          fi
+
+          case "$tag" in
+            v[0-9]*) ;;
+            *) echo "::error::$tag is not a CLI release tag (vX.Y.Z)"; exit 1 ;;
+          esac
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,isPrerelease,publishedAt,url > "$work/release.json"
+          if jq -e '.isDraft or .isPrerelease' "$work/release.json" > /dev/null; then
+            echo "::error::$tag is a draft or a prerelease; the manifest only names published stable releases"
+            exit 1
+          fi
+          if [ -n "$TAG_INPUT" ] && [ "$TAG_INPUT" != "$latest" ]; then
+            echo "::warning::The manifest will name $tag, but install.sh and install.ps1 install ${latest:-nothing} (the release marked Latest). Mark $tag as latest too (docs/RELEASING.md, Roll back)."
+          fi
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir "$work"
+
+      - name: Look up the npm package's latest version
+        id: npm
+        run: |
+          # Publishing to npm is a separate switch in release.yml, so npm may lag the release.
+          version="$(npm view @zero-x.live/neuron dist-tags.latest 2>/dev/null || true)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "npm latest: ${version:-(none)}"
+
+      - name: Write the manifest
+        id: manifest
+        env:
+          NPM_VERSION: ${{ steps.npm.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, re, sys
+
+          work = pathlib.Path(os.environ['RUNNER_TEMP']) / 'release'
+          release = json.loads((work / 'release.json').read_text())
+          tag = release['tagName']
+          match = re.fullmatch(r'v(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)', tag)
+          if not match:
+              sys.exit(f'::error::{tag} is not a vX.Y.Z tag')
+          version = match.group(1)
+          repo = os.environ['GITHUB_REPOSITORY']
+          download = f'https://github.com/{repo}/releases/download/{tag}'
+
+          assets = {}
+          for line in (work / 'SHA256SUMS').read_text().splitlines():
+              if not line.strip():
+                  continue
+              digest, name = line.split(None, 1)
+              name = name.strip().lstrip('*')
+              if not re.fullmatch(r'[0-9a-f]{64}', digest):
+                  sys.exit(f'::error::SHA256SUMS has a malformed line: {line!r}')
+              assets[name] = {'url': f'{download}/{name}', 'sha256': digest}
+          if not {'install.sh', 'install.ps1'} <= assets.keys() or not any(name.startswith('neuron-') for name in assets):
+              sys.exit(f'::error::{tag} lacks the install scripts or binaries: {sorted(assets)}')
+
+          latest = f'https://github.com/{repo}/releases/latest/download'
+          manifest = {
+              'schema': 1,
+              'product': 'neuron',
+              'version': version,
+              'tag': tag,
+              'published_at': release['publishedAt'],
+              'notes_url': release['url'],
+              'download_url': os.environ['DOWNLOAD_PAGE_URL'],
+              # The update command for each way of installing Neuron.
+              'install': {
+                  'npm': {'command': 'npm install -g @zero-x.live/neuron@latest', 'version': os.environ.get('NPM_VERSION') or None},
+                  'sh': {'command': f'curl -fsSL {latest}/install.sh | sh'},
+                  'powershell': {'command': f'irm {latest}/install.ps1 | iex'},
+              },
+              'assets': assets,
+          }
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'manifest' / 'releases' / 'cli' / 'latest.json'
+          out.parent.mkdir(parents=True, exist_ok=True)
+          out.write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f'version={version}\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write(f'## releases/cli/latest.json\n\n```json\n{json.dumps(manifest, indent=2)}\n```\n')
+          print(json.dumps(manifest, indent=2))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-manifest
+          path: ${{ runner.temp }}/manifest
+          if-no-files-found: error
+
+  upload:
+    name: Upload to the releases bucket
+    needs: build
+    if: needs.build.outputs.dry_run == 'false'
+    runs-on: ubuntu-latest
+    # Holds the bucket keys; it downloads the manifest and copies it, nothing else.
+    environment:
+      name: release-manifests
+    permissions: {}
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.RELEASES_R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.RELEASES_R2_SECRET_ACCESS_KEY }}
+      R2_ACCOUNT_ID: ${{ vars.RELEASES_R2_ACCOUNT_ID }}
+      R2_BUCKET: ${{ vars.RELEASES_R2_BUCKET }}
+      PUBLIC_BASE: ${{ vars.RELEASES_PUBLIC_URL || 'https://zero-x.live/releases' }}
+      VERSION: ${{ needs.build.outputs.version }}
+      AWS_DEFAULT_REGION: auto
+      # R2 does not take the CLI's default request checksums on every operation.
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+    steps:
+      - name: Check the bucket settings
+        id: config
+        run: |
+          if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ] || [ -z "$R2_ACCOUNT_ID" ] || [ -z "$R2_BUCKET" ]; then
+            echo "::notice::Not uploaded: set the RELEASES_R2_ACCESS_KEY_ID and RELEASES_R2_SECRET_ACCESS_KEY secrets and the RELEASES_R2_ACCOUNT_ID and RELEASES_R2_BUCKET variables (docs/RELEASING.md). The manifest is in this run's cli-manifest artifact."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/download-artifact@v4
+        if: steps.config.outputs.ready == 'true'
+        with:
+          name: cli-manifest
+          path: manifest
+      - name: Upload releases/cli/latest.json
+        if: steps.config.outputs.ready == 'true'
+        run: |
+          aws s3 cp manifest/releases/cli/latest.json "s3://$R2_BUCKET/releases/cli/latest.json" \
+            --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" \
+            --content-type application/json --cache-control 'public, max-age=300' --no-progress
+          echo "Uploaded releases/cli/latest.json for $VERSION" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Check the public copy
+        if: steps.config.outputs.ready == 'true'
+        run: |
+          url="$PUBLIC_BASE/cli/latest.json"
+          if served="$(curl -fsSL -H 'Cache-Control: no-cache' "$url" | jq -r .version)" && [ "$served" = "$VERSION" ]; then
+            echo "ok $url serves $VERSION"
+          else
+            echo "::warning::$url does not serve $VERSION yet (got '${served:-nothing}'). Check that the gateway routes /releases/ to the bucket, or wait for the 5-minute cache."
+          fi
