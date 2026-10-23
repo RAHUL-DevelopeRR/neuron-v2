@@ -62,7 +62,7 @@ rewritten for what remains:
 | `src/state/engine-store.ts` | P2: connection state, engine version, last `status` (model, mode, session, git, context %, Zero-X login), `usage`, `models`, the permission queue and a pending question. P3 adds the device code of a `/login` in progress, and `needsSignIn()`. The engine's signed-out stage is a `status` with `signed_in: false` and no session id; an API-key provider also has `signed_in: false`, but it has a session. Engines that send `status.sign_in_required` decide it directly. |
 | `src/components/sign-in-panel.tsx` | P3: above the input. In the signed-out stage it says to type `/login`. During a `/login` it shows the link (with `https://`, as an OSC 8 hyperlink where the terminal supports one), the code and a countdown, and Esc cancels (an engine interrupt). A stored login that expired or was revoked (`sign_in_required` with `signed_in: true`) says so and asks for `/login` again. After approval (the `session_starting` event, or the success notice from engines without it) it says "Starting your session…" until the engine's session is up. The engine opens the browser and keeps the token; the UI only sees the code. |
 | `src/components/model-picker.tsx` | P3: `/model` lists the engine's catalog (`list_models`, refreshed every 30 s while open; only the Zero-X gateway has one). Unavailable models are greyed with the reason and can't be picked. `/model <name>` switches without it. |
-| `src/components/engine-footer.tsx` | P3: one line under the input: model, permission mode (and plan mode), an untrusted-folder warning, git branch and counts, ↑/↓ tokens for the session, context %, and the Zero-X plan and account email, or "Zero-X session expired: /login". Parts that don't fit are dropped by priority: the email first, then tokens, git, context, the untrusted warning, the mode, the plan, and the model last. |
+| `src/components/engine-footer.tsx` | P3: one line under the input: model, permission mode (and plan mode), an untrusted-folder warning, git branch and counts, ↑/↓ tokens for the session, context %, and the Zero-X plan and account email, or "Zero-X session expired: /login". When the line is too wide, the token counters go first; then a long model id is cut with "…" (to no less than 16 columns); then parts are dropped by priority: git, context, the email, the untrusted warning, the mode, the plan, and the model last. |
 | `src/engine/status-report.ts` | `/status` adds a "Zero-X" section (email, plan, sign-in state, expiry) and, in an untrusted folder, a "Workspace trust" section: what it means and how to trust the folder. The engine has no command to trust one, so the header says it too. |
 | `src/engine/questions.ts` | An `AskUserQuestion` call is drawn in place of its tool row in the turn's message, and the typed answer goes into that block ("2" picks option 2). The reply follows below it. A question left unanswered shows "Not answered." when the turn ends. |
 | `src/utils/glyphs.ts` | Every marker and border style the UI draws. A classic console window (`ConsoleWindowClass`, asked of Windows through `bun:ffi`) gets a set its fonts have: square corners, √ and ×, ► ▼ ▲, `[ ]`/`[x]` and ASCII for emoji. A pseudoconsole (Windows Terminal, VS Code, WezTerm) keeps Unicode. Without a visible console window, terminal env markers decide. `NEURON_TUI_ASCII=1` forces the console set and `=0` forces Unicode. |
@@ -72,10 +72,13 @@ rewritten for what remains:
 | `src/commands/router.ts` | P2: a slash command the UI doesn't know goes to the engine when it is running (its own commands, such as `/login`, `/status`, `/cost` and `/context`). One typed while the engine boots waits for it. Its notices and errors show as system lines. `/new` also clears the engine session. The slash menu lists the engine's commands with `engineCommand: true`. |
 | `src/cli-args.ts` | P3: `--model`, `--provider`, `--permission-mode`, `--allow-broad-cwd` and `--dangerously-skip-permissions` pass through to `neuron engine --stdio`. |
 | `src/types/agent-run.ts` | Local versions of the SDK types the UI read: `RunState` (what `--continue` saves, with the engine session id), `MessageContent`, `ToolName`. |
-| `src/utils/user-shell.ts` | `!cmd` runner stub. It fails with a message shown in the bash bubble. |
+| `src/utils/user-shell.ts` | `!cmd` runner stub. `USER_SHELL_AVAILABLE = false` hides everything that offered it: `/bash` in the slash menu and `/help`, the `!` bash mode and its history entries. A typed `/bash` goes to the engine, and `!ls` is an ordinary prompt. |
+| `src/utils/console-guard.ts`, `src/utils/win32-console.ts`, `src/utils/terminal-title.ts` | The window's title and font. At start the console's own title is saved (`GetConsoleTitleW` through `bun:ffi` on Windows, `CSI 22;0t` elsewhere) and "Neuron" is set, then set again whenever something else changes it in the first 12 s, after each tool result and at each turn's end: a PowerShell starting on the console (the watchdog of a direct launch, the engine's PowerShell tool) retitles it "Windows PowerShell", and a bash call retitles it to the command. The same PowerShell starts switch a classic window from a TrueType font to the raster "Terminal" one; the guard saves the font at start and puts it back then too. At exit the original title (and font) come back, right before the hint. |
+| `src/engine/session-run-state.ts` | Every save of a chat's `run-state.json` carries the engine session id and model from the engine's last `status`, and a `status` writes it into an already saved chat at once. A chat whose only turn was interrupted therefore resumes its engine session on `--continue`. A save without a session keeps the one on disk. |
 | `src/utils/runtime-env.ts` | `IS_DEV`, `IS_TEST` and `IS_CI`, which came from Codebuff's env schema. |
 | `src/utils/tool-display.ts`, `src/utils/logo.ts` | Display helpers kept from removed modules (`codebuff-client.ts`, `login/`). |
-| `src/utils/exit-cleanly.ts` | Exit stops the engine first (a bounded `shutdown`, and at least 500 ms before the teardown), then tears down the renderer, prints the exit hint and leaves. The order is for a classic Windows console: see the conhost crash below. |
+| `src/utils/exit-cleanly.ts` | A quit first stops reading the keyboard, so keys typed during the exit stay in the console for the shell. Then the engine stops (a bounded `shutdown`, and at least 500 ms before the teardown), the renderer tears down, the console's title comes back, the exit hint is printed and the UI leaves. It exits 1 instead of 0 when the engine crashed during the session. The order is for a classic Windows console: see the conhost crash below. |
+| `src/utils/terminal-watchdog.ts` | When `neuron` starts the UI it names `NEURON_TUI_DISARM_FILE` and is the watchdog itself: it waits for the UI anyway. The UI writes "armed" there once it sets the terminal up and "disarmed" after its reset, and starts no PowerShell. If the UI died still "armed", `neuron` writes the same reset sequences (`full_screen.rs`; a test checks the two copies agree). Run directly, the UI keeps Freebuff's PowerShell watchdog. |
 | `src/utils/config-dir.ts` | Settings, chat history and logs now go to `~/.neuron/tui`. Freebuff used `~/.config/manicode`, which Codebuff itself still writes. `NEURON_TUI_CONFIG_DIR` still overrides it. |
 | `scripts/run-tests.ts` | `bun run test` without `find`, so it works on Windows. |
 | `scripts/dev-against-mock.ts` | P2: `bun run dev:mock [prompt]` runs the UI against the real engine and the mock Anthropic service (`PARITY_SCENARIO:<name>` prompts), in a throwaway home and workspace. No account or network is needed. With `--signed-out` (P3), the engine starts signed out against `scripts/fake-zero-x-gateway.ts`, which approves a `/login` at the first poll and serves a two-model catalog. Logins go to a file in the temp home, never the OS keychain. |
@@ -221,14 +224,28 @@ blocked.
   - the exit hint `neuron --continue <chat>`, and that command reopening the
     chat (its transcript, and the engine resuming its session);
   - then, in a classic console window (`conhost.exe`, where Windows PowerShell
-    5.1 and cmd.exe open), a turn and Ctrl-C twice through `neuron`, a turn and
-    `/exit` in the UI on its own, and a turn, the engine killed, then Ctrl-C
-    twice: the window must outlive the exit and show the hint, with the next
-    line the shell prints below it (`classic-console-check.ps1` with
-    `ConsoleKeys.cs`, which attach to the window's console to read it and type
-    into it).
+    5.1 and cmd.exe open), with `classic-console-check.ps1` and `ConsoleKeys.cs`,
+    which attach to the window's console to read it and type into it:
+    - a turn and Ctrl-C twice in a bare `neuron`, a turn and `/exit` in the UI
+      on its own, and a turn, the engine killed, then Ctrl-C twice. The window
+      must outlive the exit and show the hint, with the next line the shell
+      prints below it. Its title must be Neuron's while the UI runs and the
+      shell's own again after it, and the keyboard must still be read after
+      the turn (a probe typed, seen, erased);
+    - a command typed 150 ms after `/exit`, which must reach the shell whole;
+    - the line REPL's trust prompt and banner, with no escape code shown as
+      text;
+    - `NEURON_CONSOLE_STRESS` (3 by default) more bare `neuron` launches, each
+      checking that the keyboard is still read after a turn.
 
-  All 8 pass on Windows 11. Each scenario waits for a turn to end before Ctrl-C:
+    `-Direct` runs `neuron` itself in the window, as a customer's shell does.
+    The other cases run the dev script under Bun, which turns on the console's
+    escape-code processing first, so that the REPL check could not fail there.
+    Typed text checks that it appeared as typed, so a dropped key is reported as
+    such. The process tree comes from a toolhelp snapshot, not WMI, which stalled
+    for minutes on a loaded machine.
+
+  All 11 pass on Windows 11. Each scenario waits for a turn to end before Ctrl-C:
   during a turn Ctrl-C interrupts it instead. Bugs it found are fixed:
   - The exit hint was never shown on Windows. The `process.on('exit')` listener
     ran after the console was gone (EPIPE), and a write from the UI races its
@@ -260,6 +277,31 @@ blocked.
     and `ESC[?1049l` also restores the saved cursor, so the cursor jumped back
     above the hint. A later reset now skips that sequence
     (`MAIN_SCREEN_RESET_SEQUENCES`).
+  - Started through `neuron`, the UI stopped reading the keyboard in 2 of about
+    47 launches in the end-to-end test (it drew, typing did nothing), with no
+    known cause. When `neuron` starts the UI, the UI's PowerShell watchdog,
+    one more process on the console's input, is gone: `neuron` is the watchdog
+    (`NEURON_TUI_DISARM_FILE` above). In 30 bare `neuron` launches afterwards
+    the keyboard was read every time.
+  - The window title read "Windows PowerShell" until the first prompt, and the
+    window switched to the raster "Terminal" font: both from that PowerShell
+    starting on the console. `console-guard.ts` keeps Neuron's title and the
+    font, and gives the console both back at exit.
+  - Keys typed right after quitting were half eaten: `echo early42` typed after
+    `/exit` reached the shell as `y42`. The UI now stops reading the keyboard
+    as soon as the quit is asked for.
+  - Keys that came before React's next render worked on the last render's
+    text: three quick Backspaces deleted one character, and an Enter right
+    after the last character sent the prompt without it (`…streaming_tex`).
+    Typed characters already read refs (a Freebuff fix for fast IME input);
+    deleting, moving and Enter in `multiline-input.tsx` now read and move the
+    same refs, and the chat's submit reads the store's text. A held Backspace
+    repeats that fast, so people met this too. The console check had blamed
+    conhost for it ("dropped keys") in 2 of 30 launches.
+  - The line REPL (`neuron --no-tui`) showed its banner as raw escape codes in a
+    classic window: `neuron` now turns on the console's escape-code processing
+    before it prints anything, and draws √ and × where the fonts lack ✓ and ✗
+    (`rust/crates/rusty-claude-cli/src/console.rs`).
   - The driver's screen model is fed in a `try`, so the pseudoconsole's output
     is always read.
 - Changed after the end-to-end run against a local gateway:
@@ -283,7 +325,7 @@ blocked.
 - These slash commands are the UI's own: `help`, `new`, `copy`, `export`,
   `bash`, `image`, `history`, `queue`, `todo`, `interview`, `plan`, `review`,
   `theme:toggle`, `exit`, `mode:*` and `skill:*`. Any other goes to the engine.
-- Typecheck is clean, and `bun run test` gives 2,370 passing tests, 0 failures
+- Typecheck is clean, and `bun run test` gives 2,416 passing tests, 0 failures
   and 24 skipped.
 - `src/engine/__tests__/engine.integration.test.ts` passes 5 tests against the
   real engine: 4 turns against the mock service, and the signed-out start,
@@ -306,8 +348,6 @@ blocked.
     divider, `--lite`/`--max`/`--plan`) change only how the UI presents a turn.
     The engine ignores them. Hide them, or map PLAN to the engine's plan mode.
 - **After P4:**
-  - Bring back a reset-sequence sync test for Neuron's own launcher (the old
-    one checked `release-core/launcher.js`).
   - The release build of the UI runs only in `release.yml`. A tagged release
     is its first full test on Linux and macOS: the Linux glibc floor for the
     Bun binary, the macOS x64 cross-compile, and the install checks.
@@ -319,6 +359,8 @@ blocked.
     reads the terminal's answers to its capability queries, can be dropped. The
     console check saw "PARITY…" arrive as "ARITY…" once, so its scripts wait
     for the engine's footer before typing.
+  - One classic window vanished in the end-to-end test with no crash event
+    (n02). It was not reproduced.
   - After the UI exits, the engine can take a few seconds to finish saving and
     stopping (MCP servers still starting are stopped within 3 s). The UI waits
     for it for one second.
@@ -338,7 +380,20 @@ blocked.
     engine sends `usage` and `status` then. The UI applies every `usage` event,
     so they will update live once the engine sends them during a turn.
   - The glyph set covers what the UI draws. A model's own characters (✅ and
-    the like) and the clipboard text of `/copy` are left as they are.
+    the like) and the clipboard text of `/copy` are left as they are. The line
+    REPL decides from environment variables only (Rust here may not call the
+    console API), so Windows Terminal as the default terminal, which sets no
+    `WT_SESSION`, gets the console set there.
+  - The console's code page is not restored by the UI: Bun sets 65001 before
+    any of the UI runs, and puts the original back itself at exit.
+  - `launcher-disconnect.test.ts` set Freebuff's `CODEBUFF_LAUNCHER_PID`, which
+    the UI no longer reads, so it never exercised the launcher monitor. Its
+    fixture now sets `NEURON_TUI_LAUNCHER_PID`. It kills with `taskkill`, so it
+    hangs while WMI is stuck (see the next item).
+  - Killing a process tree on Windows goes through `taskkill`, which needs the
+    WMI service; while WMI was stuck on the test machine, `taskkill` and
+    `tasklist` hung. The engine gives up on `taskkill` after a bounded wait and
+    kills the root process instead.
   - In a folder under a git repo, Freebuff's banner offers to switch to the git
     root, even when that root is the home folder, which the engine then refuses
     as too broad.
