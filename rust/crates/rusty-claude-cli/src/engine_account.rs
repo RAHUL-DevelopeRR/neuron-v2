@@ -100,7 +100,7 @@ fn account_details(
 fn usd_to_cents(usd: f64) -> Option<u64> {
     let cents = (usd * 100.0).round();
     // Below 2^53 every whole number is exact, so the cast keeps it.
-    (cents.is_finite() && (0.0..9_007_199_254_740_992.0).contains(&cents)).then(|| cents as u64)
+    (cents.is_finite() && (0.0..9_007_199_254_740_992.0).contains(&cents)).then_some(cents as u64)
 }
 
 /// Reads `/api/account` on a thread of its own, then sends the account event. Without a
@@ -211,9 +211,9 @@ fn remember_profile(credential: &GatewayCredential, summary: &AccountSummary) {
         return;
     }
     let stored = StoredCredential {
+        plan,
         email,
         name,
-        plan,
         ..loaded.credential
     };
     let _ = store.save(&stored);

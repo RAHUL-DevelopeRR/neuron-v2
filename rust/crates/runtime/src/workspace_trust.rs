@@ -366,7 +366,9 @@ mod tests {
         assert!(!trusted_by_store(
             &store,
             &nested,
-            Some(nested_root.root.as_path()).filter(|_| nested_root.is_git_root)
+            nested_root
+                .is_git_root
+                .then_some(nested_root.root.as_path())
         ));
 
         // Outside git, the folder itself.
