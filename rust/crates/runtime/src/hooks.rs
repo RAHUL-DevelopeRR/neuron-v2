@@ -767,8 +767,12 @@ fn format_hook_failure(label: &str, code: i32, stdout: Option<&str>) -> String {
 fn shell_command(command: &str) -> CommandWithStdin {
     #[cfg(windows)]
     let command_builder = {
+        use std::os::windows::process::CommandExt;
+
         let mut command_builder = Command::new("cmd");
         command_builder.arg("/C").arg(command);
+        // Not in the user's console, whose title `cmd.exe` would change.
+        command_builder.creation_flags(plugins::subprocess::CREATE_NO_WINDOW);
         CommandWithStdin::new(command_builder)
     };
 

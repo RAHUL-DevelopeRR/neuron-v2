@@ -124,6 +124,16 @@ pub struct RuntimeToolDefinition {
     pub required_permission: PermissionMode,
 }
 
+impl RuntimeToolDefinition {
+    fn to_definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            input_schema: self.input_schema.clone(),
+        }
+    }
+}
+
 impl GlobalToolRegistry {
     #[must_use]
     pub fn builtin() -> Self {
@@ -250,9 +260,11 @@ impl GlobalToolRegistry {
     /// Tool schemas sent to the model.
     ///
     /// Without an allow-list only the default built-in tools are advertised,
-    /// plus deferred tools that `ToolSearch` activated in this session; stub
-    /// and bookkeeping tools stay behind `ToolSearch`. An explicit allow-list
-    /// advertises exactly the listed tools.
+    /// plus deferred built-ins that `ToolSearch` activated in this session; stub
+    /// and bookkeeping tools stay behind `ToolSearch`, and so do MCP tools (a
+    /// request adds the ones its conversation uses, see
+    /// [`Self::deferred_mcp_definitions`]). An explicit allow-list advertises
+    /// exactly the listed tools.
     #[must_use]
     pub fn definitions(&self, allowed_tools: Option<&BTreeSet<String>>) -> Vec<ToolDefinition> {
         let builtin = advertised_builtin_specs(allowed_tools)
@@ -267,15 +279,9 @@ impl GlobalToolRegistry {
             .iter()
             .filter(|tool| match allowed_tools {
                 Some(allowed) => allowed.contains(tool.name.as_str()),
-                None => {
-                    !is_deferred_runtime_tool(&tool.name) || is_deferred_tool_activated(&tool.name)
-                }
+                None => !is_deferred_runtime_tool(&tool.name),
             })
-            .map(|tool| ToolDefinition {
-                name: tool.name.clone(),
-                description: tool.description.clone(),
-                input_schema: tool.input_schema.clone(),
-            });
+            .map(RuntimeToolDefinition::to_definition);
         let plugin = self
             .plugin_tools
             .iter()
@@ -289,6 +295,25 @@ impl GlobalToolRegistry {
                 input_schema: tool.definition().input_schema.clone(),
             });
         builtin.chain(runtime).chain(plugin).collect()
+    }
+
+    /// The deferred MCP tools one request of the conversation `messages` carries, on
+    /// top of [`Self::definitions`] without an allow-list: the ones the model already
+    /// called, and the ones `ToolSearch` matched in the current turn (since the last
+    /// user prompt). Matches the model left unused drop out with the next prompt, so
+    /// a search does not grow every later request (a free per-minute token budget
+    /// overflowed that way); the `MCPTool` wrapper can call any MCP tool meanwhile.
+    #[must_use]
+    pub fn deferred_mcp_definitions(
+        &self,
+        messages: &[ConversationMessage],
+    ) -> Vec<ToolDefinition> {
+        let in_play = deferred_tools_in_play(messages);
+        self.runtime_tools
+            .iter()
+            .filter(|tool| is_deferred_runtime_tool(&tool.name) && in_play.contains(&tool.name))
+            .map(RuntimeToolDefinition::to_definition)
+            .collect()
     }
 
     pub fn permission_specs(
@@ -335,14 +360,10 @@ impl GlobalToolRegistry {
         let query = query.trim().to_string();
         let normalized_query = normalize_tool_search_query(&query);
         let matches = search_tool_specs(&query, max_results.max(1), &self.searchable_tool_specs());
-        // Deferred built-ins and MCP tools that were found are advertised
-        // from the next request on.
+        // Deferred built-ins that were found are advertised from the next request
+        // on. MCP tools found are advertised for the rest of the turn, which the
+        // request reads from these matches in the transcript.
         activate_deferred_tools(matches.iter().map(String::as_str));
-        activate_names(
-            matches.iter().filter(|name| {
-                is_deferred_runtime_tool(name) && self.has_runtime_tool(name.as_str())
-            }),
-        );
 
         ToolSearchOutput {
             matches,
@@ -499,19 +520,82 @@ fn is_deferred_tool_activated(name: &str) -> bool {
 }
 
 /// Tools discovered from MCP servers (`mcp__<server>__<tool>`). Their
-/// schemas stay out of requests until `ToolSearch` finds them; the
-/// `MCPTool` wrapper can call any of them by qualified name meanwhile.
-fn is_deferred_runtime_tool(name: &str) -> bool {
+/// schemas stay out of requests unless the conversation brought them into play
+/// ([`GlobalToolRegistry::deferred_mcp_definitions`]); the `MCPTool` wrapper can
+/// call any of them by qualified name meanwhile.
+#[must_use]
+pub fn is_deferred_runtime_tool(name: &str) -> bool {
     name.starts_with("mcp__")
 }
 
-fn activate_names<'a>(names: impl IntoIterator<Item = &'a String>) {
-    let mut activated = activated_deferred_tools()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    for name in names {
-        activated.insert(name.clone());
+/// Names of the tools the model called anywhere in `messages`, plus the ones a
+/// successful `ToolSearch` call matched since the last user prompt.
+fn deferred_tools_in_play(messages: &[ConversationMessage]) -> BTreeSet<String> {
+    let turn_start = current_turn_start(messages);
+    let mut names = BTreeSet::new();
+    for (index, message) in messages.iter().enumerate() {
+        for block in &message.blocks {
+            match block {
+                ContentBlock::ToolUse { name, .. } => {
+                    names.insert(name.clone());
+                }
+                ContentBlock::ToolResult {
+                    tool_name,
+                    output,
+                    is_error: false,
+                    ..
+                } if index > turn_start && tool_name == "ToolSearch" => {
+                    names.extend(tool_search_matches(output));
+                }
+                _ => {}
+            }
+        }
     }
+    names
+}
+
+/// Index in `messages` of the prompt the user typed last, where the current turn
+/// starts (0 when there is none).
+#[must_use]
+pub fn current_turn_start(messages: &[ConversationMessage]) -> usize {
+    messages
+        .iter()
+        .rposition(starts_user_turn)
+        .unwrap_or_default()
+}
+
+/// A prompt the user typed (the runtime's automatic "continue" request is part of
+/// the turn it continues).
+fn starts_user_turn(message: &ConversationMessage) -> bool {
+    message.role == MessageRole::User
+        && message.blocks.iter().any(|block| {
+            matches!(block, ContentBlock::Text { text } if !text.starts_with(runtime::AUTO_CONTINUE_PREFIX))
+        })
+        && !message
+            .blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+}
+
+/// The `matches` of a `ToolSearch` result. Text a hook appended after the JSON is
+/// ignored.
+fn tool_search_matches(output: &str) -> Vec<String> {
+    let Some(Ok(value)) = serde_json::Deserializer::from_str(output)
+        .into_iter::<Value>()
+        .next()
+    else {
+        return Vec::new();
+    };
+    value["matches"]
+        .as_array()
+        .map(|matches| {
+            matches
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn activate_deferred_tools<'a>(names: impl IntoIterator<Item = &'a str>) {
@@ -5734,6 +5818,16 @@ impl SubagentToolExecutor {
 
 impl ToolExecutor for SubagentToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        self.execute_with_cancellation(tool_name, input, &CancellationToken::new())
+    }
+
+    /// A cancelled sub-agent kills its running `bash` / `PowerShell` command tree.
+    fn execute_with_cancellation(
+        &mut self,
+        tool_name: &str,
+        input: &str,
+        cancel: &CancellationToken,
+    ) -> Result<String, ToolError> {
         if !self.allowed_tools.contains(tool_name) {
             return Err(ToolError::new(format!(
                 "tool `{tool_name}` is not enabled for this sub-agent"
@@ -5741,7 +5835,7 @@ impl ToolExecutor for SubagentToolExecutor {
         }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        execute_tool_with_enforcer(self.enforcer.as_ref(), tool_name, &value)
+        execute_tool_with_enforcer_and_cancel(self.enforcer.as_ref(), tool_name, &value, cancel)
             .map_err(ToolError::new)
     }
 }
@@ -7858,6 +7952,31 @@ mod tests {
         assert!(error
             .to_string()
             .contains("requires workspace-write permission"));
+    }
+
+    #[test]
+    fn a_cancelled_subagent_stops_its_running_bash_command() {
+        let mut executor = SubagentToolExecutor::new(BTreeSet::from([String::from("bash")]));
+        let cancel = runtime::CancellationToken::new();
+        let trigger = cancel.clone();
+        let canceller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(400));
+            trigger.cancel();
+        });
+        let command = if cfg!(windows) {
+            "ping -n 30 127.0.0.1 >NUL"
+        } else {
+            "sleep 30"
+        };
+        let started = std::time::Instant::now();
+
+        let error = executor
+            .execute_with_cancellation("bash", &json!({ "command": command }).to_string(), &cancel)
+            .expect_err("a cancelled command is an error result");
+
+        canceller.join().expect("canceller");
+        assert!(error.to_string().contains("\"cancelled\""), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(15));
     }
 
     #[test]

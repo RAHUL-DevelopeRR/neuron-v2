@@ -4,8 +4,9 @@
 //!
 //! Two threads. The engine thread owns the [`LiveCli`] (its MCP servers and plugins are
 //! thread-local) and runs one command at a time. The command thread reads the UI's
-//! commands as they arrive, so an interrupt or an answer reaches a turn that is running;
-//! everything else waits in the engine's queue.
+//! commands as they arrive, so an interrupt or an answer reaches a turn that is running,
+//! and a model listing is answered during one; everything else waits in the engine's
+//! queue.
 //!
 //! What the UI sees:
 //! - first [`UiEvent::Ready`] (the protocol version), then [`UiEvent::Status`] for the
@@ -18,7 +19,7 @@
 //! - after every `TurnFinished`, a fresh `Status`;
 //! - [`EngineCommand::SetModel`]: the switch report as a notice and a `Status`, or an
 //!   `Error`;
-//! - [`EngineCommand::ListModels`]: one [`UiEvent::Models`];
+//! - [`EngineCommand::ListModels`]: one [`UiEvent::Models`], also while a turn runs;
 //! - `runtime::ui_hooks` notices from anywhere in the process, as notices;
 //! - an `AskUserQuestion` from the agent, as a notice starting with "Question:" whose
 //!   answer is the next submitted text (a `Submit` while the question waits never starts a
@@ -117,6 +118,7 @@ pub(crate) fn spawn(options: EngineOptions) -> Result<EngineHandle, String> {
     let engine = thread::Builder::new()
         .name("neuron-engine".to_string())
         .spawn(move || {
+            let _models = ModelListing::install(&events_tx, &engine_shared);
             let _hooks = UiHooks::install(&events_tx, &engine_shared);
             let exit = run_engine(
                 options,
@@ -173,16 +175,22 @@ fn run_engine(
     let Some(reason) = options.signed_out.take() else {
         let started = open_cli(&options, events).and_then(|(cli, output)| {
             let mut engine = Engine::new(cli, output, Sender::clone(events), replies, shared);
-            if let Some(reference) = &options.resume {
-                engine
-                    .continue_saved_session(reference)
-                    .map_err(|error| error.to_string())?;
-            }
-            Ok(engine)
+            let resumed = match &options.resume {
+                Some(reference) => Some(
+                    engine
+                        .continue_saved_session(reference)
+                        .map_err(|error| error.to_string())?,
+                ),
+                None => None,
+            };
+            Ok((engine, resumed))
         });
         return match started {
-            Ok(mut engine) => {
+            Ok((mut engine, resumed)) => {
                 engine.announce();
+                if let Some(report) = resumed {
+                    engine.notice(&report);
+                }
                 let _ = ready.send(Ok(()));
                 let exit = engine.serve(queue);
                 engine.close();
@@ -224,10 +232,11 @@ fn run_engine(
         engine.account_email = signed_out.email.take();
         engine.refresh_account();
         if let Some(reference) = &signed_out.options.resume {
-            if let Err(error) = engine.continue_saved_session(reference) {
-                engine.send(UiEvent::Error {
+            match engine.continue_saved_session(reference) {
+                Ok(report) => engine.notice(&report),
+                Err(error) => engine.send(UiEvent::Error {
                     message: format!("could not continue {reference}: {error}"),
-                });
+                }),
             }
         }
         // The end of the `/login` that got here.
@@ -345,6 +354,7 @@ impl SignedOut<'_> {
     }
 
     fn send_status(&self) {
+        lock(&self.shared.model).clone_from(&self.options.model);
         let account = AccountState::read(self.email.as_deref());
         self.send(status_event(
             &self.options.model,
@@ -467,6 +477,11 @@ struct Shared {
     next_question: AtomicU64,
     /// Shutdown was requested: commands still queued are dropped.
     closing: AtomicBool,
+    /// The UI's events while the engine runs, for answering [`EngineCommand::ListModels`]
+    /// during a turn ([`ModelListing`]).
+    events: Mutex<Option<Sender<UiEvent>>>,
+    /// The session's model as the footer last showed it.
+    model: Mutex<String>,
 }
 
 impl Shared {
@@ -478,6 +493,26 @@ impl Shared {
 
     fn take_answer(&self) -> Option<Sender<String>> {
         lock(&self.answer).take().map(|(_, answer)| answer)
+    }
+
+    fn turn_running(&self) -> bool {
+        lock(&self.presses).is_some() || lock(&self.turn).is_some()
+    }
+
+    /// Answers [`EngineCommand::ListModels`] now, on a thread of its own (the catalog may
+    /// be fetched, and interrupts must not wait for it). `false` when the engine is not
+    /// running.
+    fn answer_models(&self) -> bool {
+        let Some(events) = lock(&self.events).clone() else {
+            return false;
+        };
+        let current = lock(&self.model).clone();
+        thread::Builder::new()
+            .name("neuron-engine-models".to_string())
+            .spawn(move || {
+                let _ = events.send(models_event(&current));
+            })
+            .is_ok()
     }
 
     /// Stops the running turn, without the interrupt notice: the session is closing.
@@ -556,12 +591,62 @@ fn forward_commands(
                 let _ = queue.send(EngineCommand::Shutdown);
                 return;
             }
+            // It only reads the catalog, so a running turn need not end first. Between
+            // turns it queues, after a `SetModel` sent before it.
+            EngineCommand::ListModels if shared.turn_running() && shared.answer_models() => {}
             command => {
                 if queue.send(command).is_err() {
                     return;
                 }
             }
         }
+    }
+}
+
+/// Lets the command thread answer [`EngineCommand::ListModels`] while the engine runs.
+/// Dropped when the engine stops, so the event channel can close.
+struct ModelListing<'a> {
+    shared: &'a Shared,
+}
+
+impl<'a> ModelListing<'a> {
+    fn install(events: &Sender<UiEvent>, shared: &'a Shared) -> Self {
+        *lock(&shared.events) = Some(Sender::clone(events));
+        Self { shared }
+    }
+}
+
+impl Drop for ModelListing<'_> {
+    fn drop(&mut self) {
+        lock(&self.shared.events).take();
+    }
+}
+
+/// The models [`EngineCommand::ListModels`] answers with: the gateway catalog's,
+/// available ones first, with their status as of now (asked for again at most every
+/// 30 s); none on other providers.
+fn models_event(current_model: &str) -> UiEvent {
+    let models = gateway_repl::session_catalog()
+        .map(|catalog| {
+            crate::gateway_catalog::with_session_status(&catalog)
+                .sorted()
+                .into_iter()
+                .map(|model| ModelInfo {
+                    id: model.id.clone(),
+                    display_name: model.display_name.clone(),
+                    available: model.available,
+                    unavailable_reason: model.unavailable_reason.clone(),
+                    context_window: model.context_window,
+                    tiers: model.tiers.clone(),
+                    status: model.status.clone(),
+                    available_again_at: model.available_again_at.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    UiEvent::Models {
+        current: shown_model(current_model).to_string(),
+        models,
     }
 }
 
@@ -1020,6 +1105,7 @@ impl Engine {
     }
 
     fn send_status(&mut self) {
+        lock(&self.shared.model).clone_from(&self.cli.model);
         let context_percent =
             u32::try_from(self.cli.runtime.context_snapshot().used_percent()).unwrap_or(u32::MAX);
         // A session on the gateway needs the login; other providers do not.
@@ -1078,38 +1164,18 @@ impl Engine {
         }
     }
 
-    /// The gateway catalog's models, available ones first, with their status as of now
-    /// (asked for again at most every 30 s); none on other providers.
+    /// The gateway catalog's models ([`models_event`]). During a turn the command thread
+    /// answers instead.
     fn list_models(&mut self) {
-        let models = gateway_repl::session_catalog()
-            .map(|catalog| {
-                crate::gateway_catalog::with_session_status(&catalog)
-                    .sorted()
-                    .into_iter()
-                    .map(|model| ModelInfo {
-                        id: model.id.clone(),
-                        display_name: model.display_name.clone(),
-                        available: model.available,
-                        unavailable_reason: model.unavailable_reason.clone(),
-                        context_window: model.context_window,
-                        tiers: model.tiers.clone(),
-                        status: model.status.clone(),
-                        available_again_at: model.available_again_at.clone(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        self.send(UiEvent::Models {
-            current: shown_model(&self.cli.model).to_string(),
-            models,
-        });
+        let models = models_event(&self.cli.model);
+        self.send(models);
     }
 
     fn model_report(&mut self) {
         let mut report = format_model_report(
             &self.cli.model,
             self.cli.runtime.session().messages.len(),
-            self.cli.runtime.usage().turns(),
+            prompt_count(self.cli.runtime.session()),
         );
         if let Some(listing) = gateway_repl::gateway_model_listing(&self.cli.model) {
             report.push_str("\n\n");
@@ -1199,6 +1265,13 @@ impl Engine {
     }
 
     fn resume(&mut self, reference: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let report = self.load_session(reference)?;
+        self.notice(&report);
+        Ok(())
+    }
+
+    /// Switches to saved session `reference`; returns the "Session resumed" report.
+    fn load_session(&mut self, reference: &str) -> Result<String, Box<dyn std::error::Error>> {
         let (handle, session) = load_session_reference(reference)?;
         let message_count = session.messages.len();
         let session_id = session.session_id.clone();
@@ -1207,27 +1280,26 @@ impl Engine {
             id: session_id,
             path: handle.path,
         };
-        let report = format_resume_report(
+        Ok(format_resume_report(
             &self.cli.session.path.display().to_string(),
             message_count,
-            self.cli.runtime.usage().turns(),
-        );
-        self.notice(&report);
-        Ok(())
+            prompt_count(self.cli.runtime.session()),
+        ))
     }
 
     /// Continues a saved session at startup, removing the empty one the fresh start made.
+    /// Returns the "Session resumed" report: at startup it can only be shown after `Ready`.
     fn continue_saved_session(
         &mut self,
         reference: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<String, Box<dyn std::error::Error>> {
         let placeholder = self.cli.session.path.clone();
         let placeholder_is_empty = self.cli.runtime.session().messages.is_empty();
-        self.resume(reference)?;
+        let report = self.load_session(reference)?;
         if placeholder_is_empty && placeholder != self.cli.session.path {
             let _ = fs::remove_file(&placeholder);
         }
-        Ok(())
+        Ok(report)
     }
 
     /// `/plan [on|off]`, as in the line REPL.
@@ -1556,7 +1628,10 @@ mod tests {
             ("NEURON_TOKEN", None),
         ]);
 
-        with_current_dir(&workspace, || drive_engine(&workspace));
+        with_current_dir(&workspace, || {
+            drive_engine(&workspace);
+            resume_engine();
+        });
 
         drop(vars);
         drop(server);
@@ -1828,6 +1903,21 @@ mod tests {
         // the hooks go back to the terminal and the event channel closes.
         clear_session(&engine);
         submit_bash_needing_approval(&engine, "bash_permission_prompt_approved");
+        // The model list does not wait for the turn.
+        engine.commands.send(EngineCommand::ListModels).unwrap();
+        let listed = events_until(&engine.events, |event| {
+            matches!(event, UiEvent::Models { .. })
+        });
+        assert!(
+            !listed.contains(&UiEvent::TurnFinished),
+            "answered during the turn: {listed:?}"
+        );
+        match listed.last() {
+            Some(UiEvent::Models { current, .. }) => {
+                assert!(current.contains("claude-opus"), "{current}");
+            }
+            other => panic!("expected the model list, got {other:?}"),
+        }
         engine.commands.send(EngineCommand::Shutdown).unwrap();
         let turn = turn_events(&engine.events);
         assert!(
@@ -1859,6 +1949,26 @@ mod tests {
             ),
             "the last session is saved: {sessions:?}"
         );
+    }
+
+    /// `--resume`: `Ready` is still the first event, then the footer, then the report on
+    /// the session it continues.
+    fn resume_engine() {
+        let engine = spawn(EngineOptions {
+            model: "claude-sonnet-4-6".to_string(),
+            allowed_tools: None,
+            permission_mode: PermissionMode::WorkspaceWrite,
+            reasoning_effort: None,
+            resume: Some("latest".to_string()),
+            signed_out: None,
+        })
+        .expect("the engine continues the saved session");
+        let first = next_event(&engine.events);
+        assert!(matches!(first, UiEvent::Ready { .. }), "{first:?}");
+        let second = next_event(&engine.events);
+        assert!(matches!(second, UiEvent::Status { .. }), "{second:?}");
+        expect_notice(&engine.events, "Session resumed");
+        assert_eq!(engine.finish(), EngineExit::Shutdown);
     }
 
     #[test]

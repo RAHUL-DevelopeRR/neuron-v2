@@ -1170,7 +1170,7 @@ fn run_resume_command(
                     session.model.as_deref().unwrap_or("restored-session"),
                     StatusUsage {
                         message_count: session.messages.len(),
-                        turns: tracker.turns(),
+                        turns: prompt_count(session),
                         latest: tracker.current_turn_usage(),
                         cumulative: usage,
                         estimated_tokens: 0,
@@ -1182,7 +1182,7 @@ fn run_resume_command(
                     session.model.as_deref(),
                     StatusUsage {
                         message_count: session.messages.len(),
-                        turns: tracker.turns(),
+                        turns: prompt_count(session),
                         latest: tracker.current_turn_usage(),
                         cumulative: usage,
                         estimated_tokens: 0,
@@ -1594,6 +1594,9 @@ struct RuntimeMcpState {
     /// A stand-in while the servers start in the background ([`BackgroundMcp`]): it has
     /// no tools yet, and calls say so.
     starting: bool,
+    /// A stand-in's background start, which can finish during a turn: the servers are
+    /// taken only before the next one.
+    background: Option<Arc<BackgroundMcpShared>>,
 }
 
 struct BuiltRuntime {
@@ -1727,6 +1730,7 @@ impl RuntimeMcpState {
             pending_servers: Vec::new(),
             degraded_report: None,
             starting: false,
+            background: None,
         }))
     }
 
@@ -1822,14 +1826,36 @@ impl RuntimeMcpState {
         Some(discovery)
     }
 
-    /// The error for a call that came before the servers finished starting.
+    /// The error for a call that came before the servers joined.
     fn still_starting(&self) -> Result<(), ToolError> {
-        if self.starting {
-            return Err(ToolError::new(
-                "the MCP servers are still starting; try again in a moment",
-            ));
+        if !self.starting {
+            return Ok(());
         }
-        Ok(())
+        Err(ToolError::new(match self.background_start() {
+            None => "the MCP servers are still starting; try again in a moment",
+            Some(true) => "the MCP servers have finished starting; their tools join the next turn",
+            Some(false) => "the MCP servers could not start",
+        }))
+    }
+
+    /// `None` while a stand-in's servers start in the background; then whether they
+    /// started (during a turn they join the next one).
+    fn background_start(&self) -> Option<bool> {
+        self.background
+            .as_ref()
+            .and_then(|background| background.finished())
+    }
+
+    /// ToolSearch's note while a stand-in's servers are missing; `None` otherwise.
+    fn starting_note(&self) -> Option<&'static str> {
+        if !self.starting {
+            return None;
+        }
+        Some(match self.background_start() {
+            None => "The MCP servers in pending_mcp_servers are still starting, so their tools are not searchable yet; search again in a moment.",
+            Some(true) => "The MCP servers in pending_mcp_servers have finished starting; their tools join the next turn, not this one.",
+            Some(false) => "The MCP servers in pending_mcp_servers could not start; their tools are unavailable.",
+        })
     }
 
     fn shutdown(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -1846,10 +1872,6 @@ impl RuntimeMcpState {
             self.pending_servers.clone()
         };
         (!pending.is_empty()).then_some(pending)
-    }
-
-    fn is_starting(&self) -> bool {
-        self.starting
     }
 
     fn degraded_report(&self) -> Option<runtime::McpDegradedReport> {
@@ -2085,6 +2107,15 @@ impl BackgroundMcpShared {
         self.outcome
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `None` while the servers start; then whether they started (taken counts).
+    fn finished(&self) -> Option<bool> {
+        match &*self.lock() {
+            BackgroundMcpOutcome::Starting => None,
+            BackgroundMcpOutcome::Started(..) | BackgroundMcpOutcome::Done => Some(true),
+            BackgroundMcpOutcome::Failed(_) => Some(false),
+        }
     }
 }
 
@@ -2359,8 +2390,9 @@ impl LiveCli {
             |_| "<unknown>".to_string(),
             |path| {
                 let s = path.display().to_string();
-                if s.len() > 35 {
-                    format!("...{}", &s[s.len() - 32..])
+                let chars = s.chars().count();
+                if chars > 35 {
+                    format!("...{}", s.chars().skip(chars - 32).collect::<String>())
                 } else {
                     s
                 }
@@ -2369,6 +2401,17 @@ impl LiveCli {
         let username = env::var("USERNAME")
             .or_else(|_| env::var("USER"))
             .unwrap_or_else(|_| "Developer".to_string());
+        // Long names are cut to fit their panel, so the borders line up.
+        let fit = |text: &str, width: usize| -> String {
+            if text.chars().count() <= width {
+                return text.to_string();
+            }
+            let kept = text
+                .chars()
+                .take(width.saturating_sub(3))
+                .collect::<String>();
+            format!("{kept}...")
+        };
         let model_short = self.model.split('/').last().unwrap_or(&self.model);
         let active = provider::active_provider();
         let provider = active.as_ref().map_or_else(
@@ -2430,117 +2473,108 @@ impl LiveCli {
             rs = " ".repeat(w_right),
         ));
 
+        // A row of the box: each cell padded to its panel's width, art and text alike.
+        let row = |left: &str, right: &str| {
+            format!(
+                "  {b}|{r}{left}{lpad}{b}|{r}{right}{rpad}{b}|{r}",
+                lpad = " ".repeat(w_left.saturating_sub(brand::strip_ansi_len(left))),
+                rpad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(right))),
+            )
+        };
+        let red = RED;
+
         // Welcome + Tips heading
-        let welcome = format!("{w}{bd}Welcome back, {user}!{r}", user = username);
+        let welcome = format!(
+            "{w}{bd}Welcome back, {user}!{r}",
+            user = fit(&username, w_left - "  Welcome back, !".len())
+        );
         let tips = format!("{o}{bd}Tips for getting started{r}");
-        lines.push(format!(
-            "  {b}|{r}  {welcome}{wpad}{b}|{r}  {tips}{tpad}{b}|{r}",
-            wpad = " ".repeat(w_left.saturating_sub(brand::strip_ansi_len(&welcome) + 2)),
-            tpad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&tips) + 2)),
-        ));
+        lines.push(row(&format!("  {welcome}"), &format!("  {tips}")));
 
         // Tips content
         let tip1 = format!("{d}Run{r} {o}/init{r} {d}to create a NEURON.md{r}");
-        lines.push(format!(
-            "  {b}|{r}{ls}{b}|{r}  {tip1}{tpad}{b}|{r}",
-            ls = " ".repeat(w_left),
-            tpad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&tip1) + 2)),
-        ));
+        lines.push(row("", &format!("  {tip1}")));
 
         let tip2 = format!("{d}file with project context{r}");
-        lines.push(format!(
-            "  {b}|{r}   {s}*{r}        {s}.{r}        {s}*{r}   {hpad}{b}|{r}  {tip2}{tpad}{b}|{r}",
-            hpad = " ".repeat(w_left.saturating_sub(27)),
-            tpad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&tip2) + 2)),
+        lines.push(row(
+            &format!("   {s}*{r}        {s}.{r}        {s}*{r}"),
+            &format!("  {tip2}"),
         ));
 
         let tip3 = format!("{d}instructions for Neuron...{r}");
-        lines.push(format!(
-            "  {b}|{r}  {s}.{r}  {b}\\--\\{r}    {b}/--/{r}  {s}.{r}   {hpad}{b}|{r}  {tip3}{tpad}{b}|{r}",
-            hpad = " ".repeat(w_left.saturating_sub(27)),
-            tpad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&tip3) + 2)),
+        lines.push(row(
+            &format!("  {s}.{r}  {b}\\--\\{r}    {b}/--/{r}  {s}.{r}"),
+            &format!("  {tip3}"),
         ));
 
         // Helix center rows + what's new
         let whatsnew = format!("{o}{bd}What's new{r}");
-        lines.push(format!(
-            "  {b}|{r} {s}*{r}    {b}\\--{o}X{RED}----{o}X{b}--/{r}    {s}*{r}   {hpad}{b}|{r}{rpad}{b}|{r}",
-            RED=RED, hpad = " ".repeat(w_left.saturating_sub(30)),
-            rpad = " ".repeat(w_right),
+        lines.push(row(
+            &format!(" {s}*{r}    {b}\\--{o}X{red}----{o}X{b}--/{r}    {s}*{r}"),
+            "",
         ));
-
-        lines.push(format!(
-            "  {b}|{r} {s}.{r}  {g}/{b}--/{r}  {s}.  .{r}  {b}\\--{g}\\{r}  {s}.{r}  {hpad}{b}|{r}  {whatsnew}{wpad}{b}|{r}",
-            hpad = " ".repeat(w_left.saturating_sub(30)),
-            wpad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&whatsnew) + 2)),
+        lines.push(row(
+            &format!(" {s}.{r}  {g}/{b}--/{r}  {s}.  .{r}  {b}\\--{g}\\{r}  {s}.{r}"),
+            &format!("  {whatsnew}"),
         ));
 
         // What's new items
         let news = [
             format!("{d}- Zero-X model catalog: /model{r}"),
             format!("{d}- Plan usage: /usage, /upgrade{r}"),
-            format!("{d}- {repo_status}{r}"),
+            format!("{d}- {}{r}", fit(&repo_status, w_right - 4)),
             format!("{d}/release-notes for more{r}"),
         ];
-
-        lines.push(format!(
-            "  {b}|{r}    {RED}X{b}--/{r}   {s}.  .{r}   {b}\\--{RED}X{r}   {hpad}{b}|{r}  {n}{npad}{b}|{r}",
-            RED=RED, hpad = " ".repeat(w_left.saturating_sub(30)),
-            n = news[0], npad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&news[0]) + 2)),
+        lines.push(row(
+            &format!("    {red}X{b}--/{r}   {s}.  .{r}   {b}\\--{red}X{r}"),
+            &format!("  {}", news[0]),
         ));
-
-        lines.push(format!(
-            "  {b}|{r} {s}.{r}  {g}\\{b}--/{r}  {s}.  .{r}  {b}\\--{g}/{r}  {s}.{r}  {hpad}{b}|{r}  {n}{npad}{b}|{r}",
-            hpad = " ".repeat(w_left.saturating_sub(30)),
-            n = news[1], npad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&news[1]) + 2)),
+        lines.push(row(
+            &format!(" {s}.{r}  {g}\\{b}--/{r}  {s}.  .{r}  {b}\\--{g}/{r}  {s}.{r}"),
+            &format!("  {}", news[1]),
         ));
-
-        lines.push(format!(
-            "  {b}|{r} {s}*{r}    {b}\\--{o}X{RED}----{o}X{b}--/{r}    {s}*{r}   {hpad}{b}|{r}  {n}{npad}{b}|{r}",
-            RED=RED, hpad = " ".repeat(w_left.saturating_sub(30)),
-            n = news[2], npad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&news[2]) + 2)),
+        lines.push(row(
+            &format!(" {s}*{r}    {b}\\--{o}X{red}----{o}X{b}--/{r}    {s}*{r}"),
+            &format!("  {}", news[2]),
         ));
-
-        lines.push(format!(
-            "  {b}|{r}  {s}.{r}  {b}\\---{r}    {b}\\--/{r}  {s}.{r}   {hpad}{b}|{r}  {n}{npad}{b}|{r}",
-            hpad = " ".repeat(w_left.saturating_sub(27)),
-            n = news[3], npad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&news[3]) + 2)),
+        lines.push(row(
+            &format!("  {s}.{r}  {b}\\---{r}    {b}\\--/{r}  {s}.{r}"),
+            &format!("  {}", news[3]),
         ));
 
         // Neuron branding row
-        lines.push(format!(
-            "  {b}|{r}   {s}*{r}     {ng}     {s}*{r}     {hpad}{b}|{r}{rpad}{b}|{r}",
-            hpad = " ".repeat(w_left.saturating_sub(27)),
-            rpad = " ".repeat(w_right),
-        ));
+        lines.push(row(&format!("   {s}*{r}     {ng}     {s}*{r}"), ""));
 
         // @ zero-x.live
-        lines.push(format!(
-            "  {b}|{r}      {s}@{r} {d}zero-x.live{r}          {hpad}{b}|{r}{rpad}{b}|{r}",
-            hpad = " ".repeat(w_left.saturating_sub(33)),
-            rpad = " ".repeat(w_right),
-        ));
+        lines.push(row(&format!("      {s}@{r} {d}zero-x.live{r}"), ""));
 
-        // Model info
+        // Model info: on one line when it fits, else the model, then the rest.
+        let inner = w_left - 2;
         let model_info = format!(
             "{g}{ms}{r} {d}.{r} {b}{prov}{r} {d}. Plan: {qs}{r}",
             ms = model_short,
             prov = provider,
             qs = quota_str
         );
-        lines.push(format!(
-            "  {b}|{r}  {model_info}{mpad}{b}|{r}{rpad}{b}|{r}",
-            mpad = " ".repeat(w_left.saturating_sub(brand::strip_ansi_len(&model_info) + 2)),
-            rpad = " ".repeat(w_right),
-        ));
+        let model_lines = if brand::strip_ansi_len(&model_info) <= inner {
+            vec![model_info]
+        } else {
+            let rest = format!("{provider} . Plan: {quota_str}");
+            vec![
+                format!("{g}{}{r}", fit(model_short, inner)),
+                if rest.chars().count() <= inner {
+                    format!("{b}{provider}{r} {d}. Plan: {quota_str}{r}")
+                } else {
+                    format!("{d}{}{r}", fit(&rest, inner))
+                },
+            ]
+        };
+        for model_line in model_lines {
+            lines.push(row(&format!("  {model_line}"), ""));
+        }
 
         // CWD
-        let cwd_line = format!("{d}{cwd}{r}");
-        lines.push(format!(
-            "  {b}|{r}  {cwd_line}{cpad}{b}|{r}{rpad}{b}|{r}",
-            cpad = " ".repeat(w_left.saturating_sub(brand::strip_ansi_len(&cwd_line) + 2)),
-            rpad = " ".repeat(w_right),
-        ));
+        lines.push(row(&format!("  {d}{cwd}{r}"), ""));
 
         // Empty row
         lines.push(format!(
@@ -3145,7 +3179,7 @@ impl LiveCli {
             &self.model,
             StatusUsage {
                 message_count: self.runtime.session().messages.len(),
-                turns: self.runtime.usage().turns(),
+                turns: prompt_count(self.runtime.session()),
                 latest,
                 cumulative,
                 estimated_tokens: self.runtime.estimated_tokens(),
@@ -3226,7 +3260,7 @@ impl LiveCli {
                 format_model_report(
                     &self.model,
                     self.runtime.session().messages.len(),
-                    self.runtime.usage().turns(),
+                    prompt_count(self.runtime.session()),
                 )
             );
             if let Some(listing) = gateway_repl::gateway_model_listing(&self.model) {
@@ -3246,7 +3280,7 @@ impl LiveCli {
                 format_model_report(
                     &self.model,
                     self.runtime.session().messages.len(),
-                    self.runtime.usage().turns(),
+                    prompt_count(self.runtime.session()),
                 )
             );
             return Ok(false);
@@ -3408,7 +3442,7 @@ impl LiveCli {
             format_resume_report(
                 &self.session.path.display().to_string(),
                 message_count,
-                self.runtime.usage().turns(),
+                prompt_count(self.runtime.session()),
             )
         );
         Ok(true)
@@ -4583,11 +4617,13 @@ fn build_runtime_plugin_state_starting_mcp(
         McpStartup::Wait | McpStartup::WaitWithoutBundled => None,
     };
     let (mcp_state, runtime_tools, background) = if let Some(mut stand_in) = stand_in {
+        let background = BackgroundMcp::start(servers);
         stand_in.starting = true;
+        stand_in.background = Some(Arc::clone(&background.shared));
         (
             Some(Arc::new(Mutex::new(stand_in))),
             mcp_wrapper_tool_definitions(),
-            Some(BackgroundMcp::start(servers)),
+            Some(background),
         )
     } else {
         let (mcp_state, runtime_tools) = build_runtime_mcp_state(&servers)?;
@@ -5574,7 +5610,12 @@ mod tests {
         // the parser says if it ever sees it.
         let login = parse_args(&["login".to_string()]).expect_err("login is not a parser action");
         assert!(login.contains("`neuron login [--no-browser | --with-token]`"));
-        assert!(login.contains("ANTHROPIC_API_KEY"));
+        // The hint is about quoting, not about other providers' keys.
+        assert!(!login.contains("ANTHROPIC_API_KEY"), "{login}");
+        assert!(
+            login.ends_with("or use `neuron prompt \"login ...\"`."),
+            "{login}"
+        );
         // An unquoted prompt that starts with an account command's name is not guessed.
         for word in ["login", "logout", "auth", "usage", "upgrade"] {
             let prompt = [word, "to", "the", "server", "and", "fix", "it"].map(String::from);
@@ -5584,7 +5625,7 @@ mod tests {
         }
         let logout =
             parse_args(&["logout".to_string()]).expect_err("logout is not a parser action");
-        assert!(logout.contains("ANTHROPIC_AUTH_TOKEN"));
+        assert!(!logout.contains("ANTHROPIC_AUTH_TOKEN"), "{logout}");
         assert_eq!(
             parse_args(&["doctor".to_string()]).expect("doctor should parse"),
             CliAction::Doctor {
@@ -5635,25 +5676,16 @@ mod tests {
                 output_format: CliOutputFormat::Text,
             }
         );
-        assert_eq!(
-            parse_args(&[
-                "skills".to_string(),
-                "help".to_string(),
-                "overview".to_string()
-            ])
-            .expect("skills help overview should invoke"),
-            CliAction::Prompt {
-                prompt: "$help overview".to_string(),
-                model: DEFAULT_MODEL.to_string(),
-                output_format: CliOutputFormat::Text,
-                allowed_tools: None,
-                permission_mode: crate::default_permission_mode(),
-                compact: false,
-                base_commit: None,
-                reasoning_effort: None,
-                allow_broad_cwd: false,
-            }
-        );
+        // `skills NAME ...` runs skill NAME; there is no skill "help", so the words are an
+        // unquoted prompt.
+        let error = parse_args(&[
+            "skills".to_string(),
+            "help".to_string(),
+            "overview".to_string(),
+        ])
+        .expect_err("skills help overview names no skill");
+        assert!(error.contains("Unknown skill: help"), "{error}");
+        assert!(error.contains("neuron prompt \"skills ...\""), "{error}");
         assert_eq!(
             parse_args(&["agents".to_string(), "--help".to_string()])
                 .expect("agents help should parse"),
@@ -6080,14 +6112,14 @@ mod tests {
     fn multi_word_prompt_still_uses_shorthand_prompt_mode() {
         let _guard = env_lock();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
-        // Input is ["help", "me", "debug"] so the joined prompt shorthand
-        // must be "help me debug". A previous batch accidentally rewrote
-        // the expected string to "$help overview" (copy-paste slip).
+        // Input is ["explain", "me", "this"] so the joined prompt shorthand
+        // must be "explain me this". (A prompt that starts with a subcommand
+        // such as `help` needs quotes: see the next test.)
         assert_eq!(
-            parse_args(&["help".to_string(), "me".to_string(), "debug".to_string()])
+            parse_args(&["explain".to_string(), "me".to_string(), "this".to_string()])
                 .expect("prompt shorthand should still work"),
             CliAction::Prompt {
-                prompt: "help me debug".to_string(),
+                prompt: "explain me this".to_string(),
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
@@ -6098,6 +6130,144 @@ mod tests {
                 allow_broad_cwd: false,
             }
         );
+        // Quoted, it is one argument: a prompt.
+        assert!(matches!(
+            parse_args(&["init the database schema".to_string()]),
+            Ok(CliAction::Prompt { prompt, .. }) if prompt == "init the database schema"
+        ));
+    }
+
+    #[test]
+    fn unquoted_prompts_that_start_with_a_subcommand_are_refused_not_run() {
+        let words = |values: &[&str]| values.iter().map(ToString::to_string).collect::<Vec<_>>();
+        for command in [
+            vec!["init", "the", "database", "schema"],
+            vec!["help", "me", "debug"],
+            vec!["version", "of", "python"],
+            vec!["status", "of", "the", "build"],
+            vec!["status", "-x"],
+            vec!["sandbox", "the", "tests"],
+            vec!["doctor", "the", "results"],
+            vec!["state", "machine", "refactor"],
+            vec!["bootstrap-plan", "for", "me"],
+            vec!["agents", "that", "review", "code"],
+            vec!["agents", "list", "them"],
+            vec!["mcp", "server", "for", "github"],
+            vec!["mcp", "show", "the", "github", "server"],
+            vec!["acp", "serve", "now"],
+            vec!["acp", "protocol", "notes"],
+            vec!["dump-manifests", "of", "the", "repo"],
+            vec!["system-prompt", "rewrite"],
+            vec!["export", "the", "database", "schema"],
+            vec!["--model", "sonnet", "init", "the", "repo"],
+            vec!["skills", "install", "a", "b"],
+        ] {
+            let error = parse_args(&words(&command)).expect_err(&command.join(" "));
+            let name = command
+                .iter()
+                .find(|word| !word.starts_with('-') && **word != "sonnet")
+                .unwrap();
+            assert!(
+                error.contains(&format!("`neuron prompt \"{name} ...\"`")),
+                "{command:?}: {error}"
+            );
+            assert!(error.contains("quote it"), "{command:?}: {error}");
+        }
+        let error = parse_args(&words(&["init", "the", "database", "schema"])).unwrap_err();
+        assert!(
+            error.starts_with(
+                "`init` is a neuron command (`neuron init`) and does not take `the database schema`."
+            ),
+            "{error}"
+        );
+        // Unknown options are still named by the subcommand's own parser.
+        assert_eq!(
+            parse_args(&words(&["dump-manifests", "--bogus"])).unwrap_err(),
+            "unknown dump-manifests option: --bogus"
+        );
+        assert_eq!(
+            parse_args(&words(&["export", "--bogus"])).unwrap_err(),
+            "unknown export option: --bogus"
+        );
+    }
+
+    #[test]
+    fn subcommands_keep_the_arguments_they_take() {
+        let words = |values: &[&str]| values.iter().map(ToString::to_string).collect::<Vec<_>>();
+        for command in [
+            vec!["agents", "list"],
+            vec!["agents", "help"],
+            vec!["agents", "list", "--help"],
+            vec!["mcp", "list"],
+            vec!["mcp", "show", "github"],
+            vec!["mcp", "show", "github", "help"],
+            vec!["mcp", "serve"],
+            vec!["mcp", "-h"],
+            vec!["acp", "serve"],
+            vec!["skills", "list"],
+            vec!["skills", "--help"],
+            vec!["skills", "install", "./fixtures/help-skill"],
+            vec!["dump-manifests", "--manifests-dir", "upstream"],
+            vec![
+                "system-prompt",
+                "--cwd",
+                "/tmp/project",
+                "--date",
+                "2026-04-01",
+            ],
+            vec!["export", "notes.md"],
+            vec!["export", "--session", "latest", "-o", "notes.md"],
+            vec!["status", "--help"],
+            vec!["init", "--help"],
+            vec!["--output-format", "json", "init"],
+        ] {
+            assert!(
+                parse_args(&words(&command)).is_ok(),
+                "{command:?}: {:?}",
+                parse_args(&words(&command))
+            );
+        }
+        assert_eq!(
+            parse_args(&words(&["init", "--output-format", "json"])).unwrap(),
+            CliAction::Init {
+                output_format: CliOutputFormat::Json,
+            }
+        );
+        // A slash command's alias gets the same guidance as its name.
+        let error = parse_args(&words(&["plugins"])).unwrap_err();
+        assert!(error.contains("/plugins"), "{error}");
+    }
+
+    #[test]
+    fn skills_subcommand_runs_a_known_skill_and_refuses_other_words() {
+        let _guard = env_lock();
+        let workspace = temp_dir();
+        write_skill_fixture(
+            &workspace.join(".codex").join("skills"),
+            "caveman",
+            "Project skill fixture",
+        );
+        let words = |values: &[&str]| values.iter().map(ToString::to_string).collect::<Vec<_>>();
+
+        let parsed = with_current_dir(&workspace, || {
+            parse_args(&words(&["skills", "caveman", "sharpen", "club"]))
+        });
+        assert!(
+            matches!(&parsed, Ok(CliAction::Prompt { prompt, .. }) if prompt == "$caveman sharpen club"),
+            "{parsed:?}"
+        );
+        let error = with_current_dir(&workspace, || {
+            parse_args(&words(&["skills", "that", "are", "installed"]))
+        })
+        .unwrap_err();
+        assert!(error.contains("Unknown skill: that"), "{error}");
+        assert!(
+            error.contains("Available skills: ") && error.contains("caveman"),
+            "{error}"
+        );
+        assert!(error.contains("`neuron prompt \"skills ...\"`"), "{error}");
+
+        fs::remove_dir_all(workspace).expect("workspace should clean up");
     }
 
     #[test]
@@ -6508,6 +6678,38 @@ mod tests {
 
         assert!(banner.contains("Tips for getting started"));
         assert!(banner.contains("What's new"));
+
+        // A long model name and user name are cut to fit: every row of the box is as
+        // wide as its borders.
+        let username = std::env::var_os("USERNAME");
+        std::env::set_var("USERNAME", "a-very-long-user-name-for-the-banner-test");
+        let banner = with_current_dir(&root, || {
+            LiveCli::new(
+                "claude-sonnet-4-6-with-a-very-long-experimental-suffix-x".to_string(),
+                true,
+                None,
+                PermissionMode::DangerFullAccess,
+            )
+            .expect("cli should initialize")
+            .startup_banner()
+        });
+        match username {
+            Some(username) => std::env::set_var("USERNAME", username),
+            None => std::env::remove_var("USERNAME"),
+        }
+        let widths = banner
+            .lines()
+            .skip(1)
+            .map(crate::brand::strip_ansi_len)
+            .collect::<Vec<_>>();
+        assert!(
+            widths.iter().all(|width| *width == widths[0]),
+            "{widths:?}\n{banner}"
+        );
+        assert!(
+            banner.contains("claude-sonnet-4-6-with-a-very-lon..."),
+            "{banner}"
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
         fs::remove_dir_all(config_home).expect("cleanup config home");
@@ -8128,6 +8330,68 @@ UU conflicted.rs",
         background.stop();
 
         let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn a_background_start_that_ends_during_a_turn_says_its_tools_join_the_next_one() {
+        let workspace = temp_dir();
+        let config_home = workspace.join("config-home");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::write(
+            config_home.join("settings.json"),
+            json!({
+                "defaultMcpServers": false,
+                "mcpServers": {"alpha": {"command": "neuron-test-no-such-mcp-server"}}
+            })
+            .to_string(),
+        )
+        .expect("write mcp settings");
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let runtime_config = loader.load().expect("runtime config should load");
+        let (state, background) = build_runtime_plugin_state_starting_mcp(
+            &workspace,
+            &loader,
+            &runtime_config,
+            McpStartup::Background,
+        )
+        .expect("runtime plugin state should build at once");
+        let background = background.expect("the servers start in the background");
+        let mut executor = CliToolExecutor::new(
+            None,
+            false,
+            state.tool_registry.clone(),
+            state.mcp_state.clone(),
+        );
+
+        // The start ends while this turn's runtime still has the stand-in.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while background.shared.finished().is_none() {
+            assert!(Instant::now() < deadline, "the start never ended");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let search: serde_json::Value = serde_json::from_str(
+            &executor
+                .execute("ToolSearch", r#"{"query":"alpha echo","max_results":5}"#)
+                .expect("tool search runs"),
+        )
+        .expect("search output is json");
+        assert_eq!(search["pending_mcp_servers"], json!(["alpha"]), "{search}");
+        assert!(
+            search["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("join the next turn")),
+            "{search}"
+        );
+        let call = executor
+            .execute(
+                "MCPTool",
+                r#"{"qualifiedName":"mcp__alpha__echo","arguments":{}}"#,
+            )
+            .expect_err("the stand-in runs no tool");
+        assert!(call.to_string().contains("join the next turn"), "{call}");
+
+        background.stop();
         let _ = fs::remove_dir_all(workspace);
     }
 

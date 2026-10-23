@@ -39,7 +39,7 @@ pub fn format_tool_call_start(name: &str, input: &str) -> String {
             format!(
                 "{ICON_EDIT} {ORANGE}{BOLD}Editing {path}{R}{}",
                 format_patch_preview(old_value, new_value)
-                    .map(|preview| format!("\n{BLUE}\u{2502}{R}  {preview}"))
+                    .map(|preview| format!("\n{preview}"))
                     .unwrap_or_default()
             )
         }
@@ -65,8 +65,18 @@ pub fn format_tool_call_start(name: &str, input: &str) -> String {
     let label_len = strip_ansi_len(&format!("{ORANGE}{BOLD}{label}{R}"));
     let left_pad = 3; // "───"
     let right_pad = tw.saturating_sub(left_pad + label_len);
+    // Every line of the detail inside the box, behind its left border.
+    let detail = if detail.is_empty() {
+        format!("{BLUE}\u{2502}{R}  ")
+    } else {
+        detail
+            .lines()
+            .map(|line| format!("{BLUE}\u{2502}{R}  {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     format!(
-        "{BLUE}\u{256d}{left}{ORANGE}{BOLD}{label}{R}{BLUE}{right}\u{256e}{R}\n{BLUE}\u{2502}{R}  {detail}\n{BLUE}\u{2570}{bottom}\u{256f}{R}",
+        "{BLUE}\u{256d}{left}{ORANGE}{BOLD}{label}{R}{BLUE}{right}\u{256e}{R}\n{detail}\n{BLUE}\u{2570}{bottom}\u{256f}{R}",
         left = "\u{2500}".repeat(left_pad),
         right = "\u{2500}".repeat(right_pad),
         bottom = "\u{2500}".repeat(tw.saturating_sub(2)),
@@ -409,18 +419,22 @@ pub fn format_glob_result(icon: &str, parsed: &serde_json::Value) -> String {
                 .join("\n")
         })
         .unwrap_or_default();
+    let files = count_of(num_files, "file", "files");
     if filenames.is_empty() {
-        format!("{icon} \x1b[38;5;245mglob_search\x1b[0m matched {num_files} files")
+        format!("{icon} \x1b[38;5;245mglob_search\x1b[0m matched {files}")
     } else {
-        format!("{icon} \x1b[38;5;245mglob_search\x1b[0m matched {num_files} files\n{filenames}")
+        format!("{icon} \x1b[38;5;245mglob_search\x1b[0m matched {files}\n{filenames}")
     }
 }
 
+/// `1 file`, `2 files`.
+fn count_of(count: u64, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
+}
+
 pub fn format_grep_result(icon: &str, parsed: &serde_json::Value) -> String {
-    let num_matches = parsed
-        .get("numMatches")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
+    // Absent in `files_with_matches` mode, which does not count matches.
+    let num_matches = parsed.get("numMatches").and_then(serde_json::Value::as_u64);
     let num_files = parsed
         .get("numFiles")
         .and_then(serde_json::Value::as_u64)
@@ -441,9 +455,14 @@ pub fn format_grep_result(icon: &str, parsed: &serde_json::Value) -> String {
                 .join("\n")
         })
         .unwrap_or_default();
-    let summary = format!(
-        "{icon} \x1b[38;5;245mgrep_search\x1b[0m {num_matches} matches across {num_files} files"
-    );
+    let files = count_of(num_files, "file", "files");
+    let summary = match num_matches {
+        Some(num_matches) => format!(
+            "{icon} \x1b[38;5;245mgrep_search\x1b[0m {} across {files}",
+            count_of(num_matches, "match", "matches")
+        ),
+        None => format!("{icon} \x1b[38;5;245mgrep_search\x1b[0m matched {files}"),
+    };
     if !content.trim().is_empty() {
         format!(
             "{summary}\n{}",
@@ -544,4 +563,51 @@ pub fn truncate_output_for_display(content: &str, max_lines: usize, max_chars: u
         preview.push_str(DISPLAY_TRUNCATION_NOTICE);
     }
     preview
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_grep_result, format_tool_call_start};
+    use crate::render::strip_ansi;
+
+    #[test]
+    fn grep_summaries_count_what_the_mode_counts() {
+        let files_only = serde_json::json!({
+            "mode": "files_with_matches", "numFiles": 1, "filenames": ["src/lib.rs"]
+        });
+        assert_eq!(
+            strip_ansi(&format_grep_result("ok", &files_only)),
+            "ok grep_search matched 1 file\nsrc/lib.rs"
+        );
+        let content = serde_json::json!({
+            "mode": "content", "numFiles": 2, "numMatches": 3, "filenames": [], "content": "a:1:x"
+        });
+        assert!(strip_ansi(&format_grep_result("ok", &content))
+            .starts_with("ok grep_search 3 matches across 2 files\n"));
+    }
+
+    #[test]
+    fn every_line_of_a_tool_call_is_inside_its_box() {
+        let start = strip_ansi(&format_tool_call_start(
+            "grep_search",
+            r#"{"pattern":"fn main","path":"src"}"#,
+        ));
+        let lines = start.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 4, "{start}");
+        assert!(lines[1].starts_with("\u{2502}  ") && lines[1].contains("fn main"));
+        assert_eq!(lines[2], "\u{2502}  in src");
+        assert!(lines[3].starts_with('\u{2570}'));
+
+        let edit = strip_ansi(&format_tool_call_start(
+            "edit_file",
+            r#"{"path":"a.rs","old_string":"one\ntwo","new_string":"three"}"#,
+        ));
+        let inner = edit.lines().skip(1).collect::<Vec<_>>();
+        let (bottom, inner) = inner.split_last().unwrap();
+        assert!(bottom.starts_with('\u{2570}'));
+        assert!(
+            inner.iter().all(|line| line.starts_with("\u{2502}  ")),
+            "{edit}"
+        );
+    }
 }

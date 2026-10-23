@@ -440,7 +440,8 @@ fn warn_about_env_token() {
 }
 
 /// `neuron auth status`: validates the credential with the server and prints
-/// plan, expiry and today's usage.
+/// plan, expiry and today's usage. A login that expired or was revoked is signed
+/// out: said once, on stdout, with the signed-out exit code.
 fn status() -> Result<(), Box<dyn std::error::Error>> {
     let Some(credential) = env_credential()?.or_else(stored_credential_for_use) else {
         println!("Signed out of Zero-X. Run `neuron auth login`.");
@@ -448,20 +449,28 @@ fn status() -> Result<(), Box<dyn std::error::Error>> {
     };
     let base = gateway_base_url()?;
     let now = crate::clock::now_unix();
+    if credential.is_expired(now) {
+        println!("{}", signed_out_line(&credential, Some(now)));
+        std::process::exit(SIGNED_OUT_EXIT_CODE);
+    }
+    let verified = fetch_session(&base, &credential.token, credential.kind);
+    if verified
+        .as_ref()
+        .is_err_and(GatewayHttpError::is_invalid_session)
+    {
+        println!("{}", signed_out_line(&credential, None));
+        std::process::exit(SIGNED_OUT_EXIT_CODE);
+    }
     println!("Zero-X");
     println!("  Signed in        yes ({})", credential.source.describe());
     println!("  Gateway          {base}");
-    let session = match fetch_session(&base, &credential.token, credential.kind) {
+    let session = match verified {
         Ok(info) => {
             if let CredentialSource::Stored(_) = credential.source {
                 refresh_stored_metadata(&credential, &info);
             }
             println!("  Session          valid");
             info
-        }
-        Err(error) if error.is_invalid_session() => {
-            recover_invalid_session()?;
-            return Ok(());
         }
         Err(error) => {
             println!("  Session          not verified: {error}");
@@ -484,9 +493,6 @@ fn status() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{line}");
             }
         }
-        Err(error) if error.is_invalid_session() => {
-            recover_invalid_session()?;
-        }
         Err(error) => {
             if let Some(plan) = &session.plan {
                 println!("  Plan             {plan}");
@@ -497,20 +503,52 @@ fn status() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// `neuron auth status` for a login that expired (`now` given: it expired by its
+/// stored expiry) or that the gateway rejected.
+fn signed_out_line(credential: &GatewayCredential, now: Option<u64>) -> String {
+    let what = match now {
+        Some(now) => format!(
+            "the session expired {}",
+            describe_expiry(credential.expires_at, now)
+        ),
+        None => "the session expired or was revoked".to_string(),
+    };
+    let next = match credential.source {
+        CredentialSource::EnvToken => {
+            "Set a valid NEURON_TOKEN, or unset it and run `neuron auth login`."
+        }
+        CredentialSource::Stored(_) => "Run `neuron auth login`.",
+    };
+    format!(
+        "Signed out of Zero-X: {what} ({}). {next}",
+        credential.source.describe()
+    )
+}
+
 /// `neuron auth status --output-format json`: what [`status`] prints, as JSON, and
 /// whether a usable login was found. Never includes the token.
 fn status_json() -> Result<(Value, bool), Box<dyn std::error::Error>> {
     let Some(credential) = env_credential()?.or_else(stored_credential_for_use) else {
-        return Ok((serde_json::json!({ "signed_in": false }), false));
+        return Ok((
+            serde_json::json!({ "type": "auth_status", "signed_in": false }),
+            false,
+        ));
     };
     let base = gateway_base_url()?;
     let mut report = serde_json::json!({
+        "type": "auth_status",
         "signed_in": true,
         "source": credential.source.describe(),
         "gateway": base,
         "plan": credential.plan,
         "expires_at": credential.expires_at,
     });
+    if credential.is_expired(crate::clock::now_unix()) {
+        report["signed_in"] = false.into();
+        report["session"] = "expired".into();
+        report["error"] = api::INVALID_SESSION_MESSAGE.into();
+        return Ok((report, false));
+    }
     match fetch_session(&base, &credential.token, credential.kind) {
         Ok(info) => {
             if let CredentialSource::Stored(_) = credential.source {

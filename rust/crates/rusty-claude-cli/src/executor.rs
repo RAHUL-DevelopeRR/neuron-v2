@@ -202,18 +202,16 @@ impl CliToolExecutor {
         let input: ToolSearchRequest = serde_json::from_value(value)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
         let (pending_mcp_servers, mcp_degraded, mcp_starting) =
-            self.mcp_state
-                .as_ref()
-                .map_or((None, None, false), |state| {
-                    let state = state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    (
-                        state.pending_servers(),
-                        state.degraded_report(),
-                        state.is_starting(),
-                    )
-                });
+            self.mcp_state.as_ref().map_or((None, None, None), |state| {
+                let state = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (
+                    state.pending_servers(),
+                    state.degraded_report(),
+                    state.starting_note(),
+                )
+            });
         let output = self.tool_registry.search(
             &input.query,
             input.max_results.unwrap_or(5),
@@ -222,11 +220,9 @@ impl CliToolExecutor {
         );
         let mut output =
             serde_json::to_value(output).map_err(|error| ToolError::new(error.to_string()))?;
-        if mcp_starting {
+        if let Some(note) = mcp_starting {
             // Like the MCP tools say: no match yet is not "no such tool".
-            output["note"] = json!(
-                "The MCP servers in pending_mcp_servers are still starting, so their tools are not searchable yet; search again in a moment."
-            );
+            output["note"] = json!(note);
         }
         serde_json::to_string_pretty(&output).map_err(|error| ToolError::new(error.to_string()))
     }
@@ -275,6 +271,17 @@ impl CliToolExecutor {
 
 impl ToolExecutor for CliToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        self.execute_with_cancellation(tool_name, input, &runtime::CancellationToken::new())
+    }
+
+    /// An interrupted turn cancels `cancel`: `bash`, `PowerShell` and `REPL` then kill
+    /// the command's whole process tree and return the output captured so far.
+    fn execute_with_cancellation(
+        &mut self,
+        tool_name: &str,
+        input: &str,
+        cancel: &runtime::CancellationToken,
+    ) -> Result<String, ToolError> {
         if self
             .allowed_tools
             .as_ref()
@@ -292,7 +299,7 @@ impl ToolExecutor for CliToolExecutor {
             self.execute_runtime_tool(tool_name, value)
         } else {
             self.tool_registry
-                .execute(tool_name, &value)
+                .execute_with_cancel(tool_name, &value, cancel)
                 .map_err(ToolError::new)
         };
         match result {
@@ -738,5 +745,149 @@ mod channel_prompter_tests {
         )
         .decide(&request(&[]));
         assert!(matches!(decision, PermissionPromptDecision::Deny { .. }));
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::CliToolExecutor;
+    use runtime::{CancellationToken, ToolExecutor};
+    use serde_json::{json, Value};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::thread;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use tools::GlobalToolRegistry;
+
+    /// Where the command under test writes the PID of the long-running child it starts.
+    fn pid_file(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        std::env::temp_dir().join(format!(
+            "neuron-cancel-{label}-{}-{nanos}.pid",
+            std::process::id()
+        ))
+    }
+
+    /// Whether process `pid` still runs (a zombie waiting to be reaped does not).
+    fn is_running(pid: u32) -> bool {
+        if cfg!(windows) {
+            Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+                .output()
+                .is_ok_and(|output| {
+                    String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+                })
+        } else {
+            Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .is_ok_and(|output| {
+                    let state = String::from_utf8_lossy(&output.stdout);
+                    let state = state.trim();
+                    !state.is_empty() && !state.starts_with('Z')
+                })
+        }
+    }
+
+    /// Runs `tool` through the CLI executor, interrupts the turn once the command's child
+    /// wrote its PID to `pid_file`, and checks that the call returns promptly with an
+    /// interrupted result and that the child is gone with the shell that started it.
+    fn assert_interrupt_kills_the_process_tree(tool: &str, input: &Value, pid_file: &Path) {
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        let watched = pid_file.to_path_buf();
+        let interrupter = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let pid = loop {
+                if let Some(pid) = std::fs::read_to_string(&watched)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok())
+                {
+                    break pid;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the command never started its child"
+                );
+                thread::sleep(Duration::from_millis(50));
+            };
+            let running_before = is_running(pid);
+            trigger.cancel();
+            (pid, running_before, Instant::now())
+        });
+        let mut executor = CliToolExecutor::new(None, false, GlobalToolRegistry::builtin(), None);
+        let result = executor.execute_with_cancellation(tool, &input.to_string(), &cancel);
+        let returned = Instant::now();
+        let (pid, running_before, interrupted_at) = interrupter.join().expect("interrupter");
+        let _ = std::fs::remove_file(pid_file);
+
+        assert!(running_before, "child {pid} runs until the interrupt");
+        let error = result.expect_err("a cancelled command is an error result");
+        let output: Value = serde_json::from_str(&error.to_string()).expect("the JSON envelope");
+        assert_eq!(output["interrupted"], true, "{output}");
+        assert_eq!(output["returnCodeInterpretation"], "cancelled", "{output}");
+        let took = returned.saturating_duration_since(interrupted_at);
+        assert!(
+            took < Duration::from_secs(5),
+            "returned {took:?} after the interrupt"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while is_running(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "child {pid} still runs after the interrupt"
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    #[test]
+    fn an_interrupt_kills_a_running_bash_command_and_its_children() {
+        let pid_file = pid_file("bash");
+        // The shell starts a child that would run for 30 s; the child reports its PID.
+        let command = if cfg!(windows) {
+            format!(
+                "powershell -NoProfile -NonInteractive -Command \"Set-Content -LiteralPath '{}' -Value $PID; Start-Sleep -Seconds 30\"",
+                pid_file.display()
+            )
+        } else {
+            format!("sleep 30 & echo $! > '{}'; wait", pid_file.display())
+        };
+        assert_interrupt_kills_the_process_tree(
+            "bash",
+            &json!({ "command": command, "timeout": 90_000 }),
+            &pid_file,
+        );
+    }
+
+    #[test]
+    #[allow(clippy::print_stderr)]
+    fn an_interrupt_kills_a_running_powershell_command_and_its_children() {
+        let shell = if cfg!(windows) { "powershell" } else { "pwsh" };
+        if Command::new(shell)
+            .args(["-NoProfile", "-Command", "exit 0"])
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: {shell} is not installed");
+            return;
+        }
+        let pid_file = pid_file("powershell");
+        let (program, arguments) = if cfg!(windows) {
+            ("ping.exe", "'-n','30','127.0.0.1'")
+        } else {
+            ("sleep", "'30'")
+        };
+        let command = format!(
+            "$child = Start-Process -FilePath {program} -ArgumentList {arguments} -NoNewWindow -PassThru; Set-Content -LiteralPath '{}' -Value $child.Id; $child.WaitForExit()",
+            pid_file.display()
+        );
+        assert_interrupt_kills_the_process_tree(
+            "PowerShell",
+            &json!({ "command": command, "timeout": 90_000 }),
+            &pid_file,
+        );
     }
 }

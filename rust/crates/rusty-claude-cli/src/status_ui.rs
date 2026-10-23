@@ -335,6 +335,23 @@ pub(crate) fn status_context(
     })
 }
 
+/// The turns of a session as the user counts them: the prompts sent, which are its user
+/// messages (tool results are messages of their own) less the runtime's automatic
+/// "continue" nudges. The usage tracker's `turns` counts model requests instead.
+pub(crate) fn prompt_count(session: &Session) -> u32 {
+    let prompts = session
+        .messages
+        .iter()
+        .filter(|message| {
+            message.role == MessageRole::User
+                && !message.blocks.iter().any(|block| {
+                    matches!(block, ContentBlock::Text { text } if text.starts_with(runtime::AUTO_CONTINUE_PREFIX))
+                })
+        })
+        .count();
+    u32::try_from(prompts).unwrap_or(u32::MAX)
+}
+
 pub(crate) fn format_status_report(
     model: &str,
     usage: StatusUsage,
@@ -812,5 +829,26 @@ mod tests {
         let json = status_json_value(Some("openai/auto"), usage, "workspace-write", &context);
         assert_eq!(json["model"], "auto");
         assert!(status_json_value(None, usage, "workspace-write", &context)["model"].is_null());
+    }
+
+    /// Turns are the prompts sent, not the model requests a tool loop makes.
+    #[test]
+    fn turns_count_the_prompts_not_the_model_requests() {
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::user_text("fix the bug"),
+            ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "t1".to_string(),
+                name: "bash".to_string(),
+                input: "{}".to_string(),
+            }]),
+            ConversationMessage::tool_result("t1", "bash", "ok", false),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "Fixed.".to_string(),
+            }]),
+            ConversationMessage::user_text(format!("{} continue", runtime::AUTO_CONTINUE_PREFIX)),
+            ConversationMessage::user_text("now add a test"),
+        ];
+        assert_eq!(prompt_count(&session), 2);
     }
 }

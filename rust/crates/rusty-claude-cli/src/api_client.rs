@@ -295,6 +295,22 @@ pub(crate) struct AnthropicRuntimeClient {
     progress_reporter: Option<InternalPromptProgressReporter>,
     reasoning_effort: Option<String>,
     timeouts: StreamTimeouts,
+    /// The turn (by the index of its prompt) whose request was too large with the
+    /// deferred MCP tool definitions: its later requests leave them out at once.
+    oversized_with_deferred_tools: Option<usize>,
+}
+
+/// The notice shown when a request that was too large is sent again without the
+/// `count` MCP tool definitions `ToolSearch` brought in.
+pub(crate) fn deferred_tools_dropped_notice(count: usize) -> String {
+    let definitions = if count == 1 {
+        "definition"
+    } else {
+        "definitions"
+    };
+    format!(
+        "\n\u{26a0} The request is too large for this model's limit \u{2014} retrying once without the {count} MCP tool {definitions} found by ToolSearch (MCPTool can still call them)\u{2026}"
+    )
 }
 
 /// Builds the provider client for `model`, routing Anthropic models through
@@ -358,6 +374,7 @@ impl AnthropicRuntimeClient {
             progress_reporter,
             reasoning_effort: None,
             timeouts: StreamTimeouts::from_env(),
+            oversized_with_deferred_tools: None,
         })
     }
 
@@ -385,15 +402,32 @@ impl AnthropicRuntimeClient {
         self.timeouts = timeouts;
     }
 
-    fn message_request(&self, request: &ApiRequest) -> MessageRequest {
+    /// The deferred MCP tool definitions `request` carries: the ones its conversation
+    /// brought into play. None with an allow-list, which names every tool itself.
+    fn deferred_mcp_tools(&self, request: &ApiRequest) -> Vec<ToolDefinition> {
+        if !self.enable_tools || self.allowed_tools.is_some() {
+            return Vec::new();
+        }
+        self.tool_registry
+            .deferred_mcp_definitions(&request.messages)
+    }
+
+    fn message_request(
+        &self,
+        request: &ApiRequest,
+        deferred_mcp_tools: Vec<ToolDefinition>,
+    ) -> MessageRequest {
         MessageRequest {
             model: self.model.clone(),
             max_tokens: max_tokens_for_model(&self.model),
             messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
-            tools: self
-                .enable_tools
-                .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
+            tools: self.enable_tools.then(|| {
+                let mut definitions =
+                    filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref());
+                definitions.extend(deferred_mcp_tools);
+                definitions
+            }),
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
             reasoning_effort: self.reasoning_effort.clone(),
@@ -424,20 +458,43 @@ impl ApiClient for AnthropicRuntimeClient {
             progress_reporter.mark_model_phase();
         }
         let after_tool_results = request_ends_with_tool_result(&request);
-        let message_request = self.message_request(&request);
+        let turn = tools::current_turn_start(&request.messages);
+        let deferred_mcp_tools = if self.oversized_with_deferred_tools == Some(turn) {
+            Vec::new()
+        } else {
+            self.deferred_mcp_tools(&request)
+        };
+        let deferred_count = deferred_mcp_tools.len();
+        let mut message_request = self.message_request(&request, deferred_mcp_tools);
 
-        self.runtime.block_on(async {
+        let (result, dropped_deferred_tools) = self.runtime.block_on(async {
             // One retry state for the whole model call: the stream retry
             // below continues the provider client's retry count and budget
             // instead of starting a fresh one.
             let progress = RetryProgress::new();
             let mut attempt = 1;
+            let mut dropped_deferred_tools = false;
             loop {
                 match self
                     .consume_stream(&message_request, after_tool_results, cancel, &progress)
                     .await
                 {
-                    Ok(events) => return Ok(events),
+                    Ok(events) => return (Ok(events), dropped_deferred_tools),
+                    Err(StreamFailure::Fatal(error))
+                        if error.kind() == RuntimeErrorKind::ContextWindowExceeded
+                            && deferred_count > 0
+                            && !dropped_deferred_tools =>
+                    {
+                        // A small budget (such as a free per-minute token limit)
+                        // can fit the conversation but not the MCP tool schemas
+                        // ToolSearch added: send it once more without them before
+                        // the runtime shrinks the conversation itself.
+                        runtime::ui_hooks::notice(&deferred_tools_dropped_notice(deferred_count));
+                        if let Some(definitions) = message_request.tools.as_mut() {
+                            definitions.retain(|tool| !tools::is_deferred_runtime_tool(&tool.name));
+                        }
+                        dropped_deferred_tools = true;
+                    }
                     Err(failure)
                         if failure.is_retryable()
                             && attempt < MAX_STREAM_ATTEMPTS
@@ -453,11 +510,18 @@ impl ApiClient for AnthropicRuntimeClient {
                     }
                     Err(failure) => {
                         let retries = progress.retries().max(attempt - 1);
-                        return Err(failure.into_runtime_error(retries));
+                        return (
+                            Err(failure.into_runtime_error(retries)),
+                            dropped_deferred_tools,
+                        );
                     }
                 }
             }
-        })
+        });
+        if dropped_deferred_tools {
+            self.oversized_with_deferred_tools = Some(turn);
+        }
+        result
     }
 }
 
@@ -1244,6 +1308,8 @@ mod stream_resilience_tests {
         Hang,
         /// A complete text answer.
         Text,
+        /// `400 context_length_exceeded`: over the free per-minute token budget.
+        TooLarge,
     }
 
     struct FakeGateway {
@@ -1251,10 +1317,35 @@ mod stream_resilience_tests {
         connections: Arc<AtomicUsize>,
         /// When each connection was accepted.
         accepted: Arc<Mutex<Vec<Instant>>>,
+        /// The body of each request.
+        bodies: Arc<Mutex<Vec<String>>>,
         _held: Arc<Mutex<Vec<TcpStream>>>,
     }
 
     impl FakeGateway {
+        /// The tool names each request carried, in order.
+        fn tool_names(&self) -> Vec<Vec<String>> {
+            self.bodies
+                .lock()
+                .expect("bodies")
+                .iter()
+                .map(|body| {
+                    let body: serde_json::Value =
+                        serde_json::from_str(body).expect("request body is json");
+                    body["tools"]
+                        .as_array()
+                        .map(|tools| {
+                            tools
+                                .iter()
+                                .filter_map(|tool| tool["function"]["name"].as_str())
+                                .map(ToOwned::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect()
+        }
+
         /// Time between the starts of consecutive requests.
         fn gaps(&self) -> Vec<Duration> {
             let accepted = self.accepted.lock().expect("accepted");
@@ -1298,7 +1389,25 @@ mod stream_resilience_tests {
         write_sse_body(stream, &body);
     }
 
-    fn read_request(stream: &mut TcpStream) {
+    fn write_too_large(stream: &mut TcpStream) {
+        let body = serde_json::json!({"error": {
+            "message": "This request is too large for the free per-minute token budget (8,000 tokens, prompt plus max_tokens). Shorten the conversation or lower max_tokens.",
+            "type": "invalid_request_error",
+            "code": "context_length_exceeded",
+            "param": null,
+            "request_id": "req_too_large"
+        }})
+        .to_string();
+        let _ = write!(
+            stream,
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.flush();
+    }
+
+    /// Reads one request and returns its body.
+    fn read_request(stream: &mut TcpStream) -> String {
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("timeout");
@@ -1320,10 +1429,11 @@ mod stream_resilience_tests {
                     })
                     .unwrap_or(0);
                 if buffer.len() >= header_end + 4 + length {
-                    break;
+                    return String::from_utf8_lossy(&buffer[header_end + 4..]).into_owned();
                 }
             }
         }
+        String::new()
     }
 
     fn sse_chunk(value: &serde_json::Value) -> String {
@@ -1344,16 +1454,19 @@ mod stream_resilience_tests {
         let base_url = format!("http://{}/v1", listener.local_addr().expect("addr"));
         let connections = Arc::new(AtomicUsize::new(0));
         let accepted = Arc::new(Mutex::new(Vec::new()));
+        let bodies = Arc::new(Mutex::new(Vec::new()));
         let held = Arc::new(Mutex::new(Vec::new()));
         let counter = Arc::clone(&connections);
         let accepted_at = Arc::clone(&accepted);
+        let request_bodies = Arc::clone(&bodies);
         let holder = Arc::clone(&held);
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
                 accepted_at.lock().expect("accepted").push(Instant::now());
                 let index = counter.fetch_add(1, Ordering::SeqCst);
-                read_request(&mut stream);
+                let body = read_request(&mut stream);
+                request_bodies.lock().expect("bodies").push(body);
                 match behavior {
                     Behavior::Hang => {}
                     Behavior::Scripted(steps) => match steps.get(index).or(steps.last()).copied() {
@@ -1361,6 +1474,7 @@ mod stream_resilience_tests {
                             write_capacity_exhausted(&mut stream, retry_after);
                         }
                         Some(Step::Text) => write_text_answer(&mut stream, "after the wait"),
+                        Some(Step::TooLarge) => write_too_large(&mut stream),
                         Some(Step::Hang) | None => {}
                     },
                     Behavior::StallAfterFirstChunk => {
@@ -1438,6 +1552,7 @@ mod stream_resilience_tests {
             base_url,
             connections,
             accepted,
+            bodies,
             _held: held,
         }
     }
@@ -1480,6 +1595,7 @@ mod stream_resilience_tests {
             progress_reporter: None,
             reasoning_effort: None,
             timeouts,
+            oversized_with_deferred_tools: None,
         }
     }
 
@@ -1615,6 +1731,100 @@ mod stream_resilience_tests {
             "one request and two retries in total"
         );
         assert!(gateway.gaps()[1] >= Duration::from_millis(400));
+    }
+
+    const PROBE_TOOL: &str = "mcp__probe__navigate";
+
+    /// A client with tools on and one MCP tool, `mcp__probe__navigate`, behind ToolSearch.
+    fn client_with_mcp_probe(gateway: &FakeGateway) -> AnthropicRuntimeClient {
+        let mut client = zero_x_client_for(gateway, fast_timeouts());
+        client.enable_tools = true;
+        client.tool_registry = tools::GlobalToolRegistry::builtin()
+            .with_runtime_tools(vec![tools::RuntimeToolDefinition {
+                name: PROBE_TOOL.to_string(),
+                description: Some("Open a page in the probe browser".to_string()),
+                input_schema: serde_json::json!({ "type": "object" }),
+                required_permission: PermissionMode::ReadOnly,
+            }])
+            .expect("runtime tools register");
+        client
+    }
+
+    /// A turn whose ToolSearch call matched the probe tool.
+    fn request_after_tool_search(prompt: &str) -> ApiRequest {
+        let search = serde_json::json!({
+            "matches": [PROBE_TOOL],
+            "query": "probe",
+            "normalized_query": "probe",
+            "total_deferred_tools": 1
+        });
+        ApiRequest {
+            system_prompt: Vec::new(),
+            messages: vec![
+                ConversationMessage::user_text(prompt),
+                ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                    id: "s1".to_string(),
+                    name: "ToolSearch".to_string(),
+                    input: r#"{"query":"probe"}"#.to_string(),
+                }]),
+                ConversationMessage::tool_result("s1", "ToolSearch", search.to_string(), false),
+            ],
+        }
+    }
+
+    /// The failed live run: once ToolSearch matched MCP tools, their schemas made every
+    /// request too large for the free per-minute token budget. The request goes out
+    /// once more without them, and the rest of the turn leaves them out at once.
+    #[test]
+    fn a_request_too_large_with_deferred_mcp_tools_is_resent_once_without_them() {
+        static STEPS: &[Step] = &[Step::TooLarge, Step::Text];
+        let gateway = spawn_gateway(Behavior::Scripted(STEPS));
+        let mut client = client_with_mcp_probe(&gateway);
+        let request = request_after_tool_search("open the probe page");
+
+        let events = client
+            .stream(request.clone())
+            .expect("the request without the MCP tools fits");
+
+        assert!(events.contains(&AssistantEvent::TextDelta("after the wait".to_string())));
+        let sent = gateway.tool_names();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert!(sent[0].iter().any(|name| name == PROBE_TOOL), "{sent:?}");
+        assert!(!sent[1].iter().any(|name| name == PROBE_TOOL), "{sent:?}");
+        assert!(sent[1]
+            .iter()
+            .any(|name| name == "MCPTool" || name == "bash"));
+        assert_eq!(
+            sent[1].len() + 1,
+            sent[0].len(),
+            "only the MCP tool is left out"
+        );
+
+        // Later requests of the same turn leave the MCP tools out at once.
+        client.stream(request).expect("the next request answers");
+        let sent = gateway.tool_names();
+        assert_eq!(sent.len(), 3, "no second rejected request: {sent:?}");
+        assert!(!sent[2].iter().any(|name| name == PROBE_TOOL), "{sent:?}");
+        assert!(super::deferred_tools_dropped_notice(10).contains("10 MCP tool definitions"));
+        assert!(super::deferred_tools_dropped_notice(1).contains("1 MCP tool definition "));
+    }
+
+    #[test]
+    fn a_too_large_request_without_mcp_tools_is_not_resent() {
+        static STEPS: &[Step] = &[Step::TooLarge, Step::Text];
+        let gateway = spawn_gateway(Behavior::Scripted(STEPS));
+        let mut client = client_with_mcp_probe(&gateway);
+
+        let error = client
+            .stream(request(false))
+            .expect_err("nothing to leave out, so the rejection stands");
+
+        // The runtime shrinks the conversation and retries on this kind.
+        assert_eq!(error.kind(), RuntimeErrorKind::ContextWindowExceeded);
+        assert_eq!(gateway.connections.load(Ordering::SeqCst), 1);
+        assert!(!gateway.tool_names()[0]
+            .iter()
+            .any(|name| name == PROBE_TOOL));
     }
 
     #[test]

@@ -81,6 +81,13 @@ pub fn windows_cmd_command(command: &str) -> Command {
     prepared
 }
 
+/// Windows `CREATE_NO_WINDOW` creation flag: the child gets its own console,
+/// which has no window. Background children (MCP servers, hooks) then cannot
+/// retitle the user's terminal (`cmd.exe` and `npm` set the console title) or
+/// get its Ctrl+C; their stdio pipes work as before.
+#[cfg(windows)]
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// Returns `true` when an environment variable holds a credential: a known
 /// Zero-X or provider variable, a secret-looking name, or a Zero-X value.
 #[must_use]

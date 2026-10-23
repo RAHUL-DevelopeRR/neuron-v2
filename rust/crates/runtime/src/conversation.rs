@@ -32,8 +32,14 @@ pub const INTERRUPTED_TOOL_RESULT: &str = "Interrupted by user";
 /// Ends the assistant's reply of an interrupted turn in the transcript: after the
 /// partial answer, or alone when nothing was streamed yet. The next request then sees
 /// that the old one was cut short instead of an unanswered user message (and two
-/// user messages never follow each other).
+/// user messages never follow each other). Models copied the lone note as their next
+/// answer, so model requests leave it out together with its prompt.
 pub const INTERRUPTED_RESPONSE_NOTE: &str = "[response interrupted]";
+/// What a request shows instead of a lone [`INTERRUPTED_RESPONSE_NOTE`] that closes a
+/// turn which ran tools (that turn stays in the request): an out-of-band note, not
+/// something that reads like an answer.
+const INTERRUPTED_TURN_NOTE_FOR_MODEL: &str =
+    "(Note from Neuron, not a reply: the user interrupted this turn before an answer was written.)";
 /// Starts the assistant note that closes a failed turn in the transcript, for the
 /// same reason as [`INTERRUPTED_RESPONSE_NOTE`].
 pub const FAILED_RESPONSE_NOTE_PREFIX: &str = "[response failed: ";
@@ -605,7 +611,7 @@ where
 
             let request = ApiRequest {
                 system_prompt: self.system_prompt.clone(),
-                messages: normalized_messages(&self.session.messages),
+                messages: request_messages(&self.session.messages),
             };
             let events = match self
                 .api_client
@@ -1330,6 +1336,57 @@ pub fn is_truncation_stop_reason(stop_reason: Option<&str>) -> bool {
 pub fn is_turn_end_note(text: &str) -> bool {
     text == INTERRUPTED_RESPONSE_NOTE
         || (text.starts_with(FAILED_RESPONSE_NOTE_PREFIX) && text.ends_with(']'))
+}
+
+/// The transcript as the model sees it: [`normalized_messages`] without the turns the
+/// user interrupted before the model wrote anything. Such a turn is a prompt answered
+/// only by [`INTERRUPTED_RESPONSE_NOTE`], and models took that lone note for an answer
+/// and repeated it for the next, unrelated question. Leaving out the prompt together
+/// with its note keeps user and assistant messages alternating; the session keeps
+/// both. A lone note that closes a turn which ran tools stays, as
+/// [`INTERRUPTED_TURN_NOTE_FOR_MODEL`]. A partial answer ending in the note is kept
+/// as it is.
+fn request_messages(messages: &[ConversationMessage]) -> Vec<ConversationMessage> {
+    let mut request: Vec<ConversationMessage> = Vec::with_capacity(messages.len());
+    for message in normalized_messages(messages) {
+        if !is_lone_interrupted_note(&message) {
+            request.push(message);
+            continue;
+        }
+        let answers_only_a_prompt = request.last().is_some_and(is_user_prompt)
+            && request.len().checked_sub(2).is_none_or(|index| {
+                matches!(
+                    request[index].role,
+                    MessageRole::Assistant | MessageRole::System
+                )
+            });
+        if answers_only_a_prompt {
+            request.pop();
+        } else {
+            request.push(ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: INTERRUPTED_TURN_NOTE_FOR_MODEL.to_string(),
+            }]));
+        }
+    }
+    request
+}
+
+fn is_lone_interrupted_note(message: &ConversationMessage) -> bool {
+    message.role == MessageRole::Assistant
+        && matches!(
+            message.blocks.as_slice(),
+            [ContentBlock::Text { text }] if text.trim() == INTERRUPTED_RESPONSE_NOTE
+        )
+}
+
+/// A message the user typed: text only, no tool results.
+fn is_user_prompt(message: &ConversationMessage) -> bool {
+    message.role == MessageRole::User
+        && !message.blocks.is_empty()
+        && message
+            .blocks
+            .iter()
+            .all(|block| matches!(block, ContentBlock::Text { .. }))
 }
 
 fn is_complete_json(input: &str) -> bool {
@@ -2876,7 +2933,120 @@ mod resilience_tests {
         let next = runtime.run_turn("try again", None).expect("next turn runs");
         assert_eq!(next.outcome, TurnOutcome::Completed);
         assert_eq!(runtime.session().messages.len(), 4);
-        assert_alternates(&runtime.api_client().requests[1].messages);
+        // The model never sees the lone note (it repeated it as its next answer): the
+        // unanswered prompt and its note are left out of the request.
+        let next_request = &runtime.api_client().requests[1].messages;
+        assert_eq!(
+            next_request,
+            &vec![ConversationMessage::user_text("try again")]
+        );
+        assert_alternates(next_request);
+    }
+
+    #[test]
+    fn requests_leave_out_turns_interrupted_before_any_output() {
+        let note = || {
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: INTERRUPTED_RESPONSE_NOTE.to_string(),
+            }])
+        };
+        let answer = |text: &str| {
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: text.to_string(),
+            }])
+        };
+        let partial = format!("Step one\n\n{INTERRUPTED_RESPONSE_NOTE}");
+        let messages = vec![
+            ConversationMessage::user_text("first, interrupted"),
+            note(),
+            ConversationMessage::user_text("second, interrupted too"),
+            note(),
+            ConversationMessage::user_text("third"),
+            answer("three"),
+            ConversationMessage::user_text("fourth, cut short"),
+            answer(&partial),
+            ConversationMessage::user_text("fifth"),
+        ];
+
+        let request = super::request_messages(&messages);
+
+        assert_eq!(
+            request,
+            vec![
+                ConversationMessage::user_text("third"),
+                answer("three"),
+                ConversationMessage::user_text("fourth, cut short"),
+                answer(&partial),
+                ConversationMessage::user_text("fifth"),
+            ]
+        );
+        assert_alternates(&request);
+        // After a compaction summary the pair is left out too.
+        let compacted = vec![
+            ConversationMessage {
+                role: MessageRole::System,
+                blocks: vec![ContentBlock::Text {
+                    text: "summary".to_string(),
+                }],
+                usage: None,
+            },
+            ConversationMessage::user_text("interrupted"),
+            note(),
+            ConversationMessage::user_text("next"),
+        ];
+        assert_eq!(
+            super::request_messages(&compacted),
+            vec![compacted[0].clone(), compacted[3].clone()]
+        );
+    }
+
+    #[test]
+    fn an_interrupted_turn_that_ran_tools_ends_with_an_out_of_band_note() {
+        let token = CancellationToken::new();
+        let cancel_from_tool = token.clone();
+        let api = ScriptedApi::new(vec![
+            Ok(vec![
+                tool_call("a", "slow", "{}"),
+                AssistantEvent::MessageStop,
+            ]),
+            Ok(vec![text("4"), AssistantEvent::MessageStop]),
+        ]);
+        let tools = StaticToolExecutor::new().register("slow", move |_| {
+            cancel_from_tool.cancel();
+            Ok("stopped early".to_string())
+        });
+        let mut runtime = runtime_with(Session::new(), api, tools).with_cancellation_token(token);
+
+        let cancelled = runtime.run_turn("run it", None).expect("not an error");
+        assert!(matches!(cancelled.outcome, TurnOutcome::Cancelled { .. }));
+        // The session keeps the runtime's note; the summary has no answer text.
+        let last = runtime.session().messages.last().expect("messages");
+        assert!(matches!(
+            last.blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == INTERRUPTED_RESPONSE_NOTE
+        ));
+        assert!(cancelled.assistant_messages.iter().all(|message| message
+            .blocks
+            .iter()
+            .all(|block| !matches!(block, ContentBlock::Text { .. }))));
+
+        runtime.set_cancellation_token(CancellationToken::new());
+        runtime
+            .run_turn("what is 2 plus 2?", None)
+            .expect("next turn runs");
+        let next_request = &runtime.api_client().requests[1].messages;
+        // The tool call ran, so the turn stays; its close reads as a note, not an answer.
+        assert_eq!(next_request.len(), 5, "{next_request:?}");
+        assert_eq!(next_request[0], ConversationMessage::user_text("run it"));
+        assert!(matches!(
+            next_request[3].blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == super::INTERRUPTED_TURN_NOTE_FOR_MODEL
+        ));
+        assert!(!next_request.iter().any(|message| message
+            .blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Text { text } if text.contains(INTERRUPTED_RESPONSE_NOTE)))));
+        assert_eq!(next_request[4].role, MessageRole::User);
     }
 
     /// (role, text) of every message with text.

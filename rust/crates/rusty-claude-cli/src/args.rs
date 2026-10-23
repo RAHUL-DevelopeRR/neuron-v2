@@ -394,6 +394,9 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
     {
         return action;
     }
+    if let Some(error) = unexpected_subcommand_arguments(&rest) {
+        return Err(error);
+    }
 
     let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
 
@@ -411,17 +414,31 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "skills" => {
             let args = join_optional_args(&rest[1..]);
             match classify_skills_slash_command(args.as_deref()) {
-                SkillSlashDispatch::Invoke(prompt) => Ok(CliAction::Prompt {
-                    prompt,
-                    model,
-                    output_format,
-                    allowed_tools,
-                    permission_mode,
-                    compact,
-                    base_commit,
-                    reasoning_effort: reasoning_effort.clone(),
-                    allow_broad_cwd,
-                }),
+                SkillSlashDispatch::Invoke(prompt) => {
+                    // `neuron skills NAME [ARGS]` runs skill NAME. When there is none, the
+                    // words are an unquoted prompt.
+                    let cwd = env::current_dir().map_err(|error| error.to_string())?;
+                    if let Err(error) = resolve_skill_invocation(&cwd, args.as_deref()) {
+                        return Err(format!("{error}\n{}", quote_prompt_hint("skills")));
+                    }
+                    Ok(CliAction::Prompt {
+                        prompt,
+                        model,
+                        output_format,
+                        allowed_tools,
+                        permission_mode,
+                        compact,
+                        base_commit,
+                        reasoning_effort: reasoning_effort.clone(),
+                        allow_broad_cwd,
+                    })
+                }
+                // `install` takes one path.
+                SkillSlashDispatch::Local if rest.len() > 3 => Err(subcommand_arguments_error(
+                    "skills",
+                    SKILLS_USAGE,
+                    &rest[1..],
+                )),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
                     output_format,
@@ -540,9 +557,10 @@ pub(crate) fn bare_slash_command_guidance(command_name: &str) -> Option<String> 
     ) {
         return None;
     }
+    // Aliases too: `neuron plugins` is `/plugins`, not a one-word prompt.
     let slash_command = slash_command_specs()
         .iter()
-        .find(|spec| spec.name == command_name)?;
+        .find(|spec| spec.name == command_name || spec.aliases.contains(&command_name))?;
     let guidance = if slash_command.resume_supported {
         format!(
             "`neuron {command_name}` is a slash command. Use `neuron --resume SESSION.jsonl /{command_name}` or start `neuron` and run `/{command_name}`."
@@ -568,15 +586,93 @@ pub(crate) fn removed_auth_surface_error(command_name: &str) -> String {
         "upgrade" => "neuron upgrade [--no-browser]",
         _ => "neuron auth <login|logout|status>",
     };
-    let mut message = format!(
-        "`{command_name}` is a Zero-X account command (`{usage}`) and takes no other arguments. To send a prompt that starts with \"{command_name}\", quote it (`neuron \"{command_name} ...\"`) or use `neuron prompt \"{command_name} ...\"`."
-    );
-    if matches!(command_name, "login" | "logout") {
-        message.push_str(
-            " For Anthropic directly, set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead.",
-        );
+    format!(
+        "`{command_name}` is a Zero-X account command (`{usage}`) and takes no other arguments. {}",
+        quote_prompt_hint(command_name)
+    )
+}
+
+/// How to send a prompt that starts with command `name` instead of running the command.
+pub(crate) fn quote_prompt_hint(name: &str) -> String {
+    format!(
+        "To send a prompt that starts with \"{name}\", quote it (`neuron \"{name} ...\"`) or use `neuron prompt \"{name} ...\"`."
+    )
+}
+
+const SKILLS_USAGE: &str = "neuron skills [list|install <path>|help|<skill> [args]]";
+
+/// A subcommand followed by words it does not take is usually an unquoted prompt that
+/// starts with its name (`neuron init the database schema`). Like the account commands,
+/// it is refused with a quoting hint: the subcommand never runs and the prompt is not
+/// guessed. Unknown `-` options of the subcommands that take options are left to their
+/// own parsers, which name them. `skills` and `export` are checked where they are parsed
+/// (a skill's name, a path).
+pub(crate) fn unexpected_subcommand_arguments(rest: &[String]) -> Option<String> {
+    let (name, args) = rest.split_first()?;
+    let words = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let (usage, takes) = match name.as_str() {
+        "help" | "version" | "status" | "sandbox" | "doctor" | "state" | "init"
+        | "bootstrap-plan" => (format!("neuron {name}"), words.is_empty()),
+        "agents" => (
+            "neuron agents [list|help]".to_string(),
+            matches!(without_help_word(&words), [] | ["list"]),
+        ),
+        "mcp" => (
+            "neuron mcp [list|show <server>|serve|help]".to_string(),
+            matches!(
+                without_help_word(&words),
+                [] | ["list" | "show" | "serve"] | ["show", _]
+            ),
+        ),
+        "acp" => (
+            "neuron acp [serve]".to_string(),
+            matches!(bare_words(&words, &[]).as_slice(), [] | ["serve"]),
+        ),
+        "dump-manifests" => (
+            "neuron dump-manifests [--manifests-dir PATH]".to_string(),
+            bare_words(&words, &["--manifests-dir"]).is_empty(),
+        ),
+        "system-prompt" => (
+            "neuron system-prompt [--cwd PATH] [--date YYYY-MM-DD]".to_string(),
+            bare_words(&words, &["--cwd", "--date"]).is_empty(),
+        ),
+        // `export` takes a path: its parser names the word after it.
+        _ => return None,
+    };
+    (!takes).then(|| subcommand_arguments_error(name, &usage, args))
+}
+
+fn subcommand_arguments_error(name: &str, usage: &str, args: &[String]) -> String {
+    format!(
+        "`{name}` is a neuron command (`{usage}`) and does not take `{}`. {}",
+        args.join(" "),
+        quote_prompt_hint(name)
+    )
+}
+
+/// `words` without a trailing help word (`neuron mcp show help`).
+fn without_help_word<'w, 'a>(words: &'w [&'a str]) -> &'w [&'a str] {
+    match words.split_last() {
+        Some((last, init)) if is_help_flag(last) || *last == "help" => init,
+        _ => words,
     }
-    message
+}
+
+/// The words that are neither options nor the values of `value_flags`.
+fn bare_words<'a>(words: &[&'a str], value_flags: &[&str]) -> Vec<&'a str> {
+    let mut bare = Vec::new();
+    let mut index = 0;
+    while let Some(word) = words.get(index) {
+        if value_flags.contains(word) {
+            index += 2;
+            continue;
+        }
+        if !word.starts_with('-') {
+            bare.push(*word);
+        }
+        index += 1;
+    }
+    bare
 }
 
 /// Global flags whose next argument is their value (so it is never mistaken
@@ -1111,7 +1207,10 @@ pub(crate) fn parse_export_args(
                 index += 1;
             }
             other => {
-                return Err(format!("unexpected export argument: {other}"));
+                return Err(format!(
+                    "unexpected export argument: {other}. {}",
+                    quote_prompt_hint("export")
+                ));
             }
         }
     }

@@ -1360,7 +1360,33 @@ fn stdio_server_command(transport: &McpStdioTransport) -> Command {
         command.env_remove(key);
     }
     apply_env(&mut command, &transport.env);
+    // Not in the user's console: `cmd.exe /c npx …` and npm retitle the console they
+    // run in, which is the terminal of the UI or the REPL.
+    #[cfg(windows)]
+    command.creation_flags(plugins::subprocess::CREATE_NO_WINDOW);
     command
+}
+
+/// Ends a server and, on Windows, the processes it started. A server launched as
+/// `cmd.exe /c npx …` runs in node grandchildren in their own console, which killing
+/// `cmd.exe` would leave running.
+async fn kill_server_tree(child: &mut Child) -> io::Result<()> {
+    #[cfg(windows)]
+    if let (Some(pid), Ok(None)) = (child.id(), child.try_wait()) {
+        let taskkill = std::env::var_os("SystemRoot").map_or_else(
+            || PathBuf::from("taskkill.exe"),
+            |root| PathBuf::from(root).join("System32").join("taskkill.exe"),
+        );
+        let _ = Command::new(taskkill)
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(plugins::subprocess::CREATE_NO_WINDOW)
+            .status()
+            .await;
+    }
+    child.kill().await
 }
 
 impl McpStdioProcess {
@@ -1583,7 +1609,7 @@ impl McpStdioProcess {
     }
 
     pub async fn terminate(&mut self) -> io::Result<()> {
-        self.child.kill().await
+        kill_server_tree(&mut self.child).await
     }
 
     pub async fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
@@ -1596,7 +1622,7 @@ impl McpStdioProcess {
 
     async fn shutdown(&mut self) -> io::Result<()> {
         if self.child.try_wait()?.is_none() {
-            match self.child.kill().await {
+            match kill_server_tree(&mut self.child).await {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::InvalidInput => {}
                 Err(error) => return Err(error),
@@ -2150,6 +2176,49 @@ mod tests {
             assert!(status.success());
 
             cleanup_script(&script_path);
+        });
+    }
+
+    /// Servers start outside the user's console (`CREATE_NO_WINDOW`), with working pipes,
+    /// and `terminate` ends what they started.
+    #[test]
+    #[cfg(windows)]
+    fn windows_server_without_console_window_round_trips_io_and_is_terminated() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let echo = crate::mcp_client::McpStdioTransport {
+                command: "cmd.exe".to_string(),
+                args: vec![
+                    "/v:on".to_string(),
+                    "/d".to_string(),
+                    "/c".to_string(),
+                    "set /p LINE=& echo ECHO:!LINE!".to_string(),
+                ],
+                env: BTreeMap::new(),
+                tool_call_timeout_ms: None,
+            };
+            let mut process = McpStdioProcess::spawn(&echo).expect("spawn cmd.exe");
+            process.write_line("ping").await.expect("write line");
+            let echoed = process.read_line().await.expect("read echo");
+            assert_eq!(echoed.trim_end(), "ECHO:ping");
+            assert!(process.wait().await.expect("wait for exit").success());
+
+            let long_running = crate::mcp_client::McpStdioTransport {
+                command: "cmd.exe".to_string(),
+                args: vec![
+                    "/d".to_string(),
+                    "/c".to_string(),
+                    "ping -n 30 127.0.0.1 >NUL".to_string(),
+                ],
+                env: BTreeMap::new(),
+                tool_call_timeout_ms: None,
+            };
+            let mut process = McpStdioProcess::spawn(&long_running).expect("spawn cmd.exe");
+            process.terminate().await.expect("terminate");
+            assert!(process.has_exited().expect("status"));
         });
     }
 

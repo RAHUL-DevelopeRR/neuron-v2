@@ -630,29 +630,40 @@ fn azure_endpoint(
     )
 }
 
-/// Ambient Azure is used only when its daily quota is left and the endpoint
-/// answers.
+/// Ambient Azure is used only when it is configured, its daily quota is left and the
+/// endpoint answers. Says why when a configured Azure is skipped.
 fn azure_usable() -> bool {
-    let quota = crate::quota::QuotaState::load();
-    if quota.is_azure_exhausted() {
-        eprintln!(
-            "\x1b[33m\u{26a0}\x1b[0m Azure daily quota exhausted ({}) \u{2013} using fallback",
-            quota.display_compact()
-        );
-        return false;
-    }
     let (Some(key), Some(base)) = (
         non_empty_env("AZURE_OPENAI_API_KEY"),
         non_empty_env("AZURE_OPENAI_ENDPOINT"),
     ) else {
         return false;
     };
+    let quota = crate::quota::QuotaState::load();
+    if quota.is_azure_exhausted() {
+        warn_skipping_azure(&format!(
+            "Azure daily quota exhausted ({})",
+            quota.display_compact()
+        ));
+        return false;
+    }
     if azure_api_probe(&key, &base) {
         true
     } else {
-        eprintln!("\x1b[33m\u{26a0}\x1b[0m Azure unavailable \u{2013} using fallback");
+        warn_skipping_azure("Azure unavailable");
         false
     }
+}
+
+/// `⚠ <why> – not using Azure`, yellow only on a terminal.
+fn warn_skipping_azure(why: &str) {
+    use std::io::IsTerminal as _;
+    let sign = if std::io::stderr().is_terminal() {
+        "\x1b[33m\u{26a0}\x1b[0m"
+    } else {
+        "\u{26a0}"
+    };
+    eprintln!("{sign} {why} \u{2013} not using Azure");
 }
 
 /// Quick probe to check if the Azure endpoint is reachable.
