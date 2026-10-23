@@ -2341,9 +2341,14 @@ mod tests {
                 assert!(listed.message_count >= 2, "{listed:?}");
                 // Where it belongs and how its turn ended; this engine's own session is
                 // not "open elsewhere".
+                // The engine reports its working directory, which is canonical on macOS
+                // (`/private/var/...` for the test's `/var/...`).
                 assert_eq!(
-                    listed.project.as_deref(),
-                    Some(workspace.display().to_string().as_str())
+                    listed
+                        .project
+                        .as_deref()
+                        .map(|project| fs::canonicalize(project).ok()),
+                    Some(fs::canonicalize(workspace).ok())
                 );
                 assert_eq!(listed.run_status, SessionRunStatus::Idle);
                 assert!(!listed.failed);
@@ -2694,7 +2699,10 @@ mod tests {
                 permission_rules,
                 ..
             }) => {
-                assert_eq!(root, workspace.display().to_string());
+                assert_eq!(
+                    fs::canonicalize(&root).ok(),
+                    fs::canonicalize(workspace).ok()
+                );
                 assert_eq!(mcp_servers[0].name, "tools");
                 assert_eq!(permission_rules[0].rule, "bash(cargo test)");
             }
@@ -2707,7 +2715,7 @@ mod tests {
         let trusted = events_until(&engine.events, |event| {
             matches!(event, UiEvent::Status { .. })
         });
-        let workspace_root = workspace.display().to_string();
+        let workspace_root = fs::canonicalize(workspace).ok();
         assert!(
             trusted.iter().any(|event| matches!(
                 event,
@@ -2716,7 +2724,7 @@ mod tests {
                     root: Some(root),
                     session_only: false,
                     ..
-                } if *root == workspace_root
+                } if fs::canonicalize(root).ok() == workspace_root
             )),
             "{trusted:?}"
         );
