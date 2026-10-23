@@ -2,12 +2,16 @@
 //!
 //! AnthropicRuntimeClient, auth resolution, and error formatting.
 
+// A turn's output goes through a TurnSink or runtime::ui_hooks, so a full-screen UI can own
+// the terminal.
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+
 use super::*;
 use api::{self, AuthSource, RetryProgress};
 use runtime::{CancellationToken, RuntimeErrorKind};
 use std::collections::BTreeMap;
 use std::env;
-use std::io::{self, Write};
+use std::io;
 
 /// Default time to wait for the first stream event of a fresh request.
 pub(crate) const DEFAULT_FIRST_TOKEN_TIMEOUT: Duration = Duration::from_secs(90);
@@ -251,7 +255,7 @@ pub(crate) fn ends_unterminated_tool_call(error: &api::ApiError, tool_blocks_ope
 }
 
 /// Terminal line for a tool call that was cut off at the output limit.
-fn format_cut_off_tool_call(name: &str, input: &str) -> String {
+pub(crate) fn format_cut_off_tool_call(name: &str, input: &str) -> String {
     if serde_json::from_str::<serde_json::Value>(input).is_ok() {
         format_tool_call_start(name, input)
     } else {
@@ -267,7 +271,7 @@ pub(crate) struct AnthropicRuntimeClient {
     session_id: String,
     model: String,
     enable_tools: bool,
-    emit_output: bool,
+    output: TurnOutput,
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
@@ -318,7 +322,7 @@ impl AnthropicRuntimeClient {
         session_id: &str,
         model: String,
         enable_tools: bool,
-        emit_output: bool,
+        output: TurnOutput,
         allowed_tools: Option<AllowedToolSet>,
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
@@ -330,7 +334,7 @@ impl AnthropicRuntimeClient {
             session_id: session_id.to_string(),
             model,
             enable_tools,
-            emit_output,
+            output,
             allowed_tools,
             tool_registry,
             progress_reporter,
@@ -347,8 +351,8 @@ impl AnthropicRuntimeClient {
         self.reasoning_effort.as_deref()
     }
 
-    pub fn emit_output(&self) -> bool {
-        self.emit_output
+    pub(crate) fn output(&self) -> &TurnOutput {
+        &self.output
     }
 
     pub fn allowed_tools(&self) -> Option<&AllowedToolSet> {
@@ -423,10 +427,10 @@ impl ApiClient for AnthropicRuntimeClient {
                     {
                         // A stalled or broken stream is retried once with the
                         // same request; typed failures decide, not messages.
-                        eprintln!(
+                        runtime::ui_hooks::notice(&format!(
                             "\n\u{26a0} {} \u{2014} retrying once\u{2026}",
                             failure.describe()
-                        );
+                        ));
                         attempt += 1;
                     }
                     Err(failure) => {
@@ -454,7 +458,7 @@ impl AnthropicRuntimeClient {
         progress: &RetryProgress,
     ) -> Result<Vec<AssistantEvent>, StreamFailure> {
         if std::env::var("NEURON_DEBUG").is_ok() {
-            eprintln!("[DEBUG] sending stream_message to API...");
+            runtime::ui_hooks::notice("[DEBUG] sending stream_message to API...");
         }
         let first_token_timeout = self.timeouts.first_token_for(after_tool_results);
         let clock = FirstTokenClock::start(progress, first_token_timeout);
@@ -472,17 +476,9 @@ impl AnthropicRuntimeClient {
             () = clock.expired() => return Err(first_token_failure()),
         };
         if std::env::var("NEURON_DEBUG").is_ok() {
-            eprintln!("[DEBUG] stream_message connected, reading events...");
+            runtime::ui_hooks::notice("[DEBUG] stream_message connected, reading events...");
         }
-        let mut render_buf = crate::stream_buffer::SyncRenderBuffer::new();
-        let mut sink = io::sink();
-        let out: &mut dyn Write = if self.emit_output {
-            &mut render_buf
-        } else {
-            &mut sink
-        };
-        let renderer = TerminalRenderer::new();
-        let mut markdown_stream = MarkdownStreamState::default();
+        let mut sink = self.output.stream_sink();
         let mut events = Vec::new();
         let mut pending_tools = BTreeMap::<u32, (String, String, String)>::new();
         let mut block_has_thinking_summary = false;
@@ -530,7 +526,7 @@ impl AnthropicRuntimeClient {
                         let mut pending_tool = None;
                         push_output_block(
                             block,
-                            out,
+                            sink.as_mut(),
                             &mut events,
                             &mut pending_tool,
                             true,
@@ -551,7 +547,7 @@ impl AnthropicRuntimeClient {
                     let mut pending_tool = None;
                     push_output_block(
                         start.content_block,
-                        out,
+                        sink.as_mut(),
                         &mut events,
                         &mut pending_tool,
                         true,
@@ -568,11 +564,7 @@ impl AnthropicRuntimeClient {
                             if let Some(progress_reporter) = &self.progress_reporter {
                                 progress_reporter.mark_text_phase(&text);
                             }
-                            if let Some(rendered) = markdown_stream.push(&renderer, &text) {
-                                write!(out, "{rendered}")
-                                    .and_then(|()| out.flush())
-                                    .map_err(render_error)?;
-                            }
+                            sink.text_delta(&text).map_err(render_error)?;
                             events.push(AssistantEvent::TextDelta(text));
                         }
                     }
@@ -581,29 +573,26 @@ impl AnthropicRuntimeClient {
                             input.push_str(&partial_json);
                         }
                     }
-                    ContentBlockDelta::ThinkingDelta { .. } => {
+                    ContentBlockDelta::ThinkingDelta { thinking } => {
                         if !block_has_thinking_summary {
-                            render_thinking_block_summary(out, None, false)
-                                .map_err(StreamFailure::Fatal)?;
+                            sink.reasoning_started(None, false).map_err(render_error)?;
                             block_has_thinking_summary = true;
+                        }
+                        if !thinking.is_empty() {
+                            sink.reasoning_delta(&thinking).map_err(render_error)?;
                         }
                     }
                     ContentBlockDelta::SignatureDelta { .. } => {}
                 },
                 ApiStreamEvent::ContentBlockStop(stop) => {
                     block_has_thinking_summary = false;
-                    if let Some(rendered) = markdown_stream.flush(&renderer) {
-                        write!(out, "{rendered}")
-                            .and_then(|()| out.flush())
-                            .map_err(render_error)?;
-                    }
+                    sink.end_block().map_err(render_error)?;
                     if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
                         if let Some(progress_reporter) = &self.progress_reporter {
                             progress_reporter.mark_tool_phase(&name, &input);
                         }
                         // Display tool call now that input is fully accumulated
-                        writeln!(out, "\n{}", format_tool_call_start(&name, &input))
-                            .and_then(|()| out.flush())
+                        sink.tool_call(&id, &name, &input, false)
                             .map_err(render_error)?;
                         events.push(AssistantEvent::ToolUse { id, name, input });
                     }
@@ -617,11 +606,7 @@ impl AnthropicRuntimeClient {
                 }
                 ApiStreamEvent::MessageStop(_) => {
                     saw_stop = true;
-                    if let Some(rendered) = markdown_stream.flush(&renderer) {
-                        write!(out, "{rendered}")
-                            .and_then(|()| out.flush())
-                            .map_err(render_error)?;
-                    }
+                    sink.end_block().map_err(render_error)?;
                     events.push(AssistantEvent::MessageStop);
                 }
             }
@@ -633,14 +618,9 @@ impl AnthropicRuntimeClient {
             // The output limit cut the tool call(s) off. Report them with a
             // truncation stop reason: the runtime runs none whose arguments are
             // incomplete and tells the model to split the work instead.
-            if let Some(rendered) = markdown_stream.flush(&renderer) {
-                write!(out, "{rendered}")
-                    .and_then(|()| out.flush())
-                    .map_err(render_error)?;
-            }
+            sink.end_block().map_err(render_error)?;
             for (id, name, input) in std::mem::take(&mut pending_tools).into_values() {
-                writeln!(out, "\n{}", format_cut_off_tool_call(&name, &input))
-                    .and_then(|()| out.flush())
+                sink.tool_call(&id, &name, &input, true)
                     .map_err(render_error)?;
                 events.push(AssistantEvent::ToolUse { id, name, input });
             }
@@ -696,7 +676,8 @@ impl AnthropicRuntimeClient {
             response = self.client.send_message(&fallback_request) => response
                 .map_err(|error| fatal_api_error(&self.session_id, &error))?,
         };
-        let mut events = response_to_events(response, out).map_err(StreamFailure::Fatal)?;
+        let mut events =
+            response_to_events(response, sink.as_mut()).map_err(StreamFailure::Fatal)?;
         push_prompt_cache_record(&self.client, &mut events);
         Ok(events)
     }
@@ -1084,26 +1065,9 @@ pub(crate) fn slash_command_completion_candidates_with_sessions(
 }
 
 // ── Tool UI (extracted to tool_ui.rs) ───────────────────
-pub(crate) fn render_thinking_block_summary(
-    out: &mut (impl Write + ?Sized),
-    char_count: Option<usize>,
-    redacted: bool,
-) -> Result<(), RuntimeError> {
-    let summary = if redacted {
-        "\n▶ Thinking block hidden by provider\n".to_string()
-    } else if let Some(char_count) = char_count {
-        format!("\n▶ Thinking ({char_count} chars hidden)\n")
-    } else {
-        "\n▶ Thinking hidden\n".to_string()
-    };
-    write!(out, "{summary}")
-        .and_then(|()| out.flush())
-        .map_err(|error| RuntimeError::new(error.to_string()))
-}
-
 pub(crate) fn push_output_block(
     block: OutputContentBlock,
-    out: &mut (impl Write + ?Sized),
+    sink: &mut dyn TurnSink,
     events: &mut Vec<AssistantEvent>,
     pending_tool: &mut Option<(String, String, String)>,
     streaming_tool_input: bool,
@@ -1112,10 +1076,7 @@ pub(crate) fn push_output_block(
     match block {
         OutputContentBlock::Text { text } => {
             if !text.is_empty() {
-                let rendered = TerminalRenderer::new().markdown_to_ansi(&text);
-                write!(out, "{rendered}")
-                    .and_then(|()| out.flush())
-                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                sink.text_block(&text).map_err(render_failure)?;
                 events.push(AssistantEvent::TextDelta(text));
             }
         }
@@ -1134,20 +1095,28 @@ pub(crate) fn push_output_block(
             *pending_tool = Some((id, name, initial_input));
         }
         OutputContentBlock::Thinking { thinking, .. } => {
-            render_thinking_block_summary(out, Some(thinking.chars().count()), false)?;
+            sink.reasoning_started(Some(thinking.chars().count()), false)
+                .map_err(render_failure)?;
+            if !thinking.is_empty() {
+                sink.reasoning_delta(&thinking).map_err(render_failure)?;
+            }
             *block_has_thinking_summary = true;
         }
         OutputContentBlock::RedactedThinking { .. } => {
-            render_thinking_block_summary(out, None, true)?;
+            sink.reasoning_started(None, true).map_err(render_failure)?;
             *block_has_thinking_summary = true;
         }
     }
     Ok(())
 }
 
+fn render_failure(error: io::Error) -> RuntimeError {
+    RuntimeError::new(error.to_string())
+}
+
 pub(crate) fn response_to_events(
     response: MessageResponse,
-    out: &mut (impl Write + ?Sized),
+    sink: &mut dyn TurnSink,
 ) -> Result<Vec<AssistantEvent>, RuntimeError> {
     let mut events = Vec::new();
     let mut pending_tool = None;
@@ -1156,7 +1125,7 @@ pub(crate) fn response_to_events(
         let mut block_has_thinking_summary = false;
         push_output_block(
             block,
-            out,
+            sink,
             &mut events,
             &mut pending_tool,
             false,
@@ -1482,7 +1451,7 @@ mod stream_resilience_tests {
             session_id: "stream-test".to_string(),
             model: "openai/test-model".to_string(),
             enable_tools: false,
-            emit_output: false,
+            output: crate::turn_sink::TurnOutput::Silent,
             allowed_tools: None,
             tool_registry: tools::GlobalToolRegistry::builtin(),
             progress_reporter: None,
@@ -1878,7 +1847,8 @@ mod stream_resilience_tests {
             usage: Usage::default(),
             request_id: None,
         };
-        let events = response_to_events(response, &mut std::io::sink()).expect("events");
+        let events =
+            response_to_events(response, &mut crate::turn_sink::SilentSink).expect("events");
         assert!(events.contains(&AssistantEvent::StopReason("max_tokens".to_string())));
         assert_eq!(events.last(), Some(&AssistantEvent::MessageStop));
     }

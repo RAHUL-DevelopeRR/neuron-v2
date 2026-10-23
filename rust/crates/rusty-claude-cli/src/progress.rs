@@ -2,6 +2,10 @@
 //!
 //! Progress UI for bughunter, ultraplan, commit, PR, and issue commands.
 
+// A turn's output goes through a TurnSink or runtime::ui_hooks, so a full-screen UI can own
+// the terminal.
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+
 use super::*;
 use crate::brand::*;
 use std::sync::{mpsc, Arc, Mutex};
@@ -350,7 +354,7 @@ pub(crate) fn build_runtime(
     model: String,
     system_prompt: Vec<String>,
     enable_tools: bool,
-    emit_output: bool,
+    output: impl Into<TurnOutput>,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
@@ -364,7 +368,7 @@ pub(crate) fn build_runtime(
         model,
         system_prompt,
         enable_tools,
-        emit_output,
+        output.into(),
         allowed_tools,
         permission_mode,
         progress_reporter,
@@ -390,7 +394,7 @@ pub(crate) fn build_runtime_with_plugin_state(
     model: String,
     system_prompt: Vec<String>,
     enable_tools: bool,
-    emit_output: bool,
+    output: impl Into<TurnOutput>,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
@@ -405,7 +409,7 @@ pub(crate) fn build_runtime_with_plugin_state(
         model,
         system_prompt,
         enable_tools,
-        emit_output,
+        output.into(),
         allowed_tools,
         permission_mode,
         progress_reporter,
@@ -423,7 +427,7 @@ fn assemble_conversation_runtime(
     model: String,
     system_prompt: Vec<String>,
     enable_tools: bool,
-    emit_output: bool,
+    output: TurnOutput,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
@@ -471,14 +475,14 @@ fn assemble_conversation_runtime(
             session_id,
             model,
             enable_tools,
-            emit_output,
+            output.clone(),
             allowed_tools.clone(),
             tool_registry.clone(),
             progress_reporter,
         )?,
         CliToolExecutor::new(
             allowed_tools.clone(),
-            emit_output,
+            output.clone(),
             tool_registry.clone(),
             mcp_state.clone(),
         ),
@@ -488,7 +492,7 @@ fn assemble_conversation_runtime(
     )
     .with_context_manager(context_manager)
     .with_max_iterations(runtime::resolve_max_iterations(max_iterations_setting));
-    if emit_output {
+    if output.is_visible() {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
     Ok(runtime)
@@ -584,7 +588,7 @@ impl SharedRuntimePluginState {
 
     fn shutdown(self) {
         if let Err(error) = self.plugin_registry.shutdown() {
-            eprintln!("warning: plugin shutdown failed: {error}");
+            runtime::ui_hooks::notice(&format!("warning: plugin shutdown failed: {error}"));
         }
         if let Some(mcp_state) = self.mcp_state {
             if let Err(error) = mcp_state
@@ -592,7 +596,7 @@ impl SharedRuntimePluginState {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .shutdown()
             {
-                eprintln!("warning: MCP shutdown failed: {error}");
+                runtime::ui_hooks::notice(&format!("warning: MCP shutdown failed: {error}"));
             }
         }
     }
@@ -704,26 +708,26 @@ impl runtime::HookProgressReporter for CliHookProgressReporter {
                 event,
                 tool_name,
                 command,
-            } => eprintln!(
+            } => runtime::ui_hooks::notice(&format!(
                 "[hook {event_name}] {tool_name}: {command}",
                 event_name = event.as_str()
-            ),
+            )),
             runtime::HookProgressEvent::Completed {
                 event,
                 tool_name,
                 command,
-            } => eprintln!(
+            } => runtime::ui_hooks::notice(&format!(
                 "[hook done {event_name}] {tool_name}: {command}",
                 event_name = event.as_str()
-            ),
+            )),
             runtime::HookProgressEvent::Cancelled {
                 event,
                 tool_name,
                 command,
-            } => eprintln!(
+            } => runtime::ui_hooks::notice(&format!(
                 "[hook cancelled {event_name}] {tool_name}: {command}",
                 event_name = event.as_str()
-            ),
+            )),
         }
     }
 }

@@ -1,3 +1,6 @@
+// Output to the user goes through crate::ui_hooks, so a full-screen UI can own the terminal.
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
 use std::fs;
@@ -401,7 +404,7 @@ impl ConfigLoader {
         }
 
         for warning in &all_warnings {
-            eprintln!("warning: {warning}");
+            crate::ui_hooks::notice(&format!("warning: {warning}"));
         }
         warn_ignored_project_settings(&ignored_project_settings);
 
@@ -698,7 +701,7 @@ fn warn_ignored_project_settings(ignored: &[IgnoredProjectSettings]) {
             ),
         };
         if warned.insert(message.clone()) {
-            eprintln!("warning: {message}");
+            crate::ui_hooks::notice(&format!("warning: {message}"));
         }
     }
 }

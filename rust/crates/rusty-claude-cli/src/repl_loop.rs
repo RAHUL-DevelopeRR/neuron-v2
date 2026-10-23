@@ -103,6 +103,8 @@ pub(crate) fn request_force_quit() {
     }
     thread::spawn(|| {
         thread::sleep(FORCE_QUIT_GRACE);
+        // `exit` runs no destructors: give the terminal back if the full-screen UI holds it.
+        neuron_tui::terminal::restore();
         eprintln!("\nThe turn did not stop in time; exiting without cleanup.");
         std::process::exit(130);
     });
@@ -120,14 +122,37 @@ pub(crate) fn handle_turn_interrupt(
         cancel.cancel();
         hook_abort.abort();
         tools::cancel_background_subagents();
-        eprintln!(
-            "\n\x1b[33m\u{25a0}\x1b[0m Interrupting\u{2026} \x1b[2m(press Ctrl-C again to quit)\x1b[0m"
+        runtime::ui_hooks::notice(
+            "\n\x1b[33m\u{25a0}\x1b[0m Interrupting\u{2026} \x1b[2m(press Ctrl-C again to quit)\x1b[0m",
         );
         InterruptAction::Cancelled
     } else {
         cancel.cancel();
-        eprintln!("\nQuitting: saving the session first\u{2026}");
+        runtime::ui_hooks::notice("\nQuitting: saving the session first\u{2026}");
         InterruptAction::ForceQuit
+    }
+}
+
+/// Ctrl-C presses from a UI that reads the keyboard itself: in raw mode Ctrl-C arrives
+/// as a key, not as a signal. The UI calls [`InterruptPresses::press`]; the turn's
+/// interrupt watcher feeds each press through [`handle_turn_interrupt`].
+#[derive(Debug, Clone, Default)]
+pub(crate) struct InterruptPresses(Arc<tokio::sync::Notify>);
+
+impl InterruptPresses {
+    pub(crate) fn press(&self) {
+        self.0.notify_one();
+    }
+
+    /// Resolves at the next press. A press made while nobody was waiting is kept (once).
+    pub(crate) fn next_press(
+        &self,
+    ) -> impl std::future::Future<Output = io::Result<()>> + Send + 'static {
+        let presses = Arc::clone(&self.0);
+        async move {
+            presses.notified().await;
+            Ok(())
+        }
     }
 }
 
@@ -576,7 +601,7 @@ mod tests {
     use super::{
         context_command_argument, describe_turn_outcome, dispatch_line, group_digits,
         handle_turn_interrupt, render_context_report, watch_turn_interrupts, ContextReport,
-        InterruptAction, ReplBackend, ReplStep,
+        InterruptAction, InterruptPresses, ReplBackend, ReplStep,
     };
     use crate::{CliAction, ResumeLaunchOptions, DEFAULT_MODEL};
     use runtime::context_manager::{ContextBudget, ContextManager, ContextPolicy};
@@ -697,6 +722,41 @@ mod tests {
         assert!(cancel.is_cancelled(), "the first press cancels the turn");
         assert!(hooks.is_aborted(), "and aborts running hooks");
         assert_eq!(force_quits, 1, "the second press asks to quit");
+    }
+
+    #[test]
+    fn ui_key_presses_interrupt_the_turn_like_the_signal() {
+        let cancel = CancellationToken::new();
+        let hooks = HookAbortSignal::new();
+        let presses = InterruptPresses::default();
+        // Pressed before the watcher waits: the press is kept, not lost.
+        presses.press();
+        let mut force_quits = 0_u32;
+
+        current_thread_runtime().block_on(async {
+            let ui = presses.clone();
+            let stop = async move {
+                tokio::task::yield_now().await;
+                ui.press();
+                tokio::task::yield_now().await;
+                tokio::task::yield_now().await;
+            };
+            watch_turn_interrupts(
+                || presses.next_press(),
+                stop,
+                &cancel,
+                &hooks,
+                || force_quits += 1,
+            )
+            .await;
+        });
+
+        assert!(
+            cancel.is_cancelled(),
+            "the first key press cancels the turn"
+        );
+        assert!(hooks.is_aborted());
+        assert_eq!(force_quits, 1, "the second key press asks to quit");
     }
 
     #[test]

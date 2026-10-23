@@ -2,7 +2,12 @@
 //!
 //! Extracted from main.rs.
 
+// A turn's output goes through a TurnSink or runtime::ui_hooks, so a full-screen UI can own
+// the terminal.
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+
 use super::*;
+use neuron_tui::protocol::{PermissionDecision, PermissionReply, PermissionView, UiEvent};
 use std::env;
 use std::io::{self, Write};
 
@@ -16,6 +21,8 @@ impl CliPermissionPrompter {
     }
 }
 
+// The line REPL prompts on its own terminal.
+#[allow(clippy::print_stdout)]
 impl runtime::PermissionPrompter for CliPermissionPrompter {
     fn decide(
         &mut self,
@@ -55,6 +62,101 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
     }
 }
 
+/// How often a pending UI approval checks whether the turn was cancelled.
+const PERMISSION_CANCEL_POLL: Duration = Duration::from_millis(250);
+
+/// Asks the full-screen UI to approve a tool call and waits for its answer. An
+/// interrupted turn or a closed UI denies the call, so nothing runs unapproved.
+pub(crate) struct ChannelPermissionPrompter<'a> {
+    current_mode: PermissionMode,
+    events: Sender<UiEvent>,
+    replies: &'a Receiver<PermissionReply>,
+    cancel: runtime::CancellationToken,
+    next_id: u64,
+}
+
+impl<'a> ChannelPermissionPrompter<'a> {
+    pub(crate) fn new(
+        current_mode: PermissionMode,
+        events: Sender<UiEvent>,
+        replies: &'a Receiver<PermissionReply>,
+        cancel: runtime::CancellationToken,
+    ) -> Self {
+        Self {
+            current_mode,
+            events,
+            replies,
+            cancel,
+            next_id: 0,
+        }
+    }
+}
+
+impl runtime::PermissionPrompter for ChannelPermissionPrompter<'_> {
+    fn decide(
+        &mut self,
+        request: &runtime::PermissionRequest,
+    ) -> runtime::PermissionPromptDecision {
+        let deny = |reason: String| runtime::PermissionPromptDecision::Deny { reason };
+        self.next_id += 1;
+        let id = self.next_id;
+        let asked = self.events.send(UiEvent::PermissionRequested {
+            id,
+            request: PermissionView {
+                tool: request.tool_name.clone(),
+                current_mode: self.current_mode.as_str().to_string(),
+                required_mode: request.required_mode.as_str().to_string(),
+                reason: request.reason.clone(),
+                input: request.input.clone(),
+                session_prefixes: request.session_prefixes.clone(),
+            },
+        });
+        if asked.is_err() {
+            return deny("permission approval failed: the Neuron UI closed".to_string());
+        }
+        loop {
+            if self.cancel.is_cancelled() {
+                return deny(format!(
+                    "tool '{}' not run: the turn was interrupted",
+                    request.tool_name
+                ));
+            }
+            match self.replies.recv_timeout(PERMISSION_CANCEL_POLL) {
+                Ok(reply) if reply.id == id => {
+                    return match reply.decision {
+                        PermissionDecision::AllowOnce => runtime::PermissionPromptDecision::Allow,
+                        PermissionDecision::AllowForSession
+                            if !request.session_prefixes.is_empty() =>
+                        {
+                            runtime::PermissionPromptDecision::AllowForSession
+                        }
+                        // Nothing to remember for the session: approve this call only.
+                        PermissionDecision::AllowForSession => {
+                            runtime::PermissionPromptDecision::Allow
+                        }
+                        PermissionDecision::Deny { note } => deny(match note {
+                            Some(note) if !note.trim().is_empty() => format!(
+                                "tool '{}' denied by the user: {}",
+                                request.tool_name,
+                                note.trim()
+                            ),
+                            _ => format!(
+                                "tool '{}' denied by user approval prompt",
+                                request.tool_name
+                            ),
+                        }),
+                    };
+                }
+                // An answer to an earlier request the turn already gave up on.
+                Ok(_) | Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    return deny("permission approval failed: the Neuron UI closed".to_string());
+                }
+            }
+        }
+    }
+}
+
 // NOTE: Despite the historical name `AnthropicRuntimeClient`, this struct
 // now holds an `ApiProviderClient` which dispatches to Anthropic, xAI,
 // OpenAI, or DashScope at construction time based on
@@ -63,8 +165,7 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 // it. See ROADMAP #29 for the provider-dispatch routing fix.
 // -- API client (extracted to api_client.rs) --
 pub(crate) struct CliToolExecutor {
-    renderer: TerminalRenderer,
-    emit_output: bool,
+    output: Box<dyn TurnSink>,
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
@@ -73,13 +174,12 @@ pub(crate) struct CliToolExecutor {
 impl CliToolExecutor {
     pub fn new(
         allowed_tools: Option<AllowedToolSet>,
-        emit_output: bool,
+        output: impl Into<TurnOutput>,
         tool_registry: GlobalToolRegistry,
         mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     ) -> Self {
         Self {
-            renderer: TerminalRenderer::new(),
-            emit_output,
+            output: output.into().tool_sink(),
             allowed_tools,
             tool_registry,
             mcp_state,
@@ -171,21 +271,15 @@ impl ToolExecutor for CliToolExecutor {
         };
         match result {
             Ok(output) => {
-                if self.emit_output {
-                    let markdown = format_tool_result(tool_name, &output, false);
-                    self.renderer
-                        .stream_markdown(&markdown, &mut io::stdout())
-                        .map_err(|error| ToolError::new(error.to_string()))?;
-                }
+                self.output
+                    .tool_result(tool_name, &output, false)
+                    .map_err(|error| ToolError::new(error.to_string()))?;
                 Ok(output)
             }
             Err(error) => {
-                if self.emit_output {
-                    let markdown = format_tool_result(tool_name, &error.to_string(), true);
-                    self.renderer
-                        .stream_markdown(&markdown, &mut io::stdout())
-                        .map_err(|stream_error| ToolError::new(stream_error.to_string()))?;
-                }
+                self.output
+                    .tool_result(tool_name, &error.to_string(), true)
+                    .map_err(|stream_error| ToolError::new(stream_error.to_string()))?;
                 Err(error)
             }
         }
@@ -416,6 +510,7 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::print_stdout)]
 pub(crate) fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
     let mut buffer = Vec::new();
     print_help_to(&mut buffer)?;
@@ -431,4 +526,149 @@ pub(crate) fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn s
         ),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod channel_prompter_tests {
+    use super::ChannelPermissionPrompter;
+    use neuron_tui::protocol::{PermissionDecision, PermissionReply, UiEvent};
+    use runtime::{
+        CancellationToken, PermissionMode, PermissionPromptDecision, PermissionPrompter,
+        PermissionRequest,
+    };
+    use std::sync::mpsc;
+    use std::thread;
+
+    fn request(session_prefixes: &[&str]) -> PermissionRequest {
+        PermissionRequest {
+            tool_name: "bash".to_string(),
+            input: r#"{"command":"cargo test"}"#.to_string(),
+            current_mode: PermissionMode::WorkspaceWrite,
+            required_mode: PermissionMode::DangerFullAccess,
+            reason: None,
+            session_prefixes: session_prefixes.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    /// Runs one prompt while `ui` plays the user: it gets the request's id and the
+    /// reply sender, and returns once it has answered (or walked away).
+    fn decide_with(
+        session_prefixes: &[&str],
+        cancel: &CancellationToken,
+        ui: impl FnOnce(u64, mpsc::Sender<PermissionReply>) + Send,
+    ) -> PermissionPromptDecision {
+        let (events_tx, events_rx) = mpsc::channel();
+        let (replies_tx, replies_rx) = mpsc::channel();
+        thread::scope(|scope| {
+            scope.spawn(move || {
+                let Ok(UiEvent::PermissionRequested { id, request }) = events_rx.recv() else {
+                    panic!("the UI is asked first");
+                };
+                assert_eq!(request.tool, "bash");
+                assert_eq!(request.current_mode, "workspace-write");
+                assert_eq!(request.required_mode, "danger-full-access");
+                ui(id, replies_tx);
+            });
+            ChannelPermissionPrompter::new(
+                PermissionMode::WorkspaceWrite,
+                events_tx,
+                &replies_rx,
+                cancel.clone(),
+            )
+            .decide(&request(session_prefixes))
+        })
+    }
+
+    #[test]
+    fn the_user_answer_decides_and_stale_answers_are_ignored() {
+        let cancel = CancellationToken::new();
+        let allowed = decide_with(&[], &cancel, |id, replies| {
+            replies
+                .send(PermissionReply {
+                    id: id + 41,
+                    decision: PermissionDecision::AllowOnce,
+                })
+                .unwrap();
+            replies
+                .send(PermissionReply {
+                    id,
+                    decision: PermissionDecision::AllowOnce,
+                })
+                .unwrap();
+        });
+        assert_eq!(allowed, PermissionPromptDecision::Allow);
+
+        let for_session = decide_with(&["cargo test"], &cancel, |id, replies| {
+            replies
+                .send(PermissionReply {
+                    id,
+                    decision: PermissionDecision::AllowForSession,
+                })
+                .unwrap();
+        });
+        assert_eq!(for_session, PermissionPromptDecision::AllowForSession);
+
+        let nothing_to_remember = decide_with(&[], &cancel, |id, replies| {
+            replies
+                .send(PermissionReply {
+                    id,
+                    decision: PermissionDecision::AllowForSession,
+                })
+                .unwrap();
+        });
+        assert_eq!(nothing_to_remember, PermissionPromptDecision::Allow);
+
+        let denied = decide_with(&[], &cancel, |id, replies| {
+            replies
+                .send(PermissionReply {
+                    id,
+                    decision: PermissionDecision::Deny {
+                        note: Some("use --dry-run first".into()),
+                    },
+                })
+                .unwrap();
+        });
+        let PermissionPromptDecision::Deny { reason } = denied else {
+            panic!("denied");
+        };
+        assert!(reason.contains("use --dry-run first"), "{reason}");
+    }
+
+    #[test]
+    fn an_interrupted_turn_denies_the_pending_call() {
+        let cancel = CancellationToken::new();
+        let turn = cancel.clone();
+        let decision = decide_with(&[], &cancel, move |_id, replies| {
+            turn.cancel();
+            // The UI is still open but never answers.
+            thread::sleep(std::time::Duration::from_millis(600));
+            drop(replies);
+        });
+        let PermissionPromptDecision::Deny { reason } = decision else {
+            panic!("an interrupted turn runs nothing");
+        };
+        assert!(reason.contains("interrupted"), "{reason}");
+    }
+
+    #[test]
+    fn a_closed_ui_denies_the_call() {
+        let cancel = CancellationToken::new();
+        let decision = decide_with(&[], &cancel, |_id, replies| drop(replies));
+        assert!(matches!(
+            decision,
+            PermissionPromptDecision::Deny { reason } if reason.contains("UI closed")
+        ));
+
+        let (events_tx, events_rx) = mpsc::channel();
+        drop(events_rx);
+        let (_replies_tx, replies_rx) = mpsc::channel();
+        let decision = ChannelPermissionPrompter::new(
+            PermissionMode::WorkspaceWrite,
+            events_tx,
+            &replies_rx,
+            cancel,
+        )
+        .decide(&request(&[]));
+        assert!(matches!(decision, PermissionPromptDecision::Deny { .. }));
+    }
 }
