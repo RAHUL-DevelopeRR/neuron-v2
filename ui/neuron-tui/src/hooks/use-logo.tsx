@@ -1,8 +1,20 @@
-// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: every
+// variant of the logo is drawn in NeuronCLI's brand colours, letter by letter.
 // See ui/neuron-tui/PORTING.md.
 import React, { useMemo } from 'react'
 
-import { LOGO, LOGO_SMALL, SHADOW_CHARS, TEXT_LOGO, parseLogoLines } from '../utils/logo'
+import {
+  LOGO,
+  LOGO_LETTER_COLORS,
+  LOGO_SMALL,
+  SHADOW_CHARS,
+  TEXT_LOGO,
+  logoLetterColor,
+  logoShadowColor,
+  parseLogoLines,
+} from '../utils/logo'
+
+import type { ThemeName } from '../types/theme-system'
 
 interface UseLogoOptions {
   /**
@@ -11,21 +23,17 @@ interface UseLogoOptions {
   availableWidth: number
   /**
    * Optional function to apply styling to each character (e.g., for sheen animation)
-   * If not provided, default coloring is applied (white blocks, accent shadows)
+   * If not provided, default coloring is applied (brand-coloured letters, dimmed shadows)
    */
   applySheenToChar?: (char: string, charIndex: number, lineIndex: number) => React.ReactNode
   /**
-   * Color to apply to the text variant
+   * Color of the " CLI" after the text variant's brand-coloured "Neuron"
    */
   textColor?: string
   /**
-   * Accent color for shadow/border characters (defaults to acid green #9EFC62)
+   * The theme the dimmed shadows blend toward (dark by default)
    */
-  accentColor?: string
-  /**
-   * Block color for solid block characters (white for dark mode, black for light mode)
-   */
-  blockColor?: string
+  themeName?: ThemeName
   /**
    * Optional vertical budget (in rows) for the logo. When fewer than the
    * ASCII art's 6 lines are available, the hook downgrades to the single-line
@@ -65,8 +73,7 @@ export const useLogo = ({
   availableWidth,
   applySheenToChar,
   textColor,
-  accentColor = '#9EFC62',
-  blockColor = '#ffffff',
+  themeName = 'dark',
   maxHeight,
 }: UseLogoOptions): LogoResult => {
   // The ASCII art (full and small) is 6 lines tall. If the caller can't spare
@@ -101,19 +108,18 @@ export const useLogo = ({
       // the terminal is narrow), keep it to the bare brand name — "Neuron
       // CLI" reads as filler in that already-cramped space.
       const forcedByHeight = maxHeight != null && maxHeight < ASCII_LOGO_LINES
-      const displayText =
-        availableWidth < 30 || forcedByHeight
-          ? brandName
-          : `${brandName} CLI`
+      const showCli = !(availableWidth < 30 || forcedByHeight)
 
       return (
         <text style={{ wrapMode: 'none' }}>
           <b>
-            {textColor ? (
-              <span fg={textColor}>{displayText}</span>
-            ) : (
-              <>{displayText}</>
-            )}
+            {brandName.split('').map((letter, index) => (
+              <span key={index} fg={LOGO_LETTER_COLORS[index]}>
+                {letter}
+              </span>
+            ))}
+            {showCli &&
+              (textColor ? <span fg={textColor}> CLI</span> : <> CLI</>)}
           </b>
         </text>
       )
@@ -123,21 +129,15 @@ export const useLogo = ({
     const logoLines = parseLogoLines(rawLogoString)
     const displayLines = logoLines.map((line) => line.slice(0, availableWidth))
 
-    // Default coloring function: blockColor for blocks, accent color for shadows
+    // Default coloring: each letter in its brand colour, its shadow dimmed
     const defaultColorChar = (char: string, charIndex: number) => {
       if (char === ' ' || char === '\n') {
         return <span key={charIndex}>{char}</span>
       }
-      // Block characters use blockColor (white in dark mode, black in light mode)
-      if (char === '█') {
-        return <span key={charIndex} fg={blockColor}>{char}</span>
-      }
-      // Shadow/border characters get accent color
-      if (SHADOW_CHARS.has(char)) {
-        return <span key={charIndex} fg={accentColor}>{char}</span>
-      }
-      // Other characters use accent color
-      return <span key={charIndex} fg={accentColor}>{char}</span>
+      const color = SHADOW_CHARS.has(char)
+        ? logoShadowColor(charIndex, themeName)
+        : logoLetterColor(charIndex)
+      return <span key={charIndex} fg={color}>{char}</span>
     }
 
     return (
@@ -155,7 +155,7 @@ export const useLogo = ({
         ))}
       </>
     )
-  }, [rawLogoString, availableWidth, applySheenToChar, textColor, accentColor, blockColor, maxHeight])
+  }, [rawLogoString, availableWidth, applySheenToChar, textColor, themeName, maxHeight])
 
   return { component, textBlock }
 }
