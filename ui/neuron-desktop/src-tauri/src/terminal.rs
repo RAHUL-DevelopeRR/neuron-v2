@@ -194,7 +194,9 @@ mod tests {
                 100,
                 30,
                 move |_, text| drop(out_tx.send(text)),
-                move |_, code| drop(exit_tx.send(code)),
+                move |_, code| {
+                    let _ = exit_tx.send(code);
+                },
             )
             .expect("a terminal");
         terminals.resize(id, 120, 40).unwrap();

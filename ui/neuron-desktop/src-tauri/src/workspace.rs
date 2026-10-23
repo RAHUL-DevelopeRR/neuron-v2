@@ -51,6 +51,91 @@ impl Workspace {
         &self.root
     }
 
+    /// The root as people read it: without Windows' `\\?\` prefix.
+    pub fn display_root(&self) -> String {
+        let shown = self.root.display().to_string();
+        shown
+            .strip_prefix(r"\\?\UNC\")
+            .map(|rest| format!(r"\\{rest}"))
+            .or_else(|| shown.strip_prefix(r"\\?\").map(ToString::to_string))
+            .unwrap_or(shown)
+    }
+
+    /// The folder's own name.
+    pub fn name(&self) -> String {
+        self.root.file_name().map_or_else(
+            || self.display_root(),
+            |name| name.to_string_lossy().into_owned(),
+        )
+    }
+
+    /// Files whose path contains `query` (case-insensitive), matches in the file name
+    /// first, then shorter paths. Build and dependency folders are skipped.
+    pub fn search(&self, query: &str, limit: usize) -> Vec<String> {
+        const SKIPPED: &[&str] = &[
+            ".git",
+            "node_modules",
+            "target",
+            "dist",
+            "build",
+            ".neuron",
+            ".next",
+            ".venv",
+            "__pycache__",
+        ];
+        const MAX_SCANNED: usize = 20_000;
+        let needle = query.trim().to_lowercase().replace('\\', "/");
+        let mut found: Vec<(usize, String)> = Vec::new();
+        let mut scanned = 0;
+        let mut stack = vec![(self.root.clone(), String::new())];
+        while let Some((dir, relative)) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if scanned >= MAX_SCANNED {
+                    break;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let path = if relative.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{relative}/{name}")
+                };
+                // Never follow a symlink out of the workspace.
+                let Ok(kind) = entry.file_type() else {
+                    continue;
+                };
+                if kind.is_dir() {
+                    if !SKIPPED.contains(&name.as_str()) {
+                        stack.push((entry.path(), path));
+                    }
+                    continue;
+                }
+                scanned += 1;
+                let lower = path.to_lowercase();
+                let Some(at) = (if needle.is_empty() {
+                    Some(0)
+                } else {
+                    lower.find(&needle)
+                }) else {
+                    continue;
+                };
+                let in_name = name.to_lowercase().contains(&needle);
+                found.push((
+                    (if in_name { 0 } else { 1000 }) + at * 100 + path.len(),
+                    path,
+                ));
+            }
+        }
+        found.sort();
+        found
+            .into_iter()
+            .take(limit)
+            .map(|(_, path)| path)
+            .collect()
+    }
+
     /// `relative` resolved inside the workspace, and its path relative to it.
     fn inside(&self, relative: &str) -> Result<(PathBuf, String), String> {
         let absolute = fs::canonicalize(self.root.join(relative))
