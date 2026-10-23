@@ -324,6 +324,15 @@ impl GlobalToolRegistry {
         self.runtime_tools.iter().any(|tool| tool.name == name)
     }
 
+    /// The names of the runtime tools (MCP servers' `mcp__<server>__<tool>`).
+    #[must_use]
+    pub fn runtime_tool_names(&self) -> Vec<String> {
+        self.runtime_tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect()
+    }
+
     #[must_use]
     pub fn search(
         &self,

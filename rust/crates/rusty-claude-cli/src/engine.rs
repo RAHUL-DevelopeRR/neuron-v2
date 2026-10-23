@@ -33,8 +33,9 @@
 use super::*;
 use crate::device_login::{DeviceCode, DeviceLoginObserver};
 use neuron_tui::protocol::{
-    AccountInfo, Attachment, EngineCommand, GitStatus, ModelInfo, PermissionReply, SessionSummary,
-    TokenCounts, TranscriptEntry, UiEvent, CAPABILITY_QUESTIONS, ENGINE_FEATURES, PROTOCOL_VERSION,
+    AccountInfo, Attachment, DefinitionInfo, EngineCommand, GitStatus, McpServerInfo, ModelInfo,
+    PermissionReply, PluginInfo, SessionSummary, TokenCounts, TranscriptEntry, UiEvent,
+    CAPABILITY_QUESTIONS, ENGINE_FEATURES, PROTOCOL_VERSION,
 };
 use repl_loop::InterruptPresses;
 use runtime::ui_hooks::{self, UserQuestion};
@@ -332,6 +333,7 @@ impl SignedOut<'_> {
                     }
                     self.send_status();
                 }
+                EngineCommand::ListExtensions => self.send(extensions_event()),
             }
         }
         None
@@ -625,6 +627,163 @@ fn trust_workspace_events() -> Vec<UiEvent> {
             message: format!("could not trust {}: {error}", cwd.display()),
         }],
     }
+}
+
+/// `ListExtensions`: the configured MCP servers with what each is doing now, the
+/// plugins, and the skills and agent definitions this workspace sees. A server's
+/// command, arguments, environment and headers are left out: they can hold secrets.
+fn extensions_event() -> UiEvent {
+    let cwd = env::current_dir().unwrap_or_default();
+    let loader = ConfigLoader::default_for(&cwd);
+    let config = loader.load();
+    let snapshot = extensions_snapshot();
+    let live = snapshot.as_ref().and_then(|snapshot| snapshot.mcp.as_ref());
+    let mcp_servers = match &config {
+        Ok(config) => config
+            .mcp()
+            .servers()
+            .iter()
+            .map(|(name, server)| {
+                let (status, tools, error) = mcp_server_status(name, live);
+                McpServerInfo {
+                    name: name.clone(),
+                    scope: config_scope_id(server.scope).to_string(),
+                    transport: mcp_transport_id(server.transport()).to_string(),
+                    status: status.to_string(),
+                    tools,
+                    error,
+                }
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    // Before a runtime was built (signed out), the plugins come from the manager.
+    let plugins = match snapshot {
+        Some(snapshot) => snapshot.plugins,
+        None => config
+            .as_ref()
+            .ok()
+            .and_then(|config| {
+                build_plugin_manager(&cwd, &loader, config)
+                    .list_plugins()
+                    .ok()
+            })
+            .unwrap_or_default(),
+    };
+    UiEvent::Extensions {
+        mcp_servers,
+        plugins: plugins
+            .into_iter()
+            .map(|plugin| PluginInfo {
+                id: plugin.metadata.id,
+                name: plugin.metadata.name,
+                version: plugin.metadata.version,
+                description: plugin.metadata.description,
+                kind: plugin.metadata.kind.to_string(),
+                enabled: plugin.enabled,
+            })
+            .collect(),
+        skills: definitions(
+            commands::handle_skills_slash_command_json(None, &cwd).ok(),
+            "skills",
+        ),
+        agents: definitions(
+            commands::handle_agents_slash_command_json(None, &cwd).ok(),
+            "agents",
+        ),
+    }
+}
+
+/// What the MCP server `name` is doing: its status, its tools (without the
+/// `mcp__<server>__` prefix) and why it failed or is unsupported. `live` is `None`
+/// before the session's runtime started its servers.
+fn mcp_server_status(
+    name: &str,
+    live: Option<&McpRuntimeView>,
+) -> (&'static str, Vec<String>, Option<String>) {
+    let Some(live) = live else {
+        return ("not_started", Vec::new(), None);
+    };
+    let reason = |servers: &[(String, String)]| {
+        servers
+            .iter()
+            .find(|(server, _)| server == name)
+            .map(|(_, reason)| reason.clone())
+    };
+    if let Some(reason) = reason(&live.unsupported) {
+        return ("unsupported", Vec::new(), Some(reason));
+    }
+    if live.starting {
+        return ("starting", Vec::new(), None);
+    }
+    if let Some(message) = reason(&live.failed) {
+        return ("failed", Vec::new(), Some(message));
+    }
+    if live.pending.iter().any(|server| server == name) {
+        return ("pending", Vec::new(), None);
+    }
+    if live.running.iter().any(|server| server == name) {
+        let prefix = runtime::mcp_tool_prefix(name);
+        let tools = live
+            .tools
+            .iter()
+            .filter_map(|tool| tool.strip_prefix(&prefix))
+            .map(str::to_string)
+            .collect();
+        return ("ready", tools, None);
+    }
+    ("not_started", Vec::new(), None)
+}
+
+fn config_scope_id(scope: ConfigSource) -> &'static str {
+    match scope {
+        ConfigSource::Bundled => "bundled",
+        ConfigSource::User => "user",
+        ConfigSource::Project => "project",
+        ConfigSource::Local => "local",
+    }
+}
+
+fn mcp_transport_id(transport: runtime::McpTransport) -> &'static str {
+    match transport {
+        runtime::McpTransport::Stdio => "stdio",
+        runtime::McpTransport::Sse => "sse",
+        runtime::McpTransport::Http => "http",
+        runtime::McpTransport::Ws => "ws",
+        runtime::McpTransport::Sdk => "sdk",
+        runtime::McpTransport::ManagedProxy => "managed_proxy",
+    }
+}
+
+/// The skills or agents (`key`) of a `/skills` or `/agents` JSON report.
+fn definitions(report: Option<serde_json::Value>, key: &str) -> Vec<DefinitionInfo> {
+    let Some(report) = report else {
+        return Vec::new();
+    };
+    report
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|definition| {
+            Some(DefinitionInfo {
+                name: definition.get("name")?.as_str()?.to_string(),
+                description: definition
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                source: definition
+                    .pointer("/source/label")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                active: definition
+                    .get("active")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true),
+            })
+        })
+        .collect()
 }
 
 /// What the command thread needs to reach the engine thread's turn.
@@ -1045,6 +1204,7 @@ impl Engine {
                 }
                 self.send_status();
             }
+            EngineCommand::ListExtensions => self.send(extensions_event()),
             EngineCommand::Shutdown => return Step::Stop,
         }
         Step::Continue
@@ -1564,8 +1724,9 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::{
-        git_status, plain_notice, question_notice, shorten, shorten_json_strings, spawn,
-        transcript_event, EngineExit, EngineHandle, EngineOptions,
+        definitions, git_status, mcp_server_status, plain_notice, question_notice, shorten,
+        shorten_json_strings, spawn, transcript_event, EngineExit, EngineHandle, EngineOptions,
+        McpRuntimeView,
     };
     use crate::tests::{env_lock, with_current_dir};
     use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
@@ -2250,6 +2411,32 @@ mod tests {
             "{trusted:?}"
         );
 
+        // The extensions: no MCP servers in this home, and the workspace's own skill.
+        let skill = workspace.join(".claw").join("skills").join("release-notes");
+        fs::create_dir_all(&skill).expect("skill dir");
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: release-notes\ndescription: Drafts release notes\n---\nWrite them.\n",
+        )
+        .expect("skill");
+        engine.commands.send(EngineCommand::ListExtensions).unwrap();
+        match next_event(&engine.events) {
+            UiEvent::Extensions {
+                mcp_servers,
+                skills,
+                ..
+            } => {
+                assert!(mcp_servers.is_empty(), "{mcp_servers:?}");
+                assert!(
+                    skills.iter().any(|skill| skill.name == "release-notes"
+                        && skill.description.as_deref() == Some("Drafts release notes")
+                        && skill.active),
+                    "{skills:?}"
+                );
+            }
+            other => panic!("expected the extensions, got {other:?}"),
+        }
+
         // Shutdown while a turn waits for approval: the turn stops, the session is saved,
         // the hooks go back to the terminal and the event channel closes.
         clear_session(&engine);
@@ -2323,6 +2510,77 @@ mod tests {
         drop(vars);
         let _ = fs::remove_dir_all(&workspace);
         let _ = fs::remove_dir_all(&config_home);
+    }
+
+    #[test]
+    fn mcp_servers_report_what_they_are_doing() {
+        let view = |starting: bool| McpRuntimeView {
+            starting,
+            running: vec!["docs".into(), "search".into(), "broken".into()],
+            pending: vec!["search".into()],
+            failed: vec![("broken".into(), "spawn failed".into())],
+            unsupported: vec![("remote".into(), "ws is not supported".into())],
+            tools: vec![
+                "mcp__docs__lookup".into(),
+                "mcp__docs__index".into(),
+                "mcp__search__query".into(),
+            ],
+        };
+        let live = view(false);
+        assert_eq!(
+            mcp_server_status("docs", Some(&live)),
+            (
+                "ready",
+                vec!["lookup".to_string(), "index".to_string()],
+                None
+            )
+        );
+        assert_eq!(
+            mcp_server_status("search", Some(&live)),
+            ("pending", Vec::new(), None)
+        );
+        assert_eq!(
+            mcp_server_status("broken", Some(&live)),
+            ("failed", Vec::new(), Some("spawn failed".to_string()))
+        );
+        assert_eq!(
+            mcp_server_status("remote", Some(&live)),
+            (
+                "unsupported",
+                Vec::new(),
+                Some("ws is not supported".to_string())
+            )
+        );
+        assert_eq!(
+            mcp_server_status("other", Some(&live)),
+            ("not_started", Vec::new(), None)
+        );
+        assert_eq!(
+            mcp_server_status("docs", Some(&view(true))),
+            ("starting", Vec::new(), None)
+        );
+        assert_eq!(
+            mcp_server_status("docs", None),
+            ("not_started", Vec::new(), None)
+        );
+    }
+
+    #[test]
+    fn definitions_read_the_skills_report() {
+        let report = serde_json::json!({
+            "skills": [
+                {"name": "plan", "description": "Plans work", "source": {"id": "project", "label": "Project"}, "active": true},
+                {"name": "plan", "description": null, "source": {"id": "user", "label": "User"}, "active": false},
+                {"description": "no name"}
+            ]
+        });
+        let skills = definitions(Some(report), "skills");
+        assert_eq!(skills.len(), 2);
+        assert_eq!(skills[0].source, "Project");
+        assert_eq!(skills[0].description.as_deref(), Some("Plans work"));
+        assert!(!skills[1].active);
+        assert_eq!(skills[1].description, None);
+        assert!(definitions(None, "skills").is_empty());
     }
 
     #[test]

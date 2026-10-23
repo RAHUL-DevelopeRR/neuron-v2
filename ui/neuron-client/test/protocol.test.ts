@@ -101,6 +101,7 @@ describe('client messages from untrusted peers', () => {
       command: 'model',
       args: '',
     })
+    expect(parseClientMessage({ kind: 'command', type: 'list_extensions', verbose: true })).toEqual({ kind: 'command', type: 'list_extensions' })
     expect(parseClientMessage({ kind: 'permission_reply', id: 4, decision: { kind: 'deny', note: 'no' } })).toEqual({
       kind: 'permission_reply',
       id: 4,

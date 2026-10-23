@@ -358,3 +358,18 @@ describe('E1: sessions, transcripts, questions, tasks, sub-agents, trust', () =>
     expect(state.restartRequired).toBe(false)
   })
 })
+
+describe('E2: extensions', () => {
+  test('the inventory, which a restarted engine clears', () => {
+    const mcp_servers = [
+      { name: 'docs', scope: 'user', transport: 'stdio', status: 'ready', tools: ['lookup'], error: null },
+      { name: 'ghost', scope: 'project', transport: 'stdio', status: 'failed', tools: [], error: 'spawn failed' },
+    ]
+    const plugins = [{ id: 'fmt@builtin', name: 'fmt', version: '1.0.0', description: 'Formats', kind: 'builtin', enabled: true }]
+    const skills = [{ name: 'plan', description: 'Plans work', source: 'Project', active: true }]
+    let state = run([{ type: 'extensions', mcp_servers, plugins, skills, agents: [] }], started())
+    expect(state.extensions).toEqual({ mcpServers: mcp_servers, plugins, skills, agents: [] })
+    state = run([{ type: 'ready', protocol: 1, version: '6.3.0', features: ['extensions'] }], state)
+    expect(state.extensions).toBeNull()
+  })
+})

@@ -94,7 +94,49 @@ pub const ENGINE_FEATURES: &[&str] = &[
     // `todos`, `subagent_started` and `subagent_finished` events.
     "todos",
     "subagents",
+    // `list_extensions` and `extensions`.
+    "extensions",
 ];
+
+/// One configured MCP server and what it is doing now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerInfo {
+    pub name: String,
+    /// Where it is configured: `bundled`, `user`, `project` or `local`.
+    pub scope: String,
+    /// `stdio`, `http`, `sse`, `ws`, `sdk` or `managed_proxy`.
+    pub transport: String,
+    /// `starting`, `ready`, `failed`, `pending` (started, tools not found),
+    /// `unsupported` (a transport Neuron does not speak yet) or `not_started`.
+    pub status: String,
+    /// Its tools, without the `mcp__<server>__` prefix.
+    pub tools: Vec<String>,
+    /// Why it failed or is unsupported.
+    pub error: Option<String>,
+}
+
+/// One installed plugin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginInfo {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    /// `builtin`, `bundled` or `external`.
+    pub kind: String,
+    pub enabled: bool,
+}
+
+/// One skill the agent can load (its `Skill` tool), or one agent definition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefinitionInfo {
+    pub name: String,
+    pub description: Option<String>,
+    /// Where it comes from (`project`, `user`, `bundled`, ...), as people read it.
+    pub source: String,
+    /// False when another definition of the same name wins.
+    pub active: bool,
+}
 
 /// The feature that adds [`EngineCommand::Capabilities`].
 pub const FEATURE_CAPABILITIES: &str = "capabilities";
@@ -303,6 +345,15 @@ pub enum UiEvent {
         result: Option<String>,
         note: Option<String>,
     },
+    /// Answer to [`EngineCommand::ListExtensions`]: the MCP servers with what each is
+    /// doing now, the plugins, the skills and the agent definitions. Nothing secret:
+    /// no commands, arguments, environment or headers.
+    Extensions {
+        mcp_servers: Vec<McpServerInfo>,
+        plugins: Vec<PluginInfo>,
+        skills: Vec<DefinitionInfo>,
+        agents: Vec<DefinitionInfo>,
+    },
 }
 
 /// A file, folder or image the user attached to a prompt.
@@ -346,6 +397,8 @@ pub enum EngineCommand {
     /// Trust the workspace, as the line REPL's trust prompt does; a
     /// [`UiEvent::WorkspaceTrusted`] and a `Status` follow, or an `Error`.
     TrustWorkspace,
+    /// Ask for the extensions ([`UiEvent::Extensions`]).
+    ListExtensions,
 }
 
 /// The user's answer to a permission request.
@@ -496,6 +549,10 @@ mod tests {
             (
                 r#"{"kind":"command","type":"trust_workspace"}"#,
                 EngineCommand::TrustWorkspace,
+            ),
+            (
+                r#"{"kind":"command","type":"list_extensions"}"#,
+                EngineCommand::ListExtensions,
             ),
         ] {
             assert_eq!(

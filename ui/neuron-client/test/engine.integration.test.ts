@@ -214,4 +214,50 @@ describe.skipIf(!haveEngineBinaries)('the real engine', () => {
     },
     TIMEOUT,
   )
+
+  test(
+    'extensions: a failing MCP server and the workspace skill',
+    async () => {
+      const { home, transport } = engineFor('extensions')
+      // A server whose command does not exist, beside the settings the home already has.
+      const settings = path.join(home.env.NEURON_CONFIG_HOME, 'settings.json')
+      fs.writeFileSync(
+        settings,
+        JSON.stringify({ defaultMcpServers: false, mcpServers: { ghost: { command: 'neuron-test-missing-mcp-server' } } }),
+      )
+      const skill = path.join(home.workspace, '.claw', 'skills', 'release-notes')
+      fs.mkdirSync(skill, { recursive: true })
+      fs.writeFileSync(path.join(skill, 'SKILL.md'), '---\nname: release-notes\ndescription: Drafts release notes\n---\nWrite them.\n')
+      const controller = new SessionController(transport)
+      try {
+        await controller.start()
+        const state = () => controller.getState()
+        expect(state().features).toContain('extensions')
+        // The servers start in the background: ask until the ghost is past starting.
+        const ghost = () => state().extensions?.mcpServers.find((server) => server.name === 'ghost')
+        let asked = 0
+        await until('the ghost server settles', () => {
+          const server = ghost()
+          if (server && server.status !== 'starting') return true
+          if (Date.now() - asked > 500) {
+            asked = Date.now()
+            controller.listExtensions()
+          }
+          return false
+        })
+        const server = ghost()!
+        expect(server).toMatchObject({ scope: 'user', transport: 'stdio', tools: [] })
+        expect(['failed', 'pending']).toContain(server.status)
+        // Nothing about how it starts leaves the engine.
+        expect(JSON.stringify(state().extensions)).not.toContain('neuron-test-missing-mcp-server')
+        expect(state().extensions!.skills).toContainEqual(
+          expect.objectContaining({ name: 'release-notes', description: 'Drafts release notes', active: true }),
+        )
+      } finally {
+        await controller.close()
+        home.remove()
+      }
+    },
+    TIMEOUT,
+  )
 })

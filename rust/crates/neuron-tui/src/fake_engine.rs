@@ -90,7 +90,8 @@ fn run(
             | EngineCommand::Answer { .. }
             | EngineCommand::ListSessions
             | EngineCommand::Resume { .. }
-            | EngineCommand::TrustWorkspace => {}
+            | EngineCommand::TrustWorkspace
+            | EngineCommand::ListExtensions => {}
         }
     }
     log

@@ -356,8 +356,70 @@ describe('Neuron Desktop: chats, projects, trust, panes, settings', () => {
     expect(sent(engine, 'submit')).toMatchObject({ text: 'two\nlines' })
   })
 
+  test('the Extensions tab: MCP servers with their status, plugins, skills and agents', async () => {
+    const { engine } = await start()
+    fireEvent.click(screen.getByRole('tab', { name: 'Extensions' }))
+    expect(sent(engine, 'list_extensions')).toEqual({ kind: 'command', type: 'list_extensions' })
+    expect(screen.getByText('Asking the engine…')).toBeTruthy()
+    await emit(engine, {
+      type: 'extensions',
+      mcp_servers: [
+        { name: 'docs', scope: 'user', transport: 'stdio', status: 'ready', tools: ['lookup', 'index'], error: null },
+        { name: 'ghost', scope: 'project', transport: 'stdio', status: 'failed', tools: [], error: 'spawn failed: not found' },
+        { name: 'remote', scope: 'user', transport: 'ws', status: 'unsupported', tools: [], error: 'ws is not supported yet' },
+      ],
+      plugins: [{ id: 'fmt@builtin', name: 'fmt', version: '1.0.0', description: 'Formats code', kind: 'builtin', enabled: true }],
+      skills: [
+        { name: 'release-notes', description: 'Drafts release notes', source: 'Project', active: true },
+        { name: 'release-notes', description: null, source: 'User', active: false },
+      ],
+      agents: [],
+    })
+    const servers = screen.getByRole('list', { name: 'MCP servers' })
+    expect(screen.getByText('1/3 ready')).toBeTruthy()
+    expect(within(servers).getByText(/user · stdio · 2 tools/)).toBeTruthy()
+    fireEvent.click(within(servers).getByRole('button', { name: /ghost/ }))
+    expect(within(servers).getByText('spawn failed: not found')).toBeTruthy()
+    fireEvent.click(within(servers).getByRole('button', { name: /docs/ }))
+    expect(within(servers).getByText('lookup, index')).toBeTruthy()
+    expect(within(screen.getByRole('list', { name: 'Plugins' })).getByText('Formats code')).toBeTruthy()
+    const skills = screen.getByRole('list', { name: 'Skills' })
+    expect(within(skills).getAllByText('release-notes')).toHaveLength(2)
+    expect(within(skills).getByText('Drafts release notes')).toBeTruthy()
+    expect(screen.getByText('No agent definitions found.')).toBeTruthy()
+
+    fireEvent.change(screen.getByLabelText('Filter extensions'), { target: { value: 'format' } })
+    expect(within(screen.getByRole('list', { name: 'Plugins' })).getByText('fmt')).toBeTruthy()
+    // No server and no skill is about formatting.
+    expect(screen.getAllByText('None match.')).toHaveLength(2)
+    fireEvent.change(screen.getByLabelText('Filter extensions'), { target: { value: 'lookup' } })
+    expect(within(screen.getByRole('list', { name: 'MCP servers' })).queryByText('ghost')).toBeNull()
+    expect(within(screen.getByRole('list', { name: 'MCP servers' })).getByText('docs')).toBeTruthy()
+    fireEvent.change(screen.getByLabelText('Filter extensions'), { target: { value: '' } })
+
+    const asked = engine.commands().filter((message) => message.kind === 'command' && message.type === 'list_extensions').length
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+    expect(engine.commands().filter((message) => message.kind === 'command' && message.type === 'list_extensions').length).toBe(asked + 1)
+  })
+
+  test('a server still starting is asked about again', async () => {
+    const { engine } = await start()
+    fireEvent.click(screen.getByRole('tab', { name: 'Extensions' }))
+    const count = () => engine.commands().filter((message) => message.kind === 'command' && message.type === 'list_extensions').length
+    await emit(engine, {
+      type: 'extensions',
+      mcp_servers: [{ name: 'docs', scope: 'user', transport: 'stdio', status: 'starting', tools: [], error: null }],
+      plugins: [],
+      skills: [],
+      agents: [],
+    })
+    const before = count()
+    await waitFor(() => expect(count()).toBe(before + 1), { timeout: 3_500 })
+  })
+
   test('an older engine without history: no chat list, chatting still works', async () => {
     const { engine } = await start({}, [])
+    expect(screen.queryByRole('tab', { name: 'Extensions' })).toBeNull()
     expect(screen.getByText(/no chat history/)).toBeTruthy()
     expect(sent(engine, 'capabilities')).toBeUndefined()
     type('hello')

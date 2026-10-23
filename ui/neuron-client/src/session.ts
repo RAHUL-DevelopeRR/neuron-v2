@@ -8,9 +8,12 @@
 import type {
   AccountInfo,
   Attachment,
+  DefinitionInfo,
+  McpServerInfo,
   ModelInfo,
   PermissionDecision,
   PermissionView,
+  PluginInfo,
   SessionSummary,
   SignInCodeEvent,
   StatusEvent,
@@ -63,6 +66,13 @@ export type TranscriptItem =
     }
   | { kind: 'error'; key: string; text: string }
 
+export interface Extensions {
+  mcpServers: McpServerInfo[]
+  plugins: PluginInfo[]
+  skills: DefinitionInfo[]
+  agents: DefinitionInfo[]
+}
+
 export interface PendingPermission {
   id: number
   request: PermissionView
@@ -87,6 +97,8 @@ export interface SessionState {
   todos: TodoItem[]
   /** The workspace was trusted; its settings load once the engine restarts. */
   restartRequired: boolean
+  /** MCP servers, plugins, skills and agents, once asked for (feature `extensions`). */
+  extensions: Extensions | null
   models: ModelInfo[]
   /** The current turn (or slash command) has not finished. */
   busy: boolean
@@ -109,6 +121,7 @@ export const initialSession = (): SessionState => ({
   sessions: null,
   todos: [],
   restartRequired: false,
+  extensions: null,
   models: [],
   busy: false,
   sessionStarting: false,
@@ -234,6 +247,8 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
         protocol: action.protocol,
         features: action.features ?? [],
         restartRequired: false,
+        // A restarted engine may load other servers and plugins.
+        extensions: null,
       }
     case 'status': {
       // `/clear` and `/resume` switch sessions. Engines with transcripts say so first
@@ -372,6 +387,11 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
       return push(state, { kind: 'question', id: action.id, text: action.question, options: action.options, answered: false })
     case 'todos':
       return { ...state, todos: action.items }
+    case 'extensions':
+      return {
+        ...state,
+        extensions: { mcpServers: action.mcp_servers, plugins: action.plugins, skills: action.skills, agents: action.agents },
+      }
     case 'subagent_started':
     case 'subagent_finished': {
       const index = findLastIndex(state.items, (item) => item.kind === 'tool' && item.id === action.id)

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 
 import {
+  FEATURE_EXTENSIONS,
   FEATURE_SESSIONS,
   FEATURE_TRUST_WORKSPACE,
   changedPaths,
@@ -71,6 +72,10 @@ export function App({ platform }: { platform: Platform }) {
     setPaneTab(tab)
     setPaneOpen(true)
   }, [])
+
+  const refreshExtensions = useCallback(() => {
+    if (ready) controller?.listExtensions()
+  }, [controller, ready])
 
   const newChat = useCallback(() => {
     if (!controller || state.busy) return
@@ -252,6 +257,8 @@ export function App({ platform }: { platform: Platform }) {
           tool={paneTab === 'changes' ? tool : null}
           todos={state.todos}
           subagents={runningSubagents(state)}
+          extensions={hasFeature(state, FEATURE_EXTENSIONS) ? state.extensions : undefined}
+          onRefreshExtensions={refreshExtensions}
           terminalOpened={terminalOpened}
         />
       )}

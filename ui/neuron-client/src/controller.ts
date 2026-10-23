@@ -157,6 +157,11 @@ export class SessionController {
     this.transport.send(commandMessage({ type: 'trust_workspace' }))
   }
 
+  /** Asks for the MCP servers, plugins, skills and agents (feature `extensions`); `state.extensions` follows. */
+  listExtensions(): void {
+    this.transport.send(commandMessage({ type: 'list_extensions' }))
+  }
+
   setModel(model: string): void {
     this.transport.send(commandMessage({ type: 'set_model', model }))
   }

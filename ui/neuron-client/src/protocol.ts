@@ -71,6 +71,7 @@ export interface AccountInfo {
 export const FEATURE_CAPABILITIES = 'capabilities'
 export const FEATURE_SESSIONS = 'sessions'
 export const FEATURE_TRUST_WORKSPACE = 'trust_workspace'
+export const FEATURE_EXTENSIONS = 'extensions'
 
 /** A UI capability: questions come as `question` events instead of a "Question:" notice. */
 export const CAPABILITY_QUESTIONS = 'questions'
@@ -100,6 +101,45 @@ export interface TodoItem {
   content: string
   status: 'pending' | 'in_progress' | 'completed' | string
   active_form: string | null
+}
+
+/** One configured MCP server and what it is doing now. */
+export interface McpServerInfo {
+  name: string
+  /** `bundled`, `user`, `project` or `local`. */
+  scope: string
+  /** `stdio`, `http`, `sse`, `ws`, `sdk` or `managed_proxy`. */
+  transport: string
+  /**
+   * `starting`, `ready`, `failed`, `pending` (started, tools not found),
+   * `unsupported` (a transport Neuron does not speak yet) or `not_started`.
+   */
+  status: 'starting' | 'ready' | 'failed' | 'pending' | 'unsupported' | 'not_started' | string
+  /** Its tools, without the `mcp__<server>__` prefix. */
+  tools: string[]
+  /** Why it failed or is unsupported. */
+  error: string | null
+}
+
+/** One installed plugin. */
+export interface PluginInfo {
+  id: string
+  name: string
+  version: string
+  description: string
+  /** `builtin`, `bundled` or `external`. */
+  kind: string
+  enabled: boolean
+}
+
+/** One skill the agent can load, or one agent definition. */
+export interface DefinitionInfo {
+  name: string
+  description: string | null
+  /** Where it comes from, as people read it (Project, User, ...). */
+  source: string
+  /** False when another definition of the same name wins. */
+  active: boolean
 }
 
 // ---------------------------------------------------------------- engine → client
@@ -271,6 +311,15 @@ export interface SubagentFinishedEvent {
   note: string | null
 }
 
+/** Answer to `list_extensions`. */
+export interface ExtensionsEvent {
+  type: 'extensions'
+  mcp_servers: McpServerInfo[]
+  plugins: PluginInfo[]
+  skills: DefinitionInfo[]
+  agents: DefinitionInfo[]
+}
+
 export type UiEvent =
   | ReadyEvent
   | StatusEvent
@@ -295,6 +344,7 @@ export type UiEvent =
   | TodosEvent
   | SubagentStartedEvent
   | SubagentFinishedEvent
+  | ExtensionsEvent
 
 export type UiEventType = UiEvent['type']
 
@@ -323,6 +373,7 @@ export const UI_EVENT_TYPES: readonly UiEventType[] = [
   'todos',
   'subagent_started',
   'subagent_finished',
+  'extensions',
 ]
 
 // ---------------------------------------------------------------- client → engine
@@ -351,6 +402,8 @@ export type EngineCommand =
   | { type: 'resume'; session: string }
   /** Feature `trust_workspace`. */
   | { type: 'trust_workspace' }
+  /** Feature `extensions`: MCP servers, plugins, skills and agents, as an `extensions` event. */
+  | { type: 'list_extensions' }
 
 export const ENGINE_COMMAND_TYPES: readonly EngineCommand['type'][] = [
   'submit',
@@ -364,6 +417,7 @@ export const ENGINE_COMMAND_TYPES: readonly EngineCommand['type'][] = [
   'list_sessions',
   'resume',
   'trust_workspace',
+  'list_extensions',
 ]
 
 export type PermissionDecision =
@@ -462,6 +516,7 @@ export function parseClientMessage(value: unknown): ClientMessage | null {
     case 'shutdown':
     case 'list_sessions':
     case 'trust_workspace':
+    case 'list_extensions':
       return { kind: 'command', type: message.type }
     case 'capabilities':
       return Array.isArray(message.features) && message.features.every((feature) => typeof feature === 'string')

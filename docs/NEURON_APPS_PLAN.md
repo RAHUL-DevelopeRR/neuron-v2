@@ -348,6 +348,8 @@ machine.
   - Changes: git status of the open folder with each file's diff, or one tool call's diff
   - Files: tree and preview
   - Tasks: the agent's task list and its running sub-agents
+  - Extensions: MCP servers with their live status, tools and errors, plus plugins, skills and
+    agents, with a filter
   - Terminal: a real shell
 - **Also:**
   - approvals in a dialog: y, a, n, e
@@ -358,7 +360,6 @@ machine.
   - images
   - a native folder picker (needs `tauri-plugin-dialog`, which needs Rahul's OK)
   - several chats running at once
-  - the extensions panel (E2)
   - a source-control pane that stages and commits (E6)
 
 ### Phase E1: protocol for many front ends (engine, Rust): done
@@ -377,12 +378,24 @@ machine.
   executor.
 - Left for later: `task_output` for background bash.
 
-### Phase E2: extensions inventory
+### Phase E2: extensions inventory (engine, Rust): done
 
-- `list_extensions` returns `extensions {mcp_servers: [{name, transport, status, tools, error}],
-  plugins, skills, commands, agents}`.
-- `mcp_server_status` events as servers come and go.
-- The desktop Extensions panel reads it.
+- Feature `extensions`: `list_extensions` returns `extensions {mcp_servers, plugins, skills,
+  agents}`.
+  - Each MCP server has its name, scope (`bundled`, `user`, `project`, `local`), transport and
+    status: `starting`, `ready`, `failed`, `pending` (started, no tools found), `unsupported` or
+    `not_started`. It also has its tools (without the `mcp__<server>__` prefix) and why it failed.
+  - Commands, arguments, environment and headers never leave the engine: they can hold secrets.
+  - Plugins have their id, version, kind and whether they are on. Skills and agents have their
+    source, and whether another definition of the same name wins.
+- The desktop Extensions tab shows it, asks again every 2 seconds while a server is starting,
+  and has a filter.
+- Left for later:
+  - `mcp_server_status` events as servers come and go, instead of asking
+  - plugin slash commands in the inventory
+  - a mobile view
+  - YAML block scalars (`description: >`) in skill front matter show as `>`; the parser is in
+    the commands crate
 
 ### Phase E3: MCP and connectors
 

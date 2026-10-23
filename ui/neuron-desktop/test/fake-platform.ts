@@ -9,7 +9,7 @@ import {
 
 import type { DirListing, FileContent, GitStatusView, Platform, Project, TerminalSession } from '../src/platform'
 
-export const ALL_FEATURES = ['capabilities', 'sessions', 'trust_workspace', 'todos', 'subagents']
+export const ALL_FEATURES = ['capabilities', 'sessions', 'trust_workspace', 'todos', 'subagents', 'extensions']
 
 /** An engine in memory: tests emit its events and read what the UI sent. */
 export class FakeEngine implements EngineTransport {
