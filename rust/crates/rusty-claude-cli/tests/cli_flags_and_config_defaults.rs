@@ -123,8 +123,8 @@ fn omc_namespaced_slash_commands_surface_a_targeted_compatibility_hint() {
     );
     let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
     assert!(stderr.contains("unknown slash command outside the REPL: /oh-my-claudecode:hud"));
-    assert!(stderr.contains("Claude Code/OMC plugin command"));
     assert!(stderr.contains("does not yet load plugin slash commands"));
+    assert!(!stderr.contains("Claude"), "{stderr}");
 
     fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
 }
