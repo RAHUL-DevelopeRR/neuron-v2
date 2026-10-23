@@ -452,7 +452,14 @@ fn engine_speaks_protocol_v2_against_a_zero_x_gateway() {
         .iter()
         .find(|session| session["current"] == true)
         .unwrap_or_else(|| panic!("the current session: {sessions}"));
-    assert_eq!(current["project"], workspace.display().to_string());
+    // The engine reports its working directory, which is canonical on macOS
+    // (`/private/var/...` for the test's `/var/...`).
+    assert_eq!(
+        current["project"]
+            .as_str()
+            .map(|project| fs::canonicalize(project).ok()),
+        Some(fs::canonicalize(&workspace).ok())
+    );
     assert_eq!(current["run_status"], "idle");
     assert_eq!(current["client"], "terminal");
 
