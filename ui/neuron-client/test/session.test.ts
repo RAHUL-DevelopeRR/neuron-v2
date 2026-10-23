@@ -373,3 +373,42 @@ describe('E2: extensions', () => {
     expect(state.extensions).toBeNull()
   })
 })
+
+describe('WP3: gateway problems', () => {
+  test('a failing prompt keeps its text and the problem, until the next prompt', () => {
+    let state = run(
+      [
+        { type: 'local/submitted', text: 'refactor the parser', attachments: [{ kind: 'file', path: 'src/parse.rs' }] },
+        { type: 'error', message: 'gateway error insufficient_quota: Daily quota reached' },
+        { type: 'turn_finished' },
+      ],
+      started(),
+    )
+    expect(state.problem?.kind).toBe('quota')
+    expect(state.unsent).toEqual({ text: 'refactor the parser', attachments: [{ kind: 'file', path: 'src/parse.rs' }] })
+    const error = state.items.at(-1)
+    expect(error).toMatchObject({ kind: 'error', problem: { kind: 'quota' } })
+    state = run([{ type: 'local/submitted', text: 'try again', attachments: [] }], state)
+    expect(state.problem).toBeNull()
+    expect(state.unsent).toBeNull()
+  })
+
+  test('a reply already started: nothing to put back', () => {
+    const state = run(
+      [
+        { type: 'local/submitted', text: 'explain', attachments: [] },
+        { type: 'text_delta', text: 'The parser…' },
+        { type: 'error', message: 'Could not reach Zero-X: connection reset' },
+      ],
+      started(),
+    )
+    expect(state.problem?.kind).toBe('unreachable')
+    expect(state.unsent).toBeNull()
+  })
+
+  test('other errors are plain error lines', () => {
+    const state = run([{ type: 'error', message: 'unknown slash command /frobnicate' }], started())
+    expect(state.problem).toBeNull()
+    expect(state.items.at(-1)).toEqual({ kind: 'error', key: expect.any(String), text: 'unknown slash command /frobnicate' })
+  })
+})
