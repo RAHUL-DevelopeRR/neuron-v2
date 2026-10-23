@@ -73,6 +73,8 @@ pub struct GatewayCredential {
     pub plan: Option<String>,
     /// Known for a stored login the gateway reported it for.
     pub email: Option<String>,
+    /// The account's display name, likewise.
+    pub name: Option<String>,
 }
 
 impl GatewayCredential {
@@ -85,6 +87,7 @@ impl GatewayCredential {
             expires_at: stored.expires_at,
             plan: stored.plan,
             email: stored.email,
+            name: stored.name,
         })
     }
 
@@ -117,6 +120,7 @@ fn env_credential() -> io::Result<Option<GatewayCredential>> {
         expires_at: None,
         plan: None,
         email: None,
+        name: None,
     }))
 }
 
@@ -349,6 +353,7 @@ fn finish_login(
         expires_at: stored.expires_at,
         plan: stored.plan,
         email: stored.email,
+        name: stored.name,
     })
 }
 
@@ -569,6 +574,7 @@ fn refresh_stored_metadata(credential: &GatewayCredential, info: &SessionInfo) {
     stored.plan.clone_from(&info.plan);
     stored.expires_at = info.expires_at;
     stored.email = email;
+    stored.name.clone_from(&credential.name);
     if let Err(error) = CredentialStore::open_default().save(&stored) {
         eprintln!("warning: could not update the stored session details: {error}");
     }
@@ -958,6 +964,7 @@ mod tests {
             expires_at: Some(4_070_908_800),
             plan: Some("free".to_string()),
             email: Some("dev@example.com".to_string()),
+            name: None,
         };
         let report = login_json(&credential);
         assert_eq!(report["type"], "login");

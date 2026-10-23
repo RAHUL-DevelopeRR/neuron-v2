@@ -10,6 +10,11 @@
 //!
 //! Only absolute paths count: a relative store location, store line or root
 //! would resolve against the (possibly hostile) working directory.
+//!
+//! The folder trust screen trusts a whole repository: [`trust_workspace_root`] records the
+//! git root, and a folder inside a recorded git root is trusted too. A nested repository
+//! has its own root. The home folder (or a folder above it) is trusted for this process
+//! only, so it is asked about at every start.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -57,12 +62,108 @@ pub fn trust_env_override() -> bool {
 }
 
 /// Whether `cwd` is trusted by the environment override, this process, or the
-/// trust store.
+/// trust store: itself, or the git root it is in.
 #[must_use]
 pub fn is_workspace_trusted(cwd: &Path) -> bool {
-    trust_env_override()
-        || trusted_this_process(cwd)
-        || trust_store_path().is_some_and(|store| is_trusted_in(&store, cwd))
+    if trust_env_override() || trusted_this_process(cwd) {
+        return true;
+    }
+    let root = trust_root(cwd);
+    let git_root = (root.is_git_root && root.root != cwd).then_some(root.root);
+    if git_root.as_deref().is_some_and(trusted_this_process) {
+        return true;
+    }
+    trust_store_path().is_some_and(|store| trusted_by_store(&store, cwd, git_root.as_deref()))
+}
+
+/// Whether `store` lists `cwd`, or the git root it is in.
+fn trusted_by_store(store: &Path, cwd: &Path, git_root: Option<&Path>) -> bool {
+    is_trusted_in(store, cwd) || git_root.is_some_and(|root| is_trusted_in(store, root))
+}
+
+/// Where trust for a folder is recorded, and for how long.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustRoot {
+    /// The git root `cwd` is in, or `cwd` itself outside git.
+    pub root: PathBuf,
+    pub is_git_root: bool,
+    /// The home folder or a folder above it: trusted for this process only.
+    pub session_only: bool,
+}
+
+/// Where trusting `cwd` records the trust: its git root, unless that is the home folder or
+/// above it, else `cwd` itself.
+#[must_use]
+pub fn trust_root(cwd: &Path) -> TrustRoot {
+    let home = user_home();
+    let at_or_above_home = |path: &Path| {
+        path.parent().is_none()
+            || home
+                .as_deref()
+                .is_some_and(|home| is_ancestor_or_same(path, home))
+    };
+    let session_only = at_or_above_home(cwd);
+    let git_root = (!session_only)
+        .then(|| git_root_of(cwd))
+        .flatten()
+        .filter(|root| !at_or_above_home(root));
+    match git_root {
+        Some(root) => TrustRoot {
+            root,
+            is_git_root: true,
+            session_only,
+        },
+        None => TrustRoot {
+            root: cwd.to_path_buf(),
+            is_git_root: false,
+            session_only,
+        },
+    }
+}
+
+/// Trusts `cwd` as the folder trust screen does: records its [`trust_root`] (so a whole
+/// repository), or, for the home folder, trusts it for this process only.
+pub fn trust_workspace_root(cwd: &Path) -> io::Result<TrustRoot> {
+    let root = trust_root(cwd);
+    if root.session_only {
+        let cwd = absolute_cwd(cwd)?;
+        TRUSTED_THIS_PROCESS
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(cwd);
+        return Ok(root);
+    }
+    record_trusted_workspace(&root.root)?;
+    Ok(root)
+}
+
+/// The nearest folder at or above `cwd` with a `.git` entry (a folder, or the file of a
+/// worktree or submodule).
+fn git_root_of(cwd: &Path) -> Option<PathBuf> {
+    cwd.ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
+/// Whether `path` is `other` or one of its parents, compared after canonicalization.
+fn is_ancestor_or_same(path: &Path, other: &Path) -> bool {
+    let path = canonical(path).unwrap_or_else(|| path.to_path_buf());
+    let other = canonical(other).unwrap_or_else(|| other.to_path_buf());
+    other.starts_with(&path)
+}
+
+/// The user's home (`USERPROFILE` on Windows, `HOME` elsewhere), when absolute.
+fn user_home() -> Option<PathBuf> {
+    let (primary, secondary) = if cfg!(windows) {
+        ("USERPROFILE", "HOME")
+    } else {
+        ("HOME", "USERPROFILE")
+    };
+    non_empty_env(primary)
+        .or_else(|| non_empty_env(secondary))
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
 }
 
 /// Whether `store` lists `cwd`. Lines match exactly or after canonicalization,
@@ -178,15 +279,7 @@ fn default_neuron_home() -> Option<PathBuf> {
     if let Some(home) = non_empty_env("NEURON_HOME") {
         return Some(PathBuf::from(home)).filter(|path| path.is_absolute());
     }
-    let (primary, secondary) = if cfg!(windows) {
-        ("USERPROFILE", "HOME")
-    } else {
-        ("HOME", "USERPROFILE")
-    };
-    non_empty_env(primary)
-        .or_else(|| non_empty_env(secondary))
-        .map(|home| PathBuf::from(home).join(".neuroncli"))
-        .filter(|path| path.is_absolute())
+    user_home().map(|home| home.join(".neuroncli"))
 }
 
 fn non_empty_env(name: &str) -> Option<String> {
@@ -197,7 +290,10 @@ fn non_empty_env(name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_trusted_in, path_is_under_root, record_trusted_in};
+    use super::{
+        is_trusted_in, path_is_under_root, record_trusted_in, trust_root, trusted_by_store,
+        user_home,
+    };
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -243,6 +339,60 @@ mod tests {
         assert!(!is_trusted_in(&store, &sibling));
 
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The trust screen records a repository's git root: its folders are trusted with it,
+    /// a nested repository is not.
+    #[test]
+    fn trust_recorded_for_a_git_root_covers_its_folders_but_not_nested_repositories() {
+        let root = temp_dir("git-root");
+        let repo = root.join("repo");
+        let src = repo.join("src").join("deep");
+        let nested = repo.join("vendor").join("lib");
+        fs::create_dir_all(repo.join(".git")).expect("repo");
+        fs::create_dir_all(&src).expect("src");
+        fs::create_dir_all(nested.join(".git")).expect("nested repo");
+        let store = root.join("trusted_dirs.txt");
+
+        let found = trust_root(&src);
+        assert_eq!(found.root, repo);
+        assert!(found.is_git_root);
+        assert!(!found.session_only);
+        assert_eq!(trust_root(&nested).root, nested);
+
+        record_trusted_in(&store, &found.root).expect("record trust");
+        assert!(trusted_by_store(&store, &src, Some(&found.root)));
+        let nested_root = trust_root(&nested);
+        assert!(!trusted_by_store(
+            &store,
+            &nested,
+            nested_root
+                .is_git_root
+                .then_some(nested_root.root.as_path())
+        ));
+
+        // Outside git, the folder itself.
+        let plain = root.join("plain");
+        fs::create_dir_all(&plain).expect("plain");
+        let outside = trust_root(&plain);
+        if !outside.is_git_root {
+            assert_eq!(outside.root, plain);
+        }
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn the_home_folder_is_trusted_for_one_session_only() {
+        let Some(home) = user_home() else {
+            return;
+        };
+        let found = trust_root(&home);
+        assert!(found.session_only);
+        assert!(!found.is_git_root);
+        assert_eq!(found.root, home);
+        if let Some(above) = home.parent() {
+            assert!(trust_root(above).session_only);
+        }
     }
 
     #[test]

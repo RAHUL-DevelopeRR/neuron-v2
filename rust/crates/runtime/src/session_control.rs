@@ -61,6 +61,26 @@ impl SessionStore {
         })
     }
 
+    /// The store of the workspace at `cwd` when it has one, found without creating or
+    /// writing anything: for listing the sessions of other workspaces.
+    #[must_use]
+    pub fn existing(cwd: impl AsRef<Path>) -> Option<Self> {
+        let cwd = cwd.as_ref();
+        #[cfg(target_os = "macos")]
+        let storage_root = fs::canonicalize(cwd).ok()?;
+        #[cfg(not(target_os = "macos"))]
+        let storage_root = cwd.to_path_buf();
+        let fingerprint = workspace_fingerprint(&storage_root);
+        let sessions_root = [".neuron", ".claw"]
+            .into_iter()
+            .map(|dir| storage_root.join(dir).join("sessions").join(&fingerprint))
+            .find(|root| root.is_dir())?;
+        Some(Self {
+            sessions_root,
+            workspace_root: cwd.to_path_buf(),
+        })
+    }
+
     /// Build a store from an explicit `--data-dir` flag.
     ///
     /// The on-disk layout becomes `<data_dir>/sessions/<workspace_hash>/`
@@ -844,6 +864,30 @@ mod tests {
             .save_to_path(&handle.path)
             .expect("session should persist");
         session
+    }
+
+    #[test]
+    fn an_existing_store_is_found_without_creating_one() {
+        let base = std::env::temp_dir().join(format!(
+            "session-control-existing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let workspace = base.join("project");
+        fs::create_dir_all(&workspace).expect("workspace");
+        assert!(SessionStore::existing(&workspace).is_none());
+        assert!(
+            !workspace.join(".neuron").exists(),
+            "looking creates nothing"
+        );
+        let created = SessionStore::from_cwd(&workspace).expect("a store");
+        let found = SessionStore::existing(&workspace).expect("the same store");
+        assert_eq!(found.sessions_dir(), created.sessions_dir());
+        assert_eq!(found.workspace_root(), workspace.as_path());
+        fs::remove_dir_all(base).expect("cleanup");
     }
 
     #[test]

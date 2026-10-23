@@ -24,6 +24,7 @@ pub fn pricing_url() -> String {
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct AccountSummary {
     pub email: Option<String>,
+    pub name: Option<String>,
     pub plan_id: Option<String>,
     pub plan_name: Option<String>,
     pub daily_requests_limit: Option<u64>,
@@ -75,6 +76,7 @@ pub fn parse_account(value: &Value) -> AccountSummary {
     let subscription = section("subscription");
     AccountSummary {
         email: user.and_then(|user| string_field(user, "email")),
+        name: user.and_then(|user| string_field(user, "name")),
         plan_id: plan.and_then(|plan| string_field(plan, "id")),
         plan_name: plan.and_then(|plan| string_field(plan, "name")),
         daily_requests_limit: limits.and_then(|limits| u64_field(limits, "daily_requests")),
@@ -304,6 +306,7 @@ mod tests {
     fn parses_the_contract_account_shape() {
         let account = parse_account(&sample());
         assert_eq!(account.email.as_deref(), Some("dev@example.com"));
+        assert_eq!(account.name.as_deref(), Some("Dev"));
         assert_eq!(account.plan_id.as_deref(), Some("pro"));
         assert_eq!(account.daily_requests_limit, Some(2000));
         assert_eq!(account.tokens_today, Some(120_431));

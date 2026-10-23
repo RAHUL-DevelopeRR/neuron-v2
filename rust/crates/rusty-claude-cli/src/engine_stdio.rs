@@ -55,6 +55,7 @@ pub(crate) fn run_engine_command(args: &[String]) -> Result<(), Box<dyn std::err
                 &mut io::stdout(),
                 &UiEvent::Error {
                     message: message.clone(),
+                    detail: None,
                 },
             );
             return Err(message.into());

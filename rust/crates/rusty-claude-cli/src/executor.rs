@@ -550,7 +550,7 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         "  Use /session list in the REPL to browse managed sessions"
     )?;
     writeln!(out, "Examples:")?;
-    writeln!(out, "  neuron --model claude-opus \"summarize this repo\"")?;
+    writeln!(out, "  neuron --model auto \"summarize this repo\"")?;
     writeln!(
         out,
         "  neuron --output-format json prompt \"explain src/main.rs\""

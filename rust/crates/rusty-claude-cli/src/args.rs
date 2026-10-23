@@ -573,7 +573,7 @@ pub(crate) fn removed_auth_surface_error(command_name: &str) -> String {
     );
     if matches!(command_name, "login" | "logout") {
         message.push_str(
-            " For Anthropic directly, set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead.",
+            " To use your own provider key instead, set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN.",
         );
     }
     message
@@ -769,7 +769,7 @@ pub(crate) fn format_unknown_slash_command(name: &str) -> String {
 pub(crate) fn omc_compatibility_note_for_unknown_slash_command(name: &str) -> Option<&'static str> {
     name.starts_with("oh-my-claudecode:")
         .then_some(
-            "Compatibility note: `/oh-my-claudecode:*` is a Claude Code/OMC plugin command. `neuron` does not yet load plugin slash commands, Claude statusline stdin, or OMC session hooks.",
+            "Note: this looks like a plugin slash command. `neuron` does not yet load plugin slash commands.",
         )
 }
 
