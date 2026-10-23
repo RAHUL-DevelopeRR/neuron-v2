@@ -1,7 +1,8 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: prompts
 // and slash commands the UI does not have go to the engine, and a `!cmd`
 // prompt is a shell command only when shell commands are implemented
-// (USER_SHELL_AVAILABLE); until then it goes to the agent like any prompt.
+// (USER_SHELL_AVAILABLE); until then it goes to the agent like any prompt. A
+// `/login` that could not reach Zero-X sets the sign-in panel's state for it.
 // See ui/neuron-tui/PORTING.md.
 import {
   dispatchSkillPrompt,
@@ -15,7 +16,7 @@ import {
   buildPlanPrompt,
   buildReviewPrompt,
 } from './prompt-builders'
-import { whenEngineStarted } from '../engine/engine-session'
+import { isUnreachableSignIn, whenEngineStarted } from '../engine/engine-session'
 import { getNeuronEngineClient, runExchange } from '../engine/neuron-engine-client'
 import { withQuestionAnswer } from '../engine/questions'
 import { statusAddendum } from '../engine/status-report'
@@ -403,8 +404,13 @@ export async function routeUserPrompt(
   if (isSlashCommand(trimmed) && engineReady) {
     const [command = '', ...args] = trimmed.slice(1).trim().split(/\s+/)
     setMessages((prev) => [...prev, getUserMessage(trimmed)])
+    const isLogin = command.toLowerCase() === 'login'
+    if (isLogin) useEngineStore.getState().setSignInProblem(null)
     runExchange(engine, () => engine.slash(command, args.join(' ')), () => {})
-      .then(() => {
+      .then((outcome) => {
+        if (isLogin && outcome.error && isUnreachableSignIn(outcome.error)) {
+          useEngineStore.getState().setSignInProblem(outcome.error)
+        }
         // The engine's report has no account and no folder trust: the UI
         // adds them from the engine's status (engine/status-report.ts).
         if (command.toLowerCase() !== 'status') return

@@ -47,6 +47,12 @@ export interface EngineStoreState {
    * the engine said the sign-in worked and is opening the session.
    */
   signIn: (SignInCodeEvent & { receivedAt: number; approved: boolean }) | null
+  /**
+   * Why the last `/login` could not start: Zero-X was unreachable, does not
+   * offer device sign-in, or answered with a server error (the engine's
+   * message). Cleared when a sign-in code arrives or the session is signed in.
+   */
+  signInProblem: string | null
 
   /** `errorInChat`: the chat already shows `error` (see {@link EngineStoreState.errorInChat}). */
   setConnection: (
@@ -66,6 +72,7 @@ export interface EngineStoreState {
   setPendingQuestion: (question: string | null) => void
   setPendingQuestionTarget: (target: QuestionTarget | null) => void
   setSignIn: (code: SignInCodeEvent | null, receivedAt?: number) => void
+  setSignInProblem: (problem: string | null) => void
   markSignInApproved: () => void
   reset: () => void
 }
@@ -94,6 +101,7 @@ const initial = {
   pendingQuestion: null,
   pendingQuestionTarget: null,
   signIn: null,
+  signInProblem: null,
 }
 
 export const useEngineStore = create<EngineStoreState>()(
@@ -123,6 +131,7 @@ export const useEngineStore = create<EngineStoreState>()(
     setStatus: (status) =>
       set((state) => {
         state.status = status
+        if (!needsSignIn(status)) state.signInProblem = null
       }),
     setModels: (models) =>
       set((state) => {
@@ -160,6 +169,11 @@ export const useEngineStore = create<EngineStoreState>()(
     setSignIn: (code, receivedAt = Date.now()) =>
       set((state) => {
         state.signIn = code ? { ...code, receivedAt, approved: false } : null
+        if (code) state.signInProblem = null
+      }),
+    setSignInProblem: (problem) =>
+      set((state) => {
+        state.signInProblem = problem
       }),
     markSignInApproved: () =>
       set((state) => {

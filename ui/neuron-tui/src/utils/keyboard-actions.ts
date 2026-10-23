@@ -1,5 +1,7 @@
-// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: Tab and
+// Shift+Tab no longer cycle the agent modes (AGENT_MODES_AVAILABLE).
 // See ui/neuron-tui/PORTING.md.
+import { AGENT_MODES_AVAILABLE } from './constants'
 import { getInputModeConfig, type InputMode } from './input-modes'
 import { isPlainEnterKey } from './terminal-enter-detection'
 import type { KeyEvent } from '@opentui/core'
@@ -306,6 +308,7 @@ export function resolveChatKeyboardAction(
 
   // Priority 12: Agent mode toggle (tab or shift-tab when not in menus)
   if (
+    AGENT_MODES_AVAILABLE &&
     (isShiftTab || isTab) &&
     !state.slashMenuActive &&
     !state.mentionMenuActive

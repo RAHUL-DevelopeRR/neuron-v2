@@ -3,8 +3,10 @@
  * says how to start one (`/login`), and whether a stored login expired or was
  * revoked. During a `/login` it shows the link (a full https URL, an OSC 8
  * hyperlink where the terminal has them) and the device code, counts down to
- * the code's expiry, and cancels on Esc (an engine interrupt). The engine
- * does the sign-in and keeps the token; the UI only ever sees the code.
+ * the code's expiry, and cancels on Esc (an engine interrupt). When a
+ * `/login` could not start because Zero-X was unreachable (or answered with an
+ * error), it says so and how to try again. The engine does the sign-in and
+ * keeps the token; the UI only ever sees the code.
  */
 
 import { TextAttributes, type KeyEvent } from '@opentui/core'
@@ -29,6 +31,8 @@ export type SignInView =
    */
   | { kind: 'signed_out'; expired: boolean; email: string | null }
   | { kind: 'starting' }
+  /** The last `/login` could not reach Zero-X; `reason` is the engine's message. */
+  | { kind: 'unreachable'; reason: string }
   | {
       kind: 'code'
       url: string
@@ -42,6 +46,7 @@ export function signInView(
   status: StatusEvent | null,
   signIn: EngineStoreState['signIn'],
   now: number,
+  problem: string | null = null,
 ): SignInView | null {
   if (signIn?.approved) return { kind: 'starting' }
   if (signIn) {
@@ -55,6 +60,7 @@ export function signInView(
     }
   }
   if (!needsSignIn(status)) return null
+  if (problem) return { kind: 'unreachable', reason: problem }
   const account = status?.account ?? null
   return {
     kind: 'signed_out',
@@ -80,6 +86,7 @@ export const SignInPanel = ({ width }: { width: number }) => {
   const theme = useTheme()
   const status = useEngineStore((state) => state.status)
   const signIn = useEngineStore((state) => state.signIn)
+  const problem = useEngineStore((state) => state.signInProblem)
   const [now, setNow] = useState(() => Date.now())
 
   useEffect(() => {
@@ -104,12 +111,12 @@ export const SignInPanel = ({ width }: { width: number }) => {
     ),
   )
 
-  const view = signInView(status, signIn, now)
+  const view = signInView(status, signIn, now, problem)
   if (!view) return null
 
   return (
     <box
-      title=" Sign in to Zero-X "
+      title={view.kind === 'unreachable' ? " Can't reach Zero-X " : ' Sign in to Zero-X '}
       titleAlignment="center"
       style={{
         width: Math.max(20, width),
@@ -125,6 +132,20 @@ export const SignInPanel = ({ width }: { width: number }) => {
         <text style={{ wrapMode: 'word', fg: theme.foreground }}>
           Signed in. Starting your session…
         </text>
+      ) : view.kind === 'unreachable' ? (
+        <>
+          <text style={{ wrapMode: 'word', fg: theme.foreground }}>
+            Neuron could not start a sign-in with Zero-X.
+          </text>
+          <text style={{ wrapMode: 'word', fg: theme.muted }}>{view.reason}</text>
+          <text style={{ wrapMode: 'word', fg: theme.foreground }}>
+            <span>Check your connection, then type </span>
+            <span fg={theme.primary} attributes={TextAttributes.BOLD}>
+              /login
+            </span>
+            <span> to try again.</span>
+          </text>
+        </>
       ) : view.kind === 'signed_out' ? (
         <text style={{ wrapMode: 'word', fg: theme.foreground }}>
           <span>

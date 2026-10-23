@@ -18,6 +18,7 @@ import {
 import { afterConsoleCommand } from '../utils/console-guard'
 import {
   getNeuronEngineClient,
+  runExchange,
   setNeuronEngineClient,
   type EngineExit,
   type EngineLaunchOptions,
@@ -27,6 +28,7 @@ import { engineSessionOf, withEngineSession } from './session-run-state'
 import { StdioEngineClient } from './stdio-engine-client'
 
 import type { StatusEvent, UiEvent } from './protocol'
+import type { StdioEngineClientOptions } from './stdio-engine-client'
 
 export { QUESTION_PREFIX }
 
@@ -268,12 +270,22 @@ export function handleEngineEvent(event: UiEvent): void {
 }
 
 let pendingStart: Promise<void> | null = null
+/** The latest launch, with its flags and folder, for a restart that resumes a chat. */
+let lastLaunch: EngineLaunchOptions | null = null
+/** Test seam: how each new engine client spawns (a fake process). */
+let clientOptionsForTesting: StdioEngineClientOptions = {}
+
+export function setEngineClientOptionsForTesting(options: StdioEngineClientOptions): void {
+  clientOptionsForTesting = options
+  lastLaunch = null
+}
 
 /**
  * Starts (or restarts) the engine in `launch.cwd`. Never throws: a failed
  * start is recorded in the engine store and shown in the chat.
  */
 export function startEngineSession(launch: EngineLaunchOptions): Promise<void> {
+  lastLaunch = launch
   const start = launchEngineSession(launch)
   pendingStart = start
   void start.finally(() => {
@@ -300,6 +312,7 @@ async function launchEngineSession(launch: EngineLaunchOptions): Promise<void> {
     onStderr: (line) => logger.debug({ line }, '[engine] stderr'),
     onUnknownLine: (line, reason) =>
       logger.warn({ reason, line: line.slice(0, 500) }, '[engine] unexpected stdout line'),
+    ...clientOptionsForTesting,
   })
   setNeuronEngineClient(client)
   const engine = useEngineStore.getState()
@@ -368,6 +381,51 @@ export function handleEngineExit(
   const shownInChat = unexpected && !turnShowsIt
   engine.setConnection('exited', reason, unexpected)
   if (shownInChat) showSystemMessage(reason)
+}
+
+/**
+ * A `/login` that failed because Zero-X could not be used for a sign-in at
+ * all, as the engine words it (device_login.rs): unreachable, no device
+ * sign-in on that gateway (404), or a server error. Denied, expired and
+ * cancelled sign-ins are not this: those reached Zero-X.
+ */
+export function isUnreachableSignIn(message: string): boolean {
+  return /could not reach zero-x|does not support device sign-in|answered the sign-in request with an error \(http 5/i.test(
+    message,
+  )
+}
+
+/**
+ * A new chat starts the engine on a fresh conversation as well: `/new`,
+ * `/clear`, `/reset` and the history screen's New chat. The engine refuses a
+ * bare `clear` (it asks for `--confirm`), so the next prompt used to carry the
+ * old conversation along. The old session stays saved and can be resumed.
+ *
+ * The clear joins the engine's exchange queue at once (or first thing once a
+ * start in progress is done), so a prompt sent right after it, such as
+ * `/new <prompt>`, runs in the fresh conversation.
+ */
+export function clearEngineConversation(): Promise<void> {
+  const clear = (): Promise<void> => {
+    const engine = getNeuronEngineClient()
+    if (engine.connection !== 'ready') return Promise.resolve()
+    return runExchange(engine, () => engine.slash('clear', '--confirm'), () => {}).then(
+      () => undefined,
+      () => undefined,
+    )
+  }
+  return pendingStart ? pendingStart.then(clear) : clear()
+}
+
+/**
+ * A chat picked in /history: the engine resumes the session saved with it
+ * (`--resume`), so the model has the conversation the transcript shows. Before,
+ * only the transcript came back, and the model went on with the current
+ * conversation. A chat saved without a session starts a fresh one instead.
+ */
+export function resumeEngineSessionForChat(sessionId: string | undefined): Promise<void> {
+  if (!sessionId || !lastLaunch) return clearEngineConversation()
+  return startEngineSession({ ...lastLaunch, resume: sessionId })
 }
 
 export async function stopEngineSession(): Promise<void> {

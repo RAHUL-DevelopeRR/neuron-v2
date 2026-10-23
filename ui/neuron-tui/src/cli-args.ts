@@ -2,6 +2,7 @@
 // Freebuff variant and the login/publish commands, --agent and --trust-agents
 // (Codebuff login, agent store and repository .agents loading) are gone, and
 // the engine's launch flags (--model, --provider, ...) pass through to it.
+// --lite, --max and --plan are gone with the agent modes (AGENT_MODES_AVAILABLE).
 // See ui/neuron-tui/PORTING.md.
 import { createRequire } from 'module'
 
@@ -76,10 +77,6 @@ export function parseArgs({
       '--cwd <directory>',
       'Set the working directory (default: current directory)',
     )
-    .option('--lite', 'Start in LITE mode')
-    .option('--free', 'Start in LITE mode (deprecated alias)')
-    .option('--max', 'Start in MAX mode')
-    .option('--plan', 'Start in PLAN mode')
     .option('--model <model>', 'Model for the session (an alias like opus, or a full name)')
     .option('--provider <name>', 'Provider to use instead of the configured one')
     .option(
@@ -107,11 +104,8 @@ export function parseArgs({
 
   const continueFlag = options.continue
 
-  // Determine initial mode from flags (last flag wins if multiple specified)
-  let initialMode: AgentMode | undefined
-  if (options.free || options.lite) initialMode = 'LITE'
-  if (options.max) initialMode = 'MAX'
-  if (options.plan) initialMode = 'PLAN'
+  // Every chat runs in DEFAULT while the agent modes are not offered.
+  const initialMode: AgentMode | undefined = undefined
 
   return {
     initialPrompt: args.length > 0 ? args.join(' ') : null,

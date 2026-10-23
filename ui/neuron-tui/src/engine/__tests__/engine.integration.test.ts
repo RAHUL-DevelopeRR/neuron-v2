@@ -21,6 +21,7 @@ import {
 } from '../../../scripts/fake-zero-x-gateway'
 import { modelRows } from '../../components/model-picker'
 import { needsSignIn } from '../../state/engine-store'
+import { isUnreachableSignIn } from '../engine-session'
 import { runExchange, runTurn } from '../neuron-engine-client'
 import { StdioEngineClient, type SpawnEngine } from '../stdio-engine-client'
 import { mapToolCall, mapToolResult } from '../tool-mapping'
@@ -249,6 +250,59 @@ describe.skipIf(!haveBinaries)('neuron engine --stdio', () => {
       await runExchange(client, () => client.slash('logout'), () => {})
       await until('a signed-out status', () => statuses.at(-1)?.signed_in === false)
       expect(gateway!.requests).toContain('DELETE /auth/session (signed)')
+    } finally {
+      await client.shutdown()
+    }
+  }, 90_000)
+
+  test('a new chat (`clear --confirm`) starts a fresh engine session; a bare clear does not', async () => {
+    const client = new StdioEngineClient({
+      spawn: isolatedSpawn('new-chat', {
+        ANTHROPIC_API_KEY: 'integration-test-key',
+        ANTHROPIC_BASE_URL: mockUrl,
+      }),
+      resolveBinary: () => neuronBin,
+    })
+    const statuses: StatusEvent[] = []
+    client.subscribe((event) => {
+      if (event.type === 'status') statuses.push(event)
+    })
+    try {
+      await client.start({ cwd: workspaceFor('new-chat'), model: 'sonnet' })
+      const turn = await runTurn(client, { text: 'PARITY_SCENARIO:streaming_text' }, () => {})
+      expect(turn.error).toBeNull()
+      await until('a status after the turn', () => statuses.length > 0)
+      const before = statuses.at(-1)!.session_id
+
+      // What /new sent before: the engine only says it needs --confirm, and the
+      // session stays.
+      const notices: string[] = []
+      await runExchange(client, () => client.slash('clear', ''), (event) => {
+        if (event.type === 'notice') notices.push(event.message)
+      })
+      expect(notices.join(' ')).toContain('--confirm')
+      expect(statuses.at(-1)!.session_id).toBe(before)
+
+      const cleared = await runExchange(client, () => client.slash('clear', '--confirm'), () => {})
+      expect(cleared.error).toBeNull()
+      await until('a status for the fresh session', () => statuses.at(-1)!.session_id !== before)
+      expect(statuses.at(-1)!.session_id).not.toBe('')
+    } finally {
+      await client.shutdown()
+    }
+  }, 90_000)
+
+  test("signed out with Zero-X unreachable: /login fails as the UI's Can't reach Zero-X", async () => {
+    // A port nothing listens on.
+    const client = new StdioEngineClient({
+      spawn: isolatedSpawn('unreachable', { NEURON_API_BASE: 'http://127.0.0.1:9' }),
+      resolveBinary: () => neuronBin,
+    })
+    try {
+      await client.start({ cwd: workspaceFor('unreachable') })
+      const login = await runExchange(client, () => client.slash('login'), () => {})
+      expect(login.error).not.toBeNull()
+      expect(isUnreachableSignIn(login.error!)).toBe(true)
     } finally {
       await client.shutdown()
     }
