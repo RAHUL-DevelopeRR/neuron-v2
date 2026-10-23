@@ -241,11 +241,15 @@ fn find_header_end(bytes: &[u8]) -> Option<usize> {
     bytes.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
+/// The latest scenario named in the request. A user message can hold several prompts
+/// (Neuron joins a prompt the model never answered with the next one), so the last
+/// name in a text wins.
 fn detect_scenario(request: &MessageRequest) -> Option<Scenario> {
     request.messages.iter().rev().find_map(|message| {
         message.content.iter().rev().find_map(|block| match block {
             InputContentBlock::Text { text } => text
                 .split_whitespace()
+                .rev()
                 .find_map(|token| token.strip_prefix(SCENARIO_PREFIX))
                 .and_then(Scenario::parse),
             _ => None,

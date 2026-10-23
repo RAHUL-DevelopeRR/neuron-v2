@@ -505,7 +505,7 @@ fn status() -> Result<(), Box<dyn std::error::Error>> {
 
 /// `neuron auth status` for a login that expired (`now` given: it expired by its
 /// stored expiry) or that the gateway rejected.
-fn signed_out_line(credential: &GatewayCredential, now: Option<u64>) -> String {
+pub(crate) fn signed_out_line(credential: &GatewayCredential, now: Option<u64>) -> String {
     let what = match now {
         Some(now) => format!(
             "the session expired {}",
@@ -649,7 +649,7 @@ pub fn account_command(args: &[String]) -> Option<AccountCommand> {
             ) {
                 return None;
             }
-            let mut rest = args[index + 1..].to_vec();
+            let mut rest = without_global_flags(&args[index + 1..]);
             rest.extend(output_format);
             if !takes_arguments(arg, &rest) {
                 return None;
@@ -679,6 +679,36 @@ pub fn account_command(args: &[String]) -> Option<AccountCommand> {
         index += 1 + usize::from(takes_value);
     }
     None
+}
+
+/// Global switches (no value) that `parse_args` reads.
+const GLOBAL_SWITCHES: [&str; 3] = [
+    "--compact",
+    "--dangerously-skip-permissions",
+    "--allow-broad-cwd",
+];
+
+/// `args` without the global flags, given after an account command too (`neuron usage
+/// --model m`): they don't apply to it, as before it. `--output-format` stays: the
+/// command reads it.
+fn without_global_flags(args: &[String]) -> Vec<String> {
+    let mut kept = Vec::with_capacity(args.len());
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        let (flag, inline_value) = match arg.split_once('=') {
+            Some((flag, _)) => (flag, true),
+            None => (arg.as_str(), false),
+        };
+        let takes_value = GLOBAL_VALUE_FLAGS.contains(&flag);
+        if flag == "--output-format" || !(takes_value || GLOBAL_SWITCHES.contains(&flag)) {
+            kept.push(arg.clone());
+            index += 1;
+            continue;
+        }
+        // `--model m` takes its value along; `--model=m` is one argument.
+        index += 1 + usize::from(takes_value && !inline_value);
+    }
+    kept
 }
 
 /// Whether `args` are arguments account command `name` takes. A bad `--output-format`
@@ -939,6 +969,42 @@ mod tests {
         );
         assert_eq!(account_command(&strings(&["-p", "auth", "status"])), None);
         assert_eq!(account_command(&strings(&["--help", "auth"])), None);
+    }
+
+    #[test]
+    fn global_flags_after_an_account_command_are_accepted_as_before_it() {
+        assert_eq!(
+            account_command(&strings(&["usage", "--model", "groq/openai/gpt-oss-20b"])),
+            command("usage", &[])
+        );
+        assert_eq!(
+            account_command(&strings(&[
+                "usage",
+                "--model=m",
+                "--compact",
+                "--output-format",
+                "json"
+            ])),
+            command("usage", &["--output-format", "json"])
+        );
+        assert_eq!(
+            account_command(&strings(&[
+                "auth",
+                "status",
+                "--permission-mode",
+                "read-only"
+            ])),
+            command("auth", &["status"])
+        );
+        assert_eq!(
+            account_command(&strings(&["login", "--no-browser", "--model", "m"])),
+            command("login", &["--no-browser"])
+        );
+        // Words it does not take still are not the command.
+        assert_eq!(
+            account_command(&strings(&["usage", "--model", "m", "of", "memory"])),
+            None
+        );
     }
 
     #[test]

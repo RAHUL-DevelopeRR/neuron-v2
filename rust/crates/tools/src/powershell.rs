@@ -97,12 +97,16 @@ pub(crate) fn execute(
     }
 
     if run_in_background {
-        let child = process
+        process
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-        return Ok(BashCommandOutput::background(child.id().to_string(), true));
+            .stderr(Stdio::null());
+        // Stopped with its tree when the session ends (`runtime::stop_background_commands`).
+        subprocess::isolate_process_group(&mut process);
+        let child = process.spawn()?;
+        let task_id = child.id().to_string();
+        subprocess::track_background_child(child);
+        return Ok(BashCommandOutput::background(task_id, true));
     }
 
     let timeout = Duration::from_millis(effective_bash_timeout_ms(timeout_ms));

@@ -54,6 +54,8 @@ pub struct Spinner {
 
 impl Spinner {
     const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    /// A classic Windows console's fonts have no braille.
+    const CONSOLE_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 
     #[must_use]
     pub fn new() -> Self {
@@ -79,7 +81,11 @@ impl Spinner {
         if self.plain {
             return Ok(());
         }
-        let frame = Self::FRAMES[self.frame_index % Self::FRAMES.len()];
+        let frame = if crate::console::console_glyphs() {
+            Self::CONSOLE_FRAMES[self.frame_index % Self::CONSOLE_FRAMES.len()]
+        } else {
+            Self::FRAMES[self.frame_index % Self::FRAMES.len()]
+        };
         self.frame_index += 1;
         queue!(
             out,
@@ -87,7 +93,7 @@ impl Spinner {
             MoveToColumn(0),
             Clear(ClearType::CurrentLine),
             SetForegroundColor(theme.spinner_active),
-            Print(format!("{frame} {label}")),
+            Print(crate::console::stdout_text(&format!("{frame} {label}"))),
             ResetColor,
             RestorePosition
         )?;
@@ -110,7 +116,7 @@ impl Spinner {
             MoveToColumn(0),
             Clear(ClearType::CurrentLine),
             SetForegroundColor(theme.spinner_done),
-            Print(format!("✔ {label}\n")),
+            Print(crate::console::stdout_text(&format!("✔ {label}\n"))),
             ResetColor
         )?;
         out.flush()
@@ -132,7 +138,7 @@ impl Spinner {
             MoveToColumn(0),
             Clear(ClearType::CurrentLine),
             SetForegroundColor(theme.spinner_failed),
-            Print(format!("✘ {label}\n")),
+            Print(crate::console::stdout_text(&format!("✘ {label}\n"))),
             ResetColor
         )?;
         out.flush()

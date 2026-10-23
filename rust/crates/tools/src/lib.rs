@@ -2116,10 +2116,79 @@ fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
     }
 }
 
+/// The `arguments` of an MCP call (`MCPTool`, `MCP`) as the server takes them: a JSON
+/// object, or none. Models sometimes send the object as JSON text (`"{\"path\":
+/// \"a.txt\"}"`); that text is parsed. Anything else is an error the model can act on.
+pub fn mcp_call_arguments(arguments: Option<Value>) -> Result<Option<Value>, String> {
+    const EXPECTED: &str =
+        "`arguments` must be a JSON object with the tool's parameters, such as {\"path\": \"README.md\"}";
+    match arguments {
+        None | Some(Value::Null) => Ok(None),
+        Some(object @ Value::Object(_)) => Ok(Some(object)),
+        Some(Value::String(text)) if text.trim().is_empty() => Ok(None),
+        Some(Value::String(text)) => match serde_json::from_str::<Value>(&text) {
+            Ok(object @ Value::Object(_)) => Ok(Some(object)),
+            Ok(other) => Err(format!(
+                "{EXPECTED}; got a string holding {}",
+                json_kind(&other)
+            )),
+            Err(error) => Err(format!(
+                "{EXPECTED}; got a string that is not JSON ({error})"
+            )),
+        },
+        Some(other) => Err(format!("{EXPECTED}; got {}", json_kind(&other))),
+    }
+}
+
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+#[cfg(test)]
+mod mcp_call_arguments_tests {
+    use super::mcp_call_arguments;
+    use serde_json::json;
+
+    #[test]
+    fn arguments_sent_as_json_text_reach_the_server_as_an_object() {
+        let object = json!({"path": "C:\\work\\a.txt", "lines": 3});
+        assert_eq!(
+            mcp_call_arguments(Some(json!(object.to_string()))),
+            Ok(Some(object.clone()))
+        );
+        assert_eq!(mcp_call_arguments(Some(object.clone())), Ok(Some(object)));
+        assert_eq!(mcp_call_arguments(None), Ok(None));
+        assert_eq!(mcp_call_arguments(Some(json!(null))), Ok(None));
+        assert_eq!(mcp_call_arguments(Some(json!("  "))), Ok(None));
+    }
+
+    #[test]
+    fn arguments_that_are_not_an_object_are_a_clear_error() {
+        for (arguments, got) in [
+            (json!("path=a.txt"), "a string that is not JSON"),
+            (json!("[1, 2]"), "a string holding an array"),
+            (json!("\"a.txt\""), "a string holding a string"),
+            (json!([1, 2]), "got an array"),
+            (json!(7), "got a number"),
+        ] {
+            let error = mcp_call_arguments(Some(arguments)).expect_err("not an object");
+            assert!(error.contains("must be a JSON object"), "{error}");
+            assert!(error.contains(got), "{error}");
+        }
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn run_mcp_tool(input: McpToolInput) -> Result<String, String> {
     let registry = global_mcp_registry();
-    let args = input.arguments.unwrap_or(serde_json::json!({}));
+    let args = mcp_call_arguments(input.arguments)?.unwrap_or_else(|| serde_json::json!({}));
     match registry.call_tool(&input.server, &input.tool, &args) {
         Ok(result) => to_pretty_json(json!({
             "server": input.server,
@@ -2821,6 +2890,9 @@ struct AgentOutput {
 #[derive(Debug, Clone)]
 struct AgentJob {
     manifest: AgentOutput,
+    /// The model id the sub-agent's requests use (the manifest shows it without the
+    /// routing prefix).
+    model: String,
     prompt: String,
     system_prompt: Vec<String>,
     allowed_tools: BTreeSet<String>,
@@ -3699,6 +3771,10 @@ const FALLBACK_AGENT_MODEL: &str = "auto";
 const DEFAULT_AGENT_TIMEOUT: Duration = Duration::from_mins(10);
 const AGENT_TIMEOUT_ENV_VAR: &str = "NEURON_SUBAGENT_TIMEOUT_SECS";
 const AGENT_WAIT_POLL: Duration = Duration::from_millis(200);
+/// How long an interrupted `Agent` call waits for its sub-agent to stop.
+const AGENT_CANCEL_GRACE: Duration = Duration::from_secs(2);
+/// The error of a sub-agent run the user interrupted.
+const AGENT_CANCELLED: &str = "sub-agent cancelled by the user";
 const SUBAGENT_REGISTERED_OUTPUT_CAP: u32 = 32_000;
 const SUBAGENT_UNKNOWN_MODEL_OUTPUT: u32 = 8_192;
 
@@ -3899,8 +3975,11 @@ fn wait_for_agent(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if parent_cancel.is_some_and(runtime::CancellationToken::is_cancelled) {
                     child_cancel.cancel();
+                    // A moment for it to stop, so the result says how it ended (the
+                    // manifest said `running` while the sub-agent recorded its end).
+                    let stopped = done_rx.recv_timeout(AGENT_CANCEL_GRACE).ok();
                     break (
-                        None,
+                        stopped,
                         Some("Cancelled by the user; the sub-agent was asked to stop.".to_string()),
                     );
                 }
@@ -3999,7 +4078,7 @@ where
         name: agent_name,
         description: input.description,
         subagent_type: Some(normalized_subagent_type),
-        model: Some(model),
+        model: Some(shown_agent_model(&model).to_string()),
         status: String::from("running"),
         output_file: output_file.display().to_string(),
         manifest_file: manifest_file.display().to_string(),
@@ -4016,6 +4095,7 @@ where
     let manifest_for_spawn = manifest.clone();
     let job = AgentJob {
         manifest: manifest_for_spawn,
+        model,
         prompt: input.prompt,
         system_prompt,
         allowed_tools,
@@ -4047,12 +4127,16 @@ fn spawn_agent_job_with_completion(
                     error: None,
                 },
                 Ok(Err(error)) => {
-                    let _ = persist_agent_terminal_state(
-                        &job.manifest,
-                        "failed",
-                        None,
-                        Some(error.clone()),
-                    );
+                    let _ = if error == AGENT_CANCELLED {
+                        persist_agent_cancelled(&job.manifest)
+                    } else {
+                        persist_agent_terminal_state(
+                            &job.manifest,
+                            "failed",
+                            None,
+                            Some(error.clone()),
+                        )
+                    };
                     AgentCompletion {
                         final_text: None,
                         error: Some(error),
@@ -4091,9 +4175,7 @@ fn run_agent_job(job: &AgentJob, cancel: &runtime::CancellationToken) -> Result<
         .map_err(|error| error.to_string())?;
     let final_text = final_assistant_text(&summary);
     match &summary.outcome {
-        runtime::TurnOutcome::Cancelled { .. } => {
-            Err(String::from("sub-agent cancelled by the user"))
-        }
+        runtime::TurnOutcome::Cancelled { .. } => Err(AGENT_CANCELLED.to_string()),
         runtime::TurnOutcome::LoopDetected { tool_name, repeats } => Err(format!(
             "sub-agent stopped after repeating `{tool_name}` {repeats} times"
         )),
@@ -4112,11 +4194,7 @@ fn run_agent_job(job: &AgentJob, cancel: &runtime::CancellationToken) -> Result<
 fn build_agent_runtime(
     job: &AgentJob,
 ) -> Result<ConversationRuntime<SubagentApiClient, SubagentToolExecutor>, String> {
-    let model = job
-        .manifest
-        .model
-        .clone()
-        .unwrap_or_else(|| resolve_agent_model(None));
+    let model = job.model.clone();
     let api_client = SubagentApiClient::new(&model, job.allowed_tools.clone())?;
     Ok(assemble_agent_runtime(
         api_client,
@@ -4383,6 +4461,12 @@ fn resolve_agent_model(model: Option<&str>) -> String {
     }
 }
 
+/// A sub-agent's model as the rest of Neuron shows models: without the gateway
+/// transport's `openai/` routing prefix.
+fn shown_agent_model(model: &str) -> &str {
+    model.strip_prefix("openai/").unwrap_or(model)
+}
+
 fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
     let tools = match subagent_type {
         "Explore" => vec![
@@ -4495,10 +4579,11 @@ fn agent_permission_policy_for(
 mod subagent_inheritance_tests {
     use super::{
         agent_permission_policy, assemble_agent_runtime, cancel_background_subagents,
-        clear_subagent_parent_context, resolve_agent_model, restrict_to_parent_tools,
-        set_subagent_parent_context, subagent_api_error, subagent_feature_config,
-        subagent_max_tokens, wait_for_agent, workspace_agent_store, AgentCompletion, AgentOutput,
-        SubagentParentContext,
+        clear_subagent_parent_context, persist_agent_cancelled, resolve_agent_model,
+        restrict_to_parent_tools, set_subagent_parent_context, shown_agent_model,
+        subagent_api_error, subagent_feature_config, subagent_max_tokens, wait_for_agent,
+        workspace_agent_store, AgentCompletion, AgentOutput, SubagentParentContext,
+        AGENT_CANCELLED,
     };
     use runtime::{
         ApiClient, ApiRequest, AssistantEvent, CancellationToken, ContentBlock, PermissionMode,
@@ -4822,6 +4907,76 @@ mod subagent_inheritance_tests {
             .as_deref()
             .is_some_and(|note| note.contains("Cancelled")));
     }
+
+    /// After an interrupt the `Agent` result said `running` while the sub-agent's own
+    /// manifest said `failed`, as an `infra` failure; and its model had the routing
+    /// prefix the rest of Neuron leaves out.
+    #[test]
+    fn an_interrupted_subagent_reports_cancelled_not_running_or_failed() {
+        let dir = std::env::temp_dir().join(format!(
+            "neuron-agent-cancel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("agent dir");
+        let mut running = manifest(&dir);
+        running.manifest_file = dir.join("agent-test.json").display().to_string();
+        std::fs::write(
+            &running.output_file,
+            "# Agent Task
+",
+        )
+        .expect("output file");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let parent = CancellationToken::new();
+        parent.cancel();
+        let child = CancellationToken::new();
+        let sub_agent = {
+            let child = child.clone();
+            let running = running.clone();
+            std::thread::spawn(move || {
+                while !child.is_cancelled() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                persist_agent_cancelled(&running).expect("persisted");
+                done_tx
+                    .send(AgentCompletion {
+                        final_text: None,
+                        error: Some(AGENT_CANCELLED.to_string()),
+                    })
+                    .expect("send");
+            })
+        };
+
+        let result = wait_for_agent(
+            running,
+            &done_rx,
+            Duration::from_secs(60),
+            Some(&parent),
+            &child,
+        );
+        sub_agent.join().expect("sub-agent");
+
+        let json = serde_json::to_value(&result).expect("serializes");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(json["status"], "cancelled", "{json}");
+        assert_eq!(json["derivedState"], "cancelled", "{json}");
+        assert!(json["currentBlocker"].is_null(), "{json}");
+        assert_eq!(json["laneEvents"][0]["event"], "lane.closed", "{json}");
+        assert!(json["laneEvents"][0]["failureClass"].is_null(), "{json}");
+        assert!(result
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("Cancelled")));
+
+        assert_eq!(
+            shown_agent_model("openai/groq/openai/gpt-oss-120b"),
+            "groq/openai/gpt-oss-120b"
+        );
+        assert_eq!(shown_agent_model("claude-sonnet-4-6"), "claude-sonnet-4-6");
+    }
 }
 
 fn write_agent_manifest(manifest: &AgentOutput) -> Result<(), String> {
@@ -4832,6 +4987,30 @@ fn write_agent_manifest(manifest: &AgentOutput) -> Result<(), String> {
         serde_json::to_string_pretty(&normalized).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())
+}
+
+/// Records a sub-agent the user interrupted: `cancelled`, with no failure blocker (it
+/// did not fail; it was reported as an `infra` failure).
+fn persist_agent_cancelled(manifest: &AgentOutput) -> Result<(), String> {
+    append_agent_output(
+        &manifest.output_file,
+        &format_agent_terminal_output("cancelled", None, None, Some(AGENT_CANCELLED)),
+    )?;
+    let mut next_manifest = manifest.clone();
+    next_manifest.status = "cancelled".to_string();
+    next_manifest.completed_at = Some(iso8601_now());
+    next_manifest.current_blocker = None;
+    next_manifest.derived_state = "cancelled".to_string();
+    next_manifest.error = Some(AGENT_CANCELLED.to_string());
+    next_manifest.lane_events.push(
+        LaneEvent::new(
+            LaneEventName::Closed,
+            LaneEventStatus::Closed,
+            iso8601_now(),
+        )
+        .with_detail(AGENT_CANCELLED),
+    );
+    write_agent_manifest(&next_manifest)
 }
 
 fn persist_agent_terminal_state(

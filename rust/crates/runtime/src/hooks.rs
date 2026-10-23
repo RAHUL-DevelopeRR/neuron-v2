@@ -769,8 +769,11 @@ fn shell_command(command: &str) -> CommandWithStdin {
     let command_builder = {
         use std::os::windows::process::CommandExt;
 
-        let mut command_builder = Command::new("cmd");
-        command_builder.arg("/C").arg(command);
+        // `cmd /d /s /c "<command>"` with the command line as written: Rust's own
+        // quoting escapes inner quotes as `\"`, which cmd.exe does not understand, so a
+        // command with a quoted path always failed (and a failing PreToolUse hook
+        // denies every tool call).
+        let mut command_builder = plugins::subprocess::windows_cmd_command(command);
         // Not in the user's console, whose title `cmd.exe` would change.
         command_builder.creation_flags(plugins::subprocess::CREATE_NO_WINDOW);
         CommandWithStdin::new(command_builder)
@@ -1183,6 +1186,52 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    /// A hook command that quotes paths with spaces in them, like
+    /// `node "<dir>\hook.mjs" "<dir>\hooks.log"`: Rust's argument quoting turned its
+    /// quotes into `\"`, which cmd.exe does not understand, so it always failed and
+    /// the failing `PreToolUse` hook denied every tool call.
+    #[test]
+    #[cfg(windows)]
+    fn a_hook_command_with_quoted_paths_runs_on_windows() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let dir =
+            std::env::temp_dir().join(format!("neuron hook test {}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("hook dir");
+        let script = dir.join("pre hook.cmd");
+        std::fs::write(&script, "@echo off\r\necho hook saw %~1\r\nexit /b 0\r\n")
+            .expect("hook script");
+        let log = dir.join("hooks log.txt");
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            vec![format!("\"{}\" \"{}\"", script.display(), log.display())],
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        let result = runner.run_pre_tool_use("bash", r#"{"command":"pwd"}"#);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            result,
+            HookRunResult::allow(vec![format!("hook saw {}", log.display())])
+        );
+
+        // A quoted program path, as written in settings.
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            vec![format!(
+                r#""{system_root}\System32\cmd.exe" /d /c echo quoted-exe-ok"#
+            )],
+            Vec::new(),
+            Vec::new(),
+        ));
+        assert_eq!(
+            runner.run_pre_tool_use("bash", r#"{"command":"pwd"}"#),
+            HookRunResult::allow(vec!["quoted-exe-ok".to_string()])
+        );
     }
 
     #[cfg(windows)]

@@ -67,7 +67,8 @@ pub mod workspace_trust;
 
 pub use bash::{
     bash_tool_shell_description, effective_bash_timeout_ms, execute_bash, execute_bash_with_cancel,
-    BashCommandInput, BashCommandOutput, DEFAULT_BASH_TIMEOUT_MS, MAX_BASH_TIMEOUT_MS,
+    stop_background_commands, BashCommandInput, BashCommandOutput, DEFAULT_BASH_TIMEOUT_MS,
+    MAX_BASH_TIMEOUT_MS,
 };
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};

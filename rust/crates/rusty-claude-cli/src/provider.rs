@@ -655,9 +655,21 @@ fn azure_usable() -> bool {
     }
 }
 
-/// `⚠ <why> – not using Azure`, yellow only on a terminal.
+/// `--output-format json`: stderr carries only the JSON error, so notices that are
+/// not part of it are left out.
+static JSON_OUTPUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this run prints JSON (`--output-format json`).
+pub(crate) fn set_json_output(json: bool) {
+    JSON_OUTPUT.store(json, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `⚠ <why> – not using Azure`, yellow only on a terminal; nothing in JSON mode.
 fn warn_skipping_azure(why: &str) {
     use std::io::IsTerminal as _;
+    if JSON_OUTPUT.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let sign = if std::io::stderr().is_terminal() {
         "\x1b[33m\u{26a0}\x1b[0m"
     } else {

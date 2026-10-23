@@ -110,6 +110,7 @@ impl TurnOutput {
             Self::Ansi => Box::new(
                 AnsiSink::new(SyncRenderBuffer::new())
                     .clearing_spinner()
+                    .for_stdout_terminal()
                     .spacing_tool_results(&STDOUT_AFTER_TOOL_RESULT),
             ),
             Self::Channel(events) => Box::new(ChannelSink::new(Sender::clone(events))),
@@ -126,7 +127,9 @@ impl TurnOutput {
                     .spacing_tool_results(&STDOUT_AFTER_TOOL_RESULT),
             ),
             Self::Ansi => Box::new(
-                AnsiSink::new(io::stdout()).spacing_tool_results(&STDOUT_AFTER_TOOL_RESULT),
+                AnsiSink::new(io::stdout())
+                    .for_stdout_terminal()
+                    .spacing_tool_results(&STDOUT_AFTER_TOOL_RESULT),
             ),
             Self::Channel(events) => Box::new(ChannelSink::new(Sender::clone(events))),
         }
@@ -156,6 +159,10 @@ impl<W: Write> StripAnsi<W> {
             inner,
             state: StripState::Text,
         }
+    }
+
+    pub(crate) fn into_inner(self) -> W {
+        self.inner
     }
 }
 
@@ -202,6 +209,9 @@ pub(crate) struct AnsiSink<W: Write> {
     clear_spinner: bool,
     /// Shared with the other sinks on the same stream ([`STDOUT_AFTER_TOOL_RESULT`]).
     after_tool_result: Option<&'static AtomicBool>,
+    /// `out` is stdout's terminal: text goes through [`crate::console::stdout_text`]
+    /// (plain text, or a classic console's marks, where that terminal needs them).
+    stdout_terminal: bool,
 }
 
 /// A reasoning block the terminal keeps hidden, counted as it arrives.
@@ -235,7 +245,15 @@ impl<W: Write> AnsiSink<W> {
             reasoning: None,
             clear_spinner: false,
             after_tool_result: None,
+            stdout_terminal: false,
         }
+    }
+
+    /// For stdout's terminal (see [`Self::stdout_terminal`]).
+    #[must_use]
+    fn for_stdout_terminal(mut self) -> Self {
+        self.stdout_terminal = true;
+        self
     }
 
     /// For the terminal, where the turn's spinner was drawn on the line the output starts on.
@@ -254,10 +272,17 @@ impl<W: Write> AnsiSink<W> {
     }
 
     fn write_flushed(&mut self, text: &str) -> io::Result<()> {
+        let mut shown = String::with_capacity(text.len() + 5);
         if std::mem::take(&mut self.clear_spinner) {
-            write!(self.out, "\r\x1b[2K")?;
+            shown.push_str("\r\x1b[2K");
         }
-        write!(self.out, "{text}")?;
+        shown.push_str(text);
+        let shown = if self.stdout_terminal {
+            crate::console::stdout_text(&shown)
+        } else {
+            std::borrow::Cow::Borrowed(shown.as_str())
+        };
+        self.out.write_all(shown.as_bytes())?;
         self.out.flush()
     }
 

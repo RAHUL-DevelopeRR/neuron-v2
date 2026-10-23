@@ -200,13 +200,17 @@ pub fn execute_bash_with_cancel(
 
     if input.run_in_background.unwrap_or(false) {
         let mut command = prepare_command(&input.command, &cwd, &sandbox_status);
-        let child = command
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::null());
+        // Its own process group, so that the session's end can stop the whole tree.
+        subprocess::isolate_process_group(&mut command);
+        let child = command.spawn()?;
+        let task_id = child.id().to_string();
+        subprocess::track_background_child(child);
 
-        let mut output = BashCommandOutput::background(child.id().to_string(), false);
+        let mut output = BashCommandOutput::background(task_id, false);
         output.dangerously_disable_sandbox = input.dangerously_disable_sandbox;
         output.sandbox_status = Some(sandbox_status);
         return Ok(output);
@@ -220,6 +224,14 @@ pub fn execute_bash_with_cancel(
     output.dangerously_disable_sandbox = input.dangerously_disable_sandbox;
     output.sandbox_status = Some(sandbox_status);
     Ok(output)
+}
+
+/// Stops every command still running from `run_in_background` (bash and `PowerShell`),
+/// with every process it started: the session is ending. Returns how many were
+/// running.
+#[must_use = "how many were still running"]
+pub fn stop_background_commands() -> usize {
+    subprocess::kill_background_children()
 }
 
 fn sandbox_status_for_input(input: &BashCommandInput, cwd: &Path) -> SandboxStatus {
@@ -558,6 +570,57 @@ mod tests {
         );
         assert!(!output.stdout.contains("\\\""), "{output:?}");
         assert!(output.stdout.contains("second"), "{output:?}");
+    }
+
+    /// Whether process `pid` still runs (a zombie waiting to be reaped does not).
+    fn is_running(pid: &str) -> bool {
+        if cfg!(windows) {
+            // Not `tasklist`: it hangs while the WMI service is stuck.
+            std::process::Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    &format!(
+                        "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ 'running' }}"
+                    ),
+                ])
+                .output()
+                .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains("running"))
+        } else {
+            std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", pid])
+                .output()
+                .is_ok_and(|output| {
+                    let state = String::from_utf8_lossy(&output.stdout);
+                    let state = state.trim();
+                    !state.is_empty() && !state.starts_with('Z')
+                })
+        }
+    }
+
+    /// A command started with `run_in_background` outlived the engine; the session's end
+    /// now stops it.
+    #[test]
+    fn background_commands_stop_when_the_session_ends() {
+        let command = if cfg!(windows) {
+            "ping -n 60 127.0.0.1 >NUL"
+        } else {
+            "sleep 60"
+        };
+        let mut background = input(command, None);
+        background.run_in_background = Some(true);
+        let output = execute_bash(background).expect("the command starts");
+        let pid = output.background_task_id.expect("a background task id");
+        assert!(is_running(&pid), "{pid} runs in the background");
+
+        assert!(super::stop_background_commands() >= 1);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while is_running(&pid) {
+            assert!(Instant::now() < deadline, "{pid} still runs");
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 }
 

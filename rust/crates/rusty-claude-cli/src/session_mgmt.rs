@@ -103,6 +103,24 @@ pub fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std
         .collect())
 }
 
+/// Whether this workspace has a saved session other than the one at `current`. Cheap:
+/// file names and sizes only, no session is read.
+pub fn has_other_saved_session(current: &Path) -> bool {
+    let Some(entries) = sessions_dir().ok().and_then(|dir| fs::read_dir(dir).ok()) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        path != current
+            && path
+                .extension()
+                .is_some_and(|ext| ext == "jsonl" || ext == "json")
+            && entry
+                .metadata()
+                .is_ok_and(|meta| meta.is_file() && meta.len() > 0)
+    })
+}
+
 pub fn latest_managed_session() -> Result<ManagedSessionSummary, Box<dyn std::error::Error>> {
     let session = current_session_store()?
         .latest_session()

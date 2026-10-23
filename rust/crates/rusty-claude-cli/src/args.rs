@@ -394,13 +394,17 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
     {
         return action;
     }
-    if let Some(error) = unexpected_subcommand_arguments(&rest) {
-        return Err(error);
-    }
+    // `neuron help me debug this test` is a prompt; `neuron init the schema` is refused.
+    let command = match classify_subcommand_words(&rest) {
+        SubcommandWords::Command => rest[0].as_str(),
+        // Matches no subcommand below: the words are the prompt.
+        SubcommandWords::Prompt => "",
+        SubcommandWords::Refused(error) => return Err(error),
+    };
 
     let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
 
-    match rest[0].as_str() {
+    match command {
         "dump-manifests" => parse_dump_manifests_args(&rest[1..], output_format),
         "bootstrap-plan" => Ok(CliAction::BootstrapPlan { output_format }),
         "agents" => Ok(CliAction::Agents {
@@ -418,8 +422,9 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     // `neuron skills NAME [ARGS]` runs skill NAME. When there is none, the
                     // words are an unquoted prompt.
                     let cwd = env::current_dir().map_err(|error| error.to_string())?;
-                    if let Err(error) = resolve_skill_invocation(&cwd, args.as_deref()) {
-                        return Err(format!("{error}\n{}", quote_prompt_hint("skills")));
+                    if resolve_skill_invocation(&cwd, args.as_deref()).is_err() {
+                        let word = rest[1].trim_start_matches(['$', '/']);
+                        return Err(unknown_skill_error(&cwd, word));
                     }
                     Ok(CliAction::Prompt {
                         prompt,
@@ -448,7 +453,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "system-prompt" => parse_system_prompt_args(&rest[1..], output_format),
         "acp" => parse_acp_args(&rest[1..], output_format),
         "login" | "logout" | "auth" | "usage" | "upgrade" => {
-            Err(removed_auth_surface_error(rest[0].as_str()))
+            Err(removed_auth_surface_error(command))
         }
         "init" => Ok(CliAction::Init { output_format }),
         "export" => parse_export_args(&rest[1..], output_format),
@@ -601,45 +606,128 @@ pub(crate) fn quote_prompt_hint(name: &str) -> String {
 
 const SKILLS_USAGE: &str = "neuron skills [list|install <path>|help|<skill> [args]]";
 
-/// A subcommand followed by words it does not take is usually an unquoted prompt that
-/// starts with its name (`neuron init the database schema`). Like the account commands,
-/// it is refused with a quoting hint: the subcommand never runs and the prompt is not
-/// guessed. Unknown `-` options of the subcommands that take options are left to their
-/// own parsers, which name them. `skills` and `export` are checked where they are parsed
-/// (a skill's name, a path).
-pub(crate) fn unexpected_subcommand_arguments(rest: &[String]) -> Option<String> {
-    let (name, args) = rest.split_first()?;
+/// How many skill names an unknown-skill error suggests.
+const SKILL_SUGGESTIONS: usize = 3;
+
+/// `neuron skills <words>` where the first word is no skill: usually an unquoted prompt
+/// that starts with "skills". The quoting hint comes first, then the closest skill
+/// names (not the whole list: `neuron skills` lists them).
+fn unknown_skill_error(cwd: &Path, word: &str) -> String {
+    let names = commands::handle_skills_slash_command_json(None, cwd)
+        .ok()
+        .and_then(|report| report.get("skills").and_then(Value::as_array).cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter(|skill| skill.get("shadowed_by").is_none_or(Value::is_null))
+        .filter_map(|skill| {
+            skill
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    let names = names.iter().map(String::as_str).collect::<Vec<_>>();
+    let mut message = format!(
+        "`skills` runs a skill (`{SKILLS_USAGE}`), and there is no skill named `{word}`. {}",
+        quote_prompt_hint("skills")
+    );
+    let close = ranked_suggestions(word, &names);
+    if !close.is_empty() {
+        message.push_str(&format!(
+            "\n  Did you mean: {}",
+            close
+                .iter()
+                .take(SKILL_SUGGESTIONS)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    message.push_str("\n  `neuron skills` lists the installed skills.");
+    message
+}
+
+/// What the words after a subcommand's name are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SubcommandWords {
+    /// The subcommand with arguments it takes (or no subcommand at all).
+    Command,
+    /// An unquoted prompt that starts with the name of a subcommand that only shows
+    /// something (`neuron help me debug this test`, `neuron mcp server crashes on
+    /// start`): the words go to the model.
+    Prompt,
+    /// Words a subcommand with side effects (or a developer command) does not take
+    /// (`neuron init the database schema`, `neuron login to the server`): refused with
+    /// the quoting hint, so the subcommand never runs and the prompt is not guessed.
+    Refused(String),
+}
+
+/// Sorts the words after a subcommand's name ([`SubcommandWords`]). A first word that
+/// is an option (`neuron status -x`) was meant for the subcommand: refused, or named by
+/// the subcommand's own parser. `skills` and `export` are checked where they are parsed
+/// (a skill's name, a path); one-word commands by [`parse_single_word_command_alias`].
+pub(crate) fn classify_subcommand_words(rest: &[String]) -> SubcommandWords {
+    let Some((name, args)) = rest.split_first() else {
+        return SubcommandWords::Command;
+    };
     let words = args.iter().map(String::as_str).collect::<Vec<_>>();
-    let (usage, takes) = match name.as_str() {
-        "help" | "version" | "status" | "sandbox" | "doctor" | "state" | "init"
-        | "bootstrap-plan" => (format!("neuron {name}"), words.is_empty()),
-        "agents" => (
-            "neuron agents [list|help]".to_string(),
+    let option_first = words
+        .first()
+        .is_some_and(|word| word.len() > 1 && word.starts_with('-'));
+    // Shows something: words it does not take are a prompt.
+    let shows = |usage: &str, takes: bool| match (takes, option_first) {
+        (true, _) => SubcommandWords::Command,
+        (false, false) => SubcommandWords::Prompt,
+        (false, true) => SubcommandWords::Refused(subcommand_arguments_error(name, usage, args)),
+    };
+    // Changes something, or is a developer command: words it does not take are refused.
+    let changes = |usage: &str, takes: bool| {
+        if takes {
+            SubcommandWords::Command
+        } else {
+            SubcommandWords::Refused(subcommand_arguments_error(name, usage, args))
+        }
+    };
+    match name.as_str() {
+        "help" | "version" | "status" | "sandbox" | "doctor" | "state" => {
+            shows(&format!("neuron {name}"), words.is_empty())
+        }
+        "agents" => shows(
+            "neuron agents [list|help]",
             matches!(without_help_word(&words), [] | ["list"]),
         ),
-        "mcp" => (
-            "neuron mcp [list|show <server>|serve|help]".to_string(),
+        "mcp" => shows(
+            "neuron mcp [list|show <server>|serve|help]",
             matches!(
                 without_help_word(&words),
                 [] | ["list" | "show" | "serve"] | ["show", _]
             ),
         ),
-        "acp" => (
-            "neuron acp [serve]".to_string(),
+        "acp" => shows(
+            "neuron acp [serve]",
             matches!(bare_words(&words, &[]).as_slice(), [] | ["serve"]),
         ),
-        "dump-manifests" => (
-            "neuron dump-manifests [--manifests-dir PATH]".to_string(),
+        // The account commands run before parsing (`auth::account_command`) with the
+        // arguments they take; here they have others. `usage` and `auth status` only
+        // show something; signing in or out and opening the plans page never run on a
+        // guess.
+        "usage" if !option_first => SubcommandWords::Prompt,
+        "auth" if !option_first && !matches!(words.first(), Some(&("login" | "logout"))) => {
+            SubcommandWords::Prompt
+        }
+        "init" | "bootstrap-plan" => changes(&format!("neuron {name}"), words.is_empty()),
+        "dump-manifests" => changes(
+            "neuron dump-manifests [--manifests-dir PATH]",
             bare_words(&words, &["--manifests-dir"]).is_empty(),
         ),
-        "system-prompt" => (
-            "neuron system-prompt [--cwd PATH] [--date YYYY-MM-DD]".to_string(),
+        "system-prompt" => changes(
+            "neuron system-prompt [--cwd PATH] [--date YYYY-MM-DD]",
             bare_words(&words, &["--cwd", "--date"]).is_empty(),
         ),
-        // `export` takes a path: its parser names the word after it.
-        _ => return None,
-    };
-    (!takes).then(|| subcommand_arguments_error(name, &usage, args))
+        // `login`, `logout`, `upgrade` and `auth login|logout ...` are refused by their
+        // arm in `parse_args` (`removed_auth_surface_error`); `export` by its parser.
+        _ => SubcommandWords::Command,
+    }
 }
 
 fn subcommand_arguments_error(name: &str, usage: &str, args: &[String]) -> String {
@@ -1202,6 +1290,14 @@ pub(crate) fn parse_export_args(
             other if other.starts_with('-') => {
                 return Err(format!("unknown export option: {other}"));
             }
+            // A bare word (`neuron export summary`) is more often the start of an
+            // unquoted prompt than a file name: the path must look like one.
+            other if output_path.is_none() && !looks_like_a_path(other) => {
+                return Err(format!(
+                    "`neuron export` writes the session to a file, and `{other}` does not look like one: give a file name with an extension (`{other}.md`), a path (`./{other}`), or `--output {other}`. {}",
+                    quote_prompt_hint("export")
+                ));
+            }
             other if output_path.is_none() => {
                 output_path = Some(PathBuf::from(other));
                 index += 1;
@@ -1220,6 +1316,14 @@ pub(crate) fn parse_export_args(
         output_path,
         output_format,
     })
+}
+
+/// Whether `word` names a file: it has an extension or a directory part.
+fn looks_like_a_path(word: &str) -> bool {
+    word.contains(['/', '\\'])
+        || Path::new(word)
+            .extension()
+            .is_some_and(|ext| !ext.is_empty())
 }
 
 pub(crate) fn parse_dump_manifests_args(

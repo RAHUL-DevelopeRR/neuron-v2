@@ -22,7 +22,8 @@ pub fn format_tool_call_start(name: &str, input: &str) -> String {
                 .get("content")
                 .and_then(|value| value.as_str())
                 .map_or(0, |content| content.lines().count());
-            format!("{ICON_WRITE} {GREEN}{BOLD}Writing {path}{R} {DIM}({lines} lines){R}")
+            let lines = count_of(lines as u64, "line", "lines");
+            format!("{ICON_WRITE} {GREEN}{BOLD}Writing {path}{R} {DIM}({lines}){R}")
         }
         "edit_file" | "Edit" => {
             let path = extract_tool_path(&parsed);
@@ -158,10 +159,13 @@ pub fn format_search_start(label: &str, parsed: &serde_json::Value) -> String {
         .get("pattern")
         .and_then(|value| value.as_str())
         .unwrap_or("?");
+    // No path (or `.`) is the workspace the search runs in.
     let scope = parsed
         .get("path")
         .and_then(|value| value.as_str())
-        .unwrap_or(".");
+        .map(str::trim)
+        .filter(|path| !path.is_empty() && *path != ".")
+        .map_or_else(|| "the workspace".to_string(), display_clean_path);
     format!("{label} {pattern}\n\x1b[2min {scope}\x1b[0m")
 }
 
@@ -322,13 +326,21 @@ pub fn format_write_result(icon: &str, parsed: &serde_json::Value) -> String {
         .get("type")
         .and_then(|value| value.as_str())
         .unwrap_or("write");
+    // The tool reports its line count; an older result carried the content instead.
     let line_count = parsed
-        .get("content")
-        .and_then(|value| value.as_str())
-        .map_or(0, |content| content.lines().count());
+        .get("lines")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            parsed
+                .get("content")
+                .and_then(|value| value.as_str())
+                .map(|content| content.lines().count() as u64)
+        })
+        .unwrap_or(0);
     format!(
-        "{icon} {ICON_WRITE} {GREEN}{BOLD}{} {path}{R} {DIM}({line_count} lines){R}",
+        "{icon} {ICON_WRITE} {GREEN}{BOLD}{} {path}{R} {DIM}({}){R}",
         if kind == "create" { "Wrote" } else { "Updated" },
+        count_of(line_count, "line", "lines"),
     )
 }
 
@@ -443,6 +455,7 @@ pub fn format_grep_result(icon: &str, parsed: &serde_json::Value) -> String {
         .get("content")
         .and_then(|value| value.as_str())
         .unwrap_or_default();
+    // Relative to the workspace, as glob_search lists them.
     let filenames = parsed
         .get("filenames")
         .and_then(|value| value.as_array())
@@ -451,10 +464,12 @@ pub fn format_grep_result(icon: &str, parsed: &serde_json::Value) -> String {
                 .iter()
                 .filter_map(|value| value.as_str())
                 .take(8)
+                .map(display_clean_path)
                 .collect::<Vec<_>>()
                 .join("\n")
         })
         .unwrap_or_default();
+    let content = relative_match_lines(content);
     let files = count_of(num_files, "file", "files");
     let summary = match num_matches {
         Some(num_matches) => format!(
@@ -467,7 +482,7 @@ pub fn format_grep_result(icon: &str, parsed: &serde_json::Value) -> String {
         format!(
             "{summary}\n{}",
             truncate_output_for_display(
-                content,
+                &content,
                 TOOL_OUTPUT_DISPLAY_MAX_LINES,
                 TOOL_OUTPUT_DISPLAY_MAX_CHARS,
             )
@@ -477,6 +492,34 @@ pub fn format_grep_result(icon: &str, parsed: &serde_json::Value) -> String {
     } else {
         summary
     }
+}
+
+/// grep_search content lines (`path:line:text`) with paths inside the workspace made
+/// relative to it.
+fn relative_match_lines(content: &str) -> String {
+    let Ok(cwd) = std::env::current_dir() else {
+        return content.to_string();
+    };
+    relative_to(content, &cwd.display().to_string())
+}
+
+/// `content` with every line that starts with `root` and a path separator starting
+/// after them instead.
+fn relative_to(content: &str, root: &str) -> String {
+    let root = root.trim_end_matches(['/', '\\']);
+    if root.is_empty() {
+        return content.to_string();
+    }
+    content
+        .split_inclusive('\n')
+        .map(|line| {
+            let unprefixed = line.strip_prefix(r"\\?\").unwrap_or(line);
+            match unprefixed.strip_prefix(root) {
+                Some(rest) if rest.starts_with(['/', '\\']) => &rest[1..],
+                _ => line,
+            }
+        })
+        .collect()
 }
 
 pub fn format_generic_tool_result(icon: &str, name: &str, parsed: &serde_json::Value) -> String {
@@ -567,8 +610,66 @@ pub fn truncate_output_for_display(content: &str, max_lines: usize, max_chars: u
 
 #[cfg(test)]
 mod tests {
-    use super::{format_grep_result, format_tool_call_start};
+    use super::{format_grep_result, format_tool_call_start, format_write_result, relative_to};
     use crate::render::strip_ansi;
+
+    #[test]
+    fn a_written_file_counts_its_lines_from_the_tool_result() {
+        let one_line = serde_json::json!({
+            "type": "create", "filePath": "proof.txt", "bytes": 20, "lines": 1,
+            "summary": "Created proof.txt (1 lines, 20 bytes)"
+        });
+        assert_eq!(
+            strip_ansi(&format_write_result("ok", &one_line)),
+            "ok \u{25b6} Wrote proof.txt (1 line)"
+        );
+        let update = serde_json::json!({"type": "update", "filePath": "a.txt", "lines": 3});
+        assert!(
+            strip_ansi(&format_write_result("ok", &update)).ends_with("Updated a.txt (3 lines)")
+        );
+        // An older result without the count: from the content, last line unterminated.
+        let legacy = serde_json::json!({"type": "create", "filePath": "b.txt", "content": "x\ny"});
+        assert!(strip_ansi(&format_write_result("ok", &legacy)).ends_with("(2 lines)"));
+
+        let start = strip_ansi(&format_tool_call_start(
+            "write_file",
+            r#"{"path":"proof.txt","content":"written by me"}"#,
+        ));
+        assert!(start.contains("Writing proof.txt (1 line)"), "{start}");
+    }
+
+    #[test]
+    fn a_search_without_a_path_runs_in_the_workspace() {
+        for input in [
+            r#"{"pattern":"TODO","path":""}"#,
+            r#"{"pattern":"TODO"}"#,
+            r#"{"pattern":"TODO","path":"."}"#,
+        ] {
+            let start = strip_ansi(&format_tool_call_start("glob_search", input));
+            assert!(
+                start.contains("\u{2502}  in the workspace\n"),
+                "{input}: {start}"
+            );
+        }
+    }
+
+    #[test]
+    fn grep_match_lines_are_relative_to_the_workspace() {
+        let content = "/work/repo/src/a.js:3:// TODO one\n/elsewhere/b.js:1:TODO\n/work/repo/src/util/b.js:9:x";
+        assert_eq!(
+            relative_to(content, "/work/repo/"),
+            "src/a.js:3:// TODO one\n/elsewhere/b.js:1:TODO\nsrc/util/b.js:9:x"
+        );
+        assert_eq!(
+            relative_to(r"C:\w\repo\src\a.js:1:x", r"C:\w\repo"),
+            r"src\a.js:1:x"
+        );
+        // A sibling directory that shares the prefix is not inside the workspace.
+        assert_eq!(
+            relative_to("/work/repo2/a.js:1:x", "/work/repo"),
+            "/work/repo2/a.js:1:x"
+        );
+    }
 
     #[test]
     fn grep_summaries_count_what_the_mode_counts() {

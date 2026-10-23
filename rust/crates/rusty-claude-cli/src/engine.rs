@@ -128,8 +128,10 @@ pub(crate) fn spawn(options: EngineOptions) -> Result<EngineHandle, String> {
                 &queue_rx,
                 &ready_tx,
             );
-            // Sub-agents left running in the background must not outlive the session.
+            // Sub-agents and commands left running in the background must not outlive
+            // the session.
             tools::cancel_background_subagents();
+            let _ = runtime::stop_background_commands();
             progress::shutdown_shared_runtime_state();
             exit
         })
@@ -314,6 +316,7 @@ impl SignedOut<'_> {
                     }
                 }
                 EngineCommand::Submit { .. } => {
+                    self.shared.prompt_dropped();
                     self.fail("Sign in to Zero-X first: /login.");
                 }
                 EngineCommand::SetModel { model } if !model.trim().is_empty() => {
@@ -379,7 +382,7 @@ fn sign_in(
     shared: &Shared,
 ) -> Result<(crate::auth::GatewayCredential, Option<String>), String> {
     let cancel = CancellationToken::new();
-    let running = RunningTurn::start(shared, None);
+    let running = RunningTurn::start(shared);
     running.watch(cancel.clone(), HookAbortSignal::new());
     let cancelled = || cancel.is_cancelled();
     crate::auth::login_with(
@@ -467,9 +470,8 @@ fn status_event(
 /// What the command thread needs to reach the engine thread's turn.
 #[derive(Default)]
 struct Shared {
-    /// The running turn's Ctrl-C presses; `None` between turns, so an interrupt with
-    /// nothing running is not kept for (and does not cancel) the next turn.
-    presses: Mutex<Option<InterruptPresses>>,
+    /// Where an interrupt goes. Lock it before `turn` when taking both.
+    interrupts: Mutex<Interrupts>,
     /// The running turn's cancellation, for shutdown and pending questions.
     turn: Mutex<Option<(CancellationToken, HookAbortSignal)>>,
     /// Where the answer to the pending question goes, with the question's number.
@@ -496,7 +498,43 @@ impl Shared {
     }
 
     fn turn_running(&self) -> bool {
-        lock(&self.presses).is_some() || lock(&self.turn).is_some()
+        lock(&self.interrupts).presses.is_some() || lock(&self.turn).is_some()
+    }
+
+    /// The UI's interrupt: the running turn's, else one for the prompt the engine has
+    /// not reached yet (it starts cancelled), else nothing to interrupt.
+    fn interrupt(&self) {
+        let mut guard = lock(&self.interrupts);
+        let interrupts = &mut *guard;
+        let turn = lock(&self.turn);
+        if let Some(presses) = &interrupts.presses {
+            // The turn's monitor reports the press (and quits on a second one).
+            presses.press();
+            match turn.as_ref() {
+                // Now, not when the monitor gets to the press.
+                Some((cancel, _)) => cancel.cancel(),
+                // The turn's cancellation is not installed yet: `watch` cancels it
+                // before the first request.
+                None => interrupts.early = true,
+            }
+        } else if let Some((cancel, _)) = turn.as_ref() {
+            cancel.cancel();
+        } else if interrupts.queued_prompts > 0 {
+            interrupts.early = true;
+        }
+    }
+
+    /// The command thread queued a prompt for the engine.
+    fn prompt_queued(&self) {
+        lock(&self.interrupts).queued_prompts += 1;
+    }
+
+    /// The engine took a queued prompt and will not run it (no session yet): an early
+    /// interrupt meant for it is spent.
+    fn prompt_dropped(&self) {
+        let mut interrupts = lock(&self.interrupts);
+        interrupts.queued_prompts = interrupts.queued_prompts.saturating_sub(1);
+        interrupts.early = false;
     }
 
     /// Answers [`EngineCommand::ListModels`] now, on a thread of its own (the catalog may
@@ -529,21 +567,64 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Where the UI's interrupts go ([`Shared::interrupt`]). An interrupt with nothing
+/// running and no prompt queued is dropped, not kept to cancel a later turn; one sent
+/// right after a prompt, before the engine reached it, cancels that prompt's turn.
+#[derive(Default)]
+struct Interrupts {
+    /// The running turn's Ctrl-C presses; `None` between turns.
+    presses: Option<InterruptPresses>,
+    /// Prompts the command thread queued that the engine has not taken yet.
+    queued_prompts: usize,
+    /// An interrupt came for a prompt whose turn has not installed its cancellation yet
+    /// ([`RunningTurn::watch`] cancels it).
+    early: bool,
+}
+
 /// Marks a turn as running for the command thread until dropped.
 struct RunningTurn<'a> {
     shared: &'a Shared,
+    /// A queued prompt's turn ([`Self::for_prompt`]), which owns the interrupt presses.
+    prompt: bool,
 }
 
 impl<'a> RunningTurn<'a> {
-    /// `presses` reach a turn's interrupt monitor; without them (a sign-in) an interrupt
-    /// cancels the token given to [`Self::watch`].
-    fn start(shared: &'a Shared, presses: Option<InterruptPresses>) -> Self {
-        *lock(&shared.presses) = presses;
-        Self { shared }
+    /// A turn without a prompt (a sign-in): an interrupt cancels the token given to
+    /// [`Self::watch`].
+    fn start(shared: &'a Shared) -> Self {
+        Self {
+            shared,
+            prompt: false,
+        }
+    }
+
+    /// The turn of the queued prompt the engine just took. Its `presses` reach the
+    /// turn's interrupt monitor; an interrupt that came after the prompt was queued is
+    /// one of them, so it cancels this turn (and a second one still quits).
+    fn for_prompt(shared: &'a Shared, presses: InterruptPresses) -> Self {
+        let mut interrupts = lock(&shared.interrupts);
+        interrupts.queued_prompts = interrupts.queued_prompts.saturating_sub(1);
+        if interrupts.early {
+            presses.press();
+        }
+        interrupts.presses = Some(presses);
+        drop(interrupts);
+        Self {
+            shared,
+            prompt: true,
+        }
     }
 
     fn watch(&self, cancel: CancellationToken, hook_abort: HookAbortSignal) {
+        let mut interrupts = lock(&self.shared.interrupts);
+        // Pressed before the cancellation was installed: the monitor may not have seen
+        // it yet, and the first request must not go out.
+        if self.prompt && std::mem::take(&mut interrupts.early) {
+            cancel.cancel();
+            hook_abort.abort();
+        }
         *lock(&self.shared.turn) = Some((cancel, hook_abort));
+        drop(interrupts);
         // A shutdown that came before the turn could be reached.
         if self.shared.closing.load(Ordering::SeqCst) {
             self.shared.stop_turn();
@@ -553,7 +634,11 @@ impl<'a> RunningTurn<'a> {
 
 impl Drop for RunningTurn<'_> {
     fn drop(&mut self) {
-        *lock(&self.shared.presses) = None;
+        let mut interrupts = lock(&self.shared.interrupts);
+        if self.prompt {
+            interrupts.presses = None;
+            interrupts.early = false;
+        }
         *lock(&self.shared.turn) = None;
     }
 }
@@ -567,17 +652,16 @@ fn forward_commands(
 ) {
     loop {
         match commands.recv().unwrap_or(EngineCommand::Shutdown) {
-            EngineCommand::Interrupt => {
-                if let Some(presses) = lock(&shared.presses).as_ref() {
-                    presses.press();
-                } else if let Some((cancel, _)) = lock(&shared.turn).as_ref() {
-                    cancel.cancel();
-                }
-            }
+            EngineCommand::Interrupt => shared.interrupt(),
             EngineCommand::Submit { text, attachments } => {
                 if let Some(answer) = shared.take_answer() {
                     let _ = answer.send(text);
-                } else if queue
+                    continue;
+                }
+                // Counted before the engine can take it, so an interrupt sent right
+                // after it is kept for its turn.
+                shared.prompt_queued();
+                if queue
                     .send(EngineCommand::Submit { text, attachments })
                     .is_err()
                 {
@@ -904,8 +988,13 @@ impl Engine {
     }
 
     fn submit(&mut self, text: &str, attachments: &[Attachment]) {
+        // The turn is the interrupts' target from the moment the prompt is taken.
+        let shared = Arc::clone(&self.shared);
+        let presses = InterruptPresses::default();
+        let running = RunningTurn::for_prompt(&shared, presses.clone());
         let line = text.trim();
         if line.is_empty() && attachments.is_empty() {
+            drop(running);
             self.finish_turn();
             return;
         }
@@ -914,7 +1003,7 @@ impl Engine {
         let prompt = try_resolve_bare_skill_prompt(&cwd, line).unwrap_or_else(|| line.to_string());
         let prompt = self.with_attachments(prompt, attachments);
         let input = self.wrap_for_mode(&prompt);
-        match self.run_turn(&input) {
+        match self.run_turn(&input, running, presses) {
             Ok((summary, usage)) => self.report_turn(&summary, usage),
             Err(message) => self.send(UiEvent::Error { message }),
         }
@@ -954,13 +1043,15 @@ impl Engine {
         }
     }
 
-    /// Runs one turn with UI permission prompts and UI interrupts, and saves the session
-    /// however it ends. Returns the summary and the turn's own token usage (the summary
-    /// counts the whole session).
-    fn run_turn(&mut self, input: &str) -> Result<(TurnSummary, TokenUsage), String> {
-        let shared = Arc::clone(&self.shared);
-        let presses = InterruptPresses::default();
-        let running = RunningTurn::start(&shared, Some(presses.clone()));
+    /// Runs one turn with UI permission prompts and UI interrupts (`presses`, the ones
+    /// `running` receives), and saves the session however it ends. Returns the summary
+    /// and the turn's own token usage (the summary counts the whole session).
+    fn run_turn(
+        &mut self,
+        input: &str,
+        running: RunningTurn<'_>,
+        presses: InterruptPresses,
+    ) -> Result<(TurnSummary, TokenUsage), String> {
         let monitor = self
             .cli
             .prepare_turn_runtime_watching(self.output.clone(), Some(presses))
@@ -1391,8 +1482,10 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::{
-        git_status, plain_notice, question_notice, spawn, EngineExit, EngineHandle, EngineOptions,
+        forward_commands, git_status, plain_notice, question_notice, spawn, EngineExit,
+        EngineHandle, EngineOptions, RunningTurn, Shared,
     };
+    use crate::repl_loop::InterruptPresses;
     use crate::tests::{env_lock, with_current_dir};
     use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
     use neuron_tui::protocol::{
@@ -1400,10 +1493,13 @@ mod tests {
     };
     use runtime::ui_hooks::{self, UserQuestion};
     use runtime::PermissionMode;
+    use runtime::{CancellationToken, HookAbortSignal};
     use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::mpsc::{self, Sender};
     use std::sync::mpsc::{Receiver, RecvTimeoutError};
+    use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1726,6 +1822,25 @@ mod tests {
                 },
                 UiEvent::TurnFinished,
             ]
+        );
+
+        // Interrupted at once, before the engine reached the prompt: nothing is
+        // streamed and the turn ends as interrupted.
+        engine.commands.send(scenario("streaming_text")).unwrap();
+        engine.commands.send(EngineCommand::Interrupt).unwrap();
+        let interrupted = turn_events(&engine.events);
+        assert!(
+            notices(&interrupted)
+                .iter()
+                .any(|notice| notice.starts_with("Interrupted.")),
+            "{interrupted:?}"
+        );
+        assert!(
+            matches!(
+                without_notices(&interrupted).as_slice(),
+                [UiEvent::Usage { turn, .. }, UiEvent::TurnFinished] if *turn == counts(0, 0)
+            ),
+            "{interrupted:?}"
         );
 
         // A tool call that needs approval, approved: it runs.
@@ -2057,5 +2172,125 @@ mod tests {
             }),
             "Question: Which branch?\n  1. main\n  2. dev\nAnswer with 1-2 or in your own words."
         );
+    }
+
+    /// The command thread and the engine thread's side of a turn, without a session.
+    struct Commands {
+        shared: Arc<Shared>,
+        sender: Sender<EngineCommand>,
+        queue: Receiver<EngineCommand>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl Commands {
+        fn start() -> Self {
+            let shared = Arc::new(Shared::default());
+            let (sender, commands_rx) = mpsc::channel();
+            let (queue_tx, queue) = mpsc::channel();
+            let forwarding = Arc::clone(&shared);
+            let thread =
+                thread::spawn(move || forward_commands(&commands_rx, &queue_tx, &forwarding));
+            Self {
+                shared,
+                sender,
+                queue,
+                thread: Some(thread),
+            }
+        }
+
+        /// Sends `commands`, then waits until the command thread handled them all.
+        fn send(&self, commands: Vec<EngineCommand>) {
+            for command in commands {
+                self.sender.send(command).unwrap();
+            }
+            let marker = EngineCommand::SetModel {
+                model: "marker".into(),
+            };
+            self.sender.send(marker.clone()).unwrap();
+            while self.queue.recv_timeout(EVENT_TIMEOUT).expect("queued") != marker {}
+        }
+
+        /// Takes a queued prompt as the engine does and installs its cancellation;
+        /// returns the turn, its token and whether a press is waiting for its monitor.
+        fn take_prompt(&self) -> (RunningTurn<'_>, CancellationToken, bool) {
+            let presses = InterruptPresses::default();
+            let running = RunningTurn::for_prompt(&self.shared, presses.clone());
+            let cancel = CancellationToken::new();
+            running.watch(cancel.clone(), HookAbortSignal::new());
+            let pressed = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime")
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_millis(50), presses.next_press())
+                        .await
+                        .is_ok()
+                });
+            (running, cancel, pressed)
+        }
+    }
+
+    impl Drop for Commands {
+        fn drop(&mut self) {
+            let _ = self.sender.send(EngineCommand::Shutdown);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn prompt() -> EngineCommand {
+        EngineCommand::Submit {
+            text: "write it in Rust".into(),
+            attachments: Vec::new(),
+        }
+    }
+
+    /// An interrupt that came within ~0.1 s of the submit, before the engine reached the
+    /// prompt, used to be dropped and the turn ran to completion.
+    #[test]
+    fn an_interrupt_right_after_a_submit_cancels_that_turn() {
+        let commands = Commands::start();
+
+        // Before the engine took the prompt.
+        commands.send(vec![prompt(), EngineCommand::Interrupt]);
+        let (running, cancel, pressed) = commands.take_prompt();
+        assert!(cancel.is_cancelled(), "the turn starts cancelled");
+        assert!(pressed, "the turn's monitor hears the press");
+        drop(running);
+
+        // After the engine took it, before its cancellation was installed.
+        commands.send(vec![prompt()]);
+        let presses = InterruptPresses::default();
+        let running = RunningTurn::for_prompt(&commands.shared, presses);
+        commands.send(vec![EngineCommand::Interrupt]);
+        let cancel = CancellationToken::new();
+        running.watch(cancel.clone(), HookAbortSignal::new());
+        assert!(cancel.is_cancelled());
+        drop(running);
+
+        // While it runs: the token is cancelled at once, not when the monitor gets to it.
+        commands.send(vec![prompt()]);
+        let (running, cancel, _) = commands.take_prompt();
+        assert!(!cancel.is_cancelled());
+        commands.send(vec![EngineCommand::Interrupt]);
+        assert!(cancel.is_cancelled());
+        drop(running);
+
+        // With nothing running or queued, an interrupt is dropped: the next turn runs.
+        commands.send(vec![EngineCommand::Interrupt, prompt()]);
+        let (running, cancel, pressed) = commands.take_prompt();
+        assert!(!cancel.is_cancelled());
+        assert!(!pressed);
+        drop(running);
+
+        // A prompt the engine refuses (signed out) spends the interrupt meant for it.
+        commands.send(vec![prompt(), EngineCommand::Interrupt]);
+        commands.shared.prompt_dropped();
+        commands.send(vec![prompt()]);
+        let (running, cancel, pressed) = commands.take_prompt();
+        assert!(!cancel.is_cancelled());
+        assert!(!pressed);
+        drop(running);
     }
 }

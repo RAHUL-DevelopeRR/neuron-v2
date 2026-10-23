@@ -210,13 +210,29 @@ pub fn render_usage(account: &AccountSummary, now: u64) -> String {
     lines.join("\n")
 }
 
-/// Fetches the account of the active Zero-X credential.
+/// Fetches the account of the active Zero-X credential. A login that expired (by its
+/// stored expiry, or as the gateway says) is signed out, as `neuron auth status` says.
 fn current_account() -> Result<AccountSummary, Box<dyn std::error::Error>> {
     let base = crate::auth::gateway_base_url()?;
     let credential = crate::auth::current_credential()?.ok_or(
         "Not signed in to Zero-X. Run `neuron auth login` (or set NEURON_TOKEN) to see usage.",
     )?;
-    Ok(fetch_account(&base, &credential.token)?)
+    signed_in(&credential, crate::clock::now_unix())?;
+    match fetch_account(&base, &credential.token) {
+        Err(error) if error.is_invalid_session() => {
+            Err(crate::auth::signed_out_line(&credential, None).into())
+        }
+        result => Ok(result?),
+    }
+}
+
+/// `Err` with the signed-out line when `credential` expired by `now`.
+fn signed_in(credential: &crate::auth::GatewayCredential, now: u64) -> Result<(), String> {
+    if credential.is_expired(now) {
+        Err(crate::auth::signed_out_line(credential, Some(now)))
+    } else {
+        Ok(())
+    }
 }
 
 /// Fetches and renders the usage report for the active Zero-X credential.
@@ -346,6 +362,26 @@ mod tests {
         assert_eq!(report["account"]["daily_tokens_limit"], 10_000_000);
         assert_eq!(report["account"]["credit_balance_usd"], 7.42);
         assert!(report["upgrade_url"].is_string());
+    }
+
+    #[test]
+    fn a_login_that_expired_here_is_signed_out_without_asking_the_gateway() {
+        let mut credential = crate::auth::GatewayCredential {
+            token: SecureString::new("ses_test".to_string()),
+            kind: crate::credentials::TokenKind::Session,
+            source: crate::auth::CredentialSource::EnvToken,
+            expires_at: Some(1_000),
+            plan: None,
+            email: None,
+        };
+        let error = signed_in(&credential, 1_000).expect_err("expired");
+        assert!(
+            error.starts_with("Signed out of Zero-X: the session expired"),
+            "{error}"
+        );
+        assert!(signed_in(&credential, 999).is_ok());
+        credential.expires_at = None;
+        assert!(signed_in(&credential, u64::MAX).is_ok());
     }
 
     #[test]

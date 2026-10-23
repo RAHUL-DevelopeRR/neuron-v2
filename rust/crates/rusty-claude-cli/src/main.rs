@@ -39,6 +39,9 @@
     clippy::many_single_char_names,
     clippy::wildcard_imports
 )]
+// First: its `println!` family is the one every module below prints with.
+#[macro_use]
+mod console;
 mod account;
 mod api_client;
 mod args;
@@ -55,6 +58,7 @@ mod full_screen;
 mod gateway_catalog;
 mod gateway_http;
 mod gateway_repl;
+mod headless;
 mod init;
 mod input;
 mod orchestrator;
@@ -353,6 +357,9 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Before anything prints: a classic Windows console shows colours as text until
+    // VT processing is on, and its fonts need other marks.
+    console::init();
     // The trust prompt and the config loader must read the same trust store.
     runtime::workspace_trust::set_trust_store_path(
         credentials::neuron_home().join("trusted_dirs.txt"),
@@ -444,6 +451,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             let permission_mode = crate::args::permission_mode_after_trust(permission_mode);
             let model = crate::args::model_after_trust(model);
+            // JSON mode: stderr carries only the JSON error, not the Azure notice.
+            provider::set_json_output(output_format == CliOutputFormat::Json);
             // ── Resolve provider (Azure primary → OpenRouter fallback) ──
             // The provider always dictates the model — when Azure is up we
             // use gpt-5.5, when falling back to OpenRouter we MUST switch
@@ -469,6 +478,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
             let mut cli = LiveCli::new(effective_model, true, allowed_tools, permission_mode)?;
             cli.set_reasoning_effort(reasoning_effort);
+            // Nobody to answer (stdin not a terminal): approvals and questions are refused.
+            headless::start(headless::stdin_is_unattended(), output_format);
             // Print a condensed welcome banner for one-shot mode so the user
             // sees model info and quota even when not in the REPL.
             // Not to a file or a pipe: there it is noise around the answer.
@@ -477,7 +488,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", format_connected_line(&cli.model));
                 println!();
             }
-            cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
+            let result = cli.run_turn_with_output(&effective_prompt, output_format, compact);
+            // Tool calls denied for lack of a prompt: named once more, and exit code 2.
+            let denied_exit = headless::report(output_format);
+            result?;
+            if let Some(code) = denied_exit {
+                drop(cli);
+                std::process::exit(code);
+            }
         }
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
         CliAction::Acp { output_format } => print_acp_status(output_format)?,
@@ -1589,7 +1607,8 @@ struct RuntimePluginState {
 struct RuntimeMcpState {
     runtime: tokio::runtime::Runtime,
     manager: McpServerManager,
-    pending_servers: Vec<String>,
+    /// Servers that could not start, or whose transport is unsupported.
+    failed_servers: Vec<String>,
     degraded_report: Option<runtime::McpDegradedReport>,
     /// A stand-in while the servers start in the background ([`BackgroundMcp`]): it has
     /// no tools yet, and calls say so.
@@ -1727,7 +1746,7 @@ impl RuntimeMcpState {
         Ok(Some(Self {
             runtime: tokio::runtime::Runtime::new()?,
             manager,
-            pending_servers: Vec::new(),
+            failed_servers: Vec::new(),
             degraded_report: None,
             starting: false,
             background: None,
@@ -1757,7 +1776,7 @@ impl RuntimeMcpState {
                 discovery
             }
         };
-        let pending_servers = discovery
+        let failed_server_list = discovery
             .failed_servers
             .iter()
             .map(|failure| failure.server_name.clone())
@@ -1775,7 +1794,7 @@ impl RuntimeMcpState {
             .iter()
             .map(|tool| tool.qualified_name.clone())
             .collect::<Vec<_>>();
-        let failed_server_names = pending_servers.iter().cloned().collect::<BTreeSet<_>>();
+        let failed_server_names = failed_server_list.iter().cloned().collect::<BTreeSet<_>>();
         let working_servers = self
             .manager
             .server_names()
@@ -1822,7 +1841,7 @@ impl RuntimeMcpState {
                 available_tools,
             )
         });
-        self.pending_servers = pending_servers;
+        self.failed_servers = failed_server_list;
         Some(discovery)
     }
 
@@ -1833,8 +1852,10 @@ impl RuntimeMcpState {
         }
         Err(ToolError::new(match self.background_start() {
             None => "the MCP servers are still starting; try again in a moment",
-            Some(true) => "the MCP servers have finished starting; their tools join the next turn",
-            Some(false) => "the MCP servers could not start",
+            Some(true) if !self.all_failed() => {
+                "the MCP servers have finished starting; their tools join the next turn"
+            }
+            Some(_) => "the MCP servers could not start",
         }))
     }
 
@@ -1846,15 +1867,29 @@ impl RuntimeMcpState {
             .and_then(|background| background.finished())
     }
 
-    /// ToolSearch's note while a stand-in's servers are missing; `None` otherwise.
-    fn starting_note(&self) -> Option<&'static str> {
+    /// Every server failed (a stand-in whose background start ended counts).
+    fn all_failed(&self) -> bool {
+        let servers = self.server_names();
+        let failed = self.failed_server_names().unwrap_or_default();
+        !servers.is_empty() && servers.iter().all(|server| failed.contains(server))
+    }
+
+    /// ToolSearch's note while a stand-in's servers are missing; `None` otherwise. It
+    /// names the servers as `pending_mcp_servers` and `failed_mcp_servers` list them.
+    fn starting_note(&self) -> Option<String> {
         if !self.starting {
             return None;
         }
         Some(match self.background_start() {
-            None => "The MCP servers in pending_mcp_servers are still starting, so their tools are not searchable yet; search again in a moment.",
-            Some(true) => "The MCP servers in pending_mcp_servers have finished starting; their tools join the next turn, not this one.",
-            Some(false) => "The MCP servers in pending_mcp_servers could not start; their tools are unavailable.",
+            None => "The MCP servers in pending_mcp_servers are still starting, so their tools are not searchable yet; search again in a moment.".to_string(),
+            Some(true) if !self.all_failed() => {
+                let mut note = "The MCP servers have finished starting; their tools join the next turn, not this one.".to_string();
+                if self.failed_server_names().is_some() {
+                    note.push_str(" The ones in failed_mcp_servers could not start.");
+                }
+                note
+            }
+            Some(_) => "The MCP servers in failed_mcp_servers could not start; their tools are unavailable.".to_string(),
         })
     }
 
@@ -1863,15 +1898,30 @@ impl RuntimeMcpState {
         Ok(())
     }
 
-    /// Servers whose tools are missing: the ones that failed, or every server while they
-    /// start in the background.
+    /// Servers still starting in the background, whose tools are not searchable yet.
     fn pending_servers(&self) -> Option<Vec<String>> {
-        let pending = if self.starting {
-            self.server_names()
+        (self.starting && self.background_start().is_none())
+            .then(|| self.server_names())
+            .filter(|pending| !pending.is_empty())
+    }
+
+    /// Servers that could not start (or whose transport is unsupported): their tools
+    /// are unavailable. For a stand-in, the ones its background start reported.
+    fn failed_server_names(&self) -> Option<Vec<String>> {
+        let failed = if self.starting {
+            match self.background_start() {
+                None => Vec::new(),
+                Some(true) => self
+                    .background
+                    .as_ref()
+                    .map(|background| background.failed_servers())
+                    .unwrap_or_default(),
+                Some(false) => self.server_names(),
+            }
         } else {
-            self.pending_servers.clone()
+            self.failed_servers.clone()
         };
-        (!pending.is_empty()).then_some(pending)
+        (!failed.is_empty()).then_some(failed)
     }
 
     fn degraded_report(&self) -> Option<runtime::McpDegradedReport> {
@@ -1882,16 +1932,28 @@ impl RuntimeMcpState {
         self.manager.server_names()
     }
 
+    /// Calls an MCP tool. An interrupt or the session's end (`cancel`) abandons the call
+    /// instead of waiting for the server: the server is stopped, and starts again on its
+    /// next call.
     fn call_tool(
         &mut self,
         qualified_tool_name: &str,
         arguments: Option<serde_json::Value>,
+        cancel: &runtime::CancellationToken,
     ) -> Result<String, ToolError> {
         self.still_starting()?;
         let response = self
             .runtime
-            .block_on(self.manager.call_tool(qualified_tool_name, arguments))
-            .map_err(|error| ToolError::new(error.to_string()))?;
+            .block_on(
+                self.manager
+                    .call_tool_unless_cancelled(qualified_tool_name, arguments, cancel),
+            )
+            .map_err(|error| ToolError::new(error.to_string()))?
+            .ok_or_else(|| {
+                ToolError::new(format!(
+                    "MCP tool `{qualified_tool_name}` was interrupted: the call was abandoned and its server stopped"
+                ))
+            })?;
         if let Some(error) = response.error {
             return Err(ToolError::new(format!(
                 "MCP tool `{qualified_tool_name}` returned JSON-RPC error: {} ({})",
@@ -2003,6 +2065,9 @@ struct BackgroundMcp {
 struct BackgroundMcpShared {
     outcome: Mutex<BackgroundMcpOutcome>,
     cancel: tokio::sync::Notify,
+    /// The servers that could not start, once the start ended: the stand-in reports
+    /// them after the started servers were taken.
+    failed: Mutex<Vec<String>>,
 }
 
 enum BackgroundMcpOutcome {
@@ -2021,6 +2086,7 @@ impl BackgroundMcp {
         let shared = Arc::new(BackgroundMcpShared {
             outcome: Mutex::new(BackgroundMcpOutcome::Starting),
             cancel: tokio::sync::Notify::new(),
+            failed: Mutex::new(Vec::new()),
         });
         let worker = Arc::clone(&shared);
         let spawned = thread::Builder::new()
@@ -2028,6 +2094,11 @@ impl BackgroundMcp {
             .spawn(move || {
                 let finished = match RuntimeMcpState::not_started(&servers) {
                     Ok(Some(mut state)) => state.start(Some(&worker.cancel)).map(|discovery| {
+                        worker
+                            .failed
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone_from(&state.failed_servers);
                         // All the runtime tools: they replace the stand-in's.
                         let mut tools = discovery
                             .tools
@@ -2107,6 +2178,14 @@ impl BackgroundMcpShared {
         self.outcome
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The servers that could not start, once the start ended.
+    fn failed_servers(&self) -> Vec<String> {
+        self.failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// `None` while the servers start; then whether they started (taken counts).
@@ -2483,11 +2562,15 @@ impl LiveCli {
         };
         let red = RED;
 
-        // Welcome + Tips heading
-        let welcome = format!(
-            "{w}{bd}Welcome back, {user}!{r}",
-            user = fit(&username, w_left - "  Welcome back, !".len())
-        );
+        // Welcome + Tips heading: "Welcome back" after a first session, to the account.
+        let email = crate::auth::current_credential()
+            .ok()
+            .flatten()
+            .filter(|credential| !credential.is_expired(crate::clock::now_unix()))
+            .and_then(|credential| credential.email);
+        let returning = session_mgmt::has_other_saved_session(&self.session.path);
+        let greeting = banner_greeting(email.as_deref(), &username, returning, w_left - 2);
+        let welcome = format!("{w}{bd}{greeting}{r}");
         let tips = format!("{o}{bd}Tips for getting started{r}");
         lines.push(row(&format!("  {welcome}"), &format!("  {tips}")));
 
@@ -2777,9 +2860,13 @@ impl LiveCli {
                         format_auto_compaction_notice(event.removed_message_count)
                     );
                 }
-                if let Some(notice) =
-                    repl_loop::describe_turn_outcome(&summary, repl_loop::QuitHint::Shown)
-                {
+                // A `neuron prompt` run is not "back at the prompt" afterwards.
+                let hint = if headless::one_shot() {
+                    repl_loop::QuitHint::Hidden
+                } else {
+                    repl_loop::QuitHint::Shown
+                };
+                if let Some(notice) = repl_loop::describe_turn_outcome(&summary, hint) {
                     println!("{notice}");
                 }
                 persisted?;
@@ -4607,7 +4694,20 @@ fn build_runtime_plugin_state_starting_mcp(
         .clone()
         .with_hooks(runtime_config.hooks().merged(&plugin_hook_config));
     let servers = match startup {
-        McpStartup::WaitWithoutBundled => mcp_servers_without_bundled(runtime_config),
+        McpStartup::WaitWithoutBundled => {
+            let servers = mcp_servers_without_bundled(runtime_config);
+            // ToolSearch tells the model, which would otherwise keep looking for them.
+            progress::set_left_out_bundled_mcp_servers(
+                runtime_config
+                    .mcp()
+                    .servers()
+                    .keys()
+                    .filter(|name| !servers.contains_key(*name))
+                    .cloned()
+                    .collect(),
+            );
+            servers
+        }
         McpStartup::Wait | McpStartup::Background => runtime_config.mcp().servers().clone(),
     };
     let stand_in = match startup {
@@ -4712,9 +4812,10 @@ mod tests {
         resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, status_context,
         summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_no_args,
-        write_mcp_server_fixture, BackgroundMcp, CliAction, CliOutputFormat, CliToolExecutor,
-        GitWorkspaceSummary, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
-        LocalHelpTopic, McpStartup, PromptHistoryEntry, SlashCommand, StatusUsage,
+        write_mcp_server_fixture, BackgroundMcp, BackgroundMcpOutcome, BackgroundMcpShared,
+        CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
+        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
+        McpStartup, PromptHistoryEntry, RuntimeMcpState, SlashCommand, StatusUsage,
         BACKGROUND_MCP_STOP_WAIT, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
@@ -4731,7 +4832,7 @@ mod tests {
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use tools::GlobalToolRegistry;
@@ -5616,12 +5717,33 @@ mod tests {
             login.ends_with("or use `neuron prompt \"login ...\"`."),
             "{login}"
         );
-        // An unquoted prompt that starts with an account command's name is not guessed.
-        for word in ["login", "logout", "auth", "usage", "upgrade"] {
-            let prompt = [word, "to", "the", "server", "and", "fix", "it"].map(String::from);
-            let error = parse_args(&prompt).expect_err("ambiguous");
+        // An unquoted prompt that starts with the name of an account command that signs
+        // in or out or opens a page is not guessed.
+        for words in [
+            &["login", "to", "the", "server", "and", "fix", "it"][..],
+            &["logout", "to", "the", "server", "and", "fix", "it"],
+            &["upgrade", "to", "the", "server", "and", "fix", "it"],
+            &["auth", "login", "now", "please"],
+            &["auth", "logout", "everything"],
+            &["usage", "--bogus"],
+        ] {
+            let error = parse_args(&words.iter().map(ToString::to_string).collect::<Vec<_>>())
+                .expect_err("ambiguous");
             assert!(error.contains("quote it"), "{error}");
             assert!(error.contains("neuron prompt"), "{error}");
+        }
+        // `usage` and `auth status` only show something: other words are a prompt.
+        for words in [
+            &["usage", "of", "memory", "spikes", "under", "load"][..],
+            &["auth", "middleware", "rejects", "valid", "tokens"],
+        ] {
+            assert!(
+                matches!(
+                    parse_args(&words.iter().map(ToString::to_string).collect::<Vec<_>>()),
+                    Ok(CliAction::Prompt { prompt, .. }) if prompt == words.join(" ")
+                ),
+                "{words:?}"
+            );
         }
         let logout =
             parse_args(&["logout".to_string()]).expect_err("logout is not a parser action");
@@ -5684,7 +5806,7 @@ mod tests {
             "overview".to_string(),
         ])
         .expect_err("skills help overview names no skill");
-        assert!(error.contains("Unknown skill: help"), "{error}");
+        assert!(error.contains("there is no skill named `help`"), "{error}");
         assert!(error.contains("neuron prompt \"skills ...\""), "{error}");
         assert_eq!(
             parse_args(&["agents".to_string(), "--help".to_string()])
@@ -6138,27 +6260,48 @@ mod tests {
     }
 
     #[test]
+    fn unquoted_prompts_that_start_with_a_subcommand_that_shows_something_go_to_the_model() {
+        let words = |values: &[&str]| values.iter().map(ToString::to_string).collect::<Vec<_>>();
+        for command in [
+            vec!["help", "me", "debug", "this", "test"],
+            vec!["status", "of", "the", "build", "is", "red,", "fix", "it"],
+            vec!["mcp", "server", "crashes", "on", "start"],
+            vec!["agents", "keep", "timing", "out"],
+            vec!["version", "of", "python"],
+            vec!["sandbox", "the", "tests"],
+            vec!["doctor", "the", "results"],
+            vec!["state", "machine", "refactor"],
+            vec!["agents", "list", "them"],
+            vec!["mcp", "show", "the", "github", "server"],
+            vec!["acp", "protocol", "notes"],
+            vec!["help", "me", "fix", "the", "--verbose", "flag"],
+        ] {
+            let parsed = parse_args(&words(&command));
+            assert!(
+                matches!(&parsed, Ok(CliAction::Prompt { prompt, .. }) if *prompt == command.join(" ")),
+                "{command:?}: {parsed:?}"
+            );
+        }
+        // After global flags too.
+        assert!(matches!(
+            parse_args(&words(&["--model", "sonnet", "help", "me", "debug"])),
+            Ok(CliAction::Prompt { prompt, .. }) if prompt == "help me debug"
+        ));
+    }
+
+    #[test]
     fn unquoted_prompts_that_start_with_a_subcommand_are_refused_not_run() {
         let words = |values: &[&str]| values.iter().map(ToString::to_string).collect::<Vec<_>>();
         for command in [
             vec!["init", "the", "database", "schema"],
-            vec!["help", "me", "debug"],
-            vec!["version", "of", "python"],
-            vec!["status", "of", "the", "build"],
+            // An option right after the name was meant for the command.
             vec!["status", "-x"],
-            vec!["sandbox", "the", "tests"],
-            vec!["doctor", "the", "results"],
-            vec!["state", "machine", "refactor"],
+            vec!["agents", "--bogus", "flag"],
             vec!["bootstrap-plan", "for", "me"],
-            vec!["agents", "that", "review", "code"],
-            vec!["agents", "list", "them"],
-            vec!["mcp", "server", "for", "github"],
-            vec!["mcp", "show", "the", "github", "server"],
-            vec!["acp", "serve", "now"],
-            vec!["acp", "protocol", "notes"],
             vec!["dump-manifests", "of", "the", "repo"],
             vec!["system-prompt", "rewrite"],
             vec!["export", "the", "database", "schema"],
+            vec!["export", "summary"],
             vec!["--model", "sonnet", "init", "the", "repo"],
             vec!["skills", "install", "a", "b"],
         ] {
@@ -6189,6 +6332,12 @@ mod tests {
             parse_args(&words(&["export", "--bogus"])).unwrap_err(),
             "unknown export option: --bogus"
         );
+        // A bare word is not taken for a file name: the error says what would be.
+        let error = parse_args(&words(&["export", "summary"])).unwrap_err();
+        assert!(
+            error.contains("`summary.md`") && error.contains("`./summary`"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -6216,6 +6365,8 @@ mod tests {
                 "2026-04-01",
             ],
             vec!["export", "notes.md"],
+            vec!["export", "out/notes"],
+            vec!["export", "-o", "notes"],
             vec!["export", "--session", "latest", "-o", "notes.md"],
             vec!["status", "--help"],
             vec!["init", "--help"],
@@ -6260,11 +6411,22 @@ mod tests {
             parse_args(&words(&["skills", "that", "are", "installed"]))
         })
         .unwrap_err();
-        assert!(error.contains("Unknown skill: that"), "{error}");
+        // The quoting hint first, and no list of every skill.
         assert!(
-            error.contains("Available skills: ") && error.contains("caveman"),
+            error.starts_with(
+                "`skills` runs a skill (`neuron skills [list|install <path>|help|<skill> [args]]`), and there is no skill named `that`. To send a prompt"
+            ),
             "{error}"
         );
+        assert!(!error.contains("Available skills"), "{error}");
+        assert!(!error.contains("caveman"), "not close to `that`: {error}");
+        // A close name is suggested.
+        let typo = with_current_dir(&workspace, || {
+            parse_args(&words(&["skills", "cavemen", "please"]))
+        })
+        .unwrap_err();
+        assert!(typo.contains("Did you mean: caveman"), "{typo}");
+        assert!(typo.contains("`neuron prompt \"skills ...\"`"), "{typo}");
         assert!(error.contains("`neuron prompt \"skills ...\"`"), "{error}");
 
         fs::remove_dir_all(workspace).expect("workspace should clean up");
@@ -8119,7 +8281,9 @@ UU conflicted.rs",
         let search_json: serde_json::Value =
             serde_json::from_str(&search_output).expect("search output should be json");
         assert_eq!(search_json["matches"][0], "mcp__alpha__echo");
-        assert_eq!(search_json["pending_mcp_servers"][0], "broken");
+        // It failed: nothing is pending.
+        assert_eq!(search_json["pending_mcp_servers"], serde_json::Value::Null);
+        assert_eq!(search_json["failed_mcp_servers"], json!(["broken"]));
         assert_eq!(
             search_json["mcp_degraded"]["failed_servers"][0]["server_name"],
             "broken"
@@ -8334,7 +8498,7 @@ UU conflicted.rs",
     }
 
     #[test]
-    fn a_background_start_that_ends_during_a_turn_says_its_tools_join_the_next_one() {
+    fn a_background_start_that_fails_during_a_turn_lists_the_server_as_failed() {
         let workspace = temp_dir();
         let config_home = workspace.join("config-home");
         fs::create_dir_all(&config_home).expect("config home");
@@ -8376,11 +8540,18 @@ UU conflicted.rs",
                 .expect("tool search runs"),
         )
         .expect("search output is json");
-        assert_eq!(search["pending_mcp_servers"], json!(["alpha"]), "{search}");
+        // Its start ended, and the server failed: listed as failed, not pending, and the
+        // note says so.
+        assert_eq!(
+            search["pending_mcp_servers"],
+            serde_json::Value::Null,
+            "{search}"
+        );
+        assert_eq!(search["failed_mcp_servers"], json!(["alpha"]), "{search}");
         assert!(
             search["note"]
                 .as_str()
-                .is_some_and(|note| note.contains("join the next turn")),
+                .is_some_and(|note| note.contains("could not start")),
             "{search}"
         );
         let call = executor
@@ -8389,9 +8560,68 @@ UU conflicted.rs",
                 r#"{"qualifiedName":"mcp__alpha__echo","arguments":{}}"#,
             )
             .expect_err("the stand-in runs no tool");
-        assert!(call.to_string().contains("join the next turn"), "{call}");
+        assert!(call.to_string().contains("could not start"), "{call}");
 
         background.stop();
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    /// ToolSearch listed every server as pending while its note said they had finished
+    /// starting, failed ones included.
+    #[test]
+    fn a_finished_background_start_lists_only_its_failed_servers_and_none_as_pending() {
+        let workspace = temp_dir();
+        let config_home = workspace.join("config-home");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::write(
+            config_home.join("settings.json"),
+            json!({
+                "defaultMcpServers": false,
+                "mcpServers": {
+                    "alpha": {"command": "neuron-test-alpha"},
+                    "codebase-memory": {"command": "neuron-test-codebase-memory"}
+                }
+            })
+            .to_string(),
+        )
+        .expect("write mcp settings");
+        let runtime_config = ConfigLoader::new(&workspace, &config_home)
+            .load()
+            .expect("runtime config should load");
+        let mut stand_in = RuntimeMcpState::not_started(runtime_config.mcp().servers())
+            .expect("state")
+            .expect("servers");
+        let background = Arc::new(BackgroundMcpShared {
+            outcome: Mutex::new(BackgroundMcpOutcome::Starting),
+            cancel: tokio::sync::Notify::new(),
+            failed: Mutex::new(Vec::new()),
+        });
+        stand_in.starting = true;
+        stand_in.background = Some(Arc::clone(&background));
+
+        // Starting: all pending, none failed.
+        assert_eq!(
+            stand_in.pending_servers(),
+            Some(vec!["alpha".to_string(), "codebase-memory".to_string()])
+        );
+        assert_eq!(stand_in.failed_server_names(), None);
+
+        // Started, but one failed (its tools join the next turn: the servers were taken).
+        *background.failed.lock().expect("failed") = vec!["codebase-memory".to_string()];
+        *background.lock() = BackgroundMcpOutcome::Done;
+        assert_eq!(stand_in.pending_servers(), None);
+        assert_eq!(
+            stand_in.failed_server_names(),
+            Some(vec!["codebase-memory".to_string()])
+        );
+        let note = stand_in.starting_note().expect("a note");
+        assert!(note.contains("finished starting"), "{note}");
+        assert!(
+            note.contains("failed_mcp_servers could not start"),
+            "{note}"
+        );
+        assert!(!note.contains("pending_mcp_servers"), "{note}");
+
         let _ = fs::remove_dir_all(workspace);
     }
 
@@ -8472,7 +8702,8 @@ UU conflicted.rs",
             .expect("tool search should execute");
         let search_json: serde_json::Value =
             serde_json::from_str(&search_output).expect("search output should be json");
-        assert_eq!(search_json["pending_mcp_servers"][0], "remote");
+        assert_eq!(search_json["pending_mcp_servers"], serde_json::Value::Null);
+        assert_eq!(search_json["failed_mcp_servers"], json!(["remote"]));
         assert_eq!(
             search_json["mcp_degraded"]["failed_servers"][0]["server_name"],
             "remote"

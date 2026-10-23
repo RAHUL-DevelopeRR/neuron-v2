@@ -149,10 +149,16 @@ impl StreamFailure {
                     1 => " (after one retry)".to_string(),
                     retries => format!(" (after {retries} retries)"),
                 };
+                // A `neuron prompt` run has no REPL to type `/model` into.
+                let switch = if crate::headless::one_shot() {
+                    "pick another model with --model"
+                } else {
+                    "switch models with /model"
+                };
                 RuntimeError::with_kind(
                     kind,
                     format!(
-                        "{}{after}. The provider may be overloaded; try again, or switch models with /model.",
+                        "{}{after}. The provider may be overloaded; try again, or {switch}.",
                         other.describe()
                     ),
                 )
@@ -252,10 +258,21 @@ pub(crate) fn fatal_api_error(session_id: &str, error: &api::ApiError) -> Stream
     } else {
         RuntimeErrorKind::Other
     };
-    StreamFailure::Fatal(RuntimeError::with_kind(
-        kind,
-        format_user_visible_api_error(session_id, error),
-    ))
+    let mut message = format_user_visible_api_error(session_id, error);
+    if let Some(hint) = switch_model_hint(error) {
+        message.push_str(hint);
+    }
+    StreamFailure::Fatal(RuntimeError::with_kind(kind, message))
+}
+
+/// For the gateway's `capacity_exhausted`, whose advice is to wait or upgrade (even on
+/// the highest plan): another model's shared pool may well have room now.
+fn switch_model_hint(error: &api::ApiError) -> Option<&'static str> {
+    (error.gateway_error().and_then(api::GatewayError::code_kind)
+        == Some(api::GatewayErrorCode::CapacityExhausted))
+    .then_some(
+        ". Other models may have capacity now: switch with /model (or --model in a `neuron prompt` run).",
+    )
 }
 
 /// Stop reason reported for tool calls the provider closed without
@@ -784,11 +801,16 @@ pub(crate) fn format_user_visible_api_error(session_id: &str, error: &api::ApiEr
         if let Some(request_id) = error.request_id() {
             qualifiers.push(format!("trace {request_id}"));
         }
+        let mut detail = error.to_string();
+        if crate::headless::one_shot() {
+            // The provider's advice is a REPL command; a `neuron prompt` run starts a
+            // fresh session every time.
+            detail = detail.replace(", or use /new to start a fresh session", "");
+        }
         format!(
-            "{} ({}): {}",
+            "{} ({}): {detail}",
             error.safe_failure_class(),
             qualifiers.join(", "),
-            error
         )
     } else {
         error.to_string()
@@ -870,19 +892,39 @@ pub(crate) fn format_context_window_blocked_error(
     }
 
     lines.push(String::new());
-    lines.push("Recovery".to_string());
-    lines.push("  Compact          /compact".to_string());
-    lines.push(format!(
-        "  Resume compact   neuron --resume {session_id} /compact"
+    lines.extend(context_window_recovery_lines(
+        session_id,
+        crate::headless::one_shot(),
     ));
-    lines.push("  Fresh session    /clear --confirm".to_string());
+
+    lines.join("\n")
+}
+
+/// What to do about a blocked context window: REPL commands, or for a one-shot
+/// `neuron prompt` run (`one_shot`, no REPL afterwards) the commands to run instead.
+pub(crate) fn context_window_recovery_lines(session_id: &str, one_shot: bool) -> Vec<String> {
+    let mut lines = vec!["Recovery".to_string()];
+    if one_shot {
+        lines.push(format!(
+            "  Compact          neuron --resume {session_id} /compact"
+        ));
+        lines.push(
+            "  Fresh session    run `neuron prompt` again: each run starts a new session"
+                .to_string(),
+        );
+    } else {
+        lines.push("  Compact          /compact".to_string());
+        lines.push(format!(
+            "  Resume compact   neuron --resume {session_id} /compact"
+        ));
+        lines.push("  Fresh session    /clear --confirm".to_string());
+    }
     lines.push(
         "  Reduce scope     remove large pasted context/files or ask for a smaller slice"
             .to_string(),
     );
     lines.push("  Retry            rerun after compacting or reducing the request".to_string());
-
-    lines.join("\n")
+    lines
 }
 
 pub(crate) fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
@@ -1323,12 +1365,14 @@ mod stream_resilience_tests {
     }
 
     impl FakeGateway {
-        /// The tool names each request carried, in order.
+        /// The tool names each request carried, in order. A connection that sent no
+        /// request (one a loaded machine left idle past the read timeout) is skipped.
         fn tool_names(&self) -> Vec<Vec<String>> {
             self.bodies
                 .lock()
                 .expect("bodies")
                 .iter()
+                .filter(|body| !body.is_empty())
                 .map(|body| {
                     let body: serde_json::Value =
                         serde_json::from_str(body).expect("request body is json");
@@ -1667,6 +1711,13 @@ mod stream_resilience_tests {
 
         assert_eq!(error.kind(), RuntimeErrorKind::Timeout);
         assert!(!error.to_string().contains("retry"), "{error}");
+        // On a loaded machine the client can give up before the gateway's thread has
+        // counted the connection; wait for it, then check there was no second one.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while gateway.connections.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        thread::sleep(Duration::from_millis(100));
         assert_eq!(gateway.connections.load(Ordering::SeqCst), 1);
     }
 
@@ -2127,5 +2178,67 @@ mod stream_resilience_tests {
         );
         assert_eq!(crate::max_tokens_for_model("openai/auto"), 8_192);
         assert_eq!(crate::max_tokens_for_model("vendor/unknown"), 8_192);
+    }
+}
+
+#[cfg(test)]
+mod recovery_hint_tests {
+    use super::context_window_recovery_lines;
+
+    #[test]
+    fn a_one_shot_run_is_told_commands_it_can_run_not_repl_ones() {
+        let repl = context_window_recovery_lines("session-7", false).join("\n");
+        assert!(repl.contains("  Compact          /compact\n"), "{repl}");
+        assert!(repl.contains("/clear --confirm"), "{repl}");
+
+        let one_shot = context_window_recovery_lines("session-7", true).join("\n");
+        assert!(
+            one_shot.contains("  Compact          neuron --resume session-7 /compact\n"),
+            "{one_shot}"
+        );
+        assert!(!one_shot.contains("/clear"), "{one_shot}");
+        assert!(!one_shot.contains("          /compact"), "{one_shot}");
+    }
+}
+
+#[cfg(test)]
+mod switch_model_hint_tests {
+    use super::{fatal_api_error, StreamFailure};
+
+    fn gateway_error(code: &str) -> api::ApiError {
+        let body = serde_json::json!({
+            "error": {
+                "code": code,
+                "message": "Shared free capacity is exhausted right now. Retry later or upgrade for dedicated capacity.",
+                "upgrade_url": "https://zero-x.live/pricing",
+            }
+        })
+        .to_string();
+        api::ApiError::Gateway(Box::new(
+            api::GatewayError::from_body(reqwest::StatusCode::SERVICE_UNAVAILABLE, &body)
+                .expect("an envelope"),
+        ))
+    }
+
+    /// The gateway tells everyone to upgrade, max-plan users included; switching
+    /// models is what they can do now.
+    #[test]
+    fn exhausted_capacity_suggests_another_model() {
+        let StreamFailure::Fatal(error) =
+            fatal_api_error("session-1", &gateway_error("capacity_exhausted"))
+        else {
+            panic!("a fatal error");
+        };
+        let message = error.to_string();
+        assert!(message.contains("capacity_exhausted"), "{message}");
+        assert!(message.contains("switch with /model"), "{message}");
+        assert!(message.contains("--model"), "{message}");
+
+        let StreamFailure::Fatal(error) =
+            fatal_api_error("session-1", &gateway_error("insufficient_credits"))
+        else {
+            panic!("a fatal error");
+        };
+        assert!(!error.to_string().contains("/model"), "{error}");
     }
 }

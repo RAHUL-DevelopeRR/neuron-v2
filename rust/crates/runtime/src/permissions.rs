@@ -231,6 +231,81 @@ impl PartialEq for PendingGrants {
 
 impl Eq for PendingGrants {}
 
+/// Why a tool call needs approval: as the user is asked (`asked`, which a UI shows in
+/// its permission dialog), and as a denial reads when nobody can be asked (`refused`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ApprovalReason {
+    asked: String,
+    refused: String,
+}
+
+impl From<String> for ApprovalReason {
+    fn from(reason: String) -> Self {
+        Self {
+            asked: reason.clone(),
+            refused: reason,
+        }
+    }
+}
+
+/// The command of a `bash`/`PowerShell` call, on one line and at most 120 characters.
+fn shell_command_summary(tool_name: &str, input: &str) -> Option<String> {
+    if tool_name != "bash" && tool_name != "PowerShell" {
+        return None;
+    }
+    let value = serde_json::from_str::<Value>(input).ok()?;
+    let command = value.get("command")?.as_str()?.trim();
+    if command.is_empty() {
+        return None;
+    }
+    let first_line = command.lines().next().unwrap_or(command);
+    let mut summary = first_line.chars().take(120).collect::<String>();
+    if summary.len() < command.len() {
+        summary.push('\u{2026}');
+    }
+    Some(summary)
+}
+
+/// Why a call that needs more than `current_mode` (or any call in prompt mode) asks
+/// first, in plain words: `Run `npm test`? Commands can change files and run programs,
+/// beyond what workspace-write allows.`
+fn escalation_reason(
+    tool_name: &str,
+    input: &str,
+    current_mode: PermissionMode,
+    required_mode: PermissionMode,
+    detail: Option<&str>,
+) -> ApprovalReason {
+    let command = shell_command_summary(tool_name, input);
+    let why = if current_mode == PermissionMode::Prompt {
+        "Permission mode prompt asks before every tool call.".to_string()
+    } else if command.is_some() {
+        format!(
+            "Commands can change files and run programs, beyond what {} allows.",
+            current_mode.as_str()
+        )
+    } else {
+        let detail = detail
+            .map(|detail| format!(" ({detail})"))
+            .unwrap_or_default();
+        format!(
+            "It needs {}, beyond what {} allows{detail}.",
+            required_mode.as_str(),
+            current_mode.as_str()
+        )
+    };
+    match command {
+        Some(command) => ApprovalReason {
+            asked: format!("Run `{command}`? {why}"),
+            refused: format!("`{command}` was not run: {why}"),
+        },
+        None => ApprovalReason {
+            asked: format!("Allow {tool_name}? {why}"),
+            refused: format!("tool '{tool_name}' was not run: {why}"),
+        },
+    }
+}
+
 /// Input-dependent permission requirement of one tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCallAssessment {
@@ -572,7 +647,7 @@ impl PermissionPolicy {
                     input,
                     current_mode,
                     &assessment,
-                    Some(reason),
+                    Some(reason.into()),
                     prompter,
                 );
             }
@@ -587,7 +662,7 @@ impl PermissionPolicy {
                         input,
                         current_mode,
                         &assessment,
-                        Some(reason),
+                        Some(reason.into()),
                         prompter,
                     );
                 }
@@ -611,7 +686,7 @@ impl PermissionPolicy {
                 input,
                 current_mode,
                 &assessment,
-                Some(reason),
+                Some(reason.into()),
                 prompter,
             );
         }
@@ -631,15 +706,13 @@ impl PermissionPolicy {
             || (current_mode == PermissionMode::WorkspaceWrite
                 && required_mode == PermissionMode::DangerFullAccess)
         {
-            let mut reason = format!(
-                "tool '{tool_name}' requires approval to escalate from {} to {}",
-                current_mode.as_str(),
-                required_mode.as_str()
+            let reason = escalation_reason(
+                tool_name,
+                input,
+                current_mode,
+                required_mode,
+                assessment.reason.as_deref(),
             );
-            if let Some(detail) = &assessment.reason {
-                reason.push_str(": ");
-                reason.push_str(detail);
-            }
             return self.prompt_or_deny(
                 tool_name,
                 input,
@@ -669,7 +742,7 @@ impl PermissionPolicy {
         input: &str,
         current_mode: PermissionMode,
         assessment: &ToolCallAssessment,
-        reason: Option<String>,
+        reason: Option<ApprovalReason>,
         mut prompter: Option<&mut dyn PermissionPrompter>,
     ) -> PermissionOutcome {
         let subject = grant_subject(input);
@@ -677,16 +750,21 @@ impl PermissionPolicy {
             if self.grants.consume(tool_name, &subject) {
                 return PermissionOutcome::Allow;
             }
-            let base = reason.unwrap_or_else(|| {
-                format!(
-                    "tool '{tool_name}' requires approval to run while mode is {}",
-                    current_mode.as_str()
-                )
-            });
+            let base = reason.map_or_else(
+                || {
+                    format!(
+                        "tool '{tool_name}' requires approval to run while mode is {}",
+                        current_mode.as_str()
+                    )
+                },
+                |reason| reason.refused,
+            );
+            let base = base.trim_end_matches('.');
             return PermissionOutcome::Deny {
                 reason: format!("{base}. {NON_INTERACTIVE_PERMISSION_HINT}"),
             };
         };
+        let reason = reason.map(|reason| reason.asked);
 
         let request = PermissionRequest {
             tool_name: tool_name.to_string(),
@@ -1159,9 +1237,10 @@ fn extract_permission_subject(input: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_permission_response, render_permission_prompt, url_host, ConsolePermissionPrompter,
-        PermissionContext, PermissionMode, PermissionOutcome, PermissionOverride, PermissionPolicy,
-        PermissionPromptDecision, PermissionPrompter, PermissionRequest, SessionApprovals,
+        escalation_reason, parse_permission_response, render_permission_prompt, url_host,
+        ConsolePermissionPrompter, PermissionContext, PermissionMode, PermissionOutcome,
+        PermissionOverride, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
+        PermissionRequest, SessionApprovals,
     };
     use crate::bash_validation::ShellDialect;
     use crate::config::RuntimePermissionRuleConfig;
@@ -1516,10 +1595,55 @@ mod tests {
         assert_eq!(request.required_mode, PermissionMode::DangerFullAccess);
         assert_eq!(request.current_mode, PermissionMode::WorkspaceWrite);
         assert_eq!(request.session_prefixes, vec!["cargo test".to_string()]);
-        assert!(request
-            .reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("not a known read-only command")));
+        // What the user is asked, in plain words (a UI shows it in its dialog).
+        assert_eq!(
+            request.reason.as_deref(),
+            Some("Run `cargo test -p runtime`? Commands can change files and run programs, beyond what workspace-write allows.")
+        );
+    }
+
+    #[test]
+    fn approval_reasons_are_plain_questions_and_denials_are_statements() {
+        let policy = workspace_policy(PermissionMode::WorkspaceWrite);
+        let PermissionOutcome::Deny { reason } =
+            policy.authorize("bash", &bash_input("npm test"), None)
+        else {
+            panic!("expected denial");
+        };
+        assert!(
+            reason.starts_with("`npm test` was not run: Commands can change files and run programs, beyond what workspace-write allows. No interactive approval"),
+            "{reason}"
+        );
+        assert!(!reason.contains("escalate"), "{reason}");
+
+        // A long command is cut, on one line.
+        let long = format!("echo {}\necho two", "x".repeat(200));
+        let asked = escalation_reason(
+            "bash",
+            &bash_input(&long),
+            PermissionMode::WorkspaceWrite,
+            PermissionMode::DangerFullAccess,
+            None,
+        )
+        .asked;
+        assert!(asked.starts_with("Run `echo xxx"), "{asked}");
+        assert!(asked.contains("\u{2026}`? Commands can"), "{asked}");
+        assert!(!asked.contains('\n'), "{asked}");
+
+        let reason = escalation_reason(
+            "write_file",
+            r#"{"path":"/etc/hosts"}"#,
+            PermissionMode::WorkspaceWrite,
+            PermissionMode::DangerFullAccess,
+            Some("outside the workspace"),
+        );
+        assert_eq!(
+            reason.asked,
+            "Allow write_file? It needs danger-full-access, beyond what workspace-write allows (outside the workspace)."
+        );
+        assert!(reason
+            .refused
+            .starts_with("tool 'write_file' was not run: It needs"));
     }
 
     #[test]
