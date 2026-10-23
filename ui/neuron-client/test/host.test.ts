@@ -246,7 +246,8 @@ describe('NeuronHost', () => {
     })
     const { id } = await transport.rpc<{ id: number }>('term.open', { cols: 100, rows: 30 })
     transport.terminalResize(id, 120, 40)
-    transport.terminalInput(id, 'echo neuron-term-$(1+1)\r')
+    // $((1+1)) is 2 in both PowerShell (Windows) and POSIX shells.
+    transport.terminalInput(id, 'echo neuron-term-$((1+1))\r')
     await until('the echo', () => output.includes('neuron-term-2'))
     transport.terminalInput(id, 'exit\r')
     await until('the shell to exit', () => exited !== undefined)
