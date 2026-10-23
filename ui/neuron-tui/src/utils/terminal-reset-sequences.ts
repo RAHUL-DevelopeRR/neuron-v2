@@ -4,9 +4,9 @@
  * sacrificial watchdog process (terminal-watchdog.ts).
  *
  * Keep this list in sync with the modes OpenTUI enables (see the enable
- * sequences in @opentui/core's native lib) and with
- * SAFE_TERMINAL_RESET_SEQUENCES in the npm release launcher
- * (cli/release-core/launcher.js).
+ * sequences in @opentui/core's native lib) and with TERMINAL_RESET_SEQUENCES
+ * in rust/crates/rusty-claude-cli/src/full_screen.rs, which `neuron` writes
+ * after a UI that died (a test checks the two agree).
  *
  * Sequences:
  * - \x1b[?1049l: Exit alternate screen buffer (restores main screen)

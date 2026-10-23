@@ -4,9 +4,11 @@
 // deny), resizing, Ctrl-C to quit, a bare `neuron` handing the console to the
 // UI, and `neuron --continue <chat>` reopening a chat. The steps are
 // scripts/windows-console/*.txt, played by ConPtyDrive.cs, which this compiles
-// with the csc.exe that ships with Windows. Then two exits in a classic console
-// window (classic-console-check.ps1 with ConsoleKeys.cs): the window must
-// survive them and show the --continue hint.
+// with the csc.exe that ships with Windows. Then, in a classic console window
+// (classic-console-check.ps1 with ConsoleKeys.cs): three exits the window must
+// survive with the --continue hint, its title, the line REPL's first screens,
+// and NEURON_CONSOLE_STRESS (3) launches through `neuron` that must still
+// read the keyboard.
 //
 //   bun run check:console
 //
@@ -100,30 +102,69 @@ function savedChatIds(home: string): string[] {
 // cmd.exe open: quitting must leave the window alive, with the hint on it.
 // conhost used to crash there (an access violation) as the UI quit, when the
 // process lived on after its renderer's teardown and the key-up of the
-// quitting key arrived (see exit-cleanly.ts).
-for (const [mode, keys, label] of [
-  ['--via-neuron', 'PARITY_SCENARIO:streaming_text<CR>|<SLEEP>|<CC>|<CC>', 'Ctrl-C twice, through neuron'],
-  ['--compiled', 'PARITY_SCENARIO:streaming_text<CR>|<SLEEP>|/exit<CR>', '/exit, the UI on its own'],
+// quitting key arrived (see exit-cleanly.ts). The window's title must be
+// Neuron's while the UI runs and the shell's again after it.
+// `-Direct` runs `neuron` itself in the window, as a customer's shell does
+// (`bare` is a bare `neuron`); the others run the dev script under Bun.
+const turn = 'PARITY_SCENARIO:streaming_text<SHOWN>|<CR>|<SLEEP>'
+for (const [mode, keys, label, flags] of [
+  ['bare', `${turn}|<ALIVE>|<CC>|<CC>`, 'Ctrl-C twice, a bare neuron', ['-Direct']],
+  ['--compiled', `${turn}|<ALIVE>|/exit<SHOWN>|<CR>`, '/exit, the UI on its own', []],
   // A dead engine has nothing to wait for, so the exit would tear down at once.
-  [
-    '--compiled',
-    'PARITY_SCENARIO:streaming_text<CR>|<SLEEP>|<KILLENGINE>|<CC>|<CC>',
-    'Ctrl-C twice after the engine died, the UI on its own',
-  ],
+  ['--compiled', `${turn}|<KILLENGINE>|<CC>|<CC>`, 'Ctrl-C twice after the engine died, the UI on its own', []],
 ] as const) {
-  results.push(classic(mode, keys, label))
+  results.push(classic(mode, keys, label, { flags: ['-CheckTitle', ...flags] }))
 }
 
+// A command typed right after quitting must reach the shell whole: the UI
+// stops reading the keyboard once the quit is asked for.
+results.push(
+  classic('bare', `${turn}|/exit<CR><THEN>echo early42<CR>`, 'a command typed right after /exit reaches the shell', {
+    flags: ['-Direct', '-ShellGets', 'early42'],
+  }),
+)
+
+// The line REPL's first screens (the trust prompt, the banner) in a classic
+// window: no escape code may show as text (`←[38;2;…`). Under Bun the console
+// already has escape-code processing on, so this one must run `neuron` itself.
+results.push(
+  classic('--no-tui', '1<CR>|<SLEEP>|/exit<CR>', 'the line REPL shows no escape codes', {
+    ready: 'trust this directory',
+    expect: '',
+    flags: ['-NoEscapes', '-Direct'],
+  }),
+)
+
+// The keyboard died in 2 of about 47 launches through `neuron` (the UI drew,
+// typing did nothing). NEURON_CONSOLE_STRESS more bare `neuron` launches, each
+// checking that the UI still reads keys after a turn; 3 by default.
+const stress = Number(process.env.NEURON_CONSOLE_STRESS ?? 3)
+let alive = 0
+for (let run = 1; run <= stress; run++) {
+  const label = `keyboard still read, bare neuron launch ${run} of ${stress}`
+  if (classic('bare', `${turn}|<ALIVE>|/exit<SHOWN>|<CR>`, label, { flags: ['-Direct'] })) alive++
+}
+if (stress > 0) results.push(alive === stress)
+
 /** Runs classic-console-check.ps1: types `keys`, then checks the window and its hint. */
-function classic(mode: string, keys: string, label: string): boolean {
+function classic(
+  mode: string,
+  keys: string,
+  label: string,
+  options: { ready?: string; expect?: string; flags?: string[] } = {},
+): boolean {
+  const expect = options.expect ?? 'neuron --continue'
   const run = Bun.spawnSync(
     [
       'powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
       '-File', path.join(steps, 'classic-console-check.ps1'),
       '-Work', work, '-Bun', process.execPath, '-DevScript', devScript,
-      '-Mode', mode, '-Keys', keys, '-Expect', 'neuron --continue',
+      '-Mode', mode, '-Keys', keys,
+      ...(expect ? ['-Expect', expect] : []),
+      ...(options.ready ? ['-Ready', options.ready] : []),
+      ...(options.flags ?? []),
     ],
-    { env: process.env, timeout: 200_000 },
+    { env: process.env, timeout: 240_000 },
   )
   const report = run.stdout.toString() + run.stderr.toString()
   const passed = /^RESULT pass/m.test(report)
