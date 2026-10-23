@@ -1,31 +1,50 @@
-import { lazy, Suspense, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 
-import { changedPaths, needsSignIn, openQuestion, type SessionController, type TranscriptItem } from '@neuron/client'
+import {
+  FEATURE_SESSIONS,
+  FEATURE_TRUST_WORKSPACE,
+  changedPaths,
+  hasFeature,
+  needsSignIn,
+  openQuestionItem,
+  runningSubagents,
+  type SessionController,
+  type TranscriptItem,
+} from '@neuron/client'
 
-import { StatusBar, TopBar } from './components/Bars'
-import { Composer } from './components/Composer'
-import { FileTree } from './components/FileTree'
-import { Inspector } from './components/Inspector'
+import { ChatHeader, StatusBar, TrustBanner } from './components/Bars'
+import { Composer, ModeMenu } from './components/Composer'
+import { ProjectDialog, SettingsDialog } from './components/Dialogs'
+import { ModelPicker } from './components/ModelPicker'
 import { PermissionDialog } from './components/PermissionDialog'
 import { PixelLogo } from './components/PixelLogo'
+import { SidePane, type PaneTab } from './components/SidePane'
+import { Sidebar } from './components/Sidebar'
 import { SignInPanel } from './components/SignIn'
 import { Transcript } from './components/Transcript'
 import { useSession } from './hooks'
-import type { Platform } from './platform'
-
-// xterm only loads when the terminal first opens.
-const TerminalPane = lazy(() => import('./components/TerminalPane').then((module) => ({ default: module.TerminalPane })))
+import type { Platform, Project } from './platform'
+import { useSettings } from './settings'
 
 type ToolItem = Extract<TranscriptItem, { kind: 'tool' }>
+
+const STARTERS = [
+  'Explain how this project is organised',
+  'Find likely bugs in the code I changed recently',
+  'Write tests for the least-tested module',
+]
 
 export function App({ platform }: { platform: Platform }) {
   const [controller, setController] = useState<SessionController | null>(null)
   const [launchError, setLaunchError] = useState<string | null>(null)
   const state = useSession(controller)
-  const [file, setFile] = useState<string | null>(null)
-  const [toolKey, setToolKey] = useState<string | null>(null)
+  const [settings, updateSettings] = useSettings()
+  const [paneOpen, setPaneOpen] = useState(true)
+  const [paneTab, setPaneTab] = useState<PaneTab>('changes')
   const [terminalOpened, setTerminalOpened] = useState(false)
-  const [terminalShown, setTerminalShown] = useState(false)
+  const [toolKey, setToolKey] = useState<string | null>(null)
+  const [dialog, setDialog] = useState<'project' | 'settings' | null>(null)
+  const [recent, setRecent] = useState<Project[]>([])
 
   useEffect(() => {
     let cancelled = false
@@ -38,20 +57,51 @@ export function App({ platform }: { platform: Platform }) {
     }
   }, [platform])
 
+  const history = hasFeature(state, FEATURE_SESSIONS)
+  const ready = state.connection === 'ready'
+  const sessionId = state.status?.session_id || null
+
+  // The chat list follows the engine: after it starts, after every turn, and on a switch.
+  useEffect(() => {
+    if (controller && ready && history && !state.busy) controller.listSessions()
+  }, [controller, ready, history, state.busy, sessionId])
+
+  const openPane = useCallback((tab: PaneTab) => {
+    if (tab === 'terminal') setTerminalOpened(true)
+    setPaneTab(tab)
+    setPaneOpen(true)
+  }, [])
+
+  const newChat = useCallback(() => {
+    if (!controller || state.busy) return
+    setToolKey(null)
+    controller.newChat()
+  }, [controller, state.busy])
+
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (event.ctrlKey && event.key === '`') {
+      if (!(event.ctrlKey || event.metaKey)) return
+      if (event.key === '`') {
         event.preventDefault()
-        setTerminalOpened(true)
-        setTerminalShown((shown) => !shown)
+        if (paneOpen && paneTab === 'terminal') setPaneOpen(false)
+        else openPane('terminal')
+      } else if (event.key.toLowerCase() === 'b') {
+        event.preventDefault()
+        setPaneOpen((open) => !open)
+      } else if (event.key.toLowerCase() === 'n') {
+        event.preventDefault()
+        newChat()
+      } else if (event.key === ',') {
+        event.preventDefault()
+        setDialog('settings')
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [])
+  }, [paneOpen, paneTab, openPane, newChat])
 
   const changes = useMemo(() => changedPaths(state), [state])
-  // Re-read the tree and the open file whenever a call finishes.
+  // Re-read the tree, git and open files whenever a call finishes.
   const refreshKey = useMemo(
     () => state.items.filter((item) => item.kind === 'tool' && item.state !== 'running' && item.state !== 'awaiting_permission').length,
     [state.items],
@@ -59,7 +109,12 @@ export function App({ platform }: { platform: Platform }) {
   const tool = (state.items.find((item) => item.key === toolKey) as ToolItem | undefined) ?? null
   const permission = state.permissions[0] ?? null
   const signIn = needsSignIn(state) || state.signInCode !== null || state.sessionStarting
-  const question = openQuestion(state)
+  const question = openQuestionItem(state)
+  const project = platform.project()
+  const title =
+    state.sessions?.find((session) => session.id === sessionId)?.title ??
+    (state.items.find((item) => item.kind === 'user') as Extract<TranscriptItem, { kind: 'user' }> | undefined)?.text.split('\n')[0] ??
+    'New chat'
 
   if (!controller) {
     return (
@@ -77,24 +132,34 @@ export function App({ platform }: { platform: Platform }) {
   }
 
   return (
-    <div className={`app${terminalShown ? ' with-terminal' : ''}`}>
-      <TopBar
-        state={state}
-        where={platform.label}
-        onListModels={() => controller.listModels()}
-        onPickModel={(model) => controller.setModel(model)}
-      />
-      <FileTree
-        platform={platform}
-        refreshKey={refreshKey}
-        changed={new Set(changes)}
-        selected={file}
-        onOpen={(path) => {
-          setFile(path)
+    <div className={`app${paneOpen ? '' : ' pane-closed'}`}>
+      <Sidebar
+        project={project}
+        sessions={state.sessions}
+        currentId={sessionId}
+        busy={state.busy}
+        historyAvailable={history}
+        canOpenProject={platform.can.openProject}
+        onNewChat={newChat}
+        onResume={(id) => {
           setToolKey(null)
+          controller.resume(id)
         }}
+        onOpenProject={() => {
+          void platform.recentProjects().then(setRecent, () => setRecent([]))
+          setDialog('project')
+        }}
+        onSettings={() => setDialog('settings')}
       />
       <main className="chat">
+        <ChatHeader state={state} title={title} where={platform.label} sidePaneOpen={paneOpen} onToggleSidePane={() => setPaneOpen(!paneOpen)} />
+        <TrustBanner
+          state={state}
+          canTrust={hasFeature(state, FEATURE_TRUST_WORKSPACE)}
+          canRestart={platform.can.restart}
+          onTrust={() => controller.trustWorkspace()}
+          onRestart={() => void platform.restart(sessionId).catch((error: Error) => setLaunchError(error.message))}
+        />
         {signIn ? (
           <SignInPanel
             code={state.signInCode}
@@ -108,59 +173,107 @@ export function App({ platform }: { platform: Platform }) {
           <Transcript
             items={state.items}
             busy={state.busy}
+            folded={settings.foldTools}
+            showReasoning={settings.showReasoning}
             onLink={(url) => platform.openExternal(url)}
+            onAnswer={(id, text) => controller.answer(id, text)}
             selectedTool={toolKey}
             onSelectTool={(item) => {
               setToolKey(item.key)
-              setFile(null)
+              openPane('changes')
             }}
+            empty={
+              <div className="empty">
+                <PixelLogo pixel={6} />
+                <h2>What should Neuron do in {project?.name ?? 'this project'}?</h2>
+                <div className="starters">
+                  {STARTERS.map((starter) => (
+                    <button key={starter} disabled={!ready} onClick={() => controller.send(starter)}>
+                      {starter}
+                    </button>
+                  ))}
+                </div>
+                <p className="muted small">@ adds a file · / runs a command · Ctrl+N new chat · Ctrl+B side panel</p>
+              </div>
+            }
           />
         )}
         <Composer
           busy={state.busy}
-          disabled={state.connection !== 'ready'}
-          question={question}
-          onSend={(text) => controller.send(text)}
+          disabled={!ready}
+          questionWaiting={question !== null}
+          enterSends={settings.enterSends}
+          searchFiles={platform.searchFiles}
+          onSend={(text, attachments) => {
+            setToolKey(null)
+            controller.send(text, attachments)
+          }}
           onInterrupt={() => controller.interrupt()}
+          toolbar={
+            <>
+              <ModeMenu
+                mode={state.status?.permission_mode ?? 'workspace-write'}
+                planMode={state.status?.plan_mode ?? false}
+                disabled={!ready || state.busy}
+                onMode={(mode) => controller.command('permissions', mode)}
+                onPlan={(on) => controller.command('plan', on ? 'on' : 'off')}
+              />
+              <ModelPicker
+                current={state.status?.model ?? ''}
+                models={state.models}
+                disabled={!ready || state.busy}
+                onOpen={() => controller.listModels()}
+                onPick={(model) => controller.setModel(model)}
+              />
+            </>
+          }
         />
         {state.connection === 'exited' && (
           <div className="error-line" role="alert">
             {state.connectionError ?? 'The Neuron engine stopped.'}
+            {platform.can.restart && (
+              <button className="link-button" onClick={() => void platform.restart(sessionId).catch(() => {})}>
+                Restart it
+              </button>
+            )}
           </div>
         )}
       </main>
-      <Inspector
-        platform={platform}
-        changes={changes}
-        file={file}
-        tool={tool}
-        refreshKey={refreshKey}
-        onOpenFile={(path) => {
-          setFile(path)
-          setToolKey(null)
-        }}
-      />
-      <section className="terminal-dock" hidden={!terminalShown} aria-label="Terminal">
-        {terminalOpened && (
-          <Suspense fallback={<div className="muted pad">Loading the terminal…</div>}>
-            <TerminalPane platform={platform} />
-          </Suspense>
-        )}
-      </section>
-      <StatusBar
-        state={state}
-        terminalOpen={terminalShown}
-        onToggleTerminal={() => {
-          setTerminalOpened(true)
-          setTerminalShown(!terminalShown)
-        }}
-      />
+      {paneOpen && (
+        <SidePane
+          platform={platform}
+          tab={paneTab}
+          onTab={(tab) => {
+            if (tab === 'changes') setToolKey(null)
+            openPane(tab)
+          }}
+          refreshKey={refreshKey}
+          changed={new Set(changes)}
+          tool={paneTab === 'changes' ? tool : null}
+          todos={state.todos}
+          subagents={runningSubagents(state)}
+          terminalOpened={terminalOpened}
+        />
+      )}
+      <StatusBar state={state} onPane={openPane} />
       {permission && (
         <PermissionDialog
           key={permission.id}
           pending={permission}
           cwd={state.status?.cwd}
           onAnswer={(decision) => controller.answerPermission(permission.id, decision)}
+        />
+      )}
+      {dialog === 'project' && (
+        <ProjectDialog current={project} recent={recent} onOpen={(path) => platform.openProject(path)} onClose={() => setDialog(null)} />
+      )}
+      {dialog === 'settings' && (
+        <SettingsDialog
+          settings={settings}
+          onChange={updateSettings}
+          onClose={() => setDialog(null)}
+          version={state.version}
+          where={platform.label}
         />
       )}
     </div>

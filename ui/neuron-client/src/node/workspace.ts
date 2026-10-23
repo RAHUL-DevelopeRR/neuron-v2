@@ -63,45 +63,62 @@ export interface GitStatusView {
 
 const PROGRAM_CONFIG = String.raw`^(core\.fsmonitor|filter\..*\.(clean|smudge|process)|diff\.external|diff\..*\.(command|textconv))$`
 
-function git(root: string, args: string[]): { ok: boolean; stdout: string; stderr: string; code: number | null } {
-  const child = Bun.spawnSync(
-    ['git', '--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', 'log.showSignature=false', ...args],
-    { cwd: root, env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0' }, stdout: 'pipe', stderr: 'pipe' },
+/** Git gets this long; a repository too big to answer in time shows no changes. */
+const GIT_TIMEOUT_MS = 8_000
+
+interface GitRun {
+  ok: boolean
+  stdout: string
+  code: number | null
+}
+
+/** One git command, without blocking: a host serves other clients meanwhile. */
+async function git(root: string, args: string[], hardened = true): Promise<GitRun> {
+  const child = Bun.spawn(
+    ['git', ...(hardened ? ['--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', 'log.showSignature=false'] : []), ...args],
+    { cwd: root, env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0' }, stdout: 'pipe', stderr: 'ignore' },
   )
-  return {
-    ok: child.exitCode === 0,
-    stdout: child.stdout.toString(),
-    stderr: child.stderr.toString(),
-    code: child.exitCode,
-  }
+  const timer = setTimeout(() => child.kill(), GIT_TIMEOUT_MS)
+  const [stdout, code] = await Promise.all([new Response(child.stdout).text(), child.exited])
+  clearTimeout(timer)
+  return { ok: code === 0, stdout, code }
 }
 
 /**
  * Refuses an untrusted repository whose own (local or worktree) config names a
  * program git would run while reading status or diffs. Reading config runs nothing.
  */
-function assertSafeRepository(root: string, trusted: boolean): void {
+async function assertSafeRepository(root: string, trusted: boolean): Promise<void> {
   if (trusted) return
-  const config = Bun.spawnSync(['git', 'config', '--show-scope', '--get-regexp', PROGRAM_CONFIG], {
-    cwd: root,
-    stdout: 'pipe',
-    stderr: 'pipe',
-  })
-  if (config.exitCode === 1) return
-  const repoScoped =
-    config.exitCode !== 0 ||
-    config.stdout
-      .toString()
-      .split('\n')
-      .some((line) => ['local', 'worktree'].includes(line.split('\t')[0]))
+  const config = await git(root, ['config', '--show-scope', '--get-regexp', PROGRAM_CONFIG], false)
+  if (config.code === 1) return
+  const repoScoped = !config.ok || config.stdout.split('\n').some((line) => ['local', 'worktree'].includes(line.split('\t')[0]))
   if (repoScoped) {
     throw new Error("This repository's own git config runs programs for status and diffs; trust the workspace to see its changes.")
   }
 }
 
-export function gitStatus(root: string, trusted: boolean): GitStatusView | null {
-  assertSafeRepository(root, trusted)
-  const result = git(root, ['status', '--porcelain=v1', '-z', '--branch', '--untracked-files=all'])
+/**
+ * Where the workspace sits in its repository: `''` at the top, `dir/` inside it.
+ * `null` when it is in none, or only inside a repository that does not track it
+ * (a folder under a home directory kept in git is no repository of its own).
+ */
+async function repositoryPrefix(root: string): Promise<string | null> {
+  const prefix = await git(root, ['rev-parse', '--show-prefix'])
+  if (!prefix.ok) return null
+  const dir = prefix.stdout.trim()
+  if (!dir) return ''
+  // Pathspecs are relative to the folder git runs in: `.` is the workspace.
+  const tracked = await git(root, ['ls-tree', '--name-only', 'HEAD', '--', '.'])
+  return tracked.ok && tracked.stdout.trim() ? dir : null
+}
+
+export async function gitStatus(root: string, trusted: boolean): Promise<GitStatusView | null> {
+  await assertSafeRepository(root, trusted)
+  const prefix = await repositoryPrefix(root)
+  if (prefix === null) return null
+  // Only this folder's part of the repository; untracked folders as one entry each.
+  const result = await git(root, ['status', '--porcelain=v1', '-z', '--branch', '--untracked-files=normal', '--', '.'])
   if (!result.ok) return null
   const records = result.stdout.split('\0').filter(Boolean)
   let branch: string | null = null
@@ -113,7 +130,9 @@ export function gitStatus(root: string, trusted: boolean): GitStatusView | null 
       continue
     }
     const xy = record.slice(0, 2)
-    changes.push({ path: record.slice(3), index: xy[0], worktree: xy[1] })
+    // Porcelain paths are relative to the repository's top.
+    const repoPath = record.slice(3)
+    if (repoPath.startsWith(prefix)) changes.push({ path: repoPath.slice(prefix.length), index: xy[0], worktree: xy[1] })
     // A rename's source path follows it as its own record.
     if (xy[0] === 'R' || xy[0] === 'C') index++
   }
@@ -121,14 +140,14 @@ export function gitStatus(root: string, trusted: boolean): GitStatusView | null 
 }
 
 /** The change to one file against HEAD (staged and unstaged), as a unified diff. */
-export function gitDiff(root: string, file: string, trusted: boolean): string {
-  assertSafeRepository(root, trusted)
-  if (file.startsWith('-') || path.isAbsolute(file) || file.split(/[\\/]/).includes('..')) {
+export async function gitDiff(root: string, file: string, trusted: boolean): Promise<string> {
+  if (file.startsWith('-') || path.isAbsolute(file) || file.split(/[\/]/).includes('..')) {
     throw new Error('That path is outside the workspace.')
   }
-  const head = git(root, ['diff', 'HEAD', '--no-ext-diff', '--no-textconv', '--no-color', '--', file])
+  await assertSafeRepository(root, trusted)
+  const head = await git(root, ['diff', 'HEAD', '--no-ext-diff', '--no-textconv', '--no-color', '--', file])
   if (head.ok) return head.stdout
   // No commits yet: everything is staged or untracked.
-  const cached = git(root, ['diff', '--cached', '--no-ext-diff', '--no-textconv', '--no-color', '--', file])
+  const cached = await git(root, ['diff', '--cached', '--no-ext-diff', '--no-textconv', '--no-color', '--', file])
   return cached.ok ? cached.stdout : ''
 }

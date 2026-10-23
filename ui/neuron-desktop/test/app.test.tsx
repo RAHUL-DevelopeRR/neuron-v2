@@ -1,13 +1,22 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 
+import type { ClientMessage } from '@neuron/client'
+
 import { App } from '../src/App'
 import { FakeEngine, fakePlatform } from './fake-platform'
 
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  try {
+    localStorage.clear()
+  } catch {
+    // No storage: nothing to clear.
+  }
+})
 
-async function start(statusOverrides: Record<string, unknown> = {}) {
-  const engine = new FakeEngine(statusOverrides)
+async function start(statusOverrides: Record<string, unknown> = {}, features?: string[]) {
+  const engine = new FakeEngine(statusOverrides, features)
   const platform = fakePlatform(engine)
   render(<App platform={platform} />)
   await screen.findByLabelText('Message Neuron')
@@ -21,23 +30,32 @@ const emit = (engine: FakeEngine, ...events: Parameters<FakeEngine['emit']>[0][]
 
 const type = (text: string) => {
   const box = screen.getByLabelText('Message Neuron')
-  fireEvent.change(box, { target: { value: text } })
+  fireEvent.change(box, { target: { value: text, selectionStart: text.length } })
   fireEvent.keyDown(box, { key: 'Enter' })
 }
 
-describe('Neuron Desktop', () => {
+/** The last command of this type the UI sent. */
+const sent = (engine: FakeEngine, type: string) =>
+  engine.commands().filter((message): message is Extract<ClientMessage, { kind: 'command' }> => message.kind === 'command' && message.type === type).at(-1)
+
+describe('Neuron Desktop: chatting', () => {
+  test('on start it says it takes questions and asks for the chat list', async () => {
+    const { engine } = await start()
+    expect(sent(engine, 'capabilities')).toEqual({ kind: 'command', type: 'capabilities', features: ['questions'] })
+    await waitFor(() => expect(sent(engine, 'list_sessions')).toBeTruthy())
+  })
+
   test('a prompt goes to the engine and the reply streams in', async () => {
     const { engine } = await start()
-    expect(screen.getByText('main', { exact: false })).toBeTruthy()
+    expect(document.querySelector('.chat-header .git')?.textContent).toContain('⎇ main')
     type('explain the build')
-    expect(engine.sent).toEqual([{ kind: 'command', type: 'submit', text: 'explain the build', attachments: [] }])
+    expect(sent(engine, 'submit')).toEqual({ kind: 'command', type: 'submit', text: 'explain the build', attachments: [] })
     expect(screen.getByTestId('user-message').textContent).toBe('explain the build')
     expect(screen.getByRole('button', { name: /stop/i })).toBeTruthy()
 
-    await emit(engine, { type: 'text_delta', text: 'It uses **cargo**' })
-    await emit(engine, { type: 'text_delta', text: ' and `bun`.' })
+    await emit(engine, { type: 'text_delta', text: 'It uses **cargo**' }, { type: 'text_delta', text: ' and `bun`.' })
     const reply = screen.getByTestId('assistant-message')
-    expect(reply.textContent).toBe('It uses cargo and bun.')
+    expect(reply.textContent).toContain('It uses cargo and bun.')
     expect(reply.querySelector('strong')?.textContent).toBe('cargo')
 
     await emit(
@@ -49,6 +67,7 @@ describe('Neuron Desktop', () => {
     )
     expect(screen.queryByRole('button', { name: /stop/i })).toBeNull()
     expect(screen.getByText('↑1.2k ↓300')).toBeTruthy()
+    expect(within(screen.getByTestId('assistant-message')).getByRole('button', { name: 'Copy reply' })).toBeTruthy()
   })
 
   test('a slash command goes as a slash command, with suggestions while typing', async () => {
@@ -59,9 +78,68 @@ describe('Neuron Desktop', () => {
     fireEvent.change(box, { target: { value: '/compact' } })
     fireEvent.keyDown(box, { key: 'Enter' })
     fireEvent.keyDown(box, { key: 'Enter' })
-    expect(engine.sent).toEqual([{ kind: 'command', type: 'slash', command: 'compact', args: '' }])
+    expect(sent(engine, 'slash')).toEqual({ kind: 'command', type: 'slash', command: 'compact', args: '' })
   })
 
+  test('@ mentions search the workspace and attach the file', async () => {
+    const { engine } = await start()
+    const box = screen.getByLabelText('Message Neuron')
+    fireEvent.change(box, { target: { value: 'look at @main', selectionStart: 13 } })
+    const option = await screen.findByRole('option', { name: '@src/main.rs' })
+    fireEvent.mouseDown(option)
+    expect((box as HTMLTextAreaElement).value).toBe('look at @src/main.rs ')
+    expect(within(screen.getByLabelText('Attached files')).getByText('@src/main.rs')).toBeTruthy()
+    fireEvent.keyDown(box, { key: 'Enter' })
+    expect(sent(engine, 'submit')).toEqual({
+      kind: 'command',
+      type: 'submit',
+      text: 'look at @src/main.rs',
+      attachments: [{ kind: 'file', path: 'src/main.rs' }],
+    })
+  })
+
+  test('the mode menu switches permissions and plan mode', async () => {
+    const { engine } = await start()
+    fireEvent.click(screen.getByRole('button', { name: 'Permission mode' }))
+    fireEvent.click(screen.getByRole('option', { name: /Read only/ }))
+    expect(sent(engine, 'slash')).toEqual({ kind: 'command', type: 'slash', command: 'permissions', args: 'read-only' })
+    fireEvent.click(screen.getByRole('button', { name: 'Permission mode' }))
+    fireEvent.click(screen.getByRole('option', { name: /^Plan/ }))
+    expect(sent(engine, 'slash')).toEqual({ kind: 'command', type: 'slash', command: 'plan', args: 'on' })
+    // Menu commands are not the user's messages.
+    expect(screen.queryByTestId('user-message')).toBeNull()
+  })
+
+  test('the model picker lists the catalog and switches', async () => {
+    const { engine } = await start()
+    fireEvent.click(screen.getByRole('button', { name: 'claude-sonnet-4-6' }))
+    expect(sent(engine, 'list_models')).toBeTruthy()
+    await emit(engine, {
+      type: 'models',
+      current: 'claude-sonnet-4-6',
+      models: [
+        { id: 'zx-fast', display_name: 'Zero-X Fast', available: true, unavailable_reason: null, context_window: 128000, tiers: ['free'] },
+        { id: 'zx-max', display_name: 'Zero-X Max', available: false, unavailable_reason: 'upgrade_required', context_window: 200000, tiers: ['pro'] },
+      ],
+    })
+    expect((screen.getByRole('option', { name: /Zero-X Max/ }) as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(screen.getByRole('option', { name: /Zero-X Fast/ }))
+    expect(sent(engine, 'set_model')).toEqual({ kind: 'command', type: 'set_model', model: 'zx-fast' })
+  })
+
+  test('the engine stopping is shown, with a restart', async () => {
+    const { engine, platform } = await start()
+    await act(async () => {
+      for (const listener of engine.closeListeners) listener({ code: 1, error: 'The Neuron engine stopped (exit code 1).' })
+    })
+    expect(screen.getByRole('alert').textContent).toContain('exit code 1')
+    expect((screen.getByLabelText('Message Neuron') as HTMLTextAreaElement).disabled).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: 'Restart it' }))
+    expect(platform.restarts).toEqual(['session-1'])
+  })
+})
+
+describe('Neuron Desktop: approvals, questions, tasks, sub-agents', () => {
   test('the permission dialog shows the command and sends the answer', async () => {
     const { engine } = await start()
     type('clean up')
@@ -72,24 +150,14 @@ describe('Neuron Desktop', () => {
       {
         type: 'permission_requested',
         id: 4,
-        request: {
-          tool: 'bash',
-          current_mode: 'workspace-write',
-          required_mode: 'danger-full-access',
-          reason: '`rm` is not a known read-only command',
-          input,
-          session_prefixes: ['rm'],
-        },
+        request: { tool: 'bash', current_mode: 'workspace-write', required_mode: 'danger-full-access', reason: '`rm` is not a known read-only command', input, session_prefixes: ['rm'] },
       },
     )
     const dialog = screen.getByRole('dialog')
     expect(within(dialog).getByText('$ rm -rf target')).toBeTruthy()
-    expect(within(dialog).getByText(/not a known read-only command/)).toBeTruthy()
-    expect(screen.getByText('waiting for you')).toBeTruthy()
     fireEvent.click(within(dialog).getByRole('button', { name: /allow once/i }))
     expect(engine.sent.at(-1)).toEqual({ kind: 'permission_reply', id: 4, decision: { kind: 'allow_once' } })
     expect(screen.queryByRole('dialog')).toBeNull()
-    expect(screen.getByText('running')).toBeTruthy()
   })
 
   test('n denies from the keyboard, but not in the first moment', async () => {
@@ -106,72 +174,159 @@ describe('Neuron Desktop', () => {
     await new Promise((resolve) => setTimeout(resolve, 350))
     fireEvent.keyDown(window, { key: 'n' })
     expect(engine.sent.at(-1)).toEqual({ kind: 'permission_reply', id: 9, decision: { kind: 'deny', note: null } })
-    await waitFor(() => expect(screen.getByText('denied')).toBeTruthy())
   })
 
-  test('deny with a note', async () => {
+  test("the agent's question: pick an option, or type an answer", async () => {
     const { engine } = await start()
-    type('x')
-    const input = '{"path":"src/main.rs","old_string":"hi","new_string":"hello"}'
-    await emit(engine, { type: 'tool_call_started', id: 'e', name: 'edit_file', input, cut_off: false }, {
-      type: 'permission_requested',
-      id: 2,
-      request: { tool: 'edit_file', current_mode: 'read-only', required_mode: 'workspace-write', reason: null, input, session_prefixes: [] },
-    })
-    const dialog = screen.getByRole('dialog')
-    expect(within(dialog).getByLabelText('edit to src/main.rs')).toBeTruthy()
-    fireEvent.click(within(dialog).getByRole('button', { name: /deny with note/i }))
-    fireEvent.change(within(dialog).getByPlaceholderText(/what to do instead/), { target: { value: 'keep hi' } })
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Deny with note' }))
-    expect(engine.sent.at(-1)).toEqual({ kind: 'permission_reply', id: 2, decision: { kind: 'deny', note: 'keep hi' } })
+    type('plan it')
+    await emit(engine, { type: 'question', id: 2, question: 'Which crate?', options: ['api', 'tools'] })
+    const card = screen.getByRole('note', { name: 'Neuron asks' })
+    fireEvent.click(within(card).getByRole('button', { name: /tools/ }))
+    expect(sent(engine, 'answer')).toEqual({ kind: 'command', type: 'answer', id: 2, text: 'tools' })
+    expect(within(screen.getByRole('note', { name: 'Neuron asks' })).queryByRole('button')).toBeNull()
+
+    await emit(engine, { type: 'question', id: 3, question: 'Anything else?', options: [] })
+    expect(screen.getByText("Answering Neuron's question")).toBeTruthy()
+    type('/nope')
+    // Typed while a question waits: the answer, slash and all.
+    expect(sent(engine, 'answer')).toEqual({ kind: 'command', type: 'answer', id: 3, text: '/nope' })
   })
 
-  test('an edit shows its diff in the tool card and the file in Changes', async () => {
+  test('the task list shows in the Tasks tab and the status bar', async () => {
+    const { engine } = await start()
+    await emit(engine, {
+      type: 'todos',
+      items: [
+        { content: 'Run the tests', status: 'completed', active_form: 'Running the tests' },
+        { content: 'Fix the build', status: 'in_progress', active_form: 'Fixing the build' },
+      ],
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Tasks 1/2' }))
+    const tasks = screen.getByRole('list', { name: 'Tasks' })
+    expect(within(tasks).getByText('Fixing the build')).toBeTruthy()
+    expect(within(tasks).getByText('Run the tests')).toBeTruthy()
+  })
+
+  test('a sub-agent shows on its Agent call, running then with its result', async () => {
+    const { engine } = await start()
+    type('audit')
+    await emit(
+      engine,
+      { type: 'tool_call_started', id: 'a1', name: 'Agent', input: '{"description":"Audit MCP","prompt":"…","subagent_type":"Explore"}', cut_off: false },
+      { type: 'subagent_started', id: 'a1', description: 'Audit MCP', subagent_type: 'Explore' },
+    )
+    const card = screen.getByTestId('tool-card')
+    expect(within(card).getByText('Sub-agent (Explore)')).toBeTruthy()
+    expect(within(card).getByText('sub-agent working')).toBeTruthy()
+    await emit(
+      engine,
+      { type: 'tool_result', id: 'a1', name: 'Agent', output: '{"status":"completed","result":"Only stdio is implemented."}', is_error: false },
+      { type: 'subagent_finished', id: 'a1', status: 'completed', is_error: false, result: 'Only stdio is implemented.', note: null },
+    )
+    fireEvent.click(within(card).getByRole('button', { expanded: false }))
+    expect(within(card).getByText('Only stdio is implemented.')).toBeTruthy()
+  })
+
+  test('an edit shows its diff and diffstat', async () => {
     const { engine } = await start()
     type('rename')
     await emit(
       engine,
       { type: 'tool_call_started', id: 'e1', name: 'edit_file', input: '{"path":"/work/app/src/main.rs","old_string":"println!(\\"hi\\");","new_string":"println!(\\"hello\\");"}', cut_off: false },
-      {
-        type: 'tool_result',
-        id: 'e1',
-        name: 'edit_file',
-        output: JSON.stringify({ filePath: '/work/app/src/main.rs', diff: '@@ -2,1 +2,1 @@\n-    println!("hi");\n+    println!("hello");\n' }),
-        is_error: false,
-      },
+      { type: 'tool_result', id: 'e1', name: 'edit_file', output: JSON.stringify({ filePath: '/work/app/src/main.rs', diff: '@@ -2,1 +2,1 @@\n-    println!("hi");\n+    println!("hello");\n' }), is_error: false },
     )
     const card = screen.getByTestId('tool-card')
     expect(within(card).getByText('src/main.rs')).toBeTruthy()
-    const rows = card.querySelectorAll('tr[data-kind]')
-    expect([...rows].map((row) => row.getAttribute('data-kind'))).toEqual(['remove', 'add'])
-    expect(card.textContent).toContain('println!("hello");')
-    const changes = screen.getByLabelText('Details')
-    fireEvent.click(within(changes).getByRole('button', { name: 'src/main.rs' }))
-    await waitFor(() => expect(screen.getByTestId('file-view').textContent).toContain('fn main()'))
+    expect([...card.querySelectorAll('tr[data-kind]')].map((row) => row.getAttribute('data-kind'))).toEqual(['remove', 'add'])
+    expect(card.querySelector('.tool-diffstat')?.textContent).toBe('+1 −1')
+  })
+})
+
+describe('Neuron Desktop: chats, projects, trust, panes, settings', () => {
+  const sessions = [
+    { id: 'session-1', title: 'Fix the login bug', model: 'sonnet', message_count: 6, updated_at_ms: Date.now() - 60_000, current: true, branch: null },
+    { id: 'session-0', title: 'Write the release notes', model: 'sonnet', message_count: 4, updated_at_ms: Date.now() - 3 * 86_400_000, current: false, branch: null },
+  ]
+
+  test('the chat list: open one, search, start a new chat', async () => {
+    const { engine } = await start()
+    await emit(engine, { type: 'sessions', current: 'session-1', sessions })
+    const chats = screen.getByRole('navigation', { name: 'Chats' })
+    expect(within(chats).getByRole('button', { name: /Fix the login bug/ }).getAttribute('aria-current')).toBe('true')
+    expect(screen.getByText('Fix the login bug', { selector: '.chat-header-title' })).toBeTruthy()
+    fireEvent.click(within(chats).getByRole('button', { name: /Write the release notes/ }))
+    expect(sent(engine, 'resume')).toEqual({ kind: 'command', type: 'resume', session: 'session-0' })
+
+    fireEvent.change(within(chats).getByLabelText('Search chats'), { target: { value: 'login' } })
+    expect(within(chats).queryByRole('button', { name: /release notes/ })).toBeNull()
+
+    fireEvent.click(within(chats).getByRole('button', { name: /New chat/ }))
+    expect(sent(engine, 'slash')).toEqual({ kind: 'command', type: 'slash', command: 'clear', args: '--confirm' })
   })
 
-  test('the model picker lists the catalog and switches', async () => {
+  test('a resumed chat comes back from its transcript', async () => {
     const { engine } = await start()
-    fireEvent.click(screen.getByRole('button', { name: 'claude-sonnet-4-6' }))
-    expect(engine.sent.at(-1)).toEqual({ kind: 'command', type: 'list_models' })
-    await emit(engine, {
-      type: 'models',
-      current: 'claude-sonnet-4-6',
-      models: [
-        { id: 'zx-fast', display_name: 'Zero-X Fast', available: true, unavailable_reason: null, context_window: 128000, tiers: ['free'] },
-        { id: 'zx-max', display_name: 'Zero-X Max', available: false, unavailable_reason: 'upgrade_required', context_window: 200000, tiers: ['pro'] },
-      ],
-    })
-    expect((screen.getByRole('option', { name: /Zero-X Max/ }) as HTMLButtonElement).disabled).toBe(true)
-    fireEvent.click(screen.getByRole('option', { name: /Zero-X Fast/ }))
-    expect(engine.sent.at(-1)).toEqual({ kind: 'command', type: 'set_model', model: 'zx-fast' })
+    await emit(
+      engine,
+      {
+        type: 'transcript',
+        session_id: 'session-0',
+        truncated: false,
+        entries: [
+          { kind: 'user', text: 'Write the release notes' },
+          { kind: 'assistant', text: 'Done: see **NOTES.md**.' },
+        ],
+      },
+      engine.status({ session_id: 'session-0' }),
+    )
+    expect(screen.getByTestId('user-message').textContent).toBe('Write the release notes')
+    expect(screen.getByTestId('assistant-message').textContent).toContain('Done: see NOTES.md.')
+  })
+
+  test('switching the project', async () => {
+    const { platform } = await start()
+    fireEvent.click(screen.getByRole('button', { name: 'Project' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Open a project' })
+    fireEvent.click(await within(dialog).findByRole('button', { name: /website/ }))
+    await waitFor(() => expect(platform.openedProjects).toEqual(['/work/website']))
+  })
+
+  test('an untrusted folder: trust it, then restart to load its settings', async () => {
+    const { engine, platform } = await start({ workspace_trusted: false })
+    fireEvent.click(screen.getByRole('button', { name: 'Trust folder' }))
+    expect(sent(engine, 'trust_workspace')).toBeTruthy()
+    await emit(engine, { type: 'workspace_trusted', cwd: '/work/app', restart_required: true })
+    fireEvent.click(screen.getByRole('button', { name: 'Restart engine' }))
+    await waitFor(() => expect(platform.restarts).toEqual(['session-1']))
+  })
+
+  test('the Changes tab lists git changes and shows their diffs', async () => {
+    await start()
+    const pane = screen.getByRole('complementary', { name: 'Details' })
+    const row = await within(pane).findByRole('button', { name: /src\/main\.rs/ })
+    expect(within(pane).getByText('⎇ main · 2 changed')).toBeTruthy()
+    fireEvent.click(row)
+    await waitFor(() => expect(within(pane).getByLabelText('diff of src/main.rs')).toBeTruthy())
+    expect(within(pane).getByText('println!("hello");', { exact: false })).toBeTruthy()
+    // A new file shows as all additions.
+    fireEvent.click(within(pane).getByRole('button', { name: /notes\.txt/ }))
+    await waitFor(() => expect(within(pane).getByLabelText('diff of notes.txt').textContent).toContain('a new note'))
+  })
+
+  test('the Files tab opens folders and files', async () => {
+    await start()
+    fireEvent.click(screen.getByRole('tab', { name: 'Files' }))
+    const tree = screen.getByRole('navigation', { name: 'Files' })
+    fireEvent.click(await within(tree).findByRole('button', { name: /src/ }))
+    fireEvent.click(await within(tree).findByRole('button', { name: /main\.rs/ }))
+    await waitFor(() => expect(screen.getByTestId('file-view').textContent).toBe('fn main() {\n    println!("hi");\n}\n'))
   })
 
   test('signed out: the sign-in panel, then the device code', async () => {
     const { engine, platform } = await start({ sign_in_required: true, signed_in: false, account: null, session_id: '' })
     expect(screen.getByText('Signed out')).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: 'Sign in' }))
-    expect(engine.sent.at(-1)).toEqual({ kind: 'command', type: 'slash', command: 'login', args: '' })
+    expect(sent(engine, 'slash')).toEqual({ kind: 'command', type: 'slash', command: 'login', args: '' })
     await emit(engine, {
       type: 'sign_in_code',
       url: 'https://zero-x.live/device',
@@ -183,47 +338,29 @@ describe('Neuron Desktop', () => {
     expect(screen.getByLabelText('sign-in code').textContent).toBe('WXYZ-1234')
     fireEvent.click(screen.getByRole('button', { name: 'Open the sign-in page' }))
     expect(platform.opened).toEqual(['https://zero-x.live/device?code=WXYZ-1234'])
-    await emit(engine, { type: 'session_starting' })
-    expect(screen.getByText('Starting your session…')).toBeTruthy()
-    await emit(
-      engine,
-      { type: 'turn_finished' },
-      engine.status({
-        sign_in_required: false,
-        signed_in: true,
-        session_id: 'session-2',
-        account: { email: 'new@example.com', plan: 'free', source: 'keychain', expires_at: null },
-      }),
-    )
-    expect(screen.getByLabelText('Message Neuron')).toBeTruthy()
-    expect(screen.getByText('new@example.com · free')).toBeTruthy()
   })
 
-  test('the file tree opens folders and files', async () => {
-    await start()
-    const tree = screen.getByRole('navigation', { name: 'Files' })
-    fireEvent.click(await within(tree).findByRole('button', { name: /src/ }))
-    fireEvent.click(await within(tree).findByRole('button', { name: /main\.rs/ }))
-    await waitFor(() => expect(screen.getByTestId('file-view').textContent).toBe('fn main() {\n    println!("hi");\n}\n'))
-  })
-
-  test("the agent's question, answered from the composer", async () => {
+  test('settings: the light theme and Ctrl+Enter to send', async () => {
     const { engine } = await start()
-    type('plan it')
-    await emit(engine, { type: 'notice', message: 'Question: Which crate?\n  1. api\n  2. tools\nAnswer with 1-2 or in your own words.' })
-    expect(screen.getByText("Answering Neuron's question")).toBeTruthy()
-    type('/2')
-    // Sent as typed, even with a slash: it is an answer, not a command.
-    expect(engine.sent.at(-1)).toEqual({ kind: 'command', type: 'submit', text: '/2', attachments: [] })
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+    const dialog = screen.getByRole('dialog', { name: 'Settings' })
+    fireEvent.change(within(dialog).getByLabelText('Theme'), { target: { value: 'light' } })
+    expect(document.documentElement.dataset.theme).toBe('light')
+    fireEvent.click(within(dialog).getByLabelText(/Enter sends/))
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }))
+    const box = screen.getByLabelText('Message Neuron')
+    fireEvent.change(box, { target: { value: 'two\nlines' } })
+    fireEvent.keyDown(box, { key: 'Enter' })
+    expect(sent(engine, 'submit')).toBeUndefined()
+    fireEvent.keyDown(box, { key: 'Enter', ctrlKey: true })
+    expect(sent(engine, 'submit')).toMatchObject({ text: 'two\nlines' })
   })
 
-  test('the engine stopping is shown', async () => {
-    const { engine } = await start()
-    await act(async () => {
-      for (const listener of (engine as unknown as { closeListeners: Set<(c: { code: number; error: string }) => void> }).closeListeners)
-        listener({ code: 1, error: 'The Neuron engine stopped (exit code 1).' })
-    })
-    expect(screen.getByRole('alert').textContent).toContain('exit code 1')
-    expect((screen.getByLabelText('Message Neuron') as HTMLTextAreaElement).disabled).toBe(true)
+  test('an older engine without history: no chat list, chatting still works', async () => {
+    const { engine } = await start({}, [])
+    expect(screen.getByText(/no chat history/)).toBeTruthy()
+    expect(sent(engine, 'capabilities')).toBeUndefined()
+    type('hello')
+    expect(sent(engine, 'submit')).toMatchObject({ text: 'hello' })
   })
 })

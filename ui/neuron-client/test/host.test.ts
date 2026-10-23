@@ -359,4 +359,29 @@ describe('NeuronHost', () => {
     const failure = await transport.rpc('git.status').then(() => 'ran', (error: Error) => error.message)
     expect(failure).toContain('trust the workspace')
   })
+
+  test('a folder no repository tracks is no git repository, even inside one', async () => {
+    await startHost()
+    // On machines where the temp folder sits in a repository (a home directory kept in
+    // git), the workspace is an untracked folder of it; elsewhere it is in none.
+    const { transport } = await attach('desktop')
+    expect(await transport.rpc('git.status')).toBeNull()
+    // A repository inside the workspace's parent: the workspace is a tracked subfolder.
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'neuron-host-parent-'))
+    const nested = path.join(parent, 'pkg')
+    fs.mkdirSync(nested)
+    fs.writeFileSync(path.join(nested, 'a.txt'), 'a\n')
+    fs.writeFileSync(path.join(parent, 'outside.txt'), 'x\n')
+    const git = (...args: string[]) =>
+      Bun.spawnSync(['git', '-c', 'user.email=t@example.com', '-c', 'user.name=t', ...args], { cwd: parent, stdout: 'pipe', stderr: 'pipe' })
+    git('init', '-q', '-b', 'main')
+    git('add', '.')
+    git('commit', '-q', '-m', 'init')
+    fs.writeFileSync(path.join(nested, 'a.txt'), 'changed\n')
+    fs.writeFileSync(path.join(parent, 'outside.txt'), 'changed too\n')
+    const { gitStatus } = await import('../src/node/workspace')
+    // Only the workspace's own changes, with paths relative to it.
+    expect(await gitStatus(nested, true)).toEqual({ branch: 'main', changes: [{ path: 'a.txt', index: ' ', worktree: 'M' }] })
+    fs.rmSync(parent, { recursive: true, force: true })
+  })
 })

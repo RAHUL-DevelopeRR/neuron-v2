@@ -1,4 +1,27 @@
-import { Fragment, type ReactNode } from 'react'
+import { Fragment, useState, type ReactNode } from 'react'
+
+/** Copies `text`, and says so for a moment. */
+export function CopyButton({ text, label = 'Copy' }: { text: string; label?: string }) {
+  const [copied, setCopied] = useState(false)
+  return (
+    <button
+      className="copy-button"
+      aria-label={label}
+      title={label}
+      onClick={() => {
+        void navigator.clipboard?.writeText(text).then(
+          () => {
+            setCopied(true)
+            setTimeout(() => setCopied(false), 1200)
+          },
+          () => {},
+        )
+      }}
+    >
+      {copied ? 'Copied' : 'Copy'}
+    </button>
+  )
+}
 
 /**
  * The Markdown an agent writes: fenced code, headings, lists, quotes,
@@ -23,9 +46,15 @@ function blocks(text: string, onLink?: (url: string) => void): ReactNode[] {
       while (index < lines.length && !lines[index].trimStart().startsWith(fence[1])) body.push(lines[index++])
       index++
       out.push(
-        <pre key={key++} className="code-block" data-lang={fence[2] || undefined}>
-          <code>{body.join('\n')}</code>
-        </pre>,
+        <div key={key++} className="code-wrap">
+          <div className="code-head">
+            <span>{fence[2] || 'code'}</span>
+            <CopyButton text={body.join('\n')} label="Copy code" />
+          </div>
+          <pre className="code-block" data-lang={fence[2] || undefined}>
+            <code>{body.join('\n')}</code>
+          </pre>
+        </div>,
       )
       continue
     }

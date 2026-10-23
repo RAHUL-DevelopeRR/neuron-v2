@@ -7,19 +7,24 @@ import {
   type UiEvent,
 } from '@neuron/client'
 
-import type { DirListing, FileContent, Platform, TerminalSession } from '../src/platform'
+import type { DirListing, FileContent, GitStatusView, Platform, Project, TerminalSession } from '../src/platform'
+
+export const ALL_FEATURES = ['capabilities', 'sessions', 'trust_workspace', 'todos', 'subagents']
 
 /** An engine in memory: tests emit its events and read what the UI sent. */
 export class FakeEngine implements EngineTransport {
   readonly echoesActions = false
   sent: ClientMessage[] = []
   private listeners = new Set<(action: SessionAction) => void>()
-  private closeListeners = new Set<(close: TransportClose) => void>()
+  closeListeners = new Set<(close: TransportClose) => void>()
 
-  constructor(private readonly statusOverrides: Record<string, unknown> = {}) {}
+  constructor(
+    private readonly statusOverrides: Record<string, unknown> = {},
+    private readonly features: string[] = ALL_FEATURES,
+  ) {}
 
   async start() {
-    this.emit({ type: 'ready', protocol: 1, version: '6.3.0' })
+    this.emit({ type: 'ready', protocol: 1, version: '6.3.0', features: this.features })
     this.emit(this.status())
   }
 
@@ -45,6 +50,10 @@ export class FakeEngine implements EngineTransport {
   emit(event: UiEvent) {
     for (const listener of [...this.listeners]) listener(event)
   }
+  /** What the UI sent, as commands (without permission replies). */
+  commands() {
+    return this.sent.filter((message) => message.kind === 'command')
+  }
   send(message: ClientMessage) {
     this.sent.push(message)
   }
@@ -61,17 +70,35 @@ export class FakeEngine implements EngineTransport {
 
 export const FILES: Record<string, string> = {
   'src/main.rs': 'fn main() {\n    println!("hi");\n}\n',
+  'src/lib.rs': 'pub fn add() {}\n',
   'README.md': '# app\n',
 }
 
-/** A platform over a {@link FakeEngine} and a small in-memory workspace. */
-export function fakePlatform(engine: FakeEngine): Platform & { opened: string[] } {
+export interface FakePlatform extends Platform {
+  opened: string[]
+  restarts: Array<string | null>
+  openedProjects: string[]
+  git: GitStatusView | null
+}
+
+/** A platform over a {@link FakeEngine} and a small in-memory workspace with git. */
+export function fakePlatform(engine: FakeEngine): FakePlatform {
   let connecting: Promise<SessionController> | null = null
-  const opened: string[] = []
-  return {
+  const project: Project = { name: 'app', path: '/work/app' }
+  const platform: FakePlatform = {
     kind: 'host',
     label: 'test',
-    opened,
+    can: { openProject: true, restart: true, terminal: false, git: true },
+    opened: [],
+    restarts: [],
+    openedProjects: [],
+    git: {
+      branch: 'main',
+      changes: [
+        { path: 'src/main.rs', index: ' ', worktree: 'M' },
+        { path: 'notes.txt', index: '?', worktree: '?' },
+      ],
+    },
     connect() {
       connecting ??= (async () => {
         const controller = new SessionController(engine)
@@ -79,6 +106,14 @@ export function fakePlatform(engine: FakeEngine): Platform & { opened: string[] 
         return controller
       })()
       return connecting
+    },
+    project: () => project,
+    recentProjects: async () => [project, { name: 'website', path: '/work/website' }],
+    async openProject(path) {
+      platform.openedProjects.push(path)
+    },
+    async restart(resume) {
+      platform.restarts.push(resume)
     },
     async list(path: string): Promise<DirListing> {
       const prefix = path === '.' ? '' : `${path}/`
@@ -93,14 +128,20 @@ export function fakePlatform(engine: FakeEngine): Platform & { opened: string[] 
       return { path, entries, truncated: false }
     },
     async read(path: string): Promise<FileContent> {
-      if (!(path in FILES)) throw new Error(`No such file or folder: ${path}`)
-      return { path, content: FILES[path], truncated: false, binary: false, size: FILES[path].length }
+      const content = path === 'notes.txt' ? 'a new note\n' : FILES[path]
+      if (content === undefined) throw new Error(`No such file or folder: ${path}`)
+      return { path, content, truncated: false, binary: false, size: content.length }
     },
+    searchFiles: async (query) => Object.keys(FILES).filter((file) => file.includes(query)),
+    gitStatus: async () => platform.git,
+    gitDiff: async (path) =>
+      path === 'src/main.rs' ? '@@ -1,3 +1,3 @@\n fn main() {\n-    println!("hi");\n+    println!("hello");\n }\n' : '',
     openTerminal(): Promise<TerminalSession> {
       return Promise.reject(new Error('no terminal in tests'))
     },
     openExternal(url: string) {
-      opened.push(url)
+      platform.opened.push(url)
     },
   }
+  return platform
 }

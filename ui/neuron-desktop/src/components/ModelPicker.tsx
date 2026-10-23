@@ -48,7 +48,7 @@ export function ModelPicker({
         {shown || 'model'}
       </button>
       {open && (
-        <div className="menu" role="listbox" aria-label="Models">
+        <div className="menu up" role="listbox" aria-label="Models">
           {models.map((model) => {
             const unusable = !model.available || model.status === 'blurred'
             const why =

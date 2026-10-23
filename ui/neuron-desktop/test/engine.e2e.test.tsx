@@ -87,18 +87,47 @@ describe.skipIf(!haveEngineBinaries)('Neuron Desktop on the real engine', () => 
   )
 
   test(
-    'a file write: the diff in its card, the file in Changes and in the tree',
+    'a file write: the diff in its card and the side panel, the file in the tree',
     async () => {
       await startApp()
       send('PARITY_SCENARIO:write_file_allowed')
       await until('the reply', () => text('[data-testid="assistant-message"]').includes('write_file succeeded'))
       expect(text('[data-testid="tool-card"] .tool-target')).toBe('generated/output.txt')
       expect(text('[data-testid="tool-card"] tr[data-kind="add"]')).toContain('created by mock service')
-      fireEvent.click(await element('.inspector .changes button'))
-      await until('the file', () => text('[data-testid="file-view"]') === 'created by mock service\n')
+      // The card's diff in the side panel.
+      fireEvent.click(await element('[data-testid="tool-card"] .link-button'))
+      await until('the diff in the panel', () => text('.side-pane tr[data-kind="add"]').includes('created by mock service'))
+      // The new file in the Files tab.
+      fireEvent.click([...document.querySelectorAll<HTMLElement>('.tabs button')].find((tab) => tab.textContent === 'Files')!)
       await until('the folder in the tree', () =>
         [...document.querySelectorAll('.file-tree .tree-row')].some((row) => row.textContent?.includes('generated')),
       )
+      fireEvent.click([...document.querySelectorAll<HTMLElement>('.file-tree .tree-row')].find((row) => row.textContent?.includes('generated'))!)
+      await until('the file in the tree', () =>
+        [...document.querySelectorAll('.file-tree .tree-row')].some((row) => row.textContent?.includes('output.txt')),
+      )
+      fireEvent.click([...document.querySelectorAll<HTMLElement>('.file-tree .tree-row')].find((row) => row.textContent?.includes('output.txt'))!)
+      await until('the file', () => text('[data-testid="file-view"]') === 'created by mock service\n')
+    },
+    90_000,
+  )
+
+  test(
+    'chat history: a new chat, the list, and back to the first chat',
+    async () => {
+      await startApp()
+      send('PARITY_SCENARIO:write_file_allowed')
+      await until('the reply', () => text('[data-testid="assistant-message"]').includes('write_file succeeded'))
+      await until('the chat in the list', () => text('.chat-list').includes('PARITY_SCENARIO:write_file_allowed'))
+      fireEvent.click(await element('.new-chat'))
+      await until('an empty chat', () => document.querySelector('[data-testid="assistant-message"]') === null)
+      await until('the old chat in the list, not current', () =>
+        [...document.querySelectorAll('.chat-row:not(.current)')].some((row) => row.textContent?.includes('write_file_allowed')),
+      )
+      fireEvent.click([...document.querySelectorAll<HTMLElement>('.chat-row:not(.current)')].find((row) => row.textContent?.includes('write_file_allowed'))!)
+      await until('the old conversation', () => text('[data-testid="assistant-message"]').includes('write_file succeeded'))
+      expect(text('[data-testid="tool-card"] .tool-state')).toBe('done')
+      expect(text('.chat-header-title')).toBe('PARITY_SCENARIO:write_file_allowed')
     },
     90_000,
   )

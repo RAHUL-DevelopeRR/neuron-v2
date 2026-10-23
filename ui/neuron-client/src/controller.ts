@@ -139,6 +139,14 @@ export class SessionController {
     this.transport.send(commandMessage({ type: 'resume', session }))
   }
 
+  /**
+   * A slash command from a menu rather than the message box: not shown as the
+   * user's message (the engine still reports it with a notice).
+   */
+  command(name: string, args = ''): void {
+    this.transport.send(commandMessage({ type: 'slash', command: name.replace(/^\//, ''), args }))
+  }
+
   /** A fresh chat in the same engine. */
   newChat(): void {
     this.slash('clear', '--confirm')

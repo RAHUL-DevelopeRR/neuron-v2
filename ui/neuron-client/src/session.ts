@@ -130,6 +130,8 @@ export type LocalAction =
   | { type: 'local/permission_resolved'; id: number }
   /** The structured question with this id was answered. */
   | { type: 'local/answered'; id: number; text: string }
+  /** Another project: nothing of the old session carries over. */
+  | { type: 'local/reset' }
 
 export type SessionAction = UiEvent | LocalAction
 
@@ -176,6 +178,8 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
     // -------------------------------------------------------------- local
     case 'local/connecting':
       return { ...state, connection: 'connecting', connectionError: null }
+    case 'local/reset':
+      return { ...initialSession(), nextKey: state.nextKey }
     case 'local/disconnected': {
       const items = closeStreams(state.items).map((item) =>
         item.kind === 'tool' && (item.state === 'running' || item.state === 'awaiting_permission')

@@ -1,7 +1,7 @@
 import { hostPlatform } from './host'
 import type { Platform } from './types'
 
-export type { DirEntry, DirListing, FileContent, Platform, TerminalSession } from './types'
+export type { DirEntry, DirListing, FileContent, GitChange, GitStatusView, Platform, Project, TerminalSession } from './types'
 
 /** Inside Tauri, its bridge; in a browser, the host named by the page's settings. */
 export async function detectPlatform(): Promise<Platform> {
