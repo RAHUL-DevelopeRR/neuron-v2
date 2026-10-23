@@ -2580,7 +2580,7 @@ mod tests {
         assert_eq!(skills[0].description.as_deref(), Some("Plans work"));
         assert!(!skills[1].active);
         assert_eq!(skills[1].description, None);
-        assert!(definitions(None, "skills").is_empty());
+        assert_eq!(definitions(None, "skills"), Vec::new());
     }
 
     #[test]
