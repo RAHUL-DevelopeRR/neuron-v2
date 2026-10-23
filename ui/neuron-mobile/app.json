@@ -2,13 +2,35 @@
   "expo": {
     "name": "Neuron",
     "slug": "neuron-mobile",
-    "version": "0.1.0",
+    "version": "0.2.0",
+    "scheme": "neuron",
     "orientation": "portrait",
-    "userInterfaceStyle": "dark",
-    "backgroundColor": "#0c0c0c",
+    "userInterfaceStyle": "automatic",
+    "backgroundColor": "#1a1a2e",
     "icon": "./assets/icon.png",
-    "ios": { "bundleIdentifier": "live.zero-x.neuron.mobile", "supportsTablet": true },
-    "android": { "package": "live.zero_x.neuron.mobile", "adaptiveIcon": { "foregroundImage": "./assets/icon.png", "backgroundColor": "#1a1a2e" } },
-    "web": { "bundler": "metro", "favicon": "./assets/icon.png" }
+    "ios": {
+      "bundleIdentifier": "live.zero-x.neuron.mobile",
+      "supportsTablet": true
+    },
+    "android": {
+      "package": "live.zero_x.neuron.mobile",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/icon.png",
+        "backgroundColor": "#1a1a2e"
+      }
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "single",
+      "favicon": "./assets/icon.png"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-status-bar",
+      "expo-secure-store",
+      "expo-web-browser",
+      ["expo-camera", { "cameraPermission": "Neuron uses the camera to scan the pairing code your computer shows.", "recordAudioAndroid": false }],
+      ["expo-notifications", { "color": "#4169c3" }]
+    ]
   }
 }

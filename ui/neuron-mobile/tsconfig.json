@@ -9,5 +9,5 @@
       "@neuron/client": ["../neuron-client/src/index.ts"]
     }
   },
-  "include": ["App.tsx", "index.ts", "src", "test"]
+  "include": ["app", "src", "test", "dev"]
 }

@@ -1,15 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import {
-  FlatList,
-  KeyboardAvoidingView,
-  Platform,
-  Pressable,
-  ScrollView,
-  StyleSheet,
-  Text,
-  TextInput,
-  View,
-} from 'react-native'
+import { FlatList, KeyboardAvoidingView, Platform, Pressable, ScrollView, Text, TextInput, View } from 'react-native'
 
 import {
   FEATURE_SESSIONS,
@@ -17,30 +7,89 @@ import {
   hasFeature,
   needsSignIn,
   openQuestionItem,
-  type PendingPermission,
+  type SessionController,
   type SessionSummary,
   type TodoItem,
   type TranscriptItem,
 } from '@neuron/client'
 
-import type { Connection } from '../connection'
-import { colors, mono } from '../theme'
+import { PermissionSheet } from '../components/PermissionSheet'
+import { TranscriptRow } from '../components/Transcript'
+import { Banner, useStyles } from '../components/ui'
+import { useTheme, type Palette } from '../theme'
 import { useSession } from '../useSession'
 
-const basename = (path: string) => path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || path
+const makeStyles = (colors: Palette) => ({
+  screen: { flex: 1, backgroundColor: colors.bg },
+  status: { flexDirection: 'row' as const, alignItems: 'center' as const, gap: 8, paddingHorizontal: 12, paddingVertical: 8, backgroundColor: colors.panel, borderBottomWidth: 1, borderBottomColor: colors.border },
+  dim: { color: colors.textDim, fontSize: 13 },
+  chip: { backgroundColor: colors.chip, color: colors.chipText, fontWeight: '600' as const, fontSize: 12, paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6, maxWidth: 140, overflow: 'hidden' as const },
+  link: { color: colors.link, paddingHorizontal: 6, paddingVertical: 4 },
+  transcript: { flex: 1 },
+  empty: { color: colors.textDim, textAlign: 'center' as const, marginTop: 40, paddingHorizontal: 24 },
+  working: { color: colors.accent, marginTop: 8 },
+  sheet: { backgroundColor: colors.panel, borderBottomWidth: 1, borderBottomColor: colors.border, padding: 12, gap: 6 },
+  sheetButton: { borderWidth: 1, borderColor: colors.accent, backgroundColor: colors.accent, borderRadius: 8, paddingHorizontal: 12, paddingVertical: 10, alignSelf: 'flex-start' as const },
+  sheetButtonText: { color: '#ffffff', fontWeight: '600' as const },
+  chatRow: { paddingVertical: 8, paddingHorizontal: 6, borderRadius: 6 },
+  chatRowCurrent: { backgroundColor: colors.sunken },
+  text: { color: colors.text, fontSize: 15 },
+  tasks: { backgroundColor: colors.panel, borderTopWidth: 1, borderTopColor: colors.border, paddingHorizontal: 12, paddingVertical: 8 },
+  tasksTitle: { color: colors.warning, fontWeight: '600' as const },
+  todoDone: { color: colors.textDim, textDecorationLine: 'line-through' as const },
+  composer: { borderTopWidth: 1, borderTopColor: colors.border, padding: 10, backgroundColor: colors.bg },
+  questionHint: { color: colors.warning, fontSize: 12, marginBottom: 4 },
+  composerRow: { flexDirection: 'row' as const, gap: 8, alignItems: 'flex-end' as const },
+  input: {
+    flex: 1,
+    minHeight: 44,
+    maxHeight: 140,
+    backgroundColor: colors.sunken,
+    color: colors.text,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: colors.border,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 15,
+  },
+  send: { backgroundColor: colors.accent, borderRadius: 10, paddingHorizontal: 16, paddingVertical: 12 },
+  sendText: { color: '#ffffff', fontWeight: '600' as const },
+  stop: { backgroundColor: 'transparent', borderWidth: 1, borderColor: colors.warning },
+  stopText: { color: colors.warning, fontWeight: '600' as const },
+  disabled: { opacity: 0.5 },
+})
 
-const TOOL_STATE: Record<string, string> = {
-  running: 'running',
-  awaiting_permission: 'needs you',
-  done: 'done',
-  error: 'failed',
-  denied: 'denied',
-  cut_off: 'cut off',
+export interface SessionBanner {
+  text: string
+  tone?: 'warning' | 'error'
+  action?: { label: string; onPress: () => void }
 }
 
-/** Watch a session running on the computer, and steer it: prompts, approvals, interrupts. */
-export function SessionScreen({ connection, onLeave }: { connection: Connection; onLeave: () => void }) {
-  const { controller, transport } = connection
+/**
+ * A session running on a computer, from the phone: the transcript (Markdown,
+ * reasoning, tool calls with their diffs and output), approvals, the agent's
+ * questions and tasks, and the composer.
+ */
+export function SessionView({
+  controller,
+  hostName,
+  clients,
+  banner,
+  onLeave,
+  onSeen,
+}: {
+  controller: SessionController
+  hostName: string | null
+  clients: number
+  /** The connection's state, when it is not simply attached. */
+  banner?: SessionBanner | null
+  onLeave?: () => void
+  /** Called as the transcript updates: the session was seen up to now. */
+  onSeen?: () => void
+}) {
+  const styles = useStyles(makeStyles)
+  const { colors } = useTheme()
   const state = useSession(controller)
   const [text, setText] = useState('')
   const [chatsOpen, setChatsOpen] = useState(false)
@@ -56,50 +105,51 @@ export function SessionScreen({ connection, onLeave }: { connection: Connection;
     if (ready && history && !state.busy) controller.listSessions()
   }, [controller, ready, history, state.busy, status?.session_id])
 
+  // Every action counts as seen while the session is open (the last ones often change no item).
+  useEffect(() => {
+    onSeen?.()
+  }, [onSeen, state])
+
   const send = () => {
     if (!text.trim() || !ready) return
     controller.send(text)
     setText('')
   }
 
+  const permissionTool = permission ? state.items.find((item) => item.kind === 'tool' && item.key === permission.toolKey) : undefined
+
   return (
-    <KeyboardAvoidingView style={styles.screen} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-      <View style={styles.header}>
-        <View style={{ flex: 1 }}>
-          <Text style={styles.workspace} numberOfLines={1}>
-            {status ? basename(status.cwd) : transport.host?.name ?? 'Neuron'}
-            {status?.git?.branch ? <Text style={styles.dim}>  ⎇ {status.git.branch}</Text> : null}
-          </Text>
-          <Text style={styles.dim} numberOfLines={1}>
-            <Text style={{ color: ready ? colors.success : colors.danger }}>● </Text>
-            {ready ? `on ${transport.host?.name ?? 'your computer'}` : state.connection}
-            {transport.clients > 1 ? ` · ${transport.clients} watching` : ''}
-            {state.usage ? ` · ↑${formatTokens(state.usage.cumulative.input)} ↓${formatTokens(state.usage.cumulative.output)}` : ''}
-          </Text>
-        </View>
+    <KeyboardAvoidingView style={styles.screen} behavior={Platform.OS === 'ios' ? 'padding' : undefined} keyboardVerticalOffset={Platform.OS === 'ios' ? 90 : 0}>
+      <View style={styles.status}>
+        <Text style={[styles.dim, { flex: 1 }]} numberOfLines={1}>
+          <Text style={{ color: ready ? colors.success : colors.danger }}>● </Text>
+          {ready ? `on ${hostName ?? 'your computer'}` : state.connection === 'exited' ? 'disconnected' : 'connecting'}
+          {status?.git?.branch ? ` · ⎇ ${status.git.branch}` : ''}
+          {clients > 1 ? ` · ${clients} watching` : ''}
+          {state.usage ? ` · ↑${formatTokens(state.usage.cumulative.input)} ↓${formatTokens(state.usage.cumulative.output)}` : ''}
+        </Text>
         {status?.model ? (
           <Text style={styles.chip} numberOfLines={1}>
             {status.model}
           </Text>
         ) : null}
-        {history && (
-          <Pressable accessibilityRole="button" accessibilityLabel="Chats" onPress={() => setChatsOpen(!chatsOpen)} style={styles.leave}>
-            <Text style={styles.leaveText}>Chats</Text>
+        {history ? (
+          <Pressable accessibilityRole="button" accessibilityLabel="Chats on the computer" onPress={() => setChatsOpen(!chatsOpen)}>
+            <Text style={styles.link}>Chats</Text>
           </Pressable>
-        )}
-        <Pressable accessibilityRole="button" accessibilityLabel="Leave" onPress={onLeave} style={styles.leave}>
-          <Text style={styles.leaveText}>Leave</Text>
-        </Pressable>
+        ) : null}
+        {onLeave ? (
+          <Pressable accessibilityRole="button" accessibilityLabel="Leave" onPress={onLeave}>
+            <Text style={styles.link}>Leave</Text>
+          </Pressable>
+        ) : null}
       </View>
 
-      {needsSignIn(state) && (
-        <Text style={styles.banner}>The computer's Neuron is signed out. Sign in there (or send /login and approve the code).</Text>
-      )}
-      {state.connection === 'exited' && (
-        <Text style={[styles.banner, styles.bannerError]}>{state.connectionError ?? 'Disconnected from the Neuron host.'}</Text>
-      )}
+      {banner ? <Banner text={banner.text} tone={banner.tone} action={banner.action} /> : null}
+      {needsSignIn(state) ? <Banner text="Neuron on the computer is signed out. Sign in there, or send /login and approve the code." /> : null}
+      {state.connection === 'exited' && !banner ? <Banner tone="error" text={state.connectionError ?? 'Disconnected from the computer.'} /> : null}
 
-      {chatsOpen && (
+      {chatsOpen ? (
         <ChatsSheet
           sessions={state.sessions ?? []}
           current={status?.session_id ?? null}
@@ -113,7 +163,7 @@ export function SessionScreen({ connection, onLeave }: { connection: Connection;
             controller.resume(id)
           }}
         />
-      )}
+      ) : null}
 
       <FlatList
         ref={list}
@@ -121,18 +171,26 @@ export function SessionScreen({ connection, onLeave }: { connection: Connection;
         contentContainerStyle={{ padding: 12, paddingBottom: 24 }}
         data={state.items}
         keyExtractor={(item) => item.key}
-        renderItem={({ item }) => <Row item={item} onAnswer={(id, answer) => controller.answer(id, answer)} />}
+        renderItem={({ item }) => <TranscriptRow item={item} onAnswer={(id, answer) => controller.answer(id, answer)} />}
         onContentSizeChange={() => list.current?.scrollToEnd({ animated: false })}
         ListEmptyComponent={<Text style={styles.empty}>Nothing in this session yet. Send a prompt, or wait for the computer to start one.</Text>}
         ListFooterComponent={state.busy ? <Text style={styles.working}>working…</Text> : undefined}
       />
 
-      {permission && <PermissionSheet key={permission.id} pending={permission} onAnswer={(decision) => controller.answerPermission(permission.id, decision)} />}
+      {permission ? (
+        <PermissionSheet
+          key={permission.id}
+          pending={permission}
+          diff={permissionTool?.kind === 'tool' ? permissionTool.view.diff : undefined}
+          cwd={status?.cwd}
+          onAnswer={(decision) => controller.answerPermission(permission.id, decision)}
+        />
+      ) : null}
 
-      {state.todos.length > 0 && <TasksStrip todos={state.todos} />}
+      {state.todos.length > 0 ? <TasksStrip todos={state.todos} /> : null}
 
       <View style={styles.composer}>
-        {question && <Text style={styles.questionHint}>Answering Neuron's question</Text>}
+        {question ? <Text style={styles.questionHint}>Answering Neuron's question</Text> : null}
         <View style={styles.composerRow}>
           <TextInput
             accessibilityLabel="Message Neuron"
@@ -174,11 +232,12 @@ function ChatsSheet({
   onNew: () => void
   onPick: (id: string) => void
 }) {
+  const styles = useStyles(makeStyles)
   const shown = sessions.filter((session) => session.message_count > 0 || session.id === current)
   return (
     <View style={styles.sheet} accessibilityLabel="Chats on the computer">
-      <Pressable accessibilityRole="button" style={[styles.sheetButton, styles.allow]} onPress={onNew} disabled={busy}>
-        <Text style={styles.sendText}>+ New chat</Text>
+      <Pressable accessibilityRole="button" style={styles.sheetButton} onPress={onNew} disabled={busy}>
+        <Text style={styles.sheetButtonText}>+ New chat</Text>
       </Pressable>
       <ScrollView style={{ maxHeight: 260 }}>
         {shown.map((session) => (
@@ -201,6 +260,7 @@ function ChatsSheet({
 }
 
 function TasksStrip({ todos }: { todos: TodoItem[] }) {
+  const styles = useStyles(makeStyles)
   const [open, setOpen] = useState(false)
   const done = todos.filter((todo) => todo.status === 'completed').length
   const now = todos.find((todo) => todo.status === 'in_progress')
@@ -210,176 +270,13 @@ function TasksStrip({ todos }: { todos: TodoItem[] }) {
         Tasks {done}/{todos.length}
         {now ? <Text style={styles.dim}> · {now.active_form ?? now.content}</Text> : null}
       </Text>
-      {open &&
-        todos.map((todo, index) => (
-          <Text key={index} style={[styles.text, todo.status === 'completed' && styles.todoDone]}>
-            {todo.status === 'completed' ? '✓' : todo.status === 'in_progress' ? '▸' : '○'} {todo.content}
-          </Text>
-        ))}
+      {open
+        ? todos.map((todo, index) => (
+            <Text key={index} style={[styles.text, todo.status === 'completed' && styles.todoDone]}>
+              {todo.status === 'completed' ? '✓' : todo.status === 'in_progress' ? '▸' : '○'} {todo.content}
+            </Text>
+          ))
+        : null}
     </Pressable>
   )
 }
-
-function Row({ item, onAnswer }: { item: TranscriptItem; onAnswer: (id: number, answer: string) => void }) {
-  switch (item.kind) {
-    case 'user':
-      return (
-        <View style={[styles.message, { borderLeftColor: colors.user }]}>
-          <Text style={styles.text}>{item.text}</Text>
-        </View>
-      )
-    case 'assistant':
-      return (
-        <View style={[styles.message, { borderLeftColor: colors.assistant }]}>
-          <Text style={styles.text}>{item.text}</Text>
-        </View>
-      )
-    case 'reasoning':
-      return <Text style={styles.dim}>{item.streaming ? 'Thinking…' : 'Reasoned'}</Text>
-    case 'tool': {
-      const diff = item.view.diff
-      const subagent = item.subagent
-      return (
-        <View style={styles.tool}>
-          <Text style={styles.toolHead} numberOfLines={2}>
-            <Text style={styles.toolVerb}>{subagent ? `Sub-agent${subagent.type ? ` (${subagent.type})` : ''} ` : `${item.view.verb} `}</Text>
-            <Text style={styles.toolTarget}>{subagent?.description ?? item.view.target}</Text>
-          </Text>
-          <Text style={[styles.toolState, item.state === 'awaiting_permission' && { color: colors.warning }]}>
-            {subagent?.running ? 'working' : TOOL_STATE[item.state]}
-            {diff ? `  +${diff.added} −${diff.removed}` : ''}
-          </Text>
-        </View>
-      )
-    }
-    case 'question':
-      return (
-        <View style={styles.question}>
-          <Text style={styles.questionLabel}>{item.answered ? 'Neuron asked' : 'Neuron asks'}</Text>
-          <Text style={styles.text}>{item.text}</Text>
-          {!item.answered && item.id !== undefined && (item.options?.length ?? 0) > 0 && (
-            <View style={styles.sheetButtons}>
-              {item.options!.map((option) => (
-                <Pressable key={option} accessibilityRole="button" style={styles.sheetButton} onPress={() => onAnswer(item.id!, option)}>
-                  <Text style={styles.text}>{option}</Text>
-                </Pressable>
-              ))}
-            </View>
-          )}
-        </View>
-      )
-    case 'notice':
-      return <Text style={styles.notice}>{item.text}</Text>
-    case 'error':
-      return <Text style={styles.errorLine}>{item.text}</Text>
-  }
-}
-
-function PermissionSheet({
-  pending,
-  onAnswer,
-}: {
-  pending: PendingPermission
-  onAnswer: (decision: { kind: 'allow_once' } | { kind: 'allow_for_session' } | { kind: 'deny'; note: string | null }) => void
-}) {
-  const { request } = pending
-  let detail = request.input
-  try {
-    const input = JSON.parse(request.input) as Record<string, unknown>
-    detail = typeof input.command === 'string' ? `$ ${input.command}` : typeof input.path === 'string' ? input.path : JSON.stringify(input, null, 2)
-  } catch {
-    // Shown as sent.
-  }
-  return (
-    <View style={styles.sheet} accessibilityRole="alert">
-      <Text style={styles.sheetTitle}>Allow {request.tool}?</Text>
-      {request.reason ? <Text style={styles.dim}>{request.reason}</Text> : null}
-      <ScrollView style={styles.sheetDetail}>
-        <Text style={styles.code}>{detail}</Text>
-      </ScrollView>
-      <View style={styles.sheetButtons}>
-        <Pressable accessibilityRole="button" style={[styles.sheetButton, styles.allow]} onPress={() => onAnswer({ kind: 'allow_once' })}>
-          <Text style={styles.sendText}>Allow once</Text>
-        </Pressable>
-        {request.session_prefixes.length > 0 && (
-          <Pressable accessibilityRole="button" style={styles.sheetButton} onPress={() => onAnswer({ kind: 'allow_for_session' })}>
-            <Text style={styles.text}>Allow {request.session_prefixes.join(', ')} this session</Text>
-          </Pressable>
-        )}
-        <Pressable accessibilityRole="button" style={[styles.sheetButton, styles.deny]} onPress={() => onAnswer({ kind: 'deny', note: null })}>
-          <Text style={{ color: colors.diffRemoveText }}>Deny</Text>
-        </Pressable>
-      </View>
-    </View>
-  )
-}
-
-const styles = StyleSheet.create({
-  screen: { flex: 1, backgroundColor: colors.bg },
-  header: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    paddingHorizontal: 12,
-    paddingTop: 44,
-    paddingBottom: 10,
-    backgroundColor: colors.panel,
-    borderBottomWidth: 1,
-    borderBottomColor: colors.border,
-  },
-  workspace: { color: colors.text, fontSize: 16, fontWeight: '600' },
-  dim: { color: colors.textDim, fontSize: 13 },
-  chip: { backgroundColor: colors.chip, color: colors.chipText, fontWeight: '600', fontSize: 12, paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6, maxWidth: 130 },
-  leave: { paddingHorizontal: 8, paddingVertical: 4 },
-  leaveText: { color: colors.link },
-  banner: { backgroundColor: colors.sunken, color: colors.warning, padding: 10, fontSize: 13 },
-  bannerError: { color: colors.diffRemoveText },
-  transcript: { flex: 1 },
-  empty: { color: colors.textDim, textAlign: 'center', marginTop: 40, paddingHorizontal: 24 },
-  working: { color: colors.accent, marginTop: 8 },
-  message: { borderLeftWidth: 3, paddingLeft: 10, marginVertical: 6 },
-  text: { color: colors.text, fontSize: 15, lineHeight: 21 },
-  tool: { backgroundColor: colors.panel, borderRadius: 8, borderWidth: 1, borderColor: colors.border, padding: 8, marginVertical: 4 },
-  toolHead: { color: colors.text },
-  toolVerb: { fontWeight: '600', color: colors.text },
-  toolTarget: { fontFamily: mono, color: colors.textMuted, fontSize: 13 },
-  toolState: { color: colors.textDim, fontSize: 12, marginTop: 2 },
-  question: { borderWidth: 1, borderColor: colors.warning, borderRadius: 8, padding: 8, marginVertical: 6 },
-  questionLabel: { color: colors.warning, fontSize: 12, fontWeight: '600' },
-  notice: { color: colors.textDim, fontFamily: mono, fontSize: 12, marginVertical: 4 },
-  errorLine: { color: colors.diffRemoveText, marginVertical: 4 },
-  sheet: { backgroundColor: colors.panel, borderTopWidth: 2, borderTopColor: colors.warning, padding: 14, gap: 6 },
-  sheetTitle: { color: colors.text, fontSize: 17, fontWeight: '600' },
-  sheetDetail: { maxHeight: 140, backgroundColor: colors.sunken, borderRadius: 6, padding: 8 },
-  code: { fontFamily: mono, color: colors.link, fontSize: 13 },
-  sheetButtons: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 6 },
-  sheetButton: { borderWidth: 1, borderColor: colors.border, borderRadius: 8, paddingHorizontal: 12, paddingVertical: 10 },
-  allow: { backgroundColor: colors.accent, borderColor: colors.accent },
-  deny: { borderColor: colors.danger },
-  composer: { borderTopWidth: 1, borderTopColor: colors.accent, padding: 10, backgroundColor: colors.bg },
-  questionHint: { color: colors.warning, fontSize: 12, marginBottom: 4 },
-  composerRow: { flexDirection: 'row', gap: 8, alignItems: 'flex-end' },
-  input: {
-    flex: 1,
-    minHeight: 44,
-    maxHeight: 140,
-    backgroundColor: colors.sunken,
-    color: colors.text,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: colors.border,
-    paddingHorizontal: 10,
-    paddingVertical: 10,
-    fontSize: 15,
-  },
-  send: { backgroundColor: colors.accent, borderRadius: 8, paddingHorizontal: 14, paddingVertical: 12 },
-  sendText: { color: '#fff', fontWeight: '600' },
-  stop: { backgroundColor: 'transparent', borderWidth: 1, borderColor: colors.warning },
-  stopText: { color: colors.warning, fontWeight: '600' },
-  disabled: { opacity: 0.5 },
-  chatRow: { paddingVertical: 8, paddingHorizontal: 6, borderRadius: 6 },
-  chatRowCurrent: { backgroundColor: colors.sunken },
-  tasks: { backgroundColor: colors.panel, borderTopWidth: 1, borderTopColor: colors.border, paddingHorizontal: 12, paddingVertical: 8 },
-  tasksTitle: { color: colors.warning, fontWeight: '600' },
-  todoDone: { color: colors.textDim, textDecorationLine: 'line-through' },
-})
