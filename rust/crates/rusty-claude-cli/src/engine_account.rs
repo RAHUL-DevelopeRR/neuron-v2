@@ -10,11 +10,12 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
-use neuron_tui::protocol::{AccountDetails, UiEvent, UsageAmounts};
+use neuron_tui::protocol::{AccountDetails, ErrorDetail, UiEvent, UsageAmounts};
 
 use crate::account::AccountSummary;
 use crate::auth::{CredentialSource, GatewayCredential};
 use crate::credentials::{CredentialStore, StoredCredential};
+use crate::error_detail::DetailedError;
 
 /// What the engine knows of the account beyond the stored login.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -132,23 +133,57 @@ pub(crate) fn refresh_in_background(
 /// Reads `/api/account` for `credential` into `cache`, and stores the profile it reports
 /// with the login.
 fn refresh(cache: &SharedAccountCache, credential: &GatewayCredential) {
+    let _ = read_into(cache, credential);
+}
+
+/// Reads `/api/account` into `cache` now, on this thread, for a report that needs it
+/// current (`/usage`). Without a login, says so with the `sign_in_required` code.
+pub(crate) fn read_now(cache: &SharedAccountCache) -> Result<AccountSummary, DetailedError> {
+    let credential = crate::auth::current_credential()
+        .ok()
+        .flatten()
+        .ok_or_else(|| DetailedError {
+            message: "Not signed in to Zero-X. Run /login to see your plan and usage.".to_string(),
+            detail: Some(ErrorDetail {
+                code: "sign_in_required".to_string(),
+                status: None,
+                upgrade_url: None,
+                resets_at: None,
+                retry_after_seconds: None,
+            }),
+        })?;
+    read_into(cache, &credential)
+}
+
+/// Reads `/api/account` for `credential` into `cache` (its error too), and stores the
+/// profile it reports with the login.
+fn read_into(
+    cache: &SharedAccountCache,
+    credential: &GatewayCredential,
+) -> Result<AccountSummary, DetailedError> {
     let result = crate::auth::gateway_base_url()
-        .map_err(|error| error.to_string())
+        .map_err(|error| DetailedError {
+            message: error.to_string(),
+            detail: None,
+        })
         .and_then(|base| {
-            crate::account::fetch_account(&base, &credential.token)
-                .map_err(|error| error.to_string())
+            crate::account::fetch_account(&base, &credential.token).map_err(|error| DetailedError {
+                message: error.to_string(),
+                detail: crate::error_detail::from_gateway_http_error(&error),
+            })
         });
     let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
-    match result {
+    match &result {
         Ok(summary) => {
-            remember_profile(credential, &summary);
-            cache.summary = Some(summary);
+            remember_profile(credential, summary);
+            cache.summary = Some(summary.clone());
             cache.fetched_at = Some(crate::clock::now_unix());
             cache.error = None;
             cache.quota_seen = None;
         }
-        Err(error) => cache.error = Some(error),
+        Err(error) => cache.error = Some(error.message.clone()),
     }
+    result
 }
 
 /// Stores the email, name and plan `/api/account` reported with the stored login they

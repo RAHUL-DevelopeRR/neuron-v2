@@ -33,11 +33,13 @@
 use super::*;
 use crate::device_login::{DeviceCode, DeviceLoginObserver};
 use crate::engine_account::{self, SharedAccountCache};
+use crate::engine_reports;
 use crate::error_detail::DetailedError;
 use neuron_tui::protocol::{
     AccountInfo, Attachment, DefinitionInfo, EngineCommand, GitStatus, McpServerInfo, ModelInfo,
     PermissionReply, PluginInfo, SessionRunStatus, SessionScope, SessionSummary, TokenCounts,
-    TranscriptEntry, UiEvent, CAPABILITY_QUESTIONS, ENGINE_FEATURES, PROTOCOL_VERSION,
+    TranscriptEntry, UiEvent, CAPABILITY_QUESTIONS, CAPABILITY_REPORTS, ENGINE_FEATURES,
+    PROTOCOL_VERSION,
 };
 use repl_loop::InterruptPresses;
 use runtime::ui_hooks::{self, UserQuestion};
@@ -840,6 +842,8 @@ struct Shared {
     next_question: AtomicU64,
     /// The UI takes questions as [`UiEvent::Question`] (its `questions` capability).
     structured_questions: AtomicBool,
+    /// The UI shows reports as [`UiEvent::Report`] (its `reports` capability).
+    report_panels: AtomicBool,
     /// Shutdown was requested: commands still queued are dropped.
     closing: AtomicBool,
 }
@@ -943,12 +947,13 @@ fn forward_commands(
             }
             // Both take effect at once, also while a turn runs.
             EngineCommand::Capabilities { features, .. } => {
-                let questions = features
-                    .iter()
-                    .any(|feature| feature == CAPABILITY_QUESTIONS);
+                let has = |capability: &str| features.iter().any(|feature| feature == capability);
                 shared
                     .structured_questions
-                    .store(questions, Ordering::SeqCst);
+                    .store(has(CAPABILITY_QUESTIONS), Ordering::SeqCst);
+                shared
+                    .report_panels
+                    .store(has(CAPABILITY_REPORTS), Ordering::SeqCst);
             }
             EngineCommand::Answer { id, text } => {
                 // A stale or unknown id answers nothing.
@@ -1485,6 +1490,27 @@ impl Engine {
             SlashCommand::Plan { mode } => self.plan(mode.as_deref())?,
             SlashCommand::Login => self.login()?,
             SlashCommand::Logout => self.logout(),
+            SlashCommand::Usage { .. } => {
+                let account = engine_account::read_now(&self.account_cache)?;
+                self.send_account();
+                let pricing = crate::account::pricing_url();
+                let base = crate::auth::gateway_base_url()?;
+                let dashboard = format!("{}/dashboard", crate::gateway_http::origin(&base));
+                let now = crate::clock::now_unix();
+                self.show_report(engine_reports::usage(&account, now, &pricing, &dashboard));
+            }
+            SlashCommand::Init => {
+                let report = crate::init::initialize_repo(&env::current_dir()?)?;
+                self.show_report(engine_reports::init(&report));
+            }
+            SlashCommand::Memory => {
+                let report = engine_reports::memory(&env::current_dir()?)?;
+                self.show_report(report);
+            }
+            SlashCommand::Doctor => {
+                let report = engine_reports::doctor(&render_doctor_report()?);
+                self.show_report(report);
+            }
             SlashCommand::Unknown(name) => return Err(format_unknown_slash_command(&name).into()),
             other => {
                 return Err(format!(
@@ -1505,6 +1531,15 @@ impl Engine {
         self.announce_account();
         if !self.cli.runtime.session().messages.is_empty() {
             self.send_transcript();
+        }
+    }
+
+    /// A report in the UI's report panel, or as a notice when it has none.
+    fn show_report(&mut self, report: engine_reports::Report) {
+        if self.shared.report_panels.load(Ordering::SeqCst) {
+            self.send(report.into_event());
+        } else {
+            self.notice(&report.render_text());
         }
     }
 
@@ -1827,7 +1862,8 @@ mod tests {
     use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
     use neuron_tui::protocol::{
         EngineCommand, PermissionDecision, PermissionReply, SessionScope, TokenCounts,
-        TranscriptEntry, UiEvent, CAPABILITY_QUESTIONS, ENGINE_FEATURES, PROTOCOL_VERSION,
+        TranscriptEntry, UiEvent, CAPABILITY_QUESTIONS, CAPABILITY_REPORTS, ENGINE_FEATURES,
+        PROTOCOL_VERSION,
     };
     use runtime::ui_hooks::{self, UserQuestion};
     use runtime::PermissionMode;
@@ -2413,6 +2449,68 @@ mod tests {
                 UiEvent::TurnFinished,
             ]
         );
+
+        // Reports: a notice until the UI shows report panels, then a report event.
+        let slash = |command: &str| EngineCommand::Slash {
+            command: command.into(),
+            args: String::new(),
+        };
+        engine.commands.send(slash("memory")).unwrap();
+        let memory = turn_events(&engine.events);
+        assert_eq!(without_notices(&memory), vec![UiEvent::TurnFinished]);
+        assert!(
+            notices(&memory)
+                .iter()
+                .any(|notice| notice.starts_with("Instruction files")),
+            "{memory:?}"
+        );
+        engine
+            .commands
+            .send(EngineCommand::Capabilities {
+                features: vec![CAPABILITY_QUESTIONS.into(), CAPABILITY_REPORTS.into()],
+                client: Some("terminal".into()),
+            })
+            .unwrap();
+        for (command, title) in [
+            ("memory", "Instruction files"),
+            ("doctor", "Doctor"),
+            ("init", "Project instructions"),
+        ] {
+            engine.commands.send(slash(command)).unwrap();
+            let events = without_notices(&turn_events(&engine.events));
+            match events.as_slice() {
+                [UiEvent::Report {
+                    command: sent,
+                    title: sent_title,
+                    sections,
+                    ..
+                }, UiEvent::TurnFinished] => {
+                    assert_eq!((sent.as_str(), sent_title.as_str()), (command, title));
+                    assert!(!sections.is_empty(), "{events:?}");
+                }
+                other => panic!("/{command}: a report, got {other:?}"),
+            }
+        }
+        assert!(
+            workspace.join("NEURON.md").is_file(),
+            "/init wrote NEURON.md"
+        );
+        // /usage needs a Zero-X login, and says so in a way a UI can act on.
+        engine.commands.send(slash("usage")).unwrap();
+        match without_notices(&turn_events(&engine.events)).as_slice() {
+            [UiEvent::Error {
+                detail: Some(detail),
+                ..
+            }, UiEvent::TurnFinished] => assert_eq!(detail.code, "sign_in_required"),
+            other => panic!("/usage signed out: an error with a detail, got {other:?}"),
+        }
+        engine
+            .commands
+            .send(EngineCommand::Capabilities {
+                features: Vec::new(),
+                client: None,
+            })
+            .unwrap();
 
         // SetModel switches for the next turn.
         engine

@@ -50,6 +50,7 @@ mod device_login;
 mod doctor;
 mod engine;
 mod engine_account;
+mod engine_reports;
 mod engine_stdio;
 mod error_detail;
 mod executor;
