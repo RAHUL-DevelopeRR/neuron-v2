@@ -111,6 +111,7 @@ pub const ENGINE_FEATURES: &[&str] = &[
     FEATURE_REPORTS,
     FEATURE_SESSION_SCOPE,
     FEATURE_TRUST_PREVIEW,
+    FEATURE_MODEL_IMAGES,
 ];
 
 /// `report` events for the commands that show a report (`/usage`, `/init`, `/memory`,
@@ -300,7 +301,8 @@ pub struct ErrorDetail {
     /// The gateway's code (`invalid_session`, `upgrade_required`, `insufficient_quota`,
     /// `insufficient_credits`, `rate_limited`, `capacity_exhausted`, `account_suspended`,
     /// `context_length_exceeded`, ...), `unreachable` when the server could not be
-    /// reached, or `not_available` when it does not offer the call yet (a 404).
+    /// reached, `not_available` when it does not offer the call yet (a 404), or
+    /// `sign_in_required` when the call needs a Zero-X login and there is none.
     pub code: String,
     /// The HTTP status, when there was an answer.
     pub status: Option<u16>,

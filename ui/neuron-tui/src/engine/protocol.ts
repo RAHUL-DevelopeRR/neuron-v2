@@ -290,7 +290,8 @@ export interface ErrorDetail {
    * The gateway's code (`invalid_session`, `upgrade_required`,
    * `insufficient_quota`, `insufficient_credits`, `rate_limited`,
    * `capacity_exhausted`, ...), `unreachable` when the server could not be
-   * reached, or `not_available` when it does not offer the call yet (a 404).
+   * reached, `not_available` when it does not offer the call yet (a 404), or
+   * `sign_in_required` when the call needs a Zero-X login and there is none.
    */
   code: string
   /** The HTTP status, when there was an answer. */

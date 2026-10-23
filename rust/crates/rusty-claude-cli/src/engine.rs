@@ -503,7 +503,7 @@ fn status_event(
         signed_in: account.signed_in,
         sign_in_required,
         account: account.info.clone(),
-        supports_images: None,
+        supports_images: crate::gateway_catalog::model_supports_images(model),
     }
 }
 
@@ -1662,7 +1662,7 @@ impl Engine {
                         tiers: model.tiers.clone(),
                         status: model.status.clone(),
                         available_again_at: model.available_again_at.clone(),
-                        supports_images: None,
+                        supports_images: model.supports_images,
                     })
                     .collect()
             })

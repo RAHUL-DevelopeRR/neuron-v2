@@ -172,8 +172,9 @@ export interface AccountDetails {
 /**
  * What a failed request needs from the user. `code` is the gateway's
  * (`invalid_session`, `upgrade_required`, `insufficient_quota`, `rate_limited`,
- * ...), `unreachable` when the server could not be reached, or `not_available`
- * when it does not offer the call yet.
+ * ...), `unreachable` when the server could not be reached, `not_available`
+ * when it does not offer the call yet (a 404), or `sign_in_required` when the
+ * call needs a Zero-X login and there is none.
  */
 export interface ErrorDetail {
   code: string
