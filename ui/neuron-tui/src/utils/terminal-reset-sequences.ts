@@ -31,3 +31,15 @@ export const TERMINAL_RESET_SEQUENCES =
   '\x1b[<u' + // Pop kitty keyboard protocol flags
   '\x1b[>4;0m' + // Reset modifyOtherKeys
   '\x1b[?25h' // Show cursor
+
+const LEAVE_ALTERNATE_SCREEN = '\x1b[?1049l'
+
+/**
+ * The same resets for a terminal already back on the main screen. Leaving the
+ * alternate screen again is not a no-op: terminals also restore the cursor
+ * saved when it was entered (DECRC), which moved it up to where the UI started,
+ * so the shell's next prompt overwrote the --continue hint printed below.
+ */
+export const MAIN_SCREEN_RESET_SEQUENCES = TERMINAL_RESET_SEQUENCES.slice(
+  LEAVE_ALTERNATE_SCREEN.length,
+)

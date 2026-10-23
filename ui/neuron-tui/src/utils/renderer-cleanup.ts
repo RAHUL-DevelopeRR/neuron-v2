@@ -8,7 +8,10 @@ import { getCliEnv } from './env'
 import { exitCliCleanly, registerExitCleanup } from './exit-cleanly'
 import { flushLiveChatState } from './run-state-storage'
 import { reportFatalErrorSync, writeTerminalControlSync } from './terminal-io'
-import { TERMINAL_RESET_SEQUENCES } from './terminal-reset-sequences'
+import {
+  MAIN_SCREEN_RESET_SEQUENCES,
+  TERMINAL_RESET_SEQUENCES,
+} from './terminal-reset-sequences'
 import { stopTerminalWatchdog } from './terminal-watchdog'
 
 import type { CliRenderer } from '@opentui/core'
@@ -36,6 +39,8 @@ export const CLI_RENDERER_EXIT_SIGNALS: NodeJS.Signals[] = [
 let renderer: CliRenderer | null = null
 let handlersInstalled = false
 let cleanupStarted = false
+/** A reset already left the alternate screen (see MAIN_SCREEN_RESET_SEQUENCES). */
+let leftAlternateScreen = false
 
 function isProcessRunning(pid: number, onResult: (running: boolean) => void) {
   if (process.platform === 'win32') {
@@ -106,14 +111,18 @@ function resetTerminalStateOnce(): boolean {
     resetTerminalTitle()
     if (!process.stdout.isTTY) return true
 
-    const resetCompletedSynchronously = writeTerminalControlSync(
-      TERMINAL_RESET_SEQUENCES,
-    )
+    // Only the first reset leaves the alternate screen: a later one (the
+    // process 'exit' handler's) would move the cursor back above the hint.
+    const sequences = leftAlternateScreen
+      ? MAIN_SCREEN_RESET_SEQUENCES
+      : TERMINAL_RESET_SEQUENCES
+    const resetCompletedSynchronously = writeTerminalControlSync(sequences)
     if (!resetCompletedSynchronously) {
       // Best-effort immediate reset. Keep the watchdog armed below so it can
       // retry after this process exits if the buffered write is lost.
-      process.stdout.write(TERMINAL_RESET_SEQUENCES)
+      process.stdout.write(sequences)
     }
+    leftAlternateScreen = true
     return resetCompletedSynchronously
   } catch {
     // Ignore errors - stdout may already be closed

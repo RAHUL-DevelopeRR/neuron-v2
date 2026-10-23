@@ -80,6 +80,34 @@ describe('createExitCliCleanly', () => {
     expect(events).toEqual(['engine-shutdown', 'local-cleanup', 'message', 'exit-0'])
   })
 
+  test('the teardown waits its minimum also when the engine has already stopped', async () => {
+    // A dead engine stops at once; the quitting key's key-up must still come in
+    // before the teardown, or a classic Windows console crashes.
+    const events: string[] = []
+    let releaseWait: (() => void) | undefined
+    const exitCleanly = createExitCliCleanly({
+      cleanupLocal: () => events.push('local-cleanup'),
+      shutdownEngine: async () => {
+        events.push('engine-stopped-already')
+      },
+      beforeTeardown: () =>
+        new Promise<void>((resolve) => {
+          releaseWait = resolve
+        }),
+      waitForCleanup: async (tasks) => {
+        await Promise.allSettled(tasks)
+      },
+      exit: (code) => events.push(`exit-${code}`),
+    })
+
+    const exiting = exitCleanly(0)
+    for (let tick = 0; tick < 5; tick++) await Promise.resolve()
+    expect(events).toEqual(['engine-stopped-already'])
+    releaseWait?.()
+    await exiting
+    expect(events).toEqual(['engine-stopped-already', 'local-cleanup', 'exit-0'])
+  })
+
   test('a failing exit message never blocks the exit', async () => {
     const exitCodes: number[] = []
     const exitCleanly = createExitCliCleanly({

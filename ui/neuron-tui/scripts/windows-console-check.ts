@@ -104,6 +104,12 @@ function savedChatIds(home: string): string[] {
 for (const [mode, keys, label] of [
   ['--via-neuron', 'PARITY_SCENARIO:streaming_text<CR>|<SLEEP>|<CC>|<CC>', 'Ctrl-C twice, through neuron'],
   ['--compiled', 'PARITY_SCENARIO:streaming_text<CR>|<SLEEP>|/exit<CR>', '/exit, the UI on its own'],
+  // A dead engine has nothing to wait for, so the exit would tear down at once.
+  [
+    '--compiled',
+    'PARITY_SCENARIO:streaming_text<CR>|<SLEEP>|<KILLENGINE>|<CC>|<CC>',
+    'Ctrl-C twice after the engine died, the UI on its own',
+  ],
 ] as const) {
   results.push(classic(mode, keys, label))
 }

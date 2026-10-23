@@ -11,6 +11,9 @@ import { writeTerminalControlSync } from './terminal-io'
 import { getNeuronEngineClient } from '../engine/neuron-engine-client'
 
 const EXIT_CLEANUP_TIMEOUT_MS = 1_000
+// The quitting key's key-up (and a held Ctrl's) arrives within this, before the
+// teardown; see createExitCliCleanly.
+const EXIT_TEARDOWN_MIN_WAIT_MS = 500
 // How long the exit message waits for the terminal reset.
 const EXIT_MESSAGE_WAIT_MS = 250
 // And then for the renderer's native teardown to reach the terminal.
@@ -24,6 +27,8 @@ type ExitCliDependencies = {
   exit: (code: number) => void
   /** Print the registered exit message, after the screen is restored. */
   printExitMessage?: () => Promise<void> | void
+  /** The shortest wait before the renderer's teardown, alongside the engine's stop. */
+  beforeTeardown?: () => Promise<void>
 }
 
 let localExitCleanup: (() => void) | undefined
@@ -69,12 +74,17 @@ export function createExitCliCleanly(deps: ExitCliDependencies) {
         // Windows console window, conhost crashes (an access violation that
         // closes the window) when this process lives on after OpenTUI's
         // renderer has torn down and a key still arrives: the key-up of the
-        // Enter or Ctrl-C that asked to quit is enough. So after the teardown
-        // the exit only prints its message and leaves.
+        // Enter or Ctrl-C that asked to quit is enough. So the teardown waits
+        // at least for those keys to come in, also when the engine has already
+        // stopped and has nothing to wait for, and after it the exit only
+        // prints its message and leaves.
         try {
           await deps.waitForCleanup([
             Promise.resolve()
               .then(deps.shutdownEngine)
+              .catch(() => {}),
+            Promise.resolve()
+              .then(deps.beforeTeardown)
               .catch(() => {}),
           ])
         } catch {
@@ -115,6 +125,8 @@ export const exitCliCleanly = createExitCliCleanly({
     )
   },
   exit: (code) => process.exit(code),
+  beforeTeardown: () =>
+    new Promise((resolve) => setTimeout(resolve, EXIT_TEARDOWN_MIN_WAIT_MS)),
   printExitMessage: async () => {
     const message = exitMessage?.()
     if (!message) return

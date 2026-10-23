@@ -1,8 +1,11 @@
 # Runs `bun run dev:mock <Mode>` in a classic console window (conhost.exe, which
 # Windows PowerShell 5.1 and cmd.exe open in), types $Keys, and checks that the
-# window outlives the UI's exit and shows $Expect afterwards. Started by
+# window outlives the UI's exit and shows $Expect afterwards, still there
+# after the next line the console prints (a line that the shell's prompt
+# would overwrite if the cursor had gone back up). Started by
 # windows-console-check.ts. Keys: chunks split by `|`, `<CC>` is Ctrl-C, `<CR>`
-# is Enter, `<SLEEP>` waits 4 s. Prints one `RESULT pass|fail ...` line.
+# is Enter, `<SLEEP>` waits 4 s, `<KILLENGINE>` kills the UI's engine and waits
+# for the UI to say it stopped. Prints one `RESULT pass|fail ...` line.
 param(
   [Parameter(Mandatory)] [string]$Work,
   [Parameter(Mandatory)] [string]$Bun,
@@ -26,6 +29,8 @@ Set-Content -Encoding ascii $wrapper @(
   "set `"NEURON_TUI_DEV_HOME=$home_`"",
   "`"$Bun`" `"$DevScript`" $Mode",
   "echo exit %errorlevel% > `"$marker`"",
+  # What a shell prints next: it must land below the hint, not over it.
+  'echo AFTER_THE_UI',
   # Keeps the window open, so a window that dies is conhost's doing.
   'ping -n 20 127.0.0.1 >nul'
 )
@@ -60,6 +65,21 @@ try {
   Start-Sleep -Milliseconds 800
   foreach ($chunk in ($Keys -split '\|')) {
     if ($chunk -eq '<SLEEP>') { Start-Sleep -Seconds 4; continue }
+    if ($chunk -eq '<KILLENGINE>') {
+      $engine = Get-CimInstance Win32_Process | Where-Object {
+        (Descendants ([int]$cmd.ProcessId)) -contains [int]$_.ProcessId -and $_.CommandLine -like '*engine --stdio*'
+      } | Select-Object -First 1
+      if (-not $engine) { $result = 'fail: no engine process to kill'; return }
+      Stop-Process -Id $engine.ProcessId -Force
+      $stopped = $false
+      for ($i = 0; $i -lt 40 -and -not $stopped; $i++) {
+        Start-Sleep -Milliseconds 250
+        $stopped = ([ConsoleKeys]::Screen($pid_)) -match 'engine stopped'
+      }
+      if (-not $stopped) { $result = "fail: the UI did not say the engine stopped`n$([ConsoleKeys]::Screen($pid_))"; return }
+      Start-Sleep -Milliseconds 800
+      continue
+    }
     $text = $chunk -replace '<CC>', [string][char]3 -replace '<CR>', "`r"
     if (-not [ConsoleKeys]::Type($pid_, $text)) { $result = "fail: could not type [$chunk]"; return }
     Start-Sleep -Milliseconds 900
@@ -74,8 +94,15 @@ try {
     return
   }
   if (-not (Test-Path $marker)) { $result = "fail: the UI did not exit`n$([ConsoleKeys]::Screen($pid_))"; return }
+  for ($i = 0; $i -lt 20 -and -not (([ConsoleKeys]::Screen($pid_)) -match 'AFTER_THE_UI'); $i++) { Start-Sleep -Milliseconds 250 }
   $after = [ConsoleKeys]::Screen($pid_)
-  if ($Expect -and -not ($after -like "*$Expect*")) { $result = "fail: '$Expect' is not on the screen after the exit`n$after"; return }
+  if ($Expect) {
+    $lines = @($after -split "`n")
+    $hintAt = [Array]::FindIndex($lines, [Predicate[string]] { param($line) $line -like "*$Expect*" })
+    $nextAt = [Array]::FindIndex($lines, [Predicate[string]] { param($line) $line.Trim() -eq 'AFTER_THE_UI' })
+    if ($hintAt -lt 0) { $result = "fail: '$Expect' is not on the screen after the exit`n$after"; return }
+    if ($nextAt -le $hintAt) { $result = "fail: the next line did not land below the hint (it was overwritten?)`n$after"; return }
+  }
   $result = 'pass'
 }
 finally {
