@@ -1,15 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import {
+  FEATURE_ACCOUNT,
   FEATURE_EXTENSIONS,
+  FEATURE_SESSION_SCOPE,
   FEATURE_SESSIONS,
+  FEATURE_TRUST_PREVIEW,
   FEATURE_TRUST_WORKSPACE,
-  accountView,
   changedPaths,
   hasFeature,
   needsSignIn,
   openQuestionItem,
   runningSubagents,
+  sessionAccount,
   type SessionController,
   type TranscriptItem,
 } from '@neuron/client'
@@ -128,9 +131,11 @@ export function App({ platform }: { platform: Platform }) {
   const folder = state.status?.cwd ?? project?.path ?? null
 
   // The session list follows the engine: after it starts, after every turn, and on a switch.
+  // Engines that can list every project's sessions do.
+  const allProjects = hasFeature(state, FEATURE_SESSION_SCOPE)
   useEffect(() => {
-    if (controller && ready && history && !state.busy) controller.listSessions()
-  }, [controller, ready, history, state.busy, sessionId])
+    if (controller && ready && history && !state.busy) controller.listSessions(allProjects ? 'all' : undefined)
+  }, [controller, ready, history, allProjects, state.busy, sessionId])
 
   // Sessions seen for the first time are not unread; the open one is always seen.
   useEffect(() => {
@@ -275,12 +280,14 @@ export function App({ platform }: { platform: Platform }) {
   }, [signingOut, state.busy, platform, sessionId])
 
   // Once allowed, the folder's own settings load in a fresh engine, on the same session.
+  // The home folder is trusted for that engine only, so it is told so.
+  const trustedOnce = useRef(false)
   useEffect(() => {
     if (!trusting || !state.restartRequired) return
     setTrusting(false)
     if (platform.can.restart) {
       const keep = state.items.some((item) => item.kind === 'user') ? sessionId : null
-      void platform.restart(keep).catch((error: Error) => setLaunchError(error.message))
+      void platform.restart(keep, { trustOnce: trustedOnce.current }).catch((error: Error) => setLaunchError(error.message))
     }
   }, [trusting, state.restartRequired, state.items, platform, sessionId])
 
@@ -294,10 +301,25 @@ export function App({ platform }: { platform: Platform }) {
   const permission = state.permissions[0] ?? null
   const signIn = needsSignIn(state) || state.signInCode !== null || state.sessionStarting
   const question = openQuestionItem(state)
-  const account = accountView(state.status?.signed_in, state.status?.account)
+  const account = sessionAccount(state)
   const untrusted =
     hasFeature(state, FEATURE_TRUST_WORKSPACE) && state.status !== null && !state.status.workspace_trusted && !state.restartRequired
   const firstRun = settingsLoaded && !settings.firstRunDone && controller !== null
+
+  // What allowing the folder would turn on, asked for once per folder.
+  const canPreview = hasFeature(state, FEATURE_TRUST_PREVIEW)
+  const previewAsked = useRef<string | null>(null)
+  useEffect(() => {
+    if (!controller || !ready || !untrusted || !folder || !canPreview || previewAsked.current === folder) return
+    previewAsked.current = folder
+    controller.trustPreview()
+  }, [controller, ready, untrusted, folder, canPreview])
+
+  // The usage page reads the plan and usage again.
+  const canRefreshAccount = hasFeature(state, FEATURE_ACCOUNT)
+  useEffect(() => {
+    if (view === 'settings' && section === 'usage' && controller && ready && canRefreshAccount) controller.refreshAccount()
+  }, [view, section, controller, ready, canRefreshAccount])
   const title =
     rows?.find((row) => row.id === sessionId)?.title ??
     (state.items.find((item) => item.kind === 'user') as Extract<TranscriptItem, { kind: 'user' }> | undefined)?.text.split('\n')[0] ??
@@ -574,12 +596,12 @@ export function App({ platform }: { platform: Platform }) {
       {!firstRun && untrusted && !signIn && folder && (
         <TrustModal
           folder={folder}
-          gitRoot={null}
-          preview={[]}
+          preview={state.trustPreview}
           working={trusting}
           canPickFolder={platform.can.pickFolder}
           onAllow={() => {
             setTrusting(true)
+            trustedOnce.current = state.trustPreview?.session_only === true
             controller.trustWorkspace()
           }}
           onElsewhere={() => void pickFolder()}

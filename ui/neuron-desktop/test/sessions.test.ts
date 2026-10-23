@@ -9,23 +9,33 @@ const summary = (id: string, updated: number, extra: Record<string, unknown> = {
   ({ id, title: id, model: null, message_count: 2, updated_at_ms: updated, current: false, branch: null, ...extra }) as SessionSummary
 
 describe('the session list model', () => {
-  test("a session's project: a path, an object, or the open one", () => {
+  test("a session's project: the folder the engine names, or the open one", () => {
     expect(projectOf(summary('a', 1, { project: 'C:\\work\\site\\' }), open)).toEqual({ name: 'site', path: 'C:\\work\\site\\' })
-    expect(projectOf(summary('b', 1, { project: { path: '/work/lib', name: 'Library' } }), open)).toEqual({ name: 'Library', path: '/work/lib' })
+    expect(projectOf(summary('b', 1, { project: '  ' }), open)).toBe(open)
     expect(projectOf(summary('c', 1), open)).toBe(open)
   })
 
-  test('one badge per row: running, then the terminal, then failed, then unread', () => {
+  test('one badge per row: running, then elsewhere, then failed, then unread', () => {
     const rows = sessionRows(
-      [summary('current', 50), summary('elsewhere', 40, { run_status: 'running' }), summary('broken', 30), summary('news', 20), summary('quiet', 10)],
+      [
+        summary('current', 50),
+        summary('elsewhere', 40, { run_status: 'running', client: 'terminal' }),
+        summary('window', 35, { run_status: 'open', client: 'desktop' }),
+        summary('broken', 30),
+        summary('engine-failed', 25, { failed: true }),
+        summary('news', 20),
+        summary('quiet', 10, { run_status: 'idle' }),
+      ],
       { open, currentId: 'current', busy: true, seen: { seen: { news: 5, quiet: 10 }, failed: { broken: true, elsewhere: true } } },
     )
-    expect(rows.map((row) => [row.id, row.badge])).toEqual([
-      ['current', 'running'],
-      ['elsewhere', 'terminal'],
-      ['broken', 'failed'],
-      ['news', 'unread'],
-      ['quiet', null],
+    expect(rows.map((row) => [row.id, row.badge, row.badgeLabel])).toEqual([
+      ['current', 'running', 'running'],
+      ['elsewhere', 'terminal', 'running in the terminal'],
+      ['window', 'terminal', 'open in another window'],
+      ['broken', 'failed', 'failed'],
+      ['engine-failed', 'failed', 'failed'],
+      ['news', 'unread', 'unread'],
+      ['quiet', null, null],
     ])
   })
 

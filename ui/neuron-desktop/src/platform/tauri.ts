@@ -98,8 +98,8 @@ class TauriTransport implements EngineTransport {
     return this.launch(() => invoke<Started>('engine_start', { options: this.options }))
   }
 
-  restart(resume: string | null): Promise<void> {
-    return this.launch(() => invoke<Started>('engine_restart', { resume, options: this.options }))
+  restart(resume: string | null, trustOnce = false): Promise<void> {
+    return this.launch(() => invoke<Started>('engine_restart', { resume, options: this.options, trustOnce }))
   }
 
   openProject(path: string, resume: string | null): Promise<void> {
@@ -163,7 +163,7 @@ export function tauriPlatform(): Platform {
     },
     connect() {
       connecting ??= (async () => {
-        controller = new SessionController(transport)
+        controller = new SessionController(transport, { client: 'desktop' })
         await controller.start()
         return controller
       })()
@@ -190,10 +190,10 @@ export function tauriPlatform(): Platform {
         return null
       }
     },
-    restart(resume) {
+    restart(resume, options) {
       // Until the new engine is ready, nothing can be sent.
       controller?.apply({ type: 'local/connecting' })
-      return transport.restart(resume)
+      return transport.restart(resume, options?.trustOnce === true)
     },
     list: (path) => invoke<DirListing>('fs_list', { path }),
     read: (path) => invoke<FileContent>('fs_read', { path }),

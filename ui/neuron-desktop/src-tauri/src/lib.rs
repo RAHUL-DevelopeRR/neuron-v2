@@ -128,8 +128,14 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// Starts an engine in the open project (continuing `resume`), replacing any that
-/// runs. Returns its generation.
-fn launch(app: &AppHandle, state: &AppState, resume: Option<String>) -> Result<Started, String> {
+/// runs. `trust_once` trusts the workspace for this engine only (the home folder,
+/// which is never recorded). Returns its generation.
+fn launch(
+    app: &AppHandle,
+    state: &AppState,
+    resume: Option<String>,
+    trust_once: bool,
+) -> Result<Started, String> {
     if let Some((_, old)) = lock(&state.engine).take() {
         old.stop();
     }
@@ -155,7 +161,11 @@ fn launch(app: &AppHandle, state: &AppState, resume: Option<String>) -> Result<S
         &binary,
         workspace.root(),
         &launch,
-        &Env::Inherit(Vec::new()),
+        &Env::Inherit(if trust_once {
+            vec![("NEURON_TRUST_WORKSPACE".to_string(), "1".to_string())]
+        } else {
+            Vec::new()
+        }),
         move |line| {
             if let Some(session) = status_session(&line) {
                 if let Some(state) = lines.try_state::<AppState>() {
@@ -218,7 +228,7 @@ fn engine_start(
         .is_some()
         .then(|| lock(&state.session).clone())
         .flatten();
-    launch(&app, &state, resume)
+    launch(&app, &state, resume, false)
 }
 
 #[tauri::command]
@@ -227,9 +237,10 @@ fn engine_restart(
     state: State<'_, AppState>,
     resume: Option<String>,
     options: Option<LaunchOptions>,
+    trust_once: Option<bool>,
 ) -> Result<Started, String> {
     remember_options(&state, options);
-    launch(&app, &state, resume)
+    launch(&app, &state, resume, trust_once.unwrap_or(false))
 }
 
 /// Opens another folder: a new engine there, on a fresh chat or continuing
@@ -251,7 +262,7 @@ fn project_open(
     // Terminals belong to the old folder.
     terminals.close_all();
     *lock(&state.workspace) = workspace;
-    launch(&app, &state, resume)
+    launch(&app, &state, resume, false)
 }
 
 #[tauri::command]

@@ -43,8 +43,16 @@ export function UsagePanel({ account, onOpenLink }: { account: AccountView; onOp
       <p>
         Plan: <strong>{account.plan ?? (account.signedIn ? 'Zero-X' : 'Not signed in')}</strong>
       </p>
+      {account.suspended && (
+        <p className="error-line" role="alert">
+          This account is suspended. See your Zero-X dashboard.
+        </p>
+      )}
+      {account.usageError && <p className="muted">Today's usage could not be read: {account.usageError}</p>}
       {account.meters.length === 0 ? (
-        <p className="muted">{account.signedIn ? "Today's usage shows here once Zero-X reports it." : 'Sign in to Zero-X to see your usage.'}</p>
+        !account.usageError && (
+          <p className="muted">{account.signedIn ? "Today's usage shows here once Zero-X reports it." : 'Sign in to Zero-X to see your usage.'}</p>
+        )
       ) : (
         <ul className="meters">
           {account.meters.map((meter) => (
@@ -72,8 +80,8 @@ export function UsagePanel({ account, onOpenLink }: { account: AccountView; onOp
       {resets && <p className="muted small">Resets {resets}.</p>}
       {account.creditsUsd !== null && <p>Credit balance: ${account.creditsUsd.toFixed(2)}</p>}
       <div className="dialog-buttons start">
-        {account.plan !== 'Max' && <External label="Plans and pricing" url={LINKS.pricing} onOpen={onOpenLink} />}
-        <External label="Top up credits" url={LINKS.pricing} onOpen={onOpenLink} />
+        {account.plan !== 'Max' && <External label="Plans and pricing" url={account.pricingUrl ?? LINKS.pricing} onOpen={onOpenLink} />}
+        <External label="Top up credits" url={account.pricingUrl ?? LINKS.pricing} onOpen={onOpenLink} />
       </div>
     </section>
   )
@@ -158,7 +166,7 @@ export function SettingsPage({
                     </div>
                   </div>
                   <div className="dialog-buttons start">
-                    <External label="Manage your account" url={LINKS.account} onOpen={onOpenLink} />
+                    <External label="Manage your account" url={account.dashboardUrl ?? LINKS.account} onOpen={onOpenLink} />
                     <button className="danger" onClick={onSignOut}>
                       Sign out
                     </button>

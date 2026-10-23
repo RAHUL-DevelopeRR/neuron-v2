@@ -6,6 +6,7 @@
  */
 
 import type {
+  AccountDetails,
   AccountInfo,
   Attachment,
   DefinitionInfo,
@@ -20,6 +21,7 @@ import type {
   TodoItem,
   TokenCounts,
   TranscriptEntry,
+  TrustPreviewEvent,
   UiEvent,
 } from './protocol'
 import { gatewayProblem, type GatewayProblem } from './gateway'
@@ -106,6 +108,10 @@ export interface SessionState {
   restartRequired: boolean
   /** MCP servers, plugins, skills and agents, once asked for (feature `extensions`). */
   extensions: Extensions | null
+  /** The Zero-X account, from `account` events (feature `account`); `null` before one or when signed out. */
+  account: AccountDetails | null
+  /** What trusting the workspace would turn on, once asked for (feature `trust_preview`). */
+  trustPreview: TrustPreviewEvent | null
   models: ModelInfo[]
   /** The current turn (or slash command) has not finished. */
   busy: boolean
@@ -136,6 +142,8 @@ export const initialSession = (): SessionState => ({
   todos: [],
   restartRequired: false,
   extensions: null,
+  account: null,
+  trustPreview: null,
   models: [],
   busy: false,
   sessionStarting: false,
@@ -266,8 +274,9 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
         protocol: action.protocol,
         features: action.features ?? [],
         restartRequired: false,
-        // A restarted engine may load other servers and plugins.
+        // A restarted engine may load other servers and plugins, in another folder.
         extensions: null,
+        trustPreview: null,
         problem: null,
       }
     case 'status': {
@@ -401,9 +410,14 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
       return { ...state, sessions: action.sessions }
     case 'transcript':
       return restoreTranscript(state, action.session_id, action.entries, action.truncated)
+    case 'account':
+      return { ...state, account: action.signed_in ? action.account : null }
+    case 'trust_preview':
+      return { ...state, trustPreview: action }
     case 'workspace_trusted':
       return {
         ...state,
+        trustPreview: null,
         restartRequired: action.restart_required,
         status: state.status ? { ...state.status, workspace_trusted: true } : state.status,
       }

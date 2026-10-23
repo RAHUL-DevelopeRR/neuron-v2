@@ -38,7 +38,7 @@ export function hostPlatform(options: HostPlatformOptions): Platform {
     setLaunchOptions: () => {},
     connect() {
       connecting ??= (async () => {
-        controller = new SessionController(transport)
+        controller = new SessionController(transport, { client: 'desktop' })
         await controller.start()
         return controller
       })()

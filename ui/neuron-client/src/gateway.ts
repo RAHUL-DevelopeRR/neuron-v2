@@ -3,10 +3,12 @@
  * the quota to reset, try again shortly, or check the connection. UIs show a
  * card for each instead of the raw error.
  *
- * Engines with typed errors send `code`, `status`, `upgrade_url`, `resets_at`
- * and `retry_after_seconds` on the `error` event. Older ones send only the
- * message, so known phrases are recognised too.
+ * Engines with the `error_details` feature send a `detail` on the `error`
+ * event (`code`, `status`, `upgrade_url`, `resets_at`, `retry_after_seconds`).
+ * Older ones send only the message, so known phrases are recognised too.
  */
+
+import type { ErrorDetail } from './protocol'
 
 export type GatewayProblemKind = 'sign_in' | 'upgrade' | 'quota' | 'busy' | 'unreachable'
 
@@ -20,18 +22,16 @@ export interface GatewayProblem {
   retryAfterSeconds: number | null
 }
 
-/** The fields an `error` event may carry. */
+/** The fields an `error` event carries. */
 export interface ErrorFields {
   message: string
-  code?: unknown
-  status?: unknown
-  upgrade_url?: unknown
-  resets_at?: unknown
-  retry_after_seconds?: unknown
+  detail?: ErrorDetail | null
 }
 
 const BUSY_CODES = new Set(['rate_limited', 'capacity_exhausted', 'upstream_error', 'upstream_timeout', 'service_unavailable'])
 const SIGN_IN_CODES = new Set(['invalid_session', 'unauthorized', 'session_expired', 'sign_in_required'])
+/** The gateway could not be reached, or does not offer the call yet (a 404 from an older gateway). */
+const UNREACHABLE_CODES = new Set(['unreachable', 'not_available', 'network'])
 const QUOTA_CODES = new Set(['insufficient_quota', 'insufficient_credits'])
 
 const text = (value: unknown) => (typeof value === 'string' && value.trim() ? value.trim() : null)
@@ -43,7 +43,7 @@ function kindOf(code: string | null, status: number | null, message: string): Ga
     if (code === 'upgrade_required') return 'upgrade'
     if (QUOTA_CODES.has(code)) return 'quota'
     if (BUSY_CODES.has(code)) return 'busy'
-    if (code === 'network' || code === 'unreachable' || code === 'device_sign_in_unsupported') return 'unreachable'
+    if (UNREACHABLE_CODES.has(code)) return 'unreachable'
   }
   if (status === 401) return 'sign_in'
   if (status === 503) return 'busy'
@@ -71,14 +71,15 @@ function kindOf(code: string | null, status: number | null, message: string): Ga
 
 /** The problem behind an `error` event, or `null` for an error that is not about the gateway. */
 export function gatewayProblem(error: ErrorFields): GatewayProblem | null {
-  const kind = kindOf(text(error.code), number(error.status), error.message)
+  const detail = error.detail ?? null
+  const kind = kindOf(text(detail?.code), number(detail?.status), error.message)
   if (!kind) return null
-  const seconds = number(error.retry_after_seconds) ?? (kind === 'busy' ? retryHint(error.message) : null)
+  const seconds = number(detail?.retry_after_seconds) ?? (kind === 'busy' ? retryHint(error.message) : null)
   return {
     kind,
     message: error.message,
-    upgradeUrl: text(error.upgrade_url),
-    resetsAt: text(error.resets_at),
+    upgradeUrl: text(detail?.upgrade_url),
+    resetsAt: text(detail?.resets_at),
     retryAfterSeconds: seconds,
   }
 }

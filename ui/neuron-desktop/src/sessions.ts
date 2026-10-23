@@ -16,7 +16,7 @@ export type Badge = 'running' | 'terminal' | 'failed' | 'unread'
 
 export const BADGE_LABEL: Record<Badge, string> = {
   running: 'running',
-  terminal: 'running in the terminal',
+  terminal: 'open in the terminal',
   failed: 'failed',
   unread: 'unread',
 }
@@ -30,6 +30,8 @@ export interface SessionRow {
   project: Project
   current: boolean
   badge: Badge | null
+  /** What the badge says to a screen reader and in a tooltip. */
+  badgeLabel: string | null
 }
 
 export type GroupBy = 'project' | 'date' | 'status'
@@ -50,22 +52,18 @@ export interface SeenState {
 
 const projectName = (path: string) => path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || path
 
-/** A session's project: the one the engine names, else the open one. */
+/** A session's project: the folder the engine names (feature `session_scope`), else the open one. */
 export function projectOf(session: SessionSummary, open: Project | null): Project {
-  const named = (session as SessionSummary & { project?: unknown; cwd?: unknown }).project ?? (session as { cwd?: unknown }).cwd
-  if (typeof named === 'string' && named.trim()) return { name: projectName(named), path: named }
-  if (named && typeof named === 'object' && typeof (named as { path?: unknown }).path === 'string') {
-    const path = (named as { path: string }).path
-    const name = (named as { name?: unknown }).name
-    return { name: typeof name === 'string' && name ? name : projectName(path), path }
-  }
+  const path = session.project?.trim()
+  if (path) return { name: projectName(path), path }
   return open ?? { name: 'This project', path: '' }
 }
 
-/** Whether another process runs the session now (the engine's run status). */
-function runsElsewhere(session: SessionSummary): boolean {
-  const status = (session as SessionSummary & { run_status?: unknown }).run_status
-  return status === 'running' || status === 'open'
+/** "running in the terminal", "open in another window": another Neuron has the session. */
+function elsewhereLabel(session: SessionSummary): string | null {
+  if (session.run_status !== 'running' && session.run_status !== 'open') return null
+  const where = session.client === 'terminal' || !session.client ? 'in the terminal' : 'in another window'
+  return `${session.run_status} ${where}`
 }
 
 const samePath = (a: string, b: string) => a.replace(/[\\/]+$/, '').toLowerCase() === b.replace(/[\\/]+$/, '').toLowerCase()
@@ -80,12 +78,15 @@ export function sessionRows(
       const current = session.id === options.currentId
       const project = projectOf(session, options.open)
       const seenAt = options.seen.seen[session.id]
+      const elsewhere = current ? null : elsewhereLabel(session)
+      // The engine says when a session's last turn failed; this window also remembers its own.
+      const failed = session.failed ?? options.seen.failed[session.id] ?? false
       const badge: Badge | null =
         current && options.busy
           ? 'running'
-          : !current && runsElsewhere(session)
+          : elsewhere
             ? 'terminal'
-            : options.seen.failed[session.id]
+            : failed
               ? 'failed'
               : !current && seenAt !== undefined && session.updated_at_ms > seenAt
                 ? 'unread'
@@ -95,10 +96,11 @@ export function sessionRows(
         title: session.title?.trim() || (session.message_count === 0 ? 'New session' : 'Untitled session'),
         updatedAtMs: session.updated_at_ms,
         messageCount: session.message_count,
-        branch: session.branch,
+        branch: session.git_branch ?? session.branch,
         project,
         current,
         badge,
+        badgeLabel: badge === 'terminal' ? elsewhere : badge ? BADGE_LABEL[badge] : null,
       }
     })
 }

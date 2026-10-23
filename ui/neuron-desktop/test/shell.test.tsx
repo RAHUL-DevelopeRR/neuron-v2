@@ -8,7 +8,7 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import axe from 'axe-core'
 
-import { accountView, type ClientMessage, type UiEvent } from '@neuron/client'
+import { accountView, type AccountDetails, type ClientMessage, type ErrorDetail, type UiEvent } from '@neuron/client'
 
 import { App } from '../src/App'
 import { UsagePanel } from '../src/components/SettingsPage'
@@ -43,6 +43,38 @@ const sent = (engine: FakeEngine, type: string) =>
   engine.commands().filter((message): message is Command => message.kind === 'command' && message.type === type)
 
 const sidebar = () => screen.getByRole('navigation', { name: 'Neuron' })
+
+/** An `account` event's account, as the engine sends it. */
+function accountDetails(over: Partial<AccountDetails> = {}): AccountDetails {
+  return {
+    email: 'rahul@zero-x.live',
+    name: 'Rahul S',
+    plan: 'pro',
+    plan_name: 'Pro',
+    source: 'device',
+    expires_at: null,
+    limits: { requests: 200, tokens: 1_000_000 },
+    usage_today: { requests: 74, tokens: 120_000 },
+    resets_at: '2026-10-24T00:00:00Z',
+    credit_balance_cents: 450,
+    suspended: false,
+    dashboard_url: 'https://zero-x.live/dashboard',
+    pricing_url: 'https://zero-x.live/pricing?from=account',
+    usage_updated_at: 1_792_800_000,
+    usage_error: null,
+    ...over,
+  }
+}
+
+const detail = (over: Partial<ErrorDetail>): ErrorDetail => ({
+  code: 'unknown',
+  status: null,
+  upgrade_url: null,
+  resets_at: null,
+  retry_after_seconds: null,
+  ...over,
+})
+
 
 /** No serious or critical axe violations in `root` (contrast needs layout, which happy-dom has none of). */
 async function expectAccessible(root: Element = document.body) {
@@ -83,6 +115,7 @@ function threeProjects() {
 describe('D1–D4, D12: the sidebar', () => {
   test('three projects of four sessions: three headings, newest activity first', async () => {
     const { engine } = await start()
+    expect(sent(engine, 'list_sessions').at(-1)).toEqual({ kind: 'command', type: 'list_sessions', scope: 'all' })
     await emit(engine, { type: 'sessions', current: 'session-1', sessions: threeProjects() } as UiEvent)
     const list = within(sidebar()).getByRole('list', { name: 'On this device' })
     const headings = within(list)
@@ -122,11 +155,15 @@ describe('D1–D4, D12: the sidebar', () => {
   test('badges: running, in the terminal, unread after finishing elsewhere, failed', async () => {
     const { engine } = await start()
     const base = threeProjects()
-    // The terminal UI has neuron-1 open.
-    base[1] = { ...base[1], run_status: 'running' } as (typeof base)[number]
+    // The terminal UI runs neuron-1; another desktop window has neuron-2 open; neuron-3 failed in the terminal.
+    base[1] = { ...base[1], run_status: 'running', client: 'terminal' } as (typeof base)[number]
+    base[2] = { ...base[2], run_status: 'open', client: 'desktop' } as (typeof base)[number]
+    base[3] = { ...base[3], failed: true } as (typeof base)[number]
     await emit(engine, { type: 'sessions', current: 'session-1', sessions: base } as UiEvent)
     const row = (title: RegExp) => within(sidebar()).getByRole('button', { name: title })
     expect(row(/neuron task 1/).textContent).toContain('running in the terminal')
+    expect(row(/neuron task 2/).textContent).toContain('open in another window')
+    expect(row(/neuron task 3/).textContent).toContain('failed')
 
     // zero-x.live-0 finishes in the terminal while this window is elsewhere.
     const later = base.map((session) => (session.id === 'zero-x.live-0' ? { ...session, updated_at_ms: now } : session))
@@ -240,15 +277,7 @@ describe('D5–D7: the account row and menu', () => {
   })
 
   test('the usage page: bars, the reset time and credits', () => {
-    const account = accountView(true, null, {
-      email: 'rahul@zero-x.live',
-      name: 'Rahul S',
-      plan: 'pro',
-      limits: { requests_per_day: 200, tokens_per_day: 1_000_000 },
-      usage_today: { requests: 190, tokens: 120_000 },
-      resets_at: '2026-10-24T00:00:00Z',
-      credits_usd: 4.5,
-    })
+    const account = accountView(true, null, accountDetails({ usage_today: { requests: 190, tokens: 120_000 } }))
     const opened: string[] = []
     render(<UsagePanel account={account} onOpenLink={(url) => opened.push(url)} />)
     const bars = screen.getAllByRole('progressbar')
@@ -260,7 +289,7 @@ describe('D5–D7: the account row and menu', () => {
     expect(screen.getByText(/^Resets /)).toBeTruthy()
     expect(screen.getByText('Credit balance: $4.50')).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: /Top up credits/ }))
-    expect(opened).toEqual([LINKS.pricing])
+    expect(opened).toEqual(['https://zero-x.live/pricing?from=account'])
   })
 })
 
@@ -329,11 +358,20 @@ describe('D10: first run, and gateway errors as cards', () => {
   })
 
   const cases: Array<[string, Record<string, unknown>, string]> = [
-    ['401', { message: 'Session expired', status: 401 }, 'Sign in again'],
-    ['403 upgrade_required', { message: 'Pro only', code: 'upgrade_required', upgrade_url: 'https://zero-x.live/pricing?plan=pro' }, 'This needs a paid plan'],
-    ['429 insufficient_quota', { message: 'Daily quota reached', code: 'insufficient_quota', resets_at: '2026-10-24T00:00:00Z' }, "You've used today's quota"],
-    ['503', { message: 'Busy', status: 503, retry_after_seconds: 0 }, 'Zero-X is busy'],
-    ['a network error', { message: 'Could not reach Zero-X: connection refused' }, "Can't reach Zero-X right now"],
+    ['401', { message: 'Session expired', detail: detail({ code: 'invalid_session', status: 401 }) }, 'Sign in again'],
+    [
+      '403 upgrade_required',
+      { message: 'Pro only', detail: detail({ code: 'upgrade_required', status: 403, upgrade_url: 'https://zero-x.live/pricing?plan=pro' }) },
+      'This needs a paid plan',
+    ],
+    [
+      '429 insufficient_quota',
+      { message: 'Daily quota reached', detail: detail({ code: 'insufficient_quota', status: 429, resets_at: '2026-10-24T00:00:00Z' }) },
+      "You've used today's quota",
+    ],
+    ['503', { message: 'Busy', detail: detail({ code: 'service_unavailable', status: 503, retry_after_seconds: 0 }) }, 'Zero-X is busy'],
+    ['a network error', { message: 'Could not reach Zero-X: connection refused', detail: detail({ code: 'unreachable' }) }, "Can't reach Zero-X right now"],
+    ["an older engine's wording", { message: 'Could not reach Zero-X: connection refused' }, "Can't reach Zero-X right now"],
   ]
   for (const [what, error, title] of cases) {
     test(`${what}: its card, and the prompt stays in the message box`, async () => {
@@ -354,7 +392,7 @@ describe('D10: first run, and gateway errors as cards', () => {
         fireEvent.click(within(card).getByRole('button', { name: 'Sign in to Zero-X' }))
         expect(sent(engine, 'slash').at(-1)).toMatchObject({ command: 'login' })
       }
-      if (what === '503' || what === 'a network error') {
+      if (what === '503' || what === 'a network error' || what === "an older engine's wording") {
         fireEvent.click(within(card).getByRole('button', { name: /Try again|Retry/ }))
         expect(sent(engine, 'submit').map((message) => message.text)).toEqual(['refactor the parser', 'refactor the parser'])
       }
@@ -425,5 +463,85 @@ describe('D8, D11, D23: settings, the folder picker, version and updates', () =>
     // Escape goes back to the session.
     fireEvent.keyDown(window, { key: 'Escape' })
     expect(screen.getByLabelText('Message Neuron')).toBeTruthy()
+  })
+})
+
+describe('protocol v2: the account event and the trust preview', () => {
+  test("the account row and menu read the engine's account, and the usage page refreshes it", async () => {
+    const { engine, platform } = await start()
+    await emit(engine, { type: 'account', signed_in: true, account: accountDetails() })
+    const row = within(sidebar()).getByRole('button', { name: 'Account: Rahul S, Pro plan' })
+    expect(row.textContent).toContain('RS')
+    fireEvent.click(row)
+    const menu = screen.getByRole('menu', { name: 'Account' })
+    expect(within(menu).getByText('Pro · 37% of today used')).toBeTruthy()
+    fireEvent.click(within(menu).getByRole('menuitem', { name: /Plans and pricing/ }))
+    expect(platform.opened.at(-1)).toBe('https://zero-x.live/pricing?from=account')
+
+    fireEvent.click(within(sidebar()).getByRole('button', { name: /^Account:/ }))
+    fireEvent.click(screen.getByRole('menuitem', { name: /Usage and plan/ }))
+    await waitFor(() => expect(sent(engine, 'refresh_account')).toHaveLength(1))
+    expect(screen.getAllByRole('progressbar').map((bar) => bar.getAttribute('aria-valuenow'))).toEqual(['37', '12'])
+    expect(screen.getByText('Credit balance: $4.50')).toBeTruthy()
+
+    // A suspended account says so; signing out on the engine clears the row.
+    await emit(engine, { type: 'account', signed_in: true, account: accountDetails({ suspended: true }) })
+    expect(screen.getByRole('alert').textContent).toContain('suspended')
+    await emit(engine, { type: 'account', signed_in: false, account: null }, engine.status({ signed_in: false, account: null }))
+    expect(within(sidebar()).getByRole('button', { name: 'Sign in to Zero-X' })).toBeTruthy()
+  })
+
+  test('the trust dialog lists what the folder turns on, in the shared wording', async () => {
+    const { engine } = await start({ workspace_trusted: false })
+    await waitFor(() => expect(sent(engine, 'trust_preview')).toHaveLength(1))
+    await emit(engine, {
+      type: 'trust_preview',
+      cwd: '/work/app',
+      root: '/work/app',
+      is_git_root: true,
+      session_only: false,
+      trusted: false,
+      settings_files: ['/work/app/.neuron/settings.json'],
+      hooks: [
+        { event: 'PreToolUse', command: 'lint', source: '/work/app/.neuron/settings.json' },
+        { event: 'PostToolUse', command: 'fmt', source: '/work/app/.neuron/settings.json' },
+      ],
+      mcp_servers: [{ name: 'postgres-tools', transport: 'stdio', target: 'pg-mcp', source: '/work/app/.neuron/settings.json' }],
+      permission_rules: [{ effect: 'allow', rule: 'Bash(cargo test)', source: '/work/app/.neuron/settings.json' }],
+      other_settings: [],
+    })
+    const dialog = screen.getByRole('dialog', { name: 'Before Neuron works here' })
+    expect(within(dialog).getByText('(git root: this folder)')).toBeTruthy()
+    const list = within(dialog).getByRole('list', { name: 'What this folder turns on' })
+    expect(within(list).getAllByRole('listitem').map((item) => item.textContent)).toEqual([
+      '2 hooks that run commands around tool calls',
+      '1 MCP server: postgres-tools',
+      '1 permission rule from .neuron/settings.json',
+    ])
+    await expectAccessible()
+  })
+
+  test('the home folder is trusted for the next engine only', async () => {
+    const { engine, platform } = await start({ workspace_trusted: false, cwd: '/home/rahul' })
+    await waitFor(() => expect(sent(engine, 'trust_preview')).toHaveLength(1))
+    await emit(engine, {
+      type: 'trust_preview',
+      cwd: '/home/rahul',
+      root: '/home/rahul',
+      is_git_root: false,
+      session_only: true,
+      trusted: false,
+      settings_files: [],
+      hooks: [],
+      mcp_servers: [],
+      permission_rules: [],
+      other_settings: [],
+    })
+    const dialog = screen.getByRole('dialog', { name: 'Before Neuron works here' })
+    expect(within(dialog).getByText(/does not turn on any hooks/)).toBeTruthy()
+    expect(within(dialog).getByText(/for this session only/)).toBeTruthy()
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Allow Neuron in this folder' }))
+    await emit(engine, { type: 'workspace_trusted', cwd: '/home/rahul', restart_required: true, session_only: true, root: '/home/rahul' })
+    await waitFor(() => expect(platform.trustedOnce).toEqual([null]))
   })
 })

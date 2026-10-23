@@ -1,6 +1,6 @@
 import { forwardRef, useState, type ReactNode } from 'react'
 
-import { BADGE_LABEL, ago, filterRows, groupRows, type Badge, type GroupBy, type SessionRow } from '../sessions'
+import { ago, filterRows, groupRows, type Badge, type GroupBy, type SessionRow } from '../sessions'
 import type { Project } from '../platform'
 import { PixelLogo } from './PixelLogo'
 
@@ -52,13 +52,13 @@ function SessionButton({ row, disabled, onOpen }: { row: SessionRow; disabled: b
       aria-current={row.current ? 'true' : undefined}
       disabled={disabled}
       onClick={() => !row.current && onOpen(row)}
-      title={row.title}
+      title={row.badgeLabel ? `${row.title} (${row.badgeLabel})` : row.title}
     >
       <span className={`session-badge${row.badge ? ` badge-${row.badge}` : ''}`} aria-hidden>
         {row.badge ? BADGE_MARK[row.badge] : ''}
       </span>
       <span className="session-title">{row.title}</span>
-      {row.badge && <span className="sr-only">, {BADGE_LABEL[row.badge]}</span>}
+      {row.badgeLabel && <span className="sr-only">, {row.badgeLabel}</span>}
       <span className="session-age">{ago(row.updatedAtMs)}</span>
     </button>
   )

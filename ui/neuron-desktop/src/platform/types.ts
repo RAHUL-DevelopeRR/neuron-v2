@@ -93,8 +93,12 @@ export interface Platform {
   appVersion(): Promise<string | null>
   /** A newer release, if the update manifest names one. */
   checkForUpdate(): Promise<UpdateInfo | null>
-  /** A new engine on the same project, continuing `resume` (a session id). */
-  restart(resume: string | null): Promise<void>
+  /**
+   * A new engine on the same project, continuing `resume` (a session id).
+   * `trustOnce` trusts the folder for that engine only (the home folder, which
+   * is never recorded).
+   */
+  restart(resume: string | null, options?: { trustOnce?: boolean }): Promise<void>
   list(path: string): Promise<DirListing>
   read(path: string): Promise<FileContent>
   /** Workspace files whose path contains `query`, for `@` mentions. */

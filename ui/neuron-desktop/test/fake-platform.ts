@@ -10,7 +10,18 @@ import {
 import type { DirListing, FileContent, GitStatusView, LaunchOptions, Platform, Project, TerminalSession, UpdateInfo } from '../src/platform'
 import type { Settings } from '../src/settings'
 
-export const ALL_FEATURES = ['capabilities', 'sessions', 'trust_workspace', 'todos', 'subagents', 'extensions']
+export const ALL_FEATURES = [
+  'capabilities',
+  'sessions',
+  'trust_workspace',
+  'todos',
+  'subagents',
+  'extensions',
+  'account',
+  'error_details',
+  'session_scope',
+  'trust_preview',
+]
 
 /** An engine in memory: tests emit its events and read what the UI sent. */
 export class FakeEngine implements EngineTransport {
@@ -78,6 +89,8 @@ export const FILES: Record<string, string> = {
 export interface FakePlatform extends Platform {
   opened: string[]
   restarts: Array<string | null>
+  /** Restarts that trusted the folder for that engine only. */
+  trustedOnce: Array<string | null>
   openedProjects: string[]
   /** `[path, resume]` for each project opened. */
   projectOpens: Array<[string, string | null]>
@@ -106,6 +119,7 @@ export function fakePlatform(engine: FakeEngine, options: FakePlatformOptions = 
     can: { openProject: true, restart: true, terminal: false, git: true, pickFolder: true, updates: true },
     opened: [],
     restarts: [],
+    trustedOnce: [],
     openedProjects: [],
     projectOpens: [],
     launches: [],
@@ -144,7 +158,8 @@ export function fakePlatform(engine: FakeEngine, options: FakePlatformOptions = 
       platform.projectOpens.push([path, resume])
       project = { name: path.split('/').pop() ?? path, path }
     },
-    async restart(resume) {
+    async restart(resume, options) {
+      if (options?.trustOnce) platform.trustedOnce.push(resume)
       platform.restarts.push(resume)
     },
     async list(path: string): Promise<DirListing> {

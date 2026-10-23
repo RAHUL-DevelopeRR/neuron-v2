@@ -377,10 +377,12 @@ machine.
     newer version
   - keyboard and screen-reader basics: focus trapped and restored in dialogs, arrow keys in
     menus, named controls; axe-core checks in the test suite
-- **Waiting on the engine-protocol work (WP1):** the `account` event (name, limits, usage),
-  `list_sessions {scope: "all"}` with each session's project and run status, `trust_preview`
-  and typed gateway errors. Until then the desktop reads what today's engine sends: the email
-  and plan, this project's sessions, and the gateway's error wording.
+- **On engine protocol v2 (WP1):**
+  - the `account` event gives the row and menu the name, plan, today's usage and credits
+  - `list_sessions {scope: "all"}` lists every project's sessions, with where each runs
+  - `trust_preview` lists the hooks, MCP servers and rules in the trust dialog, worded by the shared `copy/trust.ts`
+  - typed error details pick the card
+  - engines without these features still work, from what they send
 - **Still to come:**
   - images
   - several sessions running at once

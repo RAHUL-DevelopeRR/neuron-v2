@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from 'react'
 
-import { BADGE_LABEL, ago, filterRows, groupRows, type GroupBy, type SessionRow } from '../sessions'
+import { ago, filterRows, groupRows, type GroupBy, type SessionRow } from '../sessions'
 import type { Project, UpdateInfo } from '../platform'
 
 function Page({ title, onClose, children, actions }: { title: string; onClose: () => void; children: ReactNode; actions?: ReactNode }) {
@@ -134,7 +134,7 @@ export function AllSessionsPage({
                   <span className="session-title">{row.title}</span>
                   <span className="muted small">
                     {row.project.name} · {ago(row.updatedAtMs)} · {row.messageCount} messages{row.branch ? ` · ⎇ ${row.branch}` : ''}
-                    {row.badge ? ` · ${BADGE_LABEL[row.badge]}` : ''}
+                    {row.badgeLabel ? ` · ${row.badgeLabel}` : ''}
                   </span>
                 </button>
               </li>

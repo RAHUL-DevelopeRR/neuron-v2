@@ -8,7 +8,6 @@ export const LINKS = {
   account: `${SITE}/dashboard`,
   download: `${SITE}/download`,
   help: `${SITE}/docs`,
-  trust: `${SITE}/docs/trust`,
   providerKeys: `${SITE}/docs/providers`,
   changelog: `${SITE}/changelog`,
 } as const

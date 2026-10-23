@@ -54,6 +54,7 @@ export function AccountMenu({
       <div className="menu-account" role="presentation">
         <div className="menu-email">{account.email ?? 'Zero-X account'}</div>
         {line && <div className="muted small">{line}</div>}
+        {account.suspended && <div className="error-line small">This account is suspended.</div>}
       </div>
       <div className="menu-separator" role="separator" />
       <button role="menuitem" className="menu-item" onClick={() => act('settings')}>
@@ -63,7 +64,7 @@ export function AccountMenu({
       <button role="menuitem" className="menu-item" onClick={() => act('usage')}>
         <span>Usage and plan</span>
       </button>
-      {account.plan !== 'Max' && <MenuLink label="Plans and pricing" href={LINKS.pricing} onOpen={open} />}
+      {account.plan !== 'Max' && <MenuLink label="Plans and pricing" href={account.pricingUrl ?? LINKS.pricing} onOpen={open} />}
       <MenuLink label="API keys" href={LINKS.apiKeys} onOpen={open} />
       <div className="menu-separator" role="separator" />
       <MenuLink label="Download Neuron" href={LINKS.download} onOpen={open} />
