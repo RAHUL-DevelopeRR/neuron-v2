@@ -32,6 +32,8 @@
 
 use super::*;
 use crate::device_login::{DeviceCode, DeviceLoginObserver};
+use crate::engine_account::{self, SharedAccountCache};
+use crate::error_detail::DetailedError;
 use neuron_tui::protocol::{
     AccountInfo, Attachment, DefinitionInfo, EngineCommand, GitStatus, McpServerInfo, ModelInfo,
     PermissionReply, PluginInfo, SessionRunStatus, SessionScope, SessionSummary, TokenCounts,
@@ -225,6 +227,7 @@ fn run_engine(
         let mut engine = Engine::new(cli, output, Sender::clone(events), replies, shared);
         engine.account_email = signed_out.email.take();
         engine.refresh_account();
+        engine.announce_account();
         if let Some(reference) = &signed_out.options.resume {
             match engine.continue_saved_session(reference) {
                 Ok(()) => engine.send_transcript(),
@@ -278,6 +281,15 @@ impl SignedOut<'_> {
             self.send(UiEvent::Notice { message: reason });
         }
         self.send_status();
+        self.send_account();
+    }
+
+    /// The login there is, if any (expired, or signed out): no session reads the account.
+    fn send_account(&self) {
+        self.send(engine_account::account_event(
+            &SharedAccountCache::default(),
+            self.email.as_deref(),
+        ));
     }
 
     /// Runs commands until a sign-in starts the provider (its model) or the engine stops.
@@ -293,7 +305,7 @@ impl SignedOut<'_> {
                         "exit" | "quit" => return None,
                         "login" => match self.login() {
                             Ok(model) => return Some(model),
-                            Err(message) => self.fail(&message),
+                            Err(error) => self.fail_with(error),
                         },
                         "logout" => {
                             crate::auth::logout();
@@ -336,7 +348,8 @@ impl SignedOut<'_> {
                     self.send_status();
                 }
                 EngineCommand::ListExtensions => self.send(extensions_event()),
-                EngineCommand::TrustPreview | EngineCommand::RefreshAccount => {
+                EngineCommand::RefreshAccount => self.send_account(),
+                EngineCommand::TrustPreview => {
                     self.send(UiEvent::error(
                         "This engine does not support that command yet.",
                     ));
@@ -347,20 +360,32 @@ impl SignedOut<'_> {
     }
 
     /// Signs in, then starts the provider the sign-in was missing for.
-    fn login(&mut self) -> Result<String, String> {
+    fn login(&mut self) -> Result<String, DetailedError> {
         let (_credential, email) = sign_in(self.events, self.shared)?;
         self.email = email;
-        match start_provider(&self.options.model).map_err(|error| error.to_string())? {
+        let plain = |message: String| DetailedError {
+            message,
+            detail: None,
+        };
+        match start_provider(&self.options.model).map_err(|error| plain(error.to_string()))? {
             ProviderStart::Ready(model) => Ok(model),
-            ProviderStart::SignInRequired(reason) => Err(reason),
+            ProviderStart::SignInRequired(reason) => Err(plain(reason)),
         }
     }
 
     /// Ends a refused or failed command: the error, `TurnFinished`, the footer.
     fn fail(&self, message: &str) {
-        self.send(UiEvent::Error {
+        self.fail_with(DetailedError {
             message: message.to_string(),
             detail: None,
+        });
+    }
+
+    /// [`Self::fail`] with what the failure needs from the user.
+    fn fail_with(&self, error: DetailedError) {
+        self.send(UiEvent::Error {
+            message: error.message,
+            detail: error.detail,
         });
         self.finish();
     }
@@ -393,7 +418,7 @@ impl SignedOut<'_> {
 fn sign_in(
     events: &Sender<UiEvent>,
     shared: &Shared,
-) -> Result<(crate::auth::GatewayCredential, Option<String>), String> {
+) -> Result<(crate::auth::GatewayCredential, Option<String>), DetailedError> {
     let cancel = CancellationToken::new();
     let running = RunningTurn::start(shared, None);
     running.watch(cancel.clone(), HookAbortSignal::new());
@@ -403,7 +428,7 @@ fn sign_in(
         &SignInObserver { events },
         &cancelled,
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| DetailedError::from_io(&error))
 }
 
 /// Shows the device code on the UI.
@@ -1114,6 +1139,8 @@ struct Engine {
     account: AccountState,
     /// The email the last sign-in in this engine reported.
     account_email: Option<String>,
+    /// The plan and usage `/api/account` reported, shared with the threads that read it.
+    account_cache: SharedAccountCache,
     /// The UI stopped listening.
     ui_closed: bool,
 }
@@ -1135,12 +1162,36 @@ impl Engine {
             last_permission_id: 0,
             account: AccountState::read(None),
             account_email: None,
+            account_cache: SharedAccountCache::default(),
             ui_closed: false,
         }
     }
 
     fn refresh_account(&mut self) {
         self.account = AccountState::read(self.account_email.as_deref());
+    }
+
+    /// The account as it is known now, then (with a login) again once `/api/account`
+    /// answered.
+    fn announce_account(&mut self) {
+        self.send_account();
+        self.read_account_in_background();
+    }
+
+    fn send_account(&mut self) {
+        let event =
+            engine_account::account_event(&self.account_cache, self.account_email.as_deref());
+        self.send(event);
+    }
+
+    /// Reads `/api/account` on a thread of its own; its account event follows. False
+    /// without a login.
+    fn read_account_in_background(&self) -> bool {
+        engine_account::refresh_in_background(
+            &self.account_cache,
+            &self.events,
+            self.account_email.clone(),
+        )
     }
 
     /// Runs queued commands until shutdown. A failure or panic in one command is reported
@@ -1224,7 +1275,12 @@ impl Engine {
                 self.send_status();
             }
             EngineCommand::ListExtensions => self.send(extensions_event()),
-            EngineCommand::TrustPreview | EngineCommand::RefreshAccount => {
+            EngineCommand::RefreshAccount => {
+                if !self.read_account_in_background() {
+                    self.send_account();
+                }
+            }
+            EngineCommand::TrustPreview => {
                 self.send(UiEvent::error(
                     "This engine does not support that command yet.",
                 ));
@@ -1251,11 +1307,12 @@ impl Engine {
         let prompt = try_resolve_bare_skill_prompt(&cwd, line).unwrap_or_else(|| line.to_string());
         let prompt = self.with_attachments(prompt, attachments);
         let input = self.wrap_for_mode(&prompt);
+        crate::error_detail::clear_model_call_failure();
         match self.run_turn(&input) {
             Ok((summary, usage)) => self.report_turn(&summary, usage),
             Err(message) => self.send(UiEvent::Error {
                 message,
-                detail: None,
+                detail: crate::error_detail::take_model_call_failure(),
             }),
         }
         self.finish_turn();
@@ -1343,6 +1400,10 @@ impl Engine {
             cumulative: token_counts(summary.usage),
             estimated: false,
         });
+        // The gateway's quota headers moved today's usage.
+        if engine_account::apply_quota_headers(&self.account_cache) {
+            self.send_account();
+        }
     }
 
     /// Runs `/<command> <args>` and ends it with [`UiEvent::TurnFinished`]. Commands that
@@ -1372,7 +1433,7 @@ impl Engine {
         if let Err(error) = result {
             self.send(UiEvent::Error {
                 message: error.to_string(),
-                detail: None,
+                detail: DetailedError::detail_of(error.as_ref()),
             });
         }
         self.finish_turn();
@@ -1441,6 +1502,7 @@ impl Engine {
     fn announce(&mut self) {
         self.send(ready_event());
         self.send_status();
+        self.announce_account();
         if !self.cli.runtime.session().messages.is_empty() {
             self.send_transcript();
         }
@@ -1476,6 +1538,8 @@ impl Engine {
         let (credential, email) = sign_in(&self.events, &self.shared)?;
         self.account_email = email;
         self.refresh_account();
+        engine_account::forget(&self.account_cache);
+        self.announce_account();
         let Some(active) = active_provider().filter(|active| active.id == ProviderId::ZeroX) else {
             self.notice(
                 "Signed in. This session uses another provider; restart neuron (or pass --provider zero-x) to use the Zero-X gateway.",
@@ -1506,6 +1570,8 @@ impl Engine {
         crate::auth::logout();
         self.account_email = None;
         self.refresh_account();
+        engine_account::forget(&self.account_cache);
+        self.send_account();
         if active_provider().is_some_and(|active| active.id == ProviderId::ZeroX) {
             self.notice("Requests in this session will fail until you run /login again.");
         }
@@ -1851,18 +1917,23 @@ mod tests {
         loop {
             match next_event(events) {
                 UiEvent::Notice { message } if message.contains(needle) => return message,
-                UiEvent::Notice { .. } | UiEvent::Status { .. } => {}
+                UiEvent::Notice { .. } | UiEvent::Status { .. } | UiEvent::Account { .. } => {}
                 other => panic!("expected a notice with {needle:?}, got {other:?}"),
             }
         }
     }
 
-    /// The events without notices and footer updates: the hooks are process-wide, so a test
-    /// running alongside may add notices of its own.
+    /// The events without notices, footer updates and account updates: the hooks are
+    /// process-wide, so a test running alongside may add notices of its own.
     fn without_notices(events: &[UiEvent]) -> Vec<UiEvent> {
         events
             .iter()
-            .filter(|event| !matches!(event, UiEvent::Notice { .. } | UiEvent::Status { .. }))
+            .filter(|event| {
+                !matches!(
+                    event,
+                    UiEvent::Notice { .. } | UiEvent::Status { .. } | UiEvent::Account { .. }
+                )
+            })
             .cloned()
             .collect()
     }
@@ -2048,6 +2119,14 @@ mod tests {
             }
             other => panic!("expected the footer status, got {other:?}"),
         };
+        // Then the account: there is no Zero-X login here, so nothing is read.
+        assert_eq!(
+            next_event(&engine.events),
+            UiEvent::Account {
+                signed_in: false,
+                account: None,
+            }
+        );
 
         // Notices from anywhere in the process reach the UI, as plain text.
         ui_hooks::notice("\n\x1b[33m!\x1b[0m engine-test notice\n");

@@ -106,6 +106,8 @@ pub const ENGINE_FEATURES: &[&str] = &[
     "subagents",
     // `list_extensions` and `extensions`.
     "extensions",
+    FEATURE_ERROR_DETAILS,
+    FEATURE_ACCOUNT,
 ];
 
 /// `report` events for the commands that show a report (`/usage`, `/init`, `/memory`,

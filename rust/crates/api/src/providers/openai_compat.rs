@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::{Debug, Formatter};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
@@ -384,6 +384,7 @@ impl OpenAiCompatClient {
         let response = self
             .send_with_retry(&request, &RetryProgress::new())
             .await?;
+        record_quota_headers(response.headers());
         let request_id = request_id_from_headers(response.headers());
         let body = response.text().await.map_err(ApiError::from)?;
         // Some backends return {"error":{"message":"...","type":"...","code":...}}
@@ -433,6 +434,7 @@ impl OpenAiCompatClient {
         let response = self
             .send_with_retry(&request.clone().with_streaming(), progress)
             .await?;
+        record_quota_headers(response.headers());
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
             response,
@@ -1844,6 +1846,43 @@ fn chat_completions_endpoint(base_url: &str) -> String {
         trimmed.to_string()
     } else {
         format!("{trimmed}/chat/completions")
+    }
+}
+
+/// What the Zero-X gateway said was left of today's quota on a reply
+/// (`x-neuron-quota-remaining-requests` and `x-neuron-quota-remaining-tokens`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuotaRemaining {
+    pub requests: Option<u64>,
+    pub tokens: Option<u64>,
+}
+
+static LAST_QUOTA_REMAINING: Mutex<Option<QuotaRemaining>> = Mutex::new(None);
+
+/// The quota the last reply that reported one said was left, in this process.
+#[must_use]
+pub fn last_quota_remaining() -> Option<QuotaRemaining> {
+    *LAST_QUOTA_REMAINING
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Keeps the quota a reply reports; a reply without the headers changes nothing.
+fn record_quota_headers(headers: &reqwest::header::HeaderMap) {
+    let read = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+    };
+    let quota = QuotaRemaining {
+        requests: read("x-neuron-quota-remaining-requests"),
+        tokens: read("x-neuron-quota-remaining-tokens"),
+    };
+    if quota != QuotaRemaining::default() {
+        *LAST_QUOTA_REMAINING
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(quota);
     }
 }
 
