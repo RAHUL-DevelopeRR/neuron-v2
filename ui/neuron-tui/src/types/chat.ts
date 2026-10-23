@@ -118,6 +118,11 @@ export type AskUserContentBlock = {
     otherText?: string
   }>
   skipped?: boolean
+  /**
+   * Set (possibly empty) on the engine's AskUserQuestion, which is answered
+   * in the input: how to answer ("Answer with 1-2 or in your own words.").
+   */
+  hint?: string
 }
 
 export type ImageContentBlock = {

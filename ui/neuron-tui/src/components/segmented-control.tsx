@@ -1,8 +1,12 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the corners
+// come from utils/ui-constants.ts (square in a classic Windows console
+// window). See ui/neuron-tui/PORTING.md.
 import React, { useState } from 'react'
 import stringWidth from 'string-width'
 
 import { Button } from './button'
 import { useTheme } from '../hooks/use-theme'
+import { BORDER_CHARS } from '../utils/ui-constants'
 
 import type { ChatTheme } from '../types/theme-system'
 
@@ -70,9 +74,9 @@ export const SegmentedControl = ({
           <React.Fragment key={seg.id}>
             {leftOfHovered ? (
               <box style={{ flexDirection: 'column', gap: 0 }}>
-                <text fg={seg.frameColor} selectable={false}>╭</text>
-                <text fg={seg.frameColor} selectable={false}>│</text>
-                <text fg={seg.frameColor} selectable={false}>╰</text>
+                <text fg={seg.frameColor} selectable={false}>{BORDER_CHARS.topLeft}</text>
+                <text fg={seg.frameColor} selectable={false}>{BORDER_CHARS.vertical}</text>
+                <text fg={seg.frameColor} selectable={false}>{BORDER_CHARS.bottomLeft}</text>
               </box>
             ) : null}
 
@@ -104,9 +108,9 @@ export const SegmentedControl = ({
 
             {rightOfHovered ? (
               <box style={{ flexDirection: 'column', gap: 0 }}>
-                <text fg={seg.frameColor} selectable={false}>╮</text>
-                <text fg={seg.frameColor} selectable={false}>│</text>
-                <text fg={seg.frameColor} selectable={false}>╯</text>
+                <text fg={seg.frameColor} selectable={false}>{BORDER_CHARS.topRight}</text>
+                <text fg={seg.frameColor} selectable={false}>{BORDER_CHARS.vertical}</text>
+                <text fg={seg.frameColor} selectable={false}>{BORDER_CHARS.bottomRight}</text>
               </box>
             ) : null}
           </React.Fragment>

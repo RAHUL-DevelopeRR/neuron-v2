@@ -1,6 +1,9 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the error
+// mark comes from utils/glyphs.ts. See ui/neuron-tui/PORTING.md.
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
 
+import { GLYPHS } from './glyphs'
 import { processImageFile, resolveFilePath, isImageFile } from './image-handler'
 import { useChatStore } from '../state/chat-store'
 import type { PendingAttachment } from '../types/store'
@@ -192,7 +195,7 @@ export async function validateAndAddImage(
   // Check if file exists
   if (!existsSync(resolvedPath)) {
     const error = 'file not found'
-    addPendingImageWithError(resolvedPath, `❌ ${error}`)
+    addPendingImageWithError(resolvedPath, `${GLYPHS.error} ${error}`)
     return { success: false, error }
   }
   
@@ -200,7 +203,7 @@ export async function validateAndAddImage(
   if (!isImageFile(resolvedPath)) {
     const ext = path.extname(imagePath).toLowerCase()
     const error = ext ? `unsupported format ${ext}` : 'unsupported format'
-    addPendingImageWithError(resolvedPath, `❌ ${error}`)
+    addPendingImageWithError(resolvedPath, `${GLYPHS.error} ${error}`)
     return { success: false, error }
   }
   

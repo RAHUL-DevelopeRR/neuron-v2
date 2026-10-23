@@ -1,8 +1,14 @@
 import { describe, expect, test } from 'bun:test'
 
 import { fitParts, footerParts, formatGit } from '../engine-footer'
-import { modelRows, visibleWindow } from '../model-picker'
-import { formatRemaining, signInView } from '../sign-in-panel'
+import {
+  fitModelRow,
+  modelRows,
+  truncateToWidth,
+  unavailableMessage,
+  visibleWindow,
+} from '../model-picker'
+import { formatRemaining, signInUrl, signInView } from '../sign-in-panel'
 
 import type { ModelsEvent, StatusEvent } from '../../engine/protocol'
 
@@ -69,11 +75,43 @@ describe('sign-in panel', () => {
   })
 
   test('asks for /login only in the signed-out stage', () => {
-    expect(signInView({ ...STATUS, session_id: '', signed_in: false }, null, 0)).toEqual({
-      kind: 'signed_out',
-    })
+    expect(
+      signInView({ ...STATUS, session_id: '', signed_in: false, account: null }, null, 0),
+    ).toEqual({ kind: 'signed_out', expired: false, email: null })
     expect(signInView({ ...STATUS, signed_in: false }, null, 0)).toBeNull()
     expect(signInView(STATUS, null, 0)).toBeNull()
+  })
+
+  test('a stored login that expired or was revoked asks to sign in again', () => {
+    // The engine reads a revoked login as signed in (it has not expired) but
+    // starts signed out with it.
+    const revoked: StatusEvent = {
+      ...STATUS,
+      session_id: '',
+      signed_in: true,
+      sign_in_required: true,
+      account: { email: 'ana@example.com', plan: 'free', source: 'stored login', expires_at: null },
+    }
+    expect(signInView(revoked, null, 0)).toEqual({
+      kind: 'signed_out',
+      expired: true,
+      email: 'ana@example.com',
+    })
+    // The footer no longer shows the plan as if it were usable.
+    expect(footerParts(revoked, null).map((part) => part.text)).toEqual([
+      'claude-sonnet-4-6',
+      'workspace-write',
+      'main +1 ~2',
+      'Zero-X session expired: /login',
+    ])
+  })
+
+  test('the sign-in link is a full https URL', () => {
+    expect(signInUrl('https://zero-x.live/device?code=AB')).toBe('https://zero-x.live/device?code=AB')
+    expect(signInUrl('zero-x.live/device')).toBe('https://zero-x.live/device')
+    expect(signInView(null, { ...signIn, url: 'zero-x.live/device' }, 1_000)).toMatchObject({
+      url: 'https://zero-x.live/device',
+    })
   })
 
   test('formats the countdown as m:ss', () => {
@@ -92,6 +130,7 @@ describe('model picker', () => {
         available: true,
         current: true,
         marker: null,
+        unavailableReason: null,
       },
       {
         id: 'zx-big',
@@ -100,9 +139,53 @@ describe('model picker', () => {
         available: false,
         current: false,
         marker: null,
+        unavailableReason: 'Pro plan only',
       },
     ])
     expect(modelRows(null)).toEqual([])
+  })
+
+  test('Enter on a model that cannot be picked says why', () => {
+    const [, big] = modelRows(MODELS)
+    expect(unavailableMessage(big!)).toBe("Big can't be picked: Pro plan only.")
+    const blurred = modelRows(
+      {
+        ...MODELS,
+        models: [
+          { ...MODELS.models[0]!, status: 'blurred', available_again_at: '2026-10-21T13:20:00Z' },
+        ],
+      },
+      Date.parse('2026-10-21T10:00:00Z'),
+    )[0]!
+    expect(unavailableMessage(blurred)).toBe(
+      "Fast can't be picked: the gateway took it out of rotation; back in 3h 20m.",
+    )
+  })
+
+  test('long rows end in an ellipsis: the detail gives way first, then the name', () => {
+    const [fast] = modelRows(MODELS)
+    // "Fast  (current)  zx-fast · 131.1K context · free" is 49 columns.
+    expect(fitModelRow(fast!, 60)).toEqual({
+      label: 'Fast',
+      current: '  (current)',
+      marker: '',
+      detail: '  zx-fast · 131.1K context · free',
+    })
+    expect(fitModelRow(fast!, 30)).toEqual({
+      label: 'Fast',
+      current: '  (current)',
+      marker: '',
+      detail: '  zx-fast · 13…',
+    })
+    const long = { ...fast!, label: 'A very long model display name indeed' }
+    expect(fitModelRow(long, 20)).toEqual({
+      label: 'A very l…',
+      current: '  (current)',
+      marker: '',
+      detail: '',
+    })
+    expect(truncateToWidth('abcdef', 4)).toBe('abc…')
+    expect(truncateToWidth('abc', 4)).toBe('abc')
   })
 
   test('the current model matches with the engine’s openai/ wire prefix too', () => {
@@ -203,7 +286,7 @@ describe('engine footer', () => {
       { ...STATUS, workspace_trusted: false, git: null, signed_in: false, plan_mode: true },
       null,
     )
-    expect(parts).toEqual([
+    expect(parts.map(({ text, tone }) => ({ text, tone }))).toEqual([
       { text: 'claude-sonnet-4-6', tone: 'normal' },
       { text: 'workspace-write · plan', tone: 'muted' },
       { text: 'untrusted folder', tone: 'warning' },
@@ -213,13 +296,43 @@ describe('engine footer', () => {
     expect(footerParts(null, null)).toEqual([])
   })
 
-  test('parts that do not fit are dropped from the end', () => {
+  test('the signed-in account shows its email after the plan', () => {
+    const parts = footerParts(
+      { ...STATUS, account: { ...STATUS.account!, email: 'ana@example.com' } },
+      null,
+    )
+    expect(parts.map((part) => part.text).slice(-2)).toEqual(['Zero-X pro', 'ana@example.com'])
+  })
+
+  test('parts that do not fit are dropped, least important first', () => {
     const parts = footerParts(STATUS, null)
-    // "claude-sonnet-4-6 · workspace-write" is 35 columns.
+    // "claude-sonnet-4-6 · Zero-X pro" is 30 columns: the plan stays before the mode.
     expect(fitParts(parts, 35).map((part) => part.text)).toEqual([
       'claude-sonnet-4-6',
-      'workspace-write',
+      'Zero-X pro',
     ])
     expect(fitParts(parts, 5)).toEqual([])
+  })
+
+  test('at 120 columns with the token counters the plan stays and the email goes', () => {
+    const status: StatusEvent = {
+      ...STATUS,
+      model: 'nvidia/nvidia/nemotron-3-ultra-550b-a55b',
+      workspace_trusted: false,
+      git: { branch: 'feature/long-branch-name', changed: 4, staged: 1, unstaged: 2, untracked: 1, conflicted: 0 },
+      account: { ...STATUS.account!, plan: 'free', email: 'someone.long@example.com' },
+    }
+    const usage = {
+      turn: { input: 10, output: 5, cache_read: 0, cache_write: 0 },
+      cumulative: { input: 19_100, output: 646, cache_read: 0, cache_write: 0 },
+      estimated: false,
+    }
+    // The footer box draws in the width less its 2 columns of padding.
+    const shown = fitParts(footerParts(status, usage), 118).map((part) => part.text)
+    expect(shown).toContain('Zero-X free')
+    expect(shown).toContain('↑19.1K ↓646')
+    expect(shown).not.toContain('someone.long@example.com')
+    // In their own order.
+    expect(shown.at(-1)).toBe('Zero-X free')
   })
 })

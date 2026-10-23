@@ -4,18 +4,46 @@
  * tool renderers draw a Neuron turn the way they drew a Codebuff run.
  *
  * Events outside the transcript (status, usage, permission requests, notices)
- * are handled once, globally, by ./engine-session.ts.
+ * are handled once, globally, by ./engine-session.ts. Two notices also change
+ * the turn's message: an AskUserQuestion is drawn in it (./questions.ts), and
+ * a retry of the model call drops what the failed attempt streamed.
  */
 
+import { useEngineStore } from '../state/engine-store'
+import { closeNativeReasoningBlock } from '../utils/block-operations'
 import {
   createEventHandler,
   createStreamChunkHandler,
   type EventHandlerState,
   type ToolResultWithStatus,
 } from '../utils/sdk-event-handlers'
+import { isRetryNotice } from './engine-session'
+import {
+  QUESTION_PREFIX,
+  engineQuestionBlock,
+  insertQuestionBlock,
+  markUnansweredQuestions,
+} from './questions'
 import { NO_RESULT_MESSAGE, mapToolCall, mapToolResult } from './tool-mapping'
 
+import type { ContentBlock } from '../types/chat'
 import type { UiEvent } from './protocol'
+
+/**
+ * The blocks without the text and reasoning a failed attempt of the model
+ * call streamed: those after `attemptStart`, where the attempt began (the
+ * turn's start, or its last tool call, result or question). The engine sends
+ * the request again, and the next attempt streams them anew.
+ */
+export function dropFailedAttempt(
+  blocks: ContentBlock[],
+  attemptStart: number,
+): ContentBlock[] {
+  const kept = blocks.filter(
+    (block, index) => index < attemptStart || block.type !== 'text',
+  )
+  return kept.length === blocks.length ? blocks : kept
+}
 
 export interface TurnEventSink {
   handle(event: UiEvent): void
@@ -47,6 +75,37 @@ export function createTurnEventSink(state: EventHandlerState): TurnEventSink {
   const separateTextBlocks = () => {
     textBlockEnded = false
     textTail = ''
+  }
+
+  const updater = state.message.updater
+  /**
+   * How many blocks the message had when the current attempt of the model
+   * call began. Read in the updater's order, so it counts the blocks of the
+   * events before it even while updates are batched.
+   */
+  let attemptStart = 0
+  const markAttemptStart = () =>
+    updater.updateAiMessage((message) => {
+      attemptStart = message.blocks?.length ?? 0
+      return message
+    })
+
+  let questionCount = 0
+  const showQuestion = (message: string) => {
+    separateTextBlocks()
+    // In place of the AskUserQuestion row: the question comes from the call
+    // that is running, the last one still open.
+    const asking = open[open.length - 1]
+    questionCount += 1
+    const toolCallId = asking?.id ?? `question-${questionCount}`
+    const block = engineQuestionBlock(message, toolCallId)
+    updater.updateAiMessageBlocks((blocks) =>
+      insertQuestionBlock(closeNativeReasoningBlock(blocks), block),
+    )
+    markAttemptStart()
+    useEngineStore
+      .getState()
+      .setPendingQuestionTarget({ messageId: state.message.aiMessageId, toolCallId })
   }
 
   const close = (call: OpenCall, output: string, isError: boolean) => {
@@ -120,6 +179,7 @@ export function createTurnEventSink(state: EventHandlerState): TurnEventSink {
           } else {
             open.push(call)
           }
+          markAttemptStart()
           return
         }
         case 'tool_result': {
@@ -136,6 +196,25 @@ export function createTurnEventSink(state: EventHandlerState): TurnEventSink {
           }
           const [call] = open.splice(index, 1)
           close(call!, event.output, event.is_error)
+          markAttemptStart()
+          return
+        }
+        case 'notice': {
+          if (state.isActive?.() === false) return
+          if (event.message.startsWith(QUESTION_PREFIX)) {
+            showQuestion(event.message)
+            return
+          }
+          if (isRetryNotice(event.message)) {
+            // The engine sends the model call again; what this attempt
+            // streamed would run on into the next one ("...no extra
+            // text.The user asks: ..."). The notice itself goes above the
+            // turn's message (engine-session.ts).
+            separateTextBlocks()
+            updater.updateAiMessageBlocks((blocks) =>
+              dropFailedAttempt(blocks, attemptStart),
+            )
+          }
           return
         }
         default:
@@ -144,6 +223,8 @@ export function createTurnEventSink(state: EventHandlerState): TurnEventSink {
     },
     finish() {
       for (const call of open.splice(0)) close(call, NO_RESULT_MESSAGE, true)
+      // An interrupted turn leaves its question unanswered.
+      if (questionCount > 0) updater.updateAiMessageBlocks(markUnansweredQuestions)
     },
   }
 }

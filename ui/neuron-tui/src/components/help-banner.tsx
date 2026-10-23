@@ -11,7 +11,8 @@ const SECTIONS = [
     title: 'Compose',
     rows: [
       ['/', 'Commands'],
-      ['@files', 'Mention files'],
+      // `@path` puts the path in the prompt; the agent reads the file if it needs it.
+      ['@file', "Insert a file's path"],
       ['/login', 'Sign in to Zero-X'],
       ['Ctrl+J', 'New line'],
       ['Opt+Enter', 'New line'],

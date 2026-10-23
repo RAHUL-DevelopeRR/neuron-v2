@@ -104,7 +104,10 @@ async function main(): Promise<void> {
     engine: engineFlags,
   } = parseArgs()
 
-  await initializeApp({ cwd })
+  await initializeApp({
+    cwd,
+    continueChat: continueChat ? { chatId: continueId ?? null } : null,
+  })
 
   // Show project picker only when user starts at the home directory or an ancestor
   const projectRoot = getProjectRoot()

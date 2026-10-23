@@ -9,6 +9,7 @@ import { failureLabel, useToolFailure } from './tools/tool-call-item'
 import { useTerminalDimensions } from '../hooks/use-terminal-dimensions'
 import { useTheme } from '../hooks/use-theme'
 import { formatTimeout } from '../utils/format-timeout'
+import { GLYPHS } from '../utils/glyphs'
 import { getLastNVisualLines } from '../utils/text-layout'
 
 interface TerminalCommandDisplayProps {
@@ -79,7 +80,7 @@ export const TerminalCommandDisplay = ({
         </span>
       )}
       {failure ? (
-        <span fg={theme.error}>{`  ✗ ${failureLabel(failure)}`}</span>
+        <span fg={theme.error}>{`  ${GLYPHS.cross} ${failureLabel(failure)}`}</span>
       ) : null}
     </text>
   )

@@ -29,6 +29,7 @@ import { createStreamController } from './stream-state'
 import { useChatStore } from '../state/chat-store'
 import { useEngineStore } from '../state/engine-store'
 import { createEventHandlerState } from '../utils/create-event-handler-state'
+import { GLYPHS } from '../utils/glyphs'
 import { logger } from '../utils/logger'
 import { clearActiveRun, registerActiveRun } from '../utils/active-run'
 import {
@@ -362,7 +363,7 @@ export const useSendMessage = ({
         setMessages((prev) => [
           ...prev,
           createErrorChatMessage(
-            '⚠️ Failed to prepare message. Please try again.',
+            `${GLYPHS.warning} Failed to prepare message. Please try again.`,
           ),
         ])
         finishPreflight()
@@ -401,7 +402,7 @@ export const useSendMessage = ({
         setMessages((prev) => [
           ...prev,
           createErrorChatMessage(
-            '⚠️ Validation failed unexpectedly. Please try again.',
+            `${GLYPHS.warning} Validation failed unexpectedly. Please try again.`,
           ),
         ])
         await yieldToEventLoop()
@@ -495,7 +496,7 @@ export const useSendMessage = ({
         }
         turnSink = createTurnEventSink(eventHandlerState)
         const sink = turnSink
-        setEngineTurnActive(true)
+        setEngineTurnActive(true, aiMessageId)
         // Files and text are inlined into the prompt (as Freebuff did);
         // images go as attachments (see engine/attachments.ts).
         const outcome = await runTurn(

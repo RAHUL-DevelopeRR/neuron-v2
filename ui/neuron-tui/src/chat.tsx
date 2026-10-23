@@ -61,6 +61,7 @@ import { useMessageBlockStore } from './state/message-block-store'
 import { stopActiveRun } from './utils/active-run'
 import { showClipboardMessage } from './utils/clipboard'
 import { readClipboardImage } from './utils/clipboard-image'
+import { GLYPHS } from './utils/glyphs'
 import { getSystemMessage } from './utils/message-history'
 import { getInputModeConfig } from './utils/input-modes'
 import {
@@ -780,8 +781,9 @@ export const Chat = ({
   }, [askUserState, inputRef])
 
   const handleSubmit = useCallback(async () => {
-    // Update terminal title with truncated user input
-    if (inputValue.trim()) {
+    // Update terminal title with truncated user input. A slash command
+    // (`/login`) does not say what the chat is about.
+    if (inputValue.trim() && !inputValue.trim().startsWith('/')) {
       setTerminalTitle(inputValue)
     }
     const result = await onSubmitPrompt(inputValue, agentMode)
@@ -1408,7 +1410,7 @@ export const Chat = ({
                   })
                   // Show temporary status message
                   showClipboardMessage(
-                    `📋 Pasted text (${pastedText.length.toLocaleString()} chars)`,
+                    `${GLYPHS.pastedText} Pasted text (${pastedText.length.toLocaleString()} chars)`,
                     { durationMs: 5000 },
                   )
                 },

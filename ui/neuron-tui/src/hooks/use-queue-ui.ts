@@ -3,7 +3,7 @@
 import { pluralize } from '@neuron-tui/common/util/string'
 import { useMemo } from 'react'
 
-
+import { GLYPHS } from '../utils/glyphs'
 import { formatQueuedPreview } from '../utils/helpers'
 
 import type { QueuedMessage } from './use-message-queue'
@@ -42,12 +42,12 @@ export const useQueueUi = ({
         Math.max(30, separatorWidth - 20),
       )
     } else if (queuePaused && queuedCount > 0) {
-      preview = `⏸ ${pluralize(queuedCount, 'message')} queued — your next message sends first`
+      preview = `${GLYPHS.paused} ${pluralize(queuedCount, 'message')} queued — your next message sends first`
     }
 
     if (!preview) return undefined
-    if (terminalWidth < HINT_MIN_WIDTH) return ` ▸ ${preview} `
-    return ` ▸ ${preview}   click to expand `
+    if (terminalWidth < HINT_MIN_WIDTH) return ` ${GLYPHS.collapsed} ${preview} `
+    return ` ${GLYPHS.collapsed} ${preview}   click to expand `
   }, [
     shouldShowQueuePreview,
     queuePaused,

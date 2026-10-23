@@ -1,3 +1,6 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: its icons
+// come from utils/glyphs.ts (console-safe in a classic Windows console
+// window). See ui/neuron-tui/PORTING.md.
 import { TextAttributes } from '@opentui/core'
 import React, { useCallback, useState } from 'react'
 
@@ -5,6 +8,7 @@ import { Clickable } from './clickable'
 import { useTheme } from '../hooks/use-theme'
 import { useTimeout } from '../hooks/use-timeout'
 import { copyTextToClipboard } from '../utils/clipboard'
+import { GLYPHS } from '../utils/glyphs'
 
 import type { ReactNode } from 'react'
 
@@ -52,11 +56,11 @@ export function useCopyToClipboard(text: string): {
 }
 
 /** Icon shown in collapsed state */
-export const COPY_ICON_COLLAPSED = '⎘'
+export const COPY_ICON_COLLAPSED = GLYPHS.copy
 /** Text shown when hovering */
-export const COPY_ICON_EXPANDED = '[⎘ copy]'
+export const COPY_ICON_EXPANDED = GLYPHS.copyHover
 /** Text shown after copying */
-export const COPY_ICON_COPIED = '[✔ copied]'
+export const COPY_ICON_COPIED = GLYPHS.copied
 
 /**
  * Get the text to display for the copy icon based on state.

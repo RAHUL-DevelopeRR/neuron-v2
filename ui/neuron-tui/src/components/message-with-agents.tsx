@@ -14,6 +14,7 @@ import { useChatStore } from '../state/chat-store'
 import { useMessageBlockStore } from '../state/message-block-store'
 import { splitByAgentSize } from '../utils/block-processor'
 import { getCliEnv } from '../utils/env'
+import { GLYPHS } from '../utils/glyphs'
 import {
   AGENT_CONTENT_HORIZONTAL_PADDING,
   MAX_AGENT_DEPTH,
@@ -435,7 +436,9 @@ const AgentMessage = memo(
               onClick={handleTitleClick}
             >
               <text style={{ wrapMode: 'word' }}>
-                <span fg={theme?.foreground}>{isCollapsed ? '▸ ' : '▾ '}</span>
+                <span fg={theme?.foreground}>
+                  {`${isCollapsed ? GLYPHS.collapsed : GLYPHS.expanded} `}
+                </span>
                 <span fg={theme?.foreground} attributes={TextAttributes.BOLD}>
                   {agentInfo.agentName}
                 </span>

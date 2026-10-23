@@ -1,5 +1,9 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the icons'
+// corners come from utils/ui-constants.ts (square in a classic Windows console
+// window). See ui/neuron-tui/PORTING.md.
 import { AttachmentCard } from './attachment-card'
 import { useTheme } from '../hooks/use-theme'
+import { BORDER_CHARS } from '../utils/ui-constants'
 
 import type { FileAttachment } from '../types/chat'
 import type { PendingFileAttachment } from '../types/store'
@@ -7,16 +11,23 @@ import type { PendingFileAttachment } from '../types/store'
 const FILE_CARD_WIDTH = 20
 const MAX_FILENAME_LENGTH = 16
 
+const {
+  topLeft: TL,
+  topRight: TR,
+  bottomLeft: BL,
+  bottomRight: BR,
+} = BORDER_CHARS
+
 const FILE_ICON_LINES = [
-  '   ┌───╮',
+  `   ┌───${TR}`,
   '   │ ≡ │',
-  '   └───╯',
+  `   └───${BR}`,
 ]
 
 const FOLDER_ICON_LINES = [
-  '  ╭──╮   ',
-  '  │  ╰──╮',
-  '  ╰─────╯',
+  `  ${TL}──${TR}   `,
+  `  │  ${BL}──${TR}`,
+  `  ${BL}─────${BR}`,
 ]
 
 const truncateFilename = (filename: string): string => {

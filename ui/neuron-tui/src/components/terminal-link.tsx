@@ -1,3 +1,6 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: a link can
+// keep its https:// and be an OSC 8 hyperlink (`href`), which terminals that
+// support it open on click. See ui/neuron-tui/PORTING.md.
 import React, { useCallback, useMemo, useState } from 'react'
 
 import { Button } from './button'
@@ -17,6 +20,13 @@ export interface TerminalLinkProps {
   containerStyle?: Record<string, unknown>
   lineWrap?: boolean
   inline?: boolean
+  /** Show the scheme (`https://`); it is dropped by default. */
+  keepScheme?: boolean
+  /**
+   * Make the text an OSC 8 hyperlink to this URL. OpenTUI writes it only to
+   * terminals that support hyperlinks.
+   */
+  href?: string
 }
 
 const defaultFormatLines: FormatLinesFn = (text) => [text]
@@ -34,6 +44,8 @@ export const TerminalLink: React.FC<TerminalLinkProps> = ({
   containerStyle,
   lineWrap = false,
   inline = false,
+  keepScheme = false,
+  href,
 }) => {
   const theme = useTheme()
 
@@ -44,7 +56,7 @@ export const TerminalLink: React.FC<TerminalLinkProps> = ({
 
   const displayLines = useMemo(() => {
     let displayText = text.trim()
-    for (const prefix of PREFIXES_TO_STRIP) {
+    for (const prefix of keepScheme ? [] : PREFIXES_TO_STRIP) {
       if (displayText.startsWith(prefix)) {
         displayText = displayText.slice(prefix.length)
       }
@@ -55,7 +67,7 @@ export const TerminalLink: React.FC<TerminalLinkProps> = ({
       return formatted
     }
     return formatted.filter((line) => line.trim().length > 0)
-  }, [formatLines, maxWidth, text])
+  }, [formatLines, keepScheme, maxWidth, text])
 
   const displayColor = isActive ? linkActiveColor : linkColor
   const shouldUnderline = underlineOnHover && isHovered
@@ -86,9 +98,10 @@ export const TerminalLink: React.FC<TerminalLinkProps> = ({
     >
       {displayLines.map((line: string, index: number) => {
         const coloredText = <span fg={displayColor}>{line}</span>
+        const styled = shouldUnderline ? <u>{coloredText}</u> : coloredText
         return (
           <text key={index} style={{ wrapMode: lineWrap ? 'word' : 'none' }}>
-            {shouldUnderline ? <u>{coloredText}</u> : coloredText}
+            {href ? <a href={href}>{styled}</a> : styled}
           </text>
         )
       })}

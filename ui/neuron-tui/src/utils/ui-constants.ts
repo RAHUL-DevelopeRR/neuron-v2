@@ -1,3 +1,8 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the border
+// characters come from utils/glyphs.ts, so a classic Windows console window
+// gets square corners. See ui/neuron-tui/PORTING.md.
+import { BORDERS } from './glyphs'
+
 import type { BorderCharacters } from '@opentui/core'
 
 /**
@@ -9,61 +14,14 @@ import type { BorderCharacters } from '@opentui/core'
  */
 export const INVERTED_CTA_FG = '#10131a'
 
-export const BORDER_CHARS: BorderCharacters = {
-  topLeft: '╭',
-  topRight: '╮',
-  bottomLeft: '╰',
-  bottomRight: '╯',
-  horizontal: '─',
-  vertical: '│',
-  topT: '┬',
-  bottomT: '┴',
-  leftT: '├',
-  rightT: '┤',
-  cross: '┼',
-}
+/** Rounded corners (square in a classic Windows console). */
+export const BORDER_CHARS: BorderCharacters = BORDERS.rounded
 
 /** Dashed border characters with rounded corners for ghost/ephemeral UI */
-export const DASHED_BORDER_CHARS: BorderCharacters = {
-  topLeft: '╭',
-  topRight: '╮',
-  bottomLeft: '╰',
-  bottomRight: '╯',
-  horizontal: '┄',
-  vertical: '┆',
-  topT: '┬',
-  bottomT: '┴',
-  leftT: '├',
-  rightT: '┤',
-  cross: '┼',
-}
+export const DASHED_BORDER_CHARS: BorderCharacters = BORDERS.dashed
 
 /** Square corner border for image cards (separate from the rounded default) */
-export const IMAGE_CARD_BORDER_CHARS: BorderCharacters = {
-  horizontal: '─',
-  vertical: '│',
-  topLeft: '┌',
-  topRight: '┐',
-  bottomLeft: '└',
-  bottomRight: '┘',
-  topT: '┬',
-  bottomT: '┴',
-  leftT: '├',
-  rightT: '┤',
-  cross: '┼',
-}
+export const IMAGE_CARD_BORDER_CHARS: BorderCharacters = BORDERS.square
 
 /** Dashed border with rounded corners for proposal cards */
-export const PROPOSAL_BORDER_CHARS: BorderCharacters = {
-  topLeft: '╭',
-  topRight: '╮',
-  bottomLeft: '╰',
-  bottomRight: '╯',
-  horizontal: '┈',
-  vertical: '┊',
-  topT: '┬',
-  bottomT: '┴',
-  leftT: '├',
-  rightT: '┤',
-  cross: '┼',
-}
+export const PROPOSAL_BORDER_CHARS: BorderCharacters = BORDERS.dotted

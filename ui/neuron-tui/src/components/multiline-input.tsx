@@ -18,6 +18,7 @@ import {
 import { InputCursor } from './input-cursor'
 import { useTheme } from '../hooks/use-theme'
 import { useChatStore } from '../state/chat-store'
+import { GLYPHS } from '../utils/glyphs'
 import {
   getKeypadPrintableSequence,
   isKeypadEnter,
@@ -93,7 +94,7 @@ function findNextWordBoundary(text: string, cursor: number): number {
   return pos
 }
 
-export const CURSOR_CHAR = '▍'
+export const CURSOR_CHAR = GLYPHS.cursor
 const CONTROL_CHAR_REGEX = /[\u0000-\u0008\u000b-\u000c\u000e-\u001f\u007f]/
 const TAB_WIDTH = 4
 

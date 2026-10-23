@@ -1,11 +1,13 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: a tool
 // result the engine marked an error draws as a failure (✗, error colour,
-// "failed" or "refused" and the reason). See ui/neuron-tui/PORTING.md.
+// "failed" or "refused" and the reason). Its markers come from
+// utils/glyphs.ts. See ui/neuron-tui/PORTING.md.
 import { TextAttributes } from '@opentui/core'
 import React, { createContext, useContext, type ReactNode } from 'react'
 import stringWidth from 'string-width'
 
 import { useTheme } from '../../hooks/use-theme'
+import { GLYPHS } from '../../utils/glyphs'
 import { Button } from '../button'
 
 import type { ChatTheme } from '../../types/theme-system'
@@ -209,7 +211,7 @@ export const SimpleToolCallItem = ({
 }: SimpleToolCallItemProps) => {
   const theme = useTheme()
   const failure = useToolFailure()
-  const bulletChar = failure ? '✗ ' : '• '
+  const bulletChar = failure ? `${GLYPHS.cross} ` : '• '
   const accent = failure ? theme.error : theme.foreground
 
   const row = (
@@ -261,8 +263,10 @@ export const ToolCallItem = ({
   }
 
   const isExpanded = !isCollapsed
-  const bulletChar = failure ? '✗ ' : '• '
-  const toggleIndicator = onToggle ? (isCollapsed ? '▸ ' : '▾ ') : ''
+  const bulletChar = failure ? `${GLYPHS.cross} ` : '• '
+  const toggleIndicator = onToggle
+    ? `${isCollapsed ? GLYPHS.collapsed : GLYPHS.expanded} `
+    : ''
   const toggleLabel = onToggle ? toggleIndicator : bulletChar
   // Width in cells of the toggle label (toggle arrow or bullet). Used to align
   // expanded content directly under the toggle icon.

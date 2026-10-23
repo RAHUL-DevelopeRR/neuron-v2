@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import { immer } from 'zustand/middleware/immer'
 
 import type { EngineConnection } from '../engine/neuron-engine-client'
+import type { QuestionTarget } from '../engine/questions'
 import type {
   ModelsEvent,
   PermissionRequestedEvent,
@@ -32,6 +33,11 @@ export interface EngineStoreState {
    */
   pendingQuestion: string | null
   /**
+   * Where that question is drawn: its block in the turn's message, which the
+   * answer is written into. `null` when it is a chat line instead.
+   */
+  pendingQuestionTarget: QuestionTarget | null
+  /**
    * The device code of a `/login` in progress, until it ends. `approved` once
    * the engine said the sign-in worked and is opening the session.
    */
@@ -46,7 +52,9 @@ export interface EngineStoreState {
   /** Drop a request once answered (or when the turn ends without one). */
   resolvePermission: (id: number) => void
   clearPermissions: () => void
+  /** Also forgets where the previous question was drawn. */
   setPendingQuestion: (question: string | null) => void
+  setPendingQuestionTarget: (target: QuestionTarget | null) => void
   setSignIn: (code: SignInCodeEvent | null, receivedAt?: number) => void
   markSignInApproved: () => void
   reset: () => void
@@ -73,6 +81,7 @@ const initial = {
   usage: null,
   permissionQueue: [] as PermissionRequestedEvent[],
   pendingQuestion: null,
+  pendingQuestionTarget: null,
   signIn: null,
 }
 
@@ -86,6 +95,7 @@ export const useEngineStore = create<EngineStoreState>()(
         if (connection === 'exited') {
           state.permissionQueue = []
           state.pendingQuestion = null
+          state.pendingQuestionTarget = null
           state.signIn = null
         }
       }),
@@ -126,6 +136,11 @@ export const useEngineStore = create<EngineStoreState>()(
     setPendingQuestion: (question) =>
       set((state) => {
         state.pendingQuestion = question
+        state.pendingQuestionTarget = null
+      }),
+    setPendingQuestionTarget: (target) =>
+      set((state) => {
+        state.pendingQuestionTarget = target
       }),
     setSignIn: (code, receivedAt = Date.now()) =>
       set((state) => {
