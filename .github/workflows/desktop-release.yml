@@ -537,6 +537,9 @@ jobs:
   install-test:
     name: install-${{ matrix.name }}
     needs: [metadata, build]
+    # Test every platform that built, even when another one failed; a platform
+    # whose build failed fails here at the download.
+    if: ${{ !cancelled() && needs.metadata.result == 'success' }}
     runs-on: ${{ matrix.test_runner }}
     timeout-minutes: 30
     strategy:
