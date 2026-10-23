@@ -52,6 +52,7 @@ mod engine;
 mod engine_account;
 mod engine_reports;
 mod engine_stdio;
+mod engine_trust;
 mod error_detail;
 mod executor;
 mod full_screen;

@@ -34,6 +34,7 @@ use super::*;
 use crate::device_login::{DeviceCode, DeviceLoginObserver};
 use crate::engine_account::{self, SharedAccountCache};
 use crate::engine_reports;
+use crate::engine_trust;
 use crate::error_detail::DetailedError;
 use crate::session_presence::{self, SessionPresence};
 use neuron_tui::protocol::{
@@ -351,11 +352,9 @@ impl SignedOut<'_> {
                 }
                 EngineCommand::ListExtensions => self.send(extensions_event()),
                 EngineCommand::RefreshAccount => self.send_account(),
-                EngineCommand::TrustPreview => {
-                    self.send(UiEvent::error(
-                        "This engine does not support that command yet.",
-                    ));
-                }
+                EngineCommand::TrustPreview => self.send(engine_trust::trust_preview_event(
+                    &env::current_dir().unwrap_or_default(),
+                )),
             }
         }
         None
@@ -627,28 +626,38 @@ fn shorten_json_strings(input: &str, limit: usize) -> String {
     }
 }
 
-/// `TrustWorkspace`: records the working directory in the trust store, as the line REPL's
-/// trust prompt does. The workspace's own settings, hooks and MCP servers load when a
-/// session starts, so the UI restarts the engine to use them.
+/// `TrustWorkspace`: records trust for the working directory's git root (the folder itself
+/// outside git) in the trust store; the home folder is trusted for this engine only. The
+/// workspace's own settings, hooks and MCP servers load when a session starts, so the UI
+/// restarts the engine to use them.
 fn trust_workspace_events() -> Vec<UiEvent> {
     let cwd = env::current_dir().unwrap_or_default();
-    match runtime::workspace_trust::record_trusted_workspace(&cwd) {
-        Ok(()) => vec![
+    match runtime::workspace_trust::trust_workspace_root(&cwd) {
+        Ok(trusted) => vec![
             UiEvent::WorkspaceTrusted {
                 cwd: cwd.display().to_string(),
                 restart_required: true,
-                root: None,
-                session_only: false,
+                root: Some(trusted.root.display().to_string()),
+                session_only: trusted.session_only,
             },
             UiEvent::Notice {
-                message: format!(
-                    "Trusted {}. Its settings, hooks and MCP servers load when the session restarts.",
-                    cwd.display()
-                ),
+                message: if trusted.session_only {
+                    format!(
+                        "Trusted {} for this session only. Its settings, hooks and MCP servers load when the session restarts.",
+                        cwd.display()
+                    )
+                } else {
+                    format!(
+                        "Trusted {}. Its settings, hooks and MCP servers load when the session restarts.",
+                        trusted.root.display()
+                    )
+                },
             },
         ],
-        Err(error) => vec![UiEvent::Error {
-            message: format!("could not trust {}: {error}", cwd.display()), detail: None }],
+        Err(error) => vec![UiEvent::error(format!(
+            "could not trust {}: {error}",
+            cwd.display()
+        ))],
     }
 }
 
@@ -767,7 +776,7 @@ fn config_scope_id(scope: ConfigSource) -> &'static str {
     }
 }
 
-fn mcp_transport_id(transport: runtime::McpTransport) -> &'static str {
+pub(crate) fn mcp_transport_id(transport: runtime::McpTransport) -> &'static str {
     match transport {
         runtime::McpTransport::Stdio => "stdio",
         runtime::McpTransport::Sse => "sse",
@@ -1272,9 +1281,9 @@ impl Engine {
                 }
             }
             EngineCommand::TrustPreview => {
-                self.send(UiEvent::error(
-                    "This engine does not support that command yet.",
-                ));
+                let event =
+                    engine_trust::trust_preview_event(&env::current_dir().unwrap_or_default());
+                self.send(event);
             }
             EngineCommand::Shutdown => return Step::Stop,
         }
@@ -2661,18 +2670,53 @@ mod tests {
             Some(UiEvent::Error { .. })
         ));
 
+        // Before trusting it: what the workspace would turn on, and where trust would go
+        // (the repository's root). Nothing in it starts.
+        let settings = workspace.join(".neuron").join("settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).expect("settings dir");
+        fs::write(
+            &settings,
+            r#"{"permissions":{"allow":["bash(cargo test)"]},"mcpServers":{"tools":{"command":"uvx"}}}"#,
+        )
+        .expect("workspace settings");
+        engine.commands.send(EngineCommand::TrustPreview).unwrap();
+        match events_until(&engine.events, |event| {
+            matches!(event, UiEvent::TrustPreview { .. })
+        })
+        .pop()
+        {
+            Some(UiEvent::TrustPreview {
+                root,
+                is_git_root: true,
+                session_only: false,
+                trusted: false,
+                mcp_servers,
+                permission_rules,
+                ..
+            }) => {
+                assert_eq!(root, workspace.display().to_string());
+                assert_eq!(mcp_servers[0].name, "tools");
+                assert_eq!(permission_rules[0].rule, "bash(cargo test)");
+            }
+            other => panic!("expected the trust preview, got {other:?}"),
+        }
+        fs::remove_file(&settings).expect("settings removed");
+
         // Trust the workspace: recorded, and the footer says so; settings load on restart.
         engine.commands.send(EngineCommand::TrustWorkspace).unwrap();
         let trusted = events_until(&engine.events, |event| {
             matches!(event, UiEvent::Status { .. })
         });
+        let workspace_root = workspace.display().to_string();
         assert!(
             trusted.iter().any(|event| matches!(
                 event,
                 UiEvent::WorkspaceTrusted {
                     restart_required: true,
+                    root: Some(root),
+                    session_only: false,
                     ..
-                }
+                } if *root == workspace_root
             )),
             "{trusted:?}"
         );
