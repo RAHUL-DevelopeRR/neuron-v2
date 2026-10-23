@@ -328,38 +328,62 @@ machine.
 
 ### Desktop features
 
-- **Sidebar:**
-  - the project, and switching to another folder (with recent projects)
-  - New chat (Ctrl+N)
-  - the project's chats grouped by day and searchable; one click resumes a chat and its
-    conversation comes back
+- **Sidebar** (WP3, `feat/desktop-shell`):
+  - *New session* (Ctrl+N), *Search* (Ctrl+K), *Projects* and *Extensions*
+  - collapses to an icon rail: Ctrl+Shift+B, or automatically when the window is narrow
+  - *On this device*: sessions from every project the engine lists, under project headings
+    ordered by activity, or grouped by date or status; a session of another project reopens
+    that folder on it
+  - one badge per session: running, running in the terminal, failed, unread
+  - title search across all projects, and an *All sessions* page
+  - the account row at the bottom left, with initials, name and plan, and *Sign in to Zero-X*
+    when signed out
+- **Account menu:** the email and plan line, *Settings*, *Usage and plan*, *Plans and pricing*,
+  *API keys*, *Download Neuron*, *What's new*, *Help and support*, and *Sign out* (with a
+  confirmation; a fresh engine then shows the sign-in screen)
 - **Composer:**
   - `@` file mentions, searched in the workspace and sent as attachments
   - the slash-command menu
   - a mode menu: read only, edit files, full access, plan
   - the model menu, and Stop
+  - a prompt a gateway failure stopped comes back into the box
 - **Transcript:**
   - streamed Markdown, reasoning
   - tool cards with diffs and diffstats
   - the agent's questions as cards with option buttons
   - sub-agents on their Agent calls
   - copy buttons on replies and code
+  - gateway failures as cards: sign in again (401), plans (403 `upgrade_required`), the quota's
+    reset time (429 `insufficient_quota`), try again in N s (503), and "Can't reach Zero-X right
+    now" (network errors, and `/auth/device/*` answering 404)
 - **Side panel (Ctrl+B):**
   - Changes: git status of the open folder with each file's diff, or one tool call's diff
   - Files: tree and preview
   - Tasks: the agent's task list and its running sub-agents
-  - Extensions: MCP servers with their live status, tools and errors, plus plugins, skills and
-    agents, with a filter
   - Terminal: a real shell
+- **Pages:** Projects (recent folders and the native *Open folder…* picker), Extensions (MCP
+  servers with their live status, tools and errors, plus plugins, skills and agents, with a
+  filter), All sessions, and Settings
+- **Settings (Ctrl+,):** Account, Usage and plan (bars, reset time, credits), Appearance,
+  Sessions (default model and permission mode, a mode remembered per folder) and About (the app
+  and engine versions, copied on click, and *Check for updates*). Kept in the Tauri store.
 - **Also:**
+  - first run: welcome, sign in, choose the folder
+  - a blocking *Before Neuron works here* dialog for a folder not yet allowed; allowing it
+    restarts the engine with the folder's own settings
   - approvals in a dialog: y, a, n, e
-  - trust and restart, keeping the chat
   - Zero-X sign-in with a device code
-  - Settings (Ctrl+,): theme, the send key, reasoning, folding
+  - an update notice when the manifest at `zero-x.live/releases/desktop/latest.json` names a
+    newer version
+  - keyboard and screen-reader basics: focus trapped and restored in dialogs, arrow keys in
+    menus, named controls; axe-core checks in the test suite
+- **Waiting on the engine-protocol work (WP1):** the `account` event (name, limits, usage),
+  `list_sessions {scope: "all"}` with each session's project and run status, `trust_preview`
+  and typed gateway errors. Until then the desktop reads what today's engine sends: the email
+  and plan, this project's sessions, and the gateway's error wording.
 - **Still to come:**
   - images
-  - a native folder picker (needs `tauri-plugin-dialog`, which needs Rahul's OK)
-  - several chats running at once
+  - several sessions running at once
   - a source-control pane that stages and commits (E6)
 
 ### Phase E1: protocol for many front ends (engine, Rust): done

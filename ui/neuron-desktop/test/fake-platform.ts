@@ -7,7 +7,8 @@ import {
   type UiEvent,
 } from '@neuron/client'
 
-import type { DirListing, FileContent, GitStatusView, Platform, Project, TerminalSession } from '../src/platform'
+import type { DirListing, FileContent, GitStatusView, LaunchOptions, Platform, Project, TerminalSession, UpdateInfo } from '../src/platform'
+import type { Settings } from '../src/settings'
 
 export const ALL_FEATURES = ['capabilities', 'sessions', 'trust_workspace', 'todos', 'subagents', 'extensions']
 
@@ -78,20 +79,49 @@ export interface FakePlatform extends Platform {
   opened: string[]
   restarts: Array<string | null>
   openedProjects: string[]
+  /** `[path, resume]` for each project opened. */
+  projectOpens: Array<[string, string | null]>
+  launches: LaunchOptions[]
   git: GitStatusView | null
+  /** What the folder picker returns next. */
+  picked: string | null
+  update: UpdateInfo | null
+  saved: Map<string, unknown>
+}
+
+export interface FakePlatformOptions {
+  /** Settings already saved; the welcome steps count as done unless these say otherwise. */
+  settings?: Partial<Settings>
+  update?: UpdateInfo | null
 }
 
 /** A platform over a {@link FakeEngine} and a small in-memory workspace with git. */
-export function fakePlatform(engine: FakeEngine): FakePlatform {
+export function fakePlatform(engine: FakeEngine, options: FakePlatformOptions = {}): FakePlatform {
   let connecting: Promise<SessionController> | null = null
-  const project: Project = { name: 'app', path: '/work/app' }
+  let project: Project = { name: 'app', path: '/work/app' }
+  const saved = new Map<string, unknown>([['settings', { firstRunDone: true, ...options.settings }]])
   const platform: FakePlatform = {
     kind: 'host',
     label: 'test',
-    can: { openProject: true, restart: true, terminal: false, git: true },
+    can: { openProject: true, restart: true, terminal: false, git: true, pickFolder: true, updates: true },
     opened: [],
     restarts: [],
     openedProjects: [],
+    projectOpens: [],
+    launches: [],
+    picked: '/work/picked',
+    update: options.update ?? null,
+    saved,
+    store: {
+      get: async <T,>(key: string) => saved.get(key) as T | undefined,
+      set: async (key, value) => void saved.set(key, value),
+    },
+    setLaunchOptions(launch) {
+      platform.launches.push(launch)
+    },
+    pickFolder: async () => platform.picked,
+    appVersion: async () => '0.2.0',
+    checkForUpdate: async () => platform.update,
     git: {
       branch: 'main',
       changes: [
@@ -109,8 +139,10 @@ export function fakePlatform(engine: FakeEngine): FakePlatform {
     },
     project: () => project,
     recentProjects: async () => [project, { name: 'website', path: '/work/website' }],
-    async openProject(path) {
+    async openProject(path, resume = null) {
       platform.openedProjects.push(path)
+      platform.projectOpens.push([path, resume])
+      project = { name: path.split('/').pop() ?? path, path }
     },
     async restart(resume) {
       platform.restarts.push(resume)

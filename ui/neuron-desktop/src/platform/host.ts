@@ -2,6 +2,7 @@
 
 import { SessionController, WebSocketTransport, type SocketLike } from '@neuron/client'
 
+import { browserStore } from './store'
 import type { DirListing, FileContent, GitStatusView, Platform, Project, TerminalSession } from './types'
 
 export interface HostPlatformOptions {
@@ -31,7 +32,10 @@ export function hostPlatform(options: HostPlatformOptions): Platform {
     kind: 'host',
     label: new URL(options.url.replace(/^ws/, 'http')).host,
     // A host serves one workspace; it restarts its engine for clients on its machine.
-    can: { openProject: false, restart: true, terminal: true, git: true },
+    can: { openProject: false, restart: true, terminal: true, git: true, pickFolder: false, updates: false },
+    store: browserStore('neuron.desktop.'),
+    // The host starts its engine with its own options.
+    setLaunchOptions: () => {},
     connect() {
       connecting ??= (async () => {
         controller = new SessionController(transport)
@@ -46,6 +50,9 @@ export function hostPlatform(options: HostPlatformOptions): Platform {
       return current ? [current] : []
     },
     openProject: () => Promise.reject(new Error('This Neuron host serves one project.')),
+    pickFolder: async () => null,
+    appVersion: async () => null,
+    checkForUpdate: async () => null,
     restart: async (resume) => {
       await transport.rpc('engine.restart', { resume: resume ?? '' })
     },

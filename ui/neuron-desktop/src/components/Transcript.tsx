@@ -4,6 +4,7 @@ import type { ToolState, TranscriptItem } from '@neuron/client'
 
 import { DiffView } from './DiffView'
 import { CopyButton, Markdown } from './Markdown'
+import { ProblemCard, type ProblemActions } from './ProblemCard'
 
 type ToolItem = Extract<TranscriptItem, { kind: 'tool' }>
 type QuestionItem = Extract<TranscriptItem, { kind: 'question' }>
@@ -109,6 +110,7 @@ export function Transcript({
   onSelectTool,
   selectedTool,
   empty,
+  problemActions,
 }: {
   items: TranscriptItem[]
   busy: boolean
@@ -119,6 +121,8 @@ export function Transcript({
   onSelectTool?: (item: ToolItem) => void
   selectedTool?: string | null
   empty?: React.ReactNode
+  /** What a gateway failure's card offers; without them it is a plain error line. */
+  problemActions?: ProblemActions
 }) {
   const end = useRef<HTMLDivElement>(null)
   const [pinned, setPinned] = useState(true)
@@ -170,7 +174,9 @@ export function Transcript({
           case 'question':
             return <QuestionCard key={item.key} item={item} onAnswer={onAnswer} />
           case 'error':
-            return (
+            return item.problem && problemActions ? (
+              <ProblemCard key={item.key} problem={item.problem} actions={problemActions} />
+            ) : (
               <div key={item.key} className="error-line" role="alert">
                 {item.text}
               </div>
