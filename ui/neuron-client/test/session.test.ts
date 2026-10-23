@@ -3,6 +3,9 @@ import { describe, expect, test } from 'bun:test'
 import type { UiEvent } from '../src/protocol'
 import {
   changedPaths,
+  hasFeature,
+  openQuestionItem,
+  runningSubagents,
   initialSession,
   needsSignIn,
   openQuestion,
@@ -267,5 +270,91 @@ describe('the rest of the protocol', () => {
   test('an MCP call names its server and tool', () => {
     const state = run([{ type: 'tool_call_started', id: 'm', name: 'mcp__playwright__browser_navigate', input: '{"url":"https://example.com"}', cut_off: false }], started())
     expect(tool(state).view).toMatchObject({ kind: 'mcp', mcp: { server: 'playwright', tool: 'browser_navigate' } })
+  })
+})
+
+describe('E1: sessions, transcripts, questions, tasks, sub-agents, trust', () => {
+  test('ready carries the engine features', () => {
+    const state = run([{ type: 'ready', protocol: 1, version: '6.4.0', features: ['capabilities', 'sessions'] }])
+    expect(hasFeature(state, 'sessions')).toBe(true)
+    expect(hasFeature(state, 'trust_workspace')).toBe(false)
+    expect(run([{ type: 'ready', protocol: 1, version: '6.3.0' }]).features).toEqual([])
+  })
+
+  test('a transcript replaces what is shown, with calls and their results', () => {
+    const before = run([{ type: 'local/submitted', text: 'old chat' }, { type: 'turn_finished' }, status()], started())
+    const state = run(
+      [
+        {
+          type: 'transcript',
+          session_id: 'session-2',
+          truncated: true,
+          entries: [
+            { kind: 'user', text: 'write it' },
+            { kind: 'assistant', text: 'Writing.' },
+            { kind: 'tool_call', id: 'w', name: 'write_file', input: '{"path":"a.txt","content":"hi\\n"}' },
+            { kind: 'tool_result', id: 'w', name: 'write_file', output: '{"type":"create","summary":"Created a.txt"}', is_error: false },
+            { kind: 'tool_call', id: 'b', name: 'bash', input: '{"command":"rm -rf /"}' },
+            { kind: 'tool_result', id: 'b', name: 'bash', output: "tool 'bash' denied by the user: no", is_error: true },
+            { kind: 'tool_call', id: 'x', name: 'read_file', input: '{"path":"a.txt"}' },
+          ],
+        },
+        status({ session_id: 'session-2' }),
+      ],
+      before,
+    )
+    expect(kinds(state.items)).toEqual(['notice', 'user', 'assistant', 'tool', 'tool', 'tool'])
+    expect(state.items[0]).toMatchObject({ kind: 'notice', text: 'Earlier messages of this chat are not shown.' })
+    expect(tool(state, 0)).toMatchObject({ state: 'done', view: { kind: 'write', target: 'a.txt', output: 'Created a.txt' } })
+    expect(tool(state, 1).state).toBe('denied')
+    expect(tool(state, 2).state).toBe('error')
+    // No "New session" line: the transcript already switched the session.
+    expect(state.items.some((item) => item.kind === 'notice' && item.text.startsWith('New session'))).toBe(false)
+  })
+
+  test('the session list', () => {
+    const sessions = [{ id: 's1', title: 'Fix the build', model: 'sonnet', message_count: 4, updated_at_ms: 1, current: true, branch: null }]
+    expect(run([{ type: 'sessions', current: 's1', sessions }], started()).sessions).toEqual(sessions)
+  })
+
+  test('a structured question with options, answered by id', () => {
+    let state = run([{ type: 'local/submitted', text: 'plan' }, { type: 'question', id: 3, question: 'Which crate?', options: ['api', 'tools'] }], started())
+    expect(openQuestionItem(state)).toMatchObject({ id: 3, text: 'Which crate?', options: ['api', 'tools'], answered: false })
+    state = run([{ type: 'local/answered', id: 9, text: 'stale' }], state)
+    expect(openQuestionItem(state)?.id).toBe(3)
+    state = run([{ type: 'local/answered', id: 3, text: 'tools' }], state)
+    expect(openQuestionItem(state)).toBeNull()
+    expect(state.items.at(-1)).toMatchObject({ kind: 'user', text: 'tools' })
+  })
+
+  test('the task list', () => {
+    const items = [
+      { content: 'Run the tests', status: 'in_progress', active_form: 'Running the tests' },
+      { content: 'Fix the build', status: 'pending', active_form: null },
+    ]
+    expect(run([{ type: 'todos', items }], started()).todos).toEqual(items)
+  })
+
+  test('a sub-agent on its Agent call, running then finished', () => {
+    let state = run(
+      [
+        { type: 'tool_call_started', id: 'a1', name: 'Agent', input: '{"description":"Audit MCP","prompt":"..."}', cut_off: false },
+        { type: 'subagent_started', id: 'a1', description: 'Audit MCP', subagent_type: 'Explore' },
+      ],
+      started(),
+    )
+    expect(runningSubagents(state).map((item) => item.id)).toEqual(['a1'])
+    expect(tool(state).subagent).toMatchObject({ description: 'Audit MCP', type: 'Explore', running: true })
+    state = run([{ type: 'subagent_finished', id: 'a1', status: 'completed', is_error: false, result: 'Only stdio.', note: null }], state)
+    expect(runningSubagents(state)).toEqual([])
+    expect(tool(state).subagent).toMatchObject({ running: false, status: 'completed', result: 'Only stdio.', type: 'Explore' })
+  })
+
+  test('trusting the workspace asks for a restart, which the next ready clears', () => {
+    let state = run([{ type: 'workspace_trusted', cwd: cwd, restart_required: true }], started())
+    expect(state.restartRequired).toBe(true)
+    expect(state.status?.workspace_trusted).toBe(true)
+    state = run([{ type: 'ready', protocol: 1, version: '6.3.0', features: [] }], state)
+    expect(state.restartRequired).toBe(false)
   })
 })

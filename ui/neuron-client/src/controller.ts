@@ -5,13 +5,15 @@
  */
 
 import {
+  CAPABILITY_QUESTIONS,
+  FEATURE_CAPABILITIES,
   type Attachment,
   type ClientMessage,
   type PermissionDecision,
   commandMessage,
   permissionReplyMessage,
 } from './protocol'
-import { initialSession, reduceSession, type SessionAction, type SessionState } from './session'
+import { initialSession, openQuestionItem, reduceSession, type SessionAction, type SessionState } from './session'
 
 export interface TransportClose {
   code: number | null
@@ -45,7 +47,14 @@ export class SessionController {
 
   constructor(readonly transport: EngineTransport) {
     this.unsubscribers.push(
-      transport.subscribe((action) => this.apply(action)),
+      transport.subscribe((action) => {
+        this.apply(action)
+        // An engine of its own hears what this client handles. A remote host tells its
+        // engine itself, for all its clients.
+        if (action.type === 'ready' && !transport.echoesActions && action.features?.includes(FEATURE_CAPABILITIES)) {
+          transport.send(commandMessage({ type: 'capabilities', features: [CAPABILITY_QUESTIONS] }))
+        }
+      }),
       transport.onClose((close) => this.apply({ type: 'local/disconnected', error: close.error })),
     )
     if (transport.onSnapshot) this.unsubscribers.push(transport.onSnapshot((state) => this.replace(state)))
@@ -97,17 +106,47 @@ export class SessionController {
     this.local({ type: 'local/slash', command: name, args })
   }
 
-  /** A prompt as typed: `/cmd args` goes as a slash command, anything else as a prompt. */
+  /**
+   * A prompt as typed: `/cmd args` goes as a slash command, anything else as a
+   * prompt. While the agent waits for an answer, it is the answer, as typed.
+   */
   send(input: string, attachments: Attachment[] = []): void {
     const text = input.trim()
     if (!text) return
+    const question = openQuestionItem(this.state)
+    if (question?.id !== undefined) return this.answer(question.id, text)
     const slash = /^\/(\S+)\s*([\s\S]*)$/.exec(text)
-    // An answer to the agent's question is sent as typed, even when it starts with "/".
-    if (slash && !this.state.items.some((item) => item.kind === 'question' && !item.answered)) {
+    if (slash && !question) {
       this.slash(slash[1], slash[2].trim())
     } else {
       this.submit(text, attachments)
     }
+  }
+
+  /** Answers the agent's question with this id. */
+  answer(id: number, text: string): void {
+    this.transport.send(commandMessage({ type: 'answer', id, text }))
+    this.local({ type: 'local/answered', id, text })
+  }
+
+  /** The workspace's saved chats arrive as `state.sessions` (feature `sessions`). */
+  listSessions(): void {
+    this.transport.send(commandMessage({ type: 'list_sessions' }))
+  }
+
+  /** Continues a saved chat; its transcript replaces what is shown (feature `sessions`). */
+  resume(session: string): void {
+    this.transport.send(commandMessage({ type: 'resume', session }))
+  }
+
+  /** A fresh chat in the same engine. */
+  newChat(): void {
+    this.slash('clear', '--confirm')
+  }
+
+  /** Trusts the workspace (feature `trust_workspace`); `state.restartRequired` follows. */
+  trustWorkspace(): void {
+    this.transport.send(commandMessage({ type: 'trust_workspace' }))
   }
 
   setModel(model: string): void {

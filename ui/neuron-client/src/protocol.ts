@@ -64,12 +64,52 @@ export interface AccountInfo {
   expires_at: number | null
 }
 
+/**
+ * Features an engine adds to protocol 1 (`ENGINE_FEATURES` in protocol.rs). Send
+ * the commands a feature adds only when `ready.features` lists it.
+ */
+export const FEATURE_CAPABILITIES = 'capabilities'
+export const FEATURE_SESSIONS = 'sessions'
+export const FEATURE_TRUST_WORKSPACE = 'trust_workspace'
+
+/** A UI capability: questions come as `question` events instead of a "Question:" notice. */
+export const CAPABILITY_QUESTIONS = 'questions'
+
+/** One saved chat in the workspace. */
+export interface SessionSummary {
+  id: string
+  /** The first prompt, on one line and shortened. */
+  title: string | null
+  model: string | null
+  message_count: number
+  /** Unix milliseconds. */
+  updated_at_ms: number
+  current: boolean
+  branch: string | null
+}
+
+/** One entry of a saved conversation. */
+export type TranscriptEntry =
+  | { kind: 'user'; text: string }
+  | { kind: 'assistant'; text: string }
+  | { kind: 'tool_call'; id: string; name: string; input: string }
+  | { kind: 'tool_result'; id: string; name: string; output: string; is_error: boolean }
+
+/** One item of the agent's task list. */
+export interface TodoItem {
+  content: string
+  status: 'pending' | 'in_progress' | 'completed' | string
+  active_form: string | null
+}
+
 // ---------------------------------------------------------------- engine → client
 
 export interface ReadyEvent {
   type: 'ready'
   protocol: number
   version: string
+  /** What the engine adds to protocol 1; absent from older engines. */
+  features?: string[]
 }
 
 export interface StatusEvent {
@@ -173,6 +213,64 @@ export interface ErrorEvent {
   message: string
 }
 
+/** Answer to `list_sessions`: the workspace's saved chats, newest first. */
+export interface SessionsEvent {
+  type: 'sessions'
+  current: string
+  sessions: SessionSummary[]
+}
+
+/**
+ * The conversation of the session the engine now runs, from its start: after
+ * `--resume`, `resume`, `/resume` and `/clear`.
+ */
+export interface TranscriptEvent {
+  type: 'transcript'
+  session_id: string
+  entries: TranscriptEntry[]
+  /** The oldest entries were left out. */
+  truncated: boolean
+}
+
+/** The workspace is trusted now; its settings, hooks and MCP servers load on a restart. */
+export interface WorkspaceTrustedEvent {
+  type: 'workspace_trusted'
+  cwd: string
+  restart_required: boolean
+}
+
+/** The agent asks something (with the `questions` capability); answer with `answer`. */
+export interface QuestionEvent {
+  type: 'question'
+  id: number
+  question: string
+  options: string[]
+}
+
+/** The agent's whole task list, after its TodoWrite tool ran. */
+export interface TodosEvent {
+  type: 'todos'
+  items: TodoItem[]
+}
+
+/** An Agent call began running; `id` is its tool call id. */
+export interface SubagentStartedEvent {
+  type: 'subagent_started'
+  id: string
+  description: string
+  subagent_type: string | null
+}
+
+/** An Agent call ended. */
+export interface SubagentFinishedEvent {
+  type: 'subagent_finished'
+  id: string
+  status: string
+  is_error: boolean
+  result: string | null
+  note: string | null
+}
+
 export type UiEvent =
   | ReadyEvent
   | StatusEvent
@@ -190,6 +288,13 @@ export type UiEvent =
   | NoticeEvent
   | TurnFinishedEvent
   | ErrorEvent
+  | SessionsEvent
+  | TranscriptEvent
+  | WorkspaceTrustedEvent
+  | QuestionEvent
+  | TodosEvent
+  | SubagentStartedEvent
+  | SubagentFinishedEvent
 
 export type UiEventType = UiEvent['type']
 
@@ -211,6 +316,13 @@ export const UI_EVENT_TYPES: readonly UiEventType[] = [
   'notice',
   'turn_finished',
   'error',
+  'sessions',
+  'transcript',
+  'workspace_trusted',
+  'question',
+  'todos',
+  'subagent_started',
+  'subagent_finished',
 ]
 
 // ---------------------------------------------------------------- client → engine
@@ -229,6 +341,16 @@ export type EngineCommand =
   /** A second one during a turn quits after saving. */
   | { type: 'interrupt' }
   | { type: 'shutdown' }
+  /** What this UI handles (feature `capabilities`): `questions`. */
+  | { type: 'capabilities'; features: string[] }
+  /** Answers the `question` event with this id. */
+  | { type: 'answer'; id: number; text: string }
+  /** Feature `sessions`: the saved chats, as a `sessions` event. */
+  | { type: 'list_sessions' }
+  /** Feature `sessions`: continue a saved chat (an id, a path, or `latest`). */
+  | { type: 'resume'; session: string }
+  /** Feature `trust_workspace`. */
+  | { type: 'trust_workspace' }
 
 export const ENGINE_COMMAND_TYPES: readonly EngineCommand['type'][] = [
   'submit',
@@ -237,6 +359,11 @@ export const ENGINE_COMMAND_TYPES: readonly EngineCommand['type'][] = [
   'list_models',
   'interrupt',
   'shutdown',
+  'capabilities',
+  'answer',
+  'list_sessions',
+  'resume',
+  'trust_workspace',
 ]
 
 export type PermissionDecision =
@@ -333,7 +460,21 @@ export function parseClientMessage(value: unknown): ClientMessage | null {
     case 'list_models':
     case 'interrupt':
     case 'shutdown':
+    case 'list_sessions':
+    case 'trust_workspace':
       return { kind: 'command', type: message.type }
+    case 'capabilities':
+      return Array.isArray(message.features) && message.features.every((feature) => typeof feature === 'string')
+        ? { kind: 'command', type: 'capabilities', features: message.features as string[] }
+        : null
+    case 'answer':
+      return Number.isSafeInteger(message.id) && typeof message.text === 'string'
+        ? { kind: 'command', type: 'answer', id: message.id as number, text: message.text }
+        : null
+    case 'resume':
+      return typeof message.session === 'string' && message.session.trim()
+        ? { kind: 'command', type: 'resume', session: message.session }
+        : null
     default:
       return null
   }

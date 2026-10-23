@@ -52,12 +52,22 @@ const token = randomBytes(24).toString('base64url')
 const tokenFile = path.resolve(value('--token-file') ?? path.join(os.tmpdir(), `neuron-host-${process.pid}.token`))
 fs.writeFileSync(tokenFile, token, { mode: 0o600 })
 
-const transport = new StdioTransport(
-  { binary, cwd, env, model: value('--model') ?? (mockMode ? 'sonnet' : undefined), permissionMode: value('--permission-mode') ?? 'workspace-write' },
-  { onStderr: (line) => flag('--verbose') && console.error(`[engine] ${line}`) },
-)
+// A new engine for each (re)start; a restart continues the chat it was on.
+const engineFor = (resume: string | null) =>
+  new StdioTransport(
+    {
+      binary,
+      cwd,
+      env,
+      model: value('--model') ?? (mockMode ? 'sonnet' : undefined),
+      permissionMode: value('--permission-mode') ?? 'workspace-write',
+      resume: resume ?? undefined,
+    },
+    { onStderr: (line) => flag('--verbose') && console.error(`[engine] ${line}`) },
+  )
 const host = new NeuronHost({
-  transport,
+  transport: engineFor(null),
+  restart: engineFor,
   token,
   root: cwd,
   name: mockMode ? 'Neuron (mock)' : os.hostname(),

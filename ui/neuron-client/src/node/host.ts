@@ -16,6 +16,7 @@ import { promises as fs } from 'fs'
 import path from 'path'
 
 import type { EngineTransport } from '../controller'
+import { CAPABILITY_QUESTIONS, FEATURE_CAPABILITIES, commandMessage } from '../protocol'
 import {
   REMOTE_PROTOCOL,
   parseClientFrame,
@@ -25,6 +26,7 @@ import {
   type HostInfo,
 } from '../remote'
 import { initialSession, reduceSession, type SessionAction, type SessionState } from '../session'
+import { gitDiff, gitStatus, searchFiles } from './workspace'
 
 export interface HostOptions {
   transport: EngineTransport
@@ -43,6 +45,11 @@ export interface HostOptions {
   terminalEnv?: Record<string, string | undefined>
   /** Whether a client's address is this machine (loopback by default; tests override it). */
   isLocal?: (address: string) => boolean
+  /**
+   * A new engine, continuing `resume` (a session id) when given: lets clients on this
+   * machine restart it (`engine.restart`), as trusting the workspace needs.
+   */
+  restart?: (resume: string | null) => EngineTransport
 }
 
 interface Terminal {
@@ -83,12 +90,41 @@ export class NeuronHost {
   private server: ReturnType<typeof Bun.serve<Peer>> | null = null
   private unsubscribers: Array<() => void> = []
   private nextTerminal = 1
+  private transport: EngineTransport
 
   constructor(private readonly options: HostOptions) {
+    this.transport = options.transport
+    this.attach(options.transport)
+  }
+
+  /** Follows `transport`'s events. Its clients take structured questions, so its engine sends them. */
+  private attach(transport: EngineTransport): void {
     this.unsubscribers.push(
-      options.transport.subscribe((action) => this.record(action)),
-      options.transport.onClose((close) => this.record({ type: 'local/disconnected', error: close.error })),
+      transport.subscribe((action) => {
+        this.record(action)
+        if (action.type === 'ready' && action.features?.includes(FEATURE_CAPABILITIES)) {
+          transport.send(commandMessage({ type: 'capabilities', features: [CAPABILITY_QUESTIONS] }))
+        }
+      }),
+      transport.onClose((close) => this.record({ type: 'local/disconnected', error: close.error })),
     )
+  }
+
+  private detach(): void {
+    for (const unsubscribe of this.unsubscribers) unsubscribe()
+    this.unsubscribers = []
+  }
+
+  /** Replaces the engine with a new one continuing `resume`. Clients see it start again. */
+  async restartEngine(resume: string | null): Promise<void> {
+    if (!this.options.restart) throw new Error('This host cannot restart its engine.')
+    const old = this.transport
+    this.detach()
+    await old.close().catch(() => {})
+    this.transport = this.options.restart(resume)
+    this.attach(this.transport)
+    this.record({ type: 'local/connecting' })
+    await this.transport.start()
   }
 
   get info(): HostInfo {
@@ -113,7 +149,7 @@ export class NeuronHost {
   async start(): Promise<void> {
     this.listen()
     this.record({ type: 'local/connecting' })
-    await this.options.transport.start()
+    await this.transport.start()
   }
 
   listen(): void {
@@ -240,13 +276,19 @@ export class NeuronHost {
     if (message.kind === 'permission_reply') {
       // The first answer wins; later ones (another client's) are dropped.
       if (!this.state.permissions.some((permission) => permission.id === message.id)) return
-      this.options.transport.send(message)
+      this.transport.send(message)
       return this.record({ type: 'local/permission_answered', id: message.id, decision: message.decision })
     }
     if (message.type === 'shutdown') return refuse('Only the machine running Neuron can stop the engine.')
-    this.options.transport.send(message)
+    // The host speaks for all its clients.
+    if (message.type === 'capabilities') return
+    if (message.type === 'trust_workspace' && !socket.data.local) {
+      return refuse('Only the machine running Neuron can trust its workspace.')
+    }
+    this.transport.send(message)
     if (message.type === 'submit') this.record({ type: 'local/submitted', text: message.text, attachments: message.attachments })
     else if (message.type === 'slash') this.record({ type: 'local/slash', command: message.command, args: message.args })
+    else if (message.type === 'answer') this.record({ type: 'local/answered', id: message.id, text: message.text })
   }
 
   private async call(socket: Socket, method: string, params: Record<string, unknown>): Promise<unknown> {
@@ -263,6 +305,18 @@ export class NeuronHost {
         return listDirectory(this.options.root, typeof params.path === 'string' ? params.path : '.')
       case 'fs.read':
         return readFile(this.options.root, typeof params.path === 'string' ? params.path : '')
+      case 'fs.search':
+        return searchFiles(this.options.root, typeof params.query === 'string' ? params.query : '')
+      case 'git.status':
+        return gitStatus(this.options.root, this.state.status?.workspace_trusted === true)
+      case 'git.diff':
+        return gitDiff(this.options.root, typeof params.path === 'string' ? params.path : '', this.state.status?.workspace_trusted === true)
+      case 'engine.restart': {
+        if (!socket.data.local) throw new Error('Only the machine running Neuron can restart its engine.')
+        const resume = typeof params.resume === 'string' && params.resume ? params.resume : null
+        await this.restartEngine(resume)
+        return { restarted: true }
+      }
       default:
         throw new Error(`Unknown method ${method}.`)
     }
@@ -299,9 +353,8 @@ export class NeuronHost {
     for (const socket of this.sockets) socket.close(1001, 'host stopping')
     this.server?.stop(true)
     this.server = null
-    await this.options.transport.close()
-    for (const unsubscribe of this.unsubscribers) unsubscribe()
-    this.unsubscribers = []
+    await this.transport.close()
+    this.detach()
   }
 }
 

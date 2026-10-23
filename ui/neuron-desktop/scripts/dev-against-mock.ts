@@ -31,14 +31,23 @@ const token = randomBytes(24).toString('base64url')
 const tokenFile = path.join(os.tmpdir(), `neuron-desktop-${process.pid}.token`)
 fs.writeFileSync(tokenFile, token, { mode: 0o600 })
 
-const transport = new StdioTransport({
-  binary: neuronBinary,
-  cwd: home.workspace,
-  model: 'sonnet',
-  permissionMode: 'workspace-write',
-  env: home.env,
+const engineFor = (resume: string | null) =>
+  new StdioTransport({
+    binary: neuronBinary,
+    cwd: home.workspace,
+    model: 'sonnet',
+    permissionMode: 'workspace-write',
+    env: home.env,
+    resume: resume ?? undefined,
+  })
+const host = new NeuronHost({
+  transport: engineFor(null),
+  restart: engineFor,
+  token,
+  root: home.workspace,
+  name: 'Neuron (mock)',
+  terminalEnv: { ...home.env },
 })
-const host = new NeuronHost({ transport, token, root: home.workspace, name: 'Neuron (mock)', terminalEnv: { ...home.env } })
 await host.start()
 
 const vite = Bun.spawn([process.execPath, 'x', 'vite', ...process.argv.slice(2)], {

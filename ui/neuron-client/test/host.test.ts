@@ -16,15 +16,20 @@ class FakeEngine implements EngineTransport {
   private listeners = new Set<(action: SessionAction) => void>()
   private closeListeners = new Set<(close: TransportClose) => void>()
 
+  constructor(
+    private readonly features: string[] = [],
+    private readonly trusted = true,
+  ) {}
+
   async start() {
-    this.emit({ type: 'ready', protocol: 1, version: '6.3.0' })
+    this.emit({ type: 'ready', protocol: 1, version: '6.3.0', features: this.features })
     this.emit({
       type: 'status',
       model: 'm',
       permission_mode: 'workspace-write',
       session_id: 's',
       cwd: '/ws',
-      workspace_trusted: true,
+      workspace_trusted: this.trusted,
       plan_mode: false,
       context_percent: 0,
       git: null,
@@ -55,18 +60,27 @@ let engine: FakeEngine
 let root = ''
 const controllers: SessionController[] = []
 
-async function startHost(options: { remoteOnly?: boolean } = {}) {
+/** Engines the host's restart made, with the session each was asked to continue. */
+let restarted: Array<{ engine: FakeEngine; resume: string | null }> = []
+
+async function startHost(options: { remoteOnly?: boolean; features?: string[]; trusted?: boolean } = {}) {
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'neuron-host-test-'))
   fs.mkdirSync(path.join(root, 'src'))
   fs.writeFileSync(path.join(root, 'src', 'main.rs'), 'fn main() {}\n')
   fs.writeFileSync(path.join(root, 'README.md'), '# hi\n')
-  engine = new FakeEngine()
+  engine = new FakeEngine(options.features, options.trusted)
+  restarted = []
   host = new NeuronHost({
     transport: engine,
     token: TOKEN,
     root,
     name: 'test host',
     ...(options.remoteOnly && { isLocal: () => false }),
+    restart: (resume) => {
+      const next = new FakeEngine(options.features, true)
+      restarted.push({ engine: next, resume })
+      return next
+    },
   })
   await host.start()
   return host
@@ -243,5 +257,106 @@ describe('NeuronHost', () => {
     const { transport } = await attach('mobile')
     const failure = await transport.rpc('term.open', {}).then(() => 'opened', (error: Error) => error.message)
     expect(failure).toBe('Terminals are only available on the machine running Neuron.')
+  })
+
+  test('the host tells an engine that takes them: its clients answer questions', async () => {
+    await startHost({ features: ['capabilities', 'sessions', 'trust_workspace'] })
+    expect(engine.sent).toEqual([{ kind: 'command', type: 'capabilities', features: ['questions'] }])
+    const { controller } = await attach('mobile')
+    expect(controller.getState().features).toContain('sessions')
+    // Clients do not set the engine's capabilities: the host speaks for all of them.
+    expect(engine.sent).toHaveLength(1)
+  })
+
+  test('an answer reaches the engine, and every client sees the question answered', async () => {
+    await startHost({ features: ['capabilities'] })
+    const desktop = await attach('desktop')
+    const phone = await attach('mobile')
+    engine.emit({ type: 'question', id: 4, question: 'Which crate?', options: ['api', 'tools'] })
+    await until('the question', () => desktop.controller.getState().items.some((item) => item.kind === 'question'))
+    phone.controller.send('tools')
+    await until('the answer', () => engine.sent.some((message) => message.kind === 'command' && message.type === 'answer'))
+    expect(engine.sent.at(-1)).toEqual({ kind: 'command', type: 'answer', id: 4, text: 'tools' })
+    await until('answered everywhere', () =>
+      [desktop, phone].every((client) => client.controller.getState().items.some((item) => item.kind === 'question' && item.answered)),
+    )
+  })
+
+  test('only clients on this machine may trust the workspace or restart the engine', async () => {
+    await startHost({ remoteOnly: true, features: ['trust_workspace'], trusted: false })
+    const { transport, controller } = await attach('mobile')
+    const errors: string[] = []
+    const socket = new WebSocket(host!.url)
+    socket.onopen = () => {
+      socket.send(JSON.stringify({ t: 'hello', protocol: 1, token: TOKEN, client: { name: 'raw', kind: 'cli' } }))
+      socket.send(JSON.stringify({ t: 'send', message: { kind: 'command', type: 'trust_workspace' } }))
+    }
+    socket.onmessage = (event) => {
+      const frame = JSON.parse(String(event.data)) as HostFrame
+      if (frame.t === 'error') errors.push(frame.message)
+    }
+    await until('the refusal', () => errors.length > 0)
+    socket.close()
+    expect(errors[0]).toContain('Only the machine running Neuron can trust')
+    expect(engine.sent.filter((message) => message.kind === 'command' && message.type === 'trust_workspace')).toEqual([])
+    const failure = await transport.rpc('engine.restart', {}).then(() => 'restarted', (error: Error) => error.message)
+    expect(failure).toBe('Only the machine running Neuron can restart its engine.')
+    expect(controller.getState().connection).toBe('ready')
+  })
+
+  test('a restart from this machine starts a new engine on the same chat', async () => {
+    await startHost({ features: ['trust_workspace'], trusted: false })
+    const { transport, controller } = await attach('desktop')
+    controller.trustWorkspace()
+    await until('the trust command', () => engine.sent.some((message) => message.kind === 'command' && message.type === 'trust_workspace'))
+    engine.emit({ type: 'workspace_trusted', cwd: '/ws', restart_required: true })
+    await until('the restart prompt', () => controller.getState().restartRequired)
+    await transport.rpc('engine.restart', { resume: 's' })
+    expect(restarted.map((entry) => entry.resume)).toEqual(['s'])
+    await until('the new engine', () => !controller.getState().restartRequired && controller.getState().connection === 'ready')
+    expect(controller.getState().status?.workspace_trusted).toBe(true)
+    // Commands go to the new engine now.
+    controller.send('after restart')
+    await until('the prompt', () => restarted[0].engine.sent.some((message) => message.kind === 'command' && message.type === 'submit'))
+  })
+
+  test('fs.search finds workspace files by name', async () => {
+    await startHost()
+    fs.mkdirSync(path.join(root, 'node_modules', 'dep'), { recursive: true })
+    fs.writeFileSync(path.join(root, 'node_modules', 'dep', 'main.rs'), '')
+    const { transport } = await attach('desktop')
+    expect(await transport.rpc<string[]>('fs.search', { query: 'main' })).toEqual(['src/main.rs'])
+    expect(await transport.rpc<string[]>('fs.search', { query: 'READ' })).toEqual(['README.md'])
+  })
+
+  test('git.status and git.diff show the working tree changes', async () => {
+    await startHost()
+    const git = (...args: string[]) =>
+      Bun.spawnSync(['git', '-c', 'user.email=t@example.com', '-c', 'user.name=t', ...args], { cwd: root, stdout: 'pipe', stderr: 'pipe' })
+    git('init', '-q', '-b', 'main')
+    git('add', '.')
+    git('commit', '-q', '-m', 'init')
+    fs.writeFileSync(path.join(root, 'src', 'main.rs'), 'fn main() { println!("hi"); }\n')
+    fs.writeFileSync(path.join(root, 'new.txt'), 'new\n')
+    const { transport } = await attach('desktop')
+    const status = await transport.rpc<{ branch: string; changes: Array<{ path: string; index: string; worktree: string }> }>('git.status')
+    expect(status.branch).toBe('main')
+    expect(status.changes).toEqual([
+      { path: 'src/main.rs', index: ' ', worktree: 'M' },
+      { path: 'new.txt', index: '?', worktree: '?' },
+    ])
+    const diff = await transport.rpc<string>('git.diff', { path: 'src/main.rs' })
+    expect(diff).toContain('+fn main() { println!("hi"); }')
+    const outside = await transport.rpc('git.diff', { path: '../x' }).then(() => 'ran', (error: Error) => error.message)
+    expect(outside).toBe('That path is outside the workspace.')
+  })
+
+  test('git.status refuses an untrusted repository whose config runs programs', async () => {
+    await startHost({ trusted: false })
+    Bun.spawnSync(['git', 'init', '-q'], { cwd: root })
+    Bun.spawnSync(['git', 'config', 'core.fsmonitor', 'echo pwned'], { cwd: root })
+    const { transport } = await attach('desktop')
+    const failure = await transport.rpc('git.status').then(() => 'ran', (error: Error) => error.message)
+    expect(failure).toContain('trust the workspace')
   })
 })

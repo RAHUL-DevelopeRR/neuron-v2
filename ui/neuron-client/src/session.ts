@@ -11,14 +11,28 @@ import type {
   ModelInfo,
   PermissionDecision,
   PermissionView,
+  SessionSummary,
   SignInCodeEvent,
   StatusEvent,
+  TodoItem,
   TokenCounts,
+  TranscriptEntry,
   UiEvent,
 } from './protocol'
 import { toolView, withResult, type ToolView } from './tools'
 
 export type ToolState = 'running' | 'awaiting_permission' | 'done' | 'error' | 'denied' | 'cut_off'
+
+/** The sub-agent an `Agent` call runs. */
+export interface Subagent {
+  description: string
+  type: string | null
+  running: boolean
+  /** The sub-agent's own status once it ended (`completed`, `failed`, `running` in the background). */
+  status: string | null
+  result: string | null
+  note: string | null
+}
 
 export type TranscriptItem =
   | { kind: 'user'; key: string; text: string; attachments: Attachment[] }
@@ -35,9 +49,18 @@ export type TranscriptItem =
       view: ToolView
       output: string | null
       permissionId: number | null
+      subagent?: Subagent
     }
   | { kind: 'notice'; key: string; text: string }
-  | { kind: 'question'; key: string; text: string; answered: boolean }
+  | {
+      kind: 'question'
+      key: string
+      text: string
+      answered: boolean
+      /** The engine's question id (structured questions); answer with `answer`. */
+      id?: number
+      options?: string[]
+    }
   | { kind: 'error'; key: string; text: string }
 
 export interface PendingPermission {
@@ -55,7 +78,15 @@ export interface SessionState {
   connectionError: string | null
   version: string | null
   protocol: number | null
+  /** What the engine adds to protocol 1 (`ready.features`). */
+  features: string[]
   status: StatusEvent | null
+  /** The workspace's saved chats, once asked for. */
+  sessions: SessionSummary[] | null
+  /** The agent's task list. */
+  todos: TodoItem[]
+  /** The workspace was trusted; its settings load once the engine restarts. */
+  restartRequired: boolean
   models: ModelInfo[]
   /** The current turn (or slash command) has not finished. */
   busy: boolean
@@ -73,7 +104,11 @@ export const initialSession = (): SessionState => ({
   connectionError: null,
   version: null,
   protocol: null,
+  features: [],
   status: null,
+  sessions: null,
+  todos: [],
+  restartRequired: false,
   models: [],
   busy: false,
   sessionStarting: false,
@@ -93,6 +128,8 @@ export type LocalAction =
   | { type: 'local/permission_answered'; id: number; decision: PermissionDecision }
   /** Another client answered it (remote sessions). */
   | { type: 'local/permission_resolved'; id: number }
+  /** The structured question with this id was answered. */
+  | { type: 'local/answered'; id: number; text: string }
 
 export type SessionAction = UiEvent | LocalAction
 
@@ -175,13 +212,28 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
       }
       return { ...state, items, permissions: state.permissions.filter((permission) => permission.id !== action.id) }
     }
+    case 'local/answered': {
+      const index = findLastIndex(state.items, (item) => item.kind === 'question' && item.id === action.id)
+      if (index < 0) return state
+      const question = state.items[index] as Extract<TranscriptItem, { kind: 'question' }>
+      const answered = { ...state, items: replaceAt(state.items, index, { ...question, answered: true }) }
+      return push(answered, { kind: 'user', text: action.text, attachments: [] })
+    }
 
     // -------------------------------------------------------------- engine
     case 'ready':
-      return { ...state, connection: 'ready', connectionError: null, version: action.version, protocol: action.protocol }
+      return {
+        ...state,
+        connection: 'ready',
+        connectionError: null,
+        version: action.version,
+        protocol: action.protocol,
+        features: action.features ?? [],
+        restartRequired: false,
+      }
     case 'status': {
-      // `/clear` and `/resume` switch sessions; the protocol can't replay the new one's
-      // history yet, so the transcript says where the old one ended.
+      // `/clear` and `/resume` switch sessions. Engines with transcripts say so first
+      // (the session id already matches); with older ones the transcript marks it.
       const before = state.status?.session_id
       const next = { ...state, status: action }
       return before && action.session_id && before !== action.session_id
@@ -302,9 +354,97 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
         return push({ ...state, connectionError: action.message }, { kind: 'error', text: action.message })
       }
       return push({ ...state, items: closeStreams(state.items) }, { kind: 'error', text: action.message })
+    case 'sessions':
+      return { ...state, sessions: action.sessions }
+    case 'transcript':
+      return restoreTranscript(state, action.session_id, action.entries, action.truncated)
+    case 'workspace_trusted':
+      return {
+        ...state,
+        restartRequired: action.restart_required,
+        status: state.status ? { ...state.status, workspace_trusted: true } : state.status,
+      }
+    case 'question':
+      return push(state, { kind: 'question', id: action.id, text: action.question, options: action.options, answered: false })
+    case 'todos':
+      return { ...state, todos: action.items }
+    case 'subagent_started':
+    case 'subagent_finished': {
+      const index = findLastIndex(state.items, (item) => item.kind === 'tool' && item.id === action.id)
+      if (index < 0) return state
+      const item = state.items[index] as Extract<TranscriptItem, { kind: 'tool' }>
+      const subagent: Subagent =
+        action.type === 'subagent_started'
+          ? { description: action.description, type: action.subagent_type, running: true, status: null, result: null, note: null }
+          : {
+              description: item.subagent?.description ?? item.view.target,
+              type: item.subagent?.type ?? null,
+              running: false,
+              status: action.status,
+              result: action.result,
+              note: action.note,
+            }
+      return { ...state, items: replaceAt(state.items, index, { ...item, subagent }) }
+    }
     default:
       return state
   }
+}
+
+/**
+ * The transcript of the session the engine now runs: the saved conversation in
+ * place of what was shown, tool calls with their results folded in. The footer's
+ * session id follows, so the status after it does not read as another switch.
+ */
+function restoreTranscript(state: SessionState, sessionId: string, entries: TranscriptEntry[], truncated: boolean): SessionState {
+  let next: SessionState = {
+    ...state,
+    items: [],
+    permissions: [],
+    todos: [],
+    status: state.status ? { ...state.status, session_id: sessionId } : state.status,
+  }
+  if (truncated) next = push(next, { kind: 'notice', text: 'Earlier messages of this chat are not shown.' })
+  for (const entry of entries) {
+    switch (entry.kind) {
+      case 'user':
+        next = push(next, { kind: 'user', text: entry.text, attachments: [] })
+        break
+      case 'assistant':
+        next = push(next, { kind: 'assistant', text: entry.text, streaming: false })
+        break
+      case 'tool_call':
+        next = push(next, {
+          kind: 'tool',
+          id: entry.id,
+          name: entry.name,
+          input: entry.input,
+          // Without a result it never finished (interrupted, or the engine stopped).
+          state: 'error',
+          view: toolView(entry.name, entry.input, state.status?.cwd),
+          output: null,
+          permissionId: null,
+        })
+        break
+      case 'tool_result': {
+        const index = findLastIndex(next.items, (item) => item.kind === 'tool' && item.id === entry.id)
+        if (index < 0) break
+        const item = next.items[index] as Extract<TranscriptItem, { kind: 'tool' }>
+        const denied = entry.is_error && /denied by (the )?user/.test(entry.output)
+        next = {
+          ...next,
+          items: replaceAt(next.items, index, {
+            ...item,
+            state: denied ? 'denied' : entry.is_error ? 'error' : 'done',
+            output: entry.output,
+            view: withResult(item.view, item.name, entry.output, entry.is_error),
+          }),
+        }
+        break
+      }
+    }
+  }
+  return next
 }
 
 function sameJson(a: string, b: string): boolean {
@@ -328,8 +468,25 @@ export function account(state: SessionState): AccountInfo | null {
 
 /** The agent waits for an answer to a question. */
 export function openQuestion(state: SessionState): string | null {
+  return openQuestionItem(state)?.text ?? null
+}
+
+/** The unanswered question, with its id and options when the engine sent them. */
+export function openQuestionItem(state: SessionState): Extract<TranscriptItem, { kind: 'question' }> | null {
   const item = findLastIndex(state.items, (entry) => entry.kind === 'question' && !entry.answered)
-  return item >= 0 ? (state.items[item] as Extract<TranscriptItem, { kind: 'question' }>).text : null
+  return item >= 0 ? (state.items[item] as Extract<TranscriptItem, { kind: 'question' }>) : null
+}
+
+/** The engine lists this feature on `ready`. */
+export function hasFeature(state: SessionState, feature: string): boolean {
+  return state.features.includes(feature)
+}
+
+/** The `Agent` calls whose sub-agents run now. */
+export function runningSubagents(state: SessionState): Array<Extract<TranscriptItem, { kind: 'tool' }>> {
+  return state.items.filter(
+    (item): item is Extract<TranscriptItem, { kind: 'tool' }> => item.kind === 'tool' && item.subagent?.running === true,
+  )
 }
 
 /** The paths a session's tool calls wrote or edited, newest first, for a "changes" list. */

@@ -73,7 +73,7 @@ describe('lines', () => {
 
   test('event lines parse; unknown types and junk are reported, not thrown', () => {
     expect(parseUiEventLine('{"type":"turn_finished"}')).toEqual({ ok: true, event: { type: 'turn_finished' } })
-    expect(parseUiEventLine('{"type":"subagent_started"}')).toEqual({ ok: false, reason: 'unknown_type', type: 'subagent_started' })
+    expect(parseUiEventLine('{"type":"future_event"}')).toEqual({ ok: false, reason: 'unknown_type', type: 'future_event' })
     expect(parseUiEventLine('not json').ok).toBe(false)
     expect(parseUiEventLine('{"no":"type"}').ok).toBe(false)
   })

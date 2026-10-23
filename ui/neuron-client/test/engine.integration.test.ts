@@ -177,4 +177,41 @@ describe.skipIf(!haveEngineBinaries)('the real engine', () => {
     },
     TIMEOUT,
   )
+
+  test(
+    'chat history: list the chats, resume one, and its conversation comes back',
+    async () => {
+      const { home, transport } = engineFor('history')
+      const controller = new SessionController(transport)
+      try {
+        await controller.start()
+        const state = () => controller.getState()
+        expect(state().features).toEqual(expect.arrayContaining(['sessions', 'trust_workspace', 'capabilities']))
+        controller.send('PARITY_SCENARIO:write_file_allowed')
+        await until('the first turn', () => !state().busy && state().usage !== null)
+        const first = state().status!.session_id
+
+        controller.newChat()
+        await until('a fresh chat', () => !state().busy && state().status?.session_id !== first)
+        expect(state().items.filter((item) => item.kind !== 'user' && item.kind !== 'notice')).toEqual([])
+
+        controller.listSessions()
+        await until('the chat list', () => state().sessions !== null)
+        const listed = state().sessions!.find((session) => session.id === first)
+        expect(listed).toMatchObject({ title: 'PARITY_SCENARIO:write_file_allowed', current: false })
+
+        controller.resume(first)
+        await until('the old chat', () => state().status?.session_id === first && state().items.some((item) => item.kind === 'tool'))
+        expect(state().items[0]).toMatchObject({ kind: 'user', text: 'PARITY_SCENARIO:write_file_allowed' })
+        const [write] = tools(state())
+        expect(write).toMatchObject({ name: 'write_file', state: 'done' })
+        expect(write.view.target).toBe('generated/output.txt')
+        expect(text(state())).toContain('write_file succeeded')
+      } finally {
+        await controller.close()
+        home.remove()
+      }
+    },
+    TIMEOUT,
+  )
 })

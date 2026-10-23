@@ -9,7 +9,7 @@ import { additionDiff, diffLines, parseUnifiedDiff, type Diff } from './diff'
 
 export type ToolKind = 'terminal' | 'read' | 'write' | 'edit' | 'search' | 'web' | 'todo' | 'agent' | 'skill' | 'mcp' | 'other'
 
-export interface TodoItem {
+export interface ToolTodo {
   text: string
   status: 'pending' | 'in_progress' | 'completed'
 }
@@ -24,7 +24,7 @@ export interface ToolView {
   diff?: Diff
   /** Text output worth showing (stdout, a file's content, matches). */
   output?: string
-  todos?: TodoItem[]
+  todos?: ToolTodo[]
   /** For `mcp__server__tool` calls. */
   mcp?: { server: string; tool: string }
 }
