@@ -68,8 +68,6 @@ jobs:
       DOWNLOAD_PAGE_URL: ${{ vars.DOWNLOAD_PAGE_URL || 'https://zero-x.live/download' }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
 
       - name: Choose dry run or upload
         id: mode
