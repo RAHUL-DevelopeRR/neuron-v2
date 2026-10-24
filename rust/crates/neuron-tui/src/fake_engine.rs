@@ -85,7 +85,13 @@ fn run(
             }
             EngineCommand::Slash { .. }
             | EngineCommand::SetModel { .. }
-            | EngineCommand::ListModels => {}
+            | EngineCommand::ListModels
+            | EngineCommand::Capabilities { .. }
+            | EngineCommand::Answer { .. }
+            | EngineCommand::ListSessions
+            | EngineCommand::Resume { .. }
+            | EngineCommand::TrustWorkspace
+            | EngineCommand::ListExtensions => {}
         }
     }
     log

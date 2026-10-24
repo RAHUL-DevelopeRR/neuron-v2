@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use crate::session::{Session, SessionError};
+use crate::session::{ContentBlock, MessageRole, Session, SessionError};
 
 /// Per-worktree session store that namespaces on-disk session files by
 /// workspace fingerprint so that parallel `opencode serve` instances never
@@ -269,6 +269,8 @@ impl SessionStore {
                         continue;
                     }
                     ManagedSessionSummary {
+                        title: session_title(&session),
+                        model: session.model.clone(),
                         id: session.session_id,
                         path,
                         updated_at_ms: session.updated_at_ms,
@@ -296,6 +298,8 @@ impl SessionStore {
                     message_count: 0,
                     parent_session_id: None,
                     branch_name: None,
+                    title: None,
+                    model: None,
                 },
             };
             sessions.push(summary);
@@ -353,6 +357,41 @@ pub struct ManagedSessionSummary {
     pub message_count: usize,
     pub parent_session_id: Option<String>,
     pub branch_name: Option<String>,
+    /// The first prompt, on one line and shortened, for a session list.
+    pub title: Option<String>,
+    /// The model the session last ran on.
+    pub model: Option<String>,
+}
+
+/// How long a session title gets, in characters.
+const SESSION_TITLE_CHARS: usize = 80;
+
+/// The first prompt as typed (or, in sessions saved before the prompt history, the
+/// first user message): its first non-empty line, shortened.
+fn session_title(session: &Session) -> Option<String> {
+    let first_message = || {
+        session
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::User)
+            .flat_map(|message| &message.blocks)
+            .find_map(|block| match block {
+                ContentBlock::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
+                _ => None,
+            })
+    };
+    let text = session
+        .prompt_history
+        .first()
+        .map(|entry| entry.text.as_str())
+        .or_else(first_message)?;
+    let line = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+    Some(if line.chars().count() > SESSION_TITLE_CHARS {
+        let cut: String = line.chars().take(SESSION_TITLE_CHARS - 1).collect();
+        format!("{}\u{2026}", cut.trim_end())
+    } else {
+        line.to_string()
+    })
 }
 
 fn sort_managed_sessions(sessions: &mut [ManagedSessionSummary]) {
@@ -582,8 +621,8 @@ mod tests {
     use super::{
         create_managed_session_handle_for, fork_managed_session_for, is_session_reference_alias,
         list_managed_sessions_for, load_managed_session_for, resolve_session_reference_for,
-        workspace_fingerprint, ManagedSessionSummary, SessionControlError, SessionStore,
-        LATEST_SESSION_REFERENCE,
+        session_title, workspace_fingerprint, ManagedSessionSummary, SessionControlError,
+        SessionStore, LATEST_SESSION_REFERENCE, SESSION_TITLE_CHARS,
     };
     use crate::session::Session;
     use std::fs;
@@ -668,6 +707,8 @@ mod tests {
                 message_count: 2,
                 parent_session_id: None,
                 branch_name: None,
+                title: None,
+                model: None,
             },
             ManagedSessionSummary {
                 id: "newer-file-older-session".to_string(),
@@ -677,6 +718,8 @@ mod tests {
                 message_count: 1,
                 parent_session_id: None,
                 branch_name: None,
+                title: None,
+                model: None,
             },
         ];
 
@@ -703,7 +746,35 @@ mod tests {
         assert_eq!(sessions[0].id, newer.session_id);
         assert_eq!(summary_by_id(&sessions, &older.session_id).message_count, 1);
         assert_eq!(summary_by_id(&sessions, &newer.session_id).message_count, 1);
+        assert_eq!(
+            summary_by_id(&sessions, &older.session_id).title.as_deref(),
+            Some("older session")
+        );
         fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    /// A list shows each session by its first prompt: the one typed (the prompt history)
+    /// over the message the model got, on one line and shortened.
+    #[test]
+    fn titles_are_the_first_prompt_on_one_short_line() {
+        let mut session = Session::new();
+        assert_eq!(session_title(&session), None);
+        session
+            .push_user_text("\n  Fix the login bug\nin auth.rs")
+            .expect("message");
+        assert_eq!(
+            session_title(&session).as_deref(),
+            Some("Fix the login bug")
+        );
+        session
+            .prompt_history
+            .push(crate::session::SessionPromptEntry {
+                timestamp_ms: 1,
+                text: "x".repeat(100),
+            });
+        let title = session_title(&session).expect("a title");
+        assert_eq!(title.chars().count(), SESSION_TITLE_CHARS);
+        assert!(title.ends_with('\u{2026}'));
     }
 
     #[test]
