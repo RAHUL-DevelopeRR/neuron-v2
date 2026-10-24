@@ -780,7 +780,7 @@ pub(crate) fn render_memory_report() -> Result<String, Box<dyn std::error::Error
     if project_context.instruction_files.is_empty() {
         lines.push("Discovered files".to_string());
         lines.push(
-            "  No CLAUDE instruction files discovered in the current directory ancestry."
+            "  No instruction files (NEURON.md, AGENTS.md) in this folder or the ones above it."
                 .to_string(),
         );
     } else {
@@ -836,6 +836,38 @@ pub(crate) fn init_claude_md() -> Result<String, Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--help`, `/help`, the help topics and every command summary never name another
+    /// product. Provider and model ids (`anthropic`, `claude-*`) are lowercase identifiers
+    /// and stay allowed.
+    #[test]
+    fn help_text_names_no_other_product() {
+        let mut cli_help = Vec::new();
+        crate::executor::print_help_to(&mut cli_help).expect("help renders");
+        let mut texts = vec![
+            String::from_utf8(cli_help).expect("help is utf-8"),
+            render_repl_help(),
+        ];
+        texts.extend(
+            [
+                LocalHelpTopic::Status,
+                LocalHelpTopic::Sandbox,
+                LocalHelpTopic::Doctor,
+                LocalHelpTopic::Acp,
+            ]
+            .map(render_help_topic),
+        );
+        texts.extend(
+            commands::slash_command_specs()
+                .iter()
+                .map(|spec| format!("/{}: {}", spec.name, spec.summary)),
+        );
+        for text in texts {
+            for brand in ["Claude", "Anthropic"] {
+                assert!(!text.contains(brand), "{brand} in: {text}");
+            }
+        }
+    }
 
     #[test]
     fn the_banner_welcomes_a_new_account_and_names_it() {

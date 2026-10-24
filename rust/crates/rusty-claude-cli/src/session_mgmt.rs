@@ -71,7 +71,9 @@ pub fn new_cli_session() -> Result<Session, Box<dyn std::error::Error>> {
 pub fn create_managed_session_handle(
     session_id: &str,
 ) -> Result<SessionHandle, Box<dyn std::error::Error>> {
-    let handle = current_session_store()?.create_handle(session_id);
+    let store = current_session_store()?;
+    crate::session_presence::record_project(store.workspace_root());
+    let handle = store.create_handle(session_id);
     Ok(SessionHandle {
         id: handle.id,
         path: handle.path,

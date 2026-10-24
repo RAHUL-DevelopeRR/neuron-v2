@@ -52,7 +52,11 @@ mod credentials;
 mod device_login;
 mod doctor;
 mod engine;
+mod engine_account;
+mod engine_reports;
 mod engine_stdio;
+mod engine_trust;
+mod error_detail;
 mod executor;
 mod full_screen;
 mod gateway_catalog;
@@ -71,6 +75,7 @@ mod repl_loop;
 mod repo_map;
 mod reports;
 mod session_mgmt;
+mod session_presence;
 mod shell_pty;
 mod status_ui;
 mod stream_buffer;
@@ -6588,10 +6593,8 @@ mod tests {
     fn formats_namespaced_omc_slash_command_with_contract_guidance() {
         let report = format_unknown_slash_command_message("oh-my-claudecode:hud");
         assert!(report.contains("unknown slash command: /oh-my-claudecode:hud"));
-        assert!(report.contains("Claude Code/OMC plugin command"));
-        assert!(report.contains("plugin slash commands"));
-        assert!(report.contains("statusline"));
-        assert!(report.contains("session hooks"));
+        assert!(report.contains("does not yet load plugin slash commands"));
+        assert!(!report.contains("Claude"), "{report}");
     }
 
     #[test]
@@ -7613,8 +7616,8 @@ UU conflicted.rs",
     fn unknown_omc_slash_command_guidance_explains_runtime_gap() {
         let message = format_unknown_slash_command("oh-my-claudecode:hud");
         assert!(message.contains("Unknown slash command: /oh-my-claudecode:hud"));
-        assert!(message.contains("Claude Code/OMC plugin command"));
         assert!(message.contains("does not yet load plugin slash commands"));
+        assert!(!message.contains("Claude"), "{message}");
     }
 
     #[test]

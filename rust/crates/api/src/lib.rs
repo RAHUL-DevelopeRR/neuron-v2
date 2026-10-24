@@ -29,9 +29,10 @@ pub use prompt_cache::{
 pub use providers::anthropic::{AnthropicClient, AnthropicClient as ApiClient, AuthSource};
 pub use providers::openai_compat::{
     build_chat_completion_request, flatten_tool_result_content, install_openai_compat_endpoint,
-    installed_openai_compat_endpoint, is_reasoning_model, model_rejects_is_error_field,
-    translate_message, OpenAiCompatClient, OpenAiCompatConfig, OpenAiCompatEndpoint, UsageObserver,
-    DEFAULT_ZERO_X_BASE_URL, ZERO_X_PROVIDER_NAME,
+    installed_openai_compat_endpoint, is_reasoning_model, last_quota_remaining,
+    model_rejects_is_error_field, translate_message, OpenAiCompatClient, OpenAiCompatConfig,
+    OpenAiCompatEndpoint, QuotaRemaining, UsageObserver, DEFAULT_ZERO_X_BASE_URL,
+    ZERO_X_PROVIDER_NAME,
 };
 pub use providers::{
     detect_provider_kind, max_tokens_for_model, max_tokens_for_model_with_override,

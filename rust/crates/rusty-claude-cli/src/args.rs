@@ -953,7 +953,7 @@ pub(crate) fn format_unknown_slash_command(name: &str) -> String {
 pub(crate) fn omc_compatibility_note_for_unknown_slash_command(name: &str) -> Option<&'static str> {
     name.starts_with("oh-my-claudecode:")
         .then_some(
-            "Compatibility note: `/oh-my-claudecode:*` is a Claude Code/OMC plugin command. `neuron` does not yet load plugin slash commands, Claude statusline stdin, or OMC session hooks.",
+            "Note: this looks like a plugin slash command. `neuron` does not yet load plugin slash commands.",
         )
 }
 

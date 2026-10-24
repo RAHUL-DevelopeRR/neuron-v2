@@ -83,10 +83,11 @@ pub use config::{
     ConfigEntry, ConfigError, ConfigLoader, ConfigSource, IgnoredProjectSettings,
     McpConfigCollection, McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig,
     McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
-    McpWebSocketServerConfig, OAuthConfig, ProjectSettingsAction, ProjectTrust,
-    ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
-    RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
-    CLAW_SETTINGS_SCHEMA_NAME, UNTRUSTED_WORKSPACE_KEYS,
+    McpWebSocketServerConfig, OAuthConfig, PreviewHook, PreviewMcpServer, PreviewPermissionRule,
+    ProjectSettingsAction, ProjectTrust, ProviderFallbackConfig, ResolvedPermissionMode,
+    RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig, RuntimePermissionRuleConfig,
+    RuntimePluginConfig, ScopedMcpServerConfig, WorkspaceTrustPreview, CLAW_SETTINGS_SCHEMA_NAME,
+    UNTRUSTED_WORKSPACE_KEYS,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
@@ -160,8 +161,8 @@ pub use policy_engine::{
     PolicyEngine, PolicyRule, ReconcileReason, ReviewStatus,
 };
 pub use prompt::{
-    load_system_prompt, prepend_bullets, workspace_git_status, ContextFile, ProjectContext,
-    PromptBuildError, SystemPromptBuilder, FRONTIER_MODEL_NAME, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+    load_system_prompt, prepend_bullets, set_prompt_model, workspace_git_status, ContextFile,
+    ProjectContext, PromptBuildError, SystemPromptBuilder, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
 pub use recovery_recipes::{
     attempt_recovery, recipe_for, EscalationPolicy, FailureScenario, RecoveryContext,

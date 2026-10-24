@@ -1474,7 +1474,7 @@ mod tests {
         let mut body = serde_json::json!({
             "model": "claude-sonnet-4-6",
             "max_tokens": 1024,
-            "betas": ["claude-code-20250219", "prompt-caching-scope-2026-01-05"],
+            "betas": ["prompt-caching-scope-2026-01-05", "tools-2026-04-01"],
             "metadata": {"source": "test"},
         });
 
