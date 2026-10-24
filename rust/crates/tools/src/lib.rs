@@ -1630,32 +1630,45 @@ fn maybe_enforce_permission_check_with_mode(
     }
 }
 
-/// Asks on the terminal: prints the question (and numbered options) and reads one line.
+/// What `AskUserQuestion` answers (as its error) when the person at the terminal would
+/// not see the question: stdout and stderr both go to files or pipes.
+const UNSEEN_QUESTION_REFUSAL: &str =
+    "no one can see questions in this run (its output is not a terminal); decide yourself and say what you assumed";
+
+/// Asks on the terminal: writes the question (and numbered options) where the user sees
+/// it (stdout, or stderr when stdout is redirected; see
+/// [`runtime::ui_hooks::PromptStream`]) and reads one line from stdin.
 fn ask_on_terminal(input: &AskUserQuestionInput) -> Result<String, String> {
-    use std::io::{self, BufRead, Write};
+    use std::io::{self, BufRead};
 
-    let stdout = io::stdout();
-    let stdin = io::stdin();
-    let mut out = stdout.lock();
-
-    writeln!(out, "\n[Question] {}", input.question).map_err(|e| e.to_string())?;
-
-    if let Some(ref options) = input.options {
-        for (i, option) in options.iter().enumerate() {
-            writeln!(out, "  {}. {}", i + 1, option).map_err(|e| e.to_string())?;
-        }
-        write!(out, "Enter choice (1-{}): ", options.len()).map_err(|e| e.to_string())?;
-    } else {
-        write!(out, "Your answer: ").map_err(|e| e.to_string())?;
-    }
-    out.flush().map_err(|e| e.to_string())?;
+    let Some(stream) = runtime::ui_hooks::PromptStream::current() else {
+        return Err(UNSEEN_QUESTION_REFUSAL.to_string());
+    };
+    write_question(&mut stream.writer(), input).map_err(|e| e.to_string())?;
 
     let mut response = String::new();
-    stdin
+    io::stdin()
         .lock()
         .read_line(&mut response)
         .map_err(|e| e.to_string())?;
     Ok(response)
+}
+
+/// The question as [`ask_on_terminal`] shows it, ending in the answer prompt.
+fn write_question(
+    out: &mut dyn std::io::Write,
+    input: &AskUserQuestionInput,
+) -> std::io::Result<()> {
+    writeln!(out, "\n[Question] {}", input.question)?;
+    if let Some(ref options) = input.options {
+        for (i, option) in options.iter().enumerate() {
+            writeln!(out, "  {}. {}", i + 1, option)?;
+        }
+        write!(out, "Enter choice (1-{}): ", options.len())?;
+    } else {
+        write!(out, "Your answer: ")?;
+    }
+    out.flush()
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -11216,5 +11229,29 @@ printf 'pwsh:%s' "$1"
             )
             .into_bytes()
         }
+    }
+}
+
+#[cfg(test)]
+mod ask_on_terminal_tests {
+    use super::{write_question, AskUserQuestionInput};
+
+    /// The question and its answer prompt go to the stream chosen for it (stderr when
+    /// stdout is redirected), all of it.
+    #[test]
+    fn the_question_goes_to_the_stream_it_is_given() {
+        let mut out = Vec::new();
+        write_question(
+            &mut out,
+            &AskUserQuestionInput {
+                question: "Which branch?".to_string(),
+                options: Some(vec!["main".to_string(), "dev".to_string()]),
+            },
+        )
+        .expect("written");
+        assert_eq!(
+            String::from_utf8(out).expect("utf-8"),
+            "\n[Question] Which branch?\n  1. main\n  2. dev\nEnter choice (1-2): "
+        );
     }
 }

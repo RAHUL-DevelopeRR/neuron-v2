@@ -6,9 +6,10 @@
 // scripts/windows-console/*.txt, played by ConPtyDrive.cs, which this compiles
 // with the csc.exe that ships with Windows. Then, in a classic console window
 // (classic-console-check.ps1 with ConsoleKeys.cs): three exits the window must
-// survive with the --continue hint, its title, the line REPL's first screens,
-// and NEURON_CONSOLE_STRESS (3) launches through `neuron` that must still
-// read the keyboard.
+// survive with the --continue hint, its title, a command typed right after
+// quitting (in cmd and in Windows PowerShell), the console's input mode after
+// the UI is killed, the line REPL's first screens, and NEURON_CONSOLE_STRESS
+// (3) launches through `neuron` that must still read the keyboard.
 //
 //   bun run check:console
 //
@@ -121,6 +122,31 @@ for (const [mode, keys, label, flags] of [
 results.push(
   classic('bare', `${turn}|/exit<CR><THEN>echo early42<CR>`, 'a command typed right after /exit reaches the shell', {
     flags: ['-Direct', '-ShellGets', 'early42'],
+  }),
+)
+// The same in Windows PowerShell, whose PSReadLine read such a command's Enter
+// as a literal "m" while the console still had the UI's virtual-terminal input
+// on: the UI turns that off as soon as the quit is asked for.
+for (const [keys, typed, label] of [
+  [`${turn}|/exit<CR><THEN>echo early43<CR>`, 'early43', '/exit'],
+  [`${turn}|<CC>|<CC><THEN>echo early44<CR>`, 'early44', 'Ctrl-C twice'],
+] as const) {
+  results.push(
+    classic('bare', keys, `a command typed right after ${label} reaches Windows PowerShell`, {
+      flags: ['-Direct', '-Shell', 'powershell', '-ShellGets', typed],
+    }),
+  )
+}
+
+// A UI that dies leaves the console's input in its modes (virtual-terminal
+// input on, so cmd's Up arrow types `[A`); `neuron` gives the console its
+// input mode back once the UI has exited. In PowerShell, which starts
+// `neuron` itself and leaves the mode as it finds it; cmd running a batch
+// file puts the mode back on its own. A killed UI leaves no hint.
+results.push(
+  classic('bare', '<ALIVE>|<KILLUI>', "the console's input mode is the shell's again after the UI is killed", {
+    expect: '',
+    flags: ['-Direct', '-Shell', 'powershell', '-InputModeRestored'],
   }),
 )
 

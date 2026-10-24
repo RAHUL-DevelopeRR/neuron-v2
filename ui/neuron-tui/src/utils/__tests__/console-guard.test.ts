@@ -3,12 +3,14 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import {
   BLIND_RESET_AT_MS,
   GUARD_DURATION_MS,
+  GUARD_POLL_MS,
   createConsoleGuard,
   fontToRepair,
 } from '../console-guard'
 import { setTerminalTitleHostForTesting } from '../terminal-title'
 import {
   CONSOLE_FONT_INFOEX_SIZE,
+  ENABLE_VIRTUAL_TERMINAL_INPUT,
   decodeConsoleFont,
   encodeConsoleFont,
   isTrueTypeConsoleFont,
@@ -22,6 +24,10 @@ import {
 const CONSOLAS: ConsoleFont = { index: 0, width: 7, height: 16, family: 54, weight: 400, face: 'Consolas' }
 const RASTER: ConsoleFont = { index: 0, width: 8, height: 12, family: 48, weight: 400, face: 'Terminal' }
 const CASCADIA: ConsoleFont = { index: 0, width: 0, height: 16, family: 54, weight: 400, face: 'Cascadia Mono' }
+// The console's input mode in Windows PowerShell 5.1 as it ran `neuron`, and
+// under the renderer's raw mode (window input and virtual-terminal input).
+const SHELL_INPUT_MODE = 0x1e4
+const RAW_INPUT_MODE = 0x208
 
 /** A classic console window: a title and a font that others change. */
 function fakeConsole(platform: NodeJS.Platform = 'win32') {
@@ -29,6 +35,9 @@ function fakeConsole(platform: NodeJS.Platform = 'win32') {
     title: 'Windows PowerShell' as string | null,
     font: { ...CONSOLAS } as ConsoleFont | null,
     fontSets: [] as ConsoleFont[],
+    // What PowerShell 5.1 left the console in while it ran `neuron`.
+    inputMode: SHELL_INPUT_MODE as number | null,
+    inputModeSets: [] as number[],
   }
   const win32: Win32Console = {
     getTitle: () => state.title,
@@ -40,6 +49,12 @@ function fakeConsole(platform: NodeJS.Platform = 'win32') {
     setFont: (font) => {
       state.fontSets.push(font)
       state.font = { ...font }
+      return true
+    },
+    getInputMode: () => state.inputMode,
+    setInputMode: (mode) => {
+      state.inputModeSets.push(mode)
+      state.inputMode = mode
       return true
     },
   }
@@ -55,12 +70,14 @@ function fakeConsole(platform: NodeJS.Platform = 'win32') {
   })
   let now = 0
   let tick: (() => void) | null = null
+  const intervals: number[] = []
   const guard = createConsoleGuard({
     console: win32,
     isClassicConsole: () => true,
     now: () => now,
-    setInterval: (run) => {
+    setInterval: (run, ms) => {
       tick = run
+      intervals.push(ms)
       return 1
     },
     clearInterval: () => {
@@ -71,7 +88,7 @@ function fakeConsole(platform: NodeJS.Platform = 'win32') {
     now += ms
     tick?.()
   }
-  return { state, guard, advance, polling: () => tick !== null }
+  return { state, guard, advance, intervals, polling: () => tick !== null }
 }
 
 afterEach(() => setTerminalTitleHostForTesting(null))
@@ -119,6 +136,17 @@ describe('the console guard', () => {
     guard.restore()
     expect(state.title).toBe('Windows PowerShell')
     expect(state.font).toEqual(CONSOLAS)
+  })
+
+  test('a PowerShell that starts late is undone within one 25 ms check', () => {
+    const { state, guard, advance, intervals } = fakeConsole()
+    guard.start()
+    expect(intervals).toEqual([GUARD_POLL_MS])
+    expect(GUARD_POLL_MS).toBeLessThanOrEqual(25)
+    advance(8_000)
+    state.title = 'Windows PowerShell'
+    advance(GUARD_POLL_MS)
+    expect(state.title).toBe('Neuron')
   })
 
   test('after a tool result the title is set again and the font repaired', () => {
@@ -170,5 +198,46 @@ describe('the console guard', () => {
     guard.restore()
     expect(state.font).toEqual(CASCADIA)
     expect(state.fontSets).toEqual([])
+  })
+})
+
+describe("the console's input mode", () => {
+  test('on quit only virtual-terminal input goes off; at exit the saved mode comes back', () => {
+    const { state, guard } = fakeConsole()
+    guard.start()
+    // The renderer's raw mode.
+    state.inputMode = RAW_INPUT_MODE
+    guard.endVirtualTerminalInput()
+    // Still raw (a Ctrl-C stays a key), but keys are stored as keys.
+    expect(state.inputMode).toBe(RAW_INPUT_MODE & ~ENABLE_VIRTUAL_TERMINAL_INPUT)
+    guard.restore()
+    expect(state.inputMode).toBe(SHELL_INPUT_MODE)
+  })
+
+  test('a mode without virtual-terminal input is left as it is on quit', () => {
+    const { state, guard } = fakeConsole()
+    guard.start()
+    state.inputMode = 0x8
+    guard.endVirtualTerminalInput()
+    expect(state.inputModeSets).toEqual([])
+  })
+
+  test('without a console nothing is set', () => {
+    const { state, guard } = fakeConsole('linux')
+    state.inputMode = null
+    guard.start()
+    guard.endVirtualTerminalInput()
+    guard.restore()
+    expect(state.inputModeSets).toEqual([])
+  })
+
+  test('the mode is restored once', () => {
+    const { state, guard } = fakeConsole()
+    guard.start()
+    state.inputMode = RAW_INPUT_MODE
+    guard.restore()
+    state.inputMode = RAW_INPUT_MODE
+    guard.restore()
+    expect(state.inputModeSets).toEqual([SHELL_INPUT_MODE])
   })
 })

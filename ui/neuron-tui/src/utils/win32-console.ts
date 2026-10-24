@@ -1,9 +1,16 @@
 /**
  * The few Win32 console calls the UI makes itself, through bun:ffi (as
- * glyphs.ts does for the console window's class): the console's title and its
- * font. Everything here is a no-op returning `null`/`false` off Windows, or
- * when a call fails; the UI never depends on it.
+ * glyphs.ts does for the console window's class): the console's title, its
+ * font and its input mode. Everything here is a no-op returning `null`/`false`
+ * off Windows, or when a call fails; the UI never depends on it.
  */
+
+/**
+ * The input mode bit that has the console turn keys into escape sequences as
+ * they are typed (ENABLE_VIRTUAL_TERMINAL_INPUT). The renderer's raw mode
+ * turns it on; a shell reading keys typed under it gets those sequences.
+ */
+export const ENABLE_VIRTUAL_TERMINAL_INPUT = 0x200
 
 /** A console font, as `GetCurrentConsoleFontEx` reports it (CONSOLE_FONT_INFOEX). */
 export interface ConsoleFont {
@@ -72,6 +79,9 @@ export interface Win32Console {
   setTitle(title: string): boolean
   getFont(): ConsoleFont | null
   setFont(font: ConsoleFont): boolean
+  /** The console input buffer's mode (CONIN$, so it works whatever stdin is). */
+  getInputMode(): number | null
+  setInputMode(mode: number): boolean
 }
 
 const GENERIC_READ_WRITE = 0xc0000000
@@ -92,6 +102,8 @@ type Kernel32 = {
   CloseHandle: (handle: unknown) => number
   GetCurrentConsoleFontEx: (handle: unknown, max: number, info: unknown) => number
   SetCurrentConsoleFontEx: (handle: unknown, max: number, info: unknown) => number
+  GetConsoleMode: (handle: unknown, mode: unknown) => number
+  SetConsoleMode: (handle: unknown, mode: number) => number
 }
 
 let kernel32: { symbols: Kernel32; ptr: (view: ArrayBufferView) => unknown } | null | undefined
@@ -128,6 +140,8 @@ function loadKernel32() {
         args: [FFIType.ptr, FFIType.i32, FFIType.ptr],
         returns: FFIType.i32,
       },
+      GetConsoleMode: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
+      SetConsoleMode: { args: [FFIType.ptr, FFIType.u32], returns: FFIType.i32 },
     })
     kernel32 = {
       symbols: library.symbols as unknown as Kernel32,
@@ -140,13 +154,14 @@ function loadKernel32() {
 }
 
 /**
- * Run `use` with a handle to the console's active screen buffer (CONOUT$, so
- * it works whatever stdout is). `null` when there is no console.
+ * Run `use` with a handle to the console's active screen buffer (CONOUT$) or
+ * its input buffer (CONIN$), so it works whatever stdout and stdin are. `null`
+ * when there is no console.
  */
-function withConsoleOutput<T>(use: (handle: unknown) => T): T | null {
+function withConsole<T>(device: 'CONOUT$' | 'CONIN$', use: (handle: unknown) => T): T | null {
   const k = loadKernel32()
   if (!k) return null
-  const name = wide('CONOUT$')
+  const name = wide(device)
   const handle = k.symbols.CreateFileW(
     k.ptr(name),
     GENERIC_READ_WRITE,
@@ -193,7 +208,7 @@ export const win32Console: Win32Console = {
   },
   getFont() {
     try {
-      return withConsoleOutput((handle) => {
+      return withConsole('CONOUT$', (handle) => {
         const k = loadKernel32()!
         const bytes = new Uint8Array(CONSOLE_FONT_INFOEX_SIZE)
         new DataView(bytes.buffer).setUint32(0, CONSOLE_FONT_INFOEX_SIZE, true)
@@ -207,11 +222,35 @@ export const win32Console: Win32Console = {
   setFont(font) {
     try {
       return (
-        withConsoleOutput((handle) => {
+        withConsole('CONOUT$', (handle) => {
           const k = loadKernel32()!
           // By face and size: a saved table index may name another font now.
           const bytes = encodeConsoleFont({ ...font, index: 0 })
           return k.symbols.SetCurrentConsoleFontEx(handle, 0, k.ptr(bytes)) !== 0
+        }) ?? false
+      )
+    } catch {
+      return false
+    }
+  },
+  getInputMode() {
+    try {
+      return withConsole('CONIN$', (handle) => {
+        const k = loadKernel32()!
+        const mode = new Uint32Array(1)
+        if (k.symbols.GetConsoleMode(handle, k.ptr(mode)) === 0) return null
+        return mode[0]!
+      })
+    } catch {
+      return null
+    }
+  },
+  setInputMode(mode) {
+    try {
+      return (
+        withConsole('CONIN$', (handle) => {
+          const k = loadKernel32()!
+          return k.symbols.SetConsoleMode(handle, mode >>> 0) !== 0
         }) ?? false
       )
     } catch {

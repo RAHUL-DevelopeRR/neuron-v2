@@ -463,9 +463,12 @@ pub fn start_provider(requested_model: &str) -> Result<ProviderStart, Box<dyn st
     }
 }
 
-/// Makes `active` the process's provider, prints its startup line and returns its model.
+/// Makes `active` the process's provider, prints its startup line (not in JSON mode,
+/// whose stderr carries JSON only) and returns its model.
 fn install_active(active: ActiveProvider) -> String {
-    eprintln!("{}", active.startup_line());
+    if !JSON_OUTPUT.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("{}", active.startup_line());
+    }
     let model = active.model.clone();
     set_active_provider(active);
     model
@@ -605,14 +608,28 @@ fn load_catalog_checked(
             }
             let renewed = crate::auth::recover_invalid_session()?;
             if let Err(error) = crate::gateway_catalog::load(base, Some(renewed.token.expose())) {
-                eprintln!("warning: {error}");
+                warn(&error.to_string());
             }
             Ok(renewed)
         }
         Err(error) => {
-            eprintln!("warning: {error}; model limits fall back to built-in defaults");
+            warn(&format!(
+                "{error}; model limits fall back to built-in defaults"
+            ));
             Ok(credential)
         }
+    }
+}
+
+/// `warning: <message>` on stderr, or in JSON mode the same as a JSON line.
+fn warn(message: &str) {
+    if JSON_OUTPUT.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "{}",
+            serde_json::json!({ "type": "warning", "warning": format!("warning: {message}") })
+        );
+    } else {
+        eprintln!("warning: {message}");
     }
 }
 

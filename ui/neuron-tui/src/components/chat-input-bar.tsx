@@ -350,6 +350,7 @@ export const ChatInputBar = ({
             onKeyIntercept={handleKeyIntercept}
             placeholder={effectivePlaceholder}
             focused={inputFocused}
+            takesKeysUnfocused
             maxHeight={compactMaxHeight}
             ref={inputRef}
             cursorPosition={cursorPosition}
@@ -446,6 +447,7 @@ export const ChatInputBar = ({
                 onKeyIntercept={handleKeyIntercept}
                 placeholder={effectivePlaceholder}
                 focused={inputFocused}
+                takesKeysUnfocused
                 maxHeight={Math.floor(terminalHeight / 2)}
                 ref={inputRef}
                 cursorPosition={cursorPosition}

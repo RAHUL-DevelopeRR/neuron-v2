@@ -320,6 +320,34 @@ blocked.
   - Interrupt notices from the engine no longer carry the line REPL's "press
     Ctrl-C again" wording, and "■ Interrupting…" lasts only until the turn ends.
     The sign-in panel's `/login` is the one sign-in instruction.
+- Changed after the second end-to-end run (round 5):
+  - A command typed in Windows PowerShell within about half a second of
+    `/exit` or Ctrl-C did not run: its Enter arrived as a character (`dirm`).
+    The renderer's raw mode turns on the console's virtual-terminal input,
+    under which the console stores each key down as the character it types,
+    with no key code, and PSReadLine inserts such an Enter as text. The UI now
+    turns that mode off as soon as the quit is asked for, and gives the console
+    its saved input mode back at exit (`console-guard.ts`).
+  - A UI that was killed left virtual-terminal input on, so cmd's Up arrow
+    typed `[A`. `neuron` saves the console's input mode before it starts the UI
+    and puts it back once the UI has exited
+    (`rust/crates/rusty-claude-cli/src/full_screen.rs`).
+  - Started without `neuron`, the UI's watchdog PowerShells showed "Windows
+    PowerShell" in the title until the next check, up to 250 ms later; on a
+    busy machine one started 8 s in. The title is now checked every 25 ms for
+    the first 12 s. A PowerShell that starts while the UI is still loading its
+    renderer still shows its title for about 0.2 s (no check runs until that
+    load is done). Launches through `neuron` start no PowerShell at all.
+  - Keys were dropped while the terminal's last focus report said it had lost
+    the focus, so a window that got and lost the foreground again looked dead
+    until the next focus-in. Only a focused terminal gets keys: a key now
+    counts as a focus-in (`terminal-protocol-controller.ts`), and the chat input
+    takes keys whatever the reports say.
+  - `bun run check:console` covers the first two: a command typed right after
+    `/exit` and after Ctrl-C must run in Windows PowerShell, and after the UI is
+    killed PowerShell's prompt must not have virtual-terminal input on. Keys
+    after `<THEN>` now go in as one batch, as a fast typist's do; typed one at a
+    time, the late Enter missed the window and the check passed anyway.
 - `!cmd` and `/bash` show "Shell commands (!) are not available in this build of
   the Neuron UI yet."
 - These slash commands are the UI's own: `help`, `new`, `copy`, `export`,

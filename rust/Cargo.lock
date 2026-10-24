@@ -1859,6 +1859,7 @@ dependencies = [
  "compat-harness",
  "constant_time_eq",
  "crossterm",
+ "crossterm_winapi",
  "dirs",
  "hex",
  "hmac",

@@ -322,25 +322,6 @@ fn failed_turn_json(error: &str, model: &str, messages: &[ConversationMessage]) 
     })
 }
 
-/// Read piped stdin content when stdin is not a terminal.
-///
-/// Returns `None` when stdin is attached to a terminal (interactive REPL use),
-/// when reading fails, or when the piped content is empty after trimming.
-/// Returns `Some(raw_content)` when a pipe delivered non-empty content.
-fn read_piped_stdin() -> Option<String> {
-    if io::stdin().is_terminal() {
-        return None;
-    }
-    let mut buffer = String::new();
-    if io::stdin().read_to_string(&mut buffer).is_err() {
-        return None;
-    }
-    if buffer.trim().is_empty() {
-        return None;
-    }
-    Some(buffer)
-}
-
 /// Merge a piped stdin payload into a prompt argument.
 ///
 /// When `stdin_content` is `None` or empty after trimming, the prompt is
@@ -448,7 +429,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             run_stale_base_preflight(base_commit.as_deref());
             progress::set_mcp_startup(McpStartup::WaitWithoutBundled);
             // Workspace trust check (skip when stdin is piped so we don't consume the pipe)
-            if std::io::stdin().is_terminal() {
+            if runtime::ui_hooks::stdin_is_terminal() {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 if !crate::auth::check_trust(&cwd) {
                     std::process::exit(1);
@@ -463,23 +444,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // use gpt-5.5, when falling back to OpenRouter we MUST switch
             // to the free-tier model regardless of what the user passed.
             let effective_model = configure_provider_for_model(model)?;
-            // Only consume piped stdin as prompt context when the permission
-            // mode is fully unattended. In modes where the permission
-            // prompter may invoke CliPermissionPrompter::decide(), stdin
-            // must remain available for interactive approval; otherwise the
-            // prompter's read_line() would hit EOF and deny every request.
-            let stdin_context = if matches!(permission_mode, PermissionMode::DangerFullAccess) {
-                read_piped_stdin()
-            } else {
-                None
-            };
-            // If -p was used with no trailing text, read piped stdin regardless of
-            // permission mode so `echo 'hello' | neuron -p` works as expected.
-            let stdin_context = if prompt.trim().is_empty() {
-                read_piped_stdin()
-            } else {
-                stdin_context
-            };
+            // `cat log | neuron prompt "explain this log"`: what stdin carries is context
+            // for the prompt, in any permission mode. A run whose stdin is not a terminal
+            // never asks for approval (approvals and questions are refused), so reading
+            // it takes nothing from them. `echo 'hello' | neuron -p`: stdin is the prompt.
+            let stdin_context = headless::stdin_context(!prompt.trim().is_empty(), output_format);
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
             let mut cli = LiveCli::new(effective_model, true, allowed_tools, permission_mode)?;
             cli.set_reasoning_effort(reasoning_effort);
@@ -2833,7 +2802,8 @@ impl LiveCli {
             TerminalRenderer::new().color_theme(),
             &mut stdout,
         )?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode)
+            .stopping(self.runtime.cancellation_token().clone());
         let result = self
             .runtime
             .run_turn(actual_input, Some(&mut permission_prompter));
@@ -2842,11 +2812,16 @@ impl LiveCli {
         // rewriting the full snapshot keeps disk and memory identical however
         // the turn ended (including failures and interruptions).
         let persisted = self.persist_session();
+        // Stopped at the denial limit, not by the user: the run's last line says why.
+        let stopped_by_denials = headless::stopped();
         match result {
             Ok(summary) => {
                 let renderer = TerminalRenderer::new();
                 let theme = renderer.color_theme();
                 match &summary.outcome {
+                    runtime::TurnOutcome::Cancelled { .. } if stopped_by_denials => {
+                        spinner.fail("Stopped", theme, &mut stdout)?;
+                    }
                     runtime::TurnOutcome::Cancelled { .. } => {
                         spinner.fail("Interrupted", theme, &mut stdout)?;
                     }
@@ -2871,7 +2846,9 @@ impl LiveCli {
                 } else {
                     repl_loop::QuitHint::Shown
                 };
-                if let Some(notice) = repl_loop::describe_turn_outcome(&summary, hint) {
+                if let Some(notice) =
+                    repl_loop::describe_turn_outcome(&summary, hint).filter(|_| !stopped_by_denials)
+                {
                     println!("{notice}");
                 }
                 persisted?;
@@ -2914,7 +2891,8 @@ impl LiveCli {
         input: &str,
     ) -> Result<runtime::TurnSummary, Box<dyn std::error::Error>> {
         let hook_abort_monitor = self.prepare_turn_runtime(false)?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode)
+            .stopping(self.runtime.cancellation_token().clone());
         let result = self.runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         self.persist_session()?;
@@ -2943,6 +2921,16 @@ impl LiveCli {
                 return Err(error);
             }
         };
+        if let Some(stop) = headless::stop_message() {
+            // Stopped at the denial limit: an error answer, with what the turn did. The
+            // exit code and the stderr line come from `headless::report`.
+            let messages = self.runtime.session().messages.get(before..).unwrap_or(&[]);
+            println!(
+                "{}",
+                failed_turn_json(&stop, shown_model(&self.model), messages)
+            );
+            return Ok(());
+        }
         println!(
             "{}",
             json!({
@@ -5368,6 +5356,46 @@ mod tests {
 
         // then
         assert_eq!(merged, "standalone body");
+    }
+
+    /// `cat log | neuron prompt "explain this log"`: the log reaches the model after
+    /// the prompt; a pipe that sends nothing leaves the prompt as typed.
+    #[test]
+    fn piped_stdin_is_merged_into_the_prompt_and_a_silent_pipe_is_not() {
+        let log = "2026-10-24 ERROR db timeout\n2026-10-24 ERROR retry failed\n";
+        let read = crate::headless::read_piped(
+            std::io::Cursor::new(log),
+            Some(crate::headless::STDIN_WAIT),
+            crate::headless::STDIN_MAX_BYTES,
+        );
+        let crate::headless::PipedStdin::Text { text, truncated } = read else {
+            panic!("the log was read: {read:?}");
+        };
+        assert!(!truncated);
+        assert_eq!(
+            merge_prompt_with_stdin("explain this log", Some(&text)),
+            "explain this log\n\n2026-10-24 ERROR db timeout\n2026-10-24 ERROR retry failed"
+        );
+
+        struct Silent(std::sync::mpsc::Receiver<()>);
+        impl std::io::Read for Silent {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                let _ = self.0.recv();
+                Ok(0)
+            }
+        }
+        let (release, never) = std::sync::mpsc::channel();
+        let read = crate::headless::read_piped(
+            Silent(never),
+            Some(crate::headless::STDIN_WAIT),
+            crate::headless::STDIN_MAX_BYTES,
+        );
+        drop(release);
+        assert_eq!(read, crate::headless::PipedStdin::Silent);
+        assert_eq!(
+            merge_prompt_with_stdin("explain this log", None),
+            "explain this log"
+        );
     }
 
     #[test]

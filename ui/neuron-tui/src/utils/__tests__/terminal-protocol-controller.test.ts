@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 
 import {
   installTerminalProtocolController,
+  isKeyInput,
   TerminalProtocolController,
 } from '../terminal-protocol-controller'
 
@@ -67,6 +68,38 @@ describe('TerminalProtocolController', () => {
     expect(fixture.dispatchInput('\x1b[A')).toBe(false)
     expect(focusStates).toEqual([false, true])
     expect(supportDetections).toBe(1)
+  })
+
+  test('a key while the terminal reported no focus counts as a focus-in', () => {
+    const fixture = createFixture()
+    const focusStates: boolean[] = []
+    fixture.controller.subscribeToFocus({
+      onFocusChange: (focused) => focusStates.push(focused),
+    })
+
+    fixture.dispatchInput('[O')
+    // A mouse report or a paste reaches an unfocused terminal too.
+    expect(fixture.dispatchInput('[<35;10;5M')).toBe(false)
+    expect(fixture.dispatchInput('[200~text[201~')).toBe(false)
+    expect(focusStates).toEqual([false])
+    // A key does not; it is not consumed either.
+    expect(fixture.dispatchInput('h')).toBe(false)
+    expect(focusStates).toEqual([false, true])
+    fixture.dispatchInput('i')
+    expect(focusStates).toEqual([false, true])
+  })
+
+  test('keys before any focus report change nothing', () => {
+    const fixture = createFixture()
+    const focusStates: boolean[] = []
+    fixture.controller.subscribeToFocus({
+      onFocusChange: (focused) => focusStates.push(focused),
+    })
+    fixture.dispatchInput('h')
+    expect(focusStates).toEqual([])
+    expect(isKeyInput('[A')).toBe(true)
+    expect(isKeyInput('[M !!')).toBe(false)
+    expect(isKeyInput('')).toBe(false)
   })
 
   test('replays detected focus state to a late subscriber', () => {

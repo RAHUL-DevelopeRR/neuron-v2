@@ -102,10 +102,10 @@ pub use conversation::{
     INTERRUPTED_TOOL_RESULT, MAX_ITERATIONS_ENV_VAR,
 };
 pub use file_ops::{
-    display_path, edit_file, edit_file_in_workspace, glob_search, grep_search, read_file,
-    read_file_in_workspace, write_file, write_file_in_workspace, EditFileOutput, GlobSearchOutput,
-    GrepSearchInput, GrepSearchOutput, ReadFileOutput, StructuredPatchHunk, TextFilePayload,
-    WriteFileOutput,
+    display_path, edit_file, edit_file_in_workspace, glob_search, grep_search,
+    is_blank_search_path, read_file, read_file_in_workspace, write_file, write_file_in_workspace,
+    EditFileOutput, GlobSearchOutput, GrepSearchInput, GrepSearchOutput, ReadFileOutput,
+    StructuredPatchHunk, TextFilePayload, WriteFileOutput,
 };
 pub use git_context::{GitCommitEntry, GitContext};
 pub use hooks::{

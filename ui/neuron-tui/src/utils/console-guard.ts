@@ -6,19 +6,28 @@
  * PowerShell" and, in a classic console window whose font is the default
  * TrueType one (HKCU\Console FaceName `__DefaultTTFont__`), switches the window
  * to the raster "Terminal" font, where "…", "›" and "×" degrade. Neither is
- * undone when that PowerShell exits. The UI's terminal-reset watchdog is two
- * such PowerShells (terminal-watchdog.ts), started right after the UI; the
- * engine's PowerShell tool and hooks start more, and a bash tool call's
- * cmd.exe retitles the window to its command. Bun's own switch of the code
+ * undone when that PowerShell exits. Without `neuron` (which is the watchdog
+ * itself), the UI's terminal-reset watchdog is two such PowerShells
+ * (terminal-watchdog.ts), started right after the UI; the engine's PowerShell
+ * tool and hooks start more, and a bash tool call's cmd.exe retitles the
+ * window to its command. Bun's own switch of the code
  * page to 65001 (restored by Bun at exit) leaves the font alone; OpenTUI
  * makes no title, font or code page calls at all.
  *
  * So: at start the console's title and font are saved and the title becomes
- * "Neuron"; for a few seconds the window is checked and put back when one of
+ * "Neuron"; for a few seconds the window is checked (every 25 ms, so their
+ * title shows for a frame or two at most) and put back when one of
  * those PowerShells changed it (re-set blindly at 1 s and 3 s where the title
  * can't be read back); after every tool result the title is set again and the
  * font repaired; and at exit both are restored. Only a font that went from
  * TrueType to raster is "repaired", so a font the user picks is left alone.
+ *
+ * The console's input mode is saved at start too. The renderer's raw mode
+ * turns on virtual-terminal input, under which the console stores each key
+ * down as the character it types, with no key code; Windows PowerShell's
+ * PSReadLine then inserts a typed Enter as a character (`dirm`), so a command
+ * typed while the UI exits never runs. So that mode goes off as soon as the
+ * quit is asked for, and the saved mode comes back at exit.
  */
 
 import { probeConsoleWindowClass } from './glyphs'
@@ -30,14 +39,20 @@ import {
   terminalTitleDrifted,
 } from './terminal-title'
 import {
+  ENABLE_VIRTUAL_TERMINAL_INPUT,
   isTrueTypeConsoleFont,
   win32Console,
   type ConsoleFont,
   type Win32Console,
 } from './win32-console'
 
-/** How often, and for how long after start, the window is checked. */
-export const GUARD_POLL_MS = 250
+/**
+ * How often, and for how long after start, the window is checked. Often: the
+ * title a starting PowerShell sets shows until the next check (for up to
+ * 250 ms when this was 250), and on a busy machine the watchdog's PowerShell
+ * started 8 s in. A check reads the title, and the font in a classic window.
+ */
+export const GUARD_POLL_MS = 25
 export const GUARD_DURATION_MS = 12_000
 /** Where the title can't be read back, it is set again at these times. */
 export const BLIND_RESET_AT_MS = [1_000, 3_000] as const
@@ -67,6 +82,7 @@ export interface ConsoleGuardDeps {
 
 export function createConsoleGuard(deps: ConsoleGuardDeps) {
   let savedFont: ConsoleFont | null = null
+  let savedInputMode: number | null = null
   let timer: unknown = null
   let startedAt = 0
   let blindResets = 0
@@ -102,7 +118,10 @@ export function createConsoleGuard(deps: ConsoleGuardDeps) {
   }
 
   return {
-    /** Save the title and font, title the window "Neuron", start checking. */
+    /**
+     * Save the title, font and input mode, title the window "Neuron", start
+     * checking. Before the renderer, whose raw mode changes the input mode.
+     */
     start() {
       if (stopped || timer !== null) return
       saveTerminalTitle()
@@ -110,6 +129,11 @@ export function createConsoleGuard(deps: ConsoleGuardDeps) {
         if (deps.isClassicConsole()) savedFont = deps.console.getFont()
       } catch {
         savedFont = null
+      }
+      try {
+        savedInputMode = deps.console.getInputMode()
+      } catch {
+        savedInputMode = null
       }
       setNeuronTitle()
       startedAt = deps.now()
@@ -127,7 +151,23 @@ export function createConsoleGuard(deps: ConsoleGuardDeps) {
       reassertTerminalTitle()
       repairFont()
     },
-    /** At exit: stop checking, put the font and the title back. Once. */
+    /**
+     * As the quit is asked for: keys typed from now on are the shell's, so the
+     * console keeps them as keys. Only virtual-terminal input goes off; the
+     * rest of raw mode stays until the renderer's teardown, so a Ctrl-C is
+     * still a key there, not a signal.
+     */
+    endVirtualTerminalInput() {
+      try {
+        const mode = deps.console.getInputMode()
+        if (mode !== null && (mode & ENABLE_VIRTUAL_TERMINAL_INPUT) !== 0) {
+          deps.console.setInputMode(mode & ~ENABLE_VIRTUAL_TERMINAL_INPUT)
+        }
+      } catch {
+        // The quit goes ahead either way.
+      }
+    },
+    /** At exit: stop checking, put the font, title and input mode back. Once. */
     restore() {
       if (stopped) return
       stopped = true
@@ -138,6 +178,11 @@ export function createConsoleGuard(deps: ConsoleGuardDeps) {
         // The console may be gone already.
       }
       restoreTerminalTitle()
+      try {
+        if (savedInputMode !== null) deps.console.setInputMode(savedInputMode)
+      } catch {
+        // Likewise.
+      }
     },
   }
 }
@@ -154,5 +199,7 @@ const guard = createConsoleGuard({
 export const startConsoleGuard = (): void => guard.start()
 /** After a tool result or a turn's end: set the title again, repair the font. */
 export const afterConsoleCommand = (): void => guard.afterConsoleCommand()
+/** First thing on quit, so keys typed during the exit reach the shell as keys. */
+export const endVirtualTerminalInput = (): void => guard.endVirtualTerminalInput()
 /** In the exit path, right before the exit message (the --continue hint). */
 export const restoreConsoleAtExit = (): void => guard.restore()

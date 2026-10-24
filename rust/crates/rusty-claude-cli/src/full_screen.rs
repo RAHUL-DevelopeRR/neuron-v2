@@ -188,9 +188,9 @@ pub(crate) const TERMINAL_RESET_SEQUENCES: &str = "\x1b[?1049l\x1b[?1000l\x1b[?1
 
 /// Runs the UI with this binary as its engine. On Unix the UI replaces this
 /// process; on Windows this process waits for it, ignoring the console's
-/// Ctrl-C and Ctrl-Break (the UI handles those keys), resets the terminal if
-/// the UI died in its modes, prints the UI's exit message, and exits with its
-/// code.
+/// Ctrl-C and Ctrl-Break (the UI handles those keys), gives the console its
+/// input mode back, resets the terminal if the UI died in its modes, prints
+/// the UI's exit message, and exits with its code.
 pub(crate) fn run_ui(binary: &Path, args: &[String]) -> io::Result<i32> {
     let engine = env::current_exe()?;
     let mut command = Command::new(binary);
@@ -215,7 +215,9 @@ pub(crate) fn run_ui(binary: &Path, args: &[String]) -> io::Result<i32> {
             .env(EXIT_MESSAGE_FILE_ENV, &exit_message)
             .env(DISARM_FILE_ENV, &disarm);
         let _guard = IgnoreConsoleInterrupts::install();
+        let input_mode = SavedInputMode::save();
         let status = command.status();
+        input_mode.restore();
         let mut stdout = io::stdout();
         if ui_left_terminal_armed(&disarm) {
             // The UI turned on virtual-terminal processing for the console;
@@ -309,6 +311,47 @@ impl IgnoreConsoleInterrupts {
     fn install() -> Self {
         Self
     }
+}
+
+/// The console's input mode as this process found it, put back once the UI
+/// has exited. The UI's raw mode turns on virtual-terminal input, and a UI
+/// that died leaves it on: cmd's Up arrow then types `ESC [ A`, and an Enter
+/// typed under it reaches PowerShell as a character, not a key.
+#[cfg(windows)]
+struct SavedInputMode(Option<u32>);
+
+#[cfg(windows)]
+impl SavedInputMode {
+    fn save() -> Self {
+        Self(console_input().and_then(|console| console.mode().ok()))
+    }
+
+    fn restore(&self) {
+        if let (Some(mode), Some(console)) = (self.0, console_input()) {
+            let _ = console.set_mode(mode);
+        }
+    }
+}
+
+/// The console's input buffer (CONIN$, whatever stdin is); `None` without a
+/// console.
+#[cfg(windows)]
+fn console_input() -> Option<crossterm_winapi::ConsoleMode> {
+    crossterm_winapi::Handle::current_in_handle()
+        .ok()
+        .map(crossterm_winapi::ConsoleMode::from)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+struct SavedInputMode;
+
+#[cfg(all(not(unix), not(windows)))]
+impl SavedInputMode {
+    fn save() -> Self {
+        Self
+    }
+
+    fn restore(&self) {}
 }
 
 #[cfg(test)]
@@ -469,5 +512,22 @@ mod tests {
             "it reset the terminal itself"
         );
         assert!(!file.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_saved_input_mode_comes_back_after_the_ui_changed_it() {
+        // Only where the tests have a console.
+        let Some(console) = console_input() else {
+            return;
+        };
+        let Ok(before) = console.mode() else {
+            return;
+        };
+        let saved = SavedInputMode::save();
+        // What the UI's raw mode does: virtual-terminal input on.
+        let _ = console.set_mode(before ^ 0x200);
+        saved.restore();
+        assert_eq!(console.mode().ok(), Some(before));
     }
 }
