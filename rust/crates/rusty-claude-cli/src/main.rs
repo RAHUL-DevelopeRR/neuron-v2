@@ -2937,9 +2937,12 @@ impl LiveCli {
             json!({
                 "message": final_assistant_text(&summary),
                 "model": shown_model(&self.model),
+                // The model that answered last (`auto` and failover can differ).
+                "served_model": summary.served_model,
                 "iterations": summary.iterations,
                 "outcome": repl_loop::turn_outcome_label(&summary.outcome),
                 "stop_reason": summary.stop_reason,
+                "completion_checked": summary.completion_checked,
                 "auto_compaction": summary.auto_compaction.map(|event| json!({
                     "removed_messages": event.removed_message_count,
                     "notice": format_auto_compaction_notice(event.removed_message_count),

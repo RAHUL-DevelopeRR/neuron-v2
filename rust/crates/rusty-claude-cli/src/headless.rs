@@ -1,7 +1,8 @@
 //! A `neuron prompt` run that nobody can answer: stdin is not a terminal (a script,
 //! CI, `< /dev/null`). A tool call that needs approval is not asked about: it is denied
 //! with a reason the model and the user both see. A question from the model fails, so
-//! the model decides itself. After [`DENIAL_LIMIT`] denied calls the turn stops. The run
+//! the model decides itself. After [`DENIAL_LIMIT`] denied calls (or
+//! [`DENIAL_LIMIT_ENV_VAR`]) the turn stops. The run
 //! ends with a warning naming what was not run, and exit code [`DENIED_EXIT_CODE`] when
 //! tool calls were denied.
 //!
@@ -31,6 +32,22 @@ pub(crate) const DENIED_EXIT_CODE: i32 = 2;
 /// kept calling tools nobody could approve, varying the tool or its arguments so the
 /// repeated-call guard never fired, until the iteration cap or the shared quota ran out.
 pub(crate) const DENIAL_LIMIT: usize = 5;
+
+/// Overrides [`DENIAL_LIMIT`] for a run: CI or an eval that allows only some commands
+/// and wants the model to work around the rest instead of stopping.
+pub(crate) const DENIAL_LIMIT_ENV_VAR: &str = "NEURON_DENIAL_LIMIT";
+
+/// [`DENIAL_LIMIT`], or a positive number from [`DENIAL_LIMIT_ENV_VAR`].
+fn denial_limit() -> usize {
+    denial_limit_from(std::env::var(DENIAL_LIMIT_ENV_VAR).ok().as_deref())
+}
+
+fn denial_limit_from(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.trim().parse().ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or(DENIAL_LIMIT)
+}
 
 /// What `AskUserQuestion` answers in a non-interactive run (as its error).
 pub(crate) const QUESTION_REFUSAL: &str =
@@ -127,7 +144,7 @@ impl DenialLog {
     /// Adds a denied call; `true` when it stops a `one_shot` run, which happens once.
     fn record(&mut self, tool_name: &str, one_shot: bool) -> bool {
         self.denied.push(tool_name.to_string());
-        if one_shot && !self.stopped && self.denied.len() >= DENIAL_LIMIT {
+        if one_shot && !self.stopped && self.denied.len() >= denial_limit() {
             self.stopped = true;
             return true;
         }
@@ -529,6 +546,19 @@ mod tests {
 
     /// The model varied the tool and its arguments, so the repeated-call guard never
     /// fired: the run stops at the limit, once, and only in a one-shot run.
+    #[test]
+    fn the_denial_limit_can_be_raised_for_a_run() {
+        assert_eq!(super::denial_limit_from(None), DENIAL_LIMIT);
+        assert_eq!(super::denial_limit_from(Some(" 25 ")), 25);
+        for ignored in ["0", "-3", "many", ""] {
+            assert_eq!(
+                super::denial_limit_from(Some(ignored)),
+                DENIAL_LIMIT,
+                "{ignored}"
+            );
+        }
+    }
+
     #[test]
     fn a_one_shot_run_stops_at_the_denial_limit() {
         let mut log = DenialLog::new();
