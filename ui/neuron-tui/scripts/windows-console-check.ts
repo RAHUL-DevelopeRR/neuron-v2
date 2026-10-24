@@ -174,9 +174,10 @@ results.push(
 // The line REPL's first screens (the trust menu, the banner) in a classic
 // window: no escape code may show as text (`←[38;2;…`). Under Bun the console
 // already has escape-code processing on, so this one must run `neuron` itself.
+// 1 allows at once: an Enter after it would answer the next question.
 results.push(
-  classic('--no-tui', '1<CR>|<SLEEP>|/exit<CR>', 'the line REPL shows no escape codes', {
-    ready: 'trust this directory',
+  classic('--no-tui', '1|<SLEEP>|/exit<CR>', 'the line REPL shows no escape codes', {
+    ready: 'Before Neuron works here;;Esc to quit',
     expect: '',
     flags: ['-NoEscapes', '-Direct', '-Untrusted'],
   }),
