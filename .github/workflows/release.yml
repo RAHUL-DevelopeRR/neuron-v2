@@ -150,19 +150,15 @@ jobs:
             asset: neuron-macos-arm64
             ui_asset: neuron-tui-macos-arm64
           - name: macos-x64
-            # Cross-compiled on Apple silicon; smoke-tested under Rosetta 2 when available.
-            runner: macos-14
+            # Built and smoke-tested natively on an Intel Mac. Bun's x64 runtime dies
+            # under Rosetta 2 ("Illegal instruction"), so a cross-build on Apple silicon
+            # could not run the UI to check it. install.sh gives a Rosetta shell the
+            # arm64 build, so this asset is for Intel Macs only.
+            runner: macos-15-intel
             target: x86_64-apple-darwin
             bin: neuron
             asset: neuron-macos-x64
             ui_asset: neuron-tui-macos-x64
-            # Bun cross-compiles the UI too (ui/neuron-tui/scripts/build-binary.ts).
-            # The baseline build needs no AVX2, so it runs on every Intel Mac and under
-            # Rosetta 2, which emulates no AVX; the default x64 build dies there with
-            # "Illegal instruction", so the smoke test below could not check it.
-            bun_target: bun-darwin-x64-baseline
-            bun_platform: darwin
-            bun_arch: x64
           - name: windows-x64
             runner: windows-2022
             target: x86_64-pc-windows-msvc
@@ -234,15 +230,7 @@ jobs:
         shell: bash
         run: |
           for binary in "dist/${{ matrix.asset }}" "dist/${{ matrix.ui_asset }}"; do
-            if [ "${{ matrix.name }}" = "macos-x64" ]; then
-              if arch -x86_64 /usr/bin/true 2>/dev/null; then
-                arch -x86_64 "$binary" --version
-              else
-                echo "::notice::Rosetta 2 is not available on this runner; skipping the x64 smoke test"
-              fi
-            else
-              "$binary" --version
-            fi
+            "$binary" --version
           done
 
       - name: Check the minimum glibc version
@@ -481,7 +469,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14, windows-2022]
+        # macos-14 installs the arm64 assets and macos-15-intel the x64 ones.
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14, macos-15-intel, windows-2022]
     env:
       TAG: ${{ needs.metadata.outputs.tag }}
       VERSION: ${{ needs.metadata.outputs.version }}
