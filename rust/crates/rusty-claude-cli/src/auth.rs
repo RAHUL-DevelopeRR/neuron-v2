@@ -15,6 +15,7 @@ use crate::device_login::{
     self, ClientInfo, DeviceLoginObserver, HttpTransport, SystemClock, TerminalObserver,
 };
 use crate::gateway_http::{self, GatewayHttpError, ACCOUNT_TIMEOUT};
+use crate::trust_menu::Answer;
 use crate::vault::SecureString;
 
 pub const GATEWAY_BASE_URL: &str = api::DEFAULT_ZERO_X_BASE_URL;
@@ -862,14 +863,42 @@ pub fn run_auth_command(args: &[String]) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-/// Asks once per directory whether to trust it. Trusting also lets the
-/// directory's own settings files run hooks, start MCP servers and change
-/// permissions; until then the config loader ignores those keys.
-pub fn check_trust(cwd: &std::path::Path) -> bool {
+/// How the folder trust question ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrustDecision {
+    /// Trusted already, or allowed now: recorded in the trust store (for the git root,
+    /// or the folder outside git), or, for the home folder, for this run only.
+    Trusted { session_only: bool },
+    /// The user chose Quit in the menu.
+    Quit,
+    /// Nobody allowed it: no input, a question nobody could see, or a piped answer
+    /// other than 1.
+    NoAnswer,
+}
+
+impl TrustDecision {
+    /// The code to exit with when Neuron stops here: 0 when the user quit, which was
+    /// their choice, and 1 without an answer. `None` once trusted.
+    pub(crate) fn exit_code(self) -> Option<i32> {
+        match self {
+            Self::Trusted { .. } => None,
+            Self::Quit => Some(0),
+            Self::NoAnswer => Some(1),
+        }
+    }
+}
+
+/// Asks once per folder whether to trust it ("Before Neuron works here", see
+/// `trust_menu.rs`). Trusting also lets the folder's own settings files run hooks,
+/// start MCP servers and change permissions; until then the config loader ignores
+/// those keys, and the question only reads them to say what they would turn on.
+pub(crate) fn check_trust(cwd: &std::path::Path) -> TrustDecision {
     // Same decision as the config loader: trust store, environment, or a
     // `trustedRoots` entry in user settings.
     if runtime::ConfigLoader::default_for(cwd).workspace_is_trusted() {
-        return true;
+        return TrustDecision::Trusted {
+            session_only: false,
+        };
     }
     // Where the user sees it: stdout, or stderr when stdout is redirected (`neuron
     // prompt ... > out.txt`). With both redirected, a person at the terminal would
@@ -879,30 +908,31 @@ pub fn check_trust(cwd: &std::path::Path) -> bool {
             "Not trusted: the trust question could not be shown (stdout and stderr are redirected). \
 Run neuron in a terminal to trust this directory, or add it to `trustedRoots` in your user settings."
         );
-        return false;
+        return TrustDecision::NoAnswer;
     };
-    let mut out = stream.writer();
-    let _ = write!(
-        out,
-        "\nNeuronCLI can read, write, and execute commands in:\n{}\nTrusting it also lets this directory's settings files run hooks, start MCP servers and change permissions.\nPress 1 to trust this directory: ",
-        cwd.display()
-    );
-    let _ = out.flush();
-    let mut input = String::new();
-    let answered = io::stdin().read_line(&mut input);
-    if answered.is_ok() && input.trim() == "1" {
-        if let Err(error) = runtime::workspace_trust::record_trusted_workspace(cwd) {
-            eprintln!(
-                "warning: could not save trust for {}: {error}",
-                cwd.display()
-            );
+    let screen = crate::trust_menu::TrustScreen::for_folder(cwd);
+    // The caller exits unless trusted; say why when nobody chose to quit.
+    match crate::trust_menu::ask(stream, &screen) {
+        Answer::Allow => {
+            // As the full-screen UI's trust screen: the git root is recorded, and the
+            // home folder is trusted for this run only, so it is asked about again.
+            if let Err(error) = runtime::workspace_trust::trust_workspace_root(cwd) {
+                eprintln!("warning: could not save trust for {}: {error}", screen.root);
+            }
+            TrustDecision::Trusted {
+                session_only: screen.session_only,
+            }
         }
-        return true;
+        Answer::Quit => TrustDecision::Quit,
+        Answer::Declined => {
+            eprintln!("{}", untrusted_reason(false));
+            TrustDecision::NoAnswer
+        }
+        Answer::NoInput => {
+            eprintln!("{}", untrusted_reason(true));
+            TrustDecision::NoAnswer
+        }
     }
-    // The caller exits; say why rather than stopping silently.
-    let _ = writeln!(out);
-    eprintln!("{}", untrusted_reason(matches!(answered, Ok(0) | Err(_))));
-    false
 }
 
 /// Why Neuron stopped at the trust question: nobody could answer it (no input), or
@@ -919,6 +949,24 @@ to trust this directory, or add it to `trustedRoots` in your user settings."
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Quitting the trust menu is the user's choice (exit 0); no answer is a failure.
+    #[test]
+    fn the_trust_question_exits_0_on_quit_and_1_without_an_answer() {
+        assert_eq!(
+            TrustDecision::Trusted {
+                session_only: false
+            }
+            .exit_code(),
+            None
+        );
+        assert_eq!(
+            TrustDecision::Trusted { session_only: true }.exit_code(),
+            None
+        );
+        assert_eq!(TrustDecision::Quit.exit_code(), Some(0));
+        assert_eq!(TrustDecision::NoAnswer.exit_code(), Some(1));
+    }
 
     #[test]
     fn gateway_endpoint_rejects_unencrypted_remote_token_delivery() {
