@@ -27,6 +27,7 @@ pub fn format_unknown_slash_command_message(name: &str) -> String {
 }
 
 pub fn format_model_report(model: &str, message_count: usize, turns: u32) -> String {
+    let model = crate::provider::shown_model(model);
     format!(
         "Model
   Current model    {model}
@@ -40,6 +41,10 @@ Usage
 }
 
 pub fn format_model_switch_report(previous: &str, next: &str, message_count: usize) -> String {
+    let (previous, next) = (
+        crate::provider::shown_model(previous),
+        crate::provider::shown_model(next),
+    );
     format!(
         "Model updated
   Previous         {previous}

@@ -41,7 +41,7 @@ pub(crate) fn render_repl_help() -> String {
     )
 }
 
-// â”€â”€ Shortcuts panel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Shortcuts panel ─────────────────────────────────────────────────
 // Rendered when the user types `?` at the prompt.  Modeled after
 // Claude Code's compact two-column layout so power users can scan
 // everything at a glance without scrolling.
@@ -142,7 +142,7 @@ pub(crate) fn render_shortcuts_panel() -> String {
     .join("\n")
 }
 
-// â”€â”€ Shell escape â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Shell escape ────────────────────────────────────────────────────
 // When the user types `!<command>` at the prompt, execute it directly
 // in the system shell.  This mirrors Claude Code's `!` prefix behavior
 // and avoids burning LLM tokens on simple shell operations.
@@ -184,7 +184,7 @@ pub(crate) fn run_shell_escape(cmd: &str) {
     }
 }
 
-// â”€â”€ Mode-aware prompt â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Mode-aware prompt ───────────────────────────────────────────────
 // Dynamically generates the input prompt string to show the current
 // permission mode, mirroring how Claude Code displays the active mode.
 //
@@ -262,7 +262,7 @@ pub(crate) fn status_json_value(
 ) -> serde_json::Value {
     json!({
         "kind": "status",
-        "model": model,
+        "model": model.map(crate::provider::shown_model),
         "permission_mode": permission_mode,
         "usage": {
             "messages": usage.message_count,
@@ -335,12 +335,30 @@ pub(crate) fn status_context(
     })
 }
 
+/// The turns of a session as the user counts them: the prompts sent, which are its user
+/// messages (tool results are messages of their own) less the runtime's automatic
+/// "continue" nudges. The usage tracker's `turns` counts model requests instead.
+pub(crate) fn prompt_count(session: &Session) -> u32 {
+    let prompts = session
+        .messages
+        .iter()
+        .filter(|message| {
+            message.role == MessageRole::User
+                && !message.blocks.iter().any(|block| {
+                    matches!(block, ContentBlock::Text { text } if text.starts_with(runtime::AUTO_CONTINUE_PREFIX))
+                })
+        })
+        .count();
+    u32::try_from(prompts).unwrap_or(u32::MAX)
+}
+
 pub(crate) fn format_status_report(
     model: &str,
     usage: StatusUsage,
     permission_mode: &str,
     context: &StatusContext,
 ) -> String {
+    let model = crate::provider::shown_model(model);
     [
         format!(
             "Status
@@ -375,7 +393,7 @@ pub(crate) fn format_status_report(
   Session          {}
   Config files     loaded {}/{}
   Memory files     {}
-  Suggested flow   /status â†’ /diff â†’ /commit",
+  Suggested flow   /status → /diff → /commit",
             context.cwd.display(),
             context
                 .project_root
@@ -395,13 +413,56 @@ pub(crate) fn format_status_report(
             context.discovered_config_files,
             context.memory_file_count,
         ),
-        format_sandbox_report(&context.sandbox_status),
+        format_status_sandbox_section(&context.sandbox_status, cfg!(target_os = "linux")),
     ]
     .join(
         "
 
 ",
     )
+}
+
+/// The `/status` Sandbox section: the report on Linux, where the sandbox (namespaces,
+/// `unshare`) exists; one line elsewhere. `neuron sandbox` keeps the full report.
+pub(crate) fn format_status_sandbox_section(
+    status: &runtime::SandboxStatus,
+    supported_os: bool,
+) -> String {
+    if supported_os {
+        format_sandbox_report(status)
+    } else {
+        "Sandbox\n  Available         not on this OS (Linux only)".to_string()
+    }
+}
+
+/// The banner's greeting in at most `width` columns: "Welcome back" once this
+/// workspace has a saved session (`returning`), "Welcome" before; to the signed-in
+/// account (its email, or the part before `@` when the whole one does not fit), else
+/// to the OS user.
+pub(crate) fn banner_greeting(
+    email: Option<&str>,
+    os_user: &str,
+    returning: bool,
+    width: usize,
+) -> String {
+    let opening = if returning { "Welcome back" } else { "Welcome" };
+    // ", " and "!".
+    let room = width.saturating_sub(opening.len() + 3);
+    let name = match email.map(str::trim).filter(|email| !email.is_empty()) {
+        Some(email) if email.chars().count() <= room => email,
+        Some(email) => email.split('@').next().unwrap_or(email),
+        None => os_user,
+    };
+    let name = if name.chars().count() <= room {
+        name.to_string()
+    } else {
+        let kept = name
+            .chars()
+            .take(room.saturating_sub(3))
+            .collect::<String>();
+        format!("{kept}...")
+    };
+    format!("{opening}, {name}!")
 }
 
 pub(crate) fn format_sandbox_report(status: &runtime::SandboxStatus) -> String {
@@ -469,7 +530,7 @@ pub(crate) fn format_commit_skipped_report() -> String {
   Result           skipped
   Reason           no workspace changes
   Action           create a git commit from the current workspace changes
-  Next             /status to inspect context Â· /diff to inspect repo changes"
+  Next             /status to inspect context · /diff to inspect repo changes"
         .to_string()
 }
 
@@ -517,26 +578,26 @@ pub(crate) fn render_help_topic(topic: LocalHelpTopic) -> String {
   Usage            neuron status
   Purpose          show the local workspace snapshot without entering the REPL
   Output           model, permissions, git state, config files, and sandbox status
-  Related          /status Â· neuron --resume latest /status"
+  Related          /status · neuron --resume latest /status"
             .to_string(),
         LocalHelpTopic::Sandbox => "Sandbox
   Usage            neuron sandbox
   Purpose          inspect the resolved sandbox and isolation state for the current directory
   Output           namespace, network, filesystem, and fallback details
-  Related          /sandbox Â· neuron status"
+  Related          /sandbox · neuron status"
             .to_string(),
         LocalHelpTopic::Doctor => "Doctor
   Usage            neuron doctor
   Purpose          diagnose local auth, config, workspace, sandbox, and build metadata
   Output           local-only health report; no provider request or session resume required
-  Related          /doctor Â· neuron --resume latest /doctor"
+  Related          /doctor · neuron --resume latest /doctor"
             .to_string(),
         LocalHelpTopic::Acp => "ACP / Zed
   Usage            neuron acp [serve]
-  Aliases          neuron --acp Â· neuron -acp
+  Aliases          neuron --acp · neuron -acp
   Purpose          explain the current editor-facing ACP/Zed launch contract without starting the runtime
   Status           discoverability only; `serve` is a status alias and does not launch a daemon yet
-  Related          ROADMAP #64a (discoverability) Â· ROADMAP #76 (real ACP support) Â· neuron --help"
+  Related          ROADMAP #64a (discoverability) · ROADMAP #76 (real ACP support) · neuron --help"
             .to_string(),
     }
 }
@@ -602,6 +663,7 @@ pub(crate) fn render_config_report(
     ];
     for entry in discovered {
         let source = match entry.source {
+            ConfigSource::Bundled => "bundled",
             ConfigSource::User => "user",
             ConfigSource::Project => "project",
             ConfigSource::Local => "local",
@@ -679,6 +741,7 @@ pub(crate) fn render_config_json(
         .iter()
         .map(|e| {
             let source = match e.source {
+                ConfigSource::Bundled => "bundled",
                 ConfigSource::User => "user",
                 ConfigSource::Project => "project",
                 ConfigSource::Local => "local",
@@ -717,7 +780,7 @@ pub(crate) fn render_memory_report() -> Result<String, Box<dyn std::error::Error
     if project_context.instruction_files.is_empty() {
         lines.push("Discovered files".to_string());
         lines.push(
-            "  No CLAUDE instruction files discovered in the current directory ancestry."
+            "  No instruction files (NEURON.md, AGENTS.md) in this folder or the ones above it."
                 .to_string(),
         );
     } else {
@@ -768,4 +831,136 @@ pub(crate) fn render_memory_json() -> Result<serde_json::Value, Box<dyn std::err
 pub(crate) fn init_claude_md() -> Result<String, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     Ok(initialize_repo(&cwd)?.render())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_banner_welcomes_a_new_account_and_names_it() {
+        assert_eq!(
+            banner_greeting(Some("dev@zero-x.live"), "rahul", false, 36),
+            "Welcome, dev@zero-x.live!"
+        );
+        assert_eq!(
+            banner_greeting(Some("dev@zero-x.live"), "rahul", true, 36),
+            "Welcome back, dev@zero-x.live!"
+        );
+        // Signed out: the OS user.
+        assert_eq!(
+            banner_greeting(None, "rahul", true, 36),
+            "Welcome back, rahul!"
+        );
+        // An email that does not fit: the part before `@`, cut when even that is long.
+        assert_eq!(
+            banner_greeting(Some("tcli-verify.e2e@zero-x.test"), "rahul", true, 36),
+            "Welcome back, tcli-verify.e2e!"
+        );
+        let long = banner_greeting(Some("a-very-long-mailbox-name-here@x.io"), "r", true, 36);
+        assert!(long.chars().count() <= 36, "{long}");
+        assert!(long.ends_with("...!"), "{long}");
+    }
+
+    #[test]
+    fn status_shows_the_sandbox_report_only_where_it_applies() {
+        let status = runtime::SandboxStatus::default();
+        let linux = format_status_sandbox_section(&status, true);
+        assert!(linux.contains("Fallback reason"), "{linux}");
+        let other = format_status_sandbox_section(&status, false);
+        assert_eq!(
+            other,
+            "Sandbox\n  Available         not on this OS (Linux only)"
+        );
+    }
+
+    /// `--help`, `/help`, the help topics and every command summary never name another
+    /// product. Provider and model ids (`anthropic`, `claude-*`) are lowercase identifiers
+    /// and stay allowed.
+    #[test]
+    fn help_text_names_no_other_product() {
+        let mut cli_help = Vec::new();
+        crate::executor::print_help_to(&mut cli_help).expect("help renders");
+        let mut texts = vec![
+            String::from_utf8(cli_help).expect("help is utf-8"),
+            render_repl_help(),
+        ];
+        texts.extend(
+            [
+                LocalHelpTopic::Status,
+                LocalHelpTopic::Sandbox,
+                LocalHelpTopic::Doctor,
+                LocalHelpTopic::Acp,
+            ]
+            .map(render_help_topic),
+        );
+        texts.extend(
+            commands::slash_command_specs()
+                .iter()
+                .map(|spec| format!("/{}: {}", spec.name, spec.summary)),
+        );
+        for text in texts {
+            for brand in ["Claude", "Anthropic"] {
+                assert!(!text.contains(brand), "{brand} in: {text}");
+            }
+        }
+    }
+
+    /// The `openai/` routing prefix picks a client; it is not part of the model's name, in
+    /// the text report or the JSON one (a resumed session's stored model included).
+    #[test]
+    fn status_shows_the_model_without_its_routing_prefix() {
+        let usage = StatusUsage {
+            message_count: 0,
+            turns: 0,
+            latest: TokenUsage::default(),
+            cumulative: TokenUsage::default(),
+            estimated_tokens: 0,
+        };
+        let context = StatusContext {
+            cwd: PathBuf::from("/tmp/project"),
+            session_path: None,
+            loaded_config_files: 0,
+            discovered_config_files: 0,
+            memory_file_count: 0,
+            project_root: None,
+            git_branch: None,
+            git_summary: GitWorkspaceSummary::default(),
+            sandbox_status: runtime::SandboxStatus::default(),
+        };
+        let text = format_status_report(
+            "openai/nvidia/nvidia/nemotron-3-ultra-550b-a55b",
+            usage,
+            "workspace-write",
+            &context,
+        );
+        assert!(
+            text.contains("  Model            nvidia/nvidia/nemotron-3-ultra-550b-a55b\n"),
+            "{text}"
+        );
+        let json = status_json_value(Some("openai/auto"), usage, "workspace-write", &context);
+        assert_eq!(json["model"], "auto");
+        assert!(status_json_value(None, usage, "workspace-write", &context)["model"].is_null());
+    }
+
+    /// Turns are the prompts sent, not the model requests a tool loop makes.
+    #[test]
+    fn turns_count_the_prompts_not_the_model_requests() {
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::user_text("fix the bug"),
+            ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "t1".to_string(),
+                name: "bash".to_string(),
+                input: "{}".to_string(),
+            }]),
+            ConversationMessage::tool_result("t1", "bash", "ok", false),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "Fixed.".to_string(),
+            }]),
+            ConversationMessage::user_text(format!("{} continue", runtime::AUTO_CONTINUE_PREFIX)),
+            ConversationMessage::user_text("now add a test"),
+        ];
+        assert_eq!(prompt_count(&session), 2);
+    }
 }

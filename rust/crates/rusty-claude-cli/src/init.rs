@@ -1,10 +1,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Shared project defaults written by `neuron init`. `acceptEdits` resolves
+/// to workspace-write, the CLI default, which still asks before commands that
+/// are not read-only; a repository file must never grant full access.
 const STARTER_CLAW_JSON: &str = concat!(
     "{\n",
     "  \"permissions\": {\n",
-    "    \"defaultMode\": \"dontAsk\"\n",
+    "    \"defaultMode\": \"acceptEdits\"\n",
     "  }\n",
     "}\n",
 );
@@ -371,11 +374,20 @@ mod tests {
             concat!(
                 "{\n",
                 "  \"permissions\": {\n",
-                "    \"defaultMode\": \"dontAsk\"\n",
+                "    \"defaultMode\": \"acceptEdits\"\n",
                 "  }\n",
                 "}\n",
             )
         );
+        // The starter must resolve to the CLI default, never to full access.
+        let config = runtime::ConfigLoader::new(&root, root.join("missing-home"))
+            .load()
+            .expect("starter settings load");
+        assert_eq!(
+            config.permission_mode(),
+            Some(runtime::ResolvedPermissionMode::WorkspaceWrite)
+        );
+        assert_eq!(config.ignored_project_settings(), []);
         let gitignore = fs::read_to_string(root.join(".gitignore")).expect("read gitignore");
         assert!(gitignore.contains(".neuron/settings.local.json"));
         assert!(gitignore.contains(".neuron/sessions/"));
@@ -383,6 +395,26 @@ mod tests {
         let claude_md = fs::read_to_string(root.join("NEURON.md")).expect("read neuron md");
         assert!(claude_md.contains("Languages: Rust."));
         assert!(claude_md.contains("cargo clippy --workspace --all-targets -- -D warnings"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn initialized_neuron_md_is_loaded_as_project_instructions() {
+        let root = temp_dir();
+        fs::create_dir_all(root.join("rust")).expect("create rust dir");
+        fs::write(root.join("rust").join("Cargo.toml"), "[workspace]\n").expect("write cargo");
+        initialize_repo(&root).expect("init should succeed");
+
+        let context = runtime::ProjectContext::discover(&root, "2026-10-16")
+            .expect("project context should load");
+        let neuron_md = context
+            .instruction_files
+            .iter()
+            .find(|file| file.path.ends_with("NEURON.md"))
+            .expect("the NEURON.md written by /init must be discovered");
+        assert!(neuron_md.content.contains("# NEURON.md"));
+        assert!(neuron_md.content.contains("Languages: Rust."));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

@@ -1,0 +1,82 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: it says
+// what an untrusted folder means and how to trust it, and the logo is in
+// NeuronCLI's brand colours. See ui/neuron-tui/PORTING.md.
+import { memo, useState } from 'react'
+
+import { UNTRUSTED_FOLDER_NOTE } from '../engine/status-report'
+import { useLogo } from '../hooks/use-logo'
+import { useSheenAnimation } from '../hooks/use-sheen-animation'
+import { useTerminalDimensions } from '../hooks/use-terminal-dimensions'
+import { useTheme } from '../hooks/use-theme'
+import { useEngineStore } from '../state/engine-store'
+import { openFileAtPath } from '../utils/open-file'
+import { formatCwd } from '../utils/path-helpers'
+import { TerminalLink } from './terminal-link'
+
+export const ChatHeader = memo(function ChatHeader({
+  projectRoot,
+  animationEnabled,
+}: {
+  projectRoot: string
+  animationEnabled: boolean
+}) {
+  const { contentMaxWidth, terminalWidth } = useTerminalDimensions()
+  const theme = useTheme()
+  // The footer's "untrusted folder", explained (the engine has no command
+  // to trust it).
+  const untrusted = useEngineStore(
+    (state) => state.status !== null && !state.status.workspace_trusted,
+  )
+  const [sheenPosition, setSheenPosition] = useState(0)
+  const { applySheenToChar } = useSheenAnimation({
+    enabled: animationEnabled,
+    themeName: theme.name,
+    terminalWidth,
+    sheenPosition,
+    setSheenPosition,
+  })
+  const { component: logoComponent } = useLogo({
+    availableWidth: contentMaxWidth,
+    themeName: theme.name,
+    applySheenToChar,
+  })
+
+  return (
+    <box
+      style={{
+        flexDirection: 'column',
+        gap: 0,
+        paddingLeft: 1,
+        paddingRight: 1,
+      }}
+    >
+      <box
+        style={{
+          flexDirection: 'column',
+          marginBottom: 1,
+          marginTop: 2,
+        }}
+      >
+        {logoComponent}
+      </box>
+      <text style={{ wrapMode: 'word', marginBottom: 1, fg: theme.foreground }}>
+        Neuron will run commands on your behalf to help you build.
+      </text>
+      <text style={{ wrapMode: 'word', marginBottom: 1, fg: theme.foreground }}>
+        Directory{' '}
+        <TerminalLink
+          text={formatCwd(projectRoot)}
+          color={theme.muted}
+          inline={true}
+          underlineOnHover={true}
+          onActivate={() => openFileAtPath(projectRoot)}
+        />
+      </text>
+      {untrusted && (
+        <text style={{ wrapMode: 'word', marginBottom: 1, fg: theme.warning }}>
+          {UNTRUSTED_FOLDER_NOTE}
+        </text>
+      )}
+    </box>
+  )
+})

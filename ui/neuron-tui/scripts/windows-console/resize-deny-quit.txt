@@ -1,0 +1,29 @@
+# Resize narrow then wide, deny a command (n), Ctrl-C twice, and the screen after exit.
+wait 60000 Enter a coding task
+wait 60000 claude-opus-4-6
+sleep 500
+dump start-120x36
+resize 60 28
+sleep 2000
+wait 10000 Enter a coding task
+dump narrow-60x28
+resize 150 42
+sleep 2000
+wait 10000 Enter a coding task
+dump wide-150x42
+type PARITY_SCENARIO:bash_permission_prompt_denied
+send \r
+wait 60000 Permission needed
+sleep 600
+type n
+wait 60000 bash denied as expected
+gone 10000 Permission needed
+dump denied
+# Ctrl-C during a turn interrupts it; quit once it has ended.
+gone 30000 ■ Esc
+send \x03
+sleep 800
+send \x03
+exit 30000
+sleep 2000
+dump after-exit

@@ -125,7 +125,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "config",
         aliases: &[],
-        summary: "Inspect Claude config files or merged sections",
+        summary: "Show Neuron settings files or merged sections",
         argument_hint: Some("[env|hooks|model|plugins]"),
         resume_supported: true,
     },
@@ -139,14 +139,14 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "memory",
         aliases: &[],
-        summary: "Inspect loaded Claude instruction memory files",
+        summary: "Show loaded instruction files",
         argument_hint: None,
         resume_supported: true,
     },
     SlashCommandSpec {
         name: "init",
         aliases: &[],
-        summary: "Create a starter CLAUDE.md for this repo",
+        summary: "Create a starter NEURON.md for this repo",
         argument_hint: None,
         resume_supported: true,
     },
@@ -232,7 +232,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "plugin",
         aliases: &["plugins", "marketplace"],
-        summary: "Manage Claw Code plugins",
+        summary: "Manage Neuron plugins",
         argument_hint: Some(
             "[list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]",
         ),
@@ -302,16 +302,30 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: false,
     },
     SlashCommandSpec {
+        name: "login",
+        aliases: &[],
+        summary: "Sign in to your Zero-X account in the browser",
+        argument_hint: None,
+        resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "logout",
+        aliases: &[],
+        summary: "Sign out of Zero-X and remove the stored login",
+        argument_hint: None,
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "upgrade",
         aliases: &[],
-        summary: "Check for and install CLI updates",
+        summary: "Open Zero-X plans to upgrade your account",
         argument_hint: None,
         resume_supported: false,
     },
     SlashCommandSpec {
         name: "usage",
         aliases: &[],
-        summary: "Show detailed API usage statistics",
+        summary: "Show Zero-X plan usage, limits and credits",
         argument_hint: None,
         resume_supported: true,
     },
@@ -528,7 +542,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "api-key",
         aliases: &[],
-        summary: "Show or set the Anthropic API key",
+        summary: "Show or set a provider API key",
         argument_hint: Some("[key]"),
         resume_supported: false,
     },
@@ -1404,12 +1418,13 @@ pub fn validate_slash_command_input(
             validate_no_args(command, &args)?;
             SlashCommand::Doctor
         }
-        "login" | "logout" => {
-            return Err(command_error(
-                "This auth flow was removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead.",
-                command,
-                "",
-            ));
+        "login" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Login
+        }
+        "logout" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Logout
         }
         "vim" => {
             validate_no_args(command, &args)?;
@@ -1908,7 +1923,7 @@ fn slash_command_category(name: &str) -> &'static str {
         | "stickers" | "language" | "profile" | "max-tokens" | "temperature" | "system-prompt"
         | "api-key" | "terminal-setup" | "notifications" | "telemetry" | "providers" | "env"
         | "project" | "reasoning" | "budget" | "rate-limit" | "workspace" | "reset" | "ide"
-        | "desktop" | "upgrade" => "Config",
+        | "desktop" | "upgrade" | "login" | "logout" => "Config",
         "debug-tool-call" | "doctor" | "sandbox" | "diagnostics" | "tool-details" | "changelog"
         | "metrics" => "Debug",
         _ => "Tools",
@@ -2108,6 +2123,7 @@ enum DefinitionSource {
     UserClaw,
     UserCodex,
     UserClaude,
+    Bundled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -2115,6 +2131,7 @@ enum DefinitionScope {
     Project,
     UserConfigHome,
     UserHome,
+    Bundled,
 }
 
 impl DefinitionScope {
@@ -2123,6 +2140,7 @@ impl DefinitionScope {
             Self::Project => "Project roots",
             Self::UserConfigHome => "User config roots",
             Self::UserHome => "User home roots",
+            Self::Bundled => "Bundled defaults",
         }
     }
 }
@@ -2135,6 +2153,7 @@ impl DefinitionSource {
             }
             Self::UserClawConfigHome | Self::UserCodexHome => DefinitionScope::UserConfigHome,
             Self::UserClaw | Self::UserCodex | Self::UserClaude => DefinitionScope::UserHome,
+            Self::Bundled => DefinitionScope::Bundled,
         }
     }
 
@@ -2863,6 +2882,13 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         );
     }
 
+    push_unique_skill_root(
+        &mut roots,
+        DefinitionSource::UserClawConfigHome,
+        ConfigLoader::default_for(cwd).config_home().join("skills"),
+        SkillOrigin::SkillsDir,
+    );
+
     if let Ok(claw_config_home) = env::var("CLAW_CONFIG_HOME") {
         let claw_config_home = PathBuf::from(claw_config_home);
         push_unique_skill_root(
@@ -2970,11 +2996,28 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         );
     }
 
+    if let Ok(bundle) =
+        runtime::default_skills::bundled_skill_root(ConfigLoader::default_for(cwd).config_home())
+    {
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::Bundled,
+            bundle.clone(),
+            SkillOrigin::SkillsDir,
+        );
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::Bundled,
+            bundle.join("gstack"),
+            SkillOrigin::SkillsDir,
+        );
+    }
+
     roots
 }
 
 fn install_skill(source: &str, cwd: &Path) -> std::io::Result<InstalledSkill> {
-    let registry_root = default_skill_install_root()?;
+    let registry_root = default_skill_install_root();
     install_skill_into(source, cwd, &registry_root)
 }
 
@@ -3023,20 +3066,17 @@ fn install_skill_into(
     })
 }
 
-fn default_skill_install_root() -> std::io::Result<PathBuf> {
+fn default_skill_install_root() -> PathBuf {
+    if let Some(neuron_config_home) = env::var_os("NEURON_CONFIG_HOME") {
+        return PathBuf::from(neuron_config_home).join("skills");
+    }
     if let Ok(claw_config_home) = env::var("CLAW_CONFIG_HOME") {
-        return Ok(PathBuf::from(claw_config_home).join("skills"));
+        return PathBuf::from(claw_config_home).join("skills");
     }
     if let Ok(codex_home) = env::var("CODEX_HOME") {
-        return Ok(PathBuf::from(codex_home).join("skills"));
+        return PathBuf::from(codex_home).join("skills");
     }
-    if let Some(home) = env::var_os("HOME") {
-        return Ok(PathBuf::from(home).join(".claw").join("skills"));
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "unable to resolve a skills install root; set CLAW_CONFIG_HOME or HOME",
-    ))
+    ConfigLoader::default_for(".").config_home().join("skills")
 }
 
 fn resolve_skill_install_source(source: &str, cwd: &Path) -> std::io::Result<SkillInstallSource> {
@@ -3480,6 +3520,7 @@ fn render_skills_report(skills: &[SkillSummary]) -> String {
         DefinitionScope::Project,
         DefinitionScope::UserConfigHome,
         DefinitionScope::UserHome,
+        DefinitionScope::Bundled,
     ] {
         let group = skills
             .iter()
@@ -3726,7 +3767,7 @@ fn render_agents_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "Agents".to_string(),
         "  Usage            /agents [list|help]".to_string(),
-        "  Direct CLI       claw agents".to_string(),
+        "  Direct CLI       neuron agents".to_string(),
         "  Sources          .claw/agents, ~/.claw/agents, $CLAW_CONFIG_HOME/agents".to_string(),
     ];
     if let Some(args) = unexpected {
@@ -3741,7 +3782,7 @@ fn render_agents_usage_json(unexpected: Option<&str>) -> Value {
         "action": "help",
         "usage": {
             "slash_command": "/agents [list|help]",
-            "direct_cli": "claw agents [list|help]",
+            "direct_cli": "neuron agents [list|help]",
             "sources": [".claw/agents", "~/.claw/agents", "$CLAW_CONFIG_HOME/agents"],
         },
         "unexpected": unexpected,
@@ -3753,7 +3794,7 @@ fn render_skills_usage(unexpected: Option<&str>) -> String {
         "Skills".to_string(),
         "  Usage            /skills [list|install <path>|help|<skill> [args]]".to_string(),
         "  Alias            /skill".to_string(),
-        "  Direct CLI       claw skills [list|install <path>|help|<skill> [args]]".to_string(),
+        "  Direct CLI       neuron skills [list|install <path>|help|<skill> [args]]".to_string(),
         "  Invoke           /skills help overview -> $help overview".to_string(),
         "  Install root     $CLAW_CONFIG_HOME/skills or ~/.claw/skills".to_string(),
         "  Sources          .claw/skills, .omc/skills, .agents/skills, .codex/skills, .claude/skills, ~/.claw/skills, ~/.omc/skills, ~/.claude/skills/omc-learned, ~/.codex/skills, ~/.claude/skills, legacy /commands".to_string(),
@@ -3771,7 +3812,7 @@ fn render_skills_usage_json(unexpected: Option<&str>) -> Value {
         "usage": {
             "slash_command": "/skills [list|install <path>|help|<skill> [args]]",
             "aliases": ["/skill"],
-            "direct_cli": "claw skills [list|install <path>|help|<skill> [args]]",
+            "direct_cli": "neuron skills [list|install <path>|help|<skill> [args]]",
             "invoke": "/skills help overview -> $help overview",
             "install_root": "$CLAW_CONFIG_HOME/skills or ~/.claw/skills",
             "sources": [
@@ -3797,7 +3838,7 @@ fn render_mcp_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "MCP".to_string(),
         "  Usage            /mcp [list|show <server>|help]".to_string(),
-        "  Direct CLI       claw mcp [list|show <server>|help]".to_string(),
+        "  Direct CLI       neuron mcp [list|show <server>|help]".to_string(),
         "  Sources          .claw/settings.json, .claw/settings.local.json".to_string(),
     ];
     if let Some(args) = unexpected {
@@ -3812,7 +3853,7 @@ fn render_mcp_usage_json(unexpected: Option<&str>) -> Value {
         "action": "help",
         "usage": {
             "slash_command": "/mcp [list|show <server>|help]",
-            "direct_cli": "claw mcp [list|show <server>|help]",
+            "direct_cli": "neuron mcp [list|show <server>|help]",
             "sources": [".claw/settings.json", ".claw/settings.local.json"],
         },
         "unexpected": unexpected,
@@ -3821,6 +3862,7 @@ fn render_mcp_usage_json(unexpected: Option<&str>) -> Value {
 
 fn config_source_label(source: ConfigSource) -> &'static str {
     match source {
+        ConfigSource::Bundled => "bundled",
         ConfigSource::User => "user",
         ConfigSource::Project => "project",
         ConfigSource::Local => "local",
@@ -3906,6 +3948,7 @@ fn definition_source_id(source: DefinitionSource) -> &'static str {
         DefinitionSource::UserClaw | DefinitionSource::UserCodex | DefinitionSource::UserClaude => {
             "user_claw"
         }
+        DefinitionSource::Bundled => "bundled",
     }
 }
 
@@ -3955,6 +3998,7 @@ fn skill_summary_json(skill: &SkillSummary) -> Value {
 
 fn config_source_id(source: ConfigSource) -> &'static str {
     match source {
+        ConfigSource::Bundled => "bundled",
         ConfigSource::User => "user",
         ConfigSource::Project => "project",
         ConfigSource::Local => "local",
@@ -4621,11 +4665,22 @@ mod tests {
     }
 
     #[test]
-    fn removed_login_and_logout_commands_report_env_auth_guidance() {
-        let login_error = parse_error_message("/login");
-        assert!(login_error.contains("ANTHROPIC_API_KEY"));
-        let logout_error = parse_error_message("/logout");
-        assert!(logout_error.contains("ANTHROPIC_AUTH_TOKEN"));
+    fn login_and_logout_commands_run_the_gateway_flow() {
+        assert_eq!(SlashCommand::parse("/login"), Ok(Some(SlashCommand::Login)));
+        assert_eq!(
+            SlashCommand::parse("/logout"),
+            Ok(Some(SlashCommand::Logout))
+        );
+        assert_eq!(
+            SlashCommand::parse("/upgrade"),
+            Ok(Some(SlashCommand::Upgrade))
+        );
+        assert_eq!(
+            SlashCommand::parse("/usage"),
+            Ok(Some(SlashCommand::Usage { scope: None }))
+        );
+        let error = parse_error_message("/login now");
+        assert!(error.contains("Unexpected arguments for /login."));
     }
 
     #[test]
@@ -4669,9 +4724,10 @@ mod tests {
         assert!(help.contains("/agents [list|help]"));
         assert!(help.contains("/skills [list|install <path>|help|<skill> [args]]"));
         assert!(help.contains("aliases: /skill"));
-        assert!(!help.contains("/login"));
-        assert!(!help.contains("/logout"));
-        assert_eq!(slash_command_specs().len(), 139);
+        assert!(help.contains("/login"));
+        assert!(help.contains("/logout"));
+        assert!(help.contains("Sign in to your Zero-X account in the browser"));
+        assert_eq!(slash_command_specs().len(), 141);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 
@@ -4732,7 +4788,7 @@ mod tests {
 
         // then
         assert!(help.contains("/plugin"));
-        assert!(help.contains("Summary          Manage Claw Code plugins"));
+        assert!(help.contains("Summary          Manage Neuron plugins"));
         assert!(help.contains("Aliases          /plugins, /marketplace"));
         assert!(help.contains("Category         Tools"));
     }
@@ -5062,7 +5118,7 @@ mod tests {
         let help = handle_agents_slash_command_json(Some("help"), &workspace).expect("agents help");
         assert_eq!(help["kind"], "agents");
         assert_eq!(help["action"], "help");
-        assert_eq!(help["usage"]["direct_cli"], "claw agents [list|help]");
+        assert_eq!(help["usage"]["direct_cli"], "neuron agents [list|help]");
 
         let unexpected = handle_agents_slash_command_json(Some("show planner"), &workspace)
             .expect("agents usage");
@@ -5139,6 +5195,37 @@ mod tests {
     }
 
     #[test]
+    fn bundled_skills_resolve_without_a_checkout_and_project_skills_override_them() {
+        let _guard = env_guard();
+        let workspace = temp_dir("bundled-registry");
+        let original = std::env::var_os("NEURON_CONFIG_HOME");
+        std::env::set_var("NEURON_CONFIG_HOME", workspace.join("config"));
+        fs::create_dir_all(&workspace).expect("workspace");
+
+        for name in runtime::default_skills::DEFAULT_SKILL_NAMES {
+            let path = resolve_skill_path(&workspace, name).expect("embedded skill resolves");
+            assert!(path.is_file());
+        }
+        let skills = load_skills_from_roots(&super::discover_skill_roots(&workspace))
+            .expect("registry loads");
+        assert!(skills.iter().any(
+            |skill| skill.name == "gstack-review" && skill.source == DefinitionSource::Bundled
+        ));
+        let report = render_skills_report(&skills);
+        assert!(report.contains("Bundled defaults:"));
+        assert!(report.contains("gstack-review"));
+
+        let project_skills = workspace.join(".claw").join("skills");
+        write_skill(&project_skills, "ponytail", "Project Ponytail override");
+        assert_eq!(
+            resolve_skill_path(&workspace, "ponytail").unwrap(),
+            project_skills.join("ponytail").join("SKILL.md")
+        );
+        restore_env_var("NEURON_CONFIG_HOME", original);
+        fs::remove_dir_all(workspace).expect("cleanup");
+    }
+
+    #[test]
     fn renders_skills_reports_as_json() {
         let workspace = temp_dir("skills-json-workspace");
         let project_skills = workspace.join(".codex").join("skills");
@@ -5187,7 +5274,7 @@ mod tests {
         assert_eq!(help["usage"]["aliases"][0], "/skill");
         assert_eq!(
             help["usage"]["direct_cli"],
-            "claw skills [list|install <path>|help|<skill> [args]]"
+            "neuron skills [list|install <path>|help|<skill> [args]]"
         );
 
         let _ = fs::remove_dir_all(workspace);
@@ -5201,7 +5288,7 @@ mod tests {
         let agents_help =
             super::handle_agents_slash_command(Some("help"), &cwd).expect("agents help");
         assert!(agents_help.contains("Usage            /agents [list|help]"));
-        assert!(agents_help.contains("Direct CLI       claw agents"));
+        assert!(agents_help.contains("Direct CLI       neuron agents"));
         assert!(agents_help
             .contains("Sources          .claw/agents, ~/.claw/agents, $CLAW_CONFIG_HOME/agents"));
 
@@ -5325,7 +5412,7 @@ mod tests {
 
         let help = super::handle_mcp_slash_command(Some("help"), &cwd).expect("mcp help");
         assert!(help.contains("Usage            /mcp [list|show <server>|help]"));
-        assert!(help.contains("Direct CLI       claw mcp [list|show <server>|help]"));
+        assert!(help.contains("Direct CLI       neuron mcp [list|show <server>|help]"));
 
         let unexpected =
             super::handle_mcp_slash_command(Some("show alpha beta"), &cwd).expect("mcp usage");
@@ -5340,6 +5427,36 @@ mod tests {
             super::handle_mcp_slash_command(Some("inspect --help"), &cwd).expect("mcp usage");
         assert!(unknown_help.contains("Usage            /mcp [list|show <server>|help]"));
         assert!(unknown_help.contains("Unexpected       inspect"));
+
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn agents_skills_and_mcp_help_name_the_neuron_command() {
+        let cwd = temp_dir("direct-cli-name");
+
+        let texts = [
+            super::handle_agents_slash_command(Some("help"), &cwd).expect("agents help"),
+            super::handle_skills_slash_command(Some("help"), &cwd).expect("skills help"),
+            super::handle_mcp_slash_command(Some("help"), &cwd).expect("mcp help"),
+        ];
+        for text in &texts {
+            assert!(text.contains("Direct CLI       neuron "), "{text}");
+            assert!(!text.contains("claw "), "{text}");
+        }
+
+        let reports = [
+            super::handle_agents_slash_command_json(Some("help"), &cwd).expect("agents help"),
+            super::handle_skills_slash_command_json(Some("help"), &cwd).expect("skills help"),
+            super::handle_mcp_slash_command_json(Some("help"), &cwd).expect("mcp help"),
+        ];
+        for report in &reports {
+            let direct_cli = report["usage"]["direct_cli"]
+                .as_str()
+                .expect("direct_cli is a string");
+            assert!(direct_cli.starts_with("neuron "), "{direct_cli}");
+            assert!(!report.to_string().contains("claw "), "{report}");
+        }
 
         let _ = fs::remove_dir_all(cwd);
     }
@@ -5390,7 +5507,9 @@ mod tests {
         let loader = ConfigLoader::new(&workspace, &config_home);
         let list = super::render_mcp_report_for(&loader, &workspace, None)
             .expect("mcp list report should render");
-        assert!(list.contains("Configured servers 2"));
+        assert!(list.contains("Configured servers 4"));
+        assert!(list.contains("codebase-memory"));
+        assert!(list.contains("playwright"));
         assert!(list.contains("alpha"));
         assert!(list.contains("stdio"));
         assert!(list.contains("project"));
@@ -5469,15 +5588,18 @@ mod tests {
             render_mcp_report_json_for(&loader, &workspace, None).expect("mcp list json render");
         assert_eq!(list["kind"], "mcp");
         assert_eq!(list["action"], "list");
-        assert_eq!(list["configured_servers"], 2);
+        assert_eq!(list["configured_servers"], 4);
         assert_eq!(list["servers"][0]["name"], "alpha");
         assert_eq!(list["servers"][0]["transport"]["id"], "stdio");
         assert_eq!(list["servers"][0]["details"]["command"], "uvx");
-        assert_eq!(list["servers"][1]["name"], "remote");
-        assert_eq!(list["servers"][1]["scope"]["id"], "local");
-        assert_eq!(list["servers"][1]["transport"]["id"], "ws");
+        assert_eq!(list["servers"][1]["name"], "codebase-memory");
+        assert_eq!(list["servers"][1]["scope"]["id"], "bundled");
+        assert_eq!(list["servers"][2]["name"], "playwright");
+        assert_eq!(list["servers"][3]["name"], "remote");
+        assert_eq!(list["servers"][3]["scope"]["id"], "local");
+        assert_eq!(list["servers"][3]["transport"]["id"], "ws");
         assert_eq!(
-            list["servers"][1]["details"]["url"],
+            list["servers"][3]["details"]["url"],
             "wss://remote.example/mcp"
         );
 

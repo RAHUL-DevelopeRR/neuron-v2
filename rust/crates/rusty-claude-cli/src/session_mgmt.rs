@@ -37,8 +37,12 @@ pub fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
 }
 
 pub fn current_session_store() -> Result<runtime::SessionStore, Box<dyn std::error::Error>> {
-    let cwd = env::current_dir()?;
-    runtime::SessionStore::from_cwd(&cwd).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+    session_store_in(&env::current_dir()?)
+}
+
+/// The session store of the workspace at `cwd`.
+pub fn session_store_in(cwd: &Path) -> Result<runtime::SessionStore, Box<dyn std::error::Error>> {
+    runtime::SessionStore::from_cwd(cwd).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
 
 pub fn new_cli_session() -> Result<Session, Box<dyn std::error::Error>> {
@@ -58,7 +62,14 @@ pub fn create_managed_session_handle(
 pub fn resolve_session_reference(
     reference: &str,
 ) -> Result<SessionHandle, Box<dyn std::error::Error>> {
-    let handle = current_session_store()?
+    resolve_session_reference_in_store(&current_session_store()?, reference)
+}
+
+pub fn resolve_session_reference_in_store(
+    store: &runtime::SessionStore,
+    reference: &str,
+) -> Result<SessionHandle, Box<dyn std::error::Error>> {
+    let handle = store
         .resolve_reference(reference)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     Ok(SessionHandle {
@@ -92,6 +103,24 @@ pub fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std
         .collect())
 }
 
+/// Whether this workspace has a saved session other than the one at `current`. Cheap:
+/// file names and sizes only, no session is read.
+pub fn has_other_saved_session(current: &Path) -> bool {
+    let Some(entries) = sessions_dir().ok().and_then(|dir| fs::read_dir(dir).ok()) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        path != current
+            && path
+                .extension()
+                .is_some_and(|ext| ext == "jsonl" || ext == "json")
+            && entry
+                .metadata()
+                .is_ok_and(|meta| meta.is_file() && meta.len() > 0)
+    })
+}
+
 pub fn latest_managed_session() -> Result<ManagedSessionSummary, Box<dyn std::error::Error>> {
     let session = current_session_store()?
         .latest_session()
@@ -110,7 +139,14 @@ pub fn latest_managed_session() -> Result<ManagedSessionSummary, Box<dyn std::er
 pub fn load_session_reference(
     reference: &str,
 ) -> Result<(SessionHandle, Session), Box<dyn std::error::Error>> {
-    let loaded = current_session_store()?
+    load_session_reference_in_store(&current_session_store()?, reference)
+}
+
+pub fn load_session_reference_in_store(
+    store: &runtime::SessionStore,
+    reference: &str,
+) -> Result<(SessionHandle, Session), Box<dyn std::error::Error>> {
+    let loaded = store
         .load_session(reference)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     Ok((

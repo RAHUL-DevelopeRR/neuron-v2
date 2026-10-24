@@ -123,8 +123,8 @@ fn omc_namespaced_slash_commands_surface_a_targeted_compatibility_hint() {
     );
     let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
     assert!(stderr.contains("unknown slash command outside the REPL: /oh-my-claudecode:hud"));
-    assert!(stderr.contains("Claude Code/OMC plugin command"));
     assert!(stderr.contains("does not yet load plugin slash commands"));
+    assert!(!stderr.contains("Claude"), "{stderr}");
 
     fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
 }
@@ -151,6 +151,8 @@ fn config_command_loads_defaults_from_standard_config_locations() {
     // when
     let output = command_in(&temp_dir)
         .env("CLAW_CONFIG_HOME", &config_home)
+        // Workspace settings only apply to a trusted workspace.
+        .env("NEURON_TRUST_WORKSPACE", "1")
         .args([
             "--resume",
             session_path.to_str().expect("utf8 path"),

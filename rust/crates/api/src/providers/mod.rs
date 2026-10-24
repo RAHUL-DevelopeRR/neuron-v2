@@ -233,6 +233,12 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     {
         return ProviderKind::OpenAi;
     }
+    // An explicitly installed OpenAI-compatible endpoint (e.g. the Zero-X
+    // gateway) plays the same role as `OPENAI_BASE_URL` without exporting
+    // its credential into the environment.
+    if openai_compat::installed_openai_compat_endpoint().is_some() {
+        return ProviderKind::OpenAi;
+    }
     if anthropic::has_auth_from_env_or_saved().unwrap_or(false) {
         return ProviderKind::Anthropic;
     }
@@ -295,7 +301,12 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
             max_output_tokens: 16_384,
             context_window_tokens: 256_000,
         }),
-        _ => None,
+        // Gateway catalog models (registered from `GET /v1/models`) and the
+        // runtime's verified fallback table.
+        _ => runtime::model_registry::lookup(&canonical).map(|capability| ModelTokenLimit {
+            max_output_tokens: capability.max_output_tokens,
+            context_window_tokens: capability.context_window,
+        }),
     }
 }
 
@@ -447,10 +458,21 @@ pub(crate) fn load_dotenv_file(
 }
 
 /// Look up `key` in a `.env` file located in the current working directory.
-/// Returns `None` when the file is missing, the key is absent, or the value
-/// is empty.
+/// Returns `None` when the workspace is not trusted, the file is missing,
+/// the key is absent, or the value is empty.
 pub(crate) fn dotenv_value(key: &str) -> Option<String> {
     let cwd = std::env::current_dir().ok()?;
+    let trusted = runtime::ConfigLoader::default_for(&cwd).workspace_is_trusted();
+    dotenv_value_in(&cwd, key, trusted)
+}
+
+/// A cloned repository's `.env` could supply its own API key, sending the
+/// user's prompts and code to an account its author can read, so the file
+/// only counts once the user has trusted the workspace.
+fn dotenv_value_in(cwd: &std::path::Path, key: &str, workspace_trusted: bool) -> Option<String> {
+    if !workspace_trusted {
+        return None;
+    }
     let values = load_dotenv_file(&cwd.join(".env"))?;
     values.get(key).filter(|value| !value.is_empty()).cloned()
 }
@@ -469,9 +491,9 @@ mod tests {
 
     use super::{
         anthropic_missing_credentials, anthropic_missing_credentials_hint, detect_provider_kind,
-        load_dotenv_file, max_tokens_for_model, max_tokens_for_model_with_override,
-        model_token_limit, parse_dotenv, preflight_message_request, resolve_model_alias,
-        ProviderKind,
+        dotenv_value_in, load_dotenv_file, max_tokens_for_model,
+        max_tokens_for_model_with_override, model_token_limit, parse_dotenv,
+        preflight_message_request, resolve_model_alias, ProviderKind,
     };
 
     /// Serializes every test in this module that mutates process-wide
@@ -729,6 +751,43 @@ mod tests {
     }
 
     #[test]
+    fn token_limits_and_preflight_consult_the_runtime_model_registry() {
+        // A gateway catalog model the static table does not know.
+        let model = "openai/test-catalog/registry-limits-model";
+        runtime::model_registry::register([runtime::model_registry::ModelCapability::new(
+            "test-catalog/registry-limits-model",
+            4_096,
+            1_024,
+            true,
+        )]);
+
+        let limit = model_token_limit(model).expect("registered model has limits");
+        assert_eq!(limit.context_window_tokens, 4_096);
+        assert_eq!(limit.max_output_tokens, 1_024);
+        assert_eq!(max_tokens_for_model(model), 1_024);
+
+        let request = MessageRequest {
+            model: model.to_string(),
+            max_tokens: 1_024,
+            messages: vec![InputMessage::user_text("x".repeat(20_000))],
+            ..Default::default()
+        };
+        let error = preflight_message_request(&request)
+            .expect_err("oversized gateway requests should be blocked locally");
+        assert!(matches!(
+            error,
+            ApiError::ContextWindowExceeded {
+                context_window_tokens: 4_096,
+                ..
+            }
+        ));
+
+        // Built-in fallbacks (verified free models) also apply.
+        let gemini = model_token_limit("openai/gemini/gemini-2.5-flash").expect("fallback");
+        assert_eq!(gemini.context_window_tokens, 1_048_576);
+    }
+
+    #[test]
     fn preflight_skips_unknown_models() {
         let request = MessageRequest {
             model: "unknown-model".to_string(),
@@ -857,6 +916,32 @@ NO_EQUALS_LINE
         assert_eq!(values.get("EMPTY_VALUE").map(String::as_str), Some(""));
         assert!(!values.contains_key("NO_EQUALS_LINE"));
         assert!(!values.contains_key("# this is a comment"));
+    }
+
+    #[test]
+    fn dotenv_credentials_only_count_in_a_trusted_workspace() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "api-dotenv-trust-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_root).expect("temp dir");
+        std::fs::write(
+            temp_root.join(".env"),
+            "OPENAI_API_KEY=sk-from-a-cloned-repo\n",
+        )
+        .expect("write .env");
+
+        assert_eq!(dotenv_value_in(&temp_root, "OPENAI_API_KEY", false), None);
+        assert_eq!(
+            dotenv_value_in(&temp_root, "OPENAI_API_KEY", true).as_deref(),
+            Some("sk-from-a-cloned-repo")
+        );
+
+        std::fs::remove_dir_all(&temp_root).expect("cleanup");
     }
 
     #[test]

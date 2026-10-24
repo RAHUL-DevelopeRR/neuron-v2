@@ -1,365 +1,344 @@
-# Claw Code Usage
+# Using Neuron
 
-This guide covers the current Rust workspace under `rust/` and the `claw` CLI binary. If you are brand new, make the doctor health check your first run: start `claw`, then run `/doctor`.
+This guide covers day-to-day use of the `neuron` command. Installation is in the
+[README](README.md#install); `neuron --help` lists every flag of the version you have.
 
-## Quick-start health check
+## Start a session
 
-Run this before prompts, sessions, or automation:
-
-```bash
-cd rust
-cargo build --workspace
-./target/debug/claw
-# first command inside the REPL
-/doctor
+```sh
+cd your-project
+neuron
 ```
 
-`/doctor` is the built-in setup and preflight diagnostic. Once you have a saved session, you can rerun it with `./target/debug/claw --resume latest /doctor`.
+On a terminal, `neuron` opens the full-screen UI, `neuron-tui`, which the installers
+and launchers put beside `neuron`. Type a request, or a slash command such as `/help`.
+Approve or deny tool calls in its dialog (Esc denies; Ctrl+C denies and interrupts the
+turn), sign in with `/login` and pick a model with `/model`. Ctrl+C interrupts the
+current turn, and `/exit` or Ctrl+C twice quits. `neuron --continue` reopens the
+latest chat for this folder, and `neuron --continue CHAT` a given one. Shell commands
+typed in the UI (`!cmd`, `/bash`) are not available yet.
 
-## Prerequisites
+The UI does not ask whether you trust the folder: until you do, the folder's own
+settings, hooks and MCP servers are not loaded, and `/status` says how to trust it
+(see [Workspace trust](#workspace-trust)).
 
-- Rust toolchain with `cargo`
-- One of:
-  - `ANTHROPIC_API_KEY` for direct API access
-  - `ANTHROPIC_AUTH_TOKEN` for bearer-token auth
-- Optional: `ANTHROPIC_BASE_URL` when targeting a proxy or local service
+`neuron --no-tui` (or `NEURON_NO_TUI=1`) keeps the line REPL, which also runs when the
+UI is missing. The first time you run it in a directory it asks whether you trust it;
+Neuron reads, writes and runs commands only after you agree. Press Ctrl+C to interrupt
+the current turn and `/exit` to leave.
 
-## Install / build the workspace
+For one-off and scripted use:
 
-```bash
-cd rust
-cargo build --workspace
+```sh
+neuron prompt "summarize the open TODOs in src/"     # one prompt, then exit
+neuron "summarize Cargo.toml"                        # shorthand for the same
+neuron --output-format json prompt "list the public functions in lib.rs"
+neuron --compact "summarize Cargo.toml" | wc -l      # final answer only, for pipes
+git diff | neuron prompt "review this change"        # piped input goes with the prompt
 ```
 
-The CLI binary is available at `rust/target/debug/claw` after a debug build. Make the doctor check above your first post-build step.
+Piped standard input is sent to the model with the prompt, up to 128 KiB; with a prompt
+on the command line, a pipe that sends nothing for 500 ms is not waited for. In a
+script or CI, `neuron prompt` asks nothing: see [Permission modes](#permission-modes)
+for what happens to tool calls that need approval, and why such a run can exit with
+code 2.
 
-## Quick start
+## Sign in
 
-### First-run doctor check
+Neuron uses your Zero-X account unless you choose another provider.
 
-```bash
-cd rust
-./target/debug/claw
-/doctor
+| Command | What it does |
+| --- | --- |
+| `neuron login` (or `neuron auth login`) | Prints a link, <https://neuron.zero-x.live/device>, and a short code such as `BDWP-HQPK`, and opens the link in your browser when this machine has one. Approve the code there while signed in to Zero-X (on this machine or any other device, such as your phone), and Neuron continues on its own. Nothing listens on a local port, so this works over SSH, in WSL and in containers; `--no-browser` (or `NEURON_NO_BROWSER=1`) only skips opening the browser. The code expires after 10 minutes. The session is stored in the OS credential store on macOS and Windows, otherwise in `~/.neuroncli/credentials.json` (owner-only); see [SECURITY.md](SECURITY.md#how-neuron-handles-credentials). |
+| `neuron login --with-token` | Reads a credential from standard input instead, for CI. Use a personal API key (`nzx_…`) from the Zero-X dashboard, or a session token (`ses_…`). |
+| `neuron auth status` | Checks the credential with the gateway and prints where it came from, the plan, the expiry and today's usage. |
+| `neuron logout` (or `neuron auth logout`) | Revokes a session on the gateway and deletes the local copy (API keys are revoked in the dashboard). |
+
+Inside a session, `/login` and `/logout` run the same flows.
+
+Only approve a code you started yourself: the approval page shows which device asked
+and where from, and warns when that differs from your browser's location. Zero-X never
+asks you to enter a code sent by email, chat or phone.
+
+```sh
+# CI: keep the key in your CI secret store, never in the repository
+printf '%s' "$ZEROX_API_KEY" | neuron auth login --with-token
 ```
 
-### Interactive REPL
+You can also set `NEURON_TOKEN` to a key or session for a single process; it takes
+precedence over the stored login and over any provider choice, and is not saved.
+Neuron removes it (and any other `ses_…` or `nzx_…` value) from the environment of the
+commands, plugin tools and MCP servers it starts; hooks run with Neuron's own
+environment and do see it. `neuron auth logout` does not clear it, so
+unset it yourself. `NEURON_API_BASE` changes the gateway URL (default
+`https://zero-x.live/v1`; plain HTTP is accepted only for a loopback address).
 
-```bash
-cd rust
-./target/debug/claw
+Sessions expire after 30 days by default. If the gateway answers `invalid_session`,
+the credential expired or was revoked: run `neuron auth login` again. Revoking all
+sessions from the Zero-X dashboard signs out every machine.
+
+## Plans, usage and limits
+
+| Command | What it does |
+| --- | --- |
+| `neuron usage` | Prints your plan, today's requests and tokens with the reset time, and your credit balance. |
+| `/usage` | The same, inside a session. |
+| `/upgrade` | Opens <https://zero-x.live/pricing>. |
+| `/cost` | Token usage of the current session. |
+
+Neuron reports gateway limits with the reason and what to do next:
+
+| Error | Meaning | What Neuron does |
+| --- | --- | --- |
+| `insufficient_quota` | Daily request or token cap reached | Stops and shows the reset time and the upgrade link. No retry. |
+| `rate_limited` | Too many requests per minute, or too many at once | Waits for the `Retry-After` time and retries, at most twice; each wait may be up to 90 seconds and all of them up to 180 seconds, shown as a countdown. |
+| `capacity_exhausted` | The shared free pool for this model is used up | Same as `rate_limited`. A longer wait than that stops with the error. |
+| `upstream_error`, `upstream_timeout`, `service_unavailable` | The upstream provider failed or stalled, or the gateway is briefly unavailable; the gateway refunds most of these requests | Retries at most twice, waiting at most 60 seconds in total. |
+| `model_not_found` | The model id is not in the catalog | Stops; pick one from `/model`. |
+| `upgrade_required` | The model is not in your plan | Stops and shows the upgrade link. |
+| `insufficient_credits` | Paid capacity needed, credit balance too low | Stops and shows the upgrade link. |
+| `region_unavailable` | The free pool is not offered in your region | Stops; choose another model. |
+| `context_length_exceeded` | No available model fits the request, including a prompt above a free model's per-minute token budget | Stops with the gateway's message and, when a paid pool would take the request, the upgrade link; shorten the prompt or `/compact` the session. |
+| `invalid_session` | The credential expired or was revoked | Stops and asks you to run `neuron auth login`. |
+
+Waits between retries do not count toward the first-token timeout (90 seconds, 60
+after tool results). A response that times out or breaks off is sent once more only
+while the retry limit above still allows a request, so one model call sends at most
+three requests to the gateway.
+
+The free plan's limits and the providers behind it are described in the
+[README](README.md#plans-and-limits).
+
+## Models
+
+```sh
+neuron --model auto                 # let the gateway choose (the default)
+neuron --model gemini/gemini-2.5-flash
 ```
 
-### One-shot prompt
+Inside a session, `/model` shows the active model and the catalog, and
+`/model <id>` switches. The list comes from the gateway (`GET /v1/models`, cached for
+10 minutes in `~/.neuroncli/catalog.json`) and marks models that are unavailable to
+you with the reason: not in your plan, not offered in your region, or not configured
+on the gateway. `auto` picks a tool-capable model whose context window fits the
+request. `NEURON_MODEL` sets the model for a process.
 
-```bash
-cd rust
-./target/debug/claw prompt "summarize this repository"
-```
+Free pools have small per-minute token budgets, so the first request of a session is
+kept small: the system prompt lists the bundled skills by name and the model loads a
+skill's instructions only when it needs them, and MCP server tools are offered
+through `ToolSearch` instead of with every request. In a one-file repository the first
+request is about 17,000 characters (roughly 4,500 tokens).
 
-### Shorthand prompt mode
+## Permission modes
 
-```bash
-cd rust
-./target/debug/claw "explain rust/crates/runtime/src/lib.rs"
-```
+| Mode | Neuron may, without asking | Needs your approval |
+| --- | --- | --- |
+| `read-only` | Read and search files in the workspace, run read-only shell commands | Nothing else is allowed |
+| `workspace-write` (default) | The above, plus edit files in the workspace | Other shell commands, searches or writes outside the workspace, writes to `.git` or Neuron settings, fetches from a new domain, sub-agents, and MCP and other tools that need full access |
+| `danger-full-access` | Everything | Nothing |
 
-### JSON output for scripting
+A shell command (bash or PowerShell) counts as read-only only when every command in
+the line is a known read-only program with safe arguments, writes nowhere except
+`/dev/null` and names no path outside the workspace; pipes, `&&`, redirections and
+substitutions are all checked. When Neuron asks, it shows the tool, the mode it needs,
+the reason and the input, and runs the call only if you answer `y`; when standard
+output is redirected, the question goes to standard error. When standard output and
+standard error are both redirected, nobody would see the question, so the call is
+denied instead.
 
-```bash
-cd rust
-./target/debug/claw --output-format json prompt "status"
-```
+`neuron prompt` asks only when standard input is a terminal. In a script or CI
+(standard input a pipe, a file or `/dev/null`) a call that needs approval is denied
+without asking, the model is told that nothing ran, and questions from the model are
+refused so it decides itself. After 5 denied calls the turn stops. A run that denied a
+call ends with a warning naming the denied tools and exits with code 2.
 
-## Model and permission controls
+`permissions` rules in settings can allow or deny tools and command prefixes in
+advance, for example `{"permissions": {"allow": ["bash(git:*)"]}}`.
 
-```bash
-cd rust
-./target/debug/claw --model sonnet prompt "review this diff"
-./target/debug/claw --permission-mode read-only prompt "summarize Cargo.toml"
-./target/debug/claw --permission-mode workspace-write prompt "update README.md"
-./target/debug/claw --allowedTools read,glob "inspect the runtime crate"
-```
-
-Supported permission modes:
-
-- `read-only`
-- `workspace-write`
-- `danger-full-access`
-
-Model aliases currently supported by the CLI:
-
-- `opus` → `claude-opus-4-6`
-- `sonnet` → `claude-sonnet-4-6`
-- `haiku` → `claude-haiku-4-5-20251213`
-
-## Authentication
-
-### API key
-
-```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
-```
-
-### OAuth
-
-```bash
-cd rust
-export ANTHROPIC_AUTH_TOKEN="anthropic-oauth-or-proxy-bearer-token"
-```
-
-### Which env var goes where
-
-`claw` accepts two Anthropic credential env vars and they are **not interchangeable** — the HTTP header Anthropic expects differs per credential shape. Putting the wrong value in the wrong slot is the most common 401 we see.
-
-| Credential shape | Env var | HTTP header | Typical source |
-|---|---|---|---|
-| `sk-ant-*` API key | `ANTHROPIC_API_KEY` | `x-api-key: sk-ant-...` | [console.anthropic.com](https://console.anthropic.com) |
-| OAuth access token (opaque) | `ANTHROPIC_AUTH_TOKEN` | `Authorization: Bearer ...` | an Anthropic-compatible proxy or OAuth flow that mints bearer tokens |
-| OpenRouter key (`sk-or-v1-*`) | `OPENAI_API_KEY` + `OPENAI_BASE_URL=https://openrouter.ai/api/v1` | `Authorization: Bearer ...` | [openrouter.ai/keys](https://openrouter.ai/keys) |
-
-**Why this matters:** if you paste an `sk-ant-*` key into `ANTHROPIC_AUTH_TOKEN`, Anthropic's API will return `401 Invalid bearer token` because `sk-ant-*` keys are rejected over the Bearer header. The fix is a one-line env var swap — move the key to `ANTHROPIC_API_KEY`. Recent `claw` builds detect this exact shape (401 + `sk-ant-*` in the Bearer slot) and append a hint to the error message pointing at the fix.
-
-**If you meant a different provider:** if `claw` reports missing Anthropic credentials but you already have `OPENAI_API_KEY`, `XAI_API_KEY`, or `DASHSCOPE_API_KEY` exported, you most likely forgot to prefix the model name with the provider's routing prefix. Use `--model openai/gpt-4.1-mini` (OpenAI-compat / OpenRouter / Ollama), `--model grok` (xAI), or `--model qwen-plus` (DashScope) and the prefix router will select the right backend regardless of the ambient credentials. The error message now includes a hint that names the detected env var.
-
-## Local Models
-
-`claw` can talk to local servers and provider gateways through either Anthropic-compatible or OpenAI-compatible endpoints. Use `ANTHROPIC_BASE_URL` with `ANTHROPIC_AUTH_TOKEN` for Anthropic-compatible services, or `OPENAI_BASE_URL` with `OPENAI_API_KEY` for OpenAI-compatible services.
-
-### Anthropic-compatible endpoint
-
-```bash
-export ANTHROPIC_BASE_URL="http://127.0.0.1:8080"
-export ANTHROPIC_AUTH_TOKEN="local-dev-token"
-
-cd rust
-./target/debug/claw --model "claude-sonnet-4-6" prompt "reply with the word ready"
-```
-
-### OpenAI-compatible endpoint
-
-```bash
-export OPENAI_BASE_URL="http://127.0.0.1:8000/v1"
-export OPENAI_API_KEY="local-dev-token"
-
-cd rust
-./target/debug/claw --model "qwen2.5-coder" prompt "reply with the word ready"
-```
-
-### Ollama
-
-```bash
-export OPENAI_BASE_URL="http://127.0.0.1:11434/v1"
-unset OPENAI_API_KEY
-
-cd rust
-./target/debug/claw --model "llama3.2" prompt "summarize this repository in one sentence"
-```
-
-### OpenRouter
-
-```bash
-export OPENAI_BASE_URL="https://openrouter.ai/api/v1"
-export OPENAI_API_KEY="sk-or-v1-..."
-
-cd rust
-./target/debug/claw --model "openai/gpt-4.1-mini" prompt "summarize this repository in one sentence"
-```
-
-### Alibaba DashScope (Qwen)
-
-For Qwen models via Alibaba's native DashScope API (higher rate limits than OpenRouter):
-
-```bash
-export DASHSCOPE_API_KEY="sk-..."
-
-cd rust
-./target/debug/claw --model "qwen/qwen-max" prompt "hello"
-# or bare:
-./target/debug/claw --model "qwen-plus" prompt "hello"
-```
-
-Model names starting with `qwen/` or `qwen-` are automatically routed to the DashScope compatible-mode endpoint (`https://dashscope.aliyuncs.com/compatible-mode/v1`). You do **not** need to set `OPENAI_BASE_URL` or unset `ANTHROPIC_API_KEY` — the model prefix wins over the ambient credential sniffer.
-
-Reasoning variants (`qwen-qwq-*`, `qwq-*`, `*-thinking`) automatically strip `temperature`/`top_p`/`frequency_penalty`/`presence_penalty` before the request hits the wire (these params are rejected by reasoning models).
-
-## Supported Providers & Models
-
-`claw` has three built-in provider backends. The provider is selected automatically based on the model name, falling back to whichever credential is present in the environment.
-
-### Provider matrix
-
-| Provider | Protocol | Auth env var(s) | Base URL env var | Default base URL |
-|---|---|---|---|---|
-| **Anthropic** (direct) | Anthropic Messages API | `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` |
-| **xAI** | OpenAI-compatible | `XAI_API_KEY` | `XAI_BASE_URL` | `https://api.x.ai/v1` |
-| **OpenAI-compatible** | OpenAI Chat Completions | `OPENAI_API_KEY` | `OPENAI_BASE_URL` | `https://api.openai.com/v1` |
-| **DashScope** (Alibaba) | OpenAI-compatible | `DASHSCOPE_API_KEY` | `DASHSCOPE_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
-
-The OpenAI-compatible backend also serves as the gateway for **OpenRouter**, **Ollama**, and any other service that speaks the OpenAI `/v1/chat/completions` wire format — just point `OPENAI_BASE_URL` at the service.
-
-**Model-name prefix routing:** If a model name starts with `openai/`, `gpt-`, `qwen/`, or `qwen-`, the provider is selected by the prefix regardless of which env vars are set. This prevents accidental misrouting to Anthropic when multiple credentials exist in the environment.
-
-### Tested models and aliases
-
-These are the models registered in the built-in alias table with known token limits:
-
-| Alias | Resolved model name | Provider | Max output tokens | Context window |
-|---|---|---|---|---|
-| `opus` | `claude-opus-4-6` | Anthropic | 32 000 | 200 000 |
-| `sonnet` | `claude-sonnet-4-6` | Anthropic | 64 000 | 200 000 |
-| `haiku` | `claude-haiku-4-5-20251213` | Anthropic | 64 000 | 200 000 |
-| `grok` / `grok-3` | `grok-3` | xAI | 64 000 | 131 072 |
-| `grok-mini` / `grok-3-mini` | `grok-3-mini` | xAI | 64 000 | 131 072 |
-| `grok-2` | `grok-2` | xAI | — | — |
-
-Any model name that does not match an alias is passed through verbatim. This is how you use OpenRouter model slugs (`openai/gpt-4.1-mini`), Ollama tags (`llama3.2`), or full Anthropic model IDs (`claude-sonnet-4-20250514`).
-
-### User-defined aliases
-
-You can add custom aliases in any settings file (`~/.claw/settings.json`, `.claw/settings.json`, or `.claw/settings.local.json`):
+Choose the mode with `--permission-mode MODE`, switch inside a session with
+`/permissions MODE`, or set a default in settings:
 
 ```json
-{
-  "aliases": {
-    "fast": "claude-haiku-4-5-20251213",
-    "smart": "claude-opus-4-6",
-    "cheap": "grok-3-mini"
-  }
-}
+{ "permissionMode": "read-only" }
 ```
 
-Local project settings override user-level settings. Aliases resolve through the built-in table, so `"fast": "haiku"` also works.
+`--dangerously-skip-permissions` turns every check off for that run; use it only in a
+disposable environment such as a container. `--allowedTools read,glob` limits which
+tools exist at all, whatever the mode. Settings can also carry `permissions` allow, ask
+and deny rules for individual tools.
 
-### How provider detection works
+## Sessions
 
-1. If the resolved model name starts with `claude` → Anthropic.
-2. If it starts with `grok` → xAI.
-3. Otherwise, `claw` checks which credential is set: `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` first, then `OPENAI_API_KEY`, then `XAI_API_KEY`.
-4. If nothing matches, it defaults to Anthropic.
+Interactive turns are saved to `.neuron/sessions/<session-id>.jsonl` in the project.
 
-## FAQ
-
-### What about Codex?
-
-The name "codex" appears in the Claw Code ecosystem but it does **not** refer to OpenAI Codex (the code-generation model). Here is what it means in this project:
-
-- **`oh-my-codex` (OmX)** is the workflow and plugin layer that sits on top of `claw`. It provides planning modes, parallel multi-agent execution, notification routing, and other automation features. See [PHILOSOPHY.md](./PHILOSOPHY.md) and the [oh-my-codex repo](https://github.com/Yeachan-Heo/oh-my-codex).
-- **`.codex/` directories** (e.g. `.codex/skills`, `.codex/agents`, `.codex/commands`) are legacy lookup paths that `claw` still scans alongside the primary `.claw/` directories.
-- **`CODEX_HOME`** is an optional environment variable that points to a custom root for user-level skill and command lookups.
-
-`claw` does **not** support OpenAI Codex sessions, the Codex CLI, or Codex session import/export. If you need to use OpenAI models (like GPT-4.1), configure the OpenAI-compatible provider as shown above in the [OpenAI-compatible endpoint](#openai-compatible-endpoint) and [OpenRouter](#openrouter) sections.
-
-## HTTP proxy support
-
-`claw` honours the standard `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` environment variables (both upper- and lower-case spellings are accepted) when issuing outbound requests to Anthropic, OpenAI-, and xAI-compatible endpoints. Set them before launching the CLI and the underlying `reqwest` client will be configured automatically.
-
-### Environment variables
-
-```bash
-export HTTPS_PROXY="http://proxy.corp.example:3128"
-export HTTP_PROXY="http://proxy.corp.example:3128"
-export NO_PROXY="localhost,127.0.0.1,.corp.example"
-
-cd rust
-./target/debug/claw prompt "hello via the corporate proxy"
+```sh
+neuron --resume latest                         # continue the newest session
+neuron --resume latest --permission-mode read-only   # ...with different launch flags
+neuron --resume latest /status /diff           # run resume-safe commands without the REPL
+neuron export conversation.md                  # write the latest session as Markdown
 ```
 
-### Programmatic `proxy_url` config option
+On a terminal, `--resume` without slash commands continues the session interactively.
+`--model`, `--permission-mode`, `--allowedTools`, `--reasoning-effort` and the other
+launch flags apply to it whether you put them before or after `--resume`; without
+`--model` it continues on the model the session used.
 
-As an alternative to per-scheme environment variables, the `ProxyConfig` type exposes a `proxy_url` field that acts as a single catch-all proxy for both HTTP and HTTPS traffic. When `proxy_url` is set it takes precedence over the separate `http_proxy` and `https_proxy` fields.
+Inside a session: `/session list`, `/session switch <id>`, `/resume <path>`,
+`/compact` to shrink history, `/clear` to start over.
 
-```rust
-use api::{build_http_client_with, ProxyConfig};
+## Common slash commands
 
-// From a single unified URL (config file, CLI flag, etc.)
-let config = ProxyConfig::from_proxy_url("http://proxy.corp.example:3128");
-let client = build_http_client_with(&config).expect("proxy client");
+| Command | Purpose |
+| --- | --- |
+| `/help` | All commands |
+| `/status` | Model, permission mode, workspace and session |
+| `/model [id]` | Show or switch the model |
+| `/permissions [mode]` | Show or switch the permission mode |
+| `/usage`, `/upgrade` | Account usage; open the pricing page |
+| `/login`, `/logout` | Sign in or out of Zero-X |
+| `/cost` | Token usage of this session |
+| `/compact`, `/clear` | Shrink or reset the conversation |
+| `/diff` | Changes in the working tree |
+| `/init` | Create a starter `NEURON.md` for the project |
+| `/mcp`, `/skills`, `/plugins` | Inspect and manage integrations |
+| `/doctor` | Diagnose auth, configuration and sandbox setup |
+| `/exit` | Leave |
 
-// Or set the field directly alongside NO_PROXY
-let config = ProxyConfig {
-    proxy_url: Some("http://proxy.corp.example:3128".to_string()),
-    no_proxy: Some("localhost,127.0.0.1".to_string()),
-    ..ProxyConfig::default()
-};
-let client = build_http_client_with(&config).expect("proxy client");
-```
+`neuron status`, `neuron doctor` and `neuron sandbox` print the same reports without
+starting a session.
 
-### Notes
+## Bring your own key
 
-- When both `HTTPS_PROXY` and `HTTP_PROXY` are set, the secure proxy applies to `https://` URLs and the plain proxy applies to `http://` URLs.
-- `proxy_url` is a unified alternative: when set, it applies to both `http://` and `https://` destinations, overriding the per-scheme fields.
-- `NO_PROXY` accepts a comma-separated list of host suffixes (for example `.corp.example`) and IP literals.
-- Empty values are treated as unset, so leaving `HTTPS_PROXY=""` in your shell will not enable a proxy.
-- If a proxy URL cannot be parsed, `claw` falls back to a direct (no-proxy) client so existing workflows keep working; double-check the URL if you expected the request to be tunnelled.
+Set the key for the provider you want to use:
 
-## Common operational commands
+| Provider | Variables |
+| --- | --- |
+| OpenAI or any OpenAI-compatible endpoint | `OPENAI_API_KEY`, optional `OPENAI_BASE_URL` |
+| Local OpenAI-compatible server | `OPENAI_BASE_URL=http://127.0.0.1:<port>/v1` (no key needed) |
+| Anthropic | `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_TOKEN`), with `auto` or a `claude-*` model |
+| xAI | `XAI_API_KEY`, with a `grok-*` model |
+| OpenRouter | `OPENROUTER_API_KEY` (OpenRouter is only available with your own key) |
+| Azure AI Foundry | `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_MODEL` |
 
-```bash
-cd rust
-./target/debug/claw status
-./target/debug/claw sandbox
-./target/debug/claw agents
-./target/debug/claw mcp
-./target/debug/claw skills
-./target/debug/claw system-prompt --cwd .. --date 2026-04-04
-```
+Neuron picks the provider in this order and names it, with the credential source, on
+startup:
 
-## Session management
+1. `NEURON_TOKEN` in the environment: the Zero-X gateway.
+2. An explicit choice: `--provider NAME`, then `NEURON_PROVIDER`, then the `provider`
+   setting. Names: `zero-x`, `openai`, `openrouter`, `azure`, `anthropic`, `xai`,
+   `local`. A misspelled name is an error that names the file or flag.
+3. Your stored Zero-X login.
+4. Keys in the environment, in this order: Anthropic (for `auto` or `claude-*`
+   models), xAI (for `grok-*` models), Azure (while its daily quota lasts and the
+   endpoint answers), OpenAI, a loopback `OPENAI_BASE_URL`, OpenRouter.
+5. Otherwise Neuron asks you to run `neuron auth login`.
 
-REPL turns are persisted under `.claw/sessions/` in the current workspace.
+So while you are signed in to Zero-X, keys in the environment are ignored until you
+select their provider. Requests then go straight to that provider under your account
+and its terms; Zero-X limits and credits do not apply. The key stays in memory and is
+not exported to the commands Neuron runs, and Neuron removes provider keys and any
+variable named `*_API_KEY`, `*_TOKEN` or `*_SECRET` from the environment of the
+commands, plugin tools and MCP servers it starts, including keys you exported yourself
+(a value set in an MCP server's `env` still applies). Hooks are the exception: they run
+with Neuron's own environment, including any keys you exported.
 
-```bash
-cd rust
-./target/debug/claw --resume latest
-./target/debug/claw --resume latest /status /diff
-```
+## Configuration files
 
-Useful interactive commands include `/help`, `/status`, `/cost`, `/config`, `/session`, `/model`, `/permissions`, and `/export`.
+| File | Scope |
+| --- | --- |
+| `~/.neuron/settings.json` | Your defaults (the directory moves with `NEURON_CONFIG_HOME`) |
+| `.neuron/settings.json` | Project settings, safe to commit |
+| `.neuron/settings.local.json` | Your overrides for this project; keep it out of version control |
 
-## Config file resolution order
+Later files override earlier ones. `/config` shows the merged result. Settings are
+checked when they load: an unknown key or a value of the wrong type is an error that
+names the file, the line and the closest known key. Commonly used keys:
 
-Runtime config is loaded in this order, with later entries overriding earlier ones:
+| Key | Purpose |
+| --- | --- |
+| `model` | Default model |
+| `permissionMode` | Default permission mode |
+| `permissions` | `allow`, `ask` and `deny` rules for individual tools |
+| `provider` | Provider to use (see [Bring your own key](#bring-your-own-key)) |
+| `maxIterations` | Model calls allowed in one turn (default 50); `NEURON_MAX_ITERATIONS` overrides it |
+| `hooks` | Commands run before and after tool calls |
+| `mcpServers`, `defaultMcpServers`, `disabledMcpServers` | MCP servers |
+| `defaultSkills` | `false` leaves the bundled skills out of the system prompt |
 
-1. `~/.claw.json`
-2. `~/.config/claw/settings.json`
-3. `<repo>/.claw.json`
-4. `<repo>/.claw/settings.json`
-5. `<repo>/.claw/settings.local.json`
+Default skills and MCP servers are described in
+[default integrations](docs/DEFAULT_INTEGRATIONS.md).
 
-## Mock parity harness
+### Workspace trust
 
-The workspace includes a deterministic Anthropic-compatible mock service and parity harness.
+A cloned repository's own settings files (`.neuron.json`, `.neuron/settings*.json`
+and the `.claw` equivalents) can run commands, so Neuron applies them only once you
+trust the directory. The first time you start Neuron in a directory it asks; your
+answer is saved in `~/.neuroncli/trusted_dirs.txt` (under `NEURON_HOME` if set).
+A directory is also trusted when it sits under a `trustedRoots` entry in **your user
+settings**; a repository cannot list itself. For headless runs, set
+`NEURON_TRUST_WORKSPACE=1` only for checkouts you trust.
 
-```bash
-cd rust
-./scripts/run_mock_parity_harness.sh
-```
+Until a directory is trusted, its settings keep only what restricts Neuron:
+`permissions.deny` (added to your own deny rules), a read-only `defaultMode` or
+`permissionMode`, and `"defaultMcpServers": false` or `"defaultSkills": false`.
+Hooks, MCP servers, allow and ask rules, model, aliases, provider and the other keys
+are ignored, with a warning naming them. Even in a trusted directory, settings files
+cannot set a full-access permission mode; pass `--permission-mode danger-full-access`
+or put it in your user settings.
 
-Manual mock service startup:
+## Environment variables
 
-```bash
-cd rust
-cargo run -p mock-anthropic-service -- --bind 127.0.0.1:0
-```
+| Variable | Used by | Purpose |
+| --- | --- | --- |
+| `NEURON_TOKEN` | neuron | Gateway credential for this process |
+| `NEURON_API_BASE` | neuron | Gateway URL (default `https://zero-x.live/v1`) |
+| `NEURON_MODEL` | neuron | Model for this process |
+| `NEURON_PROVIDER` | neuron | Provider for this process (see [Bring your own key](#bring-your-own-key)) |
+| `NEURON_MAX_ITERATIONS` | neuron | Model calls allowed in one turn (default 50) |
+| `NEURON_CONFIG_HOME` | neuron | Settings directory (default `~/.neuron`) |
+| `NEURON_HOME` | neuron | Directory for the login file and caches (default `~/.neuroncli`); setting it also keeps the login out of the OS credential store |
+| `NEURON_CREDENTIAL_STORE` | neuron | `file` or `keychain`: force where the login is kept |
+| `NEURON_TRUST_WORKSPACE=1` | neuron | Trust the current directory in a headless run (only for checkouts you trust) |
+| `NEURON_NO_TUI=1` | neuron | Use the line REPL instead of the full-screen UI |
+| `NEURON_TUI_ASCII` | neuron-tui | `1` draws with the classic-console character set everywhere, `0` with the Unicode one |
+| `NEURON_VERSION` | install.sh, install.ps1 | Release to install (default: the latest release; a prerelease such as `7.0.0-alpha.1` must be named) |
+| `NEURON_INSTALL_DIR` | install.sh, install.ps1 | Install directory |
+| `NEURON_BINARY_PATH` | npm and pip launchers | Run this binary instead of the downloaded one |
+| `NEURON_CACHE_DIR` | npm and pip launchers | Where downloaded binaries are cached |
+| `NEURON_SKIP_DOWNLOAD=1` | npm postinstall | Defer the binary download to the first run |
+| `NEURON_DOWNLOAD_BASE` | installers and launchers | Release mirror (HTTPS, or loopback HTTP for tests) |
 
-## Verification
+## Update and uninstall
 
-```bash
-cd rust
-cargo test --workspace
-```
+| Installed with | Update | Uninstall |
+| --- | --- | --- |
+| `install.sh` | Run it again with the new version: that version's release URL and `--version` (or `NEURON_VERSION`). Without a version it installs the latest stable release, and there is none yet | `rm ~/.local/bin/neuron ~/.local/bin/neuron-tui` |
+| `install.ps1` | Run it again with the new version: that version's release URL and `-Version` (or `NEURON_VERSION`). Without a version it installs the latest stable release, and there is none yet | Delete `%LOCALAPPDATA%\Programs\Neuron\bin` and remove it from your user `PATH` if you added it |
+| npm | `npm install --global @zero-x.live/neuron@next` during the alpha (`@latest` once a stable release is out) | `npm uninstall --global @zero-x.live/neuron` |
+| pip | Not available during the alpha, which is not on PyPI. For a prerelease on PyPI, `pip install --upgrade --pre neuroncli` | `pipx uninstall neuroncli` or `pip uninstall neuroncli` |
 
-## Workspace overview
+Neuron keeps your login in the OS credential store or `~/.neuroncli/`, and your
+settings in `~/.neuron/`; the launchers cache binaries in `~/.cache/neuroncli` (Linux), `~/Library/Caches/neuroncli`
+(macOS) or `%LOCALAPPDATA%\neuroncli` (Windows). Run `neuron auth logout` before
+deleting them so the session is revoked on the gateway and removed from the
+credential store too.
 
-Current Rust crates:
+## Troubleshooting
 
-- `api`
-- `commands`
-- `compat-harness`
-- `mock-anthropic-service`
-- `plugins`
-- `runtime`
-- `rusty-claude-cli`
-- `telemetry`
-- `tools`
+- **The wrong `neuron` runs.** Older packages (npm 6.2.0, PyPI 6.2.4 and earlier) can
+  leave a `neuron` earlier on your `PATH`. `command -v neuron` (or `Get-Command neuron`
+  on Windows) shows which one wins; the installers warn about this. Remove the old
+  package with `pip uninstall neuroncli` or `npm uninstall --global @zero-x.live/neuron`.
+- **The first run fails offline.** The npm and pip launchers need GitHub Releases once
+  per version. Behind a proxy set `HTTPS_PROXY` (Node 24 also needs
+  `NODE_USE_ENV_PROXY=1`), or download the binary yourself and set
+  `NEURON_BINARY_PATH`.
+- **Checksum mismatch.** Nothing was installed. Retry; if it persists, report it as
+  described in [SECURITY.md](SECURITY.md).
+- **Windows SmartScreen or macOS Gatekeeper warnings.** The binaries are not
+  code-signed yet. Files fetched by the installers are not quarantined on macOS; if
+  you downloaded a binary with a browser, check its SHA-256 and then run
+  `xattr -d com.apple.quarantine ./neuron-macos-arm64`.
+- **Anything else.** `neuron doctor` checks auth, configuration and the workspace.
+  Include its output, `neuron --version` and your install method when you open an
+  issue.

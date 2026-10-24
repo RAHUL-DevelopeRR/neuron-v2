@@ -5,6 +5,7 @@
 )]
 
 mod hooks;
+pub mod subprocess;
 #[cfg(test)]
 pub mod test_isolation;
 
@@ -311,13 +312,20 @@ impl PluginTool {
     }
 
     pub fn execute(&self, input: &Value) -> Result<String, PluginError> {
+        self.execute_with_timeout(input, subprocess::DEFAULT_PLUGIN_TOOL_TIMEOUT)
+    }
+
+    /// Runs the plugin tool, killing its process tree once `timeout` elapses.
+    pub fn execute_with_timeout(
+        &self,
+        input: &Value,
+        timeout: std::time::Duration,
+    ) -> Result<String, PluginError> {
         let input_json = input.to_string();
         let mut process = plugin_command(&self.command);
+        subprocess::scrub_credential_env(&mut process);
         process
             .args(&self.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
             .env("CLAWD_PLUGIN_ID", &self.plugin_id)
             .env("CLAWD_PLUGIN_NAME", &self.plugin_name)
             .env("CLAWD_TOOL_NAME", &self.definition.name)
@@ -328,14 +336,21 @@ impl PluginTool {
                 .env("CLAWD_PLUGIN_ROOT", root.display().to_string());
         }
 
-        let mut child = process.spawn()?;
-        if let Some(stdin) = child.stdin.as_mut() {
-            use std::io::Write as _;
-            stdin.write_all(input_json.as_bytes())?;
+        let output = subprocess::run_bounded(
+            &mut process,
+            Some(input_json.as_bytes()),
+            Some(timeout),
+            &|| false,
+        )?;
+        if output.timed_out() {
+            return Err(PluginError::CommandFailed(format!(
+                "plugin tool `{}` from `{}` timed out after {} ms and was terminated",
+                self.definition.name,
+                self.plugin_id,
+                timeout.as_millis()
+            )));
         }
-
-        let output = child.wait_with_output()?;
-        if output.status.success() {
+        if output.success() {
             Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -345,13 +360,20 @@ impl PluginTool {
                 self.plugin_id,
                 self.command,
                 if stderr.is_empty() {
-                    format!("exit status {}", output.status)
+                    describe_exit(&output)
                 } else {
                     stderr
                 }
             )))
         }
     }
+}
+
+fn describe_exit(output: &subprocess::BoundedOutput) -> String {
+    output.status.map_or_else(
+        || "terminated without an exit status".to_string(),
+        |status| format!("exit status {status}"),
+    )
 }
 
 fn plugin_command(command: &str) -> Command {
@@ -1638,15 +1660,15 @@ fn detect_claude_code_manifest_contract_gaps(
     for (field, detail) in [
         (
             "skills",
-            "plugin manifest field `skills` uses the Claude Code plugin contract; `claw` does not load plugin-managed skills and instead discovers skills from local roots such as `.claw/skills`, `.omc/skills`, `.agents/skills`, `~/.omc/skills`, and `~/.claude/skills/omc-learned`.",
+            "plugin manifest field `skills` is not supported: Neuron does not load plugin-managed skills; it finds skills in local roots such as `.claw/skills`, `.omc/skills`, `.agents/skills`, `~/.omc/skills` and `~/.claude/skills/omc-learned`.",
         ),
         (
             "mcpServers",
-            "plugin manifest field `mcpServers` uses the Claude Code plugin contract; `claw` does not import MCP servers from plugin manifests.",
+            "plugin manifest field `mcpServers` is not supported: Neuron does not import MCP servers from plugin manifests; add them to `mcpServers` in your settings instead.",
         ),
         (
             "agents",
-            "plugin manifest field `agents` uses the Claude Code plugin contract; `claw` does not load plugin-managed agent markdown catalogs from plugin manifests.",
+            "plugin manifest field `agents` is not supported: Neuron does not load agent definitions from plugin manifests.",
         ),
     ] {
         if root.contains_key(field) {
@@ -1662,7 +1684,7 @@ fn detect_claude_code_manifest_contract_gaps(
         .is_some_and(|commands| commands.iter().any(Value::is_string))
     {
         errors.push(PluginManifestValidationError::UnsupportedManifestContract {
-            detail: "plugin manifest field `commands` uses Claude Code-style directory globs; `claw` slash dispatch is still built-in and does not load plugin slash command markdown files.".to_string(),
+            detail: "plugin manifest field `commands` lists command files or directories, which are not supported: Neuron's slash commands are built in, and it does not load slash commands from plugin markdown files.".to_string(),
         });
     }
 
@@ -1674,7 +1696,7 @@ fn detect_claude_code_manifest_contract_gaps(
             ) {
                 errors.push(PluginManifestValidationError::UnsupportedManifestContract {
                     detail: format!(
-                        "plugin hook `{hook_name}` uses the Claude Code lifecycle contract; `claw` plugins currently support only PreToolUse, PostToolUse, and PostToolUseFailure."
+                        "plugin hook `{hook_name}` is not supported: Neuron plugins support only PreToolUse, PostToolUse and PostToolUseFailure hooks."
                     ),
                 });
             }
@@ -2125,9 +2147,20 @@ fn run_lifecycle_commands(
         if let Some(root) = &metadata.root {
             process.current_dir(root);
         }
-        let output = process.output()?;
+        subprocess::scrub_credential_env(&mut process);
+        let timeout = subprocess::DEFAULT_PLUGIN_TOOL_TIMEOUT;
+        let output = subprocess::run_bounded(&mut process, None, Some(timeout), &|| false)?;
 
-        if !output.status.success() {
+        if output.timed_out() {
+            return Err(PluginError::CommandFailed(format!(
+                "plugin `{}` {} timed out after {} ms for `{}`",
+                metadata.id,
+                phase,
+                timeout.as_millis(),
+                command
+            )));
+        }
+        if !output.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             return Err(PluginError::CommandFailed(format!(
                 "plugin `{}` {} failed for `{}`: {}",
@@ -2135,7 +2168,7 @@ fn run_lifecycle_commands(
                 phase,
                 command,
                 if stderr.is_empty() {
-                    format!("exit status {}", output.status)
+                    describe_exit(&output)
                 } else {
                     stderr
                 }
@@ -2574,8 +2607,8 @@ mod tests {
 
         let manifest = load_plugin_from_directory(&root).expect("packaged manifest should load");
         assert_eq!(manifest.name, "packaged-demo");
-        assert!(manifest.tools.is_empty());
-        assert!(manifest.commands.is_empty());
+        assert_eq!(manifest.tools, [] as [PluginToolManifest; 0]);
+        assert_eq!(manifest.commands, [] as [PluginCommandManifest; 0]);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2594,10 +2627,10 @@ mod tests {
         );
 
         let manifest = load_plugin_from_directory(&root).expect("minimal manifest should load");
-        assert!(manifest.permissions.is_empty());
+        assert_eq!(manifest.permissions, [] as [PluginPermission; 0]);
         assert!(manifest.hooks.is_empty());
-        assert!(manifest.tools.is_empty());
-        assert!(manifest.commands.is_empty());
+        assert_eq!(manifest.tools, [] as [PluginToolManifest; 0]);
+        assert_eq!(manifest.commands, [] as [PluginCommandManifest; 0]);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2666,11 +2699,17 @@ mod tests {
         let error = load_plugin_from_directory(&root)
             .expect_err("Claude Code plugin manifest should fail with guidance");
         let rendered = error.to_string();
-        assert!(rendered.contains("field `skills` uses the Claude Code plugin contract"));
-        assert!(rendered.contains("field `mcpServers` uses the Claude Code plugin contract"));
-        assert!(rendered.contains("field `agents` uses the Claude Code plugin contract"));
-        assert!(rendered.contains("field `commands` uses Claude Code-style directory globs"));
-        assert!(rendered.contains("hook `SessionStart` uses the Claude Code lifecycle contract"));
+        assert!(rendered.contains("field `skills` is not supported: Neuron does not load"));
+        assert!(rendered.contains("field `mcpServers` is not supported: Neuron does not import"));
+        assert!(rendered.contains("field `agents` is not supported: Neuron does not load"));
+        assert!(rendered.contains("field `commands` lists command files or directories"));
+        assert!(
+            rendered.contains("hook `SessionStart` is not supported: Neuron plugins support only")
+        );
+        // The messages speak for Neuron and name no other product or its binary.
+        assert!(!rendered.contains("Claude"), "{rendered}");
+        assert!(!rendered.contains("claw "), "{rendered}");
+        assert!(!rendered.contains("`claw`"), "{rendered}");
 
         let _ = fs::remove_dir_all(root);
     }
@@ -3676,5 +3715,82 @@ mod tests {
 
         // Cleanup
         let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// A plugin tool that runs `script` through the platform shell.
+    fn shell_plugin_tool(script: &str) -> PluginTool {
+        let (command, mut args) = if cfg!(windows) {
+            ("cmd.exe", vec!["/D".to_string(), "/C".to_string()])
+        } else {
+            ("sh", vec!["-c".to_string()])
+        };
+        args.push(script.to_string());
+        PluginTool::new(
+            "shell-demo@external",
+            "shell-demo",
+            PluginToolDefinition {
+                name: "shell_demo".to_string(),
+                description: None,
+                input_schema: serde_json::json!({ "type": "object" }),
+            },
+            command,
+            args,
+            PluginToolPermission::ReadOnly,
+            None,
+        )
+    }
+
+    #[test]
+    fn plugin_tools_time_out_and_their_process_tree_is_terminated() {
+        assert_eq!(
+            subprocess::DEFAULT_PLUGIN_TOOL_TIMEOUT,
+            std::time::Duration::from_secs(120)
+        );
+        assert_eq!(
+            subprocess::DEFAULT_HOOK_TIMEOUT,
+            std::time::Duration::from_secs(60)
+        );
+        let tool = shell_plugin_tool(if cfg!(windows) {
+            "ping -n 30 127.0.0.1 >NUL & echo late"
+        } else {
+            "sleep 30; echo late"
+        });
+        let started = std::time::Instant::now();
+        let error = tool
+            .execute_with_timeout(
+                &serde_json::json!({}),
+                std::time::Duration::from_millis(300),
+            )
+            .expect_err("a plugin tool that outlives its timeout must fail");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "the plugin tool must be killed promptly, took {:?}",
+            started.elapsed()
+        );
+        let message = error.to_string();
+        assert!(message.contains("timed out after 300 ms"), "{message}");
+        assert!(message.contains("shell_demo"), "{message}");
+    }
+
+    #[test]
+    fn plugin_tools_do_not_inherit_zero_x_credentials() {
+        let _guard = env_guard();
+        std::env::set_var("NEURON_TOKEN", "nzx_plugin_tool_token");
+        std::env::set_var("PLUGINS_TOOL_SCRUB_SESSION", "ses_plugin_tool_session");
+        std::env::set_var("PLUGINS_TOOL_SCRUB_KEEP", "keep-me");
+        let tool = shell_plugin_tool(if cfg!(windows) {
+            "echo token=%NEURON_TOKEN% session=%PLUGINS_TOOL_SCRUB_SESSION% keep=%PLUGINS_TOOL_SCRUB_KEEP%"
+        } else {
+            "echo token=${NEURON_TOKEN:-unset} session=${PLUGINS_TOOL_SCRUB_SESSION:-unset} keep=$PLUGINS_TOOL_SCRUB_KEEP"
+        });
+        let output = tool.execute(&serde_json::json!({}));
+        std::env::remove_var("NEURON_TOKEN");
+        std::env::remove_var("PLUGINS_TOOL_SCRUB_SESSION");
+        std::env::remove_var("PLUGINS_TOOL_SCRUB_KEEP");
+
+        let output = output.expect("plugin tool runs");
+        assert!(!output.contains("nzx_plugin_tool_token"), "{output}");
+        assert!(!output.contains("ses_plugin_tool_session"), "{output}");
+        assert!(output.contains("keep=keep-me"), "{output}");
     }
 }

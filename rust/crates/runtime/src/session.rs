@@ -1,12 +1,13 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::json::{JsonError, JsonValue};
+use crate::transcript::{normalize_messages, TranscriptRepair};
 use crate::usage::TokenUsage;
 
 const SESSION_VERSION: u32 = 1;
@@ -76,6 +77,10 @@ pub struct SessionPromptEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionPersistence {
     path: PathBuf,
+    /// The file on disk differs from memory (malformed records were skipped
+    /// or the transcript was repaired on load): the next write rewrites the
+    /// whole file instead of appending to it.
+    rewrite_before_append: bool,
 }
 
 /// Persisted conversational state for the runtime and CLI session manager.
@@ -103,6 +108,63 @@ pub struct Session {
     pub last_health_check_ms: Option<u64>,
     pub model: Option<String>,
     persistence: Option<SessionPersistence>,
+    load_diagnostics: SessionLoadDiagnostics,
+}
+
+/// What happened while a session file was loaded: malformed JSONL records
+/// that were skipped and transcript repairs applied by the normalizer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionLoadDiagnostics {
+    pub skipped_records: usize,
+    pub first_skip_reason: Option<String>,
+    pub transcript_repair: TranscriptRepair,
+}
+
+impl SessionLoadDiagnostics {
+    #[must_use]
+    pub fn has_warnings(&self) -> bool {
+        self.skipped_records > 0 || self.transcript_repair.changed()
+    }
+
+    /// One-line human readable description, `None` when the load was clean.
+    #[must_use]
+    pub fn warning_message(&self) -> Option<String> {
+        if !self.has_warnings() {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if self.skipped_records > 0 {
+            let reason = self
+                .first_skip_reason
+                .as_deref()
+                .map(|reason| format!(" (first: {reason})"))
+                .unwrap_or_default();
+            parts.push(format!(
+                "skipped {} malformed record(s){reason}",
+                self.skipped_records
+            ));
+        }
+        let repair = &self.transcript_repair;
+        if repair.synthesized_tool_results > 0 {
+            parts.push(format!(
+                "added {} interrupted tool result(s)",
+                repair.synthesized_tool_results
+            ));
+        }
+        if repair.dropped_orphan_tool_results > 0 {
+            parts.push(format!(
+                "dropped {} orphan tool result(s)",
+                repair.dropped_orphan_tool_results
+            ));
+        }
+        if repair.dropped_empty_assistant_messages > 0 {
+            parts.push(format!(
+                "dropped {} empty assistant message(s)",
+                repair.dropped_empty_assistant_messages
+            ));
+        }
+        Some(parts.join("; "))
+    }
 }
 
 impl PartialEq for Session {
@@ -171,12 +233,16 @@ impl Session {
             last_health_check_ms: None,
             model: None,
             persistence: None,
+            load_diagnostics: SessionLoadDiagnostics::default(),
         }
     }
 
     #[must_use]
     pub fn with_persistence_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.persistence = Some(SessionPersistence { path: path.into() });
+        self.persistence = Some(SessionPersistence {
+            path: path.into(),
+            rewrite_before_append: false,
+        });
         self
     }
 
@@ -210,10 +276,17 @@ impl Session {
         Ok(())
     }
 
+    /// Loads a session from a JSONL (or legacy JSON) file.
+    ///
+    /// Malformed JSONL records are skipped and counted instead of failing the
+    /// whole load, and the transcript is normalized (see
+    /// [`crate::transcript::normalize_messages`]). Both are reported through
+    /// [`Session::load_diagnostics`] so callers can warn where it matters (for
+    /// example when resuming), not on every listing.
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, SessionError> {
         let path = path.as_ref();
         let contents = fs::read_to_string(path)?;
-        let session = match JsonValue::parse(&contents) {
+        let mut session = match JsonValue::parse(&contents) {
             Ok(value)
                 if value
                     .as_object()
@@ -223,13 +296,41 @@ impl Session {
             }
             Err(_) | Ok(_) => Self::from_jsonl(&contents)?,
         };
-        Ok(session.with_persistence_path(path.to_path_buf()))
+        session.load_diagnostics.transcript_repair = normalize_messages(&mut session.messages);
+        let rewrite_before_append = session.load_diagnostics.has_warnings();
+        let mut session = session.with_persistence_path(path.to_path_buf());
+        if let Some(persistence) = session.persistence.as_mut() {
+            persistence.rewrite_before_append = rewrite_before_append;
+        }
+        Ok(session)
+    }
+
+    /// Diagnostics recorded by [`Session::load_from_path`].
+    #[must_use]
+    pub fn load_diagnostics(&self) -> &SessionLoadDiagnostics {
+        &self.load_diagnostics
+    }
+
+    /// Rewrites the persisted file (when one is configured) with the full
+    /// in-memory state, so disk and memory agree after in-place edits such as
+    /// compaction, pruning or transcript repair.
+    pub fn persist_snapshot(&self) -> Result<(), SessionError> {
+        match self.persistence_path() {
+            Some(path) => self.save_to_path(path),
+            None => Ok(()),
+        }
     }
 
     pub fn push_message(&mut self, message: ConversationMessage) -> Result<(), SessionError> {
         self.touch();
         self.messages.push(message);
-        let persist_result = {
+        let persist_result = if self.take_pending_rewrite() {
+            let rewritten = self.persist_snapshot();
+            if rewritten.is_err() {
+                self.set_pending_rewrite();
+            }
+            rewritten
+        } else {
             let message_ref = self.messages.last().ok_or_else(|| {
                 SessionError::Format("message was just pushed but missing".to_string())
             })?;
@@ -240,6 +341,20 @@ impl Session {
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Returns (and clears) whether the file must be rewritten before the
+    /// next append because it no longer matches memory.
+    fn take_pending_rewrite(&mut self) -> bool {
+        self.persistence
+            .as_mut()
+            .is_some_and(|persistence| std::mem::take(&mut persistence.rewrite_before_append))
+    }
+
+    fn set_pending_rewrite(&mut self) {
+        if let Some(persistence) = self.persistence.as_mut() {
+            persistence.rewrite_before_append = true;
+        }
     }
 
     pub fn push_user_text(&mut self, text: impl Into<String>) -> Result<(), SessionError> {
@@ -275,6 +390,7 @@ impl Session {
             last_health_check_ms: self.last_health_check_ms,
             model: self.model.clone(),
             persistence: None,
+            load_diagnostics: SessionLoadDiagnostics::default(),
         }
     }
 
@@ -399,107 +515,55 @@ impl Session {
             last_health_check_ms: None,
             model,
             persistence: None,
+            load_diagnostics: SessionLoadDiagnostics::default(),
         })
     }
 
     fn from_jsonl(contents: &str) -> Result<Self, SessionError> {
-        let mut version = SESSION_VERSION;
-        let mut session_id = None;
-        let mut created_at_ms = None;
-        let mut updated_at_ms = None;
-        let mut messages = Vec::new();
-        let mut compaction = None;
-        let mut fork = None;
-        let mut workspace_root = None;
-        let mut model = None;
-        let mut prompt_history = Vec::new();
-
-        for (line_number, raw_line) in contents.lines().enumerate() {
+        let mut state = JsonlLoadState::default();
+        let mut first_error = None;
+        for (line_index, raw_line) in contents.lines().enumerate() {
             let line = raw_line.trim();
             if line.is_empty() {
                 continue;
             }
-            let value = JsonValue::parse(line).map_err(|error| {
-                SessionError::Format(format!(
-                    "invalid JSONL record at line {}: {}",
-                    line_number + 1,
-                    error
-                ))
-            })?;
-            let object = value.as_object().ok_or_else(|| {
-                SessionError::Format(format!(
-                    "JSONL record at line {} must be an object",
-                    line_number + 1
-                ))
-            })?;
-            match object
-                .get("type")
-                .and_then(JsonValue::as_str)
-                .ok_or_else(|| {
-                    SessionError::Format(format!(
-                        "JSONL record at line {} missing type",
-                        line_number + 1
-                    ))
-                })? {
-                "session_meta" => {
-                    version = required_u32(object, "version")?;
-                    session_id = Some(required_string(object, "session_id")?);
-                    created_at_ms = Some(required_u64(object, "created_at_ms")?);
-                    updated_at_ms = Some(required_u64(object, "updated_at_ms")?);
-                    fork = object.get("fork").map(SessionFork::from_json).transpose()?;
-                    workspace_root = object
-                        .get("workspace_root")
-                        .and_then(JsonValue::as_str)
-                        .map(PathBuf::from);
-                    model = object
-                        .get("model")
-                        .and_then(JsonValue::as_str)
-                        .map(String::from);
-                }
-                "message" => {
-                    let message_value = object.get("message").ok_or_else(|| {
-                        SessionError::Format(format!(
-                            "JSONL record at line {} missing message",
-                            line_number + 1
-                        ))
-                    })?;
-                    messages.push(ConversationMessage::from_json(message_value)?);
-                }
-                "compaction" => {
-                    compaction = Some(SessionCompaction::from_json(&JsonValue::Object(
-                        object.clone(),
-                    ))?);
-                }
-                "prompt_history" => {
-                    if let Some(entry) =
-                        SessionPromptEntry::from_json_opt(&JsonValue::Object(object.clone()))
-                    {
-                        prompt_history.push(entry);
+            match state.apply_record(line_index + 1, line) {
+                Ok(()) => state.valid_records += 1,
+                Err(error) => {
+                    state.diagnostics.skipped_records += 1;
+                    if state.diagnostics.first_skip_reason.is_none() {
+                        state.diagnostics.first_skip_reason = Some(error.to_string());
                     }
+                    first_error.get_or_insert(error);
                 }
-                other => {
-                    return Err(SessionError::Format(format!(
-                        "unsupported JSONL record type at line {}: {other}",
-                        line_number + 1
-                    )))
-                }
+            }
+        }
+        if state.valid_records == 0 {
+            if let Some(error) = first_error {
+                // Nothing usable at all: this is not a session file.
+                return Err(SessionError::Format(format!(
+                    "session file contains no valid records ({} malformed): {error}",
+                    state.diagnostics.skipped_records
+                )));
             }
         }
 
         let now = current_time_millis();
+        let created_at_ms = state.created_at_ms;
         Ok(Self {
-            version,
-            session_id: session_id.unwrap_or_else(generate_session_id),
+            version: state.version.unwrap_or(SESSION_VERSION),
+            session_id: state.session_id.unwrap_or_else(generate_session_id),
             created_at_ms: created_at_ms.unwrap_or(now),
-            updated_at_ms: updated_at_ms.unwrap_or(created_at_ms.unwrap_or(now)),
-            messages,
-            compaction,
-            fork,
-            workspace_root,
-            prompt_history,
+            updated_at_ms: state.updated_at_ms.unwrap_or(created_at_ms.unwrap_or(now)),
+            messages: state.messages,
+            compaction: state.compaction,
+            fork: state.fork,
+            workspace_root: state.workspace_root,
+            prompt_history: state.prompt_history,
             last_health_check_ms: None,
-            model,
+            model: state.model,
             persistence: None,
+            load_diagnostics: state.diagnostics,
         })
     }
 
@@ -514,6 +578,13 @@ impl Session {
             text: text.into(),
         };
         self.prompt_history.push(entry);
+        if self.take_pending_rewrite() {
+            let rewritten = self.persist_snapshot();
+            if rewritten.is_err() {
+                self.set_pending_rewrite();
+            }
+            return rewritten;
+        }
         let entry_ref = self.prompt_history.last().expect("entry was just pushed");
         self.append_persisted_prompt_entry(entry_ref)
     }
@@ -549,7 +620,7 @@ impl Session {
             return Ok(());
         }
 
-        let mut file = OpenOptions::new().append(true).open(path)?;
+        let mut file = open_for_record_append(path)?;
         writeln!(file, "{}", message_record(message).render())?;
         Ok(())
     }
@@ -568,7 +639,7 @@ impl Session {
             return Ok(());
         }
 
-        let mut file = OpenOptions::new().append(true).open(path)?;
+        let mut file = open_for_record_append(path)?;
         writeln!(file, "{}", entry.to_jsonl_record().render())?;
         Ok(())
     }
@@ -919,6 +990,100 @@ impl SessionPromptEntry {
     }
 }
 
+/// Accumulates the records of a JSONL session file. Each record is applied
+/// atomically: a malformed record leaves the state untouched.
+#[derive(Default)]
+struct JsonlLoadState {
+    version: Option<u32>,
+    session_id: Option<String>,
+    created_at_ms: Option<u64>,
+    updated_at_ms: Option<u64>,
+    messages: Vec<ConversationMessage>,
+    compaction: Option<SessionCompaction>,
+    fork: Option<SessionFork>,
+    workspace_root: Option<PathBuf>,
+    model: Option<String>,
+    prompt_history: Vec<SessionPromptEntry>,
+    valid_records: usize,
+    diagnostics: SessionLoadDiagnostics,
+}
+
+impl JsonlLoadState {
+    fn apply_record(&mut self, line_number: usize, line: &str) -> Result<(), SessionError> {
+        let value = JsonValue::parse(line).map_err(|error| {
+            SessionError::Format(format!(
+                "invalid JSONL record at line {line_number}: {error}"
+            ))
+        })?;
+        let object = value.as_object().ok_or_else(|| {
+            SessionError::Format(format!(
+                "JSONL record at line {line_number} must be an object"
+            ))
+        })?;
+        let record_type = object
+            .get("type")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                SessionError::Format(format!("JSONL record at line {line_number} missing type"))
+            })?;
+        match record_type {
+            "session_meta" => {
+                let version = required_u32(object, "version")?;
+                let session_id = required_string(object, "session_id")?;
+                let created_at_ms = required_u64(object, "created_at_ms")?;
+                let updated_at_ms = required_u64(object, "updated_at_ms")?;
+                let fork = object.get("fork").map(SessionFork::from_json).transpose()?;
+                self.version = Some(version);
+                self.session_id = Some(session_id);
+                self.created_at_ms = Some(created_at_ms);
+                self.updated_at_ms = Some(updated_at_ms);
+                self.fork = fork;
+                self.workspace_root = object
+                    .get("workspace_root")
+                    .and_then(JsonValue::as_str)
+                    .map(PathBuf::from);
+                self.model = object
+                    .get("model")
+                    .and_then(JsonValue::as_str)
+                    .map(String::from);
+            }
+            "message" => {
+                let message_value = object.get("message").ok_or_else(|| {
+                    SessionError::Format(format!(
+                        "JSONL record at line {line_number} missing message"
+                    ))
+                })?;
+                let message = ConversationMessage::from_json(message_value).map_err(|error| {
+                    SessionError::Format(format!(
+                        "invalid message record at line {line_number}: {error}"
+                    ))
+                })?;
+                self.messages.push(message);
+            }
+            "compaction" => {
+                self.compaction = Some(SessionCompaction::from_json(&JsonValue::Object(
+                    object.clone(),
+                ))?);
+            }
+            "prompt_history" => {
+                let entry = SessionPromptEntry::from_json_opt(&JsonValue::Object(object.clone()))
+                    .ok_or_else(|| {
+                    SessionError::Format(format!(
+                        "invalid prompt_history record at line {line_number}"
+                    ))
+                })?;
+                self.prompt_history.push(entry);
+            }
+            other => {
+                return Err(SessionError::Format(format!(
+                    "unsupported JSONL record type at line {line_number}: {other}"
+                )))
+            }
+        }
+        Ok(())
+    }
+}
+
 fn message_record(message: &ConversationMessage) -> JsonValue {
     let mut object = BTreeMap::new();
     object.insert("type".to_string(), JsonValue::String("message".to_string()));
@@ -1060,6 +1225,23 @@ fn generate_session_id() -> String {
     format!("session-{millis}-{counter}")
 }
 
+/// Opens a JSONL file for appending one record. When the file does not end
+/// with a newline (a crash cut the last record off), a newline is written
+/// first so the new record does not merge into the partial one.
+fn open_for_record_append(path: &Path) -> Result<fs::File, SessionError> {
+    let mut file = OpenOptions::new().read(true).append(true).open(path)?;
+    let len = file.metadata()?.len();
+    if len > 0 {
+        file.seek(SeekFrom::Start(len - 1))?;
+        let mut last = [0_u8; 1];
+        file.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            file.write_all(b"\n")?;
+        }
+    }
+    Ok(file)
+}
+
 fn write_atomic(path: &Path, contents: &str) -> Result<(), SessionError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -1148,7 +1330,8 @@ mod tests {
     };
     use crate::json::JsonValue;
     use crate::usage::TokenUsage;
-    use std::fs;
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1232,7 +1415,7 @@ mod tests {
             restored.messages[0],
             ConversationMessage::user_text("legacy")
         );
-        assert!(!restored.session_id.is_empty());
+        assert_ne!(restored.session_id, "");
     }
 
     #[test]
@@ -1448,6 +1631,157 @@ mod tests {
         // then
         assert_eq!(restored.workspace_root(), Some(workspace_root.as_path()));
         assert_eq!(forked.workspace_root(), Some(workspace_root.as_path()));
+    }
+
+    #[test]
+    fn tolerant_jsonl_load_skips_malformed_lines_and_counts_them() {
+        // given a session file with a truncated write and an unknown record
+        let contents = [
+            r#"{"type":"session_meta","version":1,"session_id":"tolerant","created_at_ms":1,"updated_at_ms":2}"#,
+            r#"{"type":"message","message":{"role":"user","blocks":[{"type":"text","text":"first"}]}}"#,
+            r#"{"type":"message","message":{"role":"assistant","blocks":[{"type":"te"#,
+            r#"{"type":"mystery"}"#,
+            r#"{"type":"message","message":{"role":"assistant","blocks":[{"type":"text","text":"second"}]}}"#,
+        ]
+        .join("\n");
+        let path = write_temp_session_file("tolerant", &contents);
+
+        // when
+        let restored = Session::load_from_path(&path).expect("tolerant load should succeed");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        // then
+        assert_eq!(restored.session_id, "tolerant");
+        assert_eq!(restored.messages.len(), 2);
+        let diagnostics = restored.load_diagnostics();
+        assert_eq!(diagnostics.skipped_records, 2);
+        assert!(diagnostics
+            .first_skip_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("line 3")));
+        assert!(diagnostics
+            .warning_message()
+            .is_some_and(|message| message.contains("skipped 2 malformed record(s)")));
+    }
+
+    #[test]
+    fn first_write_after_a_lossy_load_rewrites_the_file_cleanly() {
+        // given a session whose last record was cut off by a crash (no
+        // trailing newline)
+        let path = temp_session_path("truncated-tail");
+        let contents = [
+            r#"{"type":"session_meta","version":1,"session_id":"tail","created_at_ms":1,"updated_at_ms":2}"#,
+            r#"{"type":"message","message":{"role":"user","blocks":[{"type":"text","text":"first"}]}}"#,
+            r#"{"type":"message","message":{"role":"assistant","blocks":[{"type":"te"#,
+        ]
+        .join("\n");
+        fs::write(&path, contents).expect("write session");
+        let mut session = Session::load_from_path(&path).expect("tolerant load");
+        assert_eq!(session.load_diagnostics().skipped_records, 1);
+
+        // when the next message is recorded
+        session.push_user_text("second").expect("append");
+
+        // then the file holds both messages and no malformed record
+        let restored = Session::load_from_path(&path).expect("reload");
+        assert_eq!(restored.load_diagnostics().skipped_records, 0);
+        assert_eq!(
+            restored.messages,
+            vec![
+                ConversationMessage::user_text("first"),
+                ConversationMessage::user_text("second"),
+            ]
+        );
+        // and later messages are appended normally again
+        session.push_user_text("third").expect("append");
+        let restored = Session::load_from_path(&path).expect("reload");
+        fs::remove_file(&path).expect("cleanup");
+        assert_eq!(restored.messages.len(), 3);
+        assert_eq!(restored.load_diagnostics().skipped_records, 0);
+    }
+
+    #[test]
+    fn append_never_merges_into_a_partial_last_line() {
+        // given a cleanly loaded session whose file later lost its tail
+        let path = temp_session_path("partial-append");
+        let mut session = Session::new().with_persistence_path(path.clone());
+        session.push_user_text("first").expect("append");
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open session");
+        file.write_all(br#"{"type":"message","message":{"role":"assis"#)
+            .expect("partial record");
+        drop(file);
+
+        // when
+        session.push_user_text("second").expect("append");
+
+        // then only the partial record is lost, never the new message
+        let restored = Session::load_from_path(&path).expect("reload");
+        fs::remove_file(&path).expect("cleanup");
+        assert_eq!(restored.load_diagnostics().skipped_records, 1);
+        assert_eq!(
+            restored.messages,
+            vec![
+                ConversationMessage::user_text("first"),
+                ConversationMessage::user_text("second"),
+            ]
+        );
+    }
+
+    #[test]
+    fn load_repairs_dangling_tool_use_from_interrupted_session() {
+        // given a session that crashed after the model requested a tool
+        let mut session = Session::new();
+        session.push_user_text("run it").expect("user message");
+        session
+            .push_message(ConversationMessage::assistant(vec![
+                ContentBlock::ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "bash".to_string(),
+                    input: "{}".to_string(),
+                },
+            ]))
+            .expect("assistant message");
+        let path = temp_session_path("dangling");
+        session.save_to_path(&path).expect("session should save");
+
+        // when
+        let restored = Session::load_from_path(&path).expect("session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        // then the dangling call has a synthetic error result
+        assert_eq!(restored.messages.len(), 3);
+        assert!(matches!(
+            &restored.messages[2].blocks[0],
+            ContentBlock::ToolResult { tool_use_id, is_error: true, .. } if tool_use_id == "tool-1"
+        ));
+        assert_eq!(
+            restored
+                .load_diagnostics()
+                .transcript_repair
+                .synthesized_tool_results,
+            1
+        );
+    }
+
+    #[test]
+    fn persist_snapshot_rewrites_file_with_in_memory_state() {
+        let path = temp_session_path("snapshot");
+        let mut session = Session::new().with_persistence_path(path.clone());
+        session.push_user_text("one").expect("append");
+        session.push_user_text("two").expect("append");
+        session.messages.remove(0);
+
+        session.persist_snapshot().expect("snapshot should persist");
+        let restored = Session::load_from_path(&path).expect("session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        assert_eq!(
+            restored.messages,
+            vec![ConversationMessage::user_text("two")]
+        );
     }
 
     fn temp_session_path(label: &str) -> PathBuf {

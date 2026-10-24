@@ -1,0 +1,10 @@
+# Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+# See ui/neuron-tui/PORTING.md.
+node_modules
+dist
+bin
+*.log
+.DS_Store
+debug/
+# Temp files `bun build --compile` leaves when it cannot replace a running binary.
+*.bun-build

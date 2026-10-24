@@ -5,6 +5,7 @@
 use super::*;
 use std::env;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CliAction {
@@ -44,6 +45,7 @@ pub(crate) enum CliAction {
         session_path: PathBuf,
         commands: Vec<String>,
         output_format: CliOutputFormat,
+        launch: ResumeLaunchOptions,
     },
     Status {
         model: String,
@@ -96,6 +98,19 @@ pub(crate) enum CliAction {
     },
 }
 
+/// Launch flags given with `--resume` (before or after it), applied when the
+/// resumed session continues interactively. `None` means "not given": the
+/// session's stored model and the configured permission mode apply.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ResumeLaunchOptions {
+    pub model: Option<String>,
+    pub permission_mode: Option<PermissionMode>,
+    pub allowed_tools: Option<AllowedToolSet>,
+    pub reasoning_effort: Option<String>,
+    pub base_commit: Option<String>,
+    pub allow_broad_cwd: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalHelpTopic {
     Status,
@@ -124,7 +139,10 @@ impl CliOutputFormat {
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
+    *MODEL_ARG.lock().unwrap_or_else(PoisonError::into_inner) = None;
     let mut model = DEFAULT_MODEL.to_string();
+    // Only an explicit --model; `model` falls back to the default.
+    let mut model_flag: Option<String> = None;
     let mut output_format = CliOutputFormat::Text;
     let mut permission_mode_override = None;
     let mut wants_help = false;
@@ -162,7 +180,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 // top-level help instead. Subcommands that consume their own
                 // args (agents, mcp, plugins, skills) and local help-topic
                 // subcommands (status, sandbox, doctor) must NOT be intercepted
-                // here â€” they handle --help in their own dispatch paths.
+                // here — they handle --help in their own dispatch paths.
                 wants_help = true;
                 index += 1;
             }
@@ -174,11 +192,13 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --model".to_string())?;
-                model = resolve_model_alias_with_config(value);
+                model = resolve_model_arg(value);
+                model_flag = Some(model.clone());
                 index += 2;
             }
             flag if flag.starts_with("--model=") => {
-                model = resolve_model_alias_with_config(&flag[8..]);
+                model = resolve_model_arg(&flag[8..]);
+                model_flag = Some(model.clone());
                 index += 1;
             }
             "--output-format" => {
@@ -324,6 +344,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
         // command line, read stdin as the prompt and dispatch as a one-shot Prompt
         // rather than starting the interactive REPL (which would consume the pipe and
         // print the startup banner, then exit without sending anything to the API).
+        #[cfg(not(test))]
         if !std::io::stdin().is_terminal() {
             let mut buf = String::new();
             let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf);
@@ -352,7 +373,18 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
         });
     }
     if rest.first().map(String::as_str) == Some("--resume") {
-        return parse_resume_args(&rest[1..], output_format);
+        return parse_resume_args(
+            &rest[1..],
+            output_format,
+            ResumeLaunchOptions {
+                model: model_flag,
+                permission_mode: permission_mode_override,
+                allowed_tools,
+                reasoning_effort,
+                base_commit,
+                allow_broad_cwd,
+            },
+        );
     }
     if let Some(action) = parse_local_help_action(&rest) {
         return action;
@@ -362,10 +394,17 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
     {
         return action;
     }
+    // `neuron help me debug this test` is a prompt; `neuron init the schema` is refused.
+    let command = match classify_subcommand_words(&rest) {
+        SubcommandWords::Command => rest[0].as_str(),
+        // Matches no subcommand below: the words are the prompt.
+        SubcommandWords::Prompt => "",
+        SubcommandWords::Refused(error) => return Err(error),
+    };
 
     let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
 
-    match rest[0].as_str() {
+    match command {
         "dump-manifests" => parse_dump_manifests_args(&rest[1..], output_format),
         "bootstrap-plan" => Ok(CliAction::BootstrapPlan { output_format }),
         "agents" => Ok(CliAction::Agents {
@@ -379,17 +418,32 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "skills" => {
             let args = join_optional_args(&rest[1..]);
             match classify_skills_slash_command(args.as_deref()) {
-                SkillSlashDispatch::Invoke(prompt) => Ok(CliAction::Prompt {
-                    prompt,
-                    model,
-                    output_format,
-                    allowed_tools,
-                    permission_mode,
-                    compact,
-                    base_commit,
-                    reasoning_effort: reasoning_effort.clone(),
-                    allow_broad_cwd,
-                }),
+                SkillSlashDispatch::Invoke(prompt) => {
+                    // `neuron skills NAME [ARGS]` runs skill NAME. When there is none, the
+                    // words are an unquoted prompt.
+                    let cwd = env::current_dir().map_err(|error| error.to_string())?;
+                    if resolve_skill_invocation(&cwd, args.as_deref()).is_err() {
+                        let word = rest[1].trim_start_matches(['$', '/']);
+                        return Err(unknown_skill_error(&cwd, word));
+                    }
+                    Ok(CliAction::Prompt {
+                        prompt,
+                        model,
+                        output_format,
+                        allowed_tools,
+                        permission_mode,
+                        compact,
+                        base_commit,
+                        reasoning_effort: reasoning_effort.clone(),
+                        allow_broad_cwd,
+                    })
+                }
+                // `install` takes one path.
+                SkillSlashDispatch::Local if rest.len() > 3 => Err(subcommand_arguments_error(
+                    "skills",
+                    SKILLS_USAGE,
+                    &rest[1..],
+                )),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
                     output_format,
@@ -398,7 +452,9 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
         }
         "system-prompt" => parse_system_prompt_args(&rest[1..], output_format),
         "acp" => parse_acp_args(&rest[1..], output_format),
-        "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
+        "login" | "logout" | "auth" | "usage" | "upgrade" => {
+            Err(removed_auth_surface_error(command))
+        }
         "init" => Ok(CliAction::Init { output_format }),
         "export" => parse_export_args(&rest[1..], output_format),
         "prompt" => {
@@ -499,12 +555,17 @@ pub(crate) fn bare_slash_command_guidance(command_name: &str) -> Option<String> 
             | "init"
             | "prompt"
             | "export"
+            // Handled by `removed_auth_surface_error`, which points at
+            // `neuron auth login|logout`.
+            | "login"
+            | "logout"
     ) {
         return None;
     }
+    // Aliases too: `neuron plugins` is `/plugins`, not a one-word prompt.
     let slash_command = slash_command_specs()
         .iter()
-        .find(|spec| spec.name == command_name)?;
+        .find(|spec| spec.name == command_name || spec.aliases.contains(&command_name))?;
     let guidance = if slash_command.resume_supported {
         format!(
             "`neuron {command_name}` is a slash command. Use `neuron --resume SESSION.jsonl /{command_name}` or start `neuron` and run `/{command_name}`."
@@ -517,10 +578,239 @@ pub(crate) fn bare_slash_command_guidance(command_name: &str) -> Option<String> 
     Some(guidance)
 }
 
+/// The account commands (`neuron login`, `logout`, `auth`, `usage`, `upgrade`) run before
+/// argument parsing (`auth::account_command`), also after global options. The parser sees
+/// one only with arguments it does not take, which is usually an unquoted prompt that
+/// starts with its name (`neuron --model m login to the server and fix it`): neither is
+/// guessed.
 pub(crate) fn removed_auth_surface_error(command_name: &str) -> String {
+    let usage = match command_name {
+        "login" => "neuron login [--no-browser | --with-token]",
+        "logout" => "neuron logout",
+        "usage" => "neuron usage",
+        "upgrade" => "neuron upgrade [--no-browser]",
+        _ => "neuron auth <login|logout|status>",
+    };
     format!(
-        "`neuron {command_name}` has been removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead."
+        "`{command_name}` is a Zero-X account command (`{usage}`) and takes no other arguments. {}",
+        quote_prompt_hint(command_name)
     )
+}
+
+/// How to send a prompt that starts with command `name` instead of running the command.
+pub(crate) fn quote_prompt_hint(name: &str) -> String {
+    format!(
+        "To send a prompt that starts with \"{name}\", quote it (`neuron \"{name} ...\"`) or use `neuron prompt \"{name} ...\"`."
+    )
+}
+
+const SKILLS_USAGE: &str = "neuron skills [list|install <path>|help|<skill> [args]]";
+
+/// How many skill names an unknown-skill error suggests.
+const SKILL_SUGGESTIONS: usize = 3;
+
+/// `neuron skills <words>` where the first word is no skill: usually an unquoted prompt
+/// that starts with "skills". The quoting hint comes first, then the closest skill
+/// names (not the whole list: `neuron skills` lists them).
+fn unknown_skill_error(cwd: &Path, word: &str) -> String {
+    let names = commands::handle_skills_slash_command_json(None, cwd)
+        .ok()
+        .and_then(|report| report.get("skills").and_then(Value::as_array).cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter(|skill| skill.get("shadowed_by").is_none_or(Value::is_null))
+        .filter_map(|skill| {
+            skill
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    let names = names.iter().map(String::as_str).collect::<Vec<_>>();
+    let mut message = format!(
+        "`skills` runs a skill (`{SKILLS_USAGE}`), and there is no skill named `{word}`. {}",
+        quote_prompt_hint("skills")
+    );
+    let close = ranked_suggestions(word, &names);
+    if !close.is_empty() {
+        message.push_str(&format!(
+            "\n  Did you mean: {}",
+            close
+                .iter()
+                .take(SKILL_SUGGESTIONS)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    message.push_str("\n  `neuron skills` lists the installed skills.");
+    message
+}
+
+/// What the words after a subcommand's name are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SubcommandWords {
+    /// The subcommand with arguments it takes (or no subcommand at all).
+    Command,
+    /// An unquoted prompt that starts with the name of a subcommand that only shows
+    /// something (`neuron help me debug this test`, `neuron mcp server crashes on
+    /// start`): the words go to the model.
+    Prompt,
+    /// Words a subcommand with side effects (or a developer command) does not take
+    /// (`neuron init the database schema`, `neuron login to the server`): refused with
+    /// the quoting hint, so the subcommand never runs and the prompt is not guessed.
+    Refused(String),
+}
+
+/// Sorts the words after a subcommand's name ([`SubcommandWords`]). A first word that
+/// is an option (`neuron status -x`) was meant for the subcommand: refused, or named by
+/// the subcommand's own parser. `skills` and `export` are checked where they are parsed
+/// (a skill's name, a path); one-word commands by [`parse_single_word_command_alias`].
+pub(crate) fn classify_subcommand_words(rest: &[String]) -> SubcommandWords {
+    let Some((name, args)) = rest.split_first() else {
+        return SubcommandWords::Command;
+    };
+    let words = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let option_first = words
+        .first()
+        .is_some_and(|word| word.len() > 1 && word.starts_with('-'));
+    // Shows something: words it does not take are a prompt.
+    let shows = |usage: &str, takes: bool| match (takes, option_first) {
+        (true, _) => SubcommandWords::Command,
+        (false, false) => SubcommandWords::Prompt,
+        (false, true) => SubcommandWords::Refused(subcommand_arguments_error(name, usage, args)),
+    };
+    // Changes something, or is a developer command: words it does not take are refused.
+    let changes = |usage: &str, takes: bool| {
+        if takes {
+            SubcommandWords::Command
+        } else {
+            SubcommandWords::Refused(subcommand_arguments_error(name, usage, args))
+        }
+    };
+    match name.as_str() {
+        "help" | "version" | "status" | "sandbox" | "doctor" | "state" => {
+            shows(&format!("neuron {name}"), words.is_empty())
+        }
+        "agents" => shows(
+            "neuron agents [list|help]",
+            matches!(without_help_word(&words), [] | ["list"]),
+        ),
+        "mcp" => shows(
+            "neuron mcp [list|show <server>|serve|help]",
+            matches!(
+                without_help_word(&words),
+                [] | ["list" | "show" | "serve"] | ["show", _]
+            ),
+        ),
+        "acp" => shows(
+            "neuron acp [serve]",
+            matches!(bare_words(&words, &[]).as_slice(), [] | ["serve"]),
+        ),
+        // The account commands run before parsing (`auth::account_command`) with the
+        // arguments they take; here they have others. `usage` and `auth status` only
+        // show something; signing in or out and opening the plans page never run on a
+        // guess.
+        "usage" if !option_first => SubcommandWords::Prompt,
+        "auth" if !option_first && !matches!(words.first(), Some(&("login" | "logout"))) => {
+            SubcommandWords::Prompt
+        }
+        "init" | "bootstrap-plan" => changes(&format!("neuron {name}"), words.is_empty()),
+        "dump-manifests" => changes(
+            "neuron dump-manifests [--manifests-dir PATH]",
+            bare_words(&words, &["--manifests-dir"]).is_empty(),
+        ),
+        "system-prompt" => changes(
+            "neuron system-prompt [--cwd PATH] [--date YYYY-MM-DD]",
+            bare_words(&words, &["--cwd", "--date"]).is_empty(),
+        ),
+        // `login`, `logout`, `upgrade` and `auth login|logout ...` are refused by their
+        // arm in `parse_args` (`removed_auth_surface_error`); `export` by its parser.
+        _ => SubcommandWords::Command,
+    }
+}
+
+fn subcommand_arguments_error(name: &str, usage: &str, args: &[String]) -> String {
+    format!(
+        "`{name}` is a neuron command (`{usage}`) and does not take `{}`. {}",
+        args.join(" "),
+        quote_prompt_hint(name)
+    )
+}
+
+/// `words` without a trailing help word (`neuron mcp show help`).
+fn without_help_word<'w, 'a>(words: &'w [&'a str]) -> &'w [&'a str] {
+    match words.split_last() {
+        Some((last, init)) if is_help_flag(last) || *last == "help" => init,
+        _ => words,
+    }
+}
+
+/// The words that are neither options nor the values of `value_flags`.
+fn bare_words<'a>(words: &[&'a str], value_flags: &[&str]) -> Vec<&'a str> {
+    let mut bare = Vec::new();
+    let mut index = 0;
+    while let Some(word) = words.get(index) {
+        if value_flags.contains(word) {
+            index += 2;
+            continue;
+        }
+        if !word.starts_with('-') {
+            bare.push(*word);
+        }
+        index += 1;
+    }
+    bare
+}
+
+/// Global flags whose next argument is their value (so it is never mistaken
+/// for a subcommand).
+const VALUE_FLAGS: &[&str] = &[
+    "--model",
+    "--output-format",
+    "--permission-mode",
+    "--base-commit",
+    "--reasoning-effort",
+    "--allowedTools",
+    "--allowed-tools",
+];
+
+/// Removes `--provider <id>` / `--provider=<id>` from `args` and returns the
+/// remaining arguments with the parsed choice. Scanning stops where prompt
+/// text begins: at `-p`, at a `prompt` subcommand, and at `--`; place
+/// `--provider` before those.
+pub(crate) fn extract_provider_flag(
+    args: &[String],
+) -> Result<(Vec<String>, Option<crate::provider::ProviderId>), String> {
+    let mut remaining = Vec::with_capacity(args.len());
+    let mut provider = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let is_flag_value = index > 0 && VALUE_FLAGS.contains(&args[index - 1].as_str());
+        if arg == "-p" || arg == "--" || (arg == "prompt" && !is_flag_value) {
+            remaining.extend_from_slice(&args[index..]);
+            break;
+        }
+        let value = if arg == "--provider" {
+            index += 1;
+            Some(
+                args.get(index)
+                    .ok_or_else(|| "missing value for --provider".to_string())?
+                    .as_str(),
+            )
+        } else {
+            arg.strip_prefix("--provider=")
+        };
+        match value {
+            Some(value) => {
+                provider = Some(crate::provider::parse_provider_id(value, "--provider")?);
+            }
+            None => remaining.push(arg.clone()),
+        }
+        index += 1;
+    }
+    Ok((remaining, provider))
 }
 
 pub(crate) fn parse_acp_args(
@@ -663,7 +953,7 @@ pub(crate) fn format_unknown_slash_command(name: &str) -> String {
 pub(crate) fn omc_compatibility_note_for_unknown_slash_command(name: &str) -> Option<&'static str> {
     name.starts_with("oh-my-claudecode:")
         .then_some(
-            "Compatibility note: `/oh-my-claudecode:*` is a Claude Code/OMC plugin command. `neuron` does not yet load plugin slash commands, Claude statusline stdin, or OMC session hooks.",
+            "Note: this looks like a plugin slash command. `neuron` does not yet load plugin slash commands.",
         )
 }
 
@@ -763,6 +1053,40 @@ pub(crate) fn resolve_model_alias_with_config(model: &str) -> String {
     resolve_model_alias(trimmed).to_string()
 }
 
+/// The `--model` value as typed and the name it resolved to while arguments
+/// were parsed, which happens before the trust prompt.
+static MODEL_ARG: Mutex<Option<(String, String)>> = Mutex::new(None);
+
+/// `--model` as the user typed it, when this run had one.
+pub(crate) fn typed_model_arg() -> Option<String> {
+    MODEL_ARG
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .map(|(typed, _)| typed.clone())
+}
+
+fn resolve_model_arg(value: &str) -> String {
+    let resolved = resolve_model_alias_with_config(value);
+    *MODEL_ARG.lock().unwrap_or_else(PoisonError::into_inner) =
+        Some((value.to_string(), resolved.clone()));
+    resolved
+}
+
+/// Re-resolves a `--model` alias after the trust prompt: arguments are parsed
+/// before it, while workspace aliases only apply to a trusted workspace. A
+/// model that did not come from `--model` is kept.
+pub(crate) fn model_after_trust(resolved: String) -> String {
+    let recorded = MODEL_ARG
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    match recorded {
+        Some((typed, parsed)) if parsed == resolved => resolve_model_alias_with_config(&typed),
+        _ => resolved,
+    }
+}
+
 pub(crate) fn config_alias_for_current_dir(alias: &str) -> Option<String> {
     if alias.is_empty() {
         return None;
@@ -824,14 +1148,34 @@ pub(crate) fn permission_mode_from_resolved(mode: ResolvedPermissionMode) -> Per
     }
 }
 
+/// Set when a permission mode came from settings or the built-in default
+/// rather than `--permission-mode` or the environment, so it can be resolved
+/// again once the workspace trust prompt has been answered.
+static PERMISSION_MODE_FROM_DEFAULTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub(crate) fn default_permission_mode() -> PermissionMode {
-    env::var("RUSTY_CLAUDE_PERMISSION_MODE")
+    if let Some(mode) = env::var("RUSTY_CLAUDE_PERMISSION_MODE")
         .ok()
         .as_deref()
         .and_then(normalize_permission_mode)
         .map(permission_mode_from_label)
-        .or_else(config_permission_mode_for_current_dir)
-        .unwrap_or(PermissionMode::WorkspaceWrite)
+    {
+        return mode;
+    }
+    PERMISSION_MODE_FROM_DEFAULTS.store(true, std::sync::atomic::Ordering::Relaxed);
+    config_permission_mode_for_current_dir().unwrap_or(PermissionMode::WorkspaceWrite)
+}
+
+/// Re-resolves a permission mode that came from defaults after the trust
+/// prompt: arguments are parsed before it, while workspace settings only
+/// apply to a trusted workspace. An explicit flag or env value is kept.
+pub(crate) fn permission_mode_after_trust(resolved: PermissionMode) -> PermissionMode {
+    if PERMISSION_MODE_FROM_DEFAULTS.load(std::sync::atomic::Ordering::Relaxed) {
+        default_permission_mode()
+    } else {
+        resolved
+    }
 }
 
 pub(crate) fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {
@@ -946,12 +1290,23 @@ pub(crate) fn parse_export_args(
             other if other.starts_with('-') => {
                 return Err(format!("unknown export option: {other}"));
             }
+            // A bare word (`neuron export summary`) is more often the start of an
+            // unquoted prompt than a file name: the path must look like one.
+            other if output_path.is_none() && !looks_like_a_path(other) => {
+                return Err(format!(
+                    "`neuron export` writes the session to a file, and `{other}` does not look like one: give a file name with an extension (`{other}.md`), a path (`./{other}`), or `--output {other}`. {}",
+                    quote_prompt_hint("export")
+                ));
+            }
             other if output_path.is_none() => {
                 output_path = Some(PathBuf::from(other));
                 index += 1;
             }
             other => {
-                return Err(format!("unexpected export argument: {other}"));
+                return Err(format!(
+                    "unexpected export argument: {other}. {}",
+                    quote_prompt_hint("export")
+                ));
             }
         }
     }
@@ -961,6 +1316,14 @@ pub(crate) fn parse_export_args(
         output_path,
         output_format,
     })
+}
+
+/// Whether `word` names a file: it has an extension or a directory part.
+fn looks_like_a_path(word: &str) -> bool {
+    word.contains(['/', '\\'])
+        || Path::new(word)
+            .extension()
+            .is_some_and(|ext| !ext.is_empty())
 }
 
 pub(crate) fn parse_dump_manifests_args(
@@ -999,6 +1362,7 @@ pub(crate) fn parse_dump_manifests_args(
 pub(crate) fn parse_resume_args(
     args: &[String],
     output_format: CliOutputFormat,
+    launch: ResumeLaunchOptions,
 ) -> Result<CliAction, String> {
     let (session_path, command_tokens): (PathBuf, &[String]) = match args.first() {
         None => (PathBuf::from(LATEST_SESSION_REFERENCE), &[]),
@@ -1040,5 +1404,72 @@ pub(crate) fn parse_resume_args(
         session_path,
         commands,
         output_format,
+        launch,
     })
+}
+
+#[cfg(test)]
+mod provider_flag_tests {
+    use super::extract_provider_flag;
+    use crate::provider::ProviderId;
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn provider_flag_is_removed_and_parsed_in_both_spellings() {
+        let (rest, provider) =
+            extract_provider_flag(&strings(&["--provider", "openai", "--model", "gpt-4o"]))
+                .unwrap();
+        assert_eq!(rest, strings(&["--model", "gpt-4o"]));
+        assert_eq!(provider, Some(ProviderId::OpenAi));
+
+        let (rest, provider) = extract_provider_flag(&strings(&[
+            "--provider=zero-x",
+            "--compact",
+            "prompt",
+            "hi",
+        ]))
+        .unwrap();
+        assert_eq!(rest, strings(&["--compact", "prompt", "hi"]));
+        assert_eq!(provider, Some(ProviderId::ZeroX));
+    }
+
+    #[test]
+    fn prompt_subcommand_words_are_prompt_text() {
+        let words = strings(&["prompt", "explain", "the", "--provider", "flag"]);
+        let (rest, provider) = extract_provider_flag(&words).unwrap();
+        assert_eq!(rest, words);
+        assert_eq!(provider, None);
+
+        let words = strings(&["--", "--provider", "flag"]);
+        assert_eq!(extract_provider_flag(&words).unwrap(), (words, None));
+
+        // `prompt` as a flag value is not the subcommand.
+        let (rest, provider) = extract_provider_flag(&strings(&[
+            "--model",
+            "prompt",
+            "--provider",
+            "local",
+            "doctor",
+        ]))
+        .unwrap();
+        assert_eq!(rest, strings(&["--model", "prompt", "doctor"]));
+        assert_eq!(provider, Some(ProviderId::Local));
+    }
+
+    #[test]
+    fn provider_flag_errors_are_actionable_and_prompt_text_is_untouched() {
+        assert!(extract_provider_flag(&strings(&["--provider"]))
+            .unwrap_err()
+            .contains("missing value"));
+        assert!(extract_provider_flag(&strings(&["--provider", "claude"]))
+            .unwrap_err()
+            .contains("expected one of"));
+        let (rest, provider) =
+            extract_provider_flag(&strings(&["-p", "explain", "--provider", "flags"])).unwrap();
+        assert_eq!(rest, strings(&["-p", "explain", "--provider", "flags"]));
+        assert_eq!(provider, None);
+    }
 }

@@ -15,6 +15,7 @@ use telemetry::{AnalyticsEvent, AnthropicRequestProfile, ClientIdentity, Session
 use crate::error::ApiError;
 use crate::http_client::build_http_client_or_default;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
+use crate::retry::{plan_retry_delay, retry_after_from_headers, RetryProgress, MAX_TOTAL_BACKOFF};
 
 use super::{
     anthropic_missing_credentials, model_token_limit, resolve_model_alias, Provider, ProviderFuture,
@@ -28,6 +29,12 @@ const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(128);
 const DEFAULT_MAX_RETRIES: u32 = 8;
+
+/// Request profile identifying Neuron (`user-agent: neuron/<version>`)
+/// instead of the telemetry crate's upstream default.
+fn neuron_request_profile() -> AnthropicRequestProfile {
+    AnthropicRequestProfile::new(ClientIdentity::new("neuron", env!("CARGO_PKG_VERSION")))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthSource {
@@ -134,7 +141,7 @@ impl AnthropicClient {
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
-            request_profile: AnthropicRequestProfile::default(),
+            request_profile: neuron_request_profile(),
             session_tracer: None,
             prompt_cache: None,
             last_prompt_cache_record: Arc::new(Mutex::new(None)),
@@ -150,7 +157,7 @@ impl AnthropicClient {
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
-            request_profile: AnthropicRequestProfile::default(),
+            request_profile: neuron_request_profile(),
             session_tracer: None,
             prompt_cache: None,
             last_prompt_cache_record: Arc::new(Mutex::new(None)),
@@ -297,7 +304,9 @@ impl AnthropicClient {
 
         self.preflight_message_request(&request).await?;
 
-        let http_response = self.send_with_retry(&request).await?;
+        let http_response = self
+            .send_with_retry(&request, &RetryProgress::new())
+            .await?;
         let request_id = request_id_from_headers(http_response.headers());
         let body = http_response.text().await.map_err(ApiError::from)?;
         let mut response = serde_json::from_str::<MessageResponse>(&body).map_err(|error| {
@@ -324,12 +333,13 @@ impl AnthropicClient {
                     .with_property("total_tokens", Value::from(response.total_tokens()))
                     .with_property(
                         "estimated_cost_usd",
-                        Value::String(format_usd(
-                            response
-                                .usage
-                                .estimated_cost_usd(&response.model)
-                                .total_cost_usd(),
-                        )),
+                        // Null when the model has no known price.
+                        response
+                            .usage
+                            .estimated_cost_usd(&response.model)
+                            .map_or(Value::Null, |cost| {
+                                Value::String(format_usd(cost.total_cost_usd()))
+                            }),
                     ),
             );
         }
@@ -340,9 +350,20 @@ impl AnthropicClient {
         &self,
         request: &MessageRequest,
     ) -> Result<MessageStream, ApiError> {
+        self.stream_message_with_progress(request, &RetryProgress::new())
+            .await
+    }
+
+    /// Like [`Self::stream_message`], continuing the retry count and budget
+    /// recorded in `progress` (see [`RetryProgress`]).
+    pub async fn stream_message_with_progress(
+        &self,
+        request: &MessageRequest,
+        progress: &RetryProgress,
+    ) -> Result<MessageStream, ApiError> {
         self.preflight_message_request(request).await?;
         let response = self
-            .send_with_retry(&request.clone().with_streaming())
+            .send_with_retry(&request.clone().with_streaming(), progress)
             .await?;
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
@@ -401,12 +422,14 @@ impl AnthropicClient {
     async fn send_with_retry(
         &self,
         request: &MessageRequest,
+        progress: &RetryProgress,
     ) -> Result<reqwest::Response, ApiError> {
-        let mut attempts = 0;
+        let mut attempts;
         let mut last_error: Option<ApiError>;
 
         loop {
-            attempts += 1;
+            attempts = progress.start_attempt(self.max_retries);
+            let mut retry_after = None;
             if let Some(session_tracer) = &self.session_tracer {
                 session_tracer.record_http_request_started(
                     attempts,
@@ -415,7 +438,11 @@ impl AnthropicClient {
                     Map::new(),
                 );
             }
-            match self.send_raw_request(request).await {
+            let sent = self.send_raw_request(request).await;
+            if let Ok(response) = &sent {
+                retry_after = retry_after_from_headers(response.headers());
+            }
+            match sent {
                 Ok(response) => match expect_success(response).await {
                     Ok(response) => {
                         if let Some(session_tracer) = &self.session_tracer {
@@ -454,7 +481,15 @@ impl AnthropicClient {
                 break;
             }
 
-            tokio::time::sleep(self.jittered_backoff_for_attempt(attempts)?).await;
+            // Honour `Retry-After` and keep the total wait across retries
+            // within MAX_TOTAL_BACKOFF instead of sleeping for minutes.
+            let backoff = self.jittered_backoff_for_attempt(attempts)?;
+            let Some(delay) =
+                plan_retry_delay(retry_after, backoff, progress.slept(), MAX_TOTAL_BACKOFF)
+            else {
+                break;
+            };
+            progress.wait(delay, None).await;
         }
 
         Err(ApiError::RetriesExhausted {
@@ -1439,7 +1474,7 @@ mod tests {
         let mut body = serde_json::json!({
             "model": "claude-sonnet-4-6",
             "max_tokens": 1024,
-            "betas": ["claude-code-20250219", "prompt-caching-scope-2026-01-05"],
+            "betas": ["prompt-caching-scope-2026-01-05", "tools-2026-04-01"],
             "metadata": {"source": "test"},
         });
 

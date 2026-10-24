@@ -6,7 +6,11 @@
 //! Permission enforcement layer that gates tool execution based on the
 //! active `PermissionPolicy`.
 
-use crate::permissions::{PermissionMode, PermissionOutcome, PermissionPolicy};
+use crate::bash_validation::{classify_shell_command, ShellDialect};
+use crate::permissions::{
+    PermissionContext, PermissionMode, PermissionOutcome, PermissionPolicy,
+    NON_INTERACTIVE_PERMISSION_HINT,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,13 +47,16 @@ impl PermissionEnforcer {
             return EnforcementResult::Allowed;
         }
 
+        // The policy also consumes a one-shot approval recorded when the
+        // conversation loop prompted the user for this exact call, so an
+        // approved escalation is not denied a second time here.
         let outcome = self.policy.authorize(tool_name, input, None);
 
         match outcome {
             PermissionOutcome::Allow => EnforcementResult::Allowed,
             PermissionOutcome::Deny { reason } => {
                 let active_mode = self.policy.active_mode();
-                let required_mode = self.policy.required_mode_for(tool_name);
+                let required_mode = self.policy.required_mode_for_input(tool_name, input);
                 EnforcementResult::Denied {
                     tool: tool_name.to_owned(),
                     active_mode: active_mode.as_str().to_owned(),
@@ -67,6 +74,10 @@ impl PermissionEnforcer {
 
     /// Check permission with an explicitly provided required mode.
     /// Used when the required mode is determined dynamically (e.g., bash command classification).
+    ///
+    /// Allow/deny rules, session approvals and approvals granted through the
+    /// conversation loop's prompt are honoured; the call needs at least
+    /// `required_mode` (or more, if the policy's own input assessment says so).
     pub fn check_with_required_mode(
         &self,
         tool_name: &str,
@@ -80,22 +91,39 @@ impl PermissionEnforcer {
         }
 
         let active_mode = self.policy.active_mode();
-
-        // Check if active mode meets the dynamically determined required mode
-        if active_mode >= required_mode {
+        let required_mode =
+            required_mode.max(self.policy.required_mode_for_input(tool_name, input));
+        let outcome = self.policy.authorize_with_floor(
+            tool_name,
+            input,
+            &PermissionContext::default(),
+            Some(required_mode),
+            None,
+        );
+        let PermissionOutcome::Deny { reason } = outcome else {
             return EnforcementResult::Allowed;
-        }
+        };
 
-        // Permission denied - active mode is insufficient
+        let reason = if active_mode >= required_mode {
+            // Denied by a rule rather than by the mode.
+            reason
+        } else {
+            let mut message = format!(
+                "'{tool_name}' with input '{input}' requires '{}' permission, but current mode is '{}'",
+                required_mode.as_str(),
+                active_mode.as_str()
+            );
+            if active_mode == PermissionMode::WorkspaceWrite {
+                message.push_str(". ");
+                message.push_str(NON_INTERACTIVE_PERMISSION_HINT);
+            }
+            message
+        };
         EnforcementResult::Denied {
             tool: tool_name.to_owned(),
             active_mode: active_mode.as_str().to_owned(),
             required_mode: required_mode.as_str().to_owned(),
-            reason: format!(
-                "'{tool_name}' with input '{input}' requires '{}' permission, but current mode is '{}'",
-                required_mode.as_str(),
-                active_mode.as_str()
-            ),
+            reason,
         }
     }
 
@@ -190,85 +218,11 @@ fn is_within_workspace(path: &str, workspace_root: &str) -> bool {
     normalized.starts_with(&root) || normalized == workspace_root.trim_end_matches('/')
 }
 
-/// Conservative heuristic: is this bash command read-only?
+/// Whether a bash command line is read-only, judged over every simple
+/// command in it (see [`classify_shell_command`]).
 fn is_read_only_command(command: &str) -> bool {
-    let first_token = command
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .rsplit('/')
-        .next()
-        .unwrap_or("");
-
-    matches!(
-        first_token,
-        "cat"
-            | "head"
-            | "tail"
-            | "less"
-            | "more"
-            | "wc"
-            | "ls"
-            | "find"
-            | "grep"
-            | "rg"
-            | "awk"
-            | "sed"
-            | "echo"
-            | "printf"
-            | "which"
-            | "where"
-            | "whoami"
-            | "pwd"
-            | "env"
-            | "printenv"
-            | "date"
-            | "cal"
-            | "df"
-            | "du"
-            | "free"
-            | "uptime"
-            | "uname"
-            | "file"
-            | "stat"
-            | "diff"
-            | "sort"
-            | "uniq"
-            | "tr"
-            | "cut"
-            | "paste"
-            | "tee"
-            | "xargs"
-            | "test"
-            | "true"
-            | "false"
-            | "type"
-            | "readlink"
-            | "realpath"
-            | "basename"
-            | "dirname"
-            | "sha256sum"
-            | "md5sum"
-            | "b3sum"
-            | "xxd"
-            | "hexdump"
-            | "od"
-            | "strings"
-            | "tree"
-            | "jq"
-            | "yq"
-            | "python3"
-            | "python"
-            | "node"
-            | "ruby"
-            | "cargo"
-            | "rustc"
-            | "git"
-            | "gh"
-    ) && !command.contains("-i ")
-        && !command.contains("--in-place")
-        && !command.contains(" > ")
-        && !command.contains(" >> ")
+    let workspace = std::env::current_dir().ok();
+    classify_shell_command(command, ShellDialect::host(), workspace.as_deref()).is_read_only()
 }
 
 #[cfg(test)]
@@ -581,5 +535,94 @@ mod tests {
             }
             other => panic!("expected denied result, got {other:?}"),
         }
+    }
+
+    struct AlwaysAllow;
+
+    impl crate::permissions::PermissionPrompter for AlwaysAllow {
+        fn decide(
+            &mut self,
+            _request: &crate::permissions::PermissionRequest,
+        ) -> crate::permissions::PermissionPromptDecision {
+            crate::permissions::PermissionPromptDecision::Allow
+        }
+    }
+
+    fn workspace_write_policy() -> PermissionPolicy {
+        PermissionPolicy::new(PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("PowerShell", PermissionMode::ReadOnly)
+            .with_tool_requirement("bash", PermissionMode::ReadOnly)
+            .with_session_approvals(crate::permissions::SessionApprovals::isolated())
+    }
+
+    #[test]
+    fn approved_escalation_is_not_denied_again_by_the_enforcer() {
+        // given: the conversation loop prompted and the user approved
+        let policy = workspace_write_policy();
+        let enforcer = PermissionEnforcer::new(policy.clone());
+        let input = r#"{"command":"Remove-Item build -Recurse"}"#;
+        assert_eq!(
+            policy.authorize("PowerShell", input, Some(&mut AlwaysAllow)),
+            PermissionOutcome::Allow
+        );
+
+        // when: the tool executor re-checks the same call
+        let first = enforcer.check_with_required_mode(
+            "PowerShell",
+            input,
+            PermissionMode::DangerFullAccess,
+        );
+        let second = enforcer.check_with_required_mode(
+            "PowerShell",
+            input,
+            PermissionMode::DangerFullAccess,
+        );
+
+        // then: the approval is honoured exactly once
+        assert_eq!(first, EnforcementResult::Allowed);
+        assert!(matches!(second, EnforcementResult::Denied { .. }));
+    }
+
+    #[test]
+    fn unapproved_escalation_denial_explains_the_flags() {
+        let enforcer = PermissionEnforcer::new(workspace_write_policy());
+        let result = enforcer.check_with_required_mode(
+            "bash",
+            r#"{"command":"cargo build"}"#,
+            PermissionMode::DangerFullAccess,
+        );
+        let EnforcementResult::Denied { reason, .. } = result else {
+            panic!("expected denial");
+        };
+        assert!(reason.contains("requires 'danger-full-access' permission"));
+        assert!(reason.contains("--permission-mode"));
+        assert!(reason.contains("--allowedTools"));
+    }
+
+    #[test]
+    fn allow_rules_are_honoured_for_classified_commands() {
+        let rules = crate::config::RuntimePermissionRuleConfig::new(
+            vec!["bash(cargo build:*)".to_string()],
+            Vec::new(),
+            Vec::new(),
+        );
+        let enforcer =
+            PermissionEnforcer::new(workspace_write_policy().with_permission_rules(&rules));
+        assert_eq!(
+            enforcer.check_with_required_mode(
+                "bash",
+                r#"{"command":"cargo build --release"}"#,
+                PermissionMode::DangerFullAccess
+            ),
+            EnforcementResult::Allowed
+        );
+    }
+
+    #[test]
+    fn read_only_heuristic_inspects_every_segment() {
+        assert!(is_read_only_command("cat a.txt && ls"));
+        assert!(!is_read_only_command("cat a.txt && rm b.txt"));
+        assert!(!is_read_only_command("ls | sh"));
+        assert!(!is_read_only_command("cargo build"));
     }
 }

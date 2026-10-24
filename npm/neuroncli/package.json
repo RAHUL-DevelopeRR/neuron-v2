@@ -1,0 +1,54 @@
+{
+  "name": "@zero-x.live/neuron",
+  "version": "7.0.0-alpha.1",
+  "description": "Neuron coding agent for the terminal, powered by the Zero-X gateway",
+  "keywords": [
+    "ai",
+    "coding-agent",
+    "cli",
+    "terminal",
+    "neuron",
+    "zero-x"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "neuron": "bin/neuron.js"
+  },
+  "files": [
+    "bin/neuron.js",
+    "lib/",
+    "scripts/install.js",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/install.js",
+    "test": "node --test \"test/*.test.js\""
+  },
+  "engines": {
+    "node": ">=22.14"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "dependencies": {
+    "codebase-memory-mcp": "0.11.0",
+    "@playwright/mcp": "0.0.83"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/RAHUL-DevelopeRR/neuron-v2.git"
+  },
+  "homepage": "https://github.com/RAHUL-DevelopeRR/neuron-v2#readme",
+  "bugs": {
+    "url": "https://github.com/RAHUL-DevelopeRR/neuron-v2/issues"
+  }
+}

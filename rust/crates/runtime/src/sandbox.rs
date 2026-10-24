@@ -1,8 +1,10 @@
 use std::env;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -54,12 +56,17 @@ pub struct SandboxStatus {
     pub enabled: bool,
     pub requested: SandboxRequest,
     pub supported: bool,
+    /// Whether every requested protection is in effect and at least one is.
     pub active: bool,
     pub namespace_supported: bool,
     pub namespace_active: bool,
     pub network_supported: bool,
     pub network_active: bool,
+    /// The filesystem mode in effect: `off` whenever `filesystem_active` is
+    /// false (the requested mode is in `requested`).
     pub filesystem_mode: FilesystemIsolationMode,
+    /// Whether commands get a per-workspace `HOME` and `TMPDIR` (see
+    /// [`SandboxDirs`]). Never on Windows, which has no filesystem isolation.
     pub filesystem_active: bool,
     pub allowed_mounts: Vec<String>,
     pub in_container: bool,
@@ -160,11 +167,34 @@ pub fn resolve_sandbox_status(config: &SandboxConfig, cwd: &Path) -> SandboxStat
 
 #[must_use]
 pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) -> SandboxStatus {
-    let container = detect_container_environment();
     let namespace_supported = cfg!(target_os = "linux") && unshare_user_namespace_works();
+    resolve_sandbox_status_with_support(
+        request,
+        cwd,
+        namespace_supported,
+        filesystem_isolation_supported(),
+    )
+}
+
+/// Filesystem isolation (a per-workspace `HOME` and `TMPDIR`) is applied on
+/// Unix only; Windows commands run unisolated.
+const fn filesystem_isolation_supported() -> bool {
+    !cfg!(windows)
+}
+
+fn resolve_sandbox_status_with_support(
+    request: &SandboxRequest,
+    cwd: &Path,
+    namespace_supported: bool,
+    filesystem_supported: bool,
+) -> SandboxStatus {
+    let container = detect_container_environment();
     let network_supported = namespace_supported;
-    let filesystem_active =
+    let filesystem_requested =
         request.enabled && request.filesystem_mode != FilesystemIsolationMode::Off;
+    let filesystem_active = filesystem_requested && filesystem_supported;
+    let namespace_active = request.enabled && request.namespace_restrictions && namespace_supported;
+    let network_active = request.enabled && request.network_isolation && network_supported;
     let mut fallback_reasons = Vec::new();
 
     if request.enabled && request.namespace_restrictions && !namespace_supported {
@@ -175,7 +205,13 @@ pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) 
         fallback_reasons
             .push("network isolation unavailable (requires Linux with `unshare`)".to_string());
     }
-    if request.enabled
+    if filesystem_requested && !filesystem_supported {
+        fallback_reasons.push(format!(
+            "filesystem isolation ({}) unavailable on this platform",
+            request.filesystem_mode.as_str()
+        ));
+    }
+    if filesystem_active
         && request.filesystem_mode == FilesystemIsolationMode::AllowList
         && request.allowed_mounts.is_empty()
     {
@@ -185,7 +221,9 @@ pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) 
 
     let active = request.enabled
         && (!request.namespace_restrictions || namespace_supported)
-        && (!request.network_isolation || network_supported);
+        && (!request.network_isolation || network_supported)
+        && (!filesystem_requested || filesystem_supported)
+        && (namespace_active || network_active || filesystem_active);
 
     let allowed_mounts = normalize_mounts(&request.allowed_mounts, cwd);
 
@@ -195,10 +233,14 @@ pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) 
         supported: namespace_supported,
         active,
         namespace_supported,
-        namespace_active: request.enabled && request.namespace_restrictions && namespace_supported,
+        namespace_active,
         network_supported,
-        network_active: request.enabled && request.network_isolation && network_supported,
-        filesystem_mode: request.filesystem_mode,
+        network_active,
+        filesystem_mode: if filesystem_active {
+            request.filesystem_mode
+        } else {
+            FilesystemIsolationMode::Off
+        },
         filesystem_active,
         allowed_mounts,
         in_container: container.in_container,
@@ -236,20 +278,20 @@ pub fn build_linux_sandbox_command(
     args.push("-lc".to_string());
     args.push(command.to_string());
 
-    let sandbox_home = cwd.join(".sandbox-home");
-    let sandbox_tmp = cwd.join(".sandbox-tmp");
-    let mut env = vec![
-        ("HOME".to_string(), sandbox_home.display().to_string()),
-        ("TMPDIR".to_string(), sandbox_tmp.display().to_string()),
-        (
-            "CLAWD_SANDBOX_FILESYSTEM_MODE".to_string(),
-            status.filesystem_mode.as_str().to_string(),
-        ),
-        (
-            "CLAWD_SANDBOX_ALLOWED_MOUNTS".to_string(),
-            status.allowed_mounts.join(":"),
-        ),
-    ];
+    let mut env = Vec::new();
+    if status.filesystem_active {
+        let dirs = SandboxDirs::for_workspace(cwd);
+        env.push(("HOME".to_string(), dirs.home.display().to_string()));
+        env.push(("TMPDIR".to_string(), dirs.tmp.display().to_string()));
+    }
+    env.push((
+        "CLAWD_SANDBOX_FILESYSTEM_MODE".to_string(),
+        status.filesystem_mode.as_str().to_string(),
+    ));
+    env.push((
+        "CLAWD_SANDBOX_ALLOWED_MOUNTS".to_string(),
+        status.allowed_mounts.join(":"),
+    ));
     if let Ok(path) = env::var("PATH") {
         env.push(("PATH".to_string(), path));
     }
@@ -259,6 +301,87 @@ pub fn build_linux_sandbox_command(
         args,
         env,
     })
+}
+
+/// The `HOME` and `TMPDIR` a sandboxed command gets while filesystem
+/// isolation is active. They live outside the project, in the user's Neuron
+/// config directory (`~/.neuron/sandbox/<workspace>-<hash>/{home,tmp}`), one
+/// pair per workspace, so caches persist between commands without littering
+/// the project. Not the shared system temp directory: another local user
+/// could pre-create a predictable path there and plant a `.profile` for the
+/// login shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxDirs {
+    pub home: PathBuf,
+    pub tmp: PathBuf,
+}
+
+impl SandboxDirs {
+    #[must_use]
+    pub fn for_workspace(cwd: &Path) -> Self {
+        let config_home = crate::config::default_config_home();
+        let base = if config_home.is_absolute() {
+            config_home
+        } else {
+            env::temp_dir().join("neuron")
+        };
+        Self::for_workspace_in(&base.join("sandbox"), cwd)
+    }
+
+    /// Directories for `cwd` under `base`, keyed by a hash of the
+    /// workspace's canonical path.
+    #[must_use]
+    pub fn for_workspace_in(base: &Path, cwd: &Path) -> Self {
+        let workspace = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        let digest = Sha256::digest(workspace.to_string_lossy().as_bytes());
+        let mut prefix = [0_u8; 8];
+        prefix.copy_from_slice(&digest[..8]);
+        let hash = format!("{:016x}", u64::from_be_bytes(prefix));
+        let name = workspace
+            .file_name()
+            .map(|name| {
+                name.to_string_lossy()
+                    .chars()
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                            c
+                        } else {
+                            '_'
+                        }
+                    })
+                    .take(32)
+                    .collect::<String>()
+            })
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "workspace".to_string());
+        let root = base.join(format!("{name}-{hash}"));
+        Self {
+            home: root.join("home"),
+            tmp: root.join("tmp"),
+        }
+    }
+
+    /// Creates both directories (owner-only on Unix) if they are missing.
+    pub fn create(&self) -> io::Result<()> {
+        for dir in [&self.home, &self.tmp] {
+            create_private_dir(dir)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn create_private_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(dir)
 }
 
 fn normalize_mounts(mounts: &[String], cwd: &Path) -> Vec<String> {
@@ -305,8 +428,9 @@ fn unshare_user_namespace_works() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_linux_sandbox_command, detect_container_environment_from, FilesystemIsolationMode,
-        SandboxConfig, SandboxDetectionInputs,
+        build_linux_sandbox_command, detect_container_environment_from,
+        resolve_sandbox_status_with_support, FilesystemIsolationMode, SandboxConfig,
+        SandboxDetectionInputs, SandboxDirs, SandboxRequest,
     };
     use std::path::Path;
 
@@ -378,7 +502,104 @@ mod tests {
         {
             assert_eq!(launcher.program, "unshare");
             assert!(launcher.args.iter().any(|arg| arg == "--mount"));
-            assert!(launcher.args.iter().any(|arg| arg == "--net") == status.network_active);
+            assert_eq!(
+                launcher.args.iter().any(|arg| arg == "--net"),
+                status.network_active
+            );
+            let home = launcher
+                .env
+                .iter()
+                .find(|(key, _)| key == "HOME")
+                .map(|(_, value)| value.clone())
+                .expect("filesystem isolation sets HOME");
+            assert!(
+                !Path::new(&home).starts_with("/workspace"),
+                "HOME must not be inside the project: {home}"
+            );
         }
+    }
+
+    fn workspace_only_request() -> SandboxRequest {
+        SandboxConfig::default().resolve_request(
+            Some(true),
+            Some(false),
+            Some(false),
+            Some(FilesystemIsolationMode::WorkspaceOnly),
+            None,
+        )
+    }
+
+    /// Windows applies no filesystem isolation, so the status must not claim
+    /// a live workspace-only mode.
+    #[test]
+    fn filesystem_isolation_is_reported_inactive_where_unsupported() {
+        let cwd = Path::new("/workspace");
+        let unsupported =
+            resolve_sandbox_status_with_support(&workspace_only_request(), cwd, false, false);
+        assert!(!unsupported.filesystem_active);
+        assert_eq!(unsupported.filesystem_mode, FilesystemIsolationMode::Off);
+        assert_eq!(
+            unsupported.requested.filesystem_mode,
+            FilesystemIsolationMode::WorkspaceOnly
+        );
+        assert!(!unsupported.active, "nothing is isolated: {unsupported:?}");
+        assert!(unsupported
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("filesystem isolation")));
+
+        let supported =
+            resolve_sandbox_status_with_support(&workspace_only_request(), cwd, false, true);
+        assert!(supported.filesystem_active);
+        assert_eq!(
+            supported.filesystem_mode,
+            FilesystemIsolationMode::WorkspaceOnly
+        );
+        assert!(supported.active);
+        assert_eq!(supported.fallback_reason, None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_status_never_claims_filesystem_isolation() {
+        let status =
+            super::resolve_sandbox_status_for_request(&workspace_only_request(), Path::new("."));
+        assert!(!status.filesystem_active, "{status:?}");
+        assert_eq!(status.filesystem_mode, FilesystemIsolationMode::Off);
+        assert!(!status.active, "{status:?}");
+    }
+
+    #[test]
+    fn sandbox_dirs_live_outside_the_workspace_one_pair_per_workspace() {
+        let base = Path::new("/home/dev/.neuron/sandbox");
+        let first = SandboxDirs::for_workspace_in(base, Path::new("/work/project-a"));
+        let again = SandboxDirs::for_workspace_in(base, Path::new("/work/project-a"));
+        let other = SandboxDirs::for_workspace_in(base, Path::new("/work/project-b"));
+        assert_eq!(first, again, "stable per workspace");
+        assert_ne!(first.home, other.home);
+        assert!(first.home.starts_with(base) && first.tmp.starts_with(base));
+        assert!(!first.home.starts_with("/work/project-a"));
+        let root = first.home.parent().expect("workspace root");
+        assert_eq!(first.tmp.parent(), Some(root));
+        assert!(root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("project-a-")));
+    }
+
+    #[test]
+    fn sandbox_dirs_are_created_on_request() {
+        let base = std::env::temp_dir().join(format!(
+            "runtime-sandbox-dirs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        let dirs = SandboxDirs::for_workspace_in(&base, Path::new("/work/project"));
+        assert!(!dirs.home.exists());
+        dirs.create().expect("create sandbox dirs");
+        assert!(dirs.home.is_dir() && dirs.tmp.is_dir());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

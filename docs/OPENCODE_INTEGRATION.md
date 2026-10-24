@@ -1,5 +1,10 @@
 # Opencode Architecture Analysis & Neuron Integration Plan
 
+> Historical proposal for the archived Go project `opencode-ai/opencode`, not the
+> current Neuron implementation. Neuron derives from Claw Code and runs Rust;
+> current OpenCode is `anomalyco/opencode` and runs TypeScript/Bun. See
+> [the current upstream review](OPENCODE_UPSTREAM_REVIEW.md) before adapting changes.
+
 ## Repository Created
 **https://github.com/RAHUL-DevelopeRR/neuron-v2**
 

@@ -139,6 +139,6 @@ mod tests {
             },
         ]);
 
-        assert!(collisions.is_empty());
+        assert_eq!(collisions.len(), 0);
     }
 }

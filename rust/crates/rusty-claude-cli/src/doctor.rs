@@ -236,7 +236,7 @@ pub(crate) fn run_worker_state(
         // Let the error propagate to main() which will format it correctly
         // (prose for text mode, JSON envelope for --output-format json).
         return Err(format!(
-            "no worker state file found at {} â€” run a worker first",
+            "no worker state file found at {} — run a worker first",
             state_path.display()
         )
         .into());
@@ -283,18 +283,187 @@ pub(crate) fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Source repository and install channels shown by `neuron doctor`.
+pub(crate) const NEURON_REPO_URL: &str = "https://github.com/RAHUL-DevelopeRR/neuron-v2";
+pub(crate) const NEURON_REPO_SLUG: &str = "RAHUL-DevelopeRR/neuron-v2";
+pub(crate) const NPM_PACKAGE: &str = "@zero-x.live/neuron";
+pub(crate) const PYPI_PACKAGE: &str = "neuroncli";
+/// Doctor runs synchronously; do not wait long on the network.
+const SESSION_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Result of asking the gateway whether the Zero-X credential still works.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GatewaySessionCheck {
+    NotSignedIn,
+    /// Signed in, but the credential was not sent to the server (why).
+    NotChecked(&'static str),
+    Valid(super::auth::SessionInfo),
+    Invalid,
+    Unreachable(String),
+}
+
+impl GatewaySessionCheck {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::NotSignedIn => "signed_out",
+            Self::NotChecked(_) => "not_checked",
+            Self::Valid(_) => "valid",
+            Self::Invalid => "invalid",
+            Self::Unreachable(_) => "unverified",
+        }
+    }
+
+    fn detail(&self, source: Option<&str>) -> String {
+        let source = source.map_or_else(String::new, |source| format!(" ({source})"));
+        match self {
+            Self::NotSignedIn => "Zero-X           signed out; run `neuron auth login`".to_string(),
+            Self::NotChecked(reason) => {
+                format!(
+                    "Zero-X           signed in{source}; not verified with the server ({reason})"
+                )
+            }
+            Self::Valid(info) => {
+                let mut detail = format!("Zero-X           session valid{source}");
+                if let Some(plan) = &info.plan {
+                    detail.push_str(&format!(", plan {plan}"));
+                }
+                if let Some(expires_at) = info.expires_at {
+                    detail.push_str(&format!(
+                        ", expires {}",
+                        crate::clock::format_utc(expires_at)
+                    ));
+                }
+                detail
+            }
+            Self::Invalid => format!("Zero-X           {}{source}", api::INVALID_SESSION_MESSAGE),
+            Self::Unreachable(error) => {
+                format!("Zero-X           session not verified{source}: {error}")
+            }
+        }
+    }
+}
+
+/// Truthy unless unset, empty, `0`, `false`, `no` or `off`.
+fn env_flag(key: &str) -> bool {
+    env::var(key).is_ok_and(|value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        )
+    })
+}
+
+/// Whether doctor may send the credential to the gateway to validate it:
+/// never with `NEURON_DOCTOR_OFFLINE`, always with `NEURON_DOCTOR_ONLINE`,
+/// otherwise only when a person is watching (a terminal on stdout or
+/// stderr). Scripted runs and test harnesses therefore never send a
+/// developer's stored login anywhere.
+fn online_check_policy(offline: bool, online: bool, interactive: bool) -> Result<(), &'static str> {
+    if offline {
+        Err("NEURON_DOCTOR_OFFLINE is set")
+    } else if online || interactive {
+        Ok(())
+    } else {
+        Err("non-interactive run; set NEURON_DOCTOR_ONLINE=1 to check with the server")
+    }
+}
+
+/// Validates the active Zero-X credential with the server (read-only: the
+/// stored login is not migrated or modified).
+pub(crate) fn check_gateway_session() -> (GatewaySessionCheck, Option<String>) {
+    let credential = match super::auth::current_credential() {
+        Ok(Some(credential)) => credential,
+        Ok(None) => return (GatewaySessionCheck::NotSignedIn, None),
+        Err(error) => {
+            return (GatewaySessionCheck::Unreachable(error.to_string()), None);
+        }
+    };
+    let source = Some(credential.source.describe());
+    if let Err(reason) = online_check_policy(
+        env_flag("NEURON_DOCTOR_OFFLINE"),
+        env_flag("NEURON_DOCTOR_ONLINE"),
+        std::io::stdout().is_terminal() || std::io::stderr().is_terminal(),
+    ) {
+        return (GatewaySessionCheck::NotChecked(reason), source);
+    }
+    let base = match super::auth::gateway_base_url() {
+        Ok(base) => base,
+        Err(error) => return (GatewaySessionCheck::Unreachable(error.to_string()), source),
+    };
+    let path = match credential.kind {
+        crate::credentials::TokenKind::Session => "/auth/session",
+        crate::credentials::TokenKind::ApiKey => "/api/account",
+    };
+    let check = match crate::gateway_http::get_json(
+        &crate::gateway_http::account_url(&base, path),
+        Some(credential.token.expose()),
+        SESSION_CHECK_TIMEOUT,
+    ) {
+        Ok(value) => GatewaySessionCheck::Valid(super::auth::parse_session_info(
+            &value,
+            crate::clock::now_unix(),
+        )),
+        Err(error) if error.is_invalid_session() => GatewaySessionCheck::Invalid,
+        Err(error) => GatewaySessionCheck::Unreachable(error.to_string()),
+    };
+    (check, source)
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn check_auth_health() -> DiagnosticCheck {
-    let api_key_present = env::var("ANTHROPIC_API_KEY")
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty());
-    let auth_token_present = env::var("ANTHROPIC_AUTH_TOKEN")
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty());
+    let (gateway_check, gateway_source) = check_gateway_session();
+    with_gateway_session(
+        base_auth_health(&gateway_check),
+        &gateway_check,
+        gateway_source.as_deref(),
+    )
+}
+
+/// Folds the Zero-X session check into the auth diagnostic: an expired or
+/// revoked session is a warning with the login instruction.
+fn with_gateway_session(
+    mut check: DiagnosticCheck,
+    gateway: &GatewaySessionCheck,
+    source: Option<&str>,
+) -> DiagnosticCheck {
+    check.details.push(gateway.detail(source));
+    if *gateway == GatewaySessionCheck::Invalid {
+        if check.level == DiagnosticLevel::Ok {
+            check.level = DiagnosticLevel::Warn;
+        }
+        check.summary = api::INVALID_SESSION_MESSAGE.to_string();
+    }
+    check
+        .data
+        .insert("gateway_session".to_string(), json!(gateway.label()));
+    if let GatewaySessionCheck::Valid(info) = gateway {
+        check
+            .data
+            .insert("gateway_plan".to_string(), json!(info.plan));
+        check.data.insert(
+            "gateway_session_expires_at".to_string(),
+            json!(info.expires_at),
+        );
+    }
+    check
+}
+
+#[allow(clippy::too_many_lines)]
+fn base_auth_health(gateway: &GatewaySessionCheck) -> DiagnosticCheck {
+    let api_key_present = env::var("ANTHROPIC_API_KEY").is_ok_and(|value| !value.trim().is_empty());
+    let auth_token_present =
+        env::var("ANTHROPIC_AUTH_TOKEN").is_ok_and(|value| !value.trim().is_empty());
+    let gateway_token_present = *gateway != GatewaySessionCheck::NotSignedIn;
+    let supported_auth_present = api_key_present || auth_token_present || gateway_token_present;
     let env_details = format!(
-        "Environment       api_key={} auth_token={}",
+        "Environment       api_key={} auth_token={} gateway_token={}",
         if api_key_present { "present" } else { "absent" },
         if auth_token_present {
+            "present"
+        } else {
+            "absent"
+        },
+        if gateway_token_present {
             "present"
         } else {
             "absent"
@@ -304,13 +473,13 @@ pub(crate) fn check_auth_health() -> DiagnosticCheck {
     match load_oauth_credentials() {
         Ok(Some(token_set)) => DiagnosticCheck::new(
             "Auth",
-            if api_key_present || auth_token_present {
+            if supported_auth_present {
                 DiagnosticLevel::Ok
             } else {
                 DiagnosticLevel::Warn
             },
-            if api_key_present || auth_token_present {
-                "supported auth env vars are configured; legacy saved OAuth is ignored"
+            if supported_auth_present {
+                "supported auth credentials are configured; legacy saved OAuth is ignored"
             } else {
                 "legacy saved OAuth credentials are present but unsupported"
             },
@@ -333,12 +502,13 @@ pub(crate) fn check_auth_health() -> DiagnosticCheck {
                     token_set.scopes.join(",")
                 }
             ),
-            "Suggested action  set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN; `neuron login` is removed"
+            "Suggested action  run `neuron auth login` for Zero-X, or set ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN"
                 .to_string(),
         ])
         .with_data(Map::from_iter([
             ("api_key_present".to_string(), json!(api_key_present)),
             ("auth_token_present".to_string(), json!(auth_token_present)),
+            ("gateway_token_present".to_string(), json!(gateway_token_present)),
             ("legacy_saved_oauth_present".to_string(), json!(true)),
             (
                 "legacy_saved_oauth_expires_at".to_string(),
@@ -352,13 +522,13 @@ pub(crate) fn check_auth_health() -> DiagnosticCheck {
         ])),
         Ok(None) => DiagnosticCheck::new(
             "Auth",
-            if api_key_present || auth_token_present {
+            if supported_auth_present {
                 DiagnosticLevel::Ok
             } else {
                 DiagnosticLevel::Warn
             },
-            if api_key_present || auth_token_present {
-                "supported auth env vars are configured"
+            if supported_auth_present {
+                "supported auth credentials are configured"
             } else {
                 "no supported auth env vars were found"
             },
@@ -367,6 +537,7 @@ pub(crate) fn check_auth_health() -> DiagnosticCheck {
         .with_data(Map::from_iter([
             ("api_key_present".to_string(), json!(api_key_present)),
             ("auth_token_present".to_string(), json!(auth_token_present)),
+            ("gateway_token_present".to_string(), json!(gateway_token_present)),
             ("legacy_saved_oauth_present".to_string(), json!(false)),
             ("legacy_saved_oauth_expires_at".to_string(), Value::Null),
             ("legacy_refresh_token_present".to_string(), json!(false)),
@@ -380,6 +551,7 @@ pub(crate) fn check_auth_health() -> DiagnosticCheck {
         .with_data(Map::from_iter([
             ("api_key_present".to_string(), json!(api_key_present)),
             ("auth_token_present".to_string(), json!(auth_token_present)),
+            ("gateway_token_present".to_string(), json!(gateway_token_present)),
             ("legacy_saved_oauth_present".to_string(), Value::Null),
             ("legacy_saved_oauth_expires_at".to_string(), Value::Null),
             ("legacy_refresh_token_present".to_string(), Value::Null),
@@ -483,31 +655,29 @@ pub(crate) fn check_config_health(
 }
 
 pub(crate) fn check_install_source_health() -> DiagnosticCheck {
+    let npm_install = format!("npm install -g {NPM_PACKAGE}");
+    let pip_install = format!("pip install {PYPI_PACKAGE}");
     DiagnosticCheck::new(
         "Install source",
         DiagnosticLevel::Ok,
         format!(
-            "official source of truth is {OFFICIAL_REPO_SLUG}; avoid `{DEPRECATED_INSTALL_COMMAND}`"
+            "official source is {NEURON_REPO_SLUG}; install with `{npm_install}` or `{pip_install}`"
         ),
     )
     .with_details(vec![
-        format!("Official repo     {OFFICIAL_REPO_URL}"),
-        "Recommended path  build from this repo or use the upstream binary documented in README.md"
-            .to_string(),
-        format!(
-            "Deprecated crate  `{DEPRECATED_INSTALL_COMMAND}` installs a deprecated stub and does not provide the `neuron` binary"
-        )
-            .to_string(),
+        format!("Official repo     {NEURON_REPO_URL}"),
+        format!("npm               {npm_install}"),
+        format!("PyPI              {pip_install}"),
+        format!("Install scripts   install.sh / install.ps1 from {NEURON_REPO_URL}/releases"),
     ])
     .with_data(Map::from_iter([
-        ("official_repo".to_string(), json!(OFFICIAL_REPO_URL)),
-        (
-            "deprecated_install".to_string(),
-            json!(DEPRECATED_INSTALL_COMMAND),
-        ),
+        ("official_repo".to_string(), json!(NEURON_REPO_URL)),
+        ("repository".to_string(), json!(NEURON_REPO_URL)),
+        ("npm_package".to_string(), json!(NPM_PACKAGE)),
+        ("pypi_package".to_string(), json!(PYPI_PACKAGE)),
         (
             "recommended_install".to_string(),
-            json!("build from source or follow the upstream binary instructions in README.md"),
+            json!(format!("{npm_install} or {pip_install}")),
         ),
     ]))
 }
@@ -546,7 +716,7 @@ pub(crate) fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck
         format!("Git state        {}", context.git_summary.headline()),
         format!("Changed files    {}", context.git_summary.changed_files),
         format!(
-            "Memory files     {} Â· config files loaded {}/{}",
+            "Memory files     {} · config files loaded {}/{}",
             context.memory_file_count, context.loaded_config_files, context.discovered_config_files
         ),
     ])
@@ -677,4 +847,89 @@ pub(crate) fn check_system_health(
         ("git_sha".to_string(), json!(GIT_SHA)),
         ("default_model".to_string(), json!(default_model)),
     ]))
+}
+
+#[cfg(test)]
+mod gateway_doctor_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_gateway_session_downgrades_auth_and_says_how_to_fix_it() {
+        let healthy = DiagnosticCheck::new(
+            "Auth",
+            DiagnosticLevel::Ok,
+            "supported auth credentials are configured",
+        );
+        let check = with_gateway_session(
+            healthy,
+            &GatewaySessionCheck::Invalid,
+            Some("stored login, OS keychain"),
+        );
+        assert_eq!(check.level, DiagnosticLevel::Warn);
+        assert_eq!(check.summary, api::INVALID_SESSION_MESSAGE);
+        assert_eq!(check.data["gateway_session"], json!("invalid"));
+        assert!(check
+            .details
+            .last()
+            .unwrap()
+            .contains("stored login, OS keychain"));
+    }
+
+    #[test]
+    fn valid_gateway_session_reports_plan_and_expiry() {
+        let info = crate::auth::SessionInfo {
+            plan: Some("pro".to_string()),
+            expires_at: Some(1_792_195_200),
+            email: None,
+        };
+        let check = with_gateway_session(
+            DiagnosticCheck::new("Auth", DiagnosticLevel::Ok, "ok"),
+            &GatewaySessionCheck::Valid(info),
+            Some("NEURON_TOKEN"),
+        );
+        assert_eq!(check.level, DiagnosticLevel::Ok);
+        let detail = check.details.last().unwrap();
+        assert!(
+            detail.contains("session valid (NEURON_TOKEN), plan pro, expires 2026-10-17 00:00 UTC"),
+            "{detail}"
+        );
+        assert_eq!(check.data["gateway_plan"], json!("pro"));
+    }
+
+    #[test]
+    fn server_check_needs_a_terminal_or_an_explicit_opt_in() {
+        assert_eq!(online_check_policy(false, false, true), Ok(()));
+        assert_eq!(online_check_policy(false, true, false), Ok(()));
+        assert!(online_check_policy(false, false, false)
+            .unwrap_err()
+            .contains("NEURON_DOCTOR_ONLINE=1"));
+        assert_eq!(
+            online_check_policy(true, true, true),
+            Err("NEURON_DOCTOR_OFFLINE is set"),
+            "offline always wins"
+        );
+
+        let check = with_gateway_session(
+            DiagnosticCheck::new("Auth", DiagnosticLevel::Ok, "ok"),
+            &GatewaySessionCheck::NotChecked("non-interactive run"),
+            Some("stored login, credentials file"),
+        );
+        assert_eq!(check.level, DiagnosticLevel::Ok);
+        assert_eq!(check.data["gateway_session"], json!("not_checked"));
+        assert!(check.details.last().unwrap().contains(
+            "signed in (stored login, credentials file); not verified with the server (non-interactive run)"
+        ));
+    }
+
+    #[test]
+    fn install_source_points_at_neuron_v2_and_package_managers() {
+        let check = check_install_source_health();
+        assert!(check.summary.contains("RAHUL-DevelopeRR/neuron-v2"));
+        assert!(check.summary.contains("npm install -g @zero-x.live/neuron"));
+        assert!(check.summary.contains("pip install neuroncli"));
+        assert!(check.details[0].contains(NEURON_REPO_URL));
+        assert_eq!(check.data["repository"], json!(NEURON_REPO_URL));
+        assert_eq!(check.data["npm_package"], json!("@zero-x.live/neuron"));
+        assert_eq!(check.data["pypi_package"], json!("neuroncli"));
+    }
 }

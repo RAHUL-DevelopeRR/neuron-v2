@@ -1,0 +1,10 @@
+# Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+# See ui/neuron-tui/PORTING.md.
+[install]
+exact = true
+
+[test]
+# bun reads bunfig.toml from the CWD only, so run `bun test` from this folder.
+# *.integration.test.* is filtered by the `test:files` script: bun 1.3.14
+# ignores [test].exclude.
+preload = ["./test/setup-env.ts"]

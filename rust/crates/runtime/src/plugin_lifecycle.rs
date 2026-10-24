@@ -465,7 +465,7 @@ mod tests {
                     healthy_servers,
                     vec!["alpha".to_string(), "beta".to_string()]
                 );
-                assert!(failed_servers.is_empty());
+                assert_eq!(failed_servers.len(), 0);
             }
             other => panic!("expected degraded state, got {other:?}"),
         }

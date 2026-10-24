@@ -5,7 +5,7 @@ use std::process::Command;
 
 use serde_json::json;
 
-use crate::{PluginError, PluginHooks, PluginRegistry};
+use crate::{subprocess, PluginError, PluginHooks, PluginRegistry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookEvent {
@@ -185,9 +185,6 @@ impl HookRunner {
         payload: &str,
     ) -> HookCommandOutcome {
         let mut child = shell_command(command);
-        child.stdin(std::process::Stdio::piped());
-        child.stdout(std::process::Stdio::piped());
-        child.stderr(std::process::Stdio::piped());
         child.env("HOOK_EVENT", event.as_str());
         child.env("HOOK_TOOL_NAME", tool_name);
         child.env("HOOK_TOOL_INPUT", tool_input);
@@ -197,11 +194,18 @@ impl HookRunner {
         }
 
         match child.output_with_stdin(payload.as_bytes()) {
+            Ok(output) if output.timed_out() => HookCommandOutcome::Failed {
+                message: format!(
+                    "{} hook `{command}` timed out after {} ms while handling `{tool_name}` and was terminated",
+                    event.as_str(),
+                    subprocess::DEFAULT_HOOK_TIMEOUT.as_millis()
+                ),
+            },
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
                 let message = (!stdout.is_empty()).then_some(stdout);
-                match output.status.code() {
+                match output.exit_code() {
                     Some(0) => HookCommandOutcome::Allow { message },
                     Some(2) => HookCommandOutcome::Deny { message },
                     Some(code) => HookCommandOutcome::Failed {
@@ -281,13 +285,18 @@ fn format_hook_warning(command: &str, code: i32, stdout: Option<&str>, stderr: &
 
 fn shell_command(command: &str) -> CommandWithStdin {
     #[cfg(windows)]
-    let command_builder = if command.ends_with(".sh") {
-        let mut command_builder = Command::new("sh");
-        command_builder.arg(command);
-        CommandWithStdin::new(command_builder)
-    } else {
-        let mut command_builder = Command::new("cmd");
-        command_builder.arg("/C").arg(command);
+    let command_builder = {
+        use std::os::windows::process::CommandExt;
+
+        let mut command_builder = if command.ends_with(".sh") {
+            let mut command_builder = Command::new("sh");
+            command_builder.arg(command);
+            command_builder
+        } else {
+            subprocess::windows_cmd_command(command)
+        };
+        // Not in the user's console, whose title `cmd.exe` would change.
+        command_builder.creation_flags(subprocess::CREATE_NO_WINDOW);
         CommandWithStdin::new(command_builder)
     };
 
@@ -310,23 +319,9 @@ struct CommandWithStdin {
 }
 
 impl CommandWithStdin {
-    fn new(command: Command) -> Self {
+    fn new(mut command: Command) -> Self {
+        subprocess::scrub_credential_env(&mut command);
         Self { command }
-    }
-
-    fn stdin(&mut self, cfg: std::process::Stdio) -> &mut Self {
-        self.command.stdin(cfg);
-        self
-    }
-
-    fn stdout(&mut self, cfg: std::process::Stdio) -> &mut Self {
-        self.command.stdout(cfg);
-        self
-    }
-
-    fn stderr(&mut self, cfg: std::process::Stdio) -> &mut Self {
-        self.command.stderr(cfg);
-        self
     }
 
     fn env<K, V>(&mut self, key: K, value: V) -> &mut Self
@@ -338,34 +333,21 @@ impl CommandWithStdin {
         self
     }
 
-    fn output_with_stdin(&mut self, stdin: &[u8]) -> std::io::Result<std::process::Output> {
-        let mut child = self.command.spawn()?;
-        if let Some(mut child_stdin) = child.stdin.take() {
-            use std::io::Write as _;
-            // Tolerate BrokenPipe: a hook script that runs to completion
-            // (or exits early without reading stdin) closes its stdin
-            // before the parent finishes writing the JSON payload, and
-            // the kernel raises EPIPE on the parent's write_all. That is
-            // not a hook failure — the child still exited cleanly and we
-            // still need to wait_with_output() to capture stdout/stderr
-            // and the real exit code. Other write errors (e.g. EIO,
-            // permission, OOM) still propagate.
-            //
-            // This was the root cause of the Linux CI flake on
-            // hooks::tests::collects_and_runs_hooks_from_enabled_plugins
-            // (ROADMAP #25, runs 24120271422 / 24120538408 / 24121392171
-            // / 24121776826): the test hook scripts run in microseconds
-            // and the parent's stdin write races against child exit.
-            // macOS pipes happen to buffer the small payload before the
-            // child exits; Linux pipes do not, so the race shows up
-            // deterministically on ubuntu runners.
-            match child_stdin.write_all(stdin) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
-                Err(error) => return Err(error),
-            }
-        }
-        child.wait_with_output()
+    /// Runs the hook with `stdin` as its payload, draining stdout/stderr
+    /// concurrently and killing the process tree after the hook timeout.
+    ///
+    /// The payload is written from a helper thread that tolerates
+    /// `BrokenPipe`: a hook script that exits without reading stdin is not a
+    /// failure (ROADMAP #25: the Linux CI flake on
+    /// `collects_and_runs_hooks_from_enabled_plugins` was the parent's
+    /// `write_all` racing the child's exit).
+    fn output_with_stdin(&mut self, stdin: &[u8]) -> std::io::Result<subprocess::BoundedOutput> {
+        subprocess::run_bounded(
+            &mut self.command,
+            Some(stdin),
+            Some(subprocess::DEFAULT_HOOK_TIMEOUT),
+            &|| false,
+        )
     }
 }
 
@@ -522,11 +504,18 @@ mod tests {
     #[test]
     fn propagates_plugin_hook_failures() {
         // given
+        #[cfg(windows)]
+        let (failure_hook, later_hook) = (
+            "echo broken plugin hook & exit /b 1",
+            "echo later plugin hook",
+        );
+        #[cfg(not(windows))]
+        let (failure_hook, later_hook) = (
+            "printf 'broken plugin hook'; exit 1",
+            "printf 'later plugin hook'",
+        );
         let runner = HookRunner::new(crate::PluginHooks {
-            pre_tool_use: vec![
-                "printf 'broken plugin hook'; exit 1".to_string(),
-                "printf 'later plugin hook'".to_string(),
-            ],
+            pre_tool_use: vec![failure_hook.to_string(), later_hook.to_string()],
             post_tool_use: Vec::new(),
             post_tool_use_failure: Vec::new(),
         });
@@ -544,6 +533,36 @@ mod tests {
             .messages()
             .iter()
             .any(|message| message == "later plugin hook"));
+    }
+
+    #[test]
+    fn plugin_hooks_do_not_inherit_zero_x_credentials() {
+        let _guard = crate::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("NEURON_SESSION_TOKEN", "ses_plugin_hook_session");
+        std::env::set_var("PLUGINS_HOOK_SCRUB_KEY", "nzx_plugin_hook_key");
+        std::env::set_var("PLUGINS_HOOK_SCRUB_KEEP", "keep-me");
+        #[cfg(windows)]
+        let hook = "echo session=%NEURON_SESSION_TOKEN% key=%PLUGINS_HOOK_SCRUB_KEY% keep=%PLUGINS_HOOK_SCRUB_KEEP%";
+        #[cfg(not(windows))]
+        let hook = "printf 'session=%s key=%s keep=%s' \"${NEURON_SESSION_TOKEN:-unset}\" \"${PLUGINS_HOOK_SCRUB_KEY:-unset}\" \"$PLUGINS_HOOK_SCRUB_KEEP\"";
+        let runner = HookRunner::new(crate::PluginHooks {
+            pre_tool_use: vec![hook.to_string()],
+            post_tool_use: Vec::new(),
+            post_tool_use_failure: Vec::new(),
+        });
+
+        let result = runner.run_pre_tool_use("Bash", r#"{"command":"pwd"}"#);
+        std::env::remove_var("NEURON_SESSION_TOKEN");
+        std::env::remove_var("PLUGINS_HOOK_SCRUB_KEY");
+        std::env::remove_var("PLUGINS_HOOK_SCRUB_KEEP");
+
+        let output = result.messages().join("\n");
+        assert!(!result.is_failed(), "{output}");
+        assert!(!output.contains("ses_plugin_hook_session"), "{output}");
+        assert!(!output.contains("nzx_plugin_hook_key"), "{output}");
+        assert!(output.contains("keep=keep-me"), "{output}");
     }
 
     #[test]

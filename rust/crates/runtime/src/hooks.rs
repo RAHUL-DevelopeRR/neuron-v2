@@ -1,3 +1,6 @@
+// Output to the user goes through crate::ui_hooks, so a full-screen UI can own the terminal.
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+
 use std::ffi::OsStr;
 use std::fmt::Write as FmtWrite;
 use std::io::Write;
@@ -342,7 +345,11 @@ impl HookRunner {
         let payload = hook_payload(event, tool_name, tool_input, tool_output, is_error).to_string();
         let mut result = HookRunResult::allow(Vec::new());
 
-        for command in commands {
+        for (index, command) in commands.iter().enumerate() {
+            // Hook messages reach the model, so hooks are named by event and
+            // position; their commands (which can embed tokens) and stderr
+            // stay on the user's terminal.
+            let label = format!("{} hook #{}", event.as_str(), index + 1);
             if let Some(reporter) = reporter.as_deref_mut() {
                 reporter.on_event(&HookProgressEvent::Started {
                     event,
@@ -353,6 +360,7 @@ impl HookRunner {
 
             match Self::run_command(
                 command,
+                &label,
                 event,
                 tool_name,
                 tool_input,
@@ -416,6 +424,7 @@ impl HookRunner {
     #[allow(clippy::too_many_arguments)]
     fn run_command(
         command: &str,
+        label: &str,
         event: HookEvent,
         tool_name: &str,
         tool_input: &str,
@@ -440,7 +449,16 @@ impl HookRunner {
             Ok(CommandExecution::Finished(output)) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                let parsed = parse_hook_output(event, tool_name, command, &stdout, &stderr);
+                let parsed = parse_hook_output(event, tool_name, label, &stdout);
+                // A failing exit is reported below, with the same details.
+                if parsed.invalid_output && matches!(output.status.code(), Some(0 | 2)) {
+                    report_hook_locally(
+                        label,
+                        command,
+                        "printed output that is not valid hook JSON",
+                        &stderr,
+                    );
+                }
                 let primary_message = parsed.primary_message().map(ToOwned::to_owned);
                 match output.status.code() {
                     Some(0) => {
@@ -456,39 +474,45 @@ impl HookRunner {
                             event.as_str()
                         )),
                     },
-                    Some(code) => HookCommandOutcome::Failed {
-                        parsed: parsed.with_fallback_message(format_hook_failure(
+                    Some(code) => {
+                        report_hook_locally(
+                            label,
                             command,
-                            code,
-                            primary_message.as_deref(),
-                            stderr.as_str(),
-                        )),
-                    },
-                    None => HookCommandOutcome::Failed {
-                        parsed: parsed.with_fallback_message(format!(
-                            "{} hook `{command}` terminated by signal while handling `{}`",
-                            event.as_str(),
-                            tool_name
-                        )),
-                    },
+                            &format!("exited with status {code}"),
+                            &stderr,
+                        );
+                        HookCommandOutcome::Failed {
+                            parsed: parsed.with_fallback_message(format_hook_failure(
+                                label,
+                                code,
+                                primary_message.as_deref(),
+                            )),
+                        }
+                    }
+                    None => {
+                        report_hook_locally(label, command, "was terminated by a signal", &stderr);
+                        HookCommandOutcome::Failed {
+                            parsed: parsed.with_fallback_message(format!(
+                                "{label} terminated by signal while handling `{tool_name}`"
+                            )),
+                        }
+                    }
                 }
             }
             Ok(CommandExecution::Cancelled) => HookCommandOutcome::Cancelled {
-                message: format!(
-                    "{} hook `{command}` cancelled while handling `{tool_name}`",
-                    event.as_str()
-                ),
+                message: format!("{label} cancelled while handling `{tool_name}`"),
             },
-            Err(error) => HookCommandOutcome::Failed {
-                parsed: ParsedHookOutput {
-                    messages: vec![format!(
-                        "{} hook `{command}` failed to start for `{}`: {error}",
-                        event.as_str(),
-                        tool_name
-                    )],
-                    ..ParsedHookOutput::default()
-                },
-            },
+            Err(error) => {
+                report_hook_locally(label, command, &format!("failed to start: {error}"), "");
+                HookCommandOutcome::Failed {
+                    parsed: ParsedHookOutput {
+                        messages: vec![format!(
+                            "{label} failed to start for `{tool_name}`: {error}"
+                        )],
+                        ..ParsedHookOutput::default()
+                    },
+                }
+            }
         }
     }
 }
@@ -503,6 +527,8 @@ enum HookCommandOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct ParsedHookOutput {
     messages: Vec<String>,
+    /// Stdout looked like JSON but did not parse as a hook response.
+    invalid_output: bool,
     deny: bool,
     permission_override: Option<PermissionOverride>,
     permission_reason: Option<String>,
@@ -538,9 +564,8 @@ fn merge_parsed_hook_output(target: &mut HookRunResult, parsed: ParsedHookOutput
 fn parse_hook_output(
     event: HookEvent,
     tool_name: &str,
-    command: &str,
+    label: &str,
     stdout: &str,
-    stderr: &str,
 ) -> ParsedHookOutput {
     if stdout.is_empty() {
         return ParsedHookOutput::default();
@@ -553,14 +578,14 @@ fn parse_hook_output(
                 messages: vec![format_invalid_hook_output(
                     event,
                     tool_name,
-                    command,
+                    label,
                     &format!(
                         "expected top-level JSON object, got {}",
                         json_type_name(&value)
                     ),
                     stdout,
-                    stderr,
                 )],
+                invalid_output: true,
                 ..ParsedHookOutput::default()
             };
         }
@@ -569,11 +594,11 @@ fn parse_hook_output(
                 messages: vec![format_invalid_hook_output(
                     event,
                     tool_name,
-                    command,
+                    label,
                     &error.to_string(),
                     stdout,
-                    stderr,
                 )],
+                invalid_output: true,
                 ..ParsedHookOutput::default()
             };
         }
@@ -663,24 +688,31 @@ fn parse_tool_input(tool_input: &str) -> Value {
 fn format_invalid_hook_output(
     event: HookEvent,
     tool_name: &str,
-    command: &str,
+    label: &str,
     detail: &str,
     stdout: &str,
-    stderr: &str,
 ) -> String {
     let stdout_preview = bounded_hook_preview(stdout).unwrap_or_else(|| "<empty>".to_string());
-    let stderr_preview = bounded_hook_preview(stderr).unwrap_or_else(|| "<empty>".to_string());
-    let command_preview = bounded_hook_preview(command).unwrap_or_else(|| "<empty>".to_string());
 
     format!(
-        "hook_invalid_json: phase={} tool={} command={} detail={} stdout_preview={} stderr_preview={}",
+        "hook_invalid_json: phase={} tool={} hook={label} detail={} stdout_preview={}",
         event.as_str(),
         tool_name,
-        command_preview,
         detail,
         stdout_preview,
-        stderr_preview
     )
+}
+
+/// Tells the user, not the model, which hook command misbehaved and what it
+/// wrote to stderr.
+fn report_hook_locally(label: &str, command: &str, problem: &str, stderr: &str) {
+    let command = bounded_hook_preview(command).unwrap_or_else(|| "<empty>".to_string());
+    match bounded_hook_preview(stderr) {
+        Some(stderr) => crate::ui_hooks::notice(&format!(
+            "warning: {label} `{command}` {problem}; stderr: {stderr}"
+        )),
+        None => crate::ui_hooks::notice(&format!("warning: {label} `{command}` {problem}")),
+    }
 }
 
 fn bounded_hook_preview(value: &str) -> Option<String> {
@@ -723,14 +755,11 @@ fn looks_like_json_attempt(value: &str) -> bool {
     matches!(value.trim_start().chars().next(), Some('{' | '['))
 }
 
-fn format_hook_failure(command: &str, code: i32, stdout: Option<&str>, stderr: &str) -> String {
-    let mut message = format!("Hook `{command}` exited with status {code}");
+fn format_hook_failure(label: &str, code: i32, stdout: Option<&str>) -> String {
+    let mut message = format!("{label} exited with status {code}");
     if let Some(stdout) = stdout.filter(|stdout| !stdout.is_empty()) {
         message.push_str(": ");
         message.push_str(stdout);
-    } else if !stderr.is_empty() {
-        message.push_str(": ");
-        message.push_str(stderr);
     }
     message
 }
@@ -738,8 +767,15 @@ fn format_hook_failure(command: &str, code: i32, stdout: Option<&str>, stderr: &
 fn shell_command(command: &str) -> CommandWithStdin {
     #[cfg(windows)]
     let command_builder = {
-        let mut command_builder = Command::new("cmd");
-        command_builder.arg("/C").arg(command);
+        use std::os::windows::process::CommandExt;
+
+        // `cmd /d /s /c "<command>"` with the command line as written: Rust's own
+        // quoting escapes inner quotes as `\"`, which cmd.exe does not understand, so a
+        // command with a quoted path always failed (and a failing PreToolUse hook
+        // denies every tool call).
+        let mut command_builder = plugins::subprocess::windows_cmd_command(command);
+        // Not in the user's console, whose title `cmd.exe` would change.
+        command_builder.creation_flags(plugins::subprocess::CREATE_NO_WINDOW);
         CommandWithStdin::new(command_builder)
     };
 
@@ -869,12 +905,13 @@ mod tests {
 
     #[test]
     fn propagates_other_non_zero_statuses_as_failures() {
+        let failure_hook = if cfg!(windows) {
+            "echo warning hook & exit /b 1"
+        } else {
+            "printf 'warning hook'; exit 1"
+        };
         let runner = HookRunner::from_feature_config(&RuntimeFeatureConfig::default().with_hooks(
-            RuntimeHookConfig::new(
-                vec![shell_snippet("printf 'warning hook'; exit 1")],
-                Vec::new(),
-                Vec::new(),
-            ),
+            RuntimeHookConfig::new(vec![shell_snippet(failure_hook)], Vec::new(), Vec::new()),
         ));
 
         // given
@@ -933,13 +970,21 @@ mod tests {
     #[test]
     fn stops_running_failure_hooks_after_failure() {
         // given
+        let (broken_hook, later_hook) = if cfg!(windows) {
+            (
+                "echo broken failure hook & exit /b 1",
+                "echo later failure hook",
+            )
+        } else {
+            (
+                "printf 'broken failure hook'; exit 1",
+                "printf 'later failure hook'",
+            )
+        };
         let runner = HookRunner::new(RuntimeHookConfig::new(
             Vec::new(),
             Vec::new(),
-            vec![
-                shell_snippet("printf 'broken failure hook'; exit 1"),
-                shell_snippet("printf 'later failure hook'"),
-            ],
+            vec![shell_snippet(broken_hook), shell_snippet(later_hook)],
         ));
 
         // when
@@ -1023,11 +1068,13 @@ mod tests {
     #[test]
     fn stops_running_hooks_after_failure() {
         // given
+        let (broken_hook, later_hook) = if cfg!(windows) {
+            ("echo broken & exit /b 1", "echo later")
+        } else {
+            ("printf 'broken'; exit 1", "printf 'later'")
+        };
         let runner = HookRunner::new(RuntimeHookConfig::new(
-            vec![
-                shell_snippet("printf 'broken'; exit 1"),
-                shell_snippet("printf 'later'"),
-            ],
+            vec![shell_snippet(broken_hook), shell_snippet(later_hook)],
             Vec::new(),
             Vec::new(),
         ));
@@ -1062,12 +1109,42 @@ mod tests {
         assert!(rendered.contains("hook_invalid_json:"));
         assert!(rendered.contains("phase=PreToolUse"));
         assert!(rendered.contains("tool=Edit"));
-        assert!(rendered.contains("command=printf '{not-json"));
-        assert!(rendered.contains("printf 'stderr warning' >&2; exit 1"));
+        assert!(rendered.contains("hook=PreToolUse hook #1"));
         assert!(rendered.contains("detail=key must be a string"));
         assert!(rendered.contains("stdout_preview={not-json"));
-        assert!(rendered.contains("second line stderr_preview=stderr warning"));
-        assert!(rendered.contains("stderr_preview=stderr warning"));
+        assert!(!rendered.contains("printf"), "{rendered}");
+        assert!(!rendered.contains("stderr warning"), "{rendered}");
+    }
+
+    #[test]
+    fn hook_results_name_hooks_without_their_commands_or_stderr() {
+        let (quiet, noisy) = if cfg!(windows) {
+            (
+                "exit /b 0 & rem Bearer secret-hook-token-1",
+                "echo leaked-stderr-tok 1>&2 & exit /b 3 & rem Bearer secret-hook-token-2",
+            )
+        } else {
+            (
+                "exit 0 # Bearer secret-hook-token-1",
+                "echo leaked-stderr-tok >&2; exit 3 # Bearer secret-hook-token-2",
+            )
+        };
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            vec![shell_snippet(quiet), shell_snippet(noisy)],
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        let result = runner.run_pre_tool_use("bash", r#"{"command":"pwd"}"#);
+
+        assert!(result.is_failed());
+        let rendered = result.messages().join("\n");
+        assert!(
+            rendered.contains("PreToolUse hook #2 exited with status 3"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("secret-hook-token"), "{rendered}");
+        assert!(!rendered.contains("leaked-stderr-tok"), "{rendered}");
     }
 
     #[test]
@@ -1109,6 +1186,52 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    /// A hook command that quotes paths with spaces in them, like
+    /// `node "<dir>\hook.mjs" "<dir>\hooks.log"`: Rust's argument quoting turned its
+    /// quotes into `\"`, which cmd.exe does not understand, so it always failed and
+    /// the failing `PreToolUse` hook denied every tool call.
+    #[test]
+    #[cfg(windows)]
+    fn a_hook_command_with_quoted_paths_runs_on_windows() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let dir =
+            std::env::temp_dir().join(format!("neuron hook test {}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("hook dir");
+        let script = dir.join("pre hook.cmd");
+        std::fs::write(&script, "@echo off\r\necho hook saw %~1\r\nexit /b 0\r\n")
+            .expect("hook script");
+        let log = dir.join("hooks log.txt");
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            vec![format!("\"{}\" \"{}\"", script.display(), log.display())],
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        let result = runner.run_pre_tool_use("bash", r#"{"command":"pwd"}"#);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            result,
+            HookRunResult::allow(vec![format!("hook saw {}", log.display())])
+        );
+
+        // A quoted program path, as written in settings.
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            vec![format!(
+                r#""{system_root}\System32\cmd.exe" /d /c echo quoted-exe-ok"#
+            )],
+            Vec::new(),
+            Vec::new(),
+        ));
+        assert_eq!(
+            runner.run_pre_tool_use("bash", r#"{"command":"pwd"}"#),
+            HookRunResult::allow(vec!["quoted-exe-ok".to_string()])
+        );
     }
 
     #[cfg(windows)]

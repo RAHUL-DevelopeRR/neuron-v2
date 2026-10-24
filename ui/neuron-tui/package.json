@@ -1,0 +1,60 @@
+{
+  "name": "neuron-tui",
+  "version": "0.0.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "description": "Neuron's full-screen terminal UI, derived from the Codebuff/Freebuff CLI (Apache-2.0)",
+  "type": "module",
+  "scripts": {
+    "dev": "bun run src/entry.ts",
+    "start": "bun run src/entry.ts",
+    "dev:mock": "bun run scripts/dev-against-mock.ts",
+    "build:binary": "bun run scripts/build-binary.ts",
+    "check:console": "bun run scripts/windows-console-check.ts",
+    "test": "bun run scripts/run-tests.ts",
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "sideEffects": false,
+  "engines": {
+    "bun": "1.3.14"
+  },
+  "packageManager": "bun@1.3.14",
+  "dependencies": {
+    "@opentui/core": "0.3.4",
+    "@opentui/react": "0.3.4",
+    "@tanstack/react-query": "5.104.3",
+    "commander": "14.0.3",
+    "ignore": "5.3.2",
+    "immer": "10.2.0",
+    "jimp": "1.6.1",
+    "lodash": "4.17.23",
+    "open": "10.2.0",
+    "pino": "9.4.0",
+    "react": "19.3.1",
+    "remark-breaks": "4.0.0",
+    "remark-gfm": "4.0.1",
+    "remark-parse": "11.0.0",
+    "string-width": "7.2.0",
+    "ts-pattern": "5.9.2",
+    "unified": "11.0.5",
+    "wsl-utils": "0.1.0",
+    "zod": "4.6.7",
+    "zustand": "5.0.15"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.14",
+    "@types/lodash": "4.17.26",
+    "@types/mdast": "4.0.4",
+    "@types/node": "22.20.5",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@types/react-reconciler": "0.32.3",
+    "react-dom": "19.3.1",
+    "strip-ansi": "7.2.0",
+    "typescript": "5.5.4"
+  },
+  "overrides": {
+    "@types/react": "19.2.14",
+    "signal-exit": "3.0.7"
+  }
+}

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,7 +26,6 @@ fn make_executable(path: &Path) {
 fn make_executable(_path: &Path) {}
 
 #[test]
-#[ignore = "mock CLI subprocess harness is long-running/flaky on Windows; run explicitly for parity checks"]
 #[allow(clippy::too_many_lines)]
 fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios() {
     let manifest_entries = load_scenario_manifest();
@@ -112,12 +111,14 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
             extra_env: None,
             resume_session: None,
         },
+        // Without a terminal nobody is prompted: an allow rule in the settings approves
+        // the escalation, and a piped answer is never read.
         ScenarioCase {
             name: "bash_permission_prompt_approved",
             permission_mode: "workspace-write",
             allowed_tools: Some("bash"),
-            stdin: Some("y\n"),
-            prepare: prepare_noop,
+            stdin: None,
+            prepare: prepare_bash_allow_rule,
             assert: assert_bash_permission_prompt_approved,
             extra_env: None,
             resume_session: None,
@@ -291,6 +292,11 @@ impl HarnessWorkspace {
         fs::create_dir_all(&self.root)?;
         fs::create_dir_all(&self.config_home)?;
         fs::create_dir_all(&self.home)?;
+        // Keep the default MCP servers (spawned through npx) out of the harness.
+        fs::write(
+            self.config_home.join("settings.json"),
+            r#"{"defaultMcpServers":false}"#,
+        )?;
         Ok(())
     }
 }
@@ -298,6 +304,7 @@ impl HarnessWorkspace {
 struct ScenarioRun {
     response: Value,
     stdout: String,
+    stderr: String,
 }
 
 #[derive(Debug, Clone)]
@@ -330,6 +337,7 @@ fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) ->
         .env("ANTHROPIC_BASE_URL", base_url)
         .env("CLAW_CONFIG_HOME", &workspace.config_home)
         .env("HOME", &workspace.home)
+        .env("USERPROFILE", &workspace.home)
         .env("NO_COLOR", "1")
         .env("PATH", "/usr/bin:/bin")
         .args([
@@ -345,6 +353,16 @@ fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) ->
     }
     if let Some((key, value)) = case.extra_env {
         command.env(key, value);
+    }
+    // Windows networking needs SystemRoot even in a cleared environment.
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        command.env("SystemRoot", system_root);
+    }
+    // `/usr/bin:/bin` means nothing on Windows: keep the real PATH so the
+    // bash tool can find a POSIX shell (Git for Windows).
+    #[cfg(windows)]
+    if let Some(path) = std::env::var_os("PATH") {
+        command.env("PATH", path);
     }
     if let Some(session_id) = case.resume_session {
         command.args(["--resume", session_id]);
@@ -371,11 +389,28 @@ fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) ->
         command.output().expect("claw should launch")
     };
 
-    assert_success(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(expected_exit_code(case.name)),
+        "stdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     ScenarioRun {
         response: parse_json_output(&stdout),
         stdout,
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+/// A run whose tool call was denied because nobody could approve it ends with exit
+/// code 2; the others succeed.
+fn expected_exit_code(scenario: &str) -> i32 {
+    if scenario == "bash_permission_prompt_denied" {
+        2
+    } else {
+        0
     }
 }
 
@@ -402,6 +437,15 @@ fn prepare_auto_compact_fixture(workspace: &HarnessWorkspace) {
 }
 
 fn prepare_noop(_: &HarnessWorkspace) {}
+
+/// Approves bash in the user settings, the way a run without a terminal allows it.
+fn prepare_bash_allow_rule(workspace: &HarnessWorkspace) {
+    fs::write(
+        workspace.config_home.join("settings.json"),
+        r#"{"defaultMcpServers":false,"permissions":{"allow":["bash"]}}"#,
+    )
+    .expect("settings should write");
+}
 
 fn prepare_read_fixture(workspace: &HarnessWorkspace) {
     fs::write(workspace.root.join("fixture.txt"), "alpha parity line\n")
@@ -471,6 +515,7 @@ fn prepare_plugin_fixture(workspace: &HarnessWorkspace) {
     fs::write(
         workspace.config_home.join("settings.json"),
         json!({
+            "defaultMcpServers": false,
             "enabledPlugins": {
                 "parity-plugin@external": true
             },
@@ -510,7 +555,11 @@ fn assert_read_file_roundtrip(workspace: &HarnessWorkspace, run: &ScenarioRun) {
     let output = run.response["tool_results"][0]["output"]
         .as_str()
         .expect("tool output");
-    assert!(output.contains(&workspace.root.join("fixture.txt").display().to_string()));
+    assert!(
+        reported_file_path(output)
+            .is_some_and(|path| same_path(&path, &workspace.root.join("fixture.txt"))),
+        "{output}"
+    );
     assert!(output.contains("alpha parity line"));
 }
 
@@ -542,9 +591,11 @@ fn assert_write_file_allowed(workspace: &HarnessWorkspace, run: &ScenarioRun) {
         run.response["tool_uses"][0]["name"],
         Value::String("write_file".to_string())
     );
+    // The reported path uses the platform's separator.
     assert!(run.response["message"]
         .as_str()
         .expect("message text")
+        .replace('\\', "/")
         .contains("generated/output.txt"));
     let generated = workspace.root.join("generated").join("output.txt");
     let contents = fs::read_to_string(&generated).expect("generated file should exist");
@@ -633,9 +684,12 @@ fn assert_bash_stdout_roundtrip(_: &HarnessWorkspace, run: &ScenarioRun) {
         .contains("alpha from bash"));
 }
 
-fn assert_bash_permission_prompt_approved(_: &HarnessWorkspace, run: &ScenarioRun) {
-    assert!(run.stdout.contains("Permission approval required"));
-    assert!(run.stdout.contains("Approve this tool call? [y/N]:"));
+fn assert_bash_permission_prompt_approved(workspace: &HarnessWorkspace, run: &ScenarioRun) {
+    assert!(
+        !run.stdout.contains("Approve this tool call?"),
+        "{}",
+        run.stdout
+    );
     assert_eq!(run.response["iterations"], Value::from(2));
     assert_eq!(
         run.response["tool_results"][0]["is_error"],
@@ -653,16 +707,31 @@ fn assert_bash_permission_prompt_approved(_: &HarnessWorkspace, run: &ScenarioRu
         .as_str()
         .expect("message text")
         .contains("approved and executed"));
+    assert!(workspace.root.join("approved.txt").is_file());
 }
 
-fn assert_bash_permission_prompt_denied(_: &HarnessWorkspace, run: &ScenarioRun) {
-    assert!(run.stdout.contains("Permission approval required"));
-    assert!(run.stdout.contains("Approve this tool call? [y/N]:"));
+fn assert_bash_permission_prompt_denied(workspace: &HarnessWorkspace, run: &ScenarioRun) {
+    // stdin is a pipe: no prompt, and the piped "n" is not read as an answer.
+    assert!(
+        !run.stdout.contains("Approve this tool call?"),
+        "{}",
+        run.stdout
+    );
     assert_eq!(run.response["iterations"], Value::from(2));
     let tool_output = run.response["tool_results"][0]["output"]
         .as_str()
         .expect("tool output");
-    assert!(tool_output.contains("denied by user approval prompt"));
+    assert!(
+        tool_output
+            .contains("non-interactive run: re-run with --permission-mode danger-full-access"),
+        "{tool_output}"
+    );
+    // The user is told too, and the run's last line on stderr names the tool.
+    assert!(
+        run.stderr.contains(r#""denied_tools":["bash"]"#),
+        "{}",
+        run.stderr
+    );
     assert_eq!(
         run.response["tool_results"][0]["is_error"],
         Value::Bool(true)
@@ -671,6 +740,7 @@ fn assert_bash_permission_prompt_denied(_: &HarnessWorkspace, run: &ScenarioRun)
         .as_str()
         .expect("message text")
         .contains("denied as expected"));
+    assert!(!workspace.root.join("denied.txt").exists());
 }
 
 fn assert_plugin_tool_roundtrip(_: &HarnessWorkspace, run: &ScenarioRun) {
@@ -871,15 +941,6 @@ fn scenario_report_json(report: &ScenarioReport) -> Value {
     })
 }
 
-fn assert_success(output: &Output) {
-    assert!(
-        output.status.success(),
-        "stdout:\n{}\n\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
 fn unique_temp_dir(label: &str) -> PathBuf {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -890,4 +951,24 @@ fn unique_temp_dir(label: &str) -> PathBuf {
         "claw-mock-parity-{label}-{}-{millis}-{counter}",
         std::process::id()
     ))
+}
+
+/// The `file.filePath` a `read_file` result reports.
+fn reported_file_path(output: &str) -> Option<String> {
+    serde_json::from_str::<Value>(output)
+        .ok()?
+        .pointer("/file/filePath")?
+        .as_str()
+        .map(ToOwned::to_owned)
+}
+
+/// Whether a path a tool reported names `expected`. Tools report canonical
+/// paths, which on Windows carry the `\\?\` verbatim prefix.
+fn same_path(reported: &str, expected: &Path) -> bool {
+    fn plain(path: &Path) -> PathBuf {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let text = canonical.display().to_string();
+        PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text))
+    }
+    plain(Path::new(reported)) == plain(expected)
 }

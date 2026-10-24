@@ -1,8 +1,12 @@
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::io;
+use std::io::{self, Write as _};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
+use std::task::Poll;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -11,6 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 
+use crate::cancel::CancellationToken;
 use crate::config::{McpTransport, RuntimeConfig, ScopedMcpServerConfig};
 use crate::mcp::mcp_tool_name;
 use crate::mcp_client::{McpClientBootstrap, McpClientTransport, McpStdioTransport};
@@ -19,14 +24,26 @@ use crate::mcp_lifecycle_hardened::{
 };
 
 #[cfg(test)]
-const MCP_INITIALIZE_TIMEOUT_MS: u64 = 200;
+const MCP_INITIALIZE_TIMEOUT_MS: u64 = 3_000;
 #[cfg(not(test))]
 const MCP_INITIALIZE_TIMEOUT_MS: u64 = 10_000;
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 300;
+#[cfg(all(test, windows))]
+const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 3_000;
 #[cfg(not(test))]
 const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 30_000;
+
+/// `tools/call` timeout used when a server config sets no `toolCallTimeoutMs`.
+pub(crate) const MCP_TOOL_CALL_TIMEOUT_MS: u64 = 120_000;
+/// How long a server whose connection broke during startup gets to finish exiting: one
+/// that exited at once (a broken install, a bad command) is not started again.
+const MCP_EXIT_CHECK_MS: u64 = 250;
+/// Past this size the MCP server log starts afresh (the old one is kept as `.old`).
+const MCP_SERVER_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
+/// How long an interrupted call waits for its server's process tree to stop.
+const ABANDONED_SERVER_STOP_WAIT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
@@ -464,6 +481,9 @@ struct ManagedMcpServer {
     bootstrap: McpClientBootstrap,
     process: Option<McpStdioProcess>,
     initialized: bool,
+    /// The last start failed because the process exited at once: starting it again would
+    /// only fail the same way, so it is not retried.
+    exited_on_start: bool,
 }
 
 impl ManagedMcpServer {
@@ -472,8 +492,319 @@ impl ManagedMcpServer {
             bootstrap,
             process: None,
             initialized: false,
+            exited_on_start: false,
         }
     }
+
+    fn process_exited(&mut self) -> Result<bool, McpServerManagerError> {
+        match self.process.as_mut() {
+            Some(process) => Ok(process.has_exited()?),
+            None => Ok(false),
+        }
+    }
+
+    async fn reset(&mut self) {
+        self.initialized = false;
+        if let Some(mut process) = self.process.take() {
+            let _ = process.shutdown().await;
+        }
+    }
+
+    /// [`Self::reset`] for a server whose call was abandoned: stopping it gets
+    /// [`ABANDONED_SERVER_STOP_WAIT`], then the server process itself is killed and
+    /// nothing waits for it, so an interrupt never waits on a server.
+    async fn abandon(&mut self) {
+        self.initialized = false;
+        let Some(mut process) = self.process.take() else {
+            return;
+        };
+        if timeout(ABANDONED_SERVER_STOP_WAIT, process.shutdown())
+            .await
+            .is_err()
+        {
+            let _ = process.child.start_kill();
+        }
+    }
+
+    /// Lists the server's tools, starting it when needed. A broken connection or a
+    /// timeout is retried once with a fresh process, unless the process exited at once.
+    async fn discover_tools(
+        &mut self,
+        server_name: &str,
+        ids: &AtomicU64,
+    ) -> Result<Vec<ManagedMcpTool>, McpServerManagerError> {
+        let mut attempts = 0;
+
+        loop {
+            match self.discover_tools_once(server_name, ids).await {
+                Ok(tools) => return Ok(tools),
+                Err(error)
+                    if attempts == 0
+                        && McpServerManager::is_retryable_error(&error)
+                        && !self.exited_on_start =>
+                {
+                    self.reset().await;
+                    attempts += 1;
+                }
+                Err(error) => {
+                    if McpServerManager::should_reset_server(&error) {
+                        self.reset().await;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    async fn discover_tools_once(
+        &mut self,
+        server_name: &str,
+        ids: &AtomicU64,
+    ) -> Result<Vec<ManagedMcpTool>, McpServerManagerError> {
+        self.ensure_ready(server_name, ids).await?;
+
+        let mut discovered_tools = Vec::new();
+        let mut cursor = None;
+        loop {
+            let response = {
+                let process = self.process.as_mut().ok_or_else(|| {
+                    McpServerManagerError::InvalidResponse {
+                        server_name: server_name.to_string(),
+                        method: "tools/list",
+                        details: "server process missing after initialization".to_string(),
+                    }
+                })?;
+                McpServerManager::run_process_request(
+                    server_name,
+                    "tools/list",
+                    MCP_LIST_TOOLS_TIMEOUT_MS,
+                    process.list_tools(
+                        next_request_id(ids),
+                        Some(McpListToolsParams {
+                            cursor: cursor.clone(),
+                        }),
+                    ),
+                )
+                .await?
+            };
+
+            if let Some(error) = response.error {
+                return Err(McpServerManagerError::JsonRpc {
+                    server_name: server_name.to_string(),
+                    method: "tools/list",
+                    error,
+                });
+            }
+
+            let result = response
+                .result
+                .ok_or_else(|| McpServerManagerError::InvalidResponse {
+                    server_name: server_name.to_string(),
+                    method: "tools/list",
+                    details: "missing result payload".to_string(),
+                })?;
+
+            for tool in result.tools {
+                let qualified_name = mcp_tool_name(server_name, &tool.name);
+                discovered_tools.push(ManagedMcpTool {
+                    server_name: server_name.to_string(),
+                    qualified_name,
+                    raw_name: tool.name.clone(),
+                    tool,
+                });
+            }
+
+            match result.next_cursor {
+                Some(next_cursor) => cursor = Some(next_cursor),
+                None => break,
+            }
+        }
+
+        Ok(discovered_tools)
+    }
+
+    /// Starts the process if needed and runs the `initialize` handshake once per process.
+    async fn ensure_ready(
+        &mut self,
+        server_name: &str,
+        ids: &AtomicU64,
+    ) -> Result<(), McpServerManagerError> {
+        self.exited_on_start = false;
+        if self.process_exited()? {
+            self.reset().await;
+        }
+
+        let mut attempts = 0;
+        loop {
+            if self.process.is_none() {
+                self.process = Some(spawn_mcp_stdio_process(&self.bootstrap)?);
+                self.initialized = false;
+            }
+            if self.initialized {
+                return Ok(());
+            }
+
+            let response = {
+                let process = self.process.as_mut().ok_or_else(|| {
+                    McpServerManagerError::InvalidResponse {
+                        server_name: server_name.to_string(),
+                        method: "initialize",
+                        details: "server process missing before initialize".to_string(),
+                    }
+                })?;
+                McpServerManager::run_process_request(
+                    server_name,
+                    "initialize",
+                    MCP_INITIALIZE_TIMEOUT_MS,
+                    process.initialize(next_request_id(ids), default_initialize_params()),
+                )
+                .await
+            };
+
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    let error = self.note_exit_on_start(error).await;
+                    if attempts == 0
+                        && McpServerManager::is_retryable_error(&error)
+                        && !self.exited_on_start
+                    {
+                        self.reset().await;
+                        attempts += 1;
+                        continue;
+                    }
+                    if McpServerManager::should_reset_server(&error) {
+                        self.reset().await;
+                    }
+                    return Err(error);
+                }
+            };
+
+            if let Some(error) = response.error {
+                return Err(McpServerManagerError::JsonRpc {
+                    server_name: server_name.to_string(),
+                    method: "initialize",
+                    error,
+                });
+            }
+
+            if response.result.is_none() {
+                let error = McpServerManagerError::InvalidResponse {
+                    server_name: server_name.to_string(),
+                    method: "initialize",
+                    details: "missing result payload".to_string(),
+                };
+                self.reset().await;
+                return Err(error);
+            }
+
+            if let Err(error) = self.send_initialized_notification(server_name).await {
+                self.reset().await;
+                return Err(error);
+            }
+
+            self.initialized = true;
+            return Ok(());
+        }
+    }
+
+    /// A connection that broke during startup: when the process has exited, says so
+    /// (with its exit status) and marks the server not worth starting again right away.
+    async fn note_exit_on_start(&mut self, error: McpServerManagerError) -> McpServerManagerError {
+        let (server_name, method, source) = match error {
+            McpServerManagerError::Transport {
+                server_name,
+                method,
+                source,
+            } => (server_name, method, source),
+            other => return other,
+        };
+        let exited = match self.process.as_mut() {
+            Some(process) => timeout(Duration::from_millis(MCP_EXIT_CHECK_MS), process.wait())
+                .await
+                .ok()
+                .and_then(Result::ok),
+            None => None,
+        };
+        let Some(status) = exited else {
+            return McpServerManagerError::Transport {
+                server_name,
+                method,
+                source,
+            };
+        };
+        self.exited_on_start = true;
+        let log = mcp_server_log()
+            .map(|path| format!("; its output is in {}", path.display()))
+            .unwrap_or_default();
+        McpServerManagerError::Transport {
+            server_name,
+            method,
+            source: io::Error::new(
+                source.kind(),
+                format!("{source} (the server exited: {status}{log})"),
+            ),
+        }
+    }
+
+    async fn send_initialized_notification(
+        &mut self,
+        server_name: &str,
+    ) -> Result<(), McpServerManagerError> {
+        let process =
+            self.process
+                .as_mut()
+                .ok_or_else(|| McpServerManagerError::InvalidResponse {
+                    server_name: server_name.to_string(),
+                    method: "initialize",
+                    details: "server process missing after initialize".to_string(),
+                })?;
+        McpServerManager::run_process_request(
+            server_name,
+            "notifications/initialized",
+            MCP_INITIALIZE_TIMEOUT_MS,
+            process.notify_initialized(),
+        )
+        .await
+    }
+}
+
+fn next_request_id(ids: &AtomicU64) -> JsonRpcId {
+    JsonRpcId::Number(ids.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Polls `futures` together on the current task and returns their outputs in order, so
+/// they can borrow from the caller (each its own server).
+async fn join_all<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
+    let mut futures = futures
+        .into_iter()
+        .map(|future| Some(Box::pin(future)))
+        .collect::<Vec<_>>();
+    let mut outputs = futures
+        .iter()
+        .map(|_| None)
+        .collect::<Vec<Option<F::Output>>>();
+    std::future::poll_fn(|cx| {
+        let mut pending = false;
+        for (slot, output) in futures.iter_mut().zip(outputs.iter_mut()) {
+            if let Some(future) = slot {
+                match future.as_mut().poll(cx) {
+                    Poll::Ready(value) => {
+                        *output = Some(value);
+                        *slot = None;
+                    }
+                    Poll::Pending => pending = true,
+                }
+            }
+        }
+        if pending {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    })
+    .await;
+    outputs.into_iter().flatten().collect()
 }
 
 #[derive(Debug)]
@@ -481,7 +812,7 @@ pub struct McpServerManager {
     servers: BTreeMap<String, ManagedMcpServer>,
     unsupported_servers: Vec<UnsupportedMcpServer>,
     tool_index: BTreeMap<String, ToolRoute>,
-    next_request_id: u64,
+    next_request_id: AtomicU64,
 }
 
 impl McpServerManager {
@@ -515,7 +846,7 @@ impl McpServerManager {
             servers: managed_servers,
             unsupported_servers,
             tool_index: BTreeMap::new(),
-            next_request_id: 1,
+            next_request_id: AtomicU64::new(1),
         }
     }
 
@@ -552,14 +883,27 @@ impl McpServerManager {
         Ok(discovered_tools)
     }
 
+    /// Starts every server and lists its tools, all at once: a slow or broken server does
+    /// not hold up the others. Servers that fail are reported, not fatal.
     pub async fn discover_tools_best_effort(&mut self) -> McpToolDiscoveryReport {
-        let server_names = self.server_names();
+        let ids = &self.next_request_id;
+        let discoveries = self
+            .servers
+            .iter_mut()
+            .map(|(server_name, server)| async move {
+                (
+                    server_name.clone(),
+                    server.discover_tools(server_name, ids).await,
+                )
+            })
+            .collect::<Vec<_>>();
+        let results = join_all(discoveries).await;
         let mut discovered_tools = Vec::new();
         let mut working_servers = Vec::new();
         let mut failed_servers = Vec::new();
 
-        for server_name in server_names {
-            match self.discover_tools_for_server(&server_name).await {
+        for (server_name, result) in results {
+            match result {
                 Ok(server_tools) => {
                     working_servers.push(server_name.clone());
                     self.clear_routes_for_server(&server_name);
@@ -673,6 +1017,37 @@ impl McpServerManager {
         response
     }
 
+    /// [`Self::call_tool`] that gives up when `cancel` fires (the turn was interrupted,
+    /// or the session is closing): `Ok(None)` then. The call's server is stopped, since
+    /// it may still be working on the call and its late reply must not be taken for the
+    /// next call's; the next call starts it again.
+    pub async fn call_tool_unless_cancelled(
+        &mut self,
+        qualified_tool_name: &str,
+        arguments: Option<JsonValue>,
+        cancel: &CancellationToken,
+    ) -> Result<Option<JsonRpcResponse<McpToolCallResult>>, McpServerManagerError> {
+        if cancel.is_cancelled() {
+            return Ok(None);
+        }
+        let finished = tokio::select! {
+            biased;
+            response = self.call_tool(qualified_tool_name, arguments) => Some(response),
+            () = cancel.cancelled() => None,
+        };
+        if let Some(response) = finished {
+            return response.map(Some);
+        }
+        let server_name = self
+            .tool_index
+            .get(qualified_tool_name)
+            .map(|route| route.server_name.clone());
+        if let Some(server_name) = server_name {
+            self.server_mut(&server_name)?.abandon().await;
+        }
+        Ok(None)
+    }
+
     pub async fn list_resources(
         &mut self,
         server_name: &str,
@@ -749,10 +1124,8 @@ impl McpServerManager {
             })
     }
 
-    fn take_request_id(&mut self) -> JsonRpcId {
-        let id = self.next_request_id;
-        self.next_request_id = self.next_request_id.saturating_add(1);
-        JsonRpcId::Number(id)
+    fn take_request_id(&self) -> JsonRpcId {
+        next_request_id(&self.next_request_id)
     }
 
     fn tool_call_timeout_ms(&self, server_name: &str) -> Result<u64, McpServerManagerError> {
@@ -763,7 +1136,9 @@ impl McpServerManager {
                     server_name: server_name.to_string(),
                 })?;
         match &server.bootstrap.transport {
-            McpClientTransport::Stdio(transport) => Ok(transport.resolved_tool_call_timeout_ms()),
+            McpClientTransport::Stdio(transport) => Ok(transport
+                .tool_call_timeout_ms
+                .unwrap_or(MCP_TOOL_CALL_TIMEOUT_MS)),
             other => Err(McpServerManagerError::InvalidResponse {
                 server_name: server_name.to_string(),
                 method: "tools/call",
@@ -772,103 +1147,17 @@ impl McpServerManager {
         }
     }
 
-    fn server_process_exited(&mut self, server_name: &str) -> Result<bool, McpServerManagerError> {
-        let server = self.server_mut(server_name)?;
-        match server.process.as_mut() {
-            Some(process) => Ok(process.has_exited()?),
-            None => Ok(false),
-        }
-    }
-
     async fn discover_tools_for_server(
         &mut self,
         server_name: &str,
     ) -> Result<Vec<ManagedMcpTool>, McpServerManagerError> {
-        let mut attempts = 0;
-
-        loop {
-            match self.discover_tools_for_server_once(server_name).await {
-                Ok(tools) => return Ok(tools),
-                Err(error) if attempts == 0 && Self::is_retryable_error(&error) => {
-                    self.reset_server(server_name).await?;
-                    attempts += 1;
-                }
-                Err(error) => {
-                    if Self::should_reset_server(&error) {
-                        self.reset_server(server_name).await?;
-                    }
-                    return Err(error);
-                }
+        let ids = &self.next_request_id;
+        let server = self.servers.get_mut(server_name).ok_or_else(|| {
+            McpServerManagerError::UnknownServer {
+                server_name: server_name.to_string(),
             }
-        }
-    }
-
-    async fn discover_tools_for_server_once(
-        &mut self,
-        server_name: &str,
-    ) -> Result<Vec<ManagedMcpTool>, McpServerManagerError> {
-        self.ensure_server_ready(server_name).await?;
-
-        let mut discovered_tools = Vec::new();
-        let mut cursor = None;
-        loop {
-            let request_id = self.take_request_id();
-            let response = {
-                let server = self.server_mut(server_name)?;
-                let process = server.process.as_mut().ok_or_else(|| {
-                    McpServerManagerError::InvalidResponse {
-                        server_name: server_name.to_string(),
-                        method: "tools/list",
-                        details: "server process missing after initialization".to_string(),
-                    }
-                })?;
-                Self::run_process_request(
-                    server_name,
-                    "tools/list",
-                    MCP_LIST_TOOLS_TIMEOUT_MS,
-                    process.list_tools(
-                        request_id,
-                        Some(McpListToolsParams {
-                            cursor: cursor.clone(),
-                        }),
-                    ),
-                )
-                .await?
-            };
-
-            if let Some(error) = response.error {
-                return Err(McpServerManagerError::JsonRpc {
-                    server_name: server_name.to_string(),
-                    method: "tools/list",
-                    error,
-                });
-            }
-
-            let result = response
-                .result
-                .ok_or_else(|| McpServerManagerError::InvalidResponse {
-                    server_name: server_name.to_string(),
-                    method: "tools/list",
-                    details: "missing result payload".to_string(),
-                })?;
-
-            for tool in result.tools {
-                let qualified_name = mcp_tool_name(server_name, &tool.name);
-                discovered_tools.push(ManagedMcpTool {
-                    server_name: server_name.to_string(),
-                    qualified_name,
-                    raw_name: tool.name.clone(),
-                    tool,
-                });
-            }
-
-            match result.next_cursor {
-                Some(next_cursor) => cursor = Some(next_cursor),
-                None => break,
-            }
-        }
-
-        Ok(discovered_tools)
+        })?;
+        server.discover_tools(server_name, ids).await
     }
 
     async fn list_resources_once(
@@ -984,16 +1273,7 @@ impl McpServerManager {
     }
 
     async fn reset_server(&mut self, server_name: &str) -> Result<(), McpServerManagerError> {
-        let mut process = {
-            let server = self.server_mut(server_name)?;
-            server.initialized = false;
-            server.process.take()
-        };
-
-        if let Some(process) = process.as_mut() {
-            let _ = process.shutdown().await;
-        }
-
+        self.server_mut(server_name)?.reset().await;
         Ok(())
     }
 
@@ -1048,94 +1328,13 @@ impl McpServerManager {
         &mut self,
         server_name: &str,
     ) -> Result<(), McpServerManagerError> {
-        if self.server_process_exited(server_name)? {
-            self.reset_server(server_name).await?;
-        }
-
-        let mut attempts = 0;
-        loop {
-            let needs_spawn = self
-                .servers
-                .get(server_name)
-                .map(|server| server.process.is_none())
-                .ok_or_else(|| McpServerManagerError::UnknownServer {
-                    server_name: server_name.to_string(),
-                })?;
-
-            if needs_spawn {
-                let server = self.server_mut(server_name)?;
-                server.process = Some(spawn_mcp_stdio_process(&server.bootstrap)?);
-                server.initialized = false;
+        let ids = &self.next_request_id;
+        let server = self.servers.get_mut(server_name).ok_or_else(|| {
+            McpServerManagerError::UnknownServer {
+                server_name: server_name.to_string(),
             }
-
-            let needs_initialize = self
-                .servers
-                .get(server_name)
-                .map(|server| !server.initialized)
-                .ok_or_else(|| McpServerManagerError::UnknownServer {
-                    server_name: server_name.to_string(),
-                })?;
-
-            if !needs_initialize {
-                return Ok(());
-            }
-
-            let request_id = self.take_request_id();
-            let response = {
-                let server = self.server_mut(server_name)?;
-                let process = server.process.as_mut().ok_or_else(|| {
-                    McpServerManagerError::InvalidResponse {
-                        server_name: server_name.to_string(),
-                        method: "initialize",
-                        details: "server process missing before initialize".to_string(),
-                    }
-                })?;
-                Self::run_process_request(
-                    server_name,
-                    "initialize",
-                    MCP_INITIALIZE_TIMEOUT_MS,
-                    process.initialize(request_id, default_initialize_params()),
-                )
-                .await
-            };
-
-            let response = match response {
-                Ok(response) => response,
-                Err(error) if attempts == 0 && Self::is_retryable_error(&error) => {
-                    self.reset_server(server_name).await?;
-                    attempts += 1;
-                    continue;
-                }
-                Err(error) => {
-                    if Self::should_reset_server(&error) {
-                        self.reset_server(server_name).await?;
-                    }
-                    return Err(error);
-                }
-            };
-
-            if let Some(error) = response.error {
-                return Err(McpServerManagerError::JsonRpc {
-                    server_name: server_name.to_string(),
-                    method: "initialize",
-                    error,
-                });
-            }
-
-            if response.result.is_none() {
-                let error = McpServerManagerError::InvalidResponse {
-                    server_name: server_name.to_string(),
-                    method: "initialize",
-                    details: "missing result payload".to_string(),
-                };
-                self.reset_server(server_name).await?;
-                return Err(error);
-            }
-
-            let server = self.server_mut(server_name)?;
-            server.initialized = true;
-            return Ok(());
-        }
+        })?;
+        server.ensure_ready(server_name, ids).await
     }
 }
 
@@ -1144,18 +1343,99 @@ pub struct McpStdioProcess {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    newline_delimited: bool,
+}
+
+/// Where stdio MCP servers write their stderr: `None` (the default) leaves it on the
+/// terminal. See [`set_mcp_server_log`].
+static MCP_SERVER_LOG: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Appends the stderr of MCP servers started from now on to the file at `path`, so their
+/// warnings never print over a prompt or a full-screen UI; `None` puts it back on the
+/// terminal. A log that cannot be opened discards the output instead.
+pub fn set_mcp_server_log(path: Option<PathBuf>) {
+    *MCP_SERVER_LOG
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = path;
+}
+
+fn mcp_server_log() -> Option<PathBuf> {
+    MCP_SERVER_LOG
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
+/// The stderr of a server started with `command`: appended to `log` after a header line
+/// naming the command (not its arguments, which may hold secrets), or the terminal.
+fn server_stderr(log: Option<&Path>, command: &str) -> Stdio {
+    let Some(log) = log else {
+        return Stdio::inherit();
+    };
+    let open = || -> io::Result<std::fs::File> {
+        if let Some(parent) = log.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if std::fs::metadata(log).is_ok_and(|metadata| metadata.len() > MCP_SERVER_LOG_MAX_BYTES) {
+            let _ = std::fs::rename(log, log.with_extension("log.old"));
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)?;
+        let started = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        writeln!(file, "--- {started} (unix time) starting {command} ---")?;
+        Ok(file)
+    };
+    open().map_or_else(|_| Stdio::null(), Stdio::from)
+}
+
+/// Builds the command that starts a stdio MCP server.
+///
+/// Inherited Zero-X credentials never reach MCP servers; variables the user
+/// configured for this server are applied afterwards and win.
+fn stdio_server_command(transport: &McpStdioTransport) -> Command {
+    let mut command = Command::new(&transport.command);
+    command
+        .args(&transport.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(server_stderr(
+            mcp_server_log().as_deref(),
+            &transport.command,
+        ));
+    for key in plugins::subprocess::credential_env_keys() {
+        command.env_remove(key);
+    }
+    apply_env(&mut command, &transport.env);
+    // Not in the user's console: `cmd.exe /c npx …` and npm retitle the console they
+    // run in, which is the terminal of the UI or the REPL.
+    #[cfg(windows)]
+    command.creation_flags(plugins::subprocess::CREATE_NO_WINDOW);
+    command
+}
+
+/// Ends a server and, on Windows, the processes it started. A server launched as
+/// `cmd.exe /c npx …` runs in node grandchildren in their own console, which killing
+/// `cmd.exe` would leave running.
+///
+/// Never waits long: `taskkill` gets [`plugins::subprocess::TREE_KILL_WAIT`] (it hangs
+/// while the WMI service is stuck), and so does the server's own exit.
+async fn kill_server_tree(child: &mut Child) -> io::Result<()> {
+    #[cfg(windows)]
+    if let (Some(pid), Ok(None)) = (child.id(), child.try_wait()) {
+        let _ = tokio::task::spawn_blocking(move || plugins::subprocess::kill_tree_of(pid)).await;
+    }
+    child.start_kill()?;
+    let _ = timeout(plugins::subprocess::TREE_KILL_WAIT, child.wait()).await;
+    Ok(())
 }
 
 impl McpStdioProcess {
     pub fn spawn(transport: &McpStdioTransport) -> io::Result<Self> {
-        let mut command = Command::new(&transport.command);
-        command
-            .args(&transport.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
-        apply_env(&mut command, &transport.env);
-
+        let mut command = stdio_server_command(transport);
         let mut child = command.spawn()?;
         let stdin = child
             .stdin
@@ -1170,6 +1450,10 @@ impl McpStdioProcess {
             child,
             stdin,
             stdout: BufReader::new(stdout),
+            newline_delimited: !transport
+                .env
+                .get("NEURON_MCP_FRAMING")
+                .is_some_and(|framing| framing.eq_ignore_ascii_case("content-length")),
         })
     }
 
@@ -1249,13 +1533,38 @@ impl McpStdioProcess {
     pub async fn write_jsonrpc_message<T: Serialize>(&mut self, message: &T) -> io::Result<()> {
         let body = serde_json::to_vec(message)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        self.write_frame(&body).await
+        if self.newline_delimited {
+            self.write_all(&body).await?;
+            self.write_all(b"\n").await?;
+            self.flush().await
+        } else {
+            self.write_frame(&body).await
+        }
     }
 
     pub async fn read_jsonrpc_message<T: DeserializeOwned>(&mut self) -> io::Result<T> {
-        let payload = self.read_frame().await?;
+        let payload = if self.newline_delimited {
+            let mut line = String::new();
+            if self.stdout.read_line(&mut line).await? == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "MCP stdio stream closed while reading JSON-RPC line",
+                ));
+            }
+            line.into_bytes()
+        } else {
+            self.read_frame().await?
+        };
         serde_json::from_slice(&payload)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
+    pub async fn notify_initialized(&mut self) -> io::Result<()> {
+        self.write_jsonrpc_message(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }))
+        .await
     }
 
     pub async fn send_request<T: Serialize>(
@@ -1344,7 +1653,7 @@ impl McpStdioProcess {
     }
 
     pub async fn terminate(&mut self) -> io::Result<()> {
-        self.child.kill().await
+        kill_server_tree(&mut self.child).await
     }
 
     pub async fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
@@ -1357,13 +1666,16 @@ impl McpStdioProcess {
 
     async fn shutdown(&mut self) -> io::Result<()> {
         if self.child.try_wait()?.is_none() {
-            match self.child.kill().await {
+            match kill_server_tree(&mut self.child).await {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::InvalidInput => {}
                 Err(error) => return Err(error),
             }
         }
-        let _ = self.child.wait().await?;
+        // Bounded: a process that cannot be reaped must not hold up a shutdown.
+        if let Ok(exited) = timeout(plugins::subprocess::TREE_KILL_WAIT, self.child.wait()).await {
+            exited?;
+        }
         Ok(())
     }
 }
@@ -1444,9 +1756,17 @@ mod tests {
 
     fn python_command() -> String {
         if cfg!(windows) {
-            "python".to_string()
+            "py".to_string()
         } else {
             "python3".to_string()
+        }
+    }
+
+    fn python_script_args(path: &Path) -> Vec<String> {
+        if cfg!(windows) {
+            vec!["-3".to_string(), path.to_string_lossy().into_owned()]
+        } else {
+            vec![path.to_string_lossy().into_owned()]
         }
     }
 
@@ -1554,6 +1874,8 @@ mod tests {
             "    if request is None:",
             "        break",
             "    method = request['method']",
+            "    if method == 'notifications/initialized':",
+            "        continue",
             "    if method == 'initialize':",
             "        send_message({",
             "            'jsonrpc': '2.0',",
@@ -1661,6 +1983,7 @@ mod tests {
             "import json, os, sys, time",
             "",
             "LABEL = os.environ.get('MCP_SERVER_LABEL', 'server')",
+            "NEWLINE = os.environ.get('NEURON_MCP_FRAMING', 'jsonl') != 'content-length'",
             "LOG_PATH = os.environ.get('MCP_LOG_PATH')",
             "EXIT_AFTER_TOOLS_LIST = os.environ.get('MCP_EXIT_AFTER_TOOLS_LIST') == '1'",
             "FAIL_ONCE_MODE = os.environ.get('MCP_FAIL_ONCE_MODE')",
@@ -1682,6 +2005,9 @@ mod tests {
             "    return True",
             "",
             "def read_message():",
+            "    if NEWLINE:",
+            "        line = sys.stdin.readline()",
+            "        return json.loads(line) if line else None",
             "    header = b''",
             r"    while not header.endswith(b'\r\n\r\n'):",
             "        chunk = sys.stdin.buffer.read(1)",
@@ -1696,6 +2022,10 @@ mod tests {
             "    return json.loads(payload.decode())",
             "",
             "def send_message(message):",
+            "    if NEWLINE:",
+            "        sys.stdout.write(json.dumps(message) + '\\n')",
+            "        sys.stdout.flush()",
+            "        return",
             "    payload = json.dumps(message).encode()",
             r"    sys.stdout.buffer.write(f'Content-Length: {len(payload)}\r\n\r\n'.encode() + payload)",
             "    sys.stdout.buffer.flush()",
@@ -1705,6 +2035,10 @@ mod tests {
             "    if request is None:",
             "        break",
             "    method = request['method']",
+            "    if method == 'notifications/initialized':",
+            "        if NEWLINE:",
+            "            log(method)",
+            "        continue",
             "    log(method)",
             "    if method == 'initialize':",
             "        if FAIL_ONCE_MODE == 'initialize_hang' and should_fail_once():",
@@ -1793,11 +2127,16 @@ mod tests {
 
     fn script_transport_with_env(
         script_path: &Path,
-        env: BTreeMap<String, String>,
+        extra_env: BTreeMap<String, String>,
     ) -> crate::mcp_client::McpStdioTransport {
+        let mut env = BTreeMap::from([(
+            "NEURON_MCP_FRAMING".to_string(),
+            "content-length".to_string(),
+        )]);
+        env.extend(extra_env);
         crate::mcp_client::McpStdioTransport {
             command: python_command(),
-            args: vec![script_path.to_string_lossy().into_owned()],
+            args: python_script_args(script_path),
             env,
             tool_call_timeout_ms: None,
         }
@@ -1837,6 +2176,10 @@ mod tests {
         let mut env = BTreeMap::from([
             ("MCP_SERVER_LABEL".to_string(), label.to_string()),
             (
+                "NEURON_MCP_FRAMING".to_string(),
+                "content-length".to_string(),
+            ),
+            (
                 "MCP_LOG_PATH".to_string(),
                 log_path.to_string_lossy().into_owned(),
             ),
@@ -1846,7 +2189,7 @@ mod tests {
             scope: ConfigSource::Local,
             config: McpServerConfig::Stdio(McpStdioServerConfig {
                 command: python_command(),
-                args: vec![script_path.to_string_lossy().into_owned()],
+                args: python_script_args(script_path),
                 env,
                 tool_call_timeout_ms: None,
             }),
@@ -1880,6 +2223,49 @@ mod tests {
             assert!(status.success());
 
             cleanup_script(&script_path);
+        });
+    }
+
+    /// Servers start outside the user's console (`CREATE_NO_WINDOW`), with working pipes,
+    /// and `terminate` ends what they started.
+    #[test]
+    #[cfg(windows)]
+    fn windows_server_without_console_window_round_trips_io_and_is_terminated() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let echo = crate::mcp_client::McpStdioTransport {
+                command: "cmd.exe".to_string(),
+                args: vec![
+                    "/v:on".to_string(),
+                    "/d".to_string(),
+                    "/c".to_string(),
+                    "set /p LINE=& echo ECHO:!LINE!".to_string(),
+                ],
+                env: BTreeMap::new(),
+                tool_call_timeout_ms: None,
+            };
+            let mut process = McpStdioProcess::spawn(&echo).expect("spawn cmd.exe");
+            process.write_line("ping").await.expect("write line");
+            let echoed = process.read_line().await.expect("read echo");
+            assert_eq!(echoed.trim_end(), "ECHO:ping");
+            assert!(process.wait().await.expect("wait for exit").success());
+
+            let long_running = crate::mcp_client::McpStdioTransport {
+                command: "cmd.exe".to_string(),
+                args: vec![
+                    "/d".to_string(),
+                    "/c".to_string(),
+                    "ping -n 30 127.0.0.1 >NUL".to_string(),
+                ],
+                env: BTreeMap::new(),
+                tool_call_timeout_ms: None,
+            };
+            let mut process = McpStdioProcess::spawn(&long_running).expect("spawn cmd.exe");
+            process.terminate().await.expect("terminate");
+            assert!(process.has_exited().expect("status"));
         });
     }
 
@@ -2242,9 +2628,56 @@ mod tests {
             assert_eq!(tools[0].raw_name, "echo");
             assert_eq!(tools[0].qualified_name, mcp_tool_name("alpha", "echo"));
             assert_eq!(tools[0].tool.name, "echo");
-            assert!(manager.unsupported_servers().is_empty());
+            assert_eq!(manager.unsupported_servers().len(), 0);
 
             manager.shutdown().await.expect("shutdown");
+            cleanup_script(&script_path);
+        });
+    }
+
+    #[test]
+    fn manager_uses_jsonl_by_default_for_handshake_discovery_and_tool_call() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_manager_mcp_server_script();
+            let root = script_path.parent().expect("script parent");
+            let log_path = root.join("jsonl.log");
+            let mut server = manager_server_config(&script_path, "jsonl", &log_path);
+            let McpServerConfig::Stdio(stdio) = &mut server.config else {
+                panic!("stdio server config");
+            };
+            stdio.env.remove("NEURON_MCP_FRAMING");
+            let servers = BTreeMap::from([("jsonl".to_string(), server)]);
+            let mut manager = McpServerManager::from_servers(&servers);
+
+            let tools = manager.discover_tools().await.expect("discover tools");
+            assert_eq!(tools.len(), 1);
+            let result = manager
+                .call_tool(
+                    &mcp_tool_name("jsonl", "echo"),
+                    Some(json!({"text": "ready"})),
+                )
+                .await
+                .expect("call JSONL tool");
+            assert_eq!(
+                result.result.unwrap().structured_content.unwrap()["echoed"],
+                "ready"
+            );
+            manager.shutdown().await.expect("shutdown");
+
+            let log = fs::read_to_string(&log_path).expect("read protocol log");
+            assert_eq!(
+                log.lines().collect::<Vec<_>>(),
+                [
+                    "initialize",
+                    "notifications/initialized",
+                    "tools/list",
+                    "tools/call"
+                ]
+            );
             cleanup_script(&script_path);
         });
     }
@@ -2329,11 +2762,14 @@ mod tests {
                     scope: ConfigSource::Local,
                     config: McpServerConfig::Stdio(McpStdioServerConfig {
                         command: python_command(),
-                        args: vec![script_path.to_string_lossy().into_owned()],
-                        env: BTreeMap::from([(
-                            "MCP_TOOL_CALL_DELAY_MS".to_string(),
-                            "200".to_string(),
-                        )]),
+                        args: python_script_args(&script_path),
+                        env: BTreeMap::from([
+                            ("MCP_TOOL_CALL_DELAY_MS".to_string(), "200".to_string()),
+                            (
+                                "NEURON_MCP_FRAMING".to_string(),
+                                "content-length".to_string(),
+                            ),
+                        ]),
                         tool_call_timeout_ms: Some(25),
                     }),
                 },
@@ -2383,11 +2819,17 @@ mod tests {
                     scope: ConfigSource::Local,
                     config: McpServerConfig::Stdio(McpStdioServerConfig {
                         command: python_command(),
-                        args: vec![script_path.to_string_lossy().into_owned()],
-                        env: BTreeMap::from([(
-                            "MCP_INVALID_TOOL_CALL_RESPONSE".to_string(),
-                            "1".to_string(),
-                        )]),
+                        args: python_script_args(&script_path),
+                        env: BTreeMap::from([
+                            (
+                                "MCP_INVALID_TOOL_CALL_RESPONSE".to_string(),
+                                "1".to_string(),
+                            ),
+                            (
+                                "NEURON_MCP_FRAMING".to_string(),
+                                "content-length".to_string(),
+                            ),
+                        ]),
                         tool_call_timeout_ms: Some(1_000),
                     }),
                 },
@@ -2770,7 +3212,7 @@ mod tests {
                 degraded.available_tools,
                 vec![mcp_tool_name("alpha", "echo")]
             );
-            assert!(degraded.missing_tools.is_empty());
+            assert_eq!(degraded.missing_tools.len(), 0);
 
             let response = manager
                 .call_tool(&mcp_tool_name("alpha", "echo"), Some(json!({"text": "ok"})))
@@ -2946,5 +3388,200 @@ mod tests {
 
             cleanup_script(&script_path);
         });
+    }
+
+    #[test]
+    fn tool_calls_default_to_a_120_second_timeout_unless_configured() {
+        let stdio = |timeout: Option<u64>| ScopedMcpServerConfig {
+            scope: ConfigSource::Local,
+            config: McpServerConfig::Stdio(McpStdioServerConfig {
+                command: "unused".to_string(),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                tool_call_timeout_ms: timeout,
+            }),
+        };
+        let servers = BTreeMap::from([
+            ("default".to_string(), stdio(None)),
+            ("custom".to_string(), stdio(Some(5_000))),
+        ]);
+        let manager = McpServerManager::from_servers(&servers);
+
+        assert_eq!(
+            manager
+                .tool_call_timeout_ms("default")
+                .expect("known server"),
+            super::MCP_TOOL_CALL_TIMEOUT_MS
+        );
+        assert_eq!(super::MCP_TOOL_CALL_TIMEOUT_MS, 120_000);
+        assert_eq!(
+            manager
+                .tool_call_timeout_ms("custom")
+                .expect("known server"),
+            5_000
+        );
+    }
+
+    #[test]
+    fn stdio_servers_do_not_inherit_zero_x_credentials() {
+        let _guard = crate::test_env_lock();
+        std::env::set_var("NEURON_SESSION_TOKEN", "ses_mcp_scrub_session");
+        std::env::set_var("MCP_SCRUB_TEST_API_KEY", "nzx_mcp_scrub_key");
+        std::env::set_var("MCP_SCRUB_TEST_KEEP", "keep-me");
+        let transport = crate::mcp_client::McpStdioTransport {
+            command: "unused".to_string(),
+            args: Vec::new(),
+            // A credential the user configured for this server explicitly.
+            env: BTreeMap::from([("NEURON_TOKEN".to_string(), "nzx_configured".to_string())]),
+            tool_call_timeout_ms: None,
+        };
+        let command = super::stdio_server_command(&transport);
+        std::env::remove_var("NEURON_SESSION_TOKEN");
+        std::env::remove_var("MCP_SCRUB_TEST_API_KEY");
+        std::env::remove_var("MCP_SCRUB_TEST_KEEP");
+
+        let envs = command
+            .as_std()
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(envs.get("NEURON_SESSION_TOKEN"), Some(&None), "{envs:?}");
+        assert_eq!(envs.get("MCP_SCRUB_TEST_API_KEY"), Some(&None), "{envs:?}");
+        assert_eq!(
+            envs.get("NEURON_TOKEN"),
+            Some(&Some("nzx_configured".to_string())),
+            "explicitly configured server env wins: {envs:?}"
+        );
+        assert!(
+            !envs.contains_key("MCP_SCRUB_TEST_KEEP"),
+            "other variables are inherited untouched: {envs:?}"
+        );
+    }
+
+    #[test]
+    fn join_all_runs_the_futures_together_and_keeps_their_order() {
+        async fn after(millis: u64, value: u32) -> u32 {
+            tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+            value
+        }
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let started = std::time::Instant::now();
+        let outputs = runtime.block_on(super::join_all(vec![
+            after(400, 1),
+            after(50, 2),
+            after(400, 3),
+        ]));
+        assert_eq!(outputs, vec![1, 2, 3]);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1_000),
+            "one after the other would take 850ms or more: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A command that appends a line to `count` each time it starts, then exits at once.
+    fn exits_at_once(count: &Path) -> McpStdioServerConfig {
+        let count = count.to_string_lossy().into_owned();
+        let (command, args) = if cfg!(windows) {
+            (
+                "cmd".to_string(),
+                vec![
+                    "/C".to_string(),
+                    "echo".to_string(),
+                    format!("started>>{count}"),
+                    "&".to_string(),
+                    "exit".to_string(),
+                    "3".to_string(),
+                ],
+            )
+        } else {
+            (
+                "sh".to_string(),
+                vec![
+                    "-c".to_string(),
+                    format!("echo started >> '{count}'; exit 3"),
+                ],
+            )
+        };
+        McpStdioServerConfig {
+            command,
+            args,
+            env: BTreeMap::new(),
+            tool_call_timeout_ms: None,
+        }
+    }
+
+    #[test]
+    fn a_server_that_exits_at_once_is_started_once_and_says_it_exited() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("temp dir");
+        let count = root.join("starts.txt");
+        let servers = BTreeMap::from([(
+            "broken".to_string(),
+            ScopedMcpServerConfig {
+                scope: ConfigSource::Local,
+                config: McpServerConfig::Stdio(exits_at_once(&count)),
+            },
+        )]);
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let report = runtime.block_on(async {
+            let mut manager = McpServerManager::from_servers(&servers);
+            let report = manager.discover_tools_best_effort().await;
+            manager.shutdown().await.expect("shutdown");
+            report
+        });
+
+        assert_eq!(report.tools, [] as [super::ManagedMcpTool; 0]);
+        assert_eq!(report.failed_servers.len(), 1);
+        assert_eq!(report.failed_servers[0].server_name, "broken");
+        assert!(
+            report.failed_servers[0].error.contains("the server exited"),
+            "{}",
+            report.failed_servers[0].error
+        );
+        let starts = fs::read_to_string(&count).expect("the server ran");
+        assert_eq!(
+            starts.lines().count(),
+            1,
+            "a server that exits at once is not started again: {starts:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn server_stderr_goes_to_the_log_file_when_one_is_set() {
+        let root = temp_dir();
+        let log = root.join("logs").join("mcp-servers.log");
+        let (program, args): (&str, &[&str]) = if cfg!(windows) {
+            ("cmd", &["/C", "echo", "server warning", "1>&2"])
+        } else {
+            ("sh", &["-c", "echo server warning >&2"])
+        };
+        let status = std::process::Command::new(program)
+            .args(args)
+            .stderr(super::server_stderr(Some(&log), program))
+            .status()
+            .expect("the command runs");
+        assert!(status.success());
+
+        let written = fs::read_to_string(&log).expect("the log was written");
+        assert!(
+            written.contains(&format!("starting {program} ---")),
+            "{written}"
+        );
+        assert!(written.contains("server warning"), "{written}");
+        let _ = fs::remove_dir_all(root);
     }
 }

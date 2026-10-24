@@ -21,7 +21,7 @@ pub struct SessionStore {
     /// Resolved root of the session namespace, e.g.
     /// `/home/user/project/.claw/sessions/a1b2c3d4e5f60718/`.
     sessions_root: PathBuf,
-    /// The canonical workspace path that was fingerprinted.
+    /// Workspace root used to resolve relative session references.
     workspace_root: PathBuf,
 }
 
@@ -31,15 +31,22 @@ impl SessionStore {
     /// The on-disk layout becomes `<cwd>/.neuron/sessions/<workspace_hash>/`.
     pub fn from_cwd(cwd: impl AsRef<Path>) -> Result<Self, SessionControlError> {
         let cwd = cwd.as_ref();
+        #[cfg(target_os = "macos")]
+        let storage_root = {
+            fs::create_dir_all(cwd)?;
+            fs::canonicalize(cwd)?
+        };
+        #[cfg(not(target_os = "macos"))]
+        let storage_root = cwd.to_path_buf();
         // Use .neuron as primary, fall back to .claw for existing sessions
-        let neuron_root = cwd
+        let neuron_root = storage_root
             .join(".neuron")
             .join("sessions")
-            .join(workspace_fingerprint(cwd));
-        let claw_root = cwd
+            .join(workspace_fingerprint(&storage_root));
+        let claw_root = storage_root
             .join(".claw")
             .join("sessions")
-            .join(workspace_fingerprint(cwd));
+            .join(workspace_fingerprint(&storage_root));
         // Migrate: if .claw exists but .neuron doesn't, use .claw for compat
         let sessions_root = if neuron_root.exists() || !claw_root.exists() {
             neuron_root
@@ -47,6 +54,7 @@ impl SessionStore {
             claw_root
         };
         fs::create_dir_all(&sessions_root)?;
+        ignore_in_git(sessions_root.parent().unwrap_or(&sessions_root));
         Ok(Self {
             sessions_root,
             workspace_root: cwd.to_path_buf(),
@@ -293,6 +301,19 @@ impl SessionStore {
             sessions.push(summary);
         }
         Ok(())
+    }
+}
+
+/// Keeps the session transcripts out of the user's `git status`: a `.gitignore`
+/// of `*` in the sessions folder (written once; an existing one is left alone).
+/// Best-effort: a read-only workspace still gets its sessions.
+fn ignore_in_git(sessions_dir: &Path) {
+    let ignore = sessions_dir.join(".gitignore");
+    if !ignore.exists() {
+        let _ = fs::write(
+            ignore,
+            "# Neuron session transcripts; they stay on this machine.\n*\n",
+        );
     }
 }
 
@@ -591,6 +612,28 @@ mod tests {
         session
     }
 
+    #[test]
+    fn session_transcripts_stay_out_of_git() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("workspace");
+        // As `from_cwd` sees it: on macOS the temp dir is a symlink it resolves
+        // (`/var/folders` is `/private/var/folders`).
+        #[cfg(target_os = "macos")]
+        let root = fs::canonicalize(&root).expect("canonical workspace");
+        let store = SessionStore::from_cwd(&root).expect("store");
+        let ignore = root.join(".neuron").join("sessions").join(".gitignore");
+        let rules = fs::read_to_string(&ignore).expect("the sessions folder ignores itself");
+        assert!(rules.lines().any(|line| line == "*"), "{rules}");
+        assert!(store
+            .sessions_dir()
+            .starts_with(root.join(".neuron").join("sessions")));
+
+        fs::write(&ignore, "mine\n").expect("edit");
+        SessionStore::from_cwd(&root).expect("store again");
+        assert_eq!(fs::read_to_string(&ignore).unwrap(), "mine\n", "left alone");
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn wait_for_next_millisecond() {
         let start = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -779,6 +822,26 @@ mod tests {
             store_b.sessions_dir(),
             "session directories must differ across workspaces"
         );
+        fs::remove_dir_all(base).expect("temp dir should clean up");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn session_store_from_cwd_resolves_symlinked_workspace_paths() {
+        use std::os::unix::fs::symlink;
+
+        let base = temp_dir();
+        let workspace = base.join("workspace");
+        let alias = base.join("workspace-alias");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        symlink(&workspace, &alias).expect("workspace alias should be created");
+
+        let workspace = workspace.join("new-project");
+        let alias = alias.join("new-project");
+        let direct = SessionStore::from_cwd(&workspace).expect("direct store should build");
+        let through_alias = SessionStore::from_cwd(&alias).expect("alias store should build");
+
+        assert_eq!(direct.sessions_dir(), through_alias.sessions_dir());
         fs::remove_dir_all(base).expect("temp dir should clean up");
     }
 

@@ -65,7 +65,7 @@ fn resumed_binary_accepts_slash_commands_with_arguments() {
     assert!(export.contains("ship the slash command harness"));
 
     let restored = Session::load_from_path(&session_path).expect("cleared session should load");
-    assert!(restored.messages.is_empty());
+    assert_eq!(restored.messages, []);
 
     let backup_path = stdout
         .lines()
@@ -144,7 +144,11 @@ fn resumed_config_command_loads_settings_files_end_to_end() {
             "/config",
             "model",
         ],
-        &[("CLAW_CONFIG_HOME", config_home.to_str().expect("utf8 path"))],
+        &[
+            ("CLAW_CONFIG_HOME", config_home.to_str().expect("utf8 path")),
+            // Workspace settings only apply to a trusted workspace.
+            ("NEURON_TRUST_WORKSPACE", "1"),
+        ],
     );
 
     // then
@@ -493,6 +497,111 @@ fn resumed_no_command_emits_restored_json() {
 }
 
 #[test]
+fn resume_without_terminal_prints_summary_instead_of_entering_the_repl() {
+    // given a saved session and a non-interactive stdin/stdout
+    let temp_dir = unique_temp_dir("resume-no-tty");
+    fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+    let session_path = temp_dir.join("session.jsonl");
+    let mut session = workspace_session(&temp_dir);
+    session
+        .push_user_text("keep going later")
+        .expect("write ok");
+    session.save_to_path(&session_path).expect("persist ok");
+
+    // when
+    let output = run_claw(
+        &temp_dir,
+        &["--resume", session_path.to_str().expect("utf8 path")],
+    );
+
+    // then the scriptable summary is printed and the process exits
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    assert!(stdout.contains("Restored session from"));
+    assert!(stdout.contains("(1 messages)"));
+}
+
+#[test]
+fn resumed_context_command_reports_window_and_usage() {
+    let temp_dir = unique_temp_dir("resume-context-json");
+    fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+    let session_path = temp_dir.join("session.jsonl");
+    let mut session = workspace_session(&temp_dir);
+    session.model = Some("gemini/gemini-2.5-flash".to_string());
+    session
+        .push_user_text("how big is my context?")
+        .expect("write ok");
+    session.save_to_path(&session_path).expect("persist ok");
+
+    let output = run_claw(
+        &temp_dir,
+        &[
+            "--output-format",
+            "json",
+            "--resume",
+            session_path.to_str().expect("utf8 path"),
+            "/context",
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    let parsed: Value = serde_json::from_str(stdout.trim()).expect("should be json");
+    assert_eq!(parsed["kind"], "context");
+    assert_eq!(parsed["context_window"], 1_048_576);
+    assert_eq!(parsed["messages"], 1);
+    assert!(parsed["estimated_tokens"]
+        .as_u64()
+        .is_some_and(|tokens| tokens > 0));
+    assert!(parsed["last_compaction"].is_null());
+}
+
+#[test]
+fn resume_tolerates_a_session_file_with_a_truncated_record() {
+    let temp_dir = unique_temp_dir("resume-truncated-record");
+    fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+    let session_path = temp_dir.join("session.jsonl");
+    let mut session = workspace_session(&temp_dir);
+    session
+        .push_user_text("survives a crash")
+        .expect("write ok");
+    session.save_to_path(&session_path).expect("persist ok");
+    let mut contents = fs::read_to_string(&session_path).expect("read session");
+    contents.push_str("{\"type\":\"message\",\"message\":{\"role\":\"assist");
+    fs::write(&session_path, contents).expect("append truncated record");
+
+    let output = run_claw(
+        &temp_dir,
+        &[
+            "--output-format",
+            "json",
+            "--resume",
+            session_path.to_str().expect("utf8 path"),
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: Value =
+        serde_json::from_str(String::from_utf8(output.stdout).expect("utf8").trim())
+            .expect("should be json");
+    assert_eq!(parsed["message_count"], 1);
+    let stderr = String::from_utf8(output.stderr).expect("utf8");
+    assert!(stderr.contains("skipped 1 malformed record(s)"), "{stderr}");
+}
+
+#[test]
 fn resumed_stub_command_emits_not_implemented_json() {
     let temp_dir = unique_temp_dir("resume-stub-json");
     fs::create_dir_all(&temp_dir).expect("temp dir should exist");
@@ -535,13 +644,40 @@ fn workspace_session(root: &Path) -> Session {
     Session::new().with_workspace_root(root.to_path_buf())
 }
 
+/// Runs the binary with an isolated home and config directory so user-level
+/// settings (`~/.neuron/settings.json`, `~/.claw*`), stored credentials and
+/// model overrides on the developer's machine cannot leak into assertions.
+/// Explicit `envs` override the isolated defaults.
 fn run_claw_with_env(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
+    let home = unique_temp_dir("isolated-home");
+    let config_home = home.join(".neuron");
+    fs::create_dir_all(&config_home).expect("isolated config home should exist");
+
     let mut command = Command::new(env!("CARGO_BIN_EXE_neuron"));
     command.current_dir(current_dir).args(args);
+    for key in [
+        "NEURON_CONFIG_HOME",
+        "NEURON_TOKEN",
+        "NEURON_MODEL",
+        "NEURON_API_BASE",
+        "ANTHROPIC_MODEL",
+        "RUSTY_CLAUDE_PERMISSION_MODE",
+    ] {
+        command.env_remove(key);
+    }
+    command
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("APPDATA", home.join("AppData").join("Roaming"))
+        .env("LOCALAPPDATA", home.join("AppData").join("Local"))
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("CLAW_CONFIG_HOME", &config_home);
     for (key, value) in envs {
         command.env(key, value);
     }
-    command.output().expect("claw should launch")
+    let output = command.output().expect("claw should launch");
+    let _ = fs::remove_dir_all(&home);
+    output
 }
 
 fn unique_temp_dir(label: &str) -> PathBuf {

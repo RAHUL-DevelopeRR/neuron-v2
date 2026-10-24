@@ -82,11 +82,11 @@ async fn send_message_posts_json_and_parses_response() {
     );
     assert_eq!(
         request.headers.get("user-agent").map(String::as_str),
-        Some("claude-code/4.1.0")
+        Some(concat!("neuron/", env!("CARGO_PKG_VERSION")))
     );
     assert_eq!(
         request.headers.get("anthropic-beta").map(String::as_str),
-        Some("claude-code-20250219,prompt-caching-scope-2026-01-05")
+        Some("prompt-caching-scope-2026-01-05")
     );
     let body: serde_json::Value =
         serde_json::from_str(&request.body).expect("request body should be json");
@@ -167,7 +167,7 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
 
     let client = AnthropicClient::new("test-key")
         .with_base_url(server.base_url())
-        .with_client_identity(ClientIdentity::new("claude-code", "9.9.9").with_runtime("rust-cli"))
+        .with_client_identity(ClientIdentity::new("neuron-test", "9.9.9").with_runtime("rust-cli"))
         .with_beta("tools-2026-04-01")
         .with_extra_body_param("metadata", json!({"source": "clawd-code"}))
         .with_session_tracer(SessionTracer::new("session-telemetry", sink.clone()));
@@ -183,11 +183,11 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
     let request = captured.first().expect("server should capture request");
     assert_eq!(
         request.headers.get("anthropic-beta").map(String::as_str),
-        Some("claude-code-20250219,prompt-caching-scope-2026-01-05,tools-2026-04-01")
+        Some("prompt-caching-scope-2026-01-05,tools-2026-04-01")
     );
     assert_eq!(
         request.headers.get("user-agent").map(String::as_str),
-        Some("claude-code/9.9.9")
+        Some("neuron-test/9.9.9")
     );
     let body: serde_json::Value =
         serde_json::from_str(&request.body).expect("request body should be json");
@@ -232,7 +232,8 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
                 && event.action == "message_usage"
                 && event.properties.get("request_id") == Some(&json!("req_profile_123"))
                 && event.properties.get("total_tokens") == Some(&json!(7))
-                && event.properties.get("estimated_cost_usd") == Some(&json!("$0.0001"))
+                // claude-3-7-sonnet at $3 / $15 per million tokens: $0.0000264.
+                && event.properties.get("estimated_cost_usd") == Some(&json!("$0.0000"))
     ));
     assert!(matches!(
         &events[5],
@@ -455,6 +456,75 @@ async fn retries_retryable_failures_before_succeeding() {
 
     assert_eq!(response.total_tokens(), 5);
     assert_eq!(state.lock().await.len(), 2);
+}
+
+#[tokio::test]
+async fn anthropic_retries_honour_retry_after() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let server = spawn_server(
+        state.clone(),
+        vec![
+            http_response_with_headers(
+                "429 Too Many Requests",
+                "application/json",
+                "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}",
+                &[("retry-after", "1")],
+            ),
+            http_response(
+                "200 OK",
+                "application/json",
+                "{\"id\":\"msg_retry_after\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Recovered\"}],\"model\":\"claude-3-7-sonnet-latest\",\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}",
+            ),
+        ],
+    )
+    .await;
+
+    // Millisecond backoff: only the server's Retry-After explains a 1s wait.
+    let client = ApiClient::new("test-key")
+        .with_base_url(server.base_url())
+        .with_retry_policy(2, Duration::from_millis(1), Duration::from_millis(2));
+
+    let started = std::time::Instant::now();
+    let response = client
+        .send_message(&sample_request(false))
+        .await
+        .expect("retry should eventually succeed");
+
+    assert_eq!(response.total_tokens(), 5);
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    assert_eq!(state.lock().await.len(), 2);
+}
+
+#[tokio::test]
+async fn anthropic_overflowing_retry_after_ends_retries_without_panicking() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let server = spawn_server(
+        state.clone(),
+        vec![
+            http_response_with_headers(
+                "503 Service Unavailable",
+                "application/json",
+                "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"overloaded\"}}",
+                &[("retry-after", "99999999999999999999")],
+            ),
+            http_response(
+                "200 OK",
+                "application/json",
+                "{\"id\":\"msg_never\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-7-sonnet-latest\",\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}",
+            ),
+        ],
+    )
+    .await;
+
+    let client = ApiClient::new("test-key")
+        .with_base_url(server.base_url())
+        .with_retry_policy(2, Duration::from_millis(1), Duration::from_millis(2));
+
+    client
+        .send_message(&sample_request(false))
+        .await
+        .expect_err("a delay that overflows Duration never fits the budget");
+    assert_eq!(state.lock().await.len(), 1);
 }
 
 #[tokio::test]

@@ -39,19 +39,35 @@
     clippy::many_single_char_names,
     clippy::wildcard_imports
 )]
+// First: its `println!` family is the one every module below prints with.
+#[macro_use]
+mod console;
+mod account;
 mod api_client;
 mod args;
 mod auth;
 mod brand;
+mod clock;
+mod credentials;
+mod device_login;
 mod doctor;
+mod engine;
+mod engine_stdio;
 mod executor;
+mod full_screen;
+mod gateway_catalog;
+mod gateway_http;
+mod gateway_repl;
+mod headless;
 mod init;
 mod input;
 mod orchestrator;
+mod plan_mode;
 mod progress;
 mod provider;
 mod quota;
 mod render;
+mod repl_loop;
 mod repo_map;
 mod reports;
 mod session_mgmt;
@@ -60,9 +76,10 @@ mod status_ui;
 mod stream_buffer;
 mod token_budget;
 mod tool_ui;
+mod turn_sink;
 mod vault;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -105,9 +122,9 @@ use runtime::{
     load_system_prompt, pricing_for_model, resolve_expected_base, resolve_sandbox_status,
     ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
     ContentBlock, ConversationMessage, ConversationRuntime, McpServer, McpServerManager,
-    McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode, PermissionPolicy,
-    ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage,
-    ToolError, ToolExecutor, UsageTracker,
+    McpServerSpec, McpTool, MessageRole, PermissionMode, PermissionPolicy, ProjectContext,
+    PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolError,
+    ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -117,14 +134,30 @@ use tool_ui::*;
 use tools::{
     execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
 };
+use turn_sink::{TurnOutput, TurnSink};
 
-const DEFAULT_MODEL: &str = "claude-opus-4-6";
+const DEFAULT_MODEL: &str = "auto";
+/// Output budget (`max_tokens`) requested per model call. Models known to the
+/// shared capability registry (gateway catalog or verified built-ins) request
+/// their advertised output limit capped at 32K; unknown models get 8K. The
+/// gateway pseudo-models (`auto`, `default`) are resolved per request to an
+/// upstream we cannot see (possibly a small free tier), so they stay at 8K.
 fn max_tokens_for_model(model: &str) -> u32 {
-    if model.contains("opus") {
-        32_000
+    const REGISTERED_OUTPUT_CAP: u32 = 32_000;
+    const UNKNOWN_MODEL_OUTPUT: u32 = 8_192;
+    let cap = if matches!(
+        runtime::model_registry::normalize_model_id(model).as_str(),
+        "auto" | "default"
+    ) {
+        UNKNOWN_MODEL_OUTPUT
     } else {
-        64_000
-    }
+        REGISTERED_OUTPUT_CAP
+    };
+    runtime::model_registry::lookup(model)
+        .or_else(|| runtime::model_registry::lookup(&api::resolve_model_alias(model)))
+        .map_or(UNKNOWN_MODEL_OUTPUT, |capability| {
+            capability.max_output_tokens.min(cap)
+        })
 }
 // Build-time constants injected by build.rs (fall back to static values when
 // build.rs hasn't run, e.g. in doc-test or unusual toolchain environments).
@@ -133,17 +166,12 @@ const DEFAULT_DATE: &str = match option_env!("BUILD_DATE") {
     None => "unknown",
 };
 const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
-const VERSION: &str = "6.1.0";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
 const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
-const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
-const INITIAL_STREAM_TIMEOUT: Duration = Duration::from_secs(60);
 const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
 const LEGACY_SESSION_EXTENSION: &str = "json";
-const OFFICIAL_REPO_URL: &str = "https://github.com/RAHUL-DevelopeRR/claw-code";
-const OFFICIAL_REPO_SLUG: &str = "RAHUL-DevelopeRR/claw-code";
-const DEPRECATED_INSTALL_COMMAND: &str = "cargo install neuron-cli";
 const LATEST_SESSION_REFERENCE: &str = "latest";
 const SESSION_REFERENCE_ALIASES: &[&str] = &[LATEST_SESSION_REFERENCE, "last", "recent"];
 const CLI_OPTION_SUGGESTIONS: &[&str] = &[
@@ -157,6 +185,8 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--dangerously-skip-permissions",
     "--allowedTools",
     "--allowed-tools",
+    "--no-tui",
+    "--continue",
     "--resume",
     "--acp",
     "-acp",
@@ -190,36 +220,101 @@ fn main() {
                     "error": message,
                 })
             );
-        } else if message.contains("`neuron --help`") {
-            eprintln!("error: {message}");
-        } else {
+        } else if error.downcast_ref::<UsageError>().is_some()
+            && !message.contains("`neuron --help`")
+        {
             eprintln!(
                 "error: {message}
 
 Run `neuron --help` for usage."
             );
+        } else {
+            // A failure while running (a turn, the network, a tool) is not a usage
+            // question.
+            eprintln!("error: {message}");
         }
         std::process::exit(1);
     }
 }
 
-/// Read piped stdin content when stdin is not a terminal.
-///
-/// Returns `None` when stdin is attached to a terminal (interactive REPL use),
-/// when reading fails, or when the piped content is empty after trimming.
-/// Returns `Some(raw_content)` when a pipe delivered non-empty content.
-fn read_piped_stdin() -> Option<String> {
-    if io::stdin().is_terminal() {
-        return None;
+/// A command line that doesn't parse: `main` adds the pointer to `neuron --help`.
+#[derive(Debug)]
+struct UsageError(String);
+
+impl std::fmt::Display for UsageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
-    let mut buffer = String::new();
-    if io::stdin().read_to_string(&mut buffer).is_err() {
-        return None;
-    }
-    if buffer.trim().is_empty() {
-        return None;
-    }
-    Some(buffer)
+}
+
+impl std::error::Error for UsageError {}
+
+/// The `--output-format json` answer of a turn that failed: the error, and what the turn
+/// had done by then (text, tool calls and their results, and the tokens its model calls
+/// were billed for).
+fn failed_turn_json(error: &str, model: &str, messages: &[ConversationMessage]) -> Value {
+    let blocks = || messages.iter().flat_map(|message| message.blocks.iter());
+    let text = messages
+        .iter()
+        .filter(|message| message.role == MessageRole::Assistant)
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match block {
+            // The runtime's note closing the failed turn is not model output.
+            ContentBlock::Text { text } if !runtime::is_turn_end_note(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    let usage = messages.iter().filter_map(|message| message.usage).fold(
+        TokenUsage::default(),
+        |total, usage| TokenUsage {
+            input_tokens: total.input_tokens.saturating_add(usage.input_tokens),
+            output_tokens: total.output_tokens.saturating_add(usage.output_tokens),
+            cache_creation_input_tokens: total
+                .cache_creation_input_tokens
+                .saturating_add(usage.cache_creation_input_tokens),
+            cache_read_input_tokens: total
+                .cache_read_input_tokens
+                .saturating_add(usage.cache_read_input_tokens),
+        },
+    );
+    let tool_uses = blocks()
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, name, input } => {
+                Some(json!({ "id": id, "name": name, "input": input }))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let tool_results = blocks()
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                tool_name,
+                output,
+                is_error,
+            } => Some(json!({
+                "tool_use_id": tool_use_id,
+                "tool_name": tool_name,
+                "output": output,
+                "is_error": is_error,
+            })),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "type": "error",
+        "error": error,
+        "model": model,
+        "message": text,
+        "tool_uses": tool_uses,
+        "tool_results": tool_results,
+        "usage": {
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+            "cache_read_input_tokens": usage.cache_read_input_tokens,
+        },
+    })
 }
 
 /// Merge a piped stdin payload into a prompt argument.
@@ -243,8 +338,37 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Before anything prints: a classic Windows console shows colours as text until
+    // VT processing is on, and its fonts need other marks.
+    console::init();
+    // The trust prompt and the config loader must read the same trust store.
+    runtime::workspace_trust::set_trust_store_path(
+        credentials::neuron_home().join("trusted_dirs.txt"),
+    );
+    // MCP servers' own warnings would print over the prompt or the full-screen UI.
+    runtime::set_mcp_server_log(Some(
+        credentials::neuron_home()
+            .join("logs")
+            .join("mcp-servers.log"),
+    ));
     let args: Vec<String> = env::args().skip(1).collect();
-    match parse_args(&args)? {
+    let (args, provider_choice) = extract_provider_flag(&args).map_err(UsageError)?;
+    provider::set_provider_flag(provider_choice);
+    let (args, no_tui) = full_screen::extract_no_tui_flag(args);
+    let (args, continue_chat) = full_screen::extract_continue_flag(args);
+    // `auth`, `login`, `logout`, `usage` and `upgrade`, also after global flags.
+    if let Some(command) = auth::account_command(&args) {
+        return auth::run_account_command(&command);
+    }
+    // Hidden: the engine for a UI in another process, as JSON lines.
+    if let Some(engine_args) = engine_stdio::stdio_engine_args(&args) {
+        return engine_stdio::run_engine_command(&engine_args);
+    }
+    let action = parse_args(&args).map_err(UsageError)?;
+    if continue_chat.is_some() && !matches!(action, CliAction::Repl { .. }) {
+        return Err(full_screen::CONTINUE_NEEDS_UI.into());
+    }
+    match action {
         CliAction::DumpManifests {
             output_format,
             manifests_dir,
@@ -277,7 +401,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             session_path,
             commands,
             output_format,
-        } => resume_session(&session_path, &commands, output_format),
+            launch,
+        } => resume_session(&session_path, &commands, output_format, launch),
         CliAction::Status {
             model,
             permission_mode,
@@ -297,46 +422,49 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             enforce_broad_cwd_policy(allow_broad_cwd, output_format)?;
             run_stale_base_preflight(base_commit.as_deref());
+            progress::set_mcp_startup(McpStartup::WaitWithoutBundled);
             // Workspace trust check (skip when stdin is piped so we don't consume the pipe)
-            if std::io::stdin().is_terminal() {
+            if runtime::ui_hooks::stdin_is_terminal() {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 if !crate::auth::check_trust(&cwd) {
                     std::process::exit(1);
                 }
             }
-            // â”€â”€ Resolve provider (Azure primary â†’ OpenRouter fallback) â”€â”€
-            // The provider always dictates the model â€” when Azure is up we
+            let permission_mode = crate::args::permission_mode_after_trust(permission_mode);
+            let model = crate::args::model_after_trust(model);
+            // JSON mode: stderr carries only the JSON error, not the Azure notice.
+            provider::set_json_output(output_format == CliOutputFormat::Json);
+            // ── Resolve provider (Azure primary → OpenRouter fallback) ──
+            // The provider always dictates the model — when Azure is up we
             // use gpt-5.5, when falling back to OpenRouter we MUST switch
             // to the free-tier model regardless of what the user passed.
-            let effective_model = configure_provider_for_model(model);
-            // Only consume piped stdin as prompt context when the permission
-            // mode is fully unattended. In modes where the permission
-            // prompter may invoke CliPermissionPrompter::decide(), stdin
-            // must remain available for interactive approval; otherwise the
-            // prompter's read_line() would hit EOF and deny every request.
-            let stdin_context = if matches!(permission_mode, PermissionMode::DangerFullAccess) {
-                read_piped_stdin()
-            } else {
-                None
-            };
-            // If -p was used with no trailing text, read piped stdin regardless of
-            // permission mode so `echo 'hello' | neuron -p` works as expected.
-            let stdin_context = if prompt.trim().is_empty() {
-                read_piped_stdin()
-            } else {
-                stdin_context
-            };
+            let effective_model = configure_provider_for_model(model)?;
+            // `cat log | neuron prompt "explain this log"`: what stdin carries is context
+            // for the prompt, in any permission mode. A run whose stdin is not a terminal
+            // never asks for approval (approvals and questions are refused), so reading
+            // it takes nothing from them. `echo 'hello' | neuron -p`: stdin is the prompt.
+            let stdin_context = headless::stdin_context(!prompt.trim().is_empty(), output_format);
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
             let mut cli = LiveCli::new(effective_model, true, allowed_tools, permission_mode)?;
             cli.set_reasoning_effort(reasoning_effort);
+            // Nobody to answer (stdin not a terminal): approvals and questions are refused.
+            headless::start(headless::stdin_is_unattended(), output_format);
             // Print a condensed welcome banner for one-shot mode so the user
             // sees model info and quota even when not in the REPL.
-            if output_format == CliOutputFormat::Text && !compact {
+            // Not to a file or a pipe: there it is noise around the answer.
+            if output_format == CliOutputFormat::Text && !compact && io::stdout().is_terminal() {
                 println!("{}", cli.startup_banner());
                 println!("{}", format_connected_line(&cli.model));
                 println!();
             }
-            cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
+            let result = cli.run_turn_with_output(&effective_prompt, output_format, compact);
+            // Tool calls denied for lack of a prompt: named once more, and exit code 2.
+            let denied_exit = headless::report(output_format);
+            result?;
+            if let Some(code) = denied_exit {
+                drop(cli);
+                std::process::exit(code);
+            }
         }
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
         CliAction::Acp { output_format } => print_acp_status(output_format)?,
@@ -354,14 +482,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             base_commit,
             reasoning_effort,
             allow_broad_cwd,
-        } => run_repl(
-            model,
-            allowed_tools,
-            permission_mode,
-            base_commit,
-            reasoning_effort,
-            allow_broad_cwd,
-        )?,
+        } => {
+            // On a terminal with the full-screen UI installed, it takes the
+            // REPL's place (`--no-tui` or NEURON_NO_TUI keeps the REPL).
+            if let Some(ui) = full_screen::ui_binary(no_tui) {
+                let launch = full_screen::UiLaunch {
+                    model: crate::args::typed_model_arg(),
+                    provider: provider::provider_flag(),
+                    permission_mode,
+                    allowed_tools: allowed_tools.as_ref(),
+                    reasoning_effort: reasoning_effort.as_deref(),
+                    allow_broad_cwd,
+                    base_commit: base_commit.as_deref(),
+                    continue_chat: continue_chat.clone(),
+                };
+                if let Some(ui_args) = full_screen::ui_args(&launch) {
+                    let code = full_screen::run_ui(&ui, &ui_args)?;
+                    std::process::exit(code);
+                }
+            }
+            if continue_chat.is_some() {
+                return Err(full_screen::CONTINUE_NEEDS_UI.into());
+            }
+            run_repl(
+                model,
+                allowed_tools,
+                permission_mode,
+                base_commit,
+                reasoning_effort,
+                allow_broad_cwd,
+            )?;
+        }
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
     }
@@ -549,7 +700,12 @@ fn version_json_value() -> serde_json::Value {
 }
 
 #[allow(clippy::too_many_lines)]
-fn resume_session(session_path: &Path, commands: &[String], output_format: CliOutputFormat) {
+fn resume_session(
+    session_path: &Path,
+    commands: &[String],
+    output_format: CliOutputFormat,
+    launch: ResumeLaunchOptions,
+) {
     let session_reference = session_path.display().to_string();
     let (handle, session) = match load_session_reference(&session_reference) {
         Ok(loaded) => loaded,
@@ -569,8 +725,36 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
         }
     };
     let resolved_path = handle.path.clone();
+    if let Some(warning) = session.load_diagnostics().warning_message() {
+        let warning = format!("session {}: {warning}", resolved_path.display());
+        if output_format == CliOutputFormat::Json {
+            eprintln!(
+                "{}",
+                serde_json::json!({ "type": "warning", "warning": warning })
+            );
+        } else {
+            eprintln!("warning: {warning}");
+        }
+    }
 
     if commands.is_empty() {
+        // `neuron --resume <id>` on a terminal continues the conversation in
+        // the REPL; piped or JSON invocations keep the scriptable summary.
+        if output_format == CliOutputFormat::Text
+            && io::stdin().is_terminal()
+            && io::stdout().is_terminal()
+        {
+            let launched = repl_loop::launch(repl_loop::resume_launch(
+                launch,
+                session.model.as_deref(),
+                resolved_path.display().to_string(),
+            ));
+            if let Err(error) = launched {
+                eprintln!("error: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
         if output_format == CliOutputFormat::Json {
             println!(
                 "{}",
@@ -594,7 +778,7 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
     let mut session = session;
     for raw_command in commands {
         // Intercept spec commands that have no parse arm before calling
-        // SlashCommand::parse â€” they return Err(SlashCommandParseError) which
+        // SlashCommand::parse — they return Err(SlashCommandParseError) which
         // formats as the confusing circular "Did you mean /X?" message.
         // STUB_COMMANDS covers both completions-filtered stubs and parse-less
         // spec entries; treat both as unsupported in resume mode.
@@ -618,6 +802,19 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                     eprintln!("/{cmd_root} is not yet implemented in this build");
                 }
                 std::process::exit(2);
+            }
+            if cmd_root == "context" {
+                let report = repl_loop::saved_session_context_report(&session);
+                if output_format == CliOutputFormat::Json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&repl_loop::context_report_json(&report))
+                            .expect("context report json")
+                    );
+                } else {
+                    println!("{}", repl_loop::render_context_report(&report));
+                }
+                continue;
             }
         }
         let command = match SlashCommand::parse(raw_command) {
@@ -755,7 +952,7 @@ impl GitWorkspaceSummary {
                 details.push(format!("{} conflicted", self.conflicted_files));
             }
             format!(
-                "dirty Â· {} files Â· {}",
+                "dirty · {} files · {}",
                 self.changed_files,
                 details.join(", ")
             )
@@ -960,7 +1157,7 @@ fn run_resume_command(
                     session.model.as_deref().unwrap_or("restored-session"),
                     StatusUsage {
                         message_count: session.messages.len(),
-                        turns: tracker.turns(),
+                        turns: prompt_count(session),
                         latest: tracker.current_turn_usage(),
                         cumulative: usage,
                         estimated_tokens: 0,
@@ -972,7 +1169,7 @@ fn run_resume_command(
                     session.model.as_deref(),
                     StatusUsage {
                         message_count: session.messages.len(),
-                        turns: tracker.turns(),
+                        turns: prompt_count(session),
                         latest: tracker.current_turn_usage(),
                         cumulative: usage,
                         estimated_tokens: 0,
@@ -1163,6 +1360,15 @@ fn run_resume_command(
                 })),
             })
         }
+        // The account report reads the gateway, not the saved session.
+        SlashCommand::Usage { .. } => {
+            let report = crate::account::usage_report()?;
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                json: Some(serde_json::json!({ "kind": "usage", "message": report })),
+                message: Some(report),
+            })
+        }
         SlashCommand::Bughunter { .. }
         | SlashCommand::Commit { .. }
         | SlashCommand::Pr { .. }
@@ -1200,7 +1406,6 @@ fn run_resume_command(
         | SlashCommand::Tasks { .. }
         | SlashCommand::Theme { .. }
         | SlashCommand::Voice { .. }
-        | SlashCommand::Usage { .. }
         | SlashCommand::Rename { .. }
         | SlashCommand::Copy { .. }
         | SlashCommand::Hooks { .. }
@@ -1309,15 +1514,12 @@ fn run_stale_base_preflight(flag_value: Option<&str>) {
     }
 }
 
-fn configure_provider_for_model(model: String) -> String {
-    if detect_provider_kind(&model) == ProviderKind::Anthropic {
-        return model;
-    }
-
-    let (api_key, base_url, resolved_model, _provider_label) = resolve_provider(&model);
-    std::env::set_var("OPENAI_API_KEY", api_key);
-    std::env::set_var("OPENAI_BASE_URL", base_url);
-    resolved_model
+/// Selects the provider (see `provider.rs` for the precedence), hands its
+/// credential to the API client in memory and prints one startup line. The
+/// credential is never exported into the environment, so tool, MCP and hook
+/// subprocesses cannot inherit it.
+fn configure_provider_for_model(model: String) -> Result<String, Box<dyn std::error::Error>> {
+    provider::configure_provider(&model)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -1329,122 +1531,19 @@ fn run_repl(
     reasoning_effort: Option<String>,
     allow_broad_cwd: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
-    run_stale_base_preflight(base_commit.as_deref());
-
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    if !crate::auth::check_trust(&cwd) {
-        std::process::exit(1);
-    }
-
-    let resolved_model = configure_provider_for_model(resolve_repl_model(model));
-
-    let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
-    cli.set_reasoning_effort(reasoning_effort);
-    let mut editor =
-        input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
-    println!();
-    println!("{}", cli.startup_banner());
-    println!("{}", format_connected_line(&cli.model));
-
-    // â”€â”€ Persistent footer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    // Shows model, session, and the ? hint so the user knows how
-    // to discover shortcuts without reading the manual.
-    {
-        let dm = "\x1b[2m";
-        let r = "\x1b[0m";
-        let bc = "\x1b[38;2;100;100;100m";
-        let model_s = cli.model.split('/').last().unwrap_or(&cli.model);
-        let session_short = &cli.session.id[..6.min(cli.session.id.len())];
-        println!(
-            "\n{bc}{}{r}\n  {dm}? for shortcuts{r}                       {dm}{model_s} \u{00b7} session {session_short}{r}\n",
-            "\u{2500}".repeat(74),
-        );
-    }
-
-    // â”€â”€ Main REPL loop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    // Input is dispatched through a priority chain:
-    //   1. "?"             â†’ local shortcuts panel  (no API call)
-    //   2. "!<cmd>"        â†’ shell escape           (no API call)
-    //   3. "/exit","/quit" â†’ exit
-    //   4. "/<cmd>"        â†’ slash-command dispatch  (local)
-    //   5. bare skill      â†’ skill prompt            (API call)
-    //   6. everything else â†’ direct LLM prompt       (API call)
-    loop {
-        // Update prompt to reflect current permission mode.
-        editor.set_prompt(&mode_aware_prompt(
-            &cli.permission_mode,
-            cli.plan_mode,
-            cli.orchestration_mode.as_deref(),
-        ));
-        editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
-
-        match editor.read_line()? {
-            input::ReadOutcome::Submit(input) => {
-                let trimmed = input.trim().to_string();
-                if trimmed.is_empty() {
-                    continue;
-                }
-
-                // â”€â”€ Priority 1: "?" â†’ local shortcuts panel â”€â”€â”€â”€â”€â”€
-                if trimmed == "?" || trimmed == "??" {
-                    println!("{}", render_shortcuts_panel());
-                    continue;
-                }
-
-                // â”€â”€ Priority 2: "!<cmd>" â†’ shell escape â”€â”€â”€â”€â”€â”€â”€â”€â”€
-                if let Some(shell_cmd) = trimmed.strip_prefix('!') {
-                    let shell_cmd = shell_cmd.trim();
-                    if !shell_cmd.is_empty() {
-                        run_shell_escape(shell_cmd);
-                    }
-                    continue;
-                }
-
-                // â”€â”€ Priority 3: exit â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-                if matches!(trimmed.as_str(), "/exit" | "/quit") {
-                    cli.persist_session()?;
-                    break;
-                }
-
-                // â”€â”€ Priority 4: slash-command dispatch â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-                match SlashCommand::parse(&trimmed) {
-                    Ok(Some(command)) => {
-                        if cli.handle_repl_command(command)? {
-                            cli.persist_session()?;
-                        }
-                        continue;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        eprintln!("{error}");
-                        continue;
-                    }
-                }
-
-                // â”€â”€ Priority 5: bare-word skill dispatch â”€â”€â”€â”€â”€â”€â”€â”€â”€
-                let cwd = std::env::current_dir().unwrap_or_default();
-                if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &trimmed) {
-                    editor.push_history(input);
-                    cli.record_prompt_history(&trimmed);
-                    cli.run_turn(&prompt)?;
-                    continue;
-                }
-
-                // â”€â”€ Priority 6: forward to LLM â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-                editor.push_history(input);
-                cli.record_prompt_history(&trimmed);
-                cli.run_turn(&trimmed)?;
-            }
-            input::ReadOutcome::Cancel => {}
-            input::ReadOutcome::Exit => {
-                cli.persist_session()?;
-                break;
-            }
-        }
-    }
-
-    Ok(())
+    progress::set_mcp_startup(McpStartup::Background);
+    // The loop itself lives in `repl_loop`: it renders turn and slash-command
+    // failures (and panics) instead of propagating them, so one failed
+    // request never ends the session.
+    repl_loop::launch(repl_loop::ReplLaunch {
+        model,
+        allowed_tools,
+        permission_mode,
+        base_commit,
+        reasoning_effort,
+        allow_broad_cwd,
+        resume: None,
+    })
 }
 
 struct LiveCli {
@@ -1477,8 +1576,15 @@ struct RuntimePluginState {
 struct RuntimeMcpState {
     runtime: tokio::runtime::Runtime,
     manager: McpServerManager,
-    pending_servers: Vec<String>,
+    /// Servers that could not start, or whose transport is unsupported.
+    failed_servers: Vec<String>,
     degraded_report: Option<runtime::McpDegradedReport>,
+    /// A stand-in while the servers start in the background ([`BackgroundMcp`]): it has
+    /// no tools yet, and calls say so.
+    starting: bool,
+    /// A stand-in's background start, which can finish during a turn: the servers are
+    /// taken only before the next one.
+    background: Option<Arc<BackgroundMcpShared>>,
 }
 
 struct BuiltRuntime {
@@ -1587,16 +1693,59 @@ struct ReadMcpResourceRequest {
 
 impl RuntimeMcpState {
     fn new(
-        runtime_config: &runtime::RuntimeConfig,
+        servers: &BTreeMap<String, runtime::ScopedMcpServerConfig>,
     ) -> Result<Option<(Self, runtime::McpToolDiscoveryReport)>, Box<dyn std::error::Error>> {
-        let mut manager = McpServerManager::from_runtime_config(runtime_config);
+        let Some(mut state) = Self::not_started(servers)? else {
+            return Ok(None);
+        };
+        let discovery = state
+            .start(None)
+            .expect("a start without a cancel signal always finishes");
+        Ok(Some((state, discovery)))
+    }
+
+    /// The configured servers, none of them started yet; `None` when there are none.
+    fn not_started(
+        servers: &BTreeMap<String, runtime::ScopedMcpServerConfig>,
+    ) -> Result<Option<Self>, Box<dyn std::error::Error>> {
+        let manager = McpServerManager::from_servers(servers);
         if manager.server_names().is_empty() && manager.unsupported_servers().is_empty() {
             return Ok(None);
         }
+        Ok(Some(Self {
+            runtime: tokio::runtime::Runtime::new()?,
+            manager,
+            failed_servers: Vec::new(),
+            degraded_report: None,
+            starting: false,
+            background: None,
+        }))
+    }
 
-        let runtime = tokio::runtime::Runtime::new()?;
-        let discovery = runtime.block_on(manager.discover_tools_best_effort());
-        let pending_servers = discovery
+    /// Starts the servers and lists their tools. `None` when `cancel` fired first; the
+    /// servers started so far are stopped then.
+    fn start(
+        &mut self,
+        cancel: Option<&tokio::sync::Notify>,
+    ) -> Option<runtime::McpToolDiscoveryReport> {
+        let (runtime, manager) = (&self.runtime, &mut self.manager);
+        let discovery = match cancel {
+            None => runtime.block_on(manager.discover_tools_best_effort()),
+            Some(cancel) => {
+                let finished = runtime.block_on(async {
+                    tokio::select! {
+                        discovery = manager.discover_tools_best_effort() => Some(discovery),
+                        () = cancel.notified() => None,
+                    }
+                });
+                let Some(discovery) = finished else {
+                    let _ = self.shutdown();
+                    return None;
+                };
+                discovery
+            }
+        };
+        let failed_server_list = discovery
             .failed_servers
             .iter()
             .map(|failure| failure.server_name.clone())
@@ -1614,8 +1763,9 @@ impl RuntimeMcpState {
             .iter()
             .map(|tool| tool.qualified_name.clone())
             .collect::<Vec<_>>();
-        let failed_server_names = pending_servers.iter().cloned().collect::<BTreeSet<_>>();
-        let working_servers = manager
+        let failed_server_names = failed_server_list.iter().cloned().collect::<BTreeSet<_>>();
+        let working_servers = self
+            .manager
             .server_names()
             .into_iter()
             .filter(|server_name| !failed_server_names.contains(server_name))
@@ -1652,7 +1802,7 @@ impl RuntimeMcpState {
                     }
                 }))
                 .collect::<Vec<_>>();
-        let degraded_report = (!failed_servers.is_empty()).then(|| {
+        self.degraded_report = (!failed_servers.is_empty()).then(|| {
             runtime::McpDegradedReport::new(
                 working_servers,
                 failed_servers,
@@ -1660,16 +1810,56 @@ impl RuntimeMcpState {
                 available_tools,
             )
         });
+        self.failed_servers = failed_server_list;
+        Some(discovery)
+    }
 
-        Ok(Some((
-            Self {
-                runtime,
-                manager,
-                pending_servers,
-                degraded_report,
-            },
-            discovery,
-        )))
+    /// The error for a call that came before the servers joined.
+    fn still_starting(&self) -> Result<(), ToolError> {
+        if !self.starting {
+            return Ok(());
+        }
+        Err(ToolError::new(match self.background_start() {
+            None => "the MCP servers are still starting; try again in a moment",
+            Some(true) if !self.all_failed() => {
+                "the MCP servers have finished starting; their tools join the next turn"
+            }
+            Some(_) => "the MCP servers could not start",
+        }))
+    }
+
+    /// `None` while a stand-in's servers start in the background; then whether they
+    /// started (during a turn they join the next one).
+    fn background_start(&self) -> Option<bool> {
+        self.background
+            .as_ref()
+            .and_then(|background| background.finished())
+    }
+
+    /// Every server failed (a stand-in whose background start ended counts).
+    fn all_failed(&self) -> bool {
+        let servers = self.server_names();
+        let failed = self.failed_server_names().unwrap_or_default();
+        !servers.is_empty() && servers.iter().all(|server| failed.contains(server))
+    }
+
+    /// ToolSearch's note while a stand-in's servers are missing; `None` otherwise. It
+    /// names the servers as `pending_mcp_servers` and `failed_mcp_servers` list them.
+    fn starting_note(&self) -> Option<String> {
+        if !self.starting {
+            return None;
+        }
+        Some(match self.background_start() {
+            None => "The MCP servers in pending_mcp_servers are still starting, so their tools are not searchable yet; search again in a moment.".to_string(),
+            Some(true) if !self.all_failed() => {
+                let mut note = "The MCP servers have finished starting; their tools join the next turn, not this one.".to_string();
+                if self.failed_server_names().is_some() {
+                    note.push_str(" The ones in failed_mcp_servers could not start.");
+                }
+                note
+            }
+            Some(_) => "The MCP servers in failed_mcp_servers could not start; their tools are unavailable.".to_string(),
+        })
     }
 
     fn shutdown(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -1677,8 +1867,30 @@ impl RuntimeMcpState {
         Ok(())
     }
 
+    /// Servers still starting in the background, whose tools are not searchable yet.
     fn pending_servers(&self) -> Option<Vec<String>> {
-        (!self.pending_servers.is_empty()).then(|| self.pending_servers.clone())
+        (self.starting && self.background_start().is_none())
+            .then(|| self.server_names())
+            .filter(|pending| !pending.is_empty())
+    }
+
+    /// Servers that could not start (or whose transport is unsupported): their tools
+    /// are unavailable. For a stand-in, the ones its background start reported.
+    fn failed_server_names(&self) -> Option<Vec<String>> {
+        let failed = if self.starting {
+            match self.background_start() {
+                None => Vec::new(),
+                Some(true) => self
+                    .background
+                    .as_ref()
+                    .map(|background| background.failed_servers())
+                    .unwrap_or_default(),
+                Some(false) => self.server_names(),
+            }
+        } else {
+            self.failed_servers.clone()
+        };
+        (!failed.is_empty()).then_some(failed)
     }
 
     fn degraded_report(&self) -> Option<runtime::McpDegradedReport> {
@@ -1689,15 +1901,28 @@ impl RuntimeMcpState {
         self.manager.server_names()
     }
 
+    /// Calls an MCP tool. An interrupt or the session's end (`cancel`) abandons the call
+    /// instead of waiting for the server: the server is stopped, and starts again on its
+    /// next call.
     fn call_tool(
         &mut self,
         qualified_tool_name: &str,
         arguments: Option<serde_json::Value>,
+        cancel: &runtime::CancellationToken,
     ) -> Result<String, ToolError> {
+        self.still_starting()?;
         let response = self
             .runtime
-            .block_on(self.manager.call_tool(qualified_tool_name, arguments))
-            .map_err(|error| ToolError::new(error.to_string()))?;
+            .block_on(
+                self.manager
+                    .call_tool_unless_cancelled(qualified_tool_name, arguments, cancel),
+            )
+            .map_err(|error| ToolError::new(error.to_string()))?
+            .ok_or_else(|| {
+                ToolError::new(format!(
+                    "MCP tool `{qualified_tool_name}` was interrupted: the call was abandoned and its server stopped"
+                ))
+            })?;
         if let Some(error) = response.error {
             return Err(ToolError::new(format!(
                 "MCP tool `{qualified_tool_name}` returned JSON-RPC error: {} ({})",
@@ -1714,6 +1939,7 @@ impl RuntimeMcpState {
     }
 
     fn list_resources_for_server(&mut self, server_name: &str) -> Result<String, ToolError> {
+        self.still_starting()?;
         let result = self
             .runtime
             .block_on(self.manager.list_resources(server_name))
@@ -1726,6 +1952,7 @@ impl RuntimeMcpState {
     }
 
     fn list_resources_for_all_servers(&mut self) -> Result<String, ToolError> {
+        self.still_starting()?;
         let mut resources = Vec::new();
         let mut failures = Vec::new();
 
@@ -1762,6 +1989,7 @@ impl RuntimeMcpState {
     }
 
     fn read_resource(&mut self, server_name: &str, uri: &str) -> Result<String, ToolError> {
+        self.still_starting()?;
         let result = self
             .runtime
             .block_on(self.manager.read_resource(server_name, uri))
@@ -1775,9 +2003,9 @@ impl RuntimeMcpState {
 }
 
 fn build_runtime_mcp_state(
-    runtime_config: &runtime::RuntimeConfig,
+    servers: &BTreeMap<String, runtime::ScopedMcpServerConfig>,
 ) -> Result<RuntimePluginStateBuildOutput, Box<dyn std::error::Error>> {
-    let Some((mcp_state, discovery)) = RuntimeMcpState::new(runtime_config)? else {
+    let Some((mcp_state, discovery)) = RuntimeMcpState::new(servers)? else {
         return Ok((None, Vec::new()));
     };
 
@@ -1791,6 +2019,165 @@ fn build_runtime_mcp_state(
     }
 
     Ok((Some(Arc::new(Mutex::new(mcp_state))), runtime_tools))
+}
+
+/// MCP servers starting on a thread of their own, so neither the engine's `ready` nor
+/// the first turn waits for them (a first `npx -y` install takes tens of seconds). Until
+/// then the runtime has a stand-in state and only the MCP wrapper tools; the started
+/// servers and their tools replace it on the next turn (see
+/// `progress::runtime_uses_current_shared_state`).
+struct BackgroundMcp {
+    shared: Arc<BackgroundMcpShared>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+struct BackgroundMcpShared {
+    outcome: Mutex<BackgroundMcpOutcome>,
+    cancel: tokio::sync::Notify,
+    /// The servers that could not start, once the start ended: the stand-in reports
+    /// them after the started servers were taken.
+    failed: Mutex<Vec<String>>,
+}
+
+enum BackgroundMcpOutcome {
+    Starting,
+    Started(Box<RuntimeMcpState>, Vec<RuntimeToolDefinition>),
+    Failed(String),
+    /// Taken by [`BackgroundMcp::take_finished`], or stopped by [`BackgroundMcp::stop`].
+    Done,
+}
+
+/// How long [`BackgroundMcp::stop`] waits for the servers started so far to stop.
+const BACKGROUND_MCP_STOP_WAIT: Duration = Duration::from_secs(3);
+
+impl BackgroundMcp {
+    fn start(servers: BTreeMap<String, runtime::ScopedMcpServerConfig>) -> Self {
+        let shared = Arc::new(BackgroundMcpShared {
+            outcome: Mutex::new(BackgroundMcpOutcome::Starting),
+            cancel: tokio::sync::Notify::new(),
+            failed: Mutex::new(Vec::new()),
+        });
+        let worker = Arc::clone(&shared);
+        let spawned = thread::Builder::new()
+            .name("neuron-mcp-start".to_string())
+            .spawn(move || {
+                let finished = match RuntimeMcpState::not_started(&servers) {
+                    Ok(Some(mut state)) => state.start(Some(&worker.cancel)).map(|discovery| {
+                        worker
+                            .failed
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone_from(&state.failed_servers);
+                        // All the runtime tools: they replace the stand-in's.
+                        let mut tools = discovery
+                            .tools
+                            .iter()
+                            .map(mcp_runtime_tool_definition)
+                            .collect::<Vec<_>>();
+                        tools.extend(mcp_wrapper_tool_definitions());
+                        BackgroundMcpOutcome::Started(Box::new(state), tools)
+                    }),
+                    Ok(None) => Some(BackgroundMcpOutcome::Failed(
+                        "no MCP servers to start".to_string(),
+                    )),
+                    Err(error) => Some(BackgroundMcpOutcome::Failed(error.to_string())),
+                };
+                let mut outcome = worker.lock();
+                match finished {
+                    Some(finished) if matches!(*outcome, BackgroundMcpOutcome::Starting) => {
+                        *outcome = finished;
+                    }
+                    // Stopped while starting: nobody will take these servers.
+                    Some(BackgroundMcpOutcome::Started(mut state, _)) => {
+                        drop(outcome);
+                        let _ = state.shutdown();
+                    }
+                    _ => {}
+                }
+            });
+        let thread = match spawned {
+            Ok(thread) => Some(thread),
+            Err(error) => {
+                *shared.lock() = BackgroundMcpOutcome::Failed(error.to_string());
+                None
+            }
+        };
+        Self { shared, thread }
+    }
+
+    /// The started servers with their tools, or why they could not start; `None` while
+    /// they are still starting, and after the first answer.
+    fn take_finished(
+        &self,
+    ) -> Option<Result<(RuntimeMcpState, Vec<RuntimeToolDefinition>), String>> {
+        let mut outcome = self.shared.lock();
+        match std::mem::replace(&mut *outcome, BackgroundMcpOutcome::Done) {
+            BackgroundMcpOutcome::Started(state, tools) => Some(Ok((*state, tools))),
+            BackgroundMcpOutcome::Failed(error) => Some(Err(error)),
+            starting @ BackgroundMcpOutcome::Starting => {
+                *outcome = starting;
+                None
+            }
+            BackgroundMcpOutcome::Done => None,
+        }
+    }
+
+    /// Stops the start, or the started servers nobody took, and waits a little for them.
+    fn stop(mut self) {
+        let unclaimed = std::mem::replace(&mut *self.shared.lock(), BackgroundMcpOutcome::Done);
+        if let BackgroundMcpOutcome::Started(mut state, _) = unclaimed {
+            let _ = state.shutdown();
+        }
+        // A stored permit: the start may not be waiting on it yet.
+        self.shared.cancel.notify_one();
+        if let Some(thread) = self.thread.take() {
+            let deadline = Instant::now() + BACKGROUND_MCP_STOP_WAIT;
+            while !thread.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
+impl BackgroundMcpShared {
+    fn lock(&self) -> std::sync::MutexGuard<'_, BackgroundMcpOutcome> {
+        self.outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The servers that could not start, once the start ended.
+    fn failed_servers(&self) -> Vec<String> {
+        self.failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// `None` while the servers start; then whether they started (taken counts).
+    fn finished(&self) -> Option<bool> {
+        match &*self.lock() {
+            BackgroundMcpOutcome::Starting => None,
+            BackgroundMcpOutcome::Started(..) | BackgroundMcpOutcome::Done => Some(true),
+            BackgroundMcpOutcome::Failed(_) => Some(false),
+        }
+    }
+}
+
+/// The configured MCP servers without the bundled defaults (codebase-memory, playwright).
+fn mcp_servers_without_bundled(
+    runtime_config: &runtime::RuntimeConfig,
+) -> BTreeMap<String, runtime::ScopedMcpServerConfig> {
+    runtime_config
+        .mcp()
+        .servers()
+        .iter()
+        .filter(|(_, server)| server.scope != ConfigSource::Bundled)
+        .map(|(name, server)| (name.clone(), server.clone()))
+        .collect()
 }
 
 fn mcp_runtime_tool_definition(tool: &runtime::ManagedMcpTool) -> RuntimeToolDefinition {
@@ -1883,6 +2270,10 @@ fn mcp_annotation_flag(tool: &McpTool, key: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Watches for Ctrl-C while a turn runs. The first press cancels the turn's
+/// [`runtime::CancellationToken`] (model stream, tool loop, sub-agents) and
+/// aborts running hooks; a second press asks the REPL to save and quit once
+/// the turn unwinds (see [`repl_loop::request_force_quit`]).
 struct HookAbortMonitor {
     stop_tx: Option<Sender<()>>,
     join_handle: Option<JoinHandle<()>>,
@@ -1890,6 +2281,31 @@ struct HookAbortMonitor {
 
 impl HookAbortMonitor {
     fn spawn(abort_signal: runtime::HookAbortSignal) -> Self {
+        Self::spawn_for_turn(abort_signal, runtime::CancellationToken::new())
+    }
+
+    fn spawn_for_turn(
+        abort_signal: runtime::HookAbortSignal,
+        cancel: runtime::CancellationToken,
+    ) -> Self {
+        Self::spawn_watching(abort_signal, cancel, None)
+    }
+
+    /// [`Self::spawn_for_turn`] for a turn under the full-screen UI, whose Ctrl-C arrives
+    /// as a key press instead of a signal.
+    fn spawn_for_ui_turn(
+        abort_signal: runtime::HookAbortSignal,
+        cancel: runtime::CancellationToken,
+        presses: repl_loop::InterruptPresses,
+    ) -> Self {
+        Self::spawn_watching(abort_signal, cancel, Some(presses))
+    }
+
+    fn spawn_watching(
+        abort_signal: runtime::HookAbortSignal,
+        cancel: runtime::CancellationToken,
+        presses: Option<repl_loop::InterruptPresses>,
+    ) -> Self {
         Self::spawn_with_waiter(abort_signal, move |stop_rx, abort_signal| {
             let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1902,14 +2318,33 @@ impl HookAbortMonitor {
                 let wait_for_stop = tokio::task::spawn_blocking(move || {
                     let _ = stop_rx.recv();
                 });
-
-                tokio::select! {
-                    result = tokio::signal::ctrl_c() => {
-                        if result.is_ok() {
-                            abort_signal.abort();
-                        }
+                let turn_ended = async {
+                    let _ = wait_for_stop.await;
+                };
+                match presses {
+                    None => {
+                        repl_loop::watch_turn_interrupts(
+                            tokio::signal::ctrl_c,
+                            turn_ended,
+                            &cancel,
+                            &abort_signal,
+                            repl_loop::QuitHint::Shown,
+                            repl_loop::request_force_quit,
+                        )
+                        .await;
                     }
-                    _ = wait_for_stop => {}
+                    Some(presses) => {
+                        repl_loop::watch_turn_interrupts(
+                            || presses.next_press(),
+                            turn_ended,
+                            &cancel,
+                            &abort_signal,
+                            // The full-screen UI shows its own key hints.
+                            repl_loop::QuitHint::Hidden,
+                            repl_loop::request_force_quit,
+                        )
+                        .await;
+                    }
                 }
             });
         })
@@ -1945,6 +2380,23 @@ impl LiveCli {
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::with_output(
+            model,
+            enable_tools,
+            allowed_tools,
+            permission_mode,
+            TurnOutput::Ansi,
+        )
+    }
+
+    /// [`Self::new`] whose turns show on `output` instead of the terminal.
+    fn with_output(
+        model: String,
+        enable_tools: bool,
+        allowed_tools: Option<AllowedToolSet>,
+        permission_mode: PermissionMode,
+        output: TurnOutput,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt()?;
         let session_state = new_cli_session()?;
         let session = create_managed_session_handle(&session_state.session_id)?;
@@ -1954,7 +2406,7 @@ impl LiveCli {
             model.clone(),
             system_prompt.clone(),
             enable_tools,
-            true,
+            output,
             allowed_tools.clone(),
             permission_mode,
             None,
@@ -1986,8 +2438,9 @@ impl LiveCli {
             |_| "<unknown>".to_string(),
             |path| {
                 let s = path.display().to_string();
-                if s.len() > 35 {
-                    format!("...{}", &s[s.len() - 32..])
+                let chars = s.chars().count();
+                if chars > 35 {
+                    format!("...{}", s.chars().skip(chars - 32).collect::<String>())
                 } else {
                     s
                 }
@@ -1996,15 +2449,32 @@ impl LiveCli {
         let username = env::var("USERNAME")
             .or_else(|_| env::var("USER"))
             .unwrap_or_else(|_| "Developer".to_string());
-        let model_short = self.model.split('/').last().unwrap_or(&self.model);
-        let provider = if std::env::var("OPENAI_BASE_URL").map_or(false, |u| u.contains("azure")) {
-            "Azure"
-        } else {
-            "OpenRouter"
+        // Long names are cut to fit their panel, so the borders line up.
+        let fit = |text: &str, width: usize| -> String {
+            if text.chars().count() <= width {
+                return text.to_string();
+            }
+            let kept = text
+                .chars()
+                .take(width.saturating_sub(3))
+                .collect::<String>();
+            format!("{kept}...")
         };
+        let model_short = self.model.split('/').last().unwrap_or(&self.model);
+        let active = provider::active_provider();
+        let provider = active.as_ref().map_or_else(
+            || provider::active_provider_name(&self.model),
+            |active| active.id.display_name().to_string(),
+        );
         let version = VERSION;
-        let quota = crate::quota::QuotaState::load();
-        let quota_str = quota.display_compact();
+        // Plan for the gateway, the local daily quota for Azure.
+        let quota_str = match &active {
+            Some(active) if active.id == provider::ProviderId::Azure => {
+                crate::quota::QuotaState::load().display_compact()
+            }
+            Some(active) => active.plan.clone().unwrap_or_else(|| "-".to_string()),
+            None => "-".to_string(),
+        };
 
         // -- Brand colors --
         use crate::brand::*;
@@ -2051,117 +2521,112 @@ impl LiveCli {
             rs = " ".repeat(w_right),
         ));
 
-        // Welcome + Tips heading
-        let welcome = format!("{w}{bd}Welcome back, {user}!{r}", user = username);
+        // A row of the box: each cell padded to its panel's width, art and text alike.
+        let row = |left: &str, right: &str| {
+            format!(
+                "  {b}|{r}{left}{lpad}{b}|{r}{right}{rpad}{b}|{r}",
+                lpad = " ".repeat(w_left.saturating_sub(brand::strip_ansi_len(left))),
+                rpad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(right))),
+            )
+        };
+        let red = RED;
+
+        // Welcome + Tips heading: "Welcome back" after a first session, to the account.
+        let email = crate::auth::current_credential()
+            .ok()
+            .flatten()
+            .filter(|credential| !credential.is_expired(crate::clock::now_unix()))
+            .and_then(|credential| credential.email);
+        let returning = session_mgmt::has_other_saved_session(&self.session.path);
+        let greeting = banner_greeting(email.as_deref(), &username, returning, w_left - 2);
+        let welcome = format!("{w}{bd}{greeting}{r}");
         let tips = format!("{o}{bd}Tips for getting started{r}");
-        lines.push(format!(
-            "  {b}|{r}  {welcome}{wpad}{b}|{r}  {tips}{tpad}{b}|{r}",
-            wpad = " ".repeat(w_left.saturating_sub(brand::strip_ansi_len(&welcome) + 2)),
-            tpad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&tips) + 2)),
-        ));
+        lines.push(row(&format!("  {welcome}"), &format!("  {tips}")));
 
         // Tips content
         let tip1 = format!("{d}Run{r} {o}/init{r} {d}to create a NEURON.md{r}");
-        lines.push(format!(
-            "  {b}|{r}{ls}{b}|{r}  {tip1}{tpad}{b}|{r}",
-            ls = " ".repeat(w_left),
-            tpad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&tip1) + 2)),
-        ));
+        lines.push(row("", &format!("  {tip1}")));
 
         let tip2 = format!("{d}file with project context{r}");
-        lines.push(format!(
-            "  {b}|{r}   {s}*{r}        {s}.{r}        {s}*{r}   {hpad}{b}|{r}  {tip2}{tpad}{b}|{r}",
-            hpad = " ".repeat(w_left.saturating_sub(27)),
-            tpad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&tip2) + 2)),
+        lines.push(row(
+            &format!("   {s}*{r}        {s}.{r}        {s}*{r}"),
+            &format!("  {tip2}"),
         ));
 
         let tip3 = format!("{d}instructions for Neuron...{r}");
-        lines.push(format!(
-            "  {b}|{r}  {s}.{r}  {b}\\--\\{r}    {b}/--/{r}  {s}.{r}   {hpad}{b}|{r}  {tip3}{tpad}{b}|{r}",
-            hpad = " ".repeat(w_left.saturating_sub(27)),
-            tpad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&tip3) + 2)),
+        lines.push(row(
+            &format!("  {s}.{r}  {b}\\--\\{r}    {b}/--/{r}  {s}.{r}"),
+            &format!("  {tip3}"),
         ));
 
         // Helix center rows + what's new
         let whatsnew = format!("{o}{bd}What's new{r}");
-        lines.push(format!(
-            "  {b}|{r} {s}*{r}    {b}\\--{o}X{RED}----{o}X{b}--/{r}    {s}*{r}   {hpad}{b}|{r}{rpad}{b}|{r}",
-            RED=RED, hpad = " ".repeat(w_left.saturating_sub(30)),
-            rpad = " ".repeat(w_right),
+        lines.push(row(
+            &format!(" {s}*{r}    {b}\\--{o}X{red}----{o}X{b}--/{r}    {s}*{r}"),
+            "",
         ));
-
-        lines.push(format!(
-            "  {b}|{r} {s}.{r}  {g}/{b}--/{r}  {s}.  .{r}  {b}\\--{g}\\{r}  {s}.{r}  {hpad}{b}|{r}  {whatsnew}{wpad}{b}|{r}",
-            hpad = " ".repeat(w_left.saturating_sub(30)),
-            wpad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&whatsnew) + 2)),
+        lines.push(row(
+            &format!(" {s}.{r}  {g}/{b}--/{r}  {s}.  .{r}  {b}\\--{g}\\{r}  {s}.{r}"),
+            &format!("  {whatsnew}"),
         ));
 
         // What's new items
         let news = [
-            format!("{d}- 44K token/day Azure quota{r}"),
-            format!("{d}- OpenRouter free fallback{r}"),
-            format!("{d}- {repo_status}{r}"),
+            format!("{d}- Zero-X model catalog: /model{r}"),
+            format!("{d}- Plan usage: /usage, /upgrade{r}"),
+            format!("{d}- {}{r}", fit(&repo_status, w_right - 4)),
             format!("{d}/release-notes for more{r}"),
         ];
-
-        lines.push(format!(
-            "  {b}|{r}    {RED}X{b}--/{r}   {s}.  .{r}   {b}\\--{RED}X{r}   {hpad}{b}|{r}  {n}{npad}{b}|{r}",
-            RED=RED, hpad = " ".repeat(w_left.saturating_sub(30)),
-            n = news[0], npad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&news[0]) + 2)),
+        lines.push(row(
+            &format!("    {red}X{b}--/{r}   {s}.  .{r}   {b}\\--{red}X{r}"),
+            &format!("  {}", news[0]),
         ));
-
-        lines.push(format!(
-            "  {b}|{r} {s}.{r}  {g}\\{b}--/{r}  {s}.  .{r}  {b}\\--{g}/{r}  {s}.{r}  {hpad}{b}|{r}  {n}{npad}{b}|{r}",
-            hpad = " ".repeat(w_left.saturating_sub(30)),
-            n = news[1], npad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&news[1]) + 2)),
+        lines.push(row(
+            &format!(" {s}.{r}  {g}\\{b}--/{r}  {s}.  .{r}  {b}\\--{g}/{r}  {s}.{r}"),
+            &format!("  {}", news[1]),
         ));
-
-        lines.push(format!(
-            "  {b}|{r} {s}*{r}    {b}\\--{o}X{RED}----{o}X{b}--/{r}    {s}*{r}   {hpad}{b}|{r}  {n}{npad}{b}|{r}",
-            RED=RED, hpad = " ".repeat(w_left.saturating_sub(30)),
-            n = news[2], npad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&news[2]) + 2)),
+        lines.push(row(
+            &format!(" {s}*{r}    {b}\\--{o}X{red}----{o}X{b}--/{r}    {s}*{r}"),
+            &format!("  {}", news[2]),
         ));
-
-        lines.push(format!(
-            "  {b}|{r}  {s}.{r}  {b}\\---{r}    {b}\\--/{r}  {s}.{r}   {hpad}{b}|{r}  {n}{npad}{b}|{r}",
-            hpad = " ".repeat(w_left.saturating_sub(27)),
-            n = news[3], npad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&news[3]) + 2)),
+        lines.push(row(
+            &format!("  {s}.{r}  {b}\\---{r}    {b}\\--/{r}  {s}.{r}"),
+            &format!("  {}", news[3]),
         ));
 
         // Neuron branding row
-        lines.push(format!(
-            "  {b}|{r}   {s}*{r}     {ng}     {s}*{r}     {hpad}{b}|{r}{rpad}{b}|{r}",
-            hpad = " ".repeat(w_left.saturating_sub(27)),
-            rpad = " ".repeat(w_right),
-        ));
+        lines.push(row(&format!("   {s}*{r}     {ng}     {s}*{r}"), ""));
 
         // @ zero-x.live
-        lines.push(format!(
-            "  {b}|{r}      {s}@{r} {d}zero-x.live{r}          {hpad}{b}|{r}{rpad}{b}|{r}",
-            hpad = " ".repeat(w_left.saturating_sub(33)),
-            rpad = " ".repeat(w_right),
-        ));
+        lines.push(row(&format!("      {s}@{r} {d}zero-x.live{r}"), ""));
 
-        // Model info
+        // Model info: on one line when it fits, else the model, then the rest.
+        let inner = w_left - 2;
         let model_info = format!(
-            "{g}{ms}{r} {d}.{r} {b}{prov}{r} {d}. Quota: {qs}{r}",
+            "{g}{ms}{r} {d}.{r} {b}{prov}{r} {d}. Plan: {qs}{r}",
             ms = model_short,
             prov = provider,
             qs = quota_str
         );
-        lines.push(format!(
-            "  {b}|{r}  {model_info}{mpad}{b}|{r}{rpad}{b}|{r}",
-            mpad = " ".repeat(w_left.saturating_sub(brand::strip_ansi_len(&model_info) + 2)),
-            rpad = " ".repeat(w_right),
-        ));
+        let model_lines = if brand::strip_ansi_len(&model_info) <= inner {
+            vec![model_info]
+        } else {
+            let rest = format!("{provider} . Plan: {quota_str}");
+            vec![
+                format!("{g}{}{r}", fit(model_short, inner)),
+                if rest.chars().count() <= inner {
+                    format!("{b}{provider}{r} {d}. Plan: {quota_str}{r}")
+                } else {
+                    format!("{d}{}{r}", fit(&rest, inner))
+                },
+            ]
+        };
+        for model_line in model_lines {
+            lines.push(row(&format!("  {model_line}"), ""));
+        }
 
         // CWD
-        let cwd_line = format!("{d}{cwd}{r}");
-        lines.push(format!(
-            "  {b}|{r}  {cwd_line}{cpad}{b}|{r}{rpad}{b}|{r}",
-            cpad = " ".repeat(w_left.saturating_sub(brand::strip_ansi_len(&cwd_line) + 2)),
-            rpad = " ".repeat(w_right),
-        ));
+        lines.push(row(&format!("  {d}{cwd}{r}"), ""));
 
         // Empty row
         lines.push(format!(
@@ -2181,25 +2646,43 @@ impl LiveCli {
     }
 
     fn repl_completion_candidates(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        Ok(slash_command_completion_candidates_with_sessions(
-            &self.model,
-            Some(&self.session.id),
-            list_managed_sessions()?
-                .into_iter()
-                .map(|session| session.id)
-                .collect(),
+        // On Zero-X, `/model` completes catalog ids instead of Anthropic aliases.
+        Ok(gateway_catalog::adjust_model_completions(
+            slash_command_completion_candidates_with_sessions(
+                &self.model,
+                Some(&self.session.id),
+                list_managed_sessions()?
+                    .into_iter()
+                    .map(|session| session.id)
+                    .collect(),
+            ),
         ))
     }
 
+    /// Readies the live runtime for one turn. The runtime (and with it the
+    /// HTTP client, MCP servers and plugins) is reused across turns; it is
+    /// rebuilt only when the tool set, permission mode, output mode or model
+    /// changed, or the shared MCP/plugin state was reloaded. Installs a fresh
+    /// cancellation token and hook-abort signal and returns the Ctrl-C
+    /// monitor guarding the turn.
     fn prepare_turn_runtime(
-        &self,
-        emit_output: bool,
-    ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
-        // â”€â”€ Plan mode: structurally strip write tools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        // Instead of asking the LLM "please don't write", we physically
-        // remove write tools from the tool list.  The LLM never sees
-        // bash, write_file, or edit_file â€” it can only read and search.
-        // This is the Claude Code approach: structural gating, not prompting.
+        &mut self,
+        output: impl Into<TurnOutput>,
+    ) -> Result<HookAbortMonitor, Box<dyn std::error::Error>> {
+        self.prepare_turn_runtime_watching(output, None)
+    }
+
+    /// [`Self::prepare_turn_runtime`] whose monitor watches `presses` (Ctrl-C keys read
+    /// by the full-screen UI) instead of the Ctrl-C signal, when given.
+    fn prepare_turn_runtime_watching(
+        &mut self,
+        output: impl Into<TurnOutput>,
+        presses: Option<repl_loop::InterruptPresses>,
+    ) -> Result<HookAbortMonitor, Box<dyn std::error::Error>> {
+        let output = output.into();
+        // Plan mode structurally strips write tools: instead of asking the
+        // model not to write, bash, write_file and edit_file are removed from
+        // the tool list so it can only read and search.
         let effective_tools = if self.plan_mode {
             let mut read_only: std::collections::BTreeSet<String> =
                 std::collections::BTreeSet::new();
@@ -2211,22 +2694,49 @@ impl LiveCli {
             self.allowed_tools.clone()
         };
 
-        let hook_abort_signal = runtime::HookAbortSignal::new();
-        let runtime = build_runtime(
-            self.runtime.session().clone(),
-            &self.session.id,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            emit_output,
-            effective_tools,
-            self.permission_mode,
-            None,
-        )?
-        .with_hook_abort_signal(hook_abort_signal.clone());
-        let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
+        let needs_rebuild = {
+            let client = self.runtime.api_client();
+            client.allowed_tools() != effective_tools.as_ref()
+                || *client.output() != output
+                || client.model() != self.model
+                || self.runtime.permission_policy().active_mode() != self.permission_mode
+                || !progress::runtime_uses_current_shared_state(&self.runtime)
+        };
+        if needs_rebuild {
+            let reasoning_effort = self
+                .runtime
+                .api_client()
+                .reasoning_effort()
+                .map(ToOwned::to_owned);
+            let mut runtime = build_runtime(
+                self.runtime.session().clone(),
+                &self.session.id,
+                self.model.clone(),
+                self.system_prompt.clone(),
+                true,
+                output,
+                effective_tools,
+                self.permission_mode,
+                None,
+            )?;
+            runtime
+                .api_client_mut()
+                .set_reasoning_effort(reasoning_effort);
+            self.replace_runtime(runtime)?;
+        }
 
-        Ok((runtime, hook_abort_monitor))
+        let cancel = runtime::CancellationToken::new();
+        let hook_abort_signal = runtime::HookAbortSignal::new();
+        self.runtime.set_cancellation_token(cancel.clone());
+        self.runtime
+            .set_hook_abort_signal(hook_abort_signal.clone());
+        tools::set_subagent_cancellation_token(cancel.clone());
+        Ok(match presses {
+            None => HookAbortMonitor::spawn_for_turn(hook_abort_signal, cancel),
+            Some(presses) => {
+                HookAbortMonitor::spawn_for_ui_turn(hook_abort_signal, cancel, presses)
+            }
+        })
     }
 
     fn replace_runtime(&mut self, runtime: BuiltRuntime) -> Result<(), Box<dyn std::error::Error>> {
@@ -2236,69 +2746,26 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        // â”€â”€ Plan-mode prompt wrapping â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        // When plan mode is active, wrap the user's prompt with strict
-        // instructions that produce an architecture plan, NOT full code.
+        // Plan-mode prompt wrapping: while plan mode is active the user's
+        // prompt is wrapped with instructions that produce an architecture
+        // plan, not full code (see `plan_mode`).
         let effective_input: String;
         let actual_input = if self.plan_mode {
-            effective_input = format!(
-                "[PLAN MODE â€” RESEARCH FIRST, THEN PLAN]\n\
-                 You are in plan mode. Follow this two-phase workflow:\n\n\
-                 PHASE 1 â€” RESEARCH:\n\
-                 Use read_file, glob_search, grep_search to explore the codebase.\n\
-                 Understand existing patterns, file structure, and dependencies.\n\
-                 Read NEURON.md or README.md if they exist.\n\
-                 Do NOT skip this â€” your plan quality depends on real context.\n\n\
-                 PHASE 2 â€” STRUCTURED PLAN:\n\
-                 After researching, produce a detailed implementation plan:\n\n\
-                 ## Goal\n\
-                 What we are building and why (2-3 sentences).\n\n\
-                 ## Current State\n\
-                 What exists now â€” relevant files, patterns, tech stack found.\n\n\
-                 ## Architecture\n\
-                 For EACH file (new or modified):\n\
-                 ### `filename`\n\
-                 - Purpose: what this file does\n\
-                 - Key functions/components to create or modify\n\
-                 - How it connects to other files (data flow)\n\n\
-                 ## Implementation Steps\n\
-                 Numbered, detailed steps. Each step should explain:\n\
-                 - What to do\n\
-                 - Why this approach (design rationale)\n\
-                 - Edge cases to handle\n\n\
-                 ## Dependencies\n\
-                 Packages needed with versions.\n\n\
-                 ## Risks & Edge Cases\n\
-                 What could go wrong, browser compat, error handling.\n\n\
-                 ## Verification\n\
-                 Specific test steps to validate the implementation.\n\n\
-                 RULES:\n\
-                 - Do NOT generate full file contents\n\
-                 - Code snippets max 3-5 lines (illustrative only)\n\
-                 - Be detailed in WHAT and WHY, not in raw code\n\n\
-                 User's request: {}\n",
-                input
-            );
+            effective_input = plan_mode::wrap_plan_prompt(input);
             effective_input.as_str()
         } else if self.plan_just_exited {
-            // First prompt after /plan off â€” clear the LLM's context
+            // First prompt after /plan off: tell the model which permission
+            // mode is active again.
             self.plan_just_exited = false;
-            effective_input = format!(
-                "[PLAN MODE ENDED â€” FULL ACCESS RESTORED]\n\
-                 Plan mode has been turned OFF. You now have full write access.\n\
-                 You can and SHOULD use write_file, bash, and all tools to implement.\n\
-                 Execute the changes directly â€” do not ask for permission.\n\n\
-                 User's request: {}\n",
-                input
-            );
+            effective_input = plan_mode::wrap_post_plan_prompt(input, self.permission_mode);
             effective_input.as_str()
         } else if let Some(ref mode) = self.orchestration_mode {
-            // â”€â”€ Orchestration mode â€” delegates to orchestrator module â”€â”€
+            // ── Orchestration mode — delegates to orchestrator module ──
             let api_key = orchestrator::azure_api_key();
             effective_input = match mode.as_str() {
                 "divide" => orchestrator::build_divide_prompt(input),
-                "chain" => orchestrator::run_chain(&api_key, input),
-                "power" => orchestrator::run_power(&api_key, input),
+                "chain" => orchestrator::run_chain(&api_key, input)?,
+                "power" => orchestrator::run_power(&api_key, input)?,
                 _ => input.to_string(),
             };
             effective_input.as_str()
@@ -2306,9 +2773,13 @@ impl LiveCli {
             input
         };
 
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
-        let mut spinner = Spinner::new();
+        let hook_abort_monitor = self.prepare_turn_runtime(true)?;
         let mut stdout = io::stdout();
+        let mut spinner = if stdout.is_terminal() {
+            Spinner::new()
+        } else {
+            Spinner::plain()
+        };
         let spinner_label = if self.plan_mode {
             "\x1b[38;2;65;105;195m\u{25E6}\x1b[0m Planning..."
         } else if self.orchestration_mode.is_some() {
@@ -2326,22 +2797,37 @@ impl LiveCli {
             TerminalRenderer::new().color_theme(),
             &mut stdout,
         )?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(actual_input, Some(&mut permission_prompter));
+        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode)
+            .stopping(self.runtime.cancellation_token().clone());
+        let result = self
+            .runtime
+            .run_turn(actual_input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
+        // Every message was appended to the session file as it was produced;
+        // rewriting the full snapshot keeps disk and memory identical however
+        // the turn ended (including failures and interruptions).
+        let persisted = self.persist_session();
+        // Stopped at the denial limit, not by the user: the run's last line says why.
+        let stopped_by_denials = headless::stopped();
         match result {
             Ok(summary) => {
-                self.replace_runtime(runtime)?;
-                spinner.finish("Done", TerminalRenderer::new().color_theme(), &mut stdout)?;
-                println!();
-
-                // â”€â”€ Record Azure quota usage â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-                // Persist output token count to ~/.neuroncli/quota.json
-                // so the banner shows accurate usage across sessions.
-                if std::env::var("OPENAI_BASE_URL").map_or(false, |u| u.contains("azure")) {
-                    let mut quota = crate::quota::QuotaState::load();
-                    quota.record_azure_usage(summary.usage.output_tokens as u32);
+                let renderer = TerminalRenderer::new();
+                let theme = renderer.color_theme();
+                match &summary.outcome {
+                    runtime::TurnOutcome::Cancelled { .. } if stopped_by_denials => {
+                        spinner.fail("Stopped", theme, &mut stdout)?;
+                    }
+                    runtime::TurnOutcome::Cancelled { .. } => {
+                        spinner.fail("Interrupted", theme, &mut stdout)?;
+                    }
+                    runtime::TurnOutcome::LoopDetected { .. } => {
+                        spinner.fail("Stopped", theme, &mut stdout)?;
+                    }
+                    runtime::TurnOutcome::Completed | runtime::TurnOutcome::OutputTruncated => {
+                        spinner.finish("Done", theme, &mut stdout)?;
+                    }
                 }
+                println!();
 
                 if let Some(event) = summary.auto_compaction {
                     println!(
@@ -2349,16 +2835,29 @@ impl LiveCli {
                         format_auto_compaction_notice(event.removed_message_count)
                     );
                 }
-                self.persist_session()?;
+                // A `neuron prompt` run is not "back at the prompt" afterwards.
+                let hint = if headless::one_shot() {
+                    repl_loop::QuitHint::Hidden
+                } else {
+                    repl_loop::QuitHint::Shown
+                };
+                if let Some(notice) =
+                    repl_loop::describe_turn_outcome(&summary, hint).filter(|_| !stopped_by_denials)
+                {
+                    println!("{notice}");
+                }
+                persisted?;
                 Ok(())
             }
             Err(error) => {
-                runtime.shutdown_plugins()?;
                 spinner.fail(
                     "Request failed",
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
+                if let Err(persist_error) = persisted {
+                    eprintln!("warning: failed to save the session: {persist_error}");
+                }
                 Err(Box::new(error))
             }
         }
@@ -2370,40 +2869,71 @@ impl LiveCli {
         output_format: CliOutputFormat,
         compact: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        match output_format {
+        let result = match output_format {
             CliOutputFormat::Text if compact => self.run_prompt_compact(input),
             CliOutputFormat::Text => self.run_turn(input),
             CliOutputFormat::Json => self.run_prompt_json(input),
-        }
+        };
+        // One-shot mode: the shared MCP servers and plugins end with the turn.
+        progress::shutdown_shared_runtime_state();
+        result
+    }
+
+    /// Runs one non-interactive turn on the live runtime and persists the
+    /// session whether or not the turn succeeded.
+    fn run_one_shot_turn(
+        &mut self,
+        input: &str,
+    ) -> Result<runtime::TurnSummary, Box<dyn std::error::Error>> {
+        let hook_abort_monitor = self.prepare_turn_runtime(false)?;
+        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode)
+            .stopping(self.runtime.cancellation_token().clone());
+        let result = self.runtime.run_turn(input, Some(&mut permission_prompter));
+        hook_abort_monitor.stop();
+        self.persist_session()?;
+        Ok(result?)
     }
 
     fn run_prompt_compact(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter));
-        hook_abort_monitor.stop();
-        let summary = result?;
-        self.replace_runtime(runtime)?;
-        self.persist_session()?;
+        let summary = self.run_one_shot_turn(input)?;
         let final_text = final_assistant_text(&summary);
         println!("{final_text}");
         Ok(())
     }
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter));
-        hook_abort_monitor.stop();
-        let summary = result?;
-        self.replace_runtime(runtime)?;
-        self.persist_session()?;
+        let before = self.runtime.session().messages.len();
+        let summary = match self.run_one_shot_turn(input) {
+            Ok(summary) => summary,
+            Err(error) => {
+                // What the turn did before it failed: a script must not mistake a
+                // failed run that already ran tools for one that did nothing.
+                let messages = self.runtime.session().messages.get(before..).unwrap_or(&[]);
+                println!(
+                    "{}",
+                    failed_turn_json(&error.to_string(), shown_model(&self.model), messages)
+                );
+                return Err(error);
+            }
+        };
+        if let Some(stop) = headless::stop_message() {
+            // Stopped at the denial limit: an error answer, with what the turn did. The
+            // exit code and the stderr line come from `headless::report`.
+            let messages = self.runtime.session().messages.get(before..).unwrap_or(&[]);
+            println!(
+                "{}",
+                failed_turn_json(&stop, shown_model(&self.model), messages)
+            );
+            return Ok(());
+        }
         println!(
             "{}",
             json!({
                 "message": final_assistant_text(&summary),
-                "model": self.model,
+                "model": shown_model(&self.model),
                 "iterations": summary.iterations,
+                "outcome": repl_loop::turn_outcome_label(&summary.outcome),
+                "stop_reason": summary.stop_reason,
                 "auto_compaction": summary.auto_compaction.map(|event| json!({
                     "removed_messages": event.removed_message_count,
                     "notice": format_auto_compaction_notice(event.removed_message_count),
@@ -2417,12 +2947,15 @@ impl LiveCli {
                     "cache_creation_input_tokens": summary.usage.cache_creation_input_tokens,
                     "cache_read_input_tokens": summary.usage.cache_read_input_tokens,
                 },
+                // Gateway and other non-Claude models have no price list here: 0, and
+                // `estimated_cost_known` says the estimate is missing, not free.
                 "estimated_cost": format_usd(
-                    summary.usage.estimate_cost_usd_with_pricing(
-                        pricing_for_model(&self.model)
-                            .unwrap_or_else(runtime::ModelPricing::default_sonnet_tier)
-                    ).total_cost_usd()
-                )
+                    summary
+                        .usage
+                        .estimate_cost_usd_for_model(&self.model)
+                        .map_or(0.0, runtime::UsageCostEstimate::total_cost_usd)
+                ),
+                "estimated_cost_known": pricing_for_model(&self.model).is_some()
             })
         );
         Ok(())
@@ -2552,10 +3085,11 @@ impl LiveCli {
                 println!("{}", format_cost_report(usage));
                 false
             }
-            SlashCommand::Login
-            | SlashCommand::Logout
-            | SlashCommand::Vim
-            | SlashCommand::Upgrade
+            SlashCommand::Login => self.gateway_login()?,
+            SlashCommand::Logout => Self::gateway_logout(),
+            SlashCommand::Usage { .. } => Self::gateway_usage(),
+            SlashCommand::Upgrade => Self::gateway_upgrade(),
+            SlashCommand::Vim
             | SlashCommand::Share
             | SlashCommand::Feedback
             | SlashCommand::Files
@@ -2576,7 +3110,6 @@ impl LiveCli {
             | SlashCommand::Tasks { .. }
             | SlashCommand::Theme { .. }
             | SlashCommand::Voice { .. }
-            | SlashCommand::Usage { .. }
             | SlashCommand::Rename { .. }
             | SlashCommand::Copy { .. }
             | SlashCommand::Hooks { .. }
@@ -2593,10 +3126,10 @@ impl LiveCli {
                 eprintln!("{cmd_name} is not yet implemented in this build.");
                 false
             }
-            // â”€â”€ /plan [on|off] â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-            // Toggles read-only plan mode.  In plan mode the agent can
-            // analyze the codebase, search files, and create plans but
-            // is restricted from modifying files or executing commands.
+            // /plan [on|off]: toggles read-only plan mode. In plan mode the
+            // agent can analyze the codebase, search files, and create plans
+            // but cannot modify files or execute commands. /plan off restores
+            // the permission mode that was active before /plan on.
             SlashCommand::Plan { mode } => {
                 match mode.as_deref().map(str::trim) {
                     Some("on") | None => {
@@ -2604,7 +3137,7 @@ impl LiveCli {
                             eprintln!("\x1b[33m[plan]\x1b[0m Plan mode is already active.");
                         } else {
                             self.plan_mode = true;
-                            self.permission_mode = PermissionMode::ReadOnly;
+                            self.permission_mode = plan_mode::enter_plan_mode(self.permission_mode);
                             eprintln!("\x1b[33m[plan]\x1b[0m \x1b[1mPlan mode ON\x1b[0m");
                             eprintln!(
                                 "  \x1b[2mThe agent will generate architecture plans, not full code.\x1b[0m"
@@ -2620,9 +3153,10 @@ impl LiveCli {
                         } else {
                             self.plan_mode = false;
                             self.plan_just_exited = true;
-                            self.permission_mode = PermissionMode::DangerFullAccess;
+                            self.permission_mode = plan_mode::exit_plan_mode(self.permission_mode);
                             eprintln!(
-                                "\x1b[32m>\x1b[0m \x1b[1mPlan mode OFF\x1b[0m \x1b[2m-- full access restored\x1b[0m"
+                                "\x1b[32m>\x1b[0m \x1b[1mPlan mode OFF\x1b[0m \x1b[2m-- permission mode restored to {}\x1b[0m",
+                                self.permission_mode.as_str()
                             );
                             eprintln!(
                                 "  \x1b[2mType \"execute the plan\" to implement it now.\x1b[0m"
@@ -2635,7 +3169,7 @@ impl LiveCli {
                 }
                 false
             }
-            // â”€â”€ Orchestration modes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            // ── Orchestration modes ─────────────────────────────
             SlashCommand::Divide { task } => {
                 match task.as_deref().map(str::trim) {
                     Some("off") => {
@@ -2686,14 +3220,12 @@ impl LiveCli {
                     _ => {
                         self.orchestration_mode = Some("power".to_string());
                         eprintln!(
-                            "\x1b[31m[power]\x1b[0m \x1b[1mPower mode ON\x1b[0m \x1b[2m-- ensemble merge (maximum quality)\x1b[0m"
+                            "\x1b[31m[power]\x1b[0m \x1b[1mPower mode ON\x1b[0m \x1b[2m-- parallel proposals and merge\x1b[0m"
                         );
                         eprintln!(
-                            "  \x1b[2mAll models generate the same module simultaneously.\x1b[0m"
+                            "  \x1b[2mAgents draft alternative solutions in parallel.\x1b[0m"
                         );
-                        eprintln!(
-                            "  \x1b[2mA merge agent combines the BEST PARTS from each.\x1b[0m"
-                        );
+                        eprintln!("  \x1b[2mA merge phase combines the candidate results.\x1b[0m");
                         eprintln!("  \x1b[2mType /power off to deactivate.\x1b[0m");
                     }
                 }
@@ -2712,23 +3244,24 @@ impl LiveCli {
     }
 
     fn print_status(&self) {
+        println!("{}", self.status_report());
+    }
+
+    fn status_report(&self) -> String {
         let cumulative = self.runtime.usage().cumulative_usage();
         let latest = self.runtime.usage().current_turn_usage();
-        println!(
-            "{}",
-            format_status_report(
-                &self.model,
-                StatusUsage {
-                    message_count: self.runtime.session().messages.len(),
-                    turns: self.runtime.usage().turns(),
-                    latest,
-                    cumulative,
-                    estimated_tokens: self.runtime.estimated_tokens(),
-                },
-                self.permission_mode.as_str(),
-                &status_context(Some(&self.session.path)).expect("status context should load"),
-            )
-        );
+        format_status_report(
+            &self.model,
+            StatusUsage {
+                message_count: self.runtime.session().messages.len(),
+                turns: prompt_count(self.runtime.session()),
+                latest,
+                cumulative,
+                estimated_tokens: self.runtime.estimated_tokens(),
+            },
+            self.permission_mode.as_str(),
+            &status_context(Some(&self.session.path)).expect("status context should load"),
+        )
     }
 
     fn record_prompt_history(&mut self, prompt: &str) {
@@ -2744,7 +3277,9 @@ impl LiveCli {
         };
         self.prompt_history.push(entry);
         if let Err(error) = self.runtime.session_mut().push_prompt_entry(prompt) {
-            eprintln!("warning: failed to persist prompt history: {error}");
+            runtime::ui_hooks::notice(&format!(
+                "warning: failed to persist prompt history: {error}"
+            ));
         }
     }
 
@@ -2800,13 +3335,19 @@ impl LiveCli {
                 format_model_report(
                     &self.model,
                     self.runtime.session().messages.len(),
-                    self.runtime.usage().turns(),
+                    prompt_count(self.runtime.session()),
                 )
             );
+            if let Some(listing) = gateway_repl::gateway_model_listing(&self.model) {
+                println!("\n{listing}");
+            }
             return Ok(false);
         };
 
-        let model = resolve_model_alias_with_config(&model);
+        let model = self.resolve_model_choice(&model);
+        if let Some(warning) = gateway_repl::gateway_model_warning(&model) {
+            eprintln!("{warning}");
+        }
 
         if model == self.model {
             println!(
@@ -2814,7 +3355,7 @@ impl LiveCli {
                 format_model_report(
                     &self.model,
                     self.runtime.session().messages.len(),
-                    self.runtime.usage().turns(),
+                    prompt_count(self.runtime.session()),
                 )
             );
             return Ok(false);
@@ -2841,6 +3382,17 @@ impl LiveCli {
             format_model_switch_report(&previous, &model, message_count)
         );
         Ok(true)
+    }
+
+    /// The model id `/model <model>` switches to: aliases resolved, and kept on the
+    /// OpenAI-compatible route when the current model uses it.
+    fn resolve_model_choice(&self, model: &str) -> String {
+        let model = resolve_model_alias_with_config(model);
+        if self.model.starts_with("openai/") && !model.starts_with("openai/") {
+            format!("openai/{model}")
+        } else {
+            model
+        }
     }
 
     fn set_permissions(
@@ -2911,16 +3463,20 @@ impl LiveCli {
             None,
         )?;
         self.replace_runtime(runtime)?;
-        println!(
+        println!("{}", self.session_cleared_report(&previous_session));
+        Ok(true)
+    }
+
+    fn session_cleared_report(&self, previous_session: &SessionHandle) -> String {
+        format!(
             "Session cleared\n  Mode             fresh session\n  Previous session {}\n  Resume previous  /resume {}\n  Preserved model  {}\n  Permission mode  {}\n  New session      {}\n  Session file     {}",
             previous_session.id,
             previous_session.id,
-            self.model,
+            shown_model(&self.model),
             self.permission_mode.as_str(),
             self.session.id,
             self.session.path.display(),
-        );
-        Ok(true)
+        )
     }
 
     fn print_cost(&self) {
@@ -2961,7 +3517,7 @@ impl LiveCli {
             format_resume_report(
                 &self.session.path.display().to_string(),
                 message_count,
-                self.runtime.usage().turns(),
+                prompt_count(self.runtime.session()),
             )
         );
         Ok(true)
@@ -3411,7 +3967,7 @@ fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Erro
 
     let mut output = String::new();
 
-    // â”€â”€ Color codes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── Color codes ─────────────────────────────────────────
     let r = "\x1b[0m"; // reset
     let add = "\x1b[32m"; // green
     let del = "\x1b[31m"; // red
@@ -3422,8 +3978,8 @@ fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Erro
 
     let render_colored_diff = |raw: &str, label: &str| -> String {
         let mut buf = String::new();
-        let border = format!("{bc}â”€{r}").repeat(30);
-        buf.push_str(&format!("\n  {hdr}â–¸ {label}{r}\n  {border}\n"));
+        let border = format!("{bc}─{r}").repeat(30);
+        buf.push_str(&format!("\n  {hdr}▸ {label}{r}\n  {border}\n"));
 
         let mut file_count = 0u32;
         let mut adds = 0u32;
@@ -3432,9 +3988,9 @@ fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Erro
         for line in raw.lines() {
             if line.starts_with("diff --git") {
                 file_count += 1;
-                // Extract filename: "diff --git a/foo.rs b/foo.rs" â†’ "foo.rs"
+                // Extract filename: "diff --git a/foo.rs b/foo.rs" → "foo.rs"
                 let fname = line.rsplit(" b/").next().unwrap_or(line);
-                buf.push_str(&format!("\n  {hdr}â”â”â” {fname} â”â”â”{r}\n"));
+                buf.push_str(&format!("\n  {hdr}━━━ {fname} ━━━{r}\n"));
             } else if line.starts_with("---") || line.starts_with("+++") {
                 // Skip raw --- a/file / +++ b/file (redundant with above)
             } else if line.starts_with("@@") {
@@ -3467,7 +4023,7 @@ fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Erro
 
         // Summary line
         buf.push_str(&format!(
-            "\n  {bc}â”€{r} {add}+{adds}{r} {del}-{dels}{r} in {file_count} file{}\n",
+            "\n  {bc}─{r} {add}+{adds}{r} {del}-{dels}{r} in {file_count} file{}\n",
             if file_count == 1 { "" } else { "s" }
         ));
         buf
@@ -3718,7 +4274,7 @@ fn render_prompt_history_report(entries: &[PromptHistoryEntry], limit: usize) ->
         "Prompt history".to_string(),
         format!("  Total            {total}"),
         format!("  Showing          {} most recent", shown.len()),
-        format!("  Reverse search   Ctrl-R in the REPL"),
+        "  Reverse search   Ctrl-R in the REPL".to_string(),
         String::new(),
     ];
     for (offset, entry) in shown.iter().enumerate() {
@@ -3797,7 +4353,7 @@ fn truncate_for_prompt(value: &str, limit: usize) -> String {
         value.trim().to_string()
     } else {
         let truncated = value.chars().take(limit).collect::<String>();
-        format!("{}\nâ€¦[truncated]", truncated.trim_end())
+        format!("{}\n…[truncated]", truncated.trim_end())
     }
 }
 
@@ -4077,14 +4633,14 @@ fn short_tool_id(id: &str) -> String {
         return id.to_string();
     }
     let prefix: String = id.chars().take(12).collect();
-    format!("{prefix}â€¦")
+    format!("{prefix}…")
 }
 
 fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let mut prompt = load_system_prompt(cwd.clone(), DEFAULT_DATE, env::consts::OS, "unknown")?;
 
-    // â”€â”€ Cascade: inject codebase context into system prompt â”€â”€
+    // ── Cascade: inject codebase context into system prompt ──
     let repo_map = crate::repo_map::RepoMap::build(&cwd);
     if repo_map.total_files > 0 {
         prompt.push(repo_map.render());
@@ -4105,6 +4661,18 @@ fn build_runtime_plugin_state_with_loader(
     loader: &ConfigLoader,
     runtime_config: &runtime::RuntimeConfig,
 ) -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
+    build_runtime_plugin_state_starting_mcp(cwd, loader, runtime_config, McpStartup::Wait)
+        .map(|(state, _)| state)
+}
+
+/// [`build_runtime_plugin_state_with_loader`] with the MCP servers started as `startup`
+/// says; the [`BackgroundMcp`] is there when they start in the background.
+fn build_runtime_plugin_state_starting_mcp(
+    cwd: &Path,
+    loader: &ConfigLoader,
+    runtime_config: &runtime::RuntimeConfig,
+    startup: McpStartup,
+) -> Result<(RuntimePluginState, Option<BackgroundMcp>), Box<dyn std::error::Error>> {
     let plugin_manager = build_plugin_manager(cwd, loader, runtime_config);
     let plugin_registry = plugin_manager.plugin_registry()?;
     let plugin_hook_config =
@@ -4113,15 +4681,53 @@ fn build_runtime_plugin_state_with_loader(
         .feature_config()
         .clone()
         .with_hooks(runtime_config.hooks().merged(&plugin_hook_config));
-    let (mcp_state, runtime_tools) = build_runtime_mcp_state(runtime_config)?;
+    let servers = match startup {
+        McpStartup::WaitWithoutBundled => {
+            let servers = mcp_servers_without_bundled(runtime_config);
+            // ToolSearch tells the model, which would otherwise keep looking for them.
+            progress::set_left_out_bundled_mcp_servers(
+                runtime_config
+                    .mcp()
+                    .servers()
+                    .keys()
+                    .filter(|name| !servers.contains_key(*name))
+                    .cloned()
+                    .collect(),
+            );
+            servers
+        }
+        McpStartup::Wait | McpStartup::Background => runtime_config.mcp().servers().clone(),
+    };
+    let stand_in = match startup {
+        McpStartup::Background => {
+            RuntimeMcpState::not_started(&servers)?.filter(|state| !state.server_names().is_empty())
+        }
+        McpStartup::Wait | McpStartup::WaitWithoutBundled => None,
+    };
+    let (mcp_state, runtime_tools, background) = if let Some(mut stand_in) = stand_in {
+        let background = BackgroundMcp::start(servers);
+        stand_in.starting = true;
+        stand_in.background = Some(Arc::clone(&background.shared));
+        (
+            Some(Arc::new(Mutex::new(stand_in))),
+            mcp_wrapper_tool_definitions(),
+            Some(background),
+        )
+    } else {
+        let (mcp_state, runtime_tools) = build_runtime_mcp_state(&servers)?;
+        (mcp_state, runtime_tools, None)
+    };
     let tool_registry = GlobalToolRegistry::with_plugin_tools(plugin_registry.aggregated_tools()?)?
         .with_runtime_tools(runtime_tools)?;
-    Ok(RuntimePluginState {
-        feature_config,
-        tool_registry,
-        plugin_registry,
-        mcp_state,
-    })
+    Ok((
+        RuntimePluginState {
+            feature_config,
+            tool_registry,
+            plugin_registry,
+            mcp_state,
+        },
+        background,
+    ))
 }
 
 fn build_plugin_manager(
@@ -4174,30 +4780,31 @@ fn runtime_hook_config_from_plugin_hooks(hooks: PluginHooks) -> runtime::Runtime
 #[cfg(test)]
 mod tests {
     use super::{
-        build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
-        collect_session_prompt_history, create_managed_session_handle, describe_tool_progress,
-        filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
-        format_commit_skipped_report, format_compact_report, format_connected_line,
-        format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
-        format_issue_report, format_model_report, format_model_switch_report,
-        format_permissions_report, format_permissions_switch_report, format_pr_report,
-        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
-        format_ultraplan_report, format_unknown_slash_command,
+        build_runtime_plugin_state_starting_mcp, build_runtime_plugin_state_with_loader,
+        build_runtime_with_plugin_state, collect_session_prompt_history,
+        create_managed_session_handle, describe_tool_progress, filter_tool_specs,
+        format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
+        format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
+        format_internal_prompt_progress_line, format_issue_report, format_model_report,
+        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
+        format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
+        format_tool_result, format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
-        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
-        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
-        parse_history_count, permission_policy, print_help_to, push_output_block,
-        render_config_report, render_diff_report, render_diff_report_for, render_memory_report,
-        render_prompt_history_report, render_repl_help, render_resume_usage,
+        mcp_servers_without_bundled, merge_prompt_with_stdin, normalize_permission_mode,
+        parse_args, parse_export_args, parse_git_status_branch, parse_git_status_metadata_for,
+        parse_git_workspace_summary, parse_history_count, permission_policy, print_help_to,
+        push_output_block, render_config_report, render_diff_report, render_diff_report_for,
+        render_memory_report, render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
         resolve_repl_model, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, status_context,
         summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_no_args,
-        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
+        write_mcp_server_fixture, BackgroundMcp, BackgroundMcpOutcome, BackgroundMcpShared,
+        CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        PromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
-        STUB_COMMANDS,
+        McpStartup, PromptHistoryEntry, RuntimeMcpState, SlashCommand, StatusUsage,
+        BACKGROUND_MCP_STOP_WAIT, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -4213,9 +4820,9 @@ mod tests {
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
     use std::thread;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use tools::GlobalToolRegistry;
 
     fn registry_with_plugin_tool() -> GlobalToolRegistry {
@@ -4396,6 +5003,43 @@ mod tests {
         );
     }
 
+    /// Contract v1.2: a prompt above the free per-minute token budget is a
+    /// `context_length_exceeded` whose message names the budget, with
+    /// `upgrade_url` when a paid pool would take it.
+    #[test]
+    fn gateway_context_length_errors_show_the_budget_message_and_upgrade_link() {
+        let message = "This request is too large for the free per-minute token budget (120,000 tokens, prompt plus max_tokens). Shorten the conversation or lower max_tokens, or upgrade for paid capacity.";
+        let body = serde_json::json!({"error": {
+            "message": message,
+            "type": "invalid_request_error",
+            "code": "context_length_exceeded",
+            "param": null,
+            "request_id": "req_budget",
+            "upgrade_url": "https://zero-x.live/pricing"
+        }})
+        .to_string();
+        let gateway = api::GatewayError::from_body(reqwest::StatusCode::BAD_REQUEST, &body)
+            .expect("gateway error body");
+        let error = ApiError::Gateway(Box::new(gateway));
+        assert!(error.is_context_window_failure());
+
+        let rendered = format_user_visible_api_error("session-budget", &error);
+        assert!(rendered.contains("context_window_blocked"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("Detail           {message}")),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Upgrade          https://zero-x.live/pricing"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Trace            req_budget"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Compact          /compact"), "{rendered}");
+    }
+
     fn temp_dir() -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -4421,14 +5065,14 @@ mod tests {
         );
     }
 
-    fn env_lock() -> MutexGuard<'static, ()> {
+    pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn with_current_dir<T>(cwd: &Path, f: impl FnOnce() -> T) -> T {
+    pub(crate) fn with_current_dir<T>(cwd: &Path, f: impl FnOnce() -> T) -> T {
         let _guard = cwd_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -4709,6 +5353,46 @@ mod tests {
         assert_eq!(merged, "standalone body");
     }
 
+    /// `cat log | neuron prompt "explain this log"`: the log reaches the model after
+    /// the prompt; a pipe that sends nothing leaves the prompt as typed.
+    #[test]
+    fn piped_stdin_is_merged_into_the_prompt_and_a_silent_pipe_is_not() {
+        let log = "2026-10-24 ERROR db timeout\n2026-10-24 ERROR retry failed\n";
+        let read = crate::headless::read_piped(
+            std::io::Cursor::new(log),
+            Some(crate::headless::STDIN_WAIT),
+            crate::headless::STDIN_MAX_BYTES,
+        );
+        let crate::headless::PipedStdin::Text { text, truncated } = read else {
+            panic!("the log was read: {read:?}");
+        };
+        assert!(!truncated);
+        assert_eq!(
+            merge_prompt_with_stdin("explain this log", Some(&text)),
+            "explain this log\n\n2026-10-24 ERROR db timeout\n2026-10-24 ERROR retry failed"
+        );
+
+        struct Silent(std::sync::mpsc::Receiver<()>);
+        impl std::io::Read for Silent {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                let _ = self.0.recv();
+                Ok(0)
+            }
+        }
+        let (release, never) = std::sync::mpsc::channel();
+        let read = crate::headless::read_piped(
+            Silent(never),
+            Some(crate::headless::STDIN_WAIT),
+            crate::headless::STDIN_MAX_BYTES,
+        );
+        drop(release);
+        assert_eq!(read, crate::headless::PipedStdin::Silent);
+        assert_eq!(
+            merge_prompt_with_stdin("explain this log", None),
+            "explain this log"
+        );
+    }
+
     #[test]
     fn parses_bare_prompt_and_json_output_flag() {
         let _guard = env_lock();
@@ -4834,7 +5518,10 @@ mod tests {
         .expect("project config should write");
 
         let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_trust = std::env::var_os("NEURON_TRUST_WORKSPACE");
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        // Workspace aliases only apply to a trusted workspace.
+        std::env::set_var("NEURON_TRUST_WORKSPACE", "1");
 
         // when
         let direct = with_current_dir(&cwd, || resolve_model_alias_with_config("fast"));
@@ -4847,6 +5534,10 @@ mod tests {
             Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
             None => std::env::remove_var("CLAW_CONFIG_HOME"),
         }
+        match original_trust {
+            Some(value) => std::env::set_var("NEURON_TRUST_WORKSPACE", value),
+            None => std::env::remove_var("NEURON_TRUST_WORKSPACE"),
+        }
         std::fs::remove_dir_all(root).expect("temp config root should clean up");
 
         // then
@@ -4855,6 +5546,55 @@ mod tests {
         assert_eq!(cross_provider, "grok-3-mini");
         assert_eq!(unknown, "unknown-model");
         assert_eq!(builtin, "claude-haiku-4-5-20251213");
+    }
+
+    #[test]
+    fn workspace_model_aliases_apply_once_the_workspace_is_trusted() {
+        // given: arguments are parsed before the trust prompt is answered
+        let _guard = env_lock();
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let config_home = root.join("config-home");
+        std::fs::create_dir_all(cwd.join(".neuron")).expect("project config dir should exist");
+        std::fs::create_dir_all(&config_home).expect("config home should exist");
+        std::fs::write(
+            cwd.join(".neuron").join("settings.json"),
+            r#"{"aliases":{"fast":"claude-haiku-4-5-20251213"}}"#,
+        )
+        .expect("project config should write");
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_trust = std::env::var_os("NEURON_TRUST_WORKSPACE");
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::remove_var("NEURON_TRUST_WORKSPACE");
+
+        // when
+        let args = vec!["--model".to_string(), "fast".to_string(), "hi".to_string()];
+        let parsed = with_current_dir(&cwd, || parse_args(&args)).expect("args should parse");
+        let CliAction::Prompt { model, .. } = parsed else {
+            panic!("expected a prompt action");
+        };
+        let untrusted = with_current_dir(&cwd, || crate::args::model_after_trust(model.clone()));
+        std::env::set_var("NEURON_TRUST_WORKSPACE", "1");
+        let trusted = with_current_dir(&cwd, || crate::args::model_after_trust(model.clone()));
+        let unrelated = with_current_dir(&cwd, || {
+            crate::args::model_after_trust("claude-opus-4-6".to_string())
+        });
+
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_trust {
+            Some(value) => std::env::set_var("NEURON_TRUST_WORKSPACE", value),
+            None => std::env::remove_var("NEURON_TRUST_WORKSPACE"),
+        }
+        std::fs::remove_dir_all(root).expect("temp config root should clean up");
+
+        // then
+        assert_eq!(model, "fast");
+        assert_eq!(untrusted, "fast");
+        assert_eq!(trusted, "claude-haiku-4-5-20251213");
+        assert_eq!(unrelated, "claude-opus-4-6");
     }
 
     #[test]
@@ -4994,11 +5734,48 @@ mod tests {
     }
 
     #[test]
-    fn removed_login_and_logout_subcommands_error_helpfully() {
-        let login = parse_args(&["login".to_string()]).expect_err("login should be removed");
-        assert!(login.contains("ANTHROPIC_API_KEY"));
-        let logout = parse_args(&["logout".to_string()]).expect_err("logout should be removed");
-        assert!(logout.contains("ANTHROPIC_AUTH_TOKEN"));
+    fn login_and_logout_after_global_options_error_helpfully() {
+        // `neuron login` itself runs before parsing (auth::account_command); this is what
+        // the parser says if it ever sees it.
+        let login = parse_args(&["login".to_string()]).expect_err("login is not a parser action");
+        assert!(login.contains("`neuron login [--no-browser | --with-token]`"));
+        // The hint is about quoting, not about other providers' keys.
+        assert!(!login.contains("ANTHROPIC_API_KEY"), "{login}");
+        assert!(
+            login.ends_with("or use `neuron prompt \"login ...\"`."),
+            "{login}"
+        );
+        // An unquoted prompt that starts with the name of an account command that signs
+        // in or out or opens a page is not guessed.
+        for words in [
+            &["login", "to", "the", "server", "and", "fix", "it"][..],
+            &["logout", "to", "the", "server", "and", "fix", "it"],
+            &["upgrade", "to", "the", "server", "and", "fix", "it"],
+            &["auth", "login", "now", "please"],
+            &["auth", "logout", "everything"],
+            &["usage", "--bogus"],
+        ] {
+            let error = parse_args(&words.iter().map(ToString::to_string).collect::<Vec<_>>())
+                .expect_err("ambiguous");
+            assert!(error.contains("quote it"), "{error}");
+            assert!(error.contains("neuron prompt"), "{error}");
+        }
+        // `usage` and `auth status` only show something: other words are a prompt.
+        for words in [
+            &["usage", "of", "memory", "spikes", "under", "load"][..],
+            &["auth", "middleware", "rejects", "valid", "tokens"],
+        ] {
+            assert!(
+                matches!(
+                    parse_args(&words.iter().map(ToString::to_string).collect::<Vec<_>>()),
+                    Ok(CliAction::Prompt { prompt, .. }) if prompt == words.join(" ")
+                ),
+                "{words:?}"
+            );
+        }
+        let logout =
+            parse_args(&["logout".to_string()]).expect_err("logout is not a parser action");
+        assert!(!logout.contains("ANTHROPIC_AUTH_TOKEN"), "{logout}");
         assert_eq!(
             parse_args(&["doctor".to_string()]).expect("doctor should parse"),
             CliAction::Doctor {
@@ -5049,25 +5826,16 @@ mod tests {
                 output_format: CliOutputFormat::Text,
             }
         );
-        assert_eq!(
-            parse_args(&[
-                "skills".to_string(),
-                "help".to_string(),
-                "overview".to_string()
-            ])
-            .expect("skills help overview should invoke"),
-            CliAction::Prompt {
-                prompt: "$help overview".to_string(),
-                model: DEFAULT_MODEL.to_string(),
-                output_format: CliOutputFormat::Text,
-                allowed_tools: None,
-                permission_mode: crate::default_permission_mode(),
-                compact: false,
-                base_commit: None,
-                reasoning_effort: None,
-                allow_broad_cwd: false,
-            }
-        );
+        // `skills NAME ...` runs skill NAME; there is no skill "help", so the words are an
+        // unquoted prompt.
+        let error = parse_args(&[
+            "skills".to_string(),
+            "help".to_string(),
+            "overview".to_string(),
+        ])
+        .expect_err("skills help overview names no skill");
+        assert!(error.contains("there is no skill named `help`"), "{error}");
+        assert!(error.contains("neuron prompt \"skills ...\""), "{error}");
         assert_eq!(
             parse_args(&["agents".to_string(), "--help".to_string()])
                 .expect("agents help should parse"),
@@ -5391,7 +6159,7 @@ mod tests {
         assert!(markdown.contains("How do I list files?"));
         assert!(markdown.contains("## 2. Assistant"));
         assert!(markdown.contains("**Tool call** `bash`"));
-        assert!(markdown.contains("toolu_abcdefâ€¦"));
+        assert!(markdown.contains("toolu_abcdef…"));
         assert!(markdown.contains("ls -la"));
         assert!(markdown.contains("## 3. Tool"));
         assert!(markdown.contains("**Tool result** `bash`"));
@@ -5455,7 +6223,7 @@ mod tests {
         let trimmed_short = short_tool_id(short);
 
         // then
-        assert_eq!(trimmed_long, "toolu_01ABCDâ€¦");
+        assert_eq!(trimmed_long, "toolu_01ABCD…");
         assert_eq!(trimmed_short, "tool_1");
     }
 
@@ -5494,14 +6262,14 @@ mod tests {
     fn multi_word_prompt_still_uses_shorthand_prompt_mode() {
         let _guard = env_lock();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
-        // Input is ["help", "me", "debug"] so the joined prompt shorthand
-        // must be "help me debug". A previous batch accidentally rewrote
-        // the expected string to "$help overview" (copy-paste slip).
+        // Input is ["explain", "me", "this"] so the joined prompt shorthand
+        // must be "explain me this". (A prompt that starts with a subcommand
+        // such as `help` needs quotes: see the next test.)
         assert_eq!(
-            parse_args(&["help".to_string(), "me".to_string(), "debug".to_string()])
+            parse_args(&["explain".to_string(), "me".to_string(), "this".to_string()])
                 .expect("prompt shorthand should still work"),
             CliAction::Prompt {
-                prompt: "help me debug".to_string(),
+                prompt: "explain me this".to_string(),
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
@@ -5512,6 +6280,184 @@ mod tests {
                 allow_broad_cwd: false,
             }
         );
+        // Quoted, it is one argument: a prompt.
+        assert!(matches!(
+            parse_args(&["init the database schema".to_string()]),
+            Ok(CliAction::Prompt { prompt, .. }) if prompt == "init the database schema"
+        ));
+    }
+
+    #[test]
+    fn unquoted_prompts_that_start_with_a_subcommand_that_shows_something_go_to_the_model() {
+        let words = |values: &[&str]| values.iter().map(ToString::to_string).collect::<Vec<_>>();
+        for command in [
+            vec!["help", "me", "debug", "this", "test"],
+            vec!["status", "of", "the", "build", "is", "red,", "fix", "it"],
+            vec!["mcp", "server", "crashes", "on", "start"],
+            vec!["agents", "keep", "timing", "out"],
+            vec!["version", "of", "python"],
+            vec!["sandbox", "the", "tests"],
+            vec!["doctor", "the", "results"],
+            vec!["state", "machine", "refactor"],
+            vec!["agents", "list", "them"],
+            vec!["mcp", "show", "the", "github", "server"],
+            vec!["acp", "protocol", "notes"],
+            vec!["help", "me", "fix", "the", "--verbose", "flag"],
+        ] {
+            let parsed = parse_args(&words(&command));
+            assert!(
+                matches!(&parsed, Ok(CliAction::Prompt { prompt, .. }) if *prompt == command.join(" ")),
+                "{command:?}: {parsed:?}"
+            );
+        }
+        // After global flags too.
+        assert!(matches!(
+            parse_args(&words(&["--model", "sonnet", "help", "me", "debug"])),
+            Ok(CliAction::Prompt { prompt, .. }) if prompt == "help me debug"
+        ));
+    }
+
+    #[test]
+    fn unquoted_prompts_that_start_with_a_subcommand_are_refused_not_run() {
+        let words = |values: &[&str]| values.iter().map(ToString::to_string).collect::<Vec<_>>();
+        for command in [
+            vec!["init", "the", "database", "schema"],
+            // An option right after the name was meant for the command.
+            vec!["status", "-x"],
+            vec!["agents", "--bogus", "flag"],
+            vec!["bootstrap-plan", "for", "me"],
+            vec!["dump-manifests", "of", "the", "repo"],
+            vec!["system-prompt", "rewrite"],
+            vec!["export", "the", "database", "schema"],
+            vec!["export", "summary"],
+            vec!["--model", "sonnet", "init", "the", "repo"],
+            vec!["skills", "install", "a", "b"],
+        ] {
+            let error = parse_args(&words(&command)).expect_err(&command.join(" "));
+            let name = command
+                .iter()
+                .find(|word| !word.starts_with('-') && **word != "sonnet")
+                .unwrap();
+            assert!(
+                error.contains(&format!("`neuron prompt \"{name} ...\"`")),
+                "{command:?}: {error}"
+            );
+            assert!(error.contains("quote it"), "{command:?}: {error}");
+        }
+        let error = parse_args(&words(&["init", "the", "database", "schema"])).unwrap_err();
+        assert!(
+            error.starts_with(
+                "`init` is a neuron command (`neuron init`) and does not take `the database schema`."
+            ),
+            "{error}"
+        );
+        // Unknown options are still named by the subcommand's own parser.
+        assert_eq!(
+            parse_args(&words(&["dump-manifests", "--bogus"])).unwrap_err(),
+            "unknown dump-manifests option: --bogus"
+        );
+        assert_eq!(
+            parse_args(&words(&["export", "--bogus"])).unwrap_err(),
+            "unknown export option: --bogus"
+        );
+        // A bare word is not taken for a file name: the error says what would be.
+        let error = parse_args(&words(&["export", "summary"])).unwrap_err();
+        assert!(
+            error.contains("`summary.md`") && error.contains("`./summary`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn subcommands_keep_the_arguments_they_take() {
+        let words = |values: &[&str]| values.iter().map(ToString::to_string).collect::<Vec<_>>();
+        for command in [
+            vec!["agents", "list"],
+            vec!["agents", "help"],
+            vec!["agents", "list", "--help"],
+            vec!["mcp", "list"],
+            vec!["mcp", "show", "github"],
+            vec!["mcp", "show", "github", "help"],
+            vec!["mcp", "serve"],
+            vec!["mcp", "-h"],
+            vec!["acp", "serve"],
+            vec!["skills", "list"],
+            vec!["skills", "--help"],
+            vec!["skills", "install", "./fixtures/help-skill"],
+            vec!["dump-manifests", "--manifests-dir", "upstream"],
+            vec![
+                "system-prompt",
+                "--cwd",
+                "/tmp/project",
+                "--date",
+                "2026-04-01",
+            ],
+            vec!["export", "notes.md"],
+            vec!["export", "out/notes"],
+            vec!["export", "-o", "notes"],
+            vec!["export", "--session", "latest", "-o", "notes.md"],
+            vec!["status", "--help"],
+            vec!["init", "--help"],
+            vec!["--output-format", "json", "init"],
+        ] {
+            assert!(
+                parse_args(&words(&command)).is_ok(),
+                "{command:?}: {:?}",
+                parse_args(&words(&command))
+            );
+        }
+        assert_eq!(
+            parse_args(&words(&["init", "--output-format", "json"])).unwrap(),
+            CliAction::Init {
+                output_format: CliOutputFormat::Json,
+            }
+        );
+        // A slash command's alias gets the same guidance as its name.
+        let error = parse_args(&words(&["plugins"])).unwrap_err();
+        assert!(error.contains("/plugins"), "{error}");
+    }
+
+    #[test]
+    fn skills_subcommand_runs_a_known_skill_and_refuses_other_words() {
+        let _guard = env_lock();
+        let workspace = temp_dir();
+        write_skill_fixture(
+            &workspace.join(".codex").join("skills"),
+            "caveman",
+            "Project skill fixture",
+        );
+        let words = |values: &[&str]| values.iter().map(ToString::to_string).collect::<Vec<_>>();
+
+        let parsed = with_current_dir(&workspace, || {
+            parse_args(&words(&["skills", "caveman", "sharpen", "club"]))
+        });
+        assert!(
+            matches!(&parsed, Ok(CliAction::Prompt { prompt, .. }) if prompt == "$caveman sharpen club"),
+            "{parsed:?}"
+        );
+        let error = with_current_dir(&workspace, || {
+            parse_args(&words(&["skills", "that", "are", "installed"]))
+        })
+        .unwrap_err();
+        // The quoting hint first, and no list of every skill.
+        assert!(
+            error.starts_with(
+                "`skills` runs a skill (`neuron skills [list|install <path>|help|<skill> [args]]`), and there is no skill named `that`. To send a prompt"
+            ),
+            "{error}"
+        );
+        assert!(!error.contains("Available skills"), "{error}");
+        assert!(!error.contains("caveman"), "not close to `that`: {error}");
+        // A close name is suggested.
+        let typo = with_current_dir(&workspace, || {
+            parse_args(&words(&["skills", "cavemen", "please"]))
+        })
+        .unwrap_err();
+        assert!(typo.contains("Did you mean: caveman"), "{typo}");
+        assert!(typo.contains("`neuron prompt \"skills ...\"`"), "{typo}");
+        assert!(error.contains("`neuron prompt \"skills ...\"`"), "{error}");
+
+        fs::remove_dir_all(workspace).expect("workspace should clean up");
     }
 
     #[test]
@@ -5642,10 +6588,8 @@ mod tests {
     fn formats_namespaced_omc_slash_command_with_contract_guidance() {
         let report = format_unknown_slash_command_message("oh-my-claudecode:hud");
         assert!(report.contains("unknown slash command: /oh-my-claudecode:hud"));
-        assert!(report.contains("Claude Code/OMC plugin command"));
-        assert!(report.contains("plugin slash commands"));
-        assert!(report.contains("statusline"));
-        assert!(report.contains("session hooks"));
+        assert!(report.contains("does not yet load plugin slash commands"));
+        assert!(!report.contains("Claude"), "{report}");
     }
 
     #[test]
@@ -5661,6 +6605,7 @@ mod tests {
                 session_path: PathBuf::from("session.jsonl"),
                 commands: vec!["/compact".to_string()],
                 output_format: CliOutputFormat::Text,
+                launch: crate::ResumeLaunchOptions::default(),
             }
         );
     }
@@ -5673,6 +6618,7 @@ mod tests {
                 session_path: PathBuf::from("latest"),
                 commands: vec![],
                 output_format: CliOutputFormat::Text,
+                launch: crate::ResumeLaunchOptions::default(),
             }
         );
         assert_eq!(
@@ -5682,6 +6628,7 @@ mod tests {
                 session_path: PathBuf::from("latest"),
                 commands: vec!["/status".to_string()],
                 output_format: CliOutputFormat::Text,
+                launch: crate::ResumeLaunchOptions::default(),
             }
         );
     }
@@ -5705,6 +6652,7 @@ mod tests {
                     "/cost".to_string(),
                 ],
                 output_format: CliOutputFormat::Text,
+                launch: crate::ResumeLaunchOptions::default(),
             }
         );
     }
@@ -5736,6 +6684,7 @@ mod tests {
                     "/clear --confirm".to_string(),
                 ],
                 output_format: CliOutputFormat::Text,
+                launch: crate::ResumeLaunchOptions::default(),
             }
         );
     }
@@ -5755,6 +6704,7 @@ mod tests {
                 session_path: PathBuf::from("session.jsonl"),
                 commands: vec!["/export /tmp/notes.txt".to_string(), "/status".to_string()],
                 output_format: CliOutputFormat::Text,
+                launch: crate::ResumeLaunchOptions::default(),
             }
         );
     }
@@ -5893,7 +6843,15 @@ mod tests {
         // Inject dummy credentials so LiveCli can construct without real Anthropic key
         std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-banner-test");
         let root = temp_dir();
+        let config_home = temp_dir();
         fs::create_dir_all(&root).expect("root dir");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{"defaultMcpServers":false}"#,
+        )
+        .expect("settings should disable default MCP servers");
+        std::env::set_var("NEURON_CONFIG_HOME", &config_home);
 
         let banner = with_current_dir(&root, || {
             LiveCli::new(
@@ -5909,8 +6867,42 @@ mod tests {
         assert!(banner.contains("Tips for getting started"));
         assert!(banner.contains("What's new"));
 
+        // A long model name and user name are cut to fit: every row of the box is as
+        // wide as its borders.
+        let username = std::env::var_os("USERNAME");
+        std::env::set_var("USERNAME", "a-very-long-user-name-for-the-banner-test");
+        let banner = with_current_dir(&root, || {
+            LiveCli::new(
+                "claude-sonnet-4-6-with-a-very-long-experimental-suffix-x".to_string(),
+                true,
+                None,
+                PermissionMode::DangerFullAccess,
+            )
+            .expect("cli should initialize")
+            .startup_banner()
+        });
+        match username {
+            Some(username) => std::env::set_var("USERNAME", username),
+            None => std::env::remove_var("USERNAME"),
+        }
+        let widths = banner
+            .lines()
+            .skip(1)
+            .map(crate::brand::strip_ansi_len)
+            .collect::<Vec<_>>();
+        assert!(
+            widths.iter().all(|width| *width == widths[0]),
+            "{widths:?}\n{banner}"
+        );
+        assert!(
+            banner.contains("claude-sonnet-4-6-with-a-very-lon..."),
+            "{banner}"
+        );
+
         fs::remove_dir_all(root).expect("cleanup temp dir");
+        fs::remove_dir_all(config_home).expect("cleanup config home");
         std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("NEURON_CONFIG_HOME");
     }
 
     #[test]
@@ -6071,10 +7063,19 @@ mod tests {
         assert!(help.contains("neuron mcp"));
         assert!(help.contains("neuron skills"));
         assert!(help.contains("neuron /skills"));
-        assert!(help.contains("RAHUL-DevelopeRR/claw-code"));
-        assert!(help.contains("cargo install neuron-cli"));
-        assert!(!help.contains("neuron login"));
-        assert!(!help.contains("neuron logout"));
+        assert!(help.contains("https://github.com/RAHUL-DevelopeRR/neuron-v2"));
+        assert!(help.contains("npm install -g @zero-x.live/neuron"));
+        assert!(help.contains("pipx install neuroncli"));
+        assert!(help.contains("install.sh"));
+        assert!(!help.contains("claw-code"));
+        assert!(!help.contains("cargo install neuron-cli"));
+        assert!(help.contains("--provider NAME"));
+        assert!(help.contains("--reasoning-effort LEVEL"));
+        // The top-level account commands.
+        assert!(help.contains("neuron login [--no-browser | --with-token]"));
+        assert!(help.contains("neuron logout"));
+        assert!(help.contains("neuron usage"));
+        assert!(help.contains("neuron upgrade [--no-browser]"));
     }
 
     #[test]
@@ -6144,8 +7145,9 @@ mod tests {
         assert!(status.contains("Cwd              /tmp/project"));
         assert!(status.contains("Project root     /tmp"));
         assert!(status.contains("Git branch       main"));
-        assert!(status
-            .contains("Git state        dirty Â· 3 files Â· 1 staged, 1 unstaged, 1 untracked"));
+        assert!(
+            status.contains("Git state        dirty · 3 files · 1 staged, 1 unstaged, 1 untracked")
+        );
         assert!(status.contains("Changed files    3"));
         assert!(status.contains("Staged           1"));
         assert!(status.contains("Unstaged         1"));
@@ -6153,7 +7155,7 @@ mod tests {
         assert!(status.contains("Session          session.jsonl"));
         assert!(status.contains("Config files     loaded 2/3"));
         assert!(status.contains("Memory files     4"));
-        assert!(status.contains("Suggested flow   /status â†’ /diff â†’ /commit"));
+        assert!(status.contains("Suggested flow   /status → /diff → /commit"));
     }
 
     #[test]
@@ -6169,7 +7171,7 @@ mod tests {
         let preflight = format_commit_preflight_report(Some("feature/ux"), summary);
         assert!(preflight.contains("Result           ready"));
         assert!(preflight.contains("Branch           feature/ux"));
-        assert!(preflight.contains("Workspace        dirty Â· 2 files Â· 1 staged, 1 unstaged"));
+        assert!(preflight.contains("Workspace        dirty · 2 files · 1 staged, 1 unstaged"));
         assert!(preflight
             .contains("Action           create a git commit from the current workspace changes"));
     }
@@ -6294,7 +7296,7 @@ UU conflicted.rs",
         );
         assert_eq!(
             summary.headline(),
-            "dirty Â· 4 files Â· 2 staged, 2 unstaged, 1 untracked, 1 conflicted"
+            "dirty · 4 files · 2 staged, 2 unstaged, 1 untracked, 1 conflicted"
         );
     }
 
@@ -6478,13 +7480,14 @@ UU conflicted.rs",
 
     #[test]
     fn managed_sessions_default_to_jsonl_and_resolve_legacy_json() {
-        let _guard = cwd_guard();
+        // The store is built for the workspace instead of switching the
+        // process cwd: on Windows a child process another test spawns
+        // meanwhile would inherit that cwd and keep the directory busy.
         let workspace = temp_workspace("session-resolution");
         std::fs::create_dir_all(&workspace).expect("workspace should create");
-        let previous = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&workspace).expect("switch cwd");
+        let store = crate::session_mgmt::session_store_in(&workspace).expect("store");
 
-        let handle = create_managed_session_handle("session-alpha").expect("jsonl handle");
+        let handle = store.create_handle("session-alpha");
         assert!(handle.path.ends_with("session-alpha.jsonl"));
 
         let legacy_path = workspace.join(".claw/sessions/legacy.json");
@@ -6500,7 +7503,8 @@ UU conflicted.rs",
             .save_to_path(&legacy_path)
             .expect("legacy session should save");
 
-        let resolved = resolve_session_reference("legacy").expect("legacy session should resolve");
+        let resolved = crate::session_mgmt::resolve_session_reference_in_store(&store, "legacy")
+            .expect("legacy session should resolve");
         assert_eq!(
             resolved
                 .path
@@ -6511,31 +7515,29 @@ UU conflicted.rs",
                 .expect("legacy path should exist")
         );
 
-        std::env::set_current_dir(previous).expect("restore cwd");
         std::fs::remove_dir_all(workspace).expect("workspace should clean up");
     }
 
     #[test]
     fn latest_session_alias_resolves_most_recent_managed_session() {
-        let _guard = cwd_guard();
         let workspace = temp_workspace("latest-session-alias");
         std::fs::create_dir_all(&workspace).expect("workspace should create");
-        let previous = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&workspace).expect("switch cwd");
+        let store = runtime::SessionStore::from_cwd(&workspace).expect("session store");
 
-        let older = create_managed_session_handle("session-older").expect("older handle");
+        let older = store.create_handle("session-older");
         Session::new()
             .with_persistence_path(older.path.clone())
             .save_to_path(&older.path)
             .expect("older session should save");
         std::thread::sleep(Duration::from_millis(20));
-        let newer = create_managed_session_handle("session-newer").expect("newer handle");
+        let newer = store.create_handle("session-newer");
         Session::new()
             .with_persistence_path(newer.path.clone())
             .save_to_path(&newer.path)
             .expect("newer session should save");
 
-        let resolved = resolve_session_reference("latest").expect("latest session should resolve");
+        let resolved = crate::session_mgmt::resolve_session_reference_in_store(&store, "latest")
+            .expect("latest session should resolve");
         assert_eq!(
             resolved
                 .path
@@ -6544,19 +7546,19 @@ UU conflicted.rs",
             newer.path.canonicalize().expect("newer path should exist")
         );
 
-        std::env::set_current_dir(previous).expect("restore cwd");
         std::fs::remove_dir_all(workspace).expect("workspace should clean up");
     }
 
     #[test]
     fn load_session_reference_rejects_workspace_mismatch() {
-        let _guard = cwd_guard();
+        // Loads through workspace B's store instead of switching the process
+        // cwd, which raced other tests (a child process spawned meanwhile
+        // inherited the cwd and kept workspace B from being deleted).
         let workspace_a = temp_workspace("session-mismatch-a");
         let workspace_b = temp_workspace("session-mismatch-b");
         std::fs::create_dir_all(&workspace_a).expect("workspace a should create");
         std::fs::create_dir_all(&workspace_b).expect("workspace b should create");
-        let previous = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&workspace_b).expect("switch cwd");
+        let store_b = crate::session_mgmt::session_store_in(&workspace_b).expect("store");
 
         let session_path = workspace_a.join(".neuron/sessions/legacy-cross.jsonl");
         std::fs::create_dir_all(
@@ -6571,8 +7573,11 @@ UU conflicted.rs",
             .save_to_path(&session_path)
             .expect("session should save");
 
-        let error = crate::load_session_reference(&session_path.display().to_string())
-            .expect_err("mismatched workspace should fail");
+        let error = crate::session_mgmt::load_session_reference_in_store(
+            &store_b,
+            &session_path.display().to_string(),
+        )
+        .expect_err("mismatched workspace should fail");
         assert!(
             error.to_string().contains("session workspace mismatch"),
             "unexpected error: {error}"
@@ -6590,7 +7595,6 @@ UU conflicted.rs",
             "expected originating workspace in error: {error}"
         );
 
-        std::env::set_current_dir(previous).expect("restore cwd");
         std::fs::remove_dir_all(workspace_a).expect("workspace a should clean up");
         std::fs::remove_dir_all(workspace_b).expect("workspace b should clean up");
     }
@@ -6607,8 +7611,8 @@ UU conflicted.rs",
     fn unknown_omc_slash_command_guidance_explains_runtime_gap() {
         let message = format_unknown_slash_command("oh-my-claudecode:hud");
         assert!(message.contains("Unknown slash command: /oh-my-claudecode:hud"));
-        assert!(message.contains("Claude Code/OMC plugin command"));
         assert!(message.contains("does not yet load plugin slash commands"));
+        assert!(!message.contains("Claude"), "{message}");
     }
 
     #[test]
@@ -7033,7 +8037,7 @@ UU conflicted.rs",
             OutputContentBlock::Text {
                 text: "# Heading".to_string(),
             },
-            &mut out,
+            &mut crate::turn_sink::AnsiSink::new(&mut out),
             &mut events,
             &mut pending_tool,
             false,
@@ -7059,7 +8063,7 @@ UU conflicted.rs",
                 name: "read_file".to_string(),
                 input: json!({}),
             },
-            &mut out,
+            &mut crate::turn_sink::AnsiSink::new(&mut out),
             &mut events,
             &mut pending_tool,
             true,
@@ -7067,7 +8071,7 @@ UU conflicted.rs",
         )
         .expect("tool block should accumulate");
 
-        assert!(events.is_empty());
+        assert_eq!(events, []);
         assert_eq!(
             pending_tool,
             Some(("tool-1".to_string(), "read_file".to_string(), String::new(),))
@@ -7098,7 +8102,7 @@ UU conflicted.rs",
                 },
                 request_id: None,
             },
-            &mut out,
+            &mut crate::turn_sink::AnsiSink::new(&mut out),
         )
         .expect("response conversion should succeed");
 
@@ -7133,7 +8137,7 @@ UU conflicted.rs",
                 },
                 request_id: None,
             },
-            &mut out,
+            &mut crate::turn_sink::AnsiSink::new(&mut out),
         )
         .expect("response conversion should succeed");
 
@@ -7172,7 +8176,7 @@ UU conflicted.rs",
                 },
                 request_id: None,
             },
-            &mut out,
+            &mut crate::turn_sink::AnsiSink::new(&mut out),
         )
         .expect("response conversion should succeed");
 
@@ -7181,7 +8185,7 @@ UU conflicted.rs",
             AssistantEvent::TextDelta(text) if text == "Final answer"
         ));
         let rendered = String::from_utf8(out).expect("utf8");
-        assert!(rendered.contains("â–¶ Thinking (6 chars hidden)"));
+        assert!(rendered.contains("▶ Thinking (6 chars hidden)"));
         assert!(!rendered.contains("step 1"));
     }
 
@@ -7194,6 +8198,11 @@ UU conflicted.rs",
         fs::create_dir_all(&workspace).expect("workspace");
         fs::create_dir_all(&source_root).expect("source root");
         write_plugin_fixture(&source_root, "hook-runtime-demo", true, false);
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{"defaultMcpServers":false}"#,
+        )
+        .expect("disable external MCPs in plugin fixture");
 
         let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
         manager
@@ -7224,17 +8233,30 @@ UU conflicted.rs",
         fs::create_dir_all(&workspace).expect("workspace");
         let script_path = workspace.join("fixture-mcp.py");
         write_mcp_server_fixture(&script_path);
+        let (python_command, python_args) = fixture_python();
+        let alpha_args = [
+            python_args.clone(),
+            vec![script_path.to_string_lossy().into_owned()],
+        ]
+        .concat();
+        let broken_args = [
+            python_args,
+            vec!["-c".to_string(), "import sys; sys.exit(0)".to_string()],
+        ]
+        .concat();
         fs::write(
             config_home.join("settings.json"),
             serde_json::to_string_pretty(&json!({
+                "defaultMcpServers": false,
                 "mcpServers": {
                     "alpha": {
-                        "command": "python3",
-                        "args": [script_path.to_string_lossy()]
+                        "command": python_command,
+                        "args": alpha_args,
+                        "env": {"NEURON_MCP_FRAMING": "content-length"}
                     },
                     "broken": {
-                        "command": "python3",
-                        "args": ["-c", "import sys; sys.exit(0)"]
+                        "command": python_command,
+                        "args": broken_args
                     }
                 }
             }))
@@ -7285,7 +8307,9 @@ UU conflicted.rs",
         let search_json: serde_json::Value =
             serde_json::from_str(&search_output).expect("search output should be json");
         assert_eq!(search_json["matches"][0], "mcp__alpha__echo");
-        assert_eq!(search_json["pending_mcp_servers"][0], "broken");
+        // It failed: nothing is pending.
+        assert_eq!(search_json["pending_mcp_servers"], serde_json::Value::Null);
+        assert_eq!(search_json["failed_mcp_servers"], json!(["broken"]));
         assert_eq!(
             search_json["mcp_degraded"]["failed_servers"][0]["server_name"],
             "broken"
@@ -7331,6 +8355,344 @@ UU conflicted.rs",
         let _ = fs::remove_dir_all(workspace);
     }
 
+    /// The Python that runs the MCP server fixture: the `py -3` launcher on Windows, or
+    /// `python` where only that is installed.
+    fn fixture_python() -> (&'static str, Vec<String>) {
+        if !cfg!(windows) {
+            return ("python3", Vec::new());
+        }
+        if Command::new("py").arg("--version").output().is_ok() {
+            ("py", vec!["-3".to_string()])
+        } else {
+            ("python", Vec::new())
+        }
+    }
+
+    #[test]
+    fn a_failed_json_turn_reports_what_it_did_first() {
+        let messages = vec![
+            ConversationMessage {
+                role: MessageRole::Assistant,
+                blocks: vec![
+                    ContentBlock::Text {
+                        text: "Running the tests.".to_string(),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "t1".to_string(),
+                        name: "bash".to_string(),
+                        input: r#"{"command":"cargo test"}"#.to_string(),
+                    },
+                ],
+                usage: Some(runtime::TokenUsage {
+                    input_tokens: 1_200,
+                    output_tokens: 40,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 300,
+                }),
+            },
+            ConversationMessage {
+                role: MessageRole::Tool,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".to_string(),
+                    tool_name: "bash".to_string(),
+                    output: "exit_code:1".to_string(),
+                    is_error: true,
+                }],
+                usage: None,
+            },
+            // The runtime's note closing the failed turn.
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: format!(
+                    "{}gateway returned 503]",
+                    runtime::FAILED_RESPONSE_NOTE_PREFIX
+                ),
+            }]),
+        ];
+        let report = super::failed_turn_json("gateway returned 503", "auto", &messages);
+        assert_eq!(report["type"], "error");
+        assert_eq!(report["error"], "gateway returned 503");
+        assert_eq!(report["message"], "Running the tests.");
+        assert_eq!(report["tool_uses"][0]["name"], "bash");
+        assert_eq!(report["tool_results"][0]["is_error"], true);
+        // The billed model call is reported, not lost with the failure.
+        assert_eq!(report["usage"]["input_tokens"], 1_200);
+        assert_eq!(report["usage"]["output_tokens"], 40);
+        assert_eq!(report["usage"]["cache_read_input_tokens"], 300);
+    }
+
+    /// A workspace whose settings configure the fixture server `alpha` only.
+    fn workspace_with_fixture_mcp_server() -> (PathBuf, PathBuf) {
+        let config_home = temp_dir();
+        let workspace = temp_dir();
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let script_path = workspace.join("fixture-mcp.py");
+        write_mcp_server_fixture(&script_path);
+        let (command, mut args) = fixture_python();
+        args.push(script_path.to_string_lossy().into_owned());
+        fs::write(
+            config_home.join("settings.json"),
+            json!({
+                "defaultMcpServers": false,
+                "mcpServers": {
+                    "alpha": {
+                        "command": command,
+                        "args": args,
+                        "env": {"NEURON_MCP_FRAMING": "content-length"}
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write mcp settings");
+        (config_home, workspace)
+    }
+
+    #[test]
+    fn mcp_servers_started_in_the_background_join_once_they_are_up() {
+        let (config_home, workspace) = workspace_with_fixture_mcp_server();
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let runtime_config = loader.load().expect("runtime config should load");
+        let (state, background) = build_runtime_plugin_state_starting_mcp(
+            &workspace,
+            &loader,
+            &runtime_config,
+            McpStartup::Background,
+        )
+        .expect("runtime plugin state should build at once");
+        let background = background.expect("the servers start in the background");
+
+        // Until then: the wrapper tools, and a stand-in that says the servers are starting.
+        let tools = state
+            .tool_registry
+            .definitions(None)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        assert!(tools.contains(&"MCPTool".to_string()));
+        assert!(!tools.contains(&"mcp__alpha__echo".to_string()));
+        let mut executor = CliToolExecutor::new(
+            None,
+            false,
+            state.tool_registry.clone(),
+            state.mcp_state.clone(),
+        );
+        let early = executor
+            .execute(
+                "MCPTool",
+                r#"{"qualifiedName":"mcp__alpha__echo","arguments":{"text":"early"}}"#,
+            )
+            .expect_err("no MCP tool runs before the servers started");
+        assert!(early.to_string().contains("still starting"), "{early}");
+        // ToolSearch says so too, instead of an empty answer.
+        let search: serde_json::Value = serde_json::from_str(
+            &executor
+                .execute("ToolSearch", r#"{"query":"alpha echo","max_results":5}"#)
+                .expect("tool search runs while the servers start"),
+        )
+        .expect("search output is json");
+        assert_eq!(search["pending_mcp_servers"], json!(["alpha"]), "{search}");
+        assert!(
+            search["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("still starting")),
+            "{search}"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let (mut started, tools) = loop {
+            if let Some(finished) = background.take_finished() {
+                break finished.expect("the fixture server starts");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the fixture server never started"
+            );
+            thread::sleep(Duration::from_millis(50));
+        };
+        assert!(
+            tools.iter().any(|tool| tool.name == "mcp__alpha__echo"),
+            "the started server's tools come with it"
+        );
+        assert!(!started.starting);
+        assert!(background.take_finished().is_none(), "taken once");
+        started.shutdown().expect("mcp shutdown should succeed");
+        background.stop();
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn a_background_start_that_fails_during_a_turn_lists_the_server_as_failed() {
+        let workspace = temp_dir();
+        let config_home = workspace.join("config-home");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::write(
+            config_home.join("settings.json"),
+            json!({
+                "defaultMcpServers": false,
+                "mcpServers": {"alpha": {"command": "neuron-test-no-such-mcp-server"}}
+            })
+            .to_string(),
+        )
+        .expect("write mcp settings");
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let runtime_config = loader.load().expect("runtime config should load");
+        let (state, background) = build_runtime_plugin_state_starting_mcp(
+            &workspace,
+            &loader,
+            &runtime_config,
+            McpStartup::Background,
+        )
+        .expect("runtime plugin state should build at once");
+        let background = background.expect("the servers start in the background");
+        let mut executor = CliToolExecutor::new(
+            None,
+            false,
+            state.tool_registry.clone(),
+            state.mcp_state.clone(),
+        );
+
+        // The start ends while this turn's runtime still has the stand-in.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while background.shared.finished().is_none() {
+            assert!(Instant::now() < deadline, "the start never ended");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let search: serde_json::Value = serde_json::from_str(
+            &executor
+                .execute("ToolSearch", r#"{"query":"alpha echo","max_results":5}"#)
+                .expect("tool search runs"),
+        )
+        .expect("search output is json");
+        // Its start ended, and the server failed: listed as failed, not pending, and the
+        // note says so.
+        assert_eq!(
+            search["pending_mcp_servers"],
+            serde_json::Value::Null,
+            "{search}"
+        );
+        assert_eq!(search["failed_mcp_servers"], json!(["alpha"]), "{search}");
+        assert!(
+            search["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("could not start")),
+            "{search}"
+        );
+        let call = executor
+            .execute(
+                "MCPTool",
+                r#"{"qualifiedName":"mcp__alpha__echo","arguments":{}}"#,
+            )
+            .expect_err("the stand-in runs no tool");
+        assert!(call.to_string().contains("could not start"), "{call}");
+
+        background.stop();
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    /// ToolSearch listed every server as pending while its note said they had finished
+    /// starting, failed ones included.
+    #[test]
+    fn a_finished_background_start_lists_only_its_failed_servers_and_none_as_pending() {
+        let workspace = temp_dir();
+        let config_home = workspace.join("config-home");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::write(
+            config_home.join("settings.json"),
+            json!({
+                "defaultMcpServers": false,
+                "mcpServers": {
+                    "alpha": {"command": "neuron-test-alpha"},
+                    "codebase-memory": {"command": "neuron-test-codebase-memory"}
+                }
+            })
+            .to_string(),
+        )
+        .expect("write mcp settings");
+        let runtime_config = ConfigLoader::new(&workspace, &config_home)
+            .load()
+            .expect("runtime config should load");
+        let mut stand_in = RuntimeMcpState::not_started(runtime_config.mcp().servers())
+            .expect("state")
+            .expect("servers");
+        let background = Arc::new(BackgroundMcpShared {
+            outcome: Mutex::new(BackgroundMcpOutcome::Starting),
+            cancel: tokio::sync::Notify::new(),
+            failed: Mutex::new(Vec::new()),
+        });
+        stand_in.starting = true;
+        stand_in.background = Some(Arc::clone(&background));
+
+        // Starting: all pending, none failed.
+        assert_eq!(
+            stand_in.pending_servers(),
+            Some(vec!["alpha".to_string(), "codebase-memory".to_string()])
+        );
+        assert_eq!(stand_in.failed_server_names(), None);
+
+        // Started, but one failed (its tools join the next turn: the servers were taken).
+        *background.failed.lock().expect("failed") = vec!["codebase-memory".to_string()];
+        *background.lock() = BackgroundMcpOutcome::Done;
+        assert_eq!(stand_in.pending_servers(), None);
+        assert_eq!(
+            stand_in.failed_server_names(),
+            Some(vec!["codebase-memory".to_string()])
+        );
+        let note = stand_in.starting_note().expect("a note");
+        assert!(note.contains("finished starting"), "{note}");
+        assert!(
+            note.contains("failed_mcp_servers could not start"),
+            "{note}"
+        );
+        assert!(!note.contains("pending_mcp_servers"), "{note}");
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn stopping_a_background_mcp_start_returns_promptly() {
+        let (config_home, workspace) = workspace_with_fixture_mcp_server();
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let runtime_config = loader.load().expect("runtime config should load");
+        let background = BackgroundMcp::start(runtime_config.mcp().servers().clone());
+        let stopping = Instant::now();
+        background.stop();
+        assert!(
+            stopping.elapsed() < BACKGROUND_MCP_STOP_WAIT + Duration::from_secs(1),
+            "stop waits at most {BACKGROUND_MCP_STOP_WAIT:?}"
+        );
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn one_shot_runs_leave_out_the_bundled_mcp_servers() {
+        let config_home = temp_dir();
+        let workspace = temp_dir();
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(
+            config_home.join("settings.json"),
+            json!({"mcpServers": {"mine": {"command": "my-server"}}}).to_string(),
+        )
+        .expect("write mcp settings");
+        let runtime_config = ConfigLoader::new(&workspace, &config_home)
+            .load()
+            .expect("runtime config should load");
+        assert!(
+            runtime_config.mcp().servers().contains_key("playwright"),
+            "the bundled defaults are on"
+        );
+        let servers = mcp_servers_without_bundled(&runtime_config);
+        assert_eq!(servers.keys().collect::<Vec<_>>(), vec!["mine"]);
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
     #[test]
     fn build_runtime_plugin_state_surfaces_unsupported_mcp_servers_structurally() {
         let config_home = temp_dir();
@@ -7340,6 +8702,7 @@ UU conflicted.rs",
         fs::write(
             config_home.join("settings.json"),
             r#"{
+              "defaultMcpServers": false,
               "mcpServers": {
                 "remote": {
                   "url": "https://example.test/mcp"
@@ -7365,7 +8728,8 @@ UU conflicted.rs",
             .expect("tool search should execute");
         let search_json: serde_json::Value =
             serde_json::from_str(&search_output).expect("search output should be json");
-        assert_eq!(search_json["pending_mcp_servers"][0], "remote");
+        assert_eq!(search_json["pending_mcp_servers"], serde_json::Value::Null);
+        assert_eq!(search_json["failed_mcp_servers"], json!(["remote"]));
         assert_eq!(
             search_json["mcp_degraded"]["failed_servers"][0]["server_name"],
             "remote"
@@ -7399,6 +8763,11 @@ UU conflicted.rs",
         fs::create_dir_all(&workspace).expect("workspace");
         fs::create_dir_all(&source_root).expect("source root");
         write_plugin_fixture(&source_root, "lifecycle-runtime-demo", false, true);
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{"defaultMcpServers":false}"#,
+        )
+        .expect("disable external MCPs in lifecycle fixture");
 
         let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
         let install = manager
@@ -7524,6 +8893,8 @@ fn write_mcp_server_fixture(script_path: &Path) {
             "    request = read_message()",
             "    if request is None:",
             "        break",
+            "    if 'id' not in request:",
+            "        continue",
             "    method = request['method']",
             "    if method == 'initialize':",
             "        send_message({",
@@ -7597,10 +8968,11 @@ fn write_mcp_server_fixture(script_path: &Path) {
 
 #[cfg(test)]
 mod sandbox_report_tests {
-    use super::{format_sandbox_report, HookAbortMonitor};
+    use super::{format_sandbox_report, repl_loop, HookAbortMonitor};
     use runtime::HookAbortSignal;
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn sandbox_report_renders_expected_fields() {
@@ -7649,6 +9021,29 @@ mod sandbox_report_tests {
 
         assert!(abort_signal.is_aborted());
     }
+
+    #[test]
+    fn ui_turn_monitor_turns_a_key_press_into_an_interrupt() {
+        let abort_signal = HookAbortSignal::new();
+        let cancel = runtime::CancellationToken::new();
+        let presses = repl_loop::InterruptPresses::default();
+        let monitor = HookAbortMonitor::spawn_for_ui_turn(
+            abort_signal.clone(),
+            cancel.clone(),
+            presses.clone(),
+        );
+
+        // One press only: a second would start the force-quit watchdog.
+        presses.press();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !cancel.is_cancelled() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        monitor.stop();
+
+        assert!(cancel.is_cancelled(), "the key press cancels the turn");
+        assert!(abort_signal.is_aborted(), "and aborts running hooks");
+    }
 }
 
 #[cfg(test)]
@@ -7678,7 +9073,13 @@ mod dump_manifests_tests {
             "error message should mention missing manifest sources: {error_msg}"
         );
         assert!(
-            error_msg.contains(&root.display().to_string()),
+            error_msg.contains(
+                &root
+                    .canonicalize()
+                    .expect("root exists")
+                    .display()
+                    .to_string()
+            ),
             "error message should contain the resolved repo root path: {error_msg}"
         );
         assert!(

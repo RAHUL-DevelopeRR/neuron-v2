@@ -13,8 +13,10 @@ use api::{
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
-    check_freshness, dedupe_superseded_commit_events, edit_file_in_workspace, execute_bash,
-    glob_search, grep_search, load_system_prompt,
+    bash_validation::{classify_powershell_command, classify_shell_command, ShellDialect},
+    cancel::CancellationToken,
+    check_freshness, dedupe_superseded_commit_events, edit_file_in_workspace,
+    execute_bash_with_cancel, glob_search, grep_search, load_system_prompt,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
@@ -120,6 +122,16 @@ pub struct RuntimeToolDefinition {
     pub description: Option<String>,
     pub input_schema: Value,
     pub required_permission: PermissionMode,
+}
+
+impl RuntimeToolDefinition {
+    fn to_definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            input_schema: self.input_schema.clone(),
+        }
+    }
 }
 
 impl GlobalToolRegistry {
@@ -245,11 +257,18 @@ impl GlobalToolRegistry {
         Ok(Some(allowed))
     }
 
+    /// Tool schemas sent to the model.
+    ///
+    /// Without an allow-list only the default built-in tools are advertised,
+    /// plus deferred built-ins that `ToolSearch` activated in this session; stub
+    /// and bookkeeping tools stay behind `ToolSearch`, and so do MCP tools (a
+    /// request adds the ones its conversation uses, see
+    /// [`Self::deferred_mcp_definitions`]). An explicit allow-list advertises
+    /// exactly the listed tools.
     #[must_use]
     pub fn definitions(&self, allowed_tools: Option<&BTreeSet<String>>) -> Vec<ToolDefinition> {
-        let builtin = mvp_tool_specs()
+        let builtin = advertised_builtin_specs(allowed_tools)
             .into_iter()
-            .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
             .map(|spec| ToolDefinition {
                 name: spec.name.to_string(),
                 description: Some(spec.description.to_string()),
@@ -258,12 +277,11 @@ impl GlobalToolRegistry {
         let runtime = self
             .runtime_tools
             .iter()
-            .filter(|tool| allowed_tools.is_none_or(|allowed| allowed.contains(tool.name.as_str())))
-            .map(|tool| ToolDefinition {
-                name: tool.name.clone(),
-                description: tool.description.clone(),
-                input_schema: tool.input_schema.clone(),
-            });
+            .filter(|tool| match allowed_tools {
+                Some(allowed) => allowed.contains(tool.name.as_str()),
+                None => !is_deferred_runtime_tool(&tool.name),
+            })
+            .map(RuntimeToolDefinition::to_definition);
         let plugin = self
             .plugin_tools
             .iter()
@@ -277,6 +295,25 @@ impl GlobalToolRegistry {
                 input_schema: tool.definition().input_schema.clone(),
             });
         builtin.chain(runtime).chain(plugin).collect()
+    }
+
+    /// The deferred MCP tools one request of the conversation `messages` carries, on
+    /// top of [`Self::definitions`] without an allow-list: the ones the model already
+    /// called, and the ones `ToolSearch` matched in the current turn (since the last
+    /// user prompt). Matches the model left unused drop out with the next prompt, so
+    /// a search does not grow every later request (a free per-minute token budget
+    /// overflowed that way); the `MCPTool` wrapper can call any MCP tool meanwhile.
+    #[must_use]
+    pub fn deferred_mcp_definitions(
+        &self,
+        messages: &[ConversationMessage],
+    ) -> Vec<ToolDefinition> {
+        let in_play = deferred_tools_in_play(messages);
+        self.runtime_tools
+            .iter()
+            .filter(|tool| is_deferred_runtime_tool(&tool.name) && in_play.contains(&tool.name))
+            .map(RuntimeToolDefinition::to_definition)
+            .collect()
     }
 
     pub fn permission_specs(
@@ -323,6 +360,10 @@ impl GlobalToolRegistry {
         let query = query.trim().to_string();
         let normalized_query = normalize_tool_search_query(&query);
         let matches = search_tool_specs(&query, max_results.max(1), &self.searchable_tool_specs());
+        // Deferred built-ins that were found are advertised from the next request
+        // on. MCP tools found are advertised for the rest of the turn, which the
+        // request reads from these matches in the transcript.
+        activate_deferred_tools(matches.iter().map(String::as_str));
 
         ToolSearchOutput {
             matches,
@@ -339,8 +380,25 @@ impl GlobalToolRegistry {
     }
 
     pub fn execute(&self, name: &str, input: &Value) -> Result<String, String> {
+        self.execute_with_cancel(name, input, &CancellationToken::new())
+    }
+
+    /// Like [`Self::execute`], but `bash`, `PowerShell` and `REPL` stop when
+    /// `cancel` fires, killing the command's whole process tree and
+    /// returning the output captured so far.
+    pub fn execute_with_cancel(
+        &self,
+        name: &str,
+        input: &Value,
+        cancel: &CancellationToken,
+    ) -> Result<String, String> {
         if mvp_tool_specs().iter().any(|spec| spec.name == name) {
-            return execute_tool_with_enforcer(self.enforcer.as_ref(), name, input);
+            return execute_tool_with_enforcer_and_cancel(
+                self.enforcer.as_ref(),
+                name,
+                input,
+                cancel,
+            );
         }
         self.plugin_tools
             .iter()
@@ -351,7 +409,7 @@ impl GlobalToolRegistry {
     }
 
     fn searchable_tool_specs(&self) -> Vec<SearchableToolSpec> {
-        let builtin = deferred_tool_specs()
+        let builtin = searchable_builtin_specs()
             .into_iter()
             .map(|spec| SearchableToolSpec {
                 name: spec.name.to_string(),
@@ -382,18 +440,211 @@ fn permission_mode_from_plugin(value: &str) -> Result<PermissionMode, String> {
     }
 }
 
+/// Description of the `bash` tool, naming the shell that actually runs.
+#[cfg(windows)]
+const BASH_TOOL_DESCRIPTION: &str = "Execute a command in the current workspace with Windows cmd.exe (`cmd.exe /D /S /C`): use cmd syntax (`dir`, `type`, `set`, `%VAR%`, `&&`); POSIX tools work only if they are on PATH, and the PowerShell tool runs PowerShell syntax. Read-only commands run directly; anything else (writes, builds, installs, network) asks the user for approval in workspace-write mode, is denied in read-only mode, and runs directly in danger-full-access mode. stdin is empty. Default timeout 120000 ms (max 600000); on timeout the whole process tree is killed.";
+#[cfg(not(windows))]
+const BASH_TOOL_DESCRIPTION: &str = "Execute a command in the current workspace with POSIX sh (`sh -lc`). Read-only commands run directly; anything else (writes, builds, installs, network) asks the user for approval in workspace-write mode, is denied in read-only mode, and runs directly in danger-full-access mode. stdin is empty. Default timeout 120000 ms (max 600000); on timeout the whole process tree is killed.";
+
+/// Tools that exist but are not advertised to the model by default: they
+/// only keep in-memory bookkeeping (tasks, teams, crons, workers), are
+/// placeholders (LSP, built-in MCP), or are niche. `ToolSearch` finds them
+/// and activates their schema for the rest of the session.
+const DEFERRED_TOOL_NAMES: &[&str] = &[
+    "TaskCreate",
+    "RunTaskPacket",
+    "TaskGet",
+    "TaskList",
+    "TaskStop",
+    "TaskUpdate",
+    "TaskOutput",
+    "WorkerCreate",
+    "WorkerGet",
+    "WorkerObserve",
+    "WorkerResolveTrust",
+    "WorkerAwaitReady",
+    "WorkerSendPrompt",
+    "WorkerRestart",
+    "WorkerTerminate",
+    "WorkerObserveCompletion",
+    "TeamCreate",
+    "TeamDelete",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "LSP",
+    "ListMcpResources",
+    "ReadMcpResource",
+    "McpAuth",
+    "MCP",
+    "RemoteTrigger",
+];
+
+/// Test-only tools that are never advertised or searchable.
+const HIDDEN_TOOL_NAMES: &[&str] = &["TestingPermission"];
+
+/// How a built-in tool is offered to the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolAdvertisement {
+    /// Sent with every request.
+    Default,
+    /// Discoverable through `ToolSearch`, then sent for the rest of the session.
+    Deferred,
+    /// Never offered (test fixtures).
+    Hidden,
+}
+
+/// Advertisement class of a built-in tool.
+#[must_use]
+pub fn tool_advertisement(name: &str) -> ToolAdvertisement {
+    if HIDDEN_TOOL_NAMES.contains(&name) {
+        ToolAdvertisement::Hidden
+    } else if DEFERRED_TOOL_NAMES.contains(&name) {
+        ToolAdvertisement::Deferred
+    } else {
+        ToolAdvertisement::Default
+    }
+}
+
+fn activated_deferred_tools() -> &'static std::sync::Mutex<BTreeSet<String>> {
+    static ACTIVATED: std::sync::OnceLock<std::sync::Mutex<BTreeSet<String>>> =
+        std::sync::OnceLock::new();
+    ACTIVATED.get_or_init(|| std::sync::Mutex::new(BTreeSet::new()))
+}
+
+fn is_deferred_tool_activated(name: &str) -> bool {
+    activated_deferred_tools()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(name)
+}
+
+/// Tools discovered from MCP servers (`mcp__<server>__<tool>`). Their
+/// schemas stay out of requests unless the conversation brought them into play
+/// ([`GlobalToolRegistry::deferred_mcp_definitions`]); the `MCPTool` wrapper can
+/// call any of them by qualified name meanwhile.
+#[must_use]
+pub fn is_deferred_runtime_tool(name: &str) -> bool {
+    name.starts_with("mcp__")
+}
+
+/// Names of the tools the model called anywhere in `messages`, plus the ones a
+/// successful `ToolSearch` call matched since the last user prompt.
+fn deferred_tools_in_play(messages: &[ConversationMessage]) -> BTreeSet<String> {
+    let turn_start = current_turn_start(messages);
+    let mut names = BTreeSet::new();
+    for (index, message) in messages.iter().enumerate() {
+        for block in &message.blocks {
+            match block {
+                ContentBlock::ToolUse { name, .. } => {
+                    names.insert(name.clone());
+                }
+                ContentBlock::ToolResult {
+                    tool_name,
+                    output,
+                    is_error: false,
+                    ..
+                } if index > turn_start && tool_name == "ToolSearch" => {
+                    names.extend(tool_search_matches(output));
+                }
+                _ => {}
+            }
+        }
+    }
+    names
+}
+
+/// Index in `messages` of the prompt the user typed last, where the current turn
+/// starts (0 when there is none).
+#[must_use]
+pub fn current_turn_start(messages: &[ConversationMessage]) -> usize {
+    messages
+        .iter()
+        .rposition(starts_user_turn)
+        .unwrap_or_default()
+}
+
+/// A prompt the user typed (the runtime's automatic "continue" request is part of
+/// the turn it continues).
+fn starts_user_turn(message: &ConversationMessage) -> bool {
+    message.role == MessageRole::User
+        && message.blocks.iter().any(|block| {
+            matches!(block, ContentBlock::Text { text } if !text.starts_with(runtime::AUTO_CONTINUE_PREFIX))
+        })
+        && !message
+            .blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+}
+
+/// The `matches` of a `ToolSearch` result. Text a hook appended after the JSON is
+/// ignored.
+fn tool_search_matches(output: &str) -> Vec<String> {
+    let Some(Ok(value)) = serde_json::Deserializer::from_str(output)
+        .into_iter::<Value>()
+        .next()
+    else {
+        return Vec::new();
+    };
+    value["matches"]
+        .as_array()
+        .map(|matches| {
+            matches
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn activate_deferred_tools<'a>(names: impl IntoIterator<Item = &'a str>) {
+    let mut activated = activated_deferred_tools()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for name in names {
+        if tool_advertisement(name) == ToolAdvertisement::Deferred {
+            activated.insert(name.to_string());
+        }
+    }
+}
+
+/// Built-in tools sent to the model: default tools plus deferred tools that
+/// `ToolSearch` activated, or exactly the explicitly allowed ones.
+fn advertised_builtin_specs(allowed_tools: Option<&BTreeSet<String>>) -> Vec<ToolSpec> {
+    mvp_tool_specs()
+        .into_iter()
+        .filter(|spec| match allowed_tools {
+            Some(allowed) => {
+                allowed.contains(spec.name)
+                    && tool_advertisement(spec.name) != ToolAdvertisement::Hidden
+            }
+            None => match tool_advertisement(spec.name) {
+                ToolAdvertisement::Default => true,
+                ToolAdvertisement::Deferred => is_deferred_tool_activated(spec.name),
+                ToolAdvertisement::Hidden => false,
+            },
+        })
+        .collect()
+}
+
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "bash",
-            description: "Execute a shell command in the current workspace.",
+            description: BASH_TOOL_DESCRIPTION,
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" },
-                    "timeout": { "type": "integer", "minimum": 1 },
+                    "timeout": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 600_000,
+                        "description": "Timeout in milliseconds (default 120000, max 600000)"
+                    },
                     "description": { "type": "string" },
                     "run_in_background": { "type": "boolean" },
                     "dangerouslyDisableSandbox": { "type": "boolean" },
@@ -409,13 +660,21 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read_file",
-            description: "Read a text file from the workspace.",
+            description: "Read a text file from the workspace. Returns at most 2000 lines per call (lines longer than 2000 characters are cut) plus the file's total line count; use offset to continue reading.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
-                    "offset": { "type": "integer", "minimum": 0 },
-                    "limit": { "type": "integer", "minimum": 1 }
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "0-based line to start from"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Maximum lines to return (default 2000)"
+                    }
                 },
                 "required": ["path"],
                 "additionalProperties": false
@@ -424,7 +683,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "write_file",
-            description: "Write a text file in the workspace.",
+            description: "Create or overwrite a text file in the workspace with the given content. Returns a short summary (path, bytes, lines, created or overwritten). Prefer edit_file for changes to existing files.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -438,7 +697,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit_file",
-            description: "Replace text in a workspace file.",
+            description: "Replace old_string with new_string in a workspace file and return a compact diff. old_string must match exactly once unless replace_all is true (the error lists the matching lines); `\\n` in old_string also matches Windows CRLF line endings, which are preserved.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -454,7 +713,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "glob_search",
-            description: "Find files by glob pattern.",
+            description: "Find files by glob pattern (`**` spans directories). Skips .git, node_modules, target, dist, build and .gitignore'd paths unless the pattern points into them; searching outside the workspace needs approval.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -468,7 +727,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "grep_search",
-            description: "Search file contents with a regex pattern.",
+            description: "Search file contents with a regex pattern. Skips .git, node_modules, target, dist, build and .gitignore'd paths below the search path; searching outside the workspace needs approval.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -495,7 +754,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "WebFetch",
             description:
-                "Fetch a URL, convert it into readable text, and answer a prompt about it.",
+                "Fetch an http(s) URL and return its readable text (up to 20000 characters) for answering the prompt. Local, private and link-local addresses are blocked; a domain not yet approved in this session needs user approval unless the session runs in danger-full-access mode.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -509,7 +768,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "WebSearch",
-            description: "Search the web for current information and return cited results.",
+            description: "Search the web for current information and return cited results. The query is sent to an external search service, so web searches need user approval (once per session) unless the session runs in danger-full-access mode.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -589,7 +848,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "ToolSearch",
-            description: "Search for deferred or specialized tools by exact name or keywords.",
+            description: "Find tools that are not offered by default (MCP server tools named `mcp__<server>__<tool>`, task, team and cron bookkeeping, worker control, LSP, the built-in MCP registry, remote triggers) by keywords or exact name (`select:Name,Other`). Matching tools are offered from the next request on.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -654,7 +913,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "Config",
-            description: "Get or set Claude Code settings.",
+            description: "Get or set Neuron settings such as theme, model or verbose. permissions.* and hooks cannot be changed with this tool.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -714,19 +973,24 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "PowerShell",
-            description: "Execute a PowerShell command with optional timeout.",
+            description: "Execute a PowerShell command (pwsh when installed, otherwise Windows PowerShell; -NoProfile -NonInteractive). Read-only cmdlets such as Get-Content, Get-ChildItem and Select-String run directly; anything else asks the user for approval in workspace-write mode and is denied in read-only mode. Default timeout 120000 ms (max 600000); on timeout the process tree is killed.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" },
-                    "timeout": { "type": "integer", "minimum": 1 },
+                    "timeout": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 600_000,
+                        "description": "Timeout in milliseconds (default 120000, max 600000)"
+                    },
                     "description": { "type": "string" },
                     "run_in_background": { "type": "boolean" }
                 },
                 "required": ["command"],
                 "additionalProperties": false
             }),
-            required_permission: PermissionMode::DangerFullAccess,
+            required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
             name: "AskUserQuestion",
@@ -747,7 +1011,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TaskCreate",
-            description: "Create a background task that runs in a separate subprocess.",
+            description: "Record a task (prompt and description) in this session's in-memory task registry. Bookkeeping only: nothing runs the task.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -761,7 +1025,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "RunTaskPacket",
-            description: "Create a background task from a structured task packet.",
+            description: "Record a task from a structured task packet in this session's in-memory task registry. Bookkeeping only: nothing runs the task.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -793,7 +1057,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TaskGet",
-            description: "Get the status and details of a background task by ID.",
+            description: "Get a task recorded in this session's in-memory task registry by ID.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -806,7 +1070,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TaskList",
-            description: "List all background tasks and their current status.",
+            description: "List the tasks recorded in this session's in-memory task registry.",
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -816,7 +1080,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TaskStop",
-            description: "Stop a running background task by ID.",
+            description: "Mark a recorded task as stopped in the in-memory task registry.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -829,7 +1093,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TaskUpdate",
-            description: "Send a message or update to a running background task.",
+            description: "Append a message to a task recorded in the in-memory task registry.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -843,7 +1107,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TaskOutput",
-            description: "Retrieve the output produced by a background task.",
+            description: "Read the output stored for a task in the in-memory task registry.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -856,7 +1120,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "WorkerCreate",
-            description: "Create a coding worker boot session with trust-gate and prompt-delivery guards.",
+            description: "Create a coding-worker boot record with trust-gate and prompt-delivery guards. It tracks an external worker's state in memory and does not start a process.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -997,7 +1261,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TeamCreate",
-            description: "Create a team of sub-agents for parallel task execution.",
+            description: "Group recorded tasks under a named team in the in-memory registry. Bookkeeping only: no sub-agents are started.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1021,7 +1285,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TeamDelete",
-            description: "Delete a team and stop all its running tasks.",
+            description: "Mark a team as deleted in the in-memory registry.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1034,7 +1298,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "CronCreate",
-            description: "Create a scheduled recurring task.",
+            description: "Record a cron schedule entry in this session's in-memory registry. Neuron does not run scheduled entries.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1049,7 +1313,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "CronDelete",
-            description: "Delete a scheduled recurring task by ID.",
+            description: "Remove a cron entry from the in-memory registry by ID.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1062,7 +1326,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "CronList",
-            description: "List all scheduled recurring tasks.",
+            description: "List the cron entries recorded in this session's in-memory registry.",
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -1072,7 +1336,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "LSP",
-            description: "Query Language Server Protocol for code intelligence (symbols, references, diagnostics).",
+            description: "Query a registered language server for symbols, references or diagnostics. No language server is registered by default, so calls fail unless one was set up.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1089,7 +1353,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "ListMcpResources",
-            description: "List available resources from connected MCP servers.",
+            description: "List resources of the built-in MCP registry. Configured MCP servers are not in it: their resources are reached through ListMcpResourcesTool and their tools appear as mcp__<server>__<tool>.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1101,7 +1365,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "ReadMcpResource",
-            description: "Read a specific resource from an MCP server by URI.",
+            description: "Read a resource from the built-in MCP registry by URI. Configured MCP servers are reached through ReadMcpResourceTool instead.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1115,7 +1379,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "McpAuth",
-            description: "Authenticate with an MCP server that requires OAuth or credentials.",
+            description: "Report the connection state of a server in the built-in MCP registry. It does not perform OAuth or store credentials.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1144,7 +1408,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "MCP",
-            description: "Execute a tool provided by a connected MCP server.",
+            description: "Call a tool through the built-in MCP registry. Configured MCP servers are called directly as mcp__<server>__<tool> (or through MCPTool) instead.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1192,10 +1456,30 @@ pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
     execute_tool_with_enforcer(None, name, input)
 }
 
+/// Like [`execute_tool`], but `bash`, `PowerShell` and `REPL` stop (and kill
+/// their whole process tree) when `cancel` fires.
+pub fn execute_tool_with_cancel(
+    name: &str,
+    input: &Value,
+    cancel: &CancellationToken,
+) -> Result<String, String> {
+    execute_tool_with_enforcer_and_cancel(None, name, input, cancel)
+}
+
 fn execute_tool_with_enforcer(
     enforcer: Option<&PermissionEnforcer>,
     name: &str,
     input: &Value,
+) -> Result<String, String> {
+    execute_tool_with_enforcer_and_cancel(enforcer, name, input, &CancellationToken::new())
+}
+
+#[allow(clippy::too_many_lines)]
+fn execute_tool_with_enforcer_and_cancel(
+    enforcer: Option<&PermissionEnforcer>,
+    name: &str,
+    input: &Value,
+    cancel: &CancellationToken,
 ) -> Result<String, String> {
     match name {
         "bash" => {
@@ -1203,7 +1487,7 @@ fn execute_tool_with_enforcer(
             let bash_input: BashCommandInput = from_value(input)?;
             let classified_mode = classify_bash_permission(&bash_input.command);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
-            run_bash(bash_input)
+            run_bash(&bash_input, cancel)
         }
         "read_file" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
@@ -1225,13 +1509,22 @@ fn execute_tool_with_enforcer(
             maybe_enforce_permission_check(enforcer, name, input)?;
             from_value::<GrepSearchInput>(input).and_then(run_grep_search)
         }
-        "WebFetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
-        "WebSearch" => from_value::<WebSearchInput>(input).and_then(run_web_search),
+        "WebFetch" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<WebFetchInput>(input).and_then(run_web_fetch)
+        }
+        "WebSearch" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<WebSearchInput>(input).and_then(run_web_search)
+        }
         "TodoWrite" => from_value::<TodoWriteInput>(input).and_then(run_todo_write),
         "Skill" => from_value::<SkillInput>(input).and_then(run_skill),
         "Agent" => from_value::<AgentInput>(input).and_then(run_agent),
         "ToolSearch" => from_value::<ToolSearchInput>(input).and_then(run_tool_search),
-        "NotebookEdit" => from_value::<NotebookEditInput>(input).and_then(run_notebook_edit),
+        "NotebookEdit" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<NotebookEditInput>(input).and_then(run_notebook_edit)
+        }
         "Sleep" => from_value::<SleepInput>(input).and_then(run_sleep),
         "SendUserMessage" | "Brief" => from_value::<BriefInput>(input).and_then(run_brief),
         "Config" => from_value::<ConfigInput>(input).and_then(run_config),
@@ -1240,13 +1533,16 @@ fn execute_tool_with_enforcer(
         "StructuredOutput" => {
             from_value::<StructuredOutputInput>(input).and_then(run_structured_output)
         }
-        "REPL" => from_value::<ReplInput>(input).and_then(run_repl),
+        "REPL" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<ReplInput>(input).and_then(|repl| run_repl(repl, cancel))
+        }
         "PowerShell" => {
             // Parse input to get the command for permission classification
             let ps_input: PowerShellInput = from_value(input)?;
             let classified_mode = classify_powershell_permission(&ps_input.command);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
-            run_powershell(ps_input)
+            run_powershell(ps_input, cancel)
         }
         "AskUserQuestion" => {
             from_value::<AskUserQuestionInput>(input).and_then(run_ask_user_question)
@@ -1325,33 +1621,58 @@ fn maybe_enforce_permission_check_with_mode(
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
-fn run_ask_user_question(input: AskUserQuestionInput) -> Result<String, String> {
-    use std::io::{self, BufRead, Write};
+/// What `AskUserQuestion` answers (as its error) when the person at the terminal would
+/// not see the question: stdout and stderr both go to files or pipes.
+const UNSEEN_QUESTION_REFUSAL: &str =
+    "no one can see questions in this run (its output is not a terminal); decide yourself and say what you assumed";
 
-    // Display the question to the user via stdout
-    let stdout = io::stdout();
-    let stdin = io::stdin();
-    let mut out = stdout.lock();
+/// Asks on the terminal: writes the question (and numbered options) where the user sees
+/// it (stdout, or stderr when stdout is redirected; see
+/// [`runtime::ui_hooks::PromptStream`]) and reads one line from stdin.
+fn ask_on_terminal(input: &AskUserQuestionInput) -> Result<String, String> {
+    use std::io::{self, BufRead};
 
-    writeln!(out, "\n[Question] {}", input.question).map_err(|e| e.to_string())?;
+    let Some(stream) = runtime::ui_hooks::PromptStream::current() else {
+        return Err(UNSEEN_QUESTION_REFUSAL.to_string());
+    };
+    write_question(&mut stream.writer(), input).map_err(|e| e.to_string())?;
 
-    if let Some(ref options) = input.options {
-        for (i, option) in options.iter().enumerate() {
-            writeln!(out, "  {}. {}", i + 1, option).map_err(|e| e.to_string())?;
-        }
-        write!(out, "Enter choice (1-{}): ", options.len()).map_err(|e| e.to_string())?;
-    } else {
-        write!(out, "Your answer: ").map_err(|e| e.to_string())?;
-    }
-    out.flush().map_err(|e| e.to_string())?;
-
-    // Read user response from stdin
     let mut response = String::new();
-    stdin
+    io::stdin()
         .lock()
         .read_line(&mut response)
         .map_err(|e| e.to_string())?;
+    Ok(response)
+}
+
+/// The question as [`ask_on_terminal`] shows it, ending in the answer prompt.
+fn write_question(
+    out: &mut dyn std::io::Write,
+    input: &AskUserQuestionInput,
+) -> std::io::Result<()> {
+    writeln!(out, "\n[Question] {}", input.question)?;
+    if let Some(ref options) = input.options {
+        for (i, option) in options.iter().enumerate() {
+            writeln!(out, "  {}. {}", i + 1, option)?;
+        }
+        write!(out, "Enter choice (1-{}): ", options.len())?;
+    } else {
+        write!(out, "Your answer: ")?;
+    }
+    out.flush()
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_ask_user_question(input: AskUserQuestionInput) -> Result<String, String> {
+    // A full-screen UI answers through runtime::ui_hooks; otherwise the terminal prompt.
+    let response = match runtime::ui_hooks::ask_handler() {
+        Some(ask) => ask(&runtime::ui_hooks::UserQuestion {
+            question: input.question.clone(),
+            options: input.options.clone(),
+        })
+        .map_err(|e| e.to_string())?,
+        None => ask_on_terminal(&input)?,
+    };
     let response = response.trim().to_string();
 
     // If options were provided, resolve the numeric choice
@@ -1808,10 +2129,79 @@ fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
     }
 }
 
+/// The `arguments` of an MCP call (`MCPTool`, `MCP`) as the server takes them: a JSON
+/// object, or none. Models sometimes send the object as JSON text (`"{\"path\":
+/// \"a.txt\"}"`); that text is parsed. Anything else is an error the model can act on.
+pub fn mcp_call_arguments(arguments: Option<Value>) -> Result<Option<Value>, String> {
+    const EXPECTED: &str =
+        "`arguments` must be a JSON object with the tool's parameters, such as {\"path\": \"README.md\"}";
+    match arguments {
+        None | Some(Value::Null) => Ok(None),
+        Some(object @ Value::Object(_)) => Ok(Some(object)),
+        Some(Value::String(text)) if text.trim().is_empty() => Ok(None),
+        Some(Value::String(text)) => match serde_json::from_str::<Value>(&text) {
+            Ok(object @ Value::Object(_)) => Ok(Some(object)),
+            Ok(other) => Err(format!(
+                "{EXPECTED}; got a string holding {}",
+                json_kind(&other)
+            )),
+            Err(error) => Err(format!(
+                "{EXPECTED}; got a string that is not JSON ({error})"
+            )),
+        },
+        Some(other) => Err(format!("{EXPECTED}; got {}", json_kind(&other))),
+    }
+}
+
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+#[cfg(test)]
+mod mcp_call_arguments_tests {
+    use super::mcp_call_arguments;
+    use serde_json::json;
+
+    #[test]
+    fn arguments_sent_as_json_text_reach_the_server_as_an_object() {
+        let object = json!({"path": "C:\\work\\a.txt", "lines": 3});
+        assert_eq!(
+            mcp_call_arguments(Some(json!(object.to_string()))),
+            Ok(Some(object.clone()))
+        );
+        assert_eq!(mcp_call_arguments(Some(object.clone())), Ok(Some(object)));
+        assert_eq!(mcp_call_arguments(None), Ok(None));
+        assert_eq!(mcp_call_arguments(Some(json!(null))), Ok(None));
+        assert_eq!(mcp_call_arguments(Some(json!("  "))), Ok(None));
+    }
+
+    #[test]
+    fn arguments_that_are_not_an_object_are_a_clear_error() {
+        for (arguments, got) in [
+            (json!("path=a.txt"), "a string that is not JSON"),
+            (json!("[1, 2]"), "a string holding an array"),
+            (json!("\"a.txt\""), "a string holding a string"),
+            (json!([1, 2]), "got an array"),
+            (json!(7), "got a number"),
+        ] {
+            let error = mcp_call_arguments(Some(arguments)).expect_err("not an object");
+            assert!(error.contains("must be a JSON object"), "{error}");
+            assert!(error.contains(got), "{error}");
+        }
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn run_mcp_tool(input: McpToolInput) -> Result<String, String> {
     let registry = global_mcp_registry();
-    let args = input.arguments.unwrap_or(serde_json::json!({}));
+    let args = mcp_call_arguments(input.arguments)?.unwrap_or_else(|| serde_json::json!({}));
     match registry.call_tool(&input.server, &input.tool, &args) {
         Ok(result) => to_pretty_json(json!({
             "server": input.server,
@@ -1840,79 +2230,34 @@ fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> 
     serde_json::from_value(input.clone()).map_err(|error| error.to_string())
 }
 
-/// Classify bash command permission based on command type and path.
-/// ROADMAP #50: read-only commands targeting CWD paths get `ReadOnly`, all
-/// others remain `DangerFullAccess`.
+/// Permission a `bash` command line needs, judged over every simple command
+/// it contains: `ReadOnly` only when each one is an allowlisted read-only
+/// program with safe arguments that stays inside the workspace, otherwise
+/// `DangerFullAccess` (which prompts in workspace-write mode).
 fn classify_bash_permission(command: &str) -> PermissionMode {
-    // Read-only commands that are safe when targeting workspace paths
-    const READ_ONLY_COMMANDS: &[&str] = &[
-        "cat", "head", "tail", "less", "more", "ls", "ll", "dir", "find", "test", "[", "[[",
-        "grep", "rg", "awk", "sed", "file", "stat", "readlink", "wc", "sort", "uniq", "cut", "tr",
-        "pwd", "echo", "printf",
-    ];
-
-    // Get the base command (first word before any args or pipes)
-    let base_cmd = command.split_whitespace().next().unwrap_or("");
-    let base_cmd = base_cmd.split('|').next().unwrap_or("").trim();
-    let base_cmd = base_cmd.split(';').next().unwrap_or("").trim();
-    let base_cmd = base_cmd.split('>').next().unwrap_or("").trim();
-    let base_cmd = base_cmd.split('<').next().unwrap_or("").trim();
-
-    // Check if it's a read-only command
-    let cmd_name = base_cmd.split('/').next_back().unwrap_or(base_cmd);
-    let is_read_only = READ_ONLY_COMMANDS.contains(&cmd_name);
-
-    if !is_read_only {
-        return PermissionMode::DangerFullAccess;
-    }
-
-    // Check if any path argument is outside workspace
-    // Simple heuristic: check for absolute paths not starting with CWD
-    if has_dangerous_paths(command) {
-        return PermissionMode::DangerFullAccess;
-    }
-
-    PermissionMode::ReadOnly
+    let workspace = std::env::current_dir().ok();
+    classify_shell_command(command, ShellDialect::host(), workspace.as_deref()).required_mode()
 }
 
-/// Check if command has dangerous paths (outside workspace).
-fn has_dangerous_paths(command: &str) -> bool {
-    // Look for absolute paths
-    let tokens: Vec<&str> = command.split_whitespace().collect();
-
-    for token in tokens {
-        // Skip flags/options
-        if token.starts_with('-') {
-            continue;
-        }
-
-        // Check for absolute paths
-        if token.starts_with('/') || token.starts_with("~/") {
-            // Check if it's within CWD
-            let path =
-                PathBuf::from(token.replace('~', &std::env::var("HOME").unwrap_or_default()));
-            if let Ok(cwd) = std::env::current_dir() {
-                if !path.starts_with(&cwd) {
-                    return true; // Path outside workspace
-                }
-            }
-        }
-
-        // Check for parent directory traversal that escapes workspace
-        if token.contains("../..") || token.starts_with("../") && !token.starts_with("./") {
-            return true;
-        }
-    }
-
-    false
+fn run_bash(input: &BashCommandInput, cancel: &CancellationToken) -> Result<String, String> {
+    let output = match workspace_test_branch_preflight(&input.command) {
+        Some(output) => output,
+        None => execute_bash_with_cancel(input, cancel).map_err(|error| error.to_string())?,
+    };
+    shell_tool_result(&output)
 }
 
-fn run_bash(input: BashCommandInput) -> Result<String, String> {
-    if let Some(output) = workspace_test_branch_preflight(&input.command) {
-        return serde_json::to_string_pretty(&output).map_err(|error| error.to_string());
+/// Serializes a shell run. A run that failed (non-zero exit, timeout,
+/// cancellation, blocked) is returned as the error so its tool result is
+/// flagged `is_error`; the error text is the same JSON envelope, so the
+/// model still sees stdout, stderr and `returnCodeInterpretation`.
+fn shell_tool_result(output: &BashCommandOutput) -> Result<String, String> {
+    let rendered = to_pretty_json(output)?;
+    if output.failed() {
+        Err(rendered)
+    } else {
+        Ok(rendered)
     }
-    serde_json::to_string_pretty(&execute_bash(input).map_err(|error| error.to_string())?)
-        .map_err(|error| error.to_string())
 }
 
 fn workspace_test_branch_preflight(command: &str) -> Option<BashCommandOutput> {
@@ -2157,84 +2502,19 @@ fn run_structured_output(input: StructuredOutputInput) -> Result<String, String>
     to_pretty_json(execute_structured_output(input)?)
 }
 
-fn run_repl(input: ReplInput) -> Result<String, String> {
-    to_pretty_json(execute_repl(input)?)
+fn run_repl(input: ReplInput, cancel: &CancellationToken) -> Result<String, String> {
+    to_pretty_json(execute_repl(input, cancel)?)
 }
 
-/// Classify `PowerShell` command permission based on command type and path.
-/// ROADMAP #50: Read-only commands targeting CWD paths get `WorkspaceWrite`,
-/// all others remain `DangerFullAccess`.
+/// Permission a `PowerShell` command line needs, judged over every statement
+/// and pipeline element (see [`classify_bash_permission`]).
 fn classify_powershell_permission(command: &str) -> PermissionMode {
-    // Read-only commands that are safe when targeting workspace paths
-    const READ_ONLY_COMMANDS: &[&str] = &[
-        "Get-Content",
-        "Get-ChildItem",
-        "Test-Path",
-        "Get-Item",
-        "Get-ItemProperty",
-        "Get-FileHash",
-        "Select-String",
-    ];
-
-    // Check if command starts with a read-only cmdlet
-    let cmd_lower = command.trim().to_lowercase();
-    let is_read_only_cmd = READ_ONLY_COMMANDS
-        .iter()
-        .any(|cmd| cmd_lower.starts_with(&cmd.to_lowercase()));
-
-    if !is_read_only_cmd {
-        return PermissionMode::DangerFullAccess;
-    }
-
-    // Check if the path is within workspace (CWD or subdirectory)
-    // Extract path from command - look for -Path or positional parameter
-    let path = extract_powershell_path(command);
-    match path {
-        Some(p) if is_within_workspace(&p) => PermissionMode::WorkspaceWrite,
-        _ => PermissionMode::DangerFullAccess,
-    }
+    let workspace = std::env::current_dir().ok();
+    classify_powershell_command(command, workspace.as_deref()).required_mode()
 }
 
-/// Extract the path argument from a `PowerShell` command.
-fn extract_powershell_path(command: &str) -> Option<String> {
-    // Look for -Path parameter
-    if let Some(idx) = command.to_lowercase().find("-path") {
-        let after_path = &command[idx + 5..];
-        let path = after_path.split_whitespace().next()?;
-        return Some(path.trim_matches('"').trim_matches('\'').to_string());
-    }
-
-    // Look for positional path parameter (after command name)
-    let parts: Vec<&str> = command.split_whitespace().collect();
-    if parts.len() >= 2 {
-        // Skip the cmdlet name and take the first argument
-        let first_arg = parts[1];
-        // Check if it looks like a path (contains \, /, or .)
-        if first_arg.contains(['\\', '/', '.']) {
-            return Some(first_arg.trim_matches('"').trim_matches('\'').to_string());
-        }
-    }
-
-    None
-}
-
-/// Check if a path is within the current workspace.
-fn is_within_workspace(path: &str) -> bool {
-    let path = PathBuf::from(path);
-
-    // If path is absolute, check if it starts with CWD
-    if path.is_absolute() {
-        if let Ok(cwd) = std::env::current_dir() {
-            return path.starts_with(&cwd);
-        }
-    }
-
-    // Relative paths are assumed to be within workspace
-    !path.starts_with("/") && !path.starts_with("\\") && !path.starts_with("..")
-}
-
-fn run_powershell(input: PowerShellInput) -> Result<String, String> {
-    to_pretty_json(execute_powershell(input).map_err(|error| error.to_string())?)
+fn run_powershell(input: PowerShellInput, cancel: &CancellationToken) -> Result<String, String> {
+    shell_tool_result(&execute_powershell(input, cancel).map_err(|error| error.to_string())?)
 }
 
 fn to_pretty_json<T: serde::Serialize>(value: T) -> Result<String, String> {
@@ -2623,6 +2903,9 @@ struct AgentOutput {
 #[derive(Debug, Clone)]
 struct AgentJob {
     manifest: AgentOutput,
+    /// The model id the sub-agent's requests use (the manifest shows it without the
+    /// routing prefix).
+    model: String,
     prompt: String,
     system_prompt: Vec<String>,
     allowed_tools: BTreeSet<String>,
@@ -2757,30 +3040,22 @@ struct SearchHit {
 
 fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
     let started = Instant::now();
-    let client = build_http_client()?;
     let request_url = normalize_fetch_url(&input.url)?;
-    let response = client
-        .get(request_url.clone())
-        .send()
-        .map_err(|error| error.to_string())?;
+    let request_url = reqwest::Url::parse(&request_url).map_err(|error| error.to_string())?;
+    web_fetch::ensure_gated_host(&input.url, &request_url)?;
+    let page = web_fetch::fetch(request_url)?;
 
-    let status = response.status();
-    let final_url = response.url().to_string();
-    let code = status.as_u16();
-    let code_text = status.canonical_reason().unwrap_or("Unknown").to_string();
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
+    let code = page.status.as_u16();
+    let code_text = page
+        .status
+        .canonical_reason()
+        .unwrap_or("Unknown")
         .to_string();
-    let body = response.text().map_err(|error| error.to_string())?;
-    let bytes = body.len();
-    let normalized = normalize_fetched_content(&body, &content_type);
-    let result = summarize_web_fetch(&final_url, &input.prompt, &normalized, &body, &content_type);
+    let final_url = page.final_url.to_string();
+    let result = render_web_fetch_result(&final_url, &input.prompt, &page);
 
     Ok(WebFetchOutput {
-        bytes,
+        bytes: page.bytes,
         code,
         code_text,
         result,
@@ -2882,40 +3157,67 @@ fn build_search_url(query: &str) -> Result<reqwest::Url, String> {
 
 fn normalize_fetched_content(body: &str, content_type: &str) -> String {
     if content_type.contains("html") {
-        html_to_text(body)
+        web_fetch::html_to_readable_text(body)
     } else {
         body.trim().to_string()
     }
 }
 
-fn summarize_web_fetch(
-    url: &str,
-    prompt: &str,
-    content: &str,
-    raw_body: &str,
-    content_type: &str,
-) -> String {
-    let lower_prompt = prompt.to_lowercase();
-    let compact = collapse_whitespace(content);
+/// Text handed to the model: where the content came from, the page title,
+/// the prompt it should answer, and up to
+/// [`web_fetch::MAX_FETCH_TEXT_CHARS`] characters of readable text.
+fn render_web_fetch_result(url: &str, prompt: &str, page: &web_fetch::FetchedPage) -> String {
+    let mut lines = vec![format!(
+        "Fetched {url} (HTTP {}{})",
+        page.status.as_u16(),
+        if page.content_type.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", page.content_type)
+        }
+    )];
+    if let Some(target) = &page.cross_host_redirect {
+        lines.push(format!(
+            "The server redirected to a different host: {target}\nThe redirect was not followed. To read it, call WebFetch again with that URL (a domain not yet approved in this session needs the user's approval)."
+        ));
+        return lines.join("\n");
+    }
+    if web_fetch::is_binary_content_type(&page.content_type) {
+        lines.push(format!(
+            "The response is binary ({} bytes) and is not shown as text.",
+            page.bytes
+        ));
+        return lines.join("\n");
+    }
 
-    let detail = if lower_prompt.contains("title") {
-        extract_title(content, raw_body, content_type).map_or_else(
-            || preview_text(&compact, 600),
-            |title| format!("Title: {title}"),
-        )
-    } else if lower_prompt.contains("summary") || lower_prompt.contains("summarize") {
-        preview_text(&compact, 900)
+    let content = normalize_fetched_content(&page.body, &page.content_type);
+    if page.content_type.contains("html") {
+        if let Some(title) = extract_title("", &page.body, &page.content_type) {
+            lines.push(format!("Title: {title}"));
+        }
+    }
+    lines.push(format!("Prompt: {prompt}"));
+    let (text, total_chars) = web_fetch::bound_text(&content);
+    lines.push(String::new());
+    lines.push(if text.is_empty() {
+        "(no readable text)".to_string()
     } else {
-        let preview = preview_text(&compact, 900);
-        format!("Prompt: {prompt}\nContent preview:\n{preview}")
-    };
-
-    format!("Fetched {url}\n{detail}")
+        text
+    });
+    if let Some(total) = total_chars {
+        lines.push(format!(
+            "\n[Content truncated: showing the first {} of {total} characters.]",
+            web_fetch::MAX_FETCH_TEXT_CHARS
+        ));
+    } else if page.body_truncated {
+        lines.push("\n[The response body was larger than 5 MB; only the start was read.]".into());
+    }
+    lines.join("\n")
 }
 
 fn extract_title(content: &str, raw_body: &str, content_type: &str) -> Option<String> {
     if content_type.contains("html") {
-        let lowered = raw_body.to_lowercase();
+        let lowered = raw_body.to_ascii_lowercase();
         if let Some(start) = lowered.find("<title>") {
             let after = start + "<title>".len();
             if let Some(end_rel) = lowered[after..].find("</title>") {
@@ -2979,14 +3281,6 @@ fn decode_html_entities(input: &str) -> String {
 
 fn collapse_whitespace(input: &str) -> String {
     input.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn preview_text(input: &str, max_chars: usize) -> String {
-    if input.chars().count() <= max_chars {
-        return input.to_string();
-    }
-    let shortened = input.chars().take(max_chars).collect::<String>();
-    format!("{}…", shortened.trim_end())
 }
 
 fn extract_search_hits(html: &str) -> Vec<SearchHit> {
@@ -3481,12 +3775,265 @@ fn parse_skill_frontmatter_value(contents: &str, key: &str) -> Option<String> {
     None
 }
 
-const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
 const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
+/// Model sub-agents use when no parent context was registered (library use).
+const FALLBACK_AGENT_MODEL: &str = "auto";
+/// How long the `Agent` tool waits for a sub-agent before returning its
+/// partial status (the sub-agent keeps running in the background).
+const DEFAULT_AGENT_TIMEOUT: Duration = Duration::from_mins(10);
+const AGENT_TIMEOUT_ENV_VAR: &str = "NEURON_SUBAGENT_TIMEOUT_SECS";
+const AGENT_WAIT_POLL: Duration = Duration::from_millis(200);
+/// How long an interrupted `Agent` call waits for its sub-agent to stop.
+const AGENT_CANCEL_GRACE: Duration = Duration::from_secs(2);
+/// The error of a sub-agent run the user interrupted.
+const AGENT_CANCELLED: &str = "sub-agent cancelled by the user";
+const SUBAGENT_REGISTERED_OUTPUT_CAP: u32 = 32_000;
+const SUBAGENT_UNKNOWN_MODEL_OUTPUT: u32 = 8_192;
 
-fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
-    execute_agent_with_spawn(input, spawn_agent_job)
+/// Builds a provider client for a model id using the parent's credentials.
+pub type SubagentClientFactory =
+    std::sync::Arc<dyn Fn(&str) -> Result<ProviderClient, String> + Send + Sync>;
+
+/// What a sub-agent inherits from the session that spawned it. A sub-agent
+/// never runs with more than its parent: the same permission mode, the same
+/// allow/deny/ask rules, the same tool hooks, and at most the parent's tools.
+#[derive(Clone)]
+pub struct SubagentParentContext {
+    /// The parent's resolved model id (including any transport prefix).
+    pub model: String,
+    /// The parent's permission mode.
+    pub permission_mode: PermissionMode,
+    /// The parent's configured permission rules (`permissions.allow/deny/ask`).
+    pub permission_rules: runtime::RuntimePermissionRuleConfig,
+    /// The parent's `PreToolUse` / `PostToolUse` hooks (settings and plugins).
+    pub hooks: runtime::RuntimeHookConfig,
+    /// The parent's tool allow-list (`--allowedTools`, plan mode). `None`
+    /// means every tool; a sub-agent's own tool set is intersected with it.
+    pub allowed_tools: Option<BTreeSet<String>>,
+    /// Builds provider clients with the parent's credentials. When `None`,
+    /// clients are built from the environment.
+    pub client_factory: Option<SubagentClientFactory>,
+}
+
+impl SubagentParentContext {
+    /// A parent context with no rules, hooks or tool restrictions beyond the
+    /// permission mode.
+    #[must_use]
+    pub fn new(model: impl Into<String>, permission_mode: PermissionMode) -> Self {
+        Self {
+            model: model.into(),
+            permission_mode,
+            permission_rules: runtime::RuntimePermissionRuleConfig::default(),
+            hooks: runtime::RuntimeHookConfig::default(),
+            allowed_tools: None,
+            client_factory: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for SubagentParentContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubagentParentContext")
+            .field("model", &self.model)
+            .field("permission_mode", &self.permission_mode)
+            .field("permission_rules", &self.permission_rules)
+            .field("hooks", &self.hooks)
+            .field("allowed_tools", &self.allowed_tools)
+            .field("client_factory", &self.client_factory.is_some())
+            .finish()
+    }
+}
+
+fn subagent_parent_slot() -> &'static std::sync::RwLock<Option<SubagentParentContext>> {
+    static SLOT: std::sync::OnceLock<std::sync::RwLock<Option<SubagentParentContext>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+fn subagent_cancel_slot() -> &'static std::sync::Mutex<Option<runtime::CancellationToken>> {
+    static SLOT: std::sync::OnceLock<std::sync::Mutex<Option<runtime::CancellationToken>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Registers the parent session's model, permission mode and credentials for
+/// sub-agents spawned by the `Agent` tool.
+pub fn set_subagent_parent_context(context: SubagentParentContext) {
+    *subagent_parent_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(context);
+}
+
+/// Forgets the registered parent context.
+pub fn clear_subagent_parent_context() {
+    *subagent_parent_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+fn subagent_parent_context() -> Option<SubagentParentContext> {
+    subagent_parent_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Installs the parent turn's cancellation token: cancelling it stops a
+/// sub-agent the `Agent` tool is waiting for.
+pub fn set_subagent_cancellation_token(token: runtime::CancellationToken) {
+    *subagent_cancel_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token);
+}
+
+fn parent_cancellation_token() -> Option<runtime::CancellationToken> {
+    subagent_cancel_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Sub-agents that outlived the `Agent` tool's wait and keep running in the
+/// background, by agent id.
+fn background_subagents() -> &'static std::sync::Mutex<BTreeMap<String, runtime::CancellationToken>>
+{
+    static AGENTS: std::sync::OnceLock<
+        std::sync::Mutex<BTreeMap<String, runtime::CancellationToken>>,
+    > = std::sync::OnceLock::new();
+    AGENTS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+fn track_background_subagent(agent_id: &str, cancel: runtime::CancellationToken) {
+    background_subagents()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(agent_id.to_string(), cancel);
+}
+
+fn forget_background_subagent(agent_id: &str) {
+    background_subagents()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(agent_id);
+}
+
+/// Asks every sub-agent still running in the background (after the `Agent`
+/// tool stopped waiting for it) to stop. The CLI calls this on Ctrl-C and
+/// when the session ends. Returns how many were signalled.
+pub fn cancel_background_subagents() -> usize {
+    let agents = std::mem::take(
+        &mut *background_subagents()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    for cancel in agents.values() {
+        cancel.cancel();
+    }
+    agents.len()
+}
+
+/// The `Agent` tool result: the manifest plus the sub-agent's final text.
+#[derive(Debug, Clone, Serialize)]
+struct AgentToolResult {
+    #[serde(flatten)]
+    manifest: AgentOutput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
+
+/// How a sub-agent run ended, reported back to the waiting `Agent` tool.
+#[derive(Debug, Clone)]
+struct AgentCompletion {
+    final_text: Option<String>,
+    error: Option<String>,
+}
+
+/// Runs a sub-agent and, by default, waits for it to finish so its final
+/// text is returned in the tool result. After the timeout (or when the
+/// parent turn is cancelled) the current status is returned instead.
+fn execute_agent(input: AgentInput) -> Result<AgentToolResult, String> {
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let child_cancel = runtime::CancellationToken::new();
+    let child_cancel_for_job = child_cancel.clone();
+    let manifest = execute_agent_with_spawn(input, move |job| {
+        spawn_agent_job_with_completion(job, child_cancel_for_job, Some(done_tx))
+    })?;
+    // A token that is already cancelled belongs to an earlier turn (the runtime
+    // never starts a tool once its own turn is cancelled), so ignore it.
+    let parent_cancel = parent_cancellation_token().filter(|token| !token.is_cancelled());
+    Ok(wait_for_agent(
+        manifest,
+        &done_rx,
+        agent_timeout(),
+        parent_cancel.as_ref(),
+        &child_cancel,
+    ))
+}
+
+fn wait_for_agent(
+    manifest: AgentOutput,
+    done_rx: &std::sync::mpsc::Receiver<AgentCompletion>,
+    timeout: Duration,
+    parent_cancel: Option<&runtime::CancellationToken>,
+    child_cancel: &runtime::CancellationToken,
+) -> AgentToolResult {
+    let deadline = Instant::now() + timeout;
+    let (completion, note) = loop {
+        match done_rx.recv_timeout(AGENT_WAIT_POLL) {
+            Ok(completion) => break (Some(completion), None),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break (None, None),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if parent_cancel.is_some_and(runtime::CancellationToken::is_cancelled) {
+                    child_cancel.cancel();
+                    // A moment for it to stop, so the result says how it ended (the
+                    // manifest said `running` while the sub-agent recorded its end).
+                    let stopped = done_rx.recv_timeout(AGENT_CANCEL_GRACE).ok();
+                    break (
+                        stopped,
+                        Some("Cancelled by the user; the sub-agent was asked to stop.".to_string()),
+                    );
+                }
+                if Instant::now() >= deadline {
+                    // Still reachable by Ctrl-C and session end.
+                    track_background_subagent(&manifest.agent_id, child_cancel.clone());
+                    break (
+                        None,
+                        Some(format!(
+                            "Sub-agent still running after {}s; it continues in the background until it finishes, the user presses Ctrl-C, or the session ends. Read {} later for its result.",
+                            timeout.as_secs(),
+                            manifest.output_file
+                        )),
+                    );
+                }
+            }
+        }
+    };
+    let latest = read_agent_manifest(&manifest.manifest_file).unwrap_or(manifest);
+    let (result, error_note) = completion.map_or((None, None), |completion| {
+        (completion.final_text, completion.error)
+    });
+    AgentToolResult {
+        manifest: latest,
+        result: result.filter(|text| !text.trim().is_empty()),
+        note: note.or(error_note),
+    }
+}
+
+fn read_agent_manifest(path: &str) -> Option<AgentOutput> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| serde_json::from_str(&contents).ok())
+}
+
+fn agent_timeout() -> Duration {
+    std::env::var(AGENT_TIMEOUT_ENV_VAR)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map_or(DEFAULT_AGENT_TIMEOUT, Duration::from_secs)
 }
 
 fn execute_agent_with_spawn<F>(input: AgentInput, spawn_fn: F) -> Result<AgentOutput, String>
@@ -3514,8 +4061,19 @@ where
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| slugify_agent_name(&input.description));
     let created_at = iso8601_now();
-    let system_prompt = build_agent_system_prompt(&normalized_subagent_type)?;
-    let allowed_tools = allowed_tools_for_subagent(&normalized_subagent_type);
+    let mut system_prompt = build_agent_system_prompt(&normalized_subagent_type)?;
+    // Name the sub-agent's own model (`auto` picks one per request: name none).
+    let prompt_model = model.strip_prefix("openai/").unwrap_or(&model);
+    runtime::set_prompt_model(
+        &mut system_prompt,
+        (prompt_model != "auto").then_some(prompt_model),
+    );
+    let allowed_tools = restrict_to_parent_tools(
+        allowed_tools_for_subagent(&normalized_subagent_type),
+        subagent_parent_context()
+            .and_then(|context| context.allowed_tools)
+            .as_ref(),
+    );
 
     let output_contents = format!(
         "# Agent Task
@@ -3539,7 +4097,7 @@ where
         name: agent_name,
         description: input.description,
         subagent_type: Some(normalized_subagent_type),
-        model: Some(model),
+        model: Some(shown_agent_model(&model).to_string()),
         status: String::from("running"),
         output_file: output_file.display().to_string(),
         manifest_file: manifest_file.display().to_string(),
@@ -3556,6 +4114,7 @@ where
     let manifest_for_spawn = manifest.clone();
     let job = AgentJob {
         manifest: manifest_for_spawn,
+        model,
         prompt: input.prompt,
         system_prompt,
         allowed_tools,
@@ -3569,62 +4128,318 @@ where
     Ok(manifest)
 }
 
-fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
+fn spawn_agent_job_with_completion(
+    job: AgentJob,
+    cancel: runtime::CancellationToken,
+    completion: Option<std::sync::mpsc::Sender<AgentCompletion>>,
+) -> Result<(), String> {
     let thread_name = format!("clawd-agent-{}", job.manifest.agent_id);
     std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
-            let result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_agent_job(&job)));
-            match result {
-                Ok(Ok(())) => {}
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_agent_job(&job, &cancel)
+            }));
+            let report = match result {
+                Ok(Ok(final_text)) => AgentCompletion {
+                    final_text: Some(final_text),
+                    error: None,
+                },
                 Ok(Err(error)) => {
-                    let _ =
-                        persist_agent_terminal_state(&job.manifest, "failed", None, Some(error));
+                    let _ = if error == AGENT_CANCELLED {
+                        persist_agent_cancelled(&job.manifest)
+                    } else {
+                        persist_agent_terminal_state(
+                            &job.manifest,
+                            "failed",
+                            None,
+                            Some(error.clone()),
+                        )
+                    };
+                    AgentCompletion {
+                        final_text: None,
+                        error: Some(error),
+                    }
                 }
                 Err(_) => {
+                    let error = String::from("sub-agent thread panicked");
                     let _ = persist_agent_terminal_state(
                         &job.manifest,
                         "failed",
                         None,
-                        Some(String::from("sub-agent thread panicked")),
+                        Some(error.clone()),
                     );
+                    AgentCompletion {
+                        final_text: None,
+                        error: Some(error),
+                    }
                 }
+            };
+            forget_background_subagent(&job.manifest.agent_id);
+            if let Some(completion) = completion {
+                let _ = completion.send(report);
             }
         })
         .map(|_| ())
         .map_err(|error| error.to_string())
 }
 
-fn run_agent_job(job: &AgentJob) -> Result<(), String> {
-    let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
+/// Runs the sub-agent turn; returns its final text on success.
+fn run_agent_job(job: &AgentJob, cancel: &runtime::CancellationToken) -> Result<String, String> {
+    let mut runtime = build_agent_runtime(job)?
+        .with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS)
+        .with_cancellation_token(cancel.clone());
     let summary = runtime
         .run_turn(job.prompt.clone(), None)
         .map_err(|error| error.to_string())?;
     let final_text = final_assistant_text(&summary);
-    persist_agent_terminal_state(&job.manifest, "completed", Some(final_text.as_str()), None)
+    match &summary.outcome {
+        runtime::TurnOutcome::Cancelled { .. } => Err(AGENT_CANCELLED.to_string()),
+        runtime::TurnOutcome::LoopDetected { tool_name, repeats } => Err(format!(
+            "sub-agent stopped after repeating `{tool_name}` {repeats} times"
+        )),
+        runtime::TurnOutcome::Completed | runtime::TurnOutcome::OutputTruncated => {
+            persist_agent_terminal_state(
+                &job.manifest,
+                "completed",
+                Some(final_text.as_str()),
+                None,
+            )?;
+            Ok(final_text)
+        }
+    }
 }
 
 fn build_agent_runtime(
     job: &AgentJob,
-) -> Result<ConversationRuntime<ProviderRuntimeClient, SubagentToolExecutor>, String> {
-    let model = job
-        .manifest
-        .model
-        .clone()
-        .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string());
-    let allowed_tools = job.allowed_tools.clone();
-    let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
+) -> Result<ConversationRuntime<SubagentApiClient, SubagentToolExecutor>, String> {
+    let model = job.model.clone();
+    let api_client = SubagentApiClient::new(&model, job.allowed_tools.clone())?;
+    Ok(assemble_agent_runtime(
+        api_client,
+        &model,
+        job.allowed_tools.clone(),
+        job.system_prompt.clone(),
+    ))
+}
+
+/// Wires a sub-agent runtime around `api_client` with the inherited
+/// permission policy, hooks and tool set.
+fn assemble_agent_runtime<C: ApiClient>(
+    api_client: C,
+    model: &str,
+    allowed_tools: BTreeSet<String>,
+    system_prompt: Vec<String>,
+) -> ConversationRuntime<C, SubagentToolExecutor> {
+    let tool_schema_tokens = subagent_tool_schema_tokens(&allowed_tools);
     let permission_policy = agent_permission_policy();
     let tool_executor = SubagentToolExecutor::new(allowed_tools)
         .with_enforcer(PermissionEnforcer::new(permission_policy.clone()));
-    Ok(ConversationRuntime::new(
+    let context_manager = runtime::context_manager::ContextManager::new(
+        runtime::context_manager::ContextBudget::for_model(
+            model,
+            subagent_max_tokens(model),
+            tool_schema_tokens,
+        ),
+        runtime::context_manager::ContextPolicy::from_env(),
+    );
+    ConversationRuntime::new_with_features(
         Session::new(),
         api_client,
         tool_executor,
         permission_policy,
-        job.system_prompt.clone(),
-    ))
+        system_prompt,
+        &subagent_feature_config(),
+    )
+    .with_context_manager(context_manager)
+}
+
+/// Runtime features a sub-agent inherits: the parent's tool hooks, so
+/// security hooks also see sub-agent tool calls.
+fn subagent_feature_config() -> runtime::RuntimeFeatureConfig {
+    runtime::RuntimeFeatureConfig::default().with_hooks(
+        subagent_parent_context()
+            .map(|context| context.hooks)
+            .unwrap_or_default(),
+    )
+}
+
+/// A sub-agent's tools, limited to the parent's allow-list when it has one.
+fn restrict_to_parent_tools(
+    tools: BTreeSet<String>,
+    parent_allowed: Option<&BTreeSet<String>>,
+) -> BTreeSet<String> {
+    match parent_allowed {
+        Some(parent_allowed) => tools
+            .into_iter()
+            .filter(|tool| parent_allowed.contains(tool))
+            .collect(),
+        None => tools,
+    }
+}
+
+/// `max_tokens` for sub-agent requests, from the shared capability registry
+/// (capped at 32K), or 8K for unknown models.
+fn subagent_max_tokens(model: &str) -> u32 {
+    // Gateway pseudo-models route to an unknown upstream: stay conservative.
+    let cap = if matches!(
+        runtime::model_registry::normalize_model_id(model).as_str(),
+        "auto" | "default"
+    ) {
+        SUBAGENT_UNKNOWN_MODEL_OUTPUT
+    } else {
+        SUBAGENT_REGISTERED_OUTPUT_CAP
+    };
+    runtime::model_registry::lookup(model)
+        .or_else(|| runtime::model_registry::lookup(&resolve_model_alias(model)))
+        .map_or(SUBAGENT_UNKNOWN_MODEL_OUTPUT, |capability| {
+            capability.max_output_tokens.min(cap)
+        })
+}
+
+fn subagent_tool_schema_tokens(allowed_tools: &BTreeSet<String>) -> usize {
+    let definitions = tool_specs_for_allowed_tools(Some(allowed_tools))
+        .into_iter()
+        .map(|spec| {
+            json!({
+                "name": spec.name,
+                "description": spec.description,
+                "input_schema": spec.input_schema,
+            })
+        })
+        .collect::<Vec<_>>();
+    runtime::context_manager::estimate_text_tokens(&Value::Array(definitions).to_string())
+}
+
+/// Model client for sub-agents: inherits the parent's credentials through the
+/// registered client factory, honors configured provider fallbacks, takes
+/// `max_tokens` from the shared registry and observes cancellation.
+struct SubagentApiClient {
+    inner: ProviderRuntimeClient,
+}
+
+impl SubagentApiClient {
+    fn new(model: &str, allowed_tools: BTreeSet<String>) -> Result<Self, String> {
+        let Some(factory) = subagent_parent_context().and_then(|context| context.client_factory)
+        else {
+            // No parent credentials registered: build clients from the
+            // environment like any other provider client.
+            return Ok(Self {
+                inner: ProviderRuntimeClient::new(model.to_string(), allowed_tools)?,
+            });
+        };
+        let mut chain = vec![subagent_provider_entry(model, &factory)?];
+        for fallback_model in load_provider_fallback_config().fallbacks() {
+            match subagent_provider_entry(fallback_model, &factory) {
+                Ok(entry) => chain.push(entry),
+                Err(error) => {
+                    if std::env::var("NEURON_DEBUG").is_ok() {
+                        runtime::ui_hooks::notice(&format!(
+                            "warning: skipping unavailable fallback provider {fallback_model}: {error}"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            inner: ProviderRuntimeClient {
+                runtime: tokio::runtime::Runtime::new().map_err(|error| error.to_string())?,
+                chain,
+                allowed_tools,
+            },
+        })
+    }
+}
+
+fn subagent_provider_entry(
+    model: &str,
+    factory: &SubagentClientFactory,
+) -> Result<ProviderEntry, String> {
+    Ok(ProviderEntry {
+        model: resolve_model_alias(model),
+        client: factory(model)?,
+    })
+}
+
+impl ApiClient for SubagentApiClient {
+    fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        self.stream_with_cancellation(request, &runtime::CancellationToken::new())
+    }
+
+    fn stream_with_cancellation(
+        &mut self,
+        request: ApiRequest,
+        cancel: &runtime::CancellationToken,
+    ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        let tools = tool_specs_for_allowed_tools(Some(&self.inner.allowed_tools))
+            .into_iter()
+            .map(|spec| ToolDefinition {
+                name: spec.name.to_string(),
+                description: Some(spec.description.to_string()),
+                input_schema: spec.input_schema,
+            })
+            .collect::<Vec<_>>();
+        let messages = convert_messages(&request.messages);
+        let system =
+            (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n"));
+        let tool_choice = (!self.inner.allowed_tools.is_empty()).then_some(ToolChoice::Auto);
+
+        let runtime = &self.inner.runtime;
+        let chain = &self.inner.chain;
+        let mut last_error = None;
+        for (index, entry) in chain.iter().enumerate() {
+            let message_request = MessageRequest {
+                model: entry.model.clone(),
+                max_tokens: subagent_max_tokens(&entry.model),
+                messages: messages.clone(),
+                system: system.clone(),
+                tools: (!tools.is_empty()).then(|| tools.clone()),
+                tool_choice: tool_choice.clone(),
+                stream: true,
+                ..Default::default()
+            };
+            let attempt = runtime.block_on(async {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => None,
+                    result = stream_with_provider(&entry.client, &message_request) => Some(result),
+                }
+            });
+            match attempt {
+                None => {
+                    return Err(RuntimeError::with_kind(
+                        runtime::RuntimeErrorKind::Cancelled,
+                        "sub-agent request cancelled",
+                    ))
+                }
+                Some(Ok(events)) => return Ok(events),
+                Some(Err(error)) if error.is_retryable() && index + 1 < chain.len() => {
+                    runtime::ui_hooks::notice(&format!(
+                        "provider {} failed with retryable error, falling back: {error}",
+                        entry.model
+                    ));
+                    last_error = Some(error);
+                }
+                Some(Err(error)) => return Err(subagent_api_error(&error)),
+            }
+        }
+
+        Err(last_error.map_or_else(
+            || RuntimeError::new("provider chain exhausted with no attempts"),
+            |error| subagent_api_error(&error),
+        ))
+    }
+}
+
+/// Keeps a context-window rejection typed so the sub-agent runtime can
+/// shrink its context and retry once.
+fn subagent_api_error(error: &ApiError) -> RuntimeError {
+    let kind = if error.is_context_window_failure() {
+        runtime::RuntimeErrorKind::ContextWindowExceeded
+    } else {
+        runtime::RuntimeErrorKind::Other
+    };
+    RuntimeError::with_kind(kind, error.to_string())
 }
 
 fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String> {
@@ -3642,12 +4457,33 @@ fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String>
     Ok(prompt)
 }
 
+/// Resolves the sub-agent model. A model requested by the tool call is used
+/// only when the capability registry knows it (models hallucinate ids);
+/// otherwise the parent's resolved model is inherited. The parent's
+/// transport prefix (e.g. `openai/` for the gateway) is preserved.
 fn resolve_agent_model(model: Option<&str>) -> String {
-    model
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .unwrap_or(DEFAULT_AGENT_MODEL)
-        .to_string()
+    let parent_model = subagent_parent_context()
+        .map_or_else(|| FALLBACK_AGENT_MODEL.to_string(), |context| context.model);
+    let Some(requested) = model.map(str::trim).filter(|model| !model.is_empty()) else {
+        return parent_model;
+    };
+    let candidate = match parent_model.split_once('/') {
+        Some(("openai", _)) if !requested.starts_with("openai/") => format!("openai/{requested}"),
+        _ => requested.to_string(),
+    };
+    // Look the id up exactly as it will be sent: through the gateway
+    // transport a provider-native id (e.g. a bare Claude id) is not routable.
+    if candidate == parent_model || runtime::model_registry::lookup(&candidate).is_some() {
+        candidate
+    } else {
+        parent_model
+    }
+}
+
+/// A sub-agent's model as the rest of Neuron shows models: without the gateway
+/// transport's `openai/` routing prefix.
+fn shown_agent_model(model: &str) -> &str {
+    model.strip_prefix("openai/").unwrap_or(model)
 }
 
 fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
@@ -3682,6 +4518,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "WebFetch",
             "WebSearch",
             "ToolSearch",
+            "Skill",
             "TodoWrite",
             "StructuredOutput",
             "SendUserMessage",
@@ -3706,6 +4543,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "glob_search",
             "grep_search",
             "ToolSearch",
+            "Skill",
         ],
         _ => vec![
             "bash",
@@ -3731,11 +4569,433 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
     tools.into_iter().map(str::to_string).collect()
 }
 
+/// Permission policy for sub-agents: the parent's permission mode and its
+/// allow/deny/ask rules, never more. Without a registered parent the
+/// sub-agent is read-only.
 fn agent_permission_policy() -> PermissionPolicy {
+    match subagent_parent_context() {
+        Some(context) => {
+            agent_permission_policy_for(context.permission_mode, &context.permission_rules)
+        }
+        None => agent_permission_policy_for(
+            PermissionMode::ReadOnly,
+            &runtime::RuntimePermissionRuleConfig::default(),
+        ),
+    }
+}
+
+fn agent_permission_policy_for(
+    mode: PermissionMode,
+    rules: &runtime::RuntimePermissionRuleConfig,
+) -> PermissionPolicy {
     mvp_tool_specs().into_iter().fold(
-        PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        PermissionPolicy::new(mode).with_permission_rules(rules),
         |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
     )
+}
+
+#[cfg(test)]
+mod subagent_inheritance_tests {
+    use super::{
+        agent_permission_policy, assemble_agent_runtime, cancel_background_subagents,
+        clear_subagent_parent_context, persist_agent_cancelled, resolve_agent_model,
+        restrict_to_parent_tools, set_subagent_parent_context, shown_agent_model,
+        subagent_api_error, subagent_feature_config, subagent_max_tokens, wait_for_agent,
+        workspace_agent_store, AgentCompletion, AgentOutput, SubagentParentContext,
+        AGENT_CANCELLED,
+    };
+    use runtime::{
+        ApiClient, ApiRequest, AssistantEvent, CancellationToken, ContentBlock, PermissionMode,
+        RuntimeError, RuntimeErrorKind, RuntimeHookConfig, RuntimePermissionRuleConfig,
+    };
+    use std::collections::BTreeSet;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::time::Duration;
+
+    fn parent_context_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn register_parent(model: &str, permission_mode: PermissionMode) {
+        set_subagent_parent_context(SubagentParentContext::new(model, permission_mode));
+    }
+
+    fn tools(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(ToString::to_string).collect()
+    }
+
+    /// Requests one tool call, then answers with text.
+    struct OneToolCallApi {
+        tool: &'static str,
+        input: String,
+        calls: usize,
+    }
+
+    impl ApiClient for OneToolCallApi {
+        fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            self.calls += 1;
+            Ok(if self.calls == 1 {
+                vec![
+                    AssistantEvent::ToolUse {
+                        id: "child-1".to_string(),
+                        name: self.tool.to_string(),
+                        input: self.input.clone(),
+                    },
+                    AssistantEvent::MessageStop,
+                ]
+            } else {
+                vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ]
+            })
+        }
+    }
+
+    /// Runs one sub-agent turn that makes a single tool call and returns
+    /// that call's `(output, is_error)`.
+    fn run_child_tool_call(tool: &'static str, input: &str) -> (String, bool) {
+        let mut runtime = assemble_agent_runtime(
+            OneToolCallApi {
+                tool,
+                input: input.to_string(),
+                calls: 0,
+            },
+            "openai/auto",
+            tools(&[tool]),
+            vec!["system".to_string()],
+        );
+        let summary = runtime.run_turn("delegated", None).expect("child turn");
+        let ContentBlock::ToolResult {
+            output, is_error, ..
+        } = &summary.tool_results[0].blocks[0]
+        else {
+            panic!("expected a tool result");
+        };
+        (output.clone(), *is_error)
+    }
+
+    #[test]
+    fn parent_deny_rules_block_the_same_call_inside_a_subagent() {
+        let _guard = parent_context_lock();
+        // Even with the parent in danger-full-access (where Agent runs
+        // without a prompt), its deny rules still apply to the child.
+        set_subagent_parent_context(SubagentParentContext {
+            permission_rules: RuntimePermissionRuleConfig::new(
+                Vec::new(),
+                vec!["bash(echo neuron-subagent-deny:*)".to_string()],
+                Vec::new(),
+            ),
+            ..SubagentParentContext::new("openai/auto", PermissionMode::DangerFullAccess)
+        });
+
+        let policy = agent_permission_policy();
+        assert!(matches!(
+            policy.authorize(
+                "bash",
+                r#"{"command":"echo neuron-subagent-deny now"}"#,
+                None
+            ),
+            runtime::PermissionOutcome::Deny { .. }
+        ));
+        assert_eq!(
+            policy.authorize("bash", r#"{"command":"echo fine"}"#, None),
+            runtime::PermissionOutcome::Allow
+        );
+
+        let (output, is_error) =
+            run_child_tool_call("bash", r#"{"command":"echo neuron-subagent-deny now"}"#);
+        clear_subagent_parent_context();
+        assert!(is_error);
+        assert!(output.contains("denied by rule"), "{output}");
+    }
+
+    #[test]
+    fn parent_hooks_run_for_subagent_tool_calls() {
+        let _guard = parent_context_lock();
+        let hooks = RuntimeHookConfig::new(vec!["exit 2".to_string()], Vec::new(), Vec::new());
+        set_subagent_parent_context(SubagentParentContext {
+            hooks: hooks.clone(),
+            ..SubagentParentContext::new("openai/auto", PermissionMode::DangerFullAccess)
+        });
+        assert_eq!(subagent_feature_config().hooks(), &hooks);
+
+        let (output, is_error) = run_child_tool_call("read_file", r#"{"path":"Cargo.toml"}"#);
+        clear_subagent_parent_context();
+        assert!(is_error);
+        assert!(output.contains("PreToolUse hook denied"), "{output}");
+    }
+
+    #[test]
+    fn subagent_tools_never_exceed_the_parent_allow_list() {
+        let general = super::allowed_tools_for_subagent("general-purpose");
+        assert!(general.contains("bash") && general.contains("write_file"));
+
+        let parent = tools(&["read_file", "grep_search", "Agent"]);
+        assert_eq!(
+            restrict_to_parent_tools(general.clone(), Some(&parent)),
+            tools(&["grep_search", "read_file"])
+        );
+        assert_eq!(restrict_to_parent_tools(general.clone(), None), general);
+    }
+
+    #[test]
+    fn subagent_context_overflow_errors_stay_typed() {
+        let overflow = subagent_api_error(&api::ApiError::ContextWindowExceeded {
+            model: "m".to_string(),
+            estimated_input_tokens: 10,
+            requested_output_tokens: 10,
+            estimated_total_tokens: 20,
+            context_window_tokens: 15,
+        });
+        assert_eq!(overflow.kind(), RuntimeErrorKind::ContextWindowExceeded);
+        let other = subagent_api_error(&api::ApiError::Io(std::io::Error::other("reset")));
+        assert_eq!(other.kind(), RuntimeErrorKind::Other);
+    }
+
+    #[test]
+    fn timed_out_subagents_can_be_cancelled_later() {
+        let dir = std::env::temp_dir();
+        let (_pending_tx, pending_rx) = std::sync::mpsc::channel::<AgentCompletion>();
+        let child = CancellationToken::new();
+        let mut timed_out_manifest = manifest(&dir);
+        timed_out_manifest.agent_id = "agent-background-test".to_string();
+
+        let timed_out = wait_for_agent(
+            timed_out_manifest,
+            &pending_rx,
+            Duration::from_millis(10),
+            None,
+            &child,
+        );
+        assert!(timed_out.result.is_none());
+        assert!(!child.is_cancelled(), "a timeout leaves it running");
+
+        assert!(cancel_background_subagents() >= 1);
+        assert!(child.is_cancelled(), "Ctrl-C or session end stops it");
+    }
+
+    #[test]
+    fn subagents_inherit_the_parent_model_instead_of_a_hardcoded_default() {
+        let _guard = parent_context_lock();
+        register_parent(
+            "openai/gemini/gemini-2.5-flash",
+            PermissionMode::WorkspaceWrite,
+        );
+
+        assert_eq!(resolve_agent_model(None), "openai/gemini/gemini-2.5-flash");
+        // Unknown (hallucinated) ids fall back to the parent's model.
+        assert_eq!(
+            resolve_agent_model(Some("claude-opus-4-6-turbo")),
+            "openai/gemini/gemini-2.5-flash"
+        );
+        // Provider-native ids are not routable through the gateway transport.
+        assert_eq!(
+            resolve_agent_model(Some("claude-opus-4-6")),
+            "openai/gemini/gemini-2.5-flash"
+        );
+        // Known catalog ids are honored with the parent's transport prefix.
+        assert_eq!(
+            resolve_agent_model(Some("groq/openai/gpt-oss-120b")),
+            "openai/groq/openai/gpt-oss-120b"
+        );
+
+        // A direct (non-gateway) parent may pick a known native model.
+        register_parent("claude-sonnet-4-6", PermissionMode::WorkspaceWrite);
+        assert_eq!(
+            resolve_agent_model(Some("claude-opus-4-6")),
+            "claude-opus-4-6"
+        );
+
+        clear_subagent_parent_context();
+        assert_eq!(resolve_agent_model(None), "auto");
+    }
+
+    #[test]
+    fn subagents_never_escalate_beyond_the_parent_permission_mode() {
+        let _guard = parent_context_lock();
+        register_parent("openai/auto", PermissionMode::WorkspaceWrite);
+        assert_eq!(
+            agent_permission_policy().active_mode(),
+            PermissionMode::WorkspaceWrite
+        );
+        register_parent("openai/auto", PermissionMode::ReadOnly);
+        assert_eq!(
+            agent_permission_policy().active_mode(),
+            PermissionMode::ReadOnly
+        );
+        clear_subagent_parent_context();
+        assert_eq!(
+            agent_permission_policy().active_mode(),
+            PermissionMode::ReadOnly
+        );
+    }
+
+    #[test]
+    fn subagent_max_tokens_come_from_the_shared_registry() {
+        assert_eq!(
+            subagent_max_tokens("openai/gemini/gemini-2.5-flash"),
+            32_000
+        );
+        assert_eq!(subagent_max_tokens("groq/qwen/qwen3.8-27b"), 16_384);
+        assert_eq!(subagent_max_tokens("vendor/unknown-model"), 8_192);
+        assert_eq!(subagent_max_tokens("openai/auto"), 8_192);
+    }
+
+    #[test]
+    fn agent_store_lives_under_the_workspace_neuron_directory() {
+        let workspace = std::path::Path::new("/work/project");
+        assert_eq!(
+            workspace_agent_store(workspace),
+            workspace.join(".neuron").join("agents")
+        );
+    }
+
+    fn manifest(dir: &std::path::Path) -> AgentOutput {
+        AgentOutput {
+            agent_id: "agent-test".to_string(),
+            name: "test".to_string(),
+            description: "test".to_string(),
+            subagent_type: Some("Explore".to_string()),
+            model: Some("openai/auto".to_string()),
+            status: "running".to_string(),
+            output_file: dir.join("agent-test.md").display().to_string(),
+            manifest_file: dir.join("missing-manifest.json").display().to_string(),
+            created_at: "0".to_string(),
+            started_at: None,
+            completed_at: None,
+            lane_events: Vec::new(),
+            current_blocker: None,
+            derived_state: "working".to_string(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn agent_tool_waits_for_the_final_text_and_reports_timeouts_and_cancellation() {
+        let dir = std::env::temp_dir();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        done_tx
+            .send(AgentCompletion {
+                final_text: Some("Found 3 call sites.".to_string()),
+                error: None,
+            })
+            .expect("send");
+        let finished = wait_for_agent(
+            manifest(&dir),
+            &done_rx,
+            Duration::from_secs(5),
+            None,
+            &CancellationToken::new(),
+        );
+        assert_eq!(finished.result.as_deref(), Some("Found 3 call sites."));
+        let json = serde_json::to_value(&finished).expect("serializes");
+        assert_eq!(json["result"], "Found 3 call sites.");
+        assert_eq!(json["agentId"], "agent-test");
+
+        let (_pending_tx, pending_rx) = std::sync::mpsc::channel::<AgentCompletion>();
+        let timed_out = wait_for_agent(
+            manifest(&dir),
+            &pending_rx,
+            Duration::from_millis(10),
+            None,
+            &CancellationToken::new(),
+        );
+        assert!(timed_out.result.is_none());
+        assert!(timed_out
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("still running")));
+
+        let parent = CancellationToken::new();
+        parent.cancel();
+        let child = CancellationToken::new();
+        let cancelled = wait_for_agent(
+            manifest(&dir),
+            &pending_rx,
+            Duration::from_secs(5),
+            Some(&parent),
+            &child,
+        );
+        assert!(child.is_cancelled(), "child is told to stop");
+        assert!(cancelled
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("Cancelled")));
+    }
+
+    /// After an interrupt the `Agent` result said `running` while the sub-agent's own
+    /// manifest said `failed`, as an `infra` failure; and its model had the routing
+    /// prefix the rest of Neuron leaves out.
+    #[test]
+    fn an_interrupted_subagent_reports_cancelled_not_running_or_failed() {
+        let dir = std::env::temp_dir().join(format!(
+            "neuron-agent-cancel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("agent dir");
+        let mut running = manifest(&dir);
+        running.manifest_file = dir.join("agent-test.json").display().to_string();
+        std::fs::write(
+            &running.output_file,
+            "# Agent Task
+",
+        )
+        .expect("output file");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let parent = CancellationToken::new();
+        parent.cancel();
+        let child = CancellationToken::new();
+        let sub_agent = {
+            let child = child.clone();
+            let running = running.clone();
+            std::thread::spawn(move || {
+                while !child.is_cancelled() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                persist_agent_cancelled(&running).expect("persisted");
+                done_tx
+                    .send(AgentCompletion {
+                        final_text: None,
+                        error: Some(AGENT_CANCELLED.to_string()),
+                    })
+                    .expect("send");
+            })
+        };
+
+        let result = wait_for_agent(
+            running,
+            &done_rx,
+            Duration::from_secs(60),
+            Some(&parent),
+            &child,
+        );
+        sub_agent.join().expect("sub-agent");
+
+        let json = serde_json::to_value(&result).expect("serializes");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(json["status"], "cancelled", "{json}");
+        assert_eq!(json["derivedState"], "cancelled", "{json}");
+        assert!(json["currentBlocker"].is_null(), "{json}");
+        assert_eq!(json["laneEvents"][0]["event"], "lane.closed", "{json}");
+        assert!(json["laneEvents"][0]["failureClass"].is_null(), "{json}");
+        assert!(result
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("Cancelled")));
+
+        assert_eq!(
+            shown_agent_model("openai/groq/openai/gpt-oss-120b"),
+            "groq/openai/gpt-oss-120b"
+        );
+        assert_eq!(shown_agent_model("claude-sonnet-4-6"), "claude-sonnet-4-6");
+    }
 }
 
 fn write_agent_manifest(manifest: &AgentOutput) -> Result<(), String> {
@@ -3746,6 +5006,30 @@ fn write_agent_manifest(manifest: &AgentOutput) -> Result<(), String> {
         serde_json::to_string_pretty(&normalized).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())
+}
+
+/// Records a sub-agent the user interrupted: `cancelled`, with no failure blocker (it
+/// did not fail; it was reported as an `infra` failure).
+fn persist_agent_cancelled(manifest: &AgentOutput) -> Result<(), String> {
+    append_agent_output(
+        &manifest.output_file,
+        &format_agent_terminal_output("cancelled", None, None, Some(AGENT_CANCELLED)),
+    )?;
+    let mut next_manifest = manifest.clone();
+    next_manifest.status = "cancelled".to_string();
+    next_manifest.completed_at = Some(iso8601_now());
+    next_manifest.current_blocker = None;
+    next_manifest.derived_state = "cancelled".to_string();
+    next_manifest.error = Some(AGENT_CANCELLED.to_string());
+    next_manifest.lane_events.push(
+        LaneEvent::new(
+            LaneEventName::Closed,
+            LaneEventStatus::Closed,
+            iso8601_now(),
+        )
+        .with_detail(AGENT_CANCELLED),
+    );
+    write_agent_manifest(&next_manifest)
 }
 
 fn persist_agent_terminal_state(
@@ -4543,9 +5827,9 @@ impl ProviderRuntimeClient {
                 Ok(entry) => chain.push(entry),
                 Err(error) => {
                     if std::env::var("NEURON_DEBUG").is_ok() {
-                        eprintln!(
+                        runtime::ui_hooks::notice(&format!(
                             "warning: skipping unavailable fallback provider {fallback_model}: {error}"
-                        );
+                        ));
                     }
                 }
             }
@@ -4593,7 +5877,7 @@ impl ApiClient for ProviderRuntimeClient {
 
         let runtime = &self.runtime;
         let chain = &self.chain;
-        let mut last_error: Option<ApiError> = None;
+        let mut last_error = None;
         for (index, entry) in chain.iter().enumerate() {
             let message_request = MessageRequest {
                 model: entry.model.clone(),
@@ -4610,10 +5894,10 @@ impl ApiClient for ProviderRuntimeClient {
             match attempt {
                 Ok(events) => return Ok(events),
                 Err(error) if error.is_retryable() && index + 1 < chain.len() => {
-                    eprintln!(
+                    runtime::ui_hooks::notice(&format!(
                         "provider {} failed with retryable error, falling back: {error}",
                         entry.model
-                    );
+                    ));
                     last_error = Some(error);
                 }
                 Err(error) => return Err(RuntimeError::new(error.to_string())),
@@ -4631,7 +5915,7 @@ impl ApiClient for ProviderRuntimeClient {
 async fn stream_with_provider(
     client: &ProviderClient,
     message_request: &MessageRequest,
-) -> Result<Vec<AssistantEvent>, ApiError> {
+) -> Result<Vec<AssistantEvent>, Box<ApiError>> {
     let mut stream = client.stream_message(message_request).await?;
     let mut events = Vec::new();
     let mut pending_tools: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
@@ -4732,6 +6016,16 @@ impl SubagentToolExecutor {
 
 impl ToolExecutor for SubagentToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        self.execute_with_cancellation(tool_name, input, &CancellationToken::new())
+    }
+
+    /// A cancelled sub-agent kills its running `bash` / `PowerShell` command tree.
+    fn execute_with_cancellation(
+        &mut self,
+        tool_name: &str,
+        input: &str,
+        cancel: &CancellationToken,
+    ) -> Result<String, ToolError> {
         if !self.allowed_tools.contains(tool_name) {
             return Err(ToolError::new(format!(
                 "tool `{tool_name}` is not enabled for this sub-agent"
@@ -4739,7 +6033,7 @@ impl ToolExecutor for SubagentToolExecutor {
         }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        execute_tool_with_enforcer(self.enforcer.as_ref(), tool_name, &value)
+        execute_tool_with_enforcer_and_cancel(self.enforcer.as_ref(), tool_name, &value, cancel)
             .map_err(ToolError::new)
     }
 }
@@ -4881,14 +6175,16 @@ fn execute_tool_search(input: ToolSearchInput) -> ToolSearchOutput {
     GlobalToolRegistry::builtin().search(&input.query, input.max_results.unwrap_or(5), None, None)
 }
 
-fn deferred_tool_specs() -> Vec<ToolSpec> {
+/// Built-in tools `ToolSearch` can find: everything except the core file and
+/// shell tools (always advertised) and hidden test fixtures.
+fn searchable_builtin_specs() -> Vec<ToolSpec> {
     mvp_tool_specs()
         .into_iter()
         .filter(|spec| {
             !matches!(
                 spec.name,
                 "bash" | "read_file" | "write_file" | "edit_file" | "glob_search" | "grep_search"
-            )
+            ) && tool_advertisement(spec.name) != ToolAdvertisement::Hidden
         })
         .collect()
 }
@@ -5000,15 +6296,18 @@ fn canonical_tool_token(value: &str) -> String {
     canonical
 }
 
+/// Sub-agent task files and manifests live in `<workspace>/.neuron/agents`
+/// (next to `.neuron/sessions`); `CLAWD_AGENT_STORE` overrides the location.
 fn agent_store_dir() -> Result<std::path::PathBuf, String> {
     if let Ok(path) = std::env::var("CLAWD_AGENT_STORE") {
         return Ok(std::path::PathBuf::from(path));
     }
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    if let Some(workspace_root) = cwd.ancestors().nth(2) {
-        return Ok(workspace_root.join(".clawd-agents"));
-    }
-    Ok(cwd.join(".clawd-agents"))
+    Ok(workspace_agent_store(&cwd))
+}
+
+fn workspace_agent_store(workspace: &Path) -> std::path::PathBuf {
+    workspace.join(".neuron").join("agents")
 }
 
 fn make_agent_id() -> String {
@@ -5279,7 +6578,8 @@ fn resolve_attachment(path: &str) -> Result<ResolvedAttachment, String> {
     let resolved = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
     let metadata = std::fs::metadata(&resolved).map_err(|error| error.to_string())?;
     Ok(ResolvedAttachment {
-        path: resolved.display().to_string(),
+        // Without the `\\?\` prefix canonicalize adds on Windows.
+        path: runtime::display_path(&resolved),
         size: metadata.len(),
         is_image: is_image_path(&resolved),
     })
@@ -5299,6 +6599,11 @@ fn execute_config(input: ConfigInput) -> Result<ConfigOutput, String> {
     let setting = input.setting.trim();
     if setting.is_empty() {
         return Err(String::from("setting must not be empty"));
+    }
+    if input.value.is_some() {
+        if let Some(reason) = protected_config_setting_reason(setting) {
+            return Err(reason);
+        }
     }
     let Some(spec) = supported_config_setting(setting) else {
         return Ok(ConfigOutput {
@@ -5340,6 +6645,21 @@ fn execute_config(input: ConfigInput) -> Result<ConfigOutput, String> {
             error: None,
         })
     }
+}
+
+/// Settings the model may read but never change through the Config tool:
+/// `permissions.*` decides what tools may do without asking, and `hooks`
+/// run arbitrary commands, so only the user may edit them.
+fn protected_config_setting_reason(setting: &str) -> Option<String> {
+    let root = setting.split('.').next().unwrap_or(setting).trim();
+    let protected = ["permissions", "permissionMode", "hooks"]
+        .iter()
+        .any(|name| root.eq_ignore_ascii_case(name));
+    protected.then(|| {
+        format!(
+            "The Config tool cannot change `{setting}`: permission and hook settings decide what tools may run without approval, so only the user can change them (edit the settings file directly, or start Neuron with --permission-mode)."
+        )
+    })
 }
 
 const PERMISSION_DEFAULT_MODE_PATH: &[&str] = &["permissions", "defaultMode"];
@@ -5496,56 +6816,43 @@ fn execute_structured_output(
     })
 }
 
-fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
+fn execute_repl(input: ReplInput, cancel: &CancellationToken) -> Result<ReplOutput, String> {
     if input.code.trim().is_empty() {
         return Err(String::from("code must not be empty"));
     }
     let runtime = resolve_repl_runtime(&input.language)?;
     let started = Instant::now();
     let mut process = Command::new(runtime.program);
-    process
-        .args(runtime.args)
-        .arg(&input.code)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+    process.args(runtime.args).arg(&input.code);
+    plugins::subprocess::scrub_credential_env(&mut process);
 
-    let output = if let Some(timeout_ms) = input.timeout_ms {
-        let mut child = process.spawn().map_err(|error| error.to_string())?;
-        loop {
-            if child
-                .try_wait()
-                .map_err(|error| error.to_string())?
-                .is_some()
-            {
-                break child
-                    .wait_with_output()
-                    .map_err(|error| error.to_string())?;
-            }
-            if started.elapsed() >= Duration::from_millis(timeout_ms) {
-                child.kill().map_err(|error| error.to_string())?;
-                child
-                    .wait_with_output()
-                    .map_err(|error| error.to_string())?;
-                return Err(format!(
-                    "REPL execution exceeded timeout of {timeout_ms} ms"
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(10));
+    let timeout_ms = runtime::effective_bash_timeout_ms(input.timeout_ms);
+    let output = plugins::subprocess::run_bounded(
+        &mut process,
+        None,
+        Some(Duration::from_millis(timeout_ms)),
+        &|| cancel.is_cancelled(),
+    )
+    .map_err(|error| error.to_string())?;
+    match output.termination {
+        plugins::subprocess::Termination::TimedOut => {
+            return Err(format!(
+                "REPL execution exceeded timeout of {timeout_ms} ms; the process tree was terminated"
+            ));
         }
-    } else {
-        process
-            .spawn()
-            .map_err(|error| error.to_string())?
-            .wait_with_output()
-            .map_err(|error| error.to_string())?
-    };
+        plugins::subprocess::Termination::Cancelled => {
+            return Err(String::from(
+                "REPL execution was cancelled; the process tree was terminated",
+            ));
+        }
+        plugins::subprocess::Termination::Exited => {}
+    }
 
     Ok(ReplOutput {
         language: input.language,
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        exit_code: output.status.code().unwrap_or(1),
+        exit_code: output.exit_code().unwrap_or(1),
         duration_ms: started.elapsed().as_millis(),
     })
 }
@@ -5913,31 +7220,20 @@ fn iso8601_timestamp() -> String {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn execute_powershell(input: PowerShellInput) -> std::io::Result<runtime::BashCommandOutput> {
+fn execute_powershell(
+    input: PowerShellInput,
+    cancel: &CancellationToken,
+) -> std::io::Result<runtime::BashCommandOutput> {
     let _ = &input.description;
     if let Some(output) = workspace_test_branch_preflight(&input.command) {
         return Ok(output);
     }
-    let shell = detect_powershell_shell()?;
-    execute_shell_command(
-        shell,
+    powershell::execute(
         &input.command,
         input.timeout,
-        input.run_in_background,
+        input.run_in_background.unwrap_or(false),
+        cancel,
     )
-}
-
-fn detect_powershell_shell() -> std::io::Result<&'static str> {
-    if command_exists("pwsh") {
-        Ok("pwsh")
-    } else if command_exists("powershell") {
-        Ok("powershell")
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "PowerShell executable not found (expected `pwsh` or `powershell` in PATH)",
-        ))
-    }
 }
 
 fn command_exists(command: &str) -> bool {
@@ -5956,138 +7252,6 @@ fn command_exists(command: &str) -> bool {
             .status()
             .is_ok_and(|status| status.success())
     }
-}
-
-#[allow(clippy::too_many_lines)]
-fn execute_shell_command(
-    shell: &str,
-    command: &str,
-    timeout: Option<u64>,
-    run_in_background: Option<bool>,
-) -> std::io::Result<runtime::BashCommandOutput> {
-    if run_in_background.unwrap_or(false) {
-        let child = std::process::Command::new(shell)
-            .arg("-NoProfile")
-            .arg("-NonInteractive")
-            .arg("-Command")
-            .arg(command)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
-        return Ok(runtime::BashCommandOutput {
-            stdout: String::new(),
-            stderr: String::new(),
-            raw_output_path: None,
-            interrupted: false,
-            is_image: None,
-            background_task_id: Some(child.id().to_string()),
-            backgrounded_by_user: Some(true),
-            assistant_auto_backgrounded: Some(false),
-            dangerously_disable_sandbox: None,
-            return_code_interpretation: None,
-            no_output_expected: Some(true),
-            structured_content: None,
-            persisted_output_path: None,
-            persisted_output_size: None,
-            sandbox_status: None,
-        });
-    }
-
-    let mut process = std::process::Command::new(shell);
-    process
-        .arg("-NoProfile")
-        .arg("-NonInteractive")
-        .arg("-Command")
-        .arg(command);
-    process
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    if let Some(timeout_ms) = timeout {
-        let mut child = process.spawn()?;
-        let started = Instant::now();
-        loop {
-            if let Some(status) = child.try_wait()? {
-                let output = child.wait_with_output()?;
-                return Ok(runtime::BashCommandOutput {
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                    raw_output_path: None,
-                    interrupted: false,
-                    is_image: None,
-                    background_task_id: None,
-                    backgrounded_by_user: None,
-                    assistant_auto_backgrounded: None,
-                    dangerously_disable_sandbox: None,
-                    return_code_interpretation: status
-                        .code()
-                        .filter(|code| *code != 0)
-                        .map(|code| format!("exit_code:{code}")),
-                    no_output_expected: Some(output.stdout.is_empty() && output.stderr.is_empty()),
-                    structured_content: None,
-                    persisted_output_path: None,
-                    persisted_output_size: None,
-                    sandbox_status: None,
-                });
-            }
-            if started.elapsed() >= Duration::from_millis(timeout_ms) {
-                let _ = child.kill();
-                let output = child.wait_with_output()?;
-                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-                let stderr = if stderr.trim().is_empty() {
-                    format!("Command exceeded timeout of {timeout_ms} ms")
-                } else {
-                    format!(
-                        "{}
-Command exceeded timeout of {timeout_ms} ms",
-                        stderr.trim_end()
-                    )
-                };
-                return Ok(runtime::BashCommandOutput {
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr,
-                    raw_output_path: None,
-                    interrupted: true,
-                    is_image: None,
-                    background_task_id: None,
-                    backgrounded_by_user: None,
-                    assistant_auto_backgrounded: None,
-                    dangerously_disable_sandbox: None,
-                    return_code_interpretation: Some(String::from("timeout")),
-                    no_output_expected: Some(false),
-                    structured_content: None,
-                    persisted_output_path: None,
-                    persisted_output_size: None,
-                    sandbox_status: None,
-                });
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    let output = process.output()?;
-    Ok(runtime::BashCommandOutput {
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        raw_output_path: None,
-        interrupted: false,
-        is_image: None,
-        background_task_id: None,
-        backgrounded_by_user: None,
-        assistant_auto_backgrounded: None,
-        dangerously_disable_sandbox: None,
-        return_code_interpretation: output
-            .status
-            .code()
-            .filter(|code| *code != 0)
-            .map(|code| format!("exit_code:{code}")),
-        no_output_expected: Some(output.stdout.is_empty() && output.stderr.is_empty()),
-        structured_content: None,
-        persisted_output_path: None,
-        persisted_output_size: None,
-        sandbox_status: None,
-    })
 }
 
 fn resolve_cell_index(
@@ -6149,6 +7313,10 @@ fn parse_skill_description(contents: &str) -> Option<String> {
 
 pub mod lane_completion;
 pub mod pdf_extract;
+mod powershell;
+#[cfg(test)]
+mod safety_tests;
+mod web_fetch;
 
 #[cfg(test)]
 mod tests {
@@ -6277,7 +7445,10 @@ mod tests {
         let policy = permission_policy_for_mode(PermissionMode::ReadOnly);
         let registry = GlobalToolRegistry::builtin().with_enforcer(PermissionEnforcer::new(policy));
 
-        let safe = registry.execute("bash", &json!({ "command": "pwd", "timeout": 1000 }));
+        // cmd.exe has no `pwd` (and a failing command is an error result);
+        // its bare `cd` prints the directory the same way.
+        let print_cwd = if cfg!(windows) { "cd" } else { "pwd" };
+        let safe = registry.execute("bash", &json!({ "command": print_cwd, "timeout": 10_000 }));
         assert!(safe.is_ok(), "read-only bash command should run: {safe:?}");
 
         let denied = registry.execute("bash", &json!({ "command": "rm scratch.txt" }));
@@ -6413,14 +7584,19 @@ mod tests {
     #[cfg_attr(windows, ignore = "Windows fixture needs shell/path isolation")]
     fn worker_create_merges_config_trusted_roots_without_per_call_override() {
         use std::fs;
-        // Write a .claw/settings.json in a temp dir with trustedRoots
+        // trustedRoots come from user settings: a worktree's own settings file
+        // cannot vouch for itself.
+        let _guard = env_guard();
         let worktree = temp_path("config-trust-worktree");
-        let claw_dir = worktree.join(".claw");
-        fs::create_dir_all(&claw_dir).expect("create .claw dir");
+        let config_home = temp_path("config-trust-home");
+        fs::create_dir_all(&worktree).expect("create worktree");
+        fs::create_dir_all(&config_home).expect("create config home");
         // Use the actual OS temp dir so the worktree path matches the allowlist
         let tmp_root = std::env::temp_dir().to_str().expect("utf-8").to_string();
-        let settings = format!("{{\"trustedRoots\": [\"{tmp_root}\"]}}");
-        fs::write(claw_dir.join("settings.json"), settings).expect("write settings");
+        let settings = json!({ "trustedRoots": [tmp_root] }).to_string();
+        fs::write(config_home.join("settings.json"), settings).expect("write settings");
+        let original_config_home = std::env::var_os("NEURON_CONFIG_HOME");
+        std::env::set_var("NEURON_CONFIG_HOME", &config_home);
 
         // WorkerCreate with no per-call trusted_roots — config should supply them
         let cwd = worktree.to_str().expect("valid utf-8").to_string();
@@ -6430,17 +7606,22 @@ mod tests {
                 "cwd": cwd
                 // trusted_roots intentionally omitted
             }),
-        )
-        .expect("WorkerCreate should succeed");
+        );
+        match original_config_home {
+            Some(value) => std::env::set_var("NEURON_CONFIG_HOME", value),
+            None => std::env::remove_var("NEURON_CONFIG_HOME"),
+        }
+        let created = created.expect("WorkerCreate should succeed");
         let output: serde_json::Value = serde_json::from_str(&created).expect("json");
 
-        // worktree is under /tmp, so config roots auto-resolve trust
+        // worktree is under the temp dir, so config roots auto-resolve trust
         assert_eq!(
             output["trust_auto_resolve"], true,
-            "config-level trustedRoots should auto-resolve trust without per-call override"
+            "user-level trustedRoots should auto-resolve trust without per-call override"
         );
 
         fs::remove_dir_all(&worktree).ok();
+        fs::remove_dir_all(&config_home).ok();
     }
 
     #[test]
@@ -6582,15 +7763,16 @@ mod tests {
     #[test]
     #[cfg_attr(windows, ignore = "Windows fixture needs shell/path isolation")]
     fn recovery_loop_state_file_reflects_transitions() {
-        // End-to-end proof: .claw/worker-state.json reflects every transition
+        // End-to-end proof: .neuron/worker-state.json reflects every transition
         // through the stall-detect -> resolve-trust -> ready loop.
         use std::fs;
+        let _guard = env_guard();
 
         // Use a real temp CWD so state file can be written
         let worktree = temp_path("recovery-loop-state");
         fs::create_dir_all(&worktree).expect("create worktree");
         let cwd = worktree.to_str().expect("utf-8").to_string();
-        let state_path = worktree.join(".claw").join("worker-state.json");
+        let state_path = worktree.join(".neuron").join("worker-state.json");
 
         // 1. Create worker WITHOUT trusted_roots
         let created = execute_tool("WorkerCreate", &json!({"cwd": cwd}))
@@ -6930,6 +8112,22 @@ mod tests {
     }
 
     #[test]
+    fn global_tool_registry_asks_before_web_search() {
+        // given
+        let policy = permission_policy_for_mode(PermissionMode::WorkspaceWrite)
+            .with_session_approvals(runtime::SessionApprovals::isolated());
+        let registry = GlobalToolRegistry::builtin().with_enforcer(PermissionEnforcer::new(policy));
+
+        // when
+        let error = registry
+            .execute("WebSearch", &json!({ "query": "rust error E0502" }))
+            .expect_err("an unapproved web search should not run");
+
+        // then
+        assert!(error.contains("search service"), "{error}");
+    }
+
+    #[test]
     fn subagent_tool_executor_denies_blocked_tool_before_dispatch() {
         // given
         let policy = permission_policy_for_mode(PermissionMode::ReadOnly);
@@ -6952,6 +8150,31 @@ mod tests {
         assert!(error
             .to_string()
             .contains("requires workspace-write permission"));
+    }
+
+    #[test]
+    fn a_cancelled_subagent_stops_its_running_bash_command() {
+        let mut executor = SubagentToolExecutor::new(BTreeSet::from([String::from("bash")]));
+        let cancel = runtime::CancellationToken::new();
+        let trigger = cancel.clone();
+        let canceller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(400));
+            trigger.cancel();
+        });
+        let command = if cfg!(windows) {
+            "ping -n 30 127.0.0.1 >NUL"
+        } else {
+            "sleep 30"
+        };
+        let started = std::time::Instant::now();
+
+        let error = executor
+            .execute_with_cancellation("bash", &json!({ "command": command }).to_string(), &cancel)
+            .expect_err("a cancelled command is an error result");
+
+        canceller.join().expect("canceller");
+        assert!(error.to_string().contains("\"cancelled\""), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(15));
     }
 
     #[test]
@@ -7033,6 +8256,8 @@ mod tests {
 
     #[test]
     fn web_fetch_returns_prompt_aware_summary() {
+        // The fixture server listens on loopback, which WebFetch blocks.
+        super::web_fetch::allow_loopback_on_this_thread();
         let server = TestServer::spawn(Arc::new(|request_line: &str| {
             assert!(request_line.starts_with("GET /page "));
             HttpResponse::html(
@@ -7073,6 +8298,7 @@ mod tests {
 
     #[test]
     fn web_fetch_supports_plain_text_and_rejects_invalid_url() {
+        super::web_fetch::allow_loopback_on_this_thread();
         let server = TestServer::spawn(Arc::new(|request_line: &str| {
             assert!(request_line.starts_with("GET /plain "));
             HttpResponse::text(200, "OK", "plain text response")
@@ -7103,6 +8329,40 @@ mod tests {
         )
         .expect_err("invalid URL should fail");
         assert!(error.contains("relative URL without a base") || error.contains("invalid"));
+    }
+
+    #[test]
+    fn web_fetch_title_preserves_unicode_byte_offsets() {
+        let html = "İ<TITLE>É 🦀</TITLE>";
+        assert_eq!(
+            super::extract_title("", html, "text/html"),
+            Some("É 🦀".to_string())
+        );
+    }
+
+    #[test]
+    fn http_test_server_drop_preserves_failures_without_double_panic() {
+        let failed_server = || TestServer {
+            addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            shutdown: None,
+            handle: Some(thread::spawn(|| panic!("server fixture failure"))),
+        };
+        let ordinary = std::panic::catch_unwind(|| drop(failed_server()))
+            .expect_err("server failure must fail its test");
+        assert_eq!(
+            ordinary.downcast_ref::<&str>(),
+            Some(&"server fixture failure")
+        );
+
+        let primary = std::panic::catch_unwind(|| {
+            let _server = failed_server();
+            panic!("primary fetch failure");
+        })
+        .expect_err("primary failure must remain observable");
+        assert_eq!(
+            primary.downcast_ref::<&str>(),
+            Some(&"primary fetch failure")
+        );
     }
 
     #[test]
@@ -7421,6 +8681,60 @@ mod tests {
             std::env::remove_var("HOME");
         }
         fs::remove_dir_all(home).expect("temp home should clean up");
+    }
+
+    /// The system prompt lists bundled skills by name only, so the Skill
+    /// tool must return each one's full instructions from the embedded bundle.
+    #[test]
+    fn skill_tool_loads_every_bundled_default_skill() {
+        let _guard = env_guard();
+        let root = temp_path("bundled-skill-load");
+        let keys = [
+            "NEURON_CONFIG_HOME",
+            "CLAW_CONFIG_HOME",
+            "CODEX_HOME",
+            "CLAUDE_CONFIG_DIR",
+            "HOME",
+        ];
+        let saved = keys.map(|key| (key, std::env::var_os(key)));
+        for key in keys {
+            std::env::remove_var(key);
+        }
+        std::env::set_var("NEURON_CONFIG_HOME", root.join("config"));
+        std::env::set_var("HOME", root.join("home"));
+
+        let mut loaded = Vec::new();
+        for name in runtime::default_skills::DEFAULT_SKILL_NAMES {
+            let output: serde_json::Value = execute_tool("Skill", &json!({ "skill": name }))
+                .map(|result| serde_json::from_str(&result).expect("valid json"))
+                .unwrap_or_else(|error| panic!("{name} should load: {error}"));
+            let prompt = output["prompt"].as_str().expect("prompt").to_string();
+            assert!(
+                prompt
+                    .lines()
+                    .any(|line| line.trim_end() == format!("name: {name}")),
+                "{name} returned its own SKILL.md"
+            );
+            loaded.push((*name, prompt));
+        }
+        let body = |name: &str| {
+            loaded
+                .iter()
+                .find(|(loaded_name, _)| *loaded_name == name)
+                .map(|(_, prompt)| prompt.as_str())
+                .expect("loaded")
+        };
+        assert!(body("ponytail").contains("# Ponytail"));
+        assert!(body("antislop").contains("R-38"));
+        assert!(body("gstack-review").len() > 10_000);
+
+        for (key, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -7831,12 +9145,11 @@ mod tests {
             },
         )
         .expect("Agent should succeed");
-        std::env::remove_var("CLAWD_AGENT_STORE");
 
         assert_eq!(manifest.name, "ship-audit");
         assert_eq!(manifest.subagent_type.as_deref(), Some("Explore"));
         assert_eq!(manifest.status, "running");
-        assert!(!manifest.created_at.is_empty());
+        assert_ne!(manifest.created_at, "");
         assert!(manifest.started_at.is_some());
         assert!(manifest.completed_at.is_none());
         let contents = std::fs::read_to_string(&manifest.output_file).expect("agent file exists");
@@ -7860,30 +9173,43 @@ mod tests {
         assert!(captured_job.allowed_tools.contains("read_file"));
         assert!(!captured_job.allowed_tools.contains("Agent"));
 
-        let normalized = execute_tool(
-            "Agent",
-            &json!({
-                "description": "Verify the branch",
-                "prompt": "Check tests.",
-                "subagent_type": "explorer"
-            }),
+        let normalized = execute_agent_with_spawn(
+            AgentInput {
+                description: "Verify the branch".to_string(),
+                prompt: "Check tests.".to_string(),
+                subagent_type: Some("explorer".to_string()),
+                name: None,
+                model: None,
+            },
+            |_| Ok(()),
         )
         .expect("Agent should normalize built-in aliases");
-        let normalized_output: serde_json::Value =
-            serde_json::from_str(&normalized).expect("valid json");
+        let normalized_output = serde_json::to_value(normalized).expect("valid json");
         assert_eq!(normalized_output["subagentType"], "Explore");
 
-        let named = execute_tool(
-            "Agent",
-            &json!({
-                "description": "Review the branch",
-                "prompt": "Inspect diff.",
-                "name": "Ship Audit!!!"
-            }),
+        let named = execute_agent_with_spawn(
+            AgentInput {
+                description: "Review the branch".to_string(),
+                prompt: "Inspect diff.".to_string(),
+                subagent_type: None,
+                name: Some("Ship Audit!!!".to_string()),
+                model: None,
+            },
+            |_| Ok(()),
         )
         .expect("Agent should normalize explicit names");
-        let named_output: serde_json::Value = serde_json::from_str(&named).expect("valid json");
+        let named_output = serde_json::to_value(named).expect("valid json");
         assert_eq!(named_output["name"], "ship-audit");
+        // Every manifest of this test goes to the test store, not to the
+        // working directory's `.neuron/agents`.
+        for output in [&normalized_output, &named_output] {
+            let manifest_file = output["manifestFile"].as_str().expect("manifest path");
+            assert!(
+                std::path::Path::new(manifest_file).starts_with(&dir),
+                "{manifest_file}"
+            );
+        }
+        std::env::remove_var("CLAWD_AGENT_STORE");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -8476,6 +9802,26 @@ mod tests {
         assert!(!verification.contains("write_file"));
     }
 
+    /// Every sub-agent gets the default system prompt, whose skill index
+    /// only names the bundled skills; their text loads through the Skill
+    /// tool, so each sub-agent type needs it.
+    #[test]
+    fn every_subagent_type_can_load_the_skills_its_prompt_lists() {
+        for subagent_type in [
+            "general-purpose",
+            "Explore",
+            "Plan",
+            "Verification",
+            "claw-guide",
+            "statusline-setup",
+        ] {
+            assert!(
+                allowed_tools_for_subagent(subagent_type).contains("Skill"),
+                "{subagent_type} cannot load skills"
+            );
+        }
+    }
+
     #[derive(Debug)]
     struct MockSubagentApiClient {
         calls: usize,
@@ -8517,6 +9863,8 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = temp_path("subagent-input.txt");
         std::fs::write(&path, "hello from child").expect("write input file");
+        let original_dir = std::env::current_dir().expect("current directory");
+        std::env::set_current_dir(std::env::temp_dir()).expect("set temp workspace");
 
         let mut runtime = ConversationRuntime::new(
             Session::new(),
@@ -8529,9 +9877,9 @@ mod tests {
             vec![String::from("system prompt")],
         );
 
-        let summary = runtime
-            .run_turn("Inspect the delegated file", None)
-            .expect("subagent loop should succeed");
+        let summary = runtime.run_turn("Inspect the delegated file", None);
+        std::env::set_current_dir(original_dir).expect("restore current directory");
+        let summary = summary.expect("subagent loop should succeed");
 
         assert_eq!(
             final_assistant_text(&summary),
@@ -8707,8 +10055,9 @@ mod tests {
         assert_eq!(success_output["stdout"], "hello");
         assert_eq!(success_output["interrupted"], false);
 
+        // Failures are error results that still carry the structured output.
         let failure = execute_tool("bash", &json!({ "command": "printf 'oops' >&2; exit 7" }))
-            .expect("bash failure should still return structured output");
+            .expect_err("a non-zero exit is an error result");
         let failure_output: serde_json::Value = serde_json::from_str(&failure).expect("json");
         assert_eq!(failure_output["returnCodeInterpretation"], "exit_code:7");
         assert!(failure_output["stderr"]
@@ -8717,7 +10066,7 @@ mod tests {
             .contains("oops"));
 
         let timeout = execute_tool("bash", &json!({ "command": "sleep 1", "timeout": 10 }))
-            .expect("bash timeout should return output");
+            .expect_err("a timed-out command is an error result");
         let timeout_output: serde_json::Value = serde_json::from_str(&timeout).expect("json");
         assert_eq!(timeout_output["interrupted"], true);
         assert_eq!(timeout_output["returnCodeInterpretation"], "timeout");
@@ -8734,6 +10083,45 @@ mod tests {
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
         assert!(background_output["backgroundTaskId"].as_str().is_some());
         assert_eq!(background_output["noOutputExpected"], true);
+    }
+
+    /// A failing command (`node --test` exiting 1, say) must not look like a
+    /// success: the result is an error, and the model still gets the output
+    /// and the exit code.
+    #[test]
+    fn bash_non_zero_exit_is_an_error_result_that_keeps_the_output() {
+        let command = if cfg!(windows) {
+            "echo partial-out & echo failing-test 1>&2 & exit /b 3"
+        } else {
+            "echo partial-out; echo failing-test >&2; exit 3"
+        };
+        let failure = execute_tool("bash", &json!({ "command": command, "timeout": 20_000 }))
+            .expect_err("a non-zero exit is an error result");
+        let output: serde_json::Value = serde_json::from_str(&failure).expect("json envelope");
+        assert_eq!(
+            output["returnCodeInterpretation"], "exit_code:3",
+            "{output}"
+        );
+        assert!(
+            output["stdout"]
+                .as_str()
+                .is_some_and(|stdout| stdout.contains("partial-out")),
+            "{output}"
+        );
+        assert!(
+            output["stderr"]
+                .as_str()
+                .is_some_and(|stderr| stderr.contains("failing-test")),
+            "{output}"
+        );
+
+        let success = execute_tool(
+            "bash",
+            &json!({ "command": "echo fine", "timeout": 20_000 }),
+        )
+        .expect("a zero exit is a normal result");
+        let output: serde_json::Value = serde_json::from_str(&success).expect("json envelope");
+        assert!(output["returnCodeInterpretation"].is_null(), "{output}");
     }
 
     #[test]
@@ -8759,7 +10147,7 @@ mod tests {
             "bash",
             &json!({ "command": "cargo test --workspace --all-targets" }),
         )
-        .expect("preflight should return structured output");
+        .expect_err("a blocked command is an error result with structured output");
         let output_json: serde_json::Value = serde_json::from_str(&output).expect("json");
         assert_eq!(
             output_json["returnCodeInterpretation"],
@@ -8805,11 +10193,14 @@ mod tests {
         run_git(&root, &["checkout", "feature/targeted-tests"]);
         std::env::set_current_dir(&root).expect("set cwd");
 
+        // The command itself may fail (the repo has no Cargo.toml), which is
+        // an error result carrying the same envelope; only the preflight
+        // matters here.
         let output = execute_tool(
             "bash",
             &json!({ "command": "printf 'targeted ok'; cargo test -p runtime stale_branch" }),
         )
-        .expect("targeted commands should still execute");
+        .unwrap_or_else(std::convert::identity);
         let output_json: serde_json::Value = serde_json::from_str(&output).expect("json");
         assert_ne!(
             output_json["returnCodeInterpretation"],
@@ -8821,6 +10212,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn file_tools_cover_read_write_and_edit_behaviors() {
         let _guard = env_lock()
             .lock()
@@ -8848,7 +10240,13 @@ mod tests {
         let write_update_output: serde_json::Value =
             serde_json::from_str(&write_update).expect("json");
         assert_eq!(write_update_output["type"], "update");
-        assert_eq!(write_update_output["originalFile"], "alpha\nbeta\nalpha\n");
+        // Writes return a compact summary instead of echoing the file.
+        assert!(write_update_output.get("originalFile").is_none());
+        assert!(write_update_output.get("content").is_none());
+        assert_eq!(write_update_output["lines"], 3);
+        assert!(write_update_output["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.starts_with("Overwrote")));
 
         let read_full = execute_tool("read_file", &json!({ "path": "nested/demo.txt" }))
             .expect("read full should succeed");
@@ -8877,7 +10275,7 @@ mod tests {
 
         let read_error = execute_tool("read_file", &json!({ "path": "missing.txt" }))
             .expect_err("missing file should fail");
-        assert!(!read_error.is_empty());
+        assert_ne!(read_error, "");
 
         let edit_once = execute_tool(
             "edit_file",
@@ -8960,7 +10358,7 @@ mod tests {
 
         let glob_error = execute_tool("glob_search", &json!({ "pattern": "[" }))
             .expect_err("invalid glob should fail");
-        assert!(!glob_error.is_empty());
+        assert_ne!(glob_error, "");
 
         let grep_content = execute_tool(
             "grep_search",
@@ -8998,7 +10396,7 @@ mod tests {
             &json!({ "pattern": "(alpha", "path": "nested" }),
         )
         .expect_err("invalid regex should fail");
-        assert!(!grep_error.is_empty());
+        assert_ne!(grep_error, "");
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
@@ -9095,21 +10493,41 @@ mod tests {
         let get_output: serde_json::Value = serde_json::from_str(&get).expect("json");
         assert_eq!(get_output["value"], false);
 
-        let set = execute_tool(
-            "Config",
-            &json!({"setting": "permissions.defaultMode", "value": "plan"}),
-        )
-        .expect("set config");
+        let set = execute_tool("Config", &json!({"setting": "model", "value": "sonnet"}))
+            .expect("set config");
         let set_output: serde_json::Value = serde_json::from_str(&set).expect("json");
         assert_eq!(set_output["operation"], "set");
-        assert_eq!(set_output["newValue"], "plan");
+        assert_eq!(set_output["newValue"], "sonnet");
 
         let invalid = execute_tool(
             "Config",
-            &json!({"setting": "permissions.defaultMode", "value": "bogus"}),
+            &json!({"setting": "editorMode", "value": "bogus"}),
         )
         .expect_err("invalid config value should error");
         assert!(invalid.contains("Invalid value"));
+
+        // Permission and hook settings are the user's: the model may read
+        // them but never change them.
+        for (setting, value) in [
+            ("permissions.defaultMode", json!("dontAsk")),
+            ("permissions.allow", json!("bash")),
+            ("hooks", json!("echo pwned")),
+            ("hooks.PreToolUse", json!("curl https://evil.example")),
+        ] {
+            let rejected = execute_tool("Config", &json!({"setting": setting, "value": value}))
+                .expect_err("protected setting must be rejected");
+            assert!(
+                rejected.contains("cannot change") && rejected.contains("only the user"),
+                "{setting}: {rejected}"
+            );
+        }
+        let settings_file = cwd.join(".neuron").join("settings.local.json");
+        let written = std::fs::read_to_string(&settings_file).unwrap_or_default();
+        assert!(!written.contains("dontAsk"), "{written}");
+        let read_back = execute_tool("Config", &json!({"setting": "permissions.defaultMode"}))
+            .expect("reading permissions.defaultMode stays allowed");
+        let read_back: serde_json::Value = serde_json::from_str(&read_back).expect("json");
+        assert_eq!(read_back["operation"], "get");
 
         let unknown =
             execute_tool("Config", &json!({"setting": "nope"})).expect("unknown setting result");
@@ -9236,8 +10654,9 @@ mod tests {
         assert_eq!(exit_output["changed"], true);
         assert_eq!(exit_output["currentLocalMode"], serde_json::Value::Null);
 
-        let local_settings = std::fs::read_to_string(cwd.join(".claw").join("settings.local.json"))
-            .expect("local settings after exit");
+        let local_settings =
+            std::fs::read_to_string(cwd.join(".neuron").join("settings.local.json"))
+                .expect("local settings after exit");
         let local_settings_json: serde_json::Value =
             serde_json::from_str(&local_settings).expect("valid settings json");
         assert_eq!(
@@ -9312,6 +10731,7 @@ mod tests {
 
     #[test]
     fn given_timeout_ms_when_repl_blocks_then_returns_timeout_error() {
+        let _guard = env_guard();
         let result = execute_tool(
             "REPL",
             &json!({
@@ -9343,7 +10763,7 @@ mod tests {
         std::fs::write(
             &script,
             r#"#!/bin/sh
-while [ "$1" != "-Command" ] && [ $# -gt 0 ]; do shift; done
+while [ "$1" != "-EncodedCommand" ] && [ $# -gt 0 ]; do shift; done
 shift
 printf 'pwsh:%s' "$1"
 "#,
@@ -9373,8 +10793,15 @@ printf 'pwsh:%s' "$1"
         let _ = std::fs::remove_dir_all(dir);
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
-        assert_eq!(output["stdout"], "pwsh:Write-Output hello");
-        assert!(output["stderr"].as_str().expect("stderr").is_empty());
+        // The command travels base64-encoded, so quoting cannot mangle it.
+        assert_eq!(
+            output["stdout"],
+            format!(
+                "pwsh:{}",
+                super::powershell::encode_command("Write-Output hello")
+            )
+        );
+        assert_eq!(output["stderr"].as_str().expect("stderr"), "");
 
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
         assert!(background_output["backgroundTaskId"].as_str().is_some());
@@ -9474,8 +10901,11 @@ printf 'pwsh:%s' "$1"
         let file = root.join("readable.txt");
         fs::write(&file, "content\n").expect("write test file");
 
+        let original_dir = std::env::current_dir().expect("current directory");
+        std::env::set_current_dir(&root).expect("set workspace root");
         let registry = read_only_registry();
         let result = registry.execute("read_file", &json!({ "path": file.display().to_string() }));
+        std::env::set_current_dir(original_dir).expect("restore current directory");
         assert!(result.is_ok(), "read_file should be allowed: {result:?}");
 
         let _ = fs::remove_dir_all(root);
@@ -9703,6 +11133,13 @@ printf 'pwsh:%s' "$1"
 
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).expect("blocking test stream");
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(20)))
+                            .expect("test stream read timeout");
+                        stream
+                            .set_write_timeout(Some(Duration::from_secs(20)))
+                            .expect("test stream write timeout");
                         let mut buffer = [0_u8; 4096];
                         let size = stream.read(&mut buffer).expect("read request");
                         let request = String::from_utf8_lossy(&buffer[..size]).into_owned();
@@ -9737,7 +11174,11 @@ printf 'pwsh:%s' "$1"
                 let _ = tx.send(());
             }
             if let Some(handle) = self.handle.take() {
-                handle.join().expect("join test server");
+                if let Err(error) = handle.join() {
+                    if !thread::panicking() {
+                        std::panic::resume_unwind(error);
+                    }
+                }
             }
         }
     }
@@ -9779,5 +11220,29 @@ printf 'pwsh:%s' "$1"
             )
             .into_bytes()
         }
+    }
+}
+
+#[cfg(test)]
+mod ask_on_terminal_tests {
+    use super::{write_question, AskUserQuestionInput};
+
+    /// The question and its answer prompt go to the stream chosen for it (stderr when
+    /// stdout is redirected), all of it.
+    #[test]
+    fn the_question_goes_to_the_stream_it_is_given() {
+        let mut out = Vec::new();
+        write_question(
+            &mut out,
+            &AskUserQuestionInput {
+                question: "Which branch?".to_string(),
+                options: Some(vec!["main".to_string(), "dev".to_string()]),
+            },
+        )
+        .expect("written");
+        assert_eq!(
+            String::from_utf8(out).expect("utf-8"),
+            "\n[Question] Which branch?\n  1. main\n  2. dev\nEnter choice (1-2): "
+        );
     }
 }

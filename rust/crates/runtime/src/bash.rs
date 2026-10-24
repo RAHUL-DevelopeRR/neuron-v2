@@ -1,18 +1,43 @@
 use std::env;
 use std::io;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use plugins::subprocess::{self, BoundedOutput, Termination};
 use serde::{Deserialize, Serialize};
-use tokio::process::Command as TokioCommand;
-use tokio::runtime::Builder;
-use tokio::time::timeout;
 
+use crate::cancel::CancellationToken;
 use crate::sandbox::{
     build_linux_sandbox_command, resolve_sandbox_status_for_request, FilesystemIsolationMode,
-    SandboxConfig, SandboxStatus,
+    SandboxConfig, SandboxDirs, SandboxStatus,
 };
 use crate::ConfigLoader;
+
+/// Timeout applied when the caller does not request one (2 minutes).
+pub const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;
+/// Upper bound for caller-requested timeouts (10 minutes).
+pub const MAX_BASH_TIMEOUT_MS: u64 = 600_000;
+
+/// Human-readable description of the shell that runs `bash` tool commands on
+/// this platform, used by the tool description and the system prompt.
+#[must_use]
+pub fn bash_tool_shell_description() -> &'static str {
+    if cfg!(windows) {
+        "Windows cmd.exe (`cmd.exe /D /S /C`): use cmd syntax (`dir`, `type`, `set`, `%VAR%`); POSIX tools work only when they are on PATH. Use the PowerShell tool for PowerShell syntax."
+    } else {
+        "POSIX sh (`sh -lc`)"
+    }
+}
+
+/// Resolves the effective timeout: the default when unset, clamped to
+/// `1..=MAX_BASH_TIMEOUT_MS`.
+#[must_use]
+pub fn effective_bash_timeout_ms(requested: Option<u64>) -> u64 {
+    requested
+        .unwrap_or(DEFAULT_BASH_TIMEOUT_MS)
+        .clamp(1, MAX_BASH_TIMEOUT_MS)
+}
 
 /// Input schema for the built-in bash execution tool.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -52,6 +77,9 @@ pub struct BashCommandOutput {
     pub assistant_auto_backgrounded: Option<bool>,
     #[serde(rename = "dangerouslyDisableSandbox")]
     pub dangerously_disable_sandbox: Option<bool>,
+    /// Set only when the command did not succeed: `exit_code:<n>`,
+    /// `signal:<n>` / `killed`, `timeout`, `cancelled`, or a
+    /// `preflight_blocked:*` reason. See [`Self::failed`].
     #[serde(rename = "returnCodeInterpretation")]
     pub return_code_interpretation: Option<String>,
     #[serde(rename = "noOutputExpected")]
@@ -66,108 +94,147 @@ pub struct BashCommandOutput {
     pub sandbox_status: Option<SandboxStatus>,
 }
 
-/// Executes a shell command with the requested sandbox settings.
-pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
-    let cwd = env::current_dir()?;
-    let sandbox_status = sandbox_status_for_input(&input, &cwd);
+impl BashCommandOutput {
+    /// Converts a bounded subprocess run into the tool output envelope.
+    ///
+    /// Output captured before a timeout or cancellation is kept and the
+    /// termination reason is appended to stderr, so the model can see how far
+    /// the command got.
+    #[must_use]
+    pub fn from_bounded(output: &BoundedOutput, timeout: Option<Duration>) -> Self {
+        let stdout = truncate_output(&String::from_utf8_lossy(&output.stdout));
+        let mut stderr = truncate_output(&String::from_utf8_lossy(&output.stderr));
+        if let Some(message) = subprocess::termination_message(output.termination, timeout) {
+            if !stderr.trim().is_empty() {
+                stderr = format!("{}\n", stderr.trim_end());
+            }
+            stderr.push_str(&message);
+        }
+        let return_code_interpretation = match output.termination {
+            Termination::TimedOut => Some(String::from("timeout")),
+            Termination::Cancelled => Some(String::from("cancelled")),
+            Termination::Exited => match output.status {
+                Some(status) if status.success() => None,
+                Some(status) => Some(status.code().map_or_else(
+                    || killed_interpretation(status),
+                    |code| format!("exit_code:{code}"),
+                )),
+                None => Some(String::from("killed")),
+            },
+        };
+        let no_output_expected = Some(stdout.trim().is_empty() && stderr.trim().is_empty());
+        Self {
+            stdout,
+            stderr,
+            raw_output_path: None,
+            interrupted: output.termination != Termination::Exited,
+            is_image: None,
+            background_task_id: None,
+            backgrounded_by_user: None,
+            assistant_auto_backgrounded: None,
+            dangerously_disable_sandbox: None,
+            return_code_interpretation,
+            no_output_expected,
+            structured_content: None,
+            persisted_output_path: None,
+            persisted_output_size: None,
+            sandbox_status: None,
+        }
+    }
 
-    if input.run_in_background.unwrap_or(false) {
-        let mut child = prepare_command(&input.command, &cwd, &sandbox_status, false);
-        let child = child
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
+    /// Whether the command failed: it exited non-zero, was killed (timeout,
+    /// cancellation, signal) or was blocked before it ran. Tools report such
+    /// a run as an error result that still carries the whole envelope, so
+    /// the model sees the output and exit code.
+    #[must_use]
+    pub fn failed(&self) -> bool {
+        self.interrupted || self.return_code_interpretation.is_some()
+    }
 
-        return Ok(BashCommandOutput {
+    /// Output envelope for a command that was started in the background.
+    #[must_use]
+    pub fn background(task_id: String, backgrounded_by_user: bool) -> Self {
+        Self {
             stdout: String::new(),
             stderr: String::new(),
             raw_output_path: None,
             interrupted: false,
             is_image: None,
-            background_task_id: Some(child.id().to_string()),
-            backgrounded_by_user: Some(false),
+            background_task_id: Some(task_id),
+            backgrounded_by_user: Some(backgrounded_by_user),
             assistant_auto_backgrounded: Some(false),
-            dangerously_disable_sandbox: input.dangerously_disable_sandbox,
+            dangerously_disable_sandbox: None,
             return_code_interpretation: None,
             no_output_expected: Some(true),
             structured_content: None,
             persisted_output_path: None,
             persisted_output_size: None,
-            sandbox_status: Some(sandbox_status),
-        });
+            sandbox_status: None,
+        }
+    }
+}
+
+/// Executes a shell command with the requested sandbox settings.
+///
+/// Equivalent to [`execute_bash_with_cancel`] with a token that is never
+/// cancelled.
+#[allow(clippy::needless_pass_by_value)]
+pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
+    execute_bash_with_cancel(&input, &CancellationToken::new())
+}
+
+/// Executes a shell command, stopping it when `cancel` fires.
+///
+/// The command runs with stdin set to null, stdout and stderr drained
+/// concurrently, Zero-X credentials removed from its environment, and a
+/// timeout of [`DEFAULT_BASH_TIMEOUT_MS`] unless the input requests another
+/// (capped at [`MAX_BASH_TIMEOUT_MS`]). On timeout or cancellation the whole
+/// process tree is killed (`taskkill /T /F` on Windows, the process group on
+/// Unix) and the output captured so far is returned with `interrupted: true`.
+pub fn execute_bash_with_cancel(
+    input: &BashCommandInput,
+    cancel: &CancellationToken,
+) -> io::Result<BashCommandOutput> {
+    let cwd = env::current_dir()?;
+    let sandbox_status = sandbox_status_for_input(input, &cwd);
+
+    if input.run_in_background.unwrap_or(false) {
+        let mut command = prepare_command(&input.command, &cwd, &sandbox_status);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // Its own process group, so that the session's end can stop the whole tree.
+        subprocess::isolate_process_group(&mut command);
+        let child = command.spawn()?;
+        let task_id = child.id().to_string();
+        subprocess::track_background_child(child);
+
+        let mut output = BashCommandOutput::background(task_id, false);
+        output.dangerously_disable_sandbox = input.dangerously_disable_sandbox;
+        output.sandbox_status = Some(sandbox_status);
+        return Ok(output);
     }
 
-    let runtime = Builder::new_current_thread().enable_all().build()?;
-    runtime.block_on(execute_bash_async(input, sandbox_status, cwd))
+    let timeout = Duration::from_millis(effective_bash_timeout_ms(input.timeout));
+    let mut command = prepare_command(&input.command, &cwd, &sandbox_status);
+    let bounded =
+        subprocess::run_bounded(&mut command, None, Some(timeout), &|| cancel.is_cancelled())?;
+    let mut output = BashCommandOutput::from_bounded(&bounded, Some(timeout));
+    output.dangerously_disable_sandbox = input.dangerously_disable_sandbox;
+    output.sandbox_status = Some(sandbox_status);
+    Ok(output)
 }
 
-async fn execute_bash_async(
-    input: BashCommandInput,
-    sandbox_status: SandboxStatus,
-    cwd: std::path::PathBuf,
-) -> io::Result<BashCommandOutput> {
-    let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true);
-
-    let output_result = if let Some(timeout_ms) = input.timeout {
-        match timeout(Duration::from_millis(timeout_ms), command.output()).await {
-            Ok(result) => (result?, false),
-            Err(_) => {
-                return Ok(BashCommandOutput {
-                    stdout: String::new(),
-                    stderr: format!("Command exceeded timeout of {timeout_ms} ms"),
-                    raw_output_path: None,
-                    interrupted: true,
-                    is_image: None,
-                    background_task_id: None,
-                    backgrounded_by_user: None,
-                    assistant_auto_backgrounded: None,
-                    dangerously_disable_sandbox: input.dangerously_disable_sandbox,
-                    return_code_interpretation: Some(String::from("timeout")),
-                    no_output_expected: Some(true),
-                    structured_content: None,
-                    persisted_output_path: None,
-                    persisted_output_size: None,
-                    sandbox_status: Some(sandbox_status),
-                });
-            }
-        }
-    } else {
-        (command.output().await?, false)
-    };
-
-    let (output, interrupted) = output_result;
-    let stdout = truncate_output(&String::from_utf8_lossy(&output.stdout));
-    let stderr = truncate_output(&String::from_utf8_lossy(&output.stderr));
-    let no_output_expected = Some(stdout.trim().is_empty() && stderr.trim().is_empty());
-    let return_code_interpretation = output.status.code().and_then(|code| {
-        if code == 0 {
-            None
-        } else {
-            Some(format!("exit_code:{code}"))
-        }
-    });
-
-    Ok(BashCommandOutput {
-        stdout,
-        stderr,
-        raw_output_path: None,
-        interrupted,
-        is_image: None,
-        background_task_id: None,
-        backgrounded_by_user: None,
-        assistant_auto_backgrounded: None,
-        dangerously_disable_sandbox: input.dangerously_disable_sandbox,
-        return_code_interpretation,
-        no_output_expected,
-        structured_content: None,
-        persisted_output_path: None,
-        persisted_output_size: None,
-        sandbox_status: Some(sandbox_status),
-    })
+/// Stops every command still running from `run_in_background` (bash and `PowerShell`),
+/// with every process it started: the session is ending. Returns how many were
+/// running.
+#[must_use = "how many were still running"]
+pub fn stop_background_commands() -> usize {
+    subprocess::kill_background_children()
 }
 
-fn sandbox_status_for_input(input: &BashCommandInput, cwd: &std::path::Path) -> SandboxStatus {
+fn sandbox_status_for_input(input: &BashCommandInput, cwd: &Path) -> SandboxStatus {
     let config = ConfigLoader::default_for(cwd).load().map_or_else(
         |_| SandboxConfig::default(),
         |runtime_config| runtime_config.sandbox().clone(),
@@ -182,87 +249,103 @@ fn sandbox_status_for_input(input: &BashCommandInput, cwd: &std::path::Path) -> 
     resolve_sandbox_status_for_request(&request, cwd)
 }
 
-fn prepare_command(
-    command: &str,
-    cwd: &std::path::Path,
-    sandbox_status: &SandboxStatus,
-    create_dirs: bool,
-) -> Command {
-    if create_dirs {
-        prepare_sandbox_dirs(cwd);
+fn prepare_command(command: &str, cwd: &Path, sandbox_status: &SandboxStatus) -> Command {
+    // Only active filesystem isolation (never on Windows) moves HOME and
+    // TMPDIR, to per-workspace directories outside the project that are
+    // created on first use.
+    let sandbox_dirs = sandbox_status
+        .filesystem_active
+        .then(|| SandboxDirs::for_workspace(cwd));
+    if let Some(dirs) = &sandbox_dirs {
+        let _ = dirs.create();
     }
 
-    if let Some(launcher) = build_linux_sandbox_command(command, cwd, sandbox_status) {
-        let mut prepared = Command::new(launcher.program);
-        prepared.args(launcher.args);
-        prepared.current_dir(cwd);
-        prepared.envs(launcher.env);
-        return prepared;
-    }
-
-    if cfg!(windows) {
-        let mut prepared = Command::new("cmd.exe");
-        prepared.arg("/C").arg(command).current_dir(cwd);
-        prepared
-    } else {
-        let mut prepared = Command::new("sh");
-        prepared.arg("-lc").arg(command).current_dir(cwd);
-        if sandbox_status.filesystem_active {
-            prepared.env("HOME", cwd.join(".sandbox-home"));
-            prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
-        }
-        prepared
-    }
+    let mut prepared =
+        if let Some(launcher) = build_linux_sandbox_command(command, cwd, sandbox_status) {
+            let mut prepared = Command::new(launcher.program);
+            prepared.args(launcher.args);
+            subprocess::scrub_credential_env(&mut prepared);
+            prepared.envs(launcher.env);
+            prepared
+        } else {
+            let mut prepared = host_shell_command(command);
+            subprocess::scrub_credential_env(&mut prepared);
+            if let Some(dirs) = &sandbox_dirs {
+                prepared.env("HOME", &dirs.home);
+                prepared.env("TMPDIR", &dirs.tmp);
+            }
+            prepared
+        };
+    prepared.current_dir(cwd);
+    prepared
 }
 
-fn prepare_tokio_command(
-    command: &str,
-    cwd: &std::path::Path,
-    sandbox_status: &SandboxStatus,
-    create_dirs: bool,
-) -> TokioCommand {
-    if create_dirs {
-        prepare_sandbox_dirs(cwd);
-    }
-
-    if let Some(launcher) = build_linux_sandbox_command(command, cwd, sandbox_status) {
-        let mut prepared = TokioCommand::new(launcher.program);
-        prepared.args(launcher.args);
-        prepared.current_dir(cwd);
-        prepared.envs(launcher.env);
-        return prepared;
-    }
-
-    if cfg!(windows) {
-        let mut prepared = TokioCommand::new("cmd.exe");
-        prepared.arg("/C").arg(command).current_dir(cwd);
-        prepared
-    } else {
-        let mut prepared = TokioCommand::new("sh");
-        prepared.arg("-lc").arg(command).current_dir(cwd);
-        if sandbox_status.filesystem_active {
-            prepared.env("HOME", cwd.join(".sandbox-home"));
-            prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
-        }
-        prepared
-    }
+/// Interpretation for a process that ended without an exit code.
+#[cfg(unix)]
+fn killed_interpretation(status: std::process::ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal().map_or_else(
+        || String::from("killed"),
+        |signal| format!("signal:{signal}"),
+    )
 }
 
-fn prepare_sandbox_dirs(cwd: &std::path::Path) {
-    let _ = std::fs::create_dir_all(cwd.join(".sandbox-home"));
-    let _ = std::fs::create_dir_all(cwd.join(".sandbox-tmp"));
+#[cfg(not(unix))]
+fn killed_interpretation(_status: std::process::ExitStatus) -> String {
+    String::from("killed")
+}
+
+#[cfg(windows)]
+fn host_shell_command(command: &str) -> Command {
+    subprocess::windows_cmd_command(command)
+}
+
+#[cfg(not(windows))]
+fn host_shell_command(command: &str) -> Command {
+    let mut prepared = Command::new("sh");
+    prepared.arg("-lc").arg(command);
+    prepared
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{execute_bash, BashCommandInput};
+    use std::time::{Duration, Instant};
+
+    use super::{
+        effective_bash_timeout_ms, execute_bash, execute_bash_with_cancel, BashCommandInput,
+        DEFAULT_BASH_TIMEOUT_MS, MAX_BASH_TIMEOUT_MS,
+    };
+    use crate::cancel::CancellationToken;
     use crate::sandbox::FilesystemIsolationMode;
+
+    fn input(command: &str, timeout: Option<u64>) -> BashCommandInput {
+        BashCommandInput {
+            command: command.to_string(),
+            timeout,
+            description: None,
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(true),
+            namespace_restrictions: None,
+            isolate_network: None,
+            filesystem_mode: None,
+            allowed_mounts: None,
+        }
+    }
+
+    /// A command that would run for ~30 s and then print `late`.
+    fn long_sleep_command() -> &'static str {
+        if cfg!(windows) {
+            "ping -n 30 127.0.0.1 >NUL & echo late"
+        } else {
+            "sleep 30; echo late"
+        }
+    }
 
     #[test]
     fn executes_simple_command() {
         let output = execute_bash(BashCommandInput {
             command: String::from("echo hello"),
-            timeout: Some(1_000),
+            timeout: Some(10_000),
             description: None,
             run_in_background: Some(false),
             dangerously_disable_sandbox: Some(false),
@@ -278,11 +361,77 @@ mod tests {
         assert!(output.sandbox_status.is_some());
     }
 
+    fn workspace_only_input(command: &str) -> BashCommandInput {
+        BashCommandInput {
+            command: command.to_string(),
+            timeout: Some(20_000),
+            description: None,
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(false),
+            namespace_restrictions: Some(false),
+            isolate_network: Some(false),
+            filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
+            allowed_mounts: None,
+        }
+    }
+
+    /// The sandbox HOME / TMPDIR live in the config home, never in the
+    /// project, and only exist once a command used them.
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_isolation_keeps_sandbox_dirs_out_of_the_workspace() {
+        let _guard = crate::test_env_lock();
+        let config_home = std::env::temp_dir().join(format!(
+            "runtime-bash-sandbox-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        let previous = std::env::var_os("NEURON_CONFIG_HOME");
+        std::env::set_var("NEURON_CONFIG_HOME", &config_home);
+        let output = execute_bash(workspace_only_input(
+            "printf '%s\\n%s' \"$HOME\" \"$TMPDIR\"",
+        ));
+        match previous {
+            Some(value) => std::env::set_var("NEURON_CONFIG_HOME", value),
+            None => std::env::remove_var("NEURON_CONFIG_HOME"),
+        }
+
+        let output = output.expect("command runs");
+        assert!(
+            output
+                .sandbox_status
+                .as_ref()
+                .expect("status")
+                .filesystem_active
+        );
+        let cwd = std::env::current_dir().expect("cwd");
+        let mut lines = output.stdout.lines();
+        for dir in [lines.next(), lines.next()] {
+            let dir = std::path::PathBuf::from(dir.expect("printed dir"));
+            assert!(dir.starts_with(&config_home), "{dir:?} {output:?}");
+            assert!(!dir.starts_with(&cwd), "{dir:?}");
+            assert!(dir.is_dir(), "{dir:?}");
+        }
+        let _ = std::fs::remove_dir_all(&config_home);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_commands_report_no_filesystem_isolation() {
+        let output = execute_bash(workspace_only_input("echo hello")).expect("command runs");
+        let status = output.sandbox_status.expect("sandbox status");
+        assert!(!status.filesystem_active, "{status:?}");
+        assert_eq!(status.filesystem_mode, FilesystemIsolationMode::Off);
+        assert!(!status.active, "{status:?}");
+    }
+
     #[test]
     fn disables_sandbox_when_requested() {
         let output = execute_bash(BashCommandInput {
             command: String::from("echo hello"),
-            timeout: Some(1_000),
+            timeout: Some(10_000),
             description: None,
             run_in_background: Some(false),
             dangerously_disable_sandbox: Some(true),
@@ -294,6 +443,184 @@ mod tests {
         .expect("bash command should execute");
 
         assert!(!output.sandbox_status.expect("sandbox status").enabled);
+    }
+
+    #[test]
+    fn timeout_defaults_and_clamps() {
+        assert_eq!(effective_bash_timeout_ms(None), DEFAULT_BASH_TIMEOUT_MS);
+        assert_eq!(effective_bash_timeout_ms(Some(5)), 5);
+        assert_eq!(effective_bash_timeout_ms(Some(0)), 1);
+        assert_eq!(
+            effective_bash_timeout_ms(Some(u64::MAX)),
+            MAX_BASH_TIMEOUT_MS
+        );
+        assert_eq!(DEFAULT_BASH_TIMEOUT_MS, 120_000);
+        assert_eq!(MAX_BASH_TIMEOUT_MS, 600_000);
+    }
+
+    #[test]
+    fn timeout_kills_the_process_tree_and_reports_interruption() {
+        let started = Instant::now();
+        let output = execute_bash(input(long_sleep_command(), Some(500)))
+            .expect("timed-out command still returns output");
+        assert!(output.interrupted);
+        assert_eq!(
+            output.return_code_interpretation.as_deref(),
+            Some("timeout")
+        );
+        assert!(output.stderr.contains("Command exceeded timeout of 500 ms"));
+        assert!(!output.stdout.contains("late"));
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "timed-out shell must be killed promptly, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn cancellation_stops_a_running_command() {
+        let token = CancellationToken::new();
+        let trigger = token.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            trigger.cancel();
+        });
+        let started = Instant::now();
+        let output = execute_bash_with_cancel(&input(long_sleep_command(), None), &token)
+            .expect("cancelled command still returns output");
+        canceller.join().expect("canceller");
+        assert!(output.interrupted);
+        assert_eq!(
+            output.return_code_interpretation.as_deref(),
+            Some("cancelled")
+        );
+        assert!(started.elapsed() < Duration::from_secs(15));
+    }
+
+    #[test]
+    fn non_zero_exit_and_timeout_are_failures() {
+        let command = if cfg!(windows) {
+            "echo partial & exit /b 3"
+        } else {
+            "echo partial; exit 3"
+        };
+        let failed = execute_bash(input(command, Some(20_000))).expect("command runs");
+        assert!(failed.failed(), "{failed:?}");
+        assert_eq!(
+            failed.return_code_interpretation.as_deref(),
+            Some("exit_code:3")
+        );
+        assert!(failed.stdout.contains("partial"), "{failed:?}");
+
+        let ok = execute_bash(input("echo fine", Some(20_000))).expect("command runs");
+        assert!(!ok.failed(), "{ok:?}");
+        assert_eq!(ok.return_code_interpretation, None);
+
+        let timed_out =
+            execute_bash(input(long_sleep_command(), Some(300))).expect("timed-out command");
+        assert!(timed_out.failed(), "{timed_out:?}");
+    }
+
+    #[test]
+    fn stdin_is_null_so_reading_commands_do_not_hang() {
+        let command = if cfg!(windows) { "more" } else { "cat" };
+        let started = Instant::now();
+        let output =
+            execute_bash(input(command, Some(20_000))).expect("stdin-reading command runs");
+        assert!(!output.interrupted, "{output:?}");
+        assert!(started.elapsed() < Duration::from_secs(15));
+    }
+
+    #[test]
+    fn child_environment_excludes_zero_x_credentials() {
+        let _guard = crate::test_env_lock();
+        std::env::set_var("NEURON_TOKEN", "nzx_bash_scrub_token");
+        std::env::set_var("RUNTIME_BASH_SCRUB_SESSION", "ses_bash_scrub_session");
+        std::env::set_var("RUNTIME_BASH_SCRUB_KEEP", "visible-value");
+        let command = if cfg!(windows) {
+            "echo %NEURON_TOKEN% %RUNTIME_BASH_SCRUB_SESSION% %RUNTIME_BASH_SCRUB_KEEP%"
+        } else {
+            "echo ${NEURON_TOKEN:-unset} ${RUNTIME_BASH_SCRUB_SESSION:-unset} $RUNTIME_BASH_SCRUB_KEEP"
+        };
+        let output = execute_bash(input(command, Some(20_000)));
+        std::env::remove_var("NEURON_TOKEN");
+        std::env::remove_var("RUNTIME_BASH_SCRUB_SESSION");
+        std::env::remove_var("RUNTIME_BASH_SCRUB_KEEP");
+
+        let output = output.expect("command runs");
+        assert!(
+            !output.stdout.contains("nzx_bash_scrub_token"),
+            "{output:?}"
+        );
+        assert!(
+            !output.stdout.contains("ses_bash_scrub_session"),
+            "{output:?}"
+        );
+        assert!(output.stdout.contains("visible-value"), "{output:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cmd_receives_the_command_line_verbatim() {
+        let output = execute_bash(input(r#"echo "quoted value" & echo second"#, Some(20_000)))
+            .expect("command runs");
+        assert!(
+            output.stdout.contains("\"quoted value\""),
+            "quotes must reach cmd.exe unescaped: {output:?}"
+        );
+        assert!(!output.stdout.contains("\\\""), "{output:?}");
+        assert!(output.stdout.contains("second"), "{output:?}");
+    }
+
+    /// Whether process `pid` still runs (a zombie waiting to be reaped does not).
+    fn is_running(pid: &str) -> bool {
+        if cfg!(windows) {
+            // Not `tasklist`: it hangs while the WMI service is stuck.
+            std::process::Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    &format!(
+                        "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ 'running' }}"
+                    ),
+                ])
+                .output()
+                .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains("running"))
+        } else {
+            std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", pid])
+                .output()
+                .is_ok_and(|output| {
+                    let state = String::from_utf8_lossy(&output.stdout);
+                    let state = state.trim();
+                    !state.is_empty() && !state.starts_with('Z')
+                })
+        }
+    }
+
+    /// A command started with `run_in_background` outlived the engine; the session's end
+    /// now stops it.
+    #[test]
+    fn background_commands_stop_when_the_session_ends() {
+        let command = if cfg!(windows) {
+            "ping -n 60 127.0.0.1 >NUL"
+        } else {
+            "sleep 60"
+        };
+        let mut background = input(command, None);
+        background.run_in_background = Some(true);
+        let output = execute_bash(background).expect("the command starts");
+        let pid = output.background_task_id.expect("a background task id");
+        assert!(is_running(&pid), "{pid} runs in the background");
+
+        assert!(super::stop_background_commands() >= 1);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while is_running(&pid) {
+            assert!(Instant::now() < deadline, "{pid} still runs");
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 }
 
