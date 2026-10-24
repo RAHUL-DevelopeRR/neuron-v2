@@ -409,12 +409,20 @@ impl GlobalToolRegistry {
                 cancel,
             );
         }
-        self.plugin_tools
+        let Some(tool) = self
+            .plugin_tools
             .iter()
             .find(|tool| tool.definition().name == name)
-            .ok_or_else(|| format!("unsupported tool: {name}"))?
-            .execute(input)
-            .map_err(|error| error.to_string())
+        else {
+            let specs = mvp_tool_specs();
+            let candidates = specs
+                .iter()
+                .map(|spec| spec.name)
+                .chain(self.plugin_tools.iter().map(|tool| tool.definition().name.as_str()))
+                .collect::<Vec<_>>();
+            return Err(runtime::tool_input::unknown_tool_message(name, &candidates));
+        };
+        tool.execute(input).map_err(|error| error.to_string())
     }
 
     fn searchable_tool_specs(&self) -> Vec<SearchableToolSpec> {
@@ -1593,7 +1601,11 @@ fn execute_tool_with_enforcer_and_cancel(
         "TestingPermission" => {
             from_value::<TestingPermissionInput>(input).and_then(run_testing_permission)
         }
-        _ => Err(format!("unsupported tool: {name}")),
+        _ => {
+            let specs = mvp_tool_specs();
+            let candidates = specs.iter().map(|spec| spec.name).collect::<Vec<_>>();
+            Err(runtime::tool_input::unknown_tool_message(name, &candidates))
+        }
     }
 }
 
@@ -6040,9 +6052,12 @@ impl ToolExecutor for SubagentToolExecutor {
                 "tool `{tool_name}` is not enabled for this sub-agent"
             )));
         }
-        let value = serde_json::from_str(input)
-            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        execute_tool_with_enforcer_and_cancel(self.enforcer.as_ref(), tool_name, &value, cancel)
+        let parsed = runtime::tool_input::parse_tool_input(input).map_err(ToolError::new)?;
+        execute_tool_with_enforcer_and_cancel(self.enforcer.as_ref(), tool_name, &parsed.value, cancel)
+            .map(|output| match parsed.repaired {
+                Some(fixes) => format!("{output}\n\n[note: the arguments were not valid JSON; Neuron {fixes}. Send them as valid JSON next time.]"),
+                None => output,
+            })
             .map_err(ToolError::new)
     }
 }
