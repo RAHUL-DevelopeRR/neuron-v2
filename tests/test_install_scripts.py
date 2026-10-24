@@ -415,6 +415,24 @@ class InstallShTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("comes first on PATH", result.stderr)
         self.assertIn("pip uninstall neuroncli", result.stderr)
+        self.assertIn("npm uninstall -g @zero-x.live/neuron neuron-cli-app", result.stderr)
+
+    def test_windows_shell_hint_names_the_requested_version(self) -> None:
+        windows_shell = ("MINGW64_NT-10.0-26100", "x86_64")
+        pinned = self.run_installer(uname=windows_shell, NEURON_VERSION="v7.0.0-alpha.1")
+        self.assertEqual(pinned.returncode, 1)
+        self.assertIn(
+            "& ([scriptblock]::Create((irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/"
+            "v7.0.0-alpha.1/install.ps1))) -Version 7.0.0-alpha.1",
+            pinned.stderr,
+        )
+        self.assertNotIn("releases/latest", pinned.stderr)
+        latest = self.run_installer(uname=windows_shell)
+        self.assertEqual(latest.returncode, 1)
+        self.assertIn(
+            "irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/latest/download/install.ps1 | iex", latest.stderr
+        )
+        self.assertEqual(self.server.paths(), [])
 
     def test_help_and_unknown_arguments(self) -> None:
         help_result = self.run_installer("--help")
@@ -621,8 +639,11 @@ try {{ Install-NeuronBinary '{source}' '{destination}'; 'no error' }} catch {{ "
         self.assertEqual(destination.read_text(encoding="ascii"), "previous")
         self.assertFalse(Path(f"{destination}.old").exists())
 
-    def run_functions(self, names: List[str], body: str) -> subprocess.CompletedProcess:
-        """Defines the named install.ps1 functions (from its AST) and runs `body` with them."""
+    def run_functions(self, names: List[str], body: str, with_assignments: bool = False) -> subprocess.CompletedProcess:
+        """Defines the named install.ps1 functions (from its AST) and runs `body` with them.
+
+        `with_assignments` also runs the script's top-level assignments ($NeuronRepository, ...).
+        """
         script = self.root / "functions.ps1"
         quoted = ", ".join(f"'{name}'" for name in names)
         script.write_text(
@@ -630,6 +651,13 @@ try {{ Install-NeuronBinary '{source}' '{destination}'; 'no error' }} catch {{ "
 Set-StrictMode -Version 2.0
 $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile('{INSTALL_PS1}', [ref]$null, [ref]$parseErrors)
+if ({'$true' if with_assignments else '$false'}) {{
+    foreach ($statement in $ast.EndBlock.Statements) {{
+        if ($statement -is [System.Management.Automation.Language.AssignmentStatementAst]) {{
+            . ([scriptblock]::Create($statement.Extent.Text))
+        }}
+    }}
+}}
 foreach ($name in @({quoted})) {{
     $definition = $ast.Find({{ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }}, $true)
     if (-not $definition) {{ throw "install.ps1 has no function $name" }}
@@ -697,10 +725,90 @@ foreach ($name in @({quoted})) {{
         )
         self.assertIn(f"Installing Neuron {VERSION}", result.stdout, result.stderr)
         self.assertTrue(self.installed().is_file(), result.stdout + result.stderr)
-        # -AddToPath cannot be passed through iex; the hint shows the script-block form.
-        self.assertIn("[scriptblock]::Create(", result.stdout)
+        # -AddToPath cannot be passed through iex; the hint shows the script-block form, for
+        # this release (a prerelease is never the latest release).
+        self.assertIn(
+            f"[scriptblock]::Create((irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v{VERSION}"
+            f"/install.ps1))) -Version {VERSION} -AddToPath",
+            result.stdout,
+        )
+        self.assertNotIn("releases/latest", result.stdout)
         self.assertIn("preference=Continue", result.stdout)
         self.assertIn("strict=off", result.stdout)
+
+    def test_posix_hint_names_the_requested_version(self) -> None:
+        cases = {
+            "7.0.0-alpha.1": "releases/download/v7.0.0-alpha.1/install.sh | sh -s -- --version 7.0.0-alpha.1",
+            "v7.0.0-alpha.1": "releases/download/v7.0.0-alpha.1/install.sh | sh -s -- --version 7.0.0-alpha.1",
+            "": "releases/latest/download/install.sh | sh",
+            "7.0; rm -rf ~": "releases/latest/download/install.sh | sh",
+        }
+        body = "\n".join(f"'[' + (Get-PosixInstallCommand '{requested}') + ']'" for requested in cases)
+        result = self.run_functions(["Get-PosixInstallCommand"], body, with_assignments=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertEqual(len(lines), len(cases), lines)
+        for line, expected in zip(lines, cases.values()):
+            self.assertEqual(line, f"[curl -fsSL https://github.com/RAHUL-DevelopeRR/neuron-v2/{expected}]")
+
+    INSTALL_FUNCTIONS = [
+        "Write-Step",
+        "Write-Detail",
+        "Write-Warn",
+        "Test-AllowedUrl",
+        "Test-GitHubApiUrl",
+        "Get-HttpStatus",
+        "Get-NeuronDownload",
+        "Get-NeuronSha256",
+        "Get-PosixInstallCommand",
+        "Assert-SupportedPlatform",
+        "Resolve-NeuronVersion",
+        "Test-PathEntry",
+        "Write-ShadowingNeuronWarning",
+        "Install-NeuronBinary",
+        "Install-NeuronUi",
+        "Get-ReportedVersion",
+        "Install-Neuron",
+    ]
+
+    def run_add_to_path_install(self, path: str) -> subprocess.CompletedProcess:
+        """Runs Install-Neuron with -AddToPath and PATH set to `path`, without writing the user PATH."""
+        fake_release.stage_release(self.releases, VERSION, self.ASSET)
+        body = f"""
+$Version = '{VERSION}'
+$InstallDir = ''
+$AddToPath = $true
+# Stands in for the registry write (test_add_to_path_updates_the_user_path_once covers that on CI).
+function Add-UserPathEntry([string]$Directory) {{ Write-Host "user-path-stub $Directory"; return $true }}
+$env:Path = '{path}'
+Install-Neuron
+"""
+        return self.run_functions(self.INSTALL_FUNCTIONS, body, with_assignments=True)
+
+    def test_add_to_path_warns_when_an_older_neuron_comes_first(self) -> None:
+        # As on a PC with an old %LOCALAPPDATA%\Programs\NeuronCLI\neuron.exe on PATH.
+        shadow = self.root / "Programs" / "NeuronCLI"
+        shadow.mkdir(parents=True)
+        (shadow / "neuron.exe").write_bytes(b"MZ old neuron")
+        system = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+        result = self.run_add_to_path_install(f"{shadow};{system}")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"user-path-stub {self.install_dir}", result.stdout)
+        self.assertIn(
+            f"another neuron at {shadow / 'neuron.exe'} comes first on PATH and runs instead of {self.installed()}",
+            result.stdout,
+        )
+        self.assertIn(r'Remove-Item -Recurse -Force "$env:LOCALAPPDATA\Programs\NeuronCLI"', result.stdout)
+        self.assertIn("npm uninstall -g @zero-x.live/neuron neuron-cli-app", result.stdout)
+        self.assertIn(f"move {self.install_dir} before {shadow} in PATH", result.stdout)
+        self.assertTrue(self.installed().is_file())
+
+    def test_add_to_path_without_another_neuron_does_not_warn(self) -> None:
+        system = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+        result = self.run_add_to_path_install(str(system))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"added {self.install_dir} to your user PATH", result.stdout)
+        self.assertNotIn("comes first on PATH", result.stdout)
 
     @unittest.skipUnless(os.environ.get("GITHUB_ACTIONS") == "true", "changes the user PATH; runs only on CI runners")
     def test_add_to_path_updates_the_user_path_once(self) -> None:

@@ -7,11 +7,14 @@
 # terminal; nothing about the UI fails the install (without it, `neuron` runs
 # its line REPL).
 #
+# The latest stable release:
 #   curl -fsSL https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/latest/download/install.sh | sh
+# A given release; a prerelease such as 7.0.0-alpha.1 is never the latest release, so name it:
+#   curl -fsSL https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.1/install.sh | sh -s -- --version 7.0.0-alpha.1
 #   curl -fsSL .../install.sh | sh -s -- --version 7.0.0-alpha.1 --install-dir "$HOME/bin"
 #
 # Environment:
-#   NEURON_VERSION         release to install, e.g. 7.0.0-alpha.1 (default: latest release)
+#   NEURON_VERSION         release to install, e.g. 7.0.0-alpha.1 (default: latest stable release)
 #   NEURON_INSTALL_DIR     install directory (default: $HOME/.local/bin)
 #   NEURON_DOWNLOAD_BASE   release download base URL (default: GitHub Releases);
 #                          must be HTTPS unless it points at a loopback host
@@ -57,7 +60,7 @@ Install the Neuron coding agent from GitHub Releases.
 Usage: install.sh [--version VERSION] [--install-dir DIR] [--help]
 
 Options:
-  --version VERSION    Release to install, e.g. 7.0.0-alpha.1 (default: latest)
+  --version VERSION    Release to install, e.g. 7.0.0-alpha.1 (default: latest stable)
   --install-dir DIR    Directory for the neuron binary (default: ~/.local/bin)
   -h, --help           Show this help
 
@@ -110,6 +113,21 @@ fi
 
 # --- platform ---------------------------------------------------------------
 
+is_valid_version() {
+    printf '%s\n' "$1" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'
+}
+
+# The install.ps1 command for Windows: for the requested release when one was named
+# (a prerelease is never the latest release), otherwise for the latest stable release.
+powershell_install_command() {
+    named="${VERSION#v}"
+    if [ -n "${named}" ] && is_valid_version "${named}"; then
+        printf '%s\n' "& ([scriptblock]::Create((irm https://github.com/${REPOSITORY}/releases/download/v${named}/install.ps1))) -Version ${named}"
+    else
+        printf '%s\n' "irm https://github.com/${REPOSITORY}/releases/latest/download/install.ps1 | iex"
+    fi
+}
+
 detect_target() {
     os="$(uname -s 2>/dev/null || echo unknown)"
     arch="$(uname -m 2>/dev/null || echo unknown)"
@@ -118,7 +136,7 @@ detect_target() {
         Darwin) os_part="macos" ;;
         MINGW* | MSYS* | CYGWIN* | Windows_NT)
             die "this is a Windows shell (${os}). Install from PowerShell instead:
-    irm https://github.com/${REPOSITORY}/releases/latest/download/install.ps1 | iex"
+    $(powershell_install_command)"
             ;;
         *) die "unsupported operating system: ${os}. Neuron publishes binaries for ${SUPPORTED}." ;;
     esac
@@ -258,7 +276,7 @@ if [ -z "${VERSION}" ]; then
     VERSION="$(resolve_latest_version)"
 fi
 VERSION="${VERSION#v}"
-if ! printf '%s\n' "${VERSION}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+if ! is_valid_version "${VERSION}"; then
     die "invalid version: ${VERSION} (expected something like 7.0.0-alpha.1)"
 fi
 
@@ -365,7 +383,7 @@ case ":${PATH:-}:" in
         RESOLVED="$(command -v neuron 2>/dev/null || true)"
         if [ -n "${RESOLVED}" ] && [ "${RESOLVED}" != "${DESTINATION}" ]; then
             warn "another neuron at ${RESOLVED} comes first on PATH and runs instead of ${DESTINATION}."
-            info "Remove it (for example: pip uninstall neuroncli, or npm uninstall -g @zero-x.live/neuron) or reorder PATH."
+            info "An older Neuron is the usual cause; remove it (pip uninstall neuroncli, or npm uninstall -g @zero-x.live/neuron neuron-cli-app). If it is another program, put ${INSTALL_DIR} earlier in PATH."
         fi
         RUN="neuron"
         ;;

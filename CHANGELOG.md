@@ -329,14 +329,18 @@ first.
   replaces the old script that built from source and printed Claw Code text.
 - New `install.ps1` for Windows x64, for Windows PowerShell 5.1 and PowerShell 7.
   Installs to `%LOCALAPPDATA%\Programs\Neuron\bin`; changes the user `PATH` only with
-  `-AddToPath`. Under `irm | iex` it leaves the caller's session settings alone. It
+  `-AddToPath`, and warns when another `neuron` comes first on `PATH` (an old
+  NeuronCLI folder or npm or pip package, say) with how to remove it. Under
+  `irm | iex` it leaves the caller's session settings alone. It
   hashes downloads with .NET's SHA-256, so it also works when Windows PowerShell 5.1
   inherits a PowerShell 7 module path without `Get-FileHash`.
-- Both installers accept a version (`NEURON_VERSION`, default: latest release) and a
-  mirror (`NEURON_DOWNLOAD_BASE`), reject non-HTTPS mirrors (plain HTTP only to an
-  exact loopback host, never with user info in the URL), and tell an unpublished
-  version apart from a network failure. `GITHUB_TOKEN` is sent only to
-  `api.github.com`, and `install.sh` keeps it off the command line.
+- Both installers accept a version (`NEURON_VERSION`, default: the latest stable
+  release) and a mirror (`NEURON_DOWNLOAD_BASE`), reject non-HTTPS mirrors (plain HTTP
+  only to an exact loopback host, never with user info in the URL), and tell an
+  unpublished version apart from a network failure. The commands they print (for the
+  other platform's installer, or to rerun with `-AddToPath`) name the requested
+  version. `GITHUB_TOKEN` is sent only to `api.github.com`, and `install.sh` keeps it
+  off the command line.
 - `install.sh` checks that the binary runs from the install directory, so a `/tmp`
   mounted `noexec` does not break it; `install.ps1` puts the previous `neuron.exe`
   back if the new one cannot be moved into place. Both print the installed version.
