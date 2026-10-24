@@ -349,6 +349,15 @@ impl GlobalToolRegistry {
         self.runtime_tools.iter().any(|tool| tool.name == name)
     }
 
+    /// The names of the runtime tools (MCP servers' `mcp__<server>__<tool>`).
+    #[must_use]
+    pub fn runtime_tool_names(&self) -> Vec<String> {
+        self.runtime_tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect()
+    }
+
     #[must_use]
     pub fn search(
         &self,
@@ -4048,7 +4057,13 @@ where
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| slugify_agent_name(&input.description));
     let created_at = iso8601_now();
-    let system_prompt = build_agent_system_prompt(&normalized_subagent_type)?;
+    let mut system_prompt = build_agent_system_prompt(&normalized_subagent_type)?;
+    // Name the sub-agent's own model (`auto` picks one per request: name none).
+    let prompt_model = model.strip_prefix("openai/").unwrap_or(&model);
+    runtime::set_prompt_model(
+        &mut system_prompt,
+        (prompt_model != "auto").then_some(prompt_model),
+    );
     let allowed_tools = restrict_to_parent_tools(
         allowed_tools_for_subagent(&normalized_subagent_type),
         subagent_parent_context()

@@ -47,6 +47,8 @@ pub struct CatalogModel {
     pub status: Option<String>,
     /// When a `blurred` model can be used again (ISO 8601).
     pub available_again_at: Option<String>,
+    /// The model reads images (`capabilities.vision`); `None` when the gateway does not say.
+    pub supports_images: Option<bool>,
 }
 
 impl CatalogModel {
@@ -82,6 +84,10 @@ impl CatalogModel {
             unavailable_reason: string_field(value, "unavailable_reason"),
             status: string_field(value, "status"),
             available_again_at: string_field(value, "available_again_at"),
+            supports_images: capabilities
+                .and_then(|capabilities| capabilities.get("vision"))
+                .and_then(Value::as_bool)
+                .or_else(|| value.get("supports_vision").and_then(Value::as_bool)),
             id,
         })
     }
@@ -153,6 +159,36 @@ impl Catalog {
         models.sort_by_key(|model| !model.available);
         models
     }
+}
+
+/// Whether the catalog says `model` reads images; `None` without a catalog entry that says.
+pub fn model_supports_images(model: &str) -> Option<bool> {
+    current().and_then(|catalog| {
+        catalog
+            .find(crate::provider::shown_model(model))
+            .and_then(|entry| entry.supports_images)
+    })
+}
+
+/// How the system prompt names `model`: the catalog's display name with the id, or the
+/// id alone. `None` for `auto`, which picks a model per request, so the prompt names
+/// none rather than a wrong one.
+pub fn prompt_model_name(model: &str) -> Option<String> {
+    let id = crate::provider::shown_model(model).trim();
+    if id.is_empty() || id.eq_ignore_ascii_case(crate::provider::AUTO_MODEL) {
+        return None;
+    }
+    let display = current().and_then(|catalog| {
+        catalog
+            .find(id)
+            .and_then(|entry| entry.display_name.clone())
+    });
+    Some(match display {
+        Some(name) if !name.trim().is_empty() && !name.trim().eq_ignore_ascii_case(id) => {
+            format!("{} ({id})", name.trim())
+        }
+        _ => id.to_string(),
+    })
 }
 
 /// Parses the `GET /v1/models` body.
@@ -643,8 +679,8 @@ mod tests {
         json!({
             "object": "list",
             "data": [
-                {"id": "auto", "object": "model", "created": 0, "owned_by": "zero-x", "display_name": "Auto", "context_window": null, "max_output_tokens": null, "capabilities": {"tools": true, "streaming": true}, "tiers": ["free"], "available": true, "unavailable_reason": null, "pricing": null},
-                {"id": "test-gw/gemini-unit-flash", "object": "model", "display_name": "Gemini Flash", "context_window": 1_048_576, "max_output_tokens": 65_536, "capabilities": {"tools": true, "streaming": true}, "tiers": ["free", "paid"], "available": true, "unavailable_reason": null},
+                {"id": "auto", "object": "model", "created": 0, "owned_by": "zero-x", "display_name": "Auto", "context_window": null, "max_output_tokens": null, "capabilities": {"tools": true, "streaming": true, "vision": false}, "tiers": ["free"], "available": true, "unavailable_reason": null, "pricing": null},
+                {"id": "test-gw/gemini-unit-flash", "object": "model", "display_name": "Gemini Flash", "context_window": 1_048_576, "max_output_tokens": 65_536, "capabilities": {"tools": true, "streaming": true, "vision": true}, "tiers": ["free", "paid"], "available": true, "unavailable_reason": null},
                 {"id": "test-gw/paid-only-unit", "object": "model", "display_name": "Paid Only", "context_window": 262_144, "max_output_tokens": 32_768, "capabilities": {"tools": false, "streaming": true}, "tiers": ["paid"], "available": false, "unavailable_reason": "upgrade_required", "pricing": {"input_per_mtok_usd": 0.3, "output_per_mtok_usd": 2.5}},
                 {"object": "model", "display_name": "missing id is skipped"}
             ]
@@ -714,6 +750,13 @@ mod tests {
             Some("upgrade_required")
         );
         assert!(models[0].capability().is_none(), "auto keeps its fallback");
+        assert_eq!(
+            models[0].supports_images,
+            Some(false),
+            "capabilities.vision"
+        );
+        assert_eq!(models[1].supports_images, Some(true), "capabilities.vision");
+        assert_eq!(models[2].supports_images, None, "not said");
 
         register(&models);
         let flash = model_registry::lookup("openai/test-gw/gemini-unit-flash").unwrap();

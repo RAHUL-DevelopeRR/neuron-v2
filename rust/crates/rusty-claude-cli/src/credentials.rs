@@ -153,6 +153,8 @@ pub struct StoredCredential {
     /// The account's email, as the gateway reported it, so a later session can show
     /// who is signed in.
     pub email: Option<String>,
+    /// The account's display name, from `/api/account`, for the same reason.
+    pub name: Option<String>,
     pub saved_at: u64,
 }
 
@@ -163,6 +165,7 @@ impl StoredCredential {
             expires_at: None,
             plan: None,
             email: None,
+            name: None,
             saved_at: crate::clock::now_unix(),
         }
     }
@@ -178,6 +181,7 @@ impl StoredCredential {
             expires_at: self.expires_at,
             plan: self.plan.clone(),
             email: self.email.clone(),
+            name: self.name.clone(),
             saved_at: self.saved_at,
         };
         Zeroizing::new(serde_json::to_string_pretty(&record).expect("record serializes"))
@@ -198,6 +202,7 @@ impl StoredCredential {
             expires_at: record.expires_at,
             plan: record.plan.take(),
             email: record.email.take(),
+            name: record.name.take(),
             saved_at: record.saved_at,
         })
     }
@@ -213,6 +218,8 @@ struct CredentialRecord {
     plan: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
     #[serde(default)]
     saved_at: u64,
 }
@@ -794,6 +801,7 @@ pub(crate) mod tests {
         let mut credential = StoredCredential::new(SecureString::new(TOKEN.to_string()));
         credential.expires_at = Some(1_792_195_200);
         credential.plan = Some("pro".to_string());
+        credential.name = Some("Dev Example".to_string());
 
         assert_eq!(store.save(&credential), Ok(CredentialLocation::File));
         let loaded = store.load().expect("stored credential");

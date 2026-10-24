@@ -33,13 +33,20 @@
 
 use super::*;
 use crate::device_login::{DeviceCode, DeviceLoginObserver};
+use crate::engine_account::{self, SharedAccountCache};
+use crate::engine_reports;
+use crate::engine_trust;
+use crate::error_detail::DetailedError;
+use crate::session_presence::{self, SessionPresence};
 use neuron_tui::protocol::{
-    AccountInfo, Attachment, EngineCommand, GitStatus, ModelInfo, PermissionReply, TokenCounts,
-    UiEvent, PROTOCOL_VERSION,
+    AccountInfo, Attachment, DefinitionInfo, EngineCommand, GitStatus, McpServerInfo, ModelInfo,
+    PermissionReply, PluginInfo, SessionScope, TokenCounts, TranscriptEntry, UiEvent,
+    CAPABILITY_QUESTIONS, CAPABILITY_REPORTS, ENGINE_FEATURES, PROTOCOL_VERSION,
 };
 use repl_loop::InterruptPresses;
 use runtime::ui_hooks::{self, UserQuestion};
 use runtime::{CancellationToken, HookAbortSignal, TurnSummary};
+use runtime::{ContentBlock, MessageRole};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{MutexGuard, PoisonError};
@@ -233,11 +240,16 @@ fn run_engine(
         let mut engine = Engine::new(cli, output, Sender::clone(events), replies, shared);
         engine.account_email = signed_out.email.take();
         engine.refresh_account();
+        engine.announce_account();
         if let Some(reference) = &signed_out.options.resume {
             match engine.continue_saved_session(reference) {
-                Ok(report) => engine.notice(&report),
+                Ok(report) => {
+                    engine.notice(&report);
+                    engine.send_transcript();
+                }
                 Err(error) => engine.send(UiEvent::Error {
                     message: format!("could not continue {reference}: {error}"),
+                    detail: None,
                 }),
             }
         }
@@ -280,14 +292,20 @@ struct SignedOut<'a> {
 
 impl SignedOut<'_> {
     fn announce(&self, reason: &str) {
-        self.send(UiEvent::Ready {
-            protocol: PROTOCOL_VERSION,
-            version: VERSION.to_string(),
-        });
+        self.send(ready_event());
         if let Some(reason) = plain_notice(reason) {
             self.send(UiEvent::Notice { message: reason });
         }
         self.send_status();
+        self.send_account();
+    }
+
+    /// The login there is, if any (expired, or signed out): no session reads the account.
+    fn send_account(&self) {
+        self.send(engine_account::account_event(
+            &SharedAccountCache::default(),
+            self.email.as_deref(),
+        ));
     }
 
     /// Runs commands until a sign-in starts the provider (its model) or the engine stops.
@@ -303,7 +321,7 @@ impl SignedOut<'_> {
                         "exit" | "quit" => return None,
                         "login" => match self.login() {
                             Ok(model) => return Some(model),
-                            Err(message) => self.fail(&message),
+                            Err(error) => self.fail_with(error),
                         },
                         "logout" => {
                             crate::auth::logout();
@@ -323,30 +341,66 @@ impl SignedOut<'_> {
                     self.options.model = resolve_model_alias_with_config(model.trim());
                     self.send_status();
                 }
-                EngineCommand::SetModel { .. } | EngineCommand::Interrupt => {}
+                // Capabilities and answers are the command thread's.
+                EngineCommand::SetModel { .. }
+                | EngineCommand::Interrupt
+                | EngineCommand::Capabilities { .. }
+                | EngineCommand::Answer { .. } => {}
                 EngineCommand::ListModels => self.send(UiEvent::Models {
                     current: shown_model(&self.options.model).to_string(),
                     models: Vec::new(),
                 }),
+                // The saved chats are there before a sign-in; continuing one needs it.
+                EngineCommand::ListSessions { scope } => self.send(sessions_event("", scope)),
+                EngineCommand::Resume { .. } => {
+                    self.send(UiEvent::Error {
+                        message: "Sign in to Zero-X first (/login) to continue a chat.".into(),
+                        detail: None,
+                    });
+                }
+                EngineCommand::TrustWorkspace => {
+                    for event in trust_workspace_events() {
+                        self.send(event);
+                    }
+                    self.send_status();
+                }
+                EngineCommand::ListExtensions => self.send(extensions_event()),
+                EngineCommand::RefreshAccount => self.send_account(),
+                EngineCommand::TrustPreview => self.send(engine_trust::trust_preview_event(
+                    &env::current_dir().unwrap_or_default(),
+                )),
             }
         }
         None
     }
 
     /// Signs in, then starts the provider the sign-in was missing for.
-    fn login(&mut self) -> Result<String, String> {
+    fn login(&mut self) -> Result<String, DetailedError> {
         let (_credential, email) = sign_in(self.events, self.shared)?;
         self.email = email;
-        match start_provider(&self.options.model).map_err(|error| error.to_string())? {
+        let plain = |message: String| DetailedError {
+            message,
+            detail: None,
+        };
+        match start_provider(&self.options.model).map_err(|error| plain(error.to_string()))? {
             ProviderStart::Ready(model) => Ok(model),
-            ProviderStart::SignInRequired(reason) => Err(reason),
+            ProviderStart::SignInRequired(reason) => Err(plain(reason)),
         }
     }
 
     /// Ends a refused or failed command: the error, `TurnFinished`, the footer.
     fn fail(&self, message: &str) {
-        self.send(UiEvent::Error {
+        self.fail_with(DetailedError {
             message: message.to_string(),
+            detail: None,
+        });
+    }
+
+    /// [`Self::fail`] with what the failure needs from the user.
+    fn fail_with(&self, error: DetailedError) {
+        self.send(UiEvent::Error {
+            message: error.message,
+            detail: error.detail,
         });
         self.finish();
     }
@@ -380,7 +434,7 @@ impl SignedOut<'_> {
 fn sign_in(
     events: &Sender<UiEvent>,
     shared: &Shared,
-) -> Result<(crate::auth::GatewayCredential, Option<String>), String> {
+) -> Result<(crate::auth::GatewayCredential, Option<String>), DetailedError> {
     let cancel = CancellationToken::new();
     let running = RunningTurn::start(shared);
     running.watch(cancel.clone(), HookAbortSignal::new());
@@ -390,7 +444,7 @@ fn sign_in(
         &SignInObserver { events },
         &cancelled,
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| DetailedError::from_io(&error))
 }
 
 /// Shows the device code on the UI.
@@ -464,7 +518,319 @@ fn status_event(
         signed_in: account.signed_in,
         sign_in_required,
         account: account.info.clone(),
+        supports_images: crate::gateway_catalog::model_supports_images(model),
     }
+}
+
+/// The first event: the protocol version and what this engine adds to it.
+fn ready_event() -> UiEvent {
+    UiEvent::Ready {
+        protocol: PROTOCOL_VERSION,
+        version: VERSION.to_string(),
+        features: ENGINE_FEATURES.iter().map(ToString::to_string).collect(),
+    }
+}
+
+/// The saved chats in `scope` (this workspace's, or every known workspace's), newest
+/// first; `current` is the one the engine runs (empty for none). A store that cannot be
+/// read lists none.
+fn sessions_event(current: &str, scope: SessionScope) -> UiEvent {
+    let cwd = env::current_dir().unwrap_or_default();
+    UiEvent::Sessions {
+        current: current.to_string(),
+        sessions: session_presence::list(scope, current, &cwd),
+        scope,
+    }
+}
+
+/// How much of a conversation a transcript carries: the newest entries, and no single
+/// text longer than this many characters.
+const TRANSCRIPT_ENTRY_LIMIT: usize = 400;
+const TRANSCRIPT_TEXT_LIMIT: usize = 4_000;
+
+/// `session`'s conversation as a UI rebuilds it: prompts, replies, tool calls and their
+/// results. System messages (and a compaction's summary) are left out.
+fn transcript_event(session_id: &str, session: &Session) -> UiEvent {
+    let mut entries = Vec::new();
+    for message in &session.messages {
+        for block in &message.blocks {
+            let entry = match (message.role, block) {
+                (MessageRole::User, ContentBlock::Text { text }) if !text.trim().is_empty() => {
+                    TranscriptEntry::User {
+                        text: shorten(text, TRANSCRIPT_TEXT_LIMIT),
+                    }
+                }
+                (MessageRole::Assistant, ContentBlock::Text { text })
+                    if !text.trim().is_empty() =>
+                {
+                    TranscriptEntry::Assistant {
+                        text: shorten(text, TRANSCRIPT_TEXT_LIMIT),
+                    }
+                }
+                (MessageRole::Assistant, ContentBlock::ToolUse { id, name, input }) => {
+                    TranscriptEntry::ToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: shorten_json_strings(input, TRANSCRIPT_TEXT_LIMIT),
+                    }
+                }
+                (
+                    _,
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        tool_name,
+                        output,
+                        is_error,
+                    },
+                ) => TranscriptEntry::ToolResult {
+                    id: tool_use_id.clone(),
+                    name: tool_name.clone(),
+                    output: shorten(output, TRANSCRIPT_TEXT_LIMIT),
+                    is_error: *is_error,
+                },
+                _ => continue,
+            };
+            entries.push(entry);
+        }
+    }
+    let truncated = entries.len() > TRANSCRIPT_ENTRY_LIMIT;
+    if truncated {
+        entries.drain(..entries.len() - TRANSCRIPT_ENTRY_LIMIT);
+    }
+    UiEvent::Transcript {
+        session_id: session_id.to_string(),
+        entries,
+        truncated,
+    }
+}
+
+/// `text` cut to `limit` characters, saying how much was left out.
+fn shorten(text: &str, limit: usize) -> String {
+    let count = text.chars().count();
+    if count <= limit {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(limit).collect();
+    format!("{kept}\n\u{2026} ({} more characters)", count - limit)
+}
+
+/// A tool input with its long string values shortened, so it stays valid JSON (a UI
+/// reads paths and diffs from it). Input that is not JSON is shortened as text.
+fn shorten_json_strings(input: &str, limit: usize) -> String {
+    fn walk(value: &mut serde_json::Value, limit: usize) {
+        match value {
+            serde_json::Value::String(text) if text.chars().count() > limit => {
+                *text = shorten(text, limit);
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(|item| walk(item, limit)),
+            serde_json::Value::Object(fields) => {
+                fields.values_mut().for_each(|field| walk(field, limit));
+            }
+            _ => {}
+        }
+    }
+    if input.chars().count() <= limit {
+        return input.to_string();
+    }
+    match serde_json::from_str::<serde_json::Value>(input) {
+        Ok(mut value) => {
+            walk(&mut value, limit);
+            value.to_string()
+        }
+        Err(_) => shorten(input, limit),
+    }
+}
+
+/// `TrustWorkspace`: records trust for the working directory's git root (the folder itself
+/// outside git) in the trust store; the home folder is trusted for this engine only. The
+/// workspace's own settings, hooks and MCP servers load when a session starts, so the UI
+/// restarts the engine to use them.
+fn trust_workspace_events() -> Vec<UiEvent> {
+    let cwd = env::current_dir().unwrap_or_default();
+    match runtime::workspace_trust::trust_workspace_root(&cwd) {
+        Ok(trusted) => vec![
+            UiEvent::WorkspaceTrusted {
+                cwd: cwd.display().to_string(),
+                restart_required: true,
+                root: Some(trusted.root.display().to_string()),
+                session_only: trusted.session_only,
+            },
+            UiEvent::Notice {
+                message: if trusted.session_only {
+                    format!(
+                        "Trusted {} for this session only. Its settings, hooks and MCP servers load when the session restarts.",
+                        cwd.display()
+                    )
+                } else {
+                    format!(
+                        "Trusted {}. Its settings, hooks and MCP servers load when the session restarts.",
+                        trusted.root.display()
+                    )
+                },
+            },
+        ],
+        Err(error) => vec![UiEvent::error(format!(
+            "could not trust {}: {error}",
+            cwd.display()
+        ))],
+    }
+}
+
+/// `ListExtensions`: the configured MCP servers with what each is doing now, the
+/// plugins, and the skills and agent definitions this workspace sees. A server's
+/// command, arguments, environment and headers are left out: they can hold secrets.
+fn extensions_event() -> UiEvent {
+    let cwd = env::current_dir().unwrap_or_default();
+    let loader = ConfigLoader::default_for(&cwd);
+    let config = loader.load();
+    let snapshot = extensions_snapshot();
+    let live = snapshot.as_ref().and_then(|snapshot| snapshot.mcp.as_ref());
+    let mcp_servers = match &config {
+        Ok(config) => config
+            .mcp()
+            .servers()
+            .iter()
+            .map(|(name, server)| {
+                let (status, tools, error) = mcp_server_status(name, live);
+                McpServerInfo {
+                    name: name.clone(),
+                    scope: config_scope_id(server.scope).to_string(),
+                    transport: mcp_transport_id(server.transport()).to_string(),
+                    status: status.to_string(),
+                    tools,
+                    error,
+                }
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    // Before a runtime was built (signed out), the plugins come from the manager.
+    let plugins = match snapshot {
+        Some(snapshot) => snapshot.plugins,
+        None => config
+            .as_ref()
+            .ok()
+            .and_then(|config| {
+                build_plugin_manager(&cwd, &loader, config)
+                    .list_plugins()
+                    .ok()
+            })
+            .unwrap_or_default(),
+    };
+    UiEvent::Extensions {
+        mcp_servers,
+        plugins: plugins
+            .into_iter()
+            .map(|plugin| PluginInfo {
+                id: plugin.metadata.id,
+                name: plugin.metadata.name,
+                version: plugin.metadata.version,
+                description: plugin.metadata.description,
+                kind: plugin.metadata.kind.to_string(),
+                enabled: plugin.enabled,
+            })
+            .collect(),
+        skills: definitions(
+            commands::handle_skills_slash_command_json(None, &cwd).ok(),
+            "skills",
+        ),
+        agents: definitions(
+            commands::handle_agents_slash_command_json(None, &cwd).ok(),
+            "agents",
+        ),
+    }
+}
+
+/// What the MCP server `name` is doing: its status, its tools (without the
+/// `mcp__<server>__` prefix) and why it failed or is unsupported. `live` is `None`
+/// before the session's runtime started its servers.
+fn mcp_server_status(
+    name: &str,
+    live: Option<&McpRuntimeView>,
+) -> (&'static str, Vec<String>, Option<String>) {
+    let Some(live) = live else {
+        return ("not_started", Vec::new(), None);
+    };
+    let reason = |servers: &[(String, String)]| {
+        servers
+            .iter()
+            .find(|(server, _)| server == name)
+            .map(|(_, reason)| reason.clone())
+    };
+    if let Some(reason) = reason(&live.unsupported) {
+        return ("unsupported", Vec::new(), Some(reason));
+    }
+    if live.starting {
+        return ("starting", Vec::new(), None);
+    }
+    if let Some(message) = reason(&live.failed) {
+        return ("failed", Vec::new(), Some(message));
+    }
+    if live.pending.iter().any(|server| server == name) {
+        return ("pending", Vec::new(), None);
+    }
+    if live.running.iter().any(|server| server == name) {
+        let prefix = runtime::mcp_tool_prefix(name);
+        let tools = live
+            .tools
+            .iter()
+            .filter_map(|tool| tool.strip_prefix(&prefix))
+            .map(str::to_string)
+            .collect();
+        return ("ready", tools, None);
+    }
+    ("not_started", Vec::new(), None)
+}
+
+fn config_scope_id(scope: ConfigSource) -> &'static str {
+    match scope {
+        ConfigSource::Bundled => "bundled",
+        ConfigSource::User => "user",
+        ConfigSource::Project => "project",
+        ConfigSource::Local => "local",
+    }
+}
+
+pub(crate) fn mcp_transport_id(transport: runtime::McpTransport) -> &'static str {
+    match transport {
+        runtime::McpTransport::Stdio => "stdio",
+        runtime::McpTransport::Sse => "sse",
+        runtime::McpTransport::Http => "http",
+        runtime::McpTransport::Ws => "ws",
+        runtime::McpTransport::Sdk => "sdk",
+        runtime::McpTransport::ManagedProxy => "managed_proxy",
+    }
+}
+
+/// The skills or agents (`key`) of a `/skills` or `/agents` JSON report.
+fn definitions(report: Option<serde_json::Value>, key: &str) -> Vec<DefinitionInfo> {
+    let Some(report) = report else {
+        return Vec::new();
+    };
+    report
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|definition| {
+            Some(DefinitionInfo {
+                name: definition.get("name")?.as_str()?.to_string(),
+                description: definition
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                source: definition
+                    .pointer("/source/label")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                active: definition
+                    .get("active")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true),
+            })
+        })
+        .collect()
 }
 
 /// What the command thread needs to reach the engine thread's turn.
@@ -477,6 +843,12 @@ struct Shared {
     /// Where the answer to the pending question goes, with the question's number.
     answer: Mutex<Option<(u64, Sender<String>)>>,
     next_question: AtomicU64,
+    /// The UI takes questions as [`UiEvent::Question`] (its `questions` capability).
+    structured_questions: AtomicBool,
+    /// The UI shows reports as [`UiEvent::Report`] (its `reports` capability).
+    report_panels: AtomicBool,
+    /// Which UI this is, as its capabilities named it (`terminal`, `desktop`).
+    client: Mutex<Option<String>>,
     /// Shutdown was requested: commands still queued are dropped.
     closing: AtomicBool,
     /// The UI's events while the engine runs, for answering [`EngineCommand::ListModels`]
@@ -551,6 +923,16 @@ impl Shared {
                 let _ = events.send(models_event(&current));
             })
             .is_ok()
+    }
+
+    /// The pending question's answer channel, when `id` is that question.
+    fn take_answer_to(&self, id: u64) -> Option<Sender<String>> {
+        let mut pending = lock(&self.answer);
+        if pending.as_ref().is_some_and(|(number, _)| *number == id) {
+            pending.take().map(|(_, answer)| answer)
+        } else {
+            None
+        }
     }
 
     /// Stops the running turn, without the interrupt notice: the session is closing.
@@ -678,6 +1060,23 @@ fn forward_commands(
             // It only reads the catalog, so a running turn need not end first. Between
             // turns it queues, after a `SetModel` sent before it.
             EngineCommand::ListModels if shared.turn_running() && shared.answer_models() => {}
+            // Both take effect at once, also while a turn runs.
+            EngineCommand::Capabilities { features, client } => {
+                *lock(&shared.client) = client;
+                let has = |capability: &str| features.iter().any(|feature| feature == capability);
+                shared
+                    .structured_questions
+                    .store(has(CAPABILITY_QUESTIONS), Ordering::SeqCst);
+                shared
+                    .report_panels
+                    .store(has(CAPABILITY_REPORTS), Ordering::SeqCst);
+            }
+            EngineCommand::Answer { id, text } => {
+                // A stale or unknown id answers nothing.
+                if let Some(answer) = shared.take_answer_to(id) {
+                    let _ = answer.send(text);
+                }
+            }
             command => {
                 if queue.send(command).is_err() {
                     return;
@@ -724,6 +1123,7 @@ fn models_event(current_model: &str) -> UiEvent {
                     tiers: model.tiers.clone(),
                     status: model.status.clone(),
                     available_again_at: model.available_again_at.clone(),
+                    supports_images: model.supports_images,
                 })
                 .collect()
         })
@@ -766,8 +1166,9 @@ fn plain_notice(message: &str) -> Option<String> {
     (!plain.is_empty()).then(|| plain.to_string())
 }
 
-/// Shows `question` as a notice and waits for the next submitted text: the answer, raw,
-/// as a user would have typed it. An interrupted turn or a closed UI gives up.
+/// Shows `question` (a [`UiEvent::Question`] when the UI takes them, else a notice) and
+/// waits for the answer: an [`EngineCommand::Answer`] with its id, or the next submitted
+/// text, raw, as a user would have typed it. An interrupted turn or a closed UI gives up.
 fn ask_the_ui(
     events: &Sender<UiEvent>,
     shared: &Shared,
@@ -787,9 +1188,17 @@ fn ask_the_ui(
     };
     let closed = || io::Error::new(io::ErrorKind::BrokenPipe, "the Neuron UI closed");
 
-    let asked = events.send(UiEvent::Notice {
-        message: question_notice(question),
-    });
+    let asked = if shared.structured_questions.load(Ordering::SeqCst) {
+        events.send(UiEvent::Question {
+            id: number,
+            question: question.question.trim().to_string(),
+            options: question.options.clone().unwrap_or_default(),
+        })
+    } else {
+        events.send(UiEvent::Notice {
+            message: question_notice(question),
+        })
+    };
     if asked.is_err() {
         withdraw();
         return Err(closed());
@@ -899,6 +1308,10 @@ struct Engine {
     account: AccountState,
     /// The email the last sign-in in this engine reported.
     account_email: Option<String>,
+    /// The plan and usage `/api/account` reported, shared with the threads that read it.
+    account_cache: SharedAccountCache,
+    /// The session this engine has open, as other Neurons' session lists see it.
+    presence: Option<SessionPresence>,
     /// The UI stopped listening.
     ui_closed: bool,
 }
@@ -920,12 +1333,37 @@ impl Engine {
             last_permission_id: 0,
             account: AccountState::read(None),
             account_email: None,
+            account_cache: SharedAccountCache::default(),
+            presence: None,
             ui_closed: false,
         }
     }
 
     fn refresh_account(&mut self) {
         self.account = AccountState::read(self.account_email.as_deref());
+    }
+
+    /// The account as it is known now, then (with a login) again once `/api/account`
+    /// answered.
+    fn announce_account(&mut self) {
+        self.send_account();
+        self.read_account_in_background();
+    }
+
+    fn send_account(&mut self) {
+        let event =
+            engine_account::account_event(&self.account_cache, self.account_email.as_deref());
+        self.send(event);
+    }
+
+    /// Reads `/api/account` on a thread of its own; its account event follows. False
+    /// without a login.
+    fn read_account_in_background(&self) -> bool {
+        engine_account::refresh_in_background(
+            &self.account_cache,
+            &self.events,
+            self.account_email.clone(),
+        )
     }
 
     /// Runs queued commands until shutdown. A failure or panic in one command is reported
@@ -943,6 +1381,7 @@ impl Engine {
                             "internal error: {}",
                             repl_loop::panic_message(payload.as_ref())
                         ),
+                        detail: None,
                     });
                     self.finish_turn();
                     self.persist();
@@ -976,15 +1415,57 @@ impl Engine {
                 }
                 Err(error) => self.send(UiEvent::Error {
                     message: error.to_string(),
+                    detail: None,
                 }),
             },
             // The command thread hands interrupts to the running turn; one that gets here
-            // found nothing to interrupt.
-            EngineCommand::Interrupt => {}
+            // found nothing to interrupt. Capabilities and answers are the command
+            // thread's too.
+            EngineCommand::Interrupt
+            | EngineCommand::Capabilities { .. }
+            | EngineCommand::Answer { .. } => {}
             EngineCommand::ListModels => self.list_models(),
+            EngineCommand::ListSessions { scope } => {
+                let event = sessions_event(&self.cli.session.id, scope);
+                self.send(event);
+            }
+            EngineCommand::Resume { session } => match self.resume(&session) {
+                Ok(()) => {
+                    self.persist();
+                    self.send_transcript();
+                    self.send_status();
+                }
+                Err(error) => self.send(UiEvent::Error {
+                    message: error.to_string(),
+                    detail: None,
+                }),
+            },
+            EngineCommand::TrustWorkspace => {
+                for event in trust_workspace_events() {
+                    self.send(event);
+                }
+                self.send_status();
+            }
+            EngineCommand::ListExtensions => self.send(extensions_event()),
+            EngineCommand::RefreshAccount => {
+                if !self.read_account_in_background() {
+                    self.send_account();
+                }
+            }
+            EngineCommand::TrustPreview => {
+                let event =
+                    engine_trust::trust_preview_event(&env::current_dir().unwrap_or_default());
+                self.send(event);
+            }
             EngineCommand::Shutdown => return Step::Stop,
         }
         Step::Continue
+    }
+
+    /// The running session's conversation, for the UI to show from the start.
+    fn send_transcript(&mut self) {
+        let event = transcript_event(&self.cli.session.id, self.cli.runtime.session());
+        self.send(event);
     }
 
     fn submit(&mut self, text: &str, attachments: &[Attachment]) {
@@ -1003,9 +1484,28 @@ impl Engine {
         let prompt = try_resolve_bare_skill_prompt(&cwd, line).unwrap_or_else(|| line.to_string());
         let prompt = self.with_attachments(prompt, attachments);
         let input = self.wrap_for_mode(&prompt);
-        match self.run_turn(&input, running, presses) {
-            Ok((summary, usage)) => self.report_turn(&summary, usage),
-            Err(message) => self.send(UiEvent::Error { message }),
+        crate::error_detail::clear_model_call_failure();
+        self.track_session();
+        let client = lock(&self.shared.client).clone();
+        if let Some(presence) = self.presence.as_mut() {
+            presence.turn_started(client);
+        }
+        let failed = match self.run_turn(&input, running, presses) {
+            Ok((summary, usage)) => {
+                self.report_turn(&summary, usage);
+                false
+            }
+            Err(message) => {
+                self.send(UiEvent::Error {
+                    message,
+                    detail: crate::error_detail::take_model_call_failure(),
+                });
+                true
+            }
+        };
+        if let Some(presence) = self.presence.as_mut() {
+            let branch = runtime::workspace_git_status(&cwd).and_then(|status| git_branch(&status));
+            presence.turn_finished(failed, branch);
         }
         self.finish_turn();
     }
@@ -1094,6 +1594,10 @@ impl Engine {
             cumulative: token_counts(summary.usage),
             estimated: false,
         });
+        // The gateway's quota headers moved today's usage.
+        if engine_account::apply_quota_headers(&self.account_cache) {
+            self.send_account();
+        }
     }
 
     /// Runs `/<command> <args>` and ends it with [`UiEvent::TurnFinished`]. Commands that
@@ -1123,6 +1627,7 @@ impl Engine {
         if let Err(error) = result {
             self.send(UiEvent::Error {
                 message: error.to_string(),
+                detail: DetailedError::detail_of(error.as_ref()),
             });
         }
         self.finish_turn();
@@ -1157,17 +1662,44 @@ impl Engine {
                 self.persist();
             }
             SlashCommand::Permissions { mode } => self.permissions(mode.as_deref())?,
-            SlashCommand::Clear { confirm } => self.clear(confirm)?,
+            SlashCommand::Clear { confirm } => {
+                self.clear(confirm)?;
+                if confirm {
+                    self.send_transcript();
+                }
+            }
             SlashCommand::Resume { session_path: None } => self.notice(&render_resume_usage()),
             SlashCommand::Resume {
                 session_path: Some(reference),
             } => {
                 self.resume(&reference)?;
                 self.persist();
+                self.send_transcript();
             }
             SlashCommand::Plan { mode } => self.plan(mode.as_deref())?,
             SlashCommand::Login => self.login()?,
             SlashCommand::Logout => self.logout(),
+            SlashCommand::Usage { .. } => {
+                let account = engine_account::read_now(&self.account_cache)?;
+                self.send_account();
+                let pricing = crate::account::pricing_url();
+                let base = crate::auth::gateway_base_url()?;
+                let dashboard = format!("{}/dashboard", crate::gateway_http::origin(&base));
+                let now = crate::clock::now_unix();
+                self.show_report(engine_reports::usage(&account, now, &pricing, &dashboard));
+            }
+            SlashCommand::Init => {
+                let report = crate::init::initialize_repo(&env::current_dir()?)?;
+                self.show_report(engine_reports::init(&report));
+            }
+            SlashCommand::Memory => {
+                let report = engine_reports::memory(&env::current_dir()?)?;
+                self.show_report(report);
+            }
+            SlashCommand::Doctor => {
+                let report = engine_reports::doctor(&render_doctor_report()?);
+                self.show_report(report);
+            }
             SlashCommand::Unknown(name) => return Err(format_unknown_slash_command(&name).into()),
             other => {
                 return Err(format!(
@@ -1180,13 +1712,46 @@ impl Engine {
         Ok(())
     }
 
-    /// `Ready`, then the footer's first `Status`.
+    /// `Ready`, then the footer's first `Status`, then the conversation of a continued
+    /// chat.
     fn announce(&mut self) {
-        self.send(UiEvent::Ready {
-            protocol: PROTOCOL_VERSION,
-            version: VERSION.to_string(),
-        });
+        if let Ok(cwd) = env::current_dir() {
+            session_presence::record_project(&cwd);
+        }
+        self.send(ready_event());
         self.send_status();
+        self.announce_account();
+        if !self.cli.runtime.session().messages.is_empty() {
+            self.send_transcript();
+        }
+    }
+
+    /// Holds the session the engine runs now as open (letting go of the one before), so
+    /// other Neurons' session lists show it.
+    fn track_session(&mut self) {
+        let id = &self.cli.session.id;
+        if self
+            .presence
+            .as_ref()
+            .is_some_and(|presence| presence.session_id() == id)
+        {
+            return;
+        }
+        self.presence = None;
+        let Some(dir) = self.cli.session.path.parent() else {
+            return;
+        };
+        let client = lock(&self.shared.client).clone();
+        self.presence = Some(SessionPresence::claim(dir, id, client));
+    }
+
+    /// A report in the UI's report panel, or as a notice when it has none.
+    fn show_report(&mut self, report: engine_reports::Report) {
+        if self.shared.report_panels.load(Ordering::SeqCst) {
+            self.send(report.into_event());
+        } else {
+            self.notice(&report.render_text());
+        }
     }
 
     /// Ends a prompt or a slash command: `TurnFinished`, then the footer's new `Status`.
@@ -1197,6 +1762,7 @@ impl Engine {
 
     fn send_status(&mut self) {
         lock(&self.shared.model).clone_from(&self.cli.model);
+        self.track_session();
         let context_percent =
             u32::try_from(self.cli.runtime.context_snapshot().used_percent()).unwrap_or(u32::MAX);
         // A session on the gateway needs the login; other providers do not.
@@ -1220,6 +1786,8 @@ impl Engine {
         let (credential, email) = sign_in(&self.events, &self.shared)?;
         self.account_email = email;
         self.refresh_account();
+        engine_account::forget(&self.account_cache);
+        self.announce_account();
         let Some(active) = active_provider().filter(|active| active.id == ProviderId::ZeroX) else {
             self.notice(
                 "Signed in. This session uses another provider; restart neuron (or pass --provider zero-x) to use the Zero-X gateway.",
@@ -1250,6 +1818,8 @@ impl Engine {
         crate::auth::logout();
         self.account_email = None;
         self.refresh_account();
+        engine_account::forget(&self.account_cache);
+        self.send_account();
         if active_provider().is_some_and(|active| active.id == ProviderId::ZeroX) {
             self.notice("Requests in this session will fail until you run /login again.");
         }
@@ -1482,18 +2052,22 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::{
-        forward_commands, git_status, plain_notice, question_notice, spawn, EngineExit,
-        EngineHandle, EngineOptions, RunningTurn, Shared,
+        definitions, forward_commands, git_status, mcp_server_status, plain_notice,
+        question_notice, shorten, shorten_json_strings, spawn, transcript_event, EngineExit,
+        EngineHandle, EngineOptions, McpRuntimeView, RunningTurn, Shared,
     };
     use crate::repl_loop::InterruptPresses;
     use crate::tests::{env_lock, with_current_dir};
     use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
     use neuron_tui::protocol::{
-        EngineCommand, PermissionDecision, PermissionReply, TokenCounts, UiEvent, PROTOCOL_VERSION,
+        EngineCommand, PermissionDecision, PermissionReply, SessionRunStatus, SessionScope,
+        TokenCounts, TranscriptEntry, UiEvent, CAPABILITY_QUESTIONS, CAPABILITY_REPORTS,
+        ENGINE_FEATURES, PROTOCOL_VERSION,
     };
     use runtime::ui_hooks::{self, UserQuestion};
     use runtime::PermissionMode;
     use runtime::{CancellationToken, HookAbortSignal};
+    use runtime::{ContentBlock, ConversationMessage, MessageRole, Session};
     use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1581,18 +2155,23 @@ mod tests {
         loop {
             match next_event(events) {
                 UiEvent::Notice { message } if message.contains(needle) => return message,
-                UiEvent::Notice { .. } | UiEvent::Status { .. } => {}
+                UiEvent::Notice { .. } | UiEvent::Status { .. } | UiEvent::Account { .. } => {}
                 other => panic!("expected a notice with {needle:?}, got {other:?}"),
             }
         }
     }
 
-    /// The events without notices and footer updates: the hooks are process-wide, so a test
-    /// running alongside may add notices of its own.
+    /// The events without notices, footer updates and account updates: the hooks are
+    /// process-wide, so a test running alongside may add notices of its own.
     fn without_notices(events: &[UiEvent]) -> Vec<UiEvent> {
         events
             .iter()
-            .filter(|event| !matches!(event, UiEvent::Notice { .. } | UiEvent::Status { .. }))
+            .filter(|event| {
+                !matches!(
+                    event,
+                    UiEvent::Notice { .. } | UiEvent::Status { .. } | UiEvent::Account { .. }
+                )
+            })
             .cloned()
             .collect()
     }
@@ -1640,7 +2219,14 @@ mod tests {
                 .any(|notice| notice.starts_with("Session cleared")),
             "{cleared:?}"
         );
-        assert_eq!(without_notices(&cleared), vec![UiEvent::TurnFinished]);
+        match without_notices(&cleared).as_slice() {
+            [UiEvent::Transcript {
+                entries, truncated, ..
+            }, UiEvent::TurnFinished] => {
+                assert!(entries.is_empty() && !truncated, "the new chat is empty");
+            }
+            other => panic!("expected an empty transcript, then the end: {other:?}"),
+        }
     }
 
     /// Submits a bash scenario that needs approval and returns the permission request's id
@@ -1747,12 +2333,13 @@ mod tests {
         })
         .expect("the engine starts");
 
-        // First the protocol version, then the footer.
+        // First the protocol version and the engine's features, then the footer.
         assert_eq!(
             next_event(&engine.events),
             UiEvent::Ready {
                 protocol: PROTOCOL_VERSION,
                 version: env!("CARGO_PKG_VERSION").to_string(),
+                features: ENGINE_FEATURES.iter().map(ToString::to_string).collect(),
             }
         );
         let untracked_at_start = match next_event(&engine.events) {
@@ -1773,6 +2360,14 @@ mod tests {
             }
             other => panic!("expected the footer status, got {other:?}"),
         };
+        // Then the account: there is no Zero-X login here, so nothing is read.
+        assert_eq!(
+            next_event(&engine.events),
+            UiEvent::Account {
+                signed_in: false,
+                account: None,
+            }
+        );
 
         // Notices from anywhere in the process reach the UI, as plain text.
         ui_hooks::notice("\n\x1b[33m!\x1b[0m engine-test notice\n");
@@ -1800,13 +2395,79 @@ mod tests {
             .unwrap();
         assert_eq!(asker.join().unwrap().expect("answered"), "2");
 
+        // With the `questions` capability: a Question event, answered by its id. The
+        // session list that follows is queued behind the capability, so it is in effect.
+        engine
+            .commands
+            .send(EngineCommand::Capabilities {
+                features: vec![CAPABILITY_QUESTIONS.into()],
+                client: None,
+            })
+            .unwrap();
+        engine
+            .commands
+            .send(EngineCommand::ListSessions {
+                scope: SessionScope::Project,
+            })
+            .unwrap();
+        events_until(&engine.events, |event| {
+            matches!(event, UiEvent::Sessions { .. })
+        });
+        let ask = ui_hooks::ask_handler().expect("the engine answers questions");
+        let asker = thread::spawn(move || {
+            ask(&UserQuestion {
+                question: "Which crate?".into(),
+                options: Some(vec!["api".into(), "tools".into()]),
+            })
+        });
+        let id = match next_event(&engine.events) {
+            UiEvent::Question {
+                id,
+                question,
+                options,
+            } => {
+                assert_eq!(question, "Which crate?");
+                assert_eq!(options, vec!["api".to_string(), "tools".to_string()]);
+                id
+            }
+            other => panic!("expected a question event, got {other:?}"),
+        };
+        // A stale id answers nothing; the right one does.
+        engine
+            .commands
+            .send(EngineCommand::Answer {
+                id: id + 7,
+                text: "api".into(),
+            })
+            .unwrap();
+        engine
+            .commands
+            .send(EngineCommand::Answer {
+                id,
+                text: "tools".into(),
+            })
+            .unwrap();
+        assert_eq!(asker.join().unwrap().expect("answered"), "tools");
+        engine
+            .commands
+            .send(EngineCommand::Capabilities {
+                features: Vec::new(),
+                client: None,
+            })
+            .unwrap();
+
         // Nothing runs: the interrupt is dropped, not kept to cancel the next turn.
         engine.commands.send(EngineCommand::Interrupt).unwrap();
 
         // Streamed text, then the turn's real usage.
         engine.commands.send(scenario("streaming_text")).unwrap();
+        let streamed = turn_events(&engine.events);
+        let first_session = match streamed.last() {
+            Some(UiEvent::Status { session_id, .. }) => session_id.clone(),
+            other => panic!("expected the footer after the turn, got {other:?}"),
+        };
         assert_eq!(
-            without_notices(&turn_events(&engine.events)),
+            without_notices(&streamed),
             vec![
                 UiEvent::TextDelta {
                     text: "Mock streaming ".into()
@@ -1823,6 +2484,72 @@ mod tests {
                 UiEvent::TurnFinished,
             ]
         );
+
+        // The session list has this chat, current, titled by its first prompt.
+        engine
+            .commands
+            .send(EngineCommand::ListSessions {
+                scope: SessionScope::Project,
+            })
+            .unwrap();
+        match events_until(&engine.events, |event| {
+            matches!(event, UiEvent::Sessions { .. })
+        })
+        .pop()
+        {
+            Some(UiEvent::Sessions {
+                current, sessions, ..
+            }) => {
+                assert_eq!(current, first_session);
+                let listed = sessions
+                    .iter()
+                    .find(|session| session.id == first_session)
+                    .unwrap_or_else(|| panic!("the chat is listed: {sessions:?}"));
+                assert!(listed.current);
+                assert_eq!(
+                    listed.title.as_deref(),
+                    Some("PARITY_SCENARIO:streaming_text")
+                );
+                assert!(listed.message_count >= 2, "{listed:?}");
+                // Where it belongs and how its turn ended; this engine's own session is
+                // not "open elsewhere".
+                // The engine reports its working directory, which is canonical on macOS
+                // (`/private/var/...` for the test's `/var/...`).
+                assert_eq!(
+                    listed
+                        .project
+                        .as_deref()
+                        .map(|project| fs::canonicalize(project).ok()),
+                    Some(fs::canonicalize(workspace).ok())
+                );
+                assert_eq!(listed.run_status, SessionRunStatus::Idle);
+                assert!(!listed.failed);
+                assert_eq!(listed.git_branch.as_deref(), Some("main"));
+            }
+            other => panic!("expected the session list, got {other:?}"),
+        }
+        // Every project's chats: this workspace was recorded when the engine started.
+        engine
+            .commands
+            .send(EngineCommand::ListSessions {
+                scope: SessionScope::All,
+            })
+            .unwrap();
+        match events_until(&engine.events, |event| {
+            matches!(event, UiEvent::Sessions { .. })
+        })
+        .pop()
+        {
+            Some(UiEvent::Sessions {
+                scope: SessionScope::All,
+                sessions,
+                ..
+            }) => assert!(
+                sessions.iter().any(|session| session.id == first_session),
+                "{sessions:?}"
+            ),
+            other => panic!("expected every project's sessions, got {other:?}"),
+        }
 
         // Interrupted at once, before the engine reached the prompt: nothing is
         // streamed and the turn ends as interrupted.
@@ -1976,11 +2703,74 @@ mod tests {
             without_notices(&turn_events(&engine.events)),
             vec![
                 UiEvent::Error {
-                    message: "/vim is not available in the full-screen UI yet.".into()
+                    message: "/vim is not available in the full-screen UI yet.".into(),
+                    detail: None
                 },
                 UiEvent::TurnFinished,
             ]
         );
+
+        // Reports: a notice until the UI shows report panels, then a report event.
+        let slash = |command: &str| EngineCommand::Slash {
+            command: command.into(),
+            args: String::new(),
+        };
+        engine.commands.send(slash("memory")).unwrap();
+        let memory = turn_events(&engine.events);
+        assert_eq!(without_notices(&memory), vec![UiEvent::TurnFinished]);
+        assert!(
+            notices(&memory)
+                .iter()
+                .any(|notice| notice.starts_with("Instruction files")),
+            "{memory:?}"
+        );
+        engine
+            .commands
+            .send(EngineCommand::Capabilities {
+                features: vec![CAPABILITY_QUESTIONS.into(), CAPABILITY_REPORTS.into()],
+                client: Some("terminal".into()),
+            })
+            .unwrap();
+        for (command, title) in [
+            ("memory", "Instruction files"),
+            ("doctor", "Doctor"),
+            ("init", "Project instructions"),
+        ] {
+            engine.commands.send(slash(command)).unwrap();
+            let events = without_notices(&turn_events(&engine.events));
+            match events.as_slice() {
+                [UiEvent::Report {
+                    command: sent,
+                    title: sent_title,
+                    sections,
+                    ..
+                }, UiEvent::TurnFinished] => {
+                    assert_eq!((sent.as_str(), sent_title.as_str()), (command, title));
+                    assert!(!sections.is_empty(), "{events:?}");
+                }
+                other => panic!("/{command}: a report, got {other:?}"),
+            }
+        }
+        assert!(
+            workspace.join("NEURON.md").is_file(),
+            "/init wrote NEURON.md"
+        );
+        // /usage needs a Zero-X login, and says so in a way a UI can act on.
+        engine.commands.send(slash("usage")).unwrap();
+        match without_notices(&turn_events(&engine.events)).as_slice() {
+            [UiEvent::Error {
+                detail: Some(detail),
+                ..
+            }, UiEvent::TurnFinished] => assert_eq!(detail.code, "sign_in_required"),
+            other => panic!("/usage signed out: an error with a detail, got {other:?}"),
+        }
+        engine
+            .commands
+            .send(EngineCommand::Capabilities {
+                features: Vec::new(),
+                client: None,
+            })
+            .unwrap();
 
         // SetModel switches for the next turn.
         engine
@@ -2012,6 +2802,158 @@ mod tests {
                 assert!(models.is_empty(), "{models:?}");
             }
             other => panic!("expected the model list, got {other:?}"),
+        }
+
+        // Resume the first chat: its conversation for the UI, then the footer on it.
+        engine
+            .commands
+            .send(EngineCommand::Resume {
+                session: first_session.clone(),
+            })
+            .unwrap();
+        let resumed = events_until(&engine.events, |event| {
+            matches!(event, UiEvent::Status { .. })
+        });
+        match without_notices(&resumed).as_slice() {
+            [UiEvent::Transcript {
+                session_id,
+                entries,
+                truncated: false,
+            }] => {
+                assert_eq!(session_id, &first_session);
+                assert_eq!(
+                    entries.first(),
+                    Some(&TranscriptEntry::User {
+                        text: "PARITY_SCENARIO:streaming_text".into()
+                    })
+                );
+                assert!(entries.contains(&TranscriptEntry::Assistant {
+                    text: "Mock streaming says hello from the parity harness.".into()
+                }));
+                assert!(
+                    entries.iter().any(|entry| matches!(
+                        entry,
+                        TranscriptEntry::ToolCall { name, .. } if name == "bash"
+                    )),
+                    "{entries:?}"
+                );
+                assert!(
+                    entries.iter().any(|entry| matches!(
+                        entry,
+                        TranscriptEntry::ToolResult { output, is_error: false, .. }
+                            if output.contains("approved via prompt")
+                    )),
+                    "{entries:?}"
+                );
+            }
+            other => panic!("expected the transcript, got {other:?}"),
+        }
+        assert!(
+            matches!(resumed.last(), Some(UiEvent::Status { session_id, .. }) if *session_id == first_session)
+        );
+        engine
+            .commands
+            .send(EngineCommand::Resume {
+                session: "no-such-chat".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            events_until(&engine.events, |event| matches!(
+                event,
+                UiEvent::Error { .. }
+            ))
+            .pop(),
+            Some(UiEvent::Error { .. })
+        ));
+
+        // Before trusting it: what the workspace would turn on, and where trust would go
+        // (the repository's root). Nothing in it starts.
+        let settings = workspace.join(".neuron").join("settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).expect("settings dir");
+        fs::write(
+            &settings,
+            r#"{"permissions":{"allow":["bash(cargo test)"]},"mcpServers":{"tools":{"command":"uvx"}}}"#,
+        )
+        .expect("workspace settings");
+        engine.commands.send(EngineCommand::TrustPreview).unwrap();
+        match events_until(&engine.events, |event| {
+            matches!(event, UiEvent::TrustPreview { .. })
+        })
+        .pop()
+        {
+            Some(UiEvent::TrustPreview {
+                root,
+                is_git_root: true,
+                session_only: false,
+                trusted: false,
+                mcp_servers,
+                permission_rules,
+                ..
+            }) => {
+                assert_eq!(
+                    fs::canonicalize(&root).ok(),
+                    fs::canonicalize(workspace).ok()
+                );
+                assert_eq!(mcp_servers[0].name, "tools");
+                assert_eq!(permission_rules[0].rule, "bash(cargo test)");
+            }
+            other => panic!("expected the trust preview, got {other:?}"),
+        }
+        fs::remove_file(&settings).expect("settings removed");
+
+        // Trust the workspace: recorded, and the footer says so; settings load on restart.
+        engine.commands.send(EngineCommand::TrustWorkspace).unwrap();
+        let trusted = events_until(&engine.events, |event| {
+            matches!(event, UiEvent::Status { .. })
+        });
+        let workspace_root = fs::canonicalize(workspace).ok();
+        assert!(
+            trusted.iter().any(|event| matches!(
+                event,
+                UiEvent::WorkspaceTrusted {
+                    restart_required: true,
+                    root: Some(root),
+                    session_only: false,
+                    ..
+                } if fs::canonicalize(root).ok() == workspace_root
+            )),
+            "{trusted:?}"
+        );
+        assert!(
+            matches!(
+                trusted.last(),
+                Some(UiEvent::Status {
+                    workspace_trusted: true,
+                    ..
+                })
+            ),
+            "{trusted:?}"
+        );
+
+        // The extensions: no MCP servers in this home, and the workspace's own skill.
+        let skill = workspace.join(".claw").join("skills").join("release-notes");
+        fs::create_dir_all(&skill).expect("skill dir");
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: release-notes\ndescription: Drafts release notes\n---\nWrite them.\n",
+        )
+        .expect("skill");
+        engine.commands.send(EngineCommand::ListExtensions).unwrap();
+        match next_event(&engine.events) {
+            UiEvent::Extensions {
+                mcp_servers,
+                skills,
+                ..
+            } => {
+                assert!(mcp_servers.is_empty(), "{mcp_servers:?}");
+                assert!(
+                    skills.iter().any(|skill| skill.name == "release-notes"
+                        && skill.description.as_deref() == Some("Drafts release notes")
+                        && skill.active),
+                    "{skills:?}"
+                );
+            }
+            other => panic!("expected the extensions, got {other:?}"),
         }
 
         // Shutdown while a turn waits for approval: the turn stops, the session is saved,
@@ -2125,6 +3067,77 @@ mod tests {
     }
 
     #[test]
+    fn mcp_servers_report_what_they_are_doing() {
+        let view = |starting: bool| McpRuntimeView {
+            starting,
+            running: vec!["docs".into(), "search".into(), "broken".into()],
+            pending: vec!["search".into()],
+            failed: vec![("broken".into(), "spawn failed".into())],
+            unsupported: vec![("remote".into(), "ws is not supported".into())],
+            tools: vec![
+                "mcp__docs__lookup".into(),
+                "mcp__docs__index".into(),
+                "mcp__search__query".into(),
+            ],
+        };
+        let live = view(false);
+        assert_eq!(
+            mcp_server_status("docs", Some(&live)),
+            (
+                "ready",
+                vec!["lookup".to_string(), "index".to_string()],
+                None
+            )
+        );
+        assert_eq!(
+            mcp_server_status("search", Some(&live)),
+            ("pending", Vec::new(), None)
+        );
+        assert_eq!(
+            mcp_server_status("broken", Some(&live)),
+            ("failed", Vec::new(), Some("spawn failed".to_string()))
+        );
+        assert_eq!(
+            mcp_server_status("remote", Some(&live)),
+            (
+                "unsupported",
+                Vec::new(),
+                Some("ws is not supported".to_string())
+            )
+        );
+        assert_eq!(
+            mcp_server_status("other", Some(&live)),
+            ("not_started", Vec::new(), None)
+        );
+        assert_eq!(
+            mcp_server_status("docs", Some(&view(true))),
+            ("starting", Vec::new(), None)
+        );
+        assert_eq!(
+            mcp_server_status("docs", None),
+            ("not_started", Vec::new(), None)
+        );
+    }
+
+    #[test]
+    fn definitions_read_the_skills_report() {
+        let report = serde_json::json!({
+            "skills": [
+                {"name": "plan", "description": "Plans work", "source": {"id": "project", "label": "Project"}, "active": true},
+                {"name": "plan", "description": null, "source": {"id": "user", "label": "User"}, "active": false},
+                {"description": "no name"}
+            ]
+        });
+        let skills = definitions(Some(report), "skills");
+        assert_eq!(skills.len(), 2);
+        assert_eq!(skills[0].source, "Project");
+        assert_eq!(skills[0].description.as_deref(), Some("Plans work"));
+        assert!(!skills[1].active);
+        assert_eq!(skills[1].description, None);
+        assert_eq!(definitions(None, "skills"), Vec::new());
+    }
+
+    #[test]
     fn the_footer_reads_git_status_headers() {
         let status = "## main...origin/main [ahead 1]\nM  src/lib.rs\n M README.md\n?? new.txt";
         let git = git_status(status);
@@ -2144,6 +3157,75 @@ mod tests {
         assert_eq!(
             git_status("## HEAD (no branch)").branch.as_deref(),
             Some("detached HEAD")
+        );
+    }
+
+    /// A saved conversation as a UI rebuilds it: prompts, replies, calls and results in
+    /// order, system messages left out, long texts shortened with JSON inputs still JSON.
+    #[test]
+    fn transcripts_carry_the_conversation_a_ui_shows() {
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage {
+                role: MessageRole::System,
+                blocks: vec![ContentBlock::Text {
+                    text: "Earlier messages were summarized.".into(),
+                }],
+                usage: None,
+            },
+            ConversationMessage::user_text("write the file"),
+            ConversationMessage::assistant(vec![
+                ContentBlock::Text {
+                    text: "Writing it.".into(),
+                },
+                ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({ "path": "a.txt", "content": "x".repeat(5_000) })
+                        .to_string(),
+                },
+            ]),
+            ConversationMessage::tool_result("t1", "write_file", "y".repeat(5_000), false),
+        ];
+        let UiEvent::Transcript {
+            session_id,
+            entries,
+            truncated,
+        } = transcript_event("s1", &session)
+        else {
+            panic!("a transcript");
+        };
+        assert_eq!((session_id.as_str(), truncated), ("s1", false));
+        assert_eq!(entries.len(), 4);
+        assert_eq!(
+            entries[..2],
+            [
+                TranscriptEntry::User {
+                    text: "write the file".into()
+                },
+                TranscriptEntry::Assistant {
+                    text: "Writing it.".into()
+                },
+            ]
+        );
+        let TranscriptEntry::ToolCall { input, .. } = &entries[2] else {
+            panic!("a tool call: {:?}", entries[2]);
+        };
+        let input: serde_json::Value = serde_json::from_str(input).expect("still JSON");
+        assert_eq!(input["path"], "a.txt");
+        assert!(input["content"]
+            .as_str()
+            .unwrap()
+            .ends_with("(1000 more characters)"));
+        let TranscriptEntry::ToolResult { output, .. } = &entries[3] else {
+            panic!("a tool result: {:?}", entries[3]);
+        };
+        assert!(output.ends_with("(1000 more characters)"));
+
+        assert_eq!(shorten("short", 10), "short");
+        assert_eq!(
+            shorten_json_strings("not json", 3),
+            "not\n\u{2026} (5 more characters)"
         );
     }
 

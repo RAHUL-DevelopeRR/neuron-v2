@@ -425,7 +425,7 @@ fn assemble_conversation_runtime(
     mut session: Session,
     session_id: &str,
     model: String,
-    system_prompt: Vec<String>,
+    mut system_prompt: Vec<String>,
     enable_tools: bool,
     output: TurnOutput,
     allowed_tools: Option<AllowedToolSet>,
@@ -439,6 +439,11 @@ fn assemble_conversation_runtime(
     // it and continues on it. Stored as people see it: provider setup on resume adds the
     // `openai/` routing prefix again where the transport needs it.
     session.model = Some(crate::provider::shown_model(&model).to_string());
+    // The prompt is kept across model switches: it names the model this runtime runs.
+    runtime::set_prompt_model(
+        &mut system_prompt,
+        crate::gateway_catalog::prompt_model_name(&model).as_deref(),
+    );
     let RuntimePluginState {
         feature_config,
         mut tool_registry,
@@ -776,6 +781,74 @@ fn shared_runtime_plugin_state_starting(
         let handle = shared.handle();
         *slot.borrow_mut() = Some(shared);
         Ok(handle)
+    })
+}
+
+/// What the MCP servers are doing now, as the shared state sees them.
+pub(crate) struct McpRuntimeView {
+    /// The servers still start in the background.
+    pub(crate) starting: bool,
+    /// Servers the manager runs (stdio).
+    pub(crate) running: Vec<String>,
+    /// Servers whose tools were not discovered.
+    pub(crate) pending: Vec<String>,
+    /// Servers that failed, with why.
+    pub(crate) failed: Vec<(String, String)>,
+    /// Servers with a transport Neuron does not speak yet, with why.
+    pub(crate) unsupported: Vec<(String, String)>,
+    /// The discovered tools, as `mcp__<server>__<tool>`.
+    pub(crate) tools: Vec<String>,
+}
+
+/// The engine's live MCP servers and plugins, for a UI's extensions view.
+pub(crate) struct ExtensionsSnapshot {
+    pub(crate) mcp: Option<McpRuntimeView>,
+    pub(crate) plugins: Vec<plugins::PluginSummary>,
+}
+
+/// The shared state's MCP servers and plugins as they are now, taking servers that
+/// finished starting in the background. `None` before any runtime was built on this
+/// thread.
+pub(crate) fn extensions_snapshot() -> Option<ExtensionsSnapshot> {
+    SHARED_PLUGIN_STATE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let state = slot.as_mut()?;
+        state.adopt_started_mcp();
+        let mcp = state.mcp_state.as_ref().map(|mcp| {
+            let mcp = mcp
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            McpRuntimeView {
+                starting: mcp.starting,
+                running: mcp.server_names(),
+                // Only servers still starting (round 4); failed ones are listed below.
+                pending: mcp.pending_servers().unwrap_or_default(),
+                failed: mcp
+                    .degraded_report
+                    .as_ref()
+                    .map(|report| {
+                        report
+                            .failed_servers
+                            .iter()
+                            .map(|failed| {
+                                (failed.server_name.clone(), failed.error.message.clone())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                unsupported: mcp
+                    .manager
+                    .unsupported_servers()
+                    .iter()
+                    .map(|server| (server.server_name.clone(), server.reason.clone()))
+                    .collect(),
+                tools: state.tool_registry.runtime_tool_names(),
+            }
+        });
+        Some(ExtensionsSnapshot {
+            mcp,
+            plugins: state.plugin_registry.summaries(),
+        })
     })
 }
 

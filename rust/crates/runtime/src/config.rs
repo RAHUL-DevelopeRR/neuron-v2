@@ -259,6 +259,74 @@ impl From<std::io::Error> for ConfigError {
     }
 }
 
+/// What a workspace's own settings files would turn on once the workspace is trusted, for
+/// the folder trust screen. Reading it parses the files and starts or runs nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkspaceTrustPreview {
+    /// The workspace's settings files that exist.
+    pub settings_files: Vec<PathBuf>,
+    pub hooks: Vec<PreviewHook>,
+    /// By name; a later file's server replaces an earlier one's, as when loading.
+    pub mcp_servers: Vec<PreviewMcpServer>,
+    /// Allow and ask rules (deny rules apply to untrusted workspaces too).
+    pub permission_rules: Vec<PreviewPermissionRule>,
+    /// Every other key trust would apply (`env`, `model`, `sandbox`, ...), sorted.
+    pub other_settings: Vec<String>,
+}
+
+/// A hook command a workspace file would run around tool calls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewHook {
+    /// `PreToolUse`, `PostToolUse` or `PostToolUseFailure`.
+    pub event: &'static str,
+    pub command: String,
+    pub source: PathBuf,
+}
+
+/// An MCP server a workspace file would start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewMcpServer {
+    pub name: String,
+    pub transport: McpTransport,
+    /// The program it starts or the host it connects to: never arguments, environment,
+    /// headers or credentials in the URL.
+    pub target: Option<String>,
+    pub source: PathBuf,
+}
+
+/// A permission rule a workspace file would add.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewPermissionRule {
+    /// `allow` or `ask`.
+    pub effect: &'static str,
+    pub rule: String,
+    pub source: PathBuf,
+}
+
+/// Hook events a settings file can name.
+const HOOK_EVENTS: [&str; 3] = ["PreToolUse", "PostToolUse", "PostToolUseFailure"];
+
+/// What a preview shows of an MCP server's address: the program, or the URL's host.
+fn mcp_preview_target(config: &McpServerConfig) -> Option<String> {
+    let host = |url: &str| {
+        let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        // Never credentials written into the URL.
+        let host = authority.rsplit('@').next().unwrap_or_default();
+        (!host.is_empty()).then(|| host.to_string())
+    };
+    match config {
+        McpServerConfig::Stdio(stdio) => {
+            let command = stdio.command.trim();
+            (!command.is_empty()).then(|| command.to_string())
+        }
+        McpServerConfig::Sse(remote) | McpServerConfig::Http(remote) => host(&remote.url),
+        McpServerConfig::Ws(socket) => host(&socket.url),
+        McpServerConfig::Sdk(sdk) => Some(sdk.name.clone()),
+        McpServerConfig::ManagedProxy(proxy) => host(&proxy.url),
+    }
+}
+
 /// Discovers config files and merges them into a [`RuntimeConfig`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigLoader {
@@ -462,6 +530,79 @@ impl ConfigLoader {
             feature_config,
             ignored_project_settings,
         })
+    }
+
+    /// What the workspace's own settings files would turn on once it is trusted, whatever
+    /// this loader's trust: read from the files, starting or running nothing. A file that
+    /// cannot be read or parsed is listed and contributes nothing.
+    #[must_use]
+    pub fn workspace_trust_preview(&self) -> WorkspaceTrustPreview {
+        let mut preview = WorkspaceTrustPreview::default();
+        let mut servers: BTreeMap<String, PreviewMcpServer> = BTreeMap::new();
+        let mut other = BTreeSet::new();
+        for entry in self.discover() {
+            if !is_workspace_entry(&entry) || !entry.path.is_file() {
+                continue;
+            }
+            preview.settings_files.push(entry.path.clone());
+            let Ok(Some(parsed)) = read_optional_json_object(&entry.path) else {
+                continue;
+            };
+            let object = parsed.object;
+            if let Some(hooks) = object.get("hooks").and_then(JsonValue::as_object) {
+                for event in HOOK_EVENTS {
+                    let commands = hooks.get(event).and_then(JsonValue::as_array);
+                    for command in commands.into_iter().flatten().filter_map(JsonValue::as_str) {
+                        preview.hooks.push(PreviewHook {
+                            event,
+                            command: command.to_string(),
+                            source: entry.path.clone(),
+                        });
+                    }
+                }
+            }
+            if let Some(mcp) = object.get("mcpServers").and_then(JsonValue::as_object) {
+                for (name, value) in mcp {
+                    let Ok(config) = parse_mcp_server_config(name, value, "trust preview") else {
+                        continue;
+                    };
+                    servers.insert(
+                        name.clone(),
+                        PreviewMcpServer {
+                            name: name.clone(),
+                            transport: config.transport(),
+                            target: mcp_preview_target(&config),
+                            source: entry.path.clone(),
+                        },
+                    );
+                }
+            }
+            if let Some(permissions) = object.get("permissions").and_then(JsonValue::as_object) {
+                for effect in ["allow", "ask"] {
+                    let rules = permissions.get(effect).and_then(JsonValue::as_array);
+                    for rule in rules.into_iter().flatten().filter_map(JsonValue::as_str) {
+                        preview.permission_rules.push(PreviewPermissionRule {
+                            effect,
+                            rule: rule.to_string(),
+                            source: entry.path.clone(),
+                        });
+                    }
+                }
+            }
+            // Everything an untrusted load would drop, less what is listed above.
+            let mut kept = object;
+            for key in retain_untrusted_workspace_keys(&mut kept) {
+                if !matches!(
+                    key.as_str(),
+                    "hooks" | "mcpServers" | "permissions.allow" | "permissions.ask"
+                ) {
+                    other.insert(key);
+                }
+            }
+        }
+        preview.mcp_servers = servers.into_values().collect();
+        preview.other_settings = other.into_iter().collect();
+        preview
     }
 
     /// Whether this loader treats the workspace as trusted. Code that reads
@@ -1684,6 +1825,111 @@ mod tests {
             .expect("time should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("runtime-config-{nanos}"))
+    }
+
+    /// A workspace whose files want hooks, MCP servers and rules, each of which would leave
+    /// a marker file if it ran: the preview lists them all and none runs.
+    #[test]
+    fn the_trust_preview_lists_what_a_workspace_turns_on_and_starts_nothing() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".neuron");
+        fs::create_dir_all(cwd.join(".neuron")).expect("project dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        let marker = cwd.join("ran.txt");
+        let marker_text = json_path(&marker);
+        fs::write(
+            cwd.join(".neuron").join("settings.json"),
+            format!(
+                r#"{{
+                  "hooks": {{"PreToolUse": ["echo hook > {marker_text}"], "PostToolUse": ["npm run lint"]}},
+                  "mcpServers": {{
+                    "postgres-tools": {{"command": "uvx", "args": ["pg-mcp", "--password=hunter2"], "env": {{"PGPASSWORD": "hunter2"}}}},
+                    "docs": {{"type": "http", "url": "https://user:secret@docs.example.com/mcp?key=1"}}
+                  }},
+                  "permissions": {{"allow": ["bash(npm test)"], "ask": ["write_file"], "deny": ["bash(rm -rf)"]}},
+                  "env": {{"A": "1"}},
+                  "model": "auto"
+                }}"#
+            ),
+        )
+        .expect("project settings");
+        fs::write(
+            cwd.join(".neuron").join("settings.local.json"),
+            r#"{"mcpServers": {"docs": {"command": "node", "args": ["docs.js"]}}}"#,
+        )
+        .expect("local settings");
+
+        let loader = ConfigLoader::new(&cwd, &home).with_project_trust(ProjectTrust::Untrusted);
+        let preview = loader.workspace_trust_preview();
+        assert_eq!(preview.settings_files.len(), 2, "{preview:?}");
+        let hooks: Vec<(&str, &str)> = preview
+            .hooks
+            .iter()
+            .map(|hook| (hook.event, hook.command.as_str()))
+            .collect();
+        assert_eq!(hooks.len(), 2);
+        assert_eq!(hooks[1], ("PostToolUse", "npm run lint"));
+        let servers: Vec<(&str, McpTransport, Option<&str>)> = preview
+            .mcp_servers
+            .iter()
+            .map(|server| {
+                (
+                    server.name.as_str(),
+                    server.transport,
+                    server.target.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            servers,
+            vec![
+                ("docs", McpTransport::Stdio, Some("node")),
+                ("postgres-tools", McpTransport::Stdio, Some("uvx")),
+            ],
+            "the local file's server replaces the project's"
+        );
+        let rules: Vec<(&str, &str)> = preview
+            .permission_rules
+            .iter()
+            .map(|rule| (rule.effect, rule.rule.as_str()))
+            .collect();
+        assert_eq!(
+            rules,
+            vec![("allow", "bash(npm test)"), ("ask", "write_file")]
+        );
+        assert_eq!(preview.other_settings, vec!["env", "model"]);
+        let shown = format!("{preview:?}");
+        assert!(
+            !shown.contains("hunter2"),
+            "no arguments or environment: {shown}"
+        );
+        assert!(
+            !shown.contains("secret"),
+            "no credentials from a URL: {shown}"
+        );
+        assert!(!marker.exists(), "nothing ran");
+
+        // A remote server shows its host only.
+        fs::remove_file(cwd.join(".neuron").join("settings.local.json")).expect("remove");
+        let preview = loader.workspace_trust_preview();
+        let docs = preview
+            .mcp_servers
+            .iter()
+            .find(|server| server.name == "docs")
+            .expect("the http server");
+        assert_eq!(docs.transport, McpTransport::Http);
+        assert_eq!(docs.target.as_deref(), Some("docs.example.com"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_workspace_without_settings_previews_nothing() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("dir");
+        let preview = ConfigLoader::new(&root, root.join("home")).workspace_trust_preview();
+        assert_eq!(preview, super::WorkspaceTrustPreview::default());
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     fn json_path(path: &std::path::Path) -> String {

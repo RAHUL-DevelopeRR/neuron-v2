@@ -228,6 +228,7 @@ fn streamed_text(events: &[AssistantEvent]) -> String {
 /// errors keep their own retry semantics (`is_retryable`); transport-level
 /// failures, including truncated streams, are treated as interruptions.
 pub(crate) fn classify_stream_read_error(session_id: &str, error: &api::ApiError) -> StreamFailure {
+    crate::error_detail::record_model_call_failure(error);
     let detail = format_user_visible_api_error(session_id, error);
     match error {
         api::ApiError::Api { .. }
@@ -253,6 +254,7 @@ pub(crate) fn classify_stream_read_error(session_id: &str, error: &api::ApiError
 /// Context-window rejections keep a typed kind so the runtime can shrink the
 /// context and retry once.
 pub(crate) fn fatal_api_error(session_id: &str, error: &api::ApiError) -> StreamFailure {
+    crate::error_detail::record_model_call_failure(error);
     let kind = if error.is_context_window_failure() {
         RuntimeErrorKind::ContextWindowExceeded
     } else {
@@ -483,6 +485,7 @@ impl ApiClient for AnthropicRuntimeClient {
         };
         let deferred_count = deferred_mcp_tools.len();
         let mut message_request = self.message_request(&request, deferred_mcp_tools);
+        crate::error_detail::clear_model_call_failure();
 
         let (result, dropped_deferred_tools) = self.runtime.block_on(async {
             // One retry state for the whole model call: the stream retry
@@ -496,7 +499,10 @@ impl ApiClient for AnthropicRuntimeClient {
                     .consume_stream(&message_request, after_tool_results, cancel, &progress)
                     .await
                 {
-                    Ok(events) => return (Ok(events), dropped_deferred_tools),
+                    Ok(events) => {
+                        crate::error_detail::clear_model_call_failure();
+                        return (Ok(events), dropped_deferred_tools);
+                    }
                     Err(StreamFailure::Fatal(error))
                         if error.kind() == RuntimeErrorKind::ContextWindowExceeded
                             && deferred_count > 0
