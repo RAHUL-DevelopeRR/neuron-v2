@@ -10,10 +10,22 @@ cd your-project
 neuron
 ```
 
-The first time you run Neuron in a directory it asks whether you trust it; Neuron
-reads, writes and runs commands only after you agree. Type a request, or a slash
-command such as `/help`. Press Ctrl+C to interrupt the current turn and `/exit` to
-leave.
+On a terminal, `neuron` opens the full-screen UI, `neuron-tui`, which the installers
+and launchers put beside `neuron`. Type a request, or a slash command such as `/help`.
+Approve or deny tool calls in its dialog (Esc denies; Ctrl+C denies and interrupts the
+turn), sign in with `/login` and pick a model with `/model`. Ctrl+C interrupts the
+current turn, and `/exit` or Ctrl+C twice quits. `neuron --continue` reopens the
+latest chat for this folder, and `neuron --continue CHAT` a given one. Shell commands
+typed in the UI (`!cmd`, `/bash`) are not available yet.
+
+The UI does not ask whether you trust the folder: until you do, the folder's own
+settings, hooks and MCP servers are not loaded, and `/status` says how to trust it
+(see [Workspace trust](#workspace-trust)).
+
+`neuron --no-tui` (or `NEURON_NO_TUI=1`) keeps the line REPL, which also runs when the
+UI is missing. The first time you run it in a directory it asks whether you trust it;
+Neuron reads, writes and runs commands only after you agree. Press Ctrl+C to interrupt
+the current turn and `/exit` to leave.
 
 For one-off and scripted use:
 
@@ -22,7 +34,14 @@ neuron prompt "summarize the open TODOs in src/"     # one prompt, then exit
 neuron "summarize Cargo.toml"                        # shorthand for the same
 neuron --output-format json prompt "list the public functions in lib.rs"
 neuron --compact "summarize Cargo.toml" | wc -l      # final answer only, for pipes
+git diff | neuron prompt "review this change"        # piped input goes with the prompt
 ```
+
+Piped standard input is sent to the model with the prompt, up to 128 KiB; with a prompt
+on the command line, a pipe that sends nothing for 500 ms is not waited for. In a
+script or CI, `neuron prompt` asks nothing: see [Permission modes](#permission-modes)
+for what happens to tool calls that need approval, and why such a run can exit with
+code 2.
 
 ## Sign in
 
@@ -49,7 +68,8 @@ printf '%s' "$ZEROX_API_KEY" | neuron auth login --with-token
 You can also set `NEURON_TOKEN` to a key or session for a single process; it takes
 precedence over the stored login and over any provider choice, and is not saved.
 Neuron removes it (and any other `ses_…` or `nzx_…` value) from the environment of the
-commands, hooks and MCP servers it starts. `neuron auth logout` does not clear it, so
+commands, plugin tools and MCP servers it starts; hooks run with Neuron's own
+environment and do see it. `neuron auth logout` does not clear it, so
 unset it yourself. `NEURON_API_BASE` changes the gateway URL (default
 `https://zero-x.live/v1`; plain HTTP is accepted only for a loopback address).
 
@@ -78,7 +98,7 @@ Neuron reports gateway limits with the reason and what to do next:
 | `upgrade_required` | The model is not in your plan | Stops and shows the upgrade link. |
 | `insufficient_credits` | Paid capacity needed, credit balance too low | Stops and shows the upgrade link. |
 | `region_unavailable` | The free pool is not offered in your region | Stops; choose another model. |
-| `context_length_exceeded` | No available model fits the request | Stops; shorten the prompt or `/compact` the session. |
+| `context_length_exceeded` | No available model fits the request, including a prompt above a free model's per-minute token budget | Stops with the gateway's message and, when a paid pool would take the request, the upgrade link; shorten the prompt or `/compact` the session. |
 | `invalid_session` | The credential expired or was revoked | Stops and asks you to run `neuron auth login`. |
 
 Waits between retries do not count toward the first-token timeout (90 seconds, 60
@@ -121,10 +141,19 @@ A shell command (bash or PowerShell) counts as read-only only when every command
 the line is a known read-only program with safe arguments, writes nowhere except
 `/dev/null` and names no path outside the workspace; pipes, `&&`, redirections and
 substitutions are all checked. When Neuron asks, it shows the tool, the mode it needs,
-the reason and the input, and runs the call only if you answer `y`. `neuron prompt`
-reads the answer from standard input, so with no input (or anything but `y`) the call
-is denied. `permissions` rules in settings can allow or deny tools and command
-prefixes in advance, for example `{"permissions": {"allow": ["bash(git:*)"]}}`.
+the reason and the input, and runs the call only if you answer `y`; when standard
+output is redirected, the question goes to standard error. When standard output and
+standard error are both redirected, nobody would see the question, so the call is
+denied instead.
+
+`neuron prompt` asks only when standard input is a terminal. In a script or CI
+(standard input a pipe, a file or `/dev/null`) a call that needs approval is denied
+without asking, the model is told that nothing ran, and questions from the model are
+refused so it decides itself. After 5 denied calls the turn stops. A run that denied a
+call ends with a warning naming the denied tools and exits with code 2.
+
+`permissions` rules in settings can allow or deny tools and command prefixes in
+advance, for example `{"permissions": {"allow": ["bash(git:*)"]}}`.
 
 Choose the mode with `--permission-mode MODE`, switch inside a session with
 `/permissions MODE`, or set a default in settings:
@@ -207,8 +236,11 @@ startup:
 So while you are signed in to Zero-X, keys in the environment are ignored until you
 select their provider. Requests then go straight to that provider under your account
 and its terms; Zero-X limits and credits do not apply. The key stays in memory and is
-not exported to the commands Neuron runs (keys you exported yourself are, of course,
-already in their environment).
+not exported to the commands Neuron runs, and Neuron removes provider keys and any
+variable named `*_API_KEY`, `*_TOKEN` or `*_SECRET` from the environment of the
+commands, plugin tools and MCP servers it starts, including keys you exported yourself
+(a value set in an MCP server's `env` still applies). Hooks are the exception: they run
+with Neuron's own environment, including any keys you exported.
 
 ## Configuration files
 
@@ -266,7 +298,10 @@ or put it in your user settings.
 | `NEURON_CONFIG_HOME` | neuron | Settings directory (default `~/.neuron`) |
 | `NEURON_HOME` | neuron | Directory for the login file and caches (default `~/.neuroncli`); setting it also keeps the login out of the OS credential store |
 | `NEURON_CREDENTIAL_STORE` | neuron | `file` or `keychain`: force where the login is kept |
-| `NEURON_VERSION` | install.sh, install.ps1 | Release to install (default: latest) |
+| `NEURON_TRUST_WORKSPACE=1` | neuron | Trust the current directory in a headless run (only for checkouts you trust) |
+| `NEURON_NO_TUI=1` | neuron | Use the line REPL instead of the full-screen UI |
+| `NEURON_TUI_ASCII` | neuron-tui | `1` draws with the classic-console character set everywhere, `0` with the Unicode one |
+| `NEURON_VERSION` | install.sh, install.ps1 | Release to install (default: the latest release; a prerelease such as `7.0.0-alpha.1` must be named) |
 | `NEURON_INSTALL_DIR` | install.sh, install.ps1 | Install directory |
 | `NEURON_BINARY_PATH` | npm and pip launchers | Run this binary instead of the downloaded one |
 | `NEURON_CACHE_DIR` | npm and pip launchers | Where downloaded binaries are cached |
@@ -277,10 +312,10 @@ or put it in your user settings.
 
 | Installed with | Update | Uninstall |
 | --- | --- | --- |
-| `install.sh` | Run it again | `rm ~/.local/bin/neuron` |
-| `install.ps1` | Run it again | Delete `%LOCALAPPDATA%\Programs\Neuron` and remove it from your user `PATH` if you added it |
-| npm | `npm install --global @zero-x.live/neuron@latest` | `npm uninstall --global @zero-x.live/neuron` |
-| pip | `pipx upgrade neuroncli` or `pip install --upgrade neuroncli` | `pipx uninstall neuroncli` or `pip uninstall neuroncli` |
+| `install.sh` | Run it again with the new version: that version's release URL and `--version` (or `NEURON_VERSION`). Without a version it installs the latest stable release, and there is none yet | `rm ~/.local/bin/neuron ~/.local/bin/neuron-tui` |
+| `install.ps1` | Run it again with the new version: that version's release URL and `-Version` (or `NEURON_VERSION`). Without a version it installs the latest stable release, and there is none yet | Delete `%LOCALAPPDATA%\Programs\Neuron\bin` and remove it from your user `PATH` if you added it |
+| npm | `npm install --global @zero-x.live/neuron@next` during the alpha (`@latest` once a stable release is out) | `npm uninstall --global @zero-x.live/neuron` |
+| pip | Not available during the alpha, which is not on PyPI. For a prerelease on PyPI, `pip install --upgrade --pre neuroncli` | `pipx uninstall neuroncli` or `pip uninstall neuroncli` |
 
 Neuron keeps your login in the OS credential store or `~/.neuroncli/`, and your
 settings in `~/.neuron/`; the launchers cache binaries in `~/.cache/neuroncli` (Linux), `~/Library/Caches/neuroncli`

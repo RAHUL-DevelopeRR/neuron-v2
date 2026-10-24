@@ -115,6 +115,12 @@ export function getDirenvExport(envrcDir: string): Record<string, string | null>
  *   (`NEURON_TRUST_WORKSPACE`);
  * - route prompts, and the code in them, to an account or endpoint it controls
  *   (`ANTHROPIC_API_KEY`, `OPENAI_BASE_URL`, ...);
+ * - point the engine at a config home it wrote (`CLAW_CONFIG_HOME`, `HOME`,
+ *   `USERPROFILE`), whose settings load as the user's own, always trusted,
+ *   with hooks, MCP servers, full access and `trustedRoots`;
+ * - add git config at global or command scope (`GIT_CONFIG_GLOBAL`,
+ *   `GIT_CONFIG_COUNT`, `XDG_CONFIG_HOME`, `HOME`, ...), such as an fsmonitor
+ *   that a read-only `git status` would run without asking;
  * - preload code into Node or Bun (`NODE_OPTIONS`), or make a MITM proxy
  *   trusted (`NODE_EXTRA_CA_CERTS`, `NODE_TLS_REJECT_UNAUTHORIZED`).
  * `direnv allow` is consent to the repo's env for the repo's tooling, not to
@@ -133,6 +139,20 @@ export const STEERING_ENV_VAR_PATTERNS: readonly RegExp[] = [
   /^NEURON_/,
   // The providers the engine can use: credentials, endpoints, models.
   /^(ANTHROPIC|OPENAI|AZURE_OPENAI|XAI|GROK|DASHSCOPE|OPENROUTER|MISTRAL|CLAWD)_/,
+  // The engine's compatibility knobs (`CLAW_CONFIG_HOME` picks its settings home).
+  /^CLAW_/,
+  // More compatibility knobs the engine reads: `RUSTY_CLAUDE_PERMISSION_MODE` sets its
+  // default permission mode (full access included); `CLAUDE_CONFIG_DIR` and
+  // `CLAUDE_CONFIG_HOME` add config, skill and agent roots.
+  /^RUSTY_CLAUDE_/,
+  /^CLAUDE_/,
+  // Home and config directories: the engine's user settings (~/.neuron) and git's
+  // global config (~/.gitconfig, $XDG_CONFIG_HOME/git/config) live under them.
+  /^HOME$/,
+  /^USERPROFILE$/,
+  /^XDG_CONFIG_HOME$/,
+  // Git config at global, system or command scope (GIT_CONFIG_GLOBAL, GIT_CONFIG_COUNT, ...).
+  /^GIT_CONFIG/,
   /^NEXT_PUBLIC_/,
   /^OVERRIDE_(TARGET|PLATFORM|ARCH)$/,
   /^NODE_OPTIONS$/,

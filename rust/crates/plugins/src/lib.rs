@@ -1660,15 +1660,15 @@ fn detect_claude_code_manifest_contract_gaps(
     for (field, detail) in [
         (
             "skills",
-            "plugin manifest field `skills` uses the Claude Code plugin contract; `claw` does not load plugin-managed skills and instead discovers skills from local roots such as `.claw/skills`, `.omc/skills`, `.agents/skills`, `~/.omc/skills`, and `~/.claude/skills/omc-learned`.",
+            "plugin manifest field `skills` is not supported: Neuron does not load plugin-managed skills; it finds skills in local roots such as `.claw/skills`, `.omc/skills`, `.agents/skills`, `~/.omc/skills` and `~/.claude/skills/omc-learned`.",
         ),
         (
             "mcpServers",
-            "plugin manifest field `mcpServers` uses the Claude Code plugin contract; `claw` does not import MCP servers from plugin manifests.",
+            "plugin manifest field `mcpServers` is not supported: Neuron does not import MCP servers from plugin manifests; add them to `mcpServers` in your settings instead.",
         ),
         (
             "agents",
-            "plugin manifest field `agents` uses the Claude Code plugin contract; `claw` does not load plugin-managed agent markdown catalogs from plugin manifests.",
+            "plugin manifest field `agents` is not supported: Neuron does not load agent definitions from plugin manifests.",
         ),
     ] {
         if root.contains_key(field) {
@@ -1684,7 +1684,7 @@ fn detect_claude_code_manifest_contract_gaps(
         .is_some_and(|commands| commands.iter().any(Value::is_string))
     {
         errors.push(PluginManifestValidationError::UnsupportedManifestContract {
-            detail: "plugin manifest field `commands` uses Claude Code-style directory globs; `claw` slash dispatch is still built-in and does not load plugin slash command markdown files.".to_string(),
+            detail: "plugin manifest field `commands` lists command files or directories, which are not supported: Neuron's slash commands are built in, and it does not load slash commands from plugin markdown files.".to_string(),
         });
     }
 
@@ -1696,7 +1696,7 @@ fn detect_claude_code_manifest_contract_gaps(
             ) {
                 errors.push(PluginManifestValidationError::UnsupportedManifestContract {
                     detail: format!(
-                        "plugin hook `{hook_name}` uses the Claude Code lifecycle contract; `claw` plugins currently support only PreToolUse, PostToolUse, and PostToolUseFailure."
+                        "plugin hook `{hook_name}` is not supported: Neuron plugins support only PreToolUse, PostToolUse and PostToolUseFailure hooks."
                     ),
                 });
             }
@@ -2699,11 +2699,17 @@ mod tests {
         let error = load_plugin_from_directory(&root)
             .expect_err("Claude Code plugin manifest should fail with guidance");
         let rendered = error.to_string();
-        assert!(rendered.contains("field `skills` uses the Claude Code plugin contract"));
-        assert!(rendered.contains("field `mcpServers` uses the Claude Code plugin contract"));
-        assert!(rendered.contains("field `agents` uses the Claude Code plugin contract"));
-        assert!(rendered.contains("field `commands` uses Claude Code-style directory globs"));
-        assert!(rendered.contains("hook `SessionStart` uses the Claude Code lifecycle contract"));
+        assert!(rendered.contains("field `skills` is not supported: Neuron does not load"));
+        assert!(rendered.contains("field `mcpServers` is not supported: Neuron does not import"));
+        assert!(rendered.contains("field `agents` is not supported: Neuron does not load"));
+        assert!(rendered.contains("field `commands` lists command files or directories"));
+        assert!(
+            rendered.contains("hook `SessionStart` is not supported: Neuron plugins support only")
+        );
+        // The messages speak for Neuron and name no other product or its binary.
+        assert!(!rendered.contains("Claude"), "{rendered}");
+        assert!(!rendered.contains("claw "), "{rendered}");
+        assert!(!rendered.contains("`claw`"), "{rendered}");
 
         let _ = fs::remove_dir_all(root);
     }

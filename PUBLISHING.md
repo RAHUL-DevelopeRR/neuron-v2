@@ -35,18 +35,24 @@ published release are never rebuilt or replaced.
 - Bump the version everywhere at once: `rust/Cargo.toml` (`[workspace.package]`),
   `rust/Cargo.lock`, `npm/neuroncli/package.json`, `npm/neuroncli/package-lock.json`,
   `pyproject.toml` and `PACKAGE_VERSION` in `neuron_cli/__init__.py`.
-  `python -m unittest tests.test_packaging_metadata` fails if any of them disagree, and
-  the release workflow refuses a tag that does not match.
+  `python -m unittest discover -s tests -p test_packaging_metadata.py` fails if any of
+  them disagree, and the release workflow refuses a tag that does not match.
+- A version with a suffix, such as `7.0.0-alpha.1`, is a prerelease. Spell it the same
+  way in every one of those files, `pyproject.toml` and `PACKAGE_VERSION` included:
+  the workflow and the launchers compare the raw string, and only the built wheel and
+  sdist file names use the PEP 440 form (`7.0.0a1`). The workflow publishes a
+  prerelease on GitHub without ever marking it "Latest", and npm gets it under the
+  `next` dist-tag.
 - In [CHANGELOG.md](CHANGELOG.md), rename `## X.Y.Z (unreleased)` to
   `## X.Y.Z (YYYY-MM-DD)`. The release notes are taken from that section.
 - Run the checks from [CONTRIBUTING.md](CONTRIBUTING.md#checks): Rust fmt, clippy and
   tests, the Python and Node packaging tests, and the notices generator.
 - Check that the docs describe the binary you are about to ship. The README,
-  [USAGE.md](USAGE.md) and [SECURITY.md](SECURITY.md) describe the 6.3.0 behavior
+  [USAGE.md](USAGE.md) and [SECURITY.md](SECURITY.md) describe the 7.0.0-alpha.1 behavior
   that `rusty-claude-cli/tests/gateway_roundtrip.rs` exercises against a fake gateway
   and that was exercised live against a local gateway during integration. On the
   release candidate, confirm at least:
-  - `neuron auth login` (browser and `--with-token`), `neuron auth status` and
+  - `neuron auth login` (device code and `--with-token`), `neuron auth status` and
     `neuron auth logout`, with the login kept in the OS credential store on macOS
     and Windows and in `~/.neuroncli/credentials.json` (mode 0600) on Linux;
   - `NEURON_TOKEN` with a session token and with a personal API key (`nzx_…`);
@@ -58,8 +64,9 @@ published release are never rebuilt or replaced.
     90 seconds per retry (180 seconds in total) with a countdown, other transient
     errors retry at most twice within 60 seconds;
   - credential scrubbing: the session token is not exported into the environment,
-    and `NEURON_TOKEN` and other `ses_`/`nzx_` values are removed from the
-    environment of shell commands, hooks and MCP servers;
+    and `NEURON_TOKEN`, provider keys, `*_API_KEY`, `*_TOKEN` and `*_SECRET`
+    variables and other `ses_`/`nzx_` values are removed from the environment of
+    shell commands, hooks and MCP servers;
   - `neuron system-prompt` in an empty directory stays under 10,000 characters (the
     bundled skills are listed, not pasted).
 
@@ -75,8 +82,8 @@ From the merge commit on the default branch:
 
 ```sh
 git switch ux-audit-fixes && git pull --ff-only
-git tag -a v6.3.0 -m "Neuron 6.3.0"
-git push origin v6.3.0
+git tag -a v7.0.0-alpha.1 -m "Neuron 7.0.0-alpha.1"
+git push origin v7.0.0-alpha.1
 ```
 
 The tag push starts the release workflow:
@@ -84,12 +91,12 @@ The tag push starts the release workflow:
 | Job | What it does |
 | --- | --- |
 | `metadata` | Checks that the tag and every manifest carry the same version, and whether the tag's release is already published |
-| `build` | Builds and smoke-tests `neuron` for linux-x64 and linux-arm64 (on Ubuntu 22.04: `ubuntu-22.04` and `ubuntu-22.04-arm`; fails if a binary needs a glibc newer than 2.35), macos-arm64, macos-x64 and windows-x64, and writes `<asset>.sha256` |
-| `attest` | Records GitHub build provenance for the five binaries |
-| `notices` | Generates `THIRD_PARTY_NOTICES.md` from `cargo metadata` |
+| `build` | Builds and smoke-tests `neuron` and `neuron-tui` for linux-x64 and linux-arm64 (on Ubuntu 22.04: `ubuntu-22.04` and `ubuntu-22.04-arm`; fails if a binary needs a glibc newer than 2.35), macos-arm64, macos-x64 and windows-x64, and writes `<asset>.sha256` |
+| `attest` | Records GitHub build provenance for the ten binaries (`neuron` and `neuron-tui` for each target) |
+| `notices` | Generates `THIRD_PARTY_NOTICES.md` from `cargo metadata` and the UI's installed npm packages |
 | `release` | Writes `SHA256SUMS`, creates a draft release with all assets, checks the uploaded list, then publishes the release without marking it "Latest" |
 | `readiness` | HEAD-checks every public asset URL and verifies the downloaded files against `SHA256SUMS` |
-| `install-check` | Installs from the public release with `install.sh` (Linux x64 and arm64, macOS) and with `irm \| iex` (Windows PowerShell 5.1), then runs `neuron --version` |
+| `install-check` | Installs from the public release with `install.sh` (Linux x64 and arm64, macOS) and with `irm \| iex` (Windows PowerShell 5.1), pinned to the release's version, then runs `neuron --version` and `neuron-tui --version` |
 | `promote` | Marks the release "Latest" once `install-check` passes, unless it is a prerelease, was withdrawn (marked as a prerelease) or a newer release is already latest. `install.sh`, `install.ps1` and the `releases/latest` links move to the new version only at this point |
 | `package-npm`, `package-pypi` | Pack the npm tarball, or build the wheel and sdist, and install them against the live release. They have no OIDC token, and the npm install runs with `--ignore-scripts` followed by an `npm rebuild` of this package only |
 | `publish-npm`, `publish-pypi` | Hold the trusted-publishing OIDC token. They check out nothing and install nothing; they check that the files are the ones the package job tested (SHA-256) and upload them. They run only when enabled (see below) |
@@ -116,39 +123,45 @@ The release must have these 24 assets:
 Check them yourself before publishing anywhere else:
 
 ```sh
-gh release view v6.3.0 --repo RAHUL-DevelopeRR/neuron-v2
-gh release download v6.3.0 --repo RAHUL-DevelopeRR/neuron-v2 --dir neuron-6.3.0
-cd neuron-6.3.0 && sha256sum --check SHA256SUMS
+gh release view v7.0.0-alpha.1 --repo RAHUL-DevelopeRR/neuron-v2
+gh release download v7.0.0-alpha.1 --repo RAHUL-DevelopeRR/neuron-v2 --dir neuron-7.0.0-alpha.1
+cd neuron-7.0.0-alpha.1 && sha256sum --check SHA256SUMS
 gh attestation verify neuron-linux-x64 --repo RAHUL-DevelopeRR/neuron-v2
 ```
 
-On a clean machine of each kind you can reach, install with the documented commands,
+On a clean machine of each kind you can reach, install with the commands in the
+release notes, which name the version (a prerelease has no `releases/latest` link),
 then run `neuron --version`, `neuron auth login`, a short prompt through the gateway
 and `/usage`.
 
 Once `promote` has passed, `gh release view --repo RAHUL-DevelopeRR/neuron-v2` (no tag)
-shows the new version. If `promote` did not run or skipped the release, mark it latest
-yourself when you are satisfied: `gh release edit v6.3.0 --latest`.
+shows the new version. If `promote` did not run or skipped a stable release, mark it
+latest yourself when you are satisfied: `gh release edit vX.Y.Z --latest`. Never do
+this for a prerelease such as `v7.0.0-alpha.1`: `promote` skips prereleases on
+purpose, and a prerelease stays out of `releases/latest`.
 
 ## 5. Publish to npm
 
 Either dispatch the workflow on the tag (Actions, Release, Run workflow, "Use workflow
-from" `v6.3.0`, tick `publish_npm`), or publish from a maintainer machine:
+from" `v7.0.0-alpha.1`, tick `publish_npm`), or publish from a maintainer machine:
 
 ```sh
-git switch --detach v6.3.0
+git switch --detach v7.0.0-alpha.1
 cd npm/neuroncli
 npm pack
 # --ignore-scripts: dependency install scripts never run where your npm login is
-npm install --global --ignore-scripts ./zero-x.live-neuron-6.3.0.tgz
+npm install --global --ignore-scripts ./zero-x.live-neuron-7.0.0-alpha.1.tgz
 npm rebuild --global @zero-x.live/neuron   # this package's postinstall: downloads the binary
 neuron --version
-npm publish ./zero-x.live-neuron-6.3.0.tgz --access public   # asks for your 2FA code
+# a prerelease goes to `next`; without --tag it would become `latest`
+npm publish ./zero-x.live-neuron-7.0.0-alpha.1.tgz --access public --tag next   # asks for your 2FA code
 ```
+
+For a stable release, leave out `--tag next`.
 
 The dispatched run does not rebuild or re-upload anything on the published release:
 `package-npm` packs and tests the tarball, then `publish-npm` publishes exactly that
-file. Prereleases (`6.4.0-rc.1`) go to the `next` dist-tag.
+file. Prereleases (`7.0.0-alpha.2`) go to the `next` dist-tag.
 
 ## 6. Publish to PyPI (paused)
 
@@ -159,21 +172,24 @@ against the live release; `publish-pypi` then uploads those exact files. By hand
 
 ```sh
 python -m build && python -m twine check --strict dist/*
-python -m zipfile -l dist/neuroncli-6.3.0-py3-none-any.whl   # neuron_cli/__init__.py + dist-info only
+python -m zipfile -l dist/neuroncli-7.0.0a1-py3-none-any.whl   # neuron_cli/__init__.py + dist-info only (PEP 440 spells 7.0.0-alpha.1 as 7.0.0a1)
 python -m twine upload dist/*
 ```
 
 ## 7. Deprecate old builds
 
-The builds that predate this pipeline do not match the release binaries:
+The builds that predate this pipeline do not match the release binaries. Do this with
+the first stable release, not with 7.0.0-alpha.1: while the only new version is a
+prerelease on `next`, npm's `latest` is still 6.2.0, and deprecating it would leave the
+default install deprecated with a message that points back at `latest`.
 
 ```sh
-npm deprecate @zero-x.live/neuron@6.2.0 "Unsupported build; install @zero-x.live/neuron@latest (6.3.0 or later)"
-npm dist-tag ls @zero-x.live/neuron    # latest must point at the new version
+npm deprecate @zero-x.live/neuron@6.2.0 "Unsupported build; install @zero-x.live/neuron@latest (7.0.0 or later)"
+npm dist-tag ls @zero-x.live/neuron    # latest must point at the new stable version
 ```
 
 On PyPI, yank `neuroncli` 6.2.4 and older (project, Manage, the release, Options,
-Yank) with the reason "Unsupported build; install 6.3.0 or later". Yanked versions stay
+Yank) with the reason "Unsupported build; install 7.0.0 or later". Yanked versions stay
 installable when pinned exactly, so existing pins keep working.
 
 ## 8. After the release

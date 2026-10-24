@@ -8,7 +8,7 @@ Requires Node.js 22.14 or later on Linux (x64, arm64, glibc), macOS (Apple
 silicon, Intel) or Windows (x64).
 
 ```sh
-npm install --global @zero-x.live/neuron
+npm install --global @zero-x.live/neuron@next   # the 7.0.0 alpha
 neuron auth login
 neuron
 ```
@@ -17,9 +17,10 @@ neuron
 
 Neuron is a native Rust program. This package contains a small launcher:
 
-- `postinstall` downloads `neuron-<platform>` for this exact package version
-  from the project's GitHub Releases and checks it against the release's
-  SHA-256 file before installing it next to the launcher.
+- `postinstall` downloads `neuron-<platform>` and the full-screen UI,
+  `neuron-tui-<platform>`, for this exact package version from the project's
+  GitHub Releases and checks each against the release's SHA-256 file before
+  installing it next to the launcher.
 - If install scripts were skipped (`npm install --ignore-scripts`) or the
   download failed because of the network, the first `neuron` run downloads and
   verifies it instead. If the package directory is read-only, the binary goes
@@ -56,5 +57,5 @@ to override or disable them.
 - [Plans and pricing](https://zero-x.live/pricing)
 - [Security policy](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/SECURITY.md)
 
-MIT licensed; see `LICENSE` and `NOTICE`. Prompts and code you send are
-processed by third-party model providers.
+MIT licensed; the full-screen UI it downloads is Apache-2.0 (see `NOTICE`).
+Prompts and code you send are processed by third-party model providers.

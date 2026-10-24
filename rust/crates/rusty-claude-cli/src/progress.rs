@@ -425,7 +425,7 @@ fn assemble_conversation_runtime(
     mut session: Session,
     session_id: &str,
     model: String,
-    system_prompt: Vec<String>,
+    mut system_prompt: Vec<String>,
     enable_tools: bool,
     output: TurnOutput,
     allowed_tools: Option<AllowedToolSet>,
@@ -439,6 +439,11 @@ fn assemble_conversation_runtime(
     // it and continues on it. Stored as people see it: provider setup on resume adds the
     // `openai/` routing prefix again where the transport needs it.
     session.model = Some(crate::provider::shown_model(&model).to_string());
+    // The prompt is kept across model switches: it names the model this runtime runs.
+    runtime::set_prompt_model(
+        &mut system_prompt,
+        crate::gateway_catalog::prompt_model_name(&model).as_deref(),
+    );
     let RuntimePluginState {
         feature_config,
         mut tool_registry,

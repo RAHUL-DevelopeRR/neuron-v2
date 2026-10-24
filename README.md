@@ -8,9 +8,12 @@ By default Neuron talks to models through the [Zero-X gateway](https://zero-x.li
 You sign in once with `neuron auth login`; the provider API keys stay on the gateway
 and never reach your machine. You can also use your own provider key instead.
 
-> 6.3.0 is the first version built and published by this repository's release
-> pipeline. The npm 6.2.0 and PyPI 6.2.4 (and earlier) packages were built outside it
-> and are deprecated. Install 6.3.0 or later.
+> 7.0.0-alpha.1 is Neuron's first alpha and the first version built and published by
+> this repository's release pipeline. Its known limitations are listed in the
+> [changelog](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/CHANGELOG.md).
+> It is a GitHub prerelease, so install it with the versioned commands below. The npm
+> 6.2.0 and PyPI 6.2.4 (and earlier) packages were built outside the pipeline and are
+> not supported.
 
 ## Install
 
@@ -18,45 +21,47 @@ Every method installs the same `neuron` binary from
 [GitHub Releases](https://github.com/RAHUL-DevelopeRR/neuron-v2/releases) and checks
 its SHA-256 checksum before using it.
 
+A prerelease is never the "latest" release, so the commands below name the alpha's
+version. Without one, the install scripts look up the latest release, and there is
+none until the first stable release is out.
+
 **macOS and Linux**
 
 ```sh
-curl -fsSL https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.1/install.sh | sh -s -- --version 7.0.0-alpha.1
 ```
 
 The script installs to `~/.local/bin` and tells you if that directory is not on your
 `PATH`. Pass options after `sh -s --`, for example
-`sh -s -- --version 6.3.0 --install-dir "$HOME/bin"`, or set `NEURON_VERSION` and
-`NEURON_INSTALL_DIR`.
+`sh -s -- --version 7.0.0-alpha.1 --install-dir "$HOME/bin"`, or set `NEURON_VERSION`
+and `NEURON_INSTALL_DIR`.
 
 **Windows (PowerShell 5.1 or 7)**
 
 ```powershell
-irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/latest/download/install.ps1 | iex
+& ([scriptblock]::Create((irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.1/install.ps1))) -Version 7.0.0-alpha.1
 ```
 
 The script installs to `%LOCALAPPDATA%\Programs\Neuron\bin` and only changes your
 `PATH` if you ask it to:
 
 ```powershell
-& ([scriptblock]::Create((irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/latest/download/install.ps1))) -AddToPath
+& ([scriptblock]::Create((irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.1/install.ps1))) -Version 7.0.0-alpha.1 -AddToPath
 ```
 
-**npm** (Node.js 22.14 or later)
+**npm** (Node.js 22.14 or later), once the alpha is published to npm:
 
 ```sh
-npm install --global @zero-x.live/neuron
+npm install --global @zero-x.live/neuron@next
 ```
 
-**pip**
+Prereleases go to npm's `next` tag; without `@next`, npm installs the unsupported
+6.2.0.
 
-```sh
-pipx install neuroncli        # or: python -m pip install neuroncli
-```
-
-Uploads to PyPI are paused until access to the PyPI project is restored (see
-[PUBLISHING.md](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/PUBLISHING.md)).
-Until a 6.3.0 wheel is on PyPI, use one of the other methods.
+**pip.** The alpha is not on PyPI: uploads are paused until access to the PyPI
+project is restored (see
+[PUBLISHING.md](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/PUBLISHING.md)),
+and the Python launcher will follow later. Use one of the methods above.
 
 The npm and pip packages are small launchers. The first run downloads the binary for
 the package's exact version, verifies it and caches it; later runs start without
@@ -207,8 +212,11 @@ grew out of and may still use its `claw` command names.
 
 MIT; see [LICENSE](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/LICENSE).
 Neuron is derived from [Claw Code](https://github.com/ultraworkers/claw-code), also
-MIT. [NOTICE](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/NOTICE) records
-that lineage and the bundled third-party skills, and every release attaches
-`THIRD_PARTY_NOTICES.md` with the licenses of the Rust crates compiled into the binary.
+MIT. The full-screen UI (`ui/neuron-tui`, the `neuron-tui` binaries) is derived from
+[Freebuff](https://github.com/CodebuffAI/freebuff) and is under the Apache License 2.0.
+[NOTICE](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/NOTICE) records both
+lineages and the bundled third-party skills, and every release attaches
+`THIRD_PARTY_NOTICES.md` with the licenses of the Rust crates compiled into `neuron`
+and of the Bun runtime and npm packages compiled into `neuron-tui`.
 Neuron and Zero-X are not affiliated with Anthropic, OpenAI, Google, Groq, Cloudflare
 or any other model provider.

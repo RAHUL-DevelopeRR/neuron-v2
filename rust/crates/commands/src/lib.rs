@@ -125,7 +125,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "config",
         aliases: &[],
-        summary: "Inspect Claude config files or merged sections",
+        summary: "Show Neuron settings files or merged sections",
         argument_hint: Some("[env|hooks|model|plugins]"),
         resume_supported: true,
     },
@@ -139,14 +139,14 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "memory",
         aliases: &[],
-        summary: "Inspect loaded Claude instruction memory files",
+        summary: "Show loaded instruction files",
         argument_hint: None,
         resume_supported: true,
     },
     SlashCommandSpec {
         name: "init",
         aliases: &[],
-        summary: "Create a starter CLAUDE.md for this repo",
+        summary: "Create a starter NEURON.md for this repo",
         argument_hint: None,
         resume_supported: true,
     },
@@ -542,7 +542,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "api-key",
         aliases: &[],
-        summary: "Show or set the Anthropic API key",
+        summary: "Show or set a provider API key",
         argument_hint: Some("[key]"),
         resume_supported: false,
     },
@@ -3767,7 +3767,7 @@ fn render_agents_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "Agents".to_string(),
         "  Usage            /agents [list|help]".to_string(),
-        "  Direct CLI       claw agents".to_string(),
+        "  Direct CLI       neuron agents".to_string(),
         "  Sources          .claw/agents, ~/.claw/agents, $CLAW_CONFIG_HOME/agents".to_string(),
     ];
     if let Some(args) = unexpected {
@@ -3782,7 +3782,7 @@ fn render_agents_usage_json(unexpected: Option<&str>) -> Value {
         "action": "help",
         "usage": {
             "slash_command": "/agents [list|help]",
-            "direct_cli": "claw agents [list|help]",
+            "direct_cli": "neuron agents [list|help]",
             "sources": [".claw/agents", "~/.claw/agents", "$CLAW_CONFIG_HOME/agents"],
         },
         "unexpected": unexpected,
@@ -3794,7 +3794,7 @@ fn render_skills_usage(unexpected: Option<&str>) -> String {
         "Skills".to_string(),
         "  Usage            /skills [list|install <path>|help|<skill> [args]]".to_string(),
         "  Alias            /skill".to_string(),
-        "  Direct CLI       claw skills [list|install <path>|help|<skill> [args]]".to_string(),
+        "  Direct CLI       neuron skills [list|install <path>|help|<skill> [args]]".to_string(),
         "  Invoke           /skills help overview -> $help overview".to_string(),
         "  Install root     $CLAW_CONFIG_HOME/skills or ~/.claw/skills".to_string(),
         "  Sources          .claw/skills, .omc/skills, .agents/skills, .codex/skills, .claude/skills, ~/.claw/skills, ~/.omc/skills, ~/.claude/skills/omc-learned, ~/.codex/skills, ~/.claude/skills, legacy /commands".to_string(),
@@ -3812,7 +3812,7 @@ fn render_skills_usage_json(unexpected: Option<&str>) -> Value {
         "usage": {
             "slash_command": "/skills [list|install <path>|help|<skill> [args]]",
             "aliases": ["/skill"],
-            "direct_cli": "claw skills [list|install <path>|help|<skill> [args]]",
+            "direct_cli": "neuron skills [list|install <path>|help|<skill> [args]]",
             "invoke": "/skills help overview -> $help overview",
             "install_root": "$CLAW_CONFIG_HOME/skills or ~/.claw/skills",
             "sources": [
@@ -3838,7 +3838,7 @@ fn render_mcp_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "MCP".to_string(),
         "  Usage            /mcp [list|show <server>|help]".to_string(),
-        "  Direct CLI       claw mcp [list|show <server>|help]".to_string(),
+        "  Direct CLI       neuron mcp [list|show <server>|help]".to_string(),
         "  Sources          .claw/settings.json, .claw/settings.local.json".to_string(),
     ];
     if let Some(args) = unexpected {
@@ -3853,7 +3853,7 @@ fn render_mcp_usage_json(unexpected: Option<&str>) -> Value {
         "action": "help",
         "usage": {
             "slash_command": "/mcp [list|show <server>|help]",
-            "direct_cli": "claw mcp [list|show <server>|help]",
+            "direct_cli": "neuron mcp [list|show <server>|help]",
             "sources": [".claw/settings.json", ".claw/settings.local.json"],
         },
         "unexpected": unexpected,
@@ -5118,7 +5118,7 @@ mod tests {
         let help = handle_agents_slash_command_json(Some("help"), &workspace).expect("agents help");
         assert_eq!(help["kind"], "agents");
         assert_eq!(help["action"], "help");
-        assert_eq!(help["usage"]["direct_cli"], "claw agents [list|help]");
+        assert_eq!(help["usage"]["direct_cli"], "neuron agents [list|help]");
 
         let unexpected = handle_agents_slash_command_json(Some("show planner"), &workspace)
             .expect("agents usage");
@@ -5274,7 +5274,7 @@ mod tests {
         assert_eq!(help["usage"]["aliases"][0], "/skill");
         assert_eq!(
             help["usage"]["direct_cli"],
-            "claw skills [list|install <path>|help|<skill> [args]]"
+            "neuron skills [list|install <path>|help|<skill> [args]]"
         );
 
         let _ = fs::remove_dir_all(workspace);
@@ -5288,7 +5288,7 @@ mod tests {
         let agents_help =
             super::handle_agents_slash_command(Some("help"), &cwd).expect("agents help");
         assert!(agents_help.contains("Usage            /agents [list|help]"));
-        assert!(agents_help.contains("Direct CLI       claw agents"));
+        assert!(agents_help.contains("Direct CLI       neuron agents"));
         assert!(agents_help
             .contains("Sources          .claw/agents, ~/.claw/agents, $CLAW_CONFIG_HOME/agents"));
 
@@ -5412,7 +5412,7 @@ mod tests {
 
         let help = super::handle_mcp_slash_command(Some("help"), &cwd).expect("mcp help");
         assert!(help.contains("Usage            /mcp [list|show <server>|help]"));
-        assert!(help.contains("Direct CLI       claw mcp [list|show <server>|help]"));
+        assert!(help.contains("Direct CLI       neuron mcp [list|show <server>|help]"));
 
         let unexpected =
             super::handle_mcp_slash_command(Some("show alpha beta"), &cwd).expect("mcp usage");
@@ -5427,6 +5427,36 @@ mod tests {
             super::handle_mcp_slash_command(Some("inspect --help"), &cwd).expect("mcp usage");
         assert!(unknown_help.contains("Usage            /mcp [list|show <server>|help]"));
         assert!(unknown_help.contains("Unexpected       inspect"));
+
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn agents_skills_and_mcp_help_name_the_neuron_command() {
+        let cwd = temp_dir("direct-cli-name");
+
+        let texts = [
+            super::handle_agents_slash_command(Some("help"), &cwd).expect("agents help"),
+            super::handle_skills_slash_command(Some("help"), &cwd).expect("skills help"),
+            super::handle_mcp_slash_command(Some("help"), &cwd).expect("mcp help"),
+        ];
+        for text in &texts {
+            assert!(text.contains("Direct CLI       neuron "), "{text}");
+            assert!(!text.contains("claw "), "{text}");
+        }
+
+        let reports = [
+            super::handle_agents_slash_command_json(Some("help"), &cwd).expect("agents help"),
+            super::handle_skills_slash_command_json(Some("help"), &cwd).expect("skills help"),
+            super::handle_mcp_slash_command_json(Some("help"), &cwd).expect("mcp help"),
+        ];
+        for report in &reports {
+            let direct_cli = report["usage"]["direct_cli"]
+                .as_str()
+                .expect("direct_cli is a string");
+            assert!(direct_cli.starts_with("neuron "), "{direct_cli}");
+            assert!(!report.to_string().contains("claw "), "{report}");
+        }
 
         let _ = fs::remove_dir_all(cwd);
     }

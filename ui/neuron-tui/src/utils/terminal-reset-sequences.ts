@@ -1,3 +1,7 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the list is
+// kept in sync with `neuron`'s own copy instead of the npm release launcher's,
+// and MAIN_SCREEN_RESET_SEQUENCES resets a terminal already back on the main
+// screen. See ui/neuron-tui/PORTING.md.
 /**
  * Terminal escape sequences to reset terminal state.
  * Shared by the in-process cleanup handlers (renderer-cleanup.ts) and the

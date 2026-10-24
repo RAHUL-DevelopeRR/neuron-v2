@@ -608,8 +608,46 @@ describe('init-direnv', () => {
       }
     })
 
+    test('covers the config homes the engine and git read, and git config', () => {
+      for (const key of [
+        'CLAW_CONFIG_HOME',
+        'CLAW_SANDBOX_MODE',
+        'RUSTY_CLAUDE_PERMISSION_MODE',
+        'CLAUDE_CONFIG_DIR',
+        'CLAUDE_CONFIG_HOME',
+        'CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS',
+        'HOME',
+        'USERPROFILE',
+        'XDG_CONFIG_HOME',
+        'GIT_CONFIG',
+        'GIT_CONFIG_GLOBAL',
+        'GIT_CONFIG_SYSTEM',
+        'GIT_CONFIG_NOSYSTEM',
+        'GIT_CONFIG_COUNT',
+        'GIT_CONFIG_KEY_0',
+        'GIT_CONFIG_VALUE_0',
+        'GIT_CONFIG_PARAMETERS',
+      ]) {
+        expect(isSteeringEnvVar(key)).toBe(true)
+      }
+    })
+
     test('leaves ordinary project variables alone', () => {
-      for (const key of ['DATABASE_URL', 'PATH', 'AWS_PROFILE', 'HTTPS_PROXY', 'NODE_ENV', 'PORT', 'OVERRIDE_SOMETHING_ELSE']) {
+      for (const key of [
+        'DATABASE_URL',
+        'PATH',
+        'AWS_PROFILE',
+        'HTTPS_PROXY',
+        'NODE_ENV',
+        'PORT',
+        'OVERRIDE_SOMETHING_ELSE',
+        // The exact-name and prefix patterns do not reach look-alikes.
+        'HOMEBREW_PREFIX',
+        'PROJECT_HOME',
+        'XDG_DATA_HOME',
+        'GIT_AUTHOR_NAME',
+        'CLAWS',
+      ]) {
         expect(isSteeringEnvVar(key)).toBe(false)
       }
     })

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "neuroncli"
-version = "6.3.0"
+version = "7.0.0-alpha.1"
 description = "Neuron - terminal coding agent powered by the Zero-X gateway"
 readme = "README.md"
 license = "MIT"
@@ -15,7 +15,7 @@ authors = [
 ]
 keywords = ["ai", "coding-agent", "cli", "terminal", "neuron", "zero-x"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Operating System :: MacOS",

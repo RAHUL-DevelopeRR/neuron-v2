@@ -13,18 +13,20 @@ method, and the steps to reproduce. We aim to acknowledge a report within five w
 days, keep you informed while we work on it, and agree on a disclosure date with you.
 Credit is given in the advisory unless you prefer otherwise.
 
-In scope: the `neuron` CLI and its Rust workspace, the npm and Python launchers, the
-install scripts and the release pipeline in this repository. Report problems with the
-Zero-X gateway or website the same way; we route them to the gateway maintainers.
+In scope: the `neuron` CLI and its Rust workspace, the full-screen UI (`neuron-tui`,
+built from `ui/neuron-tui`), the npm and Python launchers, the install scripts and the
+release pipeline in this repository. Report problems with the Zero-X gateway or
+website the same way; we route them to the gateway maintainers.
 
 ## Supported versions
 
 | Version | Supported |
 | --- | --- |
-| 6.3.x | Yes |
-| Earlier than 6.3.0 | No; this includes the npm 6.2.0 and PyPI 6.2.4 (and earlier) packages, which were built outside the release pipeline |
+| 7.0.0-alpha.1 (the latest alpha) | Yes |
+| Earlier than 7.0.0-alpha.1 | No; this includes the npm 6.2.0 and PyPI 6.2.4 (and earlier) packages, which were built outside the release pipeline |
 
-Security fixes are released as a new patch version; upgrade to get them.
+During the alpha, security fixes ship as the next prerelease (for example
+7.0.0-alpha.2); upgrade to get them.
 
 ## How Neuron handles credentials
 
@@ -57,12 +59,18 @@ Security fixes are released as a new patch version; upgrade to get them.
   provider keys such as `OPENAI_API_KEY` are read from the environment; Neuron does not
   save them, and it never exports the stored login or a provider key into its own
   environment: the credential is handed to the HTTP client in memory. Shell commands
-  (bash, PowerShell), hooks, plugin tools and MCP servers that Neuron starts do not
-  inherit `NEURON_TOKEN`, `NEURON_SESSION_TOKEN` or any variable whose value starts
-  with `ses_` or `nzx_` (a value set explicitly in an MCP server's `env` still
-  applies). Provider keys you exported yourself, such as `OPENAI_API_KEY`, are still
-  inherited by those processes, and everything they run can read your files, including
-  the credentials file above. Approve commands with that in mind (see
+  (bash, PowerShell, the REPL tool), plugin tools and MCP servers that Neuron starts do
+  not inherit `NEURON_TOKEN`, `NEURON_SESSION_TOKEN`, the provider keys Neuron reads
+  (such as `OPENAI_API_KEY`), any variable named `*_API_KEY`, `*_TOKEN` or `*_SECRET`,
+  or any variable whose value starts with `ses_` or `nzx_`, even when you exported them
+  yourself (a value set explicitly in an MCP server's `env` still applies). Shell
+  commands also get a timeout, empty standard input and termination of their whole
+  process tree on timeout or Ctrl+C. **Hooks are the exception:** they run with
+  Neuron's own environment, so a `NEURON_TOKEN` or provider key you exported reaches
+  them, and they have no timeout. Add only hooks you trust. Commands that print
+  environment variables or read `.env` files and Neuron's settings or credentials need
+  your approval. Everything those processes run can still read your files, including
+  the credentials file above, so approve commands with that in mind (see
   [Running untrusted code](#running-untrusted-code)).
 - **Provider keys you bring** are sent only to the endpoint you configured for them.
 
@@ -90,5 +98,6 @@ environments.
 - `install.sh`, `install.ps1` and both package launchers verify the SHA-256 checksum
   before a binary is installed or cached, and refuse non-HTTPS download mirrors.
 - The binaries are not yet code-signed (Windows) or notarized (macOS).
-- `THIRD_PARTY_NOTICES.md` on each release lists the Rust crates compiled into the
-  binary with their licenses.
+- `THIRD_PARTY_NOTICES.md` on each release lists the Rust crates compiled into
+  `neuron`, and the Bun runtime and npm packages compiled into `neuron-tui`, with their
+  licenses.

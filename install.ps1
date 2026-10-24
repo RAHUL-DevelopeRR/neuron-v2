@@ -9,14 +9,17 @@
     about the UI fails the install (without it, neuron runs its line REPL).
     Works in Windows PowerShell 5.1 and PowerShell 7+.
 
+    The latest stable release:
+
         irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/latest/download/install.ps1 | iex
 
-    To pass parameters when piping, create a script block:
+    A given release; a prerelease such as 7.0.0-alpha.1 is never the latest release, so
+    name it. To pass parameters when piping, create a script block:
 
-        & ([scriptblock]::Create((irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/latest/download/install.ps1))) -AddToPath
+        & ([scriptblock]::Create((irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.1/install.ps1))) -Version 7.0.0-alpha.1 -AddToPath
 
 .PARAMETER Version
-    Release to install, for example 6.3.0. Defaults to $env:NEURON_VERSION, then the latest release.
+    Release to install, for example 7.0.0-alpha.1. Defaults to $env:NEURON_VERSION, then the latest stable release.
 
 .PARAMETER InstallDir
     Install directory. Defaults to $env:NEURON_INSTALL_DIR, then %LOCALAPPDATA%\Programs\Neuron\bin.
@@ -98,9 +101,19 @@ function Get-NeuronSha256([string]$Path) {
     return ([System.BitConverter]::ToString($hash) -replace '-', '').ToLowerInvariant()
 }
 
-function Assert-SupportedPlatform {
+function Get-PosixInstallCommand([string]$Requested) {
+    # A named release gets its own install.sh and --version: a prerelease is never the latest release.
+    $named = "$Requested".Trim()
+    if ($named.StartsWith('v')) { $named = $named.Substring(1) }
+    if ($named -match '^\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$') {
+        return "curl -fsSL https://github.com/$NeuronRepository/releases/download/v$named/install.sh | sh -s -- --version $named"
+    }
+    return "curl -fsSL https://github.com/$NeuronRepository/releases/latest/download/install.sh | sh"
+}
+
+function Assert-SupportedPlatform([string]$Requested) {
     if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
-        throw "install.ps1 is for Windows. On Linux and macOS run: curl -fsSL https://github.com/$NeuronRepository/releases/latest/download/install.sh | sh"
+        throw "install.ps1 is for Windows. On Linux and macOS run: $(Get-PosixInstallCommand $Requested)"
     }
     $arch = $env:PROCESSOR_ARCHITEW6432
     if (-not $arch) { $arch = $env:PROCESSOR_ARCHITECTURE }
@@ -126,7 +139,7 @@ function Resolve-NeuronVersion([string]$Requested) {
     try {
         $release = Invoke-RestMethod -Uri $api -Headers $headers -UseBasicParsing
     } catch {
-        throw "could not look up the latest Neuron release at ${api}: $($_.Exception.Message). Pass -Version 6.3.0 (or set NEURON_VERSION) to skip the lookup."
+        throw "could not look up the latest Neuron release at ${api}: $($_.Exception.Message). Pass -Version 7.0.0-alpha.1 (or set NEURON_VERSION) to skip the lookup."
     }
     $tag = $null
     if ($release -and ($release.PSObject.Properties.Name -contains 'tag_name')) { $tag = [string]$release.tag_name }
@@ -141,6 +154,18 @@ function Test-PathEntry([string]$PathValue, [string]$Directory) {
         if ($entry -and ($entry.Trim().TrimEnd('\') -ieq $wanted)) { return $true }
     }
     return $false
+}
+
+function Write-ShadowingNeuronWarning([string]$Destination) {
+    # `neuron` runs the first neuron on PATH, which may be an older install or another program.
+    $found = Get-Command neuron -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ((-not $found) -or ($found.Path -ieq $Destination)) { return }
+    Write-Warn "another neuron at $($found.Path) comes first on PATH and runs instead of $Destination."
+    Write-Detail 'An older Neuron is the usual cause. Remove it with the command for how it was installed:'
+    Write-Detail '  an old NeuronCLI folder:  Remove-Item -Recurse -Force "$env:LOCALAPPDATA\Programs\NeuronCLI", then remove that folder from your user PATH'
+    Write-Detail '  npm (6.x):                npm uninstall -g @zero-x.live/neuron neuron-cli-app'
+    Write-Detail '  pip:                      pip uninstall neuroncli (or pipx uninstall neuroncli)'
+    Write-Detail "If it is another program, move $(Split-Path -Parent $Destination) before $(Split-Path -Parent $found.Path) in PATH, or run neuron by its full path."
 }
 
 function Add-UserPathEntry([string]$Directory) {
@@ -228,7 +253,7 @@ function Get-ReportedVersion([string]$VersionOutput) {
 function Install-Neuron {
     Set-StrictMode -Version 2.0
     $ErrorActionPreference = 'Stop'
-    Assert-SupportedPlatform
+    Assert-SupportedPlatform $Version
     if ($PSVersionTable.PSVersion.Major -lt 6) {
         [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
     }
@@ -241,7 +266,7 @@ function Install-Neuron {
     $resolved = (Resolve-NeuronVersion $Version).Trim()
     if ($resolved.StartsWith('v')) { $resolved = $resolved.Substring(1) }
     if ($resolved -notmatch '^\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$') {
-        throw "invalid version: $resolved (expected something like 6.3.0)"
+        throw "invalid version: $resolved (expected something like 7.0.0-alpha.1)"
     }
 
     $target = $InstallDir
@@ -308,23 +333,21 @@ function Install-Neuron {
 
     $run = 'neuron'
     if (Test-PathEntry $env:Path $target) {
-        $found = Get-Command neuron -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($found -and ($found.Path -ine $destination)) {
-            Write-Warn "another neuron at $($found.Path) comes first on PATH and runs instead of $destination."
-            Write-Detail 'Remove it (for example: pip uninstall neuroncli, or npm uninstall -g @zero-x.live/neuron) or reorder PATH.'
-        }
+        Write-ShadowingNeuronWarning $destination
     } elseif ($AddToPath) {
         if (Add-UserPathEntry $target) {
             Write-Detail "added $target to your user PATH; open a new terminal to use it."
         }
+        # Appended, as in the user PATH: an older neuron earlier on PATH still wins.
         $env:Path = "$env:Path;$target"
+        Write-ShadowingNeuronWarning $destination
     } else {
         Write-Warn "$target is not on your PATH."
         if ($InvokedAsFile) {
             Write-Detail 'Rerun with -AddToPath to add it to your user PATH, or run neuron by its full path.'
         } else {
             Write-Detail 'To add it to your user PATH, rerun the installer with -AddToPath:'
-            Write-Detail "  & ([scriptblock]::Create((irm https://github.com/$NeuronRepository/releases/latest/download/install.ps1))) -AddToPath"
+            Write-Detail "  & ([scriptblock]::Create((irm https://github.com/$NeuronRepository/releases/download/v$resolved/install.ps1))) -Version $resolved -AddToPath"
         }
         $run = "& '$destination'"
     }

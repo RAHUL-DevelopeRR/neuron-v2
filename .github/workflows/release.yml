@@ -379,8 +379,8 @@ jobs:
 
           ## Install
 
-          - Linux / macOS: \`curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/install.sh | sh\`
-          - Windows (PowerShell): \`irm https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/install.ps1 | iex\`
+          - Linux / macOS: \`curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/install.sh | sh -s -- --version $VERSION\`
+          - Windows (PowerShell): \`& ([scriptblock]::Create((irm https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/install.ps1))) -Version $VERSION\`
 
           Every binary has a \`.sha256\` file; \`SHA256SUMS\` lists all assets. Verify provenance with
           \`gh attestation verify <file> --repo $GITHUB_REPOSITORY\`. Third-party licenses: THIRD_PARTY_NOTICES.md.
