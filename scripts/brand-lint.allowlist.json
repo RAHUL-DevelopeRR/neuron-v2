@@ -1,0 +1,172 @@
+{
+  "$comment": "Read by scripts/brand-lint.mjs; see its header. Every allow, exact and accepted entry needs a reason. Baseline entries are known leaks with an owner: they warn and do not fail, and are deleted once fixed.",
+  "scopes": [
+    {
+      "name": "ui",
+      "rule": "brand",
+      "description": "Strings and text in the desktop app (web UI, Tauri shell and config), the mobile app, the full-screen terminal UI and the shared client",
+      "include": [
+        "ui/neuron-desktop/index.html",
+        "ui/neuron-desktop/src/**",
+        "ui/neuron-desktop/src-tauri/src/**",
+        "ui/neuron-desktop/src-tauri/tauri.conf.json",
+        "ui/neuron-desktop/src-tauri/tauri.release.conf.json",
+        "ui/neuron-mobile/App.tsx",
+        "ui/neuron-mobile/index.ts",
+        "ui/neuron-mobile/app.json",
+        "ui/neuron-mobile/src/**",
+        "ui/neuron-client/src/**",
+        "ui/neuron-tui/src/**"
+      ]
+    },
+    {
+      "name": "commands",
+      "rule": "brand",
+      "description": "Slash-command names, summaries, help and reports",
+      "include": ["rust/crates/commands/src/**"]
+    },
+    {
+      "name": "cli-help",
+      "rule": "brand",
+      "description": "`neuron --help`, argument errors and the line REPL's messages",
+      "include": ["rust/crates/rusty-claude-cli/src/args.rs", "rust/crates/rusty-claude-cli/src/main.rs"]
+    },
+    {
+      "name": "prompt",
+      "rule": "brand",
+      "description": "The system prompt every model receives",
+      "include": ["rust/crates/runtime/src/prompt.rs"]
+    },
+    {
+      "name": "identity",
+      "rule": "product-name",
+      "description": "How requests identify themselves: app name and beta headers. Model IDs and the provider's protocol names are fine here",
+      "include": ["rust/crates/telemetry/src/**", "rust/crates/api/src/**"]
+    },
+    {
+      "name": "engine",
+      "rule": "brand",
+      "report": true,
+      "description": "The rest of the engine's messages (status, plugin warnings, provider names, reports). Report only until WP1 sorts its leaks from its compatibility names; then drop `report`",
+      "include": [
+        "rust/crates/rusty-claude-cli/src/**",
+        "rust/crates/runtime/src/**",
+        "rust/crates/plugins/src/**",
+        "rust/crates/tools/src/**"
+      ]
+    }
+  ],
+  "exclude": [
+    "**/test/**",
+    "**/tests/**",
+    "**/__tests__/**",
+    "**/*.test.*",
+    "**/*.spec.*",
+    "**/fixtures/**",
+    "ui/*/scripts/**",
+    "ui/neuron-client/src/node/mock.ts"
+  ],
+  "allow": [
+    {
+      "pattern": "(?:\\b[a-z]{2}\\.)?(?:\\banthropic[./])?\\bclaude-(?:opus|sonnet|haiku|instant|\\d)[\\w.:@\\[\\]-]*",
+      "reason": "Model IDs exactly as a provider's catalog returns them (claude-sonnet-4-6, anthropic/claude-…, us.anthropic.claude-…). Display names such as \"Claude Opus 4.6\" are not IDs and still fail."
+    },
+    {
+      "pattern": "\\bCLAUDE(?:\\.local)?\\.md\\b",
+      "reason": "Compatibility instruction files that Neuron reads (guardrail 2). Neuron's own file is NEURON.md."
+    },
+    {
+      "pattern": "\\.claude(?:-plugin)?(?![\\w-])",
+      "reason": "Compatibility directories that Neuron reads (.claude/skills, ~/.claude, .claude-plugin). Neuron's own directory is .neuron/."
+    },
+    {
+      "pattern": "\\bANTHROPIC_[A-Z0-9_]+\\b",
+      "reason": "Environment variables of the provider's own SDK (ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL) that Neuron reads for bring-your-own-key use."
+    },
+    {
+      "pattern": "\\bCLAUDE_CONFIG_DIR\\b",
+      "reason": "Compatibility config location that Neuron reads skills and commands from."
+    },
+    {
+      "pattern": "\\brusty[-_]claude[-_]cli\\b|\\bmock[-_]anthropic[-_]service\\b|\\bMOCK_ANTHROPIC_[A-Z0-9_]+\\b|\\bRUSTY_CLAUDE_[A-Z0-9_]+\\b",
+      "reason": "Internal crate, binary and variable names. Not user-facing; renamed before any public source release (P2, guardrail 2)."
+    },
+    {
+      "pattern": "\\boh-my-claudecode\\b",
+      "reason": "A third-party plugin namespace whose commands Neuron recognizes for compatibility."
+    },
+    {
+      "pattern": "\\banthropic-(?:version|beta)\\b|\\bapi\\.anthropic\\.com\\b",
+      "reason": "The provider's protocol header names and API host, for the Anthropic bring-your-own-key provider."
+    }
+  ],
+  "exact": [
+    {
+      "text": "anthropic",
+      "reason": "The provider ID for bring-your-own-key use (--provider anthropic), as a whole literal."
+    }
+  ],
+  "accepted": [],
+  "baseline": [
+    {
+      "file": "rust/crates/commands/src/lib.rs",
+      "text": "Inspect Claude config files",
+      "owner": "WP1 (T6)",
+      "reason": "/config summary; becomes \"Show Neuron settings files\""
+    },
+    {
+      "file": "rust/crates/commands/src/lib.rs",
+      "text": "Inspect loaded Claude instruction memory files",
+      "owner": "WP1 (T6)",
+      "reason": "/memory summary; becomes \"Show loaded instruction files\""
+    },
+    {
+      "file": "rust/crates/commands/src/lib.rs",
+      "text": "Show or set the Anthropic API key",
+      "owner": "WP1 (T6)",
+      "reason": "becomes \"Show or set a provider API key\""
+    },
+    {
+      "file": "rust/crates/runtime/src/prompt.rs",
+      "text": "Claude Opus 4.6",
+      "owner": "WP1 (T6)",
+      "reason": "FRONTIER_MODEL_NAME: the system prompt tells every model it is this model family; name the model in use or none"
+    },
+    {
+      "file": "rust/crates/runtime/src/prompt.rs",
+      "text": "# Claude instructions",
+      "owner": "WP1 (T6)",
+      "reason": "instruction-file heading; becomes \"# Project instructions\""
+    },
+    {
+      "file": "rust/crates/rusty-claude-cli/src/args.rs",
+      "text": "Claude Code/OMC plugin command",
+      "owner": "WP1 (T6)",
+      "reason": "OMC compatibility note; just say plugin slash commands are not loaded yet"
+    },
+    {
+      "file": "rust/crates/rusty-claude-cli/src/args.rs",
+      "text": "For Anthropic directly, set ANTHROPIC_API_KEY",
+      "owner": "WP1",
+      "reason": "found by brand-lint, not in the plan's T6 list: name the variables without naming the provider"
+    },
+    {
+      "file": "rust/crates/rusty-claude-cli/src/main.rs",
+      "text": "set CLAUDE_CODE_UPSTREAM=",
+      "owner": "WP1",
+      "reason": "found by brand-lint, not in the plan's T6 list: the dump-manifests hint names the reference product's variable; rename it (keep the old name as an alias) or accept it here"
+    },
+    {
+      "file": "rust/crates/telemetry/src/lib.rs",
+      "text": "claude-code-20250219",
+      "owner": "WP1 (T6)",
+      "reason": "DEFAULT_AGENTIC_BETA: the reference product's beta header on every request to the provider"
+    },
+    {
+      "file": "rust/crates/telemetry/src/lib.rs",
+      "text": "claude-code",
+      "owner": "WP1 (T6)",
+      "reason": "DEFAULT_APP_NAME; becomes neuron"
+    }
+  ]
+}

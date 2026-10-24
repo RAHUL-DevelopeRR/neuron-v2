@@ -1,0 +1,163 @@
+name: Mobile EAS
+
+# EAS builds of the mobile app (ui/neuron-mobile, profiles in eas.json). P1:
+# the app needs the relay, push and `neuron engine --share` before it is useful
+# off the developer's network, so this runs by hand only.
+#
+# Every run first checks the app: install, typecheck, tests, the resolved Expo
+# config (bundle identifiers, EAS project) and eas.json. A dry run (the
+# default, and pull requests that change these files) stops there and needs no
+# account. A real run starts EAS builds with the EXPO_TOKEN secret, and with
+# `submit` (production only) sends them to TestFlight and Play internal
+# testing; without the token, or before the app is linked to an EAS project
+# (`eas init`, docs/RELEASING.md), it stops with a notice.
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: eas.json build profile
+        type: choice
+        options: [simulator, preview, production]
+        default: simulator
+      platform:
+        description: Platforms to build
+        type: choice
+        options: [all, ios, android]
+        default: all
+      submit:
+        description: Submit production builds to TestFlight and Play internal testing
+        type: boolean
+        default: false
+      dry_run:
+        description: Check the app and its EAS configuration without building
+        type: boolean
+        default: true
+  pull_request:
+    paths:
+      - .github/workflows/mobile-eas.yml
+      - ui/neuron-mobile/eas.json
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mobile-eas-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check the app and eas.json
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      project_id: ${{ steps.config.outputs.project_id }}
+    defaults:
+      run:
+        working-directory: ui/neuron-mobile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun run test
+
+      - name: Resolve the Expo config
+        id: config
+        run: |
+          bunx expo config --type public --json > "$RUNNER_TEMP/expo-config.json"
+          python3 - "$RUNNER_TEMP/expo-config.json" <<'PY'
+          import json, os, sys
+
+          config = json.load(open(sys.argv[1]))
+          problems = []
+          if not config.get('ios', {}).get('bundleIdentifier'):
+              problems.append('ios.bundleIdentifier')
+          if not config.get('android', {}).get('package'):
+              problems.append('android.package')
+          if problems:
+              sys.exit(f"::error::app.json lacks {', '.join(problems)}")
+          project_id = config.get('extra', {}).get('eas', {}).get('projectId', '')
+          if not project_id:
+              print('::notice::app.json has no extra.eas.projectId yet: run `eas init` once in ui/neuron-mobile (docs/RELEASING.md, Mobile) before a real build.')
+          print(f"{config['name']} {config['version']}: {config['ios']['bundleIdentifier']}, {config['android']['package']}, SDK {config.get('sdkVersion')}")
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f'project_id={project_id}\n')
+          PY
+
+      - name: Check eas.json
+        env:
+          PROFILE: ${{ inputs.profile || 'simulator' }}
+          SUBMIT: ${{ inputs.submit || false }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+
+          eas = json.load(open('eas.json'))
+          profiles = eas.get('build', {})
+          for name in ('simulator', 'preview', 'production'):
+              if name not in profiles:
+                  sys.exit(f'::error::eas.json has no build profile {name}')
+          if profiles['production'].get('distribution', 'store') != 'store':
+              sys.exit('::error::the production profile must build for the stores')
+          profile = os.environ['PROFILE']
+          if os.environ['SUBMIT'] == 'true' and profile != 'production':
+              sys.exit(f'::error::only production builds are submitted, not {profile}')
+          print(f"eas.json: profiles {sorted(profiles)}, submit profiles {sorted(eas.get('submit', {}))}")
+          PY
+
+  build:
+    name: EAS build (${{ inputs.profile }}, ${{ inputs.platform }})
+    needs: check
+    if: github.event_name == 'workflow_dispatch' && !inputs.dry_run
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: mobile-release
+    defaults:
+      run:
+        working-directory: ui/neuron-mobile
+    env:
+      EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+      PROFILE: ${{ inputs.profile }}
+      PLATFORM: ${{ inputs.platform }}
+      SUBMIT: ${{ inputs.submit }}
+      PROJECT_ID: ${{ needs.check.outputs.project_id }}
+    steps:
+      - name: Check the Expo account
+        id: ready
+        working-directory: .
+        run: |
+          if [ -z "$EXPO_TOKEN" ]; then
+            echo "::notice::Not built: set the EXPO_TOKEN secret (docs/RELEASING.md, Mobile)."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          elif [ -z "$PROJECT_ID" ]; then
+            echo "::notice::Not built: link the app to an EAS project first (eas init in ui/neuron-mobile)."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.ready.outputs.ready == 'true'
+      - uses: oven-sh/setup-bun@v2
+        if: steps.ready.outputs.ready == 'true'
+        with:
+          bun-version: 1.3.14
+      - uses: expo/expo-github-action@v8
+        if: steps.ready.outputs.ready == 'true'
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+      - name: Install the app's dependencies
+        if: steps.ready.outputs.ready == 'true'
+        run: bun install --frozen-lockfile
+      - name: Start the builds
+        if: steps.ready.outputs.ready == 'true'
+        run: |
+          set -euo pipefail
+          args=(--profile "$PROFILE" --platform "$PLATFORM" --non-interactive --no-wait --json)
+          if [ "$SUBMIT" = true ]; then args+=(--auto-submit-with-profile production); fi
+          eas build "${args[@]}" > "$RUNNER_TEMP/builds.json"
+          jq -r '.[] | "\(.platform): \(.id) \(.status)"' "$RUNNER_TEMP/builds.json" | tee -a "$GITHUB_STEP_SUMMARY"
