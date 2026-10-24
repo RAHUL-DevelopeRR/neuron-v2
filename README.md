@@ -1,8 +1,10 @@
 # Neuron
 
-Neuron is a coding agent that runs in your terminal. It reads your project, edits
-files and runs commands, and asks before it does anything your permission mode does
-not allow. It is a single native binary written in Rust.
+Neuron by [Zero-X](https://zero-x.live/neuron-cli) is an open-source AI coding agent
+that runs in your terminal. It reads your project, edits files and runs commands, and
+asks before it does anything your permission mode does not allow. It is a single
+native binary written in Rust. New to coding agents? Read
+[how an AI coding agent works](https://zero-x.live/ai-coding-agent).
 
 By default Neuron talks to models through the [Zero-X gateway](https://zero-x.live).
 You sign in once with `neuron auth login`; the provider API keys stay on the gateway
