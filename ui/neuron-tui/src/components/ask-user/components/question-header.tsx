@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: its
+// markers come from utils/glyphs.ts. See ui/neuron-tui/PORTING.md.
 /**
  * Question header component with expand/collapse functionality
  * and answer preview when collapsed
@@ -8,6 +10,7 @@ import React, { memo } from 'react'
 
 import { useTerminalLayout } from '../../../hooks/use-terminal-layout'
 import { useTheme } from '../../../hooks/use-theme'
+import { GLYPHS } from '../../../utils/glyphs'
 import { Button } from '../../button'
 
 // Overhead for the answer line: modal borders (~6) + marginLeft (3) + "↳ " (3) + quotes (2) + buffer (6)
@@ -50,7 +53,9 @@ export const QuestionHeader: React.FC<QuestionHeaderProps> = memo(
         }}
       >
         <text>
-          <span fg={theme.muted}>{isExpanded ? '▼' : '▶'}</span>
+          <span fg={theme.muted}>
+            {isExpanded ? GLYPHS.disclosureOpen : GLYPHS.disclosureClosed}
+          </span>
           <span
             fg={theme.foreground}
             attributes={isExpanded ? TextAttributes.BOLD : undefined}
@@ -63,7 +68,7 @@ export const QuestionHeader: React.FC<QuestionHeaderProps> = memo(
         {/* Answer displayed on separate line when collapsed (like User Answers style) */}
         {!isExpanded && (
           <text wrapMode="none" style={{ marginLeft: 3 }}>
-            <span fg={theme.primary}>↳ </span>
+            <span fg={theme.primary}>{`${GLYPHS.answer} `}</span>
             <span
               fg={isAnswered ? theme.primary : theme.muted}
               attributes={TextAttributes.ITALIC}

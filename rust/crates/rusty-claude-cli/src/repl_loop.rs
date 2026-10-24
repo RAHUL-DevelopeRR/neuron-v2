@@ -59,11 +59,10 @@ pub(crate) fn dispatch_line(
 
 /// Renders a failed REPL step without ending the session.
 pub(crate) fn report_repl_error(message: &str, out: &mut impl Write) {
-    let _ = writeln!(out, "\n\x1b[31m\u{2718}\x1b[0m {message}");
-    let _ = writeln!(
-        out,
-        "  \x1b[2mThe session is saved. Retry, /compact, switch /model, or keep chatting.\x1b[0m"
+    let report = format!(
+        "\n\x1b[31m\u{2718}\x1b[0m {message}\n  \x1b[2mThe session is saved. Retry, /compact, switch /model, or keep chatting.\x1b[0m"
     );
+    let _ = writeln!(out, "{}", crate::console::stderr_text(&report));
 }
 
 pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
@@ -186,6 +185,9 @@ pub(crate) async fn watch_turn_interrupts<P, F>(
     let mut presses = 0_u32;
     loop {
         tokio::select! {
+            // A press made before the turn ended counts, even when the turn ended before
+            // this watcher got to it (the UI's interrupt right after a prompt).
+            biased;
             result = next_press() => {
                 if result.is_err() {
                     break;
@@ -331,8 +333,10 @@ pub(crate) fn launch(options: ReplLaunch) -> Result<(), Box<dyn std::error::Erro
     }
 
     let result = run_loop(&mut cli, &mut editor);
-    // Sub-agents left running in the background must not outlive the session.
+    // Sub-agents and commands left running in the background must not outlive the
+    // session.
     tools::cancel_background_subagents();
+    let _ = runtime::stop_background_commands();
     drop(shutdown);
     if force_quit_requested() {
         if let Err(error) = &result {
@@ -350,11 +354,21 @@ fn print_footer(cli: &LiveCli) {
     let r = "\x1b[0m";
     let bc = "\x1b[38;2;100;100;100m";
     let model_s = cli.model.split('/').next_back().unwrap_or(&cli.model);
-    let session_short: String = cli.session.id.chars().take(6).collect();
+    let session = footer_session_label(&cli.session.id);
     println!(
-        "\n{bc}{}{r}\n  {dm}? for shortcuts{r}                       {dm}{model_s} \u{00b7} session {session_short}{r}\n",
+        "\n{bc}{}{r}\n  {dm}? for shortcuts{r}                       {dm}{model_s} \u{00b7} {session}{r}\n",
         "\u{2500}".repeat(74),
     );
+}
+
+/// The session in the footer: its whole id (what `--resume` takes), never cut
+/// mid-word. Ids are `session-<millis>-<n>`; another id gets the word in front.
+pub(crate) fn footer_session_label(id: &str) -> String {
+    if id.starts_with("session-") {
+        id.to_string()
+    } else {
+        format!("session {id}")
+    }
 }
 
 /// Switches the freshly started CLI to a saved session, removing the empty
@@ -1042,5 +1056,14 @@ mod tests {
         assert_eq!(group_digits(999), "999");
         assert_eq!(group_digits(1_000), "1,000");
         assert_eq!(group_digits(1_048_576), "1,048,576");
+    }
+
+    #[test]
+    fn the_footer_shows_the_whole_session_id() {
+        assert_eq!(
+            super::footer_session_label("session-1792751547070-0"),
+            "session-1792751547070-0"
+        );
+        assert_eq!(super::footer_session_label("abc123"), "session abc123");
     }
 }

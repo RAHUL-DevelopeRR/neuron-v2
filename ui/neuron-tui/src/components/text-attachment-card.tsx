@@ -1,5 +1,8 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the icon
+// comes from utils/glyphs.ts. See ui/neuron-tui/PORTING.md.
 import { AttachmentCard } from './attachment-card'
 import { useTheme } from '../hooks/use-theme'
+import { GLYPHS } from '../utils/glyphs'
 
 import type { PendingTextAttachment } from '../types/store'
 
@@ -62,7 +65,7 @@ export const TextAttachmentCard = ({
           gap: 1,
         }}
       >
-        <text style={{ fg: theme.info }}>📄</text>
+        <text style={{ fg: theme.info }}>{GLYPHS.file}</text>
         <text
           style={{
             fg: theme.muted,

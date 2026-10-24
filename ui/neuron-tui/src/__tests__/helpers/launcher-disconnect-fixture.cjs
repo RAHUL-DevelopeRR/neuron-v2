@@ -1,5 +1,6 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the fixture
-// spawns the bun running the test (NEURON_TUI_TEST_BUN). See ui/neuron-tui/PORTING.md.
+// spawns the bun running the test (NEURON_TUI_TEST_BUN) and names the launcher
+// in NEURON_TUI_LAUNCHER_PID. See ui/neuron-tui/PORTING.md.
 const { spawn, spawnSync } = require('child_process')
 const { existsSync, readFileSync, rmSync } = require('fs')
 const { tmpdir } = require('os')
@@ -78,7 +79,7 @@ if (mode === 'launch') {
         ...process.env,
         NODE_ENV: 'test',
         BUN_ENV: 'test',
-        CODEBUFF_LAUNCHER_PID: String(launcher.pid),
+        NEURON_TUI_LAUNCHER_PID: String(launcher.pid),
       },
       stdio: 'inherit',
     },

@@ -1,46 +1,64 @@
-// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
-// See ui/neuron-tui/PORTING.md.
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: Neuron's
+// shortcuts and commands; the new-line key is "Alt+Enter" outside macOS
+// ("Opt+Enter" there), and /bash is not listed while shell commands are not
+// implemented (USER_SHELL_AVAILABLE). See ui/neuron-tui/PORTING.md.
 import React from 'react'
 import { TextAttributes } from '@opentui/core'
 
 import { useTheme } from '../hooks/use-theme'
 import { useTerminalDimensions } from '../hooks/use-terminal-dimensions'
+import { USER_SHELL_AVAILABLE } from '../utils/user-shell'
 
-const SECTIONS = [
-  {
-    title: 'Compose',
-    rows: [
-      ['/', 'Commands'],
-      ['@files', 'Mention files'],
-      ['/login', 'Sign in to Zero-X'],
-      ['Ctrl+J', 'New line'],
-      ['Opt+Enter', 'New line'],
-      ['/bash', 'Shell command'],
-    ],
-  },
-  {
-    title: 'Chat',
-    rows: [
-      ['?', 'Help (empty input)'],
-      ['←', 'History (empty input)'],
-      ['↑ / ↓', 'Prompts (empty input)'],
-      ['/new', 'New chat'],
-      ['/model', 'Pick the model'],
-      ['Ctrl+Q', 'Edit queued messages'],
-    ],
-  },
-  {
-    title: 'Conversation',
-    rows: [
-      ['Esc', 'Close help / stop'],
-      ['Ctrl+C', 'Clear / stop / quit'],
-      ['Ctrl+T', 'Expand / collapse agents'],
-      ['/copy', 'Copy chat'],
-      ['/export', 'Export chat'],
-      ['Drag', 'Select and copy text'],
-    ],
-  },
-] as const
+export interface HelpSection {
+  title: string
+  rows: ReadonlyArray<readonly [key: string, description: string]>
+}
+
+/** The help's shortcut groups, worded for `platform`'s keyboard. */
+export function helpSections(
+  platform: NodeJS.Platform = process.platform,
+  shellAvailable: boolean = USER_SHELL_AVAILABLE,
+): HelpSection[] {
+  return [
+    {
+      title: 'Compose',
+      rows: [
+        ['/', 'Commands'],
+        // `@path` puts the path in the prompt; the agent reads the file if it needs it.
+        ['@file', "Insert a file's path"],
+        ['/login', 'Sign in to Zero-X'],
+        ['Ctrl+J', 'New line'],
+        // Option is a Mac key; Windows and Linux keyboards say Alt.
+        [platform === 'darwin' ? 'Opt+Enter' : 'Alt+Enter', 'New line'],
+        ...(shellAvailable ? ([['/bash', 'Shell command']] as const) : []),
+      ],
+    },
+    {
+      title: 'Chat',
+      rows: [
+        ['?', 'Help (empty input)'],
+        ['←', 'History (empty input)'],
+        ['↑ / ↓', 'Prompts (empty input)'],
+        ['/new', 'New chat'],
+        ['/model', 'Pick the model'],
+        ['Ctrl+Q', 'Edit queued messages'],
+      ],
+    },
+    {
+      title: 'Conversation',
+      rows: [
+        ['Esc', 'Close help / stop'],
+        ['Ctrl+C', 'Clear / stop / quit'],
+        ['Ctrl+T', 'Expand / collapse agents'],
+        ['/copy', 'Copy chat'],
+        ['/export', 'Export chat'],
+        ['Drag', 'Select and copy text'],
+      ],
+    },
+  ]
+}
+
+const SECTIONS = helpSections()
 
 /** Aligned shortcut columns; wrap whole columns on smaller terminals. */
 export const HelpBanner = () => {

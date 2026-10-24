@@ -175,10 +175,22 @@ pub(crate) fn ui_args(launch: &UiLaunch<'_>) -> Option<Vec<String>> {
 /// print; read by `exit-cleanly.ts`.
 pub(crate) const EXIT_MESSAGE_FILE_ENV: &str = "NEURON_TUI_EXIT_MESSAGE_FILE";
 
+/// Where the UI says whether the terminal is in its modes: "armed" once it sets
+/// them up, "disarmed" once it has reset them (`terminal-watchdog.ts`). With it,
+/// the UI starts no watchdog process of its own: this process is the watchdog.
+pub(crate) const DISARM_FILE_ENV: &str = "NEURON_TUI_DISARM_FILE";
+
+/// The UI's terminal resets (`ui/neuron-tui/src/utils/terminal-reset-sequences.ts`;
+/// a UI test checks the two agree): leave the alternate screen, turn off mouse
+/// tracking, focus reports and bracketed paste, pop the keyboard modes, show the
+/// cursor.
+pub(crate) const TERMINAL_RESET_SEQUENCES: &str = "\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[<u\x1b[>4;0m\x1b[?25h";
+
 /// Runs the UI with this binary as its engine. On Unix the UI replaces this
 /// process; on Windows this process waits for it, ignoring the console's
-/// Ctrl-C and Ctrl-Break (the UI handles those keys), prints the UI's exit
-/// message, and exits with its code.
+/// Ctrl-C and Ctrl-Break (the UI handles those keys), gives the console its
+/// input mode back, resets the terminal if the UI died in its modes, prints
+/// the UI's exit message, and exits with its code.
 pub(crate) fn run_ui(binary: &Path, args: &[String]) -> io::Result<i32> {
     let engine = env::current_exe()?;
     let mut command = Command::new(binary);
@@ -194,25 +206,53 @@ pub(crate) fn run_ui(binary: &Path, args: &[String]) -> io::Result<i32> {
         // The UI's own write races its renderer's teardown, which leaves the
         // alternate screen on a thread of its own; once the UI has exited, the
         // main screen is back for certain.
-        let exit_message = exit_message_file();
-        command.env(EXIT_MESSAGE_FILE_ENV, &exit_message);
+        let exit_message = temp_file("exit");
+        // This process waits for the UI anyway, so it is the UI's terminal
+        // watchdog. The UI's own one is a PowerShell on the user's console,
+        // which retitled the window and was one more process on its input.
+        let disarm = temp_file("terminal");
+        command
+            .env(EXIT_MESSAGE_FILE_ENV, &exit_message)
+            .env(DISARM_FILE_ENV, &disarm);
         let _guard = IgnoreConsoleInterrupts::install();
+        let input_mode = SavedInputMode::save();
         let status = command.status();
-        print_exit_message(&exit_message, &mut io::stdout());
+        input_mode.restore();
+        let mut stdout = io::stdout();
+        if ui_left_terminal_armed(&disarm) {
+            // The UI turned on virtual-terminal processing for the console;
+            // make sure the resets are read as such, not printed.
+            let _ = crossterm::ansi_support::supports_ansi();
+            let _ = io::Write::write_all(&mut stdout, TERMINAL_RESET_SEQUENCES.as_bytes());
+            let _ = io::Write::flush(&mut stdout);
+        }
+        print_exit_message(&exit_message, &mut stdout);
         Ok(status?.code().unwrap_or(1))
     }
 }
 
 /// A file name of this process's own in the temp folder.
 #[cfg_attr(unix, allow(dead_code))]
-fn exit_message_file() -> PathBuf {
+fn temp_file(kind: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
     env::temp_dir().join(format!(
-        "neuron-tui-exit-{}-{nanos}.txt",
+        "neuron-tui-{kind}-{}-{nanos}.txt",
         std::process::id()
     ))
+}
+
+/// Whether the UI exited with the terminal still in its modes: it wrote "armed"
+/// to `file` and never "disarmed" (it died, or its reset failed). Removes the file.
+/// No file means the UI never got as far as setting the terminal up.
+#[cfg_attr(unix, allow(dead_code))]
+fn ui_left_terminal_armed(file: &Path) -> bool {
+    let Ok(state) = std::fs::read_to_string(file) else {
+        return false;
+    };
+    let _ = std::fs::remove_file(file);
+    state.trim() == "armed"
 }
 
 /// Prints and removes the message the UI left in `file`, if it left one.
@@ -271,6 +311,47 @@ impl IgnoreConsoleInterrupts {
     fn install() -> Self {
         Self
     }
+}
+
+/// The console's input mode as this process found it, put back once the UI
+/// has exited. The UI's raw mode turns on virtual-terminal input, and a UI
+/// that died leaves it on: cmd's Up arrow then types `ESC [ A`, and an Enter
+/// typed under it reaches PowerShell as a character, not a key.
+#[cfg(windows)]
+struct SavedInputMode(Option<u32>);
+
+#[cfg(windows)]
+impl SavedInputMode {
+    fn save() -> Self {
+        Self(console_input().and_then(|console| console.mode().ok()))
+    }
+
+    fn restore(&self) {
+        if let (Some(mode), Some(console)) = (self.0, console_input()) {
+            let _ = console.set_mode(mode);
+        }
+    }
+}
+
+/// The console's input buffer (CONIN$, whatever stdin is); `None` without a
+/// console.
+#[cfg(windows)]
+fn console_input() -> Option<crossterm_winapi::ConsoleMode> {
+    crossterm_winapi::Handle::current_in_handle()
+        .ok()
+        .map(crossterm_winapi::ConsoleMode::from)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+struct SavedInputMode;
+
+#[cfg(all(not(unix), not(windows)))]
+impl SavedInputMode {
+    fn save() -> Self {
+        Self
+    }
+
+    fn restore(&self) {}
 }
 
 #[cfg(test)]
@@ -399,16 +480,54 @@ mod tests {
 
     #[test]
     fn the_exit_message_the_ui_left_is_printed_once_and_removed() {
-        let file = exit_message_file();
+        let file = temp_file("exit");
         let mut out = Vec::new();
         print_exit_message(&file, &mut out);
-        assert!(out.is_empty(), "nothing left, nothing printed");
+        assert_eq!(out, b"", "nothing left, nothing printed");
 
         let hint = "\nTo continue this session later, run:\nneuron --continue c1\n";
         std::fs::write(&file, hint).unwrap();
         print_exit_message(&file, &mut out);
         assert_eq!(String::from_utf8(out).unwrap(), hint);
         assert!(!file.exists(), "the file is removed");
-        assert_ne!(exit_message_file(), file, "each launch gets its own file");
+        assert_ne!(temp_file("exit"), file, "each launch gets its own file");
+    }
+
+    #[test]
+    fn the_terminal_is_reset_only_after_a_ui_that_died_in_its_modes() {
+        let file = temp_file("terminal");
+        // The UI never set the terminal up (it failed to start): leave it be.
+        assert!(!ui_left_terminal_armed(&file));
+
+        std::fs::write(&file, "armed").unwrap();
+        assert!(
+            ui_left_terminal_armed(&file),
+            "it died with the terminal in its modes"
+        );
+        assert!(!file.exists(), "the file is removed");
+
+        std::fs::write(&file, "disarmed").unwrap();
+        assert!(
+            !ui_left_terminal_armed(&file),
+            "it reset the terminal itself"
+        );
+        assert!(!file.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_saved_input_mode_comes_back_after_the_ui_changed_it() {
+        // Only where the tests have a console.
+        let Some(console) = console_input() else {
+            return;
+        };
+        let Ok(before) = console.mode() else {
+            return;
+        };
+        let saved = SavedInputMode::save();
+        // What the UI's raw mode does: virtual-terminal input on.
+        let _ = console.set_mode(before ^ 0x200);
+        saved.restore();
+        assert_eq!(console.mode().ok(), Some(before));
     }
 }

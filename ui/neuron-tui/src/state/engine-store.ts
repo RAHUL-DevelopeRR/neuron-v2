@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import { immer } from 'zustand/middleware/immer'
 
 import type { EngineConnection } from '../engine/neuron-engine-client'
+import type { QuestionTarget } from '../engine/questions'
 import type {
   ModelsEvent,
   PermissionRequestedEvent,
@@ -21,6 +22,11 @@ export interface EngineStoreState {
   version: string | null
   /** Why the engine is not running, after it failed to start or stopped. */
   error: string | null
+  /**
+   * That reason is already a line in the chat (or on the turn that was
+   * running), so the status bar does not repeat it.
+   */
+  errorInChat: boolean
   status: StatusEvent | null
   models: ModelsEvent | null
   usage: Omit<UsageEvent, 'type'> | null
@@ -32,12 +38,22 @@ export interface EngineStoreState {
    */
   pendingQuestion: string | null
   /**
+   * Where that question is drawn: its block in the turn's message, which the
+   * answer is written into. `null` when it is a chat line instead.
+   */
+  pendingQuestionTarget: QuestionTarget | null
+  /**
    * The device code of a `/login` in progress, until it ends. `approved` once
    * the engine said the sign-in worked and is opening the session.
    */
   signIn: (SignInCodeEvent & { receivedAt: number; approved: boolean }) | null
 
-  setConnection: (connection: EngineConnection, error?: string | null) => void
+  /** `errorInChat`: the chat already shows `error` (see {@link EngineStoreState.errorInChat}). */
+  setConnection: (
+    connection: EngineConnection,
+    error?: string | null,
+    errorInChat?: boolean,
+  ) => void
   setReady: (version: string) => void
   setStatus: (status: StatusEvent) => void
   setModels: (models: ModelsEvent) => void
@@ -46,7 +62,9 @@ export interface EngineStoreState {
   /** Drop a request once answered (or when the turn ends without one). */
   resolvePermission: (id: number) => void
   clearPermissions: () => void
+  /** Also forgets where the previous question was drawn. */
   setPendingQuestion: (question: string | null) => void
+  setPendingQuestionTarget: (target: QuestionTarget | null) => void
   setSignIn: (code: SignInCodeEvent | null, receivedAt?: number) => void
   markSignInApproved: () => void
   reset: () => void
@@ -68,24 +86,30 @@ const initial = {
   connection: 'not_started' as EngineConnection,
   version: null,
   error: null,
+  errorInChat: false,
   status: null,
   models: null,
   usage: null,
   permissionQueue: [] as PermissionRequestedEvent[],
   pendingQuestion: null,
+  pendingQuestionTarget: null,
   signIn: null,
 }
 
 export const useEngineStore = create<EngineStoreState>()(
   immer((set) => ({
     ...initial,
-    setConnection: (connection, error) =>
+    setConnection: (connection, error, errorInChat = false) =>
       set((state) => {
         state.connection = connection
-        if (error !== undefined) state.error = error
+        if (error !== undefined) {
+          state.error = error
+          state.errorInChat = error !== null && errorInChat
+        }
         if (connection === 'exited') {
           state.permissionQueue = []
           state.pendingQuestion = null
+          state.pendingQuestionTarget = null
           state.signIn = null
         }
       }),
@@ -94,6 +118,7 @@ export const useEngineStore = create<EngineStoreState>()(
         state.connection = 'ready'
         state.version = version
         state.error = null
+        state.errorInChat = false
       }),
     setStatus: (status) =>
       set((state) => {
@@ -126,6 +151,11 @@ export const useEngineStore = create<EngineStoreState>()(
     setPendingQuestion: (question) =>
       set((state) => {
         state.pendingQuestion = question
+        state.pendingQuestionTarget = null
+      }),
+    setPendingQuestionTarget: (target) =>
+      set((state) => {
+        state.pendingQuestionTarget = target
       }),
     setSignIn: (code, receivedAt = Date.now()) =>
       set((state) => {

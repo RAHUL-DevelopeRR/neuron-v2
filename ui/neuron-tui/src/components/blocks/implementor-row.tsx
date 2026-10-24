@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the status
+// check mark comes from utils/glyphs.ts. See ui/neuron-tui/PORTING.md.
 import { TextAttributes } from '@opentui/core'
 import React, { memo, useCallback, useMemo, useState } from 'react'
 
@@ -19,6 +21,7 @@ const EMPTY_STATE_LABELS = {
 import { useGridLayout } from '../../hooks/use-grid-layout'
 import { useTheme } from '../../hooks/use-theme'
 import { getAgentStatusInfo } from '../../utils/agent-helpers'
+import { GLYPHS } from '../../utils/glyphs'
 import {
   buildActivityTimeline,
   getImplementorDisplayName,
@@ -154,7 +157,7 @@ const ImplementorCard = memo(
     } = getAgentStatusInfo(agentBlock.status, theme)
     // Format: "● running" when streaming, "completed ✓" when done (checkmark at end)
     const statusText =
-      statusIndicator === '✓'
+      statusIndicator === GLYPHS.check
         ? `${statusLabel} ${statusIndicator}`
         : `${statusIndicator} ${statusLabel}`
 

@@ -65,7 +65,7 @@
   {
     "name": "bash_permission_prompt_approved",
     "category": "permissions",
-    "description": "Exercises workspace-write to bash escalation with a positive approval response.",
+    "description": "Exercises workspace-write to bash escalation approved by a settings allow rule (a run without a terminal is never prompted).",
     "parity_refs": [
       "Mock parity harness \u2014 milestone 2 (behavioral expansion)",
       "Permission enforcement across tool paths"
@@ -74,7 +74,7 @@
   {
     "name": "bash_permission_prompt_denied",
     "category": "permissions",
-    "description": "Exercises workspace-write to bash escalation with a denied approval response.",
+    "description": "Exercises workspace-write to bash escalation denied because nobody can approve it (stdin is not a terminal): exit code 2.",
     "parity_refs": [
       "Mock parity harness \u2014 milestone 2 (behavioral expansion)",
       "Permission enforcement across tool paths"

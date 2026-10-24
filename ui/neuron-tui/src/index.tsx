@@ -2,8 +2,10 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: startup no
 // longer loads a Codebuff auth token, handles `login`/`publish`, ships launch
 // and crash telemetry, loads `.agents` agents, skills or the tree-sitter wasm
-// for the SDK, or starts the engagement and process-census probes.
-// See ui/neuron-tui/PORTING.md.
+// for the SDK, or starts the engagement and process-census probes. It titles
+// the window "Neuron" (saving the console's own title and font for the exit)
+// before the watchdog starts, and `--continue` resumes the session saved with
+// the chat. See ui/neuron-tui/PORTING.md.
 
 import fs from 'fs'
 import os from 'os'
@@ -36,7 +38,7 @@ import {
   sweepLeakedRenderLibraryCopies,
 } from './utils/opentui-native-library'
 import { trimOversizedChatLogs } from './utils/chat-history'
-import { loadMostRecentChatState } from './utils/run-state-storage'
+import { resumeSessionFor } from './utils/run-state-storage'
 import { clearLogFile, logger } from './utils/logger'
 import { shouldShowProjectPicker } from './utils/project-picker'
 import { saveRecentProject } from './utils/recent-projects'
@@ -46,6 +48,7 @@ import {
   installProcessCleanupHandlers,
 } from './utils/renderer-cleanup'
 import { startTerminalWatchdog } from './utils/terminal-watchdog'
+import { restoreConsoleAtExit, startConsoleGuard } from './utils/console-guard'
 import { installTerminalProtocolController } from './utils/terminal-protocol-controller'
 import { detectTerminalTheme } from './utils/terminal-color-detection'
 import { setOscDetectedTheme } from './utils/theme-system'
@@ -104,7 +107,16 @@ async function main(): Promise<void> {
     engine: engineFlags,
   } = parseArgs()
 
-  await initializeApp({ cwd })
+  // The window is "Neuron" from the start. The console's own title (and, in
+  // a classic console window, its font) are saved first, before the
+  // watchdog's PowerShell can change them, and given back at exit.
+  startConsoleGuard()
+  process.once('exit', () => restoreConsoleAtExit())
+
+  await initializeApp({
+    cwd,
+    continueChat: continueChat ? { chatId: continueId ?? null } : null,
+  })
 
   // Show project picker only when user starts at the home directory or an ancestor
   const projectRoot = getProjectRoot()
@@ -124,9 +136,10 @@ async function main(): Promise<void> {
   const queryClient = createQueryClient()
 
   // The engine runs in the project folder, so it starts once one is chosen.
-  // `--continue` resumes the engine session the chat was saved with.
+  // `--continue` resumes the engine session the chat was saved with (saved
+  // as soon as the engine reported it, so also after an interrupted turn).
   const resumeSession = continueChat
-    ? loadMostRecentChatState(continueId ?? undefined)?.runState?.sessionId
+    ? resumeSessionFor(continueId ?? undefined)
     : undefined
   if (!showProjectPicker) {
     void startEngineSession({

@@ -29,8 +29,14 @@ export type MessageContent = TextContent | ImageContent
  */
 export interface RunState {
   traceSessionId?: string
-  /** The engine session (from its `status` event), for `--resume`. */
+  /**
+   * The engine session (from its `status` event), for `--resume`. Saved as
+   * soon as the engine reports it, so a chat whose turns were all interrupted
+   * still resumes its session (see engine/session-run-state.ts).
+   */
   sessionId?: string
+  /** The model that session was on (its `status` event). */
+  model?: string
   /** How the turn ended: `lastMessage`, or `error` with its message. */
   output: {
     type: string

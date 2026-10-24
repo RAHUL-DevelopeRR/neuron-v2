@@ -127,3 +127,42 @@ describe('ModelPicker focus', () => {
     expect(picker.focused()).toContain('› Model 3')
   })
 })
+
+describe('ModelPicker rows that cannot be picked', () => {
+  test('Enter says why, and stays open', async () => {
+    const models = catalog('auto')
+    models.models[1] = {
+      ...models.models[1]!,
+      available: false,
+      unavailable_reason: 'upgrade_required',
+    }
+    useEngineStore.getState().setModels(models)
+    const picker = await openPicker()
+    picker.mockInput.pressArrow('down')
+    await picker.settle()
+    picker.mockInput.pressEnter()
+    await picker.settle()
+    expect(switched).toEqual([])
+    expect(picker.closes()).toBe(0)
+    expect(picker.captureCharFrame()).toContain("Model 1 can't be picked: needs a plan upgrade.")
+
+    // Moving on clears it.
+    picker.mockInput.pressArrow('down')
+    await picker.settle()
+    expect(picker.captureCharFrame()).not.toContain("can't be picked")
+  })
+
+  test('a row too long for the width ends in an ellipsis', async () => {
+    const models = catalog('auto')
+    models.models[0] = {
+      ...models.models[0]!,
+      tiers: ['free', 'pro', 'max', 'team', 'enterprise', 'education', 'nonprofit', 'partner'],
+      context_window: 1_000_000,
+    }
+    useEngineStore.getState().setModels(models)
+    const picker = await openPicker()
+    const line = picker.focused()!
+    expect(line).toContain('› Auto  (current)')
+    expect(line).toMatch(/…\s*│$/)
+  })
+})

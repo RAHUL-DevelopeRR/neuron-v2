@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the close
+// mark comes from utils/glyphs.ts. See ui/neuron-tui/PORTING.md.
 /**
  * Ask User Tool - Multiple choice form with accordion-style FAQ layout
  *
@@ -8,7 +10,6 @@ import { TextAttributes } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
 import React, { useState, useCallback, useEffect, useRef } from 'react'
 
-
 import {
   AccordionQuestion,
   type AccordionAnswer,
@@ -16,6 +17,7 @@ import {
 import { getOptionLabel, KEYBOARD_HINTS, CUSTOM_OPTION_INDEX } from './constants'
 import { useTheme } from '../../hooks/use-theme'
 import { useChatStore } from '../../state/chat-store'
+import { GLYPHS } from '../../utils/glyphs'
 import { isPlainEnterKey } from '../../utils/terminal-enter-detection'
 import { BORDER_CHARS } from '../../utils/ui-constants'
 import { Button } from '../button'
@@ -505,7 +507,7 @@ export const MultipleChoiceForm: React.FC<MultipleChoiceFormProps> = ({
             padding: 0,
           }}
         >
-          <text style={{ fg: theme.muted }}>Close ✕</text>
+          <text style={{ fg: theme.muted }}>{`Close ${GLYPHS.close}`}</text>
         </Button>
       </box>
 

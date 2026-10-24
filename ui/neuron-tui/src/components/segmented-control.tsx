@@ -1,10 +1,64 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the corners
+// come from utils/ui-constants.ts (square in a classic Windows console
+// window), where the edges between segments are joints (┬ │ ┴) instead of
+// corners drawn over each other. See ui/neuron-tui/PORTING.md.
 import React, { useState } from 'react'
 import stringWidth from 'string-width'
 
 import { Button } from './button'
 import { useTheme } from '../hooks/use-theme'
+import { getGlyphMode } from '../utils/glyphs'
+import { BORDER_CHARS } from '../utils/ui-constants'
 
 import type { ChatTheme } from '../types/theme-system'
+import type { BorderCharacters } from '@opentui/core'
+
+/** One edge column of the control: its top, middle and bottom characters. */
+export type SegmentEdge = readonly [top: string, middle: string, bottom: string]
+
+/**
+ * The edge drawn left and right of each segment (`null`: none). Segments left
+ * of the hovered one draw their left edge, those right of it their right
+ * edge, and the hovered one both, so every boundary is drawn once, by the
+ * segment on the hovered side. With rounded corners (╭ ╮) Freebuff draws
+ * every edge as a corner, and the segments read as tabs stacked on each
+ * other. With square ones (a classic Windows console: ┌ ┐) those corners read
+ * as boxes drawn over each other (┌─────┌────┌───┐), so `joinInnerEdges`
+ * draws the edges between segments as joints (┌─────┬────┬───┐).
+ */
+export function segmentEdges(
+  count: number,
+  hoveredIndex: number,
+  chars: BorderCharacters,
+  joinInnerEdges: boolean,
+): Array<{ left: SegmentEdge | null; right: SegmentEdge | null }> {
+  const outerLeft: SegmentEdge = [chars.topLeft, chars.vertical, chars.bottomLeft]
+  const outerRight: SegmentEdge = [chars.topRight, chars.vertical, chars.bottomRight]
+  const joint: SegmentEdge = [chars.topT, chars.vertical, chars.bottomT]
+  const last = count - 1
+  return Array.from({ length: count }, (_, index) => ({
+    left:
+      index <= hoveredIndex
+        ? joinInnerEdges && index > 0
+          ? joint
+          : outerLeft
+        : null,
+    right:
+      index >= hoveredIndex
+        ? joinInnerEdges && index < last
+          ? joint
+          : outerRight
+        : null,
+  }))
+}
+
+const EdgeColumn = ({ edge, color }: { edge: SegmentEdge; color: string }) => (
+  <box style={{ flexDirection: 'column', gap: 0 }}>
+    <text fg={color} selectable={false}>{edge[0]}</text>
+    <text fg={color} selectable={false}>{edge[1]}</text>
+    <text fg={color} selectable={false}>{edge[2]}</text>
+  </box>
+)
 
 export interface Segment {
   id: string
@@ -47,6 +101,12 @@ export const SegmentedControl = ({
   const hoveredIndex = hoveredId
     ? processedSegments.findIndex((s) => s.id === hoveredId)
     : processedSegments.length - 1
+  const edges = segmentEdges(
+    processedSegments.length,
+    hoveredIndex,
+    BORDER_CHARS,
+    getGlyphMode() === 'console',
+  )
 
   return (
     <box
@@ -63,18 +123,11 @@ export const SegmentedControl = ({
     >
       {/* Segments rendered with dynamic left/right edges based on hover */}
       {processedSegments.map((seg, idx) => {
-        const leftOfHovered = idx <= hoveredIndex
-        const rightOfHovered = idx >= hoveredIndex
+        const { left, right } = edges[idx]!
 
         return (
           <React.Fragment key={seg.id}>
-            {leftOfHovered ? (
-              <box style={{ flexDirection: 'column', gap: 0 }}>
-                <text fg={seg.frameColor} selectable={false}>╭</text>
-                <text fg={seg.frameColor} selectable={false}>│</text>
-                <text fg={seg.frameColor} selectable={false}>╰</text>
-              </box>
-            ) : null}
+            {left ? <EdgeColumn edge={left} color={seg.frameColor} /> : null}
 
             <Button
               onClick={() => onSegmentClick && onSegmentClick(seg.id)}
@@ -102,13 +155,7 @@ export const SegmentedControl = ({
               <text fg={seg.frameColor}>{seg.bottomBorder}</text>
             </Button>
 
-            {rightOfHovered ? (
-              <box style={{ flexDirection: 'column', gap: 0 }}>
-                <text fg={seg.frameColor} selectable={false}>╮</text>
-                <text fg={seg.frameColor} selectable={false}>│</text>
-                <text fg={seg.frameColor} selectable={false}>╯</text>
-              </box>
-            ) : null}
+            {right ? <EdgeColumn edge={right} color={seg.frameColor} /> : null}
           </React.Fragment>
         )
       })}

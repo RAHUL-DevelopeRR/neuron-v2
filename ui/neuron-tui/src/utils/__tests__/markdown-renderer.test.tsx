@@ -172,6 +172,34 @@ describe('markdown renderer', () => {
     expect(textNodes).toContain('second')
   })
 
+  test('indents nested lists under their item, at every depth', async () => {
+    const markdown = [
+      '1. Install',
+      '   - run **bun install**',
+      '   - then build:',
+      '     - debug',
+      '2. Test',
+      '',
+      '   Run it twice.',
+    ].join('\n')
+    expect(textOf(flattenNodes(renderMarkdown(markdown))).trimEnd()).toBe(
+      [
+        '1. Install',
+        '   - run bun install',
+        '   - then build:',
+        '     - debug',
+        '2. Test',
+        '   Run it twice.',
+      ].join('\n'),
+    )
+    expect(await drawn('- a\n  1. b\n  2. c\n- d')).toEqual([
+      '- a',
+      '  1. b',
+      '  2. c',
+      '- d',
+    ])
+  })
+
   test('renders markdown without closing code fence while streaming', () => {
     const content = '**done**\n```js\nconsole.log('
     const output = renderStreamingMarkdown(content)

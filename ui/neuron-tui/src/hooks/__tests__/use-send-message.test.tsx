@@ -1,6 +1,7 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the run
 // lifecycle is driven through a fake engine client instead of the Codebuff
-// SDK's client.run(). See ui/neuron-tui/PORTING.md.
+// SDK's client.run(), and an interrupted turn keeps its engine session and
+// says how its running tool call ended. See ui/neuron-tui/PORTING.md.
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
@@ -17,16 +18,25 @@ import {
   type EngineExit,
   type NeuronEngineClient,
 } from '../../engine/neuron-engine-client'
+import { handleEngineEvent } from '../../engine/engine-session'
 import { setProjectRoot, tryGetProjectRoot } from '../../project-files'
 import { useChatStore } from '../../state/chat-store'
+import { useEngineStore } from '../../state/engine-store'
 import { stopActiveRun } from '../../utils/active-run'
-import { setChatDirOverrideForTesting } from '../../utils/run-state-storage'
+import {
+  flushLiveChatState,
+  resumeSessionFor,
+  saveChatState,
+  setChatDirOverrideForTesting,
+  settleCheckpointSave,
+} from '../../utils/run-state-storage'
 
 import type {
   Attachment,
   EngineCommand,
   PermissionReply,
   ReadyEvent,
+  StatusEvent,
   UiEvent,
 } from '../../engine/protocol'
 import type { SendMessageFn } from '../../types/contracts/send-message'
@@ -126,6 +136,24 @@ const waitFor = async (label: string, predicate: () => boolean) => {
 
 const savedMessages = () =>
   JSON.parse(fs.readFileSync(path.join(testRoot, 'chat-messages.json'), 'utf8'))
+const savedRunState = () =>
+  JSON.parse(fs.readFileSync(path.join(testRoot, 'run-state.json'), 'utf8'))
+
+/** The engine's footer status, naming its session. */
+const engineStatus = (
+  session_id: string,
+  model = 'nvidia/stepfun-ai/step-5-preview',
+): StatusEvent => ({
+  type: 'status',
+  model,
+  permission_mode: 'workspace-write',
+  session_id,
+  cwd: '/work',
+  workspace_trusted: true,
+  plan_mode: false,
+  context_percent: 0,
+  git: null,
+})
 
 beforeEach(() => {
   sendMessageFromHost = null
@@ -135,10 +163,12 @@ beforeEach(() => {
   setProjectRoot(process.cwd())
   setChatDirOverrideForTesting(testRoot)
   useChatStore.getState().reset()
+  useEngineStore.getState().reset()
 })
 
 afterEach(() => {
   stopActiveRun('process-exit')
+  useEngineStore.getState().reset()
   setChatDirOverrideForTesting(undefined)
   setProjectRoot(originalProjectRoot)
   fs.rmSync(testRoot, { recursive: true, force: true })
@@ -355,6 +385,123 @@ describe('useSendMessage with the engine client', () => {
     } finally {
       fake.emit({ type: 'turn_finished' })
       await run
+      flushSync(() => root.unmount())
+      setup.renderer.destroy()
+    }
+  })
+})
+
+describe('an interrupted turn', () => {
+  test('a chat whose only turn was interrupted still resumes the engine session on --continue', async () => {
+    const fake = new FakeEngine()
+    engine = fake
+    // The engine named its session before the prompt (the status after `ready`).
+    useEngineStore.getState().setStatus(engineStatus('session-42'))
+    const { setup, root } = await mountHost()
+    const run = sendMessageFromHost!({ content: 'run the slow check', agentMode: 'DEFAULT' })
+    try {
+      await waitFor('submit', () => fake.submits.length === 1)
+      // Ctrl-C stops the turn before it completes; then the UI quits.
+      stopActiveRun('user-interrupt')
+      fake.emit({ type: 'turn_finished' })
+      await run
+      await settleCheckpointSave()
+      flushLiveChatState()
+
+      // Was {"output":{"type":"error","message":"The session ended ..."}} with
+      // no session, and `--continue` started a fresh engine session.
+      const saved = savedRunState()
+      expect(saved.sessionId).toBe('session-42')
+      expect(saved.model).toBe('nvidia/stepfun-ai/step-5-preview')
+      expect(resumeSessionFor()).toBe('session-42')
+
+      // A later save without the session (an error output) keeps it.
+      saveChatState(
+        {
+          output: {
+            type: 'error',
+            message: 'The session ended before this response completed.',
+          },
+        },
+        useChatStore.getState().messages,
+        testRoot,
+      )
+      expect(savedRunState().output.type).toBe('error')
+      expect(resumeSessionFor()).toBe('session-42')
+    } finally {
+      flushSync(() => root.unmount())
+      setup.renderer.destroy()
+    }
+  })
+
+  test('a session named after the prompt is written into the saved chat at once', async () => {
+    const fake = new FakeEngine()
+    engine = fake
+    const { setup, root } = await mountHost()
+    const run = sendMessageFromHost!({ content: 'hello', agentMode: 'DEFAULT' })
+    try {
+      await waitFor('submit', () => fake.submits.length === 1)
+      // Saved at the turn's start, before the engine named its session.
+      expect(savedRunState().sessionId).toBeUndefined()
+      handleEngineEvent(engineStatus('session-7', 'groq/openai/gpt-oss-20b'))
+      expect(savedRunState().sessionId).toBe('session-7')
+      expect(savedRunState().model).toBe('groq/openai/gpt-oss-20b')
+      // The engine's signed-out stage has no session: nothing is written.
+      handleEngineEvent(engineStatus(''))
+      expect(savedRunState().sessionId).toBe('session-7')
+    } finally {
+      stopActiveRun('user-interrupt')
+      fake.emit({ type: 'turn_finished' })
+      await run
+      flushSync(() => root.unmount())
+      setup.renderer.destroy()
+    }
+  })
+
+  test('the running command says it was stopped, and its late result still reaches its row', async () => {
+    const fake = new FakeEngine()
+    engine = fake
+    const { setup, root } = await mountHost()
+    const run = sendMessageFromHost!({ content: 'run it', agentMode: 'DEFAULT' })
+    const tool = () =>
+      (useChatStore.getState().messages.at(-1)!.blocks ?? []).find(
+        (block) => block.type === 'tool',
+      ) as any
+    try {
+      await waitFor('submit', () => fake.submits.length === 1)
+      fake.emit({
+        type: 'tool_call_started',
+        id: 'toolu_slow',
+        name: 'bash',
+        input: JSON.stringify({ command: 'npm run slow-check' }),
+        cut_off: false,
+      })
+      await waitFor('tool row', () => tool() !== undefined)
+      stopActiveRun('user-interrupt')
+      await waitFor('interrupted row', () => tool()?.stopReason === 'interrupted')
+      expect(tool().output).toBeUndefined()
+
+      // The engine's result for the cancelled command (runtime/src/bash.rs).
+      fake.emit({
+        type: 'tool_result',
+        id: 'toolu_slow',
+        name: 'bash',
+        output: JSON.stringify({
+          stdout: 'slow check started, pid 5184\n',
+          stderr: 'Command was cancelled; the process tree was terminated',
+          interrupted: true,
+          returnCodeInterpretation: 'cancelled',
+        }),
+        is_error: true,
+      })
+      fake.emit({ type: 'turn_finished' })
+      await run
+
+      await waitFor('late result', () => tool()?.output !== undefined)
+      expect(tool().output).toContain('slow check started')
+      expect(tool().stopReason).toBe('interrupted')
+      expect(tool().output).not.toContain('No result')
+    } finally {
       flushSync(() => root.unmount())
       setup.renderer.destroy()
     }

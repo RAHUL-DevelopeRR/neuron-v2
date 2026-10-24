@@ -7,33 +7,56 @@
  */
 
 import { useChatStore } from '../state/chat-store'
-import { useEngineStore } from '../state/engine-store'
+import { needsSignIn, useEngineStore } from '../state/engine-store'
+import { consoleSafeText } from '../utils/glyphs'
 import { logger } from '../utils/logger'
 import { getSystemMessage } from '../utils/message-history'
 import {
+  existingCurrentChatDir,
+  recordChatEngineSession,
+} from '../utils/run-state-storage'
+import { afterConsoleCommand } from '../utils/console-guard'
+import {
   getNeuronEngineClient,
   setNeuronEngineClient,
+  type EngineExit,
   type EngineLaunchOptions,
 } from './neuron-engine-client'
+import { QUESTION_PREFIX } from './questions'
+import { engineSessionOf, withEngineSession } from './session-run-state'
 import { StdioEngineClient } from './stdio-engine-client'
 
-import type { UiEvent } from './protocol'
+import type { StatusEvent, UiEvent } from './protocol'
 
-/** AskUserQuestion reaches the UI as a notice with this prefix. */
-export const QUESTION_PREFIX = 'Question:'
+export { QUESTION_PREFIX }
 
 let turnActive = false
+/** The running turn's AI message, when it has one. */
+let turnMessageId: string | null = null
 
-/** While a turn runs, its own error is shown on its message instead. */
-export function setEngineTurnActive(active: boolean): void {
+/**
+ * While a turn runs, its own error is shown on its message instead, its
+ * retry notices go above that message, and its questions into it.
+ */
+export function setEngineTurnActive(active: boolean, messageId?: string): void {
   turnActive = active
+  turnMessageId = active ? (messageId ?? null) : null
   // A new turn has neither retried nor failed yet.
   if (active) forgetTurnRetries()
 }
 
-function showSystemMessage(text: string, id?: string): void {
-  const message = { ...getSystemMessage(text), ...(id && { id }) }
-  useChatStore.getState().setMessages((prev) => [...prev, message])
+/**
+ * A system line at the end of the chat, or right above the message `beforeId`
+ * when it is there.
+ */
+function showSystemMessage(text: string, id?: string, beforeId?: string | null): void {
+  // The engine's markers (⚠, ✓...) in characters this terminal's font has.
+  const message = { ...getSystemMessage(consoleSafeText(text)), ...(id && { id }) }
+  useChatStore.getState().setMessages((prev) => {
+    const index = beforeId ? prev.findIndex((entry) => entry.id === beforeId) : -1
+    if (index < 0) return [...prev, message]
+    return [...prev.slice(0, index), message, ...prev.slice(index)]
+  })
 }
 
 // ------------------------------------------------------------ engine wording
@@ -74,7 +97,7 @@ export type EngineNotice =
 /** How the UI shows an engine notice (see the interrupt notes above). */
 export function engineNotice(message: string): EngineNotice {
   if (SIGNED_OUT_REASON.test(message)) return { kind: 'drop' }
-  const text = inUiWording(message).trim()
+  const text = consoleSafeText(inUiWording(message).trim())
   if (!text || text === 'Interrupted.') return { kind: 'drop' }
   return { kind: 'show', text, untilTurnEnd: INTERRUPTING.test(text) }
 }
@@ -93,11 +116,15 @@ export function isRetryNotice(text: string): boolean {
 let noticeCount = 0
 
 /** Shows a notice under an id of its own, so it can be taken back. */
-function showTrackedNotice(text: string, ids: Set<string>): void {
+function showTrackedNotice(
+  text: string,
+  ids: Set<string>,
+  beforeId?: string | null,
+): void {
   noticeCount += 1
   const id = `sys-turn-notice-${Date.now()}-${noticeCount}`
   ids.add(id)
-  showSystemMessage(text, id)
+  showSystemMessage(text, id, beforeId)
 }
 
 function removeNotices(ids: Set<string>): void {
@@ -113,9 +140,10 @@ function removeNotices(ids: Set<string>): void {
 const turnScopedNotices = new Set<string>()
 
 /**
- * The running turn's retry notices. The turn's message was drawn before any
- * of them, so a turn that fails for good would show its final error above
- * "retrying in 1.3s": once it fails they are taken back (its error says how
+ * The running turn's retry notices. They go above the turn's message, which
+ * is drawn (and saved) before any of them: below it they read as coming after
+ * the answer. A turn that fails for good would show "retrying in 1.3s" next
+ * to its final error: once it fails they are taken back (its error says how
  * many attempts were made), and later ones are not shown.
  */
 const turnRetryNotices = new Set<string>()
@@ -131,7 +159,7 @@ function showNotice(notice: EngineNotice): void {
   if (notice.untilTurnEnd) {
     showTrackedNotice(notice.text, turnScopedNotices)
   } else if (turnActive && isRetryNotice(notice.text)) {
-    if (!turnFailed) showTrackedNotice(notice.text, turnRetryNotices)
+    if (!turnFailed) showTrackedNotice(notice.text, turnRetryNotices, turnMessageId)
   } else {
     showSystemMessage(notice.text)
   }
@@ -147,6 +175,25 @@ function markTurnFailed(): void {
   removeNotices(turnRetryNotices)
 }
 
+/**
+ * The engine's session goes into the chat's run state as soon as the engine
+ * names it, not when a turn completes: a chat whose only turn was interrupted
+ * must still resume it on `--continue` (see session-run-state.ts).
+ */
+export function recordEngineSessionInChat(status: StatusEvent): void {
+  const session = engineSessionOf(status)
+  if (!session) return
+  const chat = useChatStore.getState()
+  if (chat.runState) {
+    const next = withEngineSession(chat.runState, session)
+    if (next !== chat.runState) chat.setRunState(next)
+  }
+  // Only a chat that is already saved (a prompt was sent) is written: an
+  // empty one stays unsaved, and no chat directory is created for it.
+  const chatDir = existingCurrentChatDir()
+  if (chatDir) recordChatEngineSession(session, chatDir)
+}
+
 export function handleEngineEvent(event: UiEvent): void {
   const engine = useEngineStore.getState()
   switch (event.type) {
@@ -155,7 +202,10 @@ export function handleEngineEvent(event: UiEvent): void {
       return
     case 'status':
       engine.setStatus(event)
-      if (event.signed_in) engine.setSignIn(null)
+      recordEngineSessionInChat(event)
+      // A revoked stored login still reads as signed in while the engine
+      // waits for a sign-in: that is not the end of one.
+      if (event.signed_in && !needsSignIn(event)) engine.setSignIn(null)
       return
     case 'sign_in_code':
       engine.setSignIn(event)
@@ -179,7 +229,11 @@ export function handleEngineEvent(event: UiEvent): void {
       if (engine.signIn && !engine.signIn.approved) engine.markSignInApproved()
       if (event.message.startsWith(QUESTION_PREFIX)) {
         engine.setPendingQuestion(event.message)
-        showSystemMessage(event.message)
+        // A turn's question goes into its message (turn-events.ts), where
+        // the agent asked it; anywhere else it is a chat line.
+        if (!(turnActive && turnMessageId)) {
+          showSystemMessage(event.message)
+        }
         return
       }
       showNotice(engineNotice(event.message))
@@ -191,10 +245,17 @@ export function handleEngineEvent(event: UiEvent): void {
         showSystemMessage(`Error: ${inUiWording(event.message)}`)
       }
       return
+    case 'tool_result':
+      // The tool ran in the user's console: a command's cmd.exe retitled the
+      // window ("npm test"), a PowerShell changed its font. Put them back.
+      afterConsoleCommand()
+      return
     case 'turn_finished':
       // Nothing waits for an answer once the turn is over (a `/login` ends
       // with one too, signed in or not), and "Interrupting…" is over too.
-      // A turn that ended well keeps its retry notices.
+      // A turn that ended well keeps its retry notices. Its hooks ran in the
+      // console too (see tool_result).
+      afterConsoleCommand()
       engine.clearPermissions()
       engine.setPendingQuestion(null)
       engine.setSignIn(null)
@@ -248,15 +309,10 @@ async function launchEngineSession(launch: EngineLaunchOptions): Promise<void> {
   client.subscribe(handleEngineEvent)
   client.onExit((exit) => {
     if (getNeuronEngineClient() !== client) return
-    // No turn runs in an engine that stopped; one that was running failed.
-    dropTurnScopedNotices()
-    if (turnActive) markTurnFailed()
-    const wasReady = useEngineStore.getState().connection === 'ready'
-    const reason =
-      client.lastError ?? `The Neuron engine stopped (exit code ${exit.code}).`
-    useEngineStore.getState().setConnection('exited', reason)
-    // A failed start is reported by the catch below; this is a later stop.
-    if (wasReady && exit.code !== 0) showSystemMessage(reason)
+    handleEngineExit(exit, {
+      lastError: client.lastError,
+      stopRequested: client.stopRequested,
+    })
   })
 
   try {
@@ -264,9 +320,54 @@ async function launchEngineSession(launch: EngineLaunchOptions): Promise<void> {
   } catch (error) {
     if (getNeuronEngineClient() !== client) return
     const message = error instanceof Error ? error.message : String(error)
-    useEngineStore.getState().setConnection('exited', message)
+    useEngineStore.getState().setConnection('exited', message, true)
     showSystemMessage(message)
   }
+}
+
+/** The exit code of an engine that quit on its own after two interrupts. */
+const FORCED_QUIT_EXIT_CODE = 130
+
+let engineCrashed = false
+
+/**
+ * An engine stopped during this UI session without being asked to, after it
+ * was ready. The UI then exits non-zero (1), also when it was quit normally.
+ */
+export function engineCrashedThisSession(): boolean {
+  return engineCrashed
+}
+
+/** Test seam: forget an earlier crash. */
+export function resetEngineCrashForTesting(): void {
+  engineCrashed = false
+}
+
+/**
+ * The engine process ended. A stop the UI did not ask for, after the engine
+ * was ready, is said once: on the turn that was running (its message says
+ * "exited during the turn"), else as a chat line; the status bar then only
+ * says the engine is not running. A failed start is reported by its caller.
+ */
+export function handleEngineExit(
+  exit: EngineExit,
+  options: { lastError: string | null; stopRequested: boolean },
+): void {
+  // No turn runs in an engine that stopped; one that was running failed, and
+  // its message says so.
+  const turnShowsIt = turnActive && turnMessageId !== null
+  dropTurnScopedNotices()
+  if (turnActive) markTurnFailed()
+  const engine = useEngineStore.getState()
+  const wasReady = engine.connection === 'ready'
+  const reason =
+    options.lastError ?? `The Neuron engine stopped (exit code ${exit.code}).`
+  const unexpected =
+    wasReady && !options.stopRequested && (exit.code !== 0 || exit.signal !== null)
+  if (unexpected && exit.code !== FORCED_QUIT_EXIT_CODE) engineCrashed = true
+  const shownInChat = unexpected && !turnShowsIt
+  engine.setConnection('exited', reason, unexpected)
+  if (shownInChat) showSystemMessage(reason)
 }
 
 export async function stopEngineSession(): Promise<void> {

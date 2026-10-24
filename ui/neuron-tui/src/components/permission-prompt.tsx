@@ -3,10 +3,11 @@
  * place (and the keyboard) while a request waits:
  *
  *   y  allow this call            a  allow it for the session (when offered)
- *   n  deny                       e  deny with a note for the model
+ *   n  deny (also Esc)            e  deny with a note for the model
  *
- * Keys are ignored for the first 300 ms, so a key that was already on its
- * way (typing a prompt) cannot answer a request the user has not read.
+ * Ctrl-C interrupts the turn, as it does everywhere else while one runs.
+ * Other keys are ignored for the first 300 ms, so a key that was already on
+ * its way (typing a prompt) cannot answer a request the user has not read.
  */
 
 import { TextAttributes, type KeyEvent } from '@opentui/core'
@@ -18,6 +19,7 @@ import { getNeuronEngineClient } from '../engine/neuron-engine-client'
 import { displayPath } from '../engine/tool-mapping'
 import { useTheme } from '../hooks/use-theme'
 import { useEngineStore } from '../state/engine-store'
+import { stopActiveRun } from '../utils/active-run'
 import { logger } from '../utils/logger'
 import { BORDER_CHARS } from '../utils/ui-constants'
 
@@ -32,13 +34,19 @@ export const PERMISSION_KEY_GUARD_MS = 300
 export type PermissionKeyAction =
   | { type: 'decide'; decision: PermissionDecision }
   | { type: 'write-note' }
+  | { type: 'interrupt' }
   | { type: 'none' }
+
+const isCtrlC = (key: Pick<KeyEvent, 'name' | 'ctrl' | 'meta'>): boolean =>
+  key.ctrl && !key.meta && key.name === 'c'
 
 /** What a key does at the prompt (not while the note is being written). */
 export function resolvePermissionKey(
   key: Pick<KeyEvent, 'name' | 'ctrl' | 'meta'>,
   options: { armed: boolean; canAllowForSession: boolean },
 ): PermissionKeyAction {
+  // Never guarded: stopping the turn answers nothing.
+  if (isCtrlC(key)) return { type: 'interrupt' }
   if (!options.armed || key.ctrl || key.meta) return { type: 'none' }
   switch (key.name) {
     case 'y':
@@ -48,12 +56,38 @@ export function resolvePermissionKey(
         ? { type: 'decide', decision: { kind: 'allow_for_session' } }
         : { type: 'none' }
     case 'n':
+    case 'escape':
       return { type: 'decide', decision: { kind: 'deny', note: null } }
     case 'e':
       return { type: 'write-note' }
     default:
       return { type: 'none' }
   }
+}
+
+/** What a key does while the deny note is being written. */
+export function resolvePermissionNoteKey(
+  key: Pick<KeyEvent, 'name' | 'ctrl' | 'meta'>,
+): 'interrupt' | 'back' | 'none' {
+  if (isCtrlC(key)) return 'interrupt'
+  if (key.name === 'escape') return 'back'
+  return 'none'
+}
+
+/**
+ * Ctrl-C at the prompt: interrupt the turn (the engine cancels the call
+ * waiting for this answer) and close the prompt. The deny makes sure the
+ * engine is not left waiting for an answer if the interrupt finds no turn.
+ */
+export function interruptAtPermission(id: number): void {
+  if (!stopActiveRun('user-interrupt')) {
+    try {
+      getNeuronEngineClient().interrupt()
+    } catch (error) {
+      logger.warn({ error }, '[permission] interrupt failed')
+    }
+  }
+  answerPermission(id, { kind: 'deny', note: null })
 }
 
 /** The part of a call's input worth showing: the command, path or URL. */
@@ -109,10 +143,11 @@ export const PermissionPrompt = ({
     useCallback(
       (key: KeyEvent) => {
         if (note) {
-          if (key.name === 'escape') {
-            key.preventDefault?.()
-            setNote(null)
-          }
+          const noteAction = resolvePermissionNoteKey(key)
+          if (noteAction === 'none') return
+          key.preventDefault?.()
+          if (noteAction === 'back') setNote(null)
+          else interruptAtPermission(request.id)
           return
         }
         const action = resolvePermissionKey(key, { armed, canAllowForSession })
@@ -122,6 +157,10 @@ export const PermissionPrompt = ({
           setNote({ text: '', cursor: 0 })
           return
         }
+        if (action.type === 'interrupt') {
+          interruptAtPermission(request.id)
+          return
+        }
         answerPermission(request.id, action.decision)
       },
       [armed, canAllowForSession, note, request.id],
@@ -129,12 +168,13 @@ export const PermissionPrompt = ({
   )
 
   const summary = summarizePermissionInput(view)
-  const option = (keyLabel: string, label: string) => (
+  // No spaces after the last one: they would wrap onto a line of their own.
+  const option = (keyLabel: string, label: string, last = false) => (
     <span>
       <span fg={theme.primary} attributes={TextAttributes.BOLD}>
         {keyLabel}
       </span>
-      <span fg={theme.foreground}>{` ${label}   `}</span>
+      <span fg={theme.foreground}>{last ? ` ${label}` : ` ${label}   `}</span>
     </span>
   )
 
@@ -170,7 +210,8 @@ export const PermissionPrompt = ({
       {note ? (
         <box style={{ flexDirection: 'column', paddingTop: 1 }}>
           <text style={{ fg: theme.muted }}>
-            Why deny? The note goes to the model. Enter sends, Esc goes back.
+            Why deny? The note goes to the model. Enter sends, Esc goes back,
+            Ctrl-C stops the turn.
           </text>
           <MultilineInput
             value={note.text}
@@ -202,12 +243,15 @@ export const PermissionPrompt = ({
           />
         </box>
       ) : (
-        <text style={{ paddingTop: 1 }}>
-          {option('y', 'allow once')}
-          {canAllowForSession ? option('a', 'allow for session') : null}
-          {option('n', 'deny')}
-          {option('e', 'deny with a note')}
-        </text>
+        <box style={{ flexDirection: 'column', paddingTop: 1 }}>
+          <text>
+            {option('y', 'allow once')}
+            {canAllowForSession ? option('a', 'allow for session') : null}
+            {option('n', 'deny')}
+            {option('e', 'deny with a note', true)}
+          </text>
+          <text style={{ fg: theme.muted }}>esc deny · ctrl-c stop the turn</text>
+        </box>
       )}
     </box>
   )

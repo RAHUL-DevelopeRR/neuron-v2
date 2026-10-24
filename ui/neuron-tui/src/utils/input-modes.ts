@@ -5,6 +5,8 @@
 // 1. Add it to the InputMode type
 // 2. Add its configuration to INPUT_MODE_CONFIGS
 
+import { GLYPHS } from './glyphs'
+
 export type InputMode =
   | 'default'
   | 'bash'
@@ -121,7 +123,7 @@ export const INPUT_MODE_CONFIGS: Record<InputMode, InputModeConfig> = {
     blockKeyboardExit: false,
   },
   image: {
-    icon: '📎',
+    icon: GLYPHS.attachment,
     label: null,
     color: 'imageCardBorder',
     placeholder: 'enter image path or Ctrl+V to paste',
