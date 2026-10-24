@@ -2137,22 +2137,26 @@ fn announces_next_step(text: &str) -> bool {
         .any(|phrase| tail.starts_with(phrase) || tail.contains(&format!(". {phrase}")))
 }
 
-/// The file a successful edit tool call changed, from its arguments.
+/// The file a successful edit tool call changed: the `filePath` its result
+/// reports (the real path, also when the tool corrected a mistyped one), else
+/// the path in its arguments.
 fn edited_path(tool_name: &str, input: &str, result: &ConversationMessage) -> Option<String> {
     if !FILE_EDIT_TOOLS.contains(&tool_name) {
         return None;
     }
-    let succeeded = result.blocks.iter().any(|block| {
-        matches!(
-            block,
-            ContentBlock::ToolResult {
-                is_error: false,
-                ..
-            }
-        )
-    });
-    if !succeeded {
-        return None;
+    let output = result.blocks.iter().find_map(|block| match block {
+        ContentBlock::ToolResult {
+            output,
+            is_error: false,
+            ..
+        } => Some(output),
+        _ => None,
+    })?;
+    if let Some(path) = serde_json::from_str::<Value>(output)
+        .ok()
+        .and_then(|value| value.get("filePath")?.as_str().map(ToOwned::to_owned))
+    {
+        return Some(path);
     }
     let value = crate::tool_input::parse_tool_input(input).ok()?.value;
     ["path", "file_path", "notebook_path"]
@@ -5089,6 +5093,41 @@ mod resilience_tests {
             (stats.turns, stats.tool_calls),
             (11, 51),
             "this turn was recorded"
+        );
+    }
+
+    #[test]
+    fn edited_files_are_taken_from_the_result_before_the_arguments() {
+        let result = |output: &str, is_error: bool| {
+            ConversationMessage::tool_result(
+                "e1".to_string(),
+                "edit_file".to_string(),
+                output,
+                is_error,
+            )
+        };
+        let input = r#"{"path":"C:/work/mistyped-dir/app.py","old_string":"a","new_string":"b"}"#;
+        assert_eq!(
+            super::edited_path(
+                "edit_file",
+                input,
+                &result(r#"{"filePath":"C:/work/real-dir/app.py"}"#, false)
+            ),
+            Some("C:/work/real-dir/app.py".to_string()),
+            "the tool's corrected path wins"
+        );
+        assert_eq!(
+            super::edited_path("edit_file", input, &result("edited", false)),
+            Some("C:/work/mistyped-dir/app.py".to_string()),
+            "otherwise the argument"
+        );
+        assert_eq!(
+            super::edited_path("edit_file", input, &result("old_string not found", true)),
+            None
+        );
+        assert_eq!(
+            super::edited_path("read_file", input, &result("{}", false)),
+            None
         );
     }
 }
