@@ -9,8 +9,14 @@
 
 use std::collections::HashSet;
 use std::io::{self, IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
+
+/// Whether the last thing a sink printed on stdout was a tool's result. Results come
+/// from the tool sink, the answer after them from the next response's sink: stdout is
+/// one stream, so they share this, and the answer starts after a blank line.
+static STDOUT_AFTER_TOOL_RESULT: AtomicBool = AtomicBool::new(false);
 
 use neuron_tui::protocol::{TodoItem, UiEvent};
 use serde_json::Value;
@@ -103,10 +109,16 @@ impl TurnOutput {
     pub(crate) fn stream_sink(&self) -> Box<dyn TurnSink> {
         match self {
             Self::Silent => Box::new(SilentSink),
-            Self::Ansi if !io::stdout().is_terminal() => {
-                Box::new(AnsiSink::new(StripAnsi::new(io::stdout())))
-            }
-            Self::Ansi => Box::new(AnsiSink::new(SyncRenderBuffer::new()).clearing_spinner()),
+            Self::Ansi if !io::stdout().is_terminal() => Box::new(
+                AnsiSink::new(StripAnsi::new(io::stdout()))
+                    .spacing_tool_results(&STDOUT_AFTER_TOOL_RESULT),
+            ),
+            Self::Ansi => Box::new(
+                AnsiSink::new(SyncRenderBuffer::new())
+                    .clearing_spinner()
+                    .for_stdout_terminal()
+                    .spacing_tool_results(&STDOUT_AFTER_TOOL_RESULT),
+            ),
             Self::Channel(events) => Box::new(ChannelSink::new(Sender::clone(events))),
         }
     }
@@ -116,10 +128,15 @@ impl TurnOutput {
     pub(crate) fn tool_sink(&self) -> Box<dyn TurnSink> {
         match self {
             Self::Silent => Box::new(SilentSink),
-            Self::Ansi if !io::stdout().is_terminal() => {
-                Box::new(AnsiSink::new(StripAnsi::new(io::stdout())))
-            }
-            Self::Ansi => Box::new(AnsiSink::new(io::stdout())),
+            Self::Ansi if !io::stdout().is_terminal() => Box::new(
+                AnsiSink::new(StripAnsi::new(io::stdout()))
+                    .spacing_tool_results(&STDOUT_AFTER_TOOL_RESULT),
+            ),
+            Self::Ansi => Box::new(
+                AnsiSink::new(io::stdout())
+                    .for_stdout_terminal()
+                    .spacing_tool_results(&STDOUT_AFTER_TOOL_RESULT),
+            ),
             Self::Channel(events) => Box::new(ChannelSink::new(Sender::clone(events))),
         }
     }
@@ -148,6 +165,10 @@ impl<W: Write> StripAnsi<W> {
             inner,
             state: StripState::Text,
         }
+    }
+
+    pub(crate) fn into_inner(self) -> W {
+        self.inner
     }
 }
 
@@ -192,6 +213,11 @@ pub(crate) struct AnsiSink<W: Write> {
     reasoning: Option<HiddenReasoning>,
     /// The spinner's label may still be on the current line: the first write clears it.
     clear_spinner: bool,
+    /// Shared with the other sinks on the same stream ([`STDOUT_AFTER_TOOL_RESULT`]).
+    after_tool_result: Option<&'static AtomicBool>,
+    /// `out` is stdout's terminal: text goes through [`crate::console::stdout_text`]
+    /// (plain text, or a classic console's marks, where that terminal needs them).
+    stdout_terminal: bool,
 }
 
 /// A reasoning block the terminal keeps hidden, counted as it arrives.
@@ -224,7 +250,16 @@ impl<W: Write> AnsiSink<W> {
             markdown: MarkdownStreamState::default(),
             reasoning: None,
             clear_spinner: false,
+            after_tool_result: None,
+            stdout_terminal: false,
         }
+    }
+
+    /// For stdout's terminal (see [`Self::stdout_terminal`]).
+    #[must_use]
+    fn for_stdout_terminal(mut self) -> Self {
+        self.stdout_terminal = true;
+        self
     }
 
     /// For the terminal, where the turn's spinner was drawn on the line the output starts on.
@@ -234,18 +269,45 @@ impl<W: Write> AnsiSink<W> {
         self
     }
 
+    /// Text printed after a tool's result, by this sink or another one writing to the
+    /// same stream (`after_tool_result`), starts after a blank line.
+    #[must_use]
+    fn spacing_tool_results(mut self, after_tool_result: &'static AtomicBool) -> Self {
+        self.after_tool_result = Some(after_tool_result);
+        self
+    }
+
     fn write_flushed(&mut self, text: &str) -> io::Result<()> {
+        let mut shown = String::with_capacity(text.len() + 5);
         if std::mem::take(&mut self.clear_spinner) {
-            write!(self.out, "\r\x1b[2K")?;
+            shown.push_str("\r\x1b[2K");
         }
-        write!(self.out, "{text}")?;
+        shown.push_str(text);
+        let shown = if self.stdout_terminal {
+            crate::console::stdout_text(&shown)
+        } else {
+            std::borrow::Cow::Borrowed(shown.as_str())
+        };
+        self.out.write_all(shown.as_bytes())?;
         self.out.flush()
+    }
+
+    /// Assistant text, or a reasoning summary (which starts with its own blank line).
+    fn write_text(&mut self, text: &str, starts_blank: bool) -> io::Result<()> {
+        let after_tool_result = self
+            .after_tool_result
+            .is_some_and(|after| after.swap(false, Ordering::Relaxed));
+        if after_tool_result && !starts_blank {
+            self.write_flushed(&format!("\n{text}"))
+        } else {
+            self.write_flushed(text)
+        }
     }
 
     /// Prints the summary of a reasoning block that ended.
     fn finish_reasoning(&mut self) -> io::Result<()> {
         match self.reasoning.take() {
-            Some(reasoning) => self.write_flushed(&reasoning.summary()),
+            Some(reasoning) => self.write_text(&reasoning.summary(), true),
             None => Ok(()),
         }
     }
@@ -253,7 +315,7 @@ impl<W: Write> AnsiSink<W> {
     /// Prints what is still buffered of the text block.
     fn finish_text(&mut self) -> io::Result<()> {
         match self.markdown.flush(&self.renderer) {
-            Some(rendered) => self.write_flushed(&rendered),
+            Some(rendered) => self.write_text(&rendered, false),
             None => Ok(()),
         }
     }
@@ -276,7 +338,7 @@ impl<W: Write + Send> TurnSink for AnsiSink<W> {
     fn text_delta(&mut self, text: &str) -> io::Result<()> {
         self.finish_reasoning()?;
         match self.markdown.push(&self.renderer, text) {
-            Some(rendered) => self.write_flushed(&rendered),
+            Some(rendered) => self.write_text(&rendered, false),
             None => Ok(()),
         }
     }
@@ -284,7 +346,7 @@ impl<W: Write + Send> TurnSink for AnsiSink<W> {
     fn text_block(&mut self, text: &str) -> io::Result<()> {
         self.finish_reasoning()?;
         match self.markdown.render_block(&self.renderer, text) {
-            Some(rendered) => self.write_flushed(&rendered),
+            Some(rendered) => self.write_text(&rendered, false),
             None => Ok(()),
         }
     }
@@ -320,6 +382,10 @@ impl<W: Write + Send> TurnSink for AnsiSink<W> {
         } else {
             format_tool_call_start(name, input)
         };
+        // It starts with a blank line of its own.
+        if let Some(after) = self.after_tool_result {
+            after.store(false, Ordering::Relaxed);
+        }
         self.write_flushed(&format!("\n{line}\n"))
     }
 
@@ -330,7 +396,11 @@ impl<W: Write + Send> TurnSink for AnsiSink<W> {
         if !shown.ends_with('\n') {
             shown.push('\n');
         }
-        self.write_flushed(&shown)
+        self.write_flushed(&shown)?;
+        if let Some(after) = self.after_tool_result {
+            after.store(true, Ordering::Relaxed);
+        }
+        Ok(())
     }
 }
 
@@ -653,6 +723,35 @@ mod tests {
         assert!(printed.starts_with("\r\x1b[2K"), "{printed:?}");
         assert_eq!(printed.matches("\r\x1b[2K").count(), 1, "{printed:?}");
         assert!(printed.ends_with('\n'), "{printed:?}");
+    }
+
+    #[test]
+    fn the_answer_after_a_tool_result_starts_after_a_blank_line() {
+        static AFTER_TOOL_RESULT: AtomicBool = AtomicBool::new(false);
+        let mut out = StripAnsi::new(Vec::new());
+        // The result comes from the tool sink, the answer from the next response's.
+        {
+            let mut tools = AnsiSink::new(&mut out).spacing_tool_results(&AFTER_TOOL_RESULT);
+            tools
+                .tool_result("bash", r#"{"stdout":"hi\n","stderr":""}"#, false)
+                .unwrap();
+        }
+        {
+            let mut answer = AnsiSink::new(&mut out).spacing_tool_results(&AFTER_TOOL_RESULT);
+            answer.text_delta("All done.").unwrap();
+            answer.end_block().unwrap();
+            // Only the first text after the result.
+            answer.text_delta("More.").unwrap();
+            answer.end_block().unwrap();
+            // A tool call has its own blank line.
+            answer
+                .tool_call("t1", "bash", r#"{"command":"ls"}"#, false)
+                .unwrap();
+        }
+        let printed = String::from_utf8(out.inner).unwrap();
+        assert!(printed.contains("hi\n\nAll done."), "{printed:?}");
+        assert!(!printed.contains("\n\n\n"), "{printed:?}");
+        assert!(!AFTER_TOOL_RESULT.load(Ordering::Relaxed));
     }
 
     #[test]

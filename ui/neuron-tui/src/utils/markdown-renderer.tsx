@@ -1,7 +1,8 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: soft line
 // breaks render as line breaks (remark-breaks now runs), backslashes in
-// Windows paths survive, and tool data can be drawn as code without being
-// parsed. See ui/neuron-tui/PORTING.md.
+// Windows paths survive, tool data can be drawn as code without being parsed,
+// and a list item's later lines (nested lists) are indented under its text.
+// See ui/neuron-tui/PORTING.md.
 import { TextAttributes } from '@opentui/core'
 import React from 'react'
 import remarkBreaks from 'remark-breaks'
@@ -673,16 +674,24 @@ const renderList = (list: List, state: RenderState): ReactNode[] => {
     const itemNodes = trimTrailingBreaks(
       renderNodes(listItem.children as MarkdownNode[], state, listItem.type),
     )
-    if (itemNodes.length === 0) {
-      nodes.push('\n')
-    } else {
-      nodes.push(
-        <KeyedFragment key={nextKey()}>
-          {wrapSegmentsInFragments(itemNodes, nextKey())}
-        </KeyedFragment>,
-      )
-      nodes.push('\n')
-    }
+    // The item's later lines (a nested list, another paragraph) sit under its
+    // text, past the marker. Line breaks and indents stay top-level strings,
+    // so an enclosing list indents a nested list's lines once more.
+    const indent = ' '.repeat(stringWidth(marker))
+    splitNodesByNewline(itemNodes).forEach((line, lineIndex) => {
+      if (lineIndex > 0) {
+        nodes.push('\n')
+        if (line.length > 0) nodes.push(indent)
+      }
+      if (line.length > 0) {
+        nodes.push(
+          <KeyedFragment key={nextKey()}>
+            {wrapSegmentsInFragments(line, nextKey())}
+          </KeyedFragment>,
+        )
+      }
+    })
+    nodes.push('\n')
   })
 
   if (nodes.length > 0) {

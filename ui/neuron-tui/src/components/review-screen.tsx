@@ -1,8 +1,11 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
+// selection marker comes from utils/glyphs.ts. See ui/neuron-tui/PORTING.md.
 import { useKeyboard } from '@opentui/react'
 import React, { useCallback, useState } from 'react'
 
 import { buildReviewPrompt } from '../commands/prompt-builders'
 import { useTheme } from '../hooks/use-theme'
+import { GLYPHS } from '../utils/glyphs'
 import { isPlainEnterKey } from '../utils/terminal-enter-detection'
 import { BORDER_CHARS } from '../utils/ui-constants'
 
@@ -99,7 +102,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
               bg: isSelected ? theme.surface : undefined,
             }}
           >
-            {isSelected ? '❯ ' : '  '}
+            {isSelected ? `${GLYPHS.pointer} ` : '  '}
             {option.label}
           </text>
         )

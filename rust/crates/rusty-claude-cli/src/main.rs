@@ -39,6 +39,9 @@
     clippy::many_single_char_names,
     clippy::wildcard_imports
 )]
+// First: its `println!` family is the one every module below prints with.
+#[macro_use]
+mod console;
 mod account;
 mod api_client;
 mod args;
@@ -59,6 +62,7 @@ mod full_screen;
 mod gateway_catalog;
 mod gateway_http;
 mod gateway_repl;
+mod headless;
 mod init;
 mod input;
 mod orchestrator;
@@ -318,25 +322,6 @@ fn failed_turn_json(error: &str, model: &str, messages: &[ConversationMessage]) 
     })
 }
 
-/// Read piped stdin content when stdin is not a terminal.
-///
-/// Returns `None` when stdin is attached to a terminal (interactive REPL use),
-/// when reading fails, or when the piped content is empty after trimming.
-/// Returns `Some(raw_content)` when a pipe delivered non-empty content.
-fn read_piped_stdin() -> Option<String> {
-    if io::stdin().is_terminal() {
-        return None;
-    }
-    let mut buffer = String::new();
-    if io::stdin().read_to_string(&mut buffer).is_err() {
-        return None;
-    }
-    if buffer.trim().is_empty() {
-        return None;
-    }
-    Some(buffer)
-}
-
 /// Merge a piped stdin payload into a prompt argument.
 ///
 /// When `stdin_content` is `None` or empty after trimming, the prompt is
@@ -358,6 +343,9 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Before anything prints: a classic Windows console shows colours as text until
+    // VT processing is on, and its fonts need other marks.
+    console::init();
     // The trust prompt and the config loader must read the same trust store.
     runtime::workspace_trust::set_trust_store_path(
         credentials::neuron_home().join("trusted_dirs.txt"),
@@ -441,7 +429,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             run_stale_base_preflight(base_commit.as_deref());
             progress::set_mcp_startup(McpStartup::WaitWithoutBundled);
             // Workspace trust check (skip when stdin is piped so we don't consume the pipe)
-            if std::io::stdin().is_terminal() {
+            if runtime::ui_hooks::stdin_is_terminal() {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 if !crate::auth::check_trust(&cwd) {
                     std::process::exit(1);
@@ -449,31 +437,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             let permission_mode = crate::args::permission_mode_after_trust(permission_mode);
             let model = crate::args::model_after_trust(model);
+            // JSON mode: stderr carries only the JSON error, not the Azure notice.
+            provider::set_json_output(output_format == CliOutputFormat::Json);
             // ── Resolve provider (Azure primary → OpenRouter fallback) ──
             // The provider always dictates the model — when Azure is up we
             // use gpt-5.5, when falling back to OpenRouter we MUST switch
             // to the free-tier model regardless of what the user passed.
             let effective_model = configure_provider_for_model(model)?;
-            // Only consume piped stdin as prompt context when the permission
-            // mode is fully unattended. In modes where the permission
-            // prompter may invoke CliPermissionPrompter::decide(), stdin
-            // must remain available for interactive approval; otherwise the
-            // prompter's read_line() would hit EOF and deny every request.
-            let stdin_context = if matches!(permission_mode, PermissionMode::DangerFullAccess) {
-                read_piped_stdin()
-            } else {
-                None
-            };
-            // If -p was used with no trailing text, read piped stdin regardless of
-            // permission mode so `echo 'hello' | neuron -p` works as expected.
-            let stdin_context = if prompt.trim().is_empty() {
-                read_piped_stdin()
-            } else {
-                stdin_context
-            };
+            // `cat log | neuron prompt "explain this log"`: what stdin carries is context
+            // for the prompt, in any permission mode. A run whose stdin is not a terminal
+            // never asks for approval (approvals and questions are refused), so reading
+            // it takes nothing from them. `echo 'hello' | neuron -p`: stdin is the prompt.
+            let stdin_context = headless::stdin_context(!prompt.trim().is_empty(), output_format);
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
             let mut cli = LiveCli::new(effective_model, true, allowed_tools, permission_mode)?;
             cli.set_reasoning_effort(reasoning_effort);
+            // Nobody to answer (stdin not a terminal): approvals and questions are refused.
+            headless::start(headless::stdin_is_unattended(), output_format);
             // Print a condensed welcome banner for one-shot mode so the user
             // sees model info and quota even when not in the REPL.
             // Not to a file or a pipe: there it is noise around the answer.
@@ -482,7 +462,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", format_connected_line(&cli.model));
                 println!();
             }
-            cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
+            let result = cli.run_turn_with_output(&effective_prompt, output_format, compact);
+            // Tool calls denied for lack of a prompt: named once more, and exit code 2.
+            let denied_exit = headless::report(output_format);
+            result?;
+            if let Some(code) = denied_exit {
+                drop(cli);
+                std::process::exit(code);
+            }
         }
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
         CliAction::Acp { output_format } => print_acp_status(output_format)?,
@@ -1175,7 +1162,7 @@ fn run_resume_command(
                     session.model.as_deref().unwrap_or("restored-session"),
                     StatusUsage {
                         message_count: session.messages.len(),
-                        turns: tracker.turns(),
+                        turns: prompt_count(session),
                         latest: tracker.current_turn_usage(),
                         cumulative: usage,
                         estimated_tokens: 0,
@@ -1187,7 +1174,7 @@ fn run_resume_command(
                     session.model.as_deref(),
                     StatusUsage {
                         message_count: session.messages.len(),
-                        turns: tracker.turns(),
+                        turns: prompt_count(session),
                         latest: tracker.current_turn_usage(),
                         cumulative: usage,
                         estimated_tokens: 0,
@@ -1594,11 +1581,15 @@ struct RuntimePluginState {
 struct RuntimeMcpState {
     runtime: tokio::runtime::Runtime,
     manager: McpServerManager,
-    pending_servers: Vec<String>,
+    /// Servers that could not start, or whose transport is unsupported.
+    failed_servers: Vec<String>,
     degraded_report: Option<runtime::McpDegradedReport>,
     /// A stand-in while the servers start in the background ([`BackgroundMcp`]): it has
     /// no tools yet, and calls say so.
     starting: bool,
+    /// A stand-in's background start, which can finish during a turn: the servers are
+    /// taken only before the next one.
+    background: Option<Arc<BackgroundMcpShared>>,
 }
 
 struct BuiltRuntime {
@@ -1729,9 +1720,10 @@ impl RuntimeMcpState {
         Ok(Some(Self {
             runtime: tokio::runtime::Runtime::new()?,
             manager,
-            pending_servers: Vec::new(),
+            failed_servers: Vec::new(),
             degraded_report: None,
             starting: false,
+            background: None,
         }))
     }
 
@@ -1758,7 +1750,7 @@ impl RuntimeMcpState {
                 discovery
             }
         };
-        let pending_servers = discovery
+        let failed_server_list = discovery
             .failed_servers
             .iter()
             .map(|failure| failure.server_name.clone())
@@ -1776,7 +1768,7 @@ impl RuntimeMcpState {
             .iter()
             .map(|tool| tool.qualified_name.clone())
             .collect::<Vec<_>>();
-        let failed_server_names = pending_servers.iter().cloned().collect::<BTreeSet<_>>();
+        let failed_server_names = failed_server_list.iter().cloned().collect::<BTreeSet<_>>();
         let working_servers = self
             .manager
             .server_names()
@@ -1823,18 +1815,56 @@ impl RuntimeMcpState {
                 available_tools,
             )
         });
-        self.pending_servers = pending_servers;
+        self.failed_servers = failed_server_list;
         Some(discovery)
     }
 
-    /// The error for a call that came before the servers finished starting.
+    /// The error for a call that came before the servers joined.
     fn still_starting(&self) -> Result<(), ToolError> {
-        if self.starting {
-            return Err(ToolError::new(
-                "the MCP servers are still starting; try again in a moment",
-            ));
+        if !self.starting {
+            return Ok(());
         }
-        Ok(())
+        Err(ToolError::new(match self.background_start() {
+            None => "the MCP servers are still starting; try again in a moment",
+            Some(true) if !self.all_failed() => {
+                "the MCP servers have finished starting; their tools join the next turn"
+            }
+            Some(_) => "the MCP servers could not start",
+        }))
+    }
+
+    /// `None` while a stand-in's servers start in the background; then whether they
+    /// started (during a turn they join the next one).
+    fn background_start(&self) -> Option<bool> {
+        self.background
+            .as_ref()
+            .and_then(|background| background.finished())
+    }
+
+    /// Every server failed (a stand-in whose background start ended counts).
+    fn all_failed(&self) -> bool {
+        let servers = self.server_names();
+        let failed = self.failed_server_names().unwrap_or_default();
+        !servers.is_empty() && servers.iter().all(|server| failed.contains(server))
+    }
+
+    /// ToolSearch's note while a stand-in's servers are missing; `None` otherwise. It
+    /// names the servers as `pending_mcp_servers` and `failed_mcp_servers` list them.
+    fn starting_note(&self) -> Option<String> {
+        if !self.starting {
+            return None;
+        }
+        Some(match self.background_start() {
+            None => "The MCP servers in pending_mcp_servers are still starting, so their tools are not searchable yet; search again in a moment.".to_string(),
+            Some(true) if !self.all_failed() => {
+                let mut note = "The MCP servers have finished starting; their tools join the next turn, not this one.".to_string();
+                if self.failed_server_names().is_some() {
+                    note.push_str(" The ones in failed_mcp_servers could not start.");
+                }
+                note
+            }
+            Some(_) => "The MCP servers in failed_mcp_servers could not start; their tools are unavailable.".to_string(),
+        })
     }
 
     fn shutdown(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -1842,19 +1872,30 @@ impl RuntimeMcpState {
         Ok(())
     }
 
-    /// Servers whose tools are missing: the ones that failed, or every server while they
-    /// start in the background.
+    /// Servers still starting in the background, whose tools are not searchable yet.
     fn pending_servers(&self) -> Option<Vec<String>> {
-        let pending = if self.starting {
-            self.server_names()
-        } else {
-            self.pending_servers.clone()
-        };
-        (!pending.is_empty()).then_some(pending)
+        (self.starting && self.background_start().is_none())
+            .then(|| self.server_names())
+            .filter(|pending| !pending.is_empty())
     }
 
-    fn is_starting(&self) -> bool {
-        self.starting
+    /// Servers that could not start (or whose transport is unsupported): their tools
+    /// are unavailable. For a stand-in, the ones its background start reported.
+    fn failed_server_names(&self) -> Option<Vec<String>> {
+        let failed = if self.starting {
+            match self.background_start() {
+                None => Vec::new(),
+                Some(true) => self
+                    .background
+                    .as_ref()
+                    .map(|background| background.failed_servers())
+                    .unwrap_or_default(),
+                Some(false) => self.server_names(),
+            }
+        } else {
+            self.failed_servers.clone()
+        };
+        (!failed.is_empty()).then_some(failed)
     }
 
     fn degraded_report(&self) -> Option<runtime::McpDegradedReport> {
@@ -1865,16 +1906,28 @@ impl RuntimeMcpState {
         self.manager.server_names()
     }
 
+    /// Calls an MCP tool. An interrupt or the session's end (`cancel`) abandons the call
+    /// instead of waiting for the server: the server is stopped, and starts again on its
+    /// next call.
     fn call_tool(
         &mut self,
         qualified_tool_name: &str,
         arguments: Option<serde_json::Value>,
+        cancel: &runtime::CancellationToken,
     ) -> Result<String, ToolError> {
         self.still_starting()?;
         let response = self
             .runtime
-            .block_on(self.manager.call_tool(qualified_tool_name, arguments))
-            .map_err(|error| ToolError::new(error.to_string()))?;
+            .block_on(
+                self.manager
+                    .call_tool_unless_cancelled(qualified_tool_name, arguments, cancel),
+            )
+            .map_err(|error| ToolError::new(error.to_string()))?
+            .ok_or_else(|| {
+                ToolError::new(format!(
+                    "MCP tool `{qualified_tool_name}` was interrupted: the call was abandoned and its server stopped"
+                ))
+            })?;
         if let Some(error) = response.error {
             return Err(ToolError::new(format!(
                 "MCP tool `{qualified_tool_name}` returned JSON-RPC error: {} ({})",
@@ -1986,6 +2039,9 @@ struct BackgroundMcp {
 struct BackgroundMcpShared {
     outcome: Mutex<BackgroundMcpOutcome>,
     cancel: tokio::sync::Notify,
+    /// The servers that could not start, once the start ended: the stand-in reports
+    /// them after the started servers were taken.
+    failed: Mutex<Vec<String>>,
 }
 
 enum BackgroundMcpOutcome {
@@ -2004,6 +2060,7 @@ impl BackgroundMcp {
         let shared = Arc::new(BackgroundMcpShared {
             outcome: Mutex::new(BackgroundMcpOutcome::Starting),
             cancel: tokio::sync::Notify::new(),
+            failed: Mutex::new(Vec::new()),
         });
         let worker = Arc::clone(&shared);
         let spawned = thread::Builder::new()
@@ -2011,6 +2068,11 @@ impl BackgroundMcp {
             .spawn(move || {
                 let finished = match RuntimeMcpState::not_started(&servers) {
                     Ok(Some(mut state)) => state.start(Some(&worker.cancel)).map(|discovery| {
+                        worker
+                            .failed
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone_from(&state.failed_servers);
                         // All the runtime tools: they replace the stand-in's.
                         let mut tools = discovery
                             .tools
@@ -2090,6 +2152,23 @@ impl BackgroundMcpShared {
         self.outcome
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The servers that could not start, once the start ended.
+    fn failed_servers(&self) -> Vec<String> {
+        self.failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// `None` while the servers start; then whether they started (taken counts).
+    fn finished(&self) -> Option<bool> {
+        match &*self.lock() {
+            BackgroundMcpOutcome::Starting => None,
+            BackgroundMcpOutcome::Started(..) | BackgroundMcpOutcome::Done => Some(true),
+            BackgroundMcpOutcome::Failed(_) => Some(false),
+        }
     }
 }
 
@@ -2364,8 +2443,9 @@ impl LiveCli {
             |_| "<unknown>".to_string(),
             |path| {
                 let s = path.display().to_string();
-                if s.len() > 35 {
-                    format!("...{}", &s[s.len() - 32..])
+                let chars = s.chars().count();
+                if chars > 35 {
+                    format!("...{}", s.chars().skip(chars - 32).collect::<String>())
                 } else {
                     s
                 }
@@ -2374,6 +2454,17 @@ impl LiveCli {
         let username = env::var("USERNAME")
             .or_else(|_| env::var("USER"))
             .unwrap_or_else(|_| "Developer".to_string());
+        // Long names are cut to fit their panel, so the borders line up.
+        let fit = |text: &str, width: usize| -> String {
+            if text.chars().count() <= width {
+                return text.to_string();
+            }
+            let kept = text
+                .chars()
+                .take(width.saturating_sub(3))
+                .collect::<String>();
+            format!("{kept}...")
+        };
         let model_short = self.model.split('/').last().unwrap_or(&self.model);
         let active = provider::active_provider();
         let provider = active.as_ref().map_or_else(
@@ -2435,117 +2526,112 @@ impl LiveCli {
             rs = " ".repeat(w_right),
         ));
 
-        // Welcome + Tips heading
-        let welcome = format!("{w}{bd}Welcome back, {user}!{r}", user = username);
+        // A row of the box: each cell padded to its panel's width, art and text alike.
+        let row = |left: &str, right: &str| {
+            format!(
+                "  {b}|{r}{left}{lpad}{b}|{r}{right}{rpad}{b}|{r}",
+                lpad = " ".repeat(w_left.saturating_sub(brand::strip_ansi_len(left))),
+                rpad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(right))),
+            )
+        };
+        let red = RED;
+
+        // Welcome + Tips heading: "Welcome back" after a first session, to the account.
+        let email = crate::auth::current_credential()
+            .ok()
+            .flatten()
+            .filter(|credential| !credential.is_expired(crate::clock::now_unix()))
+            .and_then(|credential| credential.email);
+        let returning = session_mgmt::has_other_saved_session(&self.session.path);
+        let greeting = banner_greeting(email.as_deref(), &username, returning, w_left - 2);
+        let welcome = format!("{w}{bd}{greeting}{r}");
         let tips = format!("{o}{bd}Tips for getting started{r}");
-        lines.push(format!(
-            "  {b}|{r}  {welcome}{wpad}{b}|{r}  {tips}{tpad}{b}|{r}",
-            wpad = " ".repeat(w_left.saturating_sub(brand::strip_ansi_len(&welcome) + 2)),
-            tpad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&tips) + 2)),
-        ));
+        lines.push(row(&format!("  {welcome}"), &format!("  {tips}")));
 
         // Tips content
         let tip1 = format!("{d}Run{r} {o}/init{r} {d}to create a NEURON.md{r}");
-        lines.push(format!(
-            "  {b}|{r}{ls}{b}|{r}  {tip1}{tpad}{b}|{r}",
-            ls = " ".repeat(w_left),
-            tpad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&tip1) + 2)),
-        ));
+        lines.push(row("", &format!("  {tip1}")));
 
         let tip2 = format!("{d}file with project context{r}");
-        lines.push(format!(
-            "  {b}|{r}   {s}*{r}        {s}.{r}        {s}*{r}   {hpad}{b}|{r}  {tip2}{tpad}{b}|{r}",
-            hpad = " ".repeat(w_left.saturating_sub(27)),
-            tpad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&tip2) + 2)),
+        lines.push(row(
+            &format!("   {s}*{r}        {s}.{r}        {s}*{r}"),
+            &format!("  {tip2}"),
         ));
 
         let tip3 = format!("{d}instructions for Neuron...{r}");
-        lines.push(format!(
-            "  {b}|{r}  {s}.{r}  {b}\\--\\{r}    {b}/--/{r}  {s}.{r}   {hpad}{b}|{r}  {tip3}{tpad}{b}|{r}",
-            hpad = " ".repeat(w_left.saturating_sub(27)),
-            tpad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&tip3) + 2)),
+        lines.push(row(
+            &format!("  {s}.{r}  {b}\\--\\{r}    {b}/--/{r}  {s}.{r}"),
+            &format!("  {tip3}"),
         ));
 
         // Helix center rows + what's new
         let whatsnew = format!("{o}{bd}What's new{r}");
-        lines.push(format!(
-            "  {b}|{r} {s}*{r}    {b}\\--{o}X{RED}----{o}X{b}--/{r}    {s}*{r}   {hpad}{b}|{r}{rpad}{b}|{r}",
-            RED=RED, hpad = " ".repeat(w_left.saturating_sub(30)),
-            rpad = " ".repeat(w_right),
+        lines.push(row(
+            &format!(" {s}*{r}    {b}\\--{o}X{red}----{o}X{b}--/{r}    {s}*{r}"),
+            "",
         ));
-
-        lines.push(format!(
-            "  {b}|{r} {s}.{r}  {g}/{b}--/{r}  {s}.  .{r}  {b}\\--{g}\\{r}  {s}.{r}  {hpad}{b}|{r}  {whatsnew}{wpad}{b}|{r}",
-            hpad = " ".repeat(w_left.saturating_sub(30)),
-            wpad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&whatsnew) + 2)),
+        lines.push(row(
+            &format!(" {s}.{r}  {g}/{b}--/{r}  {s}.  .{r}  {b}\\--{g}\\{r}  {s}.{r}"),
+            &format!("  {whatsnew}"),
         ));
 
         // What's new items
         let news = [
             format!("{d}- Zero-X model catalog: /model{r}"),
             format!("{d}- Plan usage: /usage, /upgrade{r}"),
-            format!("{d}- {repo_status}{r}"),
+            format!("{d}- {}{r}", fit(&repo_status, w_right - 4)),
             format!("{d}/release-notes for more{r}"),
         ];
-
-        lines.push(format!(
-            "  {b}|{r}    {RED}X{b}--/{r}   {s}.  .{r}   {b}\\--{RED}X{r}   {hpad}{b}|{r}  {n}{npad}{b}|{r}",
-            RED=RED, hpad = " ".repeat(w_left.saturating_sub(30)),
-            n = news[0], npad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&news[0]) + 2)),
+        lines.push(row(
+            &format!("    {red}X{b}--/{r}   {s}.  .{r}   {b}\\--{red}X{r}"),
+            &format!("  {}", news[0]),
         ));
-
-        lines.push(format!(
-            "  {b}|{r} {s}.{r}  {g}\\{b}--/{r}  {s}.  .{r}  {b}\\--{g}/{r}  {s}.{r}  {hpad}{b}|{r}  {n}{npad}{b}|{r}",
-            hpad = " ".repeat(w_left.saturating_sub(30)),
-            n = news[1], npad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&news[1]) + 2)),
+        lines.push(row(
+            &format!(" {s}.{r}  {g}\\{b}--/{r}  {s}.  .{r}  {b}\\--{g}/{r}  {s}.{r}"),
+            &format!("  {}", news[1]),
         ));
-
-        lines.push(format!(
-            "  {b}|{r} {s}*{r}    {b}\\--{o}X{RED}----{o}X{b}--/{r}    {s}*{r}   {hpad}{b}|{r}  {n}{npad}{b}|{r}",
-            RED=RED, hpad = " ".repeat(w_left.saturating_sub(30)),
-            n = news[2], npad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&news[2]) + 2)),
+        lines.push(row(
+            &format!(" {s}*{r}    {b}\\--{o}X{red}----{o}X{b}--/{r}    {s}*{r}"),
+            &format!("  {}", news[2]),
         ));
-
-        lines.push(format!(
-            "  {b}|{r}  {s}.{r}  {b}\\---{r}    {b}\\--/{r}  {s}.{r}   {hpad}{b}|{r}  {n}{npad}{b}|{r}",
-            hpad = " ".repeat(w_left.saturating_sub(27)),
-            n = news[3], npad = " ".repeat(w_right.saturating_sub(brand::strip_ansi_len(&news[3]) + 2)),
+        lines.push(row(
+            &format!("  {s}.{r}  {b}\\---{r}    {b}\\--/{r}  {s}.{r}"),
+            &format!("  {}", news[3]),
         ));
 
         // Neuron branding row
-        lines.push(format!(
-            "  {b}|{r}   {s}*{r}     {ng}     {s}*{r}     {hpad}{b}|{r}{rpad}{b}|{r}",
-            hpad = " ".repeat(w_left.saturating_sub(27)),
-            rpad = " ".repeat(w_right),
-        ));
+        lines.push(row(&format!("   {s}*{r}     {ng}     {s}*{r}"), ""));
 
         // @ zero-x.live
-        lines.push(format!(
-            "  {b}|{r}      {s}@{r} {d}zero-x.live{r}          {hpad}{b}|{r}{rpad}{b}|{r}",
-            hpad = " ".repeat(w_left.saturating_sub(33)),
-            rpad = " ".repeat(w_right),
-        ));
+        lines.push(row(&format!("      {s}@{r} {d}zero-x.live{r}"), ""));
 
-        // Model info
+        // Model info: on one line when it fits, else the model, then the rest.
+        let inner = w_left - 2;
         let model_info = format!(
             "{g}{ms}{r} {d}.{r} {b}{prov}{r} {d}. Plan: {qs}{r}",
             ms = model_short,
             prov = provider,
             qs = quota_str
         );
-        lines.push(format!(
-            "  {b}|{r}  {model_info}{mpad}{b}|{r}{rpad}{b}|{r}",
-            mpad = " ".repeat(w_left.saturating_sub(brand::strip_ansi_len(&model_info) + 2)),
-            rpad = " ".repeat(w_right),
-        ));
+        let model_lines = if brand::strip_ansi_len(&model_info) <= inner {
+            vec![model_info]
+        } else {
+            let rest = format!("{provider} . Plan: {quota_str}");
+            vec![
+                format!("{g}{}{r}", fit(model_short, inner)),
+                if rest.chars().count() <= inner {
+                    format!("{b}{provider}{r} {d}. Plan: {quota_str}{r}")
+                } else {
+                    format!("{d}{}{r}", fit(&rest, inner))
+                },
+            ]
+        };
+        for model_line in model_lines {
+            lines.push(row(&format!("  {model_line}"), ""));
+        }
 
         // CWD
-        let cwd_line = format!("{d}{cwd}{r}");
-        lines.push(format!(
-            "  {b}|{r}  {cwd_line}{cpad}{b}|{r}{rpad}{b}|{r}",
-            cpad = " ".repeat(w_left.saturating_sub(brand::strip_ansi_len(&cwd_line) + 2)),
-            rpad = " ".repeat(w_right),
-        ));
+        lines.push(row(&format!("  {d}{cwd}{r}"), ""));
 
         // Empty row
         lines.push(format!(
@@ -2716,7 +2802,8 @@ impl LiveCli {
             TerminalRenderer::new().color_theme(),
             &mut stdout,
         )?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode)
+            .stopping(self.runtime.cancellation_token().clone());
         let result = self
             .runtime
             .run_turn(actual_input, Some(&mut permission_prompter));
@@ -2725,11 +2812,16 @@ impl LiveCli {
         // rewriting the full snapshot keeps disk and memory identical however
         // the turn ended (including failures and interruptions).
         let persisted = self.persist_session();
+        // Stopped at the denial limit, not by the user: the run's last line says why.
+        let stopped_by_denials = headless::stopped();
         match result {
             Ok(summary) => {
                 let renderer = TerminalRenderer::new();
                 let theme = renderer.color_theme();
                 match &summary.outcome {
+                    runtime::TurnOutcome::Cancelled { .. } if stopped_by_denials => {
+                        spinner.fail("Stopped", theme, &mut stdout)?;
+                    }
                     runtime::TurnOutcome::Cancelled { .. } => {
                         spinner.fail("Interrupted", theme, &mut stdout)?;
                     }
@@ -2748,8 +2840,14 @@ impl LiveCli {
                         format_auto_compaction_notice(event.removed_message_count)
                     );
                 }
+                // A `neuron prompt` run is not "back at the prompt" afterwards.
+                let hint = if headless::one_shot() {
+                    repl_loop::QuitHint::Hidden
+                } else {
+                    repl_loop::QuitHint::Shown
+                };
                 if let Some(notice) =
-                    repl_loop::describe_turn_outcome(&summary, repl_loop::QuitHint::Shown)
+                    repl_loop::describe_turn_outcome(&summary, hint).filter(|_| !stopped_by_denials)
                 {
                     println!("{notice}");
                 }
@@ -2793,7 +2891,8 @@ impl LiveCli {
         input: &str,
     ) -> Result<runtime::TurnSummary, Box<dyn std::error::Error>> {
         let hook_abort_monitor = self.prepare_turn_runtime(false)?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode)
+            .stopping(self.runtime.cancellation_token().clone());
         let result = self.runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         self.persist_session()?;
@@ -2822,6 +2921,16 @@ impl LiveCli {
                 return Err(error);
             }
         };
+        if let Some(stop) = headless::stop_message() {
+            // Stopped at the denial limit: an error answer, with what the turn did. The
+            // exit code and the stderr line come from `headless::report`.
+            let messages = self.runtime.session().messages.get(before..).unwrap_or(&[]);
+            println!(
+                "{}",
+                failed_turn_json(&stop, shown_model(&self.model), messages)
+            );
+            return Ok(());
+        }
         println!(
             "{}",
             json!({
@@ -3150,7 +3259,7 @@ impl LiveCli {
             &self.model,
             StatusUsage {
                 message_count: self.runtime.session().messages.len(),
-                turns: self.runtime.usage().turns(),
+                turns: prompt_count(self.runtime.session()),
                 latest,
                 cumulative,
                 estimated_tokens: self.runtime.estimated_tokens(),
@@ -3231,7 +3340,7 @@ impl LiveCli {
                 format_model_report(
                     &self.model,
                     self.runtime.session().messages.len(),
-                    self.runtime.usage().turns(),
+                    prompt_count(self.runtime.session()),
                 )
             );
             if let Some(listing) = gateway_repl::gateway_model_listing(&self.model) {
@@ -3251,7 +3360,7 @@ impl LiveCli {
                 format_model_report(
                     &self.model,
                     self.runtime.session().messages.len(),
-                    self.runtime.usage().turns(),
+                    prompt_count(self.runtime.session()),
                 )
             );
             return Ok(false);
@@ -3413,7 +3522,7 @@ impl LiveCli {
             format_resume_report(
                 &self.session.path.display().to_string(),
                 message_count,
-                self.runtime.usage().turns(),
+                prompt_count(self.runtime.session()),
             )
         );
         Ok(true)
@@ -4578,7 +4687,20 @@ fn build_runtime_plugin_state_starting_mcp(
         .clone()
         .with_hooks(runtime_config.hooks().merged(&plugin_hook_config));
     let servers = match startup {
-        McpStartup::WaitWithoutBundled => mcp_servers_without_bundled(runtime_config),
+        McpStartup::WaitWithoutBundled => {
+            let servers = mcp_servers_without_bundled(runtime_config);
+            // ToolSearch tells the model, which would otherwise keep looking for them.
+            progress::set_left_out_bundled_mcp_servers(
+                runtime_config
+                    .mcp()
+                    .servers()
+                    .keys()
+                    .filter(|name| !servers.contains_key(*name))
+                    .cloned()
+                    .collect(),
+            );
+            servers
+        }
         McpStartup::Wait | McpStartup::Background => runtime_config.mcp().servers().clone(),
     };
     let stand_in = match startup {
@@ -4588,11 +4710,13 @@ fn build_runtime_plugin_state_starting_mcp(
         McpStartup::Wait | McpStartup::WaitWithoutBundled => None,
     };
     let (mcp_state, runtime_tools, background) = if let Some(mut stand_in) = stand_in {
+        let background = BackgroundMcp::start(servers);
         stand_in.starting = true;
+        stand_in.background = Some(Arc::clone(&background.shared));
         (
             Some(Arc::new(Mutex::new(stand_in))),
             mcp_wrapper_tool_definitions(),
-            Some(BackgroundMcp::start(servers)),
+            Some(background),
         )
     } else {
         let (mcp_state, runtime_tools) = build_runtime_mcp_state(&servers)?;
@@ -4681,9 +4805,10 @@ mod tests {
         resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, status_context,
         summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_no_args,
-        write_mcp_server_fixture, BackgroundMcp, CliAction, CliOutputFormat, CliToolExecutor,
-        GitWorkspaceSummary, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
-        LocalHelpTopic, McpStartup, PromptHistoryEntry, SlashCommand, StatusUsage,
+        write_mcp_server_fixture, BackgroundMcp, BackgroundMcpOutcome, BackgroundMcpShared,
+        CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
+        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
+        McpStartup, PromptHistoryEntry, RuntimeMcpState, SlashCommand, StatusUsage,
         BACKGROUND_MCP_STOP_WAIT, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
@@ -4700,7 +4825,7 @@ mod tests {
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use tools::GlobalToolRegistry;
@@ -5233,6 +5358,46 @@ mod tests {
         assert_eq!(merged, "standalone body");
     }
 
+    /// `cat log | neuron prompt "explain this log"`: the log reaches the model after
+    /// the prompt; a pipe that sends nothing leaves the prompt as typed.
+    #[test]
+    fn piped_stdin_is_merged_into_the_prompt_and_a_silent_pipe_is_not() {
+        let log = "2026-10-24 ERROR db timeout\n2026-10-24 ERROR retry failed\n";
+        let read = crate::headless::read_piped(
+            std::io::Cursor::new(log),
+            Some(crate::headless::STDIN_WAIT),
+            crate::headless::STDIN_MAX_BYTES,
+        );
+        let crate::headless::PipedStdin::Text { text, truncated } = read else {
+            panic!("the log was read: {read:?}");
+        };
+        assert!(!truncated);
+        assert_eq!(
+            merge_prompt_with_stdin("explain this log", Some(&text)),
+            "explain this log\n\n2026-10-24 ERROR db timeout\n2026-10-24 ERROR retry failed"
+        );
+
+        struct Silent(std::sync::mpsc::Receiver<()>);
+        impl std::io::Read for Silent {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                let _ = self.0.recv();
+                Ok(0)
+            }
+        }
+        let (release, never) = std::sync::mpsc::channel();
+        let read = crate::headless::read_piped(
+            Silent(never),
+            Some(crate::headless::STDIN_WAIT),
+            crate::headless::STDIN_MAX_BYTES,
+        );
+        drop(release);
+        assert_eq!(read, crate::headless::PipedStdin::Silent);
+        assert_eq!(
+            merge_prompt_with_stdin("explain this log", None),
+            "explain this log"
+        );
+    }
+
     #[test]
     fn parses_bare_prompt_and_json_output_flag() {
         let _guard = env_lock();
@@ -5579,17 +5744,43 @@ mod tests {
         // the parser says if it ever sees it.
         let login = parse_args(&["login".to_string()]).expect_err("login is not a parser action");
         assert!(login.contains("`neuron login [--no-browser | --with-token]`"));
-        assert!(login.contains("ANTHROPIC_API_KEY"));
-        // An unquoted prompt that starts with an account command's name is not guessed.
-        for word in ["login", "logout", "auth", "usage", "upgrade"] {
-            let prompt = [word, "to", "the", "server", "and", "fix", "it"].map(String::from);
-            let error = parse_args(&prompt).expect_err("ambiguous");
+        // The hint is about quoting, not about other providers' keys.
+        assert!(!login.contains("ANTHROPIC_API_KEY"), "{login}");
+        assert!(
+            login.ends_with("or use `neuron prompt \"login ...\"`."),
+            "{login}"
+        );
+        // An unquoted prompt that starts with the name of an account command that signs
+        // in or out or opens a page is not guessed.
+        for words in [
+            &["login", "to", "the", "server", "and", "fix", "it"][..],
+            &["logout", "to", "the", "server", "and", "fix", "it"],
+            &["upgrade", "to", "the", "server", "and", "fix", "it"],
+            &["auth", "login", "now", "please"],
+            &["auth", "logout", "everything"],
+            &["usage", "--bogus"],
+        ] {
+            let error = parse_args(&words.iter().map(ToString::to_string).collect::<Vec<_>>())
+                .expect_err("ambiguous");
             assert!(error.contains("quote it"), "{error}");
             assert!(error.contains("neuron prompt"), "{error}");
         }
+        // `usage` and `auth status` only show something: other words are a prompt.
+        for words in [
+            &["usage", "of", "memory", "spikes", "under", "load"][..],
+            &["auth", "middleware", "rejects", "valid", "tokens"],
+        ] {
+            assert!(
+                matches!(
+                    parse_args(&words.iter().map(ToString::to_string).collect::<Vec<_>>()),
+                    Ok(CliAction::Prompt { prompt, .. }) if prompt == words.join(" ")
+                ),
+                "{words:?}"
+            );
+        }
         let logout =
             parse_args(&["logout".to_string()]).expect_err("logout is not a parser action");
-        assert!(logout.contains("ANTHROPIC_AUTH_TOKEN"));
+        assert!(!logout.contains("ANTHROPIC_AUTH_TOKEN"), "{logout}");
         assert_eq!(
             parse_args(&["doctor".to_string()]).expect("doctor should parse"),
             CliAction::Doctor {
@@ -5640,25 +5831,16 @@ mod tests {
                 output_format: CliOutputFormat::Text,
             }
         );
-        assert_eq!(
-            parse_args(&[
-                "skills".to_string(),
-                "help".to_string(),
-                "overview".to_string()
-            ])
-            .expect("skills help overview should invoke"),
-            CliAction::Prompt {
-                prompt: "$help overview".to_string(),
-                model: DEFAULT_MODEL.to_string(),
-                output_format: CliOutputFormat::Text,
-                allowed_tools: None,
-                permission_mode: crate::default_permission_mode(),
-                compact: false,
-                base_commit: None,
-                reasoning_effort: None,
-                allow_broad_cwd: false,
-            }
-        );
+        // `skills NAME ...` runs skill NAME; there is no skill "help", so the words are an
+        // unquoted prompt.
+        let error = parse_args(&[
+            "skills".to_string(),
+            "help".to_string(),
+            "overview".to_string(),
+        ])
+        .expect_err("skills help overview names no skill");
+        assert!(error.contains("there is no skill named `help`"), "{error}");
+        assert!(error.contains("neuron prompt \"skills ...\""), "{error}");
         assert_eq!(
             parse_args(&["agents".to_string(), "--help".to_string()])
                 .expect("agents help should parse"),
@@ -6085,14 +6267,14 @@ mod tests {
     fn multi_word_prompt_still_uses_shorthand_prompt_mode() {
         let _guard = env_lock();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
-        // Input is ["help", "me", "debug"] so the joined prompt shorthand
-        // must be "help me debug". A previous batch accidentally rewrote
-        // the expected string to "$help overview" (copy-paste slip).
+        // Input is ["explain", "me", "this"] so the joined prompt shorthand
+        // must be "explain me this". (A prompt that starts with a subcommand
+        // such as `help` needs quotes: see the next test.)
         assert_eq!(
-            parse_args(&["help".to_string(), "me".to_string(), "debug".to_string()])
+            parse_args(&["explain".to_string(), "me".to_string(), "this".to_string()])
                 .expect("prompt shorthand should still work"),
             CliAction::Prompt {
-                prompt: "help me debug".to_string(),
+                prompt: "explain me this".to_string(),
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
@@ -6103,6 +6285,184 @@ mod tests {
                 allow_broad_cwd: false,
             }
         );
+        // Quoted, it is one argument: a prompt.
+        assert!(matches!(
+            parse_args(&["init the database schema".to_string()]),
+            Ok(CliAction::Prompt { prompt, .. }) if prompt == "init the database schema"
+        ));
+    }
+
+    #[test]
+    fn unquoted_prompts_that_start_with_a_subcommand_that_shows_something_go_to_the_model() {
+        let words = |values: &[&str]| values.iter().map(ToString::to_string).collect::<Vec<_>>();
+        for command in [
+            vec!["help", "me", "debug", "this", "test"],
+            vec!["status", "of", "the", "build", "is", "red,", "fix", "it"],
+            vec!["mcp", "server", "crashes", "on", "start"],
+            vec!["agents", "keep", "timing", "out"],
+            vec!["version", "of", "python"],
+            vec!["sandbox", "the", "tests"],
+            vec!["doctor", "the", "results"],
+            vec!["state", "machine", "refactor"],
+            vec!["agents", "list", "them"],
+            vec!["mcp", "show", "the", "github", "server"],
+            vec!["acp", "protocol", "notes"],
+            vec!["help", "me", "fix", "the", "--verbose", "flag"],
+        ] {
+            let parsed = parse_args(&words(&command));
+            assert!(
+                matches!(&parsed, Ok(CliAction::Prompt { prompt, .. }) if *prompt == command.join(" ")),
+                "{command:?}: {parsed:?}"
+            );
+        }
+        // After global flags too.
+        assert!(matches!(
+            parse_args(&words(&["--model", "sonnet", "help", "me", "debug"])),
+            Ok(CliAction::Prompt { prompt, .. }) if prompt == "help me debug"
+        ));
+    }
+
+    #[test]
+    fn unquoted_prompts_that_start_with_a_subcommand_are_refused_not_run() {
+        let words = |values: &[&str]| values.iter().map(ToString::to_string).collect::<Vec<_>>();
+        for command in [
+            vec!["init", "the", "database", "schema"],
+            // An option right after the name was meant for the command.
+            vec!["status", "-x"],
+            vec!["agents", "--bogus", "flag"],
+            vec!["bootstrap-plan", "for", "me"],
+            vec!["dump-manifests", "of", "the", "repo"],
+            vec!["system-prompt", "rewrite"],
+            vec!["export", "the", "database", "schema"],
+            vec!["export", "summary"],
+            vec!["--model", "sonnet", "init", "the", "repo"],
+            vec!["skills", "install", "a", "b"],
+        ] {
+            let error = parse_args(&words(&command)).expect_err(&command.join(" "));
+            let name = command
+                .iter()
+                .find(|word| !word.starts_with('-') && **word != "sonnet")
+                .unwrap();
+            assert!(
+                error.contains(&format!("`neuron prompt \"{name} ...\"`")),
+                "{command:?}: {error}"
+            );
+            assert!(error.contains("quote it"), "{command:?}: {error}");
+        }
+        let error = parse_args(&words(&["init", "the", "database", "schema"])).unwrap_err();
+        assert!(
+            error.starts_with(
+                "`init` is a neuron command (`neuron init`) and does not take `the database schema`."
+            ),
+            "{error}"
+        );
+        // Unknown options are still named by the subcommand's own parser.
+        assert_eq!(
+            parse_args(&words(&["dump-manifests", "--bogus"])).unwrap_err(),
+            "unknown dump-manifests option: --bogus"
+        );
+        assert_eq!(
+            parse_args(&words(&["export", "--bogus"])).unwrap_err(),
+            "unknown export option: --bogus"
+        );
+        // A bare word is not taken for a file name: the error says what would be.
+        let error = parse_args(&words(&["export", "summary"])).unwrap_err();
+        assert!(
+            error.contains("`summary.md`") && error.contains("`./summary`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn subcommands_keep_the_arguments_they_take() {
+        let words = |values: &[&str]| values.iter().map(ToString::to_string).collect::<Vec<_>>();
+        for command in [
+            vec!["agents", "list"],
+            vec!["agents", "help"],
+            vec!["agents", "list", "--help"],
+            vec!["mcp", "list"],
+            vec!["mcp", "show", "github"],
+            vec!["mcp", "show", "github", "help"],
+            vec!["mcp", "serve"],
+            vec!["mcp", "-h"],
+            vec!["acp", "serve"],
+            vec!["skills", "list"],
+            vec!["skills", "--help"],
+            vec!["skills", "install", "./fixtures/help-skill"],
+            vec!["dump-manifests", "--manifests-dir", "upstream"],
+            vec![
+                "system-prompt",
+                "--cwd",
+                "/tmp/project",
+                "--date",
+                "2026-04-01",
+            ],
+            vec!["export", "notes.md"],
+            vec!["export", "out/notes"],
+            vec!["export", "-o", "notes"],
+            vec!["export", "--session", "latest", "-o", "notes.md"],
+            vec!["status", "--help"],
+            vec!["init", "--help"],
+            vec!["--output-format", "json", "init"],
+        ] {
+            assert!(
+                parse_args(&words(&command)).is_ok(),
+                "{command:?}: {:?}",
+                parse_args(&words(&command))
+            );
+        }
+        assert_eq!(
+            parse_args(&words(&["init", "--output-format", "json"])).unwrap(),
+            CliAction::Init {
+                output_format: CliOutputFormat::Json,
+            }
+        );
+        // A slash command's alias gets the same guidance as its name.
+        let error = parse_args(&words(&["plugins"])).unwrap_err();
+        assert!(error.contains("/plugins"), "{error}");
+    }
+
+    #[test]
+    fn skills_subcommand_runs_a_known_skill_and_refuses_other_words() {
+        let _guard = env_lock();
+        let workspace = temp_dir();
+        write_skill_fixture(
+            &workspace.join(".codex").join("skills"),
+            "caveman",
+            "Project skill fixture",
+        );
+        let words = |values: &[&str]| values.iter().map(ToString::to_string).collect::<Vec<_>>();
+
+        let parsed = with_current_dir(&workspace, || {
+            parse_args(&words(&["skills", "caveman", "sharpen", "club"]))
+        });
+        assert!(
+            matches!(&parsed, Ok(CliAction::Prompt { prompt, .. }) if prompt == "$caveman sharpen club"),
+            "{parsed:?}"
+        );
+        let error = with_current_dir(&workspace, || {
+            parse_args(&words(&["skills", "that", "are", "installed"]))
+        })
+        .unwrap_err();
+        // The quoting hint first, and no list of every skill.
+        assert!(
+            error.starts_with(
+                "`skills` runs a skill (`neuron skills [list|install <path>|help|<skill> [args]]`), and there is no skill named `that`. To send a prompt"
+            ),
+            "{error}"
+        );
+        assert!(!error.contains("Available skills"), "{error}");
+        assert!(!error.contains("caveman"), "not close to `that`: {error}");
+        // A close name is suggested.
+        let typo = with_current_dir(&workspace, || {
+            parse_args(&words(&["skills", "cavemen", "please"]))
+        })
+        .unwrap_err();
+        assert!(typo.contains("Did you mean: caveman"), "{typo}");
+        assert!(typo.contains("`neuron prompt \"skills ...\"`"), "{typo}");
+        assert!(error.contains("`neuron prompt \"skills ...\"`"), "{error}");
+
+        fs::remove_dir_all(workspace).expect("workspace should clean up");
     }
 
     #[test]
@@ -6511,6 +6871,38 @@ mod tests {
 
         assert!(banner.contains("Tips for getting started"));
         assert!(banner.contains("What's new"));
+
+        // A long model name and user name are cut to fit: every row of the box is as
+        // wide as its borders.
+        let username = std::env::var_os("USERNAME");
+        std::env::set_var("USERNAME", "a-very-long-user-name-for-the-banner-test");
+        let banner = with_current_dir(&root, || {
+            LiveCli::new(
+                "claude-sonnet-4-6-with-a-very-long-experimental-suffix-x".to_string(),
+                true,
+                None,
+                PermissionMode::DangerFullAccess,
+            )
+            .expect("cli should initialize")
+            .startup_banner()
+        });
+        match username {
+            Some(username) => std::env::set_var("USERNAME", username),
+            None => std::env::remove_var("USERNAME"),
+        }
+        let widths = banner
+            .lines()
+            .skip(1)
+            .map(crate::brand::strip_ansi_len)
+            .collect::<Vec<_>>();
+        assert!(
+            widths.iter().all(|width| *width == widths[0]),
+            "{widths:?}\n{banner}"
+        );
+        assert!(
+            banner.contains("claude-sonnet-4-6-with-a-very-lon..."),
+            "{banner}"
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
         fs::remove_dir_all(config_home).expect("cleanup config home");
@@ -7920,7 +8312,9 @@ UU conflicted.rs",
         let search_json: serde_json::Value =
             serde_json::from_str(&search_output).expect("search output should be json");
         assert_eq!(search_json["matches"][0], "mcp__alpha__echo");
-        assert_eq!(search_json["pending_mcp_servers"][0], "broken");
+        // It failed: nothing is pending.
+        assert_eq!(search_json["pending_mcp_servers"], serde_json::Value::Null);
+        assert_eq!(search_json["failed_mcp_servers"], json!(["broken"]));
         assert_eq!(
             search_json["mcp_degraded"]["failed_servers"][0]["server_name"],
             "broken"
@@ -8135,6 +8529,134 @@ UU conflicted.rs",
     }
 
     #[test]
+    fn a_background_start_that_fails_during_a_turn_lists_the_server_as_failed() {
+        let workspace = temp_dir();
+        let config_home = workspace.join("config-home");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::write(
+            config_home.join("settings.json"),
+            json!({
+                "defaultMcpServers": false,
+                "mcpServers": {"alpha": {"command": "neuron-test-no-such-mcp-server"}}
+            })
+            .to_string(),
+        )
+        .expect("write mcp settings");
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let runtime_config = loader.load().expect("runtime config should load");
+        let (state, background) = build_runtime_plugin_state_starting_mcp(
+            &workspace,
+            &loader,
+            &runtime_config,
+            McpStartup::Background,
+        )
+        .expect("runtime plugin state should build at once");
+        let background = background.expect("the servers start in the background");
+        let mut executor = CliToolExecutor::new(
+            None,
+            false,
+            state.tool_registry.clone(),
+            state.mcp_state.clone(),
+        );
+
+        // The start ends while this turn's runtime still has the stand-in.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while background.shared.finished().is_none() {
+            assert!(Instant::now() < deadline, "the start never ended");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let search: serde_json::Value = serde_json::from_str(
+            &executor
+                .execute("ToolSearch", r#"{"query":"alpha echo","max_results":5}"#)
+                .expect("tool search runs"),
+        )
+        .expect("search output is json");
+        // Its start ended, and the server failed: listed as failed, not pending, and the
+        // note says so.
+        assert_eq!(
+            search["pending_mcp_servers"],
+            serde_json::Value::Null,
+            "{search}"
+        );
+        assert_eq!(search["failed_mcp_servers"], json!(["alpha"]), "{search}");
+        assert!(
+            search["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("could not start")),
+            "{search}"
+        );
+        let call = executor
+            .execute(
+                "MCPTool",
+                r#"{"qualifiedName":"mcp__alpha__echo","arguments":{}}"#,
+            )
+            .expect_err("the stand-in runs no tool");
+        assert!(call.to_string().contains("could not start"), "{call}");
+
+        background.stop();
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    /// ToolSearch listed every server as pending while its note said they had finished
+    /// starting, failed ones included.
+    #[test]
+    fn a_finished_background_start_lists_only_its_failed_servers_and_none_as_pending() {
+        let workspace = temp_dir();
+        let config_home = workspace.join("config-home");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::write(
+            config_home.join("settings.json"),
+            json!({
+                "defaultMcpServers": false,
+                "mcpServers": {
+                    "alpha": {"command": "neuron-test-alpha"},
+                    "codebase-memory": {"command": "neuron-test-codebase-memory"}
+                }
+            })
+            .to_string(),
+        )
+        .expect("write mcp settings");
+        let runtime_config = ConfigLoader::new(&workspace, &config_home)
+            .load()
+            .expect("runtime config should load");
+        let mut stand_in = RuntimeMcpState::not_started(runtime_config.mcp().servers())
+            .expect("state")
+            .expect("servers");
+        let background = Arc::new(BackgroundMcpShared {
+            outcome: Mutex::new(BackgroundMcpOutcome::Starting),
+            cancel: tokio::sync::Notify::new(),
+            failed: Mutex::new(Vec::new()),
+        });
+        stand_in.starting = true;
+        stand_in.background = Some(Arc::clone(&background));
+
+        // Starting: all pending, none failed.
+        assert_eq!(
+            stand_in.pending_servers(),
+            Some(vec!["alpha".to_string(), "codebase-memory".to_string()])
+        );
+        assert_eq!(stand_in.failed_server_names(), None);
+
+        // Started, but one failed (its tools join the next turn: the servers were taken).
+        *background.failed.lock().expect("failed") = vec!["codebase-memory".to_string()];
+        *background.lock() = BackgroundMcpOutcome::Done;
+        assert_eq!(stand_in.pending_servers(), None);
+        assert_eq!(
+            stand_in.failed_server_names(),
+            Some(vec!["codebase-memory".to_string()])
+        );
+        let note = stand_in.starting_note().expect("a note");
+        assert!(note.contains("finished starting"), "{note}");
+        assert!(
+            note.contains("failed_mcp_servers could not start"),
+            "{note}"
+        );
+        assert!(!note.contains("pending_mcp_servers"), "{note}");
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
     fn stopping_a_background_mcp_start_returns_promptly() {
         let (config_home, workspace) = workspace_with_fixture_mcp_server();
         let loader = ConfigLoader::new(&workspace, &config_home);
@@ -8211,7 +8733,8 @@ UU conflicted.rs",
             .expect("tool search should execute");
         let search_json: serde_json::Value =
             serde_json::from_str(&search_output).expect("search output should be json");
-        assert_eq!(search_json["pending_mcp_servers"][0], "remote");
+        assert_eq!(search_json["pending_mcp_servers"], serde_json::Value::Null);
+        assert_eq!(search_json["failed_mcp_servers"], json!(["remote"]));
         assert_eq!(
             search_json["mcp_degraded"]["failed_servers"][0]["server_name"],
             "remote"

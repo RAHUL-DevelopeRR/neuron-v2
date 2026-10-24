@@ -81,6 +81,13 @@ pub fn windows_cmd_command(command: &str) -> Command {
     prepared
 }
 
+/// Windows `CREATE_NO_WINDOW` creation flag: the child gets its own console,
+/// which has no window. Background children (MCP servers, hooks) then cannot
+/// retitle the user's terminal (`cmd.exe` and `npm` set the console title) or
+/// get its Ctrl+C; their stdio pipes work as before.
+#[cfg(windows)]
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// Returns `true` when an environment variable holds a credential: a known
 /// Zero-X or provider variable, a secret-looking name, or a Zero-X value.
 #[must_use]
@@ -138,41 +145,257 @@ pub fn isolate_process_group(command: &mut Command) -> &mut Command {
 ///
 /// Windows uses `taskkill /T /F /PID`; Unix signals the process group created
 /// by [`isolate_process_group`]. The direct child is always killed as well, so
-/// this is safe to call for children that were not isolated.
+/// this is safe to call for children that were not isolated. It never waits
+/// longer than about [`TREE_KILL_WAIT`] (see [`kill_tree_of`]).
 pub fn kill_process_tree(child: &mut Child) {
-    let pid = child.id().to_string();
+    let _ = kill_tree_of(child.id());
+    let _ = child.kill();
+}
+
+/// How long [`kill_tree_of`] waits for the tree to be killed. `taskkill` hangs
+/// while the WMI service is stuck, and an interrupt or a shutdown must not hang
+/// with it.
+pub const TREE_KILL_WAIT: Duration = Duration::from_secs(4);
+
+/// When `taskkill` has not finished by then, the WMI-free kill
+/// ([`fallback_tree_kill_command`]) starts beside it; at once after `taskkill`
+/// was given up on once ([`TASKKILL_HUNG`]).
+#[cfg(windows)]
+const TREE_KILL_FALLBACK_AFTER: Duration = Duration::from_millis(300);
+
+/// A `taskkill` did not finish in time: WMI is stuck, and the next kills start
+/// their fallback at once.
+#[cfg(windows)]
+static TASKKILL_HUNG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Kills process `pid` and every process it started: `taskkill /T /F /PID` on
+/// Windows, a `KILL` to its process group on Unix. On Windows, a `taskkill` that
+/// has not finished after [`TREE_KILL_FALLBACK_AFTER`] gets company: a kill that
+/// reads the tree from the `Process` performance counters instead of WMI. Waits at
+/// most [`TREE_KILL_WAIT`]; killers still running then are killed themselves, and
+/// the caller falls back to killing its own child. Returns whether a killer
+/// finished in time.
+#[must_use]
+pub fn kill_tree_of(pid: u32) -> bool {
+    let Some(mut killer) = spawn_killer(tree_kill_command(pid)) else {
+        return false;
+    };
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut fallback: Option<Child> = None;
+    let started = Instant::now();
+    let finished = loop {
+        if matches!(killer.try_wait(), Ok(Some(_)) | Err(_)) {
+            break true;
+        }
+        if let Some(fallback) = fallback.as_mut() {
+            if matches!(fallback.try_wait(), Ok(Some(_)) | Err(_)) {
+                break true;
+            }
+        }
+        if started.elapsed() >= TREE_KILL_WAIT {
+            break false;
+        }
+        #[cfg(windows)]
+        if fallback.is_none()
+            && (started.elapsed() >= TREE_KILL_FALLBACK_AFTER
+                || TASKKILL_HUNG.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            fallback = spawn_killer(fallback_tree_kill_command(pid));
+        }
+        thread::sleep(POLL_INTERVAL);
+    };
+    #[cfg(windows)]
+    if matches!(killer.try_wait(), Ok(None)) {
+        TASKKILL_HUNG.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    for mut stuck in std::iter::once(killer).chain(fallback) {
+        if matches!(stuck.try_wait(), Ok(None)) {
+            let _ = stuck.kill();
+            // Reaped when it goes at once; never waited for beyond that.
+            let reap_by = Instant::now() + Duration::from_millis(200);
+            while matches!(stuck.try_wait(), Ok(None)) && Instant::now() < reap_by {
+                thread::sleep(POLL_INTERVAL);
+            }
+        }
+    }
+    finished
+}
+
+/// Starts a tree killer without a console window or stdio.
+fn spawn_killer(mut command: Command) -> Option<Child> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     #[cfg(windows)]
     {
-        let taskkill = std::env::var_os("SystemRoot").map_or_else(
-            || std::path::PathBuf::from("taskkill.exe"),
-            |root| {
-                std::path::PathBuf::from(root)
-                    .join("System32")
-                    .join("taskkill.exe")
-            },
-        );
-        let _ = Command::new(taskkill)
-            .args(["/T", "/F", "/PID", &pid])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
     }
-    #[cfg(unix)]
-    {
-        let kill = if std::path::Path::new("/bin/kill").exists() {
-            "/bin/kill"
-        } else {
-            "kill"
-        };
-        let _ = Command::new(kill)
-            .args(["-KILL", "--", &format!("-{pid}")])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+    command.spawn().ok()
+}
+
+/// Kills the tree of `pid` without `taskkill`, which goes through WMI: Windows
+/// `PowerShell` reads every process's parent from the `Process` performance counters,
+/// then stops `pid` and the processes started under it (and not before it, so a
+/// reused id is left alone). `pid` goes first: a shell whose command died would run
+/// its next one.
+#[cfg(windows)]
+fn fallback_tree_kill_command(pid: u32) -> Command {
+    let script = format!(
+        r"$ErrorActionPreference = 'SilentlyContinue'
+$root = {pid}
+$data = (New-Object System.Diagnostics.PerformanceCounterCategory('Process')).ReadCategory()
+$ids = $data['ID Process']
+$parents = $data['Creating Process ID']
+$children = @{{}}
+foreach ($name in $ids.Keys) {{
+    $id = [int]$ids[$name].RawValue
+    $parent = [int]$parents[$name].RawValue
+    if ($id -ne 0 -and $id -ne $parent) {{
+        if (-not $children.ContainsKey($parent)) {{ $children[$parent] = @() }}
+        $children[$parent] += $id
+    }}
+}}
+$since = (Get-Process -Id $root).StartTime
+$level = @($root)
+$tree = @()
+while ($level.Count -gt 0) {{
+    $next = @()
+    foreach ($p in $level) {{
+        foreach ($c in $children[$p]) {{
+            $process = Get-Process -Id $c
+            if ($process -and $since -and $process.StartTime -ge $since) {{
+                $tree += $c
+                $next += $c
+            }}
+        }}
+    }}
+    $level = $next
+}}
+# The root first: a shell whose child died would go on to its next command.
+Stop-Process -Id $root -Force
+foreach ($id in $tree) {{ Stop-Process -Id $id -Force }}
+"
+    );
+    let system_root =
+        std::env::var_os("SystemRoot").unwrap_or_else(|| OsString::from(r"C:\Windows"));
+    let mut command = Command::new(
+        std::path::PathBuf::from(system_root)
+            .join(r"System32\WindowsPowerShell\v1.0\powershell.exe"),
+    );
+    command.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-EncodedCommand",
+        &utf16le_base64(&script),
+    ]);
+    command
+}
+
+/// `PowerShell`'s `-EncodedCommand` form of `script`: UTF-16LE, base64.
+#[cfg(windows)]
+fn utf16le_base64(script: &str) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = script
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let triple = chunk.iter().enumerate().fold(0_u32, |acc, (index, byte)| {
+            acc | (u32::from(*byte) << (16 - 8 * index))
+        });
+        for position in 0..4 {
+            if position <= chunk.len() {
+                let index = (triple >> (18 - 6 * position)) & 0x3f;
+                encoded.push(char::from(ALPHABET[index as usize]));
+            } else {
+                encoded.push('=');
+            }
+        }
     }
-    let _ = child.kill();
+    encoded
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's stand-in for `taskkill` / `kill` on its own thread: program and arguments.
+    static TREE_KILL_OVERRIDE: std::cell::RefCell<Option<(String, Vec<String>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn tree_kill_command(pid: u32) -> Command {
+    #[cfg(test)]
+    if let Some((program, args)) = TREE_KILL_OVERRIDE.with(|stand_in| stand_in.borrow().clone()) {
+        let mut command = Command::new(program);
+        command.args(args);
+        return command;
+    }
+    system_tree_kill_command(pid)
+}
+
+#[cfg(windows)]
+fn system_tree_kill_command(pid: u32) -> Command {
+    let taskkill = std::env::var_os("SystemRoot").map_or_else(
+        || std::path::PathBuf::from("taskkill.exe"),
+        |root| {
+            std::path::PathBuf::from(root)
+                .join("System32")
+                .join("taskkill.exe")
+        },
+    );
+    let mut command = Command::new(taskkill);
+    command.args(["/T", "/F", "/PID", &pid.to_string()]);
+    command
+}
+
+#[cfg(not(windows))]
+fn system_tree_kill_command(pid: u32) -> Command {
+    let kill = if std::path::Path::new("/bin/kill").exists() {
+        "/bin/kill"
+    } else {
+        "kill"
+    };
+    let mut command = Command::new(kill);
+    command.args(["-KILL", "--", &format!("-{pid}")]);
+    command
+}
+
+/// Commands started in the background (`run_in_background`): nothing waits for them,
+/// and they must not outlive the session.
+static BACKGROUND_CHILDREN: Mutex<Vec<Child>> = Mutex::new(Vec::new());
+
+/// Keeps `child`, a command started in the background, for
+/// [`kill_background_children`]. Spawn it with [`isolate_process_group`] so that its
+/// whole tree can be stopped.
+pub fn track_background_child(child: Child) {
+    let mut children = BACKGROUND_CHILDREN
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    // The ones that ended are reaped.
+    children.retain_mut(|child| matches!(child.try_wait(), Ok(None)));
+    children.push(child);
+}
+
+/// Kills every background command still running, with every process it started (the
+/// session is ending). Returns how many were still running.
+#[must_use = "how many were still running"]
+pub fn kill_background_children() -> usize {
+    let children = std::mem::take(
+        &mut *BACKGROUND_CHILDREN
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner),
+    );
+    let mut killed = 0;
+    for mut child in children {
+        if matches!(child.try_wait(), Ok(None)) {
+            kill_process_tree(&mut child);
+            let _ = child.wait();
+            killed += 1;
+        }
+    }
+    killed
 }
 
 /// Why a bounded run stopped.
@@ -539,6 +762,122 @@ mod tests {
         assert_eq!(output.termination, Termination::Cancelled);
         assert!(output.cancelled());
         assert!(started.elapsed() < Duration::from_secs(15));
+    }
+
+    /// A process that sleeps for about 30 s without starting any other.
+    fn lone_sleeper() -> (String, Vec<String>) {
+        if cfg!(windows) {
+            (
+                "ping".to_string(),
+                ["-n", "30", "127.0.0.1"].map(String::from).to_vec(),
+            )
+        } else {
+            ("sleep".to_string(), vec!["30".to_string()])
+        }
+    }
+
+    /// `taskkill` hangs while the WMI service is stuck: killing a tree gives it
+    /// [`super::TREE_KILL_WAIT`], then kills it and the child itself, so an interrupt or
+    /// a shutdown never hangs with it.
+    #[test]
+    fn a_hanging_tree_killer_is_given_up_on_and_the_child_still_dies() {
+        let (program, args) = lone_sleeper();
+        let mut child = Command::new(&program)
+            .args(&args)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("the child starts");
+        super::TREE_KILL_OVERRIDE.with(|stand_in| *stand_in.borrow_mut() = Some(lone_sleeper()));
+
+        let started = Instant::now();
+        super::kill_process_tree(&mut child);
+        let took = started.elapsed();
+        super::TREE_KILL_OVERRIDE.with(|stand_in| *stand_in.borrow_mut() = None);
+
+        assert!(
+            took < super::TREE_KILL_WAIT + Duration::from_secs(3),
+            "took {took:?}"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().expect("try_wait").is_none() {
+            assert!(Instant::now() < deadline, "the child still runs");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_encoded_commands_are_utf16le_base64() {
+        assert_eq!(super::utf16le_base64(""), "");
+        assert_eq!(super::utf16le_base64("dir"), "ZABpAHIA");
+        assert_eq!(super::utf16le_base64("f"), "ZgA=");
+        assert_eq!(super::utf16le_base64("fo"), "ZgBvAA==");
+    }
+
+    /// Whether process `pid` runs, asked without WMI (`tasklist` hangs with it).
+    #[cfg(windows)]
+    fn is_running(pid: u32) -> bool {
+        Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ 'running' }}"
+                ),
+            ])
+            .output()
+            .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains("running"))
+    }
+
+    /// With `taskkill` hanging (the WMI service stuck), a shell's grandchild still dies:
+    /// the tree is read from the performance counters instead.
+    #[cfg(windows)]
+    #[test]
+    fn a_tree_is_killed_without_taskkill_when_it_hangs() {
+        let pid_file = std::env::temp_dir().join(format!(
+            "neuron-tree-kill-{}-{:?}.pid",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&pid_file);
+        let mut shell = super::windows_cmd_command(&format!(
+            "powershell -NoProfile -NonInteractive -Command \"Set-Content -LiteralPath '{}' -Value $PID; Start-Sleep -Seconds 30\"",
+            pid_file.display()
+        ));
+        let mut shell = shell
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("the shell starts");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let grandchild = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok())
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "the grandchild never started");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        super::TREE_KILL_OVERRIDE.with(|stand_in| *stand_in.borrow_mut() = Some(lone_sleeper()));
+
+        let started = Instant::now();
+        let finished = super::kill_tree_of(shell.id());
+        let took = started.elapsed();
+        let _ = shell.kill();
+        super::TREE_KILL_OVERRIDE.with(|stand_in| *stand_in.borrow_mut() = None);
+        let _ = std::fs::remove_file(&pid_file);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while is_running(grandchild) {
+            assert!(
+                Instant::now() < deadline,
+                "grandchild {grandchild} still runs (a killer finished: {finished}, after {took:?})"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = shell.wait();
     }
 
     #[test]

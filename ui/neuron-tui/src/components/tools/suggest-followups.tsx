@@ -7,6 +7,7 @@ import { defineToolComponent } from './types'
 import { useTerminalDimensions } from '../../hooks/use-terminal-dimensions'
 import { useTheme } from '../../hooks/use-theme'
 import { getLatestFollowupToolCallId, useChatStore } from '../../state/chat-store'
+import { GLYPHS } from '../../utils/glyphs'
 import { Button } from '../button'
 
 import type { ToolRenderConfig } from './types'
@@ -108,7 +109,7 @@ const FollowupLine = ({
           }}
         >
           <text style={{ wrapMode: hasLabel ? 'none' : 'word' }}>
-            <span fg={iconColor}>{isClicked ? '✓' : '→'}</span>
+            <span fg={iconColor}>{isClicked ? GLYPHS.check : '→'}</span>
             <span
               fg={labelColor}
               attributes={showHoverState ? TextAttributes.BOLD : undefined}
@@ -153,7 +154,7 @@ const PastFollowupItem = ({ followup, isClicked }: PastFollowupItemProps) => {
     <box style={{ flexDirection: 'column', marginLeft: 2 }}>
       <text>
         <span fg={isClicked ? theme.success : theme.muted}>
-          {isClicked ? '✓' : '→'}
+          {isClicked ? GLYPHS.check : '→'}
         </span>
         <span fg={isClicked ? theme.muted : theme.foreground}>
           {' '}
@@ -190,7 +191,7 @@ const PastFollowupsToggle = ({
     setIsExpanded((prev) => !prev)
   }, [])
 
-  const toggleIndicator = isExpanded ? '▾' : '▸'
+  const toggleIndicator = isExpanded ? GLYPHS.expanded : GLYPHS.collapsed
 
   return (
     <box style={{ flexDirection: 'column' }}>

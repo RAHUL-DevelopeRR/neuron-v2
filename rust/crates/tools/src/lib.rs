@@ -124,6 +124,16 @@ pub struct RuntimeToolDefinition {
     pub required_permission: PermissionMode,
 }
 
+impl RuntimeToolDefinition {
+    fn to_definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            input_schema: self.input_schema.clone(),
+        }
+    }
+}
+
 impl GlobalToolRegistry {
     #[must_use]
     pub fn builtin() -> Self {
@@ -250,9 +260,11 @@ impl GlobalToolRegistry {
     /// Tool schemas sent to the model.
     ///
     /// Without an allow-list only the default built-in tools are advertised,
-    /// plus deferred tools that `ToolSearch` activated in this session; stub
-    /// and bookkeeping tools stay behind `ToolSearch`. An explicit allow-list
-    /// advertises exactly the listed tools.
+    /// plus deferred built-ins that `ToolSearch` activated in this session; stub
+    /// and bookkeeping tools stay behind `ToolSearch`, and so do MCP tools (a
+    /// request adds the ones its conversation uses, see
+    /// [`Self::deferred_mcp_definitions`]). An explicit allow-list advertises
+    /// exactly the listed tools.
     #[must_use]
     pub fn definitions(&self, allowed_tools: Option<&BTreeSet<String>>) -> Vec<ToolDefinition> {
         let builtin = advertised_builtin_specs(allowed_tools)
@@ -267,15 +279,9 @@ impl GlobalToolRegistry {
             .iter()
             .filter(|tool| match allowed_tools {
                 Some(allowed) => allowed.contains(tool.name.as_str()),
-                None => {
-                    !is_deferred_runtime_tool(&tool.name) || is_deferred_tool_activated(&tool.name)
-                }
+                None => !is_deferred_runtime_tool(&tool.name),
             })
-            .map(|tool| ToolDefinition {
-                name: tool.name.clone(),
-                description: tool.description.clone(),
-                input_schema: tool.input_schema.clone(),
-            });
+            .map(RuntimeToolDefinition::to_definition);
         let plugin = self
             .plugin_tools
             .iter()
@@ -289,6 +295,25 @@ impl GlobalToolRegistry {
                 input_schema: tool.definition().input_schema.clone(),
             });
         builtin.chain(runtime).chain(plugin).collect()
+    }
+
+    /// The deferred MCP tools one request of the conversation `messages` carries, on
+    /// top of [`Self::definitions`] without an allow-list: the ones the model already
+    /// called, and the ones `ToolSearch` matched in the current turn (since the last
+    /// user prompt). Matches the model left unused drop out with the next prompt, so
+    /// a search does not grow every later request (a free per-minute token budget
+    /// overflowed that way); the `MCPTool` wrapper can call any MCP tool meanwhile.
+    #[must_use]
+    pub fn deferred_mcp_definitions(
+        &self,
+        messages: &[ConversationMessage],
+    ) -> Vec<ToolDefinition> {
+        let in_play = deferred_tools_in_play(messages);
+        self.runtime_tools
+            .iter()
+            .filter(|tool| is_deferred_runtime_tool(&tool.name) && in_play.contains(&tool.name))
+            .map(RuntimeToolDefinition::to_definition)
+            .collect()
     }
 
     pub fn permission_specs(
@@ -344,14 +369,10 @@ impl GlobalToolRegistry {
         let query = query.trim().to_string();
         let normalized_query = normalize_tool_search_query(&query);
         let matches = search_tool_specs(&query, max_results.max(1), &self.searchable_tool_specs());
-        // Deferred built-ins and MCP tools that were found are advertised
-        // from the next request on.
+        // Deferred built-ins that were found are advertised from the next request
+        // on. MCP tools found are advertised for the rest of the turn, which the
+        // request reads from these matches in the transcript.
         activate_deferred_tools(matches.iter().map(String::as_str));
-        activate_names(
-            matches.iter().filter(|name| {
-                is_deferred_runtime_tool(name) && self.has_runtime_tool(name.as_str())
-            }),
-        );
 
         ToolSearchOutput {
             matches,
@@ -508,19 +529,82 @@ fn is_deferred_tool_activated(name: &str) -> bool {
 }
 
 /// Tools discovered from MCP servers (`mcp__<server>__<tool>`). Their
-/// schemas stay out of requests until `ToolSearch` finds them; the
-/// `MCPTool` wrapper can call any of them by qualified name meanwhile.
-fn is_deferred_runtime_tool(name: &str) -> bool {
+/// schemas stay out of requests unless the conversation brought them into play
+/// ([`GlobalToolRegistry::deferred_mcp_definitions`]); the `MCPTool` wrapper can
+/// call any of them by qualified name meanwhile.
+#[must_use]
+pub fn is_deferred_runtime_tool(name: &str) -> bool {
     name.starts_with("mcp__")
 }
 
-fn activate_names<'a>(names: impl IntoIterator<Item = &'a String>) {
-    let mut activated = activated_deferred_tools()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    for name in names {
-        activated.insert(name.clone());
+/// Names of the tools the model called anywhere in `messages`, plus the ones a
+/// successful `ToolSearch` call matched since the last user prompt.
+fn deferred_tools_in_play(messages: &[ConversationMessage]) -> BTreeSet<String> {
+    let turn_start = current_turn_start(messages);
+    let mut names = BTreeSet::new();
+    for (index, message) in messages.iter().enumerate() {
+        for block in &message.blocks {
+            match block {
+                ContentBlock::ToolUse { name, .. } => {
+                    names.insert(name.clone());
+                }
+                ContentBlock::ToolResult {
+                    tool_name,
+                    output,
+                    is_error: false,
+                    ..
+                } if index > turn_start && tool_name == "ToolSearch" => {
+                    names.extend(tool_search_matches(output));
+                }
+                _ => {}
+            }
+        }
     }
+    names
+}
+
+/// Index in `messages` of the prompt the user typed last, where the current turn
+/// starts (0 when there is none).
+#[must_use]
+pub fn current_turn_start(messages: &[ConversationMessage]) -> usize {
+    messages
+        .iter()
+        .rposition(starts_user_turn)
+        .unwrap_or_default()
+}
+
+/// A prompt the user typed (the runtime's automatic "continue" request is part of
+/// the turn it continues).
+fn starts_user_turn(message: &ConversationMessage) -> bool {
+    message.role == MessageRole::User
+        && message.blocks.iter().any(|block| {
+            matches!(block, ContentBlock::Text { text } if !text.starts_with(runtime::AUTO_CONTINUE_PREFIX))
+        })
+        && !message
+            .blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+}
+
+/// The `matches` of a `ToolSearch` result. Text a hook appended after the JSON is
+/// ignored.
+fn tool_search_matches(output: &str) -> Vec<String> {
+    let Some(Ok(value)) = serde_json::Deserializer::from_str(output)
+        .into_iter::<Value>()
+        .next()
+    else {
+        return Vec::new();
+    };
+    value["matches"]
+        .as_array()
+        .map(|matches| {
+            matches
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn activate_deferred_tools<'a>(names: impl IntoIterator<Item = &'a str>) {
@@ -1546,32 +1630,45 @@ fn maybe_enforce_permission_check_with_mode(
     }
 }
 
-/// Asks on the terminal: prints the question (and numbered options) and reads one line.
+/// What `AskUserQuestion` answers (as its error) when the person at the terminal would
+/// not see the question: stdout and stderr both go to files or pipes.
+const UNSEEN_QUESTION_REFUSAL: &str =
+    "no one can see questions in this run (its output is not a terminal); decide yourself and say what you assumed";
+
+/// Asks on the terminal: writes the question (and numbered options) where the user sees
+/// it (stdout, or stderr when stdout is redirected; see
+/// [`runtime::ui_hooks::PromptStream`]) and reads one line from stdin.
 fn ask_on_terminal(input: &AskUserQuestionInput) -> Result<String, String> {
-    use std::io::{self, BufRead, Write};
+    use std::io::{self, BufRead};
 
-    let stdout = io::stdout();
-    let stdin = io::stdin();
-    let mut out = stdout.lock();
-
-    writeln!(out, "\n[Question] {}", input.question).map_err(|e| e.to_string())?;
-
-    if let Some(ref options) = input.options {
-        for (i, option) in options.iter().enumerate() {
-            writeln!(out, "  {}. {}", i + 1, option).map_err(|e| e.to_string())?;
-        }
-        write!(out, "Enter choice (1-{}): ", options.len()).map_err(|e| e.to_string())?;
-    } else {
-        write!(out, "Your answer: ").map_err(|e| e.to_string())?;
-    }
-    out.flush().map_err(|e| e.to_string())?;
+    let Some(stream) = runtime::ui_hooks::PromptStream::current() else {
+        return Err(UNSEEN_QUESTION_REFUSAL.to_string());
+    };
+    write_question(&mut stream.writer(), input).map_err(|e| e.to_string())?;
 
     let mut response = String::new();
-    stdin
+    io::stdin()
         .lock()
         .read_line(&mut response)
         .map_err(|e| e.to_string())?;
     Ok(response)
+}
+
+/// The question as [`ask_on_terminal`] shows it, ending in the answer prompt.
+fn write_question(
+    out: &mut dyn std::io::Write,
+    input: &AskUserQuestionInput,
+) -> std::io::Result<()> {
+    writeln!(out, "\n[Question] {}", input.question)?;
+    if let Some(ref options) = input.options {
+        for (i, option) in options.iter().enumerate() {
+            writeln!(out, "  {}. {}", i + 1, option)?;
+        }
+        write!(out, "Enter choice (1-{}): ", options.len())?;
+    } else {
+        write!(out, "Your answer: ")?;
+    }
+    out.flush()
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -2041,10 +2138,79 @@ fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
     }
 }
 
+/// The `arguments` of an MCP call (`MCPTool`, `MCP`) as the server takes them: a JSON
+/// object, or none. Models sometimes send the object as JSON text (`"{\"path\":
+/// \"a.txt\"}"`); that text is parsed. Anything else is an error the model can act on.
+pub fn mcp_call_arguments(arguments: Option<Value>) -> Result<Option<Value>, String> {
+    const EXPECTED: &str =
+        "`arguments` must be a JSON object with the tool's parameters, such as {\"path\": \"README.md\"}";
+    match arguments {
+        None | Some(Value::Null) => Ok(None),
+        Some(object @ Value::Object(_)) => Ok(Some(object)),
+        Some(Value::String(text)) if text.trim().is_empty() => Ok(None),
+        Some(Value::String(text)) => match serde_json::from_str::<Value>(&text) {
+            Ok(object @ Value::Object(_)) => Ok(Some(object)),
+            Ok(other) => Err(format!(
+                "{EXPECTED}; got a string holding {}",
+                json_kind(&other)
+            )),
+            Err(error) => Err(format!(
+                "{EXPECTED}; got a string that is not JSON ({error})"
+            )),
+        },
+        Some(other) => Err(format!("{EXPECTED}; got {}", json_kind(&other))),
+    }
+}
+
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+#[cfg(test)]
+mod mcp_call_arguments_tests {
+    use super::mcp_call_arguments;
+    use serde_json::json;
+
+    #[test]
+    fn arguments_sent_as_json_text_reach_the_server_as_an_object() {
+        let object = json!({"path": "C:\\work\\a.txt", "lines": 3});
+        assert_eq!(
+            mcp_call_arguments(Some(json!(object.to_string()))),
+            Ok(Some(object.clone()))
+        );
+        assert_eq!(mcp_call_arguments(Some(object.clone())), Ok(Some(object)));
+        assert_eq!(mcp_call_arguments(None), Ok(None));
+        assert_eq!(mcp_call_arguments(Some(json!(null))), Ok(None));
+        assert_eq!(mcp_call_arguments(Some(json!("  "))), Ok(None));
+    }
+
+    #[test]
+    fn arguments_that_are_not_an_object_are_a_clear_error() {
+        for (arguments, got) in [
+            (json!("path=a.txt"), "a string that is not JSON"),
+            (json!("[1, 2]"), "a string holding an array"),
+            (json!("\"a.txt\""), "a string holding a string"),
+            (json!([1, 2]), "got an array"),
+            (json!(7), "got a number"),
+        ] {
+            let error = mcp_call_arguments(Some(arguments)).expect_err("not an object");
+            assert!(error.contains("must be a JSON object"), "{error}");
+            assert!(error.contains(got), "{error}");
+        }
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn run_mcp_tool(input: McpToolInput) -> Result<String, String> {
     let registry = global_mcp_registry();
-    let args = input.arguments.unwrap_or(serde_json::json!({}));
+    let args = mcp_call_arguments(input.arguments)?.unwrap_or_else(|| serde_json::json!({}));
     match registry.call_tool(&input.server, &input.tool, &args) {
         Ok(result) => to_pretty_json(json!({
             "server": input.server,
@@ -2746,6 +2912,9 @@ struct AgentOutput {
 #[derive(Debug, Clone)]
 struct AgentJob {
     manifest: AgentOutput,
+    /// The model id the sub-agent's requests use (the manifest shows it without the
+    /// routing prefix).
+    model: String,
     prompt: String,
     system_prompt: Vec<String>,
     allowed_tools: BTreeSet<String>,
@@ -3624,6 +3793,10 @@ const FALLBACK_AGENT_MODEL: &str = "auto";
 const DEFAULT_AGENT_TIMEOUT: Duration = Duration::from_mins(10);
 const AGENT_TIMEOUT_ENV_VAR: &str = "NEURON_SUBAGENT_TIMEOUT_SECS";
 const AGENT_WAIT_POLL: Duration = Duration::from_millis(200);
+/// How long an interrupted `Agent` call waits for its sub-agent to stop.
+const AGENT_CANCEL_GRACE: Duration = Duration::from_secs(2);
+/// The error of a sub-agent run the user interrupted.
+const AGENT_CANCELLED: &str = "sub-agent cancelled by the user";
 const SUBAGENT_REGISTERED_OUTPUT_CAP: u32 = 32_000;
 const SUBAGENT_UNKNOWN_MODEL_OUTPUT: u32 = 8_192;
 
@@ -3824,8 +3997,11 @@ fn wait_for_agent(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if parent_cancel.is_some_and(runtime::CancellationToken::is_cancelled) {
                     child_cancel.cancel();
+                    // A moment for it to stop, so the result says how it ended (the
+                    // manifest said `running` while the sub-agent recorded its end).
+                    let stopped = done_rx.recv_timeout(AGENT_CANCEL_GRACE).ok();
                     break (
-                        None,
+                        stopped,
                         Some("Cancelled by the user; the sub-agent was asked to stop.".to_string()),
                     );
                 }
@@ -3930,7 +4106,7 @@ where
         name: agent_name,
         description: input.description,
         subagent_type: Some(normalized_subagent_type),
-        model: Some(model),
+        model: Some(shown_agent_model(&model).to_string()),
         status: String::from("running"),
         output_file: output_file.display().to_string(),
         manifest_file: manifest_file.display().to_string(),
@@ -3947,6 +4123,7 @@ where
     let manifest_for_spawn = manifest.clone();
     let job = AgentJob {
         manifest: manifest_for_spawn,
+        model,
         prompt: input.prompt,
         system_prompt,
         allowed_tools,
@@ -3978,12 +4155,16 @@ fn spawn_agent_job_with_completion(
                     error: None,
                 },
                 Ok(Err(error)) => {
-                    let _ = persist_agent_terminal_state(
-                        &job.manifest,
-                        "failed",
-                        None,
-                        Some(error.clone()),
-                    );
+                    let _ = if error == AGENT_CANCELLED {
+                        persist_agent_cancelled(&job.manifest)
+                    } else {
+                        persist_agent_terminal_state(
+                            &job.manifest,
+                            "failed",
+                            None,
+                            Some(error.clone()),
+                        )
+                    };
                     AgentCompletion {
                         final_text: None,
                         error: Some(error),
@@ -4022,9 +4203,7 @@ fn run_agent_job(job: &AgentJob, cancel: &runtime::CancellationToken) -> Result<
         .map_err(|error| error.to_string())?;
     let final_text = final_assistant_text(&summary);
     match &summary.outcome {
-        runtime::TurnOutcome::Cancelled { .. } => {
-            Err(String::from("sub-agent cancelled by the user"))
-        }
+        runtime::TurnOutcome::Cancelled { .. } => Err(AGENT_CANCELLED.to_string()),
         runtime::TurnOutcome::LoopDetected { tool_name, repeats } => Err(format!(
             "sub-agent stopped after repeating `{tool_name}` {repeats} times"
         )),
@@ -4043,11 +4222,7 @@ fn run_agent_job(job: &AgentJob, cancel: &runtime::CancellationToken) -> Result<
 fn build_agent_runtime(
     job: &AgentJob,
 ) -> Result<ConversationRuntime<SubagentApiClient, SubagentToolExecutor>, String> {
-    let model = job
-        .manifest
-        .model
-        .clone()
-        .unwrap_or_else(|| resolve_agent_model(None));
+    let model = job.model.clone();
     let api_client = SubagentApiClient::new(&model, job.allowed_tools.clone())?;
     Ok(assemble_agent_runtime(
         api_client,
@@ -4314,6 +4489,12 @@ fn resolve_agent_model(model: Option<&str>) -> String {
     }
 }
 
+/// A sub-agent's model as the rest of Neuron shows models: without the gateway
+/// transport's `openai/` routing prefix.
+fn shown_agent_model(model: &str) -> &str {
+    model.strip_prefix("openai/").unwrap_or(model)
+}
+
 fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
     let tools = match subagent_type {
         "Explore" => vec![
@@ -4426,10 +4607,11 @@ fn agent_permission_policy_for(
 mod subagent_inheritance_tests {
     use super::{
         agent_permission_policy, assemble_agent_runtime, cancel_background_subagents,
-        clear_subagent_parent_context, resolve_agent_model, restrict_to_parent_tools,
-        set_subagent_parent_context, subagent_api_error, subagent_feature_config,
-        subagent_max_tokens, wait_for_agent, workspace_agent_store, AgentCompletion, AgentOutput,
-        SubagentParentContext,
+        clear_subagent_parent_context, persist_agent_cancelled, resolve_agent_model,
+        restrict_to_parent_tools, set_subagent_parent_context, shown_agent_model,
+        subagent_api_error, subagent_feature_config, subagent_max_tokens, wait_for_agent,
+        workspace_agent_store, AgentCompletion, AgentOutput, SubagentParentContext,
+        AGENT_CANCELLED,
     };
     use runtime::{
         ApiClient, ApiRequest, AssistantEvent, CancellationToken, ContentBlock, PermissionMode,
@@ -4753,6 +4935,76 @@ mod subagent_inheritance_tests {
             .as_deref()
             .is_some_and(|note| note.contains("Cancelled")));
     }
+
+    /// After an interrupt the `Agent` result said `running` while the sub-agent's own
+    /// manifest said `failed`, as an `infra` failure; and its model had the routing
+    /// prefix the rest of Neuron leaves out.
+    #[test]
+    fn an_interrupted_subagent_reports_cancelled_not_running_or_failed() {
+        let dir = std::env::temp_dir().join(format!(
+            "neuron-agent-cancel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("agent dir");
+        let mut running = manifest(&dir);
+        running.manifest_file = dir.join("agent-test.json").display().to_string();
+        std::fs::write(
+            &running.output_file,
+            "# Agent Task
+",
+        )
+        .expect("output file");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let parent = CancellationToken::new();
+        parent.cancel();
+        let child = CancellationToken::new();
+        let sub_agent = {
+            let child = child.clone();
+            let running = running.clone();
+            std::thread::spawn(move || {
+                while !child.is_cancelled() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                persist_agent_cancelled(&running).expect("persisted");
+                done_tx
+                    .send(AgentCompletion {
+                        final_text: None,
+                        error: Some(AGENT_CANCELLED.to_string()),
+                    })
+                    .expect("send");
+            })
+        };
+
+        let result = wait_for_agent(
+            running,
+            &done_rx,
+            Duration::from_secs(60),
+            Some(&parent),
+            &child,
+        );
+        sub_agent.join().expect("sub-agent");
+
+        let json = serde_json::to_value(&result).expect("serializes");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(json["status"], "cancelled", "{json}");
+        assert_eq!(json["derivedState"], "cancelled", "{json}");
+        assert!(json["currentBlocker"].is_null(), "{json}");
+        assert_eq!(json["laneEvents"][0]["event"], "lane.closed", "{json}");
+        assert!(json["laneEvents"][0]["failureClass"].is_null(), "{json}");
+        assert!(result
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("Cancelled")));
+
+        assert_eq!(
+            shown_agent_model("openai/groq/openai/gpt-oss-120b"),
+            "groq/openai/gpt-oss-120b"
+        );
+        assert_eq!(shown_agent_model("claude-sonnet-4-6"), "claude-sonnet-4-6");
+    }
 }
 
 fn write_agent_manifest(manifest: &AgentOutput) -> Result<(), String> {
@@ -4763,6 +5015,30 @@ fn write_agent_manifest(manifest: &AgentOutput) -> Result<(), String> {
         serde_json::to_string_pretty(&normalized).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())
+}
+
+/// Records a sub-agent the user interrupted: `cancelled`, with no failure blocker (it
+/// did not fail; it was reported as an `infra` failure).
+fn persist_agent_cancelled(manifest: &AgentOutput) -> Result<(), String> {
+    append_agent_output(
+        &manifest.output_file,
+        &format_agent_terminal_output("cancelled", None, None, Some(AGENT_CANCELLED)),
+    )?;
+    let mut next_manifest = manifest.clone();
+    next_manifest.status = "cancelled".to_string();
+    next_manifest.completed_at = Some(iso8601_now());
+    next_manifest.current_blocker = None;
+    next_manifest.derived_state = "cancelled".to_string();
+    next_manifest.error = Some(AGENT_CANCELLED.to_string());
+    next_manifest.lane_events.push(
+        LaneEvent::new(
+            LaneEventName::Closed,
+            LaneEventStatus::Closed,
+            iso8601_now(),
+        )
+        .with_detail(AGENT_CANCELLED),
+    );
+    write_agent_manifest(&next_manifest)
 }
 
 fn persist_agent_terminal_state(
@@ -5749,6 +6025,16 @@ impl SubagentToolExecutor {
 
 impl ToolExecutor for SubagentToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        self.execute_with_cancellation(tool_name, input, &CancellationToken::new())
+    }
+
+    /// A cancelled sub-agent kills its running `bash` / `PowerShell` command tree.
+    fn execute_with_cancellation(
+        &mut self,
+        tool_name: &str,
+        input: &str,
+        cancel: &CancellationToken,
+    ) -> Result<String, ToolError> {
         if !self.allowed_tools.contains(tool_name) {
             return Err(ToolError::new(format!(
                 "tool `{tool_name}` is not enabled for this sub-agent"
@@ -5756,7 +6042,7 @@ impl ToolExecutor for SubagentToolExecutor {
         }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        execute_tool_with_enforcer(self.enforcer.as_ref(), tool_name, &value)
+        execute_tool_with_enforcer_and_cancel(self.enforcer.as_ref(), tool_name, &value, cancel)
             .map_err(ToolError::new)
     }
 }
@@ -7873,6 +8159,31 @@ mod tests {
         assert!(error
             .to_string()
             .contains("requires workspace-write permission"));
+    }
+
+    #[test]
+    fn a_cancelled_subagent_stops_its_running_bash_command() {
+        let mut executor = SubagentToolExecutor::new(BTreeSet::from([String::from("bash")]));
+        let cancel = runtime::CancellationToken::new();
+        let trigger = cancel.clone();
+        let canceller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(400));
+            trigger.cancel();
+        });
+        let command = if cfg!(windows) {
+            "ping -n 30 127.0.0.1 >NUL"
+        } else {
+            "sleep 30"
+        };
+        let started = std::time::Instant::now();
+
+        let error = executor
+            .execute_with_cancellation("bash", &json!({ "command": command }).to_string(), &cancel)
+            .expect_err("a cancelled command is an error result");
+
+        canceller.join().expect("canceller");
+        assert!(error.to_string().contains("\"cancelled\""), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(15));
     }
 
     #[test]
@@ -10918,5 +11229,29 @@ printf 'pwsh:%s' "$1"
             )
             .into_bytes()
         }
+    }
+}
+
+#[cfg(test)]
+mod ask_on_terminal_tests {
+    use super::{write_question, AskUserQuestionInput};
+
+    /// The question and its answer prompt go to the stream chosen for it (stderr when
+    /// stdout is redirected), all of it.
+    #[test]
+    fn the_question_goes_to_the_stream_it_is_given() {
+        let mut out = Vec::new();
+        write_question(
+            &mut out,
+            &AskUserQuestionInput {
+                question: "Which branch?".to_string(),
+                options: Some(vec!["main".to_string(), "dev".to_string()]),
+            },
+        )
+        .expect("written");
+        assert_eq!(
+            String::from_utf8(out).expect("utf-8"),
+            "\n[Question] Which branch?\n  1. main\n  2. dev\nEnter choice (1-2): "
+        );
     }
 }

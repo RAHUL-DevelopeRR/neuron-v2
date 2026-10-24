@@ -1,18 +1,24 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: a tool
 // result the engine marked an error draws as a failure (✗, error colour,
-// "failed" or "refused" and the reason). See ui/neuron-tui/PORTING.md.
+// "failed" or "refused" and the reason), and a call the user interrupted as
+// "stopped (interrupted)". Its markers come from utils/glyphs.ts.
+// See ui/neuron-tui/PORTING.md.
 import { TextAttributes } from '@opentui/core'
 import React, { createContext, useContext, type ReactNode } from 'react'
 import stringWidth from 'string-width'
 
 import { useTheme } from '../../hooks/use-theme'
+import { GLYPHS } from '../../utils/glyphs'
 import { Button } from '../button'
 
 import type { ChatTheme } from '../../types/theme-system'
 
-/** Why a tool call shows as failed: the engine refused it, or it ran and failed. */
+/**
+ * Why a tool call shows as failed: the engine refused it, it ran and failed,
+ * or it was stopped (the user interrupted the turn while it ran).
+ */
 export interface ToolFailure {
-  label: 'refused' | 'failed'
+  label: 'refused' | 'failed' | 'stopped'
   /** The error text, without an `Error: ` prefix; `null` when there is none. */
   reason: string | null
   /**
@@ -28,6 +34,9 @@ export interface ToolFailure {
 const REFUSAL_PATTERN =
   /not allowed in read-only mode|requires '?[\w-]+'? permission|current mode is|requires approval|denied by|has been denied|the call was denied/i
 
+/** How a command the user interrupted ended (engine `cancelled`, or the UI's own mark). */
+const INTERRUPTED = 'interrupted'
+
 /** The failure to show for a tool block, or `null` for one that succeeded. */
 export function toolFailureOf(block: {
   isError?: boolean
@@ -35,8 +44,16 @@ export function toolFailureOf(block: {
   exitCode?: number
   stopReason?: string
 }): ToolFailure | null {
-  if (!block.isError) return null
   const reason = (block.output ?? '').trim().replace(/^Error:\s*/, '')
+  // Interrupted, not failed: also before (or without) the engine's result.
+  if (block.stopReason === INTERRUPTED) {
+    return {
+      label: 'stopped',
+      reason: block.isError ? reason || null : null,
+      detail: INTERRUPTED,
+    }
+  }
+  if (!block.isError) return null
   const detail =
     block.exitCode !== undefined ? `exit code ${block.exitCode}` : (block.stopReason ?? null)
   return {
@@ -47,7 +64,10 @@ export function toolFailureOf(block: {
   }
 }
 
-/** The failure as its row says it: "failed", "refused", "failed (exit code 2)". */
+/**
+ * The failure as its row says it: "failed", "refused", "failed (exit code 2)",
+ * "stopped (interrupted)".
+ */
 export const failureLabel = (failure: ToolFailure): string =>
   failure.detail ? `${failure.label} (${failure.detail})` : failure.label
 
@@ -209,7 +229,7 @@ export const SimpleToolCallItem = ({
 }: SimpleToolCallItemProps) => {
   const theme = useTheme()
   const failure = useToolFailure()
-  const bulletChar = failure ? '✗ ' : '• '
+  const bulletChar = failure ? `${GLYPHS.cross} ` : '• '
   const accent = failure ? theme.error : theme.foreground
 
   const row = (
@@ -261,8 +281,10 @@ export const ToolCallItem = ({
   }
 
   const isExpanded = !isCollapsed
-  const bulletChar = failure ? '✗ ' : '• '
-  const toggleIndicator = onToggle ? (isCollapsed ? '▸ ' : '▾ ') : ''
+  const bulletChar = failure ? `${GLYPHS.cross} ` : '• '
+  const toggleIndicator = onToggle
+    ? `${isCollapsed ? GLYPHS.collapsed : GLYPHS.expanded} `
+    : ''
   const toggleLabel = onToggle ? toggleIndicator : bulletChar
   // Width in cells of the toggle label (toggle arrow or bullet). Used to align
   // expanded content directly under the toggle icon.

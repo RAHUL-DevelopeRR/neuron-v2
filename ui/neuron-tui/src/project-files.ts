@@ -171,6 +171,36 @@ export function mostRecentChatDirIn(dataDirs: string[]): string | null {
 }
 
 /**
+ * The chat `--continue [id]` reopens: `id`'s directory, else the most recent
+ * chat with a prompt in it (as loadMostRecentChatState picks it), or `null`.
+ */
+export function continuedChatDirIn(
+  dataDirs: string[],
+  chatId?: string | null,
+): string | null {
+  const named = chatId?.trim() ? findChatDirIn(dataDirs, chatId) : null
+  return named ?? mostRecentChatDirIn(dataDirs)
+}
+
+/**
+ * Make the chat `--continue` reopens the current one, before anything writes
+ * to the current chat's directory (the log does at once). Otherwise every
+ * launch made a chat directory of its own, holding only that log, and the
+ * continued chat was saved there under a new id until the transcript loaded.
+ * Returns the chat id, or `null` when there is nothing to continue.
+ */
+export function continueChatAtStart(chatId?: string | null): string | null {
+  let dir: string | null
+  try {
+    dir = continuedChatDirIn(getProjectDataDirs(), chatId)
+  } catch {
+    return null
+  }
+  if (!dir) return null
+  return setCurrentChatId(path.basename(dir))
+}
+
+/**
  * Find the most recent chat directory based on modification time
  * Returns null if no chat directories exist
  */

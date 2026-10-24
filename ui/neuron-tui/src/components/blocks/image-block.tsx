@@ -1,7 +1,10 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the icon
+// comes from utils/glyphs.ts. See ui/neuron-tui/PORTING.md.
 import { TextAttributes } from '@opentui/core'
 import { memo, useMemo } from 'react'
 
 import { useTheme } from '../../hooks/use-theme'
+import { GLYPHS } from '../../utils/glyphs'
 import { calculateDisplaySize } from '../../utils/image-display'
 import {
   renderInlineImage,
@@ -65,7 +68,7 @@ export const ImageBlock = memo(({ block, availableWidth }: ImageBlockProps) => {
       <box style={{ flexDirection: 'column', gap: 0 }}>
         {/* Image caption/metadata */}
         <text style={{ wrapMode: 'none', fg: theme.muted }}>
-          <span attributes={TextAttributes.DIM}>📷 </span>
+          <span attributes={TextAttributes.DIM}>{`${GLYPHS.image} `}</span>
           <span>{filename || 'Image'}</span>
           {formattedSize && (
             <span attributes={TextAttributes.DIM}> ({formattedSize})</span>
@@ -91,7 +94,7 @@ export const ImageBlock = memo(({ block, availableWidth }: ImageBlockProps) => {
     >
       {/* Header */}
       <text style={{ wrapMode: 'none', fg: theme.foreground }}>
-        <span attributes={TextAttributes.BOLD}>📷 Image Attachment</span>
+        <span attributes={TextAttributes.BOLD}>{`${GLYPHS.image} Image Attachment`}</span>
       </text>
 
       {/* Filename */}

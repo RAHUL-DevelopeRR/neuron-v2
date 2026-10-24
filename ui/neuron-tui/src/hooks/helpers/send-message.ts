@@ -1,4 +1,5 @@
-// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: an
+// interrupt also marks the tool calls still running as interrupted.
 // See ui/neuron-tui/PORTING.md.
 import { getErrorObject } from '@neuron-tui/common/util/error'
 
@@ -9,7 +10,10 @@ import { markRunningAgentsAsCancelled } from '../../utils/block-operations'
 import { formatElapsedTime } from '../../utils/format-elapsed-time'
 import { processImagesForMessage } from '../../utils/image-processor'
 import { logger } from '../../utils/logger'
-import { appendInterruptionNotice } from '../../utils/message-block-helpers'
+import {
+  appendInterruptionNotice,
+  markRunningToolsInterrupted,
+} from '../../utils/message-block-helpers'
 import { getUserMessage } from '../../utils/message-history'
 import {
   createBatchedMessageUpdater,
@@ -306,7 +310,9 @@ export const setupStreamingContext = (params: {
     }
 
     updater.updateAiMessageBlocks((blocks) => {
-      const cancelledBlocks = markRunningAgentsAsCancelled(blocks)
+      const cancelledBlocks = markRunningToolsInterrupted(
+        markRunningAgentsAsCancelled(blocks),
+      )
       return appendInterruptionNotice(cancelledBlocks)
     })
     updater.markComplete()

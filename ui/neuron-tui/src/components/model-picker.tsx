@@ -4,8 +4,9 @@
  * plan can't use now are greyed with the reason and can't be picked, and so
  * are models the gateway has taken out of rotation ("blurred") until they are
  * back; "degraded" and "busy" ones are marked but can be picked. The list
- * refreshes every 30 s while the picker is open. `/model <name>` switches
- * without it, for providers without a catalog.
+ * refreshes every 30 s while the picker is open. Enter on a model that can't
+ * be picked says why. Rows too long for the width end in "…". `/model <name>`
+ * switches without it, for providers without a catalog.
  *
  *   ↑/↓ move   enter switch   esc close
  */
@@ -13,6 +14,7 @@
 import { TextAttributes, type KeyEvent } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
+import stringWidth from 'string-width'
 
 import { getNeuronEngineClient } from '../engine/neuron-engine-client'
 import { useTheme } from '../hooks/use-theme'
@@ -35,6 +37,8 @@ export interface ModelRow {
   current: boolean
   /** A usable model's health worth a glance ("degraded", "busy"), or `null`. */
   marker: string | null
+  /** Why it can't be picked now, in words; `null` when it can. */
+  unavailableReason: string | null
 }
 
 /** The gateway's `unavailable_reason` codes, in words. Other text is shown as sent. */
@@ -75,11 +79,15 @@ export function modelRows(models: ModelsEvent | null, now: number = Date.now()):
     const blurred =
       model.status === 'blurred' && (Number.isNaN(againAt) || againAt > now)
     let marker: string | null = null
+    let unavailableReason: string | null = null
     if (!model.available) {
       const reason = model.unavailable_reason
-      details.push(reason ? (UNAVAILABLE_REASONS[reason] ?? reason) : 'not on your plan')
+      unavailableReason = reason ? (UNAVAILABLE_REASONS[reason] ?? reason) : 'not on your plan'
+      details.push(unavailableReason)
     } else if (blurred) {
-      details.push(backInLabel(model.available_again_at, now) ?? 'temporarily unavailable')
+      const backIn = backInLabel(model.available_again_at, now)
+      details.push(backIn ?? 'temporarily unavailable')
+      unavailableReason = `the gateway took it out of rotation${backIn ? `; ${backIn}` : ' for now'}`
     } else {
       if (model.tiers.length > 0) details.push(model.tiers.join(', '))
       if (model.status === 'degraded' || model.status === 'busy') marker = model.status
@@ -91,8 +99,60 @@ export function modelRows(models: ModelsEvent | null, now: number = Date.now()):
       available: model.available && !blurred,
       current: isCurrentModel(model.id, models.current),
       marker,
+      unavailableReason,
     }
   })
+}
+
+/** `text` cut to `width` columns, ending in "…" when it was cut. */
+export function truncateToWidth(text: string, width: number): string {
+  if (width <= 0) return ''
+  if (stringWidth(text) <= width) return text
+  let kept = ''
+  for (const char of text) {
+    if (stringWidth(kept + char) > width - 1) break
+    kept += char
+  }
+  return `${kept}…`
+}
+
+/** A row's parts as drawn: `current`, `marker` and `detail` keep their leading spaces. */
+export interface FittedRow {
+  label: string
+  current: string
+  marker: string
+  detail: string
+}
+
+/**
+ * A row in `width` columns (after its 2-column pointer): the detail gives way
+ * first, then the label; "(current)" and the health marker stay.
+ */
+export function fitModelRow(row: ModelRow, width: number): FittedRow {
+  const current = row.current ? '  (current)' : ''
+  const marker = row.marker ? `  ${row.marker}` : ''
+  const detail = row.detail ? `  ${row.detail}` : ''
+  const fixed = stringWidth(current) + stringWidth(marker)
+  const labelWidth = stringWidth(row.label)
+  if (labelWidth + fixed + stringWidth(detail) <= width) {
+    return { label: row.label, current, marker, detail }
+  }
+  const detailRoom = width - labelWidth - fixed
+  // A detail cut to almost nothing says nothing.
+  if (detailRoom >= 8) {
+    return { label: row.label, current, marker, detail: truncateToWidth(detail, detailRoom) }
+  }
+  return {
+    label: truncateToWidth(row.label, Math.max(1, width - fixed)),
+    current,
+    marker,
+    detail: '',
+  }
+}
+
+/** What Enter on a model that can't be picked says. */
+export function unavailableMessage(row: ModelRow): string {
+  return `${row.label} can't be picked: ${row.unavailableReason ?? 'not available now'}.`
 }
 
 /** The rows to draw: a window of `size` rows that keeps `focus` in view. */
@@ -130,6 +190,9 @@ export const ModelPicker = ({
   const currentId = currentIndex >= 0 ? rows[currentIndex]!.id : null
   // Each open starts on the current model (the picker mounts per open).
   const [focus, setFocus] = useState(() => Math.max(0, currentIndex))
+  // Why the model Enter was pressed on can't be picked, until the focus moves.
+  const [notice, setNotice] = useState<string | null>(null)
+  useEffect(() => setNotice(null), [focus])
 
   // Ask now and every 30 s; until the first reply the last list (if any) shows.
   useEffect(() => {
@@ -172,7 +235,11 @@ export const ModelPicker = ({
         } else if (key.name === 'return' || key.name === 'enter') {
           key.preventDefault?.()
           const row = rows[focus]
-          if (!row || !row.available) return
+          if (!row) return
+          if (!row.available) {
+            setNotice(unavailableMessage(row))
+            return
+          }
           if (!row.current) {
             try {
               switchModel(row.id)
@@ -188,6 +255,8 @@ export const ModelPicker = ({
   )
 
   const [start, end] = visibleWindow(rows.length, focus, maxVisibleRows)
+  // Inside the border and padding, after the 2-column pointer.
+  const rowWidth = Math.max(4, Math.max(20, width) - 4 - 2)
 
   return (
     <box
@@ -213,6 +282,7 @@ export const ModelPicker = ({
         rows.slice(start, end).map((row, offset) => {
           const index = start + offset
           const focused = index === focus
+          const fitted = fitModelRow(row, rowWidth)
           return (
             <text key={row.id} style={{ wrapMode: 'none' }}>
               <span fg={focused ? theme.primary : theme.muted}>{focused ? '› ' : '  '}</span>
@@ -220,19 +290,22 @@ export const ModelPicker = ({
                 fg={row.available ? theme.foreground : theme.muted}
                 attributes={focused && row.available ? TextAttributes.BOLD : undefined}
               >
-                {row.label}
+                {fitted.label}
               </span>
-              {row.current ? <span fg={theme.success}>{'  (current)'}</span> : null}
-              {row.marker ? (
+              {fitted.current ? <span fg={theme.success}>{fitted.current}</span> : null}
+              {fitted.marker ? (
                 <span fg={theme.warning} attributes={TextAttributes.DIM}>
-                  {`  ${row.marker}`}
+                  {fitted.marker}
                 </span>
               ) : null}
-              {row.detail ? <span fg={theme.muted}>{`  ${row.detail}`}</span> : null}
+              {fitted.detail ? <span fg={theme.muted}>{fitted.detail}</span> : null}
             </text>
           )
         })
       )}
+      {notice ? (
+        <text style={{ wrapMode: 'word', fg: theme.warning }}>{notice}</text>
+      ) : null}
       <text style={{ fg: theme.muted }}>
         {rows.length > maxVisibleRows ? `${focus + 1}/${rows.length} · ` : ''}
         ↑↓ move · enter switch · esc close

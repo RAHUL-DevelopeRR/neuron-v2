@@ -4,10 +4,16 @@ import * as os from 'os'
 import * as path from 'path'
 
 import {
+  continueChatAtStart,
+  continuedChatDirIn,
   findChatDirIn,
+  getCurrentChatDir,
+  getCurrentChatId,
+  getProjectRoot,
   mostRecentChatDirIn,
   projectDataDirName,
   setProjectRoot,
+  startNewChat,
   tryGetProjectRoot,
 } from '../project-files'
 import {
@@ -102,6 +108,39 @@ describe('chat lookup across data directories', () => {
     const slashOnly = writeChat(current, 'd', '/status')
     fs.utimesSync(slashOnly, new Date(4_000_000), new Date(4_000_000))
     expect(mostRecentChatDirIn([current, legacy])).toBe(newer)
+  })
+
+  test('--continue picks the named chat, else the most recent one with a prompt', () => {
+    const older = writeChat(current, 'a', 'one')
+    const newer = writeChat(current, 'b', 'two')
+    fs.utimesSync(older, new Date(1_000_000), new Date(1_000_000))
+    fs.utimesSync(newer, new Date(2_000_000), new Date(2_000_000))
+    expect(continuedChatDirIn([current, legacy], 'a')).toBe(older)
+    expect(continuedChatDirIn([current, legacy], null)).toBe(newer)
+    // An id that is not there falls back, as loadMostRecentChatState does.
+    expect(continuedChatDirIn([current, legacy], 'missing')).toBe(newer)
+    expect(continuedChatDirIn([path.join(configDir, 'none')], null)).toBeNull()
+  })
+
+  test('--continue makes the continued chat current, so no new chat directory is made', () => {
+    const savedEnv = process.env.NEURON_TUI_CONFIG_DIR
+    const savedRoot = tryGetProjectRoot()
+    try {
+      process.env.NEURON_TUI_CONFIG_DIR = configDir
+      setProjectRoot(path.join(configDir, 'repos', 'app'))
+      const dataDir = path.join(configDir, 'projects', projectDataDirName(getProjectRoot()))
+      const chat = writeChat(dataDir, '2026-01-02T03-04-05.678Z', 'old prompt')
+
+      expect(continueChatAtStart(null)).toBe('2026-01-02T03-04-05.678Z')
+      expect(getCurrentChatId()).toBe('2026-01-02T03-04-05.678Z')
+      expect(getCurrentChatDir()).toBe(chat)
+      expect(fs.readdirSync(path.join(dataDir, 'chats'))).toEqual(['2026-01-02T03-04-05.678Z'])
+    } finally {
+      if (savedEnv === undefined) delete process.env.NEURON_TUI_CONFIG_DIR
+      else process.env.NEURON_TUI_CONFIG_DIR = savedEnv
+      if (savedRoot !== undefined) setProjectRoot(savedRoot)
+      startNewChat()
+    }
   })
 
   test('--continue <chatId> still opens a chat saved under the folder name only', () => {

@@ -1225,6 +1225,73 @@ fn expired_stored_login_prints_the_login_instruction_once() {
 }
 
 #[test]
+fn auth_status_reports_an_expired_or_revoked_login_as_signed_out() {
+    // Revoked: the gateway rejects the stored login.
+    let gateway = FakeGateway::spawn(|_, _| {
+        Reply::json(
+            "401 Unauthorized",
+            &serde_json::json!({"error": {"message": "Session revoked", "type": "authentication_error", "code": "invalid_session"}}),
+        )
+    });
+    let workspace = Workspace::new("revoked-status");
+    let credentials = serde_json::json!({"version": 1, "token": STORED_TOKEN, "expires_at": 4_070_908_800_u64, "plan": "free", "saved_at": 0});
+    fs::write(
+        workspace.neuron_home().join("credentials.json"),
+        credentials.to_string(),
+    )
+    .unwrap();
+    let mut status = workspace.command(&gateway);
+    status.args(["auth", "status"]);
+    let output = run(status, None);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let report = stdout(&output);
+    assert!(
+        report.starts_with("Signed out of Zero-X: the session expired or was revoked (stored login, credentials file). Run `neuron auth login`."),
+        "{report}"
+    );
+    assert!(!report.contains("Signed in        yes"), "{report}");
+    assert_eq!(stderr(&output), "", "said once, on stdout");
+
+    let mut status = workspace.command(&gateway);
+    status.args(["auth", "status", "--output-format", "json"]);
+    let output = run(status, None);
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("JSON status");
+    assert_eq!(report["type"], "auth_status");
+    assert_eq!(report["signed_in"], false);
+    assert_eq!(report["session"], "invalid");
+
+    // Expired by its stored expiry: signed out without asking the gateway.
+    let gateway = gateway_with_chat(|_, _| text_reply("unused"));
+    let workspace = Workspace::new("expired-status");
+    let mut credentials = credentials;
+    credentials["expires_at"] = 1_000_u64.into();
+    fs::write(
+        workspace.neuron_home().join("credentials.json"),
+        credentials.to_string(),
+    )
+    .unwrap();
+    let mut status = workspace.command(&gateway);
+    status.args(["auth", "status"]);
+    let output = run(status, None);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let report = stdout(&output);
+    assert!(
+        report.starts_with("Signed out of Zero-X: the session expired 1970-01-01 00:16 UTC"),
+        "{report}"
+    );
+    let mut status = workspace.command(&gateway);
+    status.args(["--output-format", "json", "auth", "status"]);
+    let output = run(status, None);
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("JSON status");
+    assert_eq!(report["type"], "auth_status");
+    assert_eq!(report["signed_in"], false);
+    assert_eq!(report["session"], "expired");
+    assert_eq!(gateway.count("GET", "/auth/session"), 0);
+}
+
+#[test]
 fn prompt_subcommand_text_may_mention_the_provider_flag() {
     let gateway = gateway_with_chat(|_, _| text_reply("explained"));
     let workspace = Workspace::new("prompt-words");

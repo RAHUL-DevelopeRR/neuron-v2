@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -111,12 +111,14 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
             extra_env: None,
             resume_session: None,
         },
+        // Without a terminal nobody is prompted: an allow rule in the settings approves
+        // the escalation, and a piped answer is never read.
         ScenarioCase {
             name: "bash_permission_prompt_approved",
             permission_mode: "workspace-write",
             allowed_tools: Some("bash"),
-            stdin: Some("y\n"),
-            prepare: prepare_noop,
+            stdin: None,
+            prepare: prepare_bash_allow_rule,
             assert: assert_bash_permission_prompt_approved,
             extra_env: None,
             resume_session: None,
@@ -302,6 +304,7 @@ impl HarnessWorkspace {
 struct ScenarioRun {
     response: Value,
     stdout: String,
+    stderr: String,
 }
 
 #[derive(Debug, Clone)]
@@ -386,11 +389,28 @@ fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) ->
         command.output().expect("claw should launch")
     };
 
-    assert_success(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(expected_exit_code(case.name)),
+        "stdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     ScenarioRun {
         response: parse_json_output(&stdout),
         stdout,
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+/// A run whose tool call was denied because nobody could approve it ends with exit
+/// code 2; the others succeed.
+fn expected_exit_code(scenario: &str) -> i32 {
+    if scenario == "bash_permission_prompt_denied" {
+        2
+    } else {
+        0
     }
 }
 
@@ -417,6 +437,15 @@ fn prepare_auto_compact_fixture(workspace: &HarnessWorkspace) {
 }
 
 fn prepare_noop(_: &HarnessWorkspace) {}
+
+/// Approves bash in the user settings, the way a run without a terminal allows it.
+fn prepare_bash_allow_rule(workspace: &HarnessWorkspace) {
+    fs::write(
+        workspace.config_home.join("settings.json"),
+        r#"{"defaultMcpServers":false,"permissions":{"allow":["bash"]}}"#,
+    )
+    .expect("settings should write");
+}
 
 fn prepare_read_fixture(workspace: &HarnessWorkspace) {
     fs::write(workspace.root.join("fixture.txt"), "alpha parity line\n")
@@ -656,8 +685,11 @@ fn assert_bash_stdout_roundtrip(_: &HarnessWorkspace, run: &ScenarioRun) {
 }
 
 fn assert_bash_permission_prompt_approved(workspace: &HarnessWorkspace, run: &ScenarioRun) {
-    assert!(run.stdout.contains("Permission approval required"));
-    assert!(run.stdout.contains("Approve this tool call? [y/N]:"));
+    assert!(
+        !run.stdout.contains("Approve this tool call?"),
+        "{}",
+        run.stdout
+    );
     assert_eq!(run.response["iterations"], Value::from(2));
     assert_eq!(
         run.response["tool_results"][0]["is_error"],
@@ -679,13 +711,27 @@ fn assert_bash_permission_prompt_approved(workspace: &HarnessWorkspace, run: &Sc
 }
 
 fn assert_bash_permission_prompt_denied(workspace: &HarnessWorkspace, run: &ScenarioRun) {
-    assert!(run.stdout.contains("Permission approval required"));
-    assert!(run.stdout.contains("Approve this tool call? [y/N]:"));
+    // stdin is a pipe: no prompt, and the piped "n" is not read as an answer.
+    assert!(
+        !run.stdout.contains("Approve this tool call?"),
+        "{}",
+        run.stdout
+    );
     assert_eq!(run.response["iterations"], Value::from(2));
     let tool_output = run.response["tool_results"][0]["output"]
         .as_str()
         .expect("tool output");
-    assert!(tool_output.contains("denied by user approval prompt"));
+    assert!(
+        tool_output
+            .contains("non-interactive run: re-run with --permission-mode danger-full-access"),
+        "{tool_output}"
+    );
+    // The user is told too, and the run's last line on stderr names the tool.
+    assert!(
+        run.stderr.contains(r#""denied_tools":["bash"]"#),
+        "{}",
+        run.stderr
+    );
     assert_eq!(
         run.response["tool_results"][0]["is_error"],
         Value::Bool(true)
@@ -893,15 +939,6 @@ fn scenario_report_json(report: &ScenarioReport) -> Value {
         "tool_error_count": report.tool_error_count,
         "final_message": report.final_message,
     })
-}
-
-fn assert_success(output: &Output) {
-    assert!(
-        output.status.success(),
-        "stdout:\n{}\n\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
 
 fn unique_temp_dir(label: &str) -> PathBuf {

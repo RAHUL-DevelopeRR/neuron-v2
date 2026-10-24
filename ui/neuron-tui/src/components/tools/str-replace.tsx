@@ -7,6 +7,7 @@ import { DiffViewer } from './diff-viewer'
 import { ToolFailureReason, useToolFailure } from './tool-call-item'
 import { defineToolComponent } from './types'
 import { useTheme } from '../../hooks/use-theme'
+import { GLYPHS } from '../../utils/glyphs'
 import {
   extractDiff,
   extractFilePath,
@@ -24,7 +25,7 @@ interface EditHeaderProps {
 const EditHeader = ({ name, filePath }: EditHeaderProps) => {
   const theme = useTheme()
   const failure = useToolFailure()
-  const bulletChar = failure ? '✗ ' : '• '
+  const bulletChar = failure ? `${GLYPHS.cross} ` : '• '
   const accent = failure ? theme.error : theme.foreground
 
   return (

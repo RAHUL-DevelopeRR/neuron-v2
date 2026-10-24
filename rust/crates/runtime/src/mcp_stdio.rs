@@ -15,6 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 
+use crate::cancel::CancellationToken;
 use crate::config::{McpTransport, RuntimeConfig, ScopedMcpServerConfig};
 use crate::mcp::mcp_tool_name;
 use crate::mcp_client::{McpClientBootstrap, McpClientTransport, McpStdioTransport};
@@ -41,6 +42,8 @@ pub(crate) const MCP_TOOL_CALL_TIMEOUT_MS: u64 = 120_000;
 const MCP_EXIT_CHECK_MS: u64 = 250;
 /// Past this size the MCP server log starts afresh (the old one is kept as `.old`).
 const MCP_SERVER_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
+/// How long an interrupted call waits for its server's process tree to stop.
+const ABANDONED_SERVER_STOP_WAIT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
@@ -504,6 +507,22 @@ impl ManagedMcpServer {
         self.initialized = false;
         if let Some(mut process) = self.process.take() {
             let _ = process.shutdown().await;
+        }
+    }
+
+    /// [`Self::reset`] for a server whose call was abandoned: stopping it gets
+    /// [`ABANDONED_SERVER_STOP_WAIT`], then the server process itself is killed and
+    /// nothing waits for it, so an interrupt never waits on a server.
+    async fn abandon(&mut self) {
+        self.initialized = false;
+        let Some(mut process) = self.process.take() else {
+            return;
+        };
+        if timeout(ABANDONED_SERVER_STOP_WAIT, process.shutdown())
+            .await
+            .is_err()
+        {
+            let _ = process.child.start_kill();
         }
     }
 
@@ -998,6 +1017,37 @@ impl McpServerManager {
         response
     }
 
+    /// [`Self::call_tool`] that gives up when `cancel` fires (the turn was interrupted,
+    /// or the session is closing): `Ok(None)` then. The call's server is stopped, since
+    /// it may still be working on the call and its late reply must not be taken for the
+    /// next call's; the next call starts it again.
+    pub async fn call_tool_unless_cancelled(
+        &mut self,
+        qualified_tool_name: &str,
+        arguments: Option<JsonValue>,
+        cancel: &CancellationToken,
+    ) -> Result<Option<JsonRpcResponse<McpToolCallResult>>, McpServerManagerError> {
+        if cancel.is_cancelled() {
+            return Ok(None);
+        }
+        let finished = tokio::select! {
+            biased;
+            response = self.call_tool(qualified_tool_name, arguments) => Some(response),
+            () = cancel.cancelled() => None,
+        };
+        if let Some(response) = finished {
+            return response.map(Some);
+        }
+        let server_name = self
+            .tool_index
+            .get(qualified_tool_name)
+            .map(|route| route.server_name.clone());
+        if let Some(server_name) = server_name {
+            self.server_mut(&server_name)?.abandon().await;
+        }
+        Ok(None)
+    }
+
     pub async fn list_resources(
         &mut self,
         server_name: &str,
@@ -1360,7 +1410,27 @@ fn stdio_server_command(transport: &McpStdioTransport) -> Command {
         command.env_remove(key);
     }
     apply_env(&mut command, &transport.env);
+    // Not in the user's console: `cmd.exe /c npx …` and npm retitle the console they
+    // run in, which is the terminal of the UI or the REPL.
+    #[cfg(windows)]
+    command.creation_flags(plugins::subprocess::CREATE_NO_WINDOW);
     command
+}
+
+/// Ends a server and, on Windows, the processes it started. A server launched as
+/// `cmd.exe /c npx …` runs in node grandchildren in their own console, which killing
+/// `cmd.exe` would leave running.
+///
+/// Never waits long: `taskkill` gets [`plugins::subprocess::TREE_KILL_WAIT`] (it hangs
+/// while the WMI service is stuck), and so does the server's own exit.
+async fn kill_server_tree(child: &mut Child) -> io::Result<()> {
+    #[cfg(windows)]
+    if let (Some(pid), Ok(None)) = (child.id(), child.try_wait()) {
+        let _ = tokio::task::spawn_blocking(move || plugins::subprocess::kill_tree_of(pid)).await;
+    }
+    child.start_kill()?;
+    let _ = timeout(plugins::subprocess::TREE_KILL_WAIT, child.wait()).await;
+    Ok(())
 }
 
 impl McpStdioProcess {
@@ -1583,7 +1653,7 @@ impl McpStdioProcess {
     }
 
     pub async fn terminate(&mut self) -> io::Result<()> {
-        self.child.kill().await
+        kill_server_tree(&mut self.child).await
     }
 
     pub async fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
@@ -1596,13 +1666,16 @@ impl McpStdioProcess {
 
     async fn shutdown(&mut self) -> io::Result<()> {
         if self.child.try_wait()?.is_none() {
-            match self.child.kill().await {
+            match kill_server_tree(&mut self.child).await {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::InvalidInput => {}
                 Err(error) => return Err(error),
             }
         }
-        let _ = self.child.wait().await?;
+        // Bounded: a process that cannot be reaped must not hold up a shutdown.
+        if let Ok(exited) = timeout(plugins::subprocess::TREE_KILL_WAIT, self.child.wait()).await {
+            exited?;
+        }
         Ok(())
     }
 }
@@ -2150,6 +2223,49 @@ mod tests {
             assert!(status.success());
 
             cleanup_script(&script_path);
+        });
+    }
+
+    /// Servers start outside the user's console (`CREATE_NO_WINDOW`), with working pipes,
+    /// and `terminate` ends what they started.
+    #[test]
+    #[cfg(windows)]
+    fn windows_server_without_console_window_round_trips_io_and_is_terminated() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let echo = crate::mcp_client::McpStdioTransport {
+                command: "cmd.exe".to_string(),
+                args: vec![
+                    "/v:on".to_string(),
+                    "/d".to_string(),
+                    "/c".to_string(),
+                    "set /p LINE=& echo ECHO:!LINE!".to_string(),
+                ],
+                env: BTreeMap::new(),
+                tool_call_timeout_ms: None,
+            };
+            let mut process = McpStdioProcess::spawn(&echo).expect("spawn cmd.exe");
+            process.write_line("ping").await.expect("write line");
+            let echoed = process.read_line().await.expect("read echo");
+            assert_eq!(echoed.trim_end(), "ECHO:ping");
+            assert!(process.wait().await.expect("wait for exit").success());
+
+            let long_running = crate::mcp_client::McpStdioTransport {
+                command: "cmd.exe".to_string(),
+                args: vec![
+                    "/d".to_string(),
+                    "/c".to_string(),
+                    "ping -n 30 127.0.0.1 >NUL".to_string(),
+                ],
+                env: BTreeMap::new(),
+                tool_call_timeout_ms: None,
+            };
+            let mut process = McpStdioProcess::spawn(&long_running).expect("spawn cmd.exe");
+            process.terminate().await.expect("terminate");
+            assert!(process.has_exited().expect("status"));
         });
     }
 

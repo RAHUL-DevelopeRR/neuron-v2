@@ -97,6 +97,9 @@ enum Scenario {
     BashStdoutRoundtrip,
     BashPermissionPromptApproved,
     BashPermissionPromptDenied,
+    /// Calls `bash` with a new command after every result, denied or not: a model that
+    /// keeps trying tools a non-interactive run cannot approve.
+    BashDenialLoop,
     PluginToolRoundtrip,
     AutoCompactTriggered,
     TokenCostReporting,
@@ -114,6 +117,7 @@ impl Scenario {
             "bash_stdout_roundtrip" => Some(Self::BashStdoutRoundtrip),
             "bash_permission_prompt_approved" => Some(Self::BashPermissionPromptApproved),
             "bash_permission_prompt_denied" => Some(Self::BashPermissionPromptDenied),
+            "bash_denial_loop" => Some(Self::BashDenialLoop),
             "plugin_tool_roundtrip" => Some(Self::PluginToolRoundtrip),
             "auto_compact_triggered" => Some(Self::AutoCompactTriggered),
             "token_cost_reporting" => Some(Self::TokenCostReporting),
@@ -132,6 +136,7 @@ impl Scenario {
             Self::BashStdoutRoundtrip => "bash_stdout_roundtrip",
             Self::BashPermissionPromptApproved => "bash_permission_prompt_approved",
             Self::BashPermissionPromptDenied => "bash_permission_prompt_denied",
+            Self::BashDenialLoop => "bash_denial_loop",
             Self::PluginToolRoundtrip => "plugin_tool_roundtrip",
             Self::AutoCompactTriggered => "auto_compact_triggered",
             Self::TokenCostReporting => "token_cost_reporting",
@@ -241,15 +246,36 @@ fn find_header_end(bytes: &[u8]) -> Option<usize> {
     bytes.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
+/// The latest scenario named in the request: earlier prompts (including ones the
+/// model never answered) stay in the request, so the last name wins.
 fn detect_scenario(request: &MessageRequest) -> Option<Scenario> {
     request.messages.iter().rev().find_map(|message| {
         message.content.iter().rev().find_map(|block| match block {
             InputContentBlock::Text { text } => text
                 .split_whitespace()
+                .rev()
                 .find_map(|token| token.strip_prefix(SCENARIO_PREFIX))
                 .and_then(Scenario::parse),
             _ => None,
         })
+    })
+}
+
+/// How many tool results the request carries.
+fn tool_results_count(request: &MessageRequest) -> usize {
+    request
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter(|block| matches!(block, InputContentBlock::ToolResult { .. }))
+        .count()
+}
+
+/// A different command each time, writing a file: never read-only, never the same.
+fn bash_loop_input(attempt: usize) -> Value {
+    json!({
+        "command": format!("printf 'try {attempt}' | tee loop-{attempt}.txt"),
+        "timeout": 1000,
     })
 }
 
@@ -451,6 +477,14 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
                 &[r#"{"command":"printf 'should not run' | tee denied.txt","timeout":1000}"#],
             ),
         },
+        Scenario::BashDenialLoop => {
+            let attempt = tool_results_count(request);
+            tool_use_sse(
+                &format!("toolu_bash_loop_{attempt}"),
+                "bash",
+                &[&bash_loop_input(attempt).to_string()],
+            )
+        }
         Scenario::PluginToolRoundtrip => match latest_tool_result(request) {
             Some((tool_output, _)) => final_text_sse(&format!(
                 "plugin tool completed: {}",
@@ -611,6 +645,15 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
                 json!({"command": "printf 'should not run' | tee denied.txt", "timeout": 1000}),
             ),
         },
+        Scenario::BashDenialLoop => {
+            let attempt = tool_results_count(request);
+            tool_message_response(
+                &format!("msg_bash_loop_{attempt}"),
+                &format!("toolu_bash_loop_{attempt}"),
+                "bash",
+                bash_loop_input(attempt),
+            )
+        }
         Scenario::PluginToolRoundtrip => match latest_tool_result(request) {
             Some((tool_output, _)) => text_message_response(
                 "msg_plugin_tool_final",
@@ -652,6 +695,7 @@ fn request_id_for(scenario: Scenario) -> &'static str {
         Scenario::BashStdoutRoundtrip => "req_bash_stdout_roundtrip",
         Scenario::BashPermissionPromptApproved => "req_bash_permission_prompt_approved",
         Scenario::BashPermissionPromptDenied => "req_bash_permission_prompt_denied",
+        Scenario::BashDenialLoop => "req_bash_denial_loop",
         Scenario::PluginToolRoundtrip => "req_plugin_tool_roundtrip",
         Scenario::AutoCompactTriggered => "req_auto_compact_triggered",
         Scenario::TokenCostReporting => "req_token_cost_reporting",

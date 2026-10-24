@@ -1,5 +1,7 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
-// inline-ad marker on new responses is gone. See ui/neuron-tui/PORTING.md.
+// inline-ad marker on new responses is gone, and a restored turn that never
+// completed marks its running tool calls interrupted. See
+// ui/neuron-tui/PORTING.md.
 /**
  * Message-level helpers for send-message logic.
  * These functions operate on ChatMessage objects, not raw blocks.
@@ -14,6 +16,7 @@ import { formatTimestamp } from './helpers'
 import {
   appendInterruptionNotice,
   autoCollapseBlocks,
+  markRunningToolsInterrupted,
   stripHiddenAgentBlocks,
 } from './message-block-helpers'
 
@@ -95,7 +98,9 @@ export const sanitizeRestoredMessages = (
         ...restoredMessage,
         isComplete: true,
         blocks: appendInterruptionNotice(
-          markRunningAgentsAsCancelled(restoredMessage.blocks ?? []),
+          markRunningToolsInterrupted(
+            markRunningAgentsAsCancelled(restoredMessage.blocks ?? []),
+          ),
         ),
       }
     } catch {

@@ -4,7 +4,7 @@
 // subscription banners, feedback, publishing, the profile survey and every
 // analytics event are gone. The engine's permission requests, sign-in and model
 // picker open panels above the input, and its status shows in a footer line
-// below it. See ui/neuron-tui/PORTING.md.
+// below it. A submit sends the store's latest text. See ui/neuron-tui/PORTING.md.
 import { HelpBanner } from './components/help-banner'
 import {
   useCallback,
@@ -61,6 +61,7 @@ import { useMessageBlockStore } from './state/message-block-store'
 import { stopActiveRun } from './utils/active-run'
 import { showClipboardMessage } from './utils/clipboard'
 import { readClipboardImage } from './utils/clipboard-image'
+import { GLYPHS } from './utils/glyphs'
 import { getSystemMessage } from './utils/message-history'
 import { getInputModeConfig } from './utils/input-modes'
 import {
@@ -780,13 +781,17 @@ export const Chat = ({
   }, [askUserState, inputRef])
 
   const handleSubmit = useCallback(async () => {
-    // Update terminal title with truncated user input
-    if (inputValue.trim()) {
-      setTerminalTitle(inputValue)
+    // The store's text, not this render's: an Enter typed right after the last
+    // character can come before React renders it, and sent the prompt without it.
+    const text = useChatStore.getState().inputValue
+    // Update terminal title with truncated user input. A slash command
+    // (`/login`) does not say what the chat is about.
+    if (text.trim() && !text.trim().startsWith('/')) {
+      setTerminalTitle(text)
     }
-    const result = await onSubmitPrompt(inputValue, agentMode)
+    const result = await onSubmitPrompt(text, agentMode)
     handleCommandResult(result)
-  }, [onSubmitPrompt, inputValue, agentMode, handleCommandResult])
+  }, [onSubmitPrompt, agentMode, handleCommandResult])
 
   const totalMentionMatches = agentMatches.length + fileMatches.length
   const historyNavUpEnabled =
@@ -1408,7 +1413,7 @@ export const Chat = ({
                   })
                   // Show temporary status message
                   showClipboardMessage(
-                    `📋 Pasted text (${pastedText.length.toLocaleString()} chars)`,
+                    `${GLYPHS.pastedText} Pasted text (${pastedText.length.toLocaleString()} chars)`,
                     { durationMs: 5000 },
                   )
                 },

@@ -1,9 +1,12 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the title's
+// marker comes from utils/glyphs.ts. See ui/neuron-tui/PORTING.md.
 import { useKeyboard } from '@opentui/react'
 import { useCallback, useMemo, useRef } from 'react'
 
 import { ClickableTitleBox } from './clickable-title-box'
 import { WriteTodosItem } from './tools/write-todos'
 import { useTheme } from '../hooks/use-theme'
+import { GLYPHS } from '../utils/glyphs'
 import { getLatestTodos } from '../utils/todos'
 import { BORDER_CHARS } from '../utils/ui-constants'
 
@@ -68,7 +71,7 @@ export function TodoPanel({
 
   return (
     <ClickableTitleBox
-      title={` ▾ Todos — ${completed}/${todos.length} completed `}
+      title={` ${GLYPHS.expanded} Todos — ${completed}/${todos.length} completed `}
       titleAlignment="center"
       onTitleClick={onClose}
       style={{

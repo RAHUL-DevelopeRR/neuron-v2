@@ -1,10 +1,13 @@
-// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
-// See ui/neuron-tui/PORTING.md.
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
+// handler is tested as BASH_COMMAND, which is not registered while shell
+// commands are not implemented (USER_SHELL_AVAILABLE). See
+// ui/neuron-tui/PORTING.md.
 import { describe, test, expect, mock, beforeEach } from 'bun:test'
 
 import { useChatStore } from '../../state/chat-store'
 import { INPUT_MODE_CONFIGS, getInputModeConfig } from '../../utils/input-modes'
-import { findCommand } from '../command-registry'
+import { USER_SHELL_AVAILABLE } from '../../utils/user-shell'
+import { BASH_COMMAND, findCommand } from '../command-registry'
 
 import type { RouterParams } from '../command-registry'
 
@@ -44,14 +47,16 @@ describe('bash command', () => {
       ...overrides,
     })
 
-    test('/bash command exists in registry', () => {
-      const bashCommand = findCommand('bash')
-      expect(bashCommand).toBeDefined()
-      expect(bashCommand?.name).toBe('bash')
+    test('/bash is registered only when shell commands work', () => {
+      // Until then nothing offers it: "/bash" goes to the engine.
+      expect(USER_SHELL_AVAILABLE).toBe(false)
+      expect(findCommand('bash')).toBeUndefined()
+      expect(findCommand('!')).toBeUndefined()
+      expect(BASH_COMMAND.name).toBe('bash')
     })
 
     test('/bash with no args enters bash mode', () => {
-      const bashCommand = findCommand('bash')
+      const bashCommand = BASH_COMMAND
       const params = createMockParams()
 
       // Execute with empty args
@@ -62,7 +67,7 @@ describe('bash command', () => {
     })
 
     test('/bash with args does NOT enter bash mode', () => {
-      const bashCommand = findCommand('bash')
+      const bashCommand = BASH_COMMAND
       const params = createMockParams()
 
       // Execute with args - this will call runBashCommand which tries to run a real command
@@ -75,7 +80,7 @@ describe('bash command', () => {
 
     test('/bash with args saves command WITH ! prefix to history', () => {
       const saveToHistory = mock(() => {})
-      const bashCommand = findCommand('bash')
+      const bashCommand = BASH_COMMAND
       const params = createMockParams({ saveToHistory })
 
       bashCommand?.handler(params, 'ls -la')
@@ -86,7 +91,7 @@ describe('bash command', () => {
 
     test('/bash with no args saves original input to history', () => {
       const saveToHistory = mock(() => {})
-      const bashCommand = findCommand('bash')
+      const bashCommand = BASH_COMMAND
       const params = createMockParams({
         inputValue: '/bash',
         saveToHistory,
@@ -100,7 +105,7 @@ describe('bash command', () => {
 
     test('/bash with args clears input', () => {
       const setInputValue = mock(() => {})
-      const bashCommand = findCommand('bash')
+      const bashCommand = BASH_COMMAND
       const params = createMockParams({ setInputValue })
 
       bashCommand?.handler(params, 'pwd')
@@ -113,7 +118,7 @@ describe('bash command', () => {
     })
 
     test('/bash with whitespace-only args enters bash mode', () => {
-      const bashCommand = findCommand('bash')
+      const bashCommand = BASH_COMMAND
       const params = createMockParams()
 
       bashCommand?.handler(params, '   ')
@@ -123,9 +128,7 @@ describe('bash command', () => {
     })
 
     test('"!" is an alias for /bash', () => {
-      const bangCommand = findCommand('!')
-      expect(bangCommand).toBeDefined()
-      expect(bangCommand?.name).toBe('bash')
+      expect(BASH_COMMAND.aliases).toContain('!')
     })
   })
 
@@ -309,7 +312,7 @@ describe('bash command', () => {
 
     test('/bash with pipe characters preserves them', () => {
       const saveToHistory = mock(() => {})
-      const bashCommand = findCommand('bash')
+      const bashCommand = BASH_COMMAND
       const params = createMockParams({ saveToHistory })
 
       bashCommand?.handler(params, 'ls | grep foo')
@@ -319,7 +322,7 @@ describe('bash command', () => {
 
     test('/bash with quoted arguments preserves them', () => {
       const saveToHistory = mock(() => {})
-      const bashCommand = findCommand('bash')
+      const bashCommand = BASH_COMMAND
       const params = createMockParams({ saveToHistory })
 
       bashCommand?.handler(params, 'echo "hello world"')
@@ -329,7 +332,7 @@ describe('bash command', () => {
 
     test('/bash with redirection operators preserves them', () => {
       const saveToHistory = mock(() => {})
-      const bashCommand = findCommand('bash')
+      const bashCommand = BASH_COMMAND
       const params = createMockParams({ saveToHistory })
 
       bashCommand?.handler(params, 'echo test > debug/output.txt')
@@ -341,7 +344,7 @@ describe('bash command', () => {
 
     test('/bash with environment variables preserves them', () => {
       const saveToHistory = mock(() => {})
-      const bashCommand = findCommand('bash')
+      const bashCommand = BASH_COMMAND
       const params = createMockParams({ saveToHistory })
 
       bashCommand?.handler(params, 'echo $HOME')
@@ -351,7 +354,7 @@ describe('bash command', () => {
 
     test('/bash with semicolon command chaining preserves it', () => {
       const saveToHistory = mock(() => {})
-      const bashCommand = findCommand('bash')
+      const bashCommand = BASH_COMMAND
       const params = createMockParams({ saveToHistory })
 
       bashCommand?.handler(params, 'cd /tmp; ls')
@@ -361,7 +364,7 @@ describe('bash command', () => {
 
     test('/bash with && command chaining preserves it', () => {
       const saveToHistory = mock(() => {})
-      const bashCommand = findCommand('bash')
+      const bashCommand = BASH_COMMAND
       const params = createMockParams({ saveToHistory })
 
       bashCommand?.handler(params, 'mkdir test && cd test')

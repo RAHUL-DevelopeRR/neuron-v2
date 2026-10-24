@@ -1,3 +1,6 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the folder
+// icons come from utils/glyphs.ts, and the logo is in NeuronCLI's brand
+// colours. See ui/neuron-tui/PORTING.md.
 import os from 'os'
 
 import React, { useCallback, useMemo, useState } from 'react'
@@ -14,10 +17,10 @@ import { useSheenAnimation } from '../hooks/use-sheen-animation'
 import { useTerminalLayout } from '../hooks/use-terminal-layout'
 import { useTheme } from '../hooks/use-theme'
 import { exitCliCleanly } from '../utils/exit-cleanly'
+import { GLYPHS } from '../utils/glyphs'
 import { formatCwd } from '../utils/path-helpers'
 import { loadRecentProjects } from '../utils/recent-projects'
 import { isPlainEnterKey } from '../utils/terminal-enter-detection'
-import { getLogoBlockColor, getLogoAccentColor } from '../utils/theme-system'
 
 import type { SelectableListItem } from './selectable-list'
 
@@ -80,7 +83,7 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
       directories.map((entry) => ({
         id: entry.path,
         label: entry.name,
-        icon: entry.isParent ? '📂' : '📁',
+        icon: entry.isParent ? GLYPHS.folderOpen : GLYPHS.folder,
         accent: entry.isGitRepo,
       })),
     [directories],
@@ -184,12 +187,8 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
   const shouldCenterContent = !isCompactMode && spaceAfterFilePicker > 10
 
   // Logo setup
-  const blockColor = getLogoBlockColor(theme.name)
-  const accentColor = getLogoAccentColor(theme.name)
   const { applySheenToChar } = useSheenAnimation({
-    logoColor: theme.foreground,
-    accentColor,
-    blockColor,
+    themeName: theme.name,
     terminalWidth,
     sheenPosition,
     setSheenPosition,
@@ -199,6 +198,7 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
     availableWidth: contentMaxWidth,
     applySheenToChar,
     textColor: theme.foreground,
+    themeName: theme.name,
   })
 
   // Handle directory selection from SelectableList

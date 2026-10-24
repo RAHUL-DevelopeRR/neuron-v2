@@ -1,14 +1,16 @@
-// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
-// See ui/neuron-tui/PORTING.md.
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: it says
+// what an untrusted folder means and how to trust it, and the logo is in
+// NeuronCLI's brand colours. See ui/neuron-tui/PORTING.md.
 import { memo, useState } from 'react'
 
+import { UNTRUSTED_FOLDER_NOTE } from '../engine/status-report'
 import { useLogo } from '../hooks/use-logo'
 import { useSheenAnimation } from '../hooks/use-sheen-animation'
 import { useTerminalDimensions } from '../hooks/use-terminal-dimensions'
 import { useTheme } from '../hooks/use-theme'
+import { useEngineStore } from '../state/engine-store'
 import { openFileAtPath } from '../utils/open-file'
 import { formatCwd } from '../utils/path-helpers'
-import { getLogoAccentColor, getLogoBlockColor } from '../utils/theme-system'
 import { TerminalLink } from './terminal-link'
 
 export const ChatHeader = memo(function ChatHeader({
@@ -20,22 +22,22 @@ export const ChatHeader = memo(function ChatHeader({
 }) {
   const { contentMaxWidth, terminalWidth } = useTerminalDimensions()
   const theme = useTheme()
+  // The footer's "untrusted folder", explained (the engine has no command
+  // to trust it).
+  const untrusted = useEngineStore(
+    (state) => state.status !== null && !state.status.workspace_trusted,
+  )
   const [sheenPosition, setSheenPosition] = useState(0)
-  const blockColor = getLogoBlockColor(theme.name)
-  const accentColor = getLogoAccentColor(theme.name)
   const { applySheenToChar } = useSheenAnimation({
     enabled: animationEnabled,
-    logoColor: theme.foreground,
-    accentColor,
-    blockColor,
+    themeName: theme.name,
     terminalWidth,
     sheenPosition,
     setSheenPosition,
   })
   const { component: logoComponent } = useLogo({
     availableWidth: contentMaxWidth,
-    accentColor,
-    blockColor,
+    themeName: theme.name,
     applySheenToChar,
   })
 
@@ -70,6 +72,11 @@ export const ChatHeader = memo(function ChatHeader({
           onActivate={() => openFileAtPath(projectRoot)}
         />
       </text>
+      {untrusted && (
+        <text style={{ wrapMode: 'word', marginBottom: 1, fg: theme.warning }}>
+          {UNTRUSTED_FOLDER_NOTE}
+        </text>
+      )}
     </box>
   )
 })

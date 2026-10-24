@@ -1,14 +1,20 @@
-// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
-// See ui/neuron-tui/PORTING.md.
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
+// terminal reset no longer blanks the window title. The exit path gives the
+// console its own title (and font) back right before the exit message
+// (exit-cleanly.ts); the process 'exit' handler and the fatal-error path do it
+// too, for exits that skip it. See ui/neuron-tui/PORTING.md.
 import { execFile } from 'child_process'
 
-import { resetTerminalTitle } from './terminal-title'
+import { restoreConsoleAtExit } from './console-guard'
 import { stopActiveRun } from './active-run'
 import { getCliEnv } from './env'
 import { exitCliCleanly, registerExitCleanup } from './exit-cleanly'
 import { flushLiveChatState } from './run-state-storage'
 import { reportFatalErrorSync, writeTerminalControlSync } from './terminal-io'
-import { TERMINAL_RESET_SEQUENCES } from './terminal-reset-sequences'
+import {
+  MAIN_SCREEN_RESET_SEQUENCES,
+  TERMINAL_RESET_SEQUENCES,
+} from './terminal-reset-sequences'
 import { stopTerminalWatchdog } from './terminal-watchdog'
 
 import type { CliRenderer } from '@opentui/core'
@@ -36,6 +42,8 @@ export const CLI_RENDERER_EXIT_SIGNALS: NodeJS.Signals[] = [
 let renderer: CliRenderer | null = null
 let handlersInstalled = false
 let cleanupStarted = false
+/** A reset already left the alternate screen (see MAIN_SCREEN_RESET_SEQUENCES). */
+let leftAlternateScreen = false
 
 function isProcessRunning(pid: number, onResult: (running: boolean) => void) {
   if (process.platform === 'win32') {
@@ -102,18 +110,20 @@ function resetTerminalStateOnce(): boolean {
     // Ignore errors - stdin may already be closed
   }
   try {
-    // Reset terminal title to default
-    resetTerminalTitle()
     if (!process.stdout.isTTY) return true
 
-    const resetCompletedSynchronously = writeTerminalControlSync(
-      TERMINAL_RESET_SEQUENCES,
-    )
+    // Only the first reset leaves the alternate screen: a later one (the
+    // process 'exit' handler's) would move the cursor back above the hint.
+    const sequences = leftAlternateScreen
+      ? MAIN_SCREEN_RESET_SEQUENCES
+      : TERMINAL_RESET_SEQUENCES
+    const resetCompletedSynchronously = writeTerminalControlSync(sequences)
     if (!resetCompletedSynchronously) {
       // Best-effort immediate reset. Keep the watchdog armed below so it can
       // retry after this process exits if the buffered write is lost.
-      process.stdout.write(TERMINAL_RESET_SEQUENCES)
+      process.stdout.write(sequences)
     }
+    leftAlternateScreen = true
     return resetCompletedSynchronously
   } catch {
     // Ignore errors - stdout may already be closed
@@ -189,6 +199,11 @@ export function exitCliWithFatalError(label: string, error: unknown): never {
   const resetCompletedSynchronously = cleanup() || resetTerminalState()
   if (resetCompletedSynchronously) {
     stopTerminalWatchdog()
+  }
+  try {
+    restoreConsoleAtExit()
+  } catch {
+    // The title is a nicety; the error report is not.
   }
   reportFatalErrorSync(label, error)
   process.exit(1)
@@ -278,6 +293,12 @@ export function installProcessCleanupHandlers(cliRenderer: CliRenderer): void {
     // to repair the terminal after this process disappears.
     if (cleanup()) {
       stopTerminalWatchdog()
+    }
+    // Done already when the exit went through exitCliCleanly.
+    try {
+      restoreConsoleAtExit()
+    } catch {
+      // Best-effort at the very end.
     }
   })
 

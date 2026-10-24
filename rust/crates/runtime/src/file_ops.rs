@@ -679,10 +679,7 @@ fn bound_hunks(
 /// pattern's literal prefix points inside them.
 pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOutput> {
     let started = Instant::now();
-    let base_dir = path
-        .map(normalize_path)
-        .transpose()?
-        .unwrap_or(std::env::current_dir()?);
+    let base_dir = search_base(path)?;
     let search_pattern = if Path::new(pattern).is_absolute() {
         PathBuf::from(pattern)
     } else {
@@ -747,12 +744,7 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
 /// Like [`glob_search`], the walk skips [`DEFAULT_SKIPPED_DIRS`] and
 /// `.gitignore`d paths below the search root.
 pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
-    let base_path = input
-        .path
-        .as_deref()
-        .map(normalize_path)
-        .transpose()?
-        .unwrap_or(std::env::current_dir()?);
+    let base_path = search_base(input.path.as_deref())?;
 
     let regex = RegexBuilder::new(&input.pattern)
         .case_insensitive(input.case_insensitive.unwrap_or(false))
@@ -945,6 +937,23 @@ fn strip_verbatim_prefix(text: &str) -> String {
     }
 }
 
+/// Whether a search's `path` names no directory: missing, empty, `.`, or an empty
+/// quoted string (`""`, `''`), which models send for "no path". All of them mean the
+/// directory the search runs in.
+#[must_use]
+pub fn is_blank_search_path(path: &str) -> bool {
+    matches!(path.trim(), "" | "." | "\"\"" | "''")
+}
+
+/// The directory a `glob_search` or `grep_search` runs in: `path`, or the current
+/// directory when it is blank ([`is_blank_search_path`]).
+fn search_base(path: Option<&str>) -> io::Result<PathBuf> {
+    match path.filter(|path| !is_blank_search_path(path)) {
+        Some(path) => normalize_path(path),
+        None => std::env::current_dir(),
+    }
+}
+
 fn normalize_path(path: &str) -> io::Result<PathBuf> {
     let candidate = if Path::new(path).is_absolute() {
         PathBuf::from(path)
@@ -1085,6 +1094,19 @@ mod tests {
             .expect("time should move forward")
             .as_nanos();
         std::env::temp_dir().join(format!("clawd-native-{name}-{unique}"))
+    }
+
+    /// Models send `""` for "no path"; it is the directory the search runs in, not a
+    /// directory named `""` (Windows: "The filename, directory name, or volume label
+    /// syntax is incorrect").
+    #[test]
+    fn a_blank_search_path_is_the_current_directory() {
+        for blank in ["", "  ", ".", "\"\"", "''"] {
+            assert!(super::is_blank_search_path(blank), "{blank:?}");
+            assert!(super::search_base(Some(blank)).is_ok(), "{blank:?}");
+        }
+        assert!(!super::is_blank_search_path("src"));
+        assert!(!super::is_blank_search_path("\"src\""));
     }
 
     #[test]

@@ -2,7 +2,8 @@
 // Freebuff session countdown and fill, BYOK label, context usage from the SDK
 // run state, "End session" button and capacity-wait line are gone. The engine
 // footer (git, tokens, context %) is P3. The not-connected line now names the
-// engine's state. See ui/neuron-tui/PORTING.md.
+// engine's state, without repeating a reason the chat already shows.
+// See ui/neuron-tui/PORTING.md.
 import { TextAttributes } from '@opentui/core'
 import React, { useEffect, useState } from 'react'
 
@@ -66,6 +67,8 @@ export const StatusBar = ({
   const theme = useTheme()
   const engineConnection = useEngineStore((state) => state.connection)
   const engineError = useEngineStore((state) => state.error)
+  // Why it stopped is already a chat line (or on the turn): said once.
+  const engineErrorInChat = useEngineStore((state) => state.errorInChat)
   const [elapsedSeconds, setElapsedSeconds] = useState(0)
 
   // Show timer when actively working (streaming or waiting for response) or paused (ask_user)
@@ -128,7 +131,8 @@ export const StatusBar = ({
           />
         ) : (
           <span fg={theme.warning}>
-            {engineError ?? 'The Neuron engine is not running.'}
+            {(!engineErrorInChat && engineError) ||
+              'The Neuron engine is not running.'}
           </span>
         )
 

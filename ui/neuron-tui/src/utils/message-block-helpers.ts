@@ -1,5 +1,7 @@
-// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
-// See ui/neuron-tui/PORTING.md.
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: tool
+// blocks keep the engine's error flag and how a command ended, and the calls
+// still running when a turn is interrupted are marked so
+// (markRunningToolsInterrupted). See ui/neuron-tui/PORTING.md.
 import { sanitizeTerminalOutput } from '@neuron-tui/common/util/terminal-safe-text'
 import { isEqual } from 'lodash'
 
@@ -278,6 +280,36 @@ export const extractSpawnAgentResultContent = (
     content: formatToolOutput([{ type: 'json', value: resultValue }]),
     hasError: false,
   }
+}
+
+/** Why a command stopped when the user interrupted the turn (see engine/tool-mapping.ts). */
+export const INTERRUPTED_STOP_REASON = 'interrupted'
+
+/**
+ * Marks the tool calls still running (no result yet) as interrupted, in
+ * nested agents too: the turn was stopped while they ran, so their rows say
+ * so instead of looking like they are still going or finished quietly. A
+ * result the engine sends afterwards still fills the row in.
+ */
+export const markRunningToolsInterrupted = (
+  blocks: ContentBlock[],
+): ContentBlock[] => {
+  let changed = false
+  const next = blocks.map((block) => {
+    if (block.type === 'tool' && block.output === undefined && !block.stopReason) {
+      changed = true
+      return { ...block, stopReason: INTERRUPTED_STOP_REASON }
+    }
+    if (block.type === 'agent' && block.blocks) {
+      const nested = markRunningToolsInterrupted(block.blocks)
+      if (nested !== block.blocks) {
+        changed = true
+        return { ...block, blocks: nested }
+      }
+    }
+    return block
+  })
+  return changed ? next : blocks
 }
 
 /**

@@ -7,6 +7,13 @@
  * fails with a message the bash bubble shows.
  */
 
+/**
+ * Whether `!cmd` and `/bash` run anything. Until they do, nothing offers them:
+ * /bash is not registered or listed, `!` starts no bash mode (a `!` prompt goes
+ * to the agent), and /help does not mention them.
+ */
+export const USER_SHELL_AVAILABLE = false
+
 export interface UserShellResult {
   stdout: string
   stderr: string

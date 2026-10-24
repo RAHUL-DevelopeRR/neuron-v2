@@ -9,7 +9,9 @@ import {
 
 import { defineToolComponent } from './types'
 import { useTheme } from '../../hooks/use-theme'
+import { GLYPHS } from '../../utils/glyphs'
 import { safeOpen } from '../../utils/open-url'
+import { BORDER_CHARS } from '../../utils/ui-constants'
 import { Button } from '../button'
 
 import type { ToolRenderConfig } from './types'
@@ -88,7 +90,8 @@ const RenderUIButton = ({ widget }: { widget: RenderUIButtonWidget }) => {
         onMouseOut={() => setIsHovered(false)}
         style={{
           backgroundColor,
-          borderStyle: 'rounded',
+          borderStyle: 'single',
+          customBorderChars: BORDER_CHARS,
           borderColor,
           paddingLeft: 1,
           paddingRight: 1,
@@ -99,7 +102,9 @@ const RenderUIButton = ({ widget }: { widget: RenderUIButtonWidget }) => {
             {widget.text}
           </span>
           {/* Trailing arrow signals the button opens an external link. */}
-          <span fg={foregroundColor} attributes={textAttributes}>{' ↗'}</span>
+          <span fg={foregroundColor} attributes={textAttributes}>
+            {` ${GLYPHS.external}`}
+          </span>
         </text>
       </Button>
     </box>

@@ -634,6 +634,8 @@ pub enum EngineCommand {
     /// Ask for the models the user can switch to ([`UiEvent::Models`]).
     ListModels,
     /// Interrupt the running turn (a second one quits after saving, like Ctrl-C twice).
+    /// Sent right after a `Submit` the engine has not started yet, it cancels that
+    /// prompt's turn; with nothing running or waiting, it is dropped.
     Interrupt,
     /// Save and stop.
     Shutdown,

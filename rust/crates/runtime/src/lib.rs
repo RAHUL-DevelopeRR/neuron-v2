@@ -67,7 +67,8 @@ pub mod workspace_trust;
 
 pub use bash::{
     bash_tool_shell_description, effective_bash_timeout_ms, execute_bash, execute_bash_with_cancel,
-    BashCommandInput, BashCommandOutput, DEFAULT_BASH_TIMEOUT_MS, MAX_BASH_TIMEOUT_MS,
+    stop_background_commands, BashCommandInput, BashCommandOutput, DEFAULT_BASH_TIMEOUT_MS,
+    MAX_BASH_TIMEOUT_MS,
 };
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};
@@ -101,10 +102,10 @@ pub use conversation::{
     INTERRUPTED_TOOL_RESULT, MAX_ITERATIONS_ENV_VAR,
 };
 pub use file_ops::{
-    display_path, edit_file, edit_file_in_workspace, glob_search, grep_search, read_file,
-    read_file_in_workspace, write_file, write_file_in_workspace, EditFileOutput, GlobSearchOutput,
-    GrepSearchInput, GrepSearchOutput, ReadFileOutput, StructuredPatchHunk, TextFilePayload,
-    WriteFileOutput,
+    display_path, edit_file, edit_file_in_workspace, glob_search, grep_search,
+    is_blank_search_path, read_file, read_file_in_workspace, write_file, write_file_in_workspace,
+    EditFileOutput, GlobSearchOutput, GrepSearchInput, GrepSearchOutput, ReadFileOutput,
+    StructuredPatchHunk, TextFilePayload, WriteFileOutput,
 };
 pub use git_context::{GitCommitEntry, GitContext};
 pub use hooks::{
