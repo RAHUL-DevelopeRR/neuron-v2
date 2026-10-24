@@ -2097,9 +2097,18 @@ mod tests {
             "id": "tool", "choices": [{"delta": {"tool_calls": [{"index":0,"id":"call_1","function":{"arguments":"{}"}}]}, "finish_reason":"tool_calls"}]
         })).unwrap();
         nameless.ingest_chunk(chunk).unwrap();
-        assert!(nameless.finish().is_err(), "a call without a tool name still fails");
-        assert_eq!(super::parse_tool_arguments("{\"path\": \"a.rs\",}"), serde_json::json!({"path": "a.rs"}));
-        assert_eq!(super::parse_tool_arguments("{\"path\":"), serde_json::json!({"raw": "{\"path\":"}));
+        assert!(
+            nameless.finish().is_err(),
+            "a call without a tool name still fails"
+        );
+        assert_eq!(
+            super::parse_tool_arguments("{\"path\": \"a.rs\",}"),
+            serde_json::json!({"path": "a.rs"})
+        );
+        assert_eq!(
+            super::parse_tool_arguments("{\"path\":"),
+            serde_json::json!({"raw": "{\"path\":"})
+        );
     }
     /// Gemini's OpenAI-compatible stream sends two parallel calls as two
     /// items of one chunk and omits `index`. Before the fix both items

@@ -8,6 +8,8 @@
 //! cut-off write looks like, and running it would write half a file.
 //! [`unknown_tool_message`] names the closest real tools and lists them all.
 
+use std::fmt::Write as _;
+
 use serde_json::Value;
 
 /// Missing `}`/`]` a repair may add; more means the call was cut off.
@@ -169,7 +171,7 @@ fn normalize_object(text: &str) -> Option<(String, Scan)> {
                 }
                 control if u32::from(control) < 0x20 => {
                     scan.escaped_controls = true;
-                    out.push_str(&format!("\\u{:04x}", u32::from(control)));
+                    let _ = write!(out, "\\u{:04x}", u32::from(control));
                 }
                 _ => out.push(ch),
             }
@@ -202,23 +204,20 @@ fn normalize_object(text: &str) -> Option<(String, Scan)> {
     if in_string {
         return None;
     }
-    match closed_at {
-        Some(end) => {
-            if !text[end..].trim().is_empty() {
-                scan.trailing_text = true;
-            }
+    if let Some(end) = closed_at {
+        if !text[end..].trim().is_empty() {
+            scan.trailing_text = true;
         }
-        None => {
-            if stack.len() > MAX_ADDED_CLOSERS {
-                return None;
+    } else {
+        if stack.len() > MAX_ADDED_CLOSERS {
+            return None;
+        }
+        while let Some(open) = stack.pop() {
+            if drop_trailing_comma(&mut out) {
+                scan.trailing_commas = true;
             }
-            while let Some(open) = stack.pop() {
-                if drop_trailing_comma(&mut out) {
-                    scan.trailing_commas = true;
-                }
-                out.push(if open == '{' { '}' } else { ']' });
-                scan.added_closers += 1;
-            }
+            out.push(if open == '{' { '}' } else { ']' });
+            scan.added_closers += 1;
         }
     }
     Some((out, scan))
@@ -335,7 +334,7 @@ pub fn suggest_tool_names(name: &str, candidates: &[&str]) -> Vec<String> {
         .map(|candidate| (edit_distance(&wanted, &squash(candidate)), *candidate))
         .filter(|(distance, _)| *distance <= 2)
         .collect::<Vec<_>>();
-    near.sort();
+    near.sort_unstable();
     for (_, candidate) in near {
         push(candidate);
     }
@@ -359,7 +358,11 @@ pub fn unknown_tool_message(name: &str, candidates: &[&str]) -> String {
                 .join(", ")
         ),
     };
-    let mut listed = candidates.iter().take(MAX_LISTED_TOOLS).copied().collect::<Vec<_>>();
+    let mut listed = candidates
+        .iter()
+        .take(MAX_LISTED_TOOLS)
+        .copied()
+        .collect::<Vec<_>>();
     listed.sort_unstable();
     let more = if candidates.len() > MAX_LISTED_TOOLS {
         ", ..."
@@ -388,18 +391,53 @@ mod tests {
     #[test]
     fn near_json_is_repaired_and_says_how() {
         let cases = [
-            ("```json\n{\"path\": \"a.rs\"}\n```", json!({"path": "a.rs"}), "code fence"),
-            ("\"{\\\"path\\\": \\\"a.rs\\\"}\"", json!({"path": "a.rs"}), "JSON string"),
-            ("Calling the tool: {\"path\": \"a.rs\"}", json!({"path": "a.rs"}), "text before"),
-            ("{\"content\": \"line one\nline two\"}", json!({"content": "line one\nline two"}), "line breaks"),
-            ("{\"paths\": [\"a\", \"b\",], \"x\": 1,}", json!({"paths": ["a", "b"], "x": 1}), "trailing commas"),
-            ("{\"path\": \"a.rs\", \"edits\": [{\"x\": 1}", json!({"path": "a.rs", "edits": [{"x": 1}]}), "closing brackets"),
-            ("{\"path\": \"a.rs\"} and then some prose", json!({"path": "a.rs"}), "text after"),
+            (
+                "```json\n{\"path\": \"a.rs\"}\n```",
+                json!({"path": "a.rs"}),
+                "code fence",
+            ),
+            (
+                "\"{\\\"path\\\": \\\"a.rs\\\"}\"",
+                json!({"path": "a.rs"}),
+                "JSON string",
+            ),
+            (
+                "Calling the tool: {\"path\": \"a.rs\"}",
+                json!({"path": "a.rs"}),
+                "text before",
+            ),
+            (
+                "{\"content\": \"line one\nline two\"}",
+                json!({"content": "line one\nline two"}),
+                "line breaks",
+            ),
+            (
+                "{\"paths\": [\"a\", \"b\",], \"x\": 1,}",
+                json!({"paths": ["a", "b"], "x": 1}),
+                "trailing commas",
+            ),
+            (
+                "{\"path\": \"a.rs\", \"edits\": [{\"x\": 1}",
+                json!({"path": "a.rs", "edits": [{"x": 1}]}),
+                "closing brackets",
+            ),
+            (
+                "{\"path\": \"a.rs\"} and then some prose",
+                json!({"path": "a.rs"}),
+                "text after",
+            ),
         ];
         for (input, expected, fix) in cases {
             let parsed = parse_tool_input(input).unwrap_or_else(|error| panic!("{input}: {error}"));
             assert_eq!(parsed.value, expected, "{input}");
-            assert!(parsed.repaired.as_deref().is_some_and(|text| text.contains(fix)), "{input}: {:?}", parsed.repaired);
+            assert!(
+                parsed
+                    .repaired
+                    .as_deref()
+                    .is_some_and(|text| text.contains(fix)),
+                "{input}: {:?}",
+                parsed.repaired
+            );
         }
     }
 
@@ -409,23 +447,47 @@ mod tests {
         assert!(repair_tool_json("{\"path\": \"a.rs\", \"content\": \"fn main() {").is_none());
         // Too many closers missing.
         assert!(repair_tool_json("{\"a\": {\"b\": {\"c\": [1").is_none());
-        let error = parse_tool_input("{\"path\": \"a.rs\", \"content\": \"half").expect_err("cut off");
-        assert!(error.contains("invalid tool input JSON") && error.contains("\\n"), "{error}");
-        assert!(parse_tool_input("[1, 2]").expect_err("array").contains("got an array"));
+        let error =
+            parse_tool_input("{\"path\": \"a.rs\", \"content\": \"half").expect_err("cut off");
+        assert!(
+            error.contains("invalid tool input JSON") && error.contains("\\n"),
+            "{error}"
+        );
+        assert!(parse_tool_input("[1, 2]")
+            .expect_err("array")
+            .contains("got an array"));
         assert!(parse_tool_input("  ").expect_err("empty").contains("empty"));
     }
 
     #[test]
     fn unknown_tools_get_the_closest_real_names() {
-        let tools = ["bash", "read_file", "write_file", "edit_file", "glob_search", "grep_search", "TodoWrite"];
+        let tools = [
+            "bash",
+            "read_file",
+            "write_file",
+            "edit_file",
+            "glob_search",
+            "grep_search",
+            "TodoWrite",
+        ];
         assert_eq!(suggest_tool_names("Edit", &tools), vec!["edit_file"]);
-        assert_eq!(suggest_tool_names("str_replace_editor", &tools), vec!["edit_file"]);
-        assert_eq!(suggest_tool_names("run_terminal_command", &tools), vec!["bash"]);
+        assert_eq!(
+            suggest_tool_names("str_replace_editor", &tools),
+            vec!["edit_file"]
+        );
+        assert_eq!(
+            suggest_tool_names("run_terminal_command", &tools),
+            vec!["bash"]
+        );
         assert_eq!(suggest_tool_names("read_fiel", &tools), vec!["read_file"]);
         assert_eq!(suggest_tool_names("grep", &tools)[0], "grep_search");
         assert!(suggest_tool_names("teleport", &tools).is_empty());
         let message = unknown_tool_message("Read", &tools);
-        assert!(message.starts_with("unsupported tool: `Read` does not exist. Did you mean `read_file`?"), "{message}");
+        assert!(
+            message
+                .starts_with("unsupported tool: `Read` does not exist. Did you mean `read_file`?"),
+            "{message}"
+        );
         assert!(message.contains("TodoWrite, bash, edit_file"), "{message}");
     }
 }

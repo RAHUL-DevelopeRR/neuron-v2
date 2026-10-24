@@ -179,7 +179,11 @@ pub struct EditFileOutput {
     /// Set when `old_string` matched only after ignoring trailing whitespace
     /// (`trailing_whitespace`) or indentation (`indentation`, the replacement
     /// re-indented to the file's), so the model learns to copy text exactly.
-    #[serde(rename = "matchStrategy", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "matchStrategy",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub match_strategy: Option<String>,
 }
 
@@ -488,7 +492,10 @@ fn needle_lines(needle: &str) -> (Vec<String>, bool) {
     let normalized = needle.replace("\r\n", "\n");
     let ends_with_break = normalized.ends_with('\n');
     let body = normalized.strip_suffix('\n').unwrap_or(&normalized);
-    (body.split('\n').map(ToOwned::to_owned).collect(), ends_with_break)
+    (
+        body.split('\n').map(ToOwned::to_owned).collect(),
+        ends_with_break,
+    )
 }
 
 /// Byte ranges of `needle` in `haystack` compared line by line under `mode`
@@ -602,6 +609,7 @@ fn not_found_error(haystack: &str, needle: &str) -> io::Error {
 /// `old_string` occurs more than once and `replace_all` is false the edit is
 /// refused with the match count and line numbers, instead of silently
 /// changing the first occurrence.
+#[allow(clippy::too_many_lines)]
 pub fn edit_file(
     path: &str,
     old_string: &str,
@@ -633,7 +641,7 @@ pub fn edit_file(
     let line_ending = LineEnding::detect(&original_file);
     let mut loose = None;
     let mut new_string = new_string.to_string();
-    let (needle, mut offsets) = {
+    let (needle, offsets) = {
         let exact = match_offsets(&original_file, old_string);
         let adapted = line_ending.apply(old_string);
         if exact.is_empty() && adapted != old_string {
@@ -650,7 +658,7 @@ pub fn edit_file(
         for mode in [LooseMatch::TrailingWhitespace, LooseMatch::Indentation] {
             let ranges = loose_matches(&original_file, old_string, mode);
             match ranges.len() {
-                0 => continue,
+                0 => {}
                 1 => {
                     found = Some((mode, ranges[0]));
                     break;
@@ -1323,6 +1331,7 @@ fn expand_braces(pattern: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
@@ -1350,7 +1359,10 @@ mod tests {
             false,
         )
         .expect("loose match");
-        assert_eq!(output.match_strategy.as_deref(), Some("trailing_whitespace"));
+        assert_eq!(
+            output.match_strategy.as_deref(),
+            Some("trailing_whitespace")
+        );
         assert_eq!(
             std::fs::read_to_string(&path).expect("read"),
             "fn main() {\n    let a = 2;\n}\n"
@@ -1374,9 +1386,17 @@ mod tests {
             std::fs::read_to_string(&path).expect("read"),
             "class A:\n    def f(self):\n        value = 2\n        return value\n"
         );
-        let exact = edit_file(path.to_string_lossy().as_ref(), "value = 2", "value = 3", false)
-            .expect("exact");
-        assert_eq!(exact.match_strategy, None, "exact matches report nothing extra");
+        let exact = edit_file(
+            path.to_string_lossy().as_ref(),
+            "value = 2",
+            "value = 3",
+            false,
+        )
+        .expect("exact");
+        assert_eq!(
+            exact.match_strategy, None,
+            "exact matches report nothing extra"
+        );
     }
 
     #[test]
@@ -1384,10 +1404,18 @@ mod tests {
         let path = temp_path("edit-ambiguous.txt");
         std::fs::write(&path, "a:\n  x = 1\n  y = 2\nb:\n    x = 1\n    y = 2\n").expect("write");
         // Not verbatim anywhere; ignoring indentation it fits both blocks.
-        let error = edit_file(path.to_string_lossy().as_ref(), "x = 1\n y = 2", "x = 3", false)
-            .expect_err("ambiguous")
-            .to_string();
-        assert!(error.contains("ignoring indentation it matches 2 places (lines 2, 5)"), "{error}");
+        let error = edit_file(
+            path.to_string_lossy().as_ref(),
+            "x = 1\n y = 2",
+            "x = 3",
+            false,
+        )
+        .expect_err("ambiguous")
+        .to_string();
+        assert!(
+            error.contains("ignoring indentation it matches 2 places (lines 2, 5)"),
+            "{error}"
+        );
 
         std::fs::write(&path, "start\n    alpha();\n    beta();\n").expect("write");
         let error = edit_file(
@@ -1404,14 +1432,23 @@ mod tests {
     #[test]
     fn placeholders_that_would_delete_code_are_refused() {
         let path = temp_path("placeholder.ts");
-        let original = (0..40).map(|n| format!("export const v{n} = {n};\n")).collect::<String>();
+        let original = (0..40).fold(String::new(), |mut out, n| {
+            let _ = writeln!(out, "export const v{n} = {n};");
+            out
+        });
         std::fs::write(&path, &original).expect("write");
-        for placeholder in ["// ... existing code ...", "# ... rest of the file unchanged", "/* … remaining exports */",
-            "// rest of the code remains unchanged"]
-        {
-            let error = write_file(path.to_string_lossy().as_ref(), &format!("export const v0 = 1;\n{placeholder}\n"))
-                .expect_err(placeholder)
-                .to_string();
+        for placeholder in [
+            "// ... existing code ...",
+            "# ... rest of the file unchanged",
+            "/* … remaining exports */",
+            "// rest of the code remains unchanged",
+        ] {
+            let error = write_file(
+                path.to_string_lossy().as_ref(),
+                &format!("export const v0 = 1;\n{placeholder}\n"),
+            )
+            .expect_err(placeholder)
+            .to_string();
             assert!(error.contains("placeholder"), "{error}");
             let error = edit_file(
                 path.to_string_lossy().as_ref(),
@@ -1423,12 +1460,23 @@ mod tests {
             .to_string();
             assert!(error.contains("placeholder"), "{error}");
         }
-        assert_eq!(std::fs::read_to_string(&path).expect("read"), original, "nothing was written");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            original,
+            "nothing was written"
+        );
         // Prose that merely mentions code is fine, and so is a new file.
-        write_file(path.to_string_lossy().as_ref(), "// keep the existing exports stable\nexport const v = 1;\n")
-            .expect("ordinary comment");
+        write_file(
+            path.to_string_lossy().as_ref(),
+            "// keep the existing exports stable\nexport const v = 1;\n",
+        )
+        .expect("ordinary comment");
         let fresh = temp_path("fresh.ts");
-        write_file(fresh.to_string_lossy().as_ref(), "// ... existing code ...\n").expect("new file");
+        write_file(
+            fresh.to_string_lossy().as_ref(),
+            "// ... existing code ...\n",
+        )
+        .expect("new file");
     }
 
     #[test]
@@ -1436,15 +1484,25 @@ mod tests {
         let path = temp_path("cutoff.js");
         let original = format!(
             "function a() {{\n{}}}\n",
-            (0..40).map(|n| format!("  call({n});\n")).collect::<String>()
+            (0..40).fold(String::new(), |mut out, n| {
+                let _ = writeln!(out, "  call({n});");
+                out
+            })
         );
         std::fs::write(&path, &original).expect("write");
-        let error = write_file(path.to_string_lossy().as_ref(), "function a() {\n  call(0);\n  call(1);\n")
-            .expect_err("cut off")
-            .to_string();
+        let error = write_file(
+            path.to_string_lossy().as_ref(),
+            "function a() {\n  call(0);\n  call(1);\n",
+        )
+        .expect_err("cut off")
+        .to_string();
         assert!(error.contains("looks cut off"), "{error}");
         // A deliberately shorter but complete file is fine.
-        write_file(path.to_string_lossy().as_ref(), "function a() {\n  call(0);\n}\n").expect("complete");
+        write_file(
+            path.to_string_lossy().as_ref(),
+            "function a() {\n  call(0);\n}\n",
+        )
+        .expect("complete");
     }
 
     /// Models send `""` for "no path"; it is the directory the search runs in, not a
