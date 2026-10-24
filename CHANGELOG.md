@@ -293,7 +293,9 @@ first.
   heads the project instruction files "# Project instructions". Requests no longer
   carry the `claude-code-20250219` beta. In `/help` and `neuron --help`, `/init` says
   that it writes `NEURON.md` (it already did), and `/config`, `/memory` and `/api-key`
-  are described in Neuron's words.
+  are described in Neuron's words, as are the errors for unsupported plugin manifest
+  fields. The `/agents`, `/skills` and `/mcp` help names `neuron agents`,
+  `neuron skills` and `neuron mcp` as the direct commands.
 - Text that had been double-encoded (`â–¶ Thinking`, `Â·` separators, `âœ”`) is shown
   correctly again.
 - `neuron --help` and `neuron doctor` name this repository and the real install
