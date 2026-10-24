@@ -33,6 +33,14 @@ first.
   DEFAULT/LITE/MAX/PLAN mode toggle changes only how a turn is shown, the footer's token
   and git counters update when a turn ends, and a key typed in the first moment after
   the UI appears can be lost.
+- The full-screen UI cannot trust a folder yet. Run `neuron --no-tui` in the folder once
+  and press 1 when it asks, or add the folder (or one above it) to `trustedRoots` in
+  `~/.neuron/settings.json`, then restart Neuron. Until then the folder's own settings,
+  hooks and MCP servers are ignored.
+- Hooks run with Neuron's own environment: they inherit every variable Neuron has,
+  including a session token or key in `NEURON_TOKEN` and provider keys you exported.
+  They also get the event as JSON on standard input and have no timeout, and Ctrl+C
+  stops only the hook's own process. Add only hooks you trust.
 
 ### Full-screen UI
 
@@ -68,14 +76,11 @@ first.
   choice. The window is titled "Neuron" while the UI runs and gets its own title back at
   exit, and a TrueType font that a PowerShell start had switched to the raster font is
   restored.
-- Quitting (`/exit`, Ctrl+C twice) no longer crashes a classic console window and closes
-  the shell with it. A command typed right after quitting reaches the shell whole and
-  runs (in Windows PowerShell 5.1 its Enter used to arrive as text), and `neuron` gives
-  the console its input mode back after the UI exits, even when the UI was killed, so
-  cmd's Up arrow keeps working.
-- When `neuron` starts the UI, `neuron` itself watches the terminal and resets it if the
-  UI dies, instead of starting a PowerShell watchdog that retitled the window and was
-  the main suspect for a keyboard that stopped responding.
+- Quitting (`/exit`, Ctrl+C twice) keeps a classic console window and its shell open.
+  A command typed right after quitting reaches the shell whole and runs, and `neuron`
+  gives the console its input mode back after the UI exits, even when the UI was
+  killed, so cmd's Up arrow keeps working.
+- While the UI runs, `neuron` watches the terminal and resets it if the UI dies.
 - Keys that arrive faster than the screen redraws (a held Backspace, a burst from the
   console, Enter right after the last character) act on the latest text, so quick
   Backspaces delete every character and Enter sends the whole prompt. The chat input
@@ -147,7 +152,6 @@ first.
   and tool calls cut off at the output limit are reported instead of retried.
   `reasoning_content` from OpenAI-compatible streams is shown as thinking, not as
   answer text, and output tokens follow the gateway's billable count.
-- `docs/GATEWAY_CONTRACT.md` mirrors the platform contract v1.2.
 
 ### Smaller requests
 
@@ -157,8 +161,7 @@ first.
   offered through `ToolSearch` instead of with every request. In a one-file repository
   the system prompt shrank from 66,068 to about 6,200 characters and the first request
   (system prompt plus tool schemas) from about 98,000 to about 17,000 characters
-  (roughly 24,500 to 4,500 tokens). Tests keep the default system prompt under 10,000
-  characters.
+  (roughly 24,500 to 4,500 tokens).
 - MCP tool definitions are sent only for the tools the model called or that
   `ToolSearch` found since the last prompt; a request rejected as too large is sent
   once more without them.
@@ -211,8 +214,7 @@ first.
   told nothing ran), and a question from the model is refused so it decides itself.
   A run that denied a call ends with a warning naming the denied tools and exits with
   code 2. After 5 denied calls the turn stops, as with Ctrl+C, and says why on standard
-  error; models kept varying the tool or its arguments, so the repeated-call guard
-  never fired. The REPL has no such limit.
+  error. The REPL has no such limit.
 - Approval, `AskUserQuestion` and workspace trust questions go to standard error when
   standard output is redirected; with standard error redirected too, the call is denied
   (and the question refused) instead of waiting on a prompt nobody can see. In JSON
@@ -236,7 +238,8 @@ first.
 - Workspace trust: a cloned repository's own settings files (`.neuron.json`,
   `.neuron/settings*.json` and the `.claw` equivalents) apply only once you trust the
   directory. Until then only settings that restrict Neuron are kept, and the ignored
-  keys are named. Settings files can no longer select a full-access mode.
+  keys are named. A repository's settings files can no longer select a full-access
+  mode, even in a trusted folder; use `--permission-mode` or your user settings.
   `NEURON_TRUST_WORKSPACE=1` trusts a checkout in a headless run, and `trustedRoots` in
   your user settings trusts the directories under them. Provider keys are read from
   `./.env` only in a trusted workspace.
@@ -254,11 +257,14 @@ first.
   `grep`, `log -p` and the like) need approval when the repository's own config names
   an fsmonitor, filter, textconv or external diff program. PowerShell paths after a
   bare switch, and `..\` paths on every host, are checked against the workspace.
-- Tool subprocesses (bash, PowerShell, hooks, plugin tools, MCP servers) get timeouts
-  (120 seconds by default for commands, at most 600), empty standard input and
-  whole-process-tree termination on timeout or Ctrl+C, and never inherit
-  `NEURON_TOKEN`, `NEURON_SESSION_TOKEN`, provider keys such as `OPENAI_API_KEY`, any
-  variable named `*_API_KEY`, `*_TOKEN` or `*_SECRET`, or any `ses_`/`nzx_` value.
+- Shell commands (bash, PowerShell) and the REPL tool get timeouts (120 seconds by
+  default, at most 600), empty standard input and whole-process-tree termination on
+  timeout or Ctrl+C; plugin tools get a 120-second timeout that ends their process tree.
+  These commands, plugin tools and MCP servers never inherit `NEURON_TOKEN`,
+  `NEURON_SESSION_TOKEN`, provider keys such as `OPENAI_API_KEY`, any variable named
+  `*_API_KEY`, `*_TOKEN` or `*_SECRET`, or any `ses_`/`nzx_` value (a value set in an
+  MCP server's `env` still applies). Hooks are not covered: they run with Neuron's
+  environment (see Known limitations).
 - On Windows the bash tool runs `cmd.exe /D /S /C` with the command passed verbatim,
   and the PowerShell tool runs `pwsh` (or Windows PowerShell) with an encoded command.
   Settings hooks use the same `cmd` form, so quoted paths with spaces work, and MCP
@@ -339,7 +345,7 @@ first.
   access. Download problems print an actionable message instead of a traceback.
   Ctrl+C reaches Neuron instead of killing it, the exit code is passed through, and on
   Linux and macOS the launcher replaces itself with the binary. Prerelease versions
-  download from their own tag (`v6.4.0-rc.1`).
+  download from their own tag (`v7.0.0-alpha.1`).
 - The npm launcher (`@zero-x.live/neuron`) downloads and verifies the binary on first
   run when install scripts were skipped (`--ignore-scripts`), falls back to the user
   cache when the package directory is read-only, forwards SIGTERM and SIGHUP (and
@@ -363,8 +369,6 @@ first.
   for a prerelease too.
 - The assets of a published release are never rebuilt or replaced; a later run on the
   same tag only verifies them and publishes the packages.
-- New Packaging CI runs the launcher, installer and npm tarball tests against a local
-  fake release on Linux, macOS and Windows for every pull request that touches them.
 
 ### Licensing
 

@@ -59,15 +59,19 @@ During the alpha, security fixes ship as the next prerelease (for example
   provider keys such as `OPENAI_API_KEY` are read from the environment; Neuron does not
   save them, and it never exports the stored login or a provider key into its own
   environment: the credential is handed to the HTTP client in memory. Shell commands
-  (bash, PowerShell), hooks, plugin tools and MCP servers that Neuron starts do not
-  inherit `NEURON_TOKEN`, `NEURON_SESSION_TOKEN`, the provider keys Neuron reads (such
-  as `OPENAI_API_KEY`), any variable named `*_API_KEY`, `*_TOKEN` or `*_SECRET`, or any
-  variable whose value starts with `ses_` or `nzx_`, even when you exported them
-  yourself (a value set explicitly in an MCP server's `env` still applies). Commands
-  that print environment variables or read `.env` files and Neuron's settings or
-  credentials need your approval. Everything those processes run can still read your
-  files, including the credentials file above, so approve commands with that in mind
-  (see [Running untrusted code](#running-untrusted-code)).
+  (bash, PowerShell, the REPL tool), plugin tools and MCP servers that Neuron starts do
+  not inherit `NEURON_TOKEN`, `NEURON_SESSION_TOKEN`, the provider keys Neuron reads
+  (such as `OPENAI_API_KEY`), any variable named `*_API_KEY`, `*_TOKEN` or `*_SECRET`,
+  or any variable whose value starts with `ses_` or `nzx_`, even when you exported them
+  yourself (a value set explicitly in an MCP server's `env` still applies). Shell
+  commands also get a timeout, empty standard input and termination of their whole
+  process tree on timeout or Ctrl+C. **Hooks are the exception:** they run with
+  Neuron's own environment, so a `NEURON_TOKEN` or provider key you exported reaches
+  them, and they have no timeout. Add only hooks you trust. Commands that print
+  environment variables or read `.env` files and Neuron's settings or credentials need
+  your approval. Everything those processes run can still read your files, including
+  the credentials file above, so approve commands with that in mind (see
+  [Running untrusted code](#running-untrusted-code)).
 - **Provider keys you bring** are sent only to the endpoint you configured for them.
 
 ## Running untrusted code

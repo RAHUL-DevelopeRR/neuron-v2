@@ -161,7 +161,7 @@ For a stable release, leave out `--tag next`.
 
 The dispatched run does not rebuild or re-upload anything on the published release:
 `package-npm` packs and tests the tarball, then `publish-npm` publishes exactly that
-file. Prereleases (`6.4.0-rc.1`) go to the `next` dist-tag.
+file. Prereleases (`7.0.0-alpha.2`) go to the `next` dist-tag.
 
 ## 6. Publish to PyPI (paused)
 

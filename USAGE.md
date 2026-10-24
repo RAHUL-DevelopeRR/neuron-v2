@@ -68,7 +68,8 @@ printf '%s' "$ZEROX_API_KEY" | neuron auth login --with-token
 You can also set `NEURON_TOKEN` to a key or session for a single process; it takes
 precedence over the stored login and over any provider choice, and is not saved.
 Neuron removes it (and any other `ses_…` or `nzx_…` value) from the environment of the
-commands, hooks and MCP servers it starts. `neuron auth logout` does not clear it, so
+commands, plugin tools and MCP servers it starts; hooks run with Neuron's own
+environment and do see it. `neuron auth logout` does not clear it, so
 unset it yourself. `NEURON_API_BASE` changes the gateway URL (default
 `https://zero-x.live/v1`; plain HTTP is accepted only for a loopback address).
 
@@ -237,8 +238,9 @@ select their provider. Requests then go straight to that provider under your acc
 and its terms; Zero-X limits and credits do not apply. The key stays in memory and is
 not exported to the commands Neuron runs, and Neuron removes provider keys and any
 variable named `*_API_KEY`, `*_TOKEN` or `*_SECRET` from the environment of the
-commands, hooks and MCP servers it starts, including keys you exported yourself (a
-value set in an MCP server's `env` still applies).
+commands, plugin tools and MCP servers it starts, including keys you exported yourself
+(a value set in an MCP server's `env` still applies). Hooks are the exception: they run
+with Neuron's own environment, including any keys you exported.
 
 ## Configuration files
 
@@ -310,10 +312,10 @@ or put it in your user settings.
 
 | Installed with | Update | Uninstall |
 | --- | --- | --- |
-| `install.sh` | Run it again | `rm ~/.local/bin/neuron` |
-| `install.ps1` | Run it again | Delete `%LOCALAPPDATA%\Programs\Neuron` and remove it from your user `PATH` if you added it |
+| `install.sh` | Run it again with the new version: that version's release URL and `--version` (or `NEURON_VERSION`). Without a version it installs the latest stable release, and there is none yet | `rm ~/.local/bin/neuron ~/.local/bin/neuron-tui` |
+| `install.ps1` | Run it again with the new version: that version's release URL and `-Version` (or `NEURON_VERSION`). Without a version it installs the latest stable release, and there is none yet | Delete `%LOCALAPPDATA%\Programs\Neuron\bin` and remove it from your user `PATH` if you added it |
 | npm | `npm install --global @zero-x.live/neuron@next` during the alpha (`@latest` once a stable release is out) | `npm uninstall --global @zero-x.live/neuron` |
-| pip | `pipx upgrade neuroncli` or `pip install --upgrade neuroncli` | `pipx uninstall neuroncli` or `pip uninstall neuroncli` |
+| pip | Not available during the alpha, which is not on PyPI. For a prerelease on PyPI, `pip install --upgrade --pre neuroncli` | `pipx uninstall neuroncli` or `pip uninstall neuroncli` |
 
 Neuron keeps your login in the OS credential store or `~/.neuroncli/`, and your
 settings in `~/.neuron/`; the launchers cache binaries in `~/.cache/neuroncli` (Linux), `~/Library/Caches/neuroncli`

@@ -97,7 +97,11 @@ Have counsel review the following before charging for Neuron or Zero-X plans:
 1. **Lineage.** Confirm that the MIT obligations for Claw Code and the bundled skills
    are met by `LICENSE`, `NOTICE` and `THIRD_PARTY_NOTICES.md`, and review how Claw
    Code itself was produced, given that its reference snapshots mirror Claude Code's
-   file layout.
+   file layout. Confirm the Apache-2.0 obligations for `ui/neuron-tui` as well: its
+   `NOTICE` travels with every copy of the `neuron-tui` binaries and the source, every
+   file changed from the Freebuff original carries a notice saying so, and nothing uses
+   the Codebuff or Freebuff names or marks beyond describing where the code comes from
+   (Apache-2.0 grants no trademark rights).
 2. **Reference snapshots.** Decide whether to keep `src/reference_data/`, which names
    files of a proprietary product, in a commercial repository; nothing in the shipped
    binary depends on it.
