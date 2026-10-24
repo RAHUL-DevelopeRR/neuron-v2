@@ -142,16 +142,26 @@ pub fn display_clean_path(raw: &str) -> String {
     let cleaned = raw.strip_prefix(r"\\?\").unwrap_or(raw);
     // Try to make it relative to the current working directory
     if let Ok(cwd) = std::env::current_dir() {
-        if let Ok(rel) = Path::new(cleaned).strip_prefix(&cwd) {
-            let rel_str = rel.display().to_string();
-            return if rel_str.is_empty() {
-                ".".to_string()
-            } else {
-                rel_str
-            };
+        if let Some(rel) = relative_display(Path::new(cleaned), &cwd) {
+            return rel;
+        }
+        // Also as the OS resolves it: macOS reaches its temp folder through a
+        // /var -> /private/var link, and the working directory reads resolved.
+        if let Ok(resolved) = std::fs::canonicalize(cleaned) {
+            let resolved = resolved.display().to_string();
+            let resolved = resolved.strip_prefix(r"\\?\").unwrap_or(&resolved);
+            if let Some(rel) = relative_display(Path::new(resolved), &cwd) {
+                return rel;
+            }
         }
     }
     cleaned.to_string()
+}
+
+/// `path` relative to `base` (`.` for `base` itself), when it is inside it.
+fn relative_display(path: &Path, base: &Path) -> Option<String> {
+    let rel = path.strip_prefix(base).ok()?.display().to_string();
+    Some(if rel.is_empty() { ".".to_string() } else { rel })
 }
 
 pub fn format_search_start(label: &str, parsed: &serde_json::Value) -> String {
@@ -662,6 +672,28 @@ mod tests {
             strip_ansi(&format_tool_call_start("grep_search", &input))
         });
         assert!(start.contains("\u{2502}  in the workspace\n"), "{start}");
+    }
+
+    /// macOS reaches its temp folder through a /var -> /private/var link, and the
+    /// working directory reads resolved: a path through such a link is still in the
+    /// workspace.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_through_a_link_is_relative_to_the_workspace() {
+        let root = std::env::temp_dir().join(format!("neuron-tool-ui-link-{}", std::process::id()));
+        let real = root.join("real");
+        let link = root.join("link");
+        std::fs::create_dir_all(real.join("src")).expect("folders");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).expect("link");
+        let shown = crate::tests::with_current_dir(&real, || {
+            (
+                display_clean_path(&link.display().to_string()),
+                display_clean_path(&link.join("src").display().to_string()),
+            )
+        });
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(shown, (".".to_string(), "src".to_string()));
     }
 
     #[test]
