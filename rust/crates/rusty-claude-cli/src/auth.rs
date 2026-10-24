@@ -11,7 +11,9 @@ use zeroize::Zeroizing;
 use crate::credentials::{
     classify_token, CredentialLocation, CredentialStore, StoredCredential, TokenKind,
 };
-use crate::device_login::{self, ClientInfo, HttpTransport, SystemClock, TerminalObserver};
+use crate::device_login::{
+    self, ClientInfo, DeviceLoginObserver, HttpTransport, SystemClock, TerminalObserver,
+};
 use crate::gateway_http::{self, GatewayHttpError, ACCOUNT_TIMEOUT};
 use crate::vault::SecureString;
 
@@ -69,6 +71,8 @@ pub struct GatewayCredential {
     pub source: CredentialSource,
     pub expires_at: Option<u64>,
     pub plan: Option<String>,
+    /// Known for a stored login the gateway reported it for.
+    pub email: Option<String>,
 }
 
 impl GatewayCredential {
@@ -80,6 +84,7 @@ impl GatewayCredential {
             source: CredentialSource::Stored(location),
             expires_at: stored.expires_at,
             plan: stored.plan,
+            email: stored.email,
         })
     }
 
@@ -111,6 +116,7 @@ fn env_credential() -> io::Result<Option<GatewayCredential>> {
         source: CredentialSource::EnvToken,
         expires_at: None,
         plan: None,
+        email: None,
     }))
 }
 
@@ -138,7 +144,7 @@ pub fn cached_gateway_token() -> io::Result<Option<SecureString>> {
 }
 
 fn interactive() -> bool {
-    io::stdin().is_terminal() && io::stderr().is_terminal()
+    runtime::ui_hooks::stdin_is_terminal() && io::stderr().is_terminal()
 }
 
 /// Credential for a model session: `NEURON_TOKEN`, else the stored login
@@ -275,24 +281,35 @@ impl Default for LoginOptions {
 /// when this machine has one, and polls Zero-X until the code is approved on
 /// <https://neuron.zero-x.live/device>. No local port is opened.
 pub fn login(options: LoginOptions) -> io::Result<GatewayCredential> {
+    // Ctrl-C ends the process here; the full-screen UI passes its own cancel check.
+    login_with(options, &TerminalObserver, &|| false).map(|(credential, _email)| credential)
+}
+
+/// [`login`] that shows the code through `observer` and gives up when `cancelled` turns
+/// true. Also returns the account's email when the gateway sent it.
+pub fn login_with(
+    options: LoginOptions,
+    observer: &dyn DeviceLoginObserver,
+    cancelled: &dyn Fn() -> bool,
+) -> io::Result<(GatewayCredential, Option<String>)> {
     let base = gateway_base_url()?;
     let allowed =
         device_login::browser_allowed(options.open_browser, &|name| env::var(name).ok(), &|path| {
             std::path::Path::new(path).exists()
         });
     let open_browser = |link: &str| allowed && webbrowser::open(link).is_ok();
-    // Ctrl-C ends the process here; the full-screen UI passes its own cancel check.
-    let clock = SystemClock::new(&|| false);
+    let clock = SystemClock::new(cancelled);
     let grant = device_login::run(
         &base,
         &HttpTransport,
         &clock,
-        &TerminalObserver,
+        observer,
         &ClientInfo::current(),
         &open_browser,
     )?;
     let store = CredentialStore::open_default();
-    finish_login(&store, &base, grant.token)
+    let credential = finish_login(&store, &base, grant.token)?;
+    Ok((credential, grant.email))
 }
 
 /// Records session metadata after the token is stored and reports where.
@@ -307,6 +324,7 @@ fn finish_login(
         Ok(info) => {
             stored.expires_at = info.expires_at;
             stored.plan = info.plan;
+            stored.email = info.email;
         }
         Err(error) if error.is_invalid_session() => {
             let _ = store.clear();
@@ -316,18 +334,21 @@ fn finish_login(
             ));
         }
         Err(error) => {
-            eprintln!("warning: signed in, but the session details are unavailable ({error})");
+            runtime::ui_hooks::notice(&format!(
+                "warning: signed in, but the session details are unavailable ({error})"
+            ));
         }
     }
     let location = store.save(&stored).map_err(io::Error::other)?;
     crate::gateway_catalog::invalidate_cache();
-    eprintln!("{}", describe_login(&stored, location));
+    runtime::ui_hooks::notice(&describe_login(&stored, location));
     Ok(GatewayCredential {
         token,
         kind,
         source: CredentialSource::Stored(location),
         expires_at: stored.expires_at,
         plan: stored.plan,
+        email: stored.email,
     })
 }
 
@@ -365,7 +386,20 @@ fn login_with_token(input: &mut dyn BufRead, prompt: bool) -> io::Result<Gateway
 /// Signs out: revokes the session on the server when possible and removes
 /// every local copy. Always succeeds; problems are reported as warnings.
 pub fn logout() {
+    sign_out();
+    // Stdout on the terminal; a UI that took over notices (and may own stdout) hears it.
+    if runtime::ui_hooks::notice_handler_installed() {
+        runtime::ui_hooks::notice("Signed out of Zero-X.");
+    } else {
+        println!("Signed out of Zero-X.");
+    }
+    warn_about_env_token();
+}
+
+/// [`logout`] without the closing line. Returns whether the server revoked a session.
+fn sign_out() -> bool {
     let store = CredentialStore::open_default();
+    let mut revoked = false;
     if let Some(loaded) = store.load() {
         let is_session = classify_token(loaded.credential.token.expose()) == Ok(TokenKind::Session);
         match gateway_base_url() {
@@ -374,51 +408,69 @@ pub fn logout() {
                 Some(loaded.credential.token.expose()),
                 ACCOUNT_TIMEOUT,
             ) {
-                Ok(()) => eprintln!("Zero-X session revoked."),
+                Ok(()) => {
+                    revoked = true;
+                    runtime::ui_hooks::notice("Zero-X session revoked.");
+                }
                 Err(error) if error.is_invalid_session() => {}
-                Err(error) => eprintln!(
+                Err(error) => runtime::ui_hooks::notice(&format!(
                     "warning: could not revoke the session on Zero-X ({error}); it expires on its own"
-                ),
+                )),
             },
             Ok(_) => {}
-            Err(error) => eprintln!("warning: skipping server sign-out: {error}"),
+            Err(error) => {
+                runtime::ui_hooks::notice(&format!("warning: skipping server sign-out: {error}"));
+            }
         }
     }
     for warning in store.clear() {
-        eprintln!("warning: {warning}");
+        runtime::ui_hooks::notice(&format!("warning: {warning}"));
     }
     crate::gateway_catalog::invalidate_cache();
-    println!("Signed out of Zero-X.");
+    revoked
+}
+
+/// After signing out: a `NEURON_TOKEN` in the environment still signs Neuron in.
+fn warn_about_env_token() {
     if env::var("NEURON_TOKEN").is_ok_and(|token| !token.trim().is_empty()) {
-        eprintln!(
-            "NEURON_TOKEN is still set in this shell; unset it to stop using that credential."
+        runtime::ui_hooks::notice(
+            "NEURON_TOKEN is still set in this shell; unset it to stop using that credential.",
         );
     }
 }
 
 /// `neuron auth status`: validates the credential with the server and prints
-/// plan, expiry and today's usage.
+/// plan, expiry and today's usage. A login that expired or was revoked is signed
+/// out: said once, on stdout, with the signed-out exit code.
 fn status() -> Result<(), Box<dyn std::error::Error>> {
     let Some(credential) = env_credential()?.or_else(stored_credential_for_use) else {
         println!("Signed out of Zero-X. Run `neuron auth login`.");
-        return Ok(());
+        std::process::exit(SIGNED_OUT_EXIT_CODE);
     };
     let base = gateway_base_url()?;
     let now = crate::clock::now_unix();
+    if credential.is_expired(now) {
+        println!("{}", signed_out_line(&credential, Some(now)));
+        std::process::exit(SIGNED_OUT_EXIT_CODE);
+    }
+    let verified = fetch_session(&base, &credential.token, credential.kind);
+    if verified
+        .as_ref()
+        .is_err_and(GatewayHttpError::is_invalid_session)
+    {
+        println!("{}", signed_out_line(&credential, None));
+        std::process::exit(SIGNED_OUT_EXIT_CODE);
+    }
     println!("Zero-X");
     println!("  Signed in        yes ({})", credential.source.describe());
     println!("  Gateway          {base}");
-    let session = match fetch_session(&base, &credential.token, credential.kind) {
+    let session = match verified {
         Ok(info) => {
             if let CredentialSource::Stored(_) = credential.source {
                 refresh_stored_metadata(&credential, &info);
             }
             println!("  Session          valid");
             info
-        }
-        Err(error) if error.is_invalid_session() => {
-            recover_invalid_session()?;
-            return Ok(());
         }
         Err(error) => {
             println!("  Session          not verified: {error}");
@@ -441,9 +493,6 @@ fn status() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{line}");
             }
         }
-        Err(error) if error.is_invalid_session() => {
-            recover_invalid_session()?;
-        }
         Err(error) => {
             if let Some(plan) = &session.plan {
                 println!("  Plan             {plan}");
@@ -452,6 +501,80 @@ fn status() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// `neuron auth status` for a login that expired (`now` given: it expired by its
+/// stored expiry) or that the gateway rejected.
+pub(crate) fn signed_out_line(credential: &GatewayCredential, now: Option<u64>) -> String {
+    let what = match now {
+        Some(now) => format!(
+            "the session expired {}",
+            describe_expiry(credential.expires_at, now)
+        ),
+        None => "the session expired or was revoked".to_string(),
+    };
+    let next = match credential.source {
+        CredentialSource::EnvToken => {
+            "Set a valid NEURON_TOKEN, or unset it and run `neuron auth login`."
+        }
+        CredentialSource::Stored(_) => "Run `neuron auth login`.",
+    };
+    format!(
+        "Signed out of Zero-X: {what} ({}). {next}",
+        credential.source.describe()
+    )
+}
+
+/// `neuron auth status --output-format json`: what [`status`] prints, as JSON, and
+/// whether a usable login was found. Never includes the token.
+fn status_json() -> Result<(Value, bool), Box<dyn std::error::Error>> {
+    let Some(credential) = env_credential()?.or_else(stored_credential_for_use) else {
+        return Ok((
+            serde_json::json!({ "type": "auth_status", "signed_in": false }),
+            false,
+        ));
+    };
+    let base = gateway_base_url()?;
+    let mut report = serde_json::json!({
+        "type": "auth_status",
+        "signed_in": true,
+        "source": credential.source.describe(),
+        "gateway": base,
+        "plan": credential.plan,
+        "expires_at": credential.expires_at,
+    });
+    if credential.is_expired(crate::clock::now_unix()) {
+        report["signed_in"] = false.into();
+        report["session"] = "expired".into();
+        report["error"] = api::INVALID_SESSION_MESSAGE.into();
+        return Ok((report, false));
+    }
+    match fetch_session(&base, &credential.token, credential.kind) {
+        Ok(info) => {
+            if let CredentialSource::Stored(_) = credential.source {
+                refresh_stored_metadata(&credential, &info);
+            }
+            report["session"] = "valid".into();
+            report["plan"] = info.plan.into();
+            report["expires_at"] = info.expires_at.into();
+            report["email"] = info.email.into();
+        }
+        Err(error) if error.is_invalid_session() => {
+            report["signed_in"] = false.into();
+            report["session"] = "invalid".into();
+            report["error"] = api::INVALID_SESSION_MESSAGE.into();
+            return Ok((report, false));
+        }
+        Err(error) => {
+            report["session"] = "not_verified".into();
+            report["error"] = error.to_string().into();
+        }
+    }
+    match crate::account::fetch_account(&base, &credential.token) {
+        Ok(account) => report["account"] = serde_json::to_value(account)?,
+        Err(error) => report["account_error"] = error.to_string().into(),
+    }
+    Ok((report, true))
 }
 
 fn describe_expiry(expires_at: Option<u64>, now: u64) -> String {
@@ -468,7 +591,12 @@ fn describe_expiry(expires_at: Option<u64>, now: u64) -> String {
 }
 
 fn refresh_stored_metadata(credential: &GatewayCredential, info: &SessionInfo) {
-    if credential.plan == info.plan && credential.expires_at == info.expires_at {
+    // A missing email keeps the stored one.
+    let email = info.email.clone().or_else(|| credential.email.clone());
+    if credential.plan == info.plan
+        && credential.expires_at == info.expires_at
+        && credential.email == email
+    {
         return;
     }
     if credential.plan.is_some() && credential.plan != info.plan {
@@ -478,19 +606,208 @@ fn refresh_stored_metadata(credential: &GatewayCredential, info: &SessionInfo) {
     let mut stored = StoredCredential::new(credential.token.clone());
     stored.plan.clone_from(&info.plan);
     stored.expires_at = info.expires_at;
+    stored.email = email;
     if let Err(error) = CredentialStore::open_default().save(&stored) {
         eprintln!("warning: could not update the stored session details: {error}");
     }
 }
 
-/// `neuron login …` and `neuron logout` are the short forms of
-/// `neuron auth login …` and `neuron auth logout`: returns the arguments for
-/// [`run_auth_command`] when `args` is one of them.
-pub fn auth_alias(args: &[String]) -> Option<&[String]> {
-    matches!(args.first().map(String::as_str), Some("login" | "logout")).then_some(args)
+/// Global flags that take a value (`parse_args` reads them).
+const GLOBAL_VALUE_FLAGS: [&str; 7] = [
+    "--model",
+    "--output-format",
+    "--permission-mode",
+    "--base-commit",
+    "--reasoning-effort",
+    "--allowedTools",
+    "--allowed-tools",
+];
+
+/// The account commands: `auth`, `login`, `logout`, `usage` and `upgrade`. `neuron login …`
+/// and `neuron logout` are the short forms of `neuron auth login …` and `neuron auth logout`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AccountCommand {
+    pub name: String,
+    /// What follows the command, then a `--output-format` given before it.
+    pub args: Vec<String>,
 }
 
+/// Finds an account command after any global flags (`neuron --output-format json auth
+/// status`). A `--output-format` before it moves to its arguments; the other global flags
+/// don't apply to it and are dropped. `None` when the first word is not one, such as a
+/// prompt, and when what follows is not what the command takes: an unquoted prompt that
+/// starts with a command's name (`neuron --model m login to the server and fix it`) is
+/// left to the argument parser, which asks for quotes.
+pub fn account_command(args: &[String]) -> Option<AccountCommand> {
+    let mut output_format = Vec::new();
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        if !arg.starts_with('-') {
+            if !matches!(
+                arg.as_str(),
+                "auth" | "login" | "logout" | "usage" | "upgrade"
+            ) {
+                return None;
+            }
+            let mut rest = without_global_flags(&args[index + 1..]);
+            rest.extend(output_format);
+            if !takes_arguments(arg, &rest) {
+                return None;
+            }
+            return Some(AccountCommand {
+                name: arg.clone(),
+                args: rest,
+            });
+        }
+        // `-p`, `--print` and the help and version flags end the search: what follows is
+        // theirs.
+        if matches!(
+            arg.as_str(),
+            "-p" | "--print" | "--help" | "-h" | "--version" | "-V"
+        ) {
+            return None;
+        }
+        let takes_value = GLOBAL_VALUE_FLAGS.contains(&arg.as_str());
+        if arg == "--output-format" || arg.starts_with("--output-format=") {
+            output_format.extend(
+                args[index..]
+                    .iter()
+                    .take(1 + usize::from(takes_value))
+                    .cloned(),
+            );
+        }
+        index += 1 + usize::from(takes_value);
+    }
+    None
+}
+
+/// Global switches (no value) that `parse_args` reads.
+const GLOBAL_SWITCHES: [&str; 3] = [
+    "--compact",
+    "--dangerously-skip-permissions",
+    "--allow-broad-cwd",
+];
+
+/// `args` without the global flags, given after an account command too (`neuron usage
+/// --model m`): they don't apply to it, as before it. `--output-format` stays: the
+/// command reads it.
+fn without_global_flags(args: &[String]) -> Vec<String> {
+    let mut kept = Vec::with_capacity(args.len());
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        let (flag, inline_value) = match arg.split_once('=') {
+            Some((flag, _)) => (flag, true),
+            None => (arg.as_str(), false),
+        };
+        let takes_value = GLOBAL_VALUE_FLAGS.contains(&flag);
+        if flag == "--output-format" || !(takes_value || GLOBAL_SWITCHES.contains(&flag)) {
+            kept.push(arg.clone());
+            index += 1;
+            continue;
+        }
+        // `--model m` takes its value along; `--model=m` is one argument.
+        index += 1 + usize::from(takes_value && !inline_value);
+    }
+    kept
+}
+
+/// Whether `args` are arguments account command `name` takes. A bad `--output-format`
+/// value counts: the command itself reports it.
+fn takes_arguments(name: &str, args: &[String]) -> bool {
+    let Ok((args, _)) = take_output_format(args) else {
+        return true;
+    };
+    let words = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let login_flags = |flags: &[&str]| {
+        flags
+            .iter()
+            .all(|flag| matches!(*flag, "--no-browser" | "--with-token"))
+    };
+    match (name, words.as_slice()) {
+        ("login", flags) | ("auth", ["login", flags @ ..]) => login_flags(flags),
+        ("logout" | "usage" | "upgrade", [])
+        | ("upgrade", ["--no-browser"])
+        | ("auth", [] | ["help" | "--help" | "-h" | "status" | "logout"]) => true,
+        _ => false,
+    }
+}
+
+/// Runs an account command found by [`account_command`].
+pub fn run_account_command(command: &AccountCommand) -> Result<(), Box<dyn std::error::Error>> {
+    match command.name.as_str() {
+        "auth" => run_auth_command(&command.args),
+        "login" | "logout" => {
+            let mut args = vec![command.name.clone()];
+            args.extend(command.args.iter().cloned());
+            run_auth_command(&args)
+        }
+        "usage" => {
+            let (args, json) = take_output_format(&command.args)?;
+            crate::account::run_usage_command(&args, json)
+        }
+        _ => {
+            let (args, json) = take_output_format(&command.args)?;
+            crate::account::run_upgrade_command(&args, json)
+        }
+    }
+}
+
+/// Prints an account command's `--output-format json` result.
+pub(crate) fn print_json(report: &Value) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", serde_json::to_string_pretty(report)?);
+    Ok(())
+}
+
+/// `neuron login --output-format json`: who is signed in now. Never includes the token.
+fn login_json(credential: &GatewayCredential) -> Value {
+    serde_json::json!({
+        "type": "login",
+        "signed_in": true,
+        "source": credential.source.describe(),
+        "plan": credential.plan,
+        "expires_at": credential.expires_at,
+        "email": credential.email,
+    })
+}
+
+/// Takes `--output-format json|text` (or `--output-format=…`) out of `args`.
+fn take_output_format(args: &[String]) -> Result<(Vec<String>, bool), String> {
+    let mut rest = Vec::new();
+    let mut json = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let value = if arg == "--output-format" {
+            Some(iter.next().map_or("", String::as_str))
+        } else {
+            arg.strip_prefix("--output-format=")
+        };
+        match value {
+            Some("json") => json = true,
+            Some("text") => json = false,
+            Some(other) => {
+                return Err(format!(
+                    "unsupported value for --output-format: {other} (expected text or json)"
+                ))
+            }
+            None => rest.push(arg.clone()),
+        }
+    }
+    Ok((rest, json))
+}
+
+/// The exit code of `neuron auth status` when signed out, so scripts can tell.
+const SIGNED_OUT_EXIT_CODE: i32 = 1;
+
 pub fn run_auth_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (args, json) = take_output_format(args)?;
+    if json && args.first().map(String::as_str) == Some("status") && args.len() == 1 {
+        let (report, signed_in) = status_json()?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        if !signed_in {
+            std::process::exit(SIGNED_OUT_EXIT_CODE);
+        }
+        return Ok(());
+    }
     match args.first().map(String::as_str) {
         Some("login") => {
             let mut options = LoginOptions::default();
@@ -507,16 +824,32 @@ pub fn run_auth_command(args: &[String]) -> Result<(), Box<dyn std::error::Error
                     }
                 }
             }
-            if with_token {
+            let credential = if with_token {
                 let stdin = io::stdin();
                 let prompt = stdin.is_terminal();
-                login_with_token(&mut stdin.lock(), prompt)?;
+                login_with_token(&mut stdin.lock(), prompt)?
             } else {
-                login(options)?;
+                login(options)?
+            };
+            // The sign-in steps and the result line went to stderr.
+            if json {
+                print_json(&login_json(&credential))?;
             }
+        }
+        Some("logout") if args.len() == 1 && json => {
+            let revoked = sign_out();
+            warn_about_env_token();
+            print_json(&serde_json::json!({
+                "type": "logout",
+                "signed_out": true,
+                "session_revoked": revoked,
+            }))?;
         }
         Some("logout") if args.len() == 1 => logout(),
         Some("status") if args.len() == 1 => status()?,
+        None | Some("help" | "--help" | "-h") if json => {
+            print_json(&serde_json::json!({ "kind": "help", "message": AUTH_USAGE }))?;
+        }
         None | Some("help" | "--help" | "-h") => println!("{AUTH_USAGE}"),
         _ => return Err(AUTH_USAGE.into()),
     }
@@ -532,14 +865,26 @@ pub fn check_trust(cwd: &std::path::Path) -> bool {
     if runtime::ConfigLoader::default_for(cwd).workspace_is_trusted() {
         return true;
     }
-    println!(
-        "\nNeuronCLI can read, write, and execute commands in:\n{}\nTrusting it also lets this directory's settings files run hooks, start MCP servers and change permissions.",
+    // Where the user sees it: stdout, or stderr when stdout is redirected (`neuron
+    // prompt ... > out.txt`). With both redirected, a person at the terminal would
+    // not see the question.
+    let Some(stream) = runtime::ui_hooks::PromptStream::current() else {
+        eprintln!(
+            "Not trusted: the trust question could not be shown (stdout and stderr are redirected). \
+Run neuron in a terminal to trust this directory, or add it to `trustedRoots` in your user settings."
+        );
+        return false;
+    };
+    let mut out = stream.writer();
+    let _ = write!(
+        out,
+        "\nNeuronCLI can read, write, and execute commands in:\n{}\nTrusting it also lets this directory's settings files run hooks, start MCP servers and change permissions.\nPress 1 to trust this directory: ",
         cwd.display()
     );
-    print!("Press 1 to trust this directory: ");
-    let _ = io::stdout().flush();
+    let _ = out.flush();
     let mut input = String::new();
-    if io::stdin().read_line(&mut input).is_ok() && input.trim() == "1" {
+    let answered = io::stdin().read_line(&mut input);
+    if answered.is_ok() && input.trim() == "1" {
         if let Err(error) = runtime::workspace_trust::record_trusted_workspace(cwd) {
             eprintln!(
                 "warning: could not save trust for {}: {error}",
@@ -548,7 +893,21 @@ pub fn check_trust(cwd: &std::path::Path) -> bool {
         }
         return true;
     }
+    // The caller exits; say why rather than stopping silently.
+    let _ = writeln!(out);
+    eprintln!("{}", untrusted_reason(matches!(answered, Ok(0) | Err(_))));
     false
+}
+
+/// Why Neuron stopped at the trust question: nobody could answer it (no input), or
+/// the answer was not 1.
+fn untrusted_reason(no_input: bool) -> &'static str {
+    if no_input {
+        "Not trusted: there was no input to answer the trust question. Run neuron in a terminal \
+to trust this directory, or add it to `trustedRoots` in your user settings."
+    } else {
+        "Not trusted, so Neuron stopped. Run neuron again and press 1 to trust this directory."
+    }
 }
 
 #[cfg(test)]
@@ -564,22 +923,176 @@ mod tests {
         assert!(validate_gateway_base("https://example.com/v1?redirect=other").is_err());
     }
 
+    fn strings(list: &[&str]) -> Vec<String> {
+        list.iter().map(ToString::to_string).collect()
+    }
+
+    fn command(name: &str, args: &[&str]) -> Option<AccountCommand> {
+        Some(AccountCommand {
+            name: name.to_string(),
+            args: strings(args),
+        })
+    }
+
     #[test]
     fn login_and_logout_work_without_the_auth_prefix() {
-        let args = |list: &[&str]| list.iter().map(ToString::to_string).collect::<Vec<_>>();
-        assert_eq!(auth_alias(&args(&["login"])), Some(&args(&["login"])[..]));
+        assert_eq!(account_command(&strings(&["login"])), command("login", &[]));
         assert_eq!(
-            auth_alias(&args(&["login", "--no-browser"])),
-            Some(&args(&["login", "--no-browser"])[..])
+            account_command(&strings(&["login", "--no-browser"])),
+            command("login", &["--no-browser"])
         );
-        assert_eq!(auth_alias(&args(&["logout"])), Some(&args(&["logout"])[..]));
         assert_eq!(
-            auth_alias(&args(&["status"])),
+            account_command(&strings(&["logout"])),
+            command("logout", &[])
+        );
+        assert_eq!(
+            account_command(&strings(&["status"])),
             None,
             "`neuron status` stays the REPL command"
         );
-        assert_eq!(auth_alias(&args(&["prompt", "login"])), None);
-        assert_eq!(auth_alias(&[]), None);
+        assert_eq!(account_command(&strings(&["prompt", "login"])), None);
+        assert_eq!(account_command(&[]), None);
+    }
+
+    #[test]
+    fn account_commands_are_found_after_global_flags_and_keep_the_output_format() {
+        assert_eq!(
+            account_command(&strings(&["--output-format", "json", "auth", "status"])),
+            command("auth", &["status", "--output-format", "json"])
+        );
+        assert_eq!(
+            account_command(&strings(&["auth", "status", "--output-format=json"])),
+            command("auth", &["status", "--output-format=json"])
+        );
+        assert_eq!(
+            account_command(&strings(&[
+                "--model",
+                "auth",
+                "--dangerously-skip-permissions",
+                "login"
+            ])),
+            command("login", &[]),
+            "a flag's value is not the command"
+        );
+        assert_eq!(
+            account_command(&strings(&["--model", "opus", "fix the auth bug"])),
+            None
+        );
+        assert_eq!(account_command(&strings(&["-p", "auth", "status"])), None);
+        assert_eq!(account_command(&strings(&["--help", "auth"])), None);
+    }
+
+    #[test]
+    fn global_flags_after_an_account_command_are_accepted_as_before_it() {
+        assert_eq!(
+            account_command(&strings(&["usage", "--model", "groq/openai/gpt-oss-20b"])),
+            command("usage", &[])
+        );
+        assert_eq!(
+            account_command(&strings(&[
+                "usage",
+                "--model=m",
+                "--compact",
+                "--output-format",
+                "json"
+            ])),
+            command("usage", &["--output-format", "json"])
+        );
+        assert_eq!(
+            account_command(&strings(&[
+                "auth",
+                "status",
+                "--permission-mode",
+                "read-only"
+            ])),
+            command("auth", &["status"])
+        );
+        assert_eq!(
+            account_command(&strings(&["login", "--no-browser", "--model", "m"])),
+            command("login", &["--no-browser"])
+        );
+        // Words it does not take still are not the command.
+        assert_eq!(
+            account_command(&strings(&["usage", "--model", "m", "of", "memory"])),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unquoted_prompt_that_starts_with_a_command_name_is_not_the_command() {
+        let prompt = |first: &str| {
+            let mut args = strings(&["--model", "m", first]);
+            args.extend(strings(&["to", "the", "server", "and", "fix", "it"]));
+            args
+        };
+        for name in ["auth", "login", "logout", "usage", "upgrade"] {
+            assert_eq!(account_command(&prompt(name)), None, "{name}");
+        }
+        // The commands themselves, with what they take, still are.
+        assert_eq!(
+            account_command(&strings(&["--model", "m", "login"])),
+            command("login", &[])
+        );
+        assert_eq!(
+            account_command(&strings(&[
+                "login",
+                "--with-token",
+                "--output-format",
+                "json"
+            ])),
+            command("login", &["--with-token", "--output-format", "json"])
+        );
+        assert_eq!(
+            account_command(&strings(&["--output-format", "json", "usage"])),
+            command("usage", &["--output-format", "json"])
+        );
+        assert_eq!(
+            account_command(&strings(&["upgrade", "--no-browser"])),
+            command("upgrade", &["--no-browser"])
+        );
+        assert_eq!(
+            account_command(&strings(&["auth", "login", "--no-browser"])),
+            command("auth", &["login", "--no-browser"])
+        );
+        assert_eq!(account_command(&strings(&["auth"])), command("auth", &[]));
+        assert_eq!(account_command(&strings(&["logout", "now"])), None);
+        assert_eq!(account_command(&strings(&["auth", "status", "now"])), None);
+        // A bad format value is the command's to report.
+        assert_eq!(
+            account_command(&strings(&["usage", "--output-format", "yaml"])),
+            command("usage", &["--output-format", "yaml"])
+        );
+    }
+
+    #[test]
+    fn login_json_names_the_account_but_never_the_token() {
+        let credential = GatewayCredential {
+            token: SecureString::new("ses_abcdefghijklmnopqrstuvwxyz012345".to_string()),
+            kind: TokenKind::Session,
+            source: CredentialSource::Stored(CredentialLocation::Keychain),
+            expires_at: Some(4_070_908_800),
+            plan: Some("free".to_string()),
+            email: Some("dev@example.com".to_string()),
+        };
+        let report = login_json(&credential);
+        assert_eq!(report["type"], "login");
+        assert_eq!(report["signed_in"], true);
+        assert_eq!(report["plan"], "free");
+        assert_eq!(report["expires_at"], 4_070_908_800_u64);
+        assert!(!report.to_string().contains("ses_"));
+    }
+
+    #[test]
+    fn the_output_format_is_taken_out_of_auth_arguments() {
+        assert_eq!(
+            take_output_format(&strings(&["status", "--output-format", "json"])),
+            Ok((strings(&["status"]), true))
+        );
+        assert_eq!(
+            take_output_format(&strings(&["--output-format=text", "status"])),
+            Ok((strings(&["status"]), false))
+        );
+        assert!(take_output_format(&strings(&["status", "--output-format", "yaml"])).is_err());
     }
 
     #[test]

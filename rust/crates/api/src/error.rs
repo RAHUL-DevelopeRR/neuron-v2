@@ -734,7 +734,7 @@ impl Display for GatewayError {
         if let Some(resets_at) = &self.resets_at {
             write!(f, "; resets at {resets_at}")?;
         } else if let Some(seconds) = self.retry_after_seconds {
-            write!(f, "; retry in {seconds}s")?;
+            write!(f, "; retry in {}", describe_wait(seconds))?;
         }
         if let Some(upgrade_url) = &self.upgrade_url {
             write!(f, "; upgrade: {upgrade_url}")?;
@@ -743,6 +743,21 @@ impl Display for GatewayError {
             write!(f, "; request {request_id}")?;
         }
         Ok(())
+    }
+}
+
+/// A wait as people read it: `45s`, `12m`, `14h 45m`. Minutes round up, so someone who
+/// waits as long as it says is never turned away again.
+#[must_use]
+pub fn describe_wait(seconds: u64) -> String {
+    if seconds < 90 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds.div_ceil(60);
+    match (minutes / 60, minutes % 60) {
+        (0, minutes) => format!("{minutes}m"),
+        (hours, 0) => format!("{hours}h"),
+        (hours, minutes) => format!("{hours}h {minutes}m"),
     }
 }
 
@@ -1096,5 +1111,23 @@ mod tests {
         assert_eq!(error.safe_failure_class(), "provider_auth");
         assert!(!error.is_retryable());
         assert_eq!(error.request_id(), None);
+    }
+
+    #[test]
+    fn retry_waits_read_as_hours_and_minutes() {
+        assert_eq!(super::describe_wait(45), "45s");
+        assert_eq!(super::describe_wait(120), "2m");
+        assert_eq!(super::describe_wait(3_600), "1h");
+        assert_eq!(super::describe_wait(53_094), "14h 45m");
+    }
+
+    #[test]
+    fn retry_waits_round_up_so_waiting_that_long_is_enough() {
+        assert_eq!(super::describe_wait(90), "2m");
+        assert_eq!(super::describe_wait(487), "9m");
+        assert_eq!(super::describe_wait(3_541), "1h");
+        assert_eq!(super::describe_wait(3_599), "1h");
+        assert_eq!(super::describe_wait(3_601), "1h 1m");
+        assert_eq!(super::describe_wait(53_041), "14h 45m");
     }
 }

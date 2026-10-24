@@ -102,6 +102,38 @@ class PackagedLauncherTests(unittest.TestCase):
             self.launcher._release_asset("FreeBSD", "amd64")
         self.assertIn("NEURON_BINARY_PATH", str(error.exception))
 
+    def test_the_full_screen_ui_has_an_asset_beside_every_cli_asset(self) -> None:
+        cases = {
+            ("Windows", "AMD64"): "neuron-tui-windows-x64.exe",
+            ("Windows", "ARM64"): "neuron-tui-windows-x64.exe",
+            ("Linux", "x86_64"): "neuron-tui-linux-x64",
+            ("Linux", "aarch64"): "neuron-tui-linux-arm64",
+            ("Darwin", "arm64"): "neuron-tui-macos-arm64",
+            ("Darwin", "x86_64"): "neuron-tui-macos-x64",
+        }
+        for (system, machine), asset in cases.items():
+            with self.subTest(system=system, machine=machine):
+                self.assertEqual(self.launcher._release_asset(system, machine, component="ui"), asset)
+
+    def test_the_ui_is_wanted_only_for_a_bare_launch_on_a_terminal(self) -> None:
+        wants = self.launcher._wants_full_screen_ui
+        self.assertTrue(wants([], True, {}))
+        self.assertTrue(wants(["--model", "opus", "--permission-mode", "read-only", "--allow-broad-cwd"], True, {}))
+        self.assertFalse(wants([], False, {}))
+        self.assertFalse(wants([], True, {"NEURON_NO_TUI": "1"}))
+        self.assertTrue(wants([], True, {"NEURON_NO_TUI": "0"}))
+        for args in (["--no-tui"], ["fix the bug"], ["-p", "hi"], ["status"], ["--help"], ["--version"]):
+            with self.subTest(args=args):
+                self.assertFalse(wants(args, True, {}))
+
+    def test_off_a_terminal_the_ui_is_not_fetched(self) -> None:
+        with patch.dict(os.environ, {"NEURON_DOWNLOAD_BASE": "http://127.0.0.1:9"}, clear=False):
+            os.environ.pop("NEURON_TUI_BIN", None)
+            with patch.object(self.launcher, "_download_binary") as download:
+                with patch.object(self.launcher.sys.stdin, "isatty", return_value=False):
+                    self.assertIsNone(self.launcher._find_ui_binary([]))
+                download.assert_not_called()
+
     def test_download_base_must_be_https_or_loopback(self) -> None:
         for base in ("https://mirror.example/releases/download/", "http://127.0.0.1:8000", "http://localhost:1"):
             with self.subTest(base=base), patch.dict(os.environ, {"NEURON_DOWNLOAD_BASE": base}):

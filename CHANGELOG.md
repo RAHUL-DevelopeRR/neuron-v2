@@ -10,6 +10,25 @@ It signs in to the Zero-X gateway and keeps the login in the OS credential store
 makes the agent loop survive errors, cancellation and long sessions, gates every tool
 call by what it actually does, and sends far smaller requests.
 
+### Full-screen UI
+
+- On a terminal, `neuron` with no prompt opens a full-screen UI, `neuron-tui`. It is a
+  port of the Codebuff/Freebuff terminal UI (Apache-2.0; OpenTUI and React on Bun),
+  with Codebuff's services, ads, billing and telemetry removed. It runs the Rust
+  `neuron` as its engine over `neuron engine --stdio`. It shows streamed replies,
+  tool calls with their output, a permission dialog (allow once, allow for the
+  session, deny, deny with a note), the Zero-X sign-in with the device code (`/login`),
+  a model picker (`/model`) and a footer with the model, git state, tokens and context
+  use.
+- Releases ship `neuron-tui-<target>` beside each `neuron-<target>`, with checksums and
+  build provenance. The installers and the npm and pip launchers put it beside
+  `neuron` (verified, and never failing the install). `--no-tui` or `NEURON_NO_TUI=1`
+  keeps the line REPL, and without the UI `neuron` runs the line REPL as before.
+- A repository's `.envrc` can't steer the UI or its engine: the direnv import drops
+  `NEURON_*` and the providers' keys and endpoints, and the engine is found on the PATH
+  from before the import.
+- The React/Ink prototype in `ui/react-tui` is removed.
+
 ### Zero-X gateway and sign-in
 
 - `neuron login` signs in with a device code: it prints

@@ -282,7 +282,7 @@ pub fn set_provider_flag(provider: Option<ProviderId>) {
     *flag_slot().write().unwrap_or_else(PoisonError::into_inner) = provider;
 }
 
-fn provider_flag() -> Option<ProviderId> {
+pub(crate) fn provider_flag() -> Option<ProviderId> {
     *flag_slot().read().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -407,6 +407,13 @@ pub fn openai_model(model: &str) -> String {
     }
 }
 
+/// The model as people should see it: without the `openai/` routing prefix of
+/// [`openai_model`], which picks a client and is not part of its name (the
+/// gateway's catalog ids have none).
+pub fn shown_model(model: &str) -> &str {
+    model.strip_prefix("openai/").unwrap_or(model)
+}
+
 fn requested_or(requested: &str, fallback: impl FnOnce() -> String) -> String {
     if requested == AUTO_MODEL {
         fallback()
@@ -431,10 +438,40 @@ pub fn configure_provider(requested_model: &str) -> Result<String, Box<dyn std::
     let inputs = gather_inputs(requested_model)?;
     let selection = select_provider(&inputs, &azure_usable);
     let active = activate(selection, requested_model)?;
-    eprintln!("{}", active.startup_line());
+    Ok(install_active(active))
+}
+
+/// How [`start_provider`] went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderStart {
+    /// Configured, as [`configure_provider`] does; the model to use.
+    Ready(String),
+    /// Zero-X was selected but its login is missing, expired or rejected: a UI that can
+    /// sign the user in starts without a provider and calls this again afterwards.
+    SignInRequired(String),
+}
+
+/// [`configure_provider`] for a UI that can run the sign-in itself.
+pub fn start_provider(requested_model: &str) -> Result<ProviderStart, Box<dyn std::error::Error>> {
+    let inputs = gather_inputs(requested_model)?;
+    let selection = select_provider(&inputs, &azure_usable);
+    let zero_x = selection.provider == ProviderId::ZeroX;
+    match activate(selection, requested_model) {
+        Ok(active) => Ok(ProviderStart::Ready(install_active(active))),
+        Err(error) if zero_x => Ok(ProviderStart::SignInRequired(error.to_string())),
+        Err(error) => Err(error),
+    }
+}
+
+/// Makes `active` the process's provider, prints its startup line (not in JSON mode,
+/// whose stderr carries JSON only) and returns its model.
+fn install_active(active: ActiveProvider) -> String {
+    if !JSON_OUTPUT.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("{}", active.startup_line());
+    }
     let model = active.model.clone();
     set_active_provider(active);
-    Ok(model)
+    model
 }
 
 fn activate(
@@ -571,14 +608,28 @@ fn load_catalog_checked(
             }
             let renewed = crate::auth::recover_invalid_session()?;
             if let Err(error) = crate::gateway_catalog::load(base, Some(renewed.token.expose())) {
-                eprintln!("warning: {error}");
+                warn(&error.to_string());
             }
             Ok(renewed)
         }
         Err(error) => {
-            eprintln!("warning: {error}; model limits fall back to built-in defaults");
+            warn(&format!(
+                "{error}; model limits fall back to built-in defaults"
+            ));
             Ok(credential)
         }
+    }
+}
+
+/// `warning: <message>` on stderr, or in JSON mode the same as a JSON line.
+fn warn(message: &str) {
+    if JSON_OUTPUT.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "{}",
+            serde_json::json!({ "type": "warning", "warning": format!("warning: {message}") })
+        );
+    } else {
+        eprintln!("warning: {message}");
     }
 }
 
@@ -596,29 +647,52 @@ fn azure_endpoint(
     )
 }
 
-/// Ambient Azure is used only when its daily quota is left and the endpoint
-/// answers.
+/// Ambient Azure is used only when it is configured, its daily quota is left and the
+/// endpoint answers. Says why when a configured Azure is skipped.
 fn azure_usable() -> bool {
-    let quota = crate::quota::QuotaState::load();
-    if quota.is_azure_exhausted() {
-        eprintln!(
-            "\x1b[33m\u{26a0}\x1b[0m Azure daily quota exhausted ({}) \u{2013} using fallback",
-            quota.display_compact()
-        );
-        return false;
-    }
     let (Some(key), Some(base)) = (
         non_empty_env("AZURE_OPENAI_API_KEY"),
         non_empty_env("AZURE_OPENAI_ENDPOINT"),
     ) else {
         return false;
     };
+    let quota = crate::quota::QuotaState::load();
+    if quota.is_azure_exhausted() {
+        warn_skipping_azure(&format!(
+            "Azure daily quota exhausted ({})",
+            quota.display_compact()
+        ));
+        return false;
+    }
     if azure_api_probe(&key, &base) {
         true
     } else {
-        eprintln!("\x1b[33m\u{26a0}\x1b[0m Azure unavailable \u{2013} using fallback");
+        warn_skipping_azure("Azure unavailable");
         false
     }
+}
+
+/// `--output-format json`: stderr carries only the JSON error, so notices that are
+/// not part of it are left out.
+static JSON_OUTPUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this run prints JSON (`--output-format json`).
+pub(crate) fn set_json_output(json: bool) {
+    JSON_OUTPUT.store(json, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `⚠ <why> – not using Azure`, yellow only on a terminal; nothing in JSON mode.
+fn warn_skipping_azure(why: &str) {
+    use std::io::IsTerminal as _;
+    if JSON_OUTPUT.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let sign = if std::io::stderr().is_terminal() {
+        "\x1b[33m\u{26a0}\x1b[0m"
+    } else {
+        "\u{26a0}"
+    };
+    eprintln!("{sign} {why} \u{2013} not using Azure");
 }
 
 /// Quick probe to check if the Azure endpoint is reachable.
@@ -670,6 +744,7 @@ pub fn active_provider_name(model: &str) -> String {
 
 pub fn format_connected_line(model: &str) -> String {
     let provider = active_provider_name(model);
+    let model = shown_model(model);
     format!("{GREEN}{BOLD}\u{2713}{R} {DIM}Connected:{R} {BLUE}{BOLD}{model}{R} {DIM}via{R} {ORANGE}{provider}{R}")
 }
 
@@ -703,6 +778,11 @@ mod tests {
             "openai/claude-sonnet-4-6"
         );
         assert_eq!(openai_model("openai/auto"), "openai/auto");
+        assert_eq!(
+            shown_model(&openai_model("groq/openai/gpt-oss-120b")),
+            "groq/openai/gpt-oss-120b"
+        );
+        assert_eq!(shown_model("claude-sonnet-4-6"), "claude-sonnet-4-6");
     }
 
     #[test]

@@ -128,6 +128,8 @@ class InstallShTests(unittest.TestCase):
             NEURON_DOWNLOAD_BASE=self.server.base_url,
             NEURON_RELEASES_API=f"{self.server.base_url}/repos/neuron/releases/latest",
             NEURON_INSTALL_DIR=shell_path(self.install_dir),
+            # The full-screen UI step has its own tests; NEURON_NO_TUI="" turns it on.
+            NEURON_NO_TUI="1",
         )
         environment.pop("NO_COLOR", None)
         if uname is not None:
@@ -191,6 +193,38 @@ class InstallShTests(unittest.TestCase):
                 self.assertEqual(self.installed().read_bytes(), posix_dummy(VERSION))
                 self.assertIn(f"neuron-dummy {VERSION}", self.run_installed("--version"))
                 self.assertEqual(sorted(entry.name for entry in self.install_dir.iterdir()), ["neuron"])
+
+    def test_installs_the_full_screen_ui_beside_neuron(self) -> None:
+        fake_release.stage_release(self.releases, VERSION, "neuron-linux-x64", posix_dummy(VERSION))
+        fake_release.stage_release(self.releases, VERSION, "neuron-tui-linux-x64", posix_dummy(VERSION))
+        result = self.run_installer(NEURON_VERSION=VERSION, NEURON_NO_TUI="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("installed", result.stderr)
+        self.assertEqual(sorted(entry.name for entry in self.install_dir.iterdir()), ["neuron", "neuron-tui"])
+        self.assertEqual(
+            self.server.paths(),
+            [
+                f"/v{VERSION}/neuron-linux-x64.sha256",
+                f"/v{VERSION}/neuron-linux-x64",
+                f"/v{VERSION}/neuron-tui-linux-x64.sha256",
+                f"/v{VERSION}/neuron-tui-linux-x64",
+            ],
+        )
+
+    def test_a_missing_or_bad_ui_still_installs_neuron(self) -> None:
+        fake_release.stage_release(self.releases, VERSION, "neuron-linux-x64", posix_dummy(VERSION))
+        missing = self.run_installer(NEURON_VERSION=VERSION, NEURON_NO_TUI="")
+        self.assertEqual(missing.returncode, 0, missing.stderr)
+        self.assertIn("full-screen UI was not installed", missing.stderr)
+        self.assertEqual(sorted(entry.name for entry in self.install_dir.iterdir()), ["neuron"])
+
+        fake_release.stage_release(
+            self.releases, VERSION, "neuron-tui-linux-x64", posix_dummy(VERSION), checksum="0" * 64 + "  neuron-tui-linux-x64\n"
+        )
+        bad = self.run_installer(NEURON_VERSION=VERSION, NEURON_NO_TUI="")
+        self.assertEqual(bad.returncode, 0, bad.stderr)
+        self.assertIn("checksum mismatch for neuron-tui-linux-x64", bad.stderr)
+        self.assertEqual(sorted(entry.name for entry in self.install_dir.iterdir()), ["neuron"])
 
     def test_command_line_options_override_the_environment(self) -> None:
         fake_release.stage_release(self.releases, VERSION, "neuron-linux-x64", posix_dummy(VERSION))
@@ -420,6 +454,8 @@ class InstallPs1Tests(unittest.TestCase):
             NEURON_DOWNLOAD_BASE=self.server.base_url,
             NEURON_RELEASES_API=f"{self.server.base_url}/repos/neuron/releases/latest",
             LOCALAPPDATA=str(self.root),
+            # The full-screen UI step has its own tests; NEURON_NO_TUI="" turns it on.
+            NEURON_NO_TUI="1",
         )
         environment.update(env)
         return environment
@@ -468,6 +504,26 @@ class InstallPs1Tests(unittest.TestCase):
                 output = subprocess.run([str(self.installed()), "--version"], capture_output=True, text=True, check=True)
                 self.assertIn(f"neuron-dummy {VERSION}", output.stdout)
         self.assertEqual(self.user_path(), before, "install.ps1 must not touch the user PATH without -AddToPath")
+
+    def test_installs_the_full_screen_ui_beside_neuron(self) -> None:
+        fake_release.stage_release(self.releases, VERSION, self.ASSET)
+        fake_release.stage_release(self.releases, VERSION, "neuron-tui-windows-x64.exe")
+        result = self.run_installer("-Version", VERSION, NEURON_NO_TUI="")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("neuron-tui.exe", result.stdout)
+        self.assertTrue((self.install_dir / "neuron-tui.exe").is_file())
+        self.assertEqual(
+            self.server.paths()[-2:],
+            [f"/v{VERSION}/neuron-tui-windows-x64.exe.sha256", f"/v{VERSION}/neuron-tui-windows-x64.exe"],
+        )
+
+    def test_a_missing_ui_still_installs_neuron(self) -> None:
+        fake_release.stage_release(self.releases, VERSION, self.ASSET)
+        result = self.run_installer("-Version", VERSION, NEURON_NO_TUI="")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("full-screen UI was not installed", result.stdout)
+        self.assertTrue(self.installed().is_file())
+        self.assertFalse((self.install_dir / "neuron-tui.exe").exists())
 
     def test_environment_variables_and_latest_release_lookup(self) -> None:
         for version in ("6.3.0", "6.4.1"):

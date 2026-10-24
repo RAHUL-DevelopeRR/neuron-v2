@@ -1,0 +1,713 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
+// chmod case is skipped on Windows. See ui/neuron-tui/PORTING.md.
+import { describe, test, expect, afterAll, beforeEach, afterEach } from 'bun:test'
+import * as fs from 'fs'
+import * as path from 'path'
+import * as os from 'os'
+
+import {
+  saveChatState,
+  loadMostRecentChatState,
+  setChatDirOverrideForTesting,
+  setLiveChatStateProvider,
+  clearLiveChatStateProvider,
+  flushLiveChatState,
+  scheduleCheckpointSave,
+  settleCheckpointSave,
+} from '../run-state-storage'
+import type { ChatMessage } from '../../types/chat'
+import type { RunState } from '../../types/agent-run'
+
+/** Every directory below hangs off a root this run owns. They were fixed
+ *  `os.tmpdir()/codebuff-test-*` paths that `beforeEach` deletes recursively,
+ *  so an overlapping run wiped the chat state this one was still writing (4 of
+ *  10 overlapped runs failed; solo always passed). Only the parent is unique —
+ *  the names below stay stable, which is what the assertions read. See
+ *  docs/testing.md. */
+const TEST_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-run-state-'))
+
+afterAll(() => {
+  fs.rmSync(TEST_ROOT, { recursive: true, force: true })
+})
+
+// Mock the project-files module
+const mockProjectDataDir = path.join(TEST_ROOT, 'neuron-tui-test-project')
+const mockCurrentChatDir = path.join(
+  mockProjectDataDir,
+  'chats',
+  'test-chat-123',
+)
+
+describe('run-state-storage', () => {
+  beforeEach(() => {
+    // Create test directories
+    if (fs.existsSync(mockProjectDataDir)) {
+      fs.rmSync(mockProjectDataDir, { recursive: true })
+    }
+    fs.mkdirSync(mockCurrentChatDir, { recursive: true })
+  })
+
+  afterEach(() => {
+    // Clean up test directories
+    if (fs.existsSync(mockProjectDataDir)) {
+      fs.rmSync(mockProjectDataDir, { recursive: true })
+    }
+  })
+
+  describe('file serialization format', () => {
+    test('run state JSON structure is preserved through serialization', () => {
+      const runState: RunState = {
+        output: {
+          type: 'error',
+          message: 'Test output',
+        },
+      } as unknown as RunState
+
+      const runStatePath = path.join(mockCurrentChatDir, 'run-state.json')
+      fs.writeFileSync(runStatePath, JSON.stringify(runState, null, 2))
+
+      const savedRunState = JSON.parse(fs.readFileSync(runStatePath, 'utf8'))
+      expect(savedRunState.output.type).toBe('error')
+      expect(savedRunState.output.message).toBe('Test output')
+    })
+
+    test('messages JSON structure is preserved through serialization', () => {
+      const messages: ChatMessage[] = [
+        {
+          id: 'msg-1',
+          variant: 'user',
+          content: 'Hello',
+          timestamp: new Date().toISOString(),
+          blocks: [{ type: 'text', content: 'Hello' }],
+        },
+      ]
+
+      const messagesPath = path.join(mockCurrentChatDir, 'chat-messages.json')
+      fs.writeFileSync(messagesPath, JSON.stringify(messages, null, 2))
+
+      const savedMessages = JSON.parse(fs.readFileSync(messagesPath, 'utf8'))
+      expect(savedMessages).toHaveLength(1)
+      expect(savedMessages[0].variant).toBe('user')
+    })
+
+    test('nested message structure is preserved through serialization', () => {
+      const messages: ChatMessage[] = [
+        {
+          id: 'msg-1',
+          variant: 'agent',
+          content: '',
+          timestamp: new Date().toISOString(),
+          blocks: [
+            {
+              type: 'agent',
+              agentId: 'nested-agent',
+              agentName: 'NestedAgent',
+              agentType: 'inline',
+              content: '',
+              status: 'complete',
+              blocks: [
+                { type: 'text', content: 'Nested content' },
+                {
+                  type: 'tool',
+                  toolCallId: 'tool-xyz',
+                  toolName: 'glob',
+                  input: {},
+                  output: '',
+                },
+              ],
+            },
+          ],
+        },
+      ]
+
+      const messagesPath = path.join(mockCurrentChatDir, 'chat-messages.json')
+      fs.writeFileSync(messagesPath, JSON.stringify(messages, null, 2))
+
+      const savedMessages = JSON.parse(fs.readFileSync(messagesPath, 'utf8'))
+      expect(savedMessages[0].blocks[0].type).toBe('agent')
+      expect(savedMessages[0].blocks[0].blocks).toHaveLength(2)
+    })
+  })
+})
+
+describe('live chat state provider', () => {
+  // Point persistence at a temp dir via the explicit test override — module
+  // seams (mock.module, HOME, spyOn on auth) are unreliable across bun test
+  // files and platforms.
+  const chatDir = path.join(TEST_ROOT, 'neuron-tui-test-live-chatdir')
+
+  const testRunState = (marker: string): RunState =>
+    ({
+      output: { type: 'error', message: marker },
+    }) as unknown as RunState
+
+  const testMessages = (marker: string): ChatMessage[] => [
+    {
+      id: 'msg-1',
+      variant: 'user',
+      content: marker,
+      timestamp: new Date().toISOString(),
+    },
+  ]
+
+  const readSavedMessages = () =>
+    JSON.parse(
+      fs.readFileSync(path.join(chatDir, 'chat-messages.json'), 'utf8'),
+    ) as ChatMessage[]
+
+  beforeEach(() => {
+    fs.rmSync(chatDir, { recursive: true, force: true })
+    setChatDirOverrideForTesting(chatDir)
+  })
+
+  afterEach(() => {
+    clearLiveChatStateProvider('run-a')
+    clearLiveChatStateProvider('run-b')
+    setChatDirOverrideForTesting(undefined)
+    fs.rmSync(chatDir, { recursive: true, force: true })
+  })
+
+  test('flushLiveChatState persists the provided state', () => {
+    setLiveChatStateProvider('run-a', () => ({
+      runState: testRunState('checkpoint'),
+      messages: testMessages('in-flight prompt'),
+    }))
+
+    flushLiveChatState()
+
+    expect(readSavedMessages()[0].content).toBe('in-flight prompt')
+  })
+
+  test('flushLiveChatState is a no-op with no provider registered', () => {
+    flushLiveChatState()
+
+    expect(fs.existsSync(path.join(chatDir, 'chat-messages.json'))).toBe(false)
+  })
+
+  test('clearLiveChatStateProvider stops flushing', () => {
+    setLiveChatStateProvider('run-a', () => ({
+      runState: testRunState('checkpoint'),
+      messages: testMessages('in-flight prompt'),
+    }))
+    clearLiveChatStateProvider('run-a')
+
+    flushLiveChatState()
+
+    expect(fs.existsSync(path.join(chatDir, 'chat-messages.json'))).toBe(false)
+  })
+
+  test('a stale run cannot clear a newer run provider', () => {
+    setLiveChatStateProvider('run-a', () => ({
+      runState: testRunState('old'),
+      messages: testMessages('old prompt'),
+    }))
+    setLiveChatStateProvider('run-b', () => ({
+      runState: testRunState('new'),
+      messages: testMessages('new prompt'),
+    }))
+
+    // The old run settling late must not remove the new run's provider.
+    clearLiveChatStateProvider('run-a')
+    flushLiveChatState()
+
+    expect(readSavedMessages()[0].content).toBe('new prompt')
+  })
+
+  test('flushLiveChatState swallows provider errors', () => {
+    setLiveChatStateProvider('run-a', () => {
+      throw new Error('boom')
+    })
+
+    expect(() => flushLiveChatState()).not.toThrow()
+  })
+})
+
+describe('atomic save and resilient load', () => {
+  const chatDir = path.join(TEST_ROOT, 'neuron-tui-test-resilient-chatdir')
+
+  const runState = { output: { type: 'error', message: 'x' } } as RunState
+  const messages: ChatMessage[] = [
+    {
+      id: 'msg-1',
+      variant: 'user',
+      content: 'the prompt',
+      timestamp: new Date().toISOString(),
+    },
+  ]
+
+  beforeEach(() => {
+    fs.rmSync(chatDir, { recursive: true, force: true })
+    setChatDirOverrideForTesting(chatDir)
+  })
+
+  afterEach(() => {
+    setChatDirOverrideForTesting(undefined)
+    fs.rmSync(chatDir, { recursive: true, force: true })
+  })
+
+  test('saveChatState leaves no .tmp files behind', () => {
+    saveChatState(runState, messages)
+
+    const leftovers = fs
+      .readdirSync(chatDir)
+      .filter((name) => name.endsWith('.tmp'))
+    expect(leftovers).toHaveLength(0)
+    expect(
+      JSON.parse(
+        fs.readFileSync(path.join(chatDir, 'chat-messages.json'), 'utf8'),
+      ),
+    ).toHaveLength(1)
+  })
+
+  test('torn run-state.json still restores the transcript', () => {
+    saveChatState(runState, messages)
+    fs.writeFileSync(
+      path.join(chatDir, 'run-state.json'),
+      '{"sessionState": {"trunc',
+    )
+
+    const loaded = loadMostRecentChatState()
+
+    expect(loaded).not.toBeNull()
+    expect(loaded!.messages[0].content).toBe('the prompt')
+    expect(loaded!.runState.output.type).toBe('error')
+  })
+
+  test('torn chat-messages.json still restores the run state', () => {
+    saveChatState(runState, messages)
+    fs.writeFileSync(path.join(chatDir, 'chat-messages.json'), '[{"id":')
+
+    const loaded = loadMostRecentChatState()
+
+    expect(loaded).not.toBeNull()
+    expect(loaded!.messages).toHaveLength(0)
+    expect((loaded!.runState.output as any).message).toBe('x')
+  })
+
+  test('returns null when both files are unreadable', () => {
+    saveChatState(runState, messages)
+    fs.writeFileSync(path.join(chatDir, 'run-state.json'), '{')
+    fs.writeFileSync(path.join(chatDir, 'chat-messages.json'), '[')
+
+    expect(loadMostRecentChatState()).toBeNull()
+  })
+})
+
+describe('scheduleCheckpointSave (async, coalescing)', () => {
+  const chatDir = path.join(TEST_ROOT, 'neuron-tui-test-checkpoint-chatdir')
+
+  const runState = (marker: string) =>
+    ({ output: { type: 'error', message: marker } }) as unknown as RunState
+
+  const messages = (marker: string): ChatMessage[] => [
+    {
+      id: 'msg-1',
+      variant: 'user',
+      content: marker,
+      timestamp: new Date().toISOString(),
+    },
+  ]
+
+  const readSavedMessages = () =>
+    JSON.parse(
+      fs.readFileSync(path.join(chatDir, 'chat-messages.json'), 'utf8'),
+    ) as ChatMessage[]
+
+  beforeEach(() => {
+    fs.rmSync(chatDir, { recursive: true, force: true })
+    setChatDirOverrideForTesting(chatDir)
+  })
+
+  afterEach(async () => {
+    await settleCheckpointSave()
+    setChatDirOverrideForTesting(undefined)
+    fs.rmSync(chatDir, { recursive: true, force: true })
+  })
+
+  test('persists the scheduled state after settling', async () => {
+    scheduleCheckpointSave(runState('a'), messages('first'))
+
+    await settleCheckpointSave()
+
+    expect(readSavedMessages()[0].content).toBe('first')
+  })
+
+  test('does not write synchronously (deferred off the calling tick)', () => {
+    scheduleCheckpointSave(runState('a'), messages('deferred'))
+
+    // Nothing on disk yet: the write is scheduled for a later tick.
+    expect(fs.existsSync(path.join(chatDir, 'chat-messages.json'))).toBe(false)
+  })
+
+  test('coalesces a burst to the latest state', async () => {
+    scheduleCheckpointSave(runState('a'), messages('one'))
+    scheduleCheckpointSave(runState('b'), messages('two'))
+    scheduleCheckpointSave(runState('c'), messages('three'))
+
+    await settleCheckpointSave()
+
+    // Whatever intermediate states were dropped, the newest wins.
+    expect(readSavedMessages()[0].content).toBe('three')
+  })
+
+  test('an authoritative save after settling is the last write (no clobber)', async () => {
+    scheduleCheckpointSave(runState('a'), messages('checkpoint'))
+    // settle waits for the queued async write to flush, so the synchronous
+    // final save below is guaranteed to land last.
+    await settleCheckpointSave()
+
+    saveChatState(runState('final'), messages('authoritative'))
+    // Give any lingering async write a chance to (incorrectly) land on top.
+    await new Promise((r) => setImmediate(r))
+    await settleCheckpointSave()
+
+    expect(readSavedMessages()[0].content).toBe('authoritative')
+  })
+
+  test('settleCheckpointSave is safe with nothing scheduled', async () => {
+    await expect(settleCheckpointSave()).resolves.toBeUndefined()
+  })
+})
+
+describe('chat switches while saves are pending', () => {
+  // Regression tests for /history threads being clobbered: save paths used to
+  // be resolved at write time from the mutable current chat id, so a pending
+  // write from chat A could land in chat B's directory after a /new or
+  // /history resume rotated the id in between.
+  const chatDirA = path.join(TEST_ROOT, 'neuron-tui-test-switch-chat-a')
+  const chatDirB = path.join(TEST_ROOT, 'neuron-tui-test-switch-chat-b')
+
+  const runState = (marker: string) =>
+    ({ output: { type: 'error', message: marker } }) as unknown as RunState
+
+  const messages = (marker: string): ChatMessage[] => [
+    {
+      id: 'msg-1',
+      variant: 'user',
+      content: marker,
+      timestamp: new Date().toISOString(),
+    },
+  ]
+
+  const messagesFileIn = (dir: string) => path.join(dir, 'chat-messages.json')
+
+  beforeEach(() => {
+    fs.rmSync(chatDirA, { recursive: true, force: true })
+    fs.rmSync(chatDirB, { recursive: true, force: true })
+    setChatDirOverrideForTesting(chatDirA)
+  })
+
+  afterEach(async () => {
+    await settleCheckpointSave()
+    clearLiveChatStateProvider('run-a')
+    setChatDirOverrideForTesting(undefined)
+    fs.rmSync(chatDirA, { recursive: true, force: true })
+    fs.rmSync(chatDirB, { recursive: true, force: true })
+  })
+
+  test('a checkpoint scheduled before a chat switch writes to the original chat dir', async () => {
+    scheduleCheckpointSave(runState('a'), messages('chat A transcript'))
+
+    // Simulate /new or a /history resume rotating the current chat while the
+    // async checkpoint write is still queued.
+    setChatDirOverrideForTesting(chatDirB)
+    await settleCheckpointSave()
+
+    const saved = JSON.parse(
+      fs.readFileSync(messagesFileIn(chatDirA), 'utf8'),
+    ) as ChatMessage[]
+    expect(saved[0].content).toBe('chat A transcript')
+    expect(fs.existsSync(messagesFileIn(chatDirB))).toBe(false)
+  })
+
+  test('checkpoints for different chats do not displace each other', async () => {
+    // Chat A's final flush is queued, then the newly-active chat B schedules
+    // its own checkpoint before the queue drains. Both must be written —
+    // coalescing is per chat, not global.
+    scheduleCheckpointSave(runState('a'), messages('chat A final'), chatDirA)
+    scheduleCheckpointSave(runState('b'), messages('chat B first'), chatDirB)
+
+    await settleCheckpointSave()
+
+    const savedA = JSON.parse(
+      fs.readFileSync(messagesFileIn(chatDirA), 'utf8'),
+    ) as ChatMessage[]
+    const savedB = JSON.parse(
+      fs.readFileSync(messagesFileIn(chatDirB), 'utf8'),
+    ) as ChatMessage[]
+    expect(savedA[0].content).toBe('chat A final')
+    expect(savedB[0].content).toBe('chat B first')
+  })
+
+  test('saveChatState with an explicit chatDir ignores a later chat switch', () => {
+    setChatDirOverrideForTesting(chatDirB)
+
+    // chatDirA was captured while chat A was current (run start).
+    saveChatState(runState('a'), messages('chat A final'), chatDirA)
+
+    const saved = JSON.parse(
+      fs.readFileSync(messagesFileIn(chatDirA), 'utf8'),
+    ) as ChatMessage[]
+    expect(saved[0].content).toBe('chat A final')
+    expect(fs.existsSync(messagesFileIn(chatDirB))).toBe(false)
+  })
+
+  test('flushLiveChatState after a chat switch writes nothing', () => {
+    setLiveChatStateProvider('run-a', () => ({
+      runState: runState('a'),
+      // After the switch the store holds the NEW chat's messages; flushing
+      // them into chat A's directory would replace A's transcript.
+      messages: messages('chat B messages'),
+    }))
+
+    setChatDirOverrideForTesting(chatDirB)
+    flushLiveChatState()
+
+    expect(fs.existsSync(messagesFileIn(chatDirA))).toBe(false)
+    expect(fs.existsSync(messagesFileIn(chatDirB))).toBe(false)
+  })
+
+  test('flushLiveChatState drains queued checkpoints synchronously on exit', () => {
+    // A chat switch aborted the run and queued its final checkpoint, then the
+    // process exits before the async drain runs. The exit flush must write
+    // the queued checkpoint (to chat A) even though the current chat is B.
+    scheduleCheckpointSave(runState('a'), messages('aborted turn'), chatDirA)
+    setChatDirOverrideForTesting(chatDirB)
+
+    flushLiveChatState()
+
+    const saved = JSON.parse(
+      fs.readFileSync(messagesFileIn(chatDirA), 'utf8'),
+    ) as ChatMessage[]
+    expect(saved[0].content).toBe('aborted turn')
+    expect(fs.existsSync(messagesFileIn(chatDirB))).toBe(false)
+  })
+
+  test('flushLiveChatState still writes to the run chat dir when unswitched', () => {
+    setLiveChatStateProvider('run-a', () => ({
+      runState: runState('a'),
+      messages: messages('in-flight prompt'),
+    }))
+
+    flushLiveChatState()
+
+    const saved = JSON.parse(
+      fs.readFileSync(messagesFileIn(chatDirA), 'utf8'),
+    ) as ChatMessage[]
+    expect(saved[0].content).toBe('in-flight prompt')
+  })
+})
+
+describe('poisoned payload persistence', () => {
+  const chatDir = path.join(TEST_ROOT, 'neuron-tui-test-poisoned-chatdir')
+
+  const messages: ChatMessage[] = [
+    {
+      id: 'msg-1',
+      variant: 'user',
+      content: 'the prompt',
+      timestamp: new Date().toISOString(),
+    },
+  ]
+
+  beforeEach(() => {
+    fs.rmSync(chatDir, { recursive: true, force: true })
+    fs.mkdirSync(chatDir, { recursive: true })
+    setChatDirOverrideForTesting(chatDir)
+  })
+
+  afterEach(() => {
+    setChatDirOverrideForTesting(undefined)
+    fs.rmSync(chatDir, { recursive: true, force: true })
+  })
+
+  test('cyclic run state still persists (cycles broken) alongside messages', () => {
+    const cyclicRunState: any = { output: { type: 'error', message: 'x' } }
+    cyclicRunState.self = cyclicRunState
+
+    saveChatState(cyclicRunState as RunState, messages)
+
+    const savedRunState = JSON.parse(
+      fs.readFileSync(path.join(chatDir, 'run-state.json'), 'utf8'),
+    )
+    expect(savedRunState.self).toBe('[Circular]')
+    expect(savedRunState.output.message).toBe('x')
+
+    const savedMessages = JSON.parse(
+      fs.readFileSync(path.join(chatDir, 'chat-messages.json'), 'utf8'),
+    ) as ChatMessage[]
+    expect(savedMessages[0].content).toBe('the prompt')
+  })
+
+  test('cyclic tool output in messages does not block the transcript save', () => {
+    const cyclicOutput: any = { status: 'ok' }
+    cyclicOutput.self = cyclicOutput
+    const poisonedMessages: ChatMessage[] = [
+      {
+        id: 'msg-1',
+        variant: 'agent',
+        content: '',
+        timestamp: new Date().toISOString(),
+        blocks: [
+          {
+            type: 'tool',
+            toolCallId: 'tc-1',
+            toolName: 'run_terminal_command' as any,
+            input: {},
+            outputRaw: cyclicOutput,
+          },
+        ],
+      },
+    ]
+
+    saveChatState(
+      { output: { type: 'error', message: 'x' } } as RunState,
+      poisonedMessages,
+    )
+
+    const savedMessages = JSON.parse(
+      fs.readFileSync(path.join(chatDir, 'chat-messages.json'), 'utf8'),
+    ) as ChatMessage[]
+    const block = savedMessages[0].blocks?.[0] as any
+    expect(block.outputRaw.self).toBe('[Circular]')
+  })
+})
+
+/**
+ * Support ticket #180: a user's session files were present but held the four
+ * bytes `null` — the whole transcript gone. Two independent paths produced
+ * that, and both of them are one-way doors unless the bytes are kept.
+ */
+describe('a transcript is never destroyed', () => {
+  const chatDir = path.join(TEST_ROOT, 'neuron-tui-test-nulled-chatdir')
+
+  const runState = { output: { type: 'error', message: 'x' } } as RunState
+  const messages: ChatMessage[] = [
+    {
+      id: 'msg-1',
+      variant: 'user',
+      content: 'the prompt',
+      timestamp: new Date().toISOString(),
+    },
+  ]
+
+  const messagesPath = () => path.join(chatDir, 'chat-messages.json')
+  const runStatePath = () => path.join(chatDir, 'run-state.json')
+  const quarantined = (file: string) =>
+    fs
+      .readdirSync(chatDir)
+      .filter((name) => name.startsWith(`${file}.corrupt-`))
+
+  beforeEach(() => {
+    fs.rmSync(chatDir, { recursive: true, force: true })
+    setChatDirOverrideForTesting(chatDir)
+  })
+
+  afterEach(() => {
+    setChatDirOverrideForTesting(undefined)
+    fs.rmSync(chatDir, { recursive: true, force: true })
+  })
+
+  test('saveChatState never writes the literal text null over a transcript', () => {
+    saveChatState(runState, messages)
+
+    // `JSON.stringify(null)` is the string 'null', which is truthy — so this
+    // used to sail through the save's own guard and replace the transcript
+    // with four bytes, no crash required.
+    saveChatState(runState, null as unknown as ChatMessage[], chatDir)
+
+    expect(fs.readFileSync(messagesPath(), 'utf8')).not.toBe('null')
+    expect(JSON.parse(fs.readFileSync(messagesPath(), 'utf8'))).toHaveLength(1)
+  })
+
+  test('saveChatState never writes the literal text null over a run state', () => {
+    saveChatState(runState, messages)
+
+    saveChatState(null as unknown as RunState, messages, chatDir)
+
+    expect(fs.readFileSync(runStatePath(), 'utf8')).not.toBe('null')
+    expect(
+      JSON.parse(fs.readFileSync(runStatePath(), 'utf8')).output.type,
+    ).toBe('error')
+  })
+
+  test('a null-content transcript survives the load instead of being replaced', () => {
+    saveChatState(runState, messages)
+    // Exactly what the user's machine was left holding.
+    fs.writeFileSync(messagesPath(), 'null')
+
+    const loaded = loadMostRecentChatState()
+
+    // Four bytes are not much, but they are the user's bytes: the load must
+    // not nod `null` through as "no messages" and let the next turn's save
+    // write an empty array over whatever is there.
+    expect(quarantined('chat-messages.json')).toHaveLength(1)
+    expect(
+      fs.readFileSync(
+        path.join(chatDir, quarantined('chat-messages.json')[0]),
+        'utf8',
+      ),
+    ).toBe('null')
+    expect(loaded!.messages).toHaveLength(0)
+  })
+
+  test('an unparseable transcript is kept, not replaced with an empty array', () => {
+    saveChatState(runState, messages)
+    // A half-flushed multi-MB write: the tail is missing, the head is the
+    // user's conversation and a human can still read it out.
+    const partial = '[{"id":"msg-1","variant":"user","content":"the prompt"'
+    fs.writeFileSync(messagesPath(), partial)
+
+    const loaded = loadMostRecentChatState()
+    // The next turn's save, which is what used to destroy it.
+    saveChatState(loaded!.runState, loaded!.messages, chatDir)
+
+    const aside = quarantined('chat-messages.json')
+    expect(aside).toHaveLength(1)
+    expect(fs.readFileSync(path.join(chatDir, aside[0]), 'utf8')).toBe(partial)
+  })
+
+  test('an unparseable run state is kept too', () => {
+    saveChatState(runState, messages)
+    fs.writeFileSync(runStatePath(), '{"sessionState": {"trunc')
+
+    const loaded = loadMostRecentChatState()
+
+    expect(quarantined('run-state.json')).toHaveLength(1)
+    expect(loaded!.messages[0].content).toBe('the prompt')
+  })
+
+  test('a transcript that is readable is never moved aside', () => {
+    saveChatState(runState, messages)
+
+    expect(loadMostRecentChatState()!.messages).toHaveLength(1)
+    expect(quarantined('chat-messages.json')).toHaveLength(0)
+    expect(quarantined('run-state.json')).toHaveLength(0)
+  })
+
+  test('a first load with no files on disk quarantines nothing', () => {
+    fs.mkdirSync(chatDir, { recursive: true })
+
+    expect(loadMostRecentChatState()).toBeNull()
+    expect(
+      fs.readdirSync(chatDir).filter((name) => name.includes('.corrupt-')),
+    ).toHaveLength(0)
+  })
+
+  // chmod does not make a directory read-only on Windows.
+  test.skipIf(process.platform === 'win32')('refuses to resume rather than hand back a state that would overwrite unreadable bytes', () => {
+    saveChatState(runState, messages)
+    // A file we can neither parse nor move aside (its directory is read-only,
+    // so the quarantine rename fails). A rename would still have *replaced*
+    // it, so resuming here is what destroys the transcript.
+    fs.writeFileSync(messagesPath(), '[{"id":')
+    fs.chmodSync(chatDir, 0o500)
+    try {
+      expect(loadMostRecentChatState()).toBeNull()
+    } finally {
+      fs.chmodSync(chatDir, 0o700)
+    }
+
+    expect(fs.readFileSync(messagesPath(), 'utf8')).toBe('[{"id":')
+  })
+})

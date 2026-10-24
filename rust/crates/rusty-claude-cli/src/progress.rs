@@ -177,7 +177,7 @@ impl InternalPromptProgressReporter {
             .lock()
             .expect("internal prompt progress output lock poisoned");
         let mut stdout = io::stdout();
-        let _ = writeln!(stdout, "{line}");
+        let _ = writeln!(stdout, "{}", crate::console::stdout_text(line));
         let _ = stdout.flush();
     }
 }
@@ -435,10 +435,10 @@ fn assemble_conversation_runtime(
     max_iterations_setting: Option<usize>,
 ) -> Result<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
 {
-    // Persist the model in session metadata so resumed sessions can report it.
-    if session.model.is_none() {
-        session.model = Some(model.clone());
-    }
+    // The model the session runs on, kept in its metadata so a resumed session reports
+    // it and continues on it. Stored as people see it: provider setup on resume adds the
+    // `openai/` routing prefix again where the transport needs it.
+    session.model = Some(crate::provider::shown_model(&model).to_string());
     let RuntimePluginState {
         feature_config,
         mut tool_registry,
@@ -569,10 +569,114 @@ struct SharedRuntimePluginState {
     tool_registry: GlobalToolRegistry,
     plugin_registry: PluginRegistry,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+    /// The MCP servers while they start in the background; `mcp_state` is a stand-in.
+    background_mcp: Option<BackgroundMcp>,
     max_iterations_setting: Option<usize>,
 }
 
+/// When the MCP servers start (see [`set_mcp_startup`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum McpStartup {
+    /// Before the first runtime: its tools include theirs.
+    Wait,
+    /// The same, without the bundled default servers: a one-shot prompt, which would
+    /// pay their start for tools it rarely uses.
+    WaitWithoutBundled,
+    /// On a thread of their own, so the engine and the REPL start at once; their tools
+    /// join the first turn after they started.
+    Background,
+}
+
+static MCP_STARTUP: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// How this process starts its MCP servers; [`McpStartup::Wait`] until set.
+pub(crate) fn set_mcp_startup(startup: McpStartup) {
+    let value = match startup {
+        McpStartup::Wait => 0,
+        McpStartup::WaitWithoutBundled => 1,
+        McpStartup::Background => 2,
+    };
+    MCP_STARTUP.store(value, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn mcp_startup() -> McpStartup {
+    match MCP_STARTUP.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => McpStartup::WaitWithoutBundled,
+        2 => McpStartup::Background,
+        _ => McpStartup::Wait,
+    }
+}
+
+/// The bundled MCP servers [`McpStartup::WaitWithoutBundled`] left out.
+static LEFT_OUT_BUNDLED_MCP: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Records the bundled MCP servers a one-shot run did not start, for ToolSearch to tell
+/// the model (it searched for their tools over and over).
+pub(crate) fn set_left_out_bundled_mcp_servers(servers: Vec<String>) {
+    *LEFT_OUT_BUNDLED_MCP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = servers;
+}
+
+/// The bundled MCP servers this run did not start; none outside one-shot runs.
+pub(crate) fn left_out_bundled_mcp_servers() -> Vec<String> {
+    LEFT_OUT_BUNDLED_MCP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+fn next_shared_plugin_generation() -> u64 {
+    SHARED_PLUGIN_GENERATION.with(|counter| {
+        counter.set(counter.get() + 1);
+        counter.get()
+    })
+}
+
 impl SharedRuntimePluginState {
+    /// Takes the MCP servers once they started in the background: they and their tools
+    /// replace the stand-in, so runtimes built before no longer count as current.
+    fn adopt_started_mcp(&mut self) {
+        let Some(finished) = self
+            .background_mcp
+            .as_ref()
+            .and_then(BackgroundMcp::take_finished)
+        else {
+            return;
+        };
+        self.background_mcp = None;
+        match finished {
+            Ok((state, tools)) => {
+                match self.tool_registry.clone().with_runtime_tools(tools) {
+                    Ok(registry) => self.tool_registry = registry,
+                    Err(error) => {
+                        runtime::ui_hooks::notice(&format!("warning: MCP tools left out: {error}"));
+                    }
+                }
+                if let Some(stand_in) = self.mcp_state.replace(Arc::new(Mutex::new(state))) {
+                    let _ = stand_in
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .shutdown();
+                }
+                self.generation = next_shared_plugin_generation();
+            }
+            Err(error) => {
+                if let Some(stand_in) = &self.mcp_state {
+                    let mut stand_in = stand_in
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    stand_in.starting = false;
+                    // Their tools never came: ToolSearch lists them as failed.
+                    stand_in.failed_servers = stand_in.server_names();
+                }
+                runtime::ui_hooks::notice(&format!(
+                    "warning: the MCP servers could not start: {error}"
+                ));
+            }
+        }
+    }
+
     fn handle(&self) -> SharedPluginStateHandle {
         SharedPluginStateHandle {
             generation: self.generation,
@@ -587,6 +691,9 @@ impl SharedRuntimePluginState {
     }
 
     fn shutdown(self) {
+        if let Some(background) = self.background_mcp {
+            background.stop();
+        }
         if let Err(error) = self.plugin_registry.shutdown() {
             runtime::ui_hooks::notice(&format!("warning: plugin shutdown failed: {error}"));
         }
@@ -629,6 +736,14 @@ fn shared_runtime_plugin_state_with(
     cwd: &Path,
     loader: &ConfigLoader,
 ) -> Result<SharedPluginStateHandle, Box<dyn std::error::Error>> {
+    shared_runtime_plugin_state_starting(cwd, loader, mcp_startup())
+}
+
+fn shared_runtime_plugin_state_starting(
+    cwd: &Path,
+    loader: &ConfigLoader,
+    startup: McpStartup,
+) -> Result<SharedPluginStateHandle, Box<dyn std::error::Error>> {
     let runtime_config = loader.load()?;
     let plugins = build_plugin_manager(cwd, loader, &runtime_config).plugin_registry()?;
     let key = SharedPluginStateKey {
@@ -638,25 +753,24 @@ fn shared_runtime_plugin_state_with(
         plugins,
     };
     SHARED_PLUGIN_STATE.with(|slot| {
-        if let Some(existing) = slot.borrow().as_ref().filter(|state| state.key == key) {
+        if let Some(existing) = slot.borrow_mut().as_mut().filter(|state| state.key == key) {
+            existing.adopt_started_mcp();
             return Ok(existing.handle());
         }
         if let Some(stale) = slot.borrow_mut().take() {
             stale.shutdown();
         }
-        let state = build_runtime_plugin_state_with_loader(cwd, loader, &runtime_config)?;
+        let (state, background_mcp) =
+            build_runtime_plugin_state_starting_mcp(cwd, loader, &runtime_config, startup)?;
         state.plugin_registry.initialize()?;
-        let generation = SHARED_PLUGIN_GENERATION.with(|counter| {
-            counter.set(counter.get() + 1);
-            counter.get()
-        });
         let shared = SharedRuntimePluginState {
             key,
-            generation,
+            generation: next_shared_plugin_generation(),
             feature_config: state.feature_config,
             tool_registry: state.tool_registry,
             plugin_registry: state.plugin_registry,
             mcp_state: state.mcp_state,
+            background_mcp,
             max_iterations_setting: max_iterations_setting(&runtime_config),
         };
         let handle = shared.handle();
@@ -683,10 +797,11 @@ pub(crate) fn runtime_uses_current_shared_state(runtime: &BuiltRuntime) -> bool 
         return true;
     }
     SHARED_PLUGIN_STATE.with(|slot| {
-        let slot = slot.borrow();
-        let Some(shared) = slot.as_ref() else {
+        let mut slot = slot.borrow_mut();
+        let Some(shared) = slot.as_mut() else {
             return false;
         };
+        shared.adopt_started_mcp();
         let same_mcp = match (&shared.mcp_state, &runtime.mcp_state) {
             (Some(current), Some(mine)) => Arc::ptr_eq(current, mine),
             (None, None) => true,
@@ -736,11 +851,109 @@ impl runtime::HookProgressReporter for CliHookProgressReporter {
 mod shared_state_tests {
     use super::{
         estimate_tool_schema_tokens, runtime_uses_current_shared_state,
-        shared_runtime_plugin_state_with, shutdown_shared_runtime_state,
+        shared_runtime_plugin_state_starting, shared_runtime_plugin_state_with,
+        shutdown_shared_runtime_state, McpStartup, SHARED_PLUGIN_STATE,
     };
     use runtime::ConfigLoader;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn mcp_servers_started_in_the_background_replace_the_stand_in_with_their_tools() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "neuron-background-mcp-{}-{nanos}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        let config_home = root.join("config");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::create_dir_all(&config_home).expect("config home");
+        let script_path = workspace.join("fixture-mcp.py");
+        crate::write_mcp_server_fixture(&script_path);
+        let (command, mut args) = if !cfg!(windows) {
+            ("python3", Vec::new())
+        } else if std::process::Command::new("py")
+            .arg("--version")
+            .output()
+            .is_ok()
+        {
+            ("py", vec!["-3".to_string()])
+        } else {
+            ("python", Vec::new())
+        };
+        args.push(script_path.to_string_lossy().into_owned());
+        fs::write(
+            config_home.join("settings.json"),
+            serde_json::json!({
+                "defaultMcpServers": false,
+                "mcpServers": {"alpha": {
+                    "command": command,
+                    "args": args,
+                    "env": {"NEURON_MCP_FRAMING": "content-length"}
+                }}
+            })
+            .to_string(),
+        )
+        .expect("settings");
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let names = |handle: &super::SharedPluginStateHandle| {
+            handle
+                .state
+                .tool_registry
+                .definitions(None)
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect::<Vec<_>>()
+        };
+
+        // MCP tools are deferred (found through ToolSearch), so they are not among the
+        // default definitions; the allow-list knows every tool.
+        let knows_echo = |handle: &super::SharedPluginStateHandle| {
+            handle
+                .state
+                .tool_registry
+                .normalize_allowed_tools(&["mcp__alpha__echo".to_string()])
+                .is_ok()
+        };
+
+        let first =
+            shared_runtime_plugin_state_starting(&workspace, &loader, McpStartup::Background)
+                .expect("builds without waiting for the servers");
+        assert!(!knows_echo(&first));
+        assert!(names(&first).contains(&"MCPTool".to_string()));
+        let stand_in = first.state.mcp_state.clone().expect("a stand-in state");
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let started = loop {
+            let next =
+                shared_runtime_plugin_state_starting(&workspace, &loader, McpStartup::Background)
+                    .expect("same configuration");
+            let current = next.state.mcp_state.clone().expect("mcp state");
+            if !Arc::ptr_eq(&current, &stand_in) {
+                break next;
+            }
+            assert!(Instant::now() < deadline, "the servers never joined");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(knows_echo(&started), "the started server's tools join");
+        assert!(
+            names(&started).contains(&"MCPTool".to_string()),
+            "the wrapper tools stay"
+        );
+        assert!(started.generation > first.generation);
+        assert!(SHARED_PLUGIN_STATE.with(|slot| slot
+            .borrow()
+            .as_ref()
+            .is_some_and(|state| state.background_mcp.is_none())));
+
+        shutdown_shared_runtime_state();
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn plugin_and_mcp_state_is_built_once_and_rebuilt_only_on_change_or_reload() {

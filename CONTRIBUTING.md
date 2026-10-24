@@ -15,7 +15,7 @@ deliver it.
 | `install.sh`, `install.ps1` | Release installers |
 | `tests/` | Python and Node tests for the packaging surfaces, plus the Python porting workspace tests |
 | `src/` | Python porting workspace inherited from Claw Code, used for parity tooling |
-| `ui/react-tui/` | Optional React/Ink terminal frontend |
+| `ui/neuron-tui/` | Full-screen terminal UI (Bun, OpenTUI, React), started by `neuron` on a terminal; see its README and PORTING.md |
 | `docs/` | Design and product documents; `docs/GATEWAY_CONTRACT.md` is the CLI and gateway contract |
 
 ### The `opencode` entry

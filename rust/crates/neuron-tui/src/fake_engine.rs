@@ -83,7 +83,9 @@ fn run(
                     message: "Interrupting".into(),
                 });
             }
-            EngineCommand::Slash { .. } | EngineCommand::SetModel { .. } => {}
+            EngineCommand::Slash { .. }
+            | EngineCommand::SetModel { .. }
+            | EngineCommand::ListModels => {}
         }
     }
     log
@@ -113,6 +115,7 @@ mod tests {
             },
             ask.clone(),
             UiEvent::ToolResult {
+                id: "toolu_1".into(),
                 name: "bash".into(),
                 output: "denied".into(),
                 is_error: true,

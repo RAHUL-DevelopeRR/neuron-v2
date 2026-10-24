@@ -17,7 +17,7 @@ use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRun
 use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
-use crate::session::{ContentBlock, ConversationMessage, Session};
+use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 use crate::transcript::{normalize_messages, normalized_messages};
 use crate::usage::{TokenUsage, UsageTracker};
 
@@ -29,6 +29,34 @@ pub const DEFAULT_MAX_ITERATIONS: usize = 50;
 pub const MAX_ITERATIONS_ENV_VAR: &str = "NEURON_MAX_ITERATIONS";
 /// Output recorded for tool calls that never ran because the user interrupted.
 pub const INTERRUPTED_TOOL_RESULT: &str = "Interrupted by user";
+/// Ends the assistant's reply of an interrupted turn in the transcript: after the
+/// partial answer, or alone when nothing was streamed yet. The next request then sees
+/// that the old one was cut short instead of an unanswered user message (and two
+/// user messages never follow each other). Models copied the note as their next
+/// answer, so model requests never show it (see [`request_messages`]).
+pub const INTERRUPTED_RESPONSE_NOTE: &str = "[response interrupted]";
+/// What a request shows instead of a lone [`INTERRUPTED_RESPONSE_NOTE`] that closes a
+/// turn which ran tools (that turn stays in the request): an out-of-band note, not
+/// something that reads like an answer.
+const INTERRUPTED_TURN_NOTE_FOR_MODEL: &str =
+    "(Note from Neuron, not a reply: the user interrupted this turn before an answer was written.)";
+/// The assistant's turn in a request, after a prompt the user stopped before the model
+/// wrote anything: it says what happened in the past tense, so the model neither takes
+/// the old prompt as still pending nor copies it as an answer.
+const STOPPED_PROMPT_REPLY_FOR_MODEL: &str = "(no answer: the user stopped this request)";
+/// Starts the assistant's turn in a request after a prompt that failed before the
+/// model wrote anything; a short form of the error follows.
+const FAILED_PROMPT_REPLY_PREFIX_FOR_MODEL: &str = "(no answer: this request failed: ";
+/// Longest error a request shows after [`FAILED_PROMPT_REPLY_PREFIX_FOR_MODEL`].
+const FAILED_PROMPT_REPLY_ERROR_MAX_CHARS: usize = 160;
+/// Ends a partial answer the user stopped, in a request, in place of the
+/// transcript's [`INTERRUPTED_RESPONSE_NOTE`].
+const STOPPED_ANSWER_NOTE_FOR_MODEL: &str = "(answer cut off: the user stopped this request)";
+/// Starts the assistant note that closes a failed turn in the transcript, for the
+/// same reason as [`INTERRUPTED_RESPONSE_NOTE`]; requests never show it either.
+pub const FAILED_RESPONSE_NOTE_PREFIX: &str = "[response failed: ";
+/// Longest error excerpt kept in a failed turn's note.
+const FAILED_RESPONSE_NOTE_MAX_CHARS: usize = 300;
 /// Identical consecutive tool calls tolerated before the loop guard warns.
 const LOOP_GUARD_THRESHOLD: usize = 3;
 const MIN_MANUAL_SUMMARY_TOKENS: usize = 800;
@@ -103,6 +131,18 @@ pub trait ToolExecutor {
     ) -> Result<String, ToolError> {
         self.execute(tool_name, input)
     }
+
+    /// Every tool call's final result, as the model will see it: one that ran, one that
+    /// was denied or blocked by a hook, and one that never started (interrupted, cut off
+    /// at the output limit, stopped by the loop guard). The default does nothing.
+    fn tool_call_finished(
+        &mut self,
+        _tool_use_id: &str,
+        _tool_name: &str,
+        _output: &str,
+        _is_error: bool,
+    ) {
+    }
 }
 
 /// Error returned when a tool invocation fails locally.
@@ -155,6 +195,7 @@ pub enum RuntimeErrorKind {
 pub struct RuntimeError {
     message: String,
     kind: RuntimeErrorKind,
+    partial_text: Option<String>,
 }
 
 impl RuntimeError {
@@ -168,7 +209,21 @@ impl RuntimeError {
         Self {
             message: message.into(),
             kind,
+            partial_text: None,
         }
+    }
+
+    /// The text the model had streamed before the request stopped (a cancelled
+    /// request): the runtime keeps it in the transcript.
+    #[must_use]
+    pub fn with_partial_text(mut self, text: impl Into<String>) -> Self {
+        self.partial_text = Some(text.into());
+        self
+    }
+
+    #[must_use]
+    pub fn partial_text(&self) -> Option<&str> {
+        self.partial_text.as_deref()
     }
 
     #[must_use]
@@ -396,6 +451,11 @@ where
     }
 
     #[must_use]
+    pub fn hook_abort_signal(&self) -> &HookAbortSignal {
+        &self.hook_abort_signal
+    }
+
+    #[must_use]
     pub fn with_hook_progress_reporter(
         mut self,
         hook_progress_reporter: Box<dyn HookProgressReporter>,
@@ -498,12 +558,14 @@ where
     /// skipped calls), and each message is appended to the session file as
     /// it is produced. Cancellation, the repeated-call guard and output
     /// truncation end the turn with `Ok` and a [`TurnOutcome`]; provider
-    /// failures and the iteration cap return `Err`.
-    #[allow(clippy::too_many_lines)]
+    /// failures and the iteration cap return `Err`. An interrupted or failed
+    /// turn still ends with an assistant message (the partial answer and
+    /// [`INTERRUPTED_RESPONSE_NOTE`], or a note about the failure), so the next
+    /// turn's request does not answer this one's prompt again.
     pub fn run_turn(
         &mut self,
         user_input: impl Into<String>,
-        mut prompter: Option<&mut dyn PermissionPrompter>,
+        prompter: Option<&mut dyn PermissionPrompter>,
     ) -> Result<TurnSummary, RuntimeError> {
         let user_input = user_input.into();
 
@@ -518,6 +580,20 @@ where
             .push_user_text(user_input)
             .map_err(session_error)?;
 
+        let result = self.run_turn_loop(prompter);
+        if let Err(error) = &result {
+            self.close_failed_turn(error);
+        }
+        result
+    }
+
+    /// The model and tool loop of [`Self::run_turn`], once the user message is
+    /// in the session.
+    #[allow(clippy::too_many_lines)]
+    fn run_turn_loop(
+        &mut self,
+        mut prompter: Option<&mut dyn PermissionPrompter>,
+    ) -> Result<TurnSummary, RuntimeError> {
         let mut progress = TurnProgress::default();
         let mut loop_guard = LoopGuard::new(LOOP_GUARD_THRESHOLD);
 
@@ -547,7 +623,7 @@ where
 
             let request = ApiRequest {
                 system_prompt: self.system_prompt.clone(),
-                messages: normalized_messages(&self.session.messages),
+                messages: request_messages(&self.session.messages),
             };
             let events = match self
                 .api_client
@@ -555,6 +631,17 @@ where
             {
                 Ok(events) => events,
                 Err(error) if error.is_cancelled() || self.cancel.is_cancelled() => {
+                    // What the user already saw stays in the transcript.
+                    if let Some(text) = error.partial_text().filter(|text| !text.trim().is_empty())
+                    {
+                        let partial = ConversationMessage::assistant(vec![ContentBlock::Text {
+                            text: format!("{}\n\n{INTERRUPTED_RESPONSE_NOTE}", text.trim_end()),
+                        }]);
+                        self.session
+                            .push_message(partial.clone())
+                            .map_err(session_error)?;
+                        progress.assistant_messages.push(partial);
+                    }
                     return Ok(self.finish_turn(
                         progress,
                         TurnOutcome::Cancelled {
@@ -835,6 +922,16 @@ where
             .push_message(result_message.clone())
             .map_err(session_error)?;
         self.record_tool_finished(iteration, &result_message);
+        if let Some(ContentBlock::ToolResult {
+            tool_use_id,
+            tool_name,
+            output,
+            is_error,
+        }) = result_message.blocks.first()
+        {
+            self.tool_executor
+                .tool_call_finished(tool_use_id, tool_name, output, *is_error);
+        }
         progress.tool_results.push(result_message);
         Ok(())
     }
@@ -895,6 +992,9 @@ where
     }
 
     fn finish_turn(&mut self, progress: TurnProgress, outcome: TurnOutcome) -> TurnSummary {
+        if matches!(outcome, TurnOutcome::Cancelled { .. }) {
+            self.close_turn_with_note(INTERRUPTED_RESPONSE_NOTE.to_string());
+        }
         let summary = TurnSummary {
             assistant_messages: progress.assistant_messages,
             tool_results: progress.tool_results,
@@ -910,6 +1010,40 @@ where
         };
         self.record_turn_completed(&summary);
         summary
+    }
+
+    /// Ends a failed turn with an assistant note naming the failure, unless the
+    /// model's own message already ends it.
+    fn close_failed_turn(&mut self, error: &RuntimeError) {
+        let reason = error.to_string();
+        let reason = reason.lines().next().unwrap_or_default().trim();
+        let mut excerpt = reason
+            .chars()
+            .take(FAILED_RESPONSE_NOTE_MAX_CHARS)
+            .collect::<String>();
+        if excerpt.len() < reason.len() {
+            excerpt.push('\u{2026}');
+        }
+        self.close_turn_with_note(format!("{FAILED_RESPONSE_NOTE_PREFIX}{excerpt}]"));
+    }
+
+    /// Appends `note` as the assistant's message when the transcript ends in a user
+    /// or tool message: an unanswered prompt would be answered again by the next
+    /// turn, and providers expect user and assistant messages to alternate. A
+    /// session write that fails here leaves the transcript as it was.
+    fn close_turn_with_note(&mut self, note: String) {
+        let ends_unanswered = self
+            .session
+            .messages
+            .last()
+            .is_some_and(|message| message.role != MessageRole::Assistant);
+        if ends_unanswered {
+            let _ = self
+                .session
+                .push_message(ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: note,
+                }]));
+        }
     }
 
     /// Compacts the session on request (`/compact`). The recent tail is kept
@@ -1206,6 +1340,158 @@ pub fn is_truncation_stop_reason(stop_reason: Option<&str>) -> bool {
             .iter()
             .any(|candidate| reason.eq_ignore_ascii_case(candidate))
     })
+}
+
+/// Whether `text` is a note the runtime wrote to close an interrupted or failed
+/// turn, not model output.
+#[must_use]
+pub fn is_turn_end_note(text: &str) -> bool {
+    text == INTERRUPTED_RESPONSE_NOTE
+        || (text.starts_with(FAILED_RESPONSE_NOTE_PREFIX) && text.ends_with(']'))
+}
+
+/// The transcript as the model sees it: [`normalized_messages`] without the notes that
+/// close interrupted and failed turns in the session ([`INTERRUPTED_RESPONSE_NOTE`],
+/// [`FAILED_RESPONSE_NOTE_PREFIX`]). Models took such an assistant note for an answer
+/// and repeated it for the next question, so none reaches the model as the assistant's
+/// words; the session keeps them all.
+///
+/// Every prompt stays a user message of its own, and nothing is added to what the
+/// user typed: models carried out a stopped request, or answered a failed one instead
+/// of the new question, when the old prompt and a note about it shared the new
+/// prompt's message.
+///
+/// - A prompt answered only by a note keeps its own user turn, answered by a short
+///   past-tense placeholder such as [`STOPPED_PROMPT_REPLY_FOR_MODEL`] (with a short
+///   form of the error, for a failure). "Write it in Rust instead" still knows what
+///   "it" is, and user and assistant messages keep alternating.
+/// - A lone note that closes a turn which ran tools becomes an out-of-band assistant
+///   note such as [`INTERRUPTED_TURN_NOTE_FOR_MODEL`]: a user message right after tool
+///   results is refused by some providers.
+/// - A partial answer ends with [`STOPPED_ANSWER_NOTE_FOR_MODEL`] instead of
+///   [`INTERRUPTED_RESPONSE_NOTE`].
+fn request_messages(messages: &[ConversationMessage]) -> Vec<ConversationMessage> {
+    let mut request: Vec<ConversationMessage> = Vec::with_capacity(messages.len());
+    for mut message in normalized_messages(messages) {
+        if let Some(note) = TurnEndNote::of(&message) {
+            // Right after the prompt: the model wrote nothing for it.
+            let text = if request.last().is_some_and(is_user_prompt) {
+                note.instead_of_answer()
+            } else {
+                note.after_tools()
+            };
+            request.push(ConversationMessage::assistant(vec![ContentBlock::Text {
+                text,
+            }]));
+            continue;
+        }
+        mark_stopped_answer(&mut message);
+        request.push(message);
+    }
+    request
+}
+
+/// How the runtime closed a turn the model wrote nothing for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TurnEndNote {
+    Interrupted,
+    /// The error excerpt the note names.
+    Failed(String),
+}
+
+impl TurnEndNote {
+    /// The note `message` consists of: an assistant message with nothing else.
+    fn of(message: &ConversationMessage) -> Option<Self> {
+        if message.role != MessageRole::Assistant {
+            return None;
+        }
+        let [ContentBlock::Text { text }] = message.blocks.as_slice() else {
+            return None;
+        };
+        let text = text.trim();
+        if text == INTERRUPTED_RESPONSE_NOTE {
+            return Some(Self::Interrupted);
+        }
+        text.strip_prefix(FAILED_RESPONSE_NOTE_PREFIX)
+            .and_then(|rest| rest.strip_suffix(']'))
+            .map(|reason| Self::Failed(reason.trim().to_string()))
+    }
+
+    /// The assistant's turn after the prompt the turn never answered.
+    fn instead_of_answer(&self) -> String {
+        match self {
+            Self::Interrupted => STOPPED_PROMPT_REPLY_FOR_MODEL.to_string(),
+            Self::Failed(reason) => format!(
+                "{FAILED_PROMPT_REPLY_PREFIX_FOR_MODEL}{})",
+                short_error(reason)
+            ),
+        }
+    }
+
+    /// Closes a turn that ran tools, in the assistant's turn: a note, not an answer.
+    fn after_tools(&self) -> String {
+        match self {
+            Self::Interrupted => INTERRUPTED_TURN_NOTE_FOR_MODEL.to_string(),
+            Self::Failed(reason) => format!(
+                "(Note from Neuron, not a reply: this turn failed before an answer was written. The error: {reason})"
+            ),
+        }
+    }
+}
+
+/// The part of a failed turn's error a request shows: up to the first `; ` (what
+/// follows is retry timing, links and request ids), at most
+/// [`FAILED_PROMPT_REPLY_ERROR_MAX_CHARS`] characters.
+fn short_error(reason: &str) -> String {
+    let reason = reason
+        .split("; ")
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_end_matches('\u{2026}')
+        .trim_end();
+    if reason.chars().count() <= FAILED_PROMPT_REPLY_ERROR_MAX_CHARS {
+        return reason.to_string();
+    }
+    let mut short = reason
+        .chars()
+        .take(FAILED_PROMPT_REPLY_ERROR_MAX_CHARS)
+        .collect::<String>();
+    // End on a word, not inside one.
+    if let Some(space) = short.rfind(' ') {
+        short.truncate(space);
+    }
+    format!("{}\u{2026}", short.trim_end())
+}
+
+/// Ends a partial answer the user stopped with [`STOPPED_ANSWER_NOTE_FOR_MODEL`] in
+/// place of [`INTERRUPTED_RESPONSE_NOTE`]. A lone note is left alone ([`TurnEndNote`]
+/// handles those).
+fn mark_stopped_answer(message: &mut ConversationMessage) {
+    if message.role != MessageRole::Assistant {
+        return;
+    }
+    let Some(ContentBlock::Text { text }) = message.blocks.last_mut() else {
+        return;
+    };
+    let Some(answer) = text.trim_end().strip_suffix(INTERRUPTED_RESPONSE_NOTE) else {
+        return;
+    };
+    let answer = answer.trim_end();
+    if answer.is_empty() {
+        return;
+    }
+    *text = format!("{answer}\n\n{STOPPED_ANSWER_NOTE_FOR_MODEL}");
+}
+
+/// A message the user typed: text only, no tool results.
+fn is_user_prompt(message: &ConversationMessage) -> bool {
+    message.role == MessageRole::User
+        && !message.blocks.is_empty()
+        && message
+            .blocks
+            .iter()
+            .all(|block| matches!(block, ContentBlock::Text { .. }))
 }
 
 fn is_complete_json(input: &str) -> bool {
@@ -2469,7 +2755,8 @@ mod resilience_tests {
     use super::{
         parse_max_iterations, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
         ConversationRuntime, RuntimeError, RuntimeErrorKind, StaticToolExecutor, ToolExecutor,
-        TurnOutcome, DEFAULT_MAX_ITERATIONS, INTERRUPTED_TOOL_RESULT, MAX_ITERATIONS_ENV_VAR,
+        TurnOutcome, DEFAULT_MAX_ITERATIONS, FAILED_RESPONSE_NOTE_PREFIX,
+        INTERRUPTED_RESPONSE_NOTE, INTERRUPTED_TOOL_RESULT, MAX_ITERATIONS_ENV_VAR,
     };
     use crate::cancel::CancellationToken;
     use crate::compact::AUTO_CONTINUE_PREFIX;
@@ -2614,6 +2901,97 @@ mod resilience_tests {
         );
     }
 
+    /// A UI closes each tool call's row from `tool_call_finished`: it hears calls that ran,
+    /// were denied, or never started.
+    #[test]
+    fn the_executor_hears_every_tool_calls_final_result() {
+        type Finished = Rc<RefCell<Vec<(String, String, String, bool)>>>;
+        struct Recording {
+            inner: StaticToolExecutor,
+            finished: Finished,
+        }
+        impl ToolExecutor for Recording {
+            fn execute(
+                &mut self,
+                tool_name: &str,
+                input: &str,
+            ) -> Result<String, super::ToolError> {
+                self.inner.execute(tool_name, input)
+            }
+            fn tool_call_finished(&mut self, id: &str, name: &str, output: &str, is_error: bool) {
+                self.finished.borrow_mut().push((
+                    id.to_string(),
+                    name.to_string(),
+                    output.to_string(),
+                    is_error,
+                ));
+            }
+        }
+        struct DenyOne;
+        impl PermissionPrompter for DenyOne {
+            fn decide(&mut self, request: &PermissionRequest) -> PermissionPromptDecision {
+                if request.tool_name == "denied" {
+                    PermissionPromptDecision::Deny {
+                        reason: "not this one".to_string(),
+                    }
+                } else {
+                    PermissionPromptDecision::Allow
+                }
+            }
+        }
+
+        let token = CancellationToken::new();
+        let cancel_from_tool = token.clone();
+        let api = ScriptedApi::new(vec![Ok(vec![
+            tool_call("1", "ran", "{}"),
+            tool_call("2", "denied", "{}"),
+            tool_call("3", "stops", "{}"),
+            tool_call("4", "never", "{}"),
+            AssistantEvent::MessageStop,
+        ])]);
+        let finished = Finished::default();
+        let tools = Recording {
+            inner: StaticToolExecutor::new()
+                .register("ran", |_| Ok("ok".to_string()))
+                .register("stops", move |_| {
+                    cancel_from_tool.cancel();
+                    Ok("stopped".to_string())
+                })
+                .register("never", |_| panic!("cancelled tools must not run")),
+            finished: Rc::clone(&finished),
+        };
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            api,
+            tools,
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .with_cancellation_token(token);
+
+        runtime
+            .run_turn("go", Some(&mut DenyOne))
+            .expect("cancellation is not an error");
+
+        let row = |id: &str, name: &str, output: &str, is_error| {
+            (
+                id.to_string(),
+                name.to_string(),
+                output.to_string(),
+                is_error,
+            )
+        };
+        assert_eq!(
+            *finished.borrow(),
+            vec![
+                row("1", "ran", "ok", false),
+                row("2", "denied", "not this one", true),
+                row("3", "stops", "stopped", false),
+                row("4", "never", INTERRUPTED_TOOL_RESULT, true),
+            ]
+        );
+    }
+
     #[test]
     fn cancellation_during_model_call_returns_to_prompt_and_next_turn_works() {
         let token = CancellationToken::new();
@@ -2642,13 +3020,530 @@ mod resilience_tests {
                 interrupted_tool_calls: 0
             }
         );
-        assert_eq!(runtime.session().messages.len(), 1);
+        // Nothing was streamed: the note alone answers the interrupted prompt.
+        assert_eq!(
+            roles_and_texts(runtime.session()),
+            vec![
+                (MessageRole::User, "slow question".to_string()),
+                (
+                    MessageRole::Assistant,
+                    INTERRUPTED_RESPONSE_NOTE.to_string()
+                ),
+            ]
+        );
+        assert!(cancelled.assistant_messages.is_empty(), "no model output");
 
         // The REPL installs a fresh token for the next turn.
         runtime.set_cancellation_token(CancellationToken::new());
         let next = runtime.run_turn("try again", None).expect("next turn runs");
         assert_eq!(next.outcome, TurnOutcome::Completed);
-        assert_eq!(runtime.session().messages.len(), 3);
+        assert_eq!(runtime.session().messages.len(), 4);
+        // The model never sees the lone note (it repeated it as its next answer), but it
+        // still sees the interrupted prompt as a turn of its own, answered by a
+        // placeholder; the new prompt is a message of its own.
+        let next_request = &runtime.api_client().requests[1].messages;
+        assert_eq!(
+            next_request,
+            &vec![
+                ConversationMessage::user_text("slow question"),
+                assistant_text(super::STOPPED_PROMPT_REPLY_FOR_MODEL),
+                ConversationMessage::user_text("try again"),
+            ]
+        );
+        assert_alternates(next_request);
+        assert_no_turn_end_markers(next_request);
+    }
+
+    fn assistant_text(text: &str) -> ConversationMessage {
+        ConversationMessage::assistant(vec![ContentBlock::Text {
+            text: text.to_string(),
+        }])
+    }
+
+    /// A refinement after an interrupt ("write it in Rust instead") must still see the
+    /// request it refines, as the user's earlier turn.
+    #[test]
+    fn a_refinement_after_an_interrupt_keeps_the_first_prompt_as_a_prior_user_turn() {
+        let token = CancellationToken::new();
+        let cancel_from_api = token.clone();
+        let mut api = ScriptedApi::new(vec![
+            Err(RuntimeError::with_kind(
+                RuntimeErrorKind::Cancelled,
+                "request cancelled",
+            )),
+            Ok(vec![
+                text("fn frobnicate_widget(s: &str) -> String { s.chars().rev().collect() }"),
+                AssistantEvent::MessageStop,
+            ]),
+        ]);
+        api.on_call = Some(Box::new(move |call| {
+            if call == 1 {
+                cancel_from_api.cancel();
+            }
+        }));
+        let mut runtime = runtime_with(Session::new(), api, StaticToolExecutor::new())
+            .with_cancellation_token(token);
+        let first = "Write a Python function named frobnicate_widget that returns its string argument reversed.";
+        let refinement = "Actually, write it in Rust instead.";
+
+        runtime.run_turn(first, None).expect("not an error");
+        runtime.set_cancellation_token(CancellationToken::new());
+        runtime.run_turn(refinement, None).expect("next turn runs");
+
+        let next_request = &runtime.api_client().requests[1].messages;
+        assert_eq!(
+            next_request,
+            &vec![
+                ConversationMessage::user_text(first),
+                assistant_text(super::STOPPED_PROMPT_REPLY_FOR_MODEL),
+                ConversationMessage::user_text(refinement),
+            ]
+        );
+        assert_alternates(next_request);
+        assert_no_turn_end_markers(next_request);
+        // The session file keeps the runtime's own note.
+        assert_eq!(
+            roles_and_texts(runtime.session())[1],
+            (
+                MessageRole::Assistant,
+                INTERRUPTED_RESPONSE_NOTE.to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn requests_keep_each_stopped_prompt_as_its_own_turn() {
+        let note = || assistant_text(INTERRUPTED_RESPONSE_NOTE);
+        let stopped = super::STOPPED_PROMPT_REPLY_FOR_MODEL;
+        let partial = format!("Step one\n\n{INTERRUPTED_RESPONSE_NOTE}");
+        let messages = vec![
+            ConversationMessage::user_text("first, interrupted"),
+            note(),
+            ConversationMessage::user_text("second, interrupted too"),
+            note(),
+            ConversationMessage::user_text("third"),
+            assistant_text("three"),
+            ConversationMessage::user_text("fourth, cut short"),
+            assistant_text(&partial),
+            ConversationMessage::user_text("fifth"),
+        ];
+
+        let request = super::request_messages(&messages);
+
+        assert_eq!(
+            request,
+            vec![
+                ConversationMessage::user_text("first, interrupted"),
+                assistant_text(stopped),
+                ConversationMessage::user_text("second, interrupted too"),
+                assistant_text(stopped),
+                ConversationMessage::user_text("third"),
+                assistant_text("three"),
+                ConversationMessage::user_text("fourth, cut short"),
+                assistant_text(&format!(
+                    "Step one\n\n{}",
+                    super::STOPPED_ANSWER_NOTE_FOR_MODEL
+                )),
+                ConversationMessage::user_text("fifth"),
+            ]
+        );
+        assert_alternates(&request);
+        assert_no_turn_end_markers(&request);
+        // After a compaction summary too.
+        let summary = ConversationMessage {
+            role: MessageRole::System,
+            blocks: vec![ContentBlock::Text {
+                text: "summary".to_string(),
+            }],
+            usage: None,
+        };
+        let compacted = vec![
+            summary.clone(),
+            ConversationMessage::user_text("interrupted"),
+            note(),
+            ConversationMessage::user_text("next"),
+        ];
+        assert_eq!(
+            super::request_messages(&compacted),
+            vec![
+                summary,
+                ConversationMessage::user_text("interrupted"),
+                assistant_text(stopped),
+                ConversationMessage::user_text("next"),
+            ]
+        );
+    }
+
+    /// Every shape a session can close a turn with, then a new prompt: no request puts
+    /// a note in a user message or shows the session's own markers.
+    #[test]
+    fn no_request_puts_a_note_in_a_user_message() {
+        let tool_use = |id: &str| {
+            ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                id: id.to_string(),
+                name: "bash".to_string(),
+                input: "{}".to_string(),
+            }])
+        };
+        let failed = format!(
+            "{FAILED_RESPONSE_NOTE_PREFIX}api failed after 3 attempts: Shared free capacity is exhausted right now. (capacity_exhausted); retry in 3h 44m; request req_1]"
+        );
+        let messages = vec![
+            ConversationMessage::user_text("Create cancelled.txt containing hello."),
+            assistant_text(INTERRUPTED_RESPONSE_NOTE),
+            ConversationMessage::user_text("What is 17 multiplied by 3?"),
+            assistant_text(&failed),
+            ConversationMessage::user_text("explain"),
+            assistant_text(&format!("Partly\n\n{INTERRUPTED_RESPONSE_NOTE}")),
+            ConversationMessage::user_text("run it"),
+            tool_use("a"),
+            ConversationMessage::tool_result("a", "bash", INTERRUPTED_TOOL_RESULT, true),
+            assistant_text(INTERRUPTED_RESPONSE_NOTE),
+            ConversationMessage::user_text("run it again"),
+            tool_use("b"),
+            ConversationMessage::tool_result("b", "bash", "ok", false),
+            assistant_text(&failed),
+            ConversationMessage::user_text("Unrelated: what is the capital of Japan?"),
+        ];
+
+        let request = super::request_messages(&messages);
+
+        assert_alternates(&request);
+        assert_no_turn_end_markers(&request);
+        assert_eq!(
+            request.last(),
+            Some(&ConversationMessage::user_text(
+                "Unrelated: what is the capital of Japan?"
+            ))
+        );
+        assert_eq!(
+            request[3],
+            assistant_text(
+                "(no answer: this request failed: api failed after 3 attempts: Shared free capacity is exhausted right now. (capacity_exhausted))"
+            )
+        );
+        // Every prompt is a user message of its own, as typed.
+        let prompts = request
+            .iter()
+            .filter(|message| super::is_user_prompt(message))
+            .cloned()
+            .collect::<Vec<_>>();
+        let typed = messages
+            .iter()
+            .filter(|message| super::is_user_prompt(message))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(prompts, typed);
+    }
+
+    #[test]
+    fn a_failed_turns_error_is_shortened_for_the_model() {
+        assert_eq!(
+            super::short_error(
+                "Shared free capacity is exhausted right now. (capacity_exhausted); retry in 3h 44m; upgrade: https://zero-x.live/pricing"
+            ),
+            "Shared free capacity is exhausted right now. (capacity_exhausted)"
+        );
+        let long = "word ".repeat(100);
+        let short = super::short_error(&long);
+        assert!(short.ends_with("word\u{2026}"), "{short}");
+        assert!(
+            short.chars().count() <= super::FAILED_PROMPT_REPLY_ERROR_MAX_CHARS + 1,
+            "{short}"
+        );
+        // The session's own excerpt mark is not doubled.
+        assert_eq!(
+            super::short_error("upstream failed\u{2026}"),
+            "upstream failed"
+        );
+    }
+
+    /// No message in `request` carries a note the runtime wrote to close a turn (models
+    /// repeat those as their own answer), and no user message carries a note from
+    /// Neuron: the user's messages hold what the user typed.
+    fn assert_no_turn_end_markers(request: &[ConversationMessage]) {
+        for message in request {
+            for block in &message.blocks {
+                if let ContentBlock::Text { text } = block {
+                    assert!(
+                        !text.contains(INTERRUPTED_RESPONSE_NOTE)
+                            && !text.contains(FAILED_RESPONSE_NOTE_PREFIX),
+                        "{request:?}"
+                    );
+                    assert!(
+                        message.role != MessageRole::User || !text.contains("Note from Neuron"),
+                        "{request:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_interrupted_turn_that_ran_tools_ends_with_an_out_of_band_note() {
+        let token = CancellationToken::new();
+        let cancel_from_tool = token.clone();
+        let api = ScriptedApi::new(vec![
+            Ok(vec![
+                tool_call("a", "slow", "{}"),
+                AssistantEvent::MessageStop,
+            ]),
+            Ok(vec![text("4"), AssistantEvent::MessageStop]),
+        ]);
+        let tools = StaticToolExecutor::new().register("slow", move |_| {
+            cancel_from_tool.cancel();
+            Ok("stopped early".to_string())
+        });
+        let mut runtime = runtime_with(Session::new(), api, tools).with_cancellation_token(token);
+
+        let cancelled = runtime.run_turn("run it", None).expect("not an error");
+        assert!(matches!(cancelled.outcome, TurnOutcome::Cancelled { .. }));
+        // The session keeps the runtime's note; the summary has no answer text.
+        let last = runtime.session().messages.last().expect("messages");
+        assert!(matches!(
+            last.blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == INTERRUPTED_RESPONSE_NOTE
+        ));
+        assert!(cancelled.assistant_messages.iter().all(|message| message
+            .blocks
+            .iter()
+            .all(|block| !matches!(block, ContentBlock::Text { .. }))));
+
+        runtime.set_cancellation_token(CancellationToken::new());
+        runtime
+            .run_turn("what is 2 plus 2?", None)
+            .expect("next turn runs");
+        let next_request = &runtime.api_client().requests[1].messages;
+        // The tool call ran, so the turn stays; its close reads as a note, not an answer.
+        assert_eq!(next_request.len(), 5, "{next_request:?}");
+        assert_eq!(next_request[0], ConversationMessage::user_text("run it"));
+        assert!(matches!(
+            next_request[3].blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == super::INTERRUPTED_TURN_NOTE_FOR_MODEL
+        ));
+        assert!(!next_request.iter().any(|message| message
+            .blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Text { text } if text.contains(INTERRUPTED_RESPONSE_NOTE)))));
+        assert_eq!(next_request[4].role, MessageRole::User);
+    }
+
+    /// (role, text) of every message with text.
+    fn roles_and_texts(session: &Session) -> Vec<(MessageRole, String)> {
+        session
+            .messages
+            .iter()
+            .filter_map(|message| {
+                let text = message
+                    .blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>();
+                (!text.is_empty()).then_some((message.role, text))
+            })
+            .collect()
+    }
+
+    /// No two user prompts follow each other without an assistant reply between them
+    /// (tool results are on the user's side).
+    fn assert_alternates(messages: &[ConversationMessage]) {
+        let prompts = messages
+            .iter()
+            .filter_map(|message| match message.role {
+                MessageRole::User | MessageRole::Tool => Some(MessageRole::User),
+                MessageRole::Assistant => Some(MessageRole::Assistant),
+                MessageRole::System => None,
+            })
+            .collect::<Vec<_>>();
+        for pair in prompts.windows(2) {
+            assert_ne!(pair[0], pair[1], "{messages:?}");
+        }
+    }
+
+    #[test]
+    fn an_interrupted_stream_keeps_the_partial_answer_for_the_next_turn() {
+        let token = CancellationToken::new();
+        let cancel_from_api = token.clone();
+        let mut api = ScriptedApi::new(vec![
+            Err(
+                RuntimeError::with_kind(RuntimeErrorKind::Cancelled, "request cancelled")
+                    .with_partial_text("Step one: open the file. Step"),
+            ),
+            Ok(vec![text("done"), AssistantEvent::MessageStop]),
+        ]);
+        api.on_call = Some(Box::new(move |call| {
+            if call == 1 {
+                cancel_from_api.cancel();
+            }
+        }));
+        let path = temp_session_path("partial");
+        let session = Session::new().with_persistence_path(path.clone());
+        let mut runtime =
+            runtime_with(session, api, StaticToolExecutor::new()).with_cancellation_token(token);
+
+        let cancelled = runtime.run_turn("explain", None).expect("not an error");
+
+        let kept = format!("Step one: open the file. Step\n\n{INTERRUPTED_RESPONSE_NOTE}");
+        assert_eq!(
+            roles_and_texts(runtime.session()),
+            vec![
+                (MessageRole::User, "explain".to_string()),
+                (MessageRole::Assistant, kept.clone()),
+            ]
+        );
+        assert_eq!(cancelled.assistant_messages.len(), 1);
+        let restored = Session::load_from_path(&path).expect("persisted session reloads");
+        std::fs::remove_file(&path).expect("cleanup");
+        assert_eq!(restored.messages, runtime.session().messages);
+
+        runtime.set_cancellation_token(CancellationToken::new());
+        runtime.run_turn("go on", None).expect("next turn runs");
+        // The partial answer reaches the model ending with a short past-tense note
+        // instead of the session's marker; the next prompt is as typed.
+        let next_request = &runtime.api_client().requests[1].messages;
+        assert_eq!(
+            next_request,
+            &vec![
+                ConversationMessage::user_text("explain"),
+                assistant_text(&format!(
+                    "Step one: open the file. Step\n\n{}",
+                    super::STOPPED_ANSWER_NOTE_FOR_MODEL
+                )),
+                ConversationMessage::user_text("go on"),
+            ]
+        );
+        assert_alternates(next_request);
+        assert_no_turn_end_markers(next_request);
+    }
+
+    #[test]
+    fn a_turn_that_fails_before_any_output_does_not_leave_its_prompt_unanswered() {
+        let api = ScriptedApi::new(vec![
+            Err(RuntimeError::new("gateway returned 503\nretry later")),
+            Ok(vec![text("hello"), AssistantEvent::MessageStop]),
+        ]);
+        let mut runtime = runtime_with(Session::new(), api, StaticToolExecutor::new());
+
+        runtime
+            .run_turn("first request", None)
+            .expect_err("the provider failed");
+
+        let messages = roles_and_texts(runtime.session());
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_eq!(messages[1].0, MessageRole::Assistant);
+        assert_eq!(
+            messages[1].1,
+            format!("{FAILED_RESPONSE_NOTE_PREFIX}gateway returned 503]")
+        );
+        assert!(super::is_turn_end_note(&messages[1].1));
+
+        runtime
+            .run_turn("second request", None)
+            .expect("next turn runs");
+        let next_request = &runtime.api_client().requests[1].messages;
+        assert_alternates(next_request);
+        assert_no_turn_end_markers(next_request);
+    }
+
+    /// After a failure (the gateway's capacity ran out, say) and a switch to another
+    /// model, the next model must not repeat the failure note as its answer, must
+    /// answer the new, unrelated question rather than the failed one, and "try again"
+    /// must still know what to try.
+    #[test]
+    fn an_unrelated_question_after_a_failure_is_its_own_last_user_message() {
+        let api = ScriptedApi::new(vec![
+            Err(RuntimeError::new(
+                "Shared free capacity is exhausted right now. (capacity_exhausted); retry in 3h 44m; upgrade: https://zero-x.live/pricing",
+            )),
+            Ok(vec![text("Tokyo"), AssistantEvent::MessageStop]),
+        ]);
+        let mut runtime = runtime_with(Session::new(), api, StaticToolExecutor::new());
+        runtime
+            .run_turn("Write an essay on the Byzantine Empire.", None)
+            .expect_err("the provider failed");
+
+        runtime
+            .run_turn("What is the capital of Japan?", None)
+            .expect("next turn runs");
+
+        let next_request = &runtime.api_client().requests[1].messages;
+        assert_eq!(
+            next_request,
+            &vec![
+                ConversationMessage::user_text("Write an essay on the Byzantine Empire."),
+                assistant_text(
+                    "(no answer: this request failed: Shared free capacity is exhausted right now. (capacity_exhausted))"
+                ),
+                ConversationMessage::user_text("What is the capital of Japan?"),
+            ]
+        );
+        assert_alternates(next_request);
+        assert_no_turn_end_markers(next_request);
+        // The session keeps the note, for the transcript and resume.
+        assert!(runtime.session().messages.iter().any(|message| {
+            message.role == MessageRole::Assistant
+                && matches!(message.blocks.as_slice(), [ContentBlock::Text { text }] if text.starts_with(FAILED_RESPONSE_NOTE_PREFIX))
+        }));
+    }
+
+    #[test]
+    fn a_failure_after_tool_results_reaches_the_model_as_an_out_of_band_note() {
+        let messages = vec![
+            ConversationMessage::user_text("run it"),
+            ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "a".to_string(),
+                name: "echo".to_string(),
+                input: "{}".to_string(),
+            }]),
+            ConversationMessage::tool_result("a", "echo", "ok", false),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: format!("{FAILED_RESPONSE_NOTE_PREFIX}upstream failed]"),
+            }]),
+            ConversationMessage::user_text("try again"),
+        ];
+
+        let request = super::request_messages(&messages);
+
+        assert_eq!(request.len(), 5, "{request:?}");
+        assert_eq!(
+            request[3],
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "(Note from Neuron, not a reply: this turn failed before an answer was written. The error: upstream failed)".to_string(),
+            }])
+        );
+        assert_eq!(request[4], ConversationMessage::user_text("try again"));
+        assert_no_turn_end_markers(&request);
+    }
+
+    #[test]
+    fn a_turn_that_fails_after_tool_results_ends_with_the_failure_note() {
+        let api = ScriptedApi::new(vec![
+            Ok(vec![
+                tool_call("a", "echo", "{}"),
+                AssistantEvent::MessageStop,
+            ]),
+            Err(RuntimeError::new("upstream failed")),
+        ]);
+        let tools = StaticToolExecutor::new().register("echo", |_| Ok("ok".to_string()));
+        let mut runtime = runtime_with(Session::new(), api, tools);
+
+        runtime
+            .run_turn("run it", None)
+            .expect_err("second call fails");
+
+        let last = runtime.session().messages.last().expect("messages");
+        assert_eq!(last.role, MessageRole::Assistant);
+        assert!(matches!(
+            last.blocks.as_slice(),
+            [ContentBlock::Text { text }] if text.starts_with(FAILED_RESPONSE_NOTE_PREFIX)
+        ));
+        assert_eq!(
+            unanswered_tool_use_ids(&runtime.session().messages),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

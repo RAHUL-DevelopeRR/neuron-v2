@@ -755,6 +755,30 @@ fn neuron_usage_renders_the_account_from_the_gateway() {
     let output = run(upgrade, None);
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(stdout(&output).contains("https://example.test/plans"));
+
+    // Both answer `--output-format json` like the other commands.
+    let mut usage = workspace.command(&gateway);
+    usage
+        .env("NEURON_TOKEN", SESSION_TOKEN)
+        .args(["--output-format", "json", "usage"]);
+    let output = run(usage, None);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("JSON usage");
+    assert_eq!(report["type"], "usage");
+    assert_eq!(report["account"]["email"], "dev@example.com");
+    assert_eq!(report["account"]["requests_today"], 42);
+    assert!(!stdout(&output).contains(SESSION_TOKEN));
+
+    let mut upgrade = workspace.command(&gateway);
+    upgrade
+        .env("NEURON_PRICING_URL", "https://example.test/plans")
+        .args(["upgrade", "--no-browser", "--output-format=json"]);
+    let output = run(upgrade, None);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("JSON upgrade");
+    assert_eq!(report["type"], "upgrade");
+    assert_eq!(report["url"], "https://example.test/plans");
+    assert_eq!(report["opened"], false);
 }
 
 #[test]
@@ -880,7 +904,7 @@ fn auth_login_with_token_status_and_logout_lifecycle() {
     let credentials = workspace.neuron_home().join("credentials.json");
 
     let mut login = workspace.command(&gateway);
-    login.args(["auth", "login", "--with-token"]);
+    login.args(["auth", "login", "--with-token", "--output-format", "json"]);
     let output = run(login, Some(&format!("{SESSION_TOKEN}\n")));
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(
@@ -888,6 +912,10 @@ fn auth_login_with_token_status_and_logout_lifecycle() {
         "{}",
         stderr(&output)
     );
+    let report: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("JSON login");
+    assert_eq!(report["type"], "login");
+    assert_eq!(report["plan"], "free");
+    assert!(!stdout(&output).contains(SESSION_TOKEN));
     let stored: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&credentials).unwrap()).unwrap();
     assert_eq!(stored["token"], SESSION_TOKEN);
@@ -917,6 +945,18 @@ fn auth_login_with_token_status_and_logout_lifecycle() {
     assert!(report.contains("Requests today   42 / 100"), "{report}");
     assert!(!report.contains(SESSION_TOKEN));
 
+    // The same as JSON, with the format flag after `auth status` this time.
+    let mut status = workspace.command(&gateway);
+    status.args(["auth", "status", "--output-format", "json"]);
+    let output = run(status, None);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let json = stdout(&output);
+    assert!(!json.contains(SESSION_TOKEN));
+    let report: serde_json::Value = serde_json::from_str(&json).expect("JSON status");
+    assert_eq!(report["signed_in"], true);
+    assert_eq!(report["session"], "valid");
+    assert_eq!(report["account"]["requests_today"], 42);
+
     let mut logout = workspace.command(&gateway);
     logout.args(["auth", "logout"]);
     let output = run(logout, None);
@@ -928,8 +968,16 @@ fn auth_login_with_token_status_and_logout_lifecycle() {
     let mut status = workspace.command(&gateway);
     status.args(["auth", "status"]);
     let output = run(status, None);
-    assert!(output.status.success());
+    // Signed out is a failure for scripts that check before they run.
+    assert_eq!(output.status.code(), Some(1));
     assert!(stdout(&output).contains("Signed out of Zero-X"));
+
+    let mut status = workspace.command(&gateway);
+    status.args(["--output-format", "json", "auth", "status"]);
+    let output = run(status, None);
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("JSON status");
+    assert_eq!(report["signed_in"], false);
 }
 
 #[test]
@@ -942,15 +990,19 @@ fn corrupt_credentials_warn_and_logout_still_succeeds() {
     let mut status = workspace.command(&gateway);
     status.args(["auth", "status"]);
     let output = run(status, None);
-    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     assert!(stdout(&output).contains("Signed out of Zero-X"));
     assert!(stderr(&output).contains("Ignoring unreadable credential file"));
 
     let mut logout = workspace.command(&gateway);
-    logout.args(["auth", "logout"]);
+    logout.args(["--output-format", "json", "logout"]);
     let output = run(logout, None);
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(!credentials.exists());
+    let report: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("JSON logout");
+    assert_eq!(report["type"], "logout");
+    assert_eq!(report["signed_out"], true);
+    assert_eq!(report["session_revoked"], false, "nothing to revoke");
 
     let mut doctor = workspace.command(&gateway);
     doctor.args(["--output-format", "json", "doctor"]);
@@ -1170,6 +1222,73 @@ fn expired_stored_login_prints_the_login_instruction_once() {
         "{errors}"
     );
     assert_eq!(gateway.count("POST", "/v1/chat/completions"), 0);
+}
+
+#[test]
+fn auth_status_reports_an_expired_or_revoked_login_as_signed_out() {
+    // Revoked: the gateway rejects the stored login.
+    let gateway = FakeGateway::spawn(|_, _| {
+        Reply::json(
+            "401 Unauthorized",
+            &serde_json::json!({"error": {"message": "Session revoked", "type": "authentication_error", "code": "invalid_session"}}),
+        )
+    });
+    let workspace = Workspace::new("revoked-status");
+    let credentials = serde_json::json!({"version": 1, "token": STORED_TOKEN, "expires_at": 4_070_908_800_u64, "plan": "free", "saved_at": 0});
+    fs::write(
+        workspace.neuron_home().join("credentials.json"),
+        credentials.to_string(),
+    )
+    .unwrap();
+    let mut status = workspace.command(&gateway);
+    status.args(["auth", "status"]);
+    let output = run(status, None);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let report = stdout(&output);
+    assert!(
+        report.starts_with("Signed out of Zero-X: the session expired or was revoked (stored login, credentials file). Run `neuron auth login`."),
+        "{report}"
+    );
+    assert!(!report.contains("Signed in        yes"), "{report}");
+    assert_eq!(stderr(&output), "", "said once, on stdout");
+
+    let mut status = workspace.command(&gateway);
+    status.args(["auth", "status", "--output-format", "json"]);
+    let output = run(status, None);
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("JSON status");
+    assert_eq!(report["type"], "auth_status");
+    assert_eq!(report["signed_in"], false);
+    assert_eq!(report["session"], "invalid");
+
+    // Expired by its stored expiry: signed out without asking the gateway.
+    let gateway = gateway_with_chat(|_, _| text_reply("unused"));
+    let workspace = Workspace::new("expired-status");
+    let mut credentials = credentials;
+    credentials["expires_at"] = 1_000_u64.into();
+    fs::write(
+        workspace.neuron_home().join("credentials.json"),
+        credentials.to_string(),
+    )
+    .unwrap();
+    let mut status = workspace.command(&gateway);
+    status.args(["auth", "status"]);
+    let output = run(status, None);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let report = stdout(&output);
+    assert!(
+        report.starts_with("Signed out of Zero-X: the session expired 1970-01-01 00:16 UTC"),
+        "{report}"
+    );
+    let mut status = workspace.command(&gateway);
+    status.args(["--output-format", "json", "auth", "status"]);
+    let output = run(status, None);
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("JSON status");
+    assert_eq!(report["type"], "auth_status");
+    assert_eq!(report["signed_in"], false);
+    assert_eq!(report["session"], "expired");
+    assert_eq!(gateway.count("GET", "/auth/session"), 0);
 }
 
 #[test]

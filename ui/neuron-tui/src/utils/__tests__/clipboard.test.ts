@@ -1,0 +1,1005 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
+import { execSync } from 'child_process'
+
+import { createMockTimers } from '@neuron-tui/common/testing/mocks/timers'
+import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test'
+
+import {
+  copyTextToClipboard,
+  OSC52_BLOCKED_MESSAGE,
+  OSC52_UNVERIFIED_MESSAGE,
+  showClipboardMessage,
+  subscribeClipboardMessages,
+  clearClipboardMessage,
+  registerClipboardRenderer,
+  unregisterClipboardRenderer,
+} from '../clipboard'
+import { logger } from '../logger'
+
+import type { MockTimers } from '@neuron-tui/common/testing/mocks/timers'
+
+/**
+ * Tests for clipboard.ts functionality.
+ *
+ * What IS tested:
+ * - Message subscription system (show, clear, timer cancellation, multiple subscribers)
+ * - Empty/whitespace text handling (early return)
+ * - Success message formatting (truncation, whitespace collapse, custom messages)
+ * - Error handling when both copy methods fail
+ * - macOS integration test (actual pbcopy when available)
+ *
+ * What is NOT fully tested (internal functions are not exported):
+ * - SSH session detection logic (isRemoteSession)
+ * - OSC52 sequence generation (buildOsc52Sequence) with tmux/screen wrapping
+ * - Platform tool selection (tryCopyViaPlatformTool) for Linux/Windows
+ * - OSC52 32KB payload size limit
+ *
+ * The copy priority behavior (local: platform tools first, remote: OSC52 first)
+ * is tested indirectly through the error handling tests.
+ */
+
+describe('clipboard', () => {
+  describe('showClipboardMessage and subscriptions', () => {
+    let mockTimers: MockTimers
+    let receivedMessages: (string | null)[]
+
+    beforeEach(() => {
+      mockTimers = createMockTimers()
+      mockTimers.install()
+      receivedMessages = []
+      clearClipboardMessage()
+    })
+
+    afterEach(() => {
+      mockTimers.restore()
+      clearClipboardMessage()
+    })
+
+    test('notifies subscribers when message is shown', () => {
+      const unsubscribe = subscribeClipboardMessages((msg) => {
+        receivedMessages.push(msg)
+      })
+
+      showClipboardMessage('Test message')
+
+      expect(receivedMessages).toContain('Test message')
+
+      unsubscribe()
+    })
+
+    test('clears message after default duration (3000ms)', () => {
+      const unsubscribe = subscribeClipboardMessages((msg) => {
+        receivedMessages.push(msg)
+      })
+
+      showClipboardMessage('Test message')
+      expect(receivedMessages).toContain('Test message')
+
+      mockTimers.advanceBy(3001)
+
+      expect(receivedMessages[receivedMessages.length - 1]).toBeNull()
+
+      unsubscribe()
+    })
+
+    test('clears message after custom duration', () => {
+      const unsubscribe = subscribeClipboardMessages((msg) => {
+        receivedMessages.push(msg)
+      })
+
+      showClipboardMessage('Test message', { durationMs: 1000 })
+
+      mockTimers.advanceBy(1001)
+
+      expect(receivedMessages[receivedMessages.length - 1]).toBeNull()
+
+      unsubscribe()
+    })
+
+    test('cancels previous timer when new message is shown', () => {
+      // Subscribe first, then show messages
+      const unsubscribe = subscribeClipboardMessages((msg) => {
+        receivedMessages.push(msg)
+      })
+
+      // Clear initial null from subscription
+      receivedMessages = []
+
+      showClipboardMessage('First message', { durationMs: 5000 })
+      mockTimers.advanceBy(2000)
+      showClipboardMessage('Second message', { durationMs: 5000 })
+      mockTimers.advanceBy(3000)
+
+      // First message's timer should have been cancelled, so no null yet
+      expect(receivedMessages).toEqual(['First message', 'Second message'])
+
+      unsubscribe()
+    })
+
+    test('unsubscribe stops receiving messages', () => {
+      const unsubscribe = subscribeClipboardMessages((msg) => {
+        receivedMessages.push(msg)
+      })
+
+      // Clear initial null
+      receivedMessages = []
+
+      showClipboardMessage('Before unsubscribe')
+      unsubscribe()
+      showClipboardMessage('After unsubscribe')
+
+      expect(receivedMessages).toContain('Before unsubscribe')
+      expect(receivedMessages).not.toContain('After unsubscribe')
+    })
+
+    test('multiple subscribers all receive messages', () => {
+      const messages1: (string | null)[] = []
+      const messages2: (string | null)[] = []
+
+      const unsub1 = subscribeClipboardMessages((msg) => messages1.push(msg))
+      const unsub2 = subscribeClipboardMessages((msg) => messages2.push(msg))
+
+      showClipboardMessage('Broadcast message')
+
+      expect(messages1).toContain('Broadcast message')
+      expect(messages2).toContain('Broadcast message')
+
+      unsub1()
+      unsub2()
+    })
+
+    test('clearClipboardMessage immediately clears the message', () => {
+      const unsubscribe = subscribeClipboardMessages((msg) => {
+        receivedMessages.push(msg)
+      })
+
+      showClipboardMessage('Test message', { durationMs: 10000 })
+      clearClipboardMessage()
+
+      expect(receivedMessages[receivedMessages.length - 1]).toBeNull()
+
+      unsubscribe()
+    })
+  })
+
+  describe('copyTextToClipboard - empty/whitespace handling', () => {
+    beforeEach(() => {
+      clearClipboardMessage()
+    })
+
+    afterEach(() => {
+      clearClipboardMessage()
+    })
+
+    test('returns early for empty string', async () => {
+      const messages: (string | null)[] = []
+      const unsubscribe = subscribeClipboardMessages((msg) => messages.push(msg))
+      messages.length = 0 // Clear initial null
+
+      await copyTextToClipboard('')
+
+      // Should not show any success or error message
+      expect(messages.filter((m) => m !== null)).toHaveLength(0)
+
+      unsubscribe()
+    })
+
+    test('returns early for whitespace-only string', async () => {
+      const messages: (string | null)[] = []
+      const unsubscribe = subscribeClipboardMessages((msg) => messages.push(msg))
+      messages.length = 0 // Clear initial null
+
+      await copyTextToClipboard('   \n\t  ')
+
+      // Should not show any success or error message
+      expect(messages.filter((m) => m !== null)).toHaveLength(0)
+
+      unsubscribe()
+    })
+  })
+
+  describe('copyTextToClipboard - success message formatting', () => {
+    // These tests run on macOS with actual pbcopy - skip on other platforms/CI
+    const shouldRun = process.platform === 'darwin' && !process.env.CI
+
+    beforeEach(() => {
+      clearClipboardMessage()
+    })
+
+    afterEach(() => {
+      clearClipboardMessage()
+    })
+
+    test.skipIf(!shouldRun)('formats short text with quotes', async () => {
+      const messages: (string | null)[] = []
+      const unsubscribe = subscribeClipboardMessages((msg) => messages.push(msg))
+
+      await copyTextToClipboard('Hello')
+
+      expect(messages).toContain('Copied: "Hello"')
+
+      unsubscribe()
+    })
+
+    test.skipIf(!shouldRun)('truncates long text with ellipsis', async () => {
+      const messages: (string | null)[] = []
+      const unsubscribe = subscribeClipboardMessages((msg) => messages.push(msg))
+
+      const longText = 'This is a very long piece of text that should be truncated because it exceeds the maximum display length'
+      await copyTextToClipboard(longText)
+
+      const lastMessage = messages.find((m) => m?.startsWith('Copied:'))
+      expect(lastMessage).toBeDefined()
+      expect(lastMessage!.length).toBeLessThan(55) // "Copied: " + 40 chars max + quotes
+      expect(lastMessage).toContain('…')
+
+      unsubscribe()
+    })
+
+    test.skipIf(!shouldRun)('collapses whitespace in preview', async () => {
+      const messages: (string | null)[] = []
+      const unsubscribe = subscribeClipboardMessages((msg) => messages.push(msg))
+
+      await copyTextToClipboard('Hello\n\n\nWorld\t\tTest')
+
+      expect(messages).toContain('Copied: "Hello World Test"')
+
+      unsubscribe()
+    })
+
+    test.skipIf(!shouldRun)('uses custom success message when provided', async () => {
+      const messages: (string | null)[] = []
+      const unsubscribe = subscribeClipboardMessages((msg) => messages.push(msg))
+
+      await copyTextToClipboard('test', { successMessage: 'Custom success!' })
+
+      expect(messages).toContain('Custom success!')
+
+      unsubscribe()
+    })
+
+    test.skipIf(!shouldRun)('shows no message when successMessage is null', async () => {
+      const messages: (string | null)[] = []
+      const unsubscribe = subscribeClipboardMessages((msg) => messages.push(msg))
+      messages.length = 0 // Clear initial null
+
+      await copyTextToClipboard('test', { successMessage: null })
+
+      expect(messages.filter((m) => m?.startsWith('Copied'))).toHaveLength(0)
+
+      unsubscribe()
+    })
+
+    test.skipIf(!shouldRun)('suppresses message when suppressGlobalMessage is true', async () => {
+      const messages: (string | null)[] = []
+      const unsubscribe = subscribeClipboardMessages((msg) => messages.push(msg))
+      messages.length = 0 // Clear initial null
+
+      await copyTextToClipboard('test', { suppressGlobalMessage: true })
+
+      expect(messages.filter((m) => m !== null)).toHaveLength(0)
+
+      unsubscribe()
+    })
+  })
+
+  describe('copyTextToClipboard - error handling when both methods fail', () => {
+    let mockTimers: MockTimers
+    let loggerErrorSpy: ReturnType<typeof spyOn>
+    let originalPlatform: PropertyDescriptor | undefined
+    let originalEnv: { SSH_CLIENT?: string; SSH_TTY?: string; SSH_CONNECTION?: string; TERM?: string }
+
+    beforeEach(() => {
+      mockTimers = createMockTimers()
+      mockTimers.install()
+
+      originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')
+      // Use a platform that has no clipboard tool (freebsd)
+      Object.defineProperty(process, 'platform', { value: 'freebsd', configurable: true })
+
+      // Save env vars
+      originalEnv = {
+        SSH_CLIENT: process.env.SSH_CLIENT,
+        SSH_TTY: process.env.SSH_TTY,
+        SSH_CONNECTION: process.env.SSH_CONNECTION,
+        TERM: process.env.TERM,
+      }
+      // Clear SSH env vars to ensure local session detection
+      delete process.env.SSH_CLIENT
+      delete process.env.SSH_TTY
+      delete process.env.SSH_CONNECTION
+      // Set TERM=dumb to disable OSC52 (it returns early for dumb terminals)
+      process.env.TERM = 'dumb'
+
+      loggerErrorSpy = spyOn(logger, 'error').mockImplementation(() => {})
+
+      clearClipboardMessage()
+    })
+
+    afterEach(() => {
+      mockTimers.restore()
+      loggerErrorSpy.mockRestore()
+      if (originalPlatform) {
+        Object.defineProperty(process, 'platform', originalPlatform)
+      }
+      // Restore env vars
+      if (originalEnv.SSH_CLIENT !== undefined) process.env.SSH_CLIENT = originalEnv.SSH_CLIENT
+      else delete process.env.SSH_CLIENT
+      if (originalEnv.SSH_TTY !== undefined) process.env.SSH_TTY = originalEnv.SSH_TTY
+      else delete process.env.SSH_TTY
+      if (originalEnv.SSH_CONNECTION !== undefined) process.env.SSH_CONNECTION = originalEnv.SSH_CONNECTION
+      else delete process.env.SSH_CONNECTION
+      if (originalEnv.TERM !== undefined) process.env.TERM = originalEnv.TERM
+      else delete process.env.TERM
+      clearClipboardMessage()
+    })
+
+    test('shows default error message when both methods fail', async () => {
+      const messages: (string | null)[] = []
+      const unsubscribe = subscribeClipboardMessages((msg) => messages.push(msg))
+
+      await expect(copyTextToClipboard('test text')).rejects.toThrow()
+
+      expect(messages).toContain('Failed to copy to clipboard')
+
+      unsubscribe()
+    })
+
+    test('shows custom error message when provided', async () => {
+      const messages: (string | null)[] = []
+      const unsubscribe = subscribeClipboardMessages((msg) => messages.push(msg))
+
+      await expect(
+        copyTextToClipboard('test text', { errorMessage: 'Custom error!' })
+      ).rejects.toThrow()
+
+      expect(messages).toContain('Custom error!')
+
+      unsubscribe()
+    })
+
+    test('suppresses error message when suppressGlobalMessage is true', async () => {
+      const messages: (string | null)[] = []
+      const unsubscribe = subscribeClipboardMessages((msg) => messages.push(msg))
+      messages.length = 0 // Clear initial
+
+      await expect(
+        copyTextToClipboard('test text', { suppressGlobalMessage: true })
+      ).rejects.toThrow()
+
+      expect(messages.filter((m) => m !== null)).toHaveLength(0)
+
+      unsubscribe()
+    })
+
+    test('logs error when both methods fail', async () => {
+      await expect(
+        copyTextToClipboard('test text', { suppressGlobalMessage: true })
+      ).rejects.toThrow()
+
+      expect(loggerErrorSpy).toHaveBeenCalled()
+    })
+
+    test('throws error when both methods fail', async () => {
+      await expect(
+        copyTextToClipboard('test text', { suppressGlobalMessage: true })
+      ).rejects.toThrow('No clipboard method available')
+    })
+  })
+
+  describe('copyTextToClipboard - integration test', () => {
+    // This test actually calls the real clipboard on macOS
+    // Skip on CI or non-macOS systems
+    const shouldRun = process.platform === 'darwin' && !process.env.CI
+
+    test.skipIf(!shouldRun)('actually copies text to system clipboard on macOS', async () => {
+      const testText = `clipboard-test-${Date.now()}`
+
+      await copyTextToClipboard(testText, { suppressGlobalMessage: true })
+
+      // Verify with pbpaste
+      const clipboardContent = execSync('pbpaste', { encoding: 'utf8' })
+
+      expect(clipboardContent).toBe(testText)
+    })
+  })
+
+  describe('registerClipboardRenderer and renderer-based copy', () => {
+    let originalPlatform: PropertyDescriptor | undefined
+    let originalEnv: Record<string, string | undefined>
+    let loggerErrorSpy: ReturnType<typeof spyOn>
+
+    beforeEach(() => {
+      originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')
+      originalEnv = {
+        SSH_CLIENT: process.env.SSH_CLIENT,
+        SSH_TTY: process.env.SSH_TTY,
+        SSH_CONNECTION: process.env.SSH_CONNECTION,
+        TERM: process.env.TERM,
+        TMUX: process.env.TMUX,
+        STY: process.env.STY,
+      }
+      loggerErrorSpy = spyOn(logger, 'error').mockImplementation(() => {})
+
+      // Use freebsd + dumb terminal to disable platform tools and OSC52,
+      // isolating the renderer path.
+      Object.defineProperty(process, 'platform', { value: 'freebsd', configurable: true })
+      delete process.env.SSH_CLIENT
+      delete process.env.SSH_TTY
+      delete process.env.SSH_CONNECTION
+      process.env.TERM = 'dumb'
+      delete process.env.TMUX
+      delete process.env.STY
+
+      clearClipboardMessage()
+      unregisterClipboardRenderer()
+    })
+
+    afterEach(() => {
+      unregisterClipboardRenderer()
+      if (originalPlatform) {
+        Object.defineProperty(process, 'platform', originalPlatform)
+      }
+      for (const [key, value] of Object.entries(originalEnv)) {
+        if (value !== undefined) process.env[key] = value
+        else delete process.env[key]
+      }
+      loggerErrorSpy.mockRestore()
+      clearClipboardMessage()
+    })
+
+    test('renderer with copyToClipboardOSC52 returning true succeeds', async () => {
+      const calls: string[] = []
+      registerClipboardRenderer({
+        copyToClipboardOSC52: (text: string) => {
+          calls.push(text)
+          return true
+        },
+      })
+
+      await copyTextToClipboard('test text', { suppressGlobalMessage: true })
+
+      expect(calls).toEqual(['test text'])
+    })
+
+    test('renderer with copyToClipboardOSC52 returning false falls through and fails', async () => {
+      registerClipboardRenderer({ copyToClipboardOSC52: () => false })
+
+      await expect(
+        copyTextToClipboard('test text', { suppressGlobalMessage: true })
+      ).rejects.toThrow('No clipboard method available')
+    })
+
+    test('renderer without copyToClipboardOSC52 falls through and fails', async () => {
+      registerClipboardRenderer({ someOtherMethod: () => true })
+
+      await expect(
+        copyTextToClipboard('test text', { suppressGlobalMessage: true })
+      ).rejects.toThrow('No clipboard method available')
+    })
+
+    test('renderer whose copyToClipboardOSC52 throws falls through gracefully', async () => {
+      registerClipboardRenderer({
+        copyToClipboardOSC52: () => { throw new Error('renderer error') },
+      })
+
+      await expect(
+        copyTextToClipboard('test text', { suppressGlobalMessage: true })
+      ).rejects.toThrow('No clipboard method available')
+    })
+
+    test('unregisterClipboardRenderer removes renderer so it is no longer used', async () => {
+      const calls: string[] = []
+      registerClipboardRenderer({
+        copyToClipboardOSC52: (text: string) => {
+          calls.push(text)
+          return true
+        },
+      })
+      unregisterClipboardRenderer()
+
+      await expect(
+        copyTextToClipboard('test text', { suppressGlobalMessage: true })
+      ).rejects.toThrow('No clipboard method available')
+
+      expect(calls).toEqual([])
+    })
+
+    test('renderer is tried in remote sessions (SSH) before manual OSC52', async () => {
+      // Set up as remote session
+      process.env.SSH_CLIENT = '192.168.1.100 54321 22'
+      process.env.TERM = 'xterm-256color'
+
+      const calls: string[] = []
+      registerClipboardRenderer({
+        copyToClipboardOSC52: () => {
+          calls.push('renderer')
+          return true
+        },
+      })
+
+      await copyTextToClipboard('test text', { suppressGlobalMessage: true })
+
+      expect(calls).toEqual(['renderer'])
+    })
+
+    test('renderer-only copy reports guidance, not success', async () => {
+      registerClipboardRenderer({ copyToClipboardOSC52: () => true })
+
+      const messages: (string | null)[] = []
+      const unsubscribe = subscribeClipboardMessages((msg) => messages.push(msg))
+
+      // Nothing here can confirm the write: the renderer only emitted OSC 52.
+      const result = await copyTextToClipboard('Hello world')
+
+      expect(result).toBe('unverified')
+      expect(messages).toContain(OSC52_UNVERIFIED_MESSAGE)
+      expect(messages).not.toContain('Copied: "Hello world"')
+
+      unsubscribe()
+    })
+  })
+
+  describe('copyTextToClipboard - unconfirmed OSC 52 outside local Linux', () => {
+    // Over SSH, OSC 52 is the only route to the clipboard of the machine the
+    // terminal runs on, and the terminal never acknowledges it: many
+    // terminals ignore the sequence or ship with clipboard writes disabled.
+    // A bare "Copied" there claims something we cannot know, and nothing logs
+    // it, because a false success looks exactly like a real one.
+
+    let originalPlatform: PropertyDescriptor | undefined
+    let originalEnv: Record<string, string | undefined>
+
+    beforeEach(() => {
+      originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')
+      originalEnv = {
+        SSH_CLIENT: process.env.SSH_CLIENT,
+        SSH_TTY: process.env.SSH_TTY,
+        SSH_CONNECTION: process.env.SSH_CONNECTION,
+        TERM: process.env.TERM,
+        TMUX: process.env.TMUX,
+        STY: process.env.STY,
+        TERM_PROGRAM: process.env.TERM_PROGRAM,
+        CODESPACES: process.env.CODESPACES,
+      }
+
+      // freebsd + TERM=dumb leaves the registered renderer as the only
+      // clipboard route, so the OSC 52 branch is the one under test.
+      Object.defineProperty(process, 'platform', {
+        value: 'freebsd',
+        configurable: true,
+      })
+      delete process.env.SSH_CLIENT
+      delete process.env.SSH_TTY
+      delete process.env.SSH_CONNECTION
+      delete process.env.TMUX
+      delete process.env.STY
+      delete process.env.TERM_PROGRAM
+      delete process.env.CODESPACES
+      process.env.TERM = 'dumb'
+
+      clearClipboardMessage()
+      unregisterClipboardRenderer()
+    })
+
+    afterEach(() => {
+      unregisterClipboardRenderer()
+      if (originalPlatform) {
+        Object.defineProperty(process, 'platform', originalPlatform)
+      }
+      for (const [key, value] of Object.entries(originalEnv)) {
+        if (value !== undefined) process.env[key] = value
+        else delete process.env[key]
+      }
+      clearClipboardMessage()
+    })
+
+    test('an SSH copy is reported as sent to the terminal, not copied', async () => {
+      process.env.SSH_TTY = '/dev/pts/0'
+      registerClipboardRenderer({ copyToClipboardOSC52: () => true })
+      const messages: (string | null)[] = []
+      const unsubscribe = subscribeClipboardMessages((msg) =>
+        messages.push(msg),
+      )
+
+      const result = await copyTextToClipboard('hello')
+
+      expect(result).toBe('unverified')
+      expect(messages.at(-1)).toBe(OSC52_UNVERIFIED_MESSAGE)
+
+      unsubscribe()
+    })
+
+    test("an SSH copy drops the caller's success message", async () => {
+      process.env.SSH_CONNECTION = '10.0.0.2 54321 10.0.0.1 22'
+      registerClipboardRenderer({ copyToClipboardOSC52: () => true })
+      const messages: (string | null)[] = []
+      const unsubscribe = subscribeClipboardMessages((msg) =>
+        messages.push(msg),
+      )
+
+      const result = await copyTextToClipboard('hello', {
+        successMessage: 'Copied code',
+      })
+
+      expect(result).toBe('unverified')
+      expect(messages).not.toContain('Copied code')
+
+      unsubscribe()
+    })
+  })
+
+  describe('copyTextToClipboard - SSH session detection behavior', () => {
+    // These tests verify the copy behavior changes based on SSH environment variables.
+    // In remote sessions (SSH), OSC52 is tried first; in local sessions, platform tools are tried first.
+    // We can't directly test isRemoteSession() since it's not exported, but we can verify
+    // the behavior by observing what happens when platform tools are unavailable.
+
+    let originalEnv: Record<string, string | undefined>
+    let originalPlatform: PropertyDescriptor | undefined
+    let loggerErrorSpy: ReturnType<typeof spyOn>
+
+    beforeEach(() => {
+      originalEnv = {
+        SSH_CLIENT: process.env.SSH_CLIENT,
+        SSH_TTY: process.env.SSH_TTY,
+        SSH_CONNECTION: process.env.SSH_CONNECTION,
+        TERM: process.env.TERM,
+        TMUX: process.env.TMUX,
+        STY: process.env.STY,
+      }
+      originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')
+      loggerErrorSpy = spyOn(logger, 'error').mockImplementation(() => {})
+      clearClipboardMessage()
+    })
+
+    afterEach(() => {
+      // Restore all env vars
+      for (const [key, value] of Object.entries(originalEnv)) {
+        if (value !== undefined) process.env[key] = value
+        else delete process.env[key]
+      }
+      if (originalPlatform) {
+        Object.defineProperty(process, 'platform', originalPlatform)
+      }
+      loggerErrorSpy.mockRestore()
+      clearClipboardMessage()
+    })
+
+    test('SSH_CLIENT env var triggers remote session behavior', async () => {
+      // Set up as remote session with SSH_CLIENT
+      process.env.SSH_CLIENT = '192.168.1.100 54321 22'
+      delete process.env.SSH_TTY
+      delete process.env.SSH_CONNECTION
+      process.env.TERM = 'xterm-256color'
+      delete process.env.TMUX
+      delete process.env.STY
+
+      // Use freebsd platform so platform tools fail, forcing OSC52 path
+      Object.defineProperty(process, 'platform', { value: 'freebsd', configurable: true })
+
+      // In remote session with working /dev/tty, OSC52 should succeed
+      // This test verifies that having SSH_CLIENT set changes the behavior
+      // (the copy may succeed or fail depending on /dev/tty availability)
+      try {
+        await copyTextToClipboard('test', { suppressGlobalMessage: true })
+        // If it succeeded, OSC52 worked in remote mode
+      } catch {
+        // If it failed, that's expected when /dev/tty isn't available
+        // The important thing is that the code path was triggered
+      }
+
+      // Test passed - code executed the SSH detection path
+      expect(true).toBe(true)
+    })
+
+    test('SSH_TTY env var triggers remote session behavior', async () => {
+      delete process.env.SSH_CLIENT
+      process.env.SSH_TTY = '/dev/pts/0'
+      delete process.env.SSH_CONNECTION
+      process.env.TERM = 'xterm-256color'
+
+      Object.defineProperty(process, 'platform', { value: 'freebsd', configurable: true })
+
+      try {
+        await copyTextToClipboard('test', { suppressGlobalMessage: true })
+      } catch {
+        // Expected when /dev/tty isn't available
+      }
+
+      expect(true).toBe(true)
+    })
+
+    test('SSH_CONNECTION env var triggers remote session behavior', async () => {
+      delete process.env.SSH_CLIENT
+      delete process.env.SSH_TTY
+      process.env.SSH_CONNECTION = '192.168.1.100 54321 10.0.0.1 22'
+      process.env.TERM = 'xterm-256color'
+
+      Object.defineProperty(process, 'platform', { value: 'freebsd', configurable: true })
+
+      try {
+        await copyTextToClipboard('test', { suppressGlobalMessage: true })
+      } catch {
+        // Expected when /dev/tty isn't available
+      }
+
+      expect(true).toBe(true)
+    })
+
+    test('no SSH env vars triggers local session behavior (platform tools first)', async () => {
+      // Clear all SSH env vars
+      delete process.env.SSH_CLIENT
+      delete process.env.SSH_TTY
+      delete process.env.SSH_CONNECTION
+      process.env.TERM = 'xterm-256color'
+
+      // Restore the original platform for this test since we need real platform tools
+      if (originalPlatform) {
+        Object.defineProperty(process, 'platform', originalPlatform)
+      }
+
+      // On macOS with no SSH vars, should try pbcopy first (local session)
+      if (process.platform === 'darwin' && !process.env.CI) {
+        const testText = `local-session-test-${Date.now()}`
+        await copyTextToClipboard(testText, { suppressGlobalMessage: true })
+
+        // Verify pbcopy was used (local path)
+        const clipboardContent = execSync('pbpaste', { encoding: 'utf8' })
+        expect(clipboardContent).toBe(testText)
+      } else {
+        // On non-macOS or CI, just verify no errors when detecting local session
+        expect(true).toBe(true)
+      }
+    })
+  })
+
+  describe('copyTextToClipboard - blocked OSC52 terminals (Codespaces / VS Code remote)', () => {
+    // GitHub Codespaces and VS Code remote terminals silently drop OSC 52
+    // sequences, so OSC52-based copy must be treated as unavailable there and
+    // the user shown the Shift+drag workaround instead of a false "Copied".
+
+    let originalEnv: Record<string, string | undefined>
+    let originalPlatform: PropertyDescriptor | undefined
+    let loggerErrorSpy: ReturnType<typeof spyOn>
+
+    beforeEach(() => {
+      originalEnv = {
+        SSH_CLIENT: process.env.SSH_CLIENT,
+        SSH_TTY: process.env.SSH_TTY,
+        SSH_CONNECTION: process.env.SSH_CONNECTION,
+        TERM: process.env.TERM,
+        TMUX: process.env.TMUX,
+        STY: process.env.STY,
+        TERM_PROGRAM: process.env.TERM_PROGRAM,
+        CODESPACES: process.env.CODESPACES,
+      }
+      originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')
+      loggerErrorSpy = spyOn(logger, 'error').mockImplementation(() => {})
+
+      // No platform clipboard tool available
+      Object.defineProperty(process, 'platform', { value: 'freebsd', configurable: true })
+      delete process.env.SSH_CLIENT
+      delete process.env.SSH_TTY
+      delete process.env.SSH_CONNECTION
+      delete process.env.TMUX
+      delete process.env.STY
+      delete process.env.CODESPACES
+      process.env.TERM = 'xterm-256color'
+      process.env.TERM_PROGRAM = 'vscode'
+
+      clearClipboardMessage()
+      unregisterClipboardRenderer()
+    })
+
+    afterEach(() => {
+      unregisterClipboardRenderer()
+      for (const [key, value] of Object.entries(originalEnv)) {
+        if (value !== undefined) process.env[key] = value
+        else delete process.env[key]
+      }
+      if (originalPlatform) {
+        Object.defineProperty(process, 'platform', originalPlatform)
+      }
+      loggerErrorSpy.mockRestore()
+      clearClipboardMessage()
+    })
+
+    test('Codespaces: renderer OSC52 is skipped and copy fails', async () => {
+      process.env.CODESPACES = 'true'
+
+      const calls: string[] = []
+      registerClipboardRenderer({
+        copyToClipboardOSC52: (text: string) => {
+          calls.push(text)
+          return true
+        },
+      })
+
+      await expect(
+        copyTextToClipboard('test text', { suppressGlobalMessage: true }),
+      ).rejects.toThrow('No clipboard method available')
+
+      expect(calls).toEqual([])
+    })
+
+    test('Codespaces: shows Shift+drag guidance even with suppressGlobalMessage', async () => {
+      process.env.CODESPACES = 'true'
+
+      const messages: (string | null)[] = []
+      const unsubscribe = subscribeClipboardMessages((msg) => messages.push(msg))
+
+      await expect(
+        copyTextToClipboard('test text', { suppressGlobalMessage: true }),
+      ).rejects.toThrow()
+
+      expect(messages).toContain(OSC52_BLOCKED_MESSAGE)
+
+      unsubscribe()
+    })
+
+    test('VS Code remote SSH: OSC52 is skipped and guidance is shown', async () => {
+      process.env.SSH_CONNECTION = '192.168.1.100 54321 10.0.0.1 22'
+
+      const messages: (string | null)[] = []
+      const unsubscribe = subscribeClipboardMessages((msg) => messages.push(msg))
+
+      registerClipboardRenderer({ copyToClipboardOSC52: () => true })
+
+      await expect(copyTextToClipboard('test text')).rejects.toThrow()
+
+      expect(messages).toContain(OSC52_BLOCKED_MESSAGE)
+      expect(messages.find((m) => m?.startsWith('Copied'))).toBeUndefined()
+
+      unsubscribe()
+    })
+
+    test('local VS Code terminal: OSC52 still works', async () => {
+      // No CODESPACES, no SSH vars — local VS Code honors OSC 52
+      const calls: string[] = []
+      registerClipboardRenderer({
+        copyToClipboardOSC52: (text: string) => {
+          calls.push(text)
+          return true
+        },
+      })
+
+      await copyTextToClipboard('test text', { suppressGlobalMessage: true })
+
+      expect(calls).toEqual(['test text'])
+    })
+
+    test('Codespaces over plain SSH (not vscode terminal): OSC52 still works', async () => {
+      // e.g. `gh codespace ssh` from a real terminal — OSC 52 passes through
+      process.env.CODESPACES = 'true'
+      delete process.env.TERM_PROGRAM
+
+      const calls: string[] = []
+      registerClipboardRenderer({
+        copyToClipboardOSC52: (text: string) => {
+          calls.push(text)
+          return true
+        },
+      })
+
+      await copyTextToClipboard('test text', { suppressGlobalMessage: true })
+
+      expect(calls).toEqual(['test text'])
+    })
+  })
+
+  describe('copyTextToClipboard - OSC52 behavior', () => {
+    // Tests for OSC52 escape sequence behavior.
+    // OSC52 is used for clipboard access over SSH and in terminal multiplexers.
+
+    let originalEnv: Record<string, string | undefined>
+    let originalPlatform: PropertyDescriptor | undefined
+    let loggerErrorSpy: ReturnType<typeof spyOn>
+
+    beforeEach(() => {
+      originalEnv = {
+        SSH_CLIENT: process.env.SSH_CLIENT,
+        SSH_TTY: process.env.SSH_TTY,
+        SSH_CONNECTION: process.env.SSH_CONNECTION,
+        TERM: process.env.TERM,
+        TMUX: process.env.TMUX,
+        STY: process.env.STY,
+      }
+      originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')
+      loggerErrorSpy = spyOn(logger, 'error').mockImplementation(() => {})
+      clearClipboardMessage()
+    })
+
+    afterEach(() => {
+      for (const [key, value] of Object.entries(originalEnv)) {
+        if (value !== undefined) process.env[key] = value
+        else delete process.env[key]
+      }
+      if (originalPlatform) {
+        Object.defineProperty(process, 'platform', originalPlatform)
+      }
+      loggerErrorSpy.mockRestore()
+      clearClipboardMessage()
+    })
+
+    test('TERM=dumb disables OSC52 (returns null sequence)', async () => {
+      // TERM=dumb should cause OSC52 to be skipped entirely
+      delete process.env.SSH_CLIENT
+      delete process.env.SSH_TTY
+      delete process.env.SSH_CONNECTION
+      process.env.TERM = 'dumb'
+      delete process.env.TMUX
+      delete process.env.STY
+
+      // Use freebsd so platform tools also fail
+      Object.defineProperty(process, 'platform', { value: 'freebsd', configurable: true })
+
+      // Should fail because both methods are disabled
+      await expect(
+        copyTextToClipboard('test', { suppressGlobalMessage: true })
+      ).rejects.toThrow('No clipboard method available')
+    })
+
+    test('very large text (>32KB) causes OSC52 to be skipped due to size limit', async () => {
+      // OSC52 has a 32KB limit for the base64-encoded payload
+      // Text that encodes to >32KB should cause OSC52 to return null
+      delete process.env.SSH_CLIENT
+      delete process.env.SSH_TTY
+      delete process.env.SSH_CONNECTION
+      process.env.TERM = 'xterm-256color'
+      delete process.env.TMUX
+      delete process.env.STY
+
+      // Use freebsd so platform tools fail, only OSC52 available
+      Object.defineProperty(process, 'platform', { value: 'freebsd', configurable: true })
+
+      // Create text that will exceed 32KB when base64 encoded
+      // Base64 expands by ~4/3, so 25KB of text should exceed 32KB encoded
+      const largeText = 'x'.repeat(25_000)
+
+      // Should fail because OSC52 rejects oversized payload and platform tools unavailable
+      await expect(
+        copyTextToClipboard(largeText, { suppressGlobalMessage: true })
+      ).rejects.toThrow('No clipboard method available')
+    })
+
+    test('TMUX env var should use tmux passthrough wrapping for OSC52', async () => {
+      // When TMUX is set, OSC52 should wrap in DCS passthrough
+      // We can't directly verify the sequence, but we can verify the path is taken
+      process.env.SSH_CLIENT = '192.168.1.100 54321 22' // Force remote session
+      process.env.TERM = 'xterm-256color'
+      process.env.TMUX = '/tmp/tmux-1000/default,12345,0'
+      delete process.env.STY
+
+      Object.defineProperty(process, 'platform', { value: 'freebsd', configurable: true })
+
+      try {
+        await copyTextToClipboard('test', { suppressGlobalMessage: true })
+        // Success means tmux passthrough worked
+      } catch {
+        // Failure expected if /dev/tty not available, but path was exercised
+      }
+
+      expect(true).toBe(true)
+    })
+
+    test('STY env var (GNU screen) should use screen passthrough wrapping for OSC52', async () => {
+      // When STY is set (GNU screen), OSC52 should use screen-style passthrough
+      process.env.SSH_CLIENT = '192.168.1.100 54321 22'
+      process.env.TERM = 'screen-256color'
+      delete process.env.TMUX
+      process.env.STY = '12345.pts-0.hostname'
+
+      Object.defineProperty(process, 'platform', { value: 'freebsd', configurable: true })
+
+      try {
+        await copyTextToClipboard('test', { suppressGlobalMessage: true })
+      } catch {
+        // Expected if /dev/tty not available
+      }
+
+      expect(true).toBe(true)
+    })
+  })
+})

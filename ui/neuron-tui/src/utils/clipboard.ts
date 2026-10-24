@@ -1,0 +1,455 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// See ui/neuron-tui/PORTING.md.
+import { spawn } from 'child_process'
+import { closeSync, openSync, writeSync } from 'fs'
+
+import type { ChildProcess } from 'child_process'
+
+import { getCliEnv } from './env'
+import { logger } from './logger'
+
+// Global renderer reference for clipboard operations.
+// Registered once by the useClipboard hook so all callers of
+// copyTextToClipboard automatically benefit from renderer-based
+// OSC 52 without threading the renderer through every call site.
+let registeredRenderer: Record<string, unknown> | null = null
+
+export function registerClipboardRenderer(
+  renderer: Record<string, unknown>,
+): void {
+  registeredRenderer = renderer
+}
+
+export function unregisterClipboardRenderer(): void {
+  registeredRenderer = null
+}
+
+type ClipboardListener = (message: string | null) => void
+
+let currentMessage: string | null = null
+const listeners = new Set<ClipboardListener>()
+let clearTimer: ReturnType<typeof setTimeout> | null = null
+
+interface ShowMessageOptions {
+  durationMs?: number
+}
+
+export function subscribeClipboardMessages(
+  listener: ClipboardListener,
+): () => void {
+  listeners.add(listener)
+  listener(currentMessage)
+  return () => {
+    listeners.delete(listener)
+  }
+}
+
+function emitClipboardMessage(message: string | null) {
+  currentMessage = message
+  for (const listener of listeners) {
+    listener(message)
+  }
+}
+
+export function showClipboardMessage(
+  message: string | null,
+  options: ShowMessageOptions = {},
+) {
+  if (clearTimer) {
+    clearTimeout(clearTimer)
+    clearTimer = null
+  }
+
+  emitClipboardMessage(message)
+
+  const duration = options.durationMs ?? 3000
+  if (message && duration > 0) {
+    clearTimer = setTimeout(() => {
+      emitClipboardMessage(null)
+      clearTimer = null
+    }, duration)
+  }
+}
+
+function getDefaultSuccessMessage(text: string): string | null {
+  const preview = text.replace(/\s+/g, ' ').trim()
+  if (!preview) {
+    return null
+  }
+  const truncated = preview.length > 40 ? `${preview.slice(0, 37)}…` : preview
+  return `Copied: "${truncated}"`
+}
+
+type ClipboardCandidate = {
+  text: string
+  successMessage?: string | null
+}
+
+let activeClipboardOperation: AbortController | null = null
+
+export interface CopyToClipboardOptions {
+  successMessage?: string | null
+  errorMessage?: string | null
+  durationMs?: number
+  suppressGlobalMessage?: boolean
+  getOsc52Fallback?: () => ClipboardCandidate
+  signal?: AbortSignal
+}
+
+/** Returns 'unverified' when the copy could only be sent to the terminal. */
+export async function copyTextToClipboard(
+  text: string,
+  {
+    successMessage,
+    errorMessage,
+    durationMs,
+    suppressGlobalMessage = false,
+    getOsc52Fallback,
+    signal,
+  }: CopyToClipboardOptions = {},
+): Promise<'unverified' | void> {
+  if (!text || text.trim().length === 0) {
+    return
+  }
+
+  throwIfClipboardAborted(signal)
+  const operationController = new AbortController()
+  activeClipboardOperation?.abort()
+  activeClipboardOperation = operationController
+  const operationSignal = signal
+    ? AbortSignal.any([signal, operationController.signal])
+    : operationController.signal
+
+  const osc52Blocked = isOsc52Blocked()
+  const remoteSession = isRemoteSession()
+  try {
+    throwIfClipboardAborted(operationSignal)
+    const tryOsc52 = (candidate: string) =>
+      !osc52Blocked &&
+      isWithinOsc52PayloadLimit(candidate) &&
+      (tryCopyViaRenderer(candidate) || tryCopyViaTtyOsc52(candidate))
+
+    const primary: ClipboardCandidate = { text, successMessage }
+    // Set wherever OSC 52 was the method that "worked", including the remote
+    // branch below, which is reached before any native tool is tried.
+    let copiedViaOsc52 = false
+    const tryCandidateViaOsc52 = (candidate: ClipboardCandidate) => {
+      if (!tryOsc52(candidate.text)) return null
+      copiedViaOsc52 = true
+      return candidate
+    }
+    const tryFallbackViaOsc52 = () => {
+      if (!getOsc52Fallback) return null
+      const fallback = getOsc52Fallback()
+      return fallback.text.trim() && fallback.text !== text
+        ? tryCandidateViaOsc52(fallback)
+        : null
+    }
+
+    // Remote sessions need OSC 52 to reach the client clipboard. Local
+    // sessions prefer native tools because they survive tmux and have no cap.
+    let copiedCandidate = remoteSession
+      ? (tryCandidateViaOsc52(primary) ?? tryFallbackViaOsc52())
+      : null
+
+    if (
+      !copiedCandidate &&
+      (await tryCopyViaPlatformTool(text, operationSignal))
+    ) {
+      copiedCandidate = primary
+    }
+    // A local session that reaches this OSC 52 fallback had no working native
+    // tool.
+    if (!copiedCandidate && !remoteSession) {
+      copiedCandidate = tryCandidateViaOsc52(primary) ?? tryFallbackViaOsc52()
+    }
+
+    if (!copiedCandidate) {
+      throw new Error('No clipboard method available')
+    }
+
+    if (copiedViaOsc52) {
+      // This is guidance, not a success notification. Even callers with their
+      // own copy badge need it, and must not show that badge for this result.
+      // A local Linux session can fix this by installing a clipboard tool; an
+      // SSH session cannot, because the clipboard to reach belongs to the
+      // machine running the terminal, and so does the permission to write it.
+      const guidance =
+        !remoteSession && process.platform === 'linux'
+          ? LINUX_OSC52_ONLY_MESSAGE
+          : OSC52_UNVERIFIED_MESSAGE
+      showClipboardMessage(
+        copiedCandidate === primary
+          ? guidance
+          : `Text shortened to fit the terminal. ${guidance}`,
+        { durationMs: 6000 },
+      )
+      return 'unverified'
+    }
+
+    if (!suppressGlobalMessage) {
+      const message =
+        copiedCandidate.successMessage !== undefined
+          ? copiedCandidate.successMessage
+          : getDefaultSuccessMessage(copiedCandidate.text)
+      if (message) {
+        showClipboardMessage(message, { durationMs })
+      }
+    }
+  } catch (error) {
+    if (operationSignal.aborted) throw error
+    logger.error(error, 'Failed to copy to clipboard')
+    // When the terminal drops OSC 52 and no platform tool exists (e.g.
+    // Codespaces), the Shift+drag guidance is the only way the user can copy,
+    // so show it even for callers that suppress routine messages.
+    if (!suppressGlobalMessage || osc52Blocked) {
+      // Installing a Linux clipboard tool only helps when the clipboard to
+      // reach is on this machine; over SSH it is the terminal's to allow.
+      const defaultErrorMessage = remoteSession
+        ? REMOTE_CLIPBOARD_ERROR_MESSAGE
+        : process.platform === 'linux'
+          ? LINUX_CLIPBOARD_ERROR_MESSAGE
+          : 'Failed to copy to clipboard'
+      const hasGuidance =
+        osc52Blocked || remoteSession || process.platform === 'linux'
+      showClipboardMessage(
+        osc52Blocked
+          ? OSC52_BLOCKED_MESSAGE
+          : (errorMessage ?? defaultErrorMessage),
+        // Give the longer guidance message extra time to be read
+        { durationMs: durationMs ?? (hasGuidance ? 6000 : undefined) },
+      )
+    }
+    throw error
+  } finally {
+    if (activeClipboardOperation === operationController) {
+      activeClipboardOperation = null
+    }
+  }
+}
+
+export function clearClipboardMessage() {
+  if (clearTimer) {
+    clearTimeout(clearTimer)
+    clearTimer = null
+  }
+  emitClipboardMessage(null)
+}
+
+// =============================================================================
+// OSC52 Clipboard Support
+// =============================================================================
+// OSC52 writes to clipboard via terminal escape sequences - works over SSH
+// because the client terminal handles clipboard. Format: ESC ] 52 ; c ; <base64> BEL
+// tmux/screen require passthrough wrapping to forward the sequence.
+
+export function isRemoteSession(): boolean {
+  const env = getCliEnv()
+  return !!(env.SSH_CLIENT || env.SSH_TTY || env.SSH_CONNECTION)
+}
+
+export const OSC52_BLOCKED_MESSAGE =
+  'Copy is blocked by this terminal — hold Shift and drag to select, then copy normally'
+
+/** OSC 52 has no acknowledgement from the terminal. */
+export const LINUX_OSC52_ONLY_MESSAGE =
+  'Copy sent to terminal, not confirmed — if paste is empty, install wl-clipboard or xclip'
+
+/**
+ * Shown instead when no local clipboard tool could have helped: an SSH
+ * session, where OSC 52 is the only route to the user's own clipboard, or a
+ * platform whose native tool failed.
+ */
+export const OSC52_UNVERIFIED_MESSAGE =
+  'Copy sent to terminal, not confirmed — if paste is empty, allow OSC 52 clipboard writes in your terminal'
+
+export const LINUX_CLIPBOARD_ERROR_MESSAGE =
+  'Clipboard unavailable — install wl-clipboard (Wayland) or xclip (X11)'
+
+export const REMOTE_CLIPBOARD_ERROR_MESSAGE =
+  'Clipboard unavailable over SSH — allow OSC 52 clipboard writes in your terminal, or hold Shift and drag to select'
+
+// GitHub Codespaces and VS Code remote (SSH/tunnel) terminals silently drop
+// OSC 52 sequences, so a "successful" write never reaches the user's
+// clipboard. Local VS Code terminals (including devcontainers) honor OSC 52.
+// https://github.com/microsoft/vscode-remote-release/issues/11475
+export function isOsc52Blocked(): boolean {
+  const env = getCliEnv()
+  return (
+    env.TERM_PROGRAM === 'vscode' &&
+    (env.CODESPACES === 'true' || isRemoteSession())
+  )
+}
+
+const CLIPBOARD_TOOL_TIMEOUT_MS = 5000
+
+function throwIfClipboardAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return
+  if (signal.reason instanceof Error) throw signal.reason
+  throw new DOMException('The clipboard operation was aborted', 'AbortError')
+}
+
+function killClipboardTool(child: ChildProcess): void {
+  try {
+    child.kill('SIGKILL')
+  } catch {
+    // The process may already have exited between an error and cleanup.
+  }
+}
+
+function writeToClipboardTool(
+  command: string,
+  args: string[],
+  text: string,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    let child: ChildProcess
+    try {
+      child = spawn(command, args, {
+        stdio: ['pipe', 'ignore', 'ignore'],
+      })
+    } catch {
+      resolve(false)
+      return
+    }
+
+    let settled = false
+    let timeout: ReturnType<typeof setTimeout> | null = null
+    const finish = (copied: boolean) => {
+      if (settled) return
+      settled = true
+      if (timeout) clearTimeout(timeout)
+      signal?.removeEventListener('abort', handleAbort)
+      resolve(copied)
+    }
+    const handleAbort = () => {
+      killClipboardTool(child)
+      finish(false)
+    }
+
+    child.once('error', () => finish(false))
+    child.once('close', (code) => finish(code === 0))
+    child.stdin?.once('error', () => {
+      killClipboardTool(child)
+      finish(false)
+    })
+
+    timeout = setTimeout(() => {
+      // A backend waiting on a broken display server must not freeze the TUI.
+      // SIGKILL also prevents a timed-out process from retaining the clipboard
+      // pipe after the next backend starts.
+      killClipboardTool(child)
+      finish(false)
+    }, CLIPBOARD_TOOL_TIMEOUT_MS)
+    signal?.addEventListener('abort', handleAbort, { once: true })
+
+    try {
+      child.stdin?.end(text)
+    } catch {
+      killClipboardTool(child)
+      finish(false)
+    }
+
+    // Abort may have happened between the caller's check and listener setup.
+    if (signal?.aborted) handleAbort()
+  })
+}
+
+async function tryCopyViaPlatformTool(
+  text: string,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const commands: [string, string[]][] = (() => {
+    if (process.platform === 'darwin') return [['pbcopy', []]]
+    if (process.platform === 'win32') return [['clip', []]]
+    if (process.platform !== 'linux') return []
+
+    const wlCopy: [string, string[]] = ['wl-copy', ['--type', 'text/plain']]
+    const x11Commands: [string, string[]][] = [
+      ['xclip', ['-selection', 'clipboard']],
+      ['xsel', ['--clipboard', '--input']],
+    ]
+    // WAYLAND_DISPLAY decides the ORDER, never whether wl-copy is tried at
+    // all. It is routinely absent from a Wayland session's processes — tmux's
+    // default `update-environment` does not carry it, and neither does screen
+    // or a terminal started from a systemd user unit — and a Wayland-only box
+    // ships wl-clipboard and often no xclip. Gating on it made the one tool
+    // that works unreachable there, so the copy fell through to
+    // fire-and-forget OSC 52 (dropped by tmux unless `allow-passthrough` is
+    // on) and the CLI reported a copy that never reached the clipboard.
+    // wl-copy with no Wayland display exits non-zero immediately, so an X11
+    // session pays one failed spawn, last, and only when nothing else worked.
+    return getCliEnv().WAYLAND_DISPLAY
+      ? [wlCopy, ...x11Commands]
+      : [...x11Commands, wlCopy]
+  })()
+
+  for (const [command, args] of commands) {
+    throwIfClipboardAborted(signal)
+    const copied = await writeToClipboardTool(command, args, text, signal)
+    throwIfClipboardAborted(signal)
+    if (copied) return true
+  }
+
+  return false
+}
+
+function tryCopyViaRenderer(text: string): boolean {
+  if (!registeredRenderer) return false
+  const copyFn = registeredRenderer.copyToClipboardOSC52
+  if (typeof copyFn !== 'function') return false
+  try {
+    return Boolean(copyFn.call(registeredRenderer, text))
+  } catch {
+    return false
+  }
+}
+
+// 32KB is safe for all environments (tmux is the strictest)
+const OSC52_MAX_PAYLOAD = 32_000
+
+function isWithinOsc52PayloadLimit(text: string): boolean {
+  const byteLength = Buffer.byteLength(text, 'utf8')
+  const base64Length = 4 * Math.ceil(byteLength / 3)
+  return base64Length <= OSC52_MAX_PAYLOAD
+}
+
+function buildOsc52Sequence(text: string): string | null {
+  const env = getCliEnv()
+  if (env.TERM === 'dumb') return null
+  if (!isWithinOsc52PayloadLimit(text)) return null
+
+  const base64 = Buffer.from(text, 'utf8').toString('base64')
+
+  const osc = `\x1b]52;c;${base64}\x07`
+
+  // tmux: wrap in DCS passthrough with doubled ESC
+  if (env.TMUX) {
+    return `\x1bPtmux;${osc.replace(/\x1b/g, '\x1b\x1b')}\x1b\\`
+  }
+
+  // GNU screen: wrap in DCS passthrough
+  if (env.STY) {
+    return `\x1bP${osc}\x1b\\`
+  }
+
+  return osc
+}
+
+function tryCopyViaTtyOsc52(text: string): boolean {
+  const sequence = buildOsc52Sequence(text)
+  if (!sequence) return false
+
+  const ttyPath = process.platform === 'win32' ? 'CON' : '/dev/tty'
+  let fd: number | null = null
+  try {
+    fd = openSync(ttyPath, 'w')
+    writeSync(fd, sequence)
+    return true
+  } catch {
+    return false
+  } finally {
+    if (fd !== null) closeSync(fd)
+  }
+}

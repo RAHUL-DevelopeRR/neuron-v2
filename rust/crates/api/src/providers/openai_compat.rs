@@ -745,17 +745,28 @@ enum SseFrame {
     Chunk(ChatCompletionChunk),
 }
 
-#[allow(clippy::struct_excessive_bools)]
+/// Kind of the streamed prose block (answer text or reasoning) that is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProseKind {
+    Text,
+    Thinking,
+}
+
 #[derive(Debug)]
 struct StreamState {
     model: String,
     message_started: bool,
-    text_started: bool,
-    text_finished: bool,
     finished: bool,
     stop_reason: Option<String>,
     usage: Option<Usage>,
     tool_calls: BTreeMap<u32, ToolCallState>,
+    /// Index the next content block gets. Blocks are numbered in the order
+    /// they start, so text, thinking and tool blocks never share an index.
+    next_block_index: u32,
+    /// The text or thinking block currently open, with its index. At most
+    /// one is open: switching between reasoning and answer text closes the
+    /// open block and starts a new one.
+    open_prose: Option<(ProseKind, u32)>,
 }
 
 impl StreamState {
@@ -763,12 +774,61 @@ impl StreamState {
         Self {
             model,
             message_started: false,
-            text_started: false,
-            text_finished: false,
             finished: false,
             stop_reason: None,
             usage: None,
             tool_calls: BTreeMap::new(),
+            next_block_index: 0,
+            open_prose: None,
+        }
+    }
+
+    fn allocate_block_index(&mut self) -> u32 {
+        let index = self.next_block_index;
+        self.next_block_index += 1;
+        index
+    }
+
+    /// Appends `delta` to the open block of `kind`, first closing an open
+    /// block of the other kind and starting a new one when needed.
+    fn push_prose_delta(&mut self, kind: ProseKind, delta: String, events: &mut Vec<StreamEvent>) {
+        let index = match self.open_prose {
+            Some((open_kind, index)) if open_kind == kind => index,
+            _ => {
+                self.close_prose(events);
+                let index = self.allocate_block_index();
+                self.open_prose = Some((kind, index));
+                let content_block = match kind {
+                    ProseKind::Text => OutputContentBlock::Text {
+                        text: String::new(),
+                    },
+                    ProseKind::Thinking => OutputContentBlock::Thinking {
+                        thinking: String::new(),
+                        signature: None,
+                    },
+                };
+                events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                    index,
+                    content_block,
+                }));
+                index
+            }
+        };
+        let delta = match kind {
+            ProseKind::Text => ContentBlockDelta::TextDelta { text: delta },
+            ProseKind::Thinking => ContentBlockDelta::ThinkingDelta { thinking: delta },
+        };
+        events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            index,
+            delta,
+        }));
+    }
+
+    fn close_prose(&mut self, events: &mut Vec<StreamEvent>) {
+        if let Some((_, index)) = self.open_prose.take() {
+            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                index,
+            }));
         }
     }
 
@@ -797,42 +857,44 @@ impl StreamState {
         }
 
         if let Some(usage) = chunk.usage {
-            self.usage = Some(Usage {
-                input_tokens: usage.prompt_tokens,
-                cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 0,
-                output_tokens: usage.completion_tokens,
-            });
+            self.usage = Some(usage.to_usage());
         }
 
         for choice in chunk.choices {
-            let content = choice
-                .delta
-                .content
-                .or(choice.delta.reasoning_content)
-                .filter(|value| !value.is_empty());
-            if let Some(content) = content {
-                if !self.text_started {
-                    self.text_started = true;
-                    events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
-                        index: 0,
-                        content_block: OutputContentBlock::Text {
-                            text: String::new(),
-                        },
-                    }));
-                }
-                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-                    index: 0,
-                    delta: ContentBlockDelta::TextDelta { text: content },
-                }));
+            let ChunkDelta {
+                content,
+                reasoning_content,
+                reasoning,
+                tool_calls,
+            } = choice.delta;
+            // Reasoning (`reasoning_content`, or `reasoning` as sent by Groq
+            // and OpenRouter) streams as its own thinking block, never as
+            // answer text. It precedes the answer when a chunk carries both.
+            if let Some(thinking) = reasoning_text(reasoning_content, reasoning.as_ref()) {
+                self.push_prose_delta(ProseKind::Thinking, thinking, &mut events);
+            }
+            if let Some(text) = content.filter(|value| !value.is_empty()) {
+                self.push_prose_delta(ProseKind::Text, text, &mut events);
             }
 
-            for (position, tool_call) in choice.delta.tool_calls.into_iter().enumerate() {
+            for (position, tool_call) in tool_calls.into_iter().enumerate() {
                 let index = self.resolve_tool_call_index(&tool_call, position);
                 let state = self.tool_calls.entry(index).or_default();
                 state.apply(index, tool_call);
-                let block_index = state.block_index();
                 if !state.started {
+                    if state.name.is_none() {
+                        continue;
+                    }
+                    // Reasoning ends where the tool call begins; the answer
+                    // text block stays open until the end of the message.
+                    if let Some((ProseKind::Thinking, thinking_index)) = self.open_prose {
+                        self.open_prose = None;
+                        events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                            index: thinking_index,
+                        }));
+                    }
+                    state.block_index = self.next_block_index;
+                    self.next_block_index += 1;
                     if let Some(start_event) = state.start_event()? {
                         state.started = true;
                         events.push(StreamEvent::ContentBlockStart(start_event));
@@ -846,7 +908,7 @@ impl StreamState {
                 if choice.finish_reason.as_deref() == Some("tool_calls") && !state.stopped {
                     state.stopped = true;
                     events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                        index: block_index,
+                        index: state.block_index,
                     }));
                 }
             }
@@ -858,7 +920,7 @@ impl StreamState {
                         if state.started && !state.stopped {
                             state.stopped = true;
                             events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                                index: state.block_index(),
+                                index: state.block_index,
                             }));
                         }
                     }
@@ -932,15 +994,12 @@ impl StreamState {
         self.finished = true;
 
         let mut events = Vec::new();
-        if self.text_started && !self.text_finished {
-            self.text_finished = true;
-            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                index: 0,
-            }));
-        }
+        self.close_prose(&mut events);
 
         for state in self.tool_calls.values_mut() {
-            if !state.started {
+            if !state.started && state.name.is_some() {
+                state.block_index = self.next_block_index;
+                self.next_block_index += 1;
                 if let Some(start_event) = state.start_event()? {
                     state.started = true;
                     events.push(StreamEvent::ContentBlockStart(start_event));
@@ -952,7 +1011,7 @@ impl StreamState {
             if state.started && !state.stopped {
                 state.stopped = true;
                 events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                    index: state.block_index(),
+                    index: state.block_index,
                 }));
             }
         }
@@ -983,6 +1042,8 @@ impl StreamState {
 #[derive(Debug, Default)]
 struct ToolCallState {
     openai_index: u32,
+    /// Content block index, assigned when the call's block starts.
+    block_index: u32,
     id: Option<String>,
     name: Option<String>,
     arguments: String,
@@ -1005,10 +1066,6 @@ impl ToolCallState {
         }
     }
 
-    const fn block_index(&self) -> u32 {
-        self.openai_index + 1
-    }
-
     #[allow(clippy::unnecessary_wraps)]
     fn start_event(&self) -> Result<Option<ContentBlockStartEvent>, ApiError> {
         let Some(name) = self.name.clone() else {
@@ -1019,7 +1076,7 @@ impl ToolCallState {
             .clone()
             .unwrap_or_else(|| format!("tool_call_{}", self.openai_index));
         Ok(Some(ContentBlockStartEvent {
-            index: self.block_index(),
+            index: self.block_index,
             content_block: OutputContentBlock::ToolUse {
                 id,
                 name,
@@ -1035,7 +1092,7 @@ impl ToolCallState {
         let delta = self.arguments[self.emitted_len..].to_string();
         self.emitted_len = self.arguments.len();
         Some(ContentBlockDeltaEvent {
-            index: self.block_index(),
+            index: self.block_index,
             delta: ContentBlockDelta::InputJsonDelta {
                 partial_json: delta,
             },
@@ -1064,6 +1121,11 @@ struct ChatMessage {
     role: String,
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    /// Groq / `OpenRouter` name for `reasoning_content`.
+    #[serde(default)]
+    reasoning: Option<Value>,
     #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     tool_calls: Vec<ResponseToolCall>,
 }
@@ -1080,12 +1142,42 @@ struct ResponseToolFunction {
     arguments: String,
 }
 
+// The field names are the wire names.
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Deserialize)]
 struct OpenAiUsage {
     #[serde(default)]
-    prompt_tokens: u32,
+    prompt_tokens: Option<u32>,
     #[serde(default)]
-    completion_tokens: u32,
+    completion_tokens: Option<u32>,
+    #[serde(default)]
+    total_tokens: Option<u32>,
+}
+
+impl OpenAiUsage {
+    /// `completion_tokens` already includes reasoning tokens on OpenAI-style
+    /// APIs (`completion_tokens_details.reasoning_tokens` is a breakdown of
+    /// it, so it is not added again). Providers that hide reasoning tokens
+    /// (Gemini) count them only in `total_tokens`; as in the gateway's
+    /// billing, any surplus of the total over prompt + completion is output.
+    fn to_usage(&self) -> Usage {
+        let input_tokens = self.prompt_tokens.unwrap_or_else(|| {
+            match (self.total_tokens, self.completion_tokens) {
+                (Some(total), Some(completion)) => total.saturating_sub(completion),
+                _ => 0,
+            }
+        });
+        let completion_tokens = self.completion_tokens.unwrap_or(0);
+        let output_tokens = self.total_tokens.map_or(completion_tokens, |total| {
+            completion_tokens.max(total.saturating_sub(input_tokens))
+        });
+        Usage {
+            input_tokens,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            output_tokens,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1112,8 +1204,24 @@ struct ChunkDelta {
     content: Option<String>,
     #[serde(default)]
     reasoning_content: Option<String>,
+    /// Groq / `OpenRouter` name for `reasoning_content`.
+    #[serde(default)]
+    reasoning: Option<Value>,
     #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     tool_calls: Vec<DeltaToolCall>,
+}
+
+/// The non-empty reasoning text of a message or delta: `reasoning_content`,
+/// else `reasoning` when it is a string.
+fn reasoning_text(reasoning_content: Option<String>, reasoning: Option<&Value>) -> Option<String> {
+    reasoning_content
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            reasoning
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1559,6 +1667,15 @@ fn normalize_response(
             "chat completion response missing choices",
         ))?;
     let mut content = Vec::new();
+    if let Some(thinking) = reasoning_text(
+        choice.message.reasoning_content,
+        choice.message.reasoning.as_ref(),
+    ) {
+        content.push(OutputContentBlock::Thinking {
+            thinking,
+            signature: None,
+        });
+    }
     if let Some(text) = choice.message.content.filter(|value| !value.is_empty()) {
         content.push(OutputContentBlock::Text { text });
     }
@@ -1580,18 +1697,11 @@ fn normalize_response(
             .finish_reason
             .map(|value| normalize_finish_reason(&value)),
         stop_sequence: None,
-        usage: Usage {
-            input_tokens: response
-                .usage
-                .as_ref()
-                .map_or(0, |usage| usage.prompt_tokens),
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-            output_tokens: response
-                .usage
-                .as_ref()
-                .map_or(0, |usage| usage.completion_tokens),
-        },
+        usage: response
+            .usage
+            .as_ref()
+            .map(OpenAiUsage::to_usage)
+            .unwrap_or_default(),
         request_id: None,
     })
 }
@@ -1968,7 +2078,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             starts,
-            vec![(1, "call_a".to_string()), (2, "call_b".to_string())]
+            vec![(0, "call_a".to_string()), (1, "call_b".to_string())]
         );
         let arguments = |index: u32| {
             events
@@ -1986,8 +2096,230 @@ mod tests {
                 })
                 .collect::<String>()
         };
-        assert_eq!(arguments(1), r#"{"path":"a.txt"}"#);
-        assert_eq!(arguments(2), r#"{"path":"b.txt"}"#);
+        assert_eq!(arguments(0), r#"{"path":"a.txt"}"#);
+        assert_eq!(arguments(1), r#"{"path":"b.txt"}"#);
+    }
+
+    /// Collects `(kind, index)` for block starts, `("delta:<kind>", index)`
+    /// for deltas and `("stop", index)` for stops, in stream order.
+    fn block_trace(events: &[crate::types::StreamEvent]) -> Vec<(String, u32)> {
+        use crate::types::{ContentBlockDelta, OutputContentBlock, StreamEvent};
+        events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ContentBlockStart(start) => {
+                    let kind = match &start.content_block {
+                        OutputContentBlock::Text { .. } => "text",
+                        OutputContentBlock::Thinking { .. } => "thinking",
+                        OutputContentBlock::ToolUse { .. } => "tool",
+                        OutputContentBlock::RedactedThinking { .. } => "redacted",
+                    };
+                    Some((kind.to_string(), start.index))
+                }
+                StreamEvent::ContentBlockDelta(delta) => {
+                    let kind = match &delta.delta {
+                        ContentBlockDelta::TextDelta { .. } => "delta:text",
+                        ContentBlockDelta::ThinkingDelta { .. } => "delta:thinking",
+                        ContentBlockDelta::InputJsonDelta { .. } => "delta:tool",
+                        ContentBlockDelta::SignatureDelta { .. } => "delta:signature",
+                    };
+                    Some((kind.to_string(), delta.index))
+                }
+                StreamEvent::ContentBlockStop(stop) => Some(("stop".to_string(), stop.index)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn streamed_text(events: &[crate::types::StreamEvent]) -> (String, String) {
+        use crate::types::{ContentBlockDelta, StreamEvent};
+        let mut text = String::new();
+        let mut thinking = String::new();
+        for event in events {
+            if let StreamEvent::ContentBlockDelta(delta) = event {
+                match &delta.delta {
+                    ContentBlockDelta::TextDelta { text: value } => text.push_str(value),
+                    ContentBlockDelta::ThinkingDelta { thinking: value } => {
+                        thinking.push_str(value);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        (text, thinking)
+    }
+
+    fn ingest_all(
+        state: &mut super::StreamState,
+        chunks: Vec<serde_json::Value>,
+    ) -> Vec<crate::types::StreamEvent> {
+        let mut events = Vec::new();
+        for chunk in chunks {
+            events.extend(
+                state
+                    .ingest_chunk(serde_json::from_value(chunk).unwrap())
+                    .unwrap(),
+            );
+        }
+        events.extend(state.finish().unwrap());
+        events
+    }
+
+    /// The gateway renames Groq / `OpenRouter` `reasoning` to
+    /// `reasoning_content`; both stream as a thinking block, never as text.
+    #[test]
+    fn streamed_reasoning_becomes_a_thinking_block_before_the_text() {
+        for field in ["reasoning_content", "reasoning"] {
+            let mut state = super::StreamState::new("nvidia/nemotron".into());
+            let events = ingest_all(
+                &mut state,
+                vec![
+                    serde_json::json!({"id": "r", "choices": [{"delta": {field: "Let me "}}]}),
+                    serde_json::json!({"id": "r", "choices": [{"delta": {field: "think."}}]}),
+                    serde_json::json!({"id": "r", "choices": [{"delta": {"content": "Hello"}}]}),
+                    serde_json::json!({"id": "r", "choices": [{"delta": {"content": "!"}, "finish_reason": "stop"}]}),
+                ],
+            );
+            let (text, thinking) = streamed_text(&events);
+            assert_eq!(text, "Hello!", "{field}");
+            assert_eq!(thinking, "Let me think.", "{field}");
+            let trace = block_trace(&events)
+                .into_iter()
+                .map(|(kind, index)| format!("{kind}@{index}"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                trace,
+                [
+                    "thinking@0",
+                    "delta:thinking@0",
+                    "delta:thinking@0",
+                    "stop@0",
+                    "text@1",
+                    "delta:text@1",
+                    "delta:text@1",
+                    "stop@1",
+                ],
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_with_reasoning_and_content_emits_both_blocks_in_order() {
+        let mut state = super::StreamState::new("groq/openai/gpt-oss-120b".into());
+        let events = ingest_all(
+            &mut state,
+            vec![
+                serde_json::json!({"id": "r", "choices": [{"delta": {"reasoning": "plan", "content": "answer"}}]}),
+                serde_json::json!({"id": "r", "choices": [{"delta": {"reasoning_content": "more"}}]}),
+                serde_json::json!({"id": "r", "choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]}),
+            ],
+        );
+        let trace = block_trace(&events)
+            .into_iter()
+            .map(|(kind, index)| format!("{kind}@{index}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            trace,
+            [
+                "thinking@0",
+                "delta:thinking@0",
+                "stop@0",
+                "text@1",
+                "delta:text@1",
+                "stop@1",
+                "thinking@2",
+                "delta:thinking@2",
+                "stop@2",
+                "text@3",
+                "delta:text@3",
+                "stop@3",
+            ]
+        );
+        assert_eq!(
+            streamed_text(&events),
+            ("answerdone".to_string(), "planmore".to_string())
+        );
+    }
+
+    #[test]
+    fn reasoning_then_tool_call_closes_thinking_and_gets_distinct_indexes() {
+        let mut state = super::StreamState::new("auto".into());
+        let events = ingest_all(
+            &mut state,
+            vec![
+                serde_json::json!({"id": "t", "choices": [{"delta": {"reasoning_content": "need a file"}}]}),
+                serde_json::json!({"id": "t", "choices": [{"delta": {"tool_calls": [
+                    {"index": 0, "id": "call_1", "function": {"name": "read_file", "arguments": "{}"}}
+                ]}, "finish_reason": "tool_calls"}]}),
+            ],
+        );
+        let trace = block_trace(&events)
+            .into_iter()
+            .map(|(kind, index)| format!("{kind}@{index}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            trace,
+            [
+                "thinking@0",
+                "delta:thinking@0",
+                "stop@0",
+                "tool@1",
+                "delta:tool@1",
+                "stop@1",
+            ]
+        );
+    }
+
+    #[test]
+    fn non_streaming_reasoning_becomes_a_thinking_block() {
+        for field in ["reasoning_content", "reasoning"] {
+            let payload = serde_json::from_value(serde_json::json!({
+                "id": "chatcmpl_r",
+                "model": "nvidia/nemotron",
+                "choices": [{"message": {"role": "assistant", "content": "Hi", field: "thinking..."}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 7}
+            }))
+            .unwrap();
+            let response = super::normalize_response("nvidia/nemotron", payload).unwrap();
+            assert_eq!(
+                response.content,
+                vec![
+                    crate::types::OutputContentBlock::Thinking {
+                        thinking: "thinking...".to_string(),
+                        signature: None,
+                    },
+                    crate::types::OutputContentBlock::Text {
+                        text: "Hi".to_string()
+                    },
+                ],
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn output_tokens_match_the_gateways_completion_tokens() {
+        let usage = |value: serde_json::Value| {
+            serde_json::from_value::<super::OpenAiUsage>(value)
+                .unwrap()
+                .to_usage()
+        };
+        // OpenAI style: reasoning tokens are part of completion_tokens.
+        let openai = usage(serde_json::json!({
+            "prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150,
+            "completion_tokens_details": {"reasoning_tokens": 30}
+        }));
+        assert_eq!((openai.input_tokens, openai.output_tokens), (100, 50));
+        // Gemini style: hidden reasoning tokens only show in total_tokens.
+        let gemini = usage(serde_json::json!({
+            "prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 170
+        }));
+        assert_eq!((gemini.input_tokens, gemini.output_tokens), (100, 70));
+        let no_total = usage(serde_json::json!({"prompt_tokens": 9, "completion_tokens": 4}));
+        assert_eq!((no_total.input_tokens, no_total.output_tokens), (9, 4));
+        let no_prompt = usage(serde_json::json!({"completion_tokens": 4, "total_tokens": 13}));
+        assert_eq!((no_prompt.input_tokens, no_prompt.output_tokens), (9, 4));
     }
 
     #[test]

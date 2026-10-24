@@ -1999,9 +1999,8 @@ fn check_awk_args(args: &[Word]) -> Result<Vec<usize>, String> {
                     }
                 }
                 ["assign" | "field-separator"] => {
-                    if value.is_none() {
-                        index += 1;
-                    }
+                    // The value is the next word unless given inline.
+                    index += usize::from(value.is_none());
                 }
                 _ if candidates.iter().any(|candidate| {
                     matches!(*candidate, "source" | "assign" | "field-separator")

@@ -3,6 +3,9 @@
 #
 # Downloads a prebuilt `neuron` binary from GitHub Releases, verifies it
 # against the release's SHA-256 file, and installs it into a bin directory.
+# Beside it goes `neuron-tui`, the full-screen UI that `neuron` opens on a
+# terminal; nothing about the UI fails the install (without it, `neuron` runs
+# its line REPL).
 #
 #   curl -fsSL https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/latest/download/install.sh | sh
 #   curl -fsSL .../install.sh | sh -s -- --version 6.3.0 --install-dir "$HOME/bin"
@@ -14,6 +17,7 @@
 #                          must be HTTPS unless it points at a loopback host
 #   NEURON_RELEASES_API    URL of the "latest release" JSON (default: GitHub API)
 #   GITHUB_TOKEN           optional token for the GitHub API rate limit
+#   NEURON_NO_TUI          1 skips the full-screen UI
 #
 # Windows: use install.ps1 from PowerShell instead.
 
@@ -309,6 +313,43 @@ if ! VERSION_OUTPUT="$("${STAGED}" --version </dev/null 2>&1)"; then
 fi
 mv -f "${STAGED}" "${DESTINATION}"
 STAGED=""
+
+# The full-screen UI, verified and self-checked like `neuron`; returns 1 (and
+# installs nothing) on any failure.
+install_ui() {
+    UI_ASSET="neuron-tui-${TARGET}"
+    UI_URL="${DOWNLOAD_BASE}/v${VERSION}/${UI_ASSET}"
+    fetch "${UI_URL}.sha256" "${TMP_DIR}/${UI_ASSET}.sha256" || return 1
+    UI_EXPECTED="$(awk 'NR == 1 {print tolower($1)}' "${TMP_DIR}/${UI_ASSET}.sha256")"
+    printf '%s\n' "${UI_EXPECTED}" | grep -Eq '^[0-9a-f]{64}$' || return 1
+    fetch "${UI_URL}" "${TMP_DIR}/${UI_ASSET}" || return 1
+    if [ "$(sha256_of "${TMP_DIR}/${UI_ASSET}")" != "${UI_EXPECTED}" ]; then
+        warn "checksum mismatch for ${UI_ASSET}; it was not installed."
+        return 1
+    fi
+    STAGED="${INSTALL_DIR}/.neuron-tui.$$.tmp"
+    cp "${TMP_DIR}/${UI_ASSET}" "${STAGED}" 2>/dev/null || return 1
+    chmod 755 "${STAGED}"
+    if ! "${STAGED}" --version </dev/null >/dev/null 2>&1; then
+        rm -f "${STAGED}"
+        STAGED=""
+        return 1
+    fi
+    mv -f "${STAGED}" "${INSTALL_DIR}/neuron-tui"
+    STAGED=""
+}
+
+case "$(printf '%s' "${NEURON_NO_TUI:-}" | tr '[:upper:]' '[:lower:]')" in
+    "" | 0 | false | no)
+        info "installing the full-screen UI (neuron-tui) ..."
+        if install_ui; then
+            info "installed ${INSTALL_DIR}/neuron-tui"
+        else
+            warn "the full-screen UI was not installed; neuron uses its line REPL. Rerun the installer to try again."
+        fi
+        ;;
+    *) info "NEURON_NO_TUI is set; skipped the full-screen UI." ;;
+esac
 
 # The release binary prints a report whose second line is "  Version  X.Y.Z".
 REPORTED="$(printf '%s\n' "${VERSION_OUTPUT}" | sed -n 's/^[[:space:]]*Version[[:space:]][[:space:]]*\([^[:space:]][^[:space:]]*\).*/\1/p' | head -n 1)"

@@ -13,52 +13,113 @@ use std::io::{self, Write};
 
 pub(crate) struct CliPermissionPrompter {
     current_mode: PermissionMode,
+    /// The turn's token: cancelled when a non-interactive run reaches
+    /// [`crate::headless::DENIAL_LIMIT`] denied calls.
+    turn: Option<runtime::CancellationToken>,
 }
 
 impl CliPermissionPrompter {
     pub fn new(current_mode: PermissionMode) -> Self {
-        Self { current_mode }
+        Self {
+            current_mode,
+            turn: None,
+        }
+    }
+
+    /// Stops the turn of `turn` once a non-interactive run has denied
+    /// [`crate::headless::DENIAL_LIMIT`] calls.
+    pub fn stopping(mut self, turn: runtime::CancellationToken) -> Self {
+        self.turn = Some(turn);
+        self
+    }
+
+    /// Denies a call nobody can approve. The model gets the reason as the tool's result,
+    /// the user sees it now and in the run's last warning; enough of them stop the turn.
+    fn deny_unattended(
+        &self,
+        request: &runtime::PermissionRequest,
+    ) -> runtime::PermissionPromptDecision {
+        let reason = crate::headless::denial_reason(
+            &request.tool_name,
+            self.current_mode,
+            request.required_mode,
+        );
+        if crate::headless::record_denial(&request.tool_name, &reason) {
+            if let Some(turn) = &self.turn {
+                turn.cancel();
+            }
+        }
+        runtime::PermissionPromptDecision::Deny {
+            reason: crate::headless::denial_for_model(&reason),
+        }
     }
 }
 
-// The line REPL prompts on its own terminal.
-#[allow(clippy::print_stdout)]
 impl runtime::PermissionPrompter for CliPermissionPrompter {
     fn decide(
         &mut self,
         request: &runtime::PermissionRequest,
     ) -> runtime::PermissionPromptDecision {
-        println!();
-        println!("Permission approval required");
-        println!("  Tool             {}", request.tool_name);
-        println!("  Current mode     {}", self.current_mode.as_str());
-        println!("  Required mode    {}", request.required_mode.as_str());
-        if let Some(reason) = &request.reason {
-            println!("  Reason           {reason}");
+        // Nobody can answer (a script, CI, `< /dev/null`): no prompt.
+        if crate::headless::stdin_is_unattended() {
+            return self.deny_unattended(request);
         }
-        println!("  Input            {}", request.input);
-        print!("Approve this tool call? [y/N]: ");
-        let _ = io::stdout().flush();
+        // Stdout redirected (`neuron prompt ... > out.txt`): ask on stderr. With stderr
+        // redirected too, nobody would see the question.
+        let Some(stream) = runtime::ui_hooks::PromptStream::current() else {
+            return self.deny_unattended(request);
+        };
+        ask_for_approval(
+            &mut stream.writer(),
+            &mut io::stdin().lock(),
+            request,
+            self.current_mode,
+        )
+    }
+}
 
-        let mut response = String::new();
-        match io::stdin().read_line(&mut response) {
-            Ok(_) => {
-                let normalized = response.trim().to_ascii_lowercase();
-                if matches!(normalized.as_str(), "y" | "yes") {
-                    runtime::PermissionPromptDecision::Allow
-                } else {
-                    runtime::PermissionPromptDecision::Deny {
-                        reason: format!(
-                            "tool '{}' denied by user approval prompt",
-                            request.tool_name
-                        ),
-                    }
+/// Writes the approval question for `request` to `out` and reads the answer from
+/// `input`: `y` or `yes` approves the call once, anything else denies it.
+fn ask_for_approval(
+    out: &mut dyn Write,
+    input: &mut dyn io::BufRead,
+    request: &runtime::PermissionRequest,
+    current_mode: PermissionMode,
+) -> runtime::PermissionPromptDecision {
+    let mut question = format!(
+        "\nPermission approval required\n  Tool             {}\n  Current mode     {}\n  Required mode    {}\n",
+        request.tool_name,
+        current_mode.as_str(),
+        request.required_mode.as_str()
+    );
+    if let Some(reason) = &request.reason {
+        question.push_str(&format!("  Reason           {reason}\n"));
+    }
+    question.push_str(&format!(
+        "  Input            {}\nApprove this tool call? [y/N]: ",
+        request.input
+    ));
+    let _ = out.write_all(question.as_bytes());
+    let _ = out.flush();
+
+    let mut response = String::new();
+    match input.read_line(&mut response) {
+        Ok(_) => {
+            let normalized = response.trim().to_ascii_lowercase();
+            if matches!(normalized.as_str(), "y" | "yes") {
+                runtime::PermissionPromptDecision::Allow
+            } else {
+                runtime::PermissionPromptDecision::Deny {
+                    reason: format!(
+                        "tool '{}' denied by user approval prompt",
+                        request.tool_name
+                    ),
                 }
             }
-            Err(error) => runtime::PermissionPromptDecision::Deny {
-                reason: format!("permission approval failed: {error}"),
-            },
         }
+        Err(error) => runtime::PermissionPromptDecision::Deny {
+            reason: format!("permission approval failed: {error}"),
+        },
     }
 }
 
@@ -89,6 +150,18 @@ impl<'a> ChannelPermissionPrompter<'a> {
             cancel,
             next_id: 0,
         }
+    }
+
+    /// Numbers this prompter's requests after `last_id`, so a late answer to an earlier
+    /// turn's request never matches one of this turn's.
+    pub(crate) fn numbered_after(mut self, last_id: u64) -> Self {
+        self.next_id = last_id;
+        self
+    }
+
+    /// The id of the last request sent (or the starting point when none was).
+    pub(crate) fn last_id(&self) -> u64 {
+        self.next_id
     }
 }
 
@@ -189,26 +262,56 @@ impl CliToolExecutor {
     pub fn execute_search_tool(&self, value: serde_json::Value) -> Result<String, ToolError> {
         let input: ToolSearchRequest = serde_json::from_value(value)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        let (pending_mcp_servers, mcp_degraded) =
-            self.mcp_state.as_ref().map_or((None, None), |state| {
+        let (pending_mcp_servers, failed_mcp_servers, mcp_degraded, mcp_starting) = self
+            .mcp_state
+            .as_ref()
+            .map_or((None, None, None, None), |state| {
                 let state = state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                (state.pending_servers(), state.degraded_report())
+                (
+                    state.pending_servers(),
+                    state.failed_server_names(),
+                    state.degraded_report(),
+                    state.starting_note(),
+                )
             });
-        serde_json::to_string_pretty(&self.tool_registry.search(
+        let output = self.tool_registry.search(
             &input.query,
             input.max_results.unwrap_or(5),
             pending_mcp_servers,
             mcp_degraded,
-        ))
-        .map_err(|error| ToolError::new(error.to_string()))
+        );
+        let mut output =
+            serde_json::to_value(output).map_err(|error| ToolError::new(error.to_string()))?;
+        if let Some(failed) = failed_mcp_servers {
+            output["failed_mcp_servers"] = json!(failed);
+        }
+        let mut notes = Vec::new();
+        if let Some(note) = mcp_starting {
+            // Like the MCP tools say: no match yet is not "no such tool".
+            notes.push(note);
+        }
+        let left_out = crate::progress::left_out_bundled_mcp_servers();
+        if !left_out.is_empty() {
+            // A one-shot run: without this the model keeps searching for them.
+            notes.push(format!(
+                "This one-shot run (`neuron prompt`) does not load the bundled MCP servers ({}), so their tools are not available and no search will find them. Interactive sessions load them.",
+                left_out.join(", ")
+            ));
+        }
+        if !notes.is_empty() {
+            output["note"] = json!(notes.join(" "));
+        }
+        serde_json::to_string_pretty(&output).map_err(|error| ToolError::new(error.to_string()))
     }
 
+    /// Runs an MCP tool or wrapper; `cancel` abandons a tool call that is still running.
     pub fn execute_runtime_tool(
         &self,
         tool_name: &str,
         value: serde_json::Value,
+        cancel: &runtime::CancellationToken,
     ) -> Result<String, ToolError> {
         let Some(mcp_state) = &self.mcp_state else {
             return Err(ToolError::new(format!(
@@ -227,7 +330,10 @@ impl CliToolExecutor {
                     .qualified_name
                     .or(input.tool)
                     .ok_or_else(|| ToolError::new("missing required field `qualifiedName`"))?;
-                mcp_state.call_tool(&qualified_name, input.arguments)
+                // Models send the object as JSON text too; servers want the object.
+                let arguments = tools::mcp_call_arguments(input.arguments)
+                    .map_err(|error| ToolError::new(format!("invalid MCPTool input: {error}")))?;
+                mcp_state.call_tool(&qualified_name, arguments, cancel)
             }
             "ListMcpResourcesTool" => {
                 let input: ListMcpResourcesRequest = serde_json::from_value(value)
@@ -242,13 +348,24 @@ impl CliToolExecutor {
                     .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
                 mcp_state.read_resource(&input.server, &input.uri)
             }
-            _ => mcp_state.call_tool(tool_name, Some(value)),
+            _ => mcp_state.call_tool(tool_name, Some(value), cancel),
         }
     }
 }
 
 impl ToolExecutor for CliToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        self.execute_with_cancellation(tool_name, input, &runtime::CancellationToken::new())
+    }
+
+    /// An interrupted turn cancels `cancel`: `bash`, `PowerShell` and `REPL` then kill
+    /// the command's whole process tree and return the output captured so far.
+    fn execute_with_cancellation(
+        &mut self,
+        tool_name: &str,
+        input: &str,
+        cancel: &runtime::CancellationToken,
+    ) -> Result<String, ToolError> {
         if self
             .allowed_tools
             .as_ref()
@@ -263,10 +380,10 @@ impl ToolExecutor for CliToolExecutor {
         let result = if tool_name == "ToolSearch" {
             self.execute_search_tool(value)
         } else if self.tool_registry.has_runtime_tool(tool_name) {
-            self.execute_runtime_tool(tool_name, value)
+            self.execute_runtime_tool(tool_name, value, cancel)
         } else {
             self.tool_registry
-                .execute(tool_name, &value)
+                .execute_with_cancel(tool_name, &value, cancel)
                 .map_err(ToolError::new)
         };
         match result {
@@ -283,6 +400,11 @@ impl ToolExecutor for CliToolExecutor {
                 Err(error)
             }
         }
+    }
+
+    fn tool_call_finished(&mut self, id: &str, name: &str, output: &str, is_error: bool) {
+        // A closed UI also fails the turn's next stream write, which ends the turn.
+        let _ = self.output.tool_call_finished(id, name, output, is_error);
     }
 }
 
@@ -345,16 +467,47 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "neuron v{VERSION}")?;
     writeln!(out)?;
     writeln!(out, "Usage:")?;
-    writeln!(out, "  neuron auth <login|logout|status>")?;
+    writeln!(
+        out,
+        "  neuron auth <login|logout|status> [--output-format text|json]"
+    )?;
     writeln!(
         out,
         "      Connect your Zero-X account to the coding gateway"
+    )?;
+    writeln!(out, "  neuron login [--no-browser | --with-token]")?;
+    writeln!(
+        out,
+        "      Sign in to Zero-X (short for `neuron auth login`; --with-token reads a token from stdin)"
+    )?;
+    writeln!(out, "  neuron logout")?;
+    writeln!(
+        out,
+        "      Sign out of Zero-X (short for `neuron auth logout`)"
+    )?;
+    writeln!(out, "  neuron usage")?;
+    writeln!(
+        out,
+        "      Show your Zero-X plan, today's usage and credits"
+    )?;
+    writeln!(out, "  neuron upgrade [--no-browser]")?;
+    writeln!(out, "      Open the Zero-X plans page")?;
+    writeln!(
+        out,
+        "      (These account commands take --output-format text|json. To send a prompt that"
+    )?;
+    writeln!(
+        out,
+        "      starts with one of their names, quote it or use `neuron prompt \"...\"`.)"
     )?;
     writeln!(
         out,
         "  neuron [--model MODEL] [--allowedTools TOOL[,TOOL...]]"
     )?;
-    writeln!(out, "      Start the interactive REPL")?;
+    writeln!(
+        out,
+        "      Start the full-screen UI on a terminal (the line REPL with --no-tui, or without neuron-tui)"
+    )?;
     writeln!(
         out,
         "  neuron [--model MODEL] [--output-format text|json] prompt TEXT"
@@ -389,8 +542,6 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "      Diagnose local auth, config, workspace, and sandbox health"
     )?;
-    writeln!(out, "  npm run tui -- [-- --model MODEL]")?;
-    writeln!(out, "      Launch the optional React/Ink terminal frontend")?;
     writeln!(out, "  neuron acp [serve]")?;
     writeln!(
         out,
@@ -446,6 +597,14 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         "  --reasoning-effort LEVEL   low, medium or high, for models that support it"
     )?;
     writeln!(out, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)")?;
+    writeln!(
+        out,
+        "  --no-tui                   Use the line REPL even where the full-screen UI is installed (or set NEURON_NO_TUI=1)"
+    )?;
+    writeln!(
+        out,
+        "  --continue [CHAT]          Reopen a chat in the full-screen UI (the latest, or CHAT)"
+    )?;
     writeln!(
         out,
         "  --version, -V              Print version and build information locally"
@@ -526,6 +685,90 @@ pub(crate) fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn s
         ),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tool_search_tests {
+    use super::CliToolExecutor;
+    use runtime::ToolExecutor;
+    use tools::GlobalToolRegistry;
+
+    /// A one-shot run leaves out the bundled MCP servers; one model searched for their
+    /// tools 17 times. ToolSearch says they are not loaded.
+    #[test]
+    fn tool_search_says_a_one_shot_run_left_out_the_bundled_mcp_servers() {
+        crate::progress::set_left_out_bundled_mcp_servers(vec![
+            "codebase-memory".to_string(),
+            "playwright".to_string(),
+        ]);
+        let mut executor = CliToolExecutor::new(None, false, GlobalToolRegistry::builtin(), None);
+        let output = executor.execute("ToolSearch", r#"{"query":"browser navigate"}"#);
+        crate::progress::set_left_out_bundled_mcp_servers(Vec::new());
+
+        let output: serde_json::Value =
+            serde_json::from_str(&output.expect("ToolSearch runs")).expect("json");
+        let note = output["note"].as_str().unwrap_or_default();
+        assert!(
+            note.contains("does not load the bundled MCP servers (codebase-memory, playwright)"),
+            "{output}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cli_prompter_tests {
+    use super::ask_for_approval;
+    use runtime::{PermissionMode, PermissionPromptDecision, PermissionRequest};
+    use std::io::Cursor;
+
+    fn request() -> PermissionRequest {
+        PermissionRequest {
+            tool_name: "bash".to_string(),
+            input: r#"{"command":"mkdir out"}"#.to_string(),
+            current_mode: PermissionMode::WorkspaceWrite,
+            required_mode: PermissionMode::DangerFullAccess,
+            reason: Some("Run `mkdir out`?".to_string()),
+            session_prefixes: Vec::new(),
+        }
+    }
+
+    /// The whole question goes to the stream it is given (stderr when stdout is
+    /// redirected); the answer comes from stdin.
+    #[test]
+    fn the_approval_question_goes_to_the_given_stream() {
+        let mut out = Vec::new();
+        let decision = ask_for_approval(
+            &mut out,
+            &mut Cursor::new("y\n"),
+            &request(),
+            PermissionMode::WorkspaceWrite,
+        );
+        assert_eq!(decision, PermissionPromptDecision::Allow);
+        let shown = String::from_utf8(out).expect("utf-8");
+        assert!(
+            shown.starts_with("\nPermission approval required\n  Tool             bash\n"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("  Reason           Run `mkdir out`?\n"),
+            "{shown}"
+        );
+        assert!(
+            shown.ends_with("Approve this tool call? [y/N]: "),
+            "{shown}"
+        );
+
+        let decision = ask_for_approval(
+            &mut Vec::new(),
+            &mut Cursor::new("\n"),
+            &request(),
+            PermissionMode::WorkspaceWrite,
+        );
+        assert!(
+            matches!(decision, PermissionPromptDecision::Deny { ref reason } if reason == "tool 'bash' denied by user approval prompt"),
+            "{decision:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -670,5 +913,326 @@ mod channel_prompter_tests {
         )
         .decide(&request(&[]));
         assert!(matches!(decision, PermissionPromptDecision::Deny { .. }));
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::CliToolExecutor;
+    use runtime::{CancellationToken, ToolExecutor};
+    use serde_json::{json, Value};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::thread;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use tools::GlobalToolRegistry;
+
+    /// Where the command under test writes the PID of the long-running child it starts.
+    fn pid_file(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        std::env::temp_dir().join(format!(
+            "neuron-cancel-{label}-{}-{nanos}.pid",
+            std::process::id()
+        ))
+    }
+
+    /// Whether process `pid` still runs (a zombie waiting to be reaped does not).
+    fn is_running(pid: u32) -> bool {
+        if cfg!(windows) {
+            // Not `tasklist`: it hangs while the WMI service is stuck.
+            Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    &format!(
+                        "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ 'running' }}"
+                    ),
+                ])
+                .output()
+                .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains("running"))
+        } else {
+            Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .is_ok_and(|output| {
+                    let state = String::from_utf8_lossy(&output.stdout);
+                    let state = state.trim();
+                    !state.is_empty() && !state.starts_with('Z')
+                })
+        }
+    }
+
+    /// Runs `tool` through the CLI executor, interrupts the turn once the command's child
+    /// wrote its PID to `pid_file`, and checks that the call returns promptly with an
+    /// interrupted result and that the child is gone with the shell that started it.
+    fn assert_interrupt_kills_the_process_tree(tool: &str, input: &Value, pid_file: &Path) {
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        let watched = pid_file.to_path_buf();
+        let interrupter = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let pid = loop {
+                if let Some(pid) = std::fs::read_to_string(&watched)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok())
+                {
+                    break pid;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the command never started its child"
+                );
+                thread::sleep(Duration::from_millis(50));
+            };
+            let running_before = is_running(pid);
+            trigger.cancel();
+            (pid, running_before, Instant::now())
+        });
+        let mut executor = CliToolExecutor::new(None, false, GlobalToolRegistry::builtin(), None);
+        let result = executor.execute_with_cancellation(tool, &input.to_string(), &cancel);
+        let returned = Instant::now();
+        let (pid, running_before, interrupted_at) = interrupter.join().expect("interrupter");
+        let _ = std::fs::remove_file(pid_file);
+
+        assert!(running_before, "child {pid} runs until the interrupt");
+        let error = result.expect_err("a cancelled command is an error result");
+        let output: Value = serde_json::from_str(&error.to_string()).expect("the JSON envelope");
+        assert_eq!(output["interrupted"], true, "{output}");
+        assert_eq!(output["returnCodeInterpretation"], "cancelled", "{output}");
+        let took = returned.saturating_duration_since(interrupted_at);
+        assert!(
+            took < Duration::from_secs(5),
+            "returned {took:?} after the interrupt"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while is_running(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "child {pid} still runs after the interrupt"
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    #[test]
+    fn an_interrupt_kills_a_running_bash_command_and_its_children() {
+        let pid_file = pid_file("bash");
+        // The shell starts a child that would run for 30 s; the child reports its PID.
+        let command = if cfg!(windows) {
+            format!(
+                "powershell -NoProfile -NonInteractive -Command \"Set-Content -LiteralPath '{}' -Value $PID; Start-Sleep -Seconds 30\"",
+                pid_file.display()
+            )
+        } else {
+            format!("sleep 30 & echo $! > '{}'; wait", pid_file.display())
+        };
+        assert_interrupt_kills_the_process_tree(
+            "bash",
+            &json!({ "command": command, "timeout": 90_000 }),
+            &pid_file,
+        );
+    }
+
+    #[test]
+    #[allow(clippy::print_stderr)]
+    fn an_interrupt_kills_a_running_powershell_command_and_its_children() {
+        let shell = if cfg!(windows) { "powershell" } else { "pwsh" };
+        if Command::new(shell)
+            .args(["-NoProfile", "-Command", "exit 0"])
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: {shell} is not installed");
+            return;
+        }
+        let pid_file = pid_file("powershell");
+        let (program, arguments) = if cfg!(windows) {
+            ("ping.exe", "'-n','30','127.0.0.1'")
+        } else {
+            ("sleep", "'30'")
+        };
+        let command = format!(
+            "$child = Start-Process -FilePath {program} -ArgumentList {arguments} -NoNewWindow -PassThru; Set-Content -LiteralPath '{}' -Value $child.Id; $child.WaitForExit()",
+            pid_file.display()
+        );
+        assert_interrupt_kills_the_process_tree(
+            "PowerShell",
+            &json!({ "command": command, "timeout": 90_000 }),
+            &pid_file,
+        );
+    }
+
+    /// An MCP server (newline-delimited JSON-RPC) with `echo`, which reports the
+    /// arguments it got, and `wait`, which writes its PID to `argv[1]` and sleeps.
+    const MCP_FIXTURE: &str = r"import json, os, sys, time
+pid_file = sys.argv[1]
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    if not line.strip():
+        continue
+    request = json.loads(line)
+    if 'id' not in request:
+        continue
+    method = request['method']
+    if method == 'initialize':
+        result = {'protocolVersion': request['params']['protocolVersion'], 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'fixture', 'version': '1.0.0'}}
+    elif method == 'tools/list':
+        result = {'tools': [
+            {'name': 'echo', 'description': 'Reports its arguments', 'inputSchema': {'type': 'object', 'properties': {'text': {'type': 'string'}}}},
+            {'name': 'wait', 'description': 'Sleeps for a minute', 'inputSchema': {'type': 'object', 'properties': {}}},
+        ]}
+    elif method == 'tools/call':
+        args = request['params'].get('arguments')
+        if request['params']['name'] == 'wait':
+            with open(pid_file, 'w') as out:
+                out.write(str(os.getpid()))
+            time.sleep(60)
+        result = {'content': [{'type': 'text', 'text': type(args).__name__ + ':' + json.dumps(args)}], 'isError': False}
+    else:
+        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'error': {'code': -32601, 'message': method}}) + '\n')
+        sys.stdout.flush()
+        continue
+    sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}) + '\n')
+    sys.stdout.flush()
+";
+
+    /// The Python that runs [`MCP_FIXTURE`]: the `py -3` launcher on Windows, or `python`
+    /// where only that is installed.
+    fn python() -> (&'static str, Vec<String>) {
+        if !cfg!(windows) {
+            return ("python3", Vec::new());
+        }
+        if Command::new("py").arg("--version").output().is_ok() {
+            ("py", vec!["-3".to_string()])
+        } else {
+            ("python", Vec::new())
+        }
+    }
+
+    /// `MCPTool` arguments sent as JSON text reach the server as an object, and an
+    /// interrupt abandons a running MCP call instead of waiting for it (it held up the
+    /// turn and shutdown for 42 s): the call returns an "interrupted" error, the server
+    /// is stopped, and the next call starts it again.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn mcp_calls_take_arguments_as_text_and_an_interrupt_abandons_them() {
+        let root = pid_file("mcp-workspace").with_extension("");
+        let workspace = root.join("workspace");
+        let config_home = root.join("config");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(&config_home).expect("config home");
+        let script = root.join("fixture-mcp.py");
+        std::fs::write(&script, MCP_FIXTURE).expect("fixture");
+        let wait_pid = root.join("wait.pid");
+        let (python, mut args) = python();
+        args.push(script.display().to_string());
+        args.push(wait_pid.display().to_string());
+        std::fs::write(
+            config_home.join("settings.json"),
+            json!({
+                "defaultMcpServers": false,
+                "mcpServers": { "alpha": { "command": python, "args": args } }
+            })
+            .to_string(),
+        )
+        .expect("settings");
+        let loader = runtime::ConfigLoader::new(&workspace, &config_home);
+        let config = loader.load().expect("config");
+        let state = crate::build_runtime_plugin_state_with_loader(&workspace, &loader, &config)
+            .expect("plugin state");
+        let mut executor = CliToolExecutor::new(
+            None,
+            false,
+            state.tool_registry.clone(),
+            state.mcp_state.clone(),
+        );
+
+        // As text, parsed; as an object, unchanged.
+        let from_text = executor
+            .execute(
+                "MCPTool",
+                &json!({"qualifiedName": "mcp__alpha__echo", "arguments": "{\"text\": \"hi\"}"})
+                    .to_string(),
+            )
+            .expect("the call runs");
+        assert!(
+            from_text.contains(r#"dict:{\"text\": \"hi\"}"#),
+            "{from_text}"
+        );
+        let from_object = executor
+            .execute(
+                "MCPTool",
+                &json!({"qualifiedName": "mcp__alpha__echo", "arguments": {"text": "hi"}})
+                    .to_string(),
+            )
+            .expect("the call runs");
+        assert_eq!(from_object, from_text);
+        let refused = executor
+            .execute(
+                "MCPTool",
+                &json!({"qualifiedName": "mcp__alpha__echo", "arguments": "text=hi"}).to_string(),
+            )
+            .expect_err("not an object");
+        assert!(
+            refused.to_string().contains("must be a JSON object"),
+            "{refused}"
+        );
+
+        // Interrupted while the server works on the call.
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        let watched = wait_pid.clone();
+        let interrupter = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let pid = loop {
+                if let Some(pid) = std::fs::read_to_string(&watched)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok())
+                {
+                    break pid;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the call never reached the server"
+                );
+                thread::sleep(Duration::from_millis(50));
+            };
+            trigger.cancel();
+            (pid, Instant::now())
+        });
+        let result = executor.execute_with_cancellation("mcp__alpha__wait", "{}", &cancel);
+        let returned = Instant::now();
+        let (pid, interrupted_at) = interrupter.join().expect("interrupter");
+        let error = result.expect_err("an abandoned call is an error result");
+        assert!(error.to_string().contains("interrupted"), "{error}");
+        let took = returned.saturating_duration_since(interrupted_at);
+        assert!(
+            took < Duration::from_secs(5),
+            "returned {took:?} after the interrupt"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while is_running(pid) {
+            assert!(Instant::now() < deadline, "server {pid} still runs");
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        // The next call starts the server again.
+        let again = executor
+            .execute("mcp__alpha__echo", r#"{"text":"again"}"#)
+            .expect("the server restarts");
+        assert!(again.contains("again"), "{again}");
+
+        if let Some(mcp_state) = state.mcp_state {
+            let _ = mcp_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .shutdown();
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

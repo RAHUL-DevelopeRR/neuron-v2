@@ -23,6 +23,8 @@ on:
       - tests/test_release_workflow.py
       - tests/third_party_notices.test.mjs
       - scripts/generate-third-party-notices.mjs
+      - ui/neuron-tui/package.json
+      - ui/neuron-tui/bun.lock
       - LICENSE
       - NOTICE
       - README.md
@@ -55,6 +57,8 @@ on:
       - tests/test_release_workflow.py
       - tests/third_party_notices.test.mjs
       - scripts/generate-third-party-notices.mjs
+      - ui/neuron-tui/package.json
+      - ui/neuron-tui/bun.lock
       - LICENSE
       - NOTICE
       - README.md
@@ -235,11 +239,18 @@ jobs:
           node-version: '24'
       - name: Fetch crate sources for every target
         run: cargo fetch --locked --manifest-path rust/Cargo.toml
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - name: Install the full-screen UI's npm packages (their licenses go in the notices)
+        working-directory: ui/neuron-tui
+        run: bun install --frozen-lockfile --production
       - name: Generate THIRD_PARTY_NOTICES.md
         run: |
           node scripts/generate-third-party-notices.mjs --output "$RUNNER_TEMP/THIRD_PARTY_NOTICES.md"
           grep -q '^## Rust crates' "$RUNNER_TEMP/THIRD_PARTY_NOTICES.md"
           grep -q '^## Bundled skills' "$RUNNER_TEMP/THIRD_PARTY_NOTICES.md"
+          grep -q '^## Full-screen UI' "$RUNNER_TEMP/THIRD_PARTY_NOTICES.md"
           if grep -q '^### Crates without license metadata' "$RUNNER_TEMP/THIRD_PARTY_NOTICES.md"; then
             echo "::error::a dependency has no license metadata; review it before release"
             exit 1

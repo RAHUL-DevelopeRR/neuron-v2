@@ -92,6 +92,45 @@ pub fn get_json(
         .map_err(|error| GatewayHttpError::InvalidResponse(error.to_string()))
 }
 
+/// What a conditional `GET` ([`get_json_if_changed`]) found.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Conditional {
+    /// A new body, with the `ETag` to send next time.
+    Changed { value: Value, etag: Option<String> },
+    /// 304: the body is the one the `ETag` names.
+    NotModified,
+}
+
+/// `GET url` with `If-None-Match: etag` when there is one.
+pub fn get_json_if_changed(
+    url: &str,
+    token: Option<&str>,
+    etag: Option<&str>,
+    timeout: Duration,
+) -> Result<Conditional, GatewayHttpError> {
+    let mut request =
+        authorize(client(timeout)?.get(url), token).header("accept", "application/json");
+    if let Some(etag) = etag {
+        request = request.header("if-none-match", etag);
+    }
+    let response = request
+        .send()
+        .map_err(|error| GatewayHttpError::Transport(error.to_string()))?;
+    if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+        return Ok(Conditional::NotModified);
+    }
+    let response = check_status(response)?;
+    let etag = response
+        .headers()
+        .get("etag")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let value = response
+        .json::<Value>()
+        .map_err(|error| GatewayHttpError::InvalidResponse(error.to_string()))?;
+    Ok(Conditional::Changed { value, etag })
+}
+
 /// `DELETE url`, ignoring the body.
 pub fn delete(url: &str, token: Option<&str>, timeout: Duration) -> Result<(), GatewayHttpError> {
     let response = authorize(client(timeout)?.delete(url), token)

@@ -3,24 +3,30 @@
 //! Fetched at most once per process, cached on disk for ten minutes in
 //! `~/.neuroncli/catalog.json`, and registered into
 //! `runtime::model_registry` so context management and request preflight
-//! know each gateway model's window, output budget and tool support.
+//! know each gateway model's window, output budget and tool support. Model
+//! status (busy, blurred ...) changes faster: model lists lay the gateway's
+//! `GET <base>/models/status` over the catalog (see [`LiveStatus`]).
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, PoisonError, RwLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
+use std::time::{Duration, Instant};
 
 use api::GatewayError;
 use runtime::model_registry::{self, ModelCapability};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::gateway_http::{self, string_field, u64_field, GatewayHttpError};
+use crate::gateway_http::{self, string_field, u64_field, Conditional, GatewayHttpError};
 
 /// How long the on-disk catalog stays fresh.
 pub const CACHE_TTL: Duration = Duration::from_secs(600);
 /// The catalog is fetched on startup, so keep the wait short.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often model status is asked for again; the gateway suggests 30 s.
+pub const STATUS_TTL: Duration = Duration::from_secs(30);
+/// Status is fetched while the model list waits for it.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(3);
 const CATALOG_FILE: &str = "catalog.json";
 /// Version 2 keys the cache by [`credential_key`].
 const CACHE_VERSION: u64 = 2;
@@ -36,6 +42,11 @@ pub struct CatalogModel {
     pub tiers: Vec<String>,
     pub available: bool,
     pub unavailable_reason: Option<String>,
+    /// How the gateway sees it now: `available`, `degraded`, `busy` or `blurred`
+    /// (greyed out until `available_again_at`).
+    pub status: Option<String>,
+    /// When a `blurred` model can be used again (ISO 8601).
+    pub available_again_at: Option<String>,
 }
 
 impl CatalogModel {
@@ -69,6 +80,8 @@ impl CatalogModel {
                 .and_then(Value::as_bool)
                 .unwrap_or(true),
             unavailable_reason: string_field(value, "unavailable_reason"),
+            status: string_field(value, "status"),
+            available_again_at: string_field(value, "available_again_at"),
             id,
         })
     }
@@ -202,6 +215,9 @@ fn cache_path() -> PathBuf {
 /// logout or upgrade).
 pub fn invalidate_cache() {
     set_current(None);
+    *live_status_slot()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = LiveStatus::default();
     let _ = fs::remove_file(cache_path());
 }
 
@@ -292,6 +308,161 @@ fn write_cache(path: &Path, catalog: &Catalog, raw: &Value) {
     if let Ok(text) = serde_json::to_string(&document) {
         let _ = fs::write(path, text);
     }
+}
+
+/// One `data[]` entry of `GET /v1/models/status`: the part of a catalog entry
+/// that changes at runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelStatus {
+    pub id: String,
+    pub available: Option<bool>,
+    pub unavailable_reason: Option<String>,
+    pub status: Option<String>,
+    pub available_again_at: Option<String>,
+}
+
+/// Parses the `GET /v1/models/status` body.
+pub fn parse_status(value: &Value) -> Result<Vec<ModelStatus>, String> {
+    let data = value
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "status response has no data[] array".to_string())?;
+    Ok(data
+        .iter()
+        .filter_map(|entry| {
+            Some(ModelStatus {
+                id: string_field(entry, "id")?,
+                available: entry.get("available").and_then(Value::as_bool),
+                unavailable_reason: string_field(entry, "unavailable_reason"),
+                status: string_field(entry, "status"),
+                available_again_at: string_field(entry, "available_again_at"),
+            })
+        })
+        .collect())
+}
+
+/// The last `GET /v1/models/status` answer for one gateway and caller.
+#[derive(Debug, Clone)]
+struct StatusSnapshot {
+    base_url: String,
+    credential_key: String,
+    checked: Instant,
+    etag: Option<String>,
+    models: Vec<ModelStatus>,
+}
+
+/// Model status between model lists: asked for again at most every
+/// [`STATUS_TTL`], with the last `ETag` so an unchanged list costs a 304.
+#[derive(Debug, Default)]
+pub struct LiveStatus {
+    snapshot: Option<StatusSnapshot>,
+}
+
+impl LiveStatus {
+    /// `catalog` as of `now`: the latest status laid over it, and a busy or
+    /// blurred model whose `available_again_at` has passed shown available.
+    /// A failed fetch keeps the status known before (the catalog's own, at
+    /// first).
+    pub fn apply(
+        &mut self,
+        catalog: &Catalog,
+        token: Option<&str>,
+        now: Instant,
+        now_unix: u64,
+    ) -> Catalog {
+        let key = credential_key(token);
+        let known = self.snapshot.take().filter(|snapshot| {
+            snapshot.base_url == catalog.base_url && snapshot.credential_key == key
+        });
+        let snapshot = match known {
+            Some(snapshot) if now.saturating_duration_since(snapshot.checked) < STATUS_TTL => {
+                snapshot
+            }
+            known => fetch_status(known, &catalog.base_url, key, token, now),
+        };
+        let merged = merge_status(catalog, &snapshot.models, now_unix);
+        self.snapshot = Some(snapshot);
+        merged
+    }
+}
+
+fn fetch_status(
+    known: Option<StatusSnapshot>,
+    base_url: &str,
+    credential_key: String,
+    token: Option<&str>,
+    now: Instant,
+) -> StatusSnapshot {
+    let url = format!("{}/models/status", base_url.trim_end_matches('/'));
+    let sent_etag = known.as_ref().and_then(|snapshot| snapshot.etag.as_deref());
+    let fresh = match gateway_http::get_json_if_changed(&url, token, sent_etag, STATUS_TIMEOUT) {
+        Ok(Conditional::Changed { value, etag }) => {
+            parse_status(&value).ok().map(|models| (etag, models))
+        }
+        Ok(Conditional::NotModified) | Err(_) => None,
+    };
+    let (etag, models) = fresh.unwrap_or_else(|| {
+        known.map_or((None, Vec::new()), |snapshot| {
+            (snapshot.etag, snapshot.models)
+        })
+    });
+    StatusSnapshot {
+        base_url: base_url.to_string(),
+        credential_key,
+        checked: now,
+        etag,
+        models,
+    }
+}
+
+/// `catalog` with `statuses` laid over its entries.
+fn merge_status(catalog: &Catalog, statuses: &[ModelStatus], now_unix: u64) -> Catalog {
+    let mut merged = catalog.clone();
+    for model in &mut merged.models {
+        if let Some(live) = statuses.iter().find(|live| live.id == model.id) {
+            if let Some(available) = live.available {
+                model.available = available;
+                model
+                    .unavailable_reason
+                    .clone_from(&live.unavailable_reason);
+            }
+            if live.status.is_some() {
+                model.status.clone_from(&live.status);
+                model
+                    .available_again_at
+                    .clone_from(&live.available_again_at);
+            }
+        }
+        let back = model
+            .available_again_at
+            .as_deref()
+            .and_then(crate::clock::parse_timestamp);
+        if back.is_some_and(|back| back <= now_unix) {
+            model.status = Some("available".to_string());
+            model.available_again_at = None;
+        }
+    }
+    merged
+}
+
+fn live_status_slot() -> &'static Mutex<LiveStatus> {
+    static SLOT: OnceLock<Mutex<LiveStatus>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(LiveStatus::default()))
+}
+
+/// `catalog` with the gateway's current model status ([`LiveStatus::apply`]),
+/// asked for with the credential of the session's gateway endpoint.
+pub fn with_session_status(catalog: &Catalog) -> Catalog {
+    let endpoint = api::installed_openai_compat_endpoint();
+    live_status_slot()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .apply(
+            catalog,
+            endpoint.as_ref().map(api::OpenAiCompatEndpoint::api_key),
+            Instant::now(),
+            crate::clock::now_unix(),
+        )
 }
 
 /// `1048576` -> `1M`, `131072` -> `128K`, `24000` -> `24K`.
@@ -403,12 +574,23 @@ pub fn check_model(catalog: &Catalog, model: &str) -> ModelCheck {
 
 /// Warning to print for a `/model <id>` choice, if any.
 pub fn model_choice_warning(catalog: &Catalog, model: &str) -> Option<String> {
-    match check_model(catalog, model) {
+    let check = check_model(catalog, model);
+    let model = crate::provider::shown_model(model);
+    match check {
         ModelCheck::Available => None,
-        ModelCheck::Unavailable { reason } => Some(format!(
-            "warning: {model} is not available on your Zero-X plan ({reason}); requests will fail until you upgrade: {}",
-            crate::account::pricing_url()
-        )),
+        ModelCheck::Unavailable { reason } => Some(match reason.as_str() {
+            // Not a plan matter: this gateway has no provider set up for it.
+            "not_configured" => format!(
+                "warning: {model} is not configured on this Zero-X gateway; requests will fail. Pick another with /model."
+            ),
+            "region_unavailable" => format!(
+                "warning: {model} is not available in your region; requests will fail. Pick another with /model."
+            ),
+            _ => format!(
+                "warning: {model} is not available on your Zero-X plan ({reason}); requests will fail until you upgrade: {}",
+                crate::account::pricing_url()
+            ),
+        }),
         ModelCheck::Unknown { suggestions } => {
             let mut message = format!(
                 "warning: {model} is not in the Zero-X catalog; requests may fail. Run /model to list models."
@@ -592,6 +774,35 @@ mod tests {
     }
 
     #[test]
+    fn model_status_is_kept_and_unconfigured_models_are_not_a_plan_matter() {
+        let models = parse_catalog(&serde_json::json!({"data": [
+            {"id": "gemini/gemini-2.5-flash", "available": true, "status": "blurred",
+             "available_again_at": "2026-10-22T06:59:59.693Z"},
+            {"id": "openai/gpt-5", "available": false, "unavailable_reason": "not_configured"},
+        ]}))
+        .unwrap();
+        assert_eq!(models[0].status.as_deref(), Some("blurred"));
+        assert_eq!(
+            models[0].available_again_at.as_deref(),
+            Some("2026-10-22T06:59:59.693Z")
+        );
+        let catalog = Catalog {
+            models,
+            ..sample_catalog()
+        };
+        let warning = model_choice_warning(&catalog, "openai/openai/gpt-5").unwrap();
+        assert!(
+            warning.contains("not configured on this Zero-X gateway"),
+            "{warning}"
+        );
+        assert!(!warning.contains("upgrade"), "{warning}");
+        assert!(
+            warning.starts_with("warning: openai/gpt-5 "),
+            "no routing prefix: {warning}"
+        );
+    }
+
+    #[test]
     fn gateway_completions_replace_anthropic_aliases_with_catalog_ids() {
         let candidates = vec![
             "/model ".to_string(),
@@ -607,6 +818,133 @@ mod tests {
         assert!(adjusted.contains(&"/model auto".to_string()));
         assert!(adjusted.contains(&"/model test-gw/gemini-unit-flash".to_string()));
         assert!(adjusted.contains(&"/status".to_string()));
+    }
+
+    /// Serves `answers` to one connection each (`(status line, extra headers, body)`)
+    /// and records each request's `If-None-Match`.
+    fn status_server(
+        answers: Vec<(&'static str, &'static str, String)>,
+    ) -> (String, Arc<Mutex<Vec<Option<String>>>>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for (status, headers, body) in answers {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut reader = BufReader::new(stream);
+                let mut etag = None;
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 && !line.trim().is_empty() {
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("if-none-match") {
+                            etag = Some(value.trim().to_string());
+                        }
+                    }
+                    line.clear();
+                }
+                recorded.lock().unwrap().push(etag);
+                let _ = write!(
+                    reader.get_mut(),
+                    "HTTP/1.1 {status}\r\n{headers}content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (base, seen)
+    }
+
+    #[test]
+    fn model_lists_refresh_status_at_most_every_30_seconds() {
+        let now_unix = crate::clock::now_unix();
+        let past = "2026-01-01T00:00:00.000Z";
+        let soon = "2999-01-01T00:00:00.000Z".to_string();
+        let back_at = crate::clock::parse_timestamp(&soon).unwrap();
+        let body = json!({"object": "list", "poll_interval_seconds": 30, "data": [
+            {"id": "test-gw/gemini-unit-flash", "available": true, "status": "busy", "available_again_at": past},
+            {"id": "test-gw/paid-only-unit", "available": false, "unavailable_reason": "upgrade_required",
+             "status": "blurred", "available_again_at": soon},
+        ]})
+        .to_string();
+        let (base, seen) = status_server(vec![
+            ("200 OK", "etag: W/\"v1\"\r\n", body),
+            ("304 Not Modified", "etag: W/\"v1\"\r\n", String::new()),
+            ("500 Internal Server Error", "", "{}".to_string()),
+        ]);
+        let catalog = Catalog {
+            base_url: base,
+            ..sample_catalog()
+        };
+        let status_of = |catalog: &Catalog, id: &str| {
+            let model = catalog.find(id).unwrap();
+            (model.status.clone(), model.available_again_at.clone())
+        };
+        let mut live = LiveStatus::default();
+        let start = Instant::now();
+
+        let first = live.apply(&catalog, None, start, now_unix);
+        // Busy until some time ago: available again.
+        assert_eq!(
+            status_of(&first, "test-gw/gemini-unit-flash"),
+            (Some("available".into()), None)
+        );
+        assert_eq!(
+            status_of(&first, "test-gw/paid-only-unit"),
+            (Some("blurred".into()), Some(soon.clone()))
+        );
+        assert_eq!(
+            status_of(&first, "auto"),
+            (None, None),
+            "not in the status list"
+        );
+
+        // Within 30 s: no request.
+        live.apply(&catalog, None, start + Duration::from_secs(10), now_unix);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+
+        // Later: asked again with the ETag; the 304 keeps the status.
+        let later = live.apply(&catalog, None, start + Duration::from_secs(31), now_unix);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![None, Some("W/\"v1\"".to_string())]
+        );
+        assert_eq!(
+            status_of(&later, "test-gw/paid-only-unit"),
+            (Some("blurred".into()), Some(soon.clone()))
+        );
+
+        // A failed request keeps it too, and once its time has passed the model is back.
+        let failed = live.apply(&catalog, None, start + Duration::from_secs(62), now_unix);
+        assert_eq!(seen.lock().unwrap().len(), 3);
+        assert_eq!(
+            status_of(&failed, "test-gw/paid-only-unit").0.as_deref(),
+            Some("blurred")
+        );
+        let back = live.apply(&catalog, None, start + Duration::from_secs(63), back_at);
+        assert_eq!(
+            status_of(&back, "test-gw/paid-only-unit"),
+            (Some("available".into()), None)
+        );
+        assert!(!back.find("test-gw/paid-only-unit").unwrap().available);
+    }
+
+    #[test]
+    fn a_gateway_without_model_status_leaves_the_catalog_as_it_is() {
+        let (base, _seen) = status_server(vec![(
+            "404 Not Found",
+            "",
+            r#"{"error":"nope"}"#.to_string(),
+        )]);
+        let catalog = Catalog {
+            base_url: base,
+            ..sample_catalog()
+        };
+        let mut live = LiveStatus::default();
+        let shown = live.apply(&catalog, None, Instant::now(), crate::clock::now_unix());
+        assert_eq!(shown, catalog);
     }
 
     #[test]

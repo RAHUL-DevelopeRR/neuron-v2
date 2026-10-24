@@ -129,6 +129,37 @@ test('postinstall verifies the download and tolerates network failures', {skip},
   assert.ok(existsSync(`${nativeBinaryPath(context.packageRoot)}.sha256`));
 });
 
+test('postinstall also installs the full-screen UI, and nothing about it fails the install', {skip}, async (t) => {
+  const uiAsset = currentAsset().replace(/^neuron-/, 'neuron-tui-');
+
+  // Both assets published: both installed, each with its checksum sidecar.
+  const both = setup(t);
+  const cli = dummyBinary();
+  const ui = Buffer.from('a stand-in for neuron-tui');
+  const server = await startServer(t, new Map([...releaseRoutes({asset, data: cli}), ...releaseRoutes({asset: uiAsset, data: ui})]));
+  const installed = await runNode(both.postinstall, [], {env: environment(both, server.url)});
+  assert.equal(installed.code, 0, installed.stderr);
+  const native = path.dirname(nativeBinaryPath(both.packageRoot));
+  const uiName = process.platform === 'win32' ? 'neuron-tui.exe' : 'neuron-tui';
+  assert.equal(readFileSync(path.join(native, `${uiName}.sha256`), 'ascii'), `${sha256(ui)}  ${uiAsset}\n`);
+  assert.match(installed.stderr, /Downloading Neuron's full-screen UI/);
+
+  // No UI asset (HTTP 404): the CLI installs and the install still succeeds.
+  const cliOnly = setup(t);
+  const partial = await startServer(t, releaseRoutes({asset, data: cli}));
+  const result = await runNode(cliOnly.postinstall, [], {env: environment(cliOnly, partial.url)});
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stderr, /full-screen UI was not installed/);
+  assert.ok(existsSync(`${nativeBinaryPath(cliOnly.packageRoot)}.sha256`));
+
+  // NEURON_NO_TUI=1 does not fetch it at all.
+  const off = setup(t);
+  const watched = await startServer(t, new Map([...releaseRoutes({asset, data: cli}), ...releaseRoutes({asset: uiAsset, data: ui})]));
+  const skipped = await runNode(off.postinstall, [], {env: environment(off, watched.url, {NEURON_NO_TUI: '1'})});
+  assert.equal(skipped.code, 0, skipped.stderr);
+  assert.ok(!watched.requests.some((url) => url.includes('neuron-tui')), watched.requests.join(', '));
+});
+
 const canMakeReadOnly = process.platform !== 'win32' && process.getuid?.() !== 0;
 
 test('a read-only package directory falls back to the user cache', {skip: canMakeReadOnly ? false : 'needs a non-root POSIX user'}, async (t) => {

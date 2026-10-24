@@ -184,7 +184,7 @@ async fn retry_after_longer_than_the_budget_ends_retries_immediately() {
         .expect_err("a 120s Retry-After exceeds the 90s capacity wait cap");
 
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
-    assert!(error.to_string().contains("retry in 120s"), "{error}");
+    assert!(error.to_string().contains("retry in 2m"), "{error}");
     assert_eq!(state.lock().await.len(), 1);
     assert!(notices.lock().unwrap().is_empty());
 }
@@ -281,7 +281,7 @@ async fn zero_x_capacity_waits_use_the_capacity_budget_and_count_down() {
 async fn capacity_budget_applies_only_to_zero_x_capacity_waits() {
     let short = std::time::Duration::from_millis(500);
     let wait_cap = std::time::Duration::from_millis(1_500);
-    let total = std::time::Duration::from_millis(10_000);
+    let total = std::time::Duration::from_secs(10);
 
     // A capacity wait longer than the per-wait cap ends the retries.
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));

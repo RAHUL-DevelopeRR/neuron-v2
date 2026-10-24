@@ -16,6 +16,9 @@ RELEASE_ASSETS = [
     "neuron-macos-x64",
     "neuron-windows-x64.exe",
 ]
+# The full-screen UI beside each CLI asset; the launchers derive these names
+# from the CLI's (`neuron-tui-` for `neuron-`).
+UI_ASSETS = ["neuron-tui-" + asset[len("neuron-"):] for asset in RELEASE_ASSETS]
 DOCS = [
     "README.md",
     "USAGE.md",
@@ -144,6 +147,19 @@ class PackagingMetadataTests(unittest.TestCase):
             self.assertIn(part, launchers["install.sh"])
         for required in ("aarch64-unknown-linux-gnu", "actions/attest-build-provenance", "SHA256SUMS", "THIRD_PARTY_NOTICES.md"):
             self.assertIn(required, release)
+
+    def test_the_ui_assets_are_built_attested_and_installed(self) -> None:
+        release = read(".github/workflows/release.yml")
+        assets = re.search(r"RELEASE_ASSETS: >-\n((?:    .*\n)+)", release)
+        self.assertIsNotNone(assets)
+        self.assertEqual(assets.group(1).split(), RELEASE_ASSETS + UI_ASSETS)
+        for asset in UI_ASSETS:
+            self.assertIn(f"ui_asset: {asset}", release)
+            self.assertIn(f"dist/{asset}", release, f"{asset} is not attested")
+        self.assertIn("neuron-tui-windows-x64.exe", read("install.ps1"))
+        self.assertIn('UI_ASSET="neuron-tui-${TARGET}"', read("install.sh"))
+        for launcher in ("neuron_cli/__init__.py", "npm/neuroncli/lib/binary.js"):
+            self.assertIn("neuron-tui-", read(launcher), f"{launcher} has no UI asset")
 
     def test_linux_glibc_floor_matches_the_readme(self) -> None:
         release = read(".github/workflows/release.yml")

@@ -1,0 +1,8 @@
+# `neuron --continue <chat>` reopens the chat from continue-1-chat.txt.
+wait 90000 Mock streaming says hello from the parity harness.
+dump reopened
+wait 60000 claude-opus-4-6
+send \x03
+sleep 800
+send \x03
+exit 30000

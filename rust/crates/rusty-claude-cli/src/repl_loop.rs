@@ -59,14 +59,13 @@ pub(crate) fn dispatch_line(
 
 /// Renders a failed REPL step without ending the session.
 pub(crate) fn report_repl_error(message: &str, out: &mut impl Write) {
-    let _ = writeln!(out, "\n\x1b[31m\u{2718}\x1b[0m {message}");
-    let _ = writeln!(
-        out,
-        "  \x1b[2mThe session is saved. Retry, /compact, switch /model, or keep chatting.\x1b[0m"
+    let report = format!(
+        "\n\x1b[31m\u{2718}\x1b[0m {message}\n  \x1b[2mThe session is saved. Retry, /compact, switch /model, or keep chatting.\x1b[0m"
     );
+    let _ = writeln!(out, "{}", crate::console::stderr_text(&report));
 }
 
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     payload
         .downcast_ref::<&str>()
         .map(ToString::to_string)
@@ -81,6 +80,14 @@ pub(crate) enum InterruptAction {
     Cancelled,
     /// A second press: save the session and exit once the turn unwinds.
     ForceQuit,
+}
+
+/// Whether interrupt notices tell the user that another Ctrl-C quits. The line REPL
+/// does; the full-screen UI shows its own key hints, so the engine leaves it out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuitHint {
+    Shown,
+    Hidden,
 }
 
 /// Set by a second Ctrl-C during a turn: the REPL saves the session, stops
@@ -117,14 +124,18 @@ pub(crate) fn handle_turn_interrupt(
     presses: u32,
     cancel: &CancellationToken,
     hook_abort: &HookAbortSignal,
+    hint: QuitHint,
 ) -> InterruptAction {
     if presses <= 1 {
         cancel.cancel();
         hook_abort.abort();
         tools::cancel_background_subagents();
-        runtime::ui_hooks::notice(
-            "\n\x1b[33m\u{25a0}\x1b[0m Interrupting\u{2026} \x1b[2m(press Ctrl-C again to quit)\x1b[0m",
-        );
+        runtime::ui_hooks::notice(match hint {
+            QuitHint::Shown => {
+                "\n\x1b[33m\u{25a0}\x1b[0m Interrupting\u{2026} \x1b[2m(press Ctrl-C again to quit)\x1b[0m"
+            }
+            QuitHint::Hidden => "\n\x1b[33m\u{25a0}\x1b[0m Interrupting\u{2026}",
+        });
         InterruptAction::Cancelled
     } else {
         cancel.cancel();
@@ -164,6 +175,7 @@ pub(crate) async fn watch_turn_interrupts<P, F>(
     stop: impl std::future::Future<Output = ()>,
     cancel: &CancellationToken,
     hook_abort: &HookAbortSignal,
+    hint: QuitHint,
     mut on_force_quit: impl FnMut(),
 ) where
     P: FnMut() -> F,
@@ -173,12 +185,17 @@ pub(crate) async fn watch_turn_interrupts<P, F>(
     let mut presses = 0_u32;
     loop {
         tokio::select! {
+            // A press made before the turn ended counts, even when the turn ended before
+            // this watcher got to it (the UI's interrupt right after a prompt).
+            biased;
             result = next_press() => {
                 if result.is_err() {
                     break;
                 }
                 presses += 1;
-                if handle_turn_interrupt(presses, cancel, hook_abort) == InterruptAction::ForceQuit {
+                if handle_turn_interrupt(presses, cancel, hook_abort, hint)
+                    == InterruptAction::ForceQuit
+                {
                     on_force_quit();
                 }
             }
@@ -208,18 +225,24 @@ pub(crate) fn turn_outcome_label(outcome: &TurnOutcome) -> &'static str {
 }
 
 /// One-line notice describing how a turn ended, if it did not simply finish.
-pub(crate) fn describe_turn_outcome(summary: &TurnSummary) -> Option<String> {
+pub(crate) fn describe_turn_outcome(summary: &TurnSummary, hint: QuitHint) -> Option<String> {
     let mut notes = Vec::new();
     match &summary.outcome {
         TurnOutcome::Completed => {}
         TurnOutcome::Cancelled {
-            interrupted_tool_calls: 0,
-        } => notes.push("Interrupted. Back at the prompt; press Ctrl-C again to exit.".to_string()),
-        TurnOutcome::Cancelled {
             interrupted_tool_calls,
-        } => notes.push(format!(
-            "Interrupted. {interrupted_tool_calls} pending tool call(s) were not run. Press Ctrl-C again to exit."
-        )),
+        } => notes.push(match (interrupted_tool_calls, hint) {
+            (0, QuitHint::Shown) => {
+                "Interrupted. Back at the prompt; press Ctrl-C again to exit.".to_string()
+            }
+            (0, QuitHint::Hidden) => "Interrupted.".to_string(),
+            (calls, QuitHint::Shown) => format!(
+                "Interrupted. {calls} pending tool call(s) were not run. Press Ctrl-C again to exit."
+            ),
+            (calls, QuitHint::Hidden) => {
+                format!("Interrupted. {calls} pending tool call(s) were not run.")
+            }
+        }),
         TurnOutcome::LoopDetected { tool_name, repeats } => notes.push(format!(
             "Stopped: the model called `{tool_name}` {repeats} times in a row with identical arguments. Rephrase the request or give more guidance."
         )),
@@ -310,8 +333,10 @@ pub(crate) fn launch(options: ReplLaunch) -> Result<(), Box<dyn std::error::Erro
     }
 
     let result = run_loop(&mut cli, &mut editor);
-    // Sub-agents left running in the background must not outlive the session.
+    // Sub-agents and commands left running in the background must not outlive the
+    // session.
     tools::cancel_background_subagents();
+    let _ = runtime::stop_background_commands();
     drop(shutdown);
     if force_quit_requested() {
         if let Err(error) = &result {
@@ -329,11 +354,21 @@ fn print_footer(cli: &LiveCli) {
     let r = "\x1b[0m";
     let bc = "\x1b[38;2;100;100;100m";
     let model_s = cli.model.split('/').next_back().unwrap_or(&cli.model);
-    let session_short: String = cli.session.id.chars().take(6).collect();
+    let session = footer_session_label(&cli.session.id);
     println!(
-        "\n{bc}{}{r}\n  {dm}? for shortcuts{r}                       {dm}{model_s} \u{00b7} session {session_short}{r}\n",
+        "\n{bc}{}{r}\n  {dm}? for shortcuts{r}                       {dm}{model_s} \u{00b7} {session}{r}\n",
         "\u{2500}".repeat(74),
     );
+}
+
+/// The session in the footer: its whole id (what `--resume` takes), never cut
+/// mid-word. Ids are `session-<millis>-<n>`; another id gets the word in front.
+pub(crate) fn footer_session_label(id: &str) -> String {
+    if id.starts_with("session-") {
+        id.to_string()
+    } else {
+        format!("session {id}")
+    }
 }
 
 /// Switches the freshly started CLI to a saved session, removing the empty
@@ -447,11 +482,17 @@ fn context_command_argument(line: &str) -> Option<&str> {
 
 impl LiveCli {
     fn print_context(&self, argument: &str) -> Result<(), Box<dyn std::error::Error>> {
+        println!("{}", self.context_command(argument)?);
+        Ok(())
+    }
+
+    /// What `/context [show]` shows.
+    pub(crate) fn context_command(
+        &self,
+        argument: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
         match argument {
-            "" | "show" => {
-                println!("{}", self.context_report());
-                Ok(())
-            }
+            "" | "show" => Ok(self.context_report()),
             "clear" => Err(
                 "/context clear is not supported; use /compact to summarize or /clear --confirm to start fresh"
                     .into(),
@@ -513,7 +554,10 @@ pub(crate) fn render_context_report(report: &ContextReport<'_>) -> String {
     let usage = report.cumulative;
     [
         "Context".to_string(),
-        format!("  Model            {}", report.model),
+        format!(
+            "  Model            {}",
+            crate::provider::shown_model(report.model)
+        ),
         format!(
             "  Context window   {} tokens",
             group_digits(budget.context_window)
@@ -561,7 +605,7 @@ pub(crate) fn context_report_json(report: &ContextReport<'_>) -> serde_json::Val
     let snapshot = &report.snapshot;
     json!({
         "kind": "context",
-        "model": report.model,
+        "model": crate::provider::shown_model(report.model),
         "context_window": snapshot.budget.context_window,
         "output_reserve": snapshot.budget.output_reserve,
         "tool_schema_tokens": snapshot.budget.tool_schema_tokens,
@@ -601,7 +645,7 @@ mod tests {
     use super::{
         context_command_argument, describe_turn_outcome, dispatch_line, group_digits,
         handle_turn_interrupt, render_context_report, watch_turn_interrupts, ContextReport,
-        InterruptAction, InterruptPresses, ReplBackend, ReplStep,
+        InterruptAction, InterruptPresses, QuitHint, ReplBackend, ReplStep,
     };
     use crate::{CliAction, ResumeLaunchOptions, DEFAULT_MODEL};
     use runtime::context_manager::{ContextBudget, ContextManager, ContextPolicy};
@@ -678,13 +722,13 @@ mod tests {
         let cancel = CancellationToken::new();
         let hooks = HookAbortSignal::new();
         assert_eq!(
-            handle_turn_interrupt(1, &cancel, &hooks),
+            handle_turn_interrupt(1, &cancel, &hooks, QuitHint::Shown),
             InterruptAction::Cancelled
         );
         assert!(cancel.is_cancelled());
         assert!(hooks.is_aborted());
         assert_eq!(
-            handle_turn_interrupt(2, &cancel, &hooks),
+            handle_turn_interrupt(2, &cancel, &hooks, QuitHint::Shown),
             InterruptAction::ForceQuit
         );
     }
@@ -716,6 +760,7 @@ mod tests {
             std::future::pending(),
             &cancel,
             &hooks,
+            QuitHint::Shown,
             || force_quits += 1,
         ));
 
@@ -746,6 +791,7 @@ mod tests {
                 stop,
                 &cancel,
                 &hooks,
+                QuitHint::Hidden,
                 || force_quits += 1,
             )
             .await;
@@ -769,6 +815,7 @@ mod tests {
             std::future::ready(()),
             &cancel,
             &hooks,
+            QuitHint::Shown,
             || panic!("no press, no quit"),
         ));
 
@@ -793,27 +840,54 @@ mod tests {
     #[test]
     fn describes_non_trivial_turn_outcomes() {
         assert_eq!(
-            describe_turn_outcome(&summary(TurnOutcome::Completed, 0)),
+            describe_turn_outcome(&summary(TurnOutcome::Completed, 0), QuitHint::Shown),
             None
         );
-        let cancelled = describe_turn_outcome(&summary(
-            TurnOutcome::Cancelled {
-                interrupted_tool_calls: 2,
-            },
-            0,
-        ))
+        let cancelled = describe_turn_outcome(
+            &summary(
+                TurnOutcome::Cancelled {
+                    interrupted_tool_calls: 2,
+                },
+                0,
+            ),
+            QuitHint::Shown,
+        )
         .expect("notice");
         assert!(cancelled.contains("2 pending tool call(s) were not run"));
-        let looped = describe_turn_outcome(&summary(
-            TurnOutcome::LoopDetected {
-                tool_name: "bash".to_string(),
-                repeats: 4,
-            },
-            1,
-        ))
+        assert!(cancelled.contains("Ctrl-C again to exit"));
+        let looped = describe_turn_outcome(
+            &summary(
+                TurnOutcome::LoopDetected {
+                    tool_name: "bash".to_string(),
+                    repeats: 4,
+                },
+                1,
+            ),
+            QuitHint::Shown,
+        )
         .expect("notice");
         assert!(looped.contains("`bash` 4 times"));
         assert!(looped.contains("shortened 1 older tool result(s)"));
+    }
+
+    #[test]
+    fn interrupt_notices_for_the_full_screen_ui_leave_out_the_quit_hint() {
+        let cancelled = |calls| {
+            describe_turn_outcome(
+                &summary(
+                    TurnOutcome::Cancelled {
+                        interrupted_tool_calls: calls,
+                    },
+                    0,
+                ),
+                QuitHint::Hidden,
+            )
+        };
+        assert_eq!(cancelled(0).as_deref(), Some("Interrupted."));
+        assert_eq!(
+            cancelled(3).as_deref(),
+            Some("Interrupted. 3 pending tool call(s) were not run.")
+        );
     }
 
     #[test]
@@ -847,6 +921,8 @@ mod tests {
 
         let rendered = render_context_report(&report);
 
+        // Shown without the `openai/` routing prefix.
+        assert!(rendered.contains("  Model            auto\n"), "{rendered}");
         assert!(rendered.contains("Context window   131,072 tokens"));
         assert!(rendered.contains("Output reserve   32,000 tokens"));
         // 4,000 ASCII chars at 3 chars/token plus 4 tokens of message overhead.
@@ -857,6 +933,7 @@ mod tests {
         assert!(rendered.contains("Last compaction  #2 \u{00b7} 31 messages summarized"));
         assert!(rendered.contains("input 1,234,567"));
         let json = super::context_report_json(&report);
+        assert_eq!(json["model"], "auto");
         assert_eq!(json["context_window"], 131_072);
         assert_eq!(json["last_compaction"]["removed_messages"], 31);
     }
@@ -979,5 +1056,14 @@ mod tests {
         assert_eq!(group_digits(999), "999");
         assert_eq!(group_digits(1_000), "1,000");
         assert_eq!(group_digits(1_048_576), "1,048,576");
+    }
+
+    #[test]
+    fn the_footer_shows_the_whole_session_id() {
+        assert_eq!(
+            super::footer_session_label("session-1792751547070-0"),
+            "session-1792751547070-0"
+        );
+        assert_eq!(super::footer_session_label("abc123"), "session abc123");
     }
 }

@@ -38,9 +38,10 @@ impl QuotaState {
         if state.date != today {
             state.date = today;
             state.azure_output_tokens_used = 0;
-            state.daily_limit = DAILY_AZURE_TOKEN_LIMIT;
             state.save();
         }
+        // The limit is not configurable: a stored one is only a copy of it.
+        state.daily_limit = DAILY_AZURE_TOKEN_LIMIT;
         state
     }
 
@@ -69,8 +70,14 @@ impl QuotaState {
     /// Record output tokens consumed by an Azure request.
     /// Returns `true` if quota is still available after recording.
     pub fn record_azure_usage(&mut self, output_tokens: u32) -> bool {
-        self.azure_output_tokens_used = self.azure_output_tokens_used.saturating_add(output_tokens);
+        let available = self.add_azure_usage(output_tokens);
         self.save();
+        available
+    }
+
+    /// [`Self::record_azure_usage`] without saving.
+    fn add_azure_usage(&mut self, output_tokens: u32) -> bool {
+        self.azure_output_tokens_used = self.azure_output_tokens_used.saturating_add(output_tokens);
         !self.is_azure_exhausted()
     }
 
@@ -140,11 +147,12 @@ mod tests {
 
     #[test]
     fn record_usage_saturates_quota() {
+        // Not `record_azure_usage`: that saves to the user's real quota file.
         let mut q = QuotaState::default();
         q.daily_limit = 100;
-        assert!(q.record_azure_usage(50)); // still available
+        assert!(q.add_azure_usage(50)); // still available
         assert_eq!(q.remaining(), 50);
-        assert!(!q.record_azure_usage(60)); // exhausted
+        assert!(!q.add_azure_usage(60)); // exhausted
         assert!(q.is_azure_exhausted());
     }
 

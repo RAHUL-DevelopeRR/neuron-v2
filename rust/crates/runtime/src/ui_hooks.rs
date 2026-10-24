@@ -6,7 +6,7 @@
 //! over its screen; [`clear_handlers`] restores the defaults when it leaves.
 
 use std::io;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 
 type NoticeHandler = Arc<dyn Fn(&str) + Send + Sync>;
 type AskHandler = Arc<dyn Fn(&UserQuestion) -> io::Result<String> + Send + Sync>;
@@ -64,6 +64,68 @@ pub fn notice(message: &str) {
     }
 }
 
+/// Whether stdin is a terminal, found out once per process. Code that may run while
+/// another thread reads stdin asks this rather than `io::stdin().is_terminal()`: on
+/// Windows a question about a pipe waits for a read pending on it, so it would hang
+/// until the pipe sends something. Asked first before such a read starts.
+#[must_use]
+pub fn stdin_is_terminal() -> bool {
+    use std::io::IsTerminal as _;
+    static STDIN_IS_TERMINAL: OnceLock<bool> = OnceLock::new();
+    *STDIN_IS_TERMINAL.get_or_init(|| io::stdin().is_terminal())
+}
+
+/// Where the line terminal shows a question it reads the answer to from stdin (a tool
+/// approval, `AskUserQuestion`, the workspace trust question): stdout, or stderr when
+/// stdout is redirected (`neuron prompt ... > out.txt`), so the user still sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptStream {
+    Stdout,
+    Stderr,
+}
+
+impl PromptStream {
+    /// Stdout when it is a terminal, else stderr when that is one. When neither is:
+    /// stdout for a script that feeds stdin (stdin is not a terminal either), and `None`
+    /// for a person at the terminal, who would answer a question they cannot see.
+    #[must_use]
+    pub fn choose(
+        stdin_is_terminal: bool,
+        stdout_is_terminal: bool,
+        stderr_is_terminal: bool,
+    ) -> Option<Self> {
+        if stdout_is_terminal {
+            Some(Self::Stdout)
+        } else if stderr_is_terminal {
+            Some(Self::Stderr)
+        } else if stdin_is_terminal {
+            None
+        } else {
+            Some(Self::Stdout)
+        }
+    }
+
+    /// [`Self::choose`] for this process's stdin, stdout and stderr.
+    #[must_use]
+    pub fn current() -> Option<Self> {
+        use std::io::IsTerminal as _;
+        Self::choose(
+            stdin_is_terminal(),
+            io::stdout().is_terminal(),
+            io::stderr().is_terminal(),
+        )
+    }
+
+    /// The stream to write the question to.
+    #[must_use]
+    pub fn writer(self) -> Box<dyn io::Write> {
+        match self {
+            Self::Stdout => Box::new(io::stdout()),
+            Self::Stderr => Box::new(io::stderr()),
+        }
+    }
+}
+
 /// The installed question handler, if a UI provides one.
 #[must_use]
 pub fn ask_handler() -> Option<impl Fn(&UserQuestion) -> io::Result<String>> {
@@ -96,6 +158,21 @@ mod tests {
             .unwrap()
             .iter()
             .any(|message| message == "ui-hooks-test: retrying in 3 s"));
+    }
+
+    /// `neuron prompt ... > out.txt` from a terminal: the question goes to stderr, which
+    /// the user sees; with stderr redirected too, nobody would see it.
+    #[test]
+    fn a_question_goes_where_the_user_sees_it() {
+        use PromptStream::{Stderr, Stdout};
+        // (stdin, stdout, stderr) are terminals:
+        assert_eq!(PromptStream::choose(true, true, true), Some(Stdout));
+        assert_eq!(PromptStream::choose(true, true, false), Some(Stdout));
+        assert_eq!(PromptStream::choose(true, false, true), Some(Stderr));
+        assert_eq!(PromptStream::choose(true, false, false), None);
+        // A script feeds the answers: as before, on stdout.
+        assert_eq!(PromptStream::choose(false, false, false), Some(Stdout));
+        assert_eq!(PromptStream::choose(false, false, true), Some(Stderr));
     }
 
     #[test]
