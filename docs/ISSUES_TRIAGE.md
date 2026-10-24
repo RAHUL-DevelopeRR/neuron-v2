@@ -9,7 +9,7 @@ This repository has two unrelated programs called Neuron:
 
 | | Rust CLI | Go fork |
 | --- | --- | --- |
-| Branch | `ux-audit-fixes` (default) and the 6.3.0 work | `THE-BUGGY-BREACH` |
+| Branch | `ux-audit-fixes` (default) and the 7.0.0-alpha.1 work | `THE-BUGGY-BREACH` |
 | Code | `rust/`, binary `neuron` from `rusty-claude-cli` | `go/`, module `github.com/opencode-ai/opencode` |
 | Packaging | npm `@zero-x.live/neuron`, PyPI `neuroncli`, `install.sh`, `install.ps1`, GitHub Releases | None of its own; reached through the old Python shim |
 | Gateway contract | Implements [GATEWAY_CONTRACT.md](GATEWAY_CONTRACT.md) | Predates it |
@@ -32,13 +32,13 @@ deploy the custom `Neuron.exe` to a fixed path.
   on `PATH` (`os.get_exec_path()`) for `neuron.exe` (`neuron` elsewhere), so whatever
   carries that name and comes first wins: an `opencode` build installed as Neuron, an
   older package, or the pip entry-point shim itself.
-- The Rust line no longer does this. Already at the 6.3.0 branch point the Python
-  launcher ran only `NEURON_BINARY_PATH`, a binary next to the launcher, or the release
-  binary for its own version. 6.3.0 adds a verified cache, actionable network errors
-  and correct signal handling, and its tests check that other `neuron` executables on
-  `PATH` are ignored (`tests/test_packaged_launcher.py`). The npm launcher resolves the
-  same way, and `install.sh` and `install.ps1` warn when another `neuron` shadows the
-  one they installed.
+- The Rust line no longer does this. Already at the 7.0.0-alpha.1 branch point the
+  Python launcher ran only `NEURON_BINARY_PATH`, a binary next to the launcher, or the
+  release binary for its own version. 7.0.0-alpha.1 adds a verified cache, actionable
+  network errors and correct signal handling, and its tests check that other `neuron`
+  executables on `PATH` are ignored (`tests/test_packaged_launcher.py`). The npm
+  launcher resolves the same way, and `install.sh` and `install.ps1` warn when another
+  `neuron` shadows the one they installed.
 - The 42X responses themselves are the gateway rejecting a client that does not speak
   the contract. With the Rust CLI, 429 is either `insufficient_quota` (stop, show the
   reset time) or `rate_limited` (retry after `Retry-After`), both rendered with what to
@@ -46,7 +46,7 @@ deploy the custom `Neuron.exe` to a fixed path.
 - The Go changes (skipping key validation, a hard-coded placeholder key, a fixed
   install path under one user's profile) do not apply to the Rust CLI.
 
-**Recommendation.** Close as fixed for the Rust product line in 6.3.0 (launcher
+**Recommendation.** Close as fixed for the Rust product line in 7.0.0-alpha.1 (launcher
 resolution) and as not applicable for the Go-specific changes. Ask anyone still seeing
 422/429 to open a new issue with `neuron --version`, `neuron doctor`, the install
 method and the error's `code` and `request_id`.

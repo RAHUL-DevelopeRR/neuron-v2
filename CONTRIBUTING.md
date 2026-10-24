@@ -1,8 +1,9 @@
 # Contributing to Neuron
 
 Thanks for helping. This repository ships one product: the `neuron` CLI built from the
-Rust workspace in `rust/`, plus the npm and Python launchers and install scripts that
-deliver it.
+Rust workspace in `rust/` with its full-screen UI (`neuron-tui`, built from
+`ui/neuron-tui` with Bun), plus the npm and Python launchers and install scripts that
+deliver them.
 
 ## Repository layout
 
@@ -53,6 +54,15 @@ node --test tests/third_party_notices.test.mjs     # notices generator
 NEURON_TEST_NPM_PACK=1 python -m unittest tests.test_npm_package -v   # npm pack + install; needs registry access
 ```
 
+**Full-screen UI** (from `ui/neuron-tui`; Bun 1.3.14; see its README for `dev:mock` and
+`check:console`):
+
+```sh
+bun install --frozen-lockfile
+bun run typecheck
+bun run test
+```
+
 The packaging tests run the real launchers and installers against a local fake release
 server (`tests/fake_release.py`) serving a small dummy `neuron`. On Windows the dummy
 is compiled with the .NET Framework `csc.exe` that ships with Windows; set
@@ -69,12 +79,15 @@ NEURON_DOWNLOAD_BASE="http://127.0.0.1:$(cat /tmp/port)" NEURON_VERSION=6.3.0 \
   NEURON_INSTALL_DIR=/tmp/neuron-bin sh install.sh
 ```
 
-**Third-party notices** (after changing Rust dependencies):
+**Third-party notices** (after changing Rust dependencies or the UI's npm dependencies):
 
 ```sh
 cargo fetch --locked --manifest-path rust/Cargo.toml
+(cd ui/neuron-tui && bun install --frozen-lockfile --production)
 node scripts/generate-third-party-notices.mjs --output THIRD_PARTY_NOTICES.md
 ```
+
+Pass `--no-ui` to leave the UI out when you have no Bun.
 
 The generated file is a release asset; do not commit it.
 
@@ -101,5 +114,9 @@ projects pinned in `SOURCES.json`. Refresh them with
 
 ## License
 
-Neuron is MIT licensed (see [LICENSE](LICENSE) and [NOTICE](NOTICE)). By contributing,
-you agree that your contribution is licensed under the same terms.
+Neuron is MIT licensed (see [LICENSE](LICENSE) and [NOTICE](NOTICE)), except the
+full-screen UI in `ui/neuron-tui`, which is derived from Freebuff and stays under the
+Apache License 2.0 (see its `LICENSE` and `NOTICE`). By contributing, you agree that your
+contribution is licensed under the terms of the part you change. A file in
+`ui/neuron-tui` that differs from its Freebuff original keeps the "Derived from
+Codebuff/Freebuff (Apache-2.0); modified for Neuron" header.

@@ -12,6 +12,7 @@ summary, not legal advice.
 | `src/`, `tests/test_porting_workspace.py` | Claw Code's Python porting workspace | MIT (as above) | See [reference data snapshots](#reference-data-snapshots). |
 | `PARITY.md`, `PHILOSOPHY.md`, `ROADMAP.md` and other parity documents | Claw Code | MIT (as above) | Describe the upstream project and its `claw` commands. |
 | `rust/crates/runtime/bundled-skills/` | Four third-party skill projects, pinned in `SOURCES.json` | MIT each; texts in `licenses/` and embedded in the binary | See [bundled skills](#bundled-skills). |
+| `ui/neuron-tui/` (the `neuron-tui` binaries), including `src/vendor/common/` | Freebuff's `cli/` and 31 files of its `common/src`, [CodebuffAI/freebuff](https://github.com/CodebuffAI/freebuff) commit `545e04d`, modified since | Apache-2.0, "Copyright 2025 Codebuff" (`ui/neuron-tui/LICENSE`, `NOTICE`, kept unchanged) | Codebuff services, ads, billing and telemetry removed; see `ui/neuron-tui/PORTING.md`. Changed files carry a derivation header. The binary bundles Bun and npm packages (OpenTUI, React), listed in `THIRD_PARTY_NOTICES.md`. |
 | Rust crate dependencies | crates.io | Per crate; see `THIRD_PARTY_NOTICES.md` on each release | See [crate licenses](#crate-licenses). |
 | npm dependencies `codebase-memory-mcp`, `@playwright/mcp` | npm registry | MIT; Apache-2.0 | Installed next to the npm package, not bundled into it. |
 | `assets/` | Claw Code | Not covered by the MIT grant | See [assets](#assets). |

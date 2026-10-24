@@ -26,7 +26,7 @@ a `neuron` binary beside the UI, then the PATH it started with. `--model`,
 engine.
 
 ```bash
-bun run build:binary 6.3.0
+bun run build:binary 7.0.0-alpha.1
 ```
 
 `bun run build:binary <version>` writes `bin/neuron-tui` (`.exe` on Windows)

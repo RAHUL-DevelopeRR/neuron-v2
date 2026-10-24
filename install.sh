@@ -8,10 +8,10 @@
 # its line REPL).
 #
 #   curl -fsSL https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/latest/download/install.sh | sh
-#   curl -fsSL .../install.sh | sh -s -- --version 6.3.0 --install-dir "$HOME/bin"
+#   curl -fsSL .../install.sh | sh -s -- --version 7.0.0-alpha.1 --install-dir "$HOME/bin"
 #
 # Environment:
-#   NEURON_VERSION         release to install, e.g. 6.3.0 (default: latest release)
+#   NEURON_VERSION         release to install, e.g. 7.0.0-alpha.1 (default: latest release)
 #   NEURON_INSTALL_DIR     install directory (default: $HOME/.local/bin)
 #   NEURON_DOWNLOAD_BASE   release download base URL (default: GitHub Releases);
 #                          must be HTTPS unless it points at a loopback host
@@ -57,7 +57,7 @@ Install the Neuron coding agent from GitHub Releases.
 Usage: install.sh [--version VERSION] [--install-dir DIR] [--help]
 
 Options:
-  --version VERSION    Release to install, e.g. 6.3.0 (default: latest)
+  --version VERSION    Release to install, e.g. 7.0.0-alpha.1 (default: latest)
   --install-dir DIR    Directory for the neuron binary (default: ~/.local/bin)
   -h, --help           Show this help
 
@@ -232,7 +232,7 @@ resolve_latest_version() {
     is_allowed_url "${api}" || die "NEURON_RELEASES_API must be an HTTPS URL (or loopback HTTP): ${api}"
     if ! fetch_releases_api "${api}" "${TMP_DIR}/latest.json"; then
         die "could not look up the latest Neuron release at ${api}.
-    Set NEURON_VERSION (for example NEURON_VERSION=6.3.0) to skip the lookup."
+    Set NEURON_VERSION (for example NEURON_VERSION=7.0.0-alpha.1) to skip the lookup."
     fi
     tag="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${TMP_DIR}/latest.json" | head -n 1)"
     [ -n "${tag}" ] || die "the latest-release response from ${api} has no tag_name; set NEURON_VERSION."
@@ -259,7 +259,7 @@ if [ -z "${VERSION}" ]; then
 fi
 VERSION="${VERSION#v}"
 if ! printf '%s\n' "${VERSION}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
-    die "invalid version: ${VERSION} (expected something like 6.3.0)"
+    die "invalid version: ${VERSION} (expected something like 7.0.0-alpha.1)"
 fi
 
 URL="${DOWNLOAD_BASE}/v${VERSION}/${ASSET}"

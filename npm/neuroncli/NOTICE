@@ -1,7 +1,9 @@
 Neuron (https://github.com/RAHUL-DevelopeRR/neuron-v2)
 Copyright (c) 2026 RAHUL S / Zero-X
 
-Neuron is distributed under the MIT License; see LICENSE.
+Neuron is distributed under the MIT License; see LICENSE. The full-screen UI
+(ui/neuron-tui, released as the neuron-tui binaries) is distributed under the
+Apache License, Version 2.0; see below.
 
 Provenance
 ----------
@@ -17,6 +19,28 @@ the parity documents were imported from Claw Code and have since been modified.
 The Claw Code copyright and permission notice is reproduced in LICENSE and must
 be kept in all copies or substantial portions of the software. See
 docs/PROVENANCE.md for the code lineage.
+
+Full-screen UI (neuron-tui)
+---------------------------
+
+The full-screen terminal UI under ui/neuron-tui, released as the neuron-tui
+binaries, is derived from the Freebuff CLI (its cli/ package, and 31 files of its
+common/src vendored under ui/neuron-tui/src/vendor/common) at
+https://github.com/CodebuffAI/freebuff commit 545e04d, and has since been
+modified: Codebuff's services, ads, billing and telemetry were removed. It is
+distributed under the Apache License, Version 2.0, whose full text is in
+ui/neuron-tui/LICENSE. Files changed from the originals start with a
+"Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron" notice. The
+Freebuff NOTICE file reads:
+
+    Codebuff
+    Copyright 2025 Codebuff
+
+    This product includes software developed for the Codebuff project.
+
+The neuron-tui binary is compiled with Bun and contains the Bun runtime and npm
+packages, among them OpenTUI and React. THIRD_PARTY_NOTICES.md on every release
+lists them with their licenses and reproduces ui/neuron-tui/LICENSE and NOTICE.
 
 Bundled third-party skills
 --------------------------
