@@ -983,11 +983,15 @@ impl StreamState {
                     "Tool stream ended without a tool_calls finish reason",
                 ));
             }
-            if self.tool_calls.values().any(|call| {
-                call.name.as_ref().is_none_or(String::is_empty)
-                    || !serde_json::from_str::<Value>(&call.arguments)
-                        .is_ok_and(|value| value.is_object())
-            }) {
+            // A call without a name cannot run. Arguments that are not valid JSON
+            // are passed on: the model finished the call (finish_reason tool_calls),
+            // so the executor repairs near-JSON or reports the parse error to the
+            // model, instead of the turn treating the call as cut off at max_tokens.
+            if self
+                .tool_calls
+                .values()
+                .any(|call| call.name.as_ref().is_none_or(String::is_empty))
+            {
                 return Err(ApiError::InvalidSseFrame(
                     "Tool stream ended with an incomplete function name or arguments",
                 ));
@@ -1709,7 +1713,8 @@ fn normalize_response(
 }
 
 fn parse_tool_arguments(arguments: &str) -> Value {
-    serde_json::from_str(arguments).unwrap_or_else(|_| json!({ "raw": arguments }))
+    runtime::tool_input::parse_tool_input(arguments)
+        .map_or_else(|_| json!({ "raw": arguments }), |parsed| parsed.value)
 }
 
 fn next_sse_frame(buffer: &mut Vec<u8>) -> Option<String> {
@@ -2083,7 +2088,27 @@ mod tests {
             "id": "tool", "choices": [{"delta": {"tool_calls": [{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\"path\":"}}]}, "finish_reason":"tool_calls"}]
         })).unwrap();
         malformed.ingest_chunk(chunk).unwrap();
-        assert!(malformed.finish().is_err());
+        // The model finished the call, so bad JSON is not a cut-off stream: it goes
+        // to the executor, which repairs near-JSON or reports the parse error.
+        let events = malformed.finish().expect("finished call passes through");
+        assert!(events.iter().any(|event| matches!(event, crate::types::StreamEvent::MessageDelta(delta) if delta.delta.stop_reason.as_deref() == Some("tool_use"))));
+        let mut nameless = super::StreamState::new("auto".into());
+        let chunk = serde_json::from_value(serde_json::json!({
+            "id": "tool", "choices": [{"delta": {"tool_calls": [{"index":0,"id":"call_1","function":{"arguments":"{}"}}]}, "finish_reason":"tool_calls"}]
+        })).unwrap();
+        nameless.ingest_chunk(chunk).unwrap();
+        assert!(
+            nameless.finish().is_err(),
+            "a call without a tool name still fails"
+        );
+        assert_eq!(
+            super::parse_tool_arguments("{\"path\": \"a.rs\",}"),
+            serde_json::json!({"path": "a.rs"})
+        );
+        assert_eq!(
+            super::parse_tool_arguments("{\"path\":"),
+            serde_json::json!({"raw": "{\"path\":"})
+        );
     }
     /// Gemini's OpenAI-compatible stream sends two parallel calls as two
     /// items of one chunk and omits `index`. Before the fix both items

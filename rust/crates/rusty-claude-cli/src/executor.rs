@@ -375,8 +375,9 @@ impl ToolExecutor for CliToolExecutor {
                 "tool `{tool_name}` is not enabled by the current --allowedTools setting"
             )));
         }
-        let value = serde_json::from_str(input)
-            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+        let parsed = runtime::tool_input::parse_tool_input(input).map_err(ToolError::new)?;
+        let repaired = parsed.repaired;
+        let value = parsed.value;
         let result = if tool_name == "ToolSearch" {
             self.execute_search_tool(value)
         } else if self.tool_registry.has_runtime_tool(tool_name) {
@@ -386,6 +387,11 @@ impl ToolExecutor for CliToolExecutor {
                 .execute_with_cancel(tool_name, &value, cancel)
                 .map_err(ToolError::new)
         };
+        // Arguments that needed repair: say so, so the model sends valid JSON next time.
+        let result = result.map(|output| match &repaired {
+            Some(fixes) => format!("{output}\n\n[note: the arguments were not valid JSON; Neuron {fixes}. Send them as valid JSON next time.]"),
+            None => output,
+        });
         match result {
             Ok(output) => {
                 self.output

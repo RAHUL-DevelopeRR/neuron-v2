@@ -667,6 +667,8 @@ fn get_simple_doing_tasks_section() -> String {
         "Do not create files unless they are required to complete the task.".to_string(),
         "If an approach fails, diagnose the failure before switching tactics.".to_string(),
         "Be careful not to introduce security vulnerabilities such as command injection, XSS, or SQL injection.".to_string(),
+        "A reply without a tool call ends your turn. While work remains, make the next tool call instead of describing what you will do; never end a turn on a plan or a status line.".to_string(),
+        "Before you finish, verify what you changed: run the project's tests, type checker or build for the affected code.".to_string(),
         "Report outcomes faithfully: if verification fails or was not run, say so explicitly.".to_string(),
     ]);
 
