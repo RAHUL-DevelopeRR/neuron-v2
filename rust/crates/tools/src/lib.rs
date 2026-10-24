@@ -418,7 +418,11 @@ impl GlobalToolRegistry {
             let candidates = specs
                 .iter()
                 .map(|spec| spec.name)
-                .chain(self.plugin_tools.iter().map(|tool| tool.definition().name.as_str()))
+                .chain(
+                    self.plugin_tools
+                        .iter()
+                        .map(|tool| tool.definition().name.as_str()),
+                )
                 .collect::<Vec<_>>();
             return Err(runtime::tool_input::unknown_tool_message(name, &candidates));
         };
@@ -4273,6 +4277,7 @@ fn assemble_agent_runtime<C: ApiClient>(
         &subagent_feature_config(),
     )
     .with_context_manager(context_manager)
+    .with_harness_config(runtime::HarnessConfig::from_env())
 }
 
 /// Runtime features a sub-agent inherits: the parent's tool hooks, so
