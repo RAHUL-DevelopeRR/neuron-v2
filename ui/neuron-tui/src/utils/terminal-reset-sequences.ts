@@ -4,9 +4,9 @@
  * sacrificial watchdog process (terminal-watchdog.ts).
  *
  * Keep this list in sync with the modes OpenTUI enables (see the enable
- * sequences in @opentui/core's native lib) and with
- * SAFE_TERMINAL_RESET_SEQUENCES in the npm release launcher
- * (cli/release-core/launcher.js).
+ * sequences in @opentui/core's native lib) and with TERMINAL_RESET_SEQUENCES
+ * in rust/crates/rusty-claude-cli/src/full_screen.rs, which `neuron` writes
+ * after a UI that died (a test checks the two agree).
  *
  * Sequences:
  * - \x1b[?1049l: Exit alternate screen buffer (restores main screen)
@@ -31,3 +31,15 @@ export const TERMINAL_RESET_SEQUENCES =
   '\x1b[<u' + // Pop kitty keyboard protocol flags
   '\x1b[>4;0m' + // Reset modifyOtherKeys
   '\x1b[?25h' // Show cursor
+
+const LEAVE_ALTERNATE_SCREEN = '\x1b[?1049l'
+
+/**
+ * The same resets for a terminal already back on the main screen. Leaving the
+ * alternate screen again is not a no-op: terminals also restore the cursor
+ * saved when it was entered (DECRC), which moved it up to where the UI started,
+ * so the shell's next prompt overwrote the --continue hint printed below.
+ */
+export const MAIN_SCREEN_RESET_SEQUENCES = TERMINAL_RESET_SEQUENCES.slice(
+  LEAVE_ALTERNATE_SCREEN.length,
+)

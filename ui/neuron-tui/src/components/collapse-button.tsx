@@ -1,7 +1,10 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the arrow
+// comes from utils/glyphs.ts. See ui/neuron-tui/PORTING.md.
 import { memo } from 'react'
 
 import { Button } from './button'
 import { useTheme } from '../hooks/use-theme'
+import { GLYPHS } from '../utils/glyphs'
 
 import type { CSSProperties } from 'react'
 
@@ -27,7 +30,7 @@ export const CollapseButton = memo(({ onClick, style }: CollapseButtonProps) => 
       onClick={onClick}
     >
       <text fg={theme.secondary} style={{ wrapMode: 'none' }}>
-        ▴ collapse
+        {`${GLYPHS.collapseUp} collapse`}
       </text>
     </Button>
   )

@@ -1,4 +1,7 @@
-// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: /bash
+// (and its `!` alias) is not registered while shell commands are not
+// implemented (USER_SHELL_AVAILABLE in utils/user-shell.ts), so "/bash" goes
+// to the engine like any command the UI does not have.
 // See ui/neuron-tui/PORTING.md.
 import { handleCopyConversationCommand } from './copy-conversation'
 import { handleExportConversationCommand } from './export-conversation'
@@ -21,6 +24,7 @@ import { exitCliCleanly } from '../utils/exit-cleanly'
 import { getSystemMessage, getUserMessage } from '../utils/message-history'
 import { capturePendingAttachments } from '../utils/pending-attachments'
 import { getSkillByName } from '../utils/skill-registry'
+import { USER_SHELL_AVAILABLE } from '../utils/user-shell'
 
 import type { MultilineInputHandle } from '../components/multiline-input'
 import type { InputValue, PendingAttachment } from '../types/store'
@@ -163,6 +167,32 @@ const clearInput = (params: RouterParams) => {
   params.setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false })
 }
 
+/**
+ * `/bash` (`!`): run a shell command, or enter bash mode. Registered only
+ * when shell commands work (USER_SHELL_AVAILABLE); kept for when they do.
+ */
+export const BASH_COMMAND: CommandDefinition = defineCommandWithArgs({
+  name: 'bash',
+  aliases: ['!'],
+  handler: (params, args) => {
+    const trimmedArgs = args.trim()
+
+    // If user provided a command directly, execute it immediately
+    if (trimmedArgs) {
+      const commandWithBang = '!' + trimmedArgs
+      params.saveToHistory(commandWithBang)
+      clearInput(params)
+      runBashCommand(trimmedArgs)
+      return
+    }
+
+    // Otherwise enter bash mode
+    useChatStore.getState().setInputMode('bash')
+    params.saveToHistory(params.inputValue.trim())
+    clearInput(params)
+  },
+})
+
 const ALL_COMMANDS: CommandDefinition[] = [
   defineCommand({
     name: 'help',
@@ -188,27 +218,7 @@ const ALL_COMMANDS: CommandDefinition[] = [
       await handleExportConversationCommand(params, args)
     },
   }),
-  defineCommandWithArgs({
-    name: 'bash',
-    aliases: ['!'],
-    handler: (params, args) => {
-      const trimmedArgs = args.trim()
-
-      // If user provided a command directly, execute it immediately
-      if (trimmedArgs) {
-        const commandWithBang = '!' + trimmedArgs
-        params.saveToHistory(commandWithBang)
-        clearInput(params)
-        runBashCommand(trimmedArgs)
-        return
-      }
-
-      // Otherwise enter bash mode
-      useChatStore.getState().setInputMode('bash')
-      params.saveToHistory(params.inputValue.trim())
-      clearInput(params)
-    },
-  }),
+  ...(USER_SHELL_AVAILABLE ? [BASH_COMMAND] : []),
   defineCommand({
     name: 'exit',
     aliases: ['quit', 'q'],

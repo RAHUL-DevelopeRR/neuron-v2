@@ -58,6 +58,11 @@ export class EngineLaunchError extends Error {
 const exeName = (name: string) =>
   process.platform === 'win32' ? `${name}.exe` : name
 
+/** A pipe write's result: a promise's failure is dropped (see `write`). */
+function ignoreRejection(result: unknown): void {
+  if (result instanceof Promise) result.catch(() => {})
+}
+
 /**
  * Where the `neuron` binary is: `NEURON_BIN`, else beside this UI's own
  * executable (the packaged layout), else on the PATH this process started
@@ -130,6 +135,8 @@ export class StdioEngineClient implements NeuronEngineClient {
   connection: EngineConnection = 'not_started'
   /** Why the engine is not running, once it failed or stopped. */
   lastError: string | null = null
+  /** {@link shutdown} was called: the exit that follows is one the UI asked for. */
+  stopRequested = false
   ready: ReadyEvent | null = null
 
   private child: SpawnedEngine | null = null
@@ -291,8 +298,16 @@ export class StdioEngineClient implements NeuronEngineClient {
     if (this.connection !== 'ready' || !this.child) {
       throw new EngineNotConnectedError(this.lastError ?? undefined)
     }
-    this.child.stdin.write(encodeClientMessage(message))
-    this.child.stdin.flush()
+    // An engine that just died fails the write with EPIPE, synchronously or
+    // as a rejected promise. Its exit is reported through onExit (a turn sees
+    // EngineExitedError), so here it must not become an unhandled rejection,
+    // which ended the UI.
+    try {
+      ignoreRejection(this.child.stdin.write(encodeClientMessage(message)))
+      ignoreRejection(this.child.stdin.flush())
+    } catch {
+      throw new EngineNotConnectedError(this.lastError ?? undefined)
+    }
   }
 
   send(command: EngineCommand): void {
@@ -328,6 +343,7 @@ export class StdioEngineClient implements NeuronEngineClient {
   }
 
   async shutdown(): Promise<EngineExit> {
+    this.stopRequested = true
     const child = this.child
     if (!child || !this.exitPromise) {
       return { code: 0, signal: null }

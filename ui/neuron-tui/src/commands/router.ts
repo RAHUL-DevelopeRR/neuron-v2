@@ -1,4 +1,7 @@
-// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: prompts
+// and slash commands the UI does not have go to the engine, and a `!cmd`
+// prompt is a shell command only when shell commands are implemented
+// (USER_SHELL_AVAILABLE); until then it goes to the agent like any prompt.
 // See ui/neuron-tui/PORTING.md.
 import {
   dispatchSkillPrompt,
@@ -14,6 +17,8 @@ import {
 } from './prompt-builders'
 import { whenEngineStarted } from '../engine/engine-session'
 import { getNeuronEngineClient, runExchange } from '../engine/neuron-engine-client'
+import { withQuestionAnswer } from '../engine/questions'
+import { statusAddendum } from '../engine/status-report'
 import { getProjectRoot } from '../project-files'
 import { useChatStore } from '../state/chat-store'
 import { useEngineStore } from '../state/engine-store'
@@ -22,6 +27,7 @@ import {
   createRunTerminalToolResult,
 } from '../utils/bash-messages'
 import { showClipboardMessage } from '../utils/clipboard'
+import { GLYPHS } from '../utils/glyphs'
 import { getSystemMessage, getUserMessage } from '../utils/message-history'
 import { getSkillByName } from '../utils/skill-registry'
 import { pushSteeringMessage } from '../utils/steering-buffer'
@@ -31,7 +37,7 @@ import {
   hasProcessingImages,
   validateAndAddImage,
 } from '../utils/pending-attachments'
-import { runUserShellCommand } from '../utils/user-shell'
+import { USER_SHELL_AVAILABLE, runUserShellCommand } from '../utils/user-shell'
 
 /**
  * Run a bash command with automatic ghost/direct mode selection.
@@ -331,7 +337,7 @@ export async function routeUserPrompt(
   }
 
   // Handle bash commands from queue (starts with '!')
-  if (trimmed.startsWith('!') && trimmed.length > 1) {
+  if (USER_SHELL_AVAILABLE && trimmed.startsWith('!') && trimmed.length > 1) {
     const command = trimmed.slice(1)
     saveToHistory(trimmed)
     setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false })
@@ -350,7 +356,7 @@ export async function routeUserPrompt(
       setMessages((prev) => [
         ...prev,
         getUserMessage(trimmed),
-        getSystemMessage(`❌ ${result.error}`),
+        getSystemMessage(`${GLYPHS.error} ${result.error}`),
       ])
     }
 
@@ -397,22 +403,38 @@ export async function routeUserPrompt(
   if (isSlashCommand(trimmed) && engineReady) {
     const [command = '', ...args] = trimmed.slice(1).trim().split(/\s+/)
     setMessages((prev) => [...prev, getUserMessage(trimmed)])
-    runExchange(engine, () => engine.slash(command, args.join(' ')), () => {}).catch(
-      (error) =>
+    runExchange(engine, () => engine.slash(command, args.join(' ')), () => {})
+      .then(() => {
+        // The engine's report has no account and no folder trust: the UI
+        // adds them from the engine's status (engine/status-report.ts).
+        if (command.toLowerCase() !== 'status') return
+        const addendum = statusAddendum(useEngineStore.getState().status)
+        if (addendum) setMessages((prev) => [...prev, getSystemMessage(addendum)])
+      })
+      .catch((error) =>
         setMessages((prev) => [
           ...prev,
           getSystemMessage(error instanceof Error ? error.message : String(error)),
         ]),
-    )
+      )
     return
   }
 
   // The engine asked a question (AskUserQuestion) and takes the next submit
   // as its answer, even while the turn is still running.
-  const pendingQuestion = useEngineStore.getState().pendingQuestion
+  const { pendingQuestion, pendingQuestionTarget } = useEngineStore.getState()
   if (pendingQuestion && engineReady && trimmed) {
     useEngineStore.getState().setPendingQuestion(null)
-    setMessages((prev) => [...prev, getUserMessage(trimmed)])
+    // Into the question's block in the turn's message, so it reads above the
+    // agent's reply to it; a chat line when the question is one too.
+    setMessages(
+      (prev) =>
+        (pendingQuestionTarget &&
+          withQuestionAnswer(prev, pendingQuestionTarget, trimmed)) || [
+          ...prev,
+          getUserMessage(trimmed),
+        ],
+    )
     try {
       engine.submit(trimmed)
     } catch (error) {

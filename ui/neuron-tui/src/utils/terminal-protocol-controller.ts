@@ -1,3 +1,6 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: a key that
+// arrives while the last report said the terminal lost the focus counts as a
+// focus-in (only a focused terminal gets keys). See ui/neuron-tui/PORTING.md.
 import { writeTerminalControlSync } from './terminal-io'
 
 import type { CliRenderer } from '@opentui/core'
@@ -5,6 +8,9 @@ import type { CliRenderer } from '@opentui/core'
 const ENABLE_FOCUS_REPORTING = '\x1b[?1004h'
 const DISABLE_FOCUS_REPORTING = '\x1b[?1004l'
 const FOCUS_EVENT_RE = /\x1b\[(I|O)/g
+// Mouse reports (SGR and X10) and pastes, which also reach a terminal that is
+// not focused (a drag and drop pastes into one).
+const NOT_KEY_INPUT_RE = /^\x1b\[(<[\d;]*[Mm]|M|200~)/
 type TerminalProtocolRenderer = Pick<
   CliRenderer,
   'prependInputHandler' | 'removeInputHandler'
@@ -31,6 +37,11 @@ export function parseFocusState(data: string): boolean | null {
     focused = match[1] === 'I'
   }
   return focused
+}
+
+/** Whether `sequence` is a key, which only a focused terminal gets. */
+export function isKeyInput(sequence: string): boolean {
+  return sequence.length > 0 && !NOT_KEY_INPUT_RE.test(sequence)
 }
 
 /**
@@ -83,7 +94,16 @@ export class TerminalProtocolController {
 
   private readonly handleInput = (sequence: string): boolean => {
     const focused = parseFocusState(sequence)
-    if (focused === null) return false
+    if (focused === null) {
+      // The last report said the focus was lost, yet a key came: the
+      // terminal has the focus (the focus-in was lost, or the window got and
+      // lost the foreground again). Without this the input looked dead until
+      // the next focus-in.
+      if (this.lastFocusState === false && isKeyInput(sequence)) {
+        this.notifyFocus(true)
+      }
+      return false
+    }
 
     if (!this.focusSupported) {
       this.focusSupported = true
@@ -96,18 +116,20 @@ export class TerminalProtocolController {
       }
     }
 
-    if (focused !== this.lastFocusState) {
-      this.lastFocusState = focused
-      for (const subscriber of this.focusSubscribers) {
-        try {
-          subscriber.onFocusChange(focused)
-        } catch (error) {
-          this.reportError(error)
-        }
-      }
-    }
+    if (focused !== this.lastFocusState) this.notifyFocus(focused)
 
     return false
+  }
+
+  private notifyFocus(focused: boolean): void {
+    this.lastFocusState = focused
+    for (const subscriber of this.focusSubscribers) {
+      try {
+        subscriber.onFocusChange(focused)
+      } catch (error) {
+        this.reportError(error)
+      }
+    }
   }
 
   subscribeToFocus(subscriber: FocusSubscriber): () => void {

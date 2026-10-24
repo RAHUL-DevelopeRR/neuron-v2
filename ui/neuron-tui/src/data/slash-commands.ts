@@ -1,6 +1,9 @@
-// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
+// commands are Neuron's (engine commands are forwarded), and /bash is not
+// listed while shell commands are not implemented (USER_SHELL_AVAILABLE).
 // See ui/neuron-tui/PORTING.md.
 import { AGENT_MODES } from '../utils/constants'
+import { USER_SHELL_AVAILABLE } from '../utils/user-shell'
 
 import type { SkillsMap } from '@neuron-tui/common/types/skill'
 
@@ -104,12 +107,16 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
     description: 'Write the full conversation to a file (.md, or .json for raw messages)',
     aliases: ['export-chat'],
   },
-  {
-    id: 'bash',
-    label: 'bash',
-    description: 'Enter bash mode ("!" at beginning enters bash mode)',
-    aliases: ['!'],
-  },
+  ...(USER_SHELL_AVAILABLE
+    ? [
+        {
+          id: 'bash',
+          label: 'bash',
+          description: 'Enter bash mode ("!" at beginning enters bash mode)',
+          aliases: ['!'],
+        },
+      ]
+    : []),
   {
     id: 'image',
     label: 'image',

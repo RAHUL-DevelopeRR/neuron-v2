@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use runtime::cancel::CancellationToken;
 use runtime::permission_enforcer::PermissionEnforcer;
 use runtime::{
-    PermissionMode, PermissionOutcome, PermissionPolicy, PermissionPromptDecision,
-    PermissionPrompter, PermissionRequest, SessionApprovals,
+    ContentBlock, ConversationMessage, PermissionMode, PermissionOutcome, PermissionPolicy,
+    PermissionPromptDecision, PermissionPrompter, PermissionRequest, SessionApprovals,
 };
 use serde_json::{json, Value};
 
@@ -178,6 +178,14 @@ fn advertised_names(registry: &GlobalToolRegistry) -> BTreeSet<String> {
         .collect()
 }
 
+fn deferred_names(registry: &GlobalToolRegistry, messages: &[ConversationMessage]) -> Vec<String> {
+    registry
+        .deferred_mcp_definitions(messages)
+        .into_iter()
+        .map(|definition| definition.name)
+        .collect()
+}
+
 #[test]
 fn default_definitions_advertise_only_functional_tools() {
     let registry = GlobalToolRegistry::builtin();
@@ -270,9 +278,69 @@ fn mcp_tools_stay_deferred_until_tool_search_finds_them() {
         found.matches,
         vec!["mcp__deferral_probe__navigate".to_string()]
     );
-    let names = advertised_names(&registry);
-    assert!(names.contains("mcp__deferral_probe__navigate"));
-    assert!(!names.contains("mcp__deferral_probe__click"));
+    // A search alone adds nothing for the whole session: requests carry a found MCP
+    // tool only for the rest of the turn that found it.
+    assert!(!advertised_names(&registry).contains("mcp__deferral_probe__navigate"));
+    // Text a hook appended after the JSON does not hide the matches.
+    let search_result = format!(
+        "{}\n\nPostToolUse hook: logged",
+        serde_json::to_string_pretty(&found).expect("the search output serializes")
+    );
+    let mut messages = vec![
+        ConversationMessage::user_text("open the probe page"),
+        ConversationMessage::assistant(vec![
+            ContentBlock::ToolUse {
+                id: "s1".to_string(),
+                name: "ToolSearch".to_string(),
+                input: r#"{"query":"select:mcp__deferral_probe__navigate"}"#.to_string(),
+            },
+            ContentBlock::ToolUse {
+                id: "s2".to_string(),
+                name: "ToolSearch".to_string(),
+                input: r#"{"query":"nothing"}"#.to_string(),
+            },
+        ]),
+        ConversationMessage::tool_result("s1", "ToolSearch", search_result, false),
+        // Only `matches` count, not the degraded report's list of every MCP tool.
+        ConversationMessage::tool_result(
+            "s2",
+            "ToolSearch",
+            r#"{"matches":[],"mcp_degraded":{"available_tools":["mcp__deferral_probe__click"]}}"#,
+            false,
+        ),
+    ];
+    assert_eq!(
+        deferred_names(&registry, &messages),
+        vec!["mcp__deferral_probe__navigate".to_string()]
+    );
+    // The next prompt starts a new turn: the unused match drops out.
+    messages.push(ConversationMessage::assistant(vec![ContentBlock::Text {
+        text: "found it".to_string(),
+    }]));
+    messages.push(ConversationMessage::user_text("thanks, something else now"));
+    assert_eq!(deferred_names(&registry, &messages), Vec::<String>::new());
+    // A tool the model called stays in later requests.
+    messages.push(ConversationMessage::assistant(vec![
+        ContentBlock::ToolUse {
+            id: "c1".to_string(),
+            name: "mcp__deferral_probe__click".to_string(),
+            input: "{}".to_string(),
+        },
+    ]));
+    messages.push(ConversationMessage::tool_result(
+        "c1",
+        "mcp__deferral_probe__click",
+        "clicked",
+        false,
+    ));
+    messages.push(ConversationMessage::assistant(vec![ContentBlock::Text {
+        text: "clicked".to_string(),
+    }]));
+    messages.push(ConversationMessage::user_text("and now?"));
+    assert_eq!(
+        deferred_names(&registry, &messages),
+        vec!["mcp__deferral_probe__click".to_string()]
+    );
 
     // An explicit allow-list still advertises a listed MCP tool.
     let allowed = BTreeSet::from(["mcp__deferral_probe__click".to_string()]);

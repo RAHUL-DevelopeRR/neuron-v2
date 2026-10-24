@@ -285,12 +285,19 @@ fn format_hook_warning(command: &str, code: i32, stdout: Option<&str>, stderr: &
 
 fn shell_command(command: &str) -> CommandWithStdin {
     #[cfg(windows)]
-    let command_builder = if command.ends_with(".sh") {
-        let mut command_builder = Command::new("sh");
-        command_builder.arg(command);
+    let command_builder = {
+        use std::os::windows::process::CommandExt;
+
+        let mut command_builder = if command.ends_with(".sh") {
+            let mut command_builder = Command::new("sh");
+            command_builder.arg(command);
+            command_builder
+        } else {
+            subprocess::windows_cmd_command(command)
+        };
+        // Not in the user's console, whose title `cmd.exe` would change.
+        command_builder.creation_flags(subprocess::CREATE_NO_WINDOW);
         CommandWithStdin::new(command_builder)
-    } else {
-        CommandWithStdin::new(subprocess::windows_cmd_command(command))
     };
 
     #[cfg(not(windows))]

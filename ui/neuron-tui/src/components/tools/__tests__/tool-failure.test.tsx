@@ -5,10 +5,13 @@ import React from 'react'
 
 import { mapToolResult } from '../../../engine/tool-mapping'
 import { initializeThemeStore, useThemeStore } from '../../../hooks/use-theme'
-import { updateToolBlockWithOutput } from '../../../utils/message-block-helpers'
+import {
+  markRunningToolsInterrupted,
+  updateToolBlockWithOutput,
+} from '../../../utils/message-block-helpers'
 import { createMarkdownPalette } from '../../../utils/theme-system'
 import { ToolBranch } from '../../blocks/tool-branch'
-import { toolFailureOf } from '../tool-call-item'
+import { toolFailureOf, type ToolFailure } from '../tool-call-item'
 
 import type { ToolContentBlock } from '../../../types/chat'
 
@@ -79,6 +82,30 @@ describe('toolFailureOf', () => {
     expect(toolFailureOf({ isError: true, output: '', stopReason: 'timed out' })?.detail).toBe(
       'timed out',
     )
+  })
+
+  test('a call the user interrupted was stopped, with or without the engine result', () => {
+    const stopped: ToolFailure = { label: 'stopped', reason: null, detail: 'interrupted' }
+    // Marked when the turn was interrupted, before any result came back.
+    expect(toolFailureOf({ stopReason: 'interrupted' })).toEqual(stopped)
+    expect(toolFailureOf({ isError: false, output: 'out', stopReason: 'interrupted' })).toEqual(
+      stopped,
+    )
+  })
+
+  test('a command still running when the turn was interrupted says so, without "(no output)"', async () => {
+    const [block] = markRunningToolsInterrupted([
+      {
+        type: 'tool',
+        toolCallId: 'toolu_8',
+        toolName: 'run_terminal_command',
+        input: { command: 'npm run slow-check' },
+      },
+    ])
+    const shown = await frame(block as ToolContentBlock)
+    // Was the bare "$ npm run slow-check": nothing said it had been stopped.
+    expect(shown).toContain('$ npm run slow-check  ✗ stopped (interrupted)')
+    expect(shown).not.toContain('(no output)')
   })
 })
 
@@ -152,7 +179,8 @@ describe('a failed command says how it ended', () => {
         returnCodeInterpretation: 'cancelled',
       }),
     )
-    expect(interrupted).toContain('$ cargo build  ✗ failed (interrupted)')
+    // Interrupted is not failed: the user stopped it.
+    expect(interrupted).toContain('$ cargo build  ✗ stopped (interrupted)')
   })
 
   test('a command that succeeded has no failure marks', async () => {

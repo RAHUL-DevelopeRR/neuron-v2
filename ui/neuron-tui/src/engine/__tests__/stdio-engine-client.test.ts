@@ -93,6 +93,32 @@ describe('StdioEngineClient', () => {
     ])
   })
 
+  test('a write to an engine that just died is no unhandled rejection', async () => {
+    // Bun's pipe fails with EPIPE as a rejected promise, which ended the UI.
+    const engine = fakeEngine()
+    let handled = false
+    const spawn: SpawnEngine = (args, options) => {
+      const child = engine.spawn(args, options) as unknown as { stdin: Record<string, unknown> }
+      child.stdin.flush = () => {
+        const failure = Promise.reject(new Error('EPIPE: broken pipe, write'))
+        const handle = failure.catch.bind(failure)
+        failure.catch = (onRejected) => {
+          handled = true
+          return handle(onRejected)
+        }
+        return failure
+      }
+      return child as unknown as ReturnType<SpawnEngine>
+    }
+    const client = new StdioEngineClient({ spawn, resolveBinary: () => 'neuron' })
+    const started = client.start()
+    engine.emit(READY)
+    await started
+    expect(() => client.submit('after the crash')).not.toThrow()
+    await tick()
+    expect(handled).toBe(true)
+  })
+
   test('a launch error before ready rejects with the engine message', async () => {
     const engine = fakeEngine()
     const client = new StdioEngineClient({ spawn: engine.spawn, resolveBinary: () => 'neuron' })

@@ -6,6 +6,7 @@ import React, { memo, type ReactNode } from 'react'
 import { useTheme } from '../../hooks/use-theme'
 import { useWhyDidYouUpdateById } from '../../hooks/use-why-did-you-update'
 import { getCliEnv } from '../../utils/env'
+import { GLYPHS } from '../../utils/glyphs'
 import { MAX_COLLAPSED_LINES, truncateToLines } from '../../utils/strings'
 import { BORDER_CHARS } from '../../utils/ui-constants'
 import { Button } from '../button'
@@ -59,11 +60,13 @@ export const AgentBranchItem = memo((props: AgentBranchItemProps) => {
   const toggleFrameColor = isExpanded ? theme.secondary : theme.muted
   const toggleIconColor = isStreaming ? theme.primary : theme.foreground
   const bulletChar = '• '
-  const toggleIndicator = onToggle ? (isCollapsed ? '▸ ' : '▾ ') : ''
+  const toggleIndicator = onToggle
+    ? `${isCollapsed ? GLYPHS.collapsed : GLYPHS.expanded} `
+    : ''
   const toggleLabel = onToggle ? toggleIndicator : bulletChar
   const statusText =
     statusLabel && statusLabel.length > 0
-      ? statusIndicator === '✓'
+      ? statusIndicator === GLYPHS.check
         ? `${statusLabel} ${statusIndicator}`
         : `${statusIndicator} ${statusLabel}`
       : null

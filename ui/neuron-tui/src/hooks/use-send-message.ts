@@ -1,5 +1,7 @@
-// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
-// See ui/neuron-tui/PORTING.md.
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: a turn is
+// a `submit` to the engine; every save of the chat's run state names the
+// engine's session (also an interrupted turn's), and an interrupted turn's
+// late tool results still reach its rows. See ui/neuron-tui/PORTING.md.
 //
 // Freebuff ran the agent here through the Codebuff SDK (`client.run`), with
 // BYOK connection pinning, sponsored turns, Freebuff session admission and
@@ -23,12 +25,13 @@ import {
   runTurn,
   type NeuronEngineClient,
 } from '../engine/neuron-engine-client'
+import { withCurrentEngineSession } from '../engine/session-run-state'
 import { createTurnEventSink } from '../engine/turn-events'
 import { setCurrentChatId } from '../project-files'
 import { createStreamController } from './stream-state'
 import { useChatStore } from '../state/chat-store'
-import { useEngineStore } from '../state/engine-store'
 import { createEventHandlerState } from '../utils/create-event-handler-state'
+import { GLYPHS } from '../utils/glyphs'
 import { logger } from '../utils/logger'
 import { clearActiveRun, registerActiveRun } from '../utils/active-run'
 import {
@@ -278,8 +281,13 @@ export const useSendMessage = ({
       }
       let streamingStarted = false
 
+      // Every save names the engine's session as soon as the engine has
+      // reported one, so a chat whose turn is interrupted (or killed) before
+      // it completes still resumes it on `--continue`.
+      const runStateToSave = () => withCurrentEngineSession(latestRunStateSnapshot)
+
       setLiveChatStateProvider(runOwnerId, () => ({
-        runState: latestRunStateSnapshot,
+        runState: runStateToSave(),
         messages: useChatStore.getState().messages,
       }))
 
@@ -313,7 +321,7 @@ export const useSendMessage = ({
         // Capture the old chat's array now. Context-changing callers reset the
         // store immediately after stopActiveRun returns.
         scheduleCheckpointSave(
-          latestRunStateSnapshot,
+          runStateToSave(),
           useChatStore.getState().messages,
           runChatDir,
         )
@@ -362,7 +370,7 @@ export const useSendMessage = ({
         setMessages((prev) => [
           ...prev,
           createErrorChatMessage(
-            '⚠️ Failed to prepare message. Please try again.',
+            `${GLYPHS.warning} Failed to prepare message. Please try again.`,
           ),
         ])
         finishPreflight()
@@ -401,7 +409,7 @@ export const useSendMessage = ({
         setMessages((prev) => [
           ...prev,
           createErrorChatMessage(
-            '⚠️ Validation failed unexpectedly. Please try again.',
+            `${GLYPHS.warning} Validation failed unexpectedly. Please try again.`,
           ),
         ])
         await yieldToEventLoop()
@@ -447,7 +455,7 @@ export const useSendMessage = ({
       // Checkpoint the turn to disk immediately so that killing the process
       // (closed terminal, crash) can't lose the user's prompt.
       saveChatState(
-        latestRunStateSnapshot,
+        runStateToSave(),
         useChatStore.getState().messages,
         runChatDir,
       )
@@ -493,9 +501,15 @@ export const useSendMessage = ({
         if (abortController.signal.aborted) {
           throw new Error('Stopped before the engine was ready')
         }
-        turnSink = createTurnEventSink(eventHandlerState)
+        // Once the turn is interrupted its stream is no longer drawn, but the
+        // engine still reports how its running tool call ended ("interrupted"):
+        // that reaches the call's row while this chat is the current one.
+        turnSink = createTurnEventSink(eventHandlerState, {
+          acceptLateToolResults: () =>
+            abortController.signal.aborted && runChatIsCurrent(),
+        })
         const sink = turnSink
-        setEngineTurnActive(true)
+        setEngineTurnActive(true, aiMessageId)
         // Files and text are inlined into the prompt (as Freebuff did);
         // images go as attachments (see engine/attachments.ts).
         const outcome = await runTurn(
@@ -505,18 +519,16 @@ export const useSendMessage = ({
         )
         sink.finish()
 
-        const runState: RunState = {
+        // The engine's session, so `--continue` can resume it.
+        const runState: RunState = withCurrentEngineSession({
           ...latestRunStateSnapshot,
-          // The engine's session, so `--continue` can resume it.
-          sessionId:
-            useEngineStore.getState().status?.session_id ??
-            latestRunStateSnapshot.sessionId,
           // An expired session's error says /login, not the shell command.
           output: outcome.error
             ? { type: 'error', message: inUiWording(outcome.error) }
             : { type: 'lastMessage' },
-        }
-        latestRunStateSnapshot = runState
+        })
+        // An interrupted turn keeps its "ended before it completed" output.
+        if (!abortController.signal.aborted) latestRunStateSnapshot = runState
 
         // Only adopt and persist the result while this run's chat is still
         // the active one. After a mid-run chat switch (/new, resuming from
@@ -547,6 +559,14 @@ export const useSendMessage = ({
         })
         if (!abortController.signal.aborted && runChatIsCurrent()) {
           saveChatState(runState, useChatStore.getState().messages, runChatDir)
+        } else if (runChatIsCurrent()) {
+          // Interrupted: the checkpoint taken at the interrupt predates the
+          // tool results that came in after it.
+          scheduleCheckpointSave(
+            runStateToSave(),
+            useChatStore.getState().messages,
+            runChatDir,
+          )
         }
       } catch (error) {
         // If this run was aborted, the abort handler already handled cleanup.
@@ -567,7 +587,7 @@ export const useSendMessage = ({
           if (runChatIsCurrent()) {
             await settleCheckpointSave()
             saveChatState(
-              latestRunStateSnapshot,
+              runStateToSave(),
               useChatStore.getState().messages,
               runChatDir,
             )

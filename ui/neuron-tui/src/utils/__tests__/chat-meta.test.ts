@@ -66,6 +66,17 @@ describe('chat-meta', () => {
     expect(getFirstUserPrompt([])).toBe('(empty chat)')
   })
 
+  test('getFirstUserPrompt skips slash commands', () => {
+    expect(
+      getFirstUserPrompt([
+        userMessage('/login'),
+        userMessage(' /model auto'),
+        userMessage('fix the build'),
+      ]),
+    ).toBe('fix the build')
+    expect(getFirstUserPrompt([userMessage('/status')])).toBe('(empty chat)')
+  })
+
   test('writeChatMeta / readChatMeta round trip', () => {
     const messages = [userMessage('round trip prompt'), userMessage('two')]
     writeMessagesFile(messages)

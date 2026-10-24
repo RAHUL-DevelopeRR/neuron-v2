@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: a chat is
+// not named after a slash command. See ui/neuron-tui/PORTING.md.
 import * as fs from 'fs'
 import path from 'path'
 
@@ -31,11 +33,12 @@ const chatMetaSchema = z.object({
 export type ChatMeta = z.infer<typeof chatMetaSchema>
 
 /**
- * Get the first user message from a list of chat messages
+ * Get the first user message from a list of chat messages. Slash commands
+ * (`/login`, `/model x`) are skipped: they don't say what a chat is about.
  */
 export function getFirstUserPrompt(messages: ChatMessage[]): string {
   for (const msg of messages) {
-    if (msg?.variant === 'user' && msg.content) {
+    if (msg?.variant === 'user' && msg.content && !msg.content.trim().startsWith('/')) {
       // Truncate long prompts
       const content = msg.content.trim()
       if (content.length > 100) {

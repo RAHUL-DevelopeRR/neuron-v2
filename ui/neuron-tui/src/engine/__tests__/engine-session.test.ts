@@ -1,9 +1,15 @@
 import { beforeEach, describe, expect, test } from 'bun:test'
 
 import {
+  interruptAtPermission,
   resolvePermissionKey,
+  resolvePermissionNoteKey,
   summarizePermissionInput,
 } from '../../components/permission-prompt'
+import {
+  setNeuronEngineClientForTesting,
+  type NeuronEngineClient,
+} from '../neuron-engine-client'
 import { useChatStore } from '../../state/chat-store'
 import { needsSignIn, useEngineStore } from '../../state/engine-store'
 import {
@@ -208,6 +214,41 @@ describe('retry notices', () => {
     handleEngineEvent({ type: 'error', message: FINAL_ERROR })
     expect(systemLines()).toEqual([RETRY, `Error: ${FINAL_ERROR}`])
   })
+
+  test("go above the turn's answer, where they are saved too", () => {
+    useChatStore.getState().setMessages(() => [
+      { id: 'user-1', variant: 'user', content: 'what is 17 times 23', timestamp: 'now' },
+      { id: 'ai-1', variant: 'ai', content: '', blocks: [], timestamp: 'now' },
+    ])
+    setEngineTurnActive(true, 'ai-1')
+    handleEngineEvent({ type: 'notice', message: STALL_RETRY })
+    handleEngineEvent({ type: 'notice', message: RETRY })
+    // Other notices of the turn still come after it.
+    handleEngineEvent({ type: 'notice', message: 'Compacted 12 messages.' })
+    expect(useChatStore.getState().messages.map((m) => m.content || m.id)).toEqual([
+      'what is 17 times 23',
+      STALL_RETRY,
+      RETRY,
+      'ai-1',
+      'Compacted 12 messages.',
+    ])
+  })
+})
+
+describe('questions', () => {
+  const QUESTION = 'Question: Which branch?\n  1. main\n  2. dev\n  Answer with 1-2 or in your own words.'
+
+  test("a turn's question is drawn in the turn's message, not as a chat line", () => {
+    setEngineTurnActive(true, 'ai-1')
+    handleEngineEvent({ type: 'notice', message: QUESTION })
+    expect(systemLines()).toEqual([])
+    expect(useEngineStore.getState().pendingQuestion).toBe(QUESTION)
+  })
+
+  test('outside a turn it is a chat line, as before', () => {
+    handleEngineEvent({ type: 'notice', message: QUESTION })
+    expect(systemLines()).toEqual([QUESTION])
+  })
 })
 
 describe('sign-in wording', () => {
@@ -340,6 +381,46 @@ describe('permission prompt keys', () => {
     })
     expect(resolvePermissionKey({ name: 'x', ctrl: false, meta: false }, armed).type).toBe('none')
     expect(resolvePermissionKey({ name: 'y', ctrl: true, meta: false }, armed).type).toBe('none')
+  })
+
+  test('Esc denies; Ctrl-C interrupts the turn, even before the guard passes', () => {
+    expect(resolvePermissionKey({ name: 'escape', ctrl: false, meta: false }, armed)).toEqual({
+      type: 'decide',
+      decision: { kind: 'deny', note: null },
+    })
+    const unarmed = { armed: false, canAllowForSession: true }
+    expect(resolvePermissionKey({ name: 'escape', ctrl: false, meta: false }, unarmed).type).toBe(
+      'none',
+    )
+    expect(resolvePermissionKey({ name: 'c', ctrl: true, meta: false }, armed)).toEqual({
+      type: 'interrupt',
+    })
+    expect(resolvePermissionKey({ name: 'c', ctrl: true, meta: false }, unarmed)).toEqual({
+      type: 'interrupt',
+    })
+    // While the deny note is written: Esc goes back, Ctrl-C still stops.
+    expect(resolvePermissionNoteKey({ name: 'escape', ctrl: false, meta: false })).toBe('back')
+    expect(resolvePermissionNoteKey({ name: 'c', ctrl: true, meta: false })).toBe('interrupt')
+    expect(resolvePermissionNoteKey({ name: 'c', ctrl: false, meta: false })).toBe('none')
+  })
+
+  test('Ctrl-C stops the turn and closes the prompt', () => {
+    const sent: string[] = []
+    setNeuronEngineClientForTesting({
+      connection: 'ready',
+      interrupt: () => sent.push('interrupt'),
+      replyToPermission: (reply: { decision: { kind: string } }) =>
+        sent.push(`reply:${reply.decision.kind}`),
+    } as unknown as NeuronEngineClient)
+    try {
+      handleEngineEvent({ type: 'permission_requested', id: 4, request: REQUEST })
+      // No UI run is registered here, so the engine is interrupted directly.
+      interruptAtPermission(4)
+      expect(sent).toEqual(['interrupt', 'reply:deny'])
+      expect(useEngineStore.getState().permissionQueue).toEqual([])
+    } finally {
+      setNeuronEngineClientForTesting(null)
+    }
   })
 
   test('keys are ignored until the guard passes, and a only when offered', () => {

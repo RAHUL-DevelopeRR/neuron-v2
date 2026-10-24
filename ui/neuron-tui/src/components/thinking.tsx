@@ -1,9 +1,13 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: its
+// markers come from utils/glyphs.ts (console-safe in a classic Windows console
+// window). See ui/neuron-tui/PORTING.md.
 import { TextAttributes } from '@opentui/core'
 import React, { memo, type ReactNode } from 'react'
 
 import { Button } from './button'
 import { useTerminalDimensions } from '../hooks/use-terminal-dimensions'
 import { useTheme } from '../hooks/use-theme'
+import { GLYPHS } from '../utils/glyphs'
 import { getLastNVisualLines } from '../utils/text-layout'
 
 import type { ThinkingCollapseState } from '../types/chat'
@@ -56,9 +60,9 @@ export const Thinking = memo(
 
     const toggleIndicator =
       !isThinkingComplete ? '• '
-        : showFull ? '▾ '
+        : showFull ? `${GLYPHS.expanded} `
           : showPreview ? '• '
-            : '▸ '
+            : `${GLYPHS.collapsed} `
 
     return (
       <Button

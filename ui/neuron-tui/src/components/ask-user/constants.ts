@@ -1,3 +1,7 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the check
+// marks and boxes come from utils/glyphs.ts. See ui/neuron-tui/PORTING.md.
+import { GLYPHS } from '../../utils/glyphs'
+
 /**
  * Visual symbols used in the UI
  */
@@ -9,16 +13,16 @@ export const SYMBOLS = {
   UNSELECTED: '○',
 
   /** Completed question indicator */
-  COMPLETED: '✓',
+  COMPLETED: GLYPHS.check,
 
   /** Current question indicator */
   CURRENT: '●',
 
   /** Checked checkbox (multi-select) */
-  CHECKBOX_CHECKED: '☑',
+  CHECKBOX_CHECKED: GLYPHS.checkboxOn,
 
   /** Unchecked checkbox (multi-select) */
-  CHECKBOX_UNCHECKED: '☐',
+  CHECKBOX_UNCHECKED: GLYPHS.checkboxOff,
 } as const
 
 /** Option type - can be string or object with label/description */

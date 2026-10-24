@@ -1,5 +1,6 @@
-// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
-// See ui/neuron-tui/PORTING.md.
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: when
+// `neuron` starts the UI it is the watchdog (NEURON_TUI_DISARM_FILE), so no
+// PowerShell joins the user's console. See ui/neuron-tui/PORTING.md.
 /**
  * Sacrificial watchdog process that resets the terminal if the CLI dies
  * without running its own cleanup (SIGKILL, native crash, group kill).
@@ -92,6 +93,10 @@ let armedFilePath: string | null = null
 let armMonitor: ReturnType<typeof setTimeout> | null = null
 
 const WINDOWS_ARM_TIMEOUT_MS = 10_000
+
+/** What the UI writes to `neuron`'s NEURON_TUI_DISARM_FILE (full_screen.rs reads it). */
+export const PARENT_ARMED = 'armed'
+export const PARENT_DISARMED = 'disarmed'
 
 export type TerminalWatchdogFailure = {
   stage: 'spawn' | 'bootstrap' | 'arming'
@@ -534,6 +539,13 @@ const isTruthy = (value: string | undefined): boolean =>
  * explicit escape hatch for Windows endpoint-security policies that reject the
  * out-of-job PowerShell grandchild used by the recovery path.
  *
+ * When `neuron` started the UI, it names NEURON_TUI_DISARM_FILE and is the
+ * watchdog itself: it waits for the UI anyway, and resets the terminal after
+ * it unless the file says "disarmed". The UI then only writes "armed" there.
+ * No PowerShell attaches to the user's console, where its start retitled the
+ * window ("Windows PowerShell") and added one more process on the console's
+ * input.
+ *
  * @param options.ttyPath - Override the reset target (POSIX: the watchdog's
  *   stdout is pointed at this file; Windows: the watchdog writes the payload
  *   to this file and drops a `<ttyPath>.armed` marker once running). Tests
@@ -553,10 +565,21 @@ export function startTerminalWatchdog(options?: {
    */
   inspectWindowsWatchdogs?: () => WindowsWatchdogInspection
 }): void {
-  if (watchdog) return
+  if (watchdog || disarmFilePath) return
   const env = getCliEnv()
   if (isTruthy(env.NEURON_TUI_NO_TERMINAL_WATCHDOG)) return
   if (!options?.ttyPath && !process.stdout.isTTY) return
+
+  const parentDisarmFile = env.NEURON_TUI_DISARM_FILE?.trim()
+  if (parentDisarmFile && !options?.ttyPath) {
+    try {
+      writeFileSync(parentDisarmFile, PARENT_ARMED)
+      disarmFilePath = parentDisarmFile
+    } catch {
+      // `neuron` then sees no "armed" and leaves the terminal as it is.
+    }
+    return
+  }
 
   const reportFailure = options?.reportFailure ?? reportTerminalWatchdogFailure
   let overrideFd: number | null = null
@@ -672,10 +695,11 @@ export function stopTerminalWatchdog(): void {
   disarmFilePath = null
   clearArmMonitor()
   if (disarm) {
-    // Windows: the real watchdog is a grandchild we hold no handle to; it
-    // checks for this file after our death and stays silent when present.
+    // Windows: the real watchdog is a grandchild we hold no handle to (or
+    // `neuron`, our parent); it checks this file after our death and stays
+    // silent when present (or, for `neuron`, when it says "disarmed").
     try {
-      writeFileSync(disarm, '')
+      writeFileSync(disarm, PARENT_DISARMED)
     } catch {
       // Best-effort; worst case the watchdog writes resets on a clean exit,
       // which the terminal treats as no-ops.

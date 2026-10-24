@@ -9,6 +9,7 @@ import { ClickableTitleBox } from './clickable-title-box'
 import { MultilineInput } from './multiline-input'
 import { useTheme } from '../hooks/use-theme'
 import { truncateToSingleLinePreview } from '../utils/agent-display'
+import { GLYPHS } from '../utils/glyphs'
 import { clamp } from '../utils/math'
 import { resolveQueuePanelAction } from '../utils/queue-panel-actions'
 import { createPasteHandler } from '../utils/strings'
@@ -212,7 +213,7 @@ export const QueuePanel: React.FC<QueuePanelProps> = ({
 
   return (
     <ClickableTitleBox
-      title={` ▾ Queue — ${pluralize(queuedMessages.length, 'message')} `}
+      title={` ${GLYPHS.expanded} Queue — ${pluralize(queuedMessages.length, 'message')} `}
       titleAlignment="center"
       onTitleClick={editing ? undefined : onClose}
       style={{
@@ -231,7 +232,7 @@ export const QueuePanel: React.FC<QueuePanelProps> = ({
         // short terminal.
         <>
           <text style={{ fg: theme.info }}>
-            {`❯ ${position(selectedIndex)} editing`}
+            {`${GLYPHS.pointer} ${position(selectedIndex)} editing`}
           </text>
           <MultilineInput
             value={draft.text}
@@ -258,7 +259,8 @@ export const QueuePanel: React.FC<QueuePanelProps> = ({
             const index = start + offset
             const isSelected = index === selectedIndex
             const attachments = message.attachments.length
-            const suffix = attachments > 0 ? ` 📎${attachments}` : ''
+            const suffix =
+              attachments > 0 ? ` ${GLYPHS.attachment}${attachments}` : ''
             const body =
               truncateToSingleLinePreview(
                 message.content,
@@ -286,7 +288,7 @@ export const QueuePanel: React.FC<QueuePanelProps> = ({
                     wrapMode: 'none',
                   }}
                 >
-                  {isSelected ? '❯ ' : '  '}
+                  {isSelected ? `${GLYPHS.pointer} ` : '  '}
                   {position(index)} {body}
                   {suffix}
                 </text>
@@ -305,7 +307,7 @@ export const QueuePanel: React.FC<QueuePanelProps> = ({
       <text style={{ fg: theme.muted }}>
         {editing
           ? 'Enter save · Esc cancel · emptying it deletes'
-          : 'click a row to edit · ⇧↑↓ reorder · d delete · esc close'}
+          : `click a row to edit · ${GLYPHS.shift}↑↓ reorder · d delete · esc close`}
       </text>
     </ClickableTitleBox>
   )

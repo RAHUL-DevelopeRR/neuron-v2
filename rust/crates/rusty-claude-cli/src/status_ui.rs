@@ -335,6 +335,23 @@ pub(crate) fn status_context(
     })
 }
 
+/// The turns of a session as the user counts them: the prompts sent, which are its user
+/// messages (tool results are messages of their own) less the runtime's automatic
+/// "continue" nudges. The usage tracker's `turns` counts model requests instead.
+pub(crate) fn prompt_count(session: &Session) -> u32 {
+    let prompts = session
+        .messages
+        .iter()
+        .filter(|message| {
+            message.role == MessageRole::User
+                && !message.blocks.iter().any(|block| {
+                    matches!(block, ContentBlock::Text { text } if text.starts_with(runtime::AUTO_CONTINUE_PREFIX))
+                })
+        })
+        .count();
+    u32::try_from(prompts).unwrap_or(u32::MAX)
+}
+
 pub(crate) fn format_status_report(
     model: &str,
     usage: StatusUsage,
@@ -396,13 +413,56 @@ pub(crate) fn format_status_report(
             context.discovered_config_files,
             context.memory_file_count,
         ),
-        format_sandbox_report(&context.sandbox_status),
+        format_status_sandbox_section(&context.sandbox_status, cfg!(target_os = "linux")),
     ]
     .join(
         "
 
 ",
     )
+}
+
+/// The `/status` Sandbox section: the report on Linux, where the sandbox (namespaces,
+/// `unshare`) exists; one line elsewhere. `neuron sandbox` keeps the full report.
+pub(crate) fn format_status_sandbox_section(
+    status: &runtime::SandboxStatus,
+    supported_os: bool,
+) -> String {
+    if supported_os {
+        format_sandbox_report(status)
+    } else {
+        "Sandbox\n  Available         not on this OS (Linux only)".to_string()
+    }
+}
+
+/// The banner's greeting in at most `width` columns: "Welcome back" once this
+/// workspace has a saved session (`returning`), "Welcome" before; to the signed-in
+/// account (its email, or the part before `@` when the whole one does not fit), else
+/// to the OS user.
+pub(crate) fn banner_greeting(
+    email: Option<&str>,
+    os_user: &str,
+    returning: bool,
+    width: usize,
+) -> String {
+    let opening = if returning { "Welcome back" } else { "Welcome" };
+    // ", " and "!".
+    let room = width.saturating_sub(opening.len() + 3);
+    let name = match email.map(str::trim).filter(|email| !email.is_empty()) {
+        Some(email) if email.chars().count() <= room => email,
+        Some(email) => email.split('@').next().unwrap_or(email),
+        None => os_user,
+    };
+    let name = if name.chars().count() <= room {
+        name.to_string()
+    } else {
+        let kept = name
+            .chars()
+            .take(room.saturating_sub(3))
+            .collect::<String>();
+        format!("{kept}...")
+    };
+    format!("{opening}, {name}!")
 }
 
 pub(crate) fn format_sandbox_report(status: &runtime::SandboxStatus) -> String {
@@ -777,6 +837,43 @@ pub(crate) fn init_claude_md() -> Result<String, Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_banner_welcomes_a_new_account_and_names_it() {
+        assert_eq!(
+            banner_greeting(Some("dev@zero-x.live"), "rahul", false, 36),
+            "Welcome, dev@zero-x.live!"
+        );
+        assert_eq!(
+            banner_greeting(Some("dev@zero-x.live"), "rahul", true, 36),
+            "Welcome back, dev@zero-x.live!"
+        );
+        // Signed out: the OS user.
+        assert_eq!(
+            banner_greeting(None, "rahul", true, 36),
+            "Welcome back, rahul!"
+        );
+        // An email that does not fit: the part before `@`, cut when even that is long.
+        assert_eq!(
+            banner_greeting(Some("tcli-verify.e2e@zero-x.test"), "rahul", true, 36),
+            "Welcome back, tcli-verify.e2e!"
+        );
+        let long = banner_greeting(Some("a-very-long-mailbox-name-here@x.io"), "r", true, 36);
+        assert!(long.chars().count() <= 36, "{long}");
+        assert!(long.ends_with("...!"), "{long}");
+    }
+
+    #[test]
+    fn status_shows_the_sandbox_report_only_where_it_applies() {
+        let status = runtime::SandboxStatus::default();
+        let linux = format_status_sandbox_section(&status, true);
+        assert!(linux.contains("Fallback reason"), "{linux}");
+        let other = format_status_sandbox_section(&status, false);
+        assert_eq!(
+            other,
+            "Sandbox\n  Available         not on this OS (Linux only)"
+        );
+    }
+
     /// The `openai/` routing prefix picks a client; it is not part of the model's name, in
     /// the text report or the JSON one (a resumed session's stored model included).
     #[test]
@@ -812,5 +909,26 @@ mod tests {
         let json = status_json_value(Some("openai/auto"), usage, "workspace-write", &context);
         assert_eq!(json["model"], "auto");
         assert!(status_json_value(None, usage, "workspace-write", &context)["model"].is_null());
+    }
+
+    /// Turns are the prompts sent, not the model requests a tool loop makes.
+    #[test]
+    fn turns_count_the_prompts_not_the_model_requests() {
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::user_text("fix the bug"),
+            ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "t1".to_string(),
+                name: "bash".to_string(),
+                input: "{}".to_string(),
+            }]),
+            ConversationMessage::tool_result("t1", "bash", "ok", false),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "Fixed.".to_string(),
+            }]),
+            ConversationMessage::user_text(format!("{} continue", runtime::AUTO_CONTINUE_PREFIX)),
+            ConversationMessage::user_text("now add a test"),
+        ];
+        assert_eq!(prompt_count(&session), 2);
     }
 }

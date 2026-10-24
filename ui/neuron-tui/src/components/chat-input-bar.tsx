@@ -18,6 +18,7 @@ import { useEvent } from '../hooks/use-event'
 import { tryGetProjectRoot } from '../project-files'
 import { useChatStore } from '../state/chat-store'
 import { shouldInterceptChatInputKey } from '../utils/chat-input-key-intercept'
+import { GLYPHS } from '../utils/glyphs'
 import { getInputModeConfig } from '../utils/input-modes'
 import { BORDER_CHARS } from '../utils/ui-constants'
 
@@ -337,7 +338,7 @@ export const ChatInputBar = ({
               that it's a focusable input — costs no extra height. */}
           {!modeConfig.label && !modeConfig.icon && (
             <box style={{ flexShrink: 0 }}>
-              <text style={{ fg: theme.primary }}>❯</text>
+              <text style={{ fg: theme.primary }}>{GLYPHS.pointer}</text>
             </box>
           )}
           <MultilineInput
@@ -348,6 +349,7 @@ export const ChatInputBar = ({
             onKeyIntercept={handleKeyIntercept}
             placeholder={effectivePlaceholder}
             focused={inputFocused}
+            takesKeysUnfocused
             maxHeight={compactMaxHeight}
             ref={inputRef}
             cursorPosition={cursorPosition}
@@ -444,6 +446,7 @@ export const ChatInputBar = ({
                 onKeyIntercept={handleKeyIntercept}
                 placeholder={effectivePlaceholder}
                 focused={inputFocused}
+                takesKeysUnfocused
                 maxHeight={Math.floor(terminalHeight / 2)}
                 ref={inputRef}
                 cursorPosition={cursorPosition}

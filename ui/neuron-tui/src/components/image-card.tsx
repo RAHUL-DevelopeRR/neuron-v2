@@ -1,3 +1,5 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
+// fallback icon comes from utils/glyphs.ts. See ui/neuron-tui/PORTING.md.
 import fs from 'fs'
 
 import { useEffect, useState } from 'react'
@@ -5,6 +7,7 @@ import { useEffect, useState } from 'react'
 import { AttachmentCard } from './attachment-card'
 import { ImageThumbnail } from './image-thumbnail'
 import { useTheme } from '../hooks/use-theme'
+import { getGlyphMode, GLYPHS } from '../utils/glyphs'
 import {
   supportsInlineImages,
   renderInlineImage,
@@ -128,7 +131,11 @@ export const ImageCard = ({
             image={image}
             width={THUMBNAIL_WIDTH}
             height={THUMBNAIL_HEIGHT}
-            fallback={<text style={{ fg: theme.info }}>🖼️</text>}
+            fallback={
+              <text style={{ fg: theme.info }}>
+                {getGlyphMode() === 'console' ? GLYPHS.image : '🖼️'}
+              </text>
+            }
           />
         )}
       </box>

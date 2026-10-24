@@ -1,9 +1,10 @@
 /**
  * Zero-X sign-in, above the input. While the engine waits for a sign-in it
- * says how to start one (`/login`). During a `/login` it shows the link and
- * the device code, counts down to the code's expiry, and cancels on Esc (an
- * engine interrupt). The engine does the sign-in and keeps the token; the UI
- * only ever sees the code.
+ * says how to start one (`/login`), and whether a stored login expired or was
+ * revoked. During a `/login` it shows the link (a full https URL, an OSC 8
+ * hyperlink where the terminal has them) and the device code, counts down to
+ * the code's expiry, and cancels on Esc (an engine interrupt). The engine
+ * does the sign-in and keeps the token; the UI only ever sees the code.
  */
 
 import { TextAttributes, type KeyEvent } from '@opentui/core'
@@ -21,7 +22,12 @@ import { BORDER_CHARS } from '../utils/ui-constants'
 import type { StatusEvent } from '../engine/protocol'
 
 export type SignInView =
-  | { kind: 'signed_out' }
+  /**
+   * `expired`: there is a stored login, but its session expired or the
+   * gateway revoked it (the footer said "Zero-X <plan>" before). `email` is
+   * that login's, when known.
+   */
+  | { kind: 'signed_out'; expired: boolean; email: string | null }
   | { kind: 'starting' }
   | {
       kind: 'code'
@@ -42,13 +48,25 @@ export function signInView(
     const elapsed = Math.floor((now - signIn.receivedAt) / 1000)
     return {
       kind: 'code',
-      url: signIn.url_complete ?? signIn.url,
+      url: signInUrl(signIn.url_complete ?? signIn.url),
       userCode: signIn.user_code,
       remainingSecs: Math.max(0, signIn.expires_in_secs - elapsed),
       browserOpened: signIn.browser_opened,
     }
   }
-  return needsSignIn(status) ? { kind: 'signed_out' } : null
+  if (!needsSignIn(status)) return null
+  const account = status?.account ?? null
+  return {
+    kind: 'signed_out',
+    expired: account !== null,
+    email: account?.email ?? null,
+  }
+}
+
+/** The sign-in link as a full https URL: the engine's, or with https:// put back. */
+export function signInUrl(url: string): string {
+  const trimmed = url.trim()
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`
 }
 
 /** `m:ss`. */
@@ -109,11 +127,19 @@ export const SignInPanel = ({ width }: { width: number }) => {
         </text>
       ) : view.kind === 'signed_out' ? (
         <text style={{ wrapMode: 'word', fg: theme.foreground }}>
-          <span>Not signed in. Type </span>
+          <span>
+            {view.expired
+              ? `Your Zero-X sign-in${view.email ? ` (${view.email})` : ''} expired or was revoked. Type `
+              : 'Not signed in. Type '}
+          </span>
           <span fg={theme.primary} attributes={TextAttributes.BOLD}>
             /login
           </span>
-          <span> to sign in with your browser.</span>
+          <span>
+            {view.expired
+              ? ' to sign in again with your browser.'
+              : ' to sign in with your browser.'}
+          </span>
         </text>
       ) : (
         <>
@@ -124,6 +150,8 @@ export const SignInPanel = ({ width }: { width: number }) => {
           </text>
           <TerminalLink
             text={view.url}
+            href={view.url}
+            keepScheme={true}
             maxWidth={Math.max(10, width - 4)}
             lineWrap={true}
             onActivate={() => safeOpen(view.url)}

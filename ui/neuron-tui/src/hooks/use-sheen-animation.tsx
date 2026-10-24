@@ -1,5 +1,5 @@
-// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
-// See ui/neuron-tui/PORTING.md.
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the sheen
+// lights the logo in its letters' brand colours. See ui/neuron-tui/PORTING.md.
 import React, { useCallback, useEffect, useState } from 'react'
 
 import {
@@ -9,11 +9,11 @@ import {
   getSheenColor,
 } from '../utils/logo'
 
+import type { ThemeName } from '../types/theme-system'
+
 interface UseSheenAnimationParams {
   enabled?: boolean
-  logoColor: string
-  accentColor: string
-  blockColor: string
+  themeName: ThemeName
   terminalWidth: number | undefined
   sheenPosition: number
   setSheenPosition: (value: number | ((prev: number) => number)) => void
@@ -25,9 +25,7 @@ interface UseSheenAnimationParams {
  */
 export function useSheenAnimation({
   enabled = true,
-  logoColor,
-  accentColor,
-  blockColor,
+  themeName,
   terminalWidth,
   sheenPosition,
   setSheenPosition,
@@ -72,10 +70,8 @@ export function useSheenAnimation({
         char,
         charIndex,
         sheenPosition,
-        logoColor,
         SHADOW_CHARS,
-        accentColor,
-        blockColor,
+        themeName,
         isReversing,
       )
 
@@ -85,7 +81,7 @@ export function useSheenAnimation({
         </span>
       )
     },
-    [sheenPosition, logoColor, accentColor, blockColor, isReversing],
+    [sheenPosition, themeName, isReversing],
   )
 
   return {

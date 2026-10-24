@@ -54,6 +54,8 @@ pub struct Spinner {
 
 impl Spinner {
     const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    /// A classic Windows console's fonts have no braille.
+    const CONSOLE_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 
     #[must_use]
     pub fn new() -> Self {
@@ -79,7 +81,11 @@ impl Spinner {
         if self.plain {
             return Ok(());
         }
-        let frame = Self::FRAMES[self.frame_index % Self::FRAMES.len()];
+        let frame = if crate::console::console_glyphs() {
+            Self::CONSOLE_FRAMES[self.frame_index % Self::CONSOLE_FRAMES.len()]
+        } else {
+            Self::FRAMES[self.frame_index % Self::FRAMES.len()]
+        };
         self.frame_index += 1;
         queue!(
             out,
@@ -87,7 +93,7 @@ impl Spinner {
             MoveToColumn(0),
             Clear(ClearType::CurrentLine),
             SetForegroundColor(theme.spinner_active),
-            Print(format!("{frame} {label}")),
+            Print(crate::console::stdout_text(&format!("{frame} {label}"))),
             ResetColor,
             RestorePosition
         )?;
@@ -110,7 +116,7 @@ impl Spinner {
             MoveToColumn(0),
             Clear(ClearType::CurrentLine),
             SetForegroundColor(theme.spinner_done),
-            Print(format!("✔ {label}\n")),
+            Print(crate::console::stdout_text(&format!("✔ {label}\n"))),
             ResetColor
         )?;
         out.flush()
@@ -132,7 +138,7 @@ impl Spinner {
             MoveToColumn(0),
             Clear(ClearType::CurrentLine),
             SetForegroundColor(theme.spinner_failed),
-            Print(format!("✘ {label}\n")),
+            Print(crate::console::stdout_text(&format!("✘ {label}\n"))),
             ResetColor
         )?;
         out.flush()
@@ -326,6 +332,8 @@ impl TerminalRenderer {
                 state.heading_level = None;
                 output.push_str("\n\n");
             }
+            // After a nested list the item's line has ended already.
+            Event::End(TagEnd::Item) if output.ends_with('\n') => {}
             Event::End(TagEnd::Item) | Event::SoftBreak | Event::HardBreak => {
                 state.append_raw(output, "\n");
             }
@@ -338,7 +346,10 @@ impl TerminalRenderer {
             }
             Event::End(TagEnd::List(..)) => {
                 state.list_stack.pop();
-                output.push('\n');
+                // A nested list ends inside its parent item: no blank line.
+                if state.list_stack.is_empty() {
+                    output.push('\n');
+                }
             }
             Event::Start(Tag::Item) => Self::start_item(state, output),
             Event::Start(Tag::CodeBlock(kind)) => {
@@ -468,6 +479,10 @@ impl TerminalRenderer {
 
     fn start_item(state: &mut RenderState, output: &mut String) {
         let depth = state.list_stack.len().saturating_sub(1);
+        // A nested list starts right after its parent item's text: on a line of its own.
+        if depth > 0 && !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
         output.push_str(&"  ".repeat(depth));
 
         let marker = match state.list_stack.last_mut() {
@@ -977,6 +992,13 @@ fn normalize_nested_fences(markdown: &str) -> String {
 fn find_stream_safe_boundary(markdown: &str) -> Option<usize> {
     let mut open_fence: Option<FenceMarker> = None;
     let mut last_boundary = None;
+    // In a list, whether a boundary is safe depends on the next non-blank line: an
+    // indented one (a nested item, an item's paragraph or code) belongs to the item
+    // before it, and rendered on its own it would lose its nesting. `waiting` is the
+    // latest boundary since the list's last line, until that line arrives.
+    let mut in_list = false;
+    let mut waiting: Option<usize> = None;
+    let mut fence_in_list = false;
 
     for (offset, line) in markdown.split_inclusive('\n').scan(0usize, |cursor, line| {
         let start = *cursor;
@@ -984,30 +1006,60 @@ fn find_stream_safe_boundary(markdown: &str) -> Option<usize> {
         Some((start, line))
     }) {
         let line_without_newline = line.trim_end_matches('\n');
+        let end = offset + line.len();
         if let Some(opener) = open_fence {
             if line_closes_fence(line_without_newline, opener) {
                 open_fence = None;
-                last_boundary = Some(offset + line.len());
+                if fence_in_list {
+                    waiting = Some(end);
+                } else {
+                    last_boundary = Some(end);
+                }
             }
             continue;
         }
 
+        let blank = line_without_newline.trim().is_empty();
+        if !blank {
+            let indented = line_without_newline.starts_with([' ', '\t']);
+            if let Some(boundary) = waiting.take() {
+                if !indented {
+                    last_boundary = Some(boundary);
+                }
+            }
+            in_list = indented || is_list_item_line(line_without_newline);
+        }
+
         if let Some(opener) = parse_fence_opener(line_without_newline) {
             open_fence = Some(opener);
+            fence_in_list = in_list;
             continue;
         }
 
-        if line_without_newline.trim().is_empty() {
-            last_boundary = Some(offset + line.len());
-        } else if line.ends_with('\n') {
-            // For non-blank lines that end with newline, treat as a valid
-            // split point. This ensures short responses are rendered
-            // incrementally instead of being buffered until flush.
-            last_boundary = Some(offset + line.len());
+        // For complete lines, blank or not, a split point: short responses render
+        // incrementally instead of being buffered until flush.
+        if line.ends_with('\n') {
+            if in_list {
+                waiting = Some(end);
+            } else {
+                last_boundary = Some(end);
+            }
         }
     }
 
     last_boundary
+}
+
+/// `- item`, `* item`, `+ item`, `1. item` or `1) item`.
+fn is_list_item_line(line: &str) -> bool {
+    let rest = line.trim_start();
+    if rest.starts_with(['-', '*', '+']) {
+        return rest[1..].is_empty() || rest[1..].starts_with([' ', '\t']);
+    }
+    let digits = rest.chars().take_while(char::is_ascii_digit).count();
+    (1..=9).contains(&digits)
+        && rest[digits..].starts_with(['.', ')'])
+        && (rest[digits + 1..].is_empty() || rest[digits + 1..].starts_with([' ', '\t']))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1065,8 +1117,9 @@ fn break_inline_bullets(text: &str) -> String {
         result.push(ch);
         if ch == bullet {
             if chars.peek() == Some(&' ') {
-                // Look back: if prev char is not newline, insert one
-                let prev = result.chars().rev().nth(1);
+                // Look back past a nested item's indentation: if the bullet does not
+                // start its line, break the line before it.
+                let prev = result.chars().rev().skip(1).find(|c| *c != ' ');
                 if prev.is_some_and(|c| c != '\n') {
                     let bullet_start = result.len() - bullet.len_utf8();
                     result.insert(bullet_start, '\n');
@@ -1166,6 +1219,31 @@ mod tests {
         assert!(plain_text.contains("2. second"));
         assert!(plain_text.contains("• nested"));
         assert!(plain_text.contains("• child"));
+    }
+
+    /// Nested items keep their indentation, rendered whole or streamed line by line or
+    /// character by character.
+    #[test]
+    fn nested_items_under_numbered_ones_keep_their_indentation() {
+        let renderer = TerminalRenderer::new();
+        let source =
+            "Steps:\n\n1. First\n   - one\n   - two\n2. Second\n   - three\n     - deeper\n\nDone.";
+        let expected =
+            "Steps:\n\n1. First\n  \u{2022} one\n  \u{2022} two\n2. Second\n  \u{2022} three\n    \u{2022} deeper\n\nDone.\n";
+        let chunkings: [Vec<String>; 3] = [
+            vec![source.to_string()],
+            source.split_inclusive('\n').map(str::to_string).collect(),
+            source.chars().map(String::from).collect(),
+        ];
+        for chunks in chunkings {
+            let mut state = MarkdownStreamState::default();
+            let mut printed = String::new();
+            for chunk in &chunks {
+                printed.push_str(&state.push(&renderer, chunk).unwrap_or_default());
+            }
+            printed.push_str(&state.flush(&renderer).unwrap_or_default());
+            assert_eq!(strip_ansi(&printed), expected, "{} chunks", chunks.len());
+        }
     }
 
     #[test]

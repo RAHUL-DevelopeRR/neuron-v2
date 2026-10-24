@@ -1,7 +1,11 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the check
+// marks come from utils/glyphs.ts (console-safe in a classic Windows console
+// window). See ui/neuron-tui/PORTING.md.
 import { TextAttributes } from '@opentui/core'
 
 import { defineToolComponent } from './types'
 import { useTheme } from '../../hooks/use-theme'
+import { GLYPHS } from '../../utils/glyphs'
 import { parseTodos } from '../../utils/todos'
 
 import type { ToolRenderConfig } from './types'
@@ -52,7 +56,7 @@ export const WriteTodosItem = ({
           <text style={{ wrapMode: 'word', width: '100%', flexShrink: 0 }}>
             {todo.completed ? (
               <>
-                <span fg={theme.success}>{'✓  '}</span>
+                <span fg={theme.success}>{`${GLYPHS.check}  `}</span>
                 <span
                   fg={theme.muted}
                   attributes={TextAttributes.STRIKETHROUGH}
@@ -62,7 +66,7 @@ export const WriteTodosItem = ({
               </>
             ) : (
               <>
-                <span fg={theme.foreground}>{'☐  '}</span>
+                <span fg={theme.foreground}>{`${GLYPHS.todo}  `}</span>
                 <span fg={theme.foreground}>{todo.task}</span>
               </>
             )}

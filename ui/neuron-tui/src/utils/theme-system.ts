@@ -1,8 +1,13 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: both
+// themes use NeuronCLI's brand palette (BRAND in utils/logo.ts), borders
+// included, and the logo takes its colours from utils/logo.ts.
+// See ui/neuron-tui/PORTING.md.
 import { existsSync, readFileSync, readdirSync, statSync, watch } from 'fs'
 import { homedir } from 'os'
 import { dirname, join } from 'path'
 
 import { getCliEnv } from './env'
+import { BRAND } from './logo'
 
 import type { MarkdownPalette } from './markdown-renderer'
 import type { CliEnv } from '../types/env'
@@ -70,38 +75,6 @@ export function supportsTruecolor(env: CliEnv = getCliEnv()): boolean {
   
   _truecolorSupport = false
   return false
-}
-
-/**
- * Get the block color for the logo based on theme and terminal capabilities.
- * In dark mode: white (#ffffff or 'white')
- * In light mode: black (#000000 or 'black')
- */
-export function getLogoBlockColor(
-  themeName: ThemeName,
-  env: CliEnv = getCliEnv(),
-): string {
-  const isTruecolor = supportsTruecolor(env)
-  if (themeName === 'dark') {
-    return isTruecolor ? '#ffffff' : 'white'
-  }
-  return isTruecolor ? '#000000' : 'black'
-}
-
-/**
- * Get the accent color for the logo based on theme and terminal capabilities.
- * Returns the primary green color with appropriate fallback.
- */
-export function getLogoAccentColor(
-  themeName: ThemeName,
-  env: CliEnv = getCliEnv(),
-): string {
-  const isTruecolor = supportsTruecolor(env)
-  // The primary green color - 'lime' is CSS bright green
-  if (themeName === 'dark') {
-    return isTruecolor ? '#9EFC62' : 'lime'
-  }
-  return isTruecolor ? '#65A83E' : 'green'
 }
 
 const IDE_THEME_INFERENCE = {
@@ -711,43 +684,46 @@ export function detectPlatformTheme(): ThemeName {
 const DEFAULT_CHAT_THEMES: Record<ThemeName, ChatTheme> = {
   dark: {
     name: 'dark',
-    // Core semantic colors
-    primary: '#9EFC62',
+    // Core semantic colors, NeuronCLI's: blue accents, cyan info and links,
+    // orange warnings, green success, red errors
+    primary: BRAND.blue,
     secondary: '#a3aed0',
-    success: '#22c55e',
-    error: '#ef4444',
-    warning: '#FFA500',
-    info: '#9EFC62',
-    link: '#3B82F6',
+    success: BRAND.green,
+    error: BRAND.red,
+    warning: BRAND.orange,
+    info: BRAND.cyan,
+    link: BRAND.cyan,
     directory: '#9CA3AF',
 
     // Neutral scale
-    foreground: '#f1f5f9',
+    foreground: '#DCDCE6',
     background: 'transparent',
     muted: '#acb3bf',
-    border: '#536175',
+    // Brand blue: 4.0:1 on black (the grey it replaces was 3.3:1).
+    border: BRAND.blue,
     surface: '#202327',
     surfaceHover: '#334155',
 
-    // Context-specific
-    aiLine: '#6b7280',
-    userLine: '#9EFC62',
+    // Context-specific: as NeuronCLI drew them, the assistant's line blue and
+    // the user's orange
+    aiLine: BRAND.blue,
+    userLine: BRAND.orange,
 
     // Agent backgrounds
-    agentToggleHeaderBg: '#f97316',
-    agentToggleExpandedBg: '#1d4ed8',
+    agentToggleHeaderBg: BRAND.orange,
+    agentToggleExpandedBg: BRAND.blue,
     agentFocusedBg: '#334155',
     agentContentBg: '#000000',
     inputFg: '#f5f5f5',
     inputFocusedFg: '#ffffff',
 
     // Mode toggles
-    modeFastBg: '#f97316',
-    modeFastText: '#f97316',
-    modeMaxBg: '#dc2626',
-    modeMaxText: '#dc2626',
-    modePlanBg: '#1e40af',
-    modePlanText: '#1e40af',
+    modeFastBg: BRAND.orange,
+    modeFastText: BRAND.orange,
+    modeMaxBg: BRAND.red,
+    modeMaxText: BRAND.red,
+    modePlanBg: BRAND.blue,
+    modePlanText: BRAND.blue,
 
     // Image card
     imageCardBorder: '#6B7280',
@@ -757,15 +733,15 @@ const DEFAULT_CHAT_THEMES: Record<ThemeName, ChatTheme> = {
       // Dark mode: slightly darker gray for less brightness
       codeBackground: '#374151',
       codeHeaderFg: '#5b647a',
-      inlineCodeFg: '#FF8534',
-      codeTextFg: '#f1f5f9',
+      inlineCodeFg: BRAND.cyan,
+      codeTextFg: '#DCDCE6',
       headingFg: {
-        1: '#facc15',
-        2: '#facc15',
-        3: '#facc15',
-        4: '#facc15',
-        5: '#facc15',
-        6: '#facc15',
+        1: BRAND.blue,
+        2: BRAND.blue,
+        3: BRAND.blue,
+        4: BRAND.blue,
+        5: BRAND.blue,
+        6: BRAND.blue,
       },
       listBulletFg: '#a3aed0',
       blockquoteBorderFg: '#334155',
@@ -776,43 +752,46 @@ const DEFAULT_CHAT_THEMES: Record<ThemeName, ChatTheme> = {
   },
   light: {
     name: 'light',
-    // Core semantic colors
-    primary: '#65A83E',
+    // Core semantic colors: NeuronCLI's, with darker cyan and orange that
+    // stay readable on white
+    primary: BRAND.blue,
     secondary: '#6b7280',
-    success: '#059669',
-    error: '#ef4444',
-    warning: '#F59E0B',
-    info: '#65A83E',
-    link: '#2563EB',
+    success: BRAND.green,
+    error: BRAND.red,
+    warning: '#d68c27',
+    info: '#318795',
+    link: '#318795',
     directory: '#6B7280',
 
     // Neutral scale
     foreground: '#111827',
     background: 'transparent',
     muted: '#6b7280',
-    border: '#d1d5db',
+    // A lighter tint of the brand blue: 3.9:1 on white, softer than the
+    // primary blue text but as visible as a frame needs to be.
+    border: '#5B7FD0',
     surface: '#f3f4f6',
     surfaceHover: '#e5e7eb',
 
     // AI/User context
-    aiLine: '#6b7280',
-    userLine: '#65A83E',
+    aiLine: BRAND.blue,
+    userLine: BRAND.orange,
 
     // Agent context
-    agentToggleHeaderBg: '#ea580c',
-    agentToggleExpandedBg: '#1d4ed8',
+    agentToggleHeaderBg: BRAND.orange,
+    agentToggleExpandedBg: BRAND.blue,
     agentFocusedBg: '#f3f4f6',
     agentContentBg: '#ffffff',
     inputFg: '#111827',
     inputFocusedFg: '#000000',
 
     // Mode toggles
-    modeFastBg: '#f97316',
-    modeFastText: '#f97316',
-    modeMaxBg: '#dc2626',
-    modeMaxText: '#dc2626',
-    modePlanBg: '#1e40af',
-    modePlanText: '#1e40af',
+    modeFastBg: BRAND.orange,
+    modeFastText: '#d68c27',
+    modeMaxBg: BRAND.red,
+    modeMaxText: BRAND.red,
+    modePlanBg: BRAND.blue,
+    modePlanText: BRAND.blue,
 
     // Image card
     imageCardBorder: '#6B7280',
@@ -822,15 +801,15 @@ const DEFAULT_CHAT_THEMES: Record<ThemeName, ChatTheme> = {
       // Light mode: lighter gray background so inline code feels airy
       codeBackground: '#f3f4f6',
       codeHeaderFg: '#6b7280',
-      inlineCodeFg: '#C45A00',
+      inlineCodeFg: '#318795',
       codeTextFg: '#111827',
       headingFg: {
-        1: '#dc2626',
-        2: '#dc2626',
-        3: '#dc2626',
-        4: '#dc2626',
-        5: '#dc2626',
-        6: '#dc2626',
+        1: BRAND.blue,
+        2: BRAND.blue,
+        3: BRAND.blue,
+        4: BRAND.blue,
+        5: BRAND.blue,
+        6: BRAND.blue,
       },
       listBulletFg: '#6b7280',
       blockquoteBorderFg: '#d1d5db',

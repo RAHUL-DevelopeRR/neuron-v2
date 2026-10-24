@@ -89,6 +89,11 @@ export type CliEnv = BaseEnv & {
   // Set to 1/true to suppress the terminal-reset watchdog on machines where
   // the PowerShell process shape conflicts with endpoint-security policy.
   NEURON_TUI_NO_TERMINAL_WATCHDOG?: string
+  /**
+   * Set by `neuron` when it starts the UI: it is the watchdog. The UI starts
+   * none of its own and writes "armed", then "disarmed" after its reset.
+   */
+  NEURON_TUI_DISARM_FILE?: string
   /** Absolute per-process override for isolated CLI settings and transcripts. */
   NEURON_TUI_CONFIG_DIR?: string
   /** Neuron's home, shared with the engine; the UI's files go in its `tui`. */

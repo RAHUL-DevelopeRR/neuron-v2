@@ -1,5 +1,10 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the cursor
+// comes from utils/glyphs.ts (console-safe in a classic Windows console
+// window). See ui/neuron-tui/PORTING.md.
 import { TextAttributes } from '@opentui/core'
 import React, { useEffect, useRef, useState } from 'react'
+
+import { GLYPHS } from '../utils/glyphs'
 
 interface InputCursorProps {
   visible: boolean
@@ -16,7 +21,7 @@ export const InputCursor: React.FC<InputCursorProps> = ({
   visible,
   focused,
   shouldBlink = true,
-  char = '▍',
+  char = GLYPHS.cursor,
   color,
   blinkDelay = 500,
   blinkInterval = 500,  // Faster blinking

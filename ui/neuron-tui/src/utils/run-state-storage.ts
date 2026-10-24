@@ -1,5 +1,8 @@
-// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
-// See ui/neuron-tui/PORTING.md.
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: a save
+// keeps the engine session the chat's saved run state names when the new state
+// has none, recordChatEngineSession writes the engine's session into a saved
+// chat as soon as the engine reports it, and resumeSessionFor reads it back for
+// `--continue`. See ui/neuron-tui/PORTING.md.
 import * as fs from 'fs'
 import path from 'path'
 import { randomUUID } from 'node:crypto'
@@ -7,7 +10,9 @@ import { randomUUID } from 'node:crypto'
 import {
   findChatDirIn,
   getCurrentChatDir,
+  getCurrentChatId,
   getMostRecentChatDir,
+  getProjectDataDir,
   getProjectDataDirs,
 } from '../project-files'
 import {
@@ -20,8 +25,105 @@ import { writeFileAtomic, writeFileAtomicAsync } from './write-file-atomic'
 
 import type { ChatMessage } from '../types/chat'
 import type { RunState } from '../types/agent-run'
+import type { EngineSessionRef } from '../engine/session-run-state'
 
 const RUN_STATE_FILENAME = 'run-state.json'
+
+/** The run state saved in `chatDir`, or `null` when there is none (or it is unreadable). */
+function readSavedRunState(chatDir: string): RunState | null {
+  try {
+    const parsed = JSON.parse(
+      fs.readFileSync(path.join(chatDir, RUN_STATE_FILENAME), 'utf8'),
+    )
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as RunState)
+      : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * `runState` with the engine session the chat already saved, when it names
+ * none itself. A turn that ended in an error, or a checkpoint taken before the
+ * engine reported its session, must not drop the session a chat resumes.
+ */
+function keepSavedEngineSession(runState: RunState, chatDir: string): RunState {
+  if (
+    !runState ||
+    typeof runState !== 'object' ||
+    Array.isArray(runState) ||
+    runState.sessionId
+  ) {
+    return runState
+  }
+  const saved = readSavedRunState(chatDir)
+  if (!saved?.sessionId) return runState
+  return {
+    ...runState,
+    sessionId: saved.sessionId,
+    ...(saved.model !== undefined && runState.model === undefined && { model: saved.model }),
+  }
+}
+
+/**
+ * Write the engine's session into the run state of the chat saved in
+ * `chatDir`, so `--continue` resumes it even when no turn of the chat ever
+ * completed. Only a chat that has been saved (a prompt was sent) is touched:
+ * this never creates a chat. Returns whether the file was written.
+ */
+export function recordChatEngineSession(
+  session: EngineSessionRef,
+  chatDir: string,
+): boolean {
+  try {
+    const saved = readSavedRunState(chatDir)
+    if (!saved && !fs.existsSync(path.join(chatDir, CHAT_MESSAGES_FILENAME))) {
+      return false
+    }
+    const current: RunState = saved ?? { output: { type: 'lastMessage' } }
+    if (
+      current.sessionId === session.sessionId &&
+      (session.model === undefined || current.model === session.model)
+    ) {
+      return false
+    }
+    const next: RunState = {
+      ...current,
+      sessionId: session.sessionId,
+      ...(session.model !== undefined && { model: session.model }),
+    }
+    writeFileAtomic(path.join(chatDir, RUN_STATE_FILENAME), JSON.stringify(next))
+    return true
+  } catch (error) {
+    logSaveWriteFailure(error, chatDir, 'Failed to record the engine session')
+    return false
+  }
+}
+
+/**
+ * The current chat's directory when it already exists, without creating it
+ * (resolveCurrentChatDir does): for writes that must never start a chat.
+ */
+export function existingCurrentChatDir(): string | null {
+  try {
+    const dir =
+      chatDirOverride ??
+      path.join(getProjectDataDir(), 'chats', getCurrentChatId())
+    return fs.existsSync(dir) ? dir : null
+  } catch {
+    // No project yet (the project picker is open).
+    return null
+  }
+}
+
+/**
+ * The engine session `--continue` resumes: the one saved with the chat
+ * `chatId` (or the most recent chat), if any.
+ */
+export function resumeSessionFor(chatId?: string): string | undefined {
+  return loadMostRecentChatState(chatId)?.runState?.sessionId || undefined
+}
 
 type SavedChatState = {
   runState: RunState
@@ -336,7 +438,11 @@ export function saveChatState(
 ): void {
   // Compact JSON: these files are rewritten on every checkpoint and grow to
   // multiple MB; pretty-printing roughly doubles the write.
-  const serialized = serializeChatState(runState, messages, chatDir)
+  const serialized = serializeChatState(
+    keepSavedEngineSession(runState, chatDir),
+    messages,
+    chatDir,
+  )
   if (!serialized.runStateJson && !serialized.messagesJson) {
     return
   }
@@ -374,7 +480,11 @@ async function saveChatStateAsync(
   messages: ChatMessage[],
   chatDir: string,
 ): Promise<void> {
-  const serialized = serializeChatState(runState, messages, chatDir)
+  const serialized = serializeChatState(
+    keepSavedEngineSession(runState, chatDir),
+    messages,
+    chatDir,
+  )
   if (!serialized.runStateJson && !serialized.messagesJson) {
     return
   }
