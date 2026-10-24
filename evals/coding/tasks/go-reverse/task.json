@@ -1,0 +1,10 @@
+{
+  "id": "go-reverse",
+  "summary": "A Go function that reverses bytes instead of characters; the visible test fails.",
+  "tags": ["go", "bugfix"],
+  "prompt": "`go test ./...` fails. Fix Reverse in textutil/reverse.go so it reverses a string by Unicode code points. Do not change the tests.",
+  "allow": ["bash(go test:*)", "bash(go vet:*)", "bash(go build:*)"],
+  "grader": {"from": "grader", "to": "textutil"},
+  "check": "go test ./...",
+  "protected": ["textutil/reverse_test.go"]
+}

@@ -1,0 +1,9 @@
+{
+  "id": "js-rename",
+  "summary": "Rename a function across modules, imports, a re-export and tests.",
+  "tags": ["javascript", "refactor", "multi-file"],
+  "prompt": "Rename the function `calcTotal` to `computeOrderTotal` everywhere in this project: its definition, every import and re-export, every call and the tests. Do not keep an alias or wrapper with the old name.",
+  "allow": ["bash(node --test:*)", "bash(npm test:*)", "bash(npm run test:*)"],
+  "grader": {"from": "grader", "to": "_grader"},
+  "check": "node --test"
+}

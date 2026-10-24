@@ -77,7 +77,7 @@ pub fn detect_checks(root: &Path, edited: &[String]) -> Vec<ProjectCheck> {
                         name: "cargo check".to_string(),
                         command: format!(
                             "cargo check --quiet --message-format short --manifest-path {}",
-                            quote(&manifest)
+                            shell_path(&manifest, root)
                         ),
                         timeout_ms: RUST_TIMEOUT_MS,
                     });
@@ -95,7 +95,7 @@ pub fn detect_checks(root: &Path, edited: &[String]) -> Vec<ProjectCheck> {
                     let dir = module.parent().unwrap_or(root);
                     push(ProjectCheck {
                         name: "go vet".to_string(),
-                        command: format!("cd {} && go vet ./...", quote(dir)),
+                        command: in_dir(dir, root, "go vet ./..."),
                         timeout_ms: DEFAULT_TIMEOUT_MS,
                     });
                 }
@@ -108,7 +108,7 @@ pub fn detect_checks(root: &Path, edited: &[String]) -> Vec<ProjectCheck> {
         let files = python
             .iter()
             .take(MAX_PY_FILES)
-            .map(|file| quote(file))
+            .map(|file| shell_path(file, root))
             .collect::<Vec<_>>()
             .join(" ");
         push(ProjectCheck {
@@ -189,7 +189,7 @@ fn node_check(file: &Path, root: &Path) -> Option<ProjectCheck> {
         {
             return Some(ProjectCheck {
                 name: format!("{runner} {script}"),
-                command: format!("cd {} && {runner} {script}", quote(dir)),
+                command: in_dir(dir, root, &format!("{runner} {script}")),
                 timeout_ms: DEFAULT_TIMEOUT_MS,
             });
         }
@@ -203,11 +203,39 @@ fn node_check(file: &Path, root: &Path) -> Option<ProjectCheck> {
     if dir.join("tsconfig.json").is_file() && has_tsc {
         return Some(ProjectCheck {
             name: "tsc --noEmit".to_string(),
-            command: format!("cd {} && npx --no-install tsc --noEmit", quote(dir)),
+            command: in_dir(dir, root, "npx --no-install tsc --noEmit"),
             timeout_ms: DEFAULT_TIMEOUT_MS,
         });
     }
     None
+}
+
+/// `path` for a command run from `root`: relative to it when inside it (shorter,
+/// and harder for a model to copy wrong), quoted for a POSIX shell when needed.
+fn shell_path(path: &Path, root: &Path) -> String {
+    let relative = path
+        .strip_prefix(root)
+        .ok()
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            let path = path.canonicalize().ok()?;
+            let root = root.canonicalize().ok()?;
+            path.strip_prefix(&root).ok().map(Path::to_path_buf)
+        });
+    match relative {
+        Some(relative) if relative.as_os_str().is_empty() => ".".to_string(),
+        Some(relative) => quote(&relative),
+        None => quote(path),
+    }
+}
+
+/// `command` run in `dir`: as it is when `dir` is `root` (where checks run),
+/// otherwise after a `cd`.
+fn in_dir(dir: &Path, root: &Path, command: &str) -> String {
+    match shell_path(dir, root).as_str() {
+        "." => command.to_string(),
+        dir => format!("cd {dir} && {command}"),
+    }
 }
 
 /// `path` quoted for a POSIX shell when it needs it.
@@ -267,10 +295,15 @@ mod tests {
             .iter()
             .map(|check| check.command.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(checks.len(), 3, "{commands:?}");
-        assert!(
-            commands[0].starts_with("cargo check --quiet --message-format short --manifest-path "),
-            "{commands:?}"
+        // Paths are relative to the workspace, where the checks run.
+        assert_eq!(
+            commands,
+            vec![
+                "cargo check --quiet --message-format short --manifest-path rust/Cargo.toml",
+                "cd web && bun run typecheck",
+                "python -m py_compile tool.py",
+            ],
+            "typecheck preferred over lint"
         );
         // Quoted when the temp folder's path needs it (a short name like RUNNER~1).
         assert!(
@@ -286,6 +319,12 @@ mod tests {
         assert!(
             commands[2].starts_with("python -m py_compile "),
             "{commands:?}"
+        );
+        let absolute = root.join("tool.py").to_string_lossy().into_owned();
+        assert_eq!(
+            detect_checks(&root, &[absolute])[0].command,
+            "python -m py_compile tool.py",
+            "an absolute path inside the workspace is shortened"
         );
         assert!(
             detect_checks(&root, &["README.md".to_string()]).is_empty(),
