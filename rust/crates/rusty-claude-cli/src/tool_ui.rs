@@ -145,9 +145,15 @@ pub fn display_clean_path(raw: &str) -> String {
         if let Some(rel) = relative_display(Path::new(cleaned), &cwd) {
             return rel;
         }
-        // Also as the OS resolves it: macOS reaches its temp folder through a
-        // /var -> /private/var link, and the working directory reads resolved.
-        if let Ok(resolved) = std::fs::canonicalize(cleaned) {
+        // An absolute path also as the OS resolves it: macOS reaches its temp folder
+        // through a /var -> /private/var link, and the working directory reads
+        // resolved. A relative path stays as given.
+        let resolved = if Path::new(cleaned).is_absolute() {
+            std::fs::canonicalize(cleaned).ok()
+        } else {
+            None
+        };
+        if let Some(resolved) = resolved {
             let resolved = resolved.display().to_string();
             let resolved = resolved.strip_prefix(r"\\?\").unwrap_or(&resolved);
             if let Some(rel) = relative_display(Path::new(resolved), &cwd) {
@@ -688,8 +694,8 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).expect("link");
         let shown = crate::tests::with_current_dir(&real, || {
             (
-                display_clean_path(&link.display().to_string()),
-                display_clean_path(&link.join("src").display().to_string()),
+                super::display_clean_path(&link.display().to_string()),
+                super::display_clean_path(&link.join("src").display().to_string()),
             )
         });
         let _ = std::fs::remove_dir_all(&root);
