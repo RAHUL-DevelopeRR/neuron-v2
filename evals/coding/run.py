@@ -39,6 +39,10 @@ DEFAULT_ALLOW = ["bash(python -m py_compile:*)", "bash(go vet:*)", "bash(python 
 # Denied calls a run may make before Neuron stops it: high enough that a model can
 # work around commands the task does not allow; the iteration cap still applies.
 DENIAL_LIMIT = "25"
+# Errors that mean the provider, not the agent, ended a run. Such runs are
+# started again after a pause, and left out of pass rates if they keep failing.
+INFRA_ERROR_MARKERS = ("api failed after", "429", "Too Many Requests", "service_unavailable", "upstream_timeout")
+INFRA_RETRY_PAUSE_S = 60
 PROVIDERS = {
     # NVIDIA NIM's OpenAI-compatible API with NVIDIA_API_KEY.
     "nvidia": {
@@ -175,10 +179,27 @@ def build_env(args, variant, run_home):
     return env
 
 
+def is_infra_error(row):
+    """The provider failed the run (rate limit, outage), not the agent."""
+    error = row.get("error") or ""
+    return any(marker in error for marker in INFRA_ERROR_MARKERS)
+
+
 def run_one(args, task, variant, model, repeat, work):
+    """One run, started again (in a fresh workspace, after a pause) when the
+    provider rather than the agent ended it."""
+    for attempt in range(1, args.retry_infra + 2):
+        row = run_attempt(args, task, variant, model, repeat, work, attempt)
+        if not row["infra_error"] or attempt > args.retry_infra:
+            return row
+        time.sleep(INFRA_RETRY_PAUSE_S)
+    return row
+
+
+def run_attempt(args, task, variant, model, repeat, work, attempt):
     # Short paths: git on Windows fails past 260 characters.
     group = work / f"{variant['name']}-m{args.model.index(model)}"
-    workspace = group / f"{task['id']}-r{repeat}"
+    workspace = group / f"{task['id']}-r{repeat}" if attempt == 1 else group / f"{task['id']}-r{repeat}a{attempt}"
     run_home = group / "_neuron"
     prepare_workspace(task, workspace)
     env = build_env(args, variant, run_home)
@@ -191,11 +212,12 @@ def run_one(args, task, variant, model, repeat, work):
     report = report or {}
     usage = report.get("usage") or {}
     tool_results = report.get("tool_results") or []
-    return {
+    row = {
         "task": task["id"],
         "variant": variant["name"],
         "model": model,
         "repeat": repeat,
+        "attempt": attempt,
         # Editing files the task protects (its tests) fails the run.
         "passed": check_passed and not protected,
         "check_passed": check_passed,
@@ -219,25 +241,32 @@ def run_one(args, task, variant, model, repeat, work):
         "stderr": stderr[-800:],
         "workspace": str(workspace),
     }
+    row["infra_error"] = is_infra_error(row)
+    return row
 
 
 def summarize(rows):
+    """Pass rates count only runs the provider did not end (see `is_infra_error`)."""
     lines = ["# Neuron coding eval", ""]
     groups = {}
     for row in rows:
         groups.setdefault((row["variant"], row["model"]), []).append(row)
-    lines += ["| variant | model | passed | pass rate | iterations (mean) | tokens in/out (mean) | seconds (mean) | errors |",
-              "| --- | --- | --- | --- | --- | --- | --- | --- |"]
-    for (variant, model), group in sorted(groups.items()):
+    lines += ["| variant | model | passed | pass rate | iterations (mean) | tokens in/out (mean) | seconds (mean) | agent errors | provider errors |",
+              "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+    for (variant, model), runs in sorted(groups.items()):
+        group = [row for row in runs if not row.get("infra_error")] or [{"passed": False, "iterations": None,
+                 "input_tokens": 0, "output_tokens": 0, "seconds": 0, "outcome": "-"}]
+        valid = len(runs) - sum(1 for row in runs if row.get("infra_error"))
         passed = sum(row["passed"] for row in group)
         iterations = [row["iterations"] for row in group if row["iterations"] is not None]
         mean_iterations = f"{statistics.mean(iterations):.1f}" if iterations else "-"
         errors = sum(1 for row in group if row["outcome"] in ("error", "timeout"))
+        rate = f"{passed / valid:.0%}" if valid else "-"
         lines.append(
-            f"| {variant} | {model} | {passed}/{len(group)} | {passed / len(group):.0%} | {mean_iterations} | "
+            f"| {variant} | {model} | {passed}/{valid} | {rate} | {mean_iterations} | "
             f"{statistics.mean(row['input_tokens'] for row in group):,.0f} / "
             f"{statistics.mean(row['output_tokens'] for row in group):,.0f} | "
-            f"{statistics.mean(row['seconds'] for row in group):.0f} | {errors} |"
+            f"{statistics.mean(row['seconds'] for row in group):.0f} | {errors} | {len(runs) - valid} |"
         )
     lines += ["", "## Per task", ""]
     variants = sorted({(row["variant"], row["model"]) for row in rows})
@@ -246,7 +275,8 @@ def summarize(rows):
     for task in sorted({row["task"] for row in rows}):
         cells = []
         for key in variants:
-            group = [row for row in rows if row["task"] == task and (row["variant"], row["model"]) == key]
+            group = [row for row in rows if row["task"] == task and (row["variant"], row["model"]) == key
+                     and not row.get("infra_error")]
             cells.append(f"{sum(row['passed'] for row in group)}/{len(group)}" if group else "-")
         lines.append(f"| {task} | " + " | ".join(cells) + " |")
     return "\n".join(lines) + "\n"
@@ -296,6 +326,8 @@ def main():
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--jobs", type=int, default=1, help="runs in parallel")
     parser.add_argument("--timeout", type=int, default=900, help="seconds per agent run")
+    parser.add_argument("--retry-infra", type=int, default=2,
+                        help="times to start a run again when the provider ended it (rate limit, outage)")
     parser.add_argument("--work", help="directory for run workspaces (default: a new temp directory)")
     parser.add_argument("--out", help="results directory (default: evals/coding/results/<time>)")
     args = parser.parse_args()

@@ -33,6 +33,12 @@ finishes, the task's `grader/` is copied in and its `check` command decides.
 Changing a file the task lists under `protected` (its tests) fails the run even
 when the check passes.
 
+A run the provider ended (rate limit, outage) is started again in a fresh
+workspace after a minute (`--retry-infra`, default 2); if it keeps failing it
+counts as a provider error and is left out of the pass rate. Fast models on
+free tiers hit per-minute limits quickly: NVIDIA NIM allows about 40 requests
+a minute, so keep `--jobs` at 1–2 there.
+
 ## Tasks
 
 | Task | What it probes |
