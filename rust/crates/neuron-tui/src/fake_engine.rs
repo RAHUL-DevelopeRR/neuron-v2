@@ -248,6 +248,7 @@ pub mod samples {
             sign_in_required: false,
             account: None,
             supports_images: Some(false),
+            served_model: None,
         }
     }
 

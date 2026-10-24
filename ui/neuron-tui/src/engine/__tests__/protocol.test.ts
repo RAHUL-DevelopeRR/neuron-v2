@@ -270,6 +270,7 @@ const EVENT_FIELDS: { [T in UiEventType]: string[] } = {
     'sign_in_required',
     'account',
     'supports_images',
+    'served_model',
   ]),
   sign_in_code: eventFields('sign_in_code')([
     'url',

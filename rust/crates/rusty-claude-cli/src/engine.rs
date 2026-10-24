@@ -421,6 +421,7 @@ impl SignedOut<'_> {
             0,
             &account,
             true,
+            None,
         ));
     }
 
@@ -496,6 +497,7 @@ impl AccountState {
 }
 
 /// The footer's `Status`; git and the workspace's trust are read now.
+#[allow(clippy::too_many_arguments)]
 fn status_event(
     model: &str,
     permission_mode: PermissionMode,
@@ -504,10 +506,12 @@ fn status_event(
     context_percent: u32,
     account: &AccountState,
     sign_in_required: bool,
+    served_model: Option<&str>,
 ) -> UiEvent {
     let cwd = env::current_dir().unwrap_or_default();
+    let shown = shown_model(model);
     UiEvent::Status {
-        model: shown_model(model).to_string(),
+        model: shown.to_string(),
         permission_mode: permission_mode.as_str().to_string(),
         session_id: session_id.to_string(),
         workspace_trusted: ConfigLoader::default_for(&cwd).workspace_is_trusted(),
@@ -519,6 +523,10 @@ fn status_event(
         sign_in_required,
         account: account.info.clone(),
         supports_images: crate::gateway_catalog::model_supports_images(model),
+        served_model: served_model
+            .map(shown_model)
+            .filter(|served| *served != shown)
+            .map(ToString::to_string),
     }
 }
 
@@ -1776,6 +1784,7 @@ impl Engine {
             context_percent,
             &self.account,
             sign_in_required,
+            self.cli.runtime.served_model(),
         );
         self.send(status);
     }
