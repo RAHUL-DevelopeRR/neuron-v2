@@ -20,7 +20,10 @@ afterEach(() => {
 })
 
 /** The composer as chat.tsx wires it: the text lives in the chat store. */
-async function mountComposer(submitted: string[]) {
+async function mountComposer(
+  submitted: string[],
+  focus: { focused?: boolean; takesKeysUnfocused?: boolean } = {},
+) {
   const Harness = () => {
     const inputValue = useChatStore((s) => s.inputValue)
     const cursorPosition = useChatStore((s) => s.cursorPosition)
@@ -32,7 +35,8 @@ async function mountComposer(submitted: string[]) {
         onChange={setInputValue}
         onSubmit={() => submitted.push(useChatStore.getState().inputValue)}
         onPaste={() => {}}
-        focused
+        focused={focus.focused ?? true}
+        takesKeysUnfocused={focus.takesKeysUnfocused}
       />
     )
   }
@@ -72,5 +76,21 @@ describe('MultilineInput: keys that come before the next render', () => {
     await setup.renderOnce()
     await setup.mockInput.pressKeys(['\b', '\b', '\b', '/', 'e', 'x', 'i', 't'])
     expect(useChatStore.getState().inputValue).toBe('/exit')
+  })
+})
+
+describe('MultilineInput: keys while the terminal reports no focus', () => {
+  test('the chat input takes them: only a focused terminal gets keys', async () => {
+    const submitted: string[] = []
+    const setup = await mountComposer(submitted, { focused: false, takesKeysUnfocused: true })
+    await setup.mockInput.typeText('hi')
+    await setup.mockInput.pressKeys(['\r'])
+    expect(submitted).toEqual(['hi'])
+  })
+
+  test('an input that is simply not the active one still ignores them', async () => {
+    const setup = await mountComposer([], { focused: false })
+    await setup.mockInput.typeText('hi')
+    expect(useChatStore.getState().inputValue).toBe('')
   })
 })

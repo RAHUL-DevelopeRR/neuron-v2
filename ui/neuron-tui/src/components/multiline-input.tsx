@@ -2,7 +2,8 @@
 // cursor is the theme's colour everywhere (it was lime, #00FF00, wherever
 // COLORTERM was unset: every Windows console, in the light theme too), and
 // deleting, moving and Enter work on the latest text, as typing already did,
-// not on the last render's. See ui/neuron-tui/PORTING.md.
+// not on the last render's. An input whose `focused` only mirrors the
+// terminal's focus reports can take keys anyway. See ui/neuron-tui/PORTING.md.
 import {
   decodePasteBytes,
   stripAnsiSequences,
@@ -193,6 +194,13 @@ interface MultilineInputProps {
   onTypedText?: (text: string) => void
   placeholder?: string
   focused?: boolean
+  /**
+   * Take keys while not `focused`: for an input whose `focused` only mirrors
+   * the terminal's focus reports. Only a focused terminal gets keys, and a
+   * report can be wrong or lost (a window that got and lost the foreground
+   * again looked dead until the next focus-in).
+   */
+  takesKeysUnfocused?: boolean
   shouldBlinkCursor?: boolean
   maxHeight?: number
   minHeight?: number
@@ -217,6 +225,7 @@ export const MultilineInput = forwardRef<
     onTypedText,
     placeholder = '',
     focused = true,
+    takesKeysUnfocused = false,
     shouldBlinkCursor,
     maxHeight = 5,
     minHeight = 1,
@@ -1125,7 +1134,7 @@ export const MultilineInput = forwardRef<
   useKeyboard(
     useCallback(
       (key: KeyEvent) => {
-        if (!focused) return
+        if (!focused && !takesKeysUnfocused) return
 
         if (onKeyIntercept) {
           const handled = onKeyIntercept(key)
@@ -1146,6 +1155,7 @@ export const MultilineInput = forwardRef<
       },
       [
         focused,
+        takesKeysUnfocused,
         onKeyIntercept,
         handleEnterKeys,
         handleDeletionKeys,
