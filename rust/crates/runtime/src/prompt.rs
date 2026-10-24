@@ -1332,7 +1332,7 @@ mod tests {
         assert!(!sections.join("\n\n").contains(" - Model: "));
     }
 
-    /// With project files and settings loaded, a GLM or DeepSeek session's prompt carries
+    /// With project files and settings loaded, a GLM or `DeepSeek` session's prompt carries
     /// neither brand: compatibility files keep their names only as paths.
     #[test]
     fn a_rendered_prompt_for_glm_and_deepseek_is_brand_clean() {
