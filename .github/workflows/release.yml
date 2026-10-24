@@ -157,7 +157,10 @@ jobs:
             asset: neuron-macos-x64
             ui_asset: neuron-tui-macos-x64
             # Bun cross-compiles the UI too (ui/neuron-tui/scripts/build-binary.ts).
-            bun_target: bun-darwin-x64
+            # The baseline build needs no AVX2, so it runs on every Intel Mac and under
+            # Rosetta 2, which emulates no AVX; the default x64 build dies there with
+            # "Illegal instruction", so the smoke test below could not check it.
+            bun_target: bun-darwin-x64-baseline
             bun_platform: darwin
             bun_arch: x64
           - name: windows-x64
