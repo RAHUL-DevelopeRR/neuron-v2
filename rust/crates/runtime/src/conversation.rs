@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
-use std::fmt::{Display, Formatter};
-use std::path::PathBuf;
+use std::fmt::{Display, Formatter, Write as _};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Instant;
 
 use serde_json::{Map, Value};
@@ -15,6 +16,7 @@ use crate::config::RuntimeFeatureConfig;
 use crate::context_manager::{
     ContextBudget, ContextManager, ContextPolicy, ContextPreparation, ContextSnapshot,
 };
+use crate::experience::{self, ExperienceStore, HarnessStats};
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::model_registry;
 use crate::permissions::{
@@ -87,6 +89,10 @@ const CHECK_OUTPUT_TAIL_LINES: usize = 40;
 const CHECK_OUTPUT_MAX_CHARS: usize = 3_000;
 /// Longest final reply the action nudge considers (status lines are short).
 const ACTION_NUDGE_MAX_CHARS: usize = 600;
+/// Diff a reviewer is given, in characters.
+const REVIEW_DIFF_MAX_CHARS: usize = 24_000;
+/// Reviewer findings passed on to the model, in characters.
+const REVIEW_FINDINGS_MAX_CHARS: usize = 4_000;
 
 /// Harness behaviours that keep weaker models on task. Off in
 /// [`ConversationRuntime::new`]; the CLI, the engine and sub-agents switch them on with
@@ -104,6 +110,13 @@ pub struct HarnessConfig {
     pub action_nudge: bool,
     /// Where project checks are found (`.neuron/checks.json`, manifests).
     pub workspace_root: Option<PathBuf>,
+    /// The model the session asked for. Turns are recorded in the experience
+    /// library under the model that answered, or this one when the provider does
+    /// not name it.
+    pub model: Option<String>,
+    /// Where per-model experience is kept (see [`crate::experience`]); `None`
+    /// records nothing and adds no model notes.
+    pub experience: Option<ExperienceStore>,
 }
 
 impl HarnessConfig {
@@ -124,8 +137,42 @@ impl HarnessConfig {
             auto_checks: enabled(AUTO_CHECKS_ENV_VAR),
             action_nudge: true,
             workspace_root: std::env::current_dir().ok(),
+            model: None,
+            experience: ExperienceStore::from_env(),
         }
     }
+
+    /// The model the session asked for (see [`Self::model`]).
+    #[must_use]
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
+    }
+}
+
+/// What the completion check gives a [`ChangeReviewer`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewRequest {
+    /// The user's message that started the turn.
+    pub request: String,
+    /// Files the turn changed.
+    pub edited_paths: Vec<String>,
+    /// `git diff` of those files, with new files in full, capped.
+    pub diff: String,
+    /// The project checks' result lines, when Neuron ran any.
+    pub check_results: String,
+}
+
+/// A second opinion on a turn's changes, asked for once by the completion check
+/// (see [`ConversationRuntime::with_change_reviewer`]). The tools crate's reviewer
+/// runs a read-only sub-agent, possibly on another model, over the diff.
+pub trait ChangeReviewer {
+    /// Problems to fix, or `Ok(None)` when the reviewer found none.
+    fn review(
+        &mut self,
+        request: &ReviewRequest,
+        cancel: &CancellationToken,
+    ) -> Result<Option<String>, String>;
 }
 
 /// Fully assembled request payload sent to the upstream model client.
@@ -373,6 +420,8 @@ struct TurnProgress {
     edited_paths: Vec<String>,
     completion_checked: bool,
     action_nudged: bool,
+    /// Harness events this turn, for the experience library.
+    stats: HarnessStats,
 }
 
 /// Coordinates the model loop, tool execution, hooks, and session updates.
@@ -393,6 +442,9 @@ pub struct ConversationRuntime<C, T> {
     harness: HarnessConfig,
     served_model: Option<String>,
     check_counter: usize,
+    reviewer: Option<Box<dyn ChangeReviewer + Send>>,
+    /// The user's message that started the current turn.
+    turn_request: String,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -451,7 +503,17 @@ where
             harness: HarnessConfig::default(),
             served_model: None,
             check_counter: 0,
+            reviewer: None,
+            turn_request: String::new(),
         }
+    }
+
+    /// Has the completion check ask `reviewer` for a second opinion on the turn's
+    /// changes (see [`ChangeReviewer`]).
+    #[must_use]
+    pub fn with_change_reviewer(mut self, reviewer: Box<dyn ChangeReviewer + Send>) -> Self {
+        self.reviewer = Some(reviewer);
+        self
     }
 
     /// Switches on the harness behaviours in `harness` (see [`HarnessConfig`]).
@@ -683,6 +745,8 @@ where
         }
 
         self.record_turn_started(&user_input);
+        self.turn_request.clone_from(&user_input);
+        self.refresh_model_notes();
         self.session
             .push_user_text(user_input)
             .map_err(session_error)?;
@@ -860,6 +924,7 @@ where
                 }
 
                 if truncated && !is_complete_json(input) {
+                    progress.stats.truncated_calls += 1;
                     let result = ConversationMessage::tool_result(
                         tool_use_id.clone(),
                         tool_name.clone(),
@@ -908,6 +973,7 @@ where
                             reborrow_prompter(&mut prompter),
                         );
                         if let LoopVerdict::Warn(repeats) = verdict {
+                            progress.stats.loop_warnings += 1;
                             let advice = if FILE_EDIT_TOOLS.contains(&tool_name.as_str()) {
                                 "Read the file with read_file to see its current content, then make a different edit, or explain the blocker to the user"
                             } else {
@@ -1066,6 +1132,9 @@ where
         {
             self.tool_executor
                 .tool_call_finished(tool_use_id, tool_name, output, *is_error);
+            progress
+                .stats
+                .observe_tool_result(tool_name, output, *is_error);
         }
         progress.tool_results.push(result_message);
         Ok(())
@@ -1173,6 +1242,7 @@ where
         }
         if self.harness.action_nudge && !progress.action_nudged && announces_next_step(final_text) {
             progress.action_nudged = true;
+            progress.stats.nudges += 1;
             return Some(ACTION_NUDGE_MESSAGE.to_string());
         }
         if self.harness.completion_check
@@ -1180,7 +1250,10 @@ where
             && !progress.edited_paths.is_empty()
         {
             progress.completion_checked = true;
-            return Some(self.completion_check_message(&progress.edited_paths));
+            progress.stats.completion_checks += 1;
+            return Some(
+                self.completion_check_message(&progress.edited_paths, &mut progress.stats),
+            );
         }
         None
     }
@@ -1188,14 +1261,15 @@ where
     /// The completion check: the request reminder, the changed files and the project
     /// checks, run here when the permission policy allows them without asking,
     /// otherwise listed for the model to run.
-    fn completion_check_message(&mut self, edited: &[String]) -> String {
+    fn completion_check_message(&mut self, edited: &[String], stats: &mut HarnessStats) -> String {
         let root = self
             .harness
             .workspace_root
             .clone()
             .or_else(|| std::env::current_dir().ok());
         let checks = root
-            .map(|root| detect_checks(&root, edited))
+            .as_deref()
+            .map(|root| detect_checks(root, edited))
             .unwrap_or_default();
         let mut lines = vec![COMPLETION_CHECK_INTRO.to_string()];
         let shown = edited.iter().take(12).cloned().collect::<Vec<_>>();
@@ -1218,6 +1292,11 @@ where
                 to_run.push(check.command);
             }
         }
+        stats.failed_checks += results
+            .iter()
+            .filter(|result| result.contains("` FAILED ("))
+            .count() as u64;
+        let check_results = results.join("\n");
         let ran_checks = !results.is_empty();
         if ran_checks {
             lines.push("Project checks Neuron ran on your changes:".to_string());
@@ -1233,11 +1312,68 @@ where
                     .join(", ")
             ));
         }
+        if let Some(review) = self.review_changes(root.as_deref(), edited, check_results) {
+            lines.push(review);
+        }
         if !ran_checks && to_run.is_empty() {
             lines.push("No project checks were found for these files. If the project has tests, a type checker or a build for them, run it before you answer.".to_string());
         }
         lines.push(COMPLETION_CHECK_OUTRO.to_string());
         lines.join("\n")
+    }
+
+    /// The reviewer's part of the completion check, when one is set and it ran.
+    fn review_changes(
+        &mut self,
+        root: Option<&Path>,
+        edited: &[String],
+        check_results: String,
+    ) -> Option<String> {
+        if self.cancel.is_cancelled() {
+            return None;
+        }
+        let reviewer = self.reviewer.as_mut()?;
+        let request = ReviewRequest {
+            request: self.turn_request.clone(),
+            edited_paths: edited.to_vec(),
+            diff: root.map_or_else(String::new, |root| changes_for_review(root, edited)),
+            check_results,
+        };
+        match reviewer.review(&request, &self.cancel) {
+            Ok(None) => Some(
+                "A reviewer (a separate read-only agent) compared your changes with the request and found no problems.".to_string(),
+            ),
+            Ok(Some(findings)) => Some(format!(
+                "A reviewer (a separate read-only agent) compared your changes with the request and reported:\n{}\nFix the findings that are real. If one is wrong, say why in your final answer.",
+                truncate_chars(findings.trim(), REVIEW_FINDINGS_MAX_CHARS)
+            )),
+            Err(_) => None,
+        }
+    }
+
+    /// Puts the experience library's notes for the current model in the system
+    /// prompt, replacing earlier ones, or removes them when there are none.
+    fn refresh_model_notes(&mut self) {
+        let Some(store) = &self.harness.experience else {
+            return;
+        };
+        let Some(model) = self.experience_model() else {
+            return;
+        };
+        let notes = experience::notes_from(&store.stats_for(&model));
+        let section = experience::render_model_notes(&model, &notes);
+        self.system_prompt
+            .retain(|part| !part.starts_with(experience::MODEL_NOTES_HEADING));
+        self.system_prompt.extend(section);
+    }
+
+    /// The model a turn is recorded under: the one that answered, else the one
+    /// asked for (not `auto`, which is a choice rather than a model).
+    fn experience_model(&self) -> Option<String> {
+        self.served_model
+            .clone()
+            .or_else(|| self.harness.model.clone())
+            .filter(|model| !matches!(model.trim(), "" | "auto" | "default" | "openai/auto"))
     }
 
     /// Runs one project check through the `bash` tool when the pre-tool hooks and the
@@ -1289,7 +1425,12 @@ where
         Some(summarize_check(check, &output, is_error, seconds))
     }
 
-    fn finish_turn(&mut self, progress: TurnProgress, outcome: TurnOutcome) -> TurnSummary {
+    fn finish_turn(&mut self, mut progress: TurnProgress, outcome: TurnOutcome) -> TurnSummary {
+        progress.stats.turns += 1;
+        if let (Some(store), Some(model)) = (&self.harness.experience, self.experience_model()) {
+            // Best effort: a read-only or full disk must not fail the turn.
+            let _ = store.record(&model, &progress.stats);
+        }
         if matches!(outcome, TurnOutcome::Cancelled { .. }) {
             self.close_turn_with_note(INTERRUPTED_RESPONSE_NOTE.to_string());
         }
@@ -2018,6 +2159,62 @@ fn edited_path(tool_name: &str, input: &str, result: &ConversationMessage) -> Op
         .iter()
         .find_map(|key| value.get(*key).and_then(Value::as_str))
         .map(ToOwned::to_owned)
+}
+
+/// The changes in `paths` for a reviewer: `git diff` against `HEAD` for tracked
+/// files and the full text of new ones; the files' current text when `root` is
+/// not a git repository. Capped at [`REVIEW_DIFF_MAX_CHARS`].
+fn changes_for_review(root: &Path, paths: &[String]) -> String {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .args(paths)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+    };
+    let mut text = String::new();
+    match git(&["diff", "--no-color", "--no-ext-diff", "HEAD", "--"]) {
+        Some(diff) => {
+            text.push_str(&diff);
+            let untracked =
+                git(&["ls-files", "--others", "--exclude-standard", "--"]).unwrap_or_default();
+            for path in untracked.lines().filter(|line| !line.is_empty()) {
+                let content = std::fs::read_to_string(root.join(path)).unwrap_or_default();
+                let _ = write!(text, "--- /dev/null\n+++ b/{path}\n");
+                for line in content.lines() {
+                    text.push('+');
+                    text.push_str(line);
+                    text.push('\n');
+                }
+            }
+        }
+        None => {
+            for path in paths {
+                let full = Path::new(path);
+                let full = if full.is_absolute() {
+                    full.to_path_buf()
+                } else {
+                    root.join(full)
+                };
+                let content = std::fs::read_to_string(&full).unwrap_or_default();
+                let _ = write!(text, "=== {path} (current content) ===\n{content}\n");
+            }
+        }
+    }
+    truncate_chars(&text, REVIEW_DIFF_MAX_CHARS)
+}
+
+/// `text` cut to `max` characters, marked when cut.
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let kept = text.chars().take(max).collect::<String>();
+    format!("{kept}\n[... cut at {max} characters]")
 }
 
 /// One result line for a project check from the `bash` tool's output: passed, or
@@ -4432,6 +4629,7 @@ mod resilience_tests {
             auto_checks,
             action_nudge: true,
             workspace_root: Some(root.to_path_buf()),
+            ..super::HarnessConfig::default()
         }
     }
 
@@ -4741,6 +4939,156 @@ mod resilience_tests {
             runtime.context_manager().budget().context_window,
             24_000,
             "a larger served model never grows the budget"
+        );
+    }
+
+    /// Records what it was asked and answers with `findings`.
+    struct StubReviewer {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<super::ReviewRequest>>>,
+        findings: Option<String>,
+    }
+
+    impl super::ChangeReviewer for StubReviewer {
+        fn review(
+            &mut self,
+            request: &super::ReviewRequest,
+            _cancel: &CancellationToken,
+        ) -> Result<Option<String>, String> {
+            self.seen.lock().expect("lock").push(request.clone());
+            Ok(self.findings.clone())
+        }
+    }
+
+    fn git_workspace(label: &str) -> std::path::PathBuf {
+        let root = temp_workspace(label);
+        std::fs::write(root.join("app.py"), "LIMIT = 1\n").expect("file");
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "-A"],
+            vec![
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "start",
+            ],
+        ] {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(&args)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?}");
+        }
+        root
+    }
+
+    fn reviewed_turn(label: &str, findings: Option<&str>) -> (String, Vec<super::ReviewRequest>) {
+        let root = git_workspace(label);
+        let file = root.join("app.py");
+        let api = ScriptedApi::new(vec![
+            Ok(vec![edit_call("e1", "app.py"), AssistantEvent::MessageStop]),
+            Ok(vec![text("Raised the limit."), AssistantEvent::MessageStop]),
+            Ok(vec![
+                text("Done; the reviewer's point is handled."),
+                AssistantEvent::MessageStop,
+            ]),
+        ]);
+        let tools = StaticToolExecutor::new().register("edit_file", move |_| {
+            std::fs::write(&file, "LIMIT = 5\n").expect("edit");
+            Ok("edited".to_string())
+        });
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reviewer = StubReviewer {
+            seen: std::sync::Arc::clone(&seen),
+            findings: findings.map(ToOwned::to_owned),
+        };
+        let mut runtime = runtime_with(Session::new(), api, tools)
+            .with_harness_config(harness(&root, false))
+            .with_change_reviewer(Box::new(reviewer));
+
+        runtime
+            .run_turn("raise LIMIT to 5", None)
+            .expect("turn completes");
+
+        let notes = auto_continue_notes(runtime.session());
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        let seen = seen.lock().expect("lock").clone();
+        (notes[0].clone(), seen)
+    }
+
+    #[test]
+    fn the_reviewer_sees_the_request_and_diff_and_its_findings_reach_the_model() {
+        let (note, seen) =
+            reviewed_turn("review", Some("1. app.py: LIMIT must also be documented."));
+
+        assert_eq!(seen.len(), 1, "one review per turn");
+        assert_eq!(seen[0].request, "raise LIMIT to 5");
+        assert_eq!(seen[0].edited_paths, vec!["app.py".to_string()]);
+        assert!(seen[0].diff.contains("-LIMIT = 1"), "{}", seen[0].diff);
+        assert!(seen[0].diff.contains("+LIMIT = 5"), "{}", seen[0].diff);
+        assert!(
+            note.contains("reported:\n1. app.py: LIMIT must also be documented.\nFix the findings that are real."),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn a_reviewer_that_finds_nothing_says_so() {
+        let (note, _) = reviewed_turn("review-clean", None);
+        assert!(note.contains("found no problems"), "{note}");
+    }
+
+    #[test]
+    fn model_notes_follow_the_experience_library() {
+        let store = crate::experience::ExperienceStore::new(
+            temp_workspace("experience").join("experience.json"),
+        );
+        store
+            .record(
+                "weak-model",
+                &crate::experience::HarnessStats {
+                    turns: 10,
+                    tool_calls: 50,
+                    nudges: 4,
+                    ..crate::experience::HarnessStats::default()
+                },
+            )
+            .expect("seed");
+        let api = ScriptedApi::new(vec![
+            Ok(vec![
+                tool_call("r1", "read_file", "{}"),
+                AssistantEvent::MessageStop,
+            ]),
+            Ok(vec![
+                text("The file is empty."),
+                AssistantEvent::MessageStop,
+            ]),
+        ]);
+        let tools = StaticToolExecutor::new().register("read_file", |_| Ok(String::new()));
+        let mut runtime =
+            runtime_with(Session::new(), api, tools).with_harness_config(super::HarnessConfig {
+                model: Some("weak-model".to_string()),
+                experience: Some(store.clone()),
+                ..super::HarnessConfig::default()
+            });
+
+        runtime
+            .run_turn("what is in the file?", None)
+            .expect("turn completes");
+
+        let system = runtime.api_client().requests[0].system_prompt.join("\n");
+        assert!(system.contains("# Notes for this model"), "{system}");
+        assert!(system.contains("Never end a reply with a plan"), "{system}");
+        let stats = store.stats_for("weak-model");
+        assert_eq!(
+            (stats.turns, stats.tool_calls),
+            (11, 51),
+            "this turn was recorded"
         );
     }
 }

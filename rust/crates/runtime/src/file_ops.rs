@@ -4,7 +4,7 @@ use std::cmp::Reverse;
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
 use glob::Pattern;
@@ -681,6 +681,19 @@ pub fn edit_file(
             }
         }
         let Some((mode, (start, end))) = found else {
+            // Weaker models sometimes escape the JSON twice, so `old_string` arrives
+            // with `\n` as two characters: retry once with the escapes undone.
+            if let Some((old_unescaped, new_unescaped)) = unescaped_edit(old_string, &new_string) {
+                return edit_file(path, &old_unescaped, &new_unescaped, replace_all).map(
+                    |mut output| {
+                        output.match_strategy = Some(match output.match_strategy.take() {
+                            Some(strategy) => format!("unescaped, {strategy}"),
+                            None => "unescaped".to_string(),
+                        });
+                        output
+                    },
+                );
+            }
             return Err(not_found_error(&original_file, old_string));
         };
         let matched = original_file[start..end].to_string();
@@ -1211,7 +1224,87 @@ fn normalize_path(path: &str) -> io::Result<PathBuf> {
     } else {
         std::env::current_dir()?.join(path)
     };
-    candidate.canonicalize()
+    match candidate.canonicalize() {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => std::env::current_dir()
+            .ok()
+            .and_then(|cwd| recover_mistyped_path(&candidate, &cwd))
+            .ok_or(error),
+        result => result,
+    }
+}
+
+/// The workspace file a model meant when it mistyped a long absolute path, such
+/// as a session directory with a few characters dropped: `path` shares most of
+/// its leading directories with `cwd`, and the longest trailing part of it that
+/// exists under `cwd` names a file. Only files under `cwd` are returned. The
+/// tools report the corrected path in their result.
+fn recover_mistyped_path(path: &Path, cwd: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let cwd = cwd.canonicalize().ok()?;
+    let names = |path: &Path| {
+        path.components()
+            .filter_map(|component| match component {
+                Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let wanted = names(path);
+    let base = names(&cwd);
+    let shared = wanted
+        .iter()
+        .zip(&base)
+        .take_while(|(left, right)| left.eq_ignore_ascii_case(right))
+        .count();
+    if base.is_empty() || shared * 2 < base.len() {
+        return None;
+    }
+    (shared..wanted.len())
+        .map(|start| cwd.join(wanted[start..].iter().collect::<PathBuf>()))
+        .find(|candidate| candidate.is_file())
+        .and_then(|found| found.canonicalize().ok())
+        .filter(|found| found.starts_with(&cwd))
+}
+
+/// `old_string` and `new_string` with JSON escapes undone, when `old_string` looks
+/// escaped twice: no real line break but a `\n` written as two characters.
+/// `new_string` is unescaped only when it has no real line breaks either.
+fn unescaped_edit(old_string: &str, new_string: &str) -> Option<(String, String)> {
+    if old_string.contains('\n') || !old_string.contains("\\n") {
+        return None;
+    }
+    let new_string = if new_string.contains('\n') {
+        new_string.to_string()
+    } else {
+        unescape_json_text(new_string)
+    };
+    Some((unescape_json_text(old_string), new_string))
+}
+
+/// `\n`, `\t`, `\r`, `\"` and `\\` written as two characters, as the characters.
+fn unescape_json_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('"') => out.push('"'),
+            Some(other) if other != '\\' => {
+                out.push('\\');
+                out.push(other);
+            }
+            Some(_) | None => out.push('\\'),
+        }
+    }
+    out
 }
 
 fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
@@ -1339,6 +1432,67 @@ mod tests {
         read_file_in_workspace, strip_verbatim_prefix, write_file, write_file_in_workspace,
         GrepSearchInput, MAX_WRITE_SIZE,
     };
+
+    #[test]
+    fn an_edit_escaped_twice_is_applied_with_the_escapes_undone() {
+        let path = temp_path("unescape.py");
+        std::fs::write(&path, "def f():\n    return \"a\"\n").expect("write");
+        // As a model that escaped its JSON twice sends it: `\n` and `\"` as text.
+        let output = edit_file(
+            path.to_string_lossy().as_ref(),
+            r#"def f():\n    return \"a\""#,
+            r#"def f():\n    return \"b\""#,
+            false,
+        )
+        .expect("unescaped match");
+        assert_eq!(output.match_strategy.as_deref(), Some("unescaped"));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "def f():\n    return \"b\"\n"
+        );
+        assert!(
+            super::unescaped_edit("a\nb", "c").is_none(),
+            "real line breaks: not escaped"
+        );
+        assert!(super::unescaped_edit("plain", "c").is_none());
+    }
+
+    #[test]
+    fn a_mistyped_workspace_path_is_recovered_inside_the_workspace() {
+        let root = temp_path("recover-ws")
+            .join("session-1234-abcd")
+            .join("project");
+        std::fs::create_dir_all(root.join("src")).expect("dirs");
+        std::fs::write(root.join("src").join("cart.js"), "x").expect("file");
+        let root = root.canonicalize().expect("canonical");
+        let mistyped = root
+            .parent()
+            .expect("parent")
+            .parent()
+            .expect("grandparent")
+            .join("session-12-abcd")
+            .join("project")
+            .join("src")
+            .join("cart.js");
+        assert_eq!(
+            super::recover_mistyped_path(&mistyped, &root),
+            Some(root.join("src").join("cart.js"))
+        );
+        let elsewhere = std::path::Path::new(if cfg!(windows) {
+            r"Z:\other\src\cart.js"
+        } else {
+            "/other/src/cart.js"
+        });
+        assert_eq!(
+            super::recover_mistyped_path(elsewhere, &root),
+            None,
+            "unrelated paths are not guessed"
+        );
+        assert_eq!(
+            super::recover_mistyped_path(std::path::Path::new("src/cart.js"), &root),
+            None
+        );
+    }
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()

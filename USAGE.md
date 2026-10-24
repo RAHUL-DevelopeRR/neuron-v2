@@ -263,6 +263,12 @@ or put it in your user settings.
 | `NEURON_MODEL` | neuron | Model for this process |
 | `NEURON_PROVIDER` | neuron | Provider for this process (see [Bring your own key](#bring-your-own-key)) |
 | `NEURON_MAX_ITERATIONS` | neuron | Model calls allowed in one turn (default 50) |
+| `NEURON_DENIAL_LIMIT` | neuron | Denied tool calls after which a non-interactive `neuron prompt` run stops (default 5) |
+| `NEURON_COMPLETION_CHECK` | neuron | `0` turns off the completion check: after a turn that changed files, Neuron asks the model once to check its changes against the request before it finishes |
+| `NEURON_AUTO_CHECKS` | neuron | `0` stops the completion check from running the project's checks (`cargo check`, the typecheck script, `go vet`, `py_compile`, or `.neuron/checks.json`) itself; they run only when your permission settings allow them without asking |
+| `NEURON_REVIEW` | neuron | `1` adds a reviewer to the completion check: a read-only sub-agent that compares the turn's diff with the request and reports problems |
+| `NEURON_REVIEW_MODEL` | neuron | Model for the reviewer (default: the session's model) |
+| `NEURON_EXPERIENCE` | neuron | `0` turns off the experience library (`experience.json` in the settings directory): per-model counts of repaired tool calls, missed edits and similar, which add notes to that model's system prompt once they recur |
 | `NEURON_CONFIG_HOME` | neuron | Settings directory (default `~/.neuron`) |
 | `NEURON_HOME` | neuron | Directory for the login file and caches (default `~/.neuroncli`); setting it also keeps the login out of the OS credential store |
 | `NEURON_CREDENTIAL_STORE` | neuron | `file` or `keychain`: force where the login is kept |
