@@ -141,6 +141,11 @@ export const STEERING_ENV_VAR_PATTERNS: readonly RegExp[] = [
   /^(ANTHROPIC|OPENAI|AZURE_OPENAI|XAI|GROK|DASHSCOPE|OPENROUTER|MISTRAL|CLAWD)_/,
   // The engine's compatibility knobs (`CLAW_CONFIG_HOME` picks its settings home).
   /^CLAW_/,
+  // More compatibility knobs the engine reads: `RUSTY_CLAUDE_PERMISSION_MODE` sets its
+  // default permission mode (full access included); `CLAUDE_CONFIG_DIR` and
+  // `CLAUDE_CONFIG_HOME` add config, skill and agent roots.
+  /^RUSTY_CLAUDE_/,
+  /^CLAUDE_/,
   // Home and config directories: the engine's user settings (~/.neuron) and git's
   // global config (~/.gitconfig, $XDG_CONFIG_HOME/git/config) live under them.
   /^HOME$/,

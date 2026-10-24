@@ -612,6 +612,10 @@ describe('init-direnv', () => {
       for (const key of [
         'CLAW_CONFIG_HOME',
         'CLAW_SANDBOX_MODE',
+        'RUSTY_CLAUDE_PERMISSION_MODE',
+        'CLAUDE_CONFIG_DIR',
+        'CLAUDE_CONFIG_HOME',
+        'CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS',
         'HOME',
         'USERPROFILE',
         'XDG_CONFIG_HOME',

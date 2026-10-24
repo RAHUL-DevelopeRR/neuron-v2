@@ -142,9 +142,12 @@ done any of these:
   `settings.json` the engine loads as the user's (always trusted, so with
   hooks, MCP servers, full access and `trustedRoots`);
 - set `GIT_CONFIG_*`, `HOME` or `XDG_CONFIG_HOME` to give git a global or
-  command-scope fsmonitor that a read-only `git status` runs without asking.
+  command-scope fsmonitor that a read-only `git status` runs without asking;
+- set `RUSTY_CLAUDE_PERMISSION_MODE=danger-full-access`, which the engine reads
+  as its default permission mode before any settings.
 
 The list now drops `NEURON_*` (the engine's and this UI's knobs), `CLAW_*`,
+`RUSTY_CLAUDE_*` and `CLAUDE_*` (the engine's other compatibility knobs),
 the providers' prefixes (`ANTHROPIC_`, `OPENAI_`, `AZURE_OPENAI_`, `XAI_`,
 `GROK_`, `DASHSCOPE_`, `OPENROUTER_`, `MISTRAL_`, `CLAWD_`), `HOME`,
 `USERPROFILE`, `XDG_CONFIG_HOME` and `GIT_CONFIG*`. It still imports

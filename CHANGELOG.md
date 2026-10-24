@@ -40,7 +40,9 @@ first.
 - In the full-screen UI, a `PATH` change from an allowed `.envrc` reaches the engine, so
   the engine's own tool lookups (such as `node` and `npx` for MCP servers) use the
   imported `PATH` and can find a project's tools first, as in a shell that loaded
-  direnv.
+  direnv. That includes commands Neuron runs without asking, such as `git status`: a
+  folder the `.envrc` adds to `PATH` can run that repository's own programs without a
+  prompt. Only allow an `.envrc` you have read.
 - Hooks run with Neuron's own environment: they inherit every variable Neuron has,
   including a session token or key in `NEURON_TOKEN` and provider keys you exported.
   They also get the event as JSON on standard input and have no timeout, and Ctrl+C
@@ -61,9 +63,10 @@ first.
   `neuron` (verified, and never failing the install). `--no-tui` or `NEURON_NO_TUI=1`
   keeps the line REPL, and without the UI `neuron` runs the line REPL as before.
 - The UI imports an allowed `.envrc` through direnv, minus the variables that would
-  reconfigure Neuron: `NEURON_*`, `CLAW_*` and `CLAWD_*`, the providers' keys and
-  endpoints (`OPENAI_*`, `ANTHROPIC_*` and the like), `HOME`, `USERPROFILE`,
-  `XDG_CONFIG_HOME`, `GIT_CONFIG*`, and the Node, Bun, TLS and preload settings
+  reconfigure Neuron: `NEURON_*`, `CLAW_*`, `CLAWD_*` and the engine's other
+  compatibility variables (such as the one that sets its default permission mode),
+  the providers' keys and endpoints (`OPENAI_*`, `ANTHROPIC_*` and the like), `HOME`,
+  `USERPROFILE`, `XDG_CONFIG_HOME`, `GIT_CONFIG*`, and the Node, Bun, TLS and preload settings
   (`NODE_OPTIONS`, `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `LD_PRELOAD` and the like).
   The UI's log names what was dropped. The engine is found on the `PATH` from before
   the import.
