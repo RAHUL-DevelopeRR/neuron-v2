@@ -40,6 +40,7 @@ public static class ConsoleKeys
     static extern bool GetNumberOfConsoleInputEvents(IntPtr handle, out uint count);
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     static extern uint GetConsoleTitleW(StringBuilder title, uint size);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetConsoleMode(IntPtr handle, out uint mode);
 
     const uint ReadWrite = 0xC0000000, ShareReadWrite = 3, OpenExisting = 3;
 
@@ -104,6 +105,15 @@ public static class ConsoleKeys
             foreach (var parent in all)
                 if (parent.ProcessId == entry.ParentProcessId && string.Equals(parent.ExeFile, "neuron-tui.exe", StringComparison.OrdinalIgnoreCase)) return entry.ProcessId;
         }
+        return 0;
+    }
+
+    /// The UI below `root`: a neuron-tui.exe; 0 when there is none.
+    public static uint UiBelow(uint root)
+    {
+        var below = new System.Collections.Generic.HashSet<uint>(Descendants(root));
+        foreach (var entry in Snapshot())
+            if (below.Contains(entry.ProcessId) && string.Equals(entry.ExeFile, "neuron-tui.exe", StringComparison.OrdinalIgnoreCase)) return entry.ProcessId;
         return 0;
     }
 
@@ -186,32 +196,69 @@ public static class ConsoleKeys
         }
     }
 
-    /// Types `text` as key presses (a key down and its key up each): `\r` is Enter,
-    /// `\b` is Backspace, `\x03` is Ctrl-C. False when the console is gone.
-    public static bool Type(uint pid, string text)
+    /// The console's input mode (ENABLE_* bits; 0x200 is virtual-terminal input);
+    /// -1 when the console is gone.
+    public static long InputMode(uint pid)
+    {
+        if (!Attach(pid)) { FreeConsole(); return -1; }
+        IntPtr input = CreateFileW("CONIN$", ReadWrite, ShareReadWrite, IntPtr.Zero, OpenExisting, 0, IntPtr.Zero);
+        try
+        {
+            uint mode;
+            if (input == new IntPtr(-1) || !GetConsoleMode(input, out mode)) return -1;
+            return mode;
+        }
+        finally
+        {
+            if (input != new IntPtr(-1)) CloseHandle(input);
+            FreeConsole();
+        }
+    }
+
+    /// Types `text` as key presses (a key down and its key up each), 30 ms apart:
+    /// `\r` is Enter, `\b` is Backspace, `\x03` is Ctrl-C. False when the console
+    /// is gone.
+    public static bool Type(uint pid, string text) { return Write(pid, text, false); }
+
+    /// Types `text` in one go, as the keys of a fast typist reach the console
+    /// between two reads.
+    public static bool TypeAtOnce(uint pid, string text) { return Write(pid, text, true); }
+
+    static KeyRecord[] Press(char ch)
+    {
+        ushort key = 0;
+        uint controls = 0;
+        if (ch == '\r') key = 0x0D;
+        else if (ch == '\b') key = 0x08;
+        else if (ch == ' ') key = 0x20;
+        else if (ch >= '0' && ch <= '9') key = ch;
+        else if (ch == (char)3) { key = 0x43; controls = 0x0008; }
+        else if (ch >= 'a' && ch <= 'z') key = (ushort)(ch - 32);
+        else if (ch >= 'A' && ch <= 'Z') { key = ch; controls = 0x0010; }
+        else if (ch == '/') key = 0xBF;
+        var down = new KeyRecord { EventType = 1, KeyDown = 1, RepeatCount = 1, VirtualKey = key, Char = ch, ControlKeys = controls };
+        var up = down;
+        up.KeyDown = 0;
+        return new[] { down, up };
+    }
+
+    static bool Write(uint pid, string text, bool atOnce)
     {
         if (!Attach(pid)) { FreeConsole(); return false; }
         IntPtr input = CreateFileW("CONIN$", ReadWrite, ShareReadWrite, IntPtr.Zero, OpenExisting, 0, IntPtr.Zero);
         try
         {
             if (input == new IntPtr(-1)) return false;
+            uint written;
+            if (atOnce)
+            {
+                var records = new System.Collections.Generic.List<KeyRecord>();
+                foreach (char ch in text) records.AddRange(Press(ch));
+                return WriteConsoleInputW(input, records.ToArray(), (uint)records.Count, out written);
+            }
             foreach (char ch in text)
             {
-                ushort key = 0;
-                uint controls = 0;
-                if (ch == '\r') key = 0x0D;
-                else if (ch == '\b') key = 0x08;
-                else if (ch == ' ') key = 0x20;
-                else if (ch >= '0' && ch <= '9') key = ch;
-                else if (ch == (char)3) { key = 0x43; controls = 0x0008; }
-                else if (ch >= 'a' && ch <= 'z') key = (ushort)(ch - 32);
-                else if (ch >= 'A' && ch <= 'Z') { key = ch; controls = 0x0010; }
-                else if (ch == '/') key = 0xBF;
-                var down = new KeyRecord { EventType = 1, KeyDown = 1, RepeatCount = 1, VirtualKey = key, Char = ch, ControlKeys = controls };
-                var up = down;
-                up.KeyDown = 0;
-                uint written;
-                if (!WriteConsoleInputW(input, new[] { down, up }, 2, out written)) return false;
+                if (!WriteConsoleInputW(input, Press(ch), 2, out written)) return false;
                 System.Threading.Thread.Sleep(30);
             }
             return true;

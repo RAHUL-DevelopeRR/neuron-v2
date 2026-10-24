@@ -4,13 +4,13 @@
 // instead, before the renderer's teardown, gives the console its own title
 // (and font) back, and prints the exit message (the --continue hint) once the
 // screen is restored. It exits 1 when the engine crashed during the session,
-// and stops reading the keyboard once the quit is asked for.
-// See ui/neuron-tui/PORTING.md.
+// and stops reading the keyboard (and has the console keep keys as keys) once
+// the quit is asked for. See ui/neuron-tui/PORTING.md.
 import { writeFileSync, writeSync } from 'fs'
 
 import { withTimeoutOr } from '@neuron-tui/common/util/promise'
 
-import { restoreConsoleAtExit } from './console-guard'
+import { endVirtualTerminalInput, restoreConsoleAtExit } from './console-guard'
 import { writeTerminalControlSync } from './terminal-io'
 import { engineCrashedThisSession } from '../engine/engine-session'
 import { getNeuronEngineClient } from '../engine/neuron-engine-client'
@@ -41,7 +41,8 @@ type ExitCliDependencies = {
   /**
    * Stop reading the keyboard, as soon as the quit is asked for: keys typed
    * during the exit then stay in the console for the shell, instead of the
-   * UI swallowing the start of the user's next command.
+   * UI swallowing the start of the user's next command. And stored as keys,
+   * not as the escape sequences the renderer's raw mode asks for.
    */
   stopReadingInput?: () => void
 }
@@ -163,9 +164,12 @@ export const exitCliCleanly = createExitCliCleanly({
   },
   exit: (code) => process.exit(code),
   // The renderer stays up and in raw mode until its teardown; only the reading
-  // stops. Its teardown pauses stdin again, which is harmless.
+  // stops, and the console's virtual-terminal input goes off (PowerShell's
+  // PSReadLine read an Enter typed under it as a character). Its teardown
+  // pauses stdin again, which is harmless.
   stopReadingInput: () => {
     process.stdin.pause()
+    endVirtualTerminalInput()
   },
   exitCodeFor: (code) => exitCodeAfterSession(code, engineCrashedThisSession()),
   restoreConsole: () => restoreConsoleAtExit(),
