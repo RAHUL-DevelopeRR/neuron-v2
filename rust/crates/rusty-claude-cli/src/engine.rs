@@ -244,8 +244,8 @@ fn run_engine(
         if let Some(reference) = &signed_out.options.resume {
             match engine.continue_saved_session(reference) {
                 Ok(report) => {
-                    engine.notice(&report);
                     engine.send_transcript();
+                    engine.notice(&report);
                 }
                 Err(error) => engine.send(UiEvent::Error {
                     message: format!("could not continue {reference}: {error}"),
@@ -766,9 +766,6 @@ fn mcp_server_status(
     if let Some(message) = reason(&live.failed) {
         return ("failed", Vec::new(), Some(message));
     }
-    if live.pending.iter().any(|server| server == name) {
-        return ("pending", Vec::new(), None);
-    }
     if live.running.iter().any(|server| server == name) {
         let prefix = runtime::mcp_tool_prefix(name);
         let tools = live
@@ -869,6 +866,16 @@ impl Shared {
         lock(&self.answer).take().map(|(_, answer)| answer)
     }
 
+    /// The pending question's answer channel, when `id` is that question.
+    fn take_answer_to(&self, id: u64) -> Option<Sender<String>> {
+        let mut pending = lock(&self.answer);
+        if pending.as_ref().is_some_and(|(number, _)| *number == id) {
+            pending.take().map(|(_, answer)| answer)
+        } else {
+            None
+        }
+    }
+
     fn turn_running(&self) -> bool {
         lock(&self.interrupts).presses.is_some() || lock(&self.turn).is_some()
     }
@@ -923,16 +930,6 @@ impl Shared {
                 let _ = events.send(models_event(&current));
             })
             .is_ok()
-    }
-
-    /// The pending question's answer channel, when `id` is that question.
-    fn take_answer_to(&self, id: u64) -> Option<Sender<String>> {
-        let mut pending = lock(&self.answer);
-        if pending.as_ref().is_some_and(|(number, _)| *number == id) {
-            pending.take().map(|(_, answer)| answer)
-        } else {
-            None
-        }
     }
 
     /// Stops the running turn, without the interrupt notice: the session is closing.
@@ -1057,9 +1054,6 @@ fn forward_commands(
                 let _ = queue.send(EngineCommand::Shutdown);
                 return;
             }
-            // It only reads the catalog, so a running turn need not end first. Between
-            // turns it queues, after a `SetModel` sent before it.
-            EngineCommand::ListModels if shared.turn_running() && shared.answer_models() => {}
             // Both take effect at once, also while a turn runs.
             EngineCommand::Capabilities { features, client } => {
                 *lock(&shared.client) = client;
@@ -1077,6 +1071,9 @@ fn forward_commands(
                     let _ = answer.send(text);
                 }
             }
+            // It only reads the catalog, so a running turn need not end first. Between
+            // turns it queues, after a `SetModel` sent before it.
+            EngineCommand::ListModels if shared.turn_running() && shared.answer_models() => {}
             command => {
                 if queue.send(command).is_err() {
                     return;
@@ -1761,8 +1758,8 @@ impl Engine {
     }
 
     fn send_status(&mut self) {
-        lock(&self.shared.model).clone_from(&self.cli.model);
         self.track_session();
+        lock(&self.shared.model).clone_from(&self.cli.model);
         let context_percent =
             u32::try_from(self.cli.runtime.context_snapshot().used_percent()).unwrap_or(u32::MAX);
         // A session on the gateway needs the login; other providers do not.
@@ -2066,8 +2063,9 @@ mod tests {
     };
     use runtime::ui_hooks::{self, UserQuestion};
     use runtime::PermissionMode;
-    use runtime::{CancellationToken, HookAbortSignal};
-    use runtime::{ContentBlock, ConversationMessage, MessageRole, Session};
+    use runtime::{
+        CancellationToken, ContentBlock, ConversationMessage, HookAbortSignal, MessageRole, Session,
+    };
     use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -3071,7 +3069,6 @@ mod tests {
         let view = |starting: bool| McpRuntimeView {
             starting,
             running: vec!["docs".into(), "search".into(), "broken".into()],
-            pending: vec!["search".into()],
             failed: vec![("broken".into(), "spawn failed".into())],
             unsupported: vec![("remote".into(), "ws is not supported".into())],
             tools: vec![
@@ -3091,7 +3088,7 @@ mod tests {
         );
         assert_eq!(
             mcp_server_status("search", Some(&live)),
-            ("pending", Vec::new(), None)
+            ("ready", vec!["query".to_string()], None)
         );
         assert_eq!(
             mcp_server_status("broken", Some(&live)),

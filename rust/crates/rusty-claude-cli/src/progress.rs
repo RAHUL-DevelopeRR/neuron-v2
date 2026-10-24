@@ -791,8 +791,6 @@ pub(crate) struct McpRuntimeView {
     pub(crate) starting: bool,
     /// Servers the manager runs (stdio).
     pub(crate) running: Vec<String>,
-    /// Servers whose tools were not discovered.
-    pub(crate) pending: Vec<String>,
     /// Servers that failed, with why.
     pub(crate) failed: Vec<(String, String)>,
     /// Servers with a transport Neuron does not speak yet, with why.
@@ -819,24 +817,28 @@ pub(crate) fn extensions_snapshot() -> Option<ExtensionsSnapshot> {
             let mcp = mcp
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Why each failed, where the start reported it; the background start
+            // names its failures without a reason.
+            let mut failed: Vec<(String, String)> = mcp
+                .degraded_report
+                .as_ref()
+                .map(|report| {
+                    report
+                        .failed_servers
+                        .iter()
+                        .map(|failed| (failed.server_name.clone(), failed.error.message.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for name in mcp.failed_server_names().unwrap_or_default() {
+                if !failed.iter().any(|(server, _)| *server == name) {
+                    failed.push((name, "could not start".to_string()));
+                }
+            }
             McpRuntimeView {
-                starting: mcp.starting,
+                starting: mcp.pending_servers().is_some(),
                 running: mcp.server_names(),
-                // Only servers still starting (round 4); failed ones are listed below.
-                pending: mcp.pending_servers().unwrap_or_default(),
-                failed: mcp
-                    .degraded_report
-                    .as_ref()
-                    .map(|report| {
-                        report
-                            .failed_servers
-                            .iter()
-                            .map(|failed| {
-                                (failed.server_name.clone(), failed.error.message.clone())
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                failed,
                 unsupported: mcp
                     .manager
                     .unsupported_servers()
