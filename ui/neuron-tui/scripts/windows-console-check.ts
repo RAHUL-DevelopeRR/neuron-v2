@@ -2,13 +2,15 @@
 // Windows Terminal runs programs in) and uses it as a person would. It covers
 // typing and Enter, the permission dialog (allow, allow for the session,
 // deny), resizing, Ctrl-C to quit, a bare `neuron` handing the console to the
-// UI, and `neuron --continue <chat>` reopening a chat. The steps are
+// UI, `neuron --continue <chat>` reopening a chat, and the trust screen in a
+// folder nobody trusted. The steps are
 // scripts/windows-console/*.txt, played by ConPtyDrive.cs, which this compiles
 // with the csc.exe that ships with Windows. Then, in a classic console window
 // (classic-console-check.ps1 with ConsoleKeys.cs): three exits the window must
 // survive with the --continue hint, its title, a command typed right after
 // quitting (in cmd and in Windows PowerShell), the console's input mode after
-// the UI is killed, the line REPL's first screens, and NEURON_CONSOLE_STRESS
+// the UI is killed, the trust screen (2 quits, 1 allows), the line REPL's first
+// screens, and NEURON_CONSOLE_STRESS
 // (3) launches through `neuron` that must still read the keyboard.
 //
 //   bun run check:console
@@ -67,6 +69,8 @@ const results = [
   play('type-submit-allow.txt', ['--compiled']).passed,
   play('resize-deny-quit.txt', ['--compiled']).passed,
   play('neuron-hand-off.txt', ['--via-neuron']).passed,
+  // An untrusted folder: the trust screen, then 1 allows Neuron there.
+  play('trust-allow.txt', ['--untrusted', '--via-neuron']).passed,
 ]
 
 // The chat from the first run, named by its exit hint, reopened by the second
@@ -150,14 +154,31 @@ results.push(
   }),
 )
 
-// The line REPL's first screens (the trust prompt, the banner) in a classic
+// A folder the user has not trusted: "Before Neuron works here" comes before
+// the chat. 2 (Quit) leaves with exit code 0; 1 (Allow) restarts the engine
+// with the folder's settings, and the chat then reads the keyboard. The other
+// checks run in a trusted workspace.
+results.push(
+  classic('bare', '2', 'an untrusted folder: the trust screen comes first, and 2 quits with exit code 0', {
+    ready: 'Before Neuron works here;;Allow Neuron in this folder',
+    expect: '',
+    flags: ['-Direct', '-Untrusted', '-ExitCode', '0', '-NoEscapes'],
+  }),
+  classic('bare', '1|<CHAT>|<ALIVE>|/exit<SHOWN>|<CR>', 'an untrusted folder: 1 allows Neuron, then the chat reads the keyboard', {
+    ready: 'Before Neuron works here',
+    expect: '',
+    flags: ['-Direct', '-Untrusted', '-ExitCode', '0'],
+  }),
+)
+
+// The line REPL's first screens (the trust menu, the banner) in a classic
 // window: no escape code may show as text (`←[38;2;…`). Under Bun the console
 // already has escape-code processing on, so this one must run `neuron` itself.
 results.push(
   classic('--no-tui', '1<CR>|<SLEEP>|/exit<CR>', 'the line REPL shows no escape codes', {
     ready: 'trust this directory',
     expect: '',
-    flags: ['-NoEscapes', '-Direct'],
+    flags: ['-NoEscapes', '-Direct', '-Untrusted'],
   }),
 )
 

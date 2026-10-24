@@ -396,7 +396,7 @@ once this branch has it.
   mode; every chat runs in DEFAULT. The permission modes and the engine's plan
   mode are what a mode switch will offer later (T7 P1, T8).
 - **T14, `/upgrade`** opens zero-x.live/pricing (or shows the link with
-  `NEURON_NO_BROWSER`, or when no browser can open). `/usage` waits for the
+  `NEURON_NO_BROWSER`, or when no browser can open). `/usage` is phase B's
   report panel.
 - **T19, no image hint.** The engine only lists an image's path, so `/image`
   is not in the menu or `/help` (`IMAGES_REACH_THE_MODEL` in
@@ -411,6 +411,60 @@ once this branch has it.
   "Check your connection, then type /login to try again". A new code, or
   signing in, clears it. Snapshots cover it at 80×24, 200×50 and in the
   console glyph set.
+
+## Terminal UI parity (WP2, phase B)
+
+The rows that need engine protocol v2 (PR #13): the UI announces the `reports`
+capability once the engine is ready, and reads `features` from `ready`.
+
+- **T1, "Before Neuron works here".** While the engine says the folder is not
+  trusted (and offers `trust_workspace`), the trust screen
+  (`components/trust-screen.tsx`) is drawn instead of the chat. It names the
+  folder and the git root trust is recorded for, says what Neuron may do there
+  and what the project's settings would turn on (hooks, MCP servers, permission
+  rules, other settings: the engine's `trust_preview`, which starts nothing),
+  and offers *Allow Neuron in this folder* or *Quit*: 1–2 or ↑↓ and Enter, Esc
+  (or Ctrl-C) to quit. The words come from the shared trust copy
+  (`@neuron/client/copy/trust`, a path alias to `ui/neuron-client`), as the
+  desktop's do.
+  - *Allow* sends `trust_workspace`; on `workspace_trusted` the engine restarts
+    with the folder's settings (`restartWithTrust` in `engine/engine-session.ts`),
+    with `--resume` when there is a conversation to keep (a `--continue`, or
+    prompts sent already), and the chat follows. The home folder is trusted for
+    that engine only (`NEURON_TRUST_WORKSPACE=1` on its environment) and asked
+    about again at the next launch. A failure to record trust stays on the
+    screen with the engine's reason.
+  - *Quit* exits 0. The engine ran untrusted, so none of the folder's hooks or
+    MCP servers started.
+  - On the first start nothing runs, a prompt given on the command line
+    included, until the engine's first status says whether the folder is
+    trusted ("Starting Neuron…", about half a second). Later restarts (a
+    resumed chat, another folder) keep the chat on screen.
+  - An engine without `trust_workspace` keeps the chat with its "untrusted"
+    footer, as before.
+- **T2, onboarding steps 2–3.** When the first status needs a Zero-X sign-in,
+  the first screen is "Welcome to Neuron" (`components/onboarding-sign-in.tsx`):
+  Enter starts the engine's device sign-in (the sign-in panel shows the link,
+  code and countdown, and Esc cancels it), Esc leaves it for later (the chat's
+  sign-in panel then says how), Ctrl-C quits. Once signed in, the trust screen
+  follows when the folder is not trusted, then the chat. The step follows the
+  login itself rather than a stored `onboardedVersion`, so after
+  `neuron logout` the next launch starts with it again; `onboardedVersion`
+  comes with steps 1 and 4 (theme, terminal check, P1). A provider with its own
+  key is not signed in to Zero-X and needs no sign-in, so it skips the step.
+- **T5 and T14, reports.** `/usage`, `/init`, `/memory` and `/doctor` are in the
+  menu. The engine answers them with a `report` event (a title, Markdown
+  sections, links), drawn above the input (`components/report-panel.tsx`, input
+  mode `report`): PgUp and PgDn scroll it, Esc or the next prompt closes it.
+  `/usage` shows today's requests and tokens against the plan, when they reset,
+  credit and the dashboard link, as the engine read them from Zero-X.
+- **The start gate** (`state/start-gate.ts`, `components/start-gate.tsx`) picks
+  what comes before the chat: starting, sign-in, trust, or the chat.
+- **Development.** `bun run dev:mock` trusts its workspace
+  (`NEURON_TRUST_WORKSPACE=1`), as the console checks do; `--untrusted` leaves
+  it untrusted to try the trust screen. `check:console` has two untrusted
+  checks: 2 quits with exit code 0, and 1 allows Neuron, after which the chat
+  reads the keyboard.
 
 ## Left for later
 

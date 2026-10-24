@@ -3,7 +3,8 @@
 // model catalog and session gate are gone. Sign-in comes from the engine (P3).
 // A chat resumed from history resumes its engine session, a new chat clears the
 // engine's conversation, and the git-root banner never offers the home folder
-// or a folder above it. See ui/neuron-tui/PORTING.md.
+// or a folder above it. Before the chat come onboarding's sign-in and the
+// folder trust screen (StartGate). See ui/neuron-tui/PORTING.md.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useShallow } from 'zustand/react/shallow'
 
@@ -11,6 +12,7 @@ import { Chat } from './chat'
 import { ChatHistoryScreen } from './components/chat-history-screen'
 import { ChatRuntimeProvider } from './contexts/chat-runtime-context'
 import { ProjectPickerScreen } from './components/project-picker-screen'
+import { StartGate } from './components/start-gate'
 import {
   clearEngineConversation,
   resumeEngineSessionForChat,
@@ -192,23 +194,26 @@ export const App = ({
   }
 
   // Reset the runtime only when the active chat identity changes. View-only
-  // routes such as history and session gates keep the same key.
+  // routes such as history and session gates keep the same key. Onboarding's
+  // sign-in and the trust screen come first, while they apply.
   return (
-    <AuthedSurface
-      runtimeKey={chatSessionId}
-      consumeInitialPrompt={consumeInitialPrompt}
-      fileTree={fileTree}
-      inputRef={inputRef}
-      continueChat={effectiveContinueChat}
-      continueChatId={effectiveContinueChatId}
-      initialMode={initialMode}
-      gitRoot={gitRoot}
-      onSwitchToGitRoot={handleSwitchToGitRoot}
-      showChatHistory={showChatHistory}
-      onSelectChat={handleResumeChat}
-      onCancelChatHistory={closeChatHistory}
-      onNewChat={handleNewChat}
-    />
+    <StartGate>
+      <AuthedSurface
+        runtimeKey={chatSessionId}
+        consumeInitialPrompt={consumeInitialPrompt}
+        fileTree={fileTree}
+        inputRef={inputRef}
+        continueChat={effectiveContinueChat}
+        continueChatId={effectiveContinueChatId}
+        initialMode={initialMode}
+        gitRoot={gitRoot}
+        onSwitchToGitRoot={handleSwitchToGitRoot}
+        showChatHistory={showChatHistory}
+        onSelectChat={handleResumeChat}
+        onCancelChatHistory={closeChatHistory}
+        onNewChat={handleNewChat}
+      />
+    </StartGate>
   )
 }
 

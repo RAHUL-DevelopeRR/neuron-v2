@@ -16,7 +16,7 @@ import {
   buildPlanPrompt,
   buildReviewPrompt,
 } from './prompt-builders'
-import { isUnreachableSignIn, whenEngineStarted } from '../engine/engine-session'
+import { runEngineLogin, whenEngineStarted } from '../engine/engine-session'
 import { getNeuronEngineClient, runExchange } from '../engine/neuron-engine-client'
 import { withQuestionAnswer } from '../engine/questions'
 import { statusAddendum } from '../engine/status-report'
@@ -244,6 +244,9 @@ export async function routeUserPrompt(
   const hasAttachments = pendingAttachments.length > 0
   if (!trimmed && !hasAttachments && inputMode !== 'skill') return
 
+  // A report panel closes once the next prompt or command is sent.
+  if (inputMode === 'report') setInputMode('default')
+
   // Handle bash mode commands
   if (inputMode === 'bash') {
     const commandWithBang = '!' + trimmed
@@ -404,13 +407,12 @@ export async function routeUserPrompt(
   if (isSlashCommand(trimmed) && engineReady) {
     const [command = '', ...args] = trimmed.slice(1).trim().split(/\s+/)
     setMessages((prev) => [...prev, getUserMessage(trimmed)])
-    const isLogin = command.toLowerCase() === 'login'
-    if (isLogin) useEngineStore.getState().setSignInProblem(null)
-    runExchange(engine, () => engine.slash(command, args.join(' ')), () => {})
-      .then((outcome) => {
-        if (isLogin && outcome.error && isUnreachableSignIn(outcome.error)) {
-          useEngineStore.getState().setSignInProblem(outcome.error)
-        }
+    const exchange =
+      command.toLowerCase() === 'login'
+        ? runEngineLogin(engine)
+        : runExchange(engine, () => engine.slash(command, args.join(' ')), () => {})
+    exchange
+      .then(() => {
         // The engine's report has no account and no folder trust: the UI
         // adds them from the engine's status (engine/status-report.ts).
         if (command.toLowerCase() !== 'status') return

@@ -32,6 +32,11 @@ export interface EngineLaunchOptions {
   resume?: string
   allowBroadCwd?: boolean
   dangerouslySkipPermissions?: boolean
+  /**
+   * Added to the engine's environment: `NEURON_TRUST_WORKSPACE=1` for a folder
+   * trusted for this session only (the home folder).
+   */
+  env?: Record<string, string>
 }
 
 /** The argv after the binary for {@link EngineLaunchOptions}. */

@@ -160,6 +160,31 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
     engineCommand: true,
     description: 'Token usage for this session',
   },
+  // These four answer with a report panel (report-panel.tsx).
+  {
+    id: 'usage',
+    label: 'usage',
+    engineCommand: true,
+    description: "Today's requests and tokens against your plan, and when they reset",
+  },
+  {
+    id: 'init',
+    label: 'init',
+    engineCommand: true,
+    description: 'Create a starter NEURON.md for this project',
+  },
+  {
+    id: 'memory',
+    label: 'memory',
+    engineCommand: true,
+    description: 'Show the instruction files Neuron loaded',
+  },
+  {
+    id: 'doctor',
+    label: 'doctor',
+    engineCommand: true,
+    description: "Check Neuron's setup in this folder",
+  },
   {
     id: 'context',
     label: 'context',

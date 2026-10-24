@@ -17,6 +17,8 @@ export type InputMode =
   | 'skill'
   | 'image'
   | 'help'
+  /** A command's report (`/usage`, `/init`, `/memory`, `/doctor`) above the input. */
+  | 'report'
 
 // Theme color keys that are valid color values (must match ChatTheme keys)
 export type ThemeColorKey =
@@ -137,6 +139,16 @@ export const INPUT_MODE_CONFIGS: Record<InputMode, InputModeConfig> = {
     label: null,
     color: 'info',
     placeholder: 'enter a coding task or / for commands',
+    widthAdjustment: 0,
+    showAgentModeToggle: true,
+    disableSlashSuggestions: false,
+    blockKeyboardExit: false,
+  },
+  report: {
+    icon: null,
+    label: null,
+    color: 'info',
+    placeholder: 'esc to close the report, or enter a coding task',
     widthAdjustment: 0,
     showAgentModeToggle: true,
     disableSlashSuggestions: false,
