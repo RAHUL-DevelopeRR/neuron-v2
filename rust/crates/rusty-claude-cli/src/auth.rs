@@ -144,7 +144,7 @@ pub fn cached_gateway_token() -> io::Result<Option<SecureString>> {
 }
 
 fn interactive() -> bool {
-    io::stdin().is_terminal() && io::stderr().is_terminal()
+    runtime::ui_hooks::stdin_is_terminal() && io::stderr().is_terminal()
 }
 
 /// Credential for a model session: `NEURON_TOKEN`, else the stored login
@@ -865,12 +865,23 @@ pub fn check_trust(cwd: &std::path::Path) -> bool {
     if runtime::ConfigLoader::default_for(cwd).workspace_is_trusted() {
         return true;
     }
-    println!(
-        "\nNeuronCLI can read, write, and execute commands in:\n{}\nTrusting it also lets this directory's settings files run hooks, start MCP servers and change permissions.",
+    // Where the user sees it: stdout, or stderr when stdout is redirected (`neuron
+    // prompt ... > out.txt`). With both redirected, a person at the terminal would
+    // not see the question.
+    let Some(stream) = runtime::ui_hooks::PromptStream::current() else {
+        eprintln!(
+            "Not trusted: the trust question could not be shown (stdout and stderr are redirected). \
+Run neuron in a terminal to trust this directory, or add it to `trustedRoots` in your user settings."
+        );
+        return false;
+    };
+    let mut out = stream.writer();
+    let _ = write!(
+        out,
+        "\nNeuronCLI can read, write, and execute commands in:\n{}\nTrusting it also lets this directory's settings files run hooks, start MCP servers and change permissions.\nPress 1 to trust this directory: ",
         cwd.display()
     );
-    print!("Press 1 to trust this directory: ");
-    let _ = io::stdout().flush();
+    let _ = out.flush();
     let mut input = String::new();
     let answered = io::stdin().read_line(&mut input);
     if answered.is_ok() && input.trim() == "1" {
@@ -883,7 +894,7 @@ pub fn check_trust(cwd: &std::path::Path) -> bool {
         return true;
     }
     // The caller exits; say why rather than stopping silently.
-    println!();
+    let _ = writeln!(out);
     eprintln!("{}", untrusted_reason(matches!(answered, Ok(0) | Err(_))));
     false
 }

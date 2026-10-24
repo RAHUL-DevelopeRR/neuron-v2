@@ -259,20 +259,23 @@ pub(crate) fn fatal_api_error(session_id: &str, error: &api::ApiError) -> Stream
         RuntimeErrorKind::Other
     };
     let mut message = format_user_visible_api_error(session_id, error);
-    if let Some(hint) = switch_model_hint(error) {
+    if let Some(hint) = switch_model_hint(error, crate::headless::one_shot()) {
         message.push_str(hint);
     }
     StreamFailure::Fatal(RuntimeError::with_kind(kind, message))
 }
 
 /// For the gateway's `capacity_exhausted`, whose advice is to wait or upgrade (even on
-/// the highest plan): another model's shared pool may well have room now.
-fn switch_model_hint(error: &api::ApiError) -> Option<&'static str> {
+/// the highest plan): another model's shared pool may well have room now. A one-shot
+/// `neuron prompt` run has no REPL to type `/model` into: it names the flag.
+fn switch_model_hint(error: &api::ApiError, one_shot: bool) -> Option<&'static str> {
     (error.gateway_error().and_then(api::GatewayError::code_kind)
         == Some(api::GatewayErrorCode::CapacityExhausted))
-    .then_some(
-        ". Other models may have capacity now: switch with /model (or --model in a `neuron prompt` run).",
-    )
+    .then_some(if one_shot {
+        ". Other models may have capacity now: pick another with --model."
+    } else {
+        ". Other models may have capacity now: switch with /model."
+    })
 }
 
 /// Stop reason reported for tool calls the provider closed without
@@ -2203,7 +2206,7 @@ mod recovery_hint_tests {
 
 #[cfg(test)]
 mod switch_model_hint_tests {
-    use super::{fatal_api_error, StreamFailure};
+    use super::{fatal_api_error, switch_model_hint, StreamFailure};
 
     fn gateway_error(code: &str) -> api::ApiError {
         let body = serde_json::json!({
@@ -2231,8 +2234,10 @@ mod switch_model_hint_tests {
         };
         let message = error.to_string();
         assert!(message.contains("capacity_exhausted"), "{message}");
-        assert!(message.contains("switch with /model"), "{message}");
-        assert!(message.contains("--model"), "{message}");
+        assert!(
+            message.contains("Other models may have capacity now"),
+            "{message}"
+        );
 
         let StreamFailure::Fatal(error) =
             fatal_api_error("session-1", &gateway_error("insufficient_credits"))
@@ -2240,5 +2245,17 @@ mod switch_model_hint_tests {
             panic!("a fatal error");
         };
         assert!(!error.to_string().contains("/model"), "{error}");
+    }
+
+    /// The REPL and the UI have `/model`; a `neuron prompt` run has only the flag.
+    #[test]
+    fn the_hint_names_what_the_user_can_use() {
+        let error = gateway_error("capacity_exhausted");
+        let interactive = switch_model_hint(&error, false).expect("a hint");
+        assert!(interactive.contains("switch with /model"), "{interactive}");
+        assert!(!interactive.contains("--model"), "{interactive}");
+        let one_shot = switch_model_hint(&error, true).expect("a hint");
+        assert!(one_shot.contains("--model"), "{one_shot}");
+        assert!(!one_shot.contains("/model"), "{one_shot}");
     }
 }

@@ -159,13 +159,15 @@ pub fn format_search_start(label: &str, parsed: &serde_json::Value) -> String {
         .get("pattern")
         .and_then(|value| value.as_str())
         .unwrap_or("?");
-    // No path (or `.`) is the workspace the search runs in.
+    // No path (or `.`, `""`, or the workspace's own absolute path) is the workspace
+    // the search runs in.
     let scope = parsed
         .get("path")
         .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|path| !path.is_empty() && *path != ".")
-        .map_or_else(|| "the workspace".to_string(), display_clean_path);
+        .filter(|path| !runtime::is_blank_search_path(path))
+        .map(|path| display_clean_path(path.trim()))
+        .filter(|path| path != ".")
+        .unwrap_or_else(|| "the workspace".to_string());
     format!("{label} {pattern}\n\x1b[2min {scope}\x1b[0m")
 }
 
@@ -644,6 +646,8 @@ mod tests {
             r#"{"pattern":"TODO","path":""}"#,
             r#"{"pattern":"TODO"}"#,
             r#"{"pattern":"TODO","path":"."}"#,
+            // Models send an empty quoted string for "no path".
+            r#"{"pattern":"TODO","path":"\"\""}"#,
         ] {
             let start = strip_ansi(&format_tool_call_start("glob_search", input));
             assert!(
@@ -651,6 +655,13 @@ mod tests {
                 "{input}: {start}"
             );
         }
+        // The workspace's own absolute path reads the same, not as `.`.
+        let workspace = std::env::temp_dir();
+        let start = crate::tests::with_current_dir(&workspace, || {
+            let input = serde_json::json!({ "pattern": "TODO", "path": workspace }).to_string();
+            strip_ansi(&format_tool_call_start("grep_search", &input))
+        });
+        assert!(start.contains("\u{2502}  in the workspace\n"), "{start}");
     }
 
     #[test]

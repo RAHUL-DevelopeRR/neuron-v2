@@ -13,63 +13,113 @@ use std::io::{self, Write};
 
 pub(crate) struct CliPermissionPrompter {
     current_mode: PermissionMode,
+    /// The turn's token: cancelled when a non-interactive run reaches
+    /// [`crate::headless::DENIAL_LIMIT`] denied calls.
+    turn: Option<runtime::CancellationToken>,
 }
 
 impl CliPermissionPrompter {
     pub fn new(current_mode: PermissionMode) -> Self {
-        Self { current_mode }
+        Self {
+            current_mode,
+            turn: None,
+        }
+    }
+
+    /// Stops the turn of `turn` once a non-interactive run has denied
+    /// [`crate::headless::DENIAL_LIMIT`] calls.
+    pub fn stopping(mut self, turn: runtime::CancellationToken) -> Self {
+        self.turn = Some(turn);
+        self
+    }
+
+    /// Denies a call nobody can approve. The model gets the reason as the tool's result,
+    /// the user sees it now and in the run's last warning; enough of them stop the turn.
+    fn deny_unattended(
+        &self,
+        request: &runtime::PermissionRequest,
+    ) -> runtime::PermissionPromptDecision {
+        let reason = crate::headless::denial_reason(
+            &request.tool_name,
+            self.current_mode,
+            request.required_mode,
+        );
+        if crate::headless::record_denial(&request.tool_name, &reason) {
+            if let Some(turn) = &self.turn {
+                turn.cancel();
+            }
+        }
+        runtime::PermissionPromptDecision::Deny {
+            reason: crate::headless::denial_for_model(&reason),
+        }
     }
 }
 
-// The line REPL prompts on its own terminal.
-#[allow(clippy::print_stdout)]
 impl runtime::PermissionPrompter for CliPermissionPrompter {
     fn decide(
         &mut self,
         request: &runtime::PermissionRequest,
     ) -> runtime::PermissionPromptDecision {
-        // Nobody can answer (a script, CI, `< /dev/null`): no prompt. The model gets the
-        // reason as the tool's result, the user sees it now and in the run's last warning.
+        // Nobody can answer (a script, CI, `< /dev/null`): no prompt.
         if crate::headless::stdin_is_unattended() {
-            let reason = crate::headless::denial_reason(
-                &request.tool_name,
-                self.current_mode,
-                request.required_mode,
-            );
-            crate::headless::record_denial(&request.tool_name, &reason);
-            return runtime::PermissionPromptDecision::Deny { reason };
+            return self.deny_unattended(request);
         }
-        println!();
-        println!("Permission approval required");
-        println!("  Tool             {}", request.tool_name);
-        println!("  Current mode     {}", self.current_mode.as_str());
-        println!("  Required mode    {}", request.required_mode.as_str());
-        if let Some(reason) = &request.reason {
-            println!("  Reason           {reason}");
-        }
-        println!("  Input            {}", request.input);
-        print!("Approve this tool call? [y/N]: ");
-        let _ = io::stdout().flush();
+        // Stdout redirected (`neuron prompt ... > out.txt`): ask on stderr. With stderr
+        // redirected too, nobody would see the question.
+        let Some(stream) = runtime::ui_hooks::PromptStream::current() else {
+            return self.deny_unattended(request);
+        };
+        ask_for_approval(
+            &mut stream.writer(),
+            &mut io::stdin().lock(),
+            request,
+            self.current_mode,
+        )
+    }
+}
 
-        let mut response = String::new();
-        match io::stdin().read_line(&mut response) {
-            Ok(_) => {
-                let normalized = response.trim().to_ascii_lowercase();
-                if matches!(normalized.as_str(), "y" | "yes") {
-                    runtime::PermissionPromptDecision::Allow
-                } else {
-                    runtime::PermissionPromptDecision::Deny {
-                        reason: format!(
-                            "tool '{}' denied by user approval prompt",
-                            request.tool_name
-                        ),
-                    }
+/// Writes the approval question for `request` to `out` and reads the answer from
+/// `input`: `y` or `yes` approves the call once, anything else denies it.
+fn ask_for_approval(
+    out: &mut dyn Write,
+    input: &mut dyn io::BufRead,
+    request: &runtime::PermissionRequest,
+    current_mode: PermissionMode,
+) -> runtime::PermissionPromptDecision {
+    let mut question = format!(
+        "\nPermission approval required\n  Tool             {}\n  Current mode     {}\n  Required mode    {}\n",
+        request.tool_name,
+        current_mode.as_str(),
+        request.required_mode.as_str()
+    );
+    if let Some(reason) = &request.reason {
+        question.push_str(&format!("  Reason           {reason}\n"));
+    }
+    question.push_str(&format!(
+        "  Input            {}\nApprove this tool call? [y/N]: ",
+        request.input
+    ));
+    let _ = out.write_all(question.as_bytes());
+    let _ = out.flush();
+
+    let mut response = String::new();
+    match input.read_line(&mut response) {
+        Ok(_) => {
+            let normalized = response.trim().to_ascii_lowercase();
+            if matches!(normalized.as_str(), "y" | "yes") {
+                runtime::PermissionPromptDecision::Allow
+            } else {
+                runtime::PermissionPromptDecision::Deny {
+                    reason: format!(
+                        "tool '{}' denied by user approval prompt",
+                        request.tool_name
+                    ),
                 }
             }
-            Err(error) => runtime::PermissionPromptDecision::Deny {
-                reason: format!("permission approval failed: {error}"),
-            },
         }
+        Err(error) => runtime::PermissionPromptDecision::Deny {
+            reason: format!("permission approval failed: {error}"),
+        },
     }
 }
 
@@ -661,6 +711,62 @@ mod tool_search_tests {
         assert!(
             note.contains("does not load the bundled MCP servers (codebase-memory, playwright)"),
             "{output}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cli_prompter_tests {
+    use super::ask_for_approval;
+    use runtime::{PermissionMode, PermissionPromptDecision, PermissionRequest};
+    use std::io::Cursor;
+
+    fn request() -> PermissionRequest {
+        PermissionRequest {
+            tool_name: "bash".to_string(),
+            input: r#"{"command":"mkdir out"}"#.to_string(),
+            current_mode: PermissionMode::WorkspaceWrite,
+            required_mode: PermissionMode::DangerFullAccess,
+            reason: Some("Run `mkdir out`?".to_string()),
+            session_prefixes: Vec::new(),
+        }
+    }
+
+    /// The whole question goes to the stream it is given (stderr when stdout is
+    /// redirected); the answer comes from stdin.
+    #[test]
+    fn the_approval_question_goes_to_the_given_stream() {
+        let mut out = Vec::new();
+        let decision = ask_for_approval(
+            &mut out,
+            &mut Cursor::new("y\n"),
+            &request(),
+            PermissionMode::WorkspaceWrite,
+        );
+        assert_eq!(decision, PermissionPromptDecision::Allow);
+        let shown = String::from_utf8(out).expect("utf-8");
+        assert!(
+            shown.starts_with("\nPermission approval required\n  Tool             bash\n"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("  Reason           Run `mkdir out`?\n"),
+            "{shown}"
+        );
+        assert!(
+            shown.ends_with("Approve this tool call? [y/N]: "),
+            "{shown}"
+        );
+
+        let decision = ask_for_approval(
+            &mut Vec::new(),
+            &mut Cursor::new("\n"),
+            &request(),
+            PermissionMode::WorkspaceWrite,
+        );
+        assert!(
+            matches!(decision, PermissionPromptDecision::Deny { ref reason } if reason == "tool 'bash' denied by user approval prompt"),
+            "{decision:?}"
         );
     }
 }
