@@ -835,8 +835,6 @@ mod tests {
             outcome,
             stop_reason: None,
             pruned_tool_results: pruned,
-            served_model: None,
-            completion_checked: false,
         }
     }
 

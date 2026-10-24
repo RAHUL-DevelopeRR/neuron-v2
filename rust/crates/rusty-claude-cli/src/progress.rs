@@ -496,8 +496,7 @@ fn assemble_conversation_runtime(
         &feature_config,
     )
     .with_context_manager(context_manager)
-    .with_max_iterations(runtime::resolve_max_iterations(max_iterations_setting))
-    .with_harness_config(runtime::HarnessConfig::from_env());
+    .with_max_iterations(runtime::resolve_max_iterations(max_iterations_setting));
     if output.is_visible() {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
