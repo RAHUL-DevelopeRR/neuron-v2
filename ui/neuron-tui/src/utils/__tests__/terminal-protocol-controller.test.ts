@@ -1,3 +1,6 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: tests for a
+// key that arrives while the terminal reported no focus (isKeyInput). See
+// ui/neuron-tui/PORTING.md.
 import { describe, expect, test } from 'bun:test'
 
 import {
