@@ -373,3 +373,106 @@ describe('E2: extensions', () => {
     expect(state.extensions).toBeNull()
   })
 })
+
+describe('WP3: gateway problems', () => {
+  test('a failing prompt keeps its text and the problem, until the next prompt', () => {
+    let state = run(
+      [
+        { type: 'local/submitted', text: 'refactor the parser', attachments: [{ kind: 'file', path: 'src/parse.rs' }] },
+        { type: 'error', message: 'gateway error insufficient_quota: Daily quota reached' },
+        { type: 'turn_finished' },
+      ],
+      started(),
+    )
+    expect(state.problem?.kind).toBe('quota')
+    expect(state.unsent).toEqual({ text: 'refactor the parser', attachments: [{ kind: 'file', path: 'src/parse.rs' }] })
+    const error = state.items.at(-1)
+    expect(error).toMatchObject({ kind: 'error', problem: { kind: 'quota' } })
+    state = run([{ type: 'local/submitted', text: 'try again', attachments: [] }], state)
+    expect(state.problem).toBeNull()
+    expect(state.unsent).toBeNull()
+  })
+
+  test('a reply already started: nothing to put back', () => {
+    const state = run(
+      [
+        { type: 'local/submitted', text: 'explain', attachments: [] },
+        { type: 'text_delta', text: 'The parser…' },
+        { type: 'error', message: 'Could not reach Zero-X: connection reset' },
+      ],
+      started(),
+    )
+    expect(state.problem?.kind).toBe('unreachable')
+    expect(state.unsent).toBeNull()
+  })
+
+  test('other errors are plain error lines', () => {
+    const state = run([{ type: 'error', message: 'unknown slash command /frobnicate' }], started())
+    expect(state.problem).toBeNull()
+    expect(state.items.at(-1)).toEqual({ kind: 'error', key: expect.any(String), text: 'unknown slash command /frobnicate' })
+  })
+})
+
+describe('protocol v2: the account and the trust preview', () => {
+  test('account events fill the account; signing out clears it', () => {
+    const account = {
+      email: 'rahul@zero-x.live',
+      name: 'Rahul S',
+      plan: 'pro',
+      plan_name: 'Pro',
+      source: 'device',
+      expires_at: null,
+      limits: null,
+      usage_today: null,
+      resets_at: null,
+      credit_balance_cents: null,
+      suspended: false,
+      dashboard_url: 'https://zero-x.live/dashboard',
+      pricing_url: 'https://zero-x.live/pricing',
+      usage_updated_at: null,
+      usage_error: null,
+    }
+    let state = run([{ type: 'account', signed_in: true, account }], started())
+    expect(state.account?.name).toBe('Rahul S')
+    state = run([{ type: 'account', signed_in: false, account: null }], state)
+    expect(state.account).toBeNull()
+  })
+
+  test('the trust preview, until the folder is trusted or the engine restarts', () => {
+    const preview = {
+      type: 'trust_preview' as const,
+      cwd,
+      root: cwd,
+      is_git_root: true,
+      session_only: false,
+      trusted: false,
+      settings_files: [],
+      hooks: [],
+      mcp_servers: [{ name: 'postgres-tools', transport: 'stdio', target: 'pg-mcp', source: '.neuron/settings.json' }],
+      permission_rules: [],
+      other_settings: [],
+    }
+    let state = run([preview], started())
+    expect(state.trustPreview?.mcp_servers[0]?.name).toBe('postgres-tools')
+    state = run([{ type: 'workspace_trusted', cwd, restart_required: true }], state)
+    expect(state.trustPreview).toBeNull()
+    state = run([preview, { type: 'ready', protocol: 1, version: '6.3.0', features: [] }], state)
+    expect(state.trustPreview).toBeNull()
+  })
+
+  test('a typed error detail becomes the problem', () => {
+    const state = run(
+      [
+        { type: 'local/submitted', text: 'go', attachments: [] },
+        {
+          type: 'error',
+          message: 'Daily quota reached',
+          detail: { code: 'insufficient_quota', status: 429, upgrade_url: null, resets_at: '2026-10-24T00:00:00Z', retry_after_seconds: null },
+        },
+      ],
+      started(),
+    )
+    expect(state.problem).toMatchObject({ kind: 'quota', resetsAt: '2026-10-24T00:00:00Z' })
+    expect(state.unsent?.text).toBe('go')
+  })
+})

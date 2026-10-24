@@ -8,6 +8,7 @@ import {
   CAPABILITY_QUESTIONS,
   FEATURE_CAPABILITIES,
   type Attachment,
+  type SessionScope,
   type ClientMessage,
   type PermissionDecision,
   commandMessage,
@@ -40,19 +41,33 @@ export interface EngineTransport {
   close(): Promise<void>
 }
 
+export interface ControllerOptions {
+  /** This UI's name for the engine (`desktop`, `mobile`): other Neuron UIs see which one has a session open. */
+  client?: string
+}
+
 export class SessionController {
   private state: SessionState = initialSession()
   private listeners = new Set<() => void>()
   private unsubscribers: Array<() => void> = []
 
-  constructor(readonly transport: EngineTransport) {
+  constructor(
+    readonly transport: EngineTransport,
+    options: ControllerOptions = {},
+  ) {
     this.unsubscribers.push(
       transport.subscribe((action) => {
         this.apply(action)
         // An engine of its own hears what this client handles. A remote host tells its
         // engine itself, for all its clients.
         if (action.type === 'ready' && !transport.echoesActions && action.features?.includes(FEATURE_CAPABILITIES)) {
-          transport.send(commandMessage({ type: 'capabilities', features: [CAPABILITY_QUESTIONS] }))
+          transport.send(
+            commandMessage(
+              options.client
+                ? { type: 'capabilities', features: [CAPABILITY_QUESTIONS], client: options.client }
+                : { type: 'capabilities', features: [CAPABILITY_QUESTIONS] },
+            ),
+          )
         }
       }),
       transport.onClose((close) => this.apply({ type: 'local/disconnected', error: close.error })),
@@ -130,8 +145,19 @@ export class SessionController {
   }
 
   /** The workspace's saved chats arrive as `state.sessions` (feature `sessions`). */
-  listSessions(): void {
-    this.transport.send(commandMessage({ type: 'list_sessions' }))
+  /** The saved sessions, as a `sessions` event; `all` (feature `session_scope`) lists every project's. */
+  listSessions(scope?: SessionScope): void {
+    this.transport.send(commandMessage(scope ? { type: 'list_sessions', scope } : { type: 'list_sessions' }))
+  }
+
+  /** What trusting the workspace would turn on (feature `trust_preview`); `state.trustPreview` follows. */
+  trustPreview(): void {
+    this.transport.send(commandMessage({ type: 'trust_preview' }))
+  }
+
+  /** Reads the plan and usage again (feature `account`); `state.account` follows. */
+  refreshAccount(): void {
+    this.transport.send(commandMessage({ type: 'refresh_account' }))
   }
 
   /** Continues a saved chat; its transcript replaces what is shown (feature `sessions`). */

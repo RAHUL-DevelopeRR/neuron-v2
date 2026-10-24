@@ -383,6 +383,7 @@ mod tests {
             }
         );
         let _ = service.kill();
+        let _ = service.wait();
         let _ = std::fs::remove_dir_all(&home);
     }
 

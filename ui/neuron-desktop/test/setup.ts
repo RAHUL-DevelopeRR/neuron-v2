@@ -2,5 +2,6 @@
 import { GlobalRegistrator } from '@happy-dom/global-registrator'
 
 const BunWebSocket = globalThis.WebSocket
-GlobalRegistrator.register({ url: 'http://127.0.0.1:1420/' })
+// The size the app's window opens at (tauri.conf.json), so the sidebar is full width.
+GlobalRegistrator.register({ url: 'http://127.0.0.1:1420/', width: 1400, height: 900 })
 ;(globalThis as { BunWebSocket?: typeof WebSocket }).BunWebSocket = BunWebSocket
