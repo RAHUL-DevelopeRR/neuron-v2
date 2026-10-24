@@ -20,8 +20,18 @@ import {
   type FakeGateway,
 } from '../../../scripts/fake-zero-x-gateway'
 import { modelRows } from '../../components/model-picker'
-import { needsSignIn } from '../../state/engine-store'
-import { runExchange, runTurn } from '../neuron-engine-client'
+import { useChatStore } from '../../state/chat-store'
+import { needsSignIn, useEngineStore } from '../../state/engine-store'
+import { startScreen, useStartGate } from '../../state/start-gate'
+import {
+  isUnreachableSignIn,
+  runEngineLogin,
+  setEngineClientOptionsForTesting,
+  startEngineSession,
+  stopEngineSession,
+  trustWorkspace,
+} from '../engine-session'
+import { getNeuronEngineClient, runExchange, runTurn } from '../neuron-engine-client'
 import { StdioEngineClient, type SpawnEngine } from '../stdio-engine-client'
 import { mapToolCall, mapToolResult } from '../tool-mapping'
 
@@ -249,6 +259,146 @@ describe.skipIf(!haveBinaries)('neuron engine --stdio', () => {
       await runExchange(client, () => client.slash('logout'), () => {})
       await until('a signed-out status', () => statuses.at(-1)?.signed_in === false)
       expect(gateway!.requests).toContain('DELETE /auth/session (signed)')
+    } finally {
+      await client.shutdown()
+    }
+  }, 90_000)
+
+  test('a new chat (`clear --confirm`) starts a fresh engine session; a bare clear does not', async () => {
+    const client = new StdioEngineClient({
+      spawn: isolatedSpawn('new-chat', {
+        ANTHROPIC_API_KEY: 'integration-test-key',
+        ANTHROPIC_BASE_URL: mockUrl,
+      }),
+      resolveBinary: () => neuronBin,
+    })
+    const statuses: StatusEvent[] = []
+    client.subscribe((event) => {
+      if (event.type === 'status') statuses.push(event)
+    })
+    try {
+      await client.start({ cwd: workspaceFor('new-chat'), model: 'sonnet' })
+      const turn = await runTurn(client, { text: 'PARITY_SCENARIO:streaming_text' }, () => {})
+      expect(turn.error).toBeNull()
+      await until('a status after the turn', () => statuses.length > 0)
+      const before = statuses.at(-1)!.session_id
+
+      // What /new sent before: the engine only says it needs --confirm, and the
+      // session stays.
+      const notices: string[] = []
+      await runExchange(client, () => client.slash('clear', ''), (event) => {
+        if (event.type === 'notice') notices.push(event.message)
+      })
+      expect(notices.join(' ')).toContain('--confirm')
+      expect(statuses.at(-1)!.session_id).toBe(before)
+
+      const cleared = await runExchange(client, () => client.slash('clear', '--confirm'), () => {})
+      expect(cleared.error).toBeNull()
+      await until('a status for the fresh session', () => statuses.at(-1)!.session_id !== before)
+      expect(statuses.at(-1)!.session_id).not.toBe('')
+    } finally {
+      await client.shutdown()
+    }
+  }, 90_000)
+
+  test('an untrusted folder: the trust screen, then Allow restarts the engine trusted on the same conversation', async () => {
+    const workspace = workspaceFor('trust')
+    // What trusting would turn on: one MCP server and one permission rule. The
+    // server's program does not exist; it would only fail to start, after trust.
+    fs.mkdirSync(path.join(workspace, '.neuron'))
+    fs.writeFileSync(
+      path.join(workspace, '.neuron', 'settings.json'),
+      JSON.stringify({
+        permissions: { allow: ['bash(npm test)'] },
+        mcpServers: { 'postgres-tools': { command: 'neuron-integration-no-such-program' } },
+      }),
+    )
+    setEngineClientOptionsForTesting({
+      spawn: isolatedSpawn('trust', {
+        ANTHROPIC_API_KEY: 'integration-test-key',
+        ANTHROPIC_BASE_URL: mockUrl,
+      }),
+      resolveBinary: () => neuronBin,
+    })
+    const screen = () => startScreen({ ...useEngineStore.getState(), ...useStartGate.getState() })
+    try {
+      await startEngineSession({ cwd: workspace, model: 'sonnet' })
+      await until('the trust preview', () => useEngineStore.getState().trustPreview !== null)
+      expect(screen()).toBe('trust')
+      const preview = useEngineStore.getState().trustPreview!
+      expect(preview.trusted).toBe(false)
+      expect(preview.mcp_servers.map((server) => server.name)).toEqual(['postgres-tools'])
+      expect(preview.permission_rules.map((rule) => rule.rule)).toEqual(['bash(npm test)'])
+
+      // A turn first, so the restart has a conversation to keep.
+      const turn = await runTurn(getNeuronEngineClient(), { text: 'PARITY_SCENARIO:streaming_text' }, () => {})
+      expect(turn.error).toBeNull()
+      useChatStore.getState().setMessages([{ id: 'user-1', variant: 'user', content: 'hi' } as never])
+      await until('the session id', () => Boolean(useEngineStore.getState().status?.session_id))
+      const session = useEngineStore.getState().status!.session_id
+
+      const before = getNeuronEngineClient()
+      trustWorkspace()
+      await until('the restarted engine', () => getNeuronEngineClient() !== before)
+      await until('a trusted status', () => useEngineStore.getState().status?.workspace_trusted === true)
+      expect(screen()).toBe('chat')
+      expect(useEngineStore.getState().status!.session_id).toBe(session)
+
+      // The next launch in the folder: trusted from the start, no screen.
+      await stopEngineSession()
+      useStartGate.getState().reset()
+      await startEngineSession({ cwd: workspace, model: 'sonnet' })
+      await until('the first status', () => useEngineStore.getState().status !== null)
+      expect(useEngineStore.getState().status!.workspace_trusted).toBe(true)
+      expect(screen()).toBe('chat')
+    } finally {
+      await stopEngineSession()
+      setEngineClientOptionsForTesting({})
+      useEngineStore.getState().reset()
+      useStartGate.getState().reset()
+      useChatStore.getState().reset()
+    }
+  }, 90_000)
+
+  test('a first launch, signed out in an untrusted folder: sign-in, then trust, then the chat', async () => {
+    setEngineClientOptionsForTesting({
+      spawn: isolatedSpawn('onboarding', { NEURON_API_BASE: gateway!.base }),
+      resolveBinary: () => neuronBin,
+    })
+    const screen = () => startScreen({ ...useEngineStore.getState(), ...useStartGate.getState() })
+    try {
+      await startEngineSession({ cwd: workspaceFor('onboarding') })
+      await until('the first status', () => useEngineStore.getState().status !== null)
+      expect(screen()).toBe('sign_in')
+
+      const login = await runEngineLogin()
+      expect(login.error).toBeNull()
+      await until('a signed-in status', () => useEngineStore.getState().status?.signed_in === true)
+      expect(screen()).toBe('trust')
+
+      trustWorkspace()
+      await until('a trusted status', () => useEngineStore.getState().status?.workspace_trusted === true)
+      await until('the chat', () => screen() === 'chat')
+    } finally {
+      await stopEngineSession()
+      setEngineClientOptionsForTesting({})
+      useEngineStore.getState().reset()
+      useStartGate.getState().reset()
+      useChatStore.getState().reset()
+    }
+  }, 90_000)
+
+  test("signed out with Zero-X unreachable: /login fails as the UI's Can't reach Zero-X", async () => {
+    // A port nothing listens on.
+    const client = new StdioEngineClient({
+      spawn: isolatedSpawn('unreachable', { NEURON_API_BASE: 'http://127.0.0.1:9' }),
+      resolveBinary: () => neuronBin,
+    })
+    try {
+      await client.start({ cwd: workspaceFor('unreachable') })
+      const login = await runExchange(client, () => client.slash('login'), () => {})
+      expect(login.error).not.toBeNull()
+      expect(isUnreachableSignIn(login.error!)).toBe(true)
     } finally {
       await client.shutdown()
     }

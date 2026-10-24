@@ -351,19 +351,120 @@ blocked.
 - `!cmd` and `/bash` show "Shell commands (!) are not available in this build of
   the Neuron UI yet."
 - These slash commands are the UI's own: `help`, `new`, `copy`, `export`,
-  `bash`, `image`, `history`, `queue`, `todo`, `interview`, `plan`, `review`,
-  `theme:toggle`, `exit`, `mode:*` and `skill:*`. Any other goes to the engine.
-- Typecheck is clean, and `bun run test` gives 2,416 passing tests, 0 failures
+  `history`, `queue`, `todo`, `interview`, `plan`, `review`, `upgrade`,
+  `theme:toggle`, `exit` and `skill:*` (and, not offered yet, `bash`, `image` and
+  `mode:*`). Any other goes to the engine.
+- Typecheck is clean, and `bun run test` gives 2,425 passing tests, 0 failures
   and 24 skipped.
-- `src/engine/__tests__/engine.integration.test.ts` passes 5 tests against the
-  real engine: 4 turns against the mock service, and the signed-out start,
-  `/login`, catalog and `/logout` against the fake gateway. It is not part of
+- `src/engine/__tests__/engine.integration.test.ts` passes 7 tests against the
+  real engine: 4 turns against the mock service; the signed-out start,
+  `/login`, catalog and `/logout` against the fake gateway; `clear --confirm`
+  giving a fresh session where a bare `clear` does not; and `/login` with
+  Zero-X unreachable failing as "Can't reach Zero-X". It is not part of
   `bun run test`, because it needs the Rust binaries and takes about 3 minutes
   on a debug build.
 - Of the skips, 7 POSIX-only cases skip on Windows: direnv export, directory
   fsync, chmod, and a concurrent atomic rename. The rest are upstream skips,
   mostly tmux. Freebuff's CI ran on Linux, so these never ran on Windows
   before.
+
+## Terminal UI parity (WP2, phase A)
+
+From the feature-parity plan's terminal rows; the rows that need engine
+protocol v2 (the trust screen, onboarding, the report panel, `/usage`) come
+once this branch has it.
+
+- **T3, a new chat starts a fresh engine conversation.** `/new` (and `/clear`,
+  `/reset`) sent the engine a bare `clear`, which it refuses without
+  `--confirm`, and the history screen's New chat told it nothing: the next
+  prompt still carried the old conversation. Both now send `clear --confirm`
+  (`clearEngineConversation` in `engine/engine-session.ts`). The clear joins
+  the engine's exchange queue first, so `/new <prompt>` runs in the fresh
+  conversation. The old session stays saved.
+- **T4, a chat picked in `/history` resumes its engine session.** Only the
+  transcript came back before. The engine now restarts with the last launch's
+  flags and `--resume <the chat's session>` (`resumeEngineSessionForChat`);
+  a chat saved without a session gets a fresh conversation, not the current
+  one.
+- **T5, no listed command is refused.** Every engine command the menu offers
+  is one `engine.rs` handles in the full-screen UI; a test reads `run_slash` to
+  keep it so.
+- **T7, the agent modes are not offered.** DEFAULT, LITE, MAX and PLAN were
+  Codebuff agents that Neuron's engine ignores. `AGENT_MODES_AVAILABLE = false`
+  (`utils/constants.ts`) removes the toggle, Tab and Shift+Tab cycling, the
+  `/mode:*` commands, `--lite`/`--max`/`--plan` (and `--free`), and the saved
+  mode; every chat runs in DEFAULT. The permission modes and the engine's plan
+  mode are what a mode switch will offer later (T7 P1, T8).
+- **T14, `/upgrade`** opens zero-x.live/pricing (or shows the link with
+  `NEURON_NO_BROWSER`, or when no browser can open). `/usage` is phase B's
+  report panel.
+- **T19, no image hint.** The engine only lists an image's path, so `/image`
+  is not in the menu or `/help` (`IMAGES_REACH_THE_MODEL` in
+  `engine/attachments.ts`) until images reach models that support them.
+- **T20, `!` and `/bash`** stay hidden (round 4).
+- **T24, the git-root banner** never offers the home folder or a folder above
+  it (`isAtOrAboveHome` in `utils/project-picker.ts`), which the engine refuses
+  as too broad.
+- **"Can't reach Zero-X".** A `/login` that could not start, because Zero-X was
+  unreachable, offers no device sign-in (404) or answered with a server error,
+  turns the sign-in panel into "Can't reach Zero-X": the engine's reason and
+  "Check your connection, then type /login to try again". A new code, or
+  signing in, clears it. Snapshots cover it at 80×24, 200×50 and in the
+  console glyph set.
+
+## Terminal UI parity (WP2, phase B)
+
+The rows that need engine protocol v2 (PR #13): the UI announces the `reports`
+capability once the engine is ready, and reads `features` from `ready`.
+
+- **T1, "Before Neuron works here".** While the engine says the folder is not
+  trusted (and offers `trust_workspace`), the trust screen
+  (`components/trust-screen.tsx`) is drawn instead of the chat. It names the
+  folder and the git root trust is recorded for, says what Neuron may do there
+  and what the project's settings would turn on (hooks, MCP servers, permission
+  rules, other settings: the engine's `trust_preview`, which starts nothing),
+  and offers *Allow Neuron in this folder* or *Quit*: 1–2 or ↑↓ and Enter, Esc
+  (or Ctrl-C) to quit. The words come from the shared trust copy
+  (`@neuron/client/copy/trust`, a path alias to `ui/neuron-client`), as the
+  desktop's do.
+  - *Allow* sends `trust_workspace`; on `workspace_trusted` the engine restarts
+    with the folder's settings (`restartWithTrust` in `engine/engine-session.ts`),
+    with `--resume` when there is a conversation to keep (a `--continue`, or
+    prompts sent already), and the chat follows. The home folder is trusted for
+    that engine only (`NEURON_TRUST_WORKSPACE=1` on its environment) and asked
+    about again at the next launch. A failure to record trust stays on the
+    screen with the engine's reason.
+  - *Quit* exits 0. The engine ran untrusted, so none of the folder's hooks or
+    MCP servers started.
+  - On the first start nothing runs, a prompt given on the command line
+    included, until the engine's first status says whether the folder is
+    trusted ("Starting Neuron…", about half a second). Later restarts (a
+    resumed chat, another folder) keep the chat on screen.
+  - An engine without `trust_workspace` keeps the chat with its "untrusted"
+    footer, as before.
+- **T2, onboarding steps 2–3.** When the first status needs a Zero-X sign-in,
+  the first screen is "Welcome to Neuron" (`components/onboarding-sign-in.tsx`):
+  Enter starts the engine's device sign-in (the sign-in panel shows the link,
+  code and countdown, and Esc cancels it), Esc leaves it for later (the chat's
+  sign-in panel then says how), Ctrl-C quits. Once signed in, the trust screen
+  follows when the folder is not trusted, then the chat. The step follows the
+  login itself rather than a stored `onboardedVersion`, so after
+  `neuron logout` the next launch starts with it again; `onboardedVersion`
+  comes with steps 1 and 4 (theme, terminal check, P1). A provider with its own
+  key is not signed in to Zero-X and needs no sign-in, so it skips the step.
+- **T5 and T14, reports.** `/usage`, `/init`, `/memory` and `/doctor` are in the
+  menu. The engine answers them with a `report` event (a title, Markdown
+  sections, links), drawn above the input (`components/report-panel.tsx`, input
+  mode `report`): PgUp and PgDn scroll it, Esc or the next prompt closes it.
+  `/usage` shows today's requests and tokens against the plan, when they reset,
+  credit and the dashboard link, as the engine read them from Zero-X.
+- **The start gate** (`state/start-gate.ts`, `components/start-gate.tsx`) picks
+  what comes before the chat: starting, sign-in, trust, or the chat.
+- **Development.** `bun run dev:mock` trusts its workspace
+  (`NEURON_TRUST_WORKSPACE=1`), as the console checks do; `--untrusted` leaves
+  it untrusted to try the trust screen. `check:console` has two untrusted
+  checks: 2 quits with exit code 0, and 1 allows Neuron, after which the chat
+  reads the keyboard.
 
 ## Left for later
 
@@ -372,9 +473,6 @@ blocked.
   - `@tanstack/react-query` is still mounted in `index.tsx`, but nothing uses
     it now: the model list polls with a timer. Removing it changes the
     lockfile, so it waits for a dependency pass.
-  - The agent modes (DEFAULT, LITE, MAX, PLAN; the `< DEFAULT` toggle, the mode
-    divider, `--lite`/`--max`/`--plan`) change only how the UI presents a turn.
-    The engine ignores them. Hide them, or map PLAN to the engine's plan mode.
 - **After P4:**
   - The release build of the UI runs only in `release.yml`. A tagged release
     is its first full test on Linux and macOS: the Linux glibc floor for the
@@ -422,9 +520,6 @@ blocked.
     WMI service; while WMI was stuck on the test machine, `taskkill` and
     `tasklist` hung. The engine gives up on `taskkill` after a bounded wait and
     kills the root process instead.
-  - In a folder under a git repo, Freebuff's banner offers to switch to the git
-    root, even when that root is the home folder, which the engine then refuses
-    as too broad.
   - The engine gets the UI's environment after the direnv import, minus the
     blocked variables. Its own lookups on PATH (`node`/`npx` for MCP servers)
     can therefore find a project's tools first, as they would in a shell that

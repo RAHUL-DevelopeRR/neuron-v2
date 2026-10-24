@@ -4,8 +4,10 @@
 // subscription banners, feedback, publishing, the profile survey and every
 // analytics event are gone. The engine's permission requests, sign-in and model
 // picker open panels above the input, and its status shows in a footer line
-// below it. A submit sends the store's latest text. See ui/neuron-tui/PORTING.md.
+// below it, as does a command's report. A submit sends the store's latest text.
+// See ui/neuron-tui/PORTING.md.
 import { HelpBanner } from './components/help-banner'
+import { ReportPanel, scrollOpenReport } from './components/report-panel'
 import {
   useCallback,
   useEffect,
@@ -235,6 +237,7 @@ export const Chat = ({
   const setInputMode = useChatStore((state) => state.setInputMode)
   const askUserState = useChatStore((state) => state.askUserState)
   // A tool call waiting for approval takes the composer's place.
+  const report = useEngineStore((state) => state.report)
   const permissionRequest = useEngineStore(
     (state) => state.permissionQueue[0] ?? null,
   )
@@ -1061,8 +1064,13 @@ export const Chat = ({
           }
         })
       },
-      onScrollUp: scrollUp,
-      onScrollDown: scrollDown,
+      // An open report scrolls instead of the chat.
+      onScrollUp: () => {
+        if (!scrollOpenReport('up')) scrollUp()
+      },
+      onScrollDown: () => {
+        if (!scrollOpenReport('down')) scrollDown()
+      },
       onToggleAll: handleToggleAll,
     }),
     [
@@ -1316,6 +1324,14 @@ export const Chat = ({
         )}
 
         {inputMode === 'help' && <HelpBanner />}
+
+        {inputMode === 'report' && report && (
+          <ReportPanel
+            report={report}
+            width={terminalWidth}
+            maxHeight={Math.floor(terminalHeight / 2)}
+          />
+        )}
 
         {shouldShowStatusLine && (
           <StatusBar

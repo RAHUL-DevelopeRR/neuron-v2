@@ -409,12 +409,24 @@ impl GlobalToolRegistry {
                 cancel,
             );
         }
-        self.plugin_tools
+        let Some(tool) = self
+            .plugin_tools
             .iter()
             .find(|tool| tool.definition().name == name)
-            .ok_or_else(|| format!("unsupported tool: {name}"))?
-            .execute(input)
-            .map_err(|error| error.to_string())
+        else {
+            let specs = mvp_tool_specs();
+            let candidates = specs
+                .iter()
+                .map(|spec| spec.name)
+                .chain(
+                    self.plugin_tools
+                        .iter()
+                        .map(|tool| tool.definition().name.as_str()),
+                )
+                .collect::<Vec<_>>();
+            return Err(runtime::tool_input::unknown_tool_message(name, &candidates));
+        };
+        tool.execute(input).map_err(|error| error.to_string())
     }
 
     fn searchable_tool_specs(&self) -> Vec<SearchableToolSpec> {
@@ -1593,7 +1605,11 @@ fn execute_tool_with_enforcer_and_cancel(
         "TestingPermission" => {
             from_value::<TestingPermissionInput>(input).and_then(run_testing_permission)
         }
-        _ => Err(format!("unsupported tool: {name}")),
+        _ => {
+            let specs = mvp_tool_specs();
+            let candidates = specs.iter().map(|spec| spec.name).collect::<Vec<_>>();
+            Err(runtime::tool_input::unknown_tool_message(name, &candidates))
+        }
     }
 }
 
@@ -3823,6 +3839,9 @@ pub struct SubagentParentContext {
     /// Builds provider clients with the parent's credentials. When `None`,
     /// clients are built from the environment.
     pub client_factory: Option<SubagentClientFactory>,
+    /// Parts of the parent's system prompt sub-agents get too, such as the map of
+    /// the workspace's files and symbols.
+    pub context_sections: Vec<String>,
 }
 
 impl SubagentParentContext {
@@ -3837,6 +3856,7 @@ impl SubagentParentContext {
             hooks: runtime::RuntimeHookConfig::default(),
             allowed_tools: None,
             client_factory: None,
+            context_sections: Vec::new(),
         }
     }
 }
@@ -3850,6 +3870,7 @@ impl std::fmt::Debug for SubagentParentContext {
             .field("hooks", &self.hooks)
             .field("allowed_tools", &self.allowed_tools)
             .field("client_factory", &self.client_factory.is_some())
+            .field("context_sections", &self.context_sections.len())
             .finish()
     }
 }
@@ -4261,6 +4282,121 @@ fn assemble_agent_runtime<C: ApiClient>(
         &subagent_feature_config(),
     )
     .with_context_manager(context_manager)
+    .with_harness_config(runtime::HarnessConfig::from_env().with_model(model))
+}
+
+/// `1` turns on the completion check's reviewer (see [`SubagentReviewer`]).
+pub const REVIEW_ENV_VAR: &str = "NEURON_REVIEW";
+/// The model the reviewer runs on; the session's model when unset.
+pub const REVIEW_MODEL_ENV_VAR: &str = "NEURON_REVIEW_MODEL";
+const REVIEW_MAX_ITERATIONS: usize = 12;
+const REVIEWER_TOOLS: &[&str] = &["read_file", "glob_search", "grep_search"];
+const REVIEWER_INSTRUCTIONS: &str = "You review a code change that another agent just made, before it reports back to the user. Report only real problems: parts of the user's request that are missing or done wrong, bugs the change introduces, changes the request did not ask for, and failing checks the change caused. Do not report style preferences or optional improvements. Read files when the diff alone does not show enough. If there is nothing to fix, reply with exactly LGTM. Otherwise reply with a numbered list, one problem per item, naming the file (and the line when you can) and what is wrong in one or two sentences.";
+
+/// The completion check's second opinion (see `runtime::ChangeReviewer`): a
+/// read-only sub-agent that reviews the turn's diff against the user's request.
+/// Off unless [`REVIEW_ENV_VAR`] is `1`; [`REVIEW_MODEL_ENV_VAR`] can put it on a
+/// different model from the session's.
+pub struct SubagentReviewer {
+    model: String,
+}
+
+impl SubagentReviewer {
+    #[must_use]
+    pub fn new(model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+        }
+    }
+
+    /// A reviewer for a session on `session_model`, when [`REVIEW_ENV_VAR`] turns
+    /// one on.
+    #[must_use]
+    pub fn from_env(session_model: &str) -> Option<Self> {
+        let enabled = std::env::var(REVIEW_ENV_VAR).is_ok_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        });
+        if !enabled {
+            return None;
+        }
+        let model = std::env::var(REVIEW_MODEL_ENV_VAR)
+            .ok()
+            .map(|model| model.trim().to_string())
+            .filter(|model| !model.is_empty())
+            .unwrap_or_else(|| session_model.to_string());
+        Some(Self::new(model))
+    }
+}
+
+impl runtime::ChangeReviewer for SubagentReviewer {
+    fn review(
+        &mut self,
+        request: &runtime::ReviewRequest,
+        cancel: &runtime::CancellationToken,
+    ) -> Result<Option<String>, String> {
+        let allowed_tools = restrict_to_parent_tools(
+            REVIEWER_TOOLS
+                .iter()
+                .map(|tool| (*tool).to_string())
+                .collect(),
+            subagent_parent_context()
+                .and_then(|context| context.allowed_tools)
+                .as_ref(),
+        );
+        let mut system_prompt = build_agent_system_prompt("Reviewer")?;
+        let prompt_model = shown_agent_model(&self.model);
+        runtime::set_prompt_model(
+            &mut system_prompt,
+            (prompt_model != "auto").then_some(prompt_model),
+        );
+        system_prompt.push(REVIEWER_INSTRUCTIONS.to_string());
+        let api_client = SubagentApiClient::new(&self.model, allowed_tools.clone())?;
+        let mut reviewer =
+            assemble_agent_runtime(api_client, &self.model, allowed_tools, system_prompt)
+                .with_max_iterations(REVIEW_MAX_ITERATIONS)
+                .with_cancellation_token(cancel.clone());
+        let summary = reviewer
+            .run_turn(review_prompt(request), None)
+            .map_err(|error| error.to_string())?;
+        review_findings(&final_assistant_text(&summary))
+    }
+}
+
+fn review_prompt(request: &runtime::ReviewRequest) -> String {
+    let checks = if request.check_results.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nProject checks run on the change:\n{}\n",
+            request.check_results
+        )
+    };
+    format!(
+        "The user asked:\n{}\n\nFiles changed: {}\n\nThe change:\n```diff\n{}\n```\n{checks}\nReview the change against the request.",
+        request.request.trim(),
+        request.edited_paths.join(", "),
+        request.diff.trim_end(),
+    )
+}
+
+/// `Ok(None)` for an approval (`LGTM`), the findings otherwise, and an error for
+/// an empty answer (a reviewer that said nothing has not approved anything).
+fn review_findings(answer: &str) -> Result<Option<String>, String> {
+    let answer = answer.trim();
+    if answer.is_empty() {
+        return Err("the reviewer gave no answer".to_string());
+    }
+    let verdict = answer
+        .trim_matches(|ch: char| !ch.is_alphanumeric())
+        .to_ascii_uppercase();
+    if verdict == "LGTM" {
+        Ok(None)
+    } else {
+        Ok(Some(answer.to_string()))
+    }
 }
 
 /// Runtime features a sub-agent inherits: the parent's tool hooks, so
@@ -4460,6 +4596,9 @@ fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String>
         "unknown",
     )
     .map_err(|error| error.to_string())?;
+    if let Some(parent) = subagent_parent_context() {
+        prompt.extend(parent.context_sections);
+    }
     prompt.push(format!(
         "You are a background sub-agent of type `{subagent_type}`. Work only on the delegated task, use only the tools available to you, do not ask the user questions, and finish with a concise result."
     ));
@@ -4723,6 +4862,31 @@ mod subagent_inheritance_tests {
     }
 
     #[test]
+    fn subagents_get_the_parents_context_sections() {
+        let _guard = parent_context_lock();
+        set_subagent_parent_context(SubagentParentContext {
+            context_sections: vec!["[CODEBASE_CONTEXT]
+  src/lib.rs
+[/CODEBASE_CONTEXT]"
+                .to_string()],
+            ..SubagentParentContext::new("openai/auto", PermissionMode::ReadOnly)
+        });
+        let prompt = super::build_agent_system_prompt("Explore").expect("prompt");
+        let map = prompt
+            .iter()
+            .position(|part| part.starts_with("[CODEBASE_CONTEXT]"))
+            .expect("the repo map is passed on");
+        let role = prompt
+            .iter()
+            .position(|part| part.starts_with("You are a background sub-agent"))
+            .expect("role");
+        assert!(
+            map < role,
+            "context comes before the sub-agent's instructions"
+        );
+    }
+
+    #[test]
     fn parent_hooks_run_for_subagent_tool_calls() {
         let _guard = parent_context_lock();
         let hooks = RuntimeHookConfig::new(vec!["exit 2".to_string()], Vec::new(), Vec::new());
@@ -4841,6 +5005,44 @@ mod subagent_inheritance_tests {
             agent_permission_policy().active_mode(),
             PermissionMode::ReadOnly
         );
+    }
+
+    #[test]
+    fn a_reviewer_approves_with_lgtm_and_otherwise_reports_findings() {
+        assert_eq!(super::review_findings("LGTM"), Ok(None));
+        assert_eq!(super::review_findings("  **LGTM.**\n"), Ok(None));
+        assert_eq!(
+            super::review_findings("1. app.py: LIMIT is 4, the request asked for 5."),
+            Ok(Some(
+                "1. app.py: LIMIT is 4, the request asked for 5.".to_string()
+            ))
+        );
+        assert!(
+            super::review_findings("  ").is_err(),
+            "silence is no approval"
+        );
+    }
+
+    #[test]
+    fn the_review_prompt_carries_the_request_diff_and_checks() {
+        let request = runtime::ReviewRequest {
+            request: "raise LIMIT to 5".to_string(),
+            edited_paths: vec!["app.py".to_string()],
+            diff: "-LIMIT = 1\n+LIMIT = 5\n".to_string(),
+            check_results: "- `python -m py_compile app.py` passed (0.1 s).".to_string(),
+        };
+        let prompt = super::review_prompt(&request);
+        assert!(prompt.starts_with("The user asked:\nraise LIMIT to 5\n\nFiles changed: app.py"));
+        assert!(
+            prompt.contains("```diff\n-LIMIT = 1\n+LIMIT = 5\n```"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("Project checks run on the change:\n- `python -m py_compile"));
+        let without_checks = super::review_prompt(&runtime::ReviewRequest {
+            check_results: String::new(),
+            ..request
+        });
+        assert!(!without_checks.contains("Project checks"));
     }
 
     #[test]
@@ -6040,9 +6242,12 @@ impl ToolExecutor for SubagentToolExecutor {
                 "tool `{tool_name}` is not enabled for this sub-agent"
             )));
         }
-        let value = serde_json::from_str(input)
-            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        execute_tool_with_enforcer_and_cancel(self.enforcer.as_ref(), tool_name, &value, cancel)
+        let parsed = runtime::tool_input::parse_tool_input(input).map_err(ToolError::new)?;
+        execute_tool_with_enforcer_and_cancel(self.enforcer.as_ref(), tool_name, &parsed.value, cancel)
+            .map(|output| match parsed.repaired {
+                Some(fixes) => format!("{output}\n\n[note: the arguments were not valid JSON; Neuron {fixes}. Send them as valid JSON next time.]"),
+                None => output,
+            })
             .map_err(ToolError::new)
     }
 }

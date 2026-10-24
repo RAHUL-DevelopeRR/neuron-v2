@@ -81,6 +81,7 @@ mod status_ui;
 mod stream_buffer;
 mod token_budget;
 mod tool_ui;
+mod trust_menu;
 mod turn_sink;
 mod vault;
 
@@ -431,8 +432,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // Workspace trust check (skip when stdin is piped so we don't consume the pipe)
             if runtime::ui_hooks::stdin_is_terminal() {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                if !crate::auth::check_trust(&cwd) {
-                    std::process::exit(1);
+                if let Some(code) = crate::auth::check_trust(&cwd).exit_code() {
+                    std::process::exit(code);
                 }
             }
             let permission_mode = crate::args::permission_mode_after_trust(permission_mode);
@@ -2936,9 +2937,12 @@ impl LiveCli {
             json!({
                 "message": final_assistant_text(&summary),
                 "model": shown_model(&self.model),
+                // The model that answered last (`auto` and failover can differ).
+                "served_model": summary.served_model,
                 "iterations": summary.iterations,
                 "outcome": repl_loop::turn_outcome_label(&summary.outcome),
                 "stop_reason": summary.stop_reason,
+                "completion_checked": summary.completion_checked,
                 "auto_compaction": summary.auto_compaction.map(|event| json!({
                     "removed_messages": event.removed_message_count,
                     "notice": format_auto_compaction_notice(event.removed_message_count),

@@ -1,6 +1,7 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the tests
-// now exercise parseArgs itself; the Freebuff variant, `login`, `--agent` and
-// `--trust-agents` they covered were removed. See ui/neuron-tui/PORTING.md.
+// now exercise parseArgs itself; the Freebuff variant, `login`, `--agent`,
+// `--trust-agents` and the agent-mode flags they covered were removed.
+// See ui/neuron-tui/PORTING.md.
 import { describe, test, expect } from 'bun:test'
 
 import { parseArgs } from '../cli-args'
@@ -43,14 +44,6 @@ describe('CLI argument parsing', () => {
       continue: true,
       continueId: 'chat-42',
     })
-  })
-
-  test('mode flags pick the initial mode, the last one winning', () => {
-    expect(parse('--lite').initialMode).toBe('LITE')
-    expect(parse('--free').initialMode).toBe('LITE')
-    expect(parse('--max').initialMode).toBe('MAX')
-    expect(parse('--plan').initialMode).toBe('PLAN')
-    expect(parse('--lite', '--plan').initialMode).toBe('PLAN')
   })
 
   test('engine flags pass through, and are absent when not given', () => {

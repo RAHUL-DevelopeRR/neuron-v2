@@ -632,6 +632,9 @@ impl AnthropicRuntimeClient {
 
             match event {
                 ApiStreamEvent::MessageStart(start) => {
+                    if !start.message.model.trim().is_empty() {
+                        events.push(AssistantEvent::ServedModel(start.message.model.clone()));
+                    }
                     for (index, block) in start.message.content.into_iter().enumerate() {
                         let mut pending_tool = None;
                         push_output_block(

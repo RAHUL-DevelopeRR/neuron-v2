@@ -468,6 +468,8 @@ fn assemble_conversation_runtime(
         ),
         runtime::context_manager::ContextPolicy::from_env(),
     );
+    let harness = runtime::HarnessConfig::from_env().with_model(model.clone());
+    let reviewer = tools::SubagentReviewer::from_env(&model);
     register_subagent_parent(
         &model,
         permission_mode,
@@ -496,7 +498,11 @@ fn assemble_conversation_runtime(
         &feature_config,
     )
     .with_context_manager(context_manager)
-    .with_max_iterations(runtime::resolve_max_iterations(max_iterations_setting));
+    .with_max_iterations(runtime::resolve_max_iterations(max_iterations_setting))
+    .with_harness_config(harness);
+    if let Some(reviewer) = reviewer {
+        runtime = runtime.with_change_reviewer(Box::new(reviewer));
+    }
     if output.is_visible() {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
@@ -536,11 +542,19 @@ fn subagent_parent_context_for(
     let factory: tools::SubagentClientFactory = Arc::new(|model: &str| {
         crate::api_client::build_provider_client(model, None).map_err(|error| error.to_string())
     });
+    // Sub-agents get the same map of the workspace as the main conversation.
+    let repo_map = crate::repo_map::RepoMap::build(&std::env::current_dir().unwrap_or_default());
+    let context_sections = if repo_map.total_files > 0 {
+        vec![repo_map.render()]
+    } else {
+        Vec::new()
+    };
     tools::SubagentParentContext {
         permission_rules: feature_config.permission_rules().clone(),
         hooks: feature_config.hooks().clone(),
         allowed_tools: allowed_tools.cloned(),
         client_factory: Some(factory),
+        context_sections,
         ..tools::SubagentParentContext::new(model, permission_mode)
     }
 }

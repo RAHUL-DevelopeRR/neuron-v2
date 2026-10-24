@@ -420,6 +420,11 @@ pub enum UiEvent {
         /// `None` when no catalog says. A UI hides its image-paste hint unless `true`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         supports_images: Option<bool>,
+        /// The model that answered the last request, when it is not `model` (`auto`
+        /// picks one per request; a failover can switch). `None` before the first
+        /// answer, from providers that do not name the model, and from older engines.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        served_model: Option<String>,
     },
     /// After a sign-in from the signed-out start: the engine is opening the session
     /// (plugins, MCP servers), which can take a while. `TurnFinished` and a `Status` with
@@ -771,6 +776,7 @@ mod tests {
                 signed_in: false,
                 sign_in_required: false,
                 account: None,
+                served_model: None,
                 ..
             }
         ));

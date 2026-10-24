@@ -380,6 +380,12 @@ export interface StatusEvent {
    * `model_images`). Hide the image-paste hint unless it is `true`.
    */
   supports_images?: boolean | null
+  /**
+   * The model that answered the last request, when it is not `model` (`auto`
+   * picks one per request; a failover can switch). Absent before the first
+   * answer, for providers that do not name it, and from older engines.
+   */
+  served_model?: string | null
 }
 
 /**

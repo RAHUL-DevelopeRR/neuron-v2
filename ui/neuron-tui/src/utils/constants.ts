@@ -1,5 +1,5 @@
-// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
-// See ui/neuron-tui/PORTING.md.
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the agent
+// modes are not offered (AGENT_MODES_AVAILABLE). See ui/neuron-tui/PORTING.md.
 import type { ToolName } from '../types/agent-run'
 
 /** The command users type to start this UI (in messages such as "run X --continue"). */
@@ -159,3 +159,12 @@ export const AGENT_MODE_TO_ID = {
 
 export type AgentMode = keyof typeof AGENT_MODE_TO_ID
 export const AGENT_MODES = Object.keys(AGENT_MODE_TO_ID) as AgentMode[]
+
+/**
+ * DEFAULT, LITE, MAX and PLAN were Codebuff agents. Neuron's engine ignores
+ * them, so offering them only changed how a turn was drawn. Until the engine
+ * has modes of its own (the permission modes and plan mode), nothing offers
+ * them: no toggle, key, /mode:* command, launch flag or saved setting, and every
+ * chat runs in DEFAULT.
+ */
+export const AGENT_MODES_AVAILABLE = false
