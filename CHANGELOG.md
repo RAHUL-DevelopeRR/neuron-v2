@@ -37,6 +37,10 @@ first.
   and press 1 when it asks, or add the folder (or one above it) to `trustedRoots` in
   `~/.neuron/settings.json`, then restart Neuron. Until then the folder's own settings,
   hooks and MCP servers are ignored.
+- In the full-screen UI, a `PATH` change from an allowed `.envrc` reaches the engine, so
+  the engine's own tool lookups (such as `node` and `npx` for MCP servers) use the
+  imported `PATH` and can find a project's tools first, as in a shell that loaded
+  direnv.
 - Hooks run with Neuron's own environment: they inherit every variable Neuron has,
   including a session token or key in `NEURON_TOKEN` and provider keys you exported.
   They also get the event as JSON on standard input and have no timeout, and Ctrl+C
@@ -56,9 +60,13 @@ first.
   build provenance. The installers and the npm and pip launchers put it beside
   `neuron` (verified, and never failing the install). `--no-tui` or `NEURON_NO_TUI=1`
   keeps the line REPL, and without the UI `neuron` runs the line REPL as before.
-- A repository's `.envrc` can't steer the UI or its engine: the direnv import drops
-  `NEURON_*` and the providers' keys and endpoints, and the engine is found on the PATH
-  from before the import.
+- The UI imports an allowed `.envrc` through direnv, minus the variables that would
+  reconfigure Neuron: `NEURON_*`, `CLAW_*` and `CLAWD_*`, the providers' keys and
+  endpoints (`OPENAI_*`, `ANTHROPIC_*` and the like), `HOME`, `USERPROFILE`,
+  `XDG_CONFIG_HOME`, `GIT_CONFIG*`, and the Node, Bun, TLS and preload settings
+  (`NODE_OPTIONS`, `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `LD_PRELOAD` and the like).
+  The UI's log names what was dropped. The engine is found on the `PATH` from before
+  the import.
 - The React/Ink prototype in `ui/react-tui` is removed.
 - `neuron --continue [CHAT]` reopens a chat in the UI (the latest one for this folder,
   or CHAT) in the chat's own folder and on its own model, also after a turn that was

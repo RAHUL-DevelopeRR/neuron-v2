@@ -137,11 +137,17 @@ done any of these:
 
 - set `NEURON_BIN` to run its own program as the engine;
 - set `NEURON_API_BASE` to send the Zero-X session to its own host;
-- set a provider key or base URL to route prompts elsewhere.
+- set a provider key or base URL to route prompts elsewhere;
+- set `CLAW_CONFIG_HOME` or `HOME` to a folder of its own, whose
+  `settings.json` the engine loads as the user's (always trusted, so with
+  hooks, MCP servers, full access and `trustedRoots`);
+- set `GIT_CONFIG_*`, `HOME` or `XDG_CONFIG_HOME` to give git a global or
+  command-scope fsmonitor that a read-only `git status` runs without asking.
 
-The list now drops `NEURON_*` (the engine's and this UI's knobs) and the
-providers' prefixes (`ANTHROPIC_`, `OPENAI_`, `AZURE_OPENAI_`, `XAI_`,
-`GROK_`, `DASHSCOPE_`, `OPENROUTER_`, `MISTRAL_`, `CLAWD_`). It still imports
+The list now drops `NEURON_*` (the engine's and this UI's knobs), `CLAW_*`,
+the providers' prefixes (`ANTHROPIC_`, `OPENAI_`, `AZURE_OPENAI_`, `XAI_`,
+`GROK_`, `DASHSCOPE_`, `OPENROUTER_`, `MISTRAL_`, `CLAWD_`), `HOME`,
+`USERPROFILE`, `XDG_CONFIG_HOME` and `GIT_CONFIG*`. It still imports
 `PATH`, so the agent's commands see the project's tools. The `neuron` binary,
 though, is looked up on the PATH from before the import
 (`engine/startup-env.ts`), so a repo can't put its own `neuron` first.
