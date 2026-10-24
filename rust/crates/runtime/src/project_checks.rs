@@ -272,7 +272,13 @@ mod tests {
             commands[0].starts_with("cargo check --quiet --message-format short --manifest-path "),
             "{commands:?}"
         );
-        assert!(commands[0].ends_with("rust/Cargo.toml"), "{commands:?}");
+        // Quoted when the temp folder's path needs it (a short name like RUNNER~1).
+        assert!(
+            commands[0]
+                .trim_end_matches('\'')
+                .ends_with("rust/Cargo.toml"),
+            "{commands:?}"
+        );
         assert!(
             commands[1].ends_with("&& bun run typecheck"),
             "typecheck preferred over lint: {commands:?}"

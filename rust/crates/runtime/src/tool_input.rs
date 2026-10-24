@@ -481,7 +481,7 @@ mod tests {
         );
         assert_eq!(suggest_tool_names("read_fiel", &tools), vec!["read_file"]);
         assert_eq!(suggest_tool_names("grep", &tools)[0], "grep_search");
-        assert!(suggest_tool_names("teleport", &tools).is_empty());
+        assert_eq!(suggest_tool_names("teleport", &tools), Vec::<String>::new());
         let message = unknown_tool_message("Read", &tools);
         assert!(
             message

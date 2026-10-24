@@ -682,7 +682,7 @@ mod tests {
             root: "/home/dev/notes".into(),
             ..TrustScreen::default()
         };
-        assert!(screen.preview_lines().is_empty());
+        assert_eq!(screen.preview_lines(), Vec::<String>::new());
         let lines = screen.lines();
         assert!(lines.contains(&format!("  {TURNS_ON_NOTHING}")));
         assert!(!lines.iter().any(|line| line.contains(TURNS_ON_HEADING)));

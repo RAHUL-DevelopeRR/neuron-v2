@@ -4537,7 +4537,7 @@ mod resilience_tests {
 
         assert!(!summary.completion_checked);
         assert_eq!(summary.iterations, 2);
-        assert!(auto_continue_notes(runtime.session()).is_empty());
+        assert_eq!(auto_continue_notes(runtime.session()), Vec::<String>::new());
     }
 
     #[test]
