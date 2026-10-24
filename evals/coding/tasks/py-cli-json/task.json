@@ -1,0 +1,9 @@
+{
+  "id": "py-cli-json",
+  "summary": "Add a flag to a small CLI from an exact output spec, without changing existing behaviour.",
+  "tags": ["python", "feature", "spec"],
+  "prompt": "Add a `--json` option to report.py. With `--json` (it may come before or after the CSV path), print one JSON object instead of the text report, with exactly these keys: \"orders\" (the number of orders), \"total\" (the sum of amounts as a number rounded to 2 decimals), \"customers\" (the sorted list of unique customer names) and \"largest_order\" (an object {\"id\": <id string>, \"amount\": <amount number>} for the order with the largest amount, or null when there are no orders). Without `--json` the output must stay exactly as it is now. Wrong usage (no path, or more than one path) must still print the usage line to stderr and exit with code 2.",
+  "allow": ["bash(python -m unittest:*)", "bash(python report.py:*)", "bash(python -m pytest:*)"],
+  "grader": {"from": "grader", "to": "_grader"},
+  "check": "python -m unittest discover -s _grader -q"
+}
