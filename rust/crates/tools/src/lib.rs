@@ -5991,6 +5991,29 @@ async fn stream_with_provider(
         }
     }
 
+    // A stream that broke off inside a tool call, or after one but before the
+    // message ended, was cut short: the response never finished, so none of its
+    // calls may run, and the stop reason the runtime's guards read may never have
+    // come. Sent again, the request may succeed (the main client retries the same).
+    let interrupted = if !pending_tools.is_empty() {
+        Some("stream ended before all tool argument blocks completed")
+    } else if !saw_stop
+        && !ended_early
+        && events
+            .iter()
+            .any(|event| matches!(event, AssistantEvent::ToolUse { .. }))
+    {
+        Some("stream ended before the tool message completed")
+    } else {
+        None
+    };
+    if let Some(detail) = interrupted {
+        return Err(Box::new(ApiError::StreamInterrupted {
+            model: message_request.model.clone(),
+            detail,
+        }));
+    }
+
     push_prompt_cache_record(client, &mut events);
 
     if !saw_stop
@@ -11279,5 +11302,173 @@ mod ask_on_terminal_tests {
             String::from_utf8(out).expect("utf-8"),
             "\n[Question] Which branch?\n  1. main\n  2. dev\nEnter choice (1-2): "
         );
+    }
+}
+
+#[cfg(test)]
+mod subagent_stream_tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    use api::{
+        AnthropicClient, ApiError, InputContentBlock, InputMessage, MessageRequest, ProviderClient,
+    };
+    use runtime::AssistantEvent;
+
+    use super::stream_with_provider;
+
+    const MESSAGE_START: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"test-model\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":8,\"output_tokens\":0}}}\n\n",
+    );
+    const TOOL_CALL_START: &str = concat!(
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"bash\",\"input\":{}}}\n\n",
+    );
+    const TOOL_CALL_INPUT: &str = concat!(
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"echo hi\\\"}\"}}\n\n",
+    );
+    const TOOL_CALL_STOP: &str = concat!(
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    );
+    const MESSAGE_END: &str = concat!(
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":12}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+
+    /// Answers one request with `body` as a whole SSE response, then closes the
+    /// connection; later connections are refused.
+    fn serve_once(body: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base_url = format!("http://{}", listener.local_addr().expect("addr"));
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("read timeout");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            while let Ok(read) = socket.read(&mut chunk) {
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                let text = String::from_utf8_lossy(&request).to_string();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let length = text[..end]
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let _ = write!(
+                socket,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.flush();
+        });
+        base_url
+    }
+
+    /// What a sub-agent's model call makes of an Anthropic stream with `body`.
+    fn sub_agent_stream(body: String) -> Result<Vec<AssistantEvent>, Box<ApiError>> {
+        let client = ProviderClient::Anthropic(
+            AnthropicClient::new("test-key")
+                .with_base_url(serve_once(body))
+                .with_retry_policy(0, Duration::from_millis(1), Duration::from_millis(1)),
+        );
+        let request = MessageRequest {
+            model: "test-model".to_string(),
+            max_tokens: 64,
+            messages: vec![InputMessage {
+                role: "user".to_string(),
+                content: vec![InputContentBlock::Text {
+                    text: "run it".to_string(),
+                }],
+            }],
+            stream: true,
+            ..Default::default()
+        };
+        tokio::runtime::Runtime::new()
+            .expect("tokio runtime")
+            .block_on(stream_with_provider(&client, &request))
+    }
+
+    #[test]
+    fn a_tool_call_of_a_stream_that_ended_without_its_stop_reason_is_not_handed_on() {
+        // A complete call, then the connection closes before message_delta: the
+        // response never finished and no stop reason came.
+        let error = sub_agent_stream(
+            [
+                MESSAGE_START,
+                TOOL_CALL_START,
+                TOOL_CALL_INPUT,
+                TOOL_CALL_STOP,
+            ]
+            .concat(),
+        )
+        .expect_err("a call of an unfinished response must not reach the runtime");
+
+        assert!(
+            matches!(*error, ApiError::StreamInterrupted { ref model, .. } if model == "test-model"),
+            "{error:?}"
+        );
+        assert!(error.is_retryable(), "{error}");
+    }
+
+    #[test]
+    fn a_stream_that_ended_inside_a_tool_call_is_not_taken_for_its_text() {
+        let text_block = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Running it.\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        );
+        let open_call = TOOL_CALL_START.replace("\"index\":0", "\"index\":2");
+        let error = sub_agent_stream([MESSAGE_START, text_block, open_call.as_str()].concat())
+            .expect_err("the text before a broken-off call is not the whole answer");
+
+        assert!(
+            matches!(*error, ApiError::StreamInterrupted { .. }),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_finished_stream_hands_its_tool_call_and_stop_reason_on() {
+        let events = sub_agent_stream(
+            [
+                MESSAGE_START,
+                TOOL_CALL_START,
+                TOOL_CALL_INPUT,
+                TOOL_CALL_STOP,
+                MESSAGE_END,
+            ]
+            .concat(),
+        )
+        .expect("a finished stream");
+
+        assert!(events.contains(&AssistantEvent::ToolUse {
+            id: "toolu_1".to_string(),
+            name: "bash".to_string(),
+            input: "{\"command\":\"echo hi\"}".to_string(),
+        }));
+        assert!(events.contains(&AssistantEvent::StopReason("tool_use".to_string())));
+        assert_eq!(events.last(), Some(&AssistantEvent::MessageStop));
     }
 }
