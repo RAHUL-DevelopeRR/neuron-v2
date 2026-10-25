@@ -1,4 +1,38 @@
+use std::time::Duration;
+
 use crate::error::ApiError;
+
+/// Longest wait for the TCP and TLS connection of a request.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Longest silence tolerated between two reads of a response: while waiting for the
+/// response headers, and between body chunks once it streams. Streams have no total
+/// deadline, so a long answer that keeps sending runs to the end.
+pub const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Total deadline of a request whose response is read in one piece (a non-streaming
+/// completion, a token count, an OAuth exchange), set on each such request.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
+
+/// The deadlines of the provider clients' HTTP traffic. Tests shorten them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpTimeouts {
+    /// See [`CONNECT_TIMEOUT`].
+    pub connect: Duration,
+    /// See [`READ_IDLE_TIMEOUT`]; the client applies it to every read.
+    pub read_idle: Duration,
+    /// See [`REQUEST_TIMEOUT`]; callers set it on each non-streaming request
+    /// (`RequestBuilder::timeout`), never on a stream.
+    pub request: Duration,
+}
+
+impl Default for HttpTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: CONNECT_TIMEOUT,
+            read_idle: READ_IDLE_TIMEOUT,
+            request: REQUEST_TIMEOUT,
+        }
+    }
+}
 
 /// `User-Agent` sent by every client built here (`neuron/<version>`).
 /// Providers that set their own identity header (the Anthropic request
@@ -63,8 +97,9 @@ impl ProxyConfig {
 }
 
 /// Build a `reqwest::Client` that honours the standard `HTTP_PROXY`,
-/// `HTTPS_PROXY`, and `NO_PROXY` environment variables. When no proxy is
-/// configured the client behaves identically to `reqwest::Client::new()`.
+/// `HTTPS_PROXY`, and `NO_PROXY` environment variables, with the default
+/// [`HttpTimeouts`]: a connect deadline and a read-idle deadline, but no total
+/// deadline (callers set [`REQUEST_TIMEOUT`] on each non-streaming request).
 pub fn build_http_client() -> Result<reqwest::Client, ApiError> {
     build_http_client_with(&ProxyConfig::from_env())
 }
@@ -76,7 +111,21 @@ pub fn build_http_client() -> Result<reqwest::Client, ApiError> {
 /// first outbound request instead of at construction time.
 #[must_use]
 pub fn build_http_client_or_default() -> reqwest::Client {
-    build_http_client().unwrap_or_else(|_| reqwest::Client::new())
+    build_http_client_with_timeouts_or_default(HttpTimeouts::default())
+}
+
+/// [`build_http_client_or_default`] with explicit `timeouts`. The fallback client
+/// keeps the connect and read-idle deadlines.
+#[must_use]
+pub fn build_http_client_with_timeouts_or_default(timeouts: HttpTimeouts) -> reqwest::Client {
+    build_http_client_with_timeouts(&ProxyConfig::from_env(), timeouts).unwrap_or_else(|_| {
+        reqwest::Client::builder()
+            .user_agent(USER_AGENT)
+            .connect_timeout(timeouts.connect)
+            .read_timeout(timeouts.read_idle)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
 }
 
 /// Build a `reqwest::Client` from an explicit [`ProxyConfig`]. Used by tests
@@ -86,11 +135,21 @@ pub fn build_http_client_or_default() -> reqwest::Client {
 /// and `https_proxy` fields and is registered as both an HTTP and HTTPS
 /// proxy so a single value can route every outbound request.
 pub fn build_http_client_with(config: &ProxyConfig) -> Result<reqwest::Client, ApiError> {
+    build_http_client_with_timeouts(config, HttpTimeouts::default())
+}
+
+/// [`build_http_client_with`] with explicit `timeouts`. The client gets the connect and
+/// read-idle deadlines only: a total deadline would cut off a long stream that is still
+/// sending, so non-streaming callers set `timeouts.request` per request.
+pub fn build_http_client_with_timeouts(
+    config: &ProxyConfig,
+    timeouts: HttpTimeouts,
+) -> Result<reqwest::Client, ApiError> {
     let mut builder = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .no_proxy()
-        .connect_timeout(std::time::Duration::from_secs(30))
-        .timeout(std::time::Duration::from_mins(5));
+        .connect_timeout(timeouts.connect)
+        .read_timeout(timeouts.read_idle);
 
     let no_proxy = config
         .no_proxy

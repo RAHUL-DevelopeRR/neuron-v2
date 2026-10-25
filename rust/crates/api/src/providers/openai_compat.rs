@@ -8,7 +8,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error::{ApiError, GatewayError, GatewayErrorCode};
-use crate::http_client::build_http_client_or_default;
+use crate::http_client::{
+    build_http_client_or_default, build_http_client_with_timeouts_or_default, HttpTimeouts,
+};
 use crate::retry::{
     retry_after_from_headers, RetryBudget, RetryNotice, RetryObserver, RetryProgress,
     CAPACITY_MAX_WAIT, CAPACITY_TOTAL_BACKOFF, MAX_TOTAL_BACKOFF,
@@ -240,6 +242,8 @@ pub fn installed_openai_compat_endpoint() -> Option<OpenAiCompatEndpoint> {
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatClient {
     http: reqwest::Client,
+    /// The deadlines `http` was built with; `request` bounds each non-streaming call.
+    timeouts: HttpTimeouts,
     api_key: String,
     config: OpenAiCompatConfig,
     base_url: String,
@@ -281,6 +285,7 @@ impl OpenAiCompatClient {
     pub fn new(api_key: impl Into<String>, config: OpenAiCompatConfig) -> Self {
         Self {
             http: build_http_client_or_default(),
+            timeouts: HttpTimeouts::default(),
             api_key: api_key.into(),
             config,
             base_url: read_base_url(config),
@@ -323,6 +328,16 @@ impl OpenAiCompatClient {
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    /// Replaces the HTTP deadlines (default [`HttpTimeouts::default`]): the
+    /// connect and read-idle deadlines of every request, and the total deadline
+    /// of a non-streaming one. A stream has no total deadline.
+    #[must_use]
+    pub fn with_http_timeouts(mut self, timeouts: HttpTimeouts) -> Self {
+        self.http = build_http_client_with_timeouts_or_default(timeouts);
+        self.timeouts = timeouts;
         self
     }
 
@@ -441,6 +456,7 @@ impl OpenAiCompatClient {
             done: false,
             state: StreamState::new(request.model.clone()),
             usage_observer: self.usage_observer.clone(),
+            idle_timeout: self.timeouts.read_idle,
         })
     }
 
@@ -512,14 +528,19 @@ impl OpenAiCompatClient {
         check_request_body_size(request, self.config())?;
 
         let request_url = chat_completions_endpoint(&self.base_url);
-        self.http
+        let mut builder = self
+            .http
             .post(&request_url)
             .header("content-type", "application/json")
             .bearer_auth(&self.api_key)
-            .json(&build_chat_completion_request(request, self.config()))
-            .send()
-            .await
-            .map_err(ApiError::from)
+            .json(&build_chat_completion_request(request, self.config()));
+        // A stream runs as long as it keeps sending (the client's read-idle
+        // deadline ends one that stalls); a response read in one piece gets a
+        // total deadline.
+        if !request.stream {
+            builder = builder.timeout(self.timeouts.request);
+        }
+        builder.send().await.map_err(ApiError::from)
     }
 
     /// The capacity budget for the Zero-X gateway's shared-pool waits
@@ -630,6 +651,8 @@ pub struct MessageStream {
     done: bool,
     state: StreamState,
     usage_observer: Option<UsageObserver>,
+    /// The client's read-idle deadline, named when a stall ends the stream.
+    idle_timeout: Duration,
 }
 
 impl MessageStream {
@@ -667,7 +690,18 @@ impl MessageStream {
                 return Ok(None);
             }
 
-            if let Some(chunk) = self.response.chunk().await? {
+            let chunk = match self.response.chunk().await {
+                Ok(chunk) => chunk,
+                Err(error) if error.is_timeout() => {
+                    return Err(ApiError::StreamIdle {
+                        provider: self.parser.provider.clone(),
+                        model: self.state.model.clone(),
+                        idle: self.idle_timeout,
+                    });
+                }
+                Err(error) => return Err(ApiError::from(error)),
+            };
+            if let Some(chunk) = chunk {
                 for parsed in self.parser.push(&chunk)? {
                     self.pending.extend(self.state.ingest_chunk(parsed)?);
                 }

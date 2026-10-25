@@ -79,6 +79,14 @@ pub enum ApiError {
         provider: String,
         model: String,
     },
+    /// The stream sent nothing (not even a keep-alive) for `idle`, so the
+    /// connection was dropped. Streams have no total deadline; this is what
+    /// ends one that stalled.
+    StreamIdle {
+        provider: String,
+        model: String,
+        idle: Duration,
+    },
 }
 
 impl ApiError {
@@ -138,6 +146,7 @@ impl ApiError {
             Self::Api { retryable, .. } => *retryable,
             Self::Gateway(error) => error.is_retryable(),
             Self::RetriesExhausted { last_error, .. } => last_error.is_retryable(),
+            Self::StreamIdle { .. } => true,
             Self::MissingCredentials { .. }
             | Self::ContextWindowExceeded { .. }
             | Self::ExpiredOAuthToken
@@ -193,7 +202,8 @@ impl ApiError {
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. }
             | Self::RequestBodySizeExceeded { .. }
-            | Self::StreamTruncated { .. } => None,
+            | Self::StreamTruncated { .. }
+            | Self::StreamIdle { .. } => None,
         }
     }
 
@@ -218,7 +228,8 @@ impl ApiError {
             Self::Http(_)
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. }
-            | Self::StreamTruncated { .. } => "provider_transport",
+            | Self::StreamTruncated { .. }
+            | Self::StreamIdle { .. } => "provider_transport",
             Self::InvalidApiKeyEnv(_) | Self::Io(_) | Self::Json { .. } => "runtime_io",
             Self::RequestBodySizeExceeded { .. } => "request_size",
         }
@@ -246,7 +257,8 @@ impl ApiError {
             | Self::BackoffOverflow { .. }
             | Self::RequestBodySizeExceeded { .. }
             | Self::Gateway(_)
-            | Self::StreamTruncated { .. } => false,
+            | Self::StreamTruncated { .. }
+            | Self::StreamIdle { .. } => false,
         }
     }
 
@@ -280,8 +292,18 @@ impl ApiError {
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. }
             | Self::RequestBodySizeExceeded { .. }
-            | Self::StreamTruncated { .. } => false,
+            | Self::StreamTruncated { .. }
+            | Self::StreamIdle { .. } => false,
         }
+    }
+}
+
+/// `120s`, or `250ms` below a second.
+fn idle_span(idle: Duration) -> String {
+    if idle < Duration::from_secs(1) {
+        format!("{}ms", idle.as_millis())
+    } else {
+        format!("{}s", idle.as_secs())
     }
 }
 
@@ -394,6 +416,15 @@ impl Display for ApiError {
             Self::StreamTruncated { provider, model } => write!(
                 f,
                 "the {provider} stream for {model} ended before the reply completed (no finish_reason and no [DONE]); the partial reply was discarded, retry the request"
+            ),
+            Self::StreamIdle {
+                provider,
+                model,
+                idle,
+            } => write!(
+                f,
+                "the {provider} stream for {model} stalled: no data for {}, so the connection was closed; retry the request",
+                idle_span(*idle)
             ),
         }
     }
