@@ -228,6 +228,14 @@ export function createTurnEventSink(
         }
         case 'notice': {
           if (state.isActive?.() === false) return
+          if (event.kind === 'refusal') {
+            // The model declined: the turn's message ends with the refusal,
+            // drawn apart from what it wrote before (RefusalBanner).
+            separateTextBlocks()
+            const refusal = event.message
+            updater.updateAiMessage((message) => ({ ...message, refusal }))
+            return
+          }
           if (event.message.startsWith(QUESTION_PREFIX)) {
             showQuestion(event.message)
             return

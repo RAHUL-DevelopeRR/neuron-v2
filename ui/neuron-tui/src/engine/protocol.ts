@@ -8,8 +8,9 @@
  *   `{"kind":"command","type":"submit",...}` or
  *   `{"kind":"permission_reply","id":1,"decision":{"kind":"allow_once"}}`.
  *
- * serde writes `Option::None` as `null` (no field is skipped), so optional
- * fields arrive as `T | null`, not as missing keys.
+ * serde writes `Option::None` as `null`, so optional fields arrive as
+ * `T | null`, not as missing keys; the few that are left out when unset are
+ * marked `?` here.
  */
 
 /** `PROTOCOL_VERSION` in protocol.rs, sent in {@link ReadyEvent}. */
@@ -235,10 +236,20 @@ export interface PermissionRequestedEvent {
   request: PermissionView
 }
 
+/** What a {@link NoticeEvent} is about. `NoticeKind` in protocol.rs. */
+export type NoticeKind = 'refusal'
+
 /** A notice (retries, warnings, interrupts). ANSI-free; may be multi-line. */
 export interface NoticeEvent {
   type: 'notice'
   message: string
+  /**
+   * Set when the notice is more than a status line; left out of plain notices
+   * (and absent from engines older than the field). `refusal`: the model
+   * declined to continue the turn's request (`message` is the one line to
+   * show, with the provider's note); it is not assistant text.
+   */
+  kind?: NoticeKind | null
 }
 
 /** The turn is over (finished, cancelled or failed). */

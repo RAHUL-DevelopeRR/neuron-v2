@@ -69,7 +69,9 @@ function turn() {
   const update = (fn: (prev: ChatMessage[]) => ChatMessage[] | null) => {
     messages = fn(messages) ?? messages
   }
-  return { sink, blocks, text, update }
+  /** The turn's AI message as the chat holds it. */
+  const message = () => messages[0]!
+  return { sink, blocks, text, update, message }
 }
 
 describe('tool results', () => {
@@ -193,6 +195,63 @@ describe('text blocks', () => {
     sink.handle({ type: 'text_delta', text: 'Hello **wor' })
     sink.handle({ type: 'text_delta', text: 'ld**\n- item' })
     expect(text()).toEqual(['Hello **world**\n- item'])
+  })
+})
+
+describe('reasoning', () => {
+  test('streams into a thinking block apart from the answer', () => {
+    const { sink, blocks } = turn()
+    sink.handle({ type: 'reasoning_started', chars: 0, redacted: false })
+    sink.handle({ type: 'reasoning_delta', text: 'The user asks for 17 * 23.' })
+    sink.handle({ type: 'reasoning_delta', text: ' That is 391.\n\n' })
+    sink.handle({ type: 'text_delta', text: '17 * 23 = ' })
+    sink.handle({ type: 'text_delta', text: '391.' })
+    sink.handle({ type: 'text_block_end' })
+
+    const [thinking, answer] = blocks()
+    expect(blocks()).toHaveLength(2)
+    expect(thinking).toMatchObject({ type: 'text', textType: 'reasoning' })
+    expect((thinking as { content: string }).content).toBe(
+      'The user asks for 17 * 23. That is 391.\n\n',
+    )
+    expect(answer).toMatchObject({ type: 'text', content: '17 * 23 = 391.' })
+    expect((answer as { textType?: string }).textType).not.toBe('reasoning')
+    // The answer's text blocks hold no reasoning.
+    const answerText = blocks()
+      .filter((block) => block.type === 'text' && block.textType !== 'reasoning')
+      .map((block) => (block as { content: string }).content)
+      .join('')
+    expect(answerText).toBe('17 * 23 = 391.')
+  })
+})
+
+describe('a refusal', () => {
+  const REFUSAL =
+    'The model declined to continue this request. Declined (safety category: cyber). Rephrase it or choose another model.'
+
+  test('ends the message apart from the text the model wrote before', () => {
+    const { sink, text, message } = turn()
+    sink.handle({ type: 'text_delta', text: 'Here is how the lock works. First,' })
+    sink.handle({ type: 'text_block_end' })
+    sink.handle({ type: 'notice', message: REFUSAL, kind: 'refusal' })
+
+    expect(text()).toEqual(['Here is how the lock works. First,'])
+    expect(message().refusal).toBe(REFUSAL)
+  })
+
+  test('before any text marks the message instead of leaving it empty', () => {
+    const { sink, blocks, message } = turn()
+    sink.handle({ type: 'notice', message: REFUSAL, kind: 'refusal' })
+
+    expect(blocks()).toEqual([])
+    expect(message().refusal).toBe(REFUSAL)
+  })
+
+  test('is only a notice of the refusal kind', () => {
+    const { sink, message } = turn()
+    sink.handle({ type: 'notice', message: REFUSAL })
+    sink.handle({ type: 'notice', message: REFUSAL, kind: null })
+    expect(message().refusal).toBeUndefined()
   })
 })
 
