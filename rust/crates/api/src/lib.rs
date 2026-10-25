@@ -20,8 +20,9 @@ pub use client::{
 pub use error::{describe_wait, ApiError, GatewayError, GatewayErrorCode, INVALID_SESSION_MESSAGE};
 pub use http_client::{
     build_http_client, build_http_client_or_default, build_http_client_with,
-    build_http_client_with_timeouts, build_http_client_with_timeouts_or_default, HttpTimeouts,
-    ProxyConfig, CONNECT_TIMEOUT, READ_IDLE_TIMEOUT, REQUEST_TIMEOUT, USER_AGENT,
+    build_http_client_with_timeouts, build_http_client_with_timeouts_or_default,
+    build_one_piece_http_client_or_default, build_one_piece_http_client_with_timeouts,
+    HttpTimeouts, ProxyConfig, CONNECT_TIMEOUT, READ_IDLE_TIMEOUT, REQUEST_TIMEOUT, USER_AGENT,
 };
 pub use prompt_cache::{
     CacheBreakEvent, PromptCache, PromptCacheConfig, PromptCachePaths, PromptCacheRecord,

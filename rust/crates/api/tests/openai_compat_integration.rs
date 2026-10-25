@@ -688,6 +688,75 @@ async fn a_non_streaming_request_keeps_its_total_deadline() {
     );
 }
 
+/// A reply read in one piece whose server sends nothing until it is complete, as the
+/// Zero-X gateway does for a non-streaming Claude completion: the headers come after
+/// the read-idle deadline but inside the total deadline.
+fn whole_reply_after(delay: Duration, body: &str) -> Vec<(Duration, String)> {
+    vec![(
+        delay,
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    )]
+}
+
+#[tokio::test]
+async fn a_non_streaming_reply_slower_than_the_idle_deadline_still_arrives() {
+    let idle = Duration::from_millis(300);
+    let server = spawn_trickling_server(
+        "",
+        whole_reply_after(idle * 3, COMPLETION_BODY),
+        false,
+        false,
+    )
+    .await;
+    let client = trickle_client(
+        server.base_url(),
+        short_timeouts(idle, Duration::from_secs(10)),
+    );
+
+    let started = Instant::now();
+    let response = client
+        .send_message(&sample_request(false))
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "a non-streaming request has its total deadline, not the idle one ({:?}): {error:?}",
+                started.elapsed()
+            )
+        });
+
+    assert_eq!(response.stop_reason.as_deref(), Some("end_turn"));
+    assert!(started.elapsed() >= idle * 3, "{:?}", started.elapsed());
+}
+
+#[tokio::test]
+async fn a_non_streaming_anthropic_reply_slower_than_the_idle_deadline_still_arrives() {
+    let idle = Duration::from_millis(300);
+    let body = "{\"id\":\"msg_whole\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\"model\":\"test-model\",\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}";
+    let server = spawn_trickling_server("", whole_reply_after(idle * 3, body), false, false).await;
+    let client = ProviderClient::Anthropic(
+        AnthropicClient::new("test-key")
+            .with_base_url(server.base_url())
+            .with_retry_policy(0, Duration::from_millis(1), Duration::from_millis(1))
+            .with_http_timeouts(short_timeouts(idle, Duration::from_secs(10))),
+    );
+    let request = MessageRequest {
+        model: "test-model".to_string(),
+        tools: None,
+        tool_choice: None,
+        ..sample_request(false)
+    };
+
+    let response = client
+        .send_message(&request)
+        .await
+        .expect("a non-streaming request has its total deadline, not the idle one");
+
+    assert_eq!(response.stop_reason.as_deref(), Some("end_turn"));
+}
+
 #[tokio::test]
 async fn a_stalled_stream_ends_at_the_idle_deadline_with_a_clear_error() {
     let pieces = vec![

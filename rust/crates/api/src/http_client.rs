@@ -4,12 +4,13 @@ use crate::error::ApiError;
 
 /// Longest wait for the TCP and TLS connection of a request.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Longest silence tolerated between two reads of a response: while waiting for the
-/// response headers, and between body chunks once it streams. Streams have no total
-/// deadline, so a long answer that keeps sending runs to the end.
+/// Longest silence tolerated between two reads of a streamed response: while waiting
+/// for the response headers, and between body chunks once it streams. Streams have no
+/// total deadline, so a long answer that keeps sending runs to the end.
 pub const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Total deadline of a request whose response is read in one piece (a non-streaming
-/// completion, a token count, an OAuth exchange), set on each such request.
+/// completion, a token count, an OAuth exchange), set on each such request. Such a
+/// response may send nothing until it is complete, so no read-idle deadline applies.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// The deadlines of the provider clients' HTTP traffic. Tests shorten them.
@@ -17,10 +18,11 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 pub struct HttpTimeouts {
     /// See [`CONNECT_TIMEOUT`].
     pub connect: Duration,
-    /// See [`READ_IDLE_TIMEOUT`]; the client applies it to every read.
+    /// See [`READ_IDLE_TIMEOUT`]; the streaming client applies it to every read.
     pub read_idle: Duration,
     /// See [`REQUEST_TIMEOUT`]; callers set it on each non-streaming request
-    /// (`RequestBuilder::timeout`), never on a stream.
+    /// (`RequestBuilder::timeout`), which they send with the one-piece client
+    /// ([`build_one_piece_http_client_with_timeouts`]), never on a stream.
     pub request: Duration,
 }
 
@@ -99,7 +101,9 @@ impl ProxyConfig {
 /// Build a `reqwest::Client` that honours the standard `HTTP_PROXY`,
 /// `HTTPS_PROXY`, and `NO_PROXY` environment variables, with the default
 /// [`HttpTimeouts`]: a connect deadline and a read-idle deadline, but no total
-/// deadline (callers set [`REQUEST_TIMEOUT`] on each non-streaming request).
+/// deadline. This is the client for streams: a request whose response is read in
+/// one piece goes through [`build_one_piece_http_client_with_timeouts`] and sets
+/// [`REQUEST_TIMEOUT`] on itself.
 pub fn build_http_client() -> Result<reqwest::Client, ApiError> {
     build_http_client_with(&ProxyConfig::from_env())
 }
@@ -118,14 +122,27 @@ pub fn build_http_client_or_default() -> reqwest::Client {
 /// keeps the connect and read-idle deadlines.
 #[must_use]
 pub fn build_http_client_with_timeouts_or_default(timeouts: HttpTimeouts) -> reqwest::Client {
-    build_http_client_with_timeouts(&ProxyConfig::from_env(), timeouts).unwrap_or_else(|_| {
-        reqwest::Client::builder()
-            .user_agent(USER_AGENT)
-            .connect_timeout(timeouts.connect)
-            .read_timeout(timeouts.read_idle)
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
-    })
+    build_http_client_with_timeouts(&ProxyConfig::from_env(), timeouts)
+        .unwrap_or_else(|_| fallback_client(timeouts.connect, Some(timeouts.read_idle)))
+}
+
+/// [`build_one_piece_http_client_with_timeouts`] from the process environment's
+/// proxy settings. The fallback client keeps the connect deadline.
+#[must_use]
+pub fn build_one_piece_http_client_or_default(timeouts: HttpTimeouts) -> reqwest::Client {
+    build_one_piece_http_client_with_timeouts(&ProxyConfig::from_env(), timeouts)
+        .unwrap_or_else(|_| fallback_client(timeouts.connect, None))
+}
+
+/// A client without proxies, for a proxy configuration that does not parse.
+fn fallback_client(connect: Duration, read_idle: Option<Duration>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .connect_timeout(connect);
+    if let Some(read_idle) = read_idle {
+        builder = builder.read_timeout(read_idle);
+    }
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
 }
 
 /// Build a `reqwest::Client` from an explicit [`ProxyConfig`]. Used by tests
@@ -138,18 +155,41 @@ pub fn build_http_client_with(config: &ProxyConfig) -> Result<reqwest::Client, A
     build_http_client_with_timeouts(config, HttpTimeouts::default())
 }
 
-/// [`build_http_client_with`] with explicit `timeouts`. The client gets the connect and
-/// read-idle deadlines only: a total deadline would cut off a long stream that is still
-/// sending, so non-streaming callers set `timeouts.request` per request.
+/// [`build_http_client_with`] with explicit `timeouts`: the client for streams. It gets
+/// the connect and read-idle deadlines only, as a total deadline would cut off a long
+/// stream that is still sending.
 pub fn build_http_client_with_timeouts(
     config: &ProxyConfig,
     timeouts: HttpTimeouts,
 ) -> Result<reqwest::Client, ApiError> {
+    build_client(config, timeouts.connect, Some(timeouts.read_idle))
+}
+
+/// The client for responses read in one piece (a non-streaming completion, a token
+/// count, an OAuth exchange): the connect deadline only, as each such request sets
+/// `timeouts.request` as its total. reqwest's read deadline also bounds the wait for
+/// the response headers, and a request cannot lift it: on the streaming client, a
+/// completion the server sends whole once it is done (as the Zero-X gateway does for
+/// a Claude model) would fail after `read_idle` although its total had not passed.
+pub fn build_one_piece_http_client_with_timeouts(
+    config: &ProxyConfig,
+    timeouts: HttpTimeouts,
+) -> Result<reqwest::Client, ApiError> {
+    build_client(config, timeouts.connect, None)
+}
+
+fn build_client(
+    config: &ProxyConfig,
+    connect: Duration,
+    read_idle: Option<Duration>,
+) -> Result<reqwest::Client, ApiError> {
     let mut builder = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .no_proxy()
-        .connect_timeout(timeouts.connect)
-        .read_timeout(timeouts.read_idle);
+        .connect_timeout(connect);
+    if let Some(read_idle) = read_idle {
+        builder = builder.read_timeout(read_idle);
+    }
 
     let no_proxy = config
         .no_proxy

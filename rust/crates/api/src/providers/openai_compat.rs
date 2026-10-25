@@ -9,7 +9,8 @@ use serde_json::{json, Value};
 
 use crate::error::{ApiError, GatewayError, GatewayErrorCode};
 use crate::http_client::{
-    build_http_client_or_default, build_http_client_with_timeouts_or_default, HttpTimeouts,
+    build_http_client_or_default, build_http_client_with_timeouts_or_default,
+    build_one_piece_http_client_or_default, HttpTimeouts,
 };
 use crate::retry::{
     retry_after_from_headers, RetryBudget, RetryNotice, RetryObserver, RetryProgress,
@@ -241,8 +242,12 @@ pub fn installed_openai_compat_endpoint() -> Option<OpenAiCompatEndpoint> {
 
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatClient {
+    /// Streams: the connect and read-idle deadlines.
     http: reqwest::Client,
-    /// The deadlines `http` was built with; `request` bounds each non-streaming call.
+    /// Responses read in one piece: the connect deadline, and `timeouts.request`
+    /// set on each request (see [`crate::build_one_piece_http_client_with_timeouts`]).
+    one_piece_http: reqwest::Client,
+    /// The deadlines both clients were built with.
     timeouts: HttpTimeouts,
     api_key: String,
     config: OpenAiCompatConfig,
@@ -285,6 +290,7 @@ impl OpenAiCompatClient {
     pub fn new(api_key: impl Into<String>, config: OpenAiCompatConfig) -> Self {
         Self {
             http: build_http_client_or_default(),
+            one_piece_http: build_one_piece_http_client_or_default(HttpTimeouts::default()),
             timeouts: HttpTimeouts::default(),
             api_key: api_key.into(),
             config,
@@ -332,11 +338,13 @@ impl OpenAiCompatClient {
     }
 
     /// Replaces the HTTP deadlines (default [`HttpTimeouts::default`]): the
-    /// connect and read-idle deadlines of every request, and the total deadline
-    /// of a non-streaming one. A stream has no total deadline.
+    /// connect deadline of every request, the read-idle deadline of a stream and
+    /// the total deadline of a non-streaming request. A stream has no total
+    /// deadline, and a non-streaming request no read-idle one.
     #[must_use]
     pub fn with_http_timeouts(mut self, timeouts: HttpTimeouts) -> Self {
         self.http = build_http_client_with_timeouts_or_default(timeouts);
+        self.one_piece_http = build_one_piece_http_client_or_default(timeouts);
         self.timeouts = timeouts;
         self
     }
@@ -528,15 +536,19 @@ impl OpenAiCompatClient {
         check_request_body_size(request, self.config())?;
 
         let request_url = chat_completions_endpoint(&self.base_url);
-        let mut builder = self
-            .http
+        // A stream runs as long as it keeps sending (the streaming client's
+        // read-idle deadline ends one that stalls); a response read in one piece
+        // gets a total deadline, on the client without a read-idle one.
+        let http = if request.stream {
+            &self.http
+        } else {
+            &self.one_piece_http
+        };
+        let mut builder = http
             .post(&request_url)
             .header("content-type", "application/json")
             .bearer_auth(&self.api_key)
             .json(&build_chat_completion_request(request, self.config()));
-        // A stream runs as long as it keeps sending (the client's read-idle
-        // deadline ends one that stalls); a response read in one piece gets a
-        // total deadline.
         if !request.stream {
             builder = builder.timeout(self.timeouts.request);
         }
