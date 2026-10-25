@@ -226,8 +226,9 @@ describe('reasoning', () => {
 })
 
 describe('a refusal', () => {
+  // The engine's refusal line for the gateway's note in the cyber category.
   const REFUSAL =
-    'The model declined to continue this request. Declined (safety category: cyber). Rephrase it or choose another model.'
+    'The model declined to continue this request (safety category: cyber). Rephrase it or choose another model.'
 
   test('ends the message apart from the text the model wrote before', () => {
     const { sink, text, message } = turn()

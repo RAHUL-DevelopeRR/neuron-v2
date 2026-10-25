@@ -1407,6 +1407,9 @@ mod stream_resilience_tests {
             include_str!("../../api/tests/fixtures/gateway_claude/error_after_content.sse");
         /// The gateway's fixed note for a Claude refusal in the cyber category.
         pub(super) const REFUSAL_NOTE: &str = "Claude declined this request (safety category: cyber). Rephrase it or choose another model.";
+        /// That note in Neuron's words, as the turn's outcome carries it.
+        pub(super) const NEUTRAL_REFUSAL_NOTE: &str =
+            "Declined (safety category: cyber). Rephrase it or choose another model.";
     }
 
     /// One answer of a [`Behavior::Scripted`] gateway.
@@ -2176,6 +2179,8 @@ mod stream_resilience_tests {
     #[test]
     fn a_gateway_refusal_mid_text_keeps_the_text_and_ends_the_turn_with_its_note() {
         static STEPS: &[Step] = &[Step::Sse(fixture::REFUSAL_MID_TEXT)];
+        // The gateway names the model; Neuron's outcome and line do not.
+        assert!(fixture::REFUSAL_MID_TEXT.contains(fixture::REFUSAL_NOTE));
         let gateway = spawn_gateway(Behavior::Scripted(STEPS));
         let mut runtime = runtime_over(
             zero_x_client_for(&gateway, fast_timeouts()),
@@ -2189,7 +2194,7 @@ mod stream_resilience_tests {
         assert_eq!(
             summary.outcome,
             runtime::TurnOutcome::Refused {
-                note: Some(fixture::REFUSAL_NOTE.to_string()),
+                note: Some(fixture::NEUTRAL_REFUSAL_NOTE.to_string()),
                 skipped_tool_calls: 0,
             }
         );
@@ -2202,7 +2207,7 @@ mod stream_resilience_tests {
         assert_eq!(
             crate::repl_loop::refusal_notice(&summary.outcome).as_deref(),
             Some(
-                "The model declined to continue this request. Claude declined this request (safety category: cyber). Rephrase it or choose another model."
+                "The model declined to continue this request (safety category: cyber). Rephrase it or choose another model."
             )
         );
     }

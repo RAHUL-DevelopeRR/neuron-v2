@@ -253,8 +253,9 @@ impl std::error::Error for UsageError {}
 /// had done by then (text, tool calls and their results, and the tokens its model calls
 /// were billed for).
 /// The `refusal` field of a `--output-format json` result: `null`, or for a turn the
-/// model declined (`outcome` `refused`) the line shown to the user, the provider's own
-/// note (`null` when it sent none) and how many tool calls of that response did not run.
+/// model declined (`outcome` `refused`) the line shown to the user, the provider's note
+/// in Neuron's words (`null` when it sent none) and how many tool calls of that
+/// response did not run.
 fn refusal_json(outcome: &runtime::TurnOutcome) -> Value {
     match (outcome, repl_loop::refusal_notice(outcome)) {
         (

@@ -531,8 +531,14 @@ const REASONING_CUT_BY_LENGTH: &str =
     include_str!("../../api/tests/fixtures/gateway_claude/reasoning_cut_by_length.sse");
 const TOOL_CALL_CUT_BY_LENGTH: &str =
     include_str!("../../api/tests/fixtures/gateway_claude/tool_call_cut_by_length.sse");
+/// The note the gateway sends with `content_filter` (it names the model)...
 const GATEWAY_REFUSAL_NOTE: &str =
     "Claude declined this request (safety category: cyber). Rephrase it or choose another model.";
+/// ...the note in Neuron's words (JSON `refusal.note`)...
+const REFUSAL_NOTE: &str =
+    "Declined (safety category: cyber). Rephrase it or choose another model.";
+/// ...and the line Neuron shows, which says "declined" once.
+const REFUSAL_LINE: &str = "The model declined to continue this request (safety category: cyber). Rephrase it or choose another model.";
 
 fn json_prompt_args(prompt: &str) -> [&str; 6] {
     [
@@ -573,11 +579,14 @@ fn a_refusal_mid_text_is_shown_after_the_text_and_reported_in_json() {
         result["message"], "Here is how the lock mechanism works. First, the pins",
         "the text before the refusal is kept"
     );
-    assert_eq!(result["refusal"]["note"], GATEWAY_REFUSAL_NOTE);
+    assert!(REFUSAL_MID_TEXT.contains(GATEWAY_REFUSAL_NOTE));
+    assert_eq!(result["refusal"]["note"], REFUSAL_NOTE);
     assert_eq!(result["refusal"]["tool_calls_not_run"], 0);
-    assert_eq!(
-        result["refusal"]["message"],
-        format!("The model declined to continue this request. {GATEWAY_REFUSAL_NOTE}")
+    assert_eq!(result["refusal"]["message"], REFUSAL_LINE);
+    assert!(
+        !stdout(&output).contains("Claude"),
+        "no provider name in Neuron's output: {}",
+        stdout(&output)
     );
     assert_eq!(gateway.count("POST", "/v1/chat/completions"), 1);
 
@@ -597,9 +606,7 @@ fn a_refusal_mid_text_is_shown_after_the_text_and_reported_in_json() {
         .find("Here is how the lock mechanism works. First, the pins")
         .unwrap_or_else(|| panic!("the partial answer is shown: {shown}"));
     let refusal_at = shown
-        .find(&format!(
-            "The model declined to continue this request. {GATEWAY_REFUSAL_NOTE}"
-        ))
+        .find(REFUSAL_LINE)
         .unwrap_or_else(|| panic!("the refusal line is shown: {shown}"));
     assert!(text_at < refusal_at, "{shown}");
 }
@@ -618,7 +625,7 @@ fn a_refusal_before_any_text_does_not_read_as_an_empty_answer() {
     let result = json_result(&output);
     assert_eq!(result["outcome"], "refused", "{result}");
     assert_eq!(result["message"], "");
-    assert_eq!(result["refusal"]["note"], GATEWAY_REFUSAL_NOTE);
+    assert_eq!(result["refusal"]["note"], REFUSAL_NOTE);
 
     // `--compact` keeps stdout for the answer and says why there is none on stderr.
     let mut command = workspace.command(&gateway);
@@ -629,9 +636,7 @@ fn a_refusal_before_any_text_does_not_read_as_an_empty_answer() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(stdout(&output).trim(), "");
     assert!(
-        stderr(&output).contains(&format!(
-            "The model declined to continue this request. {GATEWAY_REFUSAL_NOTE}"
-        )),
+        stderr(&output).contains(REFUSAL_LINE),
         "{}",
         stderr(&output)
     );

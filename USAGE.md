@@ -49,8 +49,9 @@ final answer text (never the model's reasoning), `outcome` says how the turn end
 `stop_reason` is the provider's last stop reason. When the model declines to continue
 (`outcome` `refused`, `stop_reason` `refusal`; OpenAI-compatible providers call it
 `content_filter`), `message` keeps whatever it wrote before, and `refusal` holds the
-line Neuron shows (`message`), the provider's own explanation (`note`, or `null`) and
-how many tool calls of that response were not run (`tool_calls_not_run`); otherwise
+line Neuron shows (`message`), the provider's explanation with provider and model
+names left out (`note`, or `null`) and how many tool calls of that response were not
+run (`tool_calls_not_run`); otherwise
 `refusal` is `null`. With `--compact`, standard output keeps the answer only and the
 refusal line goes to standard error. Tool calls from a refused response, or from one
 cut off at the output token limit, are never run.

@@ -679,9 +679,10 @@ fn stdio_engine_reports_a_refusal_as_a_refusal_notice() {
         .filter(|event| event["type"] == "notice" && event["kind"] == "refusal")
         .collect::<Vec<_>>();
     assert_eq!(refusals.len(), 1, "{turn:?}");
+    // The gateway's note names the model; the line the UI shows does not.
     assert_eq!(
         refusals[0]["message"],
-        "The model declined to continue this request. Claude declined this request (safety category: cyber). Rephrase it or choose another model."
+        "The model declined to continue this request (safety category: cyber). Rephrase it or choose another model."
     );
     let refusal_at = turn
         .iter()

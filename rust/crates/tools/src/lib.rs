@@ -4198,10 +4198,10 @@ fn run_agent_job(job: &AgentJob, cancel: &runtime::CancellationToken) -> Result<
         runtime::TurnOutcome::LoopDetected { tool_name, repeats } => Err(format!(
             "sub-agent stopped after repeating `{tool_name}` {repeats} times"
         )),
-        runtime::TurnOutcome::Refused { note, .. } => Err(match note {
-            Some(note) => format!("sub-agent stopped: the model declined to continue ({note})"),
-            None => "sub-agent stopped: the model declined to continue".to_string(),
-        }),
+        runtime::TurnOutcome::Refused { note, .. } => Err(format!(
+            "sub-agent stopped: {}",
+            runtime::refusal_line(note.as_deref())
+        )),
         runtime::TurnOutcome::Completed | runtime::TurnOutcome::OutputTruncated => {
             persist_agent_terminal_state(
                 &job.manifest,

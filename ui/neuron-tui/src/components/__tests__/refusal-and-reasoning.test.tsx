@@ -20,8 +20,9 @@ beforeAll(() => {
   initializeThemeStore()
 })
 
+// The engine's refusal line for the gateway's note in the cyber category.
 const REFUSAL =
-  'The model declined to continue this request. Declined (safety category: cyber). Rephrase it or choose another model.'
+  'The model declined to continue this request (safety category: cyber). Rephrase it or choose another model.'
 
 /** The AI message a turn's engine events leave in the chat, as use-send-message wires it. */
 function messageAfter(events: UiEvent[]): ChatMessage {
@@ -126,7 +127,7 @@ describe('RefusalBanner', () => {
   test('names the refusal and shows the line', () => {
     const markup = renderToStaticMarkup(<RefusalBanner message={REFUSAL} />)
     expect(markup).toContain('Declined')
-    expect(markup).toContain('The model declined to continue this request.')
+    expect(markup).toContain('The model declined to continue this request')
     expect(markup).toContain('safety category: cyber')
   })
 
@@ -173,7 +174,7 @@ describe('a refused turn as the chat draws it', () => {
     expect(message.blocks ?? []).toEqual([])
     const shown = await frame(message)
     expect(shown).toContain('Declined')
-    expect(shown).toContain('The model declined to continue this request.')
+    expect(shown).toContain('The model declined to continue this request')
   })
 })
 

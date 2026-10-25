@@ -17,6 +17,7 @@ use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRun
 use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
+use crate::refusal::neutral_refusal_note;
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 use crate::transcript::{normalize_messages, normalized_messages};
 use crate::usage::{TokenUsage, UsageTracker};
@@ -307,7 +308,8 @@ pub enum TurnOutcome {
     /// The model declined to continue (stop reason [`REFUSAL_STOP_REASON`];
     /// `content_filter` on OpenAI-compatible providers). What it wrote before
     /// stays in the transcript, and none of the `skipped_tool_calls` calls of
-    /// that response ran. `note` is the provider's explanation, when it sent one.
+    /// that response ran. `note` is the provider's explanation, when it sent one,
+    /// in Neuron's words ([`crate::neutral_refusal_note`]).
     Refused {
         note: Option<String>,
         skipped_tool_calls: usize,
@@ -1834,8 +1836,9 @@ fn build_assistant_message(
         message: ConversationMessage::assistant_with_usage(blocks, usage),
         prompt_cache_events,
         stop_reason,
+        // In Neuron's words: the note reaches the user and the JSON output.
         refusal: refusal
-            .map(|note| note.trim().to_string())
+            .map(|note| neutral_refusal_note(note.trim()))
             .filter(|note| !note.is_empty()),
     })
 }
@@ -4367,6 +4370,32 @@ mod resilience_tests {
         assert_eq!(
             replies,
             ["(no answer: this request failed: the model declined to continue this request)"]
+        );
+    }
+
+    #[test]
+    fn a_refusal_note_reaches_the_outcome_without_provider_names() {
+        // The Zero-X gateway's note for a Claude refusal, in two pieces.
+        let api = ScriptedApi::new(vec![Ok(vec![
+            AssistantEvent::StopReason(REFUSAL_STOP_REASON.to_string()),
+            AssistantEvent::Refusal(
+                "Claude declined this request (safety category: cyber). ".to_string(),
+            ),
+            AssistantEvent::Refusal("Rephrase it or choose another model.".to_string()),
+            AssistantEvent::MessageStop,
+        ])]);
+        let mut runtime = runtime_with(Session::new(), api, StaticToolExecutor::new());
+
+        let summary = runtime
+            .run_turn("do it", None)
+            .expect("a refusal is no error");
+
+        assert_eq!(
+            summary.outcome,
+            TurnOutcome::Refused {
+                note: Some(REFUSAL_NOTE.to_string()),
+                skipped_tool_calls: 0,
+            }
         );
     }
 

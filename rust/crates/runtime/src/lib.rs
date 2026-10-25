@@ -44,6 +44,7 @@ pub mod plugin_lifecycle;
 mod policy_engine;
 mod prompt;
 pub mod recovery_recipes;
+mod refusal;
 mod remote;
 pub mod sandbox;
 pub mod sensitive_paths;
@@ -168,6 +169,7 @@ pub use recovery_recipes::{
     attempt_recovery, recipe_for, EscalationPolicy, FailureScenario, RecoveryContext,
     RecoveryEvent, RecoveryRecipe, RecoveryResult, RecoveryStep,
 };
+pub use refusal::{neutral_refusal_note, refusal_line, REFUSAL_LINE};
 pub use remote::{
     inherited_upstream_proxy_env, no_proxy_list, read_token, upstream_proxy_ws_url,
     RemoteSessionContext, UpstreamProxyBootstrap, UpstreamProxyState, DEFAULT_REMOTE_BASE_URL,

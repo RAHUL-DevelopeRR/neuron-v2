@@ -225,8 +225,6 @@ pub(crate) fn turn_outcome_label(outcome: &TurnOutcome) -> &'static str {
     }
 }
 
-/// How a refused turn's line starts.
-pub(crate) const REFUSAL_LINE: &str = "The model declined to continue this request.";
 /// The longest provider note a refusal line repeats.
 const REFUSAL_NOTE_MAX_CHARS: usize = 500;
 
@@ -256,8 +254,9 @@ pub(crate) fn refusal_note_text(note: &str) -> String {
     short
 }
 
-/// The one line a refused turn ends with: [`REFUSAL_LINE`], the provider's note
-/// when it sent one, and the tool calls that did not run. `None` for other outcomes.
+/// The one line a refused turn ends with: [`runtime::refusal_line`] (which says
+/// once that the model declined, with the provider's note when it sent one), and
+/// the tool calls that did not run. `None` for other outcomes.
 pub(crate) fn refusal_notice(outcome: &TurnOutcome) -> Option<String> {
     let TurnOutcome::Refused {
         note,
@@ -266,15 +265,8 @@ pub(crate) fn refusal_notice(outcome: &TurnOutcome) -> Option<String> {
     else {
         return None;
     };
-    let mut line = REFUSAL_LINE.to_string();
-    if let Some(note) = note
-        .as_deref()
-        .map(refusal_note_text)
-        .filter(|note| !note.is_empty())
-    {
-        line.push(' ');
-        line.push_str(&note);
-    }
+    let note = note.as_deref().map(refusal_note_text);
+    let mut line = runtime::refusal_line(note.as_deref());
     if *skipped_tool_calls > 0 {
         line.push_str(&format!(
             " {skipped_tool_calls} tool call(s) from that response were not run."
@@ -975,6 +967,20 @@ mod tests {
             "The model declined to continue this request. Rephrase it or choose another model.[2J 2 tool call(s) from that response were not run."
         );
         assert!(!line.contains('\x1b') && !line.contains('\n'), "{line:?}");
+        // The gateway's note, as the runtime words it, says "declined" only once.
+        assert_eq!(
+            refusal_notice(
+                &refused(
+                    Some("Declined (safety category: cyber). Rephrase it or choose another model."),
+                    0
+                )
+                .outcome
+            )
+            .as_deref(),
+            Some(
+                "The model declined to continue this request (safety category: cyber). Rephrase it or choose another model."
+            )
+        );
         // The full-screen UI gets the refusal as a notice of its own kind.
         assert_eq!(
             describe_turn_outcome_without_refusal(&refused(Some("note"), 0), QuitHint::Hidden),
