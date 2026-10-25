@@ -426,6 +426,18 @@ fn answer(stream: TcpStream, seen: &Mutex<Vec<String>>, page: &str) {
         if signed { " (signed)" } else { "" }
     ));
 
+    // A model call: the Claude adapter's recorded stream of a refusal mid-answer.
+    if (method.as_str(), path.as_str()) == ("POST", "/v1/chat/completions") && signed {
+        let body = include_str!("../../api/tests/fixtures/gateway_claude/refusal_mid_text.sse");
+        let mut stream = stream;
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        return;
+    }
+
     let (status, reply) = match (method.as_str(), path.as_str()) {
         ("POST", "/auth/device/code") => (
             200,
@@ -626,6 +638,80 @@ fn stdio_engine_signs_in_from_the_ui() {
             "{expected}: {requests:?}"
         );
     }
+    let _ = fs::remove_dir_all(&workspace);
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// A refusal reaches the UI as a notice of the `refusal` kind after the text streamed
+/// before it, not as assistant text and not as an error: the turn finishes normally.
+#[test]
+fn stdio_engine_reports_a_refusal_as_a_refusal_notice() {
+    let gateway = FakeGateway::start();
+    let (workspace, home) = workspace_and_home("refusal");
+    let mut engine = StdioEngine::start(
+        &workspace,
+        &home,
+        &[
+            ("NEURON_API_BASE", &gateway.base),
+            ("NEURON_TOKEN", SESSION),
+        ],
+        &[],
+        Some(SESSION),
+    );
+    assert_eq!(engine.next()["type"], "ready");
+    let status = engine.next_of("status");
+    assert_eq!(status["signed_in"], true, "{status}");
+
+    engine.send(&submit("how do I pick this lock?"));
+    let turn = engine.until("turn_finished");
+
+    let text = turn
+        .iter()
+        .filter(|event| event["type"] == "text_delta")
+        .filter_map(|event| event["text"].as_str())
+        .collect::<String>();
+    assert_eq!(
+        text,
+        "Here is how the lock mechanism works. First, the pins"
+    );
+    let refusals = turn
+        .iter()
+        .filter(|event| event["type"] == "notice" && event["kind"] == "refusal")
+        .collect::<Vec<_>>();
+    assert_eq!(refusals.len(), 1, "{turn:?}");
+    assert_eq!(
+        refusals[0]["message"],
+        "The model declined to continue this request. Claude declined this request (safety category: cyber). Rephrase it or choose another model."
+    );
+    let refusal_at = turn
+        .iter()
+        .position(|event| event["kind"] == "refusal")
+        .expect("refusal");
+    let last_text_at = turn
+        .iter()
+        .rposition(|event| event["type"] == "text_delta")
+        .expect("text");
+    assert!(
+        last_text_at < refusal_at,
+        "the notice comes after the text: {turn:?}"
+    );
+    assert!(
+        turn.iter().all(|event| event["type"] != "error"),
+        "a refusal is not a failure: {turn:?}"
+    );
+    // Plain notices keep their old shape: no `kind` field.
+    assert!(
+        turn.iter()
+            .filter(|event| event["type"] == "notice" && event["kind"] != "refusal")
+            .all(|event| event.get("kind").is_none()),
+        "{turn:?}"
+    );
+    assert!(gateway
+        .requests()
+        .iter()
+        .any(|request| request == "POST /v1/chat/completions (signed)"));
+
+    engine.end_input();
     let _ = fs::remove_dir_all(&workspace);
     let _ = fs::remove_dir_all(&home);
 }

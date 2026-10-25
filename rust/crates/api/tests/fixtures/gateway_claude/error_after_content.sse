@@ -1,0 +1,6 @@
+data: {"id":"chatcmpl-5f0c8a52-3d1e-4b7a-9c61-2e8f4d9a7b10","object":"chat.completion.chunk","created":1761350400,"model":"claude-opus-5-5","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-5f0c8a52-3d1e-4b7a-9c61-2e8f4d9a7b10","object":"chat.completion.chunk","created":1761350400,"model":"claude-opus-5-5","choices":[{"index":0,"delta":{"content":"Partial answer before the upstream failed"},"finish_reason":null}]}
+
+data: {"error":{"message":"Generation interrupted. Retry your request.","type":"server_error","code":"upstream_error","param":null,"request_id":"req_0f1e2d3c4b5a69788796a5b4c3d2e1f0"}}
+

@@ -252,6 +252,26 @@ impl std::error::Error for UsageError {}
 /// The `--output-format json` answer of a turn that failed: the error, and what the turn
 /// had done by then (text, tool calls and their results, and the tokens its model calls
 /// were billed for).
+/// The `refusal` field of a `--output-format json` result: `null`, or for a turn the
+/// model declined (`outcome` `refused`) the line shown to the user, the provider's own
+/// note (`null` when it sent none) and how many tool calls of that response did not run.
+fn refusal_json(outcome: &runtime::TurnOutcome) -> Value {
+    match (outcome, repl_loop::refusal_notice(outcome)) {
+        (
+            runtime::TurnOutcome::Refused {
+                note,
+                skipped_tool_calls,
+            },
+            Some(message),
+        ) => json!({
+            "message": message,
+            "note": note,
+            "tool_calls_not_run": skipped_tool_calls,
+        }),
+        _ => Value::Null,
+    }
+}
+
 fn failed_turn_json(error: &str, model: &str, messages: &[ConversationMessage]) -> Value {
     let blocks = || messages.iter().flat_map(|message| message.blocks.iter());
     let text = messages
@@ -2823,6 +2843,10 @@ impl LiveCli {
                     runtime::TurnOutcome::LoopDetected { .. } => {
                         spinner.fail("Stopped", theme, &mut stdout)?;
                     }
+                    // Not a reply: the line below says why.
+                    runtime::TurnOutcome::Refused { .. } => {
+                        spinner.fail("Declined", theme, &mut stdout)?;
+                    }
                     runtime::TurnOutcome::Completed | runtime::TurnOutcome::OutputTruncated => {
                         spinner.finish("Done", theme, &mut stdout)?;
                     }
@@ -2898,6 +2922,11 @@ impl LiveCli {
         let summary = self.run_one_shot_turn(input)?;
         let final_text = final_assistant_text(&summary);
         println!("{final_text}");
+        // Stdout keeps the answer only (what the model wrote before it declined);
+        // the refusal is said on stderr, so an empty answer is not taken for one.
+        if let Some(refusal) = repl_loop::refusal_notice(&summary.outcome) {
+            eprintln!("{refusal}");
+        }
         Ok(())
     }
 
@@ -2934,6 +2963,7 @@ impl LiveCli {
                 "iterations": summary.iterations,
                 "outcome": repl_loop::turn_outcome_label(&summary.outcome),
                 "stop_reason": summary.stop_reason,
+                "refusal": refusal_json(&summary.outcome),
                 "auto_compaction": summary.auto_compaction.map(|event| json!({
                     "removed_messages": event.removed_message_count,
                     "notice": format_auto_compaction_notice(event.removed_message_count),
@@ -8101,6 +8131,7 @@ UU conflicted.rs",
                     cache_read_input_tokens: 0,
                 },
                 request_id: None,
+                refusal: None,
             },
             &mut crate::turn_sink::AnsiSink::new(&mut out),
         )
@@ -8136,6 +8167,7 @@ UU conflicted.rs",
                     cache_read_input_tokens: 0,
                 },
                 request_id: None,
+                refusal: None,
             },
             &mut crate::turn_sink::AnsiSink::new(&mut out),
         )
@@ -8175,6 +8207,7 @@ UU conflicted.rs",
                     cache_read_input_tokens: 0,
                 },
                 request_id: None,
+                refusal: None,
             },
             &mut crate::turn_sink::AnsiSink::new(&mut out),
         )

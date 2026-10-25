@@ -133,6 +133,10 @@ pub struct MessageResponse {
     pub usage: Usage,
     #[serde(default)]
     pub request_id: Option<String>,
+    /// Why the model declined, when the provider said (`stop_reason` is then
+    /// `refusal`): the OpenAI-compatible `message.refusal`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
 }
 
 impl MessageResponse {
@@ -221,6 +225,10 @@ pub struct MessageDelta {
     pub stop_reason: Option<String>,
     #[serde(default)]
     pub stop_sequence: Option<String>,
+    /// Why the model declined, when the provider said (`stop_reason` is then
+    /// `refusal`): the OpenAI-compatible `delta.refusal` pieces, joined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -299,6 +307,7 @@ mod tests {
                 output_tokens: 500_000,
             },
             request_id: None,
+            refusal: None,
         };
 
         let cost = response

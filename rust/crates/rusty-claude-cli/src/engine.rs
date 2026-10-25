@@ -34,8 +34,8 @@
 use super::*;
 use crate::device_login::{DeviceCode, DeviceLoginObserver};
 use neuron_tui::protocol::{
-    AccountInfo, Attachment, EngineCommand, GitStatus, ModelInfo, PermissionReply, TokenCounts,
-    UiEvent, PROTOCOL_VERSION,
+    AccountInfo, Attachment, EngineCommand, GitStatus, ModelInfo, NoticeKind, PermissionReply,
+    TokenCounts, UiEvent, PROTOCOL_VERSION,
 };
 use repl_loop::InterruptPresses;
 use runtime::ui_hooks::{self, UserQuestion};
@@ -285,7 +285,10 @@ impl SignedOut<'_> {
             version: VERSION.to_string(),
         });
         if let Some(reason) = plain_notice(reason) {
-            self.send(UiEvent::Notice { message: reason });
+            self.send(UiEvent::Notice {
+                message: reason,
+                kind: None,
+            });
         }
         self.send_status();
     }
@@ -742,7 +745,10 @@ impl UiHooks {
         let notices = Sender::clone(events);
         ui_hooks::set_notice_handler(move |message| {
             if let Some(message) = plain_notice(message) {
-                let _ = notices.send(UiEvent::Notice { message });
+                let _ = notices.send(UiEvent::Notice {
+                    message,
+                    kind: None,
+                });
             }
         });
         let questions = Sender::clone(events);
@@ -789,6 +795,7 @@ fn ask_the_ui(
 
     let asked = events.send(UiEvent::Notice {
         message: question_notice(question),
+        kind: None,
     });
     if asked.is_err() {
         withdraw();
@@ -1085,7 +1092,15 @@ impl Engine {
         if let Some(event) = &summary.auto_compaction {
             self.notice(&format_auto_compaction_notice(event.removed_message_count));
         }
-        if let Some(notice) = repl_loop::describe_turn_outcome(summary, repl_loop::QuitHint::Hidden)
+        // A refusal is drawn apart from status lines: it is not assistant text.
+        if let Some(refusal) = repl_loop::refusal_notice(&summary.outcome) {
+            self.send(UiEvent::Notice {
+                message: refusal,
+                kind: Some(NoticeKind::Refusal),
+            });
+        }
+        if let Some(notice) =
+            repl_loop::describe_turn_outcome_without_refusal(summary, repl_loop::QuitHint::Hidden)
         {
             self.notice(&notice);
         }
@@ -1474,7 +1489,10 @@ impl Engine {
 
     fn notice(&mut self, message: &str) {
         if let Some(message) = plain_notice(message) {
-            self.send(UiEvent::Notice { message });
+            self.send(UiEvent::Notice {
+                message,
+                kind: None,
+            });
         }
     }
 }
@@ -1580,7 +1598,7 @@ mod tests {
     fn expect_notice(events: &Receiver<UiEvent>, needle: &str) -> String {
         loop {
             match next_event(events) {
-                UiEvent::Notice { message } if message.contains(needle) => return message,
+                UiEvent::Notice { message, .. } if message.contains(needle) => return message,
                 UiEvent::Notice { .. } | UiEvent::Status { .. } => {}
                 other => panic!("expected a notice with {needle:?}, got {other:?}"),
             }
@@ -1601,7 +1619,7 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                UiEvent::Notice { message } => Some(message.as_str()),
+                UiEvent::Notice { message, .. } => Some(message.as_str()),
                 _ => None,
             })
             .collect()

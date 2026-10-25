@@ -66,6 +66,16 @@ impl Reply {
         }
     }
 
+    /// A recorded SSE body, sent as it is.
+    fn sse_body(body: &str) -> Self {
+        Self {
+            status: "200 OK",
+            content_type: "text/event-stream",
+            headers: Vec::new(),
+            body: body.to_string(),
+        }
+    }
+
     fn with_header(mut self, name: &'static str, value: &str) -> Self {
         self.headers.push((name, value.to_string()));
         self
@@ -507,6 +517,198 @@ fn gateway_default_model_preserves_parallel_tool_calls_and_file_results() {
             "credential leaked into hook environment: {line}"
         );
     }
+}
+
+// ── The Claude adapter's streams (recorded in api/tests/fixtures) ─────────────
+
+const REFUSAL_MID_TEXT: &str =
+    include_str!("../../api/tests/fixtures/gateway_claude/refusal_mid_text.sse");
+const REFUSAL_BEFORE_TEXT: &str =
+    include_str!("../../api/tests/fixtures/gateway_claude/refusal_before_text.sse");
+const REASONING_THEN_TEXT: &str =
+    include_str!("../../api/tests/fixtures/gateway_claude/reasoning_then_text.sse");
+const TOOL_CALL_CUT_BY_LENGTH: &str =
+    include_str!("../../api/tests/fixtures/gateway_claude/tool_call_cut_by_length.sse");
+const GATEWAY_REFUSAL_NOTE: &str =
+    "Claude declined this request (safety category: cyber). Rephrase it or choose another model.";
+
+fn json_prompt_args(prompt: &str) -> [&str; 6] {
+    [
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "read-only",
+        "prompt",
+        prompt,
+    ]
+}
+
+fn json_result(output: &Output) -> serde_json::Value {
+    serde_json::from_str(stdout(output).trim()).unwrap_or_else(|error| {
+        panic!(
+            "one JSON result on stdout ({error}): {}; stderr: {}",
+            stdout(output),
+            stderr(output)
+        )
+    })
+}
+
+#[test]
+fn a_refusal_mid_text_is_shown_after_the_text_and_reported_in_json() {
+    let gateway = gateway_with_chat(|_, _| Reply::sse_body(REFUSAL_MID_TEXT));
+    let workspace = Workspace::new("refusal-json");
+    let mut command = workspace.command(&gateway);
+    command
+        .env("NEURON_TOKEN", SESSION_TOKEN)
+        .args(json_prompt_args("explain the lock"));
+    let output = run(command, None);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let result = json_result(&output);
+    assert_eq!(result["outcome"], "refused", "{result}");
+    assert_eq!(result["stop_reason"], "refusal");
+    assert_eq!(
+        result["message"], "Here is how the lock mechanism works. First, the pins",
+        "the text before the refusal is kept"
+    );
+    assert_eq!(result["refusal"]["note"], GATEWAY_REFUSAL_NOTE);
+    assert_eq!(result["refusal"]["tool_calls_not_run"], 0);
+    assert_eq!(
+        result["refusal"]["message"],
+        format!("The model declined to continue this request. {GATEWAY_REFUSAL_NOTE}")
+    );
+    assert_eq!(gateway.count("POST", "/v1/chat/completions"), 1);
+
+    // The text output, as the line REPL prints a turn: the partial answer, then the
+    // refusal line after it.
+    let mut command = workspace.command(&gateway);
+    command.env("NEURON_TOKEN", SESSION_TOKEN).args([
+        "--permission-mode",
+        "read-only",
+        "prompt",
+        "explain the lock",
+    ]);
+    let output = run(command, None);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let shown = stdout(&output);
+    let text_at = shown
+        .find("Here is how the lock mechanism works. First, the pins")
+        .unwrap_or_else(|| panic!("the partial answer is shown: {shown}"));
+    let refusal_at = shown
+        .find(&format!(
+            "The model declined to continue this request. {GATEWAY_REFUSAL_NOTE}"
+        ))
+        .unwrap_or_else(|| panic!("the refusal line is shown: {shown}"));
+    assert!(text_at < refusal_at, "{shown}");
+}
+
+#[test]
+fn a_refusal_before_any_text_does_not_read_as_an_empty_answer() {
+    let gateway = gateway_with_chat(|_, _| Reply::sse_body(REFUSAL_BEFORE_TEXT));
+    let workspace = Workspace::new("refusal-empty");
+
+    let mut command = workspace.command(&gateway);
+    command
+        .env("NEURON_TOKEN", SESSION_TOKEN)
+        .args(json_prompt_args("do it"));
+    let output = run(command, None);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let result = json_result(&output);
+    assert_eq!(result["outcome"], "refused", "{result}");
+    assert_eq!(result["message"], "");
+    assert_eq!(result["refusal"]["note"], GATEWAY_REFUSAL_NOTE);
+
+    // `--compact` keeps stdout for the answer and says why there is none on stderr.
+    let mut command = workspace.command(&gateway);
+    command
+        .env("NEURON_TOKEN", SESSION_TOKEN)
+        .args(prompt_args("do it"));
+    let output = run(command, None);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), "");
+    assert!(
+        stderr(&output).contains(&format!(
+            "The model declined to continue this request. {GATEWAY_REFUSAL_NOTE}"
+        )),
+        "{}",
+        stderr(&output)
+    );
+    // No retry and no non-streaming fallback: a refusal is an answer.
+    assert_eq!(gateway.count("POST", "/v1/chat/completions"), 2);
+}
+
+#[test]
+fn reasoning_never_reaches_the_answer_in_headless_output() {
+    let gateway = gateway_with_chat(|_, _| Reply::sse_body(REASONING_THEN_TEXT));
+    let workspace = Workspace::new("reasoning");
+
+    let mut command = workspace.command(&gateway);
+    command
+        .env("NEURON_TOKEN", SESSION_TOKEN)
+        .args(prompt_args("what is 17 * 23?"));
+    let output = run(command, None);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), "17 * 23 = 391.");
+
+    let mut command = workspace.command(&gateway);
+    command
+        .env("NEURON_TOKEN", SESSION_TOKEN)
+        .args(json_prompt_args("what is 17 * 23?"));
+    let output = run(command, None);
+    let result = json_result(&output);
+    assert_eq!(result["message"], "17 * 23 = 391.");
+    assert_eq!(result["outcome"], "completed");
+    assert_eq!(result["refusal"], serde_json::Value::Null);
+}
+
+#[test]
+fn a_tool_call_cut_by_length_is_reported_not_run() {
+    let gateway = gateway_with_chat(|request, index| {
+        if index == 0 {
+            Reply::sse_body(TOOL_CALL_CUT_BY_LENGTH)
+        } else {
+            let messages = request.json()["messages"].clone();
+            let result = messages
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|message| message["role"] == "tool")
+                .cloned()
+                .expect("the cut-off call's result goes back to the model");
+            assert_eq!(result["tool_call_id"], "toolu_01W");
+            assert!(
+                result["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("NOT executed"),
+                "{result}"
+            );
+            text_reply("I will write it in smaller steps.")
+        }
+    });
+    let workspace = Workspace::new("cut-by-length");
+    let mut command = workspace.command(&gateway);
+    command.env("NEURON_TOKEN", SESSION_TOKEN).args([
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "danger-full-access",
+        "prompt",
+        "write big.txt",
+    ]);
+    let output = run(command, None);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        !workspace.root.join("big.txt").exists(),
+        "a call cut off by the output limit never runs"
+    );
+    let result = json_result(&output);
+    assert_eq!(result["message"], "I will write it in smaller steps.");
+    let tool_results = result["tool_results"].as_array().expect("tool results");
+    assert_eq!(tool_results.len(), 1, "{result}");
+    assert_eq!(tool_results[0]["is_error"], true, "{result}");
+    assert_eq!(gateway.count("POST", "/v1/chat/completions"), 2);
 }
 
 #[test]

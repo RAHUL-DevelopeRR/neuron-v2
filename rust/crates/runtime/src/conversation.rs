@@ -61,7 +61,24 @@ const FAILED_RESPONSE_NOTE_MAX_CHARS: usize = 300;
 const LOOP_GUARD_THRESHOLD: usize = 3;
 const MIN_MANUAL_SUMMARY_TOKENS: usize = 800;
 const TRUNCATED_STOP_REASONS: &[&str] = &["max_tokens", "length", "model_context_window_exceeded"];
+/// Stop reason of a response the model declined to continue: Anthropic's own
+/// `refusal`, and what the OpenAI-compatible `content_filter` finish reason is
+/// normalized to.
+pub const REFUSAL_STOP_REASON: &str = "refusal";
+const REFUSAL_STOP_REASONS: &[&str] = &[REFUSAL_STOP_REASON, "content_filter"];
 const TRUNCATED_TOOL_CALL_MESSAGE: &str = "This tool call was NOT executed: your response hit the output token limit (max_tokens) while writing it, so its arguments are incomplete JSON. Split the work into smaller steps — for example write or edit the file in several smaller edit_file calls instead of one large write — and try again.";
+/// The result of a call whose arguments did arrive complete, in a response the
+/// output limit cut off: no call of a cut-off response runs.
+const TRUNCATED_COMPLETE_TOOL_CALL_MESSAGE: &str = "This tool call was NOT executed: your response hit the output token limit (max_tokens), and no tool call of a response that was cut off is run. If it is still needed, make the call again in a shorter response.";
+/// The result of every call in a response the model declined to continue.
+const REFUSED_TOOL_CALL_MESSAGE: &str = "Not executed: the model declined to continue this response (the provider ended it with a refusal), so none of its tool calls were run.";
+/// Starts the result of a call whose arguments are not a JSON object (cut off or
+/// garbled while streaming); what is wrong with them follows.
+const INVALID_TOOL_ARGUMENTS_PREFIX: &str =
+    "This tool call was NOT executed: its arguments are not a valid JSON object";
+/// What the note that closes a refused turn says, in place of an error (see
+/// [`FAILED_RESPONSE_NOTE_PREFIX`]).
+const REFUSAL_TURN_NOTE: &str = "the model declined to continue this request";
 const AUTO_CONTINUE_MESSAGE: &str = "Your previous response was cut off because it reached the maximum output length. Continue exactly where you stopped, without repeating what you already wrote.";
 const LOOP_STOPPED_REMAINING_MESSAGE: &str =
     "Not executed: the turn was stopped by the repeated-tool-call guard.";
@@ -84,8 +101,12 @@ pub enum AssistantEvent {
     },
     Usage(TokenUsage),
     PromptCache(PromptCacheEvent),
-    /// Provider stop reason (`end_turn`, `tool_use`, `max_tokens`, `length`, ...).
+    /// Provider stop reason (`end_turn`, `tool_use`, `max_tokens`, `length`,
+    /// [`REFUSAL_STOP_REASON`], ...).
     StopReason(String),
+    /// Why the model declined, as the provider explained it, with the
+    /// [`REFUSAL_STOP_REASON`] stop reason.
+    Refusal(String),
     MessageStop,
 }
 
@@ -259,6 +280,14 @@ pub enum TurnOutcome {
     /// The response hit the output limit again after one automatic
     /// continuation.
     OutputTruncated,
+    /// The model declined to continue (stop reason [`REFUSAL_STOP_REASON`];
+    /// `content_filter` on OpenAI-compatible providers). What it wrote before
+    /// stays in the transcript, and none of the `skipped_tool_calls` calls of
+    /// that response ran. `note` is the provider's explanation, when it sent one.
+    Refused {
+        note: Option<String>,
+        skipped_tool_calls: usize,
+    },
 }
 
 /// Summary of one completed runtime turn, including tool results and usage.
@@ -682,6 +711,8 @@ where
                 .extend(built.prompt_cache_events);
             progress.stop_reason.clone_from(&built.stop_reason);
             let truncated = is_truncation_stop_reason(built.stop_reason.as_deref());
+            let refused = is_refusal_stop_reason(built.stop_reason.as_deref());
+            let refusal_note = built.refusal;
             let assistant_message = built.message;
             let pending_tool_uses = assistant_message
                 .blocks
@@ -698,6 +729,15 @@ where
                 &assistant_message,
                 pending_tool_uses.len(),
             );
+
+            if refused {
+                return self.finish_refused_turn(
+                    progress,
+                    assistant_message,
+                    &pending_tool_uses,
+                    refusal_note,
+                );
+            }
 
             self.session
                 .push_message(assistant_message.clone())
@@ -736,11 +776,31 @@ where
                     ));
                 }
 
-                if truncated && !is_complete_json(input) {
+                // No call of a response the output limit cut off runs: its last
+                // call is usually incomplete, and the model never finished the turn.
+                if truncated {
+                    let output = if is_complete_json(input) {
+                        TRUNCATED_COMPLETE_TOOL_CALL_MESSAGE
+                    } else {
+                        TRUNCATED_TOOL_CALL_MESSAGE
+                    };
                     let result = ConversationMessage::tool_result(
                         tool_use_id.clone(),
                         tool_name.clone(),
-                        TRUNCATED_TOOL_CALL_MESSAGE,
+                        output,
+                        true,
+                    );
+                    self.record_tool_result(progress.iterations, result, &mut progress)?;
+                    continue;
+                }
+
+                // Arguments cut off or garbled while streaming reach neither the
+                // hooks nor the tool: the model hears what was wrong and can retry.
+                if let Err(problem) = tool_input_object(input) {
+                    let result = ConversationMessage::tool_result(
+                        tool_use_id.clone(),
+                        tool_name.clone(),
+                        format!("{INVALID_TOOL_ARGUMENTS_PREFIX} ({problem}). Send the call again with complete, valid JSON arguments."),
                         true,
                     );
                     self.record_tool_result(progress.iterations, result, &mut progress)?;
@@ -934,6 +994,40 @@ where
         }
         progress.tool_results.push(result_message);
         Ok(())
+    }
+
+    /// Ends a turn whose response the model declined to continue. Its text stays in
+    /// the transcript, its tool calls get a result saying they did not run, and a
+    /// note closes the turn when it would otherwise end without an answer (a refusal
+    /// before any text, or after tool calls), so the next prompt is not taken for a
+    /// retry of this one.
+    fn finish_refused_turn(
+        &mut self,
+        mut progress: TurnProgress,
+        message: ConversationMessage,
+        tool_uses: &[(String, String, String)],
+        note: Option<String>,
+    ) -> Result<TurnSummary, RuntimeError> {
+        if !message.blocks.is_empty() {
+            self.session
+                .push_message(message.clone())
+                .map_err(session_error)?;
+            progress.assistant_messages.push(message);
+        }
+        let skipped_tool_calls = self.push_synthetic_results(
+            progress.iterations,
+            tool_uses,
+            REFUSED_TOOL_CALL_MESSAGE,
+            &mut progress,
+        )?;
+        self.close_turn_with_note(format!("{FAILED_RESPONSE_NOTE_PREFIX}{REFUSAL_TURN_NOTE}]"));
+        Ok(self.finish_turn(
+            progress,
+            TurnOutcome::Refused {
+                note,
+                skipped_tool_calls,
+            },
+        ))
     }
 
     fn push_synthetic_results(
@@ -1342,6 +1436,17 @@ pub fn is_truncation_stop_reason(stop_reason: Option<&str>) -> bool {
     })
 }
 
+/// Whether a provider stop reason means the model declined to continue
+/// ([`REFUSAL_STOP_REASON`], or an un-normalized `content_filter`).
+#[must_use]
+pub fn is_refusal_stop_reason(stop_reason: Option<&str>) -> bool {
+    stop_reason.is_some_and(|reason| {
+        REFUSAL_STOP_REASONS
+            .iter()
+            .any(|candidate| reason.eq_ignore_ascii_case(candidate))
+    })
+}
+
 /// Whether `text` is a note the runtime wrote to close an interrupted or failed
 /// turn, not model output.
 #[must_use]
@@ -1498,6 +1603,27 @@ fn is_complete_json(input: &str) -> bool {
     serde_json::from_str::<Value>(input).is_ok()
 }
 
+/// `Ok` when a tool call's arguments are a JSON object, as every tool's input is;
+/// otherwise what is wrong with them, for the model.
+fn tool_input_object(input: &str) -> Result<(), String> {
+    match serde_json::from_str::<Value>(input) {
+        Ok(Value::Object(_)) => Ok(()),
+        Ok(other) => Err(format!(
+            "they are a JSON {}",
+            match other {
+                Value::Null => "null",
+                Value::Bool(_) => "boolean",
+                Value::Number(_) => "number",
+                Value::String(_) => "string",
+                Value::Array(_) => "array",
+                Value::Object(_) => "object",
+            }
+        )),
+        Err(_) if input.trim().is_empty() => Err("they are empty".to_string()),
+        Err(error) => Err(format!("{error}; they may have been cut off")),
+    }
+}
+
 fn append_to_tool_result(message: &mut ConversationMessage, note: &str) {
     for block in &mut message.blocks {
         if let ContentBlock::ToolResult { output, .. } = block {
@@ -1572,10 +1698,12 @@ struct ExecutedToolCall {
 
 #[derive(Debug)]
 struct BuiltAssistantMessage {
+    /// Empty only for a refusal before any output.
     message: ConversationMessage,
     usage: Option<TokenUsage>,
     prompt_cache_events: Vec<PromptCacheEvent>,
     stop_reason: Option<String>,
+    refusal: Option<String>,
 }
 
 fn build_assistant_message(
@@ -1587,6 +1715,7 @@ fn build_assistant_message(
     let mut finished = false;
     let mut usage = None;
     let mut stop_reason = None;
+    let mut refusal: Option<String> = None;
 
     for event in events {
         match event {
@@ -1598,6 +1727,9 @@ fn build_assistant_message(
             AssistantEvent::Usage(value) => usage = Some(value),
             AssistantEvent::PromptCache(event) => prompt_cache_events.push(event),
             AssistantEvent::StopReason(reason) => stop_reason = Some(reason),
+            AssistantEvent::Refusal(note) => {
+                refusal.get_or_insert_with(String::new).push_str(&note);
+            }
             AssistantEvent::MessageStop => {
                 finished = true;
             }
@@ -1612,7 +1744,8 @@ fn build_assistant_message(
             "assistant stream ended without a message stop event",
         ));
     }
-    if blocks.is_empty() {
+    // A refusal before any output is an answer of its own, not an empty reply.
+    if blocks.is_empty() && !is_refusal_stop_reason(stop_reason.as_deref()) {
         return Err(RuntimeError::new("assistant stream produced no content"));
     }
 
@@ -1621,6 +1754,9 @@ fn build_assistant_message(
         usage,
         prompt_cache_events,
         stop_reason,
+        refusal: refusal
+            .map(|note| note.trim().to_string())
+            .filter(|note| !note.is_empty()),
     })
 }
 
@@ -1708,6 +1844,7 @@ mod tests {
     use crate::session::{ContentBlock, MessageRole, Session};
     use crate::usage::TokenUsage;
     use crate::ToolError;
+    use serde_json::Value;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -1732,7 +1869,7 @@ mod tests {
                         AssistantEvent::ToolUse {
                             id: "tool-1".to_string(),
                             name: "add".to_string(),
-                            input: "2,2".to_string(),
+                            input: r#"{"numbers":"2,2"}"#.to_string(),
                         },
                         AssistantEvent::Usage(TokenUsage {
                             input_tokens: 20,
@@ -1787,7 +1924,10 @@ mod tests {
     fn runs_user_to_tool_to_result_loop_end_to_end_and_tracks_usage() {
         let api_client = ScriptedApiClient { call_count: 0 };
         let tool_executor = StaticToolExecutor::new().register("add", |input| {
-            let total = input
+            let input: Value = serde_json::from_str(input).expect("input must be JSON");
+            let total = input["numbers"]
+                .as_str()
+                .expect("numbers")
                 .split(',')
                 .map(|part| part.parse::<i32>().expect("input must be valid integer"))
                 .sum::<i32>();
@@ -1898,7 +2038,7 @@ mod tests {
                     AssistantEvent::ToolUse {
                         id: "tool-1".to_string(),
                         name: "blocked".to_string(),
-                        input: "secret".to_string(),
+                        input: r#"{"secret":true}"#.to_string(),
                     },
                     AssistantEvent::MessageStop,
                 ])
@@ -2690,7 +2830,7 @@ mod tests {
                     AssistantEvent::ToolUse {
                         id: "tool-1".to_string(),
                         name: "echo".to_string(),
-                        input: "payload".to_string(),
+                        input: r#"{"payload":1}"#.to_string(),
                     },
                     AssistantEvent::MessageStop,
                 ])
@@ -2753,10 +2893,11 @@ mod tests {
 #[cfg(test)]
 mod resilience_tests {
     use super::{
-        parse_max_iterations, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
-        ConversationRuntime, RuntimeError, RuntimeErrorKind, StaticToolExecutor, ToolExecutor,
-        TurnOutcome, DEFAULT_MAX_ITERATIONS, FAILED_RESPONSE_NOTE_PREFIX,
-        INTERRUPTED_RESPONSE_NOTE, INTERRUPTED_TOOL_RESULT, MAX_ITERATIONS_ENV_VAR,
+        is_turn_end_note, parse_max_iterations, ApiClient, ApiRequest, AssistantEvent,
+        AutoCompactionEvent, ConversationRuntime, RuntimeError, RuntimeErrorKind,
+        StaticToolExecutor, ToolExecutor, TurnOutcome, DEFAULT_MAX_ITERATIONS,
+        FAILED_RESPONSE_NOTE_PREFIX, INTERRUPTED_RESPONSE_NOTE, INTERRUPTED_TOOL_RESULT,
+        MAX_ITERATIONS_ENV_VAR, REFUSAL_STOP_REASON,
     };
     use crate::cancel::CancellationToken;
     use crate::compact::AUTO_CONTINUE_PREFIX;
@@ -2767,6 +2908,7 @@ mod resilience_tests {
     };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
     use crate::transcript::unanswered_tool_use_ids;
+    use crate::usage::TokenUsage;
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3862,6 +4004,232 @@ mod resilience_tests {
             .expect("turn completes");
         assert_eq!(summary.outcome, TurnOutcome::OutputTruncated);
         assert_eq!(runtime.api_client().requests.len(), 2);
+    }
+
+    #[test]
+    fn no_tool_call_of_a_cut_off_response_runs_even_with_complete_arguments() {
+        let api = ScriptedApi::new(vec![
+            Ok(vec![
+                tool_call("r", "read_file", r#"{"path":"notes.txt"}"#),
+                tool_call("w", "write_file", r#"{"path":"out.txt","content":"par"#),
+                AssistantEvent::StopReason("length".to_string()),
+                AssistantEvent::MessageStop,
+            ]),
+            Ok(vec![
+                text("made the calls again"),
+                AssistantEvent::MessageStop,
+            ]),
+        ]);
+        let tools = StaticToolExecutor::new()
+            .register("read_file", |_| {
+                panic!("a cut-off response's call must not run")
+            })
+            .register("write_file", |_| panic!("partial JSON must not run"));
+        let mut runtime = runtime_with(Session::new(), api, tools);
+
+        let summary = runtime
+            .run_turn("read then write", None)
+            .expect("turn completes");
+
+        assert_eq!(summary.outcome, TurnOutcome::Completed);
+        let results = tool_results(runtime.session());
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|(_, _, is_error)| *is_error));
+        assert!(
+            results[0]
+                .1
+                .contains("no tool call of a response that was cut off is run"),
+            "{}",
+            results[0].1
+        );
+        assert!(results[1].1.contains("smaller"), "{}", results[1].1);
+        assert_eq!(runtime.api_client().requests.len(), 2);
+    }
+
+    const REFUSAL_NOTE: &str =
+        "Declined (safety category: cyber). Rephrase it or choose another model.";
+
+    #[test]
+    fn a_refusal_mid_text_keeps_the_text_and_ends_the_turn() {
+        let api = ScriptedApi::new(vec![
+            Ok(vec![
+                text("Here is how it works. First,"),
+                AssistantEvent::StopReason(REFUSAL_STOP_REASON.to_string()),
+                AssistantEvent::Refusal(REFUSAL_NOTE.to_string()),
+                AssistantEvent::MessageStop,
+            ]),
+            Ok(vec![text("Sure."), AssistantEvent::MessageStop]),
+        ]);
+        let mut runtime = runtime_with(Session::new(), api, StaticToolExecutor::new());
+
+        let summary = runtime
+            .run_turn("explain", None)
+            .expect("a refusal is no error");
+
+        assert_eq!(
+            summary.outcome,
+            TurnOutcome::Refused {
+                note: Some(REFUSAL_NOTE.to_string()),
+                skipped_tool_calls: 0,
+            }
+        );
+        assert_eq!(summary.stop_reason.as_deref(), Some("refusal"));
+        assert_eq!(summary.iterations, 1, "a refused turn is not continued");
+        assert_eq!(summary.assistant_messages.len(), 1);
+        let last = runtime.session().messages.last().expect("messages");
+        assert_eq!(
+            last.blocks,
+            vec![ContentBlock::Text {
+                text: "Here is how it works. First,".to_string()
+            }],
+            "the partial answer closes the turn; no note is added after it"
+        );
+
+        runtime.run_turn("something else", None).expect("next turn");
+        let request = &runtime.api_client().requests[1];
+        assert!(request
+            .messages
+            .iter()
+            .any(|message| message.role == MessageRole::Assistant
+                && message.blocks
+                    == vec![ContentBlock::Text {
+                        text: "Here is how it works. First,".to_string()
+                    }]));
+    }
+
+    #[test]
+    fn a_refusal_before_any_text_is_an_outcome_not_an_empty_reply() {
+        let api = ScriptedApi::new(vec![
+            Ok(vec![
+                AssistantEvent::Usage(TokenUsage {
+                    input_tokens: 120,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                }),
+                AssistantEvent::StopReason(REFUSAL_STOP_REASON.to_string()),
+                AssistantEvent::Refusal(format!("  {REFUSAL_NOTE}\n")),
+                AssistantEvent::MessageStop,
+            ]),
+            Ok(vec![text("Here you go."), AssistantEvent::MessageStop]),
+        ]);
+        let mut runtime = runtime_with(Session::new(), api, StaticToolExecutor::new());
+
+        let summary = runtime
+            .run_turn("do the thing", None)
+            .expect("a refusal before any text is not 'no content'");
+
+        assert_eq!(
+            summary.outcome,
+            TurnOutcome::Refused {
+                note: Some(REFUSAL_NOTE.to_string()),
+                skipped_tool_calls: 0,
+            }
+        );
+        assert_eq!(
+            summary.assistant_messages,
+            Vec::<ConversationMessage>::new()
+        );
+        assert_eq!(summary.usage.input_tokens, 120);
+        // The prompt is answered by a note, so the next prompt is not taken for it.
+        let ContentBlock::Text { text: note } =
+            &runtime.session().messages.last().expect("note").blocks[0]
+        else {
+            panic!("expected the closing note");
+        };
+        assert!(is_turn_end_note(note), "{note}");
+        assert!(note.contains("declined"), "{note}");
+
+        runtime.run_turn("something else", None).expect("next turn");
+        let request = &runtime.api_client().requests[1];
+        let replies = request
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Assistant)
+            .flat_map(|message| message.blocks.iter())
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            replies,
+            ["(no answer: this request failed: the model declined to continue this request)"]
+        );
+    }
+
+    #[test]
+    fn tool_calls_of_a_refused_response_are_reported_not_run() {
+        let api = ScriptedApi::new(vec![Ok(vec![
+            text("Let me look."),
+            tool_call("r", "read_file", r#"{"path":"a.txt"}"#),
+            // Un-normalized, as a provider without the client's mapping says it.
+            AssistantEvent::StopReason("content_filter".to_string()),
+            AssistantEvent::MessageStop,
+        ])]);
+        let tools = StaticToolExecutor::new().register("read_file", |_| {
+            panic!("a refused response's call must not run")
+        });
+        let mut runtime = runtime_with(Session::new(), api, tools);
+
+        let summary = runtime.run_turn("read a.txt", None).expect("turn ends");
+
+        assert_eq!(
+            summary.outcome,
+            TurnOutcome::Refused {
+                note: None,
+                skipped_tool_calls: 1,
+            }
+        );
+        let results = tool_results(runtime.session());
+        assert_eq!(results.len(), 1);
+        assert!(results[0].2);
+        assert!(results[0].1.contains("declined"), "{}", results[0].1);
+        assert_eq!(runtime.api_client().requests.len(), 1);
+        // Tool results do not end the transcript: a note closes the turn.
+        let last = runtime.session().messages.last().expect("messages");
+        assert_eq!(last.role, MessageRole::Assistant);
+        assert_eq!(
+            unanswered_tool_use_ids(&runtime.session().messages),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn unparseable_tool_arguments_become_a_tool_error_for_the_model() {
+        let api = ScriptedApi::new(vec![
+            Ok(vec![
+                tool_call("x", "read_file", r#"{"path":"src/main.rs","limit":"#),
+                tool_call("s", "read_file", r#""{\"path\":\"a\"""#),
+                tool_call("e", "read_file", ""),
+                AssistantEvent::StopReason("tool_use".to_string()),
+                AssistantEvent::MessageStop,
+            ]),
+            Ok(vec![text("retried"), AssistantEvent::MessageStop]),
+        ]);
+        let tools = StaticToolExecutor::new().register("read_file", |_| {
+            panic!("bad arguments must never reach the tool")
+        });
+        let mut runtime = runtime_with(Session::new(), api, tools);
+
+        let summary = runtime.run_turn("read", None).expect("no crash, no panic");
+
+        assert_eq!(summary.outcome, TurnOutcome::Completed);
+        let results = tool_results(runtime.session());
+        assert_eq!(results.len(), 3);
+        for (_, output, is_error) in &results {
+            assert!(*is_error);
+            assert!(output.contains("NOT executed"), "{output}");
+            assert!(output.contains("not a valid JSON object"), "{output}");
+        }
+        assert!(results[0].1.contains("cut off"), "{}", results[0].1);
+        assert!(results[1].1.contains("a JSON string"), "{}", results[1].1);
+        assert!(results[2].1.contains("empty"), "{}", results[2].1);
+        assert_eq!(
+            runtime.api_client().requests.len(),
+            2,
+            "the model hears about it and goes on"
+        );
     }
 
     #[test]

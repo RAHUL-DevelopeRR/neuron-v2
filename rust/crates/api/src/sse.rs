@@ -204,6 +204,7 @@ mod tests {
                     delta: MessageDelta {
                         stop_reason: Some("tool_use".to_string()),
                         stop_sequence: None,
+                        refusal: None,
                     },
                     usage: Usage {
                         input_tokens: 1,
@@ -324,6 +325,7 @@ mod tests {
                 delta: MessageDelta {
                     stop_reason: Some("end_turn".to_string()),
                     stop_sequence: None,
+                    refusal: None,
                 },
                 usage: Usage::default(),
             }))

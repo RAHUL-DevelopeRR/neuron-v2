@@ -94,11 +94,12 @@ pub use config_validate::{
 };
 pub use conversation::{
     auto_compaction_threshold_from_env, auto_compaction_threshold_override_from_env,
-    is_truncation_stop_reason, is_turn_end_note, resolve_max_iterations, ApiClient, ApiRequest,
-    AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-    RuntimeErrorKind, StaticToolExecutor, ToolError, ToolExecutor, TurnOutcome, TurnSummary,
-    DEFAULT_MAX_ITERATIONS, FAILED_RESPONSE_NOTE_PREFIX, INTERRUPTED_RESPONSE_NOTE,
-    INTERRUPTED_TOOL_RESULT, MAX_ITERATIONS_ENV_VAR,
+    is_refusal_stop_reason, is_truncation_stop_reason, is_turn_end_note, resolve_max_iterations,
+    ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime,
+    PromptCacheEvent, RuntimeError, RuntimeErrorKind, StaticToolExecutor, ToolError, ToolExecutor,
+    TurnOutcome, TurnSummary, DEFAULT_MAX_ITERATIONS, FAILED_RESPONSE_NOTE_PREFIX,
+    INTERRUPTED_RESPONSE_NOTE, INTERRUPTED_TOOL_RESULT, MAX_ITERATIONS_ENV_VAR,
+    REFUSAL_STOP_REASON,
 };
 pub use file_ops::{
     display_path, edit_file, edit_file_in_workspace, glob_search, grep_search,

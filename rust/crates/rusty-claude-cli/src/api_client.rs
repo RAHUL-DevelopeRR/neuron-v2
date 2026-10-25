@@ -292,15 +292,31 @@ pub(crate) fn ends_unterminated_tool_call(error: &api::ApiError, tool_blocks_ope
     tool_blocks_open && matches!(error, api::ApiError::InvalidSseFrame(_))
 }
 
-/// Terminal line for a tool call that was cut off at the output limit.
+/// Terminal line for a tool call of a response the output limit cut off. None of
+/// them runs: one with incomplete arguments is to be split, a complete one made again.
 pub(crate) fn format_cut_off_tool_call(name: &str, input: &str) -> String {
     if serde_json::from_str::<serde_json::Value>(input).is_ok() {
-        format_tool_call_start(name, input)
+        format!(
+            "\x1b[33m\u{26a0}\x1b[0m `{name}` call not run: the response hit the output token limit \u{2014} the model will be asked to make it again"
+        )
     } else {
         format!(
             "\x1b[33m\u{26a0}\x1b[0m `{name}` call was cut off at the output token limit \u{2014} not run; the model will be asked to split it into smaller steps"
         )
     }
+}
+
+/// Shows the finished tool calls whose display waited for the stop reason: a call
+/// of a response the output limit cut off is shown as one that will not run.
+fn show_tool_calls(
+    sink: &mut dyn TurnSink,
+    calls: &mut Vec<(String, String, String)>,
+    cut_off: bool,
+) -> io::Result<()> {
+    for (id, name, input) in calls.drain(..) {
+        sink.tool_call(&id, &name, &input, cut_off)?;
+    }
+    Ok(())
 }
 
 pub(crate) struct AnthropicRuntimeClient {
@@ -583,6 +599,9 @@ impl AnthropicRuntimeClient {
         let mut sink = self.output.stream_sink();
         let mut events = Vec::new();
         let mut pending_tools = BTreeMap::<u32, (String, String, String)>::new();
+        // Finished tool calls not shown yet: whether they run depends on the stop
+        // reason, which comes after them.
+        let mut unshown_tools = Vec::<(String, String, String)>::new();
         let mut block_has_thinking_summary = false;
         let mut saw_stop = false;
         let mut received_any_event = false;
@@ -648,6 +667,11 @@ impl AnthropicRuntimeClient {
                     }
                 }
                 ApiStreamEvent::ContentBlockStart(start) => {
+                    // Text or reasoning after a call: show the call first, in order.
+                    if !matches!(start.content_block, OutputContentBlock::ToolUse { .. }) {
+                        show_tool_calls(sink.as_mut(), &mut unshown_tools, false)
+                            .map_err(render_error)?;
+                    }
                     let mut pending_tool = None;
                     push_output_block(
                         start.content_block,
@@ -695,9 +719,8 @@ impl AnthropicRuntimeClient {
                         if let Some(progress_reporter) = &self.progress_reporter {
                             progress_reporter.mark_tool_phase(&name, &input);
                         }
-                        // Display tool call now that input is fully accumulated
-                        sink.tool_call(&id, &name, &input, false)
-                            .map_err(render_error)?;
+                        // Shown once the stop reason says whether it runs.
+                        unshown_tools.push((id.clone(), name.clone(), input.clone()));
                         events.push(AssistantEvent::ToolUse { id, name, input });
                     }
                 }
@@ -707,14 +730,30 @@ impl AnthropicRuntimeClient {
                         stop_reason = Some(reason.clone());
                         events.push(AssistantEvent::StopReason(reason));
                     }
+                    if let Some(note) = delta.delta.refusal {
+                        events.push(AssistantEvent::Refusal(note));
+                    }
+                    sink.end_block().map_err(render_error)?;
+                    show_tool_calls(
+                        sink.as_mut(),
+                        &mut unshown_tools,
+                        runtime::is_truncation_stop_reason(stop_reason.as_deref()),
+                    )
+                    .map_err(render_error)?;
                 }
                 ApiStreamEvent::MessageStop(_) => {
                     saw_stop = true;
                     sink.end_block().map_err(render_error)?;
+                    show_tool_calls(sink.as_mut(), &mut unshown_tools, false)
+                        .map_err(render_error)?;
                     events.push(AssistantEvent::MessageStop);
                 }
             }
         }
+        let cut_off =
+            tool_calls_cut_off || runtime::is_truncation_stop_reason(stop_reason.as_deref());
+        sink.end_block().map_err(render_error)?;
+        show_tool_calls(sink.as_mut(), &mut unshown_tools, cut_off).map_err(render_error)?;
 
         if !pending_tools.is_empty()
             && (tool_calls_cut_off || runtime::is_truncation_stop_reason(stop_reason.as_deref()))
@@ -1216,13 +1255,17 @@ pub(crate) fn push_output_block(
             // During streaming, the initial content_block_start has an empty input ({}).
             // The real input arrives via input_json_delta events. In
             // non-streaming responses, preserve a legitimate empty object.
-            let initial_input = if streaming_tool_input
-                && input.is_object()
-                && input.as_object().is_some_and(serde_json::Map::is_empty)
-            {
-                String::new()
-            } else {
-                input.to_string()
+            let initial_input = match input {
+                input
+                    if streaming_tool_input
+                        && input.as_object().is_some_and(serde_json::Map::is_empty) =>
+                {
+                    String::new()
+                }
+                // Arguments that did not parse as JSON arrive as their raw text
+                // (a JSON string): the runtime answers the call with an error.
+                serde_json::Value::String(raw) if !streaming_tool_input => raw,
+                input => input.to_string(),
             };
             *pending_tool = Some((id, name, initial_input));
         }
@@ -1271,6 +1314,9 @@ pub(crate) fn response_to_events(
     events.push(AssistantEvent::Usage(response.usage.token_usage()));
     if let Some(stop_reason) = response.stop_reason {
         events.push(AssistantEvent::StopReason(stop_reason));
+    }
+    if let Some(note) = response.refusal {
+        events.push(AssistantEvent::Refusal(note));
     }
     events.push(AssistantEvent::MessageStop);
     Ok(events)
@@ -1344,6 +1390,25 @@ mod stream_resilience_tests {
         Scripted(&'static [Step]),
     }
 
+    /// Recorded Zero-X gateway streams of the Claude adapter (api/tests/fixtures).
+    mod fixture {
+        pub(super) const REFUSAL_MID_TEXT: &str =
+            include_str!("../../api/tests/fixtures/gateway_claude/refusal_mid_text.sse");
+        pub(super) const REFUSAL_BEFORE_TEXT: &str =
+            include_str!("../../api/tests/fixtures/gateway_claude/refusal_before_text.sse");
+        pub(super) const REASONING_THEN_TEXT: &str =
+            include_str!("../../api/tests/fixtures/gateway_claude/reasoning_then_text.sse");
+        pub(super) const COMPLETE_TOOL_CALL_CUT_BY_LENGTH: &str = include_str!(
+            "../../api/tests/fixtures/gateway_claude/complete_tool_call_cut_by_length.sse"
+        );
+        pub(super) const UNPARSEABLE_TOOL_ARGUMENTS: &str =
+            include_str!("../../api/tests/fixtures/gateway_claude/unparseable_tool_arguments.sse");
+        pub(super) const ERROR_AFTER_CONTENT: &str =
+            include_str!("../../api/tests/fixtures/gateway_claude/error_after_content.sse");
+        /// The gateway's fixed note for a Claude refusal in the cyber category.
+        pub(super) const REFUSAL_NOTE: &str = "Claude declined this request (safety category: cyber). Rephrase it or choose another model.";
+    }
+
     /// One answer of a [`Behavior::Scripted`] gateway.
     #[derive(Clone, Copy)]
     enum Step {
@@ -1355,6 +1420,8 @@ mod stream_resilience_tests {
         Text,
         /// `400 context_length_exceeded`: over the free per-minute token budget.
         TooLarge,
+        /// A recorded SSE body, sent as it is.
+        Sse(&'static str),
     }
 
     struct FakeGateway {
@@ -1522,6 +1589,7 @@ mod stream_resilience_tests {
                         }
                         Some(Step::Text) => write_text_answer(&mut stream, "after the wait"),
                         Some(Step::TooLarge) => write_too_large(&mut stream),
+                        Some(Step::Sse(body)) => write_sse_body(&mut stream, body),
                         Some(Step::Hang) | None => {}
                     },
                     Behavior::StallAfterFirstChunk => {
@@ -1630,13 +1698,22 @@ mod stream_resilience_tests {
         client: ApiProviderClient,
         timeouts: StreamTimeouts,
     ) -> AnthropicRuntimeClient {
+        runtime_client_showing(client, timeouts, crate::turn_sink::TurnOutput::Silent)
+    }
+
+    /// A client whose turn output goes to `output` (the UI's events, for one).
+    fn runtime_client_showing(
+        client: ApiProviderClient,
+        timeouts: StreamTimeouts,
+        output: crate::turn_sink::TurnOutput,
+    ) -> AnthropicRuntimeClient {
         AnthropicRuntimeClient {
             runtime: tokio::runtime::Runtime::new().expect("tokio"),
             client,
             session_id: "stream-test".to_string(),
             model: "openai/test-model".to_string(),
             enable_tools: false,
-            output: crate::turn_sink::TurnOutput::Silent,
+            output,
             allowed_tools: None,
             tool_registry: tools::GlobalToolRegistry::builtin(),
             progress_reporter: None,
@@ -2062,6 +2139,264 @@ mod stream_resilience_tests {
         );
     }
 
+    /// The UI's events of `client`'s turns, and the client.
+    fn showing_client(
+        gateway: &FakeGateway,
+    ) -> (
+        AnthropicRuntimeClient,
+        std::sync::mpsc::Receiver<neuron_tui::protocol::UiEvent>,
+    ) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let client = OpenAiCompatClient::new("ses_test", OpenAiCompatConfig::zero_x())
+            .with_base_url(gateway.base_url.clone())
+            .with_retry_observer(None);
+        (
+            runtime_client_showing(
+                ApiProviderClient::OpenAi(client),
+                fast_timeouts(),
+                crate::turn_sink::TurnOutput::channel(sender),
+            ),
+            receiver,
+        )
+    }
+
+    fn runtime_over<T: runtime::ToolExecutor>(
+        client: AnthropicRuntimeClient,
+        tools: T,
+    ) -> ConversationRuntime<AnthropicRuntimeClient, T> {
+        ConversationRuntime::new(
+            Session::new(),
+            client,
+            tools,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn a_gateway_refusal_mid_text_keeps_the_text_and_ends_the_turn_with_its_note() {
+        static STEPS: &[Step] = &[Step::Sse(fixture::REFUSAL_MID_TEXT)];
+        let gateway = spawn_gateway(Behavior::Scripted(STEPS));
+        let mut runtime = runtime_over(
+            zero_x_client_for(&gateway, fast_timeouts()),
+            StaticToolExecutor::new(),
+        );
+
+        let summary = runtime
+            .run_turn("explain", None)
+            .expect("a refusal is no error");
+
+        assert_eq!(
+            summary.outcome,
+            runtime::TurnOutcome::Refused {
+                note: Some(fixture::REFUSAL_NOTE.to_string()),
+                skipped_tool_calls: 0,
+            }
+        );
+        assert_eq!(summary.stop_reason.as_deref(), Some("refusal"));
+        assert_eq!(
+            super::final_assistant_text(&summary),
+            "Here is how the lock mechanism works. First, the pins"
+        );
+        assert_eq!(gateway.connections.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            crate::repl_loop::refusal_notice(&summary.outcome).as_deref(),
+            Some(
+                "The model declined to continue this request. Claude declined this request (safety category: cyber). Rephrase it or choose another model."
+            )
+        );
+    }
+
+    #[test]
+    fn a_gateway_refusal_before_any_text_is_neither_an_empty_reply_nor_retried() {
+        static STEPS: &[Step] = &[Step::Sse(fixture::REFUSAL_BEFORE_TEXT)];
+        let gateway = spawn_gateway(Behavior::Scripted(STEPS));
+        let mut runtime = runtime_over(
+            zero_x_client_for(&gateway, fast_timeouts()),
+            StaticToolExecutor::new(),
+        );
+
+        let summary = runtime
+            .run_turn("do it", None)
+            .expect("a refusal before any text is no error");
+
+        assert!(matches!(
+            summary.outcome,
+            runtime::TurnOutcome::Refused { note: Some(_), .. }
+        ));
+        assert_eq!(
+            summary.assistant_messages,
+            Vec::<ConversationMessage>::new()
+        );
+        assert_eq!(
+            gateway.connections.load(Ordering::SeqCst),
+            1,
+            "neither a stream retry nor the non-streaming fallback"
+        );
+    }
+
+    #[test]
+    fn gateway_reasoning_reaches_the_ui_apart_from_the_answer() {
+        use neuron_tui::protocol::UiEvent;
+        static STEPS: &[Step] = &[Step::Sse(fixture::REASONING_THEN_TEXT)];
+        let gateway = spawn_gateway(Behavior::Scripted(STEPS));
+        let (mut client, ui) = showing_client(&gateway);
+
+        let events = client.stream(request(false)).expect("stream completes");
+        drop(client);
+
+        let answer = events
+            .iter()
+            .filter_map(|event| match event {
+                AssistantEvent::TextDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(answer, "17 * 23 = 391.", "reasoning is never answer text");
+        let shown = ui.try_iter().collect::<Vec<_>>();
+        let reasoning = shown
+            .iter()
+            .filter_map(|event| match event {
+                UiEvent::ReasoningDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        let text = shown
+            .iter()
+            .filter_map(|event| match event {
+                UiEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(reasoning, "The user asks for 17 * 23. That is 391.\n\n");
+        assert_eq!(text, "17 * 23 = 391.");
+        let first_reasoning = shown
+            .iter()
+            .position(|event| matches!(event, UiEvent::ReasoningStarted { .. }))
+            .expect("a reasoning block");
+        let first_text = shown
+            .iter()
+            .position(|event| matches!(event, UiEvent::TextDelta { .. }))
+            .expect("answer text");
+        assert!(first_reasoning < first_text, "{shown:?}");
+    }
+
+    #[test]
+    fn no_call_of_a_response_cut_by_length_runs_and_the_ui_shows_them_cut_off() {
+        use neuron_tui::protocol::UiEvent;
+        static STEPS: &[Step] = &[
+            Step::Sse(fixture::COMPLETE_TOOL_CALL_CUT_BY_LENGTH),
+            Step::Text,
+        ];
+        let gateway = spawn_gateway(Behavior::Scripted(STEPS));
+        let (client, ui) = showing_client(&gateway);
+        let ran = Rc::new(Cell::new(0));
+        let (read_ran, write_ran) = (Rc::clone(&ran), Rc::clone(&ran));
+        let tools = StaticToolExecutor::new()
+            .register("read_file", move |_| {
+                read_ran.set(read_ran.get() + 1);
+                Ok("notes".to_string())
+            })
+            .register("write_file", move |_| {
+                write_ran.set(write_ran.get() + 1);
+                Ok("written".to_string())
+            });
+        let mut runtime = runtime_over(client, tools);
+
+        let summary = runtime
+            .run_turn("read then write", None)
+            .expect("the turn goes on after the cut-off calls");
+
+        assert_eq!(ran.get(), 0, "no call of a cut-off response runs");
+        assert_eq!(summary.tool_results.len(), 2);
+        assert!(summary.tool_results.iter().all(|result| matches!(
+            &result.blocks[0],
+            ContentBlock::ToolResult { is_error: true, output, .. } if output.contains("NOT executed")
+        )));
+        assert_eq!(gateway.connections.load(Ordering::SeqCst), 2);
+        drop(runtime);
+        let started = ui
+            .try_iter()
+            .filter_map(|event| match event {
+                UiEvent::ToolCallStarted { name, cut_off, .. } => Some((name, cut_off)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            started,
+            [
+                ("read_file".to_string(), true),
+                ("write_file".to_string(), true)
+            ]
+        );
+    }
+
+    #[test]
+    fn unparseable_tool_arguments_become_a_tool_error_not_a_stream_retry() {
+        static STEPS: &[Step] = &[Step::Sse(fixture::UNPARSEABLE_TOOL_ARGUMENTS), Step::Text];
+        let gateway = spawn_gateway(Behavior::Scripted(STEPS));
+        let tools = StaticToolExecutor::new().register("read_file", |_| {
+            panic!("garbled arguments must never reach the tool")
+        });
+        let mut runtime = runtime_over(zero_x_client_for(&gateway, fast_timeouts()), tools);
+
+        let summary = runtime.run_turn("read main.rs", None).expect("no crash");
+
+        assert_eq!(summary.outcome, runtime::TurnOutcome::Completed);
+        let ContentBlock::ToolResult {
+            output, is_error, ..
+        } = &summary.tool_results[0].blocks[0]
+        else {
+            panic!("expected a tool result");
+        };
+        assert!(*is_error);
+        assert!(output.contains("not a valid JSON object"), "{output}");
+        assert_eq!(
+            gateway.connections.load(Ordering::SeqCst),
+            2,
+            "the model heard about it; the stream itself did not fail"
+        );
+        assert_eq!(super::final_assistant_text(&summary), "after the wait");
+    }
+
+    #[test]
+    fn the_gateways_error_event_after_content_is_retried_once_then_reported() {
+        static STEPS: &[Step] = &[Step::Sse(fixture::ERROR_AFTER_CONTENT)];
+        let gateway = spawn_gateway(Behavior::Scripted(STEPS));
+        let mut client = zero_x_client_for(&gateway, fast_timeouts());
+
+        let error = client
+            .stream(request(false))
+            .expect_err("a failed stream fails the model call");
+
+        assert_eq!(error.kind(), RuntimeErrorKind::StreamInterrupted);
+        assert!(
+            error
+                .to_string()
+                .contains("Generation interrupted. Retry your request."),
+            "{error}"
+        );
+        assert!(error.to_string().contains("after one retry"), "{error}");
+        assert_eq!(gateway.connections.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_stalled_stream_reports_the_idle_deadline() {
+        let failure = classify_stream_read_error(
+            "s",
+            &api::ApiError::StreamIdle {
+                provider: "Zero-X".to_string(),
+                model: "auto".to_string(),
+                idle: Duration::from_secs(120),
+            },
+        );
+        assert!(failure.is_retryable());
+        let StreamFailure::Interrupted { detail } = &failure else {
+            panic!("a stall is an interruption: {failure:?}");
+        };
+        assert!(detail.contains("stalled: no data for 120s"), "{detail}");
+    }
+
     #[test]
     fn stream_errors_are_classified_by_type() {
         let interrupted = classify_stream_read_error(
@@ -2160,11 +2495,41 @@ mod stream_resilience_tests {
             stop_sequence: None,
             usage: Usage::default(),
             request_id: None,
+            refusal: None,
         };
         let events =
             response_to_events(response, &mut crate::turn_sink::SilentSink).expect("events");
         assert!(events.contains(&AssistantEvent::StopReason("max_tokens".to_string())));
         assert_eq!(events.last(), Some(&AssistantEvent::MessageStop));
+    }
+
+    #[test]
+    fn non_streaming_fallback_reports_a_refusal_and_keeps_bad_arguments_raw() {
+        let response = MessageResponse {
+            id: "msg".to_string(),
+            kind: "message".to_string(),
+            role: "assistant".to_string(),
+            content: vec![OutputContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::Value::String("{\"path\":".to_string()),
+            }],
+            model: "m".to_string(),
+            stop_reason: Some("refusal".to_string()),
+            stop_sequence: None,
+            usage: Usage::default(),
+            request_id: None,
+            refusal: Some("declined".to_string()),
+        };
+        let events =
+            response_to_events(response, &mut crate::turn_sink::SilentSink).expect("events");
+        assert!(events.contains(&AssistantEvent::ToolUse {
+            id: "call_1".to_string(),
+            name: "read_file".to_string(),
+            input: "{\"path\":".to_string(),
+        }));
+        assert!(events.contains(&AssistantEvent::StopReason("refusal".to_string())));
+        assert!(events.contains(&AssistantEvent::Refusal("declined".to_string())));
     }
 
     #[test]

@@ -4198,6 +4198,10 @@ fn run_agent_job(job: &AgentJob, cancel: &runtime::CancellationToken) -> Result<
         runtime::TurnOutcome::LoopDetected { tool_name, repeats } => Err(format!(
             "sub-agent stopped after repeating `{tool_name}` {repeats} times"
         )),
+        runtime::TurnOutcome::Refused { note, .. } => Err(match note {
+            Some(note) => format!("sub-agent stopped: the model declined to continue ({note})"),
+            None => "sub-agent stopped: the model declined to continue".to_string(),
+        }),
         runtime::TurnOutcome::Completed | runtime::TurnOutcome::OutputTruncated => {
             persist_agent_terminal_state(
                 &job.manifest,
@@ -5958,11 +5962,32 @@ async fn stream_with_provider(
             }
             ApiStreamEvent::MessageDelta(delta) => {
                 events.push(AssistantEvent::Usage(delta.usage.token_usage()));
+                // The runtime runs no tool call of a response that was cut off
+                // or refused, so it needs the stop reason.
+                if let Some(reason) = delta.delta.stop_reason {
+                    events.push(AssistantEvent::StopReason(reason));
+                }
+                if let Some(note) = delta.delta.refusal {
+                    events.push(AssistantEvent::Refusal(note));
+                }
             }
             ApiStreamEvent::MessageStop(_) => {
                 saw_stop = true;
                 events.push(AssistantEvent::MessageStop);
             }
+        }
+    }
+
+    // Calls still open when a cut-off or refused response ended: the runtime
+    // answers them with an error instead of running them.
+    let ended_early = events.iter().any(|event| {
+        matches!(event, AssistantEvent::StopReason(reason)
+            if runtime::is_truncation_stop_reason(Some(reason))
+                || runtime::is_refusal_stop_reason(Some(reason)))
+    });
+    if ended_early {
+        for (id, name, input) in std::mem::take(&mut pending_tools).into_values() {
+            events.push(AssistantEvent::ToolUse { id, name, input });
         }
     }
 
@@ -6100,13 +6125,17 @@ fn push_output_block(
             }
         }
         OutputContentBlock::ToolUse { id, name, input } => {
-            let initial_input = if streaming_tool_input
-                && input.is_object()
-                && input.as_object().is_some_and(serde_json::Map::is_empty)
-            {
-                String::new()
-            } else {
-                input.to_string()
+            let initial_input = match input {
+                input
+                    if streaming_tool_input
+                        && input.as_object().is_some_and(serde_json::Map::is_empty) =>
+                {
+                    String::new()
+                }
+                // Arguments that did not parse as JSON arrive as their raw text
+                // (a JSON string): the runtime answers the call with an error.
+                Value::String(raw) if !streaming_tool_input => raw,
+                input => input.to_string(),
             };
             pending_tools.insert(block_index, (id, name, initial_input));
         }
@@ -6127,6 +6156,12 @@ fn response_to_events(response: MessageResponse) -> Vec<AssistantEvent> {
     }
 
     events.push(AssistantEvent::Usage(response.usage.token_usage()));
+    if let Some(stop_reason) = response.stop_reason {
+        events.push(AssistantEvent::StopReason(stop_reason));
+    }
+    if let Some(note) = response.refusal {
+        events.push(AssistantEvent::Refusal(note));
+    }
     events.push(AssistantEvent::MessageStop);
     events
 }

@@ -1,0 +1,2 @@
+# Recorded SSE streams: keep their bytes (LF line endings) on every platform.
+*.sse text eol=lf
