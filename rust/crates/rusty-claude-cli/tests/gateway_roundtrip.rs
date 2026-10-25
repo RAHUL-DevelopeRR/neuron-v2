@@ -527,6 +527,8 @@ const REFUSAL_BEFORE_TEXT: &str =
     include_str!("../../api/tests/fixtures/gateway_claude/refusal_before_text.sse");
 const REASONING_THEN_TEXT: &str =
     include_str!("../../api/tests/fixtures/gateway_claude/reasoning_then_text.sse");
+const REASONING_CUT_BY_LENGTH: &str =
+    include_str!("../../api/tests/fixtures/gateway_claude/reasoning_cut_by_length.sse");
 const TOOL_CALL_CUT_BY_LENGTH: &str =
     include_str!("../../api/tests/fixtures/gateway_claude/tool_call_cut_by_length.sse");
 const GATEWAY_REFUSAL_NOTE: &str =
@@ -659,6 +661,49 @@ fn reasoning_never_reaches_the_answer_in_headless_output() {
     assert_eq!(result["message"], "17 * 23 = 391.");
     assert_eq!(result["outcome"], "completed");
     assert_eq!(result["refusal"], serde_json::Value::Null);
+}
+
+#[test]
+fn a_reply_cut_off_while_reasoning_is_continued_and_its_tokens_reported() {
+    // The output limit cut the model off while it was still thinking: the gateway
+    // sent reasoning only, then finish_reason "length" and the usage it billed.
+    let gateway = gateway_with_chat(|request, index| {
+        if index == 0 {
+            return Reply::sse_body(REASONING_CUT_BY_LENGTH);
+        }
+        let messages = request.json()["messages"].clone();
+        let messages = messages.as_array().expect("messages");
+        let roles = messages
+            .iter()
+            .map(|message| message["role"].as_str().unwrap_or_default().to_string())
+            .filter(|role| role != "system")
+            .collect::<Vec<_>>();
+        assert_eq!(roles, ["user", "assistant", "user"], "{messages:?}");
+        let prompt = messages.last().expect("prompt")["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(prompt.starts_with("[auto-continue]"), "{prompt}");
+        text_reply("There are infinitely many primes.")
+    });
+    let workspace = Workspace::new("reasoning-cut-by-length");
+    let mut command = workspace.command(&gateway);
+    command
+        .env("NEURON_TOKEN", SESSION_TOKEN)
+        .args(json_prompt_args(
+            "prove that there are infinitely many primes",
+        ));
+    let output = run(command, None);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let result = json_result(&output);
+    assert_eq!(result["outcome"], "completed", "{result}");
+    assert_eq!(result["message"], "There are infinitely many primes.");
+    assert_eq!(result["iterations"], 2, "one automatic continuation");
+    // What the gateway billed for the cut-off reply is reported with the rest.
+    assert_eq!(result["usage"]["input_tokens"], 430, "{result}");
+    assert_eq!(result["usage"]["output_tokens"], 16_005, "{result}");
+    assert_eq!(gateway.count("POST", "/v1/chat/completions"), 2);
 }
 
 #[test]

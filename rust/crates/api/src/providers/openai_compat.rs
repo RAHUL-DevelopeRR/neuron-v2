@@ -2295,6 +2295,33 @@ mod tests {
         assert_eq!(stop_reason(&events).as_deref(), Some("end_turn"));
     }
 
+    /// The output limit cut the model off while it was still thinking: reasoning
+    /// only, then `finish_reason` "length" and the usage the gateway billed.
+    #[test]
+    fn gateway_reasoning_cut_by_length_keeps_its_stop_reason_and_usage() {
+        let events = replay(include_str!(
+            "../../tests/fixtures/gateway_claude/reasoning_cut_by_length.sse"
+        ))
+        .unwrap();
+        let (text, thinking) = streamed_text(&events);
+        assert_eq!(text, "");
+        assert!(thinking.starts_with("The user wants a proof"), "{thinking}");
+        assert_eq!(stop_reason(&events).as_deref(), Some("length"));
+        let usage = events
+            .iter()
+            .find_map(|event| match event {
+                crate::types::StreamEvent::MessageDelta(delta) => Some(delta.usage.clone()),
+                _ => None,
+            })
+            .expect("message delta");
+        assert_eq!(usage.input_tokens, 420);
+        assert_eq!(usage.output_tokens, 16_000);
+        assert!(matches!(
+            events.last(),
+            Some(crate::types::StreamEvent::MessageStop(_))
+        ));
+    }
+
     /// The adapter's recorded agent turn: thinking, text, more thinking (sent
     /// with the blank lines the gateway puts between reasoning and text), and
     /// two parallel calls whose arguments are split across chunks.

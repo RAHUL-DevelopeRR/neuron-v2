@@ -1,0 +1,12 @@
+data: {"id":"chatcmpl-5f0c8a52-3d1e-4b7a-9c61-2e8f4d9a7b10","object":"chat.completion.chunk","created":1761350400,"model":"claude-opus-5-5","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-5f0c8a52-3d1e-4b7a-9c61-2e8f4d9a7b10","object":"chat.completion.chunk","created":1761350400,"model":"claude-opus-5-5","choices":[{"index":0,"delta":{"reasoning_content":"The user wants a proof that there are infinitely many primes."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-5f0c8a52-3d1e-4b7a-9c61-2e8f4d9a7b10","object":"chat.completion.chunk","created":1761350400,"model":"claude-opus-5-5","choices":[{"index":0,"delta":{"reasoning_content":" Suppose there were only finitely many, and multiply them all"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-5f0c8a52-3d1e-4b7a-9c61-2e8f4d9a7b10","object":"chat.completion.chunk","created":1761350400,"model":"claude-opus-5-5","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}
+
+data: {"id":"chatcmpl-5f0c8a52-3d1e-4b7a-9c61-2e8f4d9a7b10","object":"chat.completion.chunk","created":1761350400,"model":"claude-opus-5-5","choices":[],"usage":{"prompt_tokens":420,"completion_tokens":16000,"total_tokens":16420,"prompt_tokens_details":{"cached_tokens":300,"cache_write_tokens":20,"cache_write_1h_tokens":0}}}
+
+data: [DONE]
+

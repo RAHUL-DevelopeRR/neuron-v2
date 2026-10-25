@@ -80,6 +80,14 @@ const INVALID_TOOL_ARGUMENTS_PREFIX: &str =
 /// [`FAILED_RESPONSE_NOTE_PREFIX`]).
 const REFUSAL_TURN_NOTE: &str = "the model declined to continue this request";
 const AUTO_CONTINUE_MESSAGE: &str = "Your previous response was cut off because it reached the maximum output length. Continue exactly where you stopped, without repeating what you already wrote.";
+/// The automatic continuation of a response the output limit cut off before it
+/// had any text or tool call (the reasoning, which the transcript does not keep,
+/// used it all): there is nothing to continue from.
+const AUTO_CONTINUE_AFTER_REASONING_MESSAGE: &str = "Your previous response reached the maximum output length before you wrote any answer: your reasoning used all of it. Answer now, and keep your reasoning short.";
+/// What the note standing in for such a response says (see
+/// [`FAILED_RESPONSE_NOTE_PREFIX`]).
+const CUT_OFF_BEFORE_ANSWER_NOTE: &str =
+    "the output token limit was reached before any answer was written";
 const LOOP_STOPPED_REMAINING_MESSAGE: &str =
     "Not executed: the turn was stopped by the repeated-tool-call guard.";
 
@@ -217,6 +225,7 @@ pub struct RuntimeError {
     message: String,
     kind: RuntimeErrorKind,
     partial_text: Option<String>,
+    usage: Option<TokenUsage>,
 }
 
 impl RuntimeError {
@@ -231,7 +240,22 @@ impl RuntimeError {
             message: message.into(),
             kind,
             partial_text: None,
+            usage: None,
         }
+    }
+
+    /// What the provider billed for a response the turn could not use (one with
+    /// no content): the runtime counts it and keeps it with the note that closes
+    /// the failed turn.
+    #[must_use]
+    pub fn with_usage(mut self, usage: TokenUsage) -> Self {
+        self.usage = Some(usage);
+        self
+    }
+
+    #[must_use]
+    pub fn usage(&self) -> Option<TokenUsage> {
+        self.usage
     }
 
     /// The text the model had streamed before the request stopped (a cancelled
@@ -696,16 +720,22 @@ where
                     return Err(error);
                 }
             };
+            // What the provider billed for the response counts even when the
+            // response cannot be used.
+            let billed = last_usage(&events);
+            if let Some(usage) = billed {
+                self.usage_tracker.record(usage);
+            }
             let built = match build_assistant_message(events) {
                 Ok(result) => result,
                 Err(error) => {
                     self.record_turn_failed(progress.iterations, &error);
-                    return Err(error);
+                    return Err(match billed {
+                        Some(usage) => error.with_usage(usage),
+                        None => error,
+                    });
                 }
             };
-            if let Some(usage) = built.usage {
-                self.usage_tracker.record(usage);
-            }
             progress
                 .prompt_cache_events
                 .extend(built.prompt_cache_events);
@@ -739,16 +769,39 @@ where
                 );
             }
 
-            self.session
-                .push_message(assistant_message.clone())
-                .map_err(session_error)?;
-            progress.assistant_messages.push(assistant_message);
+            // Only a response the output limit cut off before any text or tool
+            // call is empty here (all of it reasoning, which the transcript does
+            // not keep). A note stands in for it, with what it was billed, so the
+            // continuation prompt does not follow the user's own.
+            let answered_nothing = assistant_message.blocks.is_empty();
+            if answered_nothing {
+                self.session
+                    .push_message(ConversationMessage::assistant_with_usage(
+                        vec![ContentBlock::Text {
+                            text: format!(
+                                "{FAILED_RESPONSE_NOTE_PREFIX}{CUT_OFF_BEFORE_ANSWER_NOTE}]"
+                            ),
+                        }],
+                        assistant_message.usage,
+                    ))
+                    .map_err(session_error)?;
+            } else {
+                self.session
+                    .push_message(assistant_message.clone())
+                    .map_err(session_error)?;
+                progress.assistant_messages.push(assistant_message);
+            }
 
             if pending_tool_uses.is_empty() {
                 if truncated && !progress.auto_continued {
                     progress.auto_continued = true;
+                    let message = if answered_nothing {
+                        AUTO_CONTINUE_AFTER_REASONING_MESSAGE
+                    } else {
+                        AUTO_CONTINUE_MESSAGE
+                    };
                     self.session
-                        .push_user_text(format!("{AUTO_CONTINUE_PREFIX} {AUTO_CONTINUE_MESSAGE}"))
+                        .push_user_text(format!("{AUTO_CONTINUE_PREFIX} {message}"))
                         .map_err(session_error)?;
                     continue;
                 }
@@ -1008,7 +1061,11 @@ where
         tool_uses: &[(String, String, String)],
         note: Option<String>,
     ) -> Result<TurnSummary, RuntimeError> {
-        if !message.blocks.is_empty() {
+        // A refusal before any output leaves its billing to the closing note.
+        let mut unrecorded_usage = None;
+        if message.blocks.is_empty() {
+            unrecorded_usage = message.usage;
+        } else {
             self.session
                 .push_message(message.clone())
                 .map_err(session_error)?;
@@ -1020,7 +1077,10 @@ where
             REFUSED_TOOL_CALL_MESSAGE,
             &mut progress,
         )?;
-        self.close_turn_with_note(format!("{FAILED_RESPONSE_NOTE_PREFIX}{REFUSAL_TURN_NOTE}]"));
+        self.close_turn_with_note(
+            format!("{FAILED_RESPONSE_NOTE_PREFIX}{REFUSAL_TURN_NOTE}]"),
+            unrecorded_usage,
+        );
         Ok(self.finish_turn(
             progress,
             TurnOutcome::Refused {
@@ -1087,7 +1147,7 @@ where
 
     fn finish_turn(&mut self, progress: TurnProgress, outcome: TurnOutcome) -> TurnSummary {
         if matches!(outcome, TurnOutcome::Cancelled { .. }) {
-            self.close_turn_with_note(INTERRUPTED_RESPONSE_NOTE.to_string());
+            self.close_turn_with_note(INTERRUPTED_RESPONSE_NOTE.to_string(), None);
         }
         let summary = TurnSummary {
             assistant_messages: progress.assistant_messages,
@@ -1107,7 +1167,8 @@ where
     }
 
     /// Ends a failed turn with an assistant note naming the failure, unless the
-    /// model's own message already ends it.
+    /// model's own message already ends it. The note keeps what the provider billed
+    /// for a response the turn could not use.
     fn close_failed_turn(&mut self, error: &RuntimeError) {
         let reason = error.to_string();
         let reason = reason.lines().next().unwrap_or_default().trim();
@@ -1118,14 +1179,19 @@ where
         if excerpt.len() < reason.len() {
             excerpt.push('\u{2026}');
         }
-        self.close_turn_with_note(format!("{FAILED_RESPONSE_NOTE_PREFIX}{excerpt}]"));
+        self.close_turn_with_note(
+            format!("{FAILED_RESPONSE_NOTE_PREFIX}{excerpt}]"),
+            error.usage(),
+        );
     }
 
     /// Appends `note` as the assistant's message when the transcript ends in a user
     /// or tool message: an unanswered prompt would be answered again by the next
-    /// turn, and providers expect user and assistant messages to alternate. A
-    /// session write that fails here leaves the transcript as it was.
-    fn close_turn_with_note(&mut self, note: String) {
+    /// turn, and providers expect user and assistant messages to alternate. `usage`
+    /// is what a response that left no message of its own was billed, so a restored
+    /// session counts it. A session write that fails here leaves the transcript as
+    /// it was.
+    fn close_turn_with_note(&mut self, note: String, usage: Option<TokenUsage>) {
         let ends_unanswered = self
             .session
             .messages
@@ -1134,9 +1200,10 @@ where
         if ends_unanswered {
             let _ = self
                 .session
-                .push_message(ConversationMessage::assistant(vec![ContentBlock::Text {
-                    text: note,
-                }]));
+                .push_message(ConversationMessage::assistant_with_usage(
+                    vec![ContentBlock::Text { text: note }],
+                    usage,
+                ));
         }
     }
 
@@ -1696,11 +1763,20 @@ struct ExecutedToolCall {
     interrupted: bool,
 }
 
+/// The usage a response's events report (the last one, as the stream's own
+/// totals come last).
+fn last_usage(events: &[AssistantEvent]) -> Option<TokenUsage> {
+    events.iter().rev().find_map(|event| match event {
+        AssistantEvent::Usage(usage) => Some(*usage),
+        _ => None,
+    })
+}
+
 #[derive(Debug)]
 struct BuiltAssistantMessage {
-    /// Empty only for a refusal before any output.
+    /// Empty only for a refusal before any output, or a response the output
+    /// limit cut off before any text or tool call. Carries the response's usage.
     message: ConversationMessage,
-    usage: Option<TokenUsage>,
     prompt_cache_events: Vec<PromptCacheEvent>,
     stop_reason: Option<String>,
     refusal: Option<String>,
@@ -1744,14 +1820,18 @@ fn build_assistant_message(
             "assistant stream ended without a message stop event",
         ));
     }
-    // A refusal before any output is an answer of its own, not an empty reply.
-    if blocks.is_empty() && !is_refusal_stop_reason(stop_reason.as_deref()) {
+    // A refusal before any output is an answer of its own, and a response the
+    // output limit cut off while the model was still reasoning is a cut-off reply
+    // to continue: neither is an empty reply.
+    if blocks.is_empty()
+        && !is_refusal_stop_reason(stop_reason.as_deref())
+        && !is_truncation_stop_reason(stop_reason.as_deref())
+    {
         return Err(RuntimeError::new("assistant stream produced no content"));
     }
 
     Ok(BuiltAssistantMessage {
         message: ConversationMessage::assistant_with_usage(blocks, usage),
-        usage,
         prompt_cache_events,
         stop_reason,
         refusal: refusal
@@ -2908,7 +2988,7 @@ mod resilience_tests {
     };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
     use crate::transcript::unanswered_tool_use_ids;
-    use crate::usage::TokenUsage;
+    use crate::usage::{TokenUsage, UsageTracker};
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -4004,6 +4084,138 @@ mod resilience_tests {
             .expect("turn completes");
         assert_eq!(summary.outcome, TurnOutcome::OutputTruncated);
         assert_eq!(runtime.api_client().requests.len(), 2);
+    }
+
+    /// What the client hands on when the output limit cuts the model off while it
+    /// is still reasoning (the gateway's `reasoning_content`, then `finish_reason`
+    /// "length" and its usage): no text, no tool call, as reasoning is no event.
+    fn cut_off_while_reasoning() -> Response {
+        Ok(vec![
+            AssistantEvent::Usage(TokenUsage {
+                input_tokens: 420,
+                output_tokens: 16_000,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            }),
+            AssistantEvent::StopReason("length".to_string()),
+            AssistantEvent::MessageStop,
+        ])
+    }
+
+    #[test]
+    fn a_reply_cut_off_while_reasoning_is_continued_and_its_usage_counted() {
+        let api = ScriptedApi::new(vec![
+            cut_off_while_reasoning(),
+            Ok(vec![
+                text("391."),
+                AssistantEvent::Usage(TokenUsage {
+                    input_tokens: 430,
+                    output_tokens: 5,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                }),
+                AssistantEvent::StopReason("end_turn".to_string()),
+                AssistantEvent::MessageStop,
+            ]),
+        ]);
+        let mut runtime = runtime_with(Session::new(), api, StaticToolExecutor::new());
+
+        let summary = runtime
+            .run_turn("what is 17 * 23?", None)
+            .expect("a reply cut off while reasoning is no empty reply");
+
+        assert_eq!(summary.outcome, TurnOutcome::Completed);
+        assert_eq!(summary.iterations, 2, "one automatic continuation");
+        assert_eq!(summary.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(summary.usage.input_tokens, 850);
+        assert_eq!(
+            summary.usage.output_tokens, 16_005,
+            "the cut-off reply was billed"
+        );
+        assert_eq!(
+            UsageTracker::from_session(runtime.session()).cumulative_usage(),
+            summary.usage,
+            "a restored session counts the cut-off reply too"
+        );
+        assert_eq!(
+            summary.assistant_messages.len(),
+            1,
+            "the note standing in for the cut-off reply is no answer"
+        );
+
+        // The continuation follows a stand-in for the reply, never the prompt itself.
+        let request = &runtime.api_client().requests[1];
+        let roles = request
+            .messages
+            .iter()
+            .map(|message| message.role)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            roles,
+            [MessageRole::User, MessageRole::Assistant, MessageRole::User]
+        );
+        let ContentBlock::Text { text: stand_in } = &request.messages[1].blocks[0] else {
+            panic!("expected the stand-in for the cut-off reply");
+        };
+        assert!(stand_in.contains("output token limit"), "{stand_in}");
+        let ContentBlock::Text { text: prompt } = &request.messages[2].blocks[0] else {
+            panic!("expected the continuation prompt");
+        };
+        assert!(prompt.starts_with(AUTO_CONTINUE_PREFIX), "{prompt}");
+        assert!(prompt.contains("before you wrote any answer"), "{prompt}");
+    }
+
+    #[test]
+    fn a_reply_cut_off_while_reasoning_twice_ends_as_output_truncated() {
+        let api = ScriptedApi::new(vec![cut_off_while_reasoning(), cut_off_while_reasoning()]);
+        let mut runtime = runtime_with(Session::new(), api, StaticToolExecutor::new());
+
+        let summary = runtime.run_turn("prove it", None).expect("turn ends");
+
+        assert_eq!(summary.outcome, TurnOutcome::OutputTruncated);
+        assert_eq!(runtime.api_client().requests.len(), 2);
+        assert_eq!(summary.usage.output_tokens, 32_000);
+        assert_eq!(
+            summary.assistant_messages,
+            Vec::<ConversationMessage>::new()
+        );
+        // The transcript ends with the runtime's note, not an unanswered prompt.
+        let last = runtime.session().messages.last().expect("messages");
+        assert_eq!(last.role, MessageRole::Assistant);
+        let ContentBlock::Text { text: note } = &last.blocks[0] else {
+            panic!("expected the closing note");
+        };
+        assert!(is_turn_end_note(note), "{note}");
+    }
+
+    #[test]
+    fn an_empty_reply_fails_the_turn_but_what_it_was_billed_is_counted() {
+        let api = ScriptedApi::new(vec![Ok(vec![
+            AssistantEvent::Usage(TokenUsage {
+                input_tokens: 40,
+                output_tokens: 3,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            }),
+            AssistantEvent::StopReason("end_turn".to_string()),
+            AssistantEvent::MessageStop,
+        ])]);
+        let mut runtime = runtime_with(Session::new(), api, StaticToolExecutor::new());
+
+        let error = runtime
+            .run_turn("hi", None)
+            .expect_err("a reply with nothing in it fails the turn");
+
+        assert!(error.to_string().contains("produced no content"), "{error}");
+        assert_eq!(error.usage().map(|usage| usage.output_tokens), Some(3));
+        assert_eq!(runtime.usage().cumulative_usage().output_tokens, 3);
+        assert_eq!(
+            UsageTracker::from_session(runtime.session())
+                .cumulative_usage()
+                .input_tokens,
+            40,
+            "the note closing the failed turn keeps its billing"
+        );
     }
 
     #[test]
