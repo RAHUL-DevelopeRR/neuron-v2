@@ -66,7 +66,7 @@ checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
 
 [[package]]
 name = "api"
-version = "7.0.0-alpha.1"
+version = "7.0.0-alpha.2"
 dependencies = [
  "criterion",
  "reqwest",
@@ -254,7 +254,7 @@ dependencies = [
 
 [[package]]
 name = "commands"
-version = "7.0.0-alpha.1"
+version = "7.0.0-alpha.2"
 dependencies = [
  "plugins",
  "runtime",
@@ -263,7 +263,7 @@ dependencies = [
 
 [[package]]
 name = "compat-harness"
-version = "7.0.0-alpha.1"
+version = "7.0.0-alpha.2"
 dependencies = [
  "commands",
  "runtime",
@@ -1187,7 +1187,7 @@ dependencies = [
 
 [[package]]
 name = "mock-anthropic-service"
-version = "7.0.0-alpha.1"
+version = "7.0.0-alpha.2"
 dependencies = [
  "api",
  "serde_json",
@@ -1202,7 +1202,7 @@ checksum = "27b02d87554356db9e9a873add8782d4ea6e3e58ea071a9adb9a2e8ddb884a8b"
 
 [[package]]
 name = "neuron-tui"
-version = "7.0.0-alpha.1"
+version = "7.0.0-alpha.2"
 dependencies = [
  "crossterm",
  "serde",
@@ -1423,7 +1423,7 @@ dependencies = [
 
 [[package]]
 name = "plugins"
-version = "7.0.0-alpha.1"
+version = "7.0.0-alpha.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -1766,7 +1766,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "7.0.0-alpha.1"
+version = "7.0.0-alpha.2"
 dependencies = [
  "glob",
  "plugins",
@@ -1850,7 +1850,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rusty-claude-cli"
-version = "7.0.0-alpha.1"
+version = "7.0.0-alpha.2"
 dependencies = [
  "aes-gcm",
  "api",
@@ -2182,7 +2182,7 @@ dependencies = [
 
 [[package]]
 name = "telemetry"
-version = "7.0.0-alpha.1"
+version = "7.0.0-alpha.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -2313,7 +2313,7 @@ dependencies = [
 
 [[package]]
 name = "tools"
-version = "7.0.0-alpha.1"
+version = "7.0.0-alpha.2"
 dependencies = [
  "api",
  "commands",

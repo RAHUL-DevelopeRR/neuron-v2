@@ -314,7 +314,7 @@ or put it in your user settings.
 | `NEURON_TRUST_WORKSPACE=1` | neuron | Trust the current directory in a headless run (only for checkouts you trust) |
 | `NEURON_NO_TUI=1` | neuron | Use the line REPL instead of the full-screen UI |
 | `NEURON_TUI_ASCII` | neuron-tui | `1` draws with the classic-console character set everywhere, `0` with the Unicode one |
-| `NEURON_VERSION` | install.sh, install.ps1 | Release to install (default: the latest release; a prerelease such as `7.0.0-alpha.1` must be named) |
+| `NEURON_VERSION` | install.sh, install.ps1 | Release to install (default: the latest release; a prerelease such as `7.0.0-alpha.2` must be named) |
 | `NEURON_INSTALL_DIR` | install.sh, install.ps1 | Install directory |
 | `NEURON_BINARY_PATH` | npm and pip launchers | Run this binary instead of the downloaded one |
 | `NEURON_CACHE_DIR` | npm and pip launchers | Where downloaded binaries are cached |
@@ -327,8 +327,8 @@ or put it in your user settings.
 | --- | --- | --- |
 | `install.sh` | Run it again with the new version: that version's release URL and `--version` (or `NEURON_VERSION`). Without a version it installs the latest stable release, and there is none yet | `rm ~/.local/bin/neuron ~/.local/bin/neuron-tui` |
 | `install.ps1` | Run it again with the new version: that version's release URL and `-Version` (or `NEURON_VERSION`). Without a version it installs the latest stable release, and there is none yet | Delete `%LOCALAPPDATA%\Programs\Neuron\bin` and remove it from your user `PATH` if you added it |
-| npm | `npm install --global @zero-x.live/neuron@next` during the alpha (`@latest` once a stable release is out) | `npm uninstall --global @zero-x.live/neuron` |
-| pip | Not available during the alpha, which is not on PyPI. For a prerelease on PyPI, `pip install --upgrade --pre neuroncli` | `pipx uninstall neuroncli` or `pip uninstall neuroncli` |
+| npm | `npm install --global @zero-x.live/neuron` (the alpha is npm's `latest` version) | `npm uninstall --global @zero-x.live/neuron` |
+| pip | `pip install --upgrade --pre neuroncli` (the alpha is a pre-release on PyPI, so pip needs `--pre`) | `pipx uninstall neuroncli` or `pip uninstall neuroncli` |
 
 Neuron keeps your login in the OS credential store or `~/.neuroncli/`, and your
 settings in `~/.neuron/`; the launchers cache binaries in `~/.cache/neuroncli` (Linux), `~/Library/Caches/neuroncli`

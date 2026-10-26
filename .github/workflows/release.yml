@@ -17,7 +17,9 @@ name: Release
 # ENABLE_PYPI_PUBLISH for tag pushes, or the publish_* inputs for a manual run
 # on a tag. Packages are built and tested in jobs without an OIDC token; the
 # publish jobs hold the token, install nothing and upload exactly the tested
-# files. A manual run on a branch only builds artifacts.
+# files. On npm, a tag push publishes a prerelease under the `next` dist-tag and
+# a release under `latest`; a manual run uses its npm_dist_tag input (next by
+# default). A manual run on a branch only builds artifacts.
 
 on:
   push:
@@ -29,6 +31,13 @@ on:
         description: Publish @zero-x.live/neuron to npm after the release assets verify (runs on a tag only)
         type: boolean
         default: false
+      npm_dist_tag:
+        description: npm dist-tag for publish_npm (latest is what a plain npm install gets; a tag push uses next for a prerelease and latest otherwise)
+        type: choice
+        options:
+          - next
+          - latest
+        default: next
       publish_pypi:
         description: Publish neuroncli to PyPI after the release assets verify (runs on a tag only)
         type: boolean
@@ -599,6 +608,8 @@ jobs:
       TARBALL: ${{ needs.package-npm.outputs.tarball }}
       EXPECTED_SHA256: ${{ needs.package-npm.outputs.sha256 }}
       PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
+      EVENT_NAME: ${{ github.event_name }}
+      NPM_DIST_TAG: ${{ inputs.npm_dist_tag }}
     steps:
       - uses: actions/setup-node@v4
         with:
@@ -619,8 +630,24 @@ jobs:
         run: echo "$EXPECTED_SHA256  dist/$TARBALL" | sha256sum --check --strict
       - name: Publish
         run: |
-          tag=latest
-          if [ "$PRERELEASE" = "true" ]; then tag=next; fi
+          # A manual run publishes under the npm_dist_tag it was given; a tag push puts a
+          # prerelease on next and a release on latest. The tag is always passed: npm 11
+          # refuses to publish a prerelease without an explicit --tag.
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            tag="$NPM_DIST_TAG"
+          elif [ "$PRERELEASE" = "true" ]; then
+            tag=next
+          else
+            tag=latest
+          fi
+          case "$tag" in
+            next | latest) ;;
+            *)
+              echo "::error::npm dist-tag must be next or latest, not '$tag'"
+              exit 1
+              ;;
+          esac
+          echo "Publishing $TARBALL to npm under the dist-tag $tag"
           npm publish "dist/$TARBALL" --access public --tag "$tag" --ignore-scripts
 
   package-pypi:
