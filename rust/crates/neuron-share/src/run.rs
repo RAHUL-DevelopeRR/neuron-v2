@@ -173,6 +173,8 @@ enum Event {
     Presence(Presence),
     /// The local host refused the observer (a wrong token).
     LocalRefused(String),
+    /// The local host did not answer the first time.
+    LocalUnreachable,
     NewCode,
     Quit,
 }
@@ -334,6 +336,13 @@ impl Driver {
                     None => Vec::new(),
                 },
                 Event::LocalRefused(message) => return Err(ShareError::Refused(message)),
+                Event::LocalUnreachable => {
+                    self.reporter.status(&format!(
+                        "Waiting for the Neuron host at {} (in ui/neuron-client: bun run host).",
+                        self.options.local_url
+                    ));
+                    Vec::new()
+                }
                 Event::NewCode => {
                     host.offer_pairing(&self.options.relay_url, self.options.pair_ttl_s)
                 }
@@ -557,8 +566,16 @@ async fn local_task(
 /// host is unreachable the session shows as failed, and the observer keeps trying.
 async fn observer_task(url: String, token: String, events: Events) {
     let mut tracker: Option<PresenceTracker> = None;
+    let mut waited = false;
     loop {
-        if let Ok((socket, _)) = tokio_tungstenite::connect_async(url.as_str()).await {
+        let connected = tokio_tungstenite::connect_async(url.as_str()).await;
+        if connected.is_err() && !waited {
+            waited = true;
+            if events.send(Event::LocalUnreachable).is_err() {
+                return;
+            }
+        }
+        if let Ok((socket, _)) = connected {
             let (mut write, mut read) = socket.split();
             let hello = json!({ "t": "hello", "protocol": 1, "token": token, "client": { "name": "Neuron share", "kind": "cli" } });
             if write.send(Message::text(hello.to_string())).await.is_ok() {
