@@ -34,7 +34,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import urlopen
 
-PACKAGE_VERSION = "7.0.0-alpha.1"
+PACKAGE_VERSION = "7.0.0-alpha.2"
 REPOSITORY = "https://github.com/RAHUL-DevelopeRR/neuron-v2"
 DEFAULT_DOWNLOAD_BASE = f"{REPOSITORY}/releases/download"
 CHECKSUM_TIMEOUT_SECONDS = 30
@@ -159,7 +159,7 @@ def _network_error(url: str, version: str, cache: Path, error: BaseException) ->
         if error.code == 404:
             return LauncherError(
                 f"Neuron {version} has no release asset at {url} (HTTP 404). The release may not be "
-                f"published yet; see {REPOSITORY}/releases, or upgrade with: pip install --upgrade neuroncli"
+                f"published yet; see {REPOSITORY}/releases, or upgrade with: pip install --upgrade --pre neuroncli"
             )
         return LauncherError(f"Downloading {url} failed with HTTP {error.code} {error.reason}. Try again later.")
     reason = getattr(error, "reason", None) or error

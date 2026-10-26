@@ -9,12 +9,12 @@
 #
 # The latest stable release:
 #   curl -fsSL https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/latest/download/install.sh | sh
-# A given release; a prerelease such as 7.0.0-alpha.1 is never the latest release, so name it:
-#   curl -fsSL https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.1/install.sh | sh -s -- --version 7.0.0-alpha.1
-#   curl -fsSL .../install.sh | sh -s -- --version 7.0.0-alpha.1 --install-dir "$HOME/bin"
+# A given release; a prerelease such as 7.0.0-alpha.2 is never the latest release, so name it:
+#   curl -fsSL https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.2/install.sh | sh -s -- --version 7.0.0-alpha.2
+#   curl -fsSL .../install.sh | sh -s -- --version 7.0.0-alpha.2 --install-dir "$HOME/bin"
 #
 # Environment:
-#   NEURON_VERSION         release to install, e.g. 7.0.0-alpha.1 (default: latest stable release)
+#   NEURON_VERSION         release to install, e.g. 7.0.0-alpha.2 (default: latest stable release)
 #   NEURON_INSTALL_DIR     install directory (default: $HOME/.local/bin)
 #   NEURON_DOWNLOAD_BASE   release download base URL (default: GitHub Releases);
 #                          must be HTTPS unless it points at a loopback host
@@ -60,7 +60,7 @@ Install the Neuron coding agent from GitHub Releases.
 Usage: install.sh [--version VERSION] [--install-dir DIR] [--help]
 
 Options:
-  --version VERSION    Release to install, e.g. 7.0.0-alpha.1 (default: latest stable)
+  --version VERSION    Release to install, e.g. 7.0.0-alpha.2 (default: latest stable)
   --install-dir DIR    Directory for the neuron binary (default: ~/.local/bin)
   -h, --help           Show this help
 
@@ -250,7 +250,7 @@ resolve_latest_version() {
     is_allowed_url "${api}" || die "NEURON_RELEASES_API must be an HTTPS URL (or loopback HTTP): ${api}"
     if ! fetch_releases_api "${api}" "${TMP_DIR}/latest.json"; then
         die "could not look up the latest Neuron release at ${api}.
-    Set NEURON_VERSION (for example NEURON_VERSION=7.0.0-alpha.1) to skip the lookup."
+    Set NEURON_VERSION (for example NEURON_VERSION=7.0.0-alpha.2) to skip the lookup."
     fi
     tag="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${TMP_DIR}/latest.json" | head -n 1)"
     [ -n "${tag}" ] || die "the latest-release response from ${api} has no tag_name; set NEURON_VERSION."
@@ -277,7 +277,7 @@ if [ -z "${VERSION}" ]; then
 fi
 VERSION="${VERSION#v}"
 if ! is_valid_version "${VERSION}"; then
-    die "invalid version: ${VERSION} (expected something like 7.0.0-alpha.1)"
+    die "invalid version: ${VERSION} (expected something like 7.0.0-alpha.2)"
 fi
 
 URL="${DOWNLOAD_BASE}/v${VERSION}/${ASSET}"

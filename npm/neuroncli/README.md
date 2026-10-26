@@ -8,7 +8,7 @@ Requires Node.js 22.14 or later on Linux (x64, arm64, glibc), macOS (Apple
 silicon, Intel) or Windows (x64).
 
 ```sh
-npm install --global @zero-x.live/neuron@next   # the 7.0.0 alpha
+npm install --global @zero-x.live/neuron   # the 7.0.0 alpha
 neuron auth login
 neuron
 ```

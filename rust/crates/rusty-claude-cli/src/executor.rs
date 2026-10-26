@@ -663,7 +663,7 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "Install and update:")?;
     writeln!(
         out,
-        "  npm install -g {NPM_PACKAGE}, pipx install {PYPI_PACKAGE}, or install.sh / install.ps1 from {NEURON_REPO_URL}/releases"
+        "  npm install -g {NPM_PACKAGE}, pipx install --pip-args=--pre {PYPI_PACKAGE}, or install.sh / install.ps1 from {NEURON_REPO_URL}/releases"
     )?;
     writeln!(out, "  Source: {NEURON_REPO_URL}")?;
     Ok(())

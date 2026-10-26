@@ -656,7 +656,7 @@ pub(crate) fn check_config_health(
 
 pub(crate) fn check_install_source_health() -> DiagnosticCheck {
     let npm_install = format!("npm install -g {NPM_PACKAGE}");
-    let pip_install = format!("pip install {PYPI_PACKAGE}");
+    let pip_install = format!("pip install --pre {PYPI_PACKAGE}");
     DiagnosticCheck::new(
         "Install source",
         DiagnosticLevel::Ok,
@@ -926,7 +926,7 @@ mod gateway_doctor_tests {
         let check = check_install_source_health();
         assert!(check.summary.contains("RAHUL-DevelopeRR/neuron-v2"));
         assert!(check.summary.contains("npm install -g @zero-x.live/neuron"));
-        assert!(check.summary.contains("pip install neuroncli"));
+        assert!(check.summary.contains("pip install --pre neuroncli"));
         assert!(check.details[0].contains(NEURON_REPO_URL));
         assert_eq!(check.data["repository"], json!(NEURON_REPO_URL));
         assert_eq!(check.data["npm_package"], json!("@zero-x.live/neuron"));

@@ -13,13 +13,13 @@
 
         irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/latest/download/install.ps1 | iex
 
-    A given release; a prerelease such as 7.0.0-alpha.1 is never the latest release, so
+    A given release; a prerelease such as 7.0.0-alpha.2 is never the latest release, so
     name it. To pass parameters when piping, create a script block:
 
-        & ([scriptblock]::Create((irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.1/install.ps1))) -Version 7.0.0-alpha.1 -AddToPath
+        & ([scriptblock]::Create((irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.2/install.ps1))) -Version 7.0.0-alpha.2 -AddToPath
 
 .PARAMETER Version
-    Release to install, for example 7.0.0-alpha.1. Defaults to $env:NEURON_VERSION, then the latest stable release.
+    Release to install, for example 7.0.0-alpha.2. Defaults to $env:NEURON_VERSION, then the latest stable release.
 
 .PARAMETER InstallDir
     Install directory. Defaults to $env:NEURON_INSTALL_DIR, then %LOCALAPPDATA%\Programs\Neuron\bin.
@@ -139,7 +139,7 @@ function Resolve-NeuronVersion([string]$Requested) {
     try {
         $release = Invoke-RestMethod -Uri $api -Headers $headers -UseBasicParsing
     } catch {
-        throw "could not look up the latest Neuron release at ${api}: $($_.Exception.Message). Pass -Version 7.0.0-alpha.1 (or set NEURON_VERSION) to skip the lookup."
+        throw "could not look up the latest Neuron release at ${api}: $($_.Exception.Message). Pass -Version 7.0.0-alpha.2 (or set NEURON_VERSION) to skip the lookup."
     }
     $tag = $null
     if ($release -and ($release.PSObject.Properties.Name -contains 'tag_name')) { $tag = [string]$release.tag_name }
@@ -266,7 +266,7 @@ function Install-Neuron {
     $resolved = (Resolve-NeuronVersion $Version).Trim()
     if ($resolved.StartsWith('v')) { $resolved = $resolved.Substring(1) }
     if ($resolved -notmatch '^\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$') {
-        throw "invalid version: $resolved (expected something like 7.0.0-alpha.1)"
+        throw "invalid version: $resolved (expected something like 7.0.0-alpha.2)"
     }
 
     $target = $InstallDir

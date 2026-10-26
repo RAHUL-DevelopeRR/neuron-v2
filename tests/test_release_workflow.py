@@ -17,7 +17,7 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fake_release  # noqa: E402
@@ -167,6 +167,18 @@ class ReleaseWorkflowStructureTests(unittest.TestCase):
                     self.assertIn(variable, condition)
         self.assertIn("environment:\n      name: npm", job_block("publish-npm"))
         self.assertIn("environment:\n      name: pypi", job_block("publish-pypi"))
+
+    def test_a_manual_npm_publish_chooses_next_or_latest_and_defaults_to_next(self) -> None:
+        match = re.search(r"(?ms)^      npm_dist_tag:\n(.*?)(?=^      \S|^\S)", WORKFLOW)
+        self.assertIsNotNone(match, "workflow_dispatch has no npm_dist_tag input")
+        block = match.group(1)
+        self.assertIn("type: choice", block)
+        self.assertEqual(re.findall(r"(?m)^          - (\S+)$", block), ["next", "latest"])
+        self.assertIn("default: next", block)
+        publish = job_block("publish-npm")
+        self.assertIn("NPM_DIST_TAG: ${{ inputs.npm_dist_tag }}", publish)
+        self.assertIn("EVENT_NAME: ${{ github.event_name }}", publish)
+        self.assertIn('--tag "$tag"', publish, "npm 11 needs an explicit --tag for a prerelease")
 
     def test_assets_are_built_only_while_the_release_is_unpublished(self) -> None:
         for job in ("build", "attest", "notices", "release"):
@@ -320,6 +332,50 @@ class ReleaseWorkflowStepTests(unittest.TestCase):
     def test_promote_leaves_a_newer_or_withdrawn_release_alone(self) -> None:
         self.assertEqual(self.run_promote(latest="v6.4.0"), [])  # publishing an old tag after the fact
         self.assertEqual(self.run_promote(latest="v6.2.9", prerelease="true"), [])
+
+    def run_npm_publish(self, event: str, dist_tag: str, prerelease: str) -> Tuple[subprocess.CompletedProcess, List[str]]:
+        """publish-npm's Publish step against a fake npm: the result and the npm calls."""
+        log = self.root / "npm.log"
+        log.write_text("", encoding="utf-8")
+        fake_release.write_executable(self.fakebin / "npm", b'#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$FAKE_NPM_LOG"\n')
+        result = self.run_step(
+            "publish-npm",
+            "Publish",
+            TARBALL="zero-x.live-neuron-7.0.0-alpha.2.tgz",
+            EVENT_NAME=event,
+            NPM_DIST_TAG=dist_tag,
+            PRERELEASE=prerelease,
+            FAKE_NPM_LOG=shell_path(log),
+        )
+        return result, log.read_text(encoding="utf-8").splitlines()
+
+    def test_npm_dist_tag_follows_the_manual_input_or_the_version(self) -> None:
+        cases = {
+            # (event, npm_dist_tag input, prerelease): dist-tag
+            ("push", "", "true"): "next",
+            ("push", "", "false"): "latest",
+            ("push", "latest", "true"): "next",  # the input applies to a manual run only
+            ("workflow_dispatch", "next", "true"): "next",
+            ("workflow_dispatch", "latest", "true"): "latest",
+            ("workflow_dispatch", "next", "false"): "next",
+            ("workflow_dispatch", "latest", "false"): "latest",
+        }
+        for (event, dist_tag, prerelease), expected in cases.items():
+            with self.subTest(event=event, npm_dist_tag=dist_tag, prerelease=prerelease):
+                result, calls = self.run_npm_publish(event, dist_tag, prerelease)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    calls,
+                    [f"publish dist/zero-x.live-neuron-7.0.0-alpha.2.tgz --access public --tag {expected} --ignore-scripts"],
+                )
+
+    def test_npm_publish_refuses_a_dist_tag_other_than_next_or_latest(self) -> None:
+        for dist_tag in ("", "beta", "latest --dry-run"):
+            with self.subTest(npm_dist_tag=dist_tag):
+                result, calls = self.run_npm_publish("workflow_dispatch", dist_tag, "true")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("must be next or latest", result.stdout)
+                self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":

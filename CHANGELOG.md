@@ -3,6 +3,77 @@
 Notable changes to Neuron. Versions follow [semantic versioning](https://semver.org/).
 The release workflow copies a version's section into its GitHub release notes.
 
+## 7.0.0-alpha.2 (2026-10-26)
+
+The second Neuron alpha, and the first one on npm and PyPI: both packages now install
+the new Neuron. It is still a GitHub prerelease. It says clearly when the model
+declines a request, keeps the model's reasoning apart from its answer, never runs a
+tool call from a reply that was refused or cut off, and lets long answers finish
+streaming.
+
+The [known limitations of 7.0.0-alpha.1](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/v7.0.0-alpha.1/CHANGELOG.md#known-limitations) still apply, except the ones about npm and PyPI.
+
+### npm and PyPI
+
+- `npm install --global @zero-x.live/neuron` installs this alpha: it is npm's default
+  `latest` version, so `@next` is no longer needed. Run the same command to upgrade.
+- On PyPI the alpha is a pre-release, so pip needs `--pre`:
+  `pip install --pre neuroncli` (`pip install --upgrade --pre neuroncli` to upgrade).
+- The old 6.2.x builds (npm 6.2.0, PyPI 6.2.4 and earlier) were built outside the
+  release pipeline and are unsupported. Upgrade with the commands above.
+- The GitHub release is still a prerelease, so `install.sh` and `install.ps1` need its
+  version (`--version 7.0.0-alpha.2`, `-Version 7.0.0-alpha.2`); the README has the
+  full commands.
+
+### Refusals and reasoning
+
+- When the model declines to continue, Neuron says so instead of failing or showing an
+  empty reply, and keeps whatever the model wrote before. The line REPL ends the turn
+  with "The model declined to continue this request." and the provider's reason, in
+  Neuron's words and without provider or model names. The full-screen UI ends the
+  message with a "Declined" banner of its own, below the answer. `--output-format json`
+  reports `outcome` `refused` and a `refusal` object (`message`, `note`,
+  `tool_calls_not_run`); with `--compact`, the refusal line goes to standard error.
+- The model's reasoning stays apart from its answer in the line REPL, the full-screen
+  UI and headless output, and is never part of the JSON `message`. A thinking block no
+  longer starts with blank lines.
+
+### Tool calls and cut-off replies
+
+- No tool call from a refused reply, or from one cut off at the output token limit,
+  runs, even when its arguments are complete. Each gets an error result saying why,
+  and the full-screen UI shows such calls as not run. Sub-agents follow the same rule,
+  and a sub-agent whose stream breaks off runs none of that reply's calls: it tries a
+  fallback model or fails with a retryable error.
+- Tool arguments that are not a JSON object, such as arguments cut off mid-stream, go
+  back to the model as a tool error instead of failing the turn. They are checked
+  before hooks, permissions or the tool run.
+- A reply cut off at the output token limit while the model was still reasoning, before
+  any answer, no longer fails the turn with "assistant stream produced no content". The
+  turn continues once, telling the model that its reasoning used the whole budget; cut
+  off again, it ends as `output_truncated`. Neuron now counts the tokens of such a
+  reply, also in a restored session.
+
+### Streams
+
+- A streamed answer has no total time limit, so long answers are no longer cut off at
+  5 minutes. The connection must open within 30 seconds, and a stream that receives
+  nothing for 120 seconds (keep-alive messages count) ends with a retryable error that
+  names the model.
+- Requests answered in one piece, such as the non-streaming fallbacks, keep their
+  5-minute total limit and have no idle limit, since their reply arrives only once it
+  is complete.
+
+### Packaging
+
+- Removed a stray submodule entry (`opencode`) that had no `.gitmodules` URL. It broke
+  the checkout in the release workflow's npm and PyPI jobs, which is why 7.0.0-alpha.1
+  never reached npm (PyPI uploads were also paused then). A packaging test now fails on
+  any such entry.
+- A manual run of the release workflow chooses the npm dist-tag (`npm_dist_tag`:
+  `next`, the default, or `latest`). A tag push still publishes a prerelease under
+  `next` and a release under `latest`.
+
 ## 7.0.0-alpha.1 (2026-10-24)
 
 The first Neuron alpha, and the first release built and published by this repository's
