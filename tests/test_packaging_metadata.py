@@ -176,6 +176,15 @@ class PackagingMetadataTests(unittest.TestCase):
         for launcher in ("neuron_cli/__init__.py", "npm/neuroncli/lib/binary.js"):
             self.assertIn("neuron-tui-", read(launcher), f"{launcher} has no UI asset")
 
+    def test_npm_publishes_the_tarball_by_an_explicit_relative_path(self) -> None:
+        # npm reads `dist/<name>.tgz` as the GitHub shorthand `owner/repo` and runs
+        # git ls-remote against github.com/dist/... (7.0.0-alpha.2's publish failed so).
+        release = read(".github/workflows/release.yml")
+        publishes = re.findall(r"npm publish (\S+)", release)
+        self.assertTrue(publishes, "release.yml has no npm publish")
+        for target in publishes:
+            self.assertRegex(target.strip("\"'"), r"^(\./|/|\$RUNNER_TEMP/)", f"npm publish {target} is not an explicit path")
+
     def test_linux_glibc_floor_matches_the_readme(self) -> None:
         release = read(".github/workflows/release.yml")
         floor = re.search(r"MAX_GLIBC: '([0-9.]+)'", release)
