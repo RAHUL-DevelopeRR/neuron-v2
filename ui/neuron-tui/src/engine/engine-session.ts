@@ -227,6 +227,12 @@ export function handleEngineEvent(event: UiEvent): void {
       // During a sign-in the only notice is its success ("Signed in to
       // Zero-X ..."), so engines without `session_starting` are read from it.
       if (engine.signIn && !engine.signIn.approved) engine.markSignInApproved()
+      if (event.kind === 'refusal') {
+        // A turn's refusal ends its message (turn-events.ts); anywhere else
+        // it is a chat line.
+        if (!(turnActive && turnMessageId)) showSystemMessage(event.message)
+        return
+      }
       if (event.message.startsWith(QUESTION_PREFIX)) {
         engine.setPendingQuestion(event.message)
         // A turn's question goes into its message (turn-events.ts), where

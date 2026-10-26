@@ -8,7 +8,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error::{ApiError, GatewayError, GatewayErrorCode};
-use crate::http_client::build_http_client_or_default;
+use crate::http_client::{
+    build_http_client_or_default, build_http_client_with_timeouts_or_default,
+    build_one_piece_http_client_or_default, HttpTimeouts,
+};
 use crate::retry::{
     retry_after_from_headers, RetryBudget, RetryNotice, RetryObserver, RetryProgress,
     CAPACITY_MAX_WAIT, CAPACITY_TOTAL_BACKOFF, MAX_TOTAL_BACKOFF,
@@ -239,7 +242,13 @@ pub fn installed_openai_compat_endpoint() -> Option<OpenAiCompatEndpoint> {
 
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatClient {
+    /// Streams: the connect and read-idle deadlines.
     http: reqwest::Client,
+    /// Responses read in one piece: the connect deadline, and `timeouts.request`
+    /// set on each request (see [`crate::build_one_piece_http_client_with_timeouts`]).
+    one_piece_http: reqwest::Client,
+    /// The deadlines both clients were built with.
+    timeouts: HttpTimeouts,
     api_key: String,
     config: OpenAiCompatConfig,
     base_url: String,
@@ -281,6 +290,8 @@ impl OpenAiCompatClient {
     pub fn new(api_key: impl Into<String>, config: OpenAiCompatConfig) -> Self {
         Self {
             http: build_http_client_or_default(),
+            one_piece_http: build_one_piece_http_client_or_default(HttpTimeouts::default()),
+            timeouts: HttpTimeouts::default(),
             api_key: api_key.into(),
             config,
             base_url: read_base_url(config),
@@ -323,6 +334,18 @@ impl OpenAiCompatClient {
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    /// Replaces the HTTP deadlines (default [`HttpTimeouts::default`]): the
+    /// connect deadline of every request, the read-idle deadline of a stream and
+    /// the total deadline of a non-streaming request. A stream has no total
+    /// deadline, and a non-streaming request no read-idle one.
+    #[must_use]
+    pub fn with_http_timeouts(mut self, timeouts: HttpTimeouts) -> Self {
+        self.http = build_http_client_with_timeouts_or_default(timeouts);
+        self.one_piece_http = build_one_piece_http_client_or_default(timeouts);
+        self.timeouts = timeouts;
         self
     }
 
@@ -441,6 +464,7 @@ impl OpenAiCompatClient {
             done: false,
             state: StreamState::new(request.model.clone()),
             usage_observer: self.usage_observer.clone(),
+            idle_timeout: self.timeouts.read_idle,
         })
     }
 
@@ -512,14 +536,23 @@ impl OpenAiCompatClient {
         check_request_body_size(request, self.config())?;
 
         let request_url = chat_completions_endpoint(&self.base_url);
-        self.http
+        // A stream runs as long as it keeps sending (the streaming client's
+        // read-idle deadline ends one that stalls); a response read in one piece
+        // gets a total deadline, on the client without a read-idle one.
+        let http = if request.stream {
+            &self.http
+        } else {
+            &self.one_piece_http
+        };
+        let mut builder = http
             .post(&request_url)
             .header("content-type", "application/json")
             .bearer_auth(&self.api_key)
-            .json(&build_chat_completion_request(request, self.config()))
-            .send()
-            .await
-            .map_err(ApiError::from)
+            .json(&build_chat_completion_request(request, self.config()));
+        if !request.stream {
+            builder = builder.timeout(self.timeouts.request);
+        }
+        builder.send().await.map_err(ApiError::from)
     }
 
     /// The capacity budget for the Zero-X gateway's shared-pool waits
@@ -630,6 +663,8 @@ pub struct MessageStream {
     done: bool,
     state: StreamState,
     usage_observer: Option<UsageObserver>,
+    /// The client's read-idle deadline, named when a stall ends the stream.
+    idle_timeout: Duration,
 }
 
 impl MessageStream {
@@ -667,7 +702,18 @@ impl MessageStream {
                 return Ok(None);
             }
 
-            if let Some(chunk) = self.response.chunk().await? {
+            let chunk = match self.response.chunk().await {
+                Ok(chunk) => chunk,
+                Err(error) if error.is_timeout() => {
+                    return Err(ApiError::StreamIdle {
+                        provider: self.parser.provider.clone(),
+                        model: self.state.model.clone(),
+                        idle: self.idle_timeout,
+                    });
+                }
+                Err(error) => return Err(ApiError::from(error)),
+            };
+            if let Some(chunk) = chunk {
                 for parsed in self.parser.push(&chunk)? {
                     self.pending.extend(self.state.ingest_chunk(parsed)?);
                 }
@@ -758,6 +804,9 @@ struct StreamState {
     message_started: bool,
     finished: bool,
     stop_reason: Option<String>,
+    /// The `delta.refusal` pieces so far (the model's or provider's reason for
+    /// declining).
+    refusal: String,
     usage: Option<Usage>,
     tool_calls: BTreeMap<u32, ToolCallState>,
     /// Index the next content block gets. Blocks are numbered in the order
@@ -776,6 +825,7 @@ impl StreamState {
             message_started: false,
             finished: false,
             stop_reason: None,
+            refusal: String::new(),
             usage: None,
             tool_calls: BTreeMap::new(),
             next_block_index: 0,
@@ -790,8 +840,20 @@ impl StreamState {
     }
 
     /// Appends `delta` to the open block of `kind`, first closing an open
-    /// block of the other kind and starting a new one when needed.
+    /// block of the other kind and starting a new one when needed. A thinking
+    /// block does not start with blank lines: the Zero-X gateway separates
+    /// reasoning that follows answer text with them.
     fn push_prose_delta(&mut self, kind: ProseKind, delta: String, events: &mut Vec<StreamEvent>) {
+        let opens_block = !matches!(self.open_prose, Some((open_kind, _)) if open_kind == kind);
+        let delta = if opens_block && kind == ProseKind::Thinking {
+            let trimmed = delta.trim_start_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                return;
+            }
+            trimmed.to_string()
+        } else {
+            delta
+        };
         let index = match self.open_prose {
             Some((open_kind, index)) if open_kind == kind => index,
             _ => {
@@ -852,6 +914,7 @@ impl StreamState {
                         output_tokens: 0,
                     },
                     request_id: None,
+                    refusal: None,
                 },
             }));
         }
@@ -865,8 +928,12 @@ impl StreamState {
                 content,
                 reasoning_content,
                 reasoning,
+                refusal,
                 tool_calls,
             } = choice.delta;
+            if let Some(piece) = refusal {
+                self.refusal.push_str(&piece);
+            }
             // Reasoning (`reasoning_content`, or `reasoning` as sent by Groq
             // and OpenRouter) streams as its own thinking block, never as
             // answer text. It precedes the answer when a chunk carries both.
@@ -975,19 +1042,29 @@ impl StreamState {
         if self.finished {
             return Ok(Vec::new());
         }
-        if !self.tool_calls.is_empty() {
+        // Refusal text means the model declined, whatever the finish reason.
+        if !self.refusal.trim().is_empty() {
+            self.stop_reason = Some(runtime::REFUSAL_STOP_REASON.to_string());
+        }
+        // The calls of a response that was cut off or refused are handed on
+        // as they are: the runtime runs none of them and says why.
+        let calls_will_not_run = runtime::is_truncation_stop_reason(self.stop_reason.as_deref())
+            || runtime::is_refusal_stop_reason(self.stop_reason.as_deref());
+        if !self.tool_calls.is_empty() && !calls_will_not_run {
             if self.stop_reason.as_deref() != Some("tool_use") {
                 return Err(ApiError::InvalidSseFrame(
                     "Tool stream ended without a tool_calls finish reason",
                 ));
             }
-            if self.tool_calls.values().any(|call| {
-                call.name.as_ref().is_none_or(String::is_empty)
-                    || !serde_json::from_str::<Value>(&call.arguments)
-                        .is_ok_and(|value| value.is_object())
-            }) {
+            // Arguments that are not valid JSON reach the runtime, which
+            // answers the call with an error instead of running it.
+            if self
+                .tool_calls
+                .values()
+                .any(|call| call.name.as_ref().is_none_or(String::is_empty))
+            {
                 return Err(ApiError::InvalidSseFrame(
-                    "Tool stream ended with an incomplete function name or arguments",
+                    "Tool stream ended with an incomplete function name",
                 ));
             }
         }
@@ -1017,6 +1094,7 @@ impl StreamState {
         }
 
         if self.message_started {
+            let refusal = self.refusal.trim();
             events.push(StreamEvent::MessageDelta(MessageDeltaEvent {
                 delta: MessageDelta {
                     stop_reason: Some(
@@ -1025,6 +1103,7 @@ impl StreamState {
                             .unwrap_or_else(|| "end_turn".to_string()),
                     ),
                     stop_sequence: None,
+                    refusal: (!refusal.is_empty()).then(|| refusal.to_string()),
                 },
                 usage: self.usage.clone().unwrap_or(Usage {
                     input_tokens: 0,
@@ -1126,6 +1205,10 @@ struct ChatMessage {
     /// Groq / `OpenRouter` name for `reasoning_content`.
     #[serde(default)]
     reasoning: Option<Value>,
+    /// Why the model declined (the Zero-X gateway's note with `content_filter`,
+    /// or `OpenAI`'s refusal text).
+    #[serde(default)]
+    refusal: Option<String>,
     #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     tool_calls: Vec<ResponseToolCall>,
 }
@@ -1207,6 +1290,11 @@ struct ChunkDelta {
     /// Groq / `OpenRouter` name for `reasoning_content`.
     #[serde(default)]
     reasoning: Option<Value>,
+    /// A piece of the reason the model declined: the Zero-X gateway sends its
+    /// note whole with `finish_reason: "content_filter"`, `OpenAI` streams its
+    /// refusal text in pieces.
+    #[serde(default)]
+    refusal: Option<String>,
     #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     tool_calls: Vec<DeltaToolCall>,
 }
@@ -1686,6 +1774,18 @@ fn normalize_response(
             input: parse_tool_arguments(&tool_call.function.arguments),
         });
     }
+    let refusal = choice
+        .message
+        .refusal
+        .map(|note| note.trim().to_string())
+        .filter(|note| !note.is_empty());
+    let stop_reason = if refusal.is_some() {
+        Some(runtime::REFUSAL_STOP_REASON.to_string())
+    } else {
+        choice
+            .finish_reason
+            .map(|value| normalize_finish_reason(&value))
+    };
 
     Ok(MessageResponse {
         id: response.id,
@@ -1693,9 +1793,7 @@ fn normalize_response(
         role: choice.message.role,
         content,
         model: response.model.if_empty_then(model.to_string()),
-        stop_reason: choice
-            .finish_reason
-            .map(|value| normalize_finish_reason(&value)),
+        stop_reason,
         stop_sequence: None,
         usage: response
             .usage
@@ -1703,11 +1801,16 @@ fn normalize_response(
             .map(OpenAiUsage::to_usage)
             .unwrap_or_default(),
         request_id: None,
+        refusal,
     })
 }
 
+/// The arguments as JSON, or the raw text as a JSON string when they do not
+/// parse (cut off or garbled): the runtime then answers the call with an error
+/// instead of running it. Wrapping them in an object would hand the tool an
+/// input it might accept.
 fn parse_tool_arguments(arguments: &str) -> Value {
-    serde_json::from_str(arguments).unwrap_or_else(|_| json!({ "raw": arguments }))
+    serde_json::from_str(arguments).unwrap_or_else(|_| Value::String(arguments.to_string()))
 }
 
 fn next_sse_frame(buffer: &mut Vec<u8>) -> Option<String> {
@@ -1967,6 +2070,9 @@ fn normalize_finish_reason(value: &str) -> String {
     match value {
         "stop" => "end_turn",
         "tool_calls" => "tool_use",
+        // The provider stopped the reply (the Zero-X gateway's Claude refusal,
+        // a moderation filter): the same stop reason as Anthropic's own.
+        "content_filter" => runtime::REFUSAL_STOP_REASON,
         other => other,
     }
     .to_string()
@@ -2025,7 +2131,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_stream_requires_explicit_completion_before_execution() {
+    fn tool_stream_requires_an_explicit_finish_reason_and_passes_bad_arguments_on() {
         let mut state = super::StreamState::new("auto".into());
         let chunk = serde_json::from_value(serde_json::json!({
             "id": "tool", "choices": [{"delta": {"tool_calls": [{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{}"}}]}}]
@@ -2039,12 +2145,349 @@ mod tests {
         state.ingest_chunk(completed).unwrap();
         let events = state.finish().unwrap();
         assert!(events.iter().any(|event| matches!(event, crate::types::StreamEvent::MessageDelta(delta) if delta.delta.stop_reason.as_deref() == Some("tool_use"))));
+        // Arguments that are not valid JSON are handed on as they came: the
+        // runtime answers the call with an error instead of running it.
         let mut malformed = super::StreamState::new("auto".into());
         let chunk = serde_json::from_value(serde_json::json!({
             "id": "tool", "choices": [{"delta": {"tool_calls": [{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\"path\":"}}]}, "finish_reason":"tool_calls"}]
         })).unwrap();
-        malformed.ingest_chunk(chunk).unwrap();
-        assert!(malformed.finish().is_err());
+        let mut events = malformed.ingest_chunk(chunk).unwrap();
+        events.extend(malformed.finish().unwrap());
+        assert_eq!(tool_arguments(&events), ["{\"path\":"]);
+        assert_eq!(stop_reason(&events).as_deref(), Some("tool_use"));
+        // A call without a name cannot be represented at all.
+        let mut nameless = super::StreamState::new("auto".into());
+        let chunk = serde_json::from_value(serde_json::json!({
+            "id": "tool", "choices": [{"delta": {"tool_calls": [{"index":0,"id":"call_1","function":{"arguments":"{}"}}]}, "finish_reason":"tool_calls"}]
+        })).unwrap();
+        nameless.ingest_chunk(chunk).unwrap();
+        assert!(nameless.finish().is_err());
+    }
+
+    /// The arguments of each tool block, in stream order.
+    fn tool_arguments(events: &[crate::types::StreamEvent]) -> Vec<String> {
+        use crate::types::{ContentBlockDelta, OutputContentBlock, StreamEvent};
+        let mut tools: Vec<(u32, String)> = Vec::new();
+        for event in events {
+            match event {
+                StreamEvent::ContentBlockStart(start) => {
+                    if let OutputContentBlock::ToolUse { .. } = start.content_block {
+                        tools.push((start.index, String::new()));
+                    }
+                }
+                StreamEvent::ContentBlockDelta(delta) => {
+                    if let ContentBlockDelta::InputJsonDelta { partial_json } = &delta.delta {
+                        if let Some((_, input)) =
+                            tools.iter_mut().find(|(index, _)| *index == delta.index)
+                        {
+                            input.push_str(partial_json);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        tools.into_iter().map(|(_, input)| input).collect()
+    }
+
+    fn message_delta(events: &[crate::types::StreamEvent]) -> Option<&crate::types::MessageDelta> {
+        events.iter().find_map(|event| match event {
+            crate::types::StreamEvent::MessageDelta(delta) => Some(&delta.delta),
+            _ => None,
+        })
+    }
+
+    fn stop_reason(events: &[crate::types::StreamEvent]) -> Option<String> {
+        message_delta(events).and_then(|delta| delta.stop_reason.clone())
+    }
+
+    /// Replays a recorded Zero-X gateway stream (`tests/fixtures/gateway_claude`)
+    /// through the SSE parser and the stream state, as `MessageStream` does.
+    fn replay(sse: &str) -> Result<Vec<crate::types::StreamEvent>, ApiError> {
+        let mut parser = super::OpenAiSseParser::with_context(super::ZERO_X_PROVIDER_NAME, "m");
+        let mut state = super::StreamState::new("claude-opus-5-5".into());
+        let mut events = Vec::new();
+        // Small pieces, as a network delivers them: frames split anywhere.
+        for piece in sse.as_bytes().chunks(37) {
+            for chunk in parser.push(piece)? {
+                events.extend(state.ingest_chunk(chunk)?);
+            }
+        }
+        for chunk in parser.finish()? {
+            events.extend(state.ingest_chunk(chunk)?);
+        }
+        assert!(
+            !state.is_truncated(parser.saw_done),
+            "a recorded stream is complete"
+        );
+        events.extend(state.finish()?);
+        Ok(events)
+    }
+
+    const GATEWAY_REFUSAL_NOTE: &str =
+        "Claude declined this request (safety category: cyber). Rephrase it or choose another model.";
+
+    #[test]
+    fn gateway_refusal_mid_text_keeps_the_text_and_carries_the_note() {
+        let events = replay(include_str!(
+            "../../tests/fixtures/gateway_claude/refusal_mid_text.sse"
+        ))
+        .unwrap();
+        assert_eq!(
+            streamed_text(&events),
+            (
+                "Here is how the lock mechanism works. First, the pins".to_string(),
+                String::new()
+            )
+        );
+        let delta = message_delta(&events).expect("message delta");
+        assert_eq!(delta.stop_reason.as_deref(), Some("refusal"));
+        assert_eq!(delta.refusal.as_deref(), Some(GATEWAY_REFUSAL_NOTE));
+        assert!(matches!(
+            events.last(),
+            Some(crate::types::StreamEvent::MessageStop(_))
+        ));
+    }
+
+    #[test]
+    fn gateway_refusal_before_any_text_is_a_refusal_not_an_empty_reply() {
+        let events = replay(include_str!(
+            "../../tests/fixtures/gateway_claude/refusal_before_text.sse"
+        ))
+        .unwrap();
+        assert!(block_trace(&events).is_empty(), "no content blocks");
+        let delta = message_delta(&events).expect("message delta");
+        assert_eq!(delta.stop_reason.as_deref(), Some("refusal"));
+        assert_eq!(delta.refusal.as_deref(), Some(GATEWAY_REFUSAL_NOTE));
+    }
+
+    #[test]
+    fn openai_refusal_text_marks_a_refusal_whatever_the_finish_reason() {
+        let mut state = super::StreamState::new("gpt-4o".into());
+        let events = ingest_all(
+            &mut state,
+            vec![
+                serde_json::json!({"id": "r", "choices": [{"delta": {"role": "assistant", "content": null, "refusal": ""}}]}),
+                serde_json::json!({"id": "r", "choices": [{"delta": {"refusal": "I can't help "}}]}),
+                serde_json::json!({"id": "r", "choices": [{"delta": {"refusal": "with that."}, "finish_reason": "stop"}]}),
+            ],
+        );
+        let delta = message_delta(&events).expect("message delta");
+        assert_eq!(delta.stop_reason.as_deref(), Some("refusal"));
+        assert_eq!(delta.refusal.as_deref(), Some("I can't help with that."));
+        // A plain content filter without a note is a refusal too.
+        let mut filtered = super::StreamState::new("azure/gpt-4o".into());
+        let events = ingest_all(
+            &mut filtered,
+            vec![
+                serde_json::json!({"id": "f", "choices": [{"delta": {"content": "Sure"}}]}),
+                serde_json::json!({"id": "f", "choices": [{"delta": {}, "finish_reason": "content_filter"}]}),
+            ],
+        );
+        let delta = message_delta(&events).expect("message delta");
+        assert_eq!(delta.stop_reason.as_deref(), Some("refusal"));
+        assert_eq!(delta.refusal, None);
+    }
+
+    #[test]
+    fn gateway_reasoning_streams_as_thinking_apart_from_the_answer() {
+        let events = replay(include_str!(
+            "../../tests/fixtures/gateway_claude/reasoning_then_text.sse"
+        ))
+        .unwrap();
+        let (text, thinking) = streamed_text(&events);
+        assert_eq!(text, "17 * 23 = 391.");
+        assert_eq!(thinking, "The user asks for 17 * 23. That is 391.\n\n");
+        let kinds = block_trace(&events)
+            .into_iter()
+            .filter(|(kind, _)| !kind.starts_with("delta:"))
+            .map(|(kind, index)| format!("{kind}@{index}"))
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, ["thinking@0", "stop@0", "text@1", "stop@1"]);
+        assert_eq!(stop_reason(&events).as_deref(), Some("end_turn"));
+    }
+
+    /// The output limit cut the model off while it was still thinking: reasoning
+    /// only, then `finish_reason` "length" and the usage the gateway billed.
+    #[test]
+    fn gateway_reasoning_cut_by_length_keeps_its_stop_reason_and_usage() {
+        let events = replay(include_str!(
+            "../../tests/fixtures/gateway_claude/reasoning_cut_by_length.sse"
+        ))
+        .unwrap();
+        let (text, thinking) = streamed_text(&events);
+        assert_eq!(text, "");
+        assert!(thinking.starts_with("The user wants a proof"), "{thinking}");
+        assert_eq!(stop_reason(&events).as_deref(), Some("length"));
+        let usage = events
+            .iter()
+            .find_map(|event| match event {
+                crate::types::StreamEvent::MessageDelta(delta) => Some(delta.usage.clone()),
+                _ => None,
+            })
+            .expect("message delta");
+        assert_eq!(usage.input_tokens, 420);
+        assert_eq!(usage.output_tokens, 16_000);
+        assert!(matches!(
+            events.last(),
+            Some(crate::types::StreamEvent::MessageStop(_))
+        ));
+    }
+
+    /// The adapter's recorded agent turn: thinking, text, more thinking (sent
+    /// with the blank lines the gateway puts between reasoning and text), and
+    /// two parallel calls whose arguments are split across chunks.
+    #[test]
+    fn gateway_agent_turn_keeps_reasoning_text_and_parallel_calls_apart() {
+        let events = replay(include_str!(
+            "../../tests/fixtures/gateway_claude/agent_turn.sse"
+        ))
+        .unwrap();
+        let (text, thinking) = streamed_text(&events);
+        assert_eq!(text, "I'll read both files.");
+        assert_eq!(
+            thinking, "Plan the reads.\n\nReading now.",
+            "a thinking block does not start with blank lines"
+        );
+        assert_eq!(
+            tool_arguments(&events),
+            [r#"{"path":"a.txt"}"#, r#"{"path":"b.txt"}"#]
+        );
+        let kinds = block_trace(&events)
+            .into_iter()
+            .filter(|(kind, _)| !kind.starts_with("delta:"))
+            .map(|(kind, index)| format!("{kind}@{index}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                "thinking@0",
+                "stop@0",
+                "text@1",
+                "stop@1",
+                "thinking@2",
+                "stop@2",
+                "tool@3",
+                "tool@4",
+                "stop@3",
+                "stop@4"
+            ]
+        );
+        assert_eq!(stop_reason(&events).as_deref(), Some("tool_use"));
+        let usage = events
+            .iter()
+            .find_map(|event| match event {
+                crate::types::StreamEvent::MessageDelta(delta) => Some(delta.usage.clone()),
+                _ => None,
+            })
+            .expect("usage");
+        assert_eq!((usage.input_tokens, usage.output_tokens), (1150, 200));
+    }
+
+    #[test]
+    fn gateway_tool_call_cut_by_length_is_handed_on_with_its_stop_reason() {
+        for (fixture, expected) in [
+            (
+                include_str!("../../tests/fixtures/gateway_claude/tool_call_cut_by_length.sse"),
+                vec!["{\"path\":\"big.txt\",\"content\":\"line 1\\nline 2"],
+            ),
+            (
+                include_str!(
+                    "../../tests/fixtures/gateway_claude/complete_tool_call_cut_by_length.sse"
+                ),
+                vec![
+                    "{\"path\":\"notes.txt\"}",
+                    "{\"path\":\"out.txt\",\"content\":\"par",
+                ],
+            ),
+        ] {
+            let events = replay(fixture).expect("a cut-off response is not a stream error");
+            assert_eq!(tool_arguments(&events), expected);
+            assert_eq!(stop_reason(&events).as_deref(), Some("length"));
+        }
+    }
+
+    #[test]
+    fn gateway_unparseable_tool_arguments_reach_the_runtime_as_sent() {
+        let events = replay(include_str!(
+            "../../tests/fixtures/gateway_claude/unparseable_tool_arguments.sse"
+        ))
+        .unwrap();
+        assert_eq!(
+            tool_arguments(&events),
+            [r#"{"path":"src/main.rs","limit":"#]
+        );
+        assert_eq!(stop_reason(&events).as_deref(), Some("tool_use"));
+    }
+
+    #[test]
+    fn gateway_error_event_after_content_is_its_actionable_error() {
+        let sse = include_str!("../../tests/fixtures/gateway_claude/error_after_content.sse");
+        let mut parser = super::OpenAiSseParser::with_context(super::ZERO_X_PROVIDER_NAME, "m");
+        let mut state = super::StreamState::new("claude-opus-5-5".into());
+        let mut events = Vec::new();
+        let mut failure = None;
+        for piece in sse.as_bytes().chunks(64) {
+            match parser.push(piece) {
+                Ok(chunks) => {
+                    for chunk in chunks {
+                        events.extend(state.ingest_chunk(chunk).unwrap());
+                    }
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            streamed_text(&events).0,
+            "Partial answer before the upstream failed"
+        );
+        let error = failure.expect("the error event fails the stream");
+        let gateway = error.gateway_error().expect("a gateway error");
+        assert_eq!(gateway.code.as_deref(), Some("upstream_error"));
+        assert_eq!(gateway.status.as_u16(), 502);
+        assert!(error.is_retryable());
+        assert!(
+            error
+                .to_string()
+                .contains("Generation interrupted. Retry your request."),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn non_streaming_refusal_and_bad_arguments_are_kept_apart() {
+        let refused: super::ChatCompletionResponse = serde_json::from_value(serde_json::json!({
+            "id": "c", "model": "claude-opus-5-5",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "", "refusal": GATEWAY_REFUSAL_NOTE}, "finish_reason": "content_filter"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 0}
+        }))
+        .unwrap();
+        let response = super::normalize_response("m", refused).unwrap();
+        assert_eq!(
+            response.content,
+            Vec::<crate::types::OutputContentBlock>::new()
+        );
+        assert_eq!(response.stop_reason.as_deref(), Some("refusal"));
+        assert_eq!(response.refusal.as_deref(), Some(GATEWAY_REFUSAL_NOTE));
+
+        let garbled: super::ChatCompletionResponse = serde_json::from_value(serde_json::json!({
+            "id": "c", "model": "m",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":"}}
+            ]}, "finish_reason": "length"}]
+        }))
+        .unwrap();
+        let response = super::normalize_response("m", garbled).unwrap();
+        assert_eq!(response.stop_reason.as_deref(), Some("length"));
+        assert_eq!(response.refusal, None);
+        assert!(matches!(
+            &response.content[0],
+            crate::types::OutputContentBlock::ToolUse { input, .. }
+                if input == &serde_json::Value::String("{\"path\":".to_string())
+        ));
     }
     /// Gemini's OpenAI-compatible stream sends two parallel calls as two
     /// items of one chunk and omits `index`. Before the fix both items
@@ -2638,7 +3081,8 @@ mod tests {
             parse_tool_arguments("{\"city\":\"Paris\"}"),
             json!({"city": "Paris"})
         );
-        assert_eq!(parse_tool_arguments("not-json"), json!({"raw": "not-json"}));
+        // Unparseable arguments stay text, never an object a tool might accept.
+        assert_eq!(parse_tool_arguments("not-json"), json!("not-json"));
     }
 
     #[test]
@@ -2683,6 +3127,8 @@ mod tests {
     fn normalizes_stop_reasons() {
         assert_eq!(normalize_finish_reason("stop"), "end_turn");
         assert_eq!(normalize_finish_reason("tool_calls"), "tool_use");
+        assert_eq!(normalize_finish_reason("content_filter"), "refusal");
+        assert_eq!(normalize_finish_reason("length"), "length");
     }
 
     #[test]

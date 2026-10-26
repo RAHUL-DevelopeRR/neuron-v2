@@ -239,6 +239,14 @@ Legacy RPCs (`zerox_reserve_usage`, `zerox_settle_usage`, …) remain for rollba
   `capacity_exhausted`, `upstream_*` at most 2 times honoring `Retry-After`, printing progress.
 - `/usage` calls `GET /api/account`; `/upgrade` opens `upgrade_url`; `/login`, `/logout` run
   the gateway login flow.
+- Streams: `delta.reasoning_content` (or `reasoning`) is shown as reasoning, never as answer
+  text. `finish_reason: "content_filter"`, or any `delta.refusal` text, ends the turn as a
+  refusal: the text before it is kept, the `refusal` note is shown, and no tool call of that
+  response runs; nor does any call of a `length` response. Tool arguments that are not a
+  JSON object go back to the model as a tool error. A stream has no total deadline, but it
+  is dropped after 120 s without a stream event (the HTTP read deadline alone counts any
+  byte, keep-alive comments included); a non-streaming request keeps a 5-minute total
+  deadline and no read deadline, as its reply may come only once it is complete.
 
 ## 6. v1.1 amendments (integration of the business platform, 2026-10-16)
 

@@ -44,6 +44,7 @@ pub mod plugin_lifecycle;
 mod policy_engine;
 mod prompt;
 pub mod recovery_recipes;
+mod refusal;
 mod remote;
 pub mod sandbox;
 pub mod sensitive_paths;
@@ -94,11 +95,12 @@ pub use config_validate::{
 };
 pub use conversation::{
     auto_compaction_threshold_from_env, auto_compaction_threshold_override_from_env,
-    is_truncation_stop_reason, is_turn_end_note, resolve_max_iterations, ApiClient, ApiRequest,
-    AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-    RuntimeErrorKind, StaticToolExecutor, ToolError, ToolExecutor, TurnOutcome, TurnSummary,
-    DEFAULT_MAX_ITERATIONS, FAILED_RESPONSE_NOTE_PREFIX, INTERRUPTED_RESPONSE_NOTE,
-    INTERRUPTED_TOOL_RESULT, MAX_ITERATIONS_ENV_VAR,
+    is_refusal_stop_reason, is_truncation_stop_reason, is_turn_end_note, resolve_max_iterations,
+    ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime,
+    PromptCacheEvent, RuntimeError, RuntimeErrorKind, StaticToolExecutor, ToolError, ToolExecutor,
+    TurnOutcome, TurnSummary, DEFAULT_MAX_ITERATIONS, FAILED_RESPONSE_NOTE_PREFIX,
+    INTERRUPTED_RESPONSE_NOTE, INTERRUPTED_TOOL_RESULT, MAX_ITERATIONS_ENV_VAR,
+    REFUSAL_STOP_REASON,
 };
 pub use file_ops::{
     display_path, edit_file, edit_file_in_workspace, glob_search, grep_search,
@@ -167,6 +169,7 @@ pub use recovery_recipes::{
     attempt_recovery, recipe_for, EscalationPolicy, FailureScenario, RecoveryContext,
     RecoveryEvent, RecoveryRecipe, RecoveryResult, RecoveryStep,
 };
+pub use refusal::{neutral_refusal_note, refusal_line, REFUSAL_LINE};
 pub use remote::{
     inherited_upstream_proxy_env, no_proxy_list, read_token, upstream_proxy_ws_url,
     RemoteSessionContext, UpstreamProxyBootstrap, UpstreamProxyState, DEFAULT_REMOTE_BASE_URL,

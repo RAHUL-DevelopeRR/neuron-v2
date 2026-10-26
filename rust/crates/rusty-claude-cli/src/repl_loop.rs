@@ -221,14 +221,84 @@ pub(crate) fn turn_outcome_label(outcome: &TurnOutcome) -> &'static str {
         TurnOutcome::Cancelled { .. } => "cancelled",
         TurnOutcome::LoopDetected { .. } => "loop_detected",
         TurnOutcome::OutputTruncated => "output_truncated",
+        TurnOutcome::Refused { .. } => "refused",
     }
+}
+
+/// The longest provider note a refusal line repeats.
+const REFUSAL_NOTE_MAX_CHARS: usize = 500;
+
+/// The provider's refusal note as one line of plain text: control characters
+/// (escape sequences included) dropped, whitespace collapsed, length capped.
+pub(crate) fn refusal_note_text(note: &str) -> String {
+    let words = note
+        .chars()
+        .map(|character| {
+            if character.is_whitespace() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .filter(|character| !character.is_control())
+        .collect::<String>();
+    let line = words.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() <= REFUSAL_NOTE_MAX_CHARS {
+        return line;
+    }
+    let mut short = line
+        .chars()
+        .take(REFUSAL_NOTE_MAX_CHARS)
+        .collect::<String>();
+    short.push('\u{2026}');
+    short
+}
+
+/// The one line a refused turn ends with: [`runtime::refusal_line`] (which says
+/// once that the model declined, with the provider's note when it sent one), and
+/// the tool calls that did not run. `None` for other outcomes.
+pub(crate) fn refusal_notice(outcome: &TurnOutcome) -> Option<String> {
+    let TurnOutcome::Refused {
+        note,
+        skipped_tool_calls,
+    } = outcome
+    else {
+        return None;
+    };
+    let note = note.as_deref().map(refusal_note_text);
+    let mut line = runtime::refusal_line(note.as_deref());
+    if *skipped_tool_calls > 0 {
+        line.push_str(&format!(
+            " {skipped_tool_calls} tool call(s) from that response were not run."
+        ));
+    }
+    Some(line)
 }
 
 /// One-line notice describing how a turn ended, if it did not simply finish.
 pub(crate) fn describe_turn_outcome(summary: &TurnSummary, hint: QuitHint) -> Option<String> {
+    let notes = refusal_notice(&summary.outcome)
+        .into_iter()
+        .chain(outcome_notes(summary, hint))
+        .collect::<Vec<_>>();
+    (!notes.is_empty()).then(|| notes.join("\n"))
+}
+
+/// [`describe_turn_outcome`] without the refusal line, which the full-screen UI gets
+/// as a notice of its own kind.
+pub(crate) fn describe_turn_outcome_without_refusal(
+    summary: &TurnSummary,
+    hint: QuitHint,
+) -> Option<String> {
+    let notes = outcome_notes(summary, hint);
+    (!notes.is_empty()).then(|| notes.join("\n"))
+}
+
+/// The notes of [`describe_turn_outcome`] other than the refusal line.
+fn outcome_notes(summary: &TurnSummary, hint: QuitHint) -> Vec<String> {
     let mut notes = Vec::new();
     match &summary.outcome {
-        TurnOutcome::Completed => {}
+        TurnOutcome::Completed | TurnOutcome::Refused { .. } => {}
         TurnOutcome::Cancelled {
             interrupted_tool_calls,
         } => notes.push(match (interrupted_tool_calls, hint) {
@@ -257,7 +327,7 @@ pub(crate) fn describe_turn_outcome(summary: &TurnSummary, hint: QuitHint) -> Op
             summary.pruned_tool_results
         ));
     }
-    (!notes.is_empty()).then(|| notes.join("\n"))
+    notes
 }
 
 /// How `neuron --resume <session>` continues interactively: the launch
@@ -643,8 +713,9 @@ fn group_digits(value: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        context_command_argument, describe_turn_outcome, dispatch_line, group_digits,
-        handle_turn_interrupt, render_context_report, watch_turn_interrupts, ContextReport,
+        context_command_argument, describe_turn_outcome, describe_turn_outcome_without_refusal,
+        dispatch_line, group_digits, handle_turn_interrupt, refusal_note_text, refusal_notice,
+        render_context_report, turn_outcome_label, watch_turn_interrupts, ContextReport,
         InterruptAction, InterruptPresses, QuitHint, ReplBackend, ReplStep,
     };
     use crate::{CliAction, ResumeLaunchOptions, DEFAULT_MODEL};
@@ -868,6 +939,60 @@ mod tests {
         .expect("notice");
         assert!(looped.contains("`bash` 4 times"));
         assert!(looped.contains("shortened 1 older tool result(s)"));
+    }
+
+    #[test]
+    fn a_refusal_ends_with_one_line_naming_the_note_and_the_calls_not_run() {
+        let refused = |note: Option<&str>, skipped_tool_calls| {
+            summary(
+                TurnOutcome::Refused {
+                    note: note.map(ToOwned::to_owned),
+                    skipped_tool_calls,
+                },
+                0,
+            )
+        };
+        assert_eq!(turn_outcome_label(&refused(None, 0).outcome), "refused");
+        assert_eq!(
+            describe_turn_outcome(&refused(None, 0), QuitHint::Shown).as_deref(),
+            Some("The model declined to continue this request.")
+        );
+        let line = describe_turn_outcome(
+            &refused(Some("Rephrase it\n or choose another model.\x1b[2J"), 2),
+            QuitHint::Hidden,
+        )
+        .expect("notice");
+        assert_eq!(
+            line,
+            "The model declined to continue this request. Rephrase it or choose another model.[2J 2 tool call(s) from that response were not run."
+        );
+        assert!(!line.contains('\x1b') && !line.contains('\n'), "{line:?}");
+        // The gateway's note, as the runtime words it, says "declined" only once.
+        assert_eq!(
+            refusal_notice(
+                &refused(
+                    Some("Declined (safety category: cyber). Rephrase it or choose another model."),
+                    0
+                )
+                .outcome
+            )
+            .as_deref(),
+            Some(
+                "The model declined to continue this request (safety category: cyber). Rephrase it or choose another model."
+            )
+        );
+        // The full-screen UI gets the refusal as a notice of its own kind.
+        assert_eq!(
+            describe_turn_outcome_without_refusal(&refused(Some("note"), 0), QuitHint::Hidden),
+            None
+        );
+        assert_eq!(
+            refusal_notice(&TurnOutcome::Completed),
+            None,
+            "only a refused turn has a refusal line"
+        );
+        let long = "x".repeat(800);
+        assert_eq!(refusal_note_text(&long).chars().count(), 501);
     }
 
     #[test]

@@ -732,6 +732,7 @@ fn text_message_response(id: &str, text: &str) -> MessageResponse {
             output_tokens: 6,
         },
         request_id: None,
+        refusal: None,
     }
 }
 
@@ -758,6 +759,7 @@ fn text_message_response_with_usage(
             output_tokens,
         },
         request_id: None,
+        refusal: None,
     }
 }
 
@@ -806,6 +808,7 @@ fn tool_message_response_many(id: &str, tool_uses: &[ToolUseMessage<'_>]) -> Mes
             output_tokens: 3,
         },
         request_id: None,
+        refusal: None,
     }
 }
 

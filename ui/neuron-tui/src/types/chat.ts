@@ -205,6 +205,12 @@ export type ChatMessage = {
    * Can be cleared by clearUserError() when starting a new successful interaction.
    */
   userError?: string
+  /**
+   * The engine's refusal line, when the model declined to continue this
+   * turn's request (a `refusal` notice). Drawn apart from the answer in
+   * RefusalBanner; the answer keeps what the model wrote before it.
+   */
+  refusal?: string
   attachments?: ImageAttachment[]
   textAttachments?: TextAttachment[]
   fileAttachments?: FileAttachment[]

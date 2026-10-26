@@ -13,7 +13,10 @@ use serde_json::{Map, Value};
 use telemetry::{AnalyticsEvent, AnthropicRequestProfile, ClientIdentity, SessionTracer};
 
 use crate::error::ApiError;
-use crate::http_client::build_http_client_or_default;
+use crate::http_client::{
+    build_http_client_or_default, build_http_client_with_timeouts_or_default,
+    build_one_piece_http_client_or_default, HttpTimeouts,
+};
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 use crate::retry::{plan_retry_delay, retry_after_from_headers, RetryProgress, MAX_TOTAL_BACKOFF};
 
@@ -119,7 +122,14 @@ impl From<OAuthTokenSet> for AuthSource {
 
 #[derive(Debug, Clone)]
 pub struct AnthropicClient {
+    /// Streams: the connect and read-idle deadlines.
     http: reqwest::Client,
+    /// Responses read in one piece (messages, token counts, OAuth): the connect
+    /// deadline, and `timeouts.request` set on each request (see
+    /// [`crate::build_one_piece_http_client_with_timeouts`]).
+    one_piece_http: reqwest::Client,
+    /// The deadlines both clients were built with.
+    timeouts: HttpTimeouts,
     auth: AuthSource,
     base_url: String,
     max_retries: u32,
@@ -136,6 +146,8 @@ impl AnthropicClient {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             http: build_http_client_or_default(),
+            one_piece_http: build_one_piece_http_client_or_default(HttpTimeouts::default()),
+            timeouts: HttpTimeouts::default(),
             auth: AuthSource::ApiKey(api_key.into()),
             base_url: DEFAULT_BASE_URL.to_string(),
             max_retries: DEFAULT_MAX_RETRIES,
@@ -152,6 +164,8 @@ impl AnthropicClient {
     pub fn from_auth(auth: AuthSource) -> Self {
         Self {
             http: build_http_client_or_default(),
+            one_piece_http: build_one_piece_http_client_or_default(HttpTimeouts::default()),
+            timeouts: HttpTimeouts::default(),
             auth,
             base_url: DEFAULT_BASE_URL.to_string(),
             max_retries: DEFAULT_MAX_RETRIES,
@@ -171,6 +185,19 @@ impl AnthropicClient {
     #[must_use]
     pub fn with_auth_source(mut self, auth: AuthSource) -> Self {
         self.auth = auth;
+        self
+    }
+
+    /// Replaces the HTTP deadlines (default [`HttpTimeouts::default`]): the
+    /// connect deadline of every request, the read-idle deadline of a stream and
+    /// the total deadline of a non-streaming request (messages, token counts,
+    /// OAuth). A stream has no total deadline, and a non-streaming request no
+    /// read-idle one.
+    #[must_use]
+    pub fn with_http_timeouts(mut self, timeouts: HttpTimeouts) -> Self {
+        self.http = build_http_client_with_timeouts_or_default(timeouts);
+        self.one_piece_http = build_one_piece_http_client_or_default(timeouts);
+        self.timeouts = timeouts;
         self
     }
 
@@ -376,6 +403,7 @@ impl AnthropicClient {
             latest_usage: None,
             usage_recorded: false,
             last_prompt_cache_record: Arc::clone(&self.last_prompt_cache_record),
+            idle_timeout: self.timeouts.read_idle,
         })
     }
 
@@ -385,10 +413,11 @@ impl AnthropicClient {
         request: &OAuthTokenExchangeRequest,
     ) -> Result<OAuthTokenSet, ApiError> {
         let response = self
-            .http
+            .one_piece_http
             .post(&config.token_url)
             .header("content-type", "application/x-www-form-urlencoded")
             .form(&request.form_params())
+            .timeout(self.timeouts.request)
             .send()
             .await
             .map_err(ApiError::from)?;
@@ -405,10 +434,11 @@ impl AnthropicClient {
         request: &OAuthRefreshRequest,
     ) -> Result<OAuthTokenSet, ApiError> {
         let response = self
-            .http
+            .one_piece_http
             .post(&config.token_url)
             .header("content-type", "application/x-www-form-urlencoded")
             .form(&request.form_params())
+            .timeout(self.timeouts.request)
             .send()
             .await
             .map_err(ApiError::from)?;
@@ -505,13 +535,27 @@ impl AnthropicClient {
         let request_url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let mut request_body = self.request_profile.render_json_body(request)?;
         strip_unsupported_beta_body_fields(&mut request_body);
-        let request_builder = self.build_request(&request_url).json(&request_body);
+        let mut request_builder = self
+            .build_request(&request_url, request.stream)
+            .json(&request_body);
+        // A stream runs as long as it keeps sending (the streaming client's
+        // read-idle deadline ends one that stalls); a response read in one piece
+        // gets a total deadline, on the client without a read-idle one.
+        if !request.stream {
+            request_builder = request_builder.timeout(self.timeouts.request);
+        }
         request_builder.send().await.map_err(ApiError::from)
     }
 
-    fn build_request(&self, request_url: &str) -> reqwest::RequestBuilder {
-        let request_builder = self
-            .http
+    /// A POST to `request_url` with the auth and profile headers, on the client for
+    /// streams or the one for responses read in one piece.
+    fn build_request(&self, request_url: &str, stream: bool) -> reqwest::RequestBuilder {
+        let http = if stream {
+            &self.http
+        } else {
+            &self.one_piece_http
+        };
+        let request_builder = http
             .post(request_url)
             .header("content-type", "application/json");
         let mut request_builder = self.auth.apply(request_builder);
@@ -567,8 +611,9 @@ impl AnthropicClient {
         let mut request_body = self.request_profile.render_json_body(request)?;
         strip_unsupported_beta_body_fields(&mut request_body);
         let response = self
-            .build_request(&request_url)
+            .build_request(&request_url, false)
             .json(&request_body)
+            .timeout(self.timeouts.request)
             .send()
             .await
             .map_err(ApiError::from)?;
@@ -840,6 +885,8 @@ pub struct MessageStream {
     latest_usage: Option<Usage>,
     usage_recorded: bool,
     last_prompt_cache_record: Arc<Mutex<Option<PromptCacheRecord>>>,
+    /// The client's read-idle deadline, named when a stall ends the stream.
+    idle_timeout: Duration,
 }
 
 impl MessageStream {
@@ -864,7 +911,18 @@ impl MessageStream {
                 return Ok(None);
             }
 
-            match self.response.chunk().await? {
+            let chunk = match self.response.chunk().await {
+                Ok(chunk) => chunk,
+                Err(error) if error.is_timeout() => {
+                    return Err(ApiError::StreamIdle {
+                        provider: "Anthropic".to_string(),
+                        model: self.request.model.clone(),
+                        idle: self.idle_timeout,
+                    });
+                }
+                Err(error) => return Err(ApiError::from(error)),
+            };
+            match chunk {
                 Some(chunk) => {
                     self.pending.extend(self.parser.push(&chunk)?);
                 }

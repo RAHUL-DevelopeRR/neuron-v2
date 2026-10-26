@@ -43,6 +43,19 @@ script or CI, `neuron prompt` asks nothing: see [Permission modes](#permission-m
 for what happens to tool calls that need approval, and why such a run can exit with
 code 2.
 
+`--output-format json` prints one JSON object when the turn ends. `message` is the
+final answer text (never the model's reasoning), `outcome` says how the turn ended
+(`completed`, `output_truncated`, `loop_detected`, `cancelled` or `refused`) and
+`stop_reason` is the provider's last stop reason. When the model declines to continue
+(`outcome` `refused`, `stop_reason` `refusal`; OpenAI-compatible providers call it
+`content_filter`), `message` keeps whatever it wrote before, and `refusal` holds the
+line Neuron shows (`message`), the provider's explanation with provider and model
+names left out (`note`, or `null`) and how many tool calls of that response were not
+run (`tool_calls_not_run`); otherwise
+`refusal` is `null`. With `--compact`, standard output keeps the answer only and the
+refusal line goes to standard error. Tool calls from a refused response, or from one
+cut off at the output token limit, are never run.
+
 ## Sign in
 
 Neuron uses your Zero-X account unless you choose another provider.

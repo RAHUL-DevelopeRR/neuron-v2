@@ -178,11 +178,28 @@ pub enum UiEvent {
     /// A tool call waits for approval; answer with a [`PermissionReply`] carrying `id`.
     PermissionRequested { id: u64, request: PermissionView },
     /// A one-line notice (retries, warnings, interrupts).
-    Notice { message: String },
+    Notice {
+        message: String,
+        /// What the notice is about, when the UI should draw it apart from status
+        /// lines. Added after protocol 1: absent from older engines and left out of
+        /// plain notices, so a UI that does not know it shows a plain notice.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<NoticeKind>,
+    },
     /// The turn is over (finished, cancelled or failed).
     TurnFinished,
     /// The turn failed; `message` is what to show.
     Error { message: String },
+}
+
+/// What a [`UiEvent::Notice`] is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoticeKind {
+    /// The model declined to continue the turn's request (a refusal; the
+    /// OpenAI-compatible `content_filter`). The message is the one line to show, with
+    /// the provider's explanation when it gave one. It is not assistant text.
+    Refusal,
 }
 
 /// A file, folder or image the user attached to a prompt.
@@ -289,6 +306,31 @@ mod tests {
             serde_json::from_value::<PermissionReply>(json).unwrap(),
             reply
         );
+    }
+
+    /// A refusal is a notice with a kind; a plain notice is written as before.
+    #[test]
+    fn refusal_notices_carry_their_kind_and_plain_ones_do_not() {
+        let refusal = UiEvent::Notice {
+            message: "The model declined to continue this request.".into(),
+            kind: Some(NoticeKind::Refusal),
+        };
+        let json = serde_json::to_value(&refusal).unwrap();
+        assert_eq!(json["type"], "notice");
+        assert_eq!(json["kind"], "refusal");
+        assert_eq!(serde_json::from_value::<UiEvent>(json).unwrap(), refusal);
+
+        let plain = UiEvent::Notice {
+            message: "Interrupting".into(),
+            kind: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"type":"notice","message":"Interrupting"}"#
+        );
+        let older: UiEvent =
+            serde_json::from_str(r#"{"type":"notice","message":"Interrupting"}"#).unwrap();
+        assert_eq!(older, plain);
     }
 
     /// Fields added after protocol 1 shipped read as their defaults from older engines.

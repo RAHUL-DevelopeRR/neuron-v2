@@ -81,6 +81,7 @@ fn run(
             EngineCommand::Interrupt => {
                 let _ = events.send(UiEvent::Notice {
                     message: "Interrupting".into(),
+                    kind: None,
                 });
             }
             EngineCommand::Slash { .. }

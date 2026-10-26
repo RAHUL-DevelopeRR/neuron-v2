@@ -3,12 +3,14 @@ use std::ffi::OsString;
 use std::sync::Arc;
 use std::sync::{Mutex as StdMutex, OnceLock};
 
+use std::time::{Duration, Instant};
+
 use api::{
-    ApiError, ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent,
-    ContentBlockStopEvent, GatewayErrorCode, InputContentBlock, InputMessage, MessageDeltaEvent,
-    MessageRequest, OpenAiCompatClient, OpenAiCompatConfig, OpenAiCompatEndpoint,
-    OutputContentBlock, ProviderClient, RetryNotice, RetryObserver, RetryProgress, StreamEvent,
-    ToolChoice, ToolDefinition, UsageObserver,
+    AnthropicClient, ApiError, ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent,
+    ContentBlockStopEvent, GatewayErrorCode, HttpTimeouts, InputContentBlock, InputMessage,
+    MessageDeltaEvent, MessageRequest, OpenAiCompatClient, OpenAiCompatConfig,
+    OpenAiCompatEndpoint, OutputContentBlock, ProviderClient, RetryNotice, RetryObserver,
+    RetryProgress, StreamEvent, ToolChoice, ToolDefinition, UsageObserver,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -467,6 +469,375 @@ async fn stream_cut_off_without_finish_reason_or_done_is_truncated() {
     };
     assert!(
         matches!(error, ApiError::StreamTruncated { ref provider, .. } if provider == "Zero-X"),
+        "{error:?}"
+    );
+}
+
+// ── Long streams: an idle deadline, no total deadline ──────────────────────
+//
+// The deadlines are injected, scaled down: a read-idle deadline of a few hundred
+// milliseconds and a total deadline (which non-streaming requests get) shorter
+// than the streams below take, standing in for the old 5-minute client total.
+
+fn short_timeouts(read_idle: Duration, request: Duration) -> HttpTimeouts {
+    HttpTimeouts {
+        connect: Duration::from_secs(5),
+        read_idle,
+        request,
+    }
+}
+
+fn trickle_client(base_url: String, timeouts: HttpTimeouts) -> ProviderClient {
+    ProviderClient::OpenAi(
+        OpenAiCompatClient::new("test-key", OpenAiCompatConfig::openai())
+            .with_base_url(base_url)
+            .with_retry_policy(0, Duration::from_millis(1), Duration::from_millis(1))
+            .with_retry_observer(None)
+            .with_http_timeouts(timeouts),
+    )
+}
+
+fn sse_frame(value: &serde_json::Value) -> String {
+    format!("data: {value}\n\n")
+}
+
+/// Reads one request (headers and `content-length` body) off `socket`.
+async fn read_one_request(socket: &mut tokio::net::TcpStream) {
+    let mut buffer = Vec::new();
+    loop {
+        let mut chunk = [0_u8; 1024];
+        let read = socket.read(&mut chunk).await.expect("read request");
+        if read == 0 {
+            return;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(end) = find_header_end(&buffer) {
+            let headers = String::from_utf8_lossy(&buffer[..end]).to_ascii_lowercase();
+            let length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while buffer.len() < end + 4 + length {
+                let read = socket.read(&mut chunk).await.expect("read body");
+                if read == 0 {
+                    return;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+            }
+            return;
+        }
+    }
+}
+
+/// Answers one request with `head`, then writes each piece after its delay. A
+/// chunked body (`chunked`) is framed per piece and ended unless `stall`: then the
+/// connection stays open without another byte.
+async fn spawn_trickling_server(
+    head: &'static str,
+    pieces: Vec<(Duration, String)>,
+    chunked: bool,
+    stall: bool,
+) -> TestServer {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener.local_addr().expect("listener addr");
+    let join_handle = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        read_one_request(&mut socket).await;
+        socket.write_all(head.as_bytes()).await.expect("head");
+        for (delay, piece) in pieces {
+            tokio::time::sleep(delay).await;
+            let framed = if chunked {
+                format!("{:x}\r\n{piece}\r\n", piece.len())
+            } else {
+                piece
+            };
+            if socket.write_all(framed.as_bytes()).await.is_err() {
+                return;
+            }
+            let _ = socket.flush().await;
+        }
+        if stall {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        } else if chunked {
+            let _ = socket.write_all(b"0\r\n\r\n").await;
+        }
+    });
+    TestServer {
+        base_url: format!("http://{address}"),
+        join_handle,
+    }
+}
+
+const SSE_HEAD: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n";
+
+async fn streamed_text_or_error(stream: &mut api::MessageStream) -> (String, Option<ApiError>) {
+    let mut text = String::new();
+    loop {
+        match stream.next_event().await {
+            Ok(Some(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                delta: ContentBlockDelta::TextDelta { text: piece },
+                ..
+            }))) => text.push_str(&piece),
+            Ok(Some(_)) => {}
+            Ok(None) => return (text, None),
+            Err(error) => return (text, Some(error)),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_stream_that_keeps_sending_outlives_the_total_request_deadline() {
+    let gap = Duration::from_millis(120);
+    let mut pieces = vec![(
+        Duration::ZERO,
+        sse_frame(
+            &json!({"id": "long", "model": "m", "choices": [{"delta": {"role": "assistant", "content": ""}}]}),
+        ),
+    )];
+    for index in 0..12 {
+        pieces.push((
+            gap,
+            sse_frame(
+                &json!({"id": "long", "choices": [{"delta": {"content": format!("w{index} ")}}]}),
+            ),
+        ));
+    }
+    pieces.push((
+        gap,
+        sse_frame(&json!({"id": "long", "choices": [{"delta": {}, "finish_reason": "stop"}]})),
+    ));
+    pieces.push((Duration::ZERO, "data: [DONE]\n\n".to_string()));
+    let server = spawn_trickling_server(SSE_HEAD, pieces, true, false).await;
+    // Every gap is well inside the idle deadline; the whole stream takes over
+    // three times the total deadline a non-streaming request gets.
+    let request_deadline = Duration::from_millis(400);
+    let client = trickle_client(
+        server.base_url(),
+        short_timeouts(Duration::from_millis(600), request_deadline),
+    );
+
+    let started = Instant::now();
+    let mut stream = client
+        .stream_message(&sample_request(false))
+        .await
+        .expect("stream should start");
+    let (text, error) = streamed_text_or_error(&mut stream).await;
+
+    assert!(
+        error.is_none(),
+        "a live stream has no total deadline: {error:?}"
+    );
+    let expected = (0..12).fold(String::new(), |mut text, index| {
+        use std::fmt::Write as _;
+        write!(text, "w{index} ").expect("write to a String");
+        text
+    });
+    assert_eq!(text, expected);
+    assert!(
+        started.elapsed() > request_deadline * 3,
+        "the stream ran {:?}, longer than any total deadline",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn a_non_streaming_request_keeps_its_total_deadline() {
+    // The completion arrives in pieces inside the idle deadline, but takes far
+    // longer than the total deadline.
+    let body = COMPLETION_BODY;
+    let head: &'static str = Box::leak(
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_boxed_str(),
+    );
+    let pieces = body
+        .as_bytes()
+        .chunks(body.len().div_ceil(12))
+        .map(|piece| {
+            (
+                Duration::from_millis(150),
+                String::from_utf8(piece.to_vec()).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let server = spawn_trickling_server(head, pieces, false, false).await;
+    let client = trickle_client(
+        server.base_url(),
+        short_timeouts(Duration::from_millis(600), Duration::from_millis(500)),
+    );
+
+    let started = Instant::now();
+    let error = client
+        .send_message(&sample_request(false))
+        .await
+        .expect_err("the total deadline ends a slow non-streaming request");
+
+    assert!(
+        matches!(&error, ApiError::Http(inner) if inner.is_timeout()),
+        "{error:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(1_500),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// A reply read in one piece whose server sends nothing until it is complete, as the
+/// Zero-X gateway does for a non-streaming Claude completion: the headers come after
+/// the read-idle deadline but inside the total deadline.
+fn whole_reply_after(delay: Duration, body: &str) -> Vec<(Duration, String)> {
+    vec![(
+        delay,
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    )]
+}
+
+#[tokio::test]
+async fn a_non_streaming_reply_slower_than_the_idle_deadline_still_arrives() {
+    let idle = Duration::from_millis(300);
+    let server = spawn_trickling_server(
+        "",
+        whole_reply_after(idle * 3, COMPLETION_BODY),
+        false,
+        false,
+    )
+    .await;
+    let client = trickle_client(
+        server.base_url(),
+        short_timeouts(idle, Duration::from_secs(10)),
+    );
+
+    let started = Instant::now();
+    let response = client
+        .send_message(&sample_request(false))
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "a non-streaming request has its total deadline, not the idle one ({:?}): {error:?}",
+                started.elapsed()
+            )
+        });
+
+    assert_eq!(response.stop_reason.as_deref(), Some("end_turn"));
+    assert!(started.elapsed() >= idle * 3, "{:?}", started.elapsed());
+}
+
+#[tokio::test]
+async fn a_non_streaming_anthropic_reply_slower_than_the_idle_deadline_still_arrives() {
+    let idle = Duration::from_millis(300);
+    let body = "{\"id\":\"msg_whole\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\"model\":\"test-model\",\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}";
+    let server = spawn_trickling_server("", whole_reply_after(idle * 3, body), false, false).await;
+    let client = ProviderClient::Anthropic(
+        AnthropicClient::new("test-key")
+            .with_base_url(server.base_url())
+            .with_retry_policy(0, Duration::from_millis(1), Duration::from_millis(1))
+            .with_http_timeouts(short_timeouts(idle, Duration::from_secs(10))),
+    );
+    let request = MessageRequest {
+        model: "test-model".to_string(),
+        tools: None,
+        tool_choice: None,
+        ..sample_request(false)
+    };
+
+    let response = client
+        .send_message(&request)
+        .await
+        .expect("a non-streaming request has its total deadline, not the idle one");
+
+    assert_eq!(response.stop_reason.as_deref(), Some("end_turn"));
+}
+
+#[tokio::test]
+async fn a_stalled_stream_ends_at_the_idle_deadline_with_a_clear_error() {
+    let pieces = vec![
+        (
+            Duration::ZERO,
+            sse_frame(
+                &json!({"id": "stall", "model": "m", "choices": [{"delta": {"content": "partial"}}]}),
+            ),
+        ),
+        // A keep-alive comment is data too: it resets the idle deadline.
+        (Duration::from_millis(200), ": keep-alive\n\n".to_string()),
+    ];
+    let server = spawn_trickling_server(SSE_HEAD, pieces, true, true).await;
+    let idle = Duration::from_millis(300);
+    let client = trickle_client(
+        server.base_url(),
+        short_timeouts(idle, Duration::from_secs(60)),
+    );
+
+    let started = Instant::now();
+    let mut stream = client
+        .stream_message(&sample_request(false))
+        .await
+        .expect("stream should start");
+    let (text, error) = streamed_text_or_error(&mut stream).await;
+
+    assert_eq!(text, "partial");
+    let error = error.expect("a stalled stream fails");
+    assert!(
+        matches!(&error, ApiError::StreamIdle { provider, idle: waited, .. } if provider == "OpenAI" && *waited == idle),
+        "{error:?}"
+    );
+    assert!(error.is_retryable());
+    assert_eq!(
+        error.to_string(),
+        "the OpenAI stream for grok-3 stalled: no data for 300ms, so the connection was closed; retry the request"
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(450) && elapsed < Duration::from_secs(5),
+        "the keep-alive extended the wait, the deadline then ended it: {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_stalled_anthropic_stream_ends_at_the_idle_deadline_too() {
+    let pieces = vec![(
+        Duration::ZERO,
+        concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stall\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"test-model\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":8,\"output_tokens\":0}}}\n\n"
+        )
+        .to_string(),
+    )];
+    let server = spawn_trickling_server(SSE_HEAD, pieces, true, true).await;
+    let idle = Duration::from_millis(300);
+    let client = ProviderClient::Anthropic(
+        AnthropicClient::new("test-key")
+            .with_base_url(server.base_url())
+            .with_http_timeouts(short_timeouts(idle, Duration::from_secs(60))),
+    );
+    let request = MessageRequest {
+        model: "test-model".to_string(),
+        tools: None,
+        tool_choice: None,
+        ..sample_request(true)
+    };
+
+    let mut stream = client
+        .stream_message(&request)
+        .await
+        .expect("stream should start");
+    let error = loop {
+        match stream.next_event().await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("a stalled stream must not end cleanly"),
+            Err(error) => break error,
+        }
+    };
+    assert!(
+        matches!(&error, ApiError::StreamIdle { provider, model, .. } if provider == "Anthropic" && model == "test-model"),
         "{error:?}"
     );
 }

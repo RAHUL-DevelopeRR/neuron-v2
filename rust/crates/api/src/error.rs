@@ -79,6 +79,21 @@ pub enum ApiError {
         provider: String,
         model: String,
     },
+    /// The stream sent nothing (not even a keep-alive) for `idle`, so the
+    /// connection was dropped. Streams have no total deadline; this is what
+    /// ends one that stalled.
+    StreamIdle {
+        provider: String,
+        model: String,
+        idle: Duration,
+    },
+    /// The stream ended before the response's stop reason arrived, after a tool
+    /// call: the call of a response that never finished must not run, and the
+    /// request may succeed when sent again.
+    StreamInterrupted {
+        model: String,
+        detail: &'static str,
+    },
 }
 
 impl ApiError {
@@ -138,6 +153,7 @@ impl ApiError {
             Self::Api { retryable, .. } => *retryable,
             Self::Gateway(error) => error.is_retryable(),
             Self::RetriesExhausted { last_error, .. } => last_error.is_retryable(),
+            Self::StreamIdle { .. } | Self::StreamInterrupted { .. } => true,
             Self::MissingCredentials { .. }
             | Self::ContextWindowExceeded { .. }
             | Self::ExpiredOAuthToken
@@ -193,7 +209,9 @@ impl ApiError {
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. }
             | Self::RequestBodySizeExceeded { .. }
-            | Self::StreamTruncated { .. } => None,
+            | Self::StreamTruncated { .. }
+            | Self::StreamIdle { .. }
+            | Self::StreamInterrupted { .. } => None,
         }
     }
 
@@ -218,7 +236,9 @@ impl ApiError {
             Self::Http(_)
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. }
-            | Self::StreamTruncated { .. } => "provider_transport",
+            | Self::StreamTruncated { .. }
+            | Self::StreamIdle { .. }
+            | Self::StreamInterrupted { .. } => "provider_transport",
             Self::InvalidApiKeyEnv(_) | Self::Io(_) | Self::Json { .. } => "runtime_io",
             Self::RequestBodySizeExceeded { .. } => "request_size",
         }
@@ -246,7 +266,9 @@ impl ApiError {
             | Self::BackoffOverflow { .. }
             | Self::RequestBodySizeExceeded { .. }
             | Self::Gateway(_)
-            | Self::StreamTruncated { .. } => false,
+            | Self::StreamTruncated { .. }
+            | Self::StreamIdle { .. }
+            | Self::StreamInterrupted { .. } => false,
         }
     }
 
@@ -280,8 +302,19 @@ impl ApiError {
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. }
             | Self::RequestBodySizeExceeded { .. }
-            | Self::StreamTruncated { .. } => false,
+            | Self::StreamTruncated { .. }
+            | Self::StreamIdle { .. }
+            | Self::StreamInterrupted { .. } => false,
         }
+    }
+}
+
+/// `120s`, or `250ms` below a second.
+fn idle_span(idle: Duration) -> String {
+    if idle < Duration::from_secs(1) {
+        format!("{}ms", idle.as_millis())
+    } else {
+        format!("{}s", idle.as_secs())
     }
 }
 
@@ -394,6 +427,19 @@ impl Display for ApiError {
             Self::StreamTruncated { provider, model } => write!(
                 f,
                 "the {provider} stream for {model} ended before the reply completed (no finish_reason and no [DONE]); the partial reply was discarded, retry the request"
+            ),
+            Self::StreamIdle {
+                provider,
+                model,
+                idle,
+            } => write!(
+                f,
+                "the {provider} stream for {model} stalled: no data for {}, so the connection was closed; retry the request",
+                idle_span(*idle)
+            ),
+            Self::StreamInterrupted { model, detail } => write!(
+                f,
+                "the response stream for {model} ended before the response completed ({detail}); retry the request"
             ),
         }
     }
@@ -930,6 +976,20 @@ mod gateway_error_tests {
         assert!(error
             .to_string()
             .contains("ended before the reply completed"));
+    }
+
+    #[test]
+    fn stream_interrupted_is_retryable_transport() {
+        let error = ApiError::StreamInterrupted {
+            model: "claude-opus-5-5".to_string(),
+            detail: "a tool call arrived but no stop reason",
+        };
+        assert!(error.is_retryable());
+        assert_eq!(error.safe_failure_class(), "provider_transport");
+        assert_eq!(
+            error.to_string(),
+            "the response stream for claude-opus-5-5 ended before the response completed (a tool call arrived but no stop reason); retry the request"
+        );
     }
 }
 

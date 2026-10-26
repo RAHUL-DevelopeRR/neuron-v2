@@ -10,6 +10,7 @@ import { FileAttachmentCard } from './file-attachment-card'
 import { ImageCard } from './image-card'
 import { MessageFooter } from './message-footer'
 import { TextAttachmentCard } from './text-attachment-card'
+import { RefusalBanner } from './refusal-banner'
 import { UserErrorBanner } from './user-error-banner'
 import { ValidationErrorPopover } from './validation-error-popover'
 import { useTheme } from '../hooks/use-theme'
@@ -51,6 +52,8 @@ interface MessageBlockProps {
   validationErrors?: Array<{ id: string; message: string }>
   /** Runtime error to display in UI but NOT send to LLM */
   userError?: string
+  /** The model declined to continue: the engine's refusal line */
+  refusal?: string
   attachments?: ImageAttachment[]
   textAttachments?: TextAttachment[]
   fileAttachments?: FileAttachment[]
@@ -126,6 +129,7 @@ export const MessageBlock = memo(({
   onBuildLite,
   validationErrors,
   userError,
+  refusal,
   attachments,
   textAttachments,
   fileAttachments,
@@ -307,6 +311,9 @@ export const MessageBlock = memo(({
             />
           )}
       </box>
+
+      {/* A refusal ends the answer, apart from it: it is not model text */}
+      {isAi && refusal && <RefusalBanner message={refusal} />}
 
       {/* Display runtime error banner for AI messages */}
       {isAi && userError && <UserErrorBanner error={userError} />}
