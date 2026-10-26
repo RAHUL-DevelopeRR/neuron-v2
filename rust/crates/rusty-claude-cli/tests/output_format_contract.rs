@@ -256,7 +256,7 @@ fn doctor_and_resume_status_emit_json_when_requested() {
     );
     assert_eq!(
         install_source["recommended_install"],
-        "npm install -g @zero-x.live/neuron or pip install neuroncli"
+        "npm install -g @zero-x.live/neuron or pip install --pre neuroncli"
     );
     assert!(install_source.get("deprecated_install").is_none());
 

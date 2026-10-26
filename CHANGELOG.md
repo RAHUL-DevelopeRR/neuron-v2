@@ -68,7 +68,8 @@ The [known limitations of 7.0.0-alpha.1](https://github.com/RAHUL-DevelopeRR/neu
 
 - Removed a stray submodule entry (`opencode`) that had no `.gitmodules` URL. It broke
   the checkout in the release workflow's npm and PyPI jobs, which is why 7.0.0-alpha.1
-  never reached either registry. A packaging test now fails on any such entry.
+  never reached npm (PyPI uploads were also paused then). A packaging test now fails on
+  any such entry.
 - A manual run of the release workflow chooses the npm dist-tag (`npm_dist_tag`:
   `next`, the default, or `latest`). A tag push still publishes a prerelease under
   `next` and a release under `latest`.

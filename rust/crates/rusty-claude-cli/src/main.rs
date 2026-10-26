@@ -7096,7 +7096,7 @@ mod tests {
         assert!(help.contains("neuron /skills"));
         assert!(help.contains("https://github.com/RAHUL-DevelopeRR/neuron-v2"));
         assert!(help.contains("npm install -g @zero-x.live/neuron"));
-        assert!(help.contains("pipx install neuroncli"));
+        assert!(help.contains("pipx install --pip-args=--pre neuroncli"));
         assert!(help.contains("install.sh"));
         assert!(!help.contains("claw-code"));
         assert!(!help.contains("cargo install neuron-cli"));
