@@ -1,0 +1,212 @@
+name: Mobile native builds
+
+# Native builds of the phone app (ui/neuron-mobile) with no Expo, Apple or Google account: an
+# Android APK to sideload and an iOS simulator app. Store builds (EAS, Play internal testing,
+# TestFlight) are mobile-eas.yml's.
+#
+# - Pull requests and pushes that touch the app build a debug-signed APK, named `-debug-signed`:
+#   it installs for testing, but is not for distribution and Play refuses it.
+# - Run by hand with `signed` to sign the APK with Neuron's upload key from the `mobile-release`
+#   environment (secrets ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS,
+#   ANDROID_KEY_PASSWORD). The key never touches the repository or the logs.
+# - The iOS simulator build is unsigned (CODE_SIGNING_ALLOWED=NO): drag it onto a simulator.
+#
+# Nothing here publishes anything.
+
+on:
+  pull_request:
+    paths:
+      - ui/neuron-mobile/**
+      - ui/neuron-client/**
+      - .github/workflows/mobile-native.yml
+  push:
+    branches:
+      - ux-audit-fixes
+      - feat/neuron-apps
+    paths:
+      - ui/neuron-mobile/**
+      - ui/neuron-client/**
+      - .github/workflows/mobile-native.yml
+  workflow_dispatch:
+    inputs:
+      signed:
+        description: Sign the APK with the upload key (mobile-release environment)
+        type: boolean
+        default: false
+      ios:
+        description: Also build the iOS simulator app
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mobile-native-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUN_VERSION: 1.3.14
+  NODE_VERSION: 22
+  JAVA_VERSION: 17
+  ABIS: arm64-v8a,x86_64
+
+jobs:
+  check:
+    name: Typecheck and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    defaults:
+      run:
+        working-directory: ui/neuron-mobile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun run test
+      - name: App version
+        id: version
+        run: echo "version=$(node -p "require('./app.json').expo.version")" >> "$GITHUB_OUTPUT"
+
+  android:
+    name: Android APK (${{ matrix.signing }})
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      matrix:
+        # The signed build runs only when asked for; its job then needs the environment's approval.
+        signing: ${{ fromJSON((github.event_name == 'workflow_dispatch' && inputs.signed) && '["release"]' || '["debug-signed"]') }}
+    # An empty name runs the job outside any environment.
+    environment: ${{ matrix.signing == 'release' && 'mobile-release' || '' }}
+    defaults:
+      run:
+        working-directory: ui/neuron-mobile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+      - uses: gradle/actions/setup-gradle@v4
+      - run: bun install --frozen-lockfile
+
+      - name: The upload key
+        if: matrix.signing == 'release'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          missing=""
+          for name in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            [ -n "${!name}" ] || missing="$missing $name"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::The mobile-release environment lacks:$missing (ANDROID_ prefixed). Add them with gh secret set --env mobile-release, or run without 'signed'."
+            exit 1
+          fi
+          keystore="$RUNNER_TEMP/upload.jks"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          {
+            echo "NEURON_ANDROID_KEYSTORE=$keystore"
+            echo "NEURON_ANDROID_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+            echo "NEURON_ANDROID_KEY_ALIAS=$KEY_ALIAS"
+            echo "NEURON_ANDROID_KEY_PASSWORD=$KEY_PASSWORD"
+          } >> "$GITHUB_ENV"
+
+      - name: Build the APK
+        run: scripts/build-android.sh "dist/neuron-mobile-${{ needs.check.outputs.version }}-${GITHUB_SHA::7}-android-${{ matrix.signing }}.apk"
+
+      - name: Check the signature
+        run: |
+          apksigner="$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)apksigner"
+          apk="$(ls dist/*.apk)"
+          "$apksigner" verify --print-certs "$apk" | tee "$RUNNER_TEMP/signature.txt"
+          if grep -q 'CN=Android Debug' "$RUNNER_TEMP/signature.txt"; then
+            [ "${{ matrix.signing }}" = debug-signed ] || { echo "::error::The release APK is debug-signed: the upload key was not used."; exit 1; }
+          else
+            [ "${{ matrix.signing }}" = release ] || { echo "::error::Expected a debug-signed APK."; exit 1; }
+          fi
+          sha256sum "$apk" | sed 's#dist/##' > "$apk.sha256"
+          {
+            echo "### Android APK (${{ matrix.signing }})"
+            echo
+            echo "\`$(basename "$apk")\`, $(du -h "$apk" | cut -f1), ABIs ${ABIS}"
+            echo
+            echo '```'
+            cat "$apk.sha256"
+            grep -m1 'SHA-256 digest' "$RUNNER_TEMP/signature.txt" || true
+            echo '```'
+            if [ "${{ matrix.signing }}" = debug-signed ]; then
+              echo
+              echo "Debug-signed: install it to test (adb install, or open it on the phone). Android refuses to update it over a build signed with another key."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: neuron-mobile-android-${{ matrix.signing }}
+          path: |
+            ui/neuron-mobile/dist/*.apk
+            ui/neuron-mobile/dist/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  ios-simulator:
+    name: iOS simulator app
+    needs: check
+    if: github.event_name != 'workflow_dispatch' || inputs.ios
+    runs-on: macos-15
+    timeout-minutes: 75
+    defaults:
+      run:
+        working-directory: ui/neuron-mobile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: The newest Xcode on the runner
+        run: |
+          xcode="$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
+      - run: bun install --frozen-lockfile
+      - run: npx expo prebuild --platform ios --no-install --clean
+      - name: Pods
+        working-directory: ui/neuron-mobile/ios
+        run: pod install
+      - name: Build for the simulator
+        working-directory: ui/neuron-mobile/ios
+        run: |
+          workspace="$(ls -d *.xcworkspace | head -1)"
+          scheme="${workspace%.xcworkspace}"
+          set -o pipefail
+          xcodebuild -workspace "$workspace" -scheme "$scheme" -configuration Release \
+            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO build | tail -n 40
+          app="$(ls -d build/Build/Products/Release-iphonesimulator/*.app | head -1)"
+          mkdir -p ../dist
+          ditto -c -k --keepParent "$app" "../dist/neuron-mobile-${{ needs.check.outputs.version }}-${GITHUB_SHA::7}-ios-simulator.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: neuron-mobile-ios-simulator
+          path: ui/neuron-mobile/dist/*.zip
+          if-no-files-found: error
+          retention-days: 30

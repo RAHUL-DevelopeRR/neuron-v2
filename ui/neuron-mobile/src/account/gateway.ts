@@ -36,6 +36,7 @@ export interface Account {
 
 export interface LinkedSession {
   id: string
+  /** The app it signed in with (`neuron-cli`, `neuron-mobile`, ...). */
   client: string | null
   device_name: string | null
   os: string | null
@@ -54,6 +55,13 @@ export class GatewayError extends Error {
     super(message)
     this.name = 'GatewayError'
   }
+}
+
+/** Zero-X lists `client` as `{name, version}` (PLATFORM_CONTRACT.md §10.1); the dev relay as a string. */
+function clientName(client: unknown): string | null {
+  if (typeof client === 'string') return client || null
+  const name = client && typeof client === 'object' ? (client as { name?: unknown }).name : null
+  return typeof name === 'string' && name ? name : null
 }
 
 /** The gateway that goes with a relay: Zero-X's for Zero-X's relay, the dev relay itself otherwise. */
@@ -170,7 +178,8 @@ export class Gateway {
   /** Devices signed in to the account (A9); `null` where the gateway does not have the endpoint yet. */
   async linkedSessions(token: string): Promise<LinkedSession[] | null> {
     try {
-      return (await this.call<{ sessions: LinkedSession[] }>('/api/sessions', { token })).sessions
+      const { sessions } = await this.call<{ sessions: Array<Omit<LinkedSession, 'client'> & { client?: unknown }> }>('/api/sessions', { token })
+      return sessions.map((session) => ({ ...session, client: clientName(session.client) }))
     } catch (error) {
       if (error instanceof GatewayError && error.status === 404) return null
       throw error

@@ -6,8 +6,8 @@ on the computer. Three parties implement this document:
 | Party | Where | Status |
 |---|---|---|
 | Phone | `ui/neuron-mobile/src/relay/` (`phone.ts`, `transport.ts`, `link.ts`, `crypto.ts`, `pairing.ts`) | built (WP4) |
-| Relay | zero-x.live: a Durable Object per account, `RelayRoom` (A11), and the push service (A12) | WP5. A stand-in runs here: `dev/relay-room.ts`, served by `dev/relay.ts` |
-| Computer | `neuron engine --share` (R1, Rust) | WP1. The TypeScript reference is `src/relay/share-host.ts`, run by `dev/share.ts` |
+| Relay | zero-x.live: a Durable Object per account, `RelayRoom` (A11), and the push service (A12) | built (`neuroncli/auth-server/src/relay.js`, `docs/RELAY.md`), not deployed yet. A stand-in runs here: `dev/relay-room.ts`, served by `dev/relay.ts` |
+| Computer | `neuron engine --share` (R1, Rust) | built (`rust/crates/neuron-share`), sharing a local host's session. The TypeScript reference is `src/relay/share-host.ts`, run by `dev/share.ts` |
 
 The source of truth for frame shapes is `src/relay/contract.ts`; for the cryptography,
 `src/relay/crypto.ts` with the vectors in §3.7. This document explains them and lists what each
@@ -314,8 +314,9 @@ All with `Authorization: Bearer ses_…`; `nzx_` keys are refused (403). Shapes 
   `{status: "registered"}`. `device_id` is the phone's relay device id; one row per account and
   device, replaced on every call. `expo_push_token` matches `ExponentPushToken[…]`.
 - `DELETE /api/push/devices/:device_id` → `{status: "removed"}`.
-- `GET /api/sessions` (A9) → `{sessions: [{id, client, device_name, os, created_at, last_used_at,
-  current}]}`. The app hides the list when this answers 404.
+- `GET /api/sessions` (A9) → `{sessions: [{id, client: {name, version}, device_name, os, created_at,
+  last_used_at, expires_at, current}]}` (the dev relay sends `client` as a string; the app reads
+  both). The app hides the list when this answers 404.
 - `DELETE /api/sessions/:id`, and `DELETE /api/sessions/current` for signing this phone out.
 - `POST /auth/device/code` accepts `client_id: "neuron-mobile"`.
 - The phone shows `GET /api/account`'s `user.email`, `plan.name`, `usage_today` and `limits`,

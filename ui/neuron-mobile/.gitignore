@@ -2,3 +2,8 @@ node_modules/
 .expo/
 dist/
 web-build/
+# `expo prebuild` makes these from app.json (CI builds them fresh); they are never committed.
+/android/
+/ios/
+*.keystore
+*.jks
