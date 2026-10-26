@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import unittest
 from pathlib import Path
 from typing import Dict, Iterator, Set, Tuple
@@ -89,6 +90,20 @@ class PackagingMetadataTests(unittest.TestCase):
     def test_every_manifest_carries_the_same_version(self) -> None:
         versions = manifest_versions()
         self.assertEqual(len(set(versions.values())), 1, versions)
+
+    def test_no_submodule_entry_lacks_a_gitmodules_url(self) -> None:
+        # actions/checkout runs `git submodule foreach` when persist-credentials is off (the
+        # release's npm and PyPI jobs); a gitlink with no .gitmodules entry fails that checkout.
+        try:
+            listing = subprocess.run(
+                ["git", "ls-files", "--stage"], cwd=REPO_ROOT, capture_output=True, text=True, check=True
+            ).stdout
+        except (OSError, subprocess.CalledProcessError):
+            self.skipTest("not a git checkout")
+        gitlinks = [line.split("\t", 1)[1] for line in listing.splitlines() if line.startswith("160000 ")]
+        declared = read(".gitmodules") if (REPO_ROOT / ".gitmodules").is_file() else ""
+        missing = [path for path in gitlinks if f"path = {path}" not in declared]
+        self.assertEqual(missing, [], "submodule entries without a .gitmodules url")
 
     def test_license_keeps_the_upstream_notice_and_adds_neuron(self) -> None:
         license_text = read("LICENSE")
