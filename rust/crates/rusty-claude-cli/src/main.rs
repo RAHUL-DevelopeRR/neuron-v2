@@ -52,6 +52,7 @@ mod credentials;
 mod device_login;
 mod doctor;
 mod engine;
+mod engine_share;
 mod engine_stdio;
 mod executor;
 mod full_screen;
@@ -359,6 +360,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // `auth`, `login`, `logout`, `usage` and `upgrade`, also after global flags.
     if let Some(command) = auth::account_command(&args) {
         return auth::run_account_command(&command);
+    }
+    // Sharing a local Neuron host's session with the phone, through the Zero-X relay.
+    if let Some(share_args) = engine_share::share_engine_args(&args) {
+        return engine_share::run_share_command(&share_args);
     }
     // Hidden: the engine for a UI in another process, as JSON lines.
     if let Some(engine_args) = engine_stdio::stdio_engine_args(&args) {

@@ -14,6 +14,7 @@ api = { path = "../api" }
 commands = { path = "../commands" }
 compat-harness = { path = "../compat-harness" }
 neuron-tui = { path = "../neuron-tui" }
+neuron-share = { path = "../neuron-share" }
 crossterm = "0.29"
 pulldown-cmark = "0.13"
 rustyline = "15"

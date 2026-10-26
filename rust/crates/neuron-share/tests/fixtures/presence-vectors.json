@@ -1,0 +1,1126 @@
+{
+ "generated_by": "ui/neuron-mobile/test/fixtures/presence-vectors.ts",
+ "scenarios": [
+  {
+   "name": "a whole session from the start",
+   "fallback_cwd": "/fallback/project",
+   "steps": [
+    {
+     "snapshot": {
+      "seq": 0,
+      "state": {
+       "connection": "connecting",
+       "connectionError": null,
+       "version": null,
+       "protocol": null,
+       "features": [],
+       "status": null,
+       "sessions": null,
+       "todos": [],
+       "restartRequired": false,
+       "extensions": null,
+       "models": [],
+       "busy": false,
+       "sessionStarting": false,
+       "signInCode": null,
+       "items": [],
+       "permissions": [],
+       "usage": null,
+       "nextKey": 1
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "project",
+      "title": null,
+      "branch": null,
+      "model": null,
+      "status": "idle",
+      "last_seq": 0
+     }
+    },
+    {
+     "action": {
+      "seq": 1,
+      "action": {
+       "type": "local/connecting"
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "project",
+      "title": null,
+      "branch": null,
+      "model": null,
+      "status": "idle",
+      "last_seq": 1
+     }
+    },
+    {
+     "action": {
+      "seq": 2,
+      "action": {
+       "type": "ready",
+       "version": "7.0.0",
+       "protocol": 1,
+       "features": [
+        "questions"
+       ]
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "project",
+      "title": null,
+      "branch": null,
+      "model": null,
+      "status": "idle",
+      "last_seq": 2
+     }
+    },
+    {
+     "action": {
+      "seq": 3,
+      "action": {
+       "type": "status",
+       "model": "glm-5.2",
+       "permission_mode": "workspace-write",
+       "session_id": "s1",
+       "cwd": "/work/neuron-v2",
+       "workspace_trusted": true,
+       "plan_mode": false,
+       "context_percent": 3,
+       "git": {
+        "branch": "main",
+        "dirty": false,
+        "ahead": 0,
+        "behind": 0
+       }
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": null,
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "idle",
+      "last_seq": 3
+     }
+    },
+    {
+     "action": {
+      "seq": 4,
+      "action": {
+       "type": "local/submitted",
+       "text": "  Fix   the build\nplease  "
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Fix the build please",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "running",
+      "last_seq": 4
+     }
+    },
+    {
+     "action": {
+      "seq": 5,
+      "action": {
+       "type": "text_delta",
+       "text": "Looking."
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Fix the build please",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "running",
+      "last_seq": 5
+     }
+    },
+    {
+     "action": {
+      "seq": 6,
+      "action": {
+       "type": "reasoning_started",
+       "chars": null,
+       "redacted": false
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Fix the build please",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "running",
+      "last_seq": 6
+     }
+    },
+    {
+     "action": {
+      "seq": 7,
+      "action": {
+       "type": "reasoning_delta",
+       "text": "hmm"
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Fix the build please",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "running",
+      "last_seq": 7
+     }
+    },
+    {
+     "action": {
+      "seq": 8,
+      "action": {
+       "type": "tool_call_started",
+       "id": "t1",
+       "name": "Bash",
+       "input": "{\"command\":\"cargo build\"}",
+       "cut_off": false
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Fix the build please",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "running",
+      "last_seq": 8
+     }
+    },
+    {
+     "action": {
+      "seq": 9,
+      "action": {
+       "type": "permission_requested",
+       "id": 1,
+       "request": {
+        "tool": "Bash",
+        "current_mode": "read-only",
+        "required_mode": "workspace-write",
+        "reason": null,
+        "input": "{ \"command\": \"cargo build\" }",
+        "session_prefixes": []
+       }
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Fix the build please",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "needs_me",
+      "last_seq": 9
+     }
+    },
+    {
+     "action": {
+      "seq": 10,
+      "action": {
+       "type": "local/permission_answered",
+       "id": 1,
+       "decision": {
+        "kind": "allow_once"
+       }
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Fix the build please",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "running",
+      "last_seq": 10
+     }
+    },
+    {
+     "action": {
+      "seq": 11,
+      "action": {
+       "type": "tool_result",
+       "id": "t1",
+       "name": "Bash",
+       "output": "ok",
+       "is_error": false
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Fix the build please",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "running",
+      "last_seq": 11
+     }
+    },
+    {
+     "action": {
+      "seq": 12,
+      "action": {
+       "type": "text_delta",
+       "text": "Built."
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Fix the build please",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "running",
+      "last_seq": 12
+     }
+    },
+    {
+     "action": {
+      "seq": 13,
+      "action": {
+       "type": "text_block_end"
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Fix the build please",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "running",
+      "last_seq": 13
+     }
+    },
+    {
+     "action": {
+      "seq": 14,
+      "action": {
+       "type": "turn_finished"
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Fix the build please",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "idle",
+      "last_seq": 14
+     }
+    },
+    {
+     "action": {
+      "seq": 15,
+      "action": {
+       "type": "question",
+       "id": 7,
+       "question": "Which branch?",
+       "options": [
+        "main",
+        "dev"
+       ]
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Fix the build please",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "needs_me",
+      "last_seq": 15
+     }
+    },
+    {
+     "action": {
+      "seq": 16,
+      "action": {
+       "type": "local/answered",
+       "id": 7,
+       "text": "main"
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Fix the build please",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "idle",
+      "last_seq": 16
+     }
+    },
+    {
+     "action": {
+      "seq": 17,
+      "action": {
+       "type": "local/submitted",
+       "text": "Now run the tests"
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Fix the build please",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "running",
+      "last_seq": 17
+     }
+    },
+    {
+     "action": {
+      "seq": 18,
+      "action": {
+       "type": "tool_call_started",
+       "id": "t2",
+       "name": "Bash",
+       "input": "{\"command\":\"cargo test\"}",
+       "cut_off": false
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Fix the build please",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "running",
+      "last_seq": 18
+     }
+    },
+    {
+     "action": {
+      "seq": 19,
+      "action": {
+       "type": "permission_requested",
+       "id": 2,
+       "request": {
+        "tool": "Bash",
+        "current_mode": "read-only",
+        "required_mode": "workspace-write",
+        "reason": null,
+        "input": "{\"command\":\"cargo test\"}",
+        "session_prefixes": []
+       }
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Fix the build please",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "needs_me",
+      "last_seq": 19
+     }
+    },
+    {
+     "action": {
+      "seq": 20,
+      "action": {
+       "type": "local/permission_answered",
+       "id": 2,
+       "decision": {
+        "kind": "deny",
+        "note": "not now"
+       }
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Fix the build please",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "running",
+      "last_seq": 20
+     }
+    },
+    {
+     "action": {
+      "seq": 21,
+      "action": {
+       "type": "tool_result",
+       "id": "t2",
+       "name": "Bash",
+       "output": "Permission denied by user",
+       "is_error": true
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Fix the build please",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "running",
+      "last_seq": 21
+     }
+    },
+    {
+     "action": {
+      "seq": 22,
+      "action": {
+       "type": "error",
+       "message": "The model stopped."
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Fix the build please",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "running",
+      "last_seq": 22
+     }
+    },
+    {
+     "action": {
+      "seq": 23,
+      "action": {
+       "type": "turn_finished"
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Fix the build please",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "failed",
+      "last_seq": 23
+     }
+    },
+    {
+     "action": {
+      "seq": 24,
+      "action": {
+       "type": "sessions",
+       "sessions": [
+        {
+         "id": "s1",
+         "title": "Build fixes",
+         "model": "glm-5.2",
+         "message_count": 4,
+         "updated_at_ms": 1,
+         "current": true,
+         "branch": "main"
+        }
+       ]
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Build fixes",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "failed",
+      "last_seq": 24
+     }
+    },
+    {
+     "action": {
+      "seq": 25,
+      "action": {
+       "type": "notice",
+       "message": "Question: proceed with the release?"
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Build fixes",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "needs_me",
+      "last_seq": 25
+     }
+    },
+    {
+     "action": {
+      "seq": 26,
+      "action": {
+       "type": "local/submitted",
+       "text": "yes"
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Build fixes",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "idle",
+      "last_seq": 26
+     }
+    },
+    {
+     "action": {
+      "seq": 27,
+      "action": {
+       "type": "turn_finished"
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Build fixes",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "idle",
+      "last_seq": 27
+     }
+    },
+    {
+     "action": {
+      "seq": 28,
+      "action": {
+       "type": "local/slash",
+       "command": "compact",
+       "args": ""
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Build fixes",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "running",
+      "last_seq": 28
+     }
+    },
+    {
+     "action": {
+      "seq": 29,
+      "action": {
+       "type": "tool_result",
+       "id": "t9",
+       "name": "Read",
+       "output": "late",
+       "is_error": false
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Build fixes",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "running",
+      "last_seq": 29
+     }
+    },
+    {
+     "action": {
+      "seq": 30,
+      "action": {
+       "type": "turn_finished"
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Build fixes",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "idle",
+      "last_seq": 30
+     }
+    },
+    {
+     "action": {
+      "seq": 31,
+      "action": {
+       "type": "tool_call_started",
+       "id": "t3",
+       "name": "Edit",
+       "input": "{\"path\":\"a.rs\"}",
+       "cut_off": false
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Build fixes",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "idle",
+      "last_seq": 31
+     }
+    },
+    {
+     "action": {
+      "seq": 32,
+      "action": {
+       "type": "permission_requested",
+       "id": 3,
+       "request": {
+        "tool": "Edit",
+        "current_mode": "read-only",
+        "required_mode": "workspace-write",
+        "reason": null,
+        "input": "{\"path\":\"a.rs\"}",
+        "session_prefixes": []
+       }
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Build fixes",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "needs_me",
+      "last_seq": 32
+     }
+    },
+    {
+     "action": {
+      "seq": 33,
+      "action": {
+       "type": "local/disconnected",
+       "error": "The engine stopped."
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Build fixes",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "failed",
+      "last_seq": 33
+     }
+    },
+    {
+     "action": {
+      "seq": 34,
+      "action": {
+       "type": "local/connecting"
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Build fixes",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "idle",
+      "last_seq": 34
+     }
+    },
+    {
+     "action": {
+      "seq": 35,
+      "action": {
+       "type": "ready",
+       "version": "7.0.0",
+       "protocol": 1,
+       "features": []
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Build fixes",
+      "branch": "main",
+      "model": "glm-5.2",
+      "status": "idle",
+      "last_seq": 35
+     }
+    },
+    {
+     "action": {
+      "seq": 36,
+      "action": {
+       "type": "status",
+       "model": "kimi-k2",
+       "permission_mode": "workspace-write",
+       "session_id": "s2",
+       "cwd": "/work/neuron-v2",
+       "workspace_trusted": true,
+       "plan_mode": false,
+       "context_percent": 3,
+       "git": null
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Fix the build please",
+      "branch": null,
+      "model": "kimi-k2",
+      "status": "idle",
+      "last_seq": 36
+     }
+    },
+    {
+     "action": {
+      "seq": 37,
+      "action": {
+       "type": "transcript",
+       "session_id": "s2",
+       "truncated": true,
+       "entries": [
+        {
+         "kind": "user",
+         "text": "Earlier prompt"
+        },
+        {
+         "kind": "tool_call",
+         "id": "x1",
+         "name": "Bash",
+         "input": "{}"
+        },
+        {
+         "kind": "tool_result",
+         "id": "x1",
+         "output": "fine",
+         "is_error": false
+        },
+        {
+         "kind": "assistant",
+         "text": "Done before."
+        }
+       ]
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Earlier prompt",
+      "branch": null,
+      "model": "kimi-k2",
+      "status": "idle",
+      "last_seq": 37
+     }
+    },
+    {
+     "action": {
+      "seq": 38,
+      "action": {
+       "type": "session_starting"
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Earlier prompt",
+      "branch": null,
+      "model": "kimi-k2",
+      "status": "running",
+      "last_seq": 38
+     }
+    },
+    {
+     "action": {
+      "seq": 39,
+      "action": {
+       "type": "turn_finished"
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Earlier prompt",
+      "branch": null,
+      "model": "kimi-k2",
+      "status": "idle",
+      "last_seq": 39
+     }
+    },
+    {
+     "action": {
+      "seq": 40,
+      "action": {
+       "type": "sign_in_code",
+       "url": "https://zero-x.live/device",
+       "url_complete": null,
+       "user_code": "ABCD-EFGH",
+       "expires_in_secs": 600,
+       "browser_opened": false
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Earlier prompt",
+      "branch": null,
+      "model": "kimi-k2",
+      "status": "running",
+      "last_seq": 40
+     }
+    },
+    {
+     "action": {
+      "seq": 41,
+      "action": {
+       "type": "turn_finished"
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "neuron-v2",
+      "title": "Earlier prompt",
+      "branch": null,
+      "model": "kimi-k2",
+      "status": "idle",
+      "last_seq": 41
+     }
+    },
+    {
+     "action": {
+      "seq": 42,
+      "action": {
+       "type": "local/reset"
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "project",
+      "title": null,
+      "branch": null,
+      "model": null,
+      "status": "idle",
+      "last_seq": 42
+     }
+    }
+   ]
+  },
+  {
+   "name": "attached mid-turn",
+   "fallback_cwd": "C:\\fallback",
+   "steps": [
+    {
+     "snapshot": {
+      "seq": 6,
+      "state": {
+       "connection": "ready",
+       "connectionError": null,
+       "version": "7.0.0",
+       "protocol": 1,
+       "features": [],
+       "status": {
+        "type": "status",
+        "model": "glm-5.2",
+        "permission_mode": "workspace-write",
+        "session_id": "s1",
+        "cwd": "C:\\Users\\rahul\\proj\\",
+        "workspace_trusted": true,
+        "plan_mode": false,
+        "context_percent": 3,
+        "git": {
+         "branch": "feat/x",
+         "dirty": true,
+         "ahead": 1,
+         "behind": 0
+        }
+       },
+       "sessions": null,
+       "todos": [],
+       "restartRequired": false,
+       "extensions": null,
+       "models": [],
+       "busy": true,
+       "sessionStarting": false,
+       "signInCode": null,
+       "items": [
+        {
+         "kind": "user",
+         "text": "Edit the config",
+         "attachments": [],
+         "key": "i1"
+        },
+        {
+         "kind": "tool",
+         "id": "e1",
+         "name": "Write",
+         "input": "{\"path\":\"c.json\"}",
+         "state": "awaiting_permission",
+         "view": {
+          "kind": "other",
+          "verb": "Write",
+          "target": "c.json"
+         },
+         "output": null,
+         "permissionId": 5,
+         "key": "i2"
+        }
+       ],
+       "permissions": [
+        {
+         "id": 5,
+         "request": {
+          "tool": "Write",
+          "current_mode": "read-only",
+          "required_mode": "workspace-write",
+          "reason": null,
+          "input": "{\"path\":\"c.json\"}",
+          "session_prefixes": []
+         },
+         "toolKey": "i2"
+        },
+        {
+         "id": 6,
+         "request": {
+          "tool": "Write",
+          "current_mode": "read-only",
+          "required_mode": "workspace-write",
+          "reason": null,
+          "input": "{\"path\":\"other\"}",
+          "session_prefixes": []
+         },
+         "toolKey": null
+        }
+       ],
+       "usage": null,
+       "nextKey": 3
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "proj",
+      "title": "Edit the config",
+      "branch": "feat/x",
+      "model": "glm-5.2",
+      "status": "needs_me",
+      "last_seq": 6
+     }
+    },
+    {
+     "action": {
+      "seq": 7,
+      "action": {
+       "type": "tool_result",
+       "id": "e1",
+       "name": "Write",
+       "output": "written",
+       "is_error": false
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "proj",
+      "title": "Edit the config",
+      "branch": "feat/x",
+      "model": "glm-5.2",
+      "status": "needs_me",
+      "last_seq": 7
+     }
+    },
+    {
+     "action": {
+      "seq": 8,
+      "action": {
+       "type": "local/permission_resolved",
+       "id": 6
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "proj",
+      "title": "Edit the config",
+      "branch": "feat/x",
+      "model": "glm-5.2",
+      "status": "running",
+      "last_seq": 8
+     }
+    },
+    {
+     "action": {
+      "seq": 9,
+      "action": {
+       "type": "tool_call_started",
+       "id": "e2",
+       "name": "Write",
+       "input": "{\"x\":1}",
+       "cut_off": true
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "proj",
+      "title": "Edit the config",
+      "branch": "feat/x",
+      "model": "glm-5.2",
+      "status": "running",
+      "last_seq": 9
+     }
+    },
+    {
+     "action": {
+      "seq": 10,
+      "action": {
+       "type": "tool_result",
+       "name": "Write",
+       "output": "cut",
+       "is_error": true
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "proj",
+      "title": "Edit the config",
+      "branch": "feat/x",
+      "model": "glm-5.2",
+      "status": "running",
+      "last_seq": 10
+     }
+    },
+    {
+     "action": {
+      "seq": 11,
+      "action": {
+       "type": "text_delta",
+       "text": "Done."
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "proj",
+      "title": "Edit the config",
+      "branch": "feat/x",
+      "model": "glm-5.2",
+      "status": "running",
+      "last_seq": 11
+     }
+    },
+    {
+     "action": {
+      "seq": 12,
+      "action": {
+       "type": "turn_finished"
+      }
+     },
+     "expect": {
+      "v": 1,
+      "project": "proj",
+      "title": "Edit the config",
+      "branch": "feat/x",
+      "model": "glm-5.2",
+      "status": "idle",
+      "last_seq": 12
+     }
+    }
+   ]
+  }
+ ]
+}
