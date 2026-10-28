@@ -638,7 +638,7 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  Use `{LATEST_SESSION_REFERENCE}` with --resume, /resume, or /session switch to target the newest saved session"
+        "  Use `{LATEST_SESSION_REFERENCE}` with --resume, /resume, or /session switch to target the newest saved session with messages"
     )?;
     writeln!(
         out,
@@ -666,7 +666,7 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(out, "  neuron agents")?;
     writeln!(out, "  neuron mcp show my-server")?;
-    writeln!(out, "  neuron /skills")?;
+    writeln!(out, "  neuron skills")?;
     writeln!(out, "  neuron doctor")?;
     writeln!(out, "  neuron init")?;
     writeln!(out, "  neuron export")?;

@@ -387,7 +387,7 @@ class InstallShTests(unittest.TestCase):
         result = self.run_installer(NEURON_VERSION=VERSION, NEURON_DUMMY_VERSION_REPORT="1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"\n  neuron {VERSION}\n", result.stderr)
-        self.assertNotIn("\n  NeuronCLI\n", result.stderr)
+        self.assertNotIn("\n  Neuron\n", result.stderr)
 
     def test_rejects_insecure_download_base_and_invalid_versions(self) -> None:
         insecure = self.run_installer(NEURON_VERSION=VERSION, NEURON_DOWNLOAD_BASE="http://downloads.example.com")
@@ -613,7 +613,7 @@ class InstallPs1Tests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         lines = result.stdout.splitlines()
         self.assertIn(f"  neuron {VERSION}", lines)
-        self.assertNotIn("  NeuronCLI", lines)
+        self.assertNotIn("  Neuron", lines)
 
     def test_a_failed_replacement_restores_the_previous_binary(self) -> None:
         folder = self.root / "replace"

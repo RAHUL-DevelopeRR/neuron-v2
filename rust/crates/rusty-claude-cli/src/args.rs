@@ -146,8 +146,92 @@ impl CliOutputFormat {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
+    parse_args_with_stdin(args, read_piped_stdin)
+}
+
+/// Standard input read to the end when it is not a terminal (a pipe or a file), else
+/// `None`. Test builds never read the test harness's stdin.
+fn read_piped_stdin() -> Option<String> {
+    if cfg!(test) || std::io::stdin().is_terminal() {
+        return None;
+    }
+    let mut piped = String::new();
+    let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut piped);
+    Some(piped)
+}
+
+/// `--no-tui`, which `main` takes out of the arguments before they are parsed.
+static NO_TUI_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Records whether this run had `--no-tui`: it asks for the line REPL, so piped input
+/// meant for it is refused rather than sent to the model.
+pub(crate) fn record_no_tui_flag(given: bool) {
+    NO_TUI_FLAG.store(given, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Piped text goes to the model as one prompt, so `/model` and `/exit` on their own
+/// lines would be a question for the model, not commands.
+const PIPED_SLASH_COMMANDS: &str = "piped input is sent to the model as one prompt, so slash \
+commands can't be piped. Use subcommands (`neuron status`), `neuron --resume latest /status`, \
+or run `neuron` in a terminal.";
+
+/// The prompt piped stdin carries when the command line has none: `None` when it is
+/// empty (the REPL arm decides), an error when it was meant for the REPL (its first
+/// line is a slash command, or `--no-tui` asked for the line REPL).
+pub(crate) fn piped_prompt(piped: &str, no_tui: bool) -> Result<Option<String>, String> {
+    let prompt = piped.trim();
+    if prompt.is_empty() {
+        return Ok(None);
+    }
+    if prompt
+        .lines()
+        .next()
+        .is_some_and(looks_like_slash_command_token)
+    {
+        return Err(PIPED_SLASH_COMMANDS.to_string());
+    }
+    if no_tui {
+        return Err(format!(
+            "--no-tui starts the line REPL, which needs a terminal, and {PIPED_SLASH_COMMANDS} \
+To send the piped text as a prompt, leave out --no-tui."
+        ));
+    }
+    Ok(Some(prompt.to_string()))
+}
+
+/// The slash command Git Bash turned into a path: MSYS rewrites an argument that starts
+/// with `/` to one under its install folder, so `neuron /model` arrives as
+/// `C:/Program Files/Git/model` (`/usr/...` under `Git/usr`). `msystem` is `MSYSTEM`,
+/// which Git Bash sets.
+pub(crate) fn msys_slash_command(arg: &str, msystem: Option<&str>) -> Option<String> {
+    msystem.filter(|value| !value.is_empty())?;
+    let bytes = arg.as_bytes();
+    if !(bytes.len() > 3 && bytes[0].is_ascii_alphabetic() && &bytes[1..3] == b":/") {
+        return None;
+    }
+    let (folder, name) = arg.rsplit_once('/')?;
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+    {
+        return None;
+    }
+    let folder = folder.strip_suffix("/usr").unwrap_or(folder);
+    let (_, last) = folder.rsplit_once('/')?;
+    let command = format!("/{name}");
+    (last.eq_ignore_ascii_case("git") && looks_like_slash_command_token(&command))
+        .then_some(command)
+}
+
+/// [`parse_args`] with standard input from `piped_stdin` (`None` on a terminal), which
+/// is read only when the command line has no prompt.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn parse_args_with_stdin(
+    args: &[String],
+    piped_stdin: impl FnOnce() -> Option<String>,
+) -> Result<CliAction, String> {
     *MODEL_ARG.lock().unwrap_or_else(PoisonError::into_inner) = None;
     let mut model = DEFAULT_MODEL.to_string();
     // Only an explicit --model; `model` falls back to the default.
@@ -358,30 +442,38 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
 
     let allowed_tools = normalize_allowed_tools(&allowed_tool_values)?;
 
+    // Git Bash turned `neuron /model` into `neuron "C:/Program Files/Git/model"`.
+    if let [only] = rest.as_mut_slice() {
+        if let Some(command) = msys_slash_command(only, env::var("MSYSTEM").ok().as_deref()) {
+            eprintln!(
+                "Git Bash turned {command} into a path; treating it as {command}. Set MSYS_NO_PATHCONV=1 to avoid this."
+            );
+            *only = command;
+        }
+    }
+
     if rest.is_empty() {
         let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
         // When stdin is not a terminal (pipe/redirect) and no prompt is given on the
         // command line, read stdin as the prompt and dispatch as a one-shot Prompt
         // rather than starting the interactive REPL (which would consume the pipe and
         // print the startup banner, then exit without sending anything to the API).
-        #[cfg(not(test))]
-        if !std::io::stdin().is_terminal() {
-            let mut buf = String::new();
-            let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf);
-            let piped = buf.trim().to_string();
-            if !piped.is_empty() {
-                return Ok(CliAction::Prompt {
-                    model,
-                    prompt: piped,
-                    allowed_tools,
-                    permission_mode,
-                    output_format,
-                    compact: false,
-                    base_commit,
-                    reasoning_effort,
-                    allow_broad_cwd,
-                });
-            }
+        let piped = piped_stdin().unwrap_or_default();
+        if let Some(prompt) = piped_prompt(
+            &piped,
+            NO_TUI_FLAG.load(std::sync::atomic::Ordering::Relaxed),
+        )? {
+            return Ok(CliAction::Prompt {
+                model,
+                prompt,
+                allowed_tools,
+                permission_mode,
+                output_format,
+                compact: false,
+                base_commit,
+                reasoning_effort,
+                allow_broad_cwd,
+            });
         }
         return Ok(CliAction::Repl {
             model,
@@ -1661,5 +1753,106 @@ mod resume_prompt_tests {
             let error = parse(words).expect_err("an empty prompt is refused");
             assert!(error.contains("requires a prompt"), "{words:?}: {error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod script_input_tests {
+    use super::{msys_slash_command, parse_args, parse_args_with_stdin, piped_prompt, CliAction};
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(ToString::to_string).collect()
+    }
+
+    fn parse_piped(values: &[&str], stdin: &str) -> Result<CliAction, String> {
+        parse_args_with_stdin(&strings(values), || Some(stdin.to_string()))
+    }
+
+    #[test]
+    fn piped_slash_commands_are_refused_not_sent_to_the_model() {
+        for stdin in ["/help\n/exit", "\n  /model\n/exit\n", "/status\r\n"] {
+            let error = parse_piped(&[], stdin).expect_err("piped slash commands are refused");
+            assert!(
+                error.contains("slash commands can't be piped"),
+                "{stdin:?}: {error}"
+            );
+            assert!(error.contains("neuron --resume latest /status"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_piped_prompt_is_unchanged() {
+        let piped = parse_piped(&["--permission-mode", "read-only"], "fix the bug\n");
+        assert_eq!(
+            piped,
+            parse_args(&strings(&["--permission-mode", "read-only", "fix the bug"]))
+        );
+        assert!(matches!(piped, Ok(CliAction::Prompt { prompt, .. }) if prompt == "fix the bug"));
+        // A path is not a slash command.
+        let piped = parse_piped(
+            &["--permission-mode", "read-only"],
+            "/usr/bin/env is missing",
+        );
+        assert!(
+            matches!(piped, Ok(CliAction::Prompt { ref prompt, .. }) if prompt == "/usr/bin/env is missing"),
+            "{piped:?}"
+        );
+    }
+
+    #[test]
+    fn piped_input_with_no_tui_names_the_terminal_it_needs() {
+        let error = piped_prompt("fix the bug", true).expect_err("--no-tui needs a terminal");
+        assert!(error.contains("--no-tui"), "{error}");
+        assert!(error.contains("leave out --no-tui"), "{error}");
+        // Nothing piped: the REPL arm decides.
+        assert_eq!(piped_prompt(" \n", true), Ok(None));
+        assert_eq!(
+            piped_prompt("fix the bug\n", false),
+            Ok(Some("fix the bug".to_string()))
+        );
+    }
+
+    #[test]
+    fn git_bash_paths_of_slash_commands_are_slash_commands_again() {
+        let git_bash = Some("MINGW64");
+        for (arg, command) in [
+            ("C:/Program Files/Git/model", "/model"),
+            ("C:/Program Files/Git/usr/skills", "/skills"),
+            ("D:/tools/Git/help", "/help"),
+        ] {
+            assert_eq!(
+                msys_slash_command(arg, git_bash).as_deref(),
+                Some(command),
+                "{arg}"
+            );
+        }
+        // Not Git Bash, not a slash command, or not under Git: left alone.
+        assert_eq!(msys_slash_command("C:/Program Files/Git/model", None), None);
+        assert_eq!(
+            msys_slash_command("C:/Program Files/Git/average", git_bash),
+            None
+        );
+        assert_eq!(msys_slash_command("C:/projects/app/model", git_bash), None);
+        assert_eq!(msys_slash_command("C:/usr/model", git_bash), None);
+        assert_eq!(msys_slash_command("fix the model", git_bash), None);
+    }
+
+    #[test]
+    fn under_git_bash_a_mangled_slash_command_is_not_a_prompt() {
+        let _guard = crate::tests::env_lock();
+        let previous = std::env::var_os("MSYSTEM");
+        std::env::set_var("MSYSTEM", "MINGW64");
+        let model = parse_args(&strings(&["C:/Program Files/Git/model"]));
+        let skills = parse_args(&strings(&["C:/Program Files/Git/skills"]));
+        match previous {
+            Some(value) => std::env::set_var("MSYSTEM", value),
+            None => std::env::remove_var("MSYSTEM"),
+        }
+        let error = model.expect_err("/model is interactive-only");
+        assert!(error.contains("slash command /model"), "{error}");
+        assert!(
+            matches!(skills, Ok(CliAction::Skills { args: None, .. })),
+            "{skills:?}"
+        );
     }
 }

@@ -5,7 +5,9 @@
 //!   spending iterations and quota;
 //! - what stdin carries reaches the model with the prompt, and a pipe that never sends
 //!   anything does not hang the run;
-//! - `neuron --resume SESSION prompt TEXT` sends a saved session another prompt.
+//! - `neuron --resume SESSION prompt TEXT` sends a saved session another prompt;
+//! - a bare `neuron` with nothing on stdin, piped slash commands and piped `--no-tui`
+//!   input are refused before any request.
 
 use std::fs;
 use std::io::Write;
@@ -232,6 +234,59 @@ fn a_saved_session_takes_another_prompt_without_a_terminal() {
     workspace.remove();
 }
 
+/// `neuron </dev/null` in a folder nobody trusted yet: no trust question nobody can
+/// answer, no request, and no empty session left for `--resume latest`.
+#[test]
+fn a_bare_run_without_a_terminal_has_nothing_to_do() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let workspace = Workspace::new("bare-no-terminal");
+
+    let output = run_bare(&workspace, &server.base_url(), &[], Stdin::Null);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("nothing to do: no prompt was given and standard input is not a terminal"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("neuron prompt \"...\""), "{stderr}");
+    assert!(!stdout.contains("Press 1") && !stderr.contains("Press 1"));
+    assert!(session_files(&workspace.root).is_empty());
+    assert!(runtime.block_on(server.captured_requests()).is_empty());
+    workspace.remove();
+}
+
+/// `printf '/help\n/exit' | neuron`: piped text would reach the model as one prompt, so
+/// slash commands are refused before any request, as is piped text with `--no-tui`
+/// (the line REPL, which reads a terminal).
+#[test]
+fn piped_repl_input_is_refused_before_any_request() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+
+    for (extra, stdin, says) in [
+        (&[][..], "/help\n/exit\n", "slash commands can't be piped"),
+        (&["--no-tui"][..], "fix the bug\n", "leave out --no-tui"),
+    ] {
+        let workspace = Workspace::new("piped-repl-input");
+        let output = run_bare(&workspace, &server.base_url(), extra, Stdin::Data(stdin));
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
+        assert!(stderr.contains(says), "{stderr}");
+        assert!(session_files(&workspace.root).is_empty());
+        workspace.remove();
+    }
+    assert!(runtime.block_on(server.captured_requests()).is_empty());
+}
+
 #[derive(Clone, Copy)]
 enum Stdin {
     Null,
@@ -253,6 +308,19 @@ fn run(
         .args(["--model", "sonnet", "--permission-mode", "workspace-write"])
         .args(extra)
         .arg(format!("{SCENARIO_PREFIX}{scenario}"));
+    output_with_stdin(command, stdin)
+}
+
+/// A bare `neuron --permission-mode workspace-write [extra]`: options, no prompt.
+fn run_bare(workspace: &Workspace, base_url: &str, extra: &[&str], stdin: Stdin) -> Output {
+    let mut command = neuron(workspace, base_url);
+    command
+        .args(["--model", "sonnet", "--permission-mode", "workspace-write"])
+        .args(extra);
+    output_with_stdin(command, stdin)
+}
+
+fn output_with_stdin(mut command: Command, stdin: Stdin) -> Output {
     match stdin {
         Stdin::Null => command
             .stdin(Stdio::null())

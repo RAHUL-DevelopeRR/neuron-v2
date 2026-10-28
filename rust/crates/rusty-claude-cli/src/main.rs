@@ -385,6 +385,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(engine_args) = engine_stdio::stdio_engine_args(&args) {
         return engine_stdio::run_engine_command(&engine_args);
     }
+    crate::args::record_no_tui_flag(no_tui);
     let action = parse_args(&args).map_err(UsageError)?;
     if continue_chat.is_some() && !matches!(action, CliAction::Repl { .. }) {
         return Err(full_screen::CONTINUE_NEEDS_UI.into());
@@ -507,6 +508,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             if continue_chat.is_some() {
                 return Err(full_screen::CONTINUE_NEEDS_UI.into());
+            }
+            // `neuron </dev/null`: an empty pipe or file, so no prompt and nobody to
+            // type one. Said before the trust question and before a session is saved.
+            if !runtime::ui_hooks::stdin_is_terminal() {
+                return Err(UsageError(
+                    "nothing to do: no prompt was given and standard input is not a terminal. \
+Use `neuron prompt \"...\"` or pipe a prompt; start `neuron` in a terminal for a session."
+                        .to_string(),
+                )
+                .into());
             }
             run_repl(
                 model,
@@ -4470,7 +4481,7 @@ fn parse_titled_body(value: &str) -> Option<(String, String)> {
 }
 
 fn render_version_report() -> String {
-    let mut lines = vec!["NeuronCLI".to_string()];
+    let mut lines = vec!["Neuron".to_string()];
     lines.push(format!("  Version          {VERSION}"));
     if let Some(sha) = GIT_SHA {
         lines.push(format!("  Git SHA          {sha}"));
@@ -4893,9 +4904,9 @@ mod tests {
         parse_git_workspace_summary, parse_history_count, permission_policy, print_help_to,
         push_output_block, render_config_report, render_diff_report, render_diff_report_for,
         render_memory_report, render_prompt_history_report, render_repl_help, render_resume_usage,
-        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
-        resolve_repl_model, resolve_session_reference, response_to_events,
-        resume_supported_slash_commands, run_resume_command, short_tool_id,
+        render_session_markdown, render_version_report, resolve_model_alias,
+        resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
+        response_to_events, resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, status_context,
         summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_no_args,
         write_mcp_server_fixture, BackgroundMcp, BackgroundMcpOutcome, BackgroundMcpShared,
@@ -5693,6 +5704,12 @@ mod tests {
         assert_eq!(untrusted, "fast");
         assert_eq!(trusted, "claude-haiku-4-5-20251213");
         assert_eq!(unrelated, "claude-opus-4-6");
+    }
+
+    #[test]
+    fn version_report_names_the_product_neuron() {
+        let report = render_version_report();
+        assert!(report.starts_with("Neuron\n  Version "), "{report}");
     }
 
     #[test]
@@ -7160,7 +7177,8 @@ mod tests {
         assert!(help.contains("neuron agents"));
         assert!(help.contains("neuron mcp"));
         assert!(help.contains("neuron skills"));
-        assert!(help.contains("neuron /skills"));
+        // Git Bash turns `/skills` into a path: the examples use the subcommand.
+        assert!(!help.contains("neuron /skills"));
         assert!(help.contains("https://github.com/RAHUL-DevelopeRR/neuron-v2"));
         assert!(help.contains("npm install -g @zero-x.live/neuron"));
         assert!(help.contains("pipx install --pip-args=--pre neuroncli"));
@@ -7622,15 +7640,18 @@ UU conflicted.rs",
         std::fs::create_dir_all(&workspace).expect("workspace should create");
         let store = runtime::SessionStore::from_cwd(&workspace).expect("session store");
 
+        // `latest` skips sessions without messages.
         let older = store.create_handle("session-older");
-        Session::new()
-            .with_persistence_path(older.path.clone())
+        let mut session = Session::new().with_persistence_path(older.path.clone());
+        session.push_user_text("older").expect("older message");
+        session
             .save_to_path(&older.path)
             .expect("older session should save");
         std::thread::sleep(Duration::from_millis(20));
         let newer = store.create_handle("session-newer");
-        Session::new()
-            .with_persistence_path(newer.path.clone())
+        let mut session = Session::new().with_persistence_path(newer.path.clone());
+        session.push_user_text("newer").expect("newer message");
+        session
             .save_to_path(&newer.path)
             .expect("newer session should save");
 

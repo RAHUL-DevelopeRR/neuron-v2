@@ -43,6 +43,13 @@ script or CI, `neuron prompt` asks nothing: see [Permission modes](#permission-m
 for what happens to tool calls that need approval, and why such a run can exit with
 code 2.
 
+Piped text without a prompt on the command line (`echo "fix the bug" | neuron`) is the
+prompt, sent to the model as one message. So slash commands can't be piped:
+`printf '/status\n/exit' | neuron` is refused, as is piped input with `--no-tui`. Use the
+subcommands (`neuron status`) or `neuron --resume latest /status` instead. A bare `neuron`
+with no terminal and nothing piped (`neuron </dev/null`) stops with "nothing to do"
+rather than starting a session.
+
 `--output-format json` prints one JSON object when the turn ends. `message` is the
 final answer text (never the model's reasoning), `outcome` says how the turn ended
 (`completed`, `output_truncated`, `loop_detected`, `cancelled` or `refused`) and
@@ -200,7 +207,9 @@ neuron --resume latest prompt "now add tests"  # send it another prompt, then ex
 neuron export conversation.md                  # write the latest session as Markdown
 ```
 
-On a terminal, `--resume` without slash commands continues the session interactively.
+`latest` is the newest session with messages: a session left before its first prompt is
+skipped. On a terminal, `--resume` without slash commands continues the session
+interactively.
 `--resume SESSION prompt "..."` (or `-p "..."`) works anywhere, scripts included: it runs
 one turn as `neuron prompt` does, with the session's history, and saves the turn to the
 same file. With `--output-format json` its stdout is the turn's JSON answer, as for
@@ -365,6 +374,16 @@ credential store too.
   code-signed yet. Files fetched by the installers are not quarantined on macOS; if
   you downloaded a binary with a browser, check its SHA-256 and then run
   `xattr -d com.apple.quarantine ./neuron-macos-arm64`.
+- **Git Bash runs `neuron /model` as a prompt.** Git Bash (MSYS) rewrites an argument
+  that starts with `/` into a Windows path, so `/model` arrives as
+  `C:/Program Files/Git/model`. When that is the only argument and names a slash
+  command, Neuron treats it as the slash command and says so. Use the subcommands
+  (`neuron skills`, `neuron status`), or set `MSYS_NO_PATHCONV=1` for the command:
+  `MSYS_NO_PATHCONV=1 neuron --resume latest /status`.
+- **A script stops with "is not trusted".** Without a terminal Neuron can't ask.
+  Set `NEURON_TRUST_WORKSPACE=1` for that run (only for checkouts you trust), add the
+  folder to `trustedRoots` in `~/.neuron/settings.json`, or run `neuron` there once in a
+  terminal and press 1.
 - **Anything else.** `neuron doctor` checks auth, configuration and the workspace.
   Include its output, `neuron --version` and your install method when you open an
   issue.
