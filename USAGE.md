@@ -114,10 +114,17 @@ Neuron reports gateway limits with the reason and what to do next:
 | `context_length_exceeded` | No available model fits the request, including a prompt above a free model's per-minute token budget | Stops with the gateway's message and, when a paid pool would take the request, the upgrade link; shorten the prompt or `/compact` the session. |
 | `invalid_session` | The credential expired or was revoked | Stops and asks you to run `neuron auth login`. |
 
-Waits between retries do not count toward the first-token timeout (90 seconds, 60
-after tool results). A response that times out or breaks off is sent once more only
-while the retry limit above still allows a request, so one model call sends at most
-three requests to the gateway.
+Neuron waits up to 100 seconds for a gateway response to start, also after tool
+results, so the gateway has time to try other upstream providers first. A provider you
+call directly ([Bring your own key](#bring-your-own-key)) gets 90 seconds, and 60 after
+tool results. `NEURON_FIRST_TOKEN_TIMEOUT_SECS` sets both of these first-token
+timeouts, and waits between retries do not count toward them. A response that does not
+start in time is sent once more after 1 to 2 seconds, and one that breaks off after 2
+to 5 seconds, only while the retry limit above still allows a request, so one model
+call sends at most three requests to the gateway. When part of a reply that broke off
+was already printed, a `(partial reply discarded — retrying)` line follows it before
+the reply starts again; `--output-format json` and `--compact` print only the final
+answer, so they need no such line.
 
 The free plan's limits and the providers behind it are described in the
 [README](README.md#plans-and-limits).
@@ -313,6 +320,7 @@ or put it in your user settings.
 | `NEURON_MODEL` | neuron | Model for this process |
 | `NEURON_PROVIDER` | neuron | Provider for this process (see [Bring your own key](#bring-your-own-key)) |
 | `NEURON_MAX_ITERATIONS` | neuron | Model calls allowed in one turn (default 50) |
+| `NEURON_FIRST_TOKEN_TIMEOUT_SECS` | neuron | Seconds to wait for a response to start, also after tool results (default 100 for the gateway; 90, and 60 after tool results, for a provider called directly) |
 | `NEURON_CONFIG_HOME` | neuron | Settings directory (default `~/.neuron`) |
 | `NEURON_HOME` | neuron | Directory for the login file and caches (default `~/.neuroncli`); setting it also keeps the login out of the OS credential store |
 | `NEURON_CREDENTIAL_STORE` | neuron | `file` or `keychain`: force where the login is kept |

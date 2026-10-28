@@ -17,6 +17,12 @@ use std::io;
 pub(crate) const DEFAULT_FIRST_TOKEN_TIMEOUT: Duration = Duration::from_secs(90);
 /// Default time to wait for the first stream event after tool results.
 pub(crate) const DEFAULT_POST_TOOL_FIRST_TOKEN_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default first-token deadline toward the Zero-X gateway, fresh or after
+/// tool results. The gateway tries up to three upstreams for one request and
+/// caps that failover at 50 s; a shorter deadline sends the request again
+/// while the gateway still serves it, and the two fill a free plan's
+/// concurrent slots.
+pub(crate) const GATEWAY_FIRST_TOKEN_TIMEOUT: Duration = Duration::from_secs(100);
 /// Longest tolerated gap between two stream events once streaming started.
 pub(crate) const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Overrides both first-token timeouts (seconds).
@@ -44,14 +50,31 @@ impl Default for StreamTimeouts {
 }
 
 impl StreamTimeouts {
-    /// Defaults with `NEURON_FIRST_TOKEN_TIMEOUT_SECS` applied to both
-    /// first-token deadlines when it holds a positive integer.
-    pub(crate) fn from_env() -> Self {
-        Self::from_override(env::var(FIRST_TOKEN_TIMEOUT_ENV_VAR).ok().as_deref())
+    /// The defaults toward the Zero-X gateway (`gateway`) or toward a provider
+    /// called directly.
+    pub(crate) fn defaults_for(gateway: bool) -> Self {
+        if gateway {
+            Self {
+                first_token: GATEWAY_FIRST_TOKEN_TIMEOUT,
+                post_tool_first_token: GATEWAY_FIRST_TOKEN_TIMEOUT,
+                ..Self::default()
+            }
+        } else {
+            Self::default()
+        }
     }
 
-    pub(crate) fn from_override(value: Option<&str>) -> Self {
-        let mut timeouts = Self::default();
+    /// [`Self::defaults_for`] with `NEURON_FIRST_TOKEN_TIMEOUT_SECS` applied
+    /// to both first-token deadlines when it holds a positive integer.
+    pub(crate) fn from_env(gateway: bool) -> Self {
+        Self::from_override(
+            gateway,
+            env::var(FIRST_TOKEN_TIMEOUT_ENV_VAR).ok().as_deref(),
+        )
+    }
+
+    pub(crate) fn from_override(gateway: bool, value: Option<&str>) -> Self {
+        let mut timeouts = Self::defaults_for(gateway);
         if let Some(seconds) = value
             .and_then(|raw| raw.trim().parse::<u64>().ok())
             .filter(|seconds| *seconds > 0)
@@ -68,6 +91,54 @@ impl StreamTimeouts {
         } else {
             self.first_token
         }
+    }
+}
+
+/// How long the stream retry waits before it sends the request again, as the
+/// shortest and longest of a random wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StreamRetryBackoff {
+    /// The stream broke off: it ended without a finish reason or `[DONE]`,
+    /// carried an error (a 5xx) or went silent. Sent again at once, the
+    /// request can reach the gateway worker that just failed, still in the
+    /// strict mode a CPU-time kill leaves it in, and fail the same way.
+    pub interrupted: (Duration, Duration),
+    /// No first event arrived before the deadline, which already spaced the
+    /// two requests out.
+    pub first_token_stall: (Duration, Duration),
+}
+
+impl Default for StreamRetryBackoff {
+    fn default() -> Self {
+        Self {
+            interrupted: (Duration::from_secs(2), Duration::from_secs(5)),
+            first_token_stall: (Duration::from_secs(1), Duration::from_secs(2)),
+        }
+    }
+}
+
+impl StreamRetryBackoff {
+    /// A random wait in the range for `failure`.
+    pub(crate) fn delay_for(self, failure: &StreamFailure) -> Duration {
+        let (shortest, longest) = match failure {
+            StreamFailure::FirstTokenTimeout { .. } => self.first_token_stall,
+            _ => self.interrupted,
+        };
+        if longest <= shortest {
+            return shortest;
+        }
+        rand::Rng::gen_range(&mut rand::thread_rng(), shortest..=longest)
+    }
+}
+
+/// Whether `client` talks to the Zero-X gateway: the provider check that also
+/// picks the gateway's credential, headers and retry policy.
+pub(crate) fn is_gateway_client(client: &ApiProviderClient) -> bool {
+    match client {
+        ApiProviderClient::Xai(client) | ApiProviderClient::OpenAi(client) => {
+            client.provider_config().is_zero_x()
+        }
+        ApiProviderClient::Anthropic(_) => false,
     }
 }
 
@@ -331,6 +402,7 @@ pub(crate) struct AnthropicRuntimeClient {
     progress_reporter: Option<InternalPromptProgressReporter>,
     reasoning_effort: Option<String>,
     timeouts: StreamTimeouts,
+    retry_backoff: StreamRetryBackoff,
     /// The turn (by the index of its prompt) whose request was too large with the
     /// deferred MCP tool definitions: its later requests leave them out at once.
     oversized_with_deferred_tools: Option<usize>,
@@ -398,6 +470,7 @@ impl AnthropicRuntimeClient {
         progress_reporter: Option<InternalPromptProgressReporter>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let client = build_provider_client(&model, Some(session_id))?;
+        let timeouts = StreamTimeouts::from_env(is_gateway_client(&client));
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
             client,
@@ -409,7 +482,8 @@ impl AnthropicRuntimeClient {
             tool_registry,
             progress_reporter,
             reasoning_effort: None,
-            timeouts: StreamTimeouts::from_env(),
+            timeouts,
+            retry_backoff: StreamRetryBackoff::default(),
             oversized_with_deferred_tools: None,
         })
     }
@@ -510,9 +584,16 @@ impl ApiClient for AnthropicRuntimeClient {
             let progress = RetryProgress::new();
             let mut attempt = 1;
             let mut dropped_deferred_tools = false;
+            let mut text_shown = false;
             loop {
                 match self
-                    .consume_stream(&message_request, after_tool_results, cancel, &progress)
+                    .consume_stream(
+                        &message_request,
+                        after_tool_results,
+                        cancel,
+                        &progress,
+                        &mut text_shown,
+                    )
                     .await
                 {
                     Ok(events) => return (Ok(events), dropped_deferred_tools),
@@ -538,10 +619,35 @@ impl ApiClient for AnthropicRuntimeClient {
                     {
                         // A stalled or broken stream is retried once with the
                         // same request; typed failures decide, not messages.
+                        // Text the failed attempt printed stays on the output:
+                        // it is marked there before the reply comes again.
+                        if std::mem::take(&mut text_shown) {
+                            if let Err(error) = self.output.stream_sink().reply_discarded() {
+                                return (
+                                    Err(RuntimeError::new(error.to_string())),
+                                    dropped_deferred_tools,
+                                );
+                            }
+                        }
                         runtime::ui_hooks::notice(&format!(
                             "\n\u{26a0} {} \u{2014} retrying once\u{2026}",
                             failure.describe()
                         ));
+                        // Not at once (see `StreamRetryBackoff`); an interrupt
+                        // ends the wait.
+                        tokio::select! {
+                            biased;
+                            () = cancel.cancelled() => {
+                                let cancelled = StreamFailure::Cancelled {
+                                    partial_text: String::new(),
+                                };
+                                return (
+                                    Err(cancelled.into_runtime_error(0)),
+                                    dropped_deferred_tools,
+                                );
+                            }
+                            () = tokio::time::sleep(self.retry_backoff.delay_for(&failure)) => {}
+                        }
                         attempt += 1;
                     }
                     Err(failure) => {
@@ -566,7 +672,8 @@ impl AnthropicRuntimeClient {
     /// connecting and the first event, leaving out the provider client's
     /// waits between retries (see [`FirstTokenClock`]); afterwards every gap
     /// between events is bounded by the idle timeout. Both waits race the
-    /// cancellation token. `progress` carries the model call's retry state.
+    /// cancellation token. `progress` carries the model call's retry state;
+    /// `text_shown` is set once reply text went to the output.
     #[allow(clippy::too_many_lines)]
     async fn consume_stream(
         &self,
@@ -574,6 +681,7 @@ impl AnthropicRuntimeClient {
         after_tool_results: bool,
         cancel: &CancellationToken,
         progress: &RetryProgress,
+        text_shown: &mut bool,
     ) -> Result<Vec<AssistantEvent>, StreamFailure> {
         if std::env::var("NEURON_DEBUG").is_ok() {
             runtime::ui_hooks::notice("[DEBUG] sending stream_message to API...");
@@ -749,6 +857,8 @@ impl AnthropicRuntimeClient {
                     events.push(AssistantEvent::MessageStop);
                 }
             }
+            // Text (a delta or a whole block) is the last event its arm records.
+            *text_shown |= matches!(events.last(), Some(AssistantEvent::TextDelta(_)));
         }
         let cut_off =
             tool_calls_cut_off || runtime::is_truncation_stop_reason(stop_reason.as_deref());
@@ -1354,9 +1464,10 @@ pub(crate) fn prompt_cache_record_to_runtime_event(
 #[cfg(test)]
 mod stream_resilience_tests {
     use super::{
-        classify_stream_read_error, ends_unterminated_tool_call, response_to_events,
-        AnthropicRuntimeClient, StreamFailure, StreamTimeouts, DEFAULT_FIRST_TOKEN_TIMEOUT,
-        DEFAULT_POST_TOOL_FIRST_TOKEN_TIMEOUT, DEFAULT_STREAM_IDLE_TIMEOUT,
+        classify_stream_read_error, ends_unterminated_tool_call, is_gateway_client,
+        response_to_events, AnthropicRuntimeClient, StreamFailure, StreamRetryBackoff,
+        StreamTimeouts, DEFAULT_FIRST_TOKEN_TIMEOUT, DEFAULT_POST_TOOL_FIRST_TOKEN_TIMEOUT,
+        DEFAULT_STREAM_IDLE_TIMEOUT, GATEWAY_FIRST_TOKEN_TIMEOUT,
     };
     use crate::{ApiProviderClient, MessageResponse};
     use api::{OpenAiCompatClient, OpenAiCompatConfig, OutputContentBlock, Usage};
@@ -1421,6 +1532,11 @@ mod stream_resilience_tests {
         Hang,
         /// A complete text answer.
         Text,
+        /// A complete text answer, sent after this long.
+        TextAfter(Duration),
+        /// Text, then the end of the body with neither a finish reason nor
+        /// `[DONE]`: the gateway's worker was killed mid-stream.
+        Truncated,
         /// `400 context_length_exceeded`: over the free per-minute token budget.
         TooLarge,
         /// A recorded SSE body, sent as it is.
@@ -1591,6 +1707,17 @@ mod stream_resilience_tests {
                             write_capacity_exhausted(&mut stream, retry_after);
                         }
                         Some(Step::Text) => write_text_answer(&mut stream, "after the wait"),
+                        Some(Step::TextAfter(delay)) => {
+                            thread::sleep(delay);
+                            write_text_answer(&mut stream, "after the wait");
+                        }
+                        Some(Step::Truncated) => write_sse_body(
+                            &mut stream,
+                            &sse_chunk(&serde_json::json!({
+                                "id": "t", "model": "m",
+                                "choices": [{"delta": {"content": "partial"}}]
+                            })),
+                        ),
                         Some(Step::TooLarge) => write_too_large(&mut stream),
                         Some(Step::Sse(body)) => write_sse_body(&mut stream, body),
                         Some(Step::Hang) | None => {}
@@ -1675,26 +1802,34 @@ mod stream_resilience_tests {
         }
     }
 
-    /// A client allowing two provider retries (the Zero-X limit); the stream
-    /// retry counts as one of them.
-    fn client_for(gateway: &FakeGateway, timeouts: StreamTimeouts) -> AnthropicRuntimeClient {
+    /// A provider called directly, allowing two retries (the Zero-X limit);
+    /// the stream retry counts as one of them.
+    fn direct_provider(gateway: &FakeGateway) -> ApiProviderClient {
         let client = OpenAiCompatClient::new("test-key", OpenAiCompatConfig::openai())
             .with_base_url(gateway.base_url.clone())
             .with_retry_policy(2, Duration::from_millis(1), Duration::from_millis(1))
             .with_retry_observer(None);
-        runtime_client(ApiProviderClient::OpenAi(client), timeouts)
+        ApiProviderClient::OpenAi(client)
     }
 
-    /// A Zero-X gateway client with its default retry policy (two retries,
+    fn client_for(gateway: &FakeGateway, timeouts: StreamTimeouts) -> AnthropicRuntimeClient {
+        runtime_client(direct_provider(gateway), timeouts)
+    }
+
+    /// The Zero-X gateway with its default retry policy (two retries,
     /// capacity waits honoured).
+    fn zero_x_provider(gateway: &FakeGateway) -> ApiProviderClient {
+        let client = OpenAiCompatClient::new("ses_test", OpenAiCompatConfig::zero_x())
+            .with_base_url(gateway.base_url.clone())
+            .with_retry_observer(None);
+        ApiProviderClient::OpenAi(client)
+    }
+
     fn zero_x_client_for(
         gateway: &FakeGateway,
         timeouts: StreamTimeouts,
     ) -> AnthropicRuntimeClient {
-        let client = OpenAiCompatClient::new("ses_test", OpenAiCompatConfig::zero_x())
-            .with_base_url(gateway.base_url.clone())
-            .with_retry_observer(None);
-        runtime_client(ApiProviderClient::OpenAi(client), timeouts)
+        runtime_client(zero_x_provider(gateway), timeouts)
     }
 
     fn runtime_client(
@@ -1722,6 +1857,7 @@ mod stream_resilience_tests {
             progress_reporter: None,
             reasoning_effort: None,
             timeouts,
+            retry_backoff: fast_backoff(),
             oversized_with_deferred_tools: None,
         }
     }
@@ -1745,9 +1881,31 @@ mod stream_resilience_tests {
         }
     }
 
+    /// `timeouts` a hundred times shorter: 100 s become one second.
+    fn scaled(timeouts: StreamTimeouts) -> StreamTimeouts {
+        StreamTimeouts {
+            first_token: timeouts.first_token / 100,
+            post_tool_first_token: timeouts.post_tool_first_token / 100,
+            idle: timeouts.idle / 100,
+        }
+    }
+
+    fn fast_backoff() -> StreamRetryBackoff {
+        backoff(Duration::from_millis(5), Duration::from_millis(5))
+    }
+
+    /// Fixed waits before the stream retry: after a broken stream, and after
+    /// a first-token stall.
+    fn backoff(interrupted: Duration, first_token_stall: Duration) -> StreamRetryBackoff {
+        StreamRetryBackoff {
+            interrupted: (interrupted, interrupted),
+            first_token_stall: (first_token_stall, first_token_stall),
+        }
+    }
+
     #[test]
     fn timeouts_default_and_env_override() {
-        let defaults = StreamTimeouts::from_override(None);
+        let defaults = StreamTimeouts::from_override(false, None);
         assert_eq!(defaults.first_token, DEFAULT_FIRST_TOKEN_TIMEOUT);
         assert_eq!(defaults.first_token, Duration::from_secs(90));
         assert_eq!(
@@ -1757,12 +1915,222 @@ mod stream_resilience_tests {
         assert_eq!(defaults.post_tool_first_token, Duration::from_secs(60));
         assert_eq!(defaults.idle, DEFAULT_STREAM_IDLE_TIMEOUT);
         assert_eq!(defaults.idle, Duration::from_secs(120));
-        let overridden = StreamTimeouts::from_override(Some(" 30 "));
+        let overridden = StreamTimeouts::from_override(false, Some(" 30 "));
         assert_eq!(overridden.first_token, Duration::from_secs(30));
         assert_eq!(overridden.post_tool_first_token, Duration::from_secs(30));
-        assert_eq!(StreamTimeouts::from_override(Some("0")), defaults);
-        assert_eq!(StreamTimeouts::from_override(Some("soon")), defaults);
+        assert_eq!(StreamTimeouts::from_override(false, Some("0")), defaults);
+        assert_eq!(StreamTimeouts::from_override(false, Some("soon")), defaults);
         assert_eq!(defaults.first_token_for(true), Duration::from_secs(60));
+
+        // Toward the gateway: 100 s, fresh or after tool results, and the
+        // variable still overrides both.
+        let gateway = StreamTimeouts::from_override(true, None);
+        assert_eq!(gateway.first_token, GATEWAY_FIRST_TOKEN_TIMEOUT);
+        assert_eq!(gateway.first_token, Duration::from_secs(100));
+        assert_eq!(gateway.post_tool_first_token, Duration::from_secs(100));
+        assert_eq!(gateway.idle, DEFAULT_STREAM_IDLE_TIMEOUT);
+        assert_eq!(StreamTimeouts::from_override(true, Some("30")), overridden);
+        assert_eq!(StreamTimeouts::from_override(true, Some("0")), gateway);
+    }
+
+    /// The deadline toward the gateway follows the check that picks its
+    /// credential and headers, not the model name.
+    #[test]
+    fn only_a_zero_x_client_counts_as_the_gateway() {
+        let gateway = spawn_gateway(Behavior::Hang);
+        assert!(is_gateway_client(&zero_x_provider(&gateway)));
+        assert!(!is_gateway_client(&direct_provider(&gateway)));
+        let xai = OpenAiCompatClient::new("test-key", OpenAiCompatConfig::xai());
+        assert!(!is_gateway_client(&ApiProviderClient::Xai(xai)));
+    }
+
+    /// The failed live run: 60 s after the tool results the CLI sent the
+    /// request again while the gateway was still failing over between its
+    /// upstreams (91.5 s in all), and the two requests took both free
+    /// concurrent slots. Toward the gateway the deadline is 100 s (scaled
+    /// down here), so an answer after 70 s arrives on the one request.
+    #[test]
+    fn a_gateway_answer_after_a_long_failover_arrives_on_one_request() {
+        static STEPS: &[Step] = &[Step::TextAfter(Duration::from_millis(700))];
+        let gateway = spawn_gateway(Behavior::Scripted(STEPS));
+        let provider = zero_x_provider(&gateway);
+        let timeouts = scaled(StreamTimeouts::from_override(
+            is_gateway_client(&provider),
+            None,
+        ));
+        let mut client = runtime_client(provider, timeouts);
+
+        let events = client
+            .stream(request(true))
+            .expect("the gateway answers within its deadline");
+
+        assert!(events.contains(&AssistantEvent::TextDelta("after the wait".to_string())));
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(gateway.connections.load(Ordering::SeqCst), 1, "no resend");
+    }
+
+    /// A provider called directly keeps 90 s, and 60 s after tool results:
+    /// the same slow answer is sent again after the post-tool deadline.
+    #[test]
+    fn direct_providers_keep_their_first_token_deadlines() {
+        static STEPS: &[Step] = &[Step::TextAfter(Duration::from_millis(700))];
+        let gateway = spawn_gateway(Behavior::Scripted(STEPS));
+        let provider = direct_provider(&gateway);
+        let defaults = StreamTimeouts::from_override(is_gateway_client(&provider), None);
+        assert_eq!(defaults.first_token, Duration::from_secs(90));
+        assert_eq!(defaults.post_tool_first_token, Duration::from_secs(60));
+        let mut client = runtime_client(provider, scaled(defaults));
+
+        let error = client
+            .stream(request(true))
+            .expect_err("the answer comes after the post-tool deadline");
+
+        assert_eq!(error.kind(), RuntimeErrorKind::Timeout);
+        assert!(
+            error.to_string().contains("after the tool results"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("after one retry"), "{error}");
+        assert_eq!(gateway.connections.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn the_stream_retry_waits_longer_after_a_break_than_after_a_stall() {
+        let backoff = StreamRetryBackoff::default();
+        let broken = StreamFailure::Interrupted {
+            detail: "stream ended before the response completed".to_string(),
+        };
+        let silent = StreamFailure::Idle {
+            waited: DEFAULT_STREAM_IDLE_TIMEOUT,
+        };
+        let stalled = StreamFailure::FirstTokenTimeout {
+            waited: GATEWAY_FIRST_TOKEN_TIMEOUT,
+            after_tool_results: true,
+        };
+        let mut waits = std::collections::BTreeSet::new();
+        for _ in 0..50 {
+            for failure in [&broken, &silent] {
+                let wait = backoff.delay_for(failure);
+                assert!(
+                    (Duration::from_secs(2)..=Duration::from_secs(5)).contains(&wait),
+                    "{wait:?}"
+                );
+                waits.insert(wait);
+            }
+            let wait = backoff.delay_for(&stalled);
+            assert!(
+                (Duration::from_secs(1)..=Duration::from_secs(2)).contains(&wait),
+                "{wait:?}"
+            );
+        }
+        assert!(waits.len() > 1, "jittered: {waits:?}");
+    }
+
+    /// The failed live run: the gateway's worker was killed for CPU time
+    /// mid-stream, and the resend 34 to 77 ms later reached the same worker,
+    /// which died again. A stream that broke off is sent again only after a
+    /// wait (2 to 5 s, shortened here).
+    #[test]
+    fn a_stream_the_server_broke_off_is_sent_again_after_a_backoff() {
+        static STEPS: &[Step] = &[Step::Truncated, Step::Text];
+        let gateway = spawn_gateway(Behavior::Scripted(STEPS));
+        let mut client = zero_x_client_for(&gateway, fast_timeouts());
+        client.retry_backoff = backoff(Duration::from_millis(500), Duration::from_millis(1));
+
+        let events = client
+            .stream(request(false))
+            .expect("the second request answers");
+
+        assert!(events.contains(&AssistantEvent::TextDelta("after the wait".to_string())));
+        assert_eq!(gateway.connections.load(Ordering::SeqCst), 2);
+        let gaps = gateway.gaps();
+        assert!(gaps[0] >= Duration::from_millis(500), "{gaps:?}");
+    }
+
+    /// After a first-token stall the deadline already spaced the requests
+    /// out: the shorter wait applies (1 to 2 s, here 400 ms).
+    #[test]
+    fn a_first_token_stall_is_sent_again_after_the_shorter_backoff() {
+        static STEPS: &[Step] = &[Step::Hang, Step::Text];
+        let gateway = spawn_gateway(Behavior::Scripted(STEPS));
+        let mut client = zero_x_client_for(&gateway, fast_timeouts());
+        client.retry_backoff = backoff(Duration::from_secs(30), Duration::from_millis(400));
+
+        client
+            .stream(request(false))
+            .expect("the second request answers");
+
+        let gaps = gateway.gaps();
+        // The 300 ms first-token deadline, then the wait.
+        assert!(gaps[0] >= Duration::from_millis(700), "{gaps:?}");
+        assert!(gaps[0] < Duration::from_secs(10), "{gaps:?}");
+    }
+
+    #[test]
+    fn an_interrupt_ends_the_backoff_without_sending_again() {
+        static STEPS: &[Step] = &[Step::Truncated, Step::Text];
+        let gateway = spawn_gateway(Behavior::Scripted(STEPS));
+        let mut client = zero_x_client_for(&gateway, fast_timeouts());
+        client.retry_backoff = backoff(Duration::from_secs(30), Duration::from_secs(30));
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            trigger.cancel();
+        });
+        let started = Instant::now();
+
+        let error = client
+            .stream_with_cancellation(request(false), &cancel)
+            .expect_err("cancelled during the wait");
+
+        assert_eq!(error.kind(), RuntimeErrorKind::Cancelled);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(gateway.connections.load(Ordering::SeqCst), 1, "no resend");
+    }
+
+    /// The failed live run: "Server Implementation: • Im" stayed on stdout,
+    /// and the retried reply's tool calls followed it as if it were complete.
+    /// The text output marks it as discarded before the reply comes again.
+    #[test]
+    fn text_shown_before_a_resend_is_marked_as_discarded() {
+        static STEPS: &[Step] = &[Step::Truncated, Step::Text];
+        let gateway = spawn_gateway(Behavior::Scripted(STEPS));
+        let shown = Arc::new(Mutex::new(Vec::new()));
+        let mut client = runtime_client_showing(
+            zero_x_provider(&gateway),
+            fast_timeouts(),
+            crate::turn_sink::TurnOutput::Captured(Arc::clone(&shown)),
+        );
+
+        client.stream(request(false)).expect("the resend answers");
+        drop(client);
+
+        let shown = String::from_utf8(shown.lock().expect("shown").clone()).expect("utf-8");
+        assert_eq!(
+            shown,
+            "partial\n(partial reply discarded \u{2014} retrying)\nafter the wait\n"
+        );
+    }
+
+    /// Nothing to mark when the failed attempt showed no text.
+    #[test]
+    fn a_resend_after_a_silent_attempt_shows_no_marker() {
+        static STEPS: &[Step] = &[Step::Hang, Step::Text];
+        let gateway = spawn_gateway(Behavior::Scripted(STEPS));
+        let shown = Arc::new(Mutex::new(Vec::new()));
+        let mut client = runtime_client_showing(
+            zero_x_provider(&gateway),
+            fast_timeouts(),
+            crate::turn_sink::TurnOutput::Captured(Arc::clone(&shown)),
+        );
+
+        client.stream(request(false)).expect("the resend answers");
+        drop(client);
+
+        let shown = String::from_utf8(shown.lock().expect("shown").clone()).expect("utf-8");
+        assert_eq!(shown, "after the wait\n");
     }
 
     #[test]
@@ -2150,12 +2518,9 @@ mod stream_resilience_tests {
         std::sync::mpsc::Receiver<neuron_tui::protocol::UiEvent>,
     ) {
         let (sender, receiver) = std::sync::mpsc::channel();
-        let client = OpenAiCompatClient::new("ses_test", OpenAiCompatConfig::zero_x())
-            .with_base_url(gateway.base_url.clone())
-            .with_retry_observer(None);
         (
             runtime_client_showing(
-                ApiProviderClient::OpenAi(client),
+                zero_x_provider(gateway),
                 fast_timeouts(),
                 crate::turn_sink::TurnOutput::channel(sender),
             ),
