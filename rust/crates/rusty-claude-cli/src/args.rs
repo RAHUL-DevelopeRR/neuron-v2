@@ -180,7 +180,9 @@ or run `neuron` in a terminal.";
 /// empty (the REPL arm decides), an error when it was meant for the REPL (its first
 /// line is a slash command, or `--no-tui` asked for the line REPL).
 pub(crate) fn piped_prompt(piped: &str, no_tui: bool) -> Result<Option<String>, String> {
-    let prompt = piped.trim();
+    // Windows PowerShell pipes, and files saved as UTF-8 with BOM, start with U+FEFF,
+    // which `trim` keeps: `\u{feff}/model` would not look like a slash command.
+    let prompt = piped.trim_start_matches('\u{feff}').trim();
     if prompt.is_empty() {
         return Ok(None);
     }
@@ -202,9 +204,23 @@ To send the piped text as a prompt, leave out --no-tui."
 
 /// The slash command Git Bash turned into a path: MSYS rewrites an argument that starts
 /// with `/` to one under its install folder, so `neuron /model` arrives as
-/// `C:/Program Files/Git/model` (`/usr/...` under `Git/usr`). `msystem` is `MSYSTEM`,
-/// which Git Bash sets.
+/// `C:/Program Files/Git/model` (`/usr/...` under `Git/usr`). The install folder is
+/// named `Git` (Git for Windows) or holds `usr/bin/msys-2.0.dll` (MSYS2 at
+/// `C:/msys64`, Scoop's `apps/git/current`). `msystem` is `MSYSTEM`, which Git Bash
+/// and MSYS2 set.
 pub(crate) fn msys_slash_command(arg: &str, msystem: Option<&str>) -> Option<String> {
+    msys_slash_command_under(arg, msystem, |root| {
+        Path::new(root).join("usr/bin/msys-2.0.dll").is_file()
+    })
+}
+
+/// [`msys_slash_command`] with `is_msys_root` telling whether a folder is an MSYS
+/// install.
+fn msys_slash_command_under(
+    arg: &str,
+    msystem: Option<&str>,
+    is_msys_root: impl FnOnce(&str) -> bool,
+) -> Option<String> {
     msystem.filter(|value| !value.is_empty())?;
     let bytes = arg.as_bytes();
     if !(bytes.len() > 3 && bytes[0].is_ascii_alphabetic() && &bytes[1..3] == b":/") {
@@ -219,10 +235,32 @@ pub(crate) fn msys_slash_command(arg: &str, msystem: Option<&str>) -> Option<Str
         return None;
     }
     let folder = folder.strip_suffix("/usr").unwrap_or(folder);
+    // Not a drive's root folder (`C:/usr/model`).
     let (_, last) = folder.rsplit_once('/')?;
     let command = format!("/{name}");
-    (last.eq_ignore_ascii_case("git") && looks_like_slash_command_token(&command))
-        .then_some(command)
+    if !looks_like_slash_command_token(&command) {
+        return None;
+    }
+    (last.eq_ignore_ascii_case("git") || is_msys_root(folder)).then_some(command)
+}
+
+/// Puts back the slash commands Git Bash turned into paths ([`msys_slash_command`])
+/// where a slash command goes: the first word (`neuron /skills list`), and every word
+/// after `--resume` (`neuron --resume latest /status`). Returns the commands put back.
+fn restore_msys_slash_commands(words: &mut [String], msystem: Option<&str>) -> Vec<String> {
+    let checked = if words.first().is_some_and(|word| word == "--resume") {
+        words.len()
+    } else {
+        1
+    };
+    let mut restored = Vec::new();
+    for word in words.iter_mut().take(checked) {
+        if let Some(command) = msys_slash_command(word, msystem) {
+            word.clone_from(&command);
+            restored.push(command);
+        }
+    }
+    restored
 }
 
 /// [`parse_args`] with standard input from `piped_stdin` (`None` on a terminal), which
@@ -443,12 +481,13 @@ pub(crate) fn parse_args_with_stdin(
     let allowed_tools = normalize_allowed_tools(&allowed_tool_values)?;
 
     // Git Bash turned `neuron /model` into `neuron "C:/Program Files/Git/model"`.
-    if let [only] = rest.as_mut_slice() {
-        if let Some(command) = msys_slash_command(only, env::var("MSYSTEM").ok().as_deref()) {
+    let restored = restore_msys_slash_commands(&mut rest, env::var("MSYSTEM").ok().as_deref());
+    // In JSON mode stderr carries only JSON (the error object `main` prints).
+    if output_format != CliOutputFormat::Json {
+        for command in restored {
             eprintln!(
                 "Git Bash turned {command} into a path; treating it as {command}. Set MSYS_NO_PATHCONV=1 to avoid this."
             );
-            *only = command;
         }
     }
 
@@ -1758,7 +1797,10 @@ mod resume_prompt_tests {
 
 #[cfg(test)]
 mod script_input_tests {
-    use super::{msys_slash_command, parse_args, parse_args_with_stdin, piped_prompt, CliAction};
+    use super::{
+        msys_slash_command, msys_slash_command_under, parse_args, parse_args_with_stdin,
+        piped_prompt, CliAction,
+    };
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(ToString::to_string).collect()
@@ -1770,7 +1812,14 @@ mod script_input_tests {
 
     #[test]
     fn piped_slash_commands_are_refused_not_sent_to_the_model() {
-        for stdin in ["/help\n/exit", "\n  /model\n/exit\n", "/status\r\n"] {
+        // Windows PowerShell pipes, and files saved as UTF-8 with BOM, start with U+FEFF.
+        for stdin in [
+            "/help\n/exit",
+            "\n  /model\n/exit\n",
+            "/status\r\n",
+            "\u{feff}/help\r\n/exit\r\n",
+            "\u{feff}\r\n/model\r\n/exit\r\n",
+        ] {
             let error = parse_piped(&[], stdin).expect_err("piped slash commands are refused");
             assert!(
                 error.contains("slash commands can't be piped"),
@@ -1804,12 +1853,26 @@ mod script_input_tests {
         let error = piped_prompt("fix the bug", true).expect_err("--no-tui needs a terminal");
         assert!(error.contains("--no-tui"), "{error}");
         assert!(error.contains("leave out --no-tui"), "{error}");
-        // Nothing piped: the REPL arm decides.
-        assert_eq!(piped_prompt(" \n", true), Ok(None));
-        assert_eq!(
-            piped_prompt("fix the bug\n", false),
-            Ok(Some("fix the bug".to_string()))
-        );
+        let error = piped_prompt("\u{feff}fix the bug\r\n", true).expect_err("with a BOM too");
+        assert!(error.contains("leave out --no-tui"), "{error}");
+        // Nothing piped (a lone BOM is nothing): the REPL arm decides.
+        for no_tui in [true, false] {
+            assert_eq!(piped_prompt(" \n", no_tui), Ok(None));
+            assert_eq!(piped_prompt("\u{feff}", no_tui), Ok(None));
+            assert_eq!(piped_prompt("\u{feff}\r\n", no_tui), Ok(None));
+        }
+        assert!(matches!(
+            parse_piped(&[], "\u{feff}"),
+            Ok(CliAction::Repl { .. })
+        ));
+        // The BOM is not part of the prompt.
+        for stdin in ["fix the bug\n", "\u{feff}fix the bug\r\n"] {
+            assert_eq!(
+                piped_prompt(stdin, false),
+                Ok(Some("fix the bug".to_string())),
+                "{stdin:?}"
+            );
+        }
     }
 
     #[test]
@@ -1838,12 +1901,60 @@ mod script_input_tests {
     }
 
     #[test]
+    fn msys2_and_scoop_paths_of_slash_commands_are_slash_commands_again() {
+        let msys2 = Some("UCRT64");
+        for (arg, root, command) in [
+            ("C:/msys64/model", "C:/msys64", "/model"),
+            ("C:/msys64/usr/status", "C:/msys64", "/status"),
+            (
+                "C:/Users/me/scoop/apps/git/current/help",
+                "C:/Users/me/scoop/apps/git/current",
+                "/help",
+            ),
+        ] {
+            assert_eq!(
+                msys_slash_command_under(arg, msys2, |folder| folder == root).as_deref(),
+                Some(command),
+                "{arg}"
+            );
+            // A folder that is not an MSYS install is left alone.
+            assert_eq!(msys_slash_command_under(arg, msys2, |_| false), None);
+        }
+    }
+
+    /// The real check: an MSYS install folder holds `usr/bin/msys-2.0.dll`.
+    #[cfg(windows)]
+    #[test]
+    fn an_msys_install_is_found_by_its_runtime_dll() {
+        let root = std::env::temp_dir().join(format!("neuron-msys-root-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("usr/bin")).expect("usr/bin should create");
+        std::fs::write(root.join("usr/bin/msys-2.0.dll"), b"").expect("dll should write");
+        let root_text = root.display().to_string().replace('\\', "/");
+
+        let found = msys_slash_command(&format!("{root_text}/model"), Some("MSYS"));
+        let elsewhere = msys_slash_command(&format!("{root_text}/usr/bin/model"), Some("MSYS"));
+
+        std::fs::remove_dir_all(&root).expect("temp dir should clean up");
+        assert_eq!(found.as_deref(), Some("/model"));
+        assert_eq!(elsewhere, None);
+    }
+
+    #[test]
     fn under_git_bash_a_mangled_slash_command_is_not_a_prompt() {
         let _guard = crate::tests::env_lock();
         let previous = std::env::var_os("MSYSTEM");
         std::env::set_var("MSYSTEM", "MINGW64");
         let model = parse_args(&strings(&["C:/Program Files/Git/model"]));
         let skills = parse_args(&strings(&["C:/Program Files/Git/skills"]));
+        // The first of several words (`neuron /skills list`), and words after --resume.
+        let skills_list = parse_args(&strings(&["C:/Program Files/Git/skills", "list"]));
+        let resumed = parse_args(&strings(&[
+            "--resume",
+            "latest",
+            "C:/Program Files/Git/status",
+        ]));
+        // Only where a slash command goes: a later word of a prompt is left alone.
+        let prompt = parse_args(&strings(&["explain", "C:/Program Files/Git/model"]));
         match previous {
             Some(value) => std::env::set_var("MSYSTEM", value),
             None => std::env::remove_var("MSYSTEM"),
@@ -1853,6 +1964,18 @@ mod script_input_tests {
         assert!(
             matches!(skills, Ok(CliAction::Skills { args: None, .. })),
             "{skills:?}"
+        );
+        assert!(
+            matches!(skills_list, Ok(CliAction::Skills { args: Some(ref args), .. }) if args == "list"),
+            "{skills_list:?}"
+        );
+        assert!(
+            matches!(resumed, Ok(CliAction::ResumeSession { ref commands, .. }) if commands == &["/status"]),
+            "{resumed:?}"
+        );
+        assert!(
+            matches!(prompt, Ok(CliAction::Prompt { prompt: ref text, .. }) if text == "explain C:/Program Files/Git/model"),
+            "{prompt:?}"
         );
     }
 }

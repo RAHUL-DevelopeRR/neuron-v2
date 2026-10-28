@@ -376,12 +376,16 @@ credential store too.
   `xattr -d com.apple.quarantine ./neuron-macos-arm64`.
 - **Git Bash runs `neuron /model` as a prompt.** Git Bash (MSYS) rewrites an argument
   that starts with `/` into a Windows path, so `/model` arrives as
-  `C:/Program Files/Git/model`. When that is the only argument and names a slash
-  command, Neuron treats it as the slash command and says so. Use the subcommands
-  (`neuron skills`, `neuron status`), or set `MSYS_NO_PATHCONV=1` for the command:
-  `MSYS_NO_PATHCONV=1 neuron --resume latest /status`.
-- **A script stops with "is not trusted".** Without a terminal Neuron can't ask.
-  Set `NEURON_TRUST_WORKSPACE=1` for that run (only for checkouts you trust), add the
+  `C:/Program Files/Git/model` (`C:/msys64/model` under MSYS2). Where a slash command
+  goes (the first argument, or any argument after `--resume`), a path like that which
+  names a slash command is treated as the slash command, and Neuron says so on stderr
+  (not with `--output-format json`). Elsewhere it stays a path, so the safe choices are
+  the subcommands (`neuron skills`, `neuron status`), or `MSYS_NO_PATHCONV=1` for the
+  command: `MSYS_NO_PATHCONV=1 neuron --resume latest /status`.
+- **A script warns "this workspace is not trusted".** Neuron never asks the trust
+  question without a terminal: a script runs, but the folder's own settings (hooks,
+  MCP servers, model, allow rules) are ignored, with that warning naming them. Set
+  `NEURON_TRUST_WORKSPACE=1` for that run (only for checkouts you trust), add the
   folder to `trustedRoots` in `~/.neuron/settings.json`, or run `neuron` there once in a
   terminal and press 1.
 - **Anything else.** `neuron doctor` checks auth, configuration and the workspace.

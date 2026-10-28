@@ -552,7 +552,7 @@ fn format_missing_session_reference(reference: &str) -> String {
 
 fn format_no_managed_sessions() -> String {
     format!(
-        "no managed sessions with messages found in .neuron/sessions/\nStart `neuron` to create a session, then rerun with `--resume {LATEST_SESSION_REFERENCE}`."
+        "no managed sessions with messages found in .neuron/sessions/\nSend a prompt in `neuron` first, then rerun with `--resume {LATEST_SESSION_REFERENCE}`."
     )
 }
 
@@ -1051,6 +1051,14 @@ mod tests {
         let error = store.latest_session().expect_err("no session has messages");
 
         assert!(error.to_string().contains("with messages"), "{error}");
+        // A session exists, so the hint is to send a prompt, not to create one.
+        assert!(
+            error
+                .to_string()
+                .contains("Send a prompt in `neuron` first"),
+            "{error}"
+        );
+        assert!(!error.to_string().contains("create a session"), "{error}");
         fs::remove_dir_all(base).expect("temp dir should clean up");
     }
 

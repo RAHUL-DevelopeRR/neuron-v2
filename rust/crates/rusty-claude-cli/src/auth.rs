@@ -866,6 +866,9 @@ pub fn check_trust(cwd: &std::path::Path) -> bool {
         return true;
     }
     // From a pipe or a file nobody can answer: say how to trust it instead of asking.
+    // Today's callers only ask on a terminal (a prompt run without one skips the
+    // question and the untrusted folder's settings stay ignored; a bare `neuron` stops
+    // with "nothing to do"), so this guards a caller that forgets to.
     if !runtime::ui_hooks::stdin_is_terminal() {
         eprintln!("{}", untrusted_without_terminal(cwd));
         return false;

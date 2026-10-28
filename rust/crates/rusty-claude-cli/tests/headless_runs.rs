@@ -7,7 +7,8 @@
 //!   anything does not hang the run;
 //! - `neuron --resume SESSION prompt TEXT` sends a saved session another prompt;
 //! - a bare `neuron` with nothing on stdin, piped slash commands and piped `--no-tui`
-//!   input are refused before any request.
+//!   input are refused before any request, with or without a byte order mark;
+//! - a slash command Git Bash turned into a path is a slash command again.
 
 use std::fs;
 use std::io::Write;
@@ -242,22 +243,31 @@ fn a_bare_run_without_a_terminal_has_nothing_to_do() {
     let server = runtime
         .block_on(MockAnthropicService::spawn())
         .expect("mock service should start");
-    let workspace = Workspace::new("bare-no-terminal");
+    // A pipe that brings only a byte order mark (Windows PowerShell's) brings nothing.
+    for stdin in [
+        Stdin::Null,
+        Stdin::Data("\u{feff}"),
+        Stdin::Data("\u{feff}\r\n"),
+    ] {
+        let workspace = Workspace::new("bare-no-terminal");
 
-    let output = run_bare(&workspace, &server.base_url(), &[], Stdin::Null);
+        let output = run_bare(&workspace, &server.base_url(), &[], stdin);
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
-    assert!(
-        stderr.contains("nothing to do: no prompt was given and standard input is not a terminal"),
-        "{stderr}"
-    );
-    assert!(stderr.contains("neuron prompt \"...\""), "{stderr}");
-    assert!(!stdout.contains("Press 1") && !stderr.contains("Press 1"));
-    assert!(session_files(&workspace.root).is_empty());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
+        assert!(
+            stderr.contains(
+                "nothing to do: no prompt was given and standard input is not a terminal"
+            ),
+            "{stderr}"
+        );
+        assert!(stderr.contains("neuron prompt \"...\""), "{stderr}");
+        assert!(!stdout.contains("Press 1") && !stderr.contains("Press 1"));
+        assert!(session_files(&workspace.root).is_empty());
+        workspace.remove();
+    }
     assert!(runtime.block_on(server.captured_requests()).is_empty());
-    workspace.remove();
 }
 
 /// `printf '/help\n/exit' | neuron`: piped text would reach the model as one prompt, so
@@ -270,9 +280,20 @@ fn piped_repl_input_is_refused_before_any_request() {
         .block_on(MockAnthropicService::spawn())
         .expect("mock service should start");
 
+    // Windows PowerShell pipes, and files saved as UTF-8 with BOM, start with U+FEFF.
     for (extra, stdin, says) in [
         (&[][..], "/help\n/exit\n", "slash commands can't be piped"),
+        (
+            &[][..],
+            "\u{feff}/help\r\n/exit\r\n",
+            "slash commands can't be piped",
+        ),
         (&["--no-tui"][..], "fix the bug\n", "leave out --no-tui"),
+        (
+            &["--no-tui"][..],
+            "\u{feff}fix the bug\r\n",
+            "leave out --no-tui",
+        ),
     ] {
         let workspace = Workspace::new("piped-repl-input");
         let output = run_bare(&workspace, &server.base_url(), extra, Stdin::Data(stdin));
@@ -282,6 +303,46 @@ fn piped_repl_input_is_refused_before_any_request() {
         assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
         assert!(stderr.contains(says), "{stderr}");
         assert!(session_files(&workspace.root).is_empty());
+        workspace.remove();
+    }
+    assert!(runtime.block_on(server.captured_requests()).is_empty());
+}
+
+/// Git Bash turned `neuron /model` into `neuron "C:/Program Files/Git/model"`: Neuron
+/// treats it as /model and says so, except in JSON mode, where stderr carries only JSON.
+#[test]
+fn a_git_bash_slash_command_is_noted_except_in_json_mode() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+
+    for (extra, json) in [(&[][..], false), (&["--output-format", "json"][..], true)] {
+        let workspace = Workspace::new("git-bash-slash");
+        let mut command = neuron(&workspace, &server.base_url());
+        command
+            .env("MSYSTEM", "MINGW64")
+            .args(extra)
+            .arg("C:/Program Files/Git/model");
+        let output = output_with_stdin(command, Stdin::Null);
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
+        // /model is interactive-only: refused as a slash command, not sent as a prompt.
+        assert!(stderr.contains("slash command /model"), "{stderr}");
+        assert_eq!(
+            stderr.contains("Git Bash turned /model into a path"),
+            !json,
+            "{stderr}"
+        );
+        if json {
+            for line in stderr.lines().filter(|line| !line.trim().is_empty()) {
+                let parsed: Value = serde_json::from_str(line)
+                    .unwrap_or_else(|error| panic!("stderr line is not JSON ({error}): {line}"));
+                assert_eq!(parsed["type"], "error", "{line}");
+            }
+        }
         workspace.remove();
     }
     assert!(runtime.block_on(server.captured_requests()).is_empty());
