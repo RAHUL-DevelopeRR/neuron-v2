@@ -298,7 +298,12 @@ fn streamed_text(events: &[AssistantEvent]) -> String {
 /// Classifies an error returned while reading the stream. Provider status
 /// errors keep their own retry semantics (`is_retryable`); transport-level
 /// failures, including truncated streams, are treated as interruptions.
-pub(crate) fn classify_stream_read_error(session_id: &str, error: &api::ApiError) -> StreamFailure {
+/// `model` is the one the request was for.
+pub(crate) fn classify_stream_read_error(
+    session_id: &str,
+    model: &str,
+    error: &api::ApiError,
+) -> StreamFailure {
     let detail = format_user_visible_api_error(session_id, error);
     match error {
         api::ApiError::Api { .. }
@@ -313,7 +318,7 @@ pub(crate) fn classify_stream_read_error(session_id: &str, error: &api::ApiError
             if error.is_retryable() {
                 StreamFailure::Interrupted { detail }
             } else {
-                fatal_api_error(session_id, error)
+                fatal_api_error(session_id, model, error)
             }
         }
         _ => StreamFailure::Interrupted { detail },
@@ -322,31 +327,70 @@ pub(crate) fn classify_stream_read_error(session_id: &str, error: &api::ApiError
 
 /// A provider error that resending the identical request will not fix.
 /// Context-window rejections keep a typed kind so the runtime can shrink the
-/// context and retry once.
-pub(crate) fn fatal_api_error(session_id: &str, error: &api::ApiError) -> StreamFailure {
+/// context and retry once. `model` is the one the request was for.
+pub(crate) fn fatal_api_error(
+    session_id: &str,
+    model: &str,
+    error: &api::ApiError,
+) -> StreamFailure {
     let kind = if error.is_context_window_failure() {
         RuntimeErrorKind::ContextWindowExceeded
     } else {
         RuntimeErrorKind::Other
     };
     let mut message = format_user_visible_api_error(session_id, error);
-    if let Some(hint) = switch_model_hint(error, crate::headless::one_shot()) {
-        message.push_str(hint);
+    if let Some(hint) = switch_model_hint(error, crate::headless::one_shot(), || {
+        capacity_alternatives(model)
+    }) {
+        message.push_str(&hint);
     }
     StreamFailure::Fatal(RuntimeError::with_kind(kind, message))
 }
 
 /// For the gateway's `capacity_exhausted`, whose advice is to wait or upgrade (even on
-/// the highest plan): another model's shared pool may well have room now. A one-shot
-/// `neuron prompt` run has no REPL to type `/model` into: it names the flag.
-fn switch_model_hint(error: &api::ApiError, one_shot: bool) -> Option<&'static str> {
-    (error.gateway_error().and_then(api::GatewayError::code_kind)
-        == Some(api::GatewayErrorCode::CapacityExhausted))
-    .then_some(if one_shot {
-        ". Other models may have capacity now: pick another with --model."
+/// the highest plan): another model's shared pool may well have room now, so it names
+/// up to three from `alternatives` (asked for only then). A one-shot `neuron prompt`
+/// run has no REPL to type `/model` into: it names the flag.
+fn switch_model_hint(
+    error: &api::ApiError,
+    one_shot: bool,
+    alternatives: impl FnOnce() -> Vec<String>,
+) -> Option<String> {
+    if error.gateway_error().and_then(api::GatewayError::code_kind)
+        != Some(api::GatewayErrorCode::CapacityExhausted)
+    {
+        return None;
+    }
+    let (switch, command) = if one_shot {
+        ("pick another with --model", "--model")
     } else {
-        ". Other models may have capacity now: switch with /model."
-    })
+        ("switch with /model", "/model")
+    };
+    let alternatives = alternatives();
+    let advice = match alternatives.as_slice() {
+        [] => switch.to_string(),
+        [only] if only == crate::provider::AUTO_MODEL => {
+            format!("{switch}, or use {command} auto, which routes around models out of capacity")
+        }
+        [one] => format!("{switch}, such as {one}"),
+        [rest @ .., last] => format!("{switch}, such as {} or {last}", rest.join(", ")),
+    };
+    Some(format!(". Other models may have capacity now: {advice}."))
+}
+
+/// The models [`switch_model_hint`] names instead of `model`, as of the gateway's
+/// current status. Asking for it blocks, so that runs on a thread of its own, away
+/// from the async runtime this is called on.
+fn capacity_alternatives(model: &str) -> Vec<String> {
+    let live = crate::gateway_catalog::current().and_then(|catalog| {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| crate::gateway_catalog::with_session_status(&catalog))
+                .join()
+                .ok()
+        })
+    });
+    crate::gateway_catalog::alternatives(live.as_ref(), model, crate::clock::now_unix())
 }
 
 /// Stop reason reported for tool calls the provider closed without
@@ -697,7 +741,7 @@ impl AnthropicRuntimeClient {
             () = cancel.cancelled() => return Err(StreamFailure::Cancelled { partial_text: String::new() }),
             result = self.client.stream_message_with_progress(message_request, progress) => match result {
                 Ok(stream) => stream,
-                Err(error) => return Err(fatal_api_error(&self.session_id, &error)),
+                Err(error) => return Err(fatal_api_error(&self.session_id, &self.model, &error)),
             },
             () = clock.expired() => return Err(first_token_failure()),
         };
@@ -738,7 +782,7 @@ impl AnthropicRuntimeClient {
                         tool_calls_cut_off = true;
                         None
                     }
-                    Ok(Err(error)) => return Err(classify_stream_read_error(&self.session_id, &error)),
+                    Ok(Err(error)) => return Err(classify_stream_read_error(&self.session_id, &self.model, &error)),
                     Err(_elapsed) if received_any_event => {
                         return Err(StreamFailure::Idle { waited: self.timeouts.idle })
                     }
@@ -927,7 +971,7 @@ impl AnthropicRuntimeClient {
             biased;
             () = cancel.cancelled() => return Err(StreamFailure::Cancelled { partial_text: String::new() }),
             response = self.client.send_message(&fallback_request) => response
-                .map_err(|error| fatal_api_error(&self.session_id, &error))?,
+                .map_err(|error| fatal_api_error(&self.session_id, &self.model, &error))?,
         };
         let mut events =
             response_to_events(response, sink.as_mut()).map_err(StreamFailure::Fatal)?;
@@ -2754,6 +2798,7 @@ mod stream_resilience_tests {
     fn a_stalled_stream_reports_the_idle_deadline() {
         let failure = classify_stream_read_error(
             "s",
+            "auto",
             &api::ApiError::StreamIdle {
                 provider: "Zero-X".to_string(),
                 model: "auto".to_string(),
@@ -2771,6 +2816,7 @@ mod stream_resilience_tests {
     fn stream_errors_are_classified_by_type() {
         let interrupted = classify_stream_read_error(
             "s",
+            "auto",
             &api::ApiError::InvalidSseFrame("Tool stream ended without a tool_calls finish reason"),
         );
         assert!(matches!(interrupted, StreamFailure::Interrupted { .. }));
@@ -2788,12 +2834,14 @@ mod stream_resilience_tests {
 
         let io = classify_stream_read_error(
             "s",
+            "auto",
             &api::ApiError::Io(std::io::Error::other("connection reset")),
         );
         assert!(io.is_retryable());
 
         let quota = classify_stream_read_error(
             "s",
+            "auto",
             &api::ApiError::Api {
                 status: reqwest::StatusCode::TOO_MANY_REQUESTS,
                 error_type: Some("insufficient_quota".to_string()),
@@ -2813,6 +2861,7 @@ mod stream_resilience_tests {
         // can shrink the context and retry once.
         let overflow = classify_stream_read_error(
             "s",
+            "auto",
             &api::ApiError::ContextWindowExceeded {
                 model: "m".to_string(),
                 estimated_input_tokens: 140_000,
@@ -2827,6 +2876,7 @@ mod stream_resilience_tests {
         ));
         let rejected_by_provider = classify_stream_read_error(
             "s",
+            "auto",
             &api::ApiError::Api {
                 status: reqwest::StatusCode::BAD_REQUEST,
                 error_type: Some("context_length_exceeded".to_string()),
@@ -2962,9 +3012,11 @@ mod switch_model_hint_tests {
     /// models is what they can do now.
     #[test]
     fn exhausted_capacity_suggests_another_model() {
-        let StreamFailure::Fatal(error) =
-            fatal_api_error("session-1", &gateway_error("capacity_exhausted"))
-        else {
+        let StreamFailure::Fatal(error) = fatal_api_error(
+            "session-1",
+            "openai/gemini/gemini-2.5-flash",
+            &gateway_error("capacity_exhausted"),
+        ) else {
             panic!("a fatal error");
         };
         let message = error.to_string();
@@ -2974,9 +3026,11 @@ mod switch_model_hint_tests {
             "{message}"
         );
 
-        let StreamFailure::Fatal(error) =
-            fatal_api_error("session-1", &gateway_error("insufficient_credits"))
-        else {
+        let StreamFailure::Fatal(error) = fatal_api_error(
+            "session-1",
+            "openai/gemini/gemini-2.5-flash",
+            &gateway_error("insufficient_credits"),
+        ) else {
             panic!("a fatal error");
         };
         assert!(!error.to_string().contains("/model"), "{error}");
@@ -2986,11 +3040,65 @@ mod switch_model_hint_tests {
     #[test]
     fn the_hint_names_what_the_user_can_use() {
         let error = gateway_error("capacity_exhausted");
-        let interactive = switch_model_hint(&error, false).expect("a hint");
+        let interactive = switch_model_hint(&error, false, Vec::new).expect("a hint");
         assert!(interactive.contains("switch with /model"), "{interactive}");
         assert!(!interactive.contains("--model"), "{interactive}");
-        let one_shot = switch_model_hint(&error, true).expect("a hint");
+        let one_shot = switch_model_hint(&error, true, Vec::new).expect("a hint");
         assert!(one_shot.contains("--model"), "{one_shot}");
         assert!(!one_shot.contains("/model"), "{one_shot}");
+    }
+
+    /// The models it names are ones the gateway's status has room on now, not one out
+    /// of capacity until tomorrow; `auto` when it knows of none.
+    #[test]
+    fn the_hint_names_models_usable_now() {
+        use crate::gateway_catalog::{alternatives, credential_key, parse_catalog, Catalog};
+        let now = crate::clock::parse_timestamp("2026-10-26T17:12:00Z").unwrap();
+        let catalog = Catalog {
+            base_url: "http://127.0.0.1:1/v1".into(),
+            credential_key: credential_key(None),
+            fetched_at: now,
+            models: parse_catalog(&serde_json::json!({"data": [
+                {"id": "auto", "available": true},
+                {"id": "gemini/gemini-2.5-flash", "available": true, "status": "blurred",
+                 "available_again_at": "2026-10-27T07:00:00.000Z"},
+                {"id": "minimax/minimax-m3.1-flash", "available": true, "status": "blurred",
+                 "available_again_at": "2026-10-27T01:00:00.000Z"},
+                {"id": "gemini/gemini-2.5-pro", "available": false,
+                 "unavailable_reason": "not_configured", "status": "available"},
+                {"id": "cerebras/qwen-3-235b", "available": true, "status": "busy"},
+                {"id": "groq/llama-3.3-70b", "available": true, "status": "available"},
+            ]}))
+            .unwrap(),
+        };
+        let error = gateway_error("capacity_exhausted");
+        let failed = "openai/gemini/gemini-2.5-flash";
+
+        let one_shot =
+            switch_model_hint(&error, true, || alternatives(Some(&catalog), failed, now))
+                .expect("a hint");
+        assert!(
+            one_shot.ends_with(
+                "pick another with --model, such as groq/llama-3.3-70b or cerebras/qwen-3-235b."
+            ),
+            "{one_shot}"
+        );
+        assert!(!one_shot.contains("gemini"), "{one_shot}");
+        assert!(!one_shot.contains("minimax"), "{one_shot}");
+
+        let nothing_known =
+            switch_model_hint(&error, false, || alternatives(None, failed, now)).expect("a hint");
+        assert!(
+            nothing_known.contains("switch with /model, or use /model auto, which routes around"),
+            "{nothing_known}"
+        );
+
+        // Status is only asked for when the gateway is out of capacity.
+        assert!(
+            switch_model_hint(&gateway_error("insufficient_credits"), true, || {
+                panic!("not asked for")
+            })
+            .is_none()
+        );
     }
 }

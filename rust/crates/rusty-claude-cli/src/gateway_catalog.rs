@@ -110,6 +110,33 @@ impl CatalogModel {
             self.tiers.join("+")
         }
     }
+
+    /// When a blurred model is back (Unix seconds), if the gateway said and it parses.
+    fn back_at(&self) -> Option<u64> {
+        self.available_again_at
+            .as_deref()
+            .and_then(crate::clock::parse_timestamp)
+    }
+
+    /// Taken out of rotation (`blurred`) as of `now_unix`: until `available_again_at`,
+    /// or without one until a later status says otherwise.
+    fn is_blurred(&self, now_unix: u64) -> bool {
+        self.status.as_deref() == Some("blurred")
+            && self.back_at().is_none_or(|back| back > now_unix)
+    }
+
+    /// Can be used now: `available` (on the plan and configured, whatever `status`
+    /// says) and not blurred.
+    fn is_usable(&self, now_unix: u64) -> bool {
+        self.available && !self.is_blurred(now_unix)
+    }
+
+    /// `busy` or `degraded`: usable, but worth a mark.
+    fn health_marker(&self) -> Option<&str> {
+        self.status
+            .as_deref()
+            .filter(|status| matches!(*status, "busy" | "degraded"))
+    }
 }
 
 /// A parsed catalog.
@@ -501,9 +528,40 @@ pub fn format_window(tokens: u32) -> String {
     }
 }
 
-/// `/model` listing: available models first, with tier, window, tools and
-/// the reason a model is unavailable.
-pub fn render_model_list(catalog: &Catalog, current_model: &str) -> String {
+/// The gateway's `unavailable_reason` codes in words, as the full-screen UI's model
+/// picker says them; other reasons as sent.
+fn reason_in_words(reason: Option<&str>) -> &str {
+    match reason {
+        Some("upgrade_required") => "needs a plan upgrade",
+        Some("region_unavailable") => "not available in your region",
+        Some("not_configured") => "not configured on this gateway",
+        Some(other) => other,
+        None => "unavailable",
+    }
+}
+
+/// `back in 13h 48m`.
+fn back_in(back: u64, now_unix: u64) -> String {
+    format!(
+        "back in {}",
+        api::describe_wait(back.saturating_sub(now_unix))
+    )
+}
+
+/// `07:00 UTC` within a day of `now_unix`, with the date further out.
+fn describe_until(back: u64, now_unix: u64) -> String {
+    let at = crate::clock::format_utc(back);
+    match at.split_once(' ') {
+        Some((_, time)) if back.saturating_sub(now_unix) < 86_400 => time.to_string(),
+        _ => at,
+    }
+}
+
+/// `/model` listing of `catalog` as of `now_unix` (lay the live status over it
+/// first, [`with_session_status`]), with tier, window and tools: the models usable
+/// now, busy or degraded ones marked; then those out of rotation (blurred) with
+/// when they are back; then those the caller cannot use, with the reason.
+pub fn render_model_list(catalog: &Catalog, current_model: &str, now_unix: u64) -> String {
     let current = model_registry::normalize_model_id(current_model);
     let width = catalog
         .models
@@ -512,17 +570,7 @@ pub fn render_model_list(catalog: &Catalog, current_model: &str) -> String {
         .max()
         .unwrap_or(0)
         .clamp(8, 48);
-    let mut lines = vec![format!(
-        "Zero-X models ({} in catalog, fetched {})",
-        catalog.models.len(),
-        crate::clock::describe_relative(catalog.fetched_at, crate::clock::now_unix())
-    )];
-    let mut printed_unavailable_heading = false;
-    for model in catalog.sorted() {
-        if !model.available && !printed_unavailable_heading {
-            lines.push("  Not available on your plan".to_string());
-            printed_unavailable_heading = true;
-        }
+    let render = |model: &CatalogModel, note: Option<&str>| {
         let marker = if model_registry::normalize_model_id(&model.id) == current {
             '*'
         } else {
@@ -542,13 +590,48 @@ pub fn render_model_list(catalog: &Catalog, current_model: &str) -> String {
         if let Some(name) = &model.display_name {
             line.push_str(&format!("  {name}"));
         }
-        if !model.available {
-            line.push_str(&format!(
-                "  [{}]",
-                model.unavailable_reason.as_deref().unwrap_or("unavailable")
-            ));
+        if let Some(note) = note {
+            line.push_str(&format!("  [{note}]"));
         }
-        lines.push(line.trim_end().to_string());
+        line.trim_end().to_string()
+    };
+    let mut lines = vec![format!(
+        "Zero-X models ({} in catalog, fetched {})",
+        catalog.models.len(),
+        crate::clock::describe_relative(catalog.fetched_at, now_unix)
+    )];
+    for model in &catalog.models {
+        if model.is_usable(now_unix) {
+            lines.push(render(model, model.health_marker()));
+        }
+    }
+    let blurred = catalog
+        .models
+        .iter()
+        .filter(|model| model.available && model.is_blurred(now_unix))
+        .collect::<Vec<_>>();
+    if !blurred.is_empty() {
+        lines.push("  Temporarily unavailable".to_string());
+        for model in blurred {
+            let back = model.back_at().map_or_else(
+                || "out of capacity for now".to_string(),
+                |back| back_in(back, now_unix),
+            );
+            lines.push(render(model, Some(&back)));
+        }
+    }
+    // `available: false` wins over a `status` of `available`.
+    let unavailable = catalog
+        .models
+        .iter()
+        .filter(|model| !model.available)
+        .collect::<Vec<_>>();
+    if !unavailable.is_empty() {
+        lines.push("  Not available".to_string());
+        for model in unavailable {
+            let reason = reason_in_words(model.unavailable_reason.as_deref());
+            lines.push(render(model, Some(reason)));
+        }
     }
     lines.push(format!(
         "Switch with /model <id>. Plans: {}",
@@ -561,19 +644,32 @@ pub fn render_model_list(catalog: &Catalog, current_model: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelCheck {
     Available,
-    Unavailable { reason: String },
-    Unknown { suggestions: Vec<String> },
+    Unavailable {
+        reason: String,
+    },
+    /// Out of capacity: out of rotation until `back_at` (Unix seconds), or without
+    /// one until the gateway says otherwise.
+    Blurred {
+        back_at: Option<u64>,
+    },
+    Unknown {
+        suggestions: Vec<String>,
+    },
 }
 
-pub fn check_model(catalog: &Catalog, model: &str) -> ModelCheck {
+/// Checks `model` against `catalog` as of `now_unix`.
+pub fn check_model(catalog: &Catalog, model: &str, now_unix: u64) -> ModelCheck {
     match catalog.find(model) {
-        Some(found) if found.available => ModelCheck::Available,
-        Some(found) => ModelCheck::Unavailable {
+        Some(found) if !found.available => ModelCheck::Unavailable {
             reason: found
                 .unavailable_reason
                 .clone()
                 .unwrap_or_else(|| "unavailable".to_string()),
         },
+        Some(found) if found.is_blurred(now_unix) => ModelCheck::Blurred {
+            back_at: found.back_at(),
+        },
+        Some(_) => ModelCheck::Available,
         None => {
             let wanted = model_registry::normalize_model_id(model);
             let leaf = wanted.rsplit('/').next().unwrap_or(&wanted).to_string();
@@ -593,19 +689,38 @@ pub fn check_model(catalog: &Catalog, model: &str) -> ModelCheck {
     }
 }
 
-/// Warning to print for a `/model <id>` choice, if any.
-pub fn model_choice_warning(catalog: &Catalog, model: &str) -> Option<String> {
-    let check = check_model(catalog, model);
+/// Warning to print for choosing `model` with `/model <id>`, or with `--model` in a
+/// `neuron prompt` run (`one_shot`), if any. Lay the live status over `catalog`
+/// first ([`with_session_status`]) so that a blurred model is caught.
+pub fn model_choice_warning(
+    catalog: &Catalog,
+    model: &str,
+    now_unix: u64,
+    one_shot: bool,
+) -> Option<String> {
+    let check = check_model(catalog, model, now_unix);
     let model = crate::provider::shown_model(model);
+    // A `neuron prompt` run has no REPL to type `/model` into.
+    let pick = if one_shot { "--model" } else { "/model" };
     match check {
         ModelCheck::Available => None,
+        ModelCheck::Blurred { back_at } => Some(match back_at {
+            Some(back) => format!(
+                "warning: {model} is out of capacity until {} ({}); requests to it fail until then. auto routes around it: {pick} auto.",
+                describe_until(back, now_unix),
+                back_in(back, now_unix)
+            ),
+            None => format!(
+                "warning: {model} is out of capacity for now; requests to it fail. auto routes around it: {pick} auto."
+            ),
+        }),
         ModelCheck::Unavailable { reason } => Some(match reason.as_str() {
             // Not a plan matter: this gateway has no provider set up for it.
             "not_configured" => format!(
-                "warning: {model} is not configured on this Zero-X gateway; requests will fail. Pick another with /model."
+                "warning: {model} is not configured on this Zero-X gateway; requests will fail. Pick another with {pick}."
             ),
             "region_unavailable" => format!(
-                "warning: {model} is not available in your region; requests will fail. Pick another with /model."
+                "warning: {model} is not available in your region; requests will fail. Pick another with {pick}."
             ),
             _ => format!(
                 "warning: {model} is not available on your Zero-X plan ({reason}); requests will fail until you upgrade: {}",
@@ -613,15 +728,50 @@ pub fn model_choice_warning(catalog: &Catalog, model: &str) -> Option<String> {
             ),
         }),
         ModelCheck::Unknown { suggestions } => {
-            let mut message = format!(
-                "warning: {model} is not in the Zero-X catalog; requests may fail. Run /model to list models."
-            );
+            let list = if one_shot {
+                "Start neuron and type /model to list models."
+            } else {
+                "Run /model to list models."
+            };
+            let mut message =
+                format!("warning: {model} is not in the Zero-X catalog; requests may fail. {list}");
             if !suggestions.is_empty() {
                 message.push_str(&format!(" Did you mean {}?", suggestions.join(", ")));
             }
             Some(message)
         }
     }
+}
+
+/// Up to three models to name instead of `model`, which is out of capacity: those
+/// usable now as `catalog` has it (lay the live status over it first), healthy ones
+/// before busy or degraded ones, in the gateway's order. `auto`, which routes around
+/// models out of capacity, when there are none or no catalog.
+pub fn alternatives(catalog: Option<&Catalog>, model: &str, now_unix: u64) -> Vec<String> {
+    let failed = model_registry::normalize_model_id(model);
+    let auto = crate::provider::AUTO_MODEL;
+    let mut usable = catalog
+        .map(|catalog| {
+            catalog
+                .models
+                .iter()
+                .filter(|candidate| {
+                    let id = model_registry::normalize_model_id(&candidate.id);
+                    candidate.is_usable(now_unix) && id != failed && id != auto
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    usable.sort_by_key(|candidate| candidate.health_marker().is_some());
+    let mut ids = usable
+        .into_iter()
+        .take(3)
+        .map(|candidate| candidate.id.clone())
+        .collect::<Vec<_>>();
+    if ids.is_empty() && failed != auto {
+        ids.push(auto.to_string());
+    }
+    ids
 }
 
 /// When the session runs on Zero-X, replaces the Anthropic alias
@@ -754,44 +904,220 @@ mod tests {
 
     #[test]
     fn listing_puts_available_models_first_and_explains_unavailable_ones() {
-        let listing = render_model_list(&sample_catalog(), "openai/test-gw/gemini-unit-flash");
+        let now = crate::clock::now_unix();
+        let listing = render_model_list(&sample_catalog(), "openai/test-gw/gemini-unit-flash", now);
         let flash = listing.find("test-gw/gemini-unit-flash").unwrap();
         let paid = listing.find("test-gw/paid-only-unit").unwrap();
-        let heading = listing.find("Not available on your plan").unwrap();
+        let heading = listing.find("Not available").unwrap();
         assert!(flash < heading && heading < paid, "{listing}");
         assert!(listing.contains("* test-gw/gemini-unit-flash"), "{listing}");
         assert!(listing.contains("free+paid"));
         assert!(listing.contains("1M"));
         assert!(listing.contains("256K"));
-        assert!(listing.contains("[upgrade_required]"));
+        assert!(listing.contains("[needs a plan upgrade]"), "{listing}");
+        assert!(!listing.contains("Temporarily unavailable"), "{listing}");
+    }
+
+    /// 2026-10-26 17:12 UTC, 13h 48m before the blurred model in [`status_catalog`]
+    /// is back.
+    fn status_now() -> u64 {
+        crate::clock::parse_timestamp("2026-10-26T17:12:00Z").unwrap()
+    }
+
+    /// A catalog with the gateway's live status laid over it: busy, degraded and
+    /// blurred models, and one the gateway reports `available` although it is not
+    /// configured (`available: false`).
+    fn status_catalog() -> Catalog {
+        let models = parse_catalog(&json!({"data": [
+            {"id": "auto", "available": true, "tiers": ["free"]},
+            {"id": "gemini/gemini-2.5-flash", "available": true, "tiers": ["free"],
+             "status": "blurred", "available_again_at": "2026-10-27T07:00:00.000Z"},
+            {"id": "test-gw/busy-unit", "available": true, "tiers": ["free"], "status": "busy"},
+            {"id": "test-gw/degraded-unit", "available": true, "tiers": ["free"], "status": "degraded"},
+            {"id": "gemini/gemini-2.5-pro", "available": false,
+             "unavailable_reason": "not_configured", "status": "available"},
+            {"id": "test-gw/paid-only-unit", "available": false, "tiers": ["paid"],
+             "unavailable_reason": "upgrade_required"},
+            {"id": "test-gw/healthy-unit", "available": true, "tiers": ["free"], "status": "available"},
+        ]}))
+        .unwrap();
+        Catalog {
+            fetched_at: status_now(),
+            models,
+            ..sample_catalog()
+        }
+    }
+
+    fn line_of<'a>(listing: &'a str, id: &str) -> &'a str {
+        listing
+            .lines()
+            .find(|line| line.split_whitespace().any(|word| word == id))
+            .unwrap_or_else(|| panic!("no line for {id}:\n{listing}"))
+    }
+
+    #[test]
+    fn listing_keeps_blurred_models_apart_until_they_are_back() {
+        let listing = render_model_list(&status_catalog(), "auto", status_now());
+        let position = |text: &str| {
+            listing
+                .find(text)
+                .unwrap_or_else(|| panic!("no {text}:\n{listing}"))
+        };
+        let temporarily = position("  Temporarily unavailable");
+        let not_available = position("  Not available");
+        assert!(position("test-gw/healthy-unit") < temporarily, "{listing}");
+        assert!(position("test-gw/busy-unit") < temporarily, "{listing}");
+        let flash = position("gemini/gemini-2.5-flash");
+        assert!(
+            temporarily < flash && flash < not_available,
+            "blurred models are not usable: {listing}"
+        );
+        assert!(
+            line_of(&listing, "gemini/gemini-2.5-flash").ends_with("[back in 13h 48m]"),
+            "{listing}"
+        );
+        assert!(line_of(&listing, "test-gw/busy-unit").ends_with("[busy]"));
+        assert!(line_of(&listing, "test-gw/degraded-unit").ends_with("[degraded]"));
+        assert!(!line_of(&listing, "test-gw/healthy-unit").contains('['));
+
+        // Once its time has passed, it is listed with the others again.
+        let later = status_now() + 14 * 3_600;
+        let listing = render_model_list(&status_catalog(), "auto", later);
+        assert!(!listing.contains("Temporarily unavailable"), "{listing}");
+        assert!(listing.find("gemini/gemini-2.5-flash") < listing.find("  Not available"));
+    }
+
+    #[test]
+    fn unavailable_models_say_why_whatever_their_status_says() {
+        let listing = render_model_list(&status_catalog(), "auto", status_now());
+        assert!(
+            !listing.contains("on your plan"),
+            "not all a plan matter: {listing}"
+        );
+        let not_available = listing.find("  Not available").unwrap();
+        let pro = listing.find("gemini/gemini-2.5-pro").unwrap();
+        assert!(
+            not_available < pro,
+            "`available: false` wins over status `available`: {listing}"
+        );
+        assert!(
+            line_of(&listing, "gemini/gemini-2.5-pro")
+                .ends_with("[not configured on this gateway]"),
+            "{listing}"
+        );
+        assert!(line_of(&listing, "test-gw/paid-only-unit").ends_with("[needs a plan upgrade]"));
+
+        let catalog = status_catalog();
+        assert_eq!(
+            check_model(&catalog, "gemini/gemini-2.5-pro", status_now()),
+            ModelCheck::Unavailable {
+                reason: "not_configured".into()
+            }
+        );
+        let warning =
+            model_choice_warning(&catalog, "gemini/gemini-2.5-pro", status_now(), false).unwrap();
+        assert!(warning.contains("not configured"), "{warning}");
+    }
+
+    #[test]
+    fn choosing_a_blurred_model_says_until_when_and_what_routes_around_it() {
+        let catalog = status_catalog();
+        let back = crate::clock::parse_timestamp("2026-10-27T07:00:00Z").unwrap();
+        assert_eq!(
+            check_model(&catalog, "openai/gemini/gemini-2.5-flash", status_now()),
+            ModelCheck::Blurred {
+                back_at: Some(back)
+            }
+        );
+        let warning = model_choice_warning(
+            &catalog,
+            "openai/gemini/gemini-2.5-flash",
+            status_now(),
+            false,
+        )
+        .unwrap();
+        assert!(
+            warning.starts_with(
+                "warning: gemini/gemini-2.5-flash is out of capacity until 07:00 UTC (back in 13h 48m)"
+            ),
+            "{warning}"
+        );
+        assert!(warning.contains("auto routes around it"), "{warning}");
+        assert!(warning.contains("/model auto"), "{warning}");
+        let one_shot =
+            model_choice_warning(&catalog, "gemini/gemini-2.5-flash", status_now(), true).unwrap();
+        assert!(one_shot.contains("--model auto"), "{one_shot}");
+        assert!(!one_shot.contains("/model"), "{one_shot}");
+
+        // Busy and degraded models can be used; once back, so can the blurred one.
+        assert!(model_choice_warning(&catalog, "test-gw/busy-unit", status_now(), false).is_none());
+        assert_eq!(
+            check_model(&catalog, "gemini/gemini-2.5-flash", back),
+            ModelCheck::Available
+        );
+    }
+
+    #[test]
+    fn alternatives_are_models_usable_now_or_auto() {
+        let catalog = status_catalog();
+        assert_eq!(
+            alternatives(
+                Some(&catalog),
+                "openai/gemini/gemini-2.5-flash",
+                status_now()
+            ),
+            vec![
+                "test-gw/healthy-unit".to_string(),
+                "test-gw/busy-unit".to_string(),
+                "test-gw/degraded-unit".to_string(),
+            ],
+            "healthy first; never blurred, unavailable, auto or the one that failed"
+        );
+        assert_eq!(
+            alternatives(Some(&catalog), "test-gw/healthy-unit", status_now()),
+            vec![
+                "test-gw/busy-unit".to_string(),
+                "test-gw/degraded-unit".to_string()
+            ]
+        );
+        assert_eq!(
+            alternatives(None, "gemini/gemini-2.5-flash", status_now()),
+            vec!["auto".to_string()]
+        );
+        assert!(alternatives(None, "auto", status_now()).is_empty());
     }
 
     #[test]
     fn model_choices_are_validated_against_the_catalog() {
         let catalog = sample_catalog();
+        let now = crate::clock::now_unix();
         assert_eq!(
-            check_model(&catalog, "openai/test-gw/gemini-unit-flash"),
+            check_model(&catalog, "openai/test-gw/gemini-unit-flash", now),
             ModelCheck::Available
         );
         assert_eq!(
-            check_model(&catalog, "test-gw/paid-only-unit"),
+            check_model(&catalog, "test-gw/paid-only-unit", now),
             ModelCheck::Unavailable {
                 reason: "upgrade_required".into()
             }
         );
         assert_eq!(
-            check_model(&catalog, "gemini-unit-flash"),
+            check_model(&catalog, "gemini-unit-flash", now),
             ModelCheck::Unknown {
                 suggestions: vec!["test-gw/gemini-unit-flash".into()]
             }
         );
-        let warning = model_choice_warning(&catalog, "test-gw/paid-only-unit").unwrap();
+        let warning = model_choice_warning(&catalog, "test-gw/paid-only-unit", now, false).unwrap();
         assert!(warning.contains("upgrade_required"));
         assert!(warning.contains("https://"));
-        assert!(model_choice_warning(&catalog, "auto").is_none());
-        assert!(model_choice_warning(&catalog, "claude-opus-4-6")
-            .unwrap()
-            .contains("not in the Zero-X catalog"));
+        assert!(model_choice_warning(&catalog, "auto", now, false).is_none());
+        assert!(
+            model_choice_warning(&catalog, "claude-opus-4-6", now, false)
+                .unwrap()
+                .contains("not in the Zero-X catalog")
+        );
+        let one_shot = model_choice_warning(&catalog, "claude-opus-4-6", now, true).unwrap();
+        assert!(!one_shot.contains("Run /model"), "{one_shot}");
     }
 
     #[test]
@@ -811,7 +1137,13 @@ mod tests {
             models,
             ..sample_catalog()
         };
-        let warning = model_choice_warning(&catalog, "openai/openai/gpt-5").unwrap();
+        let warning = model_choice_warning(
+            &catalog,
+            "openai/openai/gpt-5",
+            crate::clock::now_unix(),
+            false,
+        )
+        .unwrap();
         assert!(
             warning.contains("not configured on this Zero-X gateway"),
             "{warning}"

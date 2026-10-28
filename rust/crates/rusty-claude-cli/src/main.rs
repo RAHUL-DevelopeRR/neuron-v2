@@ -562,6 +562,8 @@ fn run_prompt(
     // use gpt-5.5, when falling back to OpenRouter we MUST switch
     // to the free-tier model regardless of what the user passed.
     let effective_model = configure_provider_for_model(model)?;
+    // A model the gateway cannot serve now is named before the request fails.
+    gateway_repl::warn_about_prompt_model(&effective_model);
     // `cat log | neuron prompt "explain this log"`: what stdin carries is context
     // for the prompt, in any permission mode. A run whose stdin is not a terminal
     // never asks for approval (approvals and questions are refused), so reading

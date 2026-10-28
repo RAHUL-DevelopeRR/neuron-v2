@@ -112,7 +112,7 @@ Neuron reports gateway limits with the reason and what to do next:
 | --- | --- | --- |
 | `insufficient_quota` | Daily request or token cap reached | Stops and shows the reset time and the upgrade link. No retry. |
 | `rate_limited` | Too many requests per minute, or too many at once | Waits for the `Retry-After` time and retries, at most twice; each wait may be up to 90 seconds and all of them up to 180 seconds, shown as a countdown. |
-| `capacity_exhausted` | The shared free pool for this model is used up | Same as `rate_limited`. A longer wait than that stops with the error. |
+| `capacity_exhausted` | The shared free pool for this model is used up | Same as `rate_limited`. A longer wait than that stops with the error, which names up to three models that have room now (or `auto`). |
 | `upstream_error`, `upstream_timeout`, `service_unavailable` | The upstream provider failed or stalled, or the gateway is briefly unavailable; the gateway refunds most of these requests | Retries at most twice, waiting at most 60 seconds in total. |
 | `model_not_found` | The model id is not in the catalog | Stops; pick one from `/model`. |
 | `upgrade_required` | The model is not in your plan | Stops and shows the upgrade link. |
@@ -145,10 +145,16 @@ neuron --model gemini/gemini-2.5-flash
 
 Inside a session, `/model` shows the active model and the catalog, and
 `/model <id>` switches. The list comes from the gateway (`GET /v1/models`, cached for
-10 minutes in `~/.neuroncli/catalog.json`) and marks models that are unavailable to
-you with the reason: not in your plan, not offered in your region, or not configured
-on the gateway. `auto` picks a tool-capable model whose context window fits the
-request. `NEURON_MODEL` sets the model for a process.
+10 minutes in `~/.neuroncli/catalog.json`) with each model's current status
+(`GET /v1/models/status`, asked for again at most every 30 seconds). Models you can use
+now come first, with busy or degraded ones marked; models out of capacity until a known
+time are listed under "Temporarily unavailable" with when they are back; models you
+cannot use are listed under "Not available" with the reason: not in your plan, not
+offered in your region, or not configured on the gateway. Choosing one of the last two
+kinds with `/model <id>` warns, and so does `neuron prompt` with a model other than
+`auto`, which asks for the status once before its request; the request is still sent.
+`auto` picks a tool-capable model whose context window fits the request, and routes
+around models out of capacity. `NEURON_MODEL` sets the model for a process.
 
 Free pools have small per-minute token budgets, so the first request of a session is
 kept small: the system prompt lists the bundled skills by name and the model loads a
