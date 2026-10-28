@@ -584,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn unapproved_escalation_denial_explains_the_flags() {
+    fn unapproved_escalation_denial_names_an_allow_rule() {
         let enforcer = PermissionEnforcer::new(workspace_write_policy());
         let result = enforcer.check_with_required_mode(
             "bash",
@@ -595,8 +595,9 @@ mod tests {
             panic!("expected denial");
         };
         assert!(reason.contains("requires 'danger-full-access' permission"));
-        assert!(reason.contains("--permission-mode"));
-        assert!(reason.contains("--allowedTools"));
+        assert!(reason.contains("permissions.allow"), "{reason}");
+        assert!(!reason.contains("--permission-mode"), "{reason}");
+        assert!(!reason.contains("--allowedTools"), "{reason}");
     }
 
     #[test]

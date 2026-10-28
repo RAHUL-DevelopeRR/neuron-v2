@@ -39,12 +39,9 @@ impl CliPermissionPrompter {
         &self,
         request: &runtime::PermissionRequest,
     ) -> runtime::PermissionPromptDecision {
-        let reason = crate::headless::denial_reason(
-            &request.tool_name,
-            self.current_mode,
-            request.required_mode,
-        );
-        if crate::headless::record_denial(&request.tool_name, &reason) {
+        let denial = crate::headless::Denial::of(request, self.current_mode);
+        let reason = denial.reason();
+        if crate::headless::record_denial(denial, &reason) {
             if let Some(turn) = &self.turn {
                 turn.cancel();
             }

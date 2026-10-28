@@ -177,7 +177,13 @@ denied instead.
 (standard input a pipe, a file or `/dev/null`) a call that needs approval is denied
 without asking, the model is told that nothing ran, and questions from the model are
 refused so it decides itself. After 5 denied calls the turn stops. A run that denied a
-call ends with a warning naming the denied tools and exits with code 2.
+call ends with a warning naming the denied tools and exits with code 2. Each denial
+names the `permissions.allow` rule that would let the call run (`"bash(npm:*)"` for
+`npm test`, `"WebSearch"` for a web search); put it in your user settings
+(`~/.neuron/settings.json`), because a script never gets the trust question and an
+untrusted workspace's own allow rules are ignored. Full access
+(`--permission-mode danger-full-access`) is named only as a last resort, for a
+disposable environment.
 
 `permissions` rules in settings can allow or deny tools and command prefixes in
 advance, for example `{"permissions": {"allow": ["bash(git:*)"]}}`.

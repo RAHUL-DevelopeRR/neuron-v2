@@ -112,8 +112,10 @@ pub enum PermissionOutcome {
     Deny { reason: String },
 }
 
-/// Hint appended when escalation is needed but nobody can be asked.
-pub const NON_INTERACTIVE_PERMISSION_HINT: &str = "No interactive approval is available in this mode. Re-run with `--permission-mode danger-full-access` to allow commands that need more access, or limit the tools offered to the model with `--allowedTools`.";
+/// Hint appended when escalation is needed but nobody can be asked. It names an
+/// allow rule, which is checked before the mode; full access stays opt-in, and
+/// `--allowedTools` only limits which tools are offered.
+pub const NON_INTERACTIVE_PERMISSION_HINT: &str = "No interactive approval is available in this mode, so this call was not run. Report the step as not done and tell the user it can be allowed with a permissions.allow rule in their user settings (for example \"bash(npm:*)\").";
 
 /// Approvals the user granted with "allow for this session".
 ///
@@ -958,7 +960,7 @@ pub fn url_host(url: &str) -> Option<String> {
 
 /// Interactive prompter for terminals: allow once, allow for the session,
 /// or deny. When stdin is not a terminal it denies without blocking and
-/// explains which flags grant access instead.
+/// says how a settings rule would allow the call.
 pub struct ConsolePermissionPrompter<R, W> {
     input: R,
     output: W,
@@ -1240,7 +1242,7 @@ mod tests {
         escalation_reason, parse_permission_response, render_permission_prompt, url_host,
         ConsolePermissionPrompter, PermissionContext, PermissionMode, PermissionOutcome,
         PermissionOverride, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
-        PermissionRequest, SessionApprovals,
+        PermissionRequest, SessionApprovals, NON_INTERACTIVE_PERMISSION_HINT,
     };
     use crate::bash_validation::ShellDialect;
     use crate::config::RuntimePermissionRuleConfig;
@@ -1714,15 +1716,25 @@ mod tests {
         ));
     }
 
+    /// The model repeated "re-run with --permission-mode danger-full-access" to the
+    /// user; an allow rule in user settings is enough, and `--allowedTools` cannot let
+    /// a denied call run.
     #[test]
-    fn non_interactive_escalation_denial_names_the_flags() {
+    fn non_interactive_escalation_denial_names_an_allow_rule() {
         let policy = workspace_policy(PermissionMode::WorkspaceWrite);
         let outcome = policy.authorize("bash", &bash_input("npm install"), None);
         let PermissionOutcome::Deny { reason } = outcome else {
             panic!("expected denial");
         };
-        assert!(reason.contains("--permission-mode"), "{reason}");
-        assert!(reason.contains("--allowedTools"), "{reason}");
+        assert!(reason.contains("permissions.allow"), "{reason}");
+        assert!(reason.contains("Report the step as not done"), "{reason}");
+        assert!(!reason.contains("danger-full-access"), "{reason}");
+        assert!(!reason.contains("--allowedTools"), "{reason}");
+        assert!(
+            !NON_INTERACTIVE_PERMISSION_HINT.contains("danger-full-access"),
+            "{NON_INTERACTIVE_PERMISSION_HINT}"
+        );
+        assert!(NON_INTERACTIVE_PERMISSION_HINT.contains("\"bash(npm:*)\""));
     }
 
     #[test]
@@ -1967,7 +1979,11 @@ mod tests {
         let PermissionPromptDecision::Deny { reason } = headless.decide(&request) else {
             panic!("non-interactive prompter must deny");
         };
-        assert!(reason.contains("--permission-mode") && reason.contains("--allowedTools"));
+        assert!(reason.contains("permissions.allow"), "{reason}");
+        assert!(
+            !reason.contains("--permission-mode") && !reason.contains("--allowedTools"),
+            "{reason}"
+        );
         assert!(
             headless.into_output().is_empty(),
             "must not prompt without a terminal"

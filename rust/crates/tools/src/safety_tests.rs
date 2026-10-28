@@ -57,8 +57,10 @@ fn approved_bash_escalation_runs_and_unapproved_escalation_is_explained() {
     let denied = registry
         .execute("bash", &input)
         .expect_err("an unapproved escalation must be denied");
-    assert!(denied.contains("--permission-mode"), "{denied}");
-    assert!(denied.contains("--allowedTools"), "{denied}");
+    // An allow rule in user settings, not full access or `--allowedTools`.
+    assert!(denied.contains("permissions.allow"), "{denied}");
+    assert!(!denied.contains("--permission-mode"), "{denied}");
+    assert!(!denied.contains("--allowedTools"), "{denied}");
 
     // The conversation loop asks the user, who allows the call once.
     let mut prompter = AllowOnce {

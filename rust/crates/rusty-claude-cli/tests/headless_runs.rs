@@ -3,6 +3,8 @@
 //! - a model that keeps calling tools nobody can approve, varying the command each time
 //!   so the repeated-call guard never fires, is stopped after five denials instead of
 //!   spending iterations and quota;
+//! - a denial names the `permissions.allow` rule that would let the call run before
+//!   full access, and that rule in user settings does let it run;
 //! - what stdin carries reaches the model with the prompt, and a pipe that never sends
 //!   anything does not hang the run;
 //! - `neuron --resume SESSION prompt TEXT` sends a saved session another prompt;
@@ -22,7 +24,9 @@ use serde_json::Value;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-const STOP_MESSAGE: &str = "stopped: 5 tool calls were denied in a non-interactive run (bash \u{00d7}5); re-run with --permission-mode danger-full-access or allow the tools in settings";
+/// The allow rule for the loop's `printf ... | tee loop-N.txt` comes first; full access
+/// only for a disposable environment.
+const STOP_MESSAGE: &str = "stopped: 5 tool calls were denied in a non-interactive run (bash \u{00d7}5); to allow them in scripts, add \"bash(tee:*)\" to permissions.allow in your user settings (~/.neuron/settings.json), or, only in a disposable environment, re-run with --permission-mode danger-full-access";
 
 #[test]
 fn a_run_stops_after_five_denied_tool_calls_with_valid_json() {
@@ -95,6 +99,92 @@ fn a_text_run_says_why_it_stopped() {
     assert!(!stdout.contains("Interrupted"), "{stdout}");
     assert_no_command_ran(&workspace.root);
     workspace.remove();
+}
+
+/// A web search on a one-line question was answered with "re-run with
+/// --permission-mode danger-full-access" first, to the user and to the model, which
+/// repeated it. The allow rule comes first now; full access only as a last resort.
+#[test]
+fn a_denied_web_search_names_the_allow_rule_first() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let workspace = Workspace::new("web-search-denied");
+
+    let output = run(
+        &workspace,
+        &server.base_url(),
+        &[],
+        "web_search_denied",
+        Stdin::Null,
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stdout}\n{stderr}");
+    let denial = "tool 'WebSearch' was not run: nobody could approve it in a non-interactive run. To allow it in scripts, add \"WebSearch\" to permissions.allow in your user settings (~/.neuron/settings.json), or, only in a disposable environment, re-run with --permission-mode danger-full-access";
+    // The user is told at once, and the model gets the same reason as the result.
+    assert!(stderr.contains(denial), "{stderr}");
+    assert!(stdout.contains(denial), "{stdout}");
+    let warning = stderr
+        .lines()
+        .find(|line| line.starts_with("warning: non-interactive run:"))
+        .expect("an end-of-run warning");
+    let rule = warning.find("\"WebSearch\"").expect(warning);
+    let full_access = warning.find("danger-full-access").expect(warning);
+    assert!(rule < full_access, "{warning}");
+    workspace.remove();
+}
+
+/// The rule a denial names, in user settings, lets the same call run without a
+/// terminal (the workspace is not trusted, so only user settings count).
+#[test]
+fn the_named_allow_rule_lets_the_call_run_in_a_script() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+
+    let denied = Workspace::new("rule-named");
+    let output = run(
+        &denied,
+        &server.base_url(),
+        &[],
+        "bash_permission_prompt_denied",
+        Stdin::Null,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("add \"bash(tee:*)\" to permissions.allow"),
+        "{stderr}"
+    );
+    assert!(!denied.root.join("denied.txt").exists());
+    denied.remove();
+
+    let allowed = Workspace::new("rule-allowed");
+    fs::write(
+        allowed.config_home.join("settings.json"),
+        r#"{"defaultMcpServers":false,"permissions":{"allow":["bash(tee:*)"]}}"#,
+    )
+    .expect("settings");
+    let output = run(
+        &allowed,
+        &server.base_url(),
+        &[],
+        "bash_permission_prompt_denied",
+        Stdin::Null,
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(!stderr.contains("was not run"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(allowed.root.join("denied.txt")).expect("the command ran"),
+        "should not run"
+    );
+    allowed.remove();
 }
 
 /// `cat log | neuron prompt "..."`, in a mode that is not danger-full-access.
