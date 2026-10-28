@@ -356,7 +356,7 @@ pub(crate) fn resume_launch(
     }
 }
 
-/// Options for starting an interactive session.
+/// Options for starting a session: the interactive REPL, or one `neuron prompt` turn.
 pub(crate) struct ReplLaunch {
     pub model: String,
     pub allowed_tools: Option<AllowedToolSet>,
@@ -447,9 +447,29 @@ fn continue_saved_session(
     cli: &mut LiveCli,
     reference: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    replace_placeholder_session(cli, |cli| {
+        cli.resume_session(Some(reference.to_string())).map(|_| ())
+    })
+}
+
+/// [`continue_saved_session`] without the restore report, for
+/// `neuron --resume SESSION prompt TEXT`, whose stdout is the answer.
+pub(crate) fn continue_saved_session_quietly(
+    cli: &mut LiveCli,
+    reference: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    replace_placeholder_session(cli, |cli| cli.switch_session(reference).map(|_| ()))
+}
+
+/// Runs `switch` and removes the session file the fresh start created when it is
+/// still empty and no longer the CLI's session.
+fn replace_placeholder_session(
+    cli: &mut LiveCli,
+    switch: impl FnOnce(&mut LiveCli) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let placeholder = cli.session.path.clone();
     let placeholder_is_empty = cli.runtime.session().messages.is_empty();
-    cli.resume_session(Some(reference.to_string()))?;
+    switch(cli)?;
     if placeholder_is_empty && placeholder != cli.session.path {
         let _ = fs::remove_file(&placeholder);
     }

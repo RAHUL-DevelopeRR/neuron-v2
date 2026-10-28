@@ -184,6 +184,7 @@ servers, can contact other services.
 cd your-project
 neuron                                   # interactive session
 neuron prompt "explain src/main.rs"      # one prompt, then exit
+neuron --resume latest prompt "and the tests?"   # one more prompt in the newest session
 neuron --permission-mode read-only       # read and search only
 ```
 

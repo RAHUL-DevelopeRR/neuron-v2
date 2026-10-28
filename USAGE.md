@@ -182,19 +182,24 @@ and deny rules for individual tools.
 
 ## Sessions
 
-Interactive turns are saved to `.neuron/sessions/<session-id>.jsonl` in the project.
+Sessions are saved to `.neuron/sessions/<workspace-id>/<session-id>.jsonl` in the
+project. Every `neuron prompt` run starts a new session.
 
 ```sh
 neuron --resume latest                         # continue the newest session
 neuron --resume latest --permission-mode read-only   # ...with different launch flags
 neuron --resume latest /status /diff           # run resume-safe commands without the REPL
+neuron --resume latest prompt "now add tests"  # send it another prompt, then exit
 neuron export conversation.md                  # write the latest session as Markdown
 ```
 
 On a terminal, `--resume` without slash commands continues the session interactively.
-`--model`, `--permission-mode`, `--allowedTools`, `--reasoning-effort` and the other
-launch flags apply to it whether you put them before or after `--resume`; without
-`--model` it continues on the model the session used.
+`--resume SESSION prompt "..."` (or `-p "..."`) works anywhere, scripts included: it runs
+one turn as `neuron prompt` does, with the session's history, and saves the turn to the
+same file. With `--output-format json` its stdout is the turn's JSON answer, as for
+`neuron prompt`. `--model`, `--permission-mode`, `--allowedTools`, `--reasoning-effort`
+and the other launch flags apply to it whether you put them before or after `--resume`;
+without `--model` it continues on the model the session used.
 
 Inside a session: `/session list`, `/session switch <id>`, `/resume <path>`,
 `/compact` to shrink history, `/clear` to start over.

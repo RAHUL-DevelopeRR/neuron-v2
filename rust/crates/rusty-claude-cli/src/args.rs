@@ -47,6 +47,15 @@ pub(crate) enum CliAction {
         output_format: CliOutputFormat,
         launch: ResumeLaunchOptions,
     },
+    /// `neuron --resume SESSION prompt TEXT` (or `-p TEXT`): one more turn on a saved
+    /// session, run as `neuron prompt` runs and saved to the same file.
+    ResumePrompt {
+        session_path: PathBuf,
+        prompt: String,
+        output_format: CliOutputFormat,
+        launch: ResumeLaunchOptions,
+        compact: bool,
+    },
     Status {
         model: String,
         permission_mode: PermissionMode,
@@ -268,9 +277,20 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 allow_broad_cwd = true;
                 index += 1;
             }
+            "-p" if rest.first().is_some_and(|word| word == "--resume") => {
+                // `--resume SESSION -p TEXT`: the words continue the saved session.
+                rest.extend(args[index..].iter().cloned());
+                break;
+            }
             "-p" => {
                 // NeuronCLI compat: -p "prompt" = one-shot prompt
                 // Allow empty prompt so piped stdin works: echo "hello" | neuron -p
+                if let Some(error) = args
+                    .get(index + 1)
+                    .and_then(|word| session_flag_error(word))
+                {
+                    return Err(error);
+                }
                 let prompt = args[index + 1..].join(" ");
                 return Ok(CliAction::Prompt {
                     prompt,
@@ -384,6 +404,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 base_commit,
                 allow_broad_cwd,
             },
+            compact,
         );
     }
     if let Some(action) = parse_local_help_action(&rest) {
@@ -458,6 +479,9 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "init" => Ok(CliAction::Init { output_format }),
         "export" => parse_export_args(&rest[1..], output_format),
         "prompt" => {
+            if let Some(error) = rest.get(1).and_then(|word| session_flag_error(word)) {
+                return Err(error);
+            }
             let prompt = rest[1..].join(" ");
             if prompt.trim().is_empty() {
                 return Err("prompt subcommand requires a prompt string".to_string());
@@ -1359,18 +1383,54 @@ pub(crate) fn parse_dump_manifests_args(
     })
 }
 
+/// How to send a saved session another prompt.
+const RESUME_PROMPT_USAGE: &str = "neuron --resume latest prompt \"...\"";
+
+/// `neuron prompt --resume SESSION TEXT`: the flag would reach the model as prompt text.
+fn session_flag_error(word: &str) -> Option<String> {
+    let flag = word.split('=').next().unwrap_or(word);
+    matches!(flag, "--resume" | "--continue").then(|| {
+        format!(
+            "{flag} after `prompt` or `-p` would be sent as prompt text; to send a saved session another prompt use `{RESUME_PROMPT_USAGE}` (or a session id in place of latest)"
+        )
+    })
+}
+
+/// Whether `word` starts the prompt in `neuron --resume SESSION prompt TEXT`.
+fn is_resume_prompt_word(word: &str) -> bool {
+    matches!(word, "prompt" | "-p")
+}
+
 pub(crate) fn parse_resume_args(
     args: &[String],
     output_format: CliOutputFormat,
     launch: ResumeLaunchOptions,
+    compact: bool,
 ) -> Result<CliAction, String> {
     let (session_path, command_tokens): (PathBuf, &[String]) = match args.first() {
         None => (PathBuf::from(LATEST_SESSION_REFERENCE), &[]),
-        Some(first) if looks_like_slash_command_token(first) => {
+        Some(first) if looks_like_slash_command_token(first) || is_resume_prompt_word(first) => {
             (PathBuf::from(LATEST_SESSION_REFERENCE), args)
         }
         Some(first) => (PathBuf::from(first), &args[1..]),
     };
+    if let Some((word, words)) = command_tokens.split_first() {
+        if is_resume_prompt_word(word) {
+            let prompt = words.join(" ");
+            if prompt.trim().is_empty() {
+                return Err(format!(
+                    "--resume ... {word} requires a prompt string: `{RESUME_PROMPT_USAGE}`"
+                ));
+            }
+            return Ok(CliAction::ResumePrompt {
+                session_path,
+                prompt,
+                output_format,
+                launch,
+                compact,
+            });
+        }
+    }
     let mut commands = Vec::new();
     let mut current_command = String::new();
 
@@ -1389,7 +1449,9 @@ pub(crate) fn parse_resume_args(
         }
 
         if current_command.is_empty() {
-            return Err("--resume trailing arguments must be slash commands".to_string());
+            return Err(format!(
+                "--resume takes slash commands such as /status; to send a prompt use `{RESUME_PROMPT_USAGE}`"
+            ));
         }
 
         current_command.push(' ');
@@ -1471,5 +1533,133 @@ mod provider_flag_tests {
             extract_provider_flag(&strings(&["-p", "explain", "--provider", "flags"])).unwrap();
         assert_eq!(rest, strings(&["-p", "explain", "--provider", "flags"]));
         assert_eq!(provider, None);
+    }
+}
+
+#[cfg(test)]
+mod resume_prompt_tests {
+    use super::{parse_args, CliAction, CliOutputFormat, ResumeLaunchOptions};
+    use std::path::PathBuf;
+
+    fn parse(values: &[&str]) -> Result<CliAction, String> {
+        parse_args(&values.iter().map(ToString::to_string).collect::<Vec<_>>())
+    }
+
+    fn resume_prompt(session: &str, prompt: &str, launch: ResumeLaunchOptions) -> CliAction {
+        CliAction::ResumePrompt {
+            session_path: PathBuf::from(session),
+            prompt: prompt.to_string(),
+            output_format: CliOutputFormat::Text,
+            launch,
+            compact: false,
+        }
+    }
+
+    #[test]
+    fn resume_with_a_prompt_continues_the_saved_session() {
+        assert_eq!(
+            parse(&["--resume", "latest", "prompt", "fix", "the", "test"]),
+            Ok(resume_prompt(
+                "latest",
+                "fix the test",
+                ResumeLaunchOptions::default()
+            ))
+        );
+        assert_eq!(
+            parse(&["--resume", "latest", "-p", "x"]),
+            Ok(resume_prompt("latest", "x", ResumeLaunchOptions::default()))
+        );
+        // No session named: the latest one, as with slash commands.
+        assert_eq!(
+            parse(&["--resume", "prompt", "x"]),
+            Ok(resume_prompt("latest", "x", ResumeLaunchOptions::default()))
+        );
+    }
+
+    #[test]
+    fn resume_prompt_keeps_launch_flags_and_output_options() {
+        assert_eq!(
+            parse(&[
+                "--model",
+                "groq/openai/gpt-oss-120b",
+                "--resume",
+                "s-1",
+                "prompt",
+                "x"
+            ]),
+            Ok(resume_prompt(
+                "s-1",
+                "x",
+                ResumeLaunchOptions {
+                    model: Some("groq/openai/gpt-oss-120b".to_string()),
+                    ..ResumeLaunchOptions::default()
+                }
+            ))
+        );
+        assert_eq!(
+            parse(&[
+                "--output-format",
+                "json",
+                "--compact",
+                "--resume",
+                "s-1",
+                "prompt",
+                "x"
+            ]),
+            Ok(CliAction::ResumePrompt {
+                session_path: PathBuf::from("s-1"),
+                prompt: "x".to_string(),
+                output_format: CliOutputFormat::Json,
+                launch: ResumeLaunchOptions::default(),
+                compact: true,
+            })
+        );
+    }
+
+    #[test]
+    fn resume_without_a_prompt_is_unchanged() {
+        assert_eq!(
+            parse(&["--resume", "latest"]),
+            Ok(CliAction::ResumeSession {
+                session_path: PathBuf::from("latest"),
+                commands: vec![],
+                output_format: CliOutputFormat::Text,
+                launch: ResumeLaunchOptions::default(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_session_flag_after_prompt_is_refused_not_sent_to_the_model() {
+        for words in [
+            &["prompt", "--resume", "latest", "hi"][..],
+            &["prompt", "--resume=latest", "hi"],
+            &["prompt", "--continue", "hi"],
+            &["-p", "--resume", "latest", "hi"],
+        ] {
+            let error = parse(words).expect_err("a session flag after prompt is refused");
+            assert!(
+                error.contains("neuron --resume latest prompt \"...\""),
+                "{words:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn resume_words_that_are_no_slash_command_name_the_prompt_form() {
+        let error = parse(&["--resume", "latest", "hi"]).expect_err("not a slash command");
+        assert!(error.contains("/status"), "{error}");
+        assert!(
+            error.contains("neuron --resume latest prompt \"...\""),
+            "{error}"
+        );
+        for words in [
+            &["--resume", "latest", "prompt"][..],
+            &["--resume", "latest", "prompt", " "],
+            &["--resume", "latest", "-p"],
+        ] {
+            let error = parse(words).expect_err("an empty prompt is refused");
+            assert!(error.contains("requires a prompt"), "{words:?}: {error}");
+        }
     }
 }

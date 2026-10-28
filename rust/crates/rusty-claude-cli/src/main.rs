@@ -424,6 +424,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
             launch,
         } => resume_session(&session_path, &commands, output_format, launch),
+        CliAction::ResumePrompt {
+            session_path,
+            prompt,
+            output_format,
+            launch,
+            compact,
+        } => {
+            // Resolved before the run starts its own session, which would be the latest.
+            let (handle, session) = restore_session_or_exit(&session_path, output_format);
+            let options = repl_loop::resume_launch(
+                launch,
+                session.model.as_deref(),
+                handle.path.display().to_string(),
+            );
+            run_prompt(&prompt, options, output_format, compact)?;
+        }
         CliAction::Status {
             model,
             permission_mode,
@@ -440,53 +456,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             base_commit,
             reasoning_effort,
             allow_broad_cwd,
-        } => {
-            enforce_broad_cwd_policy(allow_broad_cwd, output_format)?;
-            run_stale_base_preflight(base_commit.as_deref());
-            progress::set_mcp_startup(McpStartup::WaitWithoutBundled);
-            // Workspace trust check (skip when stdin is piped so we don't consume the pipe)
-            if runtime::ui_hooks::stdin_is_terminal() {
-                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                if !crate::auth::check_trust(&cwd) {
-                    std::process::exit(1);
-                }
-            }
-            let permission_mode = crate::args::permission_mode_after_trust(permission_mode);
-            let model = crate::args::model_after_trust(model);
-            // JSON mode: stderr carries only the JSON error, not the Azure notice.
-            provider::set_json_output(output_format == CliOutputFormat::Json);
-            // ── Resolve provider (Azure primary → OpenRouter fallback) ──
-            // The provider always dictates the model — when Azure is up we
-            // use gpt-5.5, when falling back to OpenRouter we MUST switch
-            // to the free-tier model regardless of what the user passed.
-            let effective_model = configure_provider_for_model(model)?;
-            // `cat log | neuron prompt "explain this log"`: what stdin carries is context
-            // for the prompt, in any permission mode. A run whose stdin is not a terminal
-            // never asks for approval (approvals and questions are refused), so reading
-            // it takes nothing from them. `echo 'hello' | neuron -p`: stdin is the prompt.
-            let stdin_context = headless::stdin_context(!prompt.trim().is_empty(), output_format);
-            let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
-            let mut cli = LiveCli::new(effective_model, true, allowed_tools, permission_mode)?;
-            cli.set_reasoning_effort(reasoning_effort);
-            // Nobody to answer (stdin not a terminal): approvals and questions are refused.
-            headless::start(headless::stdin_is_unattended(), output_format);
-            // Print a condensed welcome banner for one-shot mode so the user
-            // sees model info and quota even when not in the REPL.
-            // Not to a file or a pipe: there it is noise around the answer.
-            if output_format == CliOutputFormat::Text && !compact && io::stdout().is_terminal() {
-                println!("{}", cli.startup_banner());
-                println!("{}", format_connected_line(&cli.model));
-                println!();
-            }
-            let result = cli.run_turn_with_output(&effective_prompt, output_format, compact);
-            // Tool calls denied for lack of a prompt: named once more, and exit code 2.
-            let denied_exit = headless::report(output_format);
-            result?;
-            if let Some(code) = denied_exit {
-                drop(cli);
-                std::process::exit(code);
-            }
-        }
+        } => run_prompt(
+            &prompt,
+            repl_loop::ReplLaunch {
+                model,
+                allowed_tools,
+                permission_mode,
+                base_commit,
+                reasoning_effort,
+                allow_broad_cwd,
+                resume: None,
+            },
+            output_format,
+            compact,
+        )?,
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
         CliAction::Acp { output_format } => print_acp_status(output_format)?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
@@ -536,6 +519,72 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
+    }
+    Ok(())
+}
+
+/// `neuron prompt TEXT`: one turn, then exit. With `options.resume`
+/// (`neuron --resume SESSION prompt TEXT`) the turn continues that saved session and
+/// is saved to it.
+fn run_prompt(
+    prompt: &str,
+    options: repl_loop::ReplLaunch,
+    output_format: CliOutputFormat,
+    compact: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    enforce_broad_cwd_policy(options.allow_broad_cwd, output_format)?;
+    run_stale_base_preflight(options.base_commit.as_deref());
+    progress::set_mcp_startup(McpStartup::WaitWithoutBundled);
+    // Workspace trust check (skip when stdin is piped so we don't consume the pipe)
+    if runtime::ui_hooks::stdin_is_terminal() {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        if !crate::auth::check_trust(&cwd) {
+            std::process::exit(1);
+        }
+    }
+    let permission_mode = crate::args::permission_mode_after_trust(options.permission_mode);
+    let model = crate::args::model_after_trust(options.model);
+    // JSON mode: stderr carries only the JSON error, not the Azure notice.
+    provider::set_json_output(output_format == CliOutputFormat::Json);
+    // ── Resolve provider (Azure primary → OpenRouter fallback) ──
+    // The provider always dictates the model — when Azure is up we
+    // use gpt-5.5, when falling back to OpenRouter we MUST switch
+    // to the free-tier model regardless of what the user passed.
+    let effective_model = configure_provider_for_model(model)?;
+    // `cat log | neuron prompt "explain this log"`: what stdin carries is context
+    // for the prompt, in any permission mode. A run whose stdin is not a terminal
+    // never asks for approval (approvals and questions are refused), so reading
+    // it takes nothing from them. `echo 'hello' | neuron -p`: stdin is the prompt.
+    let stdin_context = headless::stdin_context(!prompt.trim().is_empty(), output_format);
+    let effective_prompt = merge_prompt_with_stdin(prompt, stdin_context.as_deref());
+    let mut cli = LiveCli::new(
+        effective_model,
+        true,
+        options.allowed_tools,
+        permission_mode,
+    )?;
+    if let Some(reference) = options.resume {
+        // Without the restore report: stdout carries the answer only.
+        repl_loop::continue_saved_session_quietly(&mut cli, &reference)?;
+    }
+    cli.set_reasoning_effort(options.reasoning_effort);
+    // Nobody to answer (stdin not a terminal): approvals and questions are refused.
+    headless::start(headless::stdin_is_unattended(), output_format);
+    // Print a condensed welcome banner for one-shot mode so the user
+    // sees model info and quota even when not in the REPL.
+    // Not to a file or a pipe: there it is noise around the answer.
+    if output_format == CliOutputFormat::Text && !compact && io::stdout().is_terminal() {
+        println!("{}", cli.startup_banner());
+        println!("{}", format_connected_line(&cli.model));
+        println!();
+    }
+    let result = cli.run_turn_with_output(&effective_prompt, output_format, compact);
+    // Tool calls denied for lack of a prompt: named once more, and exit code 2.
+    let denied_exit = headless::report(output_format);
+    result?;
+    if let Some(code) = denied_exit {
+        drop(cli);
+        std::process::exit(code);
     }
     Ok(())
 }
@@ -720,13 +769,13 @@ fn version_json_value() -> serde_json::Value {
     })
 }
 
-#[allow(clippy::too_many_lines)]
-fn resume_session(
+/// Loads the session `--resume` names, or exits saying why it could not (as JSON
+/// with `--output-format json`). What was wrong in a session that loaded is a warning
+/// on stderr.
+fn restore_session_or_exit(
     session_path: &Path,
-    commands: &[String],
     output_format: CliOutputFormat,
-    launch: ResumeLaunchOptions,
-) {
+) -> (SessionHandle, Session) {
     let session_reference = session_path.display().to_string();
     let (handle, session) = match load_session_reference(&session_reference) {
         Ok(loaded) => loaded,
@@ -745,9 +794,8 @@ fn resume_session(
             std::process::exit(1);
         }
     };
-    let resolved_path = handle.path.clone();
     if let Some(warning) = session.load_diagnostics().warning_message() {
-        let warning = format!("session {}: {warning}", resolved_path.display());
+        let warning = format!("session {}: {warning}", handle.path.display());
         if output_format == CliOutputFormat::Json {
             eprintln!(
                 "{}",
@@ -757,6 +805,18 @@ fn resume_session(
             eprintln!("warning: {warning}");
         }
     }
+    (handle, session)
+}
+
+#[allow(clippy::too_many_lines)]
+fn resume_session(
+    session_path: &Path,
+    commands: &[String],
+    output_format: CliOutputFormat,
+    launch: ResumeLaunchOptions,
+) {
+    let (handle, session) = restore_session_or_exit(session_path, output_format);
+    let resolved_path = handle.path.clone();
 
     if commands.is_empty() {
         // `neuron --resume <id>` on a terminal continues the conversation in
@@ -788,7 +848,7 @@ fn resume_session(
             );
         } else {
             println!(
-                "Restored session from {} ({} messages).",
+                "Restored session from {} ({} messages). Nothing to do without a terminal: add slash commands such as /status, or `prompt \"...\"` to continue it.",
                 handle.path.display(),
                 session.messages.len()
             );
@@ -3524,7 +3584,22 @@ impl LiveCli {
             return Ok(false);
         };
 
-        let (handle, session) = load_session_reference(&session_ref)?;
+        let message_count = self.switch_session(&session_ref)?;
+        println!(
+            "{}",
+            format_resume_report(
+                &self.session.path.display().to_string(),
+                message_count,
+                prompt_count(self.runtime.session()),
+            )
+        );
+        Ok(true)
+    }
+
+    /// Continues the saved session `session_ref` from here on, saying nothing; returns
+    /// how many messages it holds.
+    fn switch_session(&mut self, session_ref: &str) -> Result<usize, Box<dyn std::error::Error>> {
+        let (handle, session) = load_session_reference(session_ref)?;
         let message_count = session.messages.len();
         let session_id = session.session_id.clone();
         let runtime = build_runtime(
@@ -3543,15 +3618,7 @@ impl LiveCli {
             id: session_id,
             path: handle.path,
         };
-        println!(
-            "{}",
-            format_resume_report(
-                &self.session.path.display().to_string(),
-                message_count,
-                prompt_count(self.runtime.session()),
-            )
-        );
-        Ok(true)
+        Ok(message_count)
     }
 
     fn print_config(section: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {

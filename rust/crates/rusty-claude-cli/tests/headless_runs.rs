@@ -4,7 +4,8 @@
 //!   so the repeated-call guard never fires, is stopped after five denials instead of
 //!   spending iterations and quota;
 //! - what stdin carries reaches the model with the prompt, and a pipe that never sends
-//!   anything does not hang the run.
+//!   anything does not hang the run;
+//! - `neuron --resume SESSION prompt TEXT` sends a saved session another prompt.
 
 use std::fs;
 use std::io::Write;
@@ -163,6 +164,74 @@ fn a_silent_stdin_pipe_does_not_hang_the_run() {
     workspace.remove();
 }
 
+/// A script continues a saved session: the model sees the earlier turn, the new turn is
+/// saved to the same file, and stdout is the JSON answer alone.
+#[test]
+fn a_saved_session_takes_another_prompt_without_a_terminal() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let workspace = Workspace::new("resume-prompt");
+
+    let first = run(
+        &workspace,
+        &server.base_url(),
+        &[],
+        "streaming_text",
+        Stdin::Null,
+    );
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let sessions = session_files(&workspace.root);
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    let first_size = fs::metadata(&sessions[0]).expect("session file").len();
+
+    let second_prompt = format!("second-turn {SCENARIO_PREFIX}streaming_text");
+    let second = neuron(&workspace, &server.base_url())
+        .args(["--output-format", "json", "--resume", "latest", "prompt"])
+        .arg(&second_prompt)
+        .stdin(Stdio::null())
+        .output()
+        .expect("neuron should run");
+
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert_eq!(second.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(!stdout.contains("Restored"), "{stdout}");
+    let answer: Value = serde_json::from_str(stdout.trim()).expect("stdout is one JSON answer");
+    assert_eq!(answer["outcome"], "completed", "{answer}");
+
+    let requests = runtime.block_on(server.captured_requests());
+    let model_calls = requests
+        .iter()
+        .filter(|request| request.path == "/v1/messages")
+        .collect::<Vec<_>>();
+    assert_eq!(model_calls.len(), 2);
+    let body: Value = serde_json::from_str(&model_calls[1].raw_body).expect("JSON body");
+    let messages = body["messages"].as_array().expect("messages");
+    let roles = messages
+        .iter()
+        .map(|message| message["role"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(roles, ["user", "assistant", "user"], "{body}");
+    assert_eq!(
+        messages[0]["content"][0]["text"],
+        format!("{SCENARIO_PREFIX}streaming_text"),
+        "{body}"
+    );
+    assert_eq!(messages[2]["content"][0]["text"], second_prompt, "{body}");
+
+    // The same file, grown; no other session was left behind.
+    assert_eq!(session_files(&workspace.root), sessions);
+    assert!(fs::metadata(&sessions[0]).expect("session file").len() > first_size);
+    workspace.remove();
+}
+
 #[derive(Clone, Copy)]
 enum Stdin {
     Null,
@@ -179,30 +248,11 @@ fn run(
     scenario: &str,
     stdin: Stdin,
 ) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_neuron"));
+    let mut command = neuron(workspace, base_url);
     command
-        .current_dir(&workspace.root)
-        .env_clear()
-        .env("ANTHROPIC_API_KEY", "test-parity-key")
-        .env("ANTHROPIC_BASE_URL", base_url)
-        .env("CLAW_CONFIG_HOME", &workspace.config_home)
-        .env("HOME", &workspace.home)
-        .env("USERPROFILE", &workspace.home)
-        .env("NO_COLOR", "1")
-        .env("PATH", "/usr/bin:/bin")
         .args(["--model", "sonnet", "--permission-mode", "workspace-write"])
         .args(extra)
-        .arg(format!("{SCENARIO_PREFIX}{scenario}"))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // Windows networking needs SystemRoot even in a cleared environment.
-    if let Some(system_root) = std::env::var_os("SystemRoot") {
-        command.env("SystemRoot", system_root);
-    }
-    #[cfg(windows)]
-    if let Some(path) = std::env::var_os("PATH") {
-        command.env("PATH", path);
-    }
+        .arg(format!("{SCENARIO_PREFIX}{scenario}"));
     match stdin {
         Stdin::Null => command
             .stdin(Stdio::null())
@@ -232,6 +282,48 @@ fn run(
             output
         }
     }
+}
+
+/// `neuron` in `workspace`, talking to the mock service, with stdout and stderr captured.
+fn neuron(workspace: &Workspace, base_url: &str) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_neuron"));
+    command
+        .current_dir(&workspace.root)
+        .env_clear()
+        .env("ANTHROPIC_API_KEY", "test-parity-key")
+        .env("ANTHROPIC_BASE_URL", base_url)
+        .env("CLAW_CONFIG_HOME", &workspace.config_home)
+        .env("HOME", &workspace.home)
+        .env("USERPROFILE", &workspace.home)
+        .env("NO_COLOR", "1")
+        .env("PATH", "/usr/bin:/bin")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Windows networking needs SystemRoot even in a cleared environment.
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        command.env("SystemRoot", system_root);
+    }
+    #[cfg(windows)]
+    if let Some(path) = std::env::var_os("PATH") {
+        command.env("PATH", path);
+    }
+    command
+}
+
+/// The saved sessions of the workspace at `root`.
+fn session_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = fs::read_dir(root.join(".neuron").join("sessions"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|workspace| fs::read_dir(workspace.path()).ok())
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .collect::<Vec<_>>();
+    files.sort();
+    files
 }
 
 /// Every line of `text` as JSON.

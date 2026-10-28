@@ -526,6 +526,14 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "      Inspect or maintain a saved session without entering the REPL"
     )?;
+    writeln!(
+        out,
+        "  neuron [--output-format text|json] --resume [SESSION.jsonl|session-id|latest] prompt TEXT"
+    )?;
+    writeln!(
+        out,
+        "      Send a saved session another prompt and exit (also `-p TEXT`); the turn is saved to it"
+    )?;
     writeln!(out, "  neuron help")?;
     writeln!(out, "      Alias for --help")?;
     writeln!(out, "  neuron version")?;
@@ -626,7 +634,7 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "Session shortcuts:")?;
     writeln!(
         out,
-        "  REPL turns auto-save to .neuron/sessions/<session-id>.{PRIMARY_SESSION_EXTENSION}"
+        "  Sessions auto-save to .neuron/sessions/<workspace-id>/<session-id>.{PRIMARY_SESSION_EXTENSION}; every `neuron prompt` run starts a new one"
     )?;
     writeln!(
         out,
@@ -651,6 +659,10 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
         "  neuron --resume {LATEST_SESSION_REFERENCE} /status /diff /export notes.txt"
+    )?;
+    writeln!(
+        out,
+        "  neuron --output-format json --resume {LATEST_SESSION_REFERENCE} prompt \"now add tests\""
     )?;
     writeln!(out, "  neuron agents")?;
     writeln!(out, "  neuron mcp show my-server")?;
