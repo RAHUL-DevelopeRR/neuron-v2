@@ -209,7 +209,7 @@ Choose the mode with `--permission-mode MODE`, switch inside a session with
 `/permissions MODE`, or set a default in settings:
 
 ```json
-{ "permissionMode": "read-only" }
+{ "permissions": { "defaultMode": "read-only" } }
 ```
 
 `--dangerously-skip-permissions` turns every check off for that run; use it only in a
@@ -274,7 +274,7 @@ Set the key for the provider you want to use:
 | Local OpenAI-compatible server | `OPENAI_BASE_URL=http://127.0.0.1:<port>/v1` (no key needed) |
 | Anthropic | `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_TOKEN`), with `auto` or a `claude-*` model |
 | xAI | `XAI_API_KEY`, with a `grok-*` model |
-| OpenRouter | `OPENROUTER_API_KEY` (OpenRouter is only available with your own key) |
+| OpenRouter | `OPENROUTER_API_KEY` (the gateway offers two of OpenRouter's free models; your key gives you the rest) |
 | Azure AI Foundry | `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_MODEL` |
 
 Neuron picks the provider in this order and names it, with the credential source, on
@@ -314,7 +314,7 @@ names the file, the line and the closest known key. Commonly used keys:
 | Key | Purpose |
 | --- | --- |
 | `model` | Default model |
-| `permissionMode` | Default permission mode |
+| `permissions.defaultMode` | Default permission mode (`permissionMode` still works but prints a deprecation warning) |
 | `permissions` | `allow`, `ask` and `deny` rules for individual tools |
 | `provider` | Provider to use (see [Bring your own key](#bring-your-own-key)) |
 | `maxIterations` | Model calls allowed in one turn (default 50); `NEURON_MAX_ITERATIONS` overrides it |
@@ -336,8 +336,9 @@ settings**; a repository cannot list itself. For headless runs, set
 `NEURON_TRUST_WORKSPACE=1` only for checkouts you trust.
 
 Until a directory is trusted, its settings keep only what restricts Neuron:
-`permissions.deny` (added to your own deny rules), a read-only `defaultMode` or
-`permissionMode`, and `"defaultMcpServers": false` or `"defaultSkills": false`.
+`permissions.deny` (added to your own deny rules), a read-only
+`permissions.defaultMode` (or the deprecated `permissionMode`), and
+`"defaultMcpServers": false` or `"defaultSkills": false`.
 Hooks, MCP servers, allow and ask rules, model, aliases, provider and the other keys
 are ignored, with a warning naming them. Even in a trusted directory, settings files
 cannot set a full-access permission mode; pass `--permission-mode danger-full-access`
@@ -376,10 +377,17 @@ or put it in your user settings.
 | pip | `pip install --upgrade --pre neuroncli` (the alpha is a pre-release on PyPI, so pip needs `--pre`) | `pipx uninstall neuroncli` or `pip uninstall neuroncli` |
 
 Neuron keeps your login in the OS credential store or `~/.neuroncli/`, and your
-settings in `~/.neuron/`; the launchers cache binaries in `~/.cache/neuroncli` (Linux), `~/Library/Caches/neuroncli`
-(macOS) or `%LOCALAPPDATA%\neuroncli` (Windows). Run `neuron auth logout` before
-deleting them so the session is revoked on the gateway and removed from the
-credential store too.
+settings in `~/.neuron/`. Run `neuron auth logout` before deleting them so the
+session is revoked on the gateway and removed from the credential store too.
+
+The npm package downloads `neuron` (about 17 MB) and `neuron-tui` (about 110 MB)
+during `npm install`, without showing progress, into its own `bin/native` folder, so
+uninstalling the package removes them. pip downloads them the first time you run
+`neuron`, into a per-version cache: `~/.cache/neuroncli` (Linux),
+`~/Library/Caches/neuroncli` (macOS) or `%LOCALAPPDATA%\neuroncli` (Windows); delete
+it after uninstalling. npm uses that cache only when its package folder is read-only.
+With the installers or pip, the two default MCP servers start through `npx -y`, which
+needs Node.js; the npm package installs them with Neuron.
 
 ## Troubleshooting
 

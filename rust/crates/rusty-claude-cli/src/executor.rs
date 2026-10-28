@@ -515,6 +515,11 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         "  neuron [--model MODEL] [--output-format text|json] TEXT"
     )?;
     writeln!(out, "      Shorthand non-interactive prompt mode")?;
+    writeln!(out, "  neuron [FLAGS] -p TEXT")?;
+    writeln!(
+        out,
+        "      Same as `prompt TEXT`; everything after -p is the prompt, so put flags first"
+    )?;
     writeln!(
         out,
         "  neuron --resume [SESSION.jsonl|session-id|latest] [/status] [/compact] [...]"
@@ -604,6 +609,10 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)")?;
     writeln!(
         out,
+        "  --allow-broad-cwd          Allow running from a very broad folder such as your home folder"
+    )?;
+    writeln!(
+        out,
         "  --no-tui                   Use the line REPL even where the full-screen UI is installed (or set NEURON_NO_TUI=1)"
     )?;
     writeln!(
@@ -620,6 +629,7 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out)?;
     let resume_commands = resume_supported_slash_commands()
         .into_iter()
+        .filter(|spec| !STUB_COMMANDS.contains(&spec.name))
         .map(|spec| match spec.argument_hint {
             Some(argument_hint) => format!("/{} {}", spec.name, argument_hint),
             None => format!("/{}", spec.name),
@@ -672,7 +682,7 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "Install and update:")?;
     writeln!(
         out,
-        "  npm install -g {NPM_PACKAGE}, pipx install --pip-args=--pre {PYPI_PACKAGE}, or install.sh / install.ps1 from {NEURON_REPO_URL}/releases"
+        "  npm install -g {NPM_PACKAGE}, pip install --pre {PYPI_PACKAGE}, or install.sh / install.ps1 from {NEURON_REPO_URL}/releases"
     )?;
     writeln!(out, "  Source: {NEURON_REPO_URL}")?;
     Ok(())

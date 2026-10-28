@@ -64,9 +64,19 @@ npm install --global @zero-x.live/neuron
 pip install --pre neuroncli
 ```
 
-The npm and pip packages are small launchers. The first run downloads the binary for
-the package's exact version, verifies it and caches it; later runs start without
-network access. Ctrl+C goes to Neuron, and the launcher exits with Neuron's exit code.
+The npm and pip packages are small launchers that download the binaries for the
+package's exact version and verify their checksums. npm downloads them during
+`npm install`, without showing progress: `neuron` (about 17 MB) and `neuron-tui`
+(about 110 MB) go into the package's `bin/native` folder. pip downloads them the first
+time you run `neuron`, into a per-version cache (`~/.cache/neuroncli` on Linux,
+`~/Library/Caches/neuroncli` on macOS, `%LOCALAPPDATA%\neuroncli` on Windows); npm
+uses that cache only when its package folder is read-only. After that, Neuron starts
+without network access. Ctrl+C goes to Neuron, and the launcher exits with Neuron's
+exit code.
+
+With the installers or pip, the two default MCP servers (CodebaseMap and Playwright)
+start through `npx -y`, so they need Node.js; the npm package installs them with
+Neuron.
 
 On a terminal, `neuron` with no prompt opens the full-screen UI, `neuron-tui`. The
 installers put it beside `neuron`, and the launchers fetch it the same way, verified
@@ -125,9 +135,9 @@ in the usage guide.
 
 ## Plans and limits
 
-**Free.** No card needed. Free-plan requests run on free tiers of upstream providers
-whose terms allow serving an application's users: Groq, the Gemini API free tier and
-Cloudflare Workers AI. The limits are real and you will run into them:
+**Free.** No card needed. Free-plan requests run on free tiers of upstream providers:
+Groq, the Gemini API free tier, Cloudflare Workers AI, NVIDIA's API catalog and
+OpenRouter's free models. The limits are real and you will run into them:
 
 | Free plan | Limit |
 | --- | --- |
@@ -142,7 +152,8 @@ Cloudflare Workers AI. The limits are real and you will run into them:
   only some models, or on none.
 - The Gemini free tier is not offered to callers in the EEA, the UK or Switzerland.
 - Which models are free depends on what the providers offer, and can change at any
-  time. `/model` lists what is available to you now.
+  time. `/model` lists what is available to you now; outside a session,
+  `curl https://zero-x.live/v1/models` shows the current catalog.
 
 **Pro and Max.** Paid plans raise the daily and per-minute limits and add paid
 upstream capacity, billed against monthly credits included with the plan; credit
@@ -155,23 +166,23 @@ top-ups are also sold. Prices and current limits are at
 You can bypass the gateway with a provider account of your own: for example
 `OPENAI_API_KEY` (plus `OPENAI_BASE_URL` for any OpenAI-compatible endpoint, including
 a local model server), `ANTHROPIC_API_KEY`, `XAI_API_KEY`, Azure AI Foundry or
-`OPENROUTER_API_KEY`. OpenRouter is available only this way. While you are signed in
-to Zero-X the gateway stays the default; a provider key is used when you select that
-provider (`--provider`, `NEURON_PROVIDER` or the `provider` setting) or when you are
-not signed in. Neuron prints which provider and credential it uses when it starts.
-See
+`OPENROUTER_API_KEY`. The gateway offers two of OpenRouter's free models; your own key
+gives you the rest of OpenRouter. While you are signed in to Zero-X the gateway stays
+the default; a provider key is used when you select that provider (`--provider`,
+`NEURON_PROVIDER` or the `provider` setting) or when you are not signed in. Neuron
+prints which provider and credential it uses when it starts. See
 [Bring your own key](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/USAGE.md#bring-your-own-key).
 
 ## Privacy
 
 What you send in a session (prompts, the contents of files Neuron reads, command
 output) is processed by third-party model providers: the upstream provider the
-gateway routes to (Groq, Google, Cloudflare or a paid upstream), or the provider whose
-key you configured. Their terms apply. Free tiers can have different data-use terms
-from paid ones; Google, for example, may use Gemini API free-tier content to improve
-its products. Paid Zero-X plans also use the free pools first and fall back to paid
-capacity, so if your code must stay under one provider's terms, use your own key for
-that provider.
+gateway routes to (Groq, Google, Cloudflare, NVIDIA, OpenRouter or a paid upstream),
+or the provider whose key you configured. Their terms apply. Free tiers can have
+different data-use terms from paid ones; Google, for example, may use Gemini API
+free-tier content to improve its products. Paid Zero-X plans also use the free pools
+first and fall back to paid capacity, so if your code must stay under one provider's
+terms, use your own key for that provider.
 
 The gateway forwards each request to the upstream provider and records usage metadata
 (model, token counts, latency, status) for quotas and billing. Neuron sends no

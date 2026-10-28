@@ -6674,6 +6674,18 @@ mod tests {
             .expect_err("/status should remain REPL-only when invoked directly");
         assert!(error.contains("interactive-only"));
         assert!(error.contains("neuron --resume SESSION.jsonl /status"));
+        // /model does not run under --resume, so the error must not offer it.
+        let error = parse_args(&["/model".to_string()])
+            .expect_err("/model should remain REPL-only when invoked directly");
+        assert!(
+            error.contains("slash command /model works only inside a session"),
+            "{error}"
+        );
+        assert!(!error.contains("--resume"), "{error}");
+        assert!(
+            error.contains("The current catalog is at https://zero-x.live/v1/models."),
+            "{error}"
+        );
     }
 
     #[test]
@@ -7183,7 +7195,8 @@ mod tests {
         assert!(!help.contains("neuron /skills"));
         assert!(help.contains("https://github.com/RAHUL-DevelopeRR/neuron-v2"));
         assert!(help.contains("npm install -g @zero-x.live/neuron"));
-        assert!(help.contains("pipx install --pip-args=--pre neuroncli"));
+        assert!(help.contains("pip install --pre neuroncli"));
+        assert!(!help.contains("pipx"));
         assert!(help.contains("install.sh"));
         assert!(!help.contains("claw-code"));
         assert!(!help.contains("cargo install neuron-cli"));
@@ -8986,6 +8999,30 @@ UU conflicted.rs",
                 "stub command {with_slash} should not appear in REPL completions"
             );
         }
+    }
+
+    #[test]
+    fn help_lists_only_working_resume_commands_and_every_flag() {
+        let mut help = Vec::new();
+        print_help_to(&mut help).expect("help should render");
+        let help = String::from_utf8(help).expect("help should be utf8");
+        let resume_line = help
+            .lines()
+            .find(|line| line.starts_with("Resume-safe commands:"))
+            .expect("help should list the resume-safe commands");
+        let words = resume_line
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .collect::<Vec<_>>();
+        assert!(words.contains(&"/status"), "{resume_line}");
+        for stub in STUB_COMMANDS {
+            let with_slash = format!("/{stub}");
+            assert!(
+                !words.contains(&with_slash.as_str()),
+                "stub command {with_slash} should not be listed as resume-safe: {resume_line}"
+            );
+        }
+        assert!(help.contains("neuron [FLAGS] -p TEXT"), "{help}");
+        assert!(help.contains("--allow-broad-cwd"), "{help}");
     }
 }
 

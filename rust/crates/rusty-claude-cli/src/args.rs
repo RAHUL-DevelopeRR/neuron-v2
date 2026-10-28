@@ -1052,16 +1052,40 @@ pub(crate) fn parse_direct_slash_cli_action(
         }
         Ok(Some(SlashCommand::Unknown(name))) => Err(format_unknown_direct_slash_command(&name)),
         Ok(Some(command)) => Err({
-            let _ = command;
-            format!(
-                "slash command {command_name} is interactive-only. Start `neuron` and run it there, or use `neuron --resume SESSION.jsonl {command_name}` / `neuron --resume {latest} {command_name}` when the command is marked [resume] in /help.",
-                command_name = rest[0],
-                latest = LATEST_SESSION_REFERENCE,
-            )
+            let command_name = &rest[0];
+            if resume_safe_slash_command(command_name) {
+                format!(
+                    "slash command {command_name} is interactive-only. Start `neuron` and run it there, or use `neuron --resume SESSION.jsonl {command_name}` / `neuron --resume {latest} {command_name}`.",
+                    latest = LATEST_SESSION_REFERENCE,
+                )
+            } else {
+                let mut message = format!(
+                    "slash command {command_name} works only inside a session: start `neuron` on a terminal and run it there."
+                );
+                if matches!(command, SlashCommand::Model { .. }) {
+                    message.push_str(" The current catalog is at https://zero-x.live/v1/models.");
+                }
+                message
+            }
         }),
         Ok(None) => Err(format!("unknown subcommand: {}", rest[0])),
         Err(error) => Err(error.to_string()),
     }
+}
+
+/// Whether `neuron --resume SESSION /name` runs this command: it is marked [resume] in
+/// /help and is not one of the stubs that only say "not yet implemented".
+fn resume_safe_slash_command(command_name: &str) -> bool {
+    let name = command_name
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches('/');
+    slash_command_specs().iter().any(|spec| {
+        spec.resume_supported
+            && !STUB_COMMANDS.contains(&spec.name)
+            && (spec.name == name || spec.aliases.contains(&name))
+    })
 }
 
 pub(crate) fn format_unknown_option(option: &str) -> String {

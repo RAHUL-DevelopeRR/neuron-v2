@@ -5,7 +5,7 @@
 // See ui/neuron-tui/PORTING.md.
 import { createRequire } from 'module'
 
-import { Command } from 'commander'
+import { Command, Option } from 'commander'
 
 import type { EngineLaunchOptions } from './engine/neuron-engine-client'
 import type { AgentMode } from './utils/constants'
@@ -51,16 +51,9 @@ export function loadPackageVersion(): string {
   return 'dev'
 }
 
-export function parseArgs({
-  argv = process.argv,
-  version = loadPackageVersion(),
-}: {
-  argv?: string[]
-  version?: string
-} = {}): ParsedArgs {
-  const program = new Command()
-
-  program
+/** The command line `parseArgs` reads; its `--help` is what users see. */
+export function buildProgram(version: string): Command {
+  return new Command()
     .name('neuron')
     .description('Neuron: an AI coding agent in your terminal')
     .version(version, '-v, --version', 'Print the CLI version')
@@ -76,11 +69,16 @@ export function parseArgs({
       '--cwd <directory>',
       'Set the working directory (default: current directory)',
     )
-    .option('--lite', 'Start in LITE mode')
-    .option('--free', 'Start in LITE mode (deprecated alias)')
-    .option('--max', 'Start in MAX mode')
+    // Still accepted but left out of --help: these modes change only how the UI
+    // presents a turn, and the engine ignores them (see PORTING.md).
+    .addOption(new Option('--lite', 'Start in LITE mode').hideHelp())
+    .addOption(new Option('--free', 'Start in LITE mode (deprecated alias)').hideHelp())
+    .addOption(new Option('--max', 'Start in MAX mode').hideHelp())
     .option('--plan', 'Start in PLAN mode')
-    .option('--model <model>', 'Model for the session (an alias like opus, or a full name)')
+    .option(
+      '--model <model>',
+      'Model for the session (auto, or an id from /model such as gemini/gemini-2.5-flash)',
+    )
     .option('--provider <name>', 'Provider to use instead of the configured one')
     .option(
       '--permission-mode <mode>',
@@ -99,7 +97,16 @@ export function parseArgs({
     .helpOption('-h, --help', 'Show this help message')
     .argument('[prompt...]', 'Initial prompt to send to the agent')
     .allowExcessArguments(true)
+}
 
+export function parseArgs({
+  argv = process.argv,
+  version = loadPackageVersion(),
+}: {
+  argv?: string[]
+  version?: string
+} = {}): ParsedArgs {
+  const program = buildProgram(version)
   program.parse(argv)
 
   const options = program.opts()
