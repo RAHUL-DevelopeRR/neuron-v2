@@ -178,15 +178,26 @@ denied instead.
 without asking, the model is told that nothing ran, and questions from the model are
 refused so it decides itself. After 5 denied calls the turn stops. A run that denied a
 call ends with a warning naming the denied tools and exits with code 2. Each denial
-names the `permissions.allow` rule that would let the call run (`"bash(npm:*)"` for
-`npm test`, `"WebSearch"` for a web search); put it in your user settings
-(`~/.neuron/settings.json`), because a script never gets the trust question and an
-untrusted workspace's own allow rules are ignored. Full access
+names the `permissions.allow` rules that would let that call run, checked against the
+call first: `"bash(npm:*)"` for `npm test`, `"bash(cargo:*)", "bash(npm:*)"` for
+`cargo test && npm run build`, `"WebSearch"` for a web search. A command no prefix
+rule covers gets a rule for that exact command (`"bash(npm test > out.txt)"`), or
+none when it is longer than one line or 160 characters. The end-of-run warning, and
+its `allow_rules` field in JSON mode, lists every rule the denials named. Put them in
+your user settings (`~/.neuron/settings.json`), because a script never gets the trust
+question and an untrusted workspace's own allow rules are ignored. Full access
 (`--permission-mode danger-full-access`) is named only as a last resort, for a
 disposable environment.
 
 `permissions` rules in settings can allow or deny tools and command prefixes in
-advance, for example `{"permissions": {"allow": ["bash(git:*)"]}}`.
+advance, for example `{"permissions": {"allow": ["bash(git:*)"]}}`. `bash(git:*)`
+allows a shell command when every part of it that needs approval starts with `git`,
+so `git status; curl ...` still asks. Prefix rules count together: `bash(cargo:*)` and
+`bash(npm:*)` allow `cargo test && npm run build`. No prefix rule covers a part that
+writes a file through a redirection (`npm test > out.txt`), sets an environment
+variable first (`CI=true npm test`), uses a command substitution or a PowerShell script
+block, or runs a program named by a variable; `bash(npm test > out.txt)` allows that
+exact command only. A deny rule wins when any part matches it.
 
 Choose the mode with `--permission-mode MODE`, switch inside a session with
 `/permissions MODE`, or set a default in settings:

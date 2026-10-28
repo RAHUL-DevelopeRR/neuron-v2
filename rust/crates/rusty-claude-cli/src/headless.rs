@@ -1,10 +1,10 @@
 //! A `neuron prompt` run that nobody can answer: stdin is not a terminal (a script,
 //! CI, `< /dev/null`). A tool call that needs approval is not asked about: it is denied
-//! with a reason the model and the user both see, naming the `permissions.allow` rule
-//! that would let it run ([`Denial`]). A question from the model fails, so the model
-//! decides itself. After [`DENIAL_LIMIT`] denied calls the turn stops. The run ends with
-//! a warning naming what was not run, and exit code [`DENIED_EXIT_CODE`] when tool calls
-//! were denied.
+//! with a reason the model and the user both see, naming the `permissions.allow` rules
+//! that would let it run, when any would ([`Denial`]). A question from the model fails,
+//! so the model decides itself. After [`DENIAL_LIMIT`] denied calls the turn stops. The
+//! run ends with a warning naming what was not run and every rule the denials named, and
+//! exit code [`DENIED_EXIT_CODE`] when tool calls were denied.
 //!
 //! What stdin carries (`cat log | neuron prompt "explain this log"`) is sent as context
 //! with the prompt ([`stdin_context`]); a pipe that stays silent is not waited for.
@@ -90,91 +90,82 @@ const USER_SETTINGS: &str = "~/.neuron/settings.json";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Denial {
     tool: String,
-    /// `permissions.allow` rules that would let the call run ([`allow_rules`]).
-    rules: Vec<String>,
-    /// The mode that would let it run, when the mode is why it needed approval (not
-    /// an ask rule or a hook).
-    mode: Option<PermissionMode>,
+    /// What would let the call run: allow rules the runtime checked against the call
+    /// itself, why no `tool(program:*)` rule covers a shell command, the mode.
+    remedy: runtime::PermissionRemedy,
+    /// Why it asked, when neither an allow rule nor a mode would skip the question (an
+    /// ask rule, a hook).
+    asked: Option<String>,
 }
 
 impl Denial {
-    /// The denial of `request` in `current_mode`.
-    pub(crate) fn of(request: &runtime::PermissionRequest, current_mode: PermissionMode) -> Self {
-        let required_mode = request.required_mode;
+    /// The denial of `request`.
+    pub(crate) fn of(request: &runtime::PermissionRequest) -> Self {
+        let remedy = request.remedy.clone();
+        let unremedied = remedy.allow_rules.is_empty()
+            && remedy.mode.is_none()
+            && remedy.no_prefix_rule.is_none();
         Self {
             tool: request.tool_name.clone(),
-            rules: allow_rules(
-                &request.tool_name,
-                &request.input,
-                &request.session_prefixes,
-            ),
-            mode: (required_mode > current_mode && required_mode != PermissionMode::Prompt)
-                .then_some(required_mode),
+            asked: unremedied.then(|| request.reason.clone()).flatten(),
+            remedy,
         }
     }
 
-    /// Why the call was not run, and what would let it run: an allow rule first, the
-    /// mode only for a disposable environment (Full access stays opt-in).
+    /// Why the call was not run, and what would let it run: the allow rules first, the
+    /// mode only for a disposable environment (Full access stays opt-in). Every rule
+    /// named lets this call run: the runtime checked it with its own matching.
     pub(crate) fn reason(&self) -> String {
-        format!(
-            "tool '{}' was not run: nobody could approve it in a non-interactive run. To allow it in scripts, {}",
-            self.tool,
-            allow_hint(&self.rules, self.mode)
-        )
-    }
-}
-
-/// The `permissions.allow` rules that would let a call of `tool_name` run. A shell
-/// tool gets one per program the command needs approval for (`bash(npm:*)`), from
-/// the prefixes "allow for this session" would approve, else from the command's first
-/// word; any other tool gets its name (`WebSearch`).
-fn allow_rules(tool_name: &str, input: &str, session_prefixes: &[String]) -> Vec<String> {
-    if !matches!(tool_name, "bash" | "PowerShell") {
-        return vec![tool_name.to_string()];
-    }
-    let mut programs: Vec<String> = Vec::new();
-    for prefix in session_prefixes {
-        if let Some(program) = prefix.split_whitespace().next() {
-            if !programs.iter().any(|known| known == program) {
-                programs.push(program.to_string());
-            }
+        let tool = &self.tool;
+        let mut reason =
+            format!("tool '{tool}' was not run: nobody could approve it in a non-interactive run");
+        if let Some(why) = &self.remedy.no_prefix_rule {
+            reason.push_str(&format!(
+                ". No \"{tool}(<program>:*)\" rule covers this command ({why})"
+            ));
         }
+        let mode = self.remedy.mode;
+        if self.remedy.allow_rules.is_empty() {
+            if let Some(mode) = mode {
+                reason.push_str(&format!(
+                    ". Only in a disposable environment, re-run with --permission-mode {} to allow it",
+                    mode.as_str()
+                ));
+            } else if let Some(asked) = &self.asked {
+                reason.push_str(&format!(" ({asked})"));
+            }
+            return reason;
+        }
+        let what = if self.remedy.no_prefix_rule.is_some() {
+            "this exact command"
+        } else {
+            "it"
+        };
+        reason.push_str(&format!(
+            ". To allow {what} in scripts, {}",
+            add_rules(&self.remedy.allow_rules)
+        ));
+        if let Some(mode) = mode {
+            reason.push_str(&or_mode(mode));
+        }
+        reason
     }
-    if programs.is_empty() {
-        let command = serde_json::from_str::<serde_json::Value>(input)
-            .ok()
-            .and_then(|input| input["command"].as_str().map(str::to_string))
-            .unwrap_or_default();
-        programs.push(
-            command
-                .split_whitespace()
-                .next()
-                .unwrap_or("<program>")
-                .to_string(),
-        );
-    }
-    programs
-        .iter()
-        .map(|program| format!("{tool_name}({program}:*)"))
-        .collect()
 }
 
-/// `add "bash(npm:*)", "WebSearch" to permissions.allow in your user settings (...)`,
-/// then `mode`, when there is one, for a disposable environment only.
-fn allow_hint(rules: &[String], mode: Option<PermissionMode>) -> String {
-    let rules = rules
-        .iter()
-        .map(|rule| format!("\"{rule}\""))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let rule = format!("add {rules} to permissions.allow in your user settings ({USER_SETTINGS})");
-    match mode {
-        Some(mode) => format!(
-            "{rule}, or, only in a disposable environment, re-run with --permission-mode {}",
-            mode.as_str()
-        ),
-        None => rule,
-    }
+/// `add "bash(npm:*)", "WebSearch" to permissions.allow in your user settings (...)`.
+fn add_rules(rules: &[String]) -> String {
+    format!(
+        "add {} to permissions.allow in your user settings ({USER_SETTINGS})",
+        runtime::quote_allow_rules(rules)
+    )
+}
+
+/// The mode, after the allow rules: for a disposable environment only.
+fn or_mode(mode: PermissionMode) -> String {
+    format!(
+        ", or, only in a disposable environment, re-run with --permission-mode {}",
+        mode.as_str()
+    )
 }
 
 /// The tool result the model gets for a denied call: the reason, and that the step
@@ -277,26 +268,77 @@ impl Shortfall {
             .collect()
     }
 
-    /// What would let the denied calls run: one example rule per denied tool (from its
-    /// first denied call), then the highest mode any of them needed.
-    fn allow_hint(&self) -> String {
-        let mut tools: Vec<&str> = Vec::new();
-        let mut rules = Vec::new();
-        for denial in &self.denied {
-            if !tools.contains(&denial.tool.as_str()) {
-                tools.push(&denial.tool);
-                rules.extend(denial.rules.first().cloned());
+    /// Every allow rule the denied calls named, each once, in order: added together
+    /// they let every denied call that has a rule run (each call's rules were checked
+    /// against it, and allow rules only add).
+    fn allow_rules(&self) -> Vec<String> {
+        let mut rules: Vec<String> = Vec::new();
+        for rule in self
+            .denied
+            .iter()
+            .flat_map(|denial| &denial.remedy.allow_rules)
+        {
+            if !rules.contains(rule) {
+                rules.push(rule.clone());
             }
         }
-        let mode = self.denied.iter().filter_map(|denial| denial.mode).max();
-        allow_hint(&rules, mode)
+        rules
+    }
+
+    /// What would let the denied calls run, starting in lower case: all their allow
+    /// rules, how many no rule covers, then the mode when it would let every one of
+    /// them run (not past an ask rule or a hook), for a disposable environment only.
+    fn allow_hint(&self) -> String {
+        let calls = self.denied.len();
+        let them = if calls == 1 { "it" } else { "them" };
+        let rules = self.allow_rules();
+        let uncovered = self
+            .denied
+            .iter()
+            .filter(|denial| denial.remedy.allow_rules.is_empty())
+            .count();
+        let mode = self
+            .denied
+            .iter()
+            .map(|denial| denial.remedy.mode)
+            .collect::<Option<Vec<_>>>()
+            .and_then(|modes| modes.into_iter().max());
+        if rules.is_empty() {
+            let mut hint = format!("no permissions.allow rule covers {them}");
+            if let Some(mode) = mode {
+                hint.push_str(&format!(
+                    "; only in a disposable environment, re-run with --permission-mode {} to allow {them}",
+                    mode.as_str()
+                ));
+            }
+            return hint;
+        }
+        if uncovered == 0 {
+            let mut hint = format!("to allow {them} in scripts, {}", add_rules(&rules));
+            if let Some(mode) = mode {
+                hint.push_str(&or_mode(mode));
+            }
+            return hint;
+        }
+        let mut hint = format!(
+            "to allow {} of them in scripts, {}; no permissions.allow rule covers the other {uncovered}",
+            calls - uncovered,
+            add_rules(&rules)
+        );
+        if let Some(mode) = mode {
+            hint.push_str(&format!(
+                "; only in a disposable environment, re-run with --permission-mode {} to allow them all",
+                mode.as_str()
+            ));
+        }
+        hint
     }
 
     /// Why the run stopped early, or `None` when it did not.
     pub(crate) fn stop_message(&self) -> Option<String> {
         self.stopped.then(|| {
             format!(
-                "stopped: {} tool calls were denied in a non-interactive run ({}); to allow them in scripts, {}",
+                "stopped: {} tool calls were denied in a non-interactive run ({}); {}",
                 self.denied.len(),
                 tool_counts(&self.denied_tools()),
                 self.allow_hint(),
@@ -310,12 +352,17 @@ impl Shortfall {
         let mut parts = Vec::new();
         if !self.denied.is_empty() && !self.stopped {
             let calls = self.denied.len();
-            let them = if calls == 1 { "it" } else { "them" };
+            let hint = self.allow_hint();
+            let mut first = hint.chars();
+            let hint = first
+                .next()
+                .map(|letter| letter.to_uppercase().chain(first).collect::<String>())
+                .unwrap_or_default();
             parts.push(format!(
-                "{calls} tool call{} denied because nobody could approve {them} ({}). To allow {them} in scripts, {}.",
+                "{calls} tool call{} denied because nobody could approve {} ({}). {hint}.",
                 if calls == 1 { " was" } else { "s were" },
+                if calls == 1 { "it" } else { "them" },
                 tool_counts(&self.denied_tools()),
-                self.allow_hint(),
             ));
         }
         if self.unanswered > 0 {
@@ -336,6 +383,7 @@ impl Shortfall {
                 "type": "error",
                 "error": error,
                 "denied_tools": self.denied_tools(),
+                "allow_rules": self.allow_rules(),
                 "unanswered_questions": self.unanswered,
             }));
         }
@@ -344,6 +392,7 @@ impl Shortfall {
             "type": "warning",
             "warning": message,
             "denied_tools": self.denied_tools(),
+            "allow_rules": self.allow_rules(),
             "unanswered_questions": self.unanswered,
         }))
     }
@@ -542,57 +591,86 @@ mod tests {
         denial_for_model, read_piped, Denial, DenialLog, PipedStdin, Shortfall, DENIAL_LIMIT,
         DENIED_EXIT_CODE, STDIN_WAIT,
     };
-    use runtime::{PermissionMode, PermissionRequest};
+    use runtime::{
+        PermissionMode, PermissionOutcome, PermissionPolicy, PermissionPromptDecision,
+        PermissionPrompter, PermissionRequest, RuntimePermissionRuleConfig, SessionApprovals,
+    };
     use std::io::{self, Cursor, Read};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    /// A call that needs `required_mode`, denied in workspace-write mode.
-    fn denied(
-        tool_name: &str,
-        input: &str,
-        session_prefixes: &[&str],
-        required_mode: PermissionMode,
-    ) -> Denial {
-        let request = PermissionRequest {
-            tool_name: tool_name.to_string(),
-            input: input.to_string(),
-            current_mode: PermissionMode::WorkspaceWrite,
-            required_mode,
-            reason: None,
-            session_prefixes: session_prefixes.iter().map(ToString::to_string).collect(),
-        };
-        Denial::of(&request, PermissionMode::WorkspaceWrite)
+    /// Answers like a script: nobody approves, so it denies, keeping the request.
+    #[derive(Default)]
+    struct Nobody(Option<PermissionRequest>);
+
+    impl PermissionPrompter for Nobody {
+        fn decide(&mut self, request: &PermissionRequest) -> PermissionPromptDecision {
+            self.0 = Some(request.clone());
+            PermissionPromptDecision::Deny {
+                reason: "nobody".to_string(),
+            }
+        }
     }
 
-    fn denied_command(tool_name: &str, command: &str, session_prefixes: &[&str]) -> Denial {
-        denied(
-            tool_name,
-            &serde_json::json!({ "command": command }).to_string(),
-            session_prefixes,
-            PermissionMode::DangerFullAccess,
-        )
+    /// The policy of a script run in workspace-write mode, with `allow` and `ask` rules in
+    /// user settings; `bash` reads its command as POSIX `sh` on every platform.
+    fn policy(allow: &[String], ask: &[&str]) -> PermissionPolicy {
+        PermissionPolicy::new(PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("bash", PermissionMode::ReadOnly)
+            .with_tool_requirement("PowerShell", PermissionMode::ReadOnly)
+            .with_tool_requirement("WebSearch", PermissionMode::ReadOnly)
+            .with_tool_requirement("write_file", PermissionMode::WorkspaceWrite)
+            .with_shell_dialect(runtime::bash_validation::ShellDialect::Posix)
+            .with_workspace_root(std::env::temp_dir())
+            .with_session_approvals(SessionApprovals::isolated())
+            .with_permission_rules(&RuntimePermissionRuleConfig::new(
+                allow.to_vec(),
+                Vec::new(),
+                ask.iter().map(ToString::to_string).collect(),
+            ))
+    }
+
+    /// The denial a script gets for this call: the policy asks, nobody answers.
+    fn denied_with(policy: &PermissionPolicy, tool_name: &str, input: &str) -> Denial {
+        let mut nobody = Nobody::default();
+        let outcome = policy.authorize(tool_name, input, Some(&mut nobody));
+        assert!(
+            matches!(outcome, PermissionOutcome::Deny { .. }),
+            "{tool_name} {input} must ask: {outcome:?}"
+        );
+        Denial::of(&nobody.0.expect("the policy asked"))
+    }
+
+    fn denied(tool_name: &str, input: &str) -> Denial {
+        denied_with(&policy(&[], &[]), tool_name, input)
+    }
+
+    fn command(command: &str) -> String {
+        serde_json::json!({ "command": command }).to_string()
+    }
+
+    fn denied_command(tool_name: &str, line: &str) -> Denial {
+        denied(tool_name, &command(line))
     }
 
     #[test]
     fn a_denial_says_what_would_let_the_tool_run() {
-        let reason = denied_command("bash", "npm test", &["npm test"]).reason();
+        let reason = denied_command("bash", "npm test").reason();
         assert_eq!(
             reason,
             "tool 'bash' was not run: nobody could approve it in a non-interactive run. To allow it in scripts, add \"bash(npm:*)\" to permissions.allow in your user settings (~/.neuron/settings.json), or, only in a disposable environment, re-run with --permission-mode danger-full-access"
         );
-        // An ask rule or a hook asked for approval: the mode is not the reason.
-        let reason = denied(
+        // An ask rule asked: neither an allow rule nor a mode skips it, so neither is
+        // offered, and the reason says what asked.
+        let reason = denied_with(
+            &policy(&[], &["write_file"]),
             "write_file",
-            r#"{"path":"notes.md"}"#,
-            &[],
-            PermissionMode::ReadOnly,
+            r#"{"path":"notes.md","content":"x"}"#,
         )
         .reason();
-        assert!(!reason.contains("--permission-mode"), "{reason}");
-        assert!(
-            reason.contains("add \"write_file\" to permissions.allow"),
-            "{reason}"
+        assert_eq!(
+            reason,
+            "tool 'write_file' was not run: nobody could approve it in a non-interactive run (tool 'write_file' requires approval due to ask rule 'write_file')"
         );
     }
 
@@ -600,13 +678,7 @@ mod tests {
     /// --permission-mode danger-full-access" first, and the model repeated it.
     #[test]
     fn a_denied_web_search_names_the_allow_rule_before_full_access() {
-        let reason = denied(
-            "WebSearch",
-            r#"{"query":"latest node lts"}"#,
-            &["WebSearch"],
-            PermissionMode::DangerFullAccess,
-        )
-        .reason();
+        let reason = denied("WebSearch", r#"{"query":"latest node lts"}"#).reason();
         let rule = reason.find("\"WebSearch\"").expect(&reason);
         let full_access = reason.find("danger-full-access").expect(&reason);
         assert!(rule < full_access, "{reason}");
@@ -616,46 +688,156 @@ mod tests {
         );
     }
 
-    /// A shell rule names the program (`bash(npm:*)` covers `npm test` and `npm run
-    /// build`), one per program the command needs approval for.
+    /// A shell rule names the program: `bash(npm:*)` covers `npm test` and `npm run
+    /// build`.
     #[test]
     fn a_denied_command_names_a_rule_for_its_program() {
-        let npm = denied_command("bash", "npm test", &["npm test"]);
+        let npm = denied_command("bash", "npm test").reason();
         assert!(
-            npm.reason()
-                .contains("add \"bash(npm:*)\" to permissions.allow"),
-            "{}",
-            npm.reason()
+            npm.contains("add \"bash(npm:*)\" to permissions.allow"),
+            "{npm}"
         );
-        let powershell = denied_command("PowerShell", "npm run build", &["npm run"]);
+        let powershell = denied_command("PowerShell", "npm run build").reason();
         assert!(
-            powershell.reason().contains("\"PowerShell(npm:*)\""),
-            "{}",
-            powershell.reason()
+            powershell.contains("add \"PowerShell(npm:*)\" to permissions.allow"),
+            "{powershell}"
         );
-        let both = denied_command(
-            "bash",
-            "cargo test && cargo fmt --check && npm run build",
-            &["cargo test", "cargo fmt", "npm run"],
-        );
+    }
+
+    /// The reviewer's probe: every rule a denial names, added to user settings, lets
+    /// that same call run. Compound commands name one rule per program (prefix rules
+    /// count together); a command no prefix rule covers (a redirect that writes a
+    /// file, an environment assignment, a substitution, a script block) names the rule
+    /// for that exact command and says why.
+    #[test]
+    fn every_rule_a_denial_names_lets_the_call_run() {
+        let cases: &[(&str, &str, &[&str], Option<&str>)] = &[
+            ("WebSearch", "", &["WebSearch"], None),
+            ("bash", "npm test", &["bash(npm:*)"], None),
+            (
+                "bash",
+                "cargo test && npm run build",
+                &["bash(cargo:*)", "bash(npm:*)"],
+                None,
+            ),
+            (
+                "bash",
+                "cargo test && cargo fmt --check && npm run build",
+                &["bash(cargo:*)", "bash(npm:*)"],
+                None,
+            ),
+            (
+                "bash",
+                "mkdir build && npm run build",
+                &["bash(mkdir:*)", "bash(npm:*)"],
+                None,
+            ),
+            (
+                "PowerShell",
+                "npm test | Out-File log.txt",
+                &["PowerShell(npm:*)", "PowerShell(out-file:*)"],
+                None,
+            ),
+            (
+                "bash",
+                "CI=true npm test",
+                &["bash(CI=true npm test)"],
+                Some("environment assignment `CI=true`"),
+            ),
+            (
+                "bash",
+                "RUSTFLAGS=-Dwarnings cargo build",
+                &["bash(RUSTFLAGS=-Dwarnings cargo build)"],
+                Some("environment assignment"),
+            ),
+            (
+                "bash",
+                "npm test > out.txt",
+                &["bash(npm test > out.txt)"],
+                Some("output redirection to `out.txt` writes a file"),
+            ),
+            (
+                "bash",
+                "npm run build > build.log 2>&1",
+                &["bash(npm run build > build.log 2>&1)"],
+                Some("build.log"),
+            ),
+            (
+                "bash",
+                "echo hi > notes.txt",
+                &["bash(echo hi > notes.txt)"],
+                Some("notes.txt"),
+            ),
+            (
+                "bash",
+                "echo $(date) > stamp.txt",
+                &[r"bash(echo $\(date\) > stamp.txt)"],
+                Some(""),
+            ),
+            (
+                "PowerShell",
+                "Get-ChildItem | Where-Object { $_.Length -gt 1kb }",
+                &["PowerShell(Get-ChildItem | Where-Object { $_.Length -gt 1kb })"],
+                Some(""),
+            ),
+        ];
+        for (tool, line, rules, why) in cases {
+            let input = if *tool == "WebSearch" {
+                r#"{"query":"latest node lts"}"#.to_string()
+            } else {
+                command(line)
+            };
+            let denial = denied(tool, &input);
+            assert_eq!(denial.remedy.allow_rules, *rules, "{tool} `{line}`");
+            match why {
+                Some(why) => {
+                    let named = denial.remedy.no_prefix_rule.as_deref().unwrap_or_default();
+                    assert!(named.contains(why), "{tool} `{line}`: {named}");
+                    assert!(
+                        denial
+                            .reason()
+                            .contains("To allow this exact command in scripts"),
+                        "{}",
+                        denial.reason()
+                    );
+                }
+                None => assert_eq!(denial.remedy.no_prefix_rule, None, "{tool} `{line}`"),
+            }
+            // In user settings, the named rules let the very same call run.
+            let allowed = policy(&denial.remedy.allow_rules, &[]);
+            assert_eq!(
+                allowed.authorize(tool, &input, None),
+                PermissionOutcome::Allow,
+                "{tool} `{line}` with {rules:?}"
+            );
+        }
+
+        // An exact rule is for that command only.
+        let exact = policy(&["bash(CI=true npm test)".to_string()], &[]);
+        assert!(matches!(
+            exact.authorize("bash", &command("CI=true npm publish"), None),
+            PermissionOutcome::Deny { .. }
+        ));
+    }
+
+    /// A command no prefix rule covers and too long for a rule of its own names no rule:
+    /// only the mode, for a disposable environment.
+    #[test]
+    fn a_command_no_rule_covers_names_none() {
+        let line = format!("npm test -- {} > out.txt", "--verbose ".repeat(20));
+        let denial = denied_command("bash", &line);
+        assert!(denial.remedy.allow_rules.is_empty(), "{denial:?}");
+        let reason = denial.reason();
+        assert!(!reason.contains("add "), "{reason}");
         assert!(
-            both.reason()
-                .contains("add \"bash(cargo:*)\", \"bash(npm:*)\" to permissions.allow"),
-            "{}",
-            both.reason()
-        );
-        // No prefix to approve: the command's first program.
-        let opaque = denied_command("bash", "make release", &[]);
-        assert!(
-            opaque.reason().contains("\"bash(make:*)\""),
-            "{}",
-            opaque.reason()
+            reason.contains("No \"bash(<program>:*)\" rule covers this command (output redirection to `out.txt` writes a file). Only in a disposable environment, re-run with --permission-mode danger-full-access to allow it"),
+            "{reason}"
         );
     }
 
     #[test]
     fn the_model_is_told_the_denied_step_did_not_happen() {
-        let reason = denied_command("bash", "npm test", &["npm test"]).reason();
+        let reason = denied_command("bash", "npm test").reason();
         let for_model = denial_for_model(&reason);
         assert!(for_model.starts_with(&reason), "{for_model}");
         assert!(
@@ -672,14 +854,9 @@ mod tests {
 
         let shortfall = Shortfall {
             denied: vec![
-                denied_command("bash", "npm test", &["npm test"]),
-                denied(
-                    "write_file",
-                    r#"{"path":".git/config"}"#,
-                    &[],
-                    PermissionMode::DangerFullAccess,
-                ),
-                denied_command("bash", "cargo build", &["cargo build"]),
+                denied_command("bash", "npm test"),
+                denied("write_file", r#"{"path":".git/config","content":"x"}"#),
+                denied_command("bash", "cargo build"),
             ],
             unanswered: 3,
             stopped: false,
@@ -693,9 +870,10 @@ mod tests {
             warning.contains("(bash \u{00d7}2, write_file)"),
             "{warning}"
         );
-        // One example rule per denied tool, before the mode, which is a last resort.
+        // Every rule the denials named, so that adding them allows every one of them;
+        // the mode after them, as a last resort.
         assert!(
-            warning.contains("To allow them in scripts, add \"bash(npm:*)\", \"write_file\" to permissions.allow in your user settings (~/.neuron/settings.json), or, only in a disposable environment, re-run with --permission-mode danger-full-access."),
+            warning.contains("To allow them in scripts, add \"bash(npm:*)\", \"write_file\", \"bash(cargo:*)\" to permissions.allow in your user settings (~/.neuron/settings.json), or, only in a disposable environment, re-run with --permission-mode danger-full-access."),
             "{warning}"
         );
         assert!(
@@ -708,6 +886,10 @@ mod tests {
         let json = shortfall.warning_json().expect("json");
         assert_eq!(json["type"], "warning");
         assert_eq!(json["denied_tools"][1], "write_file");
+        assert_eq!(
+            json["allow_rules"],
+            serde_json::json!(["bash(npm:*)", "write_file", "bash(cargo:*)"])
+        );
         assert_eq!(json["unanswered_questions"], 3);
 
         // Questions alone are reported, and the run still succeeds.
@@ -722,6 +904,41 @@ mod tests {
         assert_eq!(questions.exit_code(), None);
     }
 
+    /// The warning does not claim the rules allow a call that no rule covers.
+    #[test]
+    fn the_warning_says_which_denied_calls_no_rule_covers() {
+        let long = format!("npm test -- {} > out.txt", "--verbose ".repeat(20));
+        let mixed = Shortfall {
+            denied: vec![
+                denied_command("bash", "npm test"),
+                denied_command("bash", &long),
+            ],
+            unanswered: 0,
+            stopped: false,
+        };
+        let warning = mixed.warning().expect("a warning");
+        assert!(
+            warning.ends_with("To allow 1 of them in scripts, add \"bash(npm:*)\" to permissions.allow in your user settings (~/.neuron/settings.json); no permissions.allow rule covers the other 1; only in a disposable environment, re-run with --permission-mode danger-full-access to allow them all."),
+            "{warning}"
+        );
+
+        // An ask rule asked: no rule, and no mode either.
+        let asked = Shortfall {
+            denied: vec![denied_with(
+                &policy(&[], &["write_file"]),
+                "write_file",
+                r#"{"path":"notes.md","content":"x"}"#,
+            )],
+            unanswered: 0,
+            stopped: false,
+        };
+        let warning = asked.warning().expect("a warning");
+        assert!(
+            warning.ends_with("(write_file). No permissions.allow rule covers it."),
+            "{warning}"
+        );
+    }
+
     /// The model varied the tool and its arguments, so the repeated-call guard never
     /// fired: the run stops at the limit, once, and only in a one-shot run.
     #[test]
@@ -732,25 +949,20 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, tool)| {
-                log.record(
-                    denied_command(tool, &format!("make step{index}"), &[]),
-                    true,
-                )
+                log.record(denied_command(tool, &format!("make step{index}")), true)
             })
             .collect::<Vec<_>>();
         assert_eq!(DENIAL_LIMIT, 5);
         assert_eq!(stops, vec![false, false, false, false, true]);
         assert!(
-            !log.record(denied_command("bash", "make", &[]), true),
+            !log.record(denied_command("bash", "make"), true),
             "it stops once"
         );
         assert!(log.stopped);
 
         // The REPL is not stopped: the user is there.
         let mut repl = DenialLog::new();
-        assert!(
-            (0..DENIAL_LIMIT * 2).all(|_| !repl.record(denied_command("bash", "make", &[]), false))
-        );
+        assert!((0..DENIAL_LIMIT * 2).all(|_| !repl.record(denied_command("bash", "make"), false)));
         assert!(!repl.stopped);
     }
 
@@ -758,7 +970,7 @@ mod tests {
     fn a_stopped_run_says_why_and_fails_with_the_denial_exit_code() {
         let shortfall = Shortfall {
             denied: ["bash", "PowerShell", "bash", "PowerShell", "bash"]
-                .map(|tool| denied_command(tool, "npm install", &["npm install"]))
+                .map(|tool| denied_command(tool, "npm install"))
                 .to_vec(),
             unanswered: 0,
             stopped: true,
@@ -779,6 +991,10 @@ mod tests {
         assert_eq!(parsed["type"], "error");
         assert_eq!(parsed["error"], message);
         assert_eq!(parsed["denied_tools"].as_array().map(Vec::len), Some(5));
+        assert_eq!(
+            parsed["allow_rules"],
+            serde_json::json!(["bash(npm:*)", "PowerShell(npm:*)"])
+        );
     }
 
     /// A reader that sends nothing and never ends, until the test lets it go.

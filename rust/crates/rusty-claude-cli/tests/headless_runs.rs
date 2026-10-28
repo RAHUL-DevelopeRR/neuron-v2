@@ -3,8 +3,9 @@
 //! - a model that keeps calling tools nobody can approve, varying the command each time
 //!   so the repeated-call guard never fires, is stopped after five denials instead of
 //!   spending iterations and quota;
-//! - a denial names the `permissions.allow` rule that would let the call run before
-//!   full access, and that rule in user settings does let it run;
+//! - a denial names the `permissions.allow` rules that would let the call run before
+//!   full access, and those rules in user settings do let it run, a command that needs
+//!   two programs approved included;
 //! - what stdin carries reaches the model with the prompt, and a pipe that never sends
 //!   anything does not hang the run;
 //! - `neuron --resume SESSION prompt TEXT` sends a saved session another prompt;
@@ -183,6 +184,56 @@ fn the_named_allow_rule_lets_the_call_run_in_a_script() {
     assert_eq!(
         fs::read_to_string(allowed.root.join("denied.txt")).expect("the command ran"),
         "should not run"
+    );
+    allowed.remove();
+}
+
+/// A command that needs two programs approved names a rule for each, and the two
+/// rules together, in user settings, let it run: prefix rules count together.
+#[test]
+fn the_rules_named_for_a_compound_command_let_it_run_together() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+
+    let denied = Workspace::new("compound-named");
+    let output = run(
+        &denied,
+        &server.base_url(),
+        &[],
+        "compound_command_denied",
+        Stdin::Null,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("add \"bash(mkdir:*)\", \"bash(tee:*)\" to permissions.allow"),
+        "{stderr}"
+    );
+    assert!(!denied.root.join("made").exists());
+    denied.remove();
+
+    let allowed = Workspace::new("compound-allowed");
+    fs::write(
+        allowed.config_home.join("settings.json"),
+        r#"{"defaultMcpServers":false,"permissions":{"allow":["bash(mkdir:*)","bash(tee:*)"]}}"#,
+    )
+    .expect("settings");
+    let output = run(
+        &allowed,
+        &server.base_url(),
+        &[],
+        "compound_command_denied",
+        Stdin::Null,
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(!stderr.contains("was not run"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(allowed.root.join("made").join("out.txt")).expect("the command ran"),
+        "both ran"
     );
     allowed.remove();
 }

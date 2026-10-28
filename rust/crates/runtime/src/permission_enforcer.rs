@@ -8,8 +8,7 @@
 
 use crate::bash_validation::{classify_shell_command, ShellDialect};
 use crate::permissions::{
-    PermissionContext, PermissionMode, PermissionOutcome, PermissionPolicy,
-    NON_INTERACTIVE_PERMISSION_HINT,
+    non_interactive_hint, PermissionContext, PermissionMode, PermissionOutcome, PermissionPolicy,
 };
 use serde::{Deserialize, Serialize};
 
@@ -115,7 +114,12 @@ impl PermissionEnforcer {
             );
             if active_mode == PermissionMode::WorkspaceWrite {
                 message.push_str(". ");
-                message.push_str(NON_INTERACTIVE_PERMISSION_HINT);
+                message.push_str(&non_interactive_hint(&self.policy.remedy(
+                    tool_name,
+                    input,
+                    active_mode,
+                    required_mode,
+                )));
             }
             message
         };

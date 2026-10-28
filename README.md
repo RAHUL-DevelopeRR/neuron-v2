@@ -205,8 +205,8 @@ neuron --resume latest prompt "now fix the first failure"
 Launch flags go before `prompt` (or `-p`): everything after it is the prompt, flags
 included. Without a terminal on standard input nobody can approve a tool call, so a
 call that would ask is denied instead, the model is told it did not run, and Neuron
-exits with code 2 after the answer. Each denial names the `permissions.allow` rule
-that would let the call run.
+exits with code 2 after the answer. Each denial names the `permissions.allow` rules
+that would let that call run, when any would, and the last warning lists them all.
 
 Allow what your script needs in your user settings, `~/.neuron/settings.json`. A
 script never gets the trust question, so the workspace's own settings, allow rules
@@ -223,7 +223,11 @@ included, are ignored until you
 ```
 
 `bash(npm:*)` lets a shell command run when every part of it that needs approval is
-an `npm` command (`npm install && npm run build`); `"WebSearch"` allows web searches.
+an `npm` command (`npm install && npm run build`). Rules count together: with
+`bash(cargo:*)` as well, `cargo test && npm run build` runs too. No prefix rule covers
+a command that writes a file through a redirection (`npm test > out.txt`), sets an
+environment variable first (`CI=true npm test`) or uses a substitution; a rule for the
+exact command does (`"bash(npm test > out.txt)"`). `"WebSearch"` allows web searches.
 Use `--permission-mode danger-full-access` only in a disposable environment such as a
 container: it lets every tool call run.
 

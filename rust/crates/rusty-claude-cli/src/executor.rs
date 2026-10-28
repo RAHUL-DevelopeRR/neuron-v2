@@ -39,7 +39,7 @@ impl CliPermissionPrompter {
         &self,
         request: &runtime::PermissionRequest,
     ) -> runtime::PermissionPromptDecision {
-        let denial = crate::headless::Denial::of(request, self.current_mode);
+        let denial = crate::headless::Denial::of(request);
         let reason = denial.reason();
         if crate::headless::record_denial(denial, &reason) {
             if let Some(turn) = &self.turn {
@@ -738,6 +738,7 @@ mod cli_prompter_tests {
             required_mode: PermissionMode::DangerFullAccess,
             reason: Some("Run `mkdir out`?".to_string()),
             session_prefixes: Vec::new(),
+            remedy: runtime::PermissionRemedy::default(),
         }
     }
 
@@ -799,6 +800,7 @@ mod channel_prompter_tests {
             required_mode: PermissionMode::DangerFullAccess,
             reason: None,
             session_prefixes: session_prefixes.iter().map(ToString::to_string).collect(),
+            remedy: runtime::PermissionRemedy::default(),
         }
     }
 

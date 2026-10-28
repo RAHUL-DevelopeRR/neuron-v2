@@ -85,6 +85,41 @@ pub struct PermissionRequest {
     /// the rest of the session (command prefixes such as `cargo test`, or a
     /// web domain). Empty when only a one-time approval is possible.
     pub session_prefixes: Vec<String>,
+    /// What would let this call run with nobody asked, for a run where nobody can be.
+    pub remedy: PermissionRemedy,
+}
+
+/// What would let a call that asks for approval run without asking: settings for a
+/// run nobody can answer (a script, CI).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PermissionRemedy {
+    /// `permissions.allow` rules that, added together, let the call run, checked with
+    /// the same matching [`PermissionPolicy::authorize`] uses. Empty when no allow rule
+    /// does: an ask rule or a hook asked, or nothing short of allowing every call of
+    /// the tool would.
+    pub allow_rules: Vec<String>,
+    /// Why no `tool(program:*)` rule covers this shell command (it writes a file
+    /// through a redirection, sets an environment variable, has a part that cannot be
+    /// checked in advance); `allow_rules` then holds at most a rule for this exact
+    /// command.
+    pub no_prefix_rule: Option<String>,
+    /// The permission mode that lets the call run, when the mode is why it asked; `None`
+    /// when an ask rule or a hook asked, which neither a mode nor an allow rule skips.
+    pub mode: Option<PermissionMode>,
+}
+
+/// The longest command a denial offers an exact `permissions.allow` rule for.
+const EXACT_RULE_MAX_CHARS: usize = 160;
+
+/// `"bash(npm:*)", "WebSearch"`: rules as JSON strings, ready to paste into
+/// `permissions.allow`.
+#[must_use]
+pub fn quote_allow_rules(rules: &[String]) -> String {
+    rules
+        .iter()
+        .map(|rule| serde_json::to_string(rule).unwrap_or_else(|_| format!("\"{rule}\"")))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// User-facing decision returned by a [`PermissionPrompter`].
@@ -112,10 +147,37 @@ pub enum PermissionOutcome {
     Deny { reason: String },
 }
 
-/// Hint appended when escalation is needed but nobody can be asked. It names an
-/// allow rule, which is checked before the mode; full access stays opt-in, and
-/// `--allowedTools` only limits which tools are offered.
+/// Hint appended when escalation is needed but nobody can be asked, in its general
+/// form ([`non_interactive_hint`] names the call's own rules). It names an allow rule,
+/// which is checked before the mode; full access stays opt-in, and `--allowedTools`
+/// only limits which tools are offered.
 pub const NON_INTERACTIVE_PERMISSION_HINT: &str = "No interactive approval is available in this mode, so this call was not run. Report the step as not done and tell the user it can be allowed with a permissions.allow rule in their user settings (for example \"bash(npm:*)\").";
+
+/// What the model is told about a call nobody could approve: that it did not run, and
+/// the allow rules that would let it run ([`PermissionRemedy::allow_rules`]), or that
+/// none would. Never full access: the model passed that on to the user.
+#[must_use]
+pub fn non_interactive_hint(remedy: &PermissionRemedy) -> String {
+    const NOT_RUN: &str = "No interactive approval is available in this mode, so this call was not run. Report the step as not done";
+    let why = remedy
+        .no_prefix_rule
+        .as_deref()
+        .map(|why| format!(" (no prefix rule covers this command: {why})"))
+        .unwrap_or_default();
+    if remedy.allow_rules.is_empty() {
+        format!("{NOT_RUN} and tell the user that no permissions.allow rule covers it{why}.")
+    } else {
+        let what = if remedy.no_prefix_rule.is_some() {
+            "this exact command"
+        } else {
+            "it"
+        };
+        format!(
+            "{NOT_RUN} and tell the user that adding {} to permissions.allow in their user settings would allow {what}{why}.",
+            quote_allow_rules(&remedy.allow_rules)
+        )
+    }
+}
 
 /// Approvals the user granted with "allow for this session".
 ///
@@ -627,8 +689,7 @@ impl PermissionPolicy {
         }
         let required_mode = assessment.required_mode;
         let ask_rule = self.find_matching_rule(&self.ask_rules, RuleKind::Ask, tool_name, input);
-        let allow_rule =
-            self.find_matching_rule(&self.allow_rules, RuleKind::Allow, tool_name, input);
+        let allowed_by_rule = self.allowed_by_rules(&self.allow_rules, tool_name, input);
 
         match context.override_decision() {
             Some(PermissionOverride::Deny) => {
@@ -650,6 +711,7 @@ impl PermissionPolicy {
                     current_mode,
                     &assessment,
                     Some(reason.into()),
+                    PermissionRemedy::default(),
                     prompter,
                 );
             }
@@ -665,10 +727,11 @@ impl PermissionPolicy {
                         current_mode,
                         &assessment,
                         Some(reason.into()),
+                        PermissionRemedy::default(),
                         prompter,
                     );
                 }
-                if allow_rule.is_some()
+                if allowed_by_rule
                     || current_mode == PermissionMode::Allow
                     || current_mode >= required_mode
                 {
@@ -689,13 +752,12 @@ impl PermissionPolicy {
                 current_mode,
                 &assessment,
                 Some(reason.into()),
+                PermissionRemedy::default(),
                 prompter,
             );
         }
 
-        if allow_rule.is_some()
-            || current_mode == PermissionMode::Allow
-            || current_mode >= required_mode
+        if allowed_by_rule || current_mode == PermissionMode::Allow || current_mode >= required_mode
         {
             return PermissionOutcome::Allow;
         }
@@ -715,12 +777,14 @@ impl PermissionPolicy {
                 required_mode,
                 assessment.reason.as_deref(),
             );
+            let remedy = self.remedy(tool_name, input, current_mode, required_mode);
             return self.prompt_or_deny(
                 tool_name,
                 input,
                 current_mode,
                 &assessment,
                 Some(reason),
+                remedy,
                 prompter,
             );
         }
@@ -738,6 +802,7 @@ impl PermissionPolicy {
         PermissionOutcome::Deny { reason }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prompt_or_deny(
         &self,
         tool_name: &str,
@@ -745,6 +810,7 @@ impl PermissionPolicy {
         current_mode: PermissionMode,
         assessment: &ToolCallAssessment,
         reason: Option<ApprovalReason>,
+        remedy: PermissionRemedy,
         mut prompter: Option<&mut dyn PermissionPrompter>,
     ) -> PermissionOutcome {
         let subject = grant_subject(input);
@@ -763,7 +829,7 @@ impl PermissionPolicy {
             );
             let base = base.trim_end_matches('.');
             return PermissionOutcome::Deny {
-                reason: format!("{base}. {NON_INTERACTIVE_PERMISSION_HINT}"),
+                reason: format!("{base}. {}", non_interactive_hint(&remedy)),
             };
         };
         let reason = reason.map(|reason| reason.asked);
@@ -779,6 +845,7 @@ impl PermissionPolicy {
                 .iter()
                 .map(|prefix| render_prefix(prefix))
                 .collect(),
+            remedy,
         };
 
         match prompter.decide(&request) {
@@ -820,7 +887,15 @@ impl PermissionPolicy {
         if rules.is_empty() {
             return None;
         }
-        let classification = (tool_name == "bash" || tool_name == "PowerShell").then(|| {
+        let classification = self.shell_classification(tool_name, input);
+        rules
+            .iter()
+            .find(|rule| rule.matches(tool_name, input, kind, classification.as_ref()))
+    }
+
+    /// How a shell tool's command line is classified; `None` for other tools.
+    fn shell_classification(&self, tool_name: &str, input: &str) -> Option<CommandClassification> {
+        (tool_name == "bash" || tool_name == "PowerShell").then(|| {
             let command = input_field(input, &["command"]).unwrap_or_else(|| input.to_string());
             classify_tool_command(
                 tool_name,
@@ -828,11 +903,127 @@ impl PermissionPolicy {
                 self.dialect(),
                 self.workspace().as_deref(),
             )
-        });
-        rules
-            .iter()
-            .find(|rule| rule.matches(tool_name, input, kind, classification.as_ref()))
+        })
     }
+
+    /// Whether allow `rules` let the call run. One rule may match it whole; for a shell
+    /// command the `tool(program:*)` rules also count together, as session approvals do:
+    /// each part that is not read-only must start with one of them, so `bash(cargo:*)`
+    /// and `bash(npm:*)` allow `cargo test && npm run build`, while `bash(git:*)` alone
+    /// still does not allow `git status; curl ...`.
+    fn allowed_by_rules(&self, rules: &[PermissionRule], tool_name: &str, input: &str) -> bool {
+        if rules.is_empty() {
+            return false;
+        }
+        let classification = self.shell_classification(tool_name, input);
+        if rules
+            .iter()
+            .any(|rule| rule.matches(tool_name, input, RuleKind::Allow, classification.as_ref()))
+        {
+            return true;
+        }
+        let Some(classification) = classification else {
+            return false;
+        };
+        let prefixes = rules
+            .iter()
+            .filter(|rule| rule.tool_name == tool_name)
+            .filter_map(PermissionRule::prefix_words)
+            .collect::<Vec<_>>();
+        !prefixes.is_empty() && classification.covered_by_prefixes(&prefixes)
+    }
+
+    /// What would let a call that asks because it needs `required_mode` run with nobody
+    /// asked ([`PermissionRemedy`]).
+    #[must_use]
+    pub fn remedy(
+        &self,
+        tool_name: &str,
+        input: &str,
+        current_mode: PermissionMode,
+        required_mode: PermissionMode,
+    ) -> PermissionRemedy {
+        let (allow_rules, no_prefix_rule) = self.allow_rules_for(tool_name, input);
+        PermissionRemedy {
+            allow_rules,
+            no_prefix_rule,
+            mode: (required_mode > current_mode && required_mode != PermissionMode::Prompt)
+                .then_some(required_mode),
+        }
+    }
+
+    /// `permissions.allow` rules that, added together, let this call run, each set
+    /// checked with [`Self::allowed_by_rules`] before it is offered; and, for a shell
+    /// command no `tool(program:*)` rule covers, why not. Any tool but a shell gets its
+    /// name (`WebSearch`). A shell command gets one `bash(program:*)` rule per program
+    /// that needs approval; failing that, a rule for the exact command when it is one
+    /// short line; failing that, nothing.
+    fn allow_rules_for(&self, tool_name: &str, input: &str) -> (Vec<String>, Option<String>) {
+        let Some(classification) = self.shell_classification(tool_name, input) else {
+            let rule = tool_name.to_string();
+            let works = self.allowed_by_rules(&[PermissionRule::parse(&rule)], tool_name, input);
+            return (if works { vec![rule] } else { Vec::new() }, None);
+        };
+
+        // The programs of the parts that need approval; when none does (prompt mode, a
+        // stricter requirement from the tool), of every part.
+        let prefixes = classification.approval_prefixes();
+        let programs: Vec<&String> =
+            if prefixes.is_empty() && classification.prefix_blocker().is_none() {
+                classification
+                    .segments
+                    .iter()
+                    .filter_map(|segment| segment.words.first())
+                    .collect()
+            } else {
+                prefixes
+                    .iter()
+                    .filter_map(|prefix| prefix.first())
+                    .collect()
+            };
+        let mut rules: Vec<String> = Vec::new();
+        for program in programs {
+            let rule = format!("{tool_name}({}:*)", escape_rule_content(program));
+            if !rules.contains(&rule) {
+                rules.push(rule);
+            }
+        }
+        let parsed = rules
+            .iter()
+            .map(|rule| PermissionRule::parse(rule))
+            .collect::<Vec<_>>();
+        if !parsed.is_empty()
+            && parsed
+                .iter()
+                .all(|rule| matches!(rule.matcher, PermissionRuleMatcher::Prefix(_)))
+            && self.allowed_by_rules(&parsed, tool_name, input)
+        {
+            return (rules, None);
+        }
+
+        let why = classification
+            .prefix_blocker()
+            .unwrap_or_else(|| "its program cannot be named in a prefix rule".to_string());
+        let command = input_field(input, &["command"]).unwrap_or_else(|| input.to_string());
+        if command.chars().count() <= EXACT_RULE_MAX_CHARS && !command.contains(['\n', '\r']) {
+            let rule = format!("{tool_name}({})", escape_rule_content(&command));
+            let parsed = PermissionRule::parse(&rule);
+            if matches!(parsed.matcher, PermissionRuleMatcher::Exact(_))
+                && self.allowed_by_rules(std::slice::from_ref(&parsed), tool_name, input)
+            {
+                return (vec![rule], Some(why));
+            }
+        }
+        (Vec::new(), Some(why))
+    }
+}
+
+/// Escapes rule content so that [`PermissionRule::parse`] reads it back as written.
+fn escape_rule_content(content: &str) -> String {
+    content
+        .replace('\\', r"\\")
+        .replace('(', r"\(")
+        .replace(')', r"\)")
 }
 
 fn classify_tool_command(
@@ -1002,10 +1193,11 @@ impl<R: BufRead, W: Write> PermissionPrompter for ConsolePermissionPrompter<R, W
         if !self.interactive {
             return PermissionPromptDecision::Deny {
                 reason: format!(
-                    "tool '{}' needs {} permission (current mode: {}). {NON_INTERACTIVE_PERMISSION_HINT}",
+                    "tool '{}' needs {} permission (current mode: {}). {}",
                     request.tool_name,
                     request.required_mode.as_str(),
-                    request.current_mode.as_str()
+                    request.current_mode.as_str(),
+                    non_interactive_hint(&request.remedy)
                 ),
             };
         }
@@ -1116,10 +1308,24 @@ impl PermissionRule {
         }
     }
 
+    /// The words of a `tool(prefix:*)` rule's prefix (`["git"]`); `None` for other rules.
+    fn prefix_words(&self) -> Option<Vec<String>> {
+        match &self.matcher {
+            PermissionRuleMatcher::Prefix(prefix) => Some(
+                prefix
+                    .split_whitespace()
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        }
+    }
+
     /// Matches a call. For shell tools, prefix rules are applied per simple
     /// command: an allow rule must cover every segment that is not
     /// read-only (so `bash(git:*)` does not allow `git status; curl ...`),
-    /// while deny/ask rules trigger when any segment matches.
+    /// while deny/ask rules trigger when any segment matches. Allow rules for
+    /// a shell also count together ([`PermissionPolicy::allowed_by_rules`]).
     fn matches(
         &self,
         tool_name: &str,
@@ -1242,7 +1448,7 @@ mod tests {
         escalation_reason, parse_permission_response, render_permission_prompt, url_host,
         ConsolePermissionPrompter, PermissionContext, PermissionMode, PermissionOutcome,
         PermissionOverride, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
-        PermissionRequest, SessionApprovals, NON_INTERACTIVE_PERMISSION_HINT,
+        PermissionRemedy, PermissionRequest, SessionApprovals, NON_INTERACTIVE_PERMISSION_HINT,
     };
     use crate::bash_validation::ShellDialect;
     use crate::config::RuntimePermissionRuleConfig;
@@ -1726,8 +1932,11 @@ mod tests {
         let PermissionOutcome::Deny { reason } = outcome else {
             panic!("expected denial");
         };
-        assert!(reason.contains("permissions.allow"), "{reason}");
-        assert!(reason.contains("Report the step as not done"), "{reason}");
+        // The call's own rule, which the policy checked lets it run.
+        assert!(
+            reason.contains("Report the step as not done and tell the user that adding \"bash(npm:*)\" to permissions.allow in their user settings would allow it."),
+            "{reason}"
+        );
         assert!(!reason.contains("danger-full-access"), "{reason}");
         assert!(!reason.contains("--allowedTools"), "{reason}");
         assert!(
@@ -1735,6 +1944,136 @@ mod tests {
             "{NON_INTERACTIVE_PERMISSION_HINT}"
         );
         assert!(NON_INTERACTIVE_PERMISSION_HINT.contains("\"bash(npm:*)\""));
+    }
+
+    /// A command no prefix rule covers: the model is told the exact-command rule and
+    /// why, never a `bash(program:*)` rule that would not let it run, nor full access.
+    #[test]
+    fn the_model_hint_names_no_prefix_rule_a_command_escapes() {
+        let policy = workspace_policy(PermissionMode::WorkspaceWrite)
+            .with_shell_dialect(ShellDialect::Posix);
+        let PermissionOutcome::Deny { reason } =
+            policy.authorize("bash", &bash_input("npm test > out.txt"), None)
+        else {
+            panic!("expected denial");
+        };
+        assert!(
+            reason.ends_with("tell the user that adding \"bash(npm test > out.txt)\" to permissions.allow in their user settings would allow this exact command (no prefix rule covers this command: output redirection to `out.txt` writes a file)."),
+            "{reason}"
+        );
+        assert!(!reason.contains("bash(npm:*)"), "{reason}");
+        assert!(!reason.contains("danger-full-access"), "{reason}");
+
+        // Too long for a rule of its own: no rule at all.
+        let long = format!("npm test {} > out.txt", "--verbose ".repeat(20));
+        let PermissionOutcome::Deny { reason } = policy.authorize("bash", &bash_input(&long), None)
+        else {
+            panic!("expected denial");
+        };
+        assert!(
+            reason.contains("tell the user that no permissions.allow rule covers it (no prefix rule covers this command: output redirection to `out.txt` writes a file)."),
+            "{reason}"
+        );
+    }
+
+    /// Prefix allow rules count together, as session approvals do: each part that
+    /// needs approval must start with one of them.
+    #[test]
+    fn shell_allow_rules_count_together() {
+        let rules = RuntimePermissionRuleConfig::new(
+            vec![
+                "bash(cargo:*)".to_string(),
+                "bash(npm:*)".to_string(),
+                "PowerShell(npm:*)".to_string(),
+                "PowerShell(Out-File:*)".to_string(),
+            ],
+            vec!["bash(npm publish:*)".to_string()],
+            Vec::new(),
+        );
+        let policy = workspace_policy(PermissionMode::WorkspaceWrite)
+            .with_shell_dialect(ShellDialect::Posix)
+            .with_permission_rules(&rules);
+
+        for command in [
+            "cargo test && npm run build",
+            "cargo fmt --check; npm test",
+            "npm ci || cargo build",
+        ] {
+            assert_eq!(
+                policy.authorize("bash", &bash_input(command), None),
+                PermissionOutcome::Allow,
+                "{command}"
+            );
+        }
+        let powershell =
+            serde_json::json!({ "command": "npm test | Out-File log.txt" }).to_string();
+        assert_eq!(
+            policy.authorize("PowerShell", &powershell, None),
+            PermissionOutcome::Allow
+        );
+        // A part no rule covers still asks; a deny rule still wins.
+        for command in [
+            "cargo test && rm -rf target",
+            "npm test > out.txt",
+            "CI=true npm test",
+        ] {
+            assert!(
+                matches!(
+                    policy.authorize("bash", &bash_input(command), None),
+                    PermissionOutcome::Deny { .. }
+                ),
+                "{command}"
+            );
+        }
+        assert!(matches!(
+            policy.authorize("bash", &bash_input("cargo build && npm publish"), None),
+            PermissionOutcome::Deny { reason } if reason.contains("denied by rule")
+        ));
+        // Only prefix rules of the same tool count.
+        let other_tool = RuntimePermissionRuleConfig::new(
+            vec!["bash(cargo:*)".to_string(), "PowerShell(npm:*)".to_string()],
+            Vec::new(),
+            Vec::new(),
+        );
+        let policy = workspace_policy(PermissionMode::WorkspaceWrite)
+            .with_shell_dialect(ShellDialect::Posix)
+            .with_permission_rules(&other_tool);
+        assert!(matches!(
+            policy.authorize("bash", &bash_input("cargo test && npm run build"), None),
+            PermissionOutcome::Deny { .. }
+        ));
+    }
+
+    /// An ask rule asked: no allow rule or mode skips it, so the remedy names none.
+    #[test]
+    fn an_ask_rule_leaves_nothing_to_allow() {
+        let rules = RuntimePermissionRuleConfig::new(
+            Vec::new(),
+            Vec::new(),
+            vec!["bash(git push:*)".to_string()],
+        );
+        let policy = workspace_policy(PermissionMode::WorkspaceWrite)
+            .with_shell_dialect(ShellDialect::Posix)
+            .with_permission_rules(&rules);
+        let mut prompter = RecordingPrompter {
+            seen: Vec::new(),
+            allow: false,
+        };
+        let _ = policy.authorize("bash", &bash_input("git push"), Some(&mut prompter));
+        assert_eq!(prompter.seen[0].remedy, PermissionRemedy::default());
+
+        // A call the mode is why it asked names both.
+        let _ = workspace_policy(PermissionMode::WorkspaceWrite)
+            .with_shell_dialect(ShellDialect::Posix)
+            .authorize("bash", &bash_input("git push"), Some(&mut prompter));
+        assert_eq!(
+            prompter.seen[1].remedy,
+            PermissionRemedy {
+                allow_rules: vec!["bash(git:*)".to_string()],
+                no_prefix_rule: None,
+                mode: Some(PermissionMode::DangerFullAccess),
+            }
+        );
     }
 
     #[test]
@@ -1954,6 +2293,11 @@ mod tests {
             required_mode: PermissionMode::DangerFullAccess,
             reason: Some("`cargo` is not a known read-only command".to_string()),
             session_prefixes: vec!["cargo test".to_string()],
+            remedy: PermissionRemedy {
+                allow_rules: vec!["bash(cargo:*)".to_string()],
+                no_prefix_rule: None,
+                mode: Some(PermissionMode::DangerFullAccess),
+            },
         };
         let rendered = render_permission_prompt(&request);
         assert!(rendered.contains("[a] allow `cargo test` for this session"));
@@ -1979,7 +2323,10 @@ mod tests {
         let PermissionPromptDecision::Deny { reason } = headless.decide(&request) else {
             panic!("non-interactive prompter must deny");
         };
-        assert!(reason.contains("permissions.allow"), "{reason}");
+        assert!(
+            reason.contains("adding \"bash(cargo:*)\" to permissions.allow"),
+            "{reason}"
+        );
         assert!(
             !reason.contains("--permission-mode") && !reason.contains("--allowedTools"),
             "{reason}"
