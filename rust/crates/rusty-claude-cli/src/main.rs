@@ -432,7 +432,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             launch,
             compact,
         } => {
-            // Resolved before the run starts its own session, which would be the latest.
+            // Checked here as `--resume` checks it; the run opens it again under its lock.
             let (handle, session) = restore_session_or_exit(&session_path, output_format);
             let options = repl_loop::resume_launch(
                 launch,
@@ -536,7 +536,8 @@ Use `neuron prompt \"...\"` or pipe a prompt; start `neuron` in a terminal for a
 
 /// `neuron prompt TEXT`: one turn, then exit. With `options.resume`
 /// (`neuron --resume SESSION prompt TEXT`) the turn continues that saved session and
-/// is saved to it.
+/// is saved to it; the session is held from before it is read until the run ends, so
+/// another run continuing it is refused rather than overwritten.
 fn run_prompt(
     prompt: &str,
     options: repl_loop::ReplLaunch,
@@ -570,16 +571,29 @@ fn run_prompt(
     // it takes nothing from them. `echo 'hello' | neuron -p`: stdin is the prompt.
     let stdin_context = headless::stdin_context(!prompt.trim().is_empty(), output_format);
     let effective_prompt = merge_prompt_with_stdin(prompt, stdin_context.as_deref());
-    let mut cli = LiveCli::new(
-        effective_model,
-        true,
-        options.allowed_tools,
-        permission_mode,
-    )?;
-    if let Some(reference) = options.resume {
-        // Without the restore report: stdout carries the answer only.
-        repl_loop::continue_saved_session_quietly(&mut cli, &reference)?;
+    if effective_prompt.trim().is_empty() {
+        return Err(UsageError(
+            "no prompt: nothing followed -p and standard input brought nothing. Put the \
+prompt after -p, or pipe it: `echo \"...\" | neuron -p`."
+                .to_string(),
+        )
+        .into());
     }
+    let mut cli = match options.resume {
+        Some(reference) => LiveCli::resuming(
+            effective_model,
+            true,
+            options.allowed_tools,
+            permission_mode,
+            open_session_reference(&reference)?,
+        )?,
+        None => LiveCli::new(
+            effective_model,
+            true,
+            options.allowed_tools,
+            permission_mode,
+        )?,
+    };
     cli.set_reasoning_effort(options.reasoning_effort);
     // Nobody to answer (stdin not a terminal): approvals and questions are refused.
     headless::start(headless::stdin_is_unattended(), output_format);
@@ -870,6 +884,35 @@ fn resume_session(
     }
 
     let mut session = session;
+    // /compact and /clear rewrite the session: under its lock, read again, so a run
+    // continuing it meanwhile is refused rather than overwritten.
+    let _lock = if commands
+        .iter()
+        .any(|command| resume_command_rewrites(command))
+    {
+        match open_session_reference(&resolved_path.display().to_string()) {
+            Ok(opened) => {
+                session = opened.session;
+                Some(opened.lock)
+            }
+            Err(error) => {
+                if output_format == CliOutputFormat::Json {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "type": "error",
+                            "error": format!("failed to restore session: {error}"),
+                        })
+                    );
+                } else {
+                    eprintln!("failed to restore session: {error}");
+                }
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
     for raw_command in commands {
         // Intercept spec commands that have no parse arm before calling
         // SlashCommand::parse — they return Err(SlashCommandParseError) which
@@ -982,6 +1025,16 @@ fn resume_session(
             }
         }
     }
+}
+
+/// Whether resume command `raw_command` rewrites the session file.
+fn resume_command_rewrites(raw_command: &str) -> bool {
+    matches!(
+        SlashCommand::parse(raw_command),
+        Ok(Some(
+            SlashCommand::Compact | SlashCommand::Clear { confirm: true }
+        ))
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -1651,6 +1704,8 @@ struct LiveCli {
     system_prompt: Vec<String>,
     runtime: BuiltRuntime,
     session: SessionHandle,
+    /// Held while `session` is this CLI's, so no other run writes it meanwhile.
+    session_lock: SessionLock,
     prompt_history: Vec<PromptHistoryEntry>,
 }
 
@@ -2491,12 +2546,54 @@ impl LiveCli {
         permission_mode: PermissionMode,
         output: TurnOutput,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let cli = Self::on_session(
+            model,
+            enable_tools,
+            allowed_tools,
+            permission_mode,
+            output,
+            new_open_session()?,
+        )?;
+        cli.persist_session()?;
+        Ok(cli)
+    }
+
+    /// [`Self::new`] continuing a saved session opened with [`open_session_reference`]:
+    /// no session file of its own is made, so none is left behind.
+    fn resuming(
+        model: String,
+        enable_tools: bool,
+        allowed_tools: Option<AllowedToolSet>,
+        permission_mode: PermissionMode,
+        saved: OpenSession,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::on_session(
+            model,
+            enable_tools,
+            allowed_tools,
+            permission_mode,
+            TurnOutput::Ansi,
+            saved,
+        )
+    }
+
+    fn on_session(
+        model: String,
+        enable_tools: bool,
+        allowed_tools: Option<AllowedToolSet>,
+        permission_mode: PermissionMode,
+        output: TurnOutput,
+        opened: OpenSession,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt()?;
-        let session_state = new_cli_session()?;
-        let session = create_managed_session_handle(&session_state.session_id)?;
+        let OpenSession {
+            handle,
+            session,
+            lock,
+        } = opened;
         let runtime = build_runtime(
-            session_state.with_persistence_path(session.path.clone()),
-            &session.id,
+            session,
+            &handle.id,
             model.clone(),
             system_prompt.clone(),
             enable_tools,
@@ -2505,7 +2602,7 @@ impl LiveCli {
             permission_mode,
             None,
         )?;
-        let cli = Self {
+        Ok(Self {
             model,
             allowed_tools,
             permission_mode,
@@ -2514,11 +2611,10 @@ impl LiveCli {
             orchestration_mode: None,
             system_prompt,
             runtime,
-            session,
+            session: handle,
+            session_lock: lock,
             prompt_history: Vec::new(),
-        };
-        cli.persist_session()?;
-        Ok(cli)
+        })
     }
 
     fn set_reasoning_effort(&mut self, effort: Option<String>) {
@@ -3012,10 +3108,10 @@ impl LiveCli {
                 // What the turn did before it failed: a script must not mistake a
                 // failed run that already ran tools for one that did nothing.
                 let messages = self.runtime.session().messages.get(before..).unwrap_or(&[]);
-                println!(
-                    "{}",
-                    failed_turn_json(&error.to_string(), shown_model(&self.model), messages)
-                );
+                let mut answer =
+                    failed_turn_json(&error.to_string(), shown_model(&self.model), messages);
+                answer["session_id"] = json!(self.session.id);
+                println!("{answer}");
                 return Err(error);
             }
         };
@@ -3023,10 +3119,9 @@ impl LiveCli {
             // Stopped at the denial limit: an error answer, with what the turn did. The
             // exit code and the stderr line come from `headless::report`.
             let messages = self.runtime.session().messages.get(before..).unwrap_or(&[]);
-            println!(
-                "{}",
-                failed_turn_json(&stop, shown_model(&self.model), messages)
-            );
+            let mut answer = failed_turn_json(&stop, shown_model(&self.model), messages);
+            answer["session_id"] = json!(self.session.id);
+            println!("{answer}");
             return Ok(());
         }
         println!(
@@ -3034,6 +3129,8 @@ impl LiveCli {
             json!({
                 "message": final_assistant_text(&summary),
                 "model": shown_model(&self.model),
+                // What `--resume` takes to continue this session.
+                "session_id": self.session.id,
                 "iterations": summary.iterations,
                 "outcome": repl_loop::turn_outcome_label(&summary.outcome),
                 "stop_reason": summary.stop_reason,
@@ -3553,10 +3650,15 @@ impl LiveCli {
         }
 
         let previous_session = self.session.clone();
-        let session_state = new_cli_session()?;
-        self.session = create_managed_session_handle(&session_state.session_id)?;
+        let OpenSession {
+            handle,
+            session,
+            lock,
+        } = new_open_session()?;
+        self.session = handle;
+        self.session_lock = lock;
         let runtime = build_runtime(
-            session_state.with_persistence_path(self.session.path.clone()),
+            session,
             &self.session.id,
             self.model.clone(),
             self.system_prompt.clone(),
@@ -3610,12 +3712,18 @@ impl LiveCli {
     }
 
     /// Continues the saved session `session_ref` from here on, saying nothing; returns
-    /// how many messages it holds.
+    /// how many messages it holds. One another run holds is refused.
     fn switch_session(&mut self, session_ref: &str) -> Result<usize, Box<dyn std::error::Error>> {
-        let (handle, session) = load_session_reference(session_ref)?;
+        let (handle, session, lock) = self.open_saved_session(session_ref)?;
         let message_count = session.messages.len();
         let session_id = session.session_id.clone();
-        let runtime = build_runtime(
+        // The effort the run asked for goes on, whatever session it continues.
+        let reasoning_effort = self
+            .runtime
+            .api_client()
+            .reasoning_effort()
+            .map(ToOwned::to_owned);
+        let mut runtime = build_runtime(
             session,
             &handle.id,
             self.model.clone(),
@@ -3626,12 +3734,61 @@ impl LiveCli {
             self.permission_mode,
             None,
         )?;
+        runtime
+            .api_client_mut()
+            .set_reasoning_effort(reasoning_effort);
         self.replace_runtime(runtime)?;
-        self.session = SessionHandle {
-            id: session_id,
-            path: handle.path,
-        };
+        self.adopt_session(
+            SessionHandle {
+                id: session_id,
+                path: handle.path,
+            },
+            lock,
+        );
         Ok(message_count)
+    }
+
+    /// Loads saved session `session_ref` for this CLI to continue: locked before it is
+    /// read ([`open_session_reference`]), or, when it is this CLI's own session, under the
+    /// lock the CLI already holds (no new lock).
+    fn open_saved_session(
+        &self,
+        session_ref: &str,
+    ) -> Result<(SessionHandle, Session, Option<SessionLock>), Box<dyn std::error::Error>> {
+        let resolved = resolve_session_reference(session_ref)?;
+        let reference = resolved.path.display().to_string();
+        if same_session_file(&resolved.path, &self.session.path) {
+            let (handle, session) = load_session_reference(&reference)?;
+            return Ok((handle, session, None));
+        }
+        let opened = open_session_reference(&reference)?;
+        Ok((opened.handle, opened.session, Some(opened.lock)))
+    }
+
+    /// Makes `handle` this CLI's session, holding `lock` (from
+    /// [`Self::open_saved_session`]) instead of the previous session's.
+    fn adopt_session(&mut self, handle: SessionHandle, lock: Option<SessionLock>) {
+        self.session = handle;
+        if let Some(lock) = lock {
+            self.session_lock = lock;
+        }
+    }
+
+    /// Ends a CLI that stops before its session was used: an empty session file goes,
+    /// with its lock file, so the run leaves nothing behind.
+    fn discard_unused_session(self) {
+        let Self {
+            runtime,
+            session,
+            session_lock,
+            ..
+        } = self;
+        let unused = runtime.session().messages.is_empty();
+        drop(runtime);
+        if unused {
+            let _ = fs::remove_file(&session.path);
+            session_lock.remove();
+        }
     }
 
     fn print_config(section: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
@@ -3760,25 +3917,7 @@ impl LiveCli {
                     println!("Usage: /session switch <session-id>");
                     return Ok(false);
                 };
-                let (handle, session) = load_session_reference(target)?;
-                let message_count = session.messages.len();
-                let session_id = session.session_id.clone();
-                let runtime = build_runtime(
-                    session,
-                    &handle.id,
-                    self.model.clone(),
-                    self.system_prompt.clone(),
-                    true,
-                    true,
-                    self.allowed_tools.clone(),
-                    self.permission_mode,
-                    None,
-                )?;
-                self.replace_runtime(runtime)?;
-                self.session = SessionHandle {
-                    id: session_id,
-                    path: handle.path,
-                };
+                let message_count = self.switch_session(target)?;
                 println!(
                     "Session switched\n  Active session   {}\n  File             {}\n  Messages         {}",
                     self.session.id,
@@ -3791,6 +3930,7 @@ impl LiveCli {
                 let forked = self.runtime.fork_session(target.map(ToOwned::to_owned));
                 let parent_session_id = self.session.id.clone();
                 let handle = create_managed_session_handle(&forked.session_id)?;
+                let lock = SessionLock::acquire(&handle.path)?;
                 let branch_name = forked
                     .fork
                     .as_ref()
@@ -3810,7 +3950,7 @@ impl LiveCli {
                     None,
                 )?;
                 self.replace_runtime(runtime)?;
-                self.session = handle;
+                self.adopt_session(handle, Some(lock));
                 println!(
                     "Session forked\n  Parent session   {}\n  Active session   {}\n  Branch           {}\n  File             {}\n  Messages         {}",
                     parent_session_id,
@@ -4914,7 +5054,7 @@ mod tests {
         write_mcp_server_fixture, BackgroundMcp, BackgroundMcpOutcome, BackgroundMcpShared,
         CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        McpStartup, PromptHistoryEntry, RuntimeMcpState, SlashCommand, StatusUsage,
+        McpStartup, PromptHistoryEntry, RuntimeMcpState, SessionLock, SlashCommand, StatusUsage,
         BACKGROUND_MCP_STOP_WAIT, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
@@ -7027,6 +7167,70 @@ mod tests {
             banner.contains("claude-sonnet-4-6-with-a-very-lon..."),
             "{banner}"
         );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+        fs::remove_dir_all(config_home).expect("cleanup config home");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("NEURON_CONFIG_HOME");
+    }
+
+    /// `/resume` (and `neuron --resume` in the REPL): a CLI continues its own session,
+    /// but not one another CLI holds, until that one lets go; the reasoning effort the
+    /// run asked for goes on with the session it switches to.
+    #[test]
+    fn a_cli_continues_a_session_only_while_no_other_holds_it() {
+        let _guard = env_lock();
+        std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-session-locks");
+        let root = temp_dir();
+        let config_home = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{"defaultMcpServers":false}"#,
+        )
+        .expect("settings should disable default MCP servers");
+        std::env::set_var("NEURON_CONFIG_HOME", &config_home);
+
+        with_current_dir(&root, || {
+            let new_cli = || {
+                LiveCli::new(
+                    "claude-sonnet-4-6".to_string(),
+                    true,
+                    None,
+                    PermissionMode::ReadOnly,
+                )
+                .expect("cli should initialize")
+            };
+            let mut first = new_cli();
+            let mut second = new_cli();
+            let first_session = first.session.path.display().to_string();
+            let second_session = second.session.path.clone();
+
+            first.set_reasoning_effort(Some("high".to_string()));
+            first
+                .switch_session(&first_session)
+                .expect("a CLI continues its own session");
+            assert_eq!(first.runtime.api_client().reasoning_effort(), Some("high"));
+
+            let error = second
+                .switch_session(&first_session)
+                .expect_err("the first CLI holds its session");
+            assert!(
+                error
+                    .to_string()
+                    .contains("is in use by another neuron run"),
+                "{error}"
+            );
+            assert_eq!(second.session.path, second_session);
+
+            drop(first);
+            second
+                .switch_session(&first_session)
+                .expect("free once the first CLI is gone");
+            // The session it left is free for another run.
+            drop(SessionLock::acquire(&second_session).expect("released"));
+        });
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
         fs::remove_dir_all(config_home).expect("cleanup config home");

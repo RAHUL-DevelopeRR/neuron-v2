@@ -8,7 +8,8 @@
 //!   two programs approved included;
 //! - what stdin carries reaches the model with the prompt, and a pipe that never sends
 //!   anything does not hang the run;
-//! - `neuron --resume SESSION prompt TEXT` sends a saved session another prompt;
+//! - `neuron --resume SESSION prompt TEXT` sends a saved session another prompt; a
+//!   session another run is continuing is refused, so runs at once lose no turn;
 //! - a bare `neuron` with nothing on stdin, piped slash commands and piped `--no-tui`
 //!   input are refused before any request, with or without a byte order mark;
 //! - a slash command Git Bash turned into a path is a slash command again.
@@ -308,9 +309,12 @@ fn a_silent_stdin_pipe_does_not_hang_the_run() {
     workspace.remove();
 }
 
-/// A script continues a saved session: the model sees the earlier turn, the new turn is
-/// saved to the same file, and stdout is the JSON answer alone.
+/// A script continues a saved session: the model sees the earlier turns, each turn is
+/// saved to the same file, and stdout is the JSON answer alone, naming the session so the
+/// script can continue it by id. Without `--model` the session's model goes on; `-p` with
+/// nothing after it takes the prompt from stdin, as `neuron -p` does.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn a_saved_session_takes_another_prompt_without_a_terminal() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
     let server = runtime
@@ -321,7 +325,7 @@ fn a_saved_session_takes_another_prompt_without_a_terminal() {
     let first = run(
         &workspace,
         &server.base_url(),
-        &[],
+        &["--output-format=json"],
         "streaming_text",
         Stdin::Null,
     );
@@ -333,11 +337,18 @@ fn a_saved_session_takes_another_prompt_without_a_terminal() {
     );
     let sessions = session_files(&workspace.root);
     assert_eq!(sessions.len(), 1, "{sessions:?}");
+    let session_id = sessions[0]
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .expect("session id")
+        .to_string();
+    let first_answer: Value = serde_json::from_slice(&first.stdout).expect("stdout is JSON");
+    assert_eq!(first_answer["session_id"], session_id, "{first_answer}");
     let first_size = fs::metadata(&sessions[0]).expect("session file").len();
 
     let second_prompt = format!("second-turn {SCENARIO_PREFIX}streaming_text");
     let second = neuron(&workspace, &server.base_url())
-        .args(["--output-format", "json", "--resume", "latest", "prompt"])
+        .args(["--output-format", "json", "--resume", &session_id, "prompt"])
         .arg(&second_prompt)
         .stdin(Stdio::null())
         .output()
@@ -349,31 +360,317 @@ fn a_saved_session_takes_another_prompt_without_a_terminal() {
     assert!(!stdout.contains("Restored"), "{stdout}");
     let answer: Value = serde_json::from_str(stdout.trim()).expect("stdout is one JSON answer");
     assert_eq!(answer["outcome"], "completed", "{answer}");
+    assert_eq!(answer["session_id"], session_id, "{answer}");
+
+    let third_prompt = format!("third-turn {SCENARIO_PREFIX}streaming_text");
+    let mut third = neuron(&workspace, &server.base_url())
+        .args(["--model", "opus", "--resume", "latest", "-p"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("neuron should run");
+    third
+        .stdin
+        .take()
+        .expect("stdin is piped")
+        .write_all(third_prompt.as_bytes())
+        .expect("stdin written");
+    let third = third.wait_with_output().expect("neuron should finish");
+    assert_eq!(
+        third.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&third.stderr)
+    );
 
     let requests = runtime.block_on(server.captured_requests());
-    let model_calls = requests
+    let bodies = requests
         .iter()
         .filter(|request| request.path == "/v1/messages")
+        .map(|request| serde_json::from_str::<Value>(&request.raw_body).expect("JSON body"))
         .collect::<Vec<_>>();
-    assert_eq!(model_calls.len(), 2);
-    let body: Value = serde_json::from_str(&model_calls[1].raw_body).expect("JSON body");
-    let messages = body["messages"].as_array().expect("messages");
-    let roles = messages
-        .iter()
-        .map(|message| message["role"].as_str().unwrap_or_default())
-        .collect::<Vec<_>>();
-    assert_eq!(roles, ["user", "assistant", "user"], "{body}");
+    assert_eq!(bodies.len(), 3);
+    let roles = |body: &Value| {
+        body["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .map(|message| message["role"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>()
+    };
     assert_eq!(
-        messages[0]["content"][0]["text"],
-        format!("{SCENARIO_PREFIX}streaming_text"),
-        "{body}"
+        roles(&bodies[1]),
+        ["user", "assistant", "user"],
+        "{}",
+        bodies[1]
     );
-    assert_eq!(messages[2]["content"][0]["text"], second_prompt, "{body}");
+    assert_eq!(
+        bodies[1]["messages"][0]["content"][0]["text"],
+        format!("{SCENARIO_PREFIX}streaming_text"),
+        "{}",
+        bodies[1]
+    );
+    assert_eq!(
+        bodies[1]["messages"][2]["content"][0]["text"], second_prompt,
+        "{}",
+        bodies[1]
+    );
+    assert_eq!(
+        roles(&bodies[2]),
+        ["user", "assistant", "user", "assistant", "user"],
+        "{}",
+        bodies[2]
+    );
+    assert_eq!(
+        bodies[2]["messages"][4]["content"][0]["text"], third_prompt,
+        "{}",
+        bodies[2]
+    );
+    // The session's model, until `--model` names another.
+    assert_eq!(bodies[1]["model"], bodies[0]["model"]);
+    assert!(
+        bodies[2]["model"]
+            .as_str()
+            .is_some_and(|model| model.contains("opus")),
+        "{}",
+        bodies[2]["model"]
+    );
 
     // The same file, grown; no other session was left behind.
     assert_eq!(session_files(&workspace.root), sessions);
     assert!(fs::metadata(&sessions[0]).expect("session file").len() > first_size);
     workspace.remove();
+}
+
+/// While another run continues a session (here the test holds its lock, as that run
+/// would), a run that would continue it too is refused, before any request, instead of
+/// overwriting that run's turns when it saves; nothing is left behind. Resume commands
+/// that rewrite the session are refused too; reading it is not.
+#[test]
+fn a_session_in_use_is_refused_and_left_as_it_was() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let workspace = Workspace::new("resume-in-use");
+    let first = run(
+        &workspace,
+        &server.base_url(),
+        &[],
+        "streaming_text",
+        Stdin::Null,
+    );
+    assert_eq!(first.status.code(), Some(0));
+    let sessions = session_files(&workspace.root);
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    let saved = fs::read(&sessions[0]).expect("session file");
+
+    let mut lock_name = sessions[0].file_name().expect("file name").to_os_string();
+    lock_name.push(".lock");
+    let held = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(sessions[0].with_file_name(lock_name))
+        .expect("lock file");
+    held.try_lock().expect("the test holds the session");
+
+    let prompt = format!("second-turn {SCENARIO_PREFIX}streaming_text");
+    for (args, json) in [
+        (
+            &[
+                "--output-format",
+                "json",
+                "--resume",
+                "latest",
+                "prompt",
+                &prompt,
+            ][..],
+            true,
+        ),
+        (&["--resume", "latest", "-p", &prompt], false),
+        (&["--resume", "latest", "/compact"], false),
+    ] {
+        let output = neuron(&workspace, &server.base_url())
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .expect("neuron should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{args:?}\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stderr.contains("is in use by another neuron run"),
+            "{args:?}\n{stderr}"
+        );
+        if json {
+            assert!(stdout.trim().is_empty(), "{stdout}");
+            for line in json_lines(&stderr) {
+                assert_eq!(line["type"], "error", "{stderr}");
+            }
+        }
+    }
+    let status = neuron(&workspace, &server.base_url())
+        .args(["--resume", "latest", "/status"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("neuron should run");
+    assert_eq!(
+        status.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    let model_calls = runtime
+        .block_on(server.captured_requests())
+        .iter()
+        .filter(|request| request.path == "/v1/messages")
+        .count();
+    assert_eq!(model_calls, 1, "only the first run reached the model");
+    assert_eq!(fs::read(&sessions[0]).expect("session file"), saved);
+    assert_eq!(session_files(&workspace.root), sessions);
+
+    // Once that run is over, the session takes the next prompt.
+    drop(held);
+    let next = neuron(&workspace, &server.base_url())
+        .args(["--resume", "latest", "prompt"])
+        .arg(&prompt)
+        .stdin(Stdio::null())
+        .output()
+        .expect("neuron should run");
+    assert_eq!(
+        next.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&next.stderr)
+    );
+    assert_eq!(session_files(&workspace.root), sessions);
+    workspace.remove();
+}
+
+/// Runs that continue one session at the same time: each adds its turn or is refused as
+/// the session is in use. None overwrites another's turn or lands between a prompt and
+/// its answer (each run used to save its whole session at the end, so the last one won).
+#[test]
+fn parallel_runs_on_one_session_lose_no_turn() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let workspace = Workspace::new("resume-parallel");
+    let first = run(
+        &workspace,
+        &server.base_url(),
+        &[],
+        "streaming_text",
+        Stdin::Null,
+    );
+    assert_eq!(first.status.code(), Some(0));
+    let sessions = session_files(&workspace.root);
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+
+    let prompts = (0..6)
+        .map(|turn| format!("turn-{turn} {SCENARIO_PREFIX}streaming_text"))
+        .collect::<Vec<_>>();
+    let runs = prompts
+        .iter()
+        .map(|prompt| {
+            neuron(&workspace, &server.base_url())
+                .args(["--output-format", "json", "--resume", "latest", "prompt"])
+                .arg(prompt)
+                .stdin(Stdio::null())
+                .spawn()
+                .expect("neuron should run")
+        })
+        .collect::<Vec<_>>();
+    let mut completed = vec![format!("{SCENARIO_PREFIX}streaming_text")];
+    for (prompt, run) in prompts.iter().zip(runs) {
+        let output = run.wait_with_output().expect("neuron should finish");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        match output.status.code() {
+            Some(0) => {
+                let answer: Value = serde_json::from_str(stdout.trim()).expect("one JSON answer");
+                assert_eq!(answer["outcome"], "completed", "{answer}");
+                completed.push(prompt.clone());
+            }
+            Some(1) => assert!(
+                stderr.contains("is in use by another neuron run"),
+                "{stderr}"
+            ),
+            other => panic!("{prompt}: exit {other:?}\n{stdout}\n{stderr}"),
+        }
+    }
+    assert!(
+        completed.len() > 1,
+        "at least one run continued the session"
+    );
+
+    // Every completed turn is saved, each prompt followed by its answer.
+    let messages = saved_messages(&sessions[0]);
+    let roles = messages
+        .iter()
+        .map(|(role, _)| role.as_str())
+        .collect::<Vec<_>>();
+    let expected_roles = ["user", "assistant"].repeat(completed.len());
+    assert_eq!(roles, expected_roles, "{messages:?}");
+    let mut prompts_saved = messages
+        .iter()
+        .filter(|(role, _)| role == "user")
+        .map(|(_, text)| text.clone())
+        .collect::<Vec<_>>();
+    prompts_saved.sort();
+    completed.sort();
+    assert_eq!(prompts_saved, completed);
+    assert_eq!(session_files(&workspace.root), sessions);
+    workspace.remove();
+}
+
+/// A session of another workspace is refused before any request, and the refused run
+/// leaves no session of its own behind.
+#[test]
+fn a_session_of_another_workspace_is_refused_without_a_trace() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let owner = Workspace::new("resume-owner");
+    let first = run(
+        &owner,
+        &server.base_url(),
+        &[],
+        "streaming_text",
+        Stdin::Null,
+    );
+    assert_eq!(first.status.code(), Some(0));
+    let sessions = session_files(&owner.root);
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+
+    let other = Workspace::new("resume-other");
+    let output = neuron(&other, &server.base_url())
+        .args(["--output-format", "json", "--resume"])
+        .arg(&sessions[0])
+        .arg("prompt")
+        .arg(format!("second-turn {SCENARIO_PREFIX}streaming_text"))
+        .stdin(Stdio::null())
+        .output()
+        .expect("neuron should run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("session workspace mismatch"), "{stderr}");
+    assert!(session_files(&other.root).is_empty());
+    let model_calls = runtime
+        .block_on(server.captured_requests())
+        .iter()
+        .filter(|request| request.path == "/v1/messages")
+        .count();
+    assert_eq!(model_calls, 1);
+    owner.remove();
+    other.remove();
 }
 
 /// `neuron </dev/null` in a folder nobody trusted yet: no trust question nobody can
@@ -594,6 +891,26 @@ fn session_files(root: &Path) -> Vec<PathBuf> {
         .collect::<Vec<_>>();
     files.sort();
     files
+}
+
+/// The messages saved in the session file at `path`: each one's role and first text.
+fn saved_messages(path: &Path) -> Vec<(String, String)> {
+    fs::read_to_string(path)
+        .expect("session file")
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|record| record["type"] == "message")
+        .map(|record| {
+            let message = &record["message"];
+            (
+                message["role"].as_str().unwrap_or_default().to_string(),
+                message["blocks"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        })
+        .collect()
 }
 
 /// Every line of `text` as JSON.

@@ -384,12 +384,19 @@ pub(crate) fn launch(options: ReplLaunch) -> Result<(), Box<dyn std::error::Erro
     let resolved_model = configure_provider_for_model(resolve_repl_model(
         crate::args::model_after_trust(options.model),
     ))?;
-    let mut cli = LiveCli::new(
-        resolved_model,
-        true,
-        options.allowed_tools,
-        crate::args::permission_mode_after_trust(options.permission_mode),
-    )?;
+    let permission_mode = crate::args::permission_mode_after_trust(options.permission_mode);
+    let resumed = options.resume.is_some();
+    let mut cli = match options.resume {
+        // The saved session itself, held while the REPL runs: no session of its own.
+        Some(reference) => LiveCli::resuming(
+            resolved_model,
+            true,
+            options.allowed_tools,
+            permission_mode,
+            open_session_reference(&reference)?,
+        )?,
+        None => LiveCli::new(resolved_model, true, options.allowed_tools, permission_mode)?,
+    };
     cli.set_reasoning_effort(options.reasoning_effort);
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
@@ -397,9 +404,15 @@ pub(crate) fn launch(options: ReplLaunch) -> Result<(), Box<dyn std::error::Erro
     println!("{}", cli.startup_banner());
     println!("{}", format_connected_line(&cli.model));
     print_footer(&cli);
-
-    if let Some(reference) = options.resume {
-        continue_saved_session(&mut cli, &reference)?;
+    if resumed {
+        println!(
+            "{}",
+            format_resume_report(
+                &cli.session.path.display().to_string(),
+                cli.runtime.session().messages.len(),
+                prompt_count(cli.runtime.session()),
+            )
+        );
     }
 
     let result = run_loop(&mut cli, &mut editor);
@@ -439,41 +452,6 @@ pub(crate) fn footer_session_label(id: &str) -> String {
     } else {
         format!("session {id}")
     }
-}
-
-/// Switches the freshly started CLI to a saved session, removing the empty
-/// placeholder session file the fresh start created.
-fn continue_saved_session(
-    cli: &mut LiveCli,
-    reference: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    replace_placeholder_session(cli, |cli| {
-        cli.resume_session(Some(reference.to_string())).map(|_| ())
-    })
-}
-
-/// [`continue_saved_session`] without the restore report, for
-/// `neuron --resume SESSION prompt TEXT`, whose stdout is the answer.
-pub(crate) fn continue_saved_session_quietly(
-    cli: &mut LiveCli,
-    reference: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    replace_placeholder_session(cli, |cli| cli.switch_session(reference).map(|_| ()))
-}
-
-/// Runs `switch` and removes the session file the fresh start created when it is
-/// still empty and no longer the CLI's session.
-fn replace_placeholder_session(
-    cli: &mut LiveCli,
-    switch: impl FnOnce(&mut LiveCli) -> Result<(), Box<dyn std::error::Error>>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let placeholder = cli.session.path.clone();
-    let placeholder_is_empty = cli.runtime.session().messages.is_empty();
-    switch(cli)?;
-    if placeholder_is_empty && placeholder != cli.session.path {
-        let _ = fs::remove_file(&placeholder);
-    }
-    Ok(())
 }
 
 fn run_loop(

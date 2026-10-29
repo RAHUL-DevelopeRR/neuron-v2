@@ -158,11 +158,132 @@ pub fn load_session_reference_in_store(
     ))
 }
 
+/// This run's hold on a session file. A run that writes a session (`neuron prompt`, the
+/// REPL, the full-screen UI's engine) holds one for as long as the session is its own, so
+/// a second run that would continue the same session is refused instead of overwriting
+/// the first one's turns: each run saves its whole session when a turn ends.
+///
+/// An OS lock on `<session file>.lock`, released when this is dropped or the process ends,
+/// however it ends. The lock file stays: removing it while another run is opening it
+/// could leave two runs holding locks on two different files.
+#[derive(Debug)]
+pub struct SessionLock {
+    file: fs::File,
+    path: PathBuf,
+}
+
+impl SessionLock {
+    /// Locks the session file at `session_path` (which need not exist yet), or says
+    /// that another run holds it.
+    pub fn acquire(session_path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let path = session_lock_path(session_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { file, path }),
+            Err(fs::TryLockError::WouldBlock) => Err(session_in_use(session_path).into()),
+            Err(fs::TryLockError::Error(error)) => Err(error.into()),
+        }
+    }
+
+    /// Lets go of the session and removes the lock file, for a session file that was
+    /// removed too.
+    pub fn remove(self) {
+        let path = self.path.clone();
+        drop(self);
+        let _ = fs::remove_file(path);
+    }
+}
+
+impl Drop for SessionLock {
+    fn drop(&mut self) {
+        // Closing the file unlocks it too, but Windows may take a moment to do so.
+        let _ = self.file.unlock();
+    }
+}
+
+/// The lock file of the session file at `session_path`: `<name>.jsonl.lock` beside it,
+/// which session listings skip.
+pub fn session_lock_path(session_path: &Path) -> PathBuf {
+    let mut name = session_path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(".lock");
+    session_path.with_file_name(name)
+}
+
+fn session_in_use(session_path: &Path) -> String {
+    let id = session_path.file_stem().map_or_else(
+        || session_path.display().to_string(),
+        |stem| stem.to_string_lossy().into_owned(),
+    );
+    format!(
+        "session {id} is in use by another neuron run (a terminal session, the full-screen UI \
+or a script); one run at a time can continue a session, so wait for that run to end or start \
+a new session"
+    )
+}
+
+/// A session this run writes, held under its [`SessionLock`].
+#[derive(Debug)]
+pub struct OpenSession {
+    pub handle: SessionHandle,
+    pub session: Session,
+    pub lock: SessionLock,
+}
+
+/// A new session for this run, locked, not saved yet.
+pub fn new_open_session() -> Result<OpenSession, Box<dyn std::error::Error>> {
+    let session = new_cli_session()?;
+    let handle = create_managed_session_handle(&session.session_id)?;
+    let lock = SessionLock::acquire(&handle.path)?;
+    Ok(OpenSession {
+        session: session.with_persistence_path(handle.path.clone()),
+        handle,
+        lock,
+    })
+}
+
+/// The saved session `reference` names, opened for this run to continue. It is locked
+/// before it is read, so what loads is what the last run saved, and no other run writes
+/// it until the lock is dropped.
+pub fn open_session_reference(reference: &str) -> Result<OpenSession, Box<dyn std::error::Error>> {
+    let store = current_session_store()?;
+    let resolved = resolve_session_reference_in_store(&store, reference)?;
+    let lock = SessionLock::acquire(&resolved.path)?;
+    let (handle, session) =
+        load_session_reference_in_store(&store, &resolved.path.display().to_string())?;
+    Ok(OpenSession {
+        handle,
+        session,
+        lock,
+    })
+}
+
+/// Whether `left` and `right` name the same file.
+pub fn same_session_file(left: &Path, right: &Path) -> bool {
+    left == right
+        || matches!(
+            (fs::canonicalize(left), fs::canonicalize(right)),
+            (Ok(left), Ok(right)) if left == right
+        )
+}
+
 pub fn delete_managed_session(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     if !path.exists() {
         return Err(format!("session file does not exist: {}", path.display()).into());
     }
+    // Not while another run continues it: that run would save it again.
+    let lock = SessionLock::acquire(path)?;
     fs::remove_file(path)?;
+    lock.remove();
     Ok(())
 }
 
@@ -282,4 +403,65 @@ pub fn session_clear_backup_path(session_path: &Path) -> PathBuf {
         .and_then(|value| value.to_str())
         .unwrap_or("session.jsonl");
     session_path.with_file_name(format!("{file_name}.before-clear-{timestamp}.bak"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{same_session_file, session_lock_path, SessionLock};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_session(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be after epoch")
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("neuron-session-lock-{label}-{nanos}"))
+            .join("session-1.jsonl")
+    }
+
+    #[test]
+    fn a_session_is_held_by_one_run_at_a_time() {
+        let session = temp_session("held");
+        let held = SessionLock::acquire(&session).expect("the first run holds the session");
+
+        let error = SessionLock::acquire(&session).expect_err("a second run is refused");
+        assert!(
+            error
+                .to_string()
+                .starts_with("session session-1 is in use by another neuron run"),
+            "{error}"
+        );
+        drop(held);
+        let again = SessionLock::acquire(&session).expect("free once the first run let go");
+
+        // Beside the session file, with an extension session listings skip.
+        let lock = session_lock_path(&session);
+        assert_eq!(lock, session.with_file_name("session-1.jsonl.lock"));
+        assert!(lock.is_file());
+        again.remove();
+        assert!(!lock.exists());
+        let _ = fs::remove_dir_all(session.parent().expect("temp dir"));
+    }
+
+    #[test]
+    fn the_same_session_file_is_recognised_by_any_path() {
+        let session = temp_session("same");
+        fs::create_dir_all(session.parent().expect("temp dir")).expect("temp dir");
+        fs::write(&session, "").expect("session file");
+        let roundabout = session
+            .parent()
+            .expect("temp dir")
+            .join(".")
+            .join("session-1.jsonl");
+
+        assert!(same_session_file(&session, &roundabout));
+        assert!(!same_session_file(
+            &session,
+            &session.with_file_name("session-2.jsonl")
+        ));
+        let _ = fs::remove_dir_all(session.parent().expect("temp dir"));
+    }
 }

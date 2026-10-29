@@ -518,7 +518,7 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  neuron [FLAGS] -p TEXT")?;
     writeln!(
         out,
-        "      Same as `prompt TEXT`; everything after -p is the prompt, so put flags first"
+        "      Same as `prompt TEXT`; everything after -p is the prompt (a flag like --model there is refused), so put flags first"
     )?;
     writeln!(
         out,
@@ -534,7 +534,7 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "      Send a saved session another prompt and exit (also `-p TEXT`); the turn is saved to it"
+        "      Send a saved session another prompt and exit (also `-p TEXT`, or `-p` with the prompt on stdin); the turn is saved to it"
     )?;
     writeln!(out, "  neuron help")?;
     writeln!(out, "      Alias for --help")?;
@@ -650,6 +650,14 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
         "  Use /session list in the REPL to browse managed sessions"
+    )?;
+    writeln!(
+        out,
+        "  `--output-format json` answers carry the `session_id` that --resume takes"
+    )?;
+    writeln!(
+        out,
+        "  One run at a time continues a session; another is refused while it is in use"
     )?;
     writeln!(out, "Examples:")?;
     writeln!(out, "  neuron --model auto \"summarize this repo\"")?;

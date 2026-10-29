@@ -59,9 +59,10 @@ final answer text (never the model's reasoning), `outcome` says how the turn end
 line Neuron shows (`message`), the provider's explanation with provider and model
 names left out (`note`, or `null`) and how many tool calls of that response were not
 run (`tool_calls_not_run`); otherwise
-`refusal` is `null`. With `--compact`, standard output keeps the answer only and the
-refusal line goes to standard error. Tool calls from a refused response, or from one
-cut off at the output token limit, are never run.
+`refusal` is `null`. `session_id` names the session the turn was saved to, which
+`--resume` takes (see [Sessions](#sessions)). With `--compact`, standard output keeps
+the answer only and the refusal line goes to standard error. Tool calls from a refused
+response, or from one cut off at the output token limit, are never run.
 
 ## Sign in
 
@@ -228,17 +229,34 @@ neuron --resume latest --permission-mode read-only   # ...with different launch 
 neuron --resume latest /status /diff           # run resume-safe commands without the REPL
 neuron --resume latest prompt "now add tests"  # send it another prompt, then exit
 neuron export conversation.md                  # write the latest session as Markdown
+
+# a script that keeps to its own session
+id=$(neuron --output-format json prompt "plan the change" | jq -r .session_id)
+neuron --resume "$id" prompt "now make the change"
 ```
 
 `latest` is the newest session with messages: a session left before its first prompt is
 skipped. On a terminal, `--resume` without slash commands continues the session
 interactively.
-`--resume SESSION prompt "..."` (or `-p "..."`) works anywhere, scripts included: it runs
-one turn as `neuron prompt` does, with the session's history, and saves the turn to the
-same file. With `--output-format json` its stdout is the turn's JSON answer, as for
-`neuron prompt`. `--model`, `--permission-mode`, `--allowedTools`, `--reasoning-effort`
-and the other launch flags apply to it whether you put them before or after `--resume`;
-without `--model` it continues on the model the session used.
+`--resume SESSION prompt "..."` works anywhere, scripts included: it runs one turn as
+`neuron prompt` does, with the session's history, and saves the turn to the same file.
+`-p "..."` does the same, and with nothing after it takes the prompt from standard input
+(`echo "now add tests" | neuron --resume latest -p`). With `--output-format json` its
+stdout is the turn's JSON answer, as for `neuron prompt`, and its `session_id` is the
+session's id: a script can continue the session it started by id rather than as
+`latest`, which another run may have changed. `--model`, `--permission-mode`,
+`--allowedTools`, `--reasoning-effort` and the other launch flags go before `prompt` or
+`-p`, before or after `--resume`; without `--model` the turn runs on the model the
+session used. Everything after `-p` is the prompt, so a flag such as `--model` or
+`--output-format` there is refused rather than sent to the model, as are `--resume` and
+`--continue` anywhere in a prompt.
+
+One run at a time can continue a session. While a terminal session, the full-screen UI
+or a script is on it, another run that would continue it (`--resume`, `/resume`,
+`/session switch`, or `/compact` and `/clear --confirm` given to `--resume`) is refused
+with "is in use by another neuron run" before it sends anything, instead of the two runs
+overwriting each other's turns. Wait for the other run to end, or start a new session.
+Each session file has a `.lock` file beside it for this.
 
 Inside a session: `/session list`, `/session switch <id>`, `/resume <path>`,
 `/compact` to shrink history, `/clear` to start over.

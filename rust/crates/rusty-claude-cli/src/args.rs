@@ -297,6 +297,7 @@ pub(crate) fn parse_args_with_stdin(
                     && matches!(
                         rest[0].as_str(),
                         "prompt"
+                            | "--resume"
                             | "version"
                             | "state"
                             | "init"
@@ -307,8 +308,9 @@ pub(crate) fn parse_args_with_stdin(
                     ) =>
             {
                 // `--help` following a subcommand that would otherwise forward
-                // the arg to the API (e.g. `neuron prompt --help`) should show
-                // top-level help instead. Subcommands that consume their own
+                // the arg to the API (e.g. `neuron prompt --help`, `neuron --resume
+                // latest prompt --help`) should show top-level help instead.
+                // Subcommands that consume their own
                 // args (agents, mcp, plugins, skills) and local help-topic
                 // subcommands (status, sandbox, doctor) must NOT be intercepted
                 // here — they handle --help in their own dispatch paths.
@@ -401,17 +403,17 @@ pub(crate) fn parse_args_with_stdin(
             }
             "-p" if rest.first().is_some_and(|word| word == "--resume") => {
                 // `--resume SESSION -p TEXT`: the words continue the saved session.
+                if let Some(action) = p_words_action(&args[index + 1..], output_format) {
+                    return action;
+                }
                 rest.extend(args[index..].iter().cloned());
                 break;
             }
             "-p" => {
                 // NeuronCLI compat: -p "prompt" = one-shot prompt
                 // Allow empty prompt so piped stdin works: echo "hello" | neuron -p
-                if let Some(error) = args
-                    .get(index + 1)
-                    .and_then(|word| session_flag_error(word))
-                {
-                    return Err(error);
+                if let Some(action) = p_words_action(&args[index + 1..], output_format) {
+                    return action;
                 }
                 let prompt = args[index + 1..].join(" ");
                 return Ok(CliAction::Prompt {
@@ -441,6 +443,8 @@ pub(crate) fn parse_args_with_stdin(
                 rest.push(flag[9..].to_string());
                 index += 1;
             }
+            // Among a prompt's words (or after `--resume SESSION`): it would be prompt text.
+            flag if is_session_flag(flag) => return Err(session_flag_error(flag)),
             "--acp" | "-acp" => {
                 rest.push("acp".to_string());
                 index += 1;
@@ -610,9 +614,6 @@ pub(crate) fn parse_args_with_stdin(
         "init" => Ok(CliAction::Init { output_format }),
         "export" => parse_export_args(&rest[1..], output_format),
         "prompt" => {
-            if let Some(error) = rest.get(1).and_then(|word| session_flag_error(word)) {
-                return Err(error);
-            }
             let prompt = rest[1..].join(" ");
             if prompt.trim().is_empty() {
                 return Err("prompt subcommand requires a prompt string".to_string());
@@ -1541,13 +1542,61 @@ pub(crate) fn parse_dump_manifests_args(
 /// How to send a saved session another prompt.
 const RESUME_PROMPT_USAGE: &str = "neuron --resume latest prompt \"...\"";
 
-/// `neuron prompt --resume SESSION TEXT`: the flag would reach the model as prompt text.
-fn session_flag_error(word: &str) -> Option<String> {
+/// `--resume` or `--continue`, alone or with `=VALUE`.
+fn is_session_flag(word: &str) -> bool {
+    matches!(
+        word.split('=').next().unwrap_or(word),
+        "--resume" | "--continue"
+    )
+}
+
+/// `neuron prompt TEXT --resume SESSION`: the flag would reach the model as prompt text,
+/// and the prompt would start a new session.
+fn session_flag_error(word: &str) -> String {
     let flag = word.split('=').next().unwrap_or(word);
-    matches!(flag, "--resume" | "--continue").then(|| {
-        format!(
-            "{flag} after `prompt` or `-p` would be sent as prompt text; to send a saved session another prompt use `{RESUME_PROMPT_USAGE}` (or a session id in place of latest)"
-        )
+    format!(
+        "{flag} among a prompt's words would be sent to the model as text and start a new session; to send a saved session another prompt use `{RESUME_PROMPT_USAGE}` (or a session id in place of latest)"
+    )
+}
+
+/// The options `neuron prompt TEXT` still applies after its text (the arms of
+/// [`parse_args_with_stdin`]). After `-p` every word is prompt text, so there they would
+/// be sent to the model instead.
+const OPTIONS_APPLIED_AFTER_PROMPT: &[&str] = &[
+    "--model",
+    "--output-format",
+    "--permission-mode",
+    "--dangerously-skip-permissions",
+    "--compact",
+    "--base-commit",
+    "--reasoning-effort",
+    "--allow-broad-cwd",
+    "--print",
+    "--allowedTools",
+    "--allowed-tools",
+];
+
+/// What the words after `-p`, all prompt text, ask for besides the prompt: help, as after
+/// `prompt`, or an error for an option or session flag that would be sent to the model as
+/// text where `neuron prompt` would apply it.
+fn p_words_action(
+    words: &[String],
+    output_format: CliOutputFormat,
+) -> Option<Result<CliAction, String>> {
+    if words.iter().any(|word| is_help_flag(word)) {
+        return Some(Ok(CliAction::Help { output_format }));
+    }
+    words.iter().find_map(|word| {
+        let option = word.split('=').next().unwrap_or(word);
+        if is_session_flag(word) {
+            Some(Err(session_flag_error(word)))
+        } else {
+            OPTIONS_APPLIED_AFTER_PROMPT.contains(&option).then(|| {
+                Err(format!(
+                    "{option} after `-p` would be sent to the model as prompt text: put options before `-p` (`neuron {option} ... -p \"...\"`), or quote the prompt"
+                ))
+            })
+        }
     })
 }
 
@@ -1572,7 +1621,8 @@ pub(crate) fn parse_resume_args(
     if let Some((word, words)) = command_tokens.split_first() {
         if is_resume_prompt_word(word) {
             let prompt = words.join(" ");
-            if prompt.trim().is_empty() {
+            // `echo "..." | neuron --resume latest -p`: the prompt is on stdin.
+            if prompt.trim().is_empty() && word != "-p" {
                 return Err(format!(
                     "--resume ... {word} requires a prompt string: `{RESUME_PROMPT_USAGE}`"
                 ));
@@ -1811,10 +1861,130 @@ mod resume_prompt_tests {
         for words in [
             &["--resume", "latest", "prompt"][..],
             &["--resume", "latest", "prompt", " "],
-            &["--resume", "latest", "-p"],
         ] {
             let error = parse(words).expect_err("an empty prompt is refused");
             assert!(error.contains("requires a prompt"), "{words:?}: {error}");
+        }
+    }
+
+    /// `echo "..." | neuron --resume latest -p`: as with `neuron -p`, the prompt comes on
+    /// standard input.
+    #[test]
+    fn resume_with_an_empty_p_takes_the_prompt_from_stdin() {
+        assert_eq!(
+            parse(&["--resume", "latest", "-p"]),
+            Ok(resume_prompt("latest", "", ResumeLaunchOptions::default()))
+        );
+    }
+
+    /// `neuron prompt hello --resume latest` started a new session with the prompt
+    /// "hello --resume latest": a session flag anywhere among a prompt's words is refused.
+    #[test]
+    fn a_session_flag_anywhere_in_the_prompt_is_refused() {
+        for words in [
+            &["prompt", "hello", "--resume", "latest"][..],
+            &["-p", "hello", "--resume", "latest"],
+            &["hello", "--resume", "latest"],
+            &["prompt", "hello", "--continue"],
+            &["--resume", "latest", "prompt", "--resume", "other", "x"],
+            &["--resume", "latest", "prompt", "x", "--resume=other"],
+            &["--resume", "latest", "-p", "x", "--continue"],
+        ] {
+            let error = parse(words).expect_err("a session flag in the prompt is refused");
+            assert!(
+                error.contains("neuron --resume latest prompt \"...\""),
+                "{words:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_after_a_resumed_prompt_shows_help() {
+        for words in [
+            &["--resume", "latest", "prompt", "--help"][..],
+            &["--resume", "latest", "prompt", "x", "-h"],
+            &["--resume", "latest", "-p", "--help"],
+            &["--resume", "latest", "--help"],
+            &["--resume", "--help"],
+            &["-p", "x", "--help"],
+        ] {
+            assert_eq!(
+                parse(words),
+                Ok(CliAction::Help {
+                    output_format: CliOutputFormat::Text
+                }),
+                "{words:?}"
+            );
+        }
+    }
+
+    /// After `prompt` Neuron's own options still apply, as for `neuron prompt`.
+    #[test]
+    fn options_after_a_resumed_prompt_apply() {
+        assert_eq!(
+            parse(&[
+                "--resume",
+                "latest",
+                "prompt",
+                "again",
+                "--output-format",
+                "json"
+            ]),
+            Ok(CliAction::ResumePrompt {
+                session_path: PathBuf::from("latest"),
+                prompt: "again".to_string(),
+                output_format: CliOutputFormat::Json,
+                launch: ResumeLaunchOptions::default(),
+                compact: false,
+            })
+        );
+    }
+
+    /// After `-p` every word is prompt text, so an option `prompt` would apply there was
+    /// sent to the model instead (`--resume latest -p again --output-format json` printed
+    /// a text answer): refused, saying where it goes.
+    #[test]
+    fn an_option_after_p_is_refused_not_sent_to_the_model() {
+        for (words, option) in [
+            (
+                &[
+                    "--resume",
+                    "latest",
+                    "-p",
+                    "again",
+                    "--output-format",
+                    "json",
+                ][..],
+                "--output-format",
+            ),
+            (&["-p", "again", "--output-format=json"], "--output-format"),
+            (&["-p", "again", "--model", "opus"], "--model"),
+            (
+                &[
+                    "--resume",
+                    "s-1",
+                    "-p",
+                    "x",
+                    "--permission-mode",
+                    "read-only",
+                ],
+                "--permission-mode",
+            ),
+            (&["-p", "x", "--compact"], "--compact"),
+        ] {
+            let error = parse(words).expect_err("an option after -p is refused");
+            assert!(
+                error.contains(&format!("{option} after `-p`")),
+                "{words:?}: {error}"
+            );
+            assert!(error.contains("before `-p`"), "{words:?}: {error}");
+        }
+        // Words that only look like options are prompt text.
+        match parse(&["-p", "what", "does", "--modelling", "-x", "mean"]) {
+            Ok(CliAction::Prompt { prompt, .. }) => {
+                assert_eq!(prompt, "what does --modelling -x mean");
+            }
+            other => panic!("expected a prompt: {other:?}"),
         }
     }
 }

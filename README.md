@@ -213,11 +213,12 @@ neuron --output-format json prompt "run the tests and summarise the failures"
 neuron --resume latest prompt "now fix the first failure"
 ```
 
-Launch flags go before `prompt` (or `-p`): everything after it is the prompt, flags
-included. Without a terminal on standard input nobody can approve a tool call, so a
-call that would ask is denied instead, the model is told it did not run, and Neuron
-exits with code 2 after the answer. Each denial names the `permissions.allow` rules
-that would let that call run, when any would, and the last warning lists them all.
+Launch flags go before `prompt` (or `-p`). Everything after `-p` is the prompt, so a
+flag such as `--output-format` there is refused rather than sent to the model. Without
+a terminal on standard input nobody can approve a tool call, so a call that would ask
+is denied instead, the model is told it did not run, and Neuron exits with code 2 after
+the answer. Each denial names the `permissions.allow` rules that would let that call
+run, when any would, and the last warning lists them all.
 
 Allow what your script needs in your user settings, `~/.neuron/settings.json`. A
 script never gets the trust question, so the workspace's own settings, allow rules
@@ -243,7 +244,10 @@ Use `--permission-mode danger-full-access` only in a disposable environment such
 container: it lets every tool call run.
 
 Each `neuron prompt` run starts a new session; `neuron --resume latest prompt "..."`
-sends the newest session another prompt.
+sends the newest session another prompt. The JSON answer's `session_id` is what
+`--resume` takes, so a script can continue its own session by id. One run at a time can
+continue a session: a second one is refused as "in use" rather than overwriting the
+first one's turns.
 
 ## Documentation
 
