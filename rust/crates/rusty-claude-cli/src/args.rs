@@ -1089,8 +1089,8 @@ pub(crate) fn parse_direct_slash_cli_action(
 /// Whether `neuron --resume SESSION /name` runs this command: it is marked [resume] in
 /// /help and is not one of the stubs that only say "not yet implemented". `--help`'s
 /// "Resume-safe commands" line and the hints for `neuron X` / `neuron /X` all use this;
-/// the test `every_resume_safe_command_runs_under_resume` runs each one through
-/// `run_resume_command`.
+/// the test `every_resume_safe_command_runs_under_resume` runs every form that line
+/// lists through `run_resume_command`.
 pub(crate) fn resume_safe_slash_command(command_name: &str) -> bool {
     let name = slash_command_root(command_name);
     slash_command_specs().iter().any(|spec| {
@@ -1098,6 +1098,17 @@ pub(crate) fn resume_safe_slash_command(command_name: &str) -> bool {
             && !STUB_COMMANDS.contains(&spec.name)
             && (spec.name == name || spec.aliases.contains(&name))
     })
+}
+
+/// The arguments of a resume-safe command that `neuron --resume` runs, for `--help`'s
+/// "Resume-safe commands" line: the command's argument hint without the forms that
+/// need a live session.
+pub(crate) fn resume_argument_hint(spec: &commands::SlashCommandSpec) -> Option<&'static str> {
+    match spec.name {
+        // `/skills <skill> [args]` runs the skill as a model turn.
+        "skills" => Some("[list|install <path>|help]"),
+        _ => spec.argument_hint,
+    }
 }
 
 /// Whether `/name` (or an alias of it) is one of the stubs that only say "not yet

@@ -104,7 +104,8 @@ use args::*;
 use commands::{
     classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
     handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
-    handle_skills_slash_command, handle_skills_slash_command_json, render_slash_command_help,
+    handle_skills_slash_command, handle_skills_slash_command_json,
+    handle_skills_slash_command_with_json, render_slash_command_help,
     render_slash_command_help_filtered, resolve_skill_invocation, resume_supported_slash_commands,
     slash_command_specs, validate_slash_command_input, SkillSlashDispatch, SlashCommand,
 };
@@ -1429,10 +1430,12 @@ fn run_resume_command(
                 );
             }
             let cwd = env::current_dir()?;
+            // One run for both outputs: `/skills install` must not install twice.
+            let (message, json) = handle_skills_slash_command_with_json(args.as_deref(), &cwd)?;
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
-                message: Some(handle_skills_slash_command(args.as_deref(), &cwd)?),
-                json: Some(handle_skills_slash_command_json(args.as_deref(), &cwd)?),
+                message: Some(message),
+                json: Some(json),
             })
         }
         SlashCommand::Doctor => {
@@ -1477,8 +1480,9 @@ fn run_resume_command(
                 })),
             })
         }
-        // The saved session's context budget; as before, any argument shows the report.
-        SlashCommand::Context { .. } => {
+        // The saved session's context budget; other arguments fail as in a session.
+        SlashCommand::Context { action } => {
+            repl_loop::check_context_argument(action.as_deref().unwrap_or_default())?;
             let report = repl_loop::saved_session_context_report(session);
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
@@ -9239,6 +9243,12 @@ UU conflicted.rs",
         assert_eq!(listed, marked, "{help}");
         // `neuron --resume SESSION /plan` exits 2: plan mode needs a live session.
         assert!(!listed.contains("plan"), "{resume_line}");
+        // Running a skill needs a live session, and `/context clear` is refused.
+        assert!(
+            resume_line.contains("/skills [list|install <path>|help],"),
+            "{resume_line}"
+        );
+        assert!(resume_line.contains("/context [show],"), "{resume_line}");
 
         // Every option the parser takes appears in --help as a word of its own.
         let help_words = help
@@ -9254,12 +9264,13 @@ UU conflicted.rs",
         }
     }
 
-    /// Every command that `--help` lists as resume-safe, and that the `neuron X` /
-    /// `neuron /X` hints send to `--resume`, gets past `run_resume_command`'s "needs a
-    /// live session" arm. Each runs against an empty saved session in a scratch folder,
-    /// with a scratch Neuron home (so the login is a file there, not the OS credential
-    /// store), no `NEURON_TOKEN`, doctor offline and a loopback gateway, so nothing reads
-    /// the real login or reaches the network.
+    /// Every form that `--help` lists as resume-safe runs under `neuron --resume`. Each
+    /// argument alternative on the "Resume-safe commands" line, for the command and each
+    /// alias, goes through `run_resume_command` against an empty saved session in a
+    /// scratch folder, and the only error allowed is the scratch home's missing login.
+    /// The scratch Neuron home keeps the login a file there, not the OS credential store;
+    /// with no `NEURON_TOKEN`, doctor offline and a loopback gateway, nothing reads the
+    /// real login or reaches the network.
     #[test]
     fn every_resume_safe_command_runs_under_resume() {
         struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
@@ -9333,27 +9344,124 @@ UU conflicted.rs",
             "--help must list exactly the commands the hints call resume-safe"
         );
 
-        for name in resume_safe
-            .iter()
-            .flat_map(|spec| std::iter::once(&spec.name).chain(spec.aliases.iter()))
-        {
-            let command = SlashCommand::parse(&format!("/{name}"))
-                .unwrap_or_else(|error| panic!("/{name} should parse: {error}"))
-                .unwrap_or_else(|| panic!("/{name} should be a slash command"));
-            let result = with_current_dir(&workspace, || {
-                run_resume_command(&session_path, &session, &command)
-            });
-            if let Err(error) = result {
-                assert_ne!(
-                    error.to_string(),
-                    UNSUPPORTED_RESUME_COMMAND,
-                    "/{name} is listed as resume-safe but `neuron --resume` cannot run it"
-                );
+        // A test value for each placeholder in the hints; any other word is literal.
+        // Every `<path>` is a new skill, so each `install` is a first install.
+        let mut skills_written = 0;
+        let mut fill = |word: &str| match word {
+            "<server>" => "codebase-memory".to_string(),
+            "<path>" => {
+                skills_written += 1;
+                let name = format!("resume-skill-{skills_written}");
+                write_skill_fixture(&workspace.join("skill-sources"), &name, "resume test");
+                format!("skill-sources/{name}")
+            }
+            "file" => "transcript.txt".to_string(),
+            "count" => "2".to_string(),
+            placeholder if placeholder.starts_with('<') => {
+                panic!("no test value for {placeholder}; add one here")
+            }
+            literal => literal.to_string(),
+        };
+        let forms = resume_line
+            .strip_prefix("Resume-safe commands: ")
+            .expect("the line starts with its label")
+            .split(", ");
+        for form in forms {
+            let form = form.trim_start_matches('/');
+            let (name, hint) = form
+                .split_once(' ')
+                .map_or((form, None), |(name, hint)| (name, Some(hint)));
+            let spec = resume_safe
+                .iter()
+                .find(|spec| spec.name == name)
+                .unwrap_or_else(|| panic!("/{form} is not a resume-safe command"));
+            // `[a|b <x>]`: no argument, or one of the alternatives.
+            let alternatives = match hint {
+                None => Vec::new(),
+                Some(hint) => hint
+                    .strip_prefix('[')
+                    .and_then(|hint| hint.strip_suffix(']'))
+                    .filter(|inner| !inner.contains(['[', ']']))
+                    .unwrap_or_else(|| panic!("/{form}: expected one optional [a|b <x>] group"))
+                    .split('|')
+                    .collect(),
+            };
+            for invoked in std::iter::once(&spec.name).chain(spec.aliases) {
+                for alternative in std::iter::once("").chain(alternatives.iter().copied()) {
+                    let argument = alternative
+                        .split_whitespace()
+                        .map(&mut fill)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let input = format!("/{invoked} {argument}").trim_end().to_string();
+                    let command = SlashCommand::parse(&input)
+                        .unwrap_or_else(|error| panic!("{input} should parse: {error}"))
+                        .unwrap_or_else(|| panic!("{input} should be a slash command"));
+                    let result = with_current_dir(&workspace, || {
+                        run_resume_command(&session_path, &session, &command)
+                    });
+                    match result {
+                        Ok(_) => {}
+                        // The scratch home has no login.
+                        Err(error)
+                            if *invoked == "usage"
+                                && error.to_string().starts_with("Not signed in to Zero-X") => {}
+                        Err(error) => panic!(
+                            "--help lists `{input}` as resume-safe, but `neuron --resume` fails: {error}"
+                        ),
+                    }
+                }
             }
         }
 
+        // A command that needs a live session still says so.
+        let plan = SlashCommand::parse("/plan")
+            .expect("/plan should parse")
+            .expect("/plan is a slash command");
+        let error = run_resume_command(&session_path, &session, &plan)
+            .expect_err("/plan needs a live session");
+        assert_eq!(error.to_string(), UNSUPPORTED_RESUME_COMMAND);
+
         drop(restore);
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// `neuron --resume SESSION "/context clear"` fails as `/context clear` does in a
+    /// session; it used to print the report and exit 0, so nothing was cleared.
+    #[test]
+    fn resumed_context_rejects_the_arguments_the_repl_rejects() {
+        let session_path = temp_dir().join("context.jsonl");
+        let session = Session::new();
+        let context = |argument: &str| {
+            let command = SlashCommand::parse(&format!("/context {argument}"))
+                .expect("/context should parse")
+                .expect("/context is a slash command");
+            run_resume_command(&session_path, &session, &command)
+        };
+
+        let error = context("clear").expect_err("/context clear clears nothing");
+        assert!(
+            error
+                .to_string()
+                .starts_with("/context clear is not supported; use /compact"),
+            "{error}"
+        );
+        let error = context("bogus").expect_err("unknown argument");
+        assert!(
+            error.to_string().contains("Usage: /context [show]"),
+            "{error}"
+        );
+        for argument in ["clear", "bogus"] {
+            assert_eq!(
+                context(argument).expect_err(argument).to_string(),
+                crate::repl_loop::check_context_argument(argument).expect_err(argument),
+                "the REPL and --resume give the same message"
+            );
+        }
+        for argument in ["", "show"] {
+            let outcome = context(argument).expect("the report");
+            assert_eq!(outcome.json.expect("json")["kind"], "context");
+        }
     }
 
     /// `neuron X` and `neuron /X` offer `--resume` exactly for the resume-safe commands,

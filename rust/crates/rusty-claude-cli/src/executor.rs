@@ -638,7 +638,7 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     let resume_commands = resume_supported_slash_commands()
         .into_iter()
         .filter(|spec| resume_safe_slash_command(spec.name))
-        .map(|spec| match spec.argument_hint {
+        .map(|spec| match resume_argument_hint(spec) {
             Some(argument_hint) => format!("/{} {}", spec.name, argument_hint),
             None => format!("/{}", spec.name),
         })

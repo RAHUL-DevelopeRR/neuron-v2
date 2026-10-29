@@ -542,10 +542,25 @@ impl ReplBackend for LiveCli {
     }
 }
 
-/// Returns the argument of a `/context [show|clear]` line.
+/// Returns the argument of a `/context` line.
 fn context_command_argument(line: &str) -> Option<&str> {
     let rest = line.strip_prefix("/context")?;
     (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim())
+}
+
+/// `/context [show]` only shows the report, in a session and under `neuron --resume`;
+/// any other argument is an error.
+pub(crate) fn check_context_argument(argument: &str) -> Result<(), String> {
+    match argument {
+        "" | "show" => Ok(()),
+        "clear" => Err(
+            "/context clear is not supported; use /compact to summarize or /clear --confirm to start fresh"
+                .to_string(),
+        ),
+        other => Err(format!(
+            "unknown /context argument `{other}`. Usage: /context [show]"
+        )),
+    }
 }
 
 impl LiveCli {
@@ -559,14 +574,8 @@ impl LiveCli {
         &self,
         argument: &str,
     ) -> Result<String, Box<dyn std::error::Error>> {
-        match argument {
-            "" | "show" => Ok(self.context_report()),
-            "clear" => Err(
-                "/context clear is not supported; use /compact to summarize or /clear --confirm to start fresh"
-                    .into(),
-            ),
-            other => Err(format!("unknown /context argument `{other}`. Usage: /context [show]").into()),
-        }
+        check_context_argument(argument)?;
+        Ok(self.context_report())
     }
 
     /// Context diagnostics for `/context` and `/status`.
@@ -711,10 +720,11 @@ fn group_digits(value: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        context_command_argument, describe_turn_outcome, describe_turn_outcome_without_refusal,
-        dispatch_line, group_digits, handle_turn_interrupt, refusal_note_text, refusal_notice,
-        render_context_report, turn_outcome_label, watch_turn_interrupts, ContextReport,
-        InterruptAction, InterruptPresses, QuitHint, ReplBackend, ReplStep,
+        check_context_argument, context_command_argument, describe_turn_outcome,
+        describe_turn_outcome_without_refusal, dispatch_line, group_digits, handle_turn_interrupt,
+        refusal_note_text, refusal_notice, render_context_report, turn_outcome_label,
+        watch_turn_interrupts, ContextReport, InterruptAction, InterruptPresses, QuitHint,
+        ReplBackend, ReplStep,
     };
     use crate::{CliAction, ResumeLaunchOptions, DEFAULT_MODEL};
     use runtime::context_manager::{ContextBudget, ContextManager, ContextPolicy};
@@ -1167,6 +1177,16 @@ mod tests {
 
         let legacy = super::resume_launch(ResumeLaunchOptions::default(), None, "s".into());
         assert_eq!(legacy.model, DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn context_takes_no_argument_but_show() {
+        assert_eq!(check_context_argument(""), Ok(()));
+        assert_eq!(check_context_argument("show"), Ok(()));
+        let clear = check_context_argument("clear").expect_err("nothing is cleared");
+        assert!(clear.contains("use /compact"), "{clear}");
+        let unknown = check_context_argument("bogus").expect_err("unknown argument");
+        assert!(unknown.ends_with("Usage: /context [show]"), "{unknown}");
     }
 
     #[test]

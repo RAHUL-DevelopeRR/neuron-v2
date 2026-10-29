@@ -383,8 +383,9 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "context",
         aliases: &[],
-        summary: "Inspect or manage the conversation context",
-        argument_hint: Some("[show|clear]"),
+        summary: "Inspect the conversation context",
+        // Only shows: `/context clear` is refused (use /compact or /clear --confirm).
+        argument_hint: Some("[show]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -2395,66 +2396,80 @@ pub fn handle_mcp_slash_command_json(
     render_mcp_report_json_for(&loader, cwd, args)
 }
 
-pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::Result<String> {
-    if let Some(args) = normalize_optional_args(args) {
-        if let Some(help_path) = help_path_from_args(args) {
-            return Ok(match help_path.as_slice() {
-                [] => render_skills_usage(None),
-                ["install", ..] => render_skills_usage(Some("install")),
-                _ => render_skills_usage(Some(&help_path.join(" "))),
-            });
+/// What a local `/skills` command did, before it is shown as text or JSON.
+enum SkillsCommandOutcome {
+    /// Usage, naming the unexpected argument if there was one.
+    Usage(Option<String>),
+    List(Vec<SkillSummary>),
+    Installed(InstalledSkill),
+}
+
+impl SkillsCommandOutcome {
+    fn render(&self) -> String {
+        match self {
+            Self::Usage(unexpected) => render_skills_usage(unexpected.as_deref()),
+            Self::List(skills) => render_skills_report(skills),
+            Self::Installed(skill) => render_skill_install_report(skill),
         }
     }
 
-    match normalize_optional_args(args) {
-        None | Some("list") => {
-            let roots = discover_skill_roots(cwd);
-            let skills = load_skills_from_roots(&roots)?;
-            Ok(render_skills_report(&skills))
+    fn render_json(&self) -> Value {
+        match self {
+            Self::Usage(unexpected) => render_skills_usage_json(unexpected.as_deref()),
+            Self::List(skills) => render_skills_report_json(skills),
+            Self::Installed(skill) => render_skill_install_report_json(skill),
         }
-        Some("install") => Ok(render_skills_usage(Some("install"))),
-        Some(args) if args.starts_with("install ") => {
-            let target = args["install ".len()..].trim();
-            if target.is_empty() {
-                return Ok(render_skills_usage(Some("install")));
-            }
-            let install = install_skill(target, cwd)?;
-            Ok(render_skill_install_report(&install))
-        }
-        Some(args) if is_help_arg(args) => Ok(render_skills_usage(None)),
-        Some(args) => Ok(render_skills_usage(Some(args))),
     }
 }
 
-pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::io::Result<Value> {
+fn run_skills_slash_command(
+    args: Option<&str>,
+    cwd: &Path,
+) -> std::io::Result<SkillsCommandOutcome> {
     if let Some(args) = normalize_optional_args(args) {
         if let Some(help_path) = help_path_from_args(args) {
-            return Ok(match help_path.as_slice() {
-                [] => render_skills_usage_json(None),
-                ["install", ..] => render_skills_usage_json(Some("install")),
-                _ => render_skills_usage_json(Some(&help_path.join(" "))),
-            });
+            return Ok(SkillsCommandOutcome::Usage(match help_path.as_slice() {
+                [] => None,
+                ["install", ..] => Some("install".to_string()),
+                _ => Some(help_path.join(" ")),
+            }));
         }
     }
 
-    match normalize_optional_args(args) {
+    Ok(match normalize_optional_args(args) {
         None | Some("list") => {
             let roots = discover_skill_roots(cwd);
-            let skills = load_skills_from_roots(&roots)?;
-            Ok(render_skills_report_json(&skills))
+            SkillsCommandOutcome::List(load_skills_from_roots(&roots)?)
         }
-        Some("install") => Ok(render_skills_usage_json(Some("install"))),
+        Some("install") => SkillsCommandOutcome::Usage(Some("install".to_string())),
         Some(args) if args.starts_with("install ") => {
             let target = args["install ".len()..].trim();
             if target.is_empty() {
-                return Ok(render_skills_usage_json(Some("install")));
+                SkillsCommandOutcome::Usage(Some("install".to_string()))
+            } else {
+                SkillsCommandOutcome::Installed(install_skill(target, cwd)?)
             }
-            let install = install_skill(target, cwd)?;
-            Ok(render_skill_install_report_json(&install))
         }
-        Some(args) if is_help_arg(args) => Ok(render_skills_usage_json(None)),
-        Some(args) => Ok(render_skills_usage_json(Some(args))),
-    }
+        Some(args) if is_help_arg(args) => SkillsCommandOutcome::Usage(None),
+        Some(args) => SkillsCommandOutcome::Usage(Some(args.to_string())),
+    })
+}
+
+pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::Result<String> {
+    Ok(run_skills_slash_command(args, cwd)?.render())
+}
+
+pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::io::Result<Value> {
+    Ok(run_skills_slash_command(args, cwd)?.render_json())
+}
+
+/// `/skills` as text and as JSON from a single run, so `/skills install` installs once.
+pub fn handle_skills_slash_command_with_json(
+    args: Option<&str>,
+    cwd: &Path,
+) -> std::io::Result<(String, Value)> {
+    let outcome = run_skills_slash_command(args, cwd)?;
+    Ok((outcome.render(), outcome.render_json()))
 }
 
 #[must_use]
@@ -5684,6 +5699,33 @@ mod tests {
 
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(install_root);
+    }
+
+    /// Text and JSON come from one install; a second install of the same skill fails
+    /// with "already installed".
+    #[test]
+    fn skills_install_with_json_installs_once() {
+        let _guard = env_guard();
+        let workspace = temp_dir("skills-install-with-json");
+        let original = std::env::var_os("NEURON_CONFIG_HOME");
+        std::env::set_var("NEURON_CONFIG_HOME", workspace.join("config"));
+        write_skill(&workspace.join("source"), "once", "Installed once");
+
+        let result =
+            super::handle_skills_slash_command_with_json(Some("install source/once"), &workspace);
+        restore_env_var("NEURON_CONFIG_HOME", original);
+
+        let (text, json) = result.expect("the skill installs");
+        assert!(text.contains("Result           installed once"), "{text}");
+        assert_eq!(json["result"], "installed");
+        assert_eq!(json["invocation_name"], "once");
+        assert!(workspace
+            .join("config")
+            .join("skills")
+            .join("once")
+            .join("SKILL.md")
+            .is_file());
+        let _ = fs::remove_dir_all(workspace);
     }
 
     #[test]
