@@ -67,16 +67,18 @@ pip install --pre neuroncli
 The npm and pip packages are small launchers that download the binaries for the
 package's exact version and verify their checksums. npm downloads them during
 `npm install`, without showing progress: `neuron` (about 17 MB) and `neuron-tui`
-(about 110 MB) go into the package's `bin/native` folder. pip downloads them the first
-time you run `neuron`, into a per-version cache (`~/.cache/neuroncli` on Linux,
-`~/Library/Caches/neuroncli` on macOS, `%LOCALAPPDATA%\neuroncli` on Windows); npm
-uses that cache only when its package folder is read-only. After that, Neuron starts
-without network access. Ctrl+C goes to Neuron, and the launcher exits with Neuron's
-exit code.
+(about 110 MB) go into the package's `bin/native` folder. pip downloads them on first
+use instead: `neuron` the first time you run it, and `neuron-tui` the first time the
+full-screen UI opens; npm does the same when the network failed during the install.
+pip keeps them in a per-version cache (`~/.cache/neuroncli` on Linux,
+`~/Library/Caches/neuroncli` on macOS, `%LOCALAPPDATA%\neuroncli` on Windows). npm
+uses a binary from that cache when its `bin/native` folder has none, and downloads into
+the cache only when that folder is read-only. After that, Neuron starts without network
+access. Ctrl+C goes to Neuron, and the launcher exits with Neuron's exit code.
 
-With the installers or pip, the two default MCP servers (CodebaseMap and Playwright)
-start through `npx -y`, so they need Node.js; the npm package installs them with
-Neuron.
+With the installers or pip, the two default MCP servers (CodebaseMap, which `/mcp`
+lists as `codebase-memory`, and Playwright) start through `npx -y`, so they need
+Node.js; the npm package installs them with Neuron.
 
 On a terminal, `neuron` with no prompt opens the full-screen UI, `neuron-tui`. The
 installers put it beside `neuron`, and the launchers fetch it the same way, verified

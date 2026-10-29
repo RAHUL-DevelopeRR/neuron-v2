@@ -400,10 +400,13 @@ session is revoked on the gateway and removed from the credential store too.
 
 The npm package downloads `neuron` (about 17 MB) and `neuron-tui` (about 110 MB)
 during `npm install`, without showing progress, into its own `bin/native` folder, so
-uninstalling the package removes them. pip downloads them the first time you run
-`neuron`, into a per-version cache: `~/.cache/neuroncli` (Linux),
-`~/Library/Caches/neuroncli` (macOS) or `%LOCALAPPDATA%\neuroncli` (Windows); delete
-it after uninstalling. npm uses that cache only when its package folder is read-only.
+uninstalling the package removes them; when the network fails during the install, npm
+downloads them into that folder on first use instead. pip downloads `neuron` the first
+time you run it and `neuron-tui` the first time the full-screen UI opens, into a
+per-version cache: `~/.cache/neuroncli` (Linux), `~/Library/Caches/neuroncli` (macOS)
+or `%LOCALAPPDATA%\neuroncli` (Windows); delete it after uninstalling. npm uses a
+binary from that cache when its `bin/native` folder has none, and downloads into the
+cache only when that folder is read-only.
 With the installers or pip, the two default MCP servers start through `npx -y`, which
 needs Node.js; the npm package installs them with Neuron.
 
