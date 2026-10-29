@@ -264,7 +264,9 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         aliases: &[],
         summary: "Toggle or inspect planning mode",
         argument_hint: Some("[on|off]"),
-        resume_supported: true,
+        // Plan mode switches a live session's permission mode; `neuron --resume`
+        // has no live session to switch.
+        resume_supported: false,
     },
     SlashCommandSpec {
         name: "review",

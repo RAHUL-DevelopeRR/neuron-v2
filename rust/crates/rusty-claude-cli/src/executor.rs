@@ -606,10 +606,18 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "  --reasoning-effort LEVEL   low, medium or high, for models that support it"
     )?;
-    writeln!(out, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)")?;
+    writeln!(out, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported; also --allowed-tools)")?;
     writeln!(
         out,
         "  --allow-broad-cwd          Allow running from a very broad folder such as your home folder"
+    )?;
+    writeln!(
+        out,
+        "  --base-commit REV          Warn at start when git HEAD is not REV (default: the commit in .neuron-base); a terminal session then uses the line REPL"
+    )?;
+    writeln!(
+        out,
+        "  --print                    Accepted for compatibility: the same as --output-format text"
     )?;
     writeln!(
         out,
@@ -629,7 +637,7 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out)?;
     let resume_commands = resume_supported_slash_commands()
         .into_iter()
-        .filter(|spec| !STUB_COMMANDS.contains(&spec.name))
+        .filter(|spec| resume_safe_slash_command(spec.name))
         .map(|spec| match spec.argument_hint {
             Some(argument_hint) => format!("/{} {}", spec.name, argument_hint),
             None => format!("/{}", spec.name),

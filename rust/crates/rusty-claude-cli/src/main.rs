@@ -940,19 +940,6 @@ fn resume_session(
                 }
                 std::process::exit(2);
             }
-            if cmd_root == "context" {
-                let report = repl_loop::saved_session_context_report(&session);
-                if output_format == CliOutputFormat::Json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&repl_loop::context_report_json(&report))
-                            .expect("context report json")
-                    );
-                } else {
-                    println!("{}", repl_loop::render_context_report(&report));
-                }
-                continue;
-            }
         }
         let command = match SlashCommand::parse(raw_command) {
             Ok(Some(command)) => command,
@@ -1223,6 +1210,9 @@ fn parse_git_status_metadata_for(
     (project_root, branch)
 }
 
+/// What `run_resume_command` returns for a command that needs a live session.
+const UNSUPPORTED_RESUME_COMMAND: &str = "unsupported resumed slash command";
+
 #[allow(clippy::too_many_lines)]
 fn run_resume_command(
     session_path: &Path,
@@ -1487,6 +1477,15 @@ fn run_resume_command(
                 })),
             })
         }
+        // The saved session's context budget; as before, any argument shows the report.
+        SlashCommand::Context { .. } => {
+            let report = repl_loop::saved_session_context_report(session);
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(repl_loop::render_context_report(&report)),
+                json: Some(repl_loop::context_report_json(&report)),
+            })
+        }
         SlashCommand::Unknown(name) => Err(format_unknown_slash_command(name).into()),
         // /session list can be served from the sessions directory without a live session.
         SlashCommand::Session {
@@ -1556,7 +1555,6 @@ fn run_resume_command(
         | SlashCommand::Rename { .. }
         | SlashCommand::Copy { .. }
         | SlashCommand::Hooks { .. }
-        | SlashCommand::Context { .. }
         | SlashCommand::Color { .. }
         | SlashCommand::Effort { .. }
         | SlashCommand::Branch { .. }
@@ -1567,7 +1565,7 @@ fn run_resume_command(
         | SlashCommand::AddDir { .. }
         | SlashCommand::Divide { .. }
         | SlashCommand::Chain { .. }
-        | SlashCommand::Power { .. } => Err("unsupported resumed slash command".into()),
+        | SlashCommand::Power { .. } => Err(UNSUPPORTED_RESUME_COMMAND.into()),
     }
 }
 
@@ -5048,14 +5046,15 @@ mod tests {
         render_memory_report, render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, render_version_report, resolve_model_alias,
         resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
-        response_to_events, resume_supported_slash_commands, run_resume_command, short_tool_id,
-        slash_command_completion_candidates_with_sessions, status_context,
-        summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_no_args,
-        write_mcp_server_fixture, BackgroundMcp, BackgroundMcpOutcome, BackgroundMcpShared,
-        CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
+        response_to_events, resume_safe_slash_command, resume_supported_slash_commands,
+        run_resume_command, short_tool_id, slash_command_completion_candidates_with_sessions,
+        status_context, summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt,
+        validate_no_args, write_mcp_server_fixture, BackgroundMcp, BackgroundMcpOutcome,
+        BackgroundMcpShared, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
         McpStartup, PromptHistoryEntry, RuntimeMcpState, SessionLock, SlashCommand, StatusUsage,
-        BACKGROUND_MCP_STOP_WAIT, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
+        BACKGROUND_MCP_STOP_WAIT, CLI_OPTION_SUGGESTIONS, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
+        OPTIONS_APPLIED_AFTER_PROMPT, STUB_COMMANDS, UNSUPPORTED_RESUME_COMMAND,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -9226,7 +9225,168 @@ UU conflicted.rs",
             );
         }
         assert!(help.contains("neuron [FLAGS] -p TEXT"), "{help}");
-        assert!(help.contains("--allow-broad-cwd"), "{help}");
+
+        // The slash table's [resume] marker and the Resume-safe line name the same commands.
+        let listed = words
+            .iter()
+            .filter_map(|word| word.strip_prefix('/'))
+            .collect::<std::collections::BTreeSet<_>>();
+        let marked = help
+            .lines()
+            .filter(|line| line.ends_with(" [resume]"))
+            .filter_map(|line| line.split_whitespace().next()?.strip_prefix('/'))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(listed, marked, "{help}");
+        // `neuron --resume SESSION /plan` exits 2: plan mode needs a live session.
+        assert!(!listed.contains("plan"), "{resume_line}");
+
+        // Every option the parser takes appears in --help as a word of its own.
+        let help_words = help
+            .split(|c: char| c.is_whitespace() || matches!(c, ',' | '(' | ')' | ';' | '`'))
+            .collect::<std::collections::BTreeSet<_>>();
+        for flag in CLI_OPTION_SUGGESTIONS
+            .iter()
+            .chain(OPTIONS_APPLIED_AFTER_PROMPT)
+            .chain(&["--provider"])
+            .filter(|flag| !matches!(**flag, "--help" | "-h"))
+        {
+            assert!(help_words.contains(flag), "--help does not list {flag}");
+        }
+    }
+
+    /// Every command that `--help` lists as resume-safe, and that the `neuron X` /
+    /// `neuron /X` hints send to `--resume`, gets past `run_resume_command`'s "needs a
+    /// live session" arm. Each runs against an empty saved session in a scratch folder,
+    /// with a scratch Neuron home (so the login is a file there, not the OS credential
+    /// store), no `NEURON_TOKEN`, doctor offline and a loopback gateway, so nothing reads
+    /// the real login or reaches the network.
+    #[test]
+    fn every_resume_safe_command_runs_under_resume() {
+        struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (name, value) in self.0.drain(..).rev() {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+
+        let _guard = env_lock();
+        let root = temp_dir();
+        let workspace = root.join("workspace");
+        let home = root.join("home");
+        fs::create_dir_all(&workspace).expect("workspace dir");
+        fs::create_dir_all(&home).expect("home dir");
+        let config_home = home.join(".neuron");
+        let vars: [(&'static str, Option<&std::ffi::OsStr>); 6] = [
+            ("NEURON_HOME", Some(home.as_os_str())),
+            ("NEURON_TOKEN", None),
+            ("NEURON_CONFIG_HOME", Some(config_home.as_os_str())),
+            ("CLAW_CONFIG_HOME", None),
+            ("NEURON_DOCTOR_OFFLINE", Some(std::ffi::OsStr::new("1"))),
+            (
+                "NEURON_API_BASE",
+                Some(std::ffi::OsStr::new("http://127.0.0.1:9")),
+            ),
+        ];
+        let restore = RestoreEnv(
+            vars.iter()
+                .map(|(name, value)| {
+                    let previous = std::env::var_os(name);
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                    (*name, previous)
+                })
+                .collect(),
+        );
+
+        let session_path = workspace.join("session.jsonl");
+        Session::new()
+            .save_to_path(&session_path)
+            .expect("session should save");
+        let session = Session::load_from_path(&session_path).expect("session should load");
+
+        let resume_safe = commands::slash_command_specs()
+            .iter()
+            .filter(|spec| resume_safe_slash_command(spec.name))
+            .collect::<Vec<_>>();
+        assert!(resume_safe.iter().any(|spec| spec.name == "status"));
+        let mut help = Vec::new();
+        print_help_to(&mut help).expect("help should render");
+        let help = String::from_utf8(help).expect("help should be utf8");
+        let resume_line = help
+            .lines()
+            .find(|line| line.starts_with("Resume-safe commands:"))
+            .expect("help should list the resume-safe commands");
+        let listed = resume_line
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .filter_map(|word| word.strip_prefix('/'))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            listed,
+            resume_safe.iter().map(|spec| spec.name).collect::<Vec<_>>(),
+            "--help must list exactly the commands the hints call resume-safe"
+        );
+
+        for name in resume_safe
+            .iter()
+            .flat_map(|spec| std::iter::once(&spec.name).chain(spec.aliases.iter()))
+        {
+            let command = SlashCommand::parse(&format!("/{name}"))
+                .unwrap_or_else(|error| panic!("/{name} should parse: {error}"))
+                .unwrap_or_else(|| panic!("/{name} should be a slash command"));
+            let result = with_current_dir(&workspace, || {
+                run_resume_command(&session_path, &session, &command)
+            });
+            if let Err(error) = result {
+                assert_ne!(
+                    error.to_string(),
+                    UNSUPPORTED_RESUME_COMMAND,
+                    "/{name} is listed as resume-safe but `neuron --resume` cannot run it"
+                );
+            }
+        }
+
+        drop(restore);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// `neuron X` and `neuron /X` offer `--resume` exactly for the resume-safe commands,
+    /// and send no one to a stub that only says "not yet implemented".
+    #[test]
+    fn slash_command_hints_offer_resume_only_where_it_runs() {
+        for spec in commands::slash_command_specs() {
+            for args in [vec![spec.name.to_string()], vec![format!("/{}", spec.name)]] {
+                let Err(error) = parse_args(&args) else {
+                    continue;
+                };
+                assert_eq!(
+                    error.contains("--resume"),
+                    resume_safe_slash_command(spec.name),
+                    "`neuron {}`: {error}",
+                    args[0]
+                );
+                if STUB_COMMANDS.contains(&spec.name) {
+                    assert!(
+                        error.contains("not yet implemented"),
+                        "`neuron {}`: {error}",
+                        args[0]
+                    );
+                }
+            }
+        }
+        let error = parse_args(&["/plan".to_string()]).expect_err("/plan needs a session");
+        assert!(
+            error.contains("slash command /plan works only inside a session"),
+            "{error}"
+        );
+        let error = parse_args(&["plan".to_string()]).expect_err("plan is a slash command");
+        assert!(!error.contains("--resume"), "{error}");
     }
 }
 

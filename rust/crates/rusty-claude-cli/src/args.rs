@@ -722,7 +722,11 @@ pub(crate) fn bare_slash_command_guidance(command_name: &str) -> Option<String> 
     let slash_command = slash_command_specs()
         .iter()
         .find(|spec| spec.name == command_name || spec.aliases.contains(&command_name))?;
-    let guidance = if slash_command.resume_supported {
+    let guidance = if stub_slash_command(command_name) {
+        format!(
+            "`neuron {command_name}` is a slash command that is not yet implemented in this build; to send it as a prompt, use `neuron prompt {command_name}`."
+        )
+    } else if resume_safe_slash_command(command_name) {
         format!(
             "`neuron {command_name}` is a slash command. Use `neuron --resume SESSION.jsonl /{command_name}` or start `neuron` and run `/{command_name}`."
         )
@@ -1016,6 +1020,14 @@ pub(crate) fn parse_direct_slash_cli_action(
     reasoning_effort: Option<String>,
     allow_broad_cwd: bool,
 ) -> Result<CliAction, String> {
+    // Before parsing: a stub without a parse arm would read as an unknown command
+    // that suggests itself.
+    if stub_slash_command(&rest[0]) {
+        return Err(format!(
+            "slash command {} is not yet implemented in this build.",
+            rest[0]
+        ));
+    }
     let raw = rest.join(" ");
     match SlashCommand::parse(&raw) {
         Ok(Some(SlashCommand::Help)) => Ok(CliAction::Help { output_format }),
@@ -1075,18 +1087,36 @@ pub(crate) fn parse_direct_slash_cli_action(
 }
 
 /// Whether `neuron --resume SESSION /name` runs this command: it is marked [resume] in
-/// /help and is not one of the stubs that only say "not yet implemented".
-fn resume_safe_slash_command(command_name: &str) -> bool {
-    let name = command_name
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .trim_start_matches('/');
+/// /help and is not one of the stubs that only say "not yet implemented". `--help`'s
+/// "Resume-safe commands" line and the hints for `neuron X` / `neuron /X` all use this;
+/// the test `every_resume_safe_command_runs_under_resume` runs each one through
+/// `run_resume_command`.
+pub(crate) fn resume_safe_slash_command(command_name: &str) -> bool {
+    let name = slash_command_root(command_name);
     slash_command_specs().iter().any(|spec| {
         spec.resume_supported
             && !STUB_COMMANDS.contains(&spec.name)
             && (spec.name == name || spec.aliases.contains(&name))
     })
+}
+
+/// Whether `/name` (or an alias of it) is one of the stubs that only say "not yet
+/// implemented".
+fn stub_slash_command(command_name: &str) -> bool {
+    let name = slash_command_root(command_name);
+    STUB_COMMANDS.contains(&name)
+        || slash_command_specs()
+            .iter()
+            .any(|spec| STUB_COMMANDS.contains(&spec.name) && spec.aliases.contains(&name))
+}
+
+/// `status` for `/status`, `status` or `/status --json`.
+fn slash_command_root(command_name: &str) -> &str {
+    command_name
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches('/')
 }
 
 pub(crate) fn format_unknown_option(option: &str) -> String {
@@ -1562,7 +1592,7 @@ fn session_flag_error(word: &str) -> String {
 /// The options `neuron prompt TEXT` still applies after its text (the arms of
 /// [`parse_args_with_stdin`]). After `-p` every word is prompt text, so there they would
 /// be sent to the model instead.
-const OPTIONS_APPLIED_AFTER_PROMPT: &[&str] = &[
+pub(crate) const OPTIONS_APPLIED_AFTER_PROMPT: &[&str] = &[
     "--model",
     "--output-format",
     "--permission-mode",
