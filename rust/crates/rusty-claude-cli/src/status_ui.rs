@@ -81,7 +81,7 @@ pub(crate) fn render_shortcuts_panel() -> String {
     let kv = |key: &str, desc: &str| -> String { format!("{ky}{key:<14}{r} {ds}{desc}{r}") };
 
     let title_line = format!(
-        "  {bc}\u{2502}{r}  {hd}\u{2328}  NeuronCLI Shortcuts{r}{}  {bc}\u{2502}{r}",
+        "  {bc}\u{2502}{r}  {hd}\u{2328}  Neuron Shortcuts{r}{}  {bc}\u{2502}{r}",
         " ".repeat(w - 23)
     );
 
@@ -836,6 +836,16 @@ pub(crate) fn init_claude_md() -> Result<String, Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_shortcuts_panel_title_names_neuron_and_fits_the_frame() {
+        let panel = render_shortcuts_panel();
+        assert!(panel.contains("Neuron Shortcuts"), "{panel}");
+        assert!(!panel.contains("NeuronCLI"), "{panel}");
+        let mut lines = panel.lines().map(crate::brand::strip_ansi_len);
+        let (top, title) = (lines.next(), lines.next());
+        assert!(top.is_some() && top == title, "{top:?} {title:?}");
+    }
 
     #[test]
     fn the_banner_welcomes_a_new_account_and_names_it() {

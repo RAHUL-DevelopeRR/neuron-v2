@@ -171,7 +171,7 @@ pub(crate) fn render_init_claude_md(cwd: &Path) -> String {
     let mut lines = vec![
         "# NEURON.md".to_string(),
         String::new(),
-        "This file provides guidance to NeuronCLI (zero-x.live) when working with code in this repository.".to_string(),
+        "This file provides guidance to Neuron (zero-x.live) when working with code in this repository.".to_string(),
         String::new(),
     ];
 
@@ -415,6 +415,10 @@ mod tests {
             .expect("the NEURON.md written by /init must be discovered");
         assert!(neuron_md.content.contains("# NEURON.md"));
         assert!(neuron_md.content.contains("Languages: Rust."));
+        assert!(neuron_md
+            .content
+            .contains("This file provides guidance to Neuron (zero-x.live)"));
+        assert!(!neuron_md.content.contains("NeuronCLI"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

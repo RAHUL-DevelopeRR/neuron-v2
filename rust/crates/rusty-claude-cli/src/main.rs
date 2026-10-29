@@ -104,7 +104,8 @@ use args::*;
 use commands::{
     classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
     handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
-    handle_skills_slash_command, handle_skills_slash_command_json, render_slash_command_help,
+    handle_skills_slash_command, handle_skills_slash_command_json,
+    handle_skills_slash_command_with_json, render_slash_command_help,
     render_slash_command_help_filtered, resolve_skill_invocation, resume_supported_slash_commands,
     slash_command_specs, validate_slash_command_input, SkillSlashDispatch, SlashCommand,
 };
@@ -385,6 +386,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(engine_args) = engine_stdio::stdio_engine_args(&args) {
         return engine_stdio::run_engine_command(&engine_args);
     }
+    crate::args::record_no_tui_flag(no_tui);
     let action = parse_args(&args).map_err(UsageError)?;
     if continue_chat.is_some() && !matches!(action, CliAction::Repl { .. }) {
         return Err(full_screen::CONTINUE_NEEDS_UI.into());
@@ -424,6 +426,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
             launch,
         } => resume_session(&session_path, &commands, output_format, launch),
+        CliAction::ResumePrompt {
+            session_path,
+            prompt,
+            output_format,
+            launch,
+            compact,
+        } => {
+            // Checked here as `--resume` checks it; the run opens it again under its lock.
+            let (handle, session) = restore_session_or_exit(&session_path, output_format);
+            let options = repl_loop::resume_launch(
+                launch,
+                session.model.as_deref(),
+                handle.path.display().to_string(),
+            );
+            run_prompt(&prompt, options, output_format, compact)?;
+        }
         CliAction::Status {
             model,
             permission_mode,
@@ -440,53 +458,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             base_commit,
             reasoning_effort,
             allow_broad_cwd,
-        } => {
-            enforce_broad_cwd_policy(allow_broad_cwd, output_format)?;
-            run_stale_base_preflight(base_commit.as_deref());
-            progress::set_mcp_startup(McpStartup::WaitWithoutBundled);
-            // Workspace trust check (skip when stdin is piped so we don't consume the pipe)
-            if runtime::ui_hooks::stdin_is_terminal() {
-                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                if !crate::auth::check_trust(&cwd) {
-                    std::process::exit(1);
-                }
-            }
-            let permission_mode = crate::args::permission_mode_after_trust(permission_mode);
-            let model = crate::args::model_after_trust(model);
-            // JSON mode: stderr carries only the JSON error, not the Azure notice.
-            provider::set_json_output(output_format == CliOutputFormat::Json);
-            // ── Resolve provider (Azure primary → OpenRouter fallback) ──
-            // The provider always dictates the model — when Azure is up we
-            // use gpt-5.5, when falling back to OpenRouter we MUST switch
-            // to the free-tier model regardless of what the user passed.
-            let effective_model = configure_provider_for_model(model)?;
-            // `cat log | neuron prompt "explain this log"`: what stdin carries is context
-            // for the prompt, in any permission mode. A run whose stdin is not a terminal
-            // never asks for approval (approvals and questions are refused), so reading
-            // it takes nothing from them. `echo 'hello' | neuron -p`: stdin is the prompt.
-            let stdin_context = headless::stdin_context(!prompt.trim().is_empty(), output_format);
-            let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
-            let mut cli = LiveCli::new(effective_model, true, allowed_tools, permission_mode)?;
-            cli.set_reasoning_effort(reasoning_effort);
-            // Nobody to answer (stdin not a terminal): approvals and questions are refused.
-            headless::start(headless::stdin_is_unattended(), output_format);
-            // Print a condensed welcome banner for one-shot mode so the user
-            // sees model info and quota even when not in the REPL.
-            // Not to a file or a pipe: there it is noise around the answer.
-            if output_format == CliOutputFormat::Text && !compact && io::stdout().is_terminal() {
-                println!("{}", cli.startup_banner());
-                println!("{}", format_connected_line(&cli.model));
-                println!();
-            }
-            let result = cli.run_turn_with_output(&effective_prompt, output_format, compact);
-            // Tool calls denied for lack of a prompt: named once more, and exit code 2.
-            let denied_exit = headless::report(output_format);
-            result?;
-            if let Some(code) = denied_exit {
-                drop(cli);
-                std::process::exit(code);
-            }
-        }
+        } => run_prompt(
+            &prompt,
+            repl_loop::ReplLaunch {
+                model,
+                allowed_tools,
+                permission_mode,
+                base_commit,
+                reasoning_effort,
+                allow_broad_cwd,
+                resume: None,
+            },
+            output_format,
+            compact,
+        )?,
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
         CliAction::Acp { output_format } => print_acp_status(output_format)?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
@@ -525,6 +510,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if continue_chat.is_some() {
                 return Err(full_screen::CONTINUE_NEEDS_UI.into());
             }
+            // `neuron </dev/null`: an empty pipe or file, so no prompt and nobody to
+            // type one. Said before the trust question and before a session is saved.
+            if !runtime::ui_hooks::stdin_is_terminal() {
+                return Err(UsageError(
+                    "nothing to do: no prompt was given and standard input is not a terminal. \
+Use `neuron prompt \"...\"` or pipe a prompt; start `neuron` in a terminal for a session."
+                        .to_string(),
+                )
+                .into());
+            }
             run_repl(
                 model,
                 allowed_tools,
@@ -536,6 +531,88 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
+    }
+    Ok(())
+}
+
+/// `neuron prompt TEXT`: one turn, then exit. With `options.resume`
+/// (`neuron --resume SESSION prompt TEXT`) the turn continues that saved session and
+/// is saved to it; the session is held from before it is read until the run ends, so
+/// another run continuing it is refused rather than overwritten.
+fn run_prompt(
+    prompt: &str,
+    options: repl_loop::ReplLaunch,
+    output_format: CliOutputFormat,
+    compact: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    enforce_broad_cwd_policy(options.allow_broad_cwd, output_format)?;
+    run_stale_base_preflight(options.base_commit.as_deref());
+    progress::set_mcp_startup(McpStartup::WaitWithoutBundled);
+    // Workspace trust check (skip when stdin is piped so we don't consume the pipe)
+    if runtime::ui_hooks::stdin_is_terminal() {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        if !crate::auth::check_trust(&cwd) {
+            std::process::exit(1);
+        }
+    }
+    let permission_mode = crate::args::permission_mode_after_trust(options.permission_mode);
+    let model = crate::args::model_after_trust(options.model);
+    // JSON mode: stderr carries only the JSON error, not the Azure notice.
+    provider::set_json_output(output_format == CliOutputFormat::Json);
+    // ── Resolve provider (Azure primary → OpenRouter fallback) ──
+    // The provider always dictates the model — when Azure is up we
+    // use gpt-5.5, when falling back to OpenRouter we MUST switch
+    // to the free-tier model regardless of what the user passed.
+    let effective_model = configure_provider_for_model(model)?;
+    // A model the gateway cannot serve now is named before the request fails.
+    gateway_repl::warn_about_prompt_model(&effective_model);
+    // `cat log | neuron prompt "explain this log"`: what stdin carries is context
+    // for the prompt, in any permission mode. A run whose stdin is not a terminal
+    // never asks for approval (approvals and questions are refused), so reading
+    // it takes nothing from them. `echo 'hello' | neuron -p`: stdin is the prompt.
+    let stdin_context = headless::stdin_context(!prompt.trim().is_empty(), output_format);
+    let effective_prompt = merge_prompt_with_stdin(prompt, stdin_context.as_deref());
+    if effective_prompt.trim().is_empty() {
+        return Err(UsageError(
+            "no prompt: nothing followed -p and standard input brought nothing. Put the \
+prompt after -p, or pipe it: `echo \"...\" | neuron -p`."
+                .to_string(),
+        )
+        .into());
+    }
+    let mut cli = match options.resume {
+        Some(reference) => LiveCli::resuming(
+            effective_model,
+            true,
+            options.allowed_tools,
+            permission_mode,
+            open_session_reference(&reference)?,
+        )?,
+        None => LiveCli::new(
+            effective_model,
+            true,
+            options.allowed_tools,
+            permission_mode,
+        )?,
+    };
+    cli.set_reasoning_effort(options.reasoning_effort);
+    // Nobody to answer (stdin not a terminal): approvals and questions are refused.
+    headless::start(headless::stdin_is_unattended(), output_format);
+    // Print a condensed welcome banner for one-shot mode so the user
+    // sees model info and quota even when not in the REPL.
+    // Not to a file or a pipe: there it is noise around the answer.
+    if output_format == CliOutputFormat::Text && !compact && io::stdout().is_terminal() {
+        println!("{}", cli.startup_banner());
+        println!("{}", format_connected_line(&cli.model));
+        println!();
+    }
+    let result = cli.run_turn_with_output(&effective_prompt, output_format, compact);
+    // Tool calls denied for lack of a prompt: named once more, and exit code 2.
+    let denied_exit = headless::report(output_format);
+    result?;
+    if let Some(code) = denied_exit {
+        drop(cli);
+        std::process::exit(code);
     }
     Ok(())
 }
@@ -720,13 +797,13 @@ fn version_json_value() -> serde_json::Value {
     })
 }
 
-#[allow(clippy::too_many_lines)]
-fn resume_session(
+/// Loads the session `--resume` names, or exits saying why it could not (as JSON
+/// with `--output-format json`). What was wrong in a session that loaded is a warning
+/// on stderr.
+fn restore_session_or_exit(
     session_path: &Path,
-    commands: &[String],
     output_format: CliOutputFormat,
-    launch: ResumeLaunchOptions,
-) {
+) -> (SessionHandle, Session) {
     let session_reference = session_path.display().to_string();
     let (handle, session) = match load_session_reference(&session_reference) {
         Ok(loaded) => loaded,
@@ -745,9 +822,8 @@ fn resume_session(
             std::process::exit(1);
         }
     };
-    let resolved_path = handle.path.clone();
     if let Some(warning) = session.load_diagnostics().warning_message() {
-        let warning = format!("session {}: {warning}", resolved_path.display());
+        let warning = format!("session {}: {warning}", handle.path.display());
         if output_format == CliOutputFormat::Json {
             eprintln!(
                 "{}",
@@ -757,6 +833,18 @@ fn resume_session(
             eprintln!("warning: {warning}");
         }
     }
+    (handle, session)
+}
+
+#[allow(clippy::too_many_lines)]
+fn resume_session(
+    session_path: &Path,
+    commands: &[String],
+    output_format: CliOutputFormat,
+    launch: ResumeLaunchOptions,
+) {
+    let (handle, session) = restore_session_or_exit(session_path, output_format);
+    let resolved_path = handle.path.clone();
 
     if commands.is_empty() {
         // `neuron --resume <id>` on a terminal continues the conversation in
@@ -788,7 +876,7 @@ fn resume_session(
             );
         } else {
             println!(
-                "Restored session from {} ({} messages).",
+                "Restored session from {} ({} messages). Nothing to do without a terminal: add slash commands such as /status, or `prompt \"...\"` to continue it.",
                 handle.path.display(),
                 session.messages.len()
             );
@@ -797,6 +885,35 @@ fn resume_session(
     }
 
     let mut session = session;
+    // /compact and /clear rewrite the session: under its lock, read again, so a run
+    // continuing it meanwhile is refused rather than overwritten.
+    let _lock = if commands
+        .iter()
+        .any(|command| resume_command_rewrites(command))
+    {
+        match open_session_reference(&resolved_path.display().to_string()) {
+            Ok(opened) => {
+                session = opened.session;
+                Some(opened.lock)
+            }
+            Err(error) => {
+                if output_format == CliOutputFormat::Json {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "type": "error",
+                            "error": format!("failed to restore session: {error}"),
+                        })
+                    );
+                } else {
+                    eprintln!("failed to restore session: {error}");
+                }
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
     for raw_command in commands {
         // Intercept spec commands that have no parse arm before calling
         // SlashCommand::parse — they return Err(SlashCommandParseError) which
@@ -823,19 +940,6 @@ fn resume_session(
                     eprintln!("/{cmd_root} is not yet implemented in this build");
                 }
                 std::process::exit(2);
-            }
-            if cmd_root == "context" {
-                let report = repl_loop::saved_session_context_report(&session);
-                if output_format == CliOutputFormat::Json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&repl_loop::context_report_json(&report))
-                            .expect("context report json")
-                    );
-                } else {
-                    println!("{}", repl_loop::render_context_report(&report));
-                }
-                continue;
             }
         }
         let command = match SlashCommand::parse(raw_command) {
@@ -909,6 +1013,16 @@ fn resume_session(
             }
         }
     }
+}
+
+/// Whether resume command `raw_command` rewrites the session file.
+fn resume_command_rewrites(raw_command: &str) -> bool {
+    matches!(
+        SlashCommand::parse(raw_command),
+        Ok(Some(
+            SlashCommand::Compact | SlashCommand::Clear { confirm: true }
+        ))
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -1096,6 +1210,9 @@ fn parse_git_status_metadata_for(
     let project_root = find_git_root_in(cwd).ok();
     (project_root, branch)
 }
+
+/// What `run_resume_command` returns for a command that needs a live session.
+const UNSUPPORTED_RESUME_COMMAND: &str = "unsupported resumed slash command";
 
 #[allow(clippy::too_many_lines)]
 fn run_resume_command(
@@ -1313,10 +1430,12 @@ fn run_resume_command(
                 );
             }
             let cwd = env::current_dir()?;
+            // One run for both outputs: `/skills install` must not install twice.
+            let (message, json) = handle_skills_slash_command_with_json(args.as_deref(), &cwd)?;
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
-                message: Some(handle_skills_slash_command(args.as_deref(), &cwd)?),
-                json: Some(handle_skills_slash_command_json(args.as_deref(), &cwd)?),
+                message: Some(message),
+                json: Some(json),
             })
         }
         SlashCommand::Doctor => {
@@ -1359,6 +1478,16 @@ fn run_resume_command(
                         "text": e.text,
                     })).collect::<Vec<_>>(),
                 })),
+            })
+        }
+        // The saved session's context budget; other arguments fail as in a session.
+        SlashCommand::Context { action } => {
+            repl_loop::check_context_argument(action.as_deref().unwrap_or_default())?;
+            let report = repl_loop::saved_session_context_report(session);
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(repl_loop::render_context_report(&report)),
+                json: Some(repl_loop::context_report_json(&report)),
             })
         }
         SlashCommand::Unknown(name) => Err(format_unknown_slash_command(name).into()),
@@ -1430,7 +1559,6 @@ fn run_resume_command(
         | SlashCommand::Rename { .. }
         | SlashCommand::Copy { .. }
         | SlashCommand::Hooks { .. }
-        | SlashCommand::Context { .. }
         | SlashCommand::Color { .. }
         | SlashCommand::Effort { .. }
         | SlashCommand::Branch { .. }
@@ -1441,7 +1569,7 @@ fn run_resume_command(
         | SlashCommand::AddDir { .. }
         | SlashCommand::Divide { .. }
         | SlashCommand::Chain { .. }
-        | SlashCommand::Power { .. } => Err("unsupported resumed slash command".into()),
+        | SlashCommand::Power { .. } => Err(UNSUPPORTED_RESUME_COMMAND.into()),
     }
 }
 
@@ -1578,6 +1706,8 @@ struct LiveCli {
     system_prompt: Vec<String>,
     runtime: BuiltRuntime,
     session: SessionHandle,
+    /// Held while `session` is this CLI's, so no other run writes it meanwhile.
+    session_lock: SessionLock,
     prompt_history: Vec<PromptHistoryEntry>,
 }
 
@@ -2418,12 +2548,54 @@ impl LiveCli {
         permission_mode: PermissionMode,
         output: TurnOutput,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let cli = Self::on_session(
+            model,
+            enable_tools,
+            allowed_tools,
+            permission_mode,
+            output,
+            new_open_session()?,
+        )?;
+        cli.persist_session()?;
+        Ok(cli)
+    }
+
+    /// [`Self::new`] continuing a saved session opened with [`open_session_reference`]:
+    /// no session file of its own is made, so none is left behind.
+    fn resuming(
+        model: String,
+        enable_tools: bool,
+        allowed_tools: Option<AllowedToolSet>,
+        permission_mode: PermissionMode,
+        saved: OpenSession,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::on_session(
+            model,
+            enable_tools,
+            allowed_tools,
+            permission_mode,
+            TurnOutput::Ansi,
+            saved,
+        )
+    }
+
+    fn on_session(
+        model: String,
+        enable_tools: bool,
+        allowed_tools: Option<AllowedToolSet>,
+        permission_mode: PermissionMode,
+        output: TurnOutput,
+        opened: OpenSession,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt()?;
-        let session_state = new_cli_session()?;
-        let session = create_managed_session_handle(&session_state.session_id)?;
+        let OpenSession {
+            handle,
+            session,
+            lock,
+        } = opened;
         let runtime = build_runtime(
-            session_state.with_persistence_path(session.path.clone()),
-            &session.id,
+            session,
+            &handle.id,
             model.clone(),
             system_prompt.clone(),
             enable_tools,
@@ -2432,7 +2604,7 @@ impl LiveCli {
             permission_mode,
             None,
         )?;
-        let cli = Self {
+        Ok(Self {
             model,
             allowed_tools,
             permission_mode,
@@ -2441,11 +2613,10 @@ impl LiveCli {
             orchestration_mode: None,
             system_prompt,
             runtime,
-            session,
+            session: handle,
+            session_lock: lock,
             prompt_history: Vec::new(),
-        };
-        cli.persist_session()?;
-        Ok(cli)
+        })
     }
 
     fn set_reasoning_effort(&mut self, effort: Option<String>) {
@@ -2939,10 +3110,10 @@ impl LiveCli {
                 // What the turn did before it failed: a script must not mistake a
                 // failed run that already ran tools for one that did nothing.
                 let messages = self.runtime.session().messages.get(before..).unwrap_or(&[]);
-                println!(
-                    "{}",
-                    failed_turn_json(&error.to_string(), shown_model(&self.model), messages)
-                );
+                let mut answer =
+                    failed_turn_json(&error.to_string(), shown_model(&self.model), messages);
+                answer["session_id"] = json!(self.session.id);
+                println!("{answer}");
                 return Err(error);
             }
         };
@@ -2950,10 +3121,9 @@ impl LiveCli {
             // Stopped at the denial limit: an error answer, with what the turn did. The
             // exit code and the stderr line come from `headless::report`.
             let messages = self.runtime.session().messages.get(before..).unwrap_or(&[]);
-            println!(
-                "{}",
-                failed_turn_json(&stop, shown_model(&self.model), messages)
-            );
+            let mut answer = failed_turn_json(&stop, shown_model(&self.model), messages);
+            answer["session_id"] = json!(self.session.id);
+            println!("{answer}");
             return Ok(());
         }
         println!(
@@ -2961,6 +3131,8 @@ impl LiveCli {
             json!({
                 "message": final_assistant_text(&summary),
                 "model": shown_model(&self.model),
+                // What `--resume` takes to continue this session.
+                "session_id": self.session.id,
                 "iterations": summary.iterations,
                 "outcome": repl_loop::turn_outcome_label(&summary.outcome),
                 "stop_reason": summary.stop_reason,
@@ -3480,10 +3652,15 @@ impl LiveCli {
         }
 
         let previous_session = self.session.clone();
-        let session_state = new_cli_session()?;
-        self.session = create_managed_session_handle(&session_state.session_id)?;
+        let OpenSession {
+            handle,
+            session,
+            lock,
+        } = new_open_session()?;
+        self.session = handle;
+        self.session_lock = lock;
         let runtime = build_runtime(
-            session_state.with_persistence_path(self.session.path.clone()),
+            session,
             &self.session.id,
             self.model.clone(),
             self.system_prompt.clone(),
@@ -3524,10 +3701,31 @@ impl LiveCli {
             return Ok(false);
         };
 
-        let (handle, session) = load_session_reference(&session_ref)?;
+        let message_count = self.switch_session(&session_ref)?;
+        println!(
+            "{}",
+            format_resume_report(
+                &self.session.path.display().to_string(),
+                message_count,
+                prompt_count(self.runtime.session()),
+            )
+        );
+        Ok(true)
+    }
+
+    /// Continues the saved session `session_ref` from here on, saying nothing; returns
+    /// how many messages it holds. One another run holds is refused.
+    fn switch_session(&mut self, session_ref: &str) -> Result<usize, Box<dyn std::error::Error>> {
+        let (handle, session, lock) = self.open_saved_session(session_ref)?;
         let message_count = session.messages.len();
         let session_id = session.session_id.clone();
-        let runtime = build_runtime(
+        // The effort the run asked for goes on, whatever session it continues.
+        let reasoning_effort = self
+            .runtime
+            .api_client()
+            .reasoning_effort()
+            .map(ToOwned::to_owned);
+        let mut runtime = build_runtime(
             session,
             &handle.id,
             self.model.clone(),
@@ -3538,20 +3736,61 @@ impl LiveCli {
             self.permission_mode,
             None,
         )?;
+        runtime
+            .api_client_mut()
+            .set_reasoning_effort(reasoning_effort);
         self.replace_runtime(runtime)?;
-        self.session = SessionHandle {
-            id: session_id,
-            path: handle.path,
-        };
-        println!(
-            "{}",
-            format_resume_report(
-                &self.session.path.display().to_string(),
-                message_count,
-                prompt_count(self.runtime.session()),
-            )
+        self.adopt_session(
+            SessionHandle {
+                id: session_id,
+                path: handle.path,
+            },
+            lock,
         );
-        Ok(true)
+        Ok(message_count)
+    }
+
+    /// Loads saved session `session_ref` for this CLI to continue: locked before it is
+    /// read ([`open_session_reference`]), or, when it is this CLI's own session, under the
+    /// lock the CLI already holds (no new lock).
+    fn open_saved_session(
+        &self,
+        session_ref: &str,
+    ) -> Result<(SessionHandle, Session, Option<SessionLock>), Box<dyn std::error::Error>> {
+        let resolved = resolve_session_reference(session_ref)?;
+        let reference = resolved.path.display().to_string();
+        if same_session_file(&resolved.path, &self.session.path) {
+            let (handle, session) = load_session_reference(&reference)?;
+            return Ok((handle, session, None));
+        }
+        let opened = open_session_reference(&reference)?;
+        Ok((opened.handle, opened.session, Some(opened.lock)))
+    }
+
+    /// Makes `handle` this CLI's session, holding `lock` (from
+    /// [`Self::open_saved_session`]) instead of the previous session's.
+    fn adopt_session(&mut self, handle: SessionHandle, lock: Option<SessionLock>) {
+        self.session = handle;
+        if let Some(lock) = lock {
+            self.session_lock = lock;
+        }
+    }
+
+    /// Ends a CLI that stops before its session was used: an empty session file goes,
+    /// with its lock file, so the run leaves nothing behind.
+    fn discard_unused_session(self) {
+        let Self {
+            runtime,
+            session,
+            session_lock,
+            ..
+        } = self;
+        let unused = runtime.session().messages.is_empty();
+        drop(runtime);
+        if unused {
+            let _ = fs::remove_file(&session.path);
+            session_lock.remove();
+        }
     }
 
     fn print_config(section: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
@@ -3680,25 +3919,7 @@ impl LiveCli {
                     println!("Usage: /session switch <session-id>");
                     return Ok(false);
                 };
-                let (handle, session) = load_session_reference(target)?;
-                let message_count = session.messages.len();
-                let session_id = session.session_id.clone();
-                let runtime = build_runtime(
-                    session,
-                    &handle.id,
-                    self.model.clone(),
-                    self.system_prompt.clone(),
-                    true,
-                    true,
-                    self.allowed_tools.clone(),
-                    self.permission_mode,
-                    None,
-                )?;
-                self.replace_runtime(runtime)?;
-                self.session = SessionHandle {
-                    id: session_id,
-                    path: handle.path,
-                };
+                let message_count = self.switch_session(target)?;
                 println!(
                     "Session switched\n  Active session   {}\n  File             {}\n  Messages         {}",
                     self.session.id,
@@ -3711,6 +3932,7 @@ impl LiveCli {
                 let forked = self.runtime.fork_session(target.map(ToOwned::to_owned));
                 let parent_session_id = self.session.id.clone();
                 let handle = create_managed_session_handle(&forked.session_id)?;
+                let lock = SessionLock::acquire(&handle.path)?;
                 let branch_name = forked
                     .fork
                     .as_ref()
@@ -3730,7 +3952,7 @@ impl LiveCli {
                     None,
                 )?;
                 self.replace_runtime(runtime)?;
-                self.session = handle;
+                self.adopt_session(handle, Some(lock));
                 println!(
                     "Session forked\n  Parent session   {}\n  Active session   {}\n  Branch           {}\n  File             {}\n  Messages         {}",
                     parent_session_id,
@@ -4403,7 +4625,7 @@ fn parse_titled_body(value: &str) -> Option<(String, String)> {
 }
 
 fn render_version_report() -> String {
-    let mut lines = vec!["NeuronCLI".to_string()];
+    let mut lines = vec!["Neuron".to_string()];
     lines.push(format!("  Version          {VERSION}"));
     if let Some(sha) = GIT_SHA {
         lines.push(format!("  Git SHA          {sha}"));
@@ -4826,16 +5048,17 @@ mod tests {
         parse_git_workspace_summary, parse_history_count, permission_policy, print_help_to,
         push_output_block, render_config_report, render_diff_report, render_diff_report_for,
         render_memory_report, render_prompt_history_report, render_repl_help, render_resume_usage,
-        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
-        resolve_repl_model, resolve_session_reference, response_to_events,
-        resume_supported_slash_commands, run_resume_command, short_tool_id,
-        slash_command_completion_candidates_with_sessions, status_context,
-        summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_no_args,
-        write_mcp_server_fixture, BackgroundMcp, BackgroundMcpOutcome, BackgroundMcpShared,
-        CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
+        render_session_markdown, render_version_report, resolve_model_alias,
+        resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
+        response_to_events, resume_safe_slash_command, resume_supported_slash_commands,
+        run_resume_command, short_tool_id, slash_command_completion_candidates_with_sessions,
+        status_context, summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt,
+        validate_no_args, write_mcp_server_fixture, BackgroundMcp, BackgroundMcpOutcome,
+        BackgroundMcpShared, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        McpStartup, PromptHistoryEntry, RuntimeMcpState, SlashCommand, StatusUsage,
-        BACKGROUND_MCP_STOP_WAIT, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
+        McpStartup, PromptHistoryEntry, RuntimeMcpState, SessionLock, SlashCommand, StatusUsage,
+        BACKGROUND_MCP_STOP_WAIT, CLI_OPTION_SUGGESTIONS, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
+        OPTIONS_APPLIED_AFTER_PROMPT, STUB_COMMANDS, UNSUPPORTED_RESUME_COMMAND,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -5626,6 +5849,12 @@ mod tests {
         assert_eq!(untrusted, "fast");
         assert_eq!(trusted, "claude-haiku-4-5-20251213");
         assert_eq!(unrelated, "claude-opus-4-6");
+    }
+
+    #[test]
+    fn version_report_names_the_product_neuron() {
+        let report = render_version_report();
+        assert!(report.starts_with("Neuron\n  Version "), "{report}");
     }
 
     #[test]
@@ -6588,6 +6817,18 @@ mod tests {
             .expect_err("/status should remain REPL-only when invoked directly");
         assert!(error.contains("interactive-only"));
         assert!(error.contains("neuron --resume SESSION.jsonl /status"));
+        // /model does not run under --resume, so the error must not offer it.
+        let error = parse_args(&["/model".to_string()])
+            .expect_err("/model should remain REPL-only when invoked directly");
+        assert!(
+            error.contains("slash command /model works only inside a session"),
+            "{error}"
+        );
+        assert!(!error.contains("--resume"), "{error}");
+        assert!(
+            error.contains("The current catalog is at https://zero-x.live/v1/models."),
+            "{error}"
+        );
     }
 
     #[test]
@@ -6936,6 +7177,70 @@ mod tests {
         std::env::remove_var("NEURON_CONFIG_HOME");
     }
 
+    /// `/resume` (and `neuron --resume` in the REPL): a CLI continues its own session,
+    /// but not one another CLI holds, until that one lets go; the reasoning effort the
+    /// run asked for goes on with the session it switches to.
+    #[test]
+    fn a_cli_continues_a_session_only_while_no_other_holds_it() {
+        let _guard = env_lock();
+        std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-session-locks");
+        let root = temp_dir();
+        let config_home = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{"defaultMcpServers":false}"#,
+        )
+        .expect("settings should disable default MCP servers");
+        std::env::set_var("NEURON_CONFIG_HOME", &config_home);
+
+        with_current_dir(&root, || {
+            let new_cli = || {
+                LiveCli::new(
+                    "claude-sonnet-4-6".to_string(),
+                    true,
+                    None,
+                    PermissionMode::ReadOnly,
+                )
+                .expect("cli should initialize")
+            };
+            let mut first = new_cli();
+            let mut second = new_cli();
+            let first_session = first.session.path.display().to_string();
+            let second_session = second.session.path.clone();
+
+            first.set_reasoning_effort(Some("high".to_string()));
+            first
+                .switch_session(&first_session)
+                .expect("a CLI continues its own session");
+            assert_eq!(first.runtime.api_client().reasoning_effort(), Some("high"));
+
+            let error = second
+                .switch_session(&first_session)
+                .expect_err("the first CLI holds its session");
+            assert!(
+                error
+                    .to_string()
+                    .contains("is in use by another neuron run"),
+                "{error}"
+            );
+            assert_eq!(second.session.path, second_session);
+
+            drop(first);
+            second
+                .switch_session(&first_session)
+                .expect("free once the first CLI is gone");
+            // The session it left is free for another run.
+            drop(SessionLock::acquire(&second_session).expect("released"));
+        });
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+        fs::remove_dir_all(config_home).expect("cleanup config home");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("NEURON_CONFIG_HOME");
+    }
+
     #[test]
     fn format_connected_line_renders_anthropic_provider_for_claude_model() {
         let model = "claude-sonnet-4-6";
@@ -7093,10 +7398,12 @@ mod tests {
         assert!(help.contains("neuron agents"));
         assert!(help.contains("neuron mcp"));
         assert!(help.contains("neuron skills"));
-        assert!(help.contains("neuron /skills"));
+        // Git Bash turns `/skills` into a path: the examples use the subcommand.
+        assert!(!help.contains("neuron /skills"));
         assert!(help.contains("https://github.com/RAHUL-DevelopeRR/neuron-v2"));
         assert!(help.contains("npm install -g @zero-x.live/neuron"));
-        assert!(help.contains("pipx install --pip-args=--pre neuroncli"));
+        assert!(help.contains("pip install --pre neuroncli"));
+        assert!(!help.contains("pipx"));
         assert!(help.contains("install.sh"));
         assert!(!help.contains("claw-code"));
         assert!(!help.contains("cargo install neuron-cli"));
@@ -7555,15 +7862,18 @@ UU conflicted.rs",
         std::fs::create_dir_all(&workspace).expect("workspace should create");
         let store = runtime::SessionStore::from_cwd(&workspace).expect("session store");
 
+        // `latest` skips sessions without messages.
         let older = store.create_handle("session-older");
-        Session::new()
-            .with_persistence_path(older.path.clone())
+        let mut session = Session::new().with_persistence_path(older.path.clone());
+        session.push_user_text("older").expect("older message");
+        session
             .save_to_path(&older.path)
             .expect("older session should save");
         std::thread::sleep(Duration::from_millis(20));
         let newer = store.create_handle("session-newer");
-        Session::new()
-            .with_persistence_path(newer.path.clone())
+        let mut session = Session::new().with_persistence_path(newer.path.clone());
+        session.push_user_text("newer").expect("newer message");
+        session
             .save_to_path(&newer.path)
             .expect("newer session should save");
 
@@ -8896,6 +9206,295 @@ UU conflicted.rs",
                 "stub command {with_slash} should not appear in REPL completions"
             );
         }
+    }
+
+    #[test]
+    fn help_lists_only_working_resume_commands_and_every_flag() {
+        let mut help = Vec::new();
+        print_help_to(&mut help).expect("help should render");
+        let help = String::from_utf8(help).expect("help should be utf8");
+        let resume_line = help
+            .lines()
+            .find(|line| line.starts_with("Resume-safe commands:"))
+            .expect("help should list the resume-safe commands");
+        let words = resume_line
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .collect::<Vec<_>>();
+        assert!(words.contains(&"/status"), "{resume_line}");
+        for stub in STUB_COMMANDS {
+            let with_slash = format!("/{stub}");
+            assert!(
+                !words.contains(&with_slash.as_str()),
+                "stub command {with_slash} should not be listed as resume-safe: {resume_line}"
+            );
+        }
+        assert!(help.contains("neuron [FLAGS] -p TEXT"), "{help}");
+
+        // The slash table's [resume] marker and the Resume-safe line name the same commands.
+        let listed = words
+            .iter()
+            .filter_map(|word| word.strip_prefix('/'))
+            .collect::<std::collections::BTreeSet<_>>();
+        let marked = help
+            .lines()
+            .filter(|line| line.ends_with(" [resume]"))
+            .filter_map(|line| line.split_whitespace().next()?.strip_prefix('/'))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(listed, marked, "{help}");
+        // `neuron --resume SESSION /plan` exits 2: plan mode needs a live session.
+        assert!(!listed.contains("plan"), "{resume_line}");
+        // Running a skill needs a live session, and `/context clear` is refused.
+        assert!(
+            resume_line.contains("/skills [list|install <path>|help],"),
+            "{resume_line}"
+        );
+        assert!(resume_line.contains("/context [show],"), "{resume_line}");
+
+        // Every option the parser takes appears in --help as a word of its own.
+        let help_words = help
+            .split(|c: char| c.is_whitespace() || matches!(c, ',' | '(' | ')' | ';' | '`'))
+            .collect::<std::collections::BTreeSet<_>>();
+        for flag in CLI_OPTION_SUGGESTIONS
+            .iter()
+            .chain(OPTIONS_APPLIED_AFTER_PROMPT)
+            .chain(&["--provider"])
+            .filter(|flag| !matches!(**flag, "--help" | "-h"))
+        {
+            assert!(help_words.contains(flag), "--help does not list {flag}");
+        }
+    }
+
+    /// Every form that `--help` lists as resume-safe runs under `neuron --resume`. Each
+    /// argument alternative on the "Resume-safe commands" line, for the command and each
+    /// alias, goes through `run_resume_command` against an empty saved session in a
+    /// scratch folder, and the only error allowed is the scratch home's missing login.
+    /// The scratch Neuron home keeps the login a file there, not the OS credential store;
+    /// with no `NEURON_TOKEN`, doctor offline and a loopback gateway, nothing reads the
+    /// real login or reaches the network.
+    #[test]
+    fn every_resume_safe_command_runs_under_resume() {
+        struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (name, value) in self.0.drain(..).rev() {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+
+        let _guard = env_lock();
+        let root = temp_dir();
+        let workspace = root.join("workspace");
+        let home = root.join("home");
+        fs::create_dir_all(&workspace).expect("workspace dir");
+        fs::create_dir_all(&home).expect("home dir");
+        let config_home = home.join(".neuron");
+        let vars: [(&'static str, Option<&std::ffi::OsStr>); 6] = [
+            ("NEURON_HOME", Some(home.as_os_str())),
+            ("NEURON_TOKEN", None),
+            ("NEURON_CONFIG_HOME", Some(config_home.as_os_str())),
+            ("CLAW_CONFIG_HOME", None),
+            ("NEURON_DOCTOR_OFFLINE", Some(std::ffi::OsStr::new("1"))),
+            (
+                "NEURON_API_BASE",
+                Some(std::ffi::OsStr::new("http://127.0.0.1:9")),
+            ),
+        ];
+        let restore = RestoreEnv(
+            vars.iter()
+                .map(|(name, value)| {
+                    let previous = std::env::var_os(name);
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                    (*name, previous)
+                })
+                .collect(),
+        );
+
+        let session_path = workspace.join("session.jsonl");
+        Session::new()
+            .save_to_path(&session_path)
+            .expect("session should save");
+        let session = Session::load_from_path(&session_path).expect("session should load");
+
+        let resume_safe = commands::slash_command_specs()
+            .iter()
+            .filter(|spec| resume_safe_slash_command(spec.name))
+            .collect::<Vec<_>>();
+        assert!(resume_safe.iter().any(|spec| spec.name == "status"));
+        let mut help = Vec::new();
+        print_help_to(&mut help).expect("help should render");
+        let help = String::from_utf8(help).expect("help should be utf8");
+        let resume_line = help
+            .lines()
+            .find(|line| line.starts_with("Resume-safe commands:"))
+            .expect("help should list the resume-safe commands");
+        let listed = resume_line
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .filter_map(|word| word.strip_prefix('/'))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            listed,
+            resume_safe.iter().map(|spec| spec.name).collect::<Vec<_>>(),
+            "--help must list exactly the commands the hints call resume-safe"
+        );
+
+        // A test value for each placeholder in the hints; any other word is literal.
+        // Every `<path>` is a new skill, so each `install` is a first install.
+        let mut skills_written = 0;
+        let mut fill = |word: &str| match word {
+            "<server>" => "codebase-memory".to_string(),
+            "<path>" => {
+                skills_written += 1;
+                let name = format!("resume-skill-{skills_written}");
+                write_skill_fixture(&workspace.join("skill-sources"), &name, "resume test");
+                format!("skill-sources/{name}")
+            }
+            "file" => "transcript.txt".to_string(),
+            "count" => "2".to_string(),
+            placeholder if placeholder.starts_with('<') => {
+                panic!("no test value for {placeholder}; add one here")
+            }
+            literal => literal.to_string(),
+        };
+        let forms = resume_line
+            .strip_prefix("Resume-safe commands: ")
+            .expect("the line starts with its label")
+            .split(", ");
+        for form in forms {
+            let form = form.trim_start_matches('/');
+            let (name, hint) = form
+                .split_once(' ')
+                .map_or((form, None), |(name, hint)| (name, Some(hint)));
+            let spec = resume_safe
+                .iter()
+                .find(|spec| spec.name == name)
+                .unwrap_or_else(|| panic!("/{form} is not a resume-safe command"));
+            // `[a|b <x>]`: no argument, or one of the alternatives.
+            let alternatives = match hint {
+                None => Vec::new(),
+                Some(hint) => hint
+                    .strip_prefix('[')
+                    .and_then(|hint| hint.strip_suffix(']'))
+                    .filter(|inner| !inner.contains(['[', ']']))
+                    .unwrap_or_else(|| panic!("/{form}: expected one optional [a|b <x>] group"))
+                    .split('|')
+                    .collect(),
+            };
+            for invoked in std::iter::once(&spec.name).chain(spec.aliases) {
+                for alternative in std::iter::once("").chain(alternatives.iter().copied()) {
+                    let argument = alternative
+                        .split_whitespace()
+                        .map(&mut fill)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let input = format!("/{invoked} {argument}").trim_end().to_string();
+                    let command = SlashCommand::parse(&input)
+                        .unwrap_or_else(|error| panic!("{input} should parse: {error}"))
+                        .unwrap_or_else(|| panic!("{input} should be a slash command"));
+                    let result = with_current_dir(&workspace, || {
+                        run_resume_command(&session_path, &session, &command)
+                    });
+                    match result {
+                        Ok(_) => {}
+                        // The scratch home has no login.
+                        Err(error)
+                            if *invoked == "usage"
+                                && error.to_string().starts_with("Not signed in to Zero-X") => {}
+                        Err(error) => panic!(
+                            "--help lists `{input}` as resume-safe, but `neuron --resume` fails: {error}"
+                        ),
+                    }
+                }
+            }
+        }
+
+        // A command that needs a live session still says so.
+        let plan = SlashCommand::parse("/plan")
+            .expect("/plan should parse")
+            .expect("/plan is a slash command");
+        let error = run_resume_command(&session_path, &session, &plan)
+            .expect_err("/plan needs a live session");
+        assert_eq!(error.to_string(), UNSUPPORTED_RESUME_COMMAND);
+
+        drop(restore);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// `neuron --resume SESSION "/context clear"` fails as `/context clear` does in a
+    /// session; it used to print the report and exit 0, so nothing was cleared.
+    #[test]
+    fn resumed_context_rejects_the_arguments_the_repl_rejects() {
+        let session_path = temp_dir().join("context.jsonl");
+        let session = Session::new();
+        let context = |argument: &str| {
+            let command = SlashCommand::parse(&format!("/context {argument}"))
+                .expect("/context should parse")
+                .expect("/context is a slash command");
+            run_resume_command(&session_path, &session, &command)
+        };
+
+        let error = context("clear").expect_err("/context clear clears nothing");
+        assert!(
+            error
+                .to_string()
+                .starts_with("/context clear is not supported; use /compact"),
+            "{error}"
+        );
+        let error = context("bogus").expect_err("unknown argument");
+        assert!(
+            error.to_string().contains("Usage: /context [show]"),
+            "{error}"
+        );
+        for argument in ["clear", "bogus"] {
+            assert_eq!(
+                context(argument).expect_err(argument).to_string(),
+                crate::repl_loop::check_context_argument(argument).expect_err(argument),
+                "the REPL and --resume give the same message"
+            );
+        }
+        for argument in ["", "show"] {
+            let outcome = context(argument).expect("the report");
+            assert_eq!(outcome.json.expect("json")["kind"], "context");
+        }
+    }
+
+    /// `neuron X` and `neuron /X` offer `--resume` exactly for the resume-safe commands,
+    /// and send no one to a stub that only says "not yet implemented".
+    #[test]
+    fn slash_command_hints_offer_resume_only_where_it_runs() {
+        for spec in commands::slash_command_specs() {
+            for args in [vec![spec.name.to_string()], vec![format!("/{}", spec.name)]] {
+                let Err(error) = parse_args(&args) else {
+                    continue;
+                };
+                assert_eq!(
+                    error.contains("--resume"),
+                    resume_safe_slash_command(spec.name),
+                    "`neuron {}`: {error}",
+                    args[0]
+                );
+                if STUB_COMMANDS.contains(&spec.name) {
+                    assert!(
+                        error.contains("not yet implemented"),
+                        "`neuron {}`: {error}",
+                        args[0]
+                    );
+                }
+            }
+        }
+        let error = parse_args(&["/plan".to_string()]).expect_err("/plan needs a session");
+        assert!(
+            error.contains("slash command /plan works only inside a session"),
+            "{error}"
+        );
+        let error = parse_args(&["plan".to_string()]).expect_err("plan is a slash command");
+        assert!(!error.contains("--resume"), "{error}");
     }
 }
 

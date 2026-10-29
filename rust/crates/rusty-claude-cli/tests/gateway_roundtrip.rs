@@ -873,6 +873,78 @@ fn capacity_exhausted(retry_after: u64) -> Reply {
     .with_header("Retry-After", &retry_after.to_string())
 }
 
+/// The live run: `--model gemini/gemini-2.5-flash`, out of rotation for hours, failed
+/// at once with "pick another with --model". Now the run says so before its request,
+/// which it still sends, and the error names models that have room, from the one
+/// `GET /v1/models/status` answer.
+#[test]
+fn a_blurred_model_is_named_before_the_request_and_others_after_it_fails() {
+    let gateway = FakeGateway::spawn(|request, _| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v1/models") => {
+                let mut models = catalog();
+                let data = models["data"].as_array_mut().unwrap();
+                for (id, available) in [
+                    ("groq/llama-3.3-70b", true),
+                    ("cerebras/qwen-3-235b", true),
+                    ("gemini/gemini-2.5-pro", false),
+                ] {
+                    data.push(serde_json::json!({"id": id, "context_window": 131_072, "capabilities": {"tools": true}, "tiers": ["free"], "available": available, "unavailable_reason": if available { None } else { Some("not_configured") }}));
+                }
+                Reply::json("200 OK", &models)
+            }
+            ("GET", "/v1/models/status") => Reply::json(
+                "200 OK",
+                &serde_json::json!({"object": "list", "poll_interval_seconds": 30, "data": [
+                    {"id": "gemini/gemini-2.5-flash", "available": true, "status": "blurred",
+                     "available_again_at": "2099-01-01T00:00:00.000Z"},
+                    {"id": "cerebras/qwen-3-235b", "available": true, "status": "busy"},
+                    {"id": "groq/llama-3.3-70b", "available": true, "status": "available"},
+                    // The gateway says `available` for a model it cannot serve.
+                    {"id": "gemini/gemini-2.5-pro", "available": false,
+                     "unavailable_reason": "not_configured", "status": "available"},
+                ]}),
+            ),
+            ("POST", "/v1/chat/completions") => capacity_exhausted(49_680),
+            _ => Reply::json(
+                "404 Not Found",
+                &serde_json::json!({"error": {"message": "not found", "code": "invalid_request"}}),
+            ),
+        }
+    });
+    let workspace = Workspace::new("blurred-model");
+    let mut command = workspace.command(&gateway);
+    command
+        .env("NEURON_TOKEN", SESSION_TOKEN)
+        .args(["--model", "gemini/gemini-2.5-flash"])
+        .args(prompt_args("hello"));
+    let output = run(command, None);
+
+    assert!(!output.status.success());
+    let errors = stderr(&output);
+    let warning = errors
+        .find("warning: gemini/gemini-2.5-flash is out of capacity until 2099-01-01 00:00 UTC")
+        .unwrap_or_else(|| panic!("{errors}"));
+    assert!(
+        errors.contains("auto routes around it: --model auto."),
+        "{errors}"
+    );
+    let failure = errors.find("capacity_exhausted").expect("the error");
+    assert!(warning < failure, "{errors}");
+    assert!(
+        errors.contains(
+            "Other models may have capacity now: pick another with --model, such as groq/llama-3.3-70b or cerebras/qwen-3-235b."
+        ),
+        "{errors}"
+    );
+    assert_eq!(
+        gateway.count("POST", "/v1/chat/completions"),
+        1,
+        "only a warning: the request is sent"
+    );
+    assert_eq!(gateway.count("GET", "/v1/models/status"), 1);
+}
+
 /// The failed live run, scaled down: after a tool result the gateway asked
 /// for waits of 36 s and 58 s, longer than the 60 s first-token deadline
 /// left for them. Here the deadline is 1 s and the waits 2 s and 3 s. Every

@@ -564,6 +564,116 @@ fn resumed_context_command_reports_window_and_usage() {
     assert!(parsed["last_compaction"].is_null());
 }
 
+/// `/context` only shows the report: `clear` and unknown arguments exit 2 with the
+/// session's message instead of printing the report as if they had worked.
+#[test]
+fn resumed_context_rejects_clear_and_unknown_arguments() {
+    let temp_dir = unique_temp_dir("resume-context-args");
+    fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+    let session_path = temp_dir.join("session.jsonl");
+    workspace_session(&temp_dir)
+        .save_to_path(&session_path)
+        .expect("persist ok");
+    let session_arg = session_path.to_str().expect("utf8 path");
+
+    for (argument, expected) in [
+        ("clear", "/context clear is not supported; use /compact"),
+        ("bogus", "Usage: /context [show]"),
+    ] {
+        let command = format!("/context {argument}");
+        let output = run_claw(&temp_dir, &["--resume", session_arg, &command]);
+        assert_eq!(output.status.code(), Some(2), "{command}");
+        assert!(output.stdout.is_empty(), "{command} printed the report");
+        let stderr = String::from_utf8(output.stderr).expect("utf8");
+        assert!(stderr.contains(expected), "{stderr}");
+
+        let output = run_claw(
+            &temp_dir,
+            &["--output-format", "json", "--resume", session_arg, &command],
+        );
+        assert_eq!(output.status.code(), Some(2), "{command}");
+        assert!(output.stdout.is_empty(), "{command} printed the report");
+        let stderr = String::from_utf8(output.stderr).expect("utf8");
+        let parsed: Value = serde_json::from_str(stderr.trim()).expect("should be json");
+        assert_eq!(parsed["type"], "error");
+        assert!(
+            parsed["error"]
+                .as_str()
+                .is_some_and(|error| error.contains(expected)),
+            "{parsed}"
+        );
+    }
+}
+
+/// `/skills install` under `--resume` installs once and reports it, in text and JSON;
+/// it used to install for the text and fail with "already installed" for the JSON.
+#[test]
+fn resumed_skills_install_installs_once() {
+    let temp_dir = unique_temp_dir("resume-skills-install");
+    let config_home = temp_dir.join("config-home");
+    for name in ["text-skill", "json-skill"] {
+        let source = temp_dir.join(name);
+        fs::create_dir_all(&source).expect("skill dir should exist");
+        fs::write(
+            source.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: resume test\n---\n\n# {name}\n"),
+        )
+        .expect("skill file should write");
+    }
+    let session_path = temp_dir.join("session.jsonl");
+    workspace_session(&temp_dir)
+        .save_to_path(&session_path)
+        .expect("persist ok");
+    let session_arg = session_path.to_str().expect("utf8 path");
+    let envs = [(
+        "NEURON_CONFIG_HOME",
+        config_home.to_str().expect("utf8 path"),
+    )];
+
+    let output = run_claw_with_env(
+        &temp_dir,
+        &["--resume", session_arg, "/skills install text-skill"],
+        &envs,
+    );
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    assert!(stdout.contains("installed text-skill"), "{stdout}");
+
+    let output = run_claw_with_env(
+        &temp_dir,
+        &[
+            "--output-format",
+            "json",
+            "--resume",
+            session_arg,
+            "/skills install json-skill",
+        ],
+        &envs,
+    );
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: Value =
+        serde_json::from_str(String::from_utf8(output.stdout).expect("utf8").trim())
+            .expect("should be json");
+    assert_eq!(parsed["action"], "install");
+    assert_eq!(parsed["result"], "installed");
+    assert_eq!(parsed["invocation_name"], "json-skill");
+    for name in ["text-skill", "json-skill"] {
+        assert!(config_home
+            .join("skills")
+            .join(name)
+            .join("SKILL.md")
+            .is_file());
+    }
+}
+
 #[test]
 fn resume_tolerates_a_session_file_with_a_truncated_record() {
     let temp_dir = unique_temp_dir("resume-truncated-record");

@@ -865,6 +865,14 @@ pub fn check_trust(cwd: &std::path::Path) -> bool {
     if runtime::ConfigLoader::default_for(cwd).workspace_is_trusted() {
         return true;
     }
+    // From a pipe or a file nobody can answer: say how to trust it instead of asking.
+    // Today's callers only ask on a terminal (a prompt run without one skips the
+    // question and the untrusted folder's settings stay ignored; a bare `neuron` stops
+    // with "nothing to do"), so this guards a caller that forgets to.
+    if !runtime::ui_hooks::stdin_is_terminal() {
+        eprintln!("{}", untrusted_without_terminal(cwd));
+        return false;
+    }
     // Where the user sees it: stdout, or stderr when stdout is redirected (`neuron
     // prompt ... > out.txt`). With both redirected, a person at the terminal would
     // not see the question.
@@ -876,11 +884,7 @@ Run neuron in a terminal to trust this directory, or add it to `trustedRoots` in
         return false;
     };
     let mut out = stream.writer();
-    let _ = write!(
-        out,
-        "\nNeuronCLI can read, write, and execute commands in:\n{}\nTrusting it also lets this directory's settings files run hooks, start MCP servers and change permissions.\nPress 1 to trust this directory: ",
-        cwd.display()
-    );
+    let _ = write!(out, "{}", trust_question(cwd));
     let _ = out.flush();
     let mut input = String::new();
     let answered = io::stdin().read_line(&mut input);
@@ -899,12 +903,30 @@ Run neuron in a terminal to trust this directory, or add it to `trustedRoots` in
     false
 }
 
+/// The trust question, answered on the next line of stdin.
+fn trust_question(cwd: &std::path::Path) -> String {
+    format!(
+        "\nNeuron can read, write, and execute commands in:\n{}\nTrusting it also lets this directory's settings files run hooks, start MCP servers and change permissions.\nPress 1 to trust this directory: ",
+        cwd.display()
+    )
+}
+
+/// Why Neuron stopped without asking: stdin is not a terminal, so nobody could answer.
+fn untrusted_without_terminal(cwd: &std::path::Path) -> String {
+    format!(
+        "{} is not trusted and Neuron can't ask without a terminal: set NEURON_TRUST_WORKSPACE=1 \
+for this run, add it to trustedRoots in ~/.neuron/settings.json, or run neuron once in a terminal.",
+        cwd.display()
+    )
+}
+
 /// Why Neuron stopped at the trust question: nobody could answer it (no input), or
 /// the answer was not 1.
 fn untrusted_reason(no_input: bool) -> &'static str {
     if no_input {
         "Not trusted: there was no input to answer the trust question. Run neuron in a terminal \
-to trust this directory, or add it to `trustedRoots` in your user settings."
+to trust this directory, add it to `trustedRoots` in your user settings, or set \
+NEURON_TRUST_WORKSPACE=1 for this run (from a script, use `neuron prompt \"...\"`)."
     } else {
         "Not trusted, so Neuron stopped. Run neuron again and press 1 to trust this directory."
     }
@@ -1127,6 +1149,23 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         let mut empty = io::Cursor::new(Vec::new());
         assert!(login_with_token(&mut empty, false).is_err());
+    }
+
+    #[test]
+    fn without_a_terminal_the_trust_question_is_not_asked() {
+        let cwd = std::path::Path::new("/work/app");
+        let answer = untrusted_without_terminal(cwd);
+        assert!(answer.contains("/work/app"), "{answer}");
+        assert!(answer.contains("NEURON_TRUST_WORKSPACE=1"), "{answer}");
+        assert!(answer.contains("trustedRoots"), "{answer}");
+        assert!(!answer.contains("Press 1"), "{answer}");
+        let no_input = untrusted_reason(true);
+        assert!(no_input.contains("NEURON_TRUST_WORKSPACE=1"), "{no_input}");
+        assert!(no_input.contains("neuron prompt"), "{no_input}");
+        // The product is Neuron.
+        let question = trust_question(cwd);
+        assert!(question.starts_with("\nNeuron can read"), "{question}");
+        assert!(question.ends_with("Press 1 to trust this directory: "));
     }
 
     #[test]

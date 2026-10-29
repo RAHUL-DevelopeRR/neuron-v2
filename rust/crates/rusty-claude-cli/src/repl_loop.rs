@@ -356,7 +356,7 @@ pub(crate) fn resume_launch(
     }
 }
 
-/// Options for starting an interactive session.
+/// Options for starting a session: the interactive REPL, or one `neuron prompt` turn.
 pub(crate) struct ReplLaunch {
     pub model: String,
     pub allowed_tools: Option<AllowedToolSet>,
@@ -384,12 +384,19 @@ pub(crate) fn launch(options: ReplLaunch) -> Result<(), Box<dyn std::error::Erro
     let resolved_model = configure_provider_for_model(resolve_repl_model(
         crate::args::model_after_trust(options.model),
     ))?;
-    let mut cli = LiveCli::new(
-        resolved_model,
-        true,
-        options.allowed_tools,
-        crate::args::permission_mode_after_trust(options.permission_mode),
-    )?;
+    let permission_mode = crate::args::permission_mode_after_trust(options.permission_mode);
+    let resumed = options.resume.is_some();
+    let mut cli = match options.resume {
+        // The saved session itself, held while the REPL runs: no session of its own.
+        Some(reference) => LiveCli::resuming(
+            resolved_model,
+            true,
+            options.allowed_tools,
+            permission_mode,
+            open_session_reference(&reference)?,
+        )?,
+        None => LiveCli::new(resolved_model, true, options.allowed_tools, permission_mode)?,
+    };
     cli.set_reasoning_effort(options.reasoning_effort);
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
@@ -397,9 +404,15 @@ pub(crate) fn launch(options: ReplLaunch) -> Result<(), Box<dyn std::error::Erro
     println!("{}", cli.startup_banner());
     println!("{}", format_connected_line(&cli.model));
     print_footer(&cli);
-
-    if let Some(reference) = options.resume {
-        continue_saved_session(&mut cli, &reference)?;
+    if resumed {
+        println!(
+            "{}",
+            format_resume_report(
+                &cli.session.path.display().to_string(),
+                cli.runtime.session().messages.len(),
+                prompt_count(cli.runtime.session()),
+            )
+        );
     }
 
     let result = run_loop(&mut cli, &mut editor);
@@ -439,21 +452,6 @@ pub(crate) fn footer_session_label(id: &str) -> String {
     } else {
         format!("session {id}")
     }
-}
-
-/// Switches the freshly started CLI to a saved session, removing the empty
-/// placeholder session file the fresh start created.
-fn continue_saved_session(
-    cli: &mut LiveCli,
-    reference: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let placeholder = cli.session.path.clone();
-    let placeholder_is_empty = cli.runtime.session().messages.is_empty();
-    cli.resume_session(Some(reference.to_string()))?;
-    if placeholder_is_empty && placeholder != cli.session.path {
-        let _ = fs::remove_file(&placeholder);
-    }
-    Ok(())
 }
 
 fn run_loop(
@@ -544,10 +542,25 @@ impl ReplBackend for LiveCli {
     }
 }
 
-/// Returns the argument of a `/context [show|clear]` line.
+/// Returns the argument of a `/context` line.
 fn context_command_argument(line: &str) -> Option<&str> {
     let rest = line.strip_prefix("/context")?;
     (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim())
+}
+
+/// `/context [show]` only shows the report, in a session and under `neuron --resume`;
+/// any other argument is an error.
+pub(crate) fn check_context_argument(argument: &str) -> Result<(), String> {
+    match argument {
+        "" | "show" => Ok(()),
+        "clear" => Err(
+            "/context clear is not supported; use /compact to summarize or /clear --confirm to start fresh"
+                .to_string(),
+        ),
+        other => Err(format!(
+            "unknown /context argument `{other}`. Usage: /context [show]"
+        )),
+    }
 }
 
 impl LiveCli {
@@ -561,14 +574,8 @@ impl LiveCli {
         &self,
         argument: &str,
     ) -> Result<String, Box<dyn std::error::Error>> {
-        match argument {
-            "" | "show" => Ok(self.context_report()),
-            "clear" => Err(
-                "/context clear is not supported; use /compact to summarize or /clear --confirm to start fresh"
-                    .into(),
-            ),
-            other => Err(format!("unknown /context argument `{other}`. Usage: /context [show]").into()),
-        }
+        check_context_argument(argument)?;
+        Ok(self.context_report())
     }
 
     /// Context diagnostics for `/context` and `/status`.
@@ -713,10 +720,11 @@ fn group_digits(value: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        context_command_argument, describe_turn_outcome, describe_turn_outcome_without_refusal,
-        dispatch_line, group_digits, handle_turn_interrupt, refusal_note_text, refusal_notice,
-        render_context_report, turn_outcome_label, watch_turn_interrupts, ContextReport,
-        InterruptAction, InterruptPresses, QuitHint, ReplBackend, ReplStep,
+        check_context_argument, context_command_argument, describe_turn_outcome,
+        describe_turn_outcome_without_refusal, dispatch_line, group_digits, handle_turn_interrupt,
+        refusal_note_text, refusal_notice, render_context_report, turn_outcome_label,
+        watch_turn_interrupts, ContextReport, InterruptAction, InterruptPresses, QuitHint,
+        ReplBackend, ReplStep,
     };
     use crate::{CliAction, ResumeLaunchOptions, DEFAULT_MODEL};
     use runtime::context_manager::{ContextBudget, ContextManager, ContextPolicy};
@@ -1169,6 +1177,16 @@ mod tests {
 
         let legacy = super::resume_launch(ResumeLaunchOptions::default(), None, "s".into());
         assert_eq!(legacy.model, DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn context_takes_no_argument_but_show() {
+        assert_eq!(check_context_argument(""), Ok(()));
+        assert_eq!(check_context_argument("show"), Ok(()));
+        let clear = check_context_argument("clear").expect_err("nothing is cleared");
+        assert!(clear.contains("use /compact"), "{clear}");
+        let unknown = check_context_argument("bogus").expect_err("unknown argument");
+        assert!(unknown.ends_with("Usage: /context [show]"), "{unknown}");
     }
 
     #[test]

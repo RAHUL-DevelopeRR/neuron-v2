@@ -39,12 +39,9 @@ impl CliPermissionPrompter {
         &self,
         request: &runtime::PermissionRequest,
     ) -> runtime::PermissionPromptDecision {
-        let reason = crate::headless::denial_reason(
-            &request.tool_name,
-            self.current_mode,
-            request.required_mode,
-        );
-        if crate::headless::record_denial(&request.tool_name, &reason) {
+        let denial = crate::headless::Denial::of(request);
+        let reason = denial.reason();
+        if crate::headless::record_denial(denial, &reason) {
             if let Some(turn) = &self.turn {
                 turn.cancel();
             }
@@ -518,6 +515,11 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         "  neuron [--model MODEL] [--output-format text|json] TEXT"
     )?;
     writeln!(out, "      Shorthand non-interactive prompt mode")?;
+    writeln!(out, "  neuron [FLAGS] -p TEXT")?;
+    writeln!(
+        out,
+        "      Same as `prompt TEXT`; everything after -p is the prompt (a flag like --model there is refused), so put flags first"
+    )?;
     writeln!(
         out,
         "  neuron --resume [SESSION.jsonl|session-id|latest] [/status] [/compact] [...]"
@@ -525,6 +527,14 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
         "      Inspect or maintain a saved session without entering the REPL"
+    )?;
+    writeln!(
+        out,
+        "  neuron [--output-format text|json] --resume [SESSION.jsonl|session-id|latest] prompt TEXT"
+    )?;
+    writeln!(
+        out,
+        "      Send a saved session another prompt and exit (also `-p TEXT`, or `-p` with the prompt on stdin); the turn is saved to it"
     )?;
     writeln!(out, "  neuron help")?;
     writeln!(out, "      Alias for --help")?;
@@ -596,7 +606,19 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "  --reasoning-effort LEVEL   low, medium or high, for models that support it"
     )?;
-    writeln!(out, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)")?;
+    writeln!(out, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported; also --allowed-tools)")?;
+    writeln!(
+        out,
+        "  --allow-broad-cwd          Allow running from a very broad folder such as your home folder"
+    )?;
+    writeln!(
+        out,
+        "  --base-commit REV          Warn at start when git HEAD is not REV (default: the commit in .neuron-base); a terminal session then uses the line REPL"
+    )?;
+    writeln!(
+        out,
+        "  --print                    Accepted for compatibility: the same as --output-format text"
+    )?;
     writeln!(
         out,
         "  --no-tui                   Use the line REPL even where the full-screen UI is installed (or set NEURON_NO_TUI=1)"
@@ -615,7 +637,8 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out)?;
     let resume_commands = resume_supported_slash_commands()
         .into_iter()
-        .map(|spec| match spec.argument_hint {
+        .filter(|spec| resume_safe_slash_command(spec.name))
+        .map(|spec| match resume_argument_hint(spec) {
             Some(argument_hint) => format!("/{} {}", spec.name, argument_hint),
             None => format!("/{}", spec.name),
         })
@@ -626,15 +649,23 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "Session shortcuts:")?;
     writeln!(
         out,
-        "  REPL turns auto-save to .neuron/sessions/<session-id>.{PRIMARY_SESSION_EXTENSION}"
+        "  Sessions auto-save to .neuron/sessions/<workspace-id>/<session-id>.{PRIMARY_SESSION_EXTENSION}; every `neuron prompt` run starts a new one"
     )?;
     writeln!(
         out,
-        "  Use `{LATEST_SESSION_REFERENCE}` with --resume, /resume, or /session switch to target the newest saved session"
+        "  Use `{LATEST_SESSION_REFERENCE}` with --resume, /resume, or /session switch to target the newest saved session with messages"
     )?;
     writeln!(
         out,
         "  Use /session list in the REPL to browse managed sessions"
+    )?;
+    writeln!(
+        out,
+        "  `--output-format json` answers carry the `session_id` that --resume takes"
+    )?;
+    writeln!(
+        out,
+        "  One run at a time continues a session; another is refused while it is in use"
     )?;
     writeln!(out, "Examples:")?;
     writeln!(out, "  neuron --model auto \"summarize this repo\"")?;
@@ -652,9 +683,13 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "  neuron --resume {LATEST_SESSION_REFERENCE} /status /diff /export notes.txt"
     )?;
+    writeln!(
+        out,
+        "  neuron --output-format json --resume {LATEST_SESSION_REFERENCE} prompt \"now add tests\""
+    )?;
     writeln!(out, "  neuron agents")?;
     writeln!(out, "  neuron mcp show my-server")?;
-    writeln!(out, "  neuron /skills")?;
+    writeln!(out, "  neuron skills")?;
     writeln!(out, "  neuron doctor")?;
     writeln!(out, "  neuron init")?;
     writeln!(out, "  neuron export")?;
@@ -663,7 +698,7 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "Install and update:")?;
     writeln!(
         out,
-        "  npm install -g {NPM_PACKAGE}, pipx install --pip-args=--pre {PYPI_PACKAGE}, or install.sh / install.ps1 from {NEURON_REPO_URL}/releases"
+        "  npm install -g {NPM_PACKAGE}, pip install --pre {PYPI_PACKAGE}, or install.sh / install.ps1 from {NEURON_REPO_URL}/releases"
     )?;
     writeln!(out, "  Source: {NEURON_REPO_URL}")?;
     Ok(())
@@ -729,6 +764,7 @@ mod cli_prompter_tests {
             required_mode: PermissionMode::DangerFullAccess,
             reason: Some("Run `mkdir out`?".to_string()),
             session_prefixes: Vec::new(),
+            remedy: runtime::PermissionRemedy::default(),
         }
     }
 
@@ -790,6 +826,7 @@ mod channel_prompter_tests {
             required_mode: PermissionMode::DangerFullAccess,
             reason: None,
             session_prefixes: session_prefixes.iter().map(ToString::to_string).collect(),
+            remedy: runtime::PermissionRemedy::default(),
         }
     }
 

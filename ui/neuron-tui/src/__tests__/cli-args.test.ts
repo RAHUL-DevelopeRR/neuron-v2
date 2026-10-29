@@ -3,10 +3,26 @@
 // `--trust-agents` they covered were removed. See ui/neuron-tui/PORTING.md.
 import { describe, test, expect } from 'bun:test'
 
-import { parseArgs } from '../cli-args'
+import { buildProgram, parseArgs } from '../cli-args'
 
 const parse = (...args: string[]) =>
   parseArgs({ argv: ['node', 'neuron', ...args], version: '1.0.0' })
+
+describe('CLI help', () => {
+  const help = buildProgram('1.0.0').helpInformation()
+
+  test('suggests only model ids the gateway serves', () => {
+    expect(help).not.toMatch(/opus/i)
+    expect(help).toContain('gemini/gemini-2.5-flash')
+  })
+
+  test('hides the mode flags that only pick a starting mode', () => {
+    expect(help).not.toContain('--lite')
+    expect(help).not.toContain('--free')
+    expect(help).not.toContain('--max')
+    expect(help).toContain('--plan')
+  })
+})
 
 describe('CLI argument parsing', () => {
   test('joins the remaining words into the initial prompt', () => {

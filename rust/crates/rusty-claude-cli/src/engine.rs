@@ -178,11 +178,13 @@ fn run_engine(
         let started = open_cli(&options, events).and_then(|(cli, output)| {
             let mut engine = Engine::new(cli, output, Sender::clone(events), replies, shared);
             let resumed = match &options.resume {
-                Some(reference) => Some(
-                    engine
-                        .continue_saved_session(reference)
-                        .map_err(|error| error.to_string())?,
-                ),
+                Some(reference) => match engine.continue_saved_session(reference) {
+                    Ok(report) => Some(report),
+                    Err(error) => {
+                        engine.discard();
+                        return Err(error.to_string());
+                    }
+                },
                 None => None,
             };
             Ok((engine, resumed))
@@ -1359,10 +1361,13 @@ impl Engine {
             return Ok(());
         }
         let previous = self.cli.session.clone();
-        let session_state = new_cli_session()?;
-        self.cli.session = create_managed_session_handle(&session_state.session_id)?;
+        let OpenSession {
+            handle,
+            session,
+            lock,
+        } = new_open_session()?;
+        self.cli.adopt_session(handle, Some(lock));
         let session_id = self.cli.session.id.clone();
-        let session = session_state.with_persistence_path(self.cli.session.path.clone());
         self.rebuild_runtime(session, &session_id)?;
         let report = self.cli.session_cleared_report(&previous);
         self.notice(&report);
@@ -1376,16 +1381,20 @@ impl Engine {
         Ok(())
     }
 
-    /// Switches to saved session `reference`; returns the "Session resumed" report.
+    /// Switches to saved session `reference`; returns the "Session resumed" report. One
+    /// another run holds is refused.
     fn load_session(&mut self, reference: &str) -> Result<String, Box<dyn std::error::Error>> {
-        let (handle, session) = load_session_reference(reference)?;
+        let (handle, session, lock) = self.cli.open_saved_session(reference)?;
         let message_count = session.messages.len();
         let session_id = session.session_id.clone();
         self.rebuild_runtime(session, &handle.id)?;
-        self.cli.session = SessionHandle {
-            id: session_id,
-            path: handle.path,
-        };
+        self.cli.adopt_session(
+            SessionHandle {
+                id: session_id,
+                path: handle.path,
+            },
+            lock,
+        );
         Ok(format_resume_report(
             &self.cli.session.path.display().to_string(),
             message_count,
@@ -1404,8 +1413,14 @@ impl Engine {
         let report = self.load_session(reference)?;
         if placeholder_is_empty && placeholder != self.cli.session.path {
             let _ = fs::remove_file(&placeholder);
+            let _ = fs::remove_file(session_lock_path(&placeholder));
         }
         Ok(report)
+    }
+
+    /// An engine that does not start after all: the empty session it opened goes too.
+    fn discard(self) {
+        self.cli.discard_unused_session();
     }
 
     /// `/plan [on|off]`, as in the line REPL.
@@ -1745,6 +1760,7 @@ mod tests {
         with_current_dir(&workspace, || {
             drive_engine(&workspace);
             resume_engine();
+            resume_engine_in_use(&workspace);
         });
 
         drop(vars);
@@ -2102,6 +2118,37 @@ mod tests {
         assert!(matches!(second, UiEvent::Status { .. }), "{second:?}");
         expect_notice(&engine.events, "Session resumed");
         assert_eq!(engine.finish(), EngineExit::Shutdown);
+    }
+
+    /// `--resume` of a session another run holds: the engine does not start, and leaves
+    /// no session of its own behind.
+    fn resume_engine_in_use(workspace: &Path) {
+        let latest = crate::session_mgmt::latest_managed_session().expect("a saved session");
+        let held = crate::session_mgmt::SessionLock::acquire(&latest.path)
+            .expect("the test holds the session");
+        let sessions = saved_session_files(&workspace.join(".neuron")).len();
+
+        let started = spawn(EngineOptions {
+            model: "claude-sonnet-4-6".to_string(),
+            allowed_tools: None,
+            permission_mode: PermissionMode::WorkspaceWrite,
+            reasoning_effort: None,
+            resume: Some("latest".to_string()),
+            signed_out: None,
+        });
+
+        let Err(message) = started else {
+            panic!("the session is in use");
+        };
+        assert!(
+            message.contains("is in use by another neuron run"),
+            "{message}"
+        );
+        assert_eq!(
+            saved_session_files(&workspace.join(".neuron")).len(),
+            sessions
+        );
+        drop(held);
     }
 
     #[test]

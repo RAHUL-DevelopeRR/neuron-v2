@@ -91,18 +91,45 @@ pub(crate) fn session_catalog() -> Option<std::sync::Arc<crate::gateway_catalog:
         .ok()
 }
 
-/// Catalog listing appended to `/model` when the session runs on Zero-X.
+/// Catalog listing appended to `/model` when the session runs on Zero-X, with the
+/// models' status as of now.
 pub(crate) fn gateway_model_listing(current_model: &str) -> Option<String> {
     let catalog = session_catalog()?;
     Some(crate::gateway_catalog::render_model_list(
-        &catalog,
+        &crate::gateway_catalog::with_session_status(&catalog),
         current_model,
+        crate::clock::now_unix(),
     ))
 }
 
-/// Warning for `/model <id>` on Zero-X when the id is unknown or not
-/// available on the user's plan.
+/// Warning for `/model <id>` on Zero-X when the id is unknown, not available
+/// to the user, or out of capacity now.
 pub(crate) fn gateway_model_warning(model: &str) -> Option<String> {
     let catalog = session_catalog()?;
-    crate::gateway_catalog::model_choice_warning(&catalog, model)
+    crate::gateway_catalog::model_choice_warning(
+        &crate::gateway_catalog::with_session_status(&catalog),
+        model,
+        crate::clock::now_unix(),
+        false,
+    )
+}
+
+/// `neuron prompt` on Zero-X with a model other than `auto`: the same warning,
+/// on stderr before the first request, from the gateway's current status (asked
+/// for once; without an answer the catalog's own status counts). It only warns:
+/// the request is still sent.
+pub(crate) fn warn_about_prompt_model(model: &str) {
+    if crate::provider::shown_model(model).eq_ignore_ascii_case(crate::provider::AUTO_MODEL) {
+        return;
+    }
+    let on_gateway = active_provider().is_some_and(|active| active.id == ProviderId::ZeroX);
+    let Some(catalog) = crate::gateway_catalog::current().filter(|_| on_gateway) else {
+        return;
+    };
+    let live = crate::gateway_catalog::with_session_status(&catalog);
+    if let Some(warning) =
+        crate::gateway_catalog::model_choice_warning(&live, model, crate::clock::now_unix(), true)
+    {
+        crate::provider::print_warning(&warning);
+    }
 }

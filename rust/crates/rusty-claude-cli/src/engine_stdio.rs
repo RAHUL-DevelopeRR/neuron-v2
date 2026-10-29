@@ -353,6 +353,8 @@ mod tests {
         let handle = store.create_handle("chat-on-groq");
         let mut session = runtime::Session::new().with_persistence_path(handle.path.clone());
         session.model = Some("groq/openai/gpt-oss-20b".into());
+        // `latest` is the newest chat with messages.
+        session.push_user_text("hello").expect("message");
         session.save_to_path(&handle.path).expect("save");
 
         let saved = |reference: &str| super::saved_session_model(&store, reference);

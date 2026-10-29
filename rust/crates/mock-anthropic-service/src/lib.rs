@@ -100,6 +100,12 @@ enum Scenario {
     /// Calls `bash` with a new command after every result, denied or not: a model that
     /// keeps trying tools a non-interactive run cannot approve.
     BashDenialLoop,
+    /// Calls `WebSearch` once, then answers with what it got: a one-line question in a
+    /// run that cannot approve the search.
+    WebSearchDenied,
+    /// Calls `bash` once with a command that needs two programs approved (`mkdir`,
+    /// `tee`), then answers with what it got.
+    CompoundCommandDenied,
     PluginToolRoundtrip,
     AutoCompactTriggered,
     TokenCostReporting,
@@ -118,6 +124,8 @@ impl Scenario {
             "bash_permission_prompt_approved" => Some(Self::BashPermissionPromptApproved),
             "bash_permission_prompt_denied" => Some(Self::BashPermissionPromptDenied),
             "bash_denial_loop" => Some(Self::BashDenialLoop),
+            "web_search_denied" => Some(Self::WebSearchDenied),
+            "compound_command_denied" => Some(Self::CompoundCommandDenied),
             "plugin_tool_roundtrip" => Some(Self::PluginToolRoundtrip),
             "auto_compact_triggered" => Some(Self::AutoCompactTriggered),
             "token_cost_reporting" => Some(Self::TokenCostReporting),
@@ -137,6 +145,8 @@ impl Scenario {
             Self::BashPermissionPromptApproved => "bash_permission_prompt_approved",
             Self::BashPermissionPromptDenied => "bash_permission_prompt_denied",
             Self::BashDenialLoop => "bash_denial_loop",
+            Self::WebSearchDenied => "web_search_denied",
+            Self::CompoundCommandDenied => "compound_command_denied",
             Self::PluginToolRoundtrip => "plugin_tool_roundtrip",
             Self::AutoCompactTriggered => "auto_compact_triggered",
             Self::TokenCostReporting => "token_cost_reporting",
@@ -275,6 +285,14 @@ fn tool_results_count(request: &MessageRequest) -> usize {
 fn bash_loop_input(attempt: usize) -> Value {
     json!({
         "command": format!("printf 'try {attempt}' | tee loop-{attempt}.txt"),
+        "timeout": 1000,
+    })
+}
+
+/// One command, two programs that need approval: `mkdir` and `tee`.
+fn compound_command_input() -> Value {
+    json!({
+        "command": "mkdir made && printf 'both ran' | tee made/out.txt",
         "timeout": 1000,
     })
 }
@@ -485,6 +503,22 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
                 &[&bash_loop_input(attempt).to_string()],
             )
         }
+        Scenario::WebSearchDenied => match latest_tool_result(request) {
+            Some((tool_output, _)) => final_text_sse(&format!("search not run: {tool_output}")),
+            None => tool_use_sse(
+                "toolu_web_search_deny",
+                "WebSearch",
+                &[r#"{"query":"latest node lts"}"#],
+            ),
+        },
+        Scenario::CompoundCommandDenied => match latest_tool_result(request) {
+            Some((tool_output, _)) => final_text_sse(&format!("compound command: {tool_output}")),
+            None => tool_use_sse(
+                "toolu_compound_command",
+                "bash",
+                &[&compound_command_input().to_string()],
+            ),
+        },
         Scenario::PluginToolRoundtrip => match latest_tool_result(request) {
             Some((tool_output, _)) => final_text_sse(&format!(
                 "plugin tool completed: {}",
@@ -654,6 +688,30 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
                 bash_loop_input(attempt),
             )
         }
+        Scenario::WebSearchDenied => match latest_tool_result(request) {
+            Some((tool_output, _)) => text_message_response(
+                "msg_web_search_deny_final",
+                &format!("search not run: {tool_output}"),
+            ),
+            None => tool_message_response(
+                "msg_web_search_deny_tool",
+                "toolu_web_search_deny",
+                "WebSearch",
+                json!({"query": "latest node lts"}),
+            ),
+        },
+        Scenario::CompoundCommandDenied => match latest_tool_result(request) {
+            Some((tool_output, _)) => text_message_response(
+                "msg_compound_command_final",
+                &format!("compound command: {tool_output}"),
+            ),
+            None => tool_message_response(
+                "msg_compound_command_tool",
+                "toolu_compound_command",
+                "bash",
+                compound_command_input(),
+            ),
+        },
         Scenario::PluginToolRoundtrip => match latest_tool_result(request) {
             Some((tool_output, _)) => text_message_response(
                 "msg_plugin_tool_final",
@@ -696,6 +754,8 @@ fn request_id_for(scenario: Scenario) -> &'static str {
         Scenario::BashPermissionPromptApproved => "req_bash_permission_prompt_approved",
         Scenario::BashPermissionPromptDenied => "req_bash_permission_prompt_denied",
         Scenario::BashDenialLoop => "req_bash_denial_loop",
+        Scenario::WebSearchDenied => "req_web_search_denied",
+        Scenario::CompoundCommandDenied => "req_compound_command_denied",
         Scenario::PluginToolRoundtrip => "req_plugin_tool_roundtrip",
         Scenario::AutoCompactTriggered => "req_auto_compact_triggered",
         Scenario::TokenCostReporting => "req_token_cost_reporting",

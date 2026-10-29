@@ -623,13 +623,18 @@ fn load_catalog_checked(
 
 /// `warning: <message>` on stderr, or in JSON mode the same as a JSON line.
 fn warn(message: &str) {
+    print_warning(&format!("warning: {message}"));
+}
+
+/// A whole `warning: ...` line on stderr, or in JSON mode as a JSON line.
+pub(crate) fn print_warning(line: &str) {
     if JSON_OUTPUT.load(std::sync::atomic::Ordering::Relaxed) {
         eprintln!(
             "{}",
-            serde_json::json!({ "type": "warning", "warning": format!("warning: {message}") })
+            serde_json::json!({ "type": "warning", "warning": line })
         );
     } else {
-        eprintln!("warning: {message}");
+        eprintln!("{line}");
     }
 }
 

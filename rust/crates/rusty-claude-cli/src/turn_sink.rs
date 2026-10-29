@@ -52,6 +52,12 @@ pub(crate) trait TurnSink: Send {
     ) -> io::Result<()> {
         Ok(())
     }
+    /// The reply shown so far is dropped and the request sent again. The line
+    /// terminal keeps the text it printed, so it marks it; the UI drops the attempt
+    /// on the retry notice itself.
+    fn reply_discarded(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// How a runtime shows its turns.
@@ -64,6 +70,9 @@ pub(crate) enum TurnOutput {
     Ansi,
     /// Structured events for the full-screen UI.
     Channel(Arc<Sender<UiEvent>>),
+    /// What a file or a pipe receives (`neuron prompt ... > out.txt`), kept for a test.
+    #[cfg(test)]
+    Captured(Arc<std::sync::Mutex<Vec<u8>>>),
 }
 
 /// Two outputs are the same when a runtime built for one can serve the other: the same
@@ -114,6 +123,10 @@ impl TurnOutput {
                     .spacing_tool_results(&STDOUT_AFTER_TOOL_RESULT),
             ),
             Self::Channel(events) => Box::new(ChannelSink::new(Sender::clone(events))),
+            #[cfg(test)]
+            Self::Captured(buffer) => {
+                Box::new(AnsiSink::new(StripAnsi::new(Captured(Arc::clone(buffer)))))
+            }
         }
     }
 
@@ -132,7 +145,30 @@ impl TurnOutput {
                     .spacing_tool_results(&STDOUT_AFTER_TOOL_RESULT),
             ),
             Self::Channel(events) => Box::new(ChannelSink::new(Sender::clone(events))),
+            #[cfg(test)]
+            Self::Captured(buffer) => {
+                Box::new(AnsiSink::new(StripAnsi::new(Captured(Arc::clone(buffer)))))
+            }
         }
+    }
+}
+
+/// The writer of [`TurnOutput::Captured`].
+#[cfg(test)]
+struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+#[cfg(test)]
+impl Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -395,6 +431,11 @@ impl<W: Write + Send> TurnSink for AnsiSink<W> {
             after.store(true, Ordering::Relaxed);
         }
         Ok(())
+    }
+
+    fn reply_discarded(&mut self) -> io::Result<()> {
+        self.finish_blocks()?;
+        self.write_flushed("\x1b[2m(partial reply discarded \u{2014} retrying)\x1b[0m\n")
     }
 }
 
@@ -779,6 +820,38 @@ mod tests {
             String::from_utf8(out.inner).unwrap(),
             "\u{25E6} Thinking done ok bold"
         );
+    }
+
+    /// The text a failed attempt printed stays on the terminal: a dim line of its
+    /// own under it says the retry replaces it. The UI and silent output show none.
+    #[test]
+    fn a_discarded_reply_is_marked_on_a_dim_line_of_its_own() {
+        let mut out = Vec::new();
+        {
+            let mut sink = AnsiSink::new(&mut out);
+            sink.text_delta("Server Implementation:\n\u{2022} Im")
+                .unwrap();
+            sink.reply_discarded().unwrap();
+        }
+        let output = String::from_utf8(out).unwrap();
+        assert!(
+            output.ends_with("\n\x1b[2m(partial reply discarded \u{2014} retrying)\x1b[0m\n"),
+            "{output:?}"
+        );
+        let printed = plain_output(|sink| {
+            sink.text_delta("Server Implementation:\n\u{2022} Im")
+                .unwrap();
+            sink.reply_discarded().unwrap();
+        });
+        assert!(
+            printed.ends_with(" Im\n(partial reply discarded \u{2014} retrying)\n"),
+            "{printed:?}"
+        );
+
+        let (tx, rx) = mpsc::channel();
+        ChannelSink::new(tx).reply_discarded().unwrap();
+        assert_eq!(rx.try_iter().count(), 0);
+        SilentSink.reply_discarded().unwrap();
     }
 
     #[test]

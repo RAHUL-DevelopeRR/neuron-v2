@@ -43,6 +43,13 @@ script or CI, `neuron prompt` asks nothing: see [Permission modes](#permission-m
 for what happens to tool calls that need approval, and why such a run can exit with
 code 2.
 
+Piped text without a prompt on the command line (`echo "fix the bug" | neuron`) is the
+prompt, sent to the model as one message. So slash commands can't be piped:
+`printf '/status\n/exit' | neuron` is refused, as is piped input with `--no-tui`. Use the
+subcommands (`neuron status`) or `neuron --resume latest /status` instead. A bare `neuron`
+with no terminal and nothing piped (`neuron </dev/null`) stops with "nothing to do"
+rather than starting a session.
+
 `--output-format json` prints one JSON object when the turn ends. `message` is the
 final answer text (never the model's reasoning), `outcome` says how the turn ended
 (`completed`, `output_truncated`, `loop_detected`, `cancelled` or `refused`) and
@@ -52,9 +59,10 @@ final answer text (never the model's reasoning), `outcome` says how the turn end
 line Neuron shows (`message`), the provider's explanation with provider and model
 names left out (`note`, or `null`) and how many tool calls of that response were not
 run (`tool_calls_not_run`); otherwise
-`refusal` is `null`. With `--compact`, standard output keeps the answer only and the
-refusal line goes to standard error. Tool calls from a refused response, or from one
-cut off at the output token limit, are never run.
+`refusal` is `null`. `session_id` names the session the turn was saved to, which
+`--resume` takes (see [Sessions](#sessions)). With `--compact`, standard output keeps
+the answer only and the refusal line goes to standard error. Tool calls from a refused
+response, or from one cut off at the output token limit, are never run.
 
 ## Sign in
 
@@ -105,7 +113,7 @@ Neuron reports gateway limits with the reason and what to do next:
 | --- | --- | --- |
 | `insufficient_quota` | Daily request or token cap reached | Stops and shows the reset time and the upgrade link. No retry. |
 | `rate_limited` | Too many requests per minute, or too many at once | Waits for the `Retry-After` time and retries, at most twice; each wait may be up to 90 seconds and all of them up to 180 seconds, shown as a countdown. |
-| `capacity_exhausted` | The shared free pool for this model is used up | Same as `rate_limited`. A longer wait than that stops with the error. |
+| `capacity_exhausted` | The shared free pool for this model is used up | Same as `rate_limited`. A longer wait than that stops with the error, which names up to three models that have room now (or `auto`). |
 | `upstream_error`, `upstream_timeout`, `service_unavailable` | The upstream provider failed or stalled, or the gateway is briefly unavailable; the gateway refunds most of these requests | Retries at most twice, waiting at most 60 seconds in total. |
 | `model_not_found` | The model id is not in the catalog | Stops; pick one from `/model`. |
 | `upgrade_required` | The model is not in your plan | Stops and shows the upgrade link. |
@@ -114,10 +122,17 @@ Neuron reports gateway limits with the reason and what to do next:
 | `context_length_exceeded` | No available model fits the request, including a prompt above a free model's per-minute token budget | Stops with the gateway's message and, when a paid pool would take the request, the upgrade link; shorten the prompt or `/compact` the session. |
 | `invalid_session` | The credential expired or was revoked | Stops and asks you to run `neuron auth login`. |
 
-Waits between retries do not count toward the first-token timeout (90 seconds, 60
-after tool results). A response that times out or breaks off is sent once more only
-while the retry limit above still allows a request, so one model call sends at most
-three requests to the gateway.
+Neuron waits up to 100 seconds for a gateway response to start, also after tool
+results, so the gateway has time to try other upstream providers first. A provider you
+call directly ([Bring your own key](#bring-your-own-key)) gets 90 seconds, and 60 after
+tool results. `NEURON_FIRST_TOKEN_TIMEOUT_SECS` sets both of these first-token
+timeouts, and waits between retries do not count toward them. A response that does not
+start in time is sent once more after 1 to 2 seconds, and one that breaks off after 2
+to 5 seconds, only while the retry limit above still allows a request, so one model
+call sends at most three requests to the gateway. When part of a reply that broke off
+was already printed, a `(partial reply discarded — retrying)` line follows it before
+the reply starts again; `--output-format json` and `--compact` print only the final
+answer, so they need no such line.
 
 The free plan's limits and the providers behind it are described in the
 [README](README.md#plans-and-limits).
@@ -131,10 +146,16 @@ neuron --model gemini/gemini-2.5-flash
 
 Inside a session, `/model` shows the active model and the catalog, and
 `/model <id>` switches. The list comes from the gateway (`GET /v1/models`, cached for
-10 minutes in `~/.neuroncli/catalog.json`) and marks models that are unavailable to
-you with the reason: not in your plan, not offered in your region, or not configured
-on the gateway. `auto` picks a tool-capable model whose context window fits the
-request. `NEURON_MODEL` sets the model for a process.
+10 minutes in `~/.neuroncli/catalog.json`) with each model's current status
+(`GET /v1/models/status`, asked for again at most every 30 seconds). Models you can use
+now come first, with busy or degraded ones marked; models out of capacity until a known
+time are listed under "Temporarily unavailable" with when they are back; models you
+cannot use are listed under "Not available" with the reason: not in your plan, not
+offered in your region, or not configured on the gateway. Choosing one of the last two
+kinds with `/model <id>` warns, and so does `neuron prompt` with a model other than
+`auto`, which asks for the status once before its request; the request is still sent.
+`auto` picks a tool-capable model whose context window fits the request, and routes
+around models out of capacity. `NEURON_MODEL` sets the model for a process.
 
 Free pools have small per-minute token budgets, so the first request of a session is
 kept small: the system prompt lists the bundled skills by name and the model loads a
@@ -163,16 +184,33 @@ denied instead.
 (standard input a pipe, a file or `/dev/null`) a call that needs approval is denied
 without asking, the model is told that nothing ran, and questions from the model are
 refused so it decides itself. After 5 denied calls the turn stops. A run that denied a
-call ends with a warning naming the denied tools and exits with code 2.
+call ends with a warning naming the denied tools and exits with code 2. Each denial
+names the `permissions.allow` rules that would let that call run, checked against the
+call first: `"bash(npm:*)"` for `npm test`, `"bash(cargo:*)", "bash(npm:*)"` for
+`cargo test && npm run build`, `"WebSearch"` for a web search. A command no prefix
+rule covers gets a rule for that exact command (`"bash(npm test > out.txt)"`), or
+none when it is longer than one line or 160 characters. The end-of-run warning, and
+its `allow_rules` field in JSON mode, lists every rule the denials named. Put them in
+your user settings (`~/.neuron/settings.json`), because a script never gets the trust
+question and an untrusted workspace's own allow rules are ignored. Full access
+(`--permission-mode danger-full-access`) is named only as a last resort, for a
+disposable environment.
 
 `permissions` rules in settings can allow or deny tools and command prefixes in
-advance, for example `{"permissions": {"allow": ["bash(git:*)"]}}`.
+advance, for example `{"permissions": {"allow": ["bash(git:*)"]}}`. `bash(git:*)`
+allows a shell command when every part of it that needs approval starts with `git`,
+so `git status; curl ...` still asks. Prefix rules count together: `bash(cargo:*)` and
+`bash(npm:*)` allow `cargo test && npm run build`. No prefix rule covers a part that
+writes a file through a redirection (`npm test > out.txt`), sets an environment
+variable first (`CI=true npm test`), uses a command substitution or a PowerShell script
+block, or runs a program named by a variable; `bash(npm test > out.txt)` allows that
+exact command only. A deny rule wins when any part matches it.
 
 Choose the mode with `--permission-mode MODE`, switch inside a session with
 `/permissions MODE`, or set a default in settings:
 
 ```json
-{ "permissionMode": "read-only" }
+{ "permissions": { "defaultMode": "read-only" } }
 ```
 
 `--dangerously-skip-permissions` turns every check off for that run; use it only in a
@@ -182,19 +220,43 @@ and deny rules for individual tools.
 
 ## Sessions
 
-Interactive turns are saved to `.neuron/sessions/<session-id>.jsonl` in the project.
+Sessions are saved to `.neuron/sessions/<workspace-id>/<session-id>.jsonl` in the
+project. Every `neuron prompt` run starts a new session.
 
 ```sh
 neuron --resume latest                         # continue the newest session
 neuron --resume latest --permission-mode read-only   # ...with different launch flags
 neuron --resume latest /status /diff           # run resume-safe commands without the REPL
+neuron --resume latest prompt "now add tests"  # send it another prompt, then exit
 neuron export conversation.md                  # write the latest session as Markdown
+
+# a script that keeps to its own session
+id=$(neuron --output-format json prompt "plan the change" | jq -r .session_id)
+neuron --resume "$id" prompt "now make the change"
 ```
 
-On a terminal, `--resume` without slash commands continues the session interactively.
-`--model`, `--permission-mode`, `--allowedTools`, `--reasoning-effort` and the other
-launch flags apply to it whether you put them before or after `--resume`; without
-`--model` it continues on the model the session used.
+`latest` is the newest session with messages: a session left before its first prompt is
+skipped. On a terminal, `--resume` without slash commands continues the session
+interactively.
+`--resume SESSION prompt "..."` works anywhere, scripts included: it runs one turn as
+`neuron prompt` does, with the session's history, and saves the turn to the same file.
+`-p "..."` does the same, and with nothing after it takes the prompt from standard input
+(`echo "now add tests" | neuron --resume latest -p`). With `--output-format json` its
+stdout is the turn's JSON answer, as for `neuron prompt`, and its `session_id` is the
+session's id: a script can continue the session it started by id rather than as
+`latest`, which another run may have changed. `--model`, `--permission-mode`,
+`--allowedTools`, `--reasoning-effort` and the other launch flags go before `prompt` or
+`-p`, before or after `--resume`; without `--model` the turn runs on the model the
+session used. Everything after `-p` is the prompt, so a flag such as `--model` or
+`--output-format` there is refused rather than sent to the model, as are `--resume` and
+`--continue` anywhere in a prompt.
+
+One run at a time can continue a session. While a terminal session, the full-screen UI
+or a script is on it, another run that would continue it (`--resume`, `/resume`,
+`/session switch`, or `/compact` and `/clear --confirm` given to `--resume`) is refused
+with "is in use by another neuron run" before it sends anything, instead of the two runs
+overwriting each other's turns. Wait for the other run to end, or start a new session.
+Each session file has a `.lock` file beside it for this.
 
 Inside a session: `/session list`, `/session switch <id>`, `/resume <path>`,
 `/compact` to shrink history, `/clear` to start over.
@@ -230,7 +292,7 @@ Set the key for the provider you want to use:
 | Local OpenAI-compatible server | `OPENAI_BASE_URL=http://127.0.0.1:<port>/v1` (no key needed) |
 | Anthropic | `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_TOKEN`), with `auto` or a `claude-*` model |
 | xAI | `XAI_API_KEY`, with a `grok-*` model |
-| OpenRouter | `OPENROUTER_API_KEY` (OpenRouter is only available with your own key) |
+| OpenRouter | `OPENROUTER_API_KEY` (the gateway offers two of OpenRouter's free models; your key gives you the rest) |
 | Azure AI Foundry | `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_MODEL` |
 
 Neuron picks the provider in this order and names it, with the credential source, on
@@ -270,7 +332,7 @@ names the file, the line and the closest known key. Commonly used keys:
 | Key | Purpose |
 | --- | --- |
 | `model` | Default model |
-| `permissionMode` | Default permission mode |
+| `permissions.defaultMode` | Default permission mode (`permissionMode` still works but prints a deprecation warning) |
 | `permissions` | `allow`, `ask` and `deny` rules for individual tools |
 | `provider` | Provider to use (see [Bring your own key](#bring-your-own-key)) |
 | `maxIterations` | Model calls allowed in one turn (default 50); `NEURON_MAX_ITERATIONS` overrides it |
@@ -292,8 +354,9 @@ settings**; a repository cannot list itself. For headless runs, set
 `NEURON_TRUST_WORKSPACE=1` only for checkouts you trust.
 
 Until a directory is trusted, its settings keep only what restricts Neuron:
-`permissions.deny` (added to your own deny rules), a read-only `defaultMode` or
-`permissionMode`, and `"defaultMcpServers": false` or `"defaultSkills": false`.
+`permissions.deny` (added to your own deny rules), a read-only
+`permissions.defaultMode` (or the deprecated `permissionMode`), and
+`"defaultMcpServers": false` or `"defaultSkills": false`.
 Hooks, MCP servers, allow and ask rules, model, aliases, provider and the other keys
 are ignored, with a warning naming them. Even in a trusted directory, settings files
 cannot set a full-access permission mode; pass `--permission-mode danger-full-access`
@@ -308,6 +371,7 @@ or put it in your user settings.
 | `NEURON_MODEL` | neuron | Model for this process |
 | `NEURON_PROVIDER` | neuron | Provider for this process (see [Bring your own key](#bring-your-own-key)) |
 | `NEURON_MAX_ITERATIONS` | neuron | Model calls allowed in one turn (default 50) |
+| `NEURON_FIRST_TOKEN_TIMEOUT_SECS` | neuron | Seconds to wait for a response to start, also after tool results (default 100 for the gateway; 90, and 60 after tool results, for a provider called directly) |
 | `NEURON_CONFIG_HOME` | neuron | Settings directory (default `~/.neuron`) |
 | `NEURON_HOME` | neuron | Directory for the login file and caches (default `~/.neuroncli`); setting it also keeps the login out of the OS credential store |
 | `NEURON_CREDENTIAL_STORE` | neuron | `file` or `keychain`: force where the login is kept |
@@ -331,10 +395,20 @@ or put it in your user settings.
 | pip | `pip install --upgrade --pre neuroncli` (the alpha is a pre-release on PyPI, so pip needs `--pre`) | `pipx uninstall neuroncli` or `pip uninstall neuroncli` |
 
 Neuron keeps your login in the OS credential store or `~/.neuroncli/`, and your
-settings in `~/.neuron/`; the launchers cache binaries in `~/.cache/neuroncli` (Linux), `~/Library/Caches/neuroncli`
-(macOS) or `%LOCALAPPDATA%\neuroncli` (Windows). Run `neuron auth logout` before
-deleting them so the session is revoked on the gateway and removed from the
-credential store too.
+settings in `~/.neuron/`. Run `neuron auth logout` before deleting them so the
+session is revoked on the gateway and removed from the credential store too.
+
+The npm package downloads `neuron` (about 17 MB) and `neuron-tui` (about 110 MB)
+during `npm install`, without showing progress, into its own `bin/native` folder, so
+uninstalling the package removes them; when the network fails during the install, npm
+downloads them into that folder on first use instead. pip downloads `neuron` the first
+time you run it and `neuron-tui` the first time the full-screen UI opens, into a
+per-version cache: `~/.cache/neuroncli` (Linux), `~/Library/Caches/neuroncli` (macOS)
+or `%LOCALAPPDATA%\neuroncli` (Windows); delete it after uninstalling. npm uses a
+binary from that cache when its `bin/native` folder has none, and downloads into the
+cache only when that folder is read-only.
+With the installers or pip, the two default MCP servers start through `npx -y`, which
+needs Node.js; the npm package installs them with Neuron.
 
 ## Troubleshooting
 
@@ -352,6 +426,20 @@ credential store too.
   code-signed yet. Files fetched by the installers are not quarantined on macOS; if
   you downloaded a binary with a browser, check its SHA-256 and then run
   `xattr -d com.apple.quarantine ./neuron-macos-arm64`.
+- **Git Bash runs `neuron /model` as a prompt.** Git Bash (MSYS) rewrites an argument
+  that starts with `/` into a Windows path, so `/model` arrives as
+  `C:/Program Files/Git/model` (`C:/msys64/model` under MSYS2). Where a slash command
+  goes (the first argument, or any argument after `--resume`), a path like that which
+  names a slash command is treated as the slash command, and Neuron says so on stderr
+  (not with `--output-format json`). Elsewhere it stays a path, so the safe choices are
+  the subcommands (`neuron skills`, `neuron status`), or `MSYS_NO_PATHCONV=1` for the
+  command: `MSYS_NO_PATHCONV=1 neuron --resume latest /status`.
+- **A script warns "this workspace is not trusted".** Neuron never asks the trust
+  question without a terminal: a script runs, but the folder's own settings (hooks,
+  MCP servers, model, allow rules) are ignored, with that warning naming them. Set
+  `NEURON_TRUST_WORKSPACE=1` for that run (only for checkouts you trust), add the
+  folder to `trustedRoots` in `~/.neuron/settings.json`, or run `neuron` there once in a
+  terminal and press 1.
 - **Anything else.** `neuron doctor` checks auth, configuration and the workspace.
   Include its output, `neuron --version` and your install method when you open an
   issue.

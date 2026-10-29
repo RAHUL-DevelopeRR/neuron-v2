@@ -167,10 +167,12 @@ impl SessionStore {
         Ok(sessions)
     }
 
+    /// The newest session with messages. One without any (a REPL that was left before
+    /// the first prompt) has nothing to continue, so `latest` skips it.
     pub fn latest_session(&self) -> Result<ManagedSessionSummary, SessionControlError> {
         self.list_sessions()?
             .into_iter()
-            .next()
+            .find(|session| session.message_count > 0)
             .ok_or_else(|| SessionControlError::Format(format_no_managed_sessions()))
     }
 
@@ -550,7 +552,7 @@ fn format_missing_session_reference(reference: &str) -> String {
 
 fn format_no_managed_sessions() -> String {
     format!(
-        "no managed sessions found in .neuron/sessions/\nStart `neuron` to create a session, then rerun with `--resume {LATEST_SESSION_REFERENCE}`."
+        "no managed sessions with messages found in .neuron/sessions/\nSend a prompt in `neuron` first, then rerun with `--resume {LATEST_SESSION_REFERENCE}`."
     )
 }
 
@@ -1003,6 +1005,60 @@ mod tests {
         // then
         assert_eq!(latest.id, newer.session_id);
         assert_eq!(handle.id, newer.session_id);
+        fs::remove_dir_all(base).expect("temp dir should clean up");
+    }
+
+    /// A session saved with no messages, as a REPL that was left at once leaves.
+    fn persist_empty_session_via_store(store: &SessionStore) {
+        let session = Session::new().with_workspace_root(store.workspace_root().to_path_buf());
+        let handle = store.create_handle(&session.session_id);
+        session
+            .with_persistence_path(handle.path.clone())
+            .save_to_path(&handle.path)
+            .expect("empty session should persist");
+    }
+
+    #[test]
+    fn latest_skips_a_newer_session_without_messages() {
+        // given
+        let base = temp_dir();
+        fs::create_dir_all(&base).expect("base dir should exist");
+        let store = SessionStore::from_cwd(&base).expect("store should build");
+        let worked = persist_session_via_store(&store, "fix the bug");
+        wait_for_next_millisecond();
+        persist_empty_session_via_store(&store);
+
+        // when
+        let latest = store.latest_session().expect("latest should resolve");
+        let handle = store
+            .resolve_reference("latest")
+            .expect("latest alias should resolve");
+
+        // then
+        assert_eq!(latest.id, worked.session_id);
+        assert_eq!(handle.id, worked.session_id);
+        assert_eq!(store.list_sessions().expect("sessions").len(), 2);
+        fs::remove_dir_all(base).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn latest_with_only_empty_sessions_has_nothing_to_continue() {
+        let base = temp_dir();
+        fs::create_dir_all(&base).expect("base dir should exist");
+        let store = SessionStore::from_cwd(&base).expect("store should build");
+        persist_empty_session_via_store(&store);
+
+        let error = store.latest_session().expect_err("no session has messages");
+
+        assert!(error.to_string().contains("with messages"), "{error}");
+        // A session exists, so the hint is to send a prompt, not to create one.
+        assert!(
+            error
+                .to_string()
+                .contains("Send a prompt in `neuron` first"),
+            "{error}"
+        );
+        assert!(!error.to_string().contains("create a session"), "{error}");
         fs::remove_dir_all(base).expect("temp dir should clean up");
     }
 
