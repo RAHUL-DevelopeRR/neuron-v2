@@ -15,7 +15,8 @@ summary, not legal advice.
 | `ui/neuron-tui/` (the `neuron-tui` binaries), including `src/vendor/common/` | Freebuff's `cli/` and 31 files of its `common/src`, [CodebuffAI/freebuff](https://github.com/CodebuffAI/freebuff) commit `545e04d`, modified since | Apache-2.0, "Copyright 2025 Codebuff" (`ui/neuron-tui/LICENSE`, `NOTICE`, kept unchanged) | Codebuff services, ads, billing and telemetry removed; see `ui/neuron-tui/PORTING.md`. Changed files carry a derivation header. The binary bundles Bun and npm packages (OpenTUI, React), listed in `THIRD_PARTY_NOTICES.md`. |
 | Rust crate dependencies | crates.io | Per crate; see `THIRD_PARTY_NOTICES.md` on each release | See [crate licenses](#crate-licenses). |
 | npm dependencies `codebase-memory-mcp`, `@playwright/mcp` | npm registry | MIT; Apache-2.0 | Installed next to the npm package, not bundled into it. |
-| `assets/` | Claw Code | Not covered by the MIT grant | See [assets](#assets). |
+| `assets/`, except `assets/readme/` | Claw Code | Not covered by the MIT grant | See [assets](#assets). |
+| `assets/readme/` | Made for Neuron's README | © 2026 RAHUL S / Zero-X | The Neuron logo and Zero-X mark (from Zero-X's brand files) and the session illustration with its generator; see [assets](#assets). |
 | Launchers, installers, release pipeline, `docs/GATEWAY_CONTRACT.md` | Written for Neuron | MIT, "Copyright (c) 2026 RAHUL S / Zero-X" | |
 
 `LICENSE` keeps the Claw Code copyright line next to Neuron's, as the MIT license
@@ -77,6 +78,12 @@ license metadata.
 screenshot of a social media post and a photo of a person are owned by their authors
 or subjects, and the MIT license of the code does not cover them.
 
+`assets/readme/` holds the images the README shows, made for Neuron: the Neuron logo
+and the Zero-X mark, resized from Zero-X's own brand files, and an animated
+illustration of a session (`neuron-session.svg`), which
+`assets/readme/src/build-session-svg.mjs` draws from the UI's logo and strings. None
+of it comes from Claw Code or Freebuff.
+
 ## Other branches and leftovers
 
 - **Go `opencode` fork.** The `THE-BUGGY-BREACH` branch contains a Go program in `go/`
@@ -109,7 +116,7 @@ Have counsel review the following before charging for Neuron or Zero-X plans:
    (for example the `rusty-claude-cli` crate, `.claude` and `.claw` settings paths and
    some help strings). Review them against Anthropic's and others' trademark guidelines
    and rename user-facing ones.
-4. **Assets.** Remove or license the images in `assets/`.
+4. **Assets.** Remove or license the images inherited from Claw Code in `assets/`.
 5. **Upstream provider terms.** The free plan depends on Groq, Gemini API and
    Cloudflare Workers AI free tiers permitting this kind of service, and paid plans
    resell upstream capacity; confirm each provider's current terms (the gateway
