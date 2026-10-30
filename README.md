@@ -111,7 +111,8 @@ personal API key.
 The installers download `neuron` and the full-screen UI, `neuron-tui`, from
 [GitHub Releases](https://github.com/RAHUL-DevelopeRR/neuron-v2/releases) and check
 their SHA-256 checksums before installing. A prerelease is never the "latest" GitHub
-release, so the commands name the alpha's version.
+release, so the commands name the alpha's version. The two default MCP servers,
+CodebaseMap and Playwright, start through `npx -y`, so they need Node.js and npm.
 
 ### macOS and Linux
 
@@ -203,11 +204,11 @@ In the full-screen UI:
 
 | Key or command | What it does |
 | --- | --- |
-| Type a task, or `/` | Send a request, or pick a slash command |
+| Type a task, or `/` | Send a request, or pick a slash command from the list |
 | `y` `a` `n` `e` | Answer a permission prompt: allow once, allow for the session, deny, deny with a note (Esc also denies) |
 | `/model` | Pick a model |
-| `/usage` | Your plan and today's usage |
-| `/help` | Every command |
+| `/status` | Model, permission mode, context, your Zero-X plan, and whether the folder is trusted |
+| `/help` | Keyboard shortcuts |
 | Ctrl+C | Interrupt the turn; press it twice, or type `/exit`, to quit |
 
 For one-off prompts:
@@ -279,9 +280,9 @@ OpenRouter's free models. The limits are real and you will run into them:
 
 **Pro and Max.** Paid plans raise the daily and per-minute limits and add paid
 upstream capacity, billed against monthly credits included with the plan. Prices and
-current limits are at <https://zero-x.live/pricing>. In Neuron, `/upgrade` opens that
-page, and `neuron usage` (or `/usage`) shows your plan, today's usage and your credit
-balance.
+current limits are at <https://zero-x.live/pricing>. `neuron upgrade` opens that page,
+and `neuron usage` shows your plan, today's usage and your credit balance (`/upgrade`
+and `/usage` in the line REPL, `neuron --no-tui`).
 
 ## Bring your own key
 
@@ -335,8 +336,9 @@ and [sessions](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/USAGE.md#
 
 - Provider API keys live only on the gateway. The CLI and its packages do not contain
   them.
-- Your login is kept in the OS credential store on macOS and Windows; on Linux, in
-  `~/.neuroncli/credentials.json`, readable only by you. `neuron logout` revokes the
+- Your login is kept in the OS credential store on macOS and Windows; on Linux, or
+  when that store is unavailable, in `~/.neuroncli/credentials.json`, readable only by
+  you. `neuron logout` revokes the
   session on the gateway and deletes the local copy.
 - Shell commands, plugin tools and MCP servers that Neuron starts do not inherit
   `NEURON_TOKEN`, provider keys, or variables named `*_API_KEY`, `*_TOKEN` or
@@ -401,9 +403,9 @@ describes, not in an issue.
 
 ## Credits
 
-- The engine and Rust workspace are derived from
-  [Claw Code](https://github.com/ultraworkers/claw-code) (MIT, © 2026 UltraWorkers and
-  Claw Code contributors).
+- The Rust engine, the Python porting workspace and the parity documents are derived
+  from [Claw Code](https://github.com/ultraworkers/claw-code) (MIT, © 2026 UltraWorkers
+  and Claw Code contributors).
 - The full-screen UI is derived from the
   [Freebuff CLI](https://github.com/CodebuffAI/freebuff) at commit `545e04d`
   (Apache-2.0, © 2025 Codebuff), with Codebuff's services, ads, billing and telemetry
