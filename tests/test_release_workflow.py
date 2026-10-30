@@ -146,7 +146,7 @@ class ReleaseWorkflowStructureTests(unittest.TestCase):
         self.assertIn("--ignore-scripts", install)
         self.assertIn("npm rebuild --global", npm_block)
         self.assertIn("persist-credentials: false", npm_block)
-        self.assertIn("npm publish \"dist/$TARBALL\"", job_block("publish-npm"))
+        self.assertIn("npm publish \"./dist/$TARBALL\"", job_block("publish-npm"))
         self.assertIn("--ignore-scripts", job_block("publish-npm"))
         self.assertIn("pypa/gh-action-pypi-publish", job_block("publish-pypi"))
 
