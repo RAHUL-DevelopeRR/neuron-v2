@@ -1,8 +1,13 @@
+<!--
+  Images: GitHub shows the relative path in each <source>. PyPI also shows this README
+  (pyproject.toml) but drops <source> and cannot resolve relative paths, so each
+  <img> falls back to the same file on the default branch.
+-->
 <h1 align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/readme/neuron-logo-dark.webp">
     <source media="(prefers-color-scheme: light)" srcset="assets/readme/neuron-logo-light.webp">
-    <img src="assets/readme/neuron-logo-light.webp" width="240" alt="Neuron">
+    <img src="https://raw.githubusercontent.com/RAHUL-DevelopeRR/neuron-v2/HEAD/assets/readme/neuron-logo-light.webp" width="240" alt="Neuron">
   </picture>
 </h1>
 
@@ -32,7 +37,10 @@ from several providers, or bring your own key.
 </p>
 
 <p align="center">
-  <img src="assets/readme/neuron-session.svg" width="880" alt="Animated illustration of a Neuron session: neuron login shows a device code, then the full-screen UI reads and edits a file, asks permission to run cargo test, and reports 14 passing tests.">
+  <picture>
+    <source srcset="assets/readme/neuron-session.svg">
+    <img src="https://raw.githubusercontent.com/RAHUL-DevelopeRR/neuron-v2/HEAD/assets/readme/neuron-session.svg" width="880" alt="Animated illustration of a Neuron session: neuron login shows a device code, then the full-screen UI reads and edits a file, asks permission to run cargo test, and reports 14 passing tests.">
+  </picture>
   <br>
   <sub>An illustration drawn from Neuron's UI source, not a screen recording.</sub>
 </p>
@@ -429,7 +437,10 @@ Neuron and Zero-X are not affiliated with or endorsed by any model provider; see
 [NOTICE](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/NOTICE).
 
 <p align="center">
-  <a href="https://zero-x.live"><img src="assets/readme/zerox-mark.png" width="48" alt="Zero-X"></a>
+  <a href="https://zero-x.live"><picture>
+    <source srcset="assets/readme/zerox-mark.png">
+    <img src="https://raw.githubusercontent.com/RAHUL-DevelopeRR/neuron-v2/HEAD/assets/readme/zerox-mark.png" width="48" alt="Zero-X">
+  </picture></a>
   <br>
   <sub>Built by <a href="https://zero-x.live">Zero-X</a></sub>
 </p>
