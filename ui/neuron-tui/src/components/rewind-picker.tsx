@@ -28,6 +28,7 @@ import {
   type RewindFlow,
   type RewindStep,
 } from '../state/git-views-store'
+import { stopActiveRun } from '../utils/active-run'
 import { rewoundLines, type RewoundTone } from '../utils/git-view-text'
 import { formatTimestamp } from '../utils/helpers'
 import { BORDER_CHARS } from '../utils/ui-constants'
@@ -64,7 +65,8 @@ export function resolveRewindKey(
 
 /**
  * Esc at a step: from the list it closes the picker; elsewhere it goes one
- * step back. A rewind already sent cannot be taken back.
+ * step back. A rewind already sent cannot be taken back: there Esc and
+ * Ctrl-C still interrupt a turn that runs, as they do in the composer.
  */
 export function rewindBack(flow: RewindFlow): void {
   const store = useGitViewsStore.getState()
@@ -79,6 +81,7 @@ export function rewindBack(flow: RewindFlow): void {
       store.pickMode(null)
       return
     case 'running':
+      stopActiveRun('user-interrupt')
       return
   }
 }

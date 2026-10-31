@@ -11,7 +11,8 @@ import { useChatStore } from '../../state/chat-store'
 import { useGitViewsStore } from '../../state/git-views-store'
 import { ChangesPanel, ChangesSummary } from '../changes-panel'
 import { COMMIT_KEY_GUARD_MS, CommitProposalCard, resolveCommitProposalKey } from '../commit-proposal'
-import { RewindPicker, resolveRewindKey } from '../rewind-picker'
+import { RewindPicker, resolveRewindKey, rewindBack } from '../rewind-picker'
+import { registerActiveRun, stopActiveRun } from '../../utils/active-run'
 
 import type { CheckpointInfo, RewoundEvent } from '../../engine/protocol'
 
@@ -176,6 +177,23 @@ describe('the rewind picker', () => {
     expect(resolveRewindKey('preview', key('down'))).toEqual({ type: 'none' })
     expect(resolveRewindKey('running', key('return'))).toEqual({ type: 'none' })
     expect(resolveRewindKey('running', key('escape'))).toEqual({ type: 'back' })
+  })
+
+  test('while a rewind runs, Esc and Ctrl-C still interrupt a running turn', () => {
+    const reasons: string[] = []
+    registerActiveRun('rewind-interrupt-test', (reason) => reasons.push(reason))
+    try {
+      useGitViewsStore.getState().openRewind(checkpoints)
+      useGitViewsStore.getState().pickCheckpoint(checkpoints[0]!)
+      useGitViewsStore.getState().pickMode('chat_only')
+      useGitViewsStore.getState().markRewindConfirmed()
+      rewindBack(useGitViewsStore.getState().rewind!)
+      expect(reasons).toEqual(['user-interrupt'])
+      // The rewind itself goes on.
+      expect(useGitViewsStore.getState().rewind?.confirmed).toBe(true)
+    } finally {
+      stopActiveRun('process-exit')
+    }
   })
 
   test('list, mode, dry-run preview, then the confirmed rewind', async () => {
