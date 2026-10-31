@@ -174,7 +174,8 @@ fn canonical(path: &Path) -> Option<PathBuf> {
 /// Neuron's home: `NEURON_HOME`, otherwise `.neuroncli` in the user's home
 /// (`USERPROFILE` on Windows, `HOME` elsewhere), matching the CLI. `None` when
 /// no absolute home is available.
-fn default_neuron_home() -> Option<PathBuf> {
+#[must_use]
+pub fn default_neuron_home() -> Option<PathBuf> {
     if let Some(home) = non_empty_env("NEURON_HOME") {
         return Some(PathBuf::from(home)).filter(|path| path.is_absolute());
     }
