@@ -2,7 +2,8 @@
 // and slash commands the UI does not have go to the engine, and a `!cmd`
 // prompt is a shell command only when shell commands are implemented
 // (USER_SHELL_AVAILABLE); until then it goes to the agent like any prompt.
-// See ui/neuron-tui/PORTING.md.
+// An answer to the agent's question drawn as a chat line is marked as one,
+// so a rewind does not count it as a prompt. See ui/neuron-tui/PORTING.md.
 import {
   dispatchSkillPrompt,
   findCommand,
@@ -432,7 +433,7 @@ export async function routeUserPrompt(
         (pendingQuestionTarget &&
           withQuestionAnswer(prev, pendingQuestionTarget, trimmed)) || [
           ...prev,
-          getUserMessage(trimmed),
+          { ...getUserMessage(trimmed), metadata: { answersQuestion: true } },
         ],
     )
     try {

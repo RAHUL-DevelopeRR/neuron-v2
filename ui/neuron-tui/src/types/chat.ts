@@ -1,8 +1,9 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
 // sponsored-proposal block, inline-ad marker and per-message credits are
 // gone; a tool block can carry its input while the model writes it and a
-// sub-agent's progress, and a `git-view` block holds a diff or a rewind's
-// result. See ui/neuron-tui/PORTING.md.
+// sub-agent's progress, a `git-view` block holds a diff or a rewind's result,
+// and a message can be marked as an answer to the agent's question.
+// See ui/neuron-tui/PORTING.md.
 import type { ChatTheme } from './theme-system'
 import type { ToolName } from './agent-run'
 import type { GitView } from './git-view'
@@ -224,6 +225,11 @@ export type ChatMessageMetadata = {
   userOpened?: boolean
   /** RunState stored after completion */
   runState?: unknown
+  /**
+   * A user message that answered the agent's question rather than starting a
+   * turn, so it has no checkpoint of its own.
+   */
+  answersQuestion?: boolean
 }
 
 export type ChatMessage = {

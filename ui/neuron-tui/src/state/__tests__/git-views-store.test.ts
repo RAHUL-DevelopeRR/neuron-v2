@@ -92,6 +92,24 @@ describe('dropRewoundTurns', () => {
     const notices = [message('ai', 'a'), message('user', '/diff')]
     expect(dropRewoundTurns(notices, 1)).toBe(notices)
   })
+
+  test("an answer to the agent's question is not a prompt", () => {
+    const answer = { ...message('user', 'use main'), metadata: { answersQuestion: true } }
+    const kept = dropRewoundTurns(
+      [
+        message('user', 'first prompt'),
+        message('ai', 'first answer'),
+        message('user', 'second prompt'),
+        message('ai', 'Question: which branch?'),
+        answer,
+        message('ai', 'second answer'),
+        message('user', 'third prompt'),
+        message('ai', 'third answer'),
+      ],
+      2,
+    )
+    expect(kept.map((m) => m.content)).toEqual(['first prompt', 'first answer'])
+  })
 })
 
 describe('the rewind flow', () => {
