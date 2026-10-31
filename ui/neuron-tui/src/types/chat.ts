@@ -1,9 +1,11 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
 // sponsored-proposal block, inline-ad marker and per-message credits are
 // gone; a tool block can carry its input while the model writes it and a
-// sub-agent's progress. See ui/neuron-tui/PORTING.md.
+// sub-agent's progress, and a `git-view` block holds a diff or a rewind's
+// result. See ui/neuron-tui/PORTING.md.
 import type { ChatTheme } from './theme-system'
 import type { ToolName } from './agent-run'
+import type { GitView } from './git-view'
 import type { ReactNode } from 'react'
 
 /**
@@ -168,6 +170,12 @@ export type ImageContentBlock = {
   userOpened?: boolean
 }
 
+/** A `/diff` or a rewind's result, drawn by components/git-view-cell.tsx. */
+export type GitViewContentBlock = {
+  type: 'git-view'
+  view: GitView
+}
+
 export type ImageAttachment = {
   filename: string
   path: string
@@ -192,6 +200,7 @@ export type ContentBlock =
   | AgentContentBlock
   | AgentListContentBlock
   | AskUserContentBlock
+  | GitViewContentBlock
   | HtmlContentBlock
   | ImageContentBlock
   | ModeDividerContentBlock

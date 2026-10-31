@@ -23,6 +23,7 @@ import {
   type EngineExit,
   type EngineLaunchOptions,
 } from './neuron-engine-client'
+import { handleGitViewsEvent, resetGitViews } from './git-views'
 import { QUESTION_PREFIX } from './questions'
 import { engineSessionOf, withEngineSession } from './session-run-state'
 import { StdioEngineClient } from './stdio-engine-client'
@@ -196,6 +197,8 @@ export function recordEngineSessionInChat(status: StatusEvent): void {
 }
 
 export function handleEngineEvent(event: UiEvent): void {
+  // Changes, diffs, commit proposals and checkpoints (./git-views.ts).
+  if (handleGitViewsEvent(event)) return
   const engine = useEngineStore.getState()
   switch (event.type) {
     case 'ready':
@@ -313,6 +316,7 @@ async function launchEngineSession(launch: EngineLaunchOptions): Promise<void> {
   setNeuronEngineClient(client)
   const engine = useEngineStore.getState()
   engine.reset()
+  resetGitViews()
   engine.setConnection('starting', null)
 
   client.subscribe(handleEngineEvent)

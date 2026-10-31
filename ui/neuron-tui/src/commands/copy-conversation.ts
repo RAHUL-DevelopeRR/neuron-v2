@@ -1,5 +1,5 @@
-// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
-// See ui/neuron-tui/PORTING.md.
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: git-view
+// blocks (a diff, a rewind's result) are copied too. See ui/neuron-tui/PORTING.md.
 /**
  * `/copy` command — serialize the entire conversation (user + assistant text,
  * reasoning, tool calls with their inputs and outputs, sub-agents) into clean
@@ -15,6 +15,7 @@
  */
 
 import { copyTextToClipboard, showClipboardMessage } from '../utils/clipboard'
+import { gitViewMarkdown } from '../utils/git-view-text'
 import { useChatStore } from '../state/chat-store'
 
 import type { RouterParams } from './command-registry'
@@ -221,6 +222,21 @@ function renderBlock(block: ContentBlock, out: Segment[]): void {
     case 'agent-list': {
       const names = block.agents.map((a) => a.displayName).join(', ')
       if (names) out.push(`_[available agents: ${names}]_`)
+      return
+    }
+
+    case 'git-view': {
+      const text = gitViewMarkdown(block.view)
+      // A long diff can be dropped like a tool result to fit the clipboard.
+      out.push(
+        block.view.kind === 'diff'
+          ? {
+              kind: 'output',
+              full: text,
+              note: `_Diff omitted (${formatBytes(byteLen(text))}) to fit clipboard._`,
+            }
+          : text,
+      )
       return
     }
 
