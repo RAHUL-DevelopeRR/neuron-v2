@@ -4,7 +4,8 @@
 // subscription banners, feedback, publishing, the profile survey and every
 // analytics event are gone. The engine's permission requests, sign-in and model
 // picker open panels above the input, and its status shows in a footer line
-// below it. A submit sends the store's latest text. See ui/neuron-tui/PORTING.md.
+// below it. A submit sends the store's latest text. A running turn's task list
+// shows in a strip above the input. See ui/neuron-tui/PORTING.md.
 import { HelpBanner } from './components/help-banner'
 import {
   useCallback,
@@ -34,6 +35,7 @@ import {
   type SuggestedPromptSelection,
 } from './components/suggested-prompts'
 import { TodoPanel } from './components/todo-panel'
+import { TodoStrip } from './components/todo-strip'
 import { TopBanner } from './components/top-banner'
 import { useChatRuntime } from './contexts/chat-runtime-context'
 import { getSlashCommandsWithSkills } from './data/slash-commands'
@@ -1316,6 +1318,8 @@ export const Chat = ({
         )}
 
         {inputMode === 'help' && <HelpBanner />}
+
+        <TodoStrip hidden={todoPanelOpen} />
 
         {shouldShowStatusLine && (
           <StatusBar
