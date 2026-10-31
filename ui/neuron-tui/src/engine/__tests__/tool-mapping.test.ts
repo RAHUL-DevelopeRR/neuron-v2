@@ -143,6 +143,27 @@ describe('mapToolResult', () => {
     expect(shown).toContain('Created new file C:\\work\\generated\\output.txt')
   })
 
+  test('a written or edited file inside the workspace reads relative to it, as the call named it', () => {
+    const created = JSON.stringify({
+      type: 'create',
+      filePath: '\\\\?\\C:\\Work\\shop\\grocery-shop\\style.css',
+      bytes: 24,
+      lines: 1,
+    })
+    expect(
+      formatToolOutput(mapToolResult('write_file', created, false, 'C:\\work\\shop')),
+    ).toContain('Created new file grocery-shop/style.css')
+    const edited = JSON.stringify({ filePath: '/home/me/shop/src/app.ts', diff: '' })
+    expect(
+      formatToolOutput(mapToolResult('edit_file', edited, false, '/home/me/shop/')),
+    ).toContain('Updated file src/app.ts')
+    // Outside the workspace, or in a folder whose name only starts the same: as it came.
+    const outside = JSON.stringify({ type: 'update', filePath: '/home/me/shop-old/a.ts' })
+    expect(
+      formatToolOutput(mapToolResult('write_file', outside, false, '/home/me/shop')),
+    ).toContain('Updated file /home/me/shop-old/a.ts')
+  })
+
   test('errors and plain text are shown as they came', () => {
     expect(
       formatToolOutput(

@@ -45,6 +45,9 @@ import { NO_RESULT_MESSAGE, mapToolCall, mapToolResult } from './tool-mapping'
 import type { ContentBlock } from '../types/chat'
 import type { UiEvent } from './protocol'
 
+/** The session's workspace as the engine last reported it. */
+const sessionCwd = (): string | null => useEngineStore.getState().status?.cwd ?? null
+
 /**
  * The blocks without the text and reasoning a failed attempt of the model
  * call streamed: those after `attemptStart`, where the attempt began (the
@@ -219,7 +222,7 @@ export function createTurnEventSink(
         updater.updateAiMessageBlocks((blocks) =>
           updateToolBlockWithOutput(blocks, {
             toolCallId: call.id,
-            toolOutput: mapToolResult(call.name, output, isError),
+            toolOutput: mapToolResult(call.name, output, isError, sessionCwd()),
             isError,
           }),
         )
@@ -233,7 +236,7 @@ export function createTurnEventSink(
       type: 'tool_result',
       toolCallId: call.id,
       toolName: call.toolName,
-      output: mapToolResult(call.name, output, isError),
+      output: mapToolResult(call.name, output, isError, sessionCwd()),
       isError,
     }
     sdk(result)

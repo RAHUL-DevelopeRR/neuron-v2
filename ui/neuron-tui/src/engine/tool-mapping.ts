@@ -38,6 +38,24 @@ export const NEURON_TO_RENDERER_TOOL: Record<string, string> = {
 export const displayPath = (value: string): string =>
   value.replace(/^\\\\\?\\(UNC\\)?/, (_match, unc) => (unc ? '\\\\' : ''))
 
+/**
+ * A result's file path as the call named it: relative to the workspace (with
+ * `/`) when it is inside `cwd`, so a row keeps the path it showed while the
+ * model wrote the call. Elsewhere, or without a `cwd`, as {@link displayPath}.
+ */
+export function workspacePath(value: string, cwd?: string | null): string {
+  const path = displayPath(value)
+  if (!cwd) return path
+  const windows = /^[A-Za-z]:[\\/]/.test(path) || path.includes('\\')
+  const normalize = (text: string) => {
+    const slashed = text.replace(/\\/g, '/')
+    return windows ? slashed.toLowerCase() : slashed
+  }
+  const root = normalize(displayPath(cwd)).replace(/\/+$/, '') + '/'
+  if (!normalize(path).startsWith(root)) return path
+  return path.slice(root.length).replace(/\\/g, '/') || path
+}
+
 const parseObject = (json: string): Record<string, unknown> | null => {
   try {
     const value = JSON.parse(json)
@@ -186,6 +204,8 @@ export function mapToolResult(
   name: string,
   output: string,
   isError: boolean,
+  /** The session's workspace, so file results read relative to it. */
+  cwd?: string | null,
 ): ToolResultOutput[] {
   if (TERMINAL_TOOLS.has(name)) {
     // A command that ran and failed (non-zero exit, timeout) still has its
@@ -224,7 +244,7 @@ export function mapToolResult(
 
   switch (name) {
     case 'write_file': {
-      const file = displayPath(str(parsed.filePath) ?? '')
+      const file = workspacePath(str(parsed.filePath) ?? '', cwd)
       return json({
         message: parsed.type === 'create' ? `Created new file ${file}` : `Updated file ${file}`,
         file,
@@ -237,7 +257,7 @@ export function mapToolResult(
     }
 
     case 'edit_file': {
-      const file = displayPath(str(parsed.filePath) ?? '')
+      const file = workspacePath(str(parsed.filePath) ?? '', cwd)
       return json({
         message: `Updated file ${file}`,
         file,
