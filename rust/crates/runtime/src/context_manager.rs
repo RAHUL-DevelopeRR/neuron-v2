@@ -60,14 +60,34 @@ pub const ASCII_CHARS_PER_TOKEN: usize = 3;
 /// the safe side.
 #[must_use]
 pub fn estimate_text_tokens(text: &str) -> usize {
-    let (ascii, other) = text.chars().fold((0_usize, 0_usize), |(ascii, other), ch| {
-        if ch.is_ascii() {
-            (ascii + 1, other)
-        } else {
-            (ascii, other + 1)
+    let mut estimate = TextTokenEstimate::default();
+    estimate.push(text);
+    estimate.tokens()
+}
+
+/// [`estimate_text_tokens`] of text that arrives in pieces (a streamed reply): the
+/// estimate of the pieces joined, without keeping them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TextTokenEstimate {
+    ascii: usize,
+    other: usize,
+}
+
+impl TextTokenEstimate {
+    pub fn push(&mut self, text: &str) {
+        for ch in text.chars() {
+            if ch.is_ascii() {
+                self.ascii += 1;
+            } else {
+                self.other += 1;
+            }
         }
-    });
-    ascii.div_ceil(ASCII_CHARS_PER_TOKEN) + other
+    }
+
+    #[must_use]
+    pub fn tokens(&self) -> usize {
+        self.ascii.div_ceil(ASCII_CHARS_PER_TOKEN) + self.other
+    }
 }
 
 /// Estimates the token footprint of one content block.
@@ -498,8 +518,8 @@ pub fn prune_tool_results(
 mod tests {
     use super::{
         estimate_messages_tokens, estimate_text_tokens, omission_marker, prune_tool_results,
-        truncate_head_tail, ContextBudget, ContextManager, ContextPolicy, ASCII_CHARS_PER_TOKEN,
-        DEFAULT_MAX_TOOL_RESULT_CHARS,
+        truncate_head_tail, ContextBudget, ContextManager, ContextPolicy, TextTokenEstimate,
+        ASCII_CHARS_PER_TOKEN, DEFAULT_MAX_TOOL_RESULT_CHARS,
     };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
@@ -517,6 +537,20 @@ mod tests {
         assert_eq!(estimate_text_tokens("日本語"), 3);
         assert_eq!(estimate_text_tokens("🙂🙂"), 2);
         assert_eq!(estimate_text_tokens("ab🙂"), 2);
+    }
+
+    /// Pieces of a stream add up to the estimate of the whole text, however it is cut.
+    #[test]
+    fn a_streamed_estimate_matches_the_whole_text() {
+        let text = "fn main() { println!(\"héllo 🙂\"); }\n".repeat(7);
+        for size in [1, 2, 5, 13] {
+            let mut estimate = TextTokenEstimate::default();
+            for piece in text.chars().collect::<Vec<_>>().chunks(size) {
+                estimate.push(&piece.iter().collect::<String>());
+            }
+            assert_eq!(estimate.tokens(), estimate_text_tokens(&text), "{size}");
+        }
+        assert_eq!(TextTokenEstimate::default().tokens(), 0);
     }
 
     #[test]

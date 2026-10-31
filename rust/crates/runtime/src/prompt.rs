@@ -331,6 +331,20 @@ pub fn workspace_git_status(cwd: &Path) -> Option<String> {
     read_git_status(cwd, workspace_trusted)
 }
 
+/// A `git` command in `cwd` for Neuron's own source-control work (`/diff`, `/commit`),
+/// with the safeguards of [`workspace_git_status`]: no optional locks and, in an
+/// untrusted workspace, no repository config that runs programs. `None` when the
+/// workspace is untrusted and its repository defines filter drivers, which git would
+/// run on every changed file.
+#[must_use]
+pub fn workspace_git_command(cwd: &Path) -> Option<std::process::Command> {
+    let workspace_trusted = ConfigLoader::default_for(cwd).workspace_is_trusted();
+    if !workspace_trusted && has_repository_filter_drivers(cwd) {
+        return None;
+    }
+    Some(git_command(cwd, workspace_trusted))
+}
+
 fn read_git_status(cwd: &Path, workspace_trusted: bool) -> Option<String> {
     let stdout = read_git_output(cwd, workspace_trusted, &["status", "--short", "--branch"])?;
     let trimmed = stdout.trim();

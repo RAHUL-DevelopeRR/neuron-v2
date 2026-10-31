@@ -1084,7 +1084,10 @@ mod tests {
             alternatives(None, "gemini/gemini-2.5-flash", status_now()),
             vec!["auto".to_string()]
         );
-        assert!(alternatives(None, "auto", status_now()).is_empty());
+        assert_eq!(
+            alternatives(None, "auto", status_now()),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

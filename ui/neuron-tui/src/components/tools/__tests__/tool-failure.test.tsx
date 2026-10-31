@@ -216,7 +216,7 @@ describe('a failed tool call does not look like a success', () => {
   test('a refused write shows ✗, "refused" and why', async () => {
     const shown = await frame(edit(true, REFUSED_WRITE))
     // Was "• Edit ro.txt", exactly like a write that worked.
-    expect(shown).toContain('✗ Edit ro.txt refused')
+    expect(shown).toContain('✗ Write ro.txt refused')
     expect(shown).toContain('current mode is read-only')
     expect(shown).not.toContain('•')
   })

@@ -2,7 +2,10 @@
 // and slash commands the UI does not have go to the engine, and a `!cmd`
 // prompt is a shell command only when shell commands are implemented
 // (USER_SHELL_AVAILABLE); until then it goes to the agent like any prompt.
-// See ui/neuron-tui/PORTING.md.
+// An answer to the agent's question drawn as a chat line is marked as one,
+// and it and the echo of a failed image path as not sent to the engine, so a
+// rewind does not count them as prompts. Enter on an empty input brings up a
+// waiting commit card or rewind picker. See ui/neuron-tui/PORTING.md.
 import {
   dispatchSkillPrompt,
   findCommand,
@@ -16,6 +19,7 @@ import {
   buildReviewPrompt,
 } from './prompt-builders'
 import { whenEngineStarted } from '../engine/engine-session'
+import { revealDeferredGitPanel } from '../engine/git-views'
 import { getNeuronEngineClient, runExchange } from '../engine/neuron-engine-client'
 import { withQuestionAnswer } from '../engine/questions'
 import { statusAddendum } from '../engine/status-report'
@@ -241,6 +245,9 @@ export async function routeUserPrompt(
   // Allow empty messages if there are pending attachments (images or text).
   // Skill mode also accepts an empty submit: it means "run the skill as-is".
   const hasAttachments = pendingAttachments.length > 0
+  // Enter on an empty input brings up a commit card or rewind picker that
+  // waits behind it (engine/git-views.ts).
+  if (!trimmed && !hasAttachments && inputMode === 'default' && revealDeferredGitPanel()) return
   if (!trimmed && !hasAttachments && inputMode !== 'skill') return
 
   // Handle bash mode commands
@@ -355,7 +362,8 @@ export async function routeUserPrompt(
     if (!result.success) {
       setMessages((prev) => [
         ...prev,
-        getUserMessage(trimmed),
+        // Never sent: no prompt for a rewind to count.
+        { ...getUserMessage(trimmed), metadata: { sentToEngine: false } },
         getSystemMessage(`${GLYPHS.error} ${result.error}`),
       ])
     }
@@ -432,7 +440,7 @@ export async function routeUserPrompt(
         (pendingQuestionTarget &&
           withQuestionAnswer(prev, pendingQuestionTarget, trimmed)) || [
           ...prev,
-          getUserMessage(trimmed),
+          { ...getUserMessage(trimmed), metadata: { answersQuestion: true, sentToEngine: false } },
         ],
     )
     try {

@@ -16,6 +16,7 @@ pub mod bash_validation;
 mod bootstrap;
 pub mod branch_lock;
 pub mod cancel;
+pub mod checkpoints;
 mod compact;
 mod config;
 pub mod config_validate;
@@ -163,8 +164,9 @@ pub use policy_engine::{
     PolicyEngine, PolicyRule, ReconcileReason, ReviewStatus,
 };
 pub use prompt::{
-    load_system_prompt, prepend_bullets, set_prompt_model, workspace_git_status, ContextFile,
-    ProjectContext, PromptBuildError, SystemPromptBuilder, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+    load_system_prompt, prepend_bullets, set_prompt_model, workspace_git_command,
+    workspace_git_status, ContextFile, ProjectContext, PromptBuildError, SystemPromptBuilder,
+    SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
 pub use recovery_recipes::{
     attempt_recovery, recipe_for, EscalationPolicy, FailureScenario, RecoveryContext,

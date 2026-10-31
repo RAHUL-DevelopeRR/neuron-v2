@@ -81,6 +81,103 @@ pub struct AccountInfo {
     pub expires_at: Option<u64>,
 }
 
+/// The feature that adds [`EngineCommand::Capabilities`]. Engine features are listed in
+/// [`UiEvent::Ready`]'s `features`; a UI sends a feature's commands only when it is listed.
+pub const FEATURE_CAPABILITIES: &str = "capabilities";
+
+/// The engine can report a turn while the model writes it: [`UiEvent::ToolInputStarted`],
+/// [`UiEvent::ToolInputProgress`], [`UiEvent::OutputProgress`] and
+/// [`UiEvent::RequestUsage`]. Sent only to a UI that declared [`CAPABILITY_LIVE_PROGRESS`].
+pub const FEATURE_LIVE_PROGRESS: &str = "live_progress";
+
+/// The engine reports the files the agent changed ([`UiEvent::Changes`]) and answers
+/// `/diff`, `/commit` and [`EngineCommand::Commit`] with [`UiEvent::Diff`] and
+/// [`UiEvent::CommitProposal`]. Without [`CAPABILITY_GIT_VIEWS`] it answers with notices.
+pub const FEATURE_GIT_VIEWS: &str = "git_views";
+
+/// The engine keeps a checkpoint per prompt: `/rewind` lists them
+/// ([`UiEvent::Checkpoints`]) and [`EngineCommand::Rewind`] goes back to one
+/// ([`UiEvent::Rewound`]). Without [`CAPABILITY_GIT_VIEWS`] it answers with notices.
+pub const FEATURE_CHECKPOINTS: &str = "checkpoints";
+
+/// Every feature this engine has, in [`UiEvent::Ready`].
+pub const ENGINE_FEATURES: &[&str] = &[
+    FEATURE_CAPABILITIES,
+    FEATURE_LIVE_PROGRESS,
+    FEATURE_GIT_VIEWS,
+    FEATURE_CHECKPOINTS,
+];
+
+/// A UI capability ([`EngineCommand::Capabilities`]): send the live-progress events of
+/// [`FEATURE_LIVE_PROGRESS`].
+pub const CAPABILITY_LIVE_PROGRESS: &str = "live_progress";
+
+/// A UI capability: send changes, diffs, commit proposals, checkpoints and rewinds as
+/// their own events instead of notices.
+pub const CAPABILITY_GIT_VIEWS: &str = "git_views";
+
+/// One item of the agent's task list (its `TodoWrite` tool).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoItem {
+    pub content: String,
+    /// `pending`, `in_progress` or `completed`.
+    pub status: String,
+    /// The item in the present tense, while it is in progress.
+    pub active_form: Option<String>,
+}
+
+/// A file and how it changed, with line counts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangedFile {
+    /// Relative to the workspace root, with `/`; absolute for files outside it.
+    pub path: String,
+    /// `created`, `modified`, `deleted` or `renamed`.
+    pub status: String,
+    /// Lines added and removed (0 for binary files).
+    pub added: u64,
+    pub removed: u64,
+}
+
+/// One file of a [`UiEvent::Diff`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffFile {
+    /// Relative to the workspace root, with `/`.
+    pub path: String,
+    /// `created`, `modified`, `deleted` or `renamed`.
+    pub status: String,
+    pub added: u64,
+    pub removed: u64,
+    /// The unified diff's hunks (from the first `@@` line on); empty for binary files and
+    /// for files left out to keep the event small.
+    pub patch: String,
+    pub binary: bool,
+}
+
+/// One entry of the "go back to" list ([`UiEvent::Checkpoints`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointInfo {
+    pub id: u64,
+    /// When the prompt was sent (Unix milliseconds).
+    pub created_at_ms: u64,
+    /// The prompt, shortened to one line.
+    pub prompt_preview: String,
+    /// Files the agent's file tools changed in that turn (workspace-relative, with `/`).
+    pub files: Vec<String>,
+    /// Shell commands that turn ran; a rewind cannot undo what they did.
+    pub shell_commands: Vec<String>,
+    /// Set on the checkpoint a code-only rewind saves first: the checkpoint that rewind
+    /// went back to, so the rewind itself can be undone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_rewind_to: Option<u64>,
+}
+
+/// A file a rewind could not put back, and why (as people read it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotRestoredFile {
+    pub path: String,
+    pub reason: String,
+}
+
 /// Engine → UI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -91,9 +188,13 @@ pub enum UiEvent {
         protocol: u32,
         /// The Neuron version.
         version: String,
+        /// [`ENGINE_FEATURES`]; empty from engines before them.
+        #[serde(default)]
+        features: Vec<String>,
     },
-    /// What the footer shows. Sent after `Ready`, after every `TurnFinished`, and after a
-    /// model switch.
+    /// What the footer shows. Sent after `Ready`, after every `TurnFinished`, after a
+    /// model switch, and after a tool call that may have changed files (for the git
+    /// counts).
     Status {
         model: String,
         permission_mode: String,
@@ -190,6 +291,106 @@ pub enum UiEvent {
     TurnFinished,
     /// The turn failed; `message` is what to show.
     Error { message: String },
+    /// The model started a tool call and is still writing its input: show the call now.
+    /// [`UiEvent::ToolInputProgress`] follows while the input grows, then
+    /// [`UiEvent::ToolCallStarted`] with the same `id` and the complete input. With
+    /// [`CAPABILITY_LIVE_PROGRESS`] only.
+    ToolInputStarted { id: String, name: String },
+    /// How far the model got writing a tool call's input. Sent at most every 100 ms or
+    /// so per call while it grows, and once more when the input is complete. With
+    /// [`CAPABILITY_LIVE_PROGRESS`] only.
+    ToolInputProgress {
+        id: String,
+        name: String,
+        /// Bytes of input (JSON text) so far.
+        bytes: u64,
+        /// Lines of the call's main text so far: a written file's content, an edit's
+        /// new text, a command. 0 before it starts.
+        lines: u64,
+        /// What the call is about, once the model has written it: a path, a command, a
+        /// search pattern, a URL.
+        target: Option<String>,
+        /// The last lines of the main text so far (a few lines, at most about 1 KB),
+        /// unescaped.
+        preview: Option<String>,
+    },
+    /// Output tokens of the model response now streaming (text, reasoning and tool
+    /// input), estimated from its length. Starts again from 0 with each model request
+    /// of a turn. With [`CAPABILITY_LIVE_PROGRESS`] only.
+    OutputProgress { output_tokens: u64 },
+    /// One model request of the turn ended: its tokens as the provider reported them.
+    /// [`UiEvent::Usage`] still closes the turn with its totals. With
+    /// [`CAPABILITY_LIVE_PROGRESS`] only.
+    RequestUsage { usage: TokenCounts },
+    /// The agent's task list changed (its `TodoWrite` tool ran): the whole list.
+    Todos { items: Vec<TodoItem> },
+    /// A sub-agent started (an `Agent` tool call began running). `id` is the call's
+    /// [`UiEvent::ToolCallStarted`] id.
+    SubagentStarted {
+        id: String,
+        description: String,
+        subagent_type: Option<String>,
+    },
+    /// A sub-agent's `Agent` call ended: `status` is the sub-agent's (`completed`,
+    /// `failed`, `running` when it went on in the background, ...); `result` its final
+    /// text, `note` why it stopped early.
+    SubagentFinished {
+        id: String,
+        status: String,
+        is_error: bool,
+        result: Option<String>,
+        note: Option<String>,
+    },
+    /// Every file the agent created, changed or deleted in this session, with lines
+    /// added and removed since the session first touched it. Sent when the list changes
+    /// (after a tool call, after a rewind) and after [`EngineCommand::Capabilities`] when
+    /// it is not empty. With [`CAPABILITY_GIT_VIEWS`] only.
+    Changes { files: Vec<ChangedFile> },
+    /// Answer to `/diff [path]`: the workspace's changes against `HEAD` (staged,
+    /// unstaged and untracked), or outside git the agent's changes this session. With
+    /// [`CAPABILITY_GIT_VIEWS`]; otherwise a notice with the diff as text.
+    Diff {
+        /// What was compared, as a heading (`Changes against HEAD on main`).
+        title: String,
+        files: Vec<DiffFile>,
+        /// Files or hunks were left out to keep the event small.
+        truncated: bool,
+    },
+    /// Answer to `/commit` without a message: a drafted message and what a commit would
+    /// take. Commit with [`EngineCommand::Commit`] (the message may be edited); nothing
+    /// is committed until then. With [`CAPABILITY_GIT_VIEWS`]; otherwise a notice.
+    CommitProposal {
+        message: String,
+        branch: Option<String>,
+        files: Vec<ChangedFile>,
+        /// Nothing is staged, so the commit takes every change (`git add -A`, which
+        /// respects `.gitignore`); otherwise only what is staged.
+        stage_all: bool,
+    },
+    /// Answer to `/rewind`: the session's checkpoints, newest first. Go back with
+    /// [`EngineCommand::Rewind`]. With [`CAPABILITY_GIT_VIEWS`]; otherwise a notice.
+    Checkpoints { items: Vec<CheckpointInfo> },
+    /// Answer to [`EngineCommand::Rewind`]: what it put back (or, for a dry run, would).
+    /// With [`CAPABILITY_GIT_VIEWS`]; otherwise a notice.
+    Rewound {
+        checkpoint: u64,
+        /// `code_and_chat`, `chat_only` or `code_only`.
+        mode: String,
+        dry_run: bool,
+        /// Files written back, and files removed because they did not exist then.
+        restored: Vec<String>,
+        removed: Vec<String>,
+        not_restored: Vec<NotRestoredFile>,
+        /// Shell commands run since the checkpoint; what they did was not undone.
+        shell_commands: Vec<String>,
+        /// Prompts taken out of the conversation (the checkpoint's and every later one):
+        /// the UI drops its last `removed_turns` prompts with everything after them. 0
+        /// when the chat was kept.
+        removed_turns: usize,
+        /// The checkpoint's prompt, for the input box ("edit and send again"); `None`
+        /// when the chat was kept.
+        prompt: Option<String>,
+    },
 }
 
 /// What a [`UiEvent::Notice`] is about.
@@ -232,6 +433,28 @@ pub enum EngineCommand {
     Interrupt,
     /// Save and stop.
     Shutdown,
+    /// What this UI handles (`features` from [`UiEvent::Ready`] lists `capabilities`):
+    /// [`CAPABILITY_LIVE_PROGRESS`] and [`CAPABILITY_GIT_VIEWS`]. Replaces what an earlier
+    /// one said; it may come at any time, also during a turn.
+    Capabilities {
+        features: Vec<String>,
+        /// Which UI this is (`terminal`, `desktop`, ...).
+        #[serde(default)]
+        client: Option<String>,
+    },
+    /// Commit with this message (after a [`UiEvent::CommitProposal`], or typed by the
+    /// user): what is staged, or every change when nothing is. A notice and a `Status`
+    /// follow, or an error. `/commit <message>` does the same.
+    Commit { message: String },
+    /// Go back to a checkpoint from [`UiEvent::Checkpoints`]. `mode` is `code_and_chat`,
+    /// `chat_only` or `code_only`; `dry_run` reports what it would do and changes
+    /// nothing. Answered with [`UiEvent::Rewound`] (or an error), then `TurnFinished`.
+    Rewind {
+        checkpoint: u64,
+        mode: String,
+        #[serde(default)]
+        dry_run: bool,
+    },
 }
 
 /// The user's answer to a permission request.
@@ -401,5 +624,105 @@ mod tests {
             message
         );
         assert!(serde_json::from_str::<ClientMessage>(r#"{"type":"submit"}"#).is_err());
+    }
+
+    /// Live progress, todos, sub-agents, changes and checkpoints: the tags and field
+    /// names the UIs read, and `ready` from an engine before `features`.
+    #[test]
+    fn live_progress_and_git_view_events_as_json() {
+        let ready: UiEvent =
+            serde_json::from_str(r#"{"type":"ready","protocol":1,"version":"7.0.0"}"#).unwrap();
+        assert_eq!(
+            ready,
+            UiEvent::Ready {
+                protocol: 1,
+                version: "7.0.0".into(),
+                features: Vec::new(),
+            }
+        );
+
+        let progress = serde_json::to_value(UiEvent::ToolInputProgress {
+            id: "call_1".into(),
+            name: "write_file".into(),
+            bytes: 2048,
+            lines: 40,
+            target: Some("shop/style.css".into()),
+            preview: Some("body {\n  margin: 0;".into()),
+        })
+        .unwrap();
+        assert_eq!(progress["type"], "tool_input_progress");
+        assert_eq!(progress["target"], "shop/style.css");
+        assert_eq!(
+            serde_json::to_value(UiEvent::OutputProgress { output_tokens: 12 }).unwrap(),
+            serde_json::json!({"type": "output_progress", "output_tokens": 12})
+        );
+
+        let todos = serde_json::to_value(UiEvent::Todos {
+            items: vec![TodoItem {
+                content: "Write the CSS".into(),
+                status: "in_progress".into(),
+                active_form: Some("Writing the CSS".into()),
+            }],
+        })
+        .unwrap();
+        assert_eq!(todos["items"][0]["active_form"], "Writing the CSS");
+
+        let rewound = UiEvent::Rewound {
+            checkpoint: 3,
+            mode: "code_only".into(),
+            dry_run: true,
+            restored: vec!["src/app.ts".into()],
+            removed: Vec::new(),
+            not_restored: vec![NotRestoredFile {
+                path: "dist/app.js".into(),
+                reason: "created by a shell command; left in place".into(),
+            }],
+            shell_commands: vec!["npm run build".into()],
+            removed_turns: 0,
+            prompt: None,
+        };
+        let json = serde_json::to_value(&rewound).unwrap();
+        assert_eq!(json["type"], "rewound");
+        assert_eq!(serde_json::from_value::<UiEvent>(json).unwrap(), rewound);
+
+        let checkpoint = serde_json::to_value(CheckpointInfo {
+            id: 1,
+            created_at_ms: 5,
+            prompt_preview: "fix it".into(),
+            files: Vec::new(),
+            shell_commands: Vec::new(),
+            before_rewind_to: None,
+        })
+        .unwrap();
+        assert!(checkpoint.get("before_rewind_to").is_none());
+
+        assert_eq!(
+            serde_json::from_str::<ClientMessage>(
+                r#"{"kind":"command","type":"capabilities","features":["live_progress","git_views"]}"#
+            )
+            .unwrap(),
+            ClientMessage::Command(EngineCommand::Capabilities {
+                features: vec![CAPABILITY_LIVE_PROGRESS.into(), CAPABILITY_GIT_VIEWS.into()],
+                client: None,
+            })
+        );
+        assert_eq!(
+            serde_json::from_str::<EngineCommand>(
+                r#"{"type":"rewind","checkpoint":2,"mode":"chat_only"}"#
+            )
+            .unwrap(),
+            EngineCommand::Rewind {
+                checkpoint: 2,
+                mode: "chat_only".into(),
+                dry_run: false,
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(EngineCommand::Commit {
+                message: "Add the shop page".into()
+            })
+            .unwrap()["type"],
+            "commit"
+        );
     }
 }

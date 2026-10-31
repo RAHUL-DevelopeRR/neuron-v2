@@ -399,6 +399,10 @@ impl ToolExecutor for CliToolExecutor {
         }
     }
 
+    fn tool_started(&mut self, id: &str, name: &str, input: &str) {
+        let _ = self.output.tool_started(id, name, input);
+    }
+
     fn tool_call_finished(&mut self, id: &str, name: &str, output: &str, is_error: bool) {
         // A closed UI also fails the turn's next stream write, which ends the turn.
         let _ = self.output.tool_call_finished(id, name, output, is_error);

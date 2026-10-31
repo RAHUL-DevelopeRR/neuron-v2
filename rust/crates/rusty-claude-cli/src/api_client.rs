@@ -421,6 +421,20 @@ pub(crate) fn format_cut_off_tool_call(name: &str, input: &str) -> String {
     }
 }
 
+/// A tool call the model started (`(id, name, input so far)`): its input is still being
+/// written, unless the provider sent it whole.
+fn show_tool_input_started(
+    sink: &mut dyn TurnSink,
+    (id, name, input): &(String, String, String),
+) -> io::Result<()> {
+    sink.tool_input_started(id, name)?;
+    if input.is_empty() {
+        Ok(())
+    } else {
+        sink.tool_input_delta(id, name, input)
+    }
+}
+
 /// Shows the finished tool calls whose display waited for the stop reason: a call
 /// of a response the output limit cut off is shown as one that will not run.
 fn show_tool_calls(
@@ -554,6 +568,55 @@ impl AnthropicRuntimeClient {
 
     pub fn set_timeouts(&mut self, timeouts: StreamTimeouts) {
         self.timeouts = timeouts;
+    }
+
+    /// One short request to the session's model, without tools or history: `prompt`
+    /// under `instructions`, answered with the reply's text. Gives up after `timeout`,
+    /// or when `cancel` fires. Nothing of it shows on the UI.
+    pub(crate) fn complete_text(
+        &self,
+        instructions: &str,
+        prompt: &str,
+        max_tokens: u32,
+        timeout: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<String, String> {
+        let request = MessageRequest {
+            model: self.model.clone(),
+            max_tokens,
+            messages: vec![InputMessage::user_text(prompt)],
+            system: Some(instructions.to_string()),
+            stream: true,
+            ..Default::default()
+        };
+        self.runtime.block_on(async {
+            let reply = async {
+                let mut stream = self
+                    .client
+                    .stream_message(&request)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let mut text = String::new();
+                while let Some(event) = stream
+                    .next_event()
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    if let ApiStreamEvent::ContentBlockDelta(delta) = event {
+                        if let ContentBlockDelta::TextDelta { text: piece } = delta.delta {
+                            text.push_str(&piece);
+                        }
+                    }
+                }
+                Ok(text)
+            };
+            tokio::select! {
+                reply = tokio::time::timeout(timeout, reply) => reply.unwrap_or_else(|_| {
+                    Err(format!("no answer within {} seconds", timeout.as_secs()))
+                }),
+                () = cancel.cancelled() => Err("cancelled".to_string()),
+            }
+        })
     }
 
     /// The deferred MCP tool definitions `request` carries: the ones its conversation
@@ -809,6 +872,7 @@ impl AnthropicRuntimeClient {
                         )
                         .map_err(StreamFailure::Fatal)?;
                         if let Some(tool) = pending_tool {
+                            show_tool_input_started(sink.as_mut(), &tool).map_err(render_error)?;
                             pending_tools.insert(
                                 u32::try_from(index).map_err(|error| {
                                     StreamFailure::Fatal(RuntimeError::new(error.to_string()))
@@ -835,6 +899,9 @@ impl AnthropicRuntimeClient {
                     )
                     .map_err(StreamFailure::Fatal)?;
                     if let Some(tool) = pending_tool {
+                        // Shown while the model writes its input, before the stop
+                        // reason says whether it runs.
+                        show_tool_input_started(sink.as_mut(), &tool).map_err(render_error)?;
                         pending_tools.insert(start.index, tool);
                     }
                 }
@@ -849,8 +916,10 @@ impl AnthropicRuntimeClient {
                         }
                     }
                     ContentBlockDelta::InputJsonDelta { partial_json } => {
-                        if let Some((_, _, input)) = pending_tools.get_mut(&delta.index) {
+                        if let Some((id, name, input)) = pending_tools.get_mut(&delta.index) {
                             input.push_str(&partial_json);
+                            sink.tool_input_delta(id, name, input)
+                                .map_err(render_error)?;
                         }
                     }
                     ContentBlockDelta::ThinkingDelta { thinking } => {
@@ -871,13 +940,16 @@ impl AnthropicRuntimeClient {
                         if let Some(progress_reporter) = &self.progress_reporter {
                             progress_reporter.mark_tool_phase(&name, &input);
                         }
+                        sink.tool_input_finished(&id, &name, &input)
+                            .map_err(render_error)?;
                         // Shown once the stop reason says whether it runs.
                         unshown_tools.push((id.clone(), name.clone(), input.clone()));
                         events.push(AssistantEvent::ToolUse { id, name, input });
                     }
                 }
                 ApiStreamEvent::MessageDelta(delta) => {
-                    events.push(AssistantEvent::Usage(delta.usage.token_usage()));
+                    let usage = delta.usage.token_usage();
+                    events.push(AssistantEvent::Usage(usage));
                     if let Some(reason) = delta.delta.stop_reason {
                         stop_reason = Some(reason.clone());
                         events.push(AssistantEvent::StopReason(reason));
@@ -892,6 +964,7 @@ impl AnthropicRuntimeClient {
                         runtime::is_truncation_stop_reason(stop_reason.as_deref()),
                     )
                     .map_err(render_error)?;
+                    sink.request_usage(usage).map_err(render_error)?;
                 }
                 ApiStreamEvent::MessageStop(_) => {
                     saw_stop = true;
@@ -917,6 +990,8 @@ impl AnthropicRuntimeClient {
             // incomplete and tells the model to split the work instead.
             sink.end_block().map_err(render_error)?;
             for (id, name, input) in std::mem::take(&mut pending_tools).into_values() {
+                sink.tool_input_finished(&id, &name, &input)
+                    .map_err(render_error)?;
                 sink.tool_call(&id, &name, &input, true)
                     .map_err(render_error)?;
                 events.push(AssistantEvent::ToolUse { id, name, input });
@@ -967,6 +1042,8 @@ impl AnthropicRuntimeClient {
             stream: false,
             ..message_request.clone()
         };
+        // The stream sent nothing of the reply; the wait for a whole one can be long.
+        sink.reply_not_streamed().map_err(render_error)?;
         let response = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(StreamFailure::Cancelled { partial_text: String::new() }),
@@ -1465,7 +1542,9 @@ pub(crate) fn response_to_events(
         }
     }
 
-    events.push(AssistantEvent::Usage(response.usage.token_usage()));
+    let usage = response.usage.token_usage();
+    events.push(AssistantEvent::Usage(usage));
+    sink.request_usage(usage).map_err(render_failure)?;
     if let Some(stop_reason) = response.stop_reason {
         events.push(AssistantEvent::StopReason(stop_reason));
     }
@@ -1525,7 +1604,7 @@ mod stream_resilience_tests {
     use std::net::{TcpListener, TcpStream};
     use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Condvar, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -1585,6 +1664,9 @@ mod stream_resilience_tests {
         TooLarge,
         /// A recorded SSE body, sent as it is.
         Sse(&'static str),
+        /// SSE events written one at a time, this long apart; the last one only once
+        /// the test called [`release`] on [`FakeGateway::released`].
+        Paced(fn() -> Vec<String>, Duration),
     }
 
     struct FakeGateway {
@@ -1595,6 +1677,8 @@ mod stream_resilience_tests {
         /// The body of each request.
         bodies: Arc<Mutex<Vec<String>>>,
         _held: Arc<Mutex<Vec<TcpStream>>>,
+        /// Set when a [`Step::Paced`] answer may send its last event.
+        released: Arc<(Mutex<bool>, Condvar)>,
     }
 
     impl FakeGateway {
@@ -1726,6 +1810,47 @@ mod stream_resilience_tests {
         let _ = stream.flush();
     }
 
+    /// A streamed answer, one event per HTTP chunk `pause` apart, the last one only
+    /// after `released` is set (or ten seconds, so a broken test fails instead of
+    /// hanging).
+    fn write_paced_sse(
+        stream: &mut TcpStream,
+        events: &[String],
+        pause: Duration,
+        released: &(Mutex<bool>, Condvar),
+    ) {
+        let write_chunk = |stream: &mut TcpStream, data: &str| {
+            let _ = write!(stream, "{:x}\r\n{data}\r\n", data.len());
+            let _ = stream.flush();
+        };
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
+        );
+        let Some((last, first)) = events.split_last() else {
+            return;
+        };
+        for event in first {
+            write_chunk(stream, event);
+            thread::sleep(pause);
+        }
+        let (lock, signal) = released;
+        let guard = lock.lock().expect("release");
+        let _ = signal
+            .wait_timeout_while(guard, Duration::from_secs(10), |released| !*released)
+            .expect("release");
+        write_chunk(stream, last);
+        let _ = write!(stream, "0\r\n\r\n");
+        let _ = stream.flush();
+    }
+
+    /// Lets a [`Step::Paced`] answer send its last event.
+    fn release(released: &(Mutex<bool>, Condvar)) {
+        let (lock, signal) = released;
+        *lock.lock().expect("release") = true;
+        signal.notify_all();
+    }
+
     fn spawn_gateway(behavior: Behavior) -> FakeGateway {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let base_url = format!("http://{}/v1", listener.local_addr().expect("addr"));
@@ -1737,6 +1862,8 @@ mod stream_resilience_tests {
         let accepted_at = Arc::clone(&accepted);
         let request_bodies = Arc::clone(&bodies);
         let holder = Arc::clone(&held);
+        let released = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = Arc::clone(&released);
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
@@ -1764,6 +1891,9 @@ mod stream_resilience_tests {
                         ),
                         Some(Step::TooLarge) => write_too_large(&mut stream),
                         Some(Step::Sse(body)) => write_sse_body(&mut stream, body),
+                        Some(Step::Paced(events, pause)) => {
+                            write_paced_sse(&mut stream, &events(), pause, &release);
+                        }
                         Some(Step::Hang) | None => {}
                     },
                     Behavior::StallAfterFirstChunk => {
@@ -1843,6 +1973,7 @@ mod stream_resilience_tests {
             accepted,
             bodies,
             _held: held,
+            released,
         }
     }
 
@@ -2693,6 +2824,138 @@ mod stream_resilience_tests {
             .position(|event| matches!(event, UiEvent::TextDelta { .. }))
             .expect("answer text");
         assert!(first_reasoning < first_text, "{shown:?}");
+    }
+
+    /// A `write_file` call streamed in pieces, as the gateway forwards a model writing
+    /// it. The finish reason and usage come last.
+    fn write_file_call_in_pieces() -> Vec<String> {
+        let tool_call = |call: serde_json::Value| {
+            sse_chunk(&serde_json::json!({
+                "id": "t", "model": "m",
+                "choices": [{"delta": {"tool_calls": [call]}}]
+            }))
+        };
+        let arguments = |text: &str| {
+            tool_call(serde_json::json!({"index": 0, "function": {"arguments": text}}))
+        };
+        vec![
+            tool_call(serde_json::json!({
+                "index": 0, "id": "call_css", "type": "function",
+                "function": {"name": "write_file", "arguments": ""}
+            })),
+            arguments("{\"path\":\"shop/style.css\","),
+            arguments("\"content\":\"body {\\n  margin: 0;\\n"),
+            arguments("}\\n\"}"),
+            [
+                sse_chunk(&serde_json::json!({
+                    "id": "t", "model": "m",
+                    "choices": [{"delta": {}, "finish_reason": "tool_calls"}],
+                    "usage": {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150}
+                })),
+                "data: [DONE]\n\n".to_string(),
+            ]
+            .concat(),
+        ]
+    }
+
+    /// With live progress, the UI sees a tool call and its path while the model is still
+    /// writing it: the stream's last event is held back until the UI has them.
+    #[test]
+    fn a_tool_call_reaches_the_ui_while_the_model_writes_it() {
+        use neuron_tui::protocol::{TokenCounts, UiEvent, CAPABILITY_LIVE_PROGRESS};
+        static STEPS: &[Step] = &[Step::Paced(
+            write_file_call_in_pieces,
+            Duration::from_millis(150),
+        )];
+        let gateway = spawn_gateway(Behavior::Scripted(STEPS));
+        let (sender, ui) = std::sync::mpsc::channel();
+        let capabilities = Arc::new(crate::turn_sink::UiCapabilities::default());
+        capabilities.set(&[CAPABILITY_LIVE_PROGRESS.to_string()]);
+        let patient = StreamTimeouts {
+            first_token: Duration::from_secs(10),
+            post_tool_first_token: Duration::from_secs(10),
+            idle: Duration::from_secs(10),
+        };
+        let mut client = runtime_client_showing(
+            zero_x_provider(&gateway),
+            patient,
+            crate::turn_sink::TurnOutput::channel_with_capabilities(sender, capabilities),
+        );
+        let released = Arc::clone(&gateway.released);
+        let watcher = thread::spawn(move || {
+            let mut seen = Vec::new();
+            while let Ok(event) = ui.recv_timeout(Duration::from_secs(10)) {
+                let has_path = matches!(
+                    &event,
+                    UiEvent::ToolInputProgress { target: Some(target), .. } if target == "shop/style.css"
+                );
+                seen.push(event);
+                if has_path {
+                    break;
+                }
+            }
+            release(&released);
+            (seen, ui)
+        });
+
+        let events = client.stream(request(false)).expect("stream completes");
+        drop(client);
+        let (before_the_end, ui) = watcher.join().expect("watcher");
+        let after = ui.try_iter().collect::<Vec<_>>();
+
+        let input = "{\"path\":\"shop/style.css\",\"content\":\"body {\\n  margin: 0;\\n}\\n\"}";
+        assert!(events.contains(&AssistantEvent::ToolUse {
+            id: "call_css".to_string(),
+            name: "write_file".to_string(),
+            input: input.to_string(),
+        }));
+        assert_eq!(
+            before_the_end.first(),
+            Some(&UiEvent::ToolInputStarted {
+                id: "call_css".into(),
+                name: "write_file".into(),
+            }),
+            "{before_the_end:?}"
+        );
+        assert!(
+            matches!(
+                before_the_end.last(),
+                Some(UiEvent::ToolInputProgress { id, bytes, .. }) if id == "call_css" && *bytes > 0
+            ),
+            "the path before the stream ended: {before_the_end:?}"
+        );
+        assert!(
+            !before_the_end
+                .iter()
+                .any(|event| matches!(event, UiEvent::ToolCallStarted { .. })),
+            "{before_the_end:?}"
+        );
+
+        // Then the call written, the call as it runs, and the request's tokens.
+        let position = |wanted: &dyn Fn(&UiEvent) -> bool| {
+            after
+                .iter()
+                .position(wanted)
+                .unwrap_or_else(|| panic!("missing in {after:?}"))
+        };
+        let written = position(
+            &|event| matches!(event, UiEvent::ToolInputProgress { bytes, lines: 3, .. } if *bytes == input.len() as u64),
+        );
+        let started = position(
+            &|event| matches!(event, UiEvent::ToolCallStarted { id, input: shown, cut_off: false, .. } if id == "call_css" && shown == input),
+        );
+        let usage = position(&|event| {
+            *event
+                == UiEvent::RequestUsage {
+                    usage: TokenCounts {
+                        input: 120,
+                        output: 30,
+                        cache_read: 0,
+                        cache_write: 0,
+                    },
+                }
+        });
+        assert!(written < started && started < usage, "{after:?}");
     }
 
     #[test]

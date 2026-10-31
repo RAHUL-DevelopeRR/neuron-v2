@@ -86,7 +86,10 @@ fn run(
             }
             EngineCommand::Slash { .. }
             | EngineCommand::SetModel { .. }
-            | EngineCommand::ListModels => {}
+            | EngineCommand::ListModels
+            | EngineCommand::Capabilities { .. }
+            | EngineCommand::Commit { .. }
+            | EngineCommand::Rewind { .. } => {}
         }
     }
     log

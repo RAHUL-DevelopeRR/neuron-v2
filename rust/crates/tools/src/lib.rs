@@ -1452,6 +1452,52 @@ pub fn enforce_permission_check(
     }
 }
 
+/// What a tool is about to do that may change files, as the change watcher hears it
+/// ([`set_change_watcher`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingChange<'a> {
+    /// `write_file`, `edit_file` or `NotebookEdit` is about to write this path, as the
+    /// model gave it (a relative path is taken against the working directory).
+    File(&'a str),
+    /// `bash`, `PowerShell` or `REPL` is about to run this command or code.
+    Command(&'a str),
+}
+
+type ChangeWatcher = std::sync::Arc<dyn Fn(PendingChange<'_>) + Send + Sync>;
+
+fn change_watcher_slot() -> &'static std::sync::RwLock<Option<ChangeWatcher>> {
+    static SLOT: std::sync::OnceLock<std::sync::RwLock<Option<ChangeWatcher>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// Tells `watcher` before every built-in tool call that may change files runs, once its
+/// permission check passed: the agent's own calls and its sub-agents' alike, on whichever
+/// thread runs them. The full-screen engine saves its checkpoints from here. MCP and
+/// plugin tools are not reported: what they change is unknown.
+pub fn set_change_watcher(watcher: impl Fn(PendingChange<'_>) + Send + Sync + 'static) {
+    *change_watcher_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::new(watcher));
+}
+
+/// Stops reporting changes to the watcher [`set_change_watcher`] installed.
+pub fn clear_change_watcher() {
+    *change_watcher_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+fn about_to_change(change: PendingChange<'_>) {
+    let watcher = change_watcher_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(watcher) = watcher {
+        watcher(change);
+    }
+}
+
 pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
     execute_tool_with_enforcer(None, name, input)
 }
@@ -1487,6 +1533,7 @@ fn execute_tool_with_enforcer_and_cancel(
             let bash_input: BashCommandInput = from_value(input)?;
             let classified_mode = classify_bash_permission(&bash_input.command);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
+            about_to_change(PendingChange::Command(&bash_input.command));
             run_bash(&bash_input, cancel)
         }
         "read_file" => {
@@ -1495,11 +1542,15 @@ fn execute_tool_with_enforcer_and_cancel(
         }
         "write_file" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<WriteFileInput>(input).and_then(run_write_file)
+            let write = from_value::<WriteFileInput>(input)?;
+            about_to_change(PendingChange::File(&write.path));
+            run_write_file(write)
         }
         "edit_file" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<EditFileInput>(input).and_then(run_edit_file)
+            let edit = from_value::<EditFileInput>(input)?;
+            about_to_change(PendingChange::File(&edit.path));
+            run_edit_file(edit)
         }
         "glob_search" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
@@ -1523,7 +1574,9 @@ fn execute_tool_with_enforcer_and_cancel(
         "ToolSearch" => from_value::<ToolSearchInput>(input).and_then(run_tool_search),
         "NotebookEdit" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<NotebookEditInput>(input).and_then(run_notebook_edit)
+            let edit = from_value::<NotebookEditInput>(input)?;
+            about_to_change(PendingChange::File(&edit.notebook_path));
+            run_notebook_edit(edit)
         }
         "Sleep" => from_value::<SleepInput>(input).and_then(run_sleep),
         "SendUserMessage" | "Brief" => from_value::<BriefInput>(input).and_then(run_brief),
@@ -1535,13 +1588,16 @@ fn execute_tool_with_enforcer_and_cancel(
         }
         "REPL" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<ReplInput>(input).and_then(|repl| run_repl(repl, cancel))
+            let repl = from_value::<ReplInput>(input)?;
+            about_to_change(PendingChange::Command(&repl.code));
+            run_repl(repl, cancel)
         }
         "PowerShell" => {
             // Parse input to get the command for permission classification
             let ps_input: PowerShellInput = from_value(input)?;
             let classified_mode = classify_powershell_permission(&ps_input.command);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
+            about_to_change(PendingChange::Command(&ps_input.command));
             run_powershell(ps_input, cancel)
         }
         "AskUserQuestion" => {
@@ -3435,14 +3491,12 @@ fn dedupe_hits(hits: &mut Vec<SearchHit>) {
 fn execute_todo_write(input: TodoWriteInput) -> Result<TodoWriteOutput, String> {
     validate_todos(&input.todos)?;
     let store_path = todo_store_path()?;
-    let old_todos = if store_path.exists() {
-        serde_json::from_str::<Vec<TodoItem>>(
-            &std::fs::read_to_string(&store_path).map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?
-    } else {
-        Vec::new()
-    };
+    let legacy_path = std::env::var_os("CLAWD_TODO_STORE")
+        .is_none()
+        .then(|| std::env::current_dir().ok())
+        .flatten()
+        .map(|cwd| cwd.join(LEGACY_TODO_FILE));
+    let old_todos = previous_todos(&store_path, legacy_path.as_deref())?;
 
     let all_done = input
         .todos
@@ -3506,12 +3560,46 @@ fn validate_todos(todos: &[TodoItem]) -> Result<(), String> {
     Ok(())
 }
 
-fn todo_store_path() -> Result<std::path::PathBuf, String> {
+/// Where earlier releases kept a workspace's task list: in the workspace itself, where
+/// it showed in `git status` and could be swept into a commit.
+const LEGACY_TODO_FILE: &str = ".clawd-todos.json";
+
+/// Where `TodoWrite` keeps the task list of the current workspace: `CLAWD_TODO_STORE`
+/// when set, otherwise outside the working tree (see [`todo_store_path_in`]).
+fn todo_store_path() -> Result<PathBuf, String> {
     if let Ok(path) = std::env::var("CLAWD_TODO_STORE") {
-        return Ok(std::path::PathBuf::from(path));
+        return Ok(PathBuf::from(path));
     }
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    Ok(cwd.join(".clawd-todos.json"))
+    Ok(todo_store_path_in(
+        runtime::workspace_trust::default_neuron_home().as_deref(),
+        &cwd,
+    ))
+}
+
+/// `todos/<workspace fingerprint>.json` in Neuron's home (`NEURON_HOME`, or
+/// `~/.neuroncli`), one file per workspace like the session store's folders; in the
+/// temp directory when there is no home.
+fn todo_store_path_in(neuron_home: Option<&Path>, cwd: &Path) -> PathBuf {
+    let home = neuron_home.map_or_else(|| std::env::temp_dir().join("neuron"), Path::to_path_buf);
+    home.join("todos").join(format!(
+        "{}.json",
+        runtime::session_control::workspace_fingerprint(cwd)
+    ))
+}
+
+/// The task list before this call: the store's, or else the one an earlier release
+/// left in the workspace (`legacy`, read but left in place; an unreadable one counts
+/// as none).
+fn previous_todos(store: &Path, legacy: Option<&Path>) -> Result<Vec<TodoItem>, String> {
+    if store.exists() {
+        let text = std::fs::read_to_string(store).map_err(|error| error.to_string())?;
+        return serde_json::from_str(&text).map_err(|error| error.to_string());
+    }
+    Ok(legacy
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default())
 }
 
 fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
@@ -7499,6 +7587,53 @@ mod tests {
     }
 
     #[test]
+    fn the_change_watcher_hears_what_may_change_files_once_it_is_allowed() {
+        let _guard = env_guard();
+        let root = temp_path("change-watcher");
+        fs::create_dir_all(&root).expect("root");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&heard);
+        super::set_change_watcher(move |change| {
+            sink.lock().expect("heard").push(format!("{change:?}"));
+        });
+
+        let written = execute_tool(
+            "write_file",
+            &json!({"path": "notes.txt", "content": "one\n"}),
+        );
+        let edited = execute_tool(
+            "edit_file",
+            &json!({"path": "notes.txt", "old_string": "one", "new_string": "two"}),
+        );
+        let command = execute_tool("bash", &json!({"command": "echo hi", "timeout": 10_000}));
+        let read = execute_tool("read_file", &json!({"path": "notes.txt"}));
+        // Refused before it runs: nothing to save.
+        let read_only = GlobalToolRegistry::builtin().with_enforcer(PermissionEnforcer::new(
+            permission_policy_for_mode(PermissionMode::ReadOnly),
+        ));
+        let denied =
+            read_only.execute("write_file", &json!({"path": "denied.txt", "content": "x"}));
+        super::clear_change_watcher();
+        let unheard = execute_tool("write_file", &json!({"path": "later.txt", "content": "x"}));
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+
+        assert!(written.is_ok() && edited.is_ok(), "{written:?} {edited:?}");
+        assert!(command.is_ok() && read.is_ok(), "{command:?} {read:?}");
+        assert!(denied.is_err() && unheard.is_ok(), "{denied:?} {unheard:?}");
+        assert_eq!(
+            *heard.lock().expect("heard"),
+            [
+                r#"File("notes.txt")"#,
+                r#"File("notes.txt")"#,
+                r#"Command("echo hi")"#
+            ]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn read_only_bash_allows_safe_commands_and_blocks_mutations() {
         let policy = permission_policy_for_mode(PermissionMode::ReadOnly);
         let registry = GlobalToolRegistry::builtin().with_enforcer(PermissionEnforcer::new(policy));
@@ -8628,6 +8763,80 @@ mod tests {
             3
         );
         assert!(second_output["verificationNudgeNeeded"].is_null());
+    }
+
+    /// The task list lives in Neuron's home, one file per workspace, never in the
+    /// working tree; the list an earlier release left there is still read.
+    #[test]
+    fn todo_write_keeps_its_list_outside_the_working_tree() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = temp_path("todo-home");
+        let previous_home = std::env::var_os("NEURON_HOME");
+        let previous_store = std::env::var_os("CLAWD_TODO_STORE");
+        std::env::set_var("NEURON_HOME", &home);
+        std::env::remove_var("CLAWD_TODO_STORE");
+        let cwd = std::env::current_dir().expect("cwd");
+        let legacy = cwd.join(super::LEGACY_TODO_FILE);
+        let legacy_existed = legacy.exists();
+
+        let written = execute_tool(
+            "TodoWrite",
+            &json!({"todos": [
+                {"content": "Write the CSS", "activeForm": "Writing the CSS", "status": "in_progress"}
+            ]}),
+        );
+
+        match previous_home {
+            Some(value) => std::env::set_var("NEURON_HOME", value),
+            None => std::env::remove_var("NEURON_HOME"),
+        }
+        if let Some(value) = previous_store {
+            std::env::set_var("CLAWD_TODO_STORE", value);
+        }
+        written.expect("TodoWrite should succeed");
+        let store = super::todo_store_path_in(Some(&home), &cwd);
+        assert!(store.starts_with(home.join("todos")), "{}", store.display());
+        assert!(store.exists(), "{}", store.display());
+        assert!(!store.starts_with(&cwd));
+        assert_eq!(
+            legacy.exists(),
+            legacy_existed,
+            "nothing written to the workspace"
+        );
+        let _ = fs::remove_dir_all(&home);
+
+        // One file per workspace; without a home, the temp directory.
+        let other = super::todo_store_path_in(Some(&home), &cwd.join("other"));
+        assert_ne!(store, other);
+        assert!(super::todo_store_path_in(None, &cwd).starts_with(std::env::temp_dir()));
+
+        // The list an earlier release kept in the workspace counts until the store has
+        // one; an unreadable one counts as none.
+        let workspace = temp_path("todo-legacy");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let old = workspace.join(super::LEGACY_TODO_FILE);
+        fs::write(
+            &old,
+            r#"[{"content":"Old","activeForm":"Doing old","status":"pending"}]"#,
+        )
+        .expect("legacy list");
+        let missing = workspace.join("store.json");
+        let read = super::previous_todos(&missing, Some(&old)).expect("legacy read");
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].content, "Old");
+        fs::write(&missing, "[]").expect("store");
+        assert_eq!(
+            super::previous_todos(&missing, Some(&old)).expect("store read"),
+            Vec::<super::TodoItem>::new()
+        );
+        fs::write(&old, "not json").expect("broken legacy list");
+        assert_eq!(
+            super::previous_todos(&workspace.join("none.json"), Some(&old)).expect("lenient"),
+            Vec::<super::TodoItem>::new()
+        );
+        let _ = fs::remove_dir_all(&workspace);
     }
 
     #[test]

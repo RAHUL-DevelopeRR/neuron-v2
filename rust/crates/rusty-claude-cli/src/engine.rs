@@ -23,7 +23,13 @@
 //! - `runtime::ui_hooks` notices from anywhere in the process, as notices;
 //! - an `AskUserQuestion` from the agent, as a notice starting with "Question:" whose
 //!   answer is the next submitted text (a `Submit` while the question waits never starts a
-//!   turn).
+//!   turn);
+//! - after each tool call that may have changed files, a `Status` with fresh git counts
+//!   and, for a UI that declared `git_views`, the agent's changes ([`UiEvent::Changes`]);
+//! - `/diff [path]`, `/commit [message]`, [`EngineCommand::Commit`], `/rewind [id [mode]]`,
+//!   [`EngineCommand::Rewind`] and `/changes`: their events with `git_views`, else notices,
+//!   then `TurnFinished`. Each prompt gets a checkpoint ([`SessionCheckpoints`]) that
+//!   `/rewind` goes back to.
 //!
 //! When the engine stops, the event channel closes.
 
@@ -33,11 +39,21 @@
 
 use super::*;
 use crate::device_login::{DeviceCode, DeviceLoginObserver};
+use crate::source_control::{
+    cap_diff, changed_file, clean_draft, draft_request, heuristic_message, left_out_notice,
+    nothing_to_commit, recent_prompts, render_diff_text, DiffScope, Repo, DRAFT_INSTRUCTIONS,
+};
+use crate::turn_sink::{ChangeListener, UiCapabilities};
+use crate::workspace_changes::{
+    checkpoint_info, not_restored_files, render_changes_text, render_checkpoints_text,
+    ChangeWatcher, SessionCheckpoints,
+};
 use neuron_tui::protocol::{
-    AccountInfo, Attachment, EngineCommand, GitStatus, ModelInfo, NoticeKind, PermissionReply,
-    TokenCounts, UiEvent, PROTOCOL_VERSION,
+    AccountInfo, Attachment, ChangedFile, EngineCommand, GitStatus, ModelInfo, NoticeKind,
+    PermissionReply, TokenCounts, UiEvent, ENGINE_FEATURES, PROTOCOL_VERSION,
 };
 use repl_loop::InterruptPresses;
+use runtime::checkpoints::RewindMode;
 use runtime::ui_hooks::{self, UserQuestion};
 use runtime::{CancellationToken, HookAbortSignal, TurnSummary};
 use std::panic::{self, AssertUnwindSafe};
@@ -46,6 +62,16 @@ use std::sync::{MutexGuard, PoisonError};
 
 /// How often a pending question checks whether its turn was interrupted.
 const ANSWER_CANCEL_POLL: Duration = Duration::from_millis(250);
+
+/// How long `/commit` waits for the model to draft a message before it names the files
+/// instead.
+const COMMIT_DRAFT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Output tokens a drafted commit message may take.
+const COMMIT_DRAFT_MAX_TOKENS: u32 = 1_024;
+
+/// Prompts of the session a commit draft quotes for intent.
+const COMMIT_DRAFT_PROMPTS: usize = 5;
 
 /// How the engine starts. The launcher runs the line REPL's checks first (workspace trust,
 /// provider selection), on the terminal, before the UI takes it over.
@@ -120,6 +146,7 @@ pub(crate) fn spawn(options: EngineOptions) -> Result<EngineHandle, String> {
         .spawn(move || {
             let _models = ModelListing::install(&events_tx, &engine_shared);
             let _hooks = UiHooks::install(&events_tx, &engine_shared);
+            let _watcher = ChangeWatcher::install(&engine_shared.checkpoints);
             let exit = run_engine(
                 options,
                 &events_tx,
@@ -175,7 +202,7 @@ fn run_engine(
     ready: &Sender<Result<(), String>>,
 ) -> EngineExit {
     let Some(reason) = options.signed_out.take() else {
-        let started = open_cli(&options, events).and_then(|(cli, output)| {
+        let started = open_cli(&options, events, shared).and_then(|(cli, output)| {
             let mut engine = Engine::new(cli, output, Sender::clone(events), replies, shared);
             let resumed = match &options.resume {
                 Some(reference) => match engine.continue_saved_session(reference) {
@@ -222,7 +249,7 @@ fn run_engine(
         };
         signed_out.options.model = model;
         signed_out.send(UiEvent::SessionStarting);
-        let (cli, output) = match open_cli(&signed_out.options, events) {
+        let (cli, output) = match open_cli(&signed_out.options, events, shared) {
             Ok(opened) => opened,
             Err(message) => {
                 signed_out.fail(&message);
@@ -251,12 +278,20 @@ fn run_engine(
     }
 }
 
-/// The live CLI the engine runs, showing its turns on the UI.
+/// The live CLI the engine runs, showing its turns on the UI. After each tool call that
+/// may have changed files, the UI hears what changed ([`Shared::files_may_have_changed`]).
 fn open_cli(
     options: &EngineOptions,
     events: &Sender<UiEvent>,
+    shared: &Arc<Shared>,
 ) -> Result<(LiveCli, TurnOutput), String> {
-    let output = TurnOutput::channel(Sender::clone(events));
+    let listener_shared = Arc::clone(shared);
+    let listener_events = Sender::clone(events);
+    let output = TurnOutput::engine_channel(
+        Sender::clone(events),
+        Arc::clone(&shared.capabilities),
+        ChangeListener::new(move || listener_shared.files_may_have_changed(&listener_events)),
+    );
     let mut cli = LiveCli::with_output(
         options.model.clone(),
         true,
@@ -285,6 +320,7 @@ impl SignedOut<'_> {
         self.send(UiEvent::Ready {
             protocol: PROTOCOL_VERSION,
             version: VERSION.to_string(),
+            features: engine_features(),
         });
         if let Some(reason) = plain_notice(reason) {
             self.send(UiEvent::Notice {
@@ -328,7 +364,12 @@ impl SignedOut<'_> {
                     self.options.model = resolve_model_alias_with_config(model.trim());
                     self.send_status();
                 }
-                EngineCommand::SetModel { .. } | EngineCommand::Interrupt => {}
+                EngineCommand::SetModel { .. }
+                | EngineCommand::Interrupt
+                | EngineCommand::Capabilities { .. } => {}
+                EngineCommand::Commit { .. } | EngineCommand::Rewind { .. } => {
+                    self.fail("Sign in to Zero-X first: /login.");
+                }
                 EngineCommand::ListModels => self.send(UiEvent::Models {
                     current: shown_model(&self.options.model).to_string(),
                     models: Vec::new(),
@@ -489,6 +530,22 @@ struct Shared {
     events: Mutex<Option<Sender<UiEvent>>>,
     /// The session's model as the footer last showed it.
     model: Mutex<String>,
+    /// What the UI declared it handles; the command thread sets it.
+    capabilities: Arc<UiCapabilities>,
+    /// The session's checkpoints, which tool threads save files into too.
+    checkpoints: Arc<SessionCheckpoints>,
+    /// The footer as last sent; during a turn a copy with fresh git counts goes out.
+    last_status: Mutex<Option<UiEvent>>,
+    /// The agent's changes as the UI last heard them ([`UiEvent::Changes`]).
+    sent_changes: Mutex<Option<Vec<ChangedFile>>>,
+}
+
+/// [`ENGINE_FEATURES`], for [`UiEvent::Ready`].
+fn engine_features() -> Vec<String> {
+    ENGINE_FEATURES
+        .iter()
+        .map(|feature| (*feature).to_string())
+        .collect()
 }
 
 impl Shared {
@@ -556,6 +613,20 @@ impl Shared {
                 let _ = events.send(models_event(&current));
             })
             .is_ok()
+    }
+
+    /// After a tool call that may have changed files, on the thread that ran it: the
+    /// agent's changes for a UI with `git_views`, and the footer with fresh git counts.
+    fn files_may_have_changed(&self, events: &Sender<UiEvent>) {
+        if self.capabilities.git_views() {
+            let files = self.checkpoints.changes();
+            *lock(&self.sent_changes) = Some(files.clone());
+            let _ = events.send(UiEvent::Changes { files });
+        }
+        let status = lock(&self.last_status).clone();
+        if let Some(status) = status {
+            let _ = events.send(with_current_git(status));
+        }
     }
 
     /// Stops the running turn, without the interrupt notice: the session is closing.
@@ -658,6 +729,17 @@ fn forward_commands(
     loop {
         match commands.recv().unwrap_or(EngineCommand::Shutdown) {
             EngineCommand::Interrupt => shared.interrupt(),
+            // Now, so a running turn's sinks see it; the engine also hears it, between
+            // turns, to send what the new capabilities show.
+            EngineCommand::Capabilities { features, client } => {
+                shared.capabilities.set(&features);
+                if queue
+                    .send(EngineCommand::Capabilities { features, client })
+                    .is_err()
+                {
+                    return;
+                }
+            }
             EngineCommand::Submit { text, attachments } => {
                 if let Some(answer) = shared.take_answer() {
                     let _ = answer.send(text);
@@ -852,6 +934,14 @@ fn usage_since(before: TokenUsage, after: TokenUsage) -> TokenUsage {
     }
 }
 
+/// `status` (a [`UiEvent::Status`]) with the git counts as they are now.
+fn with_current_git(mut status: UiEvent) -> UiEvent {
+    if let UiEvent::Status { git, cwd, .. } = &mut status {
+        *git = runtime::workspace_git_status(Path::new(cwd)).map(|status| git_status(&status));
+    }
+    status
+}
+
 /// The footer's view of `git status --short --branch` output.
 fn git_status(status: &str) -> GitStatus {
     let summary = parse_git_workspace_summary(Some(status));
@@ -920,7 +1010,7 @@ impl Engine {
         replies: Receiver<PermissionReply>,
         shared: &Arc<Shared>,
     ) -> Self {
-        Self {
+        let mut engine = Self {
             cli,
             output,
             events,
@@ -930,7 +1020,9 @@ impl Engine {
             account: AccountState::read(None),
             account_email: None,
             ui_closed: false,
-        }
+        };
+        engine.open_checkpoints();
+        engine
     }
 
     fn refresh_account(&mut self) {
@@ -992,8 +1084,31 @@ impl Engine {
             EngineCommand::Interrupt => {}
             EngineCommand::ListModels => self.list_models(),
             EngineCommand::Shutdown => return Step::Stop,
+            // The command thread stored them already; the engine shows what they add.
+            EngineCommand::Capabilities { .. } => self.capabilities_declared(),
+            EngineCommand::Commit { message } => {
+                let result = self.commit(&message);
+                self.finish_command(result);
+            }
+            EngineCommand::Rewind {
+                checkpoint,
+                mode,
+                dry_run,
+            } => {
+                let result = parse_rewind_mode(&mode)
+                    .and_then(|mode| self.rewind(checkpoint, mode, dry_run));
+                self.finish_command(result);
+            }
         }
         Step::Continue
+    }
+
+    /// Ends a command: its error, if it failed, then `TurnFinished` and the footer.
+    fn finish_command(&mut self, result: Result<(), String>) {
+        if let Err(message) = result {
+            self.send(UiEvent::Error { message });
+        }
+        self.finish_turn();
     }
 
     fn submit(&mut self, text: &str, attachments: &[Attachment]) {
@@ -1012,10 +1127,12 @@ impl Engine {
         let prompt = try_resolve_bare_skill_prompt(&cwd, line).unwrap_or_else(|| line.to_string());
         let prompt = self.with_attachments(prompt, attachments);
         let input = self.wrap_for_mode(&prompt);
-        match self.run_turn(&input, running, presses) {
+        match self.run_turn(line, &input, running, presses) {
             Ok((summary, usage)) => self.report_turn(&summary, usage),
             Err(message) => self.send(UiEvent::Error { message }),
         }
+        // What shell commands changed is known once the turn's checkpoint closed.
+        self.send_changes_if_new();
         self.finish_turn();
     }
 
@@ -1053,10 +1170,12 @@ impl Engine {
     }
 
     /// Runs one turn with UI permission prompts and UI interrupts (`presses`, the ones
-    /// `running` receives), and saves the session however it ends. Returns the summary
-    /// and the turn's own token usage (the summary counts the whole session).
+    /// `running` receives), in a checkpoint of its own, and saves the session however it
+    /// ends. `prompt` is what the user typed, `input` what the model gets. Returns the
+    /// summary and the turn's own token usage (the summary counts the whole session).
     fn run_turn(
         &mut self,
+        prompt: &str,
         input: &str,
         running: RunningTurn<'_>,
         presses: InterruptPresses,
@@ -1067,6 +1186,7 @@ impl Engine {
             .map_err(|error| error.to_string())?;
         let cancel = self.cli.runtime.cancellation_token().clone();
         running.watch(cancel.clone(), self.cli.runtime.hook_abort_signal().clone());
+        self.begin_checkpoint(prompt);
         // Answers to an earlier turn's requests are stale.
         while self.replies.try_recv().is_ok() {}
         let mut prompter = ChannelPermissionPrompter::new(
@@ -1078,6 +1198,7 @@ impl Engine {
         .numbered_after(self.last_permission_id);
         let before = self.cli.runtime.usage().cumulative_usage();
         let result = self.cli.runtime.run_turn(input, Some(&mut prompter));
+        self.shared.checkpoints.finish_turn();
         self.last_permission_id = prompter.last_id();
         monitor.stop();
         drop(running);
@@ -1121,20 +1242,30 @@ impl Engine {
         if matches!(name, "exit" | "quit") {
             return Step::Stop;
         }
-        let result = if name == "context" {
-            self.cli
+        let result = match name {
+            "context" => self
+                .cli
                 .context_command(args)
-                .map(|report| self.notice(&report))
-        } else {
-            let line = if args.is_empty() {
-                format!("/{name}")
-            } else {
-                format!("/{name} {args}")
-            };
-            match SlashCommand::parse(&line) {
-                Ok(Some(command)) => self.run_slash(command),
-                Ok(None) => Err(format_unknown_slash_command(name).into()),
-                Err(error) => Err(error.to_string().into()),
+                .map(|report| self.notice(&report)),
+            "diff" => self.diff(args).map_err(Into::into),
+            "commit" if args.is_empty() => self.propose_commit().map_err(Into::into),
+            "commit" => self.commit(args).map_err(Into::into),
+            "rewind" => self.rewind_command(args).map_err(Into::into),
+            "changes" => {
+                self.show_changes();
+                Ok(())
+            }
+            _ => {
+                let line = if args.is_empty() {
+                    format!("/{name}")
+                } else {
+                    format!("/{name} {args}")
+                };
+                match SlashCommand::parse(&line) {
+                    Ok(Some(command)) => self.run_slash(command),
+                    Ok(None) => Err(format_unknown_slash_command(name).into()),
+                    Err(error) => Err(error.to_string().into()),
+                }
             }
         };
         if let Err(error) = result {
@@ -1202,12 +1333,15 @@ impl Engine {
         self.send(UiEvent::Ready {
             protocol: PROTOCOL_VERSION,
             version: VERSION.to_string(),
+            features: engine_features(),
         });
         self.send_status();
     }
 
     /// Ends a prompt or a slash command: `TurnFinished`, then the footer's new `Status`.
+    /// A checkpoint a panic left open closes here.
     fn finish_turn(&mut self) {
+        self.shared.checkpoints.finish_turn();
         self.send(UiEvent::TurnFinished);
         self.send_status();
     }
@@ -1228,6 +1362,7 @@ impl Engine {
             &self.account,
             sign_in_required,
         );
+        *lock(&self.shared.last_status) = Some(status.clone());
         self.send(status);
     }
 
@@ -1369,6 +1504,7 @@ impl Engine {
         self.cli.adopt_session(handle, Some(lock));
         let session_id = self.cli.session.id.clone();
         self.rebuild_runtime(session, &session_id)?;
+        self.open_checkpoints();
         let report = self.cli.session_cleared_report(&previous);
         self.notice(&report);
         self.persist();
@@ -1395,6 +1531,7 @@ impl Engine {
             },
             lock,
         );
+        self.open_checkpoints();
         Ok(format_resume_report(
             &self.cli.session.path.display().to_string(),
             message_count,
@@ -1512,6 +1649,324 @@ impl Engine {
     }
 }
 
+/// The agent's changes, diffs, commits and checkpoints.
+impl Engine {
+    fn git_views(&self) -> bool {
+        self.shared.capabilities.git_views()
+    }
+
+    /// Opens the checkpoints of the session now running: at start and after `/clear`,
+    /// `/resume` or a continued session. A UI with `git_views` hears that session's
+    /// changes when they differ from what it showed.
+    fn open_checkpoints(&mut self) {
+        let workspace = env::current_dir().unwrap_or_default();
+        let session_id = self.cli.runtime.session().session_id.clone();
+        self.shared.checkpoints.open(&workspace, &session_id);
+        self.send_changes_if_new();
+    }
+
+    /// Opens the prompt's checkpoint. A transcript an earlier failure left inconsistent
+    /// is repaired first, as the turn would repair it, so the checkpoint records where
+    /// the prompt really starts and a chat rewind cuts exactly there.
+    fn begin_checkpoint(&mut self, prompt: &str) {
+        let session = self.cli.runtime.session_mut();
+        if runtime::transcript::normalize_messages(&mut session.messages).changed() {
+            // The turn saves the session as it goes; a failure here shows there.
+            let _ = session.persist_snapshot();
+        }
+        self.shared
+            .checkpoints
+            .begin_turn(self.cli.runtime.session(), prompt);
+    }
+
+    /// A UI that now handles `git_views` hears the agent's changes so far, if any.
+    fn capabilities_declared(&mut self) {
+        if !self.git_views() {
+            return;
+        }
+        let files = self.shared.checkpoints.changes();
+        if !files.is_empty() {
+            self.send_changes_list(files);
+        }
+    }
+
+    /// The agent's changes, for a UI with `git_views`.
+    fn send_changes(&mut self) {
+        if self.git_views() {
+            let files = self.shared.checkpoints.changes();
+            self.send_changes_list(files);
+        }
+    }
+
+    /// The agent's changes, for a UI with `git_views` that has not heard this list yet (a
+    /// UI that heard nothing knows of no changes).
+    fn send_changes_if_new(&mut self) {
+        if !self.git_views() {
+            return;
+        }
+        let files = self.shared.checkpoints.changes();
+        let heard = lock(&self.shared.sent_changes)
+            .as_deref()
+            .unwrap_or_default()
+            == files.as_slice();
+        if !heard {
+            self.send_changes_list(files);
+        }
+    }
+
+    fn send_changes_list(&mut self, files: Vec<ChangedFile>) {
+        *lock(&self.shared.sent_changes) = Some(files.clone());
+        self.send(UiEvent::Changes { files });
+    }
+
+    /// `/changes`: what the agent changed in this session.
+    fn show_changes(&mut self) {
+        let files = self.shared.checkpoints.changes();
+        if self.git_views() {
+            self.send_changes_list(files);
+        } else {
+            self.notice(&render_changes_text(&files));
+        }
+    }
+
+    /// `/diff [path]`: in a repository, the working tree against `HEAD` (staged,
+    /// unstaged and untracked changes); elsewhere, the agent's changes this session.
+    fn diff(&mut self, path: &str) -> Result<(), String> {
+        let cwd = env::current_dir().map_err(|error| error.to_string())?;
+        let path = (!path.is_empty()).then_some(path);
+        let (title, diff) = match Repo::discover(&cwd)? {
+            Some(repo) => {
+                let spec = path.map(|path| repo.pathspec(&cwd, path)).transpose()?;
+                let diff = repo.diff(DiffScope::WorkingTree, spec.as_deref())?;
+                (repo.diff_title(path), diff)
+            }
+            None => {
+                let title = match path {
+                    Some(path) => format!("The agent's changes to {path} in this session"),
+                    None => "The agent's changes in this session".to_string(),
+                };
+                (title, self.shared.checkpoints.diff(path))
+            }
+        };
+        let diff = cap_diff(diff);
+        if self.git_views() {
+            self.send(UiEvent::Diff {
+                title,
+                files: diff.files,
+                truncated: diff.truncated,
+            });
+        } else {
+            self.notice(&render_diff_text(&title, &diff));
+        }
+        Ok(())
+    }
+
+    /// `/commit` without a message: a drafted message and what the commit would take.
+    /// Nothing is committed.
+    fn propose_commit(&mut self) -> Result<(), String> {
+        let repo = self.repository()?;
+        let plan = repo.plan_commit()?;
+        if plan.is_empty() {
+            self.notice(&nothing_to_commit(&plan.left_out));
+            return Ok(());
+        }
+        let scope = if plan.stage_all {
+            DiffScope::WorkingTree
+        } else {
+            DiffScope::Staged
+        };
+        let mut diff = repo.diff(scope, None)?;
+        diff.files
+            .retain(|file| !plan.left_out.contains(&file.path));
+        let message = self.draft_commit_message(&diff.files);
+        let files = diff.files.iter().map(changed_file).collect::<Vec<_>>();
+        if !plan.left_out.is_empty() {
+            self.notice(&left_out_notice(&plan.left_out));
+        }
+        let branch = repo.branch();
+        if self.git_views() {
+            self.send(UiEvent::CommitProposal {
+                message,
+                branch,
+                files,
+                stage_all: plan.stage_all,
+            });
+        } else {
+            let what = if plan.stage_all {
+                "every change"
+            } else {
+                "what is staged"
+            };
+            let place = branch.map_or_else(String::new, |branch| format!(" on {branch}"));
+            let count = files.len();
+            self.notice(&format!(
+                "A commit{place} would take {what} ({count} file{}). Suggested message:\n\n{message}\n\nCommit with /commit <message>.",
+                if count == 1 { "" } else { "s" }
+            ));
+        }
+        Ok(())
+    }
+
+    /// A commit message for `files`: drafted by the session's model in one short request
+    /// without tools, else made from the file names. An interrupt stops the draft.
+    fn draft_commit_message(&mut self, files: &[neuron_tui::protocol::DiffFile]) -> String {
+        let changed = files.iter().map(changed_file).collect::<Vec<_>>();
+        let fallback = heuristic_message(&changed);
+        let prompts = recent_prompts(self.cli.runtime.session(), COMMIT_DRAFT_PROMPTS);
+        let request = draft_request(files, &prompts);
+        let cancel = CancellationToken::new();
+        let shared = Arc::clone(&self.shared);
+        let running = RunningTurn::start(&shared);
+        running.watch(cancel.clone(), HookAbortSignal::new());
+        let reply = self.cli.runtime.api_client().complete_text(
+            DRAFT_INSTRUCTIONS,
+            &request,
+            COMMIT_DRAFT_MAX_TOKENS,
+            COMMIT_DRAFT_TIMEOUT,
+            &cancel,
+        );
+        drop(running);
+        match reply.map(|reply| clean_draft(&reply)) {
+            Ok(Some(message)) => message,
+            Ok(None) => {
+                self.notice("The model drafted no message; this one names the files.");
+                fallback
+            }
+            Err(error) => {
+                self.notice(&format!(
+                    "Could not draft a message with the model ({error}); this one names the files."
+                ));
+                fallback
+            }
+        }
+    }
+
+    /// `/commit <message>` and [`EngineCommand::Commit`]: commits what is staged, or
+    /// every change but files that can hold credentials, which are left out and named.
+    fn commit(&mut self, message: &str) -> Result<(), String> {
+        let message = message.trim();
+        if message.is_empty() {
+            return Err("The commit message is empty.".to_string());
+        }
+        let repo = self.repository()?;
+        let plan = repo.plan_commit()?;
+        if plan.is_empty() {
+            self.notice(&nothing_to_commit(&plan.left_out));
+            return Ok(());
+        }
+        let committed = repo.commit(&plan, message)?;
+        self.notice(&committed.notice(&plan.left_out));
+        self.send_status();
+        self.send_changes();
+        Ok(())
+    }
+
+    fn repository(&self) -> Result<Repo, String> {
+        let cwd = env::current_dir().map_err(|error| error.to_string())?;
+        Repo::discover(&cwd)?.ok_or_else(|| {
+            format!(
+                "{} is not in a git repository, so there is nothing to commit to.",
+                cwd.display()
+            )
+        })
+    }
+
+    /// `/rewind`: the checkpoints; `/rewind <id> [code|chat|both]`: goes back to one.
+    fn rewind_command(&mut self, args: &str) -> Result<(), String> {
+        let mut words = args.split_whitespace();
+        let Some(id) = words.next() else {
+            self.list_checkpoints();
+            return Ok(());
+        };
+        let id = id
+            .trim_start_matches('#')
+            .parse::<u64>()
+            .map_err(|_| format!("`{id}` is not a checkpoint number. {REWIND_USAGE}"))?;
+        let mode = words
+            .next()
+            .map_or(Ok(RewindMode::CodeAndChat), parse_rewind_mode)?;
+        if words.next().is_some() {
+            return Err(REWIND_USAGE.to_string());
+        }
+        self.rewind(id, mode, false)
+    }
+
+    /// The session's checkpoints, newest first.
+    fn list_checkpoints(&mut self) {
+        let checkpoints = self.shared.checkpoints.list();
+        if self.git_views() {
+            self.send(UiEvent::Checkpoints {
+                items: checkpoints.iter().map(checkpoint_info).collect(),
+            });
+        } else {
+            self.notice(&render_checkpoints_text(&checkpoints));
+        }
+    }
+
+    /// Goes back to checkpoint `id` (or, `dry_run`, says what that would do): the files,
+    /// the conversation (cut back to that prompt and saved), or both. The UI hears what
+    /// was put back, then the changes and the footer.
+    fn rewind(&mut self, id: u64, mode: RewindMode, dry_run: bool) -> Result<(), String> {
+        // The prompts a chat rewind takes out: the checkpoint's and every later one.
+        let removed_turns = match self.shared.checkpoints.get(id) {
+            Some(checkpoint) if mode.restores_chat() => self
+                .cli
+                .runtime
+                .session()
+                .messages
+                .get(checkpoint.message_index..)
+                .map_or(0, |removed| {
+                    removed.iter().filter(|message| is_prompt(message)).count()
+                }),
+            _ => 0,
+        };
+        let report = if dry_run {
+            self.shared
+                .checkpoints
+                .preview_rewind(id, mode, self.cli.runtime.session())?
+        } else {
+            let report =
+                self.shared
+                    .checkpoints
+                    .rewind(id, mode, self.cli.runtime.session_mut())?;
+            self.persist();
+            report
+        };
+        if self.git_views() {
+            self.send(UiEvent::Rewound {
+                checkpoint: report.checkpoint_id,
+                mode: report.mode.as_str().to_string(),
+                dry_run: report.dry_run,
+                restored: report.restored.clone(),
+                removed: report.removed.clone(),
+                not_restored: not_restored_files(&report),
+                shell_commands: report.shell_commands.clone(),
+                removed_turns,
+                prompt: report
+                    .conversation
+                    .as_ref()
+                    .and_then(|conversation| conversation.prompt.clone()),
+            });
+        } else {
+            self.notice(&report.to_string());
+        }
+        if !dry_run {
+            self.send_changes();
+            self.send_status();
+        }
+        Ok(())
+    }
+}
+
+const REWIND_USAGE: &str = "Usage: /rewind [<id> [code|chat|both]]";
+
+/// A rewind mode as the protocol or `/rewind` names it.
+fn parse_rewind_mode(mode: &str) -> Result<RewindMode, String> {
+    RewindMode::parse(mode).ok_or_else(|| {
+        format!("Unknown rewind mode `{mode}`: use code_and_chat (both), chat_only (chat) or code_only (code).")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1522,7 +1977,8 @@ mod tests {
     use crate::tests::{env_lock, with_current_dir};
     use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
     use neuron_tui::protocol::{
-        EngineCommand, PermissionDecision, PermissionReply, TokenCounts, UiEvent, PROTOCOL_VERSION,
+        ChangedFile, EngineCommand, PermissionDecision, PermissionReply, TokenCounts, UiEvent,
+        PROTOCOL_VERSION,
     };
     use runtime::ui_hooks::{self, UserQuestion};
     use runtime::PermissionMode;
@@ -1787,6 +2243,7 @@ mod tests {
             UiEvent::Ready {
                 protocol: PROTOCOL_VERSION,
                 version: env!("CARGO_PKG_VERSION").to_string(),
+                features: super::engine_features(),
             }
         );
         let untracked_at_start = match next_event(&engine.events) {
@@ -2185,6 +2642,206 @@ mod tests {
             "the hooks go back to the terminal"
         );
         drop(vars);
+        let _ = fs::remove_dir_all(&workspace);
+        let _ = fs::remove_dir_all(&config_home);
+    }
+
+    /// With `git_views`: what the agent writes shows in its changes during the turn, with
+    /// the footer's git counts; `/rewind` lists the prompt's checkpoint; a dry run says
+    /// what going back would do; going back puts the file back and takes the prompt out
+    /// of the conversation. Without `git_views`, notices.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn engine_keeps_a_checkpoint_per_prompt_and_goes_back_to_it() {
+        let _env = env_lock();
+        let tokio = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let server = tokio
+            .block_on(MockAnthropicService::spawn())
+            .expect("the mock service starts");
+        let workspace = unique_dir("checkpoints");
+        let config_home = unique_dir("checkpoints-config");
+        fs::create_dir_all(workspace.join("generated")).expect("workspace");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{"defaultMcpServers":false}"#,
+        )
+        .expect("settings");
+        let written = workspace.join("generated").join("output.txt");
+        fs::write(&written, "written by hand\n").expect("the file the agent replaces");
+        let base_url = server.base_url();
+        let vars = EnvVars::set(&[
+            ("ANTHROPIC_API_KEY", Some(OsStr::new("test-engine-key"))),
+            ("ANTHROPIC_AUTH_TOKEN", None),
+            ("ANTHROPIC_BASE_URL", Some(OsStr::new(&base_url))),
+            ("NEURON_CONFIG_HOME", Some(config_home.as_os_str())),
+            ("NEURON_HOME", Some(config_home.as_os_str())),
+            ("NEURON_CREDENTIAL_STORE", Some(OsStr::new("file"))),
+            ("NEURON_TOKEN", None),
+        ]);
+
+        with_current_dir(&workspace, || {
+            let engine = spawn(EngineOptions {
+                model: "claude-sonnet-4-6".to_string(),
+                allowed_tools: Some(["write_file".to_string()].into_iter().collect()),
+                permission_mode: PermissionMode::WorkspaceWrite,
+                reasoning_effort: None,
+                resume: None,
+                signed_out: None,
+            })
+            .expect("the engine starts");
+            assert!(matches!(next_event(&engine.events), UiEvent::Ready { .. }));
+            events_until(&engine.events, |event| {
+                matches!(event, UiEvent::Status { .. })
+            });
+            let declare = |features: &[&str]| {
+                engine
+                    .commands
+                    .send(EngineCommand::Capabilities {
+                        features: features.iter().map(ToString::to_string).collect(),
+                        client: None,
+                    })
+                    .unwrap();
+            };
+            let slash = |command: &str| {
+                engine
+                    .commands
+                    .send(EngineCommand::Slash {
+                        command: command.into(),
+                        args: String::new(),
+                    })
+                    .unwrap();
+                turn_events(&engine.events)
+            };
+            declare(&["git_views"]);
+
+            // The write shows in the changes after its result, with the footer.
+            let prompt = format!("{SCENARIO_PREFIX}write_file_allowed");
+            engine
+                .commands
+                .send(scenario("write_file_allowed"))
+                .unwrap();
+            let turn = turn_events(&engine.events);
+            let rewritten = ChangedFile {
+                path: "generated/output.txt".into(),
+                status: "modified".into(),
+                added: 1,
+                removed: 1,
+            };
+            let position = |wanted: &dyn Fn(&UiEvent) -> bool| {
+                turn.iter()
+                    .position(wanted)
+                    .unwrap_or_else(|| panic!("an event is missing: {turn:?}"))
+            };
+            let result = position(&|event| matches!(event, UiEvent::ToolResult { .. }));
+            let changes = position(&|event| {
+                *event
+                    == UiEvent::Changes {
+                        files: vec![rewritten.clone()],
+                    }
+            });
+            let finished = position(&|event| *event == UiEvent::TurnFinished);
+            assert!(result < changes && changes < finished, "{turn:?}");
+            assert!(
+                turn[changes..finished]
+                    .iter()
+                    .any(|event| matches!(event, UiEvent::Status { .. })),
+                "the footer during the turn: {turn:?}"
+            );
+            assert_eq!(
+                fs::read_to_string(&written).expect("written"),
+                "created by mock service\n"
+            );
+
+            // The prompt's checkpoint.
+            let listed = without_notices(&slash("rewind"));
+            let [UiEvent::Checkpoints { items }, UiEvent::TurnFinished] = listed.as_slice() else {
+                panic!("the checkpoints: {listed:?}");
+            };
+            assert_eq!(items.len(), 1, "{items:?}");
+            assert_eq!(items[0].prompt_preview, prompt);
+            assert_eq!(items[0].files, ["generated/output.txt"]);
+            let checkpoint = items[0].id;
+            let rewound = |mode: &str, dry_run: bool, removed_turns, prompt| UiEvent::Rewound {
+                checkpoint,
+                mode: mode.into(),
+                dry_run,
+                restored: vec!["generated/output.txt".into()],
+                removed: Vec::new(),
+                not_restored: Vec::new(),
+                shell_commands: Vec::new(),
+                removed_turns,
+                prompt,
+            };
+
+            // A dry run changes nothing.
+            engine
+                .commands
+                .send(EngineCommand::Rewind {
+                    checkpoint,
+                    mode: "code_only".into(),
+                    dry_run: true,
+                })
+                .unwrap();
+            assert_eq!(
+                without_notices(&turn_events(&engine.events)),
+                [rewound("code_only", true, 0, None), UiEvent::TurnFinished]
+            );
+            assert_eq!(
+                fs::read_to_string(&written).expect("still written"),
+                "created by mock service\n"
+            );
+
+            // Code and chat: the file as it was, and the prompt out of the conversation.
+            engine
+                .commands
+                .send(EngineCommand::Rewind {
+                    checkpoint,
+                    mode: "code_and_chat".into(),
+                    dry_run: false,
+                })
+                .unwrap();
+            assert_eq!(
+                without_notices(&turn_events(&engine.events)),
+                [
+                    rewound("code_and_chat", false, 1, Some(prompt.clone())),
+                    UiEvent::Changes { files: Vec::new() },
+                    UiEvent::TurnFinished,
+                ]
+            );
+            assert_eq!(
+                fs::read_to_string(&written).expect("put back"),
+                "written by hand\n"
+            );
+            let listed = without_notices(&slash("rewind"));
+            assert_eq!(
+                listed,
+                [
+                    UiEvent::Checkpoints { items: Vec::new() },
+                    UiEvent::TurnFinished
+                ]
+            );
+
+            // A UI without git views hears notices.
+            declare(&[]);
+            let listed_changes = slash("changes");
+            assert_eq!(without_notices(&listed_changes), [UiEvent::TurnFinished]);
+            assert_eq!(
+                notices(&listed_changes),
+                ["The agent has not changed any files in this session."]
+            );
+            let checkpoints = slash("rewind");
+            assert!(
+                notices(&checkpoints)
+                    .iter()
+                    .any(|notice| notice.starts_with("No checkpoints yet")),
+                "{checkpoints:?}"
+            );
+            assert_eq!(engine.finish(), EngineExit::Shutdown);
+        });
+
+        drop(vars);
+        drop(server);
         let _ = fs::remove_dir_all(&workspace);
         let _ = fs::remove_dir_all(&config_home);
     }
