@@ -112,6 +112,63 @@ describe('dropRewoundTurns', () => {
   })
 })
 
+describe('which user messages a rewind counts', () => {
+  const sent = (content: string, sentToEngine: boolean): ChatMessage => ({
+    ...message('user', content),
+    metadata: { sentToEngine },
+  })
+
+  test('only prompts the engine took, once messages are marked', () => {
+    const kept = dropRewoundTurns(
+      [
+        sent('first prompt', true),
+        message('ai', 'first answer'),
+        // Dropped while signed out, failed validation, or a failed image path.
+        sent('signed out', false),
+        message('ai', 'Sign in to Zero-X first: /login.'),
+        sent('second prompt', true),
+        message('ai', 'second answer'),
+        sent('not an image', false),
+        sent('third prompt', true),
+        message('ai', 'third answer'),
+      ],
+      2,
+    )
+    expect(kept.map((m) => m.content)).toEqual([
+      'first prompt',
+      'first answer',
+      'signed out',
+      'Sign in to Zero-X first: /login.',
+    ])
+  })
+
+  test('an answer is never a prompt, marked or not', () => {
+    const answer: ChatMessage = {
+      ...message('user', 'use main'),
+      metadata: { answersQuestion: true, sentToEngine: false },
+    }
+    expect(
+      dropRewoundTurns([sent('a', true), message('ai', 'Question?'), answer, sent('b', true)], 1).map(
+        (m) => m.content,
+      ),
+    ).toEqual(['a', 'Question?', 'use main'])
+  })
+
+  test('a chat saved before the marks: the earlier prompts count as before', () => {
+    const kept = dropRewoundTurns(
+      [
+        message('user', 'old prompt'),
+        message('ai', 'old answer'),
+        message('user', '/status'),
+        sent('new prompt', true),
+        message('ai', 'new answer'),
+      ],
+      2,
+    )
+    expect(kept).toEqual([])
+  })
+})
+
 describe('the rewind flow', () => {
   test('goes pick, mode, preview, running', () => {
     const store = useGitViewsStore.getState()

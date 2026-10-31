@@ -230,6 +230,13 @@ export type ChatMessageMetadata = {
    * turn, so it has no checkpoint of its own.
    */
   answersQuestion?: boolean
+  /**
+   * A prompt the engine took: the UI sent it while the engine was signed in,
+   * so the engine made a checkpoint for it. `false` on user messages that
+   * never reached it (dropped, refused, stopped first) and on answers; absent
+   * from chats saved before prompts were marked.
+   */
+  sentToEngine?: boolean
 }
 
 export type ChatMessage = {

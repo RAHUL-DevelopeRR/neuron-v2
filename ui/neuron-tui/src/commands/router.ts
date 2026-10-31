@@ -3,7 +3,8 @@
 // prompt is a shell command only when shell commands are implemented
 // (USER_SHELL_AVAILABLE); until then it goes to the agent like any prompt.
 // An answer to the agent's question drawn as a chat line is marked as one,
-// so a rewind does not count it as a prompt. See ui/neuron-tui/PORTING.md.
+// and it and the echo of a failed image path as not sent to the engine, so a
+// rewind does not count them as prompts. See ui/neuron-tui/PORTING.md.
 import {
   dispatchSkillPrompt,
   findCommand,
@@ -356,7 +357,8 @@ export async function routeUserPrompt(
     if (!result.success) {
       setMessages((prev) => [
         ...prev,
-        getUserMessage(trimmed),
+        // Never sent: no prompt for a rewind to count.
+        { ...getUserMessage(trimmed), metadata: { sentToEngine: false } },
         getSystemMessage(`${GLYPHS.error} ${result.error}`),
       ])
     }
@@ -433,7 +435,7 @@ export async function routeUserPrompt(
         (pendingQuestionTarget &&
           withQuestionAnswer(prev, pendingQuestionTarget, trimmed)) || [
           ...prev,
-          { ...getUserMessage(trimmed), metadata: { answersQuestion: true } },
+          { ...getUserMessage(trimmed), metadata: { answersQuestion: true, sentToEngine: false } },
         ],
     )
     try {

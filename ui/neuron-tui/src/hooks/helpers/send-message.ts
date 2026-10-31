@@ -1,6 +1,7 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: an
-// interrupt also marks the tool calls still running as interrupted.
-// See ui/neuron-tui/PORTING.md.
+// interrupt also marks the tool calls still running as interrupted, and a
+// prompt's bubble starts as not sent to the engine (use-send-message marks it
+// once the engine takes it). See ui/neuron-tui/PORTING.md.
 import { getErrorObject } from '@neuron-tui/common/util/error'
 
 import { getProjectRoot } from '../../project-files'
@@ -224,6 +225,8 @@ export const prepareUserMessage = async (params: {
   if (imageAttachments.length > 0) {
     userMessage.attachments = imageAttachments
   }
+  // Not a prompt the engine has, until it takes it (see ChatMessageMetadata).
+  userMessage.metadata = { ...userMessage.metadata, sentToEngine: false }
 
   setMessages((prev) => {
     let next = [...prev]

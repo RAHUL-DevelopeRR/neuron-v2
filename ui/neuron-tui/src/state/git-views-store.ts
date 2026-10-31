@@ -224,18 +224,19 @@ export function rewindModeLabel(mode: RewindMode | string): string {
 }
 
 /**
- * A prompt sent to the engine: a user message that is not a slash command or
- * an answer to the agent's question. The engine makes a checkpoint for each
- * one (see use-exit-handler's isPrompt).
+ * A prompt the engine took, so it has a checkpoint: a user message marked
+ * `sentToEngine` (an answer to the agent's question never is). A chat saved
+ * before the marks has none on its messages: there a user message counts
+ * when it is not a slash command or an answer (see use-exit-handler's
+ * isPrompt).
  */
 export function isPromptMessage(
   message: Pick<ChatMessage, 'variant' | 'content' | 'metadata'>,
 ): boolean {
-  return (
-    message.variant === 'user' &&
-    !message.metadata?.answersQuestion &&
-    !message.content.trim().startsWith('/')
-  )
+  if (message.variant !== 'user' || message.metadata?.answersQuestion) return false
+  const sent = message.metadata?.sentToEngine
+  if (sent !== undefined) return sent
+  return !message.content.trim().startsWith('/')
 }
 
 /**
