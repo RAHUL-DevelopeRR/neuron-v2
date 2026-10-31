@@ -75,6 +75,9 @@ impl StdioEngine {
             .env("USERPROFILE", home)
             .env("NO_COLOR", "1")
             .env("PATH", "/usr/bin:/bin")
+            // The scenarios script each model request; Neuron's completion check adds a
+            // round after edits and is covered by the runtime's tests.
+            .env("NEURON_COMPLETION_CHECK", "0")
             .envs(env.iter().copied())
             .args(["engine", "--stdio"])
             .args(args)
@@ -177,7 +180,10 @@ impl StdioEngine {
         loop {
             match self.events.recv_timeout(EVENT_TIMEOUT) {
                 Ok(event) => assert!(
-                    matches!(event["type"].as_str(), Some("status" | "notice")),
+                    matches!(
+                        event["type"].as_str(),
+                        Some("status" | "notice" | "account")
+                    ),
                     "nothing else after the input ended: {event}"
                 ),
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -187,11 +193,17 @@ impl StdioEngine {
     }
 }
 
-/// The events without notices and footer updates.
+/// The events without notices, footer updates and account updates (an account read in
+/// the background may arrive at any point).
 fn main_events(events: &[Value]) -> Vec<Value> {
     events
         .iter()
-        .filter(|event| !matches!(event["type"].as_str(), Some("notice" | "status")))
+        .filter(|event| {
+            !matches!(
+                event["type"].as_str(),
+                Some("notice" | "status" | "account")
+            )
+        })
         .cloned()
         .collect()
 }
@@ -264,6 +276,11 @@ fn stdio_engine_runs_turns_over_json_lines() {
         "an Anthropic key needs none"
     );
     assert_eq!(status["account"], Value::Null);
+    // No Zero-X login: the account says so, and nothing is read.
+    assert_eq!(
+        engine.next(),
+        json!({"type": "account", "signed_in": false, "account": null})
+    );
 
     // A line that is not a message is skipped with a notice; the engine keeps going.
     engine.send_line("{\"kind\":\"nonsense\"}");

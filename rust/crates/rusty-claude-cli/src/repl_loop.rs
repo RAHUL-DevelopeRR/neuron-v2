@@ -375,8 +375,9 @@ pub(crate) fn launch(options: ReplLaunch) -> Result<(), Box<dyn std::error::Erro
     run_stale_base_preflight(options.base_commit.as_deref());
 
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    if !crate::auth::check_trust(&cwd) {
-        std::process::exit(1);
+    // Before anything from the folder starts (its hooks, MCP servers and settings).
+    if let Some(code) = crate::auth::check_trust(&cwd).exit_code() {
+        std::process::exit(code);
     }
 
     // From here on MCP servers may be running: stop them on every exit path.
@@ -913,6 +914,8 @@ mod tests {
             outcome,
             stop_reason: None,
             pruned_tool_results: pruned,
+            served_model: None,
+            completion_checked: false,
         }
     }
 

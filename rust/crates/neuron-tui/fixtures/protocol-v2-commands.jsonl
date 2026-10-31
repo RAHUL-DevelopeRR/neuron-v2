@@ -1,0 +1,6 @@
+{"kind":"command","type":"list_sessions","scope":"all"}
+{"kind":"command","type":"list_sessions","scope":"project"}
+{"kind":"command","type":"trust_preview"}
+{"kind":"command","type":"refresh_account"}
+{"kind":"command","type":"capabilities","features":["questions","reports"],"client":"terminal"}
+{"kind":"command","type":"slash","command":"usage","args":""}

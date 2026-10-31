@@ -1,0 +1,104 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`the screens before the chat render plainly the trust screen at 80x24 1`] = `
+"  Before Neuron works here
+  C:\\RAHUL\\PROJECTS _OF_Rahul\\zero-x.live   (git root: this folder)
+  Neuron will be able to open, change and run files in this folder.
+  This project also wants to turn on:
+    • 2 hooks that run commands around tool calls
+    • 1 MCP server: postgres-tools
+    • 3 permission rules from .neuron/settings.json
+  Continue only if you created this project or trust where it came from.
+  Why this matters: zero-x.live/docs/trust
+  › 1  Allow Neuron in this folder
+    2  Quit
+  ↑↓ or 1–2 to choose · Enter to confirm · Esc to quit"
+`;
+
+exports[`the screens before the chat render plainly onboarding's sign-in at 80x24 1`] = `
+"  Welcome to Neuron
+  Sign in with your Zero-X account to use Neuron's models. Your browser opens
+  the sign-in page; Neuron keeps the login on this computer.
+  › Sign in with Zero-X
+  Enter to sign in · Esc for later (/login signs in from the chat) · Ctrl+C
+  to quit"
+`;
+
+exports[`the screens before the chat render plainly a /usage report at 80x24 1`] = `
+" Usage today
+                                                                              █
+ Pro plan                                                                     █
+ - Requests: 37 of 1,000                                                      █
+ - Tokens: 412,300 of 5,000,000                                               █
+ - Resets at 05:30 (UTC)                                                      █
+                                                                              █
+ Credit
+ $4.20 left
+ Dashboard: https://zero-x.live/dashboard
+ Plans: https://zero-x.live/pricing
+ esc close · pgup/pgdn scroll"
+`;
+
+exports[`the screens before the chat render plainly the trust screen at 200x50 1`] = `
+"  Before Neuron works here
+  C:\\RAHUL\\PROJECTS _OF_Rahul\\zero-x.live   (git root: this folder)
+  Neuron will be able to open, change and run files in this folder.
+  This project also wants to turn on:
+    • 2 hooks that run commands around tool calls
+    • 1 MCP server: postgres-tools
+    • 3 permission rules from .neuron/settings.json
+  Continue only if you created this project or trust where it came from.
+  Why this matters: zero-x.live/docs/trust
+  › 1  Allow Neuron in this folder
+    2  Quit
+  ↑↓ or 1–2 to choose · Enter to confirm · Esc to quit"
+`;
+
+exports[`the screens before the chat render plainly onboarding's sign-in at 200x50 1`] = `
+"  Welcome to Neuron
+  Sign in with your Zero-X account to use Neuron's models. Your browser opens the sign-in page; Neuron keeps the login on this computer.
+  › Sign in with Zero-X
+  Enter to sign in · Esc for later (/login signs in from the chat) · Ctrl+C to quit"
+`;
+
+exports[`the screens before the chat render plainly a /usage report at 200x50 1`] = `
+" Usage today
+                                                                                                                                                                                                      █
+ Pro plan                                                                                                                                                                                             █
+ - Requests: 37 of 1,000                                                                                                                                                                              █
+ - Tokens: 412,300 of 5,000,000                                                                                                                                                                       █
+ - Resets at 05:30 (UTC)                                                                                                                                                                              █
+                                                                                                                                                                                                      █
+ Credit                                                                                                                                                                                               █
+ $4.20 left                                                                                                                                                                                           █
+                                                                                                                                                                                                      █
+ Dashboard: https://zero-x.live/dashboard                                                                                                                                                             █
+ Plans: https://zero-x.live/pricing                                                                                                                                                                   █
+                                                                                                                                                                                                      █
+                                                                                                                                                                                                      ▀
+ esc close · pgup/pgdn scroll"
+`;
+
+exports[`the screens before the chat render plainly in a classic console (ASCII mode) at 80x24 1`] = `
+"  Before Neuron works here
+  C:\\RAHUL\\PROJECTS _OF_Rahul\\zero-x.live   (git root: this folder)
+  Neuron will be able to open, change and run files in this folder.
+  This project also wants to turn on:
+    • 2 hooks that run commands around tool calls
+    • 1 MCP server: postgres-tools
+    • 3 permission rules from .neuron/settings.json
+  Continue only if you created this project or trust where it came from.
+  Why this matters: zero-x.live/docs/trust
+  > 1  Allow Neuron in this folder
+    2  Quit
+  Up/Down or 1–2 to choose · Enter to confirm · Esc to quit"
+`;
+
+exports[`the screens before the chat render plainly in a classic console (ASCII mode) at 80x24 2`] = `
+"  Welcome to Neuron
+  Sign in with your Zero-X account to use Neuron's models. Your browser opens
+  the sign-in page; Neuron keeps the login on this computer.
+  > Sign in with Zero-X
+  Enter to sign in · Esc for later (/login signs in from the chat) · Ctrl+C
+  to quit"
+`;

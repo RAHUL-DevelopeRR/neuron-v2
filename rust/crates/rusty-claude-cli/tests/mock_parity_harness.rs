@@ -340,6 +340,9 @@ fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) ->
         .env("USERPROFILE", &workspace.home)
         .env("NO_COLOR", "1")
         .env("PATH", "/usr/bin:/bin")
+        // The scenarios replay the reference agent loop; Neuron's completion check
+        // adds a round after edits and is covered by the runtime's tests.
+        .env("NEURON_COMPLETION_CHECK", "0")
         .args([
             "--model",
             "sonnet",

@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
-use std::fmt::{Display, Formatter};
+use std::fmt::{Display, Formatter, Write as _};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Instant;
 
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
@@ -13,10 +16,13 @@ use crate::config::RuntimeFeatureConfig;
 use crate::context_manager::{
     ContextBudget, ContextManager, ContextPolicy, ContextPreparation, ContextSnapshot,
 };
+use crate::experience::{self, ExperienceStore, HarnessStats};
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
+use crate::model_registry;
 use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
+use crate::project_checks::{detect_checks, ProjectCheck};
 use crate::refusal::neutral_refusal_note;
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 use crate::transcript::{normalize_messages, normalized_messages};
@@ -91,6 +97,109 @@ const CUT_OFF_BEFORE_ANSWER_NOTE: &str =
     "the output token limit was reached before any answer was written";
 const LOOP_STOPPED_REMAINING_MESSAGE: &str =
     "Not executed: the turn was stopped by the repeated-tool-call guard.";
+/// Sent once when a turn ends on a short promise of the next step instead of the
+/// tool call that does it (weaker models often stop on "I'll now update the file.").
+const ACTION_NUDGE_MESSAGE: &str = "Your last reply described a next step but made no tool call, and a reply without a tool call ends your turn. If work remains and you are not waiting for the user, make that tool call now. If you need the user's answer or are finished, say so in your final answer.";
+/// Opens the completion check sent once after a turn that changed files.
+const COMPLETION_CHECK_INTRO: &str = "Completion check: before you finish, compare what you changed with the user's request: every requested change made, exact paths, names and formats, nothing left half-done, nothing unrelated changed.";
+/// Closes the completion check.
+const COMPLETION_CHECK_OUTRO: &str = "Fix failures your changes caused and re-run the affected check; if a failure is unrelated to your change, say so. Do not weaken, skip or silence checks to make them pass. Then give a short final answer: what you changed, what you verified, and what you could not verify.";
+/// `0`/`false` turns the completion check off.
+pub const COMPLETION_CHECK_ENV_VAR: &str = "NEURON_COMPLETION_CHECK";
+/// `0`/`false` stops the completion check from running project checks itself.
+pub const AUTO_CHECKS_ENV_VAR: &str = "NEURON_AUTO_CHECKS";
+/// Tools whose successful calls change files (their `path`/`file_path`/`notebook_path`).
+const FILE_EDIT_TOOLS: &[&str] = &["edit_file", "write_file", "NotebookEdit"];
+/// Output lines and characters a project check contributes to the completion check.
+const CHECK_OUTPUT_TAIL_LINES: usize = 40;
+const CHECK_OUTPUT_MAX_CHARS: usize = 3_000;
+/// Longest final reply the action nudge considers (status lines are short).
+const ACTION_NUDGE_MAX_CHARS: usize = 600;
+/// Diff a reviewer is given, in characters.
+const REVIEW_DIFF_MAX_CHARS: usize = 24_000;
+/// Reviewer findings passed on to the model, in characters.
+const REVIEW_FINDINGS_MAX_CHARS: usize = 4_000;
+
+/// Harness behaviours that keep weaker models on task. Off in
+/// [`ConversationRuntime::new`]; the CLI, the engine and sub-agents switch them on with
+/// [`HarnessConfig::from_env`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HarnessConfig {
+    /// After a turn that changed files, ask the model once to check its work against
+    /// the request, with the project checks' results, before it finishes.
+    pub completion_check: bool,
+    /// Run the project's checks (`project_checks`) for the completion check when the
+    /// permission policy allows them without asking; otherwise the model is asked to
+    /// run them.
+    pub auto_checks: bool,
+    /// Ask the model, once per turn, to act when it ends on a promise of a next step.
+    pub action_nudge: bool,
+    /// Where project checks are found (`.neuron/checks.json`, manifests).
+    pub workspace_root: Option<PathBuf>,
+    /// The model the session asked for. Turns are recorded in the experience
+    /// library under the model that answered, or this one when the provider does
+    /// not name it.
+    pub model: Option<String>,
+    /// Where per-model experience is kept (see [`crate::experience`]); `None`
+    /// records nothing and adds no model notes.
+    pub experience: Option<ExperienceStore>,
+}
+
+impl HarnessConfig {
+    /// Everything on, unless [`COMPLETION_CHECK_ENV_VAR`] or [`AUTO_CHECKS_ENV_VAR`]
+    /// is `0`/`false`; checks are found from the current directory.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let enabled = |name: &str| {
+            std::env::var(name).map_or(true, |value| {
+                !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off" | "no"
+                )
+            })
+        };
+        Self {
+            completion_check: enabled(COMPLETION_CHECK_ENV_VAR),
+            auto_checks: enabled(AUTO_CHECKS_ENV_VAR),
+            action_nudge: true,
+            workspace_root: std::env::current_dir().ok(),
+            model: None,
+            experience: ExperienceStore::from_env(),
+        }
+    }
+
+    /// The model the session asked for (see [`Self::model`]).
+    #[must_use]
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
+    }
+}
+
+/// What the completion check gives a [`ChangeReviewer`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewRequest {
+    /// The user's message that started the turn.
+    pub request: String,
+    /// Files the turn changed.
+    pub edited_paths: Vec<String>,
+    /// `git diff` of those files, with new files in full, capped.
+    pub diff: String,
+    /// The project checks' result lines, when Neuron ran any.
+    pub check_results: String,
+}
+
+/// A second opinion on a turn's changes, asked for once by the completion check
+/// (see [`ConversationRuntime::with_change_reviewer`]). The tools crate's reviewer
+/// runs a read-only sub-agent, possibly on another model, over the diff.
+pub trait ChangeReviewer {
+    /// Problems to fix, or `Ok(None)` when the reviewer found none.
+    fn review(
+        &mut self,
+        request: &ReviewRequest,
+        cancel: &CancellationToken,
+    ) -> Result<Option<String>, String>;
+}
 
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +225,9 @@ pub enum AssistantEvent {
     /// Why the model declined, as the provider explained it, with the
     /// [`REFUSAL_STOP_REASON`] stop reason.
     Refusal(String),
+    /// The model that actually answered (the gateway's public id), which can differ
+    /// from the requested one (`auto`, failover).
+    ServedModel(String),
     MessageStop,
 }
 
@@ -335,6 +447,10 @@ pub struct TurnSummary {
     pub stop_reason: Option<String>,
     /// Tool results shortened by the context manager during this turn.
     pub pruned_tool_results: usize,
+    /// The model that answered last (see [`AssistantEvent::ServedModel`]).
+    pub served_model: Option<String>,
+    /// Whether the completion check ran this turn.
+    pub completion_checked: bool,
 }
 
 /// Details about automatic session compaction applied during a turn.
@@ -344,6 +460,7 @@ pub struct AutoCompactionEvent {
 }
 
 #[derive(Default)]
+#[allow(clippy::struct_excessive_bools)]
 struct TurnProgress {
     assistant_messages: Vec<ConversationMessage>,
     tool_results: Vec<ConversationMessage>,
@@ -354,6 +471,12 @@ struct TurnProgress {
     stop_reason: Option<String>,
     auto_continued: bool,
     recovered_from_overflow: bool,
+    /// Files changed by successful edit tool calls this turn, in order.
+    edited_paths: Vec<String>,
+    completion_checked: bool,
+    action_nudged: bool,
+    /// Harness events this turn, for the experience library.
+    stats: HarnessStats,
 }
 
 /// Coordinates the model loop, tool execution, hooks, and session updates.
@@ -371,6 +494,12 @@ pub struct ConversationRuntime<C, T> {
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
+    harness: HarnessConfig,
+    served_model: Option<String>,
+    check_counter: usize,
+    reviewer: Option<Box<dyn ChangeReviewer + Send>>,
+    /// The user's message that started the current turn.
+    turn_request: String,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -426,7 +555,42 @@ where
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
+            harness: HarnessConfig::default(),
+            served_model: None,
+            check_counter: 0,
+            reviewer: None,
+            turn_request: String::new(),
         }
+    }
+
+    /// Has the completion check ask `reviewer` for a second opinion on the turn's
+    /// changes (see [`ChangeReviewer`]).
+    #[must_use]
+    pub fn with_change_reviewer(mut self, reviewer: Box<dyn ChangeReviewer + Send>) -> Self {
+        self.reviewer = Some(reviewer);
+        self
+    }
+
+    /// Switches on the harness behaviours in `harness` (see [`HarnessConfig`]).
+    #[must_use]
+    pub fn with_harness_config(mut self, harness: HarnessConfig) -> Self {
+        self.harness = harness;
+        self
+    }
+
+    pub fn set_harness_config(&mut self, harness: HarnessConfig) {
+        self.harness = harness;
+    }
+
+    #[must_use]
+    pub fn harness_config(&self) -> &HarnessConfig {
+        &self.harness
+    }
+
+    /// The model that answered the latest request, when the provider named it.
+    #[must_use]
+    pub fn served_model(&self) -> Option<&str> {
+        self.served_model.as_deref()
     }
 
     #[must_use]
@@ -636,6 +800,8 @@ where
         }
 
         self.record_turn_started(&user_input);
+        self.turn_request.clone_from(&user_input);
+        self.refresh_model_notes();
         self.session
             .push_user_text(user_input)
             .map_err(session_error)?;
@@ -747,6 +913,9 @@ where
                 .prompt_cache_events
                 .extend(built.prompt_cache_events);
             progress.stop_reason.clone_from(&built.stop_reason);
+            if let Some(model) = built.served_model.as_deref() {
+                self.note_served_model(model);
+            }
             let truncated = is_truncation_stop_reason(built.stop_reason.as_deref());
             let refused = is_refusal_stop_reason(built.stop_reason.as_deref());
             let refusal_note = built.refusal;
@@ -812,6 +981,19 @@ where
                         .map_err(session_error)?;
                     continue;
                 }
+                if !truncated {
+                    let final_text = progress
+                        .assistant_messages
+                        .last()
+                        .map(message_text)
+                        .unwrap_or_default();
+                    if let Some(note) = self.before_finishing(&mut progress, &final_text) {
+                        self.session
+                            .push_user_text(format!("{AUTO_CONTINUE_PREFIX} {note}"))
+                            .map_err(session_error)?;
+                        continue;
+                    }
+                }
                 let outcome = if truncated {
                     TurnOutcome::OutputTruncated
                 } else {
@@ -842,6 +1024,7 @@ where
                     let output = if is_complete_json(input) {
                         TRUNCATED_COMPLETE_TOOL_CALL_MESSAGE
                     } else {
+                        progress.stats.truncated_calls += 1;
                         TRUNCATED_TOOL_CALL_MESSAGE
                     };
                     let result = ConversationMessage::tool_result(
@@ -905,12 +1088,23 @@ where
                             reborrow_prompter(&mut prompter),
                         );
                         if let LoopVerdict::Warn(repeats) = verdict {
+                            progress.stats.loop_warnings += 1;
+                            let advice = if FILE_EDIT_TOOLS.contains(&tool_name.as_str()) {
+                                "Read the file with read_file to see its current content, then make a different edit, or explain the blocker to the user"
+                            } else {
+                                "change your approach (different arguments, a different tool, or answer the user)"
+                            };
                             append_to_tool_result(
                                 &mut result,
                                 &format!(
-                                    "[loop guard] You have made this exact `{tool_name}` call with identical arguments {repeats} times in a row. Repeating it will not produce a different result: change your approach (different arguments, a different tool, or answer the user). If you repeat it again, the turn will be stopped."
+                                    "[loop guard] You have made this exact `{tool_name}` call with identical arguments {repeats} times in a row. Repeating it will not produce a different result: {advice}. If you repeat it again, the turn will be stopped."
                                 ),
                             );
+                        }
+                        if let Some(path) = edited_path(tool_name, input, &result) {
+                            if !progress.edited_paths.contains(&path) {
+                                progress.edited_paths.push(path);
+                            }
                         }
                         self.record_tool_result(progress.iterations, result, &mut progress)?;
                         if interrupted {
@@ -1053,6 +1247,9 @@ where
         {
             self.tool_executor
                 .tool_call_finished(tool_use_id, tool_name, output, *is_error);
+            progress
+                .stats
+                .observe_tool_result(tool_name, output, *is_error);
         }
         progress.tool_results.push(result_message);
         Ok(())
@@ -1154,7 +1351,242 @@ where
         Ok(true)
     }
 
-    fn finish_turn(&mut self, progress: TurnProgress, outcome: TurnOutcome) -> TurnSummary {
+    /// Records the model that answered. When it accepts less context than the
+    /// current budget (for example `auto` routed to a 24K model), the budget shrinks
+    /// to it so compaction happens before the provider rejects the request; it never
+    /// grows, since the next request may go to another model.
+    fn note_served_model(&mut self, model: &str) {
+        let trimmed = model.trim();
+        if trimmed.is_empty()
+            || matches!(trimmed, "auto" | "default")
+            || self.served_model.as_deref() == Some(trimmed)
+        {
+            return;
+        }
+        self.served_model = Some(trimmed.to_string());
+        let Some(capability) = model_registry::lookup(trimmed) else {
+            return;
+        };
+        let current = self.context_manager.budget();
+        let window = capability.context_window as usize;
+        if window == 0 || window >= current.context_window {
+            return;
+        }
+        let budget = ContextBudget {
+            context_window: window,
+            output_reserve: current
+                .output_reserve
+                .min(capability.max_output_tokens as usize)
+                .min(window / 4)
+                .max(1),
+            tool_schema_tokens: current.tool_schema_tokens,
+        };
+        let manager = ContextManager::new(budget, self.context_manager.policy().clone());
+        self.set_context_manager(manager);
+    }
+
+    /// The note that keeps a turn going once more, or `None` to let it end: the
+    /// action nudge when the reply only announced a next step, then (once) the
+    /// completion check after a turn that changed files.
+    fn before_finishing(
+        &mut self,
+        progress: &mut TurnProgress,
+        final_text: &str,
+    ) -> Option<String> {
+        if self.cancel.is_cancelled() {
+            return None;
+        }
+        if self.harness.action_nudge && !progress.action_nudged && announces_next_step(final_text) {
+            progress.action_nudged = true;
+            progress.stats.nudges += 1;
+            return Some(ACTION_NUDGE_MESSAGE.to_string());
+        }
+        if self.harness.completion_check
+            && !progress.completion_checked
+            && !progress.edited_paths.is_empty()
+        {
+            progress.completion_checked = true;
+            progress.stats.completion_checks += 1;
+            return Some(
+                self.completion_check_message(&progress.edited_paths, &mut progress.stats),
+            );
+        }
+        None
+    }
+
+    /// The completion check: the request reminder, the changed files and the project
+    /// checks, run here when the permission policy allows them without asking,
+    /// otherwise listed for the model to run.
+    fn completion_check_message(&mut self, edited: &[String], stats: &mut HarnessStats) -> String {
+        let root = self
+            .harness
+            .workspace_root
+            .clone()
+            .or_else(|| std::env::current_dir().ok());
+        let checks = root
+            .as_deref()
+            .map(|root| detect_checks(root, edited))
+            .unwrap_or_default();
+        let mut lines = vec![COMPLETION_CHECK_INTRO.to_string()];
+        let shown = edited.iter().take(12).cloned().collect::<Vec<_>>();
+        let more = if edited.len() > shown.len() {
+            format!(" and {} more", edited.len() - shown.len())
+        } else {
+            String::new()
+        };
+        lines.push(format!("Files you changed: {}{more}.", shown.join(", ")));
+
+        let mut results = Vec::new();
+        let mut to_run = Vec::new();
+        for check in checks {
+            if self.harness.auto_checks && !self.cancel.is_cancelled() {
+                match self.run_project_check(&check) {
+                    Some(result) => results.push(result),
+                    None => to_run.push(check.command),
+                }
+            } else {
+                to_run.push(check.command);
+            }
+        }
+        stats.failed_checks += results
+            .iter()
+            .filter(|result| result.contains("` FAILED ("))
+            .count() as u64;
+        let check_results = results.join("\n");
+        let ran_checks = !results.is_empty();
+        if ran_checks {
+            lines.push("Project checks Neuron ran on your changes:".to_string());
+            lines.extend(results);
+        }
+        if !to_run.is_empty() {
+            lines.push(format!(
+                "Run these checks with the bash tool before you answer: {}.",
+                to_run
+                    .iter()
+                    .map(|command| format!("`{command}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if let Some(review) = self.review_changes(root.as_deref(), edited, check_results) {
+            lines.push(review);
+        }
+        if !ran_checks && to_run.is_empty() {
+            lines.push("No project checks were found for these files. If the project has tests, a type checker or a build for them, run it before you answer.".to_string());
+        }
+        lines.push(COMPLETION_CHECK_OUTRO.to_string());
+        lines.join("\n")
+    }
+
+    /// The reviewer's part of the completion check, when one is set and it ran.
+    fn review_changes(
+        &mut self,
+        root: Option<&Path>,
+        edited: &[String],
+        check_results: String,
+    ) -> Option<String> {
+        if self.cancel.is_cancelled() {
+            return None;
+        }
+        let reviewer = self.reviewer.as_mut()?;
+        let request = ReviewRequest {
+            request: self.turn_request.clone(),
+            edited_paths: edited.to_vec(),
+            diff: root.map_or_else(String::new, |root| changes_for_review(root, edited)),
+            check_results,
+        };
+        match reviewer.review(&request, &self.cancel) {
+            Ok(None) => Some(
+                "A reviewer (a separate read-only agent) compared your changes with the request and found no problems.".to_string(),
+            ),
+            Ok(Some(findings)) => Some(format!(
+                "A reviewer (a separate read-only agent) compared your changes with the request and reported:\n{}\nFix the findings that are real. If one is wrong, say why in your final answer.",
+                truncate_chars(findings.trim(), REVIEW_FINDINGS_MAX_CHARS)
+            )),
+            Err(_) => None,
+        }
+    }
+
+    /// Puts the experience library's notes for the current model in the system
+    /// prompt, replacing earlier ones, or removes them when there are none.
+    fn refresh_model_notes(&mut self) {
+        let Some(store) = &self.harness.experience else {
+            return;
+        };
+        let Some(model) = self.experience_model() else {
+            return;
+        };
+        let notes = experience::notes_from(&store.stats_for(&model));
+        let section = experience::render_model_notes(&model, &notes);
+        self.system_prompt
+            .retain(|part| !part.starts_with(experience::MODEL_NOTES_HEADING));
+        self.system_prompt.extend(section);
+    }
+
+    /// The model a turn is recorded under: the one that answered, else the one
+    /// asked for (not `auto`, which is a choice rather than a model).
+    fn experience_model(&self) -> Option<String> {
+        self.served_model
+            .clone()
+            .or_else(|| self.harness.model.clone())
+            .filter(|model| !matches!(model.trim(), "" | "auto" | "default" | "openai/auto"))
+    }
+
+    /// Runs one project check through the `bash` tool when the pre-tool hooks and the
+    /// permission policy allow it without asking. `None` when it is not allowed (the
+    /// model is asked to run it instead); otherwise one result line for the model.
+    fn run_project_check(&mut self, check: &ProjectCheck) -> Option<String> {
+        let input = serde_json::json!({
+            "command": check.command,
+            "timeout": check.timeout_ms,
+            "description": format!("Neuron completion check: {}", check.name),
+        })
+        .to_string();
+        // Same gates as a model's bash call, minus the prompt: hooks that block or
+        // rewrite the call, or a policy (or hook override) that would ask, leave the
+        // check to the model.
+        let hook = self.run_pre_tool_use_hook("bash", &input);
+        if hook.is_denied()
+            || hook.is_failed()
+            || hook.is_cancelled()
+            || hook.updated_input().is_some()
+        {
+            return None;
+        }
+        let context = PermissionContext::new(
+            hook.permission_override(),
+            hook.permission_reason().map(ToOwned::to_owned),
+        );
+        if !matches!(
+            self.permission_policy
+                .authorize_with_context("bash", &input, &context, None),
+            PermissionOutcome::Allow
+        ) {
+            return None;
+        }
+        self.check_counter += 1;
+        let id = format!("neuron-check-{}", self.check_counter);
+        self.tool_executor.tool_started(&id, "bash", &input);
+        let started = Instant::now();
+        let outcome = self
+            .tool_executor
+            .execute_with_cancellation("bash", &input, &self.cancel);
+        let seconds = started.elapsed().as_secs_f32();
+        let (output, is_error) = match outcome {
+            Ok(output) => (output, false),
+            Err(error) => (error.to_string(), true),
+        };
+        self.tool_executor
+            .tool_call_finished(&id, "bash", &output, is_error);
+        Some(summarize_check(check, &output, is_error, seconds))
+    }
+
+    fn finish_turn(&mut self, mut progress: TurnProgress, outcome: TurnOutcome) -> TurnSummary {
+        progress.stats.turns += 1;
+        if let (Some(store), Some(model)) = (&self.harness.experience, self.experience_model()) {
+            // Best effort: a read-only or full disk must not fail the turn.
+            let _ = store.record(&model, &progress.stats);
+        }
         if matches!(outcome, TurnOutcome::Cancelled { .. }) {
             self.close_turn_with_note(INTERRUPTED_RESPONSE_NOTE.to_string(), None);
         }
@@ -1170,6 +1602,8 @@ where
             outcome,
             stop_reason: progress.stop_reason,
             pruned_tool_results: progress.pruned_tool_results,
+            served_model: self.served_model.clone(),
+            completion_checked: progress.completion_checked,
         };
         self.record_turn_completed(&summary);
         summary
@@ -1682,6 +2116,10 @@ fn is_complete_json(input: &str) -> bool {
 /// `Ok` when a tool call's arguments are a JSON object, as every tool's input is;
 /// otherwise what is wrong with them, for the model.
 fn tool_input_object(input: &str) -> Result<(), String> {
+    // Near-JSON the executor can repair (a trailing comma, a missing closer) passes.
+    if crate::tool_input::parse_tool_input(input).is_ok() {
+        return Ok(());
+    }
     match serde_json::from_str::<Value>(input) {
         Ok(Value::Object(_)) => Ok(()),
         Ok(other) => Err(format!(
@@ -1789,6 +2227,7 @@ struct BuiltAssistantMessage {
     prompt_cache_events: Vec<PromptCacheEvent>,
     stop_reason: Option<String>,
     refusal: Option<String>,
+    served_model: Option<String>,
 }
 
 fn build_assistant_message(
@@ -1801,6 +2240,7 @@ fn build_assistant_message(
     let mut usage = None;
     let mut stop_reason = None;
     let mut refusal: Option<String> = None;
+    let mut served_model = None;
 
     for event in events {
         match event {
@@ -1815,6 +2255,7 @@ fn build_assistant_message(
             AssistantEvent::Refusal(note) => {
                 refusal.get_or_insert_with(String::new).push_str(&note);
             }
+            AssistantEvent::ServedModel(model) => served_model = Some(model),
             AssistantEvent::MessageStop => {
                 finished = true;
             }
@@ -1847,7 +2288,211 @@ fn build_assistant_message(
         refusal: refusal
             .map(|note| neutral_refusal_note(note.trim()))
             .filter(|note| !note.is_empty()),
+        served_model,
     })
+}
+
+/// The text of an assistant message (its text blocks, joined).
+fn message_text(message: &ConversationMessage) -> String {
+    message
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whether a reply that ends the turn only announces what the model will do next
+/// ("I'll now update the config:"), the status-line stop weaker models make instead
+/// of calling the tool. Long answers and questions to the user do not count.
+fn announces_next_step(text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() || text.chars().count() > ACTION_NUDGE_MAX_CHARS || text.ends_with('?') {
+        return false;
+    }
+    let tail = text
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    // Waiting on the user is a legitimate end of turn.
+    if [
+        "let me know",
+        "feel free",
+        "happy to help",
+        "confirm",
+        "approval",
+        "go-ahead",
+        "go ahead",
+        "if you want",
+        "if you'd like",
+        "would you like",
+        "once you",
+        "when you're ready",
+        "your call",
+    ]
+    .iter()
+    .any(|phrase| tail.contains(phrase))
+    {
+        return false;
+    }
+    tail.ends_with(':')
+        || [
+            "i'll ",
+            "i will ",
+            "let me ",
+            "let's ",
+            "next, i",
+            "now i'll",
+            "now i will",
+            "i'm going to",
+            "i am going to",
+            "i'll now",
+            "proceeding to",
+            "going to ",
+        ]
+        .iter()
+        .any(|phrase| tail.starts_with(phrase) || tail.contains(&format!(". {phrase}")))
+}
+
+/// The file a successful edit tool call changed: the `filePath` its result
+/// reports (the real path, also when the tool corrected a mistyped one), else
+/// the path in its arguments.
+fn edited_path(tool_name: &str, input: &str, result: &ConversationMessage) -> Option<String> {
+    if !FILE_EDIT_TOOLS.contains(&tool_name) {
+        return None;
+    }
+    let output = result.blocks.iter().find_map(|block| match block {
+        ContentBlock::ToolResult {
+            output,
+            is_error: false,
+            ..
+        } => Some(output),
+        _ => None,
+    })?;
+    if let Some(path) = serde_json::from_str::<Value>(output)
+        .ok()
+        .and_then(|value| value.get("filePath")?.as_str().map(ToOwned::to_owned))
+    {
+        return Some(path);
+    }
+    let value = crate::tool_input::parse_tool_input(input).ok()?.value;
+    ["path", "file_path", "notebook_path"]
+        .iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+}
+
+/// The changes in `paths` for a reviewer: `git diff` against `HEAD` for tracked
+/// files and the full text of new ones; the files' current text when `root` is
+/// not a git repository. Capped at [`REVIEW_DIFF_MAX_CHARS`].
+fn changes_for_review(root: &Path, paths: &[String]) -> String {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .args(paths)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+    };
+    let mut text = String::new();
+    match git(&["diff", "--no-color", "--no-ext-diff", "HEAD", "--"]) {
+        Some(diff) => {
+            text.push_str(&diff);
+            let untracked =
+                git(&["ls-files", "--others", "--exclude-standard", "--"]).unwrap_or_default();
+            for path in untracked.lines().filter(|line| !line.is_empty()) {
+                let content = std::fs::read_to_string(root.join(path)).unwrap_or_default();
+                let _ = write!(text, "--- /dev/null\n+++ b/{path}\n");
+                for line in content.lines() {
+                    text.push('+');
+                    text.push_str(line);
+                    text.push('\n');
+                }
+            }
+        }
+        None => {
+            for path in paths {
+                let full = Path::new(path);
+                let full = if full.is_absolute() {
+                    full.to_path_buf()
+                } else {
+                    root.join(full)
+                };
+                let content = std::fs::read_to_string(&full).unwrap_or_default();
+                let _ = write!(text, "=== {path} (current content) ===\n{content}\n");
+            }
+        }
+    }
+    truncate_chars(&text, REVIEW_DIFF_MAX_CHARS)
+}
+
+/// `text` cut to `max` characters, marked when cut.
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let kept = text.chars().take(max).collect::<String>();
+    format!("{kept}\n[... cut at {max} characters]")
+}
+
+/// One result line for a project check from the `bash` tool's output: passed, or
+/// failed with the end of its output.
+fn summarize_check(check: &ProjectCheck, output: &str, is_error: bool, seconds: f32) -> String {
+    let parsed = serde_json::from_str::<Value>(output).ok();
+    let failure = parsed
+        .as_ref()
+        .and_then(|value| value.get("returnCodeInterpretation"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let text = parsed.as_ref().map_or_else(
+        || output.to_string(),
+        |value| {
+            let stdout = value
+                .get("stdout")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let stderr = value
+                .get("stderr")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            format!("{stdout}\n{stderr}")
+        },
+    );
+    if !is_error && failure.is_none() {
+        return format!("- `{}` passed ({seconds:.1} s).", check.command);
+    }
+    let lines = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    let start = lines.len().saturating_sub(CHECK_OUTPUT_TAIL_LINES);
+    let mut tail = lines[start..].join("\n");
+    if tail.len() > CHECK_OUTPUT_MAX_CHARS {
+        let cut = tail.len() - CHECK_OUTPUT_MAX_CHARS;
+        let cut = (cut..tail.len())
+            .find(|index| tail.is_char_boundary(*index))
+            .unwrap_or(cut);
+        tail = format!("...{}", &tail[cut..]);
+    }
+    format!(
+        "- `{}` FAILED ({}, {seconds:.1} s):\n{}",
+        check.command,
+        failure.unwrap_or_else(|| "could not run".to_string()),
+        if tail.is_empty() {
+            "(no output)".to_string()
+        } else {
+            tail
+        }
+    )
 }
 
 fn flush_text_block(text: &mut String, blocks: &mut Vec<ContentBlock>) {
@@ -4592,6 +5237,510 @@ mod resilience_tests {
                 MessageRole::Tool,
                 MessageRole::User
             ]
+        );
+    }
+
+    fn harness(root: &std::path::Path, auto_checks: bool) -> super::HarnessConfig {
+        super::HarnessConfig {
+            completion_check: true,
+            auto_checks,
+            action_nudge: true,
+            workspace_root: Some(root.to_path_buf()),
+            ..super::HarnessConfig::default()
+        }
+    }
+
+    fn temp_workspace(label: &str) -> std::path::PathBuf {
+        let dir = temp_session_path(label).with_extension("");
+        std::fs::create_dir_all(&dir).expect("workspace");
+        dir
+    }
+
+    fn auto_continue_notes(session: &Session) -> Vec<String> {
+        session
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::User)
+            .flat_map(|message| message.blocks.iter())
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } if text.starts_with(AUTO_CONTINUE_PREFIX) => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn edit_call(id: &str, path: &str) -> AssistantEvent {
+        tool_call(
+            id,
+            "edit_file",
+            &format!(r#"{{"path":"{path}","old_string":"a","new_string":"b"}}"#),
+        )
+    }
+
+    #[test]
+    fn a_turn_that_edited_files_gets_one_completion_check_before_it_ends() {
+        let root = temp_workspace("completion");
+        let api = ScriptedApi::new(vec![
+            Ok(vec![
+                edit_call("e1", "src/app.py"),
+                AssistantEvent::MessageStop,
+            ]),
+            Ok(vec![
+                text("Updated the handler."),
+                AssistantEvent::MessageStop,
+            ]),
+            Ok(vec![
+                text("Changed src/app.py and checked it."),
+                AssistantEvent::MessageStop,
+            ]),
+        ]);
+        let tools = StaticToolExecutor::new().register("edit_file", |_| Ok("edited".to_string()));
+        let mut runtime =
+            runtime_with(Session::new(), api, tools).with_harness_config(harness(&root, false));
+
+        let summary = runtime
+            .run_turn("fix the handler", None)
+            .expect("turn completes");
+
+        assert_eq!(summary.outcome, TurnOutcome::Completed);
+        assert!(summary.completion_checked);
+        assert_eq!(
+            summary.iterations, 3,
+            "one extra round for the check, not more"
+        );
+        let notes = auto_continue_notes(runtime.session());
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("Completion check"), "{}", notes[0]);
+        assert!(
+            notes[0].contains("Files you changed: src/app.py."),
+            "{}",
+            notes[0]
+        );
+        assert!(
+            notes[0].contains(
+                "Run these checks with the bash tool before you answer: `python -m py_compile "
+            ),
+            "auto checks off: the model is asked to run them: {}",
+            notes[0]
+        );
+    }
+
+    #[test]
+    fn failed_edits_and_plain_answers_end_the_turn_without_a_check() {
+        let root = temp_workspace("no-check");
+        let api = ScriptedApi::new(vec![
+            Ok(vec![
+                edit_call("e1", "src/app.py"),
+                AssistantEvent::MessageStop,
+            ]),
+            Ok(vec![
+                text("The edit failed: old_string not found."),
+                AssistantEvent::MessageStop,
+            ]),
+        ]);
+        let tools = StaticToolExecutor::new().register("edit_file", |_| {
+            Err(super::ToolError::new("old_string not found"))
+        });
+        let mut runtime =
+            runtime_with(Session::new(), api, tools).with_harness_config(harness(&root, true));
+
+        let summary = runtime
+            .run_turn("fix the handler", None)
+            .expect("turn completes");
+
+        assert!(!summary.completion_checked);
+        assert_eq!(summary.iterations, 2);
+        assert_eq!(auto_continue_notes(runtime.session()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn allowed_project_checks_run_and_their_results_reach_the_model() {
+        let root = temp_workspace("auto-checks");
+        std::fs::create_dir_all(root.join(".neuron")).expect("dir");
+        std::fs::write(
+            root.join(".neuron/checks.json"),
+            r#"{"checks":[{"name":"unit","command":"make test"},{"name":"types","command":"make types"}]}"#,
+        )
+        .expect("checks");
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        let seen = Rc::clone(&commands);
+        let api = ScriptedApi::new(vec![
+            Ok(vec![
+                edit_call("e1", "src/lib.rs"),
+                AssistantEvent::MessageStop,
+            ]),
+            Ok(vec![text("Done."), AssistantEvent::MessageStop]),
+            Ok(vec![
+                text("Fixed; the type error is unrelated."),
+                AssistantEvent::MessageStop,
+            ]),
+        ]);
+        let tools = StaticToolExecutor::new()
+            .register("edit_file", |_| Ok("edited".to_string()))
+            .register("bash", move |input| {
+                let value: serde_json::Value = serde_json::from_str(input).expect("json input");
+                let command = value["command"].as_str().expect("command").to_string();
+                seen.borrow_mut().push(command.clone());
+                Ok(if command == "make test" {
+                    r#"{"stdout":"12 passed","stderr":""}"#.to_string()
+                } else {
+                    r#"{"stdout":"","stderr":"src/lib.rs:4: expected u32\n","returnCodeInterpretation":"exit code 2"}"#.to_string()
+                })
+            });
+        let mut runtime =
+            runtime_with(Session::new(), api, tools).with_harness_config(harness(&root, true));
+
+        runtime
+            .run_turn("change the type", None)
+            .expect("turn completes");
+
+        assert_eq!(*commands.borrow(), vec!["make test", "make types"]);
+        let notes = auto_continue_notes(runtime.session());
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        let note = &notes[0];
+        assert!(
+            note.contains("Project checks Neuron ran on your changes:"),
+            "{note}"
+        );
+        assert!(note.contains("- `make test` passed ("), "{note}");
+        assert!(
+            note.contains("- `make types` FAILED (exit code 2, "),
+            "{note}"
+        );
+        assert!(note.contains("src/lib.rs:4: expected u32"), "{note}");
+        assert!(!note.contains("Run these checks"), "{note}");
+    }
+
+    #[test]
+    fn checks_the_policy_would_ask_about_are_left_to_the_model() {
+        let root = temp_workspace("denied-checks");
+        std::fs::create_dir_all(root.join(".neuron")).expect("dir");
+        std::fs::write(
+            root.join(".neuron/checks.json"),
+            r#"{"checks":[{"command":"neuron-test-check --strict"}]}"#,
+        )
+        .expect("checks");
+        let api = ScriptedApi::new(vec![
+            Ok(vec![
+                edit_call("e1", "src/lib.rs"),
+                AssistantEvent::MessageStop,
+            ]),
+            Ok(vec![text("Done."), AssistantEvent::MessageStop]),
+            Ok(vec![text("Ran it."), AssistantEvent::MessageStop]),
+        ]);
+        let tools = StaticToolExecutor::new()
+            .register("edit_file", |_| Ok("edited".to_string()))
+            .register("bash", |_| {
+                panic!("checks that need approval must not run unasked")
+            });
+        let policy = PermissionPolicy::new(PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("edit_file", PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess);
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            api,
+            tools,
+            policy,
+            vec!["system".to_string()],
+        )
+        .with_harness_config(harness(&root, true));
+
+        runtime
+            .run_turn("change the type", None)
+            .expect("turn completes");
+
+        let notes = auto_continue_notes(runtime.session());
+        assert!(
+            notes[0].contains("Run these checks with the bash tool before you answer: `neuron-test-check --strict`."),
+            "{}",
+            notes[0]
+        );
+    }
+
+    #[test]
+    fn a_reply_that_only_announces_the_next_step_is_nudged_once() {
+        let api = ScriptedApi::new(vec![
+            Ok(vec![
+                text("Found it. I'll now update the config file."),
+                AssistantEvent::MessageStop,
+            ]),
+            Ok(vec![text("I'll stop here."), AssistantEvent::MessageStop]),
+        ]);
+        let mut runtime = runtime_with(Session::new(), api, StaticToolExecutor::new())
+            .with_harness_config(super::HarnessConfig {
+                action_nudge: true,
+                ..super::HarnessConfig::default()
+            });
+
+        let summary = runtime
+            .run_turn("fix the config", None)
+            .expect("turn completes");
+
+        assert_eq!(summary.iterations, 2, "nudged once, then the turn ends");
+        let notes = auto_continue_notes(runtime.session());
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("described a next step but made no tool call"));
+    }
+
+    #[test]
+    fn announcements_are_told_apart_from_answers_and_questions() {
+        for text in [
+            "I'll now update the config file.",
+            "Found the bug. Let me fix it.",
+            "Next, I need to change the parser:",
+            "Here are the changes:",
+        ] {
+            assert!(super::announces_next_step(text), "{text}");
+        }
+        let long = format!("I'll {}", "explain at length. ".repeat(60));
+        for text in [
+            "",
+            "Should I also update the tests?",
+            "I'll make the change once you confirm.",
+            "Let me know if you want anything else.",
+            "The function returns early when the list is empty, so the loop never runs.",
+            long.as_str(),
+        ] {
+            assert!(!super::announces_next_step(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_served_model_is_recorded_and_shrinks_a_larger_budget() {
+        let small = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+        let api = ScriptedApi::new(vec![
+            Ok(vec![
+                AssistantEvent::ServedModel(small.to_string()),
+                text("hi"),
+                AssistantEvent::MessageStop,
+            ]),
+            Ok(vec![
+                AssistantEvent::ServedModel("gemini/gemini-2.5-flash".to_string()),
+                text("hi again"),
+                AssistantEvent::MessageStop,
+            ]),
+        ]);
+        let manager = ContextManager::new(
+            ContextBudget {
+                context_window: 131_072,
+                output_reserve: 32_000,
+                tool_schema_tokens: 1_000,
+            },
+            ContextPolicy::default(),
+        );
+        let mut runtime = runtime_with(Session::new(), api, StaticToolExecutor::new())
+            .with_context_manager(manager);
+
+        let summary = runtime.run_turn("hello", None).expect("turn completes");
+
+        assert_eq!(summary.served_model.as_deref(), Some(small));
+        let budget = runtime.context_manager().budget();
+        assert_eq!(
+            (
+                budget.context_window,
+                budget.output_reserve,
+                budget.tool_schema_tokens
+            ),
+            (24_000, 6_000, 1_000),
+            "window and reserve follow the 24K model"
+        );
+
+        let summary = runtime.run_turn("again", None).expect("turn completes");
+        assert_eq!(
+            summary.served_model.as_deref(),
+            Some("gemini/gemini-2.5-flash")
+        );
+        assert_eq!(
+            runtime.context_manager().budget().context_window,
+            24_000,
+            "a larger served model never grows the budget"
+        );
+    }
+
+    /// Records what it was asked and answers with `findings`.
+    struct StubReviewer {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<super::ReviewRequest>>>,
+        findings: Option<String>,
+    }
+
+    impl super::ChangeReviewer for StubReviewer {
+        fn review(
+            &mut self,
+            request: &super::ReviewRequest,
+            _cancel: &CancellationToken,
+        ) -> Result<Option<String>, String> {
+            self.seen.lock().expect("lock").push(request.clone());
+            Ok(self.findings.clone())
+        }
+    }
+
+    fn git_workspace(label: &str) -> std::path::PathBuf {
+        let root = temp_workspace(label);
+        std::fs::write(root.join("app.py"), "LIMIT = 1\n").expect("file");
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "-A"],
+            vec![
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "start",
+            ],
+        ] {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(&args)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?}");
+        }
+        root
+    }
+
+    fn reviewed_turn(label: &str, findings: Option<&str>) -> (String, Vec<super::ReviewRequest>) {
+        let root = git_workspace(label);
+        let file = root.join("app.py");
+        let api = ScriptedApi::new(vec![
+            Ok(vec![edit_call("e1", "app.py"), AssistantEvent::MessageStop]),
+            Ok(vec![text("Raised the limit."), AssistantEvent::MessageStop]),
+            Ok(vec![
+                text("Done; the reviewer's point is handled."),
+                AssistantEvent::MessageStop,
+            ]),
+        ]);
+        let tools = StaticToolExecutor::new().register("edit_file", move |_| {
+            std::fs::write(&file, "LIMIT = 5\n").expect("edit");
+            Ok("edited".to_string())
+        });
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reviewer = StubReviewer {
+            seen: std::sync::Arc::clone(&seen),
+            findings: findings.map(ToOwned::to_owned),
+        };
+        let mut runtime = runtime_with(Session::new(), api, tools)
+            .with_harness_config(harness(&root, false))
+            .with_change_reviewer(Box::new(reviewer));
+
+        runtime
+            .run_turn("raise LIMIT to 5", None)
+            .expect("turn completes");
+
+        let notes = auto_continue_notes(runtime.session());
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        let seen = seen.lock().expect("lock").clone();
+        (notes[0].clone(), seen)
+    }
+
+    #[test]
+    fn the_reviewer_sees_the_request_and_diff_and_its_findings_reach_the_model() {
+        let (note, seen) =
+            reviewed_turn("review", Some("1. app.py: LIMIT must also be documented."));
+
+        assert_eq!(seen.len(), 1, "one review per turn");
+        assert_eq!(seen[0].request, "raise LIMIT to 5");
+        assert_eq!(seen[0].edited_paths, vec!["app.py".to_string()]);
+        assert!(seen[0].diff.contains("-LIMIT = 1"), "{}", seen[0].diff);
+        assert!(seen[0].diff.contains("+LIMIT = 5"), "{}", seen[0].diff);
+        assert!(
+            note.contains("reported:\n1. app.py: LIMIT must also be documented.\nFix the findings that are real."),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn a_reviewer_that_finds_nothing_says_so() {
+        let (note, _) = reviewed_turn("review-clean", None);
+        assert!(note.contains("found no problems"), "{note}");
+    }
+
+    #[test]
+    fn model_notes_follow_the_experience_library() {
+        let store = crate::experience::ExperienceStore::new(
+            temp_workspace("experience").join("experience.json"),
+        );
+        store
+            .record(
+                "weak-model",
+                &crate::experience::HarnessStats {
+                    turns: 10,
+                    tool_calls: 50,
+                    nudges: 4,
+                    ..crate::experience::HarnessStats::default()
+                },
+            )
+            .expect("seed");
+        let api = ScriptedApi::new(vec![
+            Ok(vec![
+                tool_call("r1", "read_file", "{}"),
+                AssistantEvent::MessageStop,
+            ]),
+            Ok(vec![
+                text("The file is empty."),
+                AssistantEvent::MessageStop,
+            ]),
+        ]);
+        let tools = StaticToolExecutor::new().register("read_file", |_| Ok(String::new()));
+        let mut runtime =
+            runtime_with(Session::new(), api, tools).with_harness_config(super::HarnessConfig {
+                model: Some("weak-model".to_string()),
+                experience: Some(store.clone()),
+                ..super::HarnessConfig::default()
+            });
+
+        runtime
+            .run_turn("what is in the file?", None)
+            .expect("turn completes");
+
+        let system = runtime.api_client().requests[0].system_prompt.join("\n");
+        assert!(system.contains("# Notes for this model"), "{system}");
+        assert!(system.contains("Never end a reply with a plan"), "{system}");
+        let stats = store.stats_for("weak-model");
+        assert_eq!(
+            (stats.turns, stats.tool_calls),
+            (11, 51),
+            "this turn was recorded"
+        );
+    }
+
+    #[test]
+    fn edited_files_are_taken_from_the_result_before_the_arguments() {
+        let result = |output: &str, is_error: bool| {
+            ConversationMessage::tool_result(
+                "e1".to_string(),
+                "edit_file".to_string(),
+                output,
+                is_error,
+            )
+        };
+        let input = r#"{"path":"C:/work/mistyped-dir/app.py","old_string":"a","new_string":"b"}"#;
+        assert_eq!(
+            super::edited_path(
+                "edit_file",
+                input,
+                &result(r#"{"filePath":"C:/work/real-dir/app.py"}"#, false)
+            ),
+            Some("C:/work/real-dir/app.py".to_string()),
+            "the tool's corrected path wins"
+        );
+        assert_eq!(
+            super::edited_path("edit_file", input, &result("edited", false)),
+            Some("C:/work/mistyped-dir/app.py".to_string()),
+            "otherwise the argument"
+        );
+        assert_eq!(
+            super::edited_path("edit_file", input, &result("old_string not found", true)),
+            None
+        );
+        assert_eq!(
+            super::edited_path("read_file", input, &result("{}", false)),
+            None
         );
     }
 }

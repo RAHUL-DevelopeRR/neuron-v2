@@ -2,10 +2,11 @@
 // Freebuff variant and the login/publish commands, --agent and --trust-agents
 // (Codebuff login, agent store and repository .agents loading) are gone, and
 // the engine's launch flags (--model, --provider, ...) pass through to it.
+// --lite, --max and --plan are gone with the agent modes (AGENT_MODES_AVAILABLE).
 // See ui/neuron-tui/PORTING.md.
 import { createRequire } from 'module'
 
-import { Command, Option } from 'commander'
+import { Command } from 'commander'
 
 import type { EngineLaunchOptions } from './engine/neuron-engine-client'
 import type { AgentMode } from './utils/constants'
@@ -69,12 +70,6 @@ export function buildProgram(version: string): Command {
       '--cwd <directory>',
       'Set the working directory (default: current directory)',
     )
-    // Still accepted but left out of --help: these modes change only how the UI
-    // presents a turn, and the engine ignores them (see PORTING.md).
-    .addOption(new Option('--lite', 'Start in LITE mode').hideHelp())
-    .addOption(new Option('--free', 'Start in LITE mode (deprecated alias)').hideHelp())
-    .addOption(new Option('--max', 'Start in MAX mode').hideHelp())
-    .option('--plan', 'Start in PLAN mode')
     .option(
       '--model <model>',
       'Model for the session (auto, or an id from /model such as gemini/gemini-2.5-flash)',
@@ -114,11 +109,8 @@ export function parseArgs({
 
   const continueFlag = options.continue
 
-  // Determine initial mode from flags (last flag wins if multiple specified)
-  let initialMode: AgentMode | undefined
-  if (options.free || options.lite) initialMode = 'LITE'
-  if (options.max) initialMode = 'MAX'
-  if (options.plan) initialMode = 'PLAN'
+  // Every chat runs in DEFAULT while the agent modes are not offered.
+  const initialMode: AgentMode | undefined = undefined
 
   return {
     initialPrompt: args.length > 0 ? args.join(' ') : null,
