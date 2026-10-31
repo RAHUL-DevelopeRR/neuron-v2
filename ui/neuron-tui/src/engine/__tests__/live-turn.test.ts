@@ -19,6 +19,7 @@ import {
 } from '../live-turn'
 import { turnHarness } from './turn-harness'
 
+import type { TodoItem } from '../../utils/todos'
 import type { TokenCounts, UiEvent } from '../protocol'
 
 /** A clock the test moves by hand. */
@@ -379,7 +380,7 @@ describe('an older engine (no features, no progress events)', () => {
       { content: 'Run the tests', activeForm: 'Running the tests', status: 'pending' },
     ],
   })
-  const PLAN = [
+  const PLAN: TodoItem[] = [
     { task: 'Read the code', completed: true, status: 'completed', activeForm: 'Reading the code' },
     { task: 'Fix the bug', completed: false, status: 'in_progress', activeForm: 'Fixing the bug' },
     { task: 'Run the tests', completed: false, status: 'pending', activeForm: 'Running the tests' },
