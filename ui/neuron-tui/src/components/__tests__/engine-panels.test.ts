@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { MODEL_MIN_WIDTH, fitParts, footerParts, formatGit } from '../engine-footer'
+import { MODEL_MIN_WIDTH, fitParts, footerModel, footerParts, formatGit } from '../engine-footer'
 import {
   fitModelRow,
   modelRows,
@@ -258,6 +258,15 @@ describe('model picker', () => {
 })
 
 describe('engine footer', () => {
+  test('names the model auto picked', () => {
+    expect(footerModel({ ...STATUS, model: 'auto' })).toBe('auto')
+    expect(footerModel({ ...STATUS, model: 'auto', served_model: 'groq/qwen/qwen3.8-27b' })).toBe(
+      'auto → groq/qwen/qwen3.8-27b',
+    )
+    expect(footerModel({ ...STATUS, served_model: STATUS.model })).toBe(STATUS.model)
+    expect(footerParts({ ...STATUS, model: 'auto', served_model: 'm' }, null)[0]?.text).toBe('auto → m')
+  })
+
   test('git shows the branch and its non-zero counts', () => {
     expect(formatGit(STATUS.git!)).toBe('main +1 ~2')
     expect(

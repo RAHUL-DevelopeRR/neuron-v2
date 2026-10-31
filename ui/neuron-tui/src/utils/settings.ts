@@ -1,12 +1,13 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
 // Freebuff model and catalog picks, reasoning efforts, BYOK selection,
 // adsEnabled, Freebucks intro and a-la-carte flags are gone with the services
-// they configured. See ui/neuron-tui/PORTING.md.
+// they configured, and a saved agent mode is read as DEFAULT while the modes
+// are not offered (AGENT_MODES_AVAILABLE). See ui/neuron-tui/PORTING.md.
 import fs from 'fs'
 import path from 'path'
 
 import { getConfigDir } from './config-dir'
-import { AGENT_MODES } from './constants'
+import { AGENT_MODES, AGENT_MODES_AVAILABLE } from './constants'
 import { logger } from './logger'
 
 import type { AgentMode } from './constants'
@@ -86,7 +87,7 @@ const validateSettings = (parsed: unknown): Settings => {
   const obj = parsed as Record<string, unknown>
 
   // Validate mode; migrate the previously-saved 'FREE' value to 'LITE'.
-  if (typeof obj.mode === 'string') {
+  if (AGENT_MODES_AVAILABLE && typeof obj.mode === 'string') {
     const normalized = obj.mode === 'FREE' ? 'LITE' : obj.mode
     if (AGENT_MODES.includes(normalized as AgentMode)) {
       settings.mode = normalized as AgentMode

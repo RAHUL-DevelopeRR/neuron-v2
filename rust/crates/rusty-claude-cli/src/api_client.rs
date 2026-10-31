@@ -304,6 +304,7 @@ pub(crate) fn classify_stream_read_error(
     model: &str,
     error: &api::ApiError,
 ) -> StreamFailure {
+    crate::error_detail::record_model_call_failure(error);
     let detail = format_user_visible_api_error(session_id, error);
     match error {
         api::ApiError::Api { .. }
@@ -333,6 +334,7 @@ pub(crate) fn fatal_api_error(
     model: &str,
     error: &api::ApiError,
 ) -> StreamFailure {
+    crate::error_detail::record_model_call_failure(error);
     let kind = if error.is_context_window_failure() {
         RuntimeErrorKind::ContextWindowExceeded
     } else {
@@ -683,6 +685,7 @@ impl ApiClient for AnthropicRuntimeClient {
         };
         let deferred_count = deferred_mcp_tools.len();
         let mut message_request = self.message_request(&request, deferred_mcp_tools);
+        crate::error_detail::clear_model_call_failure();
 
         let (result, dropped_deferred_tools) = self.runtime.block_on(async {
             // One retry state for the whole model call: the stream retry
@@ -703,7 +706,10 @@ impl ApiClient for AnthropicRuntimeClient {
                     )
                     .await
                 {
-                    Ok(events) => return (Ok(events), dropped_deferred_tools),
+                    Ok(events) => {
+                        crate::error_detail::clear_model_call_failure();
+                        return (Ok(events), dropped_deferred_tools);
+                    }
                     Err(StreamFailure::Fatal(error))
                         if error.kind() == RuntimeErrorKind::ContextWindowExceeded
                             && deferred_count > 0
@@ -860,6 +866,9 @@ impl AnthropicRuntimeClient {
 
             match event {
                 ApiStreamEvent::MessageStart(start) => {
+                    if !start.message.model.trim().is_empty() {
+                        events.push(AssistantEvent::ServedModel(start.message.model.clone()));
+                    }
                     for (index, block) in start.message.content.into_iter().enumerate() {
                         let mut pending_tool = None;
                         push_output_block(

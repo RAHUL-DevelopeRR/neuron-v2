@@ -1,0 +1,24 @@
+# A bare `neuron` in a folder nobody has trusted: "Before Neuron works here"
+# comes before the chat. Down and Enter would quit, so up again; 1 allows
+# Neuron, the engine restarts with the folder's settings, and the chat follows
+# with no "untrusted folder" in its footer. Ctrl-C twice quits.
+wait 90000 Before Neuron works here
+wait 30000 Allow Neuron in this folder
+wait 30000 Esc to quit
+dump trust-screen
+sleep 500
+send \e[B
+sleep 300
+send \e[A
+sleep 300
+type 1
+wait 60000 Enter a coding task
+gone 10000 Before Neuron works here
+wait 60000 claude-opus-4-6
+gone 10000 untrusted folder
+dump chat-after-trust
+sleep 500
+send \x03
+sleep 800
+send \x03
+exit 30000

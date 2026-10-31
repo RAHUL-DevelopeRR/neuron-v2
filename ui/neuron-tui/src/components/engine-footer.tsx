@@ -87,18 +87,28 @@ export interface LiveTokens {
   output: number
 }
 
+/**
+ * The model as the footer names it: `auto → <model>` once `auto` (or a
+ * failover) has had an answer from a model other than the one selected.
+ */
+export function footerModel(status: StatusEvent): string {
+  const served = status.served_model
+  return served && served !== status.model ? `${status.model} → ${served}` : status.model
+}
+
 export function footerParts(
   status: StatusEvent | null,
   usage: EngineStoreState['usage'],
   live: LiveTokens | null = null,
 ): FooterPart[] {
   if (!status) return []
+  const model = footerModel(status)
   const parts: FooterPart[] = [
     {
-      text: status.model,
+      text: model,
       tone: 'normal',
       priority: PRIORITY.model,
-      minWidth: Math.min(status.model.length, MODEL_MIN_WIDTH),
+      minWidth: Math.min(model.length, MODEL_MIN_WIDTH),
     },
   ]
   parts.push({

@@ -30,6 +30,25 @@ pub struct ManagedSessionSummary {
     pub message_count: usize,
     pub parent_session_id: Option<String>,
     pub branch_name: Option<String>,
+    /// The first prompt, on one line and shortened.
+    pub title: Option<String>,
+    pub model: Option<String>,
+}
+
+impl From<runtime::session_control::ManagedSessionSummary> for ManagedSessionSummary {
+    fn from(session: runtime::session_control::ManagedSessionSummary) -> Self {
+        Self {
+            id: session.id,
+            path: session.path,
+            updated_at_ms: session.updated_at_ms,
+            modified_epoch_millis: session.modified_epoch_millis,
+            message_count: session.message_count,
+            parent_session_id: session.parent_session_id,
+            branch_name: session.branch_name,
+            title: session.title,
+            model: session.model,
+        }
+    }
 }
 
 pub fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -52,7 +71,9 @@ pub fn new_cli_session() -> Result<Session, Box<dyn std::error::Error>> {
 pub fn create_managed_session_handle(
     session_id: &str,
 ) -> Result<SessionHandle, Box<dyn std::error::Error>> {
-    let handle = current_session_store()?.create_handle(session_id);
+    let store = current_session_store()?;
+    crate::session_presence::record_project(store.workspace_root());
+    let handle = store.create_handle(session_id);
     Ok(SessionHandle {
         id: handle.id,
         path: handle.path,
@@ -91,15 +112,7 @@ pub fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std
         .list_sessions()
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?
         .into_iter()
-        .map(|session| ManagedSessionSummary {
-            id: session.id,
-            path: session.path,
-            updated_at_ms: session.updated_at_ms,
-            modified_epoch_millis: session.modified_epoch_millis,
-            message_count: session.message_count,
-            parent_session_id: session.parent_session_id,
-            branch_name: session.branch_name,
-        })
+        .map(ManagedSessionSummary::from)
         .collect())
 }
 
@@ -125,15 +138,7 @@ pub fn latest_managed_session() -> Result<ManagedSessionSummary, Box<dyn std::er
     let session = current_session_store()?
         .latest_session()
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
-    Ok(ManagedSessionSummary {
-        id: session.id,
-        path: session.path,
-        updated_at_ms: session.updated_at_ms,
-        modified_epoch_millis: session.modified_epoch_millis,
-        message_count: session.message_count,
-        parent_session_id: session.parent_session_id,
-        branch_name: session.branch_name,
-    })
+    Ok(session.into())
 }
 
 pub fn load_session_reference(

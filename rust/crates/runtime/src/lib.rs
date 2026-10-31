@@ -52,6 +52,8 @@ pub mod sensitive_paths;
 mod session;
 pub mod session_control;
 pub use session_control::SessionStore;
+pub mod experience;
+pub mod project_checks;
 mod sse;
 pub mod stale_base;
 pub mod stale_branch;
@@ -59,6 +61,7 @@ pub mod summary_compression;
 pub mod task_packet;
 pub mod task_registry;
 pub mod team_cron_registry;
+pub mod tool_input;
 pub mod transcript;
 #[cfg(test)]
 mod trust_resolver;
@@ -85,10 +88,11 @@ pub use config::{
     ConfigEntry, ConfigError, ConfigLoader, ConfigSource, IgnoredProjectSettings,
     McpConfigCollection, McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig,
     McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
-    McpWebSocketServerConfig, OAuthConfig, ProjectSettingsAction, ProjectTrust,
-    ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
-    RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
-    CLAW_SETTINGS_SCHEMA_NAME, UNTRUSTED_WORKSPACE_KEYS,
+    McpWebSocketServerConfig, OAuthConfig, PreviewHook, PreviewMcpServer, PreviewPermissionRule,
+    ProjectSettingsAction, ProjectTrust, ProviderFallbackConfig, ResolvedPermissionMode,
+    RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig, RuntimePermissionRuleConfig,
+    RuntimePluginConfig, ScopedMcpServerConfig, WorkspaceTrustPreview, CLAW_SETTINGS_SCHEMA_NAME,
+    UNTRUSTED_WORKSPACE_KEYS,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
@@ -97,11 +101,12 @@ pub use config_validate::{
 pub use conversation::{
     auto_compaction_threshold_from_env, auto_compaction_threshold_override_from_env,
     is_refusal_stop_reason, is_truncation_stop_reason, is_turn_end_note, resolve_max_iterations,
-    ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime,
-    PromptCacheEvent, RuntimeError, RuntimeErrorKind, StaticToolExecutor, ToolError, ToolExecutor,
-    TurnOutcome, TurnSummary, DEFAULT_MAX_ITERATIONS, FAILED_RESPONSE_NOTE_PREFIX,
-    INTERRUPTED_RESPONSE_NOTE, INTERRUPTED_TOOL_RESULT, MAX_ITERATIONS_ENV_VAR,
-    REFUSAL_STOP_REASON,
+    ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent, ChangeReviewer,
+    ConversationRuntime, HarnessConfig, PromptCacheEvent, ReviewRequest, RuntimeError,
+    RuntimeErrorKind, StaticToolExecutor, ToolError, ToolExecutor, TurnOutcome, TurnSummary,
+    AUTO_CHECKS_ENV_VAR, COMPLETION_CHECK_ENV_VAR, DEFAULT_MAX_ITERATIONS,
+    FAILED_RESPONSE_NOTE_PREFIX, INTERRUPTED_RESPONSE_NOTE, INTERRUPTED_TOOL_RESULT,
+    MAX_ITERATIONS_ENV_VAR, REFUSAL_STOP_REASON,
 };
 pub use file_ops::{
     display_path, edit_file, edit_file_in_workspace, glob_search, grep_search,

@@ -1,10 +1,13 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
-// commands are Neuron's (engine commands are forwarded), /bash is not
-// listed while shell commands are not implemented (USER_SHELL_AVAILABLE),
-// and the git commands only when the engine has their feature.
+// commands are Neuron's (engine commands are forwarded), /bash is not listed
+// while shell commands are not implemented (USER_SHELL_AVAILABLE), and nor are
+// the /mode:* commands (AGENT_MODES_AVAILABLE) or /image while images don't
+// reach the model (IMAGES_REACH_THE_MODEL); the git commands are listed only
+// when the engine has their feature.
 // See ui/neuron-tui/PORTING.md.
+import { IMAGES_REACH_THE_MODEL } from '../engine/attachments'
 import { FEATURE_CHECKPOINTS, FEATURE_GIT_VIEWS } from '../engine/protocol'
-import { AGENT_MODES } from '../utils/constants'
+import { AGENT_MODES, AGENT_MODES_AVAILABLE } from '../utils/constants'
 import { USER_SHELL_AVAILABLE } from '../utils/user-shell'
 
 import type { SkillsMap } from '@neuron-tui/common/types/skill'
@@ -34,7 +37,7 @@ export interface SlashCommand {
 }
 
 // Generate mode commands from the AGENT_MODES constant
-const MODE_COMMANDS: SlashCommand[] = AGENT_MODES.map((mode) => ({
+const MODE_COMMANDS: SlashCommand[] = (AGENT_MODES_AVAILABLE ? AGENT_MODES : []).map((mode) => ({
   id: `mode:${mode.toLowerCase()}`,
   label: `mode:${mode.toLowerCase()}`,
   description: `Switch to ${mode} mode`,
@@ -121,12 +124,16 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
         },
       ]
     : []),
-  {
-    id: 'image',
-    label: 'image',
-    description: 'Attach an image file (or Ctrl+V to paste from clipboard)',
-    aliases: ['img', 'attach'],
-  },
+  ...(IMAGES_REACH_THE_MODEL
+    ? [
+        {
+          id: 'image',
+          label: 'image',
+          description: 'Attach an image file (or Ctrl+V to paste from clipboard)',
+          aliases: ['img', 'attach'],
+        },
+      ]
+    : []),
   {
     id: 'model',
     label: 'model',
@@ -157,6 +164,31 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
     engineCommand: true,
     description: 'Token usage for this session',
   },
+  // These four answer with a report panel (report-panel.tsx).
+  {
+    id: 'usage',
+    label: 'usage',
+    engineCommand: true,
+    description: "Today's requests and tokens against your plan, and when they reset",
+  },
+  {
+    id: 'init',
+    label: 'init',
+    engineCommand: true,
+    description: 'Create a starter NEURON.md for this project',
+  },
+  {
+    id: 'memory',
+    label: 'memory',
+    engineCommand: true,
+    description: 'Show the instruction files Neuron loaded',
+  },
+  {
+    id: 'doctor',
+    label: 'doctor',
+    engineCommand: true,
+    description: "Check Neuron's setup in this folder",
+  },
   {
     id: 'context',
     label: 'context',
@@ -176,6 +208,11 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
     description: 'Show or change the permission mode',
   },
   ...MODE_COMMANDS,
+  {
+    id: 'upgrade',
+    label: 'upgrade',
+    description: 'Plans and pricing (opens zero-x.live/pricing)',
+  },
   {
     id: 'theme:toggle',
     label: 'theme:toggle',

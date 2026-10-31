@@ -6,20 +6,25 @@ import type { QuestionTarget } from '../engine/questions'
 import type {
   ModelsEvent,
   PermissionRequestedEvent,
+  ReportEvent,
   SignInCodeEvent,
   StatusEvent,
+  TrustPreviewEvent,
   UsageEvent,
 } from '../engine/protocol'
 
 /**
  * What the engine has told the UI outside a turn's transcript: whether it is
  * running, its footer status, the model list, token usage, the permission
- * requests waiting for an answer, and an AskUserQuestion it is waiting on.
+ * requests waiting for an answer, an AskUserQuestion it is waiting on, what
+ * trusting the folder would turn on, and the report a command showed.
  */
 export interface EngineStoreState {
   connection: EngineConnection
   /** Neuron version from `ready`. */
   version: string | null
+  /** What the engine adds to protocol 1 (`ready.features`, `FEATURE_*`). */
+  features: string[]
   /** Why the engine is not running, after it failed to start or stopped. */
   error: string | null
   /**
@@ -47,6 +52,16 @@ export interface EngineStoreState {
    * the engine said the sign-in worked and is opening the session.
    */
   signIn: (SignInCodeEvent & { receivedAt: number; approved: boolean }) | null
+  /**
+   * Why the last `/login` could not start: Zero-X was unreachable, does not
+   * offer device sign-in, or answered with a server error (the engine's
+   * message). Cleared when a sign-in code arrives or the session is signed in.
+   */
+  signInProblem: string | null
+  /** What trusting the folder would turn on, for the trust screen (`trust_preview`). */
+  trustPreview: TrustPreviewEvent | null
+  /** The report panel's content (`/usage`, `/init`, `/memory`, `/doctor`), while it is open. */
+  report: ReportEvent | null
 
   /** `errorInChat`: the chat already shows `error` (see {@link EngineStoreState.errorInChat}). */
   setConnection: (
@@ -54,7 +69,7 @@ export interface EngineStoreState {
     error?: string | null,
     errorInChat?: boolean,
   ) => void
-  setReady: (version: string) => void
+  setReady: (version: string, features?: string[]) => void
   setStatus: (status: StatusEvent) => void
   setModels: (models: ModelsEvent) => void
   setUsage: (usage: UsageEvent) => void
@@ -66,8 +81,16 @@ export interface EngineStoreState {
   setPendingQuestion: (question: string | null) => void
   setPendingQuestionTarget: (target: QuestionTarget | null) => void
   setSignIn: (code: SignInCodeEvent | null, receivedAt?: number) => void
+  setSignInProblem: (problem: string | null) => void
   markSignInApproved: () => void
+  setTrustPreview: (preview: TrustPreviewEvent | null) => void
+  setReport: (report: ReportEvent | null) => void
   reset: () => void
+}
+
+/** The engine sent `feature` in `ready.features`. */
+export function hasEngineFeature(state: Pick<EngineStoreState, 'features'>, feature: string): boolean {
+  return state.features.includes(feature)
 }
 
 /**
@@ -85,6 +108,7 @@ export function needsSignIn(status: StatusEvent | null): boolean {
 const initial = {
   connection: 'not_started' as EngineConnection,
   version: null,
+  features: [] as string[],
   error: null,
   errorInChat: false,
   status: null,
@@ -94,6 +118,9 @@ const initial = {
   pendingQuestion: null,
   pendingQuestionTarget: null,
   signIn: null,
+  signInProblem: null,
+  trustPreview: null as TrustPreviewEvent | null,
+  report: null as ReportEvent | null,
 }
 
 export const useEngineStore = create<EngineStoreState>()(
@@ -113,16 +140,18 @@ export const useEngineStore = create<EngineStoreState>()(
           state.signIn = null
         }
       }),
-    setReady: (version) =>
+    setReady: (version, features = []) =>
       set((state) => {
         state.connection = 'ready'
         state.version = version
+        state.features = features
         state.error = null
         state.errorInChat = false
       }),
     setStatus: (status) =>
       set((state) => {
         state.status = status
+        if (!needsSignIn(status)) state.signInProblem = null
       }),
     setModels: (models) =>
       set((state) => {
@@ -160,10 +189,23 @@ export const useEngineStore = create<EngineStoreState>()(
     setSignIn: (code, receivedAt = Date.now()) =>
       set((state) => {
         state.signIn = code ? { ...code, receivedAt, approved: false } : null
+        if (code) state.signInProblem = null
+      }),
+    setSignInProblem: (problem) =>
+      set((state) => {
+        state.signInProblem = problem
       }),
     markSignInApproved: () =>
       set((state) => {
         if (state.signIn) state.signIn.approved = true
+      }),
+    setTrustPreview: (preview) =>
+      set((state) => {
+        state.trustPreview = preview
+      }),
+    setReport: (report) =>
+      set((state) => {
+        state.report = report
       }),
     reset: () => set(() => ({ ...initial })),
   })),

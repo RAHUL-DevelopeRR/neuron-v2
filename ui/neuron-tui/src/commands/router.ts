@@ -1,7 +1,8 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: prompts
 // and slash commands the UI does not have go to the engine, and a `!cmd`
 // prompt is a shell command only when shell commands are implemented
-// (USER_SHELL_AVAILABLE); until then it goes to the agent like any prompt.
+// (USER_SHELL_AVAILABLE); until then it goes to the agent like any prompt. A
+// `/login` that could not reach Zero-X sets the sign-in panel's state for it.
 // An answer to the agent's question drawn as a chat line is marked as one,
 // and it and the echo of a failed image path as not sent to the engine, so a
 // rewind does not count them as prompts. Enter on an empty input brings up a
@@ -18,7 +19,7 @@ import {
   buildPlanPrompt,
   buildReviewPrompt,
 } from './prompt-builders'
-import { whenEngineStarted } from '../engine/engine-session'
+import { runEngineLogin, whenEngineStarted } from '../engine/engine-session'
 import { revealDeferredGitPanel } from '../engine/git-views'
 import { getNeuronEngineClient, runExchange } from '../engine/neuron-engine-client'
 import { withQuestionAnswer } from '../engine/questions'
@@ -250,6 +251,9 @@ export async function routeUserPrompt(
   if (!trimmed && !hasAttachments && inputMode === 'default' && revealDeferredGitPanel()) return
   if (!trimmed && !hasAttachments && inputMode !== 'skill') return
 
+  // A report panel closes once the next prompt or command is sent.
+  if (inputMode === 'report') setInputMode('default')
+
   // Handle bash mode commands
   if (inputMode === 'bash') {
     const commandWithBang = '!' + trimmed
@@ -411,7 +415,11 @@ export async function routeUserPrompt(
   if (isSlashCommand(trimmed) && engineReady) {
     const [command = '', ...args] = trimmed.slice(1).trim().split(/\s+/)
     setMessages((prev) => [...prev, getUserMessage(trimmed)])
-    runExchange(engine, () => engine.slash(command, args.join(' ')), () => {})
+    const exchange =
+      command.toLowerCase() === 'login'
+        ? runEngineLogin(engine)
+        : runExchange(engine, () => engine.slash(command, args.join(' ')), () => {})
+    exchange
       .then(() => {
         // The engine's report has no account and no folder trust: the UI
         // adds them from the engine's status (engine/status-report.ts).

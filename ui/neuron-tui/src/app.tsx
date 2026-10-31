@@ -1,7 +1,10 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
 // Codebuff login modal and auth queries, BYOK selection, and the Freebuff
 // model catalog and session gate are gone. Sign-in comes from the engine (P3).
-// See ui/neuron-tui/PORTING.md.
+// A chat resumed from history resumes its engine session, a new chat clears the
+// engine's conversation, and the git-root banner never offers the home folder
+// or a folder above it. Before the chat come onboarding's sign-in and the
+// folder trust screen (StartGate). See ui/neuron-tui/PORTING.md.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useShallow } from 'zustand/react/shallow'
 
@@ -9,7 +12,14 @@ import { Chat } from './chat'
 import { ChatHistoryScreen } from './components/chat-history-screen'
 import { ChatRuntimeProvider } from './contexts/chat-runtime-context'
 import { ProjectPickerScreen } from './components/project-picker-screen'
+import { StartGate } from './components/start-gate'
+import {
+  clearEngineConversation,
+  resumeEngineSessionForChat,
+} from './engine/engine-session'
 import { useTerminalFocus } from './hooks/use-terminal-focus'
+import { isAtOrAboveHome } from './utils/project-picker'
+import { resumeSessionFor } from './utils/run-state-storage'
 import { getProjectRoot, startNewChat } from './project-files'
 import { useChatHistoryStore } from './state/chat-history-store'
 import { stopActiveRun } from './utils/active-run'
@@ -86,7 +96,9 @@ export const App = ({
     () => findGitRoot({ cwd: projectRoot }),
     [projectRoot],
   )
-  const showGitRootBanner = Boolean(gitRoot && gitRoot !== projectRoot)
+  const showGitRootBanner = Boolean(
+    gitRoot && gitRoot !== projectRoot && !isAtOrAboveHome(gitRoot),
+  )
   const [gitRootBannerDismissed, setGitRootBannerDismissed] = useState(false)
   const prevTopBannerRef = useRef<TopBannerType | null>(null)
 
@@ -146,6 +158,8 @@ export const App = ({
       closeChatHistory()
       // Reset chat store to clear previous messages before loading the selected chat
       resetChatStore()
+      // The engine resumes the chat's own session, not just the transcript.
+      void resumeEngineSessionForChat(resumeSessionFor(chatId))
       setResumeChatId(chatId)
       setContinueRequested(true)
     },
@@ -159,6 +173,8 @@ export const App = ({
     // Rotate the chat id so the new conversation saves to its own directory
     // instead of overwriting the current (possibly resumed) chat's history
     startNewChat()
+    // And the engine starts a fresh conversation too.
+    void clearEngineConversation()
     setResumeChatId(null)
     setContinueRequested(false)
   }, [closeChatHistory, resetChatStore])
@@ -178,23 +194,26 @@ export const App = ({
   }
 
   // Reset the runtime only when the active chat identity changes. View-only
-  // routes such as history and session gates keep the same key.
+  // routes such as history and session gates keep the same key. Onboarding's
+  // sign-in and the trust screen come first, while they apply.
   return (
-    <AuthedSurface
-      runtimeKey={chatSessionId}
-      consumeInitialPrompt={consumeInitialPrompt}
-      fileTree={fileTree}
-      inputRef={inputRef}
-      continueChat={effectiveContinueChat}
-      continueChatId={effectiveContinueChatId}
-      initialMode={initialMode}
-      gitRoot={gitRoot}
-      onSwitchToGitRoot={handleSwitchToGitRoot}
-      showChatHistory={showChatHistory}
-      onSelectChat={handleResumeChat}
-      onCancelChatHistory={closeChatHistory}
-      onNewChat={handleNewChat}
-    />
+    <StartGate>
+      <AuthedSurface
+        runtimeKey={chatSessionId}
+        consumeInitialPrompt={consumeInitialPrompt}
+        fileTree={fileTree}
+        inputRef={inputRef}
+        continueChat={effectiveContinueChat}
+        continueChatId={effectiveContinueChatId}
+        initialMode={initialMode}
+        gitRoot={gitRoot}
+        onSwitchToGitRoot={handleSwitchToGitRoot}
+        showChatHistory={showChatHistory}
+        onSelectChat={handleResumeChat}
+        onCancelChatHistory={closeChatHistory}
+        onNewChat={handleNewChat}
+      />
+    </StartGate>
   )
 }
 

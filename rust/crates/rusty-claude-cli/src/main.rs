@@ -52,7 +52,11 @@ mod credentials;
 mod device_login;
 mod doctor;
 mod engine;
+mod engine_account;
+mod engine_reports;
 mod engine_stdio;
+mod engine_trust;
+mod error_detail;
 mod executor;
 mod full_screen;
 mod gateway_catalog;
@@ -72,6 +76,7 @@ mod repl_loop;
 mod repo_map;
 mod reports;
 mod session_mgmt;
+mod session_presence;
 mod shell_pty;
 mod source_control;
 mod status_ui;
@@ -79,6 +84,7 @@ mod stream_buffer;
 mod token_budget;
 mod tool_input_preview;
 mod tool_ui;
+mod trust_menu;
 mod turn_sink;
 mod vault;
 mod workspace_changes;
@@ -555,8 +561,8 @@ fn run_prompt(
     // Workspace trust check (skip when stdin is piped so we don't consume the pipe)
     if runtime::ui_hooks::stdin_is_terminal() {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        if !crate::auth::check_trust(&cwd) {
-            std::process::exit(1);
+        if let Some(code) = crate::auth::check_trust(&cwd).exit_code() {
+            std::process::exit(code);
         }
     }
     let permission_mode = crate::args::permission_mode_after_trust(options.permission_mode);
@@ -3137,10 +3143,13 @@ impl LiveCli {
                 "model": shown_model(&self.model),
                 // What `--resume` takes to continue this session.
                 "session_id": self.session.id,
+                // The model that answered last (`auto` and failover can differ).
+                "served_model": summary.served_model,
                 "iterations": summary.iterations,
                 "outcome": repl_loop::turn_outcome_label(&summary.outcome),
                 "stop_reason": summary.stop_reason,
                 "refusal": refusal_json(&summary.outcome),
+                "completion_checked": summary.completion_checked,
                 "auto_compaction": summary.auto_compaction.map(|event| json!({
                     "removed_messages": event.removed_message_count,
                     "notice": format_auto_compaction_notice(event.removed_message_count),

@@ -468,6 +468,8 @@ fn assemble_conversation_runtime(
         ),
         runtime::context_manager::ContextPolicy::from_env(),
     );
+    let harness = runtime::HarnessConfig::from_env().with_model(model.clone());
+    let reviewer = tools::SubagentReviewer::from_env(&model);
     register_subagent_parent(
         &model,
         permission_mode,
@@ -496,7 +498,11 @@ fn assemble_conversation_runtime(
         &feature_config,
     )
     .with_context_manager(context_manager)
-    .with_max_iterations(runtime::resolve_max_iterations(max_iterations_setting));
+    .with_max_iterations(runtime::resolve_max_iterations(max_iterations_setting))
+    .with_harness_config(harness);
+    if let Some(reviewer) = reviewer {
+        runtime = runtime.with_change_reviewer(Box::new(reviewer));
+    }
     if output.is_visible() {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
@@ -536,11 +542,19 @@ fn subagent_parent_context_for(
     let factory: tools::SubagentClientFactory = Arc::new(|model: &str| {
         crate::api_client::build_provider_client(model, None).map_err(|error| error.to_string())
     });
+    // Sub-agents get the same map of the workspace as the main conversation.
+    let repo_map = crate::repo_map::RepoMap::build(&std::env::current_dir().unwrap_or_default());
+    let context_sections = if repo_map.total_files > 0 {
+        vec![repo_map.render()]
+    } else {
+        Vec::new()
+    };
     tools::SubagentParentContext {
         permission_rules: feature_config.permission_rules().clone(),
         hooks: feature_config.hooks().clone(),
         allowed_tools: allowed_tools.cloned(),
         client_factory: Some(factory),
+        context_sections,
         ..tools::SubagentParentContext::new(model, permission_mode)
     }
 }
@@ -781,6 +795,76 @@ fn shared_runtime_plugin_state_starting(
         let handle = shared.handle();
         *slot.borrow_mut() = Some(shared);
         Ok(handle)
+    })
+}
+
+/// What the MCP servers are doing now, as the shared state sees them.
+pub(crate) struct McpRuntimeView {
+    /// The servers still start in the background.
+    pub(crate) starting: bool,
+    /// Servers the manager runs (stdio).
+    pub(crate) running: Vec<String>,
+    /// Servers that failed, with why.
+    pub(crate) failed: Vec<(String, String)>,
+    /// Servers with a transport Neuron does not speak yet, with why.
+    pub(crate) unsupported: Vec<(String, String)>,
+    /// The discovered tools, as `mcp__<server>__<tool>`.
+    pub(crate) tools: Vec<String>,
+}
+
+/// The engine's live MCP servers and plugins, for a UI's extensions view.
+pub(crate) struct ExtensionsSnapshot {
+    pub(crate) mcp: Option<McpRuntimeView>,
+    pub(crate) plugins: Vec<plugins::PluginSummary>,
+}
+
+/// The shared state's MCP servers and plugins as they are now, taking servers that
+/// finished starting in the background. `None` before any runtime was built on this
+/// thread.
+pub(crate) fn extensions_snapshot() -> Option<ExtensionsSnapshot> {
+    SHARED_PLUGIN_STATE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let state = slot.as_mut()?;
+        state.adopt_started_mcp();
+        let mcp = state.mcp_state.as_ref().map(|mcp| {
+            let mcp = mcp
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Why each failed, where the start reported it; the background start
+            // names its failures without a reason.
+            let mut failed: Vec<(String, String)> = mcp
+                .degraded_report
+                .as_ref()
+                .map(|report| {
+                    report
+                        .failed_servers
+                        .iter()
+                        .map(|failed| (failed.server_name.clone(), failed.error.message.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for name in mcp.failed_server_names().unwrap_or_default() {
+                if !failed.iter().any(|(server, _)| *server == name) {
+                    failed.push((name, "could not start".to_string()));
+                }
+            }
+            McpRuntimeView {
+                starting: mcp.pending_servers().is_some(),
+                running: mcp.server_names(),
+                failed,
+                unsupported: mcp
+                    .manager
+                    .unsupported_servers()
+                    .iter()
+                    .map(|server| (server.server_name.clone(), server.reason.clone()))
+                    .collect(),
+                tools: state.tool_registry.runtime_tool_names(),
+            }
+        });
+        Some(ExtensionsSnapshot {
+            mcp,
+            plugins: state.plugin_registry.summaries(),
+        })
     })
 }
 

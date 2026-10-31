@@ -2,7 +2,10 @@
 // (and its `!` alias) is not registered while shell commands are not
 // implemented (USER_SHELL_AVAILABLE in utils/user-shell.ts), so "/bash" goes
 // to the engine like any command the UI does not have; the git commands
-// (git-view-commands.ts) are found only when the engine has their feature.
+// (git-view-commands.ts) are found only when the engine has their feature;
+// /new also starts the engine on a fresh conversation (`clear --confirm`), and
+// the /mode:* commands are not registered (AGENT_MODES_AVAILABLE); /upgrade
+// opens the plans page.
 // See ui/neuron-tui/PORTING.md.
 import { handleCopyConversationCommand } from './copy-conversation'
 import { handleExportConversationCommand } from './export-conversation'
@@ -16,13 +19,15 @@ import {
   buildSkillPrompt,
 } from './prompt-builders'
 import { runBashCommand } from './router'
-import { getNeuronEngineClient, runExchange } from '../engine/neuron-engine-client'
+import { getNeuronEngineClient } from '../engine/neuron-engine-client'
+import { clearEngineConversation } from '../engine/engine-session'
 import { useThemeStore } from '../hooks/use-theme'
 import { startNewChat } from '../project-files'
 import { useChatStore } from '../state/chat-store'
 import { stopActiveRun } from '../utils/active-run'
-import { AGENT_MODES } from '../utils/constants'
+import { AGENT_MODES, AGENT_MODES_AVAILABLE } from '../utils/constants'
 import { exitCliCleanly } from '../utils/exit-cleanly'
+import { safeOpen } from '../utils/open-url'
 import { getSystemMessage, getUserMessage } from '../utils/message-history'
 import { capturePendingAttachments } from '../utils/pending-attachments'
 import { getSkillByName } from '../utils/skill-registry'
@@ -33,6 +38,9 @@ import type { InputValue, PendingAttachment } from '../types/store'
 import type { ChatMessage } from '../types/chat'
 import type { SendMessageFn } from '../types/contracts/send-message'
 import type { AgentMode } from '../utils/constants'
+
+/** Where `/upgrade` sends you. */
+export const PRICING_URL = 'https://zero-x.live/pricing'
 
 export type RouterParams = {
   agentMode: AgentMode
@@ -246,12 +254,7 @@ const ALL_COMMANDS: CommandDefinition[] = [
       params.clearMessages()
       startNewChat()
       // The engine keeps its own conversation: clear it too.
-      const engine = getNeuronEngineClient()
-      if (engine.connection === 'ready') {
-        runExchange(engine, () => engine.slash('clear', ''), () => {}).catch(
-          () => undefined,
-        )
-      }
+      void clearEngineConversation()
       params.saveToHistory(params.inputValue.trim())
       clearInput(params)
       // If user provided a message, send it as the first message in the new chat
@@ -292,7 +295,7 @@ const ALL_COMMANDS: CommandDefinition[] = [
     },
   }),
   // Mode commands generated from AGENT_MODES
-  ...AGENT_MODES.map((mode) =>
+  ...(AGENT_MODES_AVAILABLE ? AGENT_MODES : []).map((mode) =>
     defineCommandWithArgs({
       name: `mode:${mode.toLowerCase()}`,
       aliases: [`model:${mode.toLowerCase()}`],
@@ -414,6 +417,27 @@ const ALL_COMMANDS: CommandDefinition[] = [
       params.saveToHistory(params.inputValue.trim())
       clearInput(params)
       return { openQueuePanel: true }
+    },
+  }),
+  defineCommand({
+    // The plans page; the engine has no full-screen /upgrade.
+    name: 'upgrade',
+    handler: (params) => {
+      const shown = params.inputValue.trim()
+      clearInput(params)
+      // NEURON_NO_BROWSER: show the link only, as the engine does for sign-in.
+      const open = process.env.NEURON_NO_BROWSER ? Promise.resolve(false) : safeOpen(PRICING_URL)
+      void open.then((opened) => {
+        params.setMessages((prev) => [
+          ...prev,
+          getUserMessage(shown),
+          getSystemMessage(
+            opened
+              ? `Opened ${PRICING_URL} in your browser.`
+              : `Plans and pricing: ${PRICING_URL}`,
+          ),
+        ])
+      })
     },
   }),
   defineCommand({

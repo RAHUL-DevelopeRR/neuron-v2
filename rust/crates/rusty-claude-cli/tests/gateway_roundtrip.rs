@@ -733,7 +733,8 @@ fn a_tool_call_cut_by_length_is_reported_not_run() {
                     .contains("NOT executed"),
                 "{result}"
             );
-            text_reply("I will write it in smaller steps.")
+            // A final answer: one that only announces a next step would be nudged to act.
+            text_reply("big.txt is too long for one reply, so it needs smaller steps.")
         }
     });
     let workspace = Workspace::new("cut-by-length");
@@ -754,7 +755,10 @@ fn a_tool_call_cut_by_length_is_reported_not_run() {
         "a call cut off by the output limit never runs"
     );
     let result = json_result(&output);
-    assert_eq!(result["message"], "I will write it in smaller steps.");
+    assert_eq!(
+        result["message"],
+        "big.txt is too long for one reply, so it needs smaller steps."
+    );
     let tool_results = result["tool_results"].as_array().expect("tool results");
     assert_eq!(tool_results.len(), 1, "{result}");
     assert_eq!(tool_results[0]["is_error"], true, "{result}");

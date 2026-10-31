@@ -7,7 +7,7 @@
 # is Enter, `<SLEEP>` waits 4 s, `<KILLENGINE>` kills the UI's engine and waits
 # for the UI to say it stopped, `<KILLUI>` kills the UI itself, `<ALIVE>` types
 # a probe and checks it shows up (the UI still reads the keyboard), then erases
-# it. -Shell powershell makes Windows PowerShell the window's shell, which runs
+# it, `<CHAT>` waits for the chat's input (after the trust screen). -Shell powershell makes Windows PowerShell the window's shell, which runs
 # the launch and then reads the next command itself (with PSReadLine), as after
 # `neuron` in a customer's PowerShell. -InputModeRestored checks the console's
 # input mode at the shell's prompt after the exit: no virtual-terminal input
@@ -18,8 +18,10 @@
 # -Direct runs `neuron <Mode>` itself in the window, as a customer's shell does,
 # against a mock service this script starts, instead of the dev script under
 # Bun (which turns on the console's escape-code processing first, and stays
-# attached to it); `bare` as the Mode means no arguments. Prints one
-# `RESULT pass|fail ...` line.
+# attached to it); `bare` as the Mode means no arguments. Its workspace is
+# trusted (NEURON_TRUST_WORKSPACE=1) unless -Untrusted, which brings the "Before
+# Neuron works here" screen first. -ExitCode checks what the launch exited
+# with. Prints one `RESULT pass|fail ...` line.
 param(
   [Parameter(Mandatory)] [string]$Work,
   [Parameter(Mandatory)] [string]$Bun,
@@ -35,7 +37,9 @@ param(
   # the window then ends in an interactive shell, whose output must show it ran.
   [string]$ShellGets = '',
   [ValidateSet('cmd', 'powershell')] [string]$Shell = 'cmd',
-  [switch]$InputModeRestored
+  [switch]$InputModeRestored,
+  [switch]$Untrusted,
+  [int]$ExitCode = -1
 )
 $ErrorActionPreference = 'Stop'
 Add-Type -Path (Join-Path $PSScriptRoot 'ConsoleKeys.cs')
@@ -88,6 +92,7 @@ if ($Direct) {
   $env:NEURON_TUI_BIN = $ui
   $env:ANTHROPIC_API_KEY = 'mock-service-key'
   $env:ANTHROPIC_BASE_URL = $base
+  if (-not $Untrusted) { $env:NEURON_TRUST_WORKSPACE = '1' }
   $arguments = if ($Mode -eq 'bare') { '' } else { $Mode }
   $launch = @("cd /d `"$workspace`"", "`"$neuron`" $arguments")
   $psLaunch = @("Set-Location -LiteralPath $(Quoted $workspace)", "& $(Quoted $neuron) $arguments")
@@ -188,6 +193,16 @@ try {
       Start-Sleep -Milliseconds 800
       continue
     }
+    if ($chunk -eq '<CHAT>') {
+      $chat = $false
+      for ($i = 0; $i -lt 120 -and -not $chat; $i++) {
+        Start-Sleep -Milliseconds 250
+        $chat = ([ConsoleKeys]::Screen($pid_)) -match 'Enter a coding task'
+      }
+      if (-not $chat) { $result = "fail: the chat did not come`n$([ConsoleKeys]::Screen($pid_))"; return }
+      Start-Sleep -Milliseconds 800
+      continue
+    }
     if ($chunk -eq '<KILLUI>') {
       $ui = [ConsoleKeys]::UiBelow($pid_)
       if (-not $ui) { $result = 'fail: no UI process to kill'; return }
@@ -243,6 +258,10 @@ try {
     return
   }
   if (-not (Test-Path $marker)) { $result = "fail: the UI did not exit`n$([ConsoleKeys]::Screen($pid_))"; return }
+  if ($ExitCode -ge 0) {
+    $exited = if ((Get-Content -Raw $marker) -match 'exit\s+(-?\d+)') { [int]$Matches[1] } else { $null }
+    if ($exited -ne $ExitCode) { $result = "fail: the launch exited with $exited, not $ExitCode`n$([ConsoleKeys]::Screen($pid_))"; return }
+  }
   for ($i = 0; $i -lt 20 -and -not (([ConsoleKeys]::Screen($pid_)) -match 'AFTER_THE_UI'); $i++) { Start-Sleep -Milliseconds 250 }
   $after = [ConsoleKeys]::Screen($pid_)
   if ($NoEscapes -and $after.Contains($escape)) { $result = "fail: escape codes show as text`n$after"; return }
