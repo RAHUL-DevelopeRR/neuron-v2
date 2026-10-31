@@ -2607,7 +2607,12 @@ mod tests {
             OriginalState::ChangedByShell(FileChange::Created)
         );
         assert_eq!(files[3].original, OriginalState::Missing);
-        assert_eq!(store.file_path("src/new.rs"), new);
+        // The store keeps the workspace root resolved (a long Windows name for
+        // `RUNNER~1`, `/private/var` for `/var` on macOS): compare the files.
+        assert_eq!(
+            fs::canonicalize(store.file_path("src/new.rs")).expect("resolved"),
+            fs::canonicalize(&new).expect("resolved")
+        );
         assert_eq!(store.saved_contents("not-a-hash"), None);
     }
 
