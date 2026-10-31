@@ -59,6 +59,16 @@ export interface LiveTurnState {
   todos: TodoItem[] | null
   /** The list changed during the running turn. */
   todosThisTurn: boolean
+  /**
+   * The engine reports the list in `todos` events (engines with
+   * `live_progress`): a `TodoWrite` call's input is not read then.
+   */
+  todosFromEvents: boolean
+  /**
+   * The lists of `TodoWrite` calls that started and have no result yet (older
+   * engines): one becomes the list only when its call worked.
+   */
+  pendingTodoWrites: { id: string; todos: TodoItem[] }[]
 }
 
 export const INITIAL_LIVE_TURN: LiveTurnState = {
@@ -74,6 +84,8 @@ export const INITIAL_LIVE_TURN: LiveTurnState = {
   unsettledOutput: 0,
   todos: null,
   todosThisTurn: false,
+  todosFromEvents: false,
+  pendingTodoWrites: [],
 }
 
 export const useLiveTurnStore = create<LiveTurnState>()(() => ({

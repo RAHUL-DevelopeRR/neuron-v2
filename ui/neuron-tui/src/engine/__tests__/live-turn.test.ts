@@ -12,6 +12,7 @@ import {
   inputSizeDetail,
   liveFooterTokens,
   liveOutputTokens,
+  noteEngineFeatures,
   setLiveTurnClockForTesting,
   startLiveTurn,
   targetOfToolInput,
@@ -371,28 +372,76 @@ describe('an older engine (no features, no progress events)', () => {
     expect(liveOutputTokens(live())).toBe(0)
   })
 
-  test('TodoWrite still feeds the task list', () => {
+  const PLAN_INPUT = JSON.stringify({
+    todos: [
+      { content: 'Read the code', activeForm: 'Reading the code', status: 'completed' },
+      { content: 'Fix the bug', activeForm: 'Fixing the bug', status: 'in_progress' },
+      { content: 'Run the tests', activeForm: 'Running the tests', status: 'pending' },
+    ],
+  })
+  const PLAN = [
+    { task: 'Read the code', completed: true, status: 'completed', activeForm: 'Reading the code' },
+    { task: 'Fix the bug', completed: false, status: 'in_progress', activeForm: 'Fixing the bug' },
+    { task: 'Run the tests', completed: false, status: 'pending', activeForm: 'Running the tests' },
+  ]
+  const todoWrite = (id: string, input: string, cutOff = false): UiEvent => ({
+    type: 'tool_call_started',
+    id,
+    name: 'TodoWrite',
+    input,
+    cut_off: cutOff,
+  })
+  const todoResult = (id: string, isError = false): UiEvent => ({
+    type: 'tool_result',
+    id,
+    name: 'TodoWrite',
+    output: isError ? 'denied' : '{"newTodos":[]}',
+    is_error: isError,
+  })
+
+  test('TodoWrite still feeds the task list, once it ran', () => {
     const { sink } = turnHarness()
-    sink.handle({
-      type: 'tool_call_started',
-      id: 'todo',
-      name: 'TodoWrite',
-      input: JSON.stringify({
-        todos: [
-          { content: 'Read the code', activeForm: 'Reading the code', status: 'completed' },
-          { content: 'Fix the bug', activeForm: 'Fixing the bug', status: 'in_progress' },
-          { content: 'Run the tests', activeForm: 'Running the tests', status: 'pending' },
-        ],
-      }),
-      cut_off: false,
-    })
-    expect(live().todosThisTurn).toBe(true)
-    expect(live().todos).toEqual([
-      { task: 'Read the code', completed: true, status: 'completed', activeForm: 'Reading the code' },
-      { task: 'Fix the bug', completed: false, status: 'in_progress', activeForm: 'Fixing the bug' },
-      { task: 'Run the tests', completed: false, status: 'pending', activeForm: 'Running the tests' },
-    ])
+    sink.handle(todoWrite('todo', PLAN_INPUT))
     expect(activity()).toMatchObject({ verb: 'Updating the todo list', target: null })
+    expect(live().todos).toBeNull()
+    sink.handle(todoResult('todo'))
+    expect(live().todosThisTurn).toBe(true)
+    expect(live().todos).toEqual(PLAN)
+  })
+
+  test('a cut-off, malformed, denied or failed TodoWrite keeps the list', () => {
+    const { sink } = turnHarness()
+    sink.handle(todoWrite('t1', PLAN_INPUT))
+    sink.handle(todoResult('t1'))
+    // Cut off by the output limit: never ran.
+    sink.handle(todoWrite('t2', JSON.stringify({ todos: [] }), true))
+    sink.handle(todoResult('t2', true))
+    // Truncated JSON, and todos that are not a list.
+    sink.handle(todoWrite('t3', '{"todos":[{"content":"Fi'))
+    sink.handle(todoResult('t3'))
+    sink.handle(todoWrite('t4', '{"todos":"none"}'))
+    sink.handle(todoResult('t4'))
+    // Denied.
+    sink.handle(todoWrite('t5', JSON.stringify({ todos: [] })))
+    sink.handle(todoResult('t5', true))
+    expect(live().todos).toEqual(PLAN)
+  })
+
+  test('an engine with live_progress reports its list in todos events only', () => {
+    noteEngineFeatures(['capabilities', 'live_progress'])
+    const { sink } = turnHarness()
+    sink.handle(todoWrite('t1', PLAN_INPUT))
+    sink.handle(todoResult('t1'))
+    expect(live().todos).toBeNull()
+    sink.handle({
+      type: 'todos',
+      items: [{ content: 'Fix the bug', status: 'in_progress', active_form: 'Fixing the bug' }],
+    })
+    expect(live().todos).toEqual([
+      { task: 'Fix the bug', completed: false, status: 'in_progress', activeForm: 'Fixing the bug' },
+    ])
+    noteEngineFeatures([])
+    expect(live().todosFromEvents).toBe(false)
   })
 })
 

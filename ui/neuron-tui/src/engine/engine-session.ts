@@ -18,6 +18,7 @@ import {
 } from '../utils/run-state-storage'
 import { afterConsoleCommand } from '../utils/console-guard'
 import { declareUiCapabilities } from './capabilities'
+import { noteEngineFeatures } from './live-turn'
 import {
   getNeuronEngineClient,
   setNeuronEngineClient,
@@ -206,6 +207,7 @@ export function handleEngineEvent(event: UiEvent): void {
       engine.setReady(event.version)
       // What this UI draws, for engines that ask (./capabilities.ts).
       declareUiCapabilities(getNeuronEngineClient(), event)
+      noteEngineFeatures(event.features ?? [])
       return
     case 'status':
       engine.setStatus(event)

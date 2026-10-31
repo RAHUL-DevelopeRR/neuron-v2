@@ -19,6 +19,7 @@ import {
 } from '../state/live-turn-store'
 import { formatElapsedTime } from '../utils/format-elapsed-time'
 import { toTodoStatus, type TodoItem } from '../utils/todos'
+import { FEATURE_LIVE_PROGRESS } from './protocol'
 import { displayPath, mapToolCall } from './tool-mapping'
 
 import type { TodoItem as EngineTodoItem, UiEvent } from './protocol'
@@ -87,8 +88,12 @@ export function todosFromEvent(items: EngineTodoItem[]): TodoItem[] {
   }))
 }
 
-/** A `TodoWrite` call's list, for engines without the `todos` event. */
+/**
+ * A `TodoWrite` call's list, for engines without the `todos` event; `null`
+ * when its input has no list (cut short, malformed).
+ */
 function todosFromToolInput(input: string): TodoItem[] | null {
+  if (!Array.isArray(parseObject(input)?.todos)) return null
   const todos = mapToolCall('TodoWrite', input).input.todos
   return Array.isArray(todos) ? (todos as TodoItem[]) : null
 }
@@ -127,7 +132,14 @@ const requestSent = (state: LiveTurnState, now: number): LiveTurnState => ({
 /** A turn starts: its first request is being sent. */
 export function startedLiveTurn(state: LiveTurnState, now: number): LiveTurnState {
   return requestSent(
-    { ...state, active: true, calls: [], turnOutput: 0, todosThisTurn: false },
+    {
+      ...state,
+      active: true,
+      calls: [],
+      turnOutput: 0,
+      todosThisTurn: false,
+      pendingTodoWrites: [],
+    },
     now,
   )
 }
@@ -142,6 +154,7 @@ export function endedLiveTurn(state: LiveTurnState): LiveTurnState {
     unsettledInput: state.unsettledInput,
     unsettledOutput: state.unsettledOutput,
     todos: state.todos,
+    todosFromEvents: state.todosFromEvents,
   }
 }
 
@@ -154,6 +167,20 @@ export function retriedLiveTurn(state: LiveTurnState, now: number): LiveTurnStat
     { ...state, calls: state.calls.filter((call) => call.phase !== 'input') },
     now,
   )
+}
+
+/** A TodoWrite result: its list becomes the agent's when the call worked. */
+function todoWriteEnded(
+  state: LiveTurnState,
+  result: Extract<UiEvent, { type: 'tool_result' }>,
+): Partial<LiveTurnState> {
+  const index = state.pendingTodoWrites.findIndex((write) =>
+    result.id ? write.id === result.id : result.name === 'TodoWrite',
+  )
+  if (index < 0) return {}
+  const pendingTodoWrites = state.pendingTodoWrites.filter((_, position) => position !== index)
+  if (result.is_error) return { pendingTodoWrites }
+  return { pendingTodoWrites, todos: state.pendingTodoWrites[index]!.todos, todosThisTurn: true }
 }
 
 /** The state after one engine event of the running turn, at `now`. */
@@ -191,8 +218,14 @@ export function reduceLiveTurn(
     case 'output_progress':
       return tokenArrived(state, now, { streamingOutput: event.output_tokens })
     case 'tool_call_started': {
-      const todos = event.name === 'TodoWrite' ? todosFromToolInput(event.input) : null
-      const withTodos = todos ? { todos, todosThisTurn: true } : {}
+      // Older engines: the list a TodoWrite call writes, for when it worked.
+      const todos =
+        event.name === 'TodoWrite' && !event.cut_off && !state.todosFromEvents
+          ? todosFromToolInput(event.input)
+          : null
+      const withTodos = todos
+        ? { pendingTodoWrites: [...state.pendingTodoWrites, { id: event.id, todos }] }
+        : {}
       // The response is complete (calls are reported once it ends): its
       // calls run now, or, cut off, never will.
       const calls = event.cut_off
@@ -213,7 +246,7 @@ export function reduceLiveTurn(
         : state.calls.findIndex((call) => call.name === event.name)
       const calls =
         index < 0 ? state.calls : state.calls.filter((_, position) => position !== index)
-      const next = { ...state, calls }
+      const next = { ...state, calls, ...todoWriteEnded(state, event) }
       // The last result goes back to the model in a new request.
       return calls.length === 0 ? requestSent(next, now) : next
     }
@@ -254,6 +287,14 @@ export function reduceLiveTurn(
 // ----------------------------------------------------------------- store
 
 let clock: () => number = Date.now
+
+/**
+ * The running engine's features (`ready`): one with `live_progress` reports
+ * the task list in `todos` events.
+ */
+export function noteEngineFeatures(features: readonly string[]): void {
+  useLiveTurnStore.setState({ todosFromEvents: features.includes(FEATURE_LIVE_PROGRESS) })
+}
 
 /** The live-turn clock (milliseconds); tests set their own. */
 export const liveTurnNow = (): number => clock()
