@@ -323,6 +323,29 @@ pub struct ConversationTruncation {
     pub prompt: Option<String>,
 }
 
+/// A file the agent changed in this session, with what it was before the session first
+/// changed it ([`CheckpointStore::session_files`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionFile {
+    /// Workspace-relative path with `/`, or an absolute path for files outside the
+    /// workspace.
+    pub path: String,
+    pub original: OriginalState,
+}
+
+/// What a file was before the session first changed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OriginalState {
+    /// Its contents were saved: [`CheckpointStore::saved_contents`] reads them.
+    Saved { hash: String, size: u64 },
+    /// It did not exist.
+    Missing,
+    /// A shell command changed it before any file tool saved it, so only how is known.
+    ChangedByShell(FileChange),
+    /// Never saved: outside the workspace, too large, unreadable or not a file.
+    Unknown,
+}
+
 /// The outcome of [`CheckpointStore::rewind`] or
 /// [`CheckpointStore::preview_rewind`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -618,6 +641,19 @@ impl SavedState {
         }
     }
 
+    fn original(&self) -> OriginalState {
+        match self {
+            Self::Present { hash, size, .. } => OriginalState::Saved {
+                hash: hash.clone(),
+                size: *size,
+            },
+            Self::Missing { .. } => OriginalState::Missing,
+            Self::TooLarge { .. } | Self::NotAFile | Self::Unreadable { .. } => {
+                OriginalState::Unknown
+            }
+        }
+    }
+
     fn outcome(&self, limit: u64) -> TrackOutcome {
         match self {
             Self::Present { .. } => TrackOutcome::Saved,
@@ -796,6 +832,70 @@ impl CheckpointStore {
     #[must_use]
     pub fn get(&self, id: u64) -> Option<CheckpointSummary> {
         self.records.get(&id).map(CheckpointRecord::summary)
+    }
+
+    /// Every file the session's checkpoints record a change to, sorted by path, with its
+    /// state before the first of them: the oldest saved copy, unless a shell command
+    /// changed the file before it was saved. Shell changes of a turn still open are
+    /// recorded, and listed, once it finishes.
+    #[must_use]
+    pub fn session_files(&self) -> Vec<SessionFile> {
+        let mut files: BTreeMap<String, SessionFile> = BTreeMap::new();
+        for record in self.records.values() {
+            for (key, saved) in &record.files {
+                let shell_change = find_shell_change(&record.shell_changes, key);
+                let original = match (saved.after_shell, shell_change) {
+                    (true, Some(change)) => OriginalState::ChangedByShell(change),
+                    _ => saved.state.original(),
+                };
+                files.entry(fold_key(key)).or_insert_with(|| SessionFile {
+                    path: key.clone(),
+                    original,
+                });
+            }
+            for (key, change) in &record.shell_changes {
+                files.entry(fold_key(key)).or_insert_with(|| SessionFile {
+                    path: key.clone(),
+                    original: OriginalState::ChangedByShell(*change),
+                });
+            }
+            for path in &record.outside_workspace {
+                files.entry(fold_key(path)).or_insert_with(|| SessionFile {
+                    path: path.clone(),
+                    original: OriginalState::Unknown,
+                });
+            }
+        }
+        let mut files = files.into_values().collect::<Vec<_>>();
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        files
+    }
+
+    /// The contents saved under `hash` ([`OriginalState::Saved`]), or `None` when that
+    /// copy is gone.
+    #[must_use]
+    pub fn saved_contents(&self, hash: &str) -> Option<Vec<u8>> {
+        if !valid_hash(hash) {
+            return None;
+        }
+        fs::read(self.object_path(hash)).ok()
+    }
+
+    /// Whether the file at `path` (as [`SessionFile::path`] gives it) now holds exactly
+    /// the contents saved under `hash`.
+    #[must_use]
+    pub fn matches_saved(&self, path: &str, hash: &str) -> bool {
+        hash_file(&self.file_path(path)).is_ok_and(|current| current == hash)
+    }
+
+    /// Where the file of [`SessionFile::path`] is on disk.
+    #[must_use]
+    pub fn file_path(&self, path: &str) -> PathBuf {
+        if Path::new(path).is_absolute() {
+            PathBuf::from(path)
+        } else {
+            key_path(&self.root, path)
+        }
     }
 
     /// Opens the checkpoint for a new user turn. Call it before the prompt is
@@ -1694,6 +1794,16 @@ fn find_saved<'a>(files: &'a BTreeMap<String, SavedFile>, key: &str) -> Option<&
     })
 }
 
+fn find_shell_change(changes: &BTreeMap<String, FileChange>, key: &str) -> Option<FileChange> {
+    changes.get(key).copied().or_else(|| {
+        let folded = fold_key(key);
+        changes
+            .iter()
+            .find(|(changed, _)| fold_key(changed) == folded)
+            .map(|(_, change)| *change)
+    })
+}
+
 /// The outermost folder on the way to `key` that does not exist yet.
 fn first_missing_dir(root: &Path, key: &str) -> Option<String> {
     let parts = key.split('/').collect::<Vec<_>>();
@@ -2445,6 +2555,60 @@ mod tests {
         assert!(report
             .to_string()
             .starts_with("Would go back to checkpoint #1"));
+    }
+
+    #[test]
+    fn checkpoints_list_the_session_files_with_their_state_before_the_session() {
+        let workspace = TempWorkspace::new("session-files");
+        let (a, b, new) = (
+            workspace.file("a.txt"),
+            workspace.file("b.txt"),
+            workspace.file("src/new.rs"),
+        );
+        write(&a, b"one\n");
+        write(&b, b"keep\n");
+        let mut session = Session::new();
+        let mut store = open(&workspace, &session);
+        agent_turn(
+            &mut store,
+            &mut session,
+            "first",
+            &[(&a, Some(b"two\n")), (&new, Some(b"fn new() {}\n"))],
+        );
+        open_turn(&mut store, &mut session, "second");
+        store.before_file_change(&a).expect("save a");
+        write(&a, b"three\n");
+        store.before_file_change(&b).expect("save b");
+        write(&b, b"keep\n");
+        store.before_shell_command("make").expect("shell");
+        write(&workspace.file("made.o"), b"object");
+        // Still open: the shell's changes are not known yet.
+        assert_eq!(store.session_files().len(), 3);
+        store.finish_turn().expect("finish");
+
+        let files = store.session_files();
+        let paths = files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, ["a.txt", "b.txt", "made.o", "src/new.rs"]);
+        let OriginalState::Saved { hash, size } = &files[0].original else {
+            panic!("a.txt was saved: {files:?}");
+        };
+        assert_eq!(*size, 4);
+        assert_eq!(store.saved_contents(hash).as_deref(), Some(&b"one\n"[..]));
+        assert!(!store.matches_saved("a.txt", hash));
+        let OriginalState::Saved { hash, .. } = &files[1].original else {
+            panic!("b.txt was saved: {files:?}");
+        };
+        assert!(store.matches_saved("b.txt", hash), "written back unchanged");
+        assert_eq!(
+            files[2].original,
+            OriginalState::ChangedByShell(FileChange::Created)
+        );
+        assert_eq!(files[3].original, OriginalState::Missing);
+        assert_eq!(store.file_path("src/new.rs"), new);
+        assert_eq!(store.saved_contents("not-a-hash"), None);
     }
 
     #[test]
