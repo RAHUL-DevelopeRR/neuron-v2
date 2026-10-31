@@ -7,6 +7,8 @@
  * their own name and the generic tool row.
  */
 
+import { toTodoStatus } from '../utils/todos'
+
 import type { ToolResultOutput } from '@neuron-tui/common/types/messages/content-part'
 
 export interface MappedToolCall {
@@ -113,9 +115,13 @@ export function mapToolCall(name: string, inputJson: string): MappedToolCall {
         input: {
           todos: todos.map((todo) => {
             const item = (todo ?? {}) as Record<string, unknown>
+            const activeForm = str(item.activeForm)
             return {
-              task: str(item.content) ?? str(item.activeForm) ?? '',
+              task: str(item.content) ?? activeForm ?? '',
               completed: item.status === 'completed',
+              // The current item is drawn apart, in its present tense.
+              status: toTodoStatus(item.status),
+              ...(activeForm && { activeForm }),
             }
           }),
         },
@@ -197,6 +203,21 @@ export function mapToolResult(
     return json({ stdout: output })
   }
 
+  if (name === 'Agent') {
+    // The sub-agent's final text, or how it ended without one, not its
+    // manifest. Its status and note reach the row from the turn
+    // (live-tool-blocks.ts).
+    const parsed = parseObject(output)
+    if (parsed) {
+      const shown =
+        str(parsed.result) ??
+        str(parsed.note) ??
+        str(parsed.error) ??
+        `Sub-agent ${str(parsed.status) ?? 'finished'}.`
+      return text(isError ? `Error: ${shown}` : shown)
+    }
+  }
+
   if (isError) return text(`Error: ${output}`)
   const parsed = parseObject(output)
   if (!parsed) return text(output)
@@ -207,8 +228,14 @@ export function mapToolResult(
       return json({
         message: parsed.type === 'create' ? `Created new file ${file}` : `Updated file ${file}`,
         file,
+        // What was written, for the row's summary; a diff when the engine
+        // sends one.
+        ...(typeof parsed.lines === 'number' && { lines: parsed.lines }),
+        ...(typeof parsed.bytes === 'number' && { bytes: parsed.bytes }),
+        ...(str(parsed.diff) && { unifiedDiff: parsed.diff }),
       })
     }
+
     case 'edit_file': {
       const file = displayPath(str(parsed.filePath) ?? '')
       return json({

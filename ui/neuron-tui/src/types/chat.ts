@@ -1,6 +1,7 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
 // sponsored-proposal block, inline-ad marker and per-message credits are
-// gone. See ui/neuron-tui/PORTING.md.
+// gone; a tool block can carry its input while the model writes it and a
+// sub-agent's progress. See ui/neuron-tui/PORTING.md.
 import type { ChatTheme } from './theme-system'
 import type { ToolName } from './agent-run'
 import type { ReactNode } from 'react'
@@ -53,10 +54,40 @@ export type ToolContentBlock = {
   exitCode?: number
   /** Why a command stopped otherwise: "timed out", "killed", "interrupted", "blocked: …". */
   stopReason?: string
+  /**
+   * The model is still writing this call's input (`tool_input_progress`):
+   * `input` is empty until the complete one arrives and replaces this.
+   */
+  liveInput?: ToolInputSoFar
+  /** An `Agent` call's sub-agent, as the engine reports it. */
+  subagent?: SubagentState
   agentId?: string
   includeToolCall?: boolean
   isCollapsed?: boolean
   userOpened?: boolean
+}
+/** How far the model got writing a tool call's input. */
+export type ToolInputSoFar = {
+  bytes: number
+  /** Lines of the call's main text: a file's content, an edit's new text, a command. */
+  lines: number
+  /** A path, command, pattern or URL, once written. */
+  target: string | null
+  /** The last lines of the main text so far. */
+  preview: string | null
+}
+/** A sub-agent an `Agent` call runs. */
+export type SubagentState = {
+  description: string
+  subagentType: string | null
+  /** `running` until it ends: `completed`, `failed`, or `running` in the background. */
+  status: string
+  finished: boolean
+  isError: boolean
+  /** Its final text, when it finished with one. */
+  result: string | null
+  /** Why it stopped early, or that it went on in the background. */
+  note: string | null
 }
 export type AgentContentBlock = {
   type: 'agent'

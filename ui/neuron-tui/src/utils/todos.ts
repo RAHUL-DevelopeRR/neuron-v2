@@ -1,6 +1,18 @@
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: an item
+// keeps the engine's status (`in_progress` too) and its present-tense form.
+// See ui/neuron-tui/PORTING.md.
 import type { ChatMessage } from '../types/chat'
 
-export type TodoItem = { task: string; completed: boolean }
+export type TodoStatus = 'pending' | 'in_progress' | 'completed'
+
+export type TodoItem = {
+  task: string
+  completed: boolean
+  /** The engine's status; absent from lists saved before it was kept. */
+  status?: TodoStatus
+  /** The item in the present tense ("Fixing the build"), while in progress. */
+  activeForm?: string
+}
 
 export function parseTodos(input: unknown): TodoItem[] | null {
   if (!input || typeof input !== 'object' || !('todos' in input)) return null
@@ -15,6 +27,15 @@ export function parseTodos(input: unknown): TodoItem[] | null {
   )
     ? todos
     : null
+}
+
+/** An item's status, also for lists that only say whether it is done. */
+export const todoStatusOf = (todo: TodoItem): TodoStatus =>
+  todo.status ?? (todo.completed ? 'completed' : 'pending')
+
+/** The engine's status word as a {@link TodoStatus} (unknown words are pending). */
+export function toTodoStatus(value: unknown): TodoStatus {
+  return value === 'completed' || value === 'in_progress' ? value : 'pending'
 }
 
 /** Each write replaces the whole list. Only inspect root tool blocks: a

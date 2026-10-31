@@ -7,6 +7,12 @@
  * are handled once, globally, by ./engine-session.ts. Two notices also change
  * the turn's message: an AskUserQuestion is drawn in it (./questions.ts), and
  * a retry of the model call drops what the failed attempt streamed.
+ *
+ * Every event also goes to the live view of the turn (./live-turn.ts): the
+ * status line, the todo strip and the footer's running totals. With
+ * `live_progress`, a tool call's row is drawn when the model names the tool
+ * and grows with its input (./live-tool-blocks.ts); its `tool_call_started`
+ * then completes that row instead of adding one.
  */
 
 import { useEngineStore } from '../state/engine-store'
@@ -19,6 +25,15 @@ import {
   type ToolResultWithStatus,
 } from '../utils/sdk-event-handlers'
 import { isRetryNotice } from './engine-session'
+import {
+  NO_INPUT_YET,
+  subagentFromResult,
+  withCompleteToolInput,
+  withSubagent,
+  withToolInputSoFar,
+  withoutToolBlocks,
+} from './live-tool-blocks'
+import { startLiveTurn } from './live-turn'
 import {
   QUESTION_PREFIX,
   engineQuestionBlock,
@@ -55,7 +70,13 @@ export interface TurnEventSink {
   finish(): void
 }
 
-type OpenCall = { id: string; name: string; toolName: string }
+type OpenCall = {
+  id: string
+  name: string
+  toolName: string
+  /** Drawn from `tool_input_started`: its complete input has not come yet. */
+  inputStreaming?: boolean
+}
 
 export interface TurnEventSinkOptions {
   /**
@@ -72,6 +93,7 @@ export function createTurnEventSink(
 ): TurnEventSink {
   const chunk = createStreamChunkHandler(state)
   const sdk = createEventHandler(state)
+  const live = startLiveTurn()
   // Results carry their call's id. Older engines named only the tool, so
   // without an id a result goes to the oldest open call of that tool, which is
   // the engine's order.
@@ -121,11 +143,71 @@ export function createTurnEventSink(
       .setPendingQuestionTarget({ messageId: state.message.aiMessageId, toolCallId })
   }
 
+  const drawing = () => state.isActive?.() !== false
+
+  /**
+   * A tool call is content too: the turn is no longer waiting for its first
+   * token, and a retry that was shown is over.
+   */
+  const toolActivity = () => {
+    if (!state.message.hasReceivedContentRef.current) {
+      state.message.hasReceivedContentRef.current = true
+      state.streaming.setStreamStatus('streaming')
+    }
+    state.setIsRetrying(false)
+  }
+
+  /**
+   * The call's row as soon as the model names the tool, with an empty input
+   * until the complete one arrives. One row per id: later events update it.
+   */
+  const drawStreamingCall = (id: string, name: string) => {
+    if (open.some((call) => call.id === id)) return
+    separateTextBlocks()
+    toolActivity()
+    const mapped = mapToolCall(name, '')
+    sdk({ type: 'tool_call', toolCallId: id, toolName: mapped.toolName, input: mapped.input })
+    updater.updateAiMessageBlocks((blocks) => withToolInputSoFar(blocks, id, NO_INPUT_YET))
+    open.push({ id, name, toolName: mapped.toolName, inputStreaming: true })
+  }
+
+  /**
+   * The engine sends the model call again. Calls whose input the failed
+   * attempt was still writing never ran and get no result: their rows go
+   * with the attempt's text.
+   */
+  const dropStreamingCalls = () => {
+    const dropped = new Set(
+      open.filter((call) => call.inputStreaming).map((call) => call.id),
+    )
+    if (dropped.size === 0) return
+    for (let index = open.length - 1; index >= 0; index--) {
+      if (dropped.has(open[index]!.id)) open.splice(index, 1)
+    }
+    updater.updateAiMessageBlocks((blocks) => withoutToolBlocks(blocks, dropped))
+    state.streaming.setStreamingAgents((prev) => {
+      const next = new Set(prev)
+      for (const id of dropped) next.delete(id)
+      return next
+    })
+  }
+
   const close = (call: OpenCall, output: string, isError: boolean) => {
+    const showSubagentEnd = () => {
+      if (call.name !== 'Agent') return
+      // The sub-agent as its result reports it (older engines send no
+      // sub-agent events), or the final text those events left out.
+      updater.updateAiMessageBlocks((blocks) =>
+        withSubagent(blocks, call.id, (previous) =>
+          subagentFromResult(output, isError, previous),
+        ),
+      )
+    }
     if (state.isActive?.() === false) {
       // The turn was interrupted: only its row is updated, nothing that
       // belongs to the run (streaming state, agents) any more.
       if (options.acceptLateToolResults?.()) {
+        showSubagentEnd()
         updater.updateAiMessageBlocks((blocks) =>
           updateToolBlockWithOutput(blocks, {
             toolCallId: call.id,
@@ -136,6 +218,7 @@ export function createTurnEventSink(
       }
       return
     }
+    showSubagentEnd()
     // `isError` reaches the tool block, so a refused write or a failed
     // command does not read like a success.
     const result: ToolResultWithStatus = {
@@ -150,6 +233,7 @@ export function createTurnEventSink(
 
   return {
     handle(event) {
+      live.track(event)
       switch (event.type) {
         case 'text_delta': {
           if (!event.text) return
@@ -191,22 +275,86 @@ export function createTurnEventSink(
             })
           }
           return
+        case 'tool_input_started':
+          if (!drawing()) return
+          drawStreamingCall(event.id, event.name)
+          return
+        case 'tool_input_progress': {
+          if (!drawing()) return
+          // Its row, also when the start was missed.
+          drawStreamingCall(event.id, event.name)
+          const { bytes, lines, target, preview } = event
+          updater.updateAiMessageBlocks((blocks) =>
+            withToolInputSoFar(blocks, event.id, { bytes, lines, target, preview }),
+          )
+          return
+        }
         case 'tool_call_started': {
           separateTextBlocks()
           const mapped = mapToolCall(event.name, event.input)
-          sdk({
-            type: 'tool_call',
-            toolCallId: event.id,
-            toolName: mapped.toolName,
-            input: mapped.input,
-          })
-          const call = { id: event.id, name: event.name, toolName: mapped.toolName }
-          if (event.cut_off) {
-            close(call, 'The output limit cut this call off, so it did not run.', true)
+          const streamed = open.find((call) => call.id === event.id && call.inputStreaming)
+          let call: OpenCall
+          if (streamed) {
+            // Its row is drawn: the complete input replaces what streamed.
+            streamed.inputStreaming = false
+            streamed.toolName = mapped.toolName
+            call = streamed
+            if (drawing()) {
+              toolActivity()
+              updater.updateAiMessageBlocks((blocks) =>
+                withCompleteToolInput(blocks, event.id, mapped.toolName, mapped.input),
+              )
+            }
           } else {
+            if (drawing()) toolActivity()
+            sdk({
+              type: 'tool_call',
+              toolCallId: event.id,
+              toolName: mapped.toolName,
+              input: mapped.input,
+            })
+            call = { id: event.id, name: event.name, toolName: mapped.toolName }
+          }
+          if (event.cut_off) {
+            if (streamed) open.splice(open.indexOf(streamed), 1)
+            close(call, 'The output limit cut this call off, so it did not run.', true)
+          } else if (!streamed) {
             open.push(call)
           }
           markAttemptStart()
+          return
+        }
+        case 'subagent_started': {
+          if (!drawing()) return
+          const { description, subagent_type: subagentType } = event
+          updater.updateAiMessageBlocks((blocks) =>
+            withSubagent(blocks, event.id, (previous) => ({
+              ...previous,
+              description,
+              subagentType,
+              status: 'running',
+              finished: false,
+              isError: false,
+              result: null,
+              note: null,
+            })),
+          )
+          return
+        }
+        case 'subagent_finished': {
+          if (!drawing() && !options.acceptLateToolResults?.()) return
+          const { status, is_error: isError, result, note } = event
+          updater.updateAiMessageBlocks((blocks) =>
+            withSubagent(blocks, event.id, (previous) => ({
+              description: previous?.description ?? '',
+              subagentType: previous?.subagentType ?? null,
+              status,
+              finished: true,
+              isError,
+              result,
+              note,
+            })),
+          )
           return
         }
         case 'tool_result': {
@@ -249,14 +397,23 @@ export function createTurnEventSink(
             updater.updateAiMessageBlocks((blocks) =>
               dropFailedAttempt(blocks, attemptStart),
             )
+            dropStreamingCalls()
+            // "retrying..." until the next attempt's first token.
+            state.setIsRetrying(true)
+            live.retry()
           }
           return
         }
+        case 'output_progress':
+          // Tokens flow again: a retry shown is over.
+          if (drawing()) state.setIsRetrying(false)
+          return
         default:
           return
       }
     },
     finish() {
+      live.end()
       // An interrupted turn's calls without a result were marked
       // "interrupted" when it stopped: they did not fail for want of one.
       const calls = open.splice(0)
