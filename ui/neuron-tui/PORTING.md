@@ -362,6 +362,14 @@ blocked.
 - These slash commands are the UI's own: `help`, `new`, `copy`, `export`,
   `bash`, `image`, `history`, `queue`, `todo`, `interview`, `plan`, `review`,
   `theme:toggle`, `exit`, `mode:*` and `skill:*`. Any other goes to the engine.
+- With an engine whose `ready.features` lists `git_views` (and `checkpoints`),
+  `/changes`, `/diff`, `/commit` and `/rewind` are the UI's too
+  (`commands/git-view-commands.ts`, `engine/git-views.ts`): a changed-files
+  line above the input, the `/changes` panel, diff cells in the chat (drawn
+  with Freebuff's `tools/diff-viewer.tsx`, unchanged), the commit card
+  (nothing is committed before Enter on it) and the rewind picker (checkpoint,
+  mode, dry-run preview, confirm). With an older engine they are not listed
+  and go to the engine as before.
 - Typecheck is clean, and `bun run test` gives 2,416 passing tests, 0 failures
   and 24 skipped.
 - `src/engine/__tests__/engine.integration.test.ts` passes 5 tests against the
