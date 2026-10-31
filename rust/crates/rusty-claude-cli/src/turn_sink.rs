@@ -7,7 +7,7 @@
 // the terminal.
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -19,9 +19,12 @@ use std::time::{Duration, Instant};
 /// one stream, so they share this, and the answer starts after a blank line.
 static STDOUT_AFTER_TOOL_RESULT: AtomicBool = AtomicBool::new(false);
 
-use neuron_tui::protocol::{TokenCounts, UiEvent, CAPABILITY_GIT_VIEWS, CAPABILITY_LIVE_PROGRESS};
+use neuron_tui::protocol::{
+    TodoItem, TokenCounts, UiEvent, CAPABILITY_GIT_VIEWS, CAPABILITY_LIVE_PROGRESS,
+};
 use runtime::context_manager::TextTokenEstimate;
 use runtime::TokenUsage;
+use serde_json::Value;
 
 use crate::render::{MarkdownStreamState, TerminalRenderer};
 use crate::stream_buffer::SyncRenderBuffer;
@@ -69,6 +72,10 @@ pub(crate) trait TurnSink: Send {
     fn tool_call(&mut self, id: &str, name: &str, input: &str, cut_off: bool) -> io::Result<()>;
     /// A tool's result or error, as the tool returned it (calls that ran only).
     fn tool_result(&mut self, name: &str, output: &str, is_error: bool) -> io::Result<()>;
+    /// A tool call starts running (allowed, past its pre-hook). Only the UI listens.
+    fn tool_started(&mut self, _id: &str, _name: &str, _input: &str) -> io::Result<()> {
+        Ok(())
+    }
     /// A tool call's final result as the model sees it, for every call: ran, denied,
     /// blocked or never started. The line terminal shows results through
     /// [`Self::tool_result`] and ignores this.
@@ -577,6 +584,8 @@ pub(crate) struct ChannelSink {
     capabilities: Arc<UiCapabilities>,
     /// Text was sent since the last [`UiEvent::TextBlockEnd`].
     text_open: bool,
+    /// `Agent` calls this sink announced with [`UiEvent::SubagentStarted`].
+    subagents: HashSet<String>,
     /// The response as the model writes it, for the live-progress events.
     live: LiveProgress,
     clock: Clock,
@@ -619,6 +628,7 @@ impl ChannelSink {
             events,
             capabilities,
             text_open: false,
+            subagents: HashSet::new(),
             live: LiveProgress::default(),
             clock: Arc::new(Instant::now),
         }
@@ -712,6 +722,58 @@ impl ChannelSink {
             target: preview.target,
             preview: preview.preview,
         })
+    }
+}
+
+const AGENT_TOOL: &str = "Agent";
+const TODO_TOOL: &str = "TodoWrite";
+
+fn string_field(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .map(ToString::to_string)
+}
+
+/// The task list a `TodoWrite` result holds (`newTodos`), as the UI shows it.
+fn todo_items(output: &str) -> Option<Vec<TodoItem>> {
+    let output = serde_json::from_str::<Value>(output).ok()?;
+    let todos = output.get("newTodos")?.as_array()?;
+    Some(
+        todos
+            .iter()
+            .map(|todo| TodoItem {
+                content: string_field(todo, "content").unwrap_or_default(),
+                status: string_field(todo, "status").unwrap_or_else(|| "pending".to_string()),
+                active_form: string_field(todo, "activeForm"),
+            })
+            .collect(),
+    )
+}
+
+/// How an `Agent` call ended, from its result (the sub-agent's manifest, final text and
+/// note) or, when it failed before that, its error.
+fn subagent_finished(id: &str, output: &str, is_error: bool) -> UiEvent {
+    let parsed = serde_json::from_str::<Value>(output)
+        .ok()
+        .filter(Value::is_object);
+    let Some(result) = parsed else {
+        return UiEvent::SubagentFinished {
+            id: id.to_string(),
+            status: if is_error { "failed" } else { "completed" }.to_string(),
+            is_error,
+            result: None,
+            note: Some(output.to_string()).filter(|text| !text.trim().is_empty()),
+        };
+    };
+    UiEvent::SubagentFinished {
+        id: id.to_string(),
+        status: string_field(&result, "status")
+            .unwrap_or_else(|| if is_error { "failed" } else { "completed" }.to_string()),
+        is_error,
+        result: string_field(&result, "result"),
+        note: string_field(&result, "note"),
     }
 }
 
@@ -824,6 +886,20 @@ impl TurnSink for ChannelSink {
         Ok(())
     }
 
+    fn tool_started(&mut self, id: &str, name: &str, input: &str) -> io::Result<()> {
+        if name != AGENT_TOOL {
+            return Ok(());
+        }
+        let input = serde_json::from_str::<Value>(input).unwrap_or(Value::Null);
+        self.subagents.insert(id.to_string());
+        self.send(UiEvent::SubagentStarted {
+            id: id.to_string(),
+            description: string_field(&input, "description").unwrap_or_default(),
+            subagent_type: string_field(&input, "subagent_type"),
+        })
+    }
+
+    /// The result, then what it means for the task list or a sub-agent.
     fn tool_call_finished(
         &mut self,
         id: &str,
@@ -836,7 +912,16 @@ impl TurnSink for ChannelSink {
             name: name.to_string(),
             output: output.to_string(),
             is_error,
-        })
+        })?;
+        if name == TODO_TOOL && !is_error {
+            if let Some(items) = todo_items(output) {
+                self.send(UiEvent::Todos { items })?;
+            }
+        }
+        if name == AGENT_TOOL && self.subagents.remove(id) {
+            self.send(subagent_finished(id, output, is_error))?;
+        }
+        Ok(())
     }
 
     fn request_usage(&mut self, usage: TokenUsage) -> io::Result<()> {
@@ -1098,6 +1183,91 @@ mod tests {
         drop(rx);
         let error = sink.text_delta("anyone?").unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    /// `TodoWrite` results become the task list; `Agent` calls that run become sub-agent
+    /// events, with the sub-agent's status, final text and note from the result.
+    #[test]
+    fn channel_sink_reports_tasks_and_subagents() {
+        let (tx, rx) = mpsc::channel();
+        let mut sink = ChannelSink::new(tx);
+        let todos = r#"{"oldTodos":[],"newTodos":[
+            {"content":"Run the tests","activeForm":"Running the tests","status":"in_progress"},
+            {"content":"Fix the build","activeForm":"Fixing the build","status":"pending"}]}"#;
+        sink.tool_call_finished("t1", "TodoWrite", todos, false)
+            .unwrap();
+        sink.tool_call_finished("t2", "TodoWrite", "todos must not be empty", true)
+            .unwrap();
+        sink.tool_started(
+            "a1",
+            "Agent",
+            r#"{"description":"Audit MCP","prompt":"...","subagent_type":"Explore"}"#,
+        )
+        .unwrap();
+        sink.tool_call_finished(
+            "a1",
+            "Agent",
+            r#"{"agentId":"agent-1","status":"completed","result":"Only stdio is implemented."}"#,
+            false,
+        )
+        .unwrap();
+        // Denied or never started: no sub-agent ran.
+        sink.tool_call_finished("a2", "Agent", "tool 'Agent' denied by the user", true)
+            .unwrap();
+        sink.tool_started("a3", "Agent", r#"{"description":"Long job"}"#)
+            .unwrap();
+        sink.tool_call_finished("a3", "Agent", "agent spawn failed", true)
+            .unwrap();
+        sink.tool_started("b1", "bash", r#"{"command":"ls"}"#)
+            .unwrap();
+
+        let events: Vec<UiEvent> = rx
+            .try_iter()
+            .filter(|event| !matches!(event, UiEvent::ToolResult { .. }))
+            .collect();
+        assert_eq!(
+            events,
+            vec![
+                UiEvent::Todos {
+                    items: vec![
+                        TodoItem {
+                            content: "Run the tests".into(),
+                            status: "in_progress".into(),
+                            active_form: Some("Running the tests".into()),
+                        },
+                        TodoItem {
+                            content: "Fix the build".into(),
+                            status: "pending".into(),
+                            active_form: Some("Fixing the build".into()),
+                        },
+                    ]
+                },
+                UiEvent::SubagentStarted {
+                    id: "a1".into(),
+                    description: "Audit MCP".into(),
+                    subagent_type: Some("Explore".into()),
+                },
+                UiEvent::SubagentFinished {
+                    id: "a1".into(),
+                    status: "completed".into(),
+                    is_error: false,
+                    result: Some("Only stdio is implemented.".into()),
+                    note: None,
+                },
+                UiEvent::SubagentStarted {
+                    id: "a3".into(),
+                    description: "Long job".into(),
+                    subagent_type: None,
+                },
+                UiEvent::SubagentFinished {
+                    id: "a3".into(),
+                    status: "failed".into(),
+                    is_error: true,
+                    result: None,
+                    note: Some("agent spawn failed".into()),
+                },
+            ]
+        );
     }
 
     /// A clock the test moves by hand.
