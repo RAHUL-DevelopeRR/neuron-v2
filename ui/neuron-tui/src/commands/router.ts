@@ -4,7 +4,8 @@
 // (USER_SHELL_AVAILABLE); until then it goes to the agent like any prompt.
 // An answer to the agent's question drawn as a chat line is marked as one,
 // and it and the echo of a failed image path as not sent to the engine, so a
-// rewind does not count them as prompts. See ui/neuron-tui/PORTING.md.
+// rewind does not count them as prompts. Enter on an empty input brings up a
+// waiting commit card or rewind picker. See ui/neuron-tui/PORTING.md.
 import {
   dispatchSkillPrompt,
   findCommand,
@@ -18,6 +19,7 @@ import {
   buildReviewPrompt,
 } from './prompt-builders'
 import { whenEngineStarted } from '../engine/engine-session'
+import { revealDeferredGitPanel } from '../engine/git-views'
 import { getNeuronEngineClient, runExchange } from '../engine/neuron-engine-client'
 import { withQuestionAnswer } from '../engine/questions'
 import { statusAddendum } from '../engine/status-report'
@@ -243,6 +245,9 @@ export async function routeUserPrompt(
   // Allow empty messages if there are pending attachments (images or text).
   // Skill mode also accepts an empty submit: it means "run the skill as-is".
   const hasAttachments = pendingAttachments.length > 0
+  // Enter on an empty input brings up a commit card or rewind picker that
+  // waits behind it (engine/git-views.ts).
+  if (!trimmed && !hasAttachments && inputMode === 'default' && revealDeferredGitPanel()) return
   if (!trimmed && !hasAttachments && inputMode !== 'skill') return
 
   // Handle bash mode commands

@@ -7,7 +7,8 @@
 // below it. A submit sends the store's latest text. A running turn's task list
 // shows in a strip above the input. The git views (/changes, the /commit card,
 // the /rewind picker) take the input's place too, and the files the agent
-// changed show in a line above it. See ui/neuron-tui/PORTING.md.
+// changed show in a line above it; a card or picker that came while the user
+// was typing waits behind the input instead. See ui/neuron-tui/PORTING.md.
 import { HelpBanner } from './components/help-banner'
 import {
   useCallback,
@@ -24,6 +25,7 @@ import { ChatInputBar } from './components/chat-input-bar'
 import { ChatHeader } from './components/chat-header'
 import { ChangesPanel, ChangesSummary } from './components/changes-panel'
 import { CommitProposalCard } from './components/commit-proposal'
+import { GitPanelWaiting } from './components/git-panel-waiting'
 import { LoadPreviousButton } from './components/load-previous-button'
 import { QueuePanel } from './components/queue-panel'
 import { ReviewScreen } from './components/review-screen'
@@ -256,6 +258,7 @@ export const Chat = ({
       changesPanelOpen: state.changesPanelOpen,
       proposal: state.proposal,
       rewind: state.rewind,
+      deferred: state.deferred,
     })),
   )
   const gitPanelOpen = isGitPanelOpen(gitViews)
@@ -1370,13 +1373,13 @@ export const Chat = ({
             request={permissionRequest}
             width={separatorWidth}
           />
-        ) : gitViews.proposal && !askUserState ? (
+        ) : gitViews.proposal && !gitViews.deferred && !askUserState ? (
           <CommitProposalCard
             proposal={gitViews.proposal}
             width={separatorWidth}
             maxVisibleFiles={isCompactHeight ? 4 : 8}
           />
-        ) : gitViews.rewind && !askUserState ? (
+        ) : gitViews.rewind && !gitViews.deferred && !askUserState ? (
           <RewindPicker
             flow={gitViews.rewind}
             width={separatorWidth}
@@ -1419,6 +1422,7 @@ export const Chat = ({
         ) : (
           <>
             <ChangesSummary files={gitViews.changes} />
+            <GitPanelWaiting />
             <ChatInputBar
               inputValue={inputValue}
               cursorPosition={cursorPosition}

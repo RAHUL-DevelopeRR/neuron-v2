@@ -3,6 +3,7 @@
  * lists the feature each needs (`git_views`, `checkpoints` for `/rewind`).
  * Without it they are not found here, and the router forwards them to the
  * engine as before (an older engine answers with a notice, or not at all).
+ * `/commit` and `/rewind` are refused while a prompt's turn runs.
  */
 
 import {
@@ -12,7 +13,7 @@ import {
 } from '../engine/git-views'
 import { FEATURE_CHECKPOINTS, FEATURE_GIT_VIEWS } from '../engine/protocol'
 import { useGitViewsStore } from '../state/git-views-store'
-import { getUserMessage } from '../utils/message-history'
+import { getSystemMessage, getUserMessage } from '../utils/message-history'
 
 import type { CommandDefinition, RouterParams } from './command-registry'
 
@@ -33,6 +34,25 @@ const echo = (params: RouterParams) => {
   params.setMessages((prev) => [...prev, getUserMessage(typed)])
 }
 
+/** A prompt's turn runs, or prompts wait in the queue for one. */
+const turnRunning = (params: RouterParams) =>
+  params.isStreaming || params.isChainInProgressRef.current || params.hasQueuedMessages?.() === true
+
+/**
+ * `/commit` and `/rewind` wait for no turn: one that ran first would change
+ * what they act on, and their card would come up while the user types the
+ * next prompt. Said in the chat; `true` when refused.
+ */
+const refusedDuringTurn = (params: RouterParams, command: string): boolean => {
+  if (!turnRunning(params)) return false
+  echo(params)
+  params.setMessages((prev) => [
+    ...prev,
+    getSystemMessage(`Wait for the running turn to end (or stop it), then run /${command} again.`),
+  ])
+  return true
+}
+
 export const GIT_VIEW_COMMANDS: GitViewCommand[] = [
   {
     name: 'diff',
@@ -51,6 +71,7 @@ export const GIT_VIEW_COMMANDS: GitViewCommand[] = [
     acceptsArgs: true,
     feature: FEATURE_GIT_VIEWS,
     handler: (params, args) => {
+      if (refusedDuringTurn(params, 'commit')) return
       echo(params)
       requestCommit(args)
     },
@@ -72,6 +93,7 @@ export const GIT_VIEW_COMMANDS: GitViewCommand[] = [
     acceptsArgs: true,
     feature: FEATURE_CHECKPOINTS,
     handler: (params, args) => {
+      if (refusedDuringTurn(params, 'rewind')) return
       echo(params)
       requestCheckpoints(args)
     },

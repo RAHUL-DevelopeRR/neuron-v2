@@ -14,6 +14,12 @@
  *
  * The rest of this module sends their commands. Nothing is committed or
  * rewound without the user's own key in a panel or their own `/commit <message>`.
+ *
+ * The card and the picker never take keys typed for something else: they
+ * do not come up while a prompt runs (one that arrives then is put away, and
+ * a new prompt puts away one still open), they wait behind the composer
+ * while it holds a draft (Enter on an empty input brings them up), and a
+ * key typed into them that is not theirs goes to the composer instead.
  */
 
 import { getNeuronEngineClient, runExchange, type NeuronEngineClient } from './neuron-engine-client'
@@ -78,6 +84,17 @@ function exchange(
 
 // ------------------------------------------------------------------ events
 
+/** A prompt's turn runs (or waits to): the files and turns are changing. */
+const promptRunning = () => useChatStore.getState().isChainInProgress
+
+/** The composer holds text the user is writing. */
+const composerHasDraft = () => useChatStore.getState().inputValue.trim() !== ''
+
+const PROPOSAL_PUT_AWAY =
+  'The commit proposal was put away: a prompt is changing the files. Run /commit again when it is done.'
+const REWIND_PUT_AWAY =
+  'The rewind picker was put away: a prompt is running. Run /rewind again when it is done.'
+
 function applyRewound(event: Extract<UiEvent, { type: 'rewound' }>): void {
   const { type: _type, ...result } = event
   const store = useGitViewsStore.getState()
@@ -129,14 +146,17 @@ export function handleGitViewsEvent(event: UiEvent): boolean {
     case 'commit_proposal': {
       const { type: _type, ...proposal } = event
       if (proposal.files.length === 0) showLine('Nothing to commit.')
-      else store.setProposal(proposal)
+      else if (promptRunning()) showLine(PROPOSAL_PUT_AWAY)
+      else store.setProposal(proposal, { deferred: composerHasDraft() })
       return true
     }
     case 'checkpoints':
       if (event.items.length === 0) {
         showLine('No checkpoints yet: each prompt you send makes one.')
+      } else if (promptRunning()) {
+        showLine(REWIND_PUT_AWAY)
       } else {
-        store.openRewind(event.items)
+        store.openRewind(event.items, { deferred: composerHasDraft() })
       }
       return true
     case 'rewound':
@@ -145,6 +165,45 @@ export function handleGitViewsEvent(event: UiEvent): boolean {
     default:
       return false
   }
+}
+
+/**
+ * A prompt's turn starts: a proposal or picker still open would commit or
+ * rewind what that turn changes, so it is put away (a rewind already sent
+ * goes on).
+ */
+export function putAwayGitPanelsForTurn(): void {
+  const store = useGitViewsStore.getState()
+  if (store.proposal) {
+    store.setProposal(null)
+    showLine(PROPOSAL_PUT_AWAY)
+  }
+  if (store.rewind && !store.rewind.confirmed) {
+    store.closeRewind()
+    showLine(REWIND_PUT_AWAY)
+  }
+}
+
+/**
+ * Enter on an empty input: a proposal or picker waiting behind the composer
+ * comes up. `true` when one did.
+ */
+export function revealDeferredGitPanel(): boolean {
+  const store = useGitViewsStore.getState()
+  if (!store.deferred || (!store.proposal && !store.rewind) || promptRunning()) return false
+  store.setDeferred(false)
+  return true
+}
+
+/**
+ * A key typed into the card or picker that is not one of theirs: it was
+ * meant for the composer. The panel steps aside and the text goes there.
+ */
+export function stepAsideForTyping(typed: string): void {
+  useGitViewsStore.getState().setDeferred(true)
+  const chat = useChatStore.getState()
+  const text = chat.inputValue + typed
+  chat.setInputValue({ text, cursorPosition: text.length, lastEditDueToNav: false })
 }
 
 /** A new engine is starting: nothing of the last one's views is left. */
@@ -191,11 +250,18 @@ export function acceptCommitProposal(): void {
   void exchange(engine, (client) => client.send({ type: 'commit', message: proposal.message }))
 }
 
-/** `e` on the commit card: `/commit <message>` in the input, to edit and send. */
+/**
+ * Tab on the commit card: `/commit <message>` in the input, to edit and
+ * send. A draft in the input is never replaced: the card steps aside instead.
+ */
 export function editCommitProposal(): void {
   const store = useGitViewsStore.getState()
   const proposal = store.proposal
   if (!proposal) return
+  if (composerHasDraft()) {
+    store.setDeferred(true)
+    return
+  }
   store.setProposal(null)
   const text = `/commit ${proposal.message}`
   useChatStore.getState().setInputValue({

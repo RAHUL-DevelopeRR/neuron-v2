@@ -11,6 +11,7 @@ import { useChatStore } from '../../state/chat-store'
 import { useGitViewsStore } from '../../state/git-views-store'
 import { ChangesPanel, ChangesSummary } from '../changes-panel'
 import { COMMIT_KEY_GUARD_MS, CommitProposalCard, resolveCommitProposalKey } from '../commit-proposal'
+import { GitPanelWaiting } from '../git-panel-waiting'
 import { RewindPicker, resolveRewindKey, rewindBack } from '../rewind-picker'
 import { registerActiveRun, stopActiveRun } from '../../utils/active-run'
 
@@ -47,21 +48,24 @@ async function mount(node: React.ReactNode, height = 24) {
 
 /** The git panels as chat.tsx draws them, in the composer's place. */
 function GitPanels() {
-  const { proposal, rewind, changesPanelOpen, changes } = useGitViewsStore(
+  const { proposal, rewind, changesPanelOpen, changes, deferred } = useGitViewsStore(
     useShallow((state) => ({
       proposal: state.proposal,
       rewind: state.rewind,
       changesPanelOpen: state.changesPanelOpen,
       changes: state.changes,
+      deferred: state.deferred,
     })),
   )
-  if (proposal) return <CommitProposalCard proposal={proposal} width={90} />
-  if (rewind) return <RewindPicker flow={rewind} width={90} />
+  const input = useChatStore((state) => state.inputValue)
+  if (proposal && !deferred) return <CommitProposalCard proposal={proposal} width={90} />
+  if (rewind && !deferred) return <RewindPicker flow={rewind} width={90} />
   if (changesPanelOpen) return <ChangesPanel files={changes} width={90} />
   return (
     <box style={{ flexDirection: 'column' }}>
       <ChangesSummary files={changes} />
-      <text>Composer restored</text>
+      <GitPanelWaiting />
+      <text>{`Composer restored [${input}]`}</text>
     </box>
   )
 }
@@ -78,15 +82,18 @@ describe('the commit card', () => {
     stage_all: true,
   }
 
-  test('keys: Enter commits, e edits, Esc and Ctrl-C cancel; none before the guard', () => {
-    const key = (name: string, ctrl = false) => ({ name, ctrl, meta: false })
-    expect(resolveCommitProposalKey(key('return'), { armed: true })).toBe('commit')
-    expect(resolveCommitProposalKey(key('e'), { armed: true })).toBe('edit')
-    expect(resolveCommitProposalKey(key('escape'), { armed: true })).toBe('cancel')
-    expect(resolveCommitProposalKey(key('c', true), { armed: false })).toBe('cancel')
-    expect(resolveCommitProposalKey(key('return'), { armed: false })).toBe('none')
-    expect(resolveCommitProposalKey(key('e'), { armed: false })).toBe('none')
-    expect(resolveCommitProposalKey(key('y'), { armed: true })).toBe('none')
+  test('keys: Enter commits, Tab edits, Esc and Ctrl-C cancel; typing goes to the composer', () => {
+    const key = (name: string, ctrl = false, sequence = '') => ({ name, ctrl, meta: false, sequence })
+    expect(resolveCommitProposalKey(key('return'), { armed: true })).toEqual({ type: 'commit' })
+    expect(resolveCommitProposalKey(key('tab'), { armed: true })).toEqual({ type: 'edit' })
+    expect(resolveCommitProposalKey(key('escape'), { armed: true })).toEqual({ type: 'cancel' })
+    expect(resolveCommitProposalKey(key('c', true), { armed: false })).toEqual({ type: 'cancel' })
+    expect(resolveCommitProposalKey(key('return'), { armed: false })).toEqual({ type: 'none' })
+    expect(resolveCommitProposalKey(key('tab'), { armed: false })).toEqual({ type: 'none' })
+    // Letters (e included) are someone's typing, armed or not.
+    expect(resolveCommitProposalKey(key('e', false, 'e'), { armed: true })).toEqual({ type: 'type', text: 'e' })
+    expect(resolveCommitProposalKey(key('y', false, 'y'), { armed: false })).toEqual({ type: 'type', text: 'y' })
+    expect(resolveCommitProposalKey(key('up'), { armed: true })).toEqual({ type: 'none' })
   })
 
   test('shows the branch, files and message; Enter commits once the guard is over', async () => {
@@ -117,16 +124,17 @@ describe('the commit card', () => {
     expect(ui.frame()).toContain('Composer restored')
   })
 
-  test('e puts the message in the input; Esc cancels; neither commits', async () => {
+  test('Tab puts the message in the input; Esc cancels; neither commits', async () => {
     const { sent, emit } = installFakeGitEngine()
     const ui = await mount(<GitPanels />)
     emit(proposal)
     await ui.settle(COMMIT_KEY_GUARD_MS + 50)
-    ui.mockInput.pressKey('e')
+    ui.mockInput.pressTab()
     await ui.settle()
     expect(useChatStore.getState().inputValue).toBe(`/commit ${proposal.message}`)
     expect(ui.frame()).toContain('Composer restored')
 
+    useChatStore.getState().setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false })
     emit(proposal)
     await ui.settle()
     ui.mockInput.pressEscape()
@@ -134,6 +142,44 @@ describe('the commit card', () => {
     await flushExchanges()
     expect(ui.frame()).toContain('Composer restored')
     expect(sent).toEqual([])
+  })
+
+  test('typing for the composer never commits: the card steps aside and the text goes there', async () => {
+    const { sent, emit } = installFakeGitEngine()
+    const ui = await mount(<GitPanels />)
+    emit(proposal)
+    await ui.settle(COMMIT_KEY_GUARD_MS + 50)
+    // The user starts their next prompt, "explain", without looking.
+    await ui.mockInput.typeText('explain')
+    await ui.settle()
+    expect(useGitViewsStore.getState().deferred).toBe(true)
+    // Every key typed before the composer was back reached it.
+    expect(useChatStore.getState().inputValue).toBe('explain')
+    expect(ui.frame()).toContain('Commit proposal ready: press Enter on an empty input to review it.')
+    expect(ui.frame()).toContain('Composer restored [explain]')
+    await flushExchanges()
+    expect(sent).toEqual([])
+  })
+
+  test('Enter commits only after a pause with no key at all, counted from every key', async () => {
+    const { sent, emit } = installFakeGitEngine()
+    const ui = await mount(<GitPanels />)
+    emit(proposal)
+    // Keys in a stream (an arrow, Enter held down) keep it unarmed.
+    for (let i = 0; i < 4; i++) {
+      await ui.settle(COMMIT_KEY_GUARD_MS / 2)
+      ui.mockInput.pressArrow('down')
+    }
+    await ui.settle(COMMIT_KEY_GUARD_MS / 2)
+    ui.mockInput.pressEnter()
+    await ui.settle()
+    await flushExchanges()
+    expect(sent).toEqual([])
+    await ui.settle(COMMIT_KEY_GUARD_MS + 50)
+    ui.mockInput.pressEnter()
+    await ui.settle()
+    await flushExchanges()
+    expect(sent).toEqual([{ type: 'commit', message: proposal.message }])
   })
 })
 
@@ -177,6 +223,11 @@ describe('the rewind picker', () => {
     expect(resolveRewindKey('preview', key('down'))).toEqual({ type: 'none' })
     expect(resolveRewindKey('running', key('return'))).toEqual({ type: 'none' })
     expect(resolveRewindKey('running', key('escape'))).toEqual({ type: 'back' })
+    // Letters are typing for the composer, at any step but a running rewind.
+    const letter = { name: 'f', ctrl: false, meta: false, sequence: 'f' }
+    expect(resolveRewindKey('pick', letter)).toEqual({ type: 'type', text: 'f' })
+    expect(resolveRewindKey('preview', letter)).toEqual({ type: 'type', text: 'f' })
+    expect(resolveRewindKey('running', letter)).toEqual({ type: 'none' })
   })
 
   test('while a rewind runs, Esc and Ctrl-C still interrupt a running turn', () => {

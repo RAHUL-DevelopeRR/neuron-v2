@@ -4,23 +4,28 @@
  * Enter here:
  *
  *   enter  commit with this message
- *   e      edit: `/commit <message>` goes into the input, to change and send
+ *   tab    edit: `/commit <message>` goes into the input, to change and send
  *   esc    cancel (also Ctrl-C)
  *
- * Enter and e are ignored for the first 300 ms, so the Enter that sent
- * `/commit` (or one held down) cannot commit a message nobody has read.
+ * Enter and Tab work only after 300 ms with no keypress at all (counted again
+ * from every key), so the Enter that sent `/commit`, one held down, or typing
+ * meant for the composer cannot commit a message nobody has read. Any other
+ * character typed here was meant for the composer: the card steps aside
+ * (Enter on an empty input brings it back) and the text goes there.
  */
 
 import { TextAttributes, type KeyEvent } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
-import React, { useCallback, useEffect, useState } from 'react'
+import React, { useCallback } from 'react'
 
 import { truncateToWidth } from './model-picker'
 import {
   acceptCommitProposal,
   cancelCommitProposal,
   editCommitProposal,
+  stepAsideForTyping,
 } from '../engine/git-views'
+import { typedText, useIdleArming } from '../hooks/use-idle-arming'
 import { useTheme } from '../hooks/use-theme'
 import { lineCounts, statusMark, type CommitProposal } from '../state/git-views-store'
 import { BORDER_CHARS } from '../utils/ui-constants'
@@ -29,25 +34,37 @@ export const COMMIT_KEY_GUARD_MS = 300
 /** Lines of the message shown before "…". */
 const MESSAGE_MAX_LINES = 12
 
-export type CommitKeyAction = 'commit' | 'edit' | 'cancel' | 'none'
+export type CommitKeyAction =
+  | { type: 'commit' }
+  | { type: 'edit' }
+  | { type: 'cancel' }
+  /** A character meant for the composer. */
+  | { type: 'type'; text: string }
+  | { type: 'none' }
 
 /** What a key does on the commit card. */
 export function resolveCommitProposalKey(
-  key: Pick<KeyEvent, 'name' | 'ctrl' | 'meta'>,
+  key: Pick<KeyEvent, 'name' | 'ctrl' | 'meta'> & Partial<Pick<KeyEvent, 'sequence' | 'option'>>,
   options: { armed: boolean },
 ): CommitKeyAction {
-  if (key.name === 'escape' || (key.ctrl && !key.meta && key.name === 'c')) return 'cancel'
-  if (!options.armed || key.ctrl || key.meta) return 'none'
-  if (key.name === 'return' || key.name === 'enter') return 'commit'
-  if (key.name === 'e') return 'edit'
-  return 'none'
+  if (key.name === 'escape' || (key.ctrl && !key.meta && key.name === 'c')) {
+    return { type: 'cancel' }
+  }
+  if (key.ctrl || key.meta) return { type: 'none' }
+  if (key.name === 'return' || key.name === 'enter') {
+    return options.armed ? { type: 'commit' } : { type: 'none' }
+  }
+  if (key.name === 'tab') return options.armed ? { type: 'edit' } : { type: 'none' }
+  const text = typedText(key)
+  return text ? { type: 'type', text } : { type: 'none' }
 }
 
 /** Runs a key's action on the proposal in the store. */
 export function applyCommitKeyAction(action: CommitKeyAction): void {
-  if (action === 'commit') acceptCommitProposal()
-  else if (action === 'edit') editCommitProposal()
-  else if (action === 'cancel') cancelCommitProposal()
+  if (action.type === 'commit') acceptCommitProposal()
+  else if (action.type === 'edit') editCommitProposal()
+  else if (action.type === 'cancel') cancelCommitProposal()
+  else if (action.type === 'type') stepAsideForTyping(action.text)
 }
 
 export const CommitProposalCard = ({
@@ -60,23 +77,18 @@ export const CommitProposalCard = ({
   maxVisibleFiles?: number
 }) => {
   const theme = useTheme()
-  const [armed, setArmed] = useState(false)
-
-  useEffect(() => {
-    setArmed(false)
-    const timer = setTimeout(() => setArmed(true), COMMIT_KEY_GUARD_MS)
-    return () => clearTimeout(timer)
-  }, [proposal])
+  const { isArmed, noteKey } = useIdleArming(COMMIT_KEY_GUARD_MS, proposal)
 
   useKeyboard(
     useCallback(
       (key: KeyEvent) => {
-        const action = resolveCommitProposalKey(key, { armed })
-        if (action === 'none') return
+        const action = resolveCommitProposalKey(key, { armed: isArmed() })
+        noteKey()
+        if (action.type === 'none') return
         key.preventDefault?.()
         applyCommitKeyAction(action)
       },
-      [armed],
+      [isArmed, noteKey],
     ),
   )
 
@@ -153,7 +165,7 @@ export const CommitProposalCard = ({
       <box style={{ flexDirection: 'column', paddingTop: 1 }}>
         <text>
           {option('enter', 'commit')}
-          {option('e', 'edit the message')}
+          {option('tab', 'edit the message')}
           {option('esc', 'cancel', true)}
         </text>
       </box>

@@ -9,8 +9,12 @@
  *
  *   ↑/↓ move   enter next   esc back (closes from the list)
  *
- * The confirm ignores Enter for 300 ms after the preview arrives, so the
- * Enter that asked for it cannot rewind before it was read.
+ * The confirm takes Enter only after 300 ms with no keypress at all, counted
+ * from the preview's arrival and again from every key, so the Enter that
+ * asked for it, or typing meant for the composer, cannot rewind before it was
+ * read. Any other character typed here was meant for the composer: the
+ * picker steps aside (Enter on an empty input brings it back) and the text
+ * goes there.
  */
 
 import { TextAttributes, type KeyEvent } from '@opentui/core'
@@ -18,7 +22,8 @@ import { useKeyboard } from '@opentui/react'
 import React, { useCallback, useEffect, useState } from 'react'
 
 import { truncateToWidth, visibleWindow } from './model-picker'
-import { confirmRewind, previewRewind } from '../engine/git-views'
+import { confirmRewind, previewRewind, stepAsideForTyping } from '../engine/git-views'
+import { typedText, useIdleArming } from '../hooks/use-idle-arming'
 import { useTheme } from '../hooks/use-theme'
 import {
   REWIND_MODES,
@@ -41,12 +46,14 @@ export type RewindKeyAction =
   | { type: 'move'; delta: number }
   | { type: 'select' }
   | { type: 'back' }
+  /** A character meant for the composer. */
+  | { type: 'type'; text: string }
   | { type: 'none' }
 
 /** What a key does at a step of the picker. `armed`: the preview can be confirmed. */
 export function resolveRewindKey(
   step: RewindStep,
-  key: Pick<KeyEvent, 'name' | 'ctrl' | 'meta'>,
+  key: Pick<KeyEvent, 'name' | 'ctrl' | 'meta'> & Partial<Pick<KeyEvent, 'sequence' | 'option'>>,
   options: { armed: boolean } = { armed: true },
 ): RewindKeyAction {
   if (key.name === 'escape' || (key.ctrl && !key.meta && key.name === 'c')) {
@@ -54,6 +61,8 @@ export function resolveRewindKey(
   }
   if (key.ctrl || key.meta || step === 'running') return { type: 'none' }
   const enter = key.name === 'return' || key.name === 'enter'
+  const text = enter ? null : typedText(key)
+  if (text) return { type: 'type', text }
   if (step === 'preview') {
     return enter && options.armed ? { type: 'select' } : { type: 'none' }
   }
@@ -149,33 +158,31 @@ export const RewindPicker = ({
   const theme = useTheme()
   const step = rewindStep(flow)
   const [focus, setFocus] = useState(0)
-  const [armed, setArmed] = useState(false)
+  // Armed from the preview's arrival and from every key (see the top).
+  const { isArmed, noteKey } = useIdleArming(REWIND_CONFIRM_GUARD_MS, flow.preview)
   const rowCount = step === 'pick' ? flow.items.length : step === 'mode' ? REWIND_MODES.length : 0
 
   // Each step starts on its first row (the newest checkpoint, code and chat).
   useEffect(() => setFocus(0), [step])
-  useEffect(() => {
-    setArmed(false)
-    if (!flow.preview) return
-    const timer = setTimeout(() => setArmed(true), REWIND_CONFIRM_GUARD_MS)
-    return () => clearTimeout(timer)
-  }, [flow.preview])
 
   useKeyboard(
     useCallback(
       (key: KeyEvent) => {
-        const action = resolveRewindKey(step, key, { armed })
+        const action = resolveRewindKey(step, key, { armed: isArmed() && flow.preview !== null })
+        noteKey()
         if (action.type === 'none') return
         key.preventDefault?.()
         if (action.type === 'move') {
           setFocus((index) => Math.max(0, Math.min(rowCount - 1, index + action.delta)))
         } else if (action.type === 'back') {
           rewindBack(flow)
+        } else if (action.type === 'type') {
+          stepAsideForTyping(action.text)
         } else {
           rewindSelect(flow, focus)
         }
       },
-      [armed, flow, focus, rowCount, step],
+      [flow, focus, isArmed, noteKey, rowCount, step],
     ),
   )
 

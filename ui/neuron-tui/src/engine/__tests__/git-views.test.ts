@@ -4,7 +4,7 @@ import { flushExchanges, installFakeGitEngine } from '../../__tests__/helpers/gi
 import { footerParts } from '../../components/engine-footer'
 import { useChatStore } from '../../state/chat-store'
 import { useEngineStore } from '../../state/engine-store'
-import { useGitViewsStore } from '../../state/git-views-store'
+import { isGitPanelOpen, useGitViewsStore } from '../../state/git-views-store'
 import { getUserMessage } from '../../utils/message-history'
 import { handleEngineEvent, setEngineTurnActive } from '../engine-session'
 import {
@@ -13,6 +13,8 @@ import {
   confirmRewind,
   editCommitProposal,
   previewRewind,
+  putAwayGitPanelsForTurn,
+  revealDeferredGitPanel,
 } from '../git-views'
 import { setNeuronEngineClientForTesting } from '../neuron-engine-client'
 
@@ -183,6 +185,52 @@ describe('the commit card', () => {
     expect(sent).toEqual([])
     expect(gitViews().proposal).toBeNull()
     expect(useChatStore.getState().inputValue).toBe(`/commit ${proposal.message}`)
+  })
+
+  test('one that comes while the user types waits behind the composer; the draft stays', async () => {
+    const { sent, emit } = installFakeGitEngine()
+    useChatStore.getState().setInputValue({ text: 'fix the parser', cursorPosition: 14, lastEditDueToNav: false })
+    emit({ type: 'commit_proposal', ...proposal })
+    expect(gitViews().proposal).not.toBeNull()
+    expect(gitViews().deferred).toBe(true)
+    expect(isGitPanelOpen(gitViews())).toBe(false)
+    // Brought up (Enter on an empty input), its Tab would put /commit in the
+    // input: never over a draft. It steps aside again instead.
+    expect(revealDeferredGitPanel()).toBe(true)
+    expect(isGitPanelOpen(gitViews())).toBe(true)
+    editCommitProposal()
+    expect(useChatStore.getState().inputValue).toBe('fix the parser')
+    expect(gitViews().deferred).toBe(true)
+    await flushExchanges()
+    expect(sent).toEqual([])
+  })
+
+  test('one that comes while a prompt runs is put away, and so is one still open when a prompt starts', () => {
+    const { emit } = installFakeGitEngine()
+    useChatStore.getState().setIsChainInProgress(true)
+    emit({ type: 'commit_proposal', ...proposal })
+    expect(gitViews().proposal).toBeNull()
+    expect(lines().at(-1)).toContain('The commit proposal was put away')
+    emit({ type: 'checkpoints', items: CHECKPOINTS })
+    expect(gitViews().rewind).toBeNull()
+    expect(lines().at(-1)).toContain('The rewind picker was put away')
+    expect(revealDeferredGitPanel()).toBe(false)
+
+    useChatStore.getState().setIsChainInProgress(false)
+    useChatStore.getState().setInputValue({ text: 'next', cursorPosition: 4, lastEditDueToNav: false })
+    emit({ type: 'commit_proposal', ...proposal })
+    expect(gitViews().deferred).toBe(true)
+    putAwayGitPanelsForTurn()
+    expect(gitViews().proposal).toBeNull()
+    expect(gitViews().deferred).toBe(false)
+
+    // A rewind already sent goes on.
+    gitViews().openRewind(CHECKPOINTS)
+    gitViews().pickCheckpoint(CHECKPOINTS[0]!)
+    gitViews().pickMode('chat_only')
+    gitViews().markRewindConfirmed()
+    putAwayGitPanelsForTurn()
+    expect(gitViews().rewind?.confirmed).toBe(true)
   })
 
   test('Esc cancels without a commit', async () => {

@@ -54,17 +54,25 @@ export interface GitViewsState {
   /** The session's changed files, from the last `changes` event. */
   changes: ChangedFile[]
   changesPanelOpen: boolean
-  /** A `/commit` proposal waiting for Enter, e or Esc. */
+  /** A `/commit` proposal waiting for Enter, Tab or Esc. */
   proposal: CommitProposal | null
   rewind: RewindFlow | null
+  /**
+   * The proposal or rewind picker waits behind the composer instead of
+   * taking its place: it came while the user had a draft there, or they
+   * typed into it. Enter on an empty input brings it up.
+   */
+  deferred: boolean
 
   /** A new engine: its features, and nothing from the last one. */
   setFeatures: (features: string[]) => void
   setChanges: (files: ChangedFile[]) => void
   openChangesPanel: () => void
   closeChangesPanel: () => void
-  setProposal: (proposal: CommitProposal | null) => void
-  openRewind: (items: CheckpointInfo[]) => void
+  setProposal: (proposal: CommitProposal | null, options?: { deferred?: boolean }) => void
+  openRewind: (items: CheckpointInfo[], options?: { deferred?: boolean }) => void
+  /** The proposal or picker steps aside for the composer, or comes back. */
+  setDeferred: (deferred: boolean) => void
   pickCheckpoint: (checkpoint: CheckpointInfo | null) => void
   pickMode: (mode: RewindMode | null) => void
   setRewindPreview: (preview: RewindResult) => void
@@ -80,6 +88,7 @@ const initial = {
   changesPanelOpen: false,
   proposal: null,
   rewind: null,
+  deferred: false,
 }
 
 export const useGitViewsStore = create<GitViewsState>()(
@@ -98,12 +107,15 @@ export const useGitViewsStore = create<GitViewsState>()(
       set((state) => {
         state.changesPanelOpen = false
       }),
-    setProposal: (proposal) =>
+    setProposal: (proposal, options = {}) =>
       set((state) => {
         state.proposal = proposal
+        state.deferred =
+          proposal !== null ? options.deferred === true : state.rewind !== null && state.deferred
       }),
-    openRewind: (items) =>
+    openRewind: (items, options = {}) =>
       set((state) => {
+        state.deferred = options.deferred === true
         state.rewind = {
           items,
           checkpoint: null,
@@ -143,6 +155,11 @@ export const useGitViewsStore = create<GitViewsState>()(
     closeRewind: () =>
       set((state) => {
         state.rewind = null
+        if (!state.proposal) state.deferred = false
+      }),
+    setDeferred: (deferred) =>
+      set((state) => {
+        state.deferred = deferred && (state.proposal !== null || state.rewind !== null)
       }),
     reset: () => set(() => ({ ...initial })),
   })),
@@ -160,9 +177,12 @@ export function hasCheckpoints(features: readonly string[]): boolean {
 
 /** A git panel takes the composer's place (and the keyboard). */
 export function isGitPanelOpen(
-  state: Pick<GitViewsState, 'changesPanelOpen' | 'proposal' | 'rewind'>,
+  state: Pick<GitViewsState, 'changesPanelOpen' | 'proposal' | 'rewind'> & {
+    deferred?: boolean
+  },
 ): boolean {
-  return state.changesPanelOpen || state.proposal !== null || state.rewind !== null
+  if (state.changesPanelOpen) return true
+  return !state.deferred && (state.proposal !== null || state.rewind !== null)
 }
 
 // ------------------------------------------------------------ pure helpers

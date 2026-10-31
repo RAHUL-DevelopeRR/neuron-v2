@@ -132,6 +132,44 @@ describe('the commands', () => {
     expect(sent).toEqual([{ type: 'slash', command: 'rewind', args: '' }])
   })
 
+  test('/commit and /rewind wait for no turn: refused while one runs or prompts are queued', async () => {
+    withFeatures(['git_views', 'checkpoints'])
+    const { sent } = installFakeGitEngine()
+    for (const typed of ['/commit', '/commit fix: it', '/rewind']) {
+      const streaming = params(typed)
+      streaming.params.isStreaming = true
+      await routeUserPrompt(streaming.params)
+      expect(streaming.lines.at(-1)).toMatch(/^ai: Wait for the running turn to end \(or stop it\), then run \/(commit|rewind) again\.$/)
+      const chained = params(typed)
+      chained.params.isChainInProgressRef.current = true
+      await routeUserPrompt(chained.params)
+      const queued = params(typed)
+      queued.params.hasQueuedMessages = () => true
+      await routeUserPrompt(queued.params)
+    }
+    await flushExchanges()
+    expect(sent).toEqual([])
+    // /diff only reads: it still goes.
+    const diff = params('/diff')
+    diff.params.isStreaming = true
+    await routeUserPrompt(diff.params)
+    await flushExchanges()
+    expect(sent).toEqual([{ type: 'slash', command: 'diff', args: '' }])
+  })
+
+  test('Enter on an empty input brings up a card that waits behind it', async () => {
+    withFeatures(['git_views'])
+    installFakeGitEngine()
+    useGitViewsStore.getState().setProposal(
+      { message: 'fix: it', branch: 'main', files: [{ path: 'a', status: 'modified', added: 1, removed: 0 }], stage_all: true },
+      { deferred: true },
+    )
+    const empty = params('   ')
+    await routeUserPrompt(empty.params)
+    expect(useGitViewsStore.getState().deferred).toBe(false)
+    expect(empty.params.sendMessage).not.toHaveBeenCalled()
+  })
+
   test('without a running engine they say so', async () => {
     withFeatures(['git_views'])
     const { sent } = installFakeGitEngine('exited')
