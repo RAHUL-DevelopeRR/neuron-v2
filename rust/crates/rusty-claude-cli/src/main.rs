@@ -75,6 +75,7 @@ mod shell_pty;
 mod status_ui;
 mod stream_buffer;
 mod token_budget;
+mod tool_input_preview;
 mod tool_ui;
 mod turn_sink;
 mod vault;
