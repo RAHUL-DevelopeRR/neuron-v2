@@ -1,5 +1,6 @@
-// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
-// See ui/neuron-tui/PORTING.md.
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
+// renderers hear whether their call is still running. See
+// ui/neuron-tui/PORTING.md.
 import { sanitizeTerminalOutput } from '@neuron-tui/common/util/terminal-safe-text'
 import { TextAttributes } from '@opentui/core'
 import { memo, useCallback } from 'react'
@@ -60,6 +61,7 @@ export const ToolBranch = memo(
       indentationOffset: 0,
       previewPrefix: '',
       labelWidth: 0,
+      isStreaming,
     })
     
     // Tools without a registered component (fallback rendering) should be collapsed by default

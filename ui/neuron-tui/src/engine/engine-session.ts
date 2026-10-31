@@ -8,6 +8,7 @@
 
 import { useChatStore } from '../state/chat-store'
 import { needsSignIn, useEngineStore } from '../state/engine-store'
+import { resetLiveTurnStore } from '../state/live-turn-store'
 import { consoleSafeText } from '../utils/glyphs'
 import { logger } from '../utils/logger'
 import { getSystemMessage } from '../utils/message-history'
@@ -16,12 +17,15 @@ import {
   recordChatEngineSession,
 } from '../utils/run-state-storage'
 import { afterConsoleCommand } from '../utils/console-guard'
+import { declareUiCapabilities } from './capabilities'
+import { noteEngineFeatures } from './live-turn'
 import {
   getNeuronEngineClient,
   setNeuronEngineClient,
   type EngineExit,
   type EngineLaunchOptions,
 } from './neuron-engine-client'
+import { handleGitViewsEvent, resetGitViews } from './git-views'
 import { QUESTION_PREFIX } from './questions'
 import { engineSessionOf, withEngineSession } from './session-run-state'
 import { StdioEngineClient } from './stdio-engine-client'
@@ -195,10 +199,15 @@ export function recordEngineSessionInChat(status: StatusEvent): void {
 }
 
 export function handleEngineEvent(event: UiEvent): void {
+  // Changes, diffs, commit proposals and checkpoints (./git-views.ts).
+  if (handleGitViewsEvent(event)) return
   const engine = useEngineStore.getState()
   switch (event.type) {
     case 'ready':
       engine.setReady(event.version)
+      // What this UI draws, for engines that ask (./capabilities.ts).
+      declareUiCapabilities(getNeuronEngineClient(), event)
+      noteEngineFeatures(event.features ?? [])
       return
     case 'status':
       engine.setStatus(event)
@@ -310,6 +319,9 @@ async function launchEngineSession(launch: EngineLaunchOptions): Promise<void> {
   setNeuronEngineClient(client)
   const engine = useEngineStore.getState()
   engine.reset()
+  resetGitViews()
+  // No turn, unsettled tokens or task list of the last engine.
+  resetLiveTurnStore()
   engine.setConnection('starting', null)
 
   client.subscribe(handleEngineEvent)

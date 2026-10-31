@@ -1,7 +1,9 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: a turn is
 // a `submit` to the engine; every save of the chat's run state names the
 // engine's session (also an interrupted turn's), and an interrupted turn's
-// late tool results still reach its rows. See ui/neuron-tui/PORTING.md.
+// late tool results still reach its rows. A prompt the engine took is marked
+// so (`sentToEngine`), for /rewind, and a turn puts away a commit card or
+// rewind picker still open. See ui/neuron-tui/PORTING.md.
 //
 // Freebuff ran the agent here through the Codebuff SDK (`client.run`), with
 // BYOK connection pinning, sponsored turns, Freebuff session admission and
@@ -25,11 +27,13 @@ import {
   runTurn,
   type NeuronEngineClient,
 } from '../engine/neuron-engine-client'
+import { putAwayGitPanelsForTurn } from '../engine/git-views'
 import { withCurrentEngineSession } from '../engine/session-run-state'
 import { createTurnEventSink } from '../engine/turn-events'
 import { setCurrentChatId } from '../project-files'
 import { createStreamController } from './stream-state'
 import { useChatStore } from '../state/chat-store'
+import { needsSignIn, useEngineStore } from '../state/engine-store'
 import { createEventHandlerState } from '../utils/create-event-handler-state'
 import { GLYPHS } from '../utils/glyphs'
 import { logger } from '../utils/logger'
@@ -509,6 +513,9 @@ export const useSendMessage = ({
             abortController.signal.aborted && runChatIsCurrent(),
         })
         const sink = turnSink
+        // A commit card or rewind picker still open would act on what this
+        // turn changes.
+        putAwayGitPanelsForTurn()
         setEngineTurnActive(true, aiMessageId)
         // Files and text are inlined into the prompt (as Freebuff did);
         // images go as attachments (see engine/attachments.ts).
@@ -516,6 +523,17 @@ export const useSendMessage = ({
           getEngine(),
           { text: effectivePrompt, attachments: engineAttachments(attachments) },
           (event) => sink.handle(event),
+          // A signed-out engine drops the prompt: it makes no checkpoint.
+          () => {
+            if (needsSignIn(useEngineStore.getState().status)) return
+            setMessages((prev) =>
+              prev.map((message) =>
+                message.id === userMessageId
+                  ? { ...message, metadata: { ...message.metadata, sentToEngine: true } }
+                  : message,
+              ),
+            )
+          },
         )
         sink.finish()
 

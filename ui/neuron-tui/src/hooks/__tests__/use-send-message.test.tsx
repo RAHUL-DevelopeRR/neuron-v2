@@ -234,6 +234,42 @@ describe('useSendMessage with the engine client', () => {
     }
   })
 
+  test('a prompt the engine took is marked as one; one it never got is not', async () => {
+    const { setup, root } = await mountHost()
+    const userBubble = (content: string) =>
+      useChatStore.getState().messages.find((m) => m.variant === 'user' && m.content === content)
+    try {
+      // No engine running: the prompt never reached one.
+      await sendMessageFromHost!({ content: 'never sent', agentMode: 'DEFAULT' })
+      expect(userBubble('never sent')?.metadata?.sentToEngine).toBe(false)
+
+      // Signed out: the engine drops the prompt, so it has no checkpoint.
+      const fake = new FakeEngine()
+      engine = fake
+      useEngineStore.getState().setStatus({ ...engineStatus(''), signed_in: false, sign_in_required: true })
+      const dropped = sendMessageFromHost!({ content: 'signed out', agentMode: 'DEFAULT' })
+      await waitFor('submit', () => fake.submits.length === 1)
+      fake.emit({ type: 'error', message: 'Sign in to Zero-X first: /login.' })
+      fake.emit({ type: 'turn_finished' })
+      await dropped
+      expect(userBubble('signed out')?.metadata?.sentToEngine).toBe(false)
+
+      // Signed in: sent.
+      useEngineStore.getState().setStatus({ ...engineStatus('s1'), signed_in: true })
+      const sent = sendMessageFromHost!({ content: 'fix it', agentMode: 'DEFAULT' })
+      await waitFor('submit', () => fake.submits.length === 2)
+      expect(userBubble('fix it')?.metadata?.sentToEngine).toBe(true)
+      fake.emit({ type: 'turn_finished' })
+      await sent
+      expect(savedMessages().find((m: { content: string }) => m.content === 'fix it').metadata).toEqual({
+        sentToEngine: true,
+      })
+    } finally {
+      flushSync(() => root.unmount())
+      setup.renderer.destroy()
+    }
+  })
+
   test('an engine error event is shown when its turn finishes', async () => {
     const fake = new FakeEngine()
     engine = fake

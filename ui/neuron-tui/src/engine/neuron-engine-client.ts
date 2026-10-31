@@ -165,15 +165,22 @@ export function runExchange(
   return run
 }
 
-/** Runs a prompt's turn: {@link runExchange} with a `submit`. */
+/**
+ * Runs a prompt's turn: {@link runExchange} with a `submit`. `onSubmitted`
+ * runs once the submit was written to the engine (not when sending failed).
+ */
 export function runTurn(
   engine: NeuronEngineClient,
   turn: { text: string; attachments?: Attachment[] },
   onEvent: (event: UiEvent) => void,
+  onSubmitted?: () => void,
 ): Promise<TurnOutcome> {
   return runExchange(
     engine,
-    () => engine.submit(turn.text, turn.attachments ?? []),
+    () => {
+      engine.submit(turn.text, turn.attachments ?? [])
+      onSubmitted?.()
+    },
     onEvent,
   )
 }

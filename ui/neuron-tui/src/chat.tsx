@@ -4,7 +4,11 @@
 // subscription banners, feedback, publishing, the profile survey and every
 // analytics event are gone. The engine's permission requests, sign-in and model
 // picker open panels above the input, and its status shows in a footer line
-// below it. A submit sends the store's latest text. See ui/neuron-tui/PORTING.md.
+// below it. A submit sends the store's latest text. A running turn's task list
+// shows in a strip above the input. The git views (/changes, the /commit card,
+// the /rewind picker) take the input's place too, and the files the agent
+// changed show in a line above it; a card or picker that came while the user
+// was typing waits behind the input instead. See ui/neuron-tui/PORTING.md.
 import { HelpBanner } from './components/help-banner'
 import {
   useCallback,
@@ -19,6 +23,9 @@ import { useShallow } from 'zustand/react/shallow'
 import { routeUserPrompt, addBashMessageToHistory } from './commands/router'
 import { ChatInputBar } from './components/chat-input-bar'
 import { ChatHeader } from './components/chat-header'
+import { ChangesPanel, ChangesSummary } from './components/changes-panel'
+import { CommitProposalCard } from './components/commit-proposal'
+import { GitPanelWaiting } from './components/git-panel-waiting'
 import { LoadPreviousButton } from './components/load-previous-button'
 import { QueuePanel } from './components/queue-panel'
 import { ReviewScreen } from './components/review-screen'
@@ -27,6 +34,7 @@ import { PendingBashMessage } from './components/pending-bash-message'
 import { EngineFooter } from './components/engine-footer'
 import { ModelPicker } from './components/model-picker'
 import { PermissionPrompt } from './components/permission-prompt'
+import { RewindPicker } from './components/rewind-picker'
 import { SignInPanel } from './components/sign-in-panel'
 import { StatusBar } from './components/status-bar'
 import {
@@ -34,6 +42,7 @@ import {
   type SuggestedPromptSelection,
 } from './components/suggested-prompts'
 import { TodoPanel } from './components/todo-panel'
+import { TodoStrip } from './components/todo-strip'
 import { TopBanner } from './components/top-banner'
 import { useChatRuntime } from './contexts/chat-runtime-context'
 import { getSlashCommandsWithSkills } from './data/slash-commands'
@@ -55,6 +64,7 @@ import { getProjectRoot } from './project-files'
 import { useChatHistoryStore } from './state/chat-history-store'
 import { useChatStore } from './state/chat-store'
 import { useEngineStore } from './state/engine-store'
+import { isGitPanelOpen, useGitViewsStore } from './state/git-views-store'
 import { useQueuePanelStore } from './state/queue-panel-store'
 import { useReviewStore } from './state/review-store'
 import { useMessageBlockStore } from './state/message-block-store'
@@ -239,11 +249,25 @@ export const Chat = ({
     (state) => state.permissionQueue[0] ?? null,
   )
 
-  // Get loaded skills for slash commands
+  // The engine's git views: the changed files, and the /changes, /commit and
+  // /rewind panels, which take the composer's place (state/git-views-store.ts).
+  const gitViews = useGitViewsStore(
+    useShallow((state) => ({
+      features: state.features,
+      changes: state.changes,
+      changesPanelOpen: state.changesPanelOpen,
+      proposal: state.proposal,
+      rewind: state.rewind,
+      deferred: state.deferred,
+    })),
+  )
+  const gitPanelOpen = isGitPanelOpen(gitViews)
+
+  // Get loaded skills for slash commands (and the git ones the engine has)
   const loadedSkills = useMemo(() => getLoadedSkills(), [])
   const filteredSlashCommands = useMemo(
-    () => getSlashCommandsWithSkills(loadedSkills),
-    [loadedSkills],
+    () => getSlashCommandsWithSkills(loadedSkills, gitViews.features),
+    [loadedSkills, gitViews.features],
   )
 
   const {
@@ -761,6 +785,17 @@ export const Chat = ({
     inputRef.current?.focus()
   }, [closeQueuePanel, setInputFocused, inputRef])
 
+  // A git panel closes itself (a commit sent, a rewind done): the keyboard
+  // goes back to the composer, as when the todo panel closes.
+  const gitPanelWasOpen = useRef(false)
+  useEffect(() => {
+    if (gitPanelWasOpen.current && !gitPanelOpen) {
+      setInputFocused(true)
+      inputRef.current?.focus()
+    }
+    gitPanelWasOpen.current = gitPanelOpen
+  }, [gitPanelOpen, setInputFocused, inputRef])
+
   const handleCloseTodoPanel = useCallback(() => {
     setTodoPanelOpen(false)
     setInputFocused(true)
@@ -1112,7 +1147,8 @@ export const Chat = ({
       modelPickerOpen ||
       reviewMode ||
       queuePanelOpen ||
-      todoPanelOpen,
+      todoPanelOpen ||
+      gitPanelOpen,
   })
 
   // Sync message block context to zustand store for child components
@@ -1317,6 +1353,8 @@ export const Chat = ({
 
         {inputMode === 'help' && <HelpBanner />}
 
+        <TodoStrip hidden={todoPanelOpen} />
+
         {shouldShowStatusLine && (
           <StatusBar
             timerStartTime={timerStartTime}
@@ -1334,6 +1372,24 @@ export const Chat = ({
             key={`permission-${permissionRequest.id}`}
             request={permissionRequest}
             width={separatorWidth}
+          />
+        ) : gitViews.proposal && !gitViews.deferred && !askUserState ? (
+          <CommitProposalCard
+            proposal={gitViews.proposal}
+            width={separatorWidth}
+            maxVisibleFiles={isCompactHeight ? 4 : 8}
+          />
+        ) : gitViews.rewind && !gitViews.deferred && !askUserState ? (
+          <RewindPicker
+            flow={gitViews.rewind}
+            width={separatorWidth}
+            maxVisibleRows={isCompactHeight ? 4 : 8}
+          />
+        ) : gitViews.changesPanelOpen && !askUserState ? (
+          <ChangesPanel
+            files={gitViews.changes}
+            width={separatorWidth}
+            maxVisibleRows={isCompactHeight ? 4 : 8}
           />
         ) : modelPickerOpen ? (
           <ModelPicker
@@ -1365,6 +1421,8 @@ export const Chat = ({
           />
         ) : (
           <>
+            <ChangesSummary files={gitViews.changes} />
+            <GitPanelWaiting />
             <ChatInputBar
               inputValue={inputValue}
               cursorPosition={cursorPosition}

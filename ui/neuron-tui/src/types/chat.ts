@@ -1,8 +1,12 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
 // sponsored-proposal block, inline-ad marker and per-message credits are
-// gone. See ui/neuron-tui/PORTING.md.
+// gone; a tool block can carry its input while the model writes it and a
+// sub-agent's progress, a `git-view` block holds a diff or a rewind's result,
+// and a message can be marked as an answer to the agent's question.
+// See ui/neuron-tui/PORTING.md.
 import type { ChatTheme } from './theme-system'
 import type { ToolName } from './agent-run'
+import type { GitView } from './git-view'
 import type { ReactNode } from 'react'
 
 /**
@@ -53,10 +57,40 @@ export type ToolContentBlock = {
   exitCode?: number
   /** Why a command stopped otherwise: "timed out", "killed", "interrupted", "blocked: …". */
   stopReason?: string
+  /**
+   * The model is still writing this call's input (`tool_input_progress`):
+   * `input` is empty until the complete one arrives and replaces this.
+   */
+  liveInput?: ToolInputSoFar
+  /** An `Agent` call's sub-agent, as the engine reports it. */
+  subagent?: SubagentState
   agentId?: string
   includeToolCall?: boolean
   isCollapsed?: boolean
   userOpened?: boolean
+}
+/** How far the model got writing a tool call's input. */
+export type ToolInputSoFar = {
+  bytes: number
+  /** Lines of the call's main text: a file's content, an edit's new text, a command. */
+  lines: number
+  /** A path, command, pattern or URL, once written. */
+  target: string | null
+  /** The last lines of the main text so far. */
+  preview: string | null
+}
+/** A sub-agent an `Agent` call runs. */
+export type SubagentState = {
+  description: string
+  subagentType: string | null
+  /** `running` until it ends: `completed`, `failed`, or `running` in the background. */
+  status: string
+  finished: boolean
+  isError: boolean
+  /** Its final text, when it finished with one. */
+  result: string | null
+  /** Why it stopped early, or that it went on in the background. */
+  note: string | null
 }
 export type AgentContentBlock = {
   type: 'agent'
@@ -137,6 +171,12 @@ export type ImageContentBlock = {
   userOpened?: boolean
 }
 
+/** A `/diff` or a rewind's result, drawn by components/git-view-cell.tsx. */
+export type GitViewContentBlock = {
+  type: 'git-view'
+  view: GitView
+}
+
 export type ImageAttachment = {
   filename: string
   path: string
@@ -161,6 +201,7 @@ export type ContentBlock =
   | AgentContentBlock
   | AgentListContentBlock
   | AskUserContentBlock
+  | GitViewContentBlock
   | HtmlContentBlock
   | ImageContentBlock
   | ModeDividerContentBlock
@@ -184,6 +225,18 @@ export type ChatMessageMetadata = {
   userOpened?: boolean
   /** RunState stored after completion */
   runState?: unknown
+  /**
+   * A user message that answered the agent's question rather than starting a
+   * turn, so it has no checkpoint of its own.
+   */
+  answersQuestion?: boolean
+  /**
+   * A prompt the engine took: the UI sent it while the engine was signed in,
+   * so the engine made a checkpoint for it. `false` on user messages that
+   * never reached it (dropped, refused, stopped first) and on answers; absent
+   * from chats saved before prompts were marked.
+   */
+  sentToEngine?: boolean
 }
 
 export type ChatMessage = {
