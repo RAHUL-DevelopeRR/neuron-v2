@@ -662,7 +662,7 @@ fn a_session_of_another_workspace_is_refused_without_a_trace() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("session workspace mismatch"), "{stderr}");
-    assert!(session_files(&other.root).is_empty());
+    assert_eq!(session_files(&other.root), Vec::<std::path::PathBuf>::new());
     let model_calls = runtime
         .block_on(server.captured_requests())
         .iter()
@@ -702,10 +702,16 @@ fn a_bare_run_without_a_terminal_has_nothing_to_do() {
         );
         assert!(stderr.contains("neuron prompt \"...\""), "{stderr}");
         assert!(!stdout.contains("Press 1") && !stderr.contains("Press 1"));
-        assert!(session_files(&workspace.root).is_empty());
+        assert_eq!(
+            session_files(&workspace.root),
+            Vec::<std::path::PathBuf>::new()
+        );
         workspace.remove();
     }
-    assert!(runtime.block_on(server.captured_requests()).is_empty());
+    assert_eq!(
+        runtime.block_on(server.captured_requests()),
+        Vec::<mock_anthropic_service::CapturedRequest>::new()
+    );
 }
 
 /// `printf '/help\n/exit' | neuron`: piped text would reach the model as one prompt, so
@@ -740,10 +746,16 @@ fn piped_repl_input_is_refused_before_any_request() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
         assert!(stderr.contains(says), "{stderr}");
-        assert!(session_files(&workspace.root).is_empty());
+        assert_eq!(
+            session_files(&workspace.root),
+            Vec::<std::path::PathBuf>::new()
+        );
         workspace.remove();
     }
-    assert!(runtime.block_on(server.captured_requests()).is_empty());
+    assert_eq!(
+        runtime.block_on(server.captured_requests()),
+        Vec::<mock_anthropic_service::CapturedRequest>::new()
+    );
 }
 
 /// Git Bash turned `neuron /model` into `neuron "C:/Program Files/Git/model"`: Neuron
@@ -783,7 +795,10 @@ fn a_git_bash_slash_command_is_noted_except_in_json_mode() {
         }
         workspace.remove();
     }
-    assert!(runtime.block_on(server.captured_requests()).is_empty());
+    assert_eq!(
+        runtime.block_on(server.captured_requests()),
+        Vec::<mock_anthropic_service::CapturedRequest>::new()
+    );
 }
 
 #[derive(Clone, Copy)]

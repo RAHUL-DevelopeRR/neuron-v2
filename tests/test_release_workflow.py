@@ -366,7 +366,7 @@ class ReleaseWorkflowStepTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(
                     calls,
-                    [f"publish dist/zero-x.live-neuron-7.0.0-alpha.2.tgz --access public --tag {expected} --ignore-scripts"],
+                    [f"publish ./dist/zero-x.live-neuron-7.0.0-alpha.2.tgz --access public --tag {expected} --ignore-scripts"],
                 )
 
     def test_npm_publish_refuses_a_dist_tag_other_than_next_or_latest(self) -> None:

@@ -9041,14 +9041,14 @@ mod tests {
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].content, "Old");
         fs::write(&missing, "[]").expect("store");
-        assert!(super::previous_todos(&missing, Some(&old))
-            .expect("store read")
-            .is_empty());
+        assert_eq!(
+            super::previous_todos(&missing, Some(&old)).expect("store read"),
+            Vec::<super::TodoItem>::new()
+        );
         fs::write(&old, "not json").expect("broken legacy list");
-        assert!(
-            super::previous_todos(&workspace.join("none.json"), Some(&old))
-                .expect("lenient")
-                .is_empty()
+        assert_eq!(
+            super::previous_todos(&workspace.join("none.json"), Some(&old)).expect("lenient"),
+            Vec::<super::TodoItem>::new()
         );
         let _ = fs::remove_dir_all(&workspace);
     }
