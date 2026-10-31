@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 
+import { useChatStore } from '../../state/chat-store'
+import { useEngineStore } from '../../state/engine-store'
 import { resetLiveTurnStore, useLiveTurnStore } from '../../state/live-turn-store'
+import { startEngineSession } from '../engine-session'
+import { setNeuronEngineClientForTesting } from '../neuron-engine-client'
 import {
   STALL_AFTER_MS,
   describeLiveActivity,
@@ -517,5 +521,26 @@ describe('targets and sizes', () => {
     expect(formatBytes(3 * 1024 * 1024)).toBe('3 MB')
     expect(inputSizeDetail(0, 0)).toBeNull()
     expect(inputSizeDetail(1, 10)).toBe('1 line · 10 B')
+  })
+})
+
+describe('a new engine', () => {
+  test("starts with no live turn: a dead engine's unsettled tokens are not added to the next one's", async () => {
+    useLiveTurnStore.setState({
+      active: true,
+      unsettledInput: 9_000,
+      unsettledOutput: 1_200,
+      streamingOutput: 40,
+      todos: [{ task: 'old', completed: false }],
+      todosThisTurn: true,
+    })
+    setNeuronEngineClientForTesting(null)
+    // A launch that fails at once (no such binary) still starts from scratch.
+    await startEngineSession({ binary: 'neuron-binary-that-does-not-exist-for-this-test' })
+    expect(liveFooterTokens(live())).toBeNull()
+    expect(live()).toMatchObject({ active: false, todos: null, todosThisTurn: false })
+    useEngineStore.getState().reset()
+    useChatStore.getState().reset()
+    setNeuronEngineClientForTesting(null)
   })
 })

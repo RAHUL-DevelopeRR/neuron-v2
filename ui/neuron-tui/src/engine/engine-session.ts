@@ -8,6 +8,7 @@
 
 import { useChatStore } from '../state/chat-store'
 import { needsSignIn, useEngineStore } from '../state/engine-store'
+import { resetLiveTurnStore } from '../state/live-turn-store'
 import { consoleSafeText } from '../utils/glyphs'
 import { logger } from '../utils/logger'
 import { getSystemMessage } from '../utils/message-history'
@@ -317,6 +318,8 @@ async function launchEngineSession(launch: EngineLaunchOptions): Promise<void> {
   const engine = useEngineStore.getState()
   engine.reset()
   resetGitViews()
+  // No turn, unsettled tokens or task list of the last engine.
+  resetLiveTurnStore()
   engine.setConnection('starting', null)
 
   client.subscribe(handleEngineEvent)
