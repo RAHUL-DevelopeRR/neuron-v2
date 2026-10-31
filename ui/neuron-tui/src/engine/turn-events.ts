@@ -70,6 +70,14 @@ export interface TurnEventSink {
   finish(): void
 }
 
+/**
+ * The result shown for a call the model never finished writing: the turn
+ * ended (the stream failed, the request was retried out) before its input was
+ * complete.
+ */
+export const INCOMPLETE_CALL_MESSAGE =
+  'The response ended before this call was complete, so it did not run.'
+
 type OpenCall = {
   id: string
   name: string
@@ -418,7 +426,9 @@ export function createTurnEventSink(
       // "interrupted" when it stopped: they did not fail for want of one.
       const calls = open.splice(0)
       if (state.isActive?.() !== false) {
-        for (const call of calls) close(call, NO_RESULT_MESSAGE, true)
+        for (const call of calls) {
+          close(call, call.inputStreaming ? INCOMPLETE_CALL_MESSAGE : NO_RESULT_MESSAGE, true)
+        }
       }
       // An interrupted turn leaves its question unanswered.
       if (questionCount > 0) updater.updateAiMessageBlocks(markUnansweredQuestions)

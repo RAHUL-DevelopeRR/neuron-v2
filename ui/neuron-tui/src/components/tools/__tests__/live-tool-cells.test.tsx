@@ -3,7 +3,9 @@ import { createTestRenderer } from '@opentui/core/testing'
 import { createRoot, flushSync } from '@opentui/react'
 import React from 'react'
 
+import { turnHarness } from '../../../engine/__tests__/turn-harness'
 import { mapToolResult } from '../../../engine/tool-mapping'
+import { resetLiveTurnStore } from '../../../state/live-turn-store'
 import { initializeThemeStore, useThemeStore } from '../../../hooks/use-theme'
 import { useChatStore } from '../../../state/chat-store'
 import { updateToolBlockWithOutput } from '../../../utils/message-block-helpers'
@@ -18,6 +20,7 @@ beforeAll(() => {
 
 afterEach(() => {
   useChatStore.getState().setStreamingAgents(() => new Set())
+  resetLiveTurnStore()
 })
 
 /** The tool row as the chat draws it, as text; `running` while it has no result. */
@@ -239,5 +242,67 @@ describe('a sub-agent', () => {
 
   test('without sub-agent events it still reads from its input and result', async () => {
     expect(await frame(agent, true)).toContain('• Agent Map the auth flow (Explore)  running…')
+  })
+})
+
+describe('a streamed call, end to end', () => {
+  test('the sink keeps one row, drawn from the first progress to the result', async () => {
+    const { sink, tools, recorded } = turnHarness()
+    const content = 'body { margin: 0; }\n.cart { display: grid; }\n'
+    sink.handle({ type: 'tool_input_started', id: 'w', name: 'write_file' })
+    sink.handle({
+      type: 'tool_input_progress',
+      id: 'w',
+      name: 'write_file',
+      bytes: 61,
+      lines: 2,
+      target: 'grocery-shop/style.css',
+      preview: '.cart { display: grid; }',
+    })
+    const midStream = await frame(tools()[0]!, recorded.streamingRows.has('w'))
+    expect(midStream).toContain('• Write grocery-shop/style.css  2 lines · 61 B')
+    expect(midStream).toContain('.cart { display: grid; }')
+
+    sink.handle({
+      type: 'tool_call_started',
+      id: 'w',
+      name: 'write_file',
+      input: JSON.stringify({ path: 'grocery-shop/style.css', content }),
+      cut_off: false,
+    })
+    sink.handle({
+      type: 'tool_result',
+      id: 'w',
+      name: 'write_file',
+      output: JSON.stringify({ type: 'create', filePath: 'grocery-shop/style.css', bytes: 45, lines: 2, summary: '' }),
+      is_error: false,
+    })
+    sink.handle({ type: 'turn_finished' })
+    sink.finish()
+    expect(tools()).toHaveLength(1)
+    const done = await frame(tools()[0]!, recorded.streamingRows.has('w'))
+    expect(done).toContain('• Create grocery-shop/style.css  2 lines · 45 B')
+    expect(done).not.toContain('✗')
+  })
+
+  test('a call whose input never completed reads as not run, not as refused', async () => {
+    const { sink, tools } = turnHarness()
+    sink.handle({ type: 'tool_input_started', id: 'w', name: 'write_file' })
+    sink.handle({
+      type: 'tool_input_progress',
+      id: 'w',
+      name: 'write_file',
+      bytes: 900,
+      lines: 30,
+      target: 'big.css',
+      preview: null,
+    })
+    sink.handle({ type: 'error', message: 'The model stopped responding. (upstream_timeout)' })
+    sink.handle({ type: 'turn_finished' })
+    sink.finish()
+    const shown = await frame(tools()[0]!)
+    expect(shown).toContain('✗ Write big.css failed')
+    expect(shown).toContain('The response ended before this call was complete')
+    expect(shown).not.toContain('refused')
   })
 })
