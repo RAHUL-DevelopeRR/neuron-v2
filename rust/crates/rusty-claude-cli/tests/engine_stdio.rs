@@ -2,6 +2,7 @@
 //! line a JSON event. Turns run against the mock Anthropic service; the sign-in runs
 //! against a fake Zero-X gateway, with a credential store of the test's own.
 
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -363,19 +364,29 @@ struct FakeGateway {
     requests: Arc<Mutex<Vec<String>>>,
 }
 
+/// SSE bodies for the next model calls, in order; after them, a refusal.
+type Replies = Arc<Mutex<VecDeque<String>>>;
+
 impl FakeGateway {
     fn start() -> Self {
+        Self::with_replies(Vec::new())
+    }
+
+    /// Model calls get `replies`, one each, then the recorded refusal.
+    fn with_replies(replies: Vec<String>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a local port");
         let origin = format!("http://{}", listener.local_addr().expect("address"));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&requests);
         let page = format!("{origin}/device");
+        let replies: Replies = Arc::new(Mutex::new(replies.into()));
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { return };
                 let seen = Arc::clone(&seen);
                 let page = page.clone();
-                thread::spawn(move || answer(stream, &seen, &page));
+                let replies = Arc::clone(&replies);
+                thread::spawn(move || answer(stream, &seen, &page, &replies));
             }
         });
         Self {
@@ -390,7 +401,12 @@ impl FakeGateway {
     }
 }
 
-fn answer(stream: TcpStream, seen: &Mutex<Vec<String>>, page: &str) {
+fn answer(
+    stream: TcpStream,
+    seen: &Mutex<Vec<String>>,
+    page: &str,
+    replies: &Mutex<VecDeque<String>>,
+) {
     let mut reader = BufReader::new(stream.try_clone().expect("stream"));
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).is_err() {
@@ -426,9 +442,13 @@ fn answer(stream: TcpStream, seen: &Mutex<Vec<String>>, page: &str) {
         if signed { " (signed)" } else { "" }
     ));
 
-    // A model call: the Claude adapter's recorded stream of a refusal mid-answer.
+    // A model call: the next scripted reply, else the Claude adapter's recorded stream of
+    // a refusal mid-answer.
     if (method.as_str(), path.as_str()) == ("POST", "/v1/chat/completions") && signed {
-        let body = include_str!("../../api/tests/fixtures/gateway_claude/refusal_mid_text.sse");
+        let scripted = replies.lock().expect("replies").pop_front();
+        let body = scripted.as_deref().unwrap_or(include_str!(
+            "../../api/tests/fixtures/gateway_claude/refusal_mid_text.sse"
+        ));
         let mut stream = stream;
         let _ = write!(
             stream,
@@ -711,6 +731,146 @@ fn stdio_engine_reports_a_refusal_as_a_refusal_notice() {
         .requests()
         .iter()
         .any(|request| request == "POST /v1/chat/completions (signed)"));
+
+    engine.end_input();
+    let _ = fs::remove_dir_all(&workspace);
+    let _ = fs::remove_dir_all(&home);
+}
+
+fn sse(chunk: &Value) -> String {
+    format!("data: {chunk}\n\n")
+}
+
+/// A model writing `site/style.css` with `write_file`, in the pieces the gateway forwards.
+fn write_file_reply() -> String {
+    let call = |delta: Value| {
+        sse(&json!({
+            "id": "chatcmpl-1", "object": "chat.completion.chunk", "model": "auto",
+            "choices": [{"index": 0, "delta": {"tool_calls": [delta]}, "finish_reason": null}]
+        }))
+    };
+    [
+        call(json!({"index": 0, "id": "call_css", "type": "function",
+                    "function": {"name": "write_file", "arguments": ""}})),
+        call(json!({"index": 0, "function": {"arguments": "{\"path\":\"site/style.css\","}})),
+        call(json!({"index": 0, "function": {"arguments": "\"content\":\"body {\\n  margin: 0;\\n"}})),
+        call(json!({"index": 0, "function": {"arguments": "}\\n\"}"}})),
+        sse(&json!({
+            "id": "chatcmpl-1", "object": "chat.completion.chunk", "model": "auto",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 900, "completion_tokens": 40, "total_tokens": 940}
+        })),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat()
+}
+
+/// A model answering `text` after the tool's result.
+fn text_reply(text: &str) -> String {
+    [
+        sse(&json!({
+            "id": "chatcmpl-2", "object": "chat.completion.chunk", "model": "auto",
+            "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]
+        })),
+        sse(&json!({
+            "id": "chatcmpl-2", "object": "chat.completion.chunk", "model": "auto",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1000, "completion_tokens": 5, "total_tokens": 1005}
+        })),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat()
+}
+
+/// A UI that declared `live_progress` sees a tool call while the model writes it: its
+/// start, its progress with the path, then the call, its result, each request's tokens,
+/// and the turn's usage.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn stdio_engine_shows_a_tool_call_while_the_model_writes_it() {
+    let gateway = FakeGateway::with_replies(vec![write_file_reply(), text_reply("Written.")]);
+    let (workspace, home) = workspace_and_home("live-progress");
+    let mut engine = StdioEngine::start(
+        &workspace,
+        &home,
+        &[
+            ("NEURON_API_BASE", &gateway.base),
+            ("NEURON_TOKEN", SESSION),
+        ],
+        &["--permission-mode", "workspace-write"],
+        Some(SESSION),
+    );
+    let ready = engine.next();
+    assert_eq!(ready["type"], "ready", "{ready}");
+    let features = ready["features"].as_array().expect("features");
+    for feature in ["capabilities", "live_progress"] {
+        assert!(features.iter().any(|listed| listed == feature), "{ready}");
+    }
+    assert_eq!(engine.next_of("status")["signed_in"], true);
+
+    engine.send(&json!({
+        "kind": "command", "type": "capabilities",
+        "features": ["live_progress"], "client": "terminal",
+    }));
+    engine.send(&submit("write the stylesheet"));
+    let turn = main_events(&engine.until("turn_finished"));
+    let types = turn
+        .iter()
+        .map(|event| event["type"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    let first = |kind: &str| {
+        types
+            .iter()
+            .position(|listed| *listed == kind)
+            .unwrap_or_else(|| panic!("no {kind}: {turn:?}"))
+    };
+    let last = |kind: &str| {
+        types
+            .iter()
+            .rposition(|listed| *listed == kind)
+            .unwrap_or_else(|| panic!("no {kind}: {turn:?}"))
+    };
+
+    let input_started = first("tool_input_started");
+    assert_eq!(turn[input_started]["id"], "call_css");
+    assert_eq!(turn[input_started]["name"], "write_file");
+    let with_path = turn
+        .iter()
+        .position(|event| {
+            event["type"] == "tool_input_progress" && event["target"] == "site/style.css"
+        })
+        .unwrap_or_else(|| panic!("no progress with the path: {turn:?}"));
+    let written = &turn[last("tool_input_progress")];
+    assert_eq!(written["id"], "call_css");
+    assert_eq!(written["lines"], 3, "{written}");
+    assert_eq!(written["preview"], "body {\n  margin: 0;\n}", "{written}");
+    let call_started = first("tool_call_started");
+    assert_eq!(turn[call_started]["id"], "call_css");
+    let result = first("tool_result");
+    assert_eq!(turn[result]["id"], "call_css");
+    assert_eq!(turn[result]["is_error"], false, "{turn:?}");
+    assert!(
+        input_started < with_path && with_path < call_started && call_started < result,
+        "{types:?}"
+    );
+
+    // Each model request's tokens as reported, then the turn's totals.
+    let requests = turn
+        .iter()
+        .filter(|event| event["type"] == "request_usage")
+        .map(|event| event["usage"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(requests, vec![counts(900, 40), counts(1000, 5)], "{turn:?}");
+    assert!(first("request_usage") > call_started, "{types:?}");
+    assert!(first("output_progress") < result, "{types:?}");
+    let usage = last("usage");
+    assert!(last("request_usage") < usage, "{types:?}");
+    assert_eq!(turn[usage]["turn"], counts(1900, 45), "{turn:?}");
+    assert_eq!(types.last(), Some(&"turn_finished"));
+    assert_eq!(
+        fs::read_to_string(workspace.join("site").join("style.css")).expect("the file"),
+        "body {\n  margin: 0;\n}\n"
+    );
 
     engine.end_input();
     let _ = fs::remove_dir_all(&workspace);
