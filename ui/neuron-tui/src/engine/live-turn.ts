@@ -460,7 +460,7 @@ export function liveOutputTokens(state: LiveTurnState): number {
  * there is nothing to add (older engines, or right after `usage`).
  */
 export function liveFooterTokens(
-  state: LiveTurnState,
+  state: Pick<LiveTurnState, 'unsettledInput' | 'unsettledOutput' | 'streamingOutput'>,
 ): { input: number; output: number } | null {
   const output = state.unsettledOutput + state.streamingOutput
   if (state.unsettledInput === 0 && output === 0) return null
