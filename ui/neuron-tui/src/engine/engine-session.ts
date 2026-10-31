@@ -16,6 +16,7 @@ import {
   recordChatEngineSession,
 } from '../utils/run-state-storage'
 import { afterConsoleCommand } from '../utils/console-guard'
+import { declareUiCapabilities } from './capabilities'
 import {
   getNeuronEngineClient,
   setNeuronEngineClient,
@@ -199,6 +200,8 @@ export function handleEngineEvent(event: UiEvent): void {
   switch (event.type) {
     case 'ready':
       engine.setReady(event.version)
+      // What this UI draws, for engines that ask (./capabilities.ts).
+      declareUiCapabilities(getNeuronEngineClient(), event)
       return
     case 'status':
       engine.setStatus(event)
