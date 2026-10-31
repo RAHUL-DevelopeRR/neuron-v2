@@ -336,8 +336,7 @@ export function createTurnEventSink(
           if (!drawing()) return
           const { description, subagent_type: subagentType } = event
           updater.updateAiMessageBlocks((blocks) =>
-            withSubagent(blocks, event.id, (previous) => ({
-              ...previous,
+            withSubagent(blocks, event.id, () => ({
               description,
               subagentType,
               status: 'running',
