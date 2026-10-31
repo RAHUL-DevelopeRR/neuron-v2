@@ -1,6 +1,7 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: output
 // that is itself JSON (`echo 42`, `cat package.json`) is shown as printed, not
-// read as an empty result envelope. See ui/neuron-tui/PORTING.md.
+// read as an empty result envelope; the command shows while the model writes
+// it, then "Running…" until its result. See ui/neuron-tui/PORTING.md.
 import { sanitizeTerminalOutput } from '@neuron-tui/common/util/terminal-safe-text'
 
 import { defineToolComponent } from './types'
@@ -66,10 +67,13 @@ export const RunTerminalCommandComponent = defineToolComponent({
   render(toolBlock, _theme, options): ToolRenderConfig {
     // Extract command and timeout from input
     const input = toolBlock.input as { command?: string; timeout_seconds?: number } | undefined
-    const command =
-      typeof input?.command === 'string'
-        ? sanitizeTerminalOutput(input.command.trim())
-        : ''
+    // While the model writes the call, the command as far as it got.
+    const live = toolBlock.liveInput
+    const written =
+      typeof input?.command === 'string' && input.command.trim()
+        ? input.command
+        : (live?.target ?? live?.preview ?? '')
+    const command = sanitizeTerminalOutput(written.trim())
     const timeoutSeconds = typeof input?.timeout_seconds === 'number' ? input.timeout_seconds : undefined
 
     // Extract output and startingCwd from tool result
@@ -85,6 +89,13 @@ export const RunTerminalCommandComponent = defineToolComponent({
         cwd={startingCwd}
         timeoutSeconds={timeoutSeconds}
         availableWidth={options.availableWidth}
+        // Started, no result yet: it runs (or waits for approval).
+        isRunning={
+          options.isStreaming === true &&
+          !live &&
+          toolBlock.output === undefined &&
+          !toolBlock.stopReason
+        }
       />
     )
 
