@@ -1452,6 +1452,52 @@ pub fn enforce_permission_check(
     }
 }
 
+/// What a tool is about to do that may change files, as the change watcher hears it
+/// ([`set_change_watcher`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingChange<'a> {
+    /// `write_file`, `edit_file` or `NotebookEdit` is about to write this path, as the
+    /// model gave it (a relative path is taken against the working directory).
+    File(&'a str),
+    /// `bash`, `PowerShell` or `REPL` is about to run this command or code.
+    Command(&'a str),
+}
+
+type ChangeWatcher = std::sync::Arc<dyn Fn(PendingChange<'_>) + Send + Sync>;
+
+fn change_watcher_slot() -> &'static std::sync::RwLock<Option<ChangeWatcher>> {
+    static SLOT: std::sync::OnceLock<std::sync::RwLock<Option<ChangeWatcher>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// Tells `watcher` before every built-in tool call that may change files runs, once its
+/// permission check passed: the agent's own calls and its sub-agents' alike, on whichever
+/// thread runs them. The full-screen engine saves its checkpoints from here. MCP and
+/// plugin tools are not reported: what they change is unknown.
+pub fn set_change_watcher(watcher: impl Fn(PendingChange<'_>) + Send + Sync + 'static) {
+    *change_watcher_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::new(watcher));
+}
+
+/// Stops reporting changes to the watcher [`set_change_watcher`] installed.
+pub fn clear_change_watcher() {
+    *change_watcher_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+fn about_to_change(change: PendingChange<'_>) {
+    let watcher = change_watcher_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(watcher) = watcher {
+        watcher(change);
+    }
+}
+
 pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
     execute_tool_with_enforcer(None, name, input)
 }
@@ -1487,6 +1533,7 @@ fn execute_tool_with_enforcer_and_cancel(
             let bash_input: BashCommandInput = from_value(input)?;
             let classified_mode = classify_bash_permission(&bash_input.command);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
+            about_to_change(PendingChange::Command(&bash_input.command));
             run_bash(&bash_input, cancel)
         }
         "read_file" => {
@@ -1495,11 +1542,15 @@ fn execute_tool_with_enforcer_and_cancel(
         }
         "write_file" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<WriteFileInput>(input).and_then(run_write_file)
+            let write = from_value::<WriteFileInput>(input)?;
+            about_to_change(PendingChange::File(&write.path));
+            run_write_file(write)
         }
         "edit_file" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<EditFileInput>(input).and_then(run_edit_file)
+            let edit = from_value::<EditFileInput>(input)?;
+            about_to_change(PendingChange::File(&edit.path));
+            run_edit_file(edit)
         }
         "glob_search" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
@@ -1523,7 +1574,9 @@ fn execute_tool_with_enforcer_and_cancel(
         "ToolSearch" => from_value::<ToolSearchInput>(input).and_then(run_tool_search),
         "NotebookEdit" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<NotebookEditInput>(input).and_then(run_notebook_edit)
+            let edit = from_value::<NotebookEditInput>(input)?;
+            about_to_change(PendingChange::File(&edit.notebook_path));
+            run_notebook_edit(edit)
         }
         "Sleep" => from_value::<SleepInput>(input).and_then(run_sleep),
         "SendUserMessage" | "Brief" => from_value::<BriefInput>(input).and_then(run_brief),
@@ -1535,13 +1588,16 @@ fn execute_tool_with_enforcer_and_cancel(
         }
         "REPL" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<ReplInput>(input).and_then(|repl| run_repl(repl, cancel))
+            let repl = from_value::<ReplInput>(input)?;
+            about_to_change(PendingChange::Command(&repl.code));
+            run_repl(repl, cancel)
         }
         "PowerShell" => {
             // Parse input to get the command for permission classification
             let ps_input: PowerShellInput = from_value(input)?;
             let classified_mode = classify_powershell_permission(&ps_input.command);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
+            about_to_change(PendingChange::Command(&ps_input.command));
             run_powershell(ps_input, cancel)
         }
         "AskUserQuestion" => {
@@ -7528,6 +7584,53 @@ mod tests {
             result.unwrap_err().contains("escapes workspace boundary"),
             "error should explain workspace boundary"
         );
+    }
+
+    #[test]
+    fn the_change_watcher_hears_what_may_change_files_once_it_is_allowed() {
+        let _guard = env_guard();
+        let root = temp_path("change-watcher");
+        fs::create_dir_all(&root).expect("root");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&heard);
+        super::set_change_watcher(move |change| {
+            sink.lock().expect("heard").push(format!("{change:?}"));
+        });
+
+        let written = execute_tool(
+            "write_file",
+            &json!({"path": "notes.txt", "content": "one\n"}),
+        );
+        let edited = execute_tool(
+            "edit_file",
+            &json!({"path": "notes.txt", "old_string": "one", "new_string": "two"}),
+        );
+        let command = execute_tool("bash", &json!({"command": "echo hi", "timeout": 10_000}));
+        let read = execute_tool("read_file", &json!({"path": "notes.txt"}));
+        // Refused before it runs: nothing to save.
+        let read_only = GlobalToolRegistry::builtin().with_enforcer(PermissionEnforcer::new(
+            permission_policy_for_mode(PermissionMode::ReadOnly),
+        ));
+        let denied =
+            read_only.execute("write_file", &json!({"path": "denied.txt", "content": "x"}));
+        super::clear_change_watcher();
+        let unheard = execute_tool("write_file", &json!({"path": "later.txt", "content": "x"}));
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+
+        assert!(written.is_ok() && edited.is_ok(), "{written:?} {edited:?}");
+        assert!(command.is_ok() && read.is_ok(), "{command:?} {read:?}");
+        assert!(denied.is_err() && unheard.is_ok(), "{denied:?} {unheard:?}");
+        assert_eq!(
+            *heard.lock().expect("heard"),
+            [
+                r#"File("notes.txt")"#,
+                r#"File("notes.txt")"#,
+                r#"Command("echo hi")"#
+            ]
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
