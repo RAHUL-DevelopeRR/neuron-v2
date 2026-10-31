@@ -7,21 +7,35 @@
 // the terminal.
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
+use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Whether the last thing a sink printed on stdout was a tool's result. Results come
 /// from the tool sink, the answer after them from the next response's sink: stdout is
 /// one stream, so they share this, and the answer starts after a blank line.
 static STDOUT_AFTER_TOOL_RESULT: AtomicBool = AtomicBool::new(false);
 
-use neuron_tui::protocol::{UiEvent, CAPABILITY_GIT_VIEWS, CAPABILITY_LIVE_PROGRESS};
+use neuron_tui::protocol::{TokenCounts, UiEvent, CAPABILITY_GIT_VIEWS, CAPABILITY_LIVE_PROGRESS};
+use runtime::context_manager::TextTokenEstimate;
+use runtime::TokenUsage;
 
 use crate::render::{MarkdownStreamState, TerminalRenderer};
 use crate::stream_buffer::SyncRenderBuffer;
+use crate::tool_input_preview::preview_tool_input;
 use crate::tool_ui::{format_tool_call_start, format_tool_result};
+
+/// How often, at most, the UI hears that a tool call's input grew.
+pub(crate) const TOOL_INPUT_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+/// How often, at most, the UI hears the output estimate of the response.
+pub(crate) const OUTPUT_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+
+/// The notice for a stream that ended without any of the reply.
+pub(crate) const REPLY_NOT_STREAMED_NOTICE: &str =
+    "\u{26a0} The reply stream sent nothing \u{2014} asking again; the reply will arrive all at once\u{2026}";
 
 /// The visible parts of a turn, in the order they happen.
 pub(crate) trait TurnSink: Send {
@@ -36,6 +50,21 @@ pub(crate) trait TurnSink: Send {
     fn reasoning_started(&mut self, chars: Option<usize>, redacted: bool) -> io::Result<()>;
     /// Streamed reasoning text. The line terminal keeps it hidden.
     fn reasoning_delta(&mut self, text: &str) -> io::Result<()>;
+    /// The model started a tool call and is writing its input: [`Self::tool_input_delta`]
+    /// follows as it grows, [`Self::tool_input_finished`] when it is written, and
+    /// [`Self::tool_call`] once the response says whether it runs. Only the UI listens.
+    fn tool_input_started(&mut self, _id: &str, _name: &str) -> io::Result<()> {
+        Ok(())
+    }
+    /// A tool call's input grew: `input` is all of it so far (JSON text, likely
+    /// incomplete).
+    fn tool_input_delta(&mut self, _id: &str, _name: &str, _input: &str) -> io::Result<()> {
+        Ok(())
+    }
+    /// The model finished writing a tool call's input, or the output limit cut it off.
+    fn tool_input_finished(&mut self, _id: &str, _name: &str, _input: &str) -> io::Result<()> {
+        Ok(())
+    }
     /// A tool call with its complete input; `cut_off` when the output limit truncated it.
     fn tool_call(&mut self, id: &str, name: &str, input: &str, cut_off: bool) -> io::Result<()>;
     /// A tool's result or error, as the tool returned it (calls that ran only).
@@ -56,6 +85,16 @@ pub(crate) trait TurnSink: Send {
     /// terminal keeps the text it printed, so it marks it; the UI drops the attempt
     /// on the retry notice itself.
     fn reply_discarded(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+    /// One model request of the turn ended: its tokens as the provider reported them.
+    /// Only the UI listens; the turn's totals come when it ends.
+    fn request_usage(&mut self, _usage: TokenUsage) -> io::Result<()> {
+        Ok(())
+    }
+    /// The stream ended without any of the reply: the request goes again without
+    /// streaming, and the reply arrives all at once. Only the UI listens.
+    fn reply_not_streamed(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
@@ -527,6 +566,9 @@ impl TurnSink for SilentSink {
     }
 }
 
+/// Where a sink reads the time for its throttles: the real clock, or a test's.
+pub(crate) type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
 /// Sends structured events to the full-screen UI. A closed UI is an error, so the turn
 /// stops instead of running on with nobody watching.
 pub(crate) struct ChannelSink {
@@ -535,6 +577,32 @@ pub(crate) struct ChannelSink {
     capabilities: Arc<UiCapabilities>,
     /// Text was sent since the last [`UiEvent::TextBlockEnd`].
     text_open: bool,
+    /// The response as the model writes it, for the live-progress events.
+    live: LiveProgress,
+    clock: Clock,
+}
+
+/// What a sink knows of the response the model is writing, for the live-progress
+/// events. Kept also while the UI did not ask for them, so a UI that asks in the middle
+/// of a response hears the right numbers.
+#[derive(Default)]
+struct LiveProgress {
+    /// Tool calls whose input the model is writing, by id.
+    tool_inputs: HashMap<String, ToolInputState>,
+    /// The response's text, reasoning and tool input so far.
+    output: TextTokenEstimate,
+    /// When the UI last heard the estimate, and what it heard.
+    output_sent: Option<(Instant, u64)>,
+}
+
+#[derive(Default)]
+struct ToolInputState {
+    /// Bytes of the input counted in [`LiveProgress::output`].
+    counted: usize,
+    /// The UI heard [`UiEvent::ToolInputStarted`].
+    announced: bool,
+    /// When the UI last heard [`UiEvent::ToolInputProgress`].
+    progress_sent_at: Option<Instant>,
 }
 
 impl ChannelSink {
@@ -551,13 +619,109 @@ impl ChannelSink {
             events,
             capabilities,
             text_open: false,
+            live: LiveProgress::default(),
+            clock: Arc::new(Instant::now),
         }
+    }
+
+    /// The throttles read the time from `clock`.
+    #[cfg(test)]
+    fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
     }
 
     fn send(&self, event: UiEvent) -> io::Result<()> {
         self.events
             .send(event)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "the Neuron UI closed"))
+    }
+
+    fn live_progress(&self) -> bool {
+        self.capabilities.live_progress()
+    }
+
+    /// The response grew by `text` (answer or reasoning): the estimate, when it is due.
+    fn output_grew(&mut self, text: &str) -> io::Result<()> {
+        self.live.output.push(text);
+        if !self.live_progress() {
+            return Ok(());
+        }
+        let now = (self.clock)();
+        self.send_output_progress(now)
+    }
+
+    /// [`UiEvent::OutputProgress`], at most every [`OUTPUT_PROGRESS_INTERVAL`] and only
+    /// with a new number.
+    fn send_output_progress(&mut self, now: Instant) -> io::Result<()> {
+        let tokens = u64::try_from(self.live.output.tokens()).unwrap_or(u64::MAX);
+        if tokens == 0 {
+            return Ok(());
+        }
+        if let Some((sent_at, sent)) = self.live.output_sent {
+            if sent == tokens || now.saturating_duration_since(sent_at) < OUTPUT_PROGRESS_INTERVAL {
+                return Ok(());
+            }
+        }
+        self.live.output_sent = Some((now, tokens));
+        self.send(UiEvent::OutputProgress {
+            output_tokens: tokens,
+        })
+    }
+
+    /// Counts the part of a tool call's `input` not counted yet in the estimate.
+    fn count_tool_input(&mut self, id: &str, input: &str) {
+        let state = self.live.tool_inputs.entry(id.to_string()).or_default();
+        // The input only grows, so what was counted is a prefix of it.
+        let new = input.get(state.counted..).unwrap_or(input);
+        self.live.output.push(new);
+        state.counted = input.len();
+    }
+
+    /// [`UiEvent::ToolInputStarted`] once per call.
+    fn announce_tool_input(&mut self, id: &str, name: &str) -> io::Result<()> {
+        let state = self.live.tool_inputs.entry(id.to_string()).or_default();
+        if std::mem::replace(&mut state.announced, true) {
+            return Ok(());
+        }
+        self.send(UiEvent::ToolInputStarted {
+            id: id.to_string(),
+            name: name.to_string(),
+        })
+    }
+
+    /// [`UiEvent::ToolInputProgress`] now, after the call's start if the UI has not
+    /// heard it.
+    fn send_tool_input_progress(
+        &mut self,
+        id: &str,
+        name: &str,
+        input: &str,
+        now: Instant,
+    ) -> io::Result<()> {
+        self.announce_tool_input(id, name)?;
+        if let Some(state) = self.live.tool_inputs.get_mut(id) {
+            state.progress_sent_at = Some(now);
+        }
+        let preview = preview_tool_input(name, input);
+        self.send(UiEvent::ToolInputProgress {
+            id: id.to_string(),
+            name: name.to_string(),
+            bytes: u64::try_from(input.len()).unwrap_or(u64::MAX),
+            lines: preview.lines,
+            target: preview.target,
+            preview: preview.preview,
+        })
+    }
+}
+
+/// `usage` as the protocol carries it.
+fn token_counts(usage: TokenUsage) -> TokenCounts {
+    TokenCounts {
+        input: u64::from(usage.input_tokens),
+        output: u64::from(usage.output_tokens),
+        cache_read: u64::from(usage.cache_read_input_tokens),
+        cache_write: u64::from(usage.cache_creation_input_tokens),
     }
 }
 
@@ -574,7 +738,8 @@ impl TurnSink for ChannelSink {
         self.text_open = true;
         self.send(UiEvent::TextDelta {
             text: text.to_string(),
-        })
+        })?;
+        self.output_grew(text)
     }
 
     fn text_block(&mut self, text: &str) -> io::Result<()> {
@@ -597,7 +762,52 @@ impl TurnSink for ChannelSink {
     fn reasoning_delta(&mut self, text: &str) -> io::Result<()> {
         self.send(UiEvent::ReasoningDelta {
             text: text.to_string(),
-        })
+        })?;
+        self.output_grew(text)
+    }
+
+    fn tool_input_started(&mut self, id: &str, name: &str) -> io::Result<()> {
+        self.live
+            .tool_inputs
+            .insert(id.to_string(), ToolInputState::default());
+        if !self.live_progress() {
+            return Ok(());
+        }
+        self.announce_tool_input(id, name)
+    }
+
+    /// Progress at most every [`TOOL_INPUT_PROGRESS_INTERVAL`] per call.
+    fn tool_input_delta(&mut self, id: &str, name: &str, input: &str) -> io::Result<()> {
+        self.count_tool_input(id, input);
+        if !self.live_progress() {
+            return Ok(());
+        }
+        let now = (self.clock)();
+        let due = self
+            .live
+            .tool_inputs
+            .get(id)
+            .and_then(|state| state.progress_sent_at)
+            .is_none_or(|sent_at| {
+                now.saturating_duration_since(sent_at) >= TOOL_INPUT_PROGRESS_INTERVAL
+            });
+        if due {
+            self.send_tool_input_progress(id, name, input, now)?;
+        }
+        self.send_output_progress(now)
+    }
+
+    /// The call's last progress, whatever the throttle says.
+    fn tool_input_finished(&mut self, id: &str, name: &str, input: &str) -> io::Result<()> {
+        self.count_tool_input(id, input);
+        let result = if self.live_progress() {
+            let now = (self.clock)();
+            self.send_tool_input_progress(id, name, input, now)
+        } else {
+            Ok(())
+        };
+        self.live.tool_inputs.remove(id);
+        result
     }
 
     fn tool_call(&mut self, id: &str, name: &str, input: &str, cut_off: bool) -> io::Result<()> {
@@ -626,6 +836,25 @@ impl TurnSink for ChannelSink {
             name: name.to_string(),
             output: output.to_string(),
             is_error,
+        })
+    }
+
+    fn request_usage(&mut self, usage: TokenUsage) -> io::Result<()> {
+        if !self.live_progress() {
+            return Ok(());
+        }
+        self.send(UiEvent::RequestUsage {
+            usage: token_counts(usage),
+        })
+    }
+
+    fn reply_not_streamed(&mut self) -> io::Result<()> {
+        if !self.live_progress() {
+            return Ok(());
+        }
+        self.send(UiEvent::Notice {
+            message: REPLY_NOT_STREAMED_NOTICE.to_string(),
+            kind: None,
         })
     }
 }
@@ -869,6 +1098,259 @@ mod tests {
         drop(rx);
         let error = sink.text_delta("anyone?").unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    /// A clock the test moves by hand.
+    fn manual_clock() -> (Clock, Arc<std::sync::Mutex<Instant>>) {
+        let now = Arc::new(std::sync::Mutex::new(Instant::now()));
+        let read = Arc::clone(&now);
+        (Arc::new(move || *read.lock().unwrap()), now)
+    }
+
+    fn advance(now: &std::sync::Mutex<Instant>, millis: u64) {
+        *now.lock().unwrap() += Duration::from_millis(millis);
+    }
+
+    fn live_capabilities() -> Arc<UiCapabilities> {
+        let capabilities = Arc::new(UiCapabilities::default());
+        capabilities.set(&[CAPABILITY_LIVE_PROGRESS.to_string()]);
+        capabilities
+    }
+
+    /// A response with text, reasoning and a `write_file` call, its usage and a reply
+    /// that came without streaming, through `sink`.
+    fn write_a_response(sink: &mut ChannelSink, now: &std::sync::Mutex<Instant>) {
+        sink.text_delta("I will write it.").unwrap();
+        sink.end_block().unwrap();
+        sink.reasoning_started(None, false).unwrap();
+        sink.reasoning_delta("the css file").unwrap();
+        sink.tool_input_started("call_1", "write_file").unwrap();
+        let mut input = String::new();
+        for piece in [
+            r#"{"path":"#,
+            r#""shop/style.css","#,
+            r#""content":"body {\n"#,
+            r"  margin: 0;\n",
+            r#"}\n"}"#,
+        ] {
+            advance(now, 60);
+            input.push_str(piece);
+            sink.tool_input_delta("call_1", "write_file", &input)
+                .unwrap();
+        }
+        sink.tool_input_finished("call_1", "write_file", &input)
+            .unwrap();
+        sink.request_usage(TokenUsage {
+            input_tokens: 1200,
+            output_tokens: 40,
+            cache_creation_input_tokens: 3,
+            cache_read_input_tokens: 1000,
+        })
+        .unwrap();
+        sink.tool_call("call_1", "write_file", &input, false)
+            .unwrap();
+        sink.reply_not_streamed().unwrap();
+        sink.tool_call_finished("call_1", "write_file", "written", false)
+            .unwrap();
+    }
+
+    /// The events a UI that declared nothing hears: exactly those from before live
+    /// progress.
+    fn events_without_live_progress() -> Vec<UiEvent> {
+        vec![
+            UiEvent::TextDelta {
+                text: "I will write it.".into(),
+            },
+            UiEvent::TextBlockEnd,
+            UiEvent::ReasoningStarted {
+                chars: None,
+                redacted: false,
+            },
+            UiEvent::ReasoningDelta {
+                text: "the css file".into(),
+            },
+            UiEvent::ToolCallStarted {
+                id: "call_1".into(),
+                name: "write_file".into(),
+                input: "{\"path\":\"shop/style.css\",\"content\":\"body {\\n  margin: 0;\\n}\\n\"}"
+                    .into(),
+                cut_off: false,
+            },
+            UiEvent::ToolResult {
+                id: "call_1".into(),
+                name: "write_file".into(),
+                output: "written".into(),
+                is_error: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn without_live_progress_the_ui_hears_what_it_always_did() {
+        let (clock, now) = manual_clock();
+        let (tx, rx) = mpsc::channel();
+        let mut sink = ChannelSink::new(tx).with_clock(clock);
+        write_a_response(&mut sink, &now);
+        assert_eq!(
+            rx.try_iter().collect::<Vec<_>>(),
+            events_without_live_progress()
+        );
+
+        // A UI that declared other capabilities only.
+        let capabilities = Arc::new(UiCapabilities::default());
+        capabilities.set(&[CAPABILITY_GIT_VIEWS.to_string()]);
+        let (clock, now) = manual_clock();
+        let (tx, rx) = mpsc::channel();
+        let mut sink = ChannelSink::with_capabilities(tx, capabilities).with_clock(clock);
+        write_a_response(&mut sink, &now);
+        assert_eq!(
+            rx.try_iter().collect::<Vec<_>>(),
+            events_without_live_progress()
+        );
+    }
+
+    /// The call shows at once; its progress at most every 100 ms and once more when it
+    /// is written; the output estimate at most every 250 ms; the request's usage as
+    /// reported. The events from before come in the same order around them.
+    #[test]
+    fn live_progress_shows_tool_input_output_estimates_and_request_usage() {
+        let (clock, now) = manual_clock();
+        let (tx, rx) = mpsc::channel();
+        let mut sink = ChannelSink::with_capabilities(tx, live_capabilities()).with_clock(clock);
+        write_a_response(&mut sink, &now);
+        let events = rx.try_iter().collect::<Vec<_>>();
+
+        let older = events
+            .iter()
+            .filter(|event| {
+                !matches!(
+                    event,
+                    UiEvent::ToolInputStarted { .. }
+                        | UiEvent::ToolInputProgress { .. }
+                        | UiEvent::OutputProgress { .. }
+                        | UiEvent::RequestUsage { .. }
+                        | UiEvent::Notice { .. }
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(older, events_without_live_progress());
+
+        let progress = |input: &str, target: Option<&str>, lines, preview: Option<&str>| {
+            UiEvent::ToolInputProgress {
+                id: "call_1".into(),
+                name: "write_file".into(),
+                bytes: input.len() as u64,
+                lines,
+                target: target.map(Into::into),
+                preview: preview.map(Into::into),
+            }
+        };
+        let full = "{\"path\":\"shop/style.css\",\"content\":\"body {\\n  margin: 0;\\n}\\n\"}";
+        let live = events
+            .iter()
+            .filter(|event| !older.contains(event))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            live,
+            vec![
+                // "I will write it." is 16 characters: 6 tokens.
+                UiEvent::OutputProgress { output_tokens: 6 },
+                UiEvent::ToolInputStarted {
+                    id: "call_1".into(),
+                    name: "write_file".into(),
+                },
+                // 60 ms: the call's first progress; the estimate waits for 250 ms.
+                progress(r#"{"path":"#, None, 0, None),
+                // 120 ms: too soon. 180 ms: due, and the path is complete.
+                progress(
+                    r#"{"path":"shop/style.css","content":"body {\n"#,
+                    Some("shop/style.css"),
+                    1,
+                    Some("body {"),
+                ),
+                // 240 ms: too soon. 300 ms: due, and so is the estimate: 16 + 12 + 63
+                // characters.
+                progress(
+                    full,
+                    Some("shop/style.css"),
+                    3,
+                    Some("body {\n  margin: 0;\n}")
+                ),
+                UiEvent::OutputProgress { output_tokens: 31 },
+                // Written: the last progress, whatever the throttle says.
+                progress(
+                    full,
+                    Some("shop/style.css"),
+                    3,
+                    Some("body {\n  margin: 0;\n}")
+                ),
+                UiEvent::RequestUsage {
+                    usage: TokenCounts {
+                        input: 1200,
+                        output: 40,
+                        cache_read: 1000,
+                        cache_write: 3,
+                    }
+                },
+                UiEvent::Notice {
+                    message: REPLY_NOT_STREAMED_NOTICE.into(),
+                    kind: None,
+                },
+            ]
+        );
+        // The notice says what happens in plain words.
+        assert!(REPLY_NOT_STREAMED_NOTICE.contains("all at once"));
+    }
+
+    /// Each call has its own throttle; a UI that asks in the middle of a call hears its
+    /// start before its progress, and the estimate counts what came before.
+    #[test]
+    fn live_progress_throttles_each_call_and_can_start_mid_call() {
+        let capabilities = Arc::new(UiCapabilities::default());
+        let (clock, now) = manual_clock();
+        let (tx, rx) = mpsc::channel();
+        let mut sink =
+            ChannelSink::with_capabilities(tx, Arc::clone(&capabilities)).with_clock(clock);
+        sink.tool_input_started("a", "bash").unwrap();
+        sink.tool_input_delta("a", "bash", r#"{"command":"ls"#)
+            .unwrap();
+        assert_eq!(rx.try_iter().count(), 0, "not asked for yet");
+
+        capabilities.set(&[CAPABILITY_LIVE_PROGRESS.to_string()]);
+        sink.tool_input_started("b", "read_file").unwrap();
+        sink.tool_input_delta("a", "bash", r#"{"command":"ls -la"}"#)
+            .unwrap();
+        sink.tool_input_delta("b", "read_file", r#"{"path":"a.txt"}"#)
+            .unwrap();
+        advance(&now, 20);
+        sink.tool_input_delta("a", "bash", r#"{"command":"ls -la"} "#)
+            .unwrap();
+        let events = rx.try_iter().collect::<Vec<_>>();
+        let kinds = events
+            .iter()
+            .map(|event| match event {
+                UiEvent::ToolInputStarted { id, .. } => format!("started {id}"),
+                UiEvent::ToolInputProgress { id, target, .. } => {
+                    format!("progress {id} {}", target.as_deref().unwrap_or("-"))
+                }
+                UiEvent::OutputProgress { output_tokens } => format!("output {output_tokens}"),
+                other => format!("{other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                "started b",
+                "started a",
+                "progress a ls -la",
+                // The call's input, also what came before the UI asked: 20 characters.
+                "output 7",
+                // Its own throttle; the estimate's waits.
+                "progress b a.txt",
+            ]
+        );
     }
 
     #[test]
