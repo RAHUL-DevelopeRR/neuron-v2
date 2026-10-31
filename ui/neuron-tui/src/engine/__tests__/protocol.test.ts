@@ -146,10 +146,46 @@ describe('UI events (engine -> UI)', () => {
       notice: true,
       turn_finished: true,
       error: true,
+      tool_input_started: true,
+      tool_input_progress: true,
+      output_progress: true,
+      request_usage: true,
+      todos: true,
+      subagent_started: true,
+      subagent_finished: true,
+      changes: true,
+      diff: true,
+      commit_proposal: true,
+      checkpoints: true,
+      rewound: true,
     }
     expect([...UI_EVENT_TYPES].sort() as string[]).toEqual(
       Object.keys(all).sort(),
     )
+  })
+
+  test('live progress and git view events parse as the engine writes them', () => {
+    const progress = parseUiEventLine(
+      '{"type":"tool_input_progress","id":"call_1","name":"write_file","bytes":2048,"lines":40,"target":"shop/style.css","preview":"body {"}',
+    )
+    expect(progress.ok && progress.event).toMatchObject({
+      type: 'tool_input_progress',
+      target: 'shop/style.css',
+      lines: 40,
+    })
+    expect(
+      parseUiEventLine('{"type":"output_progress","output_tokens":12}').ok,
+    ).toBe(true)
+    const rewound = parseUiEventLine(
+      '{"type":"rewound","checkpoint":3,"mode":"code_only","dry_run":true,"restored":[],"removed":[],"not_restored":[],"shell_commands":[],"removed_turns":0,"prompt":null}',
+    )
+    expect(rewound.ok && rewound.event.type).toBe('rewound')
+    const ready = parseUiEventLine(
+      '{"type":"ready","protocol":1,"version":"7.0.0","features":["capabilities","live_progress"]}',
+    )
+    expect(ready.ok && ready.event).toMatchObject({
+      features: ['capabilities', 'live_progress'],
+    })
   })
 })
 

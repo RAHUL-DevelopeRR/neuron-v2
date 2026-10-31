@@ -33,9 +33,10 @@
 
 use super::*;
 use crate::device_login::{DeviceCode, DeviceLoginObserver};
+use crate::turn_sink::UiCapabilities;
 use neuron_tui::protocol::{
     AccountInfo, Attachment, EngineCommand, GitStatus, ModelInfo, NoticeKind, PermissionReply,
-    TokenCounts, UiEvent, PROTOCOL_VERSION,
+    TokenCounts, UiEvent, ENGINE_FEATURES, PROTOCOL_VERSION,
 };
 use repl_loop::InterruptPresses;
 use runtime::ui_hooks::{self, UserQuestion};
@@ -175,7 +176,7 @@ fn run_engine(
     ready: &Sender<Result<(), String>>,
 ) -> EngineExit {
     let Some(reason) = options.signed_out.take() else {
-        let started = open_cli(&options, events).and_then(|(cli, output)| {
+        let started = open_cli(&options, events, shared).and_then(|(cli, output)| {
             let mut engine = Engine::new(cli, output, Sender::clone(events), replies, shared);
             let resumed = match &options.resume {
                 Some(reference) => match engine.continue_saved_session(reference) {
@@ -222,7 +223,7 @@ fn run_engine(
         };
         signed_out.options.model = model;
         signed_out.send(UiEvent::SessionStarting);
-        let (cli, output) = match open_cli(&signed_out.options, events) {
+        let (cli, output) = match open_cli(&signed_out.options, events, shared) {
             Ok(opened) => opened,
             Err(message) => {
                 signed_out.fail(&message);
@@ -255,8 +256,12 @@ fn run_engine(
 fn open_cli(
     options: &EngineOptions,
     events: &Sender<UiEvent>,
+    shared: &Shared,
 ) -> Result<(LiveCli, TurnOutput), String> {
-    let output = TurnOutput::channel(Sender::clone(events));
+    let output = TurnOutput::channel_with_capabilities(
+        Sender::clone(events),
+        Arc::clone(&shared.capabilities),
+    );
     let mut cli = LiveCli::with_output(
         options.model.clone(),
         true,
@@ -285,6 +290,7 @@ impl SignedOut<'_> {
         self.send(UiEvent::Ready {
             protocol: PROTOCOL_VERSION,
             version: VERSION.to_string(),
+            features: engine_features(),
         });
         if let Some(reason) = plain_notice(reason) {
             self.send(UiEvent::Notice {
@@ -328,7 +334,12 @@ impl SignedOut<'_> {
                     self.options.model = resolve_model_alias_with_config(model.trim());
                     self.send_status();
                 }
-                EngineCommand::SetModel { .. } | EngineCommand::Interrupt => {}
+                EngineCommand::SetModel { .. }
+                | EngineCommand::Interrupt
+                | EngineCommand::Capabilities { .. } => {}
+                EngineCommand::Commit { .. } | EngineCommand::Rewind { .. } => {
+                    self.fail("Sign in to Zero-X first: /login.");
+                }
                 EngineCommand::ListModels => self.send(UiEvent::Models {
                     current: shown_model(&self.options.model).to_string(),
                     models: Vec::new(),
@@ -489,6 +500,16 @@ struct Shared {
     events: Mutex<Option<Sender<UiEvent>>>,
     /// The session's model as the footer last showed it.
     model: Mutex<String>,
+    /// What the UI declared it handles; the command thread sets it.
+    capabilities: Arc<UiCapabilities>,
+}
+
+/// [`ENGINE_FEATURES`], for [`UiEvent::Ready`].
+fn engine_features() -> Vec<String> {
+    ENGINE_FEATURES
+        .iter()
+        .map(|feature| (*feature).to_string())
+        .collect()
 }
 
 impl Shared {
@@ -658,6 +679,17 @@ fn forward_commands(
     loop {
         match commands.recv().unwrap_or(EngineCommand::Shutdown) {
             EngineCommand::Interrupt => shared.interrupt(),
+            // Now, so a running turn's sinks see it; the engine also hears it, between
+            // turns, to send what the new capabilities show.
+            EngineCommand::Capabilities { features, client } => {
+                shared.capabilities.set(&features);
+                if queue
+                    .send(EngineCommand::Capabilities { features, client })
+                    .is_err()
+                {
+                    return;
+                }
+            }
             EngineCommand::Submit { text, attachments } => {
                 if let Some(answer) = shared.take_answer() {
                     let _ = answer.send(text);
@@ -992,6 +1024,14 @@ impl Engine {
             EngineCommand::Interrupt => {}
             EngineCommand::ListModels => self.list_models(),
             EngineCommand::Shutdown => return Step::Stop,
+            // The command thread stored them already.
+            EngineCommand::Capabilities { .. } => {}
+            EngineCommand::Commit { .. } | EngineCommand::Rewind { .. } => {
+                self.send(UiEvent::Error {
+                    message: "This command is not available in this build yet.".to_string(),
+                });
+                self.finish_turn();
+            }
         }
         Step::Continue
     }
@@ -1202,6 +1242,7 @@ impl Engine {
         self.send(UiEvent::Ready {
             protocol: PROTOCOL_VERSION,
             version: VERSION.to_string(),
+            features: engine_features(),
         });
         self.send_status();
     }
@@ -1787,6 +1828,7 @@ mod tests {
             UiEvent::Ready {
                 protocol: PROTOCOL_VERSION,
                 version: env!("CARGO_PKG_VERSION").to_string(),
+                features: super::engine_features(),
             }
         );
         let untracked_at_start = match next_event(&engine.events) {

@@ -17,7 +17,7 @@ use std::sync::Arc;
 /// one stream, so they share this, and the answer starts after a blank line.
 static STDOUT_AFTER_TOOL_RESULT: AtomicBool = AtomicBool::new(false);
 
-use neuron_tui::protocol::UiEvent;
+use neuron_tui::protocol::{UiEvent, CAPABILITY_GIT_VIEWS, CAPABILITY_LIVE_PROGRESS};
 
 use crate::render::{MarkdownStreamState, TerminalRenderer};
 use crate::stream_buffer::SyncRenderBuffer;
@@ -69,7 +69,7 @@ pub(crate) enum TurnOutput {
     /// ANSI to the terminal, as the line REPL always did.
     Ansi,
     /// Structured events for the full-screen UI.
-    Channel(Arc<Sender<UiEvent>>),
+    Channel(Arc<UiChannel>),
     /// What a file or a pipe receives (`neuron prompt ... > out.txt`), kept for a test.
     #[cfg(test)]
     Captured(Arc<std::sync::Mutex<Vec<u8>>>),
@@ -98,9 +98,58 @@ impl From<bool> for TurnOutput {
     }
 }
 
+/// The full-screen UI's event channel, and what that UI declared it handles.
+#[derive(Debug)]
+pub(crate) struct UiChannel {
+    pub(crate) events: Sender<UiEvent>,
+    pub(crate) capabilities: Arc<UiCapabilities>,
+}
+
+/// What the UI declared it handles ([`EngineCommand::Capabilities`]). The engine's
+/// command thread sets it, at any time; sinks read it for each event.
+///
+/// [`EngineCommand::Capabilities`]: neuron_tui::protocol::EngineCommand::Capabilities
+#[derive(Debug, Default)]
+pub(crate) struct UiCapabilities {
+    live_progress: AtomicBool,
+    git_views: AtomicBool,
+}
+
+impl UiCapabilities {
+    /// Replaces what an earlier declaration said.
+    pub(crate) fn set(&self, features: &[String]) {
+        let has = |name: &str| features.iter().any(|feature| feature == name);
+        self.live_progress
+            .store(has(CAPABILITY_LIVE_PROGRESS), Ordering::SeqCst);
+        self.git_views
+            .store(has(CAPABILITY_GIT_VIEWS), Ordering::SeqCst);
+    }
+
+    /// Tool-input progress, output estimates and per-request usage.
+    pub(crate) fn live_progress(&self) -> bool {
+        self.live_progress.load(Ordering::SeqCst)
+    }
+
+    /// Changes, diffs, commit proposals, checkpoints and rewinds as events.
+    pub(crate) fn git_views(&self) -> bool {
+        self.git_views.load(Ordering::SeqCst)
+    }
+}
+
 impl TurnOutput {
+    /// A UI that declared nothing yet.
     pub(crate) fn channel(events: Sender<UiEvent>) -> Self {
-        Self::Channel(Arc::new(events))
+        Self::channel_with_capabilities(events, Arc::default())
+    }
+
+    pub(crate) fn channel_with_capabilities(
+        events: Sender<UiEvent>,
+        capabilities: Arc<UiCapabilities>,
+    ) -> Self {
+        Self::Channel(Arc::new(UiChannel {
+            events,
+            capabilities,
+        }))
     }
 
     pub(crate) fn is_visible(&self) -> bool {
@@ -122,7 +171,10 @@ impl TurnOutput {
                     .for_stdout_terminal()
                     .spacing_tool_results(&STDOUT_AFTER_TOOL_RESULT),
             ),
-            Self::Channel(events) => Box::new(ChannelSink::new(Sender::clone(events))),
+            Self::Channel(channel) => Box::new(ChannelSink::with_capabilities(
+                Sender::clone(&channel.events),
+                Arc::clone(&channel.capabilities),
+            )),
             #[cfg(test)]
             Self::Captured(buffer) => {
                 Box::new(AnsiSink::new(StripAnsi::new(Captured(Arc::clone(buffer)))))
@@ -144,7 +196,10 @@ impl TurnOutput {
                     .for_stdout_terminal()
                     .spacing_tool_results(&STDOUT_AFTER_TOOL_RESULT),
             ),
-            Self::Channel(events) => Box::new(ChannelSink::new(Sender::clone(events))),
+            Self::Channel(channel) => Box::new(ChannelSink::with_capabilities(
+                Sender::clone(&channel.events),
+                Arc::clone(&channel.capabilities),
+            )),
             #[cfg(test)]
             Self::Captured(buffer) => {
                 Box::new(AnsiSink::new(StripAnsi::new(Captured(Arc::clone(buffer)))))
@@ -476,14 +531,25 @@ impl TurnSink for SilentSink {
 /// stops instead of running on with nobody watching.
 pub(crate) struct ChannelSink {
     events: Sender<UiEvent>,
+    /// What the UI handles, as it declared it.
+    capabilities: Arc<UiCapabilities>,
     /// Text was sent since the last [`UiEvent::TextBlockEnd`].
     text_open: bool,
 }
 
 impl ChannelSink {
+    /// For a UI that declared nothing.
     pub(crate) fn new(events: Sender<UiEvent>) -> Self {
+        Self::with_capabilities(events, Arc::default())
+    }
+
+    pub(crate) fn with_capabilities(
+        events: Sender<UiEvent>,
+        capabilities: Arc<UiCapabilities>,
+    ) -> Self {
         Self {
             events,
+            capabilities,
             text_open: false,
         }
     }

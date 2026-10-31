@@ -92,6 +92,76 @@ export interface AccountInfo {
 
 // ---------------------------------------------------------------- Engine → UI
 
+/**
+ * Engine features, listed in {@link ReadyEvent.features} (`FEATURE_*` in
+ * protocol.rs). Send a feature's commands only when the engine lists it.
+ */
+export const FEATURE_CAPABILITIES = 'capabilities'
+/** Tool-input progress, output estimates and per-request usage while a turn streams. */
+export const FEATURE_LIVE_PROGRESS = 'live_progress'
+/** `changes`, `diff` and `commit_proposal` events; the `commit` command. */
+export const FEATURE_GIT_VIEWS = 'git_views'
+/** `/rewind`, the `checkpoints` and `rewound` events; the `rewind` command. */
+export const FEATURE_CHECKPOINTS = 'checkpoints'
+
+/**
+ * UI capabilities, declared with the `capabilities` command (`CAPABILITY_*` in
+ * protocol.rs). Without them the engine sends none of the events they name and
+ * answers `/diff`, `/commit` and `/rewind` with notices.
+ */
+export const CAPABILITY_LIVE_PROGRESS = 'live_progress'
+export const CAPABILITY_GIT_VIEWS = 'git_views'
+
+/** One item of the agent's task list (its `TodoWrite` tool). */
+export interface TodoItem {
+  content: string
+  /** `pending`, `in_progress` or `completed`. */
+  status: string
+  /** The item in the present tense, while it is in progress. */
+  active_form: string | null
+}
+
+/** A file and how it changed, with line counts. */
+export interface ChangedFile {
+  /** Relative to the workspace root, with `/`; absolute for files outside it. */
+  path: string
+  /** `created`, `modified`, `deleted` or `renamed`. */
+  status: string
+  added: number
+  removed: number
+}
+
+/** One file of a {@link DiffEvent}. */
+export interface DiffFile extends ChangedFile {
+  /**
+   * The unified diff's hunks (from the first `@@` line on); empty for binary
+   * files and for files left out to keep the event small.
+   */
+  patch: string
+  binary: boolean
+}
+
+/** One entry of the "go back to" list ({@link CheckpointsEvent}). */
+export interface CheckpointInfo {
+  id: number
+  /** When the prompt was sent (Unix milliseconds). */
+  created_at_ms: number
+  /** The prompt, shortened to one line. */
+  prompt_preview: string
+  /** Files the agent's file tools changed in that turn. */
+  files: string[]
+  /** Shell commands that turn ran; a rewind cannot undo what they did. */
+  shell_commands: string[]
+  /** On the checkpoint a code-only rewind saves first: where that rewind went. */
+  before_rewind_to?: number
+}
+
+/** A file a rewind could not put back, and why. */
+export interface NotRestoredFile {
+  path: string
+  reason: string
+}
+
 /** The first event: the engine is ready for commands. */
 export interface ReadyEvent {
   type: 'ready'
@@ -99,6 +169,8 @@ export interface ReadyEvent {
   protocol: number
   /** The Neuron version. */
   version: string
+  /** Engine features (`FEATURE_*`); absent from engines before them. */
+  features?: string[]
 }
 
 /**
@@ -263,6 +335,141 @@ export interface ErrorEvent {
   message: string
 }
 
+/**
+ * The model started a tool call and is still writing its input: show the call
+ * now. `tool_input_progress` follows while the input grows, then
+ * `tool_call_started` with the same `id` and the complete input.
+ */
+export interface ToolInputStartedEvent {
+  type: 'tool_input_started'
+  id: string
+  name: string
+}
+
+/**
+ * How far the model got writing a tool call's input; at most every 100 ms or so
+ * per call, and once more when the input is complete.
+ */
+export interface ToolInputProgressEvent {
+  type: 'tool_input_progress'
+  id: string
+  name: string
+  /** Bytes of input (JSON text) so far. */
+  bytes: number
+  /** Lines of the call's main text so far (file content, new text, command). */
+  lines: number
+  /** A path, command, search pattern or URL, once the model has written it. */
+  target: string | null
+  /** The last lines of the main text so far (at most about 1 KB), unescaped. */
+  preview: string | null
+}
+
+/**
+ * Estimated output tokens of the model response now streaming (text, reasoning
+ * and tool input). Starts again from 0 with each model request of a turn.
+ */
+export interface OutputProgressEvent {
+  type: 'output_progress'
+  output_tokens: number
+}
+
+/** One model request of the turn ended: its tokens as the provider reported them. */
+export interface RequestUsageEvent {
+  type: 'request_usage'
+  usage: TokenCounts
+}
+
+/** The agent's task list changed (its `TodoWrite` tool ran): the whole list. */
+export interface TodosEvent {
+  type: 'todos'
+  items: TodoItem[]
+}
+
+/** A sub-agent started; `id` is its `Agent` call's `tool_call_started` id. */
+export interface SubagentStartedEvent {
+  type: 'subagent_started'
+  id: string
+  description: string
+  subagent_type: string | null
+}
+
+/**
+ * A sub-agent's `Agent` call ended: `status` is `completed`, `failed`,
+ * `running` (it went on in the background), ...
+ */
+export interface SubagentFinishedEvent {
+  type: 'subagent_finished'
+  id: string
+  status: string
+  is_error: boolean
+  result: string | null
+  note: string | null
+}
+
+/**
+ * Every file the agent created, changed or deleted in this session, with lines
+ * added and removed since the session first touched it.
+ */
+export interface ChangesEvent {
+  type: 'changes'
+  files: ChangedFile[]
+}
+
+/**
+ * Answer to `/diff [path]`: the workspace's changes against `HEAD`, or outside
+ * git the agent's changes this session.
+ */
+export interface DiffEvent {
+  type: 'diff'
+  /** What was compared, as a heading. */
+  title: string
+  files: DiffFile[]
+  /** Files or hunks were left out to keep the event small. */
+  truncated: boolean
+}
+
+/**
+ * Answer to `/commit` without a message: a drafted message and what a commit
+ * would take. Nothing is committed until the UI sends a `commit` command.
+ */
+export interface CommitProposalEvent {
+  type: 'commit_proposal'
+  message: string
+  branch: string | null
+  files: ChangedFile[]
+  /** Nothing is staged, so the commit takes every change (`git add -A`). */
+  stage_all: boolean
+}
+
+/** Answer to `/rewind`: the session's checkpoints, newest first. */
+export interface CheckpointsEvent {
+  type: 'checkpoints'
+  items: CheckpointInfo[]
+}
+
+/** What a rewind puts back. */
+export type RewindMode = 'code_and_chat' | 'chat_only' | 'code_only'
+
+/** Answer to a `rewind` command: what it put back (or, for a dry run, would). */
+export interface RewoundEvent {
+  type: 'rewound'
+  checkpoint: number
+  mode: RewindMode
+  dry_run: boolean
+  restored: string[]
+  removed: string[]
+  not_restored: NotRestoredFile[]
+  /** Shell commands run since the checkpoint; what they did was not undone. */
+  shell_commands: string[]
+  /**
+   * Prompts taken out of the conversation: drop the last `removed_turns`
+   * prompts with everything after them. 0 when the chat was kept.
+   */
+  removed_turns: number
+  /** The checkpoint's prompt, for the input box; null when the chat was kept. */
+  prompt: string | null
+}
+
 /** Engine → UI. `UiEvent` in protocol.rs (`#[serde(tag = "type")]`). */
 export type UiEvent =
   | ReadyEvent
@@ -281,6 +488,18 @@ export type UiEvent =
   | NoticeEvent
   | TurnFinishedEvent
   | ErrorEvent
+  | ToolInputStartedEvent
+  | ToolInputProgressEvent
+  | OutputProgressEvent
+  | RequestUsageEvent
+  | TodosEvent
+  | SubagentStartedEvent
+  | SubagentFinishedEvent
+  | ChangesEvent
+  | DiffEvent
+  | CommitProposalEvent
+  | CheckpointsEvent
+  | RewoundEvent
 
 export type UiEventType = UiEvent['type']
 
@@ -302,6 +521,18 @@ export const UI_EVENT_TYPES: readonly UiEventType[] = [
   'notice',
   'turn_finished',
   'error',
+  'tool_input_started',
+  'tool_input_progress',
+  'output_progress',
+  'request_usage',
+  'todos',
+  'subagent_started',
+  'subagent_finished',
+  'changes',
+  'diff',
+  'commit_proposal',
+  'checkpoints',
+  'rewound',
 ]
 
 // ---------------------------------------------------------------- UI → engine
@@ -326,6 +557,15 @@ export type EngineCommand =
   | { type: 'interrupt' }
   /** Save and stop. */
   | { type: 'shutdown' }
+  /**
+   * What this UI handles (`CAPABILITY_*`), when the engine lists
+   * {@link FEATURE_CAPABILITIES}. Replaces an earlier one; may come at any time.
+   */
+  | { type: 'capabilities'; features: string[]; client?: string | null }
+  /** Commit with this message: what is staged, or every change when nothing is. */
+  | { type: 'commit'; message: string }
+  /** Go back to a checkpoint from a `checkpoints` event. */
+  | { type: 'rewind'; checkpoint: number; mode: RewindMode; dry_run?: boolean }
 
 /** The user's answer to a permission request (`#[serde(tag = "kind")]`). */
 export type PermissionDecision =
