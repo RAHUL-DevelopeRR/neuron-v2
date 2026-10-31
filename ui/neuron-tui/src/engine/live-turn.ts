@@ -160,13 +160,12 @@ export function endedLiveTurn(state: LiveTurnState): LiveTurnState {
 
 /**
  * The engine sends the request again: what the failed attempt streamed is
- * dropped, tool input it was writing included, and the wait starts over.
+ * dropped, every call it made included (a request goes out only once the
+ * earlier calls have their results, so all calls without one are the
+ * attempt's), and the wait starts over.
  */
 export function retriedLiveTurn(state: LiveTurnState, now: number): LiveTurnState {
-  return requestSent(
-    { ...state, calls: state.calls.filter((call) => call.phase !== 'input') },
-    now,
-  )
+  return requestSent({ ...state, calls: [], pendingTodoWrites: [] }, now)
 }
 
 /** A TodoWrite result: its list becomes the agent's when the call worked. */

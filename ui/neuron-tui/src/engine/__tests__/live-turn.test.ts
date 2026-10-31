@@ -317,6 +317,45 @@ describe('a stalled stream', () => {
     expect(activity()).toMatchObject({ verb: 'Responding', stalled: false })
   })
 
+  test('a retry also drops a call the failed attempt had already shown', () => {
+    const { sink, tools, text } = turnHarness()
+    sink.handle({ type: 'text_delta', text: 'Let me look.' })
+    sink.handle({ type: 'text_block_end' })
+    sink.handle({
+      type: 'tool_call_started',
+      id: 'ls_1',
+      name: 'bash',
+      input: '{"command":"ls"}',
+      cut_off: false,
+    })
+    sink.handle({ type: 'reasoning_delta', text: 'and then' })
+    expect(activity()).toMatchObject({ verb: 'Running', target: 'ls' })
+    sink.handle({ type: 'notice', message: 'Zero-X upstream_timeout; retrying in 1.3s (retry 1 of 2)' })
+    // The attempt's text and its call are gone: the next attempt sends them again.
+    expect(tools()).toEqual([])
+    expect(text()).toEqual([])
+    expect(live().calls).toEqual([])
+    expect(activity()).toMatchObject({ verb: 'Waiting for the model', stalled: false })
+
+    sink.handle({ type: 'text_delta', text: 'Let me look.' })
+    advance(11_000)
+    // Nothing runs, so a silent stream can read as stalled again.
+    expect(activity().stalled).toBe(true)
+    sink.handle({ type: 'text_block_end' })
+    sink.handle({
+      type: 'tool_call_started',
+      id: 'ls_2',
+      name: 'bash',
+      input: '{"command":"ls"}',
+      cut_off: false,
+    })
+    sink.handle({ type: 'tool_result', id: 'ls_2', name: 'bash', output: 'a.txt', is_error: false })
+    sink.handle({ type: 'turn_finished' })
+    sink.finish()
+    expect(text()).toEqual(['Let me look.'])
+    expect(tools().map((tool) => [tool.toolCallId, tool.isError])).toEqual([['ls_2', false]])
+  })
+
   test('an older engine: only text and reasoning reset the clock', () => {
     const { sink } = turnHarness()
     sink.handle({ type: 'reasoning_delta', text: 'hmm' })

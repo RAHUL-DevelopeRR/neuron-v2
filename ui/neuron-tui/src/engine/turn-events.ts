@@ -126,8 +126,11 @@ export function createTurnEventSink(
   const updater = state.message.updater
   /**
    * How many blocks the message had when the current attempt of the model
-   * call began. Read in the updater's order, so it counts the blocks of the
-   * events before it even while updates are batched.
+   * call began: the turn's start, or the result that left no call open (the
+   * engine then sends the next request). A call the model made counts as part
+   * of its attempt: a retry sends the whole response again. Read in the
+   * updater's order, so it counts the blocks of the events before it even
+   * while updates are batched.
    */
   let attemptStart = 0
   const markAttemptStart = () =>
@@ -183,14 +186,14 @@ export function createTurnEventSink(
   }
 
   /**
-   * The engine sends the model call again. Calls whose input the failed
-   * attempt was still writing never ran and get no result: their rows go
-   * with the attempt's text.
+   * The engine sends the model call again. The calls the failed attempt made
+   * (still being written, or shown and waiting for the response to end)
+   * never ran and get no result: their rows go with the attempt's text. A
+   * request is only sent once every earlier call has its result, so every
+   * call still open is the attempt's.
    */
-  const dropStreamingCalls = () => {
-    const dropped = new Set(
-      open.filter((call) => call.inputStreaming).map((call) => call.id),
-    )
+  const dropAttemptCalls = () => {
+    const dropped = new Set(open.map((call) => call.id))
     if (dropped.size === 0) return
     for (let index = open.length - 1; index >= 0; index--) {
       if (dropped.has(open[index]!.id)) open.splice(index, 1)
@@ -329,10 +332,11 @@ export function createTurnEventSink(
           if (event.cut_off) {
             if (streamed) open.splice(open.indexOf(streamed), 1)
             close(call, 'The output limit cut this call off, so it did not run.', true)
+            // The model is asked to make it again, in a new request.
+            if (open.length === 0) markAttemptStart()
           } else if (!streamed) {
             open.push(call)
           }
-          markAttemptStart()
           return
         }
         case 'subagent_started': {
@@ -381,7 +385,7 @@ export function createTurnEventSink(
           }
           const [call] = open.splice(index, 1)
           close(call!, event.output, event.is_error)
-          markAttemptStart()
+          if (open.length === 0) markAttemptStart()
           return
         }
         case 'notice': {
@@ -407,7 +411,7 @@ export function createTurnEventSink(
             updater.updateAiMessageBlocks((blocks) =>
               dropFailedAttempt(blocks, attemptStart),
             )
-            dropStreamingCalls()
+            dropAttemptCalls()
             // "retrying..." until the next attempt's first token.
             state.setIsRetrying(true)
             live.retry()
