@@ -877,6 +877,295 @@ fn stdio_engine_shows_a_tool_call_while_the_model_writes_it() {
     let _ = fs::remove_dir_all(&home);
 }
 
+/// `git` in `cwd` (the test's own environment); its stdout.
+fn git(cwd: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .expect("git runs");
+    assert!(
+        output.status.success(),
+        "git {}: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// The types of `events`, in order.
+fn types(events: &[Value]) -> Vec<String> {
+    events
+        .iter()
+        .map(|event| event["type"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// Source control from the UI, in a repository whose stylesheet the agent rewrites: the
+/// change shows during the turn (with the footer's git counts), `/diff` shows it against
+/// `HEAD`, `/commit` drafts a message with the model and commits nothing, the `commit`
+/// command commits, `/rewind` lists the prompt's checkpoint and the `rewind` command
+/// previews, then puts the stylesheet back and takes the prompt out. A UI that did not
+/// declare `git_views` gets notices instead.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn stdio_engine_tracks_changes_diffs_commits_and_rewinds() {
+    let gateway = FakeGateway::with_replies(vec![
+        write_file_reply(),
+        text_reply("Written."),
+        text_reply("```\nfeat(site): drop the page margin\n\nThe page starts at the edge.\n```"),
+    ]);
+    let (workspace, home) = workspace_and_home("source-control");
+    let style = workspace.join("site").join("style.css");
+    fs::create_dir_all(style.parent().expect("site")).expect("site folder");
+    fs::write(&style, "body {\n  margin: 8px;\n}\n").expect("stylesheet");
+    git(&workspace, &["init", "-q", "-b", "main"]);
+    git(&workspace, &["config", "user.email", "tests@example.com"]);
+    git(&workspace, &["config", "user.name", "Neuron Tests"]);
+    git(&workspace, &["config", "commit.gpgsign", "false"]);
+    git(&workspace, &["config", "core.autocrlf", "false"]);
+    git(&workspace, &["add", "-A"]);
+    git(&workspace, &["commit", "-q", "-m", "Add the site"]);
+    let mut engine = StdioEngine::start(
+        &workspace,
+        &home,
+        &[
+            ("NEURON_API_BASE", &gateway.base),
+            ("NEURON_TOKEN", SESSION),
+        ],
+        &["--permission-mode", "workspace-write"],
+        Some(SESSION),
+    );
+    let ready = engine.next();
+    let features = ready["features"].as_array().expect("features");
+    for feature in ["git_views", "checkpoints"] {
+        assert!(features.iter().any(|listed| listed == feature), "{ready}");
+    }
+    let status = engine.next_of("status");
+    assert_eq!(status["git"]["branch"], "main", "{status}");
+    assert_eq!(status["git"]["changed"], 0, "{status}");
+    engine.send(&json!({
+        "kind": "command", "type": "capabilities",
+        "features": ["live_progress", "git_views"], "client": "terminal",
+    }));
+
+    // The write shows in the changes once its result is in, and the footer counts it.
+    engine.send(&submit("write the stylesheet"));
+    let turn = engine.until("turn_finished");
+    let restyled =
+        json!([{"path": "site/style.css", "status": "modified", "added": 1, "removed": 1}]);
+    let kinds = types(&turn);
+    let result = kinds
+        .iter()
+        .position(|kind| kind == "tool_result")
+        .expect("a result");
+    let changes = turn
+        .iter()
+        .position(|event| event["type"] == "changes" && event["files"] == restyled)
+        .unwrap_or_else(|| panic!("the change: {turn:?}"));
+    assert!(result < changes, "{kinds:?}");
+    let footer = turn[changes..]
+        .iter()
+        .find(|event| event["type"] == "status")
+        .unwrap_or_else(|| panic!("the footer during the turn: {turn:?}"));
+    assert_eq!(footer["git"]["unstaged"], 1, "{footer}");
+    engine.next_of("status");
+
+    // `/diff`: against HEAD, with the hunk.
+    engine.slash("diff");
+    let diff = main_events(&engine.until("turn_finished"));
+    assert_eq!(types(&diff), ["diff", "turn_finished"], "{diff:?}");
+    assert_eq!(
+        diff[0],
+        json!({
+            "type": "diff",
+            "title": "Changes against HEAD on main",
+            "files": [{
+                "path": "site/style.css", "status": "modified", "added": 1, "removed": 1,
+                "patch": "@@ -1,3 +1,3 @@\n body {\n-  margin: 8px;\n+  margin: 0;\n }\n",
+                "binary": false,
+            }],
+            "truncated": false,
+        })
+    );
+    engine.next_of("status");
+
+    // `/commit`: the model's draft, and nothing committed yet.
+    engine.slash("commit");
+    let proposal = main_events(&engine.until("turn_finished"));
+    assert_eq!(
+        types(&proposal),
+        ["commit_proposal", "turn_finished"],
+        "{proposal:?}"
+    );
+    assert_eq!(
+        proposal[0],
+        json!({
+            "type": "commit_proposal",
+            "message": "feat(site): drop the page margin\n\nThe page starts at the edge.",
+            "branch": "main",
+            "files": restyled,
+            "stage_all": true,
+        })
+    );
+    assert_eq!(
+        git(&workspace, &["rev-list", "--count", "HEAD"]).trim(),
+        "1"
+    );
+    engine.next_of("status");
+
+    // The `commit` command commits, with the message as given.
+    engine.send(&json!({
+        "kind": "command", "type": "commit",
+        "message": "Drop the page margin\n\nThe page starts at the edge.",
+    }));
+    let committed = engine.until("turn_finished");
+    let hash = git(&workspace, &["rev-parse", "--short", "HEAD"]);
+    assert!(
+        notices(&committed).contains(&format!(
+            "Committed {} on main: Drop the page margin (1 file)",
+            hash.trim()
+        )),
+        "{committed:?}"
+    );
+    let footer = committed
+        .iter()
+        .find(|event| event["type"] == "status")
+        .unwrap_or_else(|| panic!("the footer after the commit: {committed:?}"));
+    assert_eq!(footer["git"]["changed"], 0, "{footer}");
+    assert_eq!(
+        types(&main_events(&committed)),
+        ["changes", "turn_finished"]
+    );
+    assert_eq!(
+        git(&workspace, &["log", "-1", "--format=%B"]),
+        "Drop the page margin\n\nThe page starts at the edge.\n\n"
+    );
+    engine.next_of("status");
+
+    // `/rewind`: the prompt's checkpoint.
+    engine.slash("rewind");
+    let listed = main_events(&engine.until("turn_finished"));
+    assert_eq!(
+        types(&listed),
+        ["checkpoints", "turn_finished"],
+        "{listed:?}"
+    );
+    let items = listed[0]["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "{listed:?}");
+    assert_eq!(items[0]["prompt_preview"], "write the stylesheet");
+    assert_eq!(items[0]["files"], json!(["site/style.css"]));
+    let checkpoint = items[0]["id"].as_u64().expect("an id");
+    engine.next_of("status");
+
+    // A dry run, then the rewind itself.
+    engine.send(&json!({
+        "kind": "command", "type": "rewind",
+        "checkpoint": checkpoint, "mode": "code_only", "dry_run": true,
+    }));
+    let preview = main_events(&engine.until("turn_finished"));
+    assert_eq!(types(&preview), ["rewound", "turn_finished"], "{preview:?}");
+    assert_eq!(preview[0]["dry_run"], true);
+    assert_eq!(preview[0]["restored"], json!(["site/style.css"]));
+    assert_eq!(preview[0]["removed_turns"], 0);
+    assert_eq!(preview[0]["prompt"], Value::Null);
+    assert!(fs::read_to_string(&style)
+        .expect("style")
+        .contains("margin: 0;"));
+    engine.next_of("status");
+
+    engine.send(&json!({
+        "kind": "command", "type": "rewind",
+        "checkpoint": checkpoint, "mode": "code_and_chat",
+    }));
+    let rewound = engine.until("turn_finished");
+    assert_eq!(
+        types(&main_events(&rewound)),
+        ["rewound", "changes", "turn_finished"],
+        "{rewound:?}"
+    );
+    let report = &main_events(&rewound)[0];
+    assert_eq!(report["mode"], "code_and_chat");
+    assert_eq!(report["dry_run"], false);
+    assert_eq!(report["restored"], json!(["site/style.css"]));
+    assert_eq!(report["removed_turns"], 1);
+    assert_eq!(report["prompt"], "write the stylesheet");
+    assert_eq!(main_events(&rewound)[1]["files"], json!([]));
+    assert_eq!(
+        fs::read_to_string(&style).expect("style"),
+        "body {\n  margin: 8px;\n}\n"
+    );
+    let footer = rewound
+        .iter()
+        .find(|event| event["type"] == "status")
+        .unwrap_or_else(|| panic!("the footer after the rewind: {rewound:?}"));
+    assert_eq!(footer["git"]["unstaged"], 1, "{footer}");
+    engine.next_of("status");
+
+    // Without git views: notices only.
+    engine.send(&json!({
+        "kind": "command", "type": "capabilities",
+        "features": ["live_progress"], "client": "terminal",
+    }));
+    engine.slash("diff");
+    let diff = engine.until("turn_finished");
+    assert_eq!(types(&main_events(&diff)), ["turn_finished"], "{diff:?}");
+    assert!(
+        notices(&diff).iter().any(|notice| notice
+            .starts_with("Changes against HEAD on main\n1 file, +1 -1")
+            && notice.contains("+  margin: 8px;")),
+        "{diff:?}"
+    );
+    engine.next_of("status");
+    engine.slash("rewind");
+    let listed = engine.until("turn_finished");
+    assert_eq!(
+        types(&main_events(&listed)),
+        ["turn_finished"],
+        "{listed:?}"
+    );
+    assert!(
+        notices(&listed)
+            .iter()
+            .any(|notice| notice.starts_with("No checkpoints yet")),
+        "{listed:?}"
+    );
+    engine.next_of("status");
+    engine.send(&json!({
+        "kind": "command", "type": "slash", "command": "commit",
+        "args": "Restore the page margin",
+    }));
+    let committed = engine.until("turn_finished");
+    assert_eq!(
+        types(&main_events(&committed)),
+        ["turn_finished"],
+        "{committed:?}"
+    );
+    assert!(
+        notices(&committed)
+            .iter()
+            .any(|notice| notice.ends_with(": Restore the page margin (1 file)")),
+        "{committed:?}"
+    );
+    assert_eq!(
+        git(&workspace, &["rev-list", "--count", "HEAD"]).trim(),
+        "3"
+    );
+    assert_eq!(
+        gateway
+            .requests()
+            .iter()
+            .filter(|request| *request == "POST /v1/chat/completions (signed)")
+            .count(),
+        3,
+        "two for the turn, one for the draft"
+    );
+
+    engine.end_input();
+    let _ = fs::remove_dir_all(&workspace);
+    let _ = fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_launch_that_fails_reports_one_error_event() {
     let (workspace, home) = workspace_and_home("bad-launch");
