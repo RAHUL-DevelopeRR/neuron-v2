@@ -294,6 +294,39 @@ describe('the rewind flow', () => {
     expect(useChatStore.getState().inputValue).toBe('draft')
   })
 
+  test('two quick Enters on the preview send one rewind', async () => {
+    const { sent, emit } = installFakeGitEngine()
+    emit({ type: 'checkpoints', items: CHECKPOINTS }, { type: 'turn_finished' })
+    gitViews().pickCheckpoint(CHECKPOINTS[0]!)
+    gitViews().pickMode('chat_only')
+    previewRewind()
+    await flushExchanges()
+    emit(
+      {
+        type: 'rewound',
+        checkpoint: 3,
+        mode: 'chat_only',
+        dry_run: true,
+        restored: [],
+        removed: [],
+        not_restored: [],
+        shell_commands: [],
+        removed_turns: 1,
+        prompt: 'add tests',
+      },
+      { type: 'turn_finished' },
+    )
+    confirmRewind()
+    confirmRewind()
+    // The first one ends; a second would be sent now.
+    await flushExchanges()
+    emit({ type: 'turn_finished' })
+    await flushExchanges()
+    emit({ type: 'turn_finished' })
+    await flushExchanges()
+    expect(sent.filter((command) => command.type === 'rewind' && !command.dry_run)).toHaveLength(1)
+  })
+
   test('a dry run that fails says why in the picker', async () => {
     const { emit } = installFakeGitEngine()
     emit({ type: 'checkpoints', items: CHECKPOINTS }, { type: 'turn_finished' })

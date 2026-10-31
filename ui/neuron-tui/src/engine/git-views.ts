@@ -245,10 +245,10 @@ export function previewRewind(): void {
   })
 }
 
-/** Enter on the preview: the real rewind. */
+/** Enter on the preview: the real rewind, once (a second Enter does nothing). */
 export function confirmRewind(): void {
   const picked = pickedRewind()
-  if (!picked || !picked.flow.preview) return
+  if (!picked || !picked.flow.preview || picked.flow.confirmed) return
   const engine = readyEngine()
   if (!engine) {
     useGitViewsStore.getState().closeRewind()
