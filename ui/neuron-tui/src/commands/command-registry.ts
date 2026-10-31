@@ -1,10 +1,12 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: /bash
 // (and its `!` alias) is not registered while shell commands are not
 // implemented (USER_SHELL_AVAILABLE in utils/user-shell.ts), so "/bash" goes
-// to the engine like any command the UI does not have.
+// to the engine like any command the UI does not have; the git commands
+// (git-view-commands.ts) are found only when the engine has their feature.
 // See ui/neuron-tui/PORTING.md.
 import { handleCopyConversationCommand } from './copy-conversation'
 import { handleExportConversationCommand } from './export-conversation'
+import { findGitViewCommand } from './git-view-commands'
 import { handleHelpCommand } from './help'
 import { handleImageCommand } from './image'
 import {
@@ -473,6 +475,9 @@ export function findCommand(cmd: string): CommandDefinition | undefined {
   if (staticCommand) {
     return staticCommand
   }
+
+  const gitViewCommand = findGitViewCommand(lowerCmd)
+  if (gitViewCommand) return gitViewCommand
 
   // Check if this is a skill command (prefixed with "skill:")
   if (lowerCmd.startsWith('skill:')) {
