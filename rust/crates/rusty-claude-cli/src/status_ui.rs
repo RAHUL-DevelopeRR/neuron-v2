@@ -342,14 +342,18 @@ pub(crate) fn prompt_count(session: &Session) -> u32 {
     let prompts = session
         .messages
         .iter()
-        .filter(|message| {
-            message.role == MessageRole::User
-                && !message.blocks.iter().any(|block| {
-                    matches!(block, ContentBlock::Text { text } if text.starts_with(runtime::AUTO_CONTINUE_PREFIX))
-                })
-        })
+        .filter(|message| is_prompt(message))
         .count();
     u32::try_from(prompts).unwrap_or(u32::MAX)
+}
+
+/// Whether `message` is a prompt the user sent, not one the runtime added to continue a
+/// turn.
+pub(crate) fn is_prompt(message: &ConversationMessage) -> bool {
+    message.role == MessageRole::User
+        && !message.blocks.iter().any(|block| {
+            matches!(block, ContentBlock::Text { text } if text.starts_with(runtime::AUTO_CONTINUE_PREFIX))
+        })
 }
 
 pub(crate) fn format_status_report(

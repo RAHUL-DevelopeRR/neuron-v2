@@ -8,6 +8,7 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -149,6 +150,32 @@ impl From<bool> for TurnOutput {
 pub(crate) struct UiChannel {
     pub(crate) events: Sender<UiEvent>,
     pub(crate) capabilities: Arc<UiCapabilities>,
+    /// Runs after each tool call that may have changed files.
+    pub(crate) after_file_changes: Option<ChangeListener>,
+}
+
+impl UiChannel {
+    fn sink(&self) -> ChannelSink {
+        ChannelSink::with_capabilities(Sender::clone(&self.events), Arc::clone(&self.capabilities))
+            .with_change_listener(self.after_file_changes.clone())
+    }
+}
+
+/// What runs after a tool call that may have changed files ends: the engine tells the UI
+/// what the agent changed and the footer's new git counts from here.
+#[derive(Clone)]
+pub(crate) struct ChangeListener(Arc<dyn Fn() + Send + Sync>);
+
+impl ChangeListener {
+    pub(crate) fn new(listener: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(Arc::new(listener))
+    }
+}
+
+impl fmt::Debug for ChangeListener {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ChangeListener")
+    }
 }
 
 /// What the UI declared it handles ([`EngineCommand::Capabilities`]). The engine's
@@ -195,6 +222,21 @@ impl TurnOutput {
         Self::Channel(Arc::new(UiChannel {
             events,
             capabilities,
+            after_file_changes: None,
+        }))
+    }
+
+    /// The engine's channel: `after_file_changes` runs after each tool call that may have
+    /// changed files.
+    pub(crate) fn engine_channel(
+        events: Sender<UiEvent>,
+        capabilities: Arc<UiCapabilities>,
+        after_file_changes: ChangeListener,
+    ) -> Self {
+        Self::Channel(Arc::new(UiChannel {
+            events,
+            capabilities,
+            after_file_changes: Some(after_file_changes),
         }))
     }
 
@@ -217,10 +259,7 @@ impl TurnOutput {
                     .for_stdout_terminal()
                     .spacing_tool_results(&STDOUT_AFTER_TOOL_RESULT),
             ),
-            Self::Channel(channel) => Box::new(ChannelSink::with_capabilities(
-                Sender::clone(&channel.events),
-                Arc::clone(&channel.capabilities),
-            )),
+            Self::Channel(channel) => Box::new(channel.sink()),
             #[cfg(test)]
             Self::Captured(buffer) => {
                 Box::new(AnsiSink::new(StripAnsi::new(Captured(Arc::clone(buffer)))))
@@ -242,10 +281,7 @@ impl TurnOutput {
                     .for_stdout_terminal()
                     .spacing_tool_results(&STDOUT_AFTER_TOOL_RESULT),
             ),
-            Self::Channel(channel) => Box::new(ChannelSink::with_capabilities(
-                Sender::clone(&channel.events),
-                Arc::clone(&channel.capabilities),
-            )),
+            Self::Channel(channel) => Box::new(channel.sink()),
             #[cfg(test)]
             Self::Captured(buffer) => {
                 Box::new(AnsiSink::new(StripAnsi::new(Captured(Arc::clone(buffer)))))
@@ -589,6 +625,8 @@ pub(crate) struct ChannelSink {
     /// The response as the model writes it, for the live-progress events.
     live: LiveProgress,
     clock: Clock,
+    /// Runs after each tool call that may have changed files.
+    after_file_changes: Option<ChangeListener>,
 }
 
 /// What a sink knows of the response the model is writing, for the live-progress
@@ -631,7 +669,14 @@ impl ChannelSink {
             subagents: HashSet::new(),
             live: LiveProgress::default(),
             clock: Arc::new(Instant::now),
+            after_file_changes: None,
         }
+    }
+
+    /// `listener` runs after each tool call that may have changed files.
+    pub(crate) fn with_change_listener(mut self, listener: Option<ChangeListener>) -> Self {
+        self.after_file_changes = listener;
+        self
     }
 
     /// The throttles read the time from `clock`.
@@ -727,6 +772,17 @@ impl ChannelSink {
 
 const AGENT_TOOL: &str = "Agent";
 const TODO_TOOL: &str = "TodoWrite";
+/// Tools whose calls may change files: the agent's file tools, its shells, and
+/// sub-agents, which run them too.
+const FILE_CHANGING_TOOLS: &[&str] = &[
+    "write_file",
+    "edit_file",
+    "NotebookEdit",
+    "bash",
+    "PowerShell",
+    "REPL",
+    AGENT_TOOL,
+];
 
 fn string_field(value: &Value, key: &str) -> Option<String> {
     value
@@ -920,6 +976,12 @@ impl TurnSink for ChannelSink {
         }
         if name == AGENT_TOOL && self.subagents.remove(id) {
             self.send(subagent_finished(id, output, is_error))?;
+        }
+        // A failed call may have changed files too.
+        if FILE_CHANGING_TOOLS.contains(&name) {
+            if let Some(listener) = &self.after_file_changes {
+                (listener.0)();
+            }
         }
         Ok(())
     }
@@ -1183,6 +1245,38 @@ mod tests {
         drop(rx);
         let error = sink.text_delta("anyone?").unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    /// The engine's channel hears about every call that may have changed files, failed
+    /// ones too, after the UI has the result; read-only tools do not count.
+    #[test]
+    fn the_engine_channel_runs_its_listener_after_calls_that_may_change_files() {
+        let (tx, rx) = mpsc::channel();
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&heard);
+        let results = std::sync::Mutex::new(rx);
+        let output = TurnOutput::engine_channel(
+            tx,
+            Arc::default(),
+            ChangeListener::new(move || {
+                let delivered = results.lock().expect("events").try_iter().count();
+                seen.lock().expect("heard").push(delivered);
+            }),
+        );
+        let mut sink = output.tool_sink();
+        for (name, is_error) in [
+            ("write_file", false),
+            ("read_file", false),
+            ("bash", true),
+            ("grep_search", false),
+            ("edit_file", false),
+            ("Agent", false),
+        ] {
+            sink.tool_call_finished("t", name, "done", is_error)
+                .unwrap();
+        }
+        // Each time, the result was already sent: one event, plus the skipped ones.
+        assert_eq!(*heard.lock().expect("heard"), [1, 2, 2, 1]);
     }
 
     /// `TodoWrite` results become the task list; `Agent` calls that run become sub-agent

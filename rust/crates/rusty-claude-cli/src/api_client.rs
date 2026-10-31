@@ -570,6 +570,55 @@ impl AnthropicRuntimeClient {
         self.timeouts = timeouts;
     }
 
+    /// One short request to the session's model, without tools or history: `prompt`
+    /// under `instructions`, answered with the reply's text. Gives up after `timeout`,
+    /// or when `cancel` fires. Nothing of it shows on the UI.
+    pub(crate) fn complete_text(
+        &self,
+        instructions: &str,
+        prompt: &str,
+        max_tokens: u32,
+        timeout: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<String, String> {
+        let request = MessageRequest {
+            model: self.model.clone(),
+            max_tokens,
+            messages: vec![InputMessage::user_text(prompt)],
+            system: Some(instructions.to_string()),
+            stream: true,
+            ..Default::default()
+        };
+        self.runtime.block_on(async {
+            let reply = async {
+                let mut stream = self
+                    .client
+                    .stream_message(&request)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let mut text = String::new();
+                while let Some(event) = stream
+                    .next_event()
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    if let ApiStreamEvent::ContentBlockDelta(delta) = event {
+                        if let ContentBlockDelta::TextDelta { text: piece } = delta.delta {
+                            text.push_str(&piece);
+                        }
+                    }
+                }
+                Ok(text)
+            };
+            tokio::select! {
+                reply = tokio::time::timeout(timeout, reply) => reply.unwrap_or_else(|_| {
+                    Err(format!("no answer within {} seconds", timeout.as_secs()))
+                }),
+                () = cancel.cancelled() => Err("cancelled".to_string()),
+            }
+        })
+    }
+
     /// The deferred MCP tool definitions `request` carries: the ones its conversation
     /// brought into play. None with an allow-list, which names every tool itself.
     fn deferred_mcp_tools(&self, request: &ApiRequest) -> Vec<ToolDefinition> {
