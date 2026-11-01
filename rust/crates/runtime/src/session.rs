@@ -321,7 +321,8 @@ impl Session {
         }
     }
 
-    pub fn push_message(&mut self, message: ConversationMessage) -> Result<(), SessionError> {
+    pub fn push_message(&mut self, mut message: ConversationMessage) -> Result<(), SessionError> {
+        crate::redaction::redact_tool_result_in_place(&mut message);
         self.touch();
         self.messages.push(message);
         let persist_result = if self.take_pending_rewrite() {

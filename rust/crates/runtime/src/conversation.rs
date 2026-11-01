@@ -1234,6 +1234,8 @@ where
         result_message: ConversationMessage,
         progress: &mut TurnProgress,
     ) -> Result<(), RuntimeError> {
+        // One redaction for every consumer: session file, model, UI events.
+        let result_message = crate::redaction::redact_tool_result(result_message);
         self.session
             .push_message(result_message.clone())
             .map_err(session_error)?;
@@ -2710,6 +2712,44 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A secret a tool printed is redacted before the session, the model's
+    /// next request and the session file see it.
+    #[test]
+    fn tool_output_secrets_are_redacted_before_the_session_and_model() {
+        let path = std::env::temp_dir().join(format!(
+            "runtime-redact-session-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        let mut runtime = ConversationRuntime::new(
+            Session::new().with_persistence_path(&path),
+            ScriptedApiClient { call_count: 0 },
+            StaticToolExecutor::new().register("add", |_input| {
+                Ok("4 GITHUB_TOKEN=ghp_0123456789abcdefABCDEF0123456789abcd".to_string())
+            }),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        );
+        let summary = runtime
+            .run_turn("what is 2 + 2?", Some(&mut PromptAllowOnce))
+            .expect("turn");
+        let ContentBlock::ToolResult { output, .. } = &summary.tool_results[0].blocks[0] else {
+            panic!("tool result");
+        };
+        assert_eq!(output, "4 GITHUB_TOKEN=[REDACTED:github-token]");
+        let ContentBlock::ToolResult { output, .. } = &runtime.session().messages[2].blocks[0]
+        else {
+            panic!("tool result in session");
+        };
+        assert!(!output.contains("ghp_"), "{output}");
+        let persisted = std::fs::read_to_string(&path).expect("session file");
+        let _ = std::fs::remove_file(&path);
+        assert!(!persisted.contains("ghp_0123"), "{persisted}");
+        assert!(persisted.contains("[REDACTED:github-token]"));
     }
 
     #[test]

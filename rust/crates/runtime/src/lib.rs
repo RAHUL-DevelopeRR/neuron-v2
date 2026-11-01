@@ -45,6 +45,7 @@ pub mod plugin_lifecycle;
 mod policy_engine;
 mod prompt;
 pub mod recovery_recipes;
+pub mod redaction;
 mod refusal;
 mod remote;
 pub mod sandbox;

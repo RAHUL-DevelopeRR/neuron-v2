@@ -975,6 +975,17 @@ impl RuntimeConfig {
     pub fn trusted_roots(&self) -> &[String] {
         &self.feature_config.trusted_roots
     }
+
+    /// Whether tool output, the session file and telemetry get token-shaped
+    /// secrets replaced (`"redactSecrets"`, default `true`). Untrusted
+    /// workspace settings cannot turn it off: the trust gate drops the key.
+    #[must_use]
+    pub fn redact_secrets(&self) -> bool {
+        self.merged
+            .get("redactSecrets")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(true)
+    }
 }
 
 impl RuntimeFeatureConfig {
@@ -2289,6 +2300,22 @@ mod tests {
         assert_eq!(config.args, vec![entry.to_string_lossy().into_owned()]);
         assert_ne!(config.command, "npx");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn redact_secrets_defaults_on_and_user_settings_can_turn_it_off() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".neuron");
+        fs::create_dir_all(cwd.join(".neuron")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        let loaded = ConfigLoader::new(&cwd, &home).load().expect("config");
+        assert!(loaded.redact_secrets());
+        fs::write(home.join("settings.json"), r#"{"redactSecrets": false}"#)
+            .expect("write settings");
+        let loaded = ConfigLoader::new(&cwd, &home).load().expect("config");
+        assert!(!loaded.redact_secrets());
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]

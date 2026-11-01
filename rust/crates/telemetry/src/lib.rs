@@ -260,9 +260,29 @@ impl JsonlTelemetrySink {
     }
 }
 
+impl TelemetryEvent {
+    /// The event with token-shaped secrets in its strings replaced by
+    /// `[REDACTED:<kind>]` (see the `redact` crate); unchanged when redaction
+    /// is off or nothing matched.
+    #[must_use]
+    pub fn redacted(self) -> Self {
+        if !redact::is_enabled() {
+            return self;
+        }
+        let Ok(mut value) = serde_json::to_value(&self) else {
+            return self;
+        };
+        if !redact::redact_json(&mut value) {
+            return self;
+        }
+        serde_json::from_value(value).unwrap_or(self)
+    }
+}
+
 impl TelemetrySink for JsonlTelemetrySink {
     fn record(&self, event: TelemetryEvent) {
-        let Ok(line) = serde_json::to_string(&event) else {
+        // The file outlives the session: never write a credential to it.
+        let Ok(line) = serde_json::to_string(&event.redacted()) else {
             return;
         };
         let mut file = self
@@ -312,7 +332,7 @@ impl SessionTracer {
             timestamp_ms: current_timestamp_ms(),
             attributes,
         };
-        self.sink.record(TelemetryEvent::SessionTrace(record));
+        self.emit(TelemetryEvent::SessionTrace(record));
     }
 
     pub fn record_http_request_started(
@@ -324,7 +344,7 @@ impl SessionTracer {
     ) {
         let method = method.into();
         let path = path.into();
-        self.sink.record(TelemetryEvent::HttpRequestStarted {
+        self.emit(TelemetryEvent::HttpRequestStarted {
             session_id: self.session_id.clone(),
             attempt,
             method: method.clone(),
@@ -348,7 +368,7 @@ impl SessionTracer {
     ) {
         let method = method.into();
         let path = path.into();
-        self.sink.record(TelemetryEvent::HttpRequestSucceeded {
+        self.emit(TelemetryEvent::HttpRequestSucceeded {
             session_id: self.session_id.clone(),
             attempt,
             method: method.clone(),
@@ -377,7 +397,7 @@ impl SessionTracer {
         let method = method.into();
         let path = path.into();
         let error = error.into();
-        self.sink.record(TelemetryEvent::HttpRequestFailed {
+        self.emit(TelemetryEvent::HttpRequestFailed {
             session_id: self.session_id.clone(),
             attempt,
             method: method.clone(),
@@ -392,6 +412,11 @@ impl SessionTracer {
         self.record("http_request_failed", trace_attributes);
     }
 
+    /// Every event a tracer produces goes to the sink redacted.
+    fn emit(&self, event: TelemetryEvent) {
+        self.sink.record(event.redacted());
+    }
+
     pub fn record_analytics(&self, event: AnalyticsEvent) {
         let mut attributes = event.properties.clone();
         attributes.insert(
@@ -399,7 +424,7 @@ impl SessionTracer {
             Value::String(event.namespace.clone()),
         );
         attributes.insert("action".to_string(), Value::String(event.action.clone()));
-        self.sink.record(TelemetryEvent::Analytics(event));
+        self.emit(TelemetryEvent::Analytics(event));
         self.record("analytics", attributes);
     }
 }
@@ -428,6 +453,46 @@ fn current_timestamp_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tracer_redacts_secrets_before_any_sink() {
+        let sink = Arc::new(MemoryTelemetrySink::default());
+        let tracer = SessionTracer::new("s", sink.clone());
+        let mut attributes = Map::new();
+        attributes.insert(
+            "error".to_string(),
+            Value::String("401 for key sk-ant-api03-AbCdEf0123456789xyzXYZ".to_string()),
+        );
+        tracer.record("http_failed", attributes);
+        let events = sink.events();
+        let TelemetryEvent::SessionTrace(record) = &events[0] else {
+            panic!("trace event");
+        };
+        assert_eq!(
+            record.attributes["error"],
+            Value::String("401 for key [REDACTED:anthropic-key]".to_string())
+        );
+    }
+
+    #[test]
+    fn jsonl_sink_never_writes_a_secret() {
+        let path = std::env::temp_dir().join(format!(
+            "telemetry-redact-{}-{}.jsonl",
+            std::process::id(),
+            current_timestamp_ms()
+        ));
+        let sink = JsonlTelemetrySink::new(&path).expect("sink");
+        sink.record(TelemetryEvent::Analytics(
+            AnalyticsEvent::new("tool", "failed").with_property(
+                "stderr",
+                Value::String("GITHUB_TOKEN=ghp_0123456789abcdefABCDEF0123456789abcd".to_string()),
+            ),
+        ));
+        let written = std::fs::read_to_string(&path).expect("read");
+        let _ = std::fs::remove_file(&path);
+        assert!(!written.contains("ghp_0123"), "{written}");
+        assert!(written.contains("[REDACTED:"), "{written}");
+    }
 
     #[test]
     fn request_profile_emits_headers_and_merges_body() {

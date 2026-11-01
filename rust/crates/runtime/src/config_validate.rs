@@ -217,6 +217,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "maxIterations",
         expected: FieldType::Number,
     },
+    FieldSpec {
+        name: "redactSecrets",
+        expected: FieldType::Bool,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[
