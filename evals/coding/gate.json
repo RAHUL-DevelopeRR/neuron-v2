@@ -1,0 +1,4 @@
+{
+  "min_pass_rate": 0.75,
+  "note": "Nightly gate for evals/coding/tasks against the gateway (README.md, 'Nightly CI'). 0.75 sits under the 79% no-harness baseline and the 92% harness result of 2026-10-24: with 8 tasks, two failures (6/8) still pass, three (5/8) fail the night."
+}

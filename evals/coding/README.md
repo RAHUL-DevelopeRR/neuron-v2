@@ -21,6 +21,43 @@ python evals/coding/run.py --provider nvidia --model nvidia/nemotron-3.5-lightni
 `results.jsonl` has one line per run (pass, iterations, tokens, time, served
 model, tools used, files changed, the check's output) and `summary.md` the table.
 
+## Nightly CI and the gate
+
+`.github/workflows/evals-nightly.yml` runs every night and on demand
+(`workflow_dispatch`, with optional `model`, `repeat` and `min_pass_rate`):
+
+- **gateway**: builds `neuron` (release, Linux) and runs the eight tasks with
+  `--provider zero-x --model auto`, the repository secret `NEURON_EVAL_API_KEY`
+  passed as `NEURON_TOKEN`. `--gate` reads `gate.json`; the job fails when any
+  variant/model passes fewer than `min_pass_rate` of the runs the provider did
+  not end, or when nothing was measured (every run a provider error). The
+  summary goes to the run page and `results.jsonl`, `summary.md` and
+  `report.json` (`--json-out`) to the `evals-gateway-*` artifact. Without the
+  secret (forks) the job says so and skips.
+- **keyless** (also on pull requests touching `evals/`): the runner's unit
+  tests (`python -m unittest discover -s evals/coding`), every grader's
+  self-test, the tasks in `mock-tasks/` against the scripted mock provider
+  (`rust/crates/mock-anthropic-service`) with `--min-pass-rate 1`, and the
+  TUI's UI-flow eval (`bun run eval:ui` in `ui/neuron-tui`).
+
+`gate.json` sets `min_pass_rate` to **0.75**: under the 79% no-harness baseline
+and the 92% harness result below, so with eight tasks two failures (6/8) pass
+and three (5/8) fail. Raise it once a few nights show where `auto` sits.
+
+The coding tasks need a model, so they cannot run against the mock provider:
+it only plays scripted turns named by `PARITY_SCENARIO:<name>` prompts.
+`mock-tasks/` holds tasks built from those scenarios; they check the pipeline
+(workspace, permissions, `neuron prompt`, the JSON report, grading, the gate),
+not a model:
+
+```bash
+cargo build -p rusty-claude-cli -p mock-anthropic-service   # in rust/
+rust/target/debug/mock-anthropic-service    # prints MOCK_ANTHROPIC_BASE_URL=...
+python evals/coding/run.py --provider mock --base-url http://127.0.0.1:PORT \
+    --tasks-dir evals/coding/mock-tasks --model sonnet \
+    --variant mock=rust/target/debug/neuron --min-pass-rate 1 --json-out report.json
+```
+
 ## How a run works
 
 Each run copies the task's `workspace/` into a new git repository, writes project
