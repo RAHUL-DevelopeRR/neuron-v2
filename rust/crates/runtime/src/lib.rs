@@ -11,6 +11,7 @@
     clippy::unnecessary_wraps
 )]
 
+pub mod artifacts;
 mod bash;
 pub mod bash_validation;
 mod bootstrap;

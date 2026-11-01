@@ -500,6 +500,8 @@ pub struct ConversationRuntime<C, T> {
     reviewer: Option<Box<dyn ChangeReviewer + Send>>,
     /// The user's message that started the current turn.
     turn_request: String,
+    /// Where tool outputs too large for the conversation are kept whole.
+    artifacts: Option<crate::artifacts::ArtifactStore>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -560,7 +562,21 @@ where
             check_counter: 0,
             reviewer: None,
             turn_request: String::new(),
+            artifacts: None,
         }
+    }
+
+    /// Keeps tool outputs longer than the tool-result cap whole in `store`; the model
+    /// gets the capped preview and the artifact's id (see [`crate::artifacts`]).
+    #[must_use]
+    pub fn with_artifact_store(mut self, store: crate::artifacts::ArtifactStore) -> Self {
+        self.artifacts = Some(store);
+        self
+    }
+
+    #[must_use]
+    pub fn artifact_store(&self) -> Option<&crate::artifacts::ArtifactStore> {
+        self.artifacts.as_ref()
     }
 
     /// Has the completion check ask `reviewer` for a second opinion on the turn's
@@ -846,6 +862,7 @@ where
             }
 
             self.prepare_context(&mut progress)?;
+            self.record_model_request_started(progress.iterations);
 
             let request = ApiRequest {
                 system_prompt: self.system_prompt.clone(),
@@ -1217,13 +1234,17 @@ where
                 true,
             ),
         };
+        let limit = self.context_manager.policy().max_tool_result_chars;
+        let context_manager = &self.context_manager;
+        let output = crate::artifacts::offload_tool_result(
+            self.artifacts.as_mut(),
+            tool_name,
+            output,
+            limit,
+            |output| context_manager.cap_tool_result(output),
+        );
         ExecutedToolCall {
-            message: ConversationMessage::tool_result(
-                tool_use_id,
-                tool_name,
-                self.context_manager.cap_tool_result(output),
-                is_error,
-            ),
+            message: ConversationMessage::tool_result(tool_use_id, tool_name, output, is_error),
             interrupted,
         }
     }
@@ -1788,7 +1809,32 @@ where
             "pending_tool_use_count".to_string(),
             Value::from(pending_tool_use_count as u64),
         );
+        if let Some(usage) = assistant_message.usage {
+            for (key, tokens) in [
+                ("input_tokens", usage.input_tokens),
+                ("output_tokens", usage.output_tokens),
+                ("cache_read_input_tokens", usage.cache_read_input_tokens),
+                (
+                    "cache_creation_input_tokens",
+                    usage.cache_creation_input_tokens,
+                ),
+            ] {
+                attributes.insert(key.to_string(), Value::from(tokens));
+            }
+        }
+        if let Some(model) = &self.served_model {
+            attributes.insert("served_model".to_string(), Value::String(model.clone()));
+        }
         session_tracer.record("assistant_iteration_completed", attributes);
+    }
+
+    fn record_model_request_started(&self, iteration: usize) {
+        let Some(session_tracer) = &self.session_tracer else {
+            return;
+        };
+        let mut attributes = Map::new();
+        attributes.insert("iteration".to_string(), Value::from(iteration as u64));
+        session_tracer.record("model_request_started", attributes);
     }
 
     fn record_tool_started(&self, iteration: usize, tool_name: &str) {
