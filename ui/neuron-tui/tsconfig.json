@@ -23,6 +23,6 @@
       "@neuron/client/*": ["../neuron-client/src/*"]
     }
   },
-  "include": ["src/**/*", "scripts/**/*.ts", "test/**/*.ts"],
+  "include": ["src/**/*", "scripts/**/*.ts", "test/**/*.ts", "evals/**/*"],
   "exclude": ["node_modules", "dist"]
 }
