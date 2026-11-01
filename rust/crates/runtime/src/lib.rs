@@ -27,9 +27,11 @@ pub mod default_skills;
 mod file_ops;
 mod git_context;
 pub mod green_contract;
+mod hook_matcher;
 mod hooks;
 mod json;
 mod lane_events;
+pub mod lifecycle_hooks;
 pub mod lsp_client;
 mod mcp;
 mod mcp_client;
@@ -115,8 +117,10 @@ pub use file_ops::{
     StructuredPatchHunk, TextFilePayload, WriteFileOutput,
 };
 pub use git_context::{GitCommitEntry, GitContext};
+pub use hook_matcher::{matcher_matches, validate_matcher, HookCommand, HookSource};
 pub use hooks::{
-    HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter, HookRunResult, HookRunner,
+    HookAbortSignal, HookEvent, HookOutcome, HookProgressEvent, HookProgressReporter,
+    HookRunResult, HookRunner, LifecycleHookInput, ToolUseIdReporter,
 };
 pub use lane_events::{
     compute_event_fingerprint, dedupe_superseded_commit_events, dedupe_terminal_events,
