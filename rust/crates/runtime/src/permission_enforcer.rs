@@ -225,7 +225,7 @@ fn is_within_workspace(path: &str, workspace_root: &str) -> bool {
 /// Whether a bash command line is read-only, judged over every simple
 /// command in it (see [`classify_shell_command`]).
 fn is_read_only_command(command: &str) -> bool {
-    let workspace = std::env::current_dir().ok();
+    let workspace = crate::workdir::current_dir().ok();
     classify_shell_command(command, ShellDialect::host(), workspace.as_deref()).is_read_only()
 }
 

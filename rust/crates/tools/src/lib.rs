@@ -860,7 +860,12 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "prompt": { "type": "string" },
                     "subagent_type": { "type": "string" },
                     "name": { "type": "string" },
-                    "model": { "type": "string" }
+                    "model": { "type": "string" },
+                    "isolation": {
+                        "type": "string",
+                        "enum": ["worktree"],
+                        "description": "`worktree`: run the sub-agent in a git worktree of its own, on a new branch from HEAD. The result names the branch when it changed anything; an unchanged worktree is removed."
+                    }
                 },
                 "required": ["description", "prompt"],
                 "additionalProperties": false
@@ -2316,7 +2321,7 @@ fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> 
 /// program with safe arguments that stays inside the workspace, otherwise
 /// `DangerFullAccess` (which prompts in workspace-write mode).
 fn classify_bash_permission(command: &str) -> PermissionMode {
-    let workspace = std::env::current_dir().ok();
+    let workspace = runtime::workdir::current_dir().ok();
     classify_shell_command(command, ShellDialect::host(), workspace.as_deref()).required_mode()
 }
 
@@ -2488,7 +2493,7 @@ fn branch_divergence_output(
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_read_file(input: ReadFileInput) -> Result<String, String> {
-    let workspace_root = std::env::current_dir().map_err(|error| error.to_string())?;
+    let workspace_root = runtime::workdir::current_dir().map_err(|error| error.to_string())?;
     to_pretty_json(
         read_file_in_workspace(&input.path, input.offset, input.limit, &workspace_root)
             .map_err(io_to_string)?,
@@ -2497,7 +2502,7 @@ fn run_read_file(input: ReadFileInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_write_file(input: WriteFileInput) -> Result<String, String> {
-    let workspace_root = std::env::current_dir().map_err(|error| error.to_string())?;
+    let workspace_root = runtime::workdir::current_dir().map_err(|error| error.to_string())?;
     to_pretty_json(
         write_file_in_workspace(&input.path, &input.content, &workspace_root)
             .map_err(io_to_string)?,
@@ -2506,7 +2511,7 @@ fn run_write_file(input: WriteFileInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_edit_file(input: EditFileInput) -> Result<String, String> {
-    let workspace_root = std::env::current_dir().map_err(|error| error.to_string())?;
+    let workspace_root = runtime::workdir::current_dir().map_err(|error| error.to_string())?;
     to_pretty_json(
         edit_file_in_workspace(
             &input.path,
@@ -2590,7 +2595,7 @@ fn run_repl(input: ReplInput, cancel: &CancellationToken) -> Result<String, Stri
 /// Permission a `PowerShell` command line needs, judged over every statement
 /// and pipeline element (see [`classify_bash_permission`]).
 fn classify_powershell_permission(command: &str) -> PermissionMode {
-    let workspace = std::env::current_dir().ok();
+    let workspace = runtime::workdir::current_dir().ok();
     classify_powershell_command(command, workspace.as_deref()).required_mode()
 }
 
@@ -2681,6 +2686,9 @@ struct AgentInput {
     subagent_type: Option<String>,
     name: Option<String>,
     model: Option<String>,
+    /// `worktree` runs the sub-agent in a git worktree of its own.
+    #[serde(default)]
+    isolation: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2979,6 +2987,10 @@ struct AgentOutput {
     derived_state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// The sub-agent's git worktree (`isolation: "worktree"`), and once it ended,
+    /// what it changed there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worktree: Option<agent_worktree::WorktreeInfo>,
 }
 
 #[derive(Debug, Clone)]
@@ -2990,6 +3002,8 @@ struct AgentJob {
     prompt: String,
     system_prompt: Vec<String>,
     allowed_tools: BTreeSet<String>,
+    /// The worktree the sub-agent works in (`isolation: "worktree"`).
+    worktree: Option<agent_worktree::AgentWorktree>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -4140,6 +4154,60 @@ fn wait_for_agent(
     }
 }
 
+/// The worktree `isolation` asks for, created for `agent_id`; `None` without isolation.
+fn agent_isolation(
+    isolation: Option<&str>,
+    agent_id: &str,
+) -> Result<Option<agent_worktree::AgentWorktree>, String> {
+    match isolation.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(None),
+        Some(agent_worktree::ISOLATION_WORKTREE) => {
+            let cwd = runtime::workdir::current_dir().map_err(|error| error.to_string())?;
+            let home = runtime::workspace_trust::default_neuron_home()
+                .unwrap_or_else(|| std::env::temp_dir().join("neuron"));
+            agent_worktree::AgentWorktree::create(&cwd, &home, agent_id).map(Some)
+        }
+        Some(other) => Err(format!(
+            "isolation must be \"worktree\" (or left out), not \"{other}\""
+        )),
+    }
+}
+
+/// After a sub-agent in a worktree ended: records what it changed in its manifest and
+/// task file, and removes the worktree when nothing changed.
+fn finish_agent_worktree(manifest: &AgentOutput, worktree: &agent_worktree::AgentWorktree) {
+    let info = worktree.finish();
+    let summary = match (info.changed, info.removed) {
+        (Some(true), _) => format!(
+            "Worktree: branch {} has the sub-agent's changes ({} commit(s){}).",
+            info.branch,
+            info.commits,
+            if info.uncommitted {
+                ", plus uncommitted changes"
+            } else {
+                ""
+            }
+        ),
+        (Some(false), true) => format!(
+            "Worktree: nothing changed; the worktree and branch {} were removed.",
+            info.branch
+        ),
+        _ => info.note.clone().unwrap_or_default(),
+    };
+    let _ = append_agent_output(
+        &manifest.output_file,
+        &format!(
+            "
+{summary}
+"
+        ),
+    );
+    let mut latest =
+        read_agent_manifest(&manifest.manifest_file).unwrap_or_else(|| manifest.clone());
+    latest.worktree = Some(info);
+    let _ = write_agent_manifest(&latest);
+}
+
 fn read_agent_manifest(path: &str) -> Option<AgentOutput> {
     std::fs::read_to_string(path)
         .ok()
@@ -4179,7 +4247,14 @@ where
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| slugify_agent_name(&input.description));
     let created_at = iso8601_now();
-    let mut system_prompt = build_agent_system_prompt(&normalized_subagent_type)?;
+    let worktree = agent_isolation(input.isolation.as_deref(), &agent_id)?;
+    let mut system_prompt = {
+        // The prompt names the folder the sub-agent works in.
+        let _workdir = worktree
+            .as_ref()
+            .map(|worktree| runtime::workdir::set_thread_dir(worktree.workdir().to_path_buf()));
+        build_agent_system_prompt(&normalized_subagent_type)?
+    };
     // Name the sub-agent's own model (`auto` picks one per request: name none).
     let prompt_model = model.strip_prefix("openai/").unwrap_or(&model);
     runtime::set_prompt_model(
@@ -4226,6 +4301,7 @@ where
         current_blocker: None,
         derived_state: String::from("working"),
         error: None,
+        worktree: worktree.as_ref().map(agent_worktree::AgentWorktree::info),
     };
     write_agent_manifest(&manifest)?;
 
@@ -4236,6 +4312,7 @@ where
         prompt: input.prompt,
         system_prompt,
         allowed_tools,
+        worktree,
     };
     if let Err(error) = spawn_fn(job) {
         let error = format!("failed to spawn sub-agent: {error}");
@@ -4252,12 +4329,21 @@ fn spawn_agent_job_with_completion(
     completion: Option<std::sync::mpsc::Sender<AgentCompletion>>,
 ) -> Result<(), String> {
     let thread_name = format!("clawd-agent-{}", job.manifest.agent_id);
+    // A sub-agent works where its parent does (a parent in a worktree passes it on),
+    // or in a worktree of its own.
+    let workdir = job
+        .worktree
+        .as_ref()
+        .map(|worktree| worktree.workdir().to_path_buf())
+        .or_else(runtime::workdir::thread_dir);
     std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
+            let workdir_guard = workdir.map(runtime::workdir::set_thread_dir);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 run_agent_job(&job, &cancel)
             }));
+            drop(workdir_guard);
             let report = match result {
                 Ok(Ok(final_text)) => AgentCompletion {
                     final_text: Some(final_text),
@@ -4293,6 +4379,10 @@ fn spawn_agent_job_with_completion(
                     }
                 }
             };
+            // After the end state is saved, so the manifest keeps what changed.
+            if let Some(worktree) = &job.worktree {
+                finish_agent_worktree(&job.manifest, worktree);
+            }
             forget_background_subagent(&job.manifest.agent_id);
             if let Some(completion) = completion {
                 let _ = completion.send(report);
@@ -4680,7 +4770,7 @@ fn subagent_api_error(error: &ApiError) -> RuntimeError {
 }
 
 fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String> {
-    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let cwd = runtime::workdir::current_dir().map_err(|error| error.to_string())?;
     let mut prompt = load_system_prompt(
         cwd,
         DEFAULT_AGENT_SYSTEM_DATE.to_string(),
@@ -5174,6 +5264,7 @@ mod subagent_inheritance_tests {
             current_blocker: None,
             derived_state: "working".to_string(),
             error: None,
+            worktree: None,
         }
     }
 
@@ -5985,7 +6076,7 @@ fn derive_agent_state(
 fn maybe_commit_provenance(result: Option<&str>) -> Option<LaneCommitProvenance> {
     let commit = extract_commit_sha(result?)?;
     let branch = current_git_branch().unwrap_or_else(|| "unknown".to_string());
-    let worktree = std::env::current_dir()
+    let worktree = runtime::workdir::current_dir()
         .ok()
         .map(|path| path.display().to_string());
     Some(LaneCommitProvenance {
@@ -7671,6 +7762,7 @@ fn parse_skill_description(contents: &str) -> Option<String> {
     None
 }
 
+mod agent_worktree;
 pub mod lane_completion;
 pub mod pdf_extract;
 mod powershell;
@@ -9617,6 +9709,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("ship-audit".to_string()),
                 model: None,
+                isolation: None,
             },
             move |job| {
                 *captured_for_spawn
@@ -9661,6 +9754,7 @@ mod tests {
                 subagent_type: Some("explorer".to_string()),
                 name: None,
                 model: None,
+                isolation: None,
             },
             |_| Ok(()),
         )
@@ -9675,6 +9769,7 @@ mod tests {
                 subagent_type: None,
                 name: Some("Ship Audit!!!".to_string()),
                 model: None,
+                isolation: None,
             },
             |_| Ok(()),
         )
@@ -9695,6 +9790,101 @@ mod tests {
     }
 
     #[test]
+    fn agent_isolation_runs_the_sub_agent_in_a_worktree_of_its_own() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("agent-worktree");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        run_git(&repo, &["init", "--quiet", "-b", "main"]);
+        run_git(&repo, &["config", "user.email", "tests@example.com"]);
+        run_git(&repo, &["config", "user.name", "Neuron Tests"]);
+        run_git(&repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(
+            repo.join("a.txt"),
+            "a
+",
+        )
+        .expect("file");
+        run_git(&repo, &["add", "-A"]);
+        run_git(&repo, &["commit", "-q", "-m", "init"]);
+        let previous_home = std::env::var_os("NEURON_HOME");
+        std::env::set_var("NEURON_HOME", root.join("home"));
+        std::env::set_var("CLAWD_AGENT_STORE", root.join("store"));
+        let workdir = runtime::workdir::set_thread_dir(repo.clone());
+
+        let isolated = |isolation: Option<&str>| AgentInput {
+            description: "Try a refactor".to_string(),
+            prompt: "Refactor a.txt".to_string(),
+            subagent_type: None,
+            name: None,
+            model: None,
+            isolation: isolation.map(str::to_string),
+        };
+        let captured = Arc::new(Mutex::new(None::<AgentJob>));
+        let captured_for_spawn = Arc::clone(&captured);
+        let manifest = execute_agent_with_spawn(isolated(Some("worktree")), move |job| {
+            *captured_for_spawn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(job);
+            Ok(())
+        })
+        .expect("Agent with a worktree");
+        let info = manifest.worktree.clone().expect("worktree in the manifest");
+        assert!(info.branch.starts_with("neuron/agent/agent-"), "{info:?}");
+        assert!(
+            Path::new(&info.path).starts_with(root.join("home").join("worktrees")),
+            "{info:?}"
+        );
+        let job = captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("job");
+        let worktree = job.worktree.as_ref().expect("job worktree");
+        assert!(worktree.workdir().join("a.txt").is_file());
+        assert!(
+            job.system_prompt
+                .iter()
+                .any(|part| part.contains(&*worktree.workdir().to_string_lossy())),
+            "the prompt names the worktree as the working directory"
+        );
+
+        // Nothing changed: the worktree and branch go, and the manifest says so.
+        super::finish_agent_worktree(&job.manifest, worktree);
+        let finished = super::read_agent_manifest(&manifest.manifest_file).expect("manifest");
+        let finished = finished.worktree.expect("worktree outcome");
+        assert_eq!(finished.changed, Some(false));
+        assert!(finished.removed);
+        assert!(!Path::new(&info.path).exists());
+
+        let wrong = execute_agent_with_spawn(isolated(Some("container")), |_| Ok(()))
+            .expect_err("an unknown isolation");
+        assert!(wrong.contains("isolation must be"), "{wrong}");
+        drop(workdir);
+        let plain = root.join("plain");
+        std::fs::create_dir_all(&plain).expect("plain");
+        let outside = runtime::workdir::set_thread_dir(plain);
+        let error = execute_agent_with_spawn(isolated(Some("worktree")), |_| Ok(()))
+            .expect_err("outside a repository");
+        // A folder above the temp folder may itself be an empty repository (it is on
+        // some machines): then the refusal is for the missing commit.
+        assert!(
+            error.contains("needs a git repository") || error.contains("needs a commit"),
+            "{error}"
+        );
+        drop(outside);
+
+        std::env::remove_var("CLAWD_AGENT_STORE");
+        match previous_home {
+            Some(value) => std::env::set_var("NEURON_HOME", value),
+            None => std::env::remove_var("NEURON_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn agent_fake_runner_can_persist_completion_and_failure() {
         let _guard = env_lock()
@@ -9710,6 +9900,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("complete-task".to_string()),
                 model: Some("claude-sonnet-4-6".to_string()),
+                isolation: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9767,6 +9958,7 @@ mod tests {
                 subagent_type: Some("Verification".to_string()),
                 name: Some("fail-task".to_string()),
                 model: None,
+                isolation: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9814,6 +10006,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("summary-floor".to_string()),
                 model: None,
+                isolation: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9859,6 +10052,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("recovery-lane".to_string()),
                 model: None,
+                isolation: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9907,6 +10101,7 @@ mod tests {
                 subagent_type: Some("Verification".to_string()),
                 name: Some("review-lane".to_string()),
                 model: None,
+                isolation: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9947,6 +10142,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("backlog-scan".to_string()),
                 model: None,
+                isolation: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9993,6 +10189,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("artifact-lane".to_string()),
                 model: None,
+                isolation: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -10063,6 +10260,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("cron-closeout".to_string()),
                 model: None,
+                isolation: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -10104,6 +10302,7 @@ mod tests {
                 subagent_type: None,
                 name: Some("spawn-error".to_string()),
                 model: None,
+                isolation: None,
             },
             |_| Err(String::from("thread creation failed")),
         )

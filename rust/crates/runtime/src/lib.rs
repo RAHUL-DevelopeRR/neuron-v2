@@ -67,6 +67,7 @@ pub mod transcript;
 mod trust_resolver;
 pub mod ui_hooks;
 mod usage;
+pub mod workdir;
 pub mod worker_boot;
 pub mod workspace_trust;
 

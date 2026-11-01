@@ -28,7 +28,7 @@
 //!   and, for a UI that declared `git_views`, the agent's changes ([`UiEvent::Changes`]);
 //! - `/diff [path]`, `/commit [message]`, [`EngineCommand::Commit`], `/rewind [id [mode]]`,
 //!   [`EngineCommand::Rewind`] and `/changes`: their events with `git_views`, else notices,
-//!   then `TurnFinished`. Each prompt gets a checkpoint ([`SessionCheckpoints`]) that
+//!   then `TurnFinished`. `/pr` and `/issue` answer with notices (`github_actions`). Each prompt gets a checkpoint ([`SessionCheckpoints`]) that
 //!   `/rewind` goes back to.
 //!
 //! When the engine stops, the event channel closes.
@@ -1746,6 +1746,12 @@ impl Engine {
             "commit" if args.is_empty() => self.propose_commit().map_err(Into::into),
             "commit" => self.commit(args).map_err(Into::into),
             "rewind" => self.rewind_command(args).map_err(Into::into),
+            "pr" => self
+                .github(crate::github_actions::GithubKind::PullRequest, args)
+                .map_err(Into::into),
+            "issue" => self
+                .github(crate::github_actions::GithubKind::Issue, args)
+                .map_err(Into::into),
             "changes" => {
                 self.show_changes();
                 Ok(())
@@ -2419,6 +2425,24 @@ impl Engine {
         self.notice(&committed.notice(&plan.left_out));
         self.send_status();
         self.send_changes();
+        Ok(())
+    }
+
+    /// `/pr …` and `/issue …` (`github_actions`): a draft as a notice, or, on
+    /// `create` after a draft was shown, the pull request or issue opened with `gh`. An
+    /// interrupt stops the draft.
+    fn github(
+        &mut self,
+        kind: crate::github_actions::GithubKind,
+        args: &str,
+    ) -> Result<(), String> {
+        let cancel = CancellationToken::new();
+        let shared = Arc::clone(&self.shared);
+        let running = RunningTurn::start(&shared);
+        running.watch(cancel.clone(), HookAbortSignal::new());
+        let result = self.cli.github_command(kind, args, &cancel);
+        drop(running);
+        self.notice(&result?);
         Ok(())
     }
 
