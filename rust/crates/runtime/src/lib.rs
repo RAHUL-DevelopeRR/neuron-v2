@@ -53,6 +53,7 @@ mod session;
 pub mod session_control;
 pub use session_control::SessionStore;
 pub mod experience;
+pub mod parallel_tools;
 pub mod project_checks;
 mod sse;
 pub mod stale_base;
@@ -62,6 +63,7 @@ pub mod task_packet;
 pub mod task_registry;
 pub mod team_cron_registry;
 pub mod tool_input;
+pub mod tool_output;
 pub mod transcript;
 #[cfg(test)]
 mod trust_resolver;
@@ -153,6 +155,7 @@ pub use oauth::{
     OAuthCallbackParams, OAuthRefreshRequest, OAuthTokenExchangeRequest, OAuthTokenSet,
     PkceChallengeMethod, PkceCodePair,
 };
+pub use parallel_tools::ConcurrentToolCall;
 pub use permissions::{
     non_interactive_hint, parse_permission_response, quote_allow_rules, render_permission_prompt,
     url_host, ConsolePermissionPrompter, PermissionContext, PermissionMode, PermissionOutcome,

@@ -236,6 +236,15 @@ impl runtime::PermissionPrompter for ChannelPermissionPrompter<'_> {
 // -- API client (extracted to api_client.rs) --
 pub(crate) struct CliToolExecutor {
     output: Box<dyn TurnSink>,
+    dispatch: ToolDispatch,
+    /// The id of the call [`ToolExecutor::tool_started`] announced, until it runs: a
+    /// UI may want its output while it runs.
+    starting_call: Option<String>,
+}
+
+/// What runs a tool call, apart from where its output goes: shared by the calls of a
+/// read-only batch, which run on threads of their own.
+struct ToolDispatch {
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
@@ -250,10 +259,71 @@ impl CliToolExecutor {
     ) -> Self {
         Self {
             output: output.into().tool_sink(),
-            allowed_tools,
-            tool_registry,
-            mcp_state,
+            dispatch: ToolDispatch {
+                allowed_tools,
+                tool_registry,
+                mcp_state,
+            },
+            starting_call: None,
         }
+    }
+
+    /// Shows a call's result on the line terminal (the UI hears it from
+    /// [`ToolExecutor::tool_call_finished`]).
+    fn report_result(
+        &mut self,
+        tool_name: &str,
+        result: &Result<String, ToolError>,
+    ) -> Result<(), ToolError> {
+        let (text, is_error) = match result {
+            Ok(output) => (output.clone(), false),
+            Err(error) => (error.to_string(), true),
+        };
+        self.output
+            .tool_result(tool_name, &text, is_error)
+            .map_err(|error| ToolError::new(error.to_string()))
+    }
+}
+
+impl ToolDispatch {
+    /// Runs one call: the `--allowedTools` check, argument parsing (and repair), then
+    /// the tool.
+    fn run(
+        &self,
+        tool_name: &str,
+        input: &str,
+        cancel: &runtime::CancellationToken,
+    ) -> Result<String, ToolError> {
+        if self
+            .allowed_tools
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(tool_name))
+        {
+            return Err(ToolError::new(format!(
+                "tool `{tool_name}` is not enabled by the current --allowedTools setting"
+            )));
+        }
+        let parsed = runtime::tool_input::parse_tool_input(input).map_err(ToolError::new)?;
+        let repaired = parsed.repaired;
+        let value = parsed.value;
+        let result = if tool_name == "ToolSearch" {
+            self.execute_search_tool(value)
+        } else if self.tool_registry.has_runtime_tool(tool_name) {
+            self.execute_runtime_tool(tool_name, value, cancel)
+        } else {
+            self.tool_registry
+                .execute_with_cancel(tool_name, &value, cancel)
+                .map_err(ToolError::new)
+        };
+        // Arguments that needed repair: say so, so the model sends valid JSON next time.
+        result.map(|output| match &repaired {
+            Some(fixes) => format!(
+                "{output}
+
+[note: the arguments were not valid JSON; Neuron {fixes}. Send them as valid JSON next time.]"
+            ),
+            None => output,
+        })
     }
 
     pub fn execute_search_tool(&self, value: serde_json::Value) -> Result<String, ToolError> {
@@ -363,49 +433,55 @@ impl ToolExecutor for CliToolExecutor {
         input: &str,
         cancel: &runtime::CancellationToken,
     ) -> Result<String, ToolError> {
-        if self
-            .allowed_tools
-            .as_ref()
-            .is_some_and(|allowed| !allowed.contains(tool_name))
-        {
-            return Err(ToolError::new(format!(
-                "tool `{tool_name}` is not enabled by the current --allowedTools setting"
-            )));
-        }
-        let parsed = runtime::tool_input::parse_tool_input(input).map_err(ToolError::new)?;
-        let repaired = parsed.repaired;
-        let value = parsed.value;
-        let result = if tool_name == "ToolSearch" {
-            self.execute_search_tool(value)
-        } else if self.tool_registry.has_runtime_tool(tool_name) {
-            self.execute_runtime_tool(tool_name, value, cancel)
-        } else {
-            self.tool_registry
-                .execute_with_cancel(tool_name, &value, cancel)
-                .map_err(ToolError::new)
+        // A UI that asked for it hears a shell command's output while it runs.
+        let observer = self
+            .starting_call
+            .take()
+            .and_then(|id| self.output.tool_output_observer(&id));
+        let dispatch = &self.dispatch;
+        let result = match observer {
+            Some(observer) => runtime::tool_output::with_output_observer(observer, || {
+                dispatch.run(tool_name, input, cancel)
+            }),
+            None => dispatch.run(tool_name, input, cancel),
         };
-        // Arguments that needed repair: say so, so the model sends valid JSON next time.
-        let result = result.map(|output| match &repaired {
-            Some(fixes) => format!("{output}\n\n[note: the arguments were not valid JSON; Neuron {fixes}. Send them as valid JSON next time.]"),
-            None => output,
-        });
-        match result {
-            Ok(output) => {
-                self.output
-                    .tool_result(tool_name, &output, false)
-                    .map_err(|error| ToolError::new(error.to_string()))?;
-                Ok(output)
-            }
-            Err(error) => {
-                self.output
-                    .tool_result(tool_name, &error.to_string(), true)
-                    .map_err(|stream_error| ToolError::new(stream_error.to_string()))?;
-                Err(error)
-            }
-        }
+        self.report_result(tool_name, &result)?;
+        result
+    }
+
+    /// Read-only calls run on scoped threads, at most
+    /// [`runtime::parallel_tools::MAX_CONCURRENT_TOOL_CALLS`] at once; the terminal
+    /// shows their results in the order of the calls.
+    fn supports_concurrent_calls(&self) -> bool {
+        true
+    }
+
+    fn execute_concurrently(
+        &mut self,
+        calls: &[runtime::ConcurrentToolCall],
+        cancel: &runtime::CancellationToken,
+    ) -> Vec<Result<String, ToolError>> {
+        self.starting_call = None;
+        let dispatch = &self.dispatch;
+        let results = runtime::parallel_tools::run_concurrently(
+            calls,
+            runtime::parallel_tools::MAX_CONCURRENT_TOOL_CALLS,
+            |call| dispatch.run(&call.tool_name, &call.input, cancel),
+        );
+        results
+            .into_iter()
+            .zip(calls)
+            .map(
+                |(result, call)| match self.report_result(&call.tool_name, &result) {
+                    Ok(()) => result,
+                    Err(error) => Err(error),
+                },
+            )
+            .collect()
     }
 
     fn tool_started(&mut self, id: &str, name: &str, input: &str) {
+        self.starting_call = Some(id.to_string());
         let _ = self.output.tool_started(id, name, input);
     }
 

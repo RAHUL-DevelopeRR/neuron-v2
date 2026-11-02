@@ -218,8 +218,10 @@ pub fn execute_bash_with_cancel(
 
     let timeout = Duration::from_millis(effective_bash_timeout_ms(input.timeout));
     let mut command = prepare_command(&input.command, &cwd, &sandbox_status);
-    let bounded =
-        subprocess::run_bounded(&mut command, None, Some(timeout), &|| cancel.is_cancelled())?;
+    // A UI that watches the call hears the output while the command runs.
+    let bounded = crate::tool_output::run_bounded_live(&mut command, None, Some(timeout), &|| {
+        cancel.is_cancelled()
+    })?;
     let mut output = BashCommandOutput::from_bounded(&bounded, Some(timeout));
     output.dangerously_disable_sandbox = input.dangerously_disable_sandbox;
     output.sandbox_status = Some(sandbox_status);
