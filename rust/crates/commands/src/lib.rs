@@ -109,6 +109,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "artifacts",
+        aliases: &[],
+        summary: "List the files and large outputs saved for this session",
+        argument_hint: None,
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "cost",
         aliases: &[],
         summary: "Show cumulative token usage for this session",
@@ -1088,6 +1095,7 @@ pub enum SlashCommand {
         confirm: bool,
     },
     Cost,
+    Artifacts,
     Resume {
         session_path: Option<String>,
     },
@@ -1249,6 +1257,7 @@ impl SlashCommand {
             Self::Clear { .. } => "/clear",
             Self::Compact { .. } => "/compact",
             Self::Cost => "/cost",
+            Self::Artifacts => "/artifacts",
             Self::Doctor => "/doctor",
             Self::Config { .. } => "/config",
             Self::Memory { .. } => "/memory",
@@ -1384,6 +1393,10 @@ pub fn validate_slash_command_input(
         "cost" => {
             validate_no_args(command, &args)?;
             SlashCommand::Cost
+        }
+        "artifacts" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Artifacts
         }
         "resume" => SlashCommand::Resume {
             session_path: Some(require_remainder(command, remainder, "<session-path>")?),
@@ -1915,7 +1928,7 @@ pub fn resume_supported_slash_commands() -> Vec<&'static SlashCommandSpec> {
 
 fn slash_command_category(name: &str) -> &'static str {
     match name {
-        "help" | "status" | "cost" | "resume" | "session" | "version" | "usage" | "stats"
+        "help" | "status" | "cost" | "artifacts" | "resume" | "session" | "version" | "usage" | "stats"
         | "rename" | "clear" | "compact" | "history" | "tokens" | "cache" | "exit" | "summary"
         | "tag" | "thinkback" | "copy" | "share" | "feedback" | "rewind" | "pin" | "unpin"
         | "bookmarks" | "context" | "files" | "focus" | "unfocus" | "retry" | "stop" | "undo" => {
@@ -4139,6 +4152,7 @@ pub fn handle_slash_command(
         | SlashCommand::Permissions { .. }
         | SlashCommand::Clear { .. }
         | SlashCommand::Cost
+        | SlashCommand::Artifacts
         | SlashCommand::Resume { .. }
         | SlashCommand::Config { .. }
         | SlashCommand::Mcp { .. }
@@ -4744,7 +4758,7 @@ mod tests {
         assert!(help.contains("/login"));
         assert!(help.contains("/logout"));
         assert!(help.contains("Sign in to your Zero-X account in the browser"));
-        assert_eq!(slash_command_specs().len(), 141);
+        assert_eq!(slash_command_specs().len(), 142);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 

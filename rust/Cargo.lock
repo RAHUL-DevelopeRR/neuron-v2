@@ -1878,6 +1878,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "syntect",
+ "telemetry",
  "tokio",
  "tools",
  "webbrowser",

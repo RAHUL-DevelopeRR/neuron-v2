@@ -139,8 +139,14 @@ impl CliOutputFormat {
         match value {
             "text" => Ok(Self::Text),
             "json" => Ok(Self::Json),
+            // JSON lines while the run goes (`neuron prompt`); other commands print
+            // their one JSON object, which is a valid stream of one line.
+            crate::stream_json::FORMAT_NAME => {
+                crate::stream_json::set_requested(true);
+                Ok(Self::Json)
+            }
             other => Err(format!(
-                "unsupported value for --output-format: {other} (expected text or json)"
+                "unsupported value for --output-format: {other} (expected text, json or stream-json)"
             )),
         }
     }
@@ -271,6 +277,7 @@ pub(crate) fn parse_args_with_stdin(
     piped_stdin: impl FnOnce() -> Option<String>,
 ) -> Result<CliAction, String> {
     *MODEL_ARG.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    crate::stream_json::set_requested(false);
     let mut model = DEFAULT_MODEL.to_string();
     // Only an explicit --model; `model` falls back to the default.
     let mut model_flag: Option<String> = None;
@@ -2212,5 +2219,42 @@ mod script_input_tests {
             matches!(prompt, Ok(CliAction::Prompt { prompt: ref text, .. }) if text == "explain C:/Program Files/Git/model"),
             "{prompt:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod stream_json_format_tests {
+    use super::{parse_args, CliAction, CliOutputFormat};
+
+    fn parse(values: &[&str]) -> Result<CliAction, String> {
+        parse_args(&values.iter().map(ToString::to_string).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn stream_json_is_json_output_with_the_stream_flag() {
+        let action = parse(&["--output-format", "stream-json", "prompt", "hi"]).unwrap();
+        assert!(matches!(
+            action,
+            CliAction::Prompt {
+                output_format: CliOutputFormat::Json,
+                ..
+            }
+        ));
+        assert!(crate::stream_json::requested());
+        let action = parse(&["--output-format=stream-json", "-p", "hi"]).unwrap();
+        assert!(matches!(
+            action,
+            CliAction::Prompt {
+                output_format: CliOutputFormat::Json,
+                ..
+            }
+        ));
+        assert!(crate::stream_json::requested());
+
+        // The next parse starts over.
+        parse(&["--output-format", "json", "prompt", "hi"]).unwrap();
+        assert!(!crate::stream_json::requested());
+        let error = parse(&["--output-format", "yaml", "prompt", "hi"]).unwrap_err();
+        assert!(error.contains("stream-json"));
     }
 }
