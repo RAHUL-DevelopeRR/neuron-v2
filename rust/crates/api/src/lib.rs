@@ -41,6 +41,7 @@ pub use providers::{
     model_token_limit, preflight_message_request, resolve_model_alias, ModelTokenLimit,
     ProviderKind,
 };
+pub use providers::user_keys::{clear_user_keys, has_user_key, install_user_key, user_key};
 pub use retry::{
     RetryNotice, RetryObserver, RetryProgress, CAPACITY_MAX_WAIT, CAPACITY_TOTAL_BACKOFF,
     MAX_TOTAL_BACKOFF,

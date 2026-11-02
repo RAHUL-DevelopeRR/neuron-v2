@@ -601,6 +601,32 @@ impl CredentialStore {
     }
 }
 
+/// The OS keychain entry `account` under [`KEYRING_SERVICE`], under the same
+/// policy as the Zero-X login: `NEURON_CREDENTIAL_STORE=file|keychain` forces
+/// a backend, and an overridden Neuron home never uses the account keychain.
+/// `None` means "use a file under [`neuron_home`]".
+pub(crate) fn keychain_for_account(account: &str) -> Option<Box<dyn SecretBackend>> {
+    let preference =
+        non_empty_env("NEURON_CREDENTIAL_STORE").map(|value| value.trim().to_ascii_lowercase());
+    let wanted = match preference.as_deref() {
+        Some("file") => false,
+        Some("keychain") => true,
+        _ => !home_is_overridden(),
+    };
+    if !wanted {
+        return None;
+    }
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        Some(Box::new(KeychainBackend::new(KEYRING_SERVICE, account)))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = account;
+        None
+    }
+}
+
 fn platform_keychain() -> Option<Box<dyn SecretBackend>> {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {

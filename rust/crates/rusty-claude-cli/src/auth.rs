@@ -731,6 +731,11 @@ fn takes_arguments(name: &str, args: &[String]) -> bool {
             .all(|flag| matches!(*flag, "--no-browser" | "--with-token"))
     };
     match (name, words.as_slice()) {
+        ("auth", provider_words)
+            if crate::provider_auth::is_provider_auth_command(provider_words) =>
+        {
+            true
+        }
         ("login", flags) | ("auth", ["login", flags @ ..]) => login_flags(flags),
         ("logout" | "usage" | "upgrade", [])
         | ("upgrade", ["--no-browser"])
@@ -815,6 +820,10 @@ pub fn run_auth_command(args: &[String]) -> Result<(), Box<dyn std::error::Error
         }
         return Ok(());
     }
+    let words = args.iter().map(String::as_str).collect::<Vec<_>>();
+    if crate::provider_auth::is_provider_auth_command(&words) {
+        return crate::provider_auth::run(&args, json);
+    }
     match args.first().map(String::as_str) {
         Some("login") => {
             let mut options = LoginOptions::default();
@@ -857,7 +866,11 @@ pub fn run_auth_command(args: &[String]) -> Result<(), Box<dyn std::error::Error
         None | Some("help" | "--help" | "-h") if json => {
             print_json(&serde_json::json!({ "kind": "help", "message": AUTH_USAGE }))?;
         }
-        None | Some("help" | "--help" | "-h") => println!("{AUTH_USAGE}"),
+        None | Some("help" | "--help" | "-h") => {
+            println!("{AUTH_USAGE}
+
+{}", crate::provider_auth::PROVIDER_AUTH_USAGE);
+        }
         _ => return Err(AUTH_USAGE.into()),
     }
     Ok(())

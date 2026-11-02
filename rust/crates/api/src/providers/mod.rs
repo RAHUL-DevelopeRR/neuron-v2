@@ -9,6 +9,7 @@ use crate::types::{MessageRequest, MessageResponse};
 
 pub mod anthropic;
 pub mod openai_compat;
+pub mod user_keys;
 
 #[allow(dead_code)]
 pub type ProviderFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ApiError>> + Send + 'a>>;
@@ -375,6 +376,7 @@ fn env_or_dotenv_present(key: &str) -> bool {
         Ok(value) if !value.is_empty() => true,
         Ok(_) | Err(std::env::VarError::NotPresent) => {
             dotenv_value(key).is_some_and(|value| !value.is_empty())
+                || user_keys::has_user_key(key)
         }
         Err(_) => false,
     }
@@ -464,6 +466,13 @@ pub(crate) fn dotenv_value(key: &str) -> Option<String> {
     let cwd = std::env::current_dir().ok()?;
     let trusted = runtime::ConfigLoader::default_for(&cwd).workspace_is_trusted();
     dotenv_value_in(&cwd, key, trusted)
+}
+
+/// A credential variable that is unset in the environment: the trusted
+/// workspace's `.env` value, else a key the user stored (keychain, installed
+/// by the CLI through [`user_keys::install_user_key`]).
+pub(crate) fn fallback_credential(key: &str) -> Option<String> {
+    dotenv_value(key).or_else(|| user_keys::user_key(key))
 }
 
 /// A cloned repository's `.env` could supply its own API key, sending the

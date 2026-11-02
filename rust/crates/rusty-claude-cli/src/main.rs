@@ -66,10 +66,12 @@ mod headless;
 mod init;
 mod input;
 mod line_diff;
+mod openrouter_oauth;
 mod orchestrator;
 mod plan_mode;
 mod progress;
 mod provider;
+mod provider_auth;
 mod quota;
 mod render;
 mod repl_loop;
@@ -1448,6 +1450,11 @@ fn run_resume_command(
                 json: Some(json),
             })
         }
+        SlashCommand::Providers => Ok(ResumeCommandOutcome {
+            session: session.clone(),
+            message: Some(provider_auth::providers_report()),
+            json: None,
+        }),
         SlashCommand::Doctor => {
             let report = render_doctor_report()?;
             Ok(ResumeCommandOutcome {
@@ -3290,6 +3297,10 @@ impl LiveCli {
             }
             SlashCommand::Doctor => {
                 println!("{}", render_doctor_report()?.render());
+                false
+            }
+            SlashCommand::Providers => {
+                println!("{}", provider_auth::providers_report());
                 false
             }
             SlashCommand::History { count } => {

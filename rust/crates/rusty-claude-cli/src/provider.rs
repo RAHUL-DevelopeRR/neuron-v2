@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::sync::{OnceLock, PoisonError, RwLock};
 
 use crate::brand::*;
+use crate::provider_auth::KeyProvider;
 use api::{detect_provider_kind, OpenAiCompatConfig, OpenAiCompatEndpoint, ProviderKind};
 use serde_json::Value;
 
@@ -30,6 +31,9 @@ const DEFAULT_OPENROUTER_MODEL: &str = "qwen/qwen3-coder-480b-a35b-instruct:free
 const DEFAULT_AZURE_MODEL: &str = "Kimi-K2.5";
 const DEFAULT_ANTHROPIC_MODEL: &str = "claude-opus-4-6";
 const DEFAULT_XAI_MODEL: &str = "grok-3";
+/// Gemini's OpenAI-compatible endpoint (Gemini API key, Bearer auth).
+const GEMINI_OPENAI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
+const DEFAULT_GEMINI_MODEL: &str = "gemini-2.5-pro";
 
 /// Providers a user can choose explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,17 +44,19 @@ pub enum ProviderId {
     Azure,
     Anthropic,
     Xai,
+    Gemini,
     Local,
 }
 
 impl ProviderId {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::ZeroX,
         Self::OpenAi,
         Self::OpenRouter,
         Self::Azure,
         Self::Anthropic,
         Self::Xai,
+        Self::Gemini,
         Self::Local,
     ];
 
@@ -62,6 +68,7 @@ impl ProviderId {
             "azure" => Self::Azure,
             "anthropic" => Self::Anthropic,
             "xai" | "grok" => Self::Xai,
+            "gemini" | "google" => Self::Gemini,
             "local" => Self::Local,
             _ => return None,
         })
@@ -75,6 +82,7 @@ impl ProviderId {
             Self::Azure => "azure",
             Self::Anthropic => "anthropic",
             Self::Xai => "xai",
+            Self::Gemini => "gemini",
             Self::Local => "local",
         }
     }
@@ -87,6 +95,7 @@ impl ProviderId {
             Self::Azure => "Azure AI Foundry",
             Self::Anthropic => "Anthropic",
             Self::Xai => "xAI",
+            Self::Gemini => "Google Gemini",
             Self::Local => "local OpenAI-compatible server",
         }
     }
@@ -162,6 +171,8 @@ pub struct ProviderInputs {
     pub openai_key: bool,
     pub local_base_url: bool,
     pub openrouter_key: bool,
+    /// `GEMINI_API_KEY`/`GOOGLE_API_KEY`, or a stored Gemini key.
+    pub gemini_key: bool,
     pub requested_model: String,
 }
 
@@ -196,6 +207,12 @@ pub fn select_provider(inputs: &ProviderInputs, azure_usable: &dyn Fn() -> bool)
     if inputs.xai_key && model.starts_with("grok") {
         return select(ProviderId::Xai, SelectionReason::Ambient("XAI_API_KEY"));
     }
+    if inputs.gemini_key && model.starts_with("gemini") {
+        return select(
+            ProviderId::Gemini,
+            SelectionReason::Ambient("GEMINI_API_KEY"),
+        );
+    }
     if inputs.azure && azure_usable() {
         return select(
             ProviderId::Azure,
@@ -218,6 +235,12 @@ pub fn select_provider(inputs: &ProviderInputs, azure_usable: &dyn Fn() -> bool)
         return select(
             ProviderId::OpenRouter,
             SelectionReason::Ambient("OPENROUTER_API_KEY"),
+        );
+    }
+    if inputs.gemini_key {
+        return select(
+            ProviderId::Gemini,
+            SelectionReason::Ambient("GEMINI_API_KEY"),
         );
     }
     select(ProviderId::ZeroX, SelectionReason::SignInRequired)
@@ -365,6 +388,9 @@ fn provider_from_settings(
 
 /// Snapshot of the environment, settings and stored login.
 fn gather_inputs(requested_model: &str) -> Result<ProviderInputs, Box<dyn std::error::Error>> {
+    // Keys stored with `neuron auth set` (keychain), used when the environment has none.
+    crate::provider_auth::load_stored_keys();
+    let has_key = |provider| crate::provider_auth::resolve_key(provider).is_some();
     let neuron_token = crate::auth::env_token()?.is_some();
     let env_choice = non_empty_env("NEURON_PROVIDER")
         .map(|value| parse_provider_id(&value, "NEURON_PROVIDER"))
@@ -387,12 +413,13 @@ fn gather_inputs(requested_model: &str) -> Result<ProviderInputs, Box<dyn std::e
         settings_choice,
         stored_login,
         anthropic_auth: crate::api_client::resolve_cli_auth_source().is_ok(),
-        xai_key: non_empty_env("XAI_API_KEY").is_some(),
+        xai_key: has_key(KeyProvider::Xai),
         azure: non_empty_env("AZURE_OPENAI_API_KEY").is_some()
             && non_empty_env("AZURE_OPENAI_ENDPOINT").is_some(),
-        openai_key: non_empty_env("OPENAI_API_KEY").is_some(),
+        openai_key: has_key(KeyProvider::OpenAi),
         local_base_url: non_empty_env("OPENAI_BASE_URL").is_some_and(|url| is_loopback_url(&url)),
-        openrouter_key: non_empty_env("OPENROUTER_API_KEY").is_some(),
+        openrouter_key: has_key(KeyProvider::OpenRouter),
+        gemini_key: has_key(KeyProvider::Gemini),
         requested_model: requested_model.to_string(),
     })
 }
@@ -421,6 +448,30 @@ fn requested_or(requested: &str, fallback: impl FnOnce() -> String) -> String {
         requested.to_string()
     }
 }
+
+/// A BYO provider key (environment first, then the stored key) and a label for
+/// where it came from.
+fn require_key(provider: KeyProvider, id: ProviderId) -> Result<(String, String), String> {
+    crate::provider_auth::resolve_key(provider)
+        .map(|(key, source)| (key, key_source_label(&source)))
+        .ok_or_else(|| {
+            format!(
+                "{} needs {} or a stored key (`neuron auth set {}`); or choose another provider with --provider",
+                id.display_name(),
+                provider.env_vars().join(" or "),
+                provider.as_str()
+            )
+        })
+}
+
+fn key_source_label(source: &crate::provider_auth::KeySource) -> String {
+    match source {
+        crate::provider_auth::KeySource::Env(name) => (*name).to_string(),
+        _ => STORED_KEY_LABEL.to_string(),
+    }
+}
+
+const STORED_KEY_LABEL: &str = "stored key (neuron auth set)";
 
 fn require_env(key: &'static str, provider: ProviderId) -> Result<String, String> {
     non_empty_env(key).ok_or_else(|| {
@@ -506,10 +557,10 @@ fn activate(
             ))
         }
         ProviderId::OpenAi => {
-            let key = require_env("OPENAI_API_KEY", id)?;
+            let (key, source) = require_key(KeyProvider::OpenAi, id)?;
             let base = non_empty_env("OPENAI_BASE_URL")
                 .unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.to_string());
-            active.credential_source = "OPENAI_API_KEY".to_string();
+            active.credential_source = source;
             active.model = openai_model(&env_model.unwrap_or_else(|| requested_model.to_string()));
             active.base_url = Some(base.clone());
             Some(OpenAiCompatEndpoint::new(
@@ -536,8 +587,8 @@ fn activate(
             ))
         }
         ProviderId::OpenRouter => {
-            let key = require_env("OPENROUTER_API_KEY", id)?;
-            active.credential_source = "OPENROUTER_API_KEY".to_string();
+            let (key, source) = require_key(KeyProvider::OpenRouter, id)?;
+            active.credential_source = source;
             active.model = openai_model(&requested_or(requested_model, || {
                 non_empty_env("OPENROUTER_MODEL")
                     .unwrap_or_else(|| DEFAULT_OPENROUTER_MODEL.to_string())
@@ -546,6 +597,19 @@ fn activate(
             Some(OpenAiCompatEndpoint::new(
                 OpenAiCompatConfig::openai(),
                 OPENROUTER_BASE_URL,
+                key,
+            ))
+        }
+        ProviderId::Gemini => {
+            let (key, source) = require_key(KeyProvider::Gemini, id)?;
+            active.credential_source = source;
+            active.model = openai_model(&requested_or(requested_model, || {
+                env_model.unwrap_or_else(|| DEFAULT_GEMINI_MODEL.to_string())
+            }));
+            active.base_url = Some(GEMINI_OPENAI_BASE_URL.to_string());
+            Some(OpenAiCompatEndpoint::new(
+                OpenAiCompatConfig::openai(),
+                GEMINI_OPENAI_BASE_URL,
                 key,
             ))
         }
@@ -565,22 +629,24 @@ fn activate(
         ProviderId::Anthropic => {
             if let Err(error) = crate::api_client::resolve_cli_auth_source() {
                 return Err(format!(
-                    "{} needs ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN ({error}); export one or choose another provider with --provider",
+                    "{} needs ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN ({error}); export one, store an API key with `neuron auth set anthropic`, or choose another provider with --provider",
                     id.display_name()
                 )
                 .into());
             }
             active.credential_source = if non_empty_env("ANTHROPIC_API_KEY").is_some() {
                 "ANTHROPIC_API_KEY".to_string()
-            } else {
+            } else if non_empty_env("ANTHROPIC_AUTH_TOKEN").is_some() {
                 "ANTHROPIC_AUTH_TOKEN".to_string()
+            } else {
+                STORED_KEY_LABEL.to_string()
             };
             active.model = requested_or(requested_model, || DEFAULT_ANTHROPIC_MODEL.to_string());
             None
         }
         ProviderId::Xai => {
-            require_env("XAI_API_KEY", id)?;
-            active.credential_source = "XAI_API_KEY".to_string();
+            let (_, source) = require_key(KeyProvider::Xai, id)?;
+            active.credential_source = source;
             active.model = requested_or(requested_model, || DEFAULT_XAI_MODEL.to_string());
             None
         }
