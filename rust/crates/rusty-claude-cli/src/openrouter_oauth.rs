@@ -120,9 +120,7 @@ pub fn parse_callback(request_line: &str, expected_state: &str) -> Callback {
 }
 
 fn respond(stream: &mut TcpStream, status: &str, message: &str) {
-    let body = format!(
-        "<!doctype html><meta charset=utf-8><title>Neuron</title><p>{message}</p>"
-    );
+    let body = format!("<!doctype html><meta charset=utf-8><title>Neuron</title><p>{message}</p>");
     let _ = write!(
         stream,
         "HTTP/1.1 {status}\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -297,7 +295,10 @@ mod tests {
             parse_callback("GET /favicon.ico HTTP/1.1", "s1"),
             Callback::Ignore
         );
-        assert_eq!(parse_callback("POST /callback HTTP/1.1", "s1"), Callback::Ignore);
+        assert_eq!(
+            parse_callback("POST /callback HTTP/1.1", "s1"),
+            Callback::Ignore
+        );
         assert!(matches!(
             parse_callback("GET /callback?code=abc&state=evil HTTP/1.1", "s1"),
             Callback::Failed(message) if message.contains("state")
@@ -353,8 +354,10 @@ mod tests {
 
     #[test]
     fn code_exchange_posts_the_verifier_and_reads_the_key() {
-        let (base, server) =
-            crate::provider_auth::tests::fake_server(200, r#"{"key":"sk-or-v1-fromexchange","user_id":"u"}"#);
+        let (base, server) = crate::provider_auth::tests::fake_server(
+            200,
+            r#"{"key":"sk-or-v1-fromexchange","user_id":"u"}"#,
+        );
         let key = exchange_code(&base, "the-code", "the-verifier").unwrap();
         assert_eq!(key.as_str(), "sk-or-v1-fromexchange");
         let request = server.join().unwrap();

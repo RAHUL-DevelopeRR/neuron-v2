@@ -253,7 +253,10 @@ impl ProviderKeyStore {
         if let Some(keychain) = (self.keychain)(provider) {
             match keychain.read() {
                 Ok(Some(key)) if !key.trim().is_empty() => {
-                    return Ok(Some((Zeroizing::new(key.trim().to_string()), KeySource::Keychain)))
+                    return Ok(Some((
+                        Zeroizing::new(key.trim().to_string()),
+                        KeySource::Keychain,
+                    )))
                 }
                 Ok(_) | Err(BackendError::Unavailable(_)) => {}
                 Err(BackendError::Failed(error)) => {
@@ -262,9 +265,10 @@ impl ProviderKeyStore {
             }
         }
         match self.file(provider).read() {
-            Ok(Some(key)) if !key.trim().is_empty() => {
-                Ok(Some((Zeroizing::new(key.trim().to_string()), KeySource::File)))
-            }
+            Ok(Some(key)) if !key.trim().is_empty() => Ok(Some((
+                Zeroizing::new(key.trim().to_string()),
+                KeySource::File,
+            ))),
             Ok(_) => Ok(None),
             Err(error) => Err(error.to_string()),
         }
@@ -438,15 +442,20 @@ fn get_json(url: &str, provider: KeyProvider, key: &str) -> Result<Value, String
             status.as_u16()
         ));
     }
-    response
-        .json::<Value>()
-        .map_err(|error| format!("unreadable answer from {}: {error}", provider.display_name()))
+    response.json::<Value>().map_err(|error| {
+        format!(
+            "unreadable answer from {}: {error}",
+            provider.display_name()
+        )
+    })
 }
 
 /// A cheap authenticated call proving the key works: the models list, or for
 /// OpenRouter (whose model list is public) `GET /key`.
 pub fn check_key(provider: KeyProvider, key: &str, base: Option<&str>) -> Result<(), String> {
-    let base = base.unwrap_or(provider.default_base()).trim_end_matches('/');
+    let base = base
+        .unwrap_or(provider.default_base())
+        .trim_end_matches('/');
     let path = if provider == KeyProvider::OpenRouter {
         "/key"
     } else {
@@ -461,7 +470,9 @@ pub fn list_models(
     key: &str,
     base: Option<&str>,
 ) -> Result<Vec<String>, String> {
-    let base = base.unwrap_or(provider.default_base()).trim_end_matches('/');
+    let base = base
+        .unwrap_or(provider.default_base())
+        .trim_end_matches('/');
     let body = get_json(&format!("{base}/models"), provider, key)?;
     Ok(parse_model_ids(provider, &body))
 }
@@ -514,12 +525,13 @@ pub fn key_provider_for(id: crate::provider::ProviderId) -> Option<KeyProvider> 
 
 /// The active BYO-key provider's models (fetched once per process).
 pub fn active_provider_models() -> Option<(KeyProvider, Vec<String>)> {
-    static CACHE: OnceLock<std::sync::Mutex<Option<(KeyProvider, Vec<String>)>>> =
-        OnceLock::new();
+    static CACHE: OnceLock<std::sync::Mutex<Option<(KeyProvider, Vec<String>)>>> = OnceLock::new();
     let active = crate::provider::active_provider()?;
     let provider = key_provider_for(active.id)?;
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
-    let mut cached = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut cached = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some((cached_provider, models)) = cached.as_ref() {
         if *cached_provider == provider {
             return Some((provider, models.clone()));
@@ -668,8 +680,7 @@ pub fn is_provider_auth_command(words: &[&str]) -> bool {
     match words {
         ["list"] => true,
         ["set", provider, flags @ ..] => {
-            KeyProvider::parse(provider).is_some()
-                && flags.iter().all(|flag| *flag == "--check")
+            KeyProvider::parse(provider).is_some() && flags.iter().all(|flag| *flag == "--check")
         }
         ["remove", provider] => KeyProvider::parse(provider).is_some(),
         ["login", "openrouter", flags @ ..] => flags.iter().all(|flag| *flag == "--no-browser"),
@@ -786,7 +797,9 @@ fn set_key(
         .iter()
         .find(|name| non_empty_env(name).is_some())
     {
-        eprintln!("note: {name} is set in the environment and takes precedence over the stored key.");
+        eprintln!(
+            "note: {name} is set in the environment and takes precedence over the stored key."
+        );
     }
     Ok(())
 }
@@ -859,9 +872,11 @@ pub(crate) mod tests {
     #[test]
     fn keys_are_validated_by_provider_shape() {
         assert!(validate_key(KeyProvider::Anthropic, ANTHROPIC).is_ok());
-        assert!(validate_key(KeyProvider::Anthropic, "sk-ant-oat01-abcdefghijklmnop")
-            .unwrap_err()
-            .contains("API keys only"));
+        assert!(
+            validate_key(KeyProvider::Anthropic, "sk-ant-oat01-abcdefghijklmnop")
+                .unwrap_err()
+                .contains("API keys only")
+        );
         assert!(validate_key(KeyProvider::OpenAi, "sk-proj-abcdefghijklmnopqrst").is_ok());
         assert!(validate_key(KeyProvider::OpenAi, OPENROUTER)
             .unwrap_err()
@@ -898,7 +913,9 @@ pub(crate) mod tests {
         assert_eq!(store.remove(KeyProvider::Anthropic), Ok(true));
         assert!(store.get(KeyProvider::Anthropic).unwrap().is_none());
         assert_eq!(store.remove(KeyProvider::Anthropic), Ok(false));
-        assert!(store.set(KeyProvider::Anthropic, "not-a-key-at-all-x").is_err());
+        assert!(store
+            .set(KeyProvider::Anthropic, "not-a-key-at-all-x")
+            .is_err());
     }
 
     #[test]
@@ -924,7 +941,9 @@ pub(crate) mod tests {
         let store = store(&dir, &keychains, false);
         store.set(KeyProvider::Anthropic, ANTHROPIC).unwrap();
         store.set(KeyProvider::OpenRouter, OPENROUTER).unwrap();
-        let env = |name: &str| (name == "OPENROUTER_API_KEY").then(|| "sk-or-v1-envenvenvenv9876".to_string());
+        let env = |name: &str| {
+            (name == "OPENROUTER_API_KEY").then(|| "sk-or-v1-envenvenvenv9876".to_string())
+        };
         let statuses = store.status(&env);
         let anthropic = &statuses[0];
         assert_eq!(anthropic.source, Some(KeySource::Keychain));
@@ -933,7 +952,10 @@ pub(crate) mod tests {
             .iter()
             .find(|status| status.provider == KeyProvider::OpenRouter)
             .unwrap();
-        assert_eq!(openrouter.source, Some(KeySource::Env("OPENROUTER_API_KEY")));
+        assert_eq!(
+            openrouter.source,
+            Some(KeySource::Env("OPENROUTER_API_KEY"))
+        );
         assert!(openrouter.shadowed_store);
         let text = render_status(&statuses, Some("anthropic"));
         let json = status_json(&statuses).to_string();
@@ -953,7 +975,9 @@ pub(crate) mod tests {
         store
             .set(KeyProvider::Gemini, "AIzaSyA-abcdefghijklmnopqrstuvwxyz012")
             .unwrap();
-        store.set(KeyProvider::Xai, "xai-abcdefghijklmnopqrstu").unwrap();
+        store
+            .set(KeyProvider::Xai, "xai-abcdefghijklmnopqrstu")
+            .unwrap();
         let env = |name: &str| (name == "GOOGLE_API_KEY").then(|| "AIza-env".to_string());
         let installed = store.install_into_api(&env);
         assert_eq!(installed, vec![KeyProvider::Xai]);
@@ -971,8 +995,16 @@ pub(crate) mod tests {
         assert!(is_provider_auth_command(&["set", "google", "--check"]));
         assert!(is_provider_auth_command(&["remove", "openai"]));
         assert!(is_provider_auth_command(&["login", "openrouter"]));
-        assert!(is_provider_auth_command(&["login", "openrouter", "--no-browser"]));
-        assert!(!is_provider_auth_command(&["set", "anthropic", "sk-ant-key"]));
+        assert!(is_provider_auth_command(&[
+            "login",
+            "openrouter",
+            "--no-browser"
+        ]));
+        assert!(!is_provider_auth_command(&[
+            "set",
+            "anthropic",
+            "sk-ant-key"
+        ]));
         assert!(!is_provider_auth_command(&["set", "claude-ai"]));
         assert!(!is_provider_auth_command(&["login"]));
         assert!(!is_provider_auth_command(&["login", "chatgpt"]));
@@ -1061,6 +1093,9 @@ pub(crate) mod tests {
         assert!(!error.contains(OPENROUTER));
         let request = server.join().unwrap();
         assert!(request.starts_with("GET /key"), "{request}");
-        assert!(request.contains(&format!("Bearer {OPENROUTER}")) || request.to_ascii_lowercase().contains("bearer"));
+        assert!(
+            request.contains(&format!("Bearer {OPENROUTER}"))
+                || request.to_ascii_lowercase().contains("bearer")
+        );
     }
 }

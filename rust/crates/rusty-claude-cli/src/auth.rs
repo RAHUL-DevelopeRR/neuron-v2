@@ -867,9 +867,12 @@ pub fn run_auth_command(args: &[String]) -> Result<(), Box<dyn std::error::Error
             print_json(&serde_json::json!({ "kind": "help", "message": AUTH_USAGE }))?;
         }
         None | Some("help" | "--help" | "-h") => {
-            println!("{AUTH_USAGE}
+            println!(
+                "{AUTH_USAGE}
 
-{}", crate::provider_auth::PROVIDER_AUTH_USAGE);
+{}",
+                crate::provider_auth::PROVIDER_AUTH_USAGE
+            );
         }
         _ => return Err(AUTH_USAGE.into()),
     }

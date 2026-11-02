@@ -375,8 +375,7 @@ fn env_or_dotenv_present(key: &str) -> bool {
     match std::env::var(key) {
         Ok(value) if !value.is_empty() => true,
         Ok(_) | Err(std::env::VarError::NotPresent) => {
-            dotenv_value(key).is_some_and(|value| !value.is_empty())
-                || user_keys::has_user_key(key)
+            dotenv_value(key).is_some_and(|value| !value.is_empty()) || user_keys::has_user_key(key)
         }
         Err(_) => false,
     }
