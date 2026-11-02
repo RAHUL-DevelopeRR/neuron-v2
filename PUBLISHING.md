@@ -37,10 +37,10 @@ published release are never rebuilt or replaced.
   `pyproject.toml` and `PACKAGE_VERSION` in `neuron_cli/__init__.py`.
   `python -m unittest discover -s tests -p test_packaging_metadata.py` fails if any of
   them disagree, and the release workflow refuses a tag that does not match.
-- A version with a suffix, such as `7.0.0-alpha.2`, is a prerelease. Spell it the same
+- A version with a suffix, such as `7.0.0-alpha.3`, is a prerelease. Spell it the same
   way in every one of those files, `pyproject.toml` and `PACKAGE_VERSION` included:
   the workflow and the launchers compare the raw string, and only the built wheel and
-  sdist file names use the PEP 440 form (`7.0.0a2`). The workflow publishes a
+  sdist file names use the PEP 440 form (`7.0.0a3`). The workflow publishes a
   prerelease on GitHub without ever marking it "Latest". On npm, a tag push publishes
   it under the `next` dist-tag; a manual run publishes it under the `npm_dist_tag` you
   choose (see [Publish to npm](#5-publish-to-npm)). PyPI has no dist-tags: pip installs
@@ -50,7 +50,7 @@ published release are never rebuilt or replaced.
 - Run the checks from [CONTRIBUTING.md](CONTRIBUTING.md#checks): Rust fmt, clippy and
   tests, the Python and Node packaging tests, and the notices generator.
 - Check that the docs describe the binary you are about to ship. The README,
-  [USAGE.md](USAGE.md) and [SECURITY.md](SECURITY.md) describe the 7.0.0-alpha.2 behavior
+  [USAGE.md](USAGE.md) and [SECURITY.md](SECURITY.md) describe the 7.0.0-alpha.3 behavior
   that `rusty-claude-cli/tests/gateway_roundtrip.rs` exercises against a fake gateway
   and that was exercised live against a local gateway during integration. On the
   release candidate, confirm at least:
@@ -84,8 +84,8 @@ From the merge commit on the default branch:
 
 ```sh
 git switch ux-audit-fixes && git pull --ff-only
-git tag -a v7.0.0-alpha.2 -m "Neuron 7.0.0-alpha.2"
-git push origin v7.0.0-alpha.2
+git tag -a v7.0.0-alpha.3 -m "Neuron 7.0.0-alpha.3"
+git push origin v7.0.0-alpha.3
 ```
 
 The tag push starts the release workflow:
@@ -125,9 +125,9 @@ The release must have these 24 assets:
 Check them yourself before publishing anywhere else:
 
 ```sh
-gh release view v7.0.0-alpha.2 --repo RAHUL-DevelopeRR/neuron-v2
-gh release download v7.0.0-alpha.2 --repo RAHUL-DevelopeRR/neuron-v2 --dir neuron-7.0.0-alpha.2
-cd neuron-7.0.0-alpha.2 && sha256sum --check SHA256SUMS
+gh release view v7.0.0-alpha.3 --repo RAHUL-DevelopeRR/neuron-v2
+gh release download v7.0.0-alpha.3 --repo RAHUL-DevelopeRR/neuron-v2 --dir neuron-7.0.0-alpha.3
+cd neuron-7.0.0-alpha.3 && sha256sum --check SHA256SUMS
 gh attestation verify neuron-linux-x64 --repo RAHUL-DevelopeRR/neuron-v2
 ```
 
@@ -139,13 +139,13 @@ and `/usage`.
 Once `promote` has passed, `gh release view --repo RAHUL-DevelopeRR/neuron-v2` (no tag)
 shows the new version. If `promote` did not run or skipped a stable release, mark it
 latest yourself when you are satisfied: `gh release edit vX.Y.Z --latest`. Never do
-this for a prerelease such as `v7.0.0-alpha.2`: `promote` skips prereleases on
+this for a prerelease such as `v7.0.0-alpha.3`: `promote` skips prereleases on
 purpose, and a prerelease stays out of `releases/latest`.
 
 ## 5. Publish to npm
 
 Either dispatch the workflow on the tag (Actions, Release, Run workflow, "Use workflow
-from" `v7.0.0-alpha.2`, tick `publish_npm` and choose the `npm_dist_tag`), or publish
+from" `v7.0.0-alpha.3`, tick `publish_npm` and choose the `npm_dist_tag`), or publish
 from a maintainer machine.
 
 The dist-tag decides what a plain `npm install --global @zero-x.live/neuron` gets:
@@ -153,9 +153,10 @@ The dist-tag decides what a plain `npm install --global @zero-x.live/neuron` get
 - `next` (the default of a manual run) publishes the version without moving `latest`;
   users get it only with `@next`. Use it for a prerelease that should not be the
   default install yet.
-- `latest` makes it the default install. 7.0.0-alpha.2 is published this way, so that
-  the default install is the new Neuron instead of the unsupported 6.2.0. Choose
-  `latest` for every stable release as well: a manual run never picks it for you.
+- `latest` makes it the default install. 7.0.0-alpha.3 is published this way, so that
+  the default install is the new Neuron instead of the unsupported 6.2.0 (7.0.0-alpha.2's
+  npm publish failed before it reached the registry). Choose `latest` for every stable
+  release as well: a manual run never picks it for you.
 
 A tag push with `ENABLE_NPM_PUBLISH` set keeps the automatic rule: a prerelease goes
 to `next` and a stable release to `latest`. Either way the workflow passes `--tag`
@@ -164,16 +165,16 @@ explicitly, because npm 11 refuses to publish a prerelease without one.
 By hand:
 
 ```sh
-git switch --detach v7.0.0-alpha.2
+git switch --detach v7.0.0-alpha.3
 cd npm/neuroncli
 npm pack
 # --ignore-scripts: dependency install scripts never run where your npm login is
-npm install --global --ignore-scripts ./zero-x.live-neuron-7.0.0-alpha.2.tgz
+npm install --global --ignore-scripts ./zero-x.live-neuron-7.0.0-alpha.3.tgz
 npm rebuild --global @zero-x.live/neuron   # this package's postinstall: downloads the binary
 neuron --version
 # always name the dist-tag: npm 11 refuses a prerelease without --tag
-npm publish ./zero-x.live-neuron-7.0.0-alpha.2.tgz --access public --tag latest   # asks for your 2FA code
-npm dist-tag ls @zero-x.live/neuron   # latest: 7.0.0-alpha.2
+npm publish ./zero-x.live-neuron-7.0.0-alpha.3.tgz --access public --tag latest   # asks for your 2FA code
+npm dist-tag ls @zero-x.live/neuron   # latest: 7.0.0-alpha.3
 ```
 
 Use `--tag next` instead for a prerelease that should not become the default install.
@@ -192,11 +193,11 @@ By hand:
 
 ```sh
 python -m build && python -m twine check --strict dist/*
-python -m zipfile -l dist/neuroncli-7.0.0a2-py3-none-any.whl   # neuron_cli/__init__.py + dist-info only (PEP 440 spells 7.0.0-alpha.2 as 7.0.0a2)
+python -m zipfile -l dist/neuroncli-7.0.0a3-py3-none-any.whl   # neuron_cli/__init__.py + dist-info only (PEP 440 spells 7.0.0-alpha.3 as 7.0.0a3)
 python -m twine upload dist/*
 ```
 
-PyPI has no dist-tags. A prerelease such as 7.0.0-alpha.2 (`7.0.0a2`) is installed with
+PyPI has no dist-tags. A prerelease such as 7.0.0-alpha.3 (`7.0.0a3`) is installed with
 `pip install --pre neuroncli` or an exact pin; plain `pip install neuroncli` keeps
 choosing an older stable version until 7.0.0 is out, which is why the README says
 `--pre`.
@@ -205,22 +206,22 @@ choosing an older stable version until 7.0.0 is out, which is why the README say
 
 The builds that predate this pipeline (npm 6.2.0, PyPI 6.2.4 and earlier) do not match
 the release binaries. Deprecate them once the new version is the default install on
-npm and is live on PyPI: from 7.0.0-alpha.2 on, npm's `latest` is the new Neuron, so a
+npm and is live on PyPI: from 7.0.0-alpha.3 on, npm's `latest` is the new Neuron, so a
 deprecation message that points at `latest` now points at a supported build.
 
 The maintainer (Rahul) runs these by hand, after the npm and PyPI publishes of
-7.0.0-alpha.2 have succeeded; the workflow never deprecates or yanks anything:
+7.0.0-alpha.3 have succeeded; the workflow never deprecates or yanks anything:
 
 ```sh
-npm dist-tag ls @zero-x.live/neuron    # latest must point at 7.0.0-alpha.2 (or newer) first
+npm dist-tag ls @zero-x.live/neuron    # latest must point at 7.0.0-alpha.3 (or newer) first
 npm view @zero-x.live/neuron versions  # the old builds the range below covers
-npm deprecate "@zero-x.live/neuron@<7.0.0-0" "Unsupported build; install @zero-x.live/neuron@latest (7.0.0-alpha.2 or later)"
+npm deprecate "@zero-x.live/neuron@<7.0.0-0" "Unsupported build; install @zero-x.live/neuron@latest (7.0.0-alpha.3 or later)"
 ```
 
 `<7.0.0-0` covers 6.2.0 and every earlier version, and no 7.0.0 prerelease. PyPI has
 no command-line yank (twine cannot do it): on pypi.org, project `neuroncli`, Manage,
 open 6.2.4 and each older release, Options, Yank, with the reason "Unsupported build;
-install 7.0.0-alpha.2 or later with pip install --pre neuroncli". Yanked versions stay
+install 7.0.0-alpha.3 or later with pip install --pre neuroncli". Yanked versions stay
 installable when pinned exactly, so existing pins keep working.
 
 ## 8. After the release

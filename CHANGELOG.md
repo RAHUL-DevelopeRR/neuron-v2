@@ -3,6 +3,134 @@
 Notable changes to Neuron. Versions follow [semantic versioning](https://semver.org/).
 The release workflow copies a version's section into its GitHub release notes.
 
+## 7.0.0-alpha.3 (2026-11-02)
+
+The third Neuron alpha. The full-screen UI now shows what a turn is doing while it
+happens: each tool call as the model writes it, output tokens as they arrive, the task
+list, sub-agents, the files the session changed, diffs, commits and rewinds to a
+checkpoint. It asks before working in a new folder and signs you in on first launch.
+Scripts can continue a saved session, and a denied tool call names the allow rule that
+lets it run. Weaker and auto-routed models get more help staying on task.
+
+It is still a GitHub prerelease. The [known limitations of 7.0.0-alpha.1](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/v7.0.0-alpha.1/CHANGELOG.md#known-limitations)
+still apply, except the ones about npm and PyPI and the ones this release fixes below.
+
+### npm and PyPI
+
+- 7.0.0-alpha.2 never reached npm: npm 11 read the tarball path `dist/<name>.tgz` as a
+  GitHub repository and the publish failed before it reached the registry. The release
+  workflow now publishes `./dist/<name>.tgz`, and a packaging test guards the path.
+  This alpha goes out as npm's default `latest`, so
+  `npm install --global @zero-x.live/neuron` installs it.
+- On PyPI the alpha is a pre-release: `pip install --pre neuroncli`.
+- The old 6.2.x builds (npm 6.2.0, PyPI 6.2.4 and earlier) remain unsupported.
+
+### Full-screen UI: live turn
+
+- Every tool call gets its row from the first token the model writes for it. A file
+  call reads Write or Edit with the path, lines and size so far and its last lines
+  dimmed; a command shows as soon as it is written, then Running... until its result;
+  a sub-agent call gets a row with its description, type, progress and the start of its
+  answer. A call the model never finished writing ends as failed ("The response ended
+  before this call was complete"), and a retried request drops the rows of the attempt
+  that failed.
+- The status line replaces "thinking..." with a spinner and what the turn is doing:
+  Thinking, Responding, Writing or Editing a file, Running a command, Waiting for
+  approval, Waiting for the model. A stream silent for more than 10 seconds says how
+  long it has had no tokens. The right side shows the elapsed time, the turn's output
+  tokens so far and "esc to interrupt". The footer's token counts include the running
+  turn, marked `~`, until its usage arrives.
+- While the agent keeps a task list, a todo strip above the input shows progress and
+  the item in progress (`Todos 2/5`); `/todo` shows the whole list. A cut-off or failed
+  TodoWrite keeps the previous list.
+- The footer shows the model `auto` picked (`auto → <model>`).
+
+### Full-screen UI: changes, diffs, commits and rewind
+
+- The engine keeps a checkpoint for every prompt, with the files the agent and its
+  sub-agents changed and the shell commands they ran.
+- A line above the input counts the session's changed files and lines
+  (`3 files changed +120 -4 · /changes`). `/changes` lists them; Enter shows a file's
+  diff, `a` shows all of them.
+- `/diff [path]` shows the working tree against HEAD (outside git, the agent's changes
+  this session).
+- `/commit` drafts a commit message with the session's model and shows a commit card
+  (branch, files, message); Enter commits, `e` edits, Esc cancels. `/commit <message>`
+  commits with that message. Files that can hold credentials are never sent to the model and are
+  left out of `git add -A`.
+- `/rewind` picks a checkpoint, then code and chat, chat only or code only, and shows a
+  preview of what is restored, removed or cannot be restored (shell commands are not
+  undone) before Enter rewinds.
+- The TodoWrite list is kept in Neuron's home folder instead of `.clawd-todos.json` in
+  the working tree, so it no longer shows in `git status` or ends up in a commit.
+
+### Full-screen UI: trust, sign-in and reports
+
+- A folder Neuron has not been trusted in opens on "Before Neuron works here": the
+  folder, its git root, what Neuron may do there and what the project's settings would
+  turn on (nothing starts while you decide), then Allow or Quit. The line REPL asks the
+  same question in the same words, as a two-choice menu.
+- With no Zero-X login, the first screen signs you in, then asks about the folder, then
+  opens the chat. Esc leaves sign-in for later. If Zero-X cannot be reached, the
+  sign-in panel says so and how to retry.
+- `/usage`, `/init`, `/memory` and `/doctor` open their report in a panel above the
+  input.
+- `/new`, `/clear` and the history screen's New chat start a fresh conversation in the
+  engine too; a chat picked in `/history` resumes its session. Agent modes the engine
+  does not support are no longer offered, `/image` is hidden while images do not reach
+  the model, and `/upgrade` opens the pricing page.
+
+### Agent loop for weaker models
+
+- Tool arguments that are almost JSON (code fences, a JSON string, trailing commas,
+  raw newlines, a missing closing brace) are repaired, and the model is told so. An
+  unknown tool name gets "did you mean" suggestions.
+- `edit_file` accepts a unique match that differs only in trailing whitespace or
+  indentation, and says which match it used. `write_file` and `edit_file` refuse
+  placeholders such as `// ... existing code ...` and cut-off rewrites that would
+  drop code.
+- After a turn that changed files, the model is asked once to check its changes against
+  the request, with the results of the project's checks (`cargo check`, the typecheck
+  script, `go vet`, `py_compile`, or `.neuron/checks.json`). The checks run by
+  themselves only when your permission settings allow them without asking.
+  `NEURON_COMPLETION_CHECK=0` and `NEURON_AUTO_CHECKS=0` turn this off.
+- `NEURON_REVIEW=1` adds a read-only reviewer sub-agent to that check
+  (`NEURON_REVIEW_MODEL` picks its model). An experience library
+  (`NEURON_EXPERIENCE=0` turns it off) adds notes to a model's system prompt about the
+  mistakes it keeps making.
+- A turn that ends on an announcement ("I'll now update the file.") is nudged once to
+  make the call. When `auto` routes to a model with a smaller context window, the
+  context budget shrinks so compaction happens before the request is rejected.
+
+### Scripts and the line REPL
+
+- `neuron --resume SESSION prompt TEXT` (or `-p TEXT`) continues a saved session from
+  a script. `--output-format json` reports `session_id`, `served_model` and
+  `completion_checked`.
+- Two runs on one session no longer lose turns: a session in use by another run is
+  refused ("session X is in use by another neuron run"); read-only commands such as
+  `/status` still work on it.
+- Piped input meant for the REPL (`printf '/model\n/exit' | neuron`, also behind a
+  UTF-8 byte order mark) is refused instead of being sent to the model as one prompt.
+  A bare `neuron` without a terminal stops with "nothing to do" instead of asking a
+  question nobody can answer. `--resume latest` skips empty sessions. Git Bash's path
+  rewriting of `neuron /model` is undone.
+- A tool call denied in a non-interactive run names the `permissions.allow` rule that
+  lets it run (in user settings), and names Full access only as a last resort. The
+  named rules are checked to actually allow the call. `NEURON_DENIAL_LIMIT` raises the
+  number of denials after which a run stops (default 5).
+- `/model` in the line REPL lists models with their live status: usable, temporarily
+  unavailable (and until when) or not available. Choosing an unavailable model, or
+  passing one to `neuron prompt --model`, warns; an out-of-capacity error names models
+  that are usable now.
+- The retry of a broken stream toward Zero-X waits 2 to 5 seconds and has a 100-second
+  first-token deadline, and text from the failed attempt is marked
+  "(partial reply discarded - retrying)".
+- `neuron --help` lists only what runs: every command on its "Resume-safe commands"
+  line runs under `neuron --resume`, and every option the parser takes is listed.
+  `--resume X /context clear` and `/skills install` under `--resume` behave as in a
+  session. README, USAGE and `neuron-tui --help` match what ships.
+
 ## 7.0.0-alpha.2 (2026-10-26)
 
 The second Neuron alpha, and the first one on npm and PyPI: both packages now install
