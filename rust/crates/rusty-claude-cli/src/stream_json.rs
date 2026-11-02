@@ -75,9 +75,15 @@ pub(crate) fn init_event(
     })
 }
 
-/// The last line of a run: `answer` is what `--output-format json` prints.
+/// The last line of a run: `answer` is what `--output-format json` prints. A failed
+/// run's answer is `"type": "error"`; here the line stays `result` with `is_error`.
 pub(crate) fn result_event(answer: Value) -> Value {
-    let mut result = json!({ "type": "result", "schema": STREAM_SCHEMA_VERSION });
+    let is_error = answer.get("type").and_then(Value::as_str) == Some("error");
+    let mut result = json!({
+        "type": "result",
+        "schema": STREAM_SCHEMA_VERSION,
+        "is_error": is_error,
+    });
     if let (Some(line), Value::Object(fields)) = (result.as_object_mut(), answer) {
         for (key, value) in fields {
             if key != "type" {
@@ -238,6 +244,11 @@ mod tests {
         });
         let line = result_event(answer.clone());
         assert_eq!(line["type"], "result");
+        assert_eq!(line["is_error"], false);
+        let failed = result_event(json!({ "type": "error", "error": "boom", "message": "" }));
+        assert_eq!(failed["type"], "result");
+        assert_eq!(failed["is_error"], true);
+        assert_eq!(failed["error"], "boom");
         for (key, value) in answer.as_object().unwrap() {
             assert_eq!(&line[key], value, "{key}");
         }
