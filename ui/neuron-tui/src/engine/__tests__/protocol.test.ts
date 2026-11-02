@@ -372,6 +372,7 @@ const EVENT_FIELDS: { [T in UiEventType]: string[] } = {
   ]),
   output_progress: eventFields('output_progress')(['output_tokens']),
   request_usage: eventFields('request_usage')(['usage']),
+  tool_output_delta: eventFields('tool_output_delta')(['tool_use_id', 'stream', 'chunk']),
   changes: eventFields('changes')(['files']),
   diff: eventFields('diff')(['title', 'files', 'truncated']),
   commit_proposal: eventFields('commit_proposal')([
@@ -608,6 +609,7 @@ describe('UI events (engine -> UI)', () => {
       tool_input_progress: true,
       output_progress: true,
       request_usage: true,
+      tool_output_delta: true,
       todos: true,
       subagent_started: true,
       subagent_finished: true,
