@@ -305,6 +305,18 @@ const SANDBOX_FIELDS: &[FieldSpec] = &[
         name: "allowedMounts",
         expected: FieldType::StringArray,
     },
+    FieldSpec {
+        name: "network",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "maxProcesses",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "memoryLimitMb",
+        expected: FieldType::Number,
+    },
 ];
 
 const OAUTH_FIELDS: &[FieldSpec] = &[

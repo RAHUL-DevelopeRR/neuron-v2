@@ -1461,6 +1461,16 @@ fn parse_optional_sandbox_config(root: &JsonValue) -> Result<SandboxConfig, Conf
         filesystem_mode,
         allowed_mounts: optional_string_array(sandbox, "allowedMounts", "merged settings.sandbox")?
             .unwrap_or_default(),
+        network_allow: match sandbox.get("network") {
+            Some(network) => optional_string_array(
+                expect_object(network, "merged settings.sandbox.network")?,
+                "allow",
+                "merged settings.sandbox.network",
+            )?,
+            None => None,
+        },
+        max_processes: optional_u32(sandbox, "maxProcesses", "merged settings.sandbox")?,
+        memory_limit_mb: optional_u64(sandbox, "memoryLimitMb", "merged settings.sandbox")?,
     })
 }
 
@@ -2319,6 +2329,29 @@ mod tests {
     }
 
     #[test]
+    fn parses_sandbox_network_allowlist_and_job_limits() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".neuron");
+        fs::create_dir_all(cwd.join(".neuron")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"sandbox": {"network": {"allow": ["github.com", "*.npmjs.org"]},
+                "maxProcesses": 64, "memoryLimitMb": 4096}}"#,
+        )
+        .expect("write settings");
+        let loaded = ConfigLoader::new(&cwd, &home).load().expect("config");
+        assert_eq!(
+            loaded.sandbox().network_allow,
+            Some(vec!["github.com".to_string(), "*.npmjs.org".to_string()])
+        );
+        assert_eq!(loaded.sandbox().max_processes, Some(64));
+        assert_eq!(loaded.sandbox().memory_limit_mb, Some(4096));
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
     fn parses_sandbox_config() {
         let root = temp_dir();
         let cwd = root.join("project");
@@ -2352,6 +2385,8 @@ mod tests {
             Some(FilesystemIsolationMode::AllowList)
         );
         assert_eq!(loaded.sandbox().allowed_mounts, vec!["logs", "tmp/cache"]);
+        assert_eq!(loaded.sandbox().network_allow, None);
+        assert_eq!(loaded.sandbox().max_processes, None);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

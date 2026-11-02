@@ -17,5 +17,8 @@ telemetry = { path = "../telemetry" }
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt", "rt-multi-thread", "time"] }
 walkdir = "2"
 
+[target.'cfg(windows)'.dependencies]
+winjob = { path = "../winjob" }
+
 [lints]
 workspace = true

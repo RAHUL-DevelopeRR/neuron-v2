@@ -217,6 +217,36 @@ pub(crate) fn ensure_gated_host(raw: &str, url: &Url) -> Result<(), String> {
     ))
 }
 
+/// Refuses `url` when `sandbox.network.allow` is configured (and the
+/// sandbox is on) and its host is not on the list.
+pub(crate) fn ensure_allowlisted(url: &Url) -> Result<(), String> {
+    let Ok(cwd) = std::env::current_dir() else {
+        return Ok(());
+    };
+    let Ok(config) = runtime::ConfigLoader::default_for(&cwd).load() else {
+        return Ok(());
+    };
+    let sandbox = config.sandbox();
+    if sandbox.enabled == Some(false) {
+        return Ok(());
+    }
+    check_allowlist(sandbox.network_allow.as_deref(), url)
+}
+
+/// The pure check behind [`ensure_allowlisted`].
+pub(crate) fn check_allowlist(allow: Option<&[String]>, url: &Url) -> Result<(), String> {
+    let Some(allow) = allow else {
+        return Ok(());
+    };
+    let host = url.host_str().unwrap_or_default();
+    if runtime::net_allow::NetworkAllowlist::new(allow).allows(host, url.port_or_known_default()) {
+        return Ok(());
+    }
+    Err(format!(
+        "WebFetch refused `{url}`: `{host}` is not in sandbox.network.allow. Ask the user to add it to their settings if this fetch is needed."
+    ))
+}
+
 enum UrlHost<'a> {
     Ip(IpAddr),
     Domain(&'a str),
@@ -557,6 +587,25 @@ pub(crate) fn bound_text(text: &str) -> (String, Option<usize>) {
         text.chars().take(MAX_FETCH_TEXT_CHARS).collect(),
         Some(total),
     )
+}
+
+#[cfg(test)]
+mod allowlist_tests {
+    use super::check_allowlist;
+    use reqwest::Url;
+
+    #[test]
+    fn webfetch_honours_the_network_allowlist() {
+        let allow = vec!["github.com".to_string(), "*.npmjs.org".to_string()];
+        let url = |text: &str| Url::parse(text).expect("url");
+        assert!(check_allowlist(None, &url("https://anything.example/")).is_ok());
+        assert!(check_allowlist(Some(&allow), &url("https://github.com/x")).is_ok());
+        assert!(check_allowlist(Some(&allow), &url("https://registry.npmjs.org/p")).is_ok());
+        let refused = check_allowlist(Some(&allow), &url("https://evil.example/"))
+            .expect_err("not on the list");
+        assert!(refused.contains("sandbox.network.allow"), "{refused}");
+        assert!(check_allowlist(Some(&[]), &url("https://github.com/")).is_err());
+    }
 }
 
 #[cfg(test)]
