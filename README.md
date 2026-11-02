@@ -10,8 +10,8 @@ By default Neuron talks to models through the [Zero-X gateway](https://zero-x.li
 You sign in once with `neuron auth login`; the provider API keys stay on the gateway
 and never reach your machine. You can also use your own provider key instead.
 
-> 7.0.0-alpha.2 is Neuron's second alpha, built and published by this repository's
-> release pipeline, and the first on npm and PyPI. Its known limitations are listed in
+> 7.0.0-alpha.3 is Neuron's third alpha, built and published by this repository's
+> release pipeline. Its known limitations are listed in
 > the [changelog](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/CHANGELOG.md).
 > It is a GitHub prerelease, so the install scripts need the versioned commands below.
 > The npm 6.2.0 and PyPI 6.2.4 (and earlier) packages were built outside the pipeline
@@ -30,25 +30,25 @@ and there is none until the first stable release is out.
 **macOS and Linux**
 
 ```sh
-curl -fsSL https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.2/install.sh | sh -s -- --version 7.0.0-alpha.2
+curl -fsSL https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.3/install.sh | sh -s -- --version 7.0.0-alpha.3
 ```
 
 The script installs to `~/.local/bin` and tells you if that directory is not on your
 `PATH`. Pass options after `sh -s --`, for example
-`sh -s -- --version 7.0.0-alpha.2 --install-dir "$HOME/bin"`, or set `NEURON_VERSION`
+`sh -s -- --version 7.0.0-alpha.3 --install-dir "$HOME/bin"`, or set `NEURON_VERSION`
 and `NEURON_INSTALL_DIR`.
 
 **Windows (PowerShell 5.1 or 7)**
 
 ```powershell
-& ([scriptblock]::Create((irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.2/install.ps1))) -Version 7.0.0-alpha.2
+& ([scriptblock]::Create((irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.3/install.ps1))) -Version 7.0.0-alpha.3
 ```
 
 The script installs to `%LOCALAPPDATA%\Programs\Neuron\bin` and only changes your
 `PATH` if you ask it to:
 
 ```powershell
-& ([scriptblock]::Create((irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.2/install.ps1))) -Version 7.0.0-alpha.2 -AddToPath
+& ([scriptblock]::Create((irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.3/install.ps1))) -Version 7.0.0-alpha.3 -AddToPath
 ```
 
 **npm** (Node.js 22.14 or later)

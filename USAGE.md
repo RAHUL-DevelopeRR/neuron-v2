@@ -384,7 +384,7 @@ or put it in your user settings.
 | `NEURON_TRUST_WORKSPACE=1` | neuron | Trust the current directory in a headless run (only for checkouts you trust) |
 | `NEURON_NO_TUI=1` | neuron | Use the line REPL instead of the full-screen UI |
 | `NEURON_TUI_ASCII` | neuron-tui | `1` draws with the classic-console character set everywhere, `0` with the Unicode one |
-| `NEURON_VERSION` | install.sh, install.ps1 | Release to install (default: the latest release; a prerelease such as `7.0.0-alpha.2` must be named) |
+| `NEURON_VERSION` | install.sh, install.ps1 | Release to install (default: the latest release; a prerelease such as `7.0.0-alpha.3` must be named) |
 | `NEURON_INSTALL_DIR` | install.sh, install.ps1 | Install directory |
 | `NEURON_BINARY_PATH` | npm and pip launchers | Run this binary instead of the downloaded one |
 | `NEURON_CACHE_DIR` | npm and pip launchers | Where downloaded binaries are cached |
