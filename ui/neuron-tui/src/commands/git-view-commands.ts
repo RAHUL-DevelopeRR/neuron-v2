@@ -11,7 +11,8 @@ import {
   requestCommit,
   requestDiff,
 } from '../engine/git-views'
-import { FEATURE_CHECKPOINTS, FEATURE_GIT_VIEWS } from '../engine/protocol'
+import { forwardMcpSlash, openMcpPanel } from '../engine/mcp-panel'
+import { FEATURE_CHECKPOINTS, FEATURE_GIT_VIEWS, FEATURE_MCP_TOGGLE } from '../engine/protocol'
 import { useGitViewsStore } from '../state/git-views-store'
 import { getSystemMessage, getUserMessage } from '../utils/message-history'
 
@@ -96,6 +97,23 @@ export const GIT_VIEW_COMMANDS: GitViewCommand[] = [
       if (refusedDuringTurn(params, 'rewind')) return
       echo(params)
       requestCheckpoints(args)
+    },
+  },
+  {
+    // `/mcp` alone opens the servers panel; with arguments it is the engine's.
+    name: 'mcp',
+    aliases: [],
+    acceptsArgs: true,
+    feature: FEATURE_MCP_TOGGLE,
+    handler: (params, args) => {
+      if (args.trim()) {
+        echo(params)
+        forwardMcpSlash(args)
+        return
+      }
+      params.saveToHistory(params.inputValue.trim())
+      clearInput(params)
+      openMcpPanel()
     },
   },
 ]

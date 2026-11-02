@@ -66,6 +66,7 @@ mod headless;
 mod init;
 mod input;
 mod line_diff;
+mod mcp_auth;
 mod orchestrator;
 mod plan_mode;
 mod progress;
@@ -383,6 +384,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .join("logs")
             .join("mcp-servers.log"),
     ));
+    // Remote MCP servers' OAuth tokens: the OS keychain (or a 0600 file).
+    mcp_auth::install_token_store();
     let args: Vec<String> = env::args().skip(1).collect();
     let (args, provider_choice) = extract_provider_flag(&args).map_err(UsageError)?;
     provider::set_provider_flag(provider_choice);
@@ -3840,6 +3843,10 @@ impl LiveCli {
         // configured-server reporter (`list`, `status`, ...).
         if matches!(args.map(str::trim), Some("serve")) {
             return run_mcp_serve();
+        }
+        if let Some(outcome) = crate::mcp_auth::handle_mcp_auth_command(args) {
+            println!("{}", outcome?);
+            return Ok(());
         }
         let cwd = env::current_dir()?;
         match output_format {

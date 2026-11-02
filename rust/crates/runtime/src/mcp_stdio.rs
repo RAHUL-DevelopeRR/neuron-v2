@@ -19,6 +19,7 @@ use crate::cancel::CancellationToken;
 use crate::config::{McpTransport, RuntimeConfig, ScopedMcpServerConfig};
 use crate::mcp::mcp_tool_name;
 use crate::mcp_client::{McpClientBootstrap, McpClientTransport, McpStdioTransport};
+use crate::mcp_http::McpConnection;
 use crate::mcp_lifecycle_hardened::{
     McpDegradedReport, McpErrorSurface, McpFailedServer, McpLifecyclePhase,
 };
@@ -479,7 +480,8 @@ struct ToolRoute {
 #[derive(Debug)]
 struct ManagedMcpServer {
     bootstrap: McpClientBootstrap,
-    process: Option<McpStdioProcess>,
+    /// The child process (stdio) or the remote connection (http, sse).
+    process: Option<McpConnection>,
     initialized: bool,
     /// The last start failed because the process exited at once: starting it again would
     /// only fail the same way, so it is not retried.
@@ -522,7 +524,7 @@ impl ManagedMcpServer {
             .await
             .is_err()
         {
-            let _ = process.child.start_kill();
+            process.start_kill();
         }
     }
 
@@ -637,7 +639,7 @@ impl ManagedMcpServer {
         let mut attempts = 0;
         loop {
             if self.process.is_none() {
-                self.process = Some(spawn_mcp_stdio_process(&self.bootstrap)?);
+                self.process = Some(McpConnection::spawn(&self.bootstrap)?);
                 self.initialized = false;
             }
             if self.initialized {
@@ -720,11 +722,13 @@ impl ManagedMcpServer {
             other => return other,
         };
         let exited = match self.process.as_mut() {
-            Some(process) => timeout(Duration::from_millis(MCP_EXIT_CHECK_MS), process.wait())
-                .await
-                .ok()
-                .and_then(Result::ok),
-            None => None,
+            Some(process) if process.is_stdio() => {
+                timeout(Duration::from_millis(MCP_EXIT_CHECK_MS), process.wait())
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+            }
+            _ => None,
         };
         let Some(status) = exited else {
             return McpServerManagerError::Transport {
@@ -827,7 +831,10 @@ impl McpServerManager {
         let mut unsupported_servers = Vec::new();
 
         for (server_name, server_config) in servers {
-            if server_config.transport() == McpTransport::Stdio {
+            if matches!(
+                server_config.transport(),
+                McpTransport::Stdio | McpTransport::Http | McpTransport::Sse
+            ) {
                 let bootstrap = McpClientBootstrap::from_scoped_config(server_name, server_config);
                 managed_servers.insert(server_name.clone(), ManagedMcpServer::new(bootstrap));
             } else {
@@ -1139,6 +1146,9 @@ impl McpServerManager {
             McpClientTransport::Stdio(transport) => Ok(transport
                 .tool_call_timeout_ms
                 .unwrap_or(MCP_TOOL_CALL_TIMEOUT_MS)),
+            McpClientTransport::Http(_) | McpClientTransport::Sse(_) => {
+                Ok(MCP_TOOL_CALL_TIMEOUT_MS)
+            }
             other => Err(McpServerManagerError::InvalidResponse {
                 server_name: server_name.to_string(),
                 method: "tools/call",
@@ -1664,7 +1674,12 @@ impl McpStdioProcess {
         Ok(self.child.try_wait()?.is_some())
     }
 
-    async fn shutdown(&mut self) -> io::Result<()> {
+    /// Kills the server process without waiting for it.
+    pub(crate) fn start_kill(&mut self) {
+        let _ = self.child.start_kill();
+    }
+
+    pub(crate) async fn shutdown(&mut self) -> io::Result<()> {
         if self.child.try_wait()?.is_none() {
             match kill_server_tree(&mut self.child).await {
                 Ok(()) => {}
@@ -3273,10 +3288,11 @@ mod tests {
         let manager = McpServerManager::from_servers(&servers);
         let unsupported = manager.unsupported_servers();
 
-        assert_eq!(unsupported.len(), 3);
-        assert_eq!(unsupported[0].server_name, "http");
-        assert_eq!(unsupported[1].server_name, "sdk");
-        assert_eq!(unsupported[2].server_name, "ws");
+        // Remote http/sse servers are managed now; sdk and ws are not.
+        assert_eq!(unsupported.len(), 2);
+        assert_eq!(unsupported[0].server_name, "sdk");
+        assert_eq!(unsupported[1].server_name, "ws");
+        assert_eq!(manager.server_names(), vec!["http".to_string()]);
         assert_eq!(
             unsupported_server_failed_server(&unsupported[0]).phase,
             McpLifecyclePhase::ServerRegistration

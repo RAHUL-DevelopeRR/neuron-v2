@@ -1770,7 +1770,9 @@ version = "7.0.0-alpha.2"
 dependencies = [
  "glob",
  "plugins",
+ "rand 0.8.6",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",

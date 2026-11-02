@@ -408,6 +408,11 @@ impl SignedOut<'_> {
                     self.send_status();
                 }
                 EngineCommand::ListExtensions => self.send(extensions_event()),
+                EngineCommand::SetMcpServerEnabled { name, enabled } => {
+                    for event in mcp_toggle_events(&name, enabled) {
+                        self.send(event);
+                    }
+                }
                 EngineCommand::RefreshAccount => self.send_account(),
                 EngineCommand::TrustPreview => self.send(engine_trust::trust_preview_event(
                     &env::current_dir().unwrap_or_default(),
@@ -737,25 +742,42 @@ fn extensions_event() -> UiEvent {
     let config = loader.load();
     let snapshot = extensions_snapshot();
     let live = snapshot.as_ref().and_then(|snapshot| snapshot.mcp.as_ref());
-    let mcp_servers = match &config {
-        Ok(config) => config
-            .mcp()
-            .servers()
-            .iter()
-            .map(|(name, server)| {
-                let (status, tools, error) = mcp_server_status(name, live);
-                McpServerInfo {
-                    name: name.clone(),
-                    scope: config_scope_id(server.scope).to_string(),
-                    transport: mcp_transport_id(server.transport()).to_string(),
-                    status: status.to_string(),
-                    tools,
-                    error,
-                }
-            })
-            .collect(),
-        Err(_) => Vec::new(),
-    };
+    let mcp_servers =
+        match &config {
+            Ok(config) => {
+                let mut servers: Vec<McpServerInfo> = config
+                    .mcp()
+                    .servers()
+                    .iter()
+                    .map(|(name, server)| {
+                        let (status, tools, error) = mcp_server_status(name, live);
+                        McpServerInfo {
+                            name: name.clone(),
+                            scope: config_scope_id(server.scope).to_string(),
+                            transport: mcp_transport_id(server.transport()).to_string(),
+                            status: status.to_string(),
+                            tools,
+                            error,
+                            enabled: true,
+                        }
+                    })
+                    .collect();
+                servers.extend(config.mcp().disabled().iter().map(|(name, server)| {
+                    McpServerInfo {
+                        name: name.clone(),
+                        scope: config_scope_id(server.scope).to_string(),
+                        transport: mcp_transport_id(server.transport()).to_string(),
+                        status: "disabled".to_string(),
+                        tools: Vec::new(),
+                        error: None,
+                        enabled: false,
+                    }
+                }));
+                servers.sort_by(|left, right| left.name.cmp(&right.name));
+                servers
+            }
+            Err(_) => Vec::new(),
+        };
     // Before a runtime was built (signed out), the plugins come from the manager.
     let plugins = match snapshot {
         Some(snapshot) => snapshot.plugins,
@@ -791,6 +813,37 @@ fn extensions_event() -> UiEvent {
             "agents",
         ),
     }
+}
+
+/// `SetMcpServerEnabled`: switches the server in the user settings (see
+/// `runtime::set_mcp_server_enabled`), then says so and lists the extensions again.
+/// The running servers restart from the next turn (the settings changed).
+fn mcp_toggle_events(name: &str, enabled: bool) -> Vec<UiEvent> {
+    let cwd = env::current_dir().unwrap_or_default();
+    let loader = ConfigLoader::default_for(&cwd);
+    let first = match runtime::set_mcp_server_enabled(&loader, name, enabled) {
+        Ok(outcome) if enabled && !outcome.still_disabled_by.is_empty() => UiEvent::Notice {
+            message: format!(
+                "MCP server {name} is still turned off by {}.",
+                outcome
+                    .still_disabled_by
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            kind: None,
+        },
+        Ok(_) => UiEvent::Notice {
+            message: format!(
+                "MCP server {name} {}; this takes effect from the next turn.",
+                if enabled { "turned on" } else { "turned off" }
+            ),
+            kind: None,
+        },
+        Err(error) => UiEvent::error(format!("could not switch MCP server {name}: {error}")),
+    };
+    vec![first, extensions_event()]
 }
 
 /// What the MCP server `name` is doing: its status, its tools (without the
@@ -1539,6 +1592,11 @@ impl Engine {
                 self.send_status();
             }
             EngineCommand::ListExtensions => self.send(extensions_event()),
+            EngineCommand::SetMcpServerEnabled { name, enabled } => {
+                for event in mcp_toggle_events(&name, enabled) {
+                    self.send(event);
+                }
+            }
             EngineCommand::RefreshAccount => {
                 if !self.read_account_in_background() {
                     self.send_account();

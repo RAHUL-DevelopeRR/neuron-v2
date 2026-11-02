@@ -57,6 +57,11 @@ export const FEATURE_LIVE_PROGRESS = 'live_progress'
 export const FEATURE_GIT_VIEWS = 'git_views'
 /** `/rewind`, the `checkpoints` and `rewound` events; the `rewind` command. */
 export const FEATURE_CHECKPOINTS = 'checkpoints'
+/**
+ * The `set_mcp_server_enabled` command; `enabled` on MCP servers, and disabled
+ * servers listed with status `disabled`.
+ */
+export const FEATURE_MCP_TOGGLE = 'mcp_toggle'
 
 /** A UI capability: questions come as `question` events, not "Question:" notices. */
 export const CAPABILITY_QUESTIONS = 'questions'
@@ -213,12 +218,14 @@ export interface McpServerInfo {
   scope: string
   /** `stdio`, `http`, `sse`, `ws`, `sdk` or `managed_proxy`. */
   transport: string
-  /** `starting`, `ready`, `failed`, `pending`, `unsupported` or `not_started`. */
+  /** `starting`, `ready`, `failed`, `pending`, `unsupported`, `not_started` or `disabled`. */
   status: string
   /** Its tools, without the `mcp__<server>__` prefix. */
   tools: string[]
   /** Why it failed or is unsupported. */
   error: string | null
+  /** Turned on (feature `mcp_toggle`); an older engine leaves it out: on. */
+  enabled?: boolean
 }
 
 /** One installed plugin. */
@@ -942,6 +949,11 @@ export type EngineCommand =
   | { type: 'trust_workspace' }
   /** MCP servers, plugins, skills and agents, as an `extensions` event. */
   | { type: 'list_extensions' }
+  /**
+   * Turn an MCP server on or off (feature `mcp_toggle`), saved in the user
+   * settings: a notice and a fresh `extensions` event follow.
+   */
+  | { type: 'set_mcp_server_enabled'; name: string; enabled: boolean }
   /** What trusting the workspace would turn on (feature `trust_preview`). */
   | { type: 'trust_preview' }
   /** Read the plan and usage again, as an `account` event (feature `account`). */
@@ -965,6 +977,7 @@ export const ENGINE_COMMAND_TYPES: readonly EngineCommand['type'][] = [
   'resume',
   'trust_workspace',
   'list_extensions',
+  'set_mcp_server_enabled',
   'trust_preview',
   'refresh_account',
   'commit',
