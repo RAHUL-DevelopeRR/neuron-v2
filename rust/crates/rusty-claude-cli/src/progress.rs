@@ -469,24 +469,41 @@ fn assemble_conversation_runtime(
         runtime::context_manager::ContextPolicy::from_env(),
     );
     let harness = runtime::HarnessConfig::from_env().with_model(model.clone());
-    let reviewer = tools::SubagentReviewer::from_env(&model);
+    let routing_settings = feature_config.model_routing();
+    let reviewer = tools::SubagentReviewer::from_env_or(
+        &model,
+        routing_settings
+            .reviewer_model()
+            .map(|reviewer| crate::model_routing::transport_model(&model, reviewer))
+            .as_deref(),
+    );
+    let routing = crate::model_routing::conversation_routing(
+        &feature_config,
+        &model,
+        crate::model_routing::is_agent_mode(enable_tools, permission_mode, allowed_tools.as_ref()),
+        crate::gateway_catalog::current().as_deref(),
+    );
+    let summary_model = crate::model_routing::summary_model(routing_settings, &model);
+    let request_model = crate::model_routing::request_model(routing_settings, &model, enable_tools);
     register_subagent_parent(
         &model,
         permission_mode,
         &feature_config,
         allowed_tools.as_ref(),
     );
+    let mut api_client = AnthropicRuntimeClient::new(
+        session_id,
+        request_model,
+        enable_tools,
+        output.clone(),
+        allowed_tools.clone(),
+        tool_registry.clone(),
+        progress_reporter,
+    )?;
+    api_client.set_summary_model(summary_model);
     let mut runtime = ConversationRuntime::new_with_features(
         session,
-        AnthropicRuntimeClient::new(
-            session_id,
-            model,
-            enable_tools,
-            output.clone(),
-            allowed_tools.clone(),
-            tool_registry.clone(),
-            progress_reporter,
-        )?,
+        api_client,
         CliToolExecutor::new(
             allowed_tools.clone(),
             output.clone(),
@@ -499,7 +516,8 @@ fn assemble_conversation_runtime(
     )
     .with_context_manager(context_manager)
     .with_max_iterations(runtime::resolve_max_iterations(max_iterations_setting))
-    .with_harness_config(harness);
+    .with_harness_config(harness)
+    .with_model_routing(routing);
     if let Some(reviewer) = reviewer {
         runtime = runtime.with_change_reviewer(Box::new(reviewer));
     }
@@ -550,6 +568,10 @@ fn subagent_parent_context_for(
         Vec::new()
     };
     tools::SubagentParentContext {
+        subagent_model: feature_config
+            .model_routing()
+            .subagent_model()
+            .map(|subagent| crate::model_routing::transport_model(model, subagent)),
         permission_rules: feature_config.permission_rules().clone(),
         hooks: feature_config.hooks().clone(),
         allowed_tools: allowed_tools.cloned(),
