@@ -179,9 +179,11 @@ pub fn parse_hook_list(
                                         )
                                     })?
                             }
-                            _ => return Err(format!(
+                            _ => {
+                                return Err(format!(
                                 "{item_context}.hooks[{inner_index}] must be a string or an object"
-                            )),
+                            ))
+                            }
                         };
                         commands
                             .push(HookCommand::new(command, source).with_matcher(matcher.clone()));

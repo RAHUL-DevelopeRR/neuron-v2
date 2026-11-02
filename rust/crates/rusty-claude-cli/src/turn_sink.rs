@@ -21,7 +21,8 @@ use std::time::{Duration, Instant};
 static STDOUT_AFTER_TOOL_RESULT: AtomicBool = AtomicBool::new(false);
 
 use neuron_tui::protocol::{
-    TodoItem, TokenCounts, UiEvent, CAPABILITY_GIT_VIEWS, CAPABILITY_LIVE_PROGRESS,
+    TodoItem, TokenCounts, UiEvent, CAPABILITY_GIT_VIEWS, CAPABILITY_HOOK_PROGRESS,
+    CAPABILITY_LIVE_PROGRESS,
 };
 use runtime::context_manager::TextTokenEstimate;
 use runtime::TokenUsage;
@@ -186,6 +187,7 @@ impl fmt::Debug for ChangeListener {
 pub(crate) struct UiCapabilities {
     live_progress: AtomicBool,
     git_views: AtomicBool,
+    hook_progress: AtomicBool,
 }
 
 impl UiCapabilities {
@@ -196,6 +198,13 @@ impl UiCapabilities {
             .store(has(CAPABILITY_LIVE_PROGRESS), Ordering::SeqCst);
         self.git_views
             .store(has(CAPABILITY_GIT_VIEWS), Ordering::SeqCst);
+        self.hook_progress
+            .store(has(CAPABILITY_HOOK_PROGRESS), Ordering::SeqCst);
+    }
+
+    /// `hook_started` and `hook_finished` events.
+    pub(crate) fn hook_progress(&self) -> bool {
+        self.hook_progress.load(Ordering::SeqCst)
     }
 
     /// Tool-input progress, output estimates and per-request usage.
@@ -242,6 +251,19 @@ impl TurnOutput {
 
     pub(crate) fn is_visible(&self) -> bool {
         !matches!(self, Self::Silent)
+    }
+
+    /// Where hook progress goes: the UI's channel, the terminal (with `NEURON_DEBUG`),
+    /// or nowhere.
+    pub(crate) fn hook_reporter(&self) -> Option<Box<dyn runtime::HookProgressReporter>> {
+        match self {
+            Self::Silent => None,
+            Self::Channel(channel) => Some(Box::new(crate::hook_events::ChannelHookReporter::new(
+                Sender::clone(&channel.events),
+                Arc::clone(&channel.capabilities),
+            ))),
+            _ => Some(Box::new(crate::progress::CliHookProgressReporter)),
+        }
     }
 
     /// A sink for one model response. The terminal one renders through a synchronized

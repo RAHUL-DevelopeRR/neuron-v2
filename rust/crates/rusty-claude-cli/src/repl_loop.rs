@@ -399,6 +399,7 @@ pub(crate) fn launch(options: ReplLaunch) -> Result<(), Box<dyn std::error::Erro
         None => LiveCli::new(resolved_model, true, options.allowed_tools, permission_mode)?,
     };
     cli.set_reasoning_effort(options.reasoning_effort);
+    cli.run_session_start_hooks(if resumed { "resume" } else { "startup" });
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     println!();

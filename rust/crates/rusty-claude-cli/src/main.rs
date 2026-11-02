@@ -63,6 +63,8 @@ mod gateway_catalog;
 mod gateway_http;
 mod gateway_repl;
 mod headless;
+mod hook_events;
+mod hooks_ui;
 mod init;
 mod input;
 mod line_diff;
@@ -606,6 +608,11 @@ prompt after -p, or pipe it: `echo \"...\" | neuron -p`."
         )?,
     };
     cli.set_reasoning_effort(options.reasoning_effort);
+    cli.run_session_start_hooks(if cli.runtime.session().messages.is_empty() {
+        "startup"
+    } else {
+        "resume"
+    });
     // Nobody to answer (stdin not a terminal): approvals and questions are refused.
     headless::start(headless::stdin_is_unattended(), output_format);
     // Print a condensed welcome banner for one-shot mode so the user
@@ -3227,6 +3234,10 @@ impl LiveCli {
                 self.compact()?;
                 false
             }
+            SlashCommand::Hooks { args } => {
+                println!("{}", self.hooks_report(args.as_deref()));
+                false
+            }
             SlashCommand::Model { model } => self.set_model(model)?,
             SlashCommand::Permissions { mode } => self.set_permissions(mode)?,
             SlashCommand::Clear { confirm } => self.clear_session(confirm)?,
@@ -3328,7 +3339,6 @@ impl LiveCli {
             | SlashCommand::Voice { .. }
             | SlashCommand::Rename { .. }
             | SlashCommand::Copy { .. }
-            | SlashCommand::Hooks { .. }
             | SlashCommand::Context { .. }
             | SlashCommand::Color { .. }
             | SlashCommand::Effort { .. }
@@ -3685,6 +3695,7 @@ impl LiveCli {
         )?;
         self.replace_runtime(runtime)?;
         println!("{}", self.session_cleared_report(&previous_session));
+        self.run_session_start_hooks("clear");
         Ok(true)
     }
 
@@ -3715,6 +3726,7 @@ impl LiveCli {
         };
 
         let message_count = self.switch_session(&session_ref)?;
+        self.run_session_start_hooks("resume");
         println!(
             "{}",
             format_resume_report(
@@ -4065,6 +4077,7 @@ impl LiveCli {
     }
 
     fn compact(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.run_manual_pre_compact_hooks();
         let result = self.runtime.compact(CompactionConfig::default());
         let removed = result.removed_message_count;
         let kept = result.compacted_session.messages.len();
@@ -4083,6 +4096,9 @@ impl LiveCli {
         self.replace_runtime(runtime)?;
         self.persist_session()?;
         println!("{}", format_compact_report(removed, kept, skipped));
+        if !skipped {
+            self.run_session_start_hooks("compact");
+        }
         Ok(())
     }
 
@@ -5033,10 +5049,11 @@ fn resolve_plugin_path(cwd: &Path, config_home: &Path, value: &str) -> PathBuf {
 }
 
 fn runtime_hook_config_from_plugin_hooks(hooks: PluginHooks) -> runtime::RuntimeHookConfig {
-    runtime::RuntimeHookConfig::new(
-        hooks.pre_tool_use,
-        hooks.post_tool_use,
-        hooks.post_tool_use_failure,
+    runtime::RuntimeHookConfig::from_event_lists(
+        runtime::HookSource::Plugin,
+        hooks.by_event().into_iter().filter_map(|(name, commands)| {
+            runtime::HookEvent::from_name(name).map(|event| (event, commands.clone()))
+        }),
     )
 }
 

@@ -11,6 +11,7 @@
 import { logger } from '../utils/logger'
 import {
   CAPABILITY_GIT_VIEWS,
+  CAPABILITY_HOOK_PROGRESS,
   CAPABILITY_LIVE_PROGRESS,
   CAPABILITY_REPORTS,
   FEATURE_CAPABILITIES,
@@ -23,13 +24,15 @@ import type { NeuronEngineClient } from './neuron-engine-client'
  * Everything this UI handles: report panels for `/usage`, `/init`, `/memory`
  * and `/doctor` (reports), tool-input progress, output estimates and
  * per-request usage while a turn streams (live_progress), and the changes,
- * diff, commit and checkpoint views (git_views). Not `questions`: this UI has
+ * diff, commit and checkpoint views (git_views), and the hook command running
+ * now on the status line (hook_progress). Not `questions`: this UI has
  * no question view, so the agent's questions stay notices it shows.
  */
 export const UI_CAPABILITIES: readonly string[] = [
   CAPABILITY_REPORTS,
   CAPABILITY_LIVE_PROGRESS,
   CAPABILITY_GIT_VIEWS,
+  CAPABILITY_HOOK_PROGRESS,
 ]
 
 /** How this UI names itself in the command. */

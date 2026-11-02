@@ -1214,6 +1214,27 @@ impl RuntimeHookConfig {
             .collect()
     }
 
+    /// Only the tool hooks (`PreToolUse`, `PostToolUse`, `PostToolUseFailure`): what a
+    /// sub-agent inherits, so session and turn hooks run once, for the main agent.
+    #[must_use]
+    pub fn tool_hooks(&self) -> Self {
+        Self {
+            entries: self
+                .entries
+                .iter()
+                .filter(|(event, _)| {
+                    matches!(
+                        event,
+                        HookEvent::PreToolUse
+                            | HookEvent::PostToolUse
+                            | HookEvent::PostToolUseFailure
+                    )
+                })
+                .cloned()
+                .collect(),
+        }
+    }
+
     #[must_use]
     pub fn has(&self, event: HookEvent) -> bool {
         self.entries.iter().any(|(entry, _)| *entry == event)
@@ -2892,7 +2913,7 @@ mod tests {
         let rendered = error.to_string();
         assert!(
             rendered.contains("hooks.PreToolUse")
-                && rendered.contains("must be an array of strings"),
+                && rendered.contains("must be an array of hook commands"),
             "expected validation error for hooks.PreToolUse, got: {rendered}"
         );
         assert!(!rendered.contains("merged settings.hooks"));
@@ -2915,6 +2936,104 @@ mod tests {
             parse_permission_mode_label("dontAsk", "test").expect("dontAsk should resolve"),
             ResolvedPermissionMode::DangerFullAccess
         );
+    }
+
+    #[test]
+    fn hooks_keep_matchers_and_sources_and_a_later_file_replaces_an_event() {
+        use crate::hook_matcher::HookSource;
+        use crate::hooks::HookEvent;
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".neuron");
+        fs::create_dir_all(cwd.join(".neuron")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"hooks":{"PreToolUse":["user-pre"],"Stop":[{"command":"user-stop"}],"SessionStart":[{"matcher":"startup|resume","command":"greet"}]}}"#,
+        )
+        .expect("write user settings");
+        fs::write(
+            cwd.join(".neuron").join("settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"bash","hooks":[{"type":"command","command":"guard"}]}],"UserPromptSubmit":["ctx"]}}"#,
+        )
+        .expect("write project settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+        let hooks = loaded.hooks();
+        let listed: Vec<(HookEvent, &str, Option<&str>, HookSource)> = hooks
+            .entries()
+            .into_iter()
+            .map(|(event, hook)| {
+                (
+                    event,
+                    hook.command.as_str(),
+                    hook.matcher.as_deref(),
+                    hook.source,
+                )
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                (
+                    HookEvent::PreToolUse,
+                    "guard",
+                    Some("bash"),
+                    HookSource::Project
+                ),
+                (
+                    HookEvent::SessionStart,
+                    "greet",
+                    Some("startup|resume"),
+                    HookSource::User
+                ),
+                (
+                    HookEvent::UserPromptSubmit,
+                    "ctx",
+                    None,
+                    HookSource::Project
+                ),
+                (HookEvent::Stop, "user-stop", None, HookSource::User),
+            ]
+        );
+
+        // Untrusted, the workspace's hooks are dropped and the user's stay.
+        let untrusted = ConfigLoader::new(&cwd, &home)
+            .with_project_trust(ProjectTrust::Untrusted)
+            .load()
+            .expect("config should load");
+        assert_eq!(untrusted.hooks().pre_tool_use(), ["user-pre"]);
+        assert!(!untrusted.hooks().has(HookEvent::UserPromptSubmit));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rejects_hook_matchers_that_are_not_valid_regexes() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".neuron");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"mcp__(","command":"x"}]}}"#,
+        )
+        .expect("write user settings");
+
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("invalid matcher");
+        let rendered = error.to_string();
+        assert!(rendered.contains("hooks.PreToolUse[0]"), "{rendered}");
+        assert!(
+            rendered.contains("not a valid regular expression"),
+            "{rendered}"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]

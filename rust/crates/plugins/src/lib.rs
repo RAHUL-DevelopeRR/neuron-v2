@@ -79,29 +79,90 @@ pub struct PluginHooks {
     pub post_tool_use: Vec<String>,
     #[serde(rename = "PostToolUseFailure", default)]
     pub post_tool_use_failure: Vec<String>,
+    #[serde(rename = "SessionStart", default)]
+    pub session_start: Vec<String>,
+    #[serde(rename = "UserPromptSubmit", default)]
+    pub user_prompt_submit: Vec<String>,
+    #[serde(rename = "Stop", default)]
+    pub stop: Vec<String>,
+    #[serde(rename = "PreCompact", default)]
+    pub pre_compact: Vec<String>,
+    #[serde(rename = "SubagentStop", default)]
+    pub subagent_stop: Vec<String>,
 }
 
+/// The hook events a plugin manifest may declare.
+pub const PLUGIN_HOOK_EVENTS: [&str; 8] = [
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "SessionStart",
+    "UserPromptSubmit",
+    "Stop",
+    "PreCompact",
+    "SubagentStop",
+];
+
 impl PluginHooks {
+    /// Each event's commands, by the event's manifest name, in [`PLUGIN_HOOK_EVENTS`] order.
+    #[must_use]
+    pub fn by_event(&self) -> [(&'static str, &Vec<String>); 8] {
+        [
+            ("PreToolUse", &self.pre_tool_use),
+            ("PostToolUse", &self.post_tool_use),
+            ("PostToolUseFailure", &self.post_tool_use_failure),
+            ("SessionStart", &self.session_start),
+            ("UserPromptSubmit", &self.user_prompt_submit),
+            ("Stop", &self.stop),
+            ("PreCompact", &self.pre_compact),
+            ("SubagentStop", &self.subagent_stop),
+        ]
+    }
+
+    fn lists_mut(&mut self) -> [&mut Vec<String>; 8] {
+        [
+            &mut self.pre_tool_use,
+            &mut self.post_tool_use,
+            &mut self.post_tool_use_failure,
+            &mut self.session_start,
+            &mut self.user_prompt_submit,
+            &mut self.stop,
+            &mut self.pre_compact,
+            &mut self.subagent_stop,
+        ]
+    }
+
+    fn all_commands(&self) -> impl Iterator<Item = &String> {
+        self.by_event()
+            .into_iter()
+            .flat_map(|(_, commands)| commands.iter())
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.pre_tool_use.is_empty()
-            && self.post_tool_use.is_empty()
-            && self.post_tool_use_failure.is_empty()
+        self.by_event()
+            .iter()
+            .all(|(_, commands)| commands.is_empty())
     }
 
     #[must_use]
     pub fn merged_with(&self, other: &Self) -> Self {
         let mut merged = self.clone();
+        for (target, (_, source)) in merged.lists_mut().into_iter().zip(other.by_event()) {
+            target.extend(source.iter().cloned());
+        }
         merged
-            .pre_tool_use
-            .extend(other.pre_tool_use.iter().cloned());
-        merged
-            .post_tool_use
-            .extend(other.post_tool_use.iter().cloned());
-        merged
-            .post_tool_use_failure
-            .extend(other.post_tool_use_failure.iter().cloned());
-        merged
+    }
+
+    #[must_use]
+    fn map_commands(&self, mut map: impl FnMut(&str) -> String) -> Self {
+        let mut mapped = self.clone();
+        for list in mapped.lists_mut() {
+            for command in list.iter_mut() {
+                *command = map(command);
+            }
+        }
+        mapped
     }
 }
 
@@ -1690,13 +1751,11 @@ fn detect_claude_code_manifest_contract_gaps(
 
     if let Some(hooks) = root.get("hooks").and_then(Value::as_object) {
         for hook_name in hooks.keys() {
-            if !matches!(
-                hook_name.as_str(),
-                "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
-            ) {
+            if !PLUGIN_HOOK_EVENTS.contains(&hook_name.as_str()) {
                 errors.push(PluginManifestValidationError::UnsupportedManifestContract {
                     detail: format!(
-                        "plugin hook `{hook_name}` is not supported: Neuron plugins support only PreToolUse, PostToolUse and PostToolUseFailure hooks."
+                        "plugin hook `{hook_name}` is not supported: Neuron plugins support only {} hooks.",
+                        PLUGIN_HOOK_EVENTS.join(", ")
                     ),
                 });
             }
@@ -1735,14 +1794,7 @@ fn build_plugin_manifest(
     validate_required_manifest_field("description", &raw.description, &mut errors);
 
     let permissions = build_manifest_permissions(&raw.permissions, &mut errors);
-    validate_command_entries(root, raw.hooks.pre_tool_use.iter(), "hook", &mut errors);
-    validate_command_entries(root, raw.hooks.post_tool_use.iter(), "hook", &mut errors);
-    validate_command_entries(
-        root,
-        raw.hooks.post_tool_use_failure.iter(),
-        "hook",
-        &mut errors,
-    );
+    validate_command_entries(root, raw.hooks.all_commands(), "hook", &mut errors);
     validate_command_entries(
         root,
         raw.lifecycle.init.iter(),
@@ -1976,23 +2028,7 @@ fn validate_command_entry(
 }
 
 fn resolve_hooks(root: &Path, hooks: &PluginHooks) -> PluginHooks {
-    PluginHooks {
-        pre_tool_use: hooks
-            .pre_tool_use
-            .iter()
-            .map(|entry| resolve_hook_entry(root, entry))
-            .collect(),
-        post_tool_use: hooks
-            .post_tool_use
-            .iter()
-            .map(|entry| resolve_hook_entry(root, entry))
-            .collect(),
-        post_tool_use_failure: hooks
-            .post_tool_use_failure
-            .iter()
-            .map(|entry| resolve_hook_entry(root, entry))
-            .collect(),
-    }
+    hooks.map_commands(|entry| resolve_hook_entry(root, entry))
 }
 
 fn resolve_lifecycle(root: &Path, lifecycle: &PluginLifecycle) -> PluginLifecycle {
@@ -2040,12 +2076,7 @@ fn validate_hook_paths(root: Option<&Path>, hooks: &PluginHooks) -> Result<(), P
     let Some(root) = root else {
         return Ok(());
     };
-    for entry in hooks
-        .pre_tool_use
-        .iter()
-        .chain(hooks.post_tool_use.iter())
-        .chain(hooks.post_tool_use_failure.iter())
-    {
+    for entry in hooks.all_commands() {
         validate_command_path(root, entry, "hook")?;
     }
     Ok(())
@@ -2678,6 +2709,62 @@ mod tests {
     }
 
     #[test]
+    fn plugins_may_declare_lifecycle_hooks() {
+        let root = temp_dir("manifest-lifecycle-hooks");
+        for script in ["start.sh", "prompt.sh", "stop.sh", "compact.sh", "agent.sh"] {
+            write_file(
+                root.join("hooks").join(script).as_path(),
+                "#!/bin/sh
+exit 0
+",
+            );
+        }
+        write_file(
+            root.join(MANIFEST_FILE_NAME).as_path(),
+            r#"{
+  "name": "lifecycle",
+  "version": "1.0.0",
+  "description": "Lifecycle hooks",
+  "hooks": {
+    "SessionStart": ["./hooks/start.sh"],
+    "UserPromptSubmit": ["./hooks/prompt.sh"],
+    "Stop": ["./hooks/stop.sh"],
+    "PreCompact": ["./hooks/compact.sh"],
+    "SubagentStop": ["./hooks/agent.sh"]
+  }
+}"#,
+        );
+
+        let manifest = load_plugin_from_directory(&root).expect("lifecycle hooks load");
+        assert_eq!(manifest.hooks.session_start, vec!["./hooks/start.sh"]);
+        assert_eq!(manifest.hooks.user_prompt_submit, vec!["./hooks/prompt.sh"]);
+        assert_eq!(manifest.hooks.stop, vec!["./hooks/stop.sh"]);
+        assert_eq!(manifest.hooks.pre_compact, vec!["./hooks/compact.sh"]);
+        assert_eq!(manifest.hooks.subagent_stop, vec!["./hooks/agent.sh"]);
+        assert!(!manifest.hooks.is_empty());
+
+        let resolved = resolve_hooks(&root, &manifest.hooks);
+        assert!(resolved.session_start[0].ends_with("start.sh"));
+        assert!(Path::new(&resolved.stop[0]).is_absolute());
+        let merged = resolved.merged_with(&resolved);
+        assert_eq!(merged.subagent_stop.len(), 2);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plugins_with_a_missing_lifecycle_hook_script_fail_validation() {
+        let root = temp_dir("manifest-lifecycle-missing");
+        write_file(
+            root.join(MANIFEST_FILE_NAME).as_path(),
+            r#"{"name":"broken","version":"1.0.0","description":"x","hooks":{"Stop":["./hooks/missing.sh"]}}"#,
+        );
+        let error = load_plugin_from_directory(&root).expect_err("missing script");
+        assert!(error.to_string().contains("missing.sh"), "{error}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn load_plugin_from_directory_rejects_claude_code_manifest_contracts_with_guidance() {
         let root = temp_dir("manifest-claude-code-contract");
         write_file(
@@ -2687,7 +2774,7 @@ mod tests {
   "version": "4.10.2",
   "description": "Claude Code plugin manifest",
   "hooks": {
-    "SessionStart": ["scripts/session-start.mjs"]
+    "Notification": ["scripts/notify.mjs"]
   },
   "agents": ["agents/*.md"],
   "commands": ["commands/**/*.md"],
@@ -2704,7 +2791,7 @@ mod tests {
         assert!(rendered.contains("field `agents` is not supported: Neuron does not load"));
         assert!(rendered.contains("field `commands` lists command files or directories"));
         assert!(
-            rendered.contains("hook `SessionStart` is not supported: Neuron plugins support only")
+            rendered.contains("hook `Notification` is not supported: Neuron plugins support only")
         );
         // The messages speak for Neuron and name no other product or its binary.
         assert!(!rendered.contains("Claude"), "{rendered}");

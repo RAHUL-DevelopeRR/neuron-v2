@@ -86,4 +86,183 @@ mod tests {
         );
         assert!(stop_continuation_message(&[]).contains("not finished"));
     }
+
+    mod in_the_agent_loop {
+        use std::sync::{Arc, Mutex};
+
+        use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
+        use crate::conversation::{
+            ApiClient, ApiRequest, AssistantEvent, ConversationRuntime, RuntimeError,
+            RuntimeErrorKind, StaticToolExecutor,
+        };
+        use crate::hook_matcher::{HookCommand, HookSource};
+        use crate::hooks::HookEvent;
+        use crate::lifecycle_hooks::{HOOK_CONTEXT_HEADING, MAX_STOP_HOOK_CONTINUATIONS};
+        use crate::permissions::{PermissionMode, PermissionPolicy};
+        use crate::session::{ContentBlock, MessageRole, Session};
+
+        /// A hook that prints `text` and exits with `code`, in the platform's shell.
+        fn hook(text: &str, code: i32) -> String {
+            if cfg!(windows) {
+                format!("echo {text}& exit /b {code}")
+            } else {
+                format!("echo '{text}'; exit {code}")
+            }
+        }
+
+        /// Answers every request with text and keeps the last user message of each.
+        #[derive(Clone, Default)]
+        struct Recording {
+            prompts: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl ApiClient for Recording {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let last_user = request
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == MessageRole::User)
+                    .map(|message| {
+                        message
+                            .blocks
+                            .iter()
+                            .filter_map(|block| match block {
+                                ContentBlock::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<String>()
+                    })
+                    .unwrap_or_default();
+                self.prompts.lock().expect("prompts").push(last_user);
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        fn runtime(
+            hooks: RuntimeHookConfig,
+            client: Recording,
+        ) -> ConversationRuntime<Recording, StaticToolExecutor> {
+            ConversationRuntime::new_with_features(
+                Session::new(),
+                client,
+                StaticToolExecutor::new(),
+                PermissionPolicy::new(PermissionMode::DangerFullAccess),
+                vec!["system".to_string()],
+                &RuntimeFeatureConfig::default().with_hooks(hooks),
+            )
+        }
+
+        fn user_hook(event: HookEvent, command: String) -> RuntimeHookConfig {
+            RuntimeHookConfig::default().with(event, HookCommand::new(command, HookSource::User))
+        }
+
+        #[test]
+        fn a_user_prompt_submit_hook_can_block_the_prompt() {
+            let client = Recording::default();
+            let mut runtime = runtime(
+                user_hook(HookEvent::UserPromptSubmit, hook("no deploys on friday", 2)),
+                client.clone(),
+            );
+
+            let error = runtime
+                .run_turn("deploy now", None)
+                .expect_err("the hook blocks the prompt");
+
+            assert_eq!(error.kind(), RuntimeErrorKind::BlockedByHook);
+            assert!(
+                error.to_string().contains("no deploys on friday"),
+                "{error}"
+            );
+            assert!(client.prompts.lock().unwrap().is_empty(), "no model call");
+            assert!(runtime.session().messages.is_empty(), "nothing recorded");
+        }
+
+        #[test]
+        fn session_start_and_prompt_hooks_add_context_for_the_model() {
+            let client = Recording::default();
+            let hooks = user_hook(HookEvent::SessionStart, hook("branch is main", 0)).with(
+                HookEvent::UserPromptSubmit,
+                HookCommand::new(hook("ticket ABC-1", 0), HookSource::Project),
+            );
+            let mut runtime = runtime(hooks, client.clone());
+
+            let started = runtime.run_session_start_hooks("startup");
+            assert!(!started.is_denied() && !started.is_failed());
+            runtime.run_turn("fix the bug", None).expect("first turn");
+            runtime.run_turn("and the next", None).expect("second turn");
+
+            let prompts = client.prompts.lock().unwrap().clone();
+            assert!(prompts[0].starts_with("fix the bug\n\n"), "{}", prompts[0]);
+            assert!(prompts[0].contains(HOOK_CONTEXT_HEADING));
+            assert!(prompts[0].contains("branch is main"), "{}", prompts[0]);
+            assert!(prompts[0].contains("ticket ABC-1"), "{}", prompts[0]);
+            // Session context is added once; prompt context every time.
+            assert!(!prompts[1].contains("branch is main"), "{}", prompts[1]);
+            assert!(prompts[1].contains("ticket ABC-1"), "{}", prompts[1]);
+        }
+
+        #[test]
+        fn session_start_matchers_compare_the_source() {
+            let client = Recording::default();
+            let hooks = RuntimeHookConfig::default().with(
+                HookEvent::SessionStart,
+                HookCommand::new(hook("resumed", 0), HookSource::User)
+                    .with_matcher(Some("resume".into())),
+            );
+            let mut runtime = runtime(hooks, client);
+            assert!(runtime
+                .run_session_start_hooks("startup")
+                .messages()
+                .is_empty());
+            assert_eq!(
+                runtime.run_session_start_hooks("resume").messages(),
+                ["resumed"]
+            );
+        }
+
+        #[test]
+        fn a_stop_hook_keeps_the_turn_going_up_to_the_guard() {
+            let client = Recording::default();
+            let mut runtime = runtime(
+                user_hook(HookEvent::Stop, hook("tests still fail", 2)),
+                client.clone(),
+            );
+
+            let summary = runtime.run_turn("finish it", None).expect("turn ends");
+
+            let prompts = client.prompts.lock().unwrap().clone();
+            assert_eq!(prompts.len(), 1 + MAX_STOP_HOOK_CONTINUATIONS);
+            assert!(prompts[1].contains("A Stop hook asked you to continue: tests still fail"));
+            assert_eq!(summary.iterations, 1 + MAX_STOP_HOOK_CONTINUATIONS);
+        }
+
+        #[test]
+        fn a_stop_hook_that_allows_ends_the_turn() {
+            let client = Recording::default();
+            let mut runtime = runtime(user_hook(HookEvent::Stop, hook("fine", 0)), client.clone());
+            runtime.run_turn("finish it", None).expect("turn ends");
+            assert_eq!(client.prompts.lock().unwrap().len(), 1);
+        }
+
+        #[test]
+        fn manual_pre_compact_hooks_run_with_the_trigger() {
+            let mut runtime = runtime(
+                RuntimeHookConfig::default().with(
+                    HookEvent::PreCompact,
+                    HookCommand::new(hook("saving notes", 0), HookSource::User)
+                        .with_matcher(Some("manual".into())),
+                ),
+                Recording::default(),
+            );
+            assert_eq!(
+                runtime.run_pre_compact_hooks("manual").messages(),
+                ["saving notes"]
+            );
+            assert!(runtime.run_pre_compact_hooks("auto").messages().is_empty());
+        }
+    }
 }

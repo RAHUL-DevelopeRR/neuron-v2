@@ -369,8 +369,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "hooks",
         aliases: &[],
-        summary: "List and manage lifecycle hooks",
-        argument_hint: Some("[list|run <hook>]"),
+        summary: "List configured hooks by event, with matcher and source",
+        argument_hint: Some("[event]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -5820,5 +5820,22 @@ mod tests {
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(bundled_root);
+    }
+
+    #[test]
+    fn hooks_help_describes_listing_by_event() {
+        let spec = super::slash_command_specs()
+            .iter()
+            .find(|spec| spec.name == "hooks")
+            .expect("hooks command");
+        assert_eq!(spec.argument_hint, Some("[event]"));
+        assert!(spec.summary.contains("matcher"));
+        assert!(super::render_slash_command_help().contains("/hooks"));
+        assert_eq!(
+            super::SlashCommand::parse("/hooks Stop"),
+            Ok(Some(super::SlashCommand::Hooks {
+                args: Some("Stop".to_string())
+            }))
+        );
     }
 }

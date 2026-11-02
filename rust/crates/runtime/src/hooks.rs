@@ -1548,6 +1548,132 @@ mod tests {
         );
     }
 
+    /// A hook that prints `text` and exits with `code`, in the platform's shell.
+    fn echo_hook(text: &str, code: i32) -> String {
+        if cfg!(windows) {
+            format!("echo {text}& exit /b {code}")
+        } else {
+            format!("echo '{text}'; exit {code}")
+        }
+    }
+
+    #[test]
+    fn tool_hooks_run_only_for_matching_tools() {
+        use crate::hook_matcher::{HookCommand, HookSource};
+        let config = RuntimeHookConfig::default()
+            .with(
+                HookEvent::PreToolUse,
+                HookCommand::new(echo_hook("any", 0), HookSource::User),
+            )
+            .with(
+                HookEvent::PreToolUse,
+                HookCommand::new(echo_hook("files", 0), HookSource::Project)
+                    .with_matcher(Some("write_file|edit_file".into())),
+            )
+            .with(
+                HookEvent::PreToolUse,
+                HookCommand::new(echo_hook("mcp", 0), HookSource::Plugin)
+                    .with_matcher(Some("mcp__.*".into())),
+            );
+        let runner = HookRunner::new(config);
+
+        assert_eq!(runner.run_pre_tool_use("bash", "{}").messages(), ["any"]);
+        assert_eq!(
+            runner.run_pre_tool_use("edit_file", "{}").messages(),
+            ["any", "files"]
+        );
+        assert_eq!(
+            runner
+                .run_pre_tool_use("mcp__github__issues", "{}")
+                .messages(),
+            ["any", "mcp"]
+        );
+    }
+
+    #[test]
+    fn progress_reports_outcome_duration_matcher_and_tool_call() {
+        use super::{HookOutcome, ToolUseIdReporter};
+        use crate::hook_matcher::{HookCommand, HookSource};
+        let runner = HookRunner::new(
+            RuntimeHookConfig::default().with(
+                HookEvent::PreToolUse,
+                HookCommand::new(echo_hook("not here", 2), HookSource::User)
+                    .with_matcher(Some("bash".into())),
+            ),
+        );
+        let mut recording = RecordingReporter { events: Vec::new() };
+        let result = runner.run_pre_tool_use_with_context(
+            "bash",
+            "{}",
+            None,
+            Some(&mut ToolUseIdReporter::new(&mut recording, Some("call-7"))),
+        );
+
+        assert!(result.is_denied());
+        assert_eq!(recording.events.len(), 2);
+        let HookProgressEvent::Completed {
+            outcome,
+            matcher,
+            tool_use_id,
+            message,
+            ..
+        } = &recording.events[1]
+        else {
+            panic!("expected a completed event: {:?}", recording.events);
+        };
+        assert_eq!(*outcome, HookOutcome::Blocked);
+        assert_eq!(matcher.as_deref(), Some("bash"));
+        assert_eq!(tool_use_id.as_deref(), Some("call-7"));
+        assert_eq!(message.as_deref(), Some("not here"));
+    }
+
+    #[test]
+    fn lifecycle_hooks_get_the_event_payload_and_can_block() {
+        use super::LifecycleHookInput;
+        use crate::hook_matcher::{HookCommand, HookSource};
+        // The hook echoes its stdin, so the payload comes back as its message.
+        let cat = if cfg!(windows) { "more" } else { "cat" };
+        let mut runner = HookRunner::new(RuntimeHookConfig::default().with(
+            HookEvent::UserPromptSubmit,
+            HookCommand::new(cat, HookSource::User),
+        ));
+        runner.set_session_id("session-1");
+        let result = runner.run_lifecycle(
+            HookEvent::UserPromptSubmit,
+            LifecycleHookInput::user_prompt_submit("hello"),
+            None,
+            None,
+        );
+        assert!(!result.is_denied() && !result.is_failed(), "{result:?}");
+        // Valid JSON without hook fields: the whole stdout is the message.
+        let payload: serde_json::Value =
+            serde_json::from_str(result.messages()[0].trim()).expect("payload JSON");
+        assert_eq!(payload["hook_event_name"], "UserPromptSubmit");
+        assert_eq!(payload["prompt"], "hello");
+        assert_eq!(payload["session_id"], "session-1");
+        assert!(payload["cwd"].is_string());
+
+        let blocking = HookRunner::new(RuntimeHookConfig::default().with(
+            HookEvent::Stop,
+            HookCommand::new(
+                if cfg!(windows) {
+                    r#"echo {"decision":"block","reason":"run the tests"}"#.to_string()
+                } else {
+                    r#"echo '{"decision":"block","reason":"run the tests"}'"#.to_string()
+                },
+                HookSource::User,
+            ),
+        ));
+        let stop = blocking.run_lifecycle(
+            HookEvent::Stop,
+            LifecycleHookInput::stop(false, "done"),
+            None,
+            None,
+        );
+        assert!(stop.is_denied());
+        assert_eq!(stop.messages(), ["run the tests"]);
+    }
+
     #[cfg(windows)]
     fn shell_snippet(script: &str) -> String {
         script.replace('\'', "\"")
