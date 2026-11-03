@@ -69,7 +69,7 @@ import { useEvent } from './hooks/use-event'
 import { useInputHistory } from './hooks/use-input-history'
 import { useSuggestionEngine } from './hooks/use-suggestion-engine'
 import { getProjectRoot } from './project-files'
-import { nextPermissionChoice, setPermissionChoice } from './engine/status-bar-actions'
+import { cyclePermissionChoice } from './engine/status-bar-actions'
 import { useChatHistoryStore } from './state/chat-history-store'
 import { useChatStore } from './state/chat-store'
 import { useEngineStore } from './state/engine-store'
@@ -152,9 +152,28 @@ export const Chat = ({
   }, [])
   const closeStatusPanel = useCallback(() => setStatusPanel(null), [])
   const cyclePermission = useCallback(() => {
-    const next = nextPermissionChoice(useEngineStore.getState().status)
-    if (next) setPermissionChoice(next)
+    cyclePermissionChoice()
   }, [])
+  // The engine restarts in the other folder with a new session: the chat
+  // above stays readable, marked as the old folder's.
+  const switchProject = useCallback(
+    (folder: string) => {
+      if (!onSwitchProject) return
+      const from = useEngineStore.getState().status?.cwd ?? null
+      onSwitchProject(folder)
+      useChatStore.getState().setMessages((prev) =>
+        prev.length === 0
+          ? prev
+          : [
+              ...prev,
+              getSystemMessage(
+                `Workspace: ${folder}. A new session starts in this folder${from ? `; the chat above was in ${from}` : ''}.`,
+              ),
+            ],
+      )
+    },
+    [onSwitchProject],
+  )
   const chatSessionId = useChatStore((state) => state.chatSessionId)
   useEffect(() => setTodoPanelOpen(false), [chatSessionId])
 
@@ -1448,7 +1467,13 @@ export const Chat = ({
             maxVisibleRows={isCompactHeight ? 4 : 8}
           />
         ) : statusPanel === 'context' ? (
-          <ContextPopover onClose={closeStatusPanel} width={separatorWidth} />
+          <ContextPopover
+            onClose={closeStatusPanel}
+            width={separatorWidth}
+            compact={isCompactHeight}
+            // The input, the status bar and a few chat lines stay in view.
+            maxRows={isCompactHeight ? 5 : Math.max(5, terminalHeight - 12)}
+          />
         ) : statusPanel === 'think' ? (
           <ThinkPicker
             onClose={closeStatusPanel}
@@ -1464,7 +1489,7 @@ export const Chat = ({
         ) : statusPanel === 'workspace' ? (
           <WorkspacePicker
             onClose={closeStatusPanel}
-            onSwitchProject={onSwitchProject}
+            onSwitchProject={onSwitchProject ? switchProject : undefined}
             width={separatorWidth}
             maxVisibleRows={isCompactHeight ? 4 : 8}
           />

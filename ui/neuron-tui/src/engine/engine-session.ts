@@ -267,6 +267,10 @@ export function handleEngineEvent(event: UiEvent): void {
       showNotice(engineNotice(event.message))
       return
     case 'error':
+      // A refused permission choice leaves nothing pending: the next
+      // Shift+Tab cycles from what the status shows. A turn's own error is
+      // not that answer; a choice queued behind the turn still comes.
+      if (!turnActive) engine.setPendingPermission(null)
       // `trust_workspace` failed: the trust screen shows why.
       if (useStartGate.getState().trustStep.kind === 'saving') {
         useStartGate.getState().setTrustStep({ kind: 'failed', error: inUiWording(event.message) })

@@ -79,8 +79,9 @@ export const PromptStatusBar = ({
   const status = useEngineStore((state) => state.status)
   const account = useEngineStore((state) => state.account)
   const models = useEngineStore((state) => state.models)
+  const pendingPermission = useEngineStore((state) => state.pendingPermission)
   const line = statusBarLine(
-    { status, account, models, mode: glyphMode },
+    { status, account, models, mode: glyphMode, pendingPermission },
     Math.max(0, width - 2),
   )
   if (!line || line.left.length === 0) return null

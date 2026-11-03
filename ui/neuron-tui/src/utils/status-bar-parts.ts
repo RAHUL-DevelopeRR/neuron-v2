@@ -101,6 +101,8 @@ interface Glyphs {
   thinkOff: string
   thinkLevels: readonly string[]
   thinkDefault: string
+  /** Between the permission mode and the one coming next. */
+  arrow: string
 }
 
 const UNICODE: Glyphs = {
@@ -115,6 +117,7 @@ const UNICODE: Glyphs = {
   thinkOff: '○',
   thinkLevels: ['◔', '◑', '◕', '●'],
   thinkDefault: '◑',
+  arrow: '→',
 }
 
 /** What the classic console fonts (WGL4/CP437) can draw. */
@@ -130,6 +133,7 @@ const CONSOLE: Glyphs = {
   thinkOff: '○',
   thinkLevels: ['●', '●', '●', '●'],
   thinkDefault: '●',
+  arrow: '>',
 }
 
 export function statusGlyphs(mode: GlyphMode): Glyphs {
@@ -143,6 +147,8 @@ export interface StatusBarInput {
   account: AccountDetails | null
   models: ModelsEvent | null
   mode: GlyphMode
+  /** A permission choice sent that no status shows yet (engine-store's `pendingPermission`). */
+  pendingPermission?: string | null
 }
 
 /** One segment's possible texts, before they are fitted. */
@@ -164,6 +170,8 @@ export interface StatusView {
     untrusted: boolean
   }
   permission: { glyph: string; long: string; short: string; tone: StatusTone; bold: boolean }
+  /** The permission choice coming next (sent, not in effect yet): `✎ Edit → ◇ Plan`. */
+  permissionNext: StatusView['permission'] | null
   context: { percent: number; estimated: boolean; thresholdPercent: number } | null
   account:
     | { kind: 'usage'; plan: string; window: number | null; requests: string | null }
@@ -281,7 +289,13 @@ export function hasUsableZeroXLogin(status: StatusEvent): boolean {
 }
 
 /** Everything the bar can say, before it is fitted to a width. */
-export function statusView({ status, account, models, mode }: StatusBarInput): StatusView | null {
+export function statusView({
+  status,
+  account,
+  models,
+  mode,
+  pendingPermission = null,
+}: StatusBarInput): StatusView | null {
   if (!status) return null
   const glyphs = statusGlyphs(mode)
   const model = catalogModel(models, status.model)
@@ -337,6 +351,10 @@ export function statusView({ status, account, models, mode }: StatusBarInput): S
       untrusted: !status.workspace_trusted,
     },
     permission: permissionView(status.permission_mode, status.plan_mode, glyphs),
+    permissionNext:
+      pendingPermission && pendingPermission !== (status.plan_mode ? 'plan' : status.permission_mode)
+        ? permissionView(pendingPermission, pendingPermission === 'plan', glyphs)
+        : null,
     context: usage
       ? { percent: usage.percent, estimated: usage.estimated, thresholdPercent: usage.thresholdPercent }
       : null,
@@ -463,10 +481,20 @@ export function buildLine(view: StatusView, c: Compaction): StatusLine {
 
   const p = view.permission
   const label = c.labels ? p.long : p.short
-  left.push({
-    target: 'permission',
-    spans: [{ text: p.glyph ? `${p.glyph} ${label}` : label, tone: p.tone, bold: p.bold }],
-  })
+  const permissionSpans: StatusSpan[] = [
+    { text: p.glyph ? `${p.glyph} ${label}` : label, tone: p.tone, bold: p.bold },
+  ]
+  const next = view.permissionNext
+  if (next) {
+    // Sent, not in effect yet (the engine answers after the running turn).
+    const nextLabel = c.labels ? next.long : next.short
+    permissionSpans.push(
+      { text: ` ${view.glyphs.arrow} `, tone: 'muted' },
+      { text: next.glyph ? `${next.glyph} ${nextLabel}` : nextLabel, tone: next.tone, bold: next.bold },
+    )
+    if (c.labels) permissionSpans.push({ text: ' next', tone: 'muted' })
+  }
+  left.push({ target: 'permission', spans: permissionSpans })
 
   if (view.context) {
     const ctx = view.context

@@ -9,6 +9,7 @@ import {
   type NeuronEngineClient,
 } from '../neuron-engine-client'
 import {
+  cyclePermissionChoice,
   nextPermissionChoice,
   permissionChoices,
   setPermissionChoice,
@@ -16,7 +17,14 @@ import {
   switchBranch,
 } from '../status-bar-actions'
 import { FEATURE_STATUS_BAR, parseUiEventLine, type EngineCommand } from '../protocol'
-import { branchRows, permissionRows, thinkRows, workspaceRows } from '../../components/status-pickers'
+import {
+  branchRows,
+  permissionRows,
+  thinkRows,
+  workspacePickAction,
+  workspaceRows,
+} from '../../components/status-pickers'
+import { statusBarLine } from '../../utils/status-bar-parts'
 import { resolveChoiceKey } from '../../components/choice-panel'
 import { helpSections } from '../../components/help-banner'
 import { reasoningLevels } from '../../components/model-picker'
@@ -127,6 +135,20 @@ describe('picker rows', () => {
     expect(rows.map((row) => row.id)).not.toContain('danger-full-access')
   })
 
+  test('a permission choice sent and not shown yet is the one marked', () => {
+    const rows = permissionRows(status(), 'plan')
+    expect(rows.find((row) => row.current)?.id).toBe('plan')
+  })
+
+  test('switching the workspace during a turn takes a second Enter on the same row', () => {
+    const other = { id: '/work/b', current: false }
+    expect(workspacePickAction({ id: '/work/a', current: true }, true, null)).toBe('close')
+    expect(workspacePickAction(other, false, null)).toBe('switch')
+    expect(workspacePickAction(other, true, null)).toBe('confirm')
+    expect(workspacePickAction(other, true, '/work/c')).toBe('confirm')
+    expect(workspacePickAction(other, true, '/work/b')).toBe('switch')
+  })
+
   test('workspaces: the current one first, no duplicates', () => {
     const rows = workspaceRows('/work/a', [{ path: '/work/b' }, { path: '/work/a' }])
     expect(rows.map((row) => [row.label, row.current])).toEqual([
@@ -177,6 +199,62 @@ describe('commands sent to the engine', () => {
       { type: 'set_reasoning_effort', effort: null },
       { type: 'switch_branch', name: 'main', create: false },
     ])
+  })
+
+  test('Shift+Tab twice before the engine answers goes two steps, not the same one twice', () => {
+    useEngineStore.getState().setReady('7.0.0', [FEATURE_STATUS_BAR])
+    // Started with Full access, now Edit workspace: two presses mean Plan.
+    useEngineStore.getState().setStatus(status({ full_access_allowed: true }))
+    expect(cyclePermissionChoice()).toBe('danger-full-access')
+    expect(cyclePermissionChoice()).toBe('plan')
+    expect(sent).toEqual([
+      { type: 'set_permission_mode', mode: 'danger-full-access' },
+      { type: 'set_permission_mode', mode: 'plan' },
+    ])
+    // The status from the end of a running turn still shows the old mode.
+    useEngineStore.getState().setStatus(status({ full_access_allowed: true }))
+    expect(useEngineStore.getState().pendingPermission).toBe('plan')
+    // The first choice's answer: still pending.
+    useEngineStore
+      .getState()
+      .setStatus(status({ full_access_allowed: true, permission_mode: 'danger-full-access' }))
+    expect(useEngineStore.getState().pendingPermission).toBe('plan')
+    // The second's: done, and the next press cycles from Plan.
+    useEngineStore
+      .getState()
+      .setStatus(status({ full_access_allowed: true, permission_mode: 'danger-full-access', plan_mode: true }))
+    expect(useEngineStore.getState().pendingPermission).toBeNull()
+    expect(cyclePermissionChoice()).toBe('read-only')
+  })
+
+  test('Edit, Plan, Read-only during a turn; an error drops the pending choice', () => {
+    useEngineStore.getState().setReady('7.0.0', [FEATURE_STATUS_BAR])
+    useEngineStore.getState().setStatus(status())
+    cyclePermissionChoice()
+    cyclePermissionChoice()
+    expect(sent).toEqual([
+      { type: 'set_permission_mode', mode: 'plan' },
+      { type: 'set_permission_mode', mode: 'read-only' },
+    ])
+    handleEngineEvent({ type: 'error', message: 'Full access was not enabled at launch.' })
+    expect(useEngineStore.getState().pendingPermission).toBeNull()
+    expect(nextPermissionChoice(useEngineStore.getState().status, null)).toBe('plan')
+  })
+
+  test('the bar shows a choice that is not in effect yet', () => {
+    useEngineStore.getState().setReady('7.0.0', [FEATURE_STATUS_BAR])
+    useEngineStore.getState().setStatus(status())
+    setPermissionChoice('plan')
+    const { status: current, account, models, pendingPermission } = useEngineStore.getState()
+    const text = (pending: string | null) =>
+      statusBarLine({ status: current, account, models, mode: 'unicode', pendingPermission: pending }, 160)!
+        .left.find((segment) => segment.target === 'permission')!
+        .spans.map((span) => span.text)
+        .join('')
+    expect(text(pendingPermission)).toBe('✎ Edit workspace → ◇ Plan next')
+    expect(text(null)).toBe('✎ Edit workspace')
+    // Once a status shows it, nothing is pending.
+    expect(text('workspace-write')).toBe('✎ Edit workspace')
   })
 
   test('without it: the slash commands, and no branch switching', async () => {

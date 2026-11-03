@@ -47,13 +47,38 @@ export function permissionChoices(status: StatusEvent | null): PermissionOption[
   return PERMISSION_OPTIONS.filter((option) => option.id !== 'danger-full-access' || allowed)
 }
 
-/** Shift+Tab: Read-only → Edit workspace → (Full access) → Plan → Read-only. */
-export function nextPermissionChoice(status: StatusEvent | null): PermissionChoice | null {
+/**
+ * Shift+Tab: Read-only → Edit workspace → (Full access) → Plan → Read-only.
+ * From `pending`, a choice already sent that no status shows yet, so two
+ * quick presses (or presses during a turn, whose status comes after it) go
+ * two steps, not the same one twice.
+ */
+export function nextPermissionChoice(
+  status: StatusEvent | null,
+  pending: PermissionChoice | null = null,
+): PermissionChoice | null {
   if (!status) return null
   const choices = permissionChoices(status)
-  const current = currentPermissionChoice(status)
+  const current =
+    pending && choices.some((option) => option.id === pending) ? pending : currentPermissionChoice(status)
   const index = choices.findIndex((option) => option.id === current)
   return choices[(index + 1) % choices.length]!.id
+}
+
+/** The choice that holds once what was sent is done: the pending one, else the status's. */
+export function effectivePermissionChoice(
+  status: StatusEvent | null,
+  pending: PermissionChoice | null,
+): PermissionChoice | null {
+  return pending ?? currentPermissionChoice(status)
+}
+
+/** Shift+Tab: sends the next choice and keeps it as pending until a status shows it. */
+export function cyclePermissionChoice(): PermissionChoice | null {
+  const { status, pendingPermission } = useEngineStore.getState()
+  const next = nextPermissionChoice(status, pendingPermission)
+  if (!next || !setPermissionChoice(next)) return null
+  return next
 }
 
 function readyEngine(): NeuronEngineClient | null {
@@ -77,6 +102,8 @@ function legacySlash(engine: NeuronEngineClient, command: string, args: string):
 export function setPermissionChoice(choice: PermissionChoice): boolean {
   const engine = readyEngine()
   if (!engine) return false
+  // Both kinds of engine answer with a status (or an error), which clears it.
+  useEngineStore.getState().setPendingPermission(choice)
   if (supportsStatusBar()) {
     engine.send({ type: 'set_permission_mode', mode: choice })
     return true

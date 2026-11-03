@@ -10,7 +10,7 @@ import React, { useEffect, useMemo, useState } from 'react'
 
 import { ChoicePanel, type ChoiceRow } from './choice-panel'
 import {
-  currentPermissionChoice,
+  effectivePermissionChoice,
   permissionChoices,
   requestBranches,
   setPermissionChoice,
@@ -19,6 +19,7 @@ import {
   type PermissionChoice,
 } from '../engine/status-bar-actions'
 import { useEngineStore } from '../state/engine-store'
+import { useLiveTurnStore } from '../state/live-turn-store'
 import { loadRecentProjects } from '../utils/recent-projects'
 import {
   catalogModel,
@@ -70,9 +71,15 @@ export const ThinkPicker = ({ onClose, width, maxVisibleRows }: PickerProps) => 
   )
 }
 
-/** The permission modes to pick from; Full access only when enabled at launch. */
-export function permissionRows(status: StatusEvent | null): ChoiceRow[] {
-  const current = currentPermissionChoice(status)
+/**
+ * The permission modes to pick from; Full access only when enabled at launch.
+ * A choice sent that no status shows yet (`pending`) is the one marked.
+ */
+export function permissionRows(
+  status: StatusEvent | null,
+  pending: PermissionChoice | null = null,
+): ChoiceRow[] {
+  const current = effectivePermissionChoice(status, pending)
   return permissionChoices(status).map((option) => ({
     id: option.id,
     label: option.label,
@@ -83,7 +90,8 @@ export function permissionRows(status: StatusEvent | null): ChoiceRow[] {
 
 export const PermissionPicker = ({ onClose, width, maxVisibleRows }: PickerProps) => {
   const status = useEngineStore((state) => state.status)
-  const rows = useMemo(() => permissionRows(status), [status])
+  const pending = useEngineStore((state) => state.pendingPermission)
+  const rows = useMemo(() => permissionRows(status, pending), [status, pending])
   return (
     <ChoicePanel
       title="Permissions"
@@ -115,6 +123,21 @@ export function workspaceRows(cwd: string | null, recent: { path: string }[]): C
   return rows
 }
 
+/**
+ * What Enter on a workspace row does. Switching restarts the engine, which
+ * stops a running turn (or one waiting on a permission or a question), so
+ * then it takes a second Enter on the same row, as the branch picker does.
+ */
+export function workspacePickAction(
+  row: Pick<ChoiceRow, 'id' | 'current'>,
+  busy: boolean,
+  confirming: string | null,
+): 'close' | 'confirm' | 'switch' {
+  if (row.current) return 'close'
+  if (busy && confirming !== row.id) return 'confirm'
+  return 'switch'
+}
+
 export const WorkspacePicker = ({
   onClose,
   width,
@@ -122,7 +145,14 @@ export const WorkspacePicker = ({
   onSwitchProject,
 }: PickerProps & { onSwitchProject?: (folder: string) => void }) => {
   const status = useEngineStore((state) => state.status)
+  const waiting = useEngineStore(
+    (state) => state.permissionQueue.length > 0 || state.pendingQuestion !== null,
+  )
+  const turnRunning = useLiveTurnStore((state) => state.active)
+  const busy = turnRunning || waiting
+  const [confirming, setConfirming] = useState<string | null>(null)
   const rows = useMemo(() => workspaceRows(status?.cwd ?? null, loadRecentProjects()), [status?.cwd])
+  const confirmingRow = confirming ? rows.find((row) => row.id === confirming) : undefined
   return (
     <ChoicePanel
       title="Workspace"
@@ -130,10 +160,28 @@ export const WorkspacePicker = ({
       width={width}
       maxVisibleRows={maxVisibleRows}
       header="Switching restarts the engine in the folder you pick."
+      notice={
+        confirmingRow
+          ? {
+              text: `Switching stops the running turn. Enter again to switch to ${confirmingRow.label}.`,
+              tone: 'warning',
+            }
+          : null
+      }
       emptyText="No recent folders yet."
       onClose={onClose}
+      onMove={() => setConfirming(null)}
       onPick={(row) => {
-        if (!row.current) onSwitchProject?.(row.id)
+        switch (workspacePickAction(row, busy, confirming)) {
+          case 'confirm':
+            setConfirming(row.id)
+            return
+          case 'switch':
+            onSwitchProject?.(row.id)
+            break
+          case 'close':
+            break
+        }
         onClose()
       }}
     />

@@ -17,6 +17,11 @@
  *
  * The account rows are read again when it opens and every minute while it is
  * open (`refresh_account`).
+ *
+ * In a short terminal (`compact`) it keeps the meter, the free share, the
+ * auto-compact line and the account's title, and points at /context for the
+ * rest; `maxRows` caps its body either way, so its border, the `esc close`
+ * line and the status bar under it stay on screen.
  */
 
 import { type KeyEvent } from '@opentui/core'
@@ -72,10 +77,16 @@ export const ContextPopover = ({
   onClose,
   width,
   now = Date.now(),
+  compact = false,
+  maxRows,
 }: {
   onClose: () => void
   width: number
   now?: number
+  /** A short terminal: only the summary lines. */
+  compact?: boolean
+  /** The most body lines (between the border and `esc close`). */
+  maxRows?: number
 }) => {
   const theme = useTheme()
   const status = useEngineStore((state) => state.status)
@@ -130,7 +141,9 @@ export const ContextPopover = ({
         </text>
       </box>,
     )
-    for (const row of breakdownRows(ctx)) {
+    const rows = breakdownRows(ctx)
+    const shown = compact && rows.some((row) => row.free) ? rows.filter((row) => row.free) : rows
+    for (const row of shown) {
       lines.push(
         <text key={`row-${row.label}`} style={{ wrapMode: 'none', fg: row.free ? theme.success : theme.muted }}>
           {breakdownLine(row, inner)}
@@ -153,7 +166,7 @@ export const ContextPopover = ({
       </text>,
     )
   }
-  if (tokens) {
+  if (tokens && !compact) {
     lines.push(
       <text key="session" style={{ wrapMode: 'none', fg: theme.muted }}>
         {`This session  ${tokens}`}
@@ -168,7 +181,7 @@ export const ContextPopover = ({
         {ago ? <span fg={theme.muted}>{` · ${ago}`}</span> : null}
       </text>,
     )
-    for (const row of accountRows(account, now)) {
+    for (const row of compact ? [] : accountRows(account, now)) {
       lines.push(
         <box key={`acct-${row.label}`} style={{ flexDirection: 'row' }}>
           <text style={{ wrapMode: 'none', fg: theme.muted }}>{`  ${pad(row.label, 16)}${pad(row.value, 22)}`}</text>
@@ -183,11 +196,13 @@ export const ContextPopover = ({
         </box>,
       )
     }
-    lines.push(
-      <text key="links" style={{ wrapMode: 'none', fg: theme.muted }}>
-        {'  /usage details · /upgrade'}
-      </text>,
-    )
+    if (!compact) {
+      lines.push(
+        <text key="links" style={{ wrapMode: 'none', fg: theme.muted }}>
+          {'  /usage details · /upgrade'}
+        </text>,
+      )
+    }
   } else if (signedIn) {
     lines.push(
       <text key="account-loading" style={{ wrapMode: 'none', fg: theme.muted }}>
@@ -195,6 +210,18 @@ export const ContextPopover = ({
       </text>,
     )
   }
+
+  let body = lines
+  if (maxRows !== undefined && lines.length > Math.max(1, maxRows)) {
+    const keep = Math.max(1, maxRows) - 1
+    body = [
+      ...lines.slice(0, keep),
+      <text key="more" style={{ wrapMode: 'none', fg: theme.muted }}>
+        {`  … ${lines.length - keep} more lines: /context, /usage`}
+      </text>,
+    ]
+  }
+  const help = compact ? 'esc close · /context for the breakdown' : 'esc close'
 
   return (
     <box
@@ -210,8 +237,8 @@ export const ContextPopover = ({
         flexDirection: 'column',
       }}
     >
-      {lines}
-      <text style={{ fg: theme.muted }}>esc close</text>
+      {body}
+      <text style={{ wrapMode: 'none', fg: theme.muted }}>{help}</text>
     </box>
   )
 }

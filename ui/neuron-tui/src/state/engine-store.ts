@@ -3,6 +3,7 @@ import { immer } from 'zustand/middleware/immer'
 
 import type { EngineConnection } from '../engine/neuron-engine-client'
 import type { QuestionTarget } from '../engine/questions'
+import type { PermissionChoice } from '../engine/status-bar-actions'
 import type {
   AccountDetails,
   BranchesEvent,
@@ -74,6 +75,13 @@ export interface EngineStoreState {
   accountReceivedAt: number | null
   /** The last `branches` answer, for the branch picker. */
   branches: Omit<BranchesEvent, 'type'> | null
+  /**
+   * A permission choice sent to the engine that no `status` shows yet: the
+   * engine answers after it rebuilds its runtime, and only after the running
+   * turn. Shift+Tab cycles on from it, and the bar shows it as coming next.
+   * Cleared by the `status` that shows it, an `error`, or the engine stopping.
+   */
+  pendingPermission: PermissionChoice | null
 
   /** `errorInChat`: the chat already shows `error` (see {@link EngineStoreState.errorInChat}). */
   setConnection: (
@@ -99,7 +107,13 @@ export interface EngineStoreState {
   setReport: (report: ReportEvent | null) => void
   setAccount: (account: AccountDetails | null, receivedAt?: number) => void
   setBranches: (branches: BranchesEvent | null) => void
+  setPendingPermission: (choice: PermissionChoice | null) => void
   reset: () => void
+}
+
+/** The permission choice a status shows: plan mode, else the mode. */
+export function permissionChoiceOf(status: StatusEvent): string {
+  return status.plan_mode ? 'plan' : status.permission_mode
 }
 
 /** The engine sent `feature` in `ready.features`. */
@@ -138,6 +152,7 @@ const initial = {
   account: null as AccountDetails | null,
   accountReceivedAt: null as number | null,
   branches: null as Omit<BranchesEvent, 'type'> | null,
+  pendingPermission: null as PermissionChoice | null,
 }
 
 export const useEngineStore = create<EngineStoreState>()(
@@ -155,6 +170,7 @@ export const useEngineStore = create<EngineStoreState>()(
           state.pendingQuestion = null
           state.pendingQuestionTarget = null
           state.signIn = null
+          state.pendingPermission = null
         }
       }),
     setReady: (version, features = []) =>
@@ -169,6 +185,9 @@ export const useEngineStore = create<EngineStoreState>()(
       set((state) => {
         state.status = status
         if (!needsSignIn(status)) state.signInProblem = null
+        // A status from before the choice (the end of the running turn, an
+        // earlier choice still queued) leaves it pending.
+        if (state.pendingPermission === permissionChoiceOf(status)) state.pendingPermission = null
       }),
     setModels: (models) =>
       set((state) => {
@@ -234,6 +253,10 @@ export const useEngineStore = create<EngineStoreState>()(
         state.branches = branches
           ? { current: branches.current, branches: branches.branches, dirty: branches.dirty }
           : null
+      }),
+    setPendingPermission: (choice) =>
+      set((state) => {
+        state.pendingPermission = choice
       }),
     reset: () => set(() => ({ ...initial })),
   })),

@@ -87,6 +87,40 @@ describe('ContextPopover', () => {
     expect(frame.replace(/resets [^\n]*/g, 'resets …')).toMatchSnapshot()
   })
 
+  test('a short terminal keeps the border, esc close and the status bar on screen', async () => {
+    // 48x14: a typical embedded IDE terminal. The chat, the popover, the input, the bar.
+    const frame = await draw(
+      <box style={{ flexDirection: 'column', width: 48, height: 14 }}>
+        <box style={{ flexGrow: 1, flexShrink: 1, minHeight: 0 }}>
+          <text>chat line</text>
+        </box>
+        <ContextPopover onClose={() => {}} width={48} now={now} compact maxRows={5} />
+        <text style={{ flexShrink: 0 }}>{'> input'}</text>
+        <PromptStatusBar width={48} />
+      </box>,
+      48,
+      14,
+    )
+    const lines = frame.split('\n')
+    expect(lines.length).toBeLessThanOrEqual(14)
+    expect(frame).toContain('esc close')
+    expect(frame).toContain('35%')
+    expect(frame).toContain('Free')
+    expect(frame).toContain('Account · Free')
+    expect(frame).not.toContain('System prompt')
+    // The bottom border is drawn, under the help line.
+    const help = lines.findIndex((line) => line.includes('esc close'))
+    expect(lines[help + 1]).toMatch(/^[└╰+]/)
+    expect(lines[lines.length - 1]).toContain('35%')
+  })
+
+  test('a row cap folds the rest into a pointer at /context', async () => {
+    const frame = await draw(<ContextPopover onClose={() => {}} width={100} now={now} maxRows={6} />, 100, 20)
+    expect(frame).toContain('more lines: /context')
+    expect(frame).toContain('esc close')
+    expect(frame).not.toContain('5-hour window')
+  })
+
   test('without an account or a breakdown', async () => {
     const engine = useEngineStore.getState()
     engine.setAccount(null)
