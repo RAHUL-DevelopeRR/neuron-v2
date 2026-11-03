@@ -343,7 +343,7 @@ fn sentences(text: &str) -> Vec<&str> {
     while let Some((index, ch)) = chars.next() {
         let ends = match ch {
             '\n' | '!' | '?' | ';' => true,
-            '.' => chars.peek().map_or(true, |(_, next)| next.is_whitespace()),
+            '.' => chars.peek().is_none_or(|(_, next)| next.is_whitespace()),
             _ => false,
         };
         if ends {
@@ -387,9 +387,8 @@ fn sentence_asks_for_change(sentence: &str) -> bool {
 fn strip_word<'a>(text: &'a str, word: &str) -> Option<&'a str> {
     let after = text.strip_prefix(word)?;
     match after.chars().next() {
-        None => Some(after),
         Some(ch) if ch.is_alphanumeric() || ch == '_' => None,
-        Some(_) => Some(after),
+        _ => Some(after),
     }
 }
 
