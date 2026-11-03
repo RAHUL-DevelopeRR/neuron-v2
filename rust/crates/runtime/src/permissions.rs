@@ -927,7 +927,7 @@ impl PermissionPolicy {
         };
         let prefixes = rules
             .iter()
-            .filter(|rule| rule.tool_name == tool_name)
+            .filter(|rule| rule.names_tool(tool_name))
             .filter_map(PermissionRule::prefix_words)
             .collect::<Vec<_>>();
         !prefixes.is_empty() && classification.covered_by_prefixes(&prefixes)
@@ -1308,6 +1308,15 @@ impl PermissionRule {
         }
     }
 
+    /// Whether this rule is about `tool_name`. Tool names compare without regard
+    /// to ASCII case, so `Bash(rm:*)` applies to the `bash` tool and `webfetch`
+    /// to `WebFetch`, as a settings author expects. Adapted from Claw Code
+    /// (MIT), upstream commit aca6584, which lowercases rule names; Neuron has
+    /// mixed-case tool names, so it compares case-insensitively instead.
+    fn names_tool(&self, tool_name: &str) -> bool {
+        self.tool_name.eq_ignore_ascii_case(tool_name)
+    }
+
     /// The words of a `tool(prefix:*)` rule's prefix (`["git"]`); `None` for other rules.
     fn prefix_words(&self) -> Option<Vec<String>> {
         match &self.matcher {
@@ -1333,7 +1342,7 @@ impl PermissionRule {
         kind: RuleKind,
         classification: Option<&CommandClassification>,
     ) -> bool {
-        if self.tool_name != tool_name {
+        if !self.names_tool(tool_name) {
             return false;
         }
 
@@ -1561,6 +1570,33 @@ mod tests {
             policy.authorize("bash", r#"{"command":"rm -rf /tmp/x"}"#, None),
             PermissionOutcome::Deny { reason } if reason.contains("denied by rule")
         ));
+    }
+
+    // Adapted from Claw Code (MIT), upstream commit aca6584.
+    #[test]
+    fn rule_tool_names_match_without_regard_to_case() {
+        let rules = RuntimePermissionRuleConfig::new(
+            vec!["Bash(git:*)".to_string(), "webfetch".to_string()],
+            vec!["BASH(rm -rf:*)".to_string()],
+            Vec::new(),
+        );
+        let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess)
+            .with_tool_requirement("WebFetch", PermissionMode::DangerFullAccess)
+            .with_permission_rules(&rules);
+
+        assert_eq!(
+            policy.authorize("bash", r#"{"command":"git status"}"#, None),
+            PermissionOutcome::Allow
+        );
+        assert!(matches!(
+            policy.authorize("bash", r#"{"command":"rm -rf /tmp/x"}"#, None),
+            PermissionOutcome::Deny { reason } if reason.contains("denied by rule")
+        ));
+        assert_eq!(
+            policy.authorize("WebFetch", r#"{"url":"https://example.com"}"#, None),
+            PermissionOutcome::Allow
+        );
     }
 
     #[test]
