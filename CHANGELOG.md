@@ -24,6 +24,9 @@ The release workflow copies a version's section into its GitHub release notes.
   limits the hosts `WebFetch` and shell commands may reach.
 - A nightly eval workflow gates on the coding-task pass rate and drives the
   full-screen UI through a scripted prompt, tool call, approval and answer.
+- Two runs started in the same millisecond no longer get the same session and refuse
+  each other: session ids are `session-<millis>-<pid>-<rand>`, and a new session that
+  finds its id taken picks another.
 
 ## 7.0.0-alpha.3 (2026-11-02)
 

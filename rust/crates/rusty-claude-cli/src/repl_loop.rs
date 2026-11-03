@@ -446,7 +446,7 @@ fn print_footer(cli: &LiveCli) {
 }
 
 /// The session in the footer: its whole id (what `--resume` takes), never cut
-/// mid-word. Ids are `session-<millis>-<n>`; another id gets the word in front.
+/// mid-word. Ids are `session-<millis>-<pid>-<rand>`; another id gets the word in front.
 pub(crate) fn footer_session_label(id: &str) -> String {
     if id.starts_with("session-") {
         id.to_string()

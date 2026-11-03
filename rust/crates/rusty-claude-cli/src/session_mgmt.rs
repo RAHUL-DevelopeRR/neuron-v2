@@ -197,6 +197,34 @@ impl SessionLock {
         }
     }
 
+    /// Locks the file of a new session, which must not exist yet. `None` when its id is
+    /// taken: the session file is there, or its lock file is (another run picked the same
+    /// id and holds it, or held it). The lock file is created with `create_new`, so two
+    /// runs that picked the same id can't both get it.
+    pub fn claim_new(session_path: &Path) -> Result<Option<Self>, Box<dyn std::error::Error>> {
+        if session_path.exists() {
+            return Ok(None);
+        }
+        let path = session_lock_path(session_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { file, path })),
+            Err(fs::TryLockError::WouldBlock) => Ok(None),
+            Err(fs::TryLockError::Error(error)) => Err(error.into()),
+        }
+    }
+
     /// Lets go of the session and removes the lock file, for a session file that was
     /// removed too.
     pub fn remove(self) {
@@ -244,16 +272,44 @@ pub struct OpenSession {
     pub lock: SessionLock,
 }
 
+/// How many ids a new session tries before giving up. Ids differ by process and carry
+/// random bits, so even a second try is rare.
+const NEW_SESSION_ATTEMPTS: usize = 8;
+
 /// A new session for this run, locked, not saved yet.
 pub fn new_open_session() -> Result<OpenSession, Box<dyn std::error::Error>> {
-    let session = new_cli_session()?;
-    let handle = create_managed_session_handle(&session.session_id)?;
-    let lock = SessionLock::acquire(&handle.path)?;
-    Ok(OpenSession {
-        session: session.with_persistence_path(handle.path.clone()),
-        handle,
-        lock,
-    })
+    let store = current_session_store()?;
+    crate::session_presence::record_project(store.workspace_root());
+    open_new_session_in(&store, new_cli_session)
+}
+
+/// A new session in `store` with the first id from `fresh` that no other run has taken:
+/// two runs started at once must each get a session of their own, not be refused as
+/// sharing one.
+fn open_new_session_in(
+    store: &runtime::SessionStore,
+    mut fresh: impl FnMut() -> Result<Session, Box<dyn std::error::Error>>,
+) -> Result<OpenSession, Box<dyn std::error::Error>> {
+    for _ in 0..NEW_SESSION_ATTEMPTS {
+        let session = fresh()?;
+        let handle = store.create_handle(&session.session_id);
+        if let Some(lock) = SessionLock::claim_new(&handle.path)? {
+            return Ok(OpenSession {
+                session: session.with_persistence_path(handle.path.clone()),
+                handle: SessionHandle {
+                    id: handle.id,
+                    path: handle.path,
+                },
+                lock,
+            });
+        }
+    }
+    Err(format!(
+        "could not start a new session: {NEW_SESSION_ATTEMPTS} new session ids in a row were \
+already taken in {}",
+        store.sessions_dir().display()
+    )
+    .into())
 }
 
 /// The saved session `reference` names, opened for this run to continue. It is locked
@@ -412,7 +468,7 @@ pub fn session_clear_backup_path(session_path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{same_session_file, session_lock_path, SessionLock};
+    use super::{open_new_session_in, same_session_file, session_lock_path, SessionLock};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -449,6 +505,55 @@ mod tests {
         again.remove();
         assert!(!lock.exists());
         let _ = fs::remove_dir_all(session.parent().expect("temp dir"));
+    }
+
+    #[test]
+    fn a_new_session_id_another_run_took_is_skipped() {
+        let session = temp_session("claim");
+        let workspace = session.parent().expect("temp dir").to_path_buf();
+        fs::create_dir_all(&workspace).expect("workspace");
+        let store = runtime::SessionStore::from_cwd(&workspace).expect("store");
+
+        // Another run started in the same millisecond with the same id and holds it.
+        let taken = store.create_handle("session-taken");
+        let held = SessionLock::claim_new(&taken.path)
+            .expect("claim")
+            .expect("the first run gets the id");
+        assert!(SessionLock::claim_new(&taken.path)
+            .expect("claim")
+            .is_none());
+        // An id whose session file was saved is taken too.
+        let saved = store.create_handle("session-saved");
+        fs::create_dir_all(saved.path.parent().expect("sessions dir")).expect("sessions dir");
+        fs::write(&saved.path, "").expect("session file");
+
+        let mut ids = ["session-taken", "session-saved", "session-free"].into_iter();
+        let opened = open_new_session_in(&store, || {
+            let mut session = runtime::Session::new();
+            session.session_id = ids.next().expect("an id").to_string();
+            Ok(session)
+        })
+        .expect("a session of its own");
+        assert_eq!(opened.handle.id, "session-free");
+        assert_eq!(opened.session.session_id, "session-free");
+        assert_eq!(opened.handle.path, store.create_handle("session-free").path);
+
+        // Every id taken: an error, not a shared session.
+        let error = open_new_session_in(&store, || {
+            let mut session = runtime::Session::new();
+            session.session_id = "session-taken".to_string();
+            Ok(session)
+        })
+        .expect_err("no free id");
+        assert!(
+            error
+                .to_string()
+                .starts_with("could not start a new session"),
+            "{error}"
+        );
+        drop(held);
+        drop(opened);
+        let _ = fs::remove_dir_all(&workspace);
     }
 
     #[test]
