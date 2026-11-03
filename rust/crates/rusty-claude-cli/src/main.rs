@@ -1122,7 +1122,14 @@ fn parse_git_status_branch(status: Option<&str>) -> Option<String> {
     if line.starts_with("HEAD") {
         return Some("detached HEAD".to_string());
     }
-    let branch = line.split(['.', ' ']).next().unwrap_or_default().trim();
+    // `## <branch>...<upstream> [ahead 1]`: a branch name may itself contain
+    // dots (`release/7.0.0-alpha.4`), so cut at the `...` and then at the
+    // first space, never at a single dot.
+    let branch = line
+        .split("...")
+        .next()
+        .and_then(|head| head.split_whitespace().next())
+        .unwrap_or_default();
     if branch.is_empty() {
         None
     } else {
@@ -7612,6 +7619,25 @@ mod tests {
         );
         let _ = project_root;
         fs::remove_dir_all(temp_root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn keeps_dots_in_branch_names_from_status_snapshot() {
+        assert_eq!(
+            parse_git_status_branch(Some(
+                "## release/7.0.0-alpha.4...origin/release/7.0.0-alpha.4 [ahead 2]\n M CHANGELOG.md"
+            ))
+            .as_deref(),
+            Some("release/7.0.0-alpha.4")
+        );
+        assert_eq!(
+            parse_git_status_branch(Some("## release/7.0.0-alpha.4\n?? notes.md")).as_deref(),
+            Some("release/7.0.0-alpha.4")
+        );
+        assert_eq!(
+            parse_git_status_branch(Some("## v1.2 [gone]")).as_deref(),
+            Some("v1.2")
+        );
     }
 
     #[test]
