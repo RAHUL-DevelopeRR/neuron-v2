@@ -208,6 +208,7 @@ export const App = ({
         initialMode={initialMode}
         gitRoot={gitRoot}
         onSwitchToGitRoot={handleSwitchToGitRoot}
+        onSwitchProject={onProjectChange}
         showChatHistory={showChatHistory}
         onSelectChat={handleResumeChat}
         onCancelChatHistory={closeChatHistory}
@@ -227,6 +228,7 @@ interface AuthedSurfaceProps {
   initialMode: AgentMode | undefined
   gitRoot: string | null | undefined
   onSwitchToGitRoot: () => void
+  onSwitchProject?: (folder: string) => void
   showChatHistory: boolean
   onSelectChat: (chatId: string) => void
   onCancelChatHistory: () => void
@@ -254,6 +256,7 @@ export const AuthedSurfaceRoutes = ({
   initialMode,
   gitRoot,
   onSwitchToGitRoot,
+  onSwitchProject,
   showChatHistory,
   onSelectChat,
   onCancelChatHistory,
@@ -279,6 +282,7 @@ export const AuthedSurfaceRoutes = ({
       initialMode={initialMode}
       gitRoot={gitRoot}
       onSwitchToGitRoot={onSwitchToGitRoot}
+      onSwitchProject={onSwitchProject}
     />
   )
 }

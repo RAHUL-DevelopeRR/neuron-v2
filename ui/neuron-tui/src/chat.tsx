@@ -32,7 +32,14 @@ import { QueuePanel } from './components/queue-panel'
 import { ReviewScreen } from './components/review-screen'
 import { MessageWithAgents } from './components/message-with-agents'
 import { PendingBashMessage } from './components/pending-bash-message'
-import { EngineFooter } from './components/engine-footer'
+import { ContextPopover } from './components/context-popover'
+import { PromptStatusBar } from './components/prompt-status-bar'
+import {
+  BranchPicker,
+  PermissionPicker,
+  ThinkPicker,
+  WorkspacePicker,
+} from './components/status-pickers'
 import { ModelPicker } from './components/model-picker'
 import { PermissionPrompt } from './components/permission-prompt'
 import { RewindPicker } from './components/rewind-picker'
@@ -62,6 +69,7 @@ import { useEvent } from './hooks/use-event'
 import { useInputHistory } from './hooks/use-input-history'
 import { useSuggestionEngine } from './hooks/use-suggestion-engine'
 import { getProjectRoot } from './project-files'
+import { nextPermissionChoice, setPermissionChoice } from './engine/status-bar-actions'
 import { useChatHistoryStore } from './state/chat-history-store'
 import { useChatStore } from './state/chat-store'
 import { useEngineStore } from './state/engine-store'
@@ -102,6 +110,7 @@ import type { CommandResult } from './commands/command-registry'
 import type { MultilineInputHandle } from './components/multiline-input'
 import type { MatchedSlashCommand } from './hooks/use-suggestion-engine'
 import type { AgentMode } from './utils/constants'
+import type { StatusTarget } from './utils/status-bar-parts'
 import type { FileTreeNode } from '@neuron-tui/common/util/file'
 import type { BoxRenderable, ScrollBoxRenderable } from '@opentui/core'
 
@@ -112,6 +121,7 @@ export const Chat = ({
   initialMode,
   gitRoot,
   onSwitchToGitRoot,
+  onSwitchProject,
 }: {
   consumeInitialPrompt: () => string | null
   fileTree: FileTreeNode[]
@@ -119,12 +129,32 @@ export const Chat = ({
   initialMode?: AgentMode
   gitRoot?: string | null
   onSwitchToGitRoot?: () => void
+  /** Restarts the engine in another folder (the status bar's workspace picker). */
+  onSwitchProject?: (folder: string) => void
 }) => {
   const [forceFileOnlyMentions, setForceFileOnlyMentions] = useState(false)
   const headerRef = useRef<BoxRenderable | null>(null)
   const [isHeaderVisible, setIsHeaderVisible] = useState(true)
   const [todoPanelOpen, setTodoPanelOpen] = useState(false)
   const [modelPickerOpen, setModelPickerOpen] = useState(false)
+  // The status bar's other pickers and its context popover, in the same slot.
+  const [statusPanel, setStatusPanel] = useState<Exclude<StatusTarget, 'model' | 'account'> | null>(
+    null,
+  )
+  const openStatusTarget = useCallback((target: StatusTarget) => {
+    if (target === 'model') {
+      setStatusPanel(null)
+      setModelPickerOpen(true)
+      return
+    }
+    setModelPickerOpen(false)
+    setStatusPanel(target === 'account' ? 'context' : target)
+  }, [])
+  const closeStatusPanel = useCallback(() => setStatusPanel(null), [])
+  const cyclePermission = useCallback(() => {
+    const next = nextPermissionChoice(useEngineStore.getState().status)
+    if (next) setPermissionChoice(next)
+  }, [])
   const chatSessionId = useChatStore((state) => state.chatSessionId)
   useEffect(() => setTodoPanelOpen(false), [chatSessionId])
 
@@ -1106,6 +1136,8 @@ export const Chat = ({
         if (!scrollOpenReport('down')) scrollDown()
       },
       onToggleAll: handleToggleAll,
+      onCyclePermission: cyclePermission,
+      onOpenStatusPicker: openStatusTarget,
     }),
     [
       setInputMode,
@@ -1139,6 +1171,8 @@ export const Chat = ({
       scrollUp,
       scrollDown,
       handleToggleAll,
+      cyclePermission,
+      openStatusTarget,
     ],
   )
 
@@ -1152,6 +1186,7 @@ export const Chat = ({
       askUserState !== null ||
       permissionRequest !== null ||
       modelPickerOpen ||
+      statusPanel !== null ||
       reviewMode ||
       queuePanelOpen ||
       todoPanelOpen ||
@@ -1412,6 +1447,33 @@ export const Chat = ({
             width={separatorWidth}
             maxVisibleRows={isCompactHeight ? 4 : 8}
           />
+        ) : statusPanel === 'context' ? (
+          <ContextPopover onClose={closeStatusPanel} width={separatorWidth} />
+        ) : statusPanel === 'think' ? (
+          <ThinkPicker
+            onClose={closeStatusPanel}
+            width={separatorWidth}
+            maxVisibleRows={isCompactHeight ? 4 : 8}
+          />
+        ) : statusPanel === 'permission' ? (
+          <PermissionPicker
+            onClose={closeStatusPanel}
+            width={separatorWidth}
+            maxVisibleRows={isCompactHeight ? 4 : 8}
+          />
+        ) : statusPanel === 'workspace' ? (
+          <WorkspacePicker
+            onClose={closeStatusPanel}
+            onSwitchProject={onSwitchProject}
+            width={separatorWidth}
+            maxVisibleRows={isCompactHeight ? 4 : 8}
+          />
+        ) : statusPanel === 'branch' ? (
+          <BranchPicker
+            onClose={closeStatusPanel}
+            width={separatorWidth}
+            maxVisibleRows={isCompactHeight ? 4 : 8}
+          />
         ) : reviewMode ? (
           <ReviewScreen
             onSelectOption={handleReviewOptionSelect}
@@ -1497,7 +1559,7 @@ export const Chat = ({
           </>
         )}
 
-        <EngineFooter width={separatorWidth} />
+        <PromptStatusBar width={separatorWidth} onActivate={openStatusTarget} />
       </box>
     </box>
   )

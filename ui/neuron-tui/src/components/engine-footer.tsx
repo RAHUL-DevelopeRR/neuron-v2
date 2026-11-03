@@ -1,4 +1,9 @@
 /**
+ * The chat no longer draws this footer: the prompt status bar
+ * (prompt-status-bar.tsx) replaced it under the input, and its token counters
+ * moved to the context popover. Its helpers (`formatGit`, `hasUsableLogin`,
+ * `footerModel`, the fitter) and their tests stay for the git views.
+ *
  * One line under the input from the engine's last `status` and `usage`:
  *
  *   claude-sonnet-4-6 · workspace-write · main +1 ~2 ?3 · ↑12.4K ↓2.1K · ctx 4% · Zero-X pro · you@example.com
