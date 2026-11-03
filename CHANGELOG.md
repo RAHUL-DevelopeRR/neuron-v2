@@ -34,7 +34,8 @@ still apply, except the ones about npm and PyPI and the ones earlier alphas fixe
 - The bar has five parts, left to right: the model, the thinking level, the folder and
   branch, the permission mode and the context meter. Click a part, or press Alt+M
   (model), Alt+T (thinking level), Alt+W (folder), Alt+P (permission mode) or Alt+C
-  (context), to open its picker; on macOS the keys are Option+M and so on. The help
+  (context), to open its picker; on macOS the keys are Option+M and so on once the
+  terminal is set to use Option as Meta (Alt), otherwise click the part. The help
   screen lists them under "Status bar". The session's token counts, which the old
   footer showed, are in the context popover.
 - In a narrow terminal, parts give way in a fixed order (the account shortens first,
