@@ -8,9 +8,10 @@ use plugins::subprocess::{self, BoundedOutput, Termination};
 use serde::{Deserialize, Serialize};
 
 use crate::cancel::CancellationToken;
+use crate::os_sandbox;
 use crate::sandbox::{
-    build_linux_sandbox_command, resolve_sandbox_status_for_request, FilesystemIsolationMode,
-    SandboxConfig, SandboxDirs, SandboxStatus,
+    resolve_sandbox_status_for_request, FilesystemIsolationMode, SandboxConfig, SandboxDirs,
+    SandboxStatus,
 };
 use crate::ConfigLoader;
 
@@ -206,7 +207,7 @@ pub fn execute_bash_with_cancel(
             .stderr(Stdio::null());
         // Its own process group, so that the session's end can stop the whole tree.
         subprocess::isolate_process_group(&mut command);
-        let child = command.spawn()?;
+        let child = os_sandbox::spawn_background(&mut command, &sandbox_status)?;
         let task_id = child.id().to_string();
         subprocess::track_background_child(child);
 
@@ -218,9 +219,17 @@ pub fn execute_bash_with_cancel(
 
     let timeout = Duration::from_millis(effective_bash_timeout_ms(input.timeout));
     let mut command = prepare_command(&input.command, &cwd, &sandbox_status);
-    let bounded =
-        subprocess::run_bounded(&mut command, None, Some(timeout), &|| cancel.is_cancelled())?;
+    let (bounded, containment_note) =
+        os_sandbox::run_bounded(&mut command, &sandbox_status, timeout, &|| {
+            cancel.is_cancelled()
+        })?;
     let mut output = BashCommandOutput::from_bounded(&bounded, Some(timeout));
+    if let Some(note) = containment_note {
+        if !output.stderr.is_empty() && !output.stderr.ends_with('\n') {
+            output.stderr.push('\n');
+        }
+        output.stderr.push_str(&note);
+    }
     output.dangerously_disable_sandbox = input.dangerously_disable_sandbox;
     output.sandbox_status = Some(sandbox_status);
     Ok(output)
@@ -260,8 +269,9 @@ fn prepare_command(command: &str, cwd: &Path, sandbox_status: &SandboxStatus) ->
         let _ = dirs.create();
     }
 
+    let proxy = os_sandbox::allowlist_proxy(sandbox_status);
     let mut prepared =
-        if let Some(launcher) = build_linux_sandbox_command(command, cwd, sandbox_status) {
+        if let Some(launcher) = os_sandbox::launcher(command, cwd, sandbox_status, proxy) {
             let mut prepared = Command::new(launcher.program);
             prepared.args(launcher.args);
             subprocess::scrub_credential_env(&mut prepared);
@@ -276,6 +286,7 @@ fn prepare_command(command: &str, cwd: &Path, sandbox_status: &SandboxStatus) ->
             }
             prepared
         };
+    os_sandbox::apply_proxy_env(&mut prepared, proxy);
     prepared.current_dir(cwd);
     prepared
 }
@@ -339,6 +350,37 @@ mod tests {
         } else {
             "sleep 30; echo late"
         }
+    }
+
+    /// A sandboxed Windows command runs in a kill-on-close job: a process it
+    /// left running in the background dies when the command returns.
+    #[cfg(windows)]
+    #[test]
+    fn windows_job_kills_what_a_sandboxed_command_leaves_behind() {
+        let marker = std::env::temp_dir().join(format!(
+            "runtime-bash-job-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        let command = format!(
+            "start /b cmd /d /c \"ping -n 4 127.0.0.1 >NUL & echo late> {}\" & echo done",
+            marker.display()
+        );
+        let mut sandboxed = input(&command, Some(20_000));
+        sandboxed.dangerously_disable_sandbox = Some(false);
+        let output = execute_bash(sandboxed).expect("bash runs");
+        assert_eq!(output.stdout.trim(), "done", "{output:?}");
+        let status = output.sandbox_status.expect("status");
+        if !status.process_containment_active {
+            // User settings turned the sandbox off on this machine.
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(5));
+        let survived = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+        assert!(!survived, "the background grandchild must die with the job");
     }
 
     #[test]

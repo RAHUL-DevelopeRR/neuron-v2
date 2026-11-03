@@ -1,0 +1,16 @@
+[package]
+name = "redact"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Token-shaped secret redaction shared by the runtime (tool results, session
+# file), telemetry and the CLI. Depends on nothing else in the workspace so
+# every crate can use it.
+[dependencies]
+regex = "1"
+serde_json.workspace = true
+
+[lints]
+workspace = true

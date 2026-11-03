@@ -33,7 +33,23 @@ pub struct SandboxConfig {
     pub network_isolation: Option<bool>,
     pub filesystem_mode: Option<FilesystemIsolationMode>,
     pub allowed_mounts: Vec<String>,
+    /// `sandbox.network.allow`: hosts shell commands and `WebFetch` may reach
+    /// (see [`crate::net_allow`]). `None`: no allowlist.
+    #[serde(default)]
+    pub network_allow: Option<Vec<String>>,
+    /// `sandbox.maxProcesses`: Windows job active-process limit
+    /// (default [`DEFAULT_MAX_PROCESSES`]).
+    #[serde(default)]
+    pub max_processes: Option<u32>,
+    /// `sandbox.memoryLimitMb`: Windows job memory limit (default none).
+    #[serde(default)]
+    pub memory_limit_mb: Option<u64>,
 }
+
+/// Active-process limit of a sandboxed command's Windows job when
+/// `sandbox.maxProcesses` is unset: room for parallel builds, not for a fork
+/// bomb.
+pub const DEFAULT_MAX_PROCESSES: u32 = 512;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct SandboxRequest {
@@ -42,6 +58,12 @@ pub struct SandboxRequest {
     pub network_isolation: bool,
     pub filesystem_mode: FilesystemIsolationMode,
     pub allowed_mounts: Vec<String>,
+    #[serde(default)]
+    pub network_allow: Option<Vec<String>>,
+    #[serde(default)]
+    pub max_processes: Option<u32>,
+    #[serde(default)]
+    pub memory_limit_mb: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -72,6 +94,23 @@ pub struct SandboxStatus {
     pub in_container: bool,
     pub container_markers: Vec<String>,
     pub fallback_reason: Option<String>,
+    /// Windows: commands run in a kill-on-close Job Object with process and
+    /// memory limits.
+    #[serde(default)]
+    pub process_containment_supported: bool,
+    #[serde(default)]
+    pub process_containment_active: bool,
+    /// macOS: commands run under a generated `sandbox-exec` profile.
+    #[serde(default)]
+    pub seatbelt_supported: bool,
+    #[serde(default)]
+    pub seatbelt_active: bool,
+    /// The configured network allowlist, when one is set and the sandbox is on.
+    #[serde(default)]
+    pub network_allowlist: Option<Vec<String>>,
+    /// How the allowlist reaches shell commands (see [`crate::net_allow`]).
+    #[serde(default)]
+    pub network_allowlist_enforcement: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +147,9 @@ impl SandboxConfig {
                 .or(self.filesystem_mode)
                 .unwrap_or_default(),
             allowed_mounts: allowed_mounts_override.unwrap_or_else(|| self.allowed_mounts.clone()),
+            network_allow: self.network_allow.clone(),
+            max_processes: self.max_processes,
+            memory_limit_mb: self.memory_limit_mb,
         }
     }
 }
@@ -169,12 +211,29 @@ pub fn resolve_sandbox_status(config: &SandboxConfig, cwd: &Path) -> SandboxStat
 #[must_use]
 pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) -> SandboxStatus {
     let namespace_supported = cfg!(target_os = "linux") && unshare_user_namespace_works();
-    resolve_sandbox_status_with_support(
+    resolve_status(
         request,
         cwd,
-        namespace_supported,
-        filesystem_isolation_supported(),
+        PlatformSupport {
+            namespace: namespace_supported,
+            filesystem: filesystem_isolation_supported(),
+            seatbelt: cfg!(target_os = "macos") && Path::new(SANDBOX_EXEC).exists(),
+            job_object: cfg!(windows),
+        },
     )
+}
+
+/// The macOS seatbelt launcher.
+pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+
+/// Which OS mechanisms this machine has.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, Default)]
+struct PlatformSupport {
+    namespace: bool,
+    filesystem: bool,
+    seatbelt: bool,
+    job_object: bool,
 }
 
 /// Filesystem isolation (a per-workspace `HOME` and `TMPDIR`) is applied on
@@ -183,14 +242,30 @@ const fn filesystem_isolation_supported() -> bool {
     !cfg!(windows)
 }
 
+#[cfg(test)]
 fn resolve_sandbox_status_with_support(
     request: &SandboxRequest,
     cwd: &Path,
     namespace_supported: bool,
     filesystem_supported: bool,
 ) -> SandboxStatus {
+    resolve_status(
+        request,
+        cwd,
+        PlatformSupport {
+            namespace: namespace_supported,
+            filesystem: filesystem_supported,
+            ..PlatformSupport::default()
+        },
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn resolve_status(request: &SandboxRequest, cwd: &Path, support: PlatformSupport) -> SandboxStatus {
+    let namespace_supported = support.namespace;
+    let filesystem_supported = support.filesystem;
     let container = detect_container_environment();
-    let network_supported = namespace_supported;
+    let network_supported = namespace_supported || support.seatbelt;
     let filesystem_requested =
         request.enabled && request.filesystem_mode != FilesystemIsolationMode::Off;
     let filesystem_active = filesystem_requested && filesystem_supported;
@@ -203,8 +278,10 @@ fn resolve_sandbox_status_with_support(
             .push("namespace isolation unavailable (requires Linux with `unshare`)".to_string());
     }
     if request.enabled && request.network_isolation && !network_supported {
-        fallback_reasons
-            .push("network isolation unavailable (requires Linux with `unshare`)".to_string());
+        fallback_reasons.push(
+            "network isolation unavailable (requires Linux `unshare` or macOS `sandbox-exec`)"
+                .to_string(),
+        );
     }
     if filesystem_requested && !filesystem_supported {
         fallback_reasons.push(format!(
@@ -220,11 +297,30 @@ fn resolve_sandbox_status_with_support(
             .push("filesystem allow-list requested without configured mounts".to_string());
     }
 
+    let network_allowlist = request.network_allow.clone().filter(|_| request.enabled);
+    let seatbelt_active = request.enabled
+        && support.seatbelt
+        && (filesystem_active || network_active || network_allowlist.is_some());
+    let process_containment_active = request.enabled && support.job_object;
+    let network_allowlist_enforcement = network_allowlist.as_ref().map(|_| {
+        if seatbelt_active {
+            "enforced: seatbelt allows only the allowlist proxy".to_string()
+        } else if network_active {
+            "blocked: network namespace has no network, allowlist not applied".to_string()
+        } else {
+            "advisory: proxy environment variables (programs may ignore them)".to_string()
+        }
+    });
+
     let active = request.enabled
         && (!request.namespace_restrictions || namespace_supported)
         && (!request.network_isolation || network_supported)
         && (!filesystem_requested || filesystem_supported)
-        && (namespace_active || network_active || filesystem_active);
+        && (namespace_active
+            || network_active
+            || filesystem_active
+            || seatbelt_active
+            || process_containment_active);
 
     let allowed_mounts = normalize_mounts(&request.allowed_mounts, cwd);
 
@@ -247,7 +343,136 @@ fn resolve_sandbox_status_with_support(
         in_container: container.in_container,
         container_markers: container.markers,
         fallback_reason: (!fallback_reasons.is_empty()).then(|| fallback_reasons.join("; ")),
+        process_containment_supported: support.job_object,
+        process_containment_active,
+        seatbelt_supported: support.seatbelt,
+        seatbelt_active,
+        network_allowlist,
+        network_allowlist_enforcement,
     }
+}
+
+/// Network policy of a seatbelt profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeatbeltNetwork {
+    /// No network rule.
+    Allow,
+    /// No outbound IP connections (local Unix sockets still work).
+    Deny,
+    /// Outbound IP only to the loopback allowlist proxy on this port.
+    ProxyOnly(u16),
+}
+
+fn sbpl_string(path: &str) -> String {
+    format!("\"{}\"", path.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// A seatbelt (SBPL) profile: everything allowed except writes outside
+/// `write_roots` (plus `/dev/null`, ttys and `/dev/fd`) when `write_roots`
+/// is `Some`, and outbound network as `network` says. Later rules win in
+/// SBPL, so the allow-exceptions come after the denies.
+#[must_use]
+pub fn seatbelt_profile(write_roots: Option<&[PathBuf]>, network: SeatbeltNetwork) -> String {
+    use std::fmt::Write as _;
+    let mut profile = String::from("(version 1)\n(allow default)\n");
+    if let Some(roots) = write_roots {
+        let mut allowed = vec![
+            "(literal \"/dev/null\")".to_string(),
+            "(literal \"/dev/zero\")".to_string(),
+            "(literal \"/dev/dtracehelper\")".to_string(),
+            "(regex #\"^/dev/tty\")".to_string(),
+            "(subpath \"/dev/fd\")".to_string(),
+        ];
+        for root in roots {
+            allowed.push(format!(
+                "(subpath {})",
+                sbpl_string(&root.to_string_lossy())
+            ));
+        }
+        let _ = writeln!(
+            profile,
+            "(deny file-write* (require-not (require-any {})))",
+            allowed.join(" ")
+        );
+    }
+    match network {
+        SeatbeltNetwork::Allow => {}
+        SeatbeltNetwork::Deny => profile.push_str("(deny network-outbound (remote ip))\n"),
+        SeatbeltNetwork::ProxyOnly(port) => {
+            profile.push_str("(deny network-outbound (remote ip))\n");
+            let _ = writeln!(
+                profile,
+                "(allow network-outbound (remote ip \"localhost:{port}\"))"
+            );
+        }
+    }
+    profile
+}
+
+/// The directories a seatbelt-confined command may write: the workspace,
+/// allowed mounts, the per-workspace sandbox `HOME`/`TMPDIR`, and the system
+/// temp directories (macOS resolves `/tmp` and `$TMPDIR` to `/private/...`).
+#[must_use]
+pub fn seatbelt_write_roots(cwd: &Path, status: &SandboxStatus) -> Vec<PathBuf> {
+    let canonical = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut roots = vec![canonical(cwd)];
+    roots.extend(
+        status
+            .allowed_mounts
+            .iter()
+            .map(|mount| canonical(Path::new(mount))),
+    );
+    let dirs = SandboxDirs::for_workspace(cwd);
+    roots.push(canonical(&dirs.home));
+    roots.push(canonical(&dirs.tmp));
+    roots.push(canonical(&env::temp_dir()));
+    roots.push(PathBuf::from("/private/tmp"));
+    roots.push(PathBuf::from("/private/var/folders"));
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// `sandbox-exec -p <profile> /bin/sh -lc <command>` when the seatbelt is
+/// active (macOS). `proxy_port` is the allowlist proxy, when an allowlist is
+/// set.
+#[must_use]
+pub fn build_macos_sandbox_command(
+    command: &str,
+    cwd: &Path,
+    status: &SandboxStatus,
+    proxy_port: Option<u16>,
+) -> Option<LinuxSandboxCommand> {
+    if !status.seatbelt_active {
+        return None;
+    }
+    let network = match (status.network_allowlist.is_some(), proxy_port) {
+        (true, Some(port)) => SeatbeltNetwork::ProxyOnly(port),
+        (true, None) => SeatbeltNetwork::Deny,
+        (false, _) if status.network_active => SeatbeltNetwork::Deny,
+        (false, _) => SeatbeltNetwork::Allow,
+    };
+    let roots = status
+        .filesystem_active
+        .then(|| seatbelt_write_roots(cwd, status));
+    let profile = seatbelt_profile(roots.as_deref(), network);
+    let mut env = Vec::new();
+    if status.filesystem_active {
+        let dirs = SandboxDirs::for_workspace(cwd);
+        env.push(("HOME".to_string(), dirs.home.display().to_string()));
+        env.push(("TMPDIR".to_string(), dirs.tmp.display().to_string()));
+    }
+    Some(LinuxSandboxCommand {
+        program: SANDBOX_EXEC.to_string(),
+        args: vec![
+            "-p".to_string(),
+            profile,
+            "/bin/sh".to_string(),
+            "-lc".to_string(),
+            command.to_string(),
+        ],
+        env,
+    })
 }
 
 #[must_use]
@@ -467,6 +692,7 @@ mod tests {
             network_isolation: Some(false),
             filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
             allowed_mounts: vec!["logs".to_string()],
+            ..SandboxConfig::default()
         };
 
         let request = config.resolve_request(
@@ -586,6 +812,107 @@ mod tests {
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with("project-a-")));
+    }
+
+    fn support(seatbelt: bool, job_object: bool) -> super::PlatformSupport {
+        super::PlatformSupport {
+            namespace: false,
+            filesystem: true,
+            seatbelt,
+            job_object,
+        }
+    }
+
+    #[test]
+    fn seatbelt_profile_confines_writes_and_network() {
+        use super::{seatbelt_profile, SeatbeltNetwork};
+        let roots = vec![
+            std::path::PathBuf::from("/Users/dev/project"),
+            std::path::PathBuf::from("/private/tmp"),
+        ];
+        let profile = seatbelt_profile(Some(&roots), SeatbeltNetwork::ProxyOnly(4567));
+        assert!(profile.starts_with("(version 1)\n(allow default)\n"));
+        assert!(
+            profile.contains("(deny file-write* (require-not (require-any (literal \"/dev/null\")")
+        );
+        assert!(profile.contains("(subpath \"/Users/dev/project\")"));
+        assert!(profile.contains("(subpath \"/private/tmp\")"));
+        assert!(profile.contains("(deny network-outbound (remote ip))"));
+        assert!(profile.contains("(allow network-outbound (remote ip \"localhost:4567\"))"));
+        let deny_at = profile.find("(deny network-outbound").expect("deny");
+        let allow_at = profile.find("(allow network-outbound").expect("allow");
+        assert!(allow_at > deny_at, "the later rule wins in SBPL");
+
+        let open = seatbelt_profile(None, SeatbeltNetwork::Allow);
+        assert_eq!(open, "(version 1)\n(allow default)\n");
+        let no_net = seatbelt_profile(None, SeatbeltNetwork::Deny);
+        assert!(no_net.contains("(deny network-outbound (remote ip))"));
+        assert!(!no_net.contains("allow network-outbound"));
+    }
+
+    #[test]
+    fn seatbelt_paths_are_quoted_safely() {
+        use super::{seatbelt_profile, SeatbeltNetwork};
+        let roots = vec![std::path::PathBuf::from("/tmp/we\"ird\\dir")];
+        let profile = seatbelt_profile(Some(&roots), SeatbeltNetwork::Allow);
+        assert!(
+            profile.contains(r#"(subpath "/tmp/we\"ird\\dir")"#),
+            "{profile}"
+        );
+    }
+
+    #[test]
+    fn seatbelt_status_drives_the_macos_launcher() {
+        let mut request = workspace_only_request();
+        request.network_allow = Some(vec!["github.com".to_string()]);
+        let cwd = Path::new("/work/project");
+        let status = super::resolve_status(&request, cwd, support(true, false));
+        assert!(status.seatbelt_active && status.active);
+        assert!(status
+            .network_allowlist_enforcement
+            .as_deref()
+            .is_some_and(|mode| mode.starts_with("enforced")));
+        let launcher = super::build_macos_sandbox_command("echo hi", cwd, &status, Some(9000))
+            .expect("seatbelt launcher");
+        assert_eq!(launcher.program, super::SANDBOX_EXEC);
+        assert_eq!(launcher.args[0], "-p");
+        assert!(launcher.args[1].contains("localhost:9000"));
+        assert_eq!(&launcher.args[2..], ["/bin/sh", "-lc", "echo hi"]);
+
+        let without = super::resolve_status(&request, cwd, support(false, false));
+        assert!(!without.seatbelt_active);
+        assert!(super::build_macos_sandbox_command("echo", cwd, &without, None).is_none());
+        assert!(without
+            .network_allowlist_enforcement
+            .as_deref()
+            .is_some_and(|mode| mode.starts_with("advisory")));
+    }
+
+    #[test]
+    fn job_objects_count_as_active_containment() {
+        let mut request = workspace_only_request();
+        request.filesystem_mode = FilesystemIsolationMode::Off;
+        let status = super::resolve_status(&request, Path::new("."), support(false, true));
+        assert!(status.process_containment_active);
+        assert!(status.active, "{status:?}");
+        request.enabled = false;
+        let off = super::resolve_status(&request, Path::new("."), support(false, true));
+        assert!(!off.process_containment_active && !off.active);
+        assert_eq!(off.network_allowlist, None);
+    }
+
+    #[test]
+    fn config_limits_and_allowlist_flow_into_the_request() {
+        let config = SandboxConfig {
+            network_allow: Some(vec!["*.npmjs.org".to_string()]),
+            max_processes: Some(64),
+            memory_limit_mb: Some(2048),
+            ..SandboxConfig::default()
+        };
+        let request = config.resolve_request(None, None, None, None, None);
+        assert_eq!(request.network_allow, Some(vec!["*.npmjs.org".to_string()]));
+        assert_eq!(request.max_processes, Some(64));
+        assert_eq!(request.memory_limit_mb, Some(2048));
     }
 
     #[test]
