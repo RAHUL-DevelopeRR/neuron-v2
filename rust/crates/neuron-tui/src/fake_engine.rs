@@ -113,7 +113,11 @@ fn run(
             | EngineCommand::TrustPreview
             | EngineCommand::RefreshAccount
             | EngineCommand::Commit { .. }
-            | EngineCommand::Rewind { .. } => {
+            | EngineCommand::Rewind { .. }
+            | EngineCommand::SetReasoningEffort { .. }
+            | EngineCommand::SetPermissionMode { .. }
+            | EngineCommand::ListBranches
+            | EngineCommand::SwitchBranch { .. } => {
                 for event in answer(&command) {
                     if events.send(event).is_err() {
                         return log;
@@ -129,10 +133,10 @@ fn run(
 /// answer function that plays them.
 pub mod samples {
     use crate::protocol::{
-        AccountDetails, ClientMessage, EngineCommand, ErrorDetail, GitStatus, HookPreview,
-        McpServerPreview, ModelInfo, PermissionRulePreview, ReportLink, ReportSection,
-        SessionRunStatus, SessionScope, SessionSummary, UiEvent, UsageAmounts,
-        CAPABILITY_QUESTIONS, CAPABILITY_REPORTS,
+        AccountDetails, BranchInfo, ClientMessage, ContextBreakdown, EngineCommand, ErrorDetail,
+        GitStatus, HookPreview, McpServerPreview, ModelInfo, PermissionRulePreview, ReportLink,
+        ReportSection, SessionRunStatus, SessionScope, SessionSummary, UiEvent, UsageAmounts,
+        UsageWindow, CAPABILITY_QUESTIONS, CAPABILITY_REPORTS,
     };
 
     /// The workspace the samples run in.
@@ -160,7 +164,18 @@ pub mod samples {
                 };
                 vec![first, UiEvent::TurnFinished, status(false)]
             }
-            EngineCommand::SetModel { .. } => vec![status(false)],
+            EngineCommand::SetModel { .. }
+            | EngineCommand::SetReasoningEffort { .. }
+            | EngineCommand::SetPermissionMode { .. } => vec![status(false)],
+            EngineCommand::ListBranches => vec![branches()],
+            EngineCommand::SwitchBranch { name, .. } => vec![
+                UiEvent::Notice {
+                    message: format!("Switched to {name}."),
+                    kind: None,
+                },
+                branches(),
+                status(false),
+            ],
             EngineCommand::Submit { .. }
             | EngineCommand::Interrupt
             | EngineCommand::Shutdown
@@ -180,6 +195,7 @@ pub mod samples {
             status(false),
             models(),
             account(),
+            branches(),
             UiEvent::Account {
                 signed_in: false,
                 account: None,
@@ -218,6 +234,17 @@ pub mod samples {
             },
             EngineCommand::TrustPreview,
             EngineCommand::RefreshAccount,
+            EngineCommand::SetReasoningEffort {
+                effort: Some("high".into()),
+            },
+            EngineCommand::SetPermissionMode {
+                mode: "plan".into(),
+            },
+            EngineCommand::ListBranches,
+            EngineCommand::SwitchBranch {
+                name: "feat/tui-status-bar".into(),
+                create: false,
+            },
             EngineCommand::Capabilities {
                 features: vec![CAPABILITY_QUESTIONS.into(), CAPABILITY_REPORTS.into()],
                 client: Some("terminal".into()),
@@ -255,6 +282,55 @@ pub mod samples {
             account: None,
             supports_images: Some(false),
             served_model: None,
+            provider: Some("cloudflare".into()),
+            model_display_name: Some("GLM 5.2".into()),
+            reasoning_effort: Some("high".into()),
+            reasoning_efforts: Some(vec![
+                "low".into(),
+                "medium".into(),
+                "high".into(),
+                "max".into(),
+            ]),
+            full_access_allowed: false,
+            context: Some(ContextBreakdown {
+                context_window: 131_072,
+                output_reserve: 16_384,
+                system_tokens: 4_100,
+                tool_schema_tokens: 11_800,
+                tool_count: 23,
+                instruction_tokens: 2_300,
+                instruction_files: vec!["NEURON.md".into()],
+                conversation_tokens: 18_000,
+                tool_output_tokens: 6_200,
+                used_tokens: 42_400,
+                threshold_tokens: 91_750,
+            }),
+        }
+    }
+
+    /// The workspace's branches, as [`EngineCommand::ListBranches`] answers.
+    #[must_use]
+    pub fn branches() -> UiEvent {
+        let branch = |name: &str, upstream: Option<&str>, ahead: u64, at: u64| BranchInfo {
+            name: name.into(),
+            upstream: upstream.map(Into::into),
+            ahead: upstream.map(|_| ahead),
+            behind: upstream.map(|_| 0),
+            last_commit_ms: Some(at),
+        };
+        UiEvent::Branches {
+            current: Some("main".into()),
+            branches: vec![
+                branch("main", Some("origin/main"), 0, 1_793_404_800_000),
+                branch(
+                    "feat/tui-status-bar",
+                    Some("origin/feat/tui-status-bar"),
+                    2,
+                    1_793_300_000_000,
+                ),
+                branch("spike/old-idea", None, 0, 1_790_000_000_000),
+            ],
+            dirty: true,
         }
     }
 
@@ -270,6 +346,9 @@ pub mod samples {
             status: Some("available".into()),
             available_again_at: None,
             supports_images: Some(images),
+            provider: Some(if images { "gemini" } else { "cloudflare" }.into()),
+            reasoning_efforts: Some(vec!["low".into(), "medium".into(), "high".into()]),
+            supports_reasoning: Some(true),
         };
         UiEvent::Models {
             current: "glm-5.2".into(),
@@ -306,6 +385,13 @@ pub mod samples {
                 pricing_url: "https://zero-x.live/pricing".into(),
                 usage_updated_at: Some(1_792_800_000),
                 usage_error: None,
+                usage_window: Some(UsageWindow {
+                    tokens: Some(120_000),
+                    limit_tokens: Some(1_000_000),
+                    remaining_tokens: Some(880_000),
+                    resets_at: Some("2026-10-24T14:32:00Z".into()),
+                    window_seconds: Some(18_000),
+                }),
             }),
         }
     }

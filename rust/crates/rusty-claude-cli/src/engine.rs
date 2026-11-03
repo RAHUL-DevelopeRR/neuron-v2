@@ -41,6 +41,7 @@ use super::*;
 use crate::device_login::{DeviceCode, DeviceLoginObserver};
 use crate::engine_account::{self, SharedAccountCache};
 use crate::engine_reports;
+use crate::engine_status_bar::{self, PermissionChoice, StatusBarFields};
 use crate::engine_trust;
 use crate::error_detail::DetailedError;
 use crate::session_presence::{self, SessionPresence};
@@ -386,9 +387,16 @@ impl SignedOut<'_> {
                 | EngineCommand::Interrupt
                 | EngineCommand::Capabilities { .. }
                 | EngineCommand::Answer { .. } => {}
-                EngineCommand::Commit { .. } | EngineCommand::Rewind { .. } => {
+                EngineCommand::Commit { .. }
+                | EngineCommand::Rewind { .. }
+                | EngineCommand::SwitchBranch { .. } => {
                     self.fail("Sign in to Zero-X first: /login.");
                 }
+                EngineCommand::SetReasoningEffort { .. }
+                | EngineCommand::SetPermissionMode { .. } => {
+                    self.send(UiEvent::error("Sign in to Zero-X first: /login."));
+                }
+                EngineCommand::ListBranches => self.send(branches_event()),
                 EngineCommand::ListModels => self.send(UiEvent::Models {
                     current: shown_model(&self.options.model).to_string(),
                     models: Vec::new(),
@@ -465,6 +473,13 @@ impl SignedOut<'_> {
             &account,
             true,
             None,
+            StatusBarFields {
+                model: engine_status_bar::model_fields(&self.options.model),
+                reasoning_effort: self.options.reasoning_effort.clone(),
+                full_access_allowed: self.options.permission_mode
+                    == PermissionMode::DangerFullAccess,
+                context: None,
+            },
         ));
     }
 
@@ -550,6 +565,7 @@ fn status_event(
     account: &AccountState,
     sign_in_required: bool,
     served_model: Option<&str>,
+    bar: StatusBarFields,
 ) -> UiEvent {
     let cwd = env::current_dir().unwrap_or_default();
     let shown = shown_model(model);
@@ -570,6 +586,30 @@ fn status_event(
             .map(shown_model)
             .filter(|served| *served != shown)
             .map(ToString::to_string),
+        provider: bar.model.provider,
+        model_display_name: bar.model.display_name,
+        reasoning_effort: bar.reasoning_effort,
+        reasoning_efforts: bar.model.reasoning_efforts,
+        full_access_allowed: bar.full_access_allowed,
+        context: bar.context,
+    }
+}
+
+/// The workspace's local branches ([`UiEvent::Branches`]); none outside a repository.
+fn branches_event() -> UiEvent {
+    let cwd = env::current_dir().unwrap_or_default();
+    let repo = crate::source_control::Repo::discover(&cwd).ok().flatten();
+    let Some(repo) = repo else {
+        return UiEvent::Branches {
+            current: None,
+            branches: Vec::new(),
+            dirty: false,
+        };
+    };
+    UiEvent::Branches {
+        current: repo.branch(),
+        branches: repo.branches().unwrap_or_default(),
+        dirty: repo.has_tracked_changes().unwrap_or(false),
     }
 }
 
@@ -1205,6 +1245,9 @@ fn models_event(current_model: &str) -> UiEvent {
                     status: model.status.clone(),
                     available_again_at: model.available_again_at.clone(),
                     supports_images: model.supports_images,
+                    provider: model.provider.clone(),
+                    reasoning_efforts: model.reasoning_efforts.clone(),
+                    supports_reasoning: model.supports_reasoning,
                 })
                 .collect()
         })
@@ -1407,6 +1450,8 @@ struct Engine {
     presence: Option<SessionPresence>,
     /// The UI stopped listening.
     ui_closed: bool,
+    /// Full access may be picked from the status bar: the engine started with it.
+    full_access_allowed: bool,
 }
 
 impl Engine {
@@ -1417,6 +1462,7 @@ impl Engine {
         replies: Receiver<PermissionReply>,
         shared: &Arc<Shared>,
     ) -> Self {
+        let full_access_allowed = cli.permission_mode == PermissionMode::DangerFullAccess;
         let mut engine = Self {
             cli,
             output,
@@ -1429,6 +1475,7 @@ impl Engine {
             account_cache: SharedAccountCache::default(),
             presence: None,
             ui_closed: false,
+            full_access_allowed,
         };
         engine.open_checkpoints();
         engine
@@ -1565,8 +1612,177 @@ impl Engine {
                     .and_then(|mode| self.rewind(checkpoint, mode, dry_run));
                 self.finish_command(result);
             }
+            EngineCommand::SetReasoningEffort { effort } => {
+                match self.set_reasoning_effort(effort.as_deref()) {
+                    Ok(()) => self.send_status(),
+                    Err(message) => self.send(UiEvent::error(message)),
+                }
+            }
+            EngineCommand::SetPermissionMode { mode } => match self.set_permission_mode(&mode) {
+                Ok(()) => self.send_status(),
+                Err(message) => self.send(UiEvent::error(message)),
+            },
+            EngineCommand::ListBranches => self.send(branches_event()),
+            EngineCommand::SwitchBranch { name, create } => match self.switch_branch(&name, create)
+            {
+                Ok(report) => {
+                    self.notice(&report);
+                    self.send(branches_event());
+                    self.send_status();
+                }
+                Err(message) => self.send(UiEvent::error(message)),
+            },
         }
         Step::Continue
+    }
+
+    /// The thinking level of the next turns: one of the model's levels, or its default.
+    fn set_reasoning_effort(&mut self, effort: Option<&str>) -> Result<(), String> {
+        let fields = engine_status_bar::model_fields(&self.cli.model);
+        let effort = engine_status_bar::resolve_reasoning_effort(
+            effort,
+            fields.reasoning_efforts.as_deref(),
+        )?;
+        self.cli.set_reasoning_effort(effort);
+        Ok(())
+    }
+
+    /// The status bar's permission choice, without a notice: a mode (plan mode off), or
+    /// plan mode on or off.
+    fn set_permission_mode(&mut self, mode: &str) -> Result<(), String> {
+        let choice = engine_status_bar::parse_permission_choice(mode, self.full_access_allowed)?;
+        let wanted = match choice {
+            PermissionChoice::PlanOn => {
+                if !self.cli.plan_mode {
+                    self.cli.plan_mode = true;
+                    self.cli.permission_mode = plan_mode::enter_plan_mode(self.cli.permission_mode);
+                }
+                return Ok(());
+            }
+            PermissionChoice::PlanOff => {
+                if self.cli.plan_mode {
+                    self.cli.plan_mode = false;
+                    self.cli.plan_just_exited = true;
+                    self.cli.permission_mode = plan_mode::exit_plan_mode(self.cli.permission_mode);
+                }
+                return Ok(());
+            }
+            PermissionChoice::Mode(mode) => mode,
+        };
+        if self.cli.plan_mode {
+            // Leave plan mode first, so its saved mode is not restored over this one later.
+            self.cli.plan_mode = false;
+            self.cli.permission_mode = plan_mode::exit_plan_mode(self.cli.permission_mode);
+        }
+        if self.cli.permission_mode == wanted {
+            return Ok(());
+        }
+        self.cli.permission_mode = wanted;
+        let session = self.cli.runtime.session().clone();
+        let session_id = self.cli.session.id.clone();
+        self.rebuild_runtime(session, &session_id)
+            .map_err(|error| error.to_string())?;
+        self.persist();
+        Ok(())
+    }
+
+    /// Checks out a branch of the workspace's repository; refused while files have
+    /// uncommitted changes.
+    fn switch_branch(&mut self, name: &str, create: bool) -> Result<String, String> {
+        let repo = self.repository()?;
+        repo.switch_branch(name, create)
+    }
+
+    /// `/branch`: the local branches; `/branch <name>` switches, `/branch new <name>` (or
+    /// `-c <name>`) creates one. Refused while files have uncommitted changes.
+    fn branch_command(&mut self, args: &str) -> Result<(), String> {
+        let mut words = args.split_whitespace();
+        match (words.next(), words.next(), words.next()) {
+            (None, _, _) => {
+                let repo = self.repository()?;
+                let current = repo.branch();
+                let lines: Vec<String> = repo
+                    .branches()?
+                    .into_iter()
+                    .map(|branch| {
+                        let mark = if current.as_deref() == Some(branch.name.as_str()) {
+                            "* "
+                        } else {
+                            "  "
+                        };
+                        format!("{mark}{}", branch.name)
+                    })
+                    .collect();
+                self.notice(&format!(
+                    "Branches:
+{}
+/branch <name> switches; /branch new <name> creates one.",
+                    lines.join(
+                        "
+"
+                    )
+                ));
+                Ok(())
+            }
+            (Some("new" | "-c" | "--create"), Some(name), None) => {
+                let report = self.switch_branch(name, true)?;
+                self.notice(&report);
+                Ok(())
+            }
+            (Some(name), None, _) if !matches!(name, "new" | "-c" | "--create") => {
+                let report = self.switch_branch(name, false)?;
+                self.notice(&report);
+                Ok(())
+            }
+            _ => Err("Usage: /branch, /branch <name>, or /branch new <name>.".to_string()),
+        }
+    }
+
+    /// `/effort [level]`: shows the thinking level and the model's levels, or sets one.
+    fn effort_command(&mut self, args: &str) -> Result<(), String> {
+        let fields = engine_status_bar::model_fields(&self.cli.model);
+        if args.trim().is_empty() {
+            let current = self
+                .cli
+                .runtime
+                .api_client()
+                .reasoning_effort()
+                .unwrap_or("default")
+                .to_string();
+            let levels = match fields.reasoning_efforts.as_deref() {
+                Some([]) => "This model has no thinking levels.".to_string(),
+                Some(levels) => format!("Levels: {}, or default.", levels.join(", ")),
+                None => format!(
+                    "Levels: {}, or default.",
+                    engine_status_bar::DEFAULT_REASONING_EFFORTS.join(", ")
+                ),
+            };
+            self.notice(&format!(
+                "Thinking level: {current}. {levels} Usage: /effort <level>"
+            ));
+            return Ok(());
+        }
+        self.set_reasoning_effort(Some(args))?;
+        let now = self
+            .cli
+            .runtime
+            .api_client()
+            .reasoning_effort()
+            .unwrap_or("default (the model's own)")
+            .to_string();
+        self.notice(&format!("Thinking level: {now}."));
+        Ok(())
+    }
+
+    /// What fills the context window now.
+    fn context_breakdown(&self) -> neuron_tui::protocol::ContextBreakdown {
+        let runtime = &self.cli.runtime;
+        engine_status_bar::context_breakdown(
+            &runtime.context_snapshot(),
+            runtime.system_prompt(),
+            &runtime.session().messages,
+            runtime.api_client().tool_count(),
+        )
     }
 
     /// Ends a command: its error, if it failed, then `TurnFinished` and the footer.
@@ -1738,10 +1954,23 @@ impl Engine {
             return Step::Stop;
         }
         let result = match name {
+            "context" if self.shared.report_panels.load(Ordering::SeqCst) => {
+                crate::repl_loop::check_context_argument(args)
+                    .map(|()| {
+                        let report = engine_status_bar::context_report(
+                            &self.cli.model,
+                            &self.context_breakdown(),
+                        );
+                        self.show_report(report);
+                    })
+                    .map_err(Into::into)
+            }
             "context" => self
                 .cli
                 .context_command(args)
                 .map(|report| self.notice(&report)),
+            "effort" | "reasoning" => self.effort_command(args).map_err(Into::into),
+            "branch" => self.branch_command(args).map_err(Into::into),
             "diff" => self.diff(args).map_err(Into::into),
             "commit" if args.is_empty() => self.propose_commit().map_err(Into::into),
             "commit" => self.commit(args).map_err(Into::into),
@@ -1909,6 +2138,17 @@ impl Engine {
         // A session on the gateway needs the login; other providers do not.
         let sign_in_required = !self.account.signed_in
             && active_provider().is_some_and(|active| active.id == ProviderId::ZeroX);
+        let bar = StatusBarFields {
+            model: engine_status_bar::model_fields(&self.cli.model),
+            reasoning_effort: self
+                .cli
+                .runtime
+                .api_client()
+                .reasoning_effort()
+                .map(ToOwned::to_owned),
+            full_access_allowed: self.full_access_allowed,
+            context: Some(self.context_breakdown()),
+        };
         let status = status_event(
             &self.cli.model,
             self.cli.permission_mode,
@@ -1918,6 +2158,7 @@ impl Engine {
             &self.account,
             sign_in_required,
             self.cli.runtime.served_model(),
+            bar,
         );
         *lock(&self.shared.last_status) = Some(status.clone());
         self.send(status);

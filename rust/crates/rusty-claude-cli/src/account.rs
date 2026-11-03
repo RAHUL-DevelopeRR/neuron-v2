@@ -38,6 +38,36 @@ pub struct AccountSummary {
     pub current_period_end: Option<String>,
     pub cancel_at_period_end: bool,
     pub suspended: bool,
+    /// The plan's rolling token window (`usage_window`), when the gateway reports one.
+    pub usage_window: Option<UsageWindowSummary>,
+}
+
+/// `usage_window` of `GET /api/account`: tokens used in the plan's rolling window (Free:
+/// 1M tokens per 5 hours). The gateway's field names are read as the platform plans them
+/// (`tokens`, `limit_tokens`, `remaining_tokens`, `resets_at`, `window_seconds`); every
+/// part is optional.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct UsageWindowSummary {
+    pub tokens: Option<u64>,
+    pub limit_tokens: Option<u64>,
+    pub remaining_tokens: Option<u64>,
+    pub resets_at: Option<String>,
+    pub window_seconds: Option<u64>,
+}
+
+/// `usage_window`, when it is an object with anything in it.
+fn parse_usage_window(value: &Value) -> Option<UsageWindowSummary> {
+    let window = value
+        .get("usage_window")
+        .filter(|window| window.is_object())?;
+    let summary = UsageWindowSummary {
+        tokens: u64_field(window, "tokens").or_else(|| u64_field(window, "used_tokens")),
+        limit_tokens: u64_field(window, "limit_tokens"),
+        remaining_tokens: u64_field(window, "remaining_tokens"),
+        resets_at: string_field(window, "resets_at"),
+        window_seconds: u64_field(window, "window_seconds"),
+    };
+    (summary != UsageWindowSummary::default()).then_some(summary)
 }
 
 impl AccountSummary {
@@ -97,6 +127,7 @@ pub fn parse_account(value: &Value) -> AccountSummary {
             .and_then(|flags| flags.get("suspended"))
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        usage_window: parse_usage_window(value),
     }
 }
 

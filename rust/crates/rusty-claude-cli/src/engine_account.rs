@@ -10,7 +10,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
-use neuron_tui::protocol::{AccountDetails, ErrorDetail, UiEvent, UsageAmounts};
+use neuron_tui::protocol::{AccountDetails, ErrorDetail, UiEvent, UsageAmounts, UsageWindow};
 
 use crate::account::AccountSummary;
 use crate::auth::{CredentialSource, GatewayCredential};
@@ -92,6 +92,15 @@ fn account_details(
         pricing_url: crate::account::pricing_url(),
         usage_updated_at: cache.fetched_at,
         usage_error: cache.error.clone(),
+        usage_window: summary
+            .and_then(|summary| summary.usage_window.clone())
+            .map(|window| UsageWindow {
+                tokens: window.tokens,
+                limit_tokens: window.limit_tokens,
+                remaining_tokens: window.remaining_tokens,
+                resets_at: window.resets_at,
+                window_seconds: window.window_seconds,
+            }),
     }
 }
 
@@ -278,9 +287,39 @@ mod tests {
             "plan": {"id": "pro", "name": "Pro"},
             "limits": {"daily_requests": 2000, "daily_tokens": 10_000_000},
             "usage_today": {"requests": 37, "tokens": 120_431, "resets_at": "2026-10-24T00:00:00Z"},
+            "usage_window": {"tokens": 120_000, "limit_tokens": 1_000_000, "remaining_tokens": 880_000, "resets_at": "2026-10-23T14:32:00Z", "window_seconds": 18_000},
             "credits": {"balance_usd": 7.42},
             "flags": {"suspended": false}
         }))
+    }
+
+    #[test]
+    fn the_five_hour_window_reaches_the_ui_and_is_left_out_when_not_sent() {
+        let cache = AccountCache {
+            summary: Some(summary()),
+            fetched_at: Some(100),
+            ..AccountCache::default()
+        };
+        let details = account_details(&credential(), &cache, None);
+        assert_eq!(
+            details.usage_window,
+            Some(UsageWindow {
+                tokens: Some(120_000),
+                limit_tokens: Some(1_000_000),
+                remaining_tokens: Some(880_000),
+                resets_at: Some("2026-10-23T14:32:00Z".into()),
+                window_seconds: Some(18_000),
+            })
+        );
+        let without = crate::account::parse_account(&serde_json::json!({
+            "plan": {"id": "free"},
+            "usage_window": {}
+        }));
+        assert_eq!(without.usage_window, None);
+        let used = crate::account::parse_account(&serde_json::json!({
+            "usage_window": {"used_tokens": 5, "limit_tokens": 10}
+        }));
+        assert_eq!(used.usage_window.and_then(|window| window.tokens), Some(5));
     }
 
     #[test]
