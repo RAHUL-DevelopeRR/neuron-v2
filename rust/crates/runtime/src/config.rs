@@ -1516,6 +1516,48 @@ fn parse_optional_oauth_config(
     }))
 }
 
+/// Expand `${VAR}` references and a leading `~` in a stdio MCP server's
+/// `command` or argument, as a shell would before `execve`. Without this a
+/// config such as `"command": "~/bin/server"` or `"args": ["${HOME}/data"]`
+/// fails with a bare "No such file or directory".
+///
+/// A `${VAR}` that is not set (or not valid Unicode) is kept as written, so
+/// the failure names it. A bare `$` passes through. `~` is expanded only as
+/// the whole value or before a path separator, from `HOME`, else
+/// `USERPROFILE`.
+///
+/// Adapted from Claw Code (MIT), upstream commit 7c4bcd9.
+fn expand_mcp_config_value(value: &str) -> String {
+    expand_mcp_config_value_with(value, |name| std::env::var(name).ok())
+}
+
+fn expand_mcp_config_value_with(value: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+    let mut result = String::with_capacity(value.len());
+    let mut rest = value;
+    if rest == "~" || rest.starts_with("~/") || rest.starts_with("~\\") {
+        if let Some(home) = lookup("HOME").or_else(|| lookup("USERPROFILE")) {
+            result.push_str(&home);
+            rest = &rest[1..];
+        }
+    }
+    while let Some(start) = rest.find("${") {
+        result.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            result.push_str(&rest[start..]);
+            return result;
+        };
+        let name = &after[..end];
+        match (!name.is_empty()).then(|| lookup(name)).flatten() {
+            Some(found) => result.push_str(&found),
+            None => result.push_str(&rest[start..=start + 2 + end]),
+        }
+        rest = &after[end + 1..];
+    }
+    result.push_str(rest);
+    result
+}
+
 fn parse_mcp_server_config(
     server_name: &str,
     value: &JsonValue,
@@ -1526,8 +1568,12 @@ fn parse_mcp_server_config(
         optional_string(object, "type", context)?.unwrap_or_else(|| infer_mcp_server_type(object));
     match server_type {
         "stdio" => Ok(McpServerConfig::Stdio(McpStdioServerConfig {
-            command: expect_string(object, "command", context)?.to_string(),
-            args: optional_string_array(object, "args", context)?.unwrap_or_default(),
+            command: expand_mcp_config_value(expect_string(object, "command", context)?),
+            args: optional_string_array(object, "args", context)?
+                .unwrap_or_default()
+                .iter()
+                .map(|arg| expand_mcp_config_value(arg))
+                .collect(),
             env: optional_string_map(object, "env", context)?.unwrap_or_default(),
             tool_call_timeout_ms: optional_u64(object, "toolCallTimeoutMs", context)?,
         })),
@@ -2523,6 +2569,73 @@ mod tests {
         assert_eq!(oauth.client_id, "runtime-client");
         assert_eq!(oauth.callback_port, Some(54_545));
         assert_eq!(oauth.scopes, vec!["org:read", "user:write"]);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    // Adapted from Claw Code (MIT), upstream commit 7c4bcd9.
+    #[test]
+    fn expands_env_references_and_home_in_stdio_mcp_values() {
+        let lookup = |name: &str| match name {
+            "HOME" => Some("/home/dev".to_string()),
+            "DATA_DIR" => Some("/srv/data".to_string()),
+            _ => None,
+        };
+        let expand = |value: &str| super::expand_mcp_config_value_with(value, lookup);
+
+        assert_eq!(expand("~/bin/server"), "/home/dev/bin/server");
+        assert_eq!(expand("~"), "/home/dev");
+        assert_eq!(expand("--root=${DATA_DIR}/x"), "--root=/srv/data/x");
+        assert_eq!(expand("${HOME}:${DATA_DIR}"), "/home/dev:/srv/data");
+        // Unset variables stay as written so the failure names them.
+        assert_eq!(expand("${NOT_SET}/x"), "${NOT_SET}/x");
+        // Only a leading `~` before a separator is a home reference.
+        assert_eq!(expand("~user/x"), "~user/x");
+        assert_eq!(expand("a~/b"), "a~/b");
+        // Bare `$`, empty and unterminated references pass through.
+        assert_eq!(expand("cost $5"), "cost $5");
+        assert_eq!(expand("${}"), "${}");
+        assert_eq!(expand("x${OPEN"), "x${OPEN");
+
+        let windows_lookup =
+            |name: &str| (name == "USERPROFILE").then(|| r"C:\Users\dev".to_string());
+        assert_eq!(
+            super::expand_mcp_config_value_with(r"~\tools\srv.exe", windows_lookup),
+            r"C:\Users\dev\tools\srv.exe"
+        );
+    }
+
+    #[test]
+    fn stdio_mcp_command_and_args_expand_from_the_environment() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        let var = "NEURON_TEST_MCP_EXPAND_DIR";
+        std::env::set_var(var, "/opt/mcp");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"mcpServers": {"tools": {
+                "command": "${NEURON_TEST_MCP_EXPAND_DIR}/server",
+                "args": ["--data", "${NEURON_TEST_MCP_EXPAND_DIR}/data", "${NEURON_TEST_MCP_UNSET}"]
+            }}}"#,
+        )
+        .expect("write user settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home).load();
+        std::env::remove_var(var);
+        let loaded = loaded.expect("config should load");
+
+        let McpServerConfig::Stdio(stdio) = &loaded.mcp().get("tools").expect("server").config
+        else {
+            panic!("expected a stdio server");
+        };
+        assert_eq!(stdio.command, "/opt/mcp/server");
+        assert_eq!(
+            stdio.args,
+            vec!["--data", "/opt/mcp/data", "${NEURON_TEST_MCP_UNSET}"]
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
