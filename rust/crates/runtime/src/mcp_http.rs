@@ -50,6 +50,7 @@ pub(crate) fn initialize_params_json() -> Value {
 
 /// A started MCP server: a child process (stdio) or a remote endpoint.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // one per server; the process is the common case
 pub(crate) enum McpConnection {
     Stdio(McpStdioProcess),
     Remote(Box<McpRemoteConnection>),
@@ -698,14 +699,11 @@ impl McpRemoteConnection {
             return Err(invalid_data("the event stream is gone"));
         };
         loop {
-            let event = match stream.reader.next_event().await? {
-                Some(event) => event,
-                None => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "the event stream closed before the response",
-                    ))
-                }
+            let Some(event) = stream.reader.next_event().await? else {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "the event stream closed before the response",
+                ));
             };
             if !matches!(event.event.as_deref(), None | Some("message")) || event.data.is_empty() {
                 continue;
