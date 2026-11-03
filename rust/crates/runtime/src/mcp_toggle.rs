@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
-use crate::config::ConfigLoader;
+use crate::config::{is_workspace_entry, ConfigLoader};
 
 /// What [`set_mcp_server_enabled`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,9 +104,13 @@ pub fn set_mcp_server_enabled(
         write_object(&settings_path, &object)?;
     }
     let still_disabled_by = if enabled {
+        // An untrusted workspace's `disabledMcpServers` is dropped when loading,
+        // so only the files the loader applies can keep the server off.
+        let workspace_trusted = loader.workspace_is_trusted();
         loader
             .discover()
             .into_iter()
+            .filter(|entry| workspace_trusted || !is_workspace_entry(entry))
             .map(|entry| entry.path)
             .filter(|path| *path != settings_path)
             .filter(|path| {
@@ -205,6 +209,36 @@ mod tests {
         let outcome = set_mcp_server_enabled(&loader, "b", true).unwrap();
         assert!(!outcome.changed);
         assert_eq!(outcome.still_disabled_by.len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_untrusted_workspace_file_does_not_count_as_still_disabling() {
+        let root = temp_root();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".neuron");
+        fs::create_dir_all(cwd.join(".neuron")).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("settings.json"),
+            r#"{"defaultMcpServers":false,"mcpServers":{"b":{"command":"b"}},"disabledMcpServers":["b"]}"#,
+        )
+        .unwrap();
+        fs::write(
+            cwd.join(".neuron").join("settings.json"),
+            r#"{"disabledMcpServers":["b"]}"#,
+        )
+        .unwrap();
+        let loader = ConfigLoader::new(&cwd, &home).with_project_trust(ProjectTrust::Untrusted);
+
+        let outcome = set_mcp_server_enabled(&loader, "b", true).unwrap();
+        assert!(outcome.changed);
+        assert!(
+            outcome.still_disabled_by.is_empty(),
+            "the untrusted project file is not applied: {:?}",
+            outcome.still_disabled_by
+        );
+        assert!(loader.load().unwrap().mcp().get("b").is_some());
         let _ = fs::remove_dir_all(root);
     }
 }

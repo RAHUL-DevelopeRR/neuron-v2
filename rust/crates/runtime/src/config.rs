@@ -684,7 +684,7 @@ impl ConfigLoader {
 /// Settings files that come from the workspace: the `Project` and `Local`
 /// sources, plus a `User` entry whose path is relative because no home
 /// directory could be resolved (it then lives in the working directory).
-fn is_workspace_entry(entry: &ConfigEntry) -> bool {
+pub(crate) fn is_workspace_entry(entry: &ConfigEntry) -> bool {
     matches!(entry.source, ConfigSource::Project | ConfigSource::Local) || !entry.path.is_absolute()
 }
 
