@@ -18,7 +18,9 @@ the `neuron` binary), the Python porting workspace under src/ and tests/, and
 the parity documents were imported from Claw Code and have since been modified.
 The Claw Code copyright and permission notice is reproduced in LICENSE and must
 be kept in all copies or substantial portions of the software. See
-docs/PROVENANCE.md for the code lineage.
+docs/PROVENANCE.md for the code lineage. Fixes ported from later Claw Code
+commits (fork point about 00d0eb6, reviewed up to 51cfca1) are listed with their
+upstream commit SHAs under "Later ports from Claw Code" in docs/PROVENANCE.md.
 
 Full-screen UI (neuron-tui)
 ---------------------------
