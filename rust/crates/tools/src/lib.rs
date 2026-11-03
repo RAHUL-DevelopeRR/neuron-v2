@@ -5393,7 +5393,7 @@ mod subagent_inheritance_tests {
         let result = wait_for_agent(
             running,
             &done_rx,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             Some(&parent),
             &child,
         );

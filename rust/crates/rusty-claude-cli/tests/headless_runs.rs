@@ -295,7 +295,7 @@ fn a_silent_stdin_pipe_does_not_hang_the_run() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(0), "{stderr}");
-    assert!(started.elapsed() < Duration::from_secs(60));
+    assert!(started.elapsed() < Duration::from_mins(1));
     let notes = json_lines(&stderr);
     assert!(
         notes.iter().any(|line| line["type"] == "notice"

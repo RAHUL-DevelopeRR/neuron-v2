@@ -44,10 +44,10 @@ pub const CREDENTIAL_ENV_SUFFIXES: &[&str] = &["API_KEY", "TOKEN", "SECRET"];
 pub const CREDENTIAL_VALUE_PREFIXES: &[&str] = &["ses_", "nzx_"];
 
 /// Default timeout for hook commands.
-pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(60);
+pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Default timeout for plugin tool commands.
-pub const DEFAULT_PLUGIN_TOOL_TIMEOUT: Duration = Duration::from_secs(120);
+pub const DEFAULT_PLUGIN_TOOL_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// Maximum bytes captured per output stream; the remainder is drained and dropped.
 pub const MAX_CAPTURED_BYTES: usize = 8 * 1024 * 1024;
@@ -731,7 +731,7 @@ mod tests {
             "i=0; while [ $i -lt 3000 ]; do echo stdout-line-$i; echo stderr-line-$i >&2; i=$((i+1)); done"
         };
         let mut command = shell(script);
-        let output = run_bounded(&mut command, None, Some(Duration::from_secs(60)), &|| false)
+        let output = run_bounded(&mut command, None, Some(Duration::from_mins(1)), &|| false)
             .expect("child should run");
         assert_eq!(output.termination, Termination::Exited);
         assert!(output.stdout.len() > 30_000);
@@ -868,7 +868,7 @@ mod tests {
             .stdout(std::process::Stdio::null())
             .spawn()
             .expect("the shell starts");
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_mins(1);
         let grandchild = loop {
             if let Some(pid) = std::fs::read_to_string(&pid_file)
                 .ok()
