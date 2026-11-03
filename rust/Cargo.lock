@@ -1663,7 +1663,7 @@ dependencies = [
 
 [[package]]
 name = "redact"
-version = "7.0.0-alpha.2"
+version = "7.0.0-alpha.3"
 dependencies = [
  "regex",
  "serde_json",
@@ -2823,7 +2823,7 @@ checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
 
 [[package]]
 name = "winjob"
-version = "7.0.0-alpha.2"
+version = "7.0.0-alpha.3"
 dependencies = [
  "windows-sys 0.59.0",
 ]
