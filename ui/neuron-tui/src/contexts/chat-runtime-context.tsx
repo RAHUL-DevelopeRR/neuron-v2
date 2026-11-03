@@ -1,4 +1,5 @@
-// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: a commit
+// card or rewind picker that waits for the user holds the message queue.
 // See ui/neuron-tui/PORTING.md.
 import {
   createContext,
@@ -17,6 +18,7 @@ import {
 } from '../hooks/use-message-queue'
 import { useSendMessage } from '../hooks/use-send-message'
 import { useChatStore } from '../state/chat-store'
+import { useGitViewsStore } from '../state/git-views-store'
 import {
   applyActiveRunQueuePolicy,
   registerActiveRunStopHandler,
@@ -105,6 +107,12 @@ export const ChatRuntimeProvider = ({
     }
   }, [askUserState, mainAgentTimer])
 
+  // A commit card or the rewind picker is up (or a rewind runs): a queued
+  // prompt run now would change the files the commit takes, or the turns
+  // the rewind takes out. The queue waits until it closes.
+  const gitPanelHoldsQueue = useGitViewsStore(
+    (state) => state.proposal !== null || state.rewind !== null,
+  )
   const queue = useMessageQueue(
     (message) =>
       sendMessageRef.current?.({
@@ -114,6 +122,7 @@ export const ChatRuntimeProvider = ({
       }) ?? Promise.resolve(),
     isChainInProgressRef,
     activeAgentStreamsRef,
+    { sendBlocked: gitPanelHoldsQueue },
   )
 
   // The module-level stop entry point keeps this callback for the runtime's

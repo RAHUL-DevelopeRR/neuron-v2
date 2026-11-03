@@ -10,6 +10,13 @@
 import path from 'path'
 
 import type { Attachment } from './protocol'
+
+/**
+ * Whether an image reaches the model. Not yet: the engine only lists an image's
+ * path. Until it sends images (to models whose catalog entry supports them),
+ * nothing offers to attach one: no /image in the menu or /help.
+ */
+export const IMAGES_REACH_THE_MODEL = false
 import type { PendingAttachment } from '../types/store'
 
 const IMAGE_TYPES: Record<string, string> = {

@@ -19,7 +19,8 @@
     "types": ["bun"],
     "baseUrl": ".",
     "paths": {
-      "@neuron-tui/common/*": ["./src/vendor/common/*"]
+      "@neuron-tui/common/*": ["./src/vendor/common/*"],
+      "@neuron/client/*": ["../neuron-client/src/*"]
     }
   },
   "include": ["src/**/*", "scripts/**/*.ts", "test/**/*.ts"],

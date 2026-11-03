@@ -561,6 +561,39 @@ mod tests {
     }
 
     #[test]
+    fn settings_examples_in_the_docs_validate_cleanly() {
+        // People copy these blocks into settings.json, so they must load without
+        // errors or deprecation warnings.
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let mut checked = 0;
+        for doc in ["README.md", "USAGE.md"] {
+            let text = std::fs::read_to_string(repo.join(doc)).expect("doc should be readable");
+            let mut lines = text.lines();
+            while let Some(line) = lines.next() {
+                if line.trim() != "```json" {
+                    continue;
+                }
+                let source = lines
+                    .by_ref()
+                    .take_while(|line| line.trim() != "```")
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let parsed = JsonValue::parse(&source)
+                    .unwrap_or_else(|error| panic!("{doc}: invalid JSON ({error}): {source}"));
+                let object = parsed.as_object().expect("settings are an object");
+                let result = validate_config_file(object, &source, Path::new(doc));
+                assert!(result.errors.is_empty(), "{doc}: {source}\n{result:?}");
+                assert!(result.warnings.is_empty(), "{doc}: {source}\n{result:?}");
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 2,
+            "expected settings examples in README.md and USAGE.md"
+        );
+    }
+
+    #[test]
     fn detects_unknown_top_level_key() {
         // given
         let source = r#"{"model": "opus", "unknownField": true}"#;

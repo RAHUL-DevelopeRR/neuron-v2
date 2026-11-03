@@ -1,0 +1,9 @@
+{
+  "id": "py-timeout-units",
+  "summary": "A symptom-only report whose cause is a unit mix-up in a different file from the setting.",
+  "tags": ["python", "bugfix", "context"],
+  "prompt": "Users report that HTTP requests from this app time out after 30 milliseconds instead of 30 seconds. Find the cause and fix it. Keep configuration values in seconds, as they are documented.",
+  "allow": ["bash(python -m unittest:*)", "bash(python -m pytest:*)"],
+  "grader": {"from": "grader", "to": "_grader"},
+  "check": "python -m unittest discover -s _grader -q"
+}

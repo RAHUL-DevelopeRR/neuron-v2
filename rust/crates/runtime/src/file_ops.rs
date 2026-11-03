@@ -4,7 +4,7 @@ use std::cmp::Reverse;
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
 use glob::Pattern;
@@ -176,6 +176,15 @@ pub struct EditFileOutput {
     /// Whether the diff was cut to stay compact.
     #[serde(rename = "diffTruncated")]
     pub diff_truncated: bool,
+    /// Set when `old_string` matched only after ignoring trailing whitespace
+    /// (`trailing_whitespace`) or indentation (`indentation`, the replacement
+    /// re-indented to the file's), so the model learns to copy text exactly.
+    #[serde(
+        rename = "matchStrategy",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub match_strategy: Option<String>,
 }
 
 /// Result of a glob-based filename search.
@@ -312,7 +321,54 @@ pub fn read_file(
     })
 }
 
-/// Replaces a file's contents and returns a compact summary.
+/// Existing files at least this long are checked for cut-off rewrites.
+const TRUNCATED_WRITE_MIN_LINES: usize = 30;
+/// A rewrite shorter than this share of the existing lines may be cut off.
+const TRUNCATED_WRITE_RATIO_PERCENT: usize = 60;
+
+/// Lines like `// ... existing code ...` or `# rest of the file unchanged`: a
+/// model eliding code it meant to keep. Written into a file they delete it.
+const PLACEHOLDER_PATTERN: &str = r"(?im)^\s*(?://+|#+|/\*+|\*|<!--|--|;+)?\s*(?:\.{3}|\x{2026})\s*\(?\s*(?:existing|rest|remaining|unchanged|previous|other|same|keep|omitted)\b|^\s*(?://+|#+|/\*+|<!--|--)\s*(?:the\s+)?(?:rest\s+of\s+(?:the\s+)?(?:code|file|implementation|function|class|module|content)|(?:existing|remaining)\s+(?:code|implementation|methods|functions|content))\b.*\b(?:here|unchanged|remains|stays|as\s+before|omitted|goes\s+here)\b";
+
+fn contains_placeholder(text: &str) -> bool {
+    RegexBuilder::new(PLACEHOLDER_PATTERN)
+        .build()
+        .is_ok_and(|pattern| pattern.is_match(text))
+}
+
+/// `(`/`)`, `[`/`]` and `{`/`}` counted over the whole text: zero when every
+/// opener has a closer (strings and comments are not told apart, which is
+/// fine for comparing two versions of the same file).
+fn bracket_imbalance(text: &str) -> i64 {
+    text.chars().fold(0, |depth, ch| match ch {
+        '(' | '[' | '{' => depth + 1,
+        ')' | ']' | '}' => depth - 1,
+        _ => depth,
+    })
+}
+
+/// Why a rewrite of `previous` with `content` looks like a mistake, if it does:
+/// it adds a placeholder that would delete the elided code, or it is much
+/// shorter than the file and its brackets no longer balance (cut off).
+fn suspicious_rewrite(previous: &str, content: &str) -> Option<String> {
+    if contains_placeholder(content) && !contains_placeholder(previous) {
+        return Some("write_file refused: the content contains a placeholder such as `// ... existing code ...`. write_file replaces the whole file, so the elided code would be deleted. Write the complete content, or use edit_file to change part of the file.".to_string());
+    }
+    let old_lines = previous.lines().count();
+    let new_lines = content.lines().count();
+    if old_lines >= TRUNCATED_WRITE_MIN_LINES
+        && new_lines * 100 < old_lines * TRUNCATED_WRITE_RATIO_PERCENT
+        && bracket_imbalance(previous) == 0
+        && bracket_imbalance(content) != 0
+    {
+        return Some(format!("write_file refused: the new content ({new_lines} lines) is much shorter than the existing file ({old_lines} lines) and its brackets do not balance, so it looks cut off. Write the complete file, or use edit_file to change part of it."));
+    }
+    None
+}
+
+/// Replaces a file's contents and returns a compact summary. A rewrite that
+/// looks like a mistake (an elision placeholder, or a cut-off file) is refused
+/// with the reason, so the model can fix it instead of losing code.
 pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
     if content.len() > MAX_WRITE_SIZE {
         return Err(io::Error::new(
@@ -327,6 +383,13 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
 
     let absolute_path = normalize_path_allow_missing(path)?;
     let existed = absolute_path.is_file();
+    if existed {
+        if let Ok(previous) = fs::read_to_string(&absolute_path) {
+            if let Some(reason) = suspicious_rewrite(&previous, content) {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
+            }
+        }
+    }
     if let Some(parent) = absolute_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -398,6 +461,147 @@ fn line_number_at(text: &str, offset: usize) -> usize {
     text[..offset].matches('\n').count() + 1
 }
 
+/// How `edit_file` found `old_string` when it was not in the file verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LooseMatch {
+    /// Lines equal once trailing whitespace is ignored.
+    TrailingWhitespace,
+    /// Lines equal once leading and trailing whitespace is ignored; the
+    /// replacement is re-indented to the file's indentation.
+    Indentation,
+}
+
+impl LooseMatch {
+    fn label(self) -> &'static str {
+        match self {
+            Self::TrailingWhitespace => "trailing_whitespace",
+            Self::Indentation => "indentation",
+        }
+    }
+
+    fn normalize(self, line: &str) -> &str {
+        match self {
+            Self::TrailingWhitespace => line.trim_end(),
+            Self::Indentation => line.trim(),
+        }
+    }
+}
+
+/// `old_string` as lines (CRLF-insensitive), and whether it ends with a break.
+fn needle_lines(needle: &str) -> (Vec<String>, bool) {
+    let normalized = needle.replace("\r\n", "\n");
+    let ends_with_break = normalized.ends_with('\n');
+    let body = normalized.strip_suffix('\n').unwrap_or(&normalized);
+    (
+        body.split('\n').map(ToOwned::to_owned).collect(),
+        ends_with_break,
+    )
+}
+
+/// Byte ranges of `needle` in `haystack` compared line by line under `mode`
+/// (whole lines; the last line's break is included only when the needle ends
+/// with one). Matches do not overlap.
+fn loose_matches(haystack: &str, needle: &str, mode: LooseMatch) -> Vec<(usize, usize)> {
+    let (wanted, ends_with_break) = needle_lines(needle);
+    if wanted.iter().all(|line| line.trim().is_empty()) {
+        return Vec::new();
+    }
+    let mut starts = Vec::new();
+    let mut lines = Vec::new();
+    let mut offset = 0;
+    for line in haystack.split_inclusive('\n') {
+        starts.push(offset);
+        lines.push(line);
+        offset += line.len();
+    }
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index + wanted.len() <= lines.len() {
+        let matched = wanted.iter().enumerate().all(|(position, line)| {
+            mode.normalize(strip_line_break(lines[index + position])) == mode.normalize(line)
+        });
+        if matched {
+            let last = index + wanted.len() - 1;
+            let end = if ends_with_break {
+                starts[last] + lines[last].len()
+            } else {
+                starts[last] + strip_line_break(lines[last]).len()
+            };
+            ranges.push((starts[index], end));
+            index += wanted.len();
+        } else {
+            index += 1;
+        }
+    }
+    ranges
+}
+
+fn leading_whitespace(line: &str) -> &str {
+    &line[..line.len() - line.trim_start().len()]
+}
+
+/// `replacement` moved from the indentation `old_string` used to the one the
+/// file has at the match (`matched`): each line starting with the old
+/// indentation gets the file's instead.
+fn reindent(replacement: &str, old_string: &str, matched: &str) -> String {
+    let first_line = |text: &str| {
+        text.lines()
+            .find(|line| !line.trim().is_empty())
+            .map(leading_whitespace)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let (from, to) = (first_line(old_string), first_line(matched));
+    if from == to {
+        return replacement.to_string();
+    }
+    replacement
+        .split_inclusive('\n')
+        .map(|line| {
+            if line.trim().is_empty() {
+                line.to_string()
+            } else if let Some(rest) = line.strip_prefix(from.as_str()) {
+                format!("{to}{rest}")
+            } else if from.is_empty() {
+                format!("{to}{line}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect()
+}
+
+/// Line numbers of file lines equal (ignoring surrounding whitespace) to the
+/// first non-blank line of `old_string`: where the model probably meant.
+fn likely_match_lines(haystack: &str, needle: &str) -> Vec<usize> {
+    let Some(first) = needle.lines().map(str::trim).find(|line| !line.is_empty()) else {
+        return Vec::new();
+    };
+    haystack
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.trim() == first)
+        .map(|(index, _)| index + 1)
+        .take(5)
+        .collect()
+}
+
+fn not_found_error(haystack: &str, needle: &str) -> io::Error {
+    let lines = likely_match_lines(haystack, needle);
+    let hint = if lines.is_empty() {
+        "Re-read the file with read_file and copy the current text exactly.".to_string()
+    } else {
+        format!(
+            "Its first line appears at line {}, but the following lines differ. Re-read that part of the file with read_file and copy the current text exactly.",
+            lines.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+        )
+    };
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("old_string not found in file, even ignoring whitespace and indentation. {hint}"),
+    )
+}
+
 /// Performs an in-file string replacement and returns a compact diff.
 ///
 /// `old_string` written with `\n` line breaks also matches a CRLF file, and
@@ -405,6 +609,7 @@ fn line_number_at(text: &str, offset: usize) -> usize {
 /// `old_string` occurs more than once and `replace_all` is false the edit is
 /// refused with the match count and line numbers, instead of silently
 /// changing the first occurrence.
+#[allow(clippy::too_many_lines)]
 pub fn edit_file(
     path: &str,
     old_string: &str,
@@ -426,8 +631,17 @@ pub fn edit_file(
         ));
     }
 
+    if contains_placeholder(new_string) && !contains_placeholder(old_string) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "edit_file refused: new_string contains a placeholder such as `// ... existing code ...`, which would replace real code with the placeholder. Put the actual code in new_string, or make old_string cover only the part you change.",
+        ));
+    }
+
     let line_ending = LineEnding::detect(&original_file);
-    let (needle, mut offsets) = {
+    let mut loose = None;
+    let mut new_string = new_string.to_string();
+    let (needle, offsets) = {
         let exact = match_offsets(&original_file, old_string);
         let adapted = line_ending.apply(old_string);
         if exact.is_empty() && adapted != old_string {
@@ -437,12 +651,61 @@ pub fn edit_file(
             (old_string.to_string(), exact)
         }
     };
-    if offsets.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "old_string not found in file (check whitespace and indentation, or re-read the file)",
-        ));
-    }
+    let (needle, mut offsets) = if offsets.is_empty() {
+        // Weaker models often get whitespace or indentation slightly wrong:
+        // accept a unique line-by-line match and say so in the result.
+        let mut found = None;
+        for mode in [LooseMatch::TrailingWhitespace, LooseMatch::Indentation] {
+            let ranges = loose_matches(&original_file, old_string, mode);
+            match ranges.len() {
+                0 => {}
+                1 => {
+                    found = Some((mode, ranges[0]));
+                    break;
+                }
+                count => {
+                    let lines = ranges
+                        .iter()
+                        .take(MAX_REPORTED_MATCH_LINES)
+                        .map(|(start, _)| line_number_at(&original_file, *start).to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "old_string is not in the file verbatim, and ignoring {} it matches {count} places (lines {lines}); copy the exact text with more surrounding context",
+                            if mode == LooseMatch::Indentation { "indentation" } else { "trailing whitespace" }
+                        ),
+                    ));
+                }
+            }
+        }
+        let Some((mode, (start, end))) = found else {
+            // Weaker models sometimes escape the JSON twice, so `old_string` arrives
+            // with `\n` as two characters: retry once with the escapes undone.
+            if let Some((old_unescaped, new_unescaped)) = unescaped_edit(old_string, &new_string) {
+                return edit_file(path, &old_unescaped, &new_unescaped, replace_all).map(
+                    |mut output| {
+                        output.match_strategy = Some(match output.match_strategy.take() {
+                            Some(strategy) => format!("unescaped, {strategy}"),
+                            None => "unescaped".to_string(),
+                        });
+                        output
+                    },
+                );
+            }
+            return Err(not_found_error(&original_file, old_string));
+        };
+        let matched = original_file[start..end].to_string();
+        if mode == LooseMatch::Indentation {
+            new_string = reindent(&new_string, old_string, &matched);
+        }
+        loose = Some(mode);
+        (matched, vec![start])
+    } else {
+        (needle, offsets)
+    };
+    let new_string = new_string.as_str();
     if offsets.len() > 1 && !replace_all {
         let lines = offsets
             .iter()
@@ -493,6 +756,7 @@ pub fn edit_file(
         diff,
         structured_patch,
         diff_truncated,
+        match_strategy: loose.map(|mode| mode.label().to_string()),
     })
 }
 
@@ -960,7 +1224,87 @@ fn normalize_path(path: &str) -> io::Result<PathBuf> {
     } else {
         std::env::current_dir()?.join(path)
     };
-    candidate.canonicalize()
+    match candidate.canonicalize() {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => std::env::current_dir()
+            .ok()
+            .and_then(|cwd| recover_mistyped_path(&candidate, &cwd))
+            .ok_or(error),
+        result => result,
+    }
+}
+
+/// The workspace file a model meant when it mistyped a long absolute path, such
+/// as a session directory with a few characters dropped: `path` shares most of
+/// its leading directories with `cwd`, and the longest trailing part of it that
+/// exists under `cwd` names a file. Only files under `cwd` are returned. The
+/// tools report the corrected path in their result.
+fn recover_mistyped_path(path: &Path, cwd: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let cwd = cwd.canonicalize().ok()?;
+    let names = |path: &Path| {
+        path.components()
+            .filter_map(|component| match component {
+                Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let wanted = names(path);
+    let base = names(&cwd);
+    let shared = wanted
+        .iter()
+        .zip(&base)
+        .take_while(|(left, right)| left.eq_ignore_ascii_case(right))
+        .count();
+    if base.is_empty() || shared * 2 < base.len() {
+        return None;
+    }
+    (shared..wanted.len())
+        .map(|start| cwd.join(wanted[start..].iter().collect::<PathBuf>()))
+        .find(|candidate| candidate.is_file())
+        .and_then(|found| found.canonicalize().ok())
+        .filter(|found| found.starts_with(&cwd))
+}
+
+/// `old_string` and `new_string` with JSON escapes undone, when `old_string` looks
+/// escaped twice: no real line break but a `\n` written as two characters.
+/// `new_string` is unescaped only when it has no real line breaks either.
+fn unescaped_edit(old_string: &str, new_string: &str) -> Option<(String, String)> {
+    if old_string.contains('\n') || !old_string.contains("\\n") {
+        return None;
+    }
+    let new_string = if new_string.contains('\n') {
+        new_string.to_string()
+    } else {
+        unescape_json_text(new_string)
+    };
+    Some((unescape_json_text(old_string), new_string))
+}
+
+/// `\n`, `\t`, `\r`, `\"` and `\\` written as two characters, as the characters.
+fn unescape_json_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('"') => out.push('"'),
+            Some(other) if other != '\\' => {
+                out.push('\\');
+                out.push(other);
+            }
+            Some(_) | None => out.push('\\'),
+        }
+    }
+    out
 }
 
 fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
@@ -1080,6 +1424,7 @@ fn expand_braces(pattern: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
@@ -1088,12 +1433,230 @@ mod tests {
         GrepSearchInput, MAX_WRITE_SIZE,
     };
 
+    #[test]
+    fn an_edit_escaped_twice_is_applied_with_the_escapes_undone() {
+        let path = temp_path("unescape.py");
+        std::fs::write(&path, "def f():\n    return \"a\"\n").expect("write");
+        // As a model that escaped its JSON twice sends it: `\n` and `\"` as text.
+        let output = edit_file(
+            path.to_string_lossy().as_ref(),
+            r#"def f():\n    return \"a\""#,
+            r#"def f():\n    return \"b\""#,
+            false,
+        )
+        .expect("unescaped match");
+        assert_eq!(output.match_strategy.as_deref(), Some("unescaped"));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "def f():\n    return \"b\"\n"
+        );
+        assert!(
+            super::unescaped_edit("a\nb", "c").is_none(),
+            "real line breaks: not escaped"
+        );
+        assert!(super::unescaped_edit("plain", "c").is_none());
+    }
+
+    #[test]
+    fn a_mistyped_workspace_path_is_recovered_inside_the_workspace() {
+        let root = temp_path("recover-ws")
+            .join("session-1234-abcd")
+            .join("project");
+        std::fs::create_dir_all(root.join("src")).expect("dirs");
+        std::fs::write(root.join("src").join("cart.js"), "x").expect("file");
+        let root = root.canonicalize().expect("canonical");
+        let mistyped = root
+            .parent()
+            .expect("parent")
+            .parent()
+            .expect("grandparent")
+            .join("session-12-abcd")
+            .join("project")
+            .join("src")
+            .join("cart.js");
+        assert_eq!(
+            super::recover_mistyped_path(&mistyped, &root),
+            Some(root.join("src").join("cart.js"))
+        );
+        let elsewhere = std::path::Path::new(if cfg!(windows) {
+            r"Z:\other\src\cart.js"
+        } else {
+            "/other/src/cart.js"
+        });
+        assert_eq!(
+            super::recover_mistyped_path(elsewhere, &root),
+            None,
+            "unrelated paths are not guessed"
+        );
+        assert_eq!(
+            super::recover_mistyped_path(std::path::Path::new("src/cart.js"), &root),
+            None
+        );
+    }
+
     fn temp_path(name: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time should move forward")
             .as_nanos();
         std::env::temp_dir().join(format!("clawd-native-{name}-{unique}"))
+    }
+
+    #[test]
+    fn edit_file_accepts_a_unique_match_with_wrong_trailing_whitespace() {
+        let path = temp_path("edit-trailing.rs");
+        std::fs::write(&path, "fn main() {   \n    let a = 1;\n}\n").expect("write");
+        let output = edit_file(
+            path.to_string_lossy().as_ref(),
+            "fn main() {\n    let a = 1;",
+            "fn main() {\n    let a = 2;",
+            false,
+        )
+        .expect("loose match");
+        assert_eq!(
+            output.match_strategy.as_deref(),
+            Some("trailing_whitespace")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "fn main() {\n    let a = 2;\n}\n"
+        );
+    }
+
+    #[test]
+    fn edit_file_reindents_a_replacement_matched_with_wrong_indentation() {
+        let path = temp_path("edit-indent.py");
+        std::fs::write(&path, "class A:\n    def f(self):\n        return 1\n").expect("write");
+        // The model dropped the method's indentation in both strings.
+        let output = edit_file(
+            path.to_string_lossy().as_ref(),
+            "def f(self):\n    return 1",
+            "def f(self):\n    value = 2\n    return value",
+            false,
+        )
+        .expect("indentation match");
+        assert_eq!(output.match_strategy.as_deref(), Some("indentation"));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "class A:\n    def f(self):\n        value = 2\n        return value\n"
+        );
+        let exact = edit_file(
+            path.to_string_lossy().as_ref(),
+            "value = 2",
+            "value = 3",
+            false,
+        )
+        .expect("exact");
+        assert_eq!(
+            exact.match_strategy, None,
+            "exact matches report nothing extra"
+        );
+    }
+
+    #[test]
+    fn edit_file_refuses_ambiguous_loose_matches_and_points_at_likely_lines() {
+        let path = temp_path("edit-ambiguous.txt");
+        std::fs::write(&path, "a:\n  x = 1\n  y = 2\nb:\n    x = 1\n    y = 2\n").expect("write");
+        // Not verbatim anywhere; ignoring indentation it fits both blocks.
+        let error = edit_file(
+            path.to_string_lossy().as_ref(),
+            "x = 1\n y = 2",
+            "x = 3",
+            false,
+        )
+        .expect_err("ambiguous")
+        .to_string();
+        assert!(
+            error.contains("ignoring indentation it matches 2 places (lines 2, 5)"),
+            "{error}"
+        );
+
+        std::fs::write(&path, "start\n    alpha();\n    beta();\n").expect("write");
+        let error = edit_file(
+            path.to_string_lossy().as_ref(),
+            "alpha();\ngamma();",
+            "alpha();",
+            false,
+        )
+        .expect_err("not found")
+        .to_string();
+        assert!(error.contains("first line appears at line 2"), "{error}");
+    }
+
+    #[test]
+    fn placeholders_that_would_delete_code_are_refused() {
+        let path = temp_path("placeholder.ts");
+        let original = (0..40).fold(String::new(), |mut out, n| {
+            let _ = writeln!(out, "export const v{n} = {n};");
+            out
+        });
+        std::fs::write(&path, &original).expect("write");
+        for placeholder in [
+            "// ... existing code ...",
+            "# ... rest of the file unchanged",
+            "/* … remaining exports */",
+            "// rest of the code remains unchanged",
+        ] {
+            let error = write_file(
+                path.to_string_lossy().as_ref(),
+                &format!("export const v0 = 1;\n{placeholder}\n"),
+            )
+            .expect_err(placeholder)
+            .to_string();
+            assert!(error.contains("placeholder"), "{error}");
+            let error = edit_file(
+                path.to_string_lossy().as_ref(),
+                "export const v1 = 1;",
+                &format!("export const v1 = 2;\n{placeholder}"),
+                false,
+            )
+            .expect_err(placeholder)
+            .to_string();
+            assert!(error.contains("placeholder"), "{error}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            original,
+            "nothing was written"
+        );
+        // Prose that merely mentions code is fine, and so is a new file.
+        write_file(
+            path.to_string_lossy().as_ref(),
+            "// keep the existing exports stable\nexport const v = 1;\n",
+        )
+        .expect("ordinary comment");
+        let fresh = temp_path("fresh.ts");
+        write_file(
+            fresh.to_string_lossy().as_ref(),
+            "// ... existing code ...\n",
+        )
+        .expect("new file");
+    }
+
+    #[test]
+    fn a_cut_off_rewrite_of_a_long_file_is_refused() {
+        let path = temp_path("cutoff.js");
+        let original = format!(
+            "function a() {{\n{}}}\n",
+            (0..40).fold(String::new(), |mut out, n| {
+                let _ = writeln!(out, "  call({n});");
+                out
+            })
+        );
+        std::fs::write(&path, &original).expect("write");
+        let error = write_file(
+            path.to_string_lossy().as_ref(),
+            "function a() {\n  call(0);\n  call(1);\n",
+        )
+        .expect_err("cut off")
+        .to_string();
+        assert!(error.contains("looks cut off"), "{error}");
+        // A deliberately shorter but complete file is fine.
+        write_file(
+            path.to_string_lossy().as_ref(),
+            "function a() {\n  call(0);\n}\n",
+        )
+        .expect("complete");
     }
 
     /// Models send `""` for "no path"; it is the directory the search runs in, not a

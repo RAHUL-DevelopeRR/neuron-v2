@@ -93,6 +93,15 @@ pub(crate) struct DoctorReport {
 }
 
 impl DoctorReport {
+    #[cfg(test)]
+    pub(crate) fn from_checks(checks: Vec<DiagnosticCheck>) -> Self {
+        Self { checks }
+    }
+
+    pub(crate) fn checks(&self) -> &[DiagnosticCheck] {
+        &self.checks
+    }
+
     pub fn counts(&self) -> (usize, usize, usize) {
         (
             self.checks

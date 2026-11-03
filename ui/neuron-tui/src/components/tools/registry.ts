@@ -1,5 +1,6 @@
-// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
-// See ui/neuron-tui/PORTING.md.
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
+// engine's Agent calls have a row of their own. See ui/neuron-tui/PORTING.md.
+import { AgentComponent } from './agent'
 import { ApplyPatchComponent } from './apply-patch'
 import { CodeSearchComponent } from './code-search'
 import { GlobComponent } from './glob'
@@ -52,6 +53,7 @@ const toolComponentRegistry = new Map<ToolName, ToolComponent>([
   ['propose_str_replace', StrReplaceComponent],
   ['propose_write_file', WriteFileComponent],
   [SkillComponent.toolName, SkillComponent],
+  [AgentComponent.toolName, AgentComponent],
 ])
 
 /**

@@ -1,0 +1,14 @@
+{
+  "expo": {
+    "name": "Neuron",
+    "slug": "neuron-mobile",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#0c0c0c",
+    "icon": "./assets/icon.png",
+    "ios": { "bundleIdentifier": "live.zero-x.neuron.mobile", "supportsTablet": true },
+    "android": { "package": "live.zero_x.neuron.mobile", "adaptiveIcon": { "foregroundImage": "./assets/icon.png", "backgroundColor": "#1a1a2e" } },
+    "web": { "bundler": "metro", "favicon": "./assets/icon.png" }
+  }
+}

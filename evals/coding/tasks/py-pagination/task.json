@@ -1,0 +1,10 @@
+{
+  "id": "py-pagination",
+  "summary": "Two bugs in one function, found from failing visible tests.",
+  "tags": ["python", "bugfix"],
+  "prompt": "The tests in tests/test_pagination.py fail. Fix the bugs in pagination.py so they pass. Do not change the tests.",
+  "allow": ["bash(python -m unittest:*)", "bash(python -m pytest:*)"],
+  "grader": {"from": "grader", "to": "_grader"},
+  "check": "python -m unittest discover -s _grader -q",
+  "protected": ["tests/"]
+}

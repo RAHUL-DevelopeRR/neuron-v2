@@ -47,6 +47,15 @@ pub(crate) enum CliAction {
         output_format: CliOutputFormat,
         launch: ResumeLaunchOptions,
     },
+    /// `neuron --resume SESSION prompt TEXT` (or `-p TEXT`): one more turn on a saved
+    /// session, run as `neuron prompt` runs and saved to the same file.
+    ResumePrompt {
+        session_path: PathBuf,
+        prompt: String,
+        output_format: CliOutputFormat,
+        launch: ResumeLaunchOptions,
+        compact: bool,
+    },
     Status {
         model: String,
         permission_mode: PermissionMode,
@@ -137,8 +146,130 @@ impl CliOutputFormat {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
+    parse_args_with_stdin(args, read_piped_stdin)
+}
+
+/// Standard input read to the end when it is not a terminal (a pipe or a file), else
+/// `None`. Test builds never read the test harness's stdin.
+fn read_piped_stdin() -> Option<String> {
+    if cfg!(test) || std::io::stdin().is_terminal() {
+        return None;
+    }
+    let mut piped = String::new();
+    let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut piped);
+    Some(piped)
+}
+
+/// `--no-tui`, which `main` takes out of the arguments before they are parsed.
+static NO_TUI_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Records whether this run had `--no-tui`: it asks for the line REPL, so piped input
+/// meant for it is refused rather than sent to the model.
+pub(crate) fn record_no_tui_flag(given: bool) {
+    NO_TUI_FLAG.store(given, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Piped text goes to the model as one prompt, so `/model` and `/exit` on their own
+/// lines would be a question for the model, not commands.
+const PIPED_SLASH_COMMANDS: &str = "piped input is sent to the model as one prompt, so slash \
+commands can't be piped. Use subcommands (`neuron status`), `neuron --resume latest /status`, \
+or run `neuron` in a terminal.";
+
+/// The prompt piped stdin carries when the command line has none: `None` when it is
+/// empty (the REPL arm decides), an error when it was meant for the REPL (its first
+/// line is a slash command, or `--no-tui` asked for the line REPL).
+pub(crate) fn piped_prompt(piped: &str, no_tui: bool) -> Result<Option<String>, String> {
+    // Windows PowerShell pipes, and files saved as UTF-8 with BOM, start with U+FEFF,
+    // which `trim` keeps: `\u{feff}/model` would not look like a slash command.
+    let prompt = piped.trim_start_matches('\u{feff}').trim();
+    if prompt.is_empty() {
+        return Ok(None);
+    }
+    if prompt
+        .lines()
+        .next()
+        .is_some_and(looks_like_slash_command_token)
+    {
+        return Err(PIPED_SLASH_COMMANDS.to_string());
+    }
+    if no_tui {
+        return Err(format!(
+            "--no-tui starts the line REPL, which needs a terminal, and {PIPED_SLASH_COMMANDS} \
+To send the piped text as a prompt, leave out --no-tui."
+        ));
+    }
+    Ok(Some(prompt.to_string()))
+}
+
+/// The slash command Git Bash turned into a path: MSYS rewrites an argument that starts
+/// with `/` to one under its install folder, so `neuron /model` arrives as
+/// `C:/Program Files/Git/model` (`/usr/...` under `Git/usr`). The install folder is
+/// named `Git` (Git for Windows) or holds `usr/bin/msys-2.0.dll` (MSYS2 at
+/// `C:/msys64`, Scoop's `apps/git/current`). `msystem` is `MSYSTEM`, which Git Bash
+/// and MSYS2 set.
+pub(crate) fn msys_slash_command(arg: &str, msystem: Option<&str>) -> Option<String> {
+    msys_slash_command_under(arg, msystem, |root| {
+        Path::new(root).join("usr/bin/msys-2.0.dll").is_file()
+    })
+}
+
+/// [`msys_slash_command`] with `is_msys_root` telling whether a folder is an MSYS
+/// install.
+fn msys_slash_command_under(
+    arg: &str,
+    msystem: Option<&str>,
+    is_msys_root: impl FnOnce(&str) -> bool,
+) -> Option<String> {
+    msystem.filter(|value| !value.is_empty())?;
+    let bytes = arg.as_bytes();
+    if !(bytes.len() > 3 && bytes[0].is_ascii_alphabetic() && &bytes[1..3] == b":/") {
+        return None;
+    }
+    let (folder, name) = arg.rsplit_once('/')?;
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+    {
+        return None;
+    }
+    let folder = folder.strip_suffix("/usr").unwrap_or(folder);
+    // Not a drive's root folder (`C:/usr/model`).
+    let (_, last) = folder.rsplit_once('/')?;
+    let command = format!("/{name}");
+    if !looks_like_slash_command_token(&command) {
+        return None;
+    }
+    (last.eq_ignore_ascii_case("git") || is_msys_root(folder)).then_some(command)
+}
+
+/// Puts back the slash commands Git Bash turned into paths ([`msys_slash_command`])
+/// where a slash command goes: the first word (`neuron /skills list`), and every word
+/// after `--resume` (`neuron --resume latest /status`). Returns the commands put back.
+fn restore_msys_slash_commands(words: &mut [String], msystem: Option<&str>) -> Vec<String> {
+    let checked = if words.first().is_some_and(|word| word == "--resume") {
+        words.len()
+    } else {
+        1
+    };
+    let mut restored = Vec::new();
+    for word in words.iter_mut().take(checked) {
+        if let Some(command) = msys_slash_command(word, msystem) {
+            word.clone_from(&command);
+            restored.push(command);
+        }
+    }
+    restored
+}
+
+/// [`parse_args`] with standard input from `piped_stdin` (`None` on a terminal), which
+/// is read only when the command line has no prompt.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn parse_args_with_stdin(
+    args: &[String],
+    piped_stdin: impl FnOnce() -> Option<String>,
+) -> Result<CliAction, String> {
     *MODEL_ARG.lock().unwrap_or_else(PoisonError::into_inner) = None;
     let mut model = DEFAULT_MODEL.to_string();
     // Only an explicit --model; `model` falls back to the default.
@@ -166,6 +297,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     && matches!(
                         rest[0].as_str(),
                         "prompt"
+                            | "--resume"
                             | "version"
                             | "state"
                             | "init"
@@ -176,8 +308,9 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     ) =>
             {
                 // `--help` following a subcommand that would otherwise forward
-                // the arg to the API (e.g. `neuron prompt --help`) should show
-                // top-level help instead. Subcommands that consume their own
+                // the arg to the API (e.g. `neuron prompt --help`, `neuron --resume
+                // latest prompt --help`) should show top-level help instead.
+                // Subcommands that consume their own
                 // args (agents, mcp, plugins, skills) and local help-topic
                 // subcommands (status, sandbox, doctor) must NOT be intercepted
                 // here — they handle --help in their own dispatch paths.
@@ -268,9 +401,20 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 allow_broad_cwd = true;
                 index += 1;
             }
+            "-p" if rest.first().is_some_and(|word| word == "--resume") => {
+                // `--resume SESSION -p TEXT`: the words continue the saved session.
+                if let Some(action) = p_words_action(&args[index + 1..], output_format) {
+                    return action;
+                }
+                rest.extend(args[index..].iter().cloned());
+                break;
+            }
             "-p" => {
                 // NeuronCLI compat: -p "prompt" = one-shot prompt
                 // Allow empty prompt so piped stdin works: echo "hello" | neuron -p
+                if let Some(action) = p_words_action(&args[index + 1..], output_format) {
+                    return action;
+                }
                 let prompt = args[index + 1..].join(" ");
                 return Ok(CliAction::Prompt {
                     prompt,
@@ -299,6 +443,8 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 rest.push(flag[9..].to_string());
                 index += 1;
             }
+            // Among a prompt's words (or after `--resume SESSION`): it would be prompt text.
+            flag if is_session_flag(flag) => return Err(session_flag_error(flag)),
             "--acp" | "-acp" => {
                 rest.push("acp".to_string());
                 index += 1;
@@ -338,30 +484,39 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
 
     let allowed_tools = normalize_allowed_tools(&allowed_tool_values)?;
 
+    // Git Bash turned `neuron /model` into `neuron "C:/Program Files/Git/model"`.
+    let restored = restore_msys_slash_commands(&mut rest, env::var("MSYSTEM").ok().as_deref());
+    // In JSON mode stderr carries only JSON (the error object `main` prints).
+    if output_format != CliOutputFormat::Json {
+        for command in restored {
+            eprintln!(
+                "Git Bash turned {command} into a path; treating it as {command}. Set MSYS_NO_PATHCONV=1 to avoid this."
+            );
+        }
+    }
+
     if rest.is_empty() {
         let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
         // When stdin is not a terminal (pipe/redirect) and no prompt is given on the
         // command line, read stdin as the prompt and dispatch as a one-shot Prompt
         // rather than starting the interactive REPL (which would consume the pipe and
         // print the startup banner, then exit without sending anything to the API).
-        #[cfg(not(test))]
-        if !std::io::stdin().is_terminal() {
-            let mut buf = String::new();
-            let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf);
-            let piped = buf.trim().to_string();
-            if !piped.is_empty() {
-                return Ok(CliAction::Prompt {
-                    model,
-                    prompt: piped,
-                    allowed_tools,
-                    permission_mode,
-                    output_format,
-                    compact: false,
-                    base_commit,
-                    reasoning_effort,
-                    allow_broad_cwd,
-                });
-            }
+        let piped = piped_stdin().unwrap_or_default();
+        if let Some(prompt) = piped_prompt(
+            &piped,
+            NO_TUI_FLAG.load(std::sync::atomic::Ordering::Relaxed),
+        )? {
+            return Ok(CliAction::Prompt {
+                model,
+                prompt,
+                allowed_tools,
+                permission_mode,
+                output_format,
+                compact: false,
+                base_commit,
+                reasoning_effort,
+                allow_broad_cwd,
+            });
         }
         return Ok(CliAction::Repl {
             model,
@@ -384,6 +539,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 base_commit,
                 allow_broad_cwd,
             },
+            compact,
         );
     }
     if let Some(action) = parse_local_help_action(&rest) {
@@ -566,7 +722,11 @@ pub(crate) fn bare_slash_command_guidance(command_name: &str) -> Option<String> 
     let slash_command = slash_command_specs()
         .iter()
         .find(|spec| spec.name == command_name || spec.aliases.contains(&command_name))?;
-    let guidance = if slash_command.resume_supported {
+    let guidance = if stub_slash_command(command_name) {
+        format!(
+            "`neuron {command_name}` is a slash command that is not yet implemented in this build; to send it as a prompt, use `neuron prompt {command_name}`."
+        )
+    } else if resume_safe_slash_command(command_name) {
         format!(
             "`neuron {command_name}` is a slash command. Use `neuron --resume SESSION.jsonl /{command_name}` or start `neuron` and run `/{command_name}`."
         )
@@ -860,6 +1020,14 @@ pub(crate) fn parse_direct_slash_cli_action(
     reasoning_effort: Option<String>,
     allow_broad_cwd: bool,
 ) -> Result<CliAction, String> {
+    // Before parsing: a stub without a parse arm would read as an unknown command
+    // that suggests itself.
+    if stub_slash_command(&rest[0]) {
+        return Err(format!(
+            "slash command {} is not yet implemented in this build.",
+            rest[0]
+        ));
+    }
     let raw = rest.join(" ");
     match SlashCommand::parse(&raw) {
         Ok(Some(SlashCommand::Help)) => Ok(CliAction::Help { output_format }),
@@ -897,16 +1065,69 @@ pub(crate) fn parse_direct_slash_cli_action(
         }
         Ok(Some(SlashCommand::Unknown(name))) => Err(format_unknown_direct_slash_command(&name)),
         Ok(Some(command)) => Err({
-            let _ = command;
-            format!(
-                "slash command {command_name} is interactive-only. Start `neuron` and run it there, or use `neuron --resume SESSION.jsonl {command_name}` / `neuron --resume {latest} {command_name}` when the command is marked [resume] in /help.",
-                command_name = rest[0],
-                latest = LATEST_SESSION_REFERENCE,
-            )
+            let command_name = &rest[0];
+            if resume_safe_slash_command(command_name) {
+                format!(
+                    "slash command {command_name} is interactive-only. Start `neuron` and run it there, or use `neuron --resume SESSION.jsonl {command_name}` / `neuron --resume {latest} {command_name}`.",
+                    latest = LATEST_SESSION_REFERENCE,
+                )
+            } else {
+                let mut message = format!(
+                    "slash command {command_name} works only inside a session: start `neuron` on a terminal and run it there."
+                );
+                if matches!(command, SlashCommand::Model { .. }) {
+                    message.push_str(" The current catalog is at https://zero-x.live/v1/models.");
+                }
+                message
+            }
         }),
         Ok(None) => Err(format!("unknown subcommand: {}", rest[0])),
         Err(error) => Err(error.to_string()),
     }
+}
+
+/// Whether `neuron --resume SESSION /name` runs this command: it is marked [resume] in
+/// /help and is not one of the stubs that only say "not yet implemented". `--help`'s
+/// "Resume-safe commands" line and the hints for `neuron X` / `neuron /X` all use this;
+/// the test `every_resume_safe_command_runs_under_resume` runs every form that line
+/// lists through `run_resume_command`.
+pub(crate) fn resume_safe_slash_command(command_name: &str) -> bool {
+    let name = slash_command_root(command_name);
+    slash_command_specs().iter().any(|spec| {
+        spec.resume_supported
+            && !STUB_COMMANDS.contains(&spec.name)
+            && (spec.name == name || spec.aliases.contains(&name))
+    })
+}
+
+/// The arguments of a resume-safe command that `neuron --resume` runs, for `--help`'s
+/// "Resume-safe commands" line: the command's argument hint without the forms that
+/// need a live session.
+pub(crate) fn resume_argument_hint(spec: &commands::SlashCommandSpec) -> Option<&'static str> {
+    match spec.name {
+        // `/skills <skill> [args]` runs the skill as a model turn.
+        "skills" => Some("[list|install <path>|help]"),
+        _ => spec.argument_hint,
+    }
+}
+
+/// Whether `/name` (or an alias of it) is one of the stubs that only say "not yet
+/// implemented".
+fn stub_slash_command(command_name: &str) -> bool {
+    let name = slash_command_root(command_name);
+    STUB_COMMANDS.contains(&name)
+        || slash_command_specs()
+            .iter()
+            .any(|spec| STUB_COMMANDS.contains(&spec.name) && spec.aliases.contains(&name))
+}
+
+/// `status` for `/status`, `status` or `/status --json`.
+fn slash_command_root(command_name: &str) -> &str {
+    command_name
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches('/')
 }
 
 pub(crate) fn format_unknown_option(option: &str) -> String {
@@ -1359,18 +1580,103 @@ pub(crate) fn parse_dump_manifests_args(
     })
 }
 
+/// How to send a saved session another prompt.
+const RESUME_PROMPT_USAGE: &str = "neuron --resume latest prompt \"...\"";
+
+/// `--resume` or `--continue`, alone or with `=VALUE`.
+fn is_session_flag(word: &str) -> bool {
+    matches!(
+        word.split('=').next().unwrap_or(word),
+        "--resume" | "--continue"
+    )
+}
+
+/// `neuron prompt TEXT --resume SESSION`: the flag would reach the model as prompt text,
+/// and the prompt would start a new session.
+fn session_flag_error(word: &str) -> String {
+    let flag = word.split('=').next().unwrap_or(word);
+    format!(
+        "{flag} among a prompt's words would be sent to the model as text and start a new session; to send a saved session another prompt use `{RESUME_PROMPT_USAGE}` (or a session id in place of latest)"
+    )
+}
+
+/// The options `neuron prompt TEXT` still applies after its text (the arms of
+/// [`parse_args_with_stdin`]). After `-p` every word is prompt text, so there they would
+/// be sent to the model instead.
+pub(crate) const OPTIONS_APPLIED_AFTER_PROMPT: &[&str] = &[
+    "--model",
+    "--output-format",
+    "--permission-mode",
+    "--dangerously-skip-permissions",
+    "--compact",
+    "--base-commit",
+    "--reasoning-effort",
+    "--allow-broad-cwd",
+    "--print",
+    "--allowedTools",
+    "--allowed-tools",
+];
+
+/// What the words after `-p`, all prompt text, ask for besides the prompt: help, as after
+/// `prompt`, or an error for an option or session flag that would be sent to the model as
+/// text where `neuron prompt` would apply it.
+fn p_words_action(
+    words: &[String],
+    output_format: CliOutputFormat,
+) -> Option<Result<CliAction, String>> {
+    if words.iter().any(|word| is_help_flag(word)) {
+        return Some(Ok(CliAction::Help { output_format }));
+    }
+    words.iter().find_map(|word| {
+        let option = word.split('=').next().unwrap_or(word);
+        if is_session_flag(word) {
+            Some(Err(session_flag_error(word)))
+        } else {
+            OPTIONS_APPLIED_AFTER_PROMPT.contains(&option).then(|| {
+                Err(format!(
+                    "{option} after `-p` would be sent to the model as prompt text: put options before `-p` (`neuron {option} ... -p \"...\"`), or quote the prompt"
+                ))
+            })
+        }
+    })
+}
+
+/// Whether `word` starts the prompt in `neuron --resume SESSION prompt TEXT`.
+fn is_resume_prompt_word(word: &str) -> bool {
+    matches!(word, "prompt" | "-p")
+}
+
 pub(crate) fn parse_resume_args(
     args: &[String],
     output_format: CliOutputFormat,
     launch: ResumeLaunchOptions,
+    compact: bool,
 ) -> Result<CliAction, String> {
     let (session_path, command_tokens): (PathBuf, &[String]) = match args.first() {
         None => (PathBuf::from(LATEST_SESSION_REFERENCE), &[]),
-        Some(first) if looks_like_slash_command_token(first) => {
+        Some(first) if looks_like_slash_command_token(first) || is_resume_prompt_word(first) => {
             (PathBuf::from(LATEST_SESSION_REFERENCE), args)
         }
         Some(first) => (PathBuf::from(first), &args[1..]),
     };
+    if let Some((word, words)) = command_tokens.split_first() {
+        if is_resume_prompt_word(word) {
+            let prompt = words.join(" ");
+            // `echo "..." | neuron --resume latest -p`: the prompt is on stdin.
+            if prompt.trim().is_empty() && word != "-p" {
+                return Err(format!(
+                    "--resume ... {word} requires a prompt string: `{RESUME_PROMPT_USAGE}`"
+                ));
+            }
+            return Ok(CliAction::ResumePrompt {
+                session_path,
+                prompt,
+                output_format,
+                launch,
+                compact,
+            });
+        }
+    }
     let mut commands = Vec::new();
     let mut current_command = String::new();
 
@@ -1389,7 +1695,9 @@ pub(crate) fn parse_resume_args(
         }
 
         if current_command.is_empty() {
-            return Err("--resume trailing arguments must be slash commands".to_string());
+            return Err(format!(
+                "--resume takes slash commands such as /status; to send a prompt use `{RESUME_PROMPT_USAGE}`"
+            ));
         }
 
         current_command.push(' ');
@@ -1471,5 +1779,438 @@ mod provider_flag_tests {
             extract_provider_flag(&strings(&["-p", "explain", "--provider", "flags"])).unwrap();
         assert_eq!(rest, strings(&["-p", "explain", "--provider", "flags"]));
         assert_eq!(provider, None);
+    }
+}
+
+#[cfg(test)]
+mod resume_prompt_tests {
+    use super::{parse_args, CliAction, CliOutputFormat, ResumeLaunchOptions};
+    use std::path::PathBuf;
+
+    fn parse(values: &[&str]) -> Result<CliAction, String> {
+        parse_args(&values.iter().map(ToString::to_string).collect::<Vec<_>>())
+    }
+
+    fn resume_prompt(session: &str, prompt: &str, launch: ResumeLaunchOptions) -> CliAction {
+        CliAction::ResumePrompt {
+            session_path: PathBuf::from(session),
+            prompt: prompt.to_string(),
+            output_format: CliOutputFormat::Text,
+            launch,
+            compact: false,
+        }
+    }
+
+    #[test]
+    fn resume_with_a_prompt_continues_the_saved_session() {
+        assert_eq!(
+            parse(&["--resume", "latest", "prompt", "fix", "the", "test"]),
+            Ok(resume_prompt(
+                "latest",
+                "fix the test",
+                ResumeLaunchOptions::default()
+            ))
+        );
+        assert_eq!(
+            parse(&["--resume", "latest", "-p", "x"]),
+            Ok(resume_prompt("latest", "x", ResumeLaunchOptions::default()))
+        );
+        // No session named: the latest one, as with slash commands.
+        assert_eq!(
+            parse(&["--resume", "prompt", "x"]),
+            Ok(resume_prompt("latest", "x", ResumeLaunchOptions::default()))
+        );
+    }
+
+    #[test]
+    fn resume_prompt_keeps_launch_flags_and_output_options() {
+        assert_eq!(
+            parse(&[
+                "--model",
+                "groq/openai/gpt-oss-120b",
+                "--resume",
+                "s-1",
+                "prompt",
+                "x"
+            ]),
+            Ok(resume_prompt(
+                "s-1",
+                "x",
+                ResumeLaunchOptions {
+                    model: Some("groq/openai/gpt-oss-120b".to_string()),
+                    ..ResumeLaunchOptions::default()
+                }
+            ))
+        );
+        assert_eq!(
+            parse(&[
+                "--output-format",
+                "json",
+                "--compact",
+                "--resume",
+                "s-1",
+                "prompt",
+                "x"
+            ]),
+            Ok(CliAction::ResumePrompt {
+                session_path: PathBuf::from("s-1"),
+                prompt: "x".to_string(),
+                output_format: CliOutputFormat::Json,
+                launch: ResumeLaunchOptions::default(),
+                compact: true,
+            })
+        );
+    }
+
+    #[test]
+    fn resume_without_a_prompt_is_unchanged() {
+        assert_eq!(
+            parse(&["--resume", "latest"]),
+            Ok(CliAction::ResumeSession {
+                session_path: PathBuf::from("latest"),
+                commands: vec![],
+                output_format: CliOutputFormat::Text,
+                launch: ResumeLaunchOptions::default(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_session_flag_after_prompt_is_refused_not_sent_to_the_model() {
+        for words in [
+            &["prompt", "--resume", "latest", "hi"][..],
+            &["prompt", "--resume=latest", "hi"],
+            &["prompt", "--continue", "hi"],
+            &["-p", "--resume", "latest", "hi"],
+        ] {
+            let error = parse(words).expect_err("a session flag after prompt is refused");
+            assert!(
+                error.contains("neuron --resume latest prompt \"...\""),
+                "{words:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn resume_words_that_are_no_slash_command_name_the_prompt_form() {
+        let error = parse(&["--resume", "latest", "hi"]).expect_err("not a slash command");
+        assert!(error.contains("/status"), "{error}");
+        assert!(
+            error.contains("neuron --resume latest prompt \"...\""),
+            "{error}"
+        );
+        for words in [
+            &["--resume", "latest", "prompt"][..],
+            &["--resume", "latest", "prompt", " "],
+        ] {
+            let error = parse(words).expect_err("an empty prompt is refused");
+            assert!(error.contains("requires a prompt"), "{words:?}: {error}");
+        }
+    }
+
+    /// `echo "..." | neuron --resume latest -p`: as with `neuron -p`, the prompt comes on
+    /// standard input.
+    #[test]
+    fn resume_with_an_empty_p_takes_the_prompt_from_stdin() {
+        assert_eq!(
+            parse(&["--resume", "latest", "-p"]),
+            Ok(resume_prompt("latest", "", ResumeLaunchOptions::default()))
+        );
+    }
+
+    /// `neuron prompt hello --resume latest` started a new session with the prompt
+    /// "hello --resume latest": a session flag anywhere among a prompt's words is refused.
+    #[test]
+    fn a_session_flag_anywhere_in_the_prompt_is_refused() {
+        for words in [
+            &["prompt", "hello", "--resume", "latest"][..],
+            &["-p", "hello", "--resume", "latest"],
+            &["hello", "--resume", "latest"],
+            &["prompt", "hello", "--continue"],
+            &["--resume", "latest", "prompt", "--resume", "other", "x"],
+            &["--resume", "latest", "prompt", "x", "--resume=other"],
+            &["--resume", "latest", "-p", "x", "--continue"],
+        ] {
+            let error = parse(words).expect_err("a session flag in the prompt is refused");
+            assert!(
+                error.contains("neuron --resume latest prompt \"...\""),
+                "{words:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_after_a_resumed_prompt_shows_help() {
+        for words in [
+            &["--resume", "latest", "prompt", "--help"][..],
+            &["--resume", "latest", "prompt", "x", "-h"],
+            &["--resume", "latest", "-p", "--help"],
+            &["--resume", "latest", "--help"],
+            &["--resume", "--help"],
+            &["-p", "x", "--help"],
+        ] {
+            assert_eq!(
+                parse(words),
+                Ok(CliAction::Help {
+                    output_format: CliOutputFormat::Text
+                }),
+                "{words:?}"
+            );
+        }
+    }
+
+    /// After `prompt` Neuron's own options still apply, as for `neuron prompt`.
+    #[test]
+    fn options_after_a_resumed_prompt_apply() {
+        assert_eq!(
+            parse(&[
+                "--resume",
+                "latest",
+                "prompt",
+                "again",
+                "--output-format",
+                "json"
+            ]),
+            Ok(CliAction::ResumePrompt {
+                session_path: PathBuf::from("latest"),
+                prompt: "again".to_string(),
+                output_format: CliOutputFormat::Json,
+                launch: ResumeLaunchOptions::default(),
+                compact: false,
+            })
+        );
+    }
+
+    /// After `-p` every word is prompt text, so an option `prompt` would apply there was
+    /// sent to the model instead (`--resume latest -p again --output-format json` printed
+    /// a text answer): refused, saying where it goes.
+    #[test]
+    fn an_option_after_p_is_refused_not_sent_to_the_model() {
+        for (words, option) in [
+            (
+                &[
+                    "--resume",
+                    "latest",
+                    "-p",
+                    "again",
+                    "--output-format",
+                    "json",
+                ][..],
+                "--output-format",
+            ),
+            (&["-p", "again", "--output-format=json"], "--output-format"),
+            (&["-p", "again", "--model", "opus"], "--model"),
+            (
+                &[
+                    "--resume",
+                    "s-1",
+                    "-p",
+                    "x",
+                    "--permission-mode",
+                    "read-only",
+                ],
+                "--permission-mode",
+            ),
+            (&["-p", "x", "--compact"], "--compact"),
+        ] {
+            let error = parse(words).expect_err("an option after -p is refused");
+            assert!(
+                error.contains(&format!("{option} after `-p`")),
+                "{words:?}: {error}"
+            );
+            assert!(error.contains("before `-p`"), "{words:?}: {error}");
+        }
+        // Words that only look like options are prompt text.
+        match parse(&["-p", "what", "does", "--modelling", "-x", "mean"]) {
+            Ok(CliAction::Prompt { prompt, .. }) => {
+                assert_eq!(prompt, "what does --modelling -x mean");
+            }
+            other => panic!("expected a prompt: {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod script_input_tests {
+    use super::{
+        msys_slash_command, msys_slash_command_under, parse_args, parse_args_with_stdin,
+        piped_prompt, CliAction,
+    };
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(ToString::to_string).collect()
+    }
+
+    fn parse_piped(values: &[&str], stdin: &str) -> Result<CliAction, String> {
+        parse_args_with_stdin(&strings(values), || Some(stdin.to_string()))
+    }
+
+    #[test]
+    fn piped_slash_commands_are_refused_not_sent_to_the_model() {
+        // Windows PowerShell pipes, and files saved as UTF-8 with BOM, start with U+FEFF.
+        for stdin in [
+            "/help\n/exit",
+            "\n  /model\n/exit\n",
+            "/status\r\n",
+            "\u{feff}/help\r\n/exit\r\n",
+            "\u{feff}\r\n/model\r\n/exit\r\n",
+        ] {
+            let error = parse_piped(&[], stdin).expect_err("piped slash commands are refused");
+            assert!(
+                error.contains("slash commands can't be piped"),
+                "{stdin:?}: {error}"
+            );
+            assert!(error.contains("neuron --resume latest /status"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_piped_prompt_is_unchanged() {
+        let piped = parse_piped(&["--permission-mode", "read-only"], "fix the bug\n");
+        assert_eq!(
+            piped,
+            parse_args(&strings(&["--permission-mode", "read-only", "fix the bug"]))
+        );
+        assert!(matches!(piped, Ok(CliAction::Prompt { prompt, .. }) if prompt == "fix the bug"));
+        // A path is not a slash command.
+        let piped = parse_piped(
+            &["--permission-mode", "read-only"],
+            "/usr/bin/env is missing",
+        );
+        assert!(
+            matches!(piped, Ok(CliAction::Prompt { ref prompt, .. }) if prompt == "/usr/bin/env is missing"),
+            "{piped:?}"
+        );
+    }
+
+    #[test]
+    fn piped_input_with_no_tui_names_the_terminal_it_needs() {
+        let error = piped_prompt("fix the bug", true).expect_err("--no-tui needs a terminal");
+        assert!(error.contains("--no-tui"), "{error}");
+        assert!(error.contains("leave out --no-tui"), "{error}");
+        let error = piped_prompt("\u{feff}fix the bug\r\n", true).expect_err("with a BOM too");
+        assert!(error.contains("leave out --no-tui"), "{error}");
+        // Nothing piped (a lone BOM is nothing): the REPL arm decides.
+        for no_tui in [true, false] {
+            assert_eq!(piped_prompt(" \n", no_tui), Ok(None));
+            assert_eq!(piped_prompt("\u{feff}", no_tui), Ok(None));
+            assert_eq!(piped_prompt("\u{feff}\r\n", no_tui), Ok(None));
+        }
+        assert!(matches!(
+            parse_piped(&[], "\u{feff}"),
+            Ok(CliAction::Repl { .. })
+        ));
+        // The BOM is not part of the prompt.
+        for stdin in ["fix the bug\n", "\u{feff}fix the bug\r\n"] {
+            assert_eq!(
+                piped_prompt(stdin, false),
+                Ok(Some("fix the bug".to_string())),
+                "{stdin:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_bash_paths_of_slash_commands_are_slash_commands_again() {
+        let git_bash = Some("MINGW64");
+        for (arg, command) in [
+            ("C:/Program Files/Git/model", "/model"),
+            ("C:/Program Files/Git/usr/skills", "/skills"),
+            ("D:/tools/Git/help", "/help"),
+        ] {
+            assert_eq!(
+                msys_slash_command(arg, git_bash).as_deref(),
+                Some(command),
+                "{arg}"
+            );
+        }
+        // Not Git Bash, not a slash command, or not under Git: left alone.
+        assert_eq!(msys_slash_command("C:/Program Files/Git/model", None), None);
+        assert_eq!(
+            msys_slash_command("C:/Program Files/Git/average", git_bash),
+            None
+        );
+        assert_eq!(msys_slash_command("C:/projects/app/model", git_bash), None);
+        assert_eq!(msys_slash_command("C:/usr/model", git_bash), None);
+        assert_eq!(msys_slash_command("fix the model", git_bash), None);
+    }
+
+    #[test]
+    fn msys2_and_scoop_paths_of_slash_commands_are_slash_commands_again() {
+        let msys2 = Some("UCRT64");
+        for (arg, root, command) in [
+            ("C:/msys64/model", "C:/msys64", "/model"),
+            ("C:/msys64/usr/status", "C:/msys64", "/status"),
+            (
+                "C:/Users/me/scoop/apps/git/current/help",
+                "C:/Users/me/scoop/apps/git/current",
+                "/help",
+            ),
+        ] {
+            assert_eq!(
+                msys_slash_command_under(arg, msys2, |folder| folder == root).as_deref(),
+                Some(command),
+                "{arg}"
+            );
+            // A folder that is not an MSYS install is left alone.
+            assert_eq!(msys_slash_command_under(arg, msys2, |_| false), None);
+        }
+    }
+
+    /// The real check: an MSYS install folder holds `usr/bin/msys-2.0.dll`.
+    #[cfg(windows)]
+    #[test]
+    fn an_msys_install_is_found_by_its_runtime_dll() {
+        let root = std::env::temp_dir().join(format!("neuron-msys-root-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("usr/bin")).expect("usr/bin should create");
+        std::fs::write(root.join("usr/bin/msys-2.0.dll"), b"").expect("dll should write");
+        let root_text = root.display().to_string().replace('\\', "/");
+
+        let found = msys_slash_command(&format!("{root_text}/model"), Some("MSYS"));
+        let elsewhere = msys_slash_command(&format!("{root_text}/usr/bin/model"), Some("MSYS"));
+
+        std::fs::remove_dir_all(&root).expect("temp dir should clean up");
+        assert_eq!(found.as_deref(), Some("/model"));
+        assert_eq!(elsewhere, None);
+    }
+
+    #[test]
+    fn under_git_bash_a_mangled_slash_command_is_not_a_prompt() {
+        let _guard = crate::tests::env_lock();
+        let previous = std::env::var_os("MSYSTEM");
+        std::env::set_var("MSYSTEM", "MINGW64");
+        let model = parse_args(&strings(&["C:/Program Files/Git/model"]));
+        let skills = parse_args(&strings(&["C:/Program Files/Git/skills"]));
+        // The first of several words (`neuron /skills list`), and words after --resume.
+        let skills_list = parse_args(&strings(&["C:/Program Files/Git/skills", "list"]));
+        let resumed = parse_args(&strings(&[
+            "--resume",
+            "latest",
+            "C:/Program Files/Git/status",
+        ]));
+        // Only where a slash command goes: a later word of a prompt is left alone.
+        let prompt = parse_args(&strings(&["explain", "C:/Program Files/Git/model"]));
+        match previous {
+            Some(value) => std::env::set_var("MSYSTEM", value),
+            None => std::env::remove_var("MSYSTEM"),
+        }
+        let error = model.expect_err("/model is interactive-only");
+        assert!(error.contains("slash command /model"), "{error}");
+        assert!(
+            matches!(skills, Ok(CliAction::Skills { args: None, .. })),
+            "{skills:?}"
+        );
+        assert!(
+            matches!(skills_list, Ok(CliAction::Skills { args: Some(ref args), .. }) if args == "list"),
+            "{skills_list:?}"
+        );
+        assert!(
+            matches!(resumed, Ok(CliAction::ResumeSession { ref commands, .. }) if commands == &["/status"]),
+            "{resumed:?}"
+        );
+        assert!(
+            matches!(prompt, Ok(CliAction::Prompt { prompt: ref text, .. }) if text == "explain C:/Program Files/Git/model"),
+            "{prompt:?}"
+        );
     }
 }

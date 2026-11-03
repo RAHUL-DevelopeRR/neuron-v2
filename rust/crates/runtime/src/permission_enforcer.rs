@@ -8,8 +8,7 @@
 
 use crate::bash_validation::{classify_shell_command, ShellDialect};
 use crate::permissions::{
-    PermissionContext, PermissionMode, PermissionOutcome, PermissionPolicy,
-    NON_INTERACTIVE_PERMISSION_HINT,
+    non_interactive_hint, PermissionContext, PermissionMode, PermissionOutcome, PermissionPolicy,
 };
 use serde::{Deserialize, Serialize};
 
@@ -115,7 +114,12 @@ impl PermissionEnforcer {
             );
             if active_mode == PermissionMode::WorkspaceWrite {
                 message.push_str(". ");
-                message.push_str(NON_INTERACTIVE_PERMISSION_HINT);
+                message.push_str(&non_interactive_hint(&self.policy.remedy(
+                    tool_name,
+                    input,
+                    active_mode,
+                    required_mode,
+                )));
             }
             message
         };
@@ -584,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn unapproved_escalation_denial_explains_the_flags() {
+    fn unapproved_escalation_denial_names_an_allow_rule() {
         let enforcer = PermissionEnforcer::new(workspace_write_policy());
         let result = enforcer.check_with_required_mode(
             "bash",
@@ -595,8 +599,9 @@ mod tests {
             panic!("expected denial");
         };
         assert!(reason.contains("requires 'danger-full-access' permission"));
-        assert!(reason.contains("--permission-mode"));
-        assert!(reason.contains("--allowedTools"));
+        assert!(reason.contains("permissions.allow"), "{reason}");
+        assert!(!reason.contains("--permission-mode"), "{reason}");
+        assert!(!reason.contains("--allowedTools"), "{reason}");
     }
 
     #[test]

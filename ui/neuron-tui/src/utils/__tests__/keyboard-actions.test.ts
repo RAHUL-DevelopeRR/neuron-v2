@@ -1,6 +1,6 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
-// feedback, usage and out-of-credits mode cases went with those modes.
-// See ui/neuron-tui/PORTING.md.
+// feedback, usage and out-of-credits mode cases went with those modes, and Tab
+// and Shift+Tab no longer cycle the agent modes. See ui/neuron-tui/PORTING.md.
 import { describe, test, expect } from 'bun:test'
 
 import {
@@ -316,8 +316,8 @@ describe('resolveChatKeyboardAction', () => {
   })
 
   describe('agent mode toggle', () => {
-    test('shift-tab toggles agent mode when not in menus', () => {
-      expect(resolveChatKeyboardAction(shiftTabKey, defaultState)).toEqual({
+    test('shift-tab no longer toggles the agent mode, which the engine ignores', () => {
+      expect(resolveChatKeyboardAction(shiftTabKey, defaultState)).not.toEqual({
         type: 'toggle-agent-mode',
       })
     })
@@ -353,12 +353,12 @@ describe('resolveChatKeyboardAction', () => {
       })
     })
 
-    test('tab toggles agent mode when disableSlashSuggestions is true', () => {
+    test('tab does not toggle the agent mode when disableSlashSuggestions is true', () => {
       const state: ChatKeyboardState = {
         ...defaultState,
         disableSlashSuggestions: true,
       }
-      expect(resolveChatKeyboardAction(tabKey, state)).toEqual({
+      expect(resolveChatKeyboardAction(tabKey, state)).not.toEqual({
         type: 'toggle-agent-mode',
       })
     })

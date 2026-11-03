@@ -177,6 +177,10 @@ export interface Glyphs {
   checkboxOff: string
   /** A todo not done yet. */
   todo: string
+  /** The todo item in progress. */
+  todoActive: string
+  /** The busy spinner's frames, one character each. */
+  spinnerFrames: string
   /** A cancelled agent. */
   cancelled: string
   /** A paused queue. */
@@ -215,6 +219,8 @@ const UNICODE_GLYPHS: Glyphs = {
   checkboxOn: '☑',
   checkboxOff: '☐',
   todo: '☐',
+  todoActive: '▸',
+  spinnerFrames: '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏',
   cancelled: '⊘',
   paused: '⏸',
   shift: '⇧',
@@ -252,6 +258,8 @@ const CONSOLE_GLYPHS: Glyphs = {
   checkboxOn: '[x]',
   checkboxOff: '[ ]',
   todo: '○',
+  todoActive: '►',
+  spinnerFrames: '|/-\\',
   cancelled: '-',
   paused: '||',
   shift: 'Shift+',

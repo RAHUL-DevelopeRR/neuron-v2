@@ -1,5 +1,6 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
-// sponsored-proposal block is gone. See ui/neuron-tui/PORTING.md.
+// sponsored-proposal block is gone, and `git-view` blocks (a diff, a
+// rewind's result) are drawn. See ui/neuron-tui/PORTING.md.
 import { TextAttributes } from '@opentui/core'
 import React, { memo, type ReactNode } from 'react'
 
@@ -11,6 +12,7 @@ import { ContentWithMarkdown } from './content-with-markdown'
 import { ImageBlock } from './image-block'
 import { UserBlockTextWithInlineCopy } from './user-content-copy'
 import { useTheme } from '../../hooks/use-theme'
+import { GitViewCell } from '../git-view-cell'
 import { PlanBox } from '../renderers/plan-box'
 
 import type {
@@ -145,6 +147,16 @@ export const SingleBlock = memo(
 
       case 'tool': {
         return null
+      }
+
+      case 'git-view': {
+        return (
+          <GitViewCell
+            key={`${messageId}-git-view-${idx}`}
+            view={block.view}
+            availableWidth={availableWidth}
+          />
+        )
       }
 
       case 'ask-user': {

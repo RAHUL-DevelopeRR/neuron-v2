@@ -1,0 +1,20 @@
+{
+  "id": "js-long-file",
+  "summary": "Fix one function in the middle of a ~530-line module without damaging the rest.",
+  "tags": [
+    "javascript",
+    "bugfix",
+    "long-file"
+  ],
+  "prompt": "`slugify` in src/catalog.js is wrong. It must lowercase the text, replace every run of characters other than a-z and 0-9 with a single dash, and remove dashes from both ends. For example '  Hello -- World!! ' becomes 'hello-world' and 'Blue Mug (12 oz)' becomes 'blue-mug-12-oz'. Leave the rest of the file as it is.",
+  "allow": [
+    "bash(node --test:*)",
+    "bash(node -e:*)",
+    "bash(npm test:*)"
+  ],
+  "grader": {
+    "from": "grader",
+    "to": "_grader"
+  },
+  "check": "node --test"
+}

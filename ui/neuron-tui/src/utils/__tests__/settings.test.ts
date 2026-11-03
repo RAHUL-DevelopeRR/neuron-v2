@@ -1,5 +1,6 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the tests
-// now cover the settings that remain. See ui/neuron-tui/PORTING.md.
+// now cover the settings that remain; a saved agent mode reads as DEFAULT
+// while the modes are not offered. See ui/neuron-tui/PORTING.md.
 import fs from 'fs'
 import os from 'os'
 import path from 'path'
@@ -36,12 +37,12 @@ const useTempConfigDir = () => {
 }
 
 describe('settings', () => {
-  test('the agent mode survives a round trip through the settings file', () => {
+  test('a saved agent mode reads as DEFAULT: the engine ignores the modes', () => {
     useTempConfigDir()
 
     expect(loadModePreference()).toBe('DEFAULT')
     saveModePreference('MAX')
-    expect(loadModePreference()).toBe('MAX')
+    expect(loadModePreference()).toBe('DEFAULT')
   })
 
   test('the first-prompt mark is kept by the allowlisting loader', () => {
@@ -63,6 +64,6 @@ describe('settings', () => {
       }),
     )
 
-    expect(loadSettings()).toEqual({ mode: 'LITE' })
+    expect(loadSettings()).toEqual({})
   })
 })

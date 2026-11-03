@@ -2,6 +2,7 @@
 // Freebuff variant and the login/publish commands, --agent and --trust-agents
 // (Codebuff login, agent store and repository .agents loading) are gone, and
 // the engine's launch flags (--model, --provider, ...) pass through to it.
+// --lite, --max and --plan are gone with the agent modes (AGENT_MODES_AVAILABLE).
 // See ui/neuron-tui/PORTING.md.
 import { createRequire } from 'module'
 
@@ -51,16 +52,9 @@ export function loadPackageVersion(): string {
   return 'dev'
 }
 
-export function parseArgs({
-  argv = process.argv,
-  version = loadPackageVersion(),
-}: {
-  argv?: string[]
-  version?: string
-} = {}): ParsedArgs {
-  const program = new Command()
-
-  program
+/** The command line `parseArgs` reads; its `--help` is what users see. */
+export function buildProgram(version: string): Command {
+  return new Command()
     .name('neuron')
     .description('Neuron: an AI coding agent in your terminal')
     .version(version, '-v, --version', 'Print the CLI version')
@@ -76,11 +70,10 @@ export function parseArgs({
       '--cwd <directory>',
       'Set the working directory (default: current directory)',
     )
-    .option('--lite', 'Start in LITE mode')
-    .option('--free', 'Start in LITE mode (deprecated alias)')
-    .option('--max', 'Start in MAX mode')
-    .option('--plan', 'Start in PLAN mode')
-    .option('--model <model>', 'Model for the session (an alias like opus, or a full name)')
+    .option(
+      '--model <model>',
+      'Model for the session (auto, or an id from /model such as gemini/gemini-2.5-flash)',
+    )
     .option('--provider <name>', 'Provider to use instead of the configured one')
     .option(
       '--permission-mode <mode>',
@@ -99,7 +92,16 @@ export function parseArgs({
     .helpOption('-h, --help', 'Show this help message')
     .argument('[prompt...]', 'Initial prompt to send to the agent')
     .allowExcessArguments(true)
+}
 
+export function parseArgs({
+  argv = process.argv,
+  version = loadPackageVersion(),
+}: {
+  argv?: string[]
+  version?: string
+} = {}): ParsedArgs {
+  const program = buildProgram(version)
   program.parse(argv)
 
   const options = program.opts()
@@ -107,11 +109,8 @@ export function parseArgs({
 
   const continueFlag = options.continue
 
-  // Determine initial mode from flags (last flag wins if multiple specified)
-  let initialMode: AgentMode | undefined
-  if (options.free || options.lite) initialMode = 'LITE'
-  if (options.max) initialMode = 'MAX'
-  if (options.plan) initialMode = 'PLAN'
+  // Every chat runs in DEFAULT while the agent modes are not offered.
+  const initialMode: AgentMode | undefined = undefined
 
   return {
     initialPrompt: args.length > 0 ? args.join(' ') : null,

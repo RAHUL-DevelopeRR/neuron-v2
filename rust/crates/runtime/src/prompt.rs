@@ -331,6 +331,20 @@ pub fn workspace_git_status(cwd: &Path) -> Option<String> {
     read_git_status(cwd, workspace_trusted)
 }
 
+/// A `git` command in `cwd` for Neuron's own source-control work (`/diff`, `/commit`),
+/// with the safeguards of [`workspace_git_status`]: no optional locks and, in an
+/// untrusted workspace, no repository config that runs programs. `None` when the
+/// workspace is untrusted and its repository defines filter drivers, which git would
+/// run on every changed file.
+#[must_use]
+pub fn workspace_git_command(cwd: &Path) -> Option<std::process::Command> {
+    let workspace_trusted = ConfigLoader::default_for(cwd).workspace_is_trusted();
+    if !workspace_trusted && has_repository_filter_drivers(cwd) {
+        return None;
+    }
+    Some(git_command(cwd, workspace_trusted))
+}
+
 fn read_git_status(cwd: &Path, workspace_trusted: bool) -> Option<String> {
     let stdout = read_git_output(cwd, workspace_trusted, &["status", "--short", "--branch"])?;
     let trimmed = stdout.trim();
@@ -667,6 +681,8 @@ fn get_simple_doing_tasks_section() -> String {
         "Do not create files unless they are required to complete the task.".to_string(),
         "If an approach fails, diagnose the failure before switching tactics.".to_string(),
         "Be careful not to introduce security vulnerabilities such as command injection, XSS, or SQL injection.".to_string(),
+        "A reply without a tool call ends your turn. While work remains, make the next tool call instead of describing what you will do; never end a turn on a plan or a status line.".to_string(),
+        "Before you finish, verify what you changed: run the project's tests, type checker or build for the affected code.".to_string(),
         "Report outcomes faithfully: if verification fails or was not run, say so explicitly.".to_string(),
     ]);
 

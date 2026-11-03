@@ -340,6 +340,9 @@ fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) ->
         .env("USERPROFILE", &workspace.home)
         .env("NO_COLOR", "1")
         .env("PATH", "/usr/bin:/bin")
+        // The scenarios replay the reference agent loop; Neuron's completion check
+        // adds a round after edits and is covered by the runtime's tests.
+        .env("NEURON_COMPLETION_CHECK", "0")
         .args([
             "--model",
             "sonnet",
@@ -721,9 +724,11 @@ fn assert_bash_permission_prompt_denied(workspace: &HarnessWorkspace, run: &Scen
     let tool_output = run.response["tool_results"][0]["output"]
         .as_str()
         .expect("tool output");
+    // The allow rule for the command's program first, full access only as a last resort.
     assert!(
-        tool_output
-            .contains("non-interactive run: re-run with --permission-mode danger-full-access"),
+        tool_output.contains(
+            "nobody could approve it in a non-interactive run. To allow it in scripts, add \"bash(tee:*)\" to permissions.allow in your user settings (~/.neuron/settings.json), or, only in a disposable environment, re-run with --permission-mode danger-full-access"
+        ),
         "{tool_output}"
     );
     // The user is told too, and the run's last line on stderr names the tool.

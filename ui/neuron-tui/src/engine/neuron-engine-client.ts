@@ -32,6 +32,11 @@ export interface EngineLaunchOptions {
   resume?: string
   allowBroadCwd?: boolean
   dangerouslySkipPermissions?: boolean
+  /**
+   * Added to the engine's environment: `NEURON_TRUST_WORKSPACE=1` for a folder
+   * trusted for this session only (the home folder).
+   */
+  env?: Record<string, string>
 }
 
 /** The argv after the binary for {@link EngineLaunchOptions}. */
@@ -165,15 +170,22 @@ export function runExchange(
   return run
 }
 
-/** Runs a prompt's turn: {@link runExchange} with a `submit`. */
+/**
+ * Runs a prompt's turn: {@link runExchange} with a `submit`. `onSubmitted`
+ * runs once the submit was written to the engine (not when sending failed).
+ */
 export function runTurn(
   engine: NeuronEngineClient,
   turn: { text: string; attachments?: Attachment[] },
   onEvent: (event: UiEvent) => void,
+  onSubmitted?: () => void,
 ): Promise<TurnOutcome> {
   return runExchange(
     engine,
-    () => engine.submit(turn.text, turn.attachments ?? []),
+    () => {
+      engine.submit(turn.text, turn.attachments ?? [])
+      onSubmitted?.()
+    },
     onEvent,
   )
 }

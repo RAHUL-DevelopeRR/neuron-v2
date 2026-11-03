@@ -166,7 +166,7 @@ export class StdioEngineClient implements NeuronEngineClient {
     try {
       child = (this.options.spawn ?? defaultSpawn)(
         [binary, ...engineArgs(launch)],
-        { cwd: launch.cwd ?? process.cwd(), env: { ...process.env } },
+        { cwd: launch.cwd ?? process.cwd(), env: { ...process.env, ...launch.env } },
       )
     } catch (error) {
       return this.fail(

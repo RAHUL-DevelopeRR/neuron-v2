@@ -133,6 +133,26 @@ impl CommandClassification {
         })
     }
 
+    /// Why no command prefix can cover this line, when none can: the part that cannot
+    /// be inspected, or the first part that needs approval and sets an environment
+    /// variable, writes a file through a redirection or runs a program named by an
+    /// expansion. `None` when prefixes can cover it ([`Self::approval_prefixes`]).
+    #[must_use]
+    pub fn prefix_blocker(&self) -> Option<String> {
+        if let Some(reason) = &self.opaque_reason {
+            return Some(reason.clone());
+        }
+        self.segments
+            .iter()
+            .find(|segment| !segment.read_only && !segment.prefix_coverable)
+            .map(|segment| {
+                segment
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "part of it cannot be checked in advance".to_string())
+            })
+    }
+
     /// Whether any segment's words start with `prefix` (used by deny/ask rules).
     #[must_use]
     pub fn any_segment_starts_with(&self, prefix: &[String]) -> bool {

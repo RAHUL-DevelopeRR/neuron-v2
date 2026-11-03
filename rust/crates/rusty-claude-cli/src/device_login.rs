@@ -127,7 +127,8 @@ impl From<DeviceLoginError> for std::io::Error {
                 std::io::ErrorKind::InvalidData
             }
         };
-        Self::new(kind, error.to_string())
+        // The error itself, so a UI can tell why (`error_detail::from_io_error`).
+        Self::new(kind, error)
     }
 }
 

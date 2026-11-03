@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { MODEL_MIN_WIDTH, fitParts, footerParts, formatGit } from '../engine-footer'
+import { MODEL_MIN_WIDTH, fitParts, footerModel, footerParts, formatGit } from '../engine-footer'
 import {
   fitModelRow,
   modelRows,
@@ -258,6 +258,15 @@ describe('model picker', () => {
 })
 
 describe('engine footer', () => {
+  test('names the model auto picked', () => {
+    expect(footerModel({ ...STATUS, model: 'auto' })).toBe('auto')
+    expect(footerModel({ ...STATUS, model: 'auto', served_model: 'groq/qwen/qwen3.8-27b' })).toBe(
+      'auto → groq/qwen/qwen3.8-27b',
+    )
+    expect(footerModel({ ...STATUS, served_model: STATUS.model })).toBe(STATUS.model)
+    expect(footerParts({ ...STATUS, model: 'auto', served_model: 'm' }, null)[0]?.text).toBe('auto → m')
+  })
+
   test('git shows the branch and its non-zero counts', () => {
     expect(formatGit(STATUS.git!)).toBe('main +1 ~2')
     expect(
@@ -279,6 +288,20 @@ describe('engine footer', () => {
       'ctx 4%',
       'Zero-X pro',
     ])
+  })
+
+  test('tokens count up while a turn streams, as estimates, until its usage settles them', () => {
+    const usage = {
+      turn: { input: 10, output: 5, cache_read: 0, cache_write: 0 },
+      cumulative: { input: 12_000, output: 2_100, cache_read: 400, cache_write: 0 },
+      estimated: false,
+    }
+    const tokens = (live: { input: number; output: number } | null, last = usage) =>
+      footerParts(STATUS, last, live).find((part) => part.text.startsWith('↑'))?.text
+    expect(tokens({ input: 9_000, output: 1_200 })).toBe('↑~21.4K ↓~3.3K')
+    // The first turn: no totals yet, only what it used so far.
+    expect(tokens({ input: 0, output: 450 }, null as never)).toBe('↑~0 ↓~450')
+    expect(tokens(null)).toBe('↑12.4K ↓2.1K')
   })
 
   test('warns about an untrusted folder and an expired login', () => {

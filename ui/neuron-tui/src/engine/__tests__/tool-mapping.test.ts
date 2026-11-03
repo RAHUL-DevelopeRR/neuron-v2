@@ -37,7 +37,7 @@ describe('mapToolCall', () => {
     })
   })
 
-  test('TodoWrite becomes write_todos with done flags', () => {
+  test('TodoWrite becomes write_todos with done flags, status and present tense', () => {
     expect(
       mapToolCall(
         'TodoWrite',
@@ -52,8 +52,8 @@ describe('mapToolCall', () => {
       toolName: 'write_todos',
       input: {
         todos: [
-          { task: 'Read', completed: true },
-          { task: 'Fix', completed: false },
+          { task: 'Read', completed: true, status: 'completed', activeForm: 'Reading' },
+          { task: 'Fix', completed: false, status: 'in_progress', activeForm: 'Fixing' },
         ],
       },
     })
@@ -143,6 +143,27 @@ describe('mapToolResult', () => {
     expect(shown).toContain('Created new file C:\\work\\generated\\output.txt')
   })
 
+  test('a written or edited file inside the workspace reads relative to it, as the call named it', () => {
+    const created = JSON.stringify({
+      type: 'create',
+      filePath: '\\\\?\\C:\\Work\\shop\\grocery-shop\\style.css',
+      bytes: 24,
+      lines: 1,
+    })
+    expect(
+      formatToolOutput(mapToolResult('write_file', created, false, 'C:\\work\\shop')),
+    ).toContain('Created new file grocery-shop/style.css')
+    const edited = JSON.stringify({ filePath: '/home/me/shop/src/app.ts', diff: '' })
+    expect(
+      formatToolOutput(mapToolResult('edit_file', edited, false, '/home/me/shop/')),
+    ).toContain('Updated file src/app.ts')
+    // Outside the workspace, or in a folder whose name only starts the same: as it came.
+    const outside = JSON.stringify({ type: 'update', filePath: '/home/me/shop-old/a.ts' })
+    expect(
+      formatToolOutput(mapToolResult('write_file', outside, false, '/home/me/shop')),
+    ).toContain('Updated file /home/me/shop-old/a.ts')
+  })
+
   test('errors and plain text are shown as they came', () => {
     expect(
       formatToolOutput(
@@ -158,6 +179,35 @@ describe('mapToolResult', () => {
     const output = JSON.stringify({ numFiles: 1, filenames: ['a.rs'], numMatches: 3 })
     expect(formatToolOutput(mapToolResult('grep_search', output, false))).toBe(
       'Found 3 matches\na.rs',
+    )
+  })
+
+  test('write_file keeps what it wrote, and a diff when the engine sends one', () => {
+    const output = JSON.stringify({ type: 'update', filePath: 'a.css', bytes: 2048, lines: 80, summary: '' })
+    expect(mapToolResult('write_file', output, false)).toEqual([
+      { type: 'json', value: { message: 'Updated file a.css', file: 'a.css', lines: 80, bytes: 2048 } },
+    ])
+    const withDiff = JSON.stringify({ type: 'update', filePath: 'a.css', diff: '@@ -1 +1 @@\n-a\n+b' })
+    expect((mapToolResult('write_file', withDiff, false)[0] as { value: unknown }).value).toMatchObject({
+      unifiedDiff: '@@ -1 +1 @@\n-a\n+b',
+    })
+  })
+
+  test("an Agent result reads as the sub-agent's text, not its manifest", () => {
+    const manifest = { agentId: 'a1', status: 'completed', outputFile: '/tmp/a1.md' }
+    expect(
+      formatToolOutput(mapToolResult('Agent', JSON.stringify({ ...manifest, result: 'Found it.' }), false)),
+    ).toBe('Found it.')
+    expect(formatToolOutput(mapToolResult('Agent', JSON.stringify(manifest), false))).toBe(
+      'Sub-agent completed.',
+    )
+    expect(
+      formatToolOutput(
+        mapToolResult('Agent', JSON.stringify({ ...manifest, status: 'failed', error: 'boom' }), true),
+      ),
+    ).toBe('Error: boom')
+    expect(formatToolOutput(mapToolResult('Agent', 'agent type not allowed', true))).toBe(
+      'Error: agent type not allowed',
     )
   })
 })

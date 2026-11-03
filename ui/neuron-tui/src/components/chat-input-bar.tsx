@@ -1,5 +1,5 @@
-// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
-// See ui/neuron-tui/PORTING.md.
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: no agent
+// mode toggle (AGENT_MODES_AVAILABLE). See ui/neuron-tui/PORTING.md.
 import {
   isShallowScanRoot,
   SHALLOW_SCAN_MAX_DEPTH,
@@ -24,6 +24,7 @@ import { BORDER_CHARS } from '../utils/ui-constants'
 
 import type { useTheme } from '../hooks/use-theme'
 import type { InputValue } from '../types/store'
+import { AGENT_MODES_AVAILABLE } from '../utils/constants'
 import type { AgentMode } from '../utils/constants'
 import type { MouseEvent } from '@opentui/core'
 
@@ -452,7 +453,7 @@ export const ChatInputBar = ({
                 cursorPosition={cursorPosition}
               />
             </box>
-            {modeConfig.showAgentModeToggle && !isNarrowWidth && (
+            {AGENT_MODES_AVAILABLE && modeConfig.showAgentModeToggle && !isNarrowWidth && (
               <box
                 style={{
                   flexShrink: 0,

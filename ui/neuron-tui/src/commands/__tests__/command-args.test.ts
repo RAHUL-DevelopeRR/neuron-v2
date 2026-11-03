@@ -1,7 +1,8 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the login,
 // logout, usage, feedback and publish command cases went with those commands,
 // and /bash is checked as BASH_COMMAND (it is not registered while shell
-// commands are not implemented). See ui/neuron-tui/PORTING.md.
+// commands are not implemented); no /mode:* commands are registered while the
+// agent modes are not offered. See ui/neuron-tui/PORTING.md.
 import { describe, test, expect, mock } from 'bun:test'
 
 import {
@@ -180,9 +181,6 @@ describe('command factory pattern', () => {
         'plan',
         'review',
         'interview',
-        'mode:default',
-        'mode:max',
-        'mode:plan',
       ]
       for (const name of expectedWithArgs) {
         const cmd = COMMAND_REGISTRY.find((c) => c.name === name)
@@ -193,17 +191,11 @@ describe('command factory pattern', () => {
       }
     })
 
-    test('mode commands accept args to send as first message', () => {
+    test('no /mode:* command is registered: the engine ignores the agent modes', () => {
       const modeCommands = COMMAND_REGISTRY.filter((cmd) =>
         cmd.name.startsWith('mode:'),
-      )
-      expect(modeCommands.length).toBeGreaterThan(0)
-      for (const cmd of modeCommands) {
-        expect(
-          cmd.acceptsArgs,
-          `Mode command ${cmd.name} should accept args`,
-        ).toBe(true)
-      }
+      ).map((cmd) => cmd.name)
+      expect(modeCommands).toEqual([])
     })
   })
 

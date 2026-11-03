@@ -1,0 +1,18 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`the sign-in panel's Can't reach Zero-X state it reads plainly at 80x24 1`] = `
+"┌──────────────────────────── Can't reach Zero-X ────────────────────────────┐
+│ Neuron could not start a sign-in with Zero-X.                              │
+│ Could not reach Zero-X: error sending request for url (https://zero-x.     │
+│ live/auth/device/code)                                                     │
+│ Check your connection, then type /login to try again.                      │
+└────────────────────────────────────────────────────────────────────────────┘"
+`;
+
+exports[`the sign-in panel's Can't reach Zero-X state it reads plainly at 200x50 1`] = `
+"┌──────────────────────────────────────────────────────────────────────────────────────── Can't reach Zero-X ────────────────────────────────────────────────────────────────────────────────────────┐
+│ Neuron could not start a sign-in with Zero-X.                                                                                                                                                      │
+│ Could not reach Zero-X: error sending request for url (https://zero-x.live/auth/device/code)                                                                                                       │
+│ Check your connection, then type /login to try again.                                                                                                                                              │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
+`;

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::{Debug, Formatter};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
@@ -407,6 +407,7 @@ impl OpenAiCompatClient {
         let response = self
             .send_with_retry(&request, &RetryProgress::new())
             .await?;
+        record_quota_headers(response.headers());
         let request_id = request_id_from_headers(response.headers());
         let body = response.text().await.map_err(ApiError::from)?;
         // Some backends return {"error":{"message":"...","type":"...","code":...}}
@@ -456,6 +457,7 @@ impl OpenAiCompatClient {
         let response = self
             .send_with_retry(&request.clone().with_streaming(), progress)
             .await?;
+        record_quota_headers(response.headers());
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
             response,
@@ -1056,8 +1058,10 @@ impl StreamState {
                     "Tool stream ended without a tool_calls finish reason",
                 ));
             }
-            // Arguments that are not valid JSON reach the runtime, which
-            // answers the call with an error instead of running it.
+            // A call without a name cannot run. Arguments that are not valid JSON
+            // are passed on: the model finished the call (finish_reason tool_calls),
+            // so the executor repairs near-JSON or reports the parse error to the
+            // model, instead of the turn treating the call as cut off at max_tokens.
             if self
                 .tool_calls
                 .values()
@@ -1810,7 +1814,12 @@ fn normalize_response(
 /// instead of running it. Wrapping them in an object would hand the tool an
 /// input it might accept.
 fn parse_tool_arguments(arguments: &str) -> Value {
-    serde_json::from_str(arguments).unwrap_or_else(|_| Value::String(arguments.to_string()))
+    // Near-JSON is repaired; what cannot be is kept as text rather than wrapped in an
+    // object a tool might accept, so the runtime answers the call with an error.
+    runtime::tool_input::parse_tool_input(arguments).map_or_else(
+        |_| Value::String(arguments.to_string()),
+        |parsed| parsed.value,
+    )
 }
 
 fn next_sse_frame(buffer: &mut Vec<u8>) -> Option<String> {
@@ -1947,6 +1956,43 @@ fn chat_completions_endpoint(base_url: &str) -> String {
         trimmed.to_string()
     } else {
         format!("{trimmed}/chat/completions")
+    }
+}
+
+/// What the Zero-X gateway said was left of today's quota on a reply
+/// (`x-neuron-quota-remaining-requests` and `x-neuron-quota-remaining-tokens`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuotaRemaining {
+    pub requests: Option<u64>,
+    pub tokens: Option<u64>,
+}
+
+static LAST_QUOTA_REMAINING: Mutex<Option<QuotaRemaining>> = Mutex::new(None);
+
+/// The quota the last reply that reported one said was left, in this process.
+#[must_use]
+pub fn last_quota_remaining() -> Option<QuotaRemaining> {
+    *LAST_QUOTA_REMAINING
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Keeps the quota a reply reports; a reply without the headers changes nothing.
+fn record_quota_headers(headers: &reqwest::header::HeaderMap) {
+    let read = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+    };
+    let quota = QuotaRemaining {
+        requests: read("x-neuron-quota-remaining-requests"),
+        tokens: read("x-neuron-quota-remaining-tokens"),
+    };
+    if quota != QuotaRemaining::default() {
+        *LAST_QUOTA_REMAINING
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(quota);
     }
 }
 
@@ -2162,6 +2208,14 @@ mod tests {
         })).unwrap();
         nameless.ingest_chunk(chunk).unwrap();
         assert!(nameless.finish().is_err());
+        assert_eq!(
+            super::parse_tool_arguments("{\"path\": \"a.rs\",}"),
+            serde_json::json!({"path": "a.rs"})
+        );
+        assert_eq!(
+            super::parse_tool_arguments("{\"path\":"),
+            serde_json::Value::String("{\"path\":".to_string())
+        );
     }
 
     /// The arguments of each tool block, in stream order.

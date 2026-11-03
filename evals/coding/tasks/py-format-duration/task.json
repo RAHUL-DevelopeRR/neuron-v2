@@ -1,0 +1,9 @@
+{
+  "id": "py-format-duration",
+  "summary": "Implement a function from an exact formatting spec with edge cases.",
+  "tags": ["python", "feature", "spec"],
+  "prompt": "Implement `format_duration(seconds)` in durations.py. `seconds` is a non-negative int; a negative value raises ValueError. The result uses hours, minutes and seconds (no days) and starts at the largest non-zero unit: 3723 gives \"1h 02m 03s\", 65 gives \"1m 05s\", 7 gives \"7s\", 0 gives \"0s\", 3600 gives \"1h 00m 00s\" and 90000 gives \"25h 00m 00s\". The first unit is not zero-padded; every later unit has two digits.",
+  "allow": ["bash(python -m unittest:*)", "bash(python -m pytest:*)", "bash(python -c:*)"],
+  "grader": {"from": "grader", "to": "_grader"},
+  "check": "python -m unittest discover -s _grader -q"
+}

@@ -1,7 +1,7 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: a failed
 // command says how it ended next to it ("✗ failed (exit code 2)", "✗ stopped
-// (interrupted)"), and one that failed printing nothing says "(no output)".
-// See ui/neuron-tui/PORTING.md.
+// (interrupted)"), and one that failed printing nothing says "(no output)";
+// one still running says "Running…". See ui/neuron-tui/PORTING.md.
 import { sanitizeTerminalOutput } from '@neuron-tui/common/util/terminal-safe-text'
 import { TextAttributes } from '@opentui/core'
 import { useState } from 'react'
@@ -93,7 +93,7 @@ export const TerminalCommandDisplay = ({
       <box style={{ flexDirection: 'column', gap: 0, width: '100%' }}>
         {commandHeader}
         {/* Running indicator */}
-        {isRunning && <text fg={theme.muted}>...</text>}
+        {isRunning && <text fg={theme.muted}>Running…</text>}
         {/* A failure with nothing printed: say so, not a bare header. An
             interrupted command's output may simply not have come back. */}
         {failure && failure.label !== 'stopped' && !isRunning && (

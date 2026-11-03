@@ -1,6 +1,6 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: examples use
-// commands that still exist (/init, /login, /usage, /feedback were removed).
-// See ui/neuron-tui/PORTING.md.
+// commands that still exist (/init, /login, /usage, /feedback were removed),
+// and the menu offers no /mode:* or /image. See ui/neuron-tui/PORTING.md.
 import { describe, test, expect } from 'bun:test'
 
 import { SLASH_COMMANDS } from '../../data/slash-commands'
@@ -211,10 +211,6 @@ describe('command-registry', () => {
       expect(chats).toBeDefined()
       expect(chats?.name).toBe('history')
 
-      const modelDefault = findCommand('model:default')
-      expect(modelDefault).toBeDefined()
-      expect(modelDefault?.name).toBe('mode:default')
-
       const quit = findCommand('quit')
       expect(quit).toBeDefined()
       expect(quit?.name).toBe('exit')
@@ -286,16 +282,12 @@ describe('command-registry', () => {
       }
     })
 
-    test('mode commands expose model aliases for slash suggestions', () => {
-      const modeCommands = SLASH_COMMANDS.filter((cmd) =>
-        cmd.id.startsWith('mode:'),
-      )
-      expect(modeCommands.length).toBeGreaterThan(0)
-
-      for (const command of modeCommands) {
-        const modeName = command.id.slice('mode:'.length)
-        expect(command.aliases).toContain(`model:${modeName}`)
-      }
+    test('the menu offers no agent modes and no /image, which do nothing yet', () => {
+      // The engine ignores the agent modes, and only lists an image's path.
+      const ids = SLASH_COMMANDS.map((cmd) => cmd.id)
+      expect(ids.filter((id) => id.startsWith('mode:'))).toEqual([])
+      expect(ids).not.toContain('image')
+      expect(findCommand('model:default')).toBeUndefined()
     })
 
     test('the ChatGPT connect command is gone from both products', () => {

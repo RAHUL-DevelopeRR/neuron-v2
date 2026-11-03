@@ -2,12 +2,16 @@
 // Freebuff session countdown and fill, BYOK label, context usage from the SDK
 // run state, "End session" button and capacity-wait line are gone. The engine
 // footer (git, tokens, context %) is P3. The not-connected line now names the
-// engine's state, without repeating a reason the chat already shows.
+// engine's state, without repeating a reason the chat already shows. A
+// running turn reads as a spinner, what it is doing (writing a file, running
+// a command, waiting for the model, a stalled stream...), its elapsed time,
+// its output tokens so far and "esc to interrupt" (see live-activity.tsx).
 // See ui/neuron-tui/PORTING.md.
 import { TextAttributes } from '@opentui/core'
 import React, { useEffect, useState } from 'react'
 
 import { Button } from './button'
+import { LiveActivityLine, LiveTokenCount } from './live-activity'
 import { ScrollToBottomButton } from './scroll-to-bottom-button'
 import { ShimmerText } from './shimmer-text'
 
@@ -69,6 +73,8 @@ export const StatusBar = ({
   const engineError = useEngineStore((state) => state.error)
   // Why it stopped is already a chat line (or on the turn): said once.
   const engineErrorInChat = useEngineStore((state) => state.errorInChat)
+  // A paused turn waits for the permission dialog (or for a question's answer).
+  const awaitingApproval = useEngineStore((state) => state.permissionQueue.length > 0)
   const [elapsedSeconds, setElapsedSeconds] = useState(0)
 
   // Show timer when actively working (streaming or waiting for response) or paused (ask_user)
@@ -137,25 +143,11 @@ export const StatusBar = ({
         )
 
       case 'waiting':
-        return (
-          <ShimmerText
-            text="thinking..."
-            interval={SHIMMER_INTERVAL_MS}
-            primaryColor={theme.secondary}
-          />
-        )
-
       case 'streaming':
-        return (
-          <ShimmerText
-            text="working..."
-            interval={SHIMMER_INTERVAL_MS}
-            primaryColor={theme.secondary}
-          />
-        )
+        return <LiveActivityLine />
 
       case 'paused':
-        return null
+        return awaitingApproval ? <LiveActivityLine /> : null
 
       case 'idle':
         return null
@@ -169,6 +161,11 @@ export const StatusBar = ({
 
     return <span fg={theme.secondary}>{formatElapsedTime(elapsedSeconds)}</span>
   }
+
+  const turnRunning =
+    statusIndicatorState.kind === 'waiting' ||
+    statusIndicatorState.kind === 'streaming' ||
+    (statusIndicatorState.kind === 'paused' && awaitingApproval)
 
   const statusIndicatorContent = renderStatusIndicator()
   const elapsedTimeContent = renderElapsedTime()
@@ -224,11 +221,14 @@ export const StatusBar = ({
           gap: 1,
         }}
       >
-        <text style={{ wrapMode: 'none' }}>{elapsedTimeContent}</text>
+        <text style={{ wrapMode: 'none' }}>
+          {elapsedTimeContent}
+          {turnRunning ? <LiveTokenCount separator={elapsedTimeContent ? ' · ' : ''} /> : null}
+        </text>
         {onStop &&
           (statusIndicatorState.kind === 'waiting' ||
             statusIndicatorState.kind === 'streaming') && (
-            <StatusActionButton onClick={onStop}>■ Esc</StatusActionButton>
+            <StatusActionButton onClick={onStop}>esc to interrupt</StatusActionButton>
           )}
       </box>
     </box>

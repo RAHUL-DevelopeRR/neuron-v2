@@ -13,7 +13,9 @@
 // NEURON_TUI_BIN names, instead of the source, to check the binary. `--via-neuron` runs a bare `neuron`, which
 // should hand the terminal to that binary (NEURON_TUI_BIN), as an installed
 // Neuron does; what follows goes to `neuron` (flags such as --continue, no
-// prompt). Flags go before the prompt.
+// prompt). The workspace is trusted (NEURON_TRUST_WORKSPACE=1), so the chat
+// comes first; `--untrusted` leaves it untrusted, to try the "Before Neuron
+// works here" screen. Flags go before the prompt.
 //
 // Needs `cargo build -p rusty-claude-cli -p mock-anthropic-service` in rust/,
 // or NEURON_BIN and NEURON_MOCK_BIN. Everything (engine config, UI settings,
@@ -42,7 +44,7 @@ for (const [label, file] of [
 
 const args = process.argv.slice(2)
 const flags = new Set<string>()
-while (['--signed-out', '--compiled', '--via-neuron'].includes(args[0] ?? '')) flags.add(args.shift()!)
+while (['--signed-out', '--compiled', '--via-neuron', '--untrusted'].includes(args[0] ?? '')) flags.add(args.shift()!)
 if (flags.has('--via-neuron')) flags.add('--compiled')
 const signedOut = flags.has('--signed-out')
 // NEURON_TUI_BIN picks another build (one that is running can't be overwritten).
@@ -103,6 +105,7 @@ Object.assign(env, {
   NEURON_BIN: neuronBin,
 })
 if (flags.has('--via-neuron')) env.NEURON_TUI_BIN = compiledBin
+if (!flags.has('--untrusted')) env.NEURON_TRUST_WORKSPACE = '1'
 const gateway = signedOut ? startFakeGateway() : null
 if (gateway) {
   env.NEURON_API_BASE = gateway.base

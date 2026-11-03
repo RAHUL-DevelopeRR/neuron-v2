@@ -1,8 +1,13 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
-// commands are Neuron's (engine commands are forwarded), and /bash is not
-// listed while shell commands are not implemented (USER_SHELL_AVAILABLE).
+// commands are Neuron's (engine commands are forwarded), /bash is not listed
+// while shell commands are not implemented (USER_SHELL_AVAILABLE), and nor are
+// the /mode:* commands (AGENT_MODES_AVAILABLE) or /image while images don't
+// reach the model (IMAGES_REACH_THE_MODEL); the git commands are listed only
+// when the engine has their feature.
 // See ui/neuron-tui/PORTING.md.
-import { AGENT_MODES } from '../utils/constants'
+import { IMAGES_REACH_THE_MODEL } from '../engine/attachments'
+import { FEATURE_CHECKPOINTS, FEATURE_GIT_VIEWS } from '../engine/protocol'
+import { AGENT_MODES, AGENT_MODES_AVAILABLE } from '../utils/constants'
 import { USER_SHELL_AVAILABLE } from '../utils/user-shell'
 
 import type { SkillsMap } from '@neuron-tui/common/types/skill'
@@ -27,10 +32,12 @@ export interface SlashCommand {
    * `slash` command.
    */
   engineCommand?: boolean
+  /** Listed only while the engine's `ready.features` has this one. */
+  feature?: string
 }
 
 // Generate mode commands from the AGENT_MODES constant
-const MODE_COMMANDS: SlashCommand[] = AGENT_MODES.map((mode) => ({
+const MODE_COMMANDS: SlashCommand[] = (AGENT_MODES_AVAILABLE ? AGENT_MODES : []).map((mode) => ({
   id: `mode:${mode.toLowerCase()}`,
   label: `mode:${mode.toLowerCase()}`,
   description: `Switch to ${mode} mode`,
@@ -117,12 +124,16 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
         },
       ]
     : []),
-  {
-    id: 'image',
-    label: 'image',
-    description: 'Attach an image file (or Ctrl+V to paste from clipboard)',
-    aliases: ['img', 'attach'],
-  },
+  ...(IMAGES_REACH_THE_MODEL
+    ? [
+        {
+          id: 'image',
+          label: 'image',
+          description: 'Attach an image file (or Ctrl+V to paste from clipboard)',
+          aliases: ['img', 'attach'],
+        },
+      ]
+    : []),
   {
     id: 'model',
     label: 'model',
@@ -153,6 +164,31 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
     engineCommand: true,
     description: 'Token usage for this session',
   },
+  // These four answer with a report panel (report-panel.tsx).
+  {
+    id: 'usage',
+    label: 'usage',
+    engineCommand: true,
+    description: "Today's requests and tokens against your plan, and when they reset",
+  },
+  {
+    id: 'init',
+    label: 'init',
+    engineCommand: true,
+    description: 'Create a starter NEURON.md for this project',
+  },
+  {
+    id: 'memory',
+    label: 'memory',
+    engineCommand: true,
+    description: 'Show the instruction files Neuron loaded',
+  },
+  {
+    id: 'doctor',
+    label: 'doctor',
+    engineCommand: true,
+    description: "Check Neuron's setup in this folder",
+  },
   {
     id: 'context',
     label: 'context',
@@ -173,6 +209,11 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
   },
   ...MODE_COMMANDS,
   {
+    id: 'upgrade',
+    label: 'upgrade',
+    description: 'Plans and pricing (opens zero-x.live/pricing)',
+  },
+  {
     id: 'theme:toggle',
     label: 'theme:toggle',
     description: 'Toggle between light and dark mode',
@@ -187,6 +228,47 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
 ]
 
 export const SLASH_COMMANDS = ALL_SLASH_COMMANDS
+
+/**
+ * The git commands (commands/git-view-commands.ts), listed after /model when
+ * the engine has their feature; an older engine never shows them.
+ */
+export const GIT_VIEW_SLASH_COMMANDS: SlashCommand[] = [
+  {
+    id: 'changes',
+    label: 'changes',
+    description: 'Files the agent changed this session, with a diff for each',
+    feature: FEATURE_GIT_VIEWS,
+  },
+  {
+    id: 'diff',
+    label: 'diff',
+    description: 'Show the changes against HEAD (or /diff <path> for one file)',
+    feature: FEATURE_GIT_VIEWS,
+  },
+  {
+    id: 'commit',
+    label: 'commit',
+    description: 'Draft a commit message to review, then commit (or /commit <message>)',
+    feature: FEATURE_GIT_VIEWS,
+  },
+  {
+    id: 'rewind',
+    label: 'rewind',
+    description: 'Go back to before an earlier prompt: code, chat or both',
+    feature: FEATURE_CHECKPOINTS,
+  },
+]
+
+/** The slash commands with the git ones the engine (`features`) has. */
+export function slashCommandsFor(features: readonly string[] = []): SlashCommand[] {
+  const gitCommands = GIT_VIEW_SLASH_COMMANDS.filter(
+    (command) => command.feature && features.includes(command.feature),
+  )
+  if (gitCommands.length === 0) return SLASH_COMMANDS
+  const at = SLASH_COMMANDS.findIndex((command) => command.id === 'model') + 1
+  return [...SLASH_COMMANDS.slice(0, at), ...gitCommands, ...SLASH_COMMANDS.slice(at)]
+}
 
 export const SLASHLESS_COMMAND_IDS = new Set(
   SLASH_COMMANDS.filter((cmd) => cmd.implicitCommand).map((cmd) =>
@@ -207,8 +289,12 @@ function truncateDescription(description: string): string {
 /**
  * Returns SLASH_COMMANDS merged with skill commands.
  * Skills become slash commands that users can invoke directly.
+ * `features`: the engine's, which decide the git commands.
  */
-export function getSlashCommandsWithSkills(skills: SkillsMap): SlashCommand[] {
+export function getSlashCommandsWithSkills(
+  skills: SkillsMap,
+  features: readonly string[] = [],
+): SlashCommand[] {
   const skillCommands: SlashCommand[] = Object.values(skills).map((skill) => ({
     id: `skill:${skill.name}`,
     label: `skill:${skill.name}`,
@@ -216,7 +302,7 @@ export function getSlashCommandsWithSkills(skills: SkillsMap): SlashCommand[] {
     insertText: `/skill:${skill.name} `,
   }))
 
-  const commands = [...SLASH_COMMANDS, ...skillCommands]
+  const commands = [...slashCommandsFor(features), ...skillCommands]
 
   return commands
 }

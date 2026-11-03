@@ -1,0 +1,23 @@
+{
+  "name": "@neuron/client",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "description": "Neuron's shared client: the engine protocol, the session reducer, transports and the remote host",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./node/*": "./src/node/*.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "host": "bun run scripts/host.ts",
+    "host:mock": "bun run scripts/host.ts --mock",
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "packageManager": "bun@1.3.14",
+  "devDependencies": {
+    "@types/bun": "1.3.14",
+    "typescript": "5.9.3"
+  }
+}

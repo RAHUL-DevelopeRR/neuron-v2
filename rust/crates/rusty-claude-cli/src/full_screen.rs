@@ -21,7 +21,8 @@ pub(crate) const NO_TUI_FLAG: &str = "--no-tui";
 /// For `--continue` where the UI can't run it.
 pub(crate) const CONTINUE_NEEDS_UI: &str = "--continue reopens a chat in the full-screen UI \
 (neuron-tui), which needs a terminal and neuron-tui installed beside neuron, and can't be \
-combined with a prompt, a subcommand or --no-tui. In the line REPL, use --resume instead.";
+combined with a prompt, a subcommand or --no-tui. In the line REPL, use --resume instead; \
+from a script, send a saved session another prompt with `neuron --resume latest prompt \"...\"`.";
 
 /// What a REPL launch asked for, as the UI's flags can carry it.
 pub(crate) struct UiLaunch<'a> {

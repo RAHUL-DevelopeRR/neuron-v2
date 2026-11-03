@@ -1,5 +1,6 @@
-// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
-// See ui/neuron-tui/PORTING.md.
+// Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
+// render options say whether the call is still running. See
+// ui/neuron-tui/PORTING.md.
 import type { ContentBlock } from '../../types/chat'
 import type { ChatTheme } from '../../types/theme-system'
 import type { ToolName } from '../../types/agent-run'
@@ -12,6 +13,11 @@ export type ToolRenderOptions = {
   indentationOffset: number
   previewPrefix?: string
   labelWidth: number
+  /**
+   * The call has no result yet in a running turn: its input is still being
+   * written, or it runs.
+   */
+  isStreaming?: boolean
 }
 
 export type ToolRenderConfig = {

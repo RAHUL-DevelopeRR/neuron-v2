@@ -81,7 +81,7 @@ pub(crate) fn render_shortcuts_panel() -> String {
     let kv = |key: &str, desc: &str| -> String { format!("{ky}{key:<14}{r} {ds}{desc}{r}") };
 
     let title_line = format!(
-        "  {bc}\u{2502}{r}  {hd}\u{2328}  NeuronCLI Shortcuts{r}{}  {bc}\u{2502}{r}",
+        "  {bc}\u{2502}{r}  {hd}\u{2328}  Neuron Shortcuts{r}{}  {bc}\u{2502}{r}",
         " ".repeat(w - 23)
     );
 
@@ -342,14 +342,18 @@ pub(crate) fn prompt_count(session: &Session) -> u32 {
     let prompts = session
         .messages
         .iter()
-        .filter(|message| {
-            message.role == MessageRole::User
-                && !message.blocks.iter().any(|block| {
-                    matches!(block, ContentBlock::Text { text } if text.starts_with(runtime::AUTO_CONTINUE_PREFIX))
-                })
-        })
+        .filter(|message| is_prompt(message))
         .count();
     u32::try_from(prompts).unwrap_or(u32::MAX)
+}
+
+/// Whether `message` is a prompt the user sent, not one the runtime added to continue a
+/// turn.
+pub(crate) fn is_prompt(message: &ConversationMessage) -> bool {
+    message.role == MessageRole::User
+        && !message.blocks.iter().any(|block| {
+            matches!(block, ContentBlock::Text { text } if text.starts_with(runtime::AUTO_CONTINUE_PREFIX))
+        })
 }
 
 pub(crate) fn format_status_report(
@@ -837,6 +841,48 @@ pub(crate) fn init_claude_md() -> Result<String, Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
+    /// `--help`, `/help`, the help topics and every command summary never name another
+    /// product. Provider and model ids (`anthropic`, `claude-*`) are lowercase identifiers
+    /// and stay allowed.
+    #[test]
+    fn help_text_names_no_other_product() {
+        let mut cli_help = Vec::new();
+        crate::executor::print_help_to(&mut cli_help).expect("help renders");
+        let mut texts = vec![
+            String::from_utf8(cli_help).expect("help is utf-8"),
+            render_repl_help(),
+        ];
+        texts.extend(
+            [
+                LocalHelpTopic::Status,
+                LocalHelpTopic::Sandbox,
+                LocalHelpTopic::Doctor,
+                LocalHelpTopic::Acp,
+            ]
+            .map(render_help_topic),
+        );
+        texts.extend(
+            commands::slash_command_specs()
+                .iter()
+                .map(|spec| format!("/{}: {}", spec.name, spec.summary)),
+        );
+        for text in texts {
+            for brand in ["Claude", "Anthropic"] {
+                assert!(!text.contains(brand), "{brand} in: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_shortcuts_panel_title_names_neuron_and_fits_the_frame() {
+        let panel = render_shortcuts_panel();
+        assert!(panel.contains("Neuron Shortcuts"), "{panel}");
+        assert!(!panel.contains("NeuronCLI"), "{panel}");
+        let mut lines = panel.lines().map(crate::brand::strip_ansi_len);
+        let (top, title) = (lines.next(), lines.next());
+        assert!(top.is_some() && top == title, "{top:?} {title:?}");
+    }
+
     #[test]
     fn the_banner_welcomes_a_new_account_and_names_it() {
         assert_eq!(
@@ -872,38 +918,6 @@ mod tests {
             other,
             "Sandbox\n  Available         not on this OS (Linux only)"
         );
-    }
-
-    /// `--help`, `/help`, the help topics and every command summary never name another
-    /// product. Provider and model ids (`anthropic`, `claude-*`) are lowercase identifiers
-    /// and stay allowed.
-    #[test]
-    fn help_text_names_no_other_product() {
-        let mut cli_help = Vec::new();
-        crate::executor::print_help_to(&mut cli_help).expect("help renders");
-        let mut texts = vec![
-            String::from_utf8(cli_help).expect("help is utf-8"),
-            render_repl_help(),
-        ];
-        texts.extend(
-            [
-                LocalHelpTopic::Status,
-                LocalHelpTopic::Sandbox,
-                LocalHelpTopic::Doctor,
-                LocalHelpTopic::Acp,
-            ]
-            .map(render_help_topic),
-        );
-        texts.extend(
-            commands::slash_command_specs()
-                .iter()
-                .map(|spec| format!("/{}: {}", spec.name, spec.summary)),
-        );
-        for text in texts {
-            for brand in ["Claude", "Anthropic"] {
-                assert!(!text.contains(brand), "{brand} in: {text}");
-            }
-        }
     }
 
     /// The `openai/` routing prefix picks a client; it is not part of the model's name, in

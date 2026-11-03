@@ -1,12 +1,13 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the check
 // marks come from utils/glyphs.ts (console-safe in a classic Windows console
-// window). See ui/neuron-tui/PORTING.md.
+// window), and the item in progress is marked and drawn bold.
+// See ui/neuron-tui/PORTING.md.
 import { TextAttributes } from '@opentui/core'
 
 import { defineToolComponent } from './types'
 import { useTheme } from '../../hooks/use-theme'
 import { GLYPHS } from '../../utils/glyphs'
-import { parseTodos } from '../../utils/todos'
+import { parseTodos, todoStatusOf } from '../../utils/todos'
 
 import type { ToolRenderConfig } from './types'
 import type { TodoItem } from '../../utils/todos'
@@ -61,6 +62,13 @@ export const WriteTodosItem = ({
                   fg={theme.muted}
                   attributes={TextAttributes.STRIKETHROUGH}
                 >
+                  {todo.task}
+                </span>
+              </>
+            ) : todoStatusOf(todo) === 'in_progress' ? (
+              <>
+                <span fg={theme.primary}>{`${GLYPHS.todoActive}  `}</span>
+                <span fg={theme.foreground} attributes={TextAttributes.BOLD}>
                   {todo.task}
                 </span>
               </>

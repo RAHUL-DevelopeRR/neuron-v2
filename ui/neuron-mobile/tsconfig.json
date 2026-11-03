@@ -1,0 +1,13 @@
+{
+  "extends": "expo/tsconfig.base",
+  "compilerOptions": {
+    "strict": true,
+    "skipLibCheck": true,
+    "types": ["bun"],
+    "baseUrl": ".",
+    "paths": {
+      "@neuron/client": ["../neuron-client/src/index.ts"]
+    }
+  },
+  "include": ["App.tsx", "index.ts", "src", "test"]
+}

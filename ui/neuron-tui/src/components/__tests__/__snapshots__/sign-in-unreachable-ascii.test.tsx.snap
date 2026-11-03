@@ -1,0 +1,9 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`the Can't reach Zero-X panel in a classic console (ASCII mode) at 80x24 1`] = `
+"┌──────────────────────────── Can't reach Zero-X ────────────────────────────┐
+│ Neuron could not start a sign-in with Zero-X.                              │
+│ Could not reach Zero-X: connection refused                                 │
+│ Check your connection, then type /login to try again.                      │
+└────────────────────────────────────────────────────────────────────────────┘"
+`;

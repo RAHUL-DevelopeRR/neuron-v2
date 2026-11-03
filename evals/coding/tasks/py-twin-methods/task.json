@@ -1,0 +1,9 @@
+{
+  "id": "py-twin-methods",
+  "summary": "Change one of two methods with identical bodies; the first match is the wrong one.",
+  "tags": ["python", "edit-precision"],
+  "prompt": "In inventory.py, `Warehouse.restock` must never raise a SKU's stock above `max_capacity`: cap it at `max_capacity` and return the capped stock. `Warehouse.receive_return` must keep accepting returns even above capacity. Change nothing else.",
+  "allow": ["bash(python -m unittest:*)", "bash(python -m pytest:*)"],
+  "grader": {"from": "grader", "to": "_grader"},
+  "check": "python -m unittest discover -s _grader -q"
+}

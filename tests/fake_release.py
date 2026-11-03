@@ -11,7 +11,7 @@ serves DIR over HTTP on 127.0.0.1 until it is killed, answering
 ``/releases/latest`` with ``{"tag_name": "v<newest staged version>"}``.
 
 The dummy binary prints ``neuron-dummy <version>`` for ``--version`` (or the real
-binary's ``NeuronCLI`` / ``Version`` report when ``$NEURON_DUMMY_VERSION_REPORT`` is
+binary's ``Neuron`` / ``Version`` report when ``$NEURON_DUMMY_VERSION_REPORT`` is
 set) and its arguments otherwise, prints ``pid=<pid>`` when ``$NEURON_DUMMY_PID`` is
 set (POSIX), and exits with ``$NEURON_DUMMY_EXIT`` (default 0).
 """
@@ -34,7 +34,7 @@ from typing import Dict, List, Optional, Tuple
 
 POSIX_DUMMY = """#!/bin/sh
 if [ "${{1:-}}" = "--version" ] && [ -n "${{NEURON_DUMMY_VERSION_REPORT:-}}" ]; then
-    echo "NeuronCLI"
+    echo "Neuron"
     echo "  Version          {version}"
     echo "  Build date       2026-01-01"
 elif [ "${{1:-}}" = "--version" ]; then
@@ -52,7 +52,7 @@ WINDOWS_DUMMY = """using System;
 class NeuronDummy {{
     static int Main(string[] args) {{
         if (args.Length > 0 && args[0] == "--version" && !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("NEURON_DUMMY_VERSION_REPORT"))) {{
-            Console.WriteLine("NeuronCLI");
+            Console.WriteLine("Neuron");
             Console.WriteLine("  Version          {version}");
             Console.WriteLine("  Build date       2026-01-01");
         }} else if (args.Length > 0 && args[0] == "--version") {{

@@ -648,7 +648,7 @@ jobs:
               ;;
           esac
           echo "Publishing $TARBALL to npm under the dist-tag $tag"
-          npm publish "dist/$TARBALL" --access public --tag "$tag" --ignore-scripts
+          npm publish "./dist/$TARBALL" --access public --tag "$tag" --ignore-scripts
 
   package-pypi:
     name: Build and test the PyPI package

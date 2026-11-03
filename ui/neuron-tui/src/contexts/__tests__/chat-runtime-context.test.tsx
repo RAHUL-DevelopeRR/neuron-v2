@@ -14,6 +14,7 @@ import {
   stopActiveRun,
   type ActiveRunStopReason,
 } from '../../utils/active-run'
+import { useGitViewsStore } from '../../state/git-views-store'
 
 import type { StreamStatus } from '../../hooks/use-message-queue'
 
@@ -146,4 +147,60 @@ describe('ChatRuntimeProvider navigation', () => {
       }
     })
   }
+})
+
+describe('ChatRuntimeProvider and the git panels', () => {
+  test('a commit card or rewind picker holds the queue; it sends once the panel closes', async () => {
+    let runtime: ChatRuntime | undefined
+    const Snapshot = () => {
+      runtime = useChatRuntime()
+      return <text>{`queued:${runtime.queuedMessages.length}`}</text>
+    }
+    const setup = await createTestRenderer({ width: 80, height: 3 })
+    const root = createRoot(setup.renderer)
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    useGitViewsStore.getState().reset()
+    useGitViewsStore.getState().setProposal({
+      message: 'fix: things',
+      branch: 'main',
+      files: [{ path: 'a.ts', status: 'modified', added: 1, removed: 0 }],
+      stage_all: true,
+    })
+    flushSync(() => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <ChatRuntimeProvider inputRef={{ current: null }} continueChat={false}>
+            <Snapshot />
+          </ChatRuntimeProvider>
+        </QueryClientProvider>,
+      )
+    })
+    await setup.renderOnce()
+    try {
+      flushSync(() => runtime!.addToQueue('P2'))
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      await setup.renderOnce()
+      expect(runtime!.queuedMessages.map((message) => message.content)).toEqual(['P2'])
+
+      // The card gives way to the picker in the same update.
+      flushSync(() => {
+        useGitViewsStore.getState().setProposal(null)
+        useGitViewsStore.getState().openRewind([])
+      })
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      await setup.renderOnce()
+      expect(runtime!.queuedMessages).toHaveLength(1)
+
+      flushSync(() => useGitViewsStore.getState().closeRewind())
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      await setup.renderOnce()
+      expect(runtime!.queuedMessages).toHaveLength(0)
+    } finally {
+      stopActiveRun('process-exit')
+      useGitViewsStore.getState().reset()
+      flushSync(() => root.unmount())
+      queryClient.clear()
+      setup.renderer.destroy()
+    }
+  })
 })

@@ -8,12 +8,18 @@
  * then the mode, an untrusted folder and the signed-in email; the token
  * counters go first. A long model id is cut short ("…") before any part but
  * the token counters is dropped.
+ *
+ * While a turn streams, the token counters add what it used so far (finished
+ * requests and the response now streaming) to the last totals, marked `~` as
+ * estimates; the turn's own `usage` then settles them.
  */
 
 import React from 'react'
 
 import { useTheme } from '../hooks/use-theme'
+import { liveFooterTokens } from '../engine/live-turn'
 import { needsSignIn, useEngineStore, type EngineStoreState } from '../state/engine-store'
+import { useLiveTurnStore } from '../state/live-turn-store'
 import { formatTokenCount } from '../utils/format-token-count'
 
 import type { GitStatus, StatusEvent } from '../engine/protocol'
@@ -75,17 +81,34 @@ export function hasUsableLogin(status: StatusEvent): boolean {
   return status.signed_in === true && !needsSignIn(status)
 }
 
+/** Tokens a streaming turn used since the last `usage` totals. */
+export interface LiveTokens {
+  input: number
+  output: number
+}
+
+/**
+ * The model as the footer names it: `auto → <model>` once `auto` (or a
+ * failover) has had an answer from a model other than the one selected.
+ */
+export function footerModel(status: StatusEvent): string {
+  const served = status.served_model
+  return served && served !== status.model ? `${status.model} → ${served}` : status.model
+}
+
 export function footerParts(
   status: StatusEvent | null,
   usage: EngineStoreState['usage'],
+  live: LiveTokens | null = null,
 ): FooterPart[] {
   if (!status) return []
+  const model = footerModel(status)
   const parts: FooterPart[] = [
     {
-      text: status.model,
+      text: model,
       tone: 'normal',
       priority: PRIORITY.model,
-      minWidth: Math.min(status.model.length, MODEL_MIN_WIDTH),
+      minWidth: Math.min(model.length, MODEL_MIN_WIDTH),
     },
   ]
   parts.push({
@@ -99,12 +122,14 @@ export function footerParts(
   if (status.git) {
     parts.push({ text: formatGit(status.git), tone: 'muted', priority: PRIORITY.git })
   }
-  if (usage) {
-    const total = usage.cumulative
-    const input = total.input + total.cache_read + total.cache_write
-    const mark = usage.estimated ? '~' : ''
+  if (usage || live) {
+    const total = usage?.cumulative
+    const input =
+      (total ? total.input + total.cache_read + total.cache_write : 0) + (live?.input ?? 0)
+    const output = (total?.output ?? 0) + (live?.output ?? 0)
+    const mark = usage?.estimated || live ? '~' : ''
     parts.push({
-      text: `↑${mark}${formatTokenCount(input)} ↓${mark}${formatTokenCount(total.output)}`,
+      text: `↑${mark}${formatTokenCount(input)} ↓${mark}${formatTokenCount(output)}`,
       tone: 'muted',
       priority: PRIORITY.tokens,
     })
@@ -199,7 +224,11 @@ export const EngineFooter = ({ width }: { width: number }) => {
   const theme = useTheme()
   const status = useEngineStore((state) => state.status)
   const usage = useEngineStore((state) => state.usage)
-  const parts = fitParts(footerParts(status, usage), Math.max(0, width - 2))
+  const unsettledInput = useLiveTurnStore((state) => state.unsettledInput)
+  const unsettledOutput = useLiveTurnStore((state) => state.unsettledOutput)
+  const streamingOutput = useLiveTurnStore((state) => state.streamingOutput)
+  const live = liveFooterTokens({ unsettledInput, unsettledOutput, streamingOutput })
+  const parts = fitParts(footerParts(status, usage, live), Math.max(0, width - 2))
   if (parts.length === 0) return null
 
   const color = (tone: FooterTone) =>
