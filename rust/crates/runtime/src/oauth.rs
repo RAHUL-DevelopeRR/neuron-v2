@@ -379,7 +379,7 @@ fn write_credentials_root(path: &PathBuf, root: &Map<String, Value>) -> io::Resu
     fs::rename(temp_path, path)
 }
 
-fn base64url_encode(bytes: &[u8]) -> String {
+pub(crate) fn base64url_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut output = String::new();
     let mut index = 0;

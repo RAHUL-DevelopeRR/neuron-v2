@@ -110,6 +110,11 @@ pub const FEATURE_GIT_VIEWS: &str = "git_views";
 /// ([`UiEvent::Rewound`]). Without [`CAPABILITY_GIT_VIEWS`] it answers with notices.
 pub const FEATURE_CHECKPOINTS: &str = "checkpoints";
 
+/// [`EngineCommand::SetMcpServerEnabled`] turns an MCP server on or off (persisted to
+/// `disabledMcpServers` in the user settings); [`McpServerInfo::enabled`] is set and
+/// disabled servers are listed with status `disabled`.
+pub const FEATURE_MCP_TOGGLE: &str = "mcp_toggle";
+
 /// What this engine can do beyond protocol 1, in [`UiEvent::Ready`]. A UI sends the
 /// commands a feature adds only when the engine lists it: an older engine would skip
 /// them with a notice.
@@ -134,6 +139,7 @@ pub const ENGINE_FEATURES: &[&str] = &[
     FEATURE_LIVE_PROGRESS,
     FEATURE_GIT_VIEWS,
     FEATURE_CHECKPOINTS,
+    FEATURE_MCP_TOGGLE,
 ];
 
 /// `report` events for the commands that show a report (`/usage`, `/init`, `/memory`,
@@ -161,12 +167,20 @@ pub struct McpServerInfo {
     /// `stdio`, `http`, `sse`, `ws`, `sdk` or `managed_proxy`.
     pub transport: String,
     /// `starting`, `ready`, `failed`, `pending` (started, tools not found),
-    /// `unsupported` (a transport Neuron does not speak yet) or `not_started`.
+    /// `unsupported` (a transport Neuron does not speak yet), `not_started` or
+    /// `disabled` (turned off in the settings).
     pub status: String,
     /// Its tools, without the `mcp__<server>__` prefix.
     pub tools: Vec<String>,
     /// Why it failed or is unsupported.
     pub error: Option<String>,
+    /// Turned on ([`FEATURE_MCP_TOGGLE`]); older engines leave it out, meaning on.
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+}
+
+fn enabled_by_default() -> bool {
+    true
 }
 
 /// One installed plugin.
@@ -848,6 +862,10 @@ pub enum EngineCommand {
     TrustWorkspace,
     /// Ask for the extensions ([`UiEvent::Extensions`]).
     ListExtensions,
+    /// Turn the MCP server `name` on or off ([`FEATURE_MCP_TOGGLE`]): a notice and a
+    /// fresh [`UiEvent::Extensions`] follow, or an error. Servers restart from the next
+    /// turn.
+    SetMcpServerEnabled { name: String, enabled: bool },
     /// Ask what trusting the workspace would turn on ([`UiEvent::TrustPreview`]).
     TrustPreview,
     /// Read the account's plan and usage again ([`UiEvent::Account`]).
@@ -1048,6 +1066,13 @@ mod tests {
             (
                 r#"{"kind":"command","type":"list_extensions"}"#,
                 EngineCommand::ListExtensions,
+            ),
+            (
+                r#"{"kind":"command","type":"set_mcp_server_enabled","name":"docs","enabled":false}"#,
+                EngineCommand::SetMcpServerEnabled {
+                    name: "docs".into(),
+                    enabled: false,
+                },
             ),
         ] {
             assert_eq!(

@@ -33,9 +33,14 @@ mod lane_events;
 pub mod lsp_client;
 mod mcp;
 mod mcp_client;
+mod mcp_http;
 pub mod mcp_lifecycle_hardened;
+mod mcp_oauth;
 pub mod mcp_server;
 mod mcp_stdio;
+#[cfg(test)]
+mod mcp_test_http;
+mod mcp_toggle;
 pub mod mcp_tool_bridge;
 pub mod model_registry;
 pub mod net_allow;
@@ -136,9 +141,16 @@ pub use mcp_client::{
     McpClientAuth, McpClientBootstrap, McpClientTransport, McpManagedProxyTransport,
     McpRemoteTransport, McpSdkTransport, McpStdioTransport,
 };
+pub use mcp_http::expand_env_refs as expand_mcp_header_value;
 pub use mcp_lifecycle_hardened::{
     McpDegradedReport, McpErrorSurface, McpFailedServer, McpLifecyclePhase, McpLifecycleState,
     McpLifecycleValidator, McpPhaseResult,
+};
+pub use mcp_oauth::{
+    build_authorization_url, canonical_resource_uri, clear_mcp_tokens, discover_mcp_authorization,
+    generate_mcp_pkce, load_mcp_tokens, login_mcp_server, mcp_token_key, parse_token_response,
+    parse_www_authenticate, refresh_mcp_tokens, save_mcp_tokens, set_mcp_token_store, token_action,
+    McpAuthDiscovery, McpLoginOptions, McpOAuthTokens, McpTokenStore, TokenAction,
 };
 pub use mcp_server::{McpServer, McpServerSpec, ToolCallHandler, MCP_SERVER_PROTOCOL_VERSION};
 pub use mcp_stdio::{
@@ -150,6 +162,7 @@ pub use mcp_stdio::{
     McpServerManagerError, McpStdioProcess, McpTool, McpToolCallContent, McpToolCallParams,
     McpToolCallResult, McpToolDiscoveryReport, UnsupportedMcpServer,
 };
+pub use mcp_toggle::{set_mcp_server_enabled, McpToggleOutcome};
 pub use oauth::{
     clear_oauth_credentials, code_challenge_s256, credentials_path, generate_pkce_pair,
     generate_state, load_oauth_credentials, loopback_redirect_uri, parse_oauth_callback_query,

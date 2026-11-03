@@ -145,6 +145,8 @@ pub struct RuntimePermissionRuleConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct McpConfigCollection {
     servers: BTreeMap<String, ScopedMcpServerConfig>,
+    /// Configured servers turned off by `disabledMcpServers` (in any settings file).
+    disabled: BTreeMap<String, ScopedMcpServerConfig>,
 }
 
 /// MCP server config paired with the scope that defined it.
@@ -454,6 +456,8 @@ impl ConfigLoader {
 
         let workspace_trusted = self.workspace_trusted(&parsed_entries)?;
         let mut ignored_project_settings = Vec::new();
+        // `disabledMcpServers` adds up across files: a server off anywhere stays off.
+        let mut disabled_mcp_servers = BTreeSet::new();
         for (entry, mut object) in parsed_entries {
             if is_workspace_entry(&entry) {
                 ignored_project_settings.extend(apply_workspace_policy(
@@ -466,6 +470,10 @@ impl ConfigLoader {
                 }
             }
             validate_optional_hooks_config(&object, &entry.path)?;
+            disabled_mcp_servers.extend(
+                optional_string_array(&object, "disabledMcpServers", "settings")?
+                    .unwrap_or_default(),
+            );
             merge_mcp_servers(&mut mcp_servers, entry.source, &object, &entry.path)?;
             deep_merge_objects(&mut merged, &object);
             loaded_entries.push(entry);
@@ -500,10 +508,11 @@ impl ConfigLoader {
                     });
             }
         }
-        for name in optional_string_array(&merged, "disabledMcpServers", "merged settings")?
-            .unwrap_or_default()
-        {
-            mcp_servers.remove(&name);
+        let mut disabled_servers = BTreeMap::new();
+        for name in disabled_mcp_servers {
+            if let Some(server) = mcp_servers.remove(&name) {
+                disabled_servers.insert(name, server);
+            }
         }
 
         let merged_value = JsonValue::Object(merged.clone());
@@ -513,6 +522,7 @@ impl ConfigLoader {
             plugins: parse_optional_plugin_config(&merged_value)?,
             mcp: McpConfigCollection {
                 servers: mcp_servers,
+                disabled: disabled_servers,
             },
             oauth: parse_optional_oauth_config(&merged_value, "merged settings.oauth")?,
             model: parse_optional_model(&merged_value),
@@ -1218,6 +1228,12 @@ impl McpConfigCollection {
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&ScopedMcpServerConfig> {
         self.servers.get(name)
+    }
+
+    /// Configured servers that `disabledMcpServers` turned off.
+    #[must_use]
+    pub fn disabled(&self) -> &BTreeMap<String, ScopedMcpServerConfig> {
+        &self.disabled
     }
 }
 
