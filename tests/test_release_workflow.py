@@ -341,7 +341,7 @@ class ReleaseWorkflowStepTests(unittest.TestCase):
         result = self.run_step(
             "publish-npm",
             "Publish",
-            TARBALL="zero-x.live-neuron-7.0.0-alpha.3.tgz",
+            TARBALL="zero-x.live-neuron-7.0.0-alpha.4.tgz",
             EVENT_NAME=event,
             NPM_DIST_TAG=dist_tag,
             PRERELEASE=prerelease,
@@ -366,7 +366,7 @@ class ReleaseWorkflowStepTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(
                     calls,
-                    [f"publish ./dist/zero-x.live-neuron-7.0.0-alpha.3.tgz --access public --tag {expected} --ignore-scripts"],
+                    [f"publish ./dist/zero-x.live-neuron-7.0.0-alpha.4.tgz --access public --tag {expected} --ignore-scripts"],
                 )
 
     def test_npm_publish_refuses_a_dist_tag_other_than_next_or_latest(self) -> None:

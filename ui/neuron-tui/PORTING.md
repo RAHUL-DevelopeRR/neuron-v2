@@ -483,6 +483,59 @@ capability once the engine is ready, and reads `features` from `ready`.
   checks: 2 quits with exit code 0, and 1 allows Neuron, after which the chat
   reads the keyboard.
 
+## Prompt status bar
+
+The one-line engine footer under the input became a status bar of five
+clickable segments and the Zero-X account (`components/prompt-status-bar.tsx`,
+text and fitting in `utils/status-bar-parts.ts`):
+
+    G Gemini 2.5 Flash ▾ │ ● think high │ ⌂ neuron-v2 ⎇ main +1 ~2 │ ✎ Edit workspace │ ●●●◑○○○○○○ 35% ctx      Free · 5h 12% · 37/100 req
+
+- **Model.** A provider monogram (`utils/provider-badge.ts`: plain letters,
+  never a logo, brand colour or provider name) and the model's name; `auto`
+  reads `auto → <model that answered>`. A model the plan can no longer use reads
+  `(locked)`. Click or Alt+M opens the model picker, whose models the plan can't
+  use stay greyed with the reason; Tab on a model lists its thinking levels.
+- **Thinking level.** The level the next turn asks for, from the model's own
+  levels (the gateway's `reasoning_efforts`). Click, Alt+T or `/effort <level>`.
+- **Workspace and branch.** The folder (click or Alt+W: the recent folders;
+  picking one restarts the engine there) and the branch with its staged,
+  unstaged, untracked and conflicted counts (click: the local branches; a switch
+  needs a second Enter, and is refused while tracked files have changes).
+  `/branch`, `/branch <name>`, `/branch new <name>`.
+- **Permission mode.** Read-only, Edit workspace, Plan, and Full access only
+  when the engine started with it. Shift+Tab cycles them; click or Alt+P lists
+  them.
+- **Context.** Ten circles (five when narrow), each a tenth of the usable
+  window (the window less the reply's reserve), partly filled cells as ◔◑◕;
+  green, then the text colour from half full, warning from 80% (where
+  auto-compaction starts, its cell marked), error from 95%. Click or Alt+C opens
+  the breakdown (system prompt, tools, project instructions, conversation, tool
+  outputs, free), the session's tokens, and the account's 5-hour window and
+  today's requests, read again every minute while it is open.
+- **Narrow terminals.** Parts give way in a fixed order (the account group
+  shortens, labels go, then git counts, the folder, half the circles, the
+  account, the branch is cut, the thinking level and the circles go, the model
+  name is cut). The monogram, the permission mode and the percentage stay.
+- **Engines.** The engine side is feature `status_bar` (protocol 1, additive
+  fields only). Older engines still get a bar: no thinking segment, the old
+  `context_percent` clamped to 100 and marked `~`, and the permission cycle runs
+  `/permissions` and `/plan` as slash commands.
+
+Ported from Freebuff (Apache-2.0, commit `545e04d`), each file with the
+derivation header:
+
+| Neuron file | Freebuff original | What changed |
+|---|---|---|
+| `components/context-meter.tsx` | `cli/src/components/progress-bar.tsx` | Circles instead of blocks, partly filled cells, fill-based tones, the compaction marker, a console-font fallback. |
+| `components/model-picker.tsx` (thinking submenu only) | the reasoning submenu of `cli/src/components/freebuff-model-selector.tsx` (Tab handling and list) | Levels from the engine's catalog, set through the engine; the rest of the picker is Neuron's. |
+| `components/prompt-status-bar.tsx` | the clickable footer of `cli/src/components/freebuff-chat-footer.tsx` | Five segments and the account, fitted to the width. |
+| `utils/account-usage.ts` (reset wording) | `formatRenewalDate` in `cli/src/components/usage-banner.tsx` | "14:32 (in 3h 10m)", Zero-X's account rows. |
+
+Not ported: the rest of `freebuff-model-selector.tsx` (Freebucks, the session
+queue, referrals), `freebuff-chat-controls.tsx` (the admission queue) and the
+SDK run-state context source of Freebuff's status bar.
+
 ## Left for later
 
 - **Still open from P3:**

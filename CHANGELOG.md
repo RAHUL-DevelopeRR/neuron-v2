@@ -3,6 +3,109 @@
 Notable changes to Neuron. Versions follow [semantic versioning](https://semver.org/).
 The release workflow copies a version's section into its GitHub release notes.
 
+## 7.0.0-alpha.4 (2026-11-03)
+
+The fourth Neuron alpha. In the full-screen UI, the line under the input is now a
+status bar: the model, its thinking level, the folder and git branch, the permission
+mode and how full the context window is, each a click or a key away from a picker,
+with your Zero-X plan and usage on the right. The status bar is the only change in
+this release: the bug fixes and the MCP work made since 7.0.0-alpha.3 are not part of
+it.
+
+It is still a GitHub prerelease. The [known limitations of 7.0.0-alpha.1](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/v7.0.0-alpha.1/CHANGELOG.md#known-limitations)
+still apply, except the ones about npm and PyPI and the ones earlier alphas fixed.
+
+### npm and PyPI
+
+- The npm and PyPI packages are published after this GitHub release, once its assets
+  have been checked, so they can appear later than the release itself.
+- On npm this alpha is published under the default `latest` dist-tag. When
+  `npm view @zero-x.live/neuron version` prints `7.0.0-alpha.4`,
+  `npm install --global @zero-x.live/neuron` installs it (run the same command to
+  upgrade from 7.0.0-alpha.3); while it still prints `7.0.0-alpha.3`, use the install
+  scripts.
+- On PyPI the alpha is a pre-release (`7.0.0a4`), installed with
+  `pip install --pre neuroncli` (`pip install --upgrade --pre neuroncli` to upgrade)
+  once `pip index versions neuroncli --pre` lists it.
+- The old 6.2.x builds (npm 6.2.0, PyPI 6.2.4 and earlier) remain unsupported.
+
+### Full-screen UI: the status bar
+
+- The bar has five parts, left to right: the model, the thinking level, the folder and
+  branch, the permission mode and the context meter. Click a part, or press Alt+M
+  (model), Alt+T (thinking level), Alt+W (folder), Alt+P (permission mode) or Alt+C
+  (context), to open its picker; on macOS the keys are Option+M and so on once the
+  terminal is set to use Option as Meta (Alt), otherwise click the part. The help
+  screen lists them under "Status bar". The session's token counts, which the old
+  footer showed, are in the context popover.
+- In a narrow terminal, parts give way in a fixed order (the account shortens first,
+  then the labels, the git counts, the folder, half the meter's circles and the account
+  go, and so on). The provider letter, the permission mode and the context percentage
+  always stay.
+
+### Model and thinking level
+
+- The model part shows a letter for the provider and the model's name. With `auto` it
+  reads `auto → <model that answered>`, and a model your plan can no longer use reads
+  `(locked)`.
+- In the model picker, Tab on a model lists its thinking levels; Enter on a level
+  switches to that model and sets that level.
+- The thinking level is the one the next turn asks for, from the levels the model
+  offers. Pick it from the bar (Alt+T), or type `/effort <level>`. `/effort` alone
+  shows the current level and the model's levels, and `/effort default` goes back to
+  the model's own default. `/effort` used to be refused in the full-screen UI.
+- Switching to a model that does not take the current level goes back to that model's
+  default and says so ("Thinking level: default. This model does not take ...").
+
+### Folder and branch
+
+- The folder part opens your recent folders. Picking one restarts Neuron there with a
+  new session, and the chat gets a line saying the new session is in another folder.
+  While a turn runs, or waits for your approval or an answer, the picker asks for a
+  second Enter first, because switching stops that turn.
+- The branch part shows the branch with its staged (`+`), unstaged (`~`), untracked
+  (`?`) and conflicted (`!`) file counts. Clicking it lists the local branches, also
+  while a turn runs; switching takes a second Enter.
+- `/branch` lists the local branches, `/branch <name>` switches to one and
+  `/branch new <name>` creates one and switches to it. A switch is refused while
+  tracked files have uncommitted changes ("Commit or stash your changes before
+  switching").
+
+### Permission mode
+
+- The permission part shows Read-only, Edit workspace or Plan; Full access is offered
+  only when Neuron was started with it. Shift+Tab cycles them (Read-only, Edit
+  workspace, Full access when allowed, Plan); Alt+P or a click lists them.
+- A mode chosen during a turn takes effect after the turn. Until then the bar shows it
+  as pending (for example "Edit workspace → Plan next") and the picker marks it. Shift+Tab moves
+  on from the pending choice, so two quick presses go two steps instead of sending the
+  same choice twice.
+
+### Context meter and popover
+
+- The meter is ten circles (five when narrow), each a tenth of the usable context
+  window (the window less the space kept for the reply), with partly filled circles and
+  the percentage. It is green, then the normal text colour from half full, the warning
+  colour from 80% and the error colour from 95%. The circle where auto-compaction
+  starts is marked, and `~` before the percentage means it is an estimate.
+- Alt+C or a click opens the context popover: what fills the window (system prompt,
+  tools, project instructions and memory, conversation, tool outputs, free), the
+  session's tokens, and your Zero-X account's 5-hour window and today's requests with
+  when each resets. The account rows are read again every minute while it is open. In
+  a short terminal the popover keeps the meter, the free share, the auto-compaction
+  line and the account title, and the status bar stays on screen.
+- `/context` in the full-screen UI opens the same breakdown as a report, with the
+  usable tokens, the space kept for the reply and where auto-compaction starts.
+
+### Zero-X plan and usage
+
+- The right side shows your plan, the share of its 5-hour token window you have used
+  (`Free · 5h 12% · 37/100 req`) and today's requests against the daily limit. The
+  window share turns to the warning colour at 80% and the error colour at 95%.
+- When the gateway does not send the 5-hour window, the bar shows the plan and today's
+  requests, and the popover shows today's requests (or tokens) only.
+- Signed out, the right side reads `Signed out: /login`.
+
 ## 7.0.0-alpha.3 (2026-11-02)
 
 The third Neuron alpha. The full-screen UI now shows what a turn is doing while it

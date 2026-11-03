@@ -49,6 +49,13 @@ pub struct CatalogModel {
     pub available_again_at: Option<String>,
     /// The model reads images (`capabilities.vision`); `None` when the gateway does not say.
     pub supports_images: Option<bool>,
+    /// Who serves it (`owned_by`, or `provider`): `gemini`, `groq`, `zero-x` for `auto`.
+    pub provider: Option<String>,
+    /// The thinking levels it takes (`reasoning_efforts`), lowest first; `None` when the
+    /// gateway does not say.
+    pub reasoning_efforts: Option<Vec<String>>,
+    /// The model reasons (`capabilities.reasoning`); `None` when the gateway does not say.
+    pub supports_reasoning: Option<bool>,
 }
 
 impl CatalogModel {
@@ -88,6 +95,21 @@ impl CatalogModel {
                 .and_then(|capabilities| capabilities.get("vision"))
                 .and_then(Value::as_bool)
                 .or_else(|| value.get("supports_vision").and_then(Value::as_bool)),
+            provider: string_field(value, "owned_by").or_else(|| string_field(value, "provider")),
+            reasoning_efforts: value
+                .get("reasoning_efforts")
+                .and_then(Value::as_array)
+                .map(|efforts| {
+                    efforts
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                }),
+            supports_reasoning: capabilities
+                .and_then(|capabilities| capabilities.get("reasoning"))
+                .and_then(Value::as_bool)
+                .or_else(|| value.get("supports_reasoning").and_then(Value::as_bool)),
             id,
         })
     }
@@ -195,6 +217,11 @@ pub fn model_supports_images(model: &str) -> Option<bool> {
             .find(crate::provider::shown_model(model))
             .and_then(|entry| entry.supports_images)
     })
+}
+
+/// The catalog's entry for `model`, when there is a catalog with one.
+pub fn model_entry(model: &str) -> Option<CatalogModel> {
+    current().and_then(|catalog| catalog.find(crate::provider::shown_model(model)).cloned())
 }
 
 /// How the system prompt names `model`: the catalog's display name with the id, or the
@@ -830,7 +857,7 @@ mod tests {
             "object": "list",
             "data": [
                 {"id": "auto", "object": "model", "created": 0, "owned_by": "zero-x", "display_name": "Auto", "context_window": null, "max_output_tokens": null, "capabilities": {"tools": true, "streaming": true, "vision": false}, "tiers": ["free"], "available": true, "unavailable_reason": null, "pricing": null},
-                {"id": "test-gw/gemini-unit-flash", "object": "model", "display_name": "Gemini Flash", "context_window": 1_048_576, "max_output_tokens": 65_536, "capabilities": {"tools": true, "streaming": true, "vision": true}, "tiers": ["free", "paid"], "available": true, "unavailable_reason": null},
+                {"id": "test-gw/gemini-unit-flash", "object": "model", "display_name": "Gemini Flash", "provider": "gemini", "reasoning_efforts": ["none", "low", "medium", "high"], "context_window": 1_048_576, "max_output_tokens": 65_536, "capabilities": {"tools": true, "streaming": true, "vision": true, "reasoning": true}, "tiers": ["free", "paid"], "available": true, "unavailable_reason": null},
                 {"id": "test-gw/paid-only-unit", "object": "model", "display_name": "Paid Only", "context_window": 262_144, "max_output_tokens": 32_768, "capabilities": {"tools": false, "streaming": true}, "tiers": ["paid"], "available": false, "unavailable_reason": "upgrade_required", "pricing": {"input_per_mtok_usd": 0.3, "output_per_mtok_usd": 2.5}},
                 {"object": "model", "display_name": "missing id is skipped"}
             ]
@@ -907,6 +934,26 @@ mod tests {
         );
         assert_eq!(models[1].supports_images, Some(true), "capabilities.vision");
         assert_eq!(models[2].supports_images, None, "not said");
+        assert_eq!(models[0].provider.as_deref(), Some("zero-x"), "owned_by");
+        assert_eq!(models[1].provider.as_deref(), Some("gemini"), "provider");
+        assert_eq!(
+            models[1].reasoning_efforts.as_deref(),
+            Some(
+                &[
+                    "none".to_string(),
+                    "low".into(),
+                    "medium".into(),
+                    "high".into()
+                ][..]
+            )
+        );
+        assert_eq!(
+            models[1].supports_reasoning,
+            Some(true),
+            "capabilities.reasoning"
+        );
+        assert_eq!(models[2].reasoning_efforts, None, "not said");
+        assert_eq!(models[2].supports_reasoning, None, "not said");
 
         register(&models);
         let flash = model_registry::lookup("openai/test-gw/gemini-unit-flash").unwrap();
