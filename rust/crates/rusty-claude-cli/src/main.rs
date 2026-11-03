@@ -7094,7 +7094,7 @@ mod tests {
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
         assert!(help.contains("/config [env|hooks|model|plugins]"));
-        assert!(help.contains("/mcp [list|show <server>|help]"));
+        assert!(help.contains("/mcp [list|show <server>|enable <server>|disable <server>|help]"));
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
         assert!(help.contains("/diff"));
@@ -9065,13 +9065,15 @@ UU conflicted.rs",
         let workspace = temp_dir();
         fs::create_dir_all(&config_home).expect("config home");
         fs::create_dir_all(&workspace).expect("workspace");
+        // Remote http/sse servers are managed now; WebSocket servers are still not.
         fs::write(
             config_home.join("settings.json"),
             r#"{
               "defaultMcpServers": false,
               "mcpServers": {
                 "remote": {
-                  "url": "https://example.test/mcp"
+                  "type": "ws",
+                  "url": "wss://example.test/mcp"
                 }
               }
             }"#,
@@ -9106,7 +9108,7 @@ UU conflicted.rs",
         );
         assert_eq!(
             search_json["mcp_degraded"]["failed_servers"][0]["error"]["context"]["transport"],
-            "http"
+            "ws"
         );
 
         let _ = fs::remove_dir_all(config_home);
