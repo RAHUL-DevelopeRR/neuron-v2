@@ -1,0 +1,215 @@
+name: Evals (nightly)
+
+# Two jobs:
+# - keyless: deterministic and needs no secret. The eval runner's unit tests
+#   and grader self-test, the coding eval against the scripted mock provider
+#   (rust/crates/mock-anthropic-service, evals/coding/mock-tasks), and the
+#   TUI's UI-flow eval (ui/neuron-tui/evals). Runs nightly, on demand, and on
+#   pull requests that touch the evals.
+# - gateway: the eight coding tasks (evals/coding/tasks) against the Zero-X
+#   gateway with the NEURON_EVAL_API_KEY repository secret, gated on the pass
+#   rate in evals/coding/gate.json. Nightly and on demand only; skipped, with
+#   a note in the run summary, where the secret is not set (forks).
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      model:
+        description: Model for the gateway run
+        required: false
+        default: auto
+      repeat:
+        description: Rounds of the eight tasks
+        required: false
+        default: '1'
+      min_pass_rate:
+        description: Override the gate (0-1); empty reads evals/coding/gate.json
+        required: false
+        default: ''
+  pull_request:
+    paths:
+      - .github/workflows/evals-nightly.yml
+      - evals/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: evals-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  keyless:
+    name: evals (keyless, mock provider)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> target
+
+      - name: Eval runner unit tests
+        run: python -m unittest discover -s evals/coding -v
+
+      - name: Graders fail unsolved and pass solved
+        run: |
+          python evals/coding/run.py --self-test
+          python evals/coding/run.py --self-test --tasks-dir evals/coding/mock-tasks
+
+      - name: Build neuron and the mock provider
+        working-directory: rust
+        run: cargo build -p rusty-claude-cli -p mock-anthropic-service
+
+      - name: Coding eval against the mock provider
+        run: |
+          set -euo pipefail
+          rust/target/debug/mock-anthropic-service > mock.log 2>&1 &
+          for _ in $(seq 1 100); do
+            grep -q MOCK_ANTHROPIC_BASE_URL= mock.log && break
+            sleep 0.1
+          done
+          url="$(sed -n 's/^MOCK_ANTHROPIC_BASE_URL=//p' mock.log)"
+          test -n "$url" || { echo "the mock provider did not start"; cat mock.log; exit 1; }
+          # Scripted turns: anything under 100% is a broken pipeline, not a model.
+          python evals/coding/run.py --provider mock --base-url "$url" \
+            --tasks-dir evals/coding/mock-tasks --model sonnet \
+            --variant mock=rust/target/debug/neuron \
+            --repeat 2 --timeout 120 --retry-infra 0 --min-pass-rate 1 \
+            --out eval-results/mock --json-out eval-results/mock/report.json
+          cat eval-results/mock/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: UI-flow eval (prompt, tool cell, approval, diff, answer)
+        working-directory: ui/neuron-tui
+        run: |
+          bun install --frozen-lockfile
+          bun run eval:ui
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evals-keyless-${{ github.run_id }}
+          path: eval-results/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  gateway:
+    name: evals (gateway, pass-rate gate)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Check for the eval key
+        id: key
+        env:
+          NEURON_EVAL_API_KEY: ${{ secrets.NEURON_EVAL_API_KEY }}
+        run: |
+          if [ -z "$NEURON_EVAL_API_KEY" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            msg="Skipped the gateway eval: the NEURON_EVAL_API_KEY secret is not set (forks never have it). The keyless job still ran."
+            echo "::notice title=Gateway eval skipped::$msg"
+            echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.key.outputs.present == 'true'
+      - uses: actions/setup-python@v5
+        if: steps.key.outputs.present == 'true'
+        with:
+          python-version: '3.x'
+      - uses: actions/setup-go@v5
+        if: steps.key.outputs.present == 'true'
+        with:
+          go-version: stable
+          cache: false
+      - uses: actions/setup-node@v4
+        if: steps.key.outputs.present == 'true'
+        with:
+          node-version: '22'
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.key.outputs.present == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.key.outputs.present == 'true'
+        with:
+          workspaces: rust -> target
+
+      - name: Build neuron (release)
+        if: steps.key.outputs.present == 'true'
+        working-directory: rust
+        run: cargo build --release -p rusty-claude-cli
+
+      - name: Coding eval against the gateway
+        id: eval
+        if: steps.key.outputs.present == 'true'
+        env:
+          # The runner passes NEURON_TOKEN to Neuron for --provider zero-x; it
+          # is never printed. GitHub also masks secrets in the log.
+          NEURON_TOKEN: ${{ secrets.NEURON_EVAL_API_KEY }}
+          EVAL_MODEL: ${{ github.event.inputs.model || 'auto' }}
+          EVAL_REPEAT: ${{ github.event.inputs.repeat || '1' }}
+          EVAL_MIN_PASS_RATE: ${{ github.event.inputs.min_pass_rate || '' }}
+        run: |
+          set +e
+          gate=(--gate evals/coding/gate.json)
+          if [ -n "$EVAL_MIN_PASS_RATE" ]; then gate=(--min-pass-rate "$EVAL_MIN_PASS_RATE"); fi
+          python evals/coding/run.py --provider zero-x --model "$EVAL_MODEL" \
+            --variant nightly=rust/target/release/neuron \
+            --repeat "$EVAL_REPEAT" --jobs 2 --timeout 900 \
+            "${gate[@]}" \
+            --out eval-results/gateway --json-out eval-results/gateway/report.json
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Run summary
+        if: always() && steps.key.outputs.present == 'true'
+        run: |
+          if [ -f eval-results/gateway/summary.md ]; then
+            cat eval-results/gateway/summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "The gateway eval wrote no summary (see the log)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload results
+        if: always() && steps.key.outputs.present == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: evals-gateway-${{ github.run_id }}
+          path: |
+            eval-results/
+            !eval-results/**/workspace/**
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Enforce the pass-rate gate
+        if: steps.key.outputs.present == 'true'
+        env:
+          CODE: ${{ steps.eval.outputs.exit_code }}
+        run: |
+          if [ "$CODE" != "0" ]; then
+            echo "::error title=Eval gate failed::run.py exited $CODE (pass rate below the gate, no runs measured, or a runner error); see the summary and the evals-gateway artifact."
+            exit 1
+          fi
+          echo "Pass-rate gate passed."
