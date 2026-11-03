@@ -306,6 +306,13 @@ export function handleEngineEvent(event: UiEvent): void {
       engine.setReport(event)
       useChatStore.getState().setInputMode('report')
       return
+    case 'account':
+      // The plan, limits and usage for the status bar and its context popover.
+      engine.setAccount(event.account)
+      return
+    case 'branches':
+      engine.setBranches(event)
+      return
     default:
       return
   }

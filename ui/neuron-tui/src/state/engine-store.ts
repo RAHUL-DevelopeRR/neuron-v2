@@ -4,6 +4,8 @@ import { immer } from 'zustand/middleware/immer'
 import type { EngineConnection } from '../engine/neuron-engine-client'
 import type { QuestionTarget } from '../engine/questions'
 import type {
+  AccountDetails,
+  BranchesEvent,
   ModelsEvent,
   PermissionRequestedEvent,
   ReportEvent,
@@ -62,6 +64,16 @@ export interface EngineStoreState {
   trustPreview: TrustPreviewEvent | null
   /** The report panel's content (`/usage`, `/init`, `/memory`, `/doctor`), while it is open. */
   report: ReportEvent | null
+  /**
+   * The Zero-X account from the last `account` event (plan, limits, usage),
+   * for the status bar and its context popover. `null` before one arrives or
+   * when there is no login.
+   */
+  account: AccountDetails | null
+  /** When that account event arrived (ms since the epoch). */
+  accountReceivedAt: number | null
+  /** The last `branches` answer, for the branch picker. */
+  branches: Omit<BranchesEvent, 'type'> | null
 
   /** `errorInChat`: the chat already shows `error` (see {@link EngineStoreState.errorInChat}). */
   setConnection: (
@@ -85,6 +97,8 @@ export interface EngineStoreState {
   markSignInApproved: () => void
   setTrustPreview: (preview: TrustPreviewEvent | null) => void
   setReport: (report: ReportEvent | null) => void
+  setAccount: (account: AccountDetails | null, receivedAt?: number) => void
+  setBranches: (branches: BranchesEvent | null) => void
   reset: () => void
 }
 
@@ -121,6 +135,9 @@ const initial = {
   signInProblem: null,
   trustPreview: null as TrustPreviewEvent | null,
   report: null as ReportEvent | null,
+  account: null as AccountDetails | null,
+  accountReceivedAt: null as number | null,
+  branches: null as Omit<BranchesEvent, 'type'> | null,
 }
 
 export const useEngineStore = create<EngineStoreState>()(
@@ -206,6 +223,17 @@ export const useEngineStore = create<EngineStoreState>()(
     setReport: (report) =>
       set((state) => {
         state.report = report
+      }),
+    setAccount: (account, receivedAt = Date.now()) =>
+      set((state) => {
+        state.account = account
+        state.accountReceivedAt = account ? receivedAt : null
+      }),
+    setBranches: (branches) =>
+      set((state) => {
+        state.branches = branches
+          ? { current: branches.current, branches: branches.branches, dirty: branches.dirty }
+          : null
       }),
     reset: () => set(() => ({ ...initial })),
   })),
