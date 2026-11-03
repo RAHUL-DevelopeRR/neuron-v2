@@ -7,8 +7,9 @@ The release workflow copies a version's section into its GitHub release notes.
 
 - Remote MCP servers: a server with a `url` is reached over Streamable HTTP (or SSE
   with `"type": "sse"`), and `neuron mcp login <server>` signs in to one that needs
-  OAuth; the token stays in the OS keychain. `neuron mcp enable|disable <server>` and
-  `/mcp enable|disable` turn servers on and off, and the full-screen UI has an MCP panel.
+  OAuth; the token is kept in the OS keychain, or in an owner-only file when no
+  keychain is available. `neuron mcp enable|disable <server>` and `/mcp enable|disable`
+  turn servers on and off, and the full-screen UI has an MCP panel.
 - A request to create or change files that a model answers in chat, without tools, is
   nudged once and then retried on a tool-capable model; a provider that stays down
   moves the turn to the next `providerFallbacks` model. `toolCapableModels`,
