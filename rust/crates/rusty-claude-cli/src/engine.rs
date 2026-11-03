@@ -1033,6 +1033,20 @@ impl Shared {
             .is_ok()
     }
 
+    /// [`EngineCommand::ListBranches`] while a turn runs, on a thread of its own; `false`
+    /// when the engine is not running.
+    fn answer_branches(&self) -> bool {
+        let Some(events) = lock(&self.events).clone() else {
+            return false;
+        };
+        thread::Builder::new()
+            .name("neuron-engine-branches".to_string())
+            .spawn(move || {
+                let _ = events.send(branches_event());
+            })
+            .is_ok()
+    }
+
     /// After a tool call that may have changed files, on the thread that ran it: the
     /// agent's changes for a UI with `git_views`, and the footer with fresh git counts.
     fn files_may_have_changed(&self, events: &Sender<UiEvent>) {
@@ -1198,6 +1212,8 @@ fn forward_commands(
             // It only reads the catalog, so a running turn need not end first. Between
             // turns it queues, after a `SetModel` sent before it.
             EngineCommand::ListModels if shared.turn_running() && shared.answer_models() => {}
+            // Likewise the branches: git reads them, the turn need not end first.
+            EngineCommand::ListBranches if shared.turn_running() && shared.answer_branches() => {}
             command => {
                 if queue.send(command).is_err() {
                     return;
@@ -2250,7 +2266,37 @@ impl Engine {
         }
         let report = format_model_switch_report(&previous, &self.cli.model, message_count);
         self.notice(&report);
+        self.carry_reasoning_effort();
         Ok(())
+    }
+
+    /// After a model switch: keeps the thinking level only when the new model takes it,
+    /// else goes back to the model's default, so no request sends a level it does not know.
+    fn carry_reasoning_effort(&mut self) {
+        let Some(kept) = self
+            .cli
+            .runtime
+            .api_client()
+            .reasoning_effort()
+            .map(ToOwned::to_owned)
+        else {
+            return;
+        };
+        let fields = engine_status_bar::model_fields(&self.cli.model);
+        let carried = engine_status_bar::carried_reasoning_effort(
+            Some(&kept),
+            fields.reasoning_efforts.as_deref(),
+        );
+        if carried.as_deref() == Some(kept.as_str()) {
+            return;
+        }
+        let dropped = carried.is_none();
+        self.cli.set_reasoning_effort(carried);
+        if dropped {
+            self.notice(&format!(
+                "Thinking level: default. This model does not take `{kept}`."
+            ));
+        }
     }
 
     fn permissions(&mut self, mode: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
@@ -3498,6 +3544,25 @@ mod tests {
             })
             .unwrap();
 
+        // A thinking level for the next turns, kept across a switch to a model that
+        // takes it (without a catalog, every model takes low, medium and high).
+        engine
+            .commands
+            .send(EngineCommand::SetReasoningEffort {
+                effort: Some("HIGH".into()),
+            })
+            .unwrap();
+        match events_until(&engine.events, |event| {
+            matches!(event, UiEvent::Status { .. })
+        })
+        .pop()
+        {
+            Some(UiEvent::Status {
+                reasoning_effort, ..
+            }) => assert_eq!(reasoning_effort.as_deref(), Some("high")),
+            other => panic!("expected the footer status, got {other:?}"),
+        }
+
         // SetModel switches for the next turn.
         engine
             .commands
@@ -3512,9 +3577,23 @@ mod tests {
         })
         .pop()
         {
-            Some(UiEvent::Status { model, .. }) => assert!(model.contains("claude-opus")),
+            Some(UiEvent::Status {
+                model,
+                reasoning_effort,
+                ..
+            }) => {
+                assert!(model.contains("claude-opus"));
+                assert_eq!(reasoning_effort.as_deref(), Some("high"));
+            }
             other => panic!("expected the footer status, got {other:?}"),
         }
+        engine
+            .commands
+            .send(EngineCommand::SetReasoningEffort { effort: None })
+            .unwrap();
+        events_until(&engine.events, |event| {
+            matches!(event, UiEvent::Status { .. })
+        });
 
         // Only the Zero-X gateway publishes a model catalog.
         engine.commands.send(EngineCommand::ListModels).unwrap();
@@ -3701,6 +3780,15 @@ mod tests {
             }
             other => panic!("expected the model list, got {other:?}"),
         }
+        // Nor do the branches for the status bar's picker.
+        engine.commands.send(EngineCommand::ListBranches).unwrap();
+        let listed = events_until(&engine.events, |event| {
+            matches!(event, UiEvent::Branches { .. })
+        });
+        assert!(
+            !listed.contains(&UiEvent::TurnFinished),
+            "answered during the turn: {listed:?}"
+        );
         engine.commands.send(EngineCommand::Shutdown).unwrap();
         let turn = turn_events(&engine.events);
         assert!(

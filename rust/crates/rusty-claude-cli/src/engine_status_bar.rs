@@ -97,6 +97,16 @@ pub(crate) fn resolve_reasoning_effort(
     ))
 }
 
+/// The thinking level a model switch keeps: `kept` in the spelling of the new model,
+/// which takes `efforts`, or `None` (the model's default) when it does not take that
+/// level or has none.
+pub(crate) fn carried_reasoning_effort(
+    kept: Option<&str>,
+    efforts: Option<&[String]>,
+) -> Option<String> {
+    resolve_reasoning_effort(kept, efforts).ok().flatten()
+}
+
 /// What a status-bar permission choice asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PermissionChoice {
@@ -303,6 +313,30 @@ mod tests {
         );
         assert!(resolve_reasoning_effort(Some("xhigh"), None).is_err());
         assert!(resolve_reasoning_effort(Some("low"), Some(&[])).is_err());
+    }
+
+    #[test]
+    fn a_model_switch_keeps_only_a_level_the_new_model_takes() {
+        let gemini = efforts(&["none", "low", "medium", "high"]);
+        let gpt = efforts(&["low", "medium", "high", "xhigh"]);
+        assert_eq!(
+            carried_reasoning_effort(Some("high"), Some(&gpt)),
+            Some("high".into())
+        );
+        // Gemini's `none` means nothing to a model without it: its default instead.
+        assert_eq!(carried_reasoning_effort(Some("none"), Some(&gpt)), None);
+        assert_eq!(
+            carried_reasoning_effort(Some("none"), Some(&gemini)),
+            Some("none".into())
+        );
+        // A model that does not reason, or an unknown one, takes no `xhigh`.
+        assert_eq!(carried_reasoning_effort(Some("high"), Some(&[])), None);
+        assert_eq!(carried_reasoning_effort(Some("xhigh"), None), None);
+        assert_eq!(
+            carried_reasoning_effort(Some("MEDIUM"), None),
+            Some("medium".into())
+        );
+        assert_eq!(carried_reasoning_effort(None, Some(&gpt)), None);
     }
 
     #[test]
