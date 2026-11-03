@@ -77,6 +77,21 @@ license metadata.
 screenshot of a social media post and a photo of a person are owned by their authors
 or subjects, and the MIT license of the code does not cover them.
 
+## Later ports from Claw Code
+
+Neuron's `rust/` workspace forked from Claw Code at about upstream commit `00d0eb6`
+(2026-04-17): the last upstream commit whose `ROADMAP.md` matches Neuron's first
+commit, with 83 of the first commit's 103 `rust/crates` files byte-identical. Fixes
+ported from Claw Code since then (reviewed at upstream `main` `51cfca1`, release
+`v0.1.10`) are listed here with the upstream commit each comes from. They are under
+Claw Code's MIT license (copyright notice in `LICENSE`), and each ported function or
+test says so in a comment. Only code was ported; no prompt or tool-description text.
+
+| Area | Neuron files | Upstream commits | What it does |
+| --- | --- | --- | --- |
+| Tools | `rust/crates/tools/src/lib.rs` | `a289024` | `RemoteTrigger` cuts a long response body on a char boundary instead of panicking. |
+| Tools | `rust/crates/tools/src/lib.rs` | `fd8527f` | `WebSearch` reports a non-200 search page (rate limit, HTTP 202 bot challenge) as an error, and the generic-link fallback drops links back to the search engine. |
+
 ## Other branches and leftovers
 
 - **Go `opencode` fork.** The `THE-BUGGY-BREACH` branch contains a Go program in `go/`
