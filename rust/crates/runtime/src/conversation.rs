@@ -19,8 +19,9 @@ use crate::context_manager::{
 use crate::experience::{self, ExperienceStore, HarnessStats};
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::model_registry;
+use crate::model_routing::{self, ModelRouting};
 use crate::permissions::{
-    PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
+    PermissionContext, PermissionMode, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
 use crate::project_checks::{detect_checks, ProjectCheck};
 use crate::refusal::neutral_refusal_note;
@@ -256,6 +257,13 @@ pub trait ApiClient {
     ) -> Result<Vec<AssistantEvent>, RuntimeError> {
         self.stream(request)
     }
+
+    /// Sends the requests that follow to `model` instead of the session's model;
+    /// `None` returns to the session's model. Returns whether the client now sends
+    /// to the model asked for. The default cannot switch models.
+    fn set_model_override(&mut self, _model: Option<&str>) -> bool {
+        false
+    }
 }
 
 /// Trait implemented by tool dispatchers that execute model-requested tools.
@@ -335,6 +343,10 @@ pub enum RuntimeErrorKind {
     /// model's context window. The runtime shrinks the context and retries
     /// once before reporting it.
     ContextWindowExceeded,
+    /// The provider could not serve the model right now even after the client's
+    /// own retries (capacity, overload, 5xx): another model may (see
+    /// [`crate::model_routing`]).
+    ProviderUnavailable,
 }
 
 /// Error returned when a conversation turn cannot be completed.
@@ -475,6 +487,12 @@ struct TurnProgress {
     edited_paths: Vec<String>,
     completion_checked: bool,
     action_nudged: bool,
+    /// The chat-only nudge was sent, and the request was retried on a model that
+    /// calls tools (see [`crate::model_routing`]).
+    chat_only_nudged: bool,
+    tool_retried: bool,
+    /// Models the turn fell over to after provider failures, in order.
+    fallen_over_to: Vec<String>,
     /// Harness events this turn, for the experience library.
     stats: HarnessStats,
 }
@@ -500,6 +518,9 @@ pub struct ConversationRuntime<C, T> {
     reviewer: Option<Box<dyn ChangeReviewer + Send>>,
     /// The user's message that started the current turn.
     turn_request: String,
+    routing: ModelRouting,
+    /// A model the client was switched to for the current turn.
+    model_override: Option<String>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -560,7 +581,22 @@ where
             check_counter: 0,
             reviewer: None,
             turn_request: String::new(),
+            routing: ModelRouting::default(),
+            model_override: None,
         }
+    }
+
+    /// How the conversation may move between models within a turn (see
+    /// [`ModelRouting`]).
+    #[must_use]
+    pub fn with_model_routing(mut self, routing: ModelRouting) -> Self {
+        self.routing = routing;
+        self
+    }
+
+    #[must_use]
+    pub fn model_routing(&self) -> &ModelRouting {
+        &self.routing
     }
 
     /// Has the completion check ask `reviewer` for a second opinion on the turn's
@@ -810,6 +846,7 @@ where
         if let Err(error) = &result {
             self.close_failed_turn(error);
         }
+        self.clear_model_override();
         result
     }
 
@@ -889,6 +926,9 @@ where
                     return Err(error);
                 }
                 Err(error) => {
+                    if self.fall_over(&mut progress, &error) {
+                        continue;
+                    }
                     self.record_turn_failed(progress.iterations, &error);
                     return Err(error);
                 }
@@ -1398,6 +1438,9 @@ where
         if self.cancel.is_cancelled() {
             return None;
         }
+        if let Some(note) = self.chat_only_note(progress) {
+            return Some(note);
+        }
         if self.harness.action_nudge && !progress.action_nudged && announces_next_step(final_text) {
             progress.action_nudged = true;
             progress.stats.nudges += 1;
@@ -1414,6 +1457,96 @@ where
             );
         }
         None
+    }
+
+    /// For a request to change files answered in chat, with no tool call this turn:
+    /// the nudge, then once the request again on a model that calls tools (see
+    /// [`crate::model_routing`]). Nudging first keeps the model the user chose when
+    /// a reminder is enough; the retry costs a second answer.
+    fn chat_only_note(&mut self, progress: &mut TurnProgress) -> Option<String> {
+        if !self.harness.action_nudge
+            || !self.routing.agent_mode
+            || !progress.tool_results.is_empty()
+            || self.permission_policy.active_mode() == PermissionMode::ReadOnly
+            || !model_routing::asks_for_file_changes(&self.turn_request)
+        {
+            return None;
+        }
+        if !progress.chat_only_nudged {
+            progress.chat_only_nudged = true;
+            // One nudge per turn, whichever rule sends it.
+            progress.action_nudged = true;
+            progress.stats.nudges += 1;
+            progress.stats.chat_only_answers += 1;
+            return Some(model_routing::CHAT_ONLY_NUDGE_MESSAGE.to_string());
+        }
+        if progress.tool_retried {
+            return None;
+        }
+        progress.tool_retried = true;
+        let from = self.current_model_label();
+        let answered = [
+            self.harness.model.as_deref(),
+            self.served_model.as_deref(),
+            self.model_override.as_deref(),
+        ];
+        let answered = answered.into_iter().flatten().collect::<Vec<_>>();
+        let target = self.routing.tool_retry_model(&answered)?.to_string();
+        if !self.switch_model(&target) {
+            return None;
+        }
+        progress.stats.tool_model_retries += 1;
+        let shown = target.strip_prefix("openai/").unwrap_or(&target);
+        crate::ui_hooks::notice(&model_routing::tool_retry_notice(&from, shown));
+        Some(model_routing::tool_retry_message(shown))
+    }
+
+    /// Moves the turn to the next model of the fallback chain after a provider
+    /// failure another model may not have; `false` when there is none to try.
+    fn fall_over(&mut self, progress: &mut TurnProgress, error: &RuntimeError) -> bool {
+        if self.cancel.is_cancelled() || !model_routing::is_provider_unavailable(error) {
+            return false;
+        }
+        let mut tried = progress.fallen_over_to.clone();
+        tried.extend(self.harness.model.clone());
+        let Some(next) = self.routing.next_fallback(&tried).map(str::to_string) else {
+            return false;
+        };
+        progress.fallen_over_to.push(next.clone());
+        let from = self.current_model_label();
+        if !self.switch_model(&next) {
+            return false;
+        }
+        progress.stats.provider_fallovers += 1;
+        let shown = next.strip_prefix("openai/").unwrap_or(&next);
+        crate::ui_hooks::notice(&model_routing::fallover_notice(&from, shown, error));
+        true
+    }
+
+    /// The model requests go to now, as people see it.
+    fn current_model_label(&self) -> String {
+        let model = self
+            .model_override
+            .as_deref()
+            .or(self.served_model.as_deref())
+            .or(self.harness.model.as_deref())
+            .unwrap_or("the model");
+        model.strip_prefix("openai/").unwrap_or(model).to_string()
+    }
+
+    fn switch_model(&mut self, model: &str) -> bool {
+        if !self.api_client.set_model_override(Some(model)) {
+            return false;
+        }
+        self.model_override = Some(model.to_string());
+        true
+    }
+
+    /// Returns the client to the session's model after a turn that switched it.
+    fn clear_model_override(&mut self) {
+        if self.model_override.take().is_some() {
+            self.api_client.set_model_override(None);
+        }
     }
 
     /// The completion check: the request reminder, the changed files and the project

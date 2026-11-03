@@ -337,6 +337,10 @@ pub(crate) fn fatal_api_error(
     crate::error_detail::record_model_call_failure(error);
     let kind = if error.is_context_window_failure() {
         RuntimeErrorKind::ContextWindowExceeded
+    } else if error.is_retryable() {
+        // Still failing after the provider client's own retries (capacity,
+        // overload, 5xx): another model of `providerFallbacks` may serve it.
+        RuntimeErrorKind::ProviderUnavailable
     } else {
         RuntimeErrorKind::Other
     };
@@ -466,6 +470,12 @@ pub(crate) struct AnthropicRuntimeClient {
     /// The turn (by the index of its prompt) whose request was too large with the
     /// deferred MCP tool definitions: its later requests leave them out at once.
     oversized_with_deferred_tools: Option<usize>,
+    /// The session's model and client while a turn runs on another model (see
+    /// `ApiClient::set_model_override`).
+    overridden: Option<(String, ApiProviderClient)>,
+    /// The model short drafting requests go to (`summaryModel`); the session's
+    /// model when unset.
+    summary_model: Option<String>,
 }
 
 /// The notice shown when a request that was too large is sent again without the
@@ -545,7 +555,14 @@ impl AnthropicRuntimeClient {
             timeouts,
             retry_backoff: StreamRetryBackoff::default(),
             oversized_with_deferred_tools: None,
+            overridden: None,
+            summary_model: None,
         })
+    }
+
+    /// Sends [`Self::complete_text`] requests to `model` (`summaryModel`).
+    pub(crate) fn set_summary_model(&mut self, model: Option<String>) {
+        self.summary_model = model;
     }
 
     pub fn set_reasoning_effort(&mut self, effort: Option<String>) {
@@ -583,8 +600,20 @@ impl AnthropicRuntimeClient {
         timeout: Duration,
         cancel: &CancellationToken,
     ) -> Result<String, String> {
+        let summary_client = match self.summary_model.as_deref() {
+            Some(model) if model != self.model => Some((
+                model.to_string(),
+                build_provider_client(model, None).map_err(|error| error.to_string())?,
+            )),
+            _ => None,
+        };
+        let (model, client) = summary_client
+            .as_ref()
+            .map_or((self.model.as_str(), &self.client), |(model, client)| {
+                (model.as_str(), client)
+            });
         let request = MessageRequest {
-            model: self.model.clone(),
+            model: model.to_string(),
             max_tokens,
             messages: vec![InputMessage::user_text(prompt)],
             system: Some(instructions.to_string()),
@@ -593,8 +622,7 @@ impl AnthropicRuntimeClient {
         };
         self.runtime.block_on(async {
             let reply = async {
-                let mut stream = self
-                    .client
+                let mut stream = client
                     .stream_message(&request)
                     .await
                     .map_err(|error| error.to_string())?;
@@ -666,6 +694,26 @@ pub(crate) fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiEr
 impl ApiClient for AnthropicRuntimeClient {
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         self.stream_with_cancellation(request, &CancellationToken::new())
+    }
+
+    fn set_model_override(&mut self, model: Option<&str>) -> bool {
+        let Some(model) = model else {
+            if let Some((model, client)) = self.overridden.take() {
+                self.model = model;
+                self.client = client;
+            }
+            return true;
+        };
+        let Ok(client) = build_provider_client(model, Some(&self.session_id)) else {
+            return false;
+        };
+        let previous_client = std::mem::replace(&mut self.client, client);
+        let previous_model = std::mem::replace(&mut self.model, model.to_string());
+        // Keep the session's own model, not one an earlier switch put in.
+        if self.overridden.is_none() {
+            self.overridden = Some((previous_model, previous_client));
+        }
+        true
     }
 
     fn stream_with_cancellation(
@@ -2043,6 +2091,8 @@ mod stream_resilience_tests {
             timeouts,
             retry_backoff: fast_backoff(),
             oversized_with_deferred_tools: None,
+            overridden: None,
+            summary_model: None,
         }
     }
 
@@ -3278,6 +3328,31 @@ mod switch_model_hint_tests {
             api::GatewayError::from_body(reqwest::StatusCode::SERVICE_UNAVAILABLE, &body)
                 .expect("an envelope"),
         ))
+    }
+
+    /// Transient provider failures that outlived the client's retries are typed so
+    /// the runtime can move to the next `providerFallbacks` model; final ones are not.
+    #[test]
+    fn transient_failures_are_typed_as_provider_unavailable() {
+        for (code, expected) in [
+            (
+                "capacity_exhausted",
+                runtime::RuntimeErrorKind::ProviderUnavailable,
+            ),
+            (
+                "upstream_error",
+                runtime::RuntimeErrorKind::ProviderUnavailable,
+            ),
+            ("insufficient_quota", runtime::RuntimeErrorKind::Other),
+            ("invalid_request", runtime::RuntimeErrorKind::Other),
+        ] {
+            let StreamFailure::Fatal(error) =
+                fatal_api_error("session-1", "openai/auto", &gateway_error(code))
+            else {
+                panic!("a fatal error");
+            };
+            assert_eq!(error.kind(), expected, "{code}");
+        }
     }
 
     /// The gateway tells everyone to upgrade, max-plan users included; switching

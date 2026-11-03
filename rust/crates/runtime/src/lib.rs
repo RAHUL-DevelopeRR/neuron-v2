@@ -43,6 +43,7 @@ mod mcp_test_http;
 mod mcp_toggle;
 pub mod mcp_tool_bridge;
 pub mod model_registry;
+pub mod model_routing;
 pub mod net_allow;
 pub mod net_proxy;
 mod oauth;
@@ -163,6 +164,7 @@ pub use mcp_stdio::{
     McpToolCallResult, McpToolDiscoveryReport, UnsupportedMcpServer,
 };
 pub use mcp_toggle::{set_mcp_server_enabled, McpToggleOutcome};
+pub use model_routing::{ModelRouting, ModelRoutingSettings};
 pub use oauth::{
     clear_oauth_credentials, code_challenge_s256, credentials_path, generate_pkce_pair,
     generate_state, load_oauth_credentials, loopback_redirect_uri, parse_oauth_callback_query,

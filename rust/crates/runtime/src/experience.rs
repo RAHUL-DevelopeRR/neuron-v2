@@ -49,6 +49,13 @@ pub struct HarnessStats {
     pub completion_checks: u64,
     /// Project checks that failed during completion checks.
     pub failed_checks: u64,
+    /// Requests to change files answered in chat without a tool call (each also
+    /// counts as a nudge).
+    pub chat_only_answers: u64,
+    /// Chat-only answers retried on a model that calls tools.
+    pub tool_model_retries: u64,
+    /// Requests moved to the next `providerFallbacks` model after a provider failure.
+    pub provider_fallovers: u64,
 }
 
 impl HarnessStats {
@@ -66,6 +73,9 @@ impl HarnessStats {
         self.truncated_calls += other.truncated_calls;
         self.completion_checks += other.completion_checks;
         self.failed_checks += other.failed_checks;
+        self.chat_only_answers += other.chat_only_answers;
+        self.tool_model_retries += other.tool_model_retries;
+        self.provider_fallovers += other.provider_fallovers;
     }
 
     /// Counts one tool result: the call, whether it failed and, from the text

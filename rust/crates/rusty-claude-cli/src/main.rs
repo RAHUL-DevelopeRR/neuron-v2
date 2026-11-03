@@ -67,6 +67,7 @@ mod init;
 mod input;
 mod line_diff;
 mod mcp_auth;
+mod model_routing;
 mod orchestrator;
 mod plan_mode;
 mod progress;

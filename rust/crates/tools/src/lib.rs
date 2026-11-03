@@ -3975,6 +3975,9 @@ pub struct SubagentParentContext {
     /// Parts of the parent's system prompt sub-agents get too, such as the map of
     /// the workspace's files and symbols.
     pub context_sections: Vec<String>,
+    /// The model sub-agents run on when the `Agent` call names none
+    /// (`subagentModel`); the parent's model when `None`.
+    pub subagent_model: Option<String>,
 }
 
 impl SubagentParentContext {
@@ -3990,6 +3993,7 @@ impl SubagentParentContext {
             allowed_tools: None,
             client_factory: None,
             context_sections: Vec::new(),
+            subagent_model: None,
         }
     }
 }
@@ -4004,6 +4008,7 @@ impl std::fmt::Debug for SubagentParentContext {
             .field("allowed_tools", &self.allowed_tools)
             .field("client_factory", &self.client_factory.is_some())
             .field("context_sections", &self.context_sections.len())
+            .field("subagent_model", &self.subagent_model)
             .finish()
     }
 }
@@ -4399,6 +4404,9 @@ fn assemble_agent_runtime<C: ApiClient>(
     system_prompt: Vec<String>,
 ) -> ConversationRuntime<C, SubagentToolExecutor> {
     let tool_schema_tokens = subagent_tool_schema_tokens(&allowed_tools);
+    let writes_files = ["write_file", "edit_file", "NotebookEdit"]
+        .iter()
+        .any(|tool| allowed_tools.contains(*tool));
     let permission_policy = agent_permission_policy();
     let tool_executor = SubagentToolExecutor::new(allowed_tools)
         .with_enforcer(PermissionEnforcer::new(permission_policy.clone()));
@@ -4420,6 +4428,12 @@ fn assemble_agent_runtime<C: ApiClient>(
     )
     .with_context_manager(context_manager)
     .with_harness_config(runtime::HarnessConfig::from_env().with_model(model))
+    .with_model_routing(runtime::ModelRouting {
+        // A sub-agent that can write is nudged when it answers a task to change
+        // files in chat; its client follows `providerFallbacks` itself.
+        agent_mode: writes_files,
+        ..runtime::ModelRouting::default()
+    })
 }
 
 /// `1` turns on the completion check's reviewer (see [`SubagentReviewer`]).
@@ -4450,6 +4464,13 @@ impl SubagentReviewer {
     /// one on.
     #[must_use]
     pub fn from_env(session_model: &str) -> Option<Self> {
+        Self::from_env_or(session_model, None)
+    }
+
+    /// [`Self::from_env`] with `configured` (the `reviewerModel` setting) as the
+    /// model when [`REVIEW_MODEL_ENV_VAR`] names none.
+    #[must_use]
+    pub fn from_env_or(session_model: &str, configured: Option<&str>) -> Option<Self> {
         let enabled = std::env::var(REVIEW_ENV_VAR).is_ok_and(|value| {
             matches!(
                 value.trim().to_ascii_lowercase().as_str(),
@@ -4459,13 +4480,26 @@ impl SubagentReviewer {
         if !enabled {
             return None;
         }
-        let model = std::env::var(REVIEW_MODEL_ENV_VAR)
-            .ok()
-            .map(|model| model.trim().to_string())
-            .filter(|model| !model.is_empty())
-            .unwrap_or_else(|| session_model.to_string());
-        Some(Self::new(model))
+        Some(Self::new(reviewer_model(
+            std::env::var(REVIEW_MODEL_ENV_VAR).ok().as_deref(),
+            configured,
+            session_model,
+        )))
     }
+}
+
+/// The reviewer's model: [`REVIEW_MODEL_ENV_VAR`], then the `reviewerModel`
+/// setting, then the session's model.
+fn reviewer_model(env: Option<&str>, configured: Option<&str>, session_model: &str) -> String {
+    let set = |model: Option<&str>| {
+        model
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string)
+    };
+    set(env)
+        .or_else(|| set(configured))
+        .unwrap_or_else(|| session_model.to_string())
 }
 
 impl runtime::ChangeReviewer for SubagentReviewer {
@@ -4747,10 +4781,16 @@ fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String>
 /// otherwise the parent's resolved model is inherited. The parent's
 /// transport prefix (e.g. `openai/` for the gateway) is preserved.
 fn resolve_agent_model(model: Option<&str>) -> String {
-    let parent_model = subagent_parent_context()
-        .map_or_else(|| FALLBACK_AGENT_MODEL.to_string(), |context| context.model);
+    let parent = subagent_parent_context();
+    let parent_model = parent.as_ref().map_or_else(
+        || FALLBACK_AGENT_MODEL.to_string(),
+        |context| context.model.clone(),
+    );
     let Some(requested) = model.map(str::trim).filter(|model| !model.is_empty()) else {
-        return parent_model;
+        // The user's `subagentModel` setting, trusted as configured.
+        return parent
+            .and_then(|context| context.subagent_model)
+            .unwrap_or(parent_model);
     };
     let candidate = match parent_model.split_once('/') {
         Some(("openai", _)) if !requested.starts_with("openai/") => format!("openai/{requested}"),
@@ -5122,6 +5162,39 @@ mod subagent_inheritance_tests {
 
         clear_subagent_parent_context();
         assert_eq!(resolve_agent_model(None), "auto");
+    }
+
+    #[test]
+    fn the_subagent_model_setting_applies_when_the_call_names_no_model() {
+        let _guard = parent_context_lock();
+        set_subagent_parent_context(SubagentParentContext {
+            subagent_model: Some("openai/groq/openai/gpt-oss-20b".to_string()),
+            ..SubagentParentContext::new("openai/auto", PermissionMode::WorkspaceWrite)
+        });
+        assert_eq!(resolve_agent_model(None), "openai/groq/openai/gpt-oss-20b");
+        assert_eq!(
+            resolve_agent_model(Some("  ")),
+            "openai/groq/openai/gpt-oss-20b"
+        );
+        // A model the call names still wins when it is known.
+        assert_eq!(
+            resolve_agent_model(Some("groq/openai/gpt-oss-120b")),
+            "openai/groq/openai/gpt-oss-120b"
+        );
+        clear_subagent_parent_context();
+    }
+
+    #[test]
+    fn the_reviewer_model_comes_from_the_env_then_the_setting_then_the_session() {
+        assert_eq!(
+            super::reviewer_model(Some("env-model"), Some("set-model"), "session"),
+            "env-model"
+        );
+        assert_eq!(
+            super::reviewer_model(Some(" "), Some("set-model"), "session"),
+            "set-model"
+        );
+        assert_eq!(super::reviewer_model(None, None, "session"), "session");
     }
 
     #[test]
