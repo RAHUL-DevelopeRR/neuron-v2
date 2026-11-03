@@ -91,6 +91,8 @@ test says so in a comment. Only code was ported; no prompt or tool-description t
 | --- | --- | --- | --- |
 | Tools | `rust/crates/tools/src/lib.rs` | `a289024` | `RemoteTrigger` cuts a long response body on a char boundary instead of panicking. |
 | Tools | `rust/crates/tools/src/lib.rs` | `fd8527f` | `WebSearch` reports a non-200 search page (rate limit, HTTP 202 bot challenge) as an error, and the generic-link fallback drops links back to the search engine. |
+| Runtime environment | `rust/crates/runtime/src/remote.rs`, `sandbox.rs` | `c55c7e4` | Reading the environment skips non-UTF-8 entries instead of panicking at startup. |
+| File boundary | `rust/crates/runtime/src/file_ops.rs` | `9e7fd60`, `dc34649` | Workspace boundary checks accept `\\?\UNC\` and `\\.\` spellings of a path and fall back to its canonical form. |
 
 ## Other branches and leftovers
 
