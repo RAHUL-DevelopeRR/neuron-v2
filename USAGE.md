@@ -157,6 +157,30 @@ kinds with `/model <id>` warns, and so does `neuron prompt` with a model other t
 `auto` picks a tool-capable model whose context window fits the request, and routes
 around models out of capacity. `NEURON_MODEL` sets the model for a process.
 
+When a request to create or change files is answered in chat with no tool call,
+Neuron reminds the model once to use its tools; if the next reply still makes no tool
+call, the request runs once more on a model known to call tools. That model is the
+first of `toolCapableModels` in your settings or, on `auto`, an available
+tool-capable model from the catalog. When a provider stays unavailable after the
+client's own retries, the turn moves on to the next model of
+`providerFallbacks.fallbacks`. Settings can also give some jobs their own model:
+
+```json
+{
+  "toolCapableModels": ["gemini/gemini-2.5-pro"],
+  "autoToolModel": "gemini/gemini-2.5-pro",
+  "subagentModel": "gemini/gemini-2.5-flash",
+  "summaryModel": "gemini/gemini-2.5-flash",
+  "reviewerModel": "gemini/gemini-2.5-flash",
+  "providerFallbacks": { "fallbacks": ["gemini/gemini-2.5-flash"] }
+}
+```
+
+`autoToolModel` replaces `auto` on requests that carry tools, `subagentModel` is the
+`Agent` tool's model when a call names none, `summaryModel` drafts short texts such as
+commit messages, and `reviewerModel` runs the completion check. An unset key leaves
+that job on the session's model.
+
 Free pools have small per-minute token budgets, so the first request of a session is
 kept small: the system prompt lists the bundled skills by name and the model loads a
 skill's instructions only when it needs them, and MCP server tools are offered
@@ -339,6 +363,10 @@ names the file, the line and the closest known key. Commonly used keys:
 | `hooks` | Commands run before and after tool calls |
 | `mcpServers`, `defaultMcpServers`, `disabledMcpServers` | MCP servers |
 | `defaultSkills` | `false` leaves the bundled skills out of the system prompt |
+| `toolCapableModels`, `autoToolModel`, `subagentModel`, `summaryModel`, `reviewerModel`, `providerFallbacks` | Models for particular jobs (see [Models](#models)) |
+| `redactSecrets` | `false` stops replacing token-shaped secrets (API keys, tokens, private keys, passwords in URLs) with `[REDACTED:<kind>]` in tool output, the session file and telemetry; on by default, and the settings of a folder you have not trusted cannot turn it off |
+| `sandbox.network.allow` | Hosts that `WebFetch` and shell commands may reach (`github.com`, `*.npmjs.org`, `*`, optionally with `:port`). `WebFetch` always enforces it; shell commands get proxy variables for a local proxy that only reaches those hosts, which macOS enforces and Linux and Windows treat as advice |
+| `sandbox.maxProcesses`, `sandbox.memoryLimitMb` | Windows: the most processes a shell command may run at once (default 512) and its memory limit in MB (default none) |
 
 Default skills and MCP servers are described in
 [default integrations](docs/DEFAULT_INTEGRATIONS.md).

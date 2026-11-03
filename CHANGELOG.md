@@ -3,6 +3,27 @@
 Notable changes to Neuron. Versions follow [semantic versioning](https://semver.org/).
 The release workflow copies a version's section into its GitHub release notes.
 
+## 7.0.0-alpha.4 (unreleased)
+
+- Remote MCP servers: a server with a `url` is reached over Streamable HTTP (or SSE
+  with `"type": "sse"`), and `neuron mcp login <server>` signs in to one that needs
+  OAuth; the token stays in the OS keychain. `neuron mcp enable|disable <server>` and
+  `/mcp enable|disable` turn servers on and off, and the full-screen UI has an MCP panel.
+- A request to create or change files that a model answers in chat, without tools, is
+  nudged once and then retried on a tool-capable model; a provider that stays down
+  moves the turn to the next `providerFallbacks` model. `toolCapableModels`,
+  `autoToolModel`, `subagentModel`, `summaryModel` and `reviewerModel` pick models for
+  particular jobs.
+- Token-shaped secrets in tool output, the session file and telemetry are replaced
+  with `[REDACTED:<kind>]` (`"redactSecrets": false` turns it off).
+- Sandbox: on Windows, shell commands run in a job object that kills what they start
+  when they end, with `sandbox.maxProcesses` and `sandbox.memoryLimitMb` limits; the
+  macOS sandbox uses a seatbelt profile that keeps writes inside the workspace and
+  temporary folders; `sandbox.network.allow`
+  limits the hosts `WebFetch` and shell commands may reach.
+- A nightly eval workflow gates on the coding-task pass rate and drives the
+  full-screen UI through a scripted prompt, tool call, approval and answer.
+
 ## 7.0.0-alpha.3 (2026-11-02)
 
 The third Neuron alpha. The full-screen UI now shows what a turn is doing while it

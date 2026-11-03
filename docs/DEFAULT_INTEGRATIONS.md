@@ -63,12 +63,42 @@ builtins, configure
 }
 ```
 
+`neuron mcp disable <server>` and `neuron mcp enable <server>` (or `/mcp disable` and
+`/mcp enable` in a session) edit `disabledMcpServers` in your user settings, never in
+a repository's files. A server turned off in any settings file stays off, and
+`/mcp list` still shows it as `disabled`.
+
 See the [Playwright MCP documentation](https://github.com/microsoft/playwright-mcp)
 for browser installation and platform requirements. This provides browser control.
 Desktop control needs a separately installed computer-use MCP server, its actual
 launch command or endpoint, and a model capable of interpreting its observations.
 Neuron forwards discovered MCP tools to the model; it does not bundle a desktop
 automation service or certify a model's computer-use capability.
+
+### Remote MCP servers
+
+A server with a `url` is a remote server reached over Streamable HTTP; set
+`"type": "sse"` for an older server that speaks HTTP with Server-Sent Events:
+
+```json
+{
+  "mcpServers": {
+    "tracker": {
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": { "X-Team": "web" }
+    }
+  }
+}
+```
+
+A server that needs a sign-in answers `401`; run `neuron mcp login <server>` to sign
+in through the browser (OAuth with PKCE and a loopback redirect on 127.0.0.1, after
+the MCP authorization specification). The token is kept in the OS keychain, or in an
+owner-only file under `~/.neuroncli/mcp-oauth` when no keychain is available, and is
+only ever sent to the server it was issued for. `neuron mcp logout <server>` removes
+it. When the server does not register clients itself, give its client under `oauth`:
+`clientId`, and optionally `callbackPort` and `authServerMetadataUrl`.
 
 ## Agent Reach
 
