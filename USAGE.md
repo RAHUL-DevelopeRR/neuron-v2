@@ -397,7 +397,7 @@ or put it in your user settings.
 | --- | --- | --- |
 | `install.sh` | Run it again with the new version: that version's release URL and `--version` (or `NEURON_VERSION`). Without a version it installs the latest stable release, and there is none yet | `rm ~/.local/bin/neuron ~/.local/bin/neuron-tui` |
 | `install.ps1` | Run it again with the new version: that version's release URL and `-Version` (or `NEURON_VERSION`). Without a version it installs the latest stable release, and there is none yet | Delete `%LOCALAPPDATA%\Programs\Neuron\bin` and remove it from your user `PATH` if you added it |
-| npm | `npm install --global @zero-x.live/neuron` (the alpha is npm's `latest` version) | `npm uninstall --global @zero-x.live/neuron` |
+| npm | `npm install --global @zero-x.live/neuron` (the alpha is published as npm's `latest`; `npm view @zero-x.live/neuron version` shows which version that is) | `npm uninstall --global @zero-x.live/neuron` |
 | pip | `pip install --upgrade --pre neuroncli` (the alpha is a pre-release on PyPI, so pip needs `--pre`) | `pipx uninstall neuroncli` or `pip uninstall neuroncli` |
 
 Neuron keeps your login in the OS credential store or `~/.neuroncli/`, and your

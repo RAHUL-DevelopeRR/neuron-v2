@@ -20,9 +20,16 @@ still apply, except the ones about npm and PyPI and the ones this release fixes 
 - 7.0.0-alpha.2 never reached npm: npm 11 read the tarball path `dist/<name>.tgz` as a
   GitHub repository and the publish failed before it reached the registry. The release
   workflow now publishes `./dist/<name>.tgz`, and a packaging test guards the path.
-  This alpha goes out as npm's default `latest`, so
-  `npm install --global @zero-x.live/neuron` installs it.
-- On PyPI the alpha is a pre-release: `pip install --pre neuroncli`.
+- The npm and PyPI packages are published after this GitHub release, once its assets
+  have been checked, so they can appear later than the release itself.
+- On npm this alpha is published under the default `latest` dist-tag. When
+  `npm view @zero-x.live/neuron version` prints `7.0.0-alpha.3`,
+  `npm install --global @zero-x.live/neuron` installs it; while it still prints 6.2.0,
+  use the install scripts.
+- On PyPI the alpha is a pre-release (`7.0.0a3`), installed with
+  `pip install --pre neuroncli` once `pip index versions neuroncli --pre` lists it. No
+  Neuron 7 build has reached PyPI yet; until one does, pip installs the unsupported
+  6.2.4, so use the install scripts or npm.
 - The old 6.2.x builds (npm 6.2.0, PyPI 6.2.4 and earlier) remain unsupported.
 
 ### Full-screen UI: live turn

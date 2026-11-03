@@ -144,7 +144,31 @@ purpose, and a prerelease stays out of `releases/latest`.
 
 ## 5. Publish to npm
 
-Either dispatch the workflow on the tag (Actions, Release, Run workflow, "Use workflow
+**7.0.0-alpha.3: a required step.** `ENABLE_NPM_PUBLISH` is not set (check with
+`gh variable list`), so the tag push builds and publishes the GitHub prerelease but not to
+npm. `ENABLE_PYPI_PUBLISH=true` is set (PyPI trusted publisher added 2026-11-03), so the
+tag push also publishes to PyPI; unset that variable first if you want PyPI to wait. Do
+not set `ENABLE_NPM_PUBLISH` for this release either: a tag push would put the
+prerelease on `next`, and a plain
+`npm install --global @zero-x.live/neuron` would keep installing 6.2.0. Instead, once
+the tag run has passed and the assets are verified (section 4), dispatch the workflow:
+Actions, Release, Run workflow, "Use workflow from" the tag `v7.0.0-alpha.3`, tick
+`publish_npm`, set `npm_dist_tag` to `latest`, and tick `publish_pypi` only after the
+PyPI check in [section 6](#6-publish-to-pypi). Then confirm:
+
+```sh
+npm dist-tag ls @zero-x.live/neuron      # latest: 7.0.0-alpha.3
+pip index versions neuroncli --pre       # lists 7.0.0a3 (only if publish_pypi ran)
+```
+
+The release notes (from CHANGELOG.md) tell users to check these same commands before
+using npm or pip, so they stay true whichever registry is late. If a publish is
+skipped or fails for good, edit the notes so they do not promise that registry: save
+them with `gh release view v7.0.0-alpha.3 --repo RAHUL-DevelopeRR/neuron-v2 --json body
+-q .body > notes.md`, remove that registry's lines, and upload them with
+`gh release edit v7.0.0-alpha.3 --repo RAHUL-DevelopeRR/neuron-v2 --notes-file notes.md`.
+
+For other releases, either dispatch the workflow on the tag (Actions, Release, Run workflow, "Use workflow
 from" `v7.0.0-alpha.3`, tick `publish_npm` and choose the `npm_dist_tag`), or publish
 from a maintainer machine.
 
@@ -184,6 +208,15 @@ The dispatched run does not rebuild or re-upload anything on the published relea
 file under the chosen dist-tag.
 
 ## 6. Publish to PyPI
+
+**Check the trusted publisher first.** It has never worked: the last attempt, the
+7.0.0-alpha.2 dispatch (run 40355819626), failed in `publish-pypi` with
+`invalid-publisher: valid token, but no corresponding publisher` for the claims
+`repo:RAHUL-DevelopeRR/neuron-v2:environment:pypi`, workflow `release.yml`. Before
+ticking `publish_pypi`, open pypi.org, project `neuroncli`, Manage project, Publishing,
+and make sure a GitHub publisher reads exactly: owner `RAHUL-DevelopeRR`, repository
+`neuron-v2`, workflow `release.yml`, environment `pypi` (fix or re-add it if any field
+differs). Only the maintainer can see this page; the workflow cannot check it.
 
 Once the trusted publisher is configured (one-time setup, step 3), dispatch the
 workflow on the tag with `publish_pypi` ticked. `package-pypi` builds the sdist and

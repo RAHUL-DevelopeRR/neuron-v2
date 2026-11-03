@@ -64,6 +64,12 @@ npm install --global @zero-x.live/neuron
 pip install --pre neuroncli
 ```
 
+The registry packages are published after the GitHub release, so check them first:
+`npm view @zero-x.live/neuron version` should print `7.0.0-alpha.3`, and
+`pip index versions neuroncli --pre` should list `7.0.0a3`. If they still show 6.2.0
+(npm) or 6.2.4 (PyPI), those are old, unsupported builds: use the install scripts
+above instead.
+
 The npm and pip packages are small launchers that download the binaries for the
 package's exact version and verify their checksums. npm downloads them during
 `npm install`, without showing progress: `neuron` (about 17 MB) and `neuron-tui`
