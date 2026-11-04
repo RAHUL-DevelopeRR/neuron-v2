@@ -66,6 +66,19 @@ The release workflow copies a version's section into its GitHub release notes.
   for this session" (`d`), after which commands that would ask and start with the same
   prefix are refused without asking. A denied model is told plainly not to retry the
   command or a variant.
+- The Free plan's rolling 5-hour token window is shown in `/usage`, `neuron usage` and
+  a new `Plan` section of `/status` (`Free 640K/1M, resets 14:20 UTC`), kept current
+  from each reply's quota headers, and Neuron warns once at 90% of it; the near-limit
+  upgrade hint follows the window instead of the daily tokens, which it does not refuse.
+  The full-screen UI protocol gains the window (`AccountDetails.window`,
+  `Status.usage_window`) and an estimate of each request's size
+  (`Status.request_tokens_estimate`).
+- On a plan with a token window, Neuron keeps a working set of about 40,000 tokens
+  (`workingSetTokens`, `NEURON_WORKING_SET_TOKENS`): older tool results become short
+  stubs from half of it, and it asks before a request would need more tokens than the
+  window has left. On the gateway, requests carry a `prompt_cache_key` (a hash of the
+  session id), and `auto` requests that attach tools carry `x-neuron-route: agentic`
+  so the gateway picks a model that calls tools well.
 
 ## 7.0.0-alpha.3 (2026-11-02)
 

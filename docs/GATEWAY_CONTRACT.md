@@ -335,3 +335,19 @@ Sync the copy in `neuron-v2`; nothing here changes what the CLI sends or must ha
   the budget, with `upgrade_url` when a paid pool would take it, instead of
   `403 upgrade_required` ("model not in plan"). Clients handle it like any other
   `context_length_exceeded` (compact or shorten).
+
+## 8. v1.3 amendments (Free token window and routing hints, 2026-11-04)
+
+- **Token window (§1, §3.4).** A plan may count tokens over a rolling window
+  (`limits.window_tokens`, `limits.window_seconds`; Free: 1,000,000 per 18,000 s). `GET
+  /api/account` adds `usage_window: null|{tokens, limit_tokens, remaining_tokens,
+  window_seconds, resets_at}`. With a window, `daily_tokens` refuses nothing; the CLI shows
+  the window (`/usage`, `neuron usage`, `/status`), warns at 90% of it, and on such a plan
+  reads `x-neuron-quota-remaining-tokens` as what the window still allows.
+- **Routing hint (§3.2).** The CLI sends `x-neuron-route: agentic` on chat requests that
+  attach tools when the model is `auto`; `auto` then picks only tool-capable models with a
+  good tool-call record.
+- **Prompt cache key (§3.2).** The CLI may send `prompt_cache_key` in chat bodies: a hash of
+  the session id (32 hex characters), never the id itself, the same for every request of a
+  session. The gateway passes it upstream to providers that accept it and strips it
+  otherwise; quota accounting is unchanged. Other OpenAI-compatible providers never get it.

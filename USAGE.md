@@ -109,10 +109,37 @@ sessions from the Zero-X dashboard signs out every machine.
 
 | Command | What it does |
 | --- | --- |
-| `neuron usage` | Prints your plan, today's requests and tokens with the reset time, and your credit balance. |
+| `neuron usage` | Prints your plan, today's requests and tokens with the reset time, your plan's token window when it has one, and your credit balance. |
 | `/usage` | The same, inside a session. |
+| `/status` | Also ends with a `Plan` section: the token window (`Free 640K/1M, resets 14:20 UTC`), the size of the next request, and the working set. |
 | `/upgrade` | Opens <https://zero-x.live/pricing>. |
 | `/cost` | Token usage of the current session. |
+
+### The Free token window
+
+Free counts tokens over a rolling 5-hour window (1,000,000 tokens), and that window,
+not the daily figure, is what refuses requests. Every step of an agent turn sends the
+whole conversation again, so a long task can use the window quickly. On a plan with a
+window Neuron:
+
+- shows the window in `/usage`, `neuron usage` and `/status`, keeps it current from
+  the quota headers of each reply, and warns once when 90% of it is used;
+- keeps a smaller working set: about 40,000 tokens of conversation (system prompt and
+  tool definitions not counted). Once the conversation reaches half of it, tool results
+  older than the last four become short stubs that name the tool and keep the start of
+  the output (the model runs the tool again when it needs the rest); near the working
+  set, older history is compacted as usual. `workingSetTokens` in the settings (or
+  `NEURON_WORKING_SET_TOKENS`) sets the size, also on other plans, and `0` turns it
+  off;
+- asks before a request would need more tokens than the window has left ("Send
+  anyway" or "Stop here"); a stopped turn sends nothing, and `/compact` makes the
+  conversation smaller. A run with nobody to ask (a script) prints a warning and
+  sends the request, and the gateway decides.
+
+On the gateway Neuron also sends a `prompt_cache_key` (a hash of the session id, never
+the id) so the requests of one session can share a provider's prompt cache, and with
+the `auto` model it marks requests that carry tools so `auto` picks a model that calls
+tools well.
 
 Neuron reports gateway limits with the reason and what to do next:
 
@@ -414,6 +441,7 @@ names the file, the line and the closest known key. Commonly used keys:
 | `permissions` | `allow`, `ask` and `deny` rules for individual tools |
 | `provider` | Provider to use (see [Bring your own key](#bring-your-own-key)) |
 | `maxIterations` | Model calls allowed in one turn (default 50); `NEURON_MAX_ITERATIONS` overrides it |
+| `workingSetTokens` | Conversation tokens to keep before older tool results become stubs and history is compacted (default 40000 on a plan with a token window, such as Free; none on other plans); `0` turns it off, and `NEURON_WORKING_SET_TOKENS` overrides it. See [The Free token window](#the-free-token-window) |
 | `hooks` | Commands run before and after tool calls |
 | `mcpServers`, `defaultMcpServers`, `disabledMcpServers` | MCP servers |
 | `defaultSkills` | `false` leaves the bundled skills out of the system prompt |
@@ -453,6 +481,7 @@ or put it in your user settings.
 | `NEURON_MODEL` | neuron | Model for this process |
 | `NEURON_PROVIDER` | neuron | Provider for this process (see [Bring your own key](#bring-your-own-key)) |
 | `NEURON_MAX_ITERATIONS` | neuron | Model calls allowed in one turn (default 50) |
+| `NEURON_WORKING_SET_TOKENS` | neuron | Working set in conversation tokens; overrides `workingSetTokens` (`0` turns it off) |
 | `NEURON_AUTO_COMPACT_INPUT_TOKENS` | neuron | Estimated context tokens at which older history is compacted automatically (default: worked out from the model's context budget) |
 | `NEURON_FIRST_TOKEN_TIMEOUT_SECS` | neuron | Seconds to wait for a response to start, also after tool results (default 100 for the gateway; 90, and 60 after tool results, for a provider called directly) |
 | `NEURON_DENIAL_LIMIT` | neuron | Denied tool calls after which a non-interactive `neuron prompt` run stops (default 5) |
