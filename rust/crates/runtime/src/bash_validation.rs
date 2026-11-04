@@ -16,6 +16,7 @@ mod command_line;
 
 use std::path::Path;
 
+pub(crate) use command_line::is_package_manager_config;
 pub use command_line::{
     classify_powershell_command, classify_shell_command, path_is_within, render_prefix,
     CommandClassification, ShellDialect, ShellSegment,

@@ -1236,6 +1236,13 @@ fn assignment_write_problem(word: &Word, context: &Context<'_>) -> Option<String
             "environment assignment `{name}` can change where programs install or what they run"
         ));
     }
+    // `--import=data:...` / `--require data:...` load code written into the value.
+    if upper == "NODE_OPTIONS" && value.contains("data:") {
+        return Some(
+            "environment assignment `NODE_OPTIONS` loads a `data:` module, which runs code given inline"
+                .to_string(),
+        );
+    }
     let separator = if context.dialect == ShellDialect::Posix {
         ':'
     } else {
@@ -1265,21 +1272,53 @@ fn redirect_write_problem(target: &Word, context: &Context<'_>) -> Option<String
             target.text
         ));
     }
-    let protected = dialect_path(&target.text, context.dialect)
-        .split('/')
-        .any(|component| {
-            let component = component.to_ascii_lowercase();
-            matches!(
-                component.as_str(),
-                ".git" | ".neuron" | ".claw" | ".claude" | ".neuron.json" | ".claw.json"
-            )
-        });
-    protected.then(|| {
-        format!(
-            "output redirection to `{}` changes configuration that controls permissions, hooks or git",
-            target.text
+    protected_path_kind(&target.text, context.dialect)
+        .map(|kind| format!("output redirection to `{}` changes {kind}", target.text))
+}
+
+/// What a workspace path holds, when a command that writes it must not run unasked:
+/// configuration that controls permissions, hooks or git (`.git/hooks/pre-commit`,
+/// `.neuron/settings.json`), or package-manager configuration that can move installs or
+/// output outside the workspace (`.npmrc`, `.cargo/config.toml`).
+fn protected_path_kind(text: &str, dialect: ShellDialect) -> Option<&'static str> {
+    let path = dialect_path(text, dialect);
+    let components: Vec<String> = path.split('/').map(str::to_ascii_lowercase).collect();
+    let controls_permissions = components.iter().any(|component| {
+        matches!(
+            component.as_str(),
+            ".git" | ".neuron" | ".claw" | ".claude" | ".neuron.json" | ".claw.json"
         )
-    })
+    });
+    if controls_permissions {
+        Some("configuration that controls permissions, hooks or git")
+    } else if is_package_manager_config(&components) {
+        Some("package-manager configuration that can move installs or output outside the workspace")
+    } else {
+        None
+    }
+}
+
+/// Package-manager configuration files that can set a global install prefix, a target
+/// directory or install hooks: `.npmrc`, `.yarnrc(.yml)`, `.pnpmfile.cjs`,
+/// `bunfig.toml`, `pip.conf`/`pip.ini`, `uv.toml` and `.cargo/config(.toml)`.
+/// `components` are the path's lowercased components.
+pub(crate) fn is_package_manager_config(components: &[String]) -> bool {
+    let Some(file_name) = components.last() else {
+        return false;
+    };
+    let in_cargo_dir = components.len() >= 2 && components[components.len() - 2] == ".cargo";
+    matches!(
+        file_name.as_str(),
+        ".npmrc"
+            | ".yarnrc"
+            | ".yarnrc.yml"
+            | ".pnpmfile.cjs"
+            | ".pnpmfile.mjs"
+            | "bunfig.toml"
+            | "pip.conf"
+            | "pip.ini"
+            | "uv.toml"
+    ) || (in_cargo_dir && matches!(file_name.as_str(), "config" | "config.toml"))
 }
 
 /// Name of a build program, without the `.cmd`/`.bat`/`.ps1` of its Windows shims.
@@ -1313,13 +1352,17 @@ fn workspace_write_program(
     let name = name.as_str();
     let texts: Vec<&str> = args.iter().map(|arg| arg.text.as_str()).collect();
     let verdict = match name {
-        "npm" | "pnpm" | "yarn" | "bun" => js_package_manager_problem(name, &texts),
-        "npx" | "pnpx" | "bunx" => js_global_flag_problem(name, &texts),
-        "node" | "tsc" | "pytest" => Ok(()),
+        "npm" | "pnpm" | "yarn" | "bun" => js_package_manager_problem(name, &texts)
+            .and_then(|()| wrapped_program_problem(name, args, context)),
+        "npx" | "pnpx" | "bunx" => js_global_flag_problem(name, &texts)
+            .and_then(|()| js_command_string_problem(name, &texts)),
+        "node" => node_problem(&texts),
+        "tsc" | "pytest" => Ok(()),
         "cargo" => cargo_problem(&texts),
         "pip" | "pip3" => pip_problem(name, &texts),
-        "uv" => uv_problem(&texts),
-        "go" => subcommand_problem(name, &texts, GO_SUBCOMMANDS, &[]),
+        "uv" => uv_problem(&texts).and_then(|()| wrapped_program_problem(name, args, context)),
+        "go" => subcommand_problem(name, &texts, GO_SUBCOMMANDS, &[])
+            .and_then(|()| go_helper_program_problem(&texts)),
         "make" | "gmake" => make_problem(name, &texts),
         "deno" => subcommand_problem(name, &texts, DENO_SUBCOMMANDS, &[]),
         // `set NAME=value` in cmd.exe only sets a variable for the commands after it.
@@ -1338,8 +1381,10 @@ fn workspace_write_program(
 }
 
 /// Why the arguments of a build program keep it from running unasked: a variable
-/// whose value is unknown, a path outside the workspace (also as `--opt=path` or an
-/// attached short option such as `-t/usr/lib`), or a file holding credentials.
+/// whose value is unknown, a path outside the workspace (also after an `=`, as in
+/// `--opt=path`, Go's `-o=path` or `KEY=path`, or as an attached short option such as
+/// `-t/usr/lib`), a path into configuration that controls permissions, hooks, git or
+/// the package managers ([`protected_path_kind`]), or a file holding credentials.
 fn build_args_problem(args: &[Word], context: &Context<'_>) -> Option<String> {
     args.iter().find_map(|arg| {
         if arg.expanded {
@@ -1349,17 +1394,272 @@ fn build_args_problem(args: &[Word], context: &Context<'_>) -> Option<String> {
             ));
         }
         let text = arg.text.as_str();
-        let option_value = if text.starts_with("--") {
-            text.split_once('=').map(|(_, value)| value)
-        } else if text.starts_with('-') {
-            text.get(2..).filter(|value| !value.is_empty())
-        } else {
-            None
-        };
-        path_problem(text, false, context)
-            .or_else(|| option_value.and_then(|value| path_problem(value, false, context)))
+        let mut candidates = vec![text];
+        if let Some((_, value)) = text.split_once('=') {
+            candidates.push(value);
+        }
+        if text.starts_with('-') && !text.starts_with("--") {
+            candidates.extend(text.get(2..).filter(|value| !value.is_empty()));
+        }
+        candidates
+            .iter()
+            .find_map(|candidate| {
+                path_problem(candidate, false, context).or_else(|| {
+                    protected_path_kind(candidate, context.dialect)
+                        .map(|kind| format!("argument `{text}` names {kind}"))
+                })
+            })
             .or_else(|| sensitive_read_problem(text, context))
     })
+}
+
+/// Why a program needs approval when it runs code given on its command line or
+/// standard input (`node -e "..."`, `python -c "..."`, `echo ... | node`): the code is
+/// not a workspace file, so what it does cannot be checked in advance.
+fn inline_code_reason(program: &str, how: &str) -> String {
+    format!("`{program} {how}` runs code given inline, which cannot be checked in advance")
+}
+
+/// Why a program that reads its code from standard input (`node`, `python -`) needs
+/// approval; `shown` is how it was called.
+fn stdin_code_reason(shown: &str) -> String {
+    format!("`{shown}` runs code read from standard input, which cannot be checked in advance")
+}
+
+/// Options of `node` that take a separate value.
+const NODE_VALUE_OPTIONS: &[&str] = &[
+    "-r",
+    "--require",
+    "--import",
+    "--loader",
+    "--experimental-loader",
+    "-C",
+    "--conditions",
+    "--env-file",
+    "--input-type",
+    "--title",
+];
+
+/// `node` runs a script from the workspace without asking; code passed with `-e`,
+/// `--eval`, `-p`, `--print` (also attached or grouped, as in `-pe`), as a `data:`
+/// module, or read from standard input (`node`, `node -`) needs approval.
+fn node_problem(args: &[&str]) -> Result<(), String> {
+    let mut index = 0;
+    let mut informational = false;
+    while let Some(&arg) = args.get(index) {
+        if arg == "-" {
+            return Err(stdin_code_reason("node -"));
+        }
+        if arg == "--" {
+            return match args.get(index + 1) {
+                Some(&script) if script != "-" => Ok(()),
+                _ => Err(stdin_code_reason("node --")),
+            };
+        }
+        if !arg.starts_with('-') {
+            return Ok(());
+        }
+        let (name, attached) = arg
+            .split_once('=')
+            .map_or((arg, None), |(name, value)| (name, Some(value)));
+        let short_group = !arg.starts_with("--")
+            && arg.len() > 2
+            && arg[1..].chars().all(|ch| ch.is_ascii_alphabetic());
+        if matches!(name, "-e" | "--eval" | "-p" | "--print")
+            || (short_group && arg[1..].contains(['e', 'p']))
+        {
+            return Err(inline_code_reason("node", name));
+        }
+        informational |= matches!(name, "-v" | "--version" | "-h" | "--help" | "--v8-options");
+        let value = if NODE_VALUE_OPTIONS.contains(&name) && attached.is_none() {
+            index += 1;
+            args.get(index).copied()
+        } else {
+            attached
+        };
+        if value.is_some_and(|value| value.trim_start().starts_with("data:")) {
+            return Err(inline_code_reason("node", name));
+        }
+        index += 1;
+    }
+    if informational {
+        Ok(())
+    } else {
+        Err(stdin_code_reason("node"))
+    }
+}
+
+/// `npx -c`, `npm exec --call` and `pnpm dlx --shell-mode` run a shell command string.
+/// Only the options before the package are the runner's own (`npx eslint -c x` passes
+/// `-c` to eslint).
+fn js_command_string_problem(program: &str, args: &[&str]) -> Result<(), String> {
+    let end = first_operand(args, &["-p", "--package"]).map_or(args.len(), |(index, _)| index);
+    for arg in args[..end].iter().take_while(|arg| **arg != "--") {
+        let name = arg.split_once('=').map_or(*arg, |(name, _)| name);
+        if matches!(name, "-c" | "--call" | "--shell-mode") {
+            return Err(format!(
+                "`{program} {name}` runs a shell command string, which cannot be checked in advance"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Wrapper subcommands that start another program: `pnpm exec`, `yarn exec` and
+/// `uv run` run whatever program follows (`uv run git push`), so that program must
+/// itself be on the auto-allow list; `bun exec` runs a shell command string. Options
+/// of the wrapper before the program must be ones it is known to take, or the program
+/// cannot be told apart from an option's value.
+fn wrapped_program_problem(
+    wrapper: &str,
+    args: &[Word],
+    context: &Context<'_>,
+) -> Result<(), String> {
+    let texts: Vec<&str> = args.iter().map(|arg| arg.text.as_str()).collect();
+    let (value_options, subcommand) = match wrapper {
+        "uv" => (UV_VALUE_OPTIONS, "run"),
+        "pnpm" | "yarn" | "bun" => (JS_VALUE_OPTIONS, "exec"),
+        _ => return Ok(()),
+    };
+    let Some((index, found)) = first_operand(&texts, value_options) else {
+        return Ok(());
+    };
+    if found != subcommand {
+        return Ok(());
+    }
+    if wrapper == "bun" {
+        return Err(
+            "`bun exec` runs a shell command string, which cannot be checked in advance"
+                .to_string(),
+        );
+    }
+    let (inner_values, inner_flags): (&[&str], &[&str]) = match wrapper {
+        "uv" => (UV_RUN_VALUE_OPTIONS, UV_RUN_FLAGS),
+        "pnpm" => (PNPM_EXEC_VALUE_OPTIONS, PNPM_EXEC_FLAGS),
+        _ => (&[], &[]),
+    };
+    let rest = &args[index + 1..];
+    let mut position = 0;
+    while let Some(arg) = rest.get(position) {
+        let text = arg.text.as_str();
+        if text == "--" {
+            position += 1;
+            break;
+        }
+        if !text.starts_with('-') {
+            break;
+        }
+        let name = text.split_once('=').map_or(text, |(name, _)| name);
+        if inner_values.contains(&name) {
+            position += if name == text { 2 } else { 1 };
+        } else if inner_flags.contains(&text) {
+            position += 1;
+        } else {
+            return Err(format!(
+                "`{wrapper} {subcommand} {text}` is not an option Neuron can see past to the program it starts"
+            ));
+        }
+    }
+    let Some(inner) = rest.get(position) else {
+        return Ok(());
+    };
+    match workspace_write_program(inner, &rest[position + 1..], context) {
+        Some(verdict) => verdict,
+        None => Err(format!(
+            "`{wrapper} {subcommand}` starts `{}`, which is not on the auto-allow list",
+            inner.text
+        )),
+    }
+}
+
+/// Options of `uv run` before the program it starts that take a value.
+const UV_RUN_VALUE_OPTIONS: &[&str] = &[
+    "--with",
+    "-w",
+    "--with-editable",
+    "--with-requirements",
+    "--python",
+    "-p",
+    "--package",
+    "--directory",
+    "--project",
+    "--extra",
+    "--group",
+    "--only-group",
+    "--no-group",
+    "--env-file",
+    "--index",
+    "--default-index",
+    "--index-url",
+    "-i",
+    "--extra-index-url",
+    "--find-links",
+    "-f",
+    "--cache-dir",
+    "--config-file",
+    "--color",
+];
+
+/// Flags of `uv run` before the program it starts.
+const UV_RUN_FLAGS: &[&str] = &[
+    "--frozen",
+    "--locked",
+    "--no-sync",
+    "--isolated",
+    "--all-extras",
+    "--no-dev",
+    "--dev",
+    "--no-project",
+    "--active",
+    "--exact",
+    "--all-packages",
+    "--no-editable",
+    "--offline",
+    "--refresh",
+    "--reinstall",
+    "--upgrade",
+    "-U",
+    "--no-cache",
+    "-n",
+    "--no-config",
+    "--no-env-file",
+    "--native-tls",
+    "--compile-bytecode",
+    "-q",
+    "--quiet",
+    "-v",
+    "--verbose",
+];
+
+/// Options of `pnpm exec` before the program it starts that take a value.
+const PNPM_EXEC_VALUE_OPTIONS: &[&str] = &["--resume-from", "--workspace-concurrency"];
+
+/// Flags of `pnpm exec` before the program it starts (`-c`/`--shell-mode`, which runs
+/// a shell command string, is deliberately not one).
+const PNPM_EXEC_FLAGS: &[&str] = &[
+    "-r",
+    "--recursive",
+    "--parallel",
+    "--no-bail",
+    "--bail",
+    "--report-summary",
+    "--reporter-hide-prefix",
+    "--no-reporter-hide-prefix",
+];
+
+/// `go build -exec` and `-toolexec` (with one or two dashes, separate or after `=`)
+/// name a program that go runs on every binary or tool.
+fn go_helper_program_problem(args: &[&str]) -> Result<(), String> {
+    match args.iter().find(|arg| {
+        let name = arg.trim_start_matches('-');
+        let name = name.split_once('=').map_or(name, |(name, _)| name);
+        arg.starts_with('-') && matches!(name, "exec" | "toolexec")
+    }) {
+        Some(flag) => Err(format!(
+            "`go {flag}` names a program go runs, which cannot be checked in advance"
+        )),
+        None => Ok(()),
+    }
 }
 
 /// The first argument that is not an option, skipping the values of `value_options`.
@@ -1508,10 +1808,25 @@ fn js_global_flag_problem(program: &str, args: &[&str]) -> Result<(), String> {
 
 fn js_package_manager_problem(program: &str, args: &[&str]) -> Result<(), String> {
     js_global_flag_problem(program, args)?;
-    let Some((_, subcommand)) = first_operand(args, JS_VALUE_OPTIONS) else {
+    if program == "bun" {
+        // `bun -e`/`--eval` and `-p`/`--print` (before any subcommand) run inline code.
+        for arg in args
+            .iter()
+            .take_while(|arg| arg.starts_with('-') && **arg != "--")
+        {
+            let name = arg.split_once('=').map_or(*arg, |(name, _)| name);
+            if matches!(name, "-e" | "--eval" | "-p" | "--print") {
+                return Err(inline_code_reason(program, name));
+            }
+        }
+    }
+    let Some((index, subcommand)) = first_operand(args, JS_VALUE_OPTIONS) else {
         // `yarn`, `bun` and `pnpm` alone install; `npm` alone prints help.
         return Ok(());
     };
+    if matches!(subcommand, "exec" | "x" | "dlx") {
+        js_command_string_problem(&format!("{program} {subcommand}"), &args[index + 1..])?;
+    }
     // `bun upgrade` replaces bun itself; `bun app.ts` runs a file.
     if program == "bun" {
         if subcommand == "upgrade" {
@@ -1630,26 +1945,82 @@ fn uv_problem(args: &[&str]) -> Result<(), String> {
     subcommand_problem("uv", args, UV_SUBCOMMANDS, UV_VALUE_OPTIONS)
 }
 
-/// `python -m pip ...` follows the pip rules; `setup.py install`/`develop` installs
-/// into site-packages; anything else runs a script or module from the workspace.
+/// Python's options are read the way the interpreter reads them, short flags grouped or
+/// not (`-Im pip`, `-mpip`): `-m pip ...` follows the pip rules, `-m uv` the uv rules;
+/// `-c` code and code read from standard input (`python`, `python -`) need approval;
+/// `setup.py install`/`develop` installs into site-packages; anything else runs a
+/// script or module from the workspace.
 fn python_problem(program: &str, args: &[&str]) -> Result<(), String> {
-    if let Some(index) = args.iter().position(|arg| *arg == "-m") {
-        return match args.get(index + 1) {
-            Some(module @ (&"pip" | &"pip3")) => {
-                pip_problem(&format!("{program} -m {module}"), &args[index + 2..])
+    let mut index = 0;
+    let mut informational = false;
+    while let Some(&arg) = args.get(index) {
+        index += 1;
+        if arg == "-" {
+            return Err(stdin_code_reason(&format!("{program} -")));
+        }
+        if arg == "--" {
+            return match args.get(index) {
+                Some(&script) if script != "-" => python_script_problem(program, &args[index..]),
+                _ => Err(stdin_code_reason(&format!("{program} --"))),
+            };
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            informational |= matches!(long, "version" | "help" | "help-all" | "help-env");
+            if long == "check-hash-based-pycs" {
+                index += 1;
             }
-            Some(&"uv") => uv_problem(&args[index + 2..]),
-            _ => Ok(()),
+            continue;
+        }
+        let Some(flags) = arg.strip_prefix('-') else {
+            return python_script_problem(program, &args[index - 1..]);
         };
-    }
-    if let Some(index) = args.iter().position(|arg| arg.ends_with("setup.py")) {
-        if let Some(action @ (&"install" | &"develop")) = args.get(index + 1) {
-            return Err(format!(
-                "`{program} setup.py {action}` installs outside the workspace"
-            ));
+        for (offset, flag) in flags.char_indices() {
+            let rest = &flags[offset + flag.len_utf8()..];
+            match flag {
+                'c' => return Err(inline_code_reason(program, "-c")),
+                'm' => {
+                    let (module, after) = if rest.is_empty() {
+                        (args.get(index).copied(), index + 1)
+                    } else {
+                        (Some(rest), index)
+                    };
+                    let after = &args[after.min(args.len())..];
+                    return match module {
+                        Some(module @ ("pip" | "pip3")) => {
+                            pip_problem(&format!("{program} -m {module}"), after)
+                        }
+                        Some("uv") => uv_problem(after),
+                        _ => Ok(()),
+                    };
+                }
+                // `-W arg` and `-X opt` take a value, attached or separate.
+                'W' | 'X' => {
+                    if rest.is_empty() {
+                        index += 1;
+                    }
+                    break;
+                }
+                'V' | 'h' | '?' => informational = true,
+                _ => {}
+            }
         }
     }
-    Ok(())
+    if informational {
+        Ok(())
+    } else {
+        Err(stdin_code_reason(program))
+    }
+}
+
+/// `args` start with the script Python runs: `setup.py install`/`develop` installs into
+/// site-packages; any other script runs from the workspace.
+fn python_script_problem(program: &str, args: &[&str]) -> Result<(), String> {
+    match args {
+        [script, action @ ("install" | "develop"), ..] if script.ends_with("setup.py") => Err(
+            format!("`{program} setup.py {action}` installs outside the workspace"),
+        ),
+        _ => Ok(()),
+    }
 }
 
 const GO_SUBCOMMANDS: &[&str] = &[
@@ -1662,17 +2033,32 @@ const DENO_SUBCOMMANDS: &[&str] = &[
     "remove", "init", "serve",
 ];
 
-/// `make install`/`uninstall` usually write to system directories.
+/// `make install`/`uninstall` usually write to system directories. `--eval`/`-E` and
+/// a command-line variable that sets the shell or holds a command (`SHELL=...`,
+/// `CC='sh -c ...'`) put recipe code on the command line instead of in the workspace's
+/// makefile.
 fn make_problem(program: &str, args: &[&str]) -> Result<(), String> {
-    match args
-        .iter()
-        .find(|arg| matches!(**arg, "install" | "uninstall"))
-    {
-        Some(target) => Err(format!(
-            "`{program} {target}` usually installs outside the workspace"
-        )),
-        None => Ok(()),
+    for arg in args {
+        if matches!(*arg, "install" | "uninstall") {
+            return Err(format!(
+                "`{program} {arg}` usually installs outside the workspace"
+            ));
+        }
+        if arg.starts_with("--eval") || (arg.starts_with("-E") && !arg.starts_with("--")) {
+            return Err(inline_code_reason(program, "--eval"));
+        }
+        if let Some((name, value)) = arg.split_once('=').filter(|_| is_assignment(arg)) {
+            let command_like = value
+                .chars()
+                .any(|ch| ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | '`' | '$'));
+            if matches!(name, "SHELL" | ".SHELLFLAGS" | "MAKESHELL") || command_like {
+                return Err(format!(
+                    "`{program} {name}=...` sets a make variable to a command, which cannot be checked in advance"
+                ));
+            }
+        }
     }
+    Ok(())
 }
 
 fn is_assignment(text: &str) -> bool {
@@ -3570,6 +3956,18 @@ mod tests {
             "make",
             "make -j8 test",
             "deno task dev",
+            // Interpreter options that are not inline code, and wrappers that start a
+            // program that is itself on the list.
+            "node --require ./setup.js app.js",
+            "node --check src/index.js",
+            "python -X dev -W error manage.py test",
+            "python -Im pytest -q",
+            "python3 --version",
+            "uv run pytest -q",
+            "uv run --frozen python manage.py migrate",
+            "pnpm exec tsc --noEmit",
+            "go build -o=bin/tool ./cmd/tool",
+            "make CFLAGS=-O2 test",
             // Environment assignments and redirections inside the workspace.
             "NODE_ENV=production npm run build",
             "CARGO_INCREMENTAL=0 cargo test > test.log 2>&1",
@@ -3664,16 +4062,7 @@ mod tests {
             ("npm install $(cat deps.txt)", "substitution"),
             ("rm -rf node_modules", "`rm`"),
         ] {
-            let classification = posix(command);
-            assert_eq!(
-                classification.required_mode(),
-                PermissionMode::DangerFullAccess,
-                "expected to ask: {command}"
-            );
-            let reason = classification
-                .full_access_reason()
-                .unwrap_or_else(|| panic!("a reason for {command}"));
-            assert!(reason.contains(why), "{command}: {reason}");
+            assert_asks_with(command, why);
         }
         assert_eq!(
             cmd("npm install -g typescript").required_mode(),
@@ -3683,6 +4072,96 @@ mod tests {
             cmd("set PATH=C:\\tools&& npm test").required_mode(),
             PermissionMode::DangerFullAccess
         );
+    }
+
+    /// Asserts that `command` needs approval in workspace-write, for a reason that
+    /// mentions `why`.
+    fn assert_asks_with(command: &str, why: &str) {
+        let classification = posix(command);
+        assert_eq!(
+            classification.required_mode(),
+            PermissionMode::DangerFullAccess,
+            "expected to ask: {command}"
+        );
+        let reason = classification
+            .full_access_reason()
+            .unwrap_or_else(|| panic!("a reason for {command}"));
+        assert!(reason.contains(why), "{command}: {reason}");
+    }
+
+    #[test]
+    fn inline_code_wrapped_programs_and_protected_outputs_still_ask() {
+        for (command, why) in [
+            // Inline code and code from standard input.
+            (
+                "node -e \"require('child_process').execSync('git push')\"",
+                "inline",
+            ),
+            ("node --eval=process.exit(1)", "inline"),
+            ("node -pe 1+1", "inline"),
+            ("node --import data:text/javascript,1 app.js", "inline"),
+            ("echo 'console.log(1)' | node", "standard input"),
+            ("node - < script.js", "standard input"),
+            (
+                "python3 -c 'import os; os.system(\"sudo rm -rf /\")'",
+                "inline",
+            ),
+            (r"python -cimport\ os", "inline"),
+            ("python -Ic 'print(1)'", "inline"),
+            ("echo 'print(1)' | python3", "standard input"),
+            ("bun -e 'Bun.spawnSync([\"git\", \"push\"])'", "inline"),
+            ("bun --eval=1", "inline"),
+            ("bun exec 'git push'", "shell command string"),
+            ("deno eval 'Deno.exit(0)'", "`deno eval`"),
+            ("npx -c 'git push'", "shell command string"),
+            ("npm exec --call='git push'", "shell command string"),
+            ("pnpm dlx --shell-mode 'git push'", "shell command string"),
+            ("pnpm exec git push", "`git`"),
+            ("pnpm exec -c 'git push'", "-c"),
+            ("yarn exec 'git push'", "auto-allow list"),
+            ("uv run git push", "`git`"),
+            ("uv run --python python git push", "`git`"),
+            ("make --eval='x:;git push' x", "inline"),
+            ("make SHELL=/bin/sh test", "SHELL"),
+            ("make CC='sh -c x' test", "CC"),
+            (
+                "NODE_OPTIONS=--import=data:text/javascript,1 npm test",
+                "inline",
+            ),
+            // Options with the value after `=`, as Go spells them.
+            (
+                "go build -o=/usr/local/bin/tool ./cmd/tool",
+                "outside the workspace",
+            ),
+            (
+                "go test -coverprofile=/tmp/c.out ./...",
+                "outside the workspace",
+            ),
+            ("go run -exec 'sh -c x' .", "-exec"),
+            ("go build -toolexec=./wrap ./...", "-toolexec"),
+            // pip's location rules hold however `-m` is spelled.
+            ("python -mpip install --user requests", "--user"),
+            ("python -Im pip install --user requests", "--user"),
+            (
+                "python3 -Impip install --break-system-packages x",
+                "outside the workspace",
+            ),
+            // Build output into hooks, permission or package-manager configuration.
+            (
+                "go build -o .git/hooks/pre-commit ./cmd/hook",
+                "controls permissions",
+            ),
+            (
+                "echo global=true > .npmrc && npm install vite",
+                "package-manager configuration",
+            ),
+            (
+                "echo x >> .cargo/config.toml",
+                "package-manager configuration",
+            ),
+        ] {
+            assert_asks_with(command, why);
+        }
     }
 
     #[test]
@@ -3964,7 +4443,7 @@ mod tests {
 
     #[test]
     fn non_allowlisted_programs_escalate() {
-        for command in ["cargo test", "npm install", "python3 -c 'print(1)'"] {
+        for command in ["cargo test", "npm install", "python3 script.py"] {
             assert_escalates_in_workspace(command);
         }
         for command in [

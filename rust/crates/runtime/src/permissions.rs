@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use serde_json::Value;
 
 use crate::bash_validation::{
-    classify_powershell_command, classify_shell_command, path_is_within, render_prefix,
-    CommandClassification, ShellDialect,
+    classify_powershell_command, classify_shell_command, is_package_manager_config, path_is_within,
+    render_prefix, CommandClassification, ShellDialect,
 };
 use crate::config::RuntimePermissionRuleConfig;
 use crate::sensitive_paths::sensitive_path_reason_resolved;
@@ -1340,6 +1340,11 @@ fn protected_config_reason(path: &str) -> Option<String> {
             "`{path}` is Neuron configuration that can change permissions or hooks"
         ));
     }
+    if is_package_manager_config(&components) {
+        return Some(format!(
+            "`{path}` is package-manager configuration that can move installs or output outside the workspace"
+        ));
+    }
     None
 }
 
@@ -2649,6 +2654,9 @@ mod tests {
             ".claw/settings.json",
             ".git/config",
             "sub/.git/hooks/pre-commit",
+            ".npmrc",
+            "web/.yarnrc.yml",
+            ".cargo/config.toml",
         ] {
             assert!(
                 matches!(
