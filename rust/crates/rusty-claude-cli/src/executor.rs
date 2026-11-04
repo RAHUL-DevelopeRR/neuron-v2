@@ -308,10 +308,19 @@ impl CliToolExecutor {
         let left_out = crate::progress::left_out_bundled_mcp_servers();
         if !left_out.is_empty() {
             // A one-shot run: without this the model keeps searching for them.
-            notes.push(format!(
+            let mut note = format!(
                 "This one-shot run (`neuron prompt`) does not load the bundled MCP servers ({}), so their tools are not available and no search will find them. Interactive sessions load them.",
                 left_out.join(", ")
-            ));
+            );
+            if left_out
+                .iter()
+                .any(|name| name == runtime::browser::BROWSER_SERVER)
+            {
+                note.push_str(
+                    " The user can load the browser in a one-shot run with --with-browser (or the browser.oneShot setting); do not write browser scripts instead.",
+                );
+            }
+            notes.push(note);
         }
         if !notes.is_empty() {
             output["note"] = json!(notes.join(" "));
@@ -658,6 +667,10 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
+        "  --with-browser             Load the bundled browser in a one-shot run (-p, prompt); pages still need --allow-origin or an allow rule"
+    )?;
+    writeln!(
+        out,
         "  --base-commit REV          Warn at start when git HEAD is not REV (default: the commit in .neuron-base); a terminal session then uses the line REPL"
     )?;
     writeln!(
@@ -792,6 +805,7 @@ mod tool_search_tests {
             note.contains("does not load the bundled MCP servers (codebase-memory, playwright)"),
             "{output}"
         );
+        assert!(note.contains("--with-browser"), "{output}");
     }
 }
 

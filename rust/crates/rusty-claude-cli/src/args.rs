@@ -1046,11 +1046,11 @@ const VALUE_FLAGS: &[&str] = &[
     "--allow-origin",
 ];
 
-/// The run-only web grants, which `main` takes out of the arguments before they
+/// The run-only web flags, which `main` takes out of the arguments before they
 /// are parsed ([`extract_web_grant_flags`]).
-pub(crate) const WEB_GRANT_FLAGS: &[&str] = &["--allow-web", "--allow-origin"];
+pub(crate) const WEB_GRANT_FLAGS: &[&str] = &["--allow-web", "--allow-origin", "--with-browser"];
 
-/// Removes `--allow-web` and every `--allow-origin <host>` /
+/// Removes `--allow-web`, `--with-browser` and every `--allow-origin <host>` /
 /// `--allow-origin=<host>` from `args` and returns the remaining arguments with
 /// the grants for this run. Like `--provider`, scanning stops where prompt text
 /// begins: at `-p`, at a `prompt` subcommand, and at `--`.
@@ -1069,6 +1069,8 @@ pub(crate) fn extract_web_grant_flags(
         }
         if arg == "--allow-web" {
             grants.allow_web = true;
+        } else if arg == "--with-browser" {
+            grants.with_browser = true;
         } else if arg == "--allow-origin" {
             index += 1;
             let value = args
@@ -1984,6 +1986,34 @@ mod web_grant_flag_tests {
             error.starts_with("--allow-origin among a prompt's words"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn with_browser_is_taken_out_before_the_prompt_and_grants_nothing() {
+        let (rest, grants) = extract_web_grant_flags(&strings(&[
+            "--with-browser",
+            "--allow-origin",
+            "example.com",
+            "-p",
+            "open example.com",
+        ]))
+        .unwrap();
+        assert_eq!(rest, strings(&["-p", "open example.com"]));
+        assert!(grants.with_browser);
+        assert!(!grants.allow_web);
+        assert_eq!(grants.origins, vec!["example.com"]);
+
+        let (rest, grants) = extract_web_grant_flags(&strings(&["--with-browser"])).unwrap();
+        assert!(rest.is_empty());
+        assert!(grants.with_browser);
+        assert!(grants.is_empty(), "loading the browser grants nothing");
+
+        // After `-p` it would be prompt text.
+        let words = strings(&["-p", "open it", "--with-browser"]);
+        let (rest, grants) = extract_web_grant_flags(&words).unwrap();
+        assert!(!grants.with_browser);
+        let error = parse_args(&rest).unwrap_err();
+        assert!(error.contains("--with-browser after `-p`"), "{error}");
     }
 
     #[test]

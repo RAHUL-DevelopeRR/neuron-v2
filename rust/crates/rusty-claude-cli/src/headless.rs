@@ -133,6 +133,19 @@ impl Denial {
     /// mode only for a disposable environment (Full access stays opt-in). Every rule
     /// named lets this call run: the runtime checked it with its own matching.
     pub(crate) fn reason(&self) -> String {
+        let mut reason = self.reason_without_hint();
+        // A page in the bundled browser: the run's own grant is the usual answer.
+        if self.tool.starts_with(runtime::browser::BROWSER_TOOL_PREFIX)
+            && self.remedy.mode.is_some()
+        {
+            reason.push_str(
+                ". For this run only, name the sites the browser may open with --allow-origin (`neuron --with-browser --allow-origin example.com -p \"...\"`)",
+            );
+        }
+        reason
+    }
+
+    fn reason_without_hint(&self) -> String {
         let tool = &self.tool;
         let mut reason =
             format!("tool '{tool}' was not run: nobody could approve it in a non-interactive run");
@@ -689,6 +702,34 @@ mod tests {
             reason,
             "tool 'write_file' was not run: nobody could approve it in a non-interactive run (tool 'write_file' requires approval due to ask rule 'write_file')"
         );
+    }
+
+    /// A page the bundled browser was not allowed to open names `--allow-origin`,
+    /// the run-only grant, besides the allow rule.
+    #[test]
+    fn a_denied_browser_page_names_allow_origin() {
+        let mut browser = policy(&[], &[]);
+        for (tool, _) in runtime::browser::BUNDLED_BROWSER_TOOLS {
+            browser = browser.with_tool_requirement(
+                format!("mcp__playwright__{tool}"),
+                runtime::browser::browser_tool_permission(tool).expect("tier"),
+            );
+        }
+        let browser = browser.with_run_web_grants(runtime::RunWebGrants::default());
+        let reason = denied_with(
+            &browser,
+            "mcp__playwright__browser_navigate",
+            r#"{"url":"https://example.com/"}"#,
+        )
+        .reason();
+        assert!(
+            reason.contains("\"mcp__playwright__browser_navigate\""),
+            "{reason}"
+        );
+        assert!(reason.contains("--allow-origin"), "{reason}");
+        // Other tools get no such hint.
+        let reason = denied("WebSearch", r#"{"query":"latest node lts"}"#).reason();
+        assert!(!reason.contains("--allow-origin"), "{reason}");
     }
 
     /// A web search on a one-line question was answered with "re-run with

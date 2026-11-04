@@ -209,6 +209,7 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--base-commit",
     "--allow-web",
     "--allow-origin",
+    "--with-browser",
     "-p",
 ];
 
@@ -720,6 +721,8 @@ fn run_prompt(
     enforce_broad_cwd_policy(options.allow_broad_cwd, output_format)?;
     run_stale_base_preflight(options.base_commit.as_deref());
     progress::set_mcp_startup(McpStartup::WaitWithoutBundled);
+    // Before the system prompt is built: it says which bundled servers this run has.
+    runtime::browser::set_one_shot_run(true);
     // Workspace trust check (skip when stdin is piped so we don't consume the pipe)
     if runtime::ui_hooks::stdin_is_terminal() {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -2650,6 +2653,38 @@ fn mcp_servers_without_bundled(
         .collect()
 }
 
+/// The servers a one-shot run starts: the configured ones without the bundled
+/// defaults, except the bundled browser when `--with-browser` (`with_browser`) or
+/// `browser.oneShot` asks for it.
+fn mcp_servers_for_one_shot(
+    runtime_config: &runtime::RuntimeConfig,
+    with_browser: bool,
+) -> BTreeMap<String, runtime::ScopedMcpServerConfig> {
+    let mut servers = mcp_servers_without_bundled(runtime_config);
+    for (name, server) in runtime_config.mcp().servers() {
+        if server.scope == ConfigSource::Bundled
+            && runtime::browser::one_shot_loads_bundled_with(name, runtime_config, with_browser)
+        {
+            servers.insert(name.clone(), server.clone());
+        }
+    }
+    servers
+}
+
+/// The bundled browser's tools take their tier from Neuron's table
+/// ([`runtime::browser::BUNDLED_BROWSER_TOOLS`]) rather than from their annotations,
+/// which mark every one as reaching the open world; `None` for any other tool, and for
+/// a browser tool the table does not know (a later release).
+fn bundled_browser_tool_permission(
+    tool: &runtime::ManagedMcpTool,
+    server: Option<&runtime::ScopedMcpServerConfig>,
+) -> Option<PermissionMode> {
+    let bundled = server.is_some_and(|server| server.scope == ConfigSource::Bundled);
+    (bundled && tool.server_name == runtime::browser::BROWSER_SERVER)
+        .then(|| runtime::browser::browser_tool_permission(&tool.raw_name))
+        .flatten()
+}
+
 /// `servers` are the configured servers: a tool's server decides how far its own
 /// annotations are trusted ([`permission_mode_for_mcp_tool`]).
 fn mcp_runtime_tool_definition(
@@ -2669,10 +2704,10 @@ fn mcp_runtime_tool_definition(
             .input_schema
             .clone()
             .unwrap_or_else(|| json!({ "type": "object", "additionalProperties": true })),
-        required_permission: permission_mode_for_mcp_tool(
-            &tool.tool,
-            servers.get(&tool.server_name),
-        ),
+        required_permission: bundled_browser_tool_permission(tool, servers.get(&tool.server_name))
+            .unwrap_or_else(|| {
+                permission_mode_for_mcp_tool(&tool.tool, servers.get(&tool.server_name))
+            }),
     }
 }
 
@@ -5404,7 +5439,8 @@ fn build_runtime_plugin_state_starting_mcp(
         .with_hooks(runtime_config.hooks().merged(&plugin_hook_config));
     let servers = match startup {
         McpStartup::WaitWithoutBundled => {
-            let servers = mcp_servers_without_bundled(runtime_config);
+            let servers =
+                mcp_servers_for_one_shot(runtime_config, runtime::run_web_grants().with_browser);
             // ToolSearch tells the model, which would otherwise keep looking for them.
             progress::set_left_out_bundled_mcp_servers(
                 runtime_config
@@ -5419,6 +5455,15 @@ fn build_runtime_plugin_state_starting_mcp(
         }
         McpStartup::Wait | McpStartup::Background => runtime_config.mcp().servers().clone(),
     };
+    // Unit tests build runtimes in the crate's own folder, which must stay clean.
+    if !cfg!(test) && servers.contains_key(runtime::browser::BROWSER_SERVER) {
+        // Its screenshots and saved pages go there, out of the project's history.
+        if let Err(error) = runtime::browser::prepare_output_dir(runtime_config) {
+            runtime::ui_hooks::notice(&format!(
+                "warning: could not prepare the browser's output folder: {error}"
+            ));
+        }
+    }
     let stand_in = match startup {
         McpStartup::Background => {
             RuntimeMcpState::not_started(&servers)?.filter(|state| !state.server_names().is_empty())
@@ -9751,6 +9796,127 @@ UU conflicted.rs",
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn one_shot_runs_load_the_bundled_browser_only_when_asked() {
+        let config_home = temp_dir();
+        let workspace = temp_dir();
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let load = || {
+            ConfigLoader::new(&workspace, &config_home)
+                .load()
+                .expect("runtime config should load")
+        };
+        let names = |servers: &std::collections::BTreeMap<
+            String,
+            runtime::ScopedMcpServerConfig,
+        >| { servers.keys().cloned().collect::<Vec<_>>() };
+        assert_eq!(
+            names(&super::mcp_servers_for_one_shot(&load(), false)),
+            Vec::<String>::new()
+        );
+        // --with-browser: the browser, not the code graph.
+        assert_eq!(
+            names(&super::mcp_servers_for_one_shot(&load(), true)),
+            vec!["playwright"]
+        );
+        // browser.oneShot does the same from settings.
+        fs::write(
+            config_home.join("settings.json"),
+            json!({"browser": {"oneShot": true}}).to_string(),
+        )
+        .expect("write settings");
+        assert_eq!(
+            names(&super::mcp_servers_for_one_shot(&load(), false)),
+            vec!["playwright"]
+        );
+        // Turned off, it stays off.
+        fs::write(
+            config_home.join("settings.json"),
+            json!({"browser": {"oneShot": true}, "disabledMcpServers": ["playwright"]}).to_string(),
+        )
+        .expect("write settings");
+        assert_eq!(
+            names(&super::mcp_servers_for_one_shot(&load(), true)),
+            Vec::<String>::new()
+        );
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn bundled_browser_tools_take_their_tier_from_the_table() {
+        let tool = |server: &str, name: &str| runtime::ManagedMcpTool {
+            server_name: server.to_string(),
+            qualified_name: format!("mcp__{server}__{name}"),
+            raw_name: name.to_string(),
+            tool: runtime::McpTool {
+                name: name.to_string(),
+                description: None,
+                input_schema: None,
+                // What @playwright/mcp 0.0.83 says of every tool.
+                annotations: Some(
+                    json!({"readOnlyHint": false, "destructiveHint": true, "openWorldHint": true}),
+                ),
+                meta: None,
+            },
+        };
+        let stdio = |scope: runtime::ConfigSource| runtime::ScopedMcpServerConfig {
+            scope,
+            config: runtime::McpServerConfig::Stdio(runtime::McpStdioServerConfig {
+                command: "npx".to_string(),
+                args: Vec::new(),
+                env: std::collections::BTreeMap::new(),
+                tool_call_timeout_ms: None,
+            }),
+        };
+        let mut servers = std::collections::BTreeMap::new();
+        servers.insert(
+            "playwright".to_string(),
+            stdio(runtime::ConfigSource::Bundled),
+        );
+        let required = |name: &str,
+                        servers: &std::collections::BTreeMap<
+            String,
+            runtime::ScopedMcpServerConfig,
+        >| {
+            super::mcp_runtime_tool_definition(&tool("playwright", name), servers)
+                .required_permission
+        };
+        assert_eq!(
+            required("browser_navigate", &servers),
+            PermissionMode::WorkspaceWrite
+        );
+        assert_eq!(
+            required("browser_snapshot", &servers),
+            PermissionMode::WorkspaceWrite
+        );
+        for name in [
+            "browser_network_request",
+            "browser_file_upload",
+            "browser_drop",
+            "browser_run_code_unsafe",
+        ] {
+            assert_eq!(
+                required(name, &servers),
+                PermissionMode::DangerFullAccess,
+                "{name}"
+            );
+        }
+        // A later tool the table does not know keeps its annotations: full access.
+        assert_eq!(
+            required("browser_future_tool", &servers),
+            PermissionMode::DangerFullAccess
+        );
+        // A user's own server named playwright gets no table.
+        servers.insert("playwright".to_string(), stdio(runtime::ConfigSource::User));
+        assert_eq!(
+            required("browser_navigate", &servers),
+            PermissionMode::DangerFullAccess
+        );
     }
 
     #[test]
