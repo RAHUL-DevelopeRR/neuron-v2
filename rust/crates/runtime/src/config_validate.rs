@@ -241,6 +241,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "reviewerModel",
         expected: FieldType::String,
     },
+    FieldSpec {
+        name: "browser",
+        expected: FieldType::Object,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[
@@ -336,6 +340,25 @@ const SANDBOX_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         name: "memoryLimitMb",
         expected: FieldType::Number,
+    },
+];
+
+const BROWSER_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "headless",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "images",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "allowLocal",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "oneShot",
+        expected: FieldType::Bool,
     },
 ];
 
@@ -548,6 +571,15 @@ pub fn validate_config_file(
             &path_display,
         ));
     }
+    if let Some(browser) = object.get("browser").and_then(JsonValue::as_object) {
+        result.merge(validate_object_keys(
+            browser,
+            BROWSER_FIELDS,
+            "browser",
+            source,
+            &path_display,
+        ));
+    }
     if let Some(oauth) = object.get("oauth").and_then(JsonValue::as_object) {
         result.merge(validate_object_keys(
             oauth,
@@ -646,6 +678,31 @@ mod tests {
             result.errors[0].kind,
             DiagnosticKind::UnknownKey { .. }
         ));
+    }
+
+    #[test]
+    fn accepts_browser_keys_and_types_them() {
+        let source = r#"{"browser": {"headless": true, "images": "omit", "allowLocal": false, "oneShot": true}}"#;
+        let parsed = JsonValue::parse(source).expect("valid json");
+        let object = parsed.as_object().expect("object");
+        let result = validate_config_file(object, source, &test_path());
+        assert!(result.errors.is_empty(), "{result:?}");
+        assert!(result.warnings.is_empty(), "{result:?}");
+
+        let source = r#"{"browser": {"headless": "yes", "persistentProfile": true}}"#;
+        let parsed = JsonValue::parse(source).expect("valid json");
+        let object = parsed.as_object().expect("object");
+        let result = validate_config_file(object, source, &test_path());
+        let fields: Vec<&str> = result
+            .errors
+            .iter()
+            .map(|error| error.field.as_str())
+            .collect();
+        assert_eq!(
+            fields,
+            ["browser.headless", "browser.persistentProfile"],
+            "{result:?}"
+        );
     }
 
     #[test]

@@ -488,6 +488,7 @@ impl ConfigLoader {
         warn_ignored_project_settings(&ignored_project_settings);
 
         if optional_bool(&merged, "defaultMcpServers", "merged settings")? != Some(false) {
+            let browser = crate::browser::BrowserSettings::from_settings(&merged)?;
             for (name, package, entry_variable) in [
                 (
                     "codebase-memory",
@@ -500,15 +501,21 @@ impl ConfigLoader {
                     "NEURON_PLAYWRIGHT_MCP_ENTRY",
                 ),
             ] {
-                mcp_servers
-                    .entry(name.to_string())
-                    .or_insert_with(|| ScopedMcpServerConfig {
+                mcp_servers.entry(name.to_string()).or_insert_with(|| {
+                    let mut server = default_mcp_stdio_config(package, entry_variable);
+                    if name == crate::browser::BROWSER_SERVER {
+                        crate::browser::apply_launch_settings(
+                            &mut server,
+                            &browser,
+                            &self.cwd,
+                            crate::browser::BrowserHost::detect(),
+                        );
+                    }
+                    ScopedMcpServerConfig {
                         scope: ConfigSource::Bundled,
-                        config: McpServerConfig::Stdio(default_mcp_stdio_config(
-                            package,
-                            entry_variable,
-                        )),
-                    });
+                        config: McpServerConfig::Stdio(server),
+                    }
+                });
             }
         }
         let mut disabled_servers = BTreeMap::new();
@@ -2386,9 +2393,39 @@ mod tests {
             let McpServerConfig::Stdio(stdio) = &server.config else {
                 panic!("stdio default");
             };
-            assert_eq!(stdio.args.last().map(String::as_str), Some(package));
+            assert!(
+                stdio.args.iter().any(|arg| arg == package),
+                "{:?}",
+                stdio.args
+            );
             assert_eq!(stdio.command, if cfg!(windows) { "cmd.exe" } else { "npx" });
         }
+        // The bundled browser starts with the safe launch flags after its package.
+        let McpServerConfig::Stdio(browser) = &config.mcp().get("playwright").unwrap().config
+        else {
+            panic!("stdio default");
+        };
+        let after_package = browser
+            .args
+            .iter()
+            .skip_while(|arg| *arg != "@playwright/mcp@0.0.83")
+            .skip(1)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(after_package[0], "--isolated");
+        assert_eq!(after_package[1], "--output-dir");
+        assert_eq!(
+            std::path::PathBuf::from(&after_package[2]),
+            root.join(".neuron").join("browser")
+        );
+        assert!(browser
+            .env
+            .contains_key(crate::browser::BLOCKED_ORIGINS_ENV));
+        let McpServerConfig::Stdio(codebase) = &config.mcp().get("codebase-memory").unwrap().config
+        else {
+            panic!("stdio default");
+        };
+        assert!(!codebase.args.contains(&"--isolated".to_string()));
         let settings = config_home.join("settings.json");
         fs::write(&settings, r#"{"mcpServers":{"playwright":{"command":"custom-browser","args":[]}},"disabledMcpServers":["codebase-memory"]}"#).unwrap();
         let overridden = loader.load().unwrap();
@@ -2399,6 +2436,29 @@ mod tests {
             panic!("stdio override");
         };
         assert_eq!(stdio.command, "custom-browser");
+        // A server of the user's own under the same name is started as written.
+        assert!(stdio.args.is_empty());
+        assert!(stdio.env.is_empty());
+        fs::write(
+            &settings,
+            r#"{"browser":{"allowLocal":true,"images":"allow","headless":true}}"#,
+        )
+        .unwrap();
+        let with_settings = loader.load().unwrap();
+        let McpServerConfig::Stdio(browser) =
+            &with_settings.mcp().get("playwright").unwrap().config
+        else {
+            panic!("stdio default");
+        };
+        assert!(!browser
+            .env
+            .contains_key(crate::browser::BLOCKED_ORIGINS_ENV));
+        assert!(!browser.args.contains(&"--image-responses".to_string()));
+        assert!(browser.args.contains(&"--headless".to_string()));
+        assert!(browser.args.contains(&"--isolated".to_string()));
+        fs::write(&settings, r#"{"browser":{"images":"sometimes"}}"#).unwrap();
+        let error = loader.load().unwrap_err().to_string();
+        assert!(error.contains("browser.images"), "{error}");
         fs::write(&settings, r#"{"defaultMcpServers":false}"#).unwrap();
         assert_eq!(
             loader.load().unwrap().mcp().servers(),

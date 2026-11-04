@@ -1,7 +1,9 @@
 //! Run-only web grants from the command line: `--allow-web` lets `WebSearch`
 //! and `WebFetch` run without a prompt for this run, and `--allow-origin
 //! <host>` (repeatable) limits `WebFetch` and the browser to those hosts and
-//! lets fetches from them run without a prompt.
+//! lets fetches from them, and the bundled browser's pages on them, run
+//! without a prompt. `--with-browser` is not a grant: it loads the bundled
+//! browser in a one-shot run, which leaves it out otherwise.
 //!
 //! The grants live only in this process: they are never written to a
 //! settings file, so a later run asks again.
@@ -16,10 +18,13 @@ pub struct RunWebGrants {
     /// `--allow-origin` hosts, lowercase, without scheme, port or path. A
     /// leading `*.` also matches every subdomain. Empty means no limit.
     pub origins: Vec<String>,
+    /// `--with-browser`: a one-shot run loads the bundled browser. It grants
+    /// nothing; browser pages still need `--allow-origin` or an allow rule.
+    pub with_browser: bool,
 }
 
 impl RunWebGrants {
-    /// Whether nothing was granted.
+    /// Whether nothing was granted (`--with-browser` grants nothing).
     #[must_use]
     pub fn is_empty(&self) -> bool {
         !self.allow_web && self.origins.is_empty()
@@ -61,6 +66,14 @@ impl RunWebGrants {
         } else {
             self.origin_listed(host)
         }
+    }
+
+    /// Whether the bundled browser opens or acts on a page on `host` without
+    /// a prompt: only a host listed with `--allow-origin` (`--allow-web`
+    /// covers searches and fetches, not the browser).
+    #[must_use]
+    pub fn grants_browsing(&self, host: &str) -> bool {
+        self.origin_listed(host)
     }
 
     /// Whether web searches run without a prompt (`--allow-web`).
@@ -198,14 +211,18 @@ mod tests {
             "{refusal}"
         );
         assert_eq!(grants.refusal_for("WebFetch", "example.com"), None);
+        assert!(grants.grants_browsing("example.com"));
+        assert!(grants.grants_browsing("api.github.com"));
+        assert!(!grants.grants_browsing("evil.com"));
     }
 
     #[test]
     fn allow_web_grants_searches_and_fetches_everywhere_unless_origins_limit_it() {
         let mut grants = RunWebGrants {
             allow_web: true,
-            origins: Vec::new(),
+            ..RunWebGrants::default()
         };
+        assert!(!grants.grants_browsing("anything.example"));
         assert!(grants.grants_search());
         assert!(grants.grants_fetch("anything.example"));
         assert!(grants.origin_allowed("anything.example"));
@@ -219,6 +236,12 @@ mod tests {
     fn no_grants_change_nothing() {
         let grants = RunWebGrants::default();
         assert!(grants.is_empty());
+        assert!(!grants.grants_browsing("example.com"));
+        let browser_only = RunWebGrants {
+            with_browser: true,
+            ..RunWebGrants::default()
+        };
+        assert!(browser_only.is_empty(), "--with-browser grants nothing");
         assert!(!grants.grants_search());
         assert!(!grants.grants_fetch("example.com"));
         assert!(grants.origin_allowed("example.com"));

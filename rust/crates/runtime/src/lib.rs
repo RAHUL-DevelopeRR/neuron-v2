@@ -15,6 +15,7 @@ mod bash;
 pub mod bash_validation;
 mod bootstrap;
 pub mod branch_lock;
+pub mod browser;
 pub mod cancel;
 pub mod checkpoints;
 mod compact;
