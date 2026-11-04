@@ -2406,22 +2406,29 @@ mod tests {
         // Prints a notification and a ping, reads the answer, asks for roots, reads that
         // answer, and sends both answers back as its replies.
         let (command, args) = if cfg!(windows) {
-            let script = root.join("server.cmd");
+            // PowerShell, not cmd.exe: `set /p` on a pipe sometimes read nothing.
+            let script = root.join("server.ps1");
             fs::write(
                 &script,
                 format!(
-                    "@echo off\r\necho {}\r\necho {}\r\nset /p ONE=\r\necho {roots}\r\nset /p TWO=\r\nsetlocal enabledelayedexpansion\r\necho !ONE!\r\necho !TWO!\r\n",
+                    "$out = [Console]::Out\r\n$out.WriteLine('{}')\r\n$out.WriteLine('{}')\r\n$out.Flush()\r\n$one = [Console]::In.ReadLine()\r\n$out.WriteLine('{roots}')\r\n$out.Flush()\r\n$two = [Console]::In.ReadLine()\r\n$out.WriteLine($one)\r\n$out.WriteLine($two)\r\n$out.Flush()\r\n",
                     lines[0], lines[1]
                 ),
             )
             .expect("script");
             (
-                "cmd.exe".to_string(),
-                vec![
-                    "/d".to_string(),
-                    "/c".to_string(),
-                    script.to_string_lossy().into_owned(),
-                ],
+                "powershell.exe".to_string(),
+                [
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .chain([script.to_string_lossy().into_owned()])
+                .collect(),
             )
         } else {
             (
@@ -2529,8 +2536,11 @@ mod tests {
             let saved = fs::read_dir(&output)
                 .expect("output folder")
                 .filter_map(Result::ok)
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .filter(|name| name.ends_with(".png"))
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
+                })
                 .collect::<Vec<_>>();
             assert_eq!(saved.len(), 1, "{shot}");
             manager.shutdown().await.expect("shutdown");
