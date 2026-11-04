@@ -317,6 +317,10 @@ pub(crate) enum StopReason {
     /// Every sub-question was searched and read.
     Completed,
     StepCap(usize),
+    /// The page cap was reached with `skipped` sub-questions not searched.
+    PageCap { pages: usize, skipped: usize },
+    /// The search cap was reached with `skipped` sub-questions not searched.
+    SearchCap { searches: usize, skipped: usize },
     /// 80% of the token cap was used: the report was written from the notes.
     TokenCap(u64),
     SearchQuota {
@@ -332,6 +336,14 @@ impl StopReason {
         match self {
             Self::Completed => "every sub-question was searched and read".to_string(),
             Self::StepCap(steps) => format!("the step cap ({steps} searches and page reads) was reached"),
+            Self::PageCap { pages, skipped } => format!(
+                "the page cap ({pages} pages) was reached before {}",
+                not_searched(*skipped)
+            ),
+            Self::SearchCap { searches, skipped } => format!(
+                "the search cap ({searches} searches) was reached before {}",
+                not_searched(*skipped)
+            ),
             Self::TokenCap(cap) => format!(
                 "{WRAP_UP_PERCENT}% of the token budget ({} tokens) was used, so the report was written from the notes so far",
                 group_digits(*cap)
@@ -356,6 +368,8 @@ impl StopReason {
         match self {
             Self::Completed => "completed",
             Self::StepCap(_) => "step_cap",
+            Self::PageCap { .. } => "page_cap",
+            Self::SearchCap { .. } => "search_cap",
             Self::TokenCap(_) => "token_cap",
             Self::SearchQuota { .. } => "search_quota_exhausted",
             Self::SignedOut => "signed_out",
@@ -363,6 +377,14 @@ impl StopReason {
             Self::Cancelled => "cancelled",
         }
     }
+}
+
+/// "1 sub-question could be searched", "3 sub-questions could be searched".
+fn not_searched(skipped: usize) -> String {
+    format!(
+        "{skipped} sub-question{} could be searched",
+        if skipped == 1 { "" } else { "s" }
+    )
 }
 
 /// What a run found and wrote.
@@ -432,10 +454,16 @@ pub(crate) fn run_research(
             if run.should_stop(progress) {
                 break;
             }
+            // A sub-question the caps leave no room for is not searched: the run
+            // stops, says which cap, and the sub-question stays pending.
+            if let Some(cap) = run.cap_reached(run.sub_questions.len() - next) {
+                run.stop = Some(cap);
+                break;
+            }
             run.plan_status[next] = "in_progress";
             run.show_plan(progress);
-            run.research_question(next, model, web, progress);
-            run.plan_status[next] = "completed";
+            let searched = run.research_question(next, model, web, progress);
+            run.plan_status[next] = if searched { "completed" } else { "pending" };
             run.show_plan(progress);
             next += 1;
         }
@@ -549,9 +577,27 @@ impl Run<'_> {
         self.stop.is_some()
     }
 
-    /// Whether the page and search caps leave room for more reading.
+    /// Whether the page cap leaves room for more reading.
     fn room_to_read(&self) -> bool {
         self.sources.len() < self.limits.max_pages
+    }
+
+    /// The cap that leaves no room to search another sub-question, with the
+    /// `skipped` sub-questions it leaves unsearched.
+    fn cap_reached(&self, skipped: usize) -> Option<StopReason> {
+        if self.searches >= self.limits.max_searches {
+            Some(StopReason::SearchCap {
+                searches: self.limits.max_searches,
+                skipped,
+            })
+        } else if !self.room_to_read() {
+            Some(StopReason::PageCap {
+                pages: self.limits.max_pages,
+                skipped,
+            })
+        } else {
+            None
+        }
     }
 
     fn show_plan(&self, progress: &mut dyn ResearchProgress) {
@@ -599,16 +645,15 @@ impl Run<'_> {
         }
     }
 
+    /// Searches sub-question `index` and reads its best pages. False when the
+    /// search was refused or stopped the run (the sub-question is not done).
     fn research_question(
         &mut self,
         index: usize,
         model: &mut dyn ResearchModel,
         web: &mut dyn ResearchWeb,
         progress: &mut dyn ResearchProgress,
-    ) {
-        if self.searches >= self.limits.max_searches || !self.room_to_read() {
-            return;
-        }
+    ) -> bool {
         let query = shorten_query(&self.sub_questions[index]);
         self.steps += 1;
         self.searches += 1;
@@ -646,16 +691,19 @@ impl Run<'_> {
                     SearchFailure::Failed(message) => message.clone(),
                 };
                 progress.step_finished(&search_id, "WebSearch", &message, true);
-                return;
+                // A failed search is done (nothing to read); one that stops the
+                // run is not.
+                return matches!(failure, SearchFailure::Failed(_));
             }
         };
 
         for hit in self.pick_pages(&hits) {
             if self.should_stop(progress) || !self.room_to_read() {
-                return;
+                break;
             }
             self.read_page(index, &hit, model, web, progress);
         }
+        true
     }
 
     /// The results to read: not tried yet, other hosts first.
@@ -2073,6 +2121,73 @@ mod tests {
             vec!["a", "b", "c", "d", "e", "Write the cited report"]
         );
         assert_eq!(last[4].status, "pending");
+    }
+
+    #[test]
+    fn the_page_cap_leaves_unsearched_sub_questions_pending_and_says_so() {
+        // Six sub-questions, three readable pages each: the deep depth's 15-page
+        // cap is reached after five, so the sixth is never searched.
+        let questions = ["q1", "q2", "q3", "q4", "q5", "q6"];
+        let mut model = FakeModel {
+            plan: serde_json::to_string(&questions).unwrap(),
+            writer: Ok("Found [1].\n\n## Findings\n- Found [1]".to_string()),
+            ..FakeModel::default()
+        };
+        let mut web = FakeWeb::default();
+        for query in questions {
+            let urls = (1..=3)
+                .map(|page| format!("https://{query}-{page}.example/page"))
+                .collect::<Vec<_>>();
+            web.results
+                .insert(query.to_string(), Ok(urls.iter().map(|url| hit(url)).collect()));
+            for url in urls {
+                model.notes.insert(
+                    url.clone(),
+                    r#"[{"claim":"Found.","quote":"found here"}]"#.to_string(),
+                );
+                web.pages.insert(url, Ok("It was found here.".to_string()));
+            }
+        }
+        let mut progress = Recorder::default();
+        let outcome = run(&request(Depth::Deep), &mut model, &mut web, &mut progress);
+
+        assert_eq!(
+            outcome.stop,
+            StopReason::PageCap {
+                pages: 15,
+                skipped: 1
+            }
+        );
+        assert_eq!(outcome.stop.code(), "page_cap");
+        assert_eq!(outcome.sources.len(), 15);
+        assert_eq!(web.searches.len(), 5);
+        assert!(!web.searches.iter().any(|(query, _)| query == "q6"));
+        assert!(model.prompts_of("follow_up").is_empty());
+        assert_eq!(model.prompts_of("writer").len(), 1);
+        assert!(
+            outcome.report.contains(
+                "Stopped because the page cap (15 pages) was reached before 1 sub-question could be searched."
+            ),
+            "{}",
+            outcome.report
+        );
+        assert!(!outcome.report.contains("every sub-question was searched"));
+        let last = progress.plans.last().unwrap();
+        assert_eq!(last.len(), 7);
+        assert!(last[..5].iter().all(|item| item.status == "completed"));
+        assert_eq!((last[5].content.as_str(), last[5].status), ("q6", "pending"));
+        assert_eq!(last[6].status, "completed");
+
+        // The search cap is worded the same way.
+        let cap = StopReason::SearchCap {
+            searches: 10,
+            skipped: 2,
+        };
+        assert_eq!(cap.code(), "search_cap");
+        assert_eq!(
+            cap.describe(),
+            "the search cap (10 searches) was reached before 2 sub-questions could be searched"
+        );
     }
 
     #[test]
