@@ -178,6 +178,7 @@ impl Script {
 struct Recorder {
     events: Mutex<Vec<ColonyEvent>>,
     questions: Mutex<Vec<ColonyQuestion>>,
+    start: ColonyAnswer,
     near_cap: ColonyAnswer,
     merge: ColonyAnswer,
     repo: PathBuf,
@@ -189,6 +190,7 @@ impl Recorder {
         Self {
             events: Mutex::new(Vec::new()),
             questions: Mutex::new(Vec::new()),
+            start: ColonyAnswer::Continue,
             near_cap,
             merge,
             repo: repo.to_path_buf(),
@@ -205,6 +207,7 @@ impl ColonyObserver for Recorder {
     fn ask(&self, question: &ColonyQuestion) -> ColonyAnswer {
         self.questions.lock().unwrap().push(question.clone());
         match question {
+            ColonyQuestion::Start { .. } => self.start,
             ColonyQuestion::NearCap { .. } => self.near_cap,
             ColonyQuestion::Merge { .. } => {
                 *self.tree_untouched_at_merge.lock().unwrap() =
@@ -429,12 +432,18 @@ fn free_runs_one_worker_at_a_time_and_stops_when_asked_near_the_cap() {
         "Free runs workers in turn"
     );
     let questions = recorder.questions.lock().unwrap().clone();
+    assert_eq!(questions.len(), 2, "{questions:?}");
+    assert!(matches!(
+        &questions[0],
+        ColonyQuestion::Start { tasks, workers: 1, token_cap: 6_000, allow_web: false }
+            if tasks.len() == 3
+    ));
     assert_eq!(
-        questions,
-        vec![ColonyQuestion::NearCap {
+        questions[1],
+        ColonyQuestion::NearCap {
             used: 5_000,
             limit: 6_000
-        }]
+        }
     );
     assert_eq!(report.status, "stopped", "{report:#?}");
     assert_eq!(report.tasks[2].status, AgentStatus::Stopped);
@@ -522,4 +531,26 @@ fn account_limits_fall_back_to_free() {
         ColonyLimits::from_account(&huge).max_workers,
         super::MAX_COLONY_WORKERS
     );
+}
+
+#[test]
+fn declining_the_plan_runs_nothing_but_the_planner() {
+    let repo = TempRepo::new("decline");
+    let script = Script::new(vec![("planner", vec![text(THREE_TASKS)])]);
+    let runner = RuntimeAgentRunner::new(
+        |request: &AgentRequest| script.client(request),
+        RuntimePermissionRuleConfig::default(),
+    );
+    let mut recorder = Recorder::new(&repo.repo, ColonyAnswer::Continue, ColonyAnswer::Merge);
+    recorder.start = ColonyAnswer::Stop;
+    let config = config(&repo, ColonyLimits::FREE);
+    let handle = ColonyHandle::new(config.token_cap());
+
+    let report = run_colony(&config, &runner, &recorder, &handle);
+
+    assert_eq!(report.status, "stopped");
+    assert!(report.tasks.is_empty());
+    let seen = script.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert!(repo.branches().is_empty());
 }

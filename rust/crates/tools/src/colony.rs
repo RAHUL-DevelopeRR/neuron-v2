@@ -247,6 +247,14 @@ pub enum ColonyEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ColonyQuestion {
+    /// The plan is ready: start the workers? Nothing but the read-only planner runs
+    /// before this is answered.
+    Start {
+        tasks: Vec<PlannedTask>,
+        workers: usize,
+        token_cap: u64,
+        allow_web: bool,
+    },
     /// The run used most of its token cap: go on (up to the cap) or stop now?
     NearCap { used: u64, limit: u64 },
     /// Apply the synthesis diff to the working tree?
@@ -260,9 +268,9 @@ pub enum ColonyQuestion {
 /// The observer's answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColonyAnswer {
-    /// Go on (a near-cap question).
+    /// Start, or go on (a start or near-cap question).
     Continue,
-    /// Stop the run now (a near-cap question).
+    /// Do not start, or stop the run now (a start or near-cap question).
     Stop,
     /// Apply the synthesis diff (a merge question).
     Merge,
@@ -937,6 +945,18 @@ fn drive(run: &Run<'_>) -> ColonyReport {
         workers,
         token_cap: cap,
     });
+    let start = run.observer.ask(&ColonyQuestion::Start {
+        tasks: tasks.clone(),
+        workers,
+        token_cap: cap,
+        allow_web: config.allow_web,
+    });
+    if start != ColonyAnswer::Continue {
+        run.handle.stop();
+        report.status = "stopped".to_string();
+        report.note = Some("The plan was not started.".to_string());
+        return finish(report, run);
+    }
 
     // 2. Workers, each with a fair share of the cap.
     let worker_share = (cap / u64::try_from(tasks.len()).unwrap_or(1).max(1)).max(1);

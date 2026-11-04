@@ -4144,6 +4144,13 @@ pub fn clear_subagent_parent_context() {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
+/// The parent context registered with [`set_subagent_parent_context`], if any (a
+/// Colony run takes its models and rules from it).
+#[must_use]
+pub fn registered_subagent_parent() -> Option<SubagentParentContext> {
+    subagent_parent_context()
+}
+
 fn subagent_parent_context() -> Option<SubagentParentContext> {
     subagent_parent_slot()
         .read()
