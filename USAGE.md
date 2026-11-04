@@ -366,6 +366,8 @@ Permissions, per tool (all 25 tools of `@playwright/mcp` 0.0.83):
 A tool name that takes a `filename` asks too when the name leaves the project
 (`../`, an absolute path), names Neuron or git configuration (`.neuron/`, `.git/`),
 or names a credential file such as `.env`; names under `.neuron/browser/` are fine.
+Names that Windows opens as those files count as them: trailing dots and spaces
+(`.git./hooks`, `.neuron /settings.json`) and data streams (`.neuron.json::$DATA`).
 
 In a script nobody can approve web browsing, so name the sites with `--allow-origin`:
 

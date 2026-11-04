@@ -109,6 +109,11 @@ The release workflow copies a version's section into its GitHub release notes.
   `browser_network_request`, `browser_file_upload`, `browser_drop` and
   `browser_run_code_unsafe` need full access. A browser file name outside the
   project, on Neuron or git configuration, or on a credential file asks first.
+  Declining one browser tool for the rest of the session refuses that tool only,
+  unless what was declined was web browsing.
+- A file name that Windows opens as Neuron or git configuration (`.git./hooks`,
+  `.neuron /settings.json`, `.neuron.json::$DATA`) needs approval like the name it
+  stands for, for file writes and browser files alike.
 - `--with-browser` (or `browser.oneShot`) loads the bundled browser in a one-shot run.
   Without it, the system prompt and `ToolSearch` say the browser is not loaded in that
   run instead of calling it configured.

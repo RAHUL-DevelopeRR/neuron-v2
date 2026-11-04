@@ -266,7 +266,10 @@ struct SessionDenial {
     /// Command prefixes (shell), a domain (`WebFetch`) or the tool name
     /// (`WebSearch`) the denial covers: [`PermissionRequest::session_prefixes`].
     prefixes: Vec<Vec<String>>,
-    /// The exact call declined (command, path, URL); always covered.
+    /// The tool declined. Denials are kept by [`session_key`], which the bundled
+    /// browser's tools share, so the exact call is matched with its tool.
+    tool: String,
+    /// The exact call declined (command, path, URL); always covered for `tool`.
     subject: String,
     /// The call as the model is told it was declined.
     shown: String,
@@ -1102,6 +1105,7 @@ impl PermissionPolicy {
                     session_key(tool_name),
                     SessionDenial {
                         prefixes: assessment.session_prefixes.clone(),
+                        tool: tool_name.to_string(),
                         subject,
                         shown: declined_subject(tool_name, input),
                     },
@@ -1138,9 +1142,10 @@ impl PermissionPolicy {
     }
 
     /// What a call the user declined for the rest of the session was shown as, when
-    /// this call matches it: the same exact call, a shell command with a part starting
-    /// with a declined prefix, a fetch from a declined domain, or any web search once
-    /// one was declined.
+    /// this call matches it: the same exact call of the same tool, a shell command
+    /// with a part starting with a declined prefix, a fetch from a declined domain,
+    /// any web search once one was declined, or any browser call that opens or acts
+    /// on a page once web browsing was declined.
     fn session_denial(&self, tool_name: &str, input: &str) -> Option<String> {
         let denials = self.session.denials(session_key(tool_name));
         if denials.is_empty() {
@@ -1156,7 +1161,7 @@ impl PermissionPolicy {
         denials
             .into_iter()
             .find(|denial| {
-                denial.subject == subject
+                (denial.tool == tool_name && denial.subject == subject)
                     || match (&classification, tool_name) {
                         (Some(classification), _) => denial
                             .prefixes
@@ -1394,8 +1399,16 @@ fn browser_filename_reason(filename: &str, workspace: &[PathBuf]) -> Option<Stri
         ));
     }
     // The browser's own output folder is Neuron's, but holds no configuration.
-    let in_output_folder =
-        path.starts_with(crate::browser::BROWSER_OUTPUT_DIR) && path.components().count() > 2;
+    let names: Vec<String> = path
+        .components()
+        .filter(|component| !matches!(component, std::path::Component::CurDir))
+        .map(|component| windows_file_name(&component.as_os_str().to_string_lossy()))
+        .collect();
+    let in_output_folder = names.len() > 2
+        && Path::new(crate::browser::BROWSER_OUTPUT_DIR)
+            .components()
+            .zip(&names)
+            .all(|(folder, name)| folder.as_os_str() == name.as_str());
     (!in_output_folder)
         .then(|| protected_config_reason(filename))
         .flatten()
@@ -1455,7 +1468,7 @@ fn search_path_outside_workspace(path: &str, workspace: Option<&Path>) -> bool {
 fn protected_config_reason(path: &str) -> Option<String> {
     let components: Vec<String> = Path::new(path)
         .components()
-        .map(|component| component.as_os_str().to_string_lossy().to_ascii_lowercase())
+        .map(|component| windows_file_name(&component.as_os_str().to_string_lossy()))
         .collect();
     let file_name = components.last()?;
     if components.iter().any(|component| component == ".git") {
@@ -1480,6 +1493,16 @@ fn protected_config_reason(path: &str) -> Option<String> {
         ));
     }
     None
+}
+
+/// One path component as Windows opens it, for comparing with a protected name:
+/// lowercased, without an alternate data stream (`settings.json::$DATA`,
+/// `.git::$INDEX_ALLOCATION`) and without the trailing dots and spaces Windows
+/// drops (`.git.` and `.neuron ` open `.git` and `.neuron`). Applied on every
+/// system: elsewhere such names are merely odd, and asking about them is harmless.
+fn windows_file_name(component: &str) -> String {
+    let name = component.split(':').next().unwrap_or_default();
+    name.trim_end_matches(['.', ' ']).to_ascii_lowercase()
 }
 
 /// Host of an `http(s)` URL, lowercased and without port or credentials.
@@ -2442,6 +2465,55 @@ mod tests {
         );
     }
 
+    /// The browser's tools share one session key, and many take the same input (`{}`):
+    /// declining one page-reading call for the session refuses that tool only.
+    #[test]
+    fn declining_one_browser_tool_for_the_session_leaves_the_others_with_the_same_input() {
+        let rules = RuntimePermissionRuleConfig::new(
+            Vec::new(),
+            Vec::new(),
+            vec!["mcp__playwright__browser_snapshot".to_string()],
+        );
+        let policy = browser_policy(PermissionMode::WorkspaceWrite).with_permission_rules(&rules);
+        let snapshot = "mcp__playwright__browser_snapshot";
+        let mut prompter = ScriptedPrompter::new(vec![PermissionPromptDecision::DenyForSession {
+            reason: "declined".to_string(),
+        }]);
+        assert!(matches!(
+            policy.authorize(snapshot, "{}", Some(&mut prompter)),
+            PermissionOutcome::Deny { .. }
+        ));
+        let mut prompter = ScriptedPrompter::new(Vec::new());
+        assert!(matches!(
+            policy.authorize(snapshot, "{}", Some(&mut prompter)),
+            PermissionOutcome::Deny { .. }
+        ));
+        for tool in [
+            "browser_take_screenshot",
+            "browser_console_messages",
+            "browser_close",
+            "browser_network_requests",
+        ] {
+            assert_eq!(
+                policy.authorize(&format!("mcp__playwright__{tool}"), "{}", None),
+                PermissionOutcome::Allow,
+                "{tool}"
+            );
+        }
+        assert!(prompter.seen.is_empty(), "asked after a session denial");
+        // A page-reading denial does not decline web browsing: going back still asks.
+        let mut prompter = ScriptedPrompter::new(vec![PermissionPromptDecision::Allow]);
+        assert_eq!(
+            policy.authorize(
+                "mcp__playwright__browser_navigate_back",
+                "{}",
+                Some(&mut prompter)
+            ),
+            PermissionOutcome::Allow
+        );
+        assert_eq!(prompter.seen.len(), 1);
+    }
+
     #[test]
     fn allow_origin_hosts_open_in_the_browser_without_asking() {
         let mut grants = crate::RunWebGrants::default();
@@ -2471,7 +2543,15 @@ mod tests {
         let policy = browser_policy(PermissionMode::WorkspaceWrite);
         let shot = |filename: &str| serde_json::json!({ "filename": filename }).to_string();
         let screenshot = "mcp__playwright__browser_take_screenshot";
-        for filename in ["shot.png", "out/page.md", ".neuron/browser/shot.png"] {
+        for filename in [
+            "shot.png",
+            "out/page.md",
+            ".neuron/browser/shot.png",
+            "./.neuron/browser/shot.png",
+            // Windows opens these as .neuron/browser/shot.png.
+            ".neuron./browser /shot.png",
+            ".NEURON/Browser/shot.png",
+        ] {
             assert_eq!(
                 policy.authorize(screenshot, &shot(filename), None),
                 PermissionOutcome::Allow,
@@ -2484,9 +2564,21 @@ mod tests {
             ".neuron/settings.json",
             ".git/hooks/pre-commit",
             ".env",
+            // Windows drops trailing dots and spaces and opens a name's default data
+            // stream: these are .git/hooks/pre-commit, .neuron/settings.json and
+            // .neuron.json.
+            ".git./hooks/pre-commit",
+            ".git ./hooks/pre-commit",
+            ".git::$INDEX_ALLOCATION/hooks/pre-commit",
+            ".neuron./settings.json",
+            ".neuron /settings.json",
+            ".neuron.json::$DATA",
+            ".claude.json.",
+            ".neuron/browser./../settings.json",
         ];
         if cfg!(windows) {
             outside.push("C:/x.png");
+            outside.push(r".git.\hooks\pre-commit");
         }
         for filename in outside {
             let PermissionOutcome::Deny { reason } =
@@ -3152,6 +3244,12 @@ mod tests {
             ".claw/settings.json",
             ".git/config",
             "sub/.git/hooks/pre-commit",
+            // Names Windows opens as the ones above.
+            ".git./config",
+            ".Git ./hooks/pre-commit",
+            ".neuron./settings.local.json",
+            ".neuron.json.",
+            ".neuron.json:$DATA",
         ] {
             assert!(
                 matches!(
