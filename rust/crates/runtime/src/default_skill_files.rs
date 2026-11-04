@@ -61,6 +61,10 @@ pub const FILES: &[(&str, &str)] = &[
         include_str!("../bundled-skills/antislop-ui/SKILL.md"),
     ),
     (
+        "browser/SKILL.md",
+        include_str!("../bundled-skills/browser/SKILL.md"),
+    ),
+    (
         "gstack/BROWSER.md",
         include_str!("../bundled-skills/gstack/BROWSER.md"),
     ),
@@ -287,5 +291,9 @@ pub const FILES: &[(&str, &str)] = &[
     (
         "SOURCES.json",
         include_str!("../bundled-skills/SOURCES.json"),
+    ),
+    (
+        "web-research/SKILL.md",
+        include_str!("../bundled-skills/web-research/SKILL.md"),
     ),
 ];
