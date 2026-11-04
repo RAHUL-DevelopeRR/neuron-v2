@@ -2136,15 +2136,22 @@ pub struct PluginsCommandResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum DefinitionSource {
+    /// `.neuron/` in the workspace or a folder above it: read first.
+    ProjectNeuron,
+    /// Other project folders read as silent aliases (`.agents/`, and inherited ones).
     ProjectClaw,
     ProjectCodex,
     ProjectClaude,
+    /// Neuron's own config home (`~/.neuron`, or `NEURON_CONFIG_HOME`).
+    UserNeuron,
     UserClawConfigHome,
     UserCodexHome,
     UserClaw,
     UserCodex,
     UserClaude,
     Bundled,
+    /// A skill folder of an enabled plugin: read last, so it never hides another skill.
+    Plugin,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -2153,6 +2160,7 @@ enum DefinitionScope {
     UserConfigHome,
     UserHome,
     Bundled,
+    Plugin,
 }
 
 impl DefinitionScope {
@@ -2162,6 +2170,7 @@ impl DefinitionScope {
             Self::UserConfigHome => "User config roots",
             Self::UserHome => "User home roots",
             Self::Bundled => "Bundled defaults",
+            Self::Plugin => "Plugin skills",
         }
     }
 }
@@ -2169,12 +2178,15 @@ impl DefinitionScope {
 impl DefinitionSource {
     fn report_scope(self) -> DefinitionScope {
         match self {
-            Self::ProjectClaw | Self::ProjectCodex | Self::ProjectClaude => {
+            Self::ProjectNeuron | Self::ProjectClaw | Self::ProjectCodex | Self::ProjectClaude => {
                 DefinitionScope::Project
             }
-            Self::UserClawConfigHome | Self::UserCodexHome => DefinitionScope::UserConfigHome,
+            Self::UserNeuron | Self::UserClawConfigHome | Self::UserCodexHome => {
+                DefinitionScope::UserConfigHome
+            }
             Self::UserClaw | Self::UserCodex | Self::UserClaude => DefinitionScope::UserHome,
             Self::Bundled => DefinitionScope::Bundled,
+            Self::Plugin => DefinitionScope::Plugin,
         }
     }
 
@@ -2877,10 +2889,17 @@ fn resolve_plugin_target(
     }
 }
 
+/// Where agent definitions (`leaf`) live. Neuron's own folders come first; the
+/// inherited upstream folders after them are read-only aliases kept for old setups.
 fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, PathBuf)> {
     let mut roots = Vec::new();
 
     for ancestor in cwd.ancestors() {
+        push_unique_root(
+            &mut roots,
+            DefinitionSource::ProjectNeuron,
+            ancestor.join(".neuron").join(leaf),
+        );
         push_unique_root(
             &mut roots,
             DefinitionSource::ProjectClaw,
@@ -2898,6 +2917,11 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
         );
     }
 
+    push_unique_root(
+        &mut roots,
+        DefinitionSource::UserNeuron,
+        ConfigLoader::default_for(cwd).config_home().join(leaf),
+    );
     if let Ok(claw_config_home) = env::var("CLAW_CONFIG_HOME") {
         push_unique_root(
             &mut roots,
@@ -2944,11 +2968,28 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
     roots
 }
 
+/// Where skills live, in lookup order: a name found earlier hides the same name later.
+/// Neuron's own folders (`.neuron/skills` in the workspace and above, then the config
+/// home's `skills`) come first, then `.agents/skills`, then inherited upstream folders
+/// that are read as silent, read-only aliases, then the bundled skills, and last the
+/// skill folders of enabled plugins (so a plugin never hides another skill).
 #[allow(clippy::too_many_lines)]
 fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
     let mut roots = Vec::new();
 
     for ancestor in cwd.ancestors() {
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::ProjectNeuron,
+            ancestor.join(".neuron").join("skills"),
+            SkillOrigin::SkillsDir,
+        );
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::ProjectNeuron,
+            ancestor.join(".neuron").join("commands"),
+            SkillOrigin::LegacyCommandsDir,
+        );
         push_unique_skill_root(
             &mut roots,
             DefinitionSource::ProjectClaw,
@@ -2999,11 +3040,18 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         );
     }
 
+    let config_home = ConfigLoader::default_for(cwd).config_home().to_path_buf();
     push_unique_skill_root(
         &mut roots,
-        DefinitionSource::UserClawConfigHome,
-        ConfigLoader::default_for(cwd).config_home().join("skills"),
+        DefinitionSource::UserNeuron,
+        config_home.join("skills"),
         SkillOrigin::SkillsDir,
+    );
+    push_unique_skill_root(
+        &mut roots,
+        DefinitionSource::UserNeuron,
+        config_home.join("commands"),
+        SkillOrigin::LegacyCommandsDir,
     );
 
     if let Ok(claw_config_home) = env::var("CLAW_CONFIG_HOME") {
@@ -3130,7 +3178,26 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         );
     }
 
+    for dir in plugin_skill_dirs(cwd) {
+        push_unique_skill_root(&mut roots, DefinitionSource::Plugin, dir, SkillOrigin::SkillsDir);
+    }
+
     roots
+}
+
+/// The skill folders of the plugins enabled in this workspace's settings.
+fn plugin_skill_dirs(cwd: &Path) -> Vec<PathBuf> {
+    let loader = ConfigLoader::default_for(cwd);
+    loader
+        .load()
+        .map(|config| {
+            loader
+                .plugin_skill_dirs(&config)
+                .into_iter()
+                .map(|(_, dir)| dir)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn install_skill(source: &str, cwd: &Path) -> std::io::Result<InstalledSkill> {
@@ -3183,16 +3250,9 @@ fn install_skill_into(
     })
 }
 
+/// Neuron's skills folder: `skills` in the config home (`~/.neuron/skills`, or
+/// `$NEURON_CONFIG_HOME/skills`). Installs never write into an inherited folder.
 fn default_skill_install_root() -> PathBuf {
-    if let Some(neuron_config_home) = env::var_os("NEURON_CONFIG_HOME") {
-        return PathBuf::from(neuron_config_home).join("skills");
-    }
-    if let Ok(claw_config_home) = env::var("CLAW_CONFIG_HOME") {
-        return PathBuf::from(claw_config_home).join("skills");
-    }
-    if let Ok(codex_home) = env::var("CODEX_HOME") {
-        return PathBuf::from(codex_home).join("skills");
-    }
     ConfigLoader::default_for(".").config_home().join("skills")
 }
 
@@ -3638,6 +3698,7 @@ fn render_skills_report(skills: &[SkillSummary]) -> String {
         DefinitionScope::UserConfigHome,
         DefinitionScope::UserHome,
         DefinitionScope::Bundled,
+        DefinitionScope::Plugin,
     ] {
         let group = skills
             .iter()
@@ -3885,7 +3946,7 @@ fn render_agents_usage(unexpected: Option<&str>) -> String {
         "Agents".to_string(),
         "  Usage            /agents [list|help]".to_string(),
         "  Direct CLI       neuron agents".to_string(),
-        "  Sources          .claw/agents, ~/.claw/agents, $CLAW_CONFIG_HOME/agents".to_string(),
+        "  Sources          .neuron/agents, ~/.neuron/agents".to_string(),
     ];
     if let Some(args) = unexpected {
         lines.push(format!("  Unexpected       {args}"));
@@ -3900,7 +3961,7 @@ fn render_agents_usage_json(unexpected: Option<&str>) -> Value {
         "usage": {
             "slash_command": "/agents [list|help]",
             "direct_cli": "neuron agents [list|help]",
-            "sources": [".claw/agents", "~/.claw/agents", "$CLAW_CONFIG_HOME/agents"],
+            "sources": [".neuron/agents", "~/.neuron/agents"],
         },
         "unexpected": unexpected,
     })
@@ -3913,8 +3974,8 @@ fn render_skills_usage(unexpected: Option<&str>) -> String {
         "  Alias            /skill".to_string(),
         "  Direct CLI       neuron skills [list|install <path>|help|<skill> [args]]".to_string(),
         "  Invoke           /skills help overview -> $help overview".to_string(),
-        "  Install root     $CLAW_CONFIG_HOME/skills or ~/.claw/skills".to_string(),
-        "  Sources          .claw/skills, .omc/skills, .agents/skills, .codex/skills, .claude/skills, ~/.claw/skills, ~/.omc/skills, ~/.claude/skills/omc-learned, ~/.codex/skills, ~/.claude/skills, legacy /commands".to_string(),
+        "  Install root     ~/.neuron/skills".to_string(),
+        "  Sources          .neuron/skills, ~/.neuron/skills, .agents/skills, bundled skills, enabled plugins' skills".to_string(),
     ];
     if let Some(args) = unexpected {
         lines.push(format!("  Unexpected       {args}"));
@@ -3931,20 +3992,13 @@ fn render_skills_usage_json(unexpected: Option<&str>) -> Value {
             "aliases": ["/skill"],
             "direct_cli": "neuron skills [list|install <path>|help|<skill> [args]]",
             "invoke": "/skills help overview -> $help overview",
-            "install_root": "$CLAW_CONFIG_HOME/skills or ~/.claw/skills",
+            "install_root": "~/.neuron/skills",
             "sources": [
-                ".claw/skills",
-                ".omc/skills",
+                ".neuron/skills",
+                "~/.neuron/skills",
                 ".agents/skills",
-                ".codex/skills",
-                ".claude/skills",
-                "~/.claw/skills",
-                "~/.omc/skills",
-                "~/.claude/skills/omc-learned",
-                "~/.codex/skills",
-                "~/.claude/skills",
-                "legacy /commands",
-                "legacy fallback dirs still load automatically"
+                "bundled skills",
+                "enabled plugins' skills"
             ],
         },
         "unexpected": unexpected,
@@ -4026,7 +4080,7 @@ fn render_mcp_usage(unexpected: Option<&str>) -> String {
         "  Direct CLI       neuron mcp [list|show <server>|enable <server>|disable <server>|login <server>|logout <server>|help]"
             .to_string(),
         "  Switches         enable/disable edit disabledMcpServers in the user settings".to_string(),
-        "  Sources          .claw/settings.json, .claw/settings.local.json".to_string(),
+        "  Sources          .neuron/settings.json, .neuron/settings.local.json".to_string(),
     ];
     if let Some(args) = unexpected {
         lines.push(format!("  Unexpected       {args}"));
@@ -4041,7 +4095,7 @@ fn render_mcp_usage_json(unexpected: Option<&str>) -> Value {
         "usage": {
             "slash_command": "/mcp [list|show <server>|enable <server>|disable <server>|help]",
             "direct_cli": "neuron mcp [list|show <server>|enable <server>|disable <server>|login <server>|logout <server>|help]",
-            "sources": [".claw/settings.json", ".claw/settings.local.json"],
+            "sources": [".neuron/settings.json", ".neuron/settings.local.json"],
         },
         "unexpected": unexpected,
     })
@@ -4127,16 +4181,18 @@ fn format_mcp_oauth(oauth: Option<&McpOAuthConfig>) -> String {
 
 fn definition_source_id(source: DefinitionSource) -> &'static str {
     match source {
-        DefinitionSource::ProjectClaw
+        DefinitionSource::ProjectNeuron
+        | DefinitionSource::ProjectClaw
         | DefinitionSource::ProjectCodex
         | DefinitionSource::ProjectClaude => "project_claw",
-        DefinitionSource::UserClawConfigHome | DefinitionSource::UserCodexHome => {
-            "user_claw_config_home"
-        }
+        DefinitionSource::UserNeuron
+        | DefinitionSource::UserClawConfigHome
+        | DefinitionSource::UserCodexHome => "user_claw_config_home",
         DefinitionSource::UserClaw | DefinitionSource::UserCodex | DefinitionSource::UserClaude => {
             "user_claw"
         }
         DefinitionSource::Bundled => "bundled",
+        DefinitionSource::Plugin => "plugin",
     }
 }
 
@@ -5496,8 +5552,7 @@ mod tests {
             super::handle_agents_slash_command(Some("help"), &cwd).expect("agents help");
         assert!(agents_help.contains("Usage            /agents [list|help]"));
         assert!(agents_help.contains("Direct CLI       neuron agents"));
-        assert!(agents_help
-            .contains("Sources          .claw/agents, ~/.claw/agents, $CLAW_CONFIG_HOME/agents"));
+        assert!(agents_help.contains("Sources          .neuron/agents, ~/.neuron/agents"));
 
         let agents_unexpected =
             super::handle_agents_slash_command(Some("show planner"), &cwd).expect("agents usage");
@@ -5509,11 +5564,14 @@ mod tests {
             .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
         assert!(skills_help.contains("Alias            /skill"));
         assert!(skills_help.contains("Invoke           /skills help overview -> $help overview"));
-        assert!(skills_help.contains("Install root     $CLAW_CONFIG_HOME/skills or ~/.claw/skills"));
-        assert!(skills_help.contains(".omc/skills"));
+        assert!(skills_help.contains("Install root     ~/.neuron/skills"));
+        assert!(skills_help.contains(".neuron/skills"));
         assert!(skills_help.contains(".agents/skills"));
-        assert!(skills_help.contains("~/.claude/skills/omc-learned"));
-        assert!(skills_help.contains("legacy /commands"));
+        // Inherited folders still load, but the help names only Neuron's own.
+        for upstream in [".claw", ".claude", ".codex", ".omc"] {
+            assert!(!skills_help.contains(upstream), "{upstream}: {skills_help}");
+            assert!(!agents_help.contains(upstream), "{upstream}: {agents_help}");
+        }
 
         let skills_unexpected =
             super::handle_skills_slash_command(Some("show help"), &cwd).expect("skills usage");
@@ -5538,12 +5596,10 @@ mod tests {
             .as_array()
             .expect("skills help sources");
         assert_eq!(skills_help_json["usage"]["aliases"][0], "/skill");
-        assert!(sources.iter().any(|value| value == ".omc/skills"));
+        assert!(sources.iter().any(|value| value == ".neuron/skills"));
+        assert!(sources.iter().any(|value| value == "~/.neuron/skills"));
         assert!(sources.iter().any(|value| value == ".agents/skills"));
-        assert!(sources.iter().any(|value| value == "~/.omc/skills"));
-        assert!(sources
-            .iter()
-            .any(|value| value == "~/.claude/skills/omc-learned"));
+        assert_eq!(skills_help_json["usage"]["install_root"], "~/.neuron/skills");
 
         let _ = fs::remove_dir_all(cwd);
     }
@@ -5599,12 +5655,11 @@ mod tests {
             .as_array()
             .expect("skills help sources");
         assert_eq!(help["usage"]["aliases"][0], "/skill");
-        assert!(sources.iter().any(|value| value == ".omc/skills"));
+        assert!(sources.iter().any(|value| value == ".neuron/skills"));
         assert!(sources.iter().any(|value| value == ".agents/skills"));
-        assert!(sources.iter().any(|value| value == "~/.omc/skills"));
-        assert!(sources
+        assert!(!sources
             .iter()
-            .any(|value| value == "~/.claude/skills/omc-learned"));
+            .any(|value| value.as_str().is_some_and(|text| text.contains(".claude"))));
 
         restore_env_var("HOME", original_home);
         restore_env_var("CLAUDE_CONFIG_DIR", original_claude_config_dir);
@@ -5834,7 +5889,7 @@ mod tests {
         let help =
             render_mcp_report_json_for(&loader, &workspace, Some("help")).expect("mcp help json");
         assert_eq!(help["action"], "help");
-        assert_eq!(help["usage"]["sources"][0], ".claw/settings.json");
+        assert_eq!(help["usage"]["sources"][0], ".neuron/settings.json");
 
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(config_home);
@@ -5897,6 +5952,62 @@ mod tests {
 
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(install_root);
+    }
+
+    /// `.neuron/skills` wins over an inherited folder's skill of the same name, the
+    /// config home's skills folder is Neuron's install root, and an enabled plugin's
+    /// skills come last: listed under "Plugin skills", never hiding another skill.
+    #[test]
+    fn neuron_skill_folders_come_first_and_plugin_skills_last() {
+        let _guard = env_guard();
+        let workspace = temp_dir("neuron-skill-roots");
+        let config_home = workspace.join("config");
+        let original_config = std::env::var_os("NEURON_CONFIG_HOME");
+        let original_home = std::env::var_os("HOME");
+        std::env::set_var("NEURON_CONFIG_HOME", &config_home);
+        std::env::set_var("HOME", workspace.join("home"));
+        let project = workspace.join("project");
+        write_skill(&project.join(".neuron").join("skills"), "triage", "Neuron triage");
+        write_skill(&project.join(".claude").join("skills"), "triage", "Inherited triage");
+        write_skill(&project.join(".claude").join("skills"), "legacy-only", "Still read");
+        write_skill(&config_home.join("skills"), "release", "User release notes");
+
+        let plugin = workspace.join("plugin-src");
+        write_skill(&plugin.join("skills"), "release", "Plugin release notes");
+        write_skill(&plugin.join("skills"), "kit-only", "From the plugin");
+        fs::create_dir_all(plugin.join(".neuron-plugin")).expect("manifest dir");
+        fs::write(
+            plugin.join(".neuron-plugin").join("plugin.json"),
+            r#"{"name": "kit", "version": "1.0.0", "description": "d", "skills": "skills"}"#,
+        )
+        .expect("manifest");
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        manager
+            .install(plugin.to_str().expect("utf8"))
+            .expect("plugin installs");
+
+        let report = super::handle_skills_slash_command(None, &project).expect("skills list");
+        assert!(report.contains("triage · Neuron triage"), "{report}");
+        assert!(
+            report.contains("(shadowed by Project roots) triage · Inherited triage"),
+            "{report}"
+        );
+        assert!(report.contains("legacy-only · Still read"), "{report}");
+        assert!(report.contains("release · User release notes"), "{report}");
+        assert!(report.contains("Plugin skills:"), "{report}");
+        assert!(report.contains("kit-only · From the plugin"), "{report}");
+        assert!(
+            report.contains("(shadowed by User config roots) release · Plugin release notes"),
+            "{report}"
+        );
+        assert_eq!(
+            super::default_skill_install_root(),
+            config_home.join("skills")
+        );
+
+        restore_env_var("NEURON_CONFIG_HOME", original_config);
+        restore_env_var("HOME", original_home);
+        let _ = fs::remove_dir_all(workspace);
     }
 
     /// Text and JSON come from one install; a second install of the same skill fails

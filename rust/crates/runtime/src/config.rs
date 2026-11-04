@@ -598,11 +598,9 @@ impl ConfigLoader {
         for extension in extensions {
             let plugin_root = extension.root.display().to_string();
             for (name, value) in extension.mcp_servers {
+                // Skipped without a notice: settings load often (skill lookups too), and
+                // `/mcp` already shows which scope owns the name.
                 if configured.contains_key(&name) || servers.contains_key(&name) {
-                    crate::ui_hooks::notice(&format!(
-                        "warning: plugin {} brings MCP server {name}, but that name is already in use; skipped it.",
-                        extension.plugin_name
-                    ));
                     continue;
                 }
                 let value = expand_plugin_root(&value, &plugin_root);
