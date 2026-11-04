@@ -405,7 +405,7 @@ pub(crate) fn run_research(
     let limits = request.depth.limits();
     let mut run = Run {
         request,
-        run_id,
+        id: run_id,
         now,
         limits,
         tokens_used: 0,
@@ -487,7 +487,7 @@ pub(crate) fn run_research(
 
 struct Run<'a> {
     request: &'a ResearchRequest,
-    run_id: &'a str,
+    id: &'a str,
     now: &'a dyn Fn() -> u64,
     limits: DepthLimits,
     tokens_used: u64,
@@ -612,9 +612,9 @@ impl Run<'_> {
         let query = shorten_query(&self.sub_questions[index]);
         self.steps += 1;
         self.searches += 1;
-        let search_id = format!("{}-search-{}", self.run_id, self.searches);
+        let search_id = format!("{}-search-{}", self.id, self.searches);
         progress.step_started(&search_id, "WebSearch", &json!({ "query": query }));
-        let hits = match web.search(&query, self.run_id) {
+        let hits = match web.search(&query, self.id) {
             Ok(hits) => {
                 progress.step_finished(
                     &search_id,
@@ -702,7 +702,7 @@ impl Run<'_> {
     ) {
         self.steps += 1;
         self.tried_urls.insert(normalize_url(&hit.url));
-        let read_id = format!("{}-read-{}", self.run_id, self.steps);
+        let read_id = format!("{}-read-{}", self.id, self.steps);
         progress.step_started(&read_id, "WebFetch", &json!({ "url": hit.url }));
         let page = match web.fetch(&hit.url) {
             Ok(page) => page,
@@ -951,7 +951,7 @@ fn render_report(run: &Run<'_>, body: &str, stop: &StopReason, removed_claims: u
     let _ = write!(
         report,
         "\n---\n\nResearch run `{}` ({} depth): {} search{}, {} page{} read, {} not readable, about {} of {} tokens. Stopped because {}.",
-        run.run_id,
+        run.id,
         run.request.depth.name(),
         run.searches,
         if run.searches == 1 { "" } else { "es" },
@@ -1250,7 +1250,7 @@ pub(crate) fn group_digits(value: u64) -> String {
     let digits = value.to_string();
     let mut grouped = String::new();
     for (index, ch) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             grouped.push(',');
         }
         grouped.push(ch);

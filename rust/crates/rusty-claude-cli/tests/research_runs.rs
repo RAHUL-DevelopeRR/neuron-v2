@@ -108,7 +108,10 @@ fn research_searches_with_one_run_id_and_saves_the_report() {
     assert_eq!(saved.len(), 1, "{saved:?}");
     let report = fs::read_to_string(&saved[0]).expect("report");
     assert_eq!(report.trim_end(), stdout.trim_end());
-    assert!(report.contains(&run_ids[0].to_string()) || report.contains("Research run `rr_"));
+    assert!(
+        report.contains(&format!("Research run `{}`", run_ids[0])),
+        "{report}"
+    );
     let requests = runtime.block_on(server.captured_requests());
     assert!(requests
         .iter()
@@ -208,7 +211,7 @@ fn until(
     let mut seen = Vec::new();
     loop {
         let event = events
-            .recv_timeout(Duration::from_secs(60))
+            .recv_timeout(Duration::from_mins(1))
             .unwrap_or_else(|_| panic!("the engine reports in time; so far: {seen:?}"));
         let done = last(&event);
         seen.push(event);
@@ -226,6 +229,7 @@ fn is_question(event: &serde_json::Value) -> bool {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn the_engine_runs_research_as_a_turn_with_tool_rows_and_a_task_list() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
     let server = runtime
@@ -305,8 +309,7 @@ fn the_engine_runs_research_as_a_turn_with_tool_rows_and_a_task_list() {
     );
     let todos = turn
         .iter()
-        .filter(|event| event["type"] == "todos")
-        .last()
+        .rfind(|event| event["type"] == "todos")
         .expect("a task list");
     let items = todos["items"].as_array().unwrap();
     assert_eq!(items.last().unwrap()["content"], "Write the cited report");
