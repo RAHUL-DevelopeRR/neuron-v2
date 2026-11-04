@@ -1811,7 +1811,8 @@ fn run_research_command(
     let json_output = output_format == CliOutputFormat::Json;
     provider::set_json_output(json_output);
     let cwd = env::current_dir()?;
-    let runtime_config = ConfigLoader::default_for(&cwd).load()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let runtime_config = loader.load()?;
     let feature_config = runtime_config.feature_config();
     let policy = permission_policy(
         permission_mode,
@@ -1819,7 +1820,12 @@ fn run_research_command(
         &GlobalToolRegistry::builtin(),
     )
     .map_err(UsageError)?;
-    let mut web = research::LiveWeb::new(&policy, false);
+    let cancel = runtime::CancellationToken::new();
+    let hook_abort = runtime::HookAbortSignal::new();
+    let mut web = research::LiveWeb::new(&policy, false).with_hooks(
+        session_hook_runner(&cwd, &loader, &runtime_config)?,
+        hook_abort.clone(),
+    );
     if web.search_refusal(&args.question).is_some() {
         return Err(UsageError(format!(
             "`neuron research` searches and reads the web, and nobody can approve that in a script: add --allow-web (`neuron --allow-web research \"...\"`), or allow WebSearch and WebFetch with permissions.allow rules in ~/.neuron/settings.json. Usage: {}",
@@ -1848,17 +1854,20 @@ fn run_research_command(
     ));
     let mut model = research::LiveModel {
         client: &client,
-        cancel: runtime::CancellationToken::new(),
+        cancel: cancel.clone(),
     };
-    let mut progress = research::TerminalProgress::new(None, json_output);
-    let (outcome, path) = research::run_and_save(
+    let mut progress = research::TerminalProgress::new(Some(cancel.clone()), json_output);
+    let monitor = HookAbortMonitor::spawn_for_turn(hook_abort, cancel);
+    let result = research::run_and_save(
         &request,
         &mut model,
         &mut web,
         &mut progress,
         &cwd,
         args.out.as_deref(),
-    )?;
+    );
+    monitor.stop();
+    let (outcome, path) = result?;
     if json_output {
         println!(
             "{}",
@@ -1876,6 +1885,19 @@ fn run_research_command(
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// The tool hooks a session runs (settings and enabled plugins), for research
+/// runs outside a session.
+fn session_hook_runner(
+    cwd: &Path,
+    loader: &ConfigLoader,
+    runtime_config: &runtime::RuntimeConfig,
+) -> Result<runtime::HookRunner, Box<dyn std::error::Error>> {
+    let plugin_hooks = build_plugin_manager(cwd, loader, runtime_config).aggregated_hooks()?;
+    Ok(runtime::HookRunner::new(runtime_config.hooks().merged(
+        &runtime_hook_config_from_plugin_hooks(plugin_hooks),
+    )))
 }
 
 fn enforce_broad_cwd_policy(
@@ -4483,19 +4505,27 @@ impl LiveCli {
             println!("Research not started.");
             return Ok(());
         }
-        let mut web = research::LiveWeb::new(self.runtime.permission_policy(), true);
+        let cancel = runtime::CancellationToken::new();
+        let hook_abort = runtime::HookAbortSignal::new();
+        let mut web = research::LiveWeb::new(self.runtime.permission_policy(), true)
+            .with_hooks(self.runtime.hook_runner().clone(), hook_abort.clone());
         if let Some(reason) = web.search_refusal(&request.question) {
             return Err(format!("Research cannot search the web: {reason}").into());
         }
         let cwd = env::current_dir()?;
-        let (outcome, path) = {
+        // Ctrl-C interrupts the run as it does a turn: the report is written from
+        // the notes so far; a second press quits.
+        let monitor = HookAbortMonitor::spawn_for_turn(hook_abort, cancel.clone());
+        let result = {
             let mut model = research::LiveModel {
                 client: self.runtime.api_client(),
-                cancel: runtime::CancellationToken::new(),
+                cancel: cancel.clone(),
             };
-            let mut progress = research::TerminalProgress::new(None, false);
-            research::run_and_save(&request, &mut model, &mut web, &mut progress, &cwd, None)?
+            let mut progress = research::TerminalProgress::new(Some(cancel), false);
+            research::run_and_save(&request, &mut model, &mut web, &mut progress, &cwd, None)
         };
+        monitor.stop();
+        let (outcome, path) = result?;
         println!(
             "{}",
             TerminalRenderer::new().render_markdown(&outcome.report)
