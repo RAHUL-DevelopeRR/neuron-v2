@@ -354,7 +354,7 @@ is held to your plan's most per run: Free 300,000, Pro 600,000, Max 1,500,000. A
 stops when it reaches its step cap, when 80% of its tokens are used (it then writes
 the report from the notes so far), when the plan's daily search or research allowance
 is used up (Free 3 research runs a day, Pro 30, Max 150; the report says when it
-resets), or when you interrupt it (Esc in the full-screen UI), and the report says
+resets), or when you interrupt it (Ctrl+C in the full-screen UI), and the report says
 which. Requests that only take notes from one page go to `summaryModel` when it is set.
 
 Before a run starts, Neuron says what it may use and asks to start; saying yes allows
