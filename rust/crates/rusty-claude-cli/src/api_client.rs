@@ -454,6 +454,15 @@ fn show_tool_calls(
     Ok(())
 }
 
+/// A [`AnthropicRuntimeClient::complete_text_metered`] reply: the text and what the
+/// request used. Zero tokens when the provider reported no usage.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TextReply {
+    pub text: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
 pub(crate) struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
     client: ApiProviderClient,
@@ -600,7 +609,23 @@ impl AnthropicRuntimeClient {
         timeout: Duration,
         cancel: &CancellationToken,
     ) -> Result<String, String> {
-        let summary_client = match self.summary_model.as_deref() {
+        self.complete_text_metered(instructions, prompt, max_tokens, timeout, cancel, true)
+            .map(|reply| reply.text)
+    }
+
+    /// [`Self::complete_text`] with the tokens the request used, as the provider
+    /// reported them (input includes cache reads and writes). `light`: the request
+    /// goes to `summaryModel` when one is set; otherwise to the session's model.
+    pub(crate) fn complete_text_metered(
+        &self,
+        instructions: &str,
+        prompt: &str,
+        max_tokens: u32,
+        timeout: Duration,
+        cancel: &CancellationToken,
+        light: bool,
+    ) -> Result<TextReply, String> {
+        let summary_client = match self.summary_model.as_deref().filter(|_| light) {
             Some(model) if model != self.model => Some((
                 model.to_string(),
                 build_provider_client(model, None).map_err(|error| error.to_string())?,
@@ -626,19 +651,32 @@ impl AnthropicRuntimeClient {
                     .stream_message(&request)
                     .await
                     .map_err(|error| error.to_string())?;
-                let mut text = String::new();
+                let mut reply = TextReply::default();
                 while let Some(event) = stream
                     .next_event()
                     .await
                     .map_err(|error| error.to_string())?
                 {
-                    if let ApiStreamEvent::ContentBlockDelta(delta) = event {
-                        if let ContentBlockDelta::TextDelta { text: piece } = delta.delta {
-                            text.push_str(&piece);
+                    match event {
+                        ApiStreamEvent::ContentBlockDelta(delta) => {
+                            if let ContentBlockDelta::TextDelta { text: piece } = delta.delta {
+                                reply.text.push_str(&piece);
+                            }
                         }
+                        ApiStreamEvent::MessageDelta(delta) => {
+                            let usage = delta.usage;
+                            reply.input_tokens = reply.input_tokens.max(
+                                u64::from(usage.input_tokens)
+                                    + u64::from(usage.cache_creation_input_tokens)
+                                    + u64::from(usage.cache_read_input_tokens),
+                            );
+                            reply.output_tokens =
+                                reply.output_tokens.max(u64::from(usage.output_tokens));
+                        }
+                        _ => {}
                     }
                 }
-                Ok(text)
+                Ok(reply)
             };
             tokio::select! {
                 reply = tokio::time::timeout(timeout, reply) => reply.unwrap_or_else(|_| {

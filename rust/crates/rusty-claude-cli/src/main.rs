@@ -77,6 +77,7 @@ mod render;
 mod repl_loop;
 mod repo_map;
 mod reports;
+mod research;
 mod session_mgmt;
 mod session_presence;
 mod shell_pty;
