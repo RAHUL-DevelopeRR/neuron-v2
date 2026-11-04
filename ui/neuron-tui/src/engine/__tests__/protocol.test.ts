@@ -224,14 +224,14 @@ const STRUCT_FIELDS: Record<string, string[]> = {
     'pricing_url',
     'usage_updated_at',
     'usage_error',
-    'window',
+    'usage_window',
   ]),
   UsageWindow: fieldsOf<UsageWindow>()([
-    'limit_tokens',
     'tokens',
+    'limit_tokens',
     'remaining_tokens',
-    'window_seconds',
     'resets_at',
+    'window_seconds',
   ]),
   ErrorDetail: fieldsOf<ErrorDetail>()([
     'code',
@@ -304,7 +304,6 @@ const EVENT_FIELDS: { [T in UiEventType]: string[] } = {
     'account',
     'supports_images',
     'served_model',
-    'usage_window',
     'request_tokens_estimate',
   ]),
   sign_in_code: eventFields('sign_in_code')([

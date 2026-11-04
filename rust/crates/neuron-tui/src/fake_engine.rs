@@ -182,6 +182,7 @@ pub mod samples {
             status(false),
             models(),
             account(),
+            free_account(),
             UiEvent::Account {
                 signed_in: false,
                 account: None,
@@ -257,13 +258,6 @@ pub mod samples {
             account: None,
             supports_images: Some(false),
             served_model: None,
-            usage_window: Some(UsageWindow {
-                limit_tokens: 1_000_000,
-                tokens: Some(640_000),
-                remaining_tokens: Some(360_000),
-                window_seconds: Some(18_000),
-                resets_at: Some("2026-10-24T14:20:00Z".into()),
-            }),
             request_tokens_estimate: Some(6_200),
         }
     }
@@ -316,7 +310,43 @@ pub mod samples {
                 pricing_url: "https://zero-x.live/pricing".into(),
                 usage_updated_at: Some(1_792_800_000),
                 usage_error: None,
-                window: None,
+                usage_window: None,
+            }),
+        }
+    }
+
+    /// A Free account: its rolling token window refuses requests before the daily
+    /// figures do.
+    #[must_use]
+    pub fn free_account() -> UiEvent {
+        let UiEvent::Account {
+            account: Some(pro), ..
+        } = account()
+        else {
+            unreachable!("the account sample is signed in");
+        };
+        UiEvent::Account {
+            signed_in: true,
+            account: Some(AccountDetails {
+                plan: Some("free".into()),
+                plan_name: Some("Free".into()),
+                limits: Some(UsageAmounts {
+                    requests: Some(100),
+                    tokens: Some(5_000_000),
+                }),
+                usage_today: Some(UsageAmounts {
+                    requests: Some(42),
+                    tokens: Some(700_000),
+                }),
+                credit_balance_cents: None,
+                usage_window: Some(UsageWindow {
+                    tokens: Some(640_000),
+                    limit_tokens: Some(1_000_000),
+                    remaining_tokens: Some(360_000),
+                    resets_at: Some("2026-10-24T14:20:00Z".into()),
+                    window_seconds: Some(18_000),
+                }),
+                ..pro
             }),
         }
     }

@@ -338,30 +338,27 @@ pub struct AccountDetails {
     pub usage_updated_at: Option<u64>,
     /// Why the plan and usage could not be read, when they could not.
     pub usage_error: Option<String>,
-    /// The plan's rolling token window (Free), which refuses requests before the daily
-    /// figures do; `None` for a plan without one, before the account is read, and from
+    /// The plan's rolling token window (Zero-X Free: 1M tokens per 5 hours), which
+    /// refuses requests before the daily figures do, kept current from the quota headers
+    /// of each reply; `None` for a plan without one, before the account is read, and from
     /// older engines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub window: Option<UsageWindow>,
+    pub usage_window: Option<UsageWindow>,
 }
 
-/// A plan's rolling token window: at most `limit_tokens` tokens in any `window_seconds`
-/// (Free: 1,000,000 every 5 hours), as the gateway's `usage_window` reports it, kept
-/// current from the quota headers of each reply.
+/// A rolling usage window (`usage_window` in the gateway's account). Every part may be
+/// missing; `tokens` and `remaining_tokens` are `None` while not known (also once
+/// `resets_at` has passed, until the account is read again).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageWindow {
-    pub limit_tokens: u64,
-    /// Tokens counted in the window now; `None` when not known yet.
-    #[serde(default)]
+    /// Tokens used in the window.
     pub tokens: Option<u64>,
-    /// What the window still allows; `None` when not known yet.
-    #[serde(default)]
+    pub limit_tokens: Option<u64>,
     pub remaining_tokens: Option<u64>,
-    #[serde(default)]
-    pub window_seconds: Option<u64>,
-    /// When enough of the window frees up (ISO 8601, UTC); `None` while nothing counts.
-    #[serde(default)]
+    /// When the oldest usage leaves the window (ISO 8601, UTC).
     pub resets_at: Option<String>,
+    /// The window's length: 18000 for five hours.
+    pub window_seconds: Option<u64>,
 }
 
 /// What a failed request needs from the user, for a UI to offer the way out: sign in
@@ -548,15 +545,12 @@ pub enum UiEvent {
         /// answer, from providers that do not name the model, and from older engines.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         served_model: Option<String>,
-        /// The plan's token window as it stands now (Free), for the footer's
-        /// "Free 640K/1M · resets 14:20"; `None` for a plan without one, before it is
-        /// known, and from older engines.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        usage_window: Option<UsageWindow>,
         /// Estimated input tokens of each model request the next turn sends (system
-        /// prompt, tool definitions and the conversation); a turn sends one request per
-        /// step, so a long agent task spends this many times over. `None` from older
-        /// engines.
+        /// prompt, tool definitions and the conversation): the same figure as
+        /// `ContextBreakdown.used_tokens` where an engine sends both. A turn sends one
+        /// request per step, so a long agent task spends this many times over. `None`
+        /// from older engines. The plan's token window is on
+        /// [`AccountDetails::usage_window`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_tokens_estimate: Option<u64>,
     },
@@ -1112,7 +1106,6 @@ mod tests {
                 sign_in_required: false,
                 account: None,
                 served_model: None,
-                usage_window: None,
                 request_tokens_estimate: None,
                 ..
             }
@@ -1475,5 +1468,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(model.supports_images, None);
+    }
+
+    /// The token window is `AccountDetails.usage_window`, every part optional, in the
+    /// gateway's field order: the shape the full-screen footer reads.
+    #[test]
+    fn the_usage_window_rides_on_the_account_with_every_part_optional() {
+        let window: UsageWindow = serde_json::from_str(
+            r#"{"tokens":5,"limit_tokens":null,"remaining_tokens":null,"resets_at":null,"window_seconds":18000}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            window,
+            UsageWindow {
+                tokens: Some(5),
+                window_seconds: Some(18_000),
+                ..UsageWindow::default()
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<UsageWindow>("{}").unwrap(),
+            UsageWindow::default()
+        );
+        assert_eq!(
+            serde_json::to_string(&UsageWindow::default()).unwrap(),
+            r#"{"tokens":null,"limit_tokens":null,"remaining_tokens":null,"resets_at":null,"window_seconds":null}"#
+        );
+
+        let UiEvent::Account {
+            account: Some(free),
+            ..
+        } = crate::fake_engine::samples::free_account()
+        else {
+            panic!("a signed-in account");
+        };
+        let json = serde_json::to_value(&free).unwrap();
+        assert_eq!(json["usage_window"]["limit_tokens"], 1_000_000);
+        assert!(json.get("window").is_none());
+        let mut older = json.clone();
+        older.as_object_mut().unwrap().remove("usage_window");
+        let older: AccountDetails = serde_json::from_value(older).unwrap();
+        assert_eq!(older.usage_window, None, "an older engine sends none");
     }
 }

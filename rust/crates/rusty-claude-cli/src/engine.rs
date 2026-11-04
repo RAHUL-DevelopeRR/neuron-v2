@@ -577,8 +577,6 @@ fn status_event(
             .map(shown_model)
             .filter(|served| *served != shown)
             .map(ToString::to_string),
-        usage_window: crate::plan_window::current()
-            .map(|window| engine_account::usage_window(&window)),
         request_tokens_estimate: request_tokens_estimate
             .map(|tokens| u64::try_from(tokens).unwrap_or(u64::MAX)),
     }

@@ -92,20 +92,20 @@ fn account_details(
         pricing_url: crate::account::pricing_url(),
         usage_updated_at: cache.fetched_at,
         usage_error: cache.error.clone(),
-        window: summary
+        usage_window: summary
             .and_then(AccountSummary::window)
-            .map(|window| usage_window(&window)),
+            .map(|window| usage_window(&window.as_of(crate::clock::now_unix()))),
     }
 }
 
 /// The token window as the protocol carries it.
-pub(crate) fn usage_window(window: &crate::account::PlanWindow) -> UsageWindow {
+fn usage_window(window: &crate::account::PlanWindow) -> UsageWindow {
     UsageWindow {
-        limit_tokens: window.limit_tokens,
         tokens: window.used(),
+        limit_tokens: Some(window.limit_tokens),
         remaining_tokens: window.remaining(),
-        window_seconds: window.window_seconds,
         resets_at: window.resets_at.clone(),
+        window_seconds: window.window_seconds,
     }
 }
 
@@ -393,8 +393,8 @@ mod tests {
         assert_eq!(summary.requests_today, Some(4));
 
         let details = account_details(&credential(), &cache, None);
-        let window = details.window.expect("the window");
-        assert_eq!(window.limit_tokens, 1_000_000);
+        let window = details.usage_window.expect("the window");
+        assert_eq!(window.limit_tokens, Some(1_000_000));
         assert_eq!(window.tokens, Some(640_000));
         assert_eq!(window.remaining_tokens, Some(360_000));
         assert_eq!(window.window_seconds, Some(18_000));
