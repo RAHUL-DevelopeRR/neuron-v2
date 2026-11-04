@@ -5,6 +5,22 @@ The release workflow copies a version's section into its GitHub release notes.
 
 ## 7.0.0-alpha.4 (unreleased)
 
+- `neuron plugins list|install|enable|disable|update|uninstall` manages plugins without
+  a session, and `/plugins` and `/skills` now work in the full-screen UI. Unknown
+  `neuron plugins` words print the usage instead of becoming a prompt.
+- Plugins keep their manifest at `.neuron-plugin/plugin.json` and may bring skill
+  folders and MCP servers. A plugin's MCP servers are listed as `needs approval` and do
+  not start on their own; its skills are listed under "Plugin skills" and never hide
+  another skill.
+- `neuron skills search <query>` searches the skills.sh registry, and
+  `neuron skills install` also takes `owner/repo/skill`, a registry skill name, or
+  `github:owner/repo/path[@ref]`. Skills install into `~/.neuron/skills`.
+- Skills and agents are read from `.neuron/` and `~/.neuron` first.
+- New bundled skills: `web-research` (cited answers from web sources) and `browser`
+  (safe use of the Playwright browser tools).
+- Turning a plugin on or off writes `plugins.enabled` instead of the deprecated
+  `enabledPlugins`, so settings no longer warn after every switch.
+
 - Remote MCP servers: a server with a `url` is reached over Streamable HTTP (or SSE
   with `"type": "sse"`), and `neuron mcp login <server>` signs in to one that needs
   OAuth; the token is kept in the OS keychain, or in an owner-only file when no

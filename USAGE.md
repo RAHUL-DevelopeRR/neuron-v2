@@ -348,6 +348,60 @@ Inside a session: `/session list`, `/session switch <id>`, `/resume <path>`,
 `neuron status`, `neuron doctor` and `neuron sandbox` print the same reports without
 starting a session.
 
+## Plugins and skills
+
+Skills are instructions the agent loads with its Skill tool when a task needs them.
+Plugins are folders that add tools, hooks, skills and MCP servers. Each command below
+works as `neuron <command>` without a session, and as `/<command>` in the line REPL
+and the full-screen UI.
+
+| Command | Purpose |
+| --- | --- |
+| `skills` or `skills list` | The skills this workspace sees, grouped by where they come from |
+| `skills search <query>` | Search the public skills.sh registry; each hit shows its install command |
+| `skills install <source>` | Install a skill into `~/.neuron/skills` (see sources below) |
+| `skills <name> [args]` | Run a skill as a prompt |
+| `plugins` or `plugins list` | Installed plugins with version, on or off, and id |
+| `plugins install <path\|git-url>` | Install a plugin folder or git repository and turn it on |
+| `plugins enable\|disable <name>` | Turn a plugin on or off (saved in `plugins.enabled` in your settings) |
+| `plugins update\|uninstall <name>` | Update a plugin from its source, or remove it |
+
+`skills install` takes a local folder with a `SKILL.md` (or one `.md` file),
+`owner/repo/skill` or a bare skill name from the skills.sh registry, or
+`github:owner/repo/path[@ref]` for a folder on GitHub. A local path wins over a
+registry name. Downloads are limited to 200 files and 2 MB, files that would land
+outside the skill's folder are refused, and the skill's instructions are `SKILL.md`,
+else `AGENTS.md`, else its first markdown file. Registry and GitHub skills are not
+reviewed: a skill can tell the agent to run commands, so read one before you use it.
+
+Skills are looked up in this order, and a name found first hides the same name later:
+`.neuron/skills` in the workspace and the folders above it, `~/.neuron/skills`,
+`.agents/skills`, the bundled skills, then the skills of enabled plugins (a plugin
+never hides another skill). Bundled skills include `web-research` (cited answers from
+WebSearch and WebFetch) and `browser` (safe use of the Playwright browser tools).
+
+A plugin keeps its manifest at `.neuron-plugin/plugin.json` (or `plugin.json` at its
+root). Besides tools, hooks and commands, a manifest may list:
+
+```json
+{
+  "name": "tracker-kit",
+  "version": "1.0.0",
+  "description": "Issue tracker helpers",
+  "skills": "skills",
+  "mcpServers": {
+    "tracker": {"command": "node", "args": ["${NEURON_PLUGIN_ROOT}/server.js"]}
+  }
+}
+```
+
+`skills` is a folder (or a list of folders) of skills inside the plugin.
+`mcpServers` is an object of server configs, or the path of a JSON file inside the
+plugin that holds one; `${NEURON_PLUGIN_ROOT}` stands for the plugin's folder. Paths
+that leave the plugin's folder are refused. A plugin's MCP servers are listed by
+`/mcp` as `needs approval` and do not start until you approve them; a server name
+that your settings already use stays yours.
+
 ## Bring your own key
 
 Set the key for the provider you want to use:
@@ -405,6 +459,7 @@ names the file, the line and the closest known key. Commonly used keys:
 | `hooks` | Commands run before and after tool calls |
 | `mcpServers`, `defaultMcpServers`, `disabledMcpServers` | MCP servers |
 | `defaultSkills` | `false` leaves the bundled skills out of the system prompt |
+| `plugins` | `enabled` (plugin id to `true` or `false`, written by `neuron plugins enable\|disable`), `externalDirectories`, `installRoot`; see [Plugins and skills](#plugins-and-skills) |
 | `toolCapableModels`, `autoToolModel`, `subagentModel`, `summaryModel`, `reviewerModel`, `providerFallbacks` | Models for particular jobs (see [Models](#models)) |
 | `redactSecrets` | `false` stops replacing token-shaped secrets (API keys, tokens, private keys, passwords in URLs) with `[REDACTED:<kind>]` in tool output, the session file and telemetry; on by default, and the settings of a folder you have not trusted cannot turn it off |
 | `sandbox.network.allow` | Hosts that `WebFetch` and shell commands may reach (`github.com`, `*.npmjs.org`, `*`, optionally with `:port`). `WebFetch` always enforces it; shell commands get proxy variables for a local proxy that only reaches those hosts, which macOS enforces and Linux and Windows treat as advice |
@@ -449,7 +504,9 @@ or put it in your user settings.
 | `NEURON_REVIEW` | neuron | `1` adds a reviewer to the completion check: a read-only sub-agent that compares the turn's diff with the request and reports problems |
 | `NEURON_REVIEW_MODEL` | neuron | Model for the reviewer (default: the session's model) |
 | `NEURON_EXPERIENCE` | neuron | `0` turns off the experience library (`experience.json` in the settings directory): per-model counts of repaired tool calls, missed edits and similar, which add notes to that model's system prompt once they recur |
-| `NEURON_CONFIG_HOME` | neuron | Settings directory (default `~/.neuron`) |
+| `NEURON_CONFIG_HOME` | neuron | Settings directory (default `~/.neuron`); installed skills go to its `skills` folder |
+| `NEURON_SKILL_REGISTRY_URL` | neuron | Skill registry for `skills search` and `skills install` (default `https://skills.sh`) |
+| `NEURON_GITHUB_API_URL` | neuron | GitHub API for `skills install github:...` (default `https://api.github.com`) |
 | `NEURON_HOME` | neuron | Directory for the login file and caches (default `~/.neuroncli`); setting it also keeps the login out of the OS credential store |
 | `NEURON_CREDENTIAL_STORE` | neuron | `file` or `keychain`: force where the login is kept |
 | `NEURON_TRUST_WORKSPACE=1` | neuron | Trust the current directory in a headless run (only for checkouts you trust) |

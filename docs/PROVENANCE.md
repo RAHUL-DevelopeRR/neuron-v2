@@ -48,7 +48,19 @@ The `neuron` binary does not use these files.
 | agent-reach | <https://github.com/Panniantong/Agent-Reach> | `a19a171` | (c) 2025 Agent Eyes |
 
 All four are MIT. Neuron adds host-adapter sections to some of them; those additions
-are Neuron's.
+are Neuron's. The `web-research` and `browser` skills in the same folder were written
+for Neuron (MIT, as the rest of Neuron) and are not listed in `SOURCES.json`.
+
+## Ports from Freebuff into the Rust workspace
+
+Code in `rust/` ported from Freebuff ([CodebuffAI/freebuff](https://github.com/CodebuffAI/freebuff)
+commit `545e04d`, Apache-2.0, "Copyright 2025 Codebuff"; license text in
+`ui/neuron-tui/LICENSE`). Each ported file says so in a "Ported from" comment and
+states what changed.
+
+| Area | Neuron files | Freebuff source | What it does |
+| --- | --- | --- | --- |
+| Skill registry | `rust/crates/commands/src/skill_sources.rs`, `rust/crates/rusty-claude-cli/src/skill_registry.rs` | `common/src/util/skill-registry.ts` | skills.sh search and download endpoints and timeouts, ranking by installs with one row per name, 404 versus other failures, and choosing SKILL.md, then AGENTS.md, then any markdown file as a skill's instructions. Rewritten in Rust with GitHub folders, size and path limits and staged installs added. |
 
 ## Crate licenses
 
