@@ -280,7 +280,9 @@ or a script is on it, another run that would continue it (`--resume`, `/resume`,
 `/session switch`, or `/compact` and `/clear --confirm` given to `--resume`) is refused
 with "is in use by another neuron run" before it sends anything, instead of the two runs
 overwriting each other's turns. Wait for the other run to end, or start a new session.
-Each session file has a `.lock` file beside it for this.
+The locks for this are kept in `~/.neuroncli/locks` (under `NEURON_HOME` if set), one
+per session file, so `--resume <file>` leaves nothing beside the file; a file that is
+not a session is refused before it is locked.
 
 Inside a session: `/session list`, `/session switch <id>`, `/resume <path>`,
 `/compact` to shrink history, `/clear` to start over.
