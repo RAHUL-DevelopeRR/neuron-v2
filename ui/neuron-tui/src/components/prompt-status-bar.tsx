@@ -22,6 +22,7 @@ import { Button } from './button'
 import { useTheme } from '../hooks/use-theme'
 import { useEngineStore } from '../state/engine-store'
 import { getGlyphMode, type GlyphMode } from '../utils/glyphs'
+import { renderProbe } from '../utils/render-probe'
 import {
   RIGHT_GAP,
   SEGMENT_SEPARATOR,
@@ -75,6 +76,7 @@ export const PromptStatusBar = ({
   /** The terminal's glyph set (tests draw both). */
   glyphMode?: GlyphMode
 }) => {
+  renderProbe.onRender?.('PromptStatusBar')
   const theme = useTheme()
   const status = useEngineStore((state) => state.status)
   const account = useEngineStore((state) => state.account)

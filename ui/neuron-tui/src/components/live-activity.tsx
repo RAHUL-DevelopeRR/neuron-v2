@@ -21,6 +21,7 @@ import { useEngineStore } from '../state/engine-store'
 import { useLiveTurnStore } from '../state/live-turn-store'
 import { formatTokenCount } from '../utils/format-token-count'
 import { GLYPHS } from '../utils/glyphs'
+import { renderProbe } from '../utils/render-probe'
 
 const SPINNER_INTERVAL_MS = 100
 const SHIMMER_INTERVAL_MS = 160
@@ -62,6 +63,7 @@ export function useLiveClock(): number {
 
 /** What the running turn is doing, for the status line's left side. */
 export const LiveActivityLine = () => {
+  renderProbe.onRender?.('LiveActivityLine')
   const theme = useTheme()
   const live = useLiveTurnStore((state) => state)
   const awaitingApproval = useEngineStore((state) => state.permissionQueue.length > 0)

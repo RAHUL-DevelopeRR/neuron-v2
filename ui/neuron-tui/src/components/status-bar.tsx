@@ -18,6 +18,7 @@ import { ShimmerText } from './shimmer-text'
 import { useTheme } from '../hooks/use-theme'
 import { useEngineStore } from '../state/engine-store'
 import { formatElapsedTime } from '../utils/format-elapsed-time'
+import { renderProbe } from '../utils/render-probe'
 
 import type { StatusIndicatorState } from '../utils/status-indicator-state'
 
@@ -68,6 +69,7 @@ export const StatusBar = ({
   statusIndicatorState,
   onStop,
 }: StatusBarProps) => {
+  renderProbe.onRender?.('StatusBar')
   const theme = useTheme()
   const engineConnection = useEngineStore((state) => state.connection)
   const engineError = useEngineStore((state) => state.error)
