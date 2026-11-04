@@ -304,8 +304,11 @@ Two flags grant web access for one run only; they are never saved to settings:
 
 | Flag | Effect |
 | --- | --- |
-| `--allow-web` | `WebSearch` and `WebFetch` run without asking |
-| `--allow-origin HOST` | `WebFetch` and the browser may reach only `HOST` (repeatable), and fetches from it run without asking. `HOST` is a host name or URL (`example.com`, `https://docs.rs/`); `*.example.com` also matches its subdomains. Calls to other hosts are refused, whatever the permission mode or allow rules, and so is a redirect to one (`www.` added or dropped counts as another host). In the browser, opening a listed page by its URL and reading it run; clicks, typing, page scripts, going back and opening tabs are refused, because they can leave the listed hosts without naming one |
+| `--allow-web` | `WebSearch` and `WebFetch` run without asking (not the browser) |
+| `--allow-origin HOST` | `WebFetch` and the browser may reach only `HOST` (repeatable), and fetches from it, and browser pages opened on it, run without asking. `HOST` is a host name or URL (`example.com`, `https://docs.rs/`); `*.example.com` also matches its subdomains. Calls to other hosts are refused, whatever the permission mode or allow rules, and so is a redirect to one (`www.` added or dropped counts as another host). In the browser, opening a listed page by its URL, reading it and arranging tabs run; clicks, typing, page scripts, going back and opening a tab on a URL that is not listed are refused, because they can leave the listed hosts without naming one |
+
+`--with-browser` is not a grant: it loads the bundled browser in a one-shot run (see
+[Browser](#browser)).
 
 They are meant for scripts and CI, where nobody can answer a question:
 
@@ -324,6 +327,79 @@ approve web calls when asked instead.
 
 `CLAWD_WEB_SEARCH_BASE_URL` points direct searches at a search page of your own
 (it is sent `?q=<query>`); with it set, searches never go through the gateway.
+
+## Browser
+
+Neuron ships a browser the model can drive: the Playwright MCP server, listed as
+`playwright` in `/mcp list` (it needs Node.js and a Chrome or Chromium; see
+[DEFAULT_INTEGRATIONS.md](docs/DEFAULT_INTEGRATIONS.md#mcp-and-browser-control)).
+Interactive sessions load it; a one-shot run (`-p`, `neuron prompt`) does not, unless
+you pass `--with-browser` or set `browser.oneShot`.
+
+It starts with safe defaults:
+
+- a fresh in-memory profile each time (no saved logins or cookies carry over);
+- automatically named files (screenshots, saved pages) go to `.neuron/browser` in the
+  project, which gets a `.gitignore` so they stay out of git;
+- headless when there is no display (Linux without `DISPLAY` or `WAYLAND_DISPLAY`), in
+  CI (`CI` set) or when `browser.headless` is true, otherwise headed;
+- screenshots are left out of tool results (`browser.images`, `"omit"` by default),
+  because a screenshot would reach the model as tens of thousands of characters of
+  text; the model reads pages from their text snapshot instead;
+- localhost and private, link-local and unique-local addresses (`127.*`, `10.*`,
+  `172.16-31.*`, `192.168.*`, `169.254.*`, `[::1]`, `fc`/`fd`/`fe80` IPv6) are blocked
+  unless `browser.allowLocal` is true. The browser server applies this list to the
+  pages and requests it makes, not to redirects, and a public name that resolves to a
+  private address is not caught, so treat it as a guard against mistakes, not as a
+  security boundary. Right after a blocked page, the next page can fail once with
+  "interrupted by another navigation"; opening it again works.
+
+Permissions, per tool (all 25 tools of `@playwright/mcp` 0.0.83):
+
+| Tools | Needs |
+| --- | --- |
+| Reading what is open: `browser_snapshot`, `browser_take_screenshot`, `browser_console_messages`, `browser_find`, `browser_wait_for`, `browser_network_requests` (URLs only), `browser_tabs` (list, select, close, or a blank new tab), `browser_resize`, `browser_emulate_media`, `browser_close` | Workspace-write, no question |
+| Opening or acting on pages: `browser_navigate`, `browser_navigate_back`, `browser_tabs` on a URL, `browser_click`, `browser_type`, `browser_fill_form`, `browser_select_option`, `browser_press_key`, `browser_hover`, `browser_drag`, `browser_handle_dialog`, `browser_evaluate` | Workspace-write, plus one approval of `web browsing` for the session ("allow for this session" covers every page and action after it; "deny for the rest of the session" refuses them all) |
+| `browser_network_request` (full headers and bodies, cookies included), `browser_file_upload` and `browser_drop` (send local files to a page), `browser_run_code_unsafe` (runs code in the server's own process) | Full access: asks every time in workspace-write |
+
+A tool name that takes a `filename` asks too when the name leaves the project
+(`../`, an absolute path), names Neuron or git configuration (`.neuron/`, `.git/`),
+or names a credential file such as `.env`; names under `.neuron/browser/` are fine.
+
+In a script nobody can approve web browsing, so name the sites with `--allow-origin`:
+
+```bash
+neuron --with-browser --allow-origin example.com -p "open example.com and give me the page title"
+```
+
+Pages on a listed host open without asking; anything that could leave the listed
+hosts is refused (see the `--allow-origin` row above). `--allow-web` does not cover
+the browser. A persistent `permissions.allow` rule such as
+`"mcp__playwright__browser_navigate"` in `~/.neuron/settings.json` also works.
+
+Settings (user `~/.neuron/settings.json`, or a trusted project's settings):
+
+```json
+{
+  "browser": {
+    "headless": true,
+    "images": "omit",
+    "allowLocal": false,
+    "oneShot": false
+  }
+}
+```
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `browser.headless` | `false` | `true` always runs headless; otherwise headless only without a display or in CI |
+| `browser.images` | `"omit"` | `"allow"` sends screenshots to the model as the server returns them |
+| `browser.allowLocal` | `false` | `true` lets the browser open localhost and private addresses (testing your own app) |
+| `browser.oneShot` | `false` | `true` loads the browser in one-shot runs too, like `--with-browser` |
+
+A `playwright` entry of your own in `mcpServers` replaces the bundled server: it starts
+as you wrote it, without these flags or the tool table above (its tools need full
+access, as their annotations ask).
 
 ## Research
 

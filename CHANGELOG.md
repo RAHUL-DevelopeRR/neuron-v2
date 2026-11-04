@@ -72,7 +72,8 @@ The release workflow copies a version's section into its GitHub release notes.
   `--allow-origin HOST` (repeatable) limits `WebFetch` and the browser to those hosts
   and lets fetches from them run without asking. Neither is saved. Under
   `--allow-origin` a redirect to an unlisted host (`www.` included) is not followed,
-  and browser clicks, typing, page scripts and going back are refused. Either flag
+  and browser clicks, typing, page scripts, going back and full-access browser tools
+  are refused. Either flag
   keeps the line REPL instead of the full-screen UI, which could not carry them.
 - `/research <question>` (full-screen UI and line REPL) and `neuron research
   "<question>"` research a question on the web: sub-questions, searches through the
@@ -96,6 +97,21 @@ The release workflow copies a version's section into its GitHub release notes.
   token, a password in a URL, an `api_key=` parameter) is refused before it is sent,
   whatever the permission rules say; research searches and reads are checked the same
   way.
+- The bundled browser (Playwright MCP) starts with a fresh in-memory profile, writes
+  its automatically named files to `.neuron/browser` (kept out of git), runs headless
+  without a display, in CI or with `browser.headless`, leaves screenshots out of tool
+  results until they can reach the model as images (`browser.images`, `"omit"` by
+  default), and blocks localhost and private addresses unless `browser.allowLocal`
+  is true.
+- Browser tools no longer all need full access: reading the page runs in
+  workspace-write, opening and acting on pages asks once per session for web
+  browsing (or runs on the hosts given with `--allow-origin`), and only
+  `browser_network_request`, `browser_file_upload`, `browser_drop` and
+  `browser_run_code_unsafe` need full access. A browser file name outside the
+  project, on Neuron or git configuration, or on a credential file asks first.
+- `--with-browser` (or `browser.oneShot`) loads the bundled browser in a one-shot run.
+  Without it, the system prompt and `ToolSearch` say the browser is not loaded in that
+  run instead of calling it configured.
 - `neuron plugins [list|install|enable|disable|update|uninstall]` runs locally, and an
   unknown word after `neuron mcp`, `neuron plugins` or `neuron skills` is refused with
   the usage line instead of being sent to the model as a prompt.
