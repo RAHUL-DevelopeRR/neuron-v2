@@ -355,7 +355,8 @@ Colony is an opt-in mode for a task big enough to split. Start it with
 `/colony <task>` in a session, or from a shell:
 
 ```bash
-neuron colony "add input validation to every API handler" [--workers N] [--budget 400k]   [--review-model MODEL] [--no-merge] [--allow-web] [--yes]
+neuron colony "add input validation to every API handler"
+# options: --workers N  --budget 400k  --review-model MODEL  --no-merge  --allow-web  --yes
 ```
 
 A run goes in five steps:
