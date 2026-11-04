@@ -228,8 +228,10 @@ export const ModelPicker = ({
   // Each open starts on the current model (the picker mounts per open).
   const [focus, setFocus] = useState(() => Math.max(0, currentIndex))
   // Why the model Enter was pressed on can't be picked, until the focus moves.
-  const [notice, setNotice] = useState<string | null>(null)
-  useEffect(() => setNotice(null), [focus])
+  // Kept with its row, not cleared by an effect on `focus`: that effect could
+  // run after a quick Enter on the new row and clear what Enter just said.
+  const [noticeFor, setNotice] = useState<{ focus: number; text: string } | null>(null)
+  const notice = noticeFor?.focus === focus ? noticeFor.text : null
 
   // Ask now and every 30 s; until the first reply the last list (if any) shows.
   useEffect(() => {
@@ -289,11 +291,11 @@ export const ModelPicker = ({
           const row = rows[focus]
           if (!row) return
           if (!row.available) {
-            setNotice(unavailableMessage(row))
+            setNotice({ focus, text: unavailableMessage(row) })
             return
           }
           if (!row.efforts) {
-            setNotice(`${row.label} has no thinking levels to pick.`)
+            setNotice({ focus, text: `${row.label} has no thinking levels to pick.` })
             return
           }
           const levels = reasoningLevels(row)
@@ -304,16 +306,18 @@ export const ModelPicker = ({
         }
         if (key.name === 'up') {
           key.preventDefault?.()
+          setNotice(null)
           setFocus((index) => Math.max(0, index - 1))
         } else if (key.name === 'down') {
           key.preventDefault?.()
+          setNotice(null)
           setFocus((index) => Math.min(rows.length - 1, index + 1))
         } else if (key.name === 'return' || key.name === 'enter') {
           key.preventDefault?.()
           const row = rows[focus]
           if (!row) return
           if (!row.available) {
-            setNotice(unavailableMessage(row))
+            setNotice({ focus, text: unavailableMessage(row) })
             return
           }
           if (!row.current) {
