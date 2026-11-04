@@ -904,8 +904,8 @@ pub enum PermissionDecision {
     /// (so only to engines that know it).
     AllowForProject,
     /// Do not run it; `note` is passed to the model. With `session`, matching calls
-    /// (the request's `session_prefixes`, or this exact call) are refused for the rest
-    /// of the session without asking. Added after protocol 1: an older engine ignores
+    /// (ones whose asking part starts with the same command prefix, such as `git push`,
+    /// or this exact call) are refused for the rest of the session without asking. Added after protocol 1: an older engine ignores
     /// `session` and denies this call only.
     Deny {
         note: Option<String>,

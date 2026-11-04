@@ -795,6 +795,7 @@ mod cli_prompter_tests {
             session_prefixes: Vec::new(),
             remedy: runtime::PermissionRemedy::default(),
             project_rules: Vec::new(),
+            deny_prefixes: Vec::new(),
         }
     }
 
@@ -847,7 +848,8 @@ mod cli_prompter_tests {
         let request = PermissionRequest {
             input: r#"{"command":"npm install better-sqlite3"}"#.to_string(),
             session_prefixes: vec!["npm install".to_string()],
-            project_rules: vec!["bash(npm:*)".to_string()],
+            project_rules: vec!["bash(npm install:*)".to_string()],
+            deny_prefixes: vec!["npm install".to_string()],
             ..request()
         };
         let mut out = Vec::new();
@@ -869,7 +871,7 @@ mod cli_prompter_tests {
             "{shown}"
         );
         assert!(
-            shown.contains("  [p] always allow in this project (saves \"bash(npm:*)\" to .neuron/settings.local.json)\n"),
+            shown.contains("  [p] always allow in this project (saves \"bash(npm install:*)\" to .neuron/settings.local.json)\n"),
             "{shown}"
         );
         assert!(
@@ -917,8 +919,9 @@ mod channel_prompter_tests {
             project_rules: if session_prefixes.is_empty() {
                 Vec::new()
             } else {
-                vec!["bash(cargo:*)".to_string()]
+                vec!["bash(cargo test:*)".to_string()]
             },
+            deny_prefixes: session_prefixes.iter().map(ToString::to_string).collect(),
         }
     }
 

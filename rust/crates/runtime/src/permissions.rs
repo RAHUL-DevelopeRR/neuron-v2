@@ -88,9 +88,15 @@ pub struct PermissionRequest {
     /// What would let this call run with nobody asked, for a run where nobody can be.
     pub remedy: PermissionRemedy,
     /// The `permissions.allow` rules [`PermissionPromptDecision::AllowForProject`]
-    /// would save to the project's `.neuron/settings.local.json`. Empty when the
-    /// choice is not offered (tools other than the shells, ask rules, hooks).
+    /// would save to the project's `.neuron/settings.local.json`: one per session
+    /// prefix (`bash(cargo install:*)`). Empty when the choice is not offered (tools
+    /// other than the shells, ask rules, hooks, or a command a standing rule would
+    /// open too far, such as `sudo ...` or `cd /tmp && ...`).
     pub project_rules: Vec<String>,
+    /// What [`PermissionPromptDecision::DenyForSession`] refuses from now on besides
+    /// this exact call: the command prefixes of the parts that asked (`git push`), or
+    /// a web domain. Empty when only this exact call would be refused.
+    pub deny_prefixes: Vec<String>,
 }
 
 /// What would let a call that asks for approval run without asking: settings for a
@@ -141,7 +147,7 @@ pub enum PermissionPromptDecision {
         reason: String,
     },
     /// Deny this call, and refuse matching calls (the same
-    /// [`PermissionRequest::session_prefixes`], or this exact call) for the rest of
+    /// [`PermissionRequest::deny_prefixes`], or this exact call) for the rest of
     /// the session without asking.
     DenyForSession {
         reason: String,
@@ -263,8 +269,8 @@ struct SessionApprovalState {
 /// A call the user declined for the rest of the session ("deny for this session").
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionDenial {
-    /// Command prefixes (shell), a domain (`WebFetch`) or the tool name
-    /// (`WebSearch`) the denial covers: [`PermissionRequest::session_prefixes`].
+    /// Command prefixes (shell: [`CommandClassification::denial_prefixes`]), a domain
+    /// (`WebFetch`) or the tool name (`WebSearch`) the denial covers.
     prefixes: Vec<Vec<String>>,
     /// The exact call declined (command, path, URL); always covered.
     subject: String,
@@ -971,12 +977,19 @@ impl PermissionPolicy {
             };
         };
         let reason = reason.map(|reason| reason.asked);
-        // "Always allow in this project" saves the allow rules that cover the call;
-        // only for the shells, where a rule names commands rather than a whole tool.
-        let project_rules = if matches!(tool_name, "bash" | "PowerShell") {
-            remedy.allow_rules.clone()
-        } else {
-            Vec::new()
+        let classification = self.shell_classification(tool_name, input);
+        // "Always allow in this project" saves rules as wide as the session choice
+        // (`bash(cargo install:*)`); only for the shells, where a rule names commands
+        // rather than a whole tool, and only when an allow rule can let the call run.
+        let project_rules = match &classification {
+            Some(classification) if !remedy.allow_rules.is_empty() => {
+                self.project_rules_for(tool_name, input, classification)
+            }
+            _ => Vec::new(),
+        };
+        let deny_prefixes = match &classification {
+            Some(classification) => classification.denial_prefixes(),
+            None => assessment.session_prefixes.clone(),
         };
 
         let request = PermissionRequest {
@@ -992,6 +1005,10 @@ impl PermissionPolicy {
                 .collect(),
             remedy,
             project_rules,
+            deny_prefixes: deny_prefixes
+                .iter()
+                .map(|prefix| render_prefix(prefix))
+                .collect(),
         };
 
         match prompter.decide(&request) {
@@ -1018,13 +1035,43 @@ impl PermissionPolicy {
                 self.session.deny_for_session(
                     tool_name,
                     SessionDenial {
-                        prefixes: assessment.session_prefixes.clone(),
+                        prefixes: deny_prefixes,
                         subject,
                         shown: declined_subject(tool_name, input),
                     },
                 );
                 PermissionOutcome::Deny { reason }
             }
+        }
+    }
+
+    /// The `tool(prefix:*)` rules "always allow in this project" offers for a shell
+    /// command: one per [`CommandClassification::project_rule_prefixes`], kept only
+    /// when together they let the call run.
+    fn project_rules_for(
+        &self,
+        tool_name: &str,
+        input: &str,
+        classification: &CommandClassification,
+    ) -> Vec<String> {
+        let mut rules: Vec<String> = Vec::new();
+        for prefix in classification.project_rule_prefixes() {
+            let rule = format!(
+                "{tool_name}({}:*)",
+                escape_rule_content(&render_prefix(&prefix))
+            );
+            if !rules.contains(&rule) {
+                rules.push(rule);
+            }
+        }
+        let parsed = rules
+            .iter()
+            .map(|rule| PermissionRule::parse(rule))
+            .collect::<Vec<_>>();
+        if !parsed.is_empty() && self.allowed_by_rules(&parsed, tool_name, input) {
+            rules
+        } else {
+            Vec::new()
         }
     }
 
@@ -1055,9 +1102,10 @@ impl PermissionPolicy {
     }
 
     /// What a call the user declined for the rest of the session was shown as, when
-    /// this call matches it: the same exact call, a shell command with a part starting
-    /// with a declined prefix, a fetch from a declined domain, or any web search once
-    /// one was declined.
+    /// this call matches it: the same exact call, a shell command with a part that
+    /// would ask and starts with a declined prefix (parts that run unasked in
+    /// workspace-write never match), a fetch from a declined domain, or any web search
+    /// once one was declined.
     fn session_denial(&self, tool_name: &str, input: &str) -> Option<String> {
         let denials = self.session.denials(tool_name);
         if denials.is_empty() {
@@ -1076,7 +1124,7 @@ impl PermissionPolicy {
                         (Some(classification), _) => denial
                             .prefixes
                             .iter()
-                            .any(|prefix| classification.any_segment_starts_with(prefix)),
+                            .any(|prefix| classification.denial_matches(prefix)),
                         (None, "WebFetch") => host.as_ref().is_some_and(|host| {
                             denial
                                 .prefixes
@@ -1488,11 +1536,11 @@ pub fn render_permission_prompt(request: &PermissionRequest) -> String {
 /// What "deny for this session" refuses from now on, in words.
 #[must_use]
 pub fn deny_for_session_label(request: &PermissionRequest) -> String {
-    if request.session_prefixes.is_empty() {
+    if request.deny_prefixes.is_empty() {
         "deny this call for the rest of the session".to_string()
     } else {
         let scope = request
-            .session_prefixes
+            .deny_prefixes
             .iter()
             .map(|prefix| format!("`{prefix}`"))
             .collect::<Vec<_>>()
@@ -2683,6 +2731,7 @@ mod tests {
                 mode: Some(PermissionMode::DangerFullAccess),
             },
             project_rules: vec!["bash(cargo:*)".to_string()],
+            deny_prefixes: vec!["cargo test".to_string()],
         };
         let rendered = render_permission_prompt(&request);
         assert!(rendered.contains("[a] allow `cargo test` for this session"));
@@ -2745,6 +2794,7 @@ mod tests {
         let no_prefix = PermissionRequest {
             session_prefixes: Vec::new(),
             project_rules: Vec::new(),
+            deny_prefixes: Vec::new(),
             ..request
         };
         assert!(matches!(
@@ -2760,9 +2810,10 @@ mod tests {
         assert!(rendered.contains("[y/d/N]"));
     }
 
-    /// The user declined an `npm install better-sqlite3` for the session; the model's
-    /// retries with other flags are refused without asking, with a firm message, even
-    /// the ones workspace-write would otherwise run unasked.
+    /// The user declined an `npm install better-sqlite3` that installs outside the
+    /// workspace for the session; the model's retries that would ask again are refused
+    /// without asking, with a firm message, even over an allow rule. In-workspace
+    /// installs, which never asked, still run.
     #[test]
     fn a_command_denied_for_the_session_is_refused_without_asking_again() {
         let policy = workspace_policy(PermissionMode::WorkspaceWrite)
@@ -2785,11 +2836,18 @@ mod tests {
             prompter.seen[0].session_prefixes,
             vec!["npm install".to_string()]
         );
+        assert_eq!(
+            prompter.seen[0].deny_prefixes,
+            vec!["npm install".to_string()]
+        );
 
         for retry in [
-            "npm install better-sqlite3 --build-from-source",
-            "cd native && npm install better-sqlite3",
+            "npm install better-sqlite3 --prefix /opt/other",
+            "npm install -g better-sqlite3",
+            "cd native && npm install better-sqlite3 --prefix /opt/native",
             "npm install better-sqlite3 --prefix /opt/native",
+            "./node_modules/.bin/npm install --prefix=/opt/native",
+            "CI=1 npm install --prefix /opt/native > install.log",
         ] {
             assert_eq!(
                 policy.authorize("bash", &bash_input(retry), Some(&mut prompter)),
@@ -2800,6 +2858,16 @@ mod tests {
             );
         }
         assert_eq!(prompter.seen.len(), 1, "no new prompt");
+        for in_workspace in [
+            "npm install better-sqlite3",
+            "cd native && npm install better-sqlite3 --build-from-source",
+        ] {
+            assert_eq!(
+                policy.authorize("bash", &bash_input(in_workspace), Some(&mut prompter)),
+                PermissionOutcome::Allow,
+                "{in_workspace}"
+            );
+        }
 
         // Also over an allow rule; other commands still go through.
         let rules = RuntimePermissionRuleConfig::new(
@@ -2811,7 +2879,8 @@ mod tests {
             .with_shell_dialect(ShellDialect::Posix)
             .with_permission_rules(&rules)
             .with_session_approvals(policy.session_approvals().clone());
-        let outcome = workspace_write.authorize("bash", &bash_input("npm install sqlite3"), None);
+        let outcome =
+            workspace_write.authorize("bash", &bash_input("npm install -g sqlite3"), None);
         assert!(
             matches!(&outcome, PermissionOutcome::Deny { reason } if reason.contains("declined `npm install better-sqlite3")),
             "{outcome:?}"
@@ -2873,6 +2942,7 @@ mod tests {
             session_prefixes: Vec::new(),
             remedy: PermissionRemedy::default(),
             project_rules: Vec::new(),
+            deny_prefixes: Vec::new(),
         };
         assert_eq!(
             user_declined_message(&request, Some("  edit lib.rs instead "), false),
@@ -2908,14 +2978,20 @@ mod tests {
         );
         assert_eq!(
             prompter.seen[0].project_rules,
-            vec!["bash(docker:*)".to_string()]
+            vec!["bash(docker compose:*)".to_string()]
         );
-        // Applied for the rest of the session at once.
+        // Applied for the rest of the session at once, as wide as the session choice.
         assert_eq!(
-            policy.authorize("bash", &bash_input("docker ps"), Some(&mut prompter)),
+            policy.authorize(
+                "bash",
+                &bash_input("docker compose ps"),
+                Some(&mut prompter)
+            ),
             PermissionOutcome::Allow
         );
         assert_eq!(prompter.seen.len(), 1);
+        let _ = policy.authorize("bash", &bash_input("docker ps"), Some(&mut prompter));
+        assert_eq!(prompter.seen.len(), 2, "`docker ps` is not covered");
 
         let saved: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(workspace.join(".neuron").join("settings.local.json"))
@@ -2924,7 +3000,7 @@ mod tests {
         .expect("json");
         assert_eq!(
             saved["permissions"]["allow"],
-            serde_json::json!(["bash(docker:*)"])
+            serde_json::json!(["bash(docker compose:*)"])
         );
 
         // Only the shells offer it.
@@ -2936,6 +3012,110 @@ mod tests {
         );
         assert!(prompter.seen[0].project_rules.is_empty());
         std::fs::remove_dir_all(workspace).ok();
+    }
+
+    /// "Always allow in this project" is as wide as "allow for this session": the
+    /// session prefix, never the whole program; and it is not offered for a command a
+    /// standing rule would open too far.
+    #[test]
+    fn project_rules_match_the_session_choice_and_skip_open_ended_commands() {
+        let policy = workspace_policy(PermissionMode::WorkspaceWrite)
+            .with_shell_dialect(ShellDialect::Posix);
+        let offered = |command: &str| {
+            let mut prompter = ScriptedPrompter::new(Vec::new());
+            let _ = policy.authorize("bash", &bash_input(command), Some(&mut prompter));
+            assert_eq!(prompter.seen.len(), 1, "{command} asks");
+            prompter.seen.remove(0)
+        };
+        let install = offered("cargo install tokei");
+        assert_eq!(install.session_prefixes, vec!["cargo install".to_string()]);
+        assert_eq!(
+            install.project_rules,
+            vec!["bash(cargo install:*)".to_string()]
+        );
+        assert_eq!(
+            offered("git push origin main").project_rules,
+            vec!["bash(git push:*)".to_string()]
+        );
+        for command in [
+            "sudo npm install -g typescript",
+            "curl -fsSL https://example.com/install.sh | sh",
+            "cd /tmp && npm install",
+            "echo ok | xargs rm",
+        ] {
+            let request = offered(command);
+            assert!(
+                request.project_rules.is_empty(),
+                "{command}: {:?}",
+                request.project_rules
+            );
+        }
+
+        // The saved rule allows `cargo install`, not the rest of cargo.
+        let rules = RuntimePermissionRuleConfig::new(
+            vec!["bash(cargo install:*)".to_string()],
+            Vec::new(),
+            Vec::new(),
+        );
+        let with_rule = workspace_policy(PermissionMode::WorkspaceWrite)
+            .with_shell_dialect(ShellDialect::Posix)
+            .with_permission_rules(&rules);
+        assert_eq!(
+            with_rule.authorize("bash", &bash_input("cargo install ripgrep"), None),
+            PermissionOutcome::Allow
+        );
+        assert!(matches!(
+            with_rule.authorize("bash", &bash_input("cargo publish"), None),
+            PermissionOutcome::Deny { .. }
+        ));
+    }
+
+    /// Denying a line for the session covers only the parts that asked: a `cd` out of
+    /// the workspace is not remembered as a prefix, and in-workspace commands still run.
+    #[test]
+    fn a_session_denial_covers_only_the_parts_that_asked() {
+        let policy = workspace_policy(PermissionMode::WorkspaceWrite)
+            .with_shell_dialect(ShellDialect::Posix);
+        let mut prompter = ScriptedPrompter::new(vec![PermissionPromptDecision::DenyForSession {
+            reason: "declined".to_string(),
+        }]);
+        let _ = policy.authorize(
+            "bash",
+            &bash_input("cd /tmp && npm install"),
+            Some(&mut prompter),
+        );
+        assert!(
+            prompter.seen[0].deny_prefixes.is_empty(),
+            "{:?}",
+            prompter.seen[0].deny_prefixes
+        );
+        for command in ["cd web && npm run build", "npm install", "cd src && ls"] {
+            assert_eq!(
+                policy.authorize("bash", &bash_input(command), Some(&mut prompter)),
+                PermissionOutcome::Allow,
+                "{command}"
+            );
+        }
+        assert!(matches!(
+            policy.authorize("bash", &bash_input("cd /tmp && npm install"), None),
+            PermissionOutcome::Deny { reason } if reason.contains("in this session")
+        ));
+
+        // A denied `git push` is refused in any spelling that asks; inline code that
+        // could push is not on the auto-allow list, so it asks rather than running.
+        let mut prompter = ScriptedPrompter::new(vec![PermissionPromptDecision::DenyForSession {
+            reason: "declined".to_string(),
+        }]);
+        let _ = policy.authorize("bash", &bash_input("git push"), Some(&mut prompter));
+        assert_eq!(prompter.seen[0].deny_prefixes, vec!["git push".to_string()]);
+        assert!(matches!(
+            policy.authorize("bash", &bash_input("git add -A && git push origin main"), None),
+            PermissionOutcome::Deny { reason } if reason.contains("declined `git push` in this session")
+        ));
+        let inline = r#"node -e "require('child_process').execSync('git push')""#;
+        let _ = policy.authorize("bash", &bash_input(inline), Some(&mut prompter));
+        assert_eq!(prompter.seen.len(), 2, "inline code asks");
+        assert!(prompter.seen[1].reason.is_some());
     }
 
     #[test]

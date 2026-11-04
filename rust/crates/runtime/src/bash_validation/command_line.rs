@@ -197,6 +197,122 @@ impl CommandClassification {
             .iter()
             .any(|segment| words_start_with(&segment.words, prefix, self.dialect))
     }
+
+    /// Command prefixes "deny for this session" refuses from now on: one for each part
+    /// that needs more than workspace-write, leaving out the parts that run unasked and
+    /// directory changes (`cd /tmp && npm install` gives none, so only the exact line is
+    /// refused). Unlike [`Self::approval_prefixes`], parts with environment assignments
+    /// or redirections count too, since a broader denial is the safe direction; the
+    /// program is spelled without its directory or Windows shim suffix (`npm.cmd`).
+    #[must_use]
+    pub fn denial_prefixes(&self) -> Vec<Vec<String>> {
+        let mut prefixes: Vec<Vec<String>> = Vec::new();
+        for words in self.asking_words() {
+            if is_directory_change(&words[0]) {
+                continue;
+            }
+            let prefix = suggested_prefix(&words, self.dialect);
+            if !prefixes.contains(&prefix) {
+                prefixes.push(prefix);
+            }
+        }
+        prefixes
+    }
+
+    /// Whether a part of the line that needs more than workspace-write starts with a
+    /// prefix from [`Self::denial_prefixes`]; parts that run unasked never match.
+    #[must_use]
+    pub fn denial_matches(&self, prefix: &[String]) -> bool {
+        self.asking_words()
+            .iter()
+            .any(|words| words_start_with(words, prefix, self.dialect))
+    }
+
+    /// Prefixes an "always allow in this project" rule may be saved for: the
+    /// [`Self::approval_prefixes`] the session choice offers, or none when one of them
+    /// would let a standing rule run anything (`sudo`, a shell such as `sh` at the end of
+    /// `curl ... | sh`, `eval`, `xargs`) or is a directory change (`cd /tmp`).
+    #[must_use]
+    pub fn project_rule_prefixes(&self) -> Vec<Vec<String>> {
+        let prefixes = self.approval_prefixes();
+        let unsafe_program = prefixes.iter().any(|prefix| {
+            let name = build_program_name(&prefix[0], self.dialect).to_ascii_lowercase();
+            is_directory_change(&name) || NO_STANDING_RULE_PROGRAMS.contains(&name.as_str())
+        });
+        if unsafe_program {
+            Vec::new()
+        } else {
+            prefixes
+        }
+    }
+
+    /// The words of each part that needs more than workspace-write, from the program
+    /// on, with the program spelled as [`build_program_name`] does.
+    fn asking_words(&self) -> Vec<Vec<String>> {
+        self.segments
+            .iter()
+            .filter(|segment| !segment.workspace_write)
+            .filter_map(|segment| {
+                // `CI=1 npm publish` is denied and matched as `npm publish`.
+                let start = if self.dialect == ShellDialect::Posix {
+                    segment
+                        .words
+                        .iter()
+                        .take_while(|word| is_assignment(word))
+                        .count()
+                } else {
+                    0
+                };
+                let mut words = segment.words.get(start..)?.to_vec();
+                words[0] = build_program_name(words.first()?, self.dialect);
+                Some(words)
+            })
+            .collect()
+    }
+}
+
+/// Programs a standing "always allow in this project" rule is never offered for: each
+/// runs whatever it is given, so a rule naming it would allow any command.
+const NO_STANDING_RULE_PROGRAMS: &[&str] = &[
+    "sudo",
+    "su",
+    "doas",
+    "runas",
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "ksh",
+    "fish",
+    "cmd",
+    "powershell",
+    "pwsh",
+    "eval",
+    "exec",
+    "env",
+    "xargs",
+    "nohup",
+    "command",
+    "builtin",
+    "source",
+    ".",
+    "invoke-expression",
+    "iex",
+    "start-process",
+];
+
+/// Whether `program` changes the working directory (`cd`, `pushd`, `Set-Location`).
+fn is_directory_change(program: &str) -> bool {
+    matches!(
+        program.to_ascii_lowercase().as_str(),
+        "cd" | "chdir"
+            | "pushd"
+            | "popd"
+            | "set-location"
+            | "sl"
+            | "push-location"
+            | "pop-location"
+    )
 }
 
 /// Renders a prefix for display and rule matching (`cargo test`).
@@ -4560,6 +4676,42 @@ mod tests {
         assert_read_only("cat <<'EOF'\n$(rm -rf /)\nEOF");
         assert_escalates("cat <<EOF\n$(rm -rf /)\nEOF");
         assert_escalates("cat <<EOF\nunterminated");
+    }
+
+    #[test]
+    fn denial_prefixes_cover_the_asking_parts_without_assignments_or_shim_suffixes() {
+        let rendered = |classification: &CommandClassification| {
+            classification
+                .denial_prefixes()
+                .iter()
+                .map(|prefix| render_prefix(prefix))
+                .collect::<Vec<_>>()
+        };
+        // Assignments and redirections do not hide the prefix, unlike approvals.
+        let publish = posix("CI=1 npm publish > publish.log");
+        assert!(publish.approval_prefixes().is_empty());
+        assert_eq!(rendered(&publish), vec!["npm publish"]);
+        assert_eq!(
+            rendered(&posix("sudo npm i -g x 2> err.log")),
+            vec!["sudo npm"]
+        );
+        // Only the parts that ask; a `cd` is never a prefix.
+        assert!(rendered(&posix("cd /tmp && npm install")).is_empty());
+        assert_eq!(
+            rendered(&posix("cargo test && git push origin main")),
+            vec!["git push"]
+        );
+
+        let push = vec!["git".to_string(), "push".to_string()];
+        assert!(posix("NO_COLOR=1 git push --force").denial_matches(&push));
+        assert!(posix("/usr/bin/git push").denial_matches(&push));
+        assert!(!posix("git status").denial_matches(&push));
+        let publish = vec!["npm".to_string(), "publish".to_string()];
+        assert!(posix("npm.cmd publish --tag next").denial_matches(&publish));
+        // In-workspace installs run unasked, so a denied prefix never matches them.
+        let install = vec!["npm".to_string(), "install".to_string()];
+        assert!(!posix("npm install vite").denial_matches(&install));
+        assert!(posix("npm install -g vite").denial_matches(&install));
     }
 
     #[test]
