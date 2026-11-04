@@ -41,6 +41,7 @@ import {
   type UiEvent,
   type UiEventType,
   type UsageAmounts,
+  type UsageWindow,
 } from '../protocol'
 
 const rustCrate = path.resolve(
@@ -223,6 +224,14 @@ const STRUCT_FIELDS: Record<string, string[]> = {
     'pricing_url',
     'usage_updated_at',
     'usage_error',
+    'window',
+  ]),
+  UsageWindow: fieldsOf<UsageWindow>()([
+    'limit_tokens',
+    'tokens',
+    'remaining_tokens',
+    'window_seconds',
+    'resets_at',
   ]),
   ErrorDetail: fieldsOf<ErrorDetail>()([
     'code',
@@ -295,6 +304,8 @@ const EVENT_FIELDS: { [T in UiEventType]: string[] } = {
     'account',
     'supports_images',
     'served_model',
+    'usage_window',
+    'request_tokens_estimate',
   ]),
   sign_in_code: eventFields('sign_in_code')([
     'url',

@@ -470,6 +470,7 @@ impl SignedOut<'_> {
             &account,
             true,
             None,
+            None,
         ));
     }
 
@@ -555,6 +556,7 @@ fn status_event(
     account: &AccountState,
     sign_in_required: bool,
     served_model: Option<&str>,
+    request_tokens_estimate: Option<usize>,
 ) -> UiEvent {
     let cwd = env::current_dir().unwrap_or_default();
     let shown = shown_model(model);
@@ -575,6 +577,10 @@ fn status_event(
             .map(shown_model)
             .filter(|served| *served != shown)
             .map(ToString::to_string),
+        usage_window: crate::plan_window::current()
+            .map(|window| engine_account::usage_window(&window)),
+        request_tokens_estimate: request_tokens_estimate
+            .map(|tokens| u64::try_from(tokens).unwrap_or(u64::MAX)),
     }
 }
 
@@ -1785,6 +1791,9 @@ impl Engine {
         if engine_account::apply_quota_headers(&self.account_cache) {
             self.send_account();
         }
+        if let Some(warning) = crate::plan_window::near_limit_notice() {
+            self.notice(&warning);
+        }
     }
 
     /// Runs `/<command> <args>` and ends it with [`UiEvent::TurnFinished`]. Commands that
@@ -1976,6 +1985,7 @@ impl Engine {
             &self.account,
             sign_in_required,
             self.cli.runtime.served_model(),
+            Some(self.cli.runtime.request_tokens_estimate()),
         );
         *lock(&self.shared.last_status) = Some(status.clone());
         self.send(status);

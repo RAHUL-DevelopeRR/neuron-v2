@@ -132,7 +132,7 @@ pub mod samples {
     use crate::protocol::{
         AccountDetails, ClientMessage, EngineCommand, ErrorDetail, GitStatus, HookPreview,
         McpServerPreview, ModelInfo, PermissionRulePreview, ReportLink, ReportSection,
-        SessionRunStatus, SessionScope, SessionSummary, UiEvent, UsageAmounts,
+        SessionRunStatus, SessionScope, SessionSummary, UiEvent, UsageAmounts, UsageWindow,
         CAPABILITY_QUESTIONS, CAPABILITY_REPORTS,
     };
 
@@ -257,6 +257,14 @@ pub mod samples {
             account: None,
             supports_images: Some(false),
             served_model: None,
+            usage_window: Some(UsageWindow {
+                limit_tokens: 1_000_000,
+                tokens: Some(640_000),
+                remaining_tokens: Some(360_000),
+                window_seconds: Some(18_000),
+                resets_at: Some("2026-10-24T14:20:00Z".into()),
+            }),
+            request_tokens_estimate: Some(6_200),
         }
     }
 
@@ -308,6 +316,7 @@ pub mod samples {
                 pricing_url: "https://zero-x.live/pricing".into(),
                 usage_updated_at: Some(1_792_800_000),
                 usage_error: None,
+                window: None,
             }),
         }
     }

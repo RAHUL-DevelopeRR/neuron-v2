@@ -374,6 +374,7 @@ pub(crate) fn build_runtime(
         progress_reporter,
         shared.state,
         shared.max_iterations_setting,
+        shared.working_set_setting,
     )?;
     Ok(BuiltRuntime {
         runtime: Some(runtime),
@@ -415,6 +416,7 @@ pub(crate) fn build_runtime_with_plugin_state(
         progress_reporter,
         runtime_plugin_state,
         None,
+        None,
     )?;
     Ok(BuiltRuntime::new(runtime, plugin_registry, mcp_state))
 }
@@ -433,6 +435,7 @@ fn assemble_conversation_runtime(
     progress_reporter: Option<InternalPromptProgressReporter>,
     runtime_plugin_state: RuntimePluginState,
     max_iterations_setting: Option<usize>,
+    working_set_setting: Option<usize>,
 ) -> Result<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
 {
     // The model the session runs on, kept in its metadata so a resumed session reports
@@ -501,6 +504,12 @@ fn assemble_conversation_runtime(
         progress_reporter,
     )?;
     api_client.set_summary_model(summary_model);
+    // The plan's token window: a smaller working set, and a question before a request
+    // would need more than the window has left (see `plan_window`).
+    let request_guard = crate::plan_window::WindowGuard::new(
+        api_client.uses_gateway(),
+        crate::plan_window::configured_working_set(working_set_setting),
+    );
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         api_client,
@@ -517,7 +526,8 @@ fn assemble_conversation_runtime(
     .with_context_manager(context_manager)
     .with_max_iterations(runtime::resolve_max_iterations(max_iterations_setting))
     .with_harness_config(harness)
-    .with_model_routing(routing);
+    .with_model_routing(routing)
+    .with_request_guard(Box::new(request_guard));
     if let Some(reviewer) = reviewer {
         runtime = runtime.with_change_reviewer(Box::new(reviewer));
     }
@@ -592,6 +602,16 @@ fn max_iterations_setting(runtime_config: &runtime::RuntimeConfig) -> Option<usi
         .and_then(|value| usize::try_from(value).ok())
 }
 
+/// Reads the `workingSetTokens` setting (`0` turns the working set off);
+/// `NEURON_WORKING_SET_TOKENS` overrides it (see `plan_window`).
+#[allow(clippy::redundant_closure_for_method_calls)]
+fn working_set_setting(runtime_config: &runtime::RuntimeConfig) -> Option<usize> {
+    runtime_config
+        .get("workingSetTokens")
+        .and_then(|value| value.as_i64())
+        .and_then(|value| usize::try_from(value).ok())
+}
+
 /// Identity of the configuration the shared plugin state was built from.
 /// Any change (settings files, MCP servers, installed or enabled plugins)
 /// triggers a rebuild on the next [`build_runtime`].
@@ -613,6 +633,7 @@ struct SharedRuntimePluginState {
     /// The MCP servers while they start in the background; `mcp_state` is a stand-in.
     background_mcp: Option<BackgroundMcp>,
     max_iterations_setting: Option<usize>,
+    working_set_setting: Option<usize>,
 }
 
 /// When the MCP servers start (see [`set_mcp_startup`]).
@@ -728,6 +749,7 @@ impl SharedRuntimePluginState {
                 mcp_state: self.mcp_state.clone(),
             },
             max_iterations_setting: self.max_iterations_setting,
+            working_set_setting: self.working_set_setting,
         }
     }
 
@@ -755,6 +777,7 @@ struct SharedPluginStateHandle {
     generation: u64,
     state: RuntimePluginState,
     max_iterations_setting: Option<usize>,
+    working_set_setting: Option<usize>,
 }
 
 thread_local! {
@@ -813,6 +836,7 @@ fn shared_runtime_plugin_state_starting(
             mcp_state: state.mcp_state,
             background_mcp,
             max_iterations_setting: max_iterations_setting(&runtime_config),
+            working_set_setting: working_set_setting(&runtime_config),
         };
         let handle = shared.handle();
         *slot.borrow_mut() = Some(shared);

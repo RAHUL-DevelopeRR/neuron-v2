@@ -4419,6 +4419,10 @@ fn run_agent_job(job: &AgentJob, cancel: &runtime::CancellationToken) -> Result<
             "sub-agent stopped: {}",
             runtime::refusal_line(note.as_deref())
         )),
+        runtime::TurnOutcome::BudgetStopped { .. } => Err(
+            "sub-agent stopped: the plan's token window does not cover its next request"
+                .to_string(),
+        ),
         runtime::TurnOutcome::Completed | runtime::TurnOutcome::OutputTruncated => {
             persist_agent_terminal_state(
                 &job.manifest,

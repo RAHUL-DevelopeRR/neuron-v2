@@ -338,6 +338,30 @@ pub struct AccountDetails {
     pub usage_updated_at: Option<u64>,
     /// Why the plan and usage could not be read, when they could not.
     pub usage_error: Option<String>,
+    /// The plan's rolling token window (Free), which refuses requests before the daily
+    /// figures do; `None` for a plan without one, before the account is read, and from
+    /// older engines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<UsageWindow>,
+}
+
+/// A plan's rolling token window: at most `limit_tokens` tokens in any `window_seconds`
+/// (Free: 1,000,000 every 5 hours), as the gateway's `usage_window` reports it, kept
+/// current from the quota headers of each reply.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageWindow {
+    pub limit_tokens: u64,
+    /// Tokens counted in the window now; `None` when not known yet.
+    #[serde(default)]
+    pub tokens: Option<u64>,
+    /// What the window still allows; `None` when not known yet.
+    #[serde(default)]
+    pub remaining_tokens: Option<u64>,
+    #[serde(default)]
+    pub window_seconds: Option<u64>,
+    /// When enough of the window frees up (ISO 8601, UTC); `None` while nothing counts.
+    #[serde(default)]
+    pub resets_at: Option<String>,
 }
 
 /// What a failed request needs from the user, for a UI to offer the way out: sign in
@@ -524,6 +548,17 @@ pub enum UiEvent {
         /// answer, from providers that do not name the model, and from older engines.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         served_model: Option<String>,
+        /// The plan's token window as it stands now (Free), for the footer's
+        /// "Free 640K/1M · resets 14:20"; `None` for a plan without one, before it is
+        /// known, and from older engines.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage_window: Option<UsageWindow>,
+        /// Estimated input tokens of each model request the next turn sends (system
+        /// prompt, tool definitions and the conversation); a turn sends one request per
+        /// step, so a long agent task spends this many times over. `None` from older
+        /// engines.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_tokens_estimate: Option<u64>,
     },
     /// After a sign-in from the signed-out start: the engine is opening the session
     /// (plugins, MCP servers), which can take a while. `TurnFinished` and a `Status` with
@@ -1077,6 +1112,8 @@ mod tests {
                 sign_in_required: false,
                 account: None,
                 served_model: None,
+                usage_window: None,
+                request_tokens_estimate: None,
                 ..
             }
         ));

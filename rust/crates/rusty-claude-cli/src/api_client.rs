@@ -541,6 +541,11 @@ pub(crate) fn prompt_cache_key(session_id: &str) -> String {
 }
 
 impl AnthropicRuntimeClient {
+    /// The requests go to the Zero-X gateway.
+    pub(crate) fn uses_gateway(&self) -> bool {
+        is_gateway_client(&self.client)
+    }
+
     pub fn new(
         session_id: &str,
         model: String,

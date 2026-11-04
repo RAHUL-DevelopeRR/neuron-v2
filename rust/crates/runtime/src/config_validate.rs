@@ -218,6 +218,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         expected: FieldType::Number,
     },
     FieldSpec {
+        name: "workingSetTokens",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
         name: "redactSecrets",
         expected: FieldType::Bool,
     },
@@ -858,7 +862,7 @@ mod tests {
 
     #[test]
     fn accepts_provider_and_max_iterations_and_type_checks_them() {
-        let source = r#"{"provider": "openai", "maxIterations": 12}"#;
+        let source = r#"{"provider": "openai", "maxIterations": 12, "workingSetTokens": 40000}"#;
         let parsed = JsonValue::parse(source).expect("valid json");
         let object = parsed.as_object().expect("object");
         let result = validate_config_file(object, source, &test_path());

@@ -13,6 +13,13 @@
 //! 3. Is a single tool result too large to insert at all? Every tool result is
 //!    capped at insertion time ([`DEFAULT_MAX_TOOL_RESULT_CHARS`]).
 //!
+//! A plan that counts tokens in a small rolling window (Free) sets a working set
+//! ([`ContextPolicy::working_set_tokens`]): the transcript budget shrinks to it,
+//! and once the transcript fills [`WORKING_SET_STUB_PERCENT`] of it, tool results
+//! older than the most recent few are replaced by short stubs. Every model request
+//! re-sends the whole transcript, so this is what keeps a long agent task from
+//! spending the window.
+//!
 //! Token counts are heuristic estimates. They are deliberately conservative
 //! for non-ASCII text (one token per character) and never split a UTF-8
 //! sequence when truncating.
@@ -37,6 +44,14 @@ pub const MIN_COMPACTION_BUDGET_TOKENS: usize = 2_048;
 /// Bounds for the summary written by automatic compaction (20% of the budget).
 const MIN_SUMMARY_TOKENS: usize = 800;
 const MAX_SUMMARY_TOKENS: usize = 8_000;
+/// Share of the working set at which older tool results become stubs.
+pub const WORKING_SET_STUB_PERCENT: usize = 50;
+/// Tool results at most this long are never stubbed: the stub would save little.
+pub const MIN_STUBBED_TOOL_RESULT_CHARS: usize = 600;
+/// Characters of the original output a stub keeps, to remind the model what it was.
+const STUB_HEAD_CHARS: usize = 160;
+/// How a stubbed tool result starts ([`stub_tool_results`]).
+pub const STUBBED_TOOL_RESULT_PREFIX: &str = "[Earlier output of ";
 /// Environment variable overriding the per-result insertion cap.
 pub const MAX_TOOL_RESULT_CHARS_ENV_VAR: &str = "NEURON_MAX_TOOL_RESULT_CHARS";
 
@@ -232,6 +247,10 @@ pub struct ContextPolicy {
     /// Explicit compaction threshold in estimated transcript tokens. When set
     /// it replaces the percentage-based threshold.
     pub threshold_override_tokens: Option<usize>,
+    /// A transcript budget smaller than the model's, for a plan with a small
+    /// token window: the input budget is capped at it, and older tool results
+    /// become stubs early (see the module docs).
+    pub working_set_tokens: Option<usize>,
 }
 
 impl Default for ContextPolicy {
@@ -243,6 +262,7 @@ impl Default for ContextPolicy {
             pruned_tool_result_chars: DEFAULT_PRUNED_TOOL_RESULT_CHARS,
             keep_recent_tool_results: DEFAULT_KEEP_RECENT_TOOL_RESULTS,
             threshold_override_tokens: None,
+            working_set_tokens: None,
         }
     }
 }
@@ -274,6 +294,15 @@ pub struct ContextSnapshot {
 }
 
 impl ContextSnapshot {
+    /// Estimated input tokens of a request: the system prompt, the tool
+    /// definitions and the transcript.
+    #[must_use]
+    pub fn request_input_tokens(&self) -> usize {
+        self.estimated_tokens
+            .saturating_add(self.system_prompt_tokens)
+            .saturating_add(self.budget.tool_schema_tokens)
+    }
+
     /// Percentage of the input budget currently used (saturating at 999).
     #[must_use]
     pub fn used_percent(&self) -> usize {
@@ -330,6 +359,12 @@ impl ContextManager {
         self.policy.threshold_override_tokens = threshold_tokens;
     }
 
+    /// Sets (or with `None` clears) the working set
+    /// ([`ContextPolicy::working_set_tokens`]).
+    pub fn set_working_set_tokens(&mut self, working_set_tokens: Option<usize>) {
+        self.policy.working_set_tokens = working_set_tokens.filter(|tokens| *tokens > 0);
+    }
+
     /// Token count at which pruning/compaction starts for `input_budget`.
     #[must_use]
     pub fn threshold_tokens(&self, input_budget: usize) -> usize {
@@ -345,7 +380,11 @@ impl ContextManager {
         system_prompt: &[String],
     ) -> ContextSnapshot {
         let system_prompt_tokens = estimate_system_prompt_tokens(system_prompt);
-        let input_budget = self.budget.input_budget(system_prompt_tokens);
+        let model_budget = self.budget.input_budget(system_prompt_tokens);
+        let input_budget = self
+            .policy
+            .working_set_tokens
+            .map_or(model_budget, |working_set| model_budget.min(working_set));
         ContextSnapshot {
             estimated_tokens: estimate_messages_tokens(messages),
             system_prompt_tokens,
@@ -376,10 +415,29 @@ impl ContextManager {
         )
     }
 
-    /// Makes `session` fit the budget for the next request: prune old tool
-    /// results at the threshold, compact if that is not enough, and as a last
-    /// resort shorten even the most recent tool results when the transcript
-    /// still exceeds the hard input budget.
+    /// Replaces tool results older than the most recent
+    /// [`ContextPolicy::keep_recent_tool_results`] with stubs, once the
+    /// transcript fills [`WORKING_SET_STUB_PERCENT`] of the working set. Does
+    /// nothing without a working set. Returns how many results became stubs.
+    pub fn stub_old_tool_results(&self, messages: &mut [ConversationMessage]) -> usize {
+        let Some(working_set) = self.policy.working_set_tokens else {
+            return 0;
+        };
+        if estimate_messages_tokens(messages) < working_set * WORKING_SET_STUB_PERCENT / 100 {
+            return 0;
+        }
+        stub_tool_results(
+            messages,
+            self.policy.keep_recent_tool_results,
+            MIN_STUBBED_TOOL_RESULT_CHARS,
+        )
+    }
+
+    /// Makes `session` fit the budget for the next request: with a working set,
+    /// stub old tool results early; prune old tool results at the threshold,
+    /// compact if that is not enough, and as a last resort shorten even the most
+    /// recent tool results when the transcript still exceeds the hard input
+    /// budget.
     pub fn prepare_session(
         &self,
         session: &mut Session,
@@ -391,12 +449,19 @@ impl ContextManager {
             tokens_after: snapshot.estimated_tokens,
             ..ContextPreparation::default()
         };
-        if snapshot.estimated_tokens < snapshot.threshold_tokens {
+        preparation.pruned_tool_results = self.stub_old_tool_results(&mut session.messages);
+        let mut tokens = if preparation.pruned_tool_results > 0 {
+            estimate_messages_tokens(&session.messages)
+        } else {
+            snapshot.estimated_tokens
+        };
+        preparation.tokens_after = tokens;
+        if tokens < snapshot.threshold_tokens {
             return preparation;
         }
 
-        preparation.pruned_tool_results = self.prune_old_tool_results(&mut session.messages);
-        let mut tokens = estimate_messages_tokens(&session.messages);
+        preparation.pruned_tool_results += self.prune_old_tool_results(&mut session.messages);
+        tokens = estimate_messages_tokens(&session.messages);
 
         let can_compact = self.policy.threshold_override_tokens.is_some()
             || snapshot.input_budget >= MIN_COMPACTION_BUDGET_TOKENS;
@@ -480,6 +545,50 @@ impl ContextManager {
     }
 }
 
+/// Replaces every tool result except the `keep_recent` most recent ones, and
+/// those of at most `min_chars` characters, with a stub that names the tool,
+/// says how long the output was and keeps its start. Stubs are left alone, so
+/// stubbing is idempotent. Returns how many results became stubs.
+pub fn stub_tool_results(
+    messages: &mut [ConversationMessage],
+    keep_recent: usize,
+    min_chars: usize,
+) -> usize {
+    let total_results = messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .filter(|block| matches!(block, ContentBlock::ToolResult { .. }))
+        .count();
+    let stubbable = total_results.saturating_sub(keep_recent);
+    let mut seen = 0;
+    let mut stubbed = 0;
+    for message in messages.iter_mut() {
+        for block in &mut message.blocks {
+            let ContentBlock::ToolResult {
+                tool_name, output, ..
+            } = block
+            else {
+                continue;
+            };
+            if seen >= stubbable {
+                return stubbed;
+            }
+            seen += 1;
+            let chars = output.chars().count();
+            if chars <= min_chars || output.starts_with(STUBBED_TOOL_RESULT_PREFIX) {
+                continue;
+            }
+            let head = output.chars().take(STUB_HEAD_CHARS).collect::<String>();
+            *output = format!(
+                "{STUBBED_TOOL_RESULT_PREFIX}{tool_name} removed to save tokens ({chars} chars); run it again if you need it. It began:]\n{}\u{2026}",
+                head.trim_end()
+            );
+            stubbed += 1;
+        }
+    }
+    stubbed
+}
+
 /// Shortens every tool result except the `keep_recent` most recent ones to at
 /// most `max_chars` characters. Results already within the limit are left
 /// alone, so pruning is idempotent.
@@ -518,8 +627,9 @@ pub fn prune_tool_results(
 mod tests {
     use super::{
         estimate_messages_tokens, estimate_text_tokens, omission_marker, prune_tool_results,
-        truncate_head_tail, ContextBudget, ContextManager, ContextPolicy, TextTokenEstimate,
-        ASCII_CHARS_PER_TOKEN, DEFAULT_MAX_TOOL_RESULT_CHARS,
+        stub_tool_results, truncate_head_tail, ContextBudget, ContextManager, ContextPolicy,
+        TextTokenEstimate, ASCII_CHARS_PER_TOKEN, DEFAULT_MAX_TOOL_RESULT_CHARS,
+        STUBBED_TOOL_RESULT_PREFIX,
     };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
@@ -743,6 +853,112 @@ mod tests {
         assert_eq!(session.messages[0].role, MessageRole::System);
         assert!(preparation.tokens_after < manager.threshold_tokens(18_000));
         assert!(session.compaction.is_some());
+    }
+
+    fn output(message: &ConversationMessage) -> &str {
+        match &message.blocks[0] {
+            ContentBlock::ToolResult { output, .. } => output,
+            other => panic!("a tool result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stubs_keep_the_tool_name_size_and_start_and_are_idempotent() {
+        let long = format!("first line\n{}", "x".repeat(2_000));
+        let mut messages = vec![
+            ConversationMessage::tool_result("a", "read_file", long.clone(), false),
+            ConversationMessage::tool_result("b", "bash", "short", false),
+            ConversationMessage::tool_result("c", "grep_search", long.clone(), false),
+        ];
+        assert_eq!(stub_tool_results(&mut messages, 1, 600), 1);
+        let stub = output(&messages[0]);
+        assert!(stub.starts_with(STUBBED_TOOL_RESULT_PREFIX), "{stub}");
+        assert!(
+            stub.starts_with("[Earlier output of read_file removed to save tokens (2011 chars)"),
+            "{stub}"
+        );
+        assert!(stub.contains("\nfirst line\n"), "{stub}");
+        assert!(stub.chars().count() < 300, "{stub}");
+        assert_eq!(output(&messages[1]), "short", "too short to stub");
+        assert_eq!(output(&messages[2]), long, "the most recent stays whole");
+        let stubbed = output(&messages[0]).to_string();
+        assert_eq!(
+            stub_tool_results(&mut messages[..1], 0, 0),
+            0,
+            "a stub stays a stub"
+        );
+        assert_eq!(output(&messages[0]), stubbed);
+    }
+
+    #[test]
+    fn a_working_set_caps_the_budget_and_stubs_from_half_of_it() {
+        let mut manager = ContextManager::new(
+            ContextBudget::default(),
+            ContextPolicy {
+                keep_recent_tool_results: 1,
+                ..ContextPolicy::default()
+            },
+        );
+        let model_budget = manager.snapshot(&[], &[]).input_budget;
+        manager.set_working_set_tokens(Some(4_000));
+        let snapshot = manager.snapshot(&[], &[]);
+        assert_eq!(snapshot.input_budget, 4_000.min(model_budget));
+        assert_eq!(snapshot.threshold_tokens, 3_200);
+
+        let mut session = Session::new();
+        // About 1,000 tokens each: below half the working set after one, above after two.
+        session.messages = vec![ConversationMessage::tool_result(
+            "a",
+            "read_file",
+            "a".repeat(3_000),
+            false,
+        )];
+        assert_eq!(
+            manager
+                .prepare_session(&mut session, &[])
+                .pruned_tool_results,
+            0
+        );
+        session.messages.push(ConversationMessage::tool_result(
+            "b",
+            "read_file",
+            "b".repeat(3_000),
+            false,
+        ));
+        session.messages.push(ConversationMessage::tool_result(
+            "c",
+            "read_file",
+            "c".repeat(3_000),
+            false,
+        ));
+        let preparation = manager.prepare_session(&mut session, &[]);
+        assert_eq!(preparation.pruned_tool_results, 2);
+        assert_eq!(preparation.compacted_messages, 0);
+        assert!(preparation.tokens_after < preparation.tokens_before / 2);
+        assert!(output(&session.messages[1]).starts_with(STUBBED_TOOL_RESULT_PREFIX));
+        assert_eq!(output(&session.messages[2]).len(), 3_000);
+
+        // `None` (and 0) go back to the model budget, with nothing stubbed early.
+        manager.set_working_set_tokens(Some(0));
+        assert_eq!(manager.policy().working_set_tokens, None);
+        assert_eq!(manager.snapshot(&[], &[]).input_budget, model_budget);
+    }
+
+    #[test]
+    fn a_request_counts_system_prompt_and_tools_with_the_transcript() {
+        let manager = ContextManager::new(
+            ContextBudget {
+                tool_schema_tokens: 500,
+                ..ContextBudget::default()
+            },
+            ContextPolicy::default(),
+        );
+        let messages = vec![ConversationMessage::user_text("x".repeat(300))];
+        let snapshot = manager.snapshot(&messages, &["y".repeat(30)]);
+        assert_eq!(
+            snapshot.request_input_tokens(),
+            snapshot.estimated_tokens + snapshot.system_prompt_tokens + 500
+        );
     }
 
     #[test]

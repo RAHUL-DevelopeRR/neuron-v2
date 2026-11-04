@@ -393,6 +393,7 @@ fn login_with_token(input: &mut dyn BufRead, prompt: bool) -> io::Result<Gateway
 /// every local copy. Always succeeds; problems are reported as warnings.
 pub fn logout() {
     sign_out();
+    crate::plan_window::forget();
     // Stdout on the terminal; a UI that took over notices (and may own stdout) hears it.
     if runtime::ui_hooks::notice_handler_installed() {
         runtime::ui_hooks::notice("Signed out of Zero-X.");

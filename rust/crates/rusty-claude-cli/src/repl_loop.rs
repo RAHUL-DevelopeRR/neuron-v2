@@ -224,6 +224,7 @@ pub(crate) fn turn_outcome_label(outcome: &TurnOutcome) -> &'static str {
         TurnOutcome::LoopDetected { .. } => "loop_detected",
         TurnOutcome::OutputTruncated => "output_truncated",
         TurnOutcome::Refused { .. } => "refused",
+        TurnOutcome::BudgetStopped { .. } => "budget_stopped",
     }
 }
 
@@ -322,6 +323,10 @@ fn outcome_notes(summary: &TurnSummary, hint: QuitHint) -> Vec<String> {
             "Note: the response was cut off at the output token limit even after one automatic continuation. Ask the model to continue or to work in smaller steps."
                 .to_string(),
         ),
+        TurnOutcome::BudgetStopped { estimated_tokens } => notes.push(format!(
+            "Stopped before sending a request of about {} tokens: your plan's token window does not have that many left. /compact makes the conversation smaller; /usage shows when the window frees up.",
+            crate::account::short_tokens(u64::try_from(*estimated_tokens).unwrap_or(u64::MAX))
+        )),
     }
     if summary.pruned_tool_results > 0 {
         notes.push(format!(
@@ -401,6 +406,12 @@ pub(crate) fn launch(options: ReplLaunch) -> Result<(), Box<dyn std::error::Erro
         None => LiveCli::new(resolved_model, true, options.allowed_tools, permission_mode)?,
     };
     cli.set_reasoning_effort(options.reasoning_effort);
+    // The plan's token window, for `/status` and the guard before the first reply.
+    if crate::provider::active_provider()
+        .is_some_and(|active| active.id == crate::provider::ProviderId::ZeroX)
+    {
+        crate::plan_window::read_in_background();
+    }
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     println!();
@@ -1026,6 +1037,21 @@ mod tests {
         .expect("notice");
         assert!(looped.contains("`bash` 4 times"));
         assert!(looped.contains("shortened 1 older tool result(s)"));
+    }
+
+    #[test]
+    fn a_turn_stopped_for_the_token_window_says_what_to_do() {
+        let stopped = summary(
+            TurnOutcome::BudgetStopped {
+                estimated_tokens: 45_300,
+            },
+            0,
+        );
+        assert_eq!(turn_outcome_label(&stopped.outcome), "budget_stopped");
+        assert_eq!(
+            describe_turn_outcome(&stopped, QuitHint::Shown).as_deref(),
+            Some("Stopped before sending a request of about 45K tokens: your plan's token window does not have that many left. /compact makes the conversation smaller; /usage shows when the window frees up.")
+        );
     }
 
     #[test]

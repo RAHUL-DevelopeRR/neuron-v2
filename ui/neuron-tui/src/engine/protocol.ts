@@ -309,6 +309,28 @@ export interface AccountDetails {
   usage_updated_at: number | null
   /** Why the plan and usage could not be read, when they could not. */
   usage_error: string | null
+  /**
+   * The plan's rolling token window (Free), which refuses requests before the
+   * daily figures do. Absent for a plan without one, before the account is
+   * read, and from older engines.
+   */
+  window?: UsageWindow | null
+}
+
+/**
+ * A plan's rolling token window: at most `limit_tokens` tokens in any
+ * `window_seconds` (Free: 1,000,000 every 5 hours), kept current from the
+ * quota headers of each reply.
+ */
+export interface UsageWindow {
+  limit_tokens: number
+  /** Tokens counted in the window now; `null` when not known yet. */
+  tokens: number | null
+  /** What the window still allows; `null` when not known yet. */
+  remaining_tokens: number | null
+  window_seconds: number | null
+  /** When enough of the window frees up (ISO 8601, UTC). */
+  resets_at: string | null
 }
 
 /**
@@ -457,6 +479,18 @@ export interface StatusEvent {
    * answer, for providers that do not name it, and from older engines.
    */
   served_model?: string | null
+  /**
+   * The plan's token window as it stands now (Free), for a footer such as
+   * "Free 640K/1M · resets 14:20". Absent for a plan without one, before it is
+   * known, and from older engines.
+   */
+  usage_window?: UsageWindow | null
+  /**
+   * Estimated input tokens of each model request the next turn sends (system
+   * prompt, tool definitions and the conversation). A turn sends one request
+   * per step. Absent from older engines.
+   */
+  request_tokens_estimate?: number | null
 }
 
 /**

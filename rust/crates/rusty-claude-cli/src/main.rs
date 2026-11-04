@@ -70,6 +70,7 @@ mod mcp_auth;
 mod model_routing;
 mod orchestrator;
 mod plan_mode;
+mod plan_window;
 mod progress;
 mod provider;
 mod quota;
@@ -3208,7 +3209,8 @@ impl LiveCli {
                     runtime::TurnOutcome::Cancelled { .. } => {
                         spinner.fail("Interrupted", theme, &mut stdout)?;
                     }
-                    runtime::TurnOutcome::LoopDetected { .. } => {
+                    runtime::TurnOutcome::LoopDetected { .. }
+                    | runtime::TurnOutcome::BudgetStopped { .. } => {
                         spinner.fail("Stopped", theme, &mut stdout)?;
                     }
                     // Not a reply: the line below says why.
@@ -3237,6 +3239,9 @@ impl LiveCli {
                     repl_loop::describe_turn_outcome(&summary, hint).filter(|_| !stopped_by_denials)
                 {
                     println!("{notice}");
+                }
+                if let Some(warning) = crate::plan_window::near_limit_notice() {
+                    println!("{warning}");
                 }
                 persisted?;
                 Ok(())
@@ -3663,7 +3668,7 @@ impl LiveCli {
     fn status_report(&self) -> String {
         let cumulative = self.runtime.usage().cumulative_usage();
         let latest = self.runtime.usage().current_turn_usage();
-        format_status_report(
+        let report = format_status_report(
             &self.model,
             StatusUsage {
                 message_count: self.runtime.session().messages.len(),
@@ -3674,7 +3679,13 @@ impl LiveCli {
             },
             self.permission_mode.as_str(),
             &status_context(Some(&self.session.path)).expect("status context should load"),
-        )
+        );
+        let plan = crate::plan_window::status_section(
+            crate::plan_window::current().as_ref(),
+            self.runtime.request_tokens_estimate(),
+            self.runtime.context_manager().policy().working_set_tokens,
+        );
+        format!("{report}\n\n{plan}")
     }
 
     fn record_prompt_history(&mut self, prompt: &str) {

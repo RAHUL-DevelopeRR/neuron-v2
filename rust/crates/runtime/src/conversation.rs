@@ -446,7 +446,43 @@ pub enum TurnOutcome {
         note: Option<String>,
         skipped_tool_calls: usize,
     },
+    /// The [`RequestGuard`] stopped the turn before a model request of about
+    /// `estimated_tokens` input tokens (the plan's token window would not cover
+    /// it, and the user chose to stop). Nothing was sent.
+    BudgetStopped { estimated_tokens: usize },
 }
+
+/// A model request about to be sent, as a [`RequestGuard`] sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestEstimate {
+    /// Estimated input tokens: the system prompt, the tool definitions and the
+    /// conversation.
+    pub input_tokens: usize,
+    /// Output tokens the request asks for (`max_tokens`).
+    pub output_reserve: usize,
+    /// The request's step in the turn, from 1.
+    pub iteration: usize,
+}
+
+/// Looks at every model request before it is sent: the plan's token allowance as
+/// the conversation sees it. A plan with a small rolling token window (Free) keeps
+/// a smaller working set ([`ContextPolicy::working_set_tokens`]) and is asked
+/// before a request would spend more than the window has left.
+pub trait RequestGuard: Send {
+    /// The transcript budget the plan calls for now, in place of the model's own
+    /// when smaller; `None` for the model's own.
+    fn working_set_tokens(&self) -> Option<usize> {
+        None
+    }
+
+    /// Whether to send `request`; `false` stops the turn with
+    /// [`TurnOutcome::BudgetStopped`]. The guard may ask the user first.
+    fn allow_request(&mut self, request: &RequestEstimate) -> bool;
+}
+
+/// The assistant note that closes a turn the [`RequestGuard`] stopped.
+pub const BUDGET_STOPPED_NOTE: &str =
+    "[Stopped before the next model request: it would have needed more tokens than the plan's token window had left, and the user chose to stop.]";
 
 /// Summary of one completed runtime turn, including tool results and usage.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -524,6 +560,8 @@ pub struct ConversationRuntime<C, T> {
     routing: ModelRouting,
     /// A model the client was switched to for the current turn.
     model_override: Option<String>,
+    /// Looks at each model request before it is sent (see [`RequestGuard`]).
+    request_guard: Option<Box<dyn RequestGuard>>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -586,7 +624,27 @@ where
             turn_request: String::new(),
             routing: ModelRouting::default(),
             model_override: None,
+            request_guard: None,
         }
+    }
+
+    /// Has `guard` look at every model request before it is sent (see
+    /// [`RequestGuard`]).
+    #[must_use]
+    pub fn with_request_guard(mut self, guard: Box<dyn RequestGuard>) -> Self {
+        self.request_guard = Some(guard);
+        self
+    }
+
+    pub fn set_request_guard(&mut self, guard: Option<Box<dyn RequestGuard>>) {
+        self.request_guard = guard;
+    }
+
+    /// Estimated input tokens of the next model request: the system prompt, the
+    /// tool definitions and the conversation.
+    #[must_use]
+    pub fn request_tokens_estimate(&self) -> usize {
+        self.context_snapshot().request_input_tokens()
     }
 
     /// How the conversation may move between models within a turn (see
@@ -886,6 +944,11 @@ where
             }
 
             self.prepare_context(&mut progress)?;
+            if let Some(estimated_tokens) = self.guard_stops_request(progress.iterations) {
+                return Ok(
+                    self.finish_turn(progress, TurnOutcome::BudgetStopped { estimated_tokens })
+                );
+            }
 
             let request = ApiRequest {
                 system_prompt: self.system_prompt.clone(),
@@ -1361,8 +1424,12 @@ where
     }
 
     /// Checks the context budget before a model call and prunes or compacts
-    /// the session when needed.
+    /// the session when needed. The [`RequestGuard`]'s working set applies.
     fn prepare_context(&mut self, progress: &mut TurnProgress) -> Result<(), RuntimeError> {
+        if let Some(guard) = &self.request_guard {
+            self.context_manager
+                .set_working_set_tokens(guard.working_set_tokens());
+        }
         let preparation = self
             .context_manager
             .prepare_session(&mut self.session, &self.system_prompt);
@@ -1374,6 +1441,20 @@ where
         progress.compacted_messages += preparation.compacted_messages;
         self.record_context_prepared(progress.iterations, &preparation);
         self.session.persist_snapshot().map_err(session_error)
+    }
+
+    /// Asks the [`RequestGuard`] about the request step `iteration` is about to
+    /// send; `Some` with its estimated input tokens when the guard stops it.
+    fn guard_stops_request(&mut self, iteration: usize) -> Option<usize> {
+        self.request_guard.as_ref()?;
+        let snapshot = self.context_snapshot();
+        let request = RequestEstimate {
+            input_tokens: snapshot.request_input_tokens(),
+            output_reserve: snapshot.budget.output_reserve,
+            iteration,
+        };
+        let guard = self.request_guard.as_mut()?;
+        (!guard.allow_request(&request)).then_some(request.input_tokens)
     }
 
     /// Shrinks the session after the provider reported a context overflow.
@@ -1725,8 +1806,14 @@ where
             // Best effort: a read-only or full disk must not fail the turn.
             let _ = store.record(&model, &progress.stats);
         }
-        if matches!(outcome, TurnOutcome::Cancelled { .. }) {
-            self.close_turn_with_note(INTERRUPTED_RESPONSE_NOTE.to_string(), None);
+        match outcome {
+            TurnOutcome::Cancelled { .. } => {
+                self.close_turn_with_note(INTERRUPTED_RESPONSE_NOTE.to_string(), None);
+            }
+            TurnOutcome::BudgetStopped { .. } => {
+                self.close_turn_with_note(BUDGET_STOPPED_NOTE.to_string(), None);
+            }
+            _ => {}
         }
         let summary = TurnSummary {
             assistant_messages: progress.assistant_messages,
@@ -2098,11 +2185,12 @@ pub fn is_refusal_stop_reason(stop_reason: Option<&str>) -> bool {
     })
 }
 
-/// Whether `text` is a note the runtime wrote to close an interrupted or failed
-/// turn, not model output.
+/// Whether `text` is a note the runtime wrote to close an interrupted, stopped or
+/// failed turn, not model output.
 #[must_use]
 pub fn is_turn_end_note(text: &str) -> bool {
     text == INTERRUPTED_RESPONSE_NOTE
+        || text == BUDGET_STOPPED_NOTE
         || (text.starts_with(FAILED_RESPONSE_NOTE_PREFIX) && text.ends_with(']'))
 }
 
@@ -3841,10 +3929,10 @@ mod tests {
 mod resilience_tests {
     use super::{
         is_turn_end_note, parse_max_iterations, ApiClient, ApiRequest, AssistantEvent,
-        AutoCompactionEvent, ConversationRuntime, RuntimeError, RuntimeErrorKind,
-        StaticToolExecutor, ToolExecutor, TurnOutcome, DEFAULT_MAX_ITERATIONS,
-        FAILED_RESPONSE_NOTE_PREFIX, INTERRUPTED_RESPONSE_NOTE, INTERRUPTED_TOOL_RESULT,
-        MAX_ITERATIONS_ENV_VAR, REFUSAL_STOP_REASON,
+        AutoCompactionEvent, ConversationRuntime, RequestEstimate, RequestGuard, RuntimeError,
+        RuntimeErrorKind, StaticToolExecutor, ToolExecutor, TurnOutcome, BUDGET_STOPPED_NOTE,
+        DEFAULT_MAX_ITERATIONS, FAILED_RESPONSE_NOTE_PREFIX, INTERRUPTED_RESPONSE_NOTE,
+        INTERRUPTED_TOOL_RESULT, MAX_ITERATIONS_ENV_VAR, REFUSAL_STOP_REASON,
     };
     use crate::cancel::CancellationToken;
     use crate::compact::AUTO_CONTINUE_PREFIX;
@@ -5373,6 +5461,137 @@ mod resilience_tests {
         assert!(output.chars().count() <= 40_000);
         assert!(output.starts_with("start") && output.ends_with("end"));
         assert!(output.contains("chars omitted"));
+    }
+
+    /// A [`RequestGuard`] for tests: a fixed working set, and the requests it saw;
+    /// it stops the request of step `stop_at`.
+    struct TestGuard {
+        working_set: Option<usize>,
+        stop_at: Option<usize>,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<RequestEstimate>>>,
+    }
+
+    impl RequestGuard for TestGuard {
+        fn working_set_tokens(&self) -> Option<usize> {
+            self.working_set
+        }
+
+        fn allow_request(&mut self, request: &RequestEstimate) -> bool {
+            self.seen.lock().expect("seen").push(*request);
+            self.stop_at != Some(request.iteration)
+        }
+    }
+
+    fn read_twice_then_answer() -> ScriptedApi {
+        ScriptedApi::new(vec![
+            Ok(vec![
+                tool_call("a", "read_file", r#"{"path":"a"}"#),
+                AssistantEvent::MessageStop,
+            ]),
+            Ok(vec![
+                tool_call("b", "read_file", r#"{"path":"b"}"#),
+                AssistantEvent::MessageStop,
+            ]),
+            Ok(vec![text("done"), AssistantEvent::MessageStop]),
+        ])
+    }
+
+    #[test]
+    fn a_guard_working_set_stubs_older_tool_results_early() {
+        let tools = StaticToolExecutor::new().register("read_file", |_| Ok("z".repeat(3_000)));
+        let manager = ContextManager::new(
+            ContextBudget::default(),
+            ContextPolicy {
+                keep_recent_tool_results: 1,
+                ..ContextPolicy::default()
+            },
+        );
+        let seen = std::sync::Arc::default();
+        let mut runtime = runtime_with(Session::new(), read_twice_then_answer(), tools)
+            .with_context_manager(manager)
+            .with_request_guard(Box::new(TestGuard {
+                working_set: Some(2_000),
+                stop_at: None,
+                seen: std::sync::Arc::clone(&seen),
+            }));
+
+        let summary = runtime.run_turn("read both", None).expect("turn completes");
+
+        assert_eq!(summary.outcome, TurnOutcome::Completed);
+        assert_eq!(summary.pruned_tool_results, 1);
+        assert_eq!(summary.auto_compaction, None::<AutoCompactionEvent>);
+        let outputs = runtime.api_client().requests[2]
+            .messages
+            .iter()
+            .flat_map(|message| message.blocks.iter())
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { output, .. } => Some(output.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            outputs[0]
+                .starts_with("[Earlier output of read_file removed to save tokens (3000 chars)"),
+            "{}",
+            outputs[0]
+        );
+        assert_eq!(
+            outputs[1].len(),
+            3_000,
+            "the most recent result stays whole"
+        );
+        // Without the working set the model budget (100K+) would leave both alone.
+        assert_eq!(
+            runtime.context_manager().policy().working_set_tokens,
+            Some(2_000)
+        );
+        assert!(runtime.context_snapshot().input_budget <= 2_000);
+        let seen = seen.lock().expect("seen");
+        assert_eq!(
+            seen.iter()
+                .map(|request| request.iteration)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert!(seen[1].input_tokens > seen[0].input_tokens);
+    }
+
+    #[test]
+    fn a_guard_that_stops_a_request_ends_the_turn_before_it_is_sent() {
+        let tools = StaticToolExecutor::new().register("read_file", |_| Ok("z".repeat(3_000)));
+        let seen = std::sync::Arc::default();
+        let mut runtime = runtime_with(Session::new(), read_twice_then_answer(), tools)
+            .with_request_guard(Box::new(TestGuard {
+                working_set: None,
+                stop_at: Some(2),
+                seen: std::sync::Arc::clone(&seen),
+            }));
+
+        let summary = runtime
+            .run_turn("read both", None)
+            .expect("a stop is no error");
+
+        let TurnOutcome::BudgetStopped { estimated_tokens } = summary.outcome else {
+            panic!("stopped by the guard, got {:?}", summary.outcome);
+        };
+        assert_eq!(estimated_tokens, seen.lock().expect("seen")[1].input_tokens);
+        assert!(estimated_tokens > 1_000, "the read result counts");
+        assert_eq!(
+            runtime.api_client().requests.len(),
+            1,
+            "nothing more was sent"
+        );
+        let last = runtime.session().messages.last().expect("a message");
+        assert_eq!(last.role, MessageRole::Assistant);
+        assert!(matches!(
+            &last.blocks[..],
+            [ContentBlock::Text { text }] if text == BUDGET_STOPPED_NOTE
+        ));
+        assert!(is_turn_end_note(BUDGET_STOPPED_NOTE));
+        assert_eq!(
+            runtime.request_tokens_estimate(),
+            runtime.context_snapshot().request_input_tokens()
+        );
     }
 
     #[test]
