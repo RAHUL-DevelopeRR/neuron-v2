@@ -9,14 +9,14 @@
 //! terminal nobody can answer, so `--yes` is needed to start, the run stops at 80% of
 //! the cap, and the changes stay on their branch unless `--yes` was given.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::sync::{Mutex, PoisonError};
 
 use runtime::PermissionMode;
 use tools::colony::{
-    run_colony, session_agent_runner, AgentStatus, ColonyAnswer, ColonyConfig, ColonyEvent,
-    ColonyHandle, ColonyLimits, ColonyObserver, ColonyQuestion, ColonyReport,
+    describe_plan, run_colony, session_agent_runner, AgentStatus, ColonyAnswer, ColonyConfig,
+    ColonyEvent, ColonyHandle, ColonyLimits, ColonyObserver, ColonyQuestion, ColonyReport,
 };
 
 pub(crate) const COLONY_USAGE: &str = "neuron colony \"<task>\" [--workers N] [--budget 400k] [--review-model MODEL] [--no-merge] [--allow-web] [--yes]";
@@ -154,11 +154,14 @@ fn read_account() -> Result<serde_json::Value, String> {
 }
 
 /// The run's settings from the options, the account limits and the session.
+/// `session_tools` is the session's tool allow-list (`--allowedTools`, plan mode);
+/// agents get only tools on it and on the registered parent's list.
 pub(crate) fn build_config(
     options: &ColonyOptions,
     limits: ColonyLimits,
     session_model: &str,
     permission_mode: PermissionMode,
+    session_tools: Option<&BTreeSet<String>>,
 ) -> Result<ColonyConfig, String> {
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
     let home = runtime::workspace_trust::default_neuron_home()
@@ -195,6 +198,12 @@ pub(crate) fn build_config(
         worker_model,
         reviewer_model,
         permission_mode,
+        allowed_tools: both_allow_lists(
+            session_tools,
+            parent
+                .as_ref()
+                .and_then(|parent| parent.allowed_tools.as_ref()),
+        ),
         permission_rules: parent
             .map(|parent| parent.permission_rules)
             .unwrap_or_default(),
@@ -203,6 +212,18 @@ pub(crate) fn build_config(
         workspace,
         home,
     })
+}
+
+/// The tools on both lists (`None`: no list).
+fn both_allow_lists(
+    first: Option<&BTreeSet<String>>,
+    second: Option<&BTreeSet<String>>,
+) -> Option<BTreeSet<String>> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(first.intersection(second).cloned().collect()),
+        (Some(list), None) | (None, Some(list)) => Some(list.clone()),
+        (None, None) => None,
+    }
 }
 
 fn reviewer_model_setting() -> Option<String> {
@@ -254,19 +275,13 @@ impl ColonyObserver for TerminalObserver {
                 token_cap,
                 ..
             } => {
+                // Each subtask's instructions too: they are what the start approves.
                 eprintln!(
-                    "[colony] plan: {} subtask(s), {workers} at a time, token cap {}",
+                    "[colony] plan: {} subtask(s), {workers} at a time, token cap {}{}",
                     tasks.len(),
-                    crate::account::group_digits(*token_cap)
+                    crate::account::group_digits(*token_cap),
+                    describe_plan(tasks)
                 );
-                for task in tasks {
-                    eprintln!(
-                        "  {} {} ({})",
-                        task.id,
-                        task.title,
-                        if task.writes { "writes" } else { "reads" }
-                    );
-                }
             }
             ColonyEvent::Agent { row, .. } => {
                 let mut statuses = self.statuses.lock().unwrap_or_else(PoisonError::into_inner);
@@ -298,7 +313,14 @@ impl ColonyObserver for TerminalObserver {
 
     fn ask(&self, question: &ColonyQuestion) -> ColonyAnswer {
         match question {
-            ColonyQuestion::Start { allow_web, .. } => {
+            ColonyQuestion::Start {
+                allow_web,
+                read_only,
+                ..
+            } => {
+                if let Some(reason) = read_only {
+                    eprintln!("[colony] {reason}");
+                }
                 if self.yes {
                     return ColonyAnswer::Continue;
                 }
@@ -422,6 +444,7 @@ pub(crate) fn run(
     options: &ColonyOptions,
     session_model: &str,
     permission_mode: PermissionMode,
+    session_tools: Option<&BTreeSet<String>>,
     json: bool,
 ) -> Result<ColonyReport, String> {
     let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
@@ -435,7 +458,13 @@ pub(crate) fn run(
     if let Some(note) = note {
         eprintln!("[colony] {note}");
     }
-    let config = build_config(options, limits, session_model, permission_mode)?;
+    let config = build_config(
+        options,
+        limits,
+        session_model,
+        permission_mode,
+        session_tools,
+    )?;
     let handle = ColonyHandle::new(config.token_cap());
     let observer = TerminalObserver::new(interactive, options.yes);
     let rules = config.permission_rules.clone();
@@ -452,7 +481,10 @@ pub(crate) fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_colony_args, parse_token_count, render_report, ColonyOptions};
+    use super::{
+        both_allow_lists, parse_colony_args, parse_token_count, render_report, ColonyOptions,
+    };
+    use std::collections::BTreeSet;
     use tools::colony::{AgentStatus, ColonyReport, MergeConflict, TaskReport};
 
     fn args(words: &[&str]) -> Vec<String> {
@@ -498,6 +530,28 @@ mod tests {
         assert!(parse_colony_args(&args(&["x", "--budget"]))
             .unwrap_err()
             .contains("needs a value"));
+    }
+
+    #[test]
+    fn agents_get_only_tools_on_both_allow_lists() {
+        let set = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect::<BTreeSet<_>>()
+        };
+        let session = set(&["read_file", "bash"]);
+        let parent = set(&["read_file", "write_file"]);
+        assert_eq!(
+            both_allow_lists(Some(&session), Some(&parent)),
+            Some(set(&["read_file"]))
+        );
+        assert_eq!(
+            both_allow_lists(Some(&session), None),
+            Some(session.clone())
+        );
+        assert_eq!(both_allow_lists(None, Some(&parent)), Some(parent.clone()));
+        assert_eq!(both_allow_lists(None, None), None);
     }
 
     #[test]

@@ -1520,25 +1520,18 @@ impl tools::colony::ColonyObserver for EngineColonyObserver {
                 workers,
                 token_cap,
                 allow_web,
+                read_only,
             } => {
+                // Each subtask's instructions: they are what the workers will be told.
                 let mut plan = format!(
-                    "Colony plan: {} subtask(s), {workers} at a time, token cap {}, web reads {}.",
+                    "Colony plan: {} subtask(s), {workers} at a time, token cap {}, web reads {}.{}",
                     tasks.len(),
                     crate::account::group_digits(*token_cap),
-                    if *allow_web { "on" } else { "off" }
+                    if *allow_web { "on" } else { "off" },
+                    tools::colony::describe_plan(tasks)
                 );
-                for task in tasks {
-                    let _ = write!(
-                        plan,
-                        "\n  {} {} ({})",
-                        task.id,
-                        task.title,
-                        if task.writes {
-                            "writes in its own worktree"
-                        } else {
-                            "reads"
-                        }
-                    );
+                if let Some(reason) = read_only {
+                    let _ = write!(plan, "\n{reason}");
                 }
                 if self.shared.capabilities.colony() {
                     self.send(UiEvent::ColonyStarted {
@@ -2126,6 +2119,7 @@ impl Engine {
             limits,
             &self.cli.model,
             self.cli.permission_mode,
+            self.cli.session_tools().as_ref(),
         )?;
         let cancel = CancellationToken::new();
         let handle = tools::colony::ColonyHandle::with_cancel(config.token_cap(), cancel.clone());

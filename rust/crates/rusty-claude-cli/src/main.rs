@@ -814,6 +814,7 @@ fn run_colony_command(
         options,
         &cli.model,
         cli.permission_mode,
+        cli.session_tools().as_ref(),
         output_format == CliOutputFormat::Json,
     )
     .map_err(UsageError)?;
@@ -2753,9 +2754,9 @@ impl HookAbortMonitor {
 }
 
 impl LiveCli {
-    /// `/colony <task>` in the line REPL: a Colony run in this session's settings.
-    /// `status` and `stop` have nothing to act on here, since the run holds the
-    /// prompt until it ends (Ctrl-C stops it).
+    /// `/colony <task>` in the line REPL: a Colony run in this session's settings
+    /// and tools. `status` and `stop` have nothing to act on here, since the run
+    /// holds the prompt until it ends (Ctrl-C stops it).
     fn colony_command(&mut self, args: Option<&str>) {
         let words = args
             .unwrap_or_default()
@@ -2768,12 +2769,35 @@ impl LiveCli {
         }
         match colony::parse_colony_args(&words) {
             Ok(options) => {
-                if let Err(error) = colony::run(&options, &self.model, self.permission_mode, false)
-                {
+                let tools = self.session_tools();
+                if let Err(error) = colony::run(
+                    &options,
+                    &self.model,
+                    self.permission_mode,
+                    tools.as_ref(),
+                    false,
+                ) {
                     eprintln!("[colony] {error}");
                 }
             }
             Err(error) => eprintln!("[colony] {error}"),
+        }
+    }
+
+    /// The tools this session may use now: the allow-list (`--allowedTools`), or in
+    /// plan mode only the read and search tools. Plan mode strips write tools
+    /// structurally: instead of asking the model not to write, bash, `write_file`
+    /// and `edit_file` are removed from the tool list so it can only read and search.
+    fn session_tools(&self) -> Option<AllowedToolSet> {
+        if self.plan_mode {
+            Some(
+                ["read_file", "glob_search", "grep_search", "list_directory"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            )
+        } else {
+            self.allowed_tools.clone()
         }
     }
 
@@ -3147,19 +3171,7 @@ impl LiveCli {
         presses: Option<repl_loop::InterruptPresses>,
     ) -> Result<HookAbortMonitor, Box<dyn std::error::Error>> {
         let output = output.into();
-        // Plan mode structurally strips write tools: instead of asking the
-        // model not to write, bash, write_file and edit_file are removed from
-        // the tool list so it can only read and search.
-        let effective_tools = if self.plan_mode {
-            let mut read_only: std::collections::BTreeSet<String> =
-                std::collections::BTreeSet::new();
-            for tool in &["read_file", "glob_search", "grep_search", "list_directory"] {
-                read_only.insert(tool.to_string());
-            }
-            Some(read_only)
-        } else {
-            self.allowed_tools.clone()
-        };
+        let effective_tools = self.session_tools();
 
         let needs_rebuild = {
             let client = self.runtime.api_client();
