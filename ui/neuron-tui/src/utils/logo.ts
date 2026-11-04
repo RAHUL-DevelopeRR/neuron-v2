@@ -92,6 +92,8 @@ export const SHADOW_CHARS = new Set([
 // Sheen animation constants
 export const SHEEN_STEP = 2 // Advance 2 positions per frame for efficiency
 export const SHEEN_INTERVAL_MS = 150
+/** Sweeps (fills and unfills) before the sheen rests: each tick redraws the logo. */
+export const SHEEN_MAX_PHASES = 2
 
 /**
  * Determines the color for a character based on its position relative to the sheen.

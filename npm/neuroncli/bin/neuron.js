@@ -16,6 +16,7 @@ import path from 'node:path';
 import {LauncherError, ensureBinary} from '../lib/binary.js';
 import {wantsFullScreenUi} from '../lib/full-screen.js';
 import {exitCodeForSignal, isInteractive, listenedSignals, shouldForwardSignal} from '../lib/signals.js';
+import {startFailureMessage} from '../lib/start-error.js';
 
 function report(error) {
   const message = error instanceof LauncherError ? error.message : error?.stack || String(error);
@@ -81,7 +82,15 @@ async function main() {
   const ui = await resolveUi(argv);
   if (ui) env.NEURON_TUI_BIN = ui;
 
-  const child = spawn(binary, argv, {stdio: 'inherit', env});
+  let child;
+  try {
+    child = spawn(binary, argv, {stdio: 'inherit', env});
+  } catch (error) {
+    // Windows reports a binary it will not run (blocked by an antivirus) by throwing here.
+    report(new LauncherError(startFailureMessage(binary, error)));
+    process.exitCode = 1;
+    return;
+  }
   const signals = listenedSignals();
   const relay = (signal) => {
     if (!shouldForwardSignal(signal, {interactive: isInteractive()})) return;
@@ -98,7 +107,7 @@ async function main() {
 
   child.on('error', (error) => {
     stopRelaying();
-    report(new LauncherError(`could not start ${binary}: ${error.message}`));
+    report(new LauncherError(startFailureMessage(binary, error)));
     process.exitCode = 1;
   });
 

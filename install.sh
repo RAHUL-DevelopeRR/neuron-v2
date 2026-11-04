@@ -21,6 +21,11 @@
 #   NEURON_RELEASES_API    URL of the "latest release" JSON (default: GitHub API)
 #   GITHUB_TOKEN           optional token for the GitHub API rate limit
 #   NEURON_NO_TUI          1 skips the full-screen UI
+#   NEURON_NO_MODIFY_PATH  1 leaves shell startup files alone (same as --no-modify-path)
+#
+# When the install directory is not on PATH, the installer adds it to your
+# shell's startup file (~/.zshrc, ~/.bashrc, ~/.profile, or fish's conf.d) in a
+# block marked "# >>> neuron >>>", once; rerunning it changes nothing.
 #
 # Windows: use install.ps1 from PowerShell instead.
 
@@ -57,20 +62,26 @@ usage() {
     cat <<'EOF'
 Install the Neuron coding agent from GitHub Releases.
 
-Usage: install.sh [--version VERSION] [--install-dir DIR] [--help]
+Usage: install.sh [--version VERSION] [--install-dir DIR] [--no-modify-path] [--help]
 
 Options:
   --version VERSION    Release to install, e.g. 7.0.0-alpha.2 (default: latest stable)
   --install-dir DIR    Directory for the neuron binary (default: ~/.local/bin)
+  --no-modify-path     Do not add the directory to PATH in your shell's startup file
   -h, --help           Show this help
 
 Environment: NEURON_VERSION, NEURON_INSTALL_DIR, NEURON_DOWNLOAD_BASE,
-NEURON_RELEASES_API, GITHUB_TOKEN.
+NEURON_RELEASES_API, GITHUB_TOKEN, NEURON_NO_MODIFY_PATH.
 EOF
 }
 
 VERSION="${NEURON_VERSION:-}"
 INSTALL_DIR="${NEURON_INSTALL_DIR:-}"
+MODIFY_PATH=1
+case "${NEURON_NO_MODIFY_PATH:-}" in
+    "" | 0 | false | no) ;;
+    *) MODIFY_PATH=0 ;;
+esac
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -90,6 +101,10 @@ while [ "$#" -gt 0 ]; do
             ;;
         --install-dir=*)
             INSTALL_DIR="${1#--install-dir=}"
+            shift
+            ;;
+        --no-modify-path)
+            MODIFY_PATH=0
             shift
             ;;
         -h | --help)
@@ -378,6 +393,59 @@ else
     info "$(printf '%s\n' "${VERSION_OUTPUT}" | head -n 1)"
 fi
 
+# --- PATH -------------------------------------------------------------------
+
+PATH_MARKER="# >>> neuron >>>"
+
+# A directory that can go into a startup file as written: no quotes, $, ` or \.
+path_dir_is_plain() {
+    case "$1" in
+        "" | *'"'* | *'$'* | *'`'* | *\\*) return 1 ;;
+    esac
+    return 0
+}
+
+# Adds INSTALL_DIR to PATH in startup file $1 ($2: the shell), once. Prints the
+# file when it added the block; fails when it could not write the file.
+add_path_block() {
+    if [ -f "$1" ] && grep -qF "${PATH_MARKER}" "$1" 2>/dev/null; then
+        return 0
+    fi
+    mkdir -p "$(dirname "$1")" 2>/dev/null || return 1
+    if [ "$2" = fish ]; then
+        LINE="fish_add_path \"${INSTALL_DIR}\""
+    else
+        LINE="export PATH=\"${INSTALL_DIR}:\$PATH\""
+    fi
+    {
+        # A file that does not end in a newline would run into the block.
+        if [ -s "$1" ] && [ -n "$(tail -c 1 "$1")" ]; then
+            echo
+        fi
+        echo
+        echo "${PATH_MARKER}"
+        echo "${LINE}"
+        echo "# <<< neuron <<<"
+    } >>"$1" 2>/dev/null || return 1
+    info "added ${INSTALL_DIR} to PATH in $1"
+}
+
+# Adds INSTALL_DIR to PATH in the startup files a new terminal of shell $1 reads.
+add_to_startup_files() {
+    case "$1" in
+        zsh) add_path_block "${ZDOTDIR:-${HOME}}/.zshrc" zsh ;;
+        bash)
+            add_path_block "${HOME}/.bashrc" bash || return 1
+            # Login shells (macOS Terminal, ssh) read .bash_profile and skip .bashrc.
+            if [ "$(uname -s 2>/dev/null)" = Darwin ] || [ -f "${HOME}/.bash_profile" ]; then
+                add_path_block "${HOME}/.bash_profile" bash
+            fi
+            ;;
+        fish) add_path_block "${XDG_CONFIG_HOME:-${HOME}/.config}/fish/conf.d/neuron.fish" fish ;;
+        *) add_path_block "${HOME}/.profile" sh ;;
+    esac
+}
+
 case ":${PATH:-}:" in
     *":${INSTALL_DIR}:"* | *":${INSTALL_DIR}/:"*)
         RESOLVED="$(command -v neuron 2>/dev/null || true)"
@@ -389,17 +457,31 @@ case ":${PATH:-}:" in
         ;;
     *)
         warn "${INSTALL_DIR} is not on your PATH."
-        case "$(basename "${SHELL:-sh}")" in
-            zsh) PROFILE="\$HOME/.zshrc" ;;
-            bash) PROFILE="\$HOME/.bashrc" ;;
-            fish) PROFILE="" ;;
-            *) PROFILE="\$HOME/.profile" ;;
-        esac
-        if [ -n "${PROFILE}" ]; then
-            info "Add this line to ${PROFILE}, then open a new terminal:"
-            info "  export PATH=\"${INSTALL_DIR}:\$PATH\""
+        SHELL_NAME="$(basename "${SHELL:-sh}")"
+        if [ "${MODIFY_PATH}" = 1 ] && [ -n "${HOME:-}" ] && path_dir_is_plain "${INSTALL_DIR}"; then
+            if add_to_startup_files "${SHELL_NAME}"; then
+                info "New terminals find neuron. In this one, run:"
+            else
+                warn "could not update your shell's startup file; add ${INSTALL_DIR} to PATH yourself:"
+            fi
+            if [ "${SHELL_NAME}" = fish ]; then
+                info "  fish_add_path \"${INSTALL_DIR}\""
+            else
+                info "  export PATH=\"${INSTALL_DIR}:\$PATH\""
+            fi
         else
-            info "Add it with: fish_add_path ${INSTALL_DIR}"
+            case "${SHELL_NAME}" in
+                zsh) PROFILE="\$HOME/.zshrc" ;;
+                bash) PROFILE="\$HOME/.bashrc" ;;
+                fish) PROFILE="" ;;
+                *) PROFILE="\$HOME/.profile" ;;
+            esac
+            if [ -n "${PROFILE}" ]; then
+                info "Add this line to ${PROFILE}, then open a new terminal:"
+                info "  export PATH=\"${INSTALL_DIR}:\$PATH\""
+            else
+                info "Add it with: fish_add_path ${INSTALL_DIR}"
+            fi
         fi
         RUN="${DESTINATION}"
         ;;

@@ -6,6 +6,7 @@ import {
   SHADOW_CHARS,
   SHEEN_STEP,
   SHEEN_INTERVAL_MS,
+  SHEEN_MAX_PHASES,
   getSheenColor,
 } from '../utils/logo'
 
@@ -21,7 +22,10 @@ interface UseSheenAnimationParams {
 
 /**
  * Custom hook that handles the sheen animation effect on the logo
- * Animates a fill effect that loops: fill with accent color, then unfill back to original
+ * Animates a fill effect: fill with accent color, then unfill back to original,
+ * SHEEN_MAX_PHASES times, then rests until it is enabled again. Each tick redraws
+ * the logo span by span, so a sheen that never stopped kept an idle chat drawing
+ * about 7 frames a second.
  */
 export function useSheenAnimation({
   enabled = true,
@@ -33,25 +37,26 @@ export function useSheenAnimation({
   // Track whether we're in the reverse (unfill) phase
   const [isReversing, setIsReversing] = useState(false)
 
-  // Run looping sheen animation
+  // Run the sheen, a fixed number of phases each time it is enabled
   useEffect(() => {
     if (!enabled) return
 
     const maxPosition = Math.max(10, Math.min((terminalWidth || 80) - 4, 100))
-    const step = SHEEN_STEP
+    let position = 0
+    let phases = 0
+    setSheenPosition(0)
+    setIsReversing(false)
 
     const interval = setInterval(() => {
-      setSheenPosition((prev) => {
-        const next = prev + step
-
-        if (next >= maxPosition) {
-          // Reached the end, switch direction
-          setIsReversing((wasReversing) => !wasReversing)
-          return 0 // Reset position for next phase
-        }
-
-        return next
-      })
+      position += SHEEN_STEP
+      if (position >= maxPosition) {
+        // Reached the end: switch direction, or rest after the last phase
+        position = 0
+        phases += 1
+        setIsReversing(phases % 2 === 1)
+        if (phases >= SHEEN_MAX_PHASES) clearInterval(interval)
+      }
+      setSheenPosition(position)
     }, SHEEN_INTERVAL_MS)
 
     return () => {

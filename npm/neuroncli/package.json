@@ -1,14 +1,25 @@
 {
   "name": "@zero-x.live/neuron",
   "version": "7.0.0-alpha.2",
-  "description": "Neuron coding agent for the terminal, powered by the Zero-X gateway",
+  "description": "Neuron: an AI coding agent CLI for your terminal. Reads your project, edits files and runs commands with your permission, using the Zero-X gateway or your own model key.",
   "keywords": [
+    "neuron",
+    "neuron-agent",
+    "neuron-cli",
+    "neuroncli",
     "ai",
+    "ai-agent",
     "coding-agent",
+    "code-assistant",
+    "ai-coding",
+    "llm",
+    "agentic",
     "cli",
     "terminal",
-    "neuron",
-    "zero-x"
+    "tui",
+    "developer-tools",
+    "zero-x",
+    "zero-x.live"
   ],
   "license": "MIT",
   "type": "module",

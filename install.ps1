@@ -25,17 +25,22 @@
     Install directory. Defaults to $env:NEURON_INSTALL_DIR, then %LOCALAPPDATA%\Programs\Neuron\bin.
 
 .PARAMETER AddToPath
-    Add the install directory to the user PATH. Without it, PATH is left unchanged.
+    Add the install directory to the user PATH even when NEURON_NO_MODIFY_PATH is set. Adding
+    it is the default; the switch is kept so older install commands still work.
+
+.PARAMETER NoModifyPath
+    Leave the user PATH unchanged (as does NEURON_NO_MODIFY_PATH=1).
 
 .NOTES
     Environment: NEURON_VERSION, NEURON_INSTALL_DIR, NEURON_DOWNLOAD_BASE (HTTPS, or loopback HTTP
-    for testing), NEURON_RELEASES_API, GITHUB_TOKEN, NEURON_NO_TUI (1 skips the full-screen UI).
+    for testing), NEURON_RELEASES_API, GITHUB_TOKEN, NEURON_NO_TUI (1 skips the full-screen UI), NEURON_NO_MODIFY_PATH (1 leaves PATH alone).
 #>
 [CmdletBinding()]
 param(
     [string]$Version = $env:NEURON_VERSION,
     [string]$InstallDir = $env:NEURON_INSTALL_DIR,
-    [switch]$AddToPath
+    [switch]$AddToPath,
+    [switch]$NoModifyPath
 )
 
 # Strict mode and 'Stop' are set inside Install-Neuron, not here: under `irm | iex`
@@ -166,6 +171,13 @@ function Write-ShadowingNeuronWarning([string]$Destination) {
     Write-Detail '  npm (6.x):                npm uninstall -g @zero-x.live/neuron neuron-cli-app'
     Write-Detail '  pip:                      pip uninstall neuroncli (or pipx uninstall neuroncli)'
     Write-Detail "If it is another program, move $(Split-Path -Parent $Destination) before $(Split-Path -Parent $found.Path) in PATH, or run neuron by its full path."
+}
+
+# Whether the install directory goes into the user PATH: yes unless the user opted out.
+function Test-ModifyPath([bool]$Forced, [bool]$OptedOut, [string]$EnvValue) {
+    if ($Forced) { return $true }
+    if ($OptedOut) { return $false }
+    return (-not $EnvValue) -or (@('0', 'false', 'no') -contains $EnvValue.ToLowerInvariant())
 }
 
 function Add-UserPathEntry([string]$Directory) {
@@ -334,7 +346,7 @@ function Install-Neuron {
     $run = 'neuron'
     if (Test-PathEntry $env:Path $target) {
         Write-ShadowingNeuronWarning $destination
-    } elseif ($AddToPath) {
+    } elseif (Test-ModifyPath $AddToPath $NoModifyPath $env:NEURON_NO_MODIFY_PATH) {
         if (Add-UserPathEntry $target) {
             Write-Detail "added $target to your user PATH; open a new terminal to use it."
         }

@@ -132,6 +132,10 @@ class InstallShTests(unittest.TestCase):
             NEURON_NO_TUI="1",
         )
         environment.pop("NO_COLOR", None)
+        # The PATH step writes startup files under HOME only: no host ZDOTDIR or XDG config.
+        environment.pop("ZDOTDIR", None)
+        environment.pop("XDG_CONFIG_HOME", None)
+        environment["SHELL"] = "/bin/sh"
         if uname is not None:
             environment["FAKE_UNAME_S"], environment["FAKE_UNAME_M"] = uname
             environment["PATH"] = os.pathsep.join([str(self.fakebin), environment.get("PATH", "")])
@@ -398,6 +402,59 @@ class InstallShTests(unittest.TestCase):
         self.assertIn("invalid version", invalid.stderr)
         self.assertEqual(self.server.paths(), [])
 
+    def home_file(self, *parts: str) -> Path:
+        return self.root.joinpath("home", *parts)
+
+    def test_adds_the_install_dir_to_the_shell_startup_file_once(self) -> None:
+        fake_release.stage_release(self.releases, VERSION, "neuron-linux-x64", posix_dummy(VERSION))
+        bashrc = self.home_file(".bashrc")
+        bashrc.parent.mkdir(parents=True, exist_ok=True)
+        bashrc.write_text("alias ll='ls -l'", encoding="utf-8")  # no final newline
+        for _ in range(2):
+            result = self.run_installer(NEURON_VERSION=VERSION, SHELL="/bin/bash")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("is not on your PATH", result.stderr)
+            self.assertIn("New terminals find neuron", result.stderr)
+        text = bashrc.read_text(encoding="utf-8")
+        self.assertTrue(text.startswith("alias ll='ls -l'\n"), text)
+        self.assertEqual(text.count("# >>> neuron >>>"), 1, text)
+        self.assertIn(f'export PATH="{shell_path(self.install_dir)}:$PATH"', text)
+        self.assertIn("# <<< neuron <<<", text)
+        self.assertFalse(self.home_file(".bash_profile").exists(), "Linux bash without a .bash_profile")
+
+        # A new shell reading the startup file finds the install.
+        found = subprocess.run(
+            [install_sh_shells()[0], "-c", '. "$0"; command -v neuron', shell_path(bashrc)],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        self.assertEqual(found.stdout.strip(), shell_path(self.installed()), found.stderr)
+
+    def test_startup_file_follows_the_shell(self) -> None:
+        fake_release.stage_release(self.releases, VERSION, "neuron-linux-x64", posix_dummy(VERSION))
+        install_dir = shell_path(self.install_dir)
+        cases = [
+            ("/usr/bin/zsh", {"ZDOTDIR": shell_path(self.home_file("zdot"))}, ("zdot", ".zshrc"),
+             f'export PATH="{install_dir}:$PATH"'),
+            ("/usr/bin/fish", {}, (".config", "fish", "conf.d", "neuron.fish"), f'fish_add_path "{install_dir}"'),
+            ("/bin/dash", {}, (".profile",), f'export PATH="{install_dir}:$PATH"'),
+        ]
+        for shell, extra, parts, line in cases:
+            with self.subTest(shell=shell):
+                result = self.run_installer(NEURON_VERSION=VERSION, SHELL=shell, **extra)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                text = self.home_file(*parts).read_text(encoding="utf-8")
+                self.assertIn(line, text)
+                self.assertEqual(text.count("# >>> neuron >>>"), 1)
+
+    def test_no_modify_path_leaves_startup_files_alone(self) -> None:
+        fake_release.stage_release(self.releases, VERSION, "neuron-linux-x64", posix_dummy(VERSION))
+        for args, env in [(("--no-modify-path",), {}), ((), {"NEURON_NO_MODIFY_PATH": "1"})]:
+            with self.subTest(args=args, env=env):
+                result = self.run_installer(*args, NEURON_VERSION=VERSION, SHELL="/bin/bash", **env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Add this line to $HOME/.bashrc", result.stderr)
+                self.assertFalse(self.home_file(".bashrc").exists())
+
     def test_upgrade_on_path_replaces_the_binary_without_a_path_warning(self) -> None:
         fake_release.write_executable(self.installed(), posix_dummy("6.2.5"))
         fake_release.stage_release(self.releases, VERSION, "neuron-linux-x64", posix_dummy(VERSION))
@@ -474,6 +531,9 @@ class InstallPs1Tests(unittest.TestCase):
             LOCALAPPDATA=str(self.root),
             # The full-screen UI step has its own tests; NEURON_NO_TUI="" turns it on.
             NEURON_NO_TUI="1",
+            # Adding to the user PATH is the default; these tests must not write this machine's
+            # registry (test_add_to_path_updates_the_user_path_once does, on CI only).
+            NEURON_NO_MODIFY_PATH="1",
         )
         environment.update(env)
         return environment
@@ -764,6 +824,7 @@ foreach ($name in @({quoted})) {{
         "Assert-SupportedPlatform",
         "Resolve-NeuronVersion",
         "Test-PathEntry",
+        "Test-ModifyPath",
         "Write-ShadowingNeuronWarning",
         "Install-NeuronBinary",
         "Install-NeuronUi",
@@ -771,13 +832,18 @@ foreach ($name in @({quoted})) {{
         "Install-Neuron",
     ]
 
-    def run_add_to_path_install(self, path: str) -> subprocess.CompletedProcess:
-        """Runs Install-Neuron with -AddToPath and PATH set to `path`, without writing the user PATH."""
+    def run_add_to_path_install(
+        self, path: str, add_to_path: bool = True, no_modify_path: bool = False, env_opt_out: str = ""
+    ) -> subprocess.CompletedProcess:
+        """Runs Install-Neuron with PATH set to `path` and the given switches, without writing the user PATH."""
         fake_release.stage_release(self.releases, VERSION, self.ASSET)
+        flag = lambda value: "$true" if value else "$false"  # noqa: E731
         body = f"""
 $Version = '{VERSION}'
 $InstallDir = ''
-$AddToPath = $true
+$AddToPath = {flag(add_to_path)}
+$NoModifyPath = {flag(no_modify_path)}
+$env:NEURON_NO_MODIFY_PATH = '{env_opt_out}'
 # Stands in for the registry write (test_add_to_path_updates_the_user_path_once covers that on CI).
 function Add-UserPathEntry([string]$Directory) {{ Write-Host "user-path-stub $Directory"; return $true }}
 $env:Path = '{path}'
@@ -809,6 +875,26 @@ Install-Neuron
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(f"added {self.install_dir} to your user PATH", result.stdout)
         self.assertNotIn("comes first on PATH", result.stdout)
+
+    def test_user_path_is_updated_by_default_unless_opted_out(self) -> None:
+        system = str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32")
+        cases = [
+            ({"add_to_path": False}, True),
+            ({"add_to_path": False, "no_modify_path": True}, False),
+            ({"add_to_path": False, "env_opt_out": "1"}, False),
+            ({"add_to_path": False, "env_opt_out": "0"}, True),
+            ({"add_to_path": True, "env_opt_out": "1"}, True),
+        ]
+        for options, updated in cases:
+            with self.subTest(**options):
+                result = self.run_add_to_path_install(system, **options)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                if updated:
+                    self.assertIn(f"user-path-stub {self.install_dir}", result.stdout)
+                    self.assertIn("open a new terminal", result.stdout)
+                else:
+                    self.assertNotIn("user-path-stub", result.stdout)
+                    self.assertIn("is not on your PATH", result.stdout)
 
     @unittest.skipUnless(os.environ.get("GITHUB_ACTIONS") == "true", "changes the user PATH; runs only on CI runners")
     def test_add_to_path_updates_the_user_path_once(self) -> None:

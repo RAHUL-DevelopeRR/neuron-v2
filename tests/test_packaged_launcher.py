@@ -86,6 +86,21 @@ class PackagedLauncherTests(unittest.TestCase):
             with self.assertRaises(self.launcher.LauncherError):
                 self.launcher._find_binary()
 
+    def test_python_dash_m_runs_the_launcher(self) -> None:
+        # The fallback when pip's scripts folder is not on PATH.
+        environment = {**os.environ, "NEURON_BINARY_PATH": str(self.root / "missing")}
+        result = subprocess.run(
+            [sys.executable, "-m", "neuron_cli", "--version"],
+            cwd=REPO_ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("neuron: NEURON_BINARY_PATH", result.stderr)
+
     def test_release_assets_cover_every_published_platform(self) -> None:
         cases = {
             ("Windows", "AMD64"): "neuron-windows-x64.exe",

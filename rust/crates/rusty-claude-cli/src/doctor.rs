@@ -202,6 +202,7 @@ pub(crate) fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error:
             check_auth_health(),
             check_config_health(&config_loader, config.as_ref()),
             check_install_source_health(),
+            check_path_health(),
             check_workspace_health(&context),
             check_sandbox_health(&context.sandbox_status),
             check_system_health(&cwd, config.as_ref().ok()),
@@ -691,6 +692,219 @@ pub(crate) fn check_install_source_health() -> DiagnosticCheck {
     ]))
 }
 
+/// How this binary was installed, read from where it lives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InstallKind {
+    /// Inside an npm package: `neuron` on PATH is npm's shim in this directory.
+    Npm { shim_dir: PathBuf },
+    /// In the npm or pip launcher's download cache: `neuron` on PATH is that launcher.
+    LauncherCache,
+    /// A standalone binary (install script, release archive, cargo): its own directory
+    /// belongs on PATH.
+    Standalone { dir: PathBuf },
+}
+
+impl InstallKind {
+    fn of(exe: &Path, windows: bool) -> Self {
+        let components = exe
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        if let Some(index) = components
+            .iter()
+            .rposition(|component| component == "node_modules")
+        {
+            // Windows: <prefix>\node_modules, shims in <prefix>.
+            // Elsewhere: <prefix>/lib/node_modules, shims in <prefix>/bin.
+            let node_modules: PathBuf = exe.components().take(index + 1).collect();
+            let parent = node_modules.parent().unwrap_or(&node_modules);
+            let shim_dir = if windows {
+                parent.to_path_buf()
+            } else {
+                parent.parent().unwrap_or(parent).join("bin")
+            };
+            return Self::Npm { shim_dir };
+        }
+        let in_cache = exe
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "neuroncli");
+        if in_cache {
+            return Self::LauncherCache;
+        }
+        Self::Standalone {
+            dir: exe.parent().map(Path::to_path_buf).unwrap_or_default(),
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Npm { .. } => "npm",
+            Self::LauncherCache => "npm or pip launcher",
+            Self::Standalone { .. } => "standalone",
+        }
+    }
+}
+
+/// Every `neuron` command on `path_var`, in the order the shell tries them.
+fn neuron_commands_on_path(path_var: &std::ffi::OsStr, windows: bool) -> Vec<PathBuf> {
+    let names: &[&str] = if windows {
+        &["neuron.exe", "neuron.cmd", "neuron.bat", "neuron.ps1"]
+    } else {
+        &["neuron"]
+    };
+    let mut found = Vec::new();
+    for dir in env::split_paths(path_var) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        for name in names {
+            let candidate = dir.join(name);
+            if candidate.is_file() && !found.contains(&candidate) {
+                found.push(candidate);
+            }
+        }
+    }
+    found
+}
+
+fn same_dir(a: &Path, b: &Path, windows: bool) -> bool {
+    let canonical = |path: &Path| {
+        let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let text = path
+            .to_string_lossy()
+            .trim_end_matches(['/', '\\'])
+            .to_string();
+        if windows {
+            text.to_lowercase()
+        } else {
+            text
+        }
+    };
+    canonical(a) == canonical(b)
+}
+
+/// How to put `dir` on PATH for good, for the user's platform.
+fn add_to_path_hint(dir: &Path, windows: bool) -> String {
+    if windows {
+        format!(
+            "add {} to your user PATH (rerun install.ps1, or Settings > System > About > \
+             Advanced system settings > Environment Variables), then open a new terminal",
+            dir.display()
+        )
+    } else {
+        format!(
+            "add `export PATH=\"{}:$PATH\"` to your shell's startup file (~/.zshrc, ~/.bashrc or \
+             ~/.profile; fish: fish_add_path), then open a new terminal",
+            dir.display()
+        )
+    }
+}
+
+pub(crate) fn check_path_health() -> DiagnosticCheck {
+    let exe = env::current_exe().unwrap_or_default();
+    let path_var = env::var_os("PATH").unwrap_or_default();
+    path_health(&exe, &path_var, cfg!(windows))
+}
+
+fn path_health(exe: &Path, path_var: &std::ffi::OsStr, windows: bool) -> DiagnosticCheck {
+    let kind = InstallKind::of(exe, windows);
+    let commands = neuron_commands_on_path(path_var, windows);
+    let expected_dir = match &kind {
+        InstallKind::Npm { shim_dir } => Some(shim_dir.clone()),
+        InstallKind::Standalone { dir } => Some(dir.clone()),
+        InstallKind::LauncherCache => None,
+    };
+    let first = commands.first();
+    let first_is_this = match (first, &expected_dir) {
+        (Some(first), Some(dir)) => first
+            .parent()
+            .is_some_and(|parent| same_dir(parent, dir, windows)),
+        // The launcher's own folder is unknown here; any `neuron` is taken as it.
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+
+    let mut details = vec![
+        format!("This binary       {}", exe.display()),
+        format!("Installed with    {}", kind.label()),
+    ];
+    if commands.is_empty() {
+        details.push("On PATH           none".to_string());
+    }
+    for (index, command) in commands.iter().enumerate() {
+        let label = if index == 0 {
+            "On PATH (runs)"
+        } else {
+            "On PATH (hidden)"
+        };
+        details.push(format!("{label:<18}{}", command.display()));
+    }
+
+    let (level, summary) = if commands.is_empty() {
+        let fix = match &kind {
+            InstallKind::Npm { shim_dir } => {
+                details.push(format!(
+                    "npm puts global commands in {}; `npm config get prefix` shows the prefix",
+                    shim_dir.display()
+                ));
+                add_to_path_hint(shim_dir, windows)
+            }
+            InstallKind::Standalone { dir } => add_to_path_hint(dir, windows),
+            InstallKind::LauncherCache => "add the folder of the launcher you installed with \
+                 (npm's global prefix, or pip's Scripts or bin folder) to PATH, then open a new \
+                 terminal"
+                .to_string(),
+        };
+        details.push(format!("Fix               {fix}"));
+        (
+            DiagnosticLevel::Warn,
+            "`neuron` is not on PATH, so a new terminal will not find it".to_string(),
+        )
+    } else if first_is_this {
+        let summary = if commands.len() > 1 {
+            format!(
+                "`neuron` runs this install; {} other copies come later on PATH",
+                commands.len() - 1
+            )
+        } else {
+            "`neuron` on PATH runs this install".to_string()
+        };
+        (DiagnosticLevel::Ok, summary)
+    } else {
+        details.push(
+            "Fix               remove the other copy (npm uninstall -g @zero-x.live/neuron, \
+             pip uninstall neuroncli, or delete it), or move this install's folder earlier in \
+             PATH"
+                .to_string(),
+        );
+        (
+            DiagnosticLevel::Warn,
+            format!(
+                "another `neuron` comes first on PATH and runs instead of this one: {}",
+                first
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default()
+            ),
+        )
+    };
+
+    DiagnosticCheck::new("PATH", level, summary)
+        .with_details(details)
+        .with_data(Map::from_iter([
+            ("install_kind".to_string(), json!(kind.label())),
+            (
+                "commands_on_path".to_string(),
+                json!(commands
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()),
+            ),
+            ("runs_this_install".to_string(), json!(first_is_this)),
+        ]))
+}
+
 pub(crate) fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
     let in_repo = context.project_root.is_some();
     DiagnosticCheck::new(
@@ -940,5 +1154,127 @@ mod gateway_doctor_tests {
         assert_eq!(check.data["repository"], json!(NEURON_REPO_URL));
         assert_eq!(check.data["npm_package"], json!("@zero-x.live/neuron"));
         assert_eq!(check.data["pypi_package"], json!("neuroncli"));
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!(
+            "neuron-doctor-path-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn command_in(dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let file = dir.join(if cfg!(windows) {
+            "neuron.exe"
+        } else {
+            "neuron"
+        });
+        std::fs::write(&file, b"").unwrap();
+        file
+    }
+
+    fn path_of(dirs: &[&Path]) -> std::ffi::OsString {
+        env::join_paths(dirs).unwrap()
+    }
+
+    #[test]
+    fn standalone_install_on_path_is_ok() {
+        let root = scratch("ok");
+        let exe = command_in(&root.join("bin"));
+        let check = path_health(&exe, &path_of(&[&root.join("bin")]), cfg!(windows));
+        assert_eq!(check.level, DiagnosticLevel::Ok, "{check:?}");
+        assert_eq!(check.data["install_kind"], json!("standalone"));
+        assert_eq!(check.data["runs_this_install"], json!(true));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn missing_from_path_warns_with_the_folder_to_add() {
+        let root = scratch("missing");
+        let exe = command_in(&root.join("bin"));
+        let check = path_health(&exe, &path_of(&[&root.join("elsewhere")]), false);
+        assert_eq!(check.level, DiagnosticLevel::Warn);
+        assert!(check.summary.contains("not on PATH"), "{}", check.summary);
+        let fix = check.details.last().unwrap();
+        assert!(
+            fix.contains(&root.join("bin").display().to_string()),
+            "{fix}"
+        );
+        assert!(fix.contains("export PATH="), "{fix}");
+
+        let windows = path_health(&exe, &path_of(&[]), true);
+        assert!(windows.details.last().unwrap().contains("user PATH"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn npm_install_expects_the_global_shim_folder() {
+        let root = scratch("npm");
+        let exe = root
+            .join("lib")
+            .join("node_modules")
+            .join("@zero-x.live")
+            .join("neuron")
+            .join("bin")
+            .join("native")
+            .join("neuron");
+        assert_eq!(
+            InstallKind::of(&exe, false),
+            InstallKind::Npm {
+                shim_dir: root.join("bin")
+            }
+        );
+        let windows_exe = root
+            .join("node_modules")
+            .join("@zero-x.live")
+            .join("neuron.exe");
+        assert_eq!(
+            InstallKind::of(&windows_exe, true),
+            InstallKind::Npm {
+                shim_dir: root.clone()
+            }
+        );
+
+        let check = path_health(&exe, &path_of(&[]), false);
+        assert_eq!(check.level, DiagnosticLevel::Warn);
+        assert!(check
+            .details
+            .iter()
+            .any(|detail| detail.contains("npm config get prefix")));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn another_neuron_first_on_path_warns() {
+        let root = scratch("shadow");
+        let exe = command_in(&root.join("mine"));
+        let other = command_in(&root.join("old"));
+        let check = path_health(
+            &exe,
+            &path_of(&[&root.join("old"), &root.join("mine")]),
+            cfg!(windows),
+        );
+        assert_eq!(check.level, DiagnosticLevel::Warn);
+        assert!(check.summary.contains(&other.display().to_string()));
+        assert_eq!(check.data["commands_on_path"].as_array().unwrap().len(), 2);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn launcher_cache_accepts_any_neuron_on_path() {
+        let root = scratch("cache");
+        let exe = root.join("neuroncli").join("7.0.0").join("neuron");
+        assert_eq!(InstallKind::of(&exe, false), InstallKind::LauncherCache);
+        command_in(&root.join("Scripts"));
+        let check = path_health(&exe, &path_of(&[&root.join("Scripts")]), cfg!(windows));
+        assert_eq!(check.level, DiagnosticLevel::Ok);
+        std::fs::remove_dir_all(root).ok();
     }
 }
