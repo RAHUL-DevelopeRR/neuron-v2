@@ -133,7 +133,9 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         name: "mcp",
         aliases: &[],
         summary: "Inspect configured MCP servers, or turn one on or off",
-        argument_hint: Some("[list|show <server>|enable <server>|disable <server>|help]"),
+        argument_hint: Some(
+            "[list|show <server>|enable <server>|disable <server>|approve <server>|help]",
+        ),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -1708,24 +1710,24 @@ fn parse_mcp_command(args: &[&str]) -> Result<SlashCommand, SlashCommandParseErr
             action: Some("help".to_string()),
             target: None,
         }),
-        [action @ ("enable" | "disable")] => {
+        [action @ ("enable" | "disable" | "approve")] => {
             Err(usage_error(&format!("mcp {action}"), "<server>"))
         }
-        [action @ ("enable" | "disable"), target] => Ok(SlashCommand::Mcp {
+        [action @ ("enable" | "disable" | "approve"), target] => Ok(SlashCommand::Mcp {
             action: Some((*action).to_string()),
             target: Some((*target).to_string()),
         }),
-        [action @ ("enable" | "disable"), ..] => Err(command_error(
+        [action @ ("enable" | "disable" | "approve"), ..] => Err(command_error(
             &format!("Unexpected arguments for /mcp {action}."),
             "mcp",
             &format!("/mcp {action} <server>"),
         )),
         [action, ..] => Err(command_error(
             &format!(
-                "Unknown /mcp action '{action}'. Use list, show <server>, enable <server>, disable <server>, or help."
+                "Unknown /mcp action '{action}'. Use list, show <server>, enable <server>, disable <server>, approve <server>, or help."
             ),
             "mcp",
-            "/mcp [list|show <server>|enable <server>|disable <server>|help]",
+            "/mcp [list|show <server>|enable <server>|disable <server>|approve <server>|help]",
         )),
     }
 }
@@ -2629,6 +2631,20 @@ fn render_mcp_report_for(
             for name in runtime_config.mcp().disabled().keys() {
                 let _ = write!(report, "\n  {name:<16} disabled");
             }
+            for (name, server) in runtime_config.mcp().needs_approval() {
+                let _ = write!(
+                    report,
+                    "\n  {name:<16} needs approval ({} server, not started): /mcp approve {name}",
+                    config_source_label(server.scope)
+                );
+            }
+            for (name, blocked) in runtime_config.mcp().blocked() {
+                let _ = write!(
+                    report,
+                    "\n  {name:<16} blocked by permissions.deny rule '{}'",
+                    blocked.rule
+                );
+            }
             Ok(report)
         }
         Some(args) if is_help_arg(args) => Ok(render_mcp_usage(None)),
@@ -2636,6 +2652,13 @@ fn render_mcp_report_for(
             let (name, enabled) = mcp_toggle_args(args).unwrap_or_default();
             let outcome = runtime::set_mcp_server_enabled(loader, name, enabled);
             Ok(render_mcp_toggle(&outcome, name, enabled))
+        }
+        Some(args) if mcp_approve_arg(args).is_some() => {
+            let name = mcp_approve_arg(args).unwrap_or_default();
+            Ok(render_mcp_approval(
+                &runtime::approve_mcp_server(loader, name),
+                name,
+            ))
         }
         Some("show") => Ok(render_mcp_usage(Some("show"))),
         Some(args) if args.split_whitespace().next() == Some("show") => {
@@ -2679,6 +2702,17 @@ fn render_mcp_report_json_for(
             let mut report = render_mcp_summary_report_json(cwd, runtime_config.mcp().servers());
             report["disabled_servers"] =
                 json!(runtime_config.mcp().disabled().keys().collect::<Vec<_>>());
+            report["needs_approval_servers"] = json!(runtime_config
+                .mcp()
+                .needs_approval()
+                .keys()
+                .collect::<Vec<_>>());
+            report["blocked_servers"] = json!(runtime_config
+                .mcp()
+                .blocked()
+                .iter()
+                .map(|(name, blocked)| json!({"name": name, "rule": blocked.rule}))
+                .collect::<Vec<_>>());
             Ok(report)
         }
         Some(args) if is_help_arg(args) => Ok(render_mcp_usage_json(None)),
@@ -2686,6 +2720,13 @@ fn render_mcp_report_json_for(
             let (name, enabled) = mcp_toggle_args(args).unwrap_or_default();
             let outcome = runtime::set_mcp_server_enabled(loader, name, enabled);
             Ok(render_mcp_toggle_json(&outcome, name, enabled))
+        }
+        Some(args) if mcp_approve_arg(args).is_some() => {
+            let name = mcp_approve_arg(args).unwrap_or_default();
+            Ok(render_mcp_approval_json(
+                &runtime::approve_mcp_server(loader, name),
+                name,
+            ))
         }
         Some("show") => Ok(render_mcp_usage_json(Some("show"))),
         Some(args) if args.split_whitespace().next() == Some("show") => {
@@ -3885,6 +3926,59 @@ fn mcp_toggle_args(args: &str) -> Option<(&str, bool)> {
     }
 }
 
+/// `approve <server>`: the workspace server to approve.
+fn mcp_approve_arg(args: &str) -> Option<&str> {
+    match args.split_whitespace().collect::<Vec<_>>().as_slice() {
+        ["approve", name] => Some(name),
+        _ => None,
+    }
+}
+
+fn render_mcp_approval(
+    outcome: &Result<runtime::McpApprovalOutcome, String>,
+    name: &str,
+) -> String {
+    match outcome {
+        Err(error) => format!("MCP\n  Error            {error}"),
+        Ok(outcome) => [
+            "MCP".to_string(),
+            if outcome.already {
+                format!("  {name} was already approved for this workspace")
+            } else {
+                format!("  {name} is approved for this workspace as it is configured now")
+            },
+            format!("  Workspace        {}", outcome.workspace.display()),
+            format!("  Approvals        {}", outcome.approvals_path.display()),
+            "  Takes effect     from the next turn; a change to its command, arguments or URL asks again".to_string(),
+        ]
+        .join("\n"),
+    }
+}
+
+fn render_mcp_approval_json(
+    outcome: &Result<runtime::McpApprovalOutcome, String>,
+    name: &str,
+) -> Value {
+    match outcome {
+        Err(error) => json!({
+            "kind": "mcp",
+            "action": "approve",
+            "server": name,
+            "ok": false,
+            "error": error,
+        }),
+        Ok(outcome) => json!({
+            "kind": "mcp",
+            "action": "approve",
+            "server": name,
+            "ok": true,
+            "already": outcome.already,
+            "workspace": outcome.workspace.display().to_string(),
+            "approvals_path": outcome.approvals_path.display().to_string(),
+        }),
+    }
+}
+
 fn render_mcp_toggle(
     outcome: &Result<runtime::McpToggleOutcome, String>,
     name: &str,
@@ -3946,11 +4040,12 @@ fn render_mcp_toggle_json(
 fn render_mcp_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "MCP".to_string(),
-        "  Usage            /mcp [list|show <server>|enable <server>|disable <server>|help]"
+        "  Usage            /mcp [list|show <server>|enable <server>|disable <server>|approve <server>|help]"
             .to_string(),
-        "  Direct CLI       neuron mcp [list|show <server>|enable <server>|disable <server>|login <server>|logout <server>|help]"
+        "  Direct CLI       neuron mcp [list|show <server>|enable <server>|disable <server>|approve <server>|login <server>|logout <server>|help]"
             .to_string(),
         "  Switches         enable/disable edit disabledMcpServers in the user settings".to_string(),
+        "  Approval         approve starts a workspace server (project or local) as configured now".to_string(),
         "  Sources          .claw/settings.json, .claw/settings.local.json".to_string(),
     ];
     if let Some(args) = unexpected {
@@ -3964,8 +4059,8 @@ fn render_mcp_usage_json(unexpected: Option<&str>) -> Value {
         "kind": "mcp",
         "action": "help",
         "usage": {
-            "slash_command": "/mcp [list|show <server>|enable <server>|disable <server>|help]",
-            "direct_cli": "neuron mcp [list|show <server>|enable <server>|disable <server>|login <server>|logout <server>|help]",
+            "slash_command": "/mcp [list|show <server>|enable <server>|disable <server>|approve <server>|help]",
+            "direct_cli": "neuron mcp [list|show <server>|enable <server>|disable <server>|approve <server>|login <server>|logout <server>|help]",
             "sources": [".claw/settings.json", ".claw/settings.local.json"],
         },
         "unexpected": unexpected,
@@ -4576,6 +4671,14 @@ mod tests {
         assert!(SlashCommand::parse("/mcp enable").is_err());
         assert!(SlashCommand::parse("/mcp disable a b").is_err());
         assert_eq!(
+            SlashCommand::parse("/mcp approve docs"),
+            Ok(Some(SlashCommand::Mcp {
+                action: Some("approve".to_string()),
+                target: Some("docs".to_string())
+            }))
+        );
+        assert!(SlashCommand::parse("/mcp approve").is_err());
+        assert_eq!(
             SlashCommand::parse("/memory"),
             Ok(Some(SlashCommand::Memory))
         );
@@ -4788,9 +4891,9 @@ mod tests {
 
         let action_error = parse_error_message("/mcp inspect alpha");
         assert!(action_error
-            .contains("Unknown /mcp action 'inspect'. Use list, show <server>, enable <server>, disable <server>, or help."));
+            .contains("Unknown /mcp action 'inspect'. Use list, show <server>, enable <server>, disable <server>, approve <server>, or help."));
         assert!(action_error.contains(
-            "  Usage            /mcp [list|show <server>|enable <server>|disable <server>|help]"
+            "  Usage            /mcp [list|show <server>|enable <server>|disable <server>|approve <server>|help]"
         ));
     }
 
@@ -4839,7 +4942,9 @@ mod tests {
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
         assert!(help.contains("/config [env|hooks|model|plugins]"));
-        assert!(help.contains("/mcp [list|show <server>|enable <server>|disable <server>|help]"));
+        assert!(help.contains(
+            "/mcp [list|show <server>|enable <server>|disable <server>|approve <server>|help]"
+        ));
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
         assert!(help.contains("/diff"));
@@ -5542,10 +5647,10 @@ mod tests {
 
         let help = super::handle_mcp_slash_command(Some("help"), &cwd).expect("mcp help");
         assert!(help.contains(
-            "Usage            /mcp [list|show <server>|enable <server>|disable <server>|help]"
+            "Usage            /mcp [list|show <server>|enable <server>|disable <server>|approve <server>|help]"
         ));
         assert!(help.contains(
-            "Direct CLI       neuron mcp [list|show <server>|enable <server>|disable <server>|login <server>|logout <server>|help]"
+            "Direct CLI       neuron mcp [list|show <server>|enable <server>|disable <server>|approve <server>|login <server>|logout <server>|help]"
         ));
 
         let unexpected =
@@ -5555,14 +5660,14 @@ mod tests {
         let nested_help =
             super::handle_mcp_slash_command(Some("show --help"), &cwd).expect("mcp help");
         assert!(nested_help.contains(
-            "Usage            /mcp [list|show <server>|enable <server>|disable <server>|help]"
+            "Usage            /mcp [list|show <server>|enable <server>|disable <server>|approve <server>|help]"
         ));
         assert!(nested_help.contains("Unexpected       show"));
 
         let unknown_help =
             super::handle_mcp_slash_command(Some("inspect --help"), &cwd).expect("mcp usage");
         assert!(unknown_help.contains(
-            "Usage            /mcp [list|show <server>|enable <server>|disable <server>|help]"
+            "Usage            /mcp [list|show <server>|enable <server>|disable <server>|approve <server>|help]"
         ));
         assert!(unknown_help.contains("Unexpected       inspect"));
 
@@ -5673,6 +5778,56 @@ mod tests {
         let missing = super::render_mcp_report_for(&loader, &workspace, Some("show missing"))
             .expect("missing report should render");
         assert!(missing.contains("server `missing` is not configured"));
+
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(config_home);
+    }
+
+    #[test]
+    fn mcp_approve_starts_a_waiting_workspace_server() {
+        let workspace = temp_dir("mcp-approve-workspace");
+        let config_home = temp_dir("mcp-approve-home");
+        fs::create_dir_all(workspace.join(".neuron")).expect("workspace config dir");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{"defaultMcpServers":false,"permissions":{"deny":["mcp__gone"]},"mcpServers":{"gone":{"command":"node"}}}"#,
+        )
+        .expect("user settings");
+        fs::write(
+            workspace.join(".neuron").join("settings.json"),
+            r#"{"mcpServers":{"docs":{"command":"npx","args":["docs-server"]}}}"#,
+        )
+        .expect("project settings");
+        let loader = ConfigLoader::new(&workspace, &config_home).with_mcp_approvals(true);
+
+        let list = super::render_mcp_report_for(&loader, &workspace, None).expect("list");
+        assert!(list.contains("Configured servers 0"), "{list}");
+        assert!(
+            list.contains(
+                "docs             needs approval (project server, not started): /mcp approve docs"
+            ),
+            "{list}"
+        );
+        assert!(
+            list.contains("gone             blocked by permissions.deny rule 'mcp__gone'"),
+            "{list}"
+        );
+        let json = super::render_mcp_report_json_for(&loader, &workspace, None).expect("json");
+        assert_eq!(json["needs_approval_servers"], serde_json::json!(["docs"]));
+        assert_eq!(json["blocked_servers"][0]["rule"], "mcp__gone");
+
+        let approved = super::render_mcp_report_for(&loader, &workspace, Some("approve docs"))
+            .expect("approve");
+        assert!(
+            approved.contains("docs is approved for this workspace"),
+            "{approved}"
+        );
+        let list = super::render_mcp_report_for(&loader, &workspace, None).expect("list");
+        assert!(list.contains("Configured servers 1"), "{list}");
+        let refused = super::render_mcp_report_json_for(&loader, &workspace, Some("approve gone"))
+            .expect("approve json");
+        assert_eq!(refused["ok"], false);
 
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(config_home);

@@ -149,6 +149,20 @@ pub struct McpConfigCollection {
     servers: BTreeMap<String, ScopedMcpServerConfig>,
     /// Configured servers turned off by `disabledMcpServers` (in any settings file).
     disabled: BTreeMap<String, ScopedMcpServerConfig>,
+    /// Workspace servers that are new or changed since the user approved them (see
+    /// [`crate::mcp_approvals`]); they do not start.
+    needs_approval: BTreeMap<String, ScopedMcpServerConfig>,
+    /// Servers a `permissions.deny` rule refuses whole (`mcp__<server>`); they do not
+    /// start.
+    blocked: BTreeMap<String, BlockedMcpServer>,
+}
+
+/// A configured MCP server that does not start because a rule refuses all its tools.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockedMcpServer {
+    pub server: ScopedMcpServerConfig,
+    /// The `permissions.deny` rule.
+    pub rule: String,
 }
 
 /// MCP server config paired with the scope that defined it.
@@ -337,18 +351,23 @@ pub struct ConfigLoader {
     cwd: PathBuf,
     config_home: PathBuf,
     project_trust: ProjectTrust,
+    /// Workspace MCP servers start only once approved ([`crate::mcp_approvals`]).
+    mcp_approvals: bool,
 }
 
 impl ConfigLoader {
-    /// Loader with explicit paths that applies workspace settings in full.
-    /// Production code uses [`ConfigLoader::default_for`], which checks
-    /// workspace trust; call [`ConfigLoader::with_project_trust`] to change it.
+    /// Loader with explicit paths that applies workspace settings in full and
+    /// starts workspace MCP servers without approval. Production code uses
+    /// [`ConfigLoader::default_for`], which checks workspace trust and approvals;
+    /// call [`ConfigLoader::with_project_trust`] and
+    /// [`ConfigLoader::with_mcp_approvals`] to change them.
     #[must_use]
     pub fn new(cwd: impl Into<PathBuf>, config_home: impl Into<PathBuf>) -> Self {
         Self {
             cwd: cwd.into(),
             config_home: config_home.into(),
             project_trust: ProjectTrust::Trusted,
+            mcp_approvals: false,
         }
     }
 
@@ -362,6 +381,7 @@ impl ConfigLoader {
             cwd,
             config_home,
             project_trust: ProjectTrust::FromWorkspaceTrust,
+            mcp_approvals: true,
         }
     }
 
@@ -371,9 +391,22 @@ impl ConfigLoader {
         self
     }
 
+    /// Whether workspace (Project and Local) MCP servers start only once the user
+    /// approved them ([`crate::mcp_approvals`]).
+    #[must_use]
+    pub fn with_mcp_approvals(mut self, required: bool) -> Self {
+        self.mcp_approvals = required;
+        self
+    }
+
     #[must_use]
     pub fn config_home(&self) -> &Path {
         &self.config_home
+    }
+
+    #[must_use]
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
     }
 
     #[must_use]
@@ -481,6 +514,9 @@ impl ConfigLoader {
             deep_merge_objects(&mut merged, &object);
             loaded_entries.push(entry);
         }
+        if workspace_trusted {
+            self.merge_project_mcp_json(&mut mcp_servers)?;
+        }
 
         for warning in &all_warnings {
             crate::ui_hooks::notice(&format!("warning: {warning}"));
@@ -519,6 +555,13 @@ impl ConfigLoader {
         }
 
         let merged_value = JsonValue::Object(merged.clone());
+        let permission_rules = parse_optional_permission_rules(&merged_value)?;
+        let blocked_servers = take_blocked_mcp_servers(&mut mcp_servers, &permission_rules);
+        let unapproved_servers = if self.mcp_approvals {
+            self.take_unapproved_mcp_servers(&mut mcp_servers)
+        } else {
+            BTreeMap::new()
+        };
 
         let feature_config = RuntimeFeatureConfig {
             hooks: parse_optional_hooks_config(&merged_value)?,
@@ -526,12 +569,14 @@ impl ConfigLoader {
             mcp: McpConfigCollection {
                 servers: mcp_servers,
                 disabled: disabled_servers,
+                needs_approval: unapproved_servers,
+                blocked: blocked_servers,
             },
             oauth: parse_optional_oauth_config(&merged_value, "merged settings.oauth")?,
             model: parse_optional_model(&merged_value),
             aliases: parse_optional_aliases(&merged_value)?,
             permission_mode: parse_optional_permission_mode(&merged_value)?,
-            permission_rules: parse_optional_permission_rules(&merged_value)?,
+            permission_rules,
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
@@ -544,6 +589,58 @@ impl ConfigLoader {
             feature_config,
             ignored_project_settings,
         })
+    }
+
+    /// The workspace's `.mcp.json` (the file other agents read): its `mcpServers` join
+    /// as Project servers, below the workspace's own settings files and above the
+    /// user's. Only `mcpServers` is read from it.
+    fn merge_project_mcp_json(
+        &self,
+        servers: &mut BTreeMap<String, ScopedMcpServerConfig>,
+    ) -> Result<(), ConfigError> {
+        let path = self.project_mcp_json_path();
+        let Some(parsed) = read_optional_json_object(&path)? else {
+            return Ok(());
+        };
+        let mut found = BTreeMap::new();
+        merge_mcp_servers(&mut found, ConfigSource::Project, &parsed.object, &path)?;
+        for (name, server) in found {
+            let replaces = servers
+                .get(&name)
+                .is_none_or(|existing| existing.scope < ConfigSource::Project);
+            if replaces {
+                servers.insert(name, server);
+            }
+        }
+        Ok(())
+    }
+
+    /// `<workspace>/.mcp.json`.
+    #[must_use]
+    pub fn project_mcp_json_path(&self) -> PathBuf {
+        self.cwd.join(".mcp.json")
+    }
+
+    /// Removes and returns the workspace servers not approved with their current
+    /// launch spec.
+    fn take_unapproved_mcp_servers(
+        &self,
+        servers: &mut BTreeMap<String, ScopedMcpServerConfig>,
+    ) -> BTreeMap<String, ScopedMcpServerConfig> {
+        let approvals = crate::mcp_approvals::McpApprovals::in_config_home(&self.config_home);
+        let workspace = crate::mcp_approvals::mcp_approval_workspace(&self.cwd);
+        let unapproved = servers
+            .iter()
+            .filter(|(name, server)| {
+                crate::mcp_approvals::mcp_scope_needs_approval(server.scope)
+                    && !approvals.is_approved(&workspace, name, &server.config)
+            })
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        unapproved
+            .into_iter()
+            .filter_map(|name| servers.remove_entry(&name))
+            .collect()
     }
 
     /// What the workspace's own settings files would turn on once it is trusted, whatever
@@ -611,6 +708,30 @@ impl ConfigLoader {
                     "hooks" | "mcpServers" | "permissions.allow" | "permissions.ask"
                 ) {
                     other.insert(key);
+                }
+            }
+        }
+        let mcp_json = self.project_mcp_json_path();
+        if let Ok(Some(parsed)) = read_optional_json_object(&mcp_json) {
+            preview.settings_files.push(mcp_json.clone());
+            if let Some(mcp) = parsed
+                .object
+                .get("mcpServers")
+                .and_then(JsonValue::as_object)
+            {
+                for (name, value) in mcp {
+                    let Ok(config) = parse_mcp_server_config(name, value, "trust preview") else {
+                        continue;
+                    };
+                    // The settings files' servers win, as when loading.
+                    servers
+                        .entry(name.clone())
+                        .or_insert_with(|| PreviewMcpServer {
+                            name: name.clone(),
+                            transport: config.transport(),
+                            target: mcp_preview_target(&config),
+                            source: mcp_json.clone(),
+                        });
                 }
             }
         }
@@ -1257,6 +1378,18 @@ impl McpConfigCollection {
     pub fn disabled(&self) -> &BTreeMap<String, ScopedMcpServerConfig> {
         &self.disabled
     }
+
+    /// Workspace servers waiting for the user's approval; they do not start.
+    #[must_use]
+    pub fn needs_approval(&self) -> &BTreeMap<String, ScopedMcpServerConfig> {
+        &self.needs_approval
+    }
+
+    /// Servers a deny rule refuses whole; they do not start.
+    #[must_use]
+    pub fn blocked(&self) -> &BTreeMap<String, BlockedMcpServer> {
+        &self.blocked
+    }
 }
 
 impl ScopedMcpServerConfig {
@@ -1319,6 +1452,31 @@ fn read_optional_json_object(path: &Path) -> Result<Option<ParsedConfigFile>, Co
         object: object.clone(),
         source: contents,
     }))
+}
+
+/// Removes and returns the servers a `permissions.deny` rule refuses whole
+/// (`mcp__<server>` or `mcp__<server>__*`): none of their tools could run.
+fn take_blocked_mcp_servers(
+    servers: &mut BTreeMap<String, ScopedMcpServerConfig>,
+    rules: &RuntimePermissionRuleConfig,
+) -> BTreeMap<String, BlockedMcpServer> {
+    let blocked = servers
+        .keys()
+        .filter_map(|name| {
+            rules
+                .deny()
+                .iter()
+                .find(|rule| crate::permissions::rule_covers_mcp_server(rule, name))
+                .map(|rule| (name.clone(), rule.clone()))
+        })
+        .collect::<Vec<_>>();
+    blocked
+        .into_iter()
+        .filter_map(|(name, rule)| {
+            let server = servers.remove(&name)?;
+            Some((name, BlockedMcpServer { server, rule }))
+        })
+        .collect()
 }
 
 fn merge_mcp_servers(

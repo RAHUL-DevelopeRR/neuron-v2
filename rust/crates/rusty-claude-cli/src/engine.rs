@@ -777,6 +777,39 @@ fn extensions_event() -> UiEvent {
                         enabled: false,
                     }
                 }));
+                // Configured and switched on, but not started: waiting for approval, or
+                // refused whole by a deny rule.
+                let not_started = config
+                    .mcp()
+                    .needs_approval()
+                    .iter()
+                    .map(|(name, server)| {
+                        (
+                            name,
+                            server,
+                            "needs_approval",
+                            format!("a workspace server: run /mcp approve {name} to start it"),
+                        )
+                    })
+                    .chain(config.mcp().blocked().iter().map(|(name, blocked)| {
+                        (
+                            name,
+                            &blocked.server,
+                            "blocked",
+                            format!("refused by the permissions.deny rule '{}'", blocked.rule),
+                        )
+                    }));
+                servers.extend(
+                    not_started.map(|(name, server, status, why)| McpServerInfo {
+                        name: name.clone(),
+                        scope: config_scope_id(server.scope).to_string(),
+                        transport: mcp_transport_id(server.transport()).to_string(),
+                        status: status.to_string(),
+                        tools: Vec::new(),
+                        error: Some(why),
+                        enabled: true,
+                    }),
+                );
                 servers.sort_by(|left, right| left.name.cmp(&right.name));
                 servers
             }

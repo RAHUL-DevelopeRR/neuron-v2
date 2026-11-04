@@ -173,8 +173,11 @@ pub struct McpServerInfo {
     /// `stdio`, `http`, `sse`, `ws`, `sdk` or `managed_proxy`.
     pub transport: String,
     /// `starting`, `ready`, `failed`, `pending` (started, tools not found),
-    /// `unsupported` (a transport Neuron does not speak yet), `not_started` or
-    /// `disabled` (turned off in the settings).
+    /// `unsupported` (a transport Neuron does not speak yet), `not_started`,
+    /// `disabled` (turned off in the settings), `needs_approval` (a workspace server
+    /// that is new or changed: it starts once the user approves it) or `blocked`
+    /// (a deny rule refuses all its tools); `error` says why for the last two.
+    /// Older engines send none of the last two; a UI shows an unknown status as is.
     pub status: String,
     /// Its tools, without the `mcp__<server>__` prefix.
     pub tools: Vec<String>,

@@ -7375,7 +7375,9 @@ mod tests {
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
         assert!(help.contains("/config [env|hooks|model|plugins]"));
-        assert!(help.contains("/mcp [list|show <server>|enable <server>|disable <server>|help]"));
+        assert!(help.contains(
+            "/mcp [list|show <server>|enable <server>|disable <server>|approve <server>|help]"
+        ));
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
         assert!(help.contains("/diff"));
@@ -9234,6 +9236,66 @@ UU conflicted.rs",
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(workspace);
+    }
+
+    /// A server a `git pull` adds to a trusted repository's settings is listed as needing
+    /// approval and never spawned (the fixture marks its start with a file); once
+    /// approved it starts and its tools join.
+    #[test]
+    fn a_pulled_workspace_server_is_not_spawned_until_approved() {
+        let config_home = temp_dir();
+        let workspace = temp_dir();
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(workspace.join(".neuron")).expect("workspace");
+        let script = workspace.join("fixture-mcp.py");
+        write_mcp_server_fixture(&script);
+        let marker = workspace.join("spawned.marker");
+        let (python, mut args) = fixture_python();
+        args.push("-c".to_string());
+        args.push(format!(
+            "open(r'{}', 'a').close(); import runpy; runpy.run_path(r'{}', run_name='__main__')",
+            marker.display(),
+            script.display()
+        ));
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{"defaultMcpServers":false}"#,
+        )
+        .expect("user settings");
+        fs::write(
+            workspace.join(".neuron").join("settings.json"),
+            json!({"mcpServers": {"alpha": {
+                "command": python,
+                "args": args,
+                "env": {"NEURON_MCP_FRAMING": "content-length"}
+            }}})
+            .to_string(),
+        )
+        .expect("project settings");
+        let loader = ConfigLoader::new(&workspace, &config_home).with_mcp_approvals(true);
+
+        let config = loader.load().expect("config");
+        assert!(config.mcp().needs_approval().contains_key("alpha"));
+        let state = build_runtime_plugin_state_with_loader(&workspace, &loader, &config)
+            .expect("plugin state");
+        assert!(!state.tool_registry.has_runtime_tool("mcp__alpha__echo"));
+        assert!(state.mcp_state.is_none());
+        assert!(!marker.exists(), "the unapproved server was spawned");
+
+        runtime::approve_mcp_server(&loader, "alpha").expect("approve");
+        let config = loader.load().expect("config");
+        let state = build_runtime_plugin_state_with_loader(&workspace, &loader, &config)
+            .expect("plugin state");
+        assert!(state.tool_registry.has_runtime_tool("mcp__alpha__echo"));
+        assert!(marker.exists(), "the approved server starts");
+        if let Some(mcp_state) = state.mcp_state {
+            let _ = mcp_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .shutdown();
+        }
+        let _ = fs::remove_dir_all(&config_home);
+        let _ = fs::remove_dir_all(&workspace);
     }
 
     /// The Python that runs the MCP server fixture: the `py -3` launcher on Windows, or

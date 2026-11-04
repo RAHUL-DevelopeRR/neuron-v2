@@ -38,6 +38,22 @@ describe('the MCP servers panel', () => {
     expect(
       serverSummary(server({ status: 'failed', tools: [], error: 'run `neuron mcp login docs`' })),
     ).toBe('failed: run `neuron mcp login docs`')
+    // Servers that are configured but not started say why.
+    expect(
+      serverSummary(
+        server({
+          status: 'needs_approval',
+          scope: 'project',
+          tools: [],
+          error: 'a workspace server: run /mcp approve docs to start it',
+        }),
+      ),
+    ).toBe('needs approval: a workspace server: run /mcp approve docs to start it')
+    expect(
+      serverSummary(
+        server({ status: 'blocked', tools: [], error: "refused by the permissions.deny rule 'mcp__docs'" }),
+      ),
+    ).toBe("blocked: refused by the permissions.deny rule 'mcp__docs'")
     // Older engines leave `enabled` out: the server is on.
     const { enabled: _enabled, ...legacy } = server()
     expect(serverEnabled(legacy)).toBe(true)

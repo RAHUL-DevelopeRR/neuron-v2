@@ -881,16 +881,16 @@ pub(crate) fn classify_subcommand_words(rest: &[String]) -> SubcommandWords {
         // Signing in or out and switching a server change something: never a guess.
         "mcp" if matches!(
             words.first(),
-            Some(&("login" | "logout" | "enable" | "disable"))
+            Some(&("login" | "logout" | "enable" | "disable" | "approve"))
         ) =>
         {
             changes(
-                "neuron mcp [login|logout|enable|disable] <server>",
+                "neuron mcp [login|logout|enable|disable|approve] <server>",
                 words.len() == 2,
             )
         }
         "mcp" => shows(
-            "neuron mcp [list|show <server>|enable <server>|disable <server>|login <server>|logout <server>|serve|help]",
+            "neuron mcp [list|show <server>|enable <server>|disable <server>|approve <server>|login <server>|logout <server>|serve|help]",
             matches!(
                 without_help_word(&words),
                 [] | ["list" | "show" | "serve"] | ["show", _]

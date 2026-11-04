@@ -224,7 +224,12 @@ export interface McpServerInfo {
   scope: string
   /** `stdio`, `http`, `sse`, `ws`, `sdk` or `managed_proxy`. */
   transport: string
-  /** `starting`, `ready`, `failed`, `pending`, `unsupported`, `not_started` or `disabled`. */
+  /**
+   * `starting`, `ready`, `failed`, `pending`, `unsupported`, `not_started`,
+   * `disabled`, `needs_approval` (a new or changed workspace server, started once
+   * approved with `/mcp approve <name>`) or `blocked` (a deny rule refuses all its
+   * tools). `error` says why for the last two; older engines send neither.
+   */
   status: string
   /** Its tools, without the `mcp__<server>__` prefix. */
   tools: string[]

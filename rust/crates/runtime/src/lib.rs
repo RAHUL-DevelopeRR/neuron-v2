@@ -32,6 +32,7 @@ mod json;
 mod lane_events;
 pub mod lsp_client;
 mod mcp;
+pub mod mcp_approvals;
 mod mcp_client;
 mod mcp_http;
 pub mod mcp_lifecycle_hardened;
@@ -97,7 +98,7 @@ pub use compact::{
     DEFAULT_MAX_SUMMARY_TOKENS, DERIVED_CONTEXT_NOTE,
 };
 pub use config::{
-    ConfigEntry, ConfigError, ConfigLoader, ConfigSource, IgnoredProjectSettings,
+    BlockedMcpServer, ConfigEntry, ConfigError, ConfigLoader, ConfigSource, IgnoredProjectSettings,
     McpConfigCollection, McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig,
     McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
     McpWebSocketServerConfig, OAuthConfig, PreviewHook, PreviewMcpServer, PreviewPermissionRule,
@@ -140,6 +141,7 @@ pub use mcp::{
     mcp_server_signature, mcp_tool_name, mcp_tool_prefix, normalize_name_for_mcp,
     scoped_mcp_config_hash, unwrap_ccr_proxy_url,
 };
+pub use mcp_approvals::{approve_mcp_server, McpApprovalOutcome, McpApprovals};
 pub use mcp_client::{
     McpClientAuth, McpClientBootstrap, McpClientTransport, McpManagedProxyTransport,
     McpRemoteTransport, McpSdkTransport, McpStdioTransport,

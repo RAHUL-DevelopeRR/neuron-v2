@@ -76,7 +76,12 @@ pub fn set_mcp_server_enabled(
     let settings_path = loader.config_home().join("settings.json");
     if !enabled {
         let config = loader.load().map_err(|error| error.to_string())?;
-        if config.mcp().get(name).is_none() && config.mcp().disabled().get(name).is_none() {
+        let mcp = config.mcp();
+        let configured = mcp.get(name).is_some()
+            || mcp.disabled().contains_key(name)
+            || mcp.needs_approval().contains_key(name)
+            || mcp.blocked().contains_key(name);
+        if !configured {
             return Err(format!("no MCP server named `{name}` is configured"));
         }
     }
