@@ -8,9 +8,11 @@
 //!
 //! Approvals live in `<config home>/mcp-approvals.json`, keyed by the workspace
 //! root (its git root, or the folder outside git), the server name and the sha256
-//! of its launch spec: transport, command, arguments, the names (not values) of
-//! its environment variables and headers, the headers helper and the URL. Changing
-//! any of these asks again. Bundled and User servers need no approval.
+//! of its launch spec: transport, command, arguments, its environment variables and
+//! headers (names and values as written, so `${VAR}` templates; only the digest is
+//! stored), the headers helper, the URL and the OAuth settings. Changing any of
+//! these asks again: a pulled `NODE_OPTIONS`, or a header that now expands another
+//! secret, is a new launch spec. Bundled and User servers need no approval.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -31,29 +33,33 @@ pub fn mcp_scope_needs_approval(scope: ConfigSource) -> bool {
     matches!(scope, ConfigSource::Project | ConfigSource::Local)
 }
 
-/// The sha256 (hex) of what starts or reaches the server; secrets (environment and
-/// header values) are left out.
+/// The sha256 (hex) of what starts or reaches the server, environment and header
+/// values included: only the digest is stored, never a value.
 #[must_use]
 pub fn mcp_launch_fingerprint(config: &McpServerConfig) -> String {
-    let keys =
-        |map: &std::collections::BTreeMap<String, String>| map.keys().cloned().collect::<Vec<_>>();
     let spec = match config {
         McpServerConfig::Stdio(stdio) => json!({
             "type": "stdio",
             "command": stdio.command,
             "args": stdio.args,
-            "envKeys": keys(&stdio.env),
+            "env": stdio.env,
         }),
         McpServerConfig::Sse(remote) | McpServerConfig::Http(remote) => json!({
             "type": if matches!(config, McpServerConfig::Sse(_)) { "sse" } else { "http" },
             "url": remote.url,
-            "headerKeys": keys(&remote.headers),
+            "headers": remote.headers,
             "headersHelper": remote.headers_helper,
+            "oauth": remote.oauth.as_ref().map(|oauth| json!({
+                "clientId": oauth.client_id,
+                "callbackPort": oauth.callback_port,
+                "authServerMetadataUrl": oauth.auth_server_metadata_url,
+                "xaa": oauth.xaa,
+            })),
         }),
         McpServerConfig::Ws(socket) => json!({
             "type": "ws",
             "url": socket.url,
-            "headerKeys": keys(&socket.headers),
+            "headers": socket.headers,
             "headersHelper": socket.headers_helper,
         }),
         McpServerConfig::Sdk(sdk) => json!({"type": "sdk", "name": sdk.name}),
@@ -158,6 +164,8 @@ pub struct McpApprovalOutcome {
     pub workspace: PathBuf,
     /// The server was approved already (with this launch spec).
     pub already: bool,
+    /// The server is switched off (`/mcp enable <server>` starts it).
+    pub disabled: bool,
     /// The approvals file.
     pub approvals_path: PathBuf,
 }
@@ -172,35 +180,45 @@ pub fn approve_mcp_server(loader: &ConfigLoader, name: &str) -> Result<McpApprov
     }
     let config = loader.load().map_err(|error| error.to_string())?;
     let approvals = McpApprovals::in_config_home(loader.config_home());
-    let outcome = |already| McpApprovalOutcome {
-        workspace: mcp_approval_workspace(loader.cwd()),
+    let workspace = mcp_approval_workspace(loader.cwd());
+    let outcome = |already, disabled| McpApprovalOutcome {
+        workspace: workspace.clone(),
         already,
+        disabled,
         approvals_path: approvals.path().to_path_buf(),
     };
-    let Some(server) = config.mcp().needs_approval().get(name) else {
-        if let Some(blocked) = config.mcp().blocked().get(name) {
-            return Err(format!(
-                "`{name}` is refused by the permissions.deny rule '{}', so it does not start",
-                blocked.rule
-            ));
-        }
-        let known = config
-            .mcp()
-            .get(name)
-            .or_else(|| config.mcp().disabled().get(name));
-        return match known {
-            Some(server) if mcp_scope_needs_approval(server.scope) => Ok(outcome(true)),
-            Some(_) => Err(format!(
-                "`{name}` is not a workspace server, so it needs no approval"
-            )),
-            None if !loader.workspace_is_trusted() => Err(format!(
-                "this folder is not trusted, so its MCP servers are not loaded; trust it first, then approve `{name}`"
-            )),
-            None => Err(format!("no MCP server named `{name}` is configured")),
-        };
+    if let Some(server) = config.mcp().needs_approval().get(name) {
+        approvals.approve(&workspace, name, &server.config)?;
+        return Ok(outcome(false, false));
+    }
+    if let Some(blocked) = config.mcp().blocked().get(name) {
+        return Err(format!(
+            "`{name}` is refused by the permissions.deny rule '{}', so it does not start",
+            blocked.rule
+        ));
+    }
+    // A disabled server is set aside before approvals are checked, so whether it is
+    // approved is looked up here; approving it now saves a step once it is enabled.
+    let (known, disabled) = match config.mcp().get(name) {
+        Some(server) => (Some(server), false),
+        None => (config.mcp().disabled().get(name), true),
     };
-    approvals.approve(&mcp_approval_workspace(loader.cwd()), name, &server.config)?;
-    Ok(outcome(false))
+    match known {
+        Some(server) if mcp_scope_needs_approval(server.scope) => {
+            if approvals.is_approved(&workspace, name, &server.config) {
+                return Ok(outcome(true, disabled));
+            }
+            approvals.approve(&workspace, name, &server.config)?;
+            Ok(outcome(false, disabled))
+        }
+        Some(_) => Err(format!(
+            "`{name}` is not a workspace server, so it needs no approval"
+        )),
+        None if !loader.workspace_is_trusted() => Err(format!(
+            "this folder is not trusted, so its MCP servers are not loaded; trust it first, then approve `{name}`"
+        )),
+        None => Err(format!("no MCP server named `{name}` is configured")),
+    }
 }
 
 #[cfg(test)]
@@ -211,7 +229,8 @@ mod tests {
 
     use super::{approve_mcp_server, mcp_launch_fingerprint, McpApprovals};
     use crate::config::{
-        ConfigLoader, ConfigSource, McpServerConfig, McpStdioServerConfig, ProjectTrust,
+        ConfigLoader, ConfigSource, McpOAuthConfig, McpRemoteServerConfig, McpServerConfig,
+        McpStdioServerConfig, ProjectTrust,
     };
 
     fn temp_root(label: &str) -> PathBuf {
@@ -375,21 +394,112 @@ mod tests {
         })
     }
 
+    fn http(headers: &[(&str, &str)], oauth: Option<McpOAuthConfig>) -> McpServerConfig {
+        McpServerConfig::Http(McpRemoteServerConfig {
+            url: "https://mcp.example.com/mcp".to_string(),
+            headers: headers
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect::<BTreeMap<_, _>>(),
+            headers_helper: None,
+            oauth,
+        })
+    }
+
+    fn oauth(metadata: &str) -> McpOAuthConfig {
+        McpOAuthConfig {
+            client_id: Some("neuron".to_string()),
+            callback_port: None,
+            auth_server_metadata_url: Some(metadata.to_string()),
+            xaa: None,
+        }
+    }
+
     #[test]
-    fn the_fingerprint_follows_the_launch_spec_but_not_secret_values() {
-        let base = mcp_launch_fingerprint(&stdio("node", &["server.js"], &[("TOKEN", "a")]));
+    fn the_fingerprint_follows_the_whole_launch_spec() {
+        let base = mcp_launch_fingerprint(&stdio("node", &["server.js"], &[("TOKEN", "${CI}")]));
         assert_eq!(base.len(), 64);
         assert_eq!(
             base,
-            mcp_launch_fingerprint(&stdio("node", &["server.js"], &[("TOKEN", "b")]))
+            mcp_launch_fingerprint(&stdio("node", &["server.js"], &[("TOKEN", "${CI}")]))
         );
         for changed in [
-            stdio("node", &["evil.js"], &[("TOKEN", "a")]),
-            stdio("python", &["server.js"], &[("TOKEN", "a")]),
-            stdio("node", &["server.js"], &[("OTHER", "a")]),
+            stdio("node", &["evil.js"], &[("TOKEN", "${CI}")]),
+            stdio("python", &["server.js"], &[("TOKEN", "${CI}")]),
+            stdio("node", &["server.js"], &[("OTHER", "${CI}")]),
+            // A pulled value can expand another secret, or load code into the server.
+            stdio(
+                "node",
+                &["server.js"],
+                &[("TOKEN", "${AWS_SECRET_ACCESS_KEY}")],
+            ),
+            stdio(
+                "node",
+                &["server.js"],
+                &[("TOKEN", "${CI}"), ("NODE_OPTIONS", "--require ./evil.js")],
+            ),
         ] {
             assert_ne!(base, mcp_launch_fingerprint(&changed), "{changed:?}");
         }
+
+        let remote = mcp_launch_fingerprint(&http(&[("X-Trace", "${CI}")], None));
+        let signed_in = http(
+            &[("X-Trace", "${CI}")],
+            Some(oauth("https://auth.example.com/.well-known/oauth")),
+        );
+        for changed in [
+            http(&[("X-Trace", "${AWS_SECRET_ACCESS_KEY}")], None),
+            signed_in.clone(),
+        ] {
+            assert_ne!(remote, mcp_launch_fingerprint(&changed), "{changed:?}");
+        }
+        assert_ne!(
+            mcp_launch_fingerprint(&signed_in),
+            mcp_launch_fingerprint(&http(
+                &[("X-Trace", "${CI}")],
+                Some(oauth("https://evil.example/.well-known/oauth"))
+            ))
+        );
+    }
+
+    #[test]
+    fn approving_a_disabled_workspace_server_records_the_approval() {
+        let root = temp_root("disabled");
+        fs::write(
+            root.join("home").join("settings.json"),
+            r#"{"defaultMcpServers":false}"#,
+        )
+        .expect("user settings");
+        let project = root.join("repo").join(".neuron").join("settings.json");
+        fs::write(
+            &project,
+            serde_json::json!({
+                "mcpServers": {"docs": {"command": "node", "args": ["docs.js"]}},
+                "disabledMcpServers": ["docs"]
+            })
+            .to_string(),
+        )
+        .expect("project settings");
+        let trusted = loader(&root, ProjectTrust::Trusted);
+        let config = trusted.load().expect("config");
+        assert!(config.mcp().disabled().contains_key("docs"));
+        assert!(config.mcp().needs_approval().is_empty());
+
+        let outcome = approve_mcp_server(&trusted, "docs").expect("approve");
+        assert!(!outcome.already, "it was never approved");
+        assert!(outcome.disabled);
+        let again = approve_mcp_server(&trusted, "docs").expect("again");
+        assert!(again.already && again.disabled);
+
+        // Once enabled, it starts without asking again.
+        write_servers(
+            &project,
+            &serde_json::json!({"docs": {"command": "node", "args": ["docs.js"]}}),
+        );
+        let config = trusted.load().expect("config");
+        assert!(config.mcp().get("docs").is_some());
+        assert!(config.mcp().needs_approval().is_empty());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

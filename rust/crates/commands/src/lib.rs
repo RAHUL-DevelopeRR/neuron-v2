@@ -3940,18 +3940,30 @@ fn render_mcp_approval(
 ) -> String {
     match outcome {
         Err(error) => format!("MCP\n  Error            {error}"),
-        Ok(outcome) => [
-            "MCP".to_string(),
-            if outcome.already {
-                format!("  {name} was already approved for this workspace")
+        Ok(outcome) => {
+            let mut lines = vec![
+                "MCP".to_string(),
+                if outcome.already {
+                    format!("  {name} was already approved for this workspace")
+                } else {
+                    format!("  {name} is approved for this workspace as it is configured now")
+                },
+                format!("  Workspace        {}", outcome.workspace.display()),
+                format!("  Approvals        {}", outcome.approvals_path.display()),
+            ];
+            if outcome.disabled {
+                lines.push(format!(
+                    "  Disabled         it starts once enabled: /mcp enable {name}"
+                ));
             } else {
-                format!("  {name} is approved for this workspace as it is configured now")
-            },
-            format!("  Workspace        {}", outcome.workspace.display()),
-            format!("  Approvals        {}", outcome.approvals_path.display()),
-            "  Takes effect     from the next turn; a change to its command, arguments or URL asks again".to_string(),
-        ]
-        .join("\n"),
+                lines.push("  Takes effect     from the next turn".to_string());
+            }
+            lines.push(
+                "  Asks again       when its command, arguments, environment, headers or URL change"
+                    .to_string(),
+            );
+            lines.join("\n")
+        }
     }
 }
 
@@ -3973,6 +3985,7 @@ fn render_mcp_approval_json(
             "server": name,
             "ok": true,
             "already": outcome.already,
+            "disabled": outcome.disabled,
             "workspace": outcome.workspace.display().to_string(),
             "approvals_path": outcome.approvals_path.display().to_string(),
         }),
@@ -5796,7 +5809,7 @@ mod tests {
         .expect("user settings");
         fs::write(
             workspace.join(".neuron").join("settings.json"),
-            r#"{"mcpServers":{"docs":{"command":"npx","args":["docs-server"]}}}"#,
+            r#"{"mcpServers":{"docs":{"command":"npx","args":["docs-server"]},"off":{"command":"node"}},"disabledMcpServers":["off"]}"#,
         )
         .expect("project settings");
         let loader = ConfigLoader::new(&workspace, &config_home).with_mcp_approvals(true);
@@ -5828,6 +5841,17 @@ mod tests {
         let refused = super::render_mcp_report_json_for(&loader, &workspace, Some("approve gone"))
             .expect("approve json");
         assert_eq!(refused["ok"], false);
+
+        // A disabled workspace server is approved for when it is enabled, not
+        // reported as approved already.
+        let off = super::render_mcp_report_for(&loader, &workspace, Some("approve off"))
+            .expect("approve off");
+        assert!(off.contains("off is approved for this workspace"), "{off}");
+        assert!(off.contains("/mcp enable off"), "{off}");
+        let again = super::render_mcp_report_json_for(&loader, &workspace, Some("approve off"))
+            .expect("approve off json");
+        assert_eq!(again["already"], true);
+        assert_eq!(again["disabled"], true);
 
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(config_home);
