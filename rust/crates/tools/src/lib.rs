@@ -3586,6 +3586,11 @@ fn execute_todo_write(input: TodoWriteInput) -> Result<TodoWriteOutput, String> 
         serde_json::to_string_pretty(&persisted).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
+    // The store holds the list now, so the one an earlier release left in the
+    // workspace has done its job.
+    if let Some(legacy) = legacy_path.as_deref() {
+        remove_legacy_todos(legacy);
+    }
 
     let verification_nudge_needed = (all_done
         && input.todos.len() >= 3
@@ -3670,6 +3675,27 @@ fn previous_todos(store: &Path, legacy: Option<&Path>) -> Result<Vec<TodoItem>, 
         .and_then(|path| std::fs::read_to_string(path).ok())
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default())
+}
+
+/// Removes the task list an earlier release left in the workspace at `legacy`, unless git
+/// tracks it: someone committed it, and deleting it would be a change to commit. An
+/// untracked or ignored one goes, as does one outside a repository; when git can't be
+/// run to ask, it stays.
+fn remove_legacy_todos(legacy: &Path) {
+    let (Some(folder), Some(name)) = (legacy.parent(), legacy.file_name()) else {
+        return;
+    };
+    if !legacy.is_file() {
+        return;
+    }
+    let tracked = Command::new("git")
+        .args(["ls-files", "--error-unmatch", "--"])
+        .arg(name)
+        .current_dir(folder)
+        .output();
+    if tracked.is_ok_and(|output| !output.status.success()) {
+        let _ = std::fs::remove_file(legacy);
+    }
 }
 
 fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
@@ -9281,9 +9307,8 @@ mod tests {
         assert!(store.starts_with(home.join("todos")), "{}", store.display());
         assert!(store.exists(), "{}", store.display());
         assert!(!store.starts_with(&cwd));
-        assert_eq!(
-            legacy.exists(),
-            legacy_existed,
+        assert!(
+            legacy_existed || !legacy.exists(),
             "nothing written to the workspace"
         );
         let _ = fs::remove_dir_all(&home);
@@ -9318,6 +9343,48 @@ mod tests {
             Vec::<super::TodoItem>::new()
         );
         let _ = fs::remove_dir_all(&workspace);
+    }
+
+    /// Once the store has the list, the one an earlier release left in the workspace is
+    /// removed when git does not track it, and kept when it does.
+    #[test]
+    fn the_legacy_todo_list_is_removed_unless_git_tracks_it() {
+        let list = r#"[{"content":"Old","activeForm":"Doing old","status":"pending"}]"#;
+
+        // Outside a repository.
+        let plain = temp_path("todo-legacy-plain");
+        fs::create_dir_all(&plain).expect("workspace");
+        let old = plain.join(super::LEGACY_TODO_FILE);
+        fs::write(&old, list).expect("legacy list");
+        super::remove_legacy_todos(&old);
+        assert!(!old.exists());
+        let _ = fs::remove_dir_all(&plain);
+
+        // In a repository: untracked, then ignored, then committed.
+        let repo = temp_path("todo-legacy-repo");
+        init_git_repo(&repo);
+        let old = repo.join(super::LEGACY_TODO_FILE);
+        fs::write(&old, list).expect("legacy list");
+        super::remove_legacy_todos(&old);
+        assert!(!old.exists(), "untracked");
+
+        fs::write(
+            repo.join(".gitignore"),
+            ".clawd-todos.json
+",
+        )
+        .expect("ignore");
+        fs::write(&old, list).expect("legacy list");
+        super::remove_legacy_todos(&old);
+        assert!(!old.exists(), "ignored");
+
+        fs::write(repo.join(".gitignore"), "").expect("ignore");
+        fs::write(&old, list).expect("legacy list");
+        run_git(&repo, &["add", super::LEGACY_TODO_FILE]);
+        run_git(&repo, &["commit", "--quiet", "-m", "todos"]);
+        super::remove_legacy_todos(&old);
+        assert!(old.exists(), "committed");
+        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]

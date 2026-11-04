@@ -38,6 +38,8 @@ The release workflow copies a version's section into its GitHub release notes.
   `echo /status | neuron -p` is refused as piped slash commands are for `neuron`.
 - `NEURON_AUTO_COMPACT_INPUT_TOKENS` sets the automatic compaction threshold; the
   inherited variable name it replaces still works.
+- A `.clawd-todos.json` an earlier release left in the workspace is removed once the
+  task list is saved in Neuron's home, unless git tracks it.
 
 ## 7.0.0-alpha.3 (2026-11-02)
 
