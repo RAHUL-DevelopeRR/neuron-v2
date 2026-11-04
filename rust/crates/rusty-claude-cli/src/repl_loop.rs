@@ -1398,6 +1398,8 @@ mod tests {
                 assert!(saved.messages.is_empty());
             });
         });
+        // As `launch` does when the REPL ends: no other test inherits its servers.
+        crate::progress::shutdown_shared_runtime_state();
         for (name, value) in previous.into_iter().rev() {
             match value {
                 Some(value) => std::env::set_var(name, value),
