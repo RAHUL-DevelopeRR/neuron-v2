@@ -78,6 +78,32 @@ function targetLabel(targetInfo: TargetInfo): string {
   return targetInfo.bunTarget.endsWith('-baseline') ? `${base}-baseline` : base
 }
 
+/**
+ * A Windows file version has four numbers: 7.0.0-alpha.4 becomes 7.0.0.4 (the
+ * prerelease's last number), 7.0.0 becomes 7.0.0.0.
+ */
+export function windowsFileVersion(version: string): string {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(version)
+  if (!match) throw new Error(`Version ${version} is not x.y.z or x.y.z-prerelease`)
+  const prereleaseNumber = /(\d+)$/.exec(match[4] ?? '')?.[1] ?? '0'
+  return [match[1], match[2], match[3], prereleaseNumber].join('.')
+}
+
+/**
+ * Version info in neuron-tui.exe. Antivirus heuristics score an unsigned
+ * executable without it as likely malware (Defender flagged the alpha.4
+ * binaries). Matches the version info build.rs puts in neuron.exe.
+ */
+function windowsMetadataFlags(version: string): string[] {
+  return [
+    '--windows-title=Neuron',
+    '--windows-publisher=Zero-X',
+    `--windows-version=${windowsFileVersion(version)}`,
+    '--windows-description=Neuron full-screen terminal UI',
+    '--windows-copyright=Copyright (c) 2026 RAHUL S / Zero-X. MIT License.',
+  ]
+}
+
 async function main() {
   const args = process.argv.slice(2)
   const outArg = args.find((arg) => arg.startsWith('--outfile='))
@@ -118,6 +144,7 @@ async function main() {
     `--outfile=${outputFile}`,
     '--sourcemap=none',
     ...defineFlags.flatMap(([key, value]) => ['--define', `${key}=${value}`]),
+    ...(targetInfo.platform === 'win32' ? windowsMetadataFlags(version) : []),
   ]
   log(`bun ${buildArgs.join(' ')}`)
   runCommand(process.execPath, buildArgs, { cwd: cliRoot, env: process.env })
