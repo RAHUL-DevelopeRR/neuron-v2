@@ -2800,6 +2800,16 @@ mod tests {
     }
 
     #[test]
+    fn terminal_progress_reports_an_interrupt() {
+        let cancel = runtime::CancellationToken::new();
+        let progress = TerminalProgress::new(Some(cancel.clone()), true);
+        assert!(!progress.cancelled());
+        cancel.cancel();
+        assert!(progress.cancelled());
+        assert!(!TerminalProgress::new(None, true).cancelled());
+    }
+
+    #[test]
     fn the_chat_keeps_the_report_as_data() {
         let [user, assistant] = conversation_record(
             "/research q",

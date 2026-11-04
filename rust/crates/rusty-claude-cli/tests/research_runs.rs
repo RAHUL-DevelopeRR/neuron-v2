@@ -120,6 +120,67 @@ fn research_searches_with_one_run_id_and_saves_the_report() {
 }
 
 #[test]
+fn research_runs_the_users_tool_hooks_for_its_searches() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let gateway = MockGateway::spawn();
+    let workspace = Workspace::new("hook");
+    // A PreToolUse hook in the user's settings that denies every tool call.
+    let deny = if cfg!(windows) {
+        "echo blocked by research hook& exit /b 2"
+    } else {
+        "printf 'blocked by research hook'; exit 2"
+    };
+    fs::write(
+        workspace.config_home.join("settings.json"),
+        serde_json::json!({"defaultMcpServers": false, "hooks": {"PreToolUse": [deny]}})
+            .to_string(),
+    )
+    .expect("settings");
+
+    let output = research(&workspace, &server.base_url(), &gateway, &["--allow-web"]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stdout}
+{stderr}");
+    // Nothing reaches the gateway: the hook refused the first search.
+    assert!(gateway.searches().is_empty());
+    assert!(
+        stdout.contains("web search is not allowed: blocked by research hook"),
+        "{stdout}"
+    );
+    workspace.remove();
+}
+
+#[test]
+fn research_from_the_home_folder_needs_the_broad_folder_flag() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let gateway = MockGateway::spawn();
+    let workspace = Workspace::new("broad");
+
+    let output = neuron(&workspace, &server.base_url(), &gateway)
+        .current_dir(&workspace.home)
+        .args(["--provider", "anthropic", "--model", "sonnet", "--allow-web"])
+        .args(["research", "--depth", "quick", "which runtime?"])
+        .output()
+        .expect("neuron should run");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("--allow-broad-cwd"), "{stderr}");
+    assert!(gateway.searches().is_empty());
+    assert!(runtime.block_on(server.captured_requests()).is_empty());
+    assert!(!workspace.home.join(".neuron").join("research").exists());
+    workspace.remove();
+}
+
+#[test]
 fn research_json_output_names_the_stop_reason_and_path() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
     let server = runtime
