@@ -3144,9 +3144,9 @@ enum WebSearchResultItem {
     Commentary(String),
 }
 
-/// One search result. Only the URL is a structured field: the title and
-/// snippet come from the page or the search provider and reach the model
-/// inside the external-content envelope of the summary.
+/// One search result. Only the URL is a structured field: the title,
+/// snippet and date come from the page or the search provider and reach the
+/// model inside the external-content envelope of the summary.
 #[derive(Debug, Serialize)]
 struct SearchHit {
     #[serde(skip)]
@@ -3154,7 +3154,8 @@ struct SearchHit {
     url: String,
     #[serde(skip)]
     snippet: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Free text from the search provider: shown inside the envelope only.
+    #[serde(skip)]
     published: Option<String>,
 }
 
@@ -3165,7 +3166,9 @@ fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
     web_fetch::ensure_gated_host(&input.url, &request_url)?;
     web_fetch::ensure_allowlisted(&request_url)?;
     ensure_run_origin(&request_url)?;
-    let page = web_fetch::fetch(request_url)?;
+    // A same-host redirect (`www.` added or dropped) must be on the run's
+    // origins too.
+    let page = web_fetch::fetch(request_url, ensure_run_origin)?;
 
     let code = page.status.as_u16();
     let code_text = page
@@ -12620,6 +12623,10 @@ mod zerox_search_tests {
             urls[0].get("title").is_none(),
             "page text stays in the envelope"
         );
+        assert!(
+            urls[0].get("published").is_none(),
+            "the provider's date stays in the envelope"
+        );
     }
 
     #[test]
@@ -12722,5 +12729,9 @@ mod zerox_search_tests {
         let error = check_run_origin(&grants, &other).unwrap_err();
         assert!(error.contains("--allow-origin (example.com)"), "{error}");
         assert!(check_run_origin(&runtime::RunWebGrants::default(), &other).is_ok());
+        // The redirect check: `www.` is another host for --allow-origin.
+        let www = reqwest::Url::parse("https://www.example.com/page").unwrap();
+        let error = check_run_origin(&grants, &www).unwrap_err();
+        assert!(error.contains("`www.example.com`"), "{error}");
     }
 }

@@ -12,7 +12,9 @@
 //! removed counts as the same host). A redirect to another host is reported
 //! instead of followed, so the model fetches it explicitly and the new
 //! domain goes through the same session approval as any other: an approved
-//! domain's open redirect cannot carry a request to an unapproved one.
+//! domain's open redirect cannot carry a request to an unapproved one. A
+//! same-host redirect is followed only when the caller's hop check accepts
+//! it (`--allow-origin` may list `example.com` but not `www.example.com`).
 
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
@@ -302,9 +304,13 @@ fn same_host(left: &Url, right: &Url) -> bool {
 }
 
 /// Fetches `url`, following up to ten same-host redirects and validating
-/// every hop. A redirect to another host is validated and then reported in
+/// every hop; `hop_check` must also accept each redirect target before it is
+/// followed. A redirect to another host is validated and then reported in
 /// [`FetchedPage::cross_host_redirect`] instead of being followed.
-pub(crate) fn fetch(url: Url) -> Result<FetchedPage, String> {
+pub(crate) fn fetch(
+    url: Url,
+    hop_check: impl Fn(&Url) -> Result<(), String>,
+) -> Result<FetchedPage, String> {
     let mut current = url;
     for _ in 0..=MAX_REDIRECTS {
         let addresses = validate_fetch_target(&current)?;
@@ -336,6 +342,7 @@ pub(crate) fn fetch(url: Url) -> Result<FetchedPage, String> {
                         cross_host_redirect: Some(next),
                     });
                 }
+                hop_check(&next)?;
                 current = next;
                 continue;
             }
@@ -675,6 +682,52 @@ mod tests {
             .expect_err("file")
             .contains("not `file:`"));
         assert!(check("http://8.8.8.8/").is_ok());
+    }
+
+    /// A same-host redirect is followed only when the hop check accepts its
+    /// target; the refusal is returned and the target is never requested.
+    #[test]
+    fn same_host_redirects_pass_the_hop_check() {
+        use std::io::{Read as _, Write as _};
+        use std::sync::{Arc, Mutex};
+
+        super::allow_loopback_on_this_thread();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let origin = format!("http://{}", listener.local_addr().expect("addr"));
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&paths);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buffer = [0_u8; 2048];
+                let size = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..size]).into_owned();
+                let path = request.split(' ').nth(1).unwrap_or_default().to_string();
+                let response = if path == "/start" {
+                    "HTTP/1.1 302 Found\r\nLocation: /moved\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\nConnection: close\r\n\r\nmoved"
+                };
+                seen.lock().unwrap().push(path);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        let start = Url::parse(&format!("{origin}/start")).expect("url");
+
+        let error = super::fetch(start.clone(), |next| {
+            if next.path() == "/moved" {
+                Err(format!("refused {next}"))
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("the hop check refuses the redirect");
+        assert!(error.contains("/moved"), "{error}");
+        assert_eq!(paths.lock().unwrap().clone(), vec!["/start".to_string()]);
+
+        let page = super::fetch(start, |_| Ok(())).expect("followed");
+        assert_eq!(page.final_url.path(), "/moved");
+        assert_eq!(page.body, "moved");
     }
 
     #[test]
