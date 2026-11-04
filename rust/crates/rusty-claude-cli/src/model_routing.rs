@@ -94,9 +94,7 @@ pub(crate) fn is_agent_mode(
 ) -> bool {
     enable_tools
         && permission_mode != PermissionMode::ReadOnly
-        && allowed_tools.map_or(true, |tools| {
-            WRITE_TOOLS.iter().any(|tool| tools.contains(*tool))
-        })
+        && allowed_tools.is_none_or(|tools| WRITE_TOOLS.iter().any(|tool| tools.contains(*tool)))
 }
 
 /// The routing of a conversation on `session_model`.
