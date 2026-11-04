@@ -463,9 +463,9 @@ fn permission_mode_from_plugin(value: &str) -> Result<PermissionMode, String> {
 
 /// Description of the `bash` tool, naming the shell that actually runs.
 #[cfg(windows)]
-const BASH_TOOL_DESCRIPTION: &str = "Execute a command in the current workspace with Windows cmd.exe (`cmd.exe /D /S /C`): use cmd syntax (`dir`, `type`, `set`, `%VAR%`, `&&`); POSIX tools work only if they are on PATH, and the PowerShell tool runs PowerShell syntax. Read-only commands run directly; anything else (writes, builds, installs, network) asks the user for approval in workspace-write mode, is denied in read-only mode, and runs directly in danger-full-access mode. stdin is empty. Default timeout 120000 ms (max 600000); on timeout the whole process tree is killed.";
+const BASH_TOOL_DESCRIPTION: &str = "Execute a command in the current workspace with Windows cmd.exe (`cmd.exe /D /S /C`): use cmd syntax (`dir`, `type`, `set`, `%VAR%`, `&&`); POSIX tools work only if they are on PATH, and the PowerShell tool runs PowerShell syntax. Read-only commands run directly. In workspace-write mode, build, test, run and package-install commands that stay inside the workspace (npm/pnpm/yarn/bun, npx, node, cargo, python, pip/uv, go, make) also run directly; anything else (sudo, global installs, writes outside the workspace, network tools, git push) asks the user for approval. Read-only mode denies everything but read-only commands; danger-full-access runs everything directly. stdin is empty. Default timeout 120000 ms (max 600000); on timeout the whole process tree is killed.";
 #[cfg(not(windows))]
-const BASH_TOOL_DESCRIPTION: &str = "Execute a command in the current workspace with POSIX sh (`sh -lc`). Read-only commands run directly; anything else (writes, builds, installs, network) asks the user for approval in workspace-write mode, is denied in read-only mode, and runs directly in danger-full-access mode. stdin is empty. Default timeout 120000 ms (max 600000); on timeout the whole process tree is killed.";
+const BASH_TOOL_DESCRIPTION: &str = "Execute a command in the current workspace with POSIX sh (`sh -lc`). Read-only commands run directly. In workspace-write mode, build, test, run and package-install commands that stay inside the workspace (npm/pnpm/yarn/bun, npx, node, cargo, python, pip/uv, go, make) also run directly; anything else (sudo, global installs, writes outside the workspace, network tools, git push) asks the user for approval. Read-only mode denies everything but read-only commands; danger-full-access runs everything directly. stdin is empty. Default timeout 120000 ms (max 600000); on timeout the whole process tree is killed.";
 
 /// Tools that exist but are not advertised to the model by default: they
 /// only keep in-memory bookkeeping (tasks, teams, crons, workers), are
@@ -994,7 +994,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "PowerShell",
-            description: "Execute a PowerShell command (pwsh when installed, otherwise Windows PowerShell; -NoProfile -NonInteractive). Read-only cmdlets such as Get-Content, Get-ChildItem and Select-String run directly; anything else asks the user for approval in workspace-write mode and is denied in read-only mode. Default timeout 120000 ms (max 600000); on timeout the process tree is killed.",
+            description: "Execute a PowerShell command (pwsh when installed, otherwise Windows PowerShell; -NoProfile -NonInteractive). Read-only cmdlets such as Get-Content, Get-ChildItem and Select-String run directly, and so do in-workspace build, test and package commands (npm, node, cargo, python, pip, go, make) in workspace-write mode; anything else asks the user for approval in workspace-write mode and is denied in read-only mode. Default timeout 120000 ms (max 600000); on timeout the process tree is killed.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -2328,8 +2328,10 @@ fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> 
 
 /// Permission a `bash` command line needs, judged over every simple command
 /// it contains: `ReadOnly` only when each one is an allowlisted read-only
-/// program with safe arguments that stays inside the workspace, otherwise
-/// `DangerFullAccess` (which prompts in workspace-write mode).
+/// program with safe arguments that stays inside the workspace,
+/// `WorkspaceWrite` when the others are in-workspace build, test, run or
+/// package commands, otherwise `DangerFullAccess` (which prompts in
+/// workspace-write mode).
 fn classify_bash_permission(command: &str) -> PermissionMode {
     let workspace = std::env::current_dir().ok();
     classify_shell_command(command, ShellDialect::host(), workspace.as_deref()).required_mode()
