@@ -115,6 +115,9 @@ fn research_search_with(
     gateway: Option<&SearchGateway>,
 ) -> Result<ResearchSearch, ResearchSearchError> {
     zerox_search::validate_query(query).map_err(ResearchSearchError::Failed)?;
+    if let Some(refusal) = crate::outbound_secrets::refusal("WebSearch", "query", query) {
+        return Err(ResearchSearchError::Failed(refusal));
+    }
     let count = count.clamp(1, 10);
     if let Some(gateway) = gateway {
         let request = SearchRequest {
@@ -176,11 +179,14 @@ fn research_hit(hit: super::SearchHit) -> ResearchHit {
     }
 }
 
-/// Reads `url` with `WebFetch`'s guards (public hosts only, same-host
-/// redirects, the sandbox allow-list, `--allow-origin`) and returns up to
+/// Reads `url` with `WebFetch`'s guards (no credential-shaped address, public
+/// hosts only, same-host redirects, the sandbox allow-list, `--allow-origin`) and returns up to
 /// `max_chars` characters of its readable text. A redirect to another host,
 /// an error status and binary content are errors: there is nothing to read.
 pub fn research_fetch(url: &str, max_chars: usize) -> Result<ResearchPage, String> {
+    if let Some(refusal) = crate::outbound_secrets::refusal("WebFetch", "address", url) {
+        return Err(refusal);
+    }
     let request_url = super::normalize_fetch_url(url)?;
     let request_url = reqwest::Url::parse(&request_url).map_err(|error| error.to_string())?;
     web_fetch::ensure_gated_host(url, &request_url)?;
@@ -359,6 +365,25 @@ mod tests {
             research_search_with("  ", "rr_1", 8, None),
             Err(ResearchSearchError::Failed(_))
         ));
+    }
+
+    #[test]
+    fn credential_shaped_queries_and_addresses_are_never_sent() {
+        let (endpoint, requests) = mock_gateway(200, RESULTS);
+        let error = research_search_with(
+            "ghp_0123456789abcdefABCDEF0123456789abcd",
+            "rr_1",
+            8,
+            Some(&gateway(&endpoint)),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, ResearchSearchError::Failed(message) if message.contains("looks like a secret")),
+            "{error:?}"
+        );
+        assert!(requests.lock().unwrap().is_empty());
+        let error = super::research_fetch("https://user:hunter2pass@example.com/", 100).unwrap_err();
+        assert!(error.contains("looks like a secret"), "{error}");
     }
 
     fn page(status: u16, content_type: &str, body: &str) -> FetchedPage {
