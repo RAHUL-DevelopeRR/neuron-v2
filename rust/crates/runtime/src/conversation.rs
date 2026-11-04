@@ -163,7 +163,7 @@ impl HarnessConfig {
             completion_check: enabled(COMPLETION_CHECK_ENV_VAR),
             auto_checks: enabled(AUTO_CHECKS_ENV_VAR),
             action_nudge: true,
-            workspace_root: std::env::current_dir().ok(),
+            workspace_root: crate::workdir::current_dir().ok(),
             model: None,
             experience: ExperienceStore::from_env(),
         }
@@ -1555,7 +1555,7 @@ where
             .harness
             .workspace_root
             .clone()
-            .or_else(|| std::env::current_dir().ok());
+            .or_else(|| crate::workdir::current_dir().ok());
         let checks = root
             .as_deref()
             .map(|root| detect_checks(root, edited))

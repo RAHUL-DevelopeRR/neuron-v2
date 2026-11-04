@@ -92,7 +92,7 @@ pub(crate) fn execute(
     let mut process = Command::new(shell);
     process.args(powershell_args(command));
     subprocess::scrub_credential_env(&mut process);
-    if let Ok(cwd) = std::env::current_dir() {
+    if let Ok(cwd) = runtime::workdir::current_dir() {
         process.current_dir(cwd);
     }
 

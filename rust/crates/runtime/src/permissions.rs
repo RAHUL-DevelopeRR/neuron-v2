@@ -507,7 +507,7 @@ impl PermissionPolicy {
     fn workspace(&self) -> Option<PathBuf> {
         self.workspace_root
             .clone()
-            .or_else(|| std::env::current_dir().ok())
+            .or_else(|| crate::workdir::current_dir().ok())
     }
 
     /// Computes the input-dependent requirement of a tool call.
