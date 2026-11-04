@@ -41,6 +41,7 @@ export function helpSections(
         ['↑ / ↓', 'Prompts (empty input)'],
         ['/new', 'New chat'],
         ['/model', 'Pick the model'],
+        ['/skills', 'Find and install skills'],
         ['Ctrl+Q', 'Edit queued messages'],
       ],
     },
@@ -52,6 +53,7 @@ export function helpSections(
         ['Ctrl+T', 'Expand / collapse agents'],
         ['/copy', 'Copy chat'],
         ['/export', 'Export chat'],
+        ['/plugins', 'List and manage plugins'],
         ['Drag', 'Select and copy text'],
       ],
     },
@@ -60,6 +62,21 @@ export function helpSections(
 
 const SECTIONS = helpSections()
 
+/**
+ * Lines the sections take when laid out `columns` to a row: each row of
+ * sections is as tall as its longest (heading plus rows), with one blank line
+ * between rows.
+ */
+export function helpContentRows(sections: HelpSection[], columns: number): number {
+  let total = 0
+  for (let start = 0; start < sections.length; start += columns) {
+    const row = sections.slice(start, start + columns)
+    total += Math.max(...row.map((section) => section.rows.length + 1))
+  }
+  const rowsOfSections = Math.ceil(sections.length / columns)
+  return total + Math.max(0, rowsOfSections - 1)
+}
+
 /** Aligned shortcut columns; wrap whole columns on smaller terminals. */
 export const HelpBanner = () => {
   const theme = useTheme()
@@ -67,7 +84,7 @@ export const HelpBanner = () => {
   const width = Math.max(16, terminalWidth - 4)
   const columnWidth = Math.min(37, width)
   const columns = Math.max(1, Math.floor((width + 2) / (columnWidth + 2)))
-  const contentRows = Math.ceil(SECTIONS.length / columns) * 8 - 1
+  const contentRows = helpContentRows(SECTIONS, columns)
   return (
     <box
       style={{

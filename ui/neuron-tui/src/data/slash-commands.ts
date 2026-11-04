@@ -207,6 +207,20 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
     engineCommand: true,
     description: 'Show or change the permission mode',
   },
+  // Engine reports in the chat; `/skills search <query>` and `/plugins install <path>`
+  // take arguments after the name.
+  {
+    id: 'skills',
+    label: 'skills',
+    engineCommand: true,
+    description: 'List skills, or search and install them',
+  },
+  {
+    id: 'plugins',
+    label: 'plugins',
+    engineCommand: true,
+    description: 'List, install, enable or disable plugins',
+  },
   ...MODE_COMMANDS,
   {
     id: 'upgrade',
