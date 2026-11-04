@@ -132,13 +132,48 @@ impl Depth {
     }
 }
 
-/// The most tokens one run may use on `plan` (the Zero-X plan's name, as the
-/// login records it). Unknown plans get Free's.
-pub(crate) fn plan_token_ceiling(plan: Option<&str>) -> u64 {
-    match plan.map(|plan| plan.trim().to_ascii_lowercase()) {
-        Some(plan) if plan.contains("max") => 1_500_000,
-        Some(plan) if plan.contains("pro") => 600_000,
-        _ => 300_000,
+/// What a plan allows one research run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PlanBudget {
+    /// The most tokens one run may use.
+    pub max_tokens: u64,
+    /// Whether the deep depth is allowed.
+    pub deep: bool,
+    /// Research runs a day, when the gateway said (`GET /api/account`,
+    /// `limits.search.daily_research_runs`).
+    pub runs_per_day: Option<u64>,
+}
+
+/// The research budget of `plan` (the Zero-X plan's id or name); unknown plans
+/// get Free's. From the capability plan: Free 150,000 tokens a run at the quick
+/// or standard depth; Pro 600,000 and Max 1,500,000, deep included.
+pub(crate) fn plan_budget(plan: Option<&str>) -> PlanBudget {
+    let (max_tokens, deep) = match plan.map(|plan| plan.trim().to_ascii_lowercase()) {
+        Some(plan) if plan.contains("max") => (1_500_000, true),
+        Some(plan) if plan.contains("pro") => (600_000, true),
+        _ => (150_000, false),
+    };
+    PlanBudget {
+        max_tokens,
+        deep,
+        runs_per_day: None,
+    }
+}
+
+/// The budget for the plan `GET /api/account` names (`account`, when it could
+/// be read), else for the plan the login stored, with the account's daily
+/// research runs.
+pub(crate) fn account_budget(stored_plan: Option<&str>, account: Option<&Value>) -> PlanBudget {
+    let plan = account
+        .and_then(|account| account.pointer("/plan/id"))
+        .and_then(Value::as_str)
+        .filter(|plan| !plan.trim().is_empty())
+        .or(stored_plan);
+    PlanBudget {
+        runs_per_day: account
+            .and_then(|account| account.pointer("/limits/search/daily_research_runs"))
+            .and_then(Value::as_u64),
+        ..plan_budget(plan)
     }
 }
 
@@ -179,40 +214,65 @@ pub(crate) struct ResearchRequest {
     pub question: String,
     pub depth: Depth,
     pub token_cap: u64,
+    /// The plan's research runs a day, when known.
+    pub runs_per_day: Option<u64>,
 }
 
 impl ResearchRequest {
     /// `question` at `depth`, with the depth's token cap or `budget`, held to
-    /// `ceiling` (the plan's). The second value says the budget was lowered.
+    /// what `plan` allows: its token ceiling, and the standard depth for deep
+    /// on a plan without it. The notes say what was lowered.
     pub(crate) fn new(
         question: &str,
         depth: Depth,
         budget: Option<u64>,
-        ceiling: u64,
-    ) -> (Self, Option<String>) {
+        plan: &PlanBudget,
+    ) -> (Self, Vec<String>) {
+        let mut notes = Vec::new();
+        let depth = if depth == Depth::Deep && !plan.deep {
+            notes.push(
+                "Deep research is for the Pro and Max plans; this run uses the standard depth."
+                    .to_string(),
+            );
+            Depth::Standard
+        } else {
+            depth
+        };
         let wanted = budget.unwrap_or_else(|| depth.limits().default_tokens);
-        let token_cap = wanted.min(ceiling);
-        let lowered = (wanted > ceiling).then(|| {
-            format!(
+        let token_cap = wanted.min(plan.max_tokens);
+        // A depth's default above the plan's ceiling is lowered without a note:
+        // the start question shows the cap.
+        if budget.is_some_and(|budget| budget > plan.max_tokens) {
+            notes.push(format!(
                 "The research budget is {} tokens, the most your plan allows for one run.",
-                group_digits(ceiling)
-            )
-        });
+                group_digits(plan.max_tokens)
+            ));
+        }
         (
             Self {
                 question: question.trim().to_string(),
                 depth,
                 token_cap,
+                runs_per_day: plan.runs_per_day,
             },
-            lowered,
+            notes,
         )
     }
 
     /// The line shown before a run starts, asking to go ahead.
     pub(crate) fn confirmation(&self) -> String {
         let limits = self.depth.limits();
+        let runs = self
+            .runs_per_day
+            .map(|runs| {
+                format!(
+                    " It counts as one of your plan's {runs} research run{} a day.",
+                    if runs == 1 { "" } else { "s" }
+                )
+            })
+            .unwrap_or_default();
         format!(
-            "Research ({} depth): up to {} web searches and {} pages, at most {} tokens. Web reads (search and fetch on public sites) are allowed for this run only. Start?",
+            "Research ({} depth): up to {} web searches and {} pages, at most {} tokens.{runs} Web reads (search and fetch on public sites) are allowed for this run only. Start?",
             self.depth.name(),
             limits.max_searches,
             limits.max_pages,
@@ -1486,19 +1546,37 @@ pub(crate) fn parse_research_args(
     })
 }
 
-/// The request for `args` under the signed-in plan's token ceiling, and a
-/// note when the budget was lowered to it.
-pub(crate) fn request_for(args: &ResearchArgs) -> (ResearchRequest, Option<String>) {
-    let plan = crate::auth::current_credential()
-        .ok()
-        .flatten()
-        .and_then(|credential| credential.plan);
-    ResearchRequest::new(
-        &args.question,
-        args.depth,
-        args.budget,
-        plan_token_ceiling(plan.as_deref()),
+/// How long the plan lookup before a run may take.
+const ACCOUNT_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The request for `args` under the signed-in plan's budget (read from
+/// `GET /api/account`, else the plan the login stored), and notes on what was
+/// lowered to fit it.
+pub(crate) fn request_for(args: &ResearchArgs) -> (ResearchRequest, Vec<String>) {
+    let credential = crate::auth::current_credential().ok().flatten();
+    let account = credential.as_ref().and_then(account_value);
+    let plan = account_budget(
+        credential
+            .as_ref()
+            .and_then(|credential| credential.plan.as_deref()),
+        account.as_ref(),
+    );
+    ResearchRequest::new(&args.question, args.depth, args.budget, &plan)
+}
+
+/// `GET /api/account` for `credential`, or `None` when it has expired or the
+/// account cannot be read in [`ACCOUNT_LOOKUP_TIMEOUT`].
+fn account_value(credential: &crate::auth::GatewayCredential) -> Option<Value> {
+    if credential.is_expired(crate::clock::now_unix()) {
+        return None;
+    }
+    let base = crate::auth::gateway_base_url().ok()?;
+    crate::gateway_http::get_json(
+        &crate::gateway_http::account_url(&base, "/api/account"),
+        Some(credential.token.expose()),
+        ACCOUNT_LOOKUP_TIMEOUT,
     )
+    .ok()
 }
 
 /// How long one model request of a run may take.
@@ -1910,7 +1988,7 @@ mod tests {
             "Which Rust async runtime should I use?",
             depth,
             None,
-            1_500_000,
+            &plan_budget(Some("max")),
         )
         .0
     }
@@ -2485,23 +2563,70 @@ mod tests {
         assert!(Depth::parse("huge").is_err());
         assert_eq!(Depth::Standard.limits().max_steps, MAX_RESEARCH_STEPS);
 
-        assert_eq!(plan_token_ceiling(Some("Free")), 300_000);
-        assert_eq!(plan_token_ceiling(Some("Pro")), 600_000);
-        assert_eq!(plan_token_ceiling(Some("Max")), 1_500_000);
-        assert_eq!(plan_token_ceiling(None), 300_000);
+        // The capability plan's research budgets: Free 150k at quick or
+        // standard depth, Pro 600k and Max 1.5M with deep.
+        let free = plan_budget(Some("Free"));
+        assert_eq!((free.max_tokens, free.deep), (150_000, false));
+        assert_eq!(plan_budget(None), free);
+        assert_eq!(plan_budget(Some("Pro")).max_tokens, 600_000);
+        assert!(plan_budget(Some("pro")).deep);
+        assert_eq!(plan_budget(Some("Max")).max_tokens, 1_500_000);
 
-        let (request, lowered) =
-            ResearchRequest::new("  q  ", Depth::Deep, None, plan_token_ceiling(Some("Free")));
+        // Deep on Free runs at the standard depth, held to Free's ceiling; the
+        // standard default (300k) is lowered without a note.
+        let (request, notes) = ResearchRequest::new("  q  ", Depth::Deep, None, &free);
         assert_eq!(request.question, "q");
-        assert_eq!(request.token_cap, 300_000);
-        assert!(lowered.unwrap().contains("300,000 tokens"));
-        let (request, lowered) = ResearchRequest::new("q", Depth::Quick, Some(50_000), 300_000);
+        assert_eq!(request.depth, Depth::Standard);
+        assert_eq!(request.token_cap, 150_000);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("Pro and Max plans"), "{notes:?}");
+        // A budget over the ceiling is lowered with a note.
+        let (request, notes) = ResearchRequest::new("q", Depth::Quick, Some(400_000), &free);
+        assert_eq!(request.token_cap, 150_000);
+        assert_eq!(
+            notes,
+            vec!["The research budget is 150,000 tokens, the most your plan allows for one run."]
+        );
+        let pro = plan_budget(Some("pro"));
+        let (request, notes) = ResearchRequest::new("q", Depth::Deep, None, &pro);
+        assert_eq!((request.depth, request.token_cap), (Depth::Deep, 600_000));
+        assert!(notes.is_empty());
+        let (request, notes) = ResearchRequest::new("q", Depth::Quick, Some(50_000), &free);
         assert_eq!(request.token_cap, 50_000);
-        assert!(lowered.is_none());
+        assert!(notes.is_empty());
         assert!(request
             .confirmation()
-            .contains("up to 5 web searches and 5 pages, at most 50,000 tokens"));
+            .contains("up to 5 web searches and 5 pages, at most 50,000 tokens. Web reads"));
         assert!(request.confirmation().ends_with("Start?"));
+
+        // The account's plan wins over the stored one, and its daily research
+        // runs show in the start question.
+        let account = json!({
+            "plan": {"id": "pro", "name": "Pro"},
+            "limits": {"search": {"daily_searches": 400, "daily_research_runs": 30}}
+        });
+        let budget = account_budget(Some("free"), Some(&account));
+        assert_eq!(
+            budget,
+            PlanBudget {
+                max_tokens: 600_000,
+                deep: true,
+                runs_per_day: Some(30)
+            }
+        );
+        assert_eq!(account_budget(Some("free"), None), free);
+        assert_eq!(
+            account_budget(Some("max"), Some(&json!({}))).max_tokens,
+            1_500_000
+        );
+        let (request, _) = ResearchRequest::new("q", Depth::Quick, None, &budget);
+        assert!(
+            request
+                .confirmation()
+                .contains("It counts as one of your plan's 30 research runs a day."),
+            "{}",
+            request.confirmation()
+        );
         assert_eq!(group_digits(1_234_567), "1,234,567");
         assert!(new_run_id().starts_with("rr_"));
         assert_eq!(new_run_id().len(), 19);

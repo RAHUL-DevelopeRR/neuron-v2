@@ -1827,8 +1827,8 @@ fn run_research_command(
         ))
         .into());
     }
-    let (request, lowered) = research::request_for(&args);
-    if let Some(note) = lowered.filter(|_| !json_output) {
+    let (request, notes) = research::request_for(&args);
+    for note in notes.iter().filter(|_| !json_output) {
         eprintln!("{note}");
     }
     let effective_model = configure_provider_for_model(model)?;
@@ -4471,8 +4471,8 @@ impl LiveCli {
             .map(str::to_string)
             .collect::<Vec<_>>();
         let args = research::parse_research_args(&words, false)?;
-        let (request, lowered) = research::request_for(&args);
-        if let Some(note) = lowered {
+        let (request, notes) = research::request_for(&args);
+        for note in &notes {
             eprintln!("{note}");
         }
         eprint!("{} [y/N] ", request.confirmation());

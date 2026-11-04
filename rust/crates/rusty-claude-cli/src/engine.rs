@@ -2356,9 +2356,9 @@ impl Engine {
             .map(str::to_string)
             .collect::<Vec<_>>();
         let args = research::parse_research_args(&words, false)?;
-        let (request, lowered) = research::request_for(&args);
-        if let Some(note) = lowered {
-            self.notice(&note);
+        let (request, notes) = research::request_for(&args);
+        for note in &notes {
+            self.notice(note);
         }
         let ask = ui_hooks::ask_handler().ok_or("the UI cannot answer questions")?;
         let answer = ask(&UserQuestion {
