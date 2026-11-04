@@ -523,10 +523,21 @@ pub(crate) fn build_provider_client(
         // `OpenAiCompatClient::from_env` with the matching config (openai /
         // xai / dashscope), covering OpenAI, OpenRouter, xAI, DashScope,
         // Ollama and the Zero-X gateway.
+        // Requests of one session share the upstream prompt cache where the gateway's
+        // provider has one; the key is a hash, never the session id itself.
         ProviderKind::Xai | ProviderKind::OpenAi => {
             ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
+                .with_prompt_cache_key(session_id.map(prompt_cache_key))
         }
     })
+}
+
+/// The `prompt_cache_key` of a session: a SHA-256 of its id (32 hex characters), so
+/// the gateway and its providers never see the id.
+pub(crate) fn prompt_cache_key(session_id: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(format!("neuron-prompt-cache:{session_id}").as_bytes());
+    hex::encode(&digest[..16])
 }
 
 impl AnthropicRuntimeClient {
@@ -3446,5 +3457,20 @@ mod switch_model_hint_tests {
             })
             .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod prompt_cache_key_tests {
+    use super::prompt_cache_key;
+
+    #[test]
+    fn the_prompt_cache_key_is_a_stable_hash_that_hides_the_session_id() {
+        let key = prompt_cache_key("session-1792800000000-0");
+        assert_eq!(key.len(), 32, "{key}");
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()), "{key}");
+        assert!(!key.contains("1792800000000"), "{key}");
+        assert_eq!(key, prompt_cache_key("session-1792800000000-0"), "stable");
+        assert_ne!(key, prompt_cache_key("session-1792800000000-1"));
     }
 }

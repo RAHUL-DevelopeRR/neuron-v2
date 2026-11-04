@@ -260,7 +260,16 @@ pub struct OpenAiCompatClient {
     capacity_budget: RetryBudget,
     retry_observer: Option<RetryObserver>,
     usage_observer: Option<UsageObserver>,
+    /// Sent as `prompt_cache_key` to the Zero-X gateway (see
+    /// [`Self::with_prompt_cache_key`]).
+    prompt_cache_key: Option<String>,
 }
+
+/// The request header that tells the Zero-X gateway's `auto` routing a request
+/// needs a model that calls tools well.
+pub const ROUTE_HINT_HEADER: &str = "x-neuron-route";
+/// [`ROUTE_HINT_HEADER`]'s value for a request that attaches tools.
+pub const AGENTIC_ROUTE: &str = "agentic";
 
 /// A failed HTTP exchange plus the `Retry-After` the server sent with it.
 struct HttpFailure {
@@ -309,6 +318,7 @@ impl OpenAiCompatClient {
             },
             retry_observer: Some(RetryObserver::stderr()),
             usage_observer: None,
+            prompt_cache_key: None,
         }
     }
 
@@ -379,6 +389,17 @@ impl OpenAiCompatClient {
             total,
             max_wait: Some(max_wait),
         };
+        self
+    }
+
+    /// Sends `key` as `prompt_cache_key` in every chat body to the Zero-X
+    /// gateway, which passes it to the upstreams that accept it (so requests of
+    /// one conversation share a prompt cache) and drops it for the others. Callers
+    /// pass a hash of the session id, never the id itself. Other providers never
+    /// get it.
+    #[must_use]
+    pub fn with_prompt_cache_key(mut self, key: Option<String>) -> Self {
+        self.prompt_cache_key = key.filter(|key| !key.trim().is_empty());
         self
     }
 
@@ -550,11 +571,24 @@ impl OpenAiCompatClient {
             .post(&request_url)
             .header("content-type", "application/json")
             .bearer_auth(&self.api_key)
-            .json(&build_chat_completion_request(request, self.config()));
+            .json(&self.request_body(request));
+        if let Some(route) = route_hint(request, self.config()) {
+            builder = builder.header(ROUTE_HINT_HEADER, route);
+        }
         if !request.stream {
             builder = builder.timeout(self.timeouts.request);
         }
         builder.send().await.map_err(ApiError::from)
+    }
+
+    /// The chat body for `request`: [`build_chat_completion_request`], with the
+    /// `prompt_cache_key` for the Zero-X gateway.
+    fn request_body(&self, request: &MessageRequest) -> Value {
+        let mut body = build_chat_completion_request(request, self.config());
+        if let (true, Some(key)) = (self.config.is_zero_x(), &self.prompt_cache_key) {
+            body["prompt_cache_key"] = json!(key);
+        }
+        body
     }
 
     /// The capacity budget for the Zero-X gateway's shared-pool waits
@@ -1405,6 +1439,19 @@ pub fn check_request_body_size(
     } else {
         Ok(())
     }
+}
+
+/// [`ROUTE_HINT_HEADER`]'s value for `request`: [`AGENTIC_ROUTE`] when it goes to
+/// the Zero-X gateway's `auto` with tools attached, so `auto` picks a model that
+/// calls them; `None` otherwise.
+#[must_use]
+pub fn route_hint(request: &MessageRequest, config: OpenAiCompatConfig) -> Option<&'static str> {
+    let tools = request
+        .tools
+        .as_ref()
+        .is_some_and(|tools| !tools.is_empty());
+    (config.is_zero_x() && tools && strip_routing_prefix(&request.model) == "auto")
+        .then_some(AGENTIC_ROUTE)
 }
 
 /// Builds a chat completion request payload from a `MessageRequest`.
@@ -2958,8 +3005,8 @@ mod tests {
 
     use super::{
         build_chat_completion_request, chat_completions_endpoint, is_reasoning_model,
-        normalize_finish_reason, openai_tool_choice, parse_tool_arguments, OpenAiCompatClient,
-        OpenAiCompatConfig,
+        normalize_finish_reason, openai_tool_choice, parse_tool_arguments, route_hint,
+        OpenAiCompatClient, OpenAiCompatConfig, AGENTIC_ROUTE, ROUTE_HINT_HEADER,
     };
     use crate::error::ApiError;
     use crate::types::{
@@ -3049,6 +3096,88 @@ mod tests {
             json!(true),
             "must not overwrite existing"
         );
+    }
+
+    fn tool_request(model: &str, tools: Option<Vec<ToolDefinition>>) -> MessageRequest {
+        MessageRequest {
+            model: model.to_string(),
+            max_tokens: 64,
+            messages: vec![InputMessage::user_text("build it")],
+            tools,
+            ..Default::default()
+        }
+    }
+
+    fn read_tool() -> ToolDefinition {
+        ToolDefinition {
+            name: "read_file".to_string(),
+            description: None,
+            input_schema: json!({"type": "object"}),
+        }
+    }
+
+    #[test]
+    fn auto_with_tools_on_the_gateway_asks_for_an_agentic_route() {
+        let zero_x = OpenAiCompatConfig::zero_x();
+        let with_tools = tool_request("auto", Some(vec![read_tool()]));
+        assert_eq!(route_hint(&with_tools, zero_x), Some("agentic"));
+        assert_eq!(
+            route_hint(
+                &tool_request("openai/auto", Some(vec![read_tool()])),
+                zero_x
+            ),
+            Some("agentic"),
+            "the transport prefix is not part of the model"
+        );
+        assert_eq!(
+            route_hint(&tool_request("auto", None), zero_x),
+            None,
+            "no tools"
+        );
+        assert_eq!(
+            route_hint(&tool_request("auto", Some(Vec::new())), zero_x),
+            None
+        );
+        assert_eq!(
+            route_hint(&tool_request("glm-5.2", Some(vec![read_tool()])), zero_x),
+            None,
+            "a model the user chose"
+        );
+        assert_eq!(
+            route_hint(&with_tools, OpenAiCompatConfig::openai()),
+            None,
+            "only the gateway routes auto"
+        );
+        assert_eq!(
+            (ROUTE_HINT_HEADER, AGENTIC_ROUTE),
+            ("x-neuron-route", "agentic")
+        );
+    }
+
+    #[test]
+    fn the_prompt_cache_key_goes_only_to_the_gateway() {
+        let request = tool_request("auto", None);
+        let key = Some("pck_0123abcd".to_string());
+        let gateway = OpenAiCompatClient::new("nzx_test", OpenAiCompatConfig::zero_x())
+            .with_prompt_cache_key(key.clone());
+        assert_eq!(
+            gateway.request_body(&request)["prompt_cache_key"],
+            "pck_0123abcd"
+        );
+
+        let other = OpenAiCompatClient::new("sk-test", OpenAiCompatConfig::openai())
+            .with_prompt_cache_key(key);
+        assert!(other
+            .request_body(&request)
+            .get("prompt_cache_key")
+            .is_none());
+
+        let unset = OpenAiCompatClient::new("nzx_test", OpenAiCompatConfig::zero_x())
+            .with_prompt_cache_key(Some("  ".to_string()));
+        assert!(unset
+            .request_body(&request)
+            .get("prompt_cache_key")
+            .is_none());
     }
 
     #[test]

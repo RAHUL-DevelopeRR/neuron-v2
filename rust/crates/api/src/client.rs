@@ -86,6 +86,18 @@ impl ProviderClient {
         }
     }
 
+    /// Sends `key` as the OpenAI-compatible `prompt_cache_key` (see
+    /// [`OpenAiCompatClient::with_prompt_cache_key`]); the Anthropic client keeps
+    /// its own prompt cache.
+    #[must_use]
+    pub fn with_prompt_cache_key(self, key: Option<String>) -> Self {
+        match self {
+            Self::Xai(client) => Self::Xai(client.with_prompt_cache_key(key)),
+            Self::OpenAi(client) => Self::OpenAi(client.with_prompt_cache_key(key)),
+            other @ Self::Anthropic(_) => other,
+        }
+    }
+
     #[must_use]
     pub fn with_prompt_cache(self, prompt_cache: PromptCache) -> Self {
         match self {
