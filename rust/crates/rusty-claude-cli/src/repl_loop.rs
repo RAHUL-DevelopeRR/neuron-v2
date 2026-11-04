@@ -11,6 +11,8 @@ use runtime::{CancellationToken, HookAbortSignal, SessionCompaction, TurnOutcome
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::workspace_changes::{render_checkpoints_text, ChangeWatcher, SessionCheckpoints};
+
 /// What the REPL does after handling one line of input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReplStep {
@@ -462,6 +464,8 @@ fn run_loop(
     // Input is dispatched through a priority chain (see `handle_local`):
     //   "?" shortcuts, "!cmd" shell escape, /exit, /context, /status,
     //   slash commands, bare skills, then the model.
+    let checkpoints = Arc::new(SessionCheckpoints::default());
+    let _watcher = ChangeWatcher::install(&checkpoints);
     loop {
         editor.set_prompt(&mode_aware_prompt(
             &cli.permission_mode,
@@ -475,7 +479,11 @@ fn run_loop(
                 if !matches!(input.trim(), "" | "?" | "??") {
                     editor.push_history(input.clone());
                 }
-                if dispatch_line(cli, &input, &mut io::stderr()) == ReplStep::Exit
+                let mut repl = CheckpointedRepl {
+                    cli: &mut *cli,
+                    checkpoints: &checkpoints,
+                };
+                if dispatch_line(&mut repl, &input, &mut io::stderr()) == ReplStep::Exit
                     || force_quit_requested()
                 {
                     break;
@@ -541,6 +549,74 @@ impl ReplBackend for LiveCli {
     fn persist(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         self.persist_session()
     }
+}
+
+/// [`LiveCli`] with its session's checkpoints, as the full-screen engine keeps them: one
+/// opens before each prompt and closes after it, saving each file before a tool changes
+/// it, and `/rewind` lists them or goes back to one.
+struct CheckpointedRepl<'a> {
+    cli: &'a mut LiveCli,
+    checkpoints: &'a SessionCheckpoints,
+}
+
+impl CheckpointedRepl<'_> {
+    /// Opens the checkpoints of the session now running, which `/clear`, `/resume` or
+    /// `/session switch` may have changed; the open ones stay open.
+    fn open(&self) {
+        let workspace = env::current_dir().unwrap_or_default();
+        self.checkpoints
+            .open(&workspace, &self.cli.runtime.session().session_id);
+    }
+
+    /// `/rewind`: the checkpoints; `/rewind <id> [code|chat|both]`: goes back to one,
+    /// and saves the session a chat rewind cut back.
+    fn rewind(&mut self, args: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.open();
+        let Some((id, mode)) = engine::parse_rewind_args(args)? else {
+            println!("{}", render_checkpoints_text(&self.checkpoints.list()));
+            return Ok(());
+        };
+        let report = self
+            .checkpoints
+            .rewind(id, mode, self.cli.runtime.session_mut())?;
+        self.cli.persist_session()?;
+        println!("{report}");
+        Ok(())
+    }
+}
+
+impl ReplBackend for CheckpointedRepl<'_> {
+    fn handle_local(&mut self, line: &str) -> Option<Result<ReplStep, Box<dyn std::error::Error>>> {
+        if let Some(args) = rewind_command_argument(line) {
+            return Some(self.rewind(args).map(|()| ReplStep::Continue));
+        }
+        self.cli.handle_local(line)
+    }
+
+    fn run_prompt(&mut self, line: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.open();
+        // As the engine does: a transcript an earlier failure left inconsistent is
+        // repaired first, so a chat rewind cuts exactly where the prompt starts.
+        let session = self.cli.runtime.session_mut();
+        if runtime::transcript::normalize_messages(&mut session.messages).changed() {
+            let _ = session.persist_snapshot();
+        }
+        self.checkpoints
+            .begin_turn(self.cli.runtime.session(), line);
+        let result = self.cli.run_prompt(line);
+        self.checkpoints.finish_turn();
+        result
+    }
+
+    fn persist(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.cli.persist()
+    }
+}
+
+/// Returns the arguments of a `/rewind` line.
+fn rewind_command_argument(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("/rewind")?;
+    (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim())
 }
 
 /// Returns the argument of a `/context` line.
@@ -1211,5 +1287,126 @@ mod tests {
             "session-1792751547070-0"
         );
         assert_eq!(super::footer_session_label("abc123"), "session abc123");
+    }
+
+    /// The line REPL saves a checkpoint with each prompt, `/rewind` lists them, and
+    /// `/rewind <id>` puts back the file the prompt changed and cuts the chat back.
+    #[test]
+    fn the_repl_rewinds_a_prompt_to_its_checkpoint() {
+        use super::CheckpointedRepl;
+        use crate::workspace_changes::{ChangeWatcher, SessionCheckpoints};
+        use crate::LiveCli;
+        use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
+        use std::sync::Arc;
+
+        let _guard = crate::tests::env_lock();
+        let tokio = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let server = tokio
+            .block_on(MockAnthropicService::spawn())
+            .expect("the mock service starts");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time after epoch")
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("neuron-repl-rewind-{}-{nanos}", std::process::id()));
+        let workspace = root.join("workspace");
+        let config_home = root.join("config");
+        std::fs::create_dir_all(workspace.join("generated")).expect("workspace");
+        std::fs::create_dir_all(&config_home).expect("config home");
+        std::fs::write(
+            config_home.join("settings.json"),
+            r#"{"defaultMcpServers":false}"#,
+        )
+        .expect("settings");
+        let written = workspace.join("generated").join("output.txt");
+        std::fs::write(
+            &written,
+            "written by hand
+",
+        )
+        .expect("the file the agent replaces");
+        let base_url = server.base_url();
+        let vars = [
+            ("ANTHROPIC_API_KEY", Some("test-repl-key")),
+            ("ANTHROPIC_AUTH_TOKEN", None),
+            ("ANTHROPIC_BASE_URL", Some(base_url.as_str())),
+            ("NEURON_CONFIG_HOME", config_home.to_str()),
+            ("NEURON_HOME", config_home.to_str()),
+            ("NEURON_CREDENTIAL_STORE", Some("file")),
+            ("NEURON_TOKEN", None),
+        ];
+        let previous = vars
+            .iter()
+            .map(|(name, value)| {
+                let previous = std::env::var_os(name);
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+                (*name, previous)
+            })
+            .collect::<Vec<_>>();
+
+        let outcome = std::panic::catch_unwind(|| {
+            crate::tests::with_current_dir(&workspace, || {
+                let mut cli = LiveCli::new(
+                    "claude-sonnet-4-6".to_string(),
+                    true,
+                    Some(["write_file".to_string()].into_iter().collect()),
+                    PermissionMode::WorkspaceWrite,
+                )
+                .expect("cli should initialize");
+                let checkpoints = Arc::new(SessionCheckpoints::default());
+                let _watcher = ChangeWatcher::install(&checkpoints);
+                let mut repl = CheckpointedRepl {
+                    cli: &mut cli,
+                    checkpoints: &checkpoints,
+                };
+                let mut errors = Vec::new();
+
+                let prompt = format!("{SCENARIO_PREFIX}write_file_allowed");
+                dispatch_line(&mut repl, &prompt, &mut errors);
+                assert_eq!(
+                    std::fs::read_to_string(&written).expect("written"),
+                    "created by mock service
+"
+                );
+                let listed = checkpoints.list();
+                assert_eq!(listed.len(), 1, "{listed:?}");
+                assert_eq!(listed[0].prompt_preview, prompt);
+                assert_eq!(listed[0].files, ["generated/output.txt"]);
+                assert_eq!(
+                    dispatch_line(&mut repl, "/rewind", &mut errors),
+                    ReplStep::Continue
+                );
+
+                let rewind = format!("/rewind {}", listed[0].id);
+                assert_eq!(
+                    dispatch_line(&mut repl, &rewind, &mut errors),
+                    ReplStep::Continue
+                );
+                assert_eq!(String::from_utf8_lossy(&errors), "", "no step failed");
+                assert_eq!(
+                    std::fs::read_to_string(&written).expect("put back"),
+                    "written by hand
+"
+                );
+                assert!(cli.runtime.session().messages.is_empty());
+                // The cut-back chat is what was saved.
+                let saved = runtime::Session::load_from_path(&cli.session.path).expect("saved");
+                assert!(saved.messages.is_empty());
+            });
+        });
+        for (name, value) in previous.into_iter().rev() {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        if let Err(payload) = outcome {
+            std::panic::resume_unwind(payload);
+        }
     }
 }

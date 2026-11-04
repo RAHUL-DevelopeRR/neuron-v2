@@ -40,6 +40,8 @@ The release workflow copies a version's section into its GitHub release notes.
   inherited variable name it replaces still works.
 - A `.clawd-todos.json` an earlier release left in the workspace is removed once the
   task list is saved in Neuron's home, unless git tracks it.
+- `/rewind` works in the line REPL (`--no-tui`) as in the full-screen UI: a checkpoint
+  is saved with each prompt, and `/rewind <id> [code|chat|both]` goes back to one.
 
 ## 7.0.0-alpha.3 (2026-11-02)
 

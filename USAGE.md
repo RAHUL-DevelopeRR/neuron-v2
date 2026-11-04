@@ -303,6 +303,7 @@ Inside a session: `/session list`, `/session switch <id>`, `/resume <path>`,
 | `/cost` | Token usage of this session |
 | `/compact`, `/clear` | Shrink or reset the conversation |
 | `/diff` | Changes in the working tree |
+| `/rewind [id [code\|chat\|both]]` | List the checkpoint saved with each prompt, or go back to one: the files, the conversation or both |
 | `/init` | Create a starter `NEURON.md` for the project |
 | `/mcp`, `/skills`, `/plugins` | Inspect and manage integrations |
 | `/doctor` | Diagnose auth, configuration and sandbox setup |

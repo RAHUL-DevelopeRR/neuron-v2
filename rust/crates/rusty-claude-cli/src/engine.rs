@@ -2492,21 +2492,10 @@ impl Engine {
 
     /// `/rewind`: the checkpoints; `/rewind <id> [code|chat|both]`: goes back to one.
     fn rewind_command(&mut self, args: &str) -> Result<(), String> {
-        let mut words = args.split_whitespace();
-        let Some(id) = words.next() else {
+        let Some((id, mode)) = parse_rewind_args(args)? else {
             self.list_checkpoints();
             return Ok(());
         };
-        let id = id
-            .trim_start_matches('#')
-            .parse::<u64>()
-            .map_err(|_| format!("`{id}` is not a checkpoint number. {REWIND_USAGE}"))?;
-        let mode = words
-            .next()
-            .map_or(Ok(RewindMode::CodeAndChat), parse_rewind_mode)?;
-        if words.next().is_some() {
-            return Err(REWIND_USAGE.to_string());
-        }
         self.rewind(id, mode, false)
     }
 
@@ -2578,6 +2567,26 @@ impl Engine {
 }
 
 const REWIND_USAGE: &str = "Usage: /rewind [<id> [code|chat|both]]";
+
+/// The arguments of `/rewind`, here and in the line REPL: `None` for none (list the
+/// checkpoints), else the checkpoint and what to put back (both by default).
+pub(crate) fn parse_rewind_args(args: &str) -> Result<Option<(u64, RewindMode)>, String> {
+    let mut words = args.split_whitespace();
+    let Some(id) = words.next() else {
+        return Ok(None);
+    };
+    let id = id
+        .trim_start_matches('#')
+        .parse::<u64>()
+        .map_err(|_| format!("`{id}` is not a checkpoint number. {REWIND_USAGE}"))?;
+    let mode = words
+        .next()
+        .map_or(Ok(RewindMode::CodeAndChat), parse_rewind_mode)?;
+    if words.next().is_some() {
+        return Err(REWIND_USAGE.to_string());
+    }
+    Ok(Some((id, mode)))
+}
 
 /// A rewind mode as the protocol or `/rewind` names it.
 fn parse_rewind_mode(mode: &str) -> Result<RewindMode, String> {

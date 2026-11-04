@@ -426,8 +426,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "rewind",
         aliases: &[],
-        summary: "Rewind the conversation to a previous state",
-        argument_hint: Some("[steps]"),
+        summary: "List checkpoints, or go back to one: the files, the chat or both",
+        argument_hint: Some("[id [code|chat|both]]"),
         resume_supported: false,
     },
     SlashCommandSpec {
