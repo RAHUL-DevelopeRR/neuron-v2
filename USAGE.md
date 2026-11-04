@@ -404,6 +404,7 @@ or put it in your user settings.
 | `NEURON_MODEL` | neuron | Model for this process |
 | `NEURON_PROVIDER` | neuron | Provider for this process (see [Bring your own key](#bring-your-own-key)) |
 | `NEURON_MAX_ITERATIONS` | neuron | Model calls allowed in one turn (default 50) |
+| `NEURON_AUTO_COMPACT_INPUT_TOKENS` | neuron | Estimated context tokens at which older history is compacted automatically (default: worked out from the model's context budget) |
 | `NEURON_FIRST_TOKEN_TIMEOUT_SECS` | neuron | Seconds to wait for a response to start, also after tool results (default 100 for the gateway; 90, and 60 after tool results, for a provider called directly) |
 | `NEURON_DENIAL_LIMIT` | neuron | Denied tool calls after which a non-interactive `neuron prompt` run stops (default 5) |
 | `NEURON_COMPLETION_CHECK` | neuron | `0` turns off the completion check: after a turn that changed files, Neuron asks the model once to check its changes against the request before it finishes |

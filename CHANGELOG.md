@@ -36,6 +36,8 @@ The release workflow copies a version's section into its GitHub release notes.
 - `echo /status | neuron --resume latest -p` runs the piped slash commands as
   `--resume latest /status` does instead of sending them to the model, and
   `echo /status | neuron -p` is refused as piped slash commands are for `neuron`.
+- `NEURON_AUTO_COMPACT_INPUT_TOKENS` sets the automatic compaction threshold; the
+  inherited variable name it replaces still works.
 
 ## 7.0.0-alpha.3 (2026-11-02)
 

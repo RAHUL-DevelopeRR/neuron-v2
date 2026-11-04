@@ -30,7 +30,10 @@ use crate::transcript::{normalize_messages, normalized_messages};
 use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
-const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
+/// Environment variable setting the automatic compaction threshold.
+const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "NEURON_AUTO_COMPACT_INPUT_TOKENS";
+/// The name claw-code gave it, still read when the new one is unset.
+const LEGACY_AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
 /// Default cap on model calls per turn.
 pub const DEFAULT_MAX_ITERATIONS: usize = 50;
 /// Environment variable overriding the per-turn model-call cap.
@@ -2045,21 +2048,24 @@ fn parse_max_iterations(env_value: Option<&str>, configured: Option<usize>) -> u
 #[must_use]
 pub fn auto_compaction_threshold_from_env() -> u32 {
     parse_auto_compaction_threshold(
-        std::env::var(AUTO_COMPACTION_THRESHOLD_ENV_VAR)
-            .ok()
-            .as_deref(),
+        auto_compaction_threshold_env(|name| std::env::var(name).ok()).as_deref(),
     )
 }
 
 /// Explicit compaction threshold (estimated context tokens) from
-/// `CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS`, or `None` when unset or invalid so
+/// `NEURON_AUTO_COMPACT_INPUT_TOKENS`, or `None` when unset or invalid so
 /// the model-aware budget applies.
 #[must_use]
 pub fn auto_compaction_threshold_override_from_env() -> Option<u32> {
-    std::env::var(AUTO_COMPACTION_THRESHOLD_ENV_VAR)
-        .ok()
+    auto_compaction_threshold_env(|name| std::env::var(name).ok())
         .and_then(|raw| raw.trim().parse::<u32>().ok())
         .filter(|threshold| *threshold > 0)
+}
+
+/// The compaction threshold variable `var` gives: [`AUTO_COMPACTION_THRESHOLD_ENV_VAR`],
+/// else the legacy name, which is kept as a silent alias.
+fn auto_compaction_threshold_env(var: impl Fn(&str) -> Option<String>) -> Option<String> {
+    var(AUTO_COMPACTION_THRESHOLD_ENV_VAR).or_else(|| var(LEGACY_AUTO_COMPACTION_THRESHOLD_ENV_VAR))
 }
 
 #[must_use]
@@ -2700,9 +2706,10 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
-        AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        auto_compaction_threshold_env, build_assistant_message, parse_auto_compaction_threshold,
+        ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime,
+        PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolExecutor,
+        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -3600,6 +3607,38 @@ mod tests {
             parse_auto_compaction_threshold(Some("not-a-number")),
             DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD
         );
+    }
+
+    #[test]
+    fn auto_compaction_threshold_reads_the_neuron_name_then_the_old_one() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                vars.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_string())
+            }
+        };
+        assert_eq!(
+            auto_compaction_threshold_env(env(&[("NEURON_AUTO_COMPACT_INPUT_TOKENS", "4000")])),
+            Some("4000".to_string())
+        );
+        // The inherited name still works on its own...
+        assert_eq!(
+            auto_compaction_threshold_env(env(&[(
+                "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS",
+                "5000"
+            )])),
+            Some("5000".to_string())
+        );
+        // ...and the new one wins over it.
+        assert_eq!(
+            auto_compaction_threshold_env(env(&[
+                ("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS", "5000"),
+                ("NEURON_AUTO_COMPACT_INPUT_TOKENS", "4000"),
+            ])),
+            Some("4000".to_string())
+        );
+        assert_eq!(auto_compaction_threshold_env(env(&[])), None);
     }
 
     #[test]
