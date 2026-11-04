@@ -465,19 +465,7 @@ fn a_session_in_use_is_refused_and_left_as_it_was() {
     assert_eq!(sessions.len(), 1, "{sessions:?}");
     let saved = fs::read(&sessions[0]).expect("session file");
 
-    // The session's lock: `<NEURON_HOME>/locks/<sha256 of its canonical path>.lock`.
-    let canonical = fs::canonicalize(&sessions[0]).expect("session file");
-    let locks = workspace.home.join(".neuroncli").join("locks");
-    fs::create_dir_all(&locks).expect("locks dir");
-    let held = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(locks.join(format!(
-            "{}.lock",
-            hex::encode(Sha256::digest(canonical.to_string_lossy().as_bytes()))
-        )))
-        .expect("lock file");
+    let held = session_lock_file(&workspace, &sessions[0]);
     held.try_lock().expect("the test holds the session");
 
     let prompt = format!("second-turn {SCENARIO_PREFIX}streaming_text");
@@ -898,6 +886,21 @@ fn neuron(workspace: &Workspace, base_url: &str) -> Command {
         command.env("PATH", path);
     }
     command
+}
+
+/// The lock file of the session at `session`, opened (and made) as a run makes it:
+/// `<NEURON_HOME>/locks/<sha256 of its canonical path>.lock`.
+fn session_lock_file(workspace: &Workspace, session: &Path) -> fs::File {
+    let canonical = fs::canonicalize(session).expect("session file");
+    let locks = workspace.home.join(".neuroncli").join("locks");
+    fs::create_dir_all(&locks).expect("locks dir");
+    let name = hex::encode(Sha256::digest(canonical.to_string_lossy().as_bytes()));
+    fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(locks.join(format!("{name}.lock")))
+        .expect("lock file")
 }
 
 /// The saved sessions of the workspace at `root`.
