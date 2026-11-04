@@ -45,6 +45,7 @@ mod console;
 mod account;
 mod api_client;
 mod args;
+mod artifacts_view;
 mod auth;
 mod brand;
 mod clock;
@@ -70,6 +71,7 @@ mod line_diff;
 mod mcp_auth;
 mod model_routing;
 mod orchestrator;
+mod otel_export;
 mod plan_mode;
 mod progress;
 mod provider;
@@ -84,6 +86,7 @@ mod shell_pty;
 mod source_control;
 mod status_ui;
 mod stream_buffer;
+mod stream_json;
 mod token_budget;
 mod tool_input_preview;
 mod tool_ui;
@@ -622,6 +625,8 @@ prompt after -p, or pipe it: `echo \"...\" | neuron -p`."
         println!();
     }
     let result = cli.run_turn_with_output(&effective_prompt, output_format, compact);
+    // The run's spans go to the collector before the process exits.
+    otel_export::shutdown();
     // Tool calls denied for lack of a prompt: named once more, and exit code 2.
     let denied_exit = headless::report(output_format);
     result?;
@@ -1578,6 +1583,7 @@ fn run_resume_command(
         | SlashCommand::Effort { .. }
         | SlashCommand::Branch { .. }
         | SlashCommand::Rewind { .. }
+        | SlashCommand::Artifacts
         | SlashCommand::Ide { .. }
         | SlashCommand::Tag { .. }
         | SlashCommand::OutputStyle { .. }
@@ -3083,6 +3089,7 @@ impl LiveCli {
         let result = match output_format {
             CliOutputFormat::Text if compact => self.run_prompt_compact(input),
             CliOutputFormat::Text => self.run_turn(input),
+            CliOutputFormat::Json if stream_json::requested() => self.run_prompt_stream_json(input),
             CliOutputFormat::Json => self.run_prompt_json(input),
         };
         // One-shot mode: the shared MCP servers and plugins end with the turn.
@@ -3096,7 +3103,16 @@ impl LiveCli {
         &mut self,
         input: &str,
     ) -> Result<runtime::TurnSummary, Box<dyn std::error::Error>> {
-        let hook_abort_monitor = self.prepare_turn_runtime(false)?;
+        self.run_one_shot_turn_on(input, TurnOutput::Silent)
+    }
+
+    /// [`Self::run_one_shot_turn`] showing the turn on `output`.
+    fn run_one_shot_turn_on(
+        &mut self,
+        input: &str,
+        output: TurnOutput,
+    ) -> Result<runtime::TurnSummary, Box<dyn std::error::Error>> {
+        let hook_abort_monitor = self.prepare_turn_runtime(output)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode)
             .stopping(self.runtime.cancellation_token().clone());
         let result = self.runtime.run_turn(input, Some(&mut permission_prompter));
@@ -3118,8 +3134,49 @@ impl LiveCli {
     }
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let (answer, result) = self.one_shot_answer(input, TurnOutput::Silent);
+        println!("{answer}");
+        result
+    }
+
+    /// `--output-format stream-json`: an `init` line, the turn's events as they happen,
+    /// then a `result` line with the `json` answer ([`stream_json`]).
+    fn run_prompt_stream_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let cwd = env::current_dir()
+            .map(|cwd| cwd.display().to_string())
+            .unwrap_or_default();
+        let tools = tools::GlobalToolRegistry::builtin()
+            .definitions(self.allowed_tools.as_ref())
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        let init = stream_json::init_event(
+            &self.session.id,
+            shown_model(&self.model),
+            &cwd,
+            self.permission_mode.as_str(),
+            &tools,
+        );
+        stream_json::write_line(&mut io::stdout(), &init)?;
+        let writer = stream_json::EventWriter::start(io::stdout());
+        let capabilities = Arc::new(turn_sink::UiCapabilities::default());
+        capabilities.set(&stream_json::capabilities());
+        let output = TurnOutput::channel_with_capabilities(writer.sender(), capabilities);
+        let (answer, result) = self.one_shot_answer(input, output);
+        writer.finish();
+        stream_json::write_line(&mut io::stdout(), &stream_json::result_event(answer))?;
+        result
+    }
+
+    /// Runs one turn on `output` and builds the answer `--output-format json` prints:
+    /// the result, or the failure with what the turn did before it.
+    fn one_shot_answer(
+        &mut self,
+        input: &str,
+        output: TurnOutput,
+    ) -> (Value, Result<(), Box<dyn std::error::Error>>) {
         let before = self.runtime.session().messages.len();
-        let summary = match self.run_one_shot_turn(input) {
+        let summary = match self.run_one_shot_turn_on(input, output) {
             Ok(summary) => summary,
             Err(error) => {
                 // What the turn did before it failed: a script must not mistake a
@@ -3128,8 +3185,7 @@ impl LiveCli {
                 let mut answer =
                     failed_turn_json(&error.to_string(), shown_model(&self.model), messages);
                 answer["session_id"] = json!(self.session.id);
-                println!("{answer}");
-                return Err(error);
+                return (answer, Err(error));
             }
         };
         if let Some(stop) = headless::stop_message() {
@@ -3138,11 +3194,9 @@ impl LiveCli {
             let messages = self.runtime.session().messages.get(before..).unwrap_or(&[]);
             let mut answer = failed_turn_json(&stop, shown_model(&self.model), messages);
             answer["session_id"] = json!(self.session.id);
-            println!("{answer}");
-            return Ok(());
+            return (answer, Ok(()));
         }
-        println!(
-            "{}",
+        (
             json!({
                 "message": final_assistant_text(&summary),
                 "model": shown_model(&self.model),
@@ -3177,9 +3231,9 @@ impl LiveCli {
                         .map_or(0.0, runtime::UsageCostEstimate::total_cost_usd)
                 ),
                 "estimated_cost_known": pricing_for_model(&self.model).is_some()
-            })
-        );
-        Ok(())
+            }),
+            Ok(()),
+        )
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3237,6 +3291,10 @@ impl LiveCli {
             SlashCommand::Clear { confirm } => self.clear_session(confirm)?,
             SlashCommand::Cost => {
                 self.print_cost();
+                false
+            }
+            SlashCommand::Artifacts => {
+                println!("{}", artifacts_view::artifacts_report(&self.session.id));
                 false
             }
             SlashCommand::Resume { session_path } => self.resume_session(session_path)?,

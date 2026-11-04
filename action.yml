@@ -1,0 +1,209 @@
+name: Neuron agent
+description: Run the Neuron coding agent headless on a prompt (or an issue/PR comment) and post its answer.
+author: Neuron
+branding:
+  icon: cpu
+  color: purple
+
+inputs:
+  prompt:
+    description: >
+      What to ask the agent. On issue_comment events with `trigger` set, the text after
+      the trigger phrase in the comment is used instead (this input, when given, is
+      prepended as standing instructions).
+    required: false
+    default: ""
+  trigger:
+    description: >
+      Phrase a comment must contain for the agent to run (issue_comment events only).
+      Empty runs on every event the workflow triggers on.
+    required: false
+    default: "@neuron"
+  model:
+    description: Model to run (`auto` lets the gateway pick).
+    required: false
+    default: "auto"
+  permission-mode:
+    description: read-only, workspace-write or danger-full-access.
+    required: false
+    default: "read-only"
+  allowed-tools:
+    description: Comma-separated tool allowlist passed to --allowedTools (empty = all tools of the mode).
+    required: false
+    default: ""
+  api-key:
+    description: The provider credential, from a secret (e.g. secrets.NEURON_TOKEN). Never logged.
+    required: true
+  api-key-env:
+    description: >
+      The environment variable the credential goes in: NEURON_TOKEN (Zero-X gateway),
+      ANTHROPIC_API_KEY, OPENAI_API_KEY, ...
+    required: false
+    default: "NEURON_TOKEN"
+  neuron-version:
+    description: >
+      The Neuron release to install, pinned (e.g. 7.0.0-alpha.3). It must be a release
+      with `--output-format stream-json`.
+    required: true
+  comment:
+    description: Post the answer as a comment on the issue or pull request that triggered the run.
+    required: false
+    default: "true"
+  github-token:
+    description: Token used to post the comment.
+    required: false
+    default: ${{ github.token }}
+  denial-limit:
+    description: Tool calls denied for lack of approval before the run stops (NEURON_DENIAL_LIMIT).
+    required: false
+    default: "5"
+
+outputs:
+  result:
+    description: The agent's final answer.
+    value: ${{ steps.run.outputs.result }}
+  session-id:
+    description: The session id (`neuron --resume <id>` continues it).
+    value: ${{ steps.run.outputs.session-id }}
+  outcome:
+    description: How the turn ended (completed, refused, failed, ...).
+    value: ${{ steps.run.outputs.outcome }}
+  exit-code:
+    description: The exit code of `neuron prompt` (2 = tool calls were denied).
+    value: ${{ steps.run.outputs.exit-code }}
+  stream-file:
+    description: Path of the stream-json event log of the run.
+    value: ${{ steps.run.outputs.stream-file }}
+  skipped:
+    description: "true when the trigger phrase was not in the comment and nothing ran."
+    value: ${{ steps.prompt.outputs.skipped }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check the runner
+      shell: bash
+      run: |
+        case "$RUNNER_OS" in
+          Linux|macOS) ;;
+          *) echo "::error::The Neuron action supports Linux and macOS runners (got $RUNNER_OS)."; exit 1 ;;
+        esac
+
+    - name: Build the prompt
+      id: prompt
+      shell: bash
+      env:
+        INPUT_PROMPT: ${{ inputs.prompt }}
+        INPUT_TRIGGER: ${{ inputs.trigger }}
+        EVENT_NAME: ${{ github.event_name }}
+        COMMENT_BODY: ${{ github.event.comment.body }}
+        ISSUE_TITLE: ${{ github.event.issue.title || github.event.pull_request.title }}
+      run: |
+        # Untrusted text (comment bodies, titles) only ever travels in env vars and files,
+        # never interpolated into the script.
+        prompt_file="$RUNNER_TEMP/neuron-prompt.txt"
+        : > "$prompt_file"
+        if [ "$EVENT_NAME" = "issue_comment" ] || [ "$EVENT_NAME" = "pull_request_review_comment" ]; then
+          if [ -n "$INPUT_TRIGGER" ]; then
+            case "$COMMENT_BODY" in
+              *"$INPUT_TRIGGER"*) ;;
+              *) echo "skipped=true" >> "$GITHUB_OUTPUT"; echo "No '$INPUT_TRIGGER' in the comment; skipping."; exit 0 ;;
+            esac
+          fi
+          request="${COMMENT_BODY#*"$INPUT_TRIGGER"}"
+          if [ -n "$INPUT_PROMPT" ]; then printf '%s\n\n' "$INPUT_PROMPT" >> "$prompt_file"; fi
+          printf 'Request from a comment on "%s":\n%s\n' "$ISSUE_TITLE" "$request" >> "$prompt_file"
+        else
+          printf '%s\n' "$INPUT_PROMPT" >> "$prompt_file"
+        fi
+        if [ -z "$(tr -d '[:space:]' < "$prompt_file")" ]; then
+          echo "::error::No prompt: set the 'prompt' input or trigger the action from a comment."
+          exit 1
+        fi
+        echo "skipped=false" >> "$GITHUB_OUTPUT"
+        echo "file=$prompt_file" >> "$GITHUB_OUTPUT"
+
+    - name: Install Neuron
+      if: steps.prompt.outputs.skipped != 'true'
+      shell: bash
+      env:
+        NEURON_VERSION: ${{ inputs.neuron-version }}
+        NEURON_NO_TUI: "1"
+      run: |
+        install_dir="$RUNNER_TEMP/neuron-bin"
+        mkdir -p "$install_dir"
+        curl -fsSL "https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v${NEURON_VERSION}/install.sh" \
+          | sh -s -- --version "$NEURON_VERSION" --install-dir "$install_dir"
+        echo "$install_dir" >> "$GITHUB_PATH"
+        "$install_dir/neuron" --version
+
+    - name: Run Neuron
+      id: run
+      if: steps.prompt.outputs.skipped != 'true'
+      shell: bash
+      env:
+        NEURON_ACTION_KEY: ${{ inputs.api-key }}
+        NEURON_ACTION_KEY_ENV: ${{ inputs.api-key-env }}
+        NEURON_ACTION_MODEL: ${{ inputs.model }}
+        NEURON_ACTION_MODE: ${{ inputs.permission-mode }}
+        NEURON_ACTION_TOOLS: ${{ inputs.allowed-tools }}
+        NEURON_DENIAL_LIMIT: ${{ inputs.denial-limit }}
+        PROMPT_FILE: ${{ steps.prompt.outputs.file }}
+      run: |
+        case "$NEURON_ACTION_KEY_ENV" in
+          *[!A-Za-z0-9_]*|"") echo "::error::api-key-env must be an environment variable name"; exit 1 ;;
+        esac
+        if [ -n "$NEURON_ACTION_KEY" ]; then echo "::add-mask::$NEURON_ACTION_KEY"; fi
+        export "$NEURON_ACTION_KEY_ENV=$NEURON_ACTION_KEY"
+        unset NEURON_ACTION_KEY
+        stream="$RUNNER_TEMP/neuron-stream.jsonl"
+        args=(prompt --output-format stream-json --model "$NEURON_ACTION_MODEL" --permission-mode "$NEURON_ACTION_MODE")
+        if [ -n "$NEURON_ACTION_TOOLS" ]; then args+=(--allowedTools "$NEURON_ACTION_TOOLS"); fi
+        set +e
+        # stdin is not a terminal: nothing asks for approval; the prompt is an argument.
+        neuron "${args[@]}" "$(cat "$PROMPT_FILE")" < /dev/null > "$stream"
+        code=$?
+        set -e
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+        echo "stream-file=$stream" >> "$GITHUB_OUTPUT"
+        result_line="$(jq -c 'select(.type == "result")' "$stream" 2>/dev/null | tail -n 1 || true)"
+        if [ -n "$result_line" ]; then
+          message="$(printf '%s' "$result_line" | jq -r 'if .is_error then "Neuron failed: " + (.error // "unknown error") else (.message // "") end')"
+          {
+            echo "session-id=$(printf '%s' "$result_line" | jq -r '.session_id // ""')"
+            echo "outcome=$(printf '%s' "$result_line" | jq -r '.outcome // "failed"')"
+            delimiter="NEURON_RESULT_$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+            echo "result<<$delimiter"
+            printf '%s\n' "$message"
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$message" > "$RUNNER_TEMP/neuron-result.md"
+        else
+          echo "outcome=failed" >> "$GITHUB_OUTPUT"
+          echo "Neuron did not finish the run (exit code $code)." > "$RUNNER_TEMP/neuron-result.md"
+        fi
+        # 2 = some tool calls were denied; the answer is still posted.
+        if [ "$code" -ne 0 ] && [ "$code" -ne 2 ]; then
+          echo "::warning::neuron exited with code $code"
+        fi
+
+    - name: Post the answer
+      if: steps.prompt.outputs.skipped != 'true' && inputs.comment == 'true' && (github.event.issue.number || github.event.pull_request.number)
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+        REPO: ${{ github.repository }}
+        SESSION_ID: ${{ steps.run.outputs.session-id }}
+      run: |
+        body="$RUNNER_TEMP/neuron-comment.md"
+        {
+          cat "$RUNNER_TEMP/neuron-result.md"
+          printf '\n\n<sub>Neuron session `%s`</sub>\n' "${SESSION_ID:-unknown}"
+        } > "$body"
+        gh issue comment "$NUMBER" --repo "$REPO" --body-file "$body"
+
+    - name: Fail on a failed run
+      if: steps.prompt.outputs.skipped != 'true' && steps.run.outputs.exit-code != '0' && steps.run.outputs.exit-code != '2'
+      shell: bash
+      run: exit 1

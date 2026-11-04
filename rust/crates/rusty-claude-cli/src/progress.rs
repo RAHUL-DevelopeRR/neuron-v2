@@ -521,6 +521,16 @@ fn assemble_conversation_runtime(
     if let Some(reviewer) = reviewer {
         runtime = runtime.with_change_reviewer(Box::new(reviewer));
     }
+    if let Some(tracer) = crate::otel_export::tracer_for(session_id) {
+        runtime = runtime.with_session_tracer(tracer);
+    }
+    // Tool outputs too large for the conversation are kept whole (`/artifacts`). Unit
+    // tests leave the user's Neuron home alone.
+    if !cfg!(test) && runtime::artifacts::enabled_from_env() {
+        if let Ok(store) = runtime::artifacts::ArtifactStore::open_default(session_id) {
+            runtime = runtime.with_artifact_store(store);
+        }
+    }
     if output.is_visible() {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }

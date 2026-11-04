@@ -1853,6 +1853,10 @@ impl Engine {
                 let usage = self.cli.runtime.usage().cumulative_usage();
                 self.notice(&format_cost_report(usage));
             }
+            SlashCommand::Artifacts => {
+                let report = crate::artifacts_view::artifacts_report(&self.cli.session.id);
+                self.notice(&report);
+            }
             SlashCommand::Stats => {
                 let usage =
                     UsageTracker::from_session(self.cli.runtime.session()).cumulative_usage();
