@@ -206,6 +206,8 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--print",
     "--compact",
     "--base-commit",
+    "--allow-web",
+    "--allow-origin",
     "-p",
 ];
 
@@ -480,6 +482,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     let (args, provider_choice) = extract_provider_flag(&args).map_err(UsageError)?;
     provider::set_provider_flag(provider_choice);
+    // `--allow-web` and `--allow-origin`: for this run only, never saved.
+    let (args, web_grants) = extract_web_grant_flags(&args).map_err(UsageError)?;
+    runtime::set_run_web_grants(web_grants);
+    // Signed in, WebSearch goes through the Zero-X gateway (`POST /v1/search`).
+    tools::set_search_gateway_provider(auth::search_gateway);
     let (args, no_tui) = full_screen::extract_no_tui_flag(args);
     let (args, continue_chat) = full_screen::extract_continue_flag(args);
     // `auth`, `login`, `logout`, `usage` and `upgrade`, also after global flags.

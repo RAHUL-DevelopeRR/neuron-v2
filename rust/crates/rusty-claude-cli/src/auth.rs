@@ -148,6 +148,27 @@ pub fn cached_gateway_token() -> io::Result<Option<SecureString>> {
     Ok(current_credential()?.map(|credential| credential.token))
 }
 
+/// Where a signed-in `WebSearch` goes: `POST <origin>/v1/search` on the
+/// gateway, paid for by the current Zero-X credential. `None` when signed out
+/// or the login has expired, so the search goes direct. Read at each search,
+/// so signing in or out mid-session takes effect.
+pub fn search_gateway() -> Option<tools::SearchGateway> {
+    let base = gateway_base_url().ok()?;
+    let credential = current_credential().ok()??;
+    search_gateway_for(&base, &credential, crate::clock::now_unix())
+}
+
+fn search_gateway_for(
+    base: &str,
+    credential: &GatewayCredential,
+    now: u64,
+) -> Option<tools::SearchGateway> {
+    (!credential.is_expired(now)).then(|| tools::SearchGateway {
+        endpoint: gateway_http::account_url(base, "/v1/search"),
+        token: credential.token.expose().to_string(),
+    })
+}
+
 fn interactive() -> bool {
     runtime::ui_hooks::stdin_is_terminal() && io::stderr().is_terminal()
 }
@@ -993,6 +1014,28 @@ mod tests {
         assert!(validate_gateway_base("http://example.com/v1").is_err());
         assert!(validate_gateway_base("https://user:secret@example.com/v1").is_err());
         assert!(validate_gateway_base("https://example.com/v1?redirect=other").is_err());
+    }
+
+    #[test]
+    fn signed_in_searches_go_to_the_gateway_search_endpoint_until_the_login_expires() {
+        let credential = GatewayCredential {
+            token: SecureString::new("ses_test".to_string()),
+            kind: TokenKind::Session,
+            source: CredentialSource::EnvToken,
+            expires_at: Some(1_000),
+            plan: None,
+            email: None,
+            name: None,
+        };
+        let gateway =
+            search_gateway_for("https://zero-x.live/v1", &credential, 999).expect("signed in");
+        assert_eq!(gateway.endpoint, "https://zero-x.live/v1/search");
+        assert_eq!(gateway.token, "ses_test");
+        // A loopback gateway (tests, local development) keeps its port.
+        let local = search_gateway_for("http://127.0.0.1:42137/v1/", &credential, 0).unwrap();
+        assert_eq!(local.endpoint, "http://127.0.0.1:42137/v1/search");
+        // Expired: the search goes direct.
+        assert!(search_gateway_for("https://zero-x.live/v1", &credential, 1_000).is_none());
     }
 
     fn strings(list: &[&str]) -> Vec<String> {

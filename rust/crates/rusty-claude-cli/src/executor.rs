@@ -642,6 +642,14 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
+        "  --allow-web                Let WebSearch and WebFetch run without asking, for this run only"
+    )?;
+    writeln!(
+        out,
+        "  --allow-origin HOST        Limit WebFetch and the browser to HOST and fetch from it without asking, for this run only (repeatable; *.example.com for subdomains)"
+    )?;
+    writeln!(
+        out,
         "  --base-commit REV          Warn at start when git HEAD is not REV (default: the commit in .neuron-base); a terminal session then uses the line REPL"
     )?;
     writeln!(

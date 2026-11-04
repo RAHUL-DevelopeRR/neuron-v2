@@ -483,6 +483,14 @@ pub(crate) fn parse_args_with_stdin(
                 allowed_tool_values.push(flag[16..].to_string());
                 index += 1;
             }
+            // `main` takes the run-only web grants out before parsing, up to where
+            // prompt text starts: one here is among a prompt's words.
+            flag if WEB_GRANT_FLAGS.contains(&flag.split('=').next().unwrap_or(flag)) => {
+                let flag = flag.split('=').next().unwrap_or(flag);
+                return Err(format!(
+                    "{flag} among a prompt's words would be sent to the model as text: put it before the prompt (`neuron {flag} ... prompt \"...\"`), or quote the prompt"
+                ));
+            }
             other if rest.is_empty() && other.starts_with('-') => {
                 return Err(format_unknown_option(other))
             }
@@ -966,7 +974,50 @@ const VALUE_FLAGS: &[&str] = &[
     "--reasoning-effort",
     "--allowedTools",
     "--allowed-tools",
+    "--allow-origin",
 ];
+
+/// The run-only web grants, which `main` takes out of the arguments before they
+/// are parsed ([`extract_web_grant_flags`]).
+pub(crate) const WEB_GRANT_FLAGS: &[&str] = &["--allow-web", "--allow-origin"];
+
+/// Removes `--allow-web` and every `--allow-origin <host>` /
+/// `--allow-origin=<host>` from `args` and returns the remaining arguments with
+/// the grants for this run. Like `--provider`, scanning stops where prompt text
+/// begins: at `-p`, at a `prompt` subcommand, and at `--`.
+pub(crate) fn extract_web_grant_flags(
+    args: &[String],
+) -> Result<(Vec<String>, runtime::RunWebGrants), String> {
+    let mut remaining = Vec::with_capacity(args.len());
+    let mut grants = runtime::RunWebGrants::default();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let is_flag_value = index > 0 && VALUE_FLAGS.contains(&args[index - 1].as_str());
+        if arg == "-p" || arg == "--" || (arg == "prompt" && !is_flag_value) {
+            remaining.extend_from_slice(&args[index..]);
+            break;
+        }
+        if arg == "--allow-web" {
+            grants.allow_web = true;
+        } else if arg == "--allow-origin" {
+            index += 1;
+            let value = args
+                .get(index)
+                .filter(|value| !value.starts_with('-'))
+                .ok_or_else(|| {
+                    "missing value for --allow-origin (a host such as example.com)".to_string()
+                })?;
+            grants.add_origin(value)?;
+        } else if let Some(value) = arg.strip_prefix("--allow-origin=") {
+            grants.add_origin(value)?;
+        } else {
+            remaining.push(arg.clone());
+        }
+        index += 1;
+    }
+    Ok((remaining, grants))
+}
 
 /// Removes `--provider <id>` / `--provider=<id>` from `args` and returns the
 /// remaining arguments with the parsed choice. Scanning stops where prompt
@@ -1665,7 +1716,8 @@ fn p_words_action(
         if is_session_flag(word) {
             Some(Err(session_flag_error(word)))
         } else {
-            OPTIONS_APPLIED_AFTER_PROMPT.contains(&option).then(|| {
+            (OPTIONS_APPLIED_AFTER_PROMPT.contains(&option) || WEB_GRANT_FLAGS.contains(&option))
+                .then(|| {
                 Err(format!(
                     "{option} after `-p` would be sent to the model as prompt text: put options before `-p` (`neuron {option} ... -p \"...\"`), or quote the prompt"
                 ))
@@ -1812,6 +1864,74 @@ mod provider_flag_tests {
             extract_provider_flag(&strings(&["-p", "explain", "--provider", "flags"])).unwrap();
         assert_eq!(rest, strings(&["-p", "explain", "--provider", "flags"]));
         assert_eq!(provider, None);
+    }
+}
+
+#[cfg(test)]
+mod web_grant_flag_tests {
+    use super::{extract_web_grant_flags, parse_args};
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn web_grants_are_removed_and_collected_before_the_prompt() {
+        let (rest, grants) = extract_web_grant_flags(&strings(&[
+            "--allow-web",
+            "--allow-origin",
+            "https://Example.com/docs",
+            "--model",
+            "sonnet",
+            "--allow-origin=*.github.com",
+            "-p",
+            "summarize",
+        ]))
+        .unwrap();
+        assert_eq!(rest, strings(&["--model", "sonnet", "-p", "summarize"]));
+        assert!(grants.allow_web);
+        assert_eq!(grants.origins, vec!["example.com", "*.github.com"]);
+
+        // Nothing given: nothing granted, arguments untouched.
+        let words = strings(&["--model", "sonnet", "status"]);
+        let (rest, grants) = extract_web_grant_flags(&words).unwrap();
+        assert_eq!(rest, words);
+        assert!(grants.is_empty());
+    }
+
+    #[test]
+    fn web_grants_among_prompt_words_are_prompt_text_and_refused_by_the_parser() {
+        let words = strings(&["-p", "explain", "--allow-web"]);
+        let (rest, grants) = extract_web_grant_flags(&words).unwrap();
+        assert_eq!(rest, words);
+        assert!(grants.is_empty());
+        let error = parse_args(&rest).unwrap_err();
+        assert!(error.contains("--allow-web after `-p`"), "{error}");
+
+        let words = strings(&["prompt", "read", "--allow-origin=example.com"]);
+        let (rest, _) = extract_web_grant_flags(&words).unwrap();
+        let error = parse_args(&rest).unwrap_err();
+        assert!(
+            error.starts_with("--allow-origin among a prompt's words"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn bad_origins_are_usage_errors() {
+        let error = extract_web_grant_flags(&strings(&["--allow-origin"])).unwrap_err();
+        assert!(
+            error.contains("missing value for --allow-origin"),
+            "{error}"
+        );
+        let error =
+            extract_web_grant_flags(&strings(&["--allow-origin", "--allow-web"])).unwrap_err();
+        assert!(error.contains("missing value"), "{error}");
+        let error = extract_web_grant_flags(&strings(&["--allow-origin=exa mple"])).unwrap_err();
+        assert!(
+            error.contains("invalid value for --allow-origin"),
+            "{error}"
+        );
     }
 }
 
