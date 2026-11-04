@@ -773,6 +773,18 @@ fn extensions_event() -> UiEvent {
                         enabled: false,
                     }
                 }));
+                // A plugin's servers wait for the user's approval and are not started.
+                servers.extend(config.mcp().needs_approval().iter().map(|(name, server)| {
+                    McpServerInfo {
+                        name: name.clone(),
+                        scope: config_scope_id(server.scope).to_string(),
+                        transport: mcp_transport_id(server.transport()).to_string(),
+                        status: "needs_approval".to_string(),
+                        tools: Vec::new(),
+                        error: None,
+                        enabled: true,
+                    }
+                }));
                 servers.sort_by(|left, right| left.name.cmp(&right.name));
                 servers
             }
@@ -890,6 +902,7 @@ fn config_scope_id(scope: ConfigSource) -> &'static str {
         ConfigSource::User => "user",
         ConfigSource::Project => "project",
         ConfigSource::Local => "local",
+        ConfigSource::Plugin => "plugin",
     }
 }
 

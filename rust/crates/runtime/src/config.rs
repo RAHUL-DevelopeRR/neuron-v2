@@ -20,7 +20,13 @@ pub enum ConfigSource {
     User,
     Project,
     Local,
+    /// Brought by an enabled plugin. Its MCP servers wait for the same per-server
+    /// approval as a project's before they start.
+    Plugin,
 }
+
+/// What a plugin's MCP server config may write for the plugin's own folder.
+pub const PLUGIN_ROOT_PLACEHOLDER: &str = "${NEURON_PLUGIN_ROOT}";
 
 /// Effective permission mode after decoding config values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +155,9 @@ pub struct McpConfigCollection {
     servers: BTreeMap<String, ScopedMcpServerConfig>,
     /// Configured servers turned off by `disabledMcpServers` (in any settings file).
     disabled: BTreeMap<String, ScopedMcpServerConfig>,
+    /// Servers that do not start until the user approves them: the MCP servers of
+    /// enabled plugins ([`ConfigSource::Plugin`]).
+    needs_approval: BTreeMap<String, ScopedMcpServerConfig>,
 }
 
 /// MCP server config paired with the scope that defined it.
@@ -511,21 +520,27 @@ impl ConfigLoader {
                     });
             }
         }
+        let merged_value = JsonValue::Object(merged.clone());
+        let plugins = parse_optional_plugin_config(&merged_value)?;
+        let mut needs_approval = self.plugin_mcp_servers(&plugins, &mcp_servers);
+
         let mut disabled_servers = BTreeMap::new();
         for name in disabled_mcp_servers {
-            if let Some(server) = mcp_servers.remove(&name) {
+            if let Some(server) = mcp_servers
+                .remove(&name)
+                .or_else(|| needs_approval.remove(&name))
+            {
                 disabled_servers.insert(name, server);
             }
         }
 
-        let merged_value = JsonValue::Object(merged.clone());
-
         let feature_config = RuntimeFeatureConfig {
             hooks: parse_optional_hooks_config(&merged_value)?,
-            plugins: parse_optional_plugin_config(&merged_value)?,
+            plugins,
             mcp: McpConfigCollection {
                 servers: mcp_servers,
                 disabled: disabled_servers,
+                needs_approval,
             },
             oauth: parse_optional_oauth_config(&merged_value, "merged settings.oauth")?,
             model: parse_optional_model(&merged_value),
@@ -544,6 +559,72 @@ impl ConfigLoader {
             feature_config,
             ignored_project_settings,
         })
+    }
+
+    /// The plugin manager these settings describe.
+    #[must_use]
+    pub fn plugin_manager(&self, plugins: &RuntimePluginConfig) -> plugins::PluginManager {
+        plugins::PluginManager::new(plugin_manager_config(&self.cwd, &self.config_home, plugins))
+    }
+
+    /// The skill folders of the enabled plugins, each with its plugin's name.
+    #[must_use]
+    pub fn plugin_skill_dirs(&self, config: &RuntimeConfig) -> Vec<(String, PathBuf)> {
+        self.plugin_manager(config.plugins())
+            .enabled_plugin_extensions()
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|extension| {
+                let name = extension.plugin_name;
+                extension
+                    .skill_dirs
+                    .into_iter()
+                    .map(move |dir| (name.clone(), dir))
+            })
+            .collect()
+    }
+
+    /// The MCP servers of the enabled plugins, in [`ConfigSource::Plugin`] scope. A
+    /// name a settings file already uses, or an earlier plugin took, is skipped.
+    fn plugin_mcp_servers(
+        &self,
+        plugins: &RuntimePluginConfig,
+        configured: &BTreeMap<String, ScopedMcpServerConfig>,
+    ) -> BTreeMap<String, ScopedMcpServerConfig> {
+        let mut servers = BTreeMap::new();
+        let Ok(extensions) = self.plugin_manager(plugins).enabled_plugin_extensions() else {
+            return servers;
+        };
+        for extension in extensions {
+            let plugin_root = extension.root.display().to_string();
+            for (name, value) in extension.mcp_servers {
+                if configured.contains_key(&name) || servers.contains_key(&name) {
+                    crate::ui_hooks::notice(&format!(
+                        "warning: plugin {} brings MCP server {name}, but that name is already in use; skipped it.",
+                        extension.plugin_name
+                    ));
+                    continue;
+                }
+                let value = expand_plugin_root(&value, &plugin_root);
+                let context = format!("plugin {}: mcpServers.{name}", extension.plugin_name);
+                let parsed = JsonValue::parse(&value.to_string())
+                    .map_err(|error| ConfigError::Parse(format!("{context}: {error}")))
+                    .and_then(|json| parse_mcp_server_config(&name, &json, &context));
+                match parsed {
+                    Ok(config) => {
+                        servers.insert(
+                            name,
+                            ScopedMcpServerConfig {
+                                scope: ConfigSource::Plugin,
+                                config,
+                            },
+                        );
+                    }
+                    Err(error) => crate::ui_hooks::notice(&format!("warning: {error}")),
+                }
+            }
+        }
+        servers
     }
 
     /// What the workspace's own settings files would turn on once it is trusted, whatever
@@ -1257,6 +1338,67 @@ impl McpConfigCollection {
     pub fn disabled(&self) -> &BTreeMap<String, ScopedMcpServerConfig> {
         &self.disabled
     }
+
+    /// Servers that wait for the user's approval and are not started: today the
+    /// MCP servers of enabled plugins.
+    #[must_use]
+    pub fn needs_approval(&self) -> &BTreeMap<String, ScopedMcpServerConfig> {
+        &self.needs_approval
+    }
+}
+
+/// The plugin manager's settings. A path in the `plugins` settings resolves against
+/// the workspace when it starts with `.`, otherwise against the config home.
+#[must_use]
+pub fn plugin_manager_config(
+    cwd: &Path,
+    config_home: &Path,
+    plugins: &RuntimePluginConfig,
+) -> plugins::PluginManagerConfig {
+    let resolve = |value: &str| {
+        let path = PathBuf::from(value);
+        if path.is_absolute() {
+            path
+        } else if value.starts_with('.') {
+            cwd.join(path)
+        } else {
+            config_home.join(path)
+        }
+    };
+    let mut config = plugins::PluginManagerConfig::new(config_home.to_path_buf());
+    config.enabled_plugins = plugins.enabled_plugins().clone();
+    config.external_dirs = plugins
+        .external_directories()
+        .iter()
+        .map(|path| resolve(path))
+        .collect();
+    config.install_root = plugins.install_root().map(resolve);
+    config.registry_path = plugins.registry_path().map(resolve);
+    config.bundled_root = plugins.bundled_root().map(resolve);
+    config
+}
+
+/// `value` with [`PLUGIN_ROOT_PLACEHOLDER`] replaced by the plugin's folder in every
+/// string, so a plugin's server can name its own files.
+fn expand_plugin_root(value: &serde_json::Value, plugin_root: &str) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => {
+            serde_json::Value::String(text.replace(PLUGIN_ROOT_PLACEHOLDER, plugin_root))
+        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(|item| expand_plugin_root(item, plugin_root))
+                .collect(),
+        ),
+        serde_json::Value::Object(entries) => serde_json::Value::Object(
+            entries
+                .iter()
+                .map(|(key, item)| (key.clone(), expand_plugin_root(item, plugin_root)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
 }
 
 impl ScopedMcpServerConfig {
@@ -1955,6 +2097,101 @@ mod tests {
             .expect("time should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("runtime-config-{nanos}"))
+    }
+
+    /// An enabled plugin's MCP servers load in the plugin scope and wait for approval:
+    /// they are listed, never among the servers that start.
+    #[test]
+    fn plugin_mcp_servers_wait_for_approval_and_never_shadow_settings() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".neuron");
+        let plugin = root.join("plugin-src");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::create_dir_all(plugin.join(".neuron-plugin")).expect("plugin dir");
+        fs::create_dir_all(plugin.join("skills").join("triage")).expect("skill dir");
+        fs::write(
+            plugin.join("skills").join("triage").join("SKILL.md"),
+            "---
+name: triage
+description: t
+---
+",
+        )
+        .expect("skill");
+        fs::write(
+            plugin.join(".neuron-plugin").join("plugin.json"),
+            r#"{"name": "tracker-kit", "version": "1.0.0", "description": "d",
+                "skills": "skills",
+                "mcpServers": {
+                  "tracker": {"command": "node", "args": ["${NEURON_PLUGIN_ROOT}/server.js"]},
+                  "docs": {"command": "node"}
+                }}"#,
+        )
+        .expect("manifest");
+        let mut manager = plugins::PluginManager::new(plugins::PluginManagerConfig::new(&home));
+        let install = manager
+            .install(plugin.to_str().expect("utf8"))
+            .expect("install plugin");
+        // A settings server of the same name wins over the plugin's.
+        fs::write(
+            home.join("settings.json"),
+            format!(
+                r#"{{"plugins": {{"enabled": {{"{}": true}}}}, "mcpServers": {{"docs": {{"command": "uvx"}}}}}}"#,
+                install.plugin_id
+            ),
+        )
+        .expect("settings");
+
+        let loader = ConfigLoader::new(&cwd, &home);
+        let loaded = loader.load().expect("config loads");
+        let pending = loaded.mcp().needs_approval();
+        assert_eq!(pending.keys().collect::<Vec<_>>(), vec!["tracker"]);
+        assert_eq!(pending["tracker"].scope, ConfigSource::Plugin);
+        assert!(loaded.mcp().get("tracker").is_none(), "not started");
+        assert_eq!(loaded.mcp().get("docs").unwrap().scope, ConfigSource::User);
+        match &pending["tracker"].config {
+            McpServerConfig::Stdio(stdio) => {
+                let expected = format!("{}/server.js", install.install_path.display());
+                assert_eq!(stdio.args, vec![expected]);
+            }
+            other => panic!("expected stdio, got {other:?}"),
+        }
+        let skill_dirs = loader.plugin_skill_dirs(&loaded);
+        assert_eq!(skill_dirs.len(), 1);
+        assert_eq!(skill_dirs[0].0, "tracker-kit");
+        assert!(skill_dirs[0].1.join("triage").join("SKILL.md").is_file());
+
+        // Turned off in the settings: listed as disabled, not as waiting.
+        fs::write(
+            home.join("settings.json"),
+            format!(
+                r#"{{"plugins": {{"enabled": {{"{}": true}}}}, "disabledMcpServers": ["tracker"]}}"#,
+                install.plugin_id
+            ),
+        )
+        .expect("settings");
+        let loaded = loader.load().expect("config loads");
+        // With no settings server named docs, the plugin's own docs server now waits too.
+        assert_eq!(
+            loaded.mcp().needs_approval().keys().collect::<Vec<_>>(),
+            vec!["docs"]
+        );
+        assert!(loaded.mcp().disabled().contains_key("tracker"));
+
+        // A disabled plugin brings nothing.
+        fs::write(
+            home.join("settings.json"),
+            format!(
+                r#"{{"plugins": {{"enabled": {{"{}": false}}}}}}"#,
+                install.plugin_id
+            ),
+        )
+        .expect("settings");
+        let loaded = loader.load().expect("config loads");
+        assert!(loaded.mcp().needs_approval().is_empty());
+        assert!(loader.plugin_skill_dirs(&loaded).is_empty());
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     /// A workspace whose files want hooks, MCP servers and rules, each of which would leave

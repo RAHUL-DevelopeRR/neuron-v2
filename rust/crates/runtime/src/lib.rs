@@ -96,14 +96,14 @@ pub use compact::{
     DEFAULT_MAX_SUMMARY_TOKENS, DERIVED_CONTEXT_NOTE,
 };
 pub use config::{
-    ConfigEntry, ConfigError, ConfigLoader, ConfigSource, IgnoredProjectSettings,
-    McpConfigCollection, McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig,
-    McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
+    plugin_manager_config, ConfigEntry, ConfigError, ConfigLoader, ConfigSource,
+    IgnoredProjectSettings, McpConfigCollection, McpManagedProxyServerConfig, McpOAuthConfig,
+    McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
     McpWebSocketServerConfig, OAuthConfig, PreviewHook, PreviewMcpServer, PreviewPermissionRule,
     ProjectSettingsAction, ProjectTrust, ProviderFallbackConfig, ResolvedPermissionMode,
     RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig, RuntimePermissionRuleConfig,
     RuntimePluginConfig, ScopedMcpServerConfig, WorkspaceTrustPreview, CLAW_SETTINGS_SCHEMA_NAME,
-    UNTRUSTED_WORKSPACE_KEYS,
+    PLUGIN_ROOT_PLACEHOLDER, UNTRUSTED_WORKSPACE_KEYS,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,

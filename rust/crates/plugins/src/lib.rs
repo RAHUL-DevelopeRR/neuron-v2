@@ -154,6 +154,8 @@ pub struct PluginManifest {
 pub struct PluginExtensions {
     pub plugin_id: String,
     pub plugin_name: String,
+    /// The plugin's folder.
+    pub root: PathBuf,
     /// Absolute paths of the plugin's skill folders.
     pub skill_dirs: Vec<PathBuf>,
     pub mcp_servers: BTreeMap<String, Value>,
@@ -1444,6 +1446,7 @@ impl PluginManager {
             extensions.push(PluginExtensions {
                 plugin_id: metadata.id.clone(),
                 plugin_name: metadata.name.clone(),
+                root: root.to_path_buf(),
                 skill_dirs: manifest.skills.iter().map(|path| root.join(path)).collect(),
                 mcp_servers: manifest.mcp_servers,
             });

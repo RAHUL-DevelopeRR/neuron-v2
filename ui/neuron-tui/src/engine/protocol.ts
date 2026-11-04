@@ -220,11 +220,14 @@ export interface TodoItem {
 /** One configured MCP server and what it is doing now. */
 export interface McpServerInfo {
   name: string
-  /** `bundled`, `user`, `project` or `local`. */
+  /** `bundled`, `user`, `project`, `local` or `plugin` (brought by an enabled plugin). */
   scope: string
   /** `stdio`, `http`, `sse`, `ws`, `sdk` or `managed_proxy`. */
   transport: string
-  /** `starting`, `ready`, `failed`, `pending`, `unsupported`, `not_started` or `disabled`. */
+  /**
+   * `starting`, `ready`, `failed`, `pending`, `unsupported`, `not_started`, `disabled`
+   * or `needs_approval` (waits for the user's approval, as a plugin's servers do).
+   */
   status: string
   /** Its tools, without the `mcp__<server>__` prefix. */
   tools: string[]

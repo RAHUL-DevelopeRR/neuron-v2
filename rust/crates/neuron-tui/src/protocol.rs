@@ -168,13 +168,15 @@ pub const FEATURE_MODEL_IMAGES: &str = "model_images";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpServerInfo {
     pub name: String,
-    /// Where it is configured: `bundled`, `user`, `project` or `local`.
+    /// Where it is configured: `bundled`, `user`, `project`, `local` or `plugin`
+    /// (brought by an enabled plugin).
     pub scope: String,
     /// `stdio`, `http`, `sse`, `ws`, `sdk` or `managed_proxy`.
     pub transport: String,
     /// `starting`, `ready`, `failed`, `pending` (started, tools not found),
-    /// `unsupported` (a transport Neuron does not speak yet), `not_started` or
-    /// `disabled` (turned off in the settings).
+    /// `unsupported` (a transport Neuron does not speak yet), `not_started`,
+    /// `disabled` (turned off in the settings) or `needs_approval` (waits for the
+    /// user's approval before it starts, as a plugin's servers do).
     pub status: String,
     /// Its tools, without the `mcp__<server>__` prefix.
     pub tools: Vec<String>,

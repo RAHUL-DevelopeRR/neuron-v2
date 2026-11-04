@@ -2629,6 +2629,12 @@ fn render_mcp_report_for(
             for name in runtime_config.mcp().disabled().keys() {
                 let _ = write!(report, "\n  {name:<16} disabled");
             }
+            for name in runtime_config.mcp().needs_approval().keys() {
+                let _ = write!(
+                    report,
+                    "\n  {name:<16} needs approval (from a plugin; not started)"
+                );
+            }
             Ok(report)
         }
         Some(args) if is_help_arg(args) => Ok(render_mcp_usage(None)),
@@ -2679,6 +2685,8 @@ fn render_mcp_report_json_for(
             let mut report = render_mcp_summary_report_json(cwd, runtime_config.mcp().servers());
             report["disabled_servers"] =
                 json!(runtime_config.mcp().disabled().keys().collect::<Vec<_>>());
+            report["needs_approval_servers"] =
+                json!(runtime_config.mcp().needs_approval().keys().collect::<Vec<_>>());
             Ok(report)
         }
         Some(args) if is_help_arg(args) => Ok(render_mcp_usage_json(None)),
@@ -3978,6 +3986,7 @@ fn config_source_label(source: ConfigSource) -> &'static str {
         ConfigSource::User => "user",
         ConfigSource::Project => "project",
         ConfigSource::Local => "local",
+        ConfigSource::Plugin => "plugin",
     }
 }
 
@@ -4114,6 +4123,7 @@ fn config_source_id(source: ConfigSource) -> &'static str {
         ConfigSource::User => "user",
         ConfigSource::Project => "project",
         ConfigSource::Local => "local",
+        ConfigSource::Plugin => "plugin",
     }
 }
 
