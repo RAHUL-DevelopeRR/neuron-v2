@@ -476,6 +476,15 @@ impl ColonyHandle {
         }
     }
 
+    /// A handle whose run also stops when `cancel` is cancelled (an interrupt).
+    #[must_use]
+    pub fn with_cancel(token_cap: u64, cancel: CancellationToken) -> Self {
+        Self {
+            cancel,
+            ..Self::new(token_cap)
+        }
+    }
+
     /// Stops every agent and starts no more.
     pub fn stop(&self) {
         self.meter.stop();

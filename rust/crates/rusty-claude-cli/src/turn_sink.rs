@@ -194,6 +194,7 @@ pub(crate) struct UiCapabilities {
     live_progress: AtomicBool,
     git_views: AtomicBool,
     live_output: AtomicBool,
+    colony: AtomicBool,
 }
 
 impl UiCapabilities {
@@ -206,6 +207,15 @@ impl UiCapabilities {
             .store(has(CAPABILITY_GIT_VIEWS), Ordering::SeqCst);
         self.live_output
             .store(has(CAPABILITY_LIVE_OUTPUT), Ordering::SeqCst);
+        self.colony.store(
+            has(neuron_tui::protocol::CAPABILITY_COLONY),
+            Ordering::SeqCst,
+        );
+    }
+
+    /// Colony runs as `colony_*` events.
+    pub(crate) fn colony(&self) -> bool {
+        self.colony.load(Ordering::SeqCst)
     }
 
     /// A running shell command's output as it prints it.

@@ -1175,6 +1175,15 @@ fn forward_commands(
     loop {
         match commands.recv().unwrap_or(EngineCommand::Shutdown) {
             EngineCommand::Interrupt => shared.interrupt(),
+            // `/colony stop` while a run holds the engine stops it, as an interrupt
+            // stops a turn; between runs it queues and says no run is running.
+            EngineCommand::Slash { command, args }
+                if command.trim_start_matches('/') == "colony"
+                    && args.trim() == "stop"
+                    && shared.turn_running() =>
+            {
+                shared.stop_turn();
+            }
             // Now, so a running turn's sinks see it; the engine also hears it, between
             // turns, to send what the new capabilities show.
             EngineCommand::Capabilities { features, client } => {
@@ -1370,6 +1379,239 @@ fn ask_the_ui(
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return Err(closed()),
+        }
+    }
+}
+
+/// Sends a Colony run's progress to the UI and asks its questions there.
+struct EngineColonyObserver {
+    events: Sender<UiEvent>,
+    shared: Arc<Shared>,
+    /// `/colony --yes`: start and apply the changes without asking.
+    yes: bool,
+    run_id: String,
+    task: String,
+}
+
+impl EngineColonyObserver {
+    fn send(&self, event: UiEvent) {
+        let _ = self.events.send(event);
+    }
+
+    fn notice(&self, message: String) {
+        self.send(UiEvent::Notice {
+            message,
+            kind: None,
+        });
+    }
+
+    /// Asks `question` with `options`; `true` when the first option was picked.
+    fn ask_first(&self, question: String, options: &[&str]) -> bool {
+        let asked = UserQuestion {
+            question,
+            options: Some(options.iter().map(|option| (*option).to_string()).collect()),
+        };
+        let Ok(answer) = ask_the_ui(&self.events, &self.shared, &asked) else {
+            return false;
+        };
+        colony_answer_is_first(&answer, options)
+    }
+}
+
+/// Whether a typed answer picks the first of `options` (its number, its words, or a
+/// plain yes).
+fn colony_answer_is_first(answer: &str, options: &[&str]) -> bool {
+    let answer = answer.trim().to_ascii_lowercase();
+    answer == "1"
+        || options
+            .first()
+            .is_some_and(|first| answer == first.to_ascii_lowercase())
+        || matches!(answer.as_str(), "y" | "yes" | "ok")
+}
+
+fn colony_agent_info(row: &tools::colony::AgentRow) -> neuron_tui::protocol::ColonyAgentInfo {
+    neuron_tui::protocol::ColonyAgentInfo {
+        id: row.id.clone(),
+        role: row.role.as_str().to_string(),
+        title: row.title.clone(),
+        model: crate::provider::shown_model(&row.model).to_string(),
+        status: colony_status_word(row.status).to_string(),
+        tokens_used: row.tokens_used,
+        token_budget: row.token_budget,
+        branch: row.branch.clone(),
+        note: row.note.clone(),
+    }
+}
+
+fn colony_status_word(status: tools::colony::AgentStatus) -> &'static str {
+    use tools::colony::AgentStatus;
+    match status {
+        AgentStatus::Waiting => "waiting",
+        AgentStatus::Running => "running",
+        AgentStatus::Done => "done",
+        AgentStatus::Failed => "failed",
+        AgentStatus::Stopped => "stopped",
+    }
+}
+
+impl tools::colony::ColonyObserver for EngineColonyObserver {
+    fn event(&self, event: &tools::colony::ColonyEvent) {
+        use tools::colony::{AgentStatus, ColonyEvent};
+        let structured = self.shared.capabilities.colony();
+        match event {
+            ColonyEvent::Planned { .. } => {}
+            ColonyEvent::Agent { run_id, row } if structured => {
+                self.send(UiEvent::ColonyAgent {
+                    run_id: run_id.clone(),
+                    agent: colony_agent_info(row),
+                });
+            }
+            // Without the capability, one notice when an agent ends.
+            ColonyEvent::Agent { row, .. } => {
+                if matches!(
+                    row.status,
+                    AgentStatus::Done | AgentStatus::Failed | AgentStatus::Stopped
+                ) {
+                    self.notice(format!(
+                        "Colony {} {}: {} ({} tokens)",
+                        row.role.as_str(),
+                        row.title,
+                        colony_status_word(row.status),
+                        crate::account::group_digits(row.tokens_used)
+                    ));
+                }
+            }
+            ColonyEvent::Budget {
+                run_id,
+                used,
+                limit,
+            } if structured => self.send(UiEvent::ColonyBudget {
+                run_id: run_id.clone(),
+                used: *used,
+                limit: *limit,
+            }),
+            ColonyEvent::Budget { .. } | ColonyEvent::Finished { .. } => {
+                if let ColonyEvent::Finished { report } = event {
+                    if structured {
+                        self.send(UiEvent::ColonyFinished {
+                            run_id: report.run_id.clone(),
+                            status: report.status.clone(),
+                            tokens_used: report.tokens_used,
+                            token_cap: report.token_cap,
+                            merged: report.merged,
+                            branch: report.synthesis_branch.clone(),
+                            conflict: report
+                                .conflict
+                                .as_ref()
+                                .map(|conflict| conflict.branch.clone()),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    fn ask(&self, question: &tools::colony::ColonyQuestion) -> tools::colony::ColonyAnswer {
+        use std::fmt::Write as _;
+        use tools::colony::{ColonyAnswer, ColonyQuestion};
+        match question {
+            ColonyQuestion::Start {
+                tasks,
+                workers,
+                token_cap,
+                allow_web,
+            } => {
+                let mut plan = format!(
+                    "Colony plan: {} subtask(s), {workers} at a time, token cap {}, web reads {}.",
+                    tasks.len(),
+                    crate::account::group_digits(*token_cap),
+                    if *allow_web { "on" } else { "off" }
+                );
+                for task in tasks {
+                    let _ = write!(
+                        plan,
+                        "\n  {} {} ({})",
+                        task.id,
+                        task.title,
+                        if task.writes {
+                            "writes in its own worktree"
+                        } else {
+                            "reads"
+                        }
+                    );
+                }
+                if self.shared.capabilities.colony() {
+                    self.send(UiEvent::ColonyStarted {
+                        run_id: self.run_id.clone(),
+                        task: self.task.clone(),
+                        workers: *workers,
+                        token_cap: *token_cap,
+                        tasks: tasks
+                            .iter()
+                            .map(|task| neuron_tui::protocol::ColonyTaskInfo {
+                                id: task.id.clone(),
+                                title: task.title.clone(),
+                                writes: task.writes,
+                            })
+                            .collect(),
+                    });
+                }
+                if self.yes {
+                    self.notice(plan);
+                    return ColonyAnswer::Continue;
+                }
+                if self.ask_first(format!("{plan}\nStart the workers?"), &["Start", "Cancel"]) {
+                    ColonyAnswer::Continue
+                } else {
+                    ColonyAnswer::Stop
+                }
+            }
+            ColonyQuestion::NearCap { used, limit } => {
+                if self.ask_first(
+                    format!(
+                        "The Colony run used {} of its {} tokens. Go on up to the cap, or stop now?",
+                        crate::account::group_digits(*used),
+                        crate::account::group_digits(*limit)
+                    ),
+                    &["Go on", "Stop"],
+                ) {
+                    ColonyAnswer::Continue
+                } else {
+                    ColonyAnswer::Stop
+                }
+            }
+            ColonyQuestion::Merge {
+                branch, diff_stat, ..
+            } => {
+                let question = format!(
+                    "The Colony run's changes are on branch {branch}:\n{diff_stat}\nApply them to your working tree (not committed)?"
+                );
+                if self.yes {
+                    self.notice(question);
+                    return ColonyAnswer::Merge;
+                }
+                if self.ask_first(question, &["Apply", "Keep them on the branch"]) {
+                    ColonyAnswer::Merge
+                } else {
+                    ColonyAnswer::Keep
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod colony_answer_tests {
+    use super::colony_answer_is_first;
+
+    #[test]
+    fn the_first_option_is_picked_by_number_words_or_yes() {
+        let options = ["Start", "Cancel"];
+        for answer in ["1", "start", " Start ", "y", "yes"] {
+            assert!(colony_answer_is_first(answer, &options), "{answer}");
+        }
+        for answer in ["2", "cancel", "no", ""] {
+            assert!(!colony_answer_is_first(answer, &options), "{answer}");
         }
     }
 }
@@ -1838,6 +2080,7 @@ impl Engine {
                 self.show_changes();
                 Ok(())
             }
+            "colony" => self.colony(args),
             _ => {
                 let line = if args.is_empty() {
                     format!("/{name}")
@@ -1859,6 +2102,47 @@ impl Engine {
         }
         self.finish_turn();
         Step::Continue
+    }
+
+    /// `/colony <task>`: a Colony run on the engine thread, reported as `colony_*`
+    /// events (or notices) and finished with its report as a notice. An interrupt or
+    /// `/colony stop` stops it; its questions go to the UI as the agent's do.
+    fn colony(&mut self, args: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let words = args
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if matches!(words.as_slice(), [word] if word == "status" || word == "stop") {
+            self.notice("No Colony run is running. Start one with /colony <task>.");
+            return Ok(());
+        }
+        let options = crate::colony::parse_colony_args(&words)?;
+        let (limits, note) = crate::colony::account_limits();
+        if let Some(note) = note {
+            self.notice(&note);
+        }
+        let config = crate::colony::build_config(
+            &options,
+            limits,
+            &self.cli.model,
+            self.cli.permission_mode,
+        )?;
+        let cancel = CancellationToken::new();
+        let handle = tools::colony::ColonyHandle::with_cancel(config.token_cap(), cancel.clone());
+        let running = RunningTurn::start(&self.shared);
+        running.watch(cancel, HookAbortSignal::new());
+        let observer = EngineColonyObserver {
+            events: Sender::clone(&self.events),
+            shared: Arc::clone(&self.shared),
+            yes: options.yes,
+            run_id: handle.run_id.clone(),
+            task: options.task.clone(),
+        };
+        let runner = tools::colony::session_agent_runner(config.permission_rules.clone());
+        let report = tools::colony::run_colony(&config, &runner, &observer, &handle);
+        drop(running);
+        self.notice(&crate::colony::render_report(&report));
+        Ok(())
     }
 
     fn run_slash(&mut self, command: SlashCommand) -> Result<(), Box<dyn std::error::Error>> {

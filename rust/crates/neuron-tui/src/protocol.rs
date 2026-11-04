@@ -126,6 +126,13 @@ pub const FEATURE_CHECKPOINTS: &str = "checkpoints";
 /// disabled servers are listed with status `disabled`.
 pub const FEATURE_MCP_TOGGLE: &str = "mcp_toggle";
 
+/// The engine runs Colony runs (`/colony <task>`, `/colony stop`): several agents on
+/// one task inside a token budget. A UI that declared [`CAPABILITY_COLONY`] gets
+/// [`UiEvent::ColonyStarted`], [`UiEvent::ColonyAgent`], [`UiEvent::ColonyBudget`] and
+/// [`UiEvent::ColonyFinished`]; others get notices. The run's questions (start, near
+/// the cap, apply the changes) are asked like the agent's own questions.
+pub const FEATURE_COLONY: &str = "colony";
+
 /// What this engine can do beyond protocol 1, in [`UiEvent::Ready`]. A UI sends the
 /// commands a feature adds only when the engine lists it: an older engine would skip
 /// them with a notice.
@@ -152,6 +159,7 @@ pub const ENGINE_FEATURES: &[&str] = &[
     FEATURE_CHECKPOINTS,
     FEATURE_MCP_TOGGLE,
     FEATURE_LIVE_OUTPUT,
+    FEATURE_COLONY,
 ];
 
 /// `report` events for the commands that show a report (`/usage`, `/init`, `/memory`,
@@ -237,6 +245,36 @@ pub const CAPABILITY_GIT_VIEWS: &str = "git_views";
 /// A UI capability: send the output of a running shell command as
 /// [`UiEvent::ToolOutputDelta`] ([`FEATURE_LIVE_OUTPUT`]).
 pub const CAPABILITY_LIVE_OUTPUT: &str = "live_output";
+
+/// A UI capability: Colony runs as `colony_*` events ([`FEATURE_COLONY`]).
+pub const CAPABILITY_COLONY: &str = "colony";
+
+/// A subtask of a Colony run's plan ([`UiEvent::ColonyStarted`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColonyTaskInfo {
+    pub id: String,
+    pub title: String,
+    /// Whether its worker changes files (in a worktree of its own).
+    pub writes: bool,
+}
+
+/// One agent of a Colony run, as its live row shows it ([`UiEvent::ColonyAgent`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColonyAgentInfo {
+    pub id: String,
+    /// `planner`, `worker`, `reviewer` or `synthesis`.
+    pub role: String,
+    pub title: String,
+    pub model: String,
+    /// `waiting`, `running`, `done`, `failed` or `stopped`.
+    pub status: String,
+    pub tokens_used: u64,
+    /// Its own share of the run's token cap.
+    pub token_budget: Option<u64>,
+    /// A writing worker's branch.
+    pub branch: Option<String>,
+    pub note: Option<String>,
+}
 
 /// Which stream of a command a [`UiEvent::ToolOutputDelta`] carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -768,6 +806,40 @@ pub enum UiEvent {
         stream: OutputStream,
         chunk: String,
     },
+    /// A Colony run's plan was accepted and its workers are starting. With
+    /// [`CAPABILITY_COLONY`] only.
+    ColonyStarted {
+        run_id: String,
+        task: String,
+        /// Workers that run at the same time.
+        workers: usize,
+        token_cap: u64,
+        tasks: Vec<ColonyTaskInfo>,
+    },
+    /// An agent of a Colony run changed: it started, used more tokens, or ended. The
+    /// whole row; the UI replaces the row with the same `id`.
+    ColonyAgent {
+        run_id: String,
+        agent: ColonyAgentInfo,
+    },
+    /// Tokens every agent of the run used so far, against its cap.
+    ColonyBudget {
+        run_id: String,
+        used: u64,
+        limit: u64,
+    },
+    /// The run ended: `status` is `completed`, `stopped`, `conflict` or `failed`. The
+    /// full report follows as a notice. `branch` holds the changes when they were not
+    /// applied; `conflict` names the branch whose merge conflicted.
+    ColonyFinished {
+        run_id: String,
+        status: String,
+        tokens_used: u64,
+        token_cap: u64,
+        merged: bool,
+        branch: Option<String>,
+        conflict: Option<String>,
+    },
     /// Every file the agent created, changed or deleted in this session, with lines
     /// added and removed since the session first touched it. Sent when the list changes
     /// (after a tool call, after a rewind) and after [`EngineCommand::Capabilities`] when
@@ -1251,9 +1323,7 @@ mod tests {
         let delta = UiEvent::ToolOutputDelta {
             tool_use_id: "call_7".into(),
             stream: OutputStream::Stderr,
-            chunk: "warning: unused
-"
-            .into(),
+            chunk: "warning: unused\n".into(),
         };
         let json = serde_json::to_value(&delta).unwrap();
         assert_eq!(
@@ -1262,13 +1332,50 @@ mod tests {
                 "type": "tool_output_delta",
                 "tool_use_id": "call_7",
                 "stream": "stderr",
-                "chunk": "warning: unused
-            ",
+                "chunk": "warning: unused\n",
             })
         );
         assert_eq!(serde_json::from_value::<UiEvent>(json).unwrap(), delta);
         assert!(ENGINE_FEATURES.contains(&FEATURE_LIVE_OUTPUT));
         assert_eq!(CAPABILITY_LIVE_OUTPUT, FEATURE_LIVE_OUTPUT);
+    }
+
+    /// A Colony run's events, as the UI reads them.
+    #[test]
+    fn colony_events_as_json() {
+        let row = UiEvent::ColonyAgent {
+            run_id: "colony-1".into(),
+            agent: ColonyAgentInfo {
+                id: "worker-t1".into(),
+                role: "worker".into(),
+                title: "Add a.txt".into(),
+                model: "m".into(),
+                status: "running".into(),
+                tokens_used: 1_200,
+                token_budget: Some(100_000),
+                branch: Some("neuron/agent/colony-1-t1".into()),
+                note: None,
+            },
+        };
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(json["type"], "colony_agent");
+        assert_eq!(json["agent"]["tokens_used"], 1_200);
+        assert_eq!(json["agent"]["token_budget"], 100_000);
+        assert_eq!(serde_json::from_value::<UiEvent>(json).unwrap(), row);
+        let finished = UiEvent::ColonyFinished {
+            run_id: "colony-1".into(),
+            status: "conflict".into(),
+            tokens_used: 5,
+            token_cap: 10,
+            merged: false,
+            branch: Some("b".into()),
+            conflict: Some("c".into()),
+        };
+        let json = serde_json::to_value(&finished).unwrap();
+        assert_eq!(json["type"], "colony_finished");
+        assert_eq!(serde_json::from_value::<UiEvent>(json).unwrap(), finished);
+        assert!(ENGINE_FEATURES.contains(&FEATURE_COLONY));
+        assert_eq!(CAPABILITY_COLONY, FEATURE_COLONY);
     }
 
     /// Live progress, todos, sub-agents, changes and checkpoints: the tags and field
