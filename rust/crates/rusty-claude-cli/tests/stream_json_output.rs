@@ -62,11 +62,18 @@ fn stream_json_emits_init_tool_events_and_a_final_result() {
         .collect::<Vec<_>>();
 
     assert_eq!(types.first().map(String::as_str), Some("init"), "{types:?}");
-    assert_eq!(types.last().map(String::as_str), Some("result"), "{types:?}");
+    assert_eq!(
+        types.last().map(String::as_str),
+        Some("result"),
+        "{types:?}"
+    );
     let init = &lines[0];
     assert!(init["session_id"].as_str().is_some_and(|id| !id.is_empty()));
     assert_eq!(init["tools"], serde_json::json!(["read_file"]));
-    assert!(types.iter().any(|kind| kind == "tool_call_started"), "{types:?}");
+    assert!(
+        types.iter().any(|kind| kind == "tool_call_started"),
+        "{types:?}"
+    );
     let tool_result = lines
         .iter()
         .find(|line| line["type"] == "tool_result")

@@ -348,14 +348,13 @@ pub fn offload_tool_result(
     ) {
         Ok(entry) => {
             let path = store.object_path(&entry);
-            let mut preview = cap(output);
-            preview.push_str(&format!(
-                "\n\n[The full output ({} bytes) is saved as artifact {}: {}. Read that file for the parts left out above.]",
+            format!(
+                "{}\n\n[The full output ({} bytes) is saved as artifact {}: {}. Read that file for the parts left out above.]",
+                cap(output),
                 entry.bytes,
                 entry.id,
                 path.display()
-            ));
-            preview
+            )
         }
         Err(_) => cap(output),
     }

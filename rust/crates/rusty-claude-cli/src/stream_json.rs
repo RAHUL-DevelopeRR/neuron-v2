@@ -173,7 +173,10 @@ fn pump(receiver: &Receiver<UiEvent>, mut out: impl Write) {
         if let Some(line) = encode(&event) {
             if write_line(&mut out, &line).is_err() {
                 // stdout closed (the reader went away): drain without writing.
-                while receiver.recv().is_ok_and(|event| event != UiEvent::TurnFinished) {}
+                while receiver
+                    .recv()
+                    .is_ok_and(|event| event != UiEvent::TurnFinished)
+                {}
                 return;
             }
         }

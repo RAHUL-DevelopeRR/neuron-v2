@@ -1928,12 +1928,11 @@ pub fn resume_supported_slash_commands() -> Vec<&'static SlashCommandSpec> {
 
 fn slash_command_category(name: &str) -> &'static str {
     match name {
-        "help" | "status" | "cost" | "artifacts" | "resume" | "session" | "version" | "usage" | "stats"
-        | "rename" | "clear" | "compact" | "history" | "tokens" | "cache" | "exit" | "summary"
-        | "tag" | "thinkback" | "copy" | "share" | "feedback" | "rewind" | "pin" | "unpin"
-        | "bookmarks" | "context" | "files" | "focus" | "unfocus" | "retry" | "stop" | "undo" => {
-            "Session"
-        }
+        "help" | "status" | "cost" | "artifacts" | "resume" | "session" | "version" | "usage"
+        | "stats" | "rename" | "clear" | "compact" | "history" | "tokens" | "cache" | "exit"
+        | "summary" | "tag" | "thinkback" | "copy" | "share" | "feedback" | "rewind" | "pin"
+        | "unpin" | "bookmarks" | "context" | "files" | "focus" | "unfocus" | "retry" | "stop"
+        | "undo" => "Session",
         "model" | "permissions" | "config" | "memory" | "theme" | "vim" | "voice" | "color"
         | "effort" | "fast" | "brief" | "output-style" | "keybindings" | "privacy-settings"
         | "stickers" | "language" | "profile" | "max-tokens" | "temperature" | "system-prompt"
