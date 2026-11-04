@@ -7147,7 +7147,10 @@ mod tests {
             panic!("neuron research should parse as a research run");
         };
         assert_eq!(output_format, CliOutputFormat::Json);
-        assert!(allow_broad_cwd, "the broad-folder flag reaches the research run");
+        assert!(
+            allow_broad_cwd,
+            "the broad-folder flag reaches the research run"
+        );
         assert_eq!(
             research_words,
             words(&["--depth", "quick", "what changed in Rust 1.91?"])

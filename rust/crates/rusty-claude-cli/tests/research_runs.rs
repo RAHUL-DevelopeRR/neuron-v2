@@ -144,8 +144,12 @@ fn research_runs_the_users_tool_hooks_for_its_searches() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(1), "{stdout}
-{stderr}");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{stdout}
+{stderr}"
+    );
     // Nothing reaches the gateway: the hook refused the first search.
     assert!(gateway.searches().is_empty());
     assert!(
@@ -166,7 +170,13 @@ fn research_from_the_home_folder_needs_the_broad_folder_flag() {
 
     let output = neuron(&workspace, &server.base_url(), &gateway)
         .current_dir(&workspace.home)
-        .args(["--provider", "anthropic", "--model", "sonnet", "--allow-web"])
+        .args([
+            "--provider",
+            "anthropic",
+            "--model",
+            "sonnet",
+            "--allow-web",
+        ])
         .args(["research", "--depth", "quick", "which runtime?"])
         .output()
         .expect("neuron should run");

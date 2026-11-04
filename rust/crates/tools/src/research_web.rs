@@ -382,7 +382,8 @@ mod tests {
             "{error:?}"
         );
         assert!(requests.lock().unwrap().is_empty());
-        let error = super::research_fetch("https://user:hunter2pass@example.com/", 100).unwrap_err();
+        let error =
+            super::research_fetch("https://user:hunter2pass@example.com/", 100).unwrap_err();
         assert!(error.contains("looks like a secret"), "{error}");
     }
 

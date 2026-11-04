@@ -7,12 +7,16 @@
 //! take short notes from each page with a quote that must appear in the page,
 //! and has it write a report from the notes alone, never from raw pages. Every
 //! sentence of the report cites source numbers; a sentence whose citations name
-//! no page read in this run is removed, and the report says how many were. The
-//! report, with a sources table, is saved to `.neuron/research/<slug>.md`.
+//! no page read in this run is removed, so is a finding that cites nothing, and
+//! the report says how many were. The report, with a sources table, is saved to
+//! `.neuron/research/<slug>.md`.
 //!
-//! The run stops at its step cap, its token cap (80% wraps up: no more reading,
-//! the report is written from the notes so far), the plan's daily search or
-//! research allowance (HTTP 429), or an interrupt, and the report says why.
+//! The run stops at its step cap, when its page or search cap leaves a
+//! sub-question unsearched, at its token cap (80% wraps up: no more reading, the
+//! report is written from the notes so far), on the plan's daily search or
+//! research allowance (HTTP 429), or on an interrupt (Ctrl+C on every surface),
+//! and the report says why. Searches and reads go through the session's
+//! permission rules and tool hooks as `WebSearch` and `WebFetch` calls do.
 //!
 //! Pages are read one at a time. The `Agent` tool on feat/alpha4 runs
 //! sub-agents one after another and needs full access, so parallel read-only
@@ -378,9 +382,15 @@ pub(crate) enum StopReason {
     Completed,
     StepCap(usize),
     /// The page cap was reached with `skipped` sub-questions not searched.
-    PageCap { pages: usize, skipped: usize },
+    PageCap {
+        pages: usize,
+        skipped: usize,
+    },
     /// The search cap was reached with `skipped` sub-questions not searched.
-    SearchCap { searches: usize, skipped: usize },
+    SearchCap {
+        searches: usize,
+        skipped: usize,
+    },
     /// 80% of the token cap was used: the report was written from the notes.
     TokenCap(u64),
     SearchQuota {
@@ -1790,7 +1800,10 @@ impl LiveWeb {
             None
         };
         if let Some(what) = blocked {
-            return Err(hook_message(&pre, &format!("PreToolUse hook {what} {tool}")));
+            return Err(hook_message(
+                &pre,
+                &format!("PreToolUse hook {what} {tool}"),
+            ));
         }
         let effective = pre
             .updated_input()
@@ -1822,8 +1835,13 @@ impl LiveWeb {
                 Some(&self.hook_abort),
             )
         } else {
-            self.hooks
-                .run_post_tool_use_with_signal(tool, &input, output, false, Some(&self.hook_abort))
+            self.hooks.run_post_tool_use_with_signal(
+                tool,
+                &input,
+                output,
+                false,
+                Some(&self.hook_abort),
+            )
         };
         if post.is_denied() || post.is_failed() || post.is_cancelled() {
             Err(hook_message(
@@ -1905,7 +1923,10 @@ fn hook_message(result: &runtime::HookRunResult, fallback: &str) -> String {
         .iter()
         .map(|message| message.trim())
         .find(|message| !message.is_empty())
-        .map_or_else(|| fallback.to_string(), |message| first_line(message).to_string())
+        .map_or_else(
+            || fallback.to_string(),
+            |message| first_line(message).to_string(),
+        )
 }
 
 fn first_line(text: &str) -> &str {
@@ -2464,8 +2485,10 @@ mod tests {
             let urls = (1..=3)
                 .map(|page| format!("https://{query}-{page}.example/page"))
                 .collect::<Vec<_>>();
-            web.results
-                .insert(query.to_string(), Ok(urls.iter().map(|url| hit(url)).collect()));
+            web.results.insert(
+                query.to_string(),
+                Ok(urls.iter().map(|url| hit(url)).collect()),
+            );
             for url in urls {
                 model.notes.insert(
                     url.clone(),
@@ -2501,7 +2524,10 @@ mod tests {
         let last = progress.plans.last().unwrap();
         assert_eq!(last.len(), 7);
         assert!(last[..5].iter().all(|item| item.status == "completed"));
-        assert_eq!((last[5].content.as_str(), last[5].status), ("q6", "pending"));
+        assert_eq!(
+            (last[5].content.as_str(), last[5].status),
+            ("q6", "pending")
+        );
         assert_eq!(last[6].status, "completed");
 
         // The search cap is worded the same way.
