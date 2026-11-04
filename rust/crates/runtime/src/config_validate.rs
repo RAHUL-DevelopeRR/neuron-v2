@@ -599,7 +599,8 @@ mod tests {
     #[test]
     fn settings_examples_in_the_docs_validate_cleanly() {
         // People copy these blocks into settings.json, so they must load without
-        // errors or deprecation warnings.
+        // errors or deprecation warnings. A block fenced with more than `json`
+        // (such as "```json plugin.json") is another file and is not checked.
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let mut checked = 0;
         for doc in ["README.md", "USAGE.md"] {

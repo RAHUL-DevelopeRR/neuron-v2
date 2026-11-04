@@ -6866,9 +6866,11 @@ mod tests {
                 output_format: CliOutputFormat::Json,
             }
         );
-        // A slash command's alias gets the same guidance as its name.
-        let error = parse_args(&words(&["cwd"])).unwrap_err();
-        assert!(error.contains("/cwd"), "{error}");
+        // A slash command's alias gets the same guidance as its name (`/workspace`
+        // is not implemented in this build, and its alias `cwd` says so too).
+        let by_name = parse_args(&words(&["workspace"])).unwrap_err();
+        let by_alias = parse_args(&words(&["cwd"])).unwrap_err();
+        assert_eq!(by_alias, by_name.replace("workspace", "cwd"), "{by_alias}");
     }
 
     #[test]
@@ -7330,7 +7332,7 @@ mod tests {
         // the trailing bracket so future additions don't re-break this.
         assert!(help.contains("/session [list|switch <session-id>|fork [branch-name]"));
         assert!(help.contains(
-            "/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]"
+            "/plugin [list|install <path|git-url>|enable <name>|disable <name>|uninstall <name>|update <name>|help]"
         ));
         assert!(help.contains("aliases: /plugins, /marketplace"));
         assert!(help.contains("/agents"));
@@ -9730,7 +9732,9 @@ UU conflicted.rs",
         let mut skills_written = 0;
         let mut fill = |word: &str| match word {
             "<server>" => "codebase-memory".to_string(),
-            "<path>" => {
+            // A search needs the registry; this test binary has no network client.
+            "<query>" => "docker".to_string(),
+            "<path>" | "<source>" => {
                 skills_written += 1;
                 let name = format!("resume-skill-{skills_written}");
                 write_skill_fixture(&workspace.join("skill-sources"), &name, "resume test");
@@ -9787,6 +9791,10 @@ UU conflicted.rs",
                         Err(error)
                             if *invoked == "usage"
                                 && error.to_string().starts_with("Not signed in to Zero-X") => {}
+                        // No registry client outside `main`: the search says so.
+                        Err(error)
+                            if alternative.starts_with("search")
+                                && error.to_string().contains("cannot reach skill registries") => {}
                         Err(error) => panic!(
                             "--help lists `{input}` as resume-safe, but `neuron --resume` fails: {error}"
                         ),

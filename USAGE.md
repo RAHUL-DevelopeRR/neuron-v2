@@ -383,7 +383,7 @@ WebSearch and WebFetch) and `browser` (safe use of the Playwright browser tools)
 A plugin keeps its manifest at `.neuron-plugin/plugin.json` (or `plugin.json` at its
 root). Besides tools, hooks and commands, a manifest may list:
 
-```json
+```json plugin.json
 {
   "name": "tracker-kit",
   "version": "1.0.0",
