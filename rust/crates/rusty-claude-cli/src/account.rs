@@ -82,14 +82,39 @@ impl PlanWindow {
         })
     }
 
+    /// `resets_at` has passed by `now`: some of what was used has left the window since
+    /// it was read, so how much is left is not known until the next read.
+    #[must_use]
+    pub fn is_past_reset(&self, now: u64) -> bool {
+        self.resets_at
+            .as_deref()
+            .and_then(crate::clock::parse_timestamp)
+            .is_some_and(|at| at <= now)
+    }
+
+    /// The window as it stands at `now`: once [`Self::is_past_reset`], what is used and
+    /// left is unknown (and when it frees up next too) until the account is read again.
+    #[must_use]
+    pub fn as_of(&self, now: u64) -> Self {
+        if !self.is_past_reset(now) {
+            return self.clone();
+        }
+        Self {
+            used_tokens: None,
+            remaining_tokens: None,
+            resets_at: None,
+            ..self.clone()
+        }
+    }
+
     /// 90% of the window or more is used.
     #[must_use]
     pub fn is_near_limit(&self) -> bool {
         near_limit(self.used(), Some(self.limit_tokens))
     }
 
-    /// `Free 640K/1M, resets 14:20 UTC`: the plan, what is used of the window, and when
-    /// it frees up.
+    /// `Free 640K/1M, resets 14:20 UTC`: the plan, what is used of the window (`?` when
+    /// not known), and when it frees up.
     #[must_use]
     pub fn summary(&self) -> String {
         let mut line = String::new();
@@ -99,7 +124,7 @@ impl PlanWindow {
         }
         line.push_str(&format!(
             "{}/{}",
-            short_tokens(self.used().unwrap_or(0)),
+            self.used().map_or_else(|| "?".to_string(), short_tokens),
             short_tokens(self.limit_tokens)
         ));
         if let Some(at) = self
@@ -326,7 +351,7 @@ pub fn usage_lines(account: &AccountSummary, now: u64) -> Vec<String> {
         ));
     }
     if let Some(window) = account.window() {
-        lines.extend(window_lines(&window, now));
+        lines.extend(window_lines(&window.as_of(now), now));
     }
     if let Some(balance) = account.credit_balance_usd {
         let grant = account
@@ -359,14 +384,22 @@ pub fn usage_lines(account: &AccountSummary, now: u64) -> Vec<String> {
 /// The token window's lines of the usage report: what is used of it, when it frees up,
 /// and a warning near its limit.
 fn window_lines(window: &PlanWindow, now: u64) -> Vec<String> {
-    let mut lines = vec![format!(
+    let mut lines = vec![format!("  Token window     {}", window.summary())];
+    lines.push(format!(
         "  Window tokens    {}{}",
-        used_of(window.used(), Some(window.limit_tokens)).unwrap_or_default(),
+        window.used().map_or_else(
+            || format!("? / {}", group_digits(window.limit_tokens)),
+            |used| format!(
+                "{} / {}",
+                group_digits(used),
+                group_digits(window.limit_tokens)
+            )
+        ),
         window
             .length()
             .map(|length| format!(" ({length} window)"))
             .unwrap_or_default()
-    )];
+    ));
     if let Some(resets_at) = &window.resets_at {
         lines.push(format!(
             "  Window resets    {}",
@@ -565,7 +598,7 @@ mod tests {
         limits_only["usage_window"] = Value::Null;
         let window = parse_account(&limits_only).window().expect("a window");
         assert_eq!((window.limit_tokens, window.used()), (1_000_000, None));
-        assert_eq!(window.summary(), "Free 0/1M");
+        assert_eq!(window.summary(), "Free ?/1M");
 
         assert_eq!(parse_account(&sample()).window(), None, "Pro has no window");
     }
@@ -573,6 +606,10 @@ mod tests {
     #[test]
     fn the_window_decides_the_near_limit_warning() {
         let report = render_usage(&parse_account(&free_with_window(640_000)), 1_792_195_200);
+        assert!(
+            report.contains("Token window     Free 640K/1M, resets 14:20 UTC\n"),
+            "the compact form: {report}"
+        );
         assert!(
             report.contains("Window tokens    640,000 / 1,000,000 (5-hour window)"),
             "{report}"
@@ -590,6 +627,22 @@ mod tests {
             report.contains("Warning          50,000 window tokens left"),
             "{report}"
         );
+
+        // Past `resets_at` what is left is not known until the next read: no figure, no
+        // reset time and no warning from the old read.
+        let after_reset = 1_792_246_800 + 60;
+        let report = render_usage(&near, after_reset);
+        assert!(report.contains("Token window     Free ?/1M\n"), "{report}");
+        assert!(
+            report.contains("Window tokens    ? / 1,000,000"),
+            "{report}"
+        );
+        assert!(!report.contains("Window resets"), "{report}");
+        assert!(!report.contains("Warning"), "{report}");
+        let window = near.window().expect("a window");
+        assert!(!window.is_past_reset(after_reset - 120));
+        assert_eq!(window.as_of(after_reset - 120), window);
+        assert!(window.is_past_reset(after_reset));
 
         // Under a window the daily token figure refuses nothing: no warning from it.
         let mut daily = free_with_window(10_000);

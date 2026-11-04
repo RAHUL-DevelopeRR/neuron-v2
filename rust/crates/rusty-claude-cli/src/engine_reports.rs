@@ -144,9 +144,10 @@ pub(crate) fn usage(
     let mut sections = Vec::new();
     // A plan with a token window is refused by the window, not by today's tokens: it
     // comes first.
-    if let Some(window) = account.window() {
+    if let Some(window) = account.window().map(|window| window.as_of(now)) {
         let mut text = format!(
-            "{} of {} tokens used",
+            "**{}**\n\n{} of {} tokens used",
+            window.summary(),
             amount(window.used()),
             group_digits(window.limit_tokens)
         );
@@ -352,6 +353,10 @@ mod tests {
         let report = usage(&free, 0, "https://p", "https://d");
         assert_eq!(report.sections[0].heading.as_deref(), Some("Token window"));
         let window = &report.sections[0].markdown;
+        assert!(
+            window.starts_with("**Free 920K/1M, resets 14:20 UTC**\n\n"),
+            "{window}"
+        );
         assert!(
             window.contains("920,000 of 1,000,000 tokens used in this 5-hour window."),
             "{window}"
