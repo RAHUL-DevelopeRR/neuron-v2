@@ -1584,8 +1584,32 @@ impl McpStdioProcess {
         self.write_jsonrpc_message(request).await
     }
 
+    /// Reads the next response. Messages the server sends in between are not it:
+    /// notifications (`notifications/tools/list_changed`, which @playwright/mcp sends
+    /// once it is ready, logging, progress) are skipped, and requests of the server's
+    /// own are answered (`ping` with an empty result, anything else with "method not
+    /// found"), so a call's reply is never mistaken for one of them.
     pub async fn read_response<T: DeserializeOwned>(&mut self) -> io::Result<JsonRpcResponse<T>> {
-        self.read_jsonrpc_message().await
+        loop {
+            let message: JsonValue = self.read_jsonrpc_message().await?;
+            let Some(method) = message.get("method").and_then(JsonValue::as_str) else {
+                return serde_json::from_value(message)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error));
+            };
+            let Some(id) = message.get("id").filter(|id| !id.is_null()) else {
+                continue;
+            };
+            let reply = if method == "ping" {
+                serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} })
+            } else {
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32601, "message": format!("method not found: {method}") }
+                })
+            };
+            self.write_jsonrpc_message(&reply).await?;
+        }
     }
 
     pub async fn request<TParams: Serialize, TResult: DeserializeOwned>(
@@ -2364,6 +2388,153 @@ mod tests {
             );
             assert!(env.lines().any(|line| line == expected), "{folder}: {env}");
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// @playwright/mcp sends `notifications/tools/list_changed` once it is ready, and
+    /// the first browser call read it as its reply ("missing field `id`"). A response
+    /// is read past notifications, and the server's own requests are answered.
+    #[test]
+    fn a_response_is_read_past_notifications_and_server_requests_are_answered() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("temp dir");
+        let lines = [
+            r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#,
+            r#"{"jsonrpc":"2.0","id":"p1","method":"ping"}"#,
+        ];
+        let roots = r#"{"jsonrpc":"2.0","id":"r1","method":"roots/list"}"#;
+        // Prints a notification and a ping, reads the answer, asks for roots, reads that
+        // answer, and sends both answers back as its replies.
+        let (command, args) = if cfg!(windows) {
+            let script = root.join("server.cmd");
+            fs::write(
+                &script,
+                format!(
+                    "@echo off\r\necho {}\r\necho {}\r\nset /p ONE=\r\necho {roots}\r\nset /p TWO=\r\nsetlocal enabledelayedexpansion\r\necho !ONE!\r\necho !TWO!\r\n",
+                    lines[0], lines[1]
+                ),
+            )
+            .expect("script");
+            (
+                "cmd.exe".to_string(),
+                vec![
+                    "/d".to_string(),
+                    "/c".to_string(),
+                    script.to_string_lossy().into_owned(),
+                ],
+            )
+        } else {
+            (
+                "sh".to_string(),
+                vec![
+                    "-c".to_string(),
+                    format!(
+                        "printf '%s\\n' '{}' '{}'; read -r one; printf '%s\\n' '{roots}'; read -r two; printf '%s\\n' \"$one\" \"$two\"",
+                        lines[0], lines[1]
+                    ),
+                ],
+            )
+        };
+        let transport = crate::mcp_client::McpStdioTransport {
+            command,
+            args,
+            env: BTreeMap::new(),
+            tool_call_timeout_ms: None,
+        };
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let mut process = McpStdioProcess::spawn(&transport).expect("spawn server");
+            let ping: JsonRpcResponse<serde_json::Value> =
+                process.read_response().await.expect("first reply");
+            assert_eq!(ping.id, JsonRpcId::String("p1".to_string()));
+            assert_eq!(ping.result, Some(json!({})));
+            let roots: JsonRpcResponse<serde_json::Value> =
+                process.read_response().await.expect("second reply");
+            assert_eq!(roots.id, JsonRpcId::String("r1".to_string()));
+            assert_eq!(roots.error.map(|error| error.code), Some(-32601));
+            let _ = process.wait().await;
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The real bundled browser, started by Neuron's own command (the `cmd.exe /c npx`
+    /// fallback on Windows, `npx` elsewhere, or `NEURON_PLAYWRIGHT_MCP_ENTRY`) from a
+    /// project whose path has spaces and `cmd.exe` metacharacters: it starts, refuses a
+    /// local address, and saves an unnamed screenshot in the project's output folder.
+    /// Needs npx, `@playwright/mcp@0.0.83` and its browser, so it runs only when asked:
+    /// `cargo test -p runtime --lib live_bundled_browser -- --ignored`.
+    #[test]
+    #[ignore = "starts the real browser server through npx"]
+    fn live_bundled_browser_starts_from_a_project_path_with_cmd_metacharacters() {
+        let root = temp_dir();
+        let project = root.join("my app & co^1 %USERNAME%");
+        let config_home = root.join("config");
+        fs::create_dir_all(&project).expect("project folder");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{"browser":{"headless":true},"disabledMcpServers":["codebase-memory"]}"#,
+        )
+        .expect("settings");
+        let config = crate::ConfigLoader::new(&project, &config_home)
+            .load()
+            .expect("config");
+        let servers = config
+            .mcp()
+            .servers()
+            .iter()
+            .filter(|(name, _)| *name == crate::browser::BROWSER_SERVER)
+            .map(|(name, server)| (name.clone(), server.clone()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(servers.len(), 1);
+        crate::browser::prepare_output_dir(&config).expect("output folder");
+        let output = crate::browser::output_dir(&project);
+
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut manager = McpServerManager::from_servers(&servers);
+        runtime.block_on(async {
+            let tools = manager.discover_tools().await.expect("the browser starts");
+            assert!(
+                tools
+                    .iter()
+                    .any(|tool| tool.qualified_name == "mcp__playwright__browser_navigate"),
+                "{tools:?}"
+            );
+            let text = |result: &JsonRpcResponse<super::McpToolCallResult>| {
+                serde_json::to_string(result).expect("result json")
+            };
+            let blocked = manager
+                .call_tool(
+                    "mcp__playwright__browser_navigate",
+                    Some(json!({"url": "http://127.0.0.1:9/"})),
+                )
+                .await
+                .expect("navigate answers");
+            let blocked = text(&blocked);
+            assert!(blocked.contains("ERR_BLOCKED_BY_CLIENT"), "{blocked}");
+            let shot = manager
+                .call_tool(
+                    "mcp__playwright__browser_take_screenshot",
+                    Some(json!({"type": "png"})),
+                )
+                .await
+                .expect("screenshot answers");
+            let shot = text(&shot);
+            let saved = fs::read_dir(&output)
+                .expect("output folder")
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.ends_with(".png"))
+                .collect::<Vec<_>>();
+            assert_eq!(saved.len(), 1, "{shot}");
+            manager.shutdown().await.expect("shutdown");
+        });
         let _ = fs::remove_dir_all(root);
     }
 
