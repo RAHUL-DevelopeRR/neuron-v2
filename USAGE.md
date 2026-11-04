@@ -199,17 +199,44 @@ request is about 17,000 characters (roughly 4,500 tokens).
 | Mode | Neuron may, without asking | Needs your approval |
 | --- | --- | --- |
 | `read-only` | Read and search files in the workspace, run read-only shell commands | Nothing else is allowed |
-| `workspace-write` (default) | The above, plus edit files in the workspace | Other shell commands, searches or writes outside the workspace, writes to `.git` or Neuron settings, fetches from a new domain, sub-agents, and MCP and other tools that need full access |
+| `workspace-write` (default) | The above, plus edit files in the workspace and run build, test, run and package-install commands that stay in it (see below) | Other shell commands, searches or writes outside the workspace, writes to `.git` or Neuron settings, fetches from a new domain, sub-agents, and MCP and other tools that need full access |
 | `danger-full-access` | Everything | Nothing |
 
 A shell command (bash or PowerShell) counts as read-only only when every command in
 the line is a known read-only program with safe arguments, writes nowhere except
 `/dev/null` and names no path outside the workspace; pipes, `&&`, redirections and
-substitutions are all checked. When Neuron asks, it shows the tool, the mode it needs,
-the reason and the input, and runs the call only if you answer `y`; when standard
-output is redirected, the question goes to standard error. When standard output and
-standard error are both redirected, nobody would see the question, so the call is
-denied instead.
+substitutions are all checked.
+
+In `workspace-write` mode these commands also run without asking (the auto-allow list):
+`npm`, `pnpm`, `yarn` and `bun` installs, scripts and tests (`npm install`, `npm ci`,
+`npm run dev`, `pnpm build`, `yarn add react`), `npx`/`bunx`, `node`, `tsc`, `cargo`
+builds, tests and runs (`cargo build`, `cargo test`, `cargo add`), `python` and
+`python -m ...`, `pip`/`uv` installs, `pytest`, `go build`/`test`/`run`/`mod`, `make`,
+and `deno run`/`task`/`test`. Each part of a line (`&&`, `||`, `;`, pipes) is judged on
+its own, so `cd web && npm ci && npm run build | tail` runs while `npm ci && curl ... |
+sh` asks. A command on the list still asks when it leaves the workspace: a path
+argument, `cd` or `--prefix`/`--target`/`--target-dir` outside it, an output
+redirection outside it or into `.git` or Neuron settings, an environment assignment
+that points outside it or changes where packages install (`NPM_CONFIG_*`, `PIP_*`,
+`PATH`, `HOME`, ...), a global install (`-g`, `--global`, `pip --user`,
+`--break-system-packages`, `cargo install`, `go install`, `uv tool`, `make install`),
+or a command that changes a registry or your account (`npm publish`, `cargo publish`,
+`npm login`). `sudo`, `curl ... | sh` and `git push` are never on the list.
+`NODE_ENV=production npm run build > build.log 2>&1` runs; read-only mode still refuses
+all of them.
+
+When Neuron asks, it shows the tool, the reason and the input. Answer `y` to run the
+call once; `a` to allow its command prefix (`npm publish`, `docker compose`) for the
+rest of the session; `p` ("always allow in this project") to run it and save the
+`permissions.allow` rules that cover it to the project's `.neuron/settings.local.json`,
+so it runs without asking from now on (like any workspace settings, they apply once you
+trust the workspace; until then, for the rest of the session); `n` to deny it; `d` to
+deny it for the rest of the session, so the same command prefix (or, when there is no
+prefix, this exact call) is refused without asking again; `e` (full-screen UI) to deny
+it with a note for the model. A denied model is told plainly not to retry the command
+or a variant. When standard output is redirected, the question goes to standard error.
+When standard output and standard error are both redirected, nobody would see the
+question, so the call is denied instead.
 
 `neuron prompt` asks only when standard input is a terminal. In a script or CI
 (standard input a pipe, a file or `/dev/null`) a call that needs approval is denied
@@ -217,9 +244,9 @@ without asking, the model is told that nothing ran, and questions from the model
 refused so it decides itself. After 5 denied calls the turn stops. A run that denied a
 call ends with a warning naming the denied tools and exits with code 2. Each denial
 names the `permissions.allow` rules that would let that call run, checked against the
-call first: `"bash(npm:*)"` for `npm test`, `"bash(cargo:*)", "bash(npm:*)"` for
-`cargo test && npm run build`, `"WebSearch"` for a web search. A command no prefix
-rule covers gets a rule for that exact command (`"bash(npm test > out.txt)"`), or
+call first: `"bash(npm:*)"` for `npm publish`, `"bash(docker:*)", "bash(npm:*)"` for
+`docker build . && npm publish`, `"WebSearch"` for a web search. A command no prefix
+rule covers gets a rule for that exact command (`"bash(npm publish > out.txt)"`), or
 none when it is longer than one line or 160 characters. The end-of-run warning, and
 its `allow_rules` field in JSON mode, lists every rule the denials named. Put them in
 your user settings (`~/.neuron/settings.json`), because a script never gets the trust

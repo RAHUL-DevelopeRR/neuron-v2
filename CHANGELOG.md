@@ -51,6 +51,16 @@ The release workflow copies a version's section into its GitHub release notes.
   text for scripts. A `-p` run on a terminal starts with one line on stderr (model,
   permission mode, plan) instead of the boxed banner, and no longer walks the
   workspace to draw it.
+- In `workspace-write` mode, build, test, run and package-install commands that stay
+  in the workspace (`npm install`, `npm run dev`, `npx`, `node`, `cargo build`/`test`,
+  `python -m`, `pip`/`uv` installs, `go build`/`test`, `make`, ...) run without asking,
+  each part of a `&&`/`|` line judged on its own; sudo, global installs, `curl | sh`,
+  paths or writes outside the workspace and `git push` still ask. The approval says a
+  command is outside the auto-allow list instead of asking for full access.
+- Permission prompts offer "always allow in this project" (`p`), which saves the
+  covering `permissions.allow` rules to `.neuron/settings.local.json`, and "deny for
+  this session" (`d`), after which the same command prefix is refused without asking.
+  A denied model is told plainly not to retry the command or a variant.
 
 ## 7.0.0-alpha.3 (2026-11-02)
 
