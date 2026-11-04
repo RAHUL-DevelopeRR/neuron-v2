@@ -529,7 +529,14 @@ pub fn run_bounded(
     timeout: Option<Duration>,
     is_cancelled: &dyn Fn() -> bool,
 ) -> io::Result<BoundedOutput> {
-    run_bounded_full(command, stdin, timeout, is_cancelled, &mut |_| Ok(()), &mut |_, _| {})
+    run_bounded_full(
+        command,
+        stdin,
+        timeout,
+        is_cancelled,
+        &mut |_| Ok(()),
+        &mut |_, _| {},
+    )
 }
 
 /// [`run_bounded`] with `after_spawn` called on the child right after it
@@ -543,7 +550,14 @@ pub fn run_bounded_with_spawn_hook(
     is_cancelled: &dyn Fn() -> bool,
     after_spawn: &mut dyn FnMut(&Child) -> io::Result<()>,
 ) -> io::Result<BoundedOutput> {
-    run_bounded_full(command, stdin, timeout, is_cancelled, after_spawn, &mut |_, _| {})
+    run_bounded_full(
+        command,
+        stdin,
+        timeout,
+        is_cancelled,
+        after_spawn,
+        &mut |_, _| {},
+    )
 }
 
 /// Like [`run_bounded`], but `on_output` hears the output as it arrives: every
@@ -558,7 +572,14 @@ pub fn run_bounded_observed(
     is_cancelled: &dyn Fn() -> bool,
     on_output: &mut dyn FnMut(OutputPipe, &[u8]),
 ) -> io::Result<BoundedOutput> {
-    run_bounded_full(command, stdin, timeout, is_cancelled, &mut |_| Ok(()), on_output)
+    run_bounded_full(
+        command,
+        stdin,
+        timeout,
+        is_cancelled,
+        &mut |_| Ok(()),
+        on_output,
+    )
 }
 
 /// [`run_bounded_with_spawn_hook`] and [`run_bounded_observed`] together.

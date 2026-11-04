@@ -451,7 +451,8 @@ fn assemble_conversation_runtime(
         mcp_state,
     } = runtime_plugin_state;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
-        .map_err(std::io::Error::other)?;
+        .map_err(std::io::Error::other)?
+        .with_shell_tools(offers_shell_tools(allowed_tools.as_ref()));
     tool_registry.set_enforcer(runtime::permission_enforcer::PermissionEnforcer::new(
         policy.clone(),
     ));

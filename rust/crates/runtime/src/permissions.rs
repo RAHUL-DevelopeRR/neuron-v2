@@ -513,6 +513,9 @@ pub struct PermissionPolicy {
     shell_dialect: Option<ShellDialect>,
     session: SessionApprovals,
     grants: PendingGrants,
+    /// Whether the session offers a shell tool (`bash`, `PowerShell`); a
+    /// `Verification` sub-agent without one only reads (`crate::subagent_tier`).
+    shell_tools: bool,
 }
 
 impl PermissionPolicy {
@@ -528,6 +531,7 @@ impl PermissionPolicy {
             shell_dialect: None,
             session: SessionApprovals::global(),
             grants: PendingGrants::default(),
+            shell_tools: true,
         }
     }
 
@@ -575,6 +579,21 @@ impl PermissionPolicy {
     pub fn with_shell_dialect(mut self, dialect: ShellDialect) -> Self {
         self.shell_dialect = Some(dialect);
         self
+    }
+
+    /// Says whether the session offers a shell tool at all (default: it does).
+    /// Without one, `Agent` calls that start a `Verification` sub-agent only need
+    /// read access.
+    #[must_use]
+    pub fn with_shell_tools(mut self, available: bool) -> Self {
+        self.shell_tools = available;
+        self
+    }
+
+    /// Whether the session offers a shell tool (see [`Self::with_shell_tools`]).
+    #[must_use]
+    pub fn shell_tools(&self) -> bool {
+        self.shell_tools
     }
 
     /// Uses `approvals` instead of the process-wide session store.
@@ -747,6 +766,14 @@ impl PermissionPolicy {
                     );
                 }
                 assessment.session_prefixes = vec![scope];
+            }
+            "Agent" => {
+                // Lowered by what the sub-agent can do; an explicit lower
+                // requirement for the tool stays as it is.
+                if static_mode == PermissionMode::DangerFullAccess {
+                    assessment.required_mode =
+                        crate::subagent_tier::agent_call_requirement(input, self.shell_tools);
+                }
             }
             _ => {}
         }
@@ -1749,6 +1776,60 @@ mod tests {
         assert_eq!(
             policy.authorize("write_file", "{}", None),
             PermissionOutcome::Allow
+        );
+    }
+
+    #[test]
+    fn agent_calls_need_what_their_sub_agent_can_do() {
+        let explore = r#"{"description":"d","prompt":"p","subagent_type":"Explore"}"#;
+        let verify = r#"{"description":"d","prompt":"p","subagent_type":"Verification"}"#;
+        let writer = r#"{"description":"d","prompt":"p"}"#;
+        let isolated = r#"{"description":"d","prompt":"p","isolation":"worktree"}"#;
+        let policy = |mode| {
+            PermissionPolicy::new(mode)
+                .with_tool_requirement("Agent", PermissionMode::DangerFullAccess)
+        };
+
+        let read_only = policy(PermissionMode::ReadOnly);
+        assert_eq!(
+            read_only.authorize("Agent", explore, None),
+            PermissionOutcome::Allow
+        );
+        assert!(matches!(
+            read_only.authorize("Agent", isolated, None),
+            PermissionOutcome::Deny { .. }
+        ));
+
+        let workspace = policy(PermissionMode::WorkspaceWrite);
+        assert_eq!(
+            workspace.authorize("Agent", explore, None),
+            PermissionOutcome::Allow
+        );
+        assert_eq!(
+            workspace.authorize("Agent", isolated, None),
+            PermissionOutcome::Allow
+        );
+        let mut prompter = RecordingPrompter {
+            seen: Vec::new(),
+            allow: false,
+        };
+        assert!(matches!(
+            workspace.authorize("Agent", writer, Some(&mut prompter)),
+            PermissionOutcome::Deny { .. }
+        ));
+        assert_eq!(prompter.seen.len(), 1, "a shared-tree writer still asks");
+        assert!(matches!(
+            workspace.authorize("Agent", verify, None),
+            PermissionOutcome::Deny { .. }
+        ));
+        let no_shell = policy(PermissionMode::WorkspaceWrite).with_shell_tools(false);
+        assert_eq!(
+            no_shell.authorize("Agent", verify, None),
+            PermissionOutcome::Allow
+        );
+        assert_eq!(
+            workspace.required_mode_for_input("Agent", explore),
+            PermissionMode::ReadOnly
         );
     }
 

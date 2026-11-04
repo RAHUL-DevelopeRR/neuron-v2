@@ -1252,7 +1252,8 @@ mod tests {
             tool_use_id: "call_7".into(),
             stream: OutputStream::Stderr,
             chunk: "warning: unused
-".into(),
+"
+            .into(),
         };
         let json = serde_json::to_value(&delta).unwrap();
         assert_eq!(
@@ -1262,7 +1263,7 @@ mod tests {
                 "tool_use_id": "call_7",
                 "stream": "stderr",
                 "chunk": "warning: unused
-",
+            ",
             })
         );
         assert_eq!(serde_json::from_value::<UiEvent>(json).unwrap(), delta);

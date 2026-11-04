@@ -507,6 +507,13 @@ impl ToolExecutor for CliToolExecutor {
     }
 }
 
+/// Whether a session with the `--allowedTools` set `allowed_tools` (every tool when
+/// `None`) can run shell commands; without a shell a `Verification` sub-agent only
+/// reads (`runtime::subagent_tier`).
+pub(crate) fn offers_shell_tools(allowed_tools: Option<&crate::AllowedToolSet>) -> bool {
+    allowed_tools.is_none_or(|allowed| allowed.contains("bash") || allowed.contains("PowerShell"))
+}
+
 pub(crate) fn permission_policy(
     mode: PermissionMode,
     feature_config: &runtime::RuntimeFeatureConfig,
@@ -1478,5 +1485,20 @@ while True:
                 .shutdown();
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod shell_tool_tests {
+    use super::offers_shell_tools;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn a_session_offers_a_shell_unless_the_allow_list_leaves_both_out() {
+        assert!(offers_shell_tools(None));
+        let reads: BTreeSet<String> = ["read_file", "Agent"].map(String::from).into();
+        assert!(!offers_shell_tools(Some(&reads)));
+        let powershell: BTreeSet<String> = ["PowerShell"].map(String::from).into();
+        assert!(offers_shell_tools(Some(&powershell)));
     }
 }

@@ -62,6 +62,7 @@ pub mod sandbox;
 pub mod sensitive_paths;
 mod session;
 pub mod session_control;
+pub mod subagent_tier;
 pub use session_control::SessionStore;
 pub mod experience;
 pub mod parallel_tools;

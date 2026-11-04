@@ -864,7 +864,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "isolation": {
                         "type": "string",
                         "enum": ["worktree"],
-                        "description": "`worktree`: run the sub-agent in a git worktree of its own, on a new branch from HEAD. The result names the branch when it changed anything; an unchanged worktree is removed."
+                        "description": "`worktree`: run the sub-agent in a git worktree of its own, on a new branch from HEAD. The result names the branch when it changed anything; an unchanged worktree is removed. Several read-only (Explore, Plan) or worktree sub-agents asked for in one response run at the same time."
                     }
                 },
                 "required": ["description", "prompt"],
@@ -6954,22 +6954,7 @@ fn slugify_agent_name(description: &str) -> String {
 }
 
 fn normalize_subagent_type(subagent_type: Option<&str>) -> String {
-    let trimmed = subagent_type.map(str::trim).unwrap_or_default();
-    if trimmed.is_empty() {
-        return String::from("general-purpose");
-    }
-
-    match canonical_tool_token(trimmed).as_str() {
-        "general" | "generalpurpose" | "generalpurposeagent" => String::from("general-purpose"),
-        "explore" | "explorer" | "exploreagent" => String::from("Explore"),
-        "plan" | "planagent" => String::from("Plan"),
-        "verification" | "verificationagent" | "verify" | "verifier" => {
-            String::from("Verification")
-        }
-        "clawguide" | "clawguideagent" | "guide" => String::from("claw-guide"),
-        "statusline" | "statuslinesetup" => String::from("statusline-setup"),
-        _ => trimmed.to_string(),
-    }
+    runtime::subagent_tier::canonical_subagent_type(subagent_type)
 }
 
 fn iso8601_now() -> String {
