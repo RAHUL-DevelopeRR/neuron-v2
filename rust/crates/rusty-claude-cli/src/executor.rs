@@ -598,6 +598,14 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  neuron init")?;
     writeln!(
         out,
+        "  neuron --allow-web research [--depth quick|standard|deep] [--budget TOKENS] [--out FILE] QUESTION"
+    )?;
+    writeln!(
+        out,
+        "      Research a question on the web; prints a cited report and saves it to .neuron/research/"
+    )?;
+    writeln!(
+        out,
         "  neuron export [PATH] [--session SESSION] [--output PATH]"
     )?;
     writeln!(
