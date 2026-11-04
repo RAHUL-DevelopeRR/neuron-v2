@@ -37,6 +37,10 @@ pub(crate) struct UiLaunch<'a> {
     pub reasoning_effort: Option<&'a str>,
     pub allow_broad_cwd: bool,
     pub base_commit: Option<&'a str>,
+    /// `--allow-web` or `--allow-origin` was given. Those grants live only in
+    /// this process, and the UI's engine is another one, so the line REPL
+    /// runs instead and the `--allow-origin` limit holds.
+    pub run_web_grants: bool,
     pub continue_chat: Option<ContinueChat>,
     /// `--resume SESSION`: the saved session the UI's engine continues.
     pub resume: Option<String>,
@@ -144,9 +148,10 @@ pub(crate) fn ui_binary(no_tui_flag: bool) -> Option<PathBuf> {
 }
 
 /// The UI's arguments for a REPL launch, or `None` when it can't carry one of
-/// them (`--base-commit`), so the line REPL runs instead.
+/// them (`--base-commit`, `--allow-web`, `--allow-origin`), so the line REPL
+/// runs instead.
 pub(crate) fn ui_args(launch: &UiLaunch<'_>) -> Option<Vec<String>> {
-    if launch.base_commit.is_some() {
+    if launch.base_commit.is_some() || launch.run_web_grants {
         return None;
     }
     let mut args = Vec::new();
@@ -411,6 +416,7 @@ mod tests {
             reasoning_effort: Some("high"),
             allow_broad_cwd: true,
             base_commit: None,
+            run_web_grants: false,
             continue_chat: Some(ContinueChat::Chat("chat-42".to_string())),
             resume: None,
             prompt: None,
@@ -468,9 +474,30 @@ mod tests {
             reasoning_effort: None,
             allow_broad_cwd: false,
             base_commit: Some("HEAD~1"),
+            run_web_grants: false,
             continue_chat: None,
             resume: None,
             prompt: None,
+        };
+        assert_eq!(ui_args(&launch), None);
+    }
+
+    /// `neuron --allow-origin docs.rs` on a terminal: the UI's engine would start
+    /// without the run's web grants, so the line REPL keeps them.
+    #[test]
+    fn run_web_grants_keep_the_line_repl() {
+        let launch = UiLaunch {
+            model: None,
+            provider: None,
+            permission_mode: PermissionMode::WorkspaceWrite,
+            allowed_tools: None,
+            reasoning_effort: None,
+            allow_broad_cwd: false,
+            base_commit: None,
+            run_web_grants: true,
+            continue_chat: None,
+            resume: None,
+            prompt: Some("summarize the serde docs".to_string()),
         };
         assert_eq!(ui_args(&launch), None);
     }
@@ -487,6 +514,7 @@ mod tests {
             reasoning_effort: None,
             allow_broad_cwd: false,
             base_commit: None,
+            run_web_grants: false,
             continue_chat: None,
             resume: Some("/work/.neuron/sessions/abc/session-1.jsonl".to_string()),
             prompt: Some("--explain the build".to_string()),
