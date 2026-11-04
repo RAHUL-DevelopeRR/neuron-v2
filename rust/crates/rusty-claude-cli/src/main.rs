@@ -3144,12 +3144,7 @@ impl LiveCli {
         // model not to write, bash, write_file and edit_file are removed from
         // the tool list so it can only read and search.
         let effective_tools = if self.plan_mode {
-            let mut read_only: std::collections::BTreeSet<String> =
-                std::collections::BTreeSet::new();
-            for tool in &["read_file", "glob_search", "grep_search", "list_directory"] {
-                read_only.insert(tool.to_string());
-            }
-            Some(read_only)
+            Some(plan_mode::plan_mode_tools())
         } else {
             self.allowed_tools.clone()
         };
@@ -9202,6 +9197,18 @@ UU conflicted.rs",
                     "{tool} in {mode:?}: {outcome:?}"
                 );
             }
+            // Plan mode is read-only and offers no MCP tool: the call never runs.
+            let planning = super::plan_mode::PlanModeMemory::new().enter(PermissionMode::Allow);
+            assert_eq!(planning, PermissionMode::ReadOnly);
+            let refused = CliToolExecutor::new(
+                Some(super::plan_mode::plan_mode_tools()),
+                false,
+                state.tool_registry.clone(),
+                state.mcp_state.clone(),
+            )
+            .execute(tool, input)
+            .expect_err("plan mode runs no MCP tool");
+            assert!(refused.to_string().contains("not enabled"), "{refused}");
         }
 
         let mut executor = CliToolExecutor::new(
