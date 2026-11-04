@@ -219,6 +219,7 @@ pub fn execute_bash_with_cancel(
 
     let timeout = Duration::from_millis(effective_bash_timeout_ms(input.timeout));
     let mut command = prepare_command(&input.command, &cwd, &sandbox_status);
+    // A UI that watches the call hears the output while the command runs.
     let (bounded, containment_note) =
         os_sandbox::run_bounded(&mut command, &sandbox_status, timeout, &|| {
             cancel.is_cancelled()

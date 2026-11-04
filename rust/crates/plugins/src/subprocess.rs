@@ -441,12 +441,37 @@ impl BoundedOutput {
     }
 }
 
+/// Which pipe of a child a piece of output came from ([`run_bounded_observed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputPipe {
+    Stdout,
+    Stderr,
+}
+
 struct PipeReader {
     buffer: Arc<Mutex<Vec<u8>>>,
     handle: Option<JoinHandle<()>>,
+    /// Bytes already handed to the observer.
+    reported: usize,
 }
 
 impl PipeReader {
+    /// Hands what the pipe captured since the last call to `on_output`. The
+    /// bytes are copied out first, so the reader thread never waits on the
+    /// observer.
+    fn report_new(&mut self, pipe: OutputPipe, on_output: &mut dyn FnMut(OutputPipe, &[u8])) {
+        let fresh = {
+            let buffer = self.buffer.lock().unwrap_or_else(PoisonError::into_inner);
+            if buffer.len() <= self.reported {
+                return;
+            }
+            let fresh = buffer[self.reported..].to_vec();
+            self.reported = buffer.len();
+            fresh
+        };
+        on_output(pipe, &fresh);
+    }
+
     fn spawn<R: Read + Send + 'static>(pipe: Option<R>) -> Self {
         let buffer = Arc::new(Mutex::new(Vec::new()));
         let handle = pipe.map(|mut pipe| {
@@ -467,7 +492,11 @@ impl PipeReader {
                 }
             })
         });
-        Self { buffer, handle }
+        Self {
+            buffer,
+            handle,
+            reported: 0,
+        }
     }
 
     fn is_finished(&self) -> bool {
@@ -500,7 +529,14 @@ pub fn run_bounded(
     timeout: Option<Duration>,
     is_cancelled: &dyn Fn() -> bool,
 ) -> io::Result<BoundedOutput> {
-    run_bounded_with_spawn_hook(command, stdin, timeout, is_cancelled, &mut |_| Ok(()))
+    run_bounded_hooked(
+        command,
+        stdin,
+        timeout,
+        is_cancelled,
+        &mut |_| Ok(()),
+        &mut |_, _| {},
+    )
 }
 
 /// [`run_bounded`] with `after_spawn` called on the child right after it
@@ -513,6 +549,47 @@ pub fn run_bounded_with_spawn_hook(
     timeout: Option<Duration>,
     is_cancelled: &dyn Fn() -> bool,
     after_spawn: &mut dyn FnMut(&Child) -> io::Result<()>,
+) -> io::Result<BoundedOutput> {
+    run_bounded_hooked(
+        command,
+        stdin,
+        timeout,
+        is_cancelled,
+        after_spawn,
+        &mut |_, _| {},
+    )
+}
+
+/// Like [`run_bounded`], but `on_output` hears the output as it arrives: every
+/// few milliseconds while the child runs, with what each pipe captured since the
+/// last call, and once more after the pipes drained. It runs on the calling
+/// thread. What it hears is what the result holds (at most
+/// [`MAX_CAPTURED_BYTES`] per pipe).
+pub fn run_bounded_observed(
+    command: &mut Command,
+    stdin: Option<&[u8]>,
+    timeout: Option<Duration>,
+    is_cancelled: &dyn Fn() -> bool,
+    on_output: &mut dyn FnMut(OutputPipe, &[u8]),
+) -> io::Result<BoundedOutput> {
+    run_bounded_hooked(
+        command,
+        stdin,
+        timeout,
+        is_cancelled,
+        &mut |_| Ok(()),
+        on_output,
+    )
+}
+
+/// [`run_bounded_with_spawn_hook`] and [`run_bounded_observed`] together.
+pub fn run_bounded_hooked(
+    command: &mut Command,
+    stdin: Option<&[u8]>,
+    timeout: Option<Duration>,
+    is_cancelled: &dyn Fn() -> bool,
+    after_spawn: &mut dyn FnMut(&Child) -> io::Result<()>,
+    on_output: &mut dyn FnMut(OutputPipe, &[u8]),
 ) -> io::Result<BoundedOutput> {
     command
         .stdin(if stdin.is_some() {
@@ -540,11 +617,13 @@ pub fn run_bounded_with_spawn_hook(
         }
         _ => None,
     };
-    let stdout = PipeReader::spawn(child.stdout.take());
-    let stderr = PipeReader::spawn(child.stderr.take());
+    let mut stdout = PipeReader::spawn(child.stdout.take());
+    let mut stderr = PipeReader::spawn(child.stderr.take());
 
     let started = Instant::now();
     let (termination, status) = loop {
+        stdout.report_new(OutputPipe::Stdout, on_output);
+        stderr.report_new(OutputPipe::Stderr, on_output);
         if let Some(status) = child.try_wait()? {
             break (Termination::Exited, Some(status));
         }
@@ -565,6 +644,8 @@ pub fn run_bounded_with_spawn_hook(
     {
         thread::sleep(POLL_INTERVAL);
     }
+    stdout.report_new(OutputPipe::Stdout, on_output);
+    stderr.report_new(OutputPipe::Stderr, on_output);
     if let Some(writer) = writer {
         if writer.is_finished() {
             let _ = writer.join();
@@ -597,8 +678,8 @@ pub fn termination_message(termination: Termination, timeout: Option<Duration>) 
 #[cfg(test)]
 mod tests {
     use super::{
-        credential_env_keys, is_credential_env, run_bounded, scrub_credential_env,
-        termination_message, Termination,
+        credential_env_keys, is_credential_env, run_bounded, run_bounded_observed,
+        scrub_credential_env, termination_message, OutputPipe, Termination,
     };
     use std::ffi::OsStr;
     use std::process::Command;
@@ -721,6 +802,45 @@ mod tests {
         assert!(!stdout.contains("nzx_scrub_test_secret"), "{stdout}");
         assert!(!stdout.contains("sk-plain-provider-key"), "{stdout}");
         assert!(stdout.contains("keep=keep-me"), "{stdout}");
+    }
+
+    /// The observer hears each pipe's output before the run ends, and all of it
+    /// together is exactly what the result captured.
+    #[test]
+    fn observer_hears_both_pipes_while_the_child_runs() {
+        let script = if cfg!(windows) {
+            "echo first & echo oops 1>&2 & ping -n 2 127.0.0.1 >NUL & echo second"
+        } else {
+            "echo first; echo oops >&2; sleep 1; echo second"
+        };
+        let mut heard_stdout = Vec::new();
+        let mut heard_stderr = Vec::new();
+        let mut first_heard_at = None;
+        let started = Instant::now();
+        let output = run_bounded_observed(
+            &mut shell(script),
+            None,
+            Some(Duration::from_secs(20)),
+            &|| false,
+            &mut |pipe, bytes| {
+                first_heard_at.get_or_insert_with(|| started.elapsed());
+                match pipe {
+                    OutputPipe::Stdout => heard_stdout.extend_from_slice(bytes),
+                    OutputPipe::Stderr => heard_stderr.extend_from_slice(bytes),
+                }
+            },
+        )
+        .expect("child should run");
+        let total = started.elapsed();
+        assert_eq!(heard_stdout, output.stdout);
+        assert_eq!(heard_stderr, output.stderr);
+        assert!(String::from_utf8_lossy(&heard_stdout).contains("second"));
+        assert!(String::from_utf8_lossy(&heard_stderr).contains("oops"));
+        let first = first_heard_at.expect("output was heard");
+        assert!(
+            first + Duration::from_millis(500) < total,
+            "first output heard at {first:?}, run took {total:?}"
+        );
     }
 
     #[test]

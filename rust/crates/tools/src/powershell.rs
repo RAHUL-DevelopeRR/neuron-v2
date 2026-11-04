@@ -110,8 +110,11 @@ pub(crate) fn execute(
     }
 
     let timeout = Duration::from_millis(effective_bash_timeout_ms(timeout_ms));
+    // A UI that watches the call hears the output while the command runs.
     let bounded =
-        subprocess::run_bounded(&mut process, None, Some(timeout), &|| cancel.is_cancelled())?;
+        runtime::tool_output::run_bounded_live(&mut process, None, Some(timeout), &|| {
+            cancel.is_cancelled()
+        })?;
     Ok(BashCommandOutput::from_bounded(&bounded, Some(timeout)))
 }
 

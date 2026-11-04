@@ -144,7 +144,7 @@ pub fn run_bounded(
     is_cancelled: &dyn Fn() -> bool,
 ) -> io::Result<(BoundedOutput, Option<String>)> {
     let mut containment = Containment::prepare(command, status);
-    let output = subprocess::run_bounded_with_spawn_hook(
+    let output = crate::tool_output::run_bounded_live_with_spawn_hook(
         command,
         None,
         Some(timeout),

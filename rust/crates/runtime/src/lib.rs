@@ -63,6 +63,7 @@ mod session;
 pub mod session_control;
 pub use session_control::SessionStore;
 pub mod experience;
+pub mod parallel_tools;
 pub mod project_checks;
 mod sse;
 pub mod stale_base;
@@ -72,6 +73,7 @@ pub mod task_packet;
 pub mod task_registry;
 pub mod team_cron_registry;
 pub mod tool_input;
+pub mod tool_output;
 pub mod transcript;
 #[cfg(test)]
 mod trust_resolver;
@@ -164,8 +166,8 @@ pub use mcp_stdio::{
     McpServerManagerError, McpStdioProcess, McpTool, McpToolCallContent, McpToolCallParams,
     McpToolCallResult, McpToolDiscoveryReport, UnsupportedMcpServer,
 };
-pub use model_routing::{ModelRouting, ModelRoutingSettings};
 pub use mcp_toggle::{set_mcp_server_enabled, McpToggleOutcome};
+pub use model_routing::{ModelRouting, ModelRoutingSettings};
 pub use oauth::{
     clear_oauth_credentials, code_challenge_s256, credentials_path, generate_pkce_pair,
     generate_state, load_oauth_credentials, loopback_redirect_uri, parse_oauth_callback_query,
@@ -173,6 +175,7 @@ pub use oauth::{
     OAuthCallbackParams, OAuthRefreshRequest, OAuthTokenExchangeRequest, OAuthTokenSet,
     PkceChallengeMethod, PkceCodePair,
 };
+pub use parallel_tools::ConcurrentToolCall;
 pub use permissions::{
     non_interactive_hint, parse_permission_response, quote_allow_rules, render_permission_prompt,
     url_host, ConsolePermissionPrompter, PermissionContext, PermissionMode, PermissionOutcome,
