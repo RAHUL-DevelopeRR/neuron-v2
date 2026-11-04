@@ -117,6 +117,9 @@ The release workflow copies a version's section into its GitHub release notes.
 - `--with-browser` (or `browser.oneShot`) loads the bundled browser in a one-shot run.
   Without it, the system prompt and `ToolSearch` say the browser is not loaded in that
   run instead of calling it configured.
+  A script's refused page names `--allow-origin` with the page's host; calls it
+  cannot unlock (full-access tools, a refused file name, a click without a URL) do
+  not mention it.
 - `neuron plugins [list|install|enable|disable|update|uninstall]` runs locally, and an
   unknown word after `neuron mcp`, `neuron plugins` or `neuron skills` is refused with
   the usage line instead of being sent to the model as a prompt.

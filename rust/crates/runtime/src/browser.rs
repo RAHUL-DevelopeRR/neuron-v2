@@ -378,6 +378,29 @@ pub fn browser_call_tier(qualified_name: &str, input: &str) -> Option<BrowserToo
     })
 }
 
+/// The host `--allow-origin` would have to name for this bundled-browser call
+/// to run without asking: a web-tier call that opens an http(s) URL and names
+/// no file. `None` for anything `--allow-origin` cannot unlock: reading the
+/// page, the full-access tools, a call that names a file, and calls without a
+/// URL (a click, going back), which a run limited to its origins refuses.
+#[must_use]
+pub fn allow_origin_host(qualified_name: &str, input: &str) -> Option<String> {
+    if browser_call_tier(qualified_name, input) != Some(BrowserToolTier::Web) {
+        return None;
+    }
+    let Ok(serde_json::Value::Object(object)) = serde_json::from_str::<serde_json::Value>(input)
+    else {
+        return None;
+    };
+    if object.contains_key("filename") {
+        return None;
+    }
+    object
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .and_then(crate::permissions::url_host)
+}
+
 static ONE_SHOT_RUN: AtomicBool = AtomicBool::new(false);
 
 /// Marks this process as a one-shot run (`neuron -p`), which leaves out the
@@ -701,6 +724,49 @@ mod tests {
         );
         assert_eq!(
             browser_call_tier("mcp__playwright__browser_future", "{}"),
+            None
+        );
+    }
+
+    #[test]
+    fn only_web_calls_that_open_an_http_url_name_an_origin() {
+        let host =
+            |tool: &str, input: &str| allow_origin_host(&format!("mcp__playwright__{tool}"), input);
+        assert_eq!(
+            host(
+                "browser_navigate",
+                r#"{"url":"https://Docs.Example.com:8443/a"}"#
+            ),
+            Some("docs.example.com".to_string())
+        );
+        assert_eq!(
+            host("browser_tabs", r#"{"action":"new","url":"http://a.test/"}"#),
+            Some("a.test".to_string())
+        );
+        for (tool, input) in [
+            // No URL: a run limited to its origins refuses these anyway.
+            ("browser_click", r#"{"ref":"e1"}"#),
+            ("browser_navigate_back", "{}"),
+            (
+                "browser_evaluate",
+                r#"{"function":"() => 1","filename":"x.json"}"#,
+            ),
+            // Not http(s).
+            ("browser_navigate", r#"{"url":"file:///etc/passwd"}"#),
+            // Page tier and full access: no web-browsing approval is missing.
+            ("browser_snapshot", r#"{"filename":"../x.md"}"#),
+            ("browser_tabs", r#"{"action":"new"}"#),
+            ("browser_network_request", r#"{"index":1}"#),
+            ("browser_run_code_unsafe", r#"{"code":"async () => 1"}"#),
+            ("browser_file_upload", r#"{"paths":["a.txt"]}"#),
+        ] {
+            assert_eq!(host(tool, input), None, "{tool} {input}");
+        }
+        assert_eq!(
+            allow_origin_host(
+                "mcp__other__browser_navigate",
+                r#"{"url":"https://a.test/"}"#
+            ),
             None
         );
     }

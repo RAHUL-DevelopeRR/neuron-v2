@@ -113,6 +113,10 @@ pub(crate) struct Denial {
     /// Why it asked, when neither an allow rule nor a mode would skip the question (an
     /// ask rule, a hook).
     asked: Option<String>,
+    /// The host `--allow-origin` would let this bundled-browser call open: only a
+    /// page the browser was not approved to open, never a call that grant cannot
+    /// unlock (full-access tools, a named file, a call without a URL).
+    allow_origin: Option<String>,
 }
 
 impl Denial {
@@ -122,10 +126,15 @@ impl Denial {
         let unremedied = remedy.allow_rules.is_empty()
             && remedy.mode.is_none()
             && remedy.no_prefix_rule.is_none();
+        // The mode asked (an ask rule or a hook did not): the web-browsing approval.
+        let allow_origin = remedy
+            .mode
+            .and_then(|_| runtime::browser::allow_origin_host(&request.tool_name, &request.input));
         Self {
             tool: request.tool_name.clone(),
             asked: unremedied.then(|| request.reason.clone()).flatten(),
             remedy,
+            allow_origin,
         }
     }
 
@@ -135,12 +144,10 @@ impl Denial {
     pub(crate) fn reason(&self) -> String {
         let mut reason = self.reason_without_hint();
         // A page in the bundled browser: the run's own grant is the usual answer.
-        if self.tool.starts_with(runtime::browser::BROWSER_TOOL_PREFIX)
-            && self.remedy.mode.is_some()
-        {
-            reason.push_str(
-                ". For this run only, name the sites the browser may open with --allow-origin (`neuron --with-browser --allow-origin example.com -p \"...\"`)",
-            );
+        if let Some(host) = &self.allow_origin {
+            reason.push_str(&format!(
+                ". For this run only, name the sites the browser may open with --allow-origin (`neuron --with-browser --allow-origin {host} -p \"...\"`)",
+            ));
         }
         reason
     }
@@ -708,28 +715,68 @@ mod tests {
     /// the run-only grant, besides the allow rule.
     #[test]
     fn a_denied_browser_page_names_allow_origin() {
-        let mut browser = policy(&[], &[]);
-        for (tool, _) in runtime::browser::BUNDLED_BROWSER_TOOLS {
-            browser = browser.with_tool_requirement(
-                format!("mcp__playwright__{tool}"),
-                runtime::browser::browser_tool_permission(tool).expect("tier"),
-            );
-        }
-        let browser = browser.with_run_web_grants(runtime::RunWebGrants::default());
+        let browser = browser_policy(&[]);
         let reason = denied_with(
             &browser,
             "mcp__playwright__browser_navigate",
-            r#"{"url":"https://example.com/"}"#,
+            r#"{"url":"https://docs.example.com/guide"}"#,
         )
         .reason();
         assert!(
             reason.contains("\"mcp__playwright__browser_navigate\""),
             "{reason}"
         );
-        assert!(reason.contains("--allow-origin"), "{reason}");
+        assert!(
+            reason.contains("--allow-origin docs.example.com -p"),
+            "{reason}"
+        );
         // Other tools get no such hint.
         let reason = denied("WebSearch", r#"{"query":"latest node lts"}"#).reason();
         assert!(!reason.contains("--allow-origin"), "{reason}");
+    }
+
+    /// `--allow-origin` cannot unlock the full-access tools, a call refused for its
+    /// file name, or a call without a URL (a run limited to its origins refuses
+    /// those): their denials do not send the script's author there.
+    #[test]
+    fn browser_denials_that_allow_origin_cannot_lift_do_not_name_it() {
+        let browser = browser_policy(&[]);
+        for (tool, input) in [
+            ("browser_network_request", r#"{"index":3}"#),
+            ("browser_file_upload", r#"{"paths":["notes.txt"]}"#),
+            ("browser_drop", r#"{"target":"e4","paths":["notes.txt"]}"#),
+            ("browser_run_code_unsafe", r#"{"code":"async (page) => 1"}"#),
+            ("browser_take_screenshot", r#"{"filename":"../shot.png"}"#),
+            (
+                "browser_snapshot",
+                r#"{"filename":".git/hooks/pre-commit"}"#,
+            ),
+            ("browser_click", r#"{"ref":"e1"}"#),
+            ("browser_navigate_back", "{}"),
+        ] {
+            let reason = denied_with(&browser, &format!("mcp__playwright__{tool}"), input).reason();
+            assert!(!reason.contains("--allow-origin"), "{tool}: {reason}");
+        }
+        // An ask rule asked: no mode, and so no hint either.
+        let asked = browser_policy(&["mcp__playwright__browser_navigate"]);
+        let reason = denied_with(
+            &asked,
+            "mcp__playwright__browser_navigate",
+            r#"{"url":"https://example.com/"}"#,
+        )
+        .reason();
+        assert!(!reason.contains("--allow-origin"), "{reason}");
+    }
+
+    fn browser_policy(ask: &[&str]) -> PermissionPolicy {
+        let mut browser = policy(&[], ask);
+        for (tool, _) in runtime::browser::BUNDLED_BROWSER_TOOLS {
+            browser = browser.with_tool_requirement(
+                format!("mcp__playwright__{tool}"),
+                runtime::browser::browser_tool_permission(tool).expect("tier"),
+            );
+        }
+        browser.with_run_web_grants(runtime::RunWebGrants::default())
     }
 
     /// A web search on a one-line question was answered with "re-run with
