@@ -1050,6 +1050,7 @@ fn is_null_device(text: &str) -> bool {
         || text.eq_ignore_ascii_case("$null")
 }
 
+#[allow(clippy::too_many_lines)]
 fn classify_segment(raw: &RawSegment, context: &mut Context<'_>) -> ShellSegment {
     let words: Vec<String> = raw.words.iter().map(|word| word.text.clone()).collect();
     let mut prefix_coverable = true;
@@ -1149,7 +1150,8 @@ fn classify_segment(raw: &RawSegment, context: &mut Context<'_>) -> ShellSegment
                 write_reason.get_or_insert_with(|| problem.clone());
             }
             None => {
-                write_reason.get_or_insert_with(|| format!("`{name}` is not on the auto-allow list"));
+                write_reason
+                    .get_or_insert_with(|| format!("`{name}` is not on the auto-allow list"));
             }
         }
         reason.get_or_insert(problem);
@@ -1293,11 +1295,9 @@ fn build_program_name(word: &str, dialect: ShellDialect) -> String {
 /// Whether `name` is a Python interpreter (`python`, `python3`, `python3.12`, `py`).
 fn is_python(name: &str) -> bool {
     name == "py"
-        || name.strip_prefix("python").is_some_and(|version| {
-            version
-                .chars()
-                .all(|ch| ch.is_ascii_digit() || ch == '.')
-        })
+        || name
+            .strip_prefix("python")
+            .is_some_and(|version| version.chars().all(|ch| ch.is_ascii_digit() || ch == '.'))
 }
 
 /// Whether a build program is on the workspace-write auto-allow list for these
@@ -1325,9 +1325,9 @@ fn workspace_write_program(
         // `set NAME=value` in cmd.exe only sets a variable for the commands after it.
         "set" if context.dialect == ShellDialect::Cmd && context.flavor == Flavor::Shell => {
             return match args {
-                [assignment] if is_assignment(&assignment.text) => Some(
-                    assignment_write_problem(assignment, context).map_or(Ok(()), Err),
-                ),
+                [assignment] if is_assignment(&assignment.text) => {
+                    Some(assignment_write_problem(assignment, context).map_or(Ok(()), Err))
+                }
                 _ => None,
             };
         }
@@ -1486,7 +1486,7 @@ fn js_global_flag_problem(program: &str, args: &[&str]) -> Result<(), String> {
     let mut previous = "";
     for arg in args
         .iter()
-        .take_while(|arg| **arg != "--" && !(runner && !arg.starts_with('-')))
+        .take_while(|arg| **arg != "--" && (!runner || arg.starts_with('-')))
     {
         let global = matches!(*arg, "-g" | "--global" | "--location=global")
             || (arg.starts_with("--global=") && *arg != "--global=false")
@@ -1575,26 +1575,38 @@ fn cargo_problem(args: &[&str]) -> Result<(), String> {
         "cargo",
         args,
         CARGO_SUBCOMMANDS,
-        &["--manifest-path", "--target-dir", "-p", "--package", "--color", "-Z", "-C"],
+        &[
+            "--manifest-path",
+            "--target-dir",
+            "-p",
+            "--package",
+            "--color",
+            "-Z",
+            "-C",
+        ],
     )
 }
 
 const PIP_SUBCOMMANDS: &[&str] = &[
-    "install", "uninstall", "download", "wheel", "list", "show", "freeze", "check", "inspect",
+    "install",
+    "uninstall",
+    "download",
+    "wheel",
+    "list",
+    "show",
+    "freeze",
+    "check",
+    "inspect",
 ];
 
 /// `--user`, `--system` and `--break-system-packages` install into the user's or
 /// the system's Python, outside the workspace.
 fn python_install_location_problem(program: &str, args: &[&str]) -> Result<(), String> {
-    match args.iter().find(|arg| {
-        matches!(
-            **arg,
-            "--user" | "--break-system-packages" | "--system"
-        )
-    }) {
-        Some(flag) => Err(format!(
-            "`{program} {flag}` installs outside the workspace"
-        )),
+    match args
+        .iter()
+        .find(|arg| matches!(**arg, "--user" | "--break-system-packages" | "--system"))
+    {
+        Some(flag) => Err(format!("`{program} {flag}` installs outside the workspace")),
         None => Ok(()),
     }
 }
@@ -1611,13 +1623,11 @@ const UV_SUBCOMMANDS: &[&str] = &[
 const UV_VALUE_OPTIONS: &[&str] = &["--directory", "--project"];
 
 fn uv_problem(args: &[&str]) -> Result<(), String> {
-    match first_operand(args, UV_VALUE_OPTIONS) {
-        Some((index, "pip")) => pip_problem("uv pip", &args[index + 1..]),
-        _ => {
-            python_install_location_problem("uv", args)?;
-            subcommand_problem("uv", args, UV_SUBCOMMANDS, UV_VALUE_OPTIONS)
-        }
+    if let Some((index, "pip")) = first_operand(args, UV_VALUE_OPTIONS) {
+        return pip_problem("uv pip", &args[index + 1..]);
     }
+    python_install_location_problem("uv", args)?;
+    subcommand_problem("uv", args, UV_SUBCOMMANDS, UV_VALUE_OPTIONS)
 }
 
 /// `python -m pip ...` follows the pip rules; `setup.py install`/`develop` installs
@@ -3578,7 +3588,8 @@ mod tests {
         ] {
             assert_workspace_write(&cmd(command), command);
         }
-        let powershell = classify_powershell_command("npm install; npm run build", Some(&workspace()));
+        let powershell =
+            classify_powershell_command("npm install; npm run build", Some(&workspace()));
         assert_workspace_write(&powershell, "PowerShell npm install");
     }
 
@@ -3596,10 +3607,22 @@ mod tests {
             ("cargo build --config build.target-dir='/tmp/x'", "--config"),
             ("go install golang.org/x/tools/gopls@latest", "`go install`"),
             ("pip install --user requests", "--user"),
-            ("pip install --target /opt/lib requests", "outside the workspace"),
-            ("pip install -t/usr/lib/python3 requests", "outside the workspace"),
-            ("pip install --prefix=/usr/local requests", "outside the workspace"),
-            ("pip install --break-system-packages requests", "outside the workspace"),
+            (
+                "pip install --target /opt/lib requests",
+                "outside the workspace",
+            ),
+            (
+                "pip install -t/usr/lib/python3 requests",
+                "outside the workspace",
+            ),
+            (
+                "pip install --prefix=/usr/local requests",
+                "outside the workspace",
+            ),
+            (
+                "pip install --break-system-packages requests",
+                "outside the workspace",
+            ),
             ("uv pip install --system requests", "--system"),
             ("uv tool install ruff", "`uv tool`"),
             ("python setup.py install", "setup.py install"),
@@ -3613,13 +3636,28 @@ mod tests {
             ("cd .. && npm install", ".."),
             ("npm install --prefix ../elsewhere", "outside the workspace"),
             ("node ../other/script.js", "outside the workspace"),
-            ("cargo build --target-dir /tmp/target", "outside the workspace"),
-            ("npm run build > /tmp/build.log", "writes outside the workspace"),
-            ("npm run build > .git/hooks/pre-commit", "controls permissions"),
+            (
+                "cargo build --target-dir /tmp/target",
+                "outside the workspace",
+            ),
+            (
+                "npm run build > /tmp/build.log",
+                "writes outside the workspace",
+            ),
+            (
+                "npm run build > .git/hooks/pre-commit",
+                "controls permissions",
+            ),
             ("echo x > .neuron/settings.json", "controls permissions"),
-            ("NPM_CONFIG_GLOBAL=true npm install vite", "NPM_CONFIG_GLOBAL"),
+            (
+                "NPM_CONFIG_GLOBAL=true npm install vite",
+                "NPM_CONFIG_GLOBAL",
+            ),
             ("PATH=/tmp/bin:$PATH npm test", "PATH"),
-            ("CARGO_TARGET_DIR=/tmp/t cargo build", "outside the workspace"),
+            (
+                "CARGO_TARGET_DIR=/tmp/t cargo build",
+                "outside the workspace",
+            ),
             ("npm run $SCRIPT", "variable expansion"),
             ("git push origin main", "push"),
             ("git commit -m wip && git push", "git"),
@@ -3662,7 +3700,9 @@ mod tests {
         );
         // An unknown program asks with an auto-allow wording.
         assert_eq!(
-            posix("ls && curl https://example.com").full_access_reason().as_deref(),
+            posix("ls && curl https://example.com")
+                .full_access_reason()
+                .as_deref(),
             Some("`curl` is not on the auto-allow list")
         );
     }

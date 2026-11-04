@@ -672,7 +672,7 @@ mod tests {
 
     #[test]
     fn a_denial_says_what_would_let_the_tool_run() {
-        let reason = denied_command("bash", "npm test").reason();
+        let reason = denied_command("bash", "npm publish").reason();
         assert_eq!(
             reason,
             "tool 'bash' was not run: nobody could approve it in a non-interactive run. To allow it in scripts, add \"bash(npm:*)\" to permissions.allow in your user settings (~/.neuron/settings.json), or, only in a disposable environment, re-run with --permission-mode danger-full-access"
@@ -705,16 +705,16 @@ mod tests {
         );
     }
 
-    /// A shell rule names the program: `bash(npm:*)` covers `npm test` and `npm run
-    /// build`.
+    /// A shell rule names the program: `bash(npm:*)` covers `npm publish` and `npm
+    /// whoami` (builds and tests run without asking in workspace-write).
     #[test]
     fn a_denied_command_names_a_rule_for_its_program() {
-        let npm = denied_command("bash", "npm test").reason();
+        let npm = denied_command("bash", "npm publish").reason();
         assert!(
             npm.contains("add \"bash(npm:*)\" to permissions.allow"),
             "{npm}"
         );
-        let powershell = denied_command("PowerShell", "npm run build").reason();
+        let powershell = denied_command("PowerShell", "npm publish").reason();
         assert!(
             powershell.contains("add \"PowerShell(npm:*)\" to permissions.allow"),
             "{powershell}"
@@ -730,22 +730,22 @@ mod tests {
     fn every_rule_a_denial_names_lets_the_call_run() {
         let cases: &[(&str, &str, &[&str], Option<&str>)] = &[
             ("WebSearch", "", &["WebSearch"], None),
-            ("bash", "npm test", &["bash(npm:*)"], None),
+            ("bash", "npm publish", &["bash(npm:*)"], None),
             (
                 "bash",
-                "cargo test && npm run build",
+                "cargo install tokei && npm publish",
                 &["bash(cargo:*)", "bash(npm:*)"],
                 None,
             ),
             (
                 "bash",
-                "cargo test && cargo fmt --check && npm run build",
+                "cargo install tokei && cargo publish && npm publish",
                 &["bash(cargo:*)", "bash(npm:*)"],
                 None,
             ),
             (
                 "bash",
-                "mkdir build && npm run build",
+                "mkdir build && npm publish",
                 &["bash(mkdir:*)", "bash(npm:*)"],
                 None,
             ),
@@ -757,33 +757,33 @@ mod tests {
             ),
             (
                 "bash",
-                "CI=true npm test",
-                &["bash(CI=true npm test)"],
+                "CI=true npm publish",
+                &["bash(CI=true npm publish)"],
                 Some("environment assignment `CI=true`"),
             ),
             (
                 "bash",
-                "RUSTFLAGS=-Dwarnings cargo build",
-                &["bash(RUSTFLAGS=-Dwarnings cargo build)"],
+                "RUSTFLAGS=-Dwarnings cargo install tokei",
+                &["bash(RUSTFLAGS=-Dwarnings cargo install tokei)"],
                 Some("environment assignment"),
             ),
             (
                 "bash",
-                "npm test > out.txt",
-                &["bash(npm test > out.txt)"],
+                "npm publish > out.txt",
+                &["bash(npm publish > out.txt)"],
                 Some("output redirection to `out.txt` writes a file"),
             ),
             (
                 "bash",
-                "npm run build > build.log 2>&1",
-                &["bash(npm run build > build.log 2>&1)"],
+                "npm publish > build.log 2>&1",
+                &["bash(npm publish > build.log 2>&1)"],
                 Some("build.log"),
             ),
             (
                 "bash",
-                "echo hi > notes.txt",
-                &["bash(echo hi > notes.txt)"],
-                Some("notes.txt"),
+                "echo hi > ../notes.txt",
+                &["bash(echo hi > ../notes.txt)"],
+                Some("../notes.txt"),
             ),
             (
                 "bash",
@@ -830,9 +830,9 @@ mod tests {
         }
 
         // An exact rule is for that command only.
-        let exact = policy(&["bash(CI=true npm test)".to_string()], &[]);
+        let exact = policy(&["bash(CI=true npm publish)".to_string()], &[]);
         assert!(matches!(
-            exact.authorize("bash", &command("CI=true npm publish"), None),
+            exact.authorize("bash", &command("CI=true npm whoami"), None),
             PermissionOutcome::Deny { .. }
         ));
     }
@@ -841,7 +841,7 @@ mod tests {
     /// only the mode, for a disposable environment.
     #[test]
     fn a_command_no_rule_covers_names_none() {
-        let line = format!("npm test -- {} > out.txt", "--verbose ".repeat(20));
+        let line = format!("npm publish -- {} > out.txt", "--verbose ".repeat(20));
         let denial = denied_command("bash", &line);
         assert!(denial.remedy.allow_rules.is_empty(), "{denial:?}");
         let reason = denial.reason();
@@ -854,7 +854,7 @@ mod tests {
 
     #[test]
     fn the_model_is_told_the_denied_step_did_not_happen() {
-        let reason = denied_command("bash", "npm test").reason();
+        let reason = denied_command("bash", "npm publish").reason();
         let for_model = denial_for_model(&reason);
         assert!(for_model.starts_with(&reason), "{for_model}");
         assert!(
@@ -871,9 +871,9 @@ mod tests {
 
         let shortfall = Shortfall {
             denied: vec![
-                denied_command("bash", "npm test"),
+                denied_command("bash", "npm publish"),
                 denied("write_file", r#"{"path":".git/config","content":"x"}"#),
-                denied_command("bash", "cargo build"),
+                denied_command("bash", "cargo install tokei"),
             ],
             unanswered: 3,
             stopped: false,
@@ -924,10 +924,10 @@ mod tests {
     /// The warning does not claim the rules allow a call that no rule covers.
     #[test]
     fn the_warning_says_which_denied_calls_no_rule_covers() {
-        let long = format!("npm test -- {} > out.txt", "--verbose ".repeat(20));
+        let long = format!("npm publish -- {} > out.txt", "--verbose ".repeat(20));
         let mixed = Shortfall {
             denied: vec![
-                denied_command("bash", "npm test"),
+                denied_command("bash", "npm publish"),
                 denied_command("bash", &long),
             ],
             unanswered: 0,
@@ -979,20 +979,20 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, tool)| {
-                log.record(denied_command(tool, &format!("make step{index}")), true)
+                log.record(denied_command(tool, &format!("rsync step{index}")), true)
             })
             .collect::<Vec<_>>();
         assert_eq!(DENIAL_LIMIT, 5);
         assert_eq!(stops, vec![false, false, false, false, true]);
         assert!(
-            !log.record(denied_command("bash", "make"), true),
+            !log.record(denied_command("bash", "rsync"), true),
             "it stops once"
         );
         assert!(log.stopped);
 
         // The REPL is not stopped: the user is there.
         let mut repl = DenialLog::new();
-        assert!((0..DENIAL_LIMIT * 2).all(|_| !repl.record(denied_command("bash", "make"), false)));
+        assert!((0..DENIAL_LIMIT * 2).all(|_| !repl.record(denied_command("bash", "rsync"), false)));
         assert!(!repl.stopped);
     }
 
@@ -1000,7 +1000,7 @@ mod tests {
     fn a_stopped_run_says_why_and_fails_with_the_denial_exit_code() {
         let shortfall = Shortfall {
             denied: ["bash", "PowerShell", "bash", "PowerShell", "bash"]
-                .map(|tool| denied_command(tool, "npm install"))
+                .map(|tool| denied_command(tool, "npm publish"))
                 .to_vec(),
             unanswered: 0,
             stopped: true,
