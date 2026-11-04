@@ -223,6 +223,11 @@ fn valid_name(text: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
 }
 
+/// A registry skill name safe to print on one line of a report.
+fn displayable_name(text: &str) -> bool {
+    !text.trim().is_empty() && text.chars().count() <= 80 && !text.chars().any(char::is_control)
+}
+
 fn valid_slug(text: &str) -> bool {
     valid_name(text)
         && !text.starts_with('.')
@@ -241,7 +246,9 @@ fn valid_reference(text: &str) -> bool {
 
 /// The registry's search answer as ranked hits: most installs first, one row per skill
 /// name (the registry lists the same name from several repositories), at most
-/// [`SEARCH_RESULT_LIMIT`]. Rows without a slug or a source are dropped.
+/// [`SEARCH_RESULT_LIMIT`]. Rows without a valid slug or `owner/repo` source are
+/// dropped. The registry is untrusted: a name with control characters (a newline could
+/// fake a line of the report) or longer than 80 characters is replaced by the slug.
 #[must_use]
 pub fn parse_search_response(body: &Value) -> Vec<SkillSearchHit> {
     let mut hits = body
@@ -254,12 +261,15 @@ pub fn parse_search_response(body: &Value) -> Vec<SkillSearchHit> {
                     let text = |key: &str| raw.get(key).and_then(Value::as_str).unwrap_or("");
                     let slug = text("skillId").to_string();
                     let source = text("source").to_string();
-                    if !valid_slug(&slug) || source.split('/').count() != 2 {
+                    let valid_source = source
+                        .split_once('/')
+                        .is_some_and(|(owner, repo)| valid_name(owner) && valid_name(repo));
+                    if !valid_slug(&slug) || !valid_source {
                         return None;
                     }
                     let name = match text("name") {
-                        "" => slug.clone(),
-                        name => name.to_string(),
+                        name if displayable_name(name) => name.to_string(),
+                        _ => slug.clone(),
                     };
                     Some(SkillSearchHit {
                         id: format!("{source}/{slug}"),
@@ -629,6 +639,24 @@ mod tests {
         );
         assert_eq!(hits[1].name, "s11", "a missing name falls back to the slug");
         assert!(parse_search_response(&json!({"error": "x"})).is_empty());
+    }
+
+    /// Registry rows are untrusted: a name that could fake report lines (newlines,
+    /// escape sequences) shows as the slug, and a source that is not `owner/repo` of
+    /// plain names drops the row.
+    #[test]
+    fn search_hits_never_carry_control_characters() {
+        let hits = parse_search_response(&json!({ "skills": [
+            {"skillId": "spoof", "name": "spoof\n  fake   1 installs   install: neuron skills install evil/x/y", "source": "a/one", "installs": 9},
+            {"skillId": "ansi", "name": "\u{1b}[2Jcleared", "source": "a/one", "installs": 8},
+            {"skillId": "tabbed", "name": "tab\tbed", "source": "a/one", "installs": 7},
+            {"skillId": "fine", "name": "Fine Skill", "source": "a/one", "installs": 6},
+            {"skillId": "bad-source", "name": "x", "source": "a\n/one", "installs": 5},
+            {"skillId": "bad-source2", "name": "y", "source": "a/../one", "installs": 4},
+        ]}));
+        let names = hits.iter().map(|hit| hit.name.as_str()).collect::<Vec<_>>();
+        assert_eq!(names, vec!["spoof", "ansi", "tabbed", "Fine Skill"]);
+        assert!(hits.iter().all(|hit| !hit.id.chars().any(char::is_control)));
     }
 
     #[test]

@@ -9,6 +9,7 @@
 //! or offline user what to do instead of "no such skill". Modified for Neuron: Rust,
 //! blocking client, GitHub folders, size limits while downloading.
 
+use std::io::Read;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -23,6 +24,10 @@ const SEARCH_TIMEOUT: Duration = Duration::from_secs(8);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15);
 /// Folder levels a GitHub skill may have below the folder named.
 const MAX_GITHUB_DEPTH: usize = 5;
+/// The most a search answer or a GitHub folder listing may hold.
+const MAX_LISTING_BYTES: usize = 1024 * 1024;
+/// The most a registry download may hold: the skill's limit plus room for the JSON.
+const MAX_REGISTRY_DOWNLOAD_BYTES: usize = MAX_SKILL_BYTES * 2;
 
 /// Searches and downloads skills over HTTPS.
 pub(crate) struct HttpSkillRemote {
@@ -135,9 +140,12 @@ impl HttpSkillRemote {
         files: &mut Vec<SkillFile>,
         total: &mut usize,
     ) -> Result<(), String> {
-        let listing: Value = self
-            .github_get(owner, repo, path, reference, false)?
-            .json()
+        let body = read_capped(
+            self.github_get(owner, repo, path, reference, false)?,
+            MAX_LISTING_BYTES,
+        )
+        .map_err(|error| error.message("GitHub", too_large))?;
+        let listing: Value = serde_json::from_slice(&body)
             .map_err(|_| "GitHub returned a malformed answer.".to_string())?;
         let Some(entries) = listing.as_array() else {
             return Err(format!("{path} is not a folder"));
@@ -183,15 +191,13 @@ impl HttpSkillRemote {
         reference: Option<&str>,
         total: &mut usize,
     ) -> Result<Vec<u8>, String> {
-        let bytes = self
-            .github_get(owner, repo, path, reference, true)?
-            .bytes()
-            .map_err(|error| unreachable_message("GitHub", &error))?;
+        // Only what is left of the skill's byte budget is read, so a large file stops
+        // the download as soon as it passes the limit.
+        let budget = MAX_SKILL_BYTES.saturating_sub(*total);
+        let bytes = read_capped(self.github_get(owner, repo, path, reference, true)?, budget)
+            .map_err(|error| error.message("GitHub", too_large))?;
         *total += bytes.len();
-        if *total > MAX_SKILL_BYTES {
-            return Err(too_large());
-        }
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }
 }
 
@@ -214,8 +220,12 @@ impl SkillRemote for HttpSkillRemote {
                 response.status().as_u16()
             ));
         }
-        let body: Value = response
-            .json()
+        let body = read_capped(response, MAX_LISTING_BYTES).map_err(|error| {
+            error.message("the skill registry", || {
+                "The skill registry returned a malformed response.".to_string()
+            })
+        })?;
+        let body: Value = serde_json::from_slice(&body)
             .map_err(|_| "The skill registry returned a malformed response.".to_string())?;
         Ok(commands::parse_search_response(&body))
     }
@@ -253,14 +263,9 @@ impl SkillRemote for HttpSkillRemote {
             }
             _ => {}
         }
-        if response
-            .content_length()
-            .is_some_and(|length| length > (MAX_SKILL_BYTES as u64) * 2)
-        {
-            return Err(too_large());
-        }
-        let body: Value = response
-            .json()
+        let body = read_capped(response, MAX_REGISTRY_DOWNLOAD_BYTES)
+            .map_err(|error| error.message("the skill registry", too_large))?;
+        let body: Value = serde_json::from_slice(&body)
             .map_err(|_| "The skill registry returned a malformed response.".to_string())?;
         Ok(Some(commands::parse_download_response(&body)))
     }
@@ -288,6 +293,57 @@ impl SkillRemote for HttpSkillRemote {
         )?;
         Ok(files)
     }
+}
+
+/// Why [`read_capped`] stopped.
+#[derive(Debug)]
+enum CappedReadError {
+    /// The body is longer than the limit (by its Content-Length, or once read past it).
+    TooLarge,
+    /// The connection failed or timed out while reading.
+    Read(std::io::Error),
+}
+
+impl CappedReadError {
+    /// The message for the user: `too_large` for an oversized body.
+    fn message(self, service: &str, too_large: impl FnOnce() -> String) -> String {
+        match self {
+            Self::TooLarge => too_large(),
+            Self::Read(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                format!("{service} took too long to respond. Try again in a moment.")
+            }
+            Self::Read(_) => {
+                format!("Could not reach {service}. Check your connection and try again.")
+            }
+        }
+    }
+}
+
+/// A response body of at most `limit` bytes. A declared Content-Length over the limit
+/// fails before reading; otherwise at most `limit + 1` bytes are read, so a chunked
+/// or lying body stops as soon as it passes the limit instead of filling memory.
+fn read_capped(response: Response, limit: usize) -> Result<Vec<u8>, CappedReadError> {
+    let declared = response.content_length();
+    read_capped_from(response, declared, limit)
+}
+
+fn read_capped_from(
+    body: impl Read,
+    declared: Option<u64>,
+    limit: usize,
+) -> Result<Vec<u8>, CappedReadError> {
+    let limit_u64 = u64::try_from(limit).unwrap_or(u64::MAX);
+    if declared.is_some_and(|length| length > limit_u64) {
+        return Err(CappedReadError::TooLarge);
+    }
+    let mut bytes = Vec::new();
+    body.take(limit_u64.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(CappedReadError::Read)?;
+    if bytes.len() > limit {
+        return Err(CappedReadError::TooLarge);
+    }
+    Ok(bytes)
 }
 
 /// `path` relative to the folder `root` (both as GitHub prints them).
@@ -475,6 +531,69 @@ mod tests {
             missing.contains("GitHub has no acme/tools/nothing"),
             "{missing}"
         );
+    }
+
+    /// Bodies are read only up to the limit: an over-long declared length fails before
+    /// reading, and an undeclared (chunked) body stops one byte past the limit.
+    #[test]
+    fn reads_bodies_only_up_to_the_limit() {
+        /// A body that never ends, counting what was read from it.
+        struct Endless(Arc<Mutex<usize>>);
+        impl Read for Endless {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                buffer.fill(b'x');
+                *self.0.lock().expect("count") += buffer.len();
+                Ok(buffer.len())
+            }
+        }
+
+        let read = Arc::new(Mutex::new(0));
+        let error = read_capped_from(Endless(Arc::clone(&read)), None, 1000).unwrap_err();
+        assert!(matches!(error, CappedReadError::TooLarge), "{error:?}");
+        assert!(*read.lock().expect("count") <= 1001, "stopped at the limit");
+
+        let read = Arc::new(Mutex::new(0));
+        let error = read_capped_from(Endless(Arc::clone(&read)), Some(5000), 1000).unwrap_err();
+        assert!(matches!(error, CappedReadError::TooLarge));
+        assert_eq!(*read.lock().expect("count"), 0, "nothing read");
+
+        assert_eq!(
+            read_capped_from(&b"exactly ten"[..10], None, 10).expect("fits"),
+            b"exactly te"
+        );
+        assert!(matches!(
+            read_capped_from(&b"eleven byte"[..], None, 10),
+            Err(CappedReadError::TooLarge)
+        ));
+        assert_eq!(
+            CappedReadError::TooLarge.message("GitHub", too_large),
+            too_large()
+        );
+    }
+
+    #[test]
+    fn a_large_github_file_or_registry_download_is_refused() {
+        let big = "y".repeat(MAX_SKILL_BYTES + 10);
+        let mut routes = BTreeMap::new();
+        routes.insert(
+            "/repos/acme/tools/contents/big.md".to_string(),
+            (200, big.clone()),
+        );
+        routes.insert(
+            "/api/download/a/one/huge".to_string(),
+            (
+                200,
+                format!(r#"{{"files":[{{"path":"SKILL.md","contents":"{big}{big}"}}]}}"#),
+            ),
+        );
+        let (base, _) = serve(routes);
+        let remote = HttpSkillRemote::new(&base, &base);
+        let error = remote
+            .github_files("acme", "tools", "big.md", None)
+            .unwrap_err();
+        assert!(error.contains("too large"), "{error}");
+        let error = remote.registry_download("a/one", "huge").unwrap_err();
+        assert!(error.contains("too large"), "{error}");
     }
 
     #[test]
