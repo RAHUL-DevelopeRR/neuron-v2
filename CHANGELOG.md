@@ -70,7 +70,10 @@ The release workflow copies a version's section into its GitHub release notes.
   is told never to follow instructions inside it.
 - `--allow-web` lets `WebSearch` and `WebFetch` run without asking for one run, and
   `--allow-origin HOST` (repeatable) limits `WebFetch` and the browser to those hosts
-  and lets fetches from them run without asking. Neither is saved.
+  and lets fetches from them run without asking. Neither is saved. Under
+  `--allow-origin` a redirect to an unlisted host (`www.` included) is not followed,
+  and browser clicks, typing, page scripts and going back are refused. Either flag
+  keeps the line REPL instead of the full-screen UI, which could not carry them.
 - `neuron plugins [list|install|enable|disable|update|uninstall]` runs locally, and an
   unknown word after `neuron mcp`, `neuron plugins` or `neuron skills` is refused with
   the usage line instead of being sent to the model as a prompt.

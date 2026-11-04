@@ -298,7 +298,7 @@ Two flags grant web access for one run only; they are never saved to settings:
 | Flag | Effect |
 | --- | --- |
 | `--allow-web` | `WebSearch` and `WebFetch` run without asking |
-| `--allow-origin HOST` | `WebFetch` and the browser may reach only `HOST` (repeatable), and fetches from it run without asking. `HOST` is a host name or URL (`example.com`, `https://docs.rs/`); `*.example.com` also matches its subdomains. Calls to other hosts are refused, whatever the permission mode or allow rules |
+| `--allow-origin HOST` | `WebFetch` and the browser may reach only `HOST` (repeatable), and fetches from it run without asking. `HOST` is a host name or URL (`example.com`, `https://docs.rs/`); `*.example.com` also matches its subdomains. Calls to other hosts are refused, whatever the permission mode or allow rules, and so is a redirect to one (`www.` added or dropped counts as another host). In the browser, opening a listed page by its URL and reading it run; clicks, typing, page scripts, going back and opening tabs are refused, because they can leave the listed hosts without naming one |
 
 They are meant for scripts and CI, where nobody can answer a question:
 
@@ -309,8 +309,11 @@ neuron --allow-origin docs.rs --allow-origin '*.rust-lang.org' -p "summarize the
 
 Put them before `-p` or `prompt`: after it, every word is prompt text, so Neuron
 refuses them there instead of sending them to the model. A deny rule for `WebSearch`
-or `WebFetch` still wins over `--allow-web`. In the full-screen UI, approve web calls
-when asked instead.
+or `WebFetch` still wins over `--allow-web`. The full-screen UI's engine runs in a
+process of its own and would not get the grants, so with either flag Neuron keeps to
+the terminal: `neuron --allow-origin docs.rs` opens the line REPL, and
+`neuron --allow-origin docs.rs "..."` answers once in plain text. In the full-screen UI,
+approve web calls when asked instead.
 
 `CLAWD_WEB_SEARCH_BASE_URL` points direct searches at a search page of your own
 (it is sent `?q=<query>`); with it set, searches never go through the gateway.
