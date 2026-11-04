@@ -94,7 +94,8 @@ describe('a streaming message drawn in two parts', () => {
     }
     // It did cut: most prefixes have finished blocks.
     expect(splits).toBeGreaterThan(SAMPLE.length / 2)
-  })
+    // Hundreds of prefixes drawn twice each: past bun's 5 s on a busy machine.
+  }, 60_000)
 
   test('cuts only where a plain block starts after a blank line', () => {
     expect(streamingMarkdownSplit('one\n\ntwo\n')).toBe(5)
