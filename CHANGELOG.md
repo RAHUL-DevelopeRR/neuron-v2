@@ -42,6 +42,7 @@ The release workflow copies a version's section into its GitHub release notes.
   task list is saved in Neuron's home, unless git tracks it.
 - `/rewind` works in the line REPL (`--no-tui`) as in the full-screen UI: a checkpoint
   is saved with each prompt, and `/rewind <id> [code|chat|both]` goes back to one.
+  `/help` and Tab completion list it, and `neuron /rewind` says to run it in a session.
 - On a terminal, `neuron "prompt"` (without `-p`) opens the full-screen UI and sends the
   prompt first, and `neuron --resume SESSION` opens it on that session, showing its
   conversation; `-p` and `neuron prompt` stay plain text for scripts. A `-p` run on a

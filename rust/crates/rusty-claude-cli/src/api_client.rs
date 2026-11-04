@@ -1361,7 +1361,6 @@ pub(crate) const STUB_COMMANDS: &[&str] = &[
     "color",
     "effort",
     "branch",
-    "rewind",
     "ide",
     "tag",
     "output-style",

@@ -9441,6 +9441,30 @@ UU conflicted.rs",
         }
     }
 
+    /// `/rewind` runs in the line REPL, so its `/help` and Tab completion offer it, and
+    /// `neuron /rewind` sends the user into a session instead of calling it unimplemented.
+    #[test]
+    fn rewind_is_listed_in_the_repl_and_not_called_a_stub() {
+        assert!(!STUB_COMMANDS.contains(&"rewind"));
+        let help = render_repl_help();
+        assert!(help.contains("/rewind [id [code|chat|both]]"), "{help}");
+        let candidates =
+            slash_command_completion_candidates_with_sessions("claude-3-5-sonnet", None, vec![]);
+        assert!(
+            candidates.contains(&"/rewind".to_string()),
+            "{candidates:?}"
+        );
+
+        let error = parse_args(&["/rewind".to_string()]).expect_err("/rewind needs a session");
+        assert!(
+            error.contains("slash command /rewind works only inside a session"),
+            "{error}"
+        );
+        let error = parse_args(&["rewind".to_string()]).expect_err("rewind is a slash command");
+        assert!(error.contains("run `/rewind` inside the REPL"), "{error}");
+        assert!(!error.contains("not yet implemented"), "{error}");
+    }
+
     #[test]
     fn help_lists_only_working_resume_commands_and_every_flag() {
         let mut help = Vec::new();
