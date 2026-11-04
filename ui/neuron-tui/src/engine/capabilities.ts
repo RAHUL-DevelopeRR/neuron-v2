@@ -10,6 +10,7 @@
 
 import { logger } from '../utils/logger'
 import {
+  CAPABILITY_COLONY,
   CAPABILITY_GIT_VIEWS,
   CAPABILITY_LIVE_OUTPUT,
   CAPABILITY_LIVE_PROGRESS,
@@ -25,7 +26,8 @@ import type { NeuronEngineClient } from './neuron-engine-client'
  * and `/doctor` (reports), tool-input progress, output estimates and
  * per-request usage while a turn streams (live_progress), and the changes,
  * diff, commit and checkpoint views (git_views), and a running shell
- * command's output as it prints it (live_output). Not `questions`: this UI has
+ * command's output as it prints it (live_output), and a Colony run's live
+ * rows (colony). Not `questions`: this UI has
  * no question view, so the agent's questions stay notices it shows.
  */
 export const UI_CAPABILITIES: readonly string[] = [
@@ -33,6 +35,7 @@ export const UI_CAPABILITIES: readonly string[] = [
   CAPABILITY_LIVE_PROGRESS,
   CAPABILITY_GIT_VIEWS,
   CAPABILITY_LIVE_OUTPUT,
+  CAPABILITY_COLONY,
 ]
 
 /** How this UI names itself in the command. */

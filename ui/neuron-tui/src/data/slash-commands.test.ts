@@ -5,7 +5,7 @@ import { getSlashCommandsWithSkills, SLASH_COMMANDS } from './slash-commands'
 
 describe('extension commands', () => {
   test('/skills and /plugins are in the slash menu, run by the engine', () => {
-    for (const id of ['skills', 'plugins']) {
+    for (const id of ['skills', 'plugins', 'colony']) {
       expect(SLASH_COMMANDS.find((command) => command.id === id)).toMatchObject({
         engineCommand: true,
       })
@@ -18,6 +18,7 @@ describe('extension commands', () => {
     )
     expect(keys).toContain('/skills')
     expect(keys).toContain('/plugins')
+    expect(keys).toContain('/colony')
   })
 })
 

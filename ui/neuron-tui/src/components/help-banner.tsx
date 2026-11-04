@@ -54,6 +54,7 @@ export function helpSections(
         ['/copy', 'Copy chat'],
         ['/export', 'Export chat'],
         ['/plugins', 'List and manage plugins'],
+        ['/colony', 'Several agents on one task'],
         ['Drag', 'Select and copy text'],
       ],
     },

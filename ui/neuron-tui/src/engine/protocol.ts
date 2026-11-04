@@ -64,6 +64,12 @@ export const FEATURE_CHECKPOINTS = 'checkpoints'
 export const FEATURE_MCP_TOGGLE = 'mcp_toggle'
 /** `tool_output_delta` events: a running shell command's output. */
 export const FEATURE_LIVE_OUTPUT = 'live_output'
+/**
+ * `/colony <task>` and `/colony stop`: several agents on one task inside a
+ * token budget, reported as `colony_*` events to a UI that declared
+ * {@link CAPABILITY_COLONY}.
+ */
+export const FEATURE_COLONY = 'colony'
 
 /** A UI capability: questions come as `question` events, not "Question:" notices. */
 export const CAPABILITY_QUESTIONS = 'questions'
@@ -85,6 +91,8 @@ export const CAPABILITY_GIT_VIEWS = 'git_views'
  * `tool_output_delta` events. Without it the output comes only with the result.
  */
 export const CAPABILITY_LIVE_OUTPUT = 'live_output'
+/** A UI capability: Colony runs as `colony_*` events, not notices. */
+export const CAPABILITY_COLONY = 'colony'
 
 /** Token counts as the provider reported them (or estimated before it did). */
 export interface TokenCounts {
@@ -676,6 +684,71 @@ export interface SubagentFinishedEvent {
   note: string | null
 }
 
+/** A subtask of a Colony run's plan. */
+export interface ColonyTaskInfo {
+  id: string
+  title: string
+  /** Its worker changes files, in a worktree of its own. */
+  writes: boolean
+}
+
+/** One agent of a Colony run, as its live row shows it. */
+export interface ColonyAgentInfo {
+  id: string
+  /** `planner`, `worker`, `reviewer` or `synthesis`. */
+  role: string
+  title: string
+  model: string
+  /** `waiting`, `running`, `done`, `failed` or `stopped`. */
+  status: string
+  tokens_used: number
+  /** Its own share of the run's token cap. */
+  token_budget: number | null
+  /** A writing worker's branch. */
+  branch: string | null
+  note: string | null
+}
+
+/** A Colony run's plan was shown and its workers are about to start. */
+export interface ColonyStartedEvent {
+  type: 'colony_started'
+  run_id: string
+  task: string
+  /** Workers that run at the same time. */
+  workers: number
+  token_cap: number
+  tasks: ColonyTaskInfo[]
+}
+
+/** An agent of a Colony run changed: the whole row, replacing the one with its id. */
+export interface ColonyAgentEvent {
+  type: 'colony_agent'
+  run_id: string
+  agent: ColonyAgentInfo
+}
+
+/** Tokens every agent of the run used so far, against its cap. */
+export interface ColonyBudgetEvent {
+  type: 'colony_budget'
+  run_id: string
+  used: number
+  limit: number
+}
+
+/** A Colony run ended (`completed`, `stopped`, `conflict` or `failed`). */
+export interface ColonyFinishedEvent {
+  type: 'colony_finished'
+  run_id: string
+  status: string
+  tokens_used: number
+  token_cap: number
+  merged: boolean
+  /** The branch holding the changes when they were not applied. */
+  branch: string | null
+  /** The branch whose merge conflicted. */
+  conflict: string | null
+}
+
 /** Answer to `list_extensions`. Nothing secret: no commands, arguments or headers. */
 export interface ExtensionsEvent {
   type: 'extensions'
@@ -892,6 +965,10 @@ export type UiEvent =
   | TodosEvent
   | SubagentStartedEvent
   | SubagentFinishedEvent
+  | ColonyStartedEvent
+  | ColonyAgentEvent
+  | ColonyBudgetEvent
+  | ColonyFinishedEvent
   | ExtensionsEvent
   | ReportEvent
   | AccountEvent
@@ -934,6 +1011,10 @@ export const UI_EVENT_TYPES: readonly UiEventType[] = [
   'todos',
   'subagent_started',
   'subagent_finished',
+  'colony_started',
+  'colony_agent',
+  'colony_budget',
+  'colony_finished',
   'extensions',
   'report',
   'account',

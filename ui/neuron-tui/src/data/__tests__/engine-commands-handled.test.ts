@@ -20,8 +20,10 @@ describe('the engine commands the slash menu offers', () => {
     engineSource.indexOf('is not available in the full-screen UI yet'),
   )
   const handled = (name: string) => {
-    // `/context` is answered before run_slash, by name.
-    if (name === 'context') return engineSource.includes('"context" => self')
+    // `/context` and `/colony` are answered before run_slash, by name.
+    if (name === 'context' || name === 'colony') {
+      return engineSource.includes(`"${name}" => self`)
+    }
     const variant = name.charAt(0).toUpperCase() + name.slice(1)
     return runSlash.includes(`SlashCommand::${variant}`)
   }

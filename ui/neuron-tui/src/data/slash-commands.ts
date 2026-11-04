@@ -221,6 +221,14 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
     engineCommand: true,
     description: 'List, install, enable or disable plugins',
   },
+  // `/colony <task>` plans, runs workers in parallel, reviews and merges;
+  // `/colony stop` stops a run.
+  {
+    id: 'colony',
+    label: 'colony',
+    engineCommand: true,
+    description: 'Run a task with several agents inside a token budget',
+  },
   ...MODE_COMMANDS,
   {
     id: 'upgrade',

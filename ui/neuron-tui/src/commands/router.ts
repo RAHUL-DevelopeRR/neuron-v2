@@ -19,6 +19,7 @@ import {
   buildPlanPrompt,
   buildReviewPrompt,
 } from './prompt-builders'
+import { colonyEventHandler } from '../engine/colony-view'
 import { runEngineLogin, whenEngineStarted } from '../engine/engine-session'
 import { revealDeferredGitPanel } from '../engine/git-views'
 import { getNeuronEngineClient, runExchange } from '../engine/neuron-engine-client'
@@ -418,7 +419,12 @@ export async function routeUserPrompt(
     const exchange =
       command.toLowerCase() === 'login'
         ? runEngineLogin(engine)
-        : runExchange(engine, () => engine.slash(command, args.join(' ')), () => {})
+        : runExchange(
+            engine,
+            () => engine.slash(command, args.join(' ')),
+            // A Colony run keeps one message of live rows current.
+            command.toLowerCase() === 'colony' ? colonyEventHandler(setMessages) : () => {},
+          )
     exchange
       .then(() => {
         // The engine's report has no account and no folder trust: the UI

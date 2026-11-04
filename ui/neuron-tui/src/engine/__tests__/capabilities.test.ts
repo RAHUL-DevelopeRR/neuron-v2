@@ -32,7 +32,7 @@ afterEach(() => {
 
 describe('capabilities', () => {
   test('declares reports, live progress, git views and live output, as the protocol spells them', () => {
-    expect(UI_CAPABILITIES).toEqual(['reports', 'live_progress', 'git_views', 'live_output'])
+    expect(UI_CAPABILITIES).toEqual(['reports', 'live_progress', 'git_views', 'live_output', 'colony'])
     const { sent, client } = recordingClient()
     expect(
       declareUiCapabilities(client, ready(['capabilities', 'live_progress', 'git_views'])),
@@ -40,12 +40,12 @@ describe('capabilities', () => {
     expect(sent).toEqual([
       {
         type: 'capabilities',
-        features: ['reports', 'live_progress', 'git_views', 'live_output'],
+        features: ['reports', 'live_progress', 'git_views', 'live_output', 'colony'],
         client: 'terminal',
       },
     ])
     expect(encodeClientMessage(commandMessage(sent[0]!))).toBe(
-      '{"kind":"command","type":"capabilities","features":["reports","live_progress","git_views","live_output"],"client":"terminal"}\n',
+      '{"kind":"command","type":"capabilities","features":["reports","live_progress","git_views","live_output","colony"],"client":"terminal"}\n',
     )
   })
 
