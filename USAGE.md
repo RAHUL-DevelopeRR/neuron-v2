@@ -265,7 +265,9 @@ interactively.
 `--resume SESSION prompt "..."` works anywhere, scripts included: it runs one turn as
 `neuron prompt` does, with the session's history, and saves the turn to the same file.
 `-p "..."` does the same, and with nothing after it takes the prompt from standard input
-(`echo "now add tests" | neuron --resume latest -p`). With `--output-format json` its
+(`echo "now add tests" | neuron --resume latest -p`); piped slash commands, one per line,
+run as they do after `--resume` (`echo /status | neuron --resume latest -p`), and
+without `--resume` they are refused rather than sent. With `--output-format json` its
 stdout is the turn's JSON answer, as for `neuron prompt`, and its `session_id` is the
 session's id: a script can continue the session it started by id rather than as
 `latest`, which another run may have changed. Its `usage` and `estimated_cost` are that

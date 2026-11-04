@@ -371,6 +371,38 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
     format!("{prompt}\n\n{trimmed}")
 }
 
+/// The slash commands piped stdin carries in place of a `--resume ... -p` prompt, one per
+/// line: `None` when its first line is not one (the text is the prompt), an error when a
+/// later line is not one either, as a prompt can't follow them.
+fn piped_resume_commands(piped: &str) -> Result<Option<Vec<String>>, String> {
+    // Windows PowerShell pipes, and files saved as UTF-8 with BOM, start with U+FEFF.
+    let mut lines = piped
+        .trim_start_matches('\u{feff}')
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .peekable();
+    if !lines
+        .peek()
+        .is_some_and(|line| looks_like_slash_command_token(line))
+    {
+        return Ok(None);
+    }
+    lines
+        .map(|line| {
+            if looks_like_slash_command_token(line) {
+                Ok(line.to_string())
+            } else {
+                Err(format!(
+                    "piped input to `--resume ... -p` that starts with a slash command is run \
+as slash commands, one per line, and `{line}` is not one. Pipe either commands or a prompt."
+                ))
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Before anything prints: a classic Windows console shows colours as text until
     // VT processing is on, and its fonts need other marks.
@@ -447,6 +479,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             launch,
             compact,
         } => {
+            // `echo /status | neuron --resume latest -p`: stdin is the prompt, and slash
+            // commands there run as `neuron --resume latest /status` runs them.
+            let piped = if prompt.trim().is_empty() {
+                headless::stdin_context(false, output_format)
+            } else {
+                None
+            };
+            if let Some(commands) = piped
+                .as_deref()
+                .map(piped_resume_commands)
+                .transpose()
+                .map_err(UsageError)?
+                .flatten()
+            {
+                resume_session(&session_path, &commands, output_format, launch);
+                return Ok(());
+            }
+            let prompt = merge_prompt_with_stdin(&prompt, piped.as_deref());
             // Checked here as `--resume` checks it; the run opens it again under its lock.
             let (handle, session) = restore_session_or_exit(&session_path, output_format);
             let options = repl_loop::resume_launch(
@@ -585,6 +635,14 @@ fn run_prompt(
     // never asks for approval (approvals and questions are refused), so reading
     // it takes nothing from them. `echo 'hello' | neuron -p`: stdin is the prompt.
     let stdin_context = headless::stdin_context(!prompt.trim().is_empty(), output_format);
+    // `echo /status | neuron -p`: slash commands sent as a prompt would reach the model
+    // as a question, so they are refused as for a bare `neuron`. (Under `--resume` they
+    // were run before this.)
+    if prompt.trim().is_empty() {
+        if let Some(piped) = stdin_context.as_deref() {
+            crate::args::piped_prompt(piped, false).map_err(UsageError)?;
+        }
+    }
     let effective_prompt = merge_prompt_with_stdin(prompt, stdin_context.as_deref());
     if effective_prompt.trim().is_empty() {
         return Err(UsageError(

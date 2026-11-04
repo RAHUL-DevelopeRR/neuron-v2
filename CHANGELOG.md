@@ -33,6 +33,9 @@ The release workflow copies a version's section into its GitHub release notes.
   is still honoured for this release.
 - `--output-format json` for `--resume <session> -p` reports that run's `usage` and
   `estimated_cost` instead of the session's totals, which are in a new `session_usage`.
+- `echo /status | neuron --resume latest -p` runs the piped slash commands as
+  `--resume latest /status` does instead of sending them to the model, and
+  `echo /status | neuron -p` is refused as piped slash commands are for `neuron`.
 
 ## 7.0.0-alpha.3 (2026-11-02)
 
