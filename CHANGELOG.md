@@ -46,9 +46,11 @@ The release workflow copies a version's section into its GitHub release notes.
   `/help` and Tab completion list it, and `neuron /rewind` says to run it in a session.
 - On a terminal, `neuron "prompt"` (without `-p`) opens the full-screen UI and sends the
   prompt first, and `neuron --resume SESSION` opens it on that session, showing its
-  conversation; `-p` and `neuron prompt` stay plain text for scripts. A `-p` run on a
-  terminal starts with one line on stderr (model, permission mode, plan) instead of
-  the boxed banner, and no longer walks the workspace to draw it.
+  conversation (from the home folder or a drive root without `--allow-broad-cwd`, the
+  line REPL continues it, asking first as before); `-p` and `neuron prompt` stay plain
+  text for scripts. A `-p` run on a terminal starts with one line on stderr (model,
+  permission mode, plan) instead of the boxed banner, and no longer walks the
+  workspace to draw it.
 
 ## 7.0.0-alpha.3 (2026-11-02)
 

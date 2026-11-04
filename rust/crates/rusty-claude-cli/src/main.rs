@@ -374,6 +374,41 @@ fn one_shot_status_line(
     )
 }
 
+/// Whether a prompt run opens the full-screen UI (on a terminal where it is installed):
+/// the prompt is the command line's own words (`neuron "fix the bug"`), answered as text
+/// and not `--compact`. `-p`, `neuron prompt` and JSON output stay plain text for scripts.
+fn prompt_opens_ui(bare_prompt: bool, output_format: CliOutputFormat, compact: bool) -> bool {
+    bare_prompt && output_format == CliOutputFormat::Text && !compact
+}
+
+/// Whether an interactive `neuron --resume SESSION` continues in the full-screen UI. Not
+/// from a too-broad folder (the home folder or a root) without `--allow-broad-cwd`: the UI
+/// would ask for a project there and its engine refuse the folder, while the line REPL
+/// asks first and then continues the session in place, as it always has.
+fn resume_opens_ui(broad_cwd: bool, allow_broad_cwd: bool) -> bool {
+    !broad_cwd || allow_broad_cwd
+}
+
+/// The UI launch that continues the session `options.resume` names, with `model` (the
+/// typed `--model`, else the session's own).
+fn resumed_session_ui_launch(
+    options: &repl_loop::ReplLaunch,
+    model: Option<String>,
+) -> full_screen::UiLaunch<'_> {
+    full_screen::UiLaunch {
+        model,
+        provider: provider::provider_flag(),
+        permission_mode: options.permission_mode,
+        allowed_tools: options.allowed_tools.as_ref(),
+        reasoning_effort: options.reasoning_effort.as_deref(),
+        allow_broad_cwd: options.allow_broad_cwd,
+        base_commit: options.base_commit.as_deref(),
+        continue_chat: None,
+        resume: options.resume.clone(),
+        prompt: None,
+    }
+}
+
 /// Merge a piped stdin payload into a prompt argument.
 ///
 /// When `stdin_content` is `None` or empty after trimming, the prompt is
@@ -548,10 +583,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             // `neuron "fix the bug"` on a terminal: the full-screen UI, which sends the
             // prompt first. `-p` and `neuron prompt` stay plain text for scripts.
-            if crate::args::bare_prompt_given()
-                && output_format == CliOutputFormat::Text
-                && !compact
-            {
+            if prompt_opens_ui(crate::args::bare_prompt_given(), output_format, compact) {
                 if let Some(ui) = full_screen::ui_binary(no_tui) {
                     let launch = full_screen::UiLaunch {
                         model: crate::args::typed_model_arg(),
@@ -975,23 +1007,15 @@ fn resume_session(
             && io::stdout().is_terminal()
         {
             // The full-screen UI when it is installed: its engine continues the session.
-            if let Some(ui) = full_screen::ui_binary(crate::args::no_tui_flag_given()) {
+            let ui = full_screen::ui_binary(crate::args::no_tui_flag_given())
+                .filter(|_| resume_opens_ui(detect_broad_cwd().is_some(), launch.allow_broad_cwd));
+            if let Some(ui) = ui {
                 let resume = resolved_path.display().to_string();
                 let options =
                     repl_loop::resume_launch(launch.clone(), session.model.as_deref(), resume);
-                let ui_launch = full_screen::UiLaunch {
-                    // The session's own model unless `--model` named another.
-                    model: crate::args::typed_model_arg().or_else(|| session.model.clone()),
-                    provider: provider::provider_flag(),
-                    permission_mode: options.permission_mode,
-                    allowed_tools: options.allowed_tools.as_ref(),
-                    reasoning_effort: options.reasoning_effort.as_deref(),
-                    allow_broad_cwd: options.allow_broad_cwd,
-                    base_commit: options.base_commit.as_deref(),
-                    continue_chat: None,
-                    resume: options.resume.clone(),
-                    prompt: None,
-                };
+                // The session's own model unless `--model` named another.
+                let model = crate::args::typed_model_arg().or_else(|| session.model.clone());
+                let ui_launch = resumed_session_ui_launch(&options, model);
                 if let Some(ui_args) = full_screen::ui_args(&ui_launch) {
                     match full_screen::run_ui(&ui, &ui_args) {
                         Ok(code) => std::process::exit(code),
@@ -7470,6 +7494,73 @@ mod tests {
         assert!(!parse(&["prompt", "fix", "the", "bug"]));
         assert!(!parse(&[]));
         assert!(parse(&["--model", "opus", "explain", "this"]));
+    }
+
+    /// The dispatch for `neuron "prompt"`: the full-screen UI only for a bare prompt
+    /// answered as text; `-p`, `prompt`, JSON output and `--compact` keep the text path.
+    #[test]
+    fn a_bare_text_prompt_is_dispatched_to_the_full_screen_ui() {
+        let opens_ui = |args: &[&str]| {
+            let args = args.iter().map(ToString::to_string).collect::<Vec<_>>();
+            match parse_args(&args).expect("args should parse") {
+                CliAction::Prompt {
+                    output_format,
+                    compact,
+                    ..
+                } => {
+                    super::prompt_opens_ui(crate::args::bare_prompt_given(), output_format, compact)
+                }
+                other => panic!("expected a prompt, got {other:?}"),
+            }
+        };
+        assert!(opens_ui(&["fix", "the", "bug"]));
+        assert!(opens_ui(&["--model", "opus", "fix", "it"]));
+        assert!(!opens_ui(&["-p", "fix", "the", "bug"]));
+        assert!(!opens_ui(&["prompt", "fix", "the", "bug"]));
+        assert!(!opens_ui(&["--output-format", "json", "fix", "it"]));
+        assert!(!opens_ui(&["--compact", "fix", "it"]));
+    }
+
+    /// The dispatch for an interactive `neuron --resume SESSION`: the UI continues the
+    /// session with its model, except from a too-broad folder without
+    /// `--allow-broad-cwd` or with `--base-commit`, where the line REPL does.
+    #[test]
+    fn an_interactive_resume_is_dispatched_to_the_full_screen_ui() {
+        assert!(super::resume_opens_ui(false, false));
+        assert!(!super::resume_opens_ui(true, false));
+        assert!(super::resume_opens_ui(true, true));
+
+        let session = "/work/.neuron/sessions/abc/session-1.jsonl";
+        let options = crate::repl_loop::resume_launch(
+            crate::ResumeLaunchOptions::default(),
+            Some("opus"),
+            session.to_string(),
+        );
+        let launch = super::resumed_session_ui_launch(&options, Some("opus".to_string()));
+        let args = crate::full_screen::ui_args(&launch).expect("the UI carries a resume");
+        let pair = |flag: &str, value: &str| {
+            args.windows(2)
+                .any(|window| window[0] == flag && window[1] == value)
+        };
+        assert!(pair("--resume", session), "{args:?}");
+        assert!(pair("--model", "opus"), "{args:?}");
+        assert!(
+            !args.contains(&"--".to_string()),
+            "no first prompt: {args:?}"
+        );
+
+        let options = crate::repl_loop::resume_launch(
+            crate::ResumeLaunchOptions {
+                base_commit: Some("HEAD~1".to_string()),
+                ..Default::default()
+            },
+            None,
+            session.to_string(),
+        );
+        assert_eq!(
+            crate::full_screen::ui_args(&super::resumed_session_ui_launch(&options, None)),
+            None
+        );
     }
 
     #[test]

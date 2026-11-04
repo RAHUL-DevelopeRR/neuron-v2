@@ -122,11 +122,16 @@ async function main(): Promise<void> {
     continueChat: continueChat ? { chatId: continueId ?? null } : null,
   })
 
-  // Show project picker only when user starts at the home directory or an ancestor
+  // Show project picker only when user starts at the home directory or an
+  // ancestor, and not for `--resume`: the session is this folder's.
   const projectRoot = getProjectRoot()
   const homeDir = os.homedir()
   const startCwd = process.cwd()
-  const showProjectPicker = shouldShowProjectPicker(startCwd, homeDir)
+  const showProjectPicker = shouldShowProjectPicker(
+    startCwd,
+    homeDir,
+    Boolean(resume),
+  )
 
   if (clearLogs) {
     clearLogFile()

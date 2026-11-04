@@ -269,7 +269,8 @@ neuron --resume "$id" prompt "now make the change"
 `latest` is the newest session with messages: a session left before its first prompt is
 skipped. On a terminal, `--resume` without slash commands continues the session
 interactively, in the full-screen UI when it is installed (the line REPL with
-`--no-tui`).
+`--no-tui`, or from the home folder or a drive root without `--allow-broad-cwd`, where
+it asks before it continues).
 `--resume SESSION prompt "..."` works anywhere, scripts included: it runs one turn as
 `neuron prompt` does, with the session's history, and saves the turn to the same file.
 `-p "..."` does the same, and with nothing after it takes the prompt from standard input

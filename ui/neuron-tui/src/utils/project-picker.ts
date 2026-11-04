@@ -16,9 +16,15 @@ export function isAtOrAboveHome(dir: string, homeDir: string = os.homedir()): bo
   )
 }
 
+/**
+ * Whether the UI starts by asking for a project: from the home folder or above
+ * it, unless it was opened to continue a session (`neuron --resume`), which
+ * belongs to the folder it was started in and would be lost by moving.
+ */
 export function shouldShowProjectPicker(
   startCwd: string,
   homeDir: string,
+  resumingSession = false,
 ): boolean {
-  return isAtOrAboveHome(startCwd, homeDir)
+  return !resumingSession && isAtOrAboveHome(startCwd, homeDir)
 }
