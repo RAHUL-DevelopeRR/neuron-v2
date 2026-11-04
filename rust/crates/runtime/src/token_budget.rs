@@ -1,8 +1,8 @@
 //! Token budgets for sub-agents and multi-agent runs.
 //!
 //! A [`TokenBudget`] watches what one conversation runtime's model calls were billed
-//! and, optionally, adds it to a [`RunMeter`] that several runtimes share (all the
-//! agents of one Colony run). After each response it says whether to go on:
+//! and, optionally, adds it to [`RunMeter`]s: one several runtimes share (all the
+//! agents of one Colony run), and one a UI reads to show this agent's tokens live. After each response it says whether to go on:
 //!
 //! - below [`WRAP_UP_PERCENT`] of every limit: go on;
 //! - from there, once: tell the model to finish with what it has
@@ -108,7 +108,7 @@ pub enum BudgetVerdict {
 #[derive(Debug, Clone, Default)]
 pub struct TokenBudget {
     limit: Option<u64>,
-    run: Option<Arc<RunMeter>>,
+    meters: Vec<Arc<RunMeter>>,
     used: u64,
     warned: bool,
 }
@@ -123,10 +123,11 @@ impl TokenBudget {
         }
     }
 
-    /// Also counts towards (and stops at) `meter`'s limit.
+    /// Also counts towards (and stops at) `meter`'s limit. Several meters can be
+    /// added.
     #[must_use]
     pub fn with_run_meter(mut self, meter: Arc<RunMeter>) -> Self {
-        self.run = Some(meter);
+        self.meters.push(meter);
         self
     }
 
@@ -145,39 +146,32 @@ impl TokenBudget {
     pub fn record(&mut self, usage: TokenUsage) -> BudgetVerdict {
         let tokens = u64::from(usage.total_tokens());
         self.used += tokens;
-        let run_total = self.run.as_ref().map(|meter| meter.add(tokens));
-        self.verdict(run_total)
+        for meter in &self.meters {
+            meter.add(tokens);
+        }
+        self.verdict()
     }
 
     /// What to do now, without new usage (a run stopped by the user ends the agent
     /// too).
     #[must_use]
     pub fn check(&self) -> BudgetVerdict {
-        if self.run.as_ref().is_some_and(|meter| meter.exhausted()) {
+        if self.meters.iter().any(|meter| meter.exhausted()) {
             BudgetVerdict::Stop
         } else {
             BudgetVerdict::Proceed
         }
     }
 
-    fn verdict(&mut self, run_total: Option<u64>) -> BudgetVerdict {
+    fn verdict(&mut self) -> BudgetVerdict {
         let own_spent = self.limit.is_some_and(|limit| self.used >= limit);
-        let run_spent = self.run.as_ref().is_some_and(|meter| {
-            meter.is_stopped() || run_total.unwrap_or_else(|| meter.used()) >= meter.limit()
-        });
-        if own_spent || run_spent {
+        if own_spent || self.meters.iter().any(|meter| meter.exhausted()) {
             return BudgetVerdict::Stop;
         }
         let own_near = self
             .limit
             .is_some_and(|limit| reached_percent(self.used, limit, WRAP_UP_PERCENT));
-        let run_near = self.run.as_ref().is_some_and(|meter| {
-            reached_percent(
-                run_total.unwrap_or_else(|| meter.used()),
-                meter.limit(),
-                WRAP_UP_PERCENT,
-            )
-        });
+        let run_near = self.meters.iter().any(|meter| meter.near_limit());
         if (own_near || run_near) && !self.warned {
             self.warned = true;
             return BudgetVerdict::WrapUp;

@@ -3935,7 +3935,9 @@ mod tests {
                 if output == crate::token_budget::BUDGET_STOP_RESULT
         ));
         assert_eq!(
-            runtime.token_budget().map(|budget| budget.used()),
+            runtime
+                .token_budget()
+                .map(crate::token_budget::TokenBudget::used),
             Some(1_200)
         );
     }

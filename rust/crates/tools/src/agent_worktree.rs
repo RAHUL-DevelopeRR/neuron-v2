@@ -118,6 +118,35 @@ impl AgentWorktree {
         &self.workdir
     }
 
+    /// The worktree's top level.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The repository's main working tree.
+    pub(crate) fn repo_top(&self) -> &Path {
+        &self.repo_top
+    }
+
+    pub(crate) fn branch(&self) -> &str {
+        &self.branch
+    }
+
+    /// The commit the branch was cut from.
+    pub(crate) fn base(&self) -> &str {
+        &self.base
+    }
+
+    /// Removes the worktree, keeping its branch.
+    pub(crate) fn remove_keeping_branch(&self) -> Result<(), String> {
+        let path_text = self.path.to_string_lossy().into_owned();
+        git_text(
+            &self.repo_top,
+            &["worktree", "remove", "--force", &path_text],
+        )
+        .map(|_| ())
+    }
+
     pub(crate) fn info(&self) -> WorktreeInfo {
         WorktreeInfo {
             branch: self.branch.clone(),
@@ -182,7 +211,7 @@ impl AgentWorktree {
 /// `git <args>` in `cwd`, trimmed stdout; an error with git's message when it fails.
 /// In an untrusted workspace whose repository config would run programs, git does
 /// not run at all.
-fn git_text(cwd: &Path, args: &[&str]) -> Result<String, String> {
+pub(crate) fn git_text(cwd: &Path, args: &[&str]) -> Result<String, String> {
     let mut command: Command = runtime::workspace_git_command(cwd).ok_or_else(|| {
         "This workspace is not trusted and its git configuration runs programs, so Neuron does not run git here. Trust the workspace first.".to_string()
     })?;

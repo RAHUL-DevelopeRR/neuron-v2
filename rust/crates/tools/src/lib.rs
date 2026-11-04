@@ -3021,6 +3021,47 @@ struct AgentJob {
     allowed_tools: BTreeSet<String>,
     /// The worktree the sub-agent works in (`isolation: "worktree"`).
     worktree: Option<agent_worktree::AgentWorktree>,
+    /// Its place among the sub-agents running now, given back when the job ends.
+    _slot: std::sync::Arc<LiveSubagentSlot>,
+}
+
+/// Most sub-agents that may run at once in one Neuron process, those still running
+/// in the background included. Ported from Freebuff's `MAX_LIVE_SUBAGENTS_PER_ROOT`
+/// (common/src/tools/params/tool/spawn-agents.ts, Apache-2.0).
+pub const MAX_LIVE_SUBAGENTS: usize = 20;
+
+static LIVE_SUBAGENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A running sub-agent's place under [`MAX_LIVE_SUBAGENTS`]; dropping it frees it.
+#[derive(Debug)]
+struct LiveSubagentSlot(&'static std::sync::atomic::AtomicUsize);
+
+impl LiveSubagentSlot {
+    fn acquire() -> Result<Self, String> {
+        Self::acquire_from(&LIVE_SUBAGENTS, MAX_LIVE_SUBAGENTS)
+    }
+
+    fn acquire_from(
+        live: &'static std::sync::atomic::AtomicUsize,
+        most: usize,
+    ) -> Result<Self, String> {
+        use std::sync::atomic::Ordering;
+        live.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+            (count < most).then_some(count + 1)
+        })
+        .map(|_| Self(live))
+        .map_err(|count| {
+            format!(
+                "{count} sub-agents are already running, the most at once; wait for some to finish before starting more"
+            )
+        })
+    }
+}
+
+impl Drop for LiveSubagentSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -4332,6 +4373,7 @@ where
         return Err(String::from("prompt must not be empty"));
     }
 
+    let slot = LiveSubagentSlot::acquire()?;
     let agent_id = make_agent_id();
     let output_dir = agent_store_dir()?;
     std::fs::create_dir_all(&output_dir).map_err(|error| error.to_string())?;
@@ -4412,6 +4454,7 @@ where
         system_prompt,
         allowed_tools,
         worktree,
+        _slot: std::sync::Arc::new(slot),
     };
     if let Err(error) = spawn_fn(job) {
         let error = format!("failed to spawn sub-agent: {error}");
@@ -4542,11 +4585,28 @@ fn assemble_agent_runtime<C: ApiClient>(
     allowed_tools: BTreeSet<String>,
     system_prompt: Vec<String>,
 ) -> ConversationRuntime<C, SubagentToolExecutor> {
+    assemble_agent_runtime_with_policy(
+        api_client,
+        model,
+        allowed_tools,
+        system_prompt,
+        agent_permission_policy(),
+    )
+}
+
+/// [`assemble_agent_runtime`] with a given permission policy (Colony agents get one
+/// built from the run's settings).
+fn assemble_agent_runtime_with_policy<C: ApiClient>(
+    api_client: C,
+    model: &str,
+    allowed_tools: BTreeSet<String>,
+    system_prompt: Vec<String>,
+    permission_policy: PermissionPolicy,
+) -> ConversationRuntime<C, SubagentToolExecutor> {
     let tool_schema_tokens = subagent_tool_schema_tokens(&allowed_tools);
     let writes_files = ["write_file", "edit_file", "NotebookEdit"]
         .iter()
         .any(|tool| allowed_tools.contains(*tool));
-    let permission_policy = agent_permission_policy();
     let tool_executor = SubagentToolExecutor::new(allowed_tools)
         .with_enforcer(PermissionEnforcer::new(permission_policy.clone()));
     let context_manager = runtime::context_manager::ContextManager::new(
@@ -5216,6 +5276,23 @@ mod subagent_inheritance_tests {
         clear_subagent_parent_context();
         assert!(is_error);
         assert!(output.contains("PreToolUse hook denied"), "{output}");
+    }
+
+    #[test]
+    fn live_sub_agents_are_capped_and_freed_when_they_end() {
+        let live: &'static std::sync::atomic::AtomicUsize =
+            Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0)));
+        let first = super::LiveSubagentSlot::acquire_from(live, 2).expect("first");
+        let second = super::LiveSubagentSlot::acquire_from(live, 2).expect("second");
+        let refused = super::LiveSubagentSlot::acquire_from(live, 2).expect_err("full");
+        assert!(
+            refused.contains("2 sub-agents are already running"),
+            "{refused}"
+        );
+        drop(first);
+        let third = super::LiveSubagentSlot::acquire_from(live, 2).expect("a slot freed");
+        drop((second, third));
+        assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -7915,6 +7992,7 @@ fn parse_skill_description(contents: &str) -> Option<String> {
 }
 
 mod agent_worktree;
+pub mod colony;
 pub mod lane_completion;
 pub mod pdf_extract;
 mod powershell;

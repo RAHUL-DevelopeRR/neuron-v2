@@ -767,13 +767,11 @@ impl PermissionPolicy {
                 }
                 assessment.session_prefixes = vec![scope];
             }
-            "Agent" => {
-                // Lowered by what the sub-agent can do; an explicit lower
-                // requirement for the tool stays as it is.
-                if static_mode == PermissionMode::DangerFullAccess {
-                    assessment.required_mode =
-                        crate::subagent_tier::agent_call_requirement(input, self.shell_tools);
-                }
+            // Lowered by what the sub-agent can do; an explicit lower requirement
+            // for the tool stays as it is.
+            "Agent" if static_mode == PermissionMode::DangerFullAccess => {
+                assessment.required_mode =
+                    crate::subagent_tier::agent_call_requirement(input, self.shell_tools);
             }
             _ => {}
         }
