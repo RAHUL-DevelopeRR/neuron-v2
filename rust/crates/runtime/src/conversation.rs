@@ -311,13 +311,16 @@ pub trait ToolExecutor {
         false
     }
 
-    /// Runs read-only calls that were all allowed already ([`Self::tool_started`] was
-    /// called for each, in order) and returns their results in the order of `calls`.
-    /// The default runs them one after another.
+    /// Runs calls that were all allowed already ([`Self::tool_started`] was called for
+    /// each, in order), at most `limit` at a time, and returns their results in the
+    /// order of `calls`. They are read-only tool calls, or `Agent` calls whose
+    /// sub-agents only read or work in worktrees of their own. The default runs them
+    /// one after another.
     fn execute_concurrently(
         &mut self,
         calls: &[ConcurrentToolCall],
         cancel: &CancellationToken,
+        _limit: usize,
     ) -> Vec<Result<String, ToolError>> {
         calls
             .iter()
@@ -489,6 +492,9 @@ pub struct TurnSummary {
     pub served_model: Option<String>,
     /// Whether the completion check ran this turn.
     pub completion_checked: bool,
+    /// Whether the turn ended because its token budget ran out
+    /// ([`crate::token_budget`]); the outcome is then `Completed`.
+    pub budget_exhausted: bool,
 }
 
 /// Details about automatic session compaction applied during a turn.
@@ -512,6 +518,7 @@ struct TurnProgress {
     /// Files changed by successful edit tool calls this turn, in order.
     edited_paths: Vec<String>,
     completion_checked: bool,
+    budget_exhausted: bool,
     action_nudged: bool,
     /// The chat-only nudge was sent, and the request was retried on a model that
     /// calls tools (see [`crate::model_routing`]).
@@ -531,6 +538,8 @@ pub struct ConversationRuntime<C, T> {
     permission_policy: PermissionPolicy,
     system_prompt: Vec<String>,
     max_iterations: usize,
+    parallel_limits: crate::parallel_tools::ParallelLimits,
+    token_budget: Option<crate::token_budget::TokenBudget>,
     usage_tracker: UsageTracker,
     hook_runner: HookRunner,
     context_manager: ContextManager,
@@ -595,6 +604,8 @@ where
             permission_policy,
             system_prompt,
             max_iterations: DEFAULT_MAX_ITERATIONS,
+            parallel_limits: crate::parallel_tools::ParallelLimits::default(),
+            token_budget: None,
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(feature_config),
             context_manager,
@@ -653,6 +664,31 @@ where
     #[must_use]
     pub fn served_model(&self) -> Option<&str> {
         self.served_model.as_deref()
+    }
+
+    /// How many read-only tool calls and sub-agents of one response run at once.
+    #[must_use]
+    pub fn with_parallel_limits(mut self, limits: crate::parallel_tools::ParallelLimits) -> Self {
+        self.parallel_limits = limits;
+        self
+    }
+
+    #[must_use]
+    pub fn parallel_limits(&self) -> crate::parallel_tools::ParallelLimits {
+        self.parallel_limits
+    }
+
+    /// Ends turns within `budget` (see [`crate::token_budget`]).
+    #[must_use]
+    pub fn with_token_budget(mut self, budget: crate::token_budget::TokenBudget) -> Self {
+        self.token_budget = Some(budget);
+        self
+    }
+
+    /// The token budget, with what this runtime used of it.
+    #[must_use]
+    pub fn token_budget(&self) -> Option<&crate::token_budget::TokenBudget> {
+        self.token_budget.as_ref()
     }
 
     #[must_use]
@@ -895,6 +931,14 @@ where
                     },
                 ));
             }
+            if self
+                .token_budget
+                .as_ref()
+                .is_some_and(|budget| budget.check() == crate::token_budget::BudgetVerdict::Stop)
+            {
+                progress.budget_exhausted = true;
+                return Ok(self.finish_turn(progress, TurnOutcome::Completed));
+            }
             progress.iterations += 1;
             if progress.iterations > self.max_iterations {
                 let error = RuntimeError::with_kind(
@@ -965,6 +1009,7 @@ where
             if let Some(usage) = billed {
                 self.usage_tracker.record(usage);
             }
+            let budget_spent = self.note_budget_usage(billed);
             let built = match build_assistant_message(events) {
                 Ok(result) => result,
                 Err(error) => {
@@ -1032,6 +1077,17 @@ where
                     .push_message(assistant_message.clone())
                     .map_err(session_error)?;
                 progress.assistant_messages.push(assistant_message);
+            }
+
+            if budget_spent {
+                self.push_synthetic_results(
+                    progress.iterations,
+                    &pending_tool_uses,
+                    crate::token_budget::BUDGET_STOP_RESULT,
+                    &mut progress,
+                )?;
+                progress.budget_exhausted = true;
+                return Ok(self.finish_turn(progress, TurnOutcome::Completed));
             }
 
             if pending_tool_uses.is_empty() {
@@ -1365,6 +1421,30 @@ where
                 skipped_tool_calls,
             },
         ))
+    }
+
+    /// Counts a response's billed usage against the token budget: past
+    /// [`crate::token_budget::WRAP_UP_PERCENT`] the model is told to finish, and at the
+    /// limit `true` ends the turn.
+    fn note_budget_usage(&mut self, billed: Option<TokenUsage>) -> bool {
+        use crate::token_budget::{BudgetVerdict, WRAP_UP_NOTE};
+        let Some(budget) = self.token_budget.as_mut() else {
+            return false;
+        };
+        let verdict = match billed {
+            Some(usage) => budget.record(usage),
+            None => budget.check(),
+        };
+        match verdict {
+            BudgetVerdict::Proceed => false,
+            BudgetVerdict::WrapUp => {
+                if !self.system_prompt.iter().any(|part| part == WRAP_UP_NOTE) {
+                    self.system_prompt.push(WRAP_UP_NOTE.to_string());
+                }
+                false
+            }
+            BudgetVerdict::Stop => true,
+        }
     }
 
     fn push_synthetic_results(
@@ -1768,6 +1848,7 @@ where
             pruned_tool_results: progress.pruned_tool_results,
             served_model: self.served_model.clone(),
             completion_checked: progress.completion_checked,
+            budget_exhausted: progress.budget_exhausted,
         };
         self.record_turn_completed(&summary);
         summary
@@ -3789,6 +3870,74 @@ mod tests {
 
         // then
         assert_eq!(error.to_string(), "unknown tool: missing");
+    }
+
+    /// A model that keeps calling a tool, billed 400 tokens a response.
+    struct BilledLoopingApi {
+        requests: Vec<ApiRequest>,
+    }
+
+    impl ApiClient for BilledLoopingApi {
+        fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            self.requests.push(request);
+            Ok(vec![
+                AssistantEvent::TextDelta(format!("step {}", self.requests.len())),
+                AssistantEvent::ToolUse {
+                    id: format!("tool-{}", self.requests.len()),
+                    name: "echo".to_string(),
+                    input: format!(r#"{{"payload":{}}}"#, self.requests.len()),
+                },
+                AssistantEvent::Usage(TokenUsage {
+                    input_tokens: 300,
+                    output_tokens: 100,
+                    ..TokenUsage::default()
+                }),
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+
+    #[test]
+    fn a_token_budget_tells_the_model_to_wrap_up_then_ends_the_turn() {
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            BilledLoopingApi {
+                requests: Vec::new(),
+            },
+            StaticToolExecutor::new().register("echo", |input| Ok(input.to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_token_budget(crate::token_budget::TokenBudget::new(Some(1_000)));
+
+        let summary = runtime.run_turn("loop", None).expect("the turn ends");
+
+        assert!(summary.budget_exhausted);
+        assert_eq!(summary.outcome, super::TurnOutcome::Completed);
+        // 400, 800 (wrap up), 1,200 (stop): the third response's call never runs.
+        assert_eq!(summary.iterations, 3);
+        let requests = &runtime.api_client.requests;
+        assert!(!requests[1]
+            .system_prompt
+            .iter()
+            .any(|part| part == crate::token_budget::WRAP_UP_NOTE));
+        assert!(requests[2]
+            .system_prompt
+            .iter()
+            .any(|part| part == crate::token_budget::WRAP_UP_NOTE));
+        let last = summary
+            .tool_results
+            .last()
+            .expect("a result for the last call");
+        assert!(matches!(
+            &last.blocks[0],
+            ContentBlock::ToolResult { output, is_error: true, .. }
+                if output == crate::token_budget::BUDGET_STOP_RESULT
+        ));
+        assert_eq!(
+            runtime.token_budget().map(|budget| budget.used()),
+            Some(1_200)
+        );
     }
 
     #[test]

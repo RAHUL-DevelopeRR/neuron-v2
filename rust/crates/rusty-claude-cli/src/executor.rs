@@ -476,14 +476,13 @@ impl ToolExecutor for CliToolExecutor {
         &mut self,
         calls: &[runtime::ConcurrentToolCall],
         cancel: &runtime::CancellationToken,
+        limit: usize,
     ) -> Vec<Result<String, ToolError>> {
         self.starting_call = None;
         let dispatch = &self.dispatch;
-        let results = runtime::parallel_tools::run_concurrently(
-            calls,
-            runtime::parallel_tools::MAX_CONCURRENT_TOOL_CALLS,
-            |call| dispatch.run(&call.tool_name, &call.input, cancel),
-        );
+        let results = runtime::parallel_tools::run_concurrently(calls, limit, |call| {
+            dispatch.run(&call.tool_name, &call.input, cancel)
+        });
         results
             .into_iter()
             .zip(calls)

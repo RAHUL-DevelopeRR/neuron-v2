@@ -374,6 +374,7 @@ pub(crate) fn build_runtime(
         progress_reporter,
         shared.state,
         shared.max_iterations_setting,
+        shared.parallel_limits,
     )?;
     Ok(BuiltRuntime {
         runtime: Some(runtime),
@@ -415,6 +416,7 @@ pub(crate) fn build_runtime_with_plugin_state(
         progress_reporter,
         runtime_plugin_state,
         None,
+        runtime::ParallelLimits::default(),
     )?;
     Ok(BuiltRuntime::new(runtime, plugin_registry, mcp_state))
 }
@@ -433,6 +435,7 @@ fn assemble_conversation_runtime(
     progress_reporter: Option<InternalPromptProgressReporter>,
     runtime_plugin_state: RuntimePluginState,
     max_iterations_setting: Option<usize>,
+    parallel_limits: runtime::ParallelLimits,
 ) -> Result<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
 {
     // The model the session runs on, kept in its metadata so a resumed session reports
@@ -517,6 +520,7 @@ fn assemble_conversation_runtime(
     )
     .with_context_manager(context_manager)
     .with_max_iterations(runtime::resolve_max_iterations(max_iterations_setting))
+    .with_parallel_limits(parallel_limits)
     .with_harness_config(harness)
     .with_model_routing(routing);
     if let Some(reviewer) = reviewer {
@@ -593,6 +597,19 @@ fn max_iterations_setting(runtime_config: &runtime::RuntimeConfig) -> Option<usi
         .and_then(|value| usize::try_from(value).ok())
 }
 
+/// Reads the `parallelToolCalls` and `parallelAgents` settings: how many read-only
+/// tool calls and sub-agents of one response run at the same time.
+#[allow(clippy::redundant_closure_for_method_calls)]
+fn parallel_limits_setting(runtime_config: &runtime::RuntimeConfig) -> runtime::ParallelLimits {
+    let count = |key: &str| {
+        runtime_config
+            .get(key)
+            .and_then(|value| value.as_i64())
+            .and_then(|value| usize::try_from(value).ok())
+    };
+    runtime::ParallelLimits::from_settings(count("parallelToolCalls"), count("parallelAgents"))
+}
+
 /// Identity of the configuration the shared plugin state was built from.
 /// Any change (settings files, MCP servers, installed or enabled plugins)
 /// triggers a rebuild on the next [`build_runtime`].
@@ -614,6 +631,7 @@ struct SharedRuntimePluginState {
     /// The MCP servers while they start in the background; `mcp_state` is a stand-in.
     background_mcp: Option<BackgroundMcp>,
     max_iterations_setting: Option<usize>,
+    parallel_limits: runtime::ParallelLimits,
 }
 
 /// When the MCP servers start (see [`set_mcp_startup`]).
@@ -729,6 +747,7 @@ impl SharedRuntimePluginState {
                 mcp_state: self.mcp_state.clone(),
             },
             max_iterations_setting: self.max_iterations_setting,
+            parallel_limits: self.parallel_limits,
         }
     }
 
@@ -756,6 +775,7 @@ struct SharedPluginStateHandle {
     generation: u64,
     state: RuntimePluginState,
     max_iterations_setting: Option<usize>,
+    parallel_limits: runtime::ParallelLimits,
 }
 
 thread_local! {
@@ -814,6 +834,7 @@ fn shared_runtime_plugin_state_starting(
             mcp_state: state.mcp_state,
             background_mcp,
             max_iterations_setting: max_iterations_setting(&runtime_config),
+            parallel_limits: parallel_limits_setting(&runtime_config),
         };
         let handle = shared.handle();
         *slot.borrow_mut() = Some(shared);

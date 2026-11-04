@@ -1,11 +1,13 @@
-//! Read-only tool calls of one response that run at the same time. The rule for
-//! which calls qualify is in [`crate::parallel_tools`].
+//! Tool calls of one response that run at the same time: read-only tool calls (the
+//! rule is in [`crate::parallel_tools`]) and `Agent` calls whose sub-agents only read
+//! or work in a worktree of their own ([`crate::subagent_tier`]). The two kinds never
+//! share a batch, and each has its own limit ([`crate::parallel_tools::ParallelLimits`]).
 
 use super::{
     merge_hook_feedback, tool_input_object, ApiClient, ConversationMessage, ConversationRuntime,
     LoopGuard, LoopVerdict, RuntimeError, ToolError, ToolExecutor, TurnProgress,
 };
-use crate::parallel_tools::{is_concurrency_safe_tool, ConcurrentToolCall};
+use crate::parallel_tools::{is_concurrency_safe_tool, ConcurrentToolCall, MAX_AGENTS_PER_BATCH};
 use crate::permissions::{PermissionMode, PermissionOutcome};
 
 impl<C, T> ConversationRuntime<C, T>
@@ -14,9 +16,10 @@ where
     T: ToolExecutor,
 {
     /// Runs the leading calls of `calls` together when two or more of them in a row are
-    /// read-only calls nobody has to approve, and records their results in order.
-    /// Returns how many calls it ran: 0 when the first call has to run alone, the
-    /// usual way.
+    /// read-only calls nobody has to approve (or, when the first is an `Agent` call,
+    /// `Agent` calls that may run in parallel and need no approval), and records their
+    /// results in order. Returns how many calls it ran: 0 when the first call has to
+    /// run alone, the usual way.
     pub(super) fn run_read_only_batch(
         &mut self,
         calls: &[(String, String, String)],
@@ -32,12 +35,26 @@ where
         }
         // The loop guard sees the calls in order, as when they run one by one; a call
         // it would warn about or stop runs alone.
+        let agents = calls[0].1 == "Agent";
+        let (limit, most) = if agents {
+            (self.parallel_limits.agents, MAX_AGENTS_PER_BATCH)
+        } else {
+            (self.parallel_limits.tool_calls, usize::MAX)
+        };
+        if limit < 2 {
+            return Ok(0);
+        }
         let mut trial = loop_guard.clone();
         let count = calls
             .iter()
+            .take(most)
             .take_while(|(_, name, input)| {
-                self.runs_unattended_read_only(name, input)
-                    && trial.observe(name, input) == LoopVerdict::Proceed
+                let fits = if agents {
+                    self.runs_unattended_parallel_agent(name, input)
+                } else {
+                    self.runs_unattended_read_only(name, input)
+                };
+                fits && trial.observe(name, input) == LoopVerdict::Proceed
             })
             .count();
         if count < 2 {
@@ -63,7 +80,7 @@ where
         }
         let mut results = self
             .tool_executor
-            .execute_concurrently(&batch, &self.cancel)
+            .execute_concurrently(&batch, &self.cancel, limit)
             .into_iter();
         for call in &batch {
             let result = results.next().unwrap_or_else(|| {
@@ -92,6 +109,19 @@ where
                 .permission_policy
                 .required_mode_for_input(tool_name, input)
                 == PermissionMode::ReadOnly
+            && self.permission_policy.authorize(tool_name, input, None) == PermissionOutcome::Allow
+    }
+
+    /// Whether an `Agent` call may join a batch of `Agent` calls: valid arguments, a
+    /// sub-agent that only reads or works in a worktree of its own, and allowed by the
+    /// policy without a prompt.
+    fn runs_unattended_parallel_agent(&self, tool_name: &str, input: &str) -> bool {
+        tool_name == "Agent"
+            && tool_input_object(input).is_ok()
+            && crate::subagent_tier::agent_call_runs_in_parallel(
+                input,
+                self.permission_policy.shell_tools(),
+            )
             && self.permission_policy.authorize(tool_name, input, None) == PermissionOutcome::Allow
     }
 
@@ -134,7 +164,9 @@ mod tests {
         ToolExecutor,
     };
     use crate::cancel::CancellationToken;
-    use crate::parallel_tools::{run_concurrently, ConcurrentToolCall, MAX_CONCURRENT_TOOL_CALLS};
+    use crate::parallel_tools::{
+        run_concurrently, ConcurrentToolCall, ParallelLimits, MAX_CONCURRENT_TOOL_CALLS,
+    };
     use crate::permissions::{PermissionMode, PermissionPolicy};
     use crate::session::{ContentBlock, Session};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -239,13 +271,14 @@ mod tests {
             &mut self,
             calls: &[ConcurrentToolCall],
             _cancel: &CancellationToken,
+            limit: usize,
         ) -> Vec<Result<String, ToolError>> {
             self.batches
                 .push(calls.iter().map(|call| id_of(&call.input)).collect());
             let (log, running, peak) = (&self.log, &*self.running, &*self.peak);
             let count = calls.len() as u64;
             let indexed = calls.iter().enumerate().collect::<Vec<_>>();
-            run_concurrently(&indexed, MAX_CONCURRENT_TOOL_CALLS, |(index, call)| {
+            run_concurrently(&indexed, limit, |(index, call)| {
                 let delay = 20 * (count - *index as u64);
                 run_one(log, running, peak, &id_of(&call.input), delay)
             })
@@ -260,9 +293,34 @@ mod tests {
         )
     }
 
+    /// An `Agent` call starting a sub-agent of `kind` (`None`: a shared-tree writer).
+    fn agent(id: &str, kind: Option<&str>, isolated: bool) -> (String, String, String) {
+        let kind = kind.map_or(String::new(), |kind| {
+            format!(r#","subagent_type":"{kind}""#)
+        });
+        let isolation = if isolated {
+            r#","isolation":"worktree""#
+        } else {
+            ""
+        };
+        (
+            id.to_string(),
+            "Agent".to_string(),
+            format!(r#"{{"path":"{id}","description":"d","prompt":"p"{kind}{isolation}}}"#),
+        )
+    }
+
     fn run(
         tools: MockTools,
         calls: Vec<(String, String, String)>,
+    ) -> ConversationRuntime<TwoResponses, MockTools> {
+        run_with_limits(tools, calls, ParallelLimits::default())
+    }
+
+    fn run_with_limits(
+        tools: MockTools,
+        calls: Vec<(String, String, String)>,
+        limits: ParallelLimits,
     ) -> ConversationRuntime<TwoResponses, MockTools> {
         let policy = PermissionPolicy::new(PermissionMode::WorkspaceWrite)
             .with_tool_requirement("read_file", PermissionMode::ReadOnly)
@@ -274,7 +332,8 @@ mod tests {
             tools,
             policy,
             vec!["system".to_string()],
-        );
+        )
+        .with_parallel_limits(limits);
         runtime.run_turn("go", None).expect("the turn runs");
         runtime
     }
@@ -398,5 +457,96 @@ mod tests {
         assert!(runtime.tool_executor.batches.is_empty());
         assert_eq!(runtime.tool_executor.peak.load(Ordering::SeqCst), 1);
         assert_eq!(result_ids(&runtime), vec!["a=result a", "b=result b"]);
+    }
+
+    /// Read-only sub-agents of one response start together, at most
+    /// `parallelAgents` at a time: with 2, two start before either ends and the third
+    /// waits for a free slot.
+    #[test]
+    fn read_only_sub_agents_run_together_up_to_the_limit() {
+        let runtime = run_with_limits(
+            MockTools::new(true),
+            vec![
+                agent("a1", Some("Explore"), false),
+                agent("a2", Some("Plan"), false),
+                agent("a3", Some("Explore"), false),
+            ],
+            ParallelLimits::from_settings(None, Some(2)),
+        );
+        let tools = &runtime.tool_executor;
+        assert_eq!(tools.batches, vec![vec!["a1", "a2", "a3"]]);
+        assert_eq!(tools.peak.load(Ordering::SeqCst), 2);
+        let log = tools.log.lock().unwrap().clone();
+        assert!(
+            position(&log, "start a2") < position(&log, "end a1"),
+            "{log:?}"
+        );
+        let first_end = position(&log, "end a1").min(position(&log, "end a2"));
+        assert!(position(&log, "start a3") > first_end, "{log:?}");
+        assert_eq!(
+            result_ids(&runtime),
+            vec!["a1=result a1", "a2=result a2", "a3=result a3"]
+        );
+    }
+
+    /// With `parallelAgents` 1 (the Free Colony setting) sub-agents run one after the
+    /// other, the usual way.
+    #[test]
+    fn a_limit_of_one_runs_sub_agents_in_turn() {
+        let runtime = run_with_limits(
+            MockTools::new(true),
+            vec![
+                agent("a1", Some("Explore"), false),
+                agent("a2", Some("Explore"), false),
+            ],
+            ParallelLimits::from_settings(None, Some(1)),
+        );
+        let tools = &runtime.tool_executor;
+        assert!(tools.batches.is_empty());
+        assert_eq!(tools.peak.load(Ordering::SeqCst), 1);
+    }
+
+    /// Writers in worktrees of their own run together; a writer sharing the user's
+    /// tree runs alone (here it needs an approval nobody can give, so it is refused).
+    #[test]
+    fn isolated_writers_run_together_and_shared_tree_writers_alone() {
+        let runtime = run(
+            MockTools::new(true),
+            vec![
+                agent("w1", None, true),
+                agent("w2", None, true),
+                agent("w3", None, false),
+                agent("e1", Some("Explore"), false),
+            ],
+        );
+        let tools = &runtime.tool_executor;
+        assert_eq!(tools.batches, vec![vec!["w1", "w2"]]);
+        let results = result_ids(&runtime);
+        assert_eq!(results[0], "w1=result w1");
+        assert_eq!(results[1], "w2=result w2");
+        assert!(results[2].starts_with("w3="), "{results:?}");
+        assert_ne!(
+            results[2], "w3=result w3",
+            "the shared-tree writer was not run"
+        );
+        assert_eq!(results[3], "e1=result e1");
+    }
+
+    /// Reads and sub-agents never share a batch.
+    #[test]
+    fn reads_and_sub_agents_batch_separately() {
+        let runtime = run(
+            MockTools::new(true),
+            vec![
+                call("r1", "read_file"),
+                call("r2", "read_file"),
+                agent("a1", Some("Explore"), false),
+                agent("a2", Some("Explore"), false),
+            ],
+        );
+        assert_eq!(
+            runtime.tool_executor.batches,
+            vec![vec!["r1", "r2"], vec!["a1", "a2"]]
+        );
     }
 }

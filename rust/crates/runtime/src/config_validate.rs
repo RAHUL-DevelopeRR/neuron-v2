@@ -218,6 +218,14 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         expected: FieldType::Number,
     },
     FieldSpec {
+        name: "parallelToolCalls",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "parallelAgents",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
         name: "redactSecrets",
         expected: FieldType::Bool,
     },
@@ -877,6 +885,16 @@ mod tests {
             .collect::<Vec<_>>();
         fields.sort_unstable();
         assert_eq!(fields, vec!["maxIterations", "provider"]);
+    }
+
+    #[test]
+    fn accepts_the_parallel_limits() {
+        let source = r#"{"parallelToolCalls": 6, "parallelAgents": 2}"#;
+        let parsed = JsonValue::parse(source).expect("valid json");
+        let object = parsed.as_object().expect("object");
+        let result = validate_config_file(object, source, &test_path());
+        assert!(result.is_ok(), "{:?}", result.errors);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
     }
 
     #[test]

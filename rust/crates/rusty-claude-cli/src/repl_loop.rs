@@ -992,6 +992,7 @@ mod tests {
             pruned_tool_results: pruned,
             served_model: None,
             completion_checked: false,
+            budget_exhausted: false,
         }
     }
 

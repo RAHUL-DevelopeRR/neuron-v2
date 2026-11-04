@@ -25,8 +25,57 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-/// How many calls of a batch run at the same time, at most.
+/// How many calls of a batch run at the same time, at most, by default
+/// (`parallelToolCalls`).
 pub const MAX_CONCURRENT_TOOL_CALLS: usize = 4;
+
+/// The highest `parallelToolCalls` value honoured.
+pub const MAX_PARALLEL_TOOL_CALLS_SETTING: usize = 16;
+
+/// How many sub-agents of one response run at the same time by default
+/// (`parallelAgents`).
+pub const DEFAULT_PARALLEL_AGENTS: usize = 3;
+
+/// Most `Agent` calls one batch runs together; later calls of the same response
+/// wait for the next batch. Ported from Freebuff's `MAX_SPAWN_AGENTS_PER_CALL`
+/// (common/src/tools/params/tool/spawn-agents.ts, Apache-2.0).
+pub const MAX_AGENTS_PER_BATCH: usize = 6;
+
+/// How many calls of one response may run at the same time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParallelLimits {
+    /// Read-only tool calls ([`CONCURRENCY_SAFE_TOOLS`]) at once.
+    pub tool_calls: usize,
+    /// Read-only or worktree-isolated sub-agents at once (`crate::subagent_tier`).
+    pub agents: usize,
+}
+
+impl Default for ParallelLimits {
+    fn default() -> Self {
+        Self {
+            tool_calls: MAX_CONCURRENT_TOOL_CALLS,
+            agents: DEFAULT_PARALLEL_AGENTS,
+        }
+    }
+}
+
+impl ParallelLimits {
+    /// Limits from the `parallelToolCalls` and `parallelAgents` settings (unset:
+    /// the defaults), kept within 1 and the highest supported value. A limit of 1
+    /// runs those calls one after another.
+    #[must_use]
+    pub fn from_settings(tool_calls: Option<usize>, agents: Option<usize>) -> Self {
+        let defaults = Self::default();
+        Self {
+            tool_calls: tool_calls
+                .unwrap_or(defaults.tool_calls)
+                .clamp(1, MAX_PARALLEL_TOOL_CALLS_SETTING),
+            agents: agents
+                .unwrap_or(defaults.agents)
+                .clamp(1, MAX_AGENTS_PER_BATCH),
+        }
+    }
+}
 
 /// Tools that only read and may overlap with each other: they keep no state between
 /// calls that another call of the batch could see half-done.
@@ -91,7 +140,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{is_concurrency_safe_tool, run_concurrently, MAX_CONCURRENT_TOOL_CALLS};
+    use super::{
+        is_concurrency_safe_tool, run_concurrently, ParallelLimits, MAX_AGENTS_PER_BATCH,
+        MAX_CONCURRENT_TOOL_CALLS,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -112,6 +164,17 @@ mod tests {
         let peak = peak.load(Ordering::SeqCst);
         assert!(peak > 1, "ran one at a time");
         assert!(peak <= MAX_CONCURRENT_TOOL_CALLS, "peak {peak}");
+    }
+
+    #[test]
+    fn settings_are_kept_within_range() {
+        assert_eq!(
+            ParallelLimits::from_settings(None, None),
+            ParallelLimits::default()
+        );
+        let limits = ParallelLimits::from_settings(Some(0), Some(50));
+        assert_eq!(limits.tool_calls, 1);
+        assert_eq!(limits.agents, MAX_AGENTS_PER_BATCH);
     }
 
     #[test]
