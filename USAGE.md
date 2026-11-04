@@ -293,6 +293,13 @@ content (`<external-content id="..." source="web:...">`, with a random id the pa
 cannot guess). The model is told to treat that text as data and never follow
 instructions in it.
 
+A search query or a fetch address that looks like a secret (an API key, a token, a
+password in a URL, an `api_key=...` parameter, or the value of a credential
+environment variable) is refused before it is sent, whatever the permission rules or
+a domain approval say: "WebSearch refused: the query looks like a secret". This stops
+a page the model read from talking it into sending a key to the web. Browser
+navigation and typing are not checked yet.
+
 Two flags grant web access for one run only; they are never saved to settings:
 
 | Flag | Effect |
@@ -333,9 +340,10 @@ which every claim cites the pages it came from:
 4. When too few pages were read (or at standard and deep depth), it searches once
    more for what is missing.
 5. The report is written from the notes alone, never from the raw pages. A sentence
-   that cites a page not read in this run is removed, and the report says how many
-   were. A sources table (title, address, when it was read, what it was used for) and
-   why the run stopped close the report.
+   that cites a page not read in this run is removed, and so is a finding (in the
+   report's Findings section) that cites nothing; the report says how many were, and
+   how many summary sentences cite no source. A sources table (title, address, when
+   it was read, what it was used for) and why the run stopped close the report.
 
 The report is saved to `.neuron/research/<question-words>.md` in the folder you run
 Neuron in (`-2`, `-3`, ... when the name is taken), shown in the chat, and kept in the
@@ -345,28 +353,38 @@ conversation as data, so you can ask about it next.
 | --- | --- |
 | `--depth quick` | Up to 3 sub-questions, 5 searches, 5 pages, 10 steps; about 150,000 tokens |
 | `--depth standard` (default) | Up to 4 sub-questions, 7 searches, 8 pages, 15 steps; about 300,000 tokens |
-| `--depth deep` | Up to 6 sub-questions, 10 searches, 15 pages, 25 steps; about 600,000 tokens |
+| `--depth deep` | Pro and Max: up to 6 sub-questions, 10 searches, 15 pages, 25 steps; about 600,000 tokens. On Free it runs at the standard depth and says so |
 | `--budget TOKENS` | Another token cap (`200000`, `200k`, `1.5m`), at least 10k |
 | `--out FILE` | `neuron research` only: also write the report to `FILE` |
 
 Options go before the question. A step is one search or one page read. The token cap
-is held to your plan's most per run: Free 300,000, Pro 600,000, Max 1,500,000. A run
-stops when it reaches its step cap, when 80% of its tokens are used (it then writes
-the report from the notes so far), when the plan's daily search or research allowance
-is used up (Free 3 research runs a day, Pro 30, Max 150; the report says when it
-resets), or when you interrupt it (Ctrl+C in the full-screen UI), and the report says
-which. Requests that only take notes from one page go to `summaryModel` when it is set.
+is held to your plan's most per run: Free 150,000, Pro 600,000, Max 1,500,000. Neuron
+reads your plan from your Zero-X account before a run (the plan saved at sign-in when
+the account cannot be reached), so an upgrade counts at once, and the start question
+says how many research runs a day your plan has. A run stops when it reaches its step
+cap, when its page or search cap leaves no room for the next sub-question (that
+sub-question stays unsearched), when 80% of its tokens are used (it then writes the
+report from the notes so far), when the plan's daily search or research allowance is
+used up (Free 3 research runs a day, Pro 30, Max 150; the report says when it resets),
+or when you interrupt it with Ctrl+C (full-screen UI, line REPL and `neuron
+research`; a second Ctrl+C quits), and the report says which. Requests that only take
+notes from one page go to `summaryModel` when it is set.
 
 Before a run starts, Neuron says what it may use and asks to start; saying yes allows
 web searches and reads for that run only, as `--allow-web` does. Deny rules for
 `WebSearch` or `WebFetch` and `--allow-origin` limits still apply, and every page read
 goes through the same address checks as `WebFetch` (no private or local addresses).
+Your tool hooks run too: each search is a `WebSearch` call and each page read a
+`WebFetch` call to `PreToolUse` hooks (which can refuse it, change its input or decide
+its permission) and to `PostToolUse` or `PostToolUseFailure` hooks (a result one
+blocks is not used). A refused search stops the run; a refused page is skipped.
 In the full-screen UI each search and page read shows as a step of the turn and the
 sub-questions as its task list.
 
 `neuron research` cannot ask, so it refuses to start, before any model call, unless
 `--allow-web` is given or `permissions.allow` rules in `~/.neuron/settings.json` allow
-`WebSearch` and `WebFetch`:
+`WebSearch` and `WebFetch`. Run from your home folder or a drive's root it also needs
+`--allow-broad-cwd`, as a prompt does:
 
 ```bash
 neuron --allow-web research --depth quick "which Rust async runtime should I use in 2026?"
@@ -374,7 +392,10 @@ neuron --allow-web --output-format json research --out notes/runtimes.md "tokio 
 ```
 
 It prints the report on stdout and its progress on stderr (JSON output: one object
-with the report, sources, token use and `stop_reason`), and exits with 1 when no page
+with the report, sources, token use, `stop_reason` (`completed`, `step_cap`,
+`page_cap`, `search_cap`, `token_cap`, `search_quota_exhausted`, `signed_out`,
+`search_refused` or `cancelled`), `removed_claims`, `uncited_removed` and
+`uncited_kept`), and exits with 1 when no page
 could be read. Pages are read one after another; reading several at once waits for
 the multi-agent mode.
 

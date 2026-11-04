@@ -80,11 +80,22 @@ The release workflow copies a version's section into its GitHub release notes.
   `WebFetch`, notes whose quotes must be on the page, and a report written from the
   notes alone with numbered citations and a sources table, saved to
   `.neuron/research/`. Claims citing a page not read in the run are removed and counted.
-  `--depth quick|standard|deep` and `--budget` set the caps (held to the plan's
-  ceiling); a run stops at its step cap, at 80% of its tokens, on a used-up search
-  allowance or an interrupt, and says why. It asks before starting (the yes allows web
-  reads for that run); `neuron research` needs `--allow-web` or allow rules instead. In
-  the full-screen UI its searches and reads show as the turn's steps.
+  Findings that cite nothing are removed too, and uncited summary sentences counted.
+  `--depth quick|standard|deep` and `--budget` set the caps, held to the plan's budget
+  read from the account (Free 150,000 tokens a run at quick or standard depth; Pro
+  600,000 and Max 1,500,000 with deep); a run stops at its step cap, when its page or
+  search cap leaves a sub-question unsearched, at 80% of its tokens, on a used-up
+  search allowance or on Ctrl+C (in the full-screen UI, the line REPL and `neuron
+  research`), and says why. Its searches and reads run your `PreToolUse` and
+  `PostToolUse` hooks as `WebSearch` and `WebFetch` calls. It asks before starting (the
+  yes allows web reads for that run); `neuron research` needs `--allow-web` or allow
+  rules instead, and `--allow-broad-cwd` from the home folder. In the full-screen UI
+  its searches and reads show as the turn's steps; the line REPL saves the report to
+  the session at once.
+- A `WebSearch` query or `WebFetch` address that looks like a secret (an API key, a
+  token, a password in a URL, an `api_key=` parameter) is refused before it is sent,
+  whatever the permission rules say; research searches and reads are checked the same
+  way.
 - `neuron plugins [list|install|enable|disable|update|uninstall]` runs locally, and an
   unknown word after `neuron mcp`, `neuron plugins` or `neuron skills` is refused with
   the usage line instead of being sent to the model as a prompt.
