@@ -3263,8 +3263,27 @@ fn execute_web_search_with(
         }
     }
 
+    let (mut hits, backend) = direct_search_hits(&input.query, gateway.is_none())?;
+    filter_hits(input, &mut hits);
+    let note = fell_back.then_some(
+        "Zero-X search is not available right now, so this search went direct to DuckDuckGo (titles only, no snippets).",
+    );
+    Ok(WebSearchOutput {
+        query: input.query.clone(),
+        results: search_result_items(input, hits, note),
+        duration_seconds: started.elapsed().as_secs_f64(),
+        backend,
+        cached: None,
+        quota: None,
+    })
+}
+
+/// A search sent straight to the search host (`DuckDuckGo`, or
+/// `CLAWD_WEB_SEARCH_BASE_URL`): its hits, unfiltered, and the backend's name.
+/// `signed_out` (no Zero-X gateway in play) adds the sign-in hint to a failure.
+fn direct_search_hits(query: &str, signed_out: bool) -> Result<(Vec<SearchHit>, String), String> {
     let client = build_http_client()?;
-    let search_url = build_search_url(&input.query)?;
+    let search_url = build_search_url(query)?;
     let response = client
         .get(search_url.as_str())
         .send()
@@ -3277,7 +3296,7 @@ fn execute_web_search_with(
     if status != reqwest::StatusCode::OK {
         return Err(direct_search_failure(
             status.as_u16(),
-            gateway.is_none() && custom_search_base_url().is_none(),
+            signed_out && custom_search_base_url().is_none(),
         ));
     }
 
@@ -3288,24 +3307,12 @@ fn execute_web_search_with(
     if hits.is_empty() && final_url.host_str().is_some() {
         hits = extract_search_hits_from_generic_links(&html, search_url.host_str());
     }
-
-    filter_hits(input, &mut hits);
     let backend = if custom_search_base_url().is_some() {
         search_url.host_str().unwrap_or("custom").to_string()
     } else {
         "duckduckgo".to_string()
     };
-    let note = fell_back.then_some(
-        "Zero-X search is not available right now, so this search went direct to DuckDuckGo (titles only, no snippets).",
-    );
-    Ok(WebSearchOutput {
-        query: input.query.clone(),
-        results: search_result_items(input, hits, note),
-        duration_seconds: started.elapsed().as_secs_f64(),
-        backend,
-        cached: None,
-        quota: None,
-    })
+    Ok((hits, backend))
 }
 
 /// The error for a direct search that got no results page. `signed_out` (the
@@ -8016,6 +8023,7 @@ mod external_content;
 pub mod lane_completion;
 pub mod pdf_extract;
 mod powershell;
+pub mod research_web;
 pub mod zerox_search;
 pub use zerox_search::{set_search_gateway_provider, SearchGateway};
 #[cfg(test)]

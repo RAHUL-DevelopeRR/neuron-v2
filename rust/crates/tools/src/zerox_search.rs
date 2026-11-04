@@ -143,10 +143,24 @@ pub(crate) fn validate_freshness(freshness: Option<&str>) -> Result<(), String> 
     }
 }
 
+/// The header naming a research run: the gateway counts each distinct id
+/// once against the plan's daily research runs.
+pub(crate) const RESEARCH_RUN_HEADER: &str = "x-neuron-research-run";
+
 /// `POST` the query to the gateway.
 pub(crate) fn search(
     gateway: &SearchGateway,
     request: &SearchRequest<'_>,
+) -> Result<GatewayOutcome, String> {
+    search_in_run(gateway, request, None)
+}
+
+/// [`search`] as part of research run `run_id` (sent as
+/// [`RESEARCH_RUN_HEADER`]; the request's purpose should be `research`).
+pub(crate) fn search_in_run(
+    gateway: &SearchGateway,
+    request: &SearchRequest<'_>,
+    run_id: Option<&str>,
 ) -> Result<GatewayOutcome, String> {
     let client = Client::builder()
         .timeout(TIMEOUT)
@@ -155,10 +169,14 @@ pub(crate) fn search(
         .user_agent(concat!("neuron/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|error| error.to_string())?;
-    let response = client
+    let mut post = client
         .post(&gateway.endpoint)
         .bearer_auth(&gateway.token)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::CONTENT_TYPE, "application/json");
+    if let Some(run_id) = run_id {
+        post = post.header(RESEARCH_RUN_HEADER, run_id);
+    }
+    let response = post
         .body(serde_json::to_vec(request).map_err(|error| error.to_string())?)
         .send()
         .map_err(|error| format!("Web search through Zero-X failed: {error}"))?;
