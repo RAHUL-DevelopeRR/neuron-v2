@@ -31,6 +31,7 @@ import {
   type TurnOutcome,
 } from './neuron-engine-client'
 import { handleGitViewsEvent, resetGitViews } from './git-views'
+import { handleMcpPanelEvent, resetMcpPanel } from './mcp-panel'
 import { FEATURE_TRUST_PREVIEW } from './protocol'
 import { QUESTION_PREFIX } from './questions'
 import { engineSessionOf, withEngineSession } from './session-run-state'
@@ -208,6 +209,8 @@ export function recordEngineSessionInChat(status: StatusEvent): void {
 export function handleEngineEvent(event: UiEvent): void {
   // Changes, diffs, commit proposals and checkpoints (./git-views.ts).
   if (handleGitViewsEvent(event)) return
+  // The MCP servers panel, while open (./mcp-panel.ts).
+  if (handleMcpPanelEvent(event)) return
   const engine = useEngineStore.getState()
   switch (event.type) {
     case 'ready':
@@ -441,6 +444,7 @@ async function launchEngineSession(launch: EngineLaunchOptions): Promise<void> {
   const engine = useEngineStore.getState()
   engine.reset()
   resetGitViews()
+  resetMcpPanel()
   // No turn, unsettled tokens or task list of the last engine.
   resetLiveTurnStore()
   engine.setConnection('starting', null)

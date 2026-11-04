@@ -36,6 +36,8 @@ import { EngineFooter } from './components/engine-footer'
 import { ModelPicker } from './components/model-picker'
 import { PermissionPrompt } from './components/permission-prompt'
 import { RewindPicker } from './components/rewind-picker'
+import { McpPanel } from './components/mcp-panel'
+import { useMcpPanelStore } from './state/mcp-panel-store'
 import { SignInPanel } from './components/sign-in-panel'
 import { StatusBar } from './components/status-bar'
 import {
@@ -263,7 +265,12 @@ export const Chat = ({
       deferred: state.deferred,
     })),
   )
-  const gitPanelOpen = isGitPanelOpen(gitViews)
+  // `/mcp`: the MCP servers and their switches (state/mcp-panel-store.ts). It
+  // takes the keyboard like a git panel.
+  const mcpPanel = useMcpPanelStore(
+    useShallow((state) => ({ open: state.open, servers: state.servers, pending: state.pending })),
+  )
+  const gitPanelOpen = isGitPanelOpen(gitViews) || mcpPanel.open
 
   // Get loaded skills for slash commands (and the git ones the engine has)
   const loadedSkills = useMemo(() => getLoadedSkills(), [])
@@ -1403,6 +1410,13 @@ export const Chat = ({
         ) : gitViews.changesPanelOpen && !askUserState ? (
           <ChangesPanel
             files={gitViews.changes}
+            width={separatorWidth}
+            maxVisibleRows={isCompactHeight ? 4 : 8}
+          />
+        ) : mcpPanel.open && !askUserState ? (
+          <McpPanel
+            servers={mcpPanel.servers}
+            pending={mcpPanel.pending}
             width={separatorWidth}
             maxVisibleRows={isCompactHeight ? 4 : 8}
           />

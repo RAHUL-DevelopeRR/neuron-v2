@@ -132,8 +132,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "mcp",
         aliases: &[],
-        summary: "Inspect configured MCP servers",
-        argument_hint: Some("[list|show <server>|help]"),
+        summary: "Inspect configured MCP servers, or turn one on or off",
+        argument_hint: Some("[list|show <server>|enable <server>|disable <server>|help]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -1710,10 +1710,24 @@ fn parse_mcp_command(args: &[&str]) -> Result<SlashCommand, SlashCommandParseErr
             action: Some("help".to_string()),
             target: None,
         }),
-        [action, ..] => Err(command_error(
-            &format!("Unknown /mcp action '{action}'. Use list, show <server>, or help."),
+        [action @ ("enable" | "disable")] => {
+            Err(usage_error(&format!("mcp {action}"), "<server>"))
+        }
+        [action @ ("enable" | "disable"), target] => Ok(SlashCommand::Mcp {
+            action: Some((*action).to_string()),
+            target: Some((*target).to_string()),
+        }),
+        [action @ ("enable" | "disable"), ..] => Err(command_error(
+            &format!("Unexpected arguments for /mcp {action}."),
             "mcp",
-            "/mcp [list|show <server>|help]",
+            &format!("/mcp {action} <server>"),
+        )),
+        [action, ..] => Err(command_error(
+            &format!(
+                "Unknown /mcp action '{action}'. Use list, show <server>, enable <server>, disable <server>, or help."
+            ),
+            "mcp",
+            "/mcp [list|show <server>|enable <server>|disable <server>|help]",
         )),
     }
 }
@@ -2613,12 +2627,18 @@ fn render_mcp_report_for(
     match normalize_optional_args(args) {
         None | Some("list") => {
             let runtime_config = loader.load()?;
-            Ok(render_mcp_summary_report(
-                cwd,
-                runtime_config.mcp().servers(),
-            ))
+            let mut report = render_mcp_summary_report(cwd, runtime_config.mcp().servers());
+            for name in runtime_config.mcp().disabled().keys() {
+                report.push_str(&format!("\n  {name:<16} disabled"));
+            }
+            Ok(report)
         }
         Some(args) if is_help_arg(args) => Ok(render_mcp_usage(None)),
+        Some(args) if mcp_toggle_args(args).is_some() => {
+            let (name, enabled) = mcp_toggle_args(args).unwrap_or_default();
+            let outcome = runtime::set_mcp_server_enabled(loader, name, enabled);
+            Ok(render_mcp_toggle(&outcome, name, enabled))
+        }
         Some("show") => Ok(render_mcp_usage(Some("show"))),
         Some(args) if args.split_whitespace().next() == Some("show") => {
             let mut parts = args.split_whitespace();
@@ -2658,12 +2678,17 @@ fn render_mcp_report_json_for(
     match normalize_optional_args(args) {
         None | Some("list") => {
             let runtime_config = loader.load()?;
-            Ok(render_mcp_summary_report_json(
-                cwd,
-                runtime_config.mcp().servers(),
-            ))
+            let mut report = render_mcp_summary_report_json(cwd, runtime_config.mcp().servers());
+            report["disabled_servers"] =
+                json!(runtime_config.mcp().disabled().keys().collect::<Vec<_>>());
+            Ok(report)
         }
         Some(args) if is_help_arg(args) => Ok(render_mcp_usage_json(None)),
+        Some(args) if mcp_toggle_args(args).is_some() => {
+            let (name, enabled) = mcp_toggle_args(args).unwrap_or_default();
+            let outcome = runtime::set_mcp_server_enabled(loader, name, enabled);
+            Ok(render_mcp_toggle_json(&outcome, name, enabled))
+        }
         Some("show") => Ok(render_mcp_usage_json(Some("show"))),
         Some(args) if args.split_whitespace().next() == Some("show") => {
             let mut parts = args.split_whitespace();
@@ -3853,11 +3878,81 @@ fn render_skills_usage_json(unexpected: Option<&str>) -> Value {
     })
 }
 
+/// `enable <server>` / `disable <server>`: the server and whether to turn it on.
+fn mcp_toggle_args(args: &str) -> Option<(&str, bool)> {
+    match args.split_whitespace().collect::<Vec<_>>().as_slice() {
+        ["enable", name] => Some((name, true)),
+        ["disable", name] => Some((name, false)),
+        _ => None,
+    }
+}
+
+fn render_mcp_toggle(
+    outcome: &Result<runtime::McpToggleOutcome, String>,
+    name: &str,
+    enabled: bool,
+) -> String {
+    let state = if enabled { "enabled" } else { "disabled" };
+    match outcome {
+        Err(error) => format!("MCP\n  Error            {error}"),
+        Ok(outcome) => {
+            let mut lines = vec![
+                "MCP".to_string(),
+                if outcome.changed {
+                    format!("  {name} is now {state}")
+                } else {
+                    format!("  {name} was already {state} in the user settings")
+                },
+                format!("  Settings         {}", outcome.settings_path.display()),
+            ];
+            for path in &outcome.still_disabled_by {
+                lines.push(format!("  Still disabled by {}", path.display()));
+            }
+            lines.push("  Takes effect     from the next turn".to_string());
+            lines.join("\n")
+        }
+    }
+}
+
+fn render_mcp_toggle_json(
+    outcome: &Result<runtime::McpToggleOutcome, String>,
+    name: &str,
+    enabled: bool,
+) -> Value {
+    let action = if enabled { "enable" } else { "disable" };
+    match outcome {
+        Err(error) => json!({
+            "kind": "mcp",
+            "action": action,
+            "server": name,
+            "ok": false,
+            "error": error,
+        }),
+        Ok(outcome) => json!({
+            "kind": "mcp",
+            "action": action,
+            "server": name,
+            "ok": true,
+            "enabled": enabled && outcome.still_disabled_by.is_empty(),
+            "changed": outcome.changed,
+            "settings_path": outcome.settings_path.display().to_string(),
+            "still_disabled_by": outcome
+                .still_disabled_by
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>(),
+        }),
+    }
+}
+
 fn render_mcp_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "MCP".to_string(),
-        "  Usage            /mcp [list|show <server>|help]".to_string(),
-        "  Direct CLI       neuron mcp [list|show <server>|help]".to_string(),
+        "  Usage            /mcp [list|show <server>|enable <server>|disable <server>|help]"
+            .to_string(),
+        "  Direct CLI       neuron mcp [list|show <server>|enable <server>|disable <server>|login <server>|logout <server>|help]"
+            .to_string(),
+        "  Switches         enable/disable edit disabledMcpServers in the user settings".to_string(),
         "  Sources          .claw/settings.json, .claw/settings.local.json".to_string(),
     ];
     if let Some(args) = unexpected {
@@ -3871,8 +3966,8 @@ fn render_mcp_usage_json(unexpected: Option<&str>) -> Value {
         "kind": "mcp",
         "action": "help",
         "usage": {
-            "slash_command": "/mcp [list|show <server>|help]",
-            "direct_cli": "neuron mcp [list|show <server>|help]",
+            "slash_command": "/mcp [list|show <server>|enable <server>|disable <server>|help]",
+            "direct_cli": "neuron mcp [list|show <server>|enable <server>|disable <server>|login <server>|logout <server>|help]",
             "sources": [".claw/settings.json", ".claw/settings.local.json"],
         },
         "unexpected": unexpected,
@@ -4466,6 +4561,22 @@ mod tests {
                 target: Some("remote".to_string())
             }))
         );
+        assert_eq!(
+            SlashCommand::parse("/mcp disable remote"),
+            Ok(Some(SlashCommand::Mcp {
+                action: Some("disable".to_string()),
+                target: Some("remote".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/mcp enable remote"),
+            Ok(Some(SlashCommand::Mcp {
+                action: Some("enable".to_string()),
+                target: Some("remote".to_string())
+            }))
+        );
+        assert!(SlashCommand::parse("/mcp enable").is_err());
+        assert!(SlashCommand::parse("/mcp disable a b").is_err());
         assert_eq!(
             SlashCommand::parse("/memory"),
             Ok(Some(SlashCommand::Memory))

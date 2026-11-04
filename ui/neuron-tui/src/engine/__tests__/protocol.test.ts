@@ -173,6 +173,7 @@ const STRUCT_FIELDS: Record<string, string[]> = {
     'status',
     'tools',
     'error',
+    'enabled',
   ]),
   PluginInfo: fieldsOf<PluginInfo>()([
     'id',

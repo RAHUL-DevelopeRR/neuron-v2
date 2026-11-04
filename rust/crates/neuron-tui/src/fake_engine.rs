@@ -110,6 +110,7 @@ fn run(
             | EngineCommand::Resume { .. }
             | EngineCommand::TrustWorkspace
             | EngineCommand::ListExtensions
+            | EngineCommand::SetMcpServerEnabled { .. }
             | EngineCommand::TrustPreview
             | EngineCommand::RefreshAccount
             | EngineCommand::Commit { .. }
@@ -168,6 +169,7 @@ pub mod samples {
             | EngineCommand::Answer { .. }
             | EngineCommand::Resume { .. }
             | EngineCommand::ListExtensions
+            | EngineCommand::SetMcpServerEnabled { .. }
             | EngineCommand::Commit { .. }
             | EngineCommand::Rewind { .. } => Vec::new(),
         }
