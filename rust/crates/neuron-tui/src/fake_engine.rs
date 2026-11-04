@@ -282,6 +282,7 @@ pub mod samples {
             account: None,
             supports_images: Some(false),
             served_model: None,
+            served_model_display_name: None,
             provider: Some("cloudflare".into()),
             model_display_name: Some("GLM 5.2".into()),
             reasoning_effort: Some("high".into()),

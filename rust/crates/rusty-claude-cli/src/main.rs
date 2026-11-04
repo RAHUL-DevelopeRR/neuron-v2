@@ -2670,7 +2670,8 @@ impl LiveCli {
                 .collect::<String>();
             format!("{kept}...")
         };
-        let model_short = self.model.split('/').last().unwrap_or(&self.model);
+        // The model's name, without the gateway's route to it (`/status` has the id).
+        let model_short = crate::gateway_catalog::model_name(&self.model);
         let active = provider::active_provider();
         let provider = active.as_ref().map_or_else(
             || provider::active_provider_name(&self.model),
@@ -2814,7 +2815,7 @@ impl LiveCli {
         let inner = w_left - 2;
         let model_info = format!(
             "{g}{ms}{r} {d}.{r} {b}{prov}{r} {d}. Plan: {qs}{r}",
-            ms = model_short,
+            ms = model_short.as_str(),
             prov = provider,
             qs = quota_str
         );
@@ -2823,7 +2824,7 @@ impl LiveCli {
         } else {
             let rest = format!("{provider} . Plan: {quota_str}");
             vec![
-                format!("{g}{}{r}", fit(model_short, inner)),
+                format!("{g}{}{r}", fit(&model_short, inner)),
                 if rest.chars().count() <= inner {
                     format!("{b}{provider}{r} {d}. Plan: {quota_str}{r}")
                 } else {
@@ -7453,6 +7454,19 @@ mod tests {
         assert!(report.contains("Previous         claude-sonnet"));
         assert!(report.contains("Current          claude-opus"));
         assert!(report.contains("Preserved msgs   9"));
+
+        // Gateway models by name, never by the route to them.
+        let report =
+            format_model_switch_report("openai/auto", "openai/unit-maker/unit-flash:free", 2);
+        assert!(report.contains("Previous         Auto\n"), "{report}");
+        assert!(report.contains("Current          unit-flash\n"), "{report}");
+        assert!(!report.contains(":free"), "{report}");
+        let line = format_connected_line("openai/unit-maker/unit-flash:free");
+        assert!(line.contains("unit-flash"), "{line}");
+        assert!(
+            !line.contains("unit-maker/") && !line.contains(":free"),
+            "{line}"
+        );
     }
 
     #[test]

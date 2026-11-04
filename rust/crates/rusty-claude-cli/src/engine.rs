@@ -569,6 +569,9 @@ fn status_event(
 ) -> UiEvent {
     let cwd = env::current_dir().unwrap_or_default();
     let shown = shown_model(model);
+    let served = served_model
+        .map(shown_model)
+        .filter(|served| *served != shown);
     UiEvent::Status {
         model: shown.to_string(),
         permission_mode: permission_mode.as_str().to_string(),
@@ -582,10 +585,8 @@ fn status_event(
         sign_in_required,
         account: account.info.clone(),
         supports_images: crate::gateway_catalog::model_supports_images(model),
-        served_model: served_model
-            .map(shown_model)
-            .filter(|served| *served != shown)
-            .map(ToString::to_string),
+        served_model: served.map(ToString::to_string),
+        served_model_display_name: served.map(crate::gateway_catalog::model_name),
         provider: bar.model.provider,
         model_display_name: bar.model.display_name,
         reasoning_effort: bar.reasoning_effort,
@@ -2819,9 +2820,10 @@ fn parse_rewind_mode(mode: &str) -> Result<RewindMode, String> {
 mod tests {
     use super::{
         definitions, forward_commands, git_status, mcp_server_status, plain_notice,
-        question_notice, shorten, shorten_json_strings, spawn, transcript_event, EngineExit,
-        EngineHandle, EngineOptions, McpRuntimeView, RunningTurn, Shared,
+        question_notice, shorten, shorten_json_strings, spawn, status_event, transcript_event,
+        AccountState, EngineExit, EngineHandle, EngineOptions, McpRuntimeView, RunningTurn, Shared,
     };
+    use crate::engine_status_bar::StatusBarFields;
     use crate::repl_loop::InterruptPresses;
     use crate::tests::{env_lock, with_current_dir};
     use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
@@ -3042,6 +3044,52 @@ mod tests {
             }
         }
         contents
+    }
+
+    /// The status names the model that answered by name, never by the gateway's route to
+    /// it; the raw id stays beside it.
+    #[test]
+    fn the_status_names_the_served_model_without_its_route() {
+        let status = |served: Option<&str>| {
+            status_event(
+                "openai/auto",
+                PermissionMode::WorkspaceWrite,
+                "s",
+                false,
+                0,
+                &AccountState::default(),
+                false,
+                served,
+                StatusBarFields::default(),
+            )
+        };
+        match status(Some("openai/unit-maker/unit-flash:free")) {
+            UiEvent::Status {
+                model,
+                served_model,
+                served_model_display_name,
+                ..
+            } => {
+                assert_eq!(model, "auto");
+                assert_eq!(served_model.as_deref(), Some("unit-maker/unit-flash:free"));
+                assert_eq!(served_model_display_name.as_deref(), Some("unit-flash"));
+            }
+            other => panic!("not a status: {other:?}"),
+        }
+        // Nothing to name when `auto` itself (or nothing yet) answered.
+        for served in [None, Some("openai/auto")] {
+            match status(served) {
+                UiEvent::Status {
+                    served_model,
+                    served_model_display_name,
+                    ..
+                } => {
+                    assert_eq!(served_model, None);
+                    assert_eq!(served_model_display_name, None);
+                }
+                other => panic!("not a status: {other:?}"),
+            }
+        }
     }
 
     #[test]

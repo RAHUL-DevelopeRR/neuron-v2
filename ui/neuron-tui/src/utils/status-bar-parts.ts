@@ -5,7 +5,8 @@
  *
  *   G Gemini 2.5 Flash ▾ │ ◑ think high │ ⌂ neuron-v2 ⎇ main +1 ~2 │ ✎ Edit workspace │ ●●●◑○○○○○○ 35% ctx      Free · 5h 12% · 37/100 req
  *
- * Segments, left to right: the model (provider monogram and name), the
+ * Segments, left to right: the model (its maker's monogram and its name,
+ * never the route the gateway takes to it: utils/model-name.ts), the
  * thinking level, the workspace folder and git branch, the permission mode
  * and the context meter; on the right, the Zero-X plan and its usage. Each
  * segment opens its picker when clicked (`target`).
@@ -23,7 +24,8 @@ import stringWidth from 'string-width'
 import { meterCells, meterTone, displayPercent } from '../components/context-meter'
 import { needsSignIn } from '../state/engine-store'
 import { contextUsage } from './context-breakdown'
-import { inferProvider, providerBadge } from './provider-badge'
+import { cleanModelName, isAutoModel, modelMaker } from './model-name'
+import { providerBadge } from './provider-badge'
 
 import type { GlyphMode } from './glyphs'
 import type {
@@ -299,13 +301,20 @@ export function statusView({
   if (!status) return null
   const glyphs = statusGlyphs(mode)
   const model = catalogModel(models, status.model)
-  const provider = status.provider ?? model?.provider ?? inferProvider(status.model)
-  const name = status.model_display_name ?? model?.display_name ?? status.model
+  const provider = status.provider ?? model?.provider ?? null
+  const name = cleanModelName(status.model, status.model_display_name ?? model?.display_name, provider)
   const served = status.served_model
+  const servedModel = served ? catalogModel(models, served) : null
   const servedName =
     served && served !== status.model
-      ? (catalogModel(models, served)?.display_name ?? served)
+      ? cleanModelName(
+          served,
+          status.served_model_display_name ?? servedModel?.display_name,
+          servedModel?.provider,
+        )
       : null
+  // `auto` is Zero-X's router: its mark, whichever model answered.
+  const maker = isAutoModel(status.model) ? 'zero-x' : modelMaker(status.model, provider)
   const health = model?.status
   const efforts = reasoningEffortsOf(status, model)
   const usage = contextUsage(status)
@@ -331,7 +340,7 @@ export function statusView({
 
   return {
     model: {
-      badge: providerBadge(provider, mode),
+      badge: providerBadge(maker, mode),
       badgeTone: health === 'degraded' || health === 'busy' ? 'warning' : 'primary',
       name: servedName ? `${name} → ${servedName}` : name,
       pickable: (models?.models.length ?? 0) > 0,

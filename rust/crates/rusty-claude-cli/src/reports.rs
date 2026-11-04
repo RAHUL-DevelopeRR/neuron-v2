@@ -40,10 +40,12 @@ Usage
     )
 }
 
+/// `/model <id>`'s report: the models by name, without the gateway's route to them
+/// (`/status` has the id).
 pub fn format_model_switch_report(previous: &str, next: &str, message_count: usize) -> String {
     let (previous, next) = (
-        crate::provider::shown_model(previous),
-        crate::provider::shown_model(next),
+        crate::gateway_catalog::model_name(previous),
+        crate::gateway_catalog::model_name(next),
     );
     format!(
         "Model updated

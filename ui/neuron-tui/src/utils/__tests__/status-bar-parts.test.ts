@@ -6,7 +6,8 @@ import {
   STATUS_BAR_MODELS,
   STATUS_BAR_STATUS,
 } from '../../testing/status-bar-fixtures'
-import { inferProvider, providerBadge } from '../provider-badge'
+import { modelMaker } from '../model-name'
+import { providerBadge } from '../provider-badge'
 import {
   effortLabel,
   folderName,
@@ -154,7 +155,52 @@ describe('segments', () => {
 
   test('a locked model says so', () => {
     const text = render(input({ model: 'glm-5.2', model_display_name: null, provider: null }), 200)
-    expect(text.startsWith('CF GLM 5.2 (locked) ▾')).toBe(true)
+    // Its maker's monogram (Zhipu's GLM), not the route's (Cloudflare).
+    expect(text.startsWith('Z GLM 5.2 (locked) ▾')).toBe(true)
+  })
+
+  test('names leave out the gateway’s route; auto names the model that answered', () => {
+    const routed = render(
+      input({
+        model: 'cohere/north-mini-code:free',
+        provider: 'openrouter',
+        model_display_name: 'North Mini Code (OpenRouter, free)',
+      }),
+      200,
+    )
+    expect(routed.startsWith('C North Mini Code ▾')).toBe(true)
+    expect(routed).not.toMatch(/openrouter|:free|cohere\//i)
+
+    // An older engine: the served model's catalog name, cleaned here.
+    const models = {
+      ...STATUS_BAR_MODELS,
+      models: [
+        ...STATUS_BAR_MODELS.models,
+        {
+          ...STATUS_BAR_MODELS.models[1]!,
+          id: 'groq/openai/gpt-oss-120b',
+          display_name: 'GPT-OSS 120B (Groq)',
+          provider: 'groq',
+        },
+      ],
+    }
+    const auto = render(
+      input(
+        { model: 'auto', provider: 'zero-x', model_display_name: 'Auto (best available model)', served_model: 'groq/openai/gpt-oss-120b' },
+        'unicode',
+        { models },
+      ),
+      200,
+    )
+    expect(auto.startsWith('◇ Auto → GPT-OSS 120B ▾')).toBe(true)
+    // A newer engine names it; without a catalog entry, the model part of the id.
+    const named = render(
+      input({ model: 'auto', served_model: 'x/glm-4.7-flash', served_model_display_name: 'GLM-4.7 Flash' }),
+      200,
+    )
+    expect(named.startsWith('◇ Auto → GLM-4.7 Flash ▾')).toBe(true)
+    const bare = render(input({ model: 'auto', served_model: 'cohere/north-mini-code:free' }), 200)
+    expect(bare.startsWith('◇ Auto → north-mini-code ▾')).toBe(true)
   })
 
   test('no part names the provider, only its monogram', () => {
@@ -170,17 +216,27 @@ describe('segments', () => {
 })
 
 describe('helpers', () => {
-  test('monograms by provider, read from the model id when the engine does not say', () => {
-    expect(providerBadge('gemini', 'unicode')).toBe('G')
+  test('monograms by who made the model, never the route to it', () => {
+    expect(providerBadge('google', 'unicode')).toBe('G')
     expect(providerBadge('zero-x', 'unicode')).toBe('◇')
     expect(providerBadge('zero-x', 'console')).toBe('*')
     expect(providerBadge('someone', 'unicode')).toBe('•')
     expect(providerBadge(null, 'console')).toBe('.')
-    expect(inferProvider('auto')).toBe('zero-x')
-    expect(inferProvider('openai/gpt-5')).toBe('openai')
-    expect(inferProvider('claude-sonnet-4-6')).toBe('anthropic')
-    expect(inferProvider('@cf/meta/llama')).toBe('cloudflare')
-    expect(inferProvider('glm-5.2')).toBeNull()
+    // The routes that resell other makers' models have none.
+    for (const route of ['groq', 'openrouter', 'cloudflare', 'workers-ai', 'nim']) {
+      expect(providerBadge(route, 'unicode')).toBe('•')
+    }
+    expect(modelMaker('auto')).toBe('zero-x')
+    expect(modelMaker('openai/gpt-5')).toBe('openai')
+    expect(modelMaker('claude-sonnet-4-6')).toBe('anthropic')
+    expect(modelMaker('@cf/meta/llama-3.3-70b-instruct-fp8-fast', 'cloudflare')).toBe('meta')
+    expect(modelMaker('groq/openai/gpt-oss-120b', 'groq')).toBe('openai')
+    expect(modelMaker('nvidia/stepfun-ai/step-5-preview', 'nvidia')).toBe('stepfun')
+    expect(modelMaker('nvidia/nvidia/nemotron-3-ultra-550b-a55b', 'nvidia')).toBe('nvidia')
+    expect(modelMaker('cohere/north-mini-code:free', 'openrouter')).toBe('cohere')
+    expect(modelMaker('glm-5.2', 'cloudflare')).toBe('zhipu')
+    expect(modelMaker('mystery-model', 'openrouter')).toBeNull()
+    expect(modelMaker('mystery-model', 'acme')).toBe('acme')
   })
 
   test('thinking levels come from the status, then the catalog, then the default ladder', () => {
