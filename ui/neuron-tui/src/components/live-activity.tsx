@@ -15,7 +15,6 @@ import {
   describeLiveActivity,
   liveOutputTokens,
   liveTurnNow,
-  STALL_AFTER_MS,
 } from '../engine/live-turn'
 import { useTheme } from '../hooks/use-theme'
 import { useEngineStore } from '../state/engine-store'
@@ -65,7 +64,7 @@ export function useLiveClock(): number {
 /**
  * The live turn as the status line decides when to draw it. Every token
  * moves `lastTokenAt`, which only matters once the stream has been silent for
- * {@link STALL_AFTER_MS}: here it is kept to the whole second after it, so
+ * STALL_AFTER_MS (engine/live-turn.ts): here it is kept to the whole second after it, so
  * the line is drawn again when what it says can change (a new call, the
  * stream turning from thinking to responding), not for every token. The live
  * clock's tick draws it again each second anyway.
