@@ -943,7 +943,7 @@ impl PermissionPolicy {
             &target.input,
             context,
             floor,
-            Some(wrapper),
+            Some(&wrapper),
             prompter,
         )
     }
@@ -957,7 +957,7 @@ impl PermissionPolicy {
         input: &str,
         context: &PermissionContext,
         floor: Option<PermissionMode>,
-        wrapper: Option<WrapperRules<'_>>,
+        wrapper: Option<&WrapperRules<'_>>,
         prompter: Option<&mut dyn PermissionPrompter>,
     ) -> PermissionOutcome {
         if let Some(rule) =
@@ -988,8 +988,8 @@ impl PermissionPolicy {
         let required_mode = assessment.required_mode;
         let ask_rule = self
             .find_matching_rule(&self.ask_rules, RuleKind::Ask, tool_name, input)
-            .or(wrapper.as_ref().and_then(|wrapper| wrapper.ask));
-        let wrapper_allowed = wrapper.as_ref().is_some_and(|wrapper| wrapper.allowed);
+            .or(wrapper.and_then(|wrapper| wrapper.ask));
+        let wrapper_allowed = wrapper.is_some_and(|wrapper| wrapper.allowed);
         let session_rules = self.session.allow_rules();
         let allowed_by_rule = wrapper_allowed
             || if session_rules.is_empty() {
