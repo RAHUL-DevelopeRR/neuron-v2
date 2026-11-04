@@ -189,15 +189,17 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "pr",
         aliases: &[],
-        summary: "Draft or create a pull request from the conversation",
-        argument_hint: Some("[context]"),
+        summary:
+            "Draft a pull request from the branch's commits; /pr create pushes and opens it with gh",
+        argument_hint: Some("[create [--draft]] [--base <branch>] [context]"),
         resume_supported: false,
     },
     SlashCommandSpec {
         name: "issue",
         aliases: &[],
-        summary: "Draft or create a GitHub issue from the conversation",
-        argument_hint: Some("[context]"),
+        summary:
+            "Draft a GitHub issue from a title and the conversation; /issue create opens it with gh",
+        argument_hint: Some("[<title>|create]"),
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -5149,8 +5151,9 @@ mod tests {
         assert!(help.contains("/compact"));
         assert!(help.contains("/bughunter [scope]"));
         assert!(help.contains("/commit"));
-        assert!(help.contains("/pr [context]"));
-        assert!(help.contains("/issue [context]"));
+        assert!(help.contains("/pr [create [--draft]] [--base <branch>] [context]"));
+        assert!(help.contains("/pr create pushes and opens it with gh"));
+        assert!(help.contains("/issue [<title>|create]"));
         assert!(help.contains("/ultraplan [task]"));
         assert!(help.contains("/teleport <symbol-or-path>"));
         assert!(help.contains("/debug-tool-call"));

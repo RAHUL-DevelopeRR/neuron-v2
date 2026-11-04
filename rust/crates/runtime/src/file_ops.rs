@@ -1242,7 +1242,7 @@ pub fn is_blank_search_path(path: &str) -> bool {
 fn search_base(path: Option<&str>) -> io::Result<PathBuf> {
     match path.filter(|path| !is_blank_search_path(path)) {
         Some(path) => normalize_path(path),
-        None => std::env::current_dir(),
+        None => crate::workdir::current_dir(),
     }
 }
 
@@ -1250,10 +1250,10 @@ fn normalize_path(path: &str) -> io::Result<PathBuf> {
     let candidate = if Path::new(path).is_absolute() {
         PathBuf::from(path)
     } else {
-        std::env::current_dir()?.join(path)
+        crate::workdir::current_dir()?.join(path)
     };
     match candidate.canonicalize() {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => std::env::current_dir()
+        Err(error) if error.kind() == io::ErrorKind::NotFound => crate::workdir::current_dir()
             .ok()
             .and_then(|cwd| recover_mistyped_path(&candidate, &cwd))
             .ok_or(error),
@@ -1339,7 +1339,7 @@ fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
     let candidate = if Path::new(path).is_absolute() {
         PathBuf::from(path)
     } else {
-        std::env::current_dir()?.join(path)
+        crate::workdir::current_dir()?.join(path)
     };
 
     let mut ancestor = candidate.as_path();

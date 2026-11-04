@@ -62,6 +62,7 @@ mod full_screen;
 mod gateway_catalog;
 mod gateway_http;
 mod gateway_repl;
+mod github_actions;
 mod headless;
 mod init;
 mod input;
@@ -3400,11 +3401,11 @@ impl LiveCli {
                 false
             }
             SlashCommand::Pr { context } => {
-                self.run_pr(context.as_deref())?;
+                self.run_github(github_actions::GithubKind::PullRequest, context.as_deref())?;
                 false
             }
             SlashCommand::Issue { context } => {
-                self.run_issue(context.as_deref())?;
+                self.run_github(github_actions::GithubKind::Issue, context.as_deref())?;
                 false
             }
             SlashCommand::Ultraplan { task } => {
@@ -4366,15 +4367,19 @@ impl LiveCli {
         Ok(())
     }
 
-    fn run_pr(&self, context: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-        let branch =
-            resolve_git_branch_for(&env::current_dir()?).unwrap_or_else(|| "unknown".to_string());
-        println!("{}", format_pr_report(&branch, context));
-        Ok(())
-    }
-
-    fn run_issue(&self, context: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-        println!("{}", format_issue_report(context));
+    /// `/pr …` and `/issue …`: drafts, or opens the shown draft with `gh`
+    /// (`github_actions`).
+    fn run_github(
+        &self,
+        kind: github_actions::GithubKind,
+        args: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let text = self.github_command(
+            kind,
+            args.unwrap_or_default(),
+            &runtime::CancellationToken::new(),
+        )?;
+        println!("{text}");
         Ok(())
     }
 }
@@ -5232,16 +5237,16 @@ mod tests {
         create_managed_session_handle, describe_tool_progress, filter_tool_specs,
         format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
         format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
-        format_internal_prompt_progress_line, format_issue_report, format_model_report,
-        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
-        format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
-        format_tool_result, format_ultraplan_report, format_unknown_slash_command,
-        format_unknown_slash_command_message, format_user_visible_api_error,
-        mcp_servers_without_bundled, merge_prompt_with_stdin, normalize_permission_mode,
-        parse_args, parse_export_args, parse_git_status_branch, parse_git_status_metadata_for,
-        parse_git_workspace_summary, parse_history_count, permission_policy, print_help_to,
-        push_output_block, render_config_report, render_diff_report, render_diff_report_for,
-        render_memory_report, render_prompt_history_report, render_repl_help, render_resume_usage,
+        format_internal_prompt_progress_line, format_model_report, format_model_switch_report,
+        format_permissions_report, format_permissions_switch_report, format_resume_report,
+        format_status_report, format_tool_call_start, format_tool_result, format_ultraplan_report,
+        format_unknown_slash_command, format_unknown_slash_command_message,
+        format_user_visible_api_error, mcp_servers_without_bundled, merge_prompt_with_stdin,
+        normalize_permission_mode, parse_args, parse_export_args, parse_git_status_branch,
+        parse_git_status_metadata_for, parse_git_workspace_summary, parse_history_count,
+        permission_policy, print_help_to, push_output_block, render_config_report,
+        render_diff_report, render_diff_report_for, render_memory_report,
+        render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, render_version_report, resolve_model_alias,
         resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
         response_to_events, resume_safe_slash_command, resume_supported_slash_commands,
@@ -7890,14 +7895,6 @@ mod tests {
         let ultraplan = format_ultraplan_report(Some("ship the release"));
         assert!(ultraplan.contains("Task             ship the release"));
         assert!(ultraplan.contains("break work into a multi-step execution plan"));
-
-        let pr = format_pr_report("feature/ux", Some("ready for review"));
-        assert!(pr.contains("Branch           feature/ux"));
-        assert!(pr.contains("draft or create a pull request"));
-
-        let issue = format_issue_report(Some("flaky test"));
-        assert!(issue.contains("Context          flaky test"));
-        assert!(issue.contains("draft or create a GitHub issue"));
     }
 
     #[test]

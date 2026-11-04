@@ -196,7 +196,7 @@ pub fn execute_bash_with_cancel(
     input: &BashCommandInput,
     cancel: &CancellationToken,
 ) -> io::Result<BashCommandOutput> {
-    let cwd = env::current_dir()?;
+    let cwd = crate::workdir::current_dir()?;
     let sandbox_status = sandbox_status_for_input(input, &cwd);
 
     if input.run_in_background.unwrap_or(false) {
