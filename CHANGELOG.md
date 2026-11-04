@@ -55,12 +55,17 @@ The release workflow copies a version's section into its GitHub release notes.
   in the workspace (`npm install`, `npm run dev`, `npx`, `node`, `cargo build`/`test`,
   `python -m`, `pip`/`uv` installs, `go build`/`test`, `make`, ...) run without asking,
   each part of a `&&`/`|` line judged on its own; sudo, global installs, `curl | sh`,
-  paths or writes outside the workspace and `git push` still ask. The approval says a
-  command is outside the auto-allow list instead of asking for full access.
-- Permission prompts offer "always allow in this project" (`p`), which saves the
-  covering `permissions.allow` rules to `.neuron/settings.local.json`, and "deny for
-  this session" (`d`), after which the same command prefix is refused without asking.
-  A denied model is told plainly not to retry the command or a variant.
+  paths or writes outside the workspace and `git push` still ask, and so do inline
+  code (`node -e`, `python -c`, `echo ... | node`), wrappers that start a program off
+  the list (`uv run git push`, `pnpm exec ...`) and writes into `.git`, Neuron settings
+  or package-manager configuration such as `.npmrc`. The approval says a command is
+  outside the auto-allow list instead of asking for full access.
+- Permission prompts offer "always allow in this project" (`p`), which saves a rule as
+  wide as the session choice (`bash(cargo install:*)`) to `.neuron/settings.local.json`
+  and is not offered for `sudo`, `... | sh` or a `cd` out of the workspace, and "deny
+  for this session" (`d`), after which commands that would ask and start with the same
+  prefix are refused without asking. A denied model is told plainly not to retry the
+  command or a variant.
 
 ## 7.0.0-alpha.3 (2026-11-02)
 

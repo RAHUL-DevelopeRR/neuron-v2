@@ -221,18 +221,30 @@ that points outside it or changes where packages install (`NPM_CONFIG_*`, `PIP_*
 `PATH`, `HOME`, ...), a global install (`-g`, `--global`, `pip --user`,
 `--break-system-packages`, `cargo install`, `go install`, `uv tool`, `make install`),
 or a command that changes a registry or your account (`npm publish`, `cargo publish`,
-`npm login`). `sudo`, `curl ... | sh` and `git push` are never on the list.
+`npm login`). `sudo`, `curl ... | sh` and `git push` are never on the list. Neither is
+code given on the command line or through standard input rather than in a workspace
+file (`node -e`, `node -p`, `python -c`, `bun -e`, `deno eval`, `echo ... | node`,
+`npx -c`, `make --eval`, `NODE_OPTIONS=--import=data:...`), nor a wrapper that starts a
+program off the list (`uv run git push`, `pnpm exec git push`, `bun exec`, `go build
+-exec`). Option values after `=` count as paths (`go build -o=/usr/local/bin/x` asks),
+and so do build outputs and redirections into `.git`, Neuron settings or package-manager
+configuration (`.npmrc`, `.yarnrc*`, `.cargo/config.toml`, `pip.conf`, `bunfig.toml`);
+writing those files with the file tools asks too.
 `NODE_ENV=production npm run build > build.log 2>&1` runs; read-only mode still refuses
 all of them.
 
 When Neuron asks, it shows the tool, the reason and the input. Answer `y` to run the
 call once; `a` to allow its command prefix (`npm publish`, `docker compose`) for the
-rest of the session; `p` ("always allow in this project") to run it and save the
-`permissions.allow` rules that cover it to the project's `.neuron/settings.local.json`,
-so it runs without asking from now on (like any workspace settings, they apply once you
-trust the workspace; until then, for the rest of the session); `n` to deny it; `d` to
-deny it for the rest of the session, so the same command prefix (or, when there is no
-prefix, this exact call) is refused without asking again; `e` (full-screen UI) to deny
+rest of the session; `p` ("always allow in this project") to run it and save a rule
+for that same prefix (`bash(cargo install:*)`, not all of `cargo`) to the project's
+`.neuron/settings.local.json`, so it runs without asking from now on (like any workspace
+settings, they apply once you trust the workspace; until then, for the rest of the
+session). `p` is not offered for `sudo`, a shell at the end of a pipe (`curl ... | sh`),
+`xargs`, `eval` or a `cd` out of the workspace. `n` denies it; `d` denies it for the
+rest of the session: later commands whose asking part starts with the same prefix
+(`git push`), or, when there is none, this exact call, are refused without asking again.
+Commands that run without asking in `workspace-write` are not affected, and a `cd` is
+never remembered as a prefix. `e` (full-screen UI) denies
 it with a note for the model. A denied model is told plainly not to retry the command
 or a variant. When standard output is redirected, the question goes to standard error.
 When standard output and standard error are both redirected, nobody would see the
