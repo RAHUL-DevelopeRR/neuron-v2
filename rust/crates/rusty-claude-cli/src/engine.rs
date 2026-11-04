@@ -1377,7 +1377,7 @@ fn question_notice(question: &UserQuestion) -> String {
 }
 
 /// The tokens counted between two session totals.
-fn usage_since(before: TokenUsage, after: TokenUsage) -> TokenUsage {
+pub(crate) fn usage_since(before: TokenUsage, after: TokenUsage) -> TokenUsage {
     TokenUsage {
         input_tokens: after.input_tokens.saturating_sub(before.input_tokens),
         output_tokens: after.output_tokens.saturating_sub(before.output_tokens),

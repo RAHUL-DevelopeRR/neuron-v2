@@ -268,7 +268,8 @@ interactively.
 (`echo "now add tests" | neuron --resume latest -p`). With `--output-format json` its
 stdout is the turn's JSON answer, as for `neuron prompt`, and its `session_id` is the
 session's id: a script can continue the session it started by id rather than as
-`latest`, which another run may have changed. `--model`, `--permission-mode`,
+`latest`, which another run may have changed. Its `usage` and `estimated_cost` are that
+run's alone; `session_usage` is the session's total, earlier runs included. `--model`, `--permission-mode`,
 `--allowedTools`, `--reasoning-effort` and the other launch flags go before `prompt` or
 `-p`, before or after `--resume`; without `--model` the turn runs on the model the
 session used. Everything after `-p` is the prompt, so a flag such as `--model` or

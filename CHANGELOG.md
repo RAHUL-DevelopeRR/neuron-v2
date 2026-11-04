@@ -31,6 +31,8 @@ The release workflow copies a version's section into its GitHub release notes.
   kept in `~/.neuroncli/locks` (under `NEURON_HOME` if set), and a file that is not a
   session is refused before it is locked. A `.jsonl.lock` an older release is holding
   is still honoured for this release.
+- `--output-format json` for `--resume <session> -p` reports that run's `usage` and
+  `estimated_cost` instead of the session's totals, which are in a new `session_usage`.
 
 ## 7.0.0-alpha.3 (2026-11-02)
 

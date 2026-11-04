@@ -3118,6 +3118,9 @@ impl LiveCli {
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let before = self.runtime.session().messages.len();
+        // The tracker starts from a resumed session's saved totals: this run's usage is
+        // what it added to them.
+        let usage_before = self.runtime.usage().cumulative_usage();
         let summary = match self.run_one_shot_turn(input) {
             Ok(summary) => summary,
             Err(error) => {
@@ -3140,6 +3143,7 @@ impl LiveCli {
             println!("{answer}");
             return Ok(());
         }
+        let usage = engine::usage_since(usage_before, summary.usage);
         println!(
             "{}",
             json!({
@@ -3161,17 +3165,24 @@ impl LiveCli {
                 "tool_uses": collect_tool_uses(&summary),
                 "tool_results": collect_tool_results(&summary),
                 "prompt_cache_events": collect_prompt_cache_events(&summary),
+                // This run's tokens; `session_usage` adds the turns a resumed session
+                // had before it.
                 "usage": {
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                    "cache_read_input_tokens": usage.cache_read_input_tokens,
+                },
+                "session_usage": {
                     "input_tokens": summary.usage.input_tokens,
                     "output_tokens": summary.usage.output_tokens,
                     "cache_creation_input_tokens": summary.usage.cache_creation_input_tokens,
                     "cache_read_input_tokens": summary.usage.cache_read_input_tokens,
                 },
-                // Gateway and other non-Claude models have no price list here: 0, and
-                // `estimated_cost_known` says the estimate is missing, not free.
+                // This run's cost. Gateway and other non-Claude models have no price list
+                // here: 0, and `estimated_cost_known` says the estimate is missing, not free.
                 "estimated_cost": format_usd(
-                    summary
-                        .usage
+                    usage
                         .estimate_cost_usd_for_model(&self.model)
                         .map_or(0.0, runtime::UsageCostEstimate::total_cost_usd)
                 ),
