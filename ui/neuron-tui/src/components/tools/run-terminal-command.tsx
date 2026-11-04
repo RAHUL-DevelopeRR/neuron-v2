@@ -1,9 +1,10 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: output
 // that is itself JSON (`echo 42`, `cat package.json`) is shown as printed, not
 // read as an empty result envelope; the command shows while the model writes
-// it, then "Running…" until its result. See ui/neuron-tui/PORTING.md.
+// it, then "Running…" with the last lines it printed so far until its result. See ui/neuron-tui/PORTING.md.
 import { sanitizeTerminalOutput } from '@neuron-tui/common/util/terminal-safe-text'
 
+import { liveOutputTail } from '../../engine/live-tool-blocks'
 import { defineToolComponent } from './types'
 import { TerminalCommandDisplay } from '../terminal-command-display'
 
@@ -56,6 +57,9 @@ export const parseTerminalOutput = (rawOutput: string | undefined): ParsedTermin
   }
 }
 
+/** How many of a running command's last lines the cell shows. */
+export const LIVE_OUTPUT_LINES = 5
+
 /**
  * UI component for run_terminal_command tool.
  * Displays the command in bold next to the bullet point,
@@ -77,7 +81,19 @@ export const RunTerminalCommandComponent = defineToolComponent({
     const timeoutSeconds = typeof input?.timeout_seconds === 'number' ? input.timeout_seconds : undefined
 
     // Extract output and startingCwd from tool result
-    const { output, startingCwd } = parseTerminalOutput(toolBlock.output)
+    const parsed = parseTerminalOutput(toolBlock.output)
+    const { startingCwd } = parsed
+    // Still running: the last lines it printed so far, then the result.
+    const running =
+      options.isStreaming === true &&
+      !live &&
+      toolBlock.output === undefined &&
+      !toolBlock.stopReason
+    const printed =
+      toolBlock.output === undefined && toolBlock.liveOutput
+        ? liveOutputTail(toolBlock.liveOutput, LIVE_OUTPUT_LINES)
+        : null
+    const output = parsed.output ?? printed
 
     // Custom content component using shared TerminalCommandDisplay
     const content = (
@@ -90,12 +106,7 @@ export const RunTerminalCommandComponent = defineToolComponent({
         timeoutSeconds={timeoutSeconds}
         availableWidth={options.availableWidth}
         // Started, no result yet: it runs (or waits for approval).
-        isRunning={
-          options.isStreaming === true &&
-          !live &&
-          toolBlock.output === undefined &&
-          !toolBlock.stopReason
-        }
+        isRunning={running}
       />
     )
 

@@ -111,6 +111,11 @@ pub const FEATURE_LIVE_PROGRESS: &str = "live_progress";
 /// [`UiEvent::CommitProposal`]. Without [`CAPABILITY_GIT_VIEWS`] it answers with notices.
 pub const FEATURE_GIT_VIEWS: &str = "git_views";
 
+/// The engine reports a shell command's output while it runs
+/// ([`UiEvent::ToolOutputDelta`]). Sent only to a UI that declared
+/// [`CAPABILITY_LIVE_OUTPUT`].
+pub const FEATURE_LIVE_OUTPUT: &str = "live_output";
+
 /// The engine keeps a checkpoint per prompt: `/rewind` lists them
 /// ([`UiEvent::Checkpoints`]) and [`EngineCommand::Rewind`] goes back to one
 /// ([`UiEvent::Rewound`]). Without [`CAPABILITY_GIT_VIEWS`] it answers with notices.
@@ -146,6 +151,7 @@ pub const ENGINE_FEATURES: &[&str] = &[
     FEATURE_GIT_VIEWS,
     FEATURE_CHECKPOINTS,
     FEATURE_MCP_TOGGLE,
+    FEATURE_LIVE_OUTPUT,
 ];
 
 /// `report` events for the commands that show a report (`/usage`, `/init`, `/memory`,
@@ -227,6 +233,18 @@ pub const CAPABILITY_LIVE_PROGRESS: &str = "live_progress";
 /// A UI capability: send changes, diffs, commit proposals, checkpoints and rewinds as
 /// their own events instead of notices.
 pub const CAPABILITY_GIT_VIEWS: &str = "git_views";
+
+/// A UI capability: send the output of a running shell command as
+/// [`UiEvent::ToolOutputDelta`] ([`FEATURE_LIVE_OUTPUT`]).
+pub const CAPABILITY_LIVE_OUTPUT: &str = "live_output";
+
+/// Which stream of a command a [`UiEvent::ToolOutputDelta`] carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
+}
 
 /// Which saved chats [`EngineCommand::ListSessions`] lists.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -740,6 +758,16 @@ pub enum UiEvent {
     /// [`UiEvent::Usage`] still closes the turn with its totals. With
     /// [`CAPABILITY_LIVE_PROGRESS`] only.
     RequestUsage { usage: TokenCounts },
+    /// More of what a running `bash` or `PowerShell` call printed: the text since the
+    /// last delta of that stream, at most every 100 ms or so per call and at most
+    /// 8 KB (a command that printed more is reported by the tail). The call's
+    /// [`UiEvent::ToolResult`] still carries the whole output when it ends. With
+    /// [`CAPABILITY_LIVE_OUTPUT`] only.
+    ToolOutputDelta {
+        tool_use_id: String,
+        stream: OutputStream,
+        chunk: String,
+    },
     /// Every file the agent created, changed or deleted in this session, with lines
     /// added and removed since the session first touched it. Sent when the list changes
     /// (after a tool call, after a rewind) and after [`EngineCommand::Capabilities`] when
@@ -1215,6 +1243,31 @@ mod tests {
             message
         );
         assert!(serde_json::from_str::<ClientMessage>(r#"{"type":"submit"}"#).is_err());
+    }
+
+    /// A running command's output, as the UI reads it.
+    #[test]
+    fn tool_output_delta_as_json() {
+        let delta = UiEvent::ToolOutputDelta {
+            tool_use_id: "call_7".into(),
+            stream: OutputStream::Stderr,
+            chunk: "warning: unused
+".into(),
+        };
+        let json = serde_json::to_value(&delta).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "tool_output_delta",
+                "tool_use_id": "call_7",
+                "stream": "stderr",
+                "chunk": "warning: unused
+",
+            })
+        );
+        assert_eq!(serde_json::from_value::<UiEvent>(json).unwrap(), delta);
+        assert!(ENGINE_FEATURES.contains(&FEATURE_LIVE_OUTPUT));
+        assert_eq!(CAPABILITY_LIVE_OUTPUT, FEATURE_LIVE_OUTPUT);
     }
 
     /// Live progress, todos, sub-agents, changes and checkpoints: the tags and field

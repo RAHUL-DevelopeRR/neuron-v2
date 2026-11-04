@@ -170,6 +170,12 @@ impl HookRunner {
         Self::new(feature_config.hooks().clone())
     }
 
+    /// Whether any `PreToolUse` hook is configured.
+    #[must_use]
+    pub fn has_pre_tool_use_hooks(&self) -> bool {
+        !self.config.pre_tool_use().is_empty()
+    }
+
     #[must_use]
     pub fn run_pre_tool_use(&self, tool_name: &str, tool_input: &str) -> HookRunResult {
         self.run_pre_tool_use_with_context(tool_name, tool_input, None, None)

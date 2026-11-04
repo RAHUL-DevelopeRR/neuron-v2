@@ -20,6 +20,7 @@ use crate::experience::{self, ExperienceStore, HarnessStats};
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::model_registry;
 use crate::model_routing::{self, ModelRouting};
+use crate::parallel_tools::ConcurrentToolCall;
 use crate::permissions::{
     PermissionContext, PermissionMode, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
@@ -28,6 +29,8 @@ use crate::refusal::neutral_refusal_note;
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 use crate::transcript::{normalize_messages, normalized_messages};
 use crate::usage::{TokenUsage, UsageTracker};
+
+mod tool_batch;
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 /// Environment variable setting the automatic compaction threshold.
@@ -300,6 +303,26 @@ pub trait ToolExecutor {
         _output: &str,
         _is_error: bool,
     ) {
+    }
+
+    /// Whether [`Self::execute_concurrently`] really runs calls at the same time. Only
+    /// then does the runtime batch read-only calls (`crate::parallel_tools`).
+    fn supports_concurrent_calls(&self) -> bool {
+        false
+    }
+
+    /// Runs read-only calls that were all allowed already ([`Self::tool_started`] was
+    /// called for each, in order) and returns their results in the order of `calls`.
+    /// The default runs them one after another.
+    fn execute_concurrently(
+        &mut self,
+        calls: &[ConcurrentToolCall],
+        cancel: &CancellationToken,
+    ) -> Vec<Result<String, ToolError>> {
+        calls
+            .iter()
+            .map(|call| self.execute_with_cancellation(&call.tool_name, &call.input, cancel))
+            .collect()
     }
 }
 
@@ -1045,7 +1068,12 @@ where
                 return Ok(self.finish_turn(progress, outcome));
             }
 
+            // Calls up to here already ran together with an earlier one.
+            let mut batched_until = 0;
             for (index, (tool_use_id, tool_name, input)) in pending_tool_uses.iter().enumerate() {
+                if index < batched_until {
+                    continue;
+                }
                 if self.cancel.is_cancelled() {
                     let interrupted = self.push_synthetic_results(
                         progress.iterations,
@@ -1077,6 +1105,17 @@ where
                         true,
                     );
                     self.record_tool_result(progress.iterations, result, &mut progress)?;
+                    continue;
+                }
+
+                // A run of read-only calls that need nobody's approval runs at once.
+                let batched = self.run_read_only_batch(
+                    &pending_tool_uses[index..],
+                    &mut loop_guard,
+                    &mut progress,
+                )?;
+                if batched > 0 {
+                    batched_until = index + batched;
                     continue;
                 }
 
@@ -1230,30 +1269,17 @@ where
                 self.record_tool_started(iteration, tool_name);
                 self.tool_executor
                     .tool_started(tool_use_id, tool_name, &effective_input);
-                let (mut output, mut is_error) = match self.tool_executor.execute_with_cancellation(
+                let result = self.tool_executor.execute_with_cancellation(
                     tool_name,
                     &effective_input,
                     &self.cancel,
-                ) {
-                    Ok(output) => (output, false),
-                    Err(error) => (error.to_string(), true),
-                };
-                output = merge_hook_feedback(pre_hook_result.messages(), output, false);
-
-                let post_hook_result = if is_error {
-                    self.run_post_tool_use_failure_hook(tool_name, &effective_input, &output)
-                } else {
-                    self.run_post_tool_use_hook(tool_name, &effective_input, &output, false)
-                };
-                let post_hook_blocked = post_hook_result.is_denied()
-                    || post_hook_result.is_failed()
-                    || post_hook_result.is_cancelled();
-                if post_hook_blocked {
-                    is_error = true;
-                }
-                output =
-                    merge_hook_feedback(post_hook_result.messages(), output, post_hook_blocked);
-                (output, is_error)
+                );
+                self.after_tool_ran(
+                    tool_name,
+                    &effective_input,
+                    pre_hook_result.messages(),
+                    result,
+                )
             }
             PermissionOutcome::Deny { reason } => (
                 merge_hook_feedback(pre_hook_result.messages(), reason, true),
@@ -2292,6 +2318,7 @@ fn append_to_tool_result(message: &mut ConversationMessage, note: &str) {
 
 /// Signature-based detector for a model calling the same tool with the same
 /// arguments over and over.
+#[derive(Clone)]
 struct LoopGuard {
     threshold: usize,
     last_signature: Option<String>,
