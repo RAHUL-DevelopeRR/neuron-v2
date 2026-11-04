@@ -4,6 +4,7 @@
 //!   to the gateway's `POST /v1/search` with the session token, and the snippets reach
 //!   the model inside the external-content envelope;
 //! - without `--allow-web` the same search is refused, so the grant is what changed;
+//! - `--allow-origin` refuses a fetch of any other host, even with `--allow-web`;
 //! - `neuron plugins list` and unknown `neuron mcp`/`neuron plugins` words never reach
 //!   the model.
 
@@ -92,6 +93,35 @@ fn without_allow_web_the_same_search_is_refused() {
     assert_eq!(output.status.code(), Some(2), "{stderr}");
     assert!(stderr.contains("tool 'WebSearch' was not run"), "{stderr}");
     assert!(gateway.searches().is_empty());
+    workspace.remove();
+}
+
+#[test]
+fn allow_origin_refuses_a_fetch_of_another_host() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let gateway = MockGateway::spawn();
+    let workspace = Workspace::new("allow-origin");
+
+    let output = run(
+        &workspace,
+        &server.base_url(),
+        &gateway,
+        &["--allow-web", "--allow-origin", "example.com"],
+        "web_fetch_off_origin",
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let all = format!("{stdout}\n{stderr}");
+    assert!(all.contains("WebFetch refused `docs.rs`"), "{all}");
+    assert!(all.contains("--allow-origin (example.com)"), "{all}");
+    assert!(
+        !stdout.contains("<external-content"),
+        "nothing was fetched: {stdout}"
+    );
     workspace.remove();
 }
 
