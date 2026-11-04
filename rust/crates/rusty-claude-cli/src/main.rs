@@ -7470,6 +7470,20 @@ mod tests {
         assert!(report.contains("Current model    claude-sonnet"));
         assert!(report.contains("Session messages 12"));
         assert!(report.contains("Switch models with /model <name>"));
+
+        // The model by name, not the gateway's route to it (`/status` has the id).
+        let routed = format_model_report("openai/cohere/north-mini-code:free", 0, 0);
+        let line = routed
+            .lines()
+            .find(|line| line.trim_start().starts_with("Current model"))
+            .expect("a Current model line");
+        assert!(
+            line.ends_with("north-mini-code") || line.ends_with("North Mini Code"),
+            "{routed}"
+        );
+        for route in ["cohere/", ":free", "openai/", "OpenRouter"] {
+            assert!(!routed.contains(route), "{route} in {routed}");
+        }
     }
 
     #[test]

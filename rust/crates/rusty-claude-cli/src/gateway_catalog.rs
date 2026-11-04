@@ -831,7 +831,18 @@ pub fn model_choice_warning(
     one_shot: bool,
 ) -> Option<String> {
     let check = check_model(catalog, model, now_unix);
-    let model = crate::provider::shown_model(model);
+    // A model in the catalog by its name, not the gateway's route to it
+    // (`cohere/north-mini-code:free`); one it lacks as typed.
+    let model = match (&check, catalog.find(crate::provider::shown_model(model))) {
+        (ModelCheck::Unknown { .. }, _) | (_, None) => {
+            crate::provider::shown_model(model).to_string()
+        }
+        (_, Some(entry)) => clean_model_name(
+            model,
+            entry.display_name.as_deref(),
+            entry.provider.as_deref(),
+        ),
+    };
     // A `neuron prompt` run has no REPL to type `/model` into.
     let pick = if one_shot { "--model" } else { "/model" };
     match check {
@@ -1197,9 +1208,9 @@ mod tests {
         .unwrap();
         assert!(
             warning.starts_with(
-                "warning: gemini/gemini-2.5-flash is out of capacity until 07:00 UTC (back in 13h 48m)"
+                "warning: gemini-2.5-flash is out of capacity until 07:00 UTC (back in 13h 48m)"
             ),
-            "{warning}"
+            "the model by name, without its route: {warning}"
         );
         assert!(warning.contains("auto routes around it"), "{warning}");
         assert!(warning.contains("/model auto"), "{warning}");
@@ -1283,6 +1294,46 @@ mod tests {
     }
 
     #[test]
+    fn model_choice_warnings_name_the_model_without_its_route() {
+        let models = parse_catalog(&serde_json::json!({"data": [
+            {"id": "cohere/north-mini-code:free", "available": true, "tiers": ["free"],
+             "display_name": "North Mini Code (OpenRouter, free)", "owned_by": "openrouter",
+             "status": "blurred"},
+        ]}))
+        .unwrap();
+        let catalog = Catalog {
+            models,
+            ..sample_catalog()
+        };
+        let warning = model_choice_warning(
+            &catalog,
+            "openai/cohere/north-mini-code:free",
+            crate::clock::now_unix(),
+            false,
+        )
+        .unwrap();
+        assert!(
+            warning.starts_with("warning: North Mini Code is out of capacity"),
+            "{warning}"
+        );
+        for route in ["cohere/", ":free", "openai/", "OpenRouter"] {
+            assert!(!warning.contains(route), "{route} in {warning}");
+        }
+        // A model the catalog lacks is named as typed.
+        let unknown = model_choice_warning(
+            &catalog,
+            "acme/made-up-model",
+            crate::clock::now_unix(),
+            false,
+        )
+        .unwrap();
+        assert!(
+            unknown.starts_with("warning: acme/made-up-model is not in the Zero-X catalog"),
+            "{unknown}"
+        );
+    }
+
+    #[test]
     fn model_status_is_kept_and_unconfigured_models_are_not_a_plan_matter() {
         let models = parse_catalog(&serde_json::json!({"data": [
             {"id": "gemini/gemini-2.5-flash", "available": true, "status": "blurred",
@@ -1312,7 +1363,7 @@ mod tests {
         );
         assert!(!warning.contains("upgrade"), "{warning}");
         assert!(
-            warning.starts_with("warning: openai/gpt-5 "),
+            warning.starts_with("warning: gpt-5 "),
             "no routing prefix: {warning}"
         );
     }
