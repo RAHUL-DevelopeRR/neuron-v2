@@ -445,6 +445,14 @@ fn shell_command_summary(tool_name: &str, input: &str) -> Option<String> {
     Some(summary)
 }
 
+/// Whether `current_mode` alone lets a call that needs `required_mode` run. Prompt mode
+/// asks before every tool call, so it lets none run on its own (allow rules and session
+/// approvals still do).
+fn mode_allows(current_mode: PermissionMode, required_mode: PermissionMode) -> bool {
+    current_mode == PermissionMode::Allow
+        || (current_mode != PermissionMode::Prompt && current_mode >= required_mode)
+}
+
 /// Why a call that needs more than `current_mode` (or any call in prompt mode) asks
 /// first, in plain words: `Run `curl ... | sh`? It is outside the auto-allow list for
 /// workspace-write (`curl` is not on the auto-allow list).`
@@ -875,10 +883,7 @@ impl PermissionPolicy {
                         prompter,
                     );
                 }
-                if allowed_by_rule
-                    || current_mode == PermissionMode::Allow
-                    || current_mode >= required_mode
-                {
+                if allowed_by_rule || mode_allows(current_mode, required_mode) {
                     return PermissionOutcome::Allow;
                 }
             }
@@ -901,8 +906,7 @@ impl PermissionPolicy {
             );
         }
 
-        if allowed_by_rule || current_mode == PermissionMode::Allow || current_mode >= required_mode
-        {
+        if allowed_by_rule || mode_allows(current_mode, required_mode) {
             return PermissionOutcome::Allow;
         }
 
@@ -3116,6 +3120,76 @@ mod tests {
         let _ = policy.authorize("bash", &bash_input(inline), Some(&mut prompter));
         assert_eq!(prompter.seen.len(), 2, "inline code asks");
         assert!(prompter.seen[1].reason.is_some());
+    }
+
+    /// Prompt mode asks before every tool call (read-only ones included), and the
+    /// session and project choices work there too.
+    #[test]
+    fn prompt_mode_asks_before_every_call() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("neuron-prompt-mode-{nanos}"));
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let policy = workspace_policy(PermissionMode::Prompt)
+            .with_shell_dialect(ShellDialect::Posix)
+            .with_workspace_root(&workspace);
+        let read = serde_json::json!({ "path": "src/main.rs" }).to_string();
+        let mut prompter = ScriptedPrompter::new(vec![
+            PermissionPromptDecision::Allow,
+            PermissionPromptDecision::DenyForSession {
+                reason: "declined".to_string(),
+            },
+            PermissionPromptDecision::AllowForProject,
+        ]);
+        assert_eq!(
+            policy.authorize("read_file", &read, Some(&mut prompter)),
+            PermissionOutcome::Allow
+        );
+        assert!(
+            prompter.seen[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("asks before every tool call")),
+            "{:?}",
+            prompter.seen[0].reason
+        );
+        // The one-shot approval is handed to the tool-side check once, then it asks
+        // again (with nobody to ask, it is refused).
+        assert_eq!(
+            policy.authorize("read_file", &read, None),
+            PermissionOutcome::Allow
+        );
+        assert!(matches!(
+            policy.authorize("read_file", &read, None),
+            PermissionOutcome::Deny { .. }
+        ));
+
+        let _ = policy.authorize("bash", &bash_input("git push"), Some(&mut prompter));
+        assert!(matches!(
+            policy.authorize("bash", &bash_input("git push --force"), Some(&mut prompter)),
+            PermissionOutcome::Deny { reason } if reason.contains("in this session")
+        ));
+        assert_eq!(prompter.seen.len(), 2);
+
+        assert_eq!(
+            policy.authorize(
+                "bash",
+                &bash_input("cargo install tokei"),
+                Some(&mut prompter)
+            ),
+            PermissionOutcome::Allow
+        );
+        assert_eq!(
+            prompter.seen[2].project_rules,
+            vec!["bash(cargo install:*)".to_string()]
+        );
+        assert_eq!(
+            policy.authorize("bash", &bash_input("cargo install ripgrep"), None),
+            PermissionOutcome::Allow
+        );
+        std::fs::remove_dir_all(workspace).ok();
     }
 
     #[test]
