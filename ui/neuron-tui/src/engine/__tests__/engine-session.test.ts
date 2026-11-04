@@ -18,6 +18,8 @@ import {
   inUiWording,
   isRetryNotice,
   setEngineTurnActive,
+  showConversationOfResumedSession,
+  transcriptMessages,
 } from '../engine-session'
 
 import type { PermissionView, SignInCodeEvent, StatusEvent } from '../protocol'
@@ -54,6 +56,55 @@ beforeEach(() => {
   useEngineStore.getState().reset()
   useChatStore.getState().reset()
   setEngineTurnActive(false)
+})
+
+describe('a session resumed from the command line', () => {
+  const TRANSCRIPT = {
+    type: 'transcript' as const,
+    session_id: 'session-1',
+    truncated: true,
+    entries: [
+      { kind: 'user' as const, text: 'add a test' },
+      { kind: 'assistant' as const, text: 'Adding it.' },
+      { kind: 'tool_call' as const, id: 't1', name: 'write_file', input: '{}' },
+      { kind: 'tool_result' as const, id: 't1', name: 'write_file', output: 'ok', is_error: false },
+      { kind: 'assistant' as const, text: 'Done.' },
+    ],
+  }
+
+  test('its conversation is shown as prompts and answers, tools named', () => {
+    const messages = transcriptMessages(TRANSCRIPT)
+    expect(messages.map((m) => [m.variant, m.content])).toEqual([
+      ['ai', 'Earlier messages of this session are not shown.'],
+      ['user', 'add a test'],
+      ['ai', 'Adding it.\n\u2192 write_file'],
+      ['ai', 'Done.'],
+    ])
+    expect(new Set(messages.map((m) => m.id)).size).toBe(messages.length)
+  })
+
+  test('the first transcript fills the empty chat; later ones and other launches do not', () => {
+    // Without `--resume`, a transcript (after /clear, /resume) is not shown here.
+    handleEngineEvent(TRANSCRIPT)
+    expect(useChatStore.getState().messages).toEqual([])
+
+    showConversationOfResumedSession()
+    handleEngineEvent(TRANSCRIPT)
+    expect(useChatStore.getState().messages.map((m) => m.content)).toContain('add a test')
+
+    useChatStore.getState().reset()
+    handleEngineEvent(TRANSCRIPT)
+    expect(useChatStore.getState().messages).toEqual([])
+  })
+
+  test('a chat that already has messages keeps them', () => {
+    useChatStore.getState().setMessages([
+      { id: 'mine', variant: 'user', content: 'from --continue', timestamp: '' },
+    ])
+    showConversationOfResumedSession()
+    handleEngineEvent(TRANSCRIPT)
+    expect(useChatStore.getState().messages.map((m) => m.id)).toEqual(['mine'])
+  })
 })
 
 describe('handleEngineEvent', () => {

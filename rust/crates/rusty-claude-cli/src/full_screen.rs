@@ -1,6 +1,8 @@
 //! A bare `neuron` on a terminal starts Neuron's full-screen UI, `neuron-tui`,
 //! when it is installed beside this binary (the npm and PyPI packages and the
-//! install scripts put it there). The UI runs this binary as its engine
+//! install scripts put it there), and so do `neuron "prompt"`, seeded with the
+//! prompt, and `neuron --resume SESSION`, continuing the session (`-p` and
+//! `neuron prompt` stay plain text for scripts). The UI runs this binary as its engine
 //! (`neuron engine --stdio`, found through `NEURON_BIN`). The line REPL stays
 //! one flag away: `--no-tui`, or `NEURON_NO_TUI=1`. Without the UI, or off a
 //! terminal, nothing changes. `--continue [chat-id]`, which the UI's exit hint
@@ -24,7 +26,8 @@ pub(crate) const CONTINUE_NEEDS_UI: &str = "--continue reopens a chat in the ful
 combined with a prompt, a subcommand or --no-tui. In the line REPL, use --resume instead; \
 from a script, send a saved session another prompt with `neuron --resume latest prompt \"...\"`.";
 
-/// What a REPL launch asked for, as the UI's flags can carry it.
+/// What a REPL launch, a bare prompt or an interactive `--resume` asked for, as the
+/// UI's flags can carry it.
 pub(crate) struct UiLaunch<'a> {
     /// `--model` as typed, when given.
     pub model: Option<String>,
@@ -35,6 +38,10 @@ pub(crate) struct UiLaunch<'a> {
     pub allow_broad_cwd: bool,
     pub base_commit: Option<&'a str>,
     pub continue_chat: Option<ContinueChat>,
+    /// `--resume SESSION`: the saved session the UI's engine continues.
+    pub resume: Option<String>,
+    /// `neuron "prompt"`: the prompt the UI sends first.
+    pub prompt: Option<String>,
 }
 
 /// `--continue`: the latest chat, or the one named.
@@ -168,6 +175,17 @@ pub(crate) fn ui_args(launch: &UiLaunch<'_>) -> Option<Vec<String>> {
         if let ContinueChat::Chat(id) = chat {
             args.push(id.clone());
         }
+    }
+    if let Some(session) = &launch.resume {
+        args.extend(["--resume".to_string(), session.clone()]);
+    }
+    // After `--`, so a prompt that starts with `-` is not read as an option.
+    if let Some(prompt) = launch
+        .prompt
+        .as_ref()
+        .filter(|prompt| !prompt.trim().is_empty())
+    {
+        args.extend(["--".to_string(), prompt.clone()]);
     }
     Some(args)
 }
@@ -394,6 +412,8 @@ mod tests {
             allow_broad_cwd: true,
             base_commit: None,
             continue_chat: Some(ContinueChat::Chat("chat-42".to_string())),
+            resume: None,
+            prompt: None,
         };
         assert_eq!(
             ui_args(&launch),
@@ -449,8 +469,39 @@ mod tests {
             allow_broad_cwd: false,
             base_commit: Some("HEAD~1"),
             continue_chat: None,
+            resume: None,
+            prompt: None,
         };
         assert_eq!(ui_args(&launch), None);
+    }
+
+    /// `neuron --resume SESSION` and `neuron "prompt"` on a terminal: the UI continues
+    /// the session, and sends the prompt first, even one that looks like an option.
+    #[test]
+    fn ui_args_carry_a_session_to_resume_and_a_first_prompt() {
+        let launch = UiLaunch {
+            model: None,
+            provider: None,
+            permission_mode: PermissionMode::WorkspaceWrite,
+            allowed_tools: None,
+            reasoning_effort: None,
+            allow_broad_cwd: false,
+            base_commit: None,
+            continue_chat: None,
+            resume: Some("/work/.neuron/sessions/abc/session-1.jsonl".to_string()),
+            prompt: Some("--explain the build".to_string()),
+        };
+        assert_eq!(
+            ui_args(&launch),
+            Some(strings(&[
+                "--permission-mode",
+                "workspace-write",
+                "--resume",
+                "/work/.neuron/sessions/abc/session-1.jsonl",
+                "--",
+                "--explain the build",
+            ]))
+        );
     }
 
     #[test]

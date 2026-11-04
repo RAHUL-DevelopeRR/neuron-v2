@@ -13,6 +13,7 @@ import { resetLiveTurnStore } from '../state/live-turn-store'
 import { useStartGate } from '../state/start-gate'
 import { consoleSafeText } from '../utils/glyphs'
 import { logger } from '../utils/logger'
+import { formatTimestamp } from '../utils/helpers'
 import { getSystemMessage } from '../utils/message-history'
 import {
   existingCurrentChatDir,
@@ -37,12 +38,20 @@ import { QUESTION_PREFIX } from './questions'
 import { engineSessionOf, withEngineSession } from './session-run-state'
 import { StdioEngineClient } from './stdio-engine-client'
 
-import type { StatusEvent, UiEvent, WorkspaceTrustedEvent } from './protocol'
+import type { ChatMessage } from '../types/chat'
+import type {
+  StatusEvent,
+  TranscriptEvent,
+  UiEvent,
+  WorkspaceTrustedEvent,
+} from './protocol'
 import type { StdioEngineClientOptions } from './stdio-engine-client'
 
 export { QUESTION_PREFIX }
 
 let turnActive = false
+/** Launched with `--resume`: the engine's first `transcript` fills the empty chat. */
+let showNextTranscript = false
 /** The running turn's AI message, when it has one. */
 let turnMessageId: string | null = null
 
@@ -55,6 +64,47 @@ export function setEngineTurnActive(active: boolean, messageId?: string): void {
   turnMessageId = active ? (messageId ?? null) : null
   // A new turn has neither retried nor failed yet.
   if (active) forgetTurnRetries()
+}
+
+/**
+ * `neuron --resume <session>` opened the UI: the chat starts empty, so the
+ * session's conversation, which the engine sends once it has continued it,
+ * is shown there. Chats the UI saved itself (`--continue`, /history) bring
+ * their own messages and are left alone.
+ */
+export function showConversationOfResumedSession(): void {
+  showNextTranscript = true
+}
+
+/**
+ * The chat messages for a resumed session's conversation: each prompt, and
+ * each answer with the tools it called named under it. Tool output is left
+ * out; it is in the session, not needed to follow the conversation.
+ */
+export function transcriptMessages(event: TranscriptEvent): ChatMessage[] {
+  const timestamp = formatTimestamp()
+  const messages: ChatMessage[] = []
+  const add = (variant: ChatMessage['variant'], content: string) =>
+    messages.push({
+      id: `transcript-${event.session_id}-${messages.length}`,
+      variant,
+      content: consoleSafeText(content),
+      timestamp,
+    })
+  if (event.truncated) add('ai', 'Earlier messages of this session are not shown.')
+  for (const entry of event.entries) {
+    const last = messages[messages.length - 1]
+    if (entry.kind === 'user') {
+      add('user', entry.text)
+    } else if (entry.kind === 'assistant') {
+      if (entry.text.trim()) add('ai', entry.text)
+    } else if (entry.kind === 'tool_call') {
+      const line = `\u2192 ${entry.name}`
+      if (last?.variant === 'ai') last.content = `${last.content}\n${line}`
+      else add('ai', line)
+    }
+  }
+  return messages
 }
 
 /**
@@ -300,6 +350,13 @@ export function handleEngineEvent(event: UiEvent): void {
       return
     case 'trust_preview':
       engine.setTrustPreview(event)
+      return
+    case 'transcript':
+      if (showNextTranscript) {
+        showNextTranscript = false
+        const chat = useChatStore.getState()
+        if (chat.messages.length === 0) chat.setMessages(transcriptMessages(event))
+      }
       return
     case 'workspace_trusted':
       void restartWithTrust(event)

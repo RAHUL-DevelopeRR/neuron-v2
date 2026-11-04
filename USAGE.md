@@ -15,8 +15,10 @@ and launchers put beside `neuron`. Type a request, or a slash command such as `/
 Approve or deny tool calls in its dialog (Esc denies; Ctrl+C denies and interrupts the
 turn), sign in with `/login` and pick a model with `/model`. Ctrl+C interrupts the
 current turn, and `/exit` or Ctrl+C twice quits. `neuron --continue` reopens the
-latest chat for this folder, and `neuron --continue CHAT` a given one. Shell commands
-typed in the UI (`!cmd`, `/bash`) are not available yet.
+latest chat for this folder, and `neuron --continue CHAT` a given one. `neuron "fix the
+failing test"` opens the UI and sends that prompt first, and `neuron --resume SESSION`
+opens it on a saved session, showing its conversation. Shell commands typed in the UI
+(`!cmd`, `/bash`) are not available yet.
 
 The UI does not ask whether you trust the folder: until you do, the folder's own
 settings, hooks and MCP servers are not loaded, and `/status` says how to trust it
@@ -31,11 +33,16 @@ For one-off and scripted use:
 
 ```sh
 neuron prompt "summarize the open TODOs in src/"     # one prompt, then exit
-neuron "summarize Cargo.toml"                        # shorthand for the same
+neuron -p "summarize Cargo.toml"                     # shorthand for the same
 neuron --output-format json prompt "list the public functions in lib.rs"
 neuron --compact "summarize Cargo.toml" | wc -l      # final answer only, for pipes
 git diff | neuron prompt "review this change"        # piped input goes with the prompt
 ```
+
+`neuron "..."` without `-p` is the same one prompt when standard input or output is not
+a terminal; on a terminal it opens the full-screen UI. On a terminal, `-p` and
+`neuron prompt` start with one line on standard error naming the model, the permission
+mode and the plan.
 
 Piped standard input is sent to the model with the prompt, up to 128 KiB; with a prompt
 on the command line, a pipe that sends nothing for 500 ms is not waited for. In a
@@ -261,7 +268,8 @@ neuron --resume "$id" prompt "now make the change"
 
 `latest` is the newest session with messages: a session left before its first prompt is
 skipped. On a terminal, `--resume` without slash commands continues the session
-interactively.
+interactively, in the full-screen UI when it is installed (the line REPL with
+`--no-tui`).
 `--resume SESSION prompt "..."` works anywhere, scripts included: it runs one turn as
 `neuron prompt` does, with the session's history, and saves the turn to the same file.
 `-p "..."` does the same, and with nothing after it takes the prompt from standard input

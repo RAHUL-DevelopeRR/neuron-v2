@@ -26,7 +26,10 @@ import React from 'react'
 
 import { App } from './app'
 import { parseArgs } from './cli-args'
-import { startEngineSession } from './engine/engine-session'
+import {
+  showConversationOfResumedSession,
+  startEngineSession,
+} from './engine/engine-session'
 import { initializeApp } from './init/init-app'
 import { getProjectRoot, setProjectRoot } from './project-files'
 import { getConfigDir } from './utils/config-dir'
@@ -102,6 +105,7 @@ async function main(): Promise<void> {
     clearLogs,
     continue: continueChat,
     continueId,
+    resume,
     cwd,
     initialMode,
     engine: engineFlags,
@@ -138,9 +142,11 @@ async function main(): Promise<void> {
   // The engine runs in the project folder, so it starts once one is chosen.
   // `--continue` resumes the engine session the chat was saved with (saved
   // as soon as the engine reported it, so also after an interrupted turn).
-  const resumeSession = continueChat
-    ? resumeSessionFor(continueId ?? undefined)
-    : undefined
+  // `--resume <session>` (from `neuron --resume`) names the engine session
+  // itself; the chat starts empty and shows that session's conversation.
+  const resumeSession =
+    resume ?? (continueChat ? resumeSessionFor(continueId ?? undefined) : undefined)
+  if (resume) showConversationOfResumedSession()
   if (!showProjectPicker) {
     void startEngineSession({
       ...engineFlags,

@@ -90,8 +90,9 @@ On a terminal, `neuron` with no prompt opens the full-screen UI, `neuron-tui`. T
 installers put it beside `neuron`, and the launchers fetch it the same way, verified
 by checksum. `neuron --no-tui` (or `NEURON_NO_TUI=1`) keeps the line REPL. Without
 the UI, for example after a failed download, `neuron` runs the line REPL as
-before. Prompts (`neuron "fix the test"`, `neuron -p ...`) and subcommands never
-start it.
+before. On a terminal, `neuron "fix the test"` opens it with that prompt and
+`neuron --resume SESSION` on that session; `neuron -p ...`, `neuron prompt ...` and
+subcommands never start it.
 
 **From source**
 

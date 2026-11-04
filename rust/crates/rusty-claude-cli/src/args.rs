@@ -170,6 +170,24 @@ pub(crate) fn record_no_tui_flag(given: bool) {
     NO_TUI_FLAG.store(given, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether this run had `--no-tui` ([`record_no_tui_flag`]).
+pub(crate) fn no_tui_flag_given() -> bool {
+    NO_TUI_FLAG.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+thread_local! {
+    /// The prompt was the command line's own words (`neuron "fix the bug"`), not `-p`,
+    /// `prompt` or piped input: on a terminal it opens the full-screen UI. Per thread, as
+    /// the thread that parses the arguments acts on them.
+    static BARE_PROMPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread's last parse took its prompt from the command line's own words
+/// ([`BARE_PROMPT`]).
+pub(crate) fn bare_prompt_given() -> bool {
+    BARE_PROMPT.with(std::cell::Cell::get)
+}
+
 /// Piped text goes to the model as one prompt, so `/model` and `/exit` on their own
 /// lines would be a question for the model, not commands.
 const PIPED_SLASH_COMMANDS: &str = "piped input is sent to the model as one prompt, so slash \
@@ -271,6 +289,7 @@ pub(crate) fn parse_args_with_stdin(
     piped_stdin: impl FnOnce() -> Option<String>,
 ) -> Result<CliAction, String> {
     *MODEL_ARG.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    BARE_PROMPT.with(|bare| bare.set(false));
     let mut model = DEFAULT_MODEL.to_string();
     // Only an explicit --model; `model` falls back to the default.
     let mut model_flag: Option<String> = None;
@@ -641,17 +660,20 @@ pub(crate) fn parse_args_with_stdin(
             reasoning_effort,
             allow_broad_cwd,
         ),
-        _other => Ok(CliAction::Prompt {
-            prompt: rest.join(" "),
-            model,
-            output_format,
-            allowed_tools,
-            permission_mode,
-            compact,
-            base_commit,
-            reasoning_effort: reasoning_effort.clone(),
-            allow_broad_cwd,
-        }),
+        _other => {
+            BARE_PROMPT.with(|bare| bare.set(true));
+            Ok(CliAction::Prompt {
+                prompt: rest.join(" "),
+                model,
+                output_format,
+                allowed_tools,
+                permission_mode,
+                compact,
+                base_commit,
+                reasoning_effort: reasoning_effort.clone(),
+                allow_broad_cwd,
+            })
+        }
     }
 }
 

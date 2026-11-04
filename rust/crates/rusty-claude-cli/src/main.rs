@@ -351,6 +351,29 @@ fn failed_turn_json(error: &str, model: &str, messages: &[ConversationMessage]) 
     })
 }
 
+/// What answers a `neuron -p` run, in one line: `neuron · <model> · <permission mode> ·
+/// <provider> <plan>`, the plan left out when there is none. Nothing in it walks the
+/// workspace, so it costs nothing in a large repository.
+fn one_shot_status_line(
+    model: &str,
+    permission_mode: PermissionMode,
+    provider: &str,
+    plan: Option<&str>,
+) -> String {
+    let model = model.split('/').next_back().unwrap_or(model);
+    let account = match plan
+        .map(str::trim)
+        .filter(|plan| !plan.is_empty() && *plan != "-")
+    {
+        Some(plan) => format!("{provider} {plan}"),
+        None => provider.to_string(),
+    };
+    format!(
+        "neuron \u{00b7} {model} \u{00b7} {} \u{00b7} {account}",
+        permission_mode.as_str()
+    )
+}
+
 /// Merge a piped stdin payload into a prompt argument.
 ///
 /// When `stdin_content` is `None` or empty after trimming, the prompt is
@@ -522,20 +545,47 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             base_commit,
             reasoning_effort,
             allow_broad_cwd,
-        } => run_prompt(
-            &prompt,
-            repl_loop::ReplLaunch {
-                model,
-                allowed_tools,
-                permission_mode,
-                base_commit,
-                reasoning_effort,
-                allow_broad_cwd,
-                resume: None,
-            },
-            output_format,
-            compact,
-        )?,
+        } => {
+            // `neuron "fix the bug"` on a terminal: the full-screen UI, which sends the
+            // prompt first. `-p` and `neuron prompt` stay plain text for scripts.
+            if crate::args::bare_prompt_given()
+                && output_format == CliOutputFormat::Text
+                && !compact
+            {
+                if let Some(ui) = full_screen::ui_binary(no_tui) {
+                    let launch = full_screen::UiLaunch {
+                        model: crate::args::typed_model_arg(),
+                        provider: provider::provider_flag(),
+                        permission_mode,
+                        allowed_tools: allowed_tools.as_ref(),
+                        reasoning_effort: reasoning_effort.as_deref(),
+                        allow_broad_cwd,
+                        base_commit: base_commit.as_deref(),
+                        continue_chat: None,
+                        resume: None,
+                        prompt: Some(prompt.clone()),
+                    };
+                    if let Some(ui_args) = full_screen::ui_args(&launch) {
+                        let code = full_screen::run_ui(&ui, &ui_args)?;
+                        std::process::exit(code);
+                    }
+                }
+            }
+            run_prompt(
+                &prompt,
+                repl_loop::ReplLaunch {
+                    model,
+                    allowed_tools,
+                    permission_mode,
+                    base_commit,
+                    reasoning_effort,
+                    allow_broad_cwd,
+                    resume: None,
+                },
+                output_format,
+                compact,
+            )?;
+        }
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
         CliAction::Acp { output_format } => print_acp_status(output_format)?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
@@ -565,6 +615,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     allow_broad_cwd,
                     base_commit: base_commit.as_deref(),
                     continue_chat: continue_chat.clone(),
+                    resume: None,
+                    prompt: None,
                 };
                 if let Some(ui_args) = full_screen::ui_args(&launch) {
                     let code = full_screen::run_ui(&ui, &ui_args)?;
@@ -670,13 +722,10 @@ prompt after -p, or pipe it: `echo \"...\" | neuron -p`."
     cli.set_reasoning_effort(options.reasoning_effort);
     // Nobody to answer (stdin not a terminal): approvals and questions are refused.
     headless::start(headless::stdin_is_unattended(), output_format);
-    // Print a condensed welcome banner for one-shot mode so the user
-    // sees model info and quota even when not in the REPL.
-    // Not to a file or a pipe: there it is noise around the answer.
-    if output_format == CliOutputFormat::Text && !compact && io::stdout().is_terminal() {
-        println!("{}", cli.startup_banner());
-        println!("{}", format_connected_line(&cli.model));
-        println!();
+    // One line on a terminal saying what answers: model, permission mode and plan. On
+    // stderr, so stdout keeps the answer alone; not to a file or a pipe.
+    if output_format == CliOutputFormat::Text && !compact && io::stderr().is_terminal() {
+        eprintln!("{}", cli.one_shot_status_line());
     }
     let result = cli.run_turn_with_output(&effective_prompt, output_format, compact);
     // Tool calls denied for lack of a prompt: named once more, and exit code 2.
@@ -925,6 +974,34 @@ fn resume_session(
             && io::stdin().is_terminal()
             && io::stdout().is_terminal()
         {
+            // The full-screen UI when it is installed: its engine continues the session.
+            if let Some(ui) = full_screen::ui_binary(crate::args::no_tui_flag_given()) {
+                let resume = resolved_path.display().to_string();
+                let options =
+                    repl_loop::resume_launch(launch.clone(), session.model.as_deref(), resume);
+                let ui_launch = full_screen::UiLaunch {
+                    // The session's own model unless `--model` named another.
+                    model: crate::args::typed_model_arg().or_else(|| session.model.clone()),
+                    provider: provider::provider_flag(),
+                    permission_mode: options.permission_mode,
+                    allowed_tools: options.allowed_tools.as_ref(),
+                    reasoning_effort: options.reasoning_effort.as_deref(),
+                    allow_broad_cwd: options.allow_broad_cwd,
+                    base_commit: options.base_commit.as_deref(),
+                    continue_chat: None,
+                    resume: options.resume.clone(),
+                    prompt: None,
+                };
+                if let Some(ui_args) = full_screen::ui_args(&ui_launch) {
+                    match full_screen::run_ui(&ui, &ui_args) {
+                        Ok(code) => std::process::exit(code),
+                        Err(error) => {
+                            eprintln!("error: {error}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
             let launched = repl_loop::launch(repl_loop::resume_launch(
                 launch,
                 session.model.as_deref(),
@@ -2695,6 +2772,29 @@ impl LiveCli {
         if let Some(rt) = self.runtime.runtime.as_mut() {
             rt.api_client_mut().set_reasoning_effort(effort);
         }
+    }
+
+    /// The line a `neuron -p` run on a terminal starts with ([`one_shot_status_line`]).
+    fn one_shot_status_line(&self) -> String {
+        let active = provider::active_provider();
+        let provider = active.as_ref().map_or_else(
+            || provider::active_provider_name(&self.model),
+            |active| active.id.display_name().to_string(),
+        );
+        // Plan for the gateway, the local daily quota for Azure.
+        let plan = match &active {
+            Some(active) if active.id == provider::ProviderId::Azure => {
+                Some(crate::quota::QuotaState::load().display_compact())
+            }
+            Some(active) => active.plan.clone(),
+            None => None,
+        };
+        one_shot_status_line(
+            &self.model,
+            self.permission_mode,
+            &provider,
+            plan.as_deref(),
+        )
     }
 
     fn startup_banner(&self) -> String {
@@ -7330,6 +7430,46 @@ mod tests {
         fs::remove_dir_all(config_home).expect("cleanup config home");
         std::env::remove_var("ANTHROPIC_API_KEY");
         std::env::remove_var("NEURON_CONFIG_HOME");
+    }
+
+    /// `neuron -p` on a terminal starts with one line: model, mode and plan.
+    #[test]
+    fn the_one_shot_line_names_model_mode_and_plan() {
+        assert_eq!(
+            super::one_shot_status_line(
+                "zero-x/auto",
+                PermissionMode::WorkspaceWrite,
+                "Zero-X",
+                Some("Free"),
+            ),
+            "neuron \u{00b7} auto \u{00b7} workspace-write \u{00b7} Zero-X Free"
+        );
+        // No plan: the provider alone.
+        assert_eq!(
+            super::one_shot_status_line(
+                "claude-sonnet-4-6",
+                PermissionMode::ReadOnly,
+                "Anthropic",
+                Some("-"),
+            ),
+            "neuron \u{00b7} claude-sonnet-4-6 \u{00b7} read-only \u{00b7} Anthropic"
+        );
+    }
+
+    /// Only the command line's own words open the full-screen UI; `-p` and `prompt`
+    /// stay plain text.
+    #[test]
+    fn only_a_bare_prompt_is_one_for_the_full_screen_ui() {
+        let parse = |args: &[&str]| {
+            let args = args.iter().map(ToString::to_string).collect::<Vec<_>>();
+            parse_args(&args).expect("args should parse");
+            crate::args::bare_prompt_given()
+        };
+        assert!(parse(&["fix", "the", "bug"]));
+        assert!(!parse(&["-p", "fix", "the", "bug"]));
+        assert!(!parse(&["prompt", "fix", "the", "bug"]));
+        assert!(!parse(&[]));
+        assert!(parse(&["--model", "opus", "explain", "this"]));
     }
 
     #[test]

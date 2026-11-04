@@ -19,6 +19,8 @@ export type ParsedArgs = {
   clearLogs: boolean
   continue: boolean
   continueId?: string | null
+  /** `--resume <session>`: the engine continues this saved session (`neuron --resume`). */
+  resume: string | null
   cwd?: string
   initialMode?: AgentMode
   /** Flags for `neuron engine --stdio`; the engine checks them. */
@@ -65,6 +67,10 @@ export function buildProgram(version: string): Command {
     .option(
       '--continue [conversation-id]',
       'Continue from a previous conversation (optionally specify a conversation id)',
+    )
+    .option(
+      '--resume <session>',
+      'Continue a saved session: its id, its file, or latest',
     )
     .option(
       '--cwd <directory>',
@@ -119,6 +125,10 @@ export function parseArgs({
     continueId:
       typeof continueFlag === 'string' && continueFlag.trim().length > 0
         ? continueFlag.trim()
+        : null,
+    resume:
+      typeof options.resume === 'string' && options.resume.trim().length > 0
+        ? options.resume.trim()
         : null,
     cwd: options.cwd,
     initialMode,

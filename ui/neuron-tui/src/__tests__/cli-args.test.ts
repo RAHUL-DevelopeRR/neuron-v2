@@ -62,6 +62,19 @@ describe('CLI argument parsing', () => {
     })
   })
 
+  test('parses --resume with the session it names, beside a prompt', () => {
+    expect(parse().resume).toBeNull()
+    expect(parse('--resume', 'session-1-2-ab12')).toMatchObject({
+      resume: 'session-1-2-ab12',
+      initialPrompt: null,
+    })
+    // `neuron "prompt"` passes the prompt after `--`, so it may start with `-`.
+    expect(parse('--resume', 'latest', '--', '--why does it fail')).toMatchObject({
+      resume: 'latest',
+      initialPrompt: '--why does it fail',
+    })
+  })
+
   test('engine flags pass through, and are absent when not given', () => {
     expect(
       parse(

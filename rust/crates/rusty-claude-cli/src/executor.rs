@@ -524,7 +524,10 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "  neuron [--model MODEL] [--output-format text|json] TEXT"
     )?;
-    writeln!(out, "      Shorthand non-interactive prompt mode")?;
+    writeln!(
+        out,
+        "      On a terminal, the full-screen UI sending TEXT first; otherwise the same as `prompt TEXT`"
+    )?;
     writeln!(out, "  neuron [FLAGS] -p TEXT")?;
     writeln!(
         out,
