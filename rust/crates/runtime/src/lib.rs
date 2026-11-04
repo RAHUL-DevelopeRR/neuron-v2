@@ -52,6 +52,7 @@ pub mod permission_enforcer;
 mod permissions;
 pub mod plugin_lifecycle;
 mod policy_engine;
+pub mod project_permissions;
 mod prompt;
 pub mod recovery_recipes;
 pub mod redaction;
@@ -173,11 +174,11 @@ pub use oauth::{
     PkceChallengeMethod, PkceCodePair,
 };
 pub use permissions::{
-    non_interactive_hint, parse_permission_response, quote_allow_rules, render_permission_prompt,
-    url_host, ConsolePermissionPrompter, PermissionContext, PermissionMode, PermissionOutcome,
-    PermissionOverride, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
-    PermissionRemedy, PermissionRequest, SessionApprovals, ToolCallAssessment,
-    NON_INTERACTIVE_PERMISSION_HINT,
+    deny_for_session_label, non_interactive_hint, parse_permission_response, quote_allow_rules,
+    render_permission_prompt, url_host, user_declined_message, ConsolePermissionPrompter,
+    PermissionContext, PermissionMode, PermissionOutcome, PermissionOverride, PermissionPolicy,
+    PermissionPromptDecision, PermissionPrompter, PermissionRemedy, PermissionRequest,
+    SessionApprovals, ToolCallAssessment, NON_INTERACTIVE_PERMISSION_HINT,
 };
 pub use plugin_lifecycle::{
     DegradedMode, DiscoveryResult, PluginHealthcheck, PluginLifecycle, PluginLifecycleEvent,

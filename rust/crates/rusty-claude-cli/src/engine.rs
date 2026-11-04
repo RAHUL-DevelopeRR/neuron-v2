@@ -3171,7 +3171,10 @@ mod tests {
             .replies
             .send(PermissionReply {
                 id: denied,
-                decision: PermissionDecision::Deny { note: None },
+                decision: PermissionDecision::Deny {
+                    note: None,
+                    session: false,
+                },
             })
             .unwrap();
         let turn = turn_events(&engine.events);
@@ -3185,10 +3188,13 @@ mod tests {
                 turn, cumulative, ..
             }, UiEvent::TurnFinished] => {
                 assert_eq!(id, "toolu_bash_prompt_deny");
-                assert_eq!(output, "tool 'bash' denied by user approval prompt");
+                assert_eq!(
+                    output,
+                    "The user declined `printf 'should not run' | tee denied.txt`. Do not retry it or a variant; choose another approach or ask the user."
+                );
                 assert!(
                     text.starts_with("bash denied as expected: ")
-                        && text.contains("denied by user approval prompt"),
+                        && text.contains("The user declined"),
                     "{text}"
                 );
                 assert_eq!(turn, cumulative, "a cleared session counts afresh");

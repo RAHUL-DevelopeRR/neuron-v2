@@ -40,6 +40,12 @@ pub struct PermissionView {
     /// What "allow for this session" would approve from now on (command prefixes such as
     /// `cargo test`, or a web domain). Empty when only a one-time approval is possible.
     pub session_prefixes: Vec<String>,
+    /// The `permissions.allow` rules "always allow in this project"
+    /// ([`PermissionDecision::AllowForProject`]) would save to the project's
+    /// `.neuron/settings.local.json`. Added after protocol 1: older engines leave it
+    /// out, and a UI offers the choice only when it is not empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub project_rules: Vec<String>,
 }
 
 /// The workspace's git state, for the footer.
@@ -893,8 +899,19 @@ pub enum PermissionDecision {
     AllowOnce,
     /// Run this call and similar ones for the rest of the session.
     AllowForSession,
-    /// Do not run it; `note` is passed to the model.
-    Deny { note: Option<String> },
+    /// Run this call, and save [`PermissionView::project_rules`] so matching calls run
+    /// in this project from now on. Sent only when the request offered project rules
+    /// (so only to engines that know it).
+    AllowForProject,
+    /// Do not run it; `note` is passed to the model. With `session`, matching calls
+    /// (the request's `session_prefixes`, or this exact call) are refused for the rest
+    /// of the session without asking. Added after protocol 1: an older engine ignores
+    /// `session` and denies this call only.
+    Deny {
+        note: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        session: bool,
+    },
 }
 
 /// Answer to [`UiEvent::PermissionRequested`] with the same `id`.
@@ -949,14 +966,63 @@ mod tests {
             id: 7,
             decision: PermissionDecision::Deny {
                 note: Some("use a dry run".into()),
+                session: false,
             },
         };
         let json = serde_json::to_value(&reply).unwrap();
         assert_eq!(json["decision"]["kind"], "deny");
+        assert!(json["decision"].get("session").is_none(), "{json}");
         assert_eq!(
             serde_json::from_value::<PermissionReply>(json).unwrap(),
             reply
         );
+    }
+
+    /// "Deny for this session" and "always allow in this project" are additive: an
+    /// older UI's deny has no `session`, and `project_rules` is left out when empty.
+    #[test]
+    fn session_denials_and_project_rules_are_additive() {
+        let deny: PermissionDecision =
+            serde_json::from_value(serde_json::json!({ "kind": "deny", "note": null })).unwrap();
+        assert_eq!(
+            deny,
+            PermissionDecision::Deny {
+                note: None,
+                session: false
+            }
+        );
+        let for_session = PermissionDecision::Deny {
+            note: None,
+            session: true,
+        };
+        let json = serde_json::to_value(&for_session).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "kind": "deny", "note": null, "session": true })
+        );
+        assert_eq!(
+            serde_json::to_value(PermissionDecision::AllowForProject).unwrap(),
+            serde_json::json!({ "kind": "allow_for_project" })
+        );
+
+        let mut view = PermissionView {
+            tool: "bash".into(),
+            current_mode: "workspace-write".into(),
+            required_mode: "danger-full-access".into(),
+            reason: None,
+            input: r#"{"command":"docker ps"}"#.into(),
+            session_prefixes: vec!["docker ps".into()],
+            project_rules: Vec::new(),
+        };
+        let json = serde_json::to_value(&view).unwrap();
+        assert!(json.get("project_rules").is_none(), "{json}");
+        assert_eq!(
+            serde_json::from_value::<PermissionView>(json).unwrap(),
+            view
+        );
+        view.project_rules = vec!["bash(docker:*)".into()];
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["project_rules"], serde_json::json!(["bash(docker:*)"]));
     }
 
     /// A refusal is a notice with a kind; a plain notice is written as before.

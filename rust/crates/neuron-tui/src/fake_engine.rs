@@ -589,6 +589,7 @@ mod tests {
                 reason: None,
                 input: r#"{"command":"rm -rf target"}"#.into(),
                 session_prefixes: Vec::new(),
+                project_rules: Vec::new(),
             },
         };
         let engine = FakeEngine::spawn(vec![vec![
@@ -621,7 +622,10 @@ mod tests {
             .replies
             .send(PermissionReply {
                 id: 1,
-                decision: PermissionDecision::Deny { note: None },
+                decision: PermissionDecision::Deny {
+                    note: None,
+                    session: false,
+                },
             })
             .unwrap();
         assert!(matches!(

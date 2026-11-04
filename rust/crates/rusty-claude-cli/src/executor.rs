@@ -76,7 +76,9 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 }
 
 /// Writes the approval question for `request` to `out` and reads the answer from
-/// `input`: `y` or `yes` approves the call once, anything else denies it.
+/// `input`: `y` approves the call once, `a` for the session and `p` always in this
+/// project (each when offered), `d` denies it for the rest of the session, anything
+/// else denies it.
 fn ask_for_approval(
     out: &mut dyn Write,
     input: &mut dyn io::BufRead,
@@ -92,28 +94,36 @@ fn ask_for_approval(
     if let Some(reason) = &request.reason {
         question.push_str(&format!("  Reason           {reason}\n"));
     }
+    question.push_str(&format!("  Input            {}\n", request.input));
+    let mut choices = String::from("y");
+    question.push_str("  [y] allow once\n");
+    if !request.session_prefixes.is_empty() {
+        let scope = request
+            .session_prefixes
+            .iter()
+            .map(|prefix| format!("`{prefix}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        question.push_str(&format!("  [a] allow {scope} for this session\n"));
+        choices.push_str("/a");
+    }
+    if !request.project_rules.is_empty() {
+        question.push_str(&format!(
+            "  [p] always allow in this project (saves {} to .neuron/settings.local.json)\n",
+            runtime::quote_allow_rules(&request.project_rules)
+        ));
+        choices.push_str("/p");
+    }
     question.push_str(&format!(
-        "  Input            {}\nApprove this tool call? [y/N]: ",
-        request.input
+        "  [n] deny\n  [d] {}\nApprove this tool call? [{choices}/d/N]: ",
+        runtime::deny_for_session_label(request)
     ));
     let _ = out.write_all(question.as_bytes());
     let _ = out.flush();
 
     let mut response = String::new();
     match input.read_line(&mut response) {
-        Ok(_) => {
-            let normalized = response.trim().to_ascii_lowercase();
-            if matches!(normalized.as_str(), "y" | "yes") {
-                runtime::PermissionPromptDecision::Allow
-            } else {
-                runtime::PermissionPromptDecision::Deny {
-                    reason: format!(
-                        "tool '{}' denied by user approval prompt",
-                        request.tool_name
-                    ),
-                }
-            }
-        }
+        Ok(_) => runtime::parse_permission_response(&response, request),
         Err(error) => runtime::PermissionPromptDecision::Deny {
             reason: format!("permission approval failed: {error}"),
         },
@@ -179,6 +189,7 @@ impl runtime::PermissionPrompter for ChannelPermissionPrompter<'_> {
                 reason: request.reason.clone(),
                 input: request.input.clone(),
                 session_prefixes: request.session_prefixes.clone(),
+                project_rules: request.project_rules.clone(),
             },
         });
         if asked.is_err() {
@@ -200,21 +211,26 @@ impl runtime::PermissionPrompter for ChannelPermissionPrompter<'_> {
                         {
                             runtime::PermissionPromptDecision::AllowForSession
                         }
-                        // Nothing to remember for the session: approve this call only.
-                        PermissionDecision::AllowForSession => {
+                        PermissionDecision::AllowForProject
+                            if !request.project_rules.is_empty() =>
+                        {
+                            runtime::PermissionPromptDecision::AllowForProject
+                        }
+                        // Nothing to remember for the session, or no rule to save for
+                        // the project: approve this call only.
+                        PermissionDecision::AllowForSession
+                        | PermissionDecision::AllowForProject => {
                             runtime::PermissionPromptDecision::Allow
                         }
-                        PermissionDecision::Deny { note } => deny(match note {
-                            Some(note) if !note.trim().is_empty() => format!(
-                                "tool '{}' denied by the user: {}",
-                                request.tool_name,
-                                note.trim()
-                            ),
-                            _ => format!(
-                                "tool '{}' denied by user approval prompt",
-                                request.tool_name
-                            ),
-                        }),
+                        PermissionDecision::Deny { note, session } => {
+                            let reason =
+                                runtime::user_declined_message(request, note.as_deref(), session);
+                            if session {
+                                runtime::PermissionPromptDecision::DenyForSession { reason }
+                            } else {
+                                deny(reason)
+                            }
+                        }
                     };
                 }
                 // An answer to an earlier request the turn already gave up on.
@@ -778,6 +794,7 @@ mod cli_prompter_tests {
             reason: Some("Run `mkdir out`?".to_string()),
             session_prefixes: Vec::new(),
             remedy: runtime::PermissionRemedy::default(),
+            project_rules: Vec::new(),
         }
     }
 
@@ -803,7 +820,11 @@ mod cli_prompter_tests {
             "{shown}"
         );
         assert!(
-            shown.ends_with("Approve this tool call? [y/N]: "),
+            shown.contains("  [d] deny this call for the rest of the session\n"),
+            "{shown}"
+        );
+        assert!(
+            shown.ends_with("Approve this tool call? [y/d/N]: "),
             "{shown}"
         );
 
@@ -814,9 +835,62 @@ mod cli_prompter_tests {
             PermissionMode::WorkspaceWrite,
         );
         assert!(
-            matches!(decision, PermissionPromptDecision::Deny { ref reason } if reason == "tool 'bash' denied by user approval prompt"),
+            matches!(decision, PermissionPromptDecision::Deny { ref reason } if reason == "The user declined `mkdir out`. Do not retry it or a variant; choose another approach or ask the user."),
             "{decision:?}"
         );
+    }
+
+    /// The line REPL offers the session and project choices when the request has them,
+    /// and `d` denies for the rest of the session.
+    #[test]
+    fn the_line_prompt_offers_session_project_and_deny_for_session() {
+        let request = PermissionRequest {
+            input: r#"{"command":"npm install better-sqlite3"}"#.to_string(),
+            session_prefixes: vec!["npm install".to_string()],
+            project_rules: vec!["bash(npm:*)".to_string()],
+            ..request()
+        };
+        let mut out = Vec::new();
+        let decision = ask_for_approval(
+            &mut out,
+            &mut Cursor::new("d\n"),
+            &request,
+            PermissionMode::Prompt,
+        );
+        assert_eq!(
+            decision,
+            PermissionPromptDecision::DenyForSession {
+                reason: "The user declined `npm install better-sqlite3` in this session. Do not retry it or a variant; choose another approach or ask the user.".to_string()
+            }
+        );
+        let shown = String::from_utf8(out).expect("utf-8");
+        assert!(
+            shown.contains("  [a] allow `npm install` for this session\n"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("  [p] always allow in this project (saves \"bash(npm:*)\" to .neuron/settings.local.json)\n"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("  [d] deny `npm install` for the rest of the session\n"),
+            "{shown}"
+        );
+        assert!(shown.ends_with("[y/a/p/d/N]: "), "{shown}");
+
+        for (answer, expected) in [
+            ("a\n", PermissionPromptDecision::AllowForSession),
+            ("p\n", PermissionPromptDecision::AllowForProject),
+            ("yes\n", PermissionPromptDecision::Allow),
+        ] {
+            let decision = ask_for_approval(
+                &mut Vec::new(),
+                &mut Cursor::new(answer),
+                &request,
+                PermissionMode::Prompt,
+            );
+            assert_eq!(decision, expected, "{answer}");
+        }
     }
 }
 
@@ -840,6 +914,11 @@ mod channel_prompter_tests {
             reason: None,
             session_prefixes: session_prefixes.iter().map(ToString::to_string).collect(),
             remedy: runtime::PermissionRemedy::default(),
+            project_rules: if session_prefixes.is_empty() {
+                Vec::new()
+            } else {
+                vec!["bash(cargo:*)".to_string()]
+            },
         }
     }
 
@@ -917,6 +996,7 @@ mod channel_prompter_tests {
                     id,
                     decision: PermissionDecision::Deny {
                         note: Some("use --dry-run first".into()),
+                        session: false,
                     },
                 })
                 .unwrap();
@@ -925,6 +1005,44 @@ mod channel_prompter_tests {
             panic!("denied");
         };
         assert!(reason.contains("use --dry-run first"), "{reason}");
+
+        let denied_for_session = decide_with(&["cargo test"], &cancel, |id, replies| {
+            replies
+                .send(PermissionReply {
+                    id,
+                    decision: PermissionDecision::Deny {
+                        note: None,
+                        session: true,
+                    },
+                })
+                .unwrap();
+        });
+        assert_eq!(
+            denied_for_session,
+            PermissionPromptDecision::DenyForSession {
+                reason: "The user declined `cargo test` in this session. Do not retry it or a variant; choose another approach or ask the user.".to_string()
+            }
+        );
+
+        let for_project = decide_with(&["cargo test"], &cancel, |id, replies| {
+            replies
+                .send(PermissionReply {
+                    id,
+                    decision: PermissionDecision::AllowForProject,
+                })
+                .unwrap();
+        });
+        assert_eq!(for_project, PermissionPromptDecision::AllowForProject);
+        // No rule was offered: approve this call only.
+        let nothing_to_save = decide_with(&[], &cancel, |id, replies| {
+            replies
+                .send(PermissionReply {
+                    id,
+                    decision: PermissionDecision::AllowForProject,
+                })
+                .unwrap();
+        });
+        assert_eq!(nothing_to_save, PermissionPromptDecision::Allow);
     }
 
     #[test]

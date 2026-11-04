@@ -37,7 +37,7 @@ fn disabled_names(object: &Map<String, Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn read_object(path: &Path) -> Result<Map<String, Value>, String> {
+pub(crate) fn read_object(path: &Path) -> Result<Map<String, Value>, String> {
     match fs::read_to_string(path) {
         Ok(text) if text.trim().is_empty() => Ok(Map::new()),
         Ok(text) => match serde_json::from_str::<Value>(&text) {
@@ -50,7 +50,7 @@ fn read_object(path: &Path) -> Result<Map<String, Value>, String> {
     }
 }
 
-fn write_object(path: &Path, object: &Map<String, Value>) -> Result<(), String> {
+pub(crate) fn write_object(path: &Path, object: &Map<String, Value>) -> Result<(), String> {
     let failed = |error: io::Error| format!("cannot write {}: {error}", path.display());
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(failed)?;
