@@ -5213,6 +5213,31 @@ mod tests {
     }
 
     #[test]
+    fn context_window_preflight_errors_name_the_model_without_its_route() {
+        let error = ApiError::ContextWindowExceeded {
+            model: "openai/cohere/north-mini-code:free".to_string(),
+            estimated_input_tokens: 120_000,
+            requested_output_tokens: 16_000,
+            estimated_total_tokens: 136_000,
+            context_window_tokens: 128_000,
+        };
+
+        let rendered = format_user_visible_api_error("session-issue-ctx", &error);
+        let model_line = rendered
+            .lines()
+            .find(|line| line.trim_start().starts_with("Model "))
+            .expect("a Model line");
+        // With the gateway's catalog loaded its name, without it the model part of the id.
+        assert!(
+            model_line.ends_with("north-mini-code") || model_line.ends_with("North Mini Code"),
+            "{rendered}"
+        );
+        for route in ["cohere/", ":free", "openai/", "OpenRouter"] {
+            assert!(!rendered.contains(route), "{route} in {rendered}");
+        }
+    }
+
+    #[test]
     fn provider_context_window_errors_are_reframed_with_same_guidance() {
         let error = ApiError::Api {
             status: "400".parse().expect("status"),

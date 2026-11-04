@@ -1130,9 +1130,10 @@ pub(crate) fn format_context_window_blocked_error(
             estimated_total_tokens,
             context_window_tokens,
         } => {
+            // The model's name, not the gateway's route to it (`cohere/north-mini-code:free`).
             lines.push(format!(
                 "  Model            {}",
-                crate::provider::shown_model(model)
+                crate::gateway_catalog::model_name(model)
             ));
             lines.push(format!(
                 "  Input estimate   ~{estimated_input_tokens} tokens (heuristic)"
