@@ -28,7 +28,10 @@ const BUNDLED_MARKETPLACE: &str = "bundled";
 const SETTINGS_FILE_NAME: &str = "settings.json";
 const REGISTRY_FILE_NAME: &str = "installed.json";
 const MANIFEST_FILE_NAME: &str = "plugin.json";
-const MANIFEST_RELATIVE_PATH: &str = ".claude-plugin/plugin.json";
+const MANIFEST_RELATIVE_PATH: &str = ".neuron-plugin/plugin.json";
+/// Where plugins packaged for the upstream tool keep their manifest. Read only when
+/// neither Neuron path exists; never written, and never named in messages or docs.
+const LEGACY_MANIFEST_RELATIVE_PATH: &str = ".claude-plugin/plugin.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -136,6 +139,24 @@ pub struct PluginManifest {
     pub tools: Vec<PluginToolManifest>,
     #[serde(default)]
     pub commands: Vec<PluginCommandManifest>,
+    /// Skill folders inside the plugin, relative to its root. Each holds skill
+    /// folders with a `SKILL.md`, like `~/.neuron/skills`.
+    #[serde(default)]
+    pub skills: Vec<String>,
+    /// MCP servers the plugin brings, by name, in the shape of the settings'
+    /// `mcpServers` entries. They load with the plugin scope and wait for approval.
+    #[serde(rename = "mcpServers", default)]
+    pub mcp_servers: BTreeMap<String, Value>,
+}
+
+/// What an enabled plugin adds besides its tools and hooks.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PluginExtensions {
+    pub plugin_id: String,
+    pub plugin_name: String,
+    /// Absolute paths of the plugin's skill folders.
+    pub skill_dirs: Vec<PathBuf>,
+    pub mcp_servers: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -245,6 +266,10 @@ struct RawPluginManifest {
     pub tools: Vec<RawPluginToolManifest>,
     #[serde(default)]
     pub commands: Vec<PluginCommandManifest>,
+    #[serde(default)]
+    pub skills: Option<Value>,
+    #[serde(rename = "mcpServers", default)]
+    pub mcp_servers: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -964,6 +989,9 @@ pub enum PluginManifestValidationError {
     UnsupportedManifestContract {
         detail: String,
     },
+    InvalidEntry {
+        detail: String,
+    },
 }
 
 impl Display for PluginManifestValidationError {
@@ -1009,7 +1037,9 @@ impl Display for PluginManifestValidationError {
                 f,
                 "plugin tool `{tool_name}` requiredPermission `{permission}` must be read-only, workspace-write, or danger-full-access"
             ),
-            Self::UnsupportedManifestContract { detail } => f.write_str(detail),
+            Self::UnsupportedManifestContract { detail } | Self::InvalidEntry { detail } => {
+                f.write_str(detail)
+            }
         }
     }
 }
@@ -1389,6 +1419,38 @@ impl PluginManager {
         Ok(discovery)
     }
 
+    /// The skill folders and MCP servers of the enabled plugins, read from their
+    /// manifests. Copies no bundled plugin; a plugin that fails to load adds nothing.
+    pub fn enabled_plugin_extensions(&self) -> Result<Vec<PluginExtensions>, PluginError> {
+        let mut discovery = self.discover_installed_plugins_with_failures()?;
+        let external =
+            self.discover_external_directory_plugins_with_failures(&discovery.plugins)?;
+        discovery.extend(external);
+        let mut extensions = Vec::new();
+        for plugin in &discovery.plugins {
+            let metadata = plugin.metadata();
+            if !self.is_enabled(metadata) {
+                continue;
+            }
+            let Some(root) = metadata.root.as_deref() else {
+                continue;
+            };
+            let Ok(manifest) = load_plugin_from_directory(root) else {
+                continue;
+            };
+            if manifest.skills.is_empty() && manifest.mcp_servers.is_empty() {
+                continue;
+            }
+            extensions.push(PluginExtensions {
+                plugin_id: metadata.id.clone(),
+                plugin_name: metadata.name.clone(),
+                skill_dirs: manifest.skills.iter().map(|path| root.join(path)).collect(),
+                mcp_servers: manifest.mcp_servers,
+            });
+        }
+        Ok(extensions)
+    }
+
     pub fn installed_plugin_registry_report(&self) -> Result<PluginRegistryReport, PluginError> {
         self.sync_bundled_plugins()?;
         Ok(self.build_registry_report(self.discover_installed_plugins_with_failures()?))
@@ -1657,20 +1719,10 @@ fn detect_claude_code_manifest_contract_gaps(
 
     let mut errors = Vec::new();
 
-    for (field, detail) in [
-        (
-            "skills",
-            "plugin manifest field `skills` is not supported: Neuron does not load plugin-managed skills; it finds skills in local roots such as `.claw/skills`, `.omc/skills`, `.agents/skills`, `~/.omc/skills` and `~/.claude/skills/omc-learned`.",
-        ),
-        (
-            "mcpServers",
-            "plugin manifest field `mcpServers` is not supported: Neuron does not import MCP servers from plugin manifests; add them to `mcpServers` in your settings instead.",
-        ),
-        (
-            "agents",
-            "plugin manifest field `agents` is not supported: Neuron does not load agent definitions from plugin manifests.",
-        ),
-    ] {
+    for (field, detail) in [(
+        "agents",
+        "plugin manifest field `agents` is not supported: Neuron does not load agent definitions from plugin manifests.",
+    )] {
         if root.contains_key(field) {
             errors.push(PluginManifestValidationError::UnsupportedManifestContract {
                 detail: detail.to_string(),
@@ -1706,22 +1758,161 @@ fn detect_claude_code_manifest_contract_gaps(
     errors
 }
 
+/// The plugin's manifest: `.neuron-plugin/plugin.json`, then `plugin.json` at its
+/// root, then the upstream packaging path as a silent read-only alias.
 fn plugin_manifest_path(root: &Path) -> Result<PathBuf, PluginError> {
-    let direct_path = root.join(MANIFEST_FILE_NAME);
-    if direct_path.exists() {
-        return Ok(direct_path);
-    }
-
     let packaged_path = root.join(MANIFEST_RELATIVE_PATH);
     if packaged_path.exists() {
         return Ok(packaged_path);
     }
 
+    let direct_path = root.join(MANIFEST_FILE_NAME);
+    if direct_path.exists() {
+        return Ok(direct_path);
+    }
+
+    let legacy_path = root.join(LEGACY_MANIFEST_RELATIVE_PATH);
+    if legacy_path.exists() {
+        return Ok(legacy_path);
+    }
+
     Err(PluginError::NotFound(format!(
         "plugin manifest not found at {} or {}",
-        direct_path.display(),
-        packaged_path.display()
+        packaged_path.display(),
+        direct_path.display()
     )))
+}
+
+/// `entry` under `root` when it is a relative path that stays inside it.
+fn contained_plugin_path(root: &Path, entry: &str) -> Option<PathBuf> {
+    let relative = Path::new(entry);
+    let inside = relative.components().all(|component| {
+        matches!(
+            component,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    });
+    (inside && !entry.trim().is_empty()).then(|| root.join(relative))
+}
+
+fn build_manifest_skills(
+    root: &Path,
+    raw: Option<&Value>,
+    errors: &mut Vec<PluginManifestValidationError>,
+) -> Vec<String> {
+    let entries = match raw {
+        None | Some(Value::Null) => return Vec::new(),
+        Some(Value::String(path)) => vec![path.as_str()],
+        Some(Value::Array(items)) if items.iter().all(Value::is_string) => {
+            items.iter().filter_map(Value::as_str).collect()
+        }
+        Some(_) => {
+            errors.push(PluginManifestValidationError::InvalidEntry {
+                detail:
+                    "plugin manifest field `skills` must be a folder path or a list of folder paths"
+                        .to_string(),
+            });
+            return Vec::new();
+        }
+    };
+    let mut validated = Vec::new();
+    for entry in entries {
+        let entry = entry.trim();
+        let Some(path) = contained_plugin_path(root, entry) else {
+            errors.push(PluginManifestValidationError::InvalidEntry {
+                detail: format!(
+                    "plugin skill folder `{entry}` must be a relative path inside the plugin"
+                ),
+            });
+            continue;
+        };
+        if !path.is_dir() {
+            errors.push(PluginManifestValidationError::MissingPath {
+                kind: "skill folder",
+                path,
+            });
+            continue;
+        }
+        if !validated.iter().any(|known: &String| known == entry) {
+            validated.push(entry.to_string());
+        }
+    }
+    validated
+}
+
+fn build_manifest_mcp_servers(
+    root: &Path,
+    raw: Option<&Value>,
+    errors: &mut Vec<PluginManifestValidationError>,
+) -> BTreeMap<String, Value> {
+    let invalid = |detail: String| PluginManifestValidationError::InvalidEntry { detail };
+    let servers = match raw {
+        None | Some(Value::Null) => return BTreeMap::new(),
+        Some(Value::Object(servers)) => servers.clone(),
+        // A JSON file in the plugin: `{"mcpServers": {...}}` or the map itself.
+        Some(Value::String(entry)) => {
+            let Some(path) = contained_plugin_path(root, entry.trim()) else {
+                errors.push(invalid(format!(
+                    "plugin MCP server file `{entry}` must be a relative path inside the plugin"
+                )));
+                return BTreeMap::new();
+            };
+            let parsed = fs::read_to_string(&path)
+                .map_err(|error| error.to_string())
+                .and_then(|text| {
+                    serde_json::from_str::<Value>(&text).map_err(|error| error.to_string())
+                });
+            match parsed {
+                Ok(Value::Object(mut object)) => match object.remove("mcpServers") {
+                    Some(Value::Object(servers)) => servers,
+                    Some(_) => {
+                        errors.push(invalid(format!(
+                            "`mcpServers` in plugin MCP server file `{entry}` must be an object"
+                        )));
+                        return BTreeMap::new();
+                    }
+                    None => object,
+                },
+                Ok(_) => {
+                    errors.push(invalid(format!(
+                        "plugin MCP server file `{entry}` must hold a JSON object"
+                    )));
+                    return BTreeMap::new();
+                }
+                Err(error) => {
+                    errors.push(invalid(format!(
+                        "plugin MCP server file `{entry}` could not be read: {error}"
+                    )));
+                    return BTreeMap::new();
+                }
+            }
+        }
+        Some(_) => {
+            errors.push(invalid(
+                "plugin manifest field `mcpServers` must be an object or a path to a JSON file"
+                    .to_string(),
+            ));
+            return BTreeMap::new();
+        }
+    };
+    let mut validated = BTreeMap::new();
+    for (name, config) in servers {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            errors.push(PluginManifestValidationError::EmptyEntryField {
+                kind: "MCP server",
+                field: "name",
+                name: None,
+            });
+        } else if config.is_object() {
+            validated.insert(name, config);
+        } else {
+            errors.push(invalid(format!(
+                "plugin MCP server `{name}` must be an object"
+            )));
+        }
+    }
+    validated
 }
 
 fn build_plugin_manifest(
@@ -1757,6 +1948,8 @@ fn build_plugin_manifest(
     );
     let tools = build_manifest_tools(root, raw.tools, &mut errors);
     let commands = build_manifest_commands(root, raw.commands, &mut errors);
+    let skills = build_manifest_skills(root, raw.skills.as_ref(), &mut errors);
+    let mcp_servers = build_manifest_mcp_servers(root, raw.mcp_servers.as_ref(), &mut errors);
 
     if !errors.is_empty() {
         return Err(PluginError::ManifestValidation(errors));
@@ -1772,6 +1965,8 @@ fn build_plugin_manifest(
         lifecycle: raw.lifecycle,
         tools,
         commands,
+        skills,
+        mcp_servers,
     })
 }
 
@@ -2699,8 +2894,9 @@ mod tests {
         let error = load_plugin_from_directory(&root)
             .expect_err("Claude Code plugin manifest should fail with guidance");
         let rendered = error.to_string();
-        assert!(rendered.contains("field `skills` is not supported: Neuron does not load"));
-        assert!(rendered.contains("field `mcpServers` is not supported: Neuron does not import"));
+        // Skills and MCP servers are plugin features now.
+        assert!(!rendered.contains("field `skills` is not supported"));
+        assert!(!rendered.contains("field `mcpServers` is not supported"));
         assert!(rendered.contains("field `agents` is not supported: Neuron does not load"));
         assert!(rendered.contains("field `commands` lists command files or directories"));
         assert!(
@@ -3792,5 +3988,163 @@ mod tests {
         assert!(!output.contains("nzx_plugin_tool_token"), "{output}");
         assert!(!output.contains("ses_plugin_tool_session"), "{output}");
         assert!(output.contains("keep=keep-me"), "{output}");
+    }
+
+    fn write_extension_plugin(root: &Path, name: &str) {
+        write_file(
+            root.join("skills")
+                .join("triage")
+                .join("SKILL.md")
+                .as_path(),
+            "---\nname: triage\ndescription: Sort incoming issues\n---\n# Triage\n",
+        );
+        write_file(
+            root.join(MANIFEST_RELATIVE_PATH).as_path(),
+            &format!(
+                r#"{{
+  "name": "{name}",
+  "version": "1.0.0",
+  "description": "brings a skill and an MCP server",
+  "skills": "./skills",
+  "mcpServers": {{
+    "tracker": {{"command": "node", "args": ["server.js"]}}
+  }}
+}}"#
+            ),
+        );
+    }
+
+    #[test]
+    fn neuron_manifest_path_is_read_before_the_upstream_alias() {
+        let root = temp_dir("manifest-neuron-first");
+        write_file(
+            root.join(LEGACY_MANIFEST_RELATIVE_PATH).as_path(),
+            r#"{"name": "legacy-name", "version": "1.0.0", "description": "old"}"#,
+        );
+        let legacy = load_plugin_from_directory(&root).expect("the alias still loads");
+        assert_eq!(legacy.name, "legacy-name");
+
+        write_file(
+            root.join(MANIFEST_RELATIVE_PATH).as_path(),
+            r#"{"name": "neuron-name", "version": "1.0.0", "description": "new"}"#,
+        );
+        let manifest = load_plugin_from_directory(&root).expect("neuron manifest loads");
+        assert_eq!(manifest.name, "neuron-name");
+
+        fs::remove_dir_all(root.join(MANIFEST_RELATIVE_PATH).parent().unwrap()).unwrap();
+        fs::remove_dir_all(root.join(LEGACY_MANIFEST_RELATIVE_PATH).parent().unwrap()).unwrap();
+        let missing = load_plugin_from_directory(&root)
+            .expect_err("no manifest")
+            .to_string();
+        assert!(missing.contains(".neuron-plugin"), "{missing}");
+        assert!(!missing.contains("claude"), "{missing}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn manifest_declares_skill_folders_and_mcp_servers() {
+        let root = temp_dir("manifest-extensions");
+        write_extension_plugin(&root, "tracker-kit");
+        let manifest = load_plugin_from_directory(&root).expect("manifest loads");
+        assert_eq!(manifest.skills, vec!["./skills".to_string()]);
+        assert_eq!(
+            manifest.mcp_servers.get("tracker"),
+            Some(&serde_json::json!({"command": "node", "args": ["server.js"]}))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn manifest_reads_mcp_servers_from_a_json_file_in_the_plugin() {
+        let root = temp_dir("manifest-mcp-file");
+        write_file(
+            root.join("servers.json").as_path(),
+            r#"{"mcpServers": {"docs": {"type": "http", "url": "https://docs.example/mcp"}}}"#,
+        );
+        write_file(
+            root.join(MANIFEST_RELATIVE_PATH).as_path(),
+            r#"{"name": "docs-kit", "version": "1.0.0", "description": "d", "mcpServers": "servers.json"}"#,
+        );
+        let manifest = load_plugin_from_directory(&root).expect("manifest loads");
+        assert_eq!(
+            manifest.mcp_servers.keys().collect::<Vec<_>>(),
+            vec!["docs"]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn manifest_refuses_paths_that_leave_the_plugin_and_non_object_servers() {
+        let root = temp_dir("manifest-escape");
+        write_file(
+            root.join(MANIFEST_RELATIVE_PATH).as_path(),
+            r#"{"name": "escape", "version": "1.0.0", "description": "d",
+                "skills": ["../outside", "/etc"],
+                "mcpServers": {"bad": "node server.js"}}"#,
+        );
+        let rendered = load_plugin_from_directory(&root)
+            .expect_err("escaping paths are refused")
+            .to_string();
+        assert!(
+            rendered
+                .contains("skill folder `../outside` must be a relative path inside the plugin"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("skill folder `/etc` must be a relative path"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("plugin MCP server `bad` must be an object"),
+            "{rendered}"
+        );
+
+        write_file(
+            root.join(MANIFEST_RELATIVE_PATH).as_path(),
+            r#"{"name": "escape", "version": "1.0.0", "description": "d", "mcpServers": "../servers.json"}"#,
+        );
+        let rendered = load_plugin_from_directory(&root)
+            .expect_err("a server file outside is refused")
+            .to_string();
+        assert!(
+            rendered.contains("must be a relative path inside the plugin"),
+            "{rendered}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn enabled_plugin_extensions_lists_only_enabled_plugins() {
+        let _guard = env_guard();
+        let config_home = temp_dir("extensions-home");
+        let source_root = temp_dir("extensions-source");
+        write_extension_plugin(&source_root, "tracker-kit");
+
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        let install = manager
+            .install(source_root.to_str().expect("utf8 path"))
+            .expect("install should succeed");
+        let extensions = manager.enabled_plugin_extensions().expect("extensions");
+        assert_eq!(extensions.len(), 1);
+        assert_eq!(extensions[0].plugin_id, install.plugin_id);
+        assert_eq!(extensions[0].plugin_name, "tracker-kit");
+        assert_eq!(
+            extensions[0].skill_dirs,
+            vec![install.install_path.join("./skills")]
+        );
+        assert!(extensions[0].skill_dirs[0]
+            .join("triage")
+            .join("SKILL.md")
+            .is_file());
+        assert!(extensions[0].mcp_servers.contains_key("tracker"));
+
+        manager.disable(&install.plugin_id).expect("disable");
+        assert!(manager
+            .enabled_plugin_extensions()
+            .expect("extensions after disable")
+            .is_empty());
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(source_root);
     }
 }
