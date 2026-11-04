@@ -560,7 +560,7 @@ impl HookRunner {
         };
         let target = input.target.as_deref();
         self.run_commands(
-            HookCall {
+            &HookCall {
                 event,
                 target,
                 tool_name: target.unwrap_or(""),
@@ -596,7 +596,7 @@ impl HookRunner {
             env.push(("HOOK_TOOL_OUTPUT", tool_output.to_string()));
         }
         self.run_commands(
-            HookCall {
+            &HookCall {
                 event,
                 target: Some(tool_name),
                 tool_name,
@@ -609,9 +609,10 @@ impl HookRunner {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     fn run_commands(
         &self,
-        call: HookCall<'_>,
+        call: &HookCall<'_>,
         abort_signal: Option<&HookAbortSignal>,
         mut reporter: Option<&mut dyn HookProgressReporter>,
     ) -> HookRunResult {
@@ -673,7 +674,7 @@ impl HookRunner {
                 });
             }
             let started = Instant::now();
-            let outcome = Self::run_command(command, &label, &call, &payload, abort_signal);
+            let outcome = Self::run_command(command, &label, call, &payload, abort_signal);
             let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             let completed =
                 |outcome: HookOutcome, parsed: &ParsedHookOutput| HookProgressEvent::Completed {

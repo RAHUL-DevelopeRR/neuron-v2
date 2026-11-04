@@ -306,7 +306,7 @@ mod tests {
     fn rejects_malformed_entries_with_their_position() {
         let cases = [
             (json(r#""x""#), "must be an array"),
-            (json(r#"[42]"#), "hooks.Stop[0] must be a command string"),
+            (json("[42]"), "hooks.Stop[0] must be a command string"),
             (json(r#"[{"matcher": "bash"}]"#), "needs a \"command\""),
             (json(r#"[{"command": 1}]"#), "command must be a string"),
             (

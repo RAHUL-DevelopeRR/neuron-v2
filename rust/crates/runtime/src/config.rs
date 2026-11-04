@@ -424,6 +424,7 @@ impl ConfigLoader {
             .map_or_else(|| PathBuf::from(".claw"), |parent| parent.join(".claw"))
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn load(&self) -> Result<RuntimeConfig, ConfigError> {
         let mut merged = BTreeMap::new();
         let mut loaded_entries = Vec::new();

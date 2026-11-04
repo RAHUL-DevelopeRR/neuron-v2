@@ -363,7 +363,7 @@ fn run(mut command: Command, stdin: Option<&str>) -> Output {
             .write_all(input.as_bytes())
             .unwrap();
     }
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     while child.try_wait().unwrap().is_none() {
         if Instant::now() >= deadline {
             let _ = child.kill();

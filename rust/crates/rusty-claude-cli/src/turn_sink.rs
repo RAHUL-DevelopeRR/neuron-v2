@@ -262,7 +262,9 @@ impl TurnOutput {
                 Sender::clone(&channel.events),
                 Arc::clone(&channel.capabilities),
             ))),
-            _ => Some(Box::new(crate::progress::CliHookProgressReporter)),
+            Self::Ansi => Some(Box::new(crate::progress::CliHookProgressReporter)),
+            #[cfg(test)]
+            Self::Captured(_) => Some(Box::new(crate::progress::CliHookProgressReporter)),
         }
     }
 

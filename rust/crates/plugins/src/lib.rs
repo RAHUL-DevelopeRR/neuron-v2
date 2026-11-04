@@ -3831,11 +3831,11 @@ exit 0
     fn plugin_tools_time_out_and_their_process_tree_is_terminated() {
         assert_eq!(
             subprocess::DEFAULT_PLUGIN_TOOL_TIMEOUT,
-            std::time::Duration::from_secs(120)
+            std::time::Duration::from_mins(2)
         );
         assert_eq!(
             subprocess::DEFAULT_HOOK_TIMEOUT,
-            std::time::Duration::from_secs(60)
+            std::time::Duration::from_mins(1)
         );
         let tool = shell_plugin_tool(if cfg!(windows) {
             "ping -n 30 127.0.0.1 >NUL & echo late"
