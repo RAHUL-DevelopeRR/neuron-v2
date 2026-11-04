@@ -23,6 +23,9 @@ pub(crate) enum CliAction {
     Mcp {
         args: Option<String>,
         output_format: CliOutputFormat,
+        /// `--permission-mode` (or `--dangerously-skip-permissions`) when given: the
+        /// mode `neuron mcp serve` runs tools in (read-only otherwise).
+        permission_mode: Option<PermissionMode>,
     },
     Skills {
         args: Option<String>,
@@ -589,6 +592,7 @@ pub(crate) fn parse_args_with_stdin(
         "mcp" => Ok(CliAction::Mcp {
             args: join_optional_args(&rest[1..]),
             output_format,
+            permission_mode: permission_mode_override,
         }),
         "skills" => {
             let args = join_optional_args(&rest[1..]);
@@ -1076,6 +1080,7 @@ pub(crate) fn parse_direct_slash_cli_action(
                 (None, Some(target)) => Some(target),
             },
             output_format,
+            permission_mode: None,
         }),
         Ok(Some(SlashCommand::Skills { args })) => {
             match classify_skills_slash_command(args.as_deref()) {

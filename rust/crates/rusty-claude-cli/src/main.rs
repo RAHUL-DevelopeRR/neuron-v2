@@ -509,7 +509,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Mcp {
             args,
             output_format,
-        } => LiveCli::print_mcp(args.as_deref(), output_format)?,
+            permission_mode,
+        } => LiveCli::print_mcp(args.as_deref(), output_format, permission_mode)?,
         CliAction::Skills {
             args,
             output_format,
@@ -3524,7 +3525,7 @@ impl LiveCli {
                     (Some(action), Some(target)) => Some(format!("{action} {target}")),
                     (None, Some(target)) => Some(target.to_string()),
                 };
-                Self::print_mcp(args.as_deref(), CliOutputFormat::Text)?;
+                Self::print_mcp(args.as_deref(), CliOutputFormat::Text, None)?;
                 false
             }
             SlashCommand::Memory => {
@@ -4118,12 +4119,13 @@ impl LiveCli {
     fn print_mcp(
         args: Option<&str>,
         output_format: CliOutputFormat,
+        permission_mode: Option<PermissionMode>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // `neuron mcp serve` starts a stdio MCP server exposing neuron's built-in
         // tools. All other `mcp` subcommands fall through to the existing
         // configured-server reporter (`list`, `status`, ...).
         if matches!(args.map(str::trim), Some("serve")) {
-            return run_mcp_serve();
+            return run_mcp_serve(permission_mode);
         }
         if let Some(outcome) = crate::mcp_auth::handle_mcp_auth_command(args) {
             println!("{}", outcome?);
@@ -6380,6 +6382,7 @@ mod tests {
             CliAction::Mcp {
                 args: None,
                 output_format: CliOutputFormat::Text,
+                permission_mode: None,
             }
         );
         assert_eq!(
@@ -6798,6 +6801,7 @@ mod tests {
             CliAction::Mcp {
                 args: None,
                 output_format: CliOutputFormat::Json,
+                permission_mode: None,
             }
         );
         assert_eq!(
@@ -7038,6 +7042,7 @@ mod tests {
             CliAction::Mcp {
                 args: Some("show demo".to_string()),
                 output_format: CliOutputFormat::Text,
+                permission_mode: None,
             }
         );
         assert_eq!(
