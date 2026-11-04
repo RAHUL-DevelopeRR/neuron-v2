@@ -217,6 +217,26 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "maxIterations",
         expected: FieldType::Number,
     },
+    FieldSpec {
+        name: "toolCapableModels",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "autoToolModel",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "subagentModel",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "summaryModel",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "reviewerModel",
+        expected: FieldType::String,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[
@@ -610,6 +630,23 @@ mod tests {
             result.errors[0].kind,
             DiagnosticKind::UnknownKey { .. }
         ));
+    }
+
+    #[test]
+    fn accepts_model_routing_keys_and_types_them() {
+        let source = r#"{"toolCapableModels": ["nemotron-3-ultra"], "autoToolModel": "nemotron-3-ultra", "subagentModel": "a", "summaryModel": "b", "reviewerModel": "c"}"#;
+        let parsed = JsonValue::parse(source).expect("valid json");
+        let object = parsed.as_object().expect("object");
+        let result = validate_config_file(object, source, &test_path());
+        assert!(result.errors.is_empty(), "{result:?}");
+        assert!(result.warnings.is_empty(), "{result:?}");
+
+        let source = r#"{"toolCapableModels": "nemotron-3-ultra"}"#;
+        let parsed = JsonValue::parse(source).expect("valid json");
+        let object = parsed.as_object().expect("object");
+        let result = validate_config_file(object, source, &test_path());
+        assert_eq!(result.errors.len(), 1, "{result:?}");
+        assert_eq!(result.errors[0].field, "toolCapableModels");
     }
 
     #[test]

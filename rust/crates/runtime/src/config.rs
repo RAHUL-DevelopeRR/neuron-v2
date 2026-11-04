@@ -7,6 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::json::JsonValue;
+use crate::model_routing::ModelRoutingSettings;
 use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
 
 /// Schema name advertised by generated settings files.
@@ -114,6 +115,7 @@ pub struct RuntimeFeatureConfig {
     sandbox: SandboxConfig,
     provider_fallbacks: ProviderFallbackConfig,
     trusted_roots: Vec<String>,
+    model_routing: ModelRoutingSettings,
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -522,6 +524,7 @@ impl ConfigLoader {
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
+            model_routing: parse_optional_model_routing(&merged_value)?,
         };
 
         Ok(RuntimeConfig {
@@ -972,6 +975,11 @@ impl RuntimeConfig {
     }
 
     #[must_use]
+    pub fn model_routing(&self) -> &ModelRoutingSettings {
+        &self.feature_config.model_routing
+    }
+
+    #[must_use]
     pub fn trusted_roots(&self) -> &[String] {
         &self.feature_config.trusted_roots
     }
@@ -1038,6 +1046,19 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn provider_fallbacks(&self) -> &ProviderFallbackConfig {
         &self.provider_fallbacks
+    }
+
+    /// Models picked for particular jobs (`toolCapableModels`, `autoToolModel`,
+    /// `subagentModel`, `summaryModel`, `reviewerModel`).
+    #[must_use]
+    pub fn model_routing(&self) -> &ModelRoutingSettings {
+        &self.model_routing
+    }
+
+    #[must_use]
+    pub fn with_model_routing(mut self, model_routing: ModelRoutingSettings) -> Self {
+        self.model_routing = model_routing;
+        self
     }
 
     #[must_use]
@@ -1450,6 +1471,31 @@ fn parse_optional_sandbox_config(root: &JsonValue) -> Result<SandboxConfig, Conf
         filesystem_mode,
         allowed_mounts: optional_string_array(sandbox, "allowedMounts", "merged settings.sandbox")?
             .unwrap_or_default(),
+    })
+}
+
+fn parse_optional_model_routing(root: &JsonValue) -> Result<ModelRoutingSettings, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(ModelRoutingSettings::default());
+    };
+    let context = "merged settings";
+    let model = |key: &str| -> Result<Option<String>, ConfigError> {
+        Ok(optional_string(object, key, context)?
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string))
+    };
+    Ok(ModelRoutingSettings {
+        tool_capable_models: optional_string_array(object, "toolCapableModels", context)?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|model| model.trim().to_string())
+            .filter(|model| !model.is_empty())
+            .collect(),
+        auto_tool_model: model("autoToolModel")?,
+        subagent_model: model("subagentModel")?,
+        summary_model: model("summaryModel")?,
+        reviewer_model: model("reviewerModel")?,
     })
 }
 
@@ -2325,6 +2371,70 @@ mod tests {
             Some(FilesystemIsolationMode::AllowList)
         );
         assert_eq!(loaded.sandbox().allowed_mounts, vec!["logs", "tmp/cache"]);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_per_task_and_tool_capable_models() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{
+              "toolCapableModels": ["nemotron-3-ultra", " ", "kimi-k2"],
+              "autoToolModel": "nemotron-3-ultra",
+              "subagentModel": "gemini-2.5-flash",
+              "summaryModel": " groq/openai/gpt-oss-20b ",
+              "reviewerModel": ""
+            }"#,
+        )
+        .expect("write settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+        let routing = loaded.model_routing();
+        assert_eq!(
+            routing.tool_capable_models(),
+            ["nemotron-3-ultra".to_string(), "kimi-k2".to_string()]
+        );
+        assert_eq!(routing.auto_tool_model(), Some("nemotron-3-ultra"));
+        assert_eq!(routing.subagent_model(), Some("gemini-2.5-flash"));
+        assert_eq!(routing.summary_model(), Some("groq/openai/gpt-oss-20b"));
+        assert_eq!(routing.reviewer_model(), None, "blank means unset");
+        assert_eq!(
+            loaded.feature_config().model_routing(),
+            routing,
+            "the feature config carries the same settings"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn model_routing_settings_are_empty_when_unset_and_typed_when_set() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+        assert_eq!(
+            loaded.model_routing(),
+            &crate::model_routing::ModelRoutingSettings::default()
+        );
+
+        fs::write(home.join("settings.json"), r#"{"subagentModel": 3}"#).expect("write");
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("a number is not a model");
+        assert!(error.to_string().contains("subagentModel"), "{error}");
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

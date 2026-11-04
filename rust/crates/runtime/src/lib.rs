@@ -38,6 +38,7 @@ pub mod mcp_server;
 mod mcp_stdio;
 pub mod mcp_tool_bridge;
 pub mod model_registry;
+pub mod model_routing;
 mod oauth;
 pub mod permission_enforcer;
 mod permissions;
@@ -146,6 +147,7 @@ pub use mcp_stdio::{
     McpServerManagerError, McpStdioProcess, McpTool, McpToolCallContent, McpToolCallParams,
     McpToolCallResult, McpToolDiscoveryReport, UnsupportedMcpServer,
 };
+pub use model_routing::{ModelRouting, ModelRoutingSettings};
 pub use oauth::{
     clear_oauth_credentials, code_challenge_s256, credentials_path, generate_pkce_pair,
     generate_state, load_oauth_credentials, loopback_redirect_uri, parse_oauth_callback_query,

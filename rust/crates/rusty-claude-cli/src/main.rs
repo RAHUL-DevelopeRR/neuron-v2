@@ -66,6 +66,7 @@ mod headless;
 mod init;
 mod input;
 mod line_diff;
+mod model_routing;
 mod orchestrator;
 mod plan_mode;
 mod progress;
