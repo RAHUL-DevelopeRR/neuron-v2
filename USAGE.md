@@ -481,7 +481,8 @@ Until a directory is trusted, its settings keep only what restricts Neuron:
 Hooks, MCP servers, allow and ask rules, model, aliases, provider and the other keys
 are ignored, with a warning naming them. Once a directory is trusted, each MCP server
 its settings (or its `.mcp.json`) add still waits for your approval
-(`/mcp approve <server>`), and asks again when its command, arguments or URL change.
+(`/mcp approve <server>`), and asks again when its command, arguments, environment,
+headers or URL change.
 Even in a trusted directory, settings files
 cannot set a full-access permission mode; pass `--permission-mode danger-full-access`
 or put it in your user settings.

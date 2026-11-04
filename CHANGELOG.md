@@ -16,6 +16,13 @@ The release workflow copies a version's section into its GitHub release notes.
   characters with the rest in a spill file. `neuron mcp serve` checks every call
   against your permission rules (read-only unless `--permission-mode` is given),
   annotates its tools, and refuses an untrusted folder.
+- MCP hardening follow-ups: near-JSON `MCPTool` calls and `MCPTool` calls that name the
+  tool with `tool` or carry extra keys meet the named tool's rules; an approval also
+  covers environment and header values and the `oauth` block (existing approvals are
+  asked again once); approving a disabled workspace server records it; a server can
+  no longer fake the end of its external-content block; spill files go to
+  `~/.neuron/mcp-output` inside the envelope; and the tool descriptions and schemas of
+  servers Neuron does not ship are cleaned and capped.
 - Remote MCP servers: a server with a `url` is reached over Streamable HTTP (or SSE
   with `"type": "sse"`), and `neuron mcp login <server>` signs in to one that needs
   OAuth; the token is kept in the OS keychain, or in an owner-only file when no
