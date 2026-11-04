@@ -120,6 +120,9 @@ The release workflow copies a version's section into its GitHub release notes.
   A script's refused page names `--allow-origin` with the page's host; calls it
   cannot unlock (full-access tools, a refused file name, a click without a URL) do
   not mention it.
+- A stdio MCP server's notifications (such as the browser's tool-list change once it
+  is ready) and its own requests no longer stand in for the reply to a call; the first
+  browser call of a session failed with "missing field `id`".
 - `neuron plugins [list|install|enable|disable|update|uninstall]` runs locally, and an
   unknown word after `neuron mcp`, `neuron plugins` or `neuron skills` is refused with
   the usage line instead of being sent to the model as a prompt.
