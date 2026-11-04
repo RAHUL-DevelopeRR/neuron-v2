@@ -551,7 +551,9 @@ impl PermissionPolicy {
     /// bundled-browser call that opens a page (`mcp__playwright__browser_*`
     /// with a `url`), whose host is not one of the run's origins. A browser
     /// URL that is not http(s) (`file:`, `data:`) is refused too, except
-    /// `about:blank`.
+    /// `about:blank`. A browser call without a URL that can still take the
+    /// page elsewhere (a click, typing, a page script, going back) is refused
+    /// as well: only the calls in [`BROWSER_CALLS_THAT_STAY`] run without one.
     fn run_origin_refusal(&self, tool_name: &str, input: &str) -> Option<String> {
         let browser = tool_name.starts_with("mcp__playwright__browser");
         if tool_name != "WebFetch" && !browser {
@@ -561,7 +563,14 @@ impl PermissionPolicy {
         if grants.origins.is_empty() {
             return None;
         }
-        let url = input_field(input, &["url"])?;
+        let Some(url) = input_field(input, &["url"]) else {
+            return (browser && !browser_call_stays_on_page(tool_name, input)).then(|| {
+                format!(
+                    "{tool_name} refused: it can leave the page without naming a URL, and this run only reaches the hosts given with --allow-origin ({}); open a listed page with browser_navigate instead",
+                    grants.origins.join(", ")
+                )
+            });
+        };
         match url_host(&url) {
             Some(host) => grants.refusal_for(tool_name, &host),
             None if browser && url.trim() != "about:blank" => grants.refusal_for(tool_name, &url),
@@ -1311,6 +1320,28 @@ fn classify_tool_command(
 }
 
 /// Reads the first string field named in `keys` from a JSON tool input.
+/// Bundled-browser calls that read or close what is open but never load
+/// another page, so `--allow-origin` lets them run without a URL.
+const BROWSER_CALLS_THAT_STAY: &[&str] = &[
+    "browser_snapshot",
+    "browser_take_screenshot",
+    "browser_console_messages",
+    "browser_network_requests",
+    "browser_wait_for",
+    "browser_resize",
+    "browser_close",
+];
+
+/// Whether a bundled-browser call without a URL stays on the pages already
+/// open: one of [`BROWSER_CALLS_THAT_STAY`], or `browser_tabs` listing tabs.
+fn browser_call_stays_on_page(tool_name: &str, input: &str) -> bool {
+    let Some(call) = tool_name.strip_prefix("mcp__playwright__") else {
+        return false;
+    };
+    BROWSER_CALLS_THAT_STAY.contains(&call)
+        || (call == "browser_tabs" && input_field(input, &["action"]).as_deref() == Some("list"))
+}
+
 fn input_field(input: &str, keys: &[&str]) -> Option<String> {
     let Ok(Value::Object(object)) = serde_json::from_str::<Value>(input) else {
         return None;
@@ -2139,11 +2170,38 @@ mod tests {
             policy.authorize(navigate, &url("about:blank"), None),
             PermissionOutcome::Allow
         );
-        // A browser call without a URL, and other tools, are not limited here.
+        // A browser call without a URL runs only when it cannot leave the page.
         assert_eq!(
             policy.authorize("mcp__playwright__browser_snapshot", "{}", None),
             PermissionOutcome::Allow
         );
+        assert_eq!(
+            policy.authorize(
+                "mcp__playwright__browser_tabs",
+                r#"{"action":"list"}"#,
+                None
+            ),
+            PermissionOutcome::Allow
+        );
+        for (call, input) in [
+            ("browser_click", r#"{"element":"Docs link","ref":"e12"}"#),
+            (
+                "browser_evaluate",
+                r#"{"function":"() => location.href = 'https://evil.example/'"}"#,
+            ),
+            ("browser_navigate_back", "{}"),
+            ("browser_type", r#"{"ref":"e3","text":"q","submit":true}"#),
+            ("browser_tabs", r#"{"action":"new"}"#),
+        ] {
+            let reason =
+                refused(policy.authorize(&format!("mcp__playwright__{call}"), input, None));
+            assert!(reason.contains("without naming a URL"), "{call}: {reason}");
+            assert!(
+                reason.contains("--allow-origin (example.com)"),
+                "{call}: {reason}"
+            );
+        }
+        // Other tools are not limited here.
         assert_eq!(
             policy.authorize("mcp__other__fetch", &url("https://evil.example/"), None),
             PermissionOutcome::Allow
