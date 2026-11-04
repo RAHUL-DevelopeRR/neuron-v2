@@ -1613,10 +1613,15 @@ impl ResearchModel for LiveModel<'_> {
     }
 }
 
-/// [`ResearchWeb`] on the real web, each search and read checked against the
-/// session's permission rules as `WebSearch` and `WebFetch` calls are.
+/// [`ResearchWeb`] on the real web. Each search and read is a `WebSearch` or
+/// `WebFetch` call as far as the session's rules go: its `PreToolUse` hooks run
+/// first (a hook may deny it, rewrite its input or decide its permission), then
+/// the permission rules, and its `PostToolUse` (or `PostToolUseFailure`) hooks
+/// run on the result; a result a post hook blocks is not used.
 pub(crate) struct LiveWeb {
     policy: runtime::PermissionPolicy,
+    hooks: runtime::HookRunner,
+    hook_abort: runtime::HookAbortSignal,
 }
 
 impl LiveWeb {
@@ -1631,7 +1636,87 @@ impl LiveWeb {
         } else {
             policy.clone()
         };
-        Self { policy }
+        Self {
+            policy,
+            hooks: runtime::HookRunner::default(),
+            hook_abort: runtime::HookAbortSignal::new(),
+        }
+    }
+
+    /// Runs the session's tool `hooks` around each search and read; `abort`
+    /// stops a running hook when the run is interrupted.
+    pub(crate) fn with_hooks(
+        mut self,
+        hooks: runtime::HookRunner,
+        abort: runtime::HookAbortSignal,
+    ) -> Self {
+        self.hooks = hooks;
+        self.hook_abort = abort;
+        self
+    }
+
+    /// The `PreToolUse` hooks and the permission check for one `tool` call with
+    /// `input`, as a turn runs them for the model's calls. Returns the input to
+    /// use (a hook may rewrite it) or why the call is refused.
+    fn before(&self, tool: &str, input: &Value) -> Result<Value, String> {
+        let pre = self.hooks.run_pre_tool_use_with_signal(
+            tool,
+            &input.to_string(),
+            Some(&self.hook_abort),
+        );
+        let blocked = if pre.is_cancelled() {
+            Some("cancelled")
+        } else if pre.is_failed() {
+            Some("failed for")
+        } else if pre.is_denied() {
+            Some("denied")
+        } else {
+            None
+        };
+        if let Some(what) = blocked {
+            return Err(hook_message(&pre, &format!("PreToolUse hook {what} {tool}")));
+        }
+        let effective = pre
+            .updated_input()
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .filter(Value::is_object)
+            .unwrap_or_else(|| input.clone());
+        let context = runtime::PermissionContext::new(
+            pre.permission_override(),
+            pre.permission_reason().map(ToOwned::to_owned),
+        );
+        match self
+            .policy
+            .authorize_with_context(tool, &effective.to_string(), &context, None)
+        {
+            runtime::PermissionOutcome::Allow => Ok(effective),
+            runtime::PermissionOutcome::Deny { reason } => Err(first_line(&reason).to_string()),
+        }
+    }
+
+    /// The `PostToolUse` hooks (`PostToolUseFailure` for an error) on one call's
+    /// `output`. An error says a hook blocked the result, which is then not used.
+    fn after(&self, tool: &str, input: &Value, output: &str, is_error: bool) -> Result<(), String> {
+        let input = input.to_string();
+        let post = if is_error {
+            self.hooks.run_post_tool_use_failure_with_signal(
+                tool,
+                &input,
+                output,
+                Some(&self.hook_abort),
+            )
+        } else {
+            self.hooks
+                .run_post_tool_use_with_signal(tool, &input, output, false, Some(&self.hook_abort))
+        };
+        if post.is_denied() || post.is_failed() || post.is_cancelled() {
+            Err(hook_message(
+                &post,
+                &format!("a PostToolUse hook blocked the {tool} result"),
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     /// Why this run cannot search the web, checked before it starts.
@@ -1649,23 +1734,62 @@ impl LiveWeb {
 
 impl ResearchWeb for LiveWeb {
     fn search(&mut self, query: &str, run_id: &str) -> Result<Vec<ResearchHit>, SearchFailure> {
-        if let Some(reason) = self.search_refusal(query) {
-            return Err(SearchFailure::Refused(first_line(&reason).to_string()));
+        let input = self
+            .before("WebSearch", &json!({ "query": query }))
+            .map_err(SearchFailure::Refused)?;
+        let query = input
+            .get("query")
+            .and_then(Value::as_str)
+            .map_or_else(|| query.to_string(), shorten_query);
+        match tools::research_web::research_search(&query, run_id, RESULTS_PER_SEARCH) {
+            Ok(search) => {
+                let output = json!({
+                    "query": query,
+                    "results": search.hits.iter().map(|hit| json!({
+                        "title": hit.title,
+                        "url": hit.url,
+                    })).collect::<Vec<_>>(),
+                })
+                .to_string();
+                self.after("WebSearch", &input, &output, false)
+                    .map_err(SearchFailure::Failed)?;
+                Ok(search.hits)
+            }
+            Err(error) => {
+                // The run already fails this search; a hook's verdict changes nothing.
+                let _ = self.after("WebSearch", &input, &error.to_string(), true);
+                Err(SearchFailure::from(error))
+            }
         }
-        tools::research_web::research_search(query, run_id, RESULTS_PER_SEARCH)
-            .map(|search| search.hits)
-            .map_err(SearchFailure::from)
     }
 
     fn fetch(&mut self, url: &str) -> Result<ResearchPage, String> {
-        let input = json!({ "url": url, "prompt": "research" }).to_string();
-        if let runtime::PermissionOutcome::Deny { reason } =
-            self.policy.authorize("WebFetch", &input, None)
-        {
-            return Err(format!("not allowed: {}", first_line(&reason)));
+        let input = self
+            .before("WebFetch", &json!({ "url": url, "prompt": "research" }))
+            .map_err(|reason| format!("not allowed: {reason}"))?;
+        let url = input.get("url").and_then(Value::as_str).unwrap_or(url);
+        match tools::research_web::research_fetch(url, PAGE_CHARS) {
+            Ok(page) => {
+                self.after("WebFetch", &input, &page.text, false)
+                    .map_err(|reason| format!("not used: {reason}"))?;
+                Ok(page)
+            }
+            Err(error) => {
+                let _ = self.after("WebFetch", &input, &error, true);
+                Err(error)
+            }
         }
-        tools::research_web::research_fetch(url, PAGE_CHARS)
     }
+}
+
+/// A hook's own message for a refusal, or `fallback` when it gave none.
+fn hook_message(result: &runtime::HookRunResult, fallback: &str) -> String {
+    result
+        .messages()
+        .iter()
+        .map(|message| message.trim())
+        .find(|message| !message.is_empty())
+        .map_or_else(|| fallback.to_string(), |message| first_line(message).to_string())
 }
 
 fn first_line(text: &str) -> &str {
@@ -2489,6 +2613,66 @@ mod tests {
         // A granted read still goes through WebFetch's address guard.
         let error = web.fetch("http://127.0.0.1:9/").unwrap_err();
         assert!(!error.starts_with("not allowed:"), "{error}");
+    }
+
+    /// A hook command that prints `message` and exits with `code`.
+    fn hook_command(message: &str, code: u8) -> String {
+        if cfg!(windows) {
+            format!("echo {message}& exit /b {code}")
+        } else {
+            format!("printf '{message}'; exit {code}")
+        }
+    }
+
+    #[test]
+    fn tool_hooks_run_for_research_searches_and_reads() {
+        // A denying PreToolUse hook refuses searches and reads before anything is
+        // sent, even with the run's web grant and an allow rule.
+        let deny = runtime::HookRunner::new(runtime::RuntimeHookConfig::new(
+            vec![hook_command("blocked by hook", 2)],
+            Vec::new(),
+            Vec::new(),
+        ));
+        let mut web = LiveWeb::new(&policy(&["WebSearch", "WebFetch"], &[]), true)
+            .with_hooks(deny, runtime::HookAbortSignal::new());
+        match web.search("rust", "rr_x") {
+            Err(SearchFailure::Refused(reason)) => {
+                assert!(reason.contains("blocked by hook"), "{reason}");
+            }
+            other => panic!("the hook should refuse the search: {other:?}"),
+        }
+        let error = web.fetch("https://example.com/").unwrap_err();
+        assert!(error.starts_with("not allowed: blocked by hook"), "{error}");
+
+        // A hook that allows lets the permission rules decide: a deny rule wins.
+        let allow = runtime::HookRunner::new(runtime::RuntimeHookConfig::new(
+            vec![hook_command("checked", 0)],
+            Vec::new(),
+            Vec::new(),
+        ));
+        let mut denied = LiveWeb::new(&policy(&[], &["WebFetch"]), true)
+            .with_hooks(allow, runtime::HookAbortSignal::new());
+        let error = denied.fetch("https://example.com/").unwrap_err();
+        assert!(error.starts_with("not allowed:"), "{error}");
+        assert!(!error.contains("checked"), "{error}");
+
+        // A PostToolUse hook that blocks keeps the result out of the run.
+        let post = runtime::HookRunner::new(runtime::RuntimeHookConfig::new(
+            Vec::new(),
+            vec![hook_command("audit refused", 2)],
+            Vec::new(),
+        ));
+        let web = LiveWeb::new(&policy(&["WebFetch"], &[]), true)
+            .with_hooks(post, runtime::HookAbortSignal::new());
+        let input = json!({"url": "https://example.com/", "prompt": "research"});
+        let error = web
+            .after("WebFetch", &input, "page text", false)
+            .unwrap_err();
+        assert!(error.contains("audit refused"), "{error}");
+        // Without hooks nothing is blocked.
+        let plain = LiveWeb::new(&policy(&["WebFetch"], &[]), true);
+        assert_eq!(plain.after("WebFetch", &input, "page text", false), Ok(()));
+        assert_eq!(plain.before("WebFetch", &input), Ok(input));
     }
 
     #[test]

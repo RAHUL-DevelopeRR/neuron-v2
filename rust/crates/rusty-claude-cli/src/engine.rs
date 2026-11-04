@@ -1722,8 +1722,9 @@ impl Engine {
         // its searches and reads show as the turn's tool rows.
         if let Ok(Some(SlashCommand::Research { args })) = SlashCommand::parse(line) {
             let cancel = CancellationToken::new();
-            running.watch(cancel.clone(), HookAbortSignal::new());
-            let result = self.research(line, args.as_deref(), &cancel, true);
+            let hook_abort = HookAbortSignal::new();
+            running.watch(cancel.clone(), hook_abort.clone());
+            let result = self.research(line, args.as_deref(), &cancel, &hook_abort, true);
             drop(running);
             if let Err(message) = result {
                 self.send(UiEvent::Error {
@@ -1982,10 +1983,12 @@ impl Engine {
             SlashCommand::Research { args } => {
                 let line = format!("/research {}", args.as_deref().unwrap_or_default());
                 let cancel = CancellationToken::new();
+                let hook_abort = HookAbortSignal::new();
                 let shared = Arc::clone(&self.shared);
                 let running = RunningTurn::start(&shared);
-                running.watch(cancel.clone(), HookAbortSignal::new());
-                let result = self.research(line.trim(), args.as_deref(), &cancel, false);
+                running.watch(cancel.clone(), hook_abort.clone());
+                let result =
+                    self.research(line.trim(), args.as_deref(), &cancel, &hook_abort, false);
                 drop(running);
                 result?;
             }
@@ -2341,13 +2344,15 @@ impl Engine {
     /// A research run (`/research`): asks to start (the yes is the run's web grant),
     /// runs with its steps as tool rows and its plan as the task list (`as_turn`; as
     /// notices otherwise), then shows the report, saves it under `.neuron/research/`
-    /// and records it in the conversation. An interrupt (`cancel`) stops it and the
-    /// report is written from the notes so far.
+    /// and records it in the conversation. An interrupt (`cancel`, which also aborts a
+    /// running tool hook through `hook_abort`) stops it and the report is written from
+    /// the notes so far. The session's tool hooks run for its searches and reads.
     fn research(
         &mut self,
         line: &str,
         args: Option<&str>,
         cancel: &CancellationToken,
+        hook_abort: &HookAbortSignal,
         as_turn: bool,
     ) -> Result<(), String> {
         let words = args
@@ -2375,7 +2380,8 @@ impl Engine {
             self.notice("Research not started.");
             return Ok(());
         }
-        let mut web = research::LiveWeb::new(self.cli.runtime.permission_policy(), true);
+        let mut web = research::LiveWeb::new(self.cli.runtime.permission_policy(), true)
+            .with_hooks(self.cli.runtime.hook_runner().clone(), hook_abort.clone());
         if let Some(reason) = web.search_refusal(&request.question) {
             return Err(format!("Research cannot search the web: {reason}"));
         }

@@ -1840,6 +1840,13 @@ where
         &self.permission_policy
     }
 
+    /// The tool hooks this conversation runs around each tool call, for work
+    /// that makes tool-like calls outside a turn (research runs).
+    #[must_use]
+    pub fn hook_runner(&self) -> &HookRunner {
+        &self.hook_runner
+    }
+
     #[must_use]
     pub fn api_client(&self) -> &C {
         &self.api_client
@@ -3019,6 +3026,11 @@ mod tests {
                 Vec::new(),
             )),
         );
+        // Work outside a turn (research runs) reads the same hooks.
+        assert!(runtime
+            .hook_runner()
+            .run_pre_tool_use("WebFetch", r#"{"url":"https://example.com"}"#)
+            .is_denied());
 
         let summary = runtime
             .run_turn("use the tool", None)
