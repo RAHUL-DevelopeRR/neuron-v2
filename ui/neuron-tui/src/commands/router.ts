@@ -6,7 +6,8 @@
 // An answer to the agent's question drawn as a chat line is marked as one,
 // and it and the echo of a failed image path as not sent to the engine, so a
 // rewind does not count them as prompts. Enter on an empty input brings up a
-// waiting commit card or rewind picker. See ui/neuron-tui/PORTING.md.
+// waiting commit card or rewind picker. `/colony stop` during a Colony run
+// interrupts it instead of queuing behind it. See ui/neuron-tui/PORTING.md.
 import {
   dispatchSkillPrompt,
   findCommand,
@@ -19,6 +20,13 @@ import {
   buildPlanPrompt,
   buildReviewPrompt,
 } from './prompt-builders'
+import {
+  colonyRunEnded,
+  colonyRunStarted,
+  isColonyRunning,
+  isColonyStop,
+  startsColonyRun,
+} from '../engine/colony-control'
 import { colonyEventHandler } from '../engine/colony-view'
 import { runEngineLogin, whenEngineStarted } from '../engine/engine-session'
 import { revealDeferredGitPanel } from '../engine/git-views'
@@ -415,21 +423,44 @@ export async function routeUserPrompt(
   // report comes back as a notice.
   if (isSlashCommand(trimmed) && engineReady) {
     const [command = '', ...args] = trimmed.slice(1).trim().split(/\s+/)
+    const name = command.toLowerCase()
+    // `/colony stop` during a run cannot wait behind the run's own exchange:
+    // it interrupts the run now, as Esc does (engine/colony-control.ts).
+    if (name === 'colony' && isColonyStop(args) && isColonyRunning(engine)) {
+      setMessages((prev) => [
+        ...prev,
+        getUserMessage(trimmed),
+        getSystemMessage('Stopping the Colony run…'),
+      ])
+      try {
+        engine.interrupt()
+      } catch (error) {
+        setMessages((prev) => [
+          ...prev,
+          getSystemMessage(error instanceof Error ? error.message : String(error)),
+        ])
+      }
+      return
+    }
+    const startsRun = name === 'colony' && startsColonyRun(args)
     setMessages((prev) => [...prev, getUserMessage(trimmed)])
     const exchange =
-      command.toLowerCase() === 'login'
+      name === 'login'
         ? runEngineLogin(engine)
         : runExchange(
             engine,
-            () => engine.slash(command, args.join(' ')),
+            () => {
+              engine.slash(command, args.join(' '))
+              if (startsRun) colonyRunStarted(engine)
+            },
             // A Colony run keeps one message of live rows current.
-            command.toLowerCase() === 'colony' ? colonyEventHandler(setMessages) : () => {},
+            name === 'colony' ? colonyEventHandler(setMessages) : () => {},
           )
     exchange
       .then(() => {
         // The engine's report has no account and no folder trust: the UI
         // adds them from the engine's status (engine/status-report.ts).
-        if (command.toLowerCase() !== 'status') return
+        if (name !== 'status') return
         const addendum = statusAddendum(useEngineStore.getState().status)
         if (addendum) setMessages((prev) => [...prev, getSystemMessage(addendum)])
       })
@@ -439,6 +470,9 @@ export async function routeUserPrompt(
           getSystemMessage(error instanceof Error ? error.message : String(error)),
         ]),
       )
+      .finally(() => {
+        if (startsRun) colonyRunEnded(engine)
+      })
     return
   }
 
