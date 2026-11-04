@@ -4002,6 +4002,12 @@ const SUBAGENT_UNKNOWN_MODEL_OUTPUT: u32 = 8_192;
 pub type SubagentClientFactory =
     std::sync::Arc<dyn Fn(&str) -> Result<ProviderClient, String> + Send + Sync>;
 
+/// Builds a sub-agent's [`runtime::RequestGuard`] for the client its requests go to
+/// first (the plan's token window: a working set, and a stop before a request the
+/// window does not cover); `None` for no guard.
+pub type SubagentGuardFactory =
+    std::sync::Arc<dyn Fn(&ProviderClient) -> Option<Box<dyn runtime::RequestGuard>> + Send + Sync>;
+
 /// What a sub-agent inherits from the session that spawned it. A sub-agent
 /// never runs with more than its parent: the same permission mode, the same
 /// allow/deny/ask rules, the same tool hooks, and at most the parent's tools.
@@ -4027,6 +4033,8 @@ pub struct SubagentParentContext {
     /// The model sub-agents run on when the `Agent` call names none
     /// (`subagentModel`); the parent's model when `None`.
     pub subagent_model: Option<String>,
+    /// Gives each sub-agent the parent's request guard; `None` for none.
+    pub request_guard: Option<SubagentGuardFactory>,
 }
 
 impl SubagentParentContext {
@@ -4043,6 +4051,7 @@ impl SubagentParentContext {
             client_factory: None,
             context_sections: Vec::new(),
             subagent_model: None,
+            request_guard: None,
         }
     }
 }
@@ -4058,6 +4067,7 @@ impl std::fmt::Debug for SubagentParentContext {
             .field("client_factory", &self.client_factory.is_some())
             .field("context_sections", &self.context_sections.len())
             .field("subagent_model", &self.subagent_model)
+            .field("request_guard", &self.request_guard.is_some())
             .finish()
     }
 }
@@ -4440,21 +4450,30 @@ fn build_agent_runtime(
 ) -> Result<ConversationRuntime<SubagentApiClient, SubagentToolExecutor>, String> {
     let model = job.model.clone();
     let api_client = SubagentApiClient::new(&model, job.allowed_tools.clone())?;
+    let request_guard = subagent_request_guard(&api_client);
     Ok(assemble_agent_runtime(
         api_client,
         &model,
         job.allowed_tools.clone(),
         job.system_prompt.clone(),
+        request_guard,
     ))
 }
 
+/// The parent's request guard for a sub-agent whose requests go to `client` first.
+fn subagent_request_guard(client: &SubagentApiClient) -> Option<Box<dyn runtime::RequestGuard>> {
+    let factory = subagent_parent_context()?.request_guard?;
+    factory(&client.inner.chain.first()?.client)
+}
+
 /// Wires a sub-agent runtime around `api_client` with the inherited
-/// permission policy, hooks and tool set.
+/// permission policy, hooks, tool set and request guard.
 fn assemble_agent_runtime<C: ApiClient>(
     api_client: C,
     model: &str,
     allowed_tools: BTreeSet<String>,
     system_prompt: Vec<String>,
+    request_guard: Option<Box<dyn runtime::RequestGuard>>,
 ) -> ConversationRuntime<C, SubagentToolExecutor> {
     let tool_schema_tokens = subagent_tool_schema_tokens(&allowed_tools);
     let writes_files = ["write_file", "edit_file", "NotebookEdit"]
@@ -4471,7 +4490,7 @@ fn assemble_agent_runtime<C: ApiClient>(
         ),
         runtime::context_manager::ContextPolicy::from_env(),
     );
-    ConversationRuntime::new_with_features(
+    let mut runtime = ConversationRuntime::new_with_features(
         Session::new(),
         api_client,
         tool_executor,
@@ -4486,7 +4505,9 @@ fn assemble_agent_runtime<C: ApiClient>(
         // files in chat; its client follows `providerFallbacks` itself.
         agent_mode: writes_files,
         ..runtime::ModelRouting::default()
-    })
+    });
+    runtime.set_request_guard(request_guard);
+    runtime
 }
 
 /// `1` turns on the completion check's reviewer (see [`SubagentReviewer`]).
@@ -4578,10 +4599,16 @@ impl runtime::ChangeReviewer for SubagentReviewer {
         );
         system_prompt.push(REVIEWER_INSTRUCTIONS.to_string());
         let api_client = SubagentApiClient::new(&self.model, allowed_tools.clone())?;
-        let mut reviewer =
-            assemble_agent_runtime(api_client, &self.model, allowed_tools, system_prompt)
-                .with_max_iterations(REVIEW_MAX_ITERATIONS)
-                .with_cancellation_token(cancel.clone());
+        let request_guard = subagent_request_guard(&api_client);
+        let mut reviewer = assemble_agent_runtime(
+            api_client,
+            &self.model,
+            allowed_tools,
+            system_prompt,
+            request_guard,
+        )
+        .with_max_iterations(REVIEW_MAX_ITERATIONS)
+        .with_cancellation_token(cancel.clone());
         let summary = reviewer
             .run_turn(review_prompt(request), None)
             .map_err(|error| error.to_string())?;
@@ -5045,6 +5072,7 @@ mod subagent_inheritance_tests {
             "openai/auto",
             tools(&[tool]),
             vec!["system".to_string()],
+            None,
         );
         let summary = runtime.run_turn("delegated", None).expect("child turn");
         let ContentBlock::ToolResult {
@@ -5054,6 +5082,81 @@ mod subagent_inheritance_tests {
             panic!("expected a tool result");
         };
         (output.clone(), *is_error)
+    }
+
+    /// The plan's token window as a sub-agent's guard sees it: a working set, and only
+    /// requests of at most `window_left` input tokens go out.
+    struct WindowGuard {
+        working_set: Option<usize>,
+        window_left: usize,
+    }
+
+    impl runtime::RequestGuard for WindowGuard {
+        fn working_set_tokens(&self) -> Option<usize> {
+            self.working_set
+        }
+
+        fn allow_request(&mut self, request: &runtime::RequestEstimate) -> bool {
+            request.input_tokens <= self.window_left
+        }
+    }
+
+    /// Counts the requests that reached the provider.
+    struct CountingApi(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl ApiClient for CountingApi {
+        fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![
+                AssistantEvent::TextDelta("done".to_string()),
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+
+    #[test]
+    fn a_subagent_keeps_the_parents_working_set_and_stops_at_the_window() {
+        let sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut child = assemble_agent_runtime(
+            CountingApi(sent.clone()),
+            "openai/auto",
+            tools(&["read_file"]),
+            vec!["system".to_string()],
+            Some(Box::new(WindowGuard {
+                working_set: Some(2_000),
+                window_left: 0,
+            })),
+        );
+        let summary = child.run_turn("delegated", None).expect("child turn");
+        assert!(
+            matches!(summary.outcome, runtime::TurnOutcome::BudgetStopped { .. }),
+            "{:?}",
+            summary.outcome
+        );
+        assert_eq!(
+            sent.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "nothing sent"
+        );
+        assert_eq!(
+            child.context_manager().policy().working_set_tokens,
+            Some(2_000)
+        );
+
+        // A window that covers the request: it goes out as before.
+        let mut child = assemble_agent_runtime(
+            CountingApi(sent.clone()),
+            "openai/auto",
+            tools(&["read_file"]),
+            vec!["system".to_string()],
+            Some(Box::new(WindowGuard {
+                working_set: None,
+                window_left: usize::MAX,
+            })),
+        );
+        let summary = child.run_turn("delegated", None).expect("child turn");
+        assert_eq!(summary.outcome, runtime::TurnOutcome::Completed);
+        assert_eq!(sent.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

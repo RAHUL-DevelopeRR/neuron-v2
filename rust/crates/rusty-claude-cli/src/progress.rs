@@ -488,11 +488,13 @@ fn assemble_conversation_runtime(
     );
     let summary_model = crate::model_routing::summary_model(routing_settings, &model);
     let request_model = crate::model_routing::request_model(routing_settings, &model, enable_tools);
+    let working_set = crate::plan_window::configured_working_set(working_set_setting);
     register_subagent_parent(
         &model,
         permission_mode,
         &feature_config,
         allowed_tools.as_ref(),
+        working_set,
     );
     let mut api_client = AnthropicRuntimeClient::new(
         session_id,
@@ -506,10 +508,8 @@ fn assemble_conversation_runtime(
     api_client.set_summary_model(summary_model);
     // The plan's token window: a smaller working set, and a question before a request
     // would need more than the window has left (see `plan_window`).
-    let request_guard = crate::plan_window::WindowGuard::new(
-        api_client.uses_gateway(),
-        crate::plan_window::configured_working_set(working_set_setting),
-    );
+    let request_guard =
+        crate::plan_window::WindowGuard::new(api_client.uses_gateway(), working_set);
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         api_client,
@@ -546,18 +546,21 @@ pub(crate) fn estimate_tool_schema_tokens(definitions: &[ToolDefinition]) -> usi
 
 /// Lets sub-agents spawned by the `Agent` tool inherit the parent's resolved
 /// model and provider credentials, and never more authority than the parent:
-/// its permission mode, permission rules, tool hooks and tool allow-list.
+/// its permission mode, permission rules, tool hooks and tool allow-list. They
+/// keep to the plan's token window too (`working_set` is the configured one).
 fn register_subagent_parent(
     model: &str,
     permission_mode: PermissionMode,
     feature_config: &runtime::RuntimeFeatureConfig,
     allowed_tools: Option<&AllowedToolSet>,
+    working_set: Option<usize>,
 ) {
     tools::set_subagent_parent_context(subagent_parent_context_for(
         model,
         permission_mode,
         feature_config,
         allowed_tools,
+        working_set,
     ));
 }
 
@@ -566,6 +569,7 @@ fn subagent_parent_context_for(
     permission_mode: PermissionMode,
     feature_config: &runtime::RuntimeFeatureConfig,
     allowed_tools: Option<&AllowedToolSet>,
+    working_set: Option<usize>,
 ) -> tools::SubagentParentContext {
     let factory: tools::SubagentClientFactory = Arc::new(|model: &str| {
         crate::api_client::build_provider_client(model, None).map_err(|error| error.to_string())
@@ -587,6 +591,7 @@ fn subagent_parent_context_for(
         allowed_tools: allowed_tools.cloned(),
         client_factory: Some(factory),
         context_sections,
+        request_guard: Some(crate::plan_window::subagent_guard_factory(working_set)),
         ..tools::SubagentParentContext::new(model, permission_mode)
     }
 }
@@ -1182,6 +1187,7 @@ mod shared_state_tests {
             runtime::PermissionMode::DangerFullAccess,
             config.feature_config(),
             Some(&allowed),
+            Some(30_000),
         );
 
         assert_eq!(context.model, "openai/groq/openai/gpt-oss-120b");
@@ -1194,6 +1200,14 @@ mod shared_state_tests {
         assert_eq!(context.hooks.pre_tool_use(), ["audit-hook"]);
         assert_eq!(context.allowed_tools.as_ref(), Some(&allowed));
         assert!(context.client_factory.is_some());
+        // Sub-agents keep the conversation's working set (on any provider, once set).
+        let client = api::ProviderClient::OpenAi(api::OpenAiCompatClient::new(
+            "test-key",
+            api::OpenAiCompatConfig::openai(),
+        ));
+        let guard =
+            context.request_guard.as_ref().expect("a guard factory")(&client).expect("a guard");
+        assert_eq!(guard.working_set_tokens(), Some(30_000));
         let _ = fs::remove_dir_all(root);
     }
 

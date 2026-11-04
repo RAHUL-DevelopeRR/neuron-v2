@@ -62,6 +62,8 @@ pub(crate) const STDIN_WAIT: Duration = Duration::from_millis(500);
 pub(crate) const STDIN_MAX_BYTES: usize = 128 * 1024;
 
 static ONE_SHOT: AtomicBool = AtomicBool::new(false);
+/// A one-shot run nobody attends (see [`unattended`]).
+static UNATTENDED: AtomicBool = AtomicBool::new(false);
 /// `--output-format json`: stderr carries JSON only, so denials are not noticed as text.
 static JSON: AtomicBool = AtomicBool::new(false);
 static DENIED: Mutex<DenialLog> = Mutex::new(DenialLog::new());
@@ -77,6 +79,7 @@ pub(crate) fn stdin_is_unattended() -> bool {
 /// one) reach stderr as JSON lines.
 pub(crate) fn start(unattended: bool, output_format: CliOutputFormat) {
     ONE_SHOT.store(true, Ordering::SeqCst);
+    UNATTENDED.store(unattended, Ordering::SeqCst);
     let json_output = output_format == CliOutputFormat::Json;
     JSON.store(json_output, Ordering::SeqCst);
     if json_output {
@@ -96,6 +99,13 @@ pub(crate) fn start(unattended: bool, output_format: CliOutputFormat) {
 /// command into afterwards.
 pub(crate) fn one_shot() -> bool {
     ONE_SHOT.load(Ordering::SeqCst)
+}
+
+/// Whether this is a one-shot run [`start`]ed with nobody to answer (stdin not a
+/// terminal): its questions fail by design, which is not a user's answer. The engine
+/// behind the full-screen UI has no terminal on stdin either, but is attended.
+pub(crate) fn unattended() -> bool {
+    UNATTENDED.load(Ordering::SeqCst)
 }
 
 /// Where an allow rule goes so that scripts get it: a script's workspace is often not

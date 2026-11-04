@@ -1148,6 +1148,15 @@ fn resumed_usage_command_reads_the_account_from_the_gateway() {
         .args(prompt_args("hello"));
     let output = run(prompt, None);
     assert!(output.status.success(), "{}", stderr(&output));
+    // The prompt run may have read the plan's token window in the background.
+    let account_reads = |gateway: &FakeGateway| {
+        gateway
+            .requests()
+            .into_iter()
+            .filter(|request| request.path == "/api/account")
+            .collect::<Vec<_>>()
+    };
+    let before = account_reads(&gateway).len();
 
     let mut resumed = workspace.command(&gateway);
     resumed
@@ -1160,13 +1169,11 @@ fn resumed_usage_command_reads_the_account_from_the_gateway() {
     assert!(report.contains("Zero-X usage"), "{report}");
     assert!(report.contains("Requests today   42 / 100"), "{report}");
     assert!(!stderr(&output).contains("not yet implemented"));
-    let account = gateway
-        .requests()
-        .into_iter()
-        .filter(|request| request.path == "/api/account")
-        .collect::<Vec<_>>();
-    assert_eq!(account.len(), 1);
-    assert_bearer(&account[0], SESSION_TOKEN);
+    let account = account_reads(&gateway);
+    assert_eq!(account.len(), before + 1);
+    for read in &account {
+        assert_bearer(read, SESSION_TOKEN);
+    }
 }
 
 /// `neuron login` signs in through the device flow: it prints the link and code, polls the

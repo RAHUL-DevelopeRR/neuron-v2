@@ -7,7 +7,11 @@
 //! - [`near_limit_notice`] warns once when 90% of the window is used.
 //! - [`WindowGuard`] is the conversation's [`RequestGuard`]: a smaller working set on
 //!   a plan with a window (`workingSetTokens`), and a question before a request would
-//!   need more tokens than the window has left.
+//!   need more tokens than the window has left. A sub-agent gets one too
+//!   ([`subagent_guard_factory`]) that stops instead of asking.
+//! - Once the window's `resets_at` has passed, what the last read said is no longer
+//!   what is left: the figures count as unknown (nothing is asked or warned about) and
+//!   the account is read again in the background.
 
 use std::io::{self, BufRead as _, Write as _};
 use std::sync::{Mutex, PoisonError};
@@ -41,6 +45,9 @@ struct Known {
     quota_seen: Option<api::QuotaRemaining>,
     /// The near-limit notice was shown since the window last went below 90%.
     warned: bool,
+    /// The passed `resets_at` the account was last read again for: one passed reset
+    /// time starts one read.
+    reread_for: Option<String>,
 }
 
 impl Known {
@@ -50,6 +57,7 @@ impl Known {
             window: None,
             quota_seen: None,
             warned: false,
+            reread_for: None,
         }
     }
 
@@ -59,8 +67,10 @@ impl Known {
         self.quota_seen = quota;
     }
 
-    /// Moves the window by the quota headers of the last reply, when they changed.
-    fn apply_quota(&mut self, quota: Option<api::QuotaRemaining>) {
+    /// Moves the window by the quota headers of the last reply, when they changed. A
+    /// reply after the window's reset time says what is left now; when it next frees up
+    /// waits for the next read.
+    fn apply_quota(&mut self, quota: Option<api::QuotaRemaining>, now: u64) {
         if quota.is_none() || quota == self.quota_seen {
             return;
         }
@@ -68,13 +78,34 @@ impl Known {
         if let (Some(window), Some(left)) =
             (self.window.as_mut(), quota.and_then(|quota| quota.tokens))
         {
+            if window.is_past_reset(now) {
+                window.resets_at = None;
+            }
             window.remaining_tokens = Some(left);
             window.used_tokens = Some(window.limit_tokens.saturating_sub(left));
         }
     }
 
-    fn window(&self) -> Option<PlanWindow> {
-        self.window.clone()
+    /// The window at `now` (see [`PlanWindow::as_of`]).
+    fn window(&self, now: u64) -> Option<PlanWindow> {
+        self.window.as_ref().map(|window| window.as_of(now))
+    }
+
+    /// Whether to read the account again: the window's reset time has passed, and no
+    /// read was started for it yet.
+    fn needs_reread(&mut self, now: u64) -> bool {
+        let Some(window) = self
+            .window
+            .as_ref()
+            .filter(|window| window.is_past_reset(now))
+        else {
+            return false;
+        };
+        if self.reread_for == window.resets_at {
+            return false;
+        }
+        self.reread_for.clone_from(&window.resets_at);
+        true
     }
 
     /// See [`has_window`].
@@ -88,7 +119,7 @@ impl Known {
 
     /// The near-limit warning, once per stretch above 90% of the window.
     fn near_limit_notice(&mut self, now: u64) -> Option<String> {
-        let window = self.window()?;
+        let window = self.window(now)?;
         if !window.is_near_limit() {
             self.warned = false;
             return None;
@@ -116,18 +147,28 @@ pub(crate) fn forget() {
     *known() = Known::new();
 }
 
-/// The window as it stands now, when the plan has one and it was read.
+/// The window as it stands now, when the plan has one and it was read. Past its reset
+/// time the account is read again in the background.
 pub(crate) fn current() -> Option<PlanWindow> {
-    let mut known = known();
-    known.apply_quota(api::last_quota_remaining());
-    known.window()
+    let now = crate::clock::now_unix();
+    let (window, reread) = {
+        let mut known = known();
+        let reread = known.needs_reread(now);
+        known.apply_quota(api::last_quota_remaining(), now);
+        (known.window(now), reread)
+    };
+    if reread {
+        read_in_background();
+    }
+    window
 }
 
 /// The near-limit warning, once each time the window passes 90%.
 pub(crate) fn near_limit_notice() -> Option<String> {
+    let now = crate::clock::now_unix();
     let mut known = known();
-    known.apply_quota(api::last_quota_remaining());
-    known.near_limit_notice(crate::clock::now_unix())
+    known.apply_quota(api::last_quota_remaining(), now);
+    known.near_limit_notice(now)
 }
 
 /// Whether the plan has a window: as the last account read said, else (before one)
@@ -200,8 +241,9 @@ pub(crate) fn status_section(
     lines.join("\n")
 }
 
-/// Reads `/api/account` on a thread of its own, so the line REPL knows the window
-/// before the first reply. Does nothing without a usable Zero-X login.
+/// Reads `/api/account` on a thread of its own, so the line REPL and a `neuron prompt`
+/// run know the window before the first reply (or again once it has reset). Does
+/// nothing without a usable Zero-X login.
 pub(crate) fn read_in_background() {
     let Ok(Some(credential)) = crate::auth::current_credential() else {
         return;
@@ -218,6 +260,16 @@ pub(crate) fn read_in_background() {
             // `fetch_account` remembers the window; a failure leaves it unknown.
             let _ = crate::account::fetch_account(&base, &credential.token);
         });
+}
+
+/// [`read_in_background`] when the active provider is Zero-X (the line REPL and
+/// `neuron prompt`; the full-screen engine reads the account itself).
+pub(crate) fn read_on_gateway() {
+    if crate::provider::active_provider()
+        .is_some_and(|active| active.id == crate::provider::ProviderId::ZeroX)
+    {
+        read_in_background();
+    }
 }
 
 /// The working set a conversation keeps: `configured` (the setting, or
@@ -293,7 +345,25 @@ fn answer_sends(answer: &str) -> bool {
 /// terminal. `None` when nobody can answer (a script); `Some(false)` when the question
 /// could not be answered (the turn was interrupted, the UI closed).
 fn ask(question: &UserQuestion) -> Option<bool> {
-    if let Some(handler) = ui_hooks::ask_handler() {
+    ask_with(
+        crate::headless::unattended(),
+        ui_hooks::ask_handler(),
+        question,
+    )
+}
+
+/// [`ask`], given whether nobody attends this run (`neuron prompt` with stdin not a
+/// terminal, whose handler refuses every question: that is not the user choosing to
+/// stop) and the UI's handler.
+fn ask_with(
+    unattended: bool,
+    handler: Option<impl Fn(&UserQuestion) -> io::Result<String>>,
+    question: &UserQuestion,
+) -> Option<bool> {
+    if unattended {
+        return None;
+    }
+    if let Some(handler) = handler {
         return Some(handler(question).is_ok_and(|answer| answer_sends(&answer)));
     }
     if !ui_hooks::stdin_is_terminal() {
@@ -315,10 +385,21 @@ fn ask(question: &UserQuestion) -> Option<bool> {
     Some(asked.is_ok_and(|answer| answer_sends(&answer)))
 }
 
+/// What a [`WindowGuard`] does about a request the window does not cover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverWindow {
+    /// Ask the user (the conversation).
+    Ask,
+    /// Stop without asking (a sub-agent); the conversation's own next request is then
+    /// asked about.
+    Stop,
+}
+
 /// The conversation's [`RequestGuard`] (see the module docs).
 pub(crate) struct WindowGuard {
     /// The requests go to the Zero-X gateway; other providers have no window.
     gateway: bool,
+    over_window: OverWindow,
     /// `workingSetTokens` or [`WORKING_SET_ENV_VAR`].
     configured: Option<usize>,
     /// The login's plan is Free, for before the account is read.
@@ -337,9 +418,53 @@ impl WindowGuard {
                 .is_some_and(|credential| is_free_plan(credential.plan.as_deref()));
         Self {
             gateway,
+            over_window: OverWindow::Ask,
             configured,
             free_login,
             approved: false,
+        }
+    }
+
+    /// A sub-agent's guard: the same working set, and a request the window does not
+    /// cover stops the sub-agent without asking. Sub-agents run beside the conversation
+    /// (some in the background), where a question would compete with its prompt.
+    pub(crate) fn for_subagent(gateway: bool, configured: Option<usize>) -> Self {
+        Self {
+            over_window: OverWindow::Stop,
+            ..Self::new(gateway, configured)
+        }
+    }
+
+    /// [`RequestGuard::allow_request`], given the window, the time and who answers.
+    fn allow(
+        &mut self,
+        window: Option<&PlanWindow>,
+        request: &RequestEstimate,
+        now: u64,
+        ask: impl FnOnce(&UserQuestion) -> Option<bool>,
+    ) -> bool {
+        if request.iteration <= 1 {
+            self.approved = false;
+        }
+        if !self.gateway || self.approved {
+            return true;
+        }
+        let Decision::Ask(question) = decide(window, request, now) else {
+            return true;
+        };
+        if self.over_window == OverWindow::Stop {
+            return false;
+        }
+        match ask(&question) {
+            Some(send) => {
+                self.approved = send;
+                send
+            }
+            None => {
+                // Nobody to ask (a script): the gateway decides, and says why it refuses.
+                ui_hooks::notice(&format!("warning: {}", question.question));
+                true
+            }
         }
     }
 }
@@ -354,29 +479,21 @@ impl RequestGuard for WindowGuard {
     }
 
     fn allow_request(&mut self, request: &RequestEstimate) -> bool {
-        if request.iteration <= 1 {
-            self.approved = false;
-        }
-        if !self.gateway || self.approved {
-            return true;
-        }
-        let window = current();
-        let Decision::Ask(question) = decide(window.as_ref(), request, crate::clock::now_unix())
-        else {
-            return true;
-        };
-        match ask(&question) {
-            Some(send) => {
-                self.approved = send;
-                send
-            }
-            None => {
-                // Nobody to ask (a script): the gateway decides, and says why it refuses.
-                ui_hooks::notice(&format!("warning: {}", question.question));
-                true
-            }
-        }
+        let window = if self.gateway { current() } else { None };
+        self.allow(window.as_ref(), request, crate::clock::now_unix(), ask)
     }
+}
+
+/// Builds each sub-agent's [`WindowGuard`] (see [`WindowGuard::for_subagent`]) for the
+/// `Agent` tool; `configured` is the conversation's working set setting.
+pub(crate) fn subagent_guard_factory(configured: Option<usize>) -> tools::SubagentGuardFactory {
+    std::sync::Arc::new(move |client: &api::ProviderClient| {
+        let guard: Box<dyn RequestGuard> = Box::new(WindowGuard::for_subagent(
+            crate::api_client::is_gateway_client(client),
+            configured,
+        ));
+        Some(guard)
+    })
 }
 
 #[cfg(test)]
@@ -413,18 +530,21 @@ mod tests {
             tokens: Some(999_000),
         };
         known.remember(Some(window(640_000)), Some(before_read));
-        known.apply_quota(Some(before_read));
+        known.apply_quota(Some(before_read), NOW);
         assert_eq!(
-            known.window().and_then(|w| w.used()),
+            known.window(NOW).and_then(|w| w.used()),
             Some(640_000),
             "older than the read"
         );
 
-        known.apply_quota(Some(api::QuotaRemaining {
-            requests: Some(98),
-            tokens: Some(300_000),
-        }));
-        let moved = known.window().expect("a window");
+        known.apply_quota(
+            Some(api::QuotaRemaining {
+                requests: Some(98),
+                tokens: Some(300_000),
+            }),
+            NOW,
+        );
+        let moved = known.window(NOW).expect("a window");
         assert_eq!(
             (moved.used(), moved.remaining()),
             (Some(700_000), Some(300_000))
@@ -433,8 +553,48 @@ mod tests {
 
         let mut none = Known::new();
         none.remember(None, None);
-        none.apply_quota(Some(before_read));
-        assert_eq!(none.window(), None, "a plan without a window gets none");
+        none.apply_quota(Some(before_read), NOW);
+        assert_eq!(none.window(NOW), None, "a plan without a window gets none");
+    }
+
+    /// 16:20 UTC: two hours after the window's reset time.
+    const AFTER_RESET: u64 = 1_792_246_800 + 7_200;
+
+    #[test]
+    fn past_its_reset_time_the_window_counts_as_unknown_until_read_again() {
+        let mut known = Known::new();
+        known.remember(Some(window(990_000)), None);
+        assert!(known.near_limit_notice(NOW).is_some());
+
+        let stale = known.window(AFTER_RESET).expect("a window");
+        assert_eq!((stale.used(), stale.remaining()), (None, None));
+        assert_eq!(stale.summary(), "Free ?/1M");
+        assert_eq!(
+            decide(Some(&stale), &request(44_000), AFTER_RESET),
+            Decision::Send,
+            "not asked from old figures"
+        );
+        assert_eq!(known.near_limit_notice(AFTER_RESET), None, "not warned");
+        assert!(
+            status_section(Some(&stale), 900, None).contains("Token window     Free ?/1M\n"),
+            "no old figure in /status"
+        );
+
+        assert!(!known.needs_reread(NOW));
+        assert!(known.needs_reread(AFTER_RESET), "read again");
+        assert!(!known.needs_reread(AFTER_RESET + 60), "once per reset time");
+
+        // A reply after the reset says what is left now.
+        known.apply_quota(
+            Some(api::QuotaRemaining {
+                requests: Some(50),
+                tokens: Some(700_000),
+            }),
+            AFTER_RESET,
+        );
+        let moved = known.window(AFTER_RESET).expect("a window");
+        assert_eq!(moved.remaining(), Some(700_000));
+        assert_eq!(moved.summary(), "Free 300K/1M");
     }
 
     #[test]
@@ -501,6 +661,69 @@ mod tests {
         assert_eq!(
             question.options.as_deref(),
             Some(&["Send anyway".to_string(), "Stop here".to_string()][..])
+        );
+    }
+
+    fn question() -> UserQuestion {
+        UserQuestion {
+            question: "Send it anyway?".to_string(),
+            options: None,
+        }
+    }
+
+    #[test]
+    fn a_run_nobody_attends_is_not_asked_and_its_refusal_is_not_an_answer() {
+        let refusing =
+            |_: &UserQuestion| -> io::Result<String> { panic!("an unattended run is not asked") };
+        assert_eq!(ask_with(true, Some(refusing), &question()), None);
+        let answering = |_: &UserQuestion| -> io::Result<String> { Ok("Send anyway".into()) };
+        assert_eq!(ask_with(false, Some(answering), &question()), Some(true));
+        let closed = |_: &UserQuestion| -> io::Result<String> { Err(io::Error::other("closed")) };
+        assert_eq!(ask_with(false, Some(closed), &question()), Some(false));
+    }
+
+    fn guard(interactive: bool) -> WindowGuard {
+        WindowGuard {
+            gateway: true,
+            over_window: if interactive {
+                OverWindow::Ask
+            } else {
+                OverWindow::Stop
+            },
+            configured: None,
+            free_login: true,
+            approved: false,
+        }
+    }
+
+    #[test]
+    fn the_guard_asks_warns_and_sends_when_nobody_answers_and_a_subagent_stops() {
+        let short = window(960_000);
+        let big = request(44_000);
+        // Nobody to ask: a warning, and the gateway decides.
+        assert!(guard(true).allow(Some(&short), &big, NOW, |_| None));
+        // The user stops; then sends, and is not asked again this turn.
+        assert!(!guard(true).allow(Some(&short), &big, NOW, |_| Some(false)));
+        let mut asked = guard(true);
+        assert!(asked.allow(Some(&short), &big, NOW, |_| Some(true)));
+        let later = RequestEstimate {
+            iteration: 2,
+            ..big
+        };
+        assert!(asked.allow(Some(&short), &later, NOW, |_| panic!("asked again")));
+        // A sub-agent stops without asking.
+        assert!(!guard(false).allow(Some(&short), &big, NOW, |_| panic!("asked")));
+        assert!(guard(false).allow(Some(&window(0)), &big, NOW, |_| panic!("asked")));
+        // Past the reset time nothing is known: sent without asking.
+        assert!(guard(true).allow(
+            Some(&short.as_of(AFTER_RESET)),
+            &big,
+            AFTER_RESET,
+            |_| panic!("asked from old figures")
+        ));
+        assert_eq!(
+            WindowGuard::for_subagent(false, Some(30_000)).working_set_tokens(),
+            Some(30_000)
         );
     }
 

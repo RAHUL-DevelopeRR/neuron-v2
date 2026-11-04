@@ -755,6 +755,8 @@ prompt after -p, or pipe it: `echo \"...\" | neuron -p`."
     cli.set_reasoning_effort(options.reasoning_effort);
     // Nobody to answer (stdin not a terminal): approvals and questions are refused.
     headless::start(headless::stdin_is_unattended(), output_format);
+    // The plan's token window, for the guard and the near-limit warning of this run.
+    crate::plan_window::read_on_gateway();
     // One line on a terminal saying what answers: model, permission mode and plan. On
     // stderr, so stdout keeps the answer alone; not to a file or a pipe.
     if output_format == CliOutputFormat::Text && !compact && io::stderr().is_terminal() {
@@ -3300,6 +3302,9 @@ impl LiveCli {
         if let Some(refusal) = repl_loop::refusal_notice(&summary.outcome) {
             eprintln!("{refusal}");
         }
+        if let Some(warning) = crate::plan_window::near_limit_notice() {
+            eprintln!("{warning}");
+        }
         Ok(())
     }
 
@@ -3329,6 +3334,10 @@ impl LiveCli {
             answer["session_id"] = json!(self.session.id);
             println!("{answer}");
             return Ok(());
+        }
+        // On stderr, as a JSON notice line (`headless::start`).
+        if let Some(warning) = crate::plan_window::near_limit_notice() {
+            runtime::ui_hooks::notice(&warning);
         }
         let usage = engine::usage_since(usage_before, summary.usage);
         println!(

@@ -407,11 +407,7 @@ pub(crate) fn launch(options: ReplLaunch) -> Result<(), Box<dyn std::error::Erro
     };
     cli.set_reasoning_effort(options.reasoning_effort);
     // The plan's token window, for `/status` and the guard before the first reply.
-    if crate::provider::active_provider()
-        .is_some_and(|active| active.id == crate::provider::ProviderId::ZeroX)
-    {
-        crate::plan_window::read_in_background();
-    }
+    crate::plan_window::read_on_gateway();
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     println!();
