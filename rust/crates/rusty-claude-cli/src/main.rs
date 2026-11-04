@@ -4464,7 +4464,7 @@ impl LiveCli {
     /// `/research <question>` in the line REPL: says what the run may use and asks
     /// to start (a yes is the run's web grant), shows each search and read, then
     /// prints the report and where it was saved.
-    fn run_research(&self, args: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    fn run_research(&mut self, args: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         let words = args
             .unwrap_or_default()
             .split_whitespace()
@@ -4487,22 +4487,30 @@ impl LiveCli {
         if let Some(reason) = web.search_refusal(&request.question) {
             return Err(format!("Research cannot search the web: {reason}").into());
         }
-        let mut model = research::LiveModel {
-            client: self.runtime.api_client(),
-            cancel: runtime::CancellationToken::new(),
-        };
-        let mut progress = research::TerminalProgress::new(None, false);
         let cwd = env::current_dir()?;
-        let (outcome, path) =
-            research::run_and_save(&request, &mut model, &mut web, &mut progress, &cwd, None)?;
+        let (outcome, path) = {
+            let mut model = research::LiveModel {
+                client: self.runtime.api_client(),
+                cancel: runtime::CancellationToken::new(),
+            };
+            let mut progress = research::TerminalProgress::new(None, false);
+            research::run_and_save(&request, &mut model, &mut web, &mut progress, &cwd, None)?
+        };
         println!(
             "{}",
             TerminalRenderer::new().render_markdown(&outcome.report)
         );
-        println!(
-            "Saved to {}",
-            path.strip_prefix(&cwd).unwrap_or(&path).display()
-        );
+        let saved = path
+            .strip_prefix(&cwd)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        println!("Saved to {saved}");
+        // In the chat too, as data, so the next prompt can refer to it.
+        let line = format!("/research {}", words.join(" "));
+        for message in research::conversation_record(&line, &outcome.report, &saved) {
+            self.runtime.session_mut().push_message(message)?;
+        }
         Ok(())
     }
 
