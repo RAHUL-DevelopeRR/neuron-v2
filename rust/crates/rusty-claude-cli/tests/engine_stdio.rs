@@ -1217,3 +1217,122 @@ fn a_launch_that_fails_reports_one_error_event() {
     let _ = fs::remove_dir_all(&workspace);
     let _ = fs::remove_dir_all(&home);
 }
+
+fn colony(args: &str) -> Value {
+    json!({"kind": "command", "type": "slash", "command": "colony", "args": args})
+}
+
+/// `/colony` over stdio: with no run, `/colony stop` says so; during a run (here while
+/// its plan waits for approval) it stops that run at once instead of queuing behind it;
+/// and an approved run plans, works and reports as `colony_*` events, showing each
+/// subtask's instructions before the start.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn stdio_engine_runs_and_stops_colony_runs() {
+    let plan = r#"{"tasks": [{"id": "t1", "title": "Read the readme", "prompt": "Say what README.md says", "writes": false}]}"#;
+    let gateway = FakeGateway::with_replies(vec![
+        text_reply(plan),
+        text_reply(plan),
+        text_reply("README.md says hello."),
+        text_reply("The readme says hello."),
+    ]);
+    let (workspace, home) = workspace_and_home("colony");
+    fs::write(workspace.join("README.md"), "hello\n").expect("readme");
+    let mut engine = StdioEngine::start(
+        &workspace,
+        &home,
+        &[
+            ("NEURON_API_BASE", &gateway.base),
+            ("NEURON_TOKEN", SESSION),
+        ],
+        &["--permission-mode", "workspace-write"],
+        Some(SESSION),
+    );
+    assert_eq!(engine.next()["type"], "ready");
+    assert_eq!(engine.next_of("status")["signed_in"], true);
+
+    // No run: it says so.
+    engine.send(&colony("stop"));
+    let idle = engine.until("turn_finished");
+    assert!(
+        notices(&idle)
+            .iter()
+            .any(|notice| notice.starts_with("No Colony run is running")),
+        "{idle:?}"
+    );
+
+    // A run waiting for its plan's approval: `/colony stop` ends it.
+    engine.send(&colony("Say what README.md says"));
+    let question = loop {
+        let event = engine.next();
+        assert_ne!(event["type"], "turn_finished", "{event}");
+        if event["type"] == "notice"
+            && event["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Start the workers?"))
+        {
+            break event["message"].as_str().unwrap_or_default().to_string();
+        }
+    };
+    assert!(
+        question.contains("t1 Read the readme (reads)\n    Say what README.md says"),
+        "{question}"
+    );
+    engine.send(&colony("stop"));
+    let stopped = engine.until("turn_finished");
+    let report = notices(&stopped).join("\n");
+    assert!(report.contains(": stopped\n"), "{stopped:?}");
+    assert!(report.contains("The plan was not started."), "{stopped:?}");
+
+    // With the `colony` capability, an approved run reports as events.
+    engine.send(&json!({
+        "kind": "command", "type": "capabilities",
+        "features": ["colony"], "client": "terminal",
+    }));
+    engine.send(&colony("Say what README.md says"));
+    let started = engine.until("colony_started");
+    assert!(
+        started.iter().all(|event| event["type"] != "turn_finished"),
+        "{started:?}"
+    );
+    let colony_started = started.last().expect("colony_started");
+    assert_eq!(colony_started["tasks"][0]["id"], "t1", "{colony_started}");
+    assert_eq!(colony_started["workers"], 1, "{colony_started}");
+    loop {
+        let event = engine.next();
+        if event["type"] == "notice"
+            && event["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Start the workers?"))
+        {
+            break;
+        }
+    }
+    engine.send(&submit("1"));
+    let run = engine.until("turn_finished");
+    let finished = run
+        .iter()
+        .find(|event| event["type"] == "colony_finished")
+        .unwrap_or_else(|| panic!("no colony_finished: {run:?}"));
+    assert_eq!(finished["status"], "completed", "{finished}");
+    assert_eq!(finished["merged"], false, "{finished}");
+    let worker_done = run.iter().any(|event| {
+        event["type"] == "colony_agent"
+            && event["agent"]["id"] == "worker-t1"
+            && event["agent"]["status"] == "done"
+    });
+    assert!(worker_done, "{run:?}");
+    let report = notices(&run).join("\n");
+    assert!(report.contains("README.md says hello."), "{run:?}");
+    assert!(report.contains("The readme says hello."), "{run:?}");
+    let model_calls = gateway
+        .requests()
+        .iter()
+        .filter(|request| *request == "POST /v1/chat/completions (signed)")
+        .count();
+    assert_eq!(model_calls, 4, "{:?}", gateway.requests());
+
+    engine.end_input();
+    let _ = fs::remove_dir_all(&workspace);
+    let _ = fs::remove_dir_all(&home);
+}

@@ -7,7 +7,8 @@
 //! JSON with `--output-format json`). On a terminal the run asks before the workers
 //! start, when it nears its token cap, and before it applies the changes. Without a
 //! terminal nobody can answer, so `--yes` is needed to start, the run stops at 80% of
-//! the cap, and the changes stay on their branch unless `--yes` was given.
+//! the cap, and the changes stay on their branch unless `--yes` was given. Ctrl-C
+//! stops the run (a second press quits); its branches stay for the user.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -465,11 +466,16 @@ pub(crate) fn run(
         permission_mode,
         session_tools,
     )?;
-    let handle = ColonyHandle::new(config.token_cap());
+    // Ctrl-C stops the run as it stops a turn: every agent and any further start.
+    let cancel = runtime::CancellationToken::new();
+    let handle = ColonyHandle::with_cancel(config.token_cap(), cancel.clone());
+    let interrupts =
+        crate::HookAbortMonitor::spawn_for_turn(runtime::HookAbortSignal::new(), cancel);
     let observer = TerminalObserver::new(interactive, options.yes);
     let rules = config.permission_rules.clone();
     let runner = session_agent_runner(rules);
     let report = run_colony(&config, &runner, &observer, &handle);
+    interrupts.stop();
     if json {
         let value = serde_json::json!({ "type": "colony", "report": report });
         println!("{value}");

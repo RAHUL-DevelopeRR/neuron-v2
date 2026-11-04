@@ -981,6 +981,8 @@ struct Shared {
     last_status: Mutex<Option<UiEvent>>,
     /// The agent's changes as the UI last heard them ([`UiEvent::Changes`]).
     sent_changes: Mutex<Option<Vec<ChangedFile>>>,
+    /// The Colony run holding the engine, for `/colony stop` ([`ColonyRunning`]).
+    colony: Mutex<Option<tools::colony::ColonyHandle>>,
 }
 
 /// [`ENGINE_FEATURES`], for [`UiEvent::Ready`].
@@ -1072,6 +1074,18 @@ impl Shared {
         let status = lock(&self.last_status).clone();
         if let Some(status) = status {
             let _ = events.send(with_current_git(status));
+        }
+    }
+
+    /// Stops the Colony run holding the engine; `false` when none is running. Only
+    /// that run stops: not an ordinary turn, and not background sub-agents.
+    fn stop_colony(&self) -> bool {
+        match lock(&self.colony).as_ref() {
+            Some(handle) => {
+                handle.stop();
+                true
+            }
+            None => false,
         }
     }
 
@@ -1175,15 +1189,13 @@ fn forward_commands(
     loop {
         match commands.recv().unwrap_or(EngineCommand::Shutdown) {
             EngineCommand::Interrupt => shared.interrupt(),
-            // `/colony stop` while a run holds the engine stops it, as an interrupt
-            // stops a turn; between runs it queues and says no run is running.
+            // `/colony stop` while a Colony run holds the engine stops that run, as an
+            // interrupt stops a turn; otherwise (between runs, or during an ordinary
+            // turn) it queues and says no run is running.
             EngineCommand::Slash { command, args }
                 if command.trim_start_matches('/') == "colony"
                     && args.trim() == "stop"
-                    && shared.turn_running() =>
-            {
-                shared.stop_turn();
-            }
+                    && shared.stop_colony() => {}
             // Now, so a running turn's sinks see it; the engine also hears it, between
             // turns, to send what the new capabilities show.
             EngineCommand::Capabilities { features, client } => {
@@ -1380,6 +1392,22 @@ fn ask_the_ui(
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return Err(closed()),
         }
+    }
+}
+
+/// Marks a Colony run as holding the engine, for `/colony stop`, until dropped.
+struct ColonyRunning<'a>(&'a Shared);
+
+impl<'a> ColonyRunning<'a> {
+    fn start(shared: &'a Shared, handle: &tools::colony::ColonyHandle) -> Self {
+        *lock(&shared.colony) = Some(handle.clone());
+        Self(shared)
+    }
+}
+
+impl Drop for ColonyRunning<'_> {
+    fn drop(&mut self) {
+        *lock(&self.0.colony) = None;
     }
 }
 
@@ -2125,6 +2153,7 @@ impl Engine {
         let handle = tools::colony::ColonyHandle::with_cancel(config.token_cap(), cancel.clone());
         let running = RunningTurn::start(&self.shared);
         running.watch(cancel, HookAbortSignal::new());
+        let colony = ColonyRunning::start(&self.shared, &handle);
         let observer = EngineColonyObserver {
             events: Sender::clone(&self.events),
             shared: Arc::clone(&self.shared),
@@ -2134,6 +2163,7 @@ impl Engine {
         };
         let runner = tools::colony::session_agent_runner(config.permission_rules.clone());
         let report = tools::colony::run_colony(&config, &runner, &observer, &handle);
+        drop(colony);
         drop(running);
         self.notice(&crate::colony::render_report(&report));
         Ok(())
@@ -2958,8 +2988,8 @@ fn parse_rewind_mode(mode: &str) -> Result<RewindMode, String> {
 mod tests {
     use super::{
         definitions, forward_commands, git_status, mcp_server_status, plain_notice,
-        question_notice, shorten, shorten_json_strings, spawn, transcript_event, EngineExit,
-        EngineHandle, EngineOptions, McpRuntimeView, RunningTurn, Shared,
+        question_notice, shorten, shorten_json_strings, spawn, transcript_event, ColonyRunning,
+        EngineExit, EngineHandle, EngineOptions, McpRuntimeView, RunningTurn, Shared,
     };
     use crate::repl_loop::InterruptPresses;
     use crate::tests::{env_lock, with_current_dir};
@@ -4553,5 +4583,47 @@ mod tests {
         assert!(!cancel.is_cancelled());
         assert!(!pressed);
         drop(running);
+    }
+
+    fn colony_stop() -> EngineCommand {
+        EngineCommand::Slash {
+            command: "colony".into(),
+            args: " stop ".into(),
+        }
+    }
+
+    /// `/colony stop` stops the Colony run holding the engine, not an ordinary turn
+    /// (whose cancellation would also stop background sub-agents).
+    #[test]
+    fn colony_stop_stops_only_a_colony_run() {
+        let commands = Commands::start();
+
+        // During an ordinary turn it queues; the turn goes on.
+        commands.send(vec![prompt()]);
+        let (running, cancel, _) = commands.take_prompt();
+        commands.sender.send(colony_stop()).unwrap();
+        let queued = commands.queue.recv_timeout(EVENT_TIMEOUT).expect("queued");
+        assert!(
+            matches!(&queued, EngineCommand::Slash { command, .. } if command == "colony"),
+            "{queued:?}"
+        );
+        assert!(!cancel.is_cancelled());
+        drop(running);
+
+        // During a Colony run it stops the run at once and is not queued.
+        let handle = tools::colony::ColonyHandle::new(1_000);
+        let running = RunningTurn::start(&commands.shared);
+        let cancel = CancellationToken::new();
+        running.watch(cancel.clone(), HookAbortSignal::new());
+        let colony = ColonyRunning::start(&commands.shared, &handle);
+        commands.send(vec![colony_stop()]);
+        assert!(handle.is_stopped());
+        assert!(handle.meter().is_stopped());
+        assert!(!cancel.is_cancelled(), "only the run's own token");
+        drop(colony);
+        drop(running);
+
+        // After the run, nothing holds the engine: it queues again.
+        assert!(!commands.shared.stop_colony());
     }
 }
