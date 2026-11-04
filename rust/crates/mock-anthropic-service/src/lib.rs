@@ -106,6 +106,10 @@ enum Scenario {
     /// Calls `WebFetch` once for `https://docs.rs/serde`, then answers with what it
     /// got: a fetch outside a run's `--allow-origin` hosts.
     WebFetchOffOrigin,
+    /// A research run's tool-less requests, told apart by their instructions: the
+    /// planner gets two sub-questions, the follow-up check and the note taker get
+    /// `[]`, the writer a one-line report citing source 1.
+    ResearchRun,
     /// Calls `bash` once with a command that needs two programs approved (`mkdir`,
     /// `tee`), then answers with what it got.
     CompoundCommandDenied,
@@ -129,6 +133,7 @@ impl Scenario {
             "bash_denial_loop" => Some(Self::BashDenialLoop),
             "web_search_denied" => Some(Self::WebSearchDenied),
             "web_fetch_off_origin" => Some(Self::WebFetchOffOrigin),
+            "research_run" => Some(Self::ResearchRun),
             "compound_command_denied" => Some(Self::CompoundCommandDenied),
             "plugin_tool_roundtrip" => Some(Self::PluginToolRoundtrip),
             "auto_compact_triggered" => Some(Self::AutoCompactTriggered),
@@ -151,6 +156,7 @@ impl Scenario {
             Self::BashDenialLoop => "bash_denial_loop",
             Self::WebSearchDenied => "web_search_denied",
             Self::WebFetchOffOrigin => "web_fetch_off_origin",
+            Self::ResearchRun => "research_run",
             Self::CompoundCommandDenied => "compound_command_denied",
             Self::PluginToolRoundtrip => "plugin_tool_roundtrip",
             Self::AutoCompactTriggered => "auto_compact_triggered",
@@ -274,6 +280,18 @@ fn detect_scenario(request: &MessageRequest) -> Option<Scenario> {
             _ => None,
         })
     })
+}
+
+/// The [`Scenario::ResearchRun`] answer to `request`, by its instructions.
+fn research_reply(request: &MessageRequest) -> String {
+    let system = request.system.as_deref().unwrap_or_default();
+    if system.starts_with("You plan web research") {
+        r#"["rust async runtimes", "tokio release notes"]"#.to_string()
+    } else if system.starts_with("You write a short research report") {
+        "Tokio is the most used runtime [1].".to_string()
+    } else {
+        "[]".to_string()
+    }
 }
 
 /// How many tool results the request carries.
@@ -516,6 +534,7 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
                 &[r#"{"query":"latest node lts"}"#],
             ),
         },
+        Scenario::ResearchRun => final_text_sse(&research_reply(request)),
         Scenario::WebFetchOffOrigin => match latest_tool_result(request) {
             Some((tool_output, _)) => final_text_sse(&format!("fetch result: {tool_output}")),
             None => tool_use_sse(
@@ -713,6 +732,9 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
                 json!({"query": "latest node lts"}),
             ),
         },
+        Scenario::ResearchRun => {
+            text_message_response("msg_research_run", &research_reply(request))
+        }
         Scenario::WebFetchOffOrigin => match latest_tool_result(request) {
             Some((tool_output, _)) => text_message_response(
                 "msg_web_fetch_off_origin_final",
@@ -781,6 +803,7 @@ fn request_id_for(scenario: Scenario) -> &'static str {
         Scenario::BashDenialLoop => "req_bash_denial_loop",
         Scenario::WebSearchDenied => "req_web_search_denied",
         Scenario::WebFetchOffOrigin => "req_web_fetch_off_origin",
+        Scenario::ResearchRun => "req_research_run",
         Scenario::CompoundCommandDenied => "req_compound_command_denied",
         Scenario::PluginToolRoundtrip => "req_plugin_tool_roundtrip",
         Scenario::AutoCompactTriggered => "req_auto_compact_triggered",

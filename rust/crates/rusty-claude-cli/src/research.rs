@@ -1547,16 +1547,19 @@ fn first_line(text: &str) -> &str {
 }
 
 /// Progress on the terminal (line REPL, `neuron research`): one line per
-/// step on stderr, so stdout keeps the report alone.
+/// step on stderr, so stdout keeps the report alone. `quiet` shows nothing
+/// (JSON output, whose stderr carries only a JSON error).
 pub(crate) struct TerminalProgress {
     shown_plan: bool,
+    quiet: bool,
     cancel: Option<runtime::CancellationToken>,
 }
 
 impl TerminalProgress {
-    pub(crate) fn new(cancel: Option<runtime::CancellationToken>) -> Self {
+    pub(crate) fn new(cancel: Option<runtime::CancellationToken>, quiet: bool) -> Self {
         Self {
             shown_plan: false,
+            quiet,
             cancel,
         }
     }
@@ -1564,7 +1567,7 @@ impl TerminalProgress {
 
 impl ResearchProgress for TerminalProgress {
     fn plan(&mut self, items: &[PlanItem]) {
-        if self.shown_plan {
+        if self.shown_plan || self.quiet {
             return;
         }
         self.shown_plan = true;
@@ -1575,6 +1578,9 @@ impl ResearchProgress for TerminalProgress {
     }
 
     fn step_started(&mut self, _id: &str, tool: &str, input: &Value) {
+        if self.quiet {
+            return;
+        }
         let (verb, target) = if tool == "WebSearch" {
             ("search", input.get("query"))
         } else {
@@ -1587,12 +1593,17 @@ impl ResearchProgress for TerminalProgress {
     }
 
     fn step_finished(&mut self, _id: &str, _tool: &str, output: &str, is_error: bool) {
+        if self.quiet {
+            return;
+        }
         let mark = if is_error { "!" } else { "->" };
         eprintln!("    {mark} {output}");
     }
 
     fn notice(&mut self, message: &str) {
-        eprintln!("{message}");
+        if !self.quiet {
+            eprintln!("{message}");
+        }
     }
 
     fn cancelled(&self) -> bool {

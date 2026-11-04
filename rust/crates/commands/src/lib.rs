@@ -200,6 +200,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: false,
     },
     SlashCommandSpec {
+        name: "research",
+        aliases: &[],
+        summary: "Research a question on the web and write a cited report",
+        argument_hint: Some("[--depth quick|standard|deep] [--budget TOKENS] <question>"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "teleport",
         aliases: &[],
         summary: "Jump to a file or symbol by searching the workspace",
@@ -1074,6 +1081,10 @@ pub enum SlashCommand {
     Ultraplan {
         task: Option<String>,
     },
+    /// `/research [--depth ...] [--budget ...] <question>`: the words after the name.
+    Research {
+        args: Option<String>,
+    },
     Teleport {
         target: Option<String>,
     },
@@ -1263,6 +1274,7 @@ impl SlashCommand {
             Self::Init => "/init",
             Self::Bughunter { .. } => "/bughunter",
             Self::Ultraplan { .. } => "/ultraplan",
+            Self::Research { .. } => "/research",
             Self::Teleport { .. } => "/teleport",
             Self::DebugToolCall { .. } => "/debug-tool-call",
             Self::Resume { .. } => "/resume",
@@ -1365,6 +1377,7 @@ pub fn validate_slash_command_input(
         "pr" => SlashCommand::Pr { context: remainder },
         "issue" => SlashCommand::Issue { context: remainder },
         "ultraplan" => SlashCommand::Ultraplan { task: remainder },
+        "research" => SlashCommand::Research { args: remainder },
         "teleport" => SlashCommand::Teleport {
             target: Some(require_remainder(command, remainder, "<symbol-or-path>")?),
         },
@@ -4227,6 +4240,7 @@ pub fn handle_slash_command(
         | SlashCommand::Pr { .. }
         | SlashCommand::Issue { .. }
         | SlashCommand::Ultraplan { .. }
+        | SlashCommand::Research { .. }
         | SlashCommand::Teleport { .. }
         | SlashCommand::DebugToolCall
         | SlashCommand::Sandbox
@@ -4455,6 +4469,16 @@ mod tests {
             Ok(Some(SlashCommand::Ultraplan {
                 task: Some("ship both features".to_string())
             }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/research --depth quick  what changed in Rust 1.91?"),
+            Ok(Some(SlashCommand::Research {
+                args: Some("--depth quick  what changed in Rust 1.91?".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/research"),
+            Ok(Some(SlashCommand::Research { args: None }))
         );
         assert_eq!(
             SlashCommand::parse("/teleport conversation.rs"),
@@ -4831,6 +4855,7 @@ mod tests {
         assert!(help.contains("/pr [context]"));
         assert!(help.contains("/issue [context]"));
         assert!(help.contains("/ultraplan [task]"));
+        assert!(help.contains("/research [--depth quick|standard|deep] [--budget TOKENS] <question>"));
         assert!(help.contains("/teleport <symbol-or-path>"));
         assert!(help.contains("/debug-tool-call"));
         assert!(help.contains("/model [model]"));
@@ -4857,7 +4882,7 @@ mod tests {
         assert!(help.contains("/login"));
         assert!(help.contains("/logout"));
         assert!(help.contains("Sign in to your Zero-X account in the browser"));
-        assert_eq!(slash_command_specs().len(), 141);
+        assert_eq!(slash_command_specs().len(), 142);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 

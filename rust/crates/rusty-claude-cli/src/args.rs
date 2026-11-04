@@ -100,6 +100,14 @@ pub(crate) enum CliAction {
         reasoning_effort: Option<String>,
         allow_broad_cwd: bool,
     },
+    /// `neuron research [--depth ...] [--budget ...] [--out FILE] "<question>"`: the
+    /// words after `research`, parsed when it runs.
+    Research {
+        words: Vec<String>,
+        model: String,
+        permission_mode: PermissionMode,
+        output_format: CliOutputFormat,
+    },
     HelpTopic(LocalHelpTopic),
     // prompt-mode formatting is only supported for non-interactive runs
     Help {
@@ -640,6 +648,12 @@ pub(crate) fn parse_args_with_stdin(
             Err(removed_auth_surface_error(command))
         }
         "init" => Ok(CliAction::Init { output_format }),
+        "research" => Ok(CliAction::Research {
+            words: rest[1..].to_vec(),
+            model,
+            permission_mode,
+            output_format,
+        }),
         "export" => parse_export_args(&rest[1..], output_format),
         "prompt" => {
             let prompt = rest[1..].join(" ");
@@ -744,6 +758,8 @@ pub(crate) fn bare_slash_command_guidance(command_name: &str) -> Option<String> 
             | "init"
             | "prompt"
             | "export"
+            // `neuron research` alone prints its usage.
+            | "research"
             // Handled by `removed_auth_surface_error`, which points at
             // `neuron auth login|logout`.
             | "login"

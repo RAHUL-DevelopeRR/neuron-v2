@@ -632,6 +632,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Acp { output_format } => print_acp_status(output_format)?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
+        CliAction::Research {
+            words,
+            model,
+            permission_mode,
+            output_format,
+        } => run_research_command(&words, model, permission_mode, output_format)?,
         CliAction::Export {
             session_reference,
             output_path,
@@ -1708,6 +1714,7 @@ fn run_resume_command(
         | SlashCommand::Pr { .. }
         | SlashCommand::Issue { .. }
         | SlashCommand::Ultraplan { .. }
+        | SlashCommand::Research { .. }
         | SlashCommand::Teleport { .. }
         | SlashCommand::DebugToolCall { .. }
         | SlashCommand::Resume { .. }
@@ -1777,6 +1784,100 @@ fn detect_broad_cwd() -> Option<PathBuf> {
 /// Enforce the broad-CWD policy: when running from home or root, either
 /// require the --allow-broad-cwd flag, or prompt for confirmation (interactive),
 /// or exit with an error (non-interactive).
+/// `neuron research "<question>"`: a research run for scripts. Nobody is there to
+/// approve web reads, so it refuses to start, before any model call, unless
+/// `--allow-web` or `permissions.allow` rules let `WebSearch` run. The report goes
+/// to stdout (and `.neuron/research/`); progress to stderr. Exits 1 when no page
+/// could be read.
+fn run_research_command(
+    words: &[String],
+    model: String,
+    permission_mode: PermissionMode,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if matches!(words, [word] if is_help_flag(word) || word == "help") {
+        println!("Usage: {}", research::RESEARCH_CLI_USAGE);
+        return Ok(());
+    }
+    let args = research::parse_research_args(words, true).map_err(UsageError)?;
+    if runtime::ui_hooks::stdin_is_terminal() {
+        let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        if let Some(code) = crate::auth::check_trust(&cwd).exit_code() {
+            std::process::exit(code);
+        }
+    }
+    let permission_mode = crate::args::permission_mode_after_trust(permission_mode);
+    let model = crate::args::model_after_trust(model);
+    let json_output = output_format == CliOutputFormat::Json;
+    provider::set_json_output(json_output);
+    let cwd = env::current_dir()?;
+    let runtime_config = ConfigLoader::default_for(&cwd).load()?;
+    let feature_config = runtime_config.feature_config();
+    let policy = permission_policy(
+        permission_mode,
+        feature_config,
+        &GlobalToolRegistry::builtin(),
+    )
+    .map_err(UsageError)?;
+    let mut web = research::LiveWeb::new(&policy, false);
+    if web.search_refusal(&args.question).is_some() {
+        return Err(UsageError(format!(
+            "`neuron research` searches and reads the web, and nobody can approve that in a script: add --allow-web (`neuron --allow-web research \"...\"`), or allow WebSearch and WebFetch with permissions.allow rules in ~/.neuron/settings.json. Usage: {}",
+            research::RESEARCH_CLI_USAGE
+        ))
+        .into());
+    }
+    let (request, lowered) = research::request_for(&args);
+    if let Some(note) = lowered.filter(|_| !json_output) {
+        eprintln!("{note}");
+    }
+    let effective_model = configure_provider_for_model(model)?;
+    let routing = feature_config.model_routing();
+    let mut client = AnthropicRuntimeClient::new(
+        &research::new_run_id(),
+        crate::model_routing::request_model(routing, &effective_model, false),
+        false,
+        TurnOutput::Silent,
+        None,
+        GlobalToolRegistry::builtin(),
+        None,
+    )?;
+    client.set_summary_model(crate::model_routing::summary_model(
+        routing,
+        &effective_model,
+    ));
+    let mut model = research::LiveModel {
+        client: &client,
+        cancel: runtime::CancellationToken::new(),
+    };
+    let mut progress = research::TerminalProgress::new(None, json_output);
+    let (outcome, path) = research::run_and_save(
+        &request,
+        &mut model,
+        &mut web,
+        &mut progress,
+        &cwd,
+        args.out.as_deref(),
+    )?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&research::outcome_json(&outcome, Some(&path)))?
+        );
+    } else {
+        println!("{}", outcome.report.trim_end());
+        eprintln!("{}", research::summary_line(&outcome));
+        eprintln!(
+            "Saved to {}",
+            path.strip_prefix(&cwd).unwrap_or(&path).display()
+        );
+    }
+    if outcome.sources.is_empty() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 fn enforce_broad_cwd_policy(
     allow_broad_cwd: bool,
     output_format: CliOutputFormat,
@@ -3419,6 +3520,10 @@ impl LiveCli {
                 self.run_ultraplan(task.as_deref())?;
                 false
             }
+            SlashCommand::Research { args } => {
+                self.run_research(args.as_deref())?;
+                false
+            }
             SlashCommand::Teleport { target } => {
                 Self::run_teleport(target.as_deref())?;
                 false
@@ -4353,6 +4458,54 @@ impl LiveCli {
 
     fn run_ultraplan(&self, task: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", format_ultraplan_report(task));
+        Ok(())
+    }
+
+    /// `/research <question>` in the line REPL: says what the run may use and asks
+    /// to start (a yes is the run's web grant), shows each search and read, then
+    /// prints the report and where it was saved.
+    fn run_research(&self, args: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        let words = args
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let args = research::parse_research_args(&words, false)?;
+        let (request, lowered) = research::request_for(&args);
+        if let Some(note) = lowered {
+            eprintln!("{note}");
+        }
+        eprint!("{} [y/N] ", request.confirmation());
+        io::stderr().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        if !research::confirmed(&answer) {
+            println!("Research not started.");
+            return Ok(());
+        }
+        let mut web = research::LiveWeb::new(self.runtime.permission_policy(), true);
+        if let Some(reason) = web.search_refusal(&request.question) {
+            return Err(format!("Research cannot search the web: {reason}").into());
+        }
+        let mut model = research::LiveModel {
+            client: self.runtime.api_client(),
+            cancel: runtime::CancellationToken::new(),
+        };
+        let mut progress = research::TerminalProgress::new(None, false);
+        let cwd = env::current_dir()?;
+        let (outcome, path) = research::run_and_save(
+            &request,
+            &mut model,
+            &mut web,
+            &mut progress,
+            &cwd,
+            None,
+        )?;
+        println!("{}", TerminalRenderer::new().render_markdown(&outcome.report));
+        println!(
+            "Saved to {}",
+            path.strip_prefix(&cwd).unwrap_or(&path).display()
+        );
         Ok(())
     }
 
@@ -6923,6 +7076,40 @@ mod tests {
         // A slash command's alias gets the same guidance as its name.
         let error = parse_args(&words(&["marketplace"])).unwrap_err();
         assert!(error.contains("/marketplace"), "{error}");
+    }
+
+    #[test]
+    fn research_subcommand_keeps_its_words_for_the_research_parser() {
+        let words = |values: &[&str]| values.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let Ok(CliAction::Research {
+            words: research_words,
+            output_format,
+            ..
+        }) = parse_args(&words(&[
+            "--output-format",
+            "json",
+            "research",
+            "--depth",
+            "quick",
+            "what changed in Rust 1.91?",
+        ]))
+        else {
+            panic!("neuron research should parse as a research run");
+        };
+        assert_eq!(output_format, CliOutputFormat::Json);
+        assert_eq!(
+            research_words,
+            words(&["--depth", "quick", "what changed in Rust 1.91?"])
+        );
+        // Alone it is a research run with no question (its parser prints the
+        // usage), not slash-command guidance.
+        assert!(matches!(
+            parse_args(&words(&["research"])),
+            Ok(CliAction::Research { words, .. }) if words.is_empty()
+        ));
+        let error =
+            crate::research::parse_research_args(&[], true).expect_err("a question is needed");
+        assert!(error.contains(crate::research::RESEARCH_CLI_USAGE), "{error}");
     }
 
     #[test]
