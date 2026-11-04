@@ -718,6 +718,73 @@ fn a_session_that_asks_before_every_tool_keeps_workers_read_only() {
     assert_eq!(super::writing_mode(PermissionMode::Prompt), None);
 }
 
+/// The cap runs out while a worker writes: its half-done change is committed to its
+/// branch, the reviewer never runs, and the merge is not offered (so `--yes` cannot
+/// apply it); the branch stays for the user.
+#[test]
+fn a_cap_that_runs_out_during_the_workers_keeps_the_changes_on_their_branch() {
+    let repo = TempRepo::new("cap");
+    let plan = r#"{"tasks": [{"id": "t1", "title": "Add a.txt and b.txt", "prompt": "Create a.txt, then b.txt", "writes": true}]}"#;
+    let script = Script::new(vec![
+        ("planner", vec![text(plan)]),
+        (
+            "worker-t1",
+            vec![
+                write("a.txt", "alpha\n"),
+                write("b.txt", "beta\n"),
+                text("Wrote both."),
+            ],
+        ),
+    ]);
+    let runner = RuntimeAgentRunner::new(
+        |request: &AgentRequest| script.client(request),
+        RuntimePermissionRuleConfig::default(),
+    );
+    // As with `--yes`: the start and the merge are answered yes.
+    let recorder = Recorder::new(&repo.repo, ColonyAnswer::Continue, ColonyAnswer::Merge);
+    let mut config = config(&repo, ColonyLimits::FREE);
+    // The planner uses 1,000; the worker's first write takes the run to 2,000 and its
+    // second response to 3,000, past the cap, so the second write never runs.
+    config.token_cap = Some(2_500);
+    let handle = ColonyHandle::new(config.token_cap());
+
+    let report = run_colony(&config, &runner, &recorder, &handle);
+
+    assert_eq!(report.status, "stopped", "{report:#?}");
+    assert!(!report.merged);
+    assert!(!handle.meter().is_stopped(), "nobody pressed stop");
+    let questions = recorder.questions.lock().unwrap().clone();
+    assert!(
+        !questions
+            .iter()
+            .any(|question| matches!(question, ColonyQuestion::Merge { .. })),
+        "{questions:?}"
+    );
+    assert!(
+        !repo.repo.join("a.txt").exists(),
+        "the tree stays untouched"
+    );
+    let branch = report
+        .synthesis_branch
+        .clone()
+        .expect("the changes' branch");
+    assert!(repo.branches().contains(&branch), "{:?}", repo.branches());
+    assert_eq!(report.tasks[0].status, AgentStatus::Stopped);
+    assert!(report.tasks[0]
+        .review
+        .as_deref()
+        .is_some_and(|review| review.starts_with("The review did not finish")));
+    assert!(
+        report
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("token cap")),
+        "{report:#?}"
+    );
+    let seen = script.seen.lock().unwrap().clone();
+    assert!(!seen.iter().any(|(id, _, _)| id == "review-t1"), "{seen:?}");
+}
+
 #[test]
 fn eight_workers_can_have_eight_subtasks() {
     let repo = TempRepo::new("eight");

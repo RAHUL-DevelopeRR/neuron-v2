@@ -16,7 +16,10 @@
 //!    merge that conflicts stops the merging, and the report names that branch and
 //!    its files instead of guessing. A synthesis agent writes the final report.
 //! 5. The synthesis diff reaches the user's working tree only when the observer
-//!    approves it ([`ColonyQuestion::Merge`]), as uncommitted changes.
+//!    approves it ([`ColonyQuestion::Merge`]), as uncommitted changes. The merge is
+//!    not offered when the run was stopped or reached its token cap, or when any
+//!    merged work did not finish or was not reviewed: those changes stay on their
+//!    branch for the user to check.
 //!
 //! Agents never get more than the session: their tools are cut to its tool
 //! allow-list (`--allowedTools`, plan mode), they keep its permission rules, and
@@ -1140,6 +1143,13 @@ fn drive(run: &Run<'_>) -> ColonyReport {
     let reviews = runtime::parallel_tools::run_concurrently(&reviewed, workers, |outcome| {
         run_reviewer(run, outcome, reviewer_share)
     });
+    let unreviewed = reviewed
+        .iter()
+        .zip(&reviews)
+        .filter(|(_, (_, finished))| !finished)
+        .map(|(outcome, _)| outcome.task.id.clone())
+        .collect::<BTreeSet<_>>();
+    let reviews = reviews.into_iter().map(|(review, _)| review);
     let mut review_of = reviewed
         .iter()
         .map(|outcome| outcome.task.id.clone())
@@ -1243,8 +1253,20 @@ fn drive(run: &Run<'_>) -> ColonyReport {
         let branch = tree.branch().to_string();
         let _ = tree.remove_keeping_branch();
         report.synthesis_branch = Some(branch.clone());
-        // A stopped run keeps its branches for the user instead of offering a merge.
-        if config.merge && report.conflict.is_none() && !run.handle.is_stopped() {
+        // A run that was stopped, reached its cap, or merged work that did not finish
+        // or was not reviewed keeps its branches for the user instead of offering a
+        // merge (which `--yes` would apply unseen).
+        let held_back = if config.merge && report.conflict.is_none() {
+            merge_held_back(run, &report, &unreviewed)
+        } else {
+            None
+        };
+        if let Some(reason) = &held_back {
+            report.note = Some(format!(
+                "The changes were not offered for your working tree: {reason}"
+            ));
+        }
+        if config.merge && report.conflict.is_none() && held_back.is_none() {
             let files = git_text(
                 &config.workspace,
                 &["diff", "--name-only", tree.base(), &branch],
@@ -1293,6 +1315,43 @@ fn drive(run: &Run<'_>) -> ColonyReport {
     }
     .to_string();
     finish(report, run)
+}
+
+/// Why the merge is not offered, or `None` when the run finished its work: it was not
+/// stopped, did not reach its cap, and every merged branch's worker finished and was
+/// reviewed.
+fn merge_held_back(
+    run: &Run<'_>,
+    report: &ColonyReport,
+    unreviewed: &BTreeSet<String>,
+) -> Option<String> {
+    if run.handle.is_stopped() {
+        return Some("the run was stopped.".to_string());
+    }
+    if run.handle.meter.exhausted() {
+        return Some("the run reached its token cap before it finished.".to_string());
+    }
+    let unfinished = report
+        .tasks
+        .iter()
+        .filter(|task| task.branch.is_some() && task.status != AgentStatus::Done)
+        .map(|task| task.id.as_str())
+        .collect::<Vec<_>>();
+    let mut reasons = Vec::new();
+    if !unfinished.is_empty() {
+        reasons.push(format!("work did not finish ({})", unfinished.join(", ")));
+    }
+    if !unreviewed.is_empty() {
+        reasons.push(format!(
+            "reviews did not finish ({})",
+            unreviewed
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    (!reasons.is_empty()).then(|| format!("{}.", reasons.join(" and ")))
 }
 
 fn worker_id(task: &PlannedTask) -> String {
@@ -1387,10 +1446,11 @@ fn run_worker(run: &Run<'_>, task: &PlannedTask, share: u64) -> WorkerOutcome {
     outcome
 }
 
-fn run_reviewer(run: &Run<'_>, outcome: &WorkerOutcome, share: u64) -> String {
+/// The review's text, and whether the reviewer finished.
+fn run_reviewer(run: &Run<'_>, outcome: &WorkerOutcome, share: u64) -> (String, bool) {
     let config = run.config;
     let Some(worktree) = &outcome.worktree else {
-        return String::new();
+        return (String::new(), false);
     };
     let diff = git_text(
         worktree.path(),
@@ -1420,9 +1480,17 @@ fn run_reviewer(run: &Run<'_>, outcome: &WorkerOutcome, share: u64) -> String {
         false,
     );
     let review = run.run_agent(&request, share);
-    review.error.map_or(review.text, |error| {
-        format!("The review did not finish: {error}")
-    })
+    match review.error {
+        None if !review.budget_exhausted => (review.text, true),
+        None => (
+            format!(
+                "The review stopped at its token budget: {}",
+                review.text.trim()
+            ),
+            false,
+        ),
+        Some(error) => (format!("The review did not finish: {error}"), false),
+    }
 }
 
 /// Commits what a worker left in its worktree; returns the commits on its branch.
