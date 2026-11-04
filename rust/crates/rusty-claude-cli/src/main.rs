@@ -4080,6 +4080,21 @@ impl LiveCli {
         target: Option<&str>,
         output_format: CliOutputFormat,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if action == Some("help") {
+            let usage = format!("Usage: {}", crate::args::PLUGINS_USAGE);
+            match output_format {
+                CliOutputFormat::Text => println!("{usage}"),
+                CliOutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "kind": "plugin",
+                        "action": "help",
+                        "usage": usage,
+                    }))?
+                ),
+            }
+            return Ok(());
+        }
         let cwd = env::current_dir()?;
         let loader = ConfigLoader::default_for(&cwd);
         let runtime_config = loader.load()?;
@@ -6775,14 +6790,12 @@ mod tests {
         for command in [
             vec!["help", "me", "debug", "this", "test"],
             vec!["status", "of", "the", "build", "is", "red,", "fix", "it"],
-            vec!["mcp", "server", "crashes", "on", "start"],
             vec!["agents", "keep", "timing", "out"],
             vec!["version", "of", "python"],
             vec!["sandbox", "the", "tests"],
             vec!["doctor", "the", "results"],
             vec!["state", "machine", "refactor"],
             vec!["agents", "list", "them"],
-            vec!["mcp", "show", "the", "github", "server"],
             vec!["acp", "protocol", "notes"],
             vec!["help", "me", "fix", "the", "--verbose", "flag"],
         ] {
@@ -6814,6 +6827,15 @@ mod tests {
             vec!["export", "summary"],
             vec!["--model", "sonnet", "init", "the", "repo"],
             vec!["skills", "install", "a", "b"],
+            // Unknown `mcp` and `plugins` words cost a model call when they were a
+            // prompt: they are refused with the usage.
+            vec!["mcp", "server", "crashes", "on", "start"],
+            vec!["mcp", "show", "the", "github", "server"],
+            vec!["mcp", "lst"],
+            vec!["plugins", "list", "all"],
+            vec!["plugins", "lst"],
+            vec!["plugins", "install"],
+            vec!["plugin", "enable", "a", "b"],
         ] {
             let error = parse_args(&words(&command)).expect_err(&command.join(" "));
             let name = command
@@ -6895,8 +6917,61 @@ mod tests {
             }
         );
         // A slash command's alias gets the same guidance as its name.
-        let error = parse_args(&words(&["plugins"])).unwrap_err();
-        assert!(error.contains("/plugins"), "{error}");
+        let error = parse_args(&words(&["marketplace"])).unwrap_err();
+        assert!(error.contains("/marketplace"), "{error}");
+    }
+
+    #[test]
+    fn plugins_subcommand_runs_locally_without_a_model_call() {
+        let words = |values: &[&str]| values.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let plugins = |action: Option<&str>, target: Option<&str>| CliAction::Plugins {
+            action: action.map(str::to_string),
+            target: target.map(str::to_string),
+            output_format: CliOutputFormat::Text,
+        };
+        for (command, expected) in [
+            (vec!["plugins"], plugins(None, None)),
+            (vec!["plugins", "list"], plugins(Some("list"), None)),
+            (vec!["plugin", "list"], plugins(Some("list"), None)),
+            (
+                vec!["plugins", "install", "./my-plugin"],
+                plugins(Some("install"), Some("./my-plugin")),
+            ),
+            (
+                vec!["plugins", "enable", "demo"],
+                plugins(Some("enable"), Some("demo")),
+            ),
+            (
+                vec!["plugins", "remove", "demo@external"],
+                plugins(Some("uninstall"), Some("demo@external")),
+            ),
+            (vec!["plugins", "help"], plugins(Some("help"), None)),
+            (vec!["plugins", "--help"], plugins(Some("help"), None)),
+            (vec!["plugins", "list", "-h"], plugins(Some("help"), None)),
+        ] {
+            assert_eq!(
+                parse_args(&words(&command)).as_ref(),
+                Ok(&expected),
+                "{command:?}"
+            );
+        }
+        assert!(matches!(
+            parse_args(&words(&["--output-format", "json", "plugins", "list"])),
+            Ok(CliAction::Plugins {
+                output_format: CliOutputFormat::Json,
+                ..
+            })
+        ));
+        let error = parse_args(&words(&["plugins", "lst"])).unwrap_err();
+        assert!(
+            error.starts_with(&format!(
+                "`plugins` is a neuron command (`{}`) and does not take `lst`.",
+                crate::args::PLUGINS_USAGE
+            )),
+            "{error}"
+        );
+        let error = parse_args(&words(&["mcp", "lst"])).unwrap_err();
+        assert!(error.contains("neuron mcp [list|show <server>"), "{error}");
     }
 
     #[test]

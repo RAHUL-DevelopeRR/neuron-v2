@@ -633,6 +633,7 @@ pub(crate) fn parse_args_with_stdin(
                 }),
             }
         }
+        "plugins" | "plugin" => Ok(parse_plugins_args(&rest[1..], output_format)),
         "system-prompt" => parse_system_prompt_args(&rest[1..], output_format),
         "acp" => parse_acp_args(&rest[1..], output_format),
         "login" | "logout" | "auth" | "usage" | "upgrade" => {
@@ -737,6 +738,8 @@ pub(crate) fn bare_slash_command_guidance(command_name: &str) -> Option<String> 
             | "agents"
             | "mcp"
             | "skills"
+            | "plugins"
+            | "plugin"
             | "system-prompt"
             | "init"
             | "prompt"
@@ -795,6 +798,50 @@ pub(crate) fn quote_prompt_hint(name: &str) -> String {
 }
 
 const SKILLS_USAGE: &str = "neuron skills [list|install <path>|help|<skill> [args]]";
+
+/// `neuron plugins`, the same actions as `/plugins`.
+pub(crate) const PLUGINS_USAGE: &str =
+    "neuron plugins [list|install <path>|enable <name>|disable <name>|update <id>|uninstall <id>|help]";
+
+/// Whether `neuron plugins` takes `words` ([`PLUGINS_USAGE`]; `remove` is
+/// `uninstall`).
+fn plugins_words_taken(words: &[&str]) -> bool {
+    matches!(
+        without_help_word(words),
+        [] | ["list"]
+            | [
+                "install" | "enable" | "disable" | "update" | "uninstall" | "remove",
+                _
+            ]
+    )
+}
+
+/// `neuron plugins ...` once [`classify_subcommand_words`] took the words: the
+/// action and its target. Help is the action `help`.
+fn parse_plugins_args(args: &[String], output_format: CliOutputFormat) -> CliAction {
+    let words = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let wants_help = words
+        .last()
+        .is_some_and(|last| is_help_flag(last) || *last == "help");
+    let (action, target) = match without_help_word(&words) {
+        _ if wants_help => (Some("help".to_string()), None),
+        [] => (None, None),
+        [action] => (Some((*action).to_string()), None),
+        [action, target, ..] => {
+            let action = if *action == "remove" {
+                "uninstall"
+            } else {
+                action
+            };
+            (Some(action.to_string()), Some((*target).to_string()))
+        }
+    };
+    CliAction::Plugins {
+        action,
+        target,
+        output_format,
+    }
+}
 
 /// How many skill names an unknown-skill error suggests.
 const SKILL_SUGGESTIONS: usize = 3;
@@ -897,13 +944,17 @@ pub(crate) fn classify_subcommand_words(rest: &[String]) -> SubcommandWords {
                 words.len() == 2,
             )
         }
-        "mcp" => shows(
+        // Any other word is refused with the usage rather than sent to the model: a
+        // mistyped subcommand (`neuron mcp lst`) would otherwise cost a model call.
+        "mcp" => changes(
             "neuron mcp [list|show <server>|enable <server>|disable <server>|login <server>|logout <server>|serve|help]",
             matches!(
                 without_help_word(&words),
                 [] | ["list" | "show" | "serve"] | ["show", _]
             ),
         ),
+        // Likewise `neuron plugins lst`, which used to go to the model.
+        "plugins" | "plugin" => changes(PLUGINS_USAGE, plugins_words_taken(&words)),
         "acp" => shows(
             "neuron acp [serve]",
             matches!(bare_words(&words, &[]).as_slice(), [] | ["serve"]),
