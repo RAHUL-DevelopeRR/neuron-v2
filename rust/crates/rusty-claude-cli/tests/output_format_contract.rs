@@ -151,7 +151,14 @@ fn skills_search_and_install_from_a_registry() {
 
     let found = assert_json_command_with_env(
         &root,
-        &["--output-format", "json", "skills", "search", "issue", "triage"],
+        &[
+            "--output-format",
+            "json",
+            "skills",
+            "search",
+            "issue",
+            "triage",
+        ],
         &envs,
     );
     assert_eq!(found["action"], "search");
@@ -160,7 +167,13 @@ fn skills_search_and_install_from_a_registry() {
 
     let installed = assert_json_command_with_env(
         &root,
-        &["--output-format", "json", "skills", "install", "acme/tools/triage"],
+        &[
+            "--output-format",
+            "json",
+            "skills",
+            "install",
+            "acme/tools/triage",
+        ],
         &envs,
     );
     assert_eq!(installed["invocation_name"], "triage");
@@ -170,8 +183,7 @@ fn skills_search_and_install_from_a_registry() {
         .join("SKILL.md")
         .is_file());
 
-    let listed =
-        assert_json_command_with_env(&root, &["--output-format", "json", "skills"], &envs);
+    let listed = assert_json_command_with_env(&root, &["--output-format", "json", "skills"], &envs);
     assert!(
         listed["skills"]
             .as_array()

@@ -2142,12 +2142,12 @@ description: t
         .expect("settings");
 
         let loader = ConfigLoader::new(&cwd, &home);
-        let loaded = loader.load().expect("config loads");
-        let pending = loaded.mcp().needs_approval();
+        let config = loader.load().expect("config loads");
+        let pending = config.mcp().needs_approval();
         assert_eq!(pending.keys().collect::<Vec<_>>(), vec!["tracker"]);
         assert_eq!(pending["tracker"].scope, ConfigSource::Plugin);
-        assert!(loaded.mcp().get("tracker").is_none(), "not started");
-        assert_eq!(loaded.mcp().get("docs").unwrap().scope, ConfigSource::User);
+        assert!(config.mcp().get("tracker").is_none(), "not started");
+        assert_eq!(config.mcp().get("docs").unwrap().scope, ConfigSource::User);
         match &pending["tracker"].config {
             McpServerConfig::Stdio(stdio) => {
                 let expected = format!("{}/server.js", install.install_path.display());
@@ -2155,7 +2155,7 @@ description: t
             }
             other => panic!("expected stdio, got {other:?}"),
         }
-        let skill_dirs = loader.plugin_skill_dirs(&loaded);
+        let skill_dirs = loader.plugin_skill_dirs(&config);
         assert_eq!(skill_dirs.len(), 1);
         assert_eq!(skill_dirs[0].0, "tracker-kit");
         assert!(skill_dirs[0].1.join("triage").join("SKILL.md").is_file());
@@ -2169,13 +2169,13 @@ description: t
             ),
         )
         .expect("settings");
-        let loaded = loader.load().expect("config loads");
+        let config = loader.load().expect("config loads");
         // With no settings server named docs, the plugin's own docs server now waits too.
         assert_eq!(
-            loaded.mcp().needs_approval().keys().collect::<Vec<_>>(),
+            config.mcp().needs_approval().keys().collect::<Vec<_>>(),
             vec!["docs"]
         );
-        assert!(loaded.mcp().disabled().contains_key("tracker"));
+        assert!(config.mcp().disabled().contains_key("tracker"));
 
         // A disabled plugin brings nothing.
         fs::write(
@@ -2186,9 +2186,9 @@ description: t
             ),
         )
         .expect("settings");
-        let loaded = loader.load().expect("config loads");
-        assert!(loaded.mcp().needs_approval().is_empty());
-        assert!(loader.plugin_skill_dirs(&loaded).is_empty());
+        let config = loader.load().expect("config loads");
+        assert!(config.mcp().needs_approval().is_empty());
+        assert!(loader.plugin_skill_dirs(&config).is_empty());
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 

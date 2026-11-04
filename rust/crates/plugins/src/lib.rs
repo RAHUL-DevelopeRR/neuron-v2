@@ -3520,10 +3520,9 @@ mod tests {
         let enabled = load_enabled_plugins(&manager.settings_path());
         assert_eq!(enabled.get("old@external"), Some(&true));
         assert_eq!(enabled.get("starter@bundled"), Some(&true));
-        let root: Value = serde_json::from_str(
-            &fs::read_to_string(manager.settings_path()).expect("settings"),
-        )
-        .expect("settings json");
+        let root: Value =
+            serde_json::from_str(&fs::read_to_string(manager.settings_path()).expect("settings"))
+                .expect("settings json");
         assert_eq!(root["model"], "auto");
         assert_eq!(root["plugins"]["installRoot"], "plugins/installed");
 

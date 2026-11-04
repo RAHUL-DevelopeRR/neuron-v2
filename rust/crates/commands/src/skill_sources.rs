@@ -91,17 +91,15 @@ impl RemoteSkillSource {
     }
 
     /// The name to install under when the skill's front matter has none.
-    fn fallback_name(&self) -> Option<String> {
+    fn fallback_name(&self) -> String {
         match self {
-            Self::Registry { slug, .. } => Some(slug.clone()),
+            Self::Registry { slug, .. } => slug.clone(),
             Self::GitHub { repo, path, .. } => {
                 let last = path.rsplit('/').find(|segment| !segment.is_empty());
-                Some(
-                    last.map_or(repo.as_str(), |segment| {
-                        segment.strip_suffix(".md").unwrap_or(segment)
-                    })
-                    .to_string(),
-                )
+                last.map_or(repo.as_str(), |segment| {
+                    segment.strip_suffix(".md").unwrap_or(segment)
+                })
+                .to_string()
             }
         }
     }
@@ -226,7 +224,11 @@ fn valid_name(text: &str) -> bool {
 }
 
 fn valid_slug(text: &str) -> bool {
-    valid_name(text) && !text.starts_with('.') && !text.ends_with(".md")
+    valid_name(text)
+        && !text.starts_with('.')
+        && !Path::new(text)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
 }
 
 fn valid_reference(text: &str) -> bool {
@@ -270,7 +272,7 @@ pub fn parse_search_response(body: &Value) -> Vec<SkillSearchHit> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    hits.sort_by(|left, right| right.installs.cmp(&left.installs));
+    hits.sort_by_key(|hit| std::cmp::Reverse(hit.installs));
     let mut seen = std::collections::BTreeSet::new();
     hits.retain(|hit| seen.insert(hit.name.clone()));
     hits.truncate(SEARCH_RESULT_LIMIT);
@@ -408,7 +410,7 @@ pub(crate) fn install_remote_skill(
         .map(|file| String::from_utf8_lossy(&file.contents).to_string())
         .unwrap_or_default();
     let display_name = super::parse_skill_frontmatter(&instructions).0;
-    let invocation_name = [display_name.clone(), source.fallback_name()]
+    let invocation_name = [display_name.clone(), Some(source.fallback_name())]
         .into_iter()
         .flatten()
         .find_map(|candidate| super::sanitize_skill_invocation_name(&candidate))
