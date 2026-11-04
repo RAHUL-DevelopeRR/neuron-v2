@@ -39,7 +39,8 @@ The release workflow copies a version's section into its GitHub release notes.
 - `NEURON_AUTO_COMPACT_INPUT_TOKENS` sets the automatic compaction threshold; the
   inherited variable name it replaces still works.
 - A `.clawd-todos.json` an earlier release left in the workspace is removed once the
-  task list is saved in Neuron's home, unless git tracks it.
+  task list is saved in Neuron's home, unless git tracks it or fails to say inside a
+  repository (a corrupt index, a folder refused for dubious ownership).
 - `/rewind` works in the line REPL (`--no-tui`) as in the full-screen UI: a checkpoint
   is saved with each prompt, and `/rewind <id> [code|chat|both]` goes back to one.
   `/help` and Tab completion list it, and `neuron /rewind` says to run it in a session.

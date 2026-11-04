@@ -3680,7 +3680,8 @@ fn previous_todos(store: &Path, legacy: Option<&Path>) -> Result<Vec<TodoItem>, 
 /// Removes the task list an earlier release left in the workspace at `legacy`, unless git
 /// tracks it: someone committed it, and deleting it would be a change to commit. An
 /// untracked or ignored one goes, as does one outside a repository; when git can't be
-/// run to ask, it stays.
+/// run to ask, or fails inside a repository (a corrupt index, a folder git refuses as
+/// of dubious ownership), it stays.
 fn remove_legacy_todos(legacy: &Path) {
     let (Some(folder), Some(name)) = (legacy.parent(), legacy.file_name()) else {
         return;
@@ -3693,9 +3694,29 @@ fn remove_legacy_todos(legacy: &Path) {
         .arg(name)
         .current_dir(folder)
         .output();
-    if tracked.is_ok_and(|output| !output.status.success()) {
+    let Ok(output) = tracked else {
+        return;
+    };
+    if legacy_todos_removable(output.status.code(), || inside_repository(folder)) {
         let _ = std::fs::remove_file(legacy);
     }
+}
+
+/// Whether `git ls-files --error-unmatch` exiting with `code` lets the legacy task list
+/// go: 1 is git's answer "not tracked"; any other failure (128, "fatal") says so too
+/// only when `in_repository` says the folder is not in one.
+fn legacy_todos_removable(code: Option<i32>, in_repository: impl FnOnce() -> bool) -> bool {
+    match code {
+        Some(0) => false,
+        Some(1) => true,
+        _ => !in_repository(),
+    }
+}
+
+/// Whether `folder` or a folder above it has a `.git`: git's own failure there is not
+/// "not a git repository".
+fn inside_repository(folder: &Path) -> bool {
+    folder.ancestors().any(|dir| dir.join(".git").exists())
 }
 
 fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
@@ -9384,7 +9405,28 @@ mod tests {
         run_git(&repo, &["commit", "--quiet", "-m", "todos"]);
         super::remove_legacy_todos(&old);
         assert!(old.exists(), "committed");
+
+        // Git fails inside the repository (exit 128): the committed list stays.
+        fs::write(repo.join(".git").join("index"), "garbage").expect("corrupt index");
+        let status = Command::new("git")
+            .args(["ls-files", "--error-unmatch", "--", super::LEGACY_TODO_FILE])
+            .current_dir(&repo)
+            .output()
+            .expect("git runs")
+            .status;
+        assert_eq!(status.code(), Some(128), "a corrupt index is a fatal error");
+        super::remove_legacy_todos(&old);
+        assert!(old.exists(), "git failed in a repository");
+        assert!(super::inside_repository(&repo.join("sub")));
         let _ = fs::remove_dir_all(&repo);
+
+        // "Not a git repository" (128) outside one still lets it go; git's answers
+        // stand on their own.
+        assert!(super::legacy_todos_removable(Some(128), || false));
+        assert!(!super::legacy_todos_removable(Some(128), || true));
+        assert!(!super::legacy_todos_removable(None, || true));
+        assert!(super::legacy_todos_removable(Some(1), || true));
+        assert!(!super::legacy_todos_removable(Some(0), || false));
     }
 
     #[test]
