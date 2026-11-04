@@ -276,6 +276,45 @@ disposable environment such as a container. `--allowedTools read,glob` limits wh
 tools exist at all, whatever the mode. Settings can also carry `permissions` allow, ask
 and deny rules for individual tools.
 
+## Web search and fetch
+
+`WebSearch` asks once per session and `WebFetch` once per domain. Signed in to Zero-X,
+a search goes through the gateway (`https://zero-x.live/v1/search`): results come with
+a short snippet and, where known, a date, and count against your plan's daily search
+allowance. When the allowance is used up the search fails with the time it resets, and
+the model is told not to retry before then. When you are signed out, or the gateway
+has no search service, Neuron searches DuckDuckGo directly from your machine (titles
+only, no snippets); DuckDuckGo often answers scripts with a bot check, which Neuron
+reports as an error rather than empty results. If the gateway no longer accepts your
+session, the search fails and asks you to sign in again with `neuron auth login`.
+
+Search results and fetched pages reach the model wrapped as external, untrusted
+content (`<external-content id="..." source="web:...">`, with a random id the page
+cannot guess). The model is told to treat that text as data and never follow
+instructions in it.
+
+Two flags grant web access for one run only; they are never saved to settings:
+
+| Flag | Effect |
+| --- | --- |
+| `--allow-web` | `WebSearch` and `WebFetch` run without asking |
+| `--allow-origin HOST` | `WebFetch` and the browser may reach only `HOST` (repeatable), and fetches from it run without asking. `HOST` is a host name or URL (`example.com`, `https://docs.rs/`); `*.example.com` also matches its subdomains. Calls to other hosts are refused, whatever the permission mode or allow rules |
+
+They are meant for scripts and CI, where nobody can answer a question:
+
+```bash
+neuron --allow-web -p "latest stable Rust version, cite the source"
+neuron --allow-origin docs.rs --allow-origin '*.rust-lang.org' -p "summarize the serde docs"
+```
+
+Put them before `-p` or `prompt`: after it, every word is prompt text, so Neuron
+refuses them there instead of sending them to the model. A deny rule for `WebSearch`
+or `WebFetch` still wins over `--allow-web`. In the full-screen UI, approve web calls
+when asked instead.
+
+`CLAWD_WEB_SEARCH_BASE_URL` points direct searches at a search page of your own
+(it is sent `?q=<query>`); with it set, searches never go through the gateway.
+
 ## Sessions
 
 Sessions are saved to `.neuron/sessions/<workspace-id>/<session-id>.jsonl` in the
@@ -347,6 +386,19 @@ Inside a session: `/session list`, `/session switch <id>`, `/resume <path>`,
 
 `neuron status`, `neuron doctor` and `neuron sandbox` print the same reports without
 starting a session.
+
+The integrations have subcommands of their own, which run locally and never call the
+model:
+
+- `neuron mcp [list|show <server>|enable <server>|disable <server>|login <server>|logout <server>|serve|help]`
+- `neuron plugins [list|install <path>|enable <name>|disable <name>|update <id>|uninstall <id>|help]`
+  (`remove` is the same as `uninstall`; `--output-format json` prints JSON)
+- `neuron skills [list|install <path>|help|<skill> [args]]`
+
+Any other word after `neuron mcp`, `neuron plugins` or `neuron skills` is refused with
+the usage line, so a typo such as `neuron plugins lst` costs nothing. To send a prompt
+that starts with one of these words, quote it (`neuron "mcp servers keep timing out"`)
+or use `neuron prompt "..."`.
 
 ## Bring your own key
 

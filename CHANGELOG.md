@@ -61,6 +61,19 @@ The release workflow copies a version's section into its GitHub release notes.
   covering `permissions.allow` rules to `.neuron/settings.local.json`, and "deny for
   this session" (`d`), after which the same command prefix is refused without asking.
   A denied model is told plainly not to retry the command or a variant.
+- Signed in to Zero-X, `WebSearch` goes through the gateway (`POST /v1/search`):
+  results carry snippets and dates, `freshness` limits them to the last day, week,
+  month or year, and a used-up daily allowance says when it resets. Signed out, or when
+  the gateway has no search service, it searches DuckDuckGo directly as before.
+- Search results and `WebFetch` pages reach the model inside an external-content
+  envelope with a random id, which the page text cannot close or fake, and the model
+  is told never to follow instructions inside it.
+- `--allow-web` lets `WebSearch` and `WebFetch` run without asking for one run, and
+  `--allow-origin HOST` (repeatable) limits `WebFetch` and the browser to those hosts
+  and lets fetches from them run without asking. Neither is saved.
+- `neuron plugins [list|install|enable|disable|update|uninstall]` runs locally, and an
+  unknown word after `neuron mcp`, `neuron plugins` or `neuron skills` is refused with
+  the usage line instead of being sent to the model as a prompt.
 
 ## 7.0.0-alpha.3 (2026-11-02)
 

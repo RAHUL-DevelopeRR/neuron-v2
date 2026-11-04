@@ -335,3 +335,27 @@ Sync the copy in `neuron-v2`; nothing here changes what the CLI sends or must ha
   the budget, with `upgrade_url` when a paid pool would take it, instead of
   `403 upgrade_required` ("model not in plan"). Clients handle it like any other
   `context_length_exceeded` (compact or shorten).
+
+## 8. Web search (`POST /v1/search`, 2026-11-04)
+
+The CLI's `WebSearch` uses this when signed in; the gateway implements exactly this.
+
+- **Request.** `POST /v1/search`, `Authorization: Bearer <ses_ token or nzx_ key>`, JSON body
+  `{"query": string (1-400 chars), "count": 1-10 (default 8), "purpose": "search" | "research",
+  "freshness"?: "day" | "week" | "month" | "year"}`. A research run sends the header
+  `x-neuron-research-run: <run id>` with `purpose: "research"`.
+- **200.** `{"results": [{"title", "url", "snippet", "published"?}], "provider": "searxng" | "brave",
+  "cached": bool, "quota": {"remaining", "limit", "resets_at"}}`.
+- **Errors.** `429 {"error": "search_quota_exhausted", "resets_at"}`;
+  `503 {"error": "search_unavailable"}` when no search backend is configured (the default until
+  `SEARXNG_URL` or `BRAVE_API_KEY` is set); `401` sign in again.
+- **Daily quotas** (reset at `quota.resets_at`). Free 40 searches and 3 research runs, Pro
+  400/30, Max 2000/150. A research run is counted once per distinct `x-neuron-research-run` id.
+- **`/api/account`** adds `limits.search` (the daily allowance above; field names to be fixed
+  with the gateway change) and `limits.colony {max_workers, max_tokens_per_run}`: Free 1 / 300000,
+  Pro 4 / 2000000, Max 8 / 6000000. Colony budgets are enforced by the client.
+- **CLI behaviour.** Results (titles and snippets) reach the model inside the external-content
+  envelope. 429 is a tool error naming `resets_at`, with no retry. 503, or no sign-in, falls back to
+  the direct DuckDuckGo search (an HTTP 202 bot page there is an error, not empty results). 401 is
+  a tool error asking the user to sign in again. A custom `CLAWD_WEB_SEARCH_BASE_URL` bypasses the
+  gateway.
