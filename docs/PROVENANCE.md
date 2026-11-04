@@ -97,6 +97,17 @@ test says so in a comment. Only code was ported; no prompt or tool-description t
 | MCP config | `rust/crates/runtime/src/config.rs` | `7c4bcd9` | A stdio MCP server's `command` and `args` expand `${VAR}` and a leading `~`; unset variables stay as written. |
 | API errors | `rust/crates/api/src/error.rs` | `6ac13ff`, `1d516be` | OpenAI "input tokens exceed the configured limit" and llama.cpp context-overflow errors count as context-window failures. |
 
+## Ports from Freebuff outside the UI
+
+Code in the Rust workspace that follows Freebuff ([CodebuffAI/freebuff](https://github.com/CodebuffAI/freebuff),
+Apache-2.0, "Copyright 2025 Codebuff"; the license and `NOTICE` travel with
+`ui/neuron-tui/`). Each ported module says so in a comment. Only structure and
+constants were taken; the prompts are Neuron's own.
+
+| Area | Neuron files | Freebuff source (commit `545e04d`) | What was taken |
+| --- | --- | --- | --- |
+| Research | `rust/crates/rusty-claude-cli/src/research.rs` | `agents/researcher/researcher-web.ts` | Research in rounds (search, read the most promising pages, search again for what is missing), read at least three pages before answering, a cap of 15 research steps, and a final answer forced from what was read once the steps run out. |
+
 ## Other branches and leftovers
 
 - **Go `opencode` fork.** The `THE-BUGGY-BREACH` branch contains a Go program in `go/`

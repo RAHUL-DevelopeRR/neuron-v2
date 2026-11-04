@@ -318,6 +318,66 @@ approve web calls when asked instead.
 `CLAWD_WEB_SEARCH_BASE_URL` points direct searches at a search page of your own
 (it is sent `?q=<query>`); with it set, searches never go through the gateway.
 
+## Research
+
+`/research <question>` (full-screen UI and line REPL) and `neuron research
+"<question>"` (scripts) research a question on the web and write a short report in
+which every claim cites the pages it came from:
+
+1. The model splits the question into a few sub-questions.
+2. Each sub-question is searched (signed in: through the gateway, as part of one
+   research run), and the best results are read, other sites first, at most 12,000
+   characters of each page.
+3. From each page the model takes short notes, each with a quote of at most 25 words;
+   a note whose quote is not on the page is dropped.
+4. When too few pages were read (or at standard and deep depth), it searches once
+   more for what is missing.
+5. The report is written from the notes alone, never from the raw pages. A sentence
+   that cites a page not read in this run is removed, and the report says how many
+   were. A sources table (title, address, when it was read, what it was used for) and
+   why the run stopped close the report.
+
+The report is saved to `.neuron/research/<question-words>.md` in the folder you run
+Neuron in (`-2`, `-3`, ... when the name is taken), shown in the chat, and kept in the
+conversation as data, so you can ask about it next.
+
+| Option | Effect |
+| --- | --- |
+| `--depth quick` | Up to 3 sub-questions, 5 searches, 5 pages, 10 steps; about 150,000 tokens |
+| `--depth standard` (default) | Up to 4 sub-questions, 7 searches, 8 pages, 15 steps; about 300,000 tokens |
+| `--depth deep` | Up to 6 sub-questions, 10 searches, 15 pages, 25 steps; about 600,000 tokens |
+| `--budget TOKENS` | Another token cap (`200000`, `200k`, `1.5m`), at least 10k |
+| `--out FILE` | `neuron research` only: also write the report to `FILE` |
+
+Options go before the question. A step is one search or one page read. The token cap
+is held to your plan's most per run: Free 300,000, Pro 600,000, Max 1,500,000. A run
+stops when it reaches its step cap, when 80% of its tokens are used (it then writes
+the report from the notes so far), when the plan's daily search or research allowance
+is used up (Free 3 research runs a day, Pro 30, Max 150; the report says when it
+resets), or when you interrupt it (Esc in the full-screen UI), and the report says
+which. Requests that only take notes from one page go to `summaryModel` when it is set.
+
+Before a run starts, Neuron says what it may use and asks to start; saying yes allows
+web searches and reads for that run only, as `--allow-web` does. Deny rules for
+`WebSearch` or `WebFetch` and `--allow-origin` limits still apply, and every page read
+goes through the same address checks as `WebFetch` (no private or local addresses).
+In the full-screen UI each search and page read shows as a step of the turn and the
+sub-questions as its task list.
+
+`neuron research` cannot ask, so it refuses to start, before any model call, unless
+`--allow-web` is given or `permissions.allow` rules in `~/.neuron/settings.json` allow
+`WebSearch` and `WebFetch`:
+
+```bash
+neuron --allow-web research --depth quick "which Rust async runtime should I use in 2026?"
+neuron --allow-web --output-format json research --out notes/runtimes.md "tokio vs smol"
+```
+
+It prints the report on stdout and its progress on stderr (JSON output: one object
+with the report, sources, token use and `stop_reason`), and exits with 1 when no page
+could be read. Pages are read one after another; reading several at once waits for
+the multi-agent mode.
+
 ## Sessions
 
 Sessions are saved to `.neuron/sessions/<workspace-id>/<session-id>.jsonl` in the
@@ -381,6 +441,7 @@ Inside a session: `/session list`, `/session switch <id>`, `/resume <path>`,
 | `/cost` | Token usage of this session |
 | `/compact`, `/clear` | Shrink or reset the conversation |
 | `/diff` | Changes in the working tree |
+| `/research <question>` | Research a question on the web and write a cited report (see [Research](#research)) |
 | `/rewind [id [code\|chat\|both]]` | List the checkpoint saved with each prompt, or go back to one: the files, the conversation or both |
 | `/init` | Create a starter `NEURON.md` for the project |
 | `/mcp`, `/skills`, `/plugins` | Inspect and manage integrations |

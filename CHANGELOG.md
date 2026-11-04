@@ -74,6 +74,17 @@ The release workflow copies a version's section into its GitHub release notes.
   `--allow-origin` a redirect to an unlisted host (`www.` included) is not followed,
   and browser clicks, typing, page scripts and going back are refused. Either flag
   keeps the line REPL instead of the full-screen UI, which could not carry them.
+- `/research <question>` (full-screen UI and line REPL) and `neuron research
+  "<question>"` research a question on the web: sub-questions, searches through the
+  gateway as one research run, a bounded number of pages read with the same guards as
+  `WebFetch`, notes whose quotes must be on the page, and a report written from the
+  notes alone with numbered citations and a sources table, saved to
+  `.neuron/research/`. Claims citing a page not read in the run are removed and counted.
+  `--depth quick|standard|deep` and `--budget` set the caps (held to the plan's
+  ceiling); a run stops at its step cap, at 80% of its tokens, on a used-up search
+  allowance or an interrupt, and says why. It asks before starting (the yes allows web
+  reads for that run); `neuron research` needs `--allow-web` or allow rules instead. In
+  the full-screen UI its searches and reads show as the turn's steps.
 - `neuron plugins [list|install|enable|disable|update|uninstall]` runs locally, and an
   unknown word after `neuron mcp`, `neuron plugins` or `neuron skills` is refused with
   the usage line instead of being sent to the model as a prompt.

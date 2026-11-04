@@ -359,3 +359,8 @@ The CLI's `WebSearch` uses this when signed in; the gateway implements exactly t
   the direct DuckDuckGo search (an HTTP 202 bot page there is an error, not empty results). 401 is
   a tool error asking the user to sign in again. A custom `CLAWD_WEB_SEARCH_BASE_URL` bypasses the
   gateway.
+- **Research runs.** `/research` and `neuron research` send every search of one run with
+  `purpose: "research"` and the same `x-neuron-research-run` id (`rr_` and 16 hex characters, new for
+  each run), `count` 8 and no `freshness`. A 429 stops the run and the report names `resets_at`; a
+  401 stops it too; a 503 falls back to the direct search, as for `WebSearch`. Pages are fetched by
+  the client, not the gateway.
