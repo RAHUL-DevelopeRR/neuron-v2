@@ -799,6 +799,33 @@ impl PermissionPolicy {
                 }
                 assessment.session_prefixes = vec![scope];
             }
+            name if name.starts_with(crate::browser::BROWSER_TOOL_PREFIX) => {
+                // Playwright resolves a named file against the project root.
+                let file_reason = input_field(input, &["filename"])
+                    .and_then(|filename| browser_filename_reason(&filename, workspace.as_slice()));
+                if let Some(reason) = &file_reason {
+                    escalate(&mut assessment, reason.clone());
+                }
+                if crate::browser::browser_call_tier(name, input)
+                    == Some(crate::browser::BrowserToolTier::Web)
+                {
+                    // One approval covers web browsing for the rest of the session.
+                    let scope = vec![BROWSER_WEB_SCOPE.to_string()];
+                    let granted = input_field(input, &["url"])
+                        .and_then(|url| url_host(&url))
+                        .is_some_and(|host| self.run_web_grants().grants_browsing(&host));
+                    if granted || self.session.prefixes(BROWSER_SESSION_KEY).contains(&scope) {
+                        assessment.session_approved = file_reason.is_none();
+                    } else {
+                        escalate(
+                            &mut assessment,
+                            "opening and using web pages in the browser has not been approved in this session"
+                                .to_string(),
+                        );
+                    }
+                    assessment.session_prefixes = vec![scope];
+                }
+            }
             _ => {}
         }
         if assessment.session_approved && matches!(tool_name, "WebFetch" | "WebSearch") {
@@ -1072,7 +1099,7 @@ impl PermissionPolicy {
             PermissionPromptDecision::Deny { reason } => PermissionOutcome::Deny { reason },
             PermissionPromptDecision::DenyForSession { reason } => {
                 self.session.deny_for_session(
-                    tool_name,
+                    session_key(tool_name),
                     SessionDenial {
                         prefixes: assessment.session_prefixes.clone(),
                         subject,
@@ -1115,10 +1142,12 @@ impl PermissionPolicy {
     /// with a declined prefix, a fetch from a declined domain, or any web search once
     /// one was declined.
     fn session_denial(&self, tool_name: &str, input: &str) -> Option<String> {
-        let denials = self.session.denials(tool_name);
+        let denials = self.session.denials(session_key(tool_name));
         if denials.is_empty() {
             return None;
         }
+        let browsing = crate::browser::browser_call_tier(tool_name, input)
+            == Some(crate::browser::BrowserToolTier::Web);
         let subject = grant_subject(input);
         let classification = self.shell_classification(tool_name, input);
         let host = (tool_name == "WebFetch")
@@ -1140,6 +1169,8 @@ impl PermissionPolicy {
                                 .any(|prefix| prefix.first() == Some(host))
                         }),
                         (None, "WebSearch") => !denial.prefixes.is_empty(),
+                        // Web browsing declined: every call that opens or acts on a page.
+                        (None, _) if browsing => !denial.prefixes.is_empty(),
                         (None, _) => false,
                     }
             })
@@ -1153,7 +1184,7 @@ impl PermissionPolicy {
             }
         } else if !assessment.session_prefixes.is_empty() {
             self.session
-                .approve_prefixes(tool_name, &assessment.session_prefixes);
+                .approve_prefixes(session_key(tool_name), &assessment.session_prefixes);
         }
     }
 
@@ -1319,29 +1350,59 @@ fn classify_tool_command(
     }
 }
 
-/// Reads the first string field named in `keys` from a JSON tool input.
-/// Bundled-browser calls that read or close what is open but never load
-/// another page, so `--allow-origin` lets them run without a URL.
-const BROWSER_CALLS_THAT_STAY: &[&str] = &[
-    "browser_snapshot",
-    "browser_take_screenshot",
-    "browser_console_messages",
-    "browser_network_requests",
-    "browser_wait_for",
-    "browser_resize",
-    "browser_close",
-];
+/// Where "allow web browsing for this session" is kept: one approval covers
+/// every bundled-browser tool.
+const BROWSER_SESSION_KEY: &str = "mcp__playwright";
 
-/// Whether a bundled-browser call without a URL stays on the pages already
-/// open: one of [`BROWSER_CALLS_THAT_STAY`], or `browser_tabs` listing tabs.
-fn browser_call_stays_on_page(tool_name: &str, input: &str) -> bool {
-    let Some(call) = tool_name.strip_prefix("mcp__playwright__") else {
-        return false;
-    };
-    BROWSER_CALLS_THAT_STAY.contains(&call)
-        || (call == "browser_tabs" && input_field(input, &["action"]).as_deref() == Some("list"))
+/// What the browser's session approval is shown as.
+const BROWSER_WEB_SCOPE: &str = "web browsing";
+
+/// The tool name session approvals and denials are kept under: the bundled
+/// browser's tools share one, the rest their own.
+fn session_key(tool_name: &str) -> &str {
+    if tool_name.starts_with(crate::browser::BROWSER_TOOL_PREFIX) {
+        BROWSER_SESSION_KEY
+    } else {
+        tool_name
+    }
 }
 
+/// Whether a bundled-browser call without a URL stays on the pages already
+/// open, so `--allow-origin` lets it run: the page tier of
+/// [`crate::browser::BUNDLED_BROWSER_TOOLS`] (reading the page, arranging
+/// tabs, a blank new tab).
+fn browser_call_stays_on_page(tool_name: &str, input: &str) -> bool {
+    crate::browser::browser_call_tier(tool_name, input)
+        == Some(crate::browser::BrowserToolTier::Page)
+}
+
+/// Why a bundled-browser call naming `filename` needs approval: the server
+/// resolves the name against the project root, so a name that leaves the
+/// project, is Neuron or git configuration, or is a credential file asks.
+fn browser_filename_reason(filename: &str, workspace: &[PathBuf]) -> Option<String> {
+    let path = Path::new(filename);
+    let leaves = path.has_root()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::Prefix(_)
+            )
+        });
+    if leaves {
+        return Some(format!(
+            "the browser file `{filename}` is outside the project folder"
+        ));
+    }
+    // The browser's own output folder is Neuron's, but holds no configuration.
+    let in_output_folder =
+        path.starts_with(crate::browser::BROWSER_OUTPUT_DIR) && path.components().count() > 2;
+    (!in_output_folder)
+        .then(|| protected_config_reason(filename))
+        .flatten()
+        .or_else(|| sensitive_path_reason_resolved(filename, workspace))
+}
+
+/// Reads the first string field named in `keys` from a JSON tool input.
 fn input_field(input: &str, keys: &[&str]) -> Option<String> {
     let Ok(Value::Object(object)) = serde_json::from_str::<Value>(input) else {
         return None;
@@ -2083,7 +2144,7 @@ mod tests {
         let allow_web = workspace_policy(PermissionMode::WorkspaceWrite).with_run_web_grants(
             crate::RunWebGrants {
                 allow_web: true,
-                origins: Vec::new(),
+                ..crate::RunWebGrants::default()
             },
         );
         assert_eq!(
@@ -2122,7 +2183,7 @@ mod tests {
             ))
             .with_run_web_grants(crate::RunWebGrants {
                 allow_web: true,
-                origins: Vec::new(),
+                ..crate::RunWebGrants::default()
             });
         assert!(matches!(
             denied.authorize("WebSearch", &search, None),
@@ -2131,7 +2192,7 @@ mod tests {
         let read_only =
             workspace_policy(PermissionMode::ReadOnly).with_run_web_grants(crate::RunWebGrants {
                 allow_web: true,
-                origins: Vec::new(),
+                ..crate::RunWebGrants::default()
             });
         assert_eq!(
             read_only.authorize("WebSearch", &search, None),
@@ -2191,7 +2252,7 @@ mod tests {
             ),
             ("browser_navigate_back", "{}"),
             ("browser_type", r#"{"ref":"e3","text":"q","submit":true}"#),
-            ("browser_tabs", r#"{"action":"new"}"#),
+            ("browser_file_upload", r#"{"paths":["/tmp/a.txt"]}"#),
         ] {
             let reason =
                 refused(policy.authorize(&format!("mcp__playwright__{call}"), input, None));
@@ -2199,6 +2260,18 @@ mod tests {
             assert!(
                 reason.contains("--allow-origin (example.com)"),
                 "{call}: {reason}"
+            );
+        }
+        // Reading the page and arranging tabs stay on what is open.
+        for (call, input) in [
+            ("browser_find", r#"{"text":"Docs"}"#),
+            ("browser_tabs", r#"{"action":"new"}"#),
+            ("browser_tabs", r#"{"action":"select","index":1}"#),
+        ] {
+            assert_eq!(
+                policy.authorize(&format!("mcp__playwright__{call}"), input, None),
+                PermissionOutcome::Allow,
+                "{call}"
             );
         }
         // Other tools are not limited here.
@@ -2214,6 +2287,215 @@ mod tests {
             open.authorize(navigate, &url("https://evil.example/"), None),
             PermissionOutcome::Allow
         );
+    }
+
+    /// The bundled browser's tools at the tiers the CLI gives them
+    /// ([`crate::browser::browser_tool_permission`]).
+    fn browser_policy(mode: PermissionMode) -> PermissionPolicy {
+        let mut policy = workspace_policy(mode)
+            .with_session_approvals(SessionApprovals::isolated())
+            .with_run_web_grants(crate::RunWebGrants::default());
+        for (tool, _) in crate::browser::BUNDLED_BROWSER_TOOLS {
+            policy = policy.with_tool_requirement(
+                format!("mcp__playwright__{tool}"),
+                crate::browser::browser_tool_permission(tool).expect("tier"),
+            );
+        }
+        policy
+    }
+
+    #[test]
+    fn browser_pages_need_one_approval_per_session_and_reading_needs_none() {
+        let policy = browser_policy(PermissionMode::WorkspaceWrite);
+        let navigate = "mcp__playwright__browser_navigate";
+        let to = |url: &str| serde_json::json!({ "url": url }).to_string();
+
+        // Reading what is open runs in workspace-write without a question.
+        for (call, input) in [
+            ("browser_snapshot", "{}"),
+            ("browser_take_screenshot", "{}"),
+            ("browser_tabs", r#"{"action":"list"}"#),
+            ("browser_tabs", r#"{"action":"new"}"#),
+            ("browser_network_requests", "{}"),
+        ] {
+            let mut prompter = ScriptedPrompter::new(Vec::new());
+            assert_eq!(
+                policy.authorize(
+                    &format!("mcp__playwright__{call}"),
+                    input,
+                    Some(&mut prompter)
+                ),
+                PermissionOutcome::Allow,
+                "{call}"
+            );
+            assert!(prompter.seen.is_empty(), "{call} asked");
+        }
+
+        // Opening a page asks once, offering web browsing for the session.
+        let mut prompter = ScriptedPrompter::new(vec![PermissionPromptDecision::AllowForSession]);
+        assert_eq!(
+            policy.authorize(navigate, &to("https://a.test/"), Some(&mut prompter)),
+            PermissionOutcome::Allow
+        );
+        assert_eq!(prompter.seen.len(), 1);
+        assert_eq!(prompter.seen[0].session_prefixes, vec!["web browsing"]);
+        let reason = prompter.seen[0].reason.clone().unwrap_or_default();
+        assert!(reason.contains("browser"), "{reason}");
+
+        // Then every page and every action on one runs without asking.
+        let mut prompter = ScriptedPrompter::new(Vec::new());
+        for (call, input) in [
+            ("browser_navigate", to("https://b.test/")),
+            (
+                "browser_tabs",
+                r#"{"action":"new","url":"https://c.test/"}"#.to_string(),
+            ),
+            ("browser_click", r#"{"ref":"e1"}"#.to_string()),
+            ("browser_type", r#"{"ref":"e2","text":"hi"}"#.to_string()),
+            ("browser_navigate_back", "{}".to_string()),
+            ("browser_evaluate", r#"{"function":"() => 1"}"#.to_string()),
+        ] {
+            assert_eq!(
+                policy.authorize(
+                    &format!("mcp__playwright__{call}"),
+                    &input,
+                    Some(&mut prompter)
+                ),
+                PermissionOutcome::Allow,
+                "{call}"
+            );
+        }
+        assert!(prompter.seen.is_empty(), "asked again: {:?}", prompter.seen);
+
+        // The full-access tools still ask every time.
+        for (call, input) in [
+            ("browser_network_request", r#"{"index":3}"#),
+            ("browser_file_upload", r#"{"paths":["notes.txt"]}"#),
+            ("browser_drop", r#"{"target":"e4","paths":["notes.txt"]}"#),
+            ("browser_run_code_unsafe", r#"{"code":"async (page) => 1"}"#),
+        ] {
+            let mut prompter = ScriptedPrompter::new(vec![PermissionPromptDecision::Allow]);
+            assert_eq!(
+                policy.authorize(
+                    &format!("mcp__playwright__{call}"),
+                    input,
+                    Some(&mut prompter)
+                ),
+                PermissionOutcome::Allow,
+                "{call}"
+            );
+            assert_eq!(prompter.seen.len(), 1, "{call} did not ask");
+            assert_eq!(
+                prompter.seen[0].required_mode,
+                PermissionMode::DangerFullAccess
+            );
+        }
+    }
+
+    #[test]
+    fn browser_web_browsing_is_refused_unattended_and_declined_for_the_session() {
+        let policy = browser_policy(PermissionMode::WorkspaceWrite);
+        let navigate = "mcp__playwright__browser_navigate";
+        let to = |url: &str| serde_json::json!({ "url": url }).to_string();
+
+        // Nobody to ask (a script): refused, naming the allow rule.
+        let PermissionOutcome::Deny { reason } =
+            policy.authorize(navigate, &to("https://a.test/"), None)
+        else {
+            panic!("expected a refusal");
+        };
+        assert!(
+            reason.contains("mcp__playwright__browser_navigate"),
+            "{reason}"
+        );
+
+        // Declined for the session: later pages and actions are refused unasked,
+        // while reading the page still runs.
+        let mut prompter = ScriptedPrompter::new(vec![PermissionPromptDecision::DenyForSession {
+            reason: "declined".to_string(),
+        }]);
+        assert!(matches!(
+            policy.authorize(navigate, &to("https://a.test/"), Some(&mut prompter)),
+            PermissionOutcome::Deny { .. }
+        ));
+        let mut prompter = ScriptedPrompter::new(Vec::new());
+        assert!(matches!(
+            policy.authorize(
+                "mcp__playwright__browser_click",
+                r#"{"ref":"e1"}"#,
+                Some(&mut prompter)
+            ),
+            PermissionOutcome::Deny { .. }
+        ));
+        assert!(matches!(
+            policy.authorize(navigate, &to("https://other.test/"), Some(&mut prompter)),
+            PermissionOutcome::Deny { .. }
+        ));
+        assert!(prompter.seen.is_empty(), "asked after a session denial");
+        assert_eq!(
+            policy.authorize(
+                "mcp__playwright__browser_snapshot",
+                "{}",
+                Some(&mut prompter)
+            ),
+            PermissionOutcome::Allow
+        );
+    }
+
+    #[test]
+    fn allow_origin_hosts_open_in_the_browser_without_asking() {
+        let mut grants = crate::RunWebGrants::default();
+        grants.add_origin("example.com").unwrap();
+        let policy = browser_policy(PermissionMode::WorkspaceWrite).with_run_web_grants(grants);
+        let navigate = "mcp__playwright__browser_navigate";
+        let to = |url: &str| serde_json::json!({ "url": url }).to_string();
+        assert_eq!(
+            policy.authorize(navigate, &to("https://example.com/docs"), None),
+            PermissionOutcome::Allow
+        );
+        // --allow-web covers searches and fetches, not the browser.
+        let web_only = browser_policy(PermissionMode::WorkspaceWrite).with_run_web_grants(
+            crate::RunWebGrants {
+                allow_web: true,
+                ..crate::RunWebGrants::default()
+            },
+        );
+        assert!(matches!(
+            web_only.authorize(navigate, &to("https://example.com/docs"), None),
+            PermissionOutcome::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn browser_file_names_outside_the_project_or_on_configuration_ask() {
+        let policy = browser_policy(PermissionMode::WorkspaceWrite);
+        let shot = |filename: &str| serde_json::json!({ "filename": filename }).to_string();
+        let screenshot = "mcp__playwright__browser_take_screenshot";
+        for filename in ["shot.png", "out/page.md", ".neuron/browser/shot.png"] {
+            assert_eq!(
+                policy.authorize(screenshot, &shot(filename), None),
+                PermissionOutcome::Allow,
+                "{filename}"
+            );
+        }
+        let mut outside = vec![
+            "../../.env.copy",
+            "/etc/x.png",
+            ".neuron/settings.json",
+            ".git/hooks/pre-commit",
+            ".env",
+        ];
+        if cfg!(windows) {
+            outside.push("C:/x.png");
+        }
+        for filename in outside {
+            let PermissionOutcome::Deny { reason } =
+                policy.authorize(screenshot, &shot(filename), None)
+            else {
+                panic!("{filename} should need approval");
+            };
+            assert!(reason.contains(screenshot), "{filename}: {reason}");
+        }
     }
 
     #[test]
