@@ -308,6 +308,12 @@ variable first (`CI=true npm test`), uses a command substitution or a PowerShell
 block, or runs a program named by a variable; `bash(npm test > out.txt)` allows that
 exact command only. A deny rule wins when any part matches it.
 
+Rules for MCP tools name one tool (`mcp__github__delete_repository`) or a whole server
+(`mcp__github` or `mcp__github__*`, which also cover tools the server adds later). A
+call through the `MCPTool` wrapper is checked as a call of the tool it names. A server
+that a deny rule refuses whole is not started. See
+[workspace servers, permissions and output](docs/DEFAULT_INTEGRATIONS.md#workspace-servers-permissions-and-output).
+
 Choose the mode with `--permission-mode MODE`, switch inside a session with
 `/permissions MODE`, or set a default in settings:
 
@@ -473,7 +479,10 @@ Until a directory is trusted, its settings keep only what restricts Neuron:
 `permissions.defaultMode` (or the deprecated `permissionMode`), and
 `"defaultMcpServers": false` or `"defaultSkills": false`.
 Hooks, MCP servers, allow and ask rules, model, aliases, provider and the other keys
-are ignored, with a warning naming them. Even in a trusted directory, settings files
+are ignored, with a warning naming them. Once a directory is trusted, each MCP server
+its settings (or its `.mcp.json`) add still waits for your approval
+(`/mcp approve <server>`), and asks again when its command, arguments or URL change.
+Even in a trusted directory, settings files
 cannot set a full-access permission mode; pass `--permission-mode danger-full-access`
 or put it in your user settings.
 

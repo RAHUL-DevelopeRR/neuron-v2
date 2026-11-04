@@ -5,6 +5,17 @@ The release workflow copies a version's section into its GitHub release notes.
 
 ## 7.0.0-alpha.4 (unreleased)
 
+- MCP hardening: a call through `MCPTool` is checked as the tool it names, so a deny
+  or ask rule on `mcp__<server>__<tool>` can no longer be stepped around, and rules can
+  name a whole server (`mcp__<server>`, `mcp__<server>__*`); a server a deny rule
+  refuses whole shows as `blocked` and does not start. Servers other than the bundled
+  ones cannot mark their own tools read-only. A workspace's servers, including those in
+  a project `.mcp.json`, wait at `needs approval` until `/mcp approve <server>`, and
+  again when their launch spec changes. MCP output reaches the model enveloped as
+  external content, cleaned of control characters, redacted and capped at 25,000
+  characters with the rest in a spill file. `neuron mcp serve` checks every call
+  against your permission rules (read-only unless `--permission-mode` is given),
+  annotates its tools, and refuses an untrusted folder.
 - Remote MCP servers: a server with a `url` is reached over Streamable HTTP (or SSE
   with `"type": "sse"`), and `neuron mcp login <server>` signs in to one that needs
   OAuth; the token is kept in the OS keychain, or in an owner-only file when no
