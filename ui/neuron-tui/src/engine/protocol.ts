@@ -62,6 +62,12 @@ export const FEATURE_CHECKPOINTS = 'checkpoints'
  * servers listed with status `disabled`.
  */
 export const FEATURE_MCP_TOGGLE = 'mcp_toggle'
+/**
+ * A prompt of `/research <question>` runs a research run as its turn: a
+ * question to start, then `WebSearch` and `WebFetch` tool calls, `todos` for
+ * the plan and the report as text. No new events or commands.
+ */
+export const FEATURE_RESEARCH = 'research'
 
 /** A UI capability: questions come as `question` events, not "Question:" notices. */
 export const CAPABILITY_QUESTIONS = 'questions'

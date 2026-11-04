@@ -1,6 +1,7 @@
 /**
  * `/diff`, `/commit`, `/changes` and `/rewind`, the UI's own while the engine
- * lists the feature each needs (`git_views`, `checkpoints` for `/rewind`).
+ * lists the feature each needs (`git_views`, `checkpoints` for `/rewind`);
+ * `/mcp` with `mcp_toggle` and `/research` with `research`.
  * Without it they are not found here, and the router forwards them to the
  * engine as before (an older engine answers with a notice, or not at all).
  * `/commit` and `/rewind` are refused while a prompt's turn runs.
@@ -12,7 +13,12 @@ import {
   requestDiff,
 } from '../engine/git-views'
 import { forwardMcpSlash, openMcpPanel } from '../engine/mcp-panel'
-import { FEATURE_CHECKPOINTS, FEATURE_GIT_VIEWS, FEATURE_MCP_TOGGLE } from '../engine/protocol'
+import {
+  FEATURE_CHECKPOINTS,
+  FEATURE_GIT_VIEWS,
+  FEATURE_MCP_TOGGLE,
+  FEATURE_RESEARCH,
+} from '../engine/protocol'
 import { useGitViewsStore } from '../state/git-views-store'
 import { getSystemMessage, getUserMessage } from '../utils/message-history'
 
@@ -53,6 +59,10 @@ const refusedDuringTurn = (params: RouterParams, command: string): boolean => {
   ])
   return true
 }
+
+/** How `/research` is used, shown when it has no question. */
+export const RESEARCH_USAGE =
+  'Usage: /research [--depth quick|standard|deep] [--budget TOKENS] <question>'
 
 export const GIT_VIEW_COMMANDS: GitViewCommand[] = [
   {
@@ -114,6 +124,30 @@ export const GIT_VIEW_COMMANDS: GitViewCommand[] = [
       params.saveToHistory(params.inputValue.trim())
       clearInput(params)
       openMcpPanel()
+    },
+  },
+  {
+    // Sent to the engine as a prompt, not a slash command, so the run is a turn:
+    // its searches and reads show as tool rows and its plan as the task list.
+    name: 'research',
+    aliases: [],
+    acceptsArgs: true,
+    feature: FEATURE_RESEARCH,
+    handler: (params, args) => {
+      if (!args.trim()) {
+        echo(params)
+        params.setMessages((prev) => [...prev, getSystemMessage(RESEARCH_USAGE)])
+        return
+      }
+      const typed = params.inputValue.trim()
+      params.saveToHistory(typed)
+      clearInput(params)
+      if (turnRunning(params)) {
+        params.addToQueue(typed)
+        return
+      }
+      void params.sendMessage({ content: typed, agentMode: params.agentMode })
+      setTimeout(() => params.scrollToLatest(), 0)
     },
   },
 ]

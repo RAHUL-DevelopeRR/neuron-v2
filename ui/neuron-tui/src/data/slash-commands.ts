@@ -6,7 +6,7 @@
 // when the engine has their feature.
 // See ui/neuron-tui/PORTING.md.
 import { IMAGES_REACH_THE_MODEL } from '../engine/attachments'
-import { FEATURE_CHECKPOINTS, FEATURE_GIT_VIEWS } from '../engine/protocol'
+import { FEATURE_CHECKPOINTS, FEATURE_GIT_VIEWS, FEATURE_RESEARCH } from '../engine/protocol'
 import { AGENT_MODES, AGENT_MODES_AVAILABLE } from '../utils/constants'
 import { USER_SHELL_AVAILABLE } from '../utils/user-shell'
 
@@ -257,6 +257,12 @@ export const GIT_VIEW_SLASH_COMMANDS: SlashCommand[] = [
     label: 'rewind',
     description: 'Go back to before an earlier prompt: code, chat or both',
     feature: FEATURE_CHECKPOINTS,
+  },
+  {
+    id: 'research',
+    label: 'research',
+    description: 'Research a question on the web and write a cited report',
+    feature: FEATURE_RESEARCH,
   },
 ]
 

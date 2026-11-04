@@ -181,3 +181,49 @@ describe('the commands', () => {
     )
   })
 })
+
+describe('/research', () => {
+  test('only with the research feature, in the slash menu too', () => {
+    expect(findCommand('research')).toBeUndefined()
+    expect(getSlashCommandsWithSkills({}).map((c) => c.id)).not.toContain('research')
+    withFeatures(['research'])
+    expect(findCommand('research')?.name).toBe('research')
+    expect(getSlashCommandsWithSkills({}, ['research']).map((c) => c.id)).toContain('research')
+  })
+
+  test('sends the typed line as a prompt, so the run is a turn with tool rows', async () => {
+    withFeatures(['research'])
+    const { sent } = installFakeGitEngine()
+    const typed = '/research --depth quick what is new in Rust?'
+    const { params: p, history } = params(typed)
+    await routeUserPrompt(p)
+    await flushExchanges()
+    expect(sent).toEqual([])
+    expect(p.sendMessage).toHaveBeenCalledWith({ content: typed, agentMode: 'DEFAULT' })
+    expect(history).toEqual([typed])
+  })
+
+  test('waits in the queue behind a running turn', async () => {
+    withFeatures(['research'])
+    installFakeGitEngine()
+    const { params: p } = params('/research rust editions')
+    p.isStreaming = true
+    await routeUserPrompt(p)
+    expect(p.addToQueue).toHaveBeenCalledWith('/research rust editions')
+    expect(p.sendMessage).not.toHaveBeenCalled()
+  })
+
+  test('without a question it shows how to use it and sends nothing', async () => {
+    withFeatures(['research'])
+    const { sent } = installFakeGitEngine()
+    const { params: p, lines } = params('/research')
+    await routeUserPrompt(p)
+    await flushExchanges()
+    expect(sent).toEqual([])
+    expect(p.sendMessage).not.toHaveBeenCalled()
+    expect(lines).toEqual([
+      'user: /research',
+      'ai: Usage: /research [--depth quick|standard|deep] [--budget TOKENS] <question>',
+    ])
+  })
+})
