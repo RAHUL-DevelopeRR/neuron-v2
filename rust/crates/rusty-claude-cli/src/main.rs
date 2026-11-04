@@ -9722,6 +9722,67 @@ UU conflicted.rs",
         let _ = fs::remove_dir_all(workspace);
     }
 
+    /// A one-shot run (`neuron -p`) leaves the bundled servers out, except the browser
+    /// with `--with-browser`: read from the run's grants, as the CLI sets them, through
+    /// to the servers started and the list ToolSearch reports as left out.
+    #[test]
+    fn a_one_shot_run_starts_the_bundled_browser_only_with_with_browser() {
+        let _env = env_lock();
+        let workspace = temp_dir();
+        let config_home = workspace.join("config-home");
+        fs::create_dir_all(&config_home).expect("config home");
+        // A packaged entry run by a node that does not exist: the browser's start
+        // fails at once instead of running npx.
+        let entry = workspace.join("cli.js");
+        fs::write(&entry, "// stand-in\n").expect("entry");
+        let saved = ["NEURON_PLAYWRIGHT_MCP_ENTRY", "NEURON_MCP_NODE"]
+            .map(|name| (name, std::env::var_os(name)));
+        std::env::set_var("NEURON_PLAYWRIGHT_MCP_ENTRY", &entry);
+        std::env::set_var("NEURON_MCP_NODE", "neuron-test-no-such-node");
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let runtime_config = loader.load();
+        for (name, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        let runtime_config = runtime_config.expect("runtime config should load");
+        let grants = runtime::run_web_grants();
+
+        for with_browser in [false, true] {
+            runtime::set_run_web_grants(runtime::RunWebGrants {
+                with_browser,
+                ..grants.clone()
+            });
+            let built = build_runtime_plugin_state_starting_mcp(
+                &workspace,
+                &loader,
+                &runtime_config,
+                McpStartup::WaitWithoutBundled,
+            );
+            let left_out = crate::progress::left_out_bundled_mcp_servers();
+            crate::progress::set_left_out_bundled_mcp_servers(Vec::new());
+            let (state, background) = built.expect("runtime plugin state should build");
+            assert!(background.is_none(), "a one-shot run waits for its servers");
+            let mcp = state.mcp_state.as_ref().map(|mcp| {
+                let mcp = mcp.lock().expect("mcp state");
+                (mcp.server_names(), mcp.failed_server_names())
+            });
+            if with_browser {
+                assert_eq!(left_out, ["codebase-memory"]);
+                let (started, failed) = mcp.expect("the browser was started");
+                assert_eq!(started, ["playwright"]);
+                assert_eq!(failed, Some(vec!["playwright".to_string()]));
+            } else {
+                assert_eq!(left_out, ["codebase-memory", "playwright"]);
+                assert!(mcp.is_none(), "{mcp:?}");
+            }
+        }
+        runtime::set_run_web_grants(grants);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
     /// ToolSearch listed every server as pending while its note said they had finished
     /// starting, failed ones included.
     #[test]

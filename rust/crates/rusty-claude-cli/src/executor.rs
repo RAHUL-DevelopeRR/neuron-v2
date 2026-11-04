@@ -790,6 +790,8 @@ mod tool_search_tests {
     /// tools 17 times. ToolSearch says they are not loaded.
     #[test]
     fn tool_search_says_a_one_shot_run_left_out_the_bundled_mcp_servers() {
+        // The list is process-wide; another test sets it under the same lock.
+        let _env = crate::tests::env_lock();
         crate::progress::set_left_out_bundled_mcp_servers(vec![
             "codebase-memory".to_string(),
             "playwright".to_string(),
