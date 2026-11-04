@@ -391,6 +391,20 @@ impl ToolExecutor for CliToolExecutor {
         let parsed = runtime::tool_input::parse_tool_input(input).map_err(ToolError::new)?;
         let repaired = parsed.repaired;
         let value = parsed.value;
+        // `MCPTool` runs the tool it names: --allowedTools has to list that one too.
+        if let Some(inner) = (tool_name == "MCPTool")
+            .then(|| mcp_tool_target(&value))
+            .flatten()
+            .filter(|inner| {
+                self.allowed_tools
+                    .as_ref()
+                    .is_some_and(|allowed| !allowed.contains(inner.as_str()))
+            })
+        {
+            return Err(ToolError::new(format!(
+                "tool `{inner}` (called through MCPTool) is not enabled by the current --allowedTools setting"
+            )));
+        }
         let result = if tool_name == "ToolSearch" {
             self.execute_search_tool(value)
         } else if self.tool_registry.has_runtime_tool(tool_name) {
@@ -429,6 +443,18 @@ impl ToolExecutor for CliToolExecutor {
         // A closed UI also fails the turn's next stream write, which ends the turn.
         let _ = self.output.tool_call_finished(id, name, output, is_error);
     }
+}
+
+/// The MCP tool an `MCPTool` call names (`qualifiedName`, or `tool`).
+fn mcp_tool_target(input: &serde_json::Value) -> Option<String> {
+    ["qualifiedName", "tool"].iter().find_map(|key| {
+        input
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(ToOwned::to_owned)
+    })
 }
 
 pub(crate) fn permission_policy(

@@ -515,6 +515,98 @@ enum RuleKind {
     Ask,
 }
 
+/// The ask and allow rules that matched the MCP wrapper (`MCPTool`) a call came
+/// through; they apply to the MCP tool it names as well.
+struct WrapperRules<'a> {
+    ask: Option<&'a PermissionRule>,
+    allowed: bool,
+}
+
+/// The MCP tool a wrapper call runs, with the arguments it passes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct McpWrapperTarget {
+    /// `mcp__<server>__<tool>`.
+    qualified_name: String,
+    /// The arguments as JSON text (`{}` when there are none).
+    input: String,
+    /// `MCP` calls the built-in registry, whose tools have no tier: the call keeps
+    /// the wrapper's own requirement. `MCPTool` takes the named tool's.
+    keeps_wrapper_requirement: bool,
+}
+
+/// The MCP tool an `MCPTool` (`qualifiedName`, or `tool`) or `MCP` (`server` and
+/// `tool`) call runs; `None` for other tools and for input that names none.
+fn mcp_wrapper_target(tool_name: &str, input: &str) -> Option<McpWrapperTarget> {
+    if tool_name != "MCPTool" && tool_name != "MCP" {
+        return None;
+    }
+    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(input) else {
+        return None;
+    };
+    let text = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let (qualified_name, keeps_wrapper_requirement) = if tool_name == "MCPTool" {
+        (
+            text("qualifiedName").or_else(|| text("tool"))?.to_string(),
+            false,
+        )
+    } else {
+        (
+            crate::mcp::mcp_tool_name(text("server")?, text("tool")?),
+            true,
+        )
+    };
+    // Models send the arguments as JSON text too; the server gets the object.
+    let input = match object.get("arguments") {
+        None | Some(Value::Null) => "{}".to_string(),
+        Some(Value::String(text)) => match serde_json::from_str::<Value>(text) {
+            Ok(parsed) => parsed.to_string(),
+            Err(_) => Value::String(text.clone()).to_string(),
+        },
+        Some(arguments) => arguments.to_string(),
+    };
+    Some(McpWrapperTarget {
+        qualified_name,
+        input,
+        keeps_wrapper_requirement,
+    })
+}
+
+/// The tool-name prefix a server rule covers: `mcp__github` and `mcp__github__*`
+/// both cover `mcp__github__`, so the rule applies to every tool of that server,
+/// including tools it adds later. `None` for a rule that names one tool.
+fn mcp_server_rule_prefix(rule_tool_name: &str) -> Option<String> {
+    let starts_mcp = rule_tool_name
+        .get(..5)
+        .is_some_and(|start| start.eq_ignore_ascii_case("mcp__"));
+    if !starts_mcp {
+        return None;
+    }
+    if let Some(server) = rule_tool_name.strip_suffix("__*") {
+        return (server.len() > 5).then(|| format!("{server}__"));
+    }
+    let server = &rule_tool_name[5..];
+    (!server.is_empty() && !server.contains("__") && !server.contains('*'))
+        .then(|| format!("{rule_tool_name}__"))
+}
+
+/// Whether the permission rule `rule` (from `permissions.deny`) refuses every tool of
+/// the MCP server `server_name`: `mcp__<server>` or `mcp__<server>__*`, with no
+/// argument pattern. Such a server is not started.
+#[must_use]
+pub fn rule_covers_mcp_server(rule: &str, server_name: &str) -> bool {
+    let rule = PermissionRule::parse(rule);
+    matches!(rule.matcher, PermissionRuleMatcher::Any)
+        && mcp_server_rule_prefix(&rule.tool_name).is_some_and(|prefix| {
+            prefix.eq_ignore_ascii_case(&crate::mcp::mcp_tool_prefix(server_name))
+        })
+}
+
 /// Evaluates permission mode requirements plus allow/deny/ask rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionPolicy {
@@ -793,14 +885,79 @@ impl PermissionPolicy {
 
     /// Like [`Self::authorize_with_context`], but the call needs at least
     /// `floor` (used by the enforcer when a tool classified its input).
+    ///
+    /// A call through an MCP wrapper (`MCPTool`, `MCP`) is decided as a call of the
+    /// MCP tool it names (`mcp__<server>__<tool>`): that tool's rules and
+    /// requirement apply, so a rule on the tool cannot be stepped around through
+    /// the wrapper. Rules on the wrapper itself apply too.
     #[must_use]
-    #[allow(clippy::too_many_lines)]
     pub fn authorize_with_floor(
         &self,
         tool_name: &str,
         input: &str,
         context: &PermissionContext,
         floor: Option<PermissionMode>,
+        prompter: Option<&mut dyn PermissionPrompter>,
+    ) -> PermissionOutcome {
+        let Some(target) = mcp_wrapper_target(tool_name, input) else {
+            return self.authorize_call(tool_name, input, context, floor, None, prompter);
+        };
+        if let Some(rule) =
+            self.find_matching_rule(&self.deny_rules, RuleKind::Deny, tool_name, input)
+        {
+            return PermissionOutcome::Deny {
+                reason: format!(
+                    "Permission to use {tool_name} has been denied by rule '{}'",
+                    rule.raw
+                ),
+            };
+        }
+        let session_rules = self
+            .session
+            .allow_rules()
+            .iter()
+            .map(|rule| PermissionRule::parse(rule))
+            .collect::<Vec<_>>();
+        let allow_rules = self
+            .allow_rules
+            .iter()
+            .cloned()
+            .chain(session_rules)
+            .collect::<Vec<_>>();
+        let wrapper = WrapperRules {
+            ask: self.find_matching_rule(&self.ask_rules, RuleKind::Ask, tool_name, input),
+            allowed: self.allowed_by_rules(&allow_rules, tool_name, input),
+        };
+        // `MCP` does not know the tier of what it calls: it keeps its own requirement.
+        let floor = if target.keeps_wrapper_requirement {
+            Some(
+                floor
+                    .unwrap_or(PermissionMode::ReadOnly)
+                    .max(self.required_mode_for(tool_name)),
+            )
+        } else {
+            floor
+        };
+        self.authorize_call(
+            &target.qualified_name,
+            &target.input,
+            context,
+            floor,
+            Some(wrapper),
+            prompter,
+        )
+    }
+
+    /// [`Self::authorize_with_floor`] for one tool; `wrapper` carries the ask and
+    /// allow rules that matched the MCP wrapper a call came through.
+    #[allow(clippy::too_many_lines)]
+    fn authorize_call(
+        &self,
+        tool_name: &str,
+        input: &str,
+        context: &PermissionContext,
+        floor: Option<PermissionMode>,
+        wrapper: Option<WrapperRules<'_>>,
         prompter: Option<&mut dyn PermissionPrompter>,
     ) -> PermissionOutcome {
         if let Some(rule) =
@@ -829,19 +986,23 @@ impl PermissionPolicy {
             }
         }
         let required_mode = assessment.required_mode;
-        let ask_rule = self.find_matching_rule(&self.ask_rules, RuleKind::Ask, tool_name, input);
+        let ask_rule = self
+            .find_matching_rule(&self.ask_rules, RuleKind::Ask, tool_name, input)
+            .or(wrapper.as_ref().and_then(|wrapper| wrapper.ask));
+        let wrapper_allowed = wrapper.as_ref().is_some_and(|wrapper| wrapper.allowed);
         let session_rules = self.session.allow_rules();
-        let allowed_by_rule = if session_rules.is_empty() {
-            self.allowed_by_rules(&self.allow_rules, tool_name, input)
-        } else {
-            let rules = self
-                .allow_rules
-                .iter()
-                .cloned()
-                .chain(session_rules.iter().map(|rule| PermissionRule::parse(rule)))
-                .collect::<Vec<_>>();
-            self.allowed_by_rules(&rules, tool_name, input)
-        };
+        let allowed_by_rule = wrapper_allowed
+            || if session_rules.is_empty() {
+                self.allowed_by_rules(&self.allow_rules, tool_name, input)
+            } else {
+                let rules = self
+                    .allow_rules
+                    .iter()
+                    .cloned()
+                    .chain(session_rules.iter().map(|rule| PermissionRule::parse(rule)))
+                    .collect::<Vec<_>>();
+                self.allowed_by_rules(&rules, tool_name, input)
+            };
 
         match context.override_decision() {
             Some(PermissionOverride::Deny) => {
@@ -1625,8 +1786,16 @@ impl PermissionRule {
     /// to `WebFetch`, as a settings author expects. Adapted from Claw Code
     /// (MIT), upstream commit aca6584, which lowercases rule names; Neuron has
     /// mixed-case tool names, so it compares case-insensitively instead.
+    /// A server rule (`mcp__github`, `mcp__github__*`) names every tool of that MCP
+    /// server.
     fn names_tool(&self, tool_name: &str) -> bool {
         self.tool_name.eq_ignore_ascii_case(tool_name)
+            || mcp_server_rule_prefix(&self.tool_name).is_some_and(|prefix| {
+                tool_name.len() > prefix.len()
+                    && tool_name
+                        .get(..prefix.len())
+                        .is_some_and(|start| start.eq_ignore_ascii_case(&prefix))
+            })
     }
 
     /// The words of a `tool(prefix:*)` rule's prefix (`["git"]`); `None` for other rules.
@@ -1753,6 +1922,8 @@ fn extract_permission_subject(input: &str) -> Option<String> {
             "pattern",
             "code",
             "message",
+            // `MCPTool(mcp__github__delete_repository)` names the tool it calls.
+            "qualifiedName",
         ] {
             if let Some(value) = object.get(key).and_then(Value::as_str) {
                 return Some(value.to_string());
@@ -3218,5 +3389,200 @@ mod tests {
         );
         assert_eq!(url_host("file:///etc/passwd"), None);
         assert_eq!(url_host("ftp://example.com"), None);
+    }
+
+    /// `alpha`'s tools as the CLI registers them: `echo` writes, `read` only reads.
+    fn mcp_policy(mode: PermissionMode, deny: &[&str], ask: &[&str]) -> PermissionPolicy {
+        let rules = RuntimePermissionRuleConfig::new(
+            Vec::new(),
+            deny.iter().map(ToString::to_string).collect(),
+            ask.iter().map(ToString::to_string).collect(),
+        );
+        PermissionPolicy::new(mode)
+            .with_session_approvals(SessionApprovals::isolated())
+            .with_tool_requirement("mcp__alpha__echo", PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("mcp__alpha__read", PermissionMode::ReadOnly)
+            .with_tool_requirement("MCPTool", PermissionMode::DangerFullAccess)
+            .with_tool_requirement("MCP", PermissionMode::DangerFullAccess)
+            .with_permission_rules(&rules)
+    }
+
+    fn wrapped(name: &str) -> String {
+        serde_json::json!({"qualifiedName": name, "arguments": {"text": "hi"}}).to_string()
+    }
+
+    fn allowing() -> RecordingPrompter {
+        RecordingPrompter {
+            seen: Vec::new(),
+            allow: true,
+        }
+    }
+
+    const ALL_MODES: [PermissionMode; 5] = [
+        PermissionMode::ReadOnly,
+        PermissionMode::WorkspaceWrite,
+        PermissionMode::DangerFullAccess,
+        PermissionMode::Prompt,
+        PermissionMode::Allow,
+    ];
+
+    #[test]
+    fn a_tool_deny_rule_refuses_the_tool_through_mcp_tool_in_every_mode() {
+        for mode in ALL_MODES {
+            let policy = mcp_policy(mode, &["mcp__alpha__echo"], &[]);
+            let mut prompter = allowing();
+            for (tool, input) in [
+                ("mcp__alpha__echo", r#"{"text":"hi"}"#.to_string()),
+                ("MCPTool", wrapped("mcp__alpha__echo")),
+                (
+                    "MCPTool",
+                    serde_json::json!({"tool": "mcp__alpha__echo"}).to_string(),
+                ),
+                (
+                    "MCP",
+                    serde_json::json!({"server": "alpha", "tool": "echo"}).to_string(),
+                ),
+            ] {
+                let outcome = policy.authorize(tool, &input, Some(&mut prompter));
+                assert!(
+                    matches!(&outcome, PermissionOutcome::Deny { reason } if reason.contains("mcp__alpha__echo")),
+                    "{tool} {input} in {mode:?}: {outcome:?}"
+                );
+            }
+            assert!(
+                prompter.seen.is_empty(),
+                "denied without asking in {mode:?}"
+            );
+            // The server's other tools still run (prompt mode asks first).
+            assert_eq!(
+                policy.authorize(
+                    "MCPTool",
+                    &wrapped("mcp__alpha__read"),
+                    Some(&mut allowing())
+                ),
+                PermissionOutcome::Allow,
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_server_rule_covers_every_tool_of_that_server_only() {
+        for rule in ["mcp__alpha", "mcp__alpha__*", "MCP__Alpha"] {
+            for mode in ALL_MODES {
+                let policy = mcp_policy(mode, &[rule], &[]);
+                // `later` was not there at startup: the rule names the server.
+                for tool in ["mcp__alpha__echo", "mcp__alpha__read", "mcp__alpha__later"] {
+                    assert!(
+                        matches!(
+                            policy.authorize(tool, "{}", Some(&mut allowing())),
+                            PermissionOutcome::Deny { .. }
+                        ),
+                        "{rule} {tool} {mode:?}"
+                    );
+                    assert!(
+                        matches!(
+                            policy.authorize("MCPTool", &wrapped(tool), Some(&mut allowing())),
+                            PermissionOutcome::Deny { .. }
+                        ),
+                        "{rule} MCPTool {tool} {mode:?}"
+                    );
+                }
+            }
+            let policy = mcp_policy(PermissionMode::DangerFullAccess, &[rule], &[]);
+            for other in ["mcp__alphabet__echo", "mcp__beta__echo", "bash"] {
+                assert_eq!(
+                    policy.authorize(other, "{}", None),
+                    PermissionOutcome::Allow,
+                    "{rule} leaves {other} alone"
+                );
+            }
+        }
+        // An ask rule for a server asks before each of its tools.
+        let mut prompter = allowing();
+        assert_eq!(
+            mcp_policy(PermissionMode::DangerFullAccess, &[], &["mcp__alpha"]).authorize(
+                "mcp__alpha__read",
+                "{}",
+                Some(&mut prompter)
+            ),
+            PermissionOutcome::Allow
+        );
+        assert_eq!(prompter.seen.len(), 1);
+
+        assert!(super::rule_covers_mcp_server("mcp__alpha", "alpha"));
+        assert!(super::rule_covers_mcp_server("mcp__alpha__*", "alpha"));
+        assert!(!super::rule_covers_mcp_server("mcp__alpha__echo", "alpha"));
+        assert!(!super::rule_covers_mcp_server("mcp__alpha(x)", "alpha"));
+        assert!(!super::rule_covers_mcp_server("mcp__alpha", "alphabet"));
+    }
+
+    #[test]
+    fn mcp_tool_takes_the_requirement_rules_and_prompt_of_the_tool_it_calls() {
+        // A read-only tool runs in read-only mode through the wrapper too.
+        let read_only = mcp_policy(PermissionMode::ReadOnly, &[], &[]);
+        assert_eq!(
+            read_only.authorize("MCPTool", &wrapped("mcp__alpha__read"), None),
+            PermissionOutcome::Allow
+        );
+        assert!(matches!(
+            read_only.authorize("MCPTool", &wrapped("mcp__alpha__echo"), None),
+            PermissionOutcome::Deny { reason } if reason.contains("mcp__alpha__echo")
+        ));
+        // A tool nobody registered needs full access.
+        assert!(matches!(
+            mcp_policy(PermissionMode::WorkspaceWrite, &[], &[]).authorize(
+                "MCPTool",
+                &wrapped("mcp__ghost__tool"),
+                None
+            ),
+            PermissionOutcome::Deny { .. }
+        ));
+
+        // An ask rule on the tool asks through the wrapper, and the prompt names the tool.
+        let asking = mcp_policy(PermissionMode::DangerFullAccess, &[], &["mcp__alpha__read"]);
+        let mut prompter = allowing();
+        assert_eq!(
+            asking.authorize("MCPTool", &wrapped("mcp__alpha__read"), Some(&mut prompter)),
+            PermissionOutcome::Allow
+        );
+        assert_eq!(prompter.seen.len(), 1);
+        assert_eq!(prompter.seen[0].tool_name, "mcp__alpha__read");
+        assert_eq!(prompter.seen[0].input, r#"{"text":"hi"}"#);
+
+        // Rules on the wrapper name the tool through `qualifiedName`.
+        let wrapper_rule = mcp_policy(
+            PermissionMode::DangerFullAccess,
+            &["MCPTool(mcp__alpha__read)"],
+            &[],
+        );
+        assert!(matches!(
+            wrapper_rule.authorize("MCPTool", &wrapped("mcp__alpha__read"), None),
+            PermissionOutcome::Deny { .. }
+        ));
+        assert_eq!(
+            wrapper_rule.authorize("MCPTool", &wrapped("mcp__alpha__echo"), None),
+            PermissionOutcome::Allow
+        );
+
+        // `MCP` reaches a registry with no tiers: it keeps its own requirement.
+        assert!(matches!(
+            mcp_policy(PermissionMode::WorkspaceWrite, &[], &[]).authorize(
+                "MCP",
+                &serde_json::json!({"server": "alpha", "tool": "read"}).to_string(),
+                None
+            ),
+            PermissionOutcome::Deny { .. }
+        ));
+        // Arguments sent as JSON text are what the tool's rules see.
+        assert_eq!(
+            super::mcp_wrapper_target(
+                "MCPTool",
+                r#"{"qualifiedName":"mcp__alpha__echo","arguments":"{\"text\": \"hi\"}"}"#
+            )
+            .map(|target| target.input),
+            Some(r#"{"text":"hi"}"#.to_string())
+        );
+        assert_eq!(super::mcp_wrapper_target("MCPTool", "{}"), None);
     }
 }

@@ -175,10 +175,11 @@ pub use oauth::{
 };
 pub use permissions::{
     deny_for_session_label, non_interactive_hint, parse_permission_response, quote_allow_rules,
-    render_permission_prompt, url_host, user_declined_message, ConsolePermissionPrompter,
-    PermissionContext, PermissionMode, PermissionOutcome, PermissionOverride, PermissionPolicy,
-    PermissionPromptDecision, PermissionPrompter, PermissionRemedy, PermissionRequest,
-    SessionApprovals, ToolCallAssessment, NON_INTERACTIVE_PERMISSION_HINT,
+    render_permission_prompt, rule_covers_mcp_server, url_host, user_declined_message,
+    ConsolePermissionPrompter, PermissionContext, PermissionMode, PermissionOutcome,
+    PermissionOverride, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
+    PermissionRemedy, PermissionRequest, SessionApprovals, ToolCallAssessment,
+    NON_INTERACTIVE_PERMISSION_HINT,
 };
 pub use plugin_lifecycle::{
     DegradedMode, DiscoveryResult, PluginHealthcheck, PluginLifecycle, PluginLifecycleEvent,
