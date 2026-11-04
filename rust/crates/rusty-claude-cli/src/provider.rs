@@ -962,6 +962,14 @@ mod tests {
         assert_eq!(pick(&local).provider, ProviderId::Local);
         local.local_base_url = false;
         assert_eq!(pick(&local).provider, ProviderId::OpenRouter);
+        // A Gemini key (env or stored) comes last, unless a Gemini model asks for it.
+        local.gemini_key = true;
+        assert_eq!(pick(&local).provider, ProviderId::OpenRouter);
+        local.requested_model = "gemini-2.5-flash".to_string();
+        assert_eq!(pick(&local).provider, ProviderId::Gemini);
+        local.requested_model = AUTO_MODEL.to_string();
+        local.openrouter_key = false;
+        assert_eq!(pick(&local).provider, ProviderId::Gemini);
     }
 
     #[test]
@@ -996,7 +1004,8 @@ mod tests {
         }
         assert_eq!(ProviderId::parse("ZeroX"), Some(ProviderId::ZeroX));
         let error = parse_provider_id("opnai", "--provider").unwrap_err();
-        assert!(error.contains("zero-x|openai|openrouter|azure|anthropic|xai|local"));
+        assert!(error.contains("zero-x|openai|openrouter|azure|anthropic|xai|gemini|local"));
+        assert_eq!(ProviderId::parse("google"), Some(ProviderId::Gemini));
     }
 
     fn settings(files: &[(&str, &str)]) -> Result<Option<ProviderId>, String> {
