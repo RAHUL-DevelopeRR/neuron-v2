@@ -95,22 +95,11 @@ pub fn default_skill_sections(
         .map(|(name, purpose)| format!("- {name}: {purpose}"))
         .collect::<Vec<_>>()
         .join("\n");
-    let presets = [
-        ("codebase-memory", "code graph"),
-        ("playwright", "browser, not the desktop"),
-        ("computer-use", "desktop control"),
-    ]
-    .iter()
-    .map(|(name, role)| {
-        let status = if config.mcp().get(name).is_some() {
-            "configured"
-        } else {
-            "not configured"
-        };
-        format!("{name} ({role}): {status}")
-    })
-    .collect::<Vec<_>>()
-    .join("; ");
+    let presets = mcp_presets(
+        config,
+        crate::browser::is_one_shot_run(),
+        crate::run_web_grants().with_browser,
+    );
     Ok(vec![format!(
         "# Neuron default skills\n\
 Bundled skills load on demand: their full instructions are not in this prompt. When a task needs a skill's workflow, call the Skill tool with its name (for example `{{\"skill\": \"gstack-review\"}}`) and follow what it returns; small, clear tasks need none. Specific user instructions and project or user skills of the same name take precedence. Skills grant no permission to publish, contact people, transmit repository data or operate computers. Skip upstream onboarding, telemetry and absent helper scripts, use Neuron's tools in place of host-specific ones, and report a missing tool instead of counting its check as passed.\n\n\
@@ -120,6 +109,36 @@ Bundle root: {} (upstream sources and MIT licenses: SOURCES.json, licenses/).\n\
 MCP presets: {presets}. Report a tool as available only after discovery; MCP tool schemas are deferred, so find them with ToolSearch before calling them.",
         root.display()
     )])
+}
+
+/// The MCP preset line: each preset and whether this run has it. A one-shot
+/// run (`one_shot`) leaves the bundled servers out unless asked for
+/// ([`crate::browser::one_shot_loads_bundled`]); calling them "configured"
+/// there sent models looking for them, or offering to write browser scripts.
+fn mcp_presets(config: &RuntimeConfig, one_shot: bool, with_browser: bool) -> String {
+    [
+        ("codebase-memory", "code graph"),
+        ("playwright", "browser, not the desktop"),
+        ("computer-use", "desktop control"),
+    ]
+    .iter()
+    .map(|(name, role)| {
+        let status =
+            if crate::browser::bundled_server_left_out(name, config, one_shot, with_browser) {
+                if *name == crate::browser::BROWSER_SERVER {
+                    "not loaded in this run (the user can rerun with --with-browser; do not write browser scripts instead)"
+                } else {
+                    "not loaded in this run"
+                }
+            } else if config.mcp().get(name).is_some() {
+                "configured"
+            } else {
+                "not configured"
+            };
+        format!("{name} ({role}): {status}")
+    })
+    .collect::<Vec<_>>()
+    .join("; ")
 }
 
 #[cfg(test)]
@@ -175,6 +194,51 @@ mod tests {
             default_skill_sections(&loader.load().unwrap(), &config_home).unwrap(),
             Vec::<String>::new()
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn one_shot_runs_say_which_bundled_servers_they_left_out() {
+        let root = std::env::temp_dir().join(format!("neuron-presets-{}", std::process::id()));
+        let config_home = root.join("config");
+        fs::create_dir_all(&config_home).unwrap();
+        let loader = ConfigLoader::new(&root, &config_home);
+        let config = loader.load().unwrap();
+
+        let interactive = mcp_presets(&config, false, false);
+        assert!(interactive.contains("playwright (browser, not the desktop): configured"));
+        assert!(interactive.contains("codebase-memory (code graph): configured"));
+
+        let one_shot = mcp_presets(&config, true, false);
+        assert!(
+            one_shot.contains(
+                "playwright (browser, not the desktop): not loaded in this run (the user can rerun with --with-browser"
+            ),
+            "{one_shot}"
+        );
+        assert!(one_shot.contains("codebase-memory (code graph): not loaded in this run"));
+        assert!(one_shot.contains("computer-use (desktop control): not configured"));
+
+        // --with-browser, or browser.oneShot, loads the browser alone.
+        let with_browser = mcp_presets(&config, true, true);
+        assert!(with_browser.contains("playwright (browser, not the desktop): configured"));
+        assert!(with_browser.contains("codebase-memory (code graph): not loaded in this run"));
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{"browser":{"oneShot":true}}"#,
+        )
+        .unwrap();
+        let setting = mcp_presets(&loader.load().unwrap(), true, false);
+        assert!(setting.contains("playwright (browser, not the desktop): configured"));
+
+        // A user's own `playwright` server is not bundled: one-shot runs load it.
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{"mcpServers":{"playwright":{"command":"my-browser","args":[]}}}"#,
+        )
+        .unwrap();
+        let own = mcp_presets(&loader.load().unwrap(), true, false);
+        assert!(own.contains("playwright (browser, not the desktop): configured"));
         fs::remove_dir_all(root).unwrap();
     }
 
