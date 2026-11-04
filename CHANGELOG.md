@@ -70,13 +70,15 @@ The release workflow copies a version's section into its GitHub release notes.
   a new `Plan` section of `/status` (`Free 640K/1M, resets 14:20 UTC`), kept current
   from each reply's quota headers, and Neuron warns once at 90% of it; the near-limit
   upgrade hint follows the window instead of the daily tokens, which it does not refuse.
-  The full-screen UI protocol gains the window (`AccountDetails.window`,
-  `Status.usage_window`) and an estimate of each request's size
-  (`Status.request_tokens_estimate`).
+  Past the window's reset time the old figures count as unknown until the account is
+  read again. The full-screen UI protocol gains the window
+  (`AccountDetails.usage_window`, every part optional) and an estimate of each
+  request's size (`Status.request_tokens_estimate`).
 - On a plan with a token window, Neuron keeps a working set of about 40,000 tokens
   (`workingSetTokens`, `NEURON_WORKING_SET_TOKENS`): older tool results become short
   stubs from half of it, and it asks before a request would need more tokens than the
-  window has left. On the gateway, requests carry a `prompt_cache_key` (a hash of the
+  window has left (a script is warned instead; a sub-agent stops). `neuron prompt`
+  reads the window too. On the gateway, requests carry a `prompt_cache_key` (a hash of the
   session id), and `auto` requests that attach tools carry `x-neuron-route: agentic`
   so the gateway picks a model that calls tools well.
 

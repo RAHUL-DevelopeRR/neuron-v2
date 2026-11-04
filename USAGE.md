@@ -109,7 +109,7 @@ sessions from the Zero-X dashboard signs out every machine.
 
 | Command | What it does |
 | --- | --- |
-| `neuron usage` | Prints your plan, today's requests and tokens with the reset time, your plan's token window when it has one, and your credit balance. |
+| `neuron usage` | Prints your plan, today's requests and tokens with the reset time, your plan's token window when it has one (`Token window     Free 640K/1M, resets 14:20 UTC`, then the exact figures), and your credit balance. |
 | `/usage` | The same, inside a session. |
 | `/status` | Also ends with a `Plan` section: the token window (`Free 640K/1M, resets 14:20 UTC`), the size of the next request, and the working set. |
 | `/upgrade` | Opens <https://zero-x.live/pricing>. |
@@ -123,7 +123,9 @@ whole conversation again, so a long task can use the window quickly. On a plan w
 window Neuron:
 
 - shows the window in `/usage`, `neuron usage` and `/status`, keeps it current from
-  the quota headers of each reply, and warns once when 90% of it is used;
+  the quota headers of each reply, and warns once when 90% of it is used. Once the
+  window's reset time has passed, what is left is shown as unknown (`Free ?/1M`) until
+  the account is read again, which Neuron does in the background;
 - keeps a smaller working set: about 40,000 tokens of conversation (system prompt and
   tool definitions not counted). Once the conversation reaches half of it, tool results
   older than the last four become short stubs that name the tool and keep the start of
@@ -133,8 +135,11 @@ window Neuron:
   off;
 - asks before a request would need more tokens than the window has left ("Send
   anyway" or "Stop here"); a stopped turn sends nothing, and `/compact` makes the
-  conversation smaller. A run with nobody to ask (a script) prints a warning and
-  sends the request, and the gateway decides.
+  conversation smaller. `neuron prompt` asks too when stdin is a terminal; a run with
+  nobody to ask (a script) prints a warning on stderr and sends the request, and the
+  gateway decides. Sub-agents of the `Agent` tool keep the same working set and do not
+  ask: one whose next request the window does not cover stops and reports that, and
+  the conversation's own next request is asked about as above.
 
 On the gateway Neuron also sends a `prompt_cache_key` (a hash of the session id, never
 the id) so the requests of one session can share a provider's prompt cache, and with
