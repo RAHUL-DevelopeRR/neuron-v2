@@ -36,6 +36,10 @@ import { renderProbe } from '../utils/render-probe'
 import {
   createBatchedMessageUpdater,
   createMessageUpdater,
+  DEFAULT_FLUSH_INTERVAL_MS,
+  LONG_REPARSE_FLUSH_INTERVAL_MS,
+  reparsedChars,
+  LONG_REPARSE_CHARS,
   type MessageUpdater,
 } from '../utils/message-updater'
 import { createMarkdownPalette } from '../utils/theme-system'
@@ -56,9 +60,17 @@ export interface StreamingBenchOptions {
   historyTurns?: number
   /** Milliseconds between two text deltas. */
   tokenIntervalMs?: number
+  /**
+   * What the answer looks like: `mixed` (paragraphs, a short list, code) or
+   * `list` (one long list with no blank line in it, which the streaming
+   * message cannot cut into finished blocks: each update parses all of it).
+   */
+  shape?: StreamingBenchShape
   width?: number
   height?: number
 }
+
+export type StreamingBenchShape = 'mixed' | 'list'
 
 export interface Timings {
   count: number
@@ -77,6 +89,12 @@ export interface StreamingBenchResult {
   cpuMs: number
   /** Times the chat's message list changed (the batched updater's flushes and the end). */
   transcriptUpdates: number
+  /**
+   * Updates while the turn streamed that came sooner than the long interval
+   * after one whose text each update parses again was long already (see
+   * streamingFlushIntervalMs): what made a long list answer slow.
+   */
+  quickUpdatesOfLongText: number
   /** How often each component drew while the turn streamed. */
   renders: {
     /** Earlier, finished messages drawn again. */
@@ -167,9 +185,22 @@ const WORDS = [
   'state', 'in', 'one', 'store', 'and', '`useCart()`', 'reads', 'it.', '**Note:**', 'tests',
 ]
 
-/** The text the model streams: paragraphs, a list, now and then a code block. */
-export function benchTokens(count: number): string[] {
+/**
+ * The text the model streams: paragraphs, a list, now and then a code block
+ * (`mixed`), or one long list, some items nested (`list`).
+ */
+export function benchTokens(count: number, shape: StreamingBenchShape = 'mixed'): string[] {
   const tokens: string[] = []
+  if (shape === 'list') {
+    for (let index = 0; tokens.length < count; index++) {
+      // An item every 12 tokens, one in five of them nested.
+      if (index === 0) tokens.push('- ')
+      else if (index % 60 === 36) tokens.push('\n  - ')
+      else if (index % 12 === 0) tokens.push('\n- ')
+      else tokens.push(`${WORDS[index % WORDS.length]} `)
+    }
+    return tokens
+  }
   for (let index = 0; tokens.length < count; index++) {
     const position = index % 120
     if (position === 0 && index > 0) tokens.push('\n\n')
@@ -216,10 +247,14 @@ function toolCallEvents(n: number): UiEvent[] {
 }
 
 /** The whole turn's events, in order. */
-export function benchEvents(tokens: number, toolEvery: number): UiEvent[] {
+export function benchEvents(
+  tokens: number,
+  toolEvery: number,
+  shape: StreamingBenchShape = 'mixed',
+): UiEvent[] {
   const events: UiEvent[] = []
   let calls = 0
-  benchTokens(tokens).forEach((text, index) => {
+  benchTokens(tokens, shape).forEach((text, index) => {
     events.push({ type: 'text_delta', text } as UiEvent)
     // The engine sends its estimate at most every 250 ms: about every 25 tokens here.
     if (index % 25 === 24) events.push({ type: 'output_progress', output_tokens: index + 1 } as UiEvent)
@@ -344,6 +379,10 @@ export async function runStreamingBench(options: StreamingBenchOptions = {}): Pr
     promptStatusBar: 0,
   }
   let transcriptUpdates = 0
+  let quickUpdatesOfLongText = 0
+  let streamingEvents = false
+  let lastUpdateAt = -Infinity
+  let lastUpdateLong = false
   let measuring = false
   const onRender: ProfilerOnRenderCallback = (id, _phase, actualDuration) => {
     if (measuring) reactMs[id as keyof typeof reactMs] += actualDuration
@@ -358,7 +397,19 @@ export async function runStreamingBench(options: StreamingBenchOptions = {}): Pr
     else renders.promptStatusBar++
   }
   const unsubscribe = useChatStore.subscribe((state, previous) => {
-    if (measuring && state.messages !== previous.messages) transcriptUpdates++
+    if (!measuring || state.messages === previous.messages) return
+    transcriptUpdates++
+    const now = Date.now()
+    if (
+      streamingEvents &&
+      lastUpdateLong &&
+      now - lastUpdateAt < LONG_REPARSE_FLUSH_INTERVAL_MS - DEFAULT_FLUSH_INTERVAL_MS / 2
+    ) {
+      quickUpdatesOfLongText++
+    }
+    lastUpdateAt = now
+    const streaming = state.messages.find((message) => message.id === aiMessageId)
+    lastUpdateLong = reparsedChars(streaming) >= LONG_REPARSE_CHARS
   })
 
   const setup = await createTestRenderer({ width, height })
@@ -368,7 +419,7 @@ export async function runStreamingBench(options: StreamingBenchOptions = {}): Pr
 
   const updater = createBatchedMessageUpdater(aiMessageId, useChatStore.getState().setMessages)
   const sink = createTurnEventSink(handlerState(aiMessageId, updater))
-  const events = benchEvents(tokens, toolEvery)
+  const events = benchEvents(tokens, toolEvery, options.shape)
 
   const frameSamples: number[] = []
   const eventSamples: number[] = []
@@ -396,12 +447,14 @@ export async function runStreamingBench(options: StreamingBenchOptions = {}): Pr
 
   const started = performance.now()
   const cpuAtStart = process.cpuUsage()
+  streamingEvents = true
   for (const event of events) {
     const start = performance.now()
     sink.handle(event)
     eventSamples.push(performance.now() - start)
     if (event.type === 'text_delta') await sleep(tokenIntervalMs)
   }
+  streamingEvents = false
   sink.finish()
   updater.markComplete()
   await sleep(50)
@@ -425,6 +478,7 @@ export async function runStreamingBench(options: StreamingBenchOptions = {}): Pr
     wallMs: round(wallMs),
     cpuMs: round((cpu.user + cpu.system) / 1000),
     transcriptUpdates,
+    quickUpdatesOfLongText,
     renders,
     reactMs: {
       transcript: round(reactMs.transcript),

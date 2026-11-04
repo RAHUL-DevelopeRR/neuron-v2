@@ -26,5 +26,24 @@ describe('a streaming turn', () => {
     expect(result.renders.streamingMessage).toBeLessThanOrEqual(result.transcriptUpdates)
     // Per change of what it says and per clock tick, far fewer than per token.
     expect(result.renders.liveActivityLine).toBeLessThan(tokens / 4)
+    // Mixed Markdown is cut into finished blocks: updates stay quick.
+    expect(result.quickUpdatesOfLongText).toBe(0)
   }, 120_000)
+
+  test('a long list is not parsed whole 30 times a second', async () => {
+    // About 2.6 KB of list with no blank line in it: no finished block to
+    // cut off, so each update parses all of it. Past about 1 KB the updates
+    // come every 100 ms instead of every 33 ms.
+    const result = await runStreamingBench({
+      tokens: 460,
+      toolEvery: 0,
+      historyTurns: 1,
+      tokenIntervalMs: 2,
+      shape: 'list',
+    })
+    expect(result.transcriptUpdates).toBeGreaterThan(5)
+    expect(result.quickUpdatesOfLongText).toBe(0)
+    expect(result.renders.oldMessages).toBe(0)
+    expect(result.renders.streamingMessage).toBeLessThanOrEqual(result.transcriptUpdates)
+  }, 180_000)
 })
