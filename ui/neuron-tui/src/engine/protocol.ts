@@ -101,6 +101,12 @@ export interface PermissionView {
    * approval is possible.
    */
   session_prefixes: string[]
+  /**
+   * The `permissions.allow` rules "always allow in this project" would save to
+   * the project's `.neuron/settings.local.json`. Added after protocol 1: older
+   * engines leave it out, and the choice is offered only when it is not empty.
+   */
+  project_rules?: string[]
 }
 
 /** The workspace's git state, for the footer. */
@@ -990,8 +996,17 @@ export type PermissionDecision =
   | { kind: 'allow_once' }
   /** Run this call and similar ones for the rest of the session. */
   | { kind: 'allow_for_session' }
-  /** Do not run it; `note` is passed to the model. */
-  | { kind: 'deny'; note: string | null }
+  /**
+   * Run this call and save `project_rules` so matching calls run in this
+   * project from now on. Send only when the request offered `project_rules`.
+   */
+  | { kind: 'allow_for_project' }
+  /**
+   * Do not run it; `note` is passed to the model. With `session`, matching
+   * calls are refused for the rest of the session without asking (an older
+   * engine ignores it and denies this call only).
+   */
+  | { kind: 'deny'; note: string | null; session?: boolean }
 
 /** Answer to `permission_requested` with the same `id`. */
 export interface PermissionReply {

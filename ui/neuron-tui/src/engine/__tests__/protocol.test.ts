@@ -145,6 +145,7 @@ const STRUCT_FIELDS: Record<string, string[]> = {
     'reason',
     'input',
     'session_prefixes',
+    'project_rules',
   ]),
   GitStatus: fieldsOf<GitStatus>()([
     'branch',
@@ -531,6 +532,23 @@ describe('client messages (UI -> engine)', () => {
         ),
       ).decision,
     ).toEqual({ kind: 'deny', note: 'use a dry run' })
+    expect(
+      encodeClientMessage(
+        permissionReplyMessage({
+          id: 8,
+          decision: { kind: 'deny', note: null, session: true },
+        }),
+      ),
+    ).toBe(
+      '{"kind":"permission_reply","id":8,"decision":{"kind":"deny","note":null,"session":true}}\n',
+    )
+    expect(
+      encodeClientMessage(
+        permissionReplyMessage({ id: 9, decision: { kind: 'allow_for_project' } }),
+      ),
+    ).toBe(
+      '{"kind":"permission_reply","id":9,"decision":{"kind":"allow_for_project"}}\n',
+    )
   })
 })
 

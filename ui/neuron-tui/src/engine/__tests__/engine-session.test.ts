@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, test } from 'bun:test'
 
 import {
   interruptAtPermission,
+  permissionHeadline,
   resolvePermissionKey,
   resolvePermissionNoteKey,
   summarizePermissionInput,
@@ -472,6 +473,46 @@ describe('permission prompt keys', () => {
     } finally {
       setNeuronEngineClientForTesting(null)
     }
+  })
+
+  test('d denies for the rest of the session; p always allows only when rules are offered', () => {
+    expect(resolvePermissionKey({ name: 'd', ctrl: false, meta: false }, armed)).toEqual({
+      type: 'decide',
+      decision: { kind: 'deny', note: null, session: true },
+    })
+    // Offered even when there is no prefix: the engine then refuses this exact call.
+    expect(
+      resolvePermissionKey(
+        { name: 'd', ctrl: false, meta: false },
+        { armed: true, canAllowForSession: false },
+      ),
+    ).toEqual({ type: 'decide', decision: { kind: 'deny', note: null, session: true } })
+    expect(
+      resolvePermissionKey(
+        { name: 'd', ctrl: false, meta: false },
+        { armed: false, canAllowForSession: true },
+      ).type,
+    ).toBe('none')
+    expect(resolvePermissionKey({ name: 'p', ctrl: false, meta: false }, armed).type).toBe('none')
+    expect(
+      resolvePermissionKey(
+        { name: 'p', ctrl: false, meta: false },
+        { armed: true, canAllowForSession: false, canAllowForProject: true },
+      ),
+    ).toEqual({ type: 'decide', decision: { kind: 'allow_for_project' } })
+  })
+
+  test('the headline says a shell command is outside the auto-allow list', () => {
+    expect(permissionHeadline(REQUEST)).toBe(
+      ' wants to run this command (outside the auto-allow list)',
+    )
+    expect(permissionHeadline(REQUEST)).not.toContain('danger-full-access')
+    expect(permissionHeadline({ ...REQUEST, current_mode: 'prompt' })).toBe(
+      ' wants to run this command (prompt mode asks every time)',
+    )
+    expect(permissionHeadline({ ...REQUEST, tool: 'write_file' })).toBe(
+      ' wants approval (workspace-write does not cover this call)',
+    )
   })
 
   test('keys are ignored until the guard passes, and a only when offered', () => {
