@@ -342,11 +342,67 @@ Inside a session: `/session list`, `/session switch <id>`, `/resume <path>`,
 | `/rewind [id [code\|chat\|both]]` | List the checkpoint saved with each prompt, or go back to one: the files, the conversation or both |
 | `/init` | Create a starter `NEURON.md` for the project |
 | `/mcp`, `/skills`, `/plugins` | Inspect and manage integrations |
+| `/colony <task>`, `/colony stop` | Run a task with several agents inside a token budget (see [Colony](#colony-several-agents-on-one-task)) |
 | `/doctor` | Diagnose auth, configuration and sandbox setup |
 | `/exit` | Leave |
 
 `neuron status`, `neuron doctor` and `neuron sandbox` print the same reports without
 starting a session.
+
+## Colony: several agents on one task
+
+Colony is an opt-in mode for a task big enough to split. Start it with
+`/colony <task>` in a session, or from a shell:
+
+```bash
+neuron colony "add input validation to every API handler" [--workers N] [--budget 400k]   [--review-model MODEL] [--no-merge] [--allow-web] [--yes]
+```
+
+A run goes in five steps:
+
+1. A planner reads the workspace and splits the task into at most 6 subtasks, each
+   marked as writing or read-only, with the files it expects to change. You see the
+   plan, the number of workers and the token cap, and nothing else runs until you
+   say to start.
+2. Workers run the subtasks, several at a time. A writing worker works in a git
+   worktree of its own (under `~/.neuron/worktrees/`), and its changes are committed
+   to its own branch, never to your working tree. Read-only workers only report.
+3. A reviewer on the reviewer model (`--review-model`, `NEURON_REVIEW_MODEL` or the
+   `reviewerModel` setting) checks each changed branch against its subtask and
+   reports only real problems.
+4. The branches are merged one by one into a synthesis branch. The first merge that
+   conflicts stops the merging: the report names that branch and its files, and the
+   branches stay for you to merge yourself.
+5. A last agent writes the report. If the merge was clean, Neuron shows the diff
+   summary and asks before applying it to your working tree as uncommitted changes.
+   Otherwise the changes stay on their branch (`git merge <branch>` when ready).
+
+Limits come from your plan (`/api/account`, `limits.colony`): Free runs 1 worker at a
+time with 300,000 tokens per run, Pro 4 workers and 2,000,000 tokens, Max 8 workers
+and 6,000,000 tokens. When the account does not say, the Free limits apply.
+`--workers` and `--budget` (`400k`, `1.5m`, `300000`) can only lower them. Every
+agent counts against the run's cap and has a share of its own; at 80% of the cap the
+running agents are told to finish and Neuron asks whether to go on before it starts
+another; at the cap every agent stops with what it has.
+
+In the full-screen UI the run shows one live row per agent (role, task, status,
+tokens of its budget, branch) under the run's total, and Esc or `/colony stop` stops
+it. Without a terminal (`neuron colony` in a script) nobody can answer: `--yes` is
+needed to start, the run stops at 80% of the cap instead of asking, and the changes
+are applied only with `--yes`. Workers get no browser tools, and web search and fetch
+only with `--allow-web`; what they still need approval for is refused, since a worker
+cannot ask. Agents never get more access than your session: in read-only mode every
+subtask is read-only.
+
+### Parallel sub-agents
+
+Outside Colony, when one model reply asks for several `Agent` calls whose sub-agents
+only read (Explore, Plan, and Verification when the session has no shell tool) or
+run in a worktree of their own (`isolation: "worktree"`), they run at the same time,
+up to `parallelAgents` (default 3, at most 6). Such calls also need less access: a
+read-only sub-agent needs only read-only permission, and a worktree writer
+workspace-write. Sub-agents that write in your working tree still run one at a time
+and need full access. At most 20 sub-agents run at once.
 
 ## Plugins and skills
 
@@ -458,6 +514,8 @@ names the file, the line and the closest known key. Commonly used keys:
 | `permissions` | `allow`, `ask` and `deny` rules for individual tools |
 | `provider` | Provider to use (see [Bring your own key](#bring-your-own-key)) |
 | `maxIterations` | Model calls allowed in one turn (default 50); `NEURON_MAX_ITERATIONS` overrides it |
+| `parallelToolCalls` | Read-only tool calls of one reply that run at the same time (default 4, 1 to 16) |
+| `parallelAgents` | Read-only or worktree sub-agents of one reply that run at the same time (default 3, 1 to 6; 1 runs them in turn) |
 | `hooks` | Commands run before and after tool calls |
 | `mcpServers`, `defaultMcpServers`, `disabledMcpServers` | MCP servers |
 | `defaultSkills` | `false` leaves the bundled skills out of the system prompt |

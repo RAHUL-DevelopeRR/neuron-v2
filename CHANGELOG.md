@@ -5,6 +5,23 @@ The release workflow copies a version's section into its GitHub release notes.
 
 ## 7.0.0-alpha.4 (unreleased)
 
+- Colony mode: `/colony <task>` (full-screen UI and line REPL) and
+  `neuron colony "<task>"` plan a task into subtasks, run workers in parallel (writers
+  each in a git worktree of their own), have reviewers on the reviewer model check each
+  branch, merge the branches into a synthesis branch (stopping at the first conflict),
+  and apply the result to the working tree only after you approve it. Worker count and
+  the per-run token cap come from the account's `limits.colony` (Free: 1 worker,
+  300,000 tokens). Neuron asks before starting, near the cap and before applying.
+  The full-screen UI shows a live row per agent; Esc or `/colony stop` stops a run.
+- `Agent` calls whose sub-agents only read, or work in a worktree of their own, run at
+  the same time (setting `parallelAgents`, default 3) and need less access: read-only
+  sub-agents need read-only permission, worktree writers workspace-write.
+- New setting `parallelToolCalls` (default 4) for read-only tool calls that run at once.
+- Sub-agents can run inside a token budget: told to finish at 80%, stopped at 100%.
+  At most 20 sub-agents run at once.
+- Live shell output and parallel read-only tool calls (from the liveshell lane), and
+  `isolation: "worktree"` for sub-agents (from the source-control lane), are merged in.
+
 - `neuron plugins list|install|enable|disable|update|uninstall` manages plugins without
   a session, and `/plugins` and `/skills` now work in the full-screen UI. Unknown
   `neuron plugins` words print the usage instead of becoming a prompt.

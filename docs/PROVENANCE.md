@@ -61,6 +61,8 @@ states what changed.
 | Area | Neuron files | Freebuff source | What it does |
 | --- | --- | --- | --- |
 | Skill registry | `rust/crates/commands/src/skill_sources.rs`, `rust/crates/rusty-claude-cli/src/skill_registry.rs` | `common/src/util/skill-registry.ts` | skills.sh search and download endpoints and timeouts, ranking by installs with one row per name, 404 versus other failures, and choosing SKILL.md, then AGENTS.md, then any markdown file as a skill's instructions. Rewritten in Rust with GitHub folders, size and path limits and staged installs added. |
+| Colony orchestration | `rust/crates/tools/src/colony.rs` | `agents/base2/base2.ts`, `packages/agent-runtime/src/tools/handlers/tool/spawn-agents.ts` | The plan, parallel work, review and finish flow; a batch of agents where each result stands on its own (`Promise.allSettled`); every agent's usage, failed ones included, rolled into the run's total. Rewritten in Rust around git worktrees, merges and a shared token meter; the prompts are Neuron's own. |
+| Spawn limits | `rust/crates/runtime/src/parallel_tools.rs` (`MAX_AGENTS_PER_BATCH`), `rust/crates/tools/src/lib.rs` (`MAX_LIVE_SUBAGENTS`) | `common/src/tools/params/tool/spawn-agents.ts` (`MAX_SPAWN_AGENTS_PER_CALL`, `MAX_LIVE_SUBAGENTS_PER_ROOT`) | At most 6 agents per batch and 20 running at once. |
 
 ## Crate licenses
 
