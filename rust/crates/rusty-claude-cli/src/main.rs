@@ -48,6 +48,7 @@ mod args;
 mod auth;
 mod brand;
 mod clock;
+mod colony;
 mod credentials;
 mod device_login;
 mod doctor;
@@ -522,6 +523,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             target,
             output_format,
         } => LiveCli::print_plugins(action.as_deref(), target.as_deref(), output_format)?,
+        CliAction::Colony {
+            options,
+            model,
+            permission_mode,
+            allowed_tools,
+            output_format,
+        } => run_colony_command(
+            &options,
+            model,
+            permission_mode,
+            allowed_tools,
+            output_format,
+        )?,
         CliAction::PrintSystemPrompt {
             cwd,
             date,
@@ -770,6 +784,42 @@ prompt after -p, or pipe it: `echo \"...\" | neuron -p`."
     if let Some(code) = denied_exit {
         drop(cli);
         std::process::exit(code);
+    }
+    Ok(())
+}
+
+/// `neuron colony "<task>"`: sets up the session as `neuron prompt` does (provider,
+/// trust, sub-agent parent), then runs the Colony run (`colony::run`).
+fn run_colony_command(
+    options: &colony::ColonyOptions,
+    model: String,
+    permission_mode: PermissionMode,
+    allowed_tools: Option<AllowedToolSet>,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    progress::set_mcp_startup(McpStartup::WaitWithoutBundled);
+    if runtime::ui_hooks::stdin_is_terminal() {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        if let Some(code) = crate::auth::check_trust(&cwd).exit_code() {
+            std::process::exit(code);
+        }
+    }
+    let permission_mode = crate::args::permission_mode_after_trust(permission_mode);
+    let model = crate::args::model_after_trust(model);
+    provider::set_json_output(output_format == CliOutputFormat::Json);
+    let effective_model = configure_provider_for_model(model)?;
+    // Building the session registers the models, credentials and rules agents use.
+    let cli = LiveCli::new(effective_model, true, allowed_tools, permission_mode)?;
+    let report = colony::run(
+        options,
+        &cli.model,
+        cli.permission_mode,
+        output_format == CliOutputFormat::Json,
+    )
+    .map_err(UsageError)?;
+    drop(cli);
+    if report.status == "failed" {
+        std::process::exit(1);
     }
     Ok(())
 }
@@ -1746,7 +1796,8 @@ fn run_resume_command(
         | SlashCommand::AddDir { .. }
         | SlashCommand::Divide { .. }
         | SlashCommand::Chain { .. }
-        | SlashCommand::Power { .. } => Err(UNSUPPORTED_RESUME_COMMAND.into()),
+        | SlashCommand::Power { .. }
+        | SlashCommand::Colony { .. } => Err(UNSUPPORTED_RESUME_COMMAND.into()),
     }
 }
 
@@ -2702,6 +2753,30 @@ impl HookAbortMonitor {
 }
 
 impl LiveCli {
+    /// `/colony <task>` in the line REPL: a Colony run in this session's settings.
+    /// `status` and `stop` have nothing to act on here, since the run holds the
+    /// prompt until it ends (Ctrl-C stops it).
+    fn colony_command(&mut self, args: Option<&str>) {
+        let words = args
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if matches!(words.as_slice(), [word] if word == "status" || word == "stop") {
+            eprintln!("No Colony run is running. Start one with /colony <task>.");
+            return;
+        }
+        match colony::parse_colony_args(&words) {
+            Ok(options) => {
+                if let Err(error) = colony::run(&options, &self.model, self.permission_mode, false)
+                {
+                    eprintln!("[colony] {error}");
+                }
+            }
+            Err(error) => eprintln!("[colony] {error}"),
+        }
+    }
+
     fn new(
         model: String,
         enable_tools: bool,
@@ -3626,6 +3701,10 @@ impl LiveCli {
                         eprintln!("  \x1b[2mType /chain off to deactivate.\x1b[0m");
                     }
                 }
+                false
+            }
+            SlashCommand::Colony { args } => {
+                self.colony_command(args.as_deref());
                 false
             }
             SlashCommand::Power { task } => {
@@ -6973,6 +7052,36 @@ mod tests {
         assert!(error.contains("`neuron prompt \"skills ...\"`"), "{error}");
 
         fs::remove_dir_all(workspace).expect("workspace should clean up");
+    }
+
+    #[test]
+    fn colony_subcommand_parses_its_options_and_needs_a_task() {
+        let words = |list: &[&str]| {
+            list.iter()
+                .map(|word| (*word).to_string())
+                .collect::<Vec<_>>()
+        };
+        let action = parse_args(&words(&[
+            "colony",
+            "--workers",
+            "2",
+            "add",
+            "tests",
+            "--yes",
+        ]))
+        .expect("colony parses");
+        let CliAction::Colony { options, .. } = action else {
+            panic!("not a Colony action: {action:?}");
+        };
+        assert_eq!(options.task, "add tests");
+        assert_eq!(options.workers, Some(2));
+        assert!(options.yes && options.merge);
+        let error = parse_args(&words(&["colony"])).expect_err("no task");
+        assert!(error.contains("no task"), "{error}");
+        assert!(matches!(
+            SlashCommand::parse("/colony stop"),
+            Ok(Some(SlashCommand::Colony { args: Some(args) })) if args == "stop"
+        ));
     }
 
     #[test]

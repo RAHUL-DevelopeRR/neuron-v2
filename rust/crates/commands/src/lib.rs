@@ -1015,6 +1015,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "colony",
+        aliases: &[],
+        summary: "Run a task with several agents: plan, parallel workers, review, merge",
+        argument_hint: Some("<task> | status | stop"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "parallel",
         aliases: &[],
         summary: "Run commands in parallel subagents",
@@ -1220,6 +1227,10 @@ pub enum SlashCommand {
     Power {
         task: Option<String>,
     },
+    /// `/colony <task>`, `/colony status`, `/colony stop`: a Colony run.
+    Colony {
+        args: Option<String>,
+    },
     Unknown(String),
 }
 
@@ -1324,6 +1335,7 @@ impl SlashCommand {
             Self::Divide { .. } => "/divide",
             Self::Chain { .. } => "/chain",
             Self::Power { .. } => "/power",
+            Self::Colony { .. } => "/colony",
             #[allow(unreachable_patterns)]
             _ => "/unknown",
         }
@@ -1539,6 +1551,7 @@ pub fn validate_slash_command_input(
         "divide" => SlashCommand::Divide { task: remainder },
         "chain" => SlashCommand::Chain { task: remainder },
         "power" => SlashCommand::Power { task: remainder },
+        "colony" => SlashCommand::Colony { args: remainder },
         other => SlashCommand::Unknown(other.to_string()),
     }))
 }
@@ -4613,6 +4626,7 @@ pub fn handle_slash_command(
         | SlashCommand::Divide { .. }
         | SlashCommand::Chain { .. }
         | SlashCommand::Power { .. }
+        | SlashCommand::Colony { .. }
         | SlashCommand::Unknown(_) => None,
     }
 }
@@ -5181,7 +5195,7 @@ mod tests {
         assert!(help.contains("/login"));
         assert!(help.contains("/logout"));
         assert!(help.contains("Sign in to your Zero-X account in the browser"));
-        assert_eq!(slash_command_specs().len(), 141);
+        assert_eq!(slash_command_specs().len(), 142);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 

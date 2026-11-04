@@ -100,6 +100,14 @@ pub(crate) enum CliAction {
         reasoning_effort: Option<String>,
         allow_broad_cwd: bool,
     },
+    /// `neuron colony "<task>" [options]`: a Colony run.
+    Colony {
+        options: crate::colony::ColonyOptions,
+        model: String,
+        permission_mode: PermissionMode,
+        allowed_tools: Option<AllowedToolSet>,
+        output_format: CliOutputFormat,
+    },
     HelpTopic(LocalHelpTopic),
     // prompt-mode formatting is only supported for non-interactive runs
     Help {
@@ -591,6 +599,13 @@ pub(crate) fn parse_args_with_stdin(
             output_format,
         }),
         "plugins" | "plugin" => parse_plugins_args(&rest[1..], output_format),
+        "colony" => Ok(CliAction::Colony {
+            options: crate::colony::parse_colony_args(&rest[1..])?,
+            model,
+            permission_mode,
+            allowed_tools,
+            output_format,
+        }),
         "skills" => {
             let args = join_optional_args(&rest[1..]);
             match classify_skills_slash_command(args.as_deref()) {
@@ -730,6 +745,7 @@ pub(crate) fn bare_slash_command_guidance(command_name: &str) -> Option<String> 
             | "plugins"
             | "plugin"
             | "skills"
+            | "colony"
             | "system-prompt"
             | "init"
             | "prompt"
