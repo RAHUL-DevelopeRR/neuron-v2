@@ -1591,7 +1591,16 @@ impl PluginManager {
         enabled: Option<bool>,
     ) -> Result<(), PluginError> {
         update_settings_json(&self.settings_path(), |root| {
-            let enabled_plugins = ensure_object(root, "enabledPlugins");
+            // The state lives in `plugins.enabled`; entries under the deprecated top-level
+            // `enabledPlugins` move there, since `plugins.enabled` replaces them when read.
+            let legacy = match root.remove("enabledPlugins") {
+                Some(Value::Object(entries)) => entries,
+                _ => Map::new(),
+            };
+            let enabled_plugins = ensure_object(ensure_object(root, "plugins"), "enabled");
+            for (id, value) in legacy {
+                enabled_plugins.entry(id).or_insert(value);
+            }
             match enabled {
                 Some(value) => {
                     enabled_plugins.insert(plugin_id.to_string(), Value::Bool(value));
@@ -2736,7 +2745,12 @@ mod tests {
     fn load_enabled_plugins(path: &Path) -> BTreeMap<String, bool> {
         let contents = fs::read_to_string(path).expect("settings should exist");
         let root: Value = serde_json::from_str(&contents).expect("settings json");
-        root.get("enabledPlugins")
+        assert!(
+            root.get("enabledPlugins").is_none(),
+            "the deprecated key is not written"
+        );
+        root.get("plugins")
+            .and_then(|plugins| plugins.get("enabled"))
             .and_then(Value::as_object)
             .map(|enabled_plugins| {
                 enabled_plugins
@@ -3477,6 +3491,41 @@ mod tests {
         assert!(reloaded
             .iter()
             .any(|plugin| { plugin.metadata.id == "starter@bundled" && !plugin.enabled }));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(bundled_root);
+    }
+
+    /// Switching a plugin moves entries under the deprecated `enabledPlugins` key into
+    /// `plugins.enabled`, keeps other settings, and never writes the old key again.
+    #[test]
+    fn enable_state_moves_the_deprecated_key_into_plugins_enabled() {
+        let _guard = env_guard();
+        let config_home = temp_dir("legacy-enabled-home");
+        let bundled_root = temp_dir("legacy-enabled-root");
+        write_bundled_plugin(&bundled_root.join("starter"), "starter", "0.1.0", false);
+        write_file(
+            &config_home.join(SETTINGS_FILE_NAME),
+            r#"{"model": "auto", "enabledPlugins": {"old@external": true, "starter@bundled": false},
+                "plugins": {"installRoot": "plugins/installed"}}"#,
+        );
+
+        let mut config = PluginManagerConfig::new(&config_home);
+        config.bundled_root = Some(bundled_root.clone());
+        let mut manager = PluginManager::new(config);
+        manager
+            .enable("starter@bundled")
+            .expect("enable bundled plugin should succeed");
+
+        let enabled = load_enabled_plugins(&manager.settings_path());
+        assert_eq!(enabled.get("old@external"), Some(&true));
+        assert_eq!(enabled.get("starter@bundled"), Some(&true));
+        let root: Value = serde_json::from_str(
+            &fs::read_to_string(manager.settings_path()).expect("settings"),
+        )
+        .expect("settings json");
+        assert_eq!(root["model"], "auto");
+        assert_eq!(root["plugins"]["installRoot"], "plugins/installed");
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(bundled_root);
