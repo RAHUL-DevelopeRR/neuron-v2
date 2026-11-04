@@ -540,7 +540,10 @@ fn mcp_wrapper_target(tool_name: &str, input: &str) -> Option<McpWrapperTarget> 
     if tool_name != "MCPTool" && tool_name != "MCP" {
         return None;
     }
-    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(input) else {
+    // Read the way the executor reads it: near-JSON it repairs names a tool too.
+    let Ok(Value::Object(object)) =
+        crate::tool_input::parse_tool_input(input).map(|parsed| parsed.value)
+    else {
         return None;
     };
     let text = |key: &str| {
@@ -575,6 +578,14 @@ fn mcp_wrapper_target(tool_name: &str, input: &str) -> Option<McpWrapperTarget> 
         input,
         keeps_wrapper_requirement,
     })
+}
+
+/// The object the executor will run, as JSON text, when `input` is near-JSON it
+/// repairs (see [`crate::tool_input`]); `None` for valid JSON and for input with no
+/// safe repair, which is decided as sent.
+fn repaired_tool_input(input: &str) -> Option<String> {
+    let parsed = crate::tool_input::parse_tool_input(input).ok()?;
+    parsed.repaired.is_some().then(|| parsed.value.to_string())
 }
 
 /// The tool-name prefix a server rule covers: `mcp__github` and `mcp__github__*`
@@ -889,7 +900,11 @@ impl PermissionPolicy {
     /// A call through an MCP wrapper (`MCPTool`, `MCP`) is decided as a call of the
     /// MCP tool it names (`mcp__<server>__<tool>`): that tool's rules and
     /// requirement apply, so a rule on the tool cannot be stepped around through
-    /// the wrapper. Rules on the wrapper itself apply too.
+    /// the wrapper. Rules on the wrapper itself apply too, matched against the tool it
+    /// names however the call spells it (`qualifiedName` or `tool`, other keys).
+    ///
+    /// Arguments that are near-JSON the executor repairs (a trailing comma, a code
+    /// fence) are decided as the repaired object, which is what runs.
     #[must_use]
     pub fn authorize_with_floor(
         &self,
@@ -899,12 +914,19 @@ impl PermissionPolicy {
         floor: Option<PermissionMode>,
         prompter: Option<&mut dyn PermissionPrompter>,
     ) -> PermissionOutcome {
+        let repaired = repaired_tool_input(input);
+        let input = repaired.as_deref().unwrap_or(input);
         let Some(target) = mcp_wrapper_target(tool_name, input) else {
             return self.authorize_call(tool_name, input, context, floor, None, prompter);
         };
-        if let Some(rule) =
-            self.find_matching_rule(&self.deny_rules, RuleKind::Deny, tool_name, input)
-        {
+        // `MCPTool(mcp__github__x)` rules match the tool the call names; deny and ask
+        // rules also match the input as sent.
+        let named = serde_json::json!({ "qualifiedName": target.qualified_name }).to_string();
+        let wrapper_rule = |rules, kind| {
+            self.find_matching_rule(rules, kind, tool_name, &named)
+                .or_else(|| self.find_matching_rule(rules, kind, tool_name, input))
+        };
+        if let Some(rule) = wrapper_rule(&self.deny_rules, RuleKind::Deny) {
             return PermissionOutcome::Deny {
                 reason: format!(
                     "Permission to use {tool_name} has been denied by rule '{}'",
@@ -925,8 +947,8 @@ impl PermissionPolicy {
             .chain(session_rules)
             .collect::<Vec<_>>();
         let wrapper = WrapperRules {
-            ask: self.find_matching_rule(&self.ask_rules, RuleKind::Ask, tool_name, input),
-            allowed: self.allowed_by_rules(&allow_rules, tool_name, input),
+            ask: wrapper_rule(&self.ask_rules, RuleKind::Ask),
+            allowed: self.allowed_by_rules(&allow_rules, tool_name, &named),
         };
         // `MCP` does not know the tier of what it calls: it keeps its own requirement.
         let floor = if target.keeps_wrapper_requirement {
@@ -3584,5 +3606,109 @@ mod tests {
             Some(r#"{"text":"hi"}"#.to_string())
         );
         assert_eq!(super::mcp_wrapper_target("MCPTool", "{}"), None);
+    }
+
+    #[test]
+    fn near_json_the_executor_repairs_is_decided_as_the_call_it_runs() {
+        // A trailing comma, a code fence or text before the object: the executor
+        // repairs them and runs mcp__alpha__echo, so its deny rule refuses them.
+        let repairable = [
+            r#"{"qualifiedName":"mcp__alpha__echo","arguments":{},}"#,
+            "```json\n{\"qualifiedName\":\"mcp__alpha__echo\"}\n```",
+            r#"Calling it now: {"qualifiedName":"mcp__alpha__echo","arguments":{"text":"hi"}}"#,
+        ];
+        for mode in ALL_MODES {
+            let policy = mcp_policy(mode, &["mcp__alpha__echo"], &[]);
+            for input in repairable {
+                assert!(
+                    matches!(
+                        policy.authorize("MCPTool", input, Some(&mut allowing())),
+                        PermissionOutcome::Deny { reason } if reason.contains("mcp__alpha__echo")
+                    ),
+                    "{input} {mode:?}"
+                );
+            }
+        }
+        // An ask rule on the tool asks, and the question names the tool.
+        let mut prompter = allowing();
+        assert_eq!(
+            mcp_policy(PermissionMode::DangerFullAccess, &[], &["mcp__alpha__echo"]).authorize(
+                "MCPTool",
+                repairable[0],
+                Some(&mut prompter)
+            ),
+            PermissionOutcome::Allow
+        );
+        assert_eq!(prompter.seen.len(), 1);
+        assert_eq!(prompter.seen[0].tool_name, "mcp__alpha__echo");
+
+        // The same holds for any tool: a shell deny rule sees the repaired command.
+        let rules = RuntimePermissionRuleConfig::new(
+            Vec::new(),
+            vec!["bash(rm -rf:*)".to_string()],
+            Vec::new(),
+        );
+        let policy =
+            PermissionPolicy::new(PermissionMode::DangerFullAccess).with_permission_rules(&rules);
+        assert!(matches!(
+            policy.authorize("bash", r#"{"command":"rm -rf /tmp/x",}"#, None),
+            PermissionOutcome::Deny { reason } if reason.contains("denied by rule")
+        ));
+        // Input with no safe repair is decided as sent.
+        assert_eq!(super::repaired_tool_input(r#"{"command":"ls"}"#), None);
+        assert_eq!(super::repaired_tool_input("rm -rf /"), None);
+    }
+
+    #[test]
+    fn wrapper_rules_match_the_tool_however_the_call_spells_it() {
+        let spellings = [
+            serde_json::json!({"tool": "mcp__alpha__read"}),
+            serde_json::json!({"qualifiedName": "mcp__alpha__read", "path": "x"}),
+            serde_json::json!({"qualifiedName": "mcp__alpha__read", "command": "ls"}),
+            serde_json::json!({"qualifiedName": " mcp__alpha__read ", "message": "hi"}),
+        ];
+        for mode in [
+            PermissionMode::WorkspaceWrite,
+            PermissionMode::DangerFullAccess,
+        ] {
+            let policy = mcp_policy(mode, &["MCPTool(mcp__alpha__read)"], &[]);
+            for input in &spellings {
+                assert!(
+                    matches!(
+                        policy.authorize("MCPTool", &input.to_string(), None),
+                        PermissionOutcome::Deny { .. }
+                    ),
+                    "{input} {mode:?}"
+                );
+            }
+        }
+        // An ask rule on the wrapper asks for each spelling.
+        let asking = mcp_policy(
+            PermissionMode::DangerFullAccess,
+            &[],
+            &["MCPTool(mcp__alpha__read)"],
+        );
+        for input in &spellings {
+            let mut prompter = allowing();
+            assert_eq!(
+                asking.authorize("MCPTool", &input.to_string(), Some(&mut prompter)),
+                PermissionOutcome::Allow
+            );
+            assert_eq!(prompter.seen.len(), 1, "{input}");
+        }
+        // Other tools of the server are left alone, whichever key names them.
+        assert_eq!(
+            mcp_policy(
+                PermissionMode::DangerFullAccess,
+                &["MCPTool(mcp__alpha__read)"],
+                &[]
+            )
+            .authorize(
+                "MCPTool",
+                &serde_json::json!({"tool": "mcp__alpha__echo"}).to_string(),
+                None
+            ),
+            PermissionOutcome::Allow
+        );
     }
 }

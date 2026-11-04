@@ -2002,9 +2002,7 @@ struct ToolSearchRequest {
 
 #[derive(Debug, Deserialize)]
 struct McpToolRequest {
-    #[serde(rename = "qualifiedName")]
-    qualified_name: Option<String>,
-    tool: Option<String>,
+    // The tool it names (`qualifiedName` or `tool`) is read by `mcp_tool_target`.
     arguments: Option<serde_json::Value>,
 }
 

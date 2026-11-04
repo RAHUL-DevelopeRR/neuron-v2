@@ -337,12 +337,12 @@ impl CliToolExecutor {
 
         match tool_name {
             "MCPTool" => {
+                // Resolved as the permission check resolved it, so the call runs the
+                // tool that was decided on.
+                let qualified_name = mcp_tool_target(&value)
+                    .ok_or_else(|| ToolError::new("missing required field `qualifiedName`"))?;
                 let input: McpToolRequest = serde_json::from_value(value)
                     .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-                let qualified_name = input
-                    .qualified_name
-                    .or(input.tool)
-                    .ok_or_else(|| ToolError::new("missing required field `qualifiedName`"))?;
                 // Models send the object as JSON text too; servers want the object.
                 let arguments = tools::mcp_call_arguments(input.arguments)
                     .map_err(|error| ToolError::new(format!("invalid MCPTool input: {error}")))?;
