@@ -36,6 +36,7 @@ mod mcp_client;
 mod mcp_http;
 pub mod mcp_lifecycle_hardened;
 mod mcp_oauth;
+pub mod mcp_output;
 pub mod mcp_server;
 mod mcp_stdio;
 #[cfg(test)]
@@ -153,6 +154,9 @@ pub use mcp_oauth::{
     generate_mcp_pkce, load_mcp_tokens, login_mcp_server, mcp_token_key, parse_token_response,
     parse_www_authenticate, refresh_mcp_tokens, save_mcp_tokens, set_mcp_token_store, token_action,
     McpAuthDiscovery, McpLoginOptions, McpOAuthTokens, McpTokenStore, TokenAction,
+};
+pub use mcp_output::{
+    default_mcp_spill_dir, format_mcp_tool_output, McpToolOutput, MCP_OUTPUT_MAX_CHARS,
 };
 pub use mcp_server::{McpServer, McpServerSpec, ToolCallHandler, MCP_SERVER_PROTOCOL_VERSION};
 pub use mcp_stdio::{

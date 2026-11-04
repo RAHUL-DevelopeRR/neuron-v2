@@ -1357,10 +1357,7 @@ while True:
                     .to_string(),
             )
             .expect("the call runs");
-        assert!(
-            from_text.contains(r#"dict:{\"text\": \"hi\"}"#),
-            "{from_text}"
-        );
+        assert!(from_text.contains(r#"dict:{"text": "hi"}"#), "{from_text}");
         let from_object = executor
             .execute(
                 "MCPTool",
