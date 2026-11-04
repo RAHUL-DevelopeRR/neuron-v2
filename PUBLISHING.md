@@ -29,6 +29,32 @@ published release are never rebuilt or replaced.
    pipeline has shipped a few releases).
 5. **Security reporting.** Enable private vulnerability reporting (Settings, Code
    security) so the link in [SECURITY.md](SECURITY.md) works.
+6. **Code signing.** Unsigned binaries get blocked: Defender quarantined the
+   7.0.0-alpha.4 `neuron.exe` as `Trojan:Win32/Bearfoos.A!ml`, and macOS Gatekeeper
+   blocks an unnotarized binary that was downloaded in a browser. The `sign` job in
+   `release.yml` signs both platforms once you add the credentials below to a GitHub
+   environment named `signing` (Settings, Environments; no reviewers needed) and set
+   the switch. Until a switch is on, that platform's binaries ship unsigned and the
+   job prints a warning.
+   - **Windows** (SSL.com eSigner, which signs from CI and issues certificates to
+     individuals outside the US): buy an OV code-signing certificate with eSigner
+     cloud signing, enroll it for automated signing, and add secrets
+     `SSLCOM_USERNAME`, `SSLCOM_PASSWORD`, `SSLCOM_CREDENTIAL_ID` and
+     `SSLCOM_TOTP_SECRET` (the TOTP secret from the eSigner enrollment, not a one-time
+     code). Then set the repository variable `ENABLE_WINDOWS_SIGNING=true`.
+   - **macOS** (Apple Developer Program): create a *Developer ID Application*
+     certificate, export it with its key as a `.p12`, and add secrets
+     `MACOS_DEVELOPER_ID_P12` (`base64 -i cert.p12`) and
+     `MACOS_DEVELOPER_ID_P12_PASSWORD`. For notarization, create an App Store Connect
+     API key (Users and Access, Integrations, Developer role) and add
+     `APPLE_NOTARY_KEY_P8` (the `.p8` file's text), `APPLE_NOTARY_KEY_ID` and
+     `APPLE_NOTARY_ISSUER_ID`. Then set `ENABLE_MACOS_SIGNING=true`.
+   - **Linux** needs no signing: the `.sha256` files and the build attestation cover it.
+
+   Signing changes the files, so the job rewrites their `.sha256` files before attest
+   and release see them. Both Windows executables also carry version info (publisher
+   Zero-X, product Neuron), set by `rust/crates/rusty-claude-cli/build.rs` and
+   `ui/neuron-tui/scripts/build-binary.ts`.
 
 ## 1. Prepare the release
 

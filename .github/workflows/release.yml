@@ -1,6 +1,7 @@
 name: Release
 
-# Tag push (vX.Y.Z): build every target, attest provenance, attach the
+# Tag push (vX.Y.Z): build every target, sign the Windows and macOS binaries
+# (when ENABLE_WINDOWS_SIGNING / ENABLE_MACOS_SIGNING are on), attest provenance, attach the
 # binaries, per-asset .sha256 files, SHA256SUMS, THIRD_PARTY_NOTICES.md and the
 # install scripts to a GitHub release, then verify the public asset URLs and
 # install from them on Linux (x64, arm64), macOS and Windows. The release is
@@ -267,9 +268,251 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  sign:
+    name: sign-${{ matrix.name }}
+    needs: [metadata, build]
+    if: needs.metadata.outputs.build == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    # Authenticode-signs the Windows binaries (SSL.com eSigner) and signs and
+    # notarizes the macOS ones (Developer ID), then replaces the build artifact and
+    # its .sha256 files, so attest, the checksums and the release all cover the
+    # signed files. Each platform is switched on by a repository variable,
+    # ENABLE_WINDOWS_SIGNING / ENABLE_MACOS_SIGNING; while it is off, the job leaves
+    # that artifact as built. The credentials live in the `signing` environment and
+    # only this job sees them: it builds nothing and installs no packages, so no
+    # crate build script or npm package runs next to them. See PUBLISHING.md.
+    environment: signing
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            runner: windows-2022
+            asset: neuron-windows-x64.exe
+            ui_asset: neuron-tui-windows-x64.exe
+          - name: macos-arm64
+            runner: macos-14
+            asset: neuron-macos-arm64
+            ui_asset: neuron-tui-macos-arm64
+          - name: macos-x64
+            # Native, so the signed x64 binaries can be smoke-tested (see build).
+            runner: macos-15-intel
+            asset: neuron-macos-x64
+            ui_asset: neuron-tui-macos-x64
+    steps:
+      - name: Decide whether to sign
+        id: enabled
+        shell: bash
+        env:
+          WINDOWS: ${{ vars.ENABLE_WINDOWS_SIGNING }}
+          MACOS: ${{ vars.ENABLE_MACOS_SIGNING }}
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then enabled="$WINDOWS"; else enabled="$MACOS"; fi
+          if [ "$enabled" = "true" ]; then
+            echo "sign=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "sign=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::${{ matrix.asset }} and ${{ matrix.ui_asset }} ship unsigned: signing for $RUNNER_OS is switched off"
+          fi
+
+      # The entitlements file only; nothing from the checkout runs.
+      - uses: actions/checkout@v4
+        if: steps.enabled.outputs.sign == 'true'
+        with:
+          sparse-checkout: scripts/macos
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        if: steps.enabled.outputs.sign == 'true'
+        with:
+          python-version: '3.12'
+
+      - uses: actions/download-artifact@v4
+        if: steps.enabled.outputs.sign == 'true'
+        with:
+          name: ${{ matrix.asset }}
+          path: dist
+
+      - name: Check the binaries against their checksums
+        if: steps.enabled.outputs.sign == 'true'
+        shell: bash
+        run: |
+          python - dist/${{ matrix.asset }} dist/${{ matrix.ui_asset }} <<'PY'
+          import hashlib, pathlib, sys
+          for name in sys.argv[1:]:
+              path = pathlib.Path(name)
+              expected = path.with_name(path.name + '.sha256').read_text(encoding='ascii').split()[0]
+              if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+                  raise SystemExit(f'::error::{path.name} does not match its .sha256')
+          PY
+
+      - name: Check the Windows signing credentials
+        if: steps.enabled.outputs.sign == 'true' && runner.os == 'Windows'
+        shell: bash
+        env:
+          SSLCOM_USERNAME: ${{ secrets.SSLCOM_USERNAME }}
+          SSLCOM_PASSWORD: ${{ secrets.SSLCOM_PASSWORD }}
+          SSLCOM_CREDENTIAL_ID: ${{ secrets.SSLCOM_CREDENTIAL_ID }}
+          SSLCOM_TOTP_SECRET: ${{ secrets.SSLCOM_TOTP_SECRET }}
+        run: |
+          for name in SSLCOM_USERNAME SSLCOM_PASSWORD SSLCOM_CREDENTIAL_ID SSLCOM_TOTP_SECRET; do
+            if [ -z "${!name}" ]; then
+              echo "::error::ENABLE_WINDOWS_SIGNING is true but the $name secret is not set in the signing environment"
+              exit 1
+            fi
+          done
+
+      # Signs in place (override, no output_path) and timestamps with SSL.com's TSA.
+      - name: Sign neuron.exe
+        if: steps.enabled.outputs.sign == 'true' && runner.os == 'Windows'
+        uses: sslcom/esigner-codesign@cf5f6c1d38ad10f47e3ed9aca873f429b1a8d85b # v1.3.2
+        with:
+          command: sign
+          username: ${{ secrets.SSLCOM_USERNAME }}
+          password: ${{ secrets.SSLCOM_PASSWORD }}
+          credential_id: ${{ secrets.SSLCOM_CREDENTIAL_ID }}
+          totp_secret: ${{ secrets.SSLCOM_TOTP_SECRET }}
+          file_path: ${{ github.workspace }}/dist/${{ matrix.asset }}
+          override: true
+          malware_block: false
+          environment_name: PROD
+
+      - name: Sign neuron-tui.exe
+        if: steps.enabled.outputs.sign == 'true' && runner.os == 'Windows'
+        uses: sslcom/esigner-codesign@cf5f6c1d38ad10f47e3ed9aca873f429b1a8d85b # v1.3.2
+        with:
+          command: sign
+          username: ${{ secrets.SSLCOM_USERNAME }}
+          password: ${{ secrets.SSLCOM_PASSWORD }}
+          credential_id: ${{ secrets.SSLCOM_CREDENTIAL_ID }}
+          totp_secret: ${{ secrets.SSLCOM_TOTP_SECRET }}
+          file_path: ${{ github.workspace }}/dist/${{ matrix.ui_asset }}
+          override: true
+          malware_block: false
+          environment_name: PROD
+
+      - name: Check the Windows signatures
+        if: steps.enabled.outputs.sign == 'true' && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          foreach ($name in '${{ matrix.asset }}', '${{ matrix.ui_asset }}') {
+            $signature = Get-AuthenticodeSignature "dist/$name"
+            "$name`: $($signature.Status), $($signature.SignerCertificate.Subject)" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+            if ($signature.Status -ne 'Valid') { throw "$name is not validly signed: $($signature.StatusMessage)" }
+            if (-not $signature.TimeStamperCertificate) { throw "$name has no timestamp, so its signature would expire with the certificate" }
+          }
+
+      - name: Sign and notarize the macOS binaries
+        if: steps.enabled.outputs.sign == 'true' && runner.os == 'macOS'
+        env:
+          # Base64 of the Developer ID Application certificate and key (.p12).
+          CERTIFICATE_P12: ${{ secrets.MACOS_DEVELOPER_ID_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_P12_PASSWORD }}
+          # An App Store Connect API key (Developer role) for notarytool.
+          NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          CLI: dist/${{ matrix.asset }}
+          UI: dist/${{ matrix.ui_asset }}
+        run: |
+          set -euo pipefail
+          for name in CERTIFICATE_P12 CERTIFICATE_PASSWORD NOTARY_KEY_P8 NOTARY_KEY_ID NOTARY_ISSUER_ID; do
+            if [ -z "${!name}" ]; then
+              echo "::error::ENABLE_MACOS_SIGNING is true but the secret for $name is not set in the signing environment"
+              exit 1
+            fi
+          done
+
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          printf '%s' "$CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/developer-id.p12"
+          security import "$RUNNER_TEMP/developer-id.p12" -k "$keychain" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/developer-id.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          identity="$(security find-identity -v -p codesigning "$keychain" | awk '/Developer ID Application/ {print $2; exit}')"
+          if [ -z "$identity" ]; then
+            echo "::error::the .p12 holds no Developer ID Application identity"
+            exit 1
+          fi
+
+          # Hardened runtime and a secure timestamp, which notarization requires. The
+          # UI is a Bun executable: JavaScriptCore needs JIT, and OpenTUI loads its
+          # native library at run time (scripts/macos/neuron-tui.entitlements).
+          codesign --force --timestamp --options runtime --keychain "$keychain" --sign "$identity" "$CLI"
+          codesign --force --timestamp --options runtime --keychain "$keychain" --sign "$identity" \
+            --entitlements scripts/macos/neuron-tui.entitlements "$UI"
+          for binary in "$CLI" "$UI"; do
+            codesign --verify --strict --verbose=2 "$binary"
+            codesign --display --verbose=2 "$binary" 2>&1 | grep -E '^(Authority|TeamIdentifier|Timestamp)=' | head -n 3 \
+              | sed "s|^|$(basename "$binary"): |" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+
+          # A bare executable cannot carry a stapled ticket; Gatekeeper looks the
+          # notarization up online the first time the file opens.
+          key="$RUNNER_TEMP/notary-key.p8"
+          printf '%s\n' "$NOTARY_KEY_P8" > "$key"
+          archive="$RUNNER_TEMP/notarize.zip"
+          (cd dist && zip -q "$archive" "$(basename "$CLI")" "$(basename "$UI")")
+          xcrun notarytool submit "$archive" --key "$key" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" \
+            --wait --timeout 30m --output-format json > "$RUNNER_TEMP/notarization.json" || true
+          cat "$RUNNER_TEMP/notarization.json"
+          status="$(python -c 'import json, sys; print(json.load(open(sys.argv[1])).get("status", ""))' "$RUNNER_TEMP/notarization.json" || true)"
+          if [ "$status" != "Accepted" ]; then
+            id="$(python -c 'import json, sys; print(json.load(open(sys.argv[1])).get("id", ""))' "$RUNNER_TEMP/notarization.json" || true)"
+            if [ -n "$id" ]; then
+              xcrun notarytool log "$id" --key "$key" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" || true
+            fi
+            rm -f "$key"
+            echo "::error::notarization of ${{ matrix.asset }} and ${{ matrix.ui_asset }} ended as '${status:-unknown}'"
+            exit 1
+          fi
+          rm -f "$key"
+          echo "Notarized ${{ matrix.asset }} and ${{ matrix.ui_asset }}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove the signing keychain
+        if: always() && steps.enabled.outputs.sign == 'true' && runner.os == 'macOS'
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+
+      - name: Smoke-test the signed binaries
+        if: steps.enabled.outputs.sign == 'true'
+        shell: bash
+        run: |
+          for binary in "dist/${{ matrix.asset }}" "dist/${{ matrix.ui_asset }}"; do
+            "$binary" --version
+          done
+
+      - name: Rewrite the checksums for the signed binaries
+        if: steps.enabled.outputs.sign == 'true'
+        shell: bash
+        run: |
+          python - dist/${{ matrix.asset }} dist/${{ matrix.ui_asset }} <<'PY'
+          import hashlib, pathlib, sys
+          for name in sys.argv[1:]:
+              path = pathlib.Path(name)
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              path.with_name(path.name + '.sha256').write_text(f'{digest}  {path.name}\n', encoding='ascii', newline='\n')
+              print(f'{digest}  {path.name}')
+          PY
+
+      # Same name as the build artifact, so attest and release pick up the signed files.
+      - uses: actions/upload-artifact@v4
+        if: steps.enabled.outputs.sign == 'true'
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+          overwrite: true
+
   attest:
     name: Attest build provenance
-    needs: [metadata, build]
+    needs: [metadata, build, sign]
     if: needs.metadata.outputs.is_release == 'true' && needs.metadata.outputs.build == 'true'
     runs-on: ubuntu-latest
     permissions:

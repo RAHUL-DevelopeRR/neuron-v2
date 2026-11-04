@@ -53,6 +53,11 @@ nix = { version = "0.29", default-features = false, features = ["user"] }
 [target.'cfg(windows)'.dependencies]
 crossterm_winapi = "0.9.1"
 
+# Version info and an application manifest in neuron.exe (build.rs). A host
+# dependency: the Windows release binary is built on a Windows runner.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1.34"
+
 [lints]
 workspace = true
 
