@@ -78,6 +78,7 @@ pub mod transcript;
 mod trust_resolver;
 pub mod ui_hooks;
 mod usage;
+pub mod web_grants;
 pub mod worker_boot;
 pub mod workspace_trust;
 
@@ -228,6 +229,7 @@ pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, Tr
 pub use usage::{
     format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,
 };
+pub use web_grants::{run_web_grants, set_run_web_grants, RunWebGrants};
 pub use worker_boot::{
     Worker, WorkerEvent, WorkerEventKind, WorkerEventPayload, WorkerFailure, WorkerFailureKind,
     WorkerPromptTarget, WorkerReadySnapshot, WorkerRegistry, WorkerStatus, WorkerTrustResolution,

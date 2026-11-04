@@ -513,6 +513,9 @@ pub struct PermissionPolicy {
     shell_dialect: Option<ShellDialect>,
     session: SessionApprovals,
     grants: PendingGrants,
+    /// `--allow-web` / `--allow-origin` grants; `None` reads the process's
+    /// ([`crate::run_web_grants`]) at evaluation time.
+    run_web: Option<crate::RunWebGrants>,
 }
 
 impl PermissionPolicy {
@@ -528,6 +531,41 @@ impl PermissionPolicy {
             shell_dialect: None,
             session: SessionApprovals::global(),
             grants: PendingGrants::default(),
+            run_web: None,
+        }
+    }
+
+    /// Uses `grants` instead of the process's run grants
+    /// ([`crate::run_web_grants`]).
+    #[must_use]
+    pub fn with_run_web_grants(mut self, grants: crate::RunWebGrants) -> Self {
+        self.run_web = Some(grants);
+        self
+    }
+
+    fn run_web_grants(&self) -> crate::RunWebGrants {
+        self.run_web.clone().unwrap_or_else(crate::run_web_grants)
+    }
+
+    /// Why `--allow-origin` keeps this call from its URL: a `WebFetch`, or a
+    /// bundled-browser call that opens a page (`mcp__playwright__browser_*`
+    /// with a `url`), whose host is not one of the run's origins. A browser
+    /// URL that is not http(s) (`file:`, `data:`) is refused too, except
+    /// `about:blank`.
+    fn run_origin_refusal(&self, tool_name: &str, input: &str) -> Option<String> {
+        let browser = tool_name.starts_with("mcp__playwright__browser");
+        if tool_name != "WebFetch" && !browser {
+            return None;
+        }
+        let grants = self.run_web_grants();
+        if grants.origins.is_empty() {
+            return None;
+        }
+        let url = input_field(input, &["url"])?;
+        match url_host(&url) {
+            Some(host) => grants.refusal_for(tool_name, &host),
+            None if browser && url.trim() != "about:blank" => grants.refusal_for(tool_name, &url),
+            None => None,
         }
     }
 
@@ -719,7 +757,9 @@ impl PermissionPolicy {
                 let url = input_field(input, &["url"]).unwrap_or_default();
                 match url_host(&url) {
                     Some(host) => {
-                        if self.session.is_domain_approved(&host) {
+                        if self.session.is_domain_approved(&host)
+                            || self.run_web_grants().grants_fetch(&host)
+                        {
                             assessment.session_approved = true;
                         } else {
                             escalate(
@@ -737,7 +777,9 @@ impl PermissionPolicy {
             "WebSearch" => {
                 // The query goes to an external search service.
                 let scope = vec![tool_name.to_string()];
-                if self.session.prefixes(tool_name).contains(&scope) {
+                if self.session.prefixes(tool_name).contains(&scope)
+                    || self.run_web_grants().grants_search()
+                {
                     assessment.session_approved = true;
                 } else {
                     escalate(
@@ -798,6 +840,11 @@ impl PermissionPolicy {
                     rule.raw
                 ),
             };
+        }
+        // `--allow-origin` limits where this run's fetches and browser go: no mode,
+        // rule or approval widens it.
+        if let Some(reason) = self.run_origin_refusal(tool_name, input) {
+            return PermissionOutcome::Deny { reason };
         }
         // Declined for the rest of the session: refused without asking again, over
         // modes and allow rules alike.
@@ -1993,6 +2040,122 @@ mod tests {
             .with_tool_requirement("read_file", PermissionMode::ReadOnly)
             .with_workspace_root(std::env::temp_dir().join("neuron-permissions-workspace"))
             .with_session_approvals(SessionApprovals::isolated())
+            .with_run_web_grants(crate::RunWebGrants::default())
+    }
+
+    #[test]
+    fn run_web_grants_skip_the_web_prompts_only_for_what_they_name() {
+        let search = serde_json::json!({ "query": "rust release" }).to_string();
+        let fetch = |url: &str| serde_json::json!({ "url": url, "prompt": "read" }).to_string();
+
+        // --allow-web: searches and fetches from any host run without a prompt.
+        let allow_web = workspace_policy(PermissionMode::WorkspaceWrite).with_run_web_grants(
+            crate::RunWebGrants {
+                allow_web: true,
+                origins: Vec::new(),
+            },
+        );
+        assert_eq!(
+            allow_web.authorize("WebSearch", &search, None),
+            PermissionOutcome::Allow
+        );
+        assert_eq!(
+            allow_web.authorize("WebFetch", &fetch("https://docs.rs/serde"), None),
+            PermissionOutcome::Allow
+        );
+
+        // --allow-origin alone: fetches from the listed host only; searches still ask.
+        let mut origins = crate::RunWebGrants::default();
+        origins.add_origin("https://example.com").unwrap();
+        let origin_only =
+            workspace_policy(PermissionMode::WorkspaceWrite).with_run_web_grants(origins.clone());
+        assert_eq!(
+            origin_only.authorize("WebFetch", &fetch("https://example.com/a"), None),
+            PermissionOutcome::Allow
+        );
+        assert!(matches!(
+            origin_only.authorize("WebFetch", &fetch("https://docs.rs/serde"), None),
+            PermissionOutcome::Deny { .. }
+        ));
+        assert!(matches!(
+            origin_only.authorize("WebSearch", &search, None),
+            PermissionOutcome::Deny { .. }
+        ));
+
+        // A deny rule still wins; read-only mode treats the grant like a session approval.
+        let denied = workspace_policy(PermissionMode::WorkspaceWrite)
+            .with_permission_rules(&RuntimePermissionRuleConfig::new(
+                Vec::new(),
+                vec!["WebSearch".to_string()],
+                Vec::new(),
+            ))
+            .with_run_web_grants(crate::RunWebGrants {
+                allow_web: true,
+                origins: Vec::new(),
+            });
+        assert!(matches!(
+            denied.authorize("WebSearch", &search, None),
+            PermissionOutcome::Deny { .. }
+        ));
+        let read_only =
+            workspace_policy(PermissionMode::ReadOnly).with_run_web_grants(crate::RunWebGrants {
+                allow_web: true,
+                origins: Vec::new(),
+            });
+        assert_eq!(
+            read_only.authorize("WebSearch", &search, None),
+            PermissionOutcome::Allow
+        );
+    }
+
+    #[test]
+    fn allow_origin_limits_fetches_and_the_browser_even_in_full_access() {
+        let mut origins = crate::RunWebGrants::default();
+        origins.add_origin("example.com").unwrap();
+        let policy =
+            workspace_policy(PermissionMode::DangerFullAccess).with_run_web_grants(origins);
+        let url = |url: &str| serde_json::json!({ "url": url }).to_string();
+        let refused = |outcome: PermissionOutcome| match outcome {
+            PermissionOutcome::Deny { reason } => reason,
+            PermissionOutcome::Allow => panic!("expected a refusal"),
+        };
+
+        let reason = refused(policy.authorize("WebFetch", &url("https://docs.rs/serde"), None));
+        assert!(reason.contains("--allow-origin (example.com)"), "{reason}");
+        assert_eq!(
+            policy.authorize("WebFetch", &url("https://example.com/a"), None),
+            PermissionOutcome::Allow
+        );
+
+        let navigate = "mcp__playwright__browser_navigate";
+        let reason = refused(policy.authorize(navigate, &url("https://evil.example/"), None));
+        assert!(reason.contains("`evil.example`"), "{reason}");
+        refused(policy.authorize(navigate, &url("file:///etc/passwd"), None));
+        assert_eq!(
+            policy.authorize(navigate, &url("https://example.com/"), None),
+            PermissionOutcome::Allow
+        );
+        assert_eq!(
+            policy.authorize(navigate, &url("about:blank"), None),
+            PermissionOutcome::Allow
+        );
+        // A browser call without a URL, and other tools, are not limited here.
+        assert_eq!(
+            policy.authorize("mcp__playwright__browser_snapshot", "{}", None),
+            PermissionOutcome::Allow
+        );
+        assert_eq!(
+            policy.authorize("mcp__other__fetch", &url("https://evil.example/"), None),
+            PermissionOutcome::Allow
+        );
+
+        // Without --allow-origin nothing is limited.
+        let open = workspace_policy(PermissionMode::DangerFullAccess)
+            .with_run_web_grants(crate::RunWebGrants::default());
+        assert_eq!(
+            open.authorize(navigate, &url("https://evil.example/"), None),
+            PermissionOutcome::Allow
+        );
     }
 
     #[test]
