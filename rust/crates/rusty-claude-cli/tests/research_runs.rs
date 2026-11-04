@@ -4,7 +4,10 @@
 //! - with `--allow-web`, every search goes to `POST /v1/search` with
 //!   `purpose: "research"` and one `x-neuron-research-run` id for the whole run;
 //!   results on private addresses are refused by the fetch guard, and the report
-//!   saved under `.neuron/research/` says that no page could be read.
+//!   saved under `.neuron/research/` says that no page could be read;
+//! - in the full-screen UI's engine, `/research` sent as a prompt asks to start, then
+//!   runs as the turn: searches and reads as tool rows, the plan as the task list, the
+//!   report as the turn's text.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -142,6 +145,197 @@ fn research_json_output_names_the_stop_reason_and_path() {
         .as_str()
         .is_some_and(|path| path.contains("research")));
     assert!(value["run_id"].as_str().unwrap().starts_with("rr_"));
+    workspace.remove();
+}
+
+/// `neuron engine --stdio` (the full-screen UI's engine) with a stored login, the model
+/// on the mock service and searches on the mock gateway. Returns the process, a writer
+/// for its input and its events.
+fn engine(
+    workspace: &Workspace,
+    base_url: &str,
+    gateway: &MockGateway,
+) -> (
+    std::process::Child,
+    std::process::ChildStdin,
+    std::sync::mpsc::Receiver<serde_json::Value>,
+) {
+    use std::io::BufRead;
+    let mut child = neuron(workspace, base_url, gateway)
+        .args([
+            "--provider",
+            "anthropic",
+            "engine",
+            "--stdio",
+            "--model",
+            "sonnet",
+        ])
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("the engine starts");
+    let stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let stderr = child.stderr.take().expect("stderr");
+    thread::spawn(move || for _ in std::io::BufReader::new(stderr).lines() {});
+    let (events_tx, events) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { return };
+            let event: serde_json::Value =
+                serde_json::from_str(&line).expect("stdout carries JSON events");
+            if events_tx.send(event).is_err() {
+                return;
+            }
+        }
+    });
+    (child, stdin, events)
+}
+
+fn send(stdin: &mut std::process::ChildStdin, message: &serde_json::Value) {
+    writeln!(stdin, "{message}").expect("the engine reads its input");
+    stdin.flush().expect("flushed");
+}
+
+fn submit(text: &str) -> serde_json::Value {
+    serde_json::json!({"kind": "command", "type": "submit", "text": text, "attachments": []})
+}
+
+/// Events up to and including the first that `last` accepts.
+fn until(
+    events: &std::sync::mpsc::Receiver<serde_json::Value>,
+    last: impl Fn(&serde_json::Value) -> bool,
+) -> Vec<serde_json::Value> {
+    let mut seen = Vec::new();
+    loop {
+        let event = events
+            .recv_timeout(Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("the engine reports in time; so far: {seen:?}"));
+        let done = last(&event);
+        seen.push(event);
+        if done {
+            return seen;
+        }
+    }
+}
+
+fn is_question(event: &serde_json::Value) -> bool {
+    event["type"] == "notice"
+        && event["message"]
+            .as_str()
+            .is_some_and(|message| message.starts_with("Question: Research (quick depth)"))
+}
+
+#[test]
+fn the_engine_runs_research_as_a_turn_with_tool_rows_and_a_task_list() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let gateway = MockGateway::spawn();
+    let workspace = Workspace::new("engine");
+    let (mut child, mut stdin, events) = engine(&workspace, &server.base_url(), &gateway);
+
+    let ready = until(&events, |event| event["type"] == "ready");
+    let features = ready.last().unwrap()["features"].clone();
+    assert!(
+        features
+            .as_array()
+            .is_some_and(|features| features.iter().any(|feature| feature == "research")),
+        "{features}"
+    );
+    let question = format!("{SCENARIO_PREFIX}research_run which Rust async runtime?");
+
+    // Declined: nothing is searched.
+    send(
+        &mut stdin,
+        &submit(&format!("/research --depth quick {question}")),
+    );
+    until(&events, is_question);
+    send(&mut stdin, &submit("2"));
+    let declined = until(&events, |event| event["type"] == "turn_finished");
+    assert!(
+        declined
+            .iter()
+            .any(|event| event["message"] == "Research not started."),
+        "{declined:?}"
+    );
+    assert!(gateway.searches().is_empty());
+
+    // Started: searches and reads are the turn's tool rows, the plan its task list,
+    // and the report its text.
+    send(
+        &mut stdin,
+        &submit(&format!("/research --depth quick {question}")),
+    );
+    until(&events, is_question);
+    send(&mut stdin, &submit("1"));
+    let turn = until(&events, |event| event["type"] == "turn_finished");
+    let calls = turn
+        .iter()
+        .filter(|event| event["type"] == "tool_call_started")
+        .map(|event| event["name"].as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        calls,
+        vec!["WebSearch", "WebFetch", "WebFetch", "WebSearch"],
+        "{turn:?}"
+    );
+    let first = turn
+        .iter()
+        .find(|event| event["type"] == "tool_call_started")
+        .unwrap();
+    assert_eq!(first["input"], r#"{"query":"rust async runtimes"}"#);
+    let results = turn
+        .iter()
+        .filter(|event| event["type"] == "tool_result")
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 4);
+    assert!(results[1]["is_error"].as_bool().unwrap());
+    let started_ids = turn
+        .iter()
+        .filter(|event| event["type"] == "tool_call_started")
+        .map(|event| event["id"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results
+            .iter()
+            .map(|event| event["id"].clone())
+            .collect::<Vec<_>>(),
+        started_ids
+    );
+    let todos = turn
+        .iter()
+        .filter(|event| event["type"] == "todos")
+        .last()
+        .expect("a task list");
+    let items = todos["items"].as_array().unwrap();
+    assert_eq!(items.last().unwrap()["content"], "Write the cited report");
+    assert!(items.iter().all(|item| item["status"] == "completed"));
+    let text = turn
+        .iter()
+        .filter(|event| event["type"] == "text_delta")
+        .map(|event| event["text"].as_str().unwrap_or_default())
+        .collect::<String>();
+    assert!(text.starts_with("# Research: "), "{text}");
+    assert!(text.contains("No page could be read"), "{text}");
+    assert!(turn.iter().any(|event| event["type"] == "notice"
+        && event["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Saved to .neuron"))));
+    assert_eq!(gateway.searches().len(), 2);
+    assert!(gateway
+        .searches()
+        .iter()
+        .all(|request| request.contains(r#""purpose":"research""#)));
+    assert_eq!(
+        fs::read_dir(workspace.root.join(".neuron").join("research"))
+            .expect("research folder")
+            .count(),
+        1
+    );
+
+    drop(stdin);
+    let _ = child.wait();
     workspace.remove();
 }
 

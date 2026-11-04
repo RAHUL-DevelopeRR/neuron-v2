@@ -121,6 +121,12 @@ pub const FEATURE_CHECKPOINTS: &str = "checkpoints";
 /// disabled servers are listed with status `disabled`.
 pub const FEATURE_MCP_TOGGLE: &str = "mcp_toggle";
 
+/// A prompt of `/research <question>` runs a research run as its turn: the engine asks
+/// to start ([`UiEvent::Question`]), shows each search and page read as a tool call
+/// (`WebSearch`, `WebFetch`) and the plan as [`UiEvent::Todos`], then streams the report
+/// as text. No new events or commands: a UI lists `/research` only when this is listed.
+pub const FEATURE_RESEARCH: &str = "research";
+
 /// What this engine can do beyond protocol 1, in [`UiEvent::Ready`]. A UI sends the
 /// commands a feature adds only when the engine lists it: an older engine would skip
 /// them with a notice.
@@ -146,6 +152,7 @@ pub const ENGINE_FEATURES: &[&str] = &[
     FEATURE_GIT_VIEWS,
     FEATURE_CHECKPOINTS,
     FEATURE_MCP_TOGGLE,
+    FEATURE_RESEARCH,
 ];
 
 /// `report` events for the commands that show a report (`/usage`, `/init`, `/memory`,

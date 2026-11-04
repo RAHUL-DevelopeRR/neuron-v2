@@ -1441,6 +1441,71 @@ enum Step {
 }
 
 /// The engine thread's state: the live CLI and the UI's channels.
+/// A research run's progress in the full-screen UI: searches and reads as tool rows
+/// and the plan as the task list while it runs as a turn, notices otherwise.
+struct EngineResearchProgress {
+    events: Sender<UiEvent>,
+    cancel: CancellationToken,
+    as_turn: bool,
+}
+
+impl research::ResearchProgress for EngineResearchProgress {
+    fn plan(&mut self, items: &[research::PlanItem]) {
+        if !self.as_turn {
+            return;
+        }
+        let _ = self.events.send(UiEvent::Todos {
+            items: items
+                .iter()
+                .map(|item| neuron_tui::protocol::TodoItem {
+                    content: item.content.clone(),
+                    status: item.status.to_string(),
+                    active_form: None,
+                })
+                .collect(),
+        });
+    }
+
+    fn step_started(&mut self, id: &str, tool: &str, input: &serde_json::Value) {
+        if self.as_turn {
+            let _ = self.events.send(UiEvent::ToolCallStarted {
+                id: id.to_string(),
+                name: tool.to_string(),
+                input: input.to_string(),
+                cut_off: false,
+            });
+        }
+    }
+
+    fn step_finished(&mut self, id: &str, tool: &str, output: &str, is_error: bool) {
+        let event = if self.as_turn {
+            UiEvent::ToolResult {
+                id: id.to_string(),
+                name: tool.to_string(),
+                output: output.to_string(),
+                is_error,
+            }
+        } else {
+            UiEvent::Notice {
+                message: format!("{tool}: {output}"),
+                kind: None,
+            }
+        };
+        let _ = self.events.send(event);
+    }
+
+    fn notice(&mut self, message: &str) {
+        let _ = self.events.send(UiEvent::Notice {
+            message: message.to_string(),
+            kind: None,
+        });
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+}
+
 struct Engine {
     cli: LiveCli,
     /// Every runtime the engine builds shows its turns here.
@@ -1653,6 +1718,22 @@ impl Engine {
             return;
         }
         self.cli.record_prompt_history(line);
+        // `/research` sent as a prompt ([`FEATURE_RESEARCH`]) runs as this turn, so
+        // its searches and reads show as the turn's tool rows.
+        if let Ok(Some(SlashCommand::Research { args })) = SlashCommand::parse(line) {
+            let cancel = CancellationToken::new();
+            running.watch(cancel.clone(), HookAbortSignal::new());
+            let result = self.research(line, args.as_deref(), &cancel, true);
+            drop(running);
+            if let Err(message) = result {
+                self.send(UiEvent::Error {
+                    message,
+                    detail: None,
+                });
+            }
+            self.finish_turn();
+            return;
+        }
         let cwd = env::current_dir().unwrap_or_default();
         let prompt = try_resolve_bare_skill_prompt(&cwd, line).unwrap_or_else(|| line.to_string());
         let prompt = self.with_attachments(prompt, attachments);
@@ -1896,6 +1977,17 @@ impl Engine {
             SlashCommand::Doctor => {
                 let report = engine_reports::doctor(&render_doctor_report()?);
                 self.show_report(report);
+            }
+            // As a command (not a prompt) its steps are notices, not tool rows.
+            SlashCommand::Research { args } => {
+                let line = format!("/research {}", args.as_deref().unwrap_or_default());
+                let cancel = CancellationToken::new();
+                let shared = Arc::clone(&self.shared);
+                let running = RunningTurn::start(&shared);
+                running.watch(cancel.clone(), HookAbortSignal::new());
+                let result = self.research(line.trim(), args.as_deref(), &cancel, false);
+                drop(running);
+                result?;
             }
             SlashCommand::Unknown(name) => return Err(format_unknown_slash_command(&name).into()),
             other => {
@@ -2244,6 +2336,87 @@ impl Engine {
             .api_client_mut()
             .set_reasoning_effort(reasoning_effort);
         self.cli.replace_runtime(runtime)
+    }
+
+    /// A research run (`/research`): asks to start (the yes is the run's web grant),
+    /// runs with its steps as tool rows and its plan as the task list (`as_turn`; as
+    /// notices otherwise), then shows the report, saves it under `.neuron/research/`
+    /// and records it in the conversation. An interrupt (`cancel`) stops it and the
+    /// report is written from the notes so far.
+    fn research(
+        &mut self,
+        line: &str,
+        args: Option<&str>,
+        cancel: &CancellationToken,
+        as_turn: bool,
+    ) -> Result<(), String> {
+        let words = args
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let args = research::parse_research_args(&words, false)?;
+        let (request, lowered) = research::request_for(&args);
+        if let Some(note) = lowered {
+            self.notice(&note);
+        }
+        let ask = ui_hooks::ask_handler().ok_or("the UI cannot answer questions")?;
+        let answer = ask(&UserQuestion {
+            question: request.confirmation(),
+            options: Some(
+                research::START_CHOICES
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            ),
+        })
+        .map_err(|error| error.to_string())?;
+        if !research::confirmed(&answer) {
+            self.notice("Research not started.");
+            return Ok(());
+        }
+        let mut web = research::LiveWeb::new(self.cli.runtime.permission_policy(), true);
+        if let Some(reason) = web.search_refusal(&request.question) {
+            return Err(format!("Research cannot search the web: {reason}"));
+        }
+        let cwd = env::current_dir().map_err(|error| error.to_string())?;
+        let (outcome, path) = {
+            let mut model = research::LiveModel {
+                client: self.cli.runtime.api_client(),
+                cancel: cancel.clone(),
+            };
+            let mut progress = EngineResearchProgress {
+                events: Sender::clone(&self.events),
+                cancel: cancel.clone(),
+                as_turn,
+            };
+            research::run_and_save(&request, &mut model, &mut web, &mut progress, &cwd, None)?
+        };
+        let saved = path
+            .strip_prefix(&cwd)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        if as_turn {
+            self.send(UiEvent::TextDelta {
+                text: outcome.report.clone(),
+            });
+            self.send(UiEvent::TextBlockEnd);
+        }
+        self.notice(&format!(
+            "{} Saved to {saved}.",
+            research::summary_line(&outcome)
+        ));
+        for message in research::conversation_record(line, &outcome.report, &saved) {
+            if let Err(error) = self.cli.runtime.session_mut().push_message(message) {
+                self.notice(&format!(
+                    "warning: the report was not added to the chat: {error}"
+                ));
+                break;
+            }
+        }
+        self.persist();
+        Ok(())
     }
 
     fn persist(&mut self) {
