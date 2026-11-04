@@ -9,9 +9,13 @@ The release workflow copies a version's section into its GitHub release notes.
   a session, and `/plugins` and `/skills` now work in the full-screen UI. Unknown
   `neuron plugins` words print the usage instead of becoming a prompt.
 - Plugins keep their manifest at `.neuron-plugin/plugin.json` and may bring skill
-  folders and MCP servers. A plugin's MCP servers are listed as `needs approval` and do
-  not start on their own; its skills are listed under "Plugin skills" and never hide
-  another skill.
+  folders and MCP servers. A plugin's MCP servers are listed as `needs approval` but
+  are not started in this build (per-server approval comes later); `/mcp show` and
+  `/mcp disable|enable` work on them. Its skills are listed under "Plugin skills" and
+  never hide another skill. An invalid plugin server config warns once per session.
+- `/plugins` and `/skills` are in the full-screen UI's slash menu and help.
+- Skill registry and GitHub downloads stop as soon as they pass the size limit, and
+  registry skill names that contain control characters are shown as their slug.
 - `neuron skills search <query>` searches the skills.sh registry, and
   `neuron skills install` also takes `owner/repo/skill`, a registry skill name, or
   `github:owner/repo/path[@ref]`. Skills install into `~/.neuron/skills`.

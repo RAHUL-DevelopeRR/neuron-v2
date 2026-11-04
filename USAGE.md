@@ -399,8 +399,10 @@ root). Besides tools, hooks and commands, a manifest may list:
 `mcpServers` is an object of server configs, or the path of a JSON file inside the
 plugin that holds one; `${NEURON_PLUGIN_ROOT}` stands for the plugin's folder. Paths
 that leave the plugin's folder are refused. A plugin's MCP servers are listed by
-`/mcp` as `needs approval` and do not start until you approve them; a server name
-that your settings already use stays yours.
+`/mcp` as `needs approval` but are not started in this build: approving them comes
+with per-server MCP approval in a later release. Until then, `/mcp show <name>`
+prints such a server's config and `/mcp disable <name>` hides it from the list. A
+server name that your settings already use stays yours.
 
 ## Bring your own key
 
