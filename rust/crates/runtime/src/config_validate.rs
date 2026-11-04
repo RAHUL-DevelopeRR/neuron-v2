@@ -237,6 +237,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "reviewerModel",
         expected: FieldType::String,
     },
+    FieldSpec {
+        name: "redactSecrets",
+        expected: FieldType::Bool,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[
@@ -320,6 +324,18 @@ const SANDBOX_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         name: "allowedMounts",
         expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "network",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "maxProcesses",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "memoryLimitMb",
+        expected: FieldType::Number,
     },
 ];
 

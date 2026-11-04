@@ -500,6 +500,20 @@ pub fn run_bounded(
     timeout: Option<Duration>,
     is_cancelled: &dyn Fn() -> bool,
 ) -> io::Result<BoundedOutput> {
+    run_bounded_with_spawn_hook(command, stdin, timeout, is_cancelled, &mut |_| Ok(()))
+}
+
+/// [`run_bounded`] with `after_spawn` called on the child right after it
+/// started, before any output is read (a sandbox puts a suspended child in a
+/// Windows job and resumes it there). When the hook fails, the child's tree
+/// is killed and the hook's error returned.
+pub fn run_bounded_with_spawn_hook(
+    command: &mut Command,
+    stdin: Option<&[u8]>,
+    timeout: Option<Duration>,
+    is_cancelled: &dyn Fn() -> bool,
+    after_spawn: &mut dyn FnMut(&Child) -> io::Result<()>,
+) -> io::Result<BoundedOutput> {
     command
         .stdin(if stdin.is_some() {
             Stdio::piped()
@@ -510,6 +524,11 @@ pub fn run_bounded(
         .stderr(Stdio::piped());
     isolate_process_group(command);
     let mut child = command.spawn()?;
+    if let Err(error) = after_spawn(&child) {
+        kill_process_tree(&mut child);
+        let _ = child.wait();
+        return Err(error);
+    }
 
     let writer = match (stdin, child.stdin.take()) {
         (Some(bytes), Some(mut pipe)) => {

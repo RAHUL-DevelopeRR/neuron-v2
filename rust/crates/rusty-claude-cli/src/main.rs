@@ -4945,6 +4945,7 @@ fn build_runtime_plugin_state_starting_mcp(
     runtime_config: &runtime::RuntimeConfig,
     startup: McpStartup,
 ) -> Result<(RuntimePluginState, Option<BackgroundMcp>), Box<dyn std::error::Error>> {
+    runtime::redaction::set_enabled(runtime_config.redact_secrets());
     let plugin_manager = build_plugin_manager(cwd, loader, runtime_config);
     let plugin_registry = plugin_manager.plugin_registry()?;
     let plugin_hook_config =
