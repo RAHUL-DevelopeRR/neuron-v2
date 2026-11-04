@@ -16,7 +16,7 @@
  */
 
 import { TextAttributes } from '@opentui/core'
-import React, { useState } from 'react'
+import React, { memo, useMemo, useState } from 'react'
 
 import { Button } from './button'
 import { useTheme } from '../hooks/use-theme'
@@ -65,7 +65,12 @@ const Segment = ({
   )
 }
 
-export const PromptStatusBar = ({
+/**
+ * Drawn again when what it shows changes (the engine's status, account,
+ * models or a pending permission choice) or its width does: not for each
+ * streamed update of the chat around it.
+ */
+export const PromptStatusBar = memo(function PromptStatusBar({
   width,
   onActivate,
   glyphMode = getGlyphMode(),
@@ -75,16 +80,20 @@ export const PromptStatusBar = ({
   onActivate?: (target: StatusTarget) => void
   /** The terminal's glyph set (tests draw both). */
   glyphMode?: GlyphMode
-}) => {
+}) {
   renderProbe.onRender?.('PromptStatusBar')
   const theme = useTheme()
   const status = useEngineStore((state) => state.status)
   const account = useEngineStore((state) => state.account)
   const models = useEngineStore((state) => state.models)
   const pendingPermission = useEngineStore((state) => state.pendingPermission)
-  const line = statusBarLine(
-    { status, account, models, mode: glyphMode, pendingPermission },
-    Math.max(0, width - 2),
+  const line = useMemo(
+    () =>
+      statusBarLine(
+        { status, account, models, mode: glyphMode, pendingPermission },
+        Math.max(0, width - 2),
+      ),
+    [status, account, models, glyphMode, pendingPermission, width],
   )
   if (!line || line.left.length === 0) return null
 
@@ -119,4 +128,4 @@ export const PromptStatusBar = ({
       ) : null}
     </box>
   )
-}
+})

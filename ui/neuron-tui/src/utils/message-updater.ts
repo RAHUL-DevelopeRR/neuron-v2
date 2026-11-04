@@ -25,8 +25,13 @@ export type BatchedMessageUpdater = MessageUpdater & {
   dispose: () => void
 }
 
-/** Default interval for batched updates in milliseconds */
-export const DEFAULT_FLUSH_INTERVAL_MS = 100
+/**
+ * Default interval for batched updates in milliseconds: about 30 updates a
+ * second, so streamed text moves smoothly (at 100 ms it came in steps). Each
+ * update draws only the streaming message, and of its text only what came
+ * after the last finished block (see ContentWithMarkdown).
+ */
+export const DEFAULT_FLUSH_INTERVAL_MS = 33
 
 export const createMessageUpdater = (
   aiMessageId: string,

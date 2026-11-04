@@ -1,5 +1,6 @@
 // Streams a turn through the chat's transcript and status lines and prints
-// what it cost: `bun run bench:streaming [tokens] [--json]`. See
+// what it cost: `bun run bench:streaming [tokens] [--no-tools] [--json]`
+// (`--no-tools`: one long answer, no tool calls). See
 // src/testing/streaming-bench.tsx for what is measured. React runs its
 // development build here (it reports render times only there), so absolute
 // times are higher than in the shipped binary; compare runs with each other.
@@ -10,10 +11,11 @@ const { runStreamingBench } = await import('../src/testing/streaming-bench')
 const args = process.argv.slice(2)
 const json = args.includes('--json')
 const tokens = Number(args.find((arg) => /^\d+$/.test(arg)) ?? 2000)
+const toolEvery = args.includes('--no-tools') ? 0 : undefined
 
 // One warm-up run so the first-call costs (module init, JIT) stay out of it.
 await runStreamingBench({ tokens: 200, historyTurns: 2 })
-const result = await runStreamingBench({ tokens })
+const result = await runStreamingBench({ tokens, toolEvery })
 
 if (json) {
   console.log(JSON.stringify(result, null, 2))
