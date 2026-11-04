@@ -12,8 +12,11 @@
  * `clean_model_name` in rust/crates/rusty-claude-cli/src/gateway_catalog.rs;
  * the engine sends names already cleaned (`model_display_name`,
  * `served_model_display_name`), and this cleans the catalog's and older
- * engines' names the same way.
+ * engines' names the same way. Two catalog models whose names are then the
+ * same are told apart by a number ({@link sameNameSuffixes}).
  */
+
+import type { ModelInfo } from '../engine/protocol'
 
 /** What a display name's last parenthesis holds when it names the route, not the model. */
 const ROUTE_WORDS: ReadonlySet<string> = new Set([
@@ -83,6 +86,42 @@ export function cleanModelName(
   if (name) return withoutRoute(name, provider)
   const leaf = shown.split('/').pop()!.split(':')[0]!
   return leaf || shown
+}
+
+type NamedModel = Pick<ModelInfo, 'id' | 'display_name' | 'provider'>
+
+const suffixCache = new WeakMap<ReadonlyArray<NamedModel>, Map<string, string>>()
+
+/**
+ * What tells a catalog's models apart when their names are the same without
+ * the route ("GPT-OSS 20B (Groq)" and "GPT-OSS 20B (NVIDIA)" are both
+ * "GPT-OSS 20B"): nothing for the first in catalog order, then " (2)",
+ * " (3)", ..., which do not name the route either. By catalog id; a model
+ * whose name no earlier one has is left out.
+ */
+export function sameNameSuffixes(models: ReadonlyArray<NamedModel>): Map<string, string> {
+  const cached = suffixCache.get(models)
+  if (cached) return cached
+  const seen = new Map<string, number>()
+  const suffixes = new Map<string, string>()
+  for (const model of models) {
+    const key = cleanModelName(model.id, model.display_name, model.provider).toLowerCase()
+    const count = (seen.get(key) ?? 0) + 1
+    seen.set(key, count)
+    if (count > 1) suffixes.set(model.id, ` (${count})`)
+  }
+  suffixCache.set(models, suffixes)
+  return suffixes
+}
+
+/** `name` for catalog model `id`, with its {@link sameNameSuffixes} suffix when it has one. */
+export function distinctModelName(
+  models: ReadonlyArray<NamedModel> | null | undefined,
+  id: string | null | undefined,
+  name: string,
+): string {
+  if (!models || !id) return name
+  return name + (sameNameSuffixes(models).get(id) ?? '')
 }
 
 /** Routes that resell other makers' models: their monogram would name the route. */

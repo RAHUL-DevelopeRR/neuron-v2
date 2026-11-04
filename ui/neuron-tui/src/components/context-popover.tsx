@@ -39,7 +39,7 @@ import { accountRows, accountTitle, sessionTokens, updatedAgo } from '../utils/a
 import { breakdownRows, contextUsage, type BreakdownRow } from '../utils/context-breakdown'
 import { formatTokenCount } from '../utils/format-token-count'
 import { catalogModel, hasUsableZeroXLogin } from '../utils/status-bar-parts'
-import { cleanModelName } from '../utils/model-name'
+import { cleanModelName, distinctModelName } from '../utils/model-name'
 import { BORDER_CHARS } from '../utils/ui-constants'
 
 import type { StatusEvent } from '../engine/protocol'
@@ -73,10 +73,14 @@ export function breakdownLine(row: BreakdownRow, width: number): string {
 /** The model by name, without the gateway's route to it (utils/model-name.ts). */
 function modelName(status: StatusEvent, models: ReturnType<typeof useEngineStore.getState>['models']): string {
   const model = catalogModel(models, status.model)
-  return cleanModelName(
-    status.model,
-    status.model_display_name ?? model?.display_name,
-    status.provider ?? model?.provider,
+  return distinctModelName(
+    models?.models,
+    model?.id,
+    cleanModelName(
+      status.model,
+      status.model_display_name ?? model?.display_name,
+      status.provider ?? model?.provider,
+    ),
   )
 }
 

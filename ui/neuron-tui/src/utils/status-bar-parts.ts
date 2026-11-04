@@ -24,7 +24,7 @@ import stringWidth from 'string-width'
 import { meterCells, meterTone, displayPercent } from '../components/context-meter'
 import { needsSignIn } from '../state/engine-store'
 import { contextUsage } from './context-breakdown'
-import { cleanModelName, isAutoModel, modelMaker } from './model-name'
+import { cleanModelName, distinctModelName, isAutoModel, modelMaker } from './model-name'
 import { providerBadge } from './provider-badge'
 
 import type { GlyphMode } from './glyphs'
@@ -302,15 +302,24 @@ export function statusView({
   const glyphs = statusGlyphs(mode)
   const model = catalogModel(models, status.model)
   const provider = status.provider ?? model?.provider ?? null
-  const name = cleanModelName(status.model, status.model_display_name ?? model?.display_name, provider)
+  // Numbered as in the picker when another catalog model has the same name.
+  const name = distinctModelName(
+    models?.models,
+    model?.id,
+    cleanModelName(status.model, status.model_display_name ?? model?.display_name, provider),
+  )
   const served = status.served_model
   const servedModel = served ? catalogModel(models, served) : null
   const servedName =
     served && served !== status.model
-      ? cleanModelName(
-          served,
-          status.served_model_display_name ?? servedModel?.display_name,
-          servedModel?.provider,
+      ? distinctModelName(
+          models?.models,
+          servedModel?.id,
+          cleanModelName(
+            served,
+            status.served_model_display_name ?? servedModel?.display_name,
+            servedModel?.provider,
+          ),
         )
       : null
   // `auto` is Zero-X's router: its mark, whichever model answered.

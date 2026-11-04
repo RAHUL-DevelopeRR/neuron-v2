@@ -31,7 +31,7 @@ import { useEngineStore } from '../state/engine-store'
 import { formatElapsedTime } from '../utils/format-elapsed-time'
 import { formatTokenCount } from '../utils/format-token-count'
 import { logger } from '../utils/logger'
-import { cleanModelName } from '../utils/model-name'
+import { cleanModelName, distinctModelName } from '../utils/model-name'
 import { DEFAULT_REASONING_EFFORTS, effortLabel } from '../utils/status-bar-parts'
 import { BORDER_CHARS } from '../utils/ui-constants'
 
@@ -80,8 +80,8 @@ const isCurrentModel = (id: string, current: string): boolean =>
 /**
  * The picker's rows: name, then context window, plans, the gateway's health,
  * or why it's unavailable. `now` dates a blurred model's return. Names leave
- * out the route the gateway takes to a model (utils/model-name.ts), and the
- * raw id is not shown: `/status` has it.
+ * out the route the gateway takes to a model (utils/model-name.ts), two that
+ * are then the same get a number, and the raw id is not shown: `/status` has it.
  */
 export function modelRows(models: ModelsEvent | null, now: number = Date.now()): ModelRow[] {
   if (!models) return []
@@ -116,7 +116,11 @@ export function modelRows(models: ModelsEvent | null, now: number = Date.now()):
             : null
     return {
       id: model.id,
-      label: cleanModelName(model.id, model.display_name, model.provider),
+      label: distinctModelName(
+        models.models,
+        model.id,
+        cleanModelName(model.id, model.display_name, model.provider),
+      ),
       detail: details.join(' · '),
       available: model.available && !blurred,
       current: isCurrentModel(model.id, models.current),

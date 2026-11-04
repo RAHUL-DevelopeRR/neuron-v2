@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { cleanModelName, isAutoModel } from '../model-name'
+import { cleanModelName, distinctModelName, isAutoModel, sameNameSuffixes } from '../model-name'
 
 // The same cases as gateway_catalog.rs's
 // `model_names_leave_out_the_route_to_the_model`: the two must agree.
@@ -32,6 +32,26 @@ describe('model names', () => {
     expect(cleanModelName('openai/auto')).toBe('Auto')
     expect(isAutoModel('openai/auto')).toBe(true)
     expect(isAutoModel('gemini/gemini-2.5-flash')).toBe(false)
+  })
+
+  test('number catalog models whose names are the same, in catalog order, without naming the route', () => {
+    const catalog = [
+      { id: 'groq/openai/gpt-oss-20b', display_name: 'GPT-OSS 20B (Groq)', provider: 'groq' },
+      { id: 'gemini/gemini-2.5-flash', display_name: 'Gemini 2.5 Flash', provider: 'gemini' },
+      { id: 'nvidia/openai/gpt-oss-20b', display_name: 'GPT-OSS 20B (NVIDIA)', provider: 'nvidia' },
+      { id: 'y/gpt-oss-20b', display_name: 'gpt-oss 20b', provider: null },
+    ]
+    expect([...sameNameSuffixes(catalog)]).toEqual([
+      ['nvidia/openai/gpt-oss-20b', ' (2)'],
+      ['y/gpt-oss-20b', ' (3)'],
+    ])
+    // The same catalog gives the same answer (it is kept, not worked out again).
+    expect(sameNameSuffixes(catalog)).toBe(sameNameSuffixes(catalog))
+    expect(distinctModelName(catalog, 'nvidia/openai/gpt-oss-20b', 'GPT-OSS 20B')).toBe('GPT-OSS 20B (2)')
+    expect(distinctModelName(catalog, 'groq/openai/gpt-oss-20b', 'GPT-OSS 20B')).toBe('GPT-OSS 20B')
+    expect(distinctModelName(catalog, 'not/in-catalog', 'X')).toBe('X')
+    expect(distinctModelName(null, 'nvidia/openai/gpt-oss-20b', 'GPT-OSS 20B')).toBe('GPT-OSS 20B')
+    expect(distinctModelName(catalog, undefined, 'GPT-OSS 20B')).toBe('GPT-OSS 20B')
   })
 
   test('without a display name, use the model part of the id', () => {

@@ -208,6 +208,35 @@ describe('model picker', () => {
     expect(rows[0]!.id).toBe('cohere/north-mini-code:free')
   })
 
+  test('two models with the same name once the route is left out are told apart by a number', () => {
+    const base = MODELS.models[0]!
+    const rows = modelRows({
+      ...MODELS,
+      current: 'nvidia/openai/gpt-oss-20b',
+      models: [
+        { ...base, id: 'groq/openai/gpt-oss-20b', display_name: 'GPT-OSS 20B (Groq)', provider: 'groq' },
+        { ...base, id: 'nvidia/openai/gpt-oss-20b', display_name: 'GPT-OSS 20B (NVIDIA)', provider: 'nvidia' },
+        { ...base, id: 'groq/openai/gpt-oss-120b', display_name: 'GPT-OSS 120B (Groq)', provider: 'groq' },
+        { ...base, id: '@cf/openai/gpt-oss-120b', display_name: 'GPT-OSS 120B (Workers AI)', provider: 'cloudflare' },
+        { ...base, id: 'x/gpt-oss-120b', display_name: 'gpt-oss 120b (NVIDIA NIM)', provider: 'nvidia' },
+      ],
+    })
+    expect(rows.map((row) => row.label)).toEqual([
+      'GPT-OSS 20B',
+      'GPT-OSS 20B (2)',
+      'GPT-OSS 120B',
+      'GPT-OSS 120B (2)',
+      'gpt-oss 120b (3)',
+    ])
+    expect(new Set(rows.map((row) => row.label)).size).toBe(rows.length)
+    for (const row of rows) expect(row.label).not.toMatch(/groq|nvidia|workers|cloudflare|\//i)
+    // The number stays with the model, in what Enter says and as the current one.
+    expect(rows[1]!.current).toBe(true)
+    expect(unavailableMessage({ ...rows[1]!, unavailableReason: 'needs a plan upgrade' })).toBe(
+      "GPT-OSS 20B (2) can't be picked: needs a plan upgrade.",
+    )
+  })
+
   test('the current model matches with the engine’s openai/ wire prefix too', () => {
     const rows = modelRows({ ...MODELS, current: 'openai/zx-fast' })
     expect(rows.map((row) => row.current)).toEqual([true, false])

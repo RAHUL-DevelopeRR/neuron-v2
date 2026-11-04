@@ -203,6 +203,39 @@ describe('segments', () => {
     expect(bare.startsWith('◇ Auto → north-mini-code ▾')).toBe(true)
   })
 
+  test('a model whose name another catalog model has is numbered as in the picker', () => {
+    const base = STATUS_BAR_MODELS.models[1]!
+    const models = {
+      ...STATUS_BAR_MODELS,
+      models: [
+        ...STATUS_BAR_MODELS.models,
+        { ...base, id: 'groq/openai/gpt-oss-20b', display_name: 'GPT-OSS 20B (Groq)', provider: 'groq' },
+        { ...base, id: 'nvidia/openai/gpt-oss-20b', display_name: 'GPT-OSS 20B (NVIDIA)', provider: 'nvidia' },
+      ],
+    }
+    const served = (id: string) =>
+      render(
+        input(
+          { model: 'auto', provider: 'zero-x', model_display_name: 'Auto', served_model: id, served_model_display_name: 'GPT-OSS 20B' },
+          'unicode',
+          { models },
+        ),
+        200,
+      )
+    expect(served('groq/openai/gpt-oss-20b').startsWith('◇ Auto → GPT-OSS 20B ▾')).toBe(true)
+    expect(served('nvidia/openai/gpt-oss-20b').startsWith('◇ Auto → GPT-OSS 20B (2) ▾')).toBe(true)
+    const picked = render(
+      input(
+        { model: 'nvidia/openai/gpt-oss-20b', provider: 'nvidia', model_display_name: 'GPT-OSS 20B' },
+        'unicode',
+        { models },
+      ),
+      200,
+    )
+    expect(picked).toContain('GPT-OSS 20B (2) ▾')
+    expect(picked).not.toMatch(/nvidia|groq/i)
+  })
+
   test('no part names the provider, only its monogram', () => {
     for (const provider of ['anthropic', 'openai', 'gemini', 'groq']) {
       const text = render(input({ provider, model_display_name: 'Model X' }), 200)
