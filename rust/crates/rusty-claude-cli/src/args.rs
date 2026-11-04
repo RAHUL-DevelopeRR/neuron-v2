@@ -107,6 +107,7 @@ pub(crate) enum CliAction {
         model: String,
         permission_mode: PermissionMode,
         output_format: CliOutputFormat,
+        allow_broad_cwd: bool,
     },
     HelpTopic(LocalHelpTopic),
     // prompt-mode formatting is only supported for non-interactive runs
@@ -653,6 +654,7 @@ pub(crate) fn parse_args_with_stdin(
             model,
             permission_mode,
             output_format,
+            allow_broad_cwd,
         }),
         "export" => parse_export_args(&rest[1..], output_format),
         "prompt" => {

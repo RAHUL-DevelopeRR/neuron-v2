@@ -637,7 +637,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             model,
             permission_mode,
             output_format,
-        } => run_research_command(&words, model, permission_mode, output_format)?,
+            allow_broad_cwd,
+        } => run_research_command(
+            &words,
+            model,
+            permission_mode,
+            output_format,
+            allow_broad_cwd,
+        )?,
         CliAction::Export {
             session_reference,
             output_path,
@@ -1781,25 +1788,27 @@ fn detect_broad_cwd() -> Option<PathBuf> {
     }
 }
 
-/// Enforce the broad-CWD policy: when running from home or root, either
-/// require the --allow-broad-cwd flag, or prompt for confirmation (interactive),
-/// or exit with an error (non-interactive).
 /// `neuron research "<question>"`: a research run for scripts. Nobody is there to
 /// approve web reads, so it refuses to start, before any model call, unless
-/// `--allow-web` or `permissions.allow` rules let `WebSearch` run. The report goes
-/// to stdout (and `.neuron/research/`); progress to stderr. Exits 1 when no page
-/// could be read.
+/// `--allow-web` or `permissions.allow` rules let `WebSearch` run. Run from the home
+/// folder or a root it needs `--allow-broad-cwd` (or a yes on a terminal), as a
+/// prompt does. The session's tool hooks run for its searches and reads, and Ctrl-C
+/// interrupts it (the report is written from the notes so far). The report goes to
+/// stdout (and `.neuron/research/`); progress to stderr. Exits 1 when no page could
+/// be read.
 fn run_research_command(
     words: &[String],
     model: String,
     permission_mode: PermissionMode,
     output_format: CliOutputFormat,
+    allow_broad_cwd: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if matches!(words, [word] if is_help_flag(word) || word == "help") {
         println!("Usage: {}", research::RESEARCH_CLI_USAGE);
         return Ok(());
     }
     let args = research::parse_research_args(words, true).map_err(UsageError)?;
+    enforce_broad_cwd_policy(allow_broad_cwd, output_format)?;
     if runtime::ui_hooks::stdin_is_terminal() {
         let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         if let Some(code) = crate::auth::check_trust(&cwd).exit_code() {
@@ -1900,6 +1909,9 @@ fn session_hook_runner(
     )))
 }
 
+/// Enforce the broad-CWD policy: when running from home or root, either
+/// require the --allow-broad-cwd flag, or prompt for confirmation (interactive),
+/// or exit with an error (non-interactive).
 fn enforce_broad_cwd_policy(
     allow_broad_cwd: bool,
     output_format: CliOutputFormat,
@@ -3542,9 +3554,10 @@ impl LiveCli {
                 self.run_ultraplan(task.as_deref())?;
                 false
             }
+            // The report joins the conversation: save it at once.
             SlashCommand::Research { args } => {
                 self.run_research(args.as_deref())?;
-                false
+                true
             }
             SlashCommand::Teleport { target } => {
                 Self::run_teleport(target.as_deref())?;
@@ -7119,8 +7132,10 @@ mod tests {
         let Ok(CliAction::Research {
             words: research_words,
             output_format,
+            allow_broad_cwd,
             ..
         }) = parse_args(&words(&[
+            "--allow-broad-cwd",
             "--output-format",
             "json",
             "research",
@@ -7132,6 +7147,7 @@ mod tests {
             panic!("neuron research should parse as a research run");
         };
         assert_eq!(output_format, CliOutputFormat::Json);
+        assert!(allow_broad_cwd, "the broad-folder flag reaches the research run");
         assert_eq!(
             research_words,
             words(&["--depth", "quick", "what changed in Rust 1.91?"])
