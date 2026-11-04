@@ -152,9 +152,9 @@ fn take_text(pending: &mut Vec<u8>, last: bool) -> String {
         pending.len()
     } else {
         match std::str::from_utf8(pending) {
-            Ok(_) => pending.len(),
             Err(error) if error.error_len().is_none() => error.valid_up_to(),
-            Err(_) => pending.len(),
+            // Valid, or invalid bytes that more output cannot complete.
+            _ => pending.len(),
         }
     };
     let bytes: Vec<u8> = pending.drain(..complete).collect();
