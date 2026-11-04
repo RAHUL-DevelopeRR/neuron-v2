@@ -80,6 +80,7 @@ mod reports;
 mod session_mgmt;
 mod session_presence;
 mod shell_pty;
+mod skill_registry;
 mod source_control;
 mod status_ui;
 mod stream_buffer;
@@ -477,6 +478,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     ));
     // Remote MCP servers' OAuth tokens: the OS keychain (or a 0600 file).
     mcp_auth::install_token_store();
+    // `skills search` and installs from the registry or GitHub.
+    commands::set_skill_remote(Box::new(skill_registry::HttpSkillRemote::from_env()));
     let args: Vec<String> = env::args().skip(1).collect();
     let (args, provider_choice) = extract_provider_flag(&args).map_err(UsageError)?;
     provider::set_provider_flag(provider_choice);
@@ -6875,11 +6878,31 @@ mod tests {
             (vec!["plugins"], None, None),
             (vec!["plugins", "list"], Some("list"), None),
             (vec!["plugin", "help"], Some("help"), None),
-            (vec!["plugins", "install", "./kit"], Some("install"), Some("./kit")),
-            (vec!["plugins", "enable", "kit"], Some("enable"), Some("kit")),
-            (vec!["plugins", "disable", "kit"], Some("disable"), Some("kit")),
-            (vec!["plugins", "update", "kit"], Some("update"), Some("kit")),
-            (vec!["plugins", "uninstall", "kit"], Some("uninstall"), Some("kit")),
+            (
+                vec!["plugins", "install", "./kit"],
+                Some("install"),
+                Some("./kit"),
+            ),
+            (
+                vec!["plugins", "enable", "kit"],
+                Some("enable"),
+                Some("kit"),
+            ),
+            (
+                vec!["plugins", "disable", "kit"],
+                Some("disable"),
+                Some("kit"),
+            ),
+            (
+                vec!["plugins", "update", "kit"],
+                Some("update"),
+                Some("kit"),
+            ),
+            (
+                vec!["plugins", "uninstall", "kit"],
+                Some("uninstall"),
+                Some("kit"),
+            ),
         ] {
             assert_eq!(
                 parse_args(&words(&args)),
@@ -6927,7 +6950,7 @@ mod tests {
         // The quoting hint first, and no list of every skill.
         assert!(
             error.starts_with(
-                "`skills` runs a skill (`neuron skills [list|install <path>|help|<skill> [args]]`), and there is no skill named `that`. To send a prompt"
+                "`skills` runs a skill (`neuron skills [list|search <query>|install <source>|help|<skill> [args]]`), and there is no skill named `that`. To send a prompt"
             ),
             "{error}"
         );
@@ -9603,7 +9626,7 @@ UU conflicted.rs",
         assert!(!listed.contains("plan"), "{resume_line}");
         // Running a skill needs a live session, and `/context clear` is refused.
         assert!(
-            resume_line.contains("/skills [list|install <path>|help],"),
+            resume_line.contains("/skills [list|search <query>|install <source>|help],"),
             "{resume_line}"
         );
         assert!(resume_line.contains("/context [show],"), "{resume_line}");

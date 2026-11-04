@@ -105,6 +105,84 @@ fn inventory_commands_emit_structured_json_when_requested() {
     assert_eq!(skills["action"], "list");
 }
 
+/// `neuron skills search` and `neuron skills install owner/repo/skill` talk to the
+/// registry named by `NEURON_SKILL_REGISTRY_URL` (here a one-file server) and install
+/// into Neuron's skills folder; `neuron skills` then lists the new skill.
+#[test]
+fn skills_search_and_install_from_a_registry() {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let base = format!("http://{}", listener.local_addr().expect("addr"));
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+            let mut request = String::new();
+            let _ = reader.read_line(&mut request);
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() || line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            let body = if request.contains("/api/search") {
+                r#"{"skills":[{"skillId":"triage","name":"triage","source":"acme/tools","installs":12}]}"#
+            } else if request.contains("/api/download/acme/tools/triage") {
+                r#"{"files":[{"path":"SKILL.md","contents":"---\nname: triage\ndescription: Sort new issues\n---\nSteps.\n"}]}"#
+            } else {
+                "{}"
+            };
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        }
+    });
+    let root = unique_temp_dir("skills-registry");
+    fs::create_dir_all(&root).expect("root");
+    let config_home = root.join("config-home");
+    let envs = [
+        ("NEURON_CONFIG_HOME", config_home.to_str().expect("utf8")),
+        ("NEURON_SKILL_REGISTRY_URL", base.as_str()),
+    ];
+
+    let found = assert_json_command_with_env(
+        &root,
+        &["--output-format", "json", "skills", "search", "issue", "triage"],
+        &envs,
+    );
+    assert_eq!(found["action"], "search");
+    assert_eq!(found["query"], "issue triage");
+    assert_eq!(found["results"][0]["id"], "acme/tools/triage");
+
+    let installed = assert_json_command_with_env(
+        &root,
+        &["--output-format", "json", "skills", "install", "acme/tools/triage"],
+        &envs,
+    );
+    assert_eq!(installed["invocation_name"], "triage");
+    assert!(config_home
+        .join("skills")
+        .join("triage")
+        .join("SKILL.md")
+        .is_file());
+
+    let listed =
+        assert_json_command_with_env(&root, &["--output-format", "json", "skills"], &envs);
+    assert!(
+        listed["skills"]
+            .as_array()
+            .expect("skills")
+            .iter()
+            .any(|skill| skill["name"] == "triage"),
+        "{listed}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
 /// `neuron plugins ...` runs the plugin manager without a session or a model call:
 /// install from a folder, list, disable, enable and uninstall, each in its own run.
 /// Words that are no action print the usage and fail.
@@ -142,8 +220,14 @@ fn plugins_subcommand_manages_plugins_without_a_session() {
     assert_eq!(installed["kind"], "plugin");
     assert_eq!(installed["action"], "install");
     let message = installed["message"].as_str().expect("message");
-    assert!(message.contains("installed tracker-kit@external"), "{message}");
-    assert!(message.contains("tracker (wait for your approval"), "{message}");
+    assert!(
+        message.contains("installed tracker-kit@external"),
+        "{message}"
+    );
+    assert!(
+        message.contains("tracker (wait for your approval"),
+        "{message}"
+    );
     assert!(message.contains("1 folder(s)"), "{message}");
 
     let listed = run(&["--output-format", "json", "plugins", "list"]);
@@ -151,7 +235,13 @@ fn plugins_subcommand_manages_plugins_without_a_session() {
     assert!(message.contains("tracker-kit"), "{message}");
     assert!(message.contains("enabled"), "{message}");
 
-    let disabled = run(&["--output-format", "json", "plugins", "disable", "tracker-kit"]);
+    let disabled = run(&[
+        "--output-format",
+        "json",
+        "plugins",
+        "disable",
+        "tracker-kit",
+    ]);
     assert!(disabled["message"]
         .as_str()
         .expect("message")
@@ -159,11 +249,26 @@ fn plugins_subcommand_manages_plugins_without_a_session() {
     let mcp = run(&["--output-format", "json", "mcp"]);
     assert_eq!(mcp["needs_approval_servers"], serde_json::json!([]));
 
-    run(&["--output-format", "json", "plugins", "enable", "tracker-kit"]);
+    run(&[
+        "--output-format",
+        "json",
+        "plugins",
+        "enable",
+        "tracker-kit",
+    ]);
     let mcp = run(&["--output-format", "json", "mcp"]);
-    assert_eq!(mcp["needs_approval_servers"], serde_json::json!(["tracker"]));
+    assert_eq!(
+        mcp["needs_approval_servers"],
+        serde_json::json!(["tracker"])
+    );
 
-    let removed = run(&["--output-format", "json", "plugins", "uninstall", "tracker-kit"]);
+    let removed = run(&[
+        "--output-format",
+        "json",
+        "plugins",
+        "uninstall",
+        "tracker-kit",
+    ]);
     assert!(removed["message"]
         .as_str()
         .expect("message")

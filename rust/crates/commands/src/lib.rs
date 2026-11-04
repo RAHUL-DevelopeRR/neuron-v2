@@ -7,11 +7,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use plugins::{PluginError, PluginLoadFailure, PluginManager, PluginSummary};
+
+mod skill_sources;
+
 use runtime::{
     compact_session, CompactionConfig, ConfigLoader, ConfigSource, McpOAuthConfig, McpServerConfig,
     ScopedMcpServerConfig, Session,
 };
 use serde_json::{json, Value};
+pub use skill_sources::{
+    parse_download_response, parse_remote_skill_source, parse_search_response,
+    select_skill_package, set_skill_remote, RemoteSkillSource, SkillFile, SkillRemote,
+    SkillSearchHit, MAX_SKILL_BYTES, MAX_SKILL_FILES,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandManifestEntry {
@@ -249,7 +257,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         name: "skills",
         aliases: &["skill"],
         summary: "List, install, or invoke available skills",
-        argument_hint: Some("[list|install <path>|help|<skill> [args]]"),
+        argument_hint: Some("[list|search <query>|install <source>|help|<skill> [args]]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -1825,11 +1833,25 @@ fn parse_skills_args(args: Option<&str>) -> Result<Option<String>, SlashCommandP
         return Ok(Some(args.to_string()));
     }
 
+    if args == "search" {
+        return Err(command_error(
+            "Usage: /skills search <query>",
+            "skills",
+            "/skills search <query>",
+        ));
+    }
+
+    if let Some(query) = args.strip_prefix("search ").map(str::trim) {
+        if !query.is_empty() {
+            return Ok(Some(format!("search {query}")));
+        }
+    }
+
     if args == "install" {
         return Err(command_error(
-            "Usage: /skills install <path>",
+            "Usage: /skills install <source>",
             "skills",
-            "/skills install <path>",
+            "/skills install <source>",
         ));
     }
 
@@ -2447,6 +2469,11 @@ enum SkillsCommandOutcome {
     Usage(Option<String>),
     List(Vec<SkillSummary>),
     Installed(InstalledSkill),
+    /// `search <query>`: the registry's hits.
+    Search {
+        query: String,
+        hits: Vec<SkillSearchHit>,
+    },
 }
 
 impl SkillsCommandOutcome {
@@ -2455,6 +2482,7 @@ impl SkillsCommandOutcome {
             Self::Usage(unexpected) => render_skills_usage(unexpected.as_deref()),
             Self::List(skills) => render_skills_report(skills),
             Self::Installed(skill) => render_skill_install_report(skill),
+            Self::Search { query, hits } => render_skill_search_report(query, hits),
         }
     }
 
@@ -2463,6 +2491,7 @@ impl SkillsCommandOutcome {
             Self::Usage(unexpected) => render_skills_usage_json(unexpected.as_deref()),
             Self::List(skills) => render_skills_report_json(skills),
             Self::Installed(skill) => render_skill_install_report_json(skill),
+            Self::Search { query, hits } => render_skill_search_report_json(query, hits),
         }
     }
 }
@@ -2471,17 +2500,54 @@ fn run_skills_slash_command(
     args: Option<&str>,
     cwd: &Path,
 ) -> std::io::Result<SkillsCommandOutcome> {
+    run_skills_slash_command_with(args, cwd, skill_sources::skill_remote())
+}
+
+/// `/skills` with `remote` for searches and installs that are not a local path.
+fn run_skills_slash_command_with(
+    args: Option<&str>,
+    cwd: &Path,
+    remote: &dyn SkillRemote,
+) -> std::io::Result<SkillsCommandOutcome> {
     if let Some(args) = normalize_optional_args(args) {
         if let Some(help_path) = help_path_from_args(args) {
             return Ok(SkillsCommandOutcome::Usage(match help_path.as_slice() {
                 [] => None,
                 ["install", ..] => Some("install".to_string()),
+                ["search", ..] => Some("search".to_string()),
                 _ => Some(help_path.join(" ")),
             }));
         }
     }
 
     Ok(match normalize_optional_args(args) {
+        Some("search") => SkillsCommandOutcome::Usage(Some("search".to_string())),
+        Some(args) if args.starts_with("search ") => {
+            let query = args["search ".len()..].trim();
+            if query.chars().count() < 2 {
+                SkillsCommandOutcome::Usage(Some("search".to_string()))
+            } else {
+                let hits = remote.search(query).map_err(std::io::Error::other)?;
+                SkillsCommandOutcome::Search {
+                    query: query.to_string(),
+                    hits,
+                }
+            }
+        }
+        Some(args)
+            if args.starts_with("install ")
+                && is_remote_install(&args["install ".len()..], cwd) =>
+        {
+            let target = args["install ".len()..].trim();
+            let source = parse_remote_skill_source(target).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, target.to_string())
+            })?;
+            SkillsCommandOutcome::Installed(skill_sources::install_remote_skill(
+                &source,
+                remote,
+                &default_skill_install_root(),
+            )?)
+        }
         None | Some("list") => {
             let roots = discover_skill_roots(cwd);
             SkillsCommandOutcome::List(load_skills_from_roots(&roots)?)
@@ -2517,11 +2583,29 @@ pub fn handle_skills_slash_command_with_json(
     Ok((outcome.render(), outcome.render_json()))
 }
 
+/// Whether `install <target>` fetches the skill: `target` is no local file or folder
+/// and reads as a registry or GitHub source.
+fn is_remote_install(target: &str, cwd: &Path) -> bool {
+    let target = target.trim();
+    let local = Path::new(target);
+    let exists = if local.is_absolute() {
+        local.exists()
+    } else {
+        cwd.join(local).exists()
+    };
+    !exists && parse_remote_skill_source(target).is_some()
+}
+
 #[must_use]
 pub fn classify_skills_slash_command(args: Option<&str>) -> SkillSlashDispatch {
     match normalize_optional_args(args) {
         None | Some("list" | "help" | "-h" | "--help") => SkillSlashDispatch::Local,
-        Some(args) if args == "install" || args.starts_with("install ") => {
+        Some(args)
+            if args == "install"
+                || args.starts_with("install ")
+                || args == "search"
+                || args.starts_with("search ") =>
+        {
             SkillSlashDispatch::Local
         }
         Some(args) => SkillSlashDispatch::Invoke(format!("${}", args.trim_start_matches('/'))),
@@ -2558,7 +2642,9 @@ pub fn resolve_skill_invocation(
                         message.push_str(&names.join(", "));
                     }
                 }
-                message.push_str("\n  Usage: /skills [list|install <path>|help|<skill> [args]]");
+                message.push_str(
+                    "\n  Usage: /skills [list|search <query>|install <source>|help|<skill> [args]]",
+                );
                 return Err(message);
             }
         }
@@ -2716,8 +2802,11 @@ fn render_mcp_report_json_for(
             let mut report = render_mcp_summary_report_json(cwd, runtime_config.mcp().servers());
             report["disabled_servers"] =
                 json!(runtime_config.mcp().disabled().keys().collect::<Vec<_>>());
-            report["needs_approval_servers"] =
-                json!(runtime_config.mcp().needs_approval().keys().collect::<Vec<_>>());
+            report["needs_approval_servers"] = json!(runtime_config
+                .mcp()
+                .needs_approval()
+                .keys()
+                .collect::<Vec<_>>());
             Ok(report)
         }
         Some(args) if is_help_arg(args) => Ok(render_mcp_usage_json(None)),
@@ -3179,7 +3268,12 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
     }
 
     for dir in plugin_skill_dirs(cwd) {
-        push_unique_skill_root(&mut roots, DefinitionSource::Plugin, dir, SkillOrigin::SkillsDir);
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::Plugin,
+            dir,
+            SkillOrigin::SkillsDir,
+        );
     }
 
     roots
@@ -3767,6 +3861,44 @@ fn render_skill_install_report(skill: &InstalledSkill) -> String {
     lines.join("\n")
 }
 
+fn render_skill_search_report(query: &str, hits: &[SkillSearchHit]) -> String {
+    let mut lines = vec![format!("Skills search: {query}")];
+    if hits.is_empty() {
+        lines.push("  No skills found in the skills.sh registry.".to_string());
+        return lines.join("\n");
+    }
+    for hit in hits {
+        lines.push(format!(
+            "  {:<28} {:>9} installs   install: neuron skills install {}",
+            hit.name, hit.installs, hit.id
+        ));
+    }
+    lines.push(String::new());
+    lines.push(
+        "  From the public skills.sh registry. Skills are instructions the agent follows, and these are not reviewed: read one before you use it.".to_string(),
+    );
+    lines.join("\n")
+}
+
+fn render_skill_search_report_json(query: &str, hits: &[SkillSearchHit]) -> Value {
+    json!({
+        "kind": "skills",
+        "action": "search",
+        "query": query,
+        "registry": "skills.sh",
+        "results": hits
+            .iter()
+            .map(|hit| json!({
+                "id": &hit.id,
+                "name": &hit.name,
+                "slug": &hit.slug,
+                "source": &hit.source,
+                "installs": hit.installs,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
 fn render_skill_install_report_json(skill: &InstalledSkill) -> Value {
     json!({
         "kind": "skills",
@@ -3970,10 +4102,12 @@ fn render_agents_usage_json(unexpected: Option<&str>) -> Value {
 fn render_skills_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "Skills".to_string(),
-        "  Usage            /skills [list|install <path>|help|<skill> [args]]".to_string(),
+        "  Usage            /skills [list|search <query>|install <source>|help|<skill> [args]]".to_string(),
         "  Alias            /skill".to_string(),
-        "  Direct CLI       neuron skills [list|install <path>|help|<skill> [args]]".to_string(),
+        "  Direct CLI       neuron skills [list|search <query>|install <source>|help|<skill> [args]]".to_string(),
         "  Invoke           /skills help overview -> $help overview".to_string(),
+        "  Install from     a local folder or .md file; a skills.sh registry skill (owner/repo/skill, or its name); github:owner/repo/path[@ref]".to_string(),
+        "  Search           /skills search <query> (the public skills.sh registry; skills there are not reviewed)".to_string(),
         "  Install root     ~/.neuron/skills".to_string(),
         "  Sources          .neuron/skills, ~/.neuron/skills, .agents/skills, bundled skills, enabled plugins' skills".to_string(),
     ];
@@ -3988,10 +4122,16 @@ fn render_skills_usage_json(unexpected: Option<&str>) -> Value {
         "kind": "skills",
         "action": "help",
         "usage": {
-            "slash_command": "/skills [list|install <path>|help|<skill> [args]]",
+            "slash_command": "/skills [list|search <query>|install <source>|help|<skill> [args]]",
             "aliases": ["/skill"],
-            "direct_cli": "neuron skills [list|install <path>|help|<skill> [args]]",
+            "direct_cli": "neuron skills [list|search <query>|install <source>|help|<skill> [args]]",
             "invoke": "/skills help overview -> $help overview",
+            "install_sources": [
+                "a local folder with SKILL.md, or a .md file",
+                "owner/repo/skill or a skill name from the skills.sh registry",
+                "github:owner/repo/path[@ref]"
+            ],
+            "search": "/skills search <query>",
             "install_root": "~/.neuron/skills",
             "sources": [
                 ".neuron/skills",
@@ -4985,7 +5125,7 @@ mod tests {
         ));
         assert!(help.contains("aliases: /plugins, /marketplace"));
         assert!(help.contains("/agents [list|help]"));
-        assert!(help.contains("/skills [list|install <path>|help|<skill> [args]]"));
+        assert!(help.contains("/skills [list|search <query>|install <source>|help|<skill> [args]]"));
         assert!(help.contains("aliases: /skill"));
         assert!(help.contains("/login"));
         assert!(help.contains("/logout"));
@@ -5537,7 +5677,7 @@ mod tests {
         assert_eq!(help["usage"]["aliases"][0], "/skill");
         assert_eq!(
             help["usage"]["direct_cli"],
-            "neuron skills [list|install <path>|help|<skill> [args]]"
+            "neuron skills [list|search <query>|install <source>|help|<skill> [args]]"
         );
 
         let _ = fs::remove_dir_all(workspace);
@@ -5560,8 +5700,9 @@ mod tests {
 
         let skills_help =
             super::handle_skills_slash_command(Some("--help"), &cwd).expect("skills help");
-        assert!(skills_help
-            .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
+        assert!(skills_help.contains(
+            "Usage            /skills [list|search <query>|install <source>|help|<skill> [args]]"
+        ));
         assert!(skills_help.contains("Alias            /skill"));
         assert!(skills_help.contains("Invoke           /skills help overview -> $help overview"));
         assert!(skills_help.contains("Install root     ~/.neuron/skills"));
@@ -5579,15 +5720,17 @@ mod tests {
 
         let skills_install_help = super::handle_skills_slash_command(Some("install --help"), &cwd)
             .expect("nested skills help");
-        assert!(skills_install_help
-            .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
+        assert!(skills_install_help.contains(
+            "Usage            /skills [list|search <query>|install <source>|help|<skill> [args]]"
+        ));
         assert!(skills_install_help.contains("Alias            /skill"));
         assert!(skills_install_help.contains("Unexpected       install"));
 
         let skills_unknown_help =
             super::handle_skills_slash_command(Some("show --help"), &cwd).expect("skills help");
-        assert!(skills_unknown_help
-            .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
+        assert!(skills_unknown_help.contains(
+            "Usage            /skills [list|search <query>|install <source>|help|<skill> [args]]"
+        ));
         assert!(skills_unknown_help.contains("Unexpected       show"));
 
         let skills_help_json =
@@ -5599,7 +5742,10 @@ mod tests {
         assert!(sources.iter().any(|value| value == ".neuron/skills"));
         assert!(sources.iter().any(|value| value == "~/.neuron/skills"));
         assert!(sources.iter().any(|value| value == ".agents/skills"));
-        assert_eq!(skills_help_json["usage"]["install_root"], "~/.neuron/skills");
+        assert_eq!(
+            skills_help_json["usage"]["install_root"],
+            "~/.neuron/skills"
+        );
 
         let _ = fs::remove_dir_all(cwd);
     }
@@ -5967,9 +6113,21 @@ mod tests {
         std::env::set_var("NEURON_CONFIG_HOME", &config_home);
         std::env::set_var("HOME", workspace.join("home"));
         let project = workspace.join("project");
-        write_skill(&project.join(".neuron").join("skills"), "triage", "Neuron triage");
-        write_skill(&project.join(".claude").join("skills"), "triage", "Inherited triage");
-        write_skill(&project.join(".claude").join("skills"), "legacy-only", "Still read");
+        write_skill(
+            &project.join(".neuron").join("skills"),
+            "triage",
+            "Neuron triage",
+        );
+        write_skill(
+            &project.join(".claude").join("skills"),
+            "triage",
+            "Inherited triage",
+        );
+        write_skill(
+            &project.join(".claude").join("skills"),
+            "legacy-only",
+            "Still read",
+        );
         write_skill(&config_home.join("skills"), "release", "User release notes");
 
         let plugin = workspace.join("plugin-src");
@@ -6007,6 +6165,105 @@ mod tests {
 
         restore_env_var("NEURON_CONFIG_HOME", original_config);
         restore_env_var("HOME", original_home);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    /// A registry stand-in for `/skills search` and remote installs.
+    struct StubRemote;
+
+    impl super::SkillRemote for StubRemote {
+        fn search(&self, query: &str) -> Result<Vec<super::SkillSearchHit>, String> {
+            Ok(vec![super::SkillSearchHit {
+                id: format!("acme/tools/{query}"),
+                name: query.to_string(),
+                slug: query.to_string(),
+                source: "acme/tools".to_string(),
+                installs: 42,
+            }])
+        }
+        fn registry_download(
+            &self,
+            _source: &str,
+            slug: &str,
+        ) -> Result<Option<Vec<super::SkillFile>>, String> {
+            Ok(Some(vec![super::SkillFile {
+                path: "SKILL.md".to_string(),
+                contents: format!("---\nname: {slug}\ndescription: From the registry\n---\n")
+                    .into_bytes(),
+            }]))
+        }
+        fn github_files(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _path: &str,
+            _reference: Option<&str>,
+        ) -> Result<Vec<super::SkillFile>, String> {
+            Err("offline".to_string())
+        }
+    }
+
+    /// `search` lists registry hits with their install command; `install` fetches a
+    /// registry skill into Neuron's skills folder, but a local folder of the same
+    /// name wins; and `search` is never a skill invocation.
+    #[test]
+    fn skills_search_and_remote_install_use_the_remote() {
+        let _guard = env_guard();
+        let workspace = temp_dir("skills-remote");
+        let original = std::env::var_os("NEURON_CONFIG_HOME");
+        std::env::set_var("NEURON_CONFIG_HOME", workspace.join("config"));
+        fs::create_dir_all(&workspace).expect("workspace");
+
+        assert_eq!(
+            super::classify_skills_slash_command(Some("search docker")),
+            SkillSlashDispatch::Local
+        );
+        let outcome =
+            super::run_skills_slash_command_with(Some("search docker"), &workspace, &StubRemote)
+                .expect("search");
+        let text = outcome.render();
+        assert!(text.contains("Skills search: docker"), "{text}");
+        assert!(
+            text.contains("install: neuron skills install acme/tools/docker"),
+            "{text}"
+        );
+        assert!(text.contains("not reviewed"), "{text}");
+        assert_eq!(outcome.render_json()["results"][0]["installs"], 42);
+
+        let installed = super::run_skills_slash_command_with(
+            Some("install acme/tools/triage"),
+            &workspace,
+            &StubRemote,
+        )
+        .expect("install");
+        let json = installed.render_json();
+        assert_eq!(json["invocation_name"], "triage");
+        assert_eq!(json["source"], "skills.sh registry: acme/tools/triage");
+        assert!(workspace
+            .join("config")
+            .join("skills")
+            .join("triage")
+            .join("SKILL.md")
+            .is_file());
+
+        // A local folder that looks like a slug installs from disk, not the registry.
+        write_skill(&workspace, "local-notes", "From disk");
+        let local = super::run_skills_slash_command_with(
+            Some("install local-notes"),
+            &workspace,
+            &StubRemote,
+        )
+        .expect("local install")
+        .render_json();
+        assert!(
+            !local["source"]
+                .as_str()
+                .expect("source")
+                .contains("registry"),
+            "{local}"
+        );
+
+        restore_env_var("NEURON_CONFIG_HOME", original);
         let _ = fs::remove_dir_all(workspace);
     }
 

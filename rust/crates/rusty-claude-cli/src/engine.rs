@@ -1924,8 +1924,11 @@ impl Engine {
                 let loader = ConfigLoader::default_for(&cwd);
                 let config = loader.load()?;
                 let mut manager = build_plugin_manager(&cwd, &loader, &config);
-                let result =
-                    handle_plugins_slash_command(action.as_deref(), target.as_deref(), &mut manager)?;
+                let result = handle_plugins_slash_command(
+                    action.as_deref(),
+                    target.as_deref(),
+                    &mut manager,
+                )?;
                 if result.reload_runtime {
                     // The plugin's tools, hooks and skills count from the next turn.
                     let session = self.cli.runtime.session().clone();

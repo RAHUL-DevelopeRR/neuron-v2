@@ -614,12 +614,10 @@ pub(crate) fn parse_args_with_stdin(
                         allow_broad_cwd,
                     })
                 }
-                // `install` takes one path.
-                SkillSlashDispatch::Local if rest.len() > 3 => Err(subcommand_arguments_error(
-                    "skills",
-                    SKILLS_USAGE,
-                    &rest[1..],
-                )),
+                // `install` takes one source; `search` takes the rest as its query.
+                SkillSlashDispatch::Local if rest.len() > 3 && rest[1] != "search" => Err(
+                    subcommand_arguments_error("skills", SKILLS_USAGE, &rest[1..]),
+                ),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
                     output_format,
@@ -793,7 +791,10 @@ const PLUGINS_USAGE: &str = "neuron plugins [list|install <path>|enable <name>|d
 
 /// `neuron plugins [ACTION [TARGET]]`: the same actions as `/plugins`, run without a
 /// session. Words that are no action print the usage; they never become a prompt.
-fn parse_plugins_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
+fn parse_plugins_args(
+    args: &[String],
+    output_format: CliOutputFormat,
+) -> Result<CliAction, String> {
     let words = args.iter().map(String::as_str).collect::<Vec<_>>();
     if matches!(words.as_slice(), ["help" | "-h" | "--help"]) {
         return Ok(CliAction::Plugins {
@@ -816,7 +817,8 @@ fn parse_plugins_args(args: &[String], output_format: CliOutputFormat) -> Result
     }
 }
 
-const SKILLS_USAGE: &str = "neuron skills [list|install <path>|help|<skill> [args]]";
+const SKILLS_USAGE: &str =
+    "neuron skills [list|search <query>|install <source>|help|<skill> [args]]";
 
 /// How many skill names an unknown-skill error suggests.
 const SKILL_SUGGESTIONS: usize = 3;
@@ -1169,7 +1171,7 @@ pub(crate) fn resume_safe_slash_command(command_name: &str) -> bool {
 pub(crate) fn resume_argument_hint(spec: &commands::SlashCommandSpec) -> Option<&'static str> {
     match spec.name {
         // `/skills <skill> [args]` runs the skill as a model turn.
-        "skills" => Some("[list|install <path>|help]"),
+        "skills" => Some("[list|search <query>|install <source>|help]"),
         _ => spec.argument_hint,
     }
 }
