@@ -2284,6 +2284,89 @@ mod tests {
         });
     }
 
+    /// The bundled browser starts as `cmd.exe /d /s /c npx -y @playwright/mcp ...`
+    /// (no packaged entry). A project folder named `x&echo.INJECTED&rem` (no space, so
+    /// the argument is not quoted) once ran `echo.INJECTED` there, since the folder
+    /// was an argument; it now reaches the
+    /// server only through its environment. Started through Neuron's own spawn path,
+    /// with `echo` and `set` in place of `npx` so nothing is downloaded.
+    #[test]
+    #[cfg(windows)]
+    fn the_bundled_browser_start_command_survives_cmd_metacharacters_in_the_project_path() {
+        if std::env::var_os("NEURON_PLAYWRIGHT_MCP_ENTRY").is_some() {
+            return; // A packaged entry starts node directly, without cmd.exe.
+        }
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let root = temp_dir();
+        for folder in ["x&echo.INJECTED&rem", "my app & echo INJECTED ^& %PATH%"] {
+            let project = root.join(folder);
+            let config_home = root.join("config");
+            fs::create_dir_all(&project).expect("project folder");
+            fs::create_dir_all(&config_home).expect("config home");
+            let config = crate::ConfigLoader::new(&project, &config_home)
+                .load()
+                .expect("config");
+            let McpServerConfig::Stdio(server) = &config
+                .mcp()
+                .get(crate::browser::BROWSER_SERVER)
+                .expect("bundled browser")
+                .config
+            else {
+                panic!("stdio browser");
+            };
+            assert_eq!(server.command, "cmd.exe");
+            let package = server
+                .args
+                .iter()
+                .position(|arg| arg == "npx")
+                .expect("npx");
+            let run = |replacement: &[&str], rest: bool| {
+                let mut args = server.args[..package].to_vec();
+                args.extend(replacement.iter().map(|arg| (*arg).to_string()));
+                if rest {
+                    args.extend(server.args[package + 3..].iter().cloned());
+                }
+                let transport = crate::mcp_client::McpStdioTransport {
+                    command: server.command.clone(),
+                    args,
+                    env: server.env.clone(),
+                    tool_call_timeout_ms: None,
+                };
+                runtime.block_on(async {
+                    let mut process = McpStdioProcess::spawn(&transport).expect("spawn cmd.exe");
+                    let mut output = String::new();
+                    while let Ok(line) = process.read_line().await {
+                        output.push_str(&line);
+                    }
+                    assert!(process.wait().await.expect("wait").success(), "{output}");
+                    output
+                })
+            };
+            // The arguments after the package, as the server would get them.
+            let echoed = run(&["echo", "ARGS"], true);
+            assert!(
+                !echoed.lines().any(|line| line.trim() == "INJECTED"),
+                "{folder} ran a command: {echoed}"
+            );
+            let flags = server.args[package + 3..].join(" ");
+            assert!(flags.starts_with("--isolated"), "{flags}");
+            assert!(!flags.contains("INJECTED"), "{flags}");
+            assert_eq!(echoed.trim_end(), format!("ARGS {flags}"), "{folder}");
+            // The output folder arrives whole, metacharacters and all.
+            let env = run(&["set", crate::browser::OUTPUT_DIR_ENV], false);
+            let expected = format!(
+                "{}={}",
+                crate::browser::OUTPUT_DIR_ENV,
+                crate::browser::output_dir(&project).display()
+            );
+            assert!(env.lines().any(|line| line == expected), "{folder}: {env}");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn rejects_non_stdio_bootstrap() {
         let config = ScopedMcpServerConfig {

@@ -2413,10 +2413,14 @@ mod tests {
             .cloned()
             .collect::<Vec<_>>();
         assert_eq!(after_package[0], "--isolated");
-        assert_eq!(after_package[1], "--output-dir");
+        // The project's path goes in the environment, never past cmd.exe.
+        assert!(!after_package.contains(&"--output-dir".to_string()));
         assert_eq!(
-            std::path::PathBuf::from(&after_package[2]),
-            root.join(".neuron").join("browser")
+            browser
+                .env
+                .get(crate::browser::OUTPUT_DIR_ENV)
+                .map(std::path::PathBuf::from),
+            Some(root.join(".neuron").join("browser"))
         );
         assert!(browser
             .env

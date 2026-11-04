@@ -70,10 +70,13 @@ a repository's files. A server turned off in any settings file stays off, and
 
 See the [Playwright MCP documentation](https://github.com/microsoft/playwright-mcp)
 for browser installation and platform requirements. This provides browser control.
-The bundled server starts with `--isolated`, `--output-dir <project>/.neuron/browser`,
-`--image-responses omit` (until tool results carry images), `--headless` when there is
-no display or in CI, and `PLAYWRIGHT_MCP_BLOCKED_ORIGINS` set to localhost and private
-address patterns; the `browser` settings change these, and its tools have their own
+The bundled server starts with `--isolated`, `--image-responses omit` (until tool
+results carry images), `--headless` when there is no display or in CI,
+`PLAYWRIGHT_MCP_OUTPUT_DIR` set to `<project>/.neuron/browser` and
+`PLAYWRIGHT_MCP_BLOCKED_ORIGINS` set to localhost, private, shared (100.64.0.0/10) and
+benchmarking address patterns. The folder and the list go in the server's environment
+rather than its arguments, because on Windows it starts through `cmd.exe /c npx`, which
+would act on `&`, `^` or `%` in a project's path; the `browser` settings change these, and its tools have their own
 permission tiers. See [USAGE.md](../USAGE.md#browser). One-shot runs leave it out
 unless `--with-browser` or `browser.oneShot` asks for it.
 Desktop control needs a separately installed computer-use MCP server, its actual

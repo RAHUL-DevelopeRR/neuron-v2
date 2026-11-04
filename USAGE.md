@@ -346,9 +346,10 @@ It starts with safe defaults:
 - screenshots are left out of tool results (`browser.images`, `"omit"` by default),
   because a screenshot would reach the model as tens of thousands of characters of
   text; the model reads pages from their text snapshot instead;
-- localhost and private, link-local and unique-local addresses (`127.*`, `10.*`,
-  `172.16-31.*`, `192.168.*`, `169.254.*`, `[::1]`, `fc`/`fd`/`fe80` IPv6) are blocked
-  unless `browser.allowLocal` is true. The browser server applies this list to the
+- localhost and private, link-local, shared, benchmarking and unique-local addresses
+  (`127.*`, `10.*`, `172.16-31.*`, `192.168.*`, `169.254.*`, `100.64-127.*` as used by
+  Tailscale and carrier NAT, `198.18-19.*`, `[::1]`, `fc`/`fd`/`fe80` IPv6) are
+  blocked unless `browser.allowLocal` is true. The browser server applies this list to the
   pages and requests it makes, not to redirects, and a public name that resolves to a
   private address is not caught, so treat it as a guard against mistakes, not as a
   security boundary. Right after a blocked page, the next page can fail once with

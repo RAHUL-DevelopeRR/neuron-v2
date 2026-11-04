@@ -101,8 +101,8 @@ The release workflow copies a version's section into its GitHub release notes.
   its automatically named files to `.neuron/browser` (kept out of git), runs headless
   without a display, in CI or with `browser.headless`, leaves screenshots out of tool
   results until they can reach the model as images (`browser.images`, `"omit"` by
-  default), and blocks localhost and private addresses unless `browser.allowLocal`
-  is true.
+  default), and blocks localhost, private, shared (100.64.0.0/10, used by Tailscale)
+  and benchmarking addresses unless `browser.allowLocal` is true.
 - Browser tools no longer all need full access: reading the page runs in
   workspace-write, opening and acting on pages asks once per session for web
   browsing (or runs on the hosts given with `--allow-origin`), and only

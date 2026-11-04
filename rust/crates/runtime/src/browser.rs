@@ -2,7 +2,7 @@
 //!
 //! - How it is launched ([`apply_launch_settings`]): an in-memory profile
 //!   (`--isolated`), automatically named files under `<project>/.neuron/browser`
-//!   (`--output-dir`), headless when there is no display, in CI or when
+//!   (`PLAYWRIGHT_MCP_OUTPUT_DIR`), headless when there is no display, in CI or when
 //!   `browser.headless` is true, screenshots left out of tool results until
 //!   tool results can carry images (`browser.images`), and local and private
 //!   addresses blocked unless `browser.allowLocal` is true.
@@ -40,10 +40,18 @@ pub const BROWSER_OUTPUT_DIR: &str = ".neuron/browser";
 /// through `cmd.exe /c npx`, which must not see its `;` and `*` characters.
 pub const BLOCKED_ORIGINS_ENV: &str = "PLAYWRIGHT_MCP_BLOCKED_ORIGINS";
 
-/// Local, private, link-local (cloud metadata) and unique-local addresses, as
-/// @playwright/mcp origin patterns: a value that is not a URL becomes the
-/// glob `*://<value>/**`, where `*` matches anything but `/` (so a port is
-/// covered too).
+/// The server's environment variable for its output folder (what
+/// `--output-dir` sets). The folder is under the project, so it goes in the
+/// environment for the same reason as [`BLOCKED_ORIGINS_ENV`]: `cmd.exe`
+/// would run what follows a `&` in a folder's name as a command, and rewrite
+/// `^` and `%VAR%`.
+pub const OUTPUT_DIR_ENV: &str = "PLAYWRIGHT_MCP_OUTPUT_DIR";
+
+/// Local, private, link-local (cloud metadata), benchmarking and unique-local
+/// addresses, as @playwright/mcp origin patterns: a value that is not a URL
+/// becomes the glob `*://<value>/**`, where `*` matches anything but `/` (so
+/// a port is covered too). [`local_blocked_origins`] adds the shared address
+/// space 100.64.0.0/10.
 pub const LOCAL_BLOCKED_ORIGINS: &[&str] = &[
     "localhost*",
     "*.localhost*",
@@ -68,6 +76,9 @@ pub const LOCAL_BLOCKED_ORIGINS: &[&str] = &[
     "172.31.*",
     "192.168.*",
     "169.254.*",
+    // 198.18.0.0/15, for benchmarking networks.
+    "198.18.*",
+    "198.19.*",
     "[::]*",
     "[::1]*",
     "[::ffff:*",
@@ -75,6 +86,18 @@ pub const LOCAL_BLOCKED_ORIGINS: &[&str] = &[
     "[fd*",
     "[fe80:*",
 ];
+
+/// Every blocked origin pattern: [`LOCAL_BLOCKED_ORIGINS`] and the shared
+/// address space 100.64.0.0/10 (`100.64.*` to `100.127.*`), which carrier NAT
+/// and private overlays such as Tailscale give every node.
+#[must_use]
+pub fn local_blocked_origins() -> Vec<String> {
+    LOCAL_BLOCKED_ORIGINS
+        .iter()
+        .map(|origin| (*origin).to_string())
+        .chain((64..=127).map(|octet| format!("100.{octet}.*")))
+        .collect()
+}
 
 /// Whether screenshots and other images reach the model (`browser.images`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -203,7 +226,10 @@ pub fn output_dir(project: &Path) -> PathBuf {
     project.join(BROWSER_OUTPUT_DIR)
 }
 
-/// Adds the safe launch flags to the bundled browser's start command.
+/// Adds the safe launch flags to the bundled browser's start command. Nothing
+/// taken from the project (its path) goes in the arguments, which `cmd.exe`
+/// parses on Windows: the output folder and the blocked origins go in the
+/// server's environment.
 pub fn apply_launch_settings(
     server: &mut McpStdioServerConfig,
     settings: &BrowserSettings,
@@ -211,10 +237,10 @@ pub fn apply_launch_settings(
     host: BrowserHost,
 ) {
     server.args.push("--isolated".to_string());
-    server.args.push("--output-dir".to_string());
-    server
-        .args
-        .push(output_dir(project).to_string_lossy().into_owned());
+    server.env.insert(
+        OUTPUT_DIR_ENV.to_string(),
+        output_dir(project).to_string_lossy().into_owned(),
+    );
     if runs_headless(settings, host) {
         server.args.push("--headless".to_string());
     }
@@ -225,14 +251,14 @@ pub fn apply_launch_settings(
     if !settings.allow_local {
         server.env.insert(
             BLOCKED_ORIGINS_ENV.to_string(),
-            LOCAL_BLOCKED_ORIGINS.join(";"),
+            local_blocked_origins().join(";"),
         );
     }
 }
 
 /// Creates the bundled browser's output folder with a `.gitignore` that
 /// keeps it out of the project's history. Does nothing when the browser is
-/// not the bundled one or has no `--output-dir`.
+/// not the bundled one or has no output folder ([`OUTPUT_DIR_ENV`]).
 pub fn prepare_output_dir(config: &RuntimeConfig) -> std::io::Result<()> {
     let Some(server) = config.mcp().get(BROWSER_SERVER) else {
         return Ok(());
@@ -243,12 +269,7 @@ pub fn prepare_output_dir(config: &RuntimeConfig) -> std::io::Result<()> {
     let McpServerConfig::Stdio(stdio) = &server.config else {
         return Ok(());
     };
-    let Some(dir) = stdio
-        .args
-        .iter()
-        .position(|arg| arg == "--output-dir")
-        .and_then(|index| stdio.args.get(index + 1))
-    else {
+    let Some(dir) = stdio.env.get(OUTPUT_DIR_ENV) else {
         return Ok(());
     };
     let dir = PathBuf::from(dir);
@@ -458,13 +479,13 @@ mod tests {
             .args
             .starts_with(&["-y".to_string(), "@playwright/mcp@0.0.83".to_string()]));
         assert!(server.args.contains(&"--isolated".to_string()), "{args}");
-        let dir = server
-            .args
-            .iter()
-            .position(|arg| arg == "--output-dir")
-            .map(|index| PathBuf::from(&server.args[index + 1]))
-            .expect("--output-dir");
-        assert_eq!(dir, Path::new("/work/app").join(".neuron").join("browser"));
+        assert_eq!(
+            server.env.get(OUTPUT_DIR_ENV).map(PathBuf::from),
+            Some(Path::new("/work/app").join(".neuron").join("browser"))
+        );
+        // The project's path is never an argument.
+        assert!(!args.contains("--output-dir"), "{args}");
+        assert!(!args.contains("/work/app"), "{args}");
         assert!(args.contains("--image-responses omit"), "{args}");
         // A display and no CI: headed.
         assert!(!server.args.contains(&"--headless".to_string()), "{args}");
@@ -477,19 +498,65 @@ mod tests {
         ] {
             assert!(!args.contains(flag), "{args}");
         }
-        let blocked = server
+        let blocked: Vec<&str> = server
             .env
             .get(BLOCKED_ORIGINS_ENV)
-            .expect("blocked origins");
+            .expect("blocked origins")
+            .split(';')
+            .collect();
         for origin in [
             "localhost*",
             "127.*",
             "10.*",
+            "172.31.*",
             "192.168.*",
             "169.254.*",
+            "198.18.*",
+            "198.19.*",
+            "100.64.*",
+            "100.100.*",
+            "100.127.*",
             "[::1]*",
         ] {
-            assert!(blocked.split(';').any(|item| item == origin), "{blocked}");
+            assert!(blocked.contains(&origin), "{blocked:?}");
+        }
+        // 100.64.0.0/10 and 198.18.0.0/15 and no wider.
+        for origin in ["100.63.*", "100.128.*", "198.17.*", "198.20.*"] {
+            assert!(!blocked.contains(&origin), "{blocked:?}");
+        }
+        assert_eq!(blocked.len(), LOCAL_BLOCKED_ORIGINS.len() + 64);
+    }
+
+    /// On Windows the server starts as `cmd.exe /d /s /c npx ...`, which runs what
+    /// follows a `&` in a folder's name (`x&calc.exe&y`) as a command and rewrites
+    /// `^` and `%VAR%`: the project's path never reaches the arguments.
+    #[test]
+    fn a_project_path_with_cmd_metacharacters_stays_out_of_the_arguments() {
+        let package = ["/d", "/s", "/c", "npx", "-y", "@playwright/mcp@0.0.83"];
+        for project in [
+            r"C:\work\x&calc.exe&y",
+            r"C:\work\a^b %PATH% c|d",
+            "/work/my app & co",
+        ] {
+            let mut server = McpStdioServerConfig {
+                command: "cmd.exe".to_string(),
+                args: package.into_iter().map(str::to_string).collect(),
+                env: BTreeMap::new(),
+                tool_call_timeout_ms: None,
+            };
+            apply_launch_settings(
+                &mut server,
+                &BrowserSettings::default(),
+                Path::new(project),
+                DESKTOP,
+            );
+            let added = &server.args[package.len()..];
+            assert_eq!(added, ["--isolated", "--image-responses", "omit"]);
+            assert_eq!(
+                server.env.get(OUTPUT_DIR_ENV).map(PathBuf::from),
+                Some(output_dir(Path::new(project))),
+                "{project}"
+            );
         }
     }
 
@@ -531,6 +598,7 @@ mod tests {
         );
         assert!(!server.args.contains(&"--image-responses".to_string()));
         assert!(!server.env.contains_key(BLOCKED_ORIGINS_ENV));
+        assert!(server.env.contains_key(OUTPUT_DIR_ENV));
         assert!(server.args.contains(&"--isolated".to_string()));
     }
 
@@ -676,7 +744,7 @@ mod tests {
         // A browser server of the user's own: nothing is made.
         std::fs::write(
             config_home.join("settings.json"),
-            r#"{"mcpServers":{"playwright":{"command":"my-browser","args":["--output-dir","elsewhere"]}}}"#,
+            r#"{"mcpServers":{"playwright":{"command":"my-browser","args":["--output-dir","elsewhere"],"env":{"PLAYWRIGHT_MCP_OUTPUT_DIR":"elsewhere"}}}}"#,
         )
         .unwrap();
         prepare_output_dir(&loader.load().unwrap()).unwrap();
