@@ -2482,7 +2482,7 @@ fn build_runtime_mcp_state(
     let mut runtime_tools = discovery
         .tools
         .iter()
-        .map(mcp_runtime_tool_definition)
+        .map(|tool| mcp_runtime_tool_definition(tool, servers))
         .collect::<Vec<_>>();
     if !mcp_state.server_names().is_empty() {
         runtime_tools.extend(mcp_wrapper_tool_definitions());
@@ -2542,7 +2542,7 @@ impl BackgroundMcp {
                         let mut tools = discovery
                             .tools
                             .iter()
-                            .map(mcp_runtime_tool_definition)
+                            .map(|tool| mcp_runtime_tool_definition(tool, &servers))
                             .collect::<Vec<_>>();
                         tools.extend(mcp_wrapper_tool_definitions());
                         BackgroundMcpOutcome::Started(Box::new(state), tools)
@@ -2650,7 +2650,12 @@ fn mcp_servers_without_bundled(
         .collect()
 }
 
-fn mcp_runtime_tool_definition(tool: &runtime::ManagedMcpTool) -> RuntimeToolDefinition {
+/// `servers` are the configured servers: a tool's server decides how far its own
+/// annotations are trusted ([`permission_mode_for_mcp_tool`]).
+fn mcp_runtime_tool_definition(
+    tool: &runtime::ManagedMcpTool,
+    servers: &BTreeMap<String, runtime::ScopedMcpServerConfig>,
+) -> RuntimeToolDefinition {
     RuntimeToolDefinition {
         name: tool.qualified_name.clone(),
         description: Some(
@@ -2664,7 +2669,10 @@ fn mcp_runtime_tool_definition(tool: &runtime::ManagedMcpTool) -> RuntimeToolDef
             .input_schema
             .clone()
             .unwrap_or_else(|| json!({ "type": "object", "additionalProperties": true })),
-        required_permission: permission_mode_for_mcp_tool(&tool.tool),
+        required_permission: permission_mode_for_mcp_tool(
+            &tool.tool,
+            servers.get(&tool.server_name),
+        ),
     }
 }
 
@@ -2718,18 +2726,36 @@ fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
     ]
 }
 
-fn permission_mode_for_mcp_tool(tool: &McpTool) -> PermissionMode {
+/// The permission a call of `tool` needs. Its annotations are the server's own claims,
+/// so they decide alone only for servers Neuron ships (bundled scope; vetted catalog
+/// connectors join them later). Any other server cannot lower a tool below
+/// workspace-write, and a remote server's tools, or a tool that reaches the open world,
+/// need full access. An allow rule still lets a tool run with less.
+fn permission_mode_for_mcp_tool(
+    tool: &McpTool,
+    server: Option<&runtime::ScopedMcpServerConfig>,
+) -> PermissionMode {
     let read_only = mcp_annotation_flag(tool, "readOnlyHint");
     let destructive = mcp_annotation_flag(tool, "destructiveHint");
     let open_world = mcp_annotation_flag(tool, "openWorldHint");
 
-    if read_only && !destructive && !open_world {
+    let claimed = if read_only && !destructive && !open_world {
         PermissionMode::ReadOnly
     } else if destructive || open_world {
         PermissionMode::DangerFullAccess
     } else {
         PermissionMode::WorkspaceWrite
+    };
+    if server.is_some_and(|server| server.scope == ConfigSource::Bundled) {
+        return claimed;
     }
+    let remote = server.is_none_or(|server| server.transport() != runtime::McpTransport::Stdio);
+    let floor = if remote || open_world {
+        PermissionMode::DangerFullAccess
+    } else {
+        PermissionMode::WorkspaceWrite
+    };
+    claimed.max(floor)
 }
 
 fn mcp_annotation_flag(tool: &McpTool, key: &str) -> bool {
@@ -5487,9 +5513,10 @@ mod tests {
         format_unknown_slash_command_message, format_user_visible_api_error,
         mcp_servers_without_bundled, merge_prompt_with_stdin, normalize_permission_mode,
         parse_args, parse_export_args, parse_git_status_branch, parse_git_status_metadata_for,
-        parse_git_workspace_summary, parse_history_count, permission_policy, print_help_to,
-        push_output_block, render_config_report, render_diff_report, render_diff_report_for,
-        render_memory_report, render_prompt_history_report, render_repl_help, render_resume_usage,
+        parse_git_workspace_summary, parse_history_count, permission_mode_for_mcp_tool,
+        permission_policy, print_help_to, push_output_block, render_config_report,
+        render_diff_report, render_diff_report_for, render_memory_report,
+        render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, render_version_report, resolve_model_alias,
         resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
         response_to_events, resume_safe_slash_command, resume_supported_slash_commands,
@@ -9218,6 +9245,68 @@ UU conflicted.rs",
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn mcp_tool_annotations_decide_alone_only_for_servers_neuron_ships() {
+        let tool = |annotations: serde_json::Value| runtime::McpTool {
+            name: "t".to_string(),
+            description: None,
+            input_schema: None,
+            annotations: Some(annotations),
+            meta: None,
+        };
+        let server = |scope: runtime::ConfigSource, config: runtime::McpServerConfig| {
+            runtime::ScopedMcpServerConfig { scope, config }
+        };
+        let stdio = || {
+            runtime::McpServerConfig::Stdio(runtime::McpStdioServerConfig {
+                command: "node".to_string(),
+                args: Vec::new(),
+                env: std::collections::BTreeMap::new(),
+                tool_call_timeout_ms: None,
+            })
+        };
+        let remote = || {
+            runtime::McpServerConfig::Http(runtime::McpRemoteServerConfig {
+                url: "https://mcp.example.com/mcp".to_string(),
+                headers: std::collections::BTreeMap::new(),
+                headers_helper: None,
+                oauth: None,
+            })
+        };
+        let read_only = tool(json!({"readOnlyHint": true}));
+        let open_world = tool(json!({"readOnlyHint": true, "openWorldHint": true}));
+
+        let bundled = server(runtime::ConfigSource::Bundled, stdio());
+        assert_eq!(
+            permission_mode_for_mcp_tool(&read_only, Some(&bundled)),
+            PermissionMode::ReadOnly
+        );
+        for scope in [
+            runtime::ConfigSource::User,
+            runtime::ConfigSource::Project,
+            runtime::ConfigSource::Local,
+        ] {
+            let local = server(scope, stdio());
+            assert_eq!(
+                permission_mode_for_mcp_tool(&read_only, Some(&local)),
+                PermissionMode::WorkspaceWrite,
+                "{scope:?}"
+            );
+            assert_eq!(
+                permission_mode_for_mcp_tool(&open_world, Some(&local)),
+                PermissionMode::DangerFullAccess
+            );
+            assert_eq!(
+                permission_mode_for_mcp_tool(&read_only, Some(&server(scope, remote()))),
+                PermissionMode::DangerFullAccess
+            );
+        }
+        assert_eq!(
+            permission_mode_for_mcp_tool(&read_only, None),
+            PermissionMode::DangerFullAccess
+        );
     }
 
     #[test]
