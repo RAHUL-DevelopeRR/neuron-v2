@@ -3693,7 +3693,17 @@ mod tests {
                 signed_out: None,
             })
             .expect("the engine starts");
-            assert!(matches!(next_event(&engine.events), UiEvent::Ready { .. }));
+            // Notices may come first: the notice hook is the process's, and a test that
+            // loads deprecated settings at the same time warns through it.
+            let before_ready = events_until(&engine.events, |event| {
+                matches!(event, UiEvent::Ready { .. })
+            });
+            assert!(
+                before_ready
+                    .iter()
+                    .all(|event| matches!(event, UiEvent::Ready { .. } | UiEvent::Notice { .. })),
+                "{before_ready:?}"
+            );
             events_until(&engine.events, |event| {
                 matches!(event, UiEvent::Status { .. })
             });
