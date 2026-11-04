@@ -13,6 +13,16 @@ The release workflow copies a version's section into its GitHub release notes.
   the per-run token cap come from the account's `limits.colony` (Free: 1 worker,
   300,000 tokens). Neuron asks before starting, near the cap and before applying.
   The full-screen UI shows a live row per agent; Esc or `/colony stop` stops a run.
+- Colony agents get only the session's tools (`--allowedTools`, plan mode), and in
+  `prompt` mode or with no file-changing tool on the list every subtask only reads.
+- Colony keeps a run's changes on their branch, without asking to apply them (so
+  `--yes` cannot), when the run reached its token cap or a worker or review did not
+  finish.
+- `/colony stop` stops a running Colony run at once in the full-screen UI (it used to
+  wait for the run to end), and stops only a Colony run, not an ordinary turn. Ctrl-C
+  stops a run in the line REPL and `neuron colony`.
+- The Colony start question shows each subtask's instructions and files; the planner
+  treats files and web pages as data. On Max, 8 workers can each have a subtask.
 - `Agent` calls whose sub-agents only read, or work in a worktree of their own, run at
   the same time (setting `parallelAgents`, default 3) and need less access: read-only
   sub-agents need read-only permission, worktree writers workspace-write.

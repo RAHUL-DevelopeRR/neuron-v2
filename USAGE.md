@@ -361,10 +361,12 @@ neuron colony "add input validation to every API handler"
 
 A run goes in five steps:
 
-1. A planner reads the workspace and splits the task into at most 6 subtasks, each
-   marked as writing or read-only, with the files it expects to change. You see the
-   plan, the number of workers and the token cap, and nothing else runs until you
-   say to start.
+1. A planner reads the workspace and splits the task into at most 6 subtasks (or as
+   many as run at once, when that is more), each marked as writing or read-only, with
+   the files it expects to change. You see the plan, each subtask's instructions (the
+   start of them when long), the number of workers and the token cap, and nothing
+   else runs until you say to start. Text the planner reads in files or on the web is
+   data for it, not instructions.
 2. Workers run the subtasks, several at a time. A writing worker works in a git
    worktree of its own (under `~/.neuron/worktrees/`), and its changes are committed
    to its own branch, never to your working tree. Read-only workers only report.
@@ -374,9 +376,11 @@ A run goes in five steps:
 4. The branches are merged one by one into a synthesis branch. The first merge that
    conflicts stops the merging: the report names that branch and its files, and the
    branches stay for you to merge yourself.
-5. A last agent writes the report. If the merge was clean, Neuron shows the diff
-   summary and asks before applying it to your working tree as uncommitted changes.
-   Otherwise the changes stay on their branch (`git merge <branch>` when ready).
+5. A last agent writes the report. If the merge was clean and the run finished its
+   work, Neuron shows the diff summary and asks before applying it to your working
+   tree as uncommitted changes. Otherwise the changes stay on their branch
+   (`git merge <branch>` when ready): after a stop, when the run reached its token
+   cap, or when a worker or reviewer did not finish. `--yes` never applies such work.
 
 Limits come from your plan (`/api/account`, `limits.colony`): Free runs 1 worker at a
 time with 300,000 tokens per run, Pro 4 workers and 2,000,000 tokens, Max 8 workers
@@ -388,12 +392,15 @@ another; at the cap every agent stops with what it has.
 
 In the full-screen UI the run shows one live row per agent (role, task, status,
 tokens of its budget, branch) under the run's total, and Esc or `/colony stop` stops
-it. Without a terminal (`neuron colony` in a script) nobody can answer: `--yes` is
+it at once. In the line REPL and `neuron colony`, Ctrl-C stops it (a second Ctrl-C
+quits). Without a terminal (`neuron colony` in a script) nobody can answer: `--yes` is
 needed to start, the run stops at 80% of the cap instead of asking, and the changes
 are applied only with `--yes`. Workers get no browser tools, and web search and fetch
 only with `--allow-web`; what they still need approval for is refused, since a worker
-cannot ask. Agents never get more access than your session: in read-only mode every
-subtask is read-only.
+cannot ask. Agents never get more access than your session: they get only tools on
+its tool list (`--allowedTools`, and plan mode's read-only tools), and every subtask
+is read-only in read-only mode, in `prompt` mode (workers cannot ask before each
+tool), and when the tool list has no tool that changes files.
 
 ### Parallel sub-agents
 

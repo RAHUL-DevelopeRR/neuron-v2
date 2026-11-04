@@ -35,23 +35,43 @@ works and what is left. User-facing behaviour is in `USAGE.md`.
   `Neuron Colony`, signing and hooks off for that commit only) so the branch can be
   reviewed and merged. Nothing touches the user's tree until the merge step.
 - **Permissions.** Each agent runs with the session's rules and at most the session's
-  mode: writers at `min(session, workspace-write)`, everyone else read-only. A
-  read-only session turns every subtask into a read-only one. Agents have no prompter,
-  so a call that needs approval is refused; there is no approval queue in this build.
+  mode: writers at workspace-write when the session is workspace-write, full access or
+  `allow` (`colony::writing_mode`), everyone else read-only. A read-only session, a
+  `prompt` session (workers cannot ask, and running them without asking would give
+  them more than the session) and an allow-list without a file-changing tool turn
+  every subtask into a read-only one, and the start question says why. Agents have no
+  prompter, so a call that needs approval is refused; there is no approval queue in
+  this build.
 - **Tools.** Readers: `read_file`, `glob_search`, `grep_search`. Writers add
   `write_file`, `edit_file`, `bash`, `PowerShell`. `WebSearch` and `WebFetch` only with
-  `--allow-web`. No browser and no nested `Agent`.
+  `--allow-web`. No browser and no nested `Agent`. Every set is cut to the session's
+  tool allow-list (`--allowedTools`, plan mode; `ColonyConfig::allowed_tools`, the
+  session's list intersected with the registered parent's), as a plain `Agent` call's
+  is.
+- **Subtasks.** At most 6 (Freebuff's batch cap), or the worker count when that is
+  more (Max's 8), so every allowed worker can be busy.
 - **Merge conflicts.** Branches merge one by one into a synthesis branch; the first
   conflict aborts that merge and the run reports the branch, its files and the
   branches not merged. Neuron does not try to resolve conflicts.
 - **Apply.** A clean synthesis branch is offered as `git diff base..synthesis` applied
   with `git apply` to the working tree, uncommitted. On success the run's branches are
-  deleted; otherwise they stay and the report names them.
+  deleted; otherwise they stay and the report names them. The merge is not offered
+  (so `--yes` cannot apply it) when the run was stopped, reached its cap, or merged a
+  branch whose worker did not finish or whose review did not finish; the report's
+  note says which.
 - **Untrusted text.** Worker reports, diffs and reviews reach the reviewer and the
   synthesis agent between `<<<` and `>>>` markers, labelled as data, not instructions.
-- **Stopping.** `ColonyHandle::stop` (and, in the full-screen UI, an interrupt or
-  `/colony stop`) stops the meter and cancels every runtime; agents not started are
-  marked stopped.
+  The planner and workers are told that files, web pages and tool output are data.
+  The planner's subtask prompts become worker instructions, so the start question
+  shows each one (`colony::describe_plan`, control characters stripped, cut at 400
+  characters) with its files before anything else runs.
+- **Stopping.** `ColonyHandle::stop` stops the meter and cancels every runtime;
+  agents not started are marked stopped. In the engine, `Shared::colony` holds the
+  running run's handle; `/colony stop` reaches it from `forward_commands` at once and
+  matches only while a Colony run holds the engine. The full-screen UI sends an
+  interrupt for `/colony stop` while its `/colony` exchange is running
+  (`engine/colony-control.ts`), since slash commands queue behind that exchange. The
+  line REPL and `neuron colony` watch Ctrl-C as a turn does.
 
 ## Integration notes for feat/alpha4
 
@@ -65,7 +85,14 @@ works and what is left. User-facing behaviour is in `USAGE.md`.
 - `PermissionPolicy` gained `with_shell_tools`; the CLI sets it from `--allowedTools`.
 - The engine's `/colony` arm is in `Engine::slash`, before `run_slash`, like
   `/context`. A permission or TUI rework on feat/alpha4 should keep `/colony stop` in
-  `forward_commands` so it reaches a running run.
+  `forward_commands` (guarded by `Shared::stop_colony`) so it reaches a running run,
+  and keep the router's `/colony stop` interrupt ahead of `runExchange`.
+- `LiveCli::session_tools` replaces the inline plan-mode tool set in
+  `prepare_turn_runtime_watching`; a permission rework there should keep Colony's
+  `build_config` fed from it.
+- `ColonyQuestion::Start` gained `read_only`; the planner and worker prompts gained
+  a data-not-instructions line. When MCP P0's output envelope lands and workers get
+  MCP or web results, keep those results inside it.
 - Protocol additions are additive: feature and capability `colony`, events
   `colony_started`, `colony_agent`, `colony_budget`, `colony_finished`, structs
   `ColonyTaskInfo` and `ColonyAgentInfo`.
