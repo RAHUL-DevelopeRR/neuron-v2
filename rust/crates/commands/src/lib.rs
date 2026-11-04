@@ -2749,7 +2749,7 @@ fn render_mcp_report_for(
             for name in runtime_config.mcp().needs_approval().keys() {
                 let _ = write!(
                     report,
-                    "\n  {name:<16} needs approval (from a plugin; not started)"
+                    "\n  {name:<16} needs approval (from a plugin; not started in this build)"
                 );
             }
             Ok(report)
@@ -2774,7 +2774,7 @@ fn render_mcp_report_for(
             Ok(render_mcp_server_report(
                 cwd,
                 server_name,
-                runtime_config.mcp().get(server_name),
+                find_mcp_server(runtime_config.mcp(), server_name),
             ))
         }
         Some(args) => Ok(render_mcp_usage(Some(args))),
@@ -2829,7 +2829,7 @@ fn render_mcp_report_json_for(
             Ok(render_mcp_server_report_json(
                 cwd,
                 server_name,
-                runtime_config.mcp().get(server_name),
+                find_mcp_server(runtime_config.mcp(), server_name),
             ))
         }
         Some(args) => Ok(render_mcp_usage_json(Some(args))),
@@ -2911,8 +2911,8 @@ fn render_plugin_install_report(plugin_id: &str, plugin: Option<&PluginSummary>)
     )
 }
 
-/// What an installed plugin adds, as report lines: its skill folders and the MCP
-/// servers that wait for the user's approval.
+/// What an installed plugin adds, as report lines: its skill folders and its MCP
+/// servers, which are listed but not started until per-server approval lands.
 fn render_plugin_extensions_lines(extensions: Option<&plugins::PluginExtensions>) -> String {
     let Some(extensions) = extensions else {
         return String::new();
@@ -2934,7 +2934,7 @@ fn render_plugin_extensions_lines(extensions: Option<&plugins::PluginExtensions>
             .join(", ");
         let _ = write!(
             lines,
-            "\n  MCP servers      {names} (wait for your approval; not started)"
+            "\n  MCP servers      {names} (listed by /mcp; not started in this build)"
         );
     }
     lines
@@ -2946,7 +2946,7 @@ fn render_plugins_usage() -> String {
         "  Usage            /plugins [list|install <path|git-url>|enable <name>|disable <name>|update <name>|uninstall <name>]",
         "  Direct CLI       neuron plugins [list|install <path|git-url>|enable <name>|disable <name>|update <name>|uninstall <name>]",
         "  Manifest         .neuron-plugin/plugin.json (or plugin.json) in the plugin's folder",
-        "  Adds             tools, hooks, commands, skills and MCP servers; MCP servers wait for your approval",
+        "  Adds             tools, hooks, commands, skills and MCP servers; plugin MCP servers are listed but not started in this build",
     ]
     .join("\n")
 }
@@ -3279,16 +3279,16 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
     roots
 }
 
-/// The skill folders of the plugins enabled in this workspace's settings.
+/// The skill folders of the plugins enabled in this workspace's settings, from one
+/// settings load (which also discovers the plugins once).
 fn plugin_skill_dirs(cwd: &Path) -> Vec<PathBuf> {
-    let loader = ConfigLoader::default_for(cwd);
-    loader
+    ConfigLoader::default_for(cwd)
         .load()
         .map(|config| {
-            loader
-                .plugin_skill_dirs(&config)
-                .into_iter()
-                .map(|(_, dir)| dir)
+            config
+                .plugin_skill_dirs()
+                .iter()
+                .map(|(_, dir)| dir.clone())
                 .collect()
         })
         .unwrap_or_default()
@@ -3956,12 +3956,58 @@ fn render_mcp_summary_report_json(
     })
 }
 
+/// Whether a server `/mcp show` found starts, is switched off, or waits for approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpServerStatus {
+    Configured,
+    Disabled,
+    NeedsApproval,
+}
+
+impl McpServerStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Configured => "on",
+            Self::Disabled => "disabled (turn on with /mcp enable)",
+            Self::NeedsApproval => "needs approval (from a plugin; not started in this build)",
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::Configured => "configured",
+            Self::Disabled => "disabled",
+            Self::NeedsApproval => "needs_approval",
+        }
+    }
+}
+
+/// The server named `name` wherever `/mcp list` shows it: among the servers that
+/// start, the disabled ones, or the plugin servers that wait for approval.
+fn find_mcp_server<'a>(
+    mcp: &'a runtime::McpConfigCollection,
+    name: &str,
+) -> Option<(&'a ScopedMcpServerConfig, McpServerStatus)> {
+    mcp.get(name)
+        .map(|server| (server, McpServerStatus::Configured))
+        .or_else(|| {
+            mcp.disabled()
+                .get(name)
+                .map(|server| (server, McpServerStatus::Disabled))
+        })
+        .or_else(|| {
+            mcp.needs_approval()
+                .get(name)
+                .map(|server| (server, McpServerStatus::NeedsApproval))
+        })
+}
+
 fn render_mcp_server_report(
     cwd: &Path,
     server_name: &str,
-    server: Option<&ScopedMcpServerConfig>,
+    found: Option<(&ScopedMcpServerConfig, McpServerStatus)>,
 ) -> String {
-    let Some(server) = server else {
+    let Some((server, status)) = found else {
         return format!(
             "MCP\n  Working directory {}\n  Result            server `{server_name}` is not configured",
             cwd.display()
@@ -3972,6 +4018,7 @@ fn render_mcp_server_report(
         "MCP".to_string(),
         format!("  Working directory {}", cwd.display()),
         format!("  Name              {server_name}"),
+        format!("  Status            {}", status.label()),
         format!("  Scope             {}", config_source_label(server.scope)),
         format!(
             "  Transport         {}",
@@ -4038,14 +4085,15 @@ fn render_mcp_server_report(
 fn render_mcp_server_report_json(
     cwd: &Path,
     server_name: &str,
-    server: Option<&ScopedMcpServerConfig>,
+    found: Option<(&ScopedMcpServerConfig, McpServerStatus)>,
 ) -> Value {
-    match server {
-        Some(server) => json!({
+    match found {
+        Some((server, status)) => json!({
             "kind": "mcp",
             "action": "show",
             "working_directory": cwd.display().to_string(),
             "found": true,
+            "status": status.id(),
             "server": mcp_server_json(server_name, server),
         }),
         None => json!({
@@ -6039,6 +6087,61 @@ mod tests {
 
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(config_home);
+    }
+
+    /// A plugin's MCP server, listed by `/mcp list`, is found by `/mcp show` (text and
+    /// JSON) and can be switched off and on with `/mcp disable|enable`.
+    #[test]
+    fn mcp_show_and_disable_reach_a_plugin_server() {
+        let workspace = temp_dir("mcp-plugin-workspace");
+        let config_home = temp_dir("mcp-plugin-home");
+        let plugin = temp_dir("mcp-plugin-source");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::create_dir_all(plugin.join(".neuron-plugin")).expect("plugin dir");
+        fs::write(
+            plugin.join(".neuron-plugin").join("plugin.json"),
+            r#"{"name": "tracker-kit", "version": "1.0.0", "description": "d",
+                "mcpServers": {"tracker": {"command": "node", "args": ["server.js"]}}}"#,
+        )
+        .expect("manifest");
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        let install = manager
+            .install(plugin.to_str().expect("utf8"))
+            .expect("install plugin");
+        fs::write(
+            config_home.join("settings.json"),
+            format!(
+                r#"{{"defaultMcpServers": false, "plugins": {{"enabled": {{"{}": true}}}}}}"#,
+                install.plugin_id
+            ),
+        )
+        .expect("settings");
+        let loader = ConfigLoader::new(&workspace, &config_home);
+
+        let show = super::render_mcp_report_for(&loader, &workspace, Some("show tracker"))
+            .expect("show renders");
+        assert!(show.contains("Name              tracker"), "{show}");
+        assert!(show.contains("Status            needs approval"), "{show}");
+        assert!(show.contains("Command           node"), "{show}");
+        let json = render_mcp_report_json_for(&loader, &workspace, Some("show tracker"))
+            .expect("show json renders");
+        assert_eq!(json["found"], true);
+        assert_eq!(json["status"], "needs_approval");
+        assert_eq!(json["server"]["scope"]["id"], "plugin");
+
+        let disabled = super::render_mcp_report_for(&loader, &workspace, Some("disable tracker"))
+            .expect("disable renders");
+        assert!(disabled.contains("tracker is now disabled"), "{disabled}");
+        let show = super::render_mcp_report_for(&loader, &workspace, Some("show tracker"))
+            .expect("show renders");
+        assert!(show.contains("Status            disabled"), "{show}");
+        let enabled = super::render_mcp_report_for(&loader, &workspace, Some("enable tracker"))
+            .expect("enable renders");
+        assert!(enabled.contains("tracker is now enabled"), "{enabled}");
+
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(plugin);
     }
 
     #[test]

@@ -28,6 +28,11 @@ pub enum ConfigSource {
 /// What a plugin's MCP server config may write for the plugin's own folder.
 pub const PLUGIN_ROOT_PLACEHOLDER: &str = "${NEURON_PLUGIN_ROOT}";
 
+/// The same placeholder as plugins packaged for the upstream tool write it (their
+/// manifest sits in the legacy manifest folder, which the plugin loader also reads).
+/// Expanded silently, like that folder; never named in docs or messages.
+const LEGACY_PLUGIN_ROOT_PLACEHOLDER: &str = "${CLAUDE_PLUGIN_ROOT}";
+
 /// Effective permission mode after decoding config values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolvedPermissionMode {
@@ -94,6 +99,9 @@ pub struct RuntimeConfig {
     loaded_entries: Vec<ConfigEntry>,
     feature_config: RuntimeFeatureConfig,
     ignored_project_settings: Vec<IgnoredProjectSettings>,
+    /// The enabled plugins' skill folders, each with its plugin's name, found by the
+    /// same plugin discovery that read their MCP servers.
+    plugin_skill_dirs: Vec<(String, PathBuf)>,
 }
 
 /// Parsed plugin-related settings extracted from runtime config.
@@ -156,7 +164,8 @@ pub struct McpConfigCollection {
     /// Configured servers turned off by `disabledMcpServers` (in any settings file).
     disabled: BTreeMap<String, ScopedMcpServerConfig>,
     /// Servers that do not start until the user approves them: the MCP servers of
-    /// enabled plugins ([`ConfigSource::Plugin`]).
+    /// enabled plugins ([`ConfigSource::Plugin`]). See [`McpConfigCollection::needs_approval`]
+    /// for how entries leave this list.
     needs_approval: BTreeMap<String, ScopedMcpServerConfig>,
 }
 
@@ -522,7 +531,22 @@ impl ConfigLoader {
         }
         let merged_value = JsonValue::Object(merged.clone());
         let plugins = parse_optional_plugin_config(&merged_value)?;
-        let mut needs_approval = self.plugin_mcp_servers(&plugins, &mcp_servers);
+        // One plugin discovery per load serves both the MCP servers and the skill folders.
+        let plugin_extensions = self
+            .plugin_manager(&plugins)
+            .enabled_plugin_extensions()
+            .unwrap_or_default();
+        let mut needs_approval = plugin_mcp_servers(&plugin_extensions, &mcp_servers);
+        let plugin_skill_dirs = plugin_extensions
+            .into_iter()
+            .flat_map(|extension| {
+                let name = extension.plugin_name;
+                extension
+                    .skill_dirs
+                    .into_iter()
+                    .map(move |dir| (name.clone(), dir))
+            })
+            .collect();
 
         let mut disabled_servers = BTreeMap::new();
         for name in disabled_mcp_servers {
@@ -558,6 +582,7 @@ impl ConfigLoader {
             loaded_entries,
             feature_config,
             ignored_project_settings,
+            plugin_skill_dirs,
         })
     }
 
@@ -565,64 +590,6 @@ impl ConfigLoader {
     #[must_use]
     pub fn plugin_manager(&self, plugins: &RuntimePluginConfig) -> plugins::PluginManager {
         plugins::PluginManager::new(plugin_manager_config(&self.cwd, &self.config_home, plugins))
-    }
-
-    /// The skill folders of the enabled plugins, each with its plugin's name.
-    #[must_use]
-    pub fn plugin_skill_dirs(&self, config: &RuntimeConfig) -> Vec<(String, PathBuf)> {
-        self.plugin_manager(config.plugins())
-            .enabled_plugin_extensions()
-            .unwrap_or_default()
-            .into_iter()
-            .flat_map(|extension| {
-                let name = extension.plugin_name;
-                extension
-                    .skill_dirs
-                    .into_iter()
-                    .map(move |dir| (name.clone(), dir))
-            })
-            .collect()
-    }
-
-    /// The MCP servers of the enabled plugins, in [`ConfigSource::Plugin`] scope. A
-    /// name a settings file already uses, or an earlier plugin took, is skipped.
-    fn plugin_mcp_servers(
-        &self,
-        plugins: &RuntimePluginConfig,
-        configured: &BTreeMap<String, ScopedMcpServerConfig>,
-    ) -> BTreeMap<String, ScopedMcpServerConfig> {
-        let mut servers = BTreeMap::new();
-        let Ok(extensions) = self.plugin_manager(plugins).enabled_plugin_extensions() else {
-            return servers;
-        };
-        for extension in extensions {
-            let plugin_root = extension.root.display().to_string();
-            for (name, value) in extension.mcp_servers {
-                // Skipped without a notice: settings load often (skill lookups too), and
-                // `/mcp` already shows which scope owns the name.
-                if configured.contains_key(&name) || servers.contains_key(&name) {
-                    continue;
-                }
-                let value = expand_plugin_root(&value, &plugin_root);
-                let context = format!("plugin {}: mcpServers.{name}", extension.plugin_name);
-                let parsed = JsonValue::parse(&value.to_string())
-                    .map_err(|error| ConfigError::Parse(format!("{context}: {error}")))
-                    .and_then(|json| parse_mcp_server_config(&name, &json, &context));
-                match parsed {
-                    Ok(config) => {
-                        servers.insert(
-                            name,
-                            ScopedMcpServerConfig {
-                                scope: ConfigSource::Plugin,
-                                config,
-                            },
-                        );
-                    }
-                    Err(error) => crate::ui_hooks::notice(&format!("warning: {error}")),
-                }
-            }
-        }
-        servers
     }
 
     /// What the workspace's own settings files would turn on once it is trusted, whatever
@@ -979,7 +946,15 @@ impl RuntimeConfig {
             loaded_entries: Vec::new(),
             feature_config: RuntimeFeatureConfig::default(),
             ignored_project_settings: Vec::new(),
+            plugin_skill_dirs: Vec::new(),
         }
+    }
+
+    /// The skill folders of the enabled plugins, each with its plugin's name. Read
+    /// when the settings loaded, so asking costs no second plugin discovery.
+    #[must_use]
+    pub fn plugin_skill_dirs(&self) -> &[(String, PathBuf)] {
+        &self.plugin_skill_dirs
     }
 
     /// Workspace settings dropped because the workspace is untrusted, or
@@ -1338,7 +1313,17 @@ impl McpConfigCollection {
     }
 
     /// Servers that wait for the user's approval and are not started: today the
-    /// MCP servers of enabled plugins.
+    /// MCP servers of enabled plugins. `disabledMcpServers` still moves one of them to
+    /// [`Self::disabled`], so `/mcp disable` and the MCP panel can switch it off.
+    ///
+    /// Nothing in this build approves an entry, so plugin MCP servers are listed but
+    /// never started. Integration note for the per-server approvals of the MCP plan
+    /// (`mcp_approvals.rs` on feat/alpha4): treat [`ConfigSource::Plugin`] like
+    /// [`ConfigSource::Project`], keyed by the plugin id plus the server name (and the
+    /// config hash it uses for project servers), and in [`ConfigLoader::load`] move each
+    /// approved, unchanged entry from `needs_approval` into `servers`. A changed config
+    /// goes back to waiting. `/mcp approve <name>` and the panel's Approve then cover
+    /// plugin servers too.
     #[must_use]
     pub fn needs_approval(&self) -> &BTreeMap<String, ScopedMcpServerConfig> {
         &self.needs_approval
@@ -1376,13 +1361,69 @@ pub fn plugin_manager_config(
     config
 }
 
-/// `value` with [`PLUGIN_ROOT_PLACEHOLDER`] replaced by the plugin's folder in every
-/// string, so a plugin's server can name its own files.
+/// The MCP servers of the enabled plugins, in [`ConfigSource::Plugin`] scope. A
+/// name a settings file already uses, or an earlier plugin took, is skipped. A server
+/// config that does not parse is left out with a warning, shown once per process
+/// (settings load for every skill lookup).
+fn plugin_mcp_servers(
+    extensions: &[plugins::PluginExtensions],
+    configured: &BTreeMap<String, ScopedMcpServerConfig>,
+) -> BTreeMap<String, ScopedMcpServerConfig> {
+    let mut servers = BTreeMap::new();
+    for extension in extensions {
+        let plugin_root = extension.root.display().to_string();
+        for (name, value) in &extension.mcp_servers {
+            // Skipped without a notice: `/mcp` already shows which scope owns the name.
+            if configured.contains_key(name) || servers.contains_key(name) {
+                continue;
+            }
+            let value = expand_plugin_root(value, &plugin_root);
+            let context = format!("plugin {}: mcpServers.{name}", extension.plugin_name);
+            let parsed = JsonValue::parse(&value.to_string())
+                .map_err(|error| ConfigError::Parse(format!("{context}: {error}")))
+                .and_then(|json| parse_mcp_server_config(name, &json, &context));
+            match parsed {
+                Ok(config) => {
+                    servers.insert(
+                        name.clone(),
+                        ScopedMcpServerConfig {
+                            scope: ConfigSource::Plugin,
+                            config,
+                        },
+                    );
+                }
+                Err(error) => {
+                    notice_once(&format!("warning: {error}"));
+                }
+            }
+        }
+    }
+    servers
+}
+
+/// Shows `message` through [`crate::ui_hooks::notice`] the first time this process
+/// sees it; `false` when it was shown before.
+fn notice_once(message: &str) -> bool {
+    static SHOWN: std::sync::OnceLock<std::sync::Mutex<BTreeSet<String>>> =
+        std::sync::OnceLock::new();
+    let shown = SHOWN.get_or_init(|| std::sync::Mutex::new(BTreeSet::new()));
+    let first = shown
+        .lock()
+        .map_or(true, |mut shown| shown.insert(message.to_string()));
+    if first {
+        crate::ui_hooks::notice(message);
+    }
+    first
+}
+
+/// `value` with [`PLUGIN_ROOT_PLACEHOLDER`] (or its legacy spelling) replaced by the
+/// plugin's folder in every string, so a plugin's server can name its own files.
 fn expand_plugin_root(value: &serde_json::Value, plugin_root: &str) -> serde_json::Value {
     match value {
-        serde_json::Value::String(text) => {
-            serde_json::Value::String(text.replace(PLUGIN_ROOT_PLACEHOLDER, plugin_root))
-        }
+        serde_json::Value::String(text) => serde_json::Value::String(
+            text.replace(PLUGIN_ROOT_PLACEHOLDER, plugin_root)
+                .replace(LEGACY_PLUGIN_ROOT_PLACEHOLDER, plugin_root),
+        ),
         serde_json::Value::Array(items) => serde_json::Value::Array(
             items
                 .iter()
@@ -2155,7 +2196,7 @@ description: t
             }
             other => panic!("expected stdio, got {other:?}"),
         }
-        let skill_dirs = loader.plugin_skill_dirs(&config);
+        let skill_dirs = config.plugin_skill_dirs();
         assert_eq!(skill_dirs.len(), 1);
         assert_eq!(skill_dirs[0].0, "tracker-kit");
         assert!(skill_dirs[0].1.join("triage").join("SKILL.md").is_file());
@@ -2188,8 +2229,38 @@ description: t
         .expect("settings");
         let config = loader.load().expect("config loads");
         assert!(config.mcp().needs_approval().is_empty());
-        assert!(loader.plugin_skill_dirs(&config).is_empty());
+        assert!(config.plugin_skill_dirs().is_empty());
         fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    /// Both spellings of the plugin-root placeholder become the plugin's folder, in
+    /// nested strings too; other values are kept.
+    #[test]
+    fn plugin_root_placeholder_and_its_legacy_spelling_expand() {
+        let value = serde_json::json!({
+            "command": "${NEURON_PLUGIN_ROOT}/bin/server",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/server.js", "--port", 3],
+            "env": {"DATA": "${CLAUDE_PLUGIN_ROOT}/data:${NEURON_PLUGIN_ROOT}/more"}
+        });
+        let expanded = super::expand_plugin_root(&value, "/opt/kit");
+        assert_eq!(
+            expanded,
+            serde_json::json!({
+                "command": "/opt/kit/bin/server",
+                "args": ["/opt/kit/server.js", "--port", 3],
+                "env": {"DATA": "/opt/kit/data:/opt/kit/more"}
+            })
+        );
+    }
+
+    /// A plugin server config that does not parse warns the first time only: settings
+    /// load for every skill lookup.
+    #[test]
+    fn a_repeated_warning_is_shown_once() {
+        let message = format!("warning: test-only notice {}", std::process::id());
+        assert!(super::notice_once(&message));
+        assert!(!super::notice_once(&message));
+        assert!(super::notice_once(&format!("{message} (another)")));
     }
 
     /// A workspace whose files want hooks, MCP servers and rules, each of which would leave

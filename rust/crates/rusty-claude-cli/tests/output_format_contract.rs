@@ -237,7 +237,7 @@ fn plugins_subcommand_manages_plugins_without_a_session() {
         "{message}"
     );
     assert!(
-        message.contains("tracker (wait for your approval"),
+        message.contains("tracker (listed by /mcp; not started in this build)"),
         "{message}"
     );
     assert!(message.contains("1 folder(s)"), "{message}");

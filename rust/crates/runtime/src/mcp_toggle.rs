@@ -63,7 +63,7 @@ pub(crate) fn write_object(path: &Path, object: &Map<String, Value>) -> Result<(
 }
 
 /// Turns the MCP server `name` on or off in the user settings. Turning off a server
-/// no settings file configures (nor the bundled defaults) is refused.
+/// that no settings file, bundled default or enabled plugin brings is refused.
 pub fn set_mcp_server_enabled(
     loader: &ConfigLoader,
     name: &str,
@@ -76,7 +76,11 @@ pub fn set_mcp_server_enabled(
     let settings_path = loader.config_home().join("settings.json");
     if !enabled {
         let config = loader.load().map_err(|error| error.to_string())?;
-        if config.mcp().get(name).is_none() && config.mcp().disabled().get(name).is_none() {
+        let mcp = config.mcp();
+        if mcp.get(name).is_none()
+            && mcp.disabled().get(name).is_none()
+            && mcp.needs_approval().get(name).is_none()
+        {
             return Err(format!("no MCP server named `{name}` is configured"));
         }
     }
@@ -182,6 +186,57 @@ mod tests {
         assert!(config.mcp().disabled().is_empty());
         let written = fs::read_to_string(home.join("settings.json")).unwrap();
         assert!(!written.contains("disabledMcpServers"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A plugin's MCP server (waiting for approval) can be switched off and on like
+    /// any other: `/mcp disable` and the MCP panel use this.
+    #[test]
+    fn a_plugin_server_can_be_turned_off_and_on() {
+        let root = temp_root();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".neuron");
+        let plugin = root.join("plugin-src");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(plugin.join(".neuron-plugin")).unwrap();
+        fs::write(
+            plugin.join(".neuron-plugin").join("plugin.json"),
+            r#"{"name": "tracker-kit", "version": "1.0.0", "description": "d",
+                "mcpServers": {"tracker": {"command": "node"}}}"#,
+        )
+        .unwrap();
+        let mut manager = plugins::PluginManager::new(plugins::PluginManagerConfig::new(&home));
+        let install = manager.install(plugin.to_str().unwrap()).unwrap();
+        fs::write(
+            home.join("settings.json"),
+            format!(
+                r#"{{"defaultMcpServers":false,"plugins":{{"enabled":{{"{}":true}}}}}}"#,
+                install.plugin_id
+            ),
+        )
+        .unwrap();
+        let loader = ConfigLoader::new(&cwd, &home);
+        assert!(loader
+            .load()
+            .unwrap()
+            .mcp()
+            .needs_approval()
+            .contains_key("tracker"));
+
+        let outcome = set_mcp_server_enabled(&loader, "tracker", false).unwrap();
+        assert!(outcome.changed);
+        let config = loader.load().unwrap();
+        assert!(config.mcp().needs_approval().is_empty());
+        assert!(config.mcp().disabled().contains_key("tracker"));
+
+        let outcome = set_mcp_server_enabled(&loader, "tracker", true).unwrap();
+        assert!(outcome.changed);
+        assert!(loader
+            .load()
+            .unwrap()
+            .mcp()
+            .needs_approval()
+            .contains_key("tracker"));
         let _ = fs::remove_dir_all(root);
     }
 

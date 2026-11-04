@@ -773,7 +773,9 @@ fn extensions_event() -> UiEvent {
                         enabled: false,
                     }
                 }));
-                // A plugin's servers wait for the user's approval and are not started.
+                // A plugin's servers wait for approval and are not started (no approval
+                // path in this build; see McpConfigCollection::needs_approval). The panel
+                // switch still works: it writes disabledMcpServers.
                 servers.extend(config.mcp().needs_approval().iter().map(|(name, server)| {
                     McpServerInfo {
                         name: name.clone(),
