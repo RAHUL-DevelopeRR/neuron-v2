@@ -590,6 +590,7 @@ pub(crate) fn parse_args_with_stdin(
             args: join_optional_args(&rest[1..]),
             output_format,
         }),
+        "plugins" | "plugin" => parse_plugins_args(&rest[1..], output_format),
         "skills" => {
             let args = join_optional_args(&rest[1..]);
             match classify_skills_slash_command(args.as_deref()) {
@@ -728,6 +729,8 @@ pub(crate) fn bare_slash_command_guidance(command_name: &str) -> Option<String> 
             | "bootstrap-plan"
             | "agents"
             | "mcp"
+            | "plugins"
+            | "plugin"
             | "skills"
             | "system-prompt"
             | "init"
@@ -784,6 +787,33 @@ pub(crate) fn quote_prompt_hint(name: &str) -> String {
     format!(
         "To send a prompt that starts with \"{name}\", quote it (`neuron \"{name} ...\"`) or use `neuron prompt \"{name} ...\"`."
     )
+}
+
+const PLUGINS_USAGE: &str = "neuron plugins [list|install <path>|enable <name>|disable <name>|update <id>|uninstall <id>|help]";
+
+/// `neuron plugins [ACTION [TARGET]]`: the same actions as `/plugins`, run without a
+/// session. Words that are no action print the usage; they never become a prompt.
+fn parse_plugins_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
+    let words = args.iter().map(String::as_str).collect::<Vec<_>>();
+    if matches!(words.as_slice(), ["help" | "-h" | "--help"]) {
+        return Ok(CliAction::Plugins {
+            action: Some("help".to_string()),
+            target: None,
+            output_format,
+        });
+    }
+    match SlashCommand::parse(&format!("/plugins {}", words.join(" "))) {
+        Ok(Some(SlashCommand::Plugins { action, target })) => Ok(CliAction::Plugins {
+            action,
+            target,
+            output_format,
+        }),
+        Ok(_) => Err(format!("usage: {PLUGINS_USAGE}")),
+        Err(error) => Err(format!(
+            "{}\nusage: {PLUGINS_USAGE}",
+            error.to_string().lines().next().unwrap_or_default()
+        )),
+    }
 }
 
 const SKILLS_USAGE: &str = "neuron skills [list|install <path>|help|<skill> [args]]";

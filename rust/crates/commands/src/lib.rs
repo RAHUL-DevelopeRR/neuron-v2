@@ -234,7 +234,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         aliases: &["plugins", "marketplace"],
         summary: "Manage Neuron plugins",
         argument_hint: Some(
-            "[list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]",
+            "[list|install <path|git-url>|enable <name>|disable <name>|uninstall <name>|update <name>|help]",
         ),
         resume_supported: false,
     },
@@ -1741,7 +1741,11 @@ fn parse_plugin_command(args: &[&str]) -> Result<SlashCommand, SlashCommandParse
             target: None,
         }),
         ["list", ..] => Err(usage_error("plugin list", "")),
-        ["install"] => Err(usage_error("plugin install", "<path>")),
+        ["help" | "-h" | "--help"] => Ok(SlashCommand::Plugins {
+            action: Some("help".to_string()),
+            target: None,
+        }),
+        ["install"] => Err(usage_error("plugin install", "<path|git-url>")),
         ["install", target @ ..] => Ok(SlashCommand::Plugins {
             action: Some("install".to_string()),
             target: Some(target.join(" ")),
@@ -1788,10 +1792,10 @@ fn parse_plugin_command(args: &[&str]) -> Result<SlashCommand, SlashCommandParse
         )),
         [action, ..] => Err(command_error(
             &format!(
-                "Unknown /plugin action '{action}'. Use list, install <path>, enable <name>, disable <name>, uninstall <id>, or update <id>."
+                "Unknown /plugin action '{action}'. Use list, install <path|git-url>, enable <name>, disable <name>, uninstall <name>, update <name>, or help."
             ),
             "plugin",
-            "/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]",
+            "/plugin [list|install <path|git-url>|enable <name>|disable <name>|uninstall <name>|update <name>|help]",
         )),
     }
 }
@@ -2251,10 +2255,14 @@ pub fn handle_plugins_slash_command(
                 reload_runtime: false,
             })
         }
+        Some("help") => Ok(PluginsCommandResult {
+            message: render_plugins_usage(),
+            reload_runtime: false,
+        }),
         Some("install") => {
             let Some(target) = target else {
                 return Ok(PluginsCommandResult {
-                    message: "Usage: /plugins install <path>".to_string(),
+                    message: "Usage: /plugins install <path|git-url>".to_string(),
                     reload_runtime: false,
                 });
             };
@@ -2263,8 +2271,18 @@ pub fn handle_plugins_slash_command(
                 .list_installed_plugins()?
                 .into_iter()
                 .find(|plugin| plugin.metadata.id == install.plugin_id);
+            let extensions = manager
+                .enabled_plugin_extensions()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|extension| extension.plugin_id == install.plugin_id);
+            let mut message = render_plugin_install_report(&install.plugin_id, plugin.as_ref());
+            message.push_str(&render_plugin_extensions_lines(extensions.as_ref()));
+            message.push_str(
+                "\n  Source           unverified: a plugin can run commands; review it before you use it",
+            );
             Ok(PluginsCommandResult {
-                message: render_plugin_install_report(&install.plugin_id, plugin.as_ref()),
+                message,
                 reload_runtime: true,
             })
         }
@@ -2309,9 +2327,10 @@ pub fn handle_plugins_slash_command(
                     reload_runtime: false,
                 });
             };
-            manager.uninstall(target)?;
+            let id = plugin_id_for_target(manager, target);
+            manager.uninstall(&id)?;
             Ok(PluginsCommandResult {
-                message: format!("Plugins\n  Result           uninstalled {target}"),
+                message: format!("Plugins\n  Result           uninstalled {id}"),
                 reload_runtime: true,
             })
         }
@@ -2322,7 +2341,7 @@ pub fn handle_plugins_slash_command(
                     reload_runtime: false,
                 });
             };
-            let update = manager.update(target)?;
+            let update = manager.update(&plugin_id_for_target(manager, target))?;
             let plugin = manager
                 .list_installed_plugins()?
                 .into_iter()
@@ -2756,9 +2775,10 @@ pub fn render_plugins_report_with_failures(
                 "disabled"
             };
             lines.push(format!(
-                "  {name:<20} v{version:<10} {enabled}",
+                "  {name:<20} v{version:<10} {enabled:<8} {id}",
                 name = plugin.metadata.name,
                 version = plugin.metadata.version,
+                id = plugin.metadata.id,
             ));
         }
     }
@@ -2788,6 +2808,53 @@ fn render_plugin_install_report(plugin_id: &str, plugin: Option<&PluginSummary>)
         "Plugins\n  Result           installed {plugin_id}\n  Name             {name}\n  Version          {version}\n  Status           {}",
         if enabled { "enabled" } else { "disabled" }
     )
+}
+
+/// What an installed plugin adds, as report lines: its skill folders and the MCP
+/// servers that wait for the user's approval.
+fn render_plugin_extensions_lines(extensions: Option<&plugins::PluginExtensions>) -> String {
+    let Some(extensions) = extensions else {
+        return String::new();
+    };
+    let mut lines = String::new();
+    if !extensions.skill_dirs.is_empty() {
+        let _ = write!(
+            lines,
+            "\n  Skills           {} folder(s); listed by /skills",
+            extensions.skill_dirs.len()
+        );
+    }
+    if !extensions.mcp_servers.is_empty() {
+        let names = extensions
+            .mcp_servers
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = write!(
+            lines,
+            "\n  MCP servers      {names} (wait for your approval; not started)"
+        );
+    }
+    lines
+}
+
+fn render_plugins_usage() -> String {
+    [
+        "Plugins",
+        "  Usage            /plugins [list|install <path|git-url>|enable <name>|disable <name>|update <name>|uninstall <name>]",
+        "  Direct CLI       neuron plugins [list|install <path|git-url>|enable <name>|disable <name>|update <name>|uninstall <name>]",
+        "  Manifest         .neuron-plugin/plugin.json (or plugin.json) in the plugin's folder",
+        "  Adds             tools, hooks, commands, skills and MCP servers; MCP servers wait for your approval",
+    ]
+    .join("\n")
+}
+
+/// The id of the installed plugin `target` names (by id or name); `target` itself when
+/// none matches, so the manager reports it as unknown.
+fn plugin_id_for_target(manager: &PluginManager, target: &str) -> String {
+    resolve_plugin_target(manager, target)
+        .map_or_else(|_| target.to_string(), |plugin| plugin.metadata.id)
 }
 
 fn resolve_plugin_target(
@@ -4858,7 +4925,7 @@ mod tests {
         assert!(help.contains("/session"), "help must mention /session");
         assert!(help.contains("/sandbox"));
         assert!(help.contains(
-            "/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]"
+            "/plugin [list|install <path|git-url>|enable <name>|disable <name>|uninstall <name>|update <name>|help]"
         ));
         assert!(help.contains("aliases: /plugins, /marketplace"));
         assert!(help.contains("/agents [list|help]"));

@@ -1808,6 +1808,15 @@ impl Engine {
         if matches!(name, "exit" | "quit") {
             return Step::Stop;
         }
+        // `/skills <skill> [args]` runs the skill as a prompt (the turn finishes itself).
+        if matches!(name, "skills" | "skill") {
+            if let SkillSlashDispatch::Invoke(prompt) =
+                classify_skills_slash_command(Some(args).filter(|args| !args.is_empty()))
+            {
+                self.submit(&prompt, &[]);
+                return Step::Continue;
+            }
+        }
         let result = match name {
             "context" => self
                 .cli
@@ -1909,6 +1918,36 @@ impl Engine {
             SlashCommand::Doctor => {
                 let report = engine_reports::doctor(&render_doctor_report()?);
                 self.show_report(report);
+            }
+            SlashCommand::Plugins { action, target } => {
+                let cwd = env::current_dir()?;
+                let loader = ConfigLoader::default_for(&cwd);
+                let config = loader.load()?;
+                let mut manager = build_plugin_manager(&cwd, &loader, &config);
+                let result =
+                    handle_plugins_slash_command(action.as_deref(), target.as_deref(), &mut manager)?;
+                if result.reload_runtime {
+                    // The plugin's tools, hooks and skills count from the next turn.
+                    let session = self.cli.runtime.session().clone();
+                    let session_id = self.cli.session.id.clone();
+                    self.rebuild_runtime(session, &session_id)?;
+                }
+                self.notice(&result.message);
+                if result.reload_runtime {
+                    self.send(extensions_event());
+                }
+            }
+            // `/skills <skill>` became a prompt in `slash`; the rest lists or installs.
+            SlashCommand::Skills { args } => {
+                let cwd = env::current_dir()?;
+                let report = handle_skills_slash_command(args.as_deref(), &cwd)?;
+                self.notice(&report);
+                if args
+                    .as_deref()
+                    .is_some_and(|args| args.trim_start().starts_with("install"))
+                {
+                    self.send(extensions_event());
+                }
             }
             SlashCommand::Unknown(name) => return Err(format_unknown_slash_command(&name).into()),
             other => {
@@ -3280,6 +3319,28 @@ mod tests {
                 UiEvent::TurnFinished,
             ]
         );
+        // /plugins and /skills list as notices in the full-screen UI too.
+        for (command, args, heading) in [
+            ("plugins", "", "Plugins"),
+            ("plugins", "help", "Plugins"),
+            ("skills", "list", "Skills"),
+        ] {
+            engine
+                .commands
+                .send(EngineCommand::Slash {
+                    command: command.into(),
+                    args: args.into(),
+                })
+                .unwrap();
+            let events = turn_events(&engine.events);
+            assert_eq!(without_notices(&events), vec![UiEvent::TurnFinished]);
+            assert!(
+                notices(&events)
+                    .iter()
+                    .any(|notice| notice.starts_with(heading)),
+                "/{command} {args}: {events:?}"
+            );
+        }
 
         // Reports: a notice until the UI shows report panels, then a report event.
         let slash = |command: &str| EngineCommand::Slash {

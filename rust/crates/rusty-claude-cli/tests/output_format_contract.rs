@@ -105,6 +105,77 @@ fn inventory_commands_emit_structured_json_when_requested() {
     assert_eq!(skills["action"], "list");
 }
 
+/// `neuron plugins ...` runs the plugin manager without a session or a model call:
+/// install from a folder, list, disable, enable and uninstall, each in its own run.
+/// Words that are no action print the usage and fail.
+#[test]
+fn plugins_subcommand_manages_plugins_without_a_session() {
+    let root = unique_temp_dir("plugins-cli");
+    let config_home = root.join("config-home");
+    let plugin = root.join("tracker-kit");
+    fs::create_dir_all(plugin.join(".neuron-plugin")).expect("plugin dir");
+    fs::create_dir_all(plugin.join("skills").join("triage")).expect("skill dir");
+    fs::write(
+        plugin.join("skills").join("triage").join("SKILL.md"),
+        "---\nname: triage\ndescription: Sort new issues\n---\nSteps.\n",
+    )
+    .expect("skill");
+    fs::write(
+        plugin.join(".neuron-plugin").join("plugin.json"),
+        r#"{"name": "tracker-kit", "version": "1.2.0", "description": "Issue tools",
+            "skills": "skills", "mcpServers": {"tracker": {"command": "node"}}}"#,
+    )
+    .expect("manifest");
+    let envs = [(
+        "NEURON_CONFIG_HOME",
+        config_home.to_str().expect("utf8 config home"),
+    )];
+    let run = |args: &[&str]| assert_json_command_with_env(&root, args, &envs);
+
+    let installed = run(&[
+        "--output-format",
+        "json",
+        "plugins",
+        "install",
+        plugin.to_str().expect("utf8 plugin path"),
+    ]);
+    assert_eq!(installed["kind"], "plugin");
+    assert_eq!(installed["action"], "install");
+    let message = installed["message"].as_str().expect("message");
+    assert!(message.contains("installed tracker-kit@external"), "{message}");
+    assert!(message.contains("tracker (wait for your approval"), "{message}");
+    assert!(message.contains("1 folder(s)"), "{message}");
+
+    let listed = run(&["--output-format", "json", "plugins", "list"]);
+    let message = listed["message"].as_str().expect("message");
+    assert!(message.contains("tracker-kit"), "{message}");
+    assert!(message.contains("enabled"), "{message}");
+
+    let disabled = run(&["--output-format", "json", "plugins", "disable", "tracker-kit"]);
+    assert!(disabled["message"]
+        .as_str()
+        .expect("message")
+        .contains("disabled tracker-kit@external"));
+    let mcp = run(&["--output-format", "json", "mcp"]);
+    assert_eq!(mcp["needs_approval_servers"], serde_json::json!([]));
+
+    run(&["--output-format", "json", "plugins", "enable", "tracker-kit"]);
+    let mcp = run(&["--output-format", "json", "mcp"]);
+    assert_eq!(mcp["needs_approval_servers"], serde_json::json!(["tracker"]));
+
+    let removed = run(&["--output-format", "json", "plugins", "uninstall", "tracker-kit"]);
+    assert!(removed["message"]
+        .as_str()
+        .expect("message")
+        .contains("uninstalled tracker-kit@external"));
+
+    let output = run_claw(&root, &["plugins", "frobnicate"], &envs);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("usage: neuron plugins"), "{stderr}");
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn agents_command_emits_structured_agent_entries_when_requested() {
     let root = unique_temp_dir("agents-json-populated");

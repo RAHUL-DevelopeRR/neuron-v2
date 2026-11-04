@@ -6864,8 +6864,42 @@ mod tests {
             }
         );
         // A slash command's alias gets the same guidance as its name.
-        let error = parse_args(&words(&["plugins"])).unwrap_err();
-        assert!(error.contains("/plugins"), "{error}");
+        let error = parse_args(&words(&["cwd"])).unwrap_err();
+        assert!(error.contains("/cwd"), "{error}");
+    }
+
+    #[test]
+    fn plugins_subcommand_parses_actions_and_refuses_other_words() {
+        let words = |values: &[&str]| values.iter().map(ToString::to_string).collect::<Vec<_>>();
+        for (args, action, target) in [
+            (vec!["plugins"], None, None),
+            (vec!["plugins", "list"], Some("list"), None),
+            (vec!["plugin", "help"], Some("help"), None),
+            (vec!["plugins", "install", "./kit"], Some("install"), Some("./kit")),
+            (vec!["plugins", "enable", "kit"], Some("enable"), Some("kit")),
+            (vec!["plugins", "disable", "kit"], Some("disable"), Some("kit")),
+            (vec!["plugins", "update", "kit"], Some("update"), Some("kit")),
+            (vec!["plugins", "uninstall", "kit"], Some("uninstall"), Some("kit")),
+        ] {
+            assert_eq!(
+                parse_args(&words(&args)),
+                Ok(CliAction::Plugins {
+                    action: action.map(str::to_string),
+                    target: target.map(str::to_string),
+                    output_format: CliOutputFormat::Text,
+                }),
+                "{args:?}"
+            );
+        }
+        // Never a prompt: unknown words and missing targets print the usage.
+        for args in [
+            vec!["plugins", "are", "great"],
+            vec!["plugins", "enable"],
+            vec!["plugins", "enable", "a", "b"],
+        ] {
+            let error = parse_args(&words(&args)).unwrap_err();
+            assert!(error.contains("usage: neuron plugins"), "{args:?}: {error}");
+        }
     }
 
     #[test]
