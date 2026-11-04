@@ -798,7 +798,7 @@ describe('splitAgentsBySize', () => {
       createNonImplementorAgent('b-1', 'basher'),
       createNonImplementorAgent('b-2', 'basher'),
       createNonImplementorAgent('ed-1', 'editor'),
-      createNonImplementorAgent('rw-1', 'researcher-web'),
+      createNonImplementorAgent('gm-1', 'glob-matcher'),
     ]
     const result = splitAgentsBySize(agents)
     expect(result).toEqual([
@@ -806,7 +806,7 @@ describe('splitAgentsBySize', () => {
       [agents[1]],          // code-reviewer (large)
       [agents[2], agents[3]], // basher + basher (small)
       [agents[4]],          // editor (large)
-      [agents[5]],          // researcher-web (small)
+      [agents[5]],          // glob-matcher (small)
     ])
   })
 })

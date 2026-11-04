@@ -224,7 +224,7 @@ export const extractSpawnAgentResultContent = (
   }
 
   // Handle lastMessage and allMessages output modes: { type: "lastMessage"|"allMessages", value: [Message array] }
-  // This is common for agents like researcher-web
+  // This is common for agents that return their whole message history
   if (
     (obj.type === 'lastMessage' || obj.type === 'allMessages') &&
     Array.isArray(obj.value)
