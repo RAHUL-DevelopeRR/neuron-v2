@@ -4855,7 +4855,9 @@ mod tests {
         assert!(help.contains("/pr [context]"));
         assert!(help.contains("/issue [context]"));
         assert!(help.contains("/ultraplan [task]"));
-        assert!(help.contains("/research [--depth quick|standard|deep] [--budget TOKENS] <question>"));
+        assert!(
+            help.contains("/research [--depth quick|standard|deep] [--budget TOKENS] <question>")
+        );
         assert!(help.contains("/teleport <symbol-or-path>"));
         assert!(help.contains("/debug-tool-call"));
         assert!(help.contains("/model [model]"));

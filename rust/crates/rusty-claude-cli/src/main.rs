@@ -4493,15 +4493,12 @@ impl LiveCli {
         };
         let mut progress = research::TerminalProgress::new(None, false);
         let cwd = env::current_dir()?;
-        let (outcome, path) = research::run_and_save(
-            &request,
-            &mut model,
-            &mut web,
-            &mut progress,
-            &cwd,
-            None,
-        )?;
-        println!("{}", TerminalRenderer::new().render_markdown(&outcome.report));
+        let (outcome, path) =
+            research::run_and_save(&request, &mut model, &mut web, &mut progress, &cwd, None)?;
+        println!(
+            "{}",
+            TerminalRenderer::new().render_markdown(&outcome.report)
+        );
         println!(
             "Saved to {}",
             path.strip_prefix(&cwd).unwrap_or(&path).display()
@@ -7109,7 +7106,10 @@ mod tests {
         ));
         let error =
             crate::research::parse_research_args(&[], true).expect_err("a question is needed");
-        assert!(error.contains(crate::research::RESEARCH_CLI_USAGE), "{error}");
+        assert!(
+            error.contains(crate::research::RESEARCH_CLI_USAGE),
+            "{error}"
+        );
     }
 
     #[test]

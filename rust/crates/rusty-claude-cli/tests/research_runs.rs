@@ -57,12 +57,7 @@ fn research_searches_with_one_run_id_and_saves_the_report() {
     let gateway = MockGateway::spawn();
     let workspace = Workspace::new("allow-web");
 
-    let output = research(
-        &workspace,
-        &server.base_url(),
-        &gateway,
-        &["--allow-web"],
-    );
+    let output = research(&workspace, &server.base_url(), &gateway, &["--allow-web"]);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -71,7 +66,10 @@ fn research_searches_with_one_run_id_and_saves_the_report() {
     assert!(stdout.starts_with("# Research: "), "{stdout}");
     assert!(stdout.contains("No page could be read"), "{stdout}");
     assert!(stderr.contains("search: rust async runtimes"), "{stderr}");
-    assert!(stderr.contains("read: http://127.0.0.1:9/runtimes"), "{stderr}");
+    assert!(
+        stderr.contains("read: http://127.0.0.1:9/runtimes"),
+        "{stderr}"
+    );
     assert!(stderr.contains("! not read:"), "{stderr}");
 
     // Both planned sub-questions were searched (the quick follow-up check found
@@ -109,7 +107,9 @@ fn research_searches_with_one_run_id_and_saves_the_report() {
     assert_eq!(report.trim_end(), stdout.trim_end());
     assert!(report.contains(&run_ids[0].to_string()) || report.contains("Research run `rr_"));
     let requests = runtime.block_on(server.captured_requests());
-    assert!(requests.iter().all(|request| !request.raw_body.contains("loopback")));
+    assert!(requests
+        .iter()
+        .all(|request| !request.raw_body.contains("loopback")));
     workspace.remove();
 }
 
