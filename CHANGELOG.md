@@ -12,8 +12,8 @@ The release workflow copies a version's section into its GitHub release notes.
   `needs_connect` (`McpServerInfo.connect_url`, engine feature `mcp_hosted`);
   `/mcp connect <server>` and `c` in the MCP panel open the page that links it.
   Destructive tool calls tell the gateway they were confirmed only when you approved
-  them in the permission prompt. The inherited `claudeai-proxy` type still parses as
-  the same server; `/mcp` and the protocol call the transport `zerox`.
+  them in the permission prompt. Older settings for these servers keep working;
+  `/mcp` and the protocol call the transport `zerox`.
 - MCP supply chain: catalog connectors and the default MCP servers no longer start
   through `npx -y` or `uvx`. The catalog (`2026-11-05.3`) pins each local entry's whole
   npm dependency tree with `sha512` integrity, its Python requirements with wheel
