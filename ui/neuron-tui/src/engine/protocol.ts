@@ -303,6 +303,13 @@ export interface McpServerInfo {
    * status is `needs_connect` (feature `mcp_hosted`). Older engines leave it out.
    */
   connect_url?: string
+  /**
+   * The permission tier of each of its tools (`read`, `write`, `destructive`
+   * or `external`) as the connector catalog pins it, for a catalog or hosted
+   * connector (feature `mcp_catalog`); shown on the tool's calls. Other
+   * servers, and older engines, leave it out.
+   */
+  tool_tiers?: Record<string, string>
 }
 
 /** A variable a catalog connector needs. */

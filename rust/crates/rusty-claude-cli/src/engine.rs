@@ -71,6 +71,17 @@ use std::sync::{MutexGuard, PoisonError};
 /// How often a pending question checks whether its turn was interrupted.
 const ANSWER_CANCEL_POLL: Duration = Duration::from_millis(250);
 
+/// How often an idle engine looks whether the MCP servers starting in the background are
+/// up (see `Engine::serve`).
+const MCP_START_POLL: Duration = Duration::from_millis(500);
+
+/// Between commands, about the MCP servers starting in the background: whether to keep
+/// watching (they still start), and whether to send the extensions again (a start that
+/// was being watched has ended, ready or failed).
+fn mcp_start_watch(watching: bool, starting: bool) -> (bool, bool) {
+    (starting, watching && !starting)
+}
+
 /// How long `/commit` waits for the model to draft a message before it names the files
 /// instead.
 const COMMIT_DRAFT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -813,6 +824,7 @@ pub(crate) fn extensions_event() -> UiEvent {
                     .iter()
                     .map(|(name, server)| {
                         let (status, tools, error) = mcp_server_status(name, live);
+                        let tool_tiers = mcp_tool_tiers(server, &tools);
                         let required = config.mcp().required().get(name);
                         let (status, error, connect_url) = match hosted_needs_connect(name, server)
                         {
@@ -833,6 +845,7 @@ pub(crate) fn extensions_event() -> UiEvent {
                             required: required.is_some(),
                             unpinned: unpinned(server),
                             connect_url,
+                            tool_tiers,
                         }
                     })
                     .collect();
@@ -849,6 +862,7 @@ pub(crate) fn extensions_event() -> UiEvent {
                         required: false,
                         unpinned: unpinned(server),
                         connect_url: None,
+                        tool_tiers: BTreeMap::new(),
                     }
                 }));
                 // Configured and switched on, but not started: waiting for approval, or
@@ -881,6 +895,7 @@ pub(crate) fn extensions_event() -> UiEvent {
                         required: false,
                         unpinned: unpinned(server),
                         connect_url: None,
+                        tool_tiers: BTreeMap::new(),
                     }),
                 );
                 servers.sort_by(|left, right| left.name.cmp(&right.name));
@@ -943,6 +958,32 @@ fn hosted_needs_connect(
 
 /// The catalog connector a configured server was added from (see
 /// `runtime::mcp_catalog_entry_for`); bundled servers are Neuron's own.
+/// The catalog's tier of each of `tools` on `server` (a hosted connector's entry by its
+/// id, a catalog connector's by its launch spec), as permission prompts use it: a tool the
+/// entry does not list gets its default tier. Empty for any other server.
+fn mcp_tool_tiers(
+    server: &runtime::ScopedMcpServerConfig,
+    tools: &[String],
+) -> BTreeMap<String, String> {
+    let entry = match &server.config {
+        runtime::McpServerConfig::ManagedProxy(proxy) => {
+            runtime::McpCatalog::builtin().get(&proxy.id)
+        }
+        _ if server.scope == runtime::ConfigSource::Bundled => None,
+        config => runtime::mcp_catalog_entry_for(config),
+    };
+    let Some(entry) = entry else {
+        return BTreeMap::new();
+    };
+    tools
+        .iter()
+        .map(|tool| {
+            let tier = entry.pinned_tier(tool).unwrap_or(entry.default_tier);
+            (tool.clone(), tier.as_str().to_string())
+        })
+        .collect()
+}
+
 fn catalog_id(server: &runtime::ScopedMcpServerConfig) -> Option<String> {
     if server.scope == runtime::ConfigSource::Bundled {
         return None;
@@ -1675,31 +1716,55 @@ impl Engine {
 
     /// Runs queued commands until shutdown. A failure or panic in one command is reported
     /// and the engine keeps going, like the line REPL.
+    ///
+    /// While MCP servers start in the background, it also looks every
+    /// [`MCP_START_POLL`] whether they are up, and then sends the extensions again, so a UI
+    /// shows them ready without asking.
     fn serve(&mut self, queue: &Receiver<EngineCommand>) -> EngineExit {
-        while let Ok(command) = queue.recv() {
-            if self.shared.closing.load(Ordering::SeqCst) {
-                break;
-            }
-            let step = match panic::catch_unwind(AssertUnwindSafe(|| self.handle(command))) {
-                Ok(step) => step,
-                Err(payload) => {
-                    self.send(UiEvent::Error {
-                        message: format!(
-                            "internal error: {}",
-                            repl_loop::panic_message(payload.as_ref())
-                        ),
-                        detail: None,
-                    });
-                    self.finish_turn();
-                    self.persist();
-                    Step::Continue
+        let mut watching_mcp = background_mcp_starting();
+        loop {
+            let next = if watching_mcp {
+                match queue.recv_timeout(MCP_START_POLL) {
+                    Ok(command) => Some(command),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            } else {
+                match queue.recv() {
+                    Ok(command) => Some(command),
+                    Err(_) => break,
                 }
             };
-            if repl_loop::force_quit_requested() {
-                return EngineExit::ForceQuit;
+            if let Some(command) = next {
+                if self.shared.closing.load(Ordering::SeqCst) {
+                    break;
+                }
+                let step = match panic::catch_unwind(AssertUnwindSafe(|| self.handle(command))) {
+                    Ok(step) => step,
+                    Err(payload) => {
+                        self.send(UiEvent::Error {
+                            message: format!(
+                                "internal error: {}",
+                                repl_loop::panic_message(payload.as_ref())
+                            ),
+                            detail: None,
+                        });
+                        self.finish_turn();
+                        self.persist();
+                        Step::Continue
+                    }
+                };
+                if repl_loop::force_quit_requested() {
+                    return EngineExit::ForceQuit;
+                }
+                if step == Step::Stop || self.ui_closed {
+                    break;
+                }
             }
-            if step == Step::Stop || self.ui_closed {
-                break;
+            let (watch, push) = mcp_start_watch(watching_mcp, background_mcp_starting());
+            watching_mcp = watch;
+            if push {
+                self.send(extensions_event());
             }
         }
         EngineExit::Shutdown
@@ -3000,9 +3065,9 @@ fn parse_rewind_mode(mode: &str) -> Result<RewindMode, String> {
 mod tests {
     use super::{
         definitions, forward_commands, git_status, hosted_needs_connect, mcp_server_status,
-        mcp_transport_id, plain_notice, question_notice, shorten, shorten_json_strings, spawn,
-        transcript_event, EngineExit, EngineHandle, EngineOptions, McpRuntimeView, RunningTurn,
-        Shared,
+        mcp_start_watch, mcp_tool_tiers, mcp_transport_id, plain_notice, question_notice, shorten,
+        shorten_json_strings, spawn, transcript_event, EngineExit, EngineHandle, EngineOptions,
+        McpRuntimeView, RunningTurn, Shared,
     };
     use crate::repl_loop::InterruptPresses;
     use crate::tests::{env_lock, with_current_dir};
@@ -4359,6 +4424,57 @@ mod tests {
             mcp_server_status("docs", None),
             ("not_started", Vec::new(), None)
         );
+    }
+
+    #[test]
+    fn hosted_and_catalog_connectors_list_their_tool_tiers_and_others_none() {
+        let hosted = runtime::ScopedMcpServerConfig {
+            scope: runtime::ConfigSource::Managed,
+            config: runtime::McpServerConfig::ManagedProxy(runtime::McpManagedProxyServerConfig {
+                url: String::new(),
+                id: "github".to_string(),
+            }),
+        };
+        let tools = vec![
+            "get_me".to_string(),
+            "merge_pull_request".to_string(),
+            "brand_new_tool".to_string(),
+        ];
+        let tiers = mcp_tool_tiers(&hosted, &tools);
+        assert_eq!(tiers.get("get_me").map(String::as_str), Some("read"));
+        assert_eq!(
+            tiers.get("merge_pull_request").map(String::as_str),
+            Some("destructive")
+        );
+        // A tool the entry does not list gets its default tier, as its prompts do.
+        let github = runtime::McpCatalog::builtin().get("github").unwrap();
+        assert_eq!(
+            tiers.get("brand_new_tool").map(String::as_str),
+            Some(github.default_tier.as_str())
+        );
+
+        let local = runtime::ScopedMcpServerConfig {
+            scope: runtime::ConfigSource::User,
+            config: runtime::McpServerConfig::Stdio(runtime::McpStdioServerConfig {
+                command: "notes".to_string(),
+                args: Vec::new(),
+                env: std::collections::BTreeMap::new(),
+                tool_call_timeout_ms: None,
+                sandbox: None,
+            }),
+        };
+        assert!(mcp_tool_tiers(&local, &tools).is_empty());
+    }
+
+    #[test]
+    fn the_extensions_go_out_again_once_a_watched_mcp_start_ends() {
+        // Nothing starting: nothing to watch or send.
+        assert_eq!(mcp_start_watch(false, false), (false, false));
+        // A start is seen, and watched while it lasts.
+        assert_eq!(mcp_start_watch(false, true), (true, false));
+        assert_eq!(mcp_start_watch(true, true), (true, false));
+        // It ended: the extensions go out once, and the watch stops.
+        assert_eq!(mcp_start_watch(true, false), (false, true));
     }
 
     #[test]

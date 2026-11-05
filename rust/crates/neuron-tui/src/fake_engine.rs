@@ -139,11 +139,12 @@ fn run(
 pub mod samples {
     use crate::protocol::{
         AccountDetails, BranchInfo, ClientMessage, ConnectorInfo, ConnectorVariable,
-        ContextBreakdown, EngineCommand, ErrorDetail, GitStatus, HookPreview, McpServerPreview,
-        ModelInfo, PermissionRulePreview, ReportLink, ReportSection, SessionRunStatus,
-        SessionScope, SessionSummary, UiEvent, UsageAmounts, UsageWindow, CAPABILITY_QUESTIONS,
-        CAPABILITY_REPORTS,
+        ContextBreakdown, EngineCommand, ErrorDetail, GitStatus, HookPreview, McpServerInfo,
+        McpServerPreview, ModelInfo, PermissionRulePreview, ReportLink, ReportSection,
+        SecretValues, SessionRunStatus, SessionScope, SessionSummary, UiEvent, UsageAmounts,
+        UsageWindow, CAPABILITY_QUESTIONS, CAPABILITY_REPORTS,
     };
+    use std::collections::BTreeMap;
 
     /// The workspace the samples run in.
     pub const CWD: &str = "/home/dev/zero-x.live";
@@ -159,6 +160,24 @@ pub mod samples {
             EngineCommand::RefreshAccount => vec![account()],
             EngineCommand::ListModels => vec![models()],
             EngineCommand::ListConnectorCatalog { .. } => vec![connector_catalog()],
+            EngineCommand::ListExtensions => vec![extensions()],
+            // A change says what it did, then lists the servers again.
+            EngineCommand::SetMcpServerEnabled { name, .. }
+            | EngineCommand::RemoveMcpServer { name, .. }
+            | EngineCommand::ApproveMcpServer { name } => vec![
+                UiEvent::Notice {
+                    message: format!("MCP server {name} changed."),
+                    kind: None,
+                },
+                extensions(),
+            ],
+            EngineCommand::AddMcpServer { id, .. } => vec![
+                UiEvent::Notice {
+                    message: format!("Added MCP server {id}."),
+                    kind: None,
+                },
+                extensions(),
+            ],
             EngineCommand::Slash { command, .. } => {
                 let name = command.trim().trim_start_matches('/');
                 let first = match name {
@@ -189,11 +208,6 @@ pub mod samples {
             | EngineCommand::Capabilities { .. }
             | EngineCommand::Answer { .. }
             | EngineCommand::Resume { .. }
-            | EngineCommand::ListExtensions
-            | EngineCommand::SetMcpServerEnabled { .. }
-            | EngineCommand::AddMcpServer { .. }
-            | EngineCommand::RemoveMcpServer { .. }
-            | EngineCommand::ApproveMcpServer { .. }
             | EngineCommand::Commit { .. }
             | EngineCommand::Rewind { .. } => Vec::new(),
         }
@@ -232,6 +246,8 @@ pub mod samples {
             trust_preview(),
             workspace_trusted(),
             question(),
+            extensions(),
+            connector_catalog(),
         ]
     }
 
@@ -269,6 +285,30 @@ pub mod samples {
             EngineCommand::Answer {
                 id: 7,
                 text: "main".into(),
+            },
+            EngineCommand::ListExtensions,
+            EngineCommand::SetMcpServerEnabled {
+                name: "docs".into(),
+                enabled: false,
+            },
+            EngineCommand::ListConnectorCatalog {
+                query: "git".into(),
+            },
+            EngineCommand::AddMcpServer {
+                id: "github".into(),
+                name: None,
+                scope: Some("user".into()),
+                secrets: SecretValues(BTreeMap::from([(
+                    "GITHUB_PERSONAL_ACCESS_TOKEN".to_string(),
+                    "example-not-a-token".to_string(),
+                )])),
+            },
+            EngineCommand::RemoveMcpServer {
+                name: "docs".into(),
+                scope: None,
+            },
+            EngineCommand::ApproveMcpServer {
+                name: "postgres-tools".into(),
             },
         ]
         .into_iter()
@@ -377,13 +417,76 @@ pub mod samples {
         }
     }
 
-    /// The agent's AskUserQuestion, as a UI with [`CAPABILITY_QUESTIONS`] gets it.
+    /// The agent's `AskUserQuestion`, as a UI with [`CAPABILITY_QUESTIONS`] gets it.
     #[must_use]
     pub fn question() -> UiEvent {
         UiEvent::Question {
             id: 7,
             question: "Which branch should the release go out from?".into(),
             options: vec!["main".into(), "release/7.0".into()],
+        }
+    }
+
+    /// The MCP servers in each state a UI draws: a ready catalog connector with its tool
+    /// tiers, a required one, a workspace server waiting for approval, a hosted connector
+    /// not linked yet, an unpinned failed one and a disabled one.
+    #[must_use]
+    pub fn extensions() -> UiEvent {
+        let server = |name: &str, scope: &str, transport: &str, status: &str| McpServerInfo {
+            name: name.into(),
+            scope: scope.into(),
+            transport: transport.into(),
+            status: status.into(),
+            tools: Vec::new(),
+            error: None,
+            enabled: true,
+            catalog: None,
+            required: false,
+            unpinned: false,
+            connect_url: None,
+            tool_tiers: BTreeMap::new(),
+        };
+        UiEvent::Extensions {
+            mcp_servers: vec![
+                McpServerInfo {
+                    tools: vec!["get_me".into(), "merge_pull_request".into()],
+                    catalog: Some("github".into()),
+                    tool_tiers: BTreeMap::from([
+                        ("get_me".to_string(), "read".to_string()),
+                        ("merge_pull_request".to_string(), "destructive".to_string()),
+                    ]),
+                    ..server("github", "user", "http", "ready")
+                },
+                McpServerInfo {
+                    tools: vec!["search_graph".into()],
+                    catalog: Some("codebase-memory".into()),
+                    required: true,
+                    ..server("codebase-memory", "managed", "stdio", "ready")
+                },
+                McpServerInfo {
+                    error: Some(
+                        "a workspace server: run /mcp approve postgres-tools to start it".into(),
+                    ),
+                    ..server("postgres-tools", "project", "stdio", "needs_approval")
+                },
+                McpServerInfo {
+                    error: Some("not linked to your Zero-X account".into()),
+                    connect_url: Some("https://zero-x.live/dashboard#connectors".into()),
+                    ..server("linear", "managed", "zerox", "needs_connect")
+                },
+                McpServerInfo {
+                    error: Some("could not start".into()),
+                    unpinned: true,
+                    ..server("notes", "local", "stdio", "failed")
+                },
+                McpServerInfo {
+                    enabled: false,
+                    ..server("docs", "user", "http", "disabled")
+                },
+            ],
+            plugins: Vec::new(),
+            skills: Vec::new(),
+            agents: Vec::new(),
         }
     }
 
@@ -705,10 +808,10 @@ mod tests {
         }
     }
 
-    /// The catalog commands: the list gets the sample catalog; the changes are the real
-    /// engine's to answer (the fake sends nothing).
+    /// The catalog and MCP commands: the list gets the sample catalog, the extensions the
+    /// sample servers, and a change a notice and the servers again, as the real engine.
     #[test]
-    fn answers_the_connector_catalog_command() {
+    fn answers_the_connector_catalog_and_mcp_commands() {
         assert!(matches!(
             samples::answer(&EngineCommand::ListConnectorCatalog {
                 query: String::new()
@@ -716,10 +819,37 @@ mod tests {
             .as_slice(),
             [UiEvent::ConnectorCatalog { connectors, .. }] if connectors[0].variables[0].secret
         ));
-        assert!(samples::answer(&EngineCommand::ApproveMcpServer {
-            name: "docs".into()
-        })
-        .is_empty());
+        assert!(matches!(
+            samples::answer(&EngineCommand::ListExtensions).as_slice(),
+            [UiEvent::Extensions { mcp_servers, .. }]
+                if mcp_servers.iter().any(|server| server.status == "needs_approval")
+                    && mcp_servers.iter().any(|server| server.required)
+                    && mcp_servers.iter().any(|server| !server.tool_tiers.is_empty())
+        ));
+        for command in [
+            EngineCommand::ApproveMcpServer {
+                name: "postgres-tools".into(),
+            },
+            EngineCommand::AddMcpServer {
+                id: "github".into(),
+                name: None,
+                scope: None,
+                secrets: crate::protocol::SecretValues::default(),
+            },
+            EngineCommand::RemoveMcpServer {
+                name: "docs".into(),
+                scope: None,
+            },
+            EngineCommand::SetMcpServerEnabled {
+                name: "docs".into(),
+                enabled: true,
+            },
+        ] {
+            assert!(matches!(
+                samples::answer(&command).as_slice(),
+                [UiEvent::Notice { .. }, UiEvent::Extensions { .. }]
+            ));
+        }
     }
 
     /// Driven with the samples' answers, every protocol v2 command gets its events.

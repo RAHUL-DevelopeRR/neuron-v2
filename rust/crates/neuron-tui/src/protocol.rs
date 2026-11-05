@@ -248,6 +248,12 @@ pub struct McpServerInfo {
     /// ([`FEATURE_MCP_HOSTED`]): a page on the Zero-X gateway. Older engines leave it out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connect_url: Option<String>,
+    /// The permission tier of each of its tools (`read`, `write`, `destructive` or
+    /// `external`) as the connector catalog pins it, for a catalog or hosted connector
+    /// ([`FEATURE_MCP_CATALOG`]): a UI shows it on the tool's calls. Other servers, and
+    /// older engines, leave it out.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_tiers: BTreeMap<String, String>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -1893,6 +1899,7 @@ mod tests {
             required: true,
             unpinned: false,
             connect_url: None,
+            tool_tiers: BTreeMap::new(),
         };
         let json = serde_json::to_value(&required).unwrap();
         assert_eq!(json["required"], true);
@@ -1921,6 +1928,33 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<McpServerInfo>(json).unwrap(),
             unpinned
+        );
+    }
+
+    #[test]
+    fn a_catalog_row_carries_its_tool_tiers_and_older_rows_none() {
+        let older: McpServerInfo = serde_json::from_str(
+            r#"{"name":"github","scope":"user","transport":"http","status":"ready","tools":["get_me"],"error":null}"#,
+        )
+        .unwrap();
+        assert!(older.tool_tiers.is_empty());
+        assert!(serde_json::to_value(&older)
+            .unwrap()
+            .get("tool_tiers")
+            .is_none());
+        let tiered = McpServerInfo {
+            catalog: Some("github".into()),
+            tool_tiers: BTreeMap::from([
+                ("get_me".to_string(), "read".to_string()),
+                ("merge_pull_request".to_string(), "destructive".to_string()),
+            ]),
+            ..older
+        };
+        let json = serde_json::to_value(&tiered).unwrap();
+        assert_eq!(json["tool_tiers"]["merge_pull_request"], "destructive");
+        assert_eq!(
+            serde_json::from_value::<McpServerInfo>(json).unwrap(),
+            tiered
         );
     }
 

@@ -924,6 +924,19 @@ pub(crate) struct ExtensionsSnapshot {
     pub(crate) plugins: Vec<plugins::PluginSummary>,
 }
 
+/// Whether this thread's shared MCP servers are still starting in the background. It only
+/// looks: the started servers join through [`extensions_snapshot`] or the next turn.
+pub(crate) fn background_mcp_starting() -> bool {
+    SHARED_PLUGIN_STATE.with(|slot| {
+        slot.borrow().as_ref().is_some_and(|state| {
+            state
+                .background_mcp
+                .as_ref()
+                .is_some_and(BackgroundMcp::is_starting)
+        })
+    })
+}
+
 /// The shared state's MCP servers and plugins as they are now, taking servers that
 /// finished starting in the background. `None` before any runtime was built on this
 /// thread.

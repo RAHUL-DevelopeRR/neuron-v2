@@ -2531,6 +2531,11 @@ impl BackgroundMcp {
         Self { shared, thread }
     }
 
+    /// The servers are still starting (no answer yet).
+    fn is_starting(&self) -> bool {
+        self.shared.finished().is_none()
+    }
+
     /// The started servers with their tools, or why they could not start; `None` while
     /// they are still starting, and after the first answer.
     fn take_finished(
