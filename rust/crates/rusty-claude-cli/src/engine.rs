@@ -1261,7 +1261,7 @@ fn models_event(current_model: &str) -> UiEvent {
                 })
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_else(crate::provider_auth::active_provider_model_infos);
     UiEvent::Models {
         current: shown_model(current_model).to_string(),
         models,
@@ -1907,6 +1907,7 @@ impl Engine {
                 let report = engine_reports::doctor(&render_doctor_report()?);
                 self.show_report(report);
             }
+            SlashCommand::Providers => self.notice(&crate::provider_auth::providers_report()),
             SlashCommand::Unknown(name) => return Err(format_unknown_slash_command(&name).into()),
             other => {
                 return Err(format!(

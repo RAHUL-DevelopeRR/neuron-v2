@@ -742,8 +742,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "providers",
-        aliases: &[],
-        summary: "List available model providers",
+        aliases: &["auth"],
+        summary: "Show provider keys and the active provider (keys are never shown)",
         argument_hint: None,
         resume_supported: true,
     },
@@ -1130,6 +1130,8 @@ pub enum SlashCommand {
         args: Option<String>,
     },
     Doctor,
+    /// `/providers` (`/auth`): provider key status, never the keys.
+    Providers,
     Login,
     Logout,
     Vim,
@@ -1261,6 +1263,7 @@ impl SlashCommand {
             Self::Cost => "/cost",
             Self::Artifacts => "/artifacts",
             Self::Doctor => "/doctor",
+            Self::Providers => "/providers",
             Self::Config { .. } => "/config",
             Self::Memory { .. } => "/memory",
             Self::History { .. } => "/history",
@@ -1432,9 +1435,13 @@ pub fn validate_slash_command_input(
         "skills" | "skill" => SlashCommand::Skills {
             args: parse_skills_args(remainder.as_deref())?,
         },
-        "doctor" | "providers" => {
+        "doctor" => {
             validate_no_args(command, &args)?;
             SlashCommand::Doctor
+        }
+        "providers" | "auth" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Providers
         }
         "login" => {
             validate_no_args(command, &args)?;
@@ -4262,6 +4269,7 @@ pub fn handle_slash_command(
         | SlashCommand::Agents { .. }
         | SlashCommand::Skills { .. }
         | SlashCommand::Doctor
+        | SlashCommand::Providers
         | SlashCommand::Login
         | SlashCommand::Logout
         | SlashCommand::Vim
