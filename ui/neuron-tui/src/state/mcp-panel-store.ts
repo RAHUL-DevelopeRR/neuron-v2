@@ -38,6 +38,14 @@ export const serverEnabled = (server: McpServerInfo): boolean => server.enabled 
 /** The connector policy requires the server: its switch is locked on. */
 export const serverLocked = (server: McpServerInfo): boolean => server.required === true
 
+/**
+ * The page that links a hosted connector the Zero-X account has not linked yet
+ * (status `needs_connect`); `null` for any other server.
+ */
+export function serverConnectUrl(server: McpServerInfo): string | null {
+  return server.status === 'needs_connect' && server.connect_url ? server.connect_url : null
+}
+
 /** `ready · 4 tools`, `off`, `failed: why`, ... for a row. */
 export function serverSummary(server: McpServerInfo): string {
   if (!serverEnabled(server)) return 'off'

@@ -75,6 +75,12 @@ export const FEATURE_MCP_CATALOG = 'mcp_catalog'
  * and `required` on servers that cannot be turned off.
  */
 export const FEATURE_MCP_POLICY = 'mcp_policy'
+/**
+ * Hosted connectors through Zero-X: MCP servers with transport `zerox`, status
+ * `needs_connect` while the connector is not linked to the Zero-X account, and
+ * `connect_url`, the page that links it.
+ */
+export const FEATURE_MCP_HOSTED = 'mcp_hosted'
 
 /** A UI capability: questions come as `question` events, not "Question:" notices. */
 export const CAPABILITY_QUESTIONS = 'questions'
@@ -238,14 +244,18 @@ export interface McpServerInfo {
    * settings, or a server the connector policy requires).
    */
   scope: string
-  /** `stdio`, `http`, `sse`, `ws`, `sdk` or `managed_proxy`. */
+  /**
+   * `stdio`, `http`, `sse`, `ws`, `sdk` or `zerox` (a hosted connector through
+   * Zero-X; older engines said `managed_proxy`).
+   */
   transport: string
   /**
    * `starting`, `ready`, `failed`, `pending`, `unsupported`, `not_started`,
    * `disabled`, `needs_approval` (a new or changed workspace server, started once
-   * approved with `/mcp approve <name>`) or `blocked` (a deny rule or the
-   * connector policy refuses it). `error` says why for the last two; older
-   * engines send neither.
+   * approved with `/mcp approve <name>`), `blocked` (a deny rule or the
+   * connector policy refuses it) or `needs_connect` (a hosted connector not
+   * linked to the Zero-X account yet; see `connect_url`). `error` says why for
+   * the last three; older engines send none of them.
    */
   status: string
   /** Its tools, without the `mcp__<server>__` prefix. */
@@ -270,6 +280,11 @@ export interface McpServerInfo {
    * leave it out.
    */
   unpinned?: boolean
+  /**
+   * The page on the Zero-X gateway that links this hosted connector, while its
+   * status is `needs_connect` (feature `mcp_hosted`). Older engines leave it out.
+   */
+  connect_url?: string
 }
 
 /** A variable a catalog connector needs. */

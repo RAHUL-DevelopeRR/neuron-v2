@@ -181,6 +181,7 @@ const STRUCT_FIELDS: Record<string, string[]> = {
     'catalog',
     'required',
     'unpinned',
+    'connect_url',
   ]),
   ConnectorVariable: fieldsOf<ConnectorVariable>()([
     'name',

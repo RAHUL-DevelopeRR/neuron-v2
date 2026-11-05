@@ -2,12 +2,14 @@
  * `/mcp`: the MCP servers with what each is doing, and a switch per server, in
  * the composer's place (engine feature `mcp_toggle`).
  *
- *   ↑/↓ move   space/enter turn on or off   esc close
+ *   ↑/↓ move   space/enter turn on or off   c connect   esc close
  *
  * A switch is saved in the user settings (`disabledMcpServers`); the servers
  * restart from the next turn. A server the connector policy requires shows
  * `[req]` and its switch does nothing. Remote servers that need a sign-in say so in
- * their error (`neuron mcp login <server>` in a terminal). A stdio server that is
+ * their error (`neuron mcp login <server>` in a terminal). A hosted connector not
+ * linked to the Zero-X account yet shows `needs connect`; `c` opens the page that
+ * links it. A stdio server that is
  * neither a catalog connector nor pinned ends its row with `unpinned`
  * (`/mcp pin <server>` records its version and hashes).
  */
@@ -17,9 +19,10 @@ import { useKeyboard } from '@opentui/react'
 import React, { useCallback, useEffect, useState } from 'react'
 
 import { truncateToWidth, visibleWindow } from './model-picker'
-import { toggleMcpServer } from '../engine/mcp-panel'
+import { connectMcpServer, toggleMcpServer } from '../engine/mcp-panel'
 import { useTheme } from '../hooks/use-theme'
 import {
+  serverConnectUrl,
   serverEnabled,
   serverLocked,
   serverSummary,
@@ -32,6 +35,7 @@ import type { McpServerInfo } from '../engine/protocol'
 export type McpKeyAction =
   | { type: 'move'; delta: number }
   | { type: 'toggle' }
+  | { type: 'connect' }
   | { type: 'close' }
   | { type: 'none' }
 
@@ -50,6 +54,8 @@ export function resolveMcpKey(key: Pick<KeyEvent, 'name' | 'ctrl' | 'meta'>): Mc
     case 'return':
     case 'enter':
       return { type: 'toggle' }
+    case 'c':
+      return { type: 'connect' }
     default:
       return { type: 'none' }
   }
@@ -89,6 +95,11 @@ export const McpPanel = ({
           case 'toggle': {
             const server = servers?.[focus]
             if (server) toggleMcpServer(server)
+            return
+          }
+          case 'connect': {
+            const server = servers?.[focus]
+            if (server) void connectMcpServer(server)
             return
           }
         }
@@ -148,7 +159,11 @@ export const McpPanel = ({
       {body}
       <text style={{ fg: theme.muted }}>
         {count > maxVisibleRows ? `${focus + 1}/${count} · ` : ''}
-        {count > 0 ? '↑↓ move · space turn on/off · esc close' : 'esc close'}
+        {count > 0
+          ? `↑↓ move · space turn on/off${
+              servers?.[focus] && serverConnectUrl(servers[focus]) ? ' · c connect' : ''
+            } · esc close`
+          : 'esc close'}
       </text>
     </box>
   )

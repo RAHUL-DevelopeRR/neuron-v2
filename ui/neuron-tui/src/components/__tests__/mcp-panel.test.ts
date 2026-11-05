@@ -1,10 +1,11 @@
 import { beforeEach, describe, expect, test } from 'bun:test'
 
-import { handleMcpPanelEvent, toggleMcpServer } from '../../engine/mcp-panel'
+import { connectMcpServer, handleMcpPanelEvent, toggleMcpServer } from '../../engine/mcp-panel'
 import { findGitViewCommand } from '../../commands/git-view-commands'
 import { FEATURE_MCP_TOGGLE } from '../../engine/protocol'
 import { useChatStore } from '../../state/chat-store'
 import {
+  serverConnectUrl,
   serverEnabled,
   serverLocked,
   serverSummary,
@@ -36,6 +37,7 @@ describe('the MCP servers panel', () => {
     expect(resolveMcpKey({ name: 'escape', ctrl: false, meta: false })).toEqual({ type: 'close' })
     expect(resolveMcpKey({ name: 'c', ctrl: true, meta: false })).toEqual({ type: 'close' })
     expect(resolveMcpKey({ name: 'x', ctrl: false, meta: false })).toEqual({ type: 'none' })
+    expect(resolveMcpKey({ name: 'c', ctrl: false, meta: false })).toEqual({ type: 'connect' })
   })
 
   test('rows say whether a server is on and what it does', () => {
@@ -112,6 +114,54 @@ describe('the MCP servers panel', () => {
     expect(handleMcpPanelEvent(event)).toBe(true)
     expect(useMcpPanelStore.getState().servers).toEqual([server()])
     expect(useMcpPanelStore.getState().pending).toBeNull()
+  })
+
+  test('a hosted connector that is not linked opens the page that links it', async () => {
+    const connectUrl = 'https://zero-x.live/dashboard#connectors'
+    const hosted = server({
+      name: 'github',
+      scope: 'managed',
+      transport: 'zerox',
+      status: 'needs_connect',
+      tools: [],
+      error: `not linked to your Zero-X account; connect it at ${connectUrl} (/mcp connect github)`,
+      connect_url: connectUrl,
+    })
+    expect(serverConnectUrl(hosted)).toBe(connectUrl)
+    expect(serverSummary(hosted)).toStartWith('needs connect: not linked to your Zero-X account')
+    // Linked (or an older engine): nothing to connect.
+    expect(serverConnectUrl(server({ transport: 'zerox' }))).toBeNull()
+    expect(serverConnectUrl({ ...hosted, connect_url: undefined })).toBeNull()
+
+    const opened: string[] = []
+    const before = useChatStore.getState().messages.length
+    expect(
+      await connectMcpServer(hosted, async (url) => {
+        opened.push(url)
+        return true
+      }),
+    ).toBe(true)
+    expect(opened).toEqual([connectUrl])
+    let messages = useChatStore.getState().messages
+    expect(messages.length).toBe(before + 1)
+    expect(JSON.stringify(messages[messages.length - 1])).toContain(`Opening ${connectUrl}`)
+
+    // No browser here: the page is still named.
+    expect(await connectMcpServer(hosted, async () => false)).toBe(false)
+    messages = useChatStore.getState().messages
+    expect(JSON.stringify(messages[messages.length - 1])).toContain(
+      `Connect github at ${connectUrl}`,
+    )
+
+    // Any other server opens nothing.
+    opened.length = 0
+    expect(
+      await connectMcpServer(server(), async (url) => {
+        opened.push(url)
+        return true
+      }),
+    ).toBe(false)
+    expect(opened).toEqual([])
   })
 
   test('/mcp is the UI’s own only when the engine has the switch', () => {

@@ -241,7 +241,7 @@ export interface McpServerInfo {
   name: string
   /** `bundled`, `user`, `project` or `local`. */
   scope: string
-  /** `stdio`, `http`, `sse`, `ws`, `sdk` or `managed_proxy`. */
+  /** `stdio`, `http`, `sse`, `ws`, `sdk` or `zerox` (older engines: `managed_proxy`). */
   transport: string
   /**
    * `starting`, `ready`, `failed`, `pending` (started, tools not found),

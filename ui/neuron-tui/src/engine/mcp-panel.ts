@@ -8,8 +8,14 @@
 
 import { getNeuronEngineClient, runExchange } from './neuron-engine-client'
 import { useChatStore } from '../state/chat-store'
-import { serverEnabled, serverLocked, useMcpPanelStore } from '../state/mcp-panel-store'
+import {
+  serverConnectUrl,
+  serverEnabled,
+  serverLocked,
+  useMcpPanelStore,
+} from '../state/mcp-panel-store'
 import { getSystemMessage } from '../utils/message-history'
+import { safeOpen } from '../utils/open-url'
 
 import type { McpServerInfo, UiEvent } from './protocol'
 
@@ -73,6 +79,29 @@ export function toggleMcpServer(server: McpServerInfo): void {
     store.setPending(null)
     showLine(error instanceof Error ? error.message : String(error))
   }
+}
+
+/**
+ * `c` on a hosted connector that needs connecting: opens the Zero-X page that
+ * links it (`open` is the browser opener) and says where it is either way.
+ * `true` when the browser opened.
+ */
+export async function connectMcpServer(
+  server: McpServerInfo,
+  open: (url: string) => Promise<boolean> = safeOpen,
+): Promise<boolean> {
+  const url = serverConnectUrl(server)
+  if (!url) {
+    showLine(`${server.name} has nothing to connect.`)
+    return false
+  }
+  const opened = await open(url).catch(() => false)
+  showLine(
+    opened
+      ? `Opening ${url} to connect ${server.name}; it is ready from the next turn.`
+      : `Connect ${server.name} at ${url}; it is ready from the next turn.`,
+  )
+  return opened
 }
 
 /** `/mcp <args>`: the engine's own report or switch, answered in the chat. */
