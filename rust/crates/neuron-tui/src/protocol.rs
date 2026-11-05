@@ -86,6 +86,16 @@ pub struct ModelInfo {
     /// it does not say.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_images: Option<bool>,
+    /// Who serves it ([`FEATURE_STATUS_BAR`]): the gateway's `owned_by` or `provider`
+    /// (`gemini`, `groq`, `zero-x` for `auto`, ...). A UI draws it as a monogram.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// The thinking levels it takes, lowest first ([`FEATURE_STATUS_BAR`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_efforts: Option<Vec<String>>,
+    /// The catalog says it reasons ([`FEATURE_STATUS_BAR`]); `None` when it does not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_reasoning: Option<bool>,
 }
 
 /// The Zero-X login, as the UI may show it. Never carries the token.
@@ -140,6 +150,13 @@ pub const FEATURE_MCP_POLICY: &str = "mcp_policy";
 /// status `needs_connect` while the user has not linked the connector on the Zero-X
 /// dashboard, and [`McpServerInfo::connect_url`], the page to link it on (a UI opens it).
 pub const FEATURE_MCP_HOSTED: &str = "mcp_hosted";
+/// The prompt status bar's engine side: `provider`, `model_display_name`,
+/// `reasoning_effort(s)`, `full_access_allowed` and `context` on [`UiEvent::Status`];
+/// `provider`, `reasoning_efforts` and `supports_reasoning` on [`ModelInfo`];
+/// [`EngineCommand::SetReasoningEffort`], [`EngineCommand::SetPermissionMode`],
+/// [`EngineCommand::ListBranches`] (answered by [`UiEvent::Branches`]) and
+/// [`EngineCommand::SwitchBranch`]; `/effort`, and `/context` as a report.
+pub const FEATURE_STATUS_BAR: &str = "status_bar";
 
 /// What this engine can do beyond protocol 1, in [`UiEvent::Ready`]. A UI sends the
 /// commands a feature adds only when the engine lists it: an older engine would skip
@@ -169,6 +186,7 @@ pub const ENGINE_FEATURES: &[&str] = &[
     FEATURE_MCP_CATALOG,
     FEATURE_MCP_POLICY,
     FEATURE_MCP_HOSTED,
+    FEATURE_STATUS_BAR,
 ];
 
 /// `report` events for the commands that show a report (`/usage`, `/init`, `/memory`,
@@ -467,6 +485,43 @@ pub struct UsageWindow {
     pub window_seconds: Option<u64>,
 }
 
+/// What fills the context window ([`FEATURE_STATUS_BAR`]), as estimated tokens.
+/// `used_tokens` is what each request sends (system prompt, tool schemas, instructions
+/// and the conversation); `context_window - output_reserve` is what it may use.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextBreakdown {
+    pub context_window: u64,
+    /// Kept free for the reply (`max_tokens`).
+    pub output_reserve: u64,
+    /// The system prompt without the project instructions.
+    pub system_tokens: u64,
+    pub tool_schema_tokens: u64,
+    pub tool_count: u64,
+    /// `NEURON.md` and the other instruction files and memory.
+    pub instruction_tokens: u64,
+    pub instruction_files: Vec<String>,
+    /// Prompts, replies and tool calls.
+    pub conversation_tokens: u64,
+    /// Tool results.
+    pub tool_output_tokens: u64,
+    pub used_tokens: u64,
+    /// Auto-compaction starts when `used_tokens` reaches this.
+    pub threshold_tokens: u64,
+}
+
+/// One local branch, for the branch picker ([`UiEvent::Branches`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchInfo {
+    pub name: String,
+    /// Its upstream (`origin/main`), when it has one.
+    pub upstream: Option<String>,
+    /// Commits ahead of and behind the upstream; `None` without one.
+    pub ahead: Option<u64>,
+    pub behind: Option<u64>,
+    /// Its last commit (Unix milliseconds).
+    pub last_commit_ms: Option<u64>,
+}
+
 /// What a failed request needs from the user, for a UI to offer the way out: sign in
 /// again, upgrade, wait for a reset, or retry later ([`FEATURE_ERROR_DETAILS`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -659,6 +714,25 @@ pub enum UiEvent {
         /// [`AccountDetails::usage_window`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_tokens_estimate: Option<u64>,
+        /// Who serves the model ([`FEATURE_STATUS_BAR`]), as on [`ModelInfo`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        /// The catalog's name for the model ([`FEATURE_STATUS_BAR`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_display_name: Option<String>,
+        /// The thinking level the next turn asks for; `None` for the model's default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
+        /// The levels the model takes; `None` when unknown, empty when it does not reason.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_efforts: Option<Vec<String>>,
+        /// Full access may be picked: the engine started with it, or with
+        /// `--dangerously-skip-permissions`.
+        #[serde(default)]
+        full_access_allowed: bool,
+        /// What fills the context window ([`FEATURE_STATUS_BAR`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context: Option<ContextBreakdown>,
     },
     /// After a sign-in from the signed-out start: the engine is opening the session
     /// (plugins, MCP servers), which can take a while. `TurnFinished` and a `Status` with
@@ -827,6 +901,14 @@ pub enum UiEvent {
     Account {
         signed_in: bool,
         account: Option<AccountDetails>,
+    },
+    /// Answer to [`EngineCommand::ListBranches`]: the local branches, newest commit first.
+    Branches {
+        /// The checked-out branch; `None` on a detached HEAD.
+        current: Option<String>,
+        branches: Vec<BranchInfo>,
+        /// The working tree has uncommitted changes (switching is refused then).
+        dirty: bool,
     },
     /// Answer to [`EngineCommand::TrustPreview`]: what trusting the workspace would turn
     /// on. Reading it starts nothing.
@@ -1065,6 +1147,26 @@ pub enum EngineCommand {
         #[serde(default)]
         dry_run: bool,
     },
+    /// The thinking level of the next turns ([`FEATURE_STATUS_BAR`]); `None` for the
+    /// model's default. A `Status` follows, or an `Error`.
+    SetReasoningEffort {
+        #[serde(default)]
+        effort: Option<String>,
+    },
+    /// `read-only`, `workspace-write`, `danger-full-access` (only when the status says
+    /// `full_access_allowed`), or `plan` / `plan-off` for plan mode
+    /// ([`FEATURE_STATUS_BAR`]). No notice and no `TurnFinished`: a `Status` follows, or
+    /// an `Error`.
+    SetPermissionMode { mode: String },
+    /// Ask for the local branches ([`UiEvent::Branches`]).
+    ListBranches,
+    /// Check out `name` (`create`: a new branch from HEAD). Refused while a turn runs or
+    /// the working tree has changes. A notice and a `Status` follow, or an `Error`.
+    SwitchBranch {
+        name: String,
+        #[serde(default)]
+        create: bool,
+    },
 }
 
 /// The user's answer to a permission request.
@@ -1254,6 +1356,11 @@ mod tests {
                 account: None,
                 served_model: None,
                 request_tokens_estimate: None,
+                provider: None,
+                reasoning_effort: None,
+                reasoning_efforts: None,
+                full_access_allowed: false,
+                context: None,
                 ..
             }
         ));
@@ -1845,5 +1952,104 @@ mod tests {
             waiting
         );
         assert!(ENGINE_FEATURES.contains(&FEATURE_MCP_HOSTED));
+    }
+    /// The status bar's fields and commands ([`FEATURE_STATUS_BAR`]): they round-trip, and
+    /// an older engine's JSON without them reads as their defaults.
+    #[test]
+    fn status_bar_fields_and_commands_round_trip() {
+        assert!(ENGINE_FEATURES.contains(&FEATURE_STATUS_BAR));
+        for (line, command) in [
+            (
+                r#"{"kind":"command","type":"set_reasoning_effort","effort":"high"}"#,
+                EngineCommand::SetReasoningEffort {
+                    effort: Some("high".into()),
+                },
+            ),
+            (
+                r#"{"kind":"command","type":"set_reasoning_effort"}"#,
+                EngineCommand::SetReasoningEffort { effort: None },
+            ),
+            (
+                r#"{"kind":"command","type":"set_permission_mode","mode":"plan"}"#,
+                EngineCommand::SetPermissionMode {
+                    mode: "plan".into(),
+                },
+            ),
+            (
+                r#"{"kind":"command","type":"list_branches"}"#,
+                EngineCommand::ListBranches,
+            ),
+            (
+                r#"{"kind":"command","type":"switch_branch","name":"main"}"#,
+                EngineCommand::SwitchBranch {
+                    name: "main".into(),
+                    create: false,
+                },
+            ),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<ClientMessage>(line).unwrap(),
+                ClientMessage::Command(command.clone())
+            );
+            let back = serde_json::to_string(&ClientMessage::Command(command.clone())).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ClientMessage>(&back).unwrap(),
+                ClientMessage::Command(command)
+            );
+        }
+
+        let status: UiEvent = serde_json::from_str(
+            r#"{"type":"status","model":"gemini-2.5-flash","permission_mode":"workspace-write","session_id":"s","cwd":".","workspace_trusted":true,"plan_mode":false,"context_percent":4,"git":null,"provider":"gemini","model_display_name":"Gemini 2.5 Flash","reasoning_effort":"high","reasoning_efforts":["none","low","medium","high"],"full_access_allowed":true,"context":{"context_window":1000,"output_reserve":100,"system_tokens":10,"tool_schema_tokens":20,"tool_count":3,"instruction_tokens":5,"instruction_files":["NEURON.md"],"conversation_tokens":40,"tool_output_tokens":25,"used_tokens":100,"threshold_tokens":720}}"#,
+        )
+        .unwrap();
+        let UiEvent::Status {
+            provider,
+            reasoning_efforts,
+            full_access_allowed,
+            context,
+            ..
+        } = &status
+        else {
+            panic!("a status");
+        };
+        assert_eq!(provider.as_deref(), Some("gemini"));
+        assert_eq!(reasoning_efforts.as_ref().map(Vec::len), Some(4));
+        assert!(*full_access_allowed);
+        assert_eq!(
+            context.as_ref().map(|context| context.used_tokens),
+            Some(100)
+        );
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(serde_json::from_value::<UiEvent>(json).unwrap(), status);
+
+        let branches = UiEvent::Branches {
+            current: None,
+            branches: vec![BranchInfo {
+                name: "main".into(),
+                upstream: Some("origin/main".into()),
+                ahead: Some(1),
+                behind: Some(0),
+                last_commit_ms: Some(1),
+            }],
+            dirty: true,
+        };
+        let json = serde_json::to_value(&branches).unwrap();
+        assert_eq!(json["type"], "branches");
+        assert_eq!(serde_json::from_value::<UiEvent>(json).unwrap(), branches);
+
+        let window: UsageWindow = serde_json::from_str(r#"{"tokens":5,"limit_tokens":null,"remaining_tokens":null,"resets_at":null,"window_seconds":18000}"#).unwrap();
+        assert_eq!(window.window_seconds, Some(18_000));
+        let model: ModelInfo = serde_json::from_str(
+            r#"{"id":"m","display_name":null,"available":true,"unavailable_reason":null,"context_window":null,"tiers":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                model.provider,
+                model.reasoning_efforts,
+                model.supports_reasoning
+            ),
+            (None, None, None)
+        );
     }
 }

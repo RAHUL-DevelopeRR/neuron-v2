@@ -320,6 +320,10 @@ export function handleEngineEvent(event: UiEvent): void {
       showNotice(engineNotice(event.message))
       return
     case 'error':
+      // A refused permission choice leaves nothing pending: the next
+      // Shift+Tab cycles from what the status shows. A turn's own error is
+      // not that answer; a choice queued behind the turn still comes.
+      if (!turnActive) engine.setPendingPermission(null)
       // `trust_workspace` failed: the trust screen shows why.
       if (useStartGate.getState().trustStep.kind === 'saving') {
         useStartGate.getState().setTrustStep({ kind: 'failed', error: inUiWording(event.message) })
@@ -365,6 +369,13 @@ export function handleEngineEvent(event: UiEvent): void {
       // A scrollable panel above the input, closed with Esc (report-panel.tsx).
       engine.setReport(event)
       useChatStore.getState().setInputMode('report')
+      return
+    case 'account':
+      // The plan, limits and usage for the status bar and its context popover.
+      engine.setAccount(event.account)
+      return
+    case 'branches':
+      engine.setBranches(event)
       return
     default:
       return

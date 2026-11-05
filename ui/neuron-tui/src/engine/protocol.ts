@@ -81,6 +81,15 @@ export const FEATURE_MCP_POLICY = 'mcp_policy'
  * `connect_url`, the page that links it.
  */
 export const FEATURE_MCP_HOSTED = 'mcp_hosted'
+/**
+ * The prompt status bar's engine side: `provider`, `model_display_name`,
+ * `reasoning_effort(s)`, `full_access_allowed` and `context` on `status`;
+ * `provider`, `reasoning_efforts` and `supports_reasoning` on models; the
+ * `set_reasoning_effort`, `set_permission_mode`, `list_branches` and
+ * `switch_branch` commands and the `branches` event; `/effort` and a
+ * `/context` report.
+ */
+export const FEATURE_STATUS_BAR = 'status_bar'
 
 /** A UI capability: questions come as `question` events, not "Question:" notices. */
 export const CAPABILITY_QUESTIONS = 'questions'
@@ -167,6 +176,15 @@ export interface ModelInfo {
   available_again_at?: string | null
   /** The catalog says the model reads images; absent when it does not say. */
   supports_images?: boolean | null
+  /**
+   * Who serves it (the gateway's `owned_by`/`provider`: `gemini`, `groq`,
+   * `zero-x` for `auto`, ...), feature `status_bar`. Drawn as a monogram.
+   */
+  provider?: string | null
+  /** The thinking levels it takes, lowest first (feature `status_bar`). */
+  reasoning_efforts?: string[] | null
+  /** The catalog says it reasons; absent or `null` when it does not say. */
+  supports_reasoning?: boolean | null
 }
 
 /** The Zero-X login, as the UI may show it. Never carries the token. */
@@ -425,6 +443,32 @@ export interface UsageWindow {
 }
 
 /**
+ * What fills the context window (feature `status_bar`). Token counts are the
+ * engine's estimates. `used_tokens` is what is sent with each request
+ * (system prompt, tool schemas, instructions and the conversation);
+ * `context_window - output_reserve` is what it may use.
+ */
+export interface ContextBreakdown {
+  context_window: number
+  /** Kept free for the reply (`max_tokens`). */
+  output_reserve: number
+  /** The system prompt without the project instructions. */
+  system_tokens: number
+  tool_schema_tokens: number
+  tool_count: number
+  /** NEURON.md and other instruction files and memory. */
+  instruction_tokens: number
+  instruction_files: string[]
+  /** Prompts, replies and tool calls. */
+  conversation_tokens: number
+  /** Tool results. */
+  tool_output_tokens: number
+  used_tokens: number
+  /** Auto-compaction starts when `used_tokens` reaches this. */
+  threshold_tokens: number
+}
+
+/**
  * What a failed request needs from the user, for the UI to offer the way out:
  * sign in again, upgrade, wait for a reset, or retry later.
  */
@@ -578,6 +622,21 @@ export interface StatusEvent {
    * is `AccountDetails.usage_window`.
    */
   request_tokens_estimate?: number | null
+  /** Who serves the model (feature `status_bar`), as on {@link ModelInfo}. */
+  provider?: string | null
+  /** The catalog's name for the model (feature `status_bar`). */
+  model_display_name?: string | null
+  /** The thinking level the next turn asks for; `null` for the model's default. */
+  reasoning_effort?: string | null
+  /** The levels the model takes; `null` when unknown, empty when it does not reason. */
+  reasoning_efforts?: string[] | null
+  /**
+   * Full access may be picked: the engine started with it (or with
+   * `--dangerously-skip-permissions`). Absent from older engines.
+   */
+  full_access_allowed?: boolean
+  /** What fills the context window; absent from older engines. */
+  context?: ContextBreakdown | null
 }
 
 /**
@@ -963,6 +1022,28 @@ export interface RewoundEvent {
   prompt: string | null
 }
 
+/** One local branch, for the branch picker (feature `status_bar`). */
+export interface BranchInfo {
+  name: string
+  /** Its upstream (`origin/main`), when it has one. */
+  upstream: string | null
+  /** Commits ahead of and behind the upstream; `null` without one. */
+  ahead: number | null
+  behind: number | null
+  /** Its last commit (Unix milliseconds). */
+  last_commit_ms: number | null
+}
+
+/** Answer to `list_branches`: the local branches, newest commit first. */
+export interface BranchesEvent {
+  type: 'branches'
+  /** The checked-out branch; `null` on a detached HEAD. */
+  current: string | null
+  branches: BranchInfo[]
+  /** The working tree has uncommitted changes (switching is refused then). */
+  dirty: boolean
+}
+
 /** Engine → UI. `UiEvent` in protocol.rs (`#[serde(tag = "type")]`). */
 export type UiEvent =
   | ReadyEvent
@@ -1002,6 +1083,7 @@ export type UiEvent =
   | ReportEvent
   | AccountEvent
   | TrustPreviewEvent
+  | BranchesEvent
 
 export type UiEventType = UiEvent['type']
 
@@ -1044,6 +1126,7 @@ export const UI_EVENT_TYPES: readonly UiEventType[] = [
   'report',
   'account',
   'trust_preview',
+  'branches',
 ]
 
 // ---------------------------------------------------------------- UI → engine
@@ -1134,6 +1217,26 @@ export type EngineCommand =
   | { type: 'commit'; message: string }
   /** Go back to a checkpoint from a `checkpoints` event. */
   | { type: 'rewind'; checkpoint: number; mode: RewindMode; dry_run?: boolean }
+  /**
+   * The thinking level of the next turns (feature `status_bar`); `null` for
+   * the model's default. A `status` follows, or an `error`.
+   */
+  | { type: 'set_reasoning_effort'; effort: string | null }
+  /**
+   * `read-only`, `workspace-write`, `danger-full-access` (only when
+   * `full_access_allowed`), or `plan` / `plan-off` for plan mode (feature
+   * `status_bar`). No notice and no `turn_finished`: a `status` follows, or
+   * an `error`.
+   */
+  | { type: 'set_permission_mode'; mode: string }
+  /** The local branches, as a `branches` event (feature `status_bar`). */
+  | { type: 'list_branches' }
+  /**
+   * Check out `name` (`create`: a new branch from HEAD). Refused while a
+   * turn runs or the tree has changes. A notice and a `status` follow, or an
+   * `error`.
+   */
+  | { type: 'switch_branch'; name: string; create: boolean }
 
 /** Every `EngineCommand` tag. */
 export const ENGINE_COMMAND_TYPES: readonly EngineCommand['type'][] = [
@@ -1158,6 +1261,10 @@ export const ENGINE_COMMAND_TYPES: readonly EngineCommand['type'][] = [
   'refresh_account',
   'commit',
   'rewind',
+  'set_reasoning_effort',
+  'set_permission_mode',
+  'list_branches',
+  'switch_branch',
 ]
 
 /** The user's answer to a permission request (`#[serde(tag = "kind")]`). */

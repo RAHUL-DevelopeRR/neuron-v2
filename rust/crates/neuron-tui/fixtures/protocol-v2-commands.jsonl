@@ -2,5 +2,9 @@
 {"kind":"command","type":"list_sessions","scope":"project"}
 {"kind":"command","type":"trust_preview"}
 {"kind":"command","type":"refresh_account"}
+{"kind":"command","type":"set_reasoning_effort","effort":"high"}
+{"kind":"command","type":"set_permission_mode","mode":"plan"}
+{"kind":"command","type":"list_branches"}
+{"kind":"command","type":"switch_branch","name":"feat/tui-status-bar","create":false}
 {"kind":"command","type":"capabilities","features":["questions","reports"],"client":"terminal"}
 {"kind":"command","type":"slash","command":"usage","args":""}

@@ -1,5 +1,6 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: Tab and
-// Shift+Tab no longer cycle the agent modes (AGENT_MODES_AVAILABLE).
+// Shift+Tab no longer cycle the agent modes (AGENT_MODES_AVAILABLE); Shift+Tab
+// cycles the permission mode and Alt+M/T/W/P/C open the status bar's pickers.
 // See ui/neuron-tui/PORTING.md.
 import { AGENT_MODES_AVAILABLE } from './constants'
 import { getInputModeConfig, type InputMode } from './input-modes'
@@ -110,6 +111,10 @@ export type ChatKeyboardAction =
   // Paste action (dispatcher checks clipboard content to route to image or text handler)
   | { type: 'paste' }
 
+  // Status bar pickers
+  | { type: 'cycle-permission' }
+  | { type: 'open-status-picker'; picker: StatusPickerKey }
+
   // No action needed
   | { type: 'show-help' }
   | { type: 'open-chat-history' }
@@ -117,6 +122,18 @@ export type ChatKeyboardAction =
 
 const hasModifier = (key: KeyEvent) =>
   Boolean(key.ctrl || key.meta || key.option)
+
+/** The status bar's pickers, by their Alt key. */
+export type StatusPickerKey = 'model' | 'think' | 'workspace' | 'permission' | 'context'
+
+/** Alt+M model, Alt+T thinking level, Alt+W workspace, Alt+P permissions, Alt+C context. */
+export const STATUS_PICKER_KEYS: Readonly<Record<string, StatusPickerKey>> = {
+  m: 'model',
+  t: 'think',
+  w: 'workspace',
+  p: 'permission',
+  c: 'context',
+}
 
 /**
  * Pure function that resolves a keyboard action based on key event and state.
@@ -314,6 +331,19 @@ export function resolveChatKeyboardAction(
     !state.mentionMenuActive
   ) {
     return { type: 'toggle-agent-mode' }
+  }
+
+  // Priority 12.5: the status bar. Shift+Tab cycles the permission mode and
+  // Alt+<letter> opens a picker, in the plain composer only (not over a menu).
+  const inComposer =
+    state.inputMode === 'default' && !state.slashMenuActive && !state.mentionMenuActive
+  if (!AGENT_MODES_AVAILABLE && isShiftTab && inComposer) {
+    return { type: 'cycle-permission' }
+  }
+  const isAlt = Boolean((key.meta || key.option) && !key.ctrl)
+  const picker = isAlt && !key.shift ? STATUS_PICKER_KEYS[key.name] : undefined
+  if (picker && inComposer) {
+    return { type: 'open-status-picker', picker }
   }
 
   // Priority 13: Unfocus agent

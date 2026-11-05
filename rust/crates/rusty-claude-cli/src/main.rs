@@ -55,6 +55,7 @@ mod engine;
 mod engine_account;
 mod engine_mcp;
 mod engine_reports;
+mod engine_status_bar;
 mod engine_stdio;
 mod engine_trust;
 mod error_detail;

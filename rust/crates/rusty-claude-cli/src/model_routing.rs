@@ -148,6 +148,9 @@ mod tests {
             status: None,
             available_again_at: None,
             supports_images: None,
+            provider: None,
+            reasoning_efforts: None,
+            supports_reasoning: None,
         }
     }
 

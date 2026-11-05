@@ -589,6 +589,15 @@ impl AnthropicRuntimeClient {
         self.reasoning_effort.as_deref()
     }
 
+    /// How many tool definitions each request sends (without the deferred MCP ones).
+    pub fn tool_count(&self) -> usize {
+        if self.enable_tools {
+            filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref()).len()
+        } else {
+            0
+        }
+    }
+
     pub(crate) fn output(&self) -> &TurnOutput {
         &self.output
     }
