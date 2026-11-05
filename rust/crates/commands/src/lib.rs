@@ -4811,8 +4811,10 @@ mod tests {
 
         let action_error = parse_error_message("/mcp inspect alpha");
         assert!(action_error
-            .contains("Unknown /mcp action 'inspect'. Use list, show <server>, or help."));
-        assert!(action_error.contains("  Usage            /mcp [list|show <server>|help]"));
+            .contains("Unknown /mcp action 'inspect'. Use list, show <server>, enable <server>, disable <server>, or help."));
+        assert!(action_error.contains(
+            "  Usage            /mcp [list|show <server>|enable <server>|disable <server>|help]"
+        ));
     }
 
     #[test]
@@ -4861,7 +4863,7 @@ mod tests {
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
         assert!(help.contains("/config [env|hooks|model|plugins]"));
-        assert!(help.contains("/mcp [list|show <server>|help]"));
+        assert!(help.contains("/mcp [list|show <server>|enable <server>|disable <server>|help]"));
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
         assert!(help.contains("/diff"));
@@ -5563,8 +5565,10 @@ mod tests {
         let cwd = temp_dir("mcp-usage");
 
         let help = super::handle_mcp_slash_command(Some("help"), &cwd).expect("mcp help");
-        assert!(help.contains("Usage            /mcp [list|show <server>|help]"));
-        assert!(help.contains("Direct CLI       neuron mcp [list|show <server>|help]"));
+        assert!(help.contains(
+            "Usage            /mcp [list|show <server>|enable <server>|disable <server>|help]"
+        ));
+        assert!(help.contains("Direct CLI       neuron mcp [list|show <server>|enable <server>|disable <server>|login <server>|logout <server>|help]"));
 
         let unexpected =
             super::handle_mcp_slash_command(Some("show alpha beta"), &cwd).expect("mcp usage");
@@ -5572,12 +5576,16 @@ mod tests {
 
         let nested_help =
             super::handle_mcp_slash_command(Some("show --help"), &cwd).expect("mcp help");
-        assert!(nested_help.contains("Usage            /mcp [list|show <server>|help]"));
+        assert!(nested_help.contains(
+            "Usage            /mcp [list|show <server>|enable <server>|disable <server>|help]"
+        ));
         assert!(nested_help.contains("Unexpected       show"));
 
         let unknown_help =
             super::handle_mcp_slash_command(Some("inspect --help"), &cwd).expect("mcp usage");
-        assert!(unknown_help.contains("Usage            /mcp [list|show <server>|help]"));
+        assert!(unknown_help.contains(
+            "Usage            /mcp [list|show <server>|enable <server>|disable <server>|help]"
+        ));
         assert!(unknown_help.contains("Unexpected       inspect"));
 
         let _ = fs::remove_dir_all(cwd);
