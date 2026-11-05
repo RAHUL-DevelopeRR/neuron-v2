@@ -333,7 +333,10 @@ for its exact command, arguments and environment:
 - `uvx <package>[@version] ...`: uv resolves it with hashes once; it installs and
   starts as a catalog Python entry does.
 - Any other command: the sha256 of the program file and of each file its arguments
-  name. A start where one of them changed is refused until you pin it again.
+  name. A start where one of them changed is refused until you pin it again. These
+  files are found from the workspace, so such a pin holds only where they are the same
+  files: the same `node server.js` in another workspace runs another `server.js` and is
+  unpinned there until you pin it there too.
 
 Pins are kept in `~/.neuron/mcp/pins.json`. Changing the server's command, arguments
 or environment makes it unpinned again. Remote servers run what their host serves, so

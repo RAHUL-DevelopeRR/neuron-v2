@@ -2808,7 +2808,7 @@ fn render_mcp_report_for(
                 );
             }
             let store = runtime::McpInstallStore::in_config_home(loader.config_home());
-            for name in runtime::mcp_unpinned_servers(&store, runtime_config.mcp()) {
+            for name in runtime::mcp_unpinned_servers(&store, runtime_config.mcp(), loader.cwd()) {
                 let _ = write!(
                     report,
                     "\n  {name:<16} unpinned (not a catalog connector; /mcp pin {name} records its version and hash)"
@@ -2920,7 +2920,8 @@ fn render_mcp_report_json_for(
                 .collect::<Vec<_>>());
             report["unpinned_servers"] = json!(runtime::mcp_unpinned_servers(
                 &runtime::McpInstallStore::in_config_home(loader.config_home()),
-                runtime_config.mcp()
+                runtime_config.mcp(),
+                loader.cwd()
             ));
             let policy = runtime_config.mcp().policy();
             report["policy"] = json!({

@@ -17,6 +17,9 @@ The release workflow copies a version's section into its GitHub release notes.
   whose install script downloaded that binary without a pinned hash. `/mcp list`, its
   JSON and the MCP panel mark other stdio servers `unpinned` (`McpServerInfo.unpinned`),
   and `/mcp pin <server>` records their version and hashes.
+- `/mcp pin` of a program (not `npx` or `uvx`) holds only for the files it was pinned
+  with: the same relative launch (`node server.js`) in another workspace is unpinned
+  there, instead of borrowing the first workspace's pin.
 - Memory connector: its graph is kept in `~/.neuron/mcp-data/memory/memory.jsonl`
   (catalog `2026-11-05.4`), which its sandbox may write, instead of its package folder,
   where a reinstall would delete it and the sandbox did not let it write.

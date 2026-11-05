@@ -762,7 +762,7 @@ pub(crate) fn extensions_event() -> UiEvent {
     let live = snapshot.as_ref().and_then(|snapshot| snapshot.mcp.as_ref());
     let store = runtime::McpInstallStore::in_config_home(loader.config_home());
     let unpinned = |server: &runtime::ScopedMcpServerConfig| {
-        runtime::mcp_server_unpinned(&store, server.scope, &server.config)
+        runtime::mcp_server_unpinned(&store, server.scope, &server.config, &cwd)
     };
     let mcp_servers =
         match &config {

@@ -11,7 +11,9 @@
 //!   it once; it installs and starts as a catalog Python entry does.
 //! - Anything else: the sha256 of the program file and of each script file its
 //!   arguments name. A start where one of them changed is refused until it is pinned
-//!   again.
+//!   again. These files are resolved from the workspace, so the key also covers their
+//!   paths: the same `node server.js` in another workspace runs another file and is
+//!   unpinned there.
 //!
 //! A changed launch spec is a different key, so the server shows as unpinned again.
 //! Pins are in `<config home>/mcp/pins.json`.
@@ -176,6 +178,46 @@ impl McpPins {
     }
 }
 
+/// The key a launch spec's pin is kept under in `cwd`: [`mcp_pin_key`] for `npx` and
+/// `uvx` (the package does not depend on the workspace), else the key of the launch
+/// spec with the program and script files it resolves to there, so a pin made in one
+/// workspace does not vouch for another workspace's file of the same name.
+fn launch_key(
+    command: &str,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> String {
+    let launcher = launcher_words("npx", command, args).is_some()
+        || launcher_words("uvx", command, args).is_some();
+    match program_files(command, args, cwd) {
+        Ok(files) if !launcher => hex(&Sha256::digest(
+            json!([command, args, env, files]).to_string().as_bytes(),
+        )),
+        _ => mcp_pin_key(command, args, env),
+    }
+}
+
+/// The pin of a launch spec in `cwd` and its key. A program pin counts only while its
+/// files are exactly the ones the spec resolves to in `cwd`.
+fn pin_for(
+    store: &McpInstallStore,
+    command: &str,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Option<(String, McpPin)> {
+    let key = launch_key(command, args, env, cwd);
+    let pin = McpPins::in_store(store).get(&key)?;
+    if let McpPin::Program { files } = &pin {
+        let resolved = program_files(command, args, cwd).ok()?;
+        if !files.keys().eq(resolved.iter()) {
+            return None;
+        }
+    }
+    Some((key, pin))
+}
+
 /// What a stdio launch spec starts from once pins apply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum McpPinnedLaunch {
@@ -196,14 +238,12 @@ pub(crate) fn mcp_pinned_launch(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<McpPinnedLaunch, String> {
-    let key = mcp_pin_key(command, args, env);
-    let Some(pin) = McpPins::in_store(store).get(&key) else {
+    let Some((key, pin)) = pin_for(store, command, args, env, cwd) else {
         return Ok(McpPinnedLaunch::Unpinned);
     };
     if let McpPin::Program { files } = &pin {
         for (path, sha256) in files {
-            let full = cwd.join(path);
-            let actual = fs::read(&full)
+            let actual = fs::read(path)
                 .map(|bytes| hex(&Sha256::digest(&bytes)))
                 .map_err(|_| format!("the pinned file {path} is missing"))?;
             if &actual != sha256 {
@@ -219,23 +259,23 @@ pub(crate) fn mcp_pinned_launch(
         .map_or(McpPinnedLaunch::Unpinned, McpPinnedLaunch::Verified))
 }
 
-/// Whether the configured server `config` from `scope` is unpinned: a stdio server that
-/// Neuron does not ship, that is not a catalog connector, and whose launch spec has no
-/// pin. A remote server runs what its host serves, so it is never unpinned.
+/// Whether the configured server `config` from `scope` is unpinned in the workspace
+/// `cwd`: a stdio server that Neuron does not ship, that is not a catalog connector, and
+/// whose launch spec has no pin there. A remote server runs what its host serves, so it
+/// is never unpinned.
 #[must_use]
 pub fn mcp_server_unpinned(
     store: &McpInstallStore,
     scope: ConfigSource,
     config: &McpServerConfig,
+    cwd: &Path,
 ) -> bool {
     let McpServerConfig::Stdio(stdio) = config else {
         return false;
     };
     scope != ConfigSource::Bundled
         && McpCatalog::builtin().entry_for_config(config).is_none()
-        && McpPins::in_store(store)
-            .get(&mcp_pin_key(&stdio.command, &stdio.args, &stdio.env))
-            .is_none()
+        && pin_for(store, &stdio.command, &stdio.args, &stdio.env, cwd).is_none()
 }
 
 /// How a pin resolves a package: npm and uv in the CLI, fixtures in tests.
@@ -533,21 +573,30 @@ fn resolve_program(command: &str, cwd: &Path) -> Option<PathBuf> {
     })
 }
 
-/// The sha256 of the program file and of each argument that names a file.
-fn program_pin(command: &str, args: &[String], cwd: &Path) -> Result<McpPin, String> {
+/// The program file and each argument that names a file, resolved from `cwd`, as
+/// sorted paths.
+fn program_files(command: &str, args: &[String], cwd: &Path) -> Result<Vec<String>, String> {
     let program = resolve_program(command, cwd)
         .ok_or_else(|| format!("`{command}` is not a file or on the PATH"))?;
+    let mut files = std::iter::once(program)
+        .chain(
+            args.iter()
+                .map(|arg| cwd.join(arg))
+                .filter(|path| path.is_file()),
+        )
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+/// The sha256 of the program file and of each argument that names a file.
+fn program_pin(command: &str, args: &[String], cwd: &Path) -> Result<McpPin, String> {
     let mut files = BTreeMap::new();
-    for path in std::iter::once(program).chain(
-        args.iter()
-            .map(|arg| cwd.join(arg))
-            .filter(|path| path.is_file()),
-    ) {
-        let bytes = fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-        files.insert(
-            path.to_string_lossy().into_owned(),
-            hex(&Sha256::digest(&bytes)),
-        );
+    for path in program_files(command, args, cwd)? {
+        let bytes = fs::read(&path).map_err(|error| format!("{path}: {error}"))?;
+        files.insert(path, hex(&Sha256::digest(&bytes)));
     }
     Ok(McpPin::Program { files })
 }
@@ -605,7 +654,7 @@ pub(crate) fn pin_mcp_server_with(
             "`{name}` is a catalog connector: the catalog pins its version and hashes already"
         ));
     }
-    let key = mcp_pin_key(&stdio.command, &stdio.args, &stdio.env);
+    let key = launch_key(&stdio.command, &stdio.args, &stdio.env, loader.cwd());
     let pins = McpPins::in_store(store);
     let pin = if let Some(words) = launcher_words("npx", &stdio.command, &stdio.args) {
         let (word, args) = package_and_args(words)?;
@@ -654,19 +703,20 @@ pub(crate) fn pin_mcp_server_with(
     })
 }
 
-/// The names of the configured servers that are unpinned (see
+/// The names of the configured servers that are unpinned in the workspace `cwd` (see
 /// [`mcp_server_unpinned`]), started or not.
 #[must_use]
 pub fn mcp_unpinned_servers(
     store: &McpInstallStore,
     mcp: &crate::config::McpConfigCollection,
+    cwd: &Path,
 ) -> Vec<String> {
     let mut names = mcp
         .servers()
         .iter()
         .chain(mcp.disabled())
         .chain(mcp.needs_approval())
-        .filter(|(_, server)| mcp_server_unpinned(store, server.scope, &server.config))
+        .filter(|(_, server)| mcp_server_unpinned(store, server.scope, &server.config, cwd))
         .map(|(name, _)| name.clone())
         .collect::<Vec<_>>();
     names.sort();
@@ -825,9 +875,14 @@ mod tests {
         let store = McpInstallStore::in_config_home(&root.join("home"));
         let config = loader.load().unwrap();
         let server = config.mcp().get("notes").unwrap();
-        assert!(mcp_server_unpinned(&store, server.scope, &server.config));
+        assert!(mcp_server_unpinned(
+            &store,
+            server.scope,
+            &server.config,
+            loader.cwd()
+        ));
         assert_eq!(
-            super::mcp_unpinned_servers(&store, config.mcp()),
+            super::mcp_unpinned_servers(&store, config.mcp(), loader.cwd()),
             vec!["notes"]
         );
 
@@ -835,7 +890,12 @@ mod tests {
         let outcome = pin_mcp_server_with(&loader, "notes", &store, &fixture, &fixture).unwrap();
         assert!(matches!(&outcome.pin, McpPin::Npm { version, .. } if version == "1.4.2"));
         assert!(outcome.installed.is_some());
-        assert!(!mcp_server_unpinned(&store, server.scope, &server.config));
+        assert!(!mcp_server_unpinned(
+            &store,
+            server.scope,
+            &server.config,
+            loader.cwd()
+        ));
 
         let McpServerConfig::Stdio(stdio) = &server.config else {
             unreachable!()
@@ -860,7 +920,12 @@ mod tests {
             args: vec!["-y".to_string(), "notes-mcp@2".to_string()],
             ..stdio.clone()
         });
-        assert!(mcp_server_unpinned(&store, ConfigSource::User, &changed));
+        assert!(mcp_server_unpinned(
+            &store,
+            ConfigSource::User,
+            &changed,
+            loader.cwd()
+        ));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -904,6 +969,96 @@ mod tests {
     }
 
     #[test]
+    fn a_program_pin_does_not_vouch_for_the_same_relative_launch_in_another_workspace() {
+        let root = temp_root("two-workspaces");
+        let interpreter = root.join("bin").join("node-fixture");
+        fs::create_dir_all(interpreter.parent().unwrap()).unwrap();
+        fs::write(&interpreter, "interpreter").unwrap();
+        let other = root.join("other");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(root.join("repo").join("server.js"), "// pinned here").unwrap();
+        fs::write(other.join("server.js"), "// never hashed").unwrap();
+        // The same relative launch spec in both workspaces (a project `.mcp.json`, say).
+        let loader = user_servers(
+            &root,
+            &serde_json::json!({"local": {
+                "command": interpreter.to_string_lossy(),
+                "args": ["server.js"]
+            }}),
+        );
+        let elsewhere = ConfigLoader::new(&other, root.join("home"));
+        let store = McpInstallStore::in_config_home(&root.join("home"));
+        let fixture = npm_fixture();
+        pin_mcp_server_with(&loader, "local", &store, &fixture, &fixture).unwrap();
+
+        let config = loader.load().unwrap();
+        let server = config.mcp().get("local").unwrap();
+        let McpServerConfig::Stdio(stdio) = &server.config else {
+            unreachable!()
+        };
+        assert!(!mcp_server_unpinned(
+            &store,
+            server.scope,
+            &server.config,
+            loader.cwd()
+        ));
+        assert_eq!(
+            mcp_pinned_launch(
+                &store,
+                &stdio.command,
+                &stdio.args,
+                &stdio.env,
+                loader.cwd()
+            )
+            .unwrap(),
+            McpPinnedLaunch::Checked
+        );
+        // In the other workspace `server.js` is another file: unpinned, not checked.
+        assert!(mcp_server_unpinned(
+            &store,
+            server.scope,
+            &server.config,
+            &other
+        ));
+        assert_eq!(
+            mcp_pinned_launch(&store, &stdio.command, &stdio.args, &stdio.env, &other).unwrap(),
+            McpPinnedLaunch::Unpinned
+        );
+
+        // Pinned there too, each workspace keeps its own pin.
+        let outcome = pin_mcp_server_with(&elsewhere, "local", &store, &fixture, &fixture).unwrap();
+        assert!(!outcome.already);
+        assert!(!mcp_server_unpinned(
+            &store,
+            server.scope,
+            &server.config,
+            &other
+        ));
+        assert!(!mcp_server_unpinned(
+            &store,
+            server.scope,
+            &server.config,
+            loader.cwd()
+        ));
+        fs::write(other.join("server.js"), "// changed").unwrap();
+        assert!(
+            mcp_pinned_launch(&store, &stdio.command, &stdio.args, &stdio.env, &other).is_err()
+        );
+        assert_eq!(
+            mcp_pinned_launch(
+                &store,
+                &stdio.command,
+                &stdio.args,
+                &stdio.env,
+                loader.cwd()
+            )
+            .unwrap(),
+            McpPinnedLaunch::Checked
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn remote_bundled_and_catalog_servers_are_not_pinned() {
         let root = temp_root("refused");
         let loader = user_servers(
@@ -924,7 +1079,7 @@ mod tests {
             assert!(error.contains(why), "{name}: {error}");
         }
         let config = loader.load().unwrap();
-        assert!(super::mcp_unpinned_servers(&store, config.mcp()).is_empty());
+        assert!(super::mcp_unpinned_servers(&store, config.mcp(), loader.cwd()).is_empty());
         let _ = fs::remove_dir_all(root);
     }
 }
