@@ -213,6 +213,11 @@ pub struct McpServerInfo {
     /// shows it locked instead of offering to turn it off. Older engines leave it out.
     #[serde(default, skip_serializing_if = "is_false")]
     pub required: bool,
+    /// A stdio server that is not a catalog connector and whose version and hashes are
+    /// not recorded (`/mcp pin <name>` records them). A UI shows an `unpinned` badge.
+    /// Older engines leave it out.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unpinned: bool,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -1767,14 +1772,35 @@ mod tests {
             enabled: true,
             catalog: Some("codebase-memory".into()),
             required: true,
+            unpinned: false,
         };
         let json = serde_json::to_value(&required).unwrap();
         assert_eq!(json["required"], true);
         assert_eq!(json["scope"], "managed");
+        assert!(json.get("unpinned").is_none());
         assert_eq!(
             serde_json::from_value::<McpServerInfo>(json).unwrap(),
             required
         );
         assert!(ENGINE_FEATURES.contains(&FEATURE_MCP_POLICY));
+    }
+
+    #[test]
+    fn an_unpinned_server_row_says_so_and_older_rows_are_not_unpinned() {
+        let older: McpServerInfo = serde_json::from_str(
+            r#"{"name":"notes","scope":"user","transport":"stdio","status":"ready","tools":[],"error":null}"#,
+        )
+        .unwrap();
+        assert!(!older.unpinned);
+        let unpinned = McpServerInfo {
+            unpinned: true,
+            ..older
+        };
+        let json = serde_json::to_value(&unpinned).unwrap();
+        assert_eq!(json["unpinned"], true);
+        assert_eq!(
+            serde_json::from_value::<McpServerInfo>(json).unwrap(),
+            unpinned
+        );
     }
 }

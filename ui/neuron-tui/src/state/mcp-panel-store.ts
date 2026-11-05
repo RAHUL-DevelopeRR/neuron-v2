@@ -47,5 +47,8 @@ export function serverSummary(server: McpServerInfo): string {
       : ''
   const status = server.status.replace('_', ' ')
   const required = serverLocked(server) ? ' · required' : ''
-  return server.error ? `${status}: ${server.error}` : `${status}${tools}${required}`
+  const unpinned = server.unpinned ? ' · unpinned' : ''
+  return server.error
+    ? `${status}: ${server.error}`
+    : `${status}${tools}${required}${unpinned}`
 }

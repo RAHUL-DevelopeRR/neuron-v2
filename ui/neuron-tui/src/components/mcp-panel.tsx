@@ -7,7 +7,9 @@
  * A switch is saved in the user settings (`disabledMcpServers`); the servers
  * restart from the next turn. A server the connector policy requires shows
  * `[req]` and its switch does nothing. Remote servers that need a sign-in say so in
- * their error (`neuron mcp login <server>` in a terminal).
+ * their error (`neuron mcp login <server>` in a terminal). A stdio server that is
+ * neither a catalog connector nor pinned ends its row with `unpinned`
+ * (`/mcp pin <server>` records its version and hashes).
  */
 
 import { TextAttributes, type KeyEvent } from '@opentui/core'

@@ -180,6 +180,7 @@ const STRUCT_FIELDS: Record<string, string[]> = {
     'enabled',
     'catalog',
     'required',
+    'unpinned',
   ]),
   ConnectorVariable: fieldsOf<ConnectorVariable>()([
     'name',

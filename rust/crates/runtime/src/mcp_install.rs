@@ -12,10 +12,14 @@
 //! secret.
 //!
 //! A catalog connector's stdio server starts from a verified install
-//! ([`prepare_stdio_transport`], see `verified`), never through `npx` or `uvx`.
+//! ([`prepare_stdio_transport`], see `verified`), never through `npx` or `uvx`; so does
+//! a server pinned with `/mcp pin` (`mcp_pins`).
 
 mod archive;
 mod verified;
+
+#[cfg(test)]
+pub(crate) use archive::fixtures as archive_fixtures;
 
 pub use verified::{
     mcp_requirements_text, McpFetch, McpHttpFetch, McpInstallState, McpInstallStore,
@@ -208,8 +212,22 @@ fn prepare_stdio_transport_in(
     let refused = |error: String| {
         std::io::Error::other(format!("MCP server `{server}` was not started: {error}"))
     };
-    let Some(spec) = mcp_verified_spec_for(transport).map_err(refused)? else {
-        return Ok(resolved);
+    let spec = match mcp_verified_spec_for(transport).map_err(refused)? {
+        Some(spec) => spec,
+        // Any other server: a pinned npm or Python package starts from its install, a
+        // pinned program only when its files still match.
+        None => match crate::mcp_pins::mcp_pinned_launch(
+            store,
+            &transport.command,
+            &transport.args,
+            &transport.env,
+            &std::env::current_dir().unwrap_or_default(),
+        )
+        .map_err(refused)?
+        {
+            crate::mcp_pins::McpPinnedLaunch::Verified(spec) => spec,
+            _ => return Ok(resolved),
+        },
     };
     let launch = store.ensure(&spec, fetch).map_err(refused)?;
     resolved.command = launch.command;

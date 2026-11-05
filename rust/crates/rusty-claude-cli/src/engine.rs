@@ -760,6 +760,10 @@ pub(crate) fn extensions_event() -> UiEvent {
     let config = loader.load();
     let snapshot = extensions_snapshot();
     let live = snapshot.as_ref().and_then(|snapshot| snapshot.mcp.as_ref());
+    let store = runtime::McpInstallStore::in_config_home(loader.config_home());
+    let unpinned = |server: &runtime::ScopedMcpServerConfig| {
+        runtime::mcp_server_unpinned(&store, server.scope, &server.config)
+    };
     let mcp_servers =
         match &config {
             Ok(config) => {
@@ -782,6 +786,7 @@ pub(crate) fn extensions_event() -> UiEvent {
                                 required.and_then(|required| required.catalog_id.clone())
                             }),
                             required: required.is_some(),
+                            unpinned: unpinned(server),
                         }
                     })
                     .collect();
@@ -796,6 +801,7 @@ pub(crate) fn extensions_event() -> UiEvent {
                         enabled: false,
                         catalog: catalog_id(server),
                         required: false,
+                        unpinned: unpinned(server),
                     }
                 }));
                 // Configured and switched on, but not started: waiting for approval, or
@@ -826,6 +832,7 @@ pub(crate) fn extensions_event() -> UiEvent {
                         enabled: true,
                         catalog: catalog_id(server),
                         required: false,
+                        unpinned: unpinned(server),
                     }),
                 );
                 servers.sort_by(|left, right| left.name.cmp(&right.name));

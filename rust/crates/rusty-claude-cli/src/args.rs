@@ -885,11 +885,11 @@ pub(crate) fn classify_subcommand_words(rest: &[String]) -> SubcommandWords {
         // Signing in or out and switching a server change something: never a guess.
         "mcp" if matches!(
             words.first(),
-            Some(&("login" | "logout" | "enable" | "disable" | "approve"))
+            Some(&("login" | "logout" | "enable" | "disable" | "approve" | "pin"))
         ) =>
         {
             changes(
-                "neuron mcp [login|logout|enable|disable|approve] <server>",
+                "neuron mcp [login|logout|enable|disable|approve|pin] <server>",
                 words.len() == 2,
             )
         }
@@ -902,7 +902,7 @@ pub(crate) fn classify_subcommand_words(rest: &[String]) -> SubcommandWords {
             commands::parse_mcp_remove_args(&words[1..]).is_ok(),
         ),
         "mcp" => shows(
-            "neuron mcp [list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|login <server>|logout <server>|serve|help]",
+            "neuron mcp [list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|pin <server>|login <server>|logout <server>|serve|help]",
             matches!(
                 without_help_word(&words),
                 [] | ["list" | "show" | "serve" | "catalog"] | ["show", _] | ["catalog", ..]

@@ -65,6 +65,13 @@ describe('the MCP servers panel', () => {
     expect(serverEnabled(legacy)).toBe(true)
   })
 
+  test('a server whose version and hashes are not recorded says unpinned', () => {
+    const unpinned = server({ transport: 'stdio', unpinned: true })
+    expect(serverSummary(unpinned)).toBe('ready · 2 tools · unpinned')
+    // Older engines leave it out, and so does a pinned or catalog server.
+    expect(serverSummary(server({ transport: 'stdio' }))).toBe('ready · 2 tools')
+  })
+
   test('a server the connector policy requires is locked on', () => {
     const required = server({ name: 'codebase-memory', scope: 'managed', required: true })
     expect(serverLocked(required)).toBe(true)

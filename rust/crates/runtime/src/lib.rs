@@ -41,6 +41,7 @@ pub mod mcp_install;
 pub mod mcp_lifecycle_hardened;
 mod mcp_oauth;
 pub mod mcp_output;
+pub mod mcp_pins;
 pub mod mcp_policy;
 pub mod mcp_sandbox;
 pub mod mcp_server;
@@ -177,6 +178,9 @@ pub use mcp_oauth::{
 };
 pub use mcp_output::{
     default_mcp_spill_dir, format_mcp_tool_output, McpToolOutput, MCP_OUTPUT_MAX_CHARS,
+};
+pub use mcp_pins::{
+    mcp_server_unpinned, mcp_unpinned_servers, pin_mcp_server, McpPin, McpPinOutcome, McpPins,
 };
 pub use mcp_policy::{
     check_managed_settings_owner, clear_gateway_policy, managed_settings_path,

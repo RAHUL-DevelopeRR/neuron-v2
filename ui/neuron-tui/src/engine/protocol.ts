@@ -264,6 +264,12 @@ export interface McpServerInfo {
    * cannot be turned off. Older engines leave it out.
    */
   required?: boolean
+  /**
+   * A stdio server that is not a catalog connector and whose version and
+   * hashes are not recorded (`/mcp pin <name>` records them). Older engines
+   * leave it out.
+   */
+  unpinned?: boolean
 }
 
 /** A variable a catalog connector needs. */
