@@ -552,11 +552,10 @@ impl McpRemoteConnection {
                 }
                 RemoteAuth::OAuth => (None, String::new()),
             };
-            let mut request = build(self, token.as_deref());
-            if self.confirmed {
-                request = request.header(crate::mcp_zerox::ZEROX_CONFIRMED_HEADER, "1");
-            }
-            let response = request.send().await.map_err(|error| http_error(&error))?;
+            let response = build(self, token.as_deref())
+                .send()
+                .await
+                .map_err(|error| http_error(&error))?;
             match response.status() {
                 StatusCode::UNAUTHORIZED if !reread => reread = true,
                 StatusCode::UNAUTHORIZED => {
@@ -654,12 +653,22 @@ impl McpRemoteConnection {
         wait_id: Option<&JsonRpcId>,
     ) -> io::Result<PostOutcome> {
         let body = message.to_string();
+        // Only the POST that carries the approved `tools/call` says it was confirmed,
+        // never an answer to a request the server sends while it runs.
+        let confirmed =
+            self.confirmed && message.get("method").and_then(Value::as_str) == Some("tools/call");
         let response = self
             .send_authorized(|this, bearer| {
-                this.with_headers(this.client.post(&this.url), bearer)
+                let request = this
+                    .with_headers(this.client.post(&this.url), bearer)
                     .header(CONTENT_TYPE, "application/json")
                     .header("Accept", "application/json, text/event-stream")
-                    .body(body.clone())
+                    .body(body.clone());
+                if confirmed {
+                    request.header(crate::mcp_zerox::ZEROX_CONFIRMED_HEADER, "1")
+                } else {
+                    request
+                }
             })
             .await?;
         let status = response.status();
@@ -871,7 +880,6 @@ impl McpRemoteConnection {
         if self.session_id.is_none() {
             return;
         }
-        self.confirmed = false;
         let request = self.send_authorized(|this, bearer| {
             this.with_headers(this.client.delete(&this.url), bearer)
         });
@@ -1203,7 +1211,8 @@ mod tests {
 
     /// The gateway's `/mcp/<id>`: `Bearer ses_linked` reaches a server with one read and
     /// one destructive GitHub tool; `ses_unlinked` has not linked the connector; any
-    /// other sign-in is refused.
+    /// other sign-in is refused. A tool call is answered on an SSE stream that pings the
+    /// client before the result.
     fn gateway() -> FakeServer {
         let origin = Arc::new(Mutex::new(String::new()));
         let server_origin = Arc::clone(&origin);
@@ -1238,6 +1247,10 @@ mod tests {
             }
             match mcp_reply(&message) {
                 None => FakeResponse::status(202),
+                Some(reply) if message["method"] == "tools/call" => FakeResponse::sse(&[
+                    json!({"jsonrpc": "2.0", "id": "gateway-ping", "method": "ping"}),
+                    reply,
+                ]),
                 Some(reply) => FakeResponse::json(200, &reply),
             }
         }));
@@ -1361,9 +1374,15 @@ mod tests {
         assert_eq!(confirmed("delete_repository", false), None);
         // A read-tier tool is never confirmed.
         assert_eq!(confirmed("get_me", true), None);
-        // Nothing else sent after a confirmed call carries it.
-        assert!(server
-            .requests()
+        // Nothing else carries it, the answers to the gateway's pings during a
+        // confirmed call included.
+        let requests = server.requests();
+        let ping_answers = requests
+            .iter()
+            .filter(|request| request.json()["id"] == "gateway-ping")
+            .collect::<Vec<_>>();
+        assert_eq!(ping_answers.len(), 3, "one per tool call");
+        assert!(requests
             .iter()
             .filter(|request| request.json()["method"] != "tools/call")
             .all(|request| request.header("x-neuron-confirmed").is_none()));
