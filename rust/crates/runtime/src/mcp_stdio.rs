@@ -16,7 +16,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 
 use crate::cancel::CancellationToken;
-use crate::config::{McpTransport, RuntimeConfig, ScopedMcpServerConfig};
+use crate::config::{McpSandboxNetwork, McpTransport, RuntimeConfig, ScopedMcpServerConfig};
 use crate::mcp::mcp_tool_name;
 use crate::mcp_client::{McpClientBootstrap, McpClientTransport, McpStdioTransport};
 use crate::mcp_http::McpConnection;
@@ -742,12 +742,22 @@ impl ManagedMcpServer {
         let log = mcp_server_log()
             .map(|path| format!("; its output is in {}", path.display()))
             .unwrap_or_default();
+        // An unvetted server started with `npx -y` or `uvx` fails like this when its
+        // sandbox has no network to fetch the package.
+        let hint = match &self.bootstrap.transport {
+            McpClientTransport::Stdio(stdio)
+                if !stdio.sandbox.off && stdio.sandbox.network == McpSandboxNetwork::None =>
+            {
+                "; it runs with no network: if it needs to download a package or reach a service, list the hosts in its `sandbox.network` setting"
+            }
+            _ => "",
+        };
         McpServerManagerError::Transport {
             server_name,
             method,
             source: io::Error::new(
                 source.kind(),
-                format!("{source} (the server exited: {status}{log})"),
+                format!("{source} (the server exited: {status}{log}{hint})"),
             ),
         }
     }
@@ -3710,6 +3720,13 @@ mod tests {
         assert!(
             report.failed_servers[0].error.contains("the server exited"),
             "{}",
+            report.failed_servers[0].error
+        );
+        assert!(
+            report.failed_servers[0]
+                .error
+                .contains("list the hosts in its `sandbox.network` setting"),
+            "an unvetted server is told why it may have failed: {}",
             report.failed_servers[0].error
         );
         let starts = fs::read_to_string(&count).expect("the server ran");
