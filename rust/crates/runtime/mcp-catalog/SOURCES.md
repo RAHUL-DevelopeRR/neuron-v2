@@ -129,6 +129,14 @@ Release asset sha256 for v0.11.0:
 | linux-x86_64 | `codebase-memory-mcp-linux-amd64-portable.tar.gz` | `1f9e8293eb2bc5c05cfa27a7e8fc033da6d729ffad525ccfcdaa3fd606306683` |
 | linux-aarch64 | `codebase-memory-mcp-linux-arm64-portable.tar.gz` | `d62eeb224d5ee3eba3070938ec62cf1033f10b041ec1c4b2fb67f7aef390cc7b` |
 
+Version `2026-11-05.4` (5 November 2026) adds `install.data` to `memory`. Checked
+against `@modelcontextprotocol/server-memory@2.0.1` (`dist/index.js` on unpkg): its
+default file is `path.join(path.dirname(fileURLToPath(import.meta.url)),
+"memory.jsonl")`, the package's own `dist` folder, and a relative `MEMORY_FILE_PATH`
+is joined to that folder too. With verified installs that folder is the install, which
+a reinstall replaces and the sandbox does not let it write, so Neuron points the
+variable at `<config home>/mcp-data/memory/memory.jsonl` instead.
+
 To update an entry, regenerate its `lock` or `requirements` the same way for the new
 version, update `install.integrity` and `release`, and bump the catalog `version`;
 `McpCatalog::parse` refuses an entry whose own package is missing from its lock or

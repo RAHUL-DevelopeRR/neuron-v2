@@ -1,5 +1,5 @@
 {
-  "version": "2026-11-05.3",
+  "version": "2026-11-05.4",
   "connectors": [
     {
       "id": "github",
@@ -348,7 +348,8 @@
           {"path": "node_modules/@modelcontextprotocol/server", "version": "2.4.0", "resolved": "https://registry.npmjs.org/@modelcontextprotocol/server/-/server-2.4.0.tgz", "integrity": "sha512-rgR9yxSaAJ+bcsi/XroT/S2AfPiIWloXAnrdfYSCms9ivVju0ishu/wW0J21Ho6+ZOR1r7RyeRbjiRuF87ix5Q=="},
           {"path": "node_modules/@modelcontextprotocol/server-memory", "version": "2.0.1", "resolved": "https://registry.npmjs.org/@modelcontextprotocol/server-memory/-/server-memory-2.0.1.tgz", "integrity": "sha512-RbX5cm/OUbvBguVzHhJIqvG15b5K/bLODtQhHeQTkuM6XrijDtCFLl2THgLDg9JnS6pUBomNWq9n5G2bQwxD3A=="},
           {"path": "node_modules/zod", "version": "4.6.7", "resolved": "https://registry.npmjs.org/zod/-/zod-4.6.7.tgz", "integrity": "sha512-g8W2D2kU6a8untc053fX1uVBKzM7yqAxW/3zwk83+6RyF2+SKOuV+c0wBDhUwzV1PaGapmZH+rmcUzPf+3CGwg=="}
-        ]
+        ],
+        "data": {"variable": "MEMORY_FILE_PATH", "file": "memory.jsonl"}
       },
       "env": [
         {

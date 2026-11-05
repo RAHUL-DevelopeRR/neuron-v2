@@ -168,11 +168,10 @@ pub(crate) fn stdio_transport_with_secrets(
     Ok(resolved)
 }
 
-/// The verified install `transport` starts from: a catalog connector's, when its launch
-/// spec is exactly that entry's. `None` for any other server.
-pub fn mcp_verified_spec_for(
+/// The catalog entry whose launch spec `transport` is exactly.
+fn catalog_entry_for(
     transport: &crate::mcp_client::McpStdioTransport,
-) -> Result<Option<McpVerifiedSpec>, String> {
+) -> Option<&'static McpCatalogEntry> {
     let config = McpServerConfig::Stdio(crate::config::McpStdioServerConfig {
         command: transport.command.clone(),
         args: transport.args.clone(),
@@ -180,10 +179,60 @@ pub fn mcp_verified_spec_for(
         tool_call_timeout_ms: None,
         sandbox: None,
     });
-    match McpCatalog::builtin().entry_for_config(&config) {
+    McpCatalog::builtin().entry_for_config(&config)
+}
+
+/// The verified install `transport` starts from: a catalog connector's, when its launch
+/// spec is exactly that entry's. `None` for any other server.
+pub fn mcp_verified_spec_for(
+    transport: &crate::mcp_client::McpStdioTransport,
+) -> Result<Option<McpVerifiedSpec>, String> {
+    match catalog_entry_for(transport) {
         Some(entry) => McpVerifiedSpec::for_entry(entry),
         None => Ok(None),
     }
+}
+
+/// Points the data variable of `entry` (Memory's `MEMORY_FILE_PATH`) into its data
+/// folder, which becomes writable in its sandbox. The server would otherwise keep its
+/// data in its install folder (a relative value too), where a reinstall would delete it
+/// and its sandbox could not write. A value that is absolute or starts with `~` is the
+/// user's own choice and is kept; writing there needs a `sandbox.fsWrite` setting.
+fn use_data_dir(
+    entry: &McpCatalogEntry,
+    resolved: &mut crate::mcp_client::McpStdioTransport,
+    store: &McpInstallStore,
+) -> Result<(), String> {
+    let Some(data) = &entry.install.data else {
+        return Ok(());
+    };
+    let dir = store.data_dir(&entry.id)?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+    let value = resolved
+        .env
+        .get(&data.variable)
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default();
+    let path = if value.is_empty() {
+        dir.join(&data.file)
+    } else if value.starts_with(['~', '/', '\\']) || std::path::Path::new(&value).is_absolute() {
+        PathBuf::from(value)
+    } else {
+        dir.join(value)
+    };
+    if let Some(parent) = path.parent().filter(|parent| parent.starts_with(&dir)) {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+    }
+    resolved
+        .env
+        .insert(data.variable.clone(), path.to_string_lossy().into_owned());
+    resolved
+        .sandbox
+        .fs_write
+        .push(dir.to_string_lossy().into_owned());
+    Ok(())
 }
 
 /// `transport` ready to start: its secrets resolved, and a catalog connector switched
@@ -212,7 +261,13 @@ fn prepare_stdio_transport_in(
     let refused = |error: String| {
         std::io::Error::other(format!("MCP server `{server}` was not started: {error}"))
     };
-    let spec = match mcp_verified_spec_for(transport).map_err(refused)? {
+    let entry = catalog_entry_for(transport);
+    let spec = match entry
+        .map(McpVerifiedSpec::for_entry)
+        .transpose()
+        .map_err(refused)?
+        .flatten()
+    {
         Some(spec) => spec,
         // Any other server: a pinned npm or Python package starts from its install, a
         // pinned program only when its files still match.
@@ -230,6 +285,9 @@ fn prepare_stdio_transport_in(
         },
     };
     let launch = store.ensure(&spec, fetch).map_err(refused)?;
+    if let Some(entry) = entry {
+        use_data_dir(entry, &mut resolved, store).map_err(refused)?;
+    }
     resolved.command = launch.command;
     resolved.args = launch.args;
     if let Some(dir) = launch.dir {
@@ -1381,6 +1439,92 @@ mod tests {
             (started.command, started.args),
             (custom.command, custom.args)
         );
+        let _ = fs::remove_dir_all(root);
+    }
+    fn memory_transport(env: &[(&str, &str)]) -> crate::mcp_client::McpStdioTransport {
+        let entry = crate::mcp_catalog::McpCatalog::builtin()
+            .get("memory")
+            .expect("memory");
+        let (command, args) = entry.stdio_command().expect("stdio");
+        let config = crate::config::McpServerConfig::Stdio(crate::config::McpStdioServerConfig {
+            command,
+            args,
+            env: env
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect(),
+            tool_call_timeout_ms: None,
+            sandbox: None,
+        });
+        match crate::mcp_client::McpClientTransport::from_named_config(
+            "memory",
+            Some(crate::config::ConfigSource::User),
+            &config,
+        ) {
+            crate::mcp_client::McpClientTransport::Stdio(transport) => transport,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_keeps_its_graph_in_a_writable_data_folder_that_a_reinstall_keeps() {
+        let root = temp_root("memory-data");
+        let store = super::McpInstallStore::in_config_home(&root.join("home"));
+        let offline = Offline(std::sync::Mutex::new(Vec::new()));
+        let transport = memory_transport(&[]);
+        let spec = super::mcp_verified_spec_for(&transport).unwrap().unwrap();
+        let cli = "node_modules/@modelcontextprotocol/server-memory/dist/index.js";
+        let install = super::verified::record_install(&store, &spec, &[(cli, b"// server")]);
+
+        // Unset, the server would keep its graph in `dist/` of its install folder.
+        let started =
+            super::prepare_stdio_transport_in("memory", &transport, &store, &offline).unwrap();
+        let data = root.join("home").join("mcp-data").join("memory");
+        let graph = data.join("memory.jsonl");
+        assert_eq!(Path::new(&started.env["MEMORY_FILE_PATH"]), graph.as_path());
+        assert!(!graph.starts_with(&install));
+        assert!(data.is_dir());
+        assert!(
+            started
+                .sandbox
+                .fs_write
+                .contains(&data.to_string_lossy().into_owned()),
+            "{:?}",
+            started.sandbox.fs_write
+        );
+
+        // The server wrote its graph; then an installed file changed, so the install is
+        // removed and installed again. The graph is still there.
+        fs::write(
+            &graph,
+            "{\"type\":\"entity\",\"name\":\"kept\"}
+",
+        )
+        .unwrap();
+        fs::write(install.join(cli), "// tampered").unwrap();
+        let error = super::prepare_stdio_transport_in("memory", &transport, &store, &offline)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("integrity check failed"), "{error}");
+        assert!(!install.exists());
+        super::verified::record_install(&store, &spec, &[(cli, b"// server")]);
+        super::prepare_stdio_transport_in("memory", &transport, &store, &offline).unwrap();
+        assert!(fs::read_to_string(&graph).unwrap().contains("kept"));
+
+        // A relative value is in the data folder too; an absolute one is the user's.
+        let relative = memory_transport(&[("MEMORY_FILE_PATH", "notes/graph.jsonl")]);
+        let started =
+            super::prepare_stdio_transport_in("memory", &relative, &store, &offline).unwrap();
+        assert_eq!(
+            Path::new(&started.env["MEMORY_FILE_PATH"]),
+            data.join("notes").join("graph.jsonl")
+        );
+        assert!(data.join("notes").is_dir());
+        let mine = root.join("mine.jsonl").to_string_lossy().into_owned();
+        let absolute = memory_transport(&[("MEMORY_FILE_PATH", &mine)]);
+        let started =
+            super::prepare_stdio_transport_in("memory", &absolute, &store, &offline).unwrap();
+        assert_eq!(started.env["MEMORY_FILE_PATH"], mine);
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -17,6 +17,9 @@ The release workflow copies a version's section into its GitHub release notes.
   whose install script downloaded that binary without a pinned hash. `/mcp list`, its
   JSON and the MCP panel mark other stdio servers `unpinned` (`McpServerInfo.unpinned`),
   and `/mcp pin <server>` records their version and hashes.
+- Memory connector: its graph is kept in `~/.neuron/mcp-data/memory/memory.jsonl`
+  (catalog `2026-11-05.4`), which its sandbox may write, instead of its package folder,
+  where a reinstall would delete it and the sandbox did not let it write.
 
 - MCP sandbox: every stdio MCP server runs with a sandbox profile from its
   `mcpServers.<name>.sandbox` setting (`fsRead`, `fsWrite`, `network`, `envAllow`), its

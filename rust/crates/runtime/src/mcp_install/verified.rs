@@ -346,6 +346,13 @@ impl McpInstallStore {
         &self.root
     }
 
+    /// The folder the catalog server `id` keeps its data in: `<config home>/mcp-data/<id>`,
+    /// outside its install folder, which an integrity failure or a reinstall replaces.
+    pub fn data_dir(&self, id: &str) -> Result<PathBuf, String> {
+        let home = self.root.parent().unwrap_or(&self.root);
+        Ok(home.join("mcp-data").join(safe_part(id)?))
+    }
+
     fn install_dir(&self, spec: &McpVerifiedSpec) -> Result<PathBuf, String> {
         Ok(self
             .root

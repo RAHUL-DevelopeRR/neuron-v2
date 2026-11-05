@@ -313,6 +313,13 @@ matches stops the start with an integrity error and removes the install, so the 
 start installs it again. A cached tarball that does not match its integrity is removed
 the same way. The Python and container checks are uv's and Docker's at install time.
 
+A server's own data is never kept in its install folder, since a reinstall replaces
+that folder. Memory would keep its graph there (`dist/memory.jsonl` of its package), so
+Neuron sets `MEMORY_FILE_PATH` to `~/.neuron/mcp-data/memory/memory.jsonl` and lets its
+sandbox write `~/.neuron/mcp-data/memory`. A relative `MEMORY_FILE_PATH` you set is
+taken from that folder too; an absolute one (or one starting with `~`) is used as it is,
+and its folder needs a `sandbox.fsWrite` setting where file limits are enforced.
+
 #### Pinning other servers
 
 A stdio server you configured yourself, which is not a catalog connector, runs

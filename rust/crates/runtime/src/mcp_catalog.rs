@@ -154,6 +154,17 @@ pub struct McpReleaseAsset {
     pub member: String,
 }
 
+/// A file a local server keeps its data in. The server would keep it in its own package
+/// folder, which a reinstall replaces, so Neuron points `variable` at
+/// `<config home>/mcp-data/<id>/<file>` instead (`mcp_install`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpDataFile {
+    /// The variable that names the file (one of the entry's plain variables).
+    pub variable: String,
+    /// The file's name in the data folder when the user does not set the variable.
+    pub file: String,
+}
+
 /// The `release` key of this platform: `<os>-<arch>` as Rust names them
 /// (`windows-x86_64`, `macos-aarch64`, `linux-x86_64`, ...).
 #[must_use]
@@ -200,6 +211,9 @@ pub struct McpCatalogInstall {
     /// Environment a stdio server always gets.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// The file a local server keeps its data in, outside its install folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<McpDataFile>,
     /// The server signs in with OAuth (`neuron mcp login <server>`).
     #[serde(default)]
     pub oauth: bool,
@@ -534,6 +548,18 @@ impl McpCatalogEntry {
         let install = &self.install;
         let package = install.package.as_deref().unwrap_or_default();
         let version = install.version.as_deref().unwrap_or_default();
+        if let Some(data) = &install.data {
+            let declared = self
+                .env
+                .iter()
+                .any(|variable| variable.name == data.variable && !variable.secret);
+            if !declared || !relative_member(&data.file) || data.file.contains('/') {
+                return Err(format!(
+                    "MCP catalog entry `{id}` keeps its data in `{}` through {}, which is not one of its plain variables and a file name",
+                    data.file, data.variable
+                ));
+            }
+        }
         for (platform, asset) in &install.release {
             if !asset.url.starts_with("https://") || !is_sha256_hex(&asset.sha256) {
                 return Err(format!(
@@ -1215,6 +1241,35 @@ mod tests {
         assert!(McpCatalog::parse(&no_release)
             .unwrap_err()
             .contains("no release"));
+        // A data file is named by one of the entry's plain variables, in its data folder.
+        let with_data = |data: serde_json::Value| {
+            let mut value: serde_json::Value = serde_json::from_str(&binary("x", &sha)).unwrap();
+            value["connectors"][0]["install"]["data"] = data;
+            value["connectors"][0]["env"] =
+                json!([{"name": "X_FILE", "label": "", "secret": false, "required": false}]);
+            value.to_string()
+        };
+        assert!(
+            McpCatalog::parse(&with_data(json!({"variable": "X_FILE", "file": "x.db"}))).is_ok()
+        );
+        for bad in [
+            json!({"variable": "OTHER", "file": "x.db"}),
+            json!({"variable": "X_FILE", "file": "../x.db"}),
+            json!({"variable": "X_FILE", "file": "a/x.db"}),
+        ] {
+            assert!(McpCatalog::parse(&with_data(bad))
+                .unwrap_err()
+                .contains("keeps its data"));
+        }
+        let memory = McpCatalog::builtin().get("memory").unwrap();
+        assert_eq!(
+            memory
+                .install
+                .data
+                .as_ref()
+                .map(|data| data.variable.as_str()),
+            Some("MEMORY_FILE_PATH")
+        );
 
         let docker = |digest: &str| {
             with_install(&json!({"kind": "docker", "package": "ghcr.io/example/x",
