@@ -6,19 +6,18 @@ import {PACKAGE_ROOT} from './helpers.js';
 
 const read = (file) => readFileSync(path.join(PACKAGE_ROOT, file), 'utf8');
 
-// codebase-memory-mcp's package only downloads a release binary in a postinstall
-// script. Neuron fetches that binary itself and checks its pinned sha256, so the
-// package (and its script) must not come with Neuron.
-test('no dependency brings an install script, and Codebase memory is not an npm dependency', () => {
+// npm ignores the package-lock.json of a published package, so a dependency would be
+// whatever tree npm resolves on the user's machine, unchecked by Neuron. The default MCP
+// servers (Playwright, Codebase memory) are instead installed by Neuron from the
+// downloads its catalog pins, so nothing comes with this package.
+test('the package has no dependencies and passes no MCP server entry to Neuron', () => {
   const manifest = JSON.parse(read('package.json'));
-  assert.deepEqual(Object.keys(manifest.dependencies), ['@playwright/mcp']);
+  assert.equal(manifest.dependencies, undefined);
+  assert.equal(manifest.optionalDependencies, undefined);
 
   const lock = JSON.parse(read('package-lock.json'));
-  for (const [where, entry] of Object.entries(lock.packages)) {
-    if (where === '') continue;
-    assert.ok(!where.includes('codebase-memory-mcp'), where);
-    assert.notEqual(entry.hasInstallScript, true, `${where} runs an install script`);
-    assert.match(entry.integrity, /^sha512-/, where);
-  }
-  assert.doesNotMatch(read('bin/neuron.js'), /NEURON_CODEBASE_MCP_ENTRY =/);
+  assert.deepEqual(Object.keys(lock.packages), ['']);
+  assert.equal(lock.packages[''].dependencies, undefined);
+  assert.doesNotMatch(read('bin/neuron.js'), /NEURON_(PLAYWRIGHT|CODEBASE)_MCP_ENTRY/);
+  assert.match(read('bin/neuron.js'), /NEURON_MCP_NODE: process\.execPath/);
 });

@@ -43,9 +43,9 @@ it into `~/.neuron/mcp/<id>/<version>` from the downloads the catalog pins and c
 every hash, and later starts are offline. Codebase memory runs the release binary for
 your platform, checked against a pinned sha256; its npm package, whose install script
 would download that binary without a pinned hash, is never installed. Playwright runs
-with Node.js (`node` on the path, or `NEURON_MCP_NODE`); the npm package installs it
-alongside Neuron from its lockfile, and the launcher passes that installed entry
-instead.
+with Node.js (`node` on the path, or `NEURON_MCP_NODE`, which the npm launcher sets to
+its own Node.js) from its verified install, for npm users too: the npm package has no
+dependencies, since npm would not hold a published package to its lockfile.
 
 `mcpServers` in `settings.json` overrides any default by server name and configures
 additional processes or remote endpoints. Stdio servers use MCP's newline-delimited

@@ -85,7 +85,7 @@ access. Ctrl+C goes to Neuron, and the launcher exits with Neuron's exit code.
 The two default MCP servers (CodebaseMap, which `/mcp` lists as `codebase-memory`,
 and Playwright) never start through `npx -y`: on first use Neuron installs each into
 `~/.neuron/mcp` from downloads whose hashes its connector catalog pins, and later
-starts are offline. Playwright needs Node.js; the npm package installs it with Neuron.
+starts are offline. Playwright needs Node.js (the npm launcher passes its own).
 
 On a terminal, `neuron` with no prompt opens the full-screen UI, `neuron-tui`. The
 installers put it beside `neuron`, and the launchers fetch it the same way, verified

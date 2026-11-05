@@ -25,6 +25,11 @@ The release workflow copies a version's section into its GitHub release notes.
 - `/mcp pin` of a program (not `npx` or `uvx`) holds only for the files it was pinned
   with: the same relative launch (`node server.js`) in another workspace is unpinned
   there, instead of borrowing the first workspace's pin.
+- npm package: `@zero-x.live/neuron` no longer depends on `@playwright/mcp`. npm does
+  not hold a published package to its `package-lock.json`, so that tree was whatever
+  npm resolved and Neuron never checked it; Playwright now starts from its verified
+  install for npm users too, with the launcher's Node.js, and
+  `NEURON_PLAYWRIGHT_MCP_ENTRY` is ignored.
 - Memory connector: its graph is kept in `~/.neuron/mcp-data/memory/memory.jsonl`
   (catalog `2026-11-05.4`), which its sandbox may write, instead of its package folder,
   where a reinstall would delete it and the sandbox did not let it write.

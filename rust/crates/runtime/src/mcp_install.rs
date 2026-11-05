@@ -1373,9 +1373,6 @@ mod tests {
 
     #[test]
     fn with_no_network_the_bundled_servers_start_from_their_verified_installs() {
-        if std::env::var_os("NEURON_PLAYWRIGHT_MCP_ENTRY").is_some() {
-            return; // the npm launcher's own install is used instead
-        }
         let root = temp_root("offline-bundled");
         let store = super::McpInstallStore::in_config_home(&root.join("home"));
         let offline = Offline(std::sync::Mutex::new(Vec::new()));

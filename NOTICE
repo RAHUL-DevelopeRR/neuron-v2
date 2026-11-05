@@ -82,14 +82,15 @@ locally with:
 
     node scripts/generate-third-party-notices.mjs
 
-npm package dependencies
-------------------------
+Default MCP servers
+-------------------
 
-The npm package @zero-x.live/neuron installs, but does not bundle,
-@playwright/mcp (Apache License 2.0); npm installs it with its own license
-file. The codebase-memory-mcp server (MIT License) is not bundled either:
-Neuron downloads its release binary from the project's GitHub release on
-first use and checks it against a pinned sha256.
+Neither the npm package @zero-x.live/neuron nor the binary bundles the
+default MCP servers. On first use Neuron downloads @playwright/mcp (Apache
+License 2.0) and its dependencies from the npm registry, with their own
+license files, and the codebase-memory-mcp release binary (MIT License) from
+the project's GitHub release, and checks each against the hash its connector
+catalog pins.
 
 Trademarks and affiliation
 --------------------------
