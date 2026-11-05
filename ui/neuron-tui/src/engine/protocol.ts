@@ -516,6 +516,19 @@ export interface McpServerPreview {
    */
   target: string | null
   source: string
+  /**
+   * What runs, for the user to read before approving: the program and its
+   * arguments, or the URL without credentials or query, with secret-looking
+   * values shown as `[REDACTED]`; never environment or headers. Older engines
+   * leave it out.
+   */
+  command?: string
+  /**
+   * The digest of the launch spec as previewed. Approving from the preview
+   * sends it back (`approve_mcp_server`), and the engine refuses the approval
+   * if the config changed since. Older engines leave it out.
+   */
+  fingerprint?: string
 }
 
 /** A permission rule a workspace's settings would add. */
@@ -1213,9 +1226,11 @@ export type EngineCommand =
   | { type: 'remove_mcp_server'; name: string; scope?: string | null }
   /**
    * Approve the workspace server `name` (status `needs_approval`) as configured
-   * now. A notice and a fresh `extensions` event follow, or an error.
+   * now; with `fingerprint` (from the trust preview), only if it is still
+   * configured as the preview showed it. A notice and a fresh `extensions`
+   * event follow, or an error.
    */
-  | { type: 'approve_mcp_server'; name: string }
+  | { type: 'approve_mcp_server'; name: string; fingerprint?: string }
   /** What trusting the workspace would turn on (feature `trust_preview`). */
   | { type: 'trust_preview' }
   /** Read the plan and usage again, as an `account` event (feature `account`). */

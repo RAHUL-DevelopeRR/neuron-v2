@@ -301,6 +301,8 @@ const STRUCT_FIELDS: Record<string, string[]> = {
     'transport',
     'target',
     'source',
+    'command',
+    'fingerprint',
   ]),
   PermissionRulePreview: fieldsOf<PermissionRulePreview>()([
     'effect',
@@ -597,6 +599,12 @@ describe('client messages (UI -> engine)', () => {
         commandMessage({ type: 'approve_mcp_server', name: 'docs' }),
       ),
     ).toBe('{"kind":"command","type":"approve_mcp_server","name":"docs"}\n')
+    // From the trust screen, bound to what its preview showed.
+    expect(
+      encodeClientMessage(
+        commandMessage({ type: 'approve_mcp_server', name: 'docs', fingerprint: 'ab12' }),
+      ),
+    ).toBe('{"kind":"command","type":"approve_mcp_server","name":"docs","fingerprint":"ab12"}\n')
   })
 
   test('attachments are tagged by kind', () => {

@@ -567,6 +567,18 @@ pub struct McpServerPreview {
     /// or headers, which can hold secrets.
     pub target: Option<String>,
     pub source: String,
+    /// What runs, for the user to read before approving: the program and its
+    /// arguments, or the URL without credentials or query, with secret-looking values
+    /// shown as `[REDACTED]`; never environment or headers. Added after protocol 1:
+    /// older engines leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// The digest of the server's launch spec as previewed. A UI that approves the
+    /// server from this preview sends it back in [`EngineCommand::ApproveMcpServer`],
+    /// and the engine refuses the approval if the config changed since. Added after
+    /// protocol 1: older engines leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
 }
 
 /// A permission rule a workspace's settings would add.
@@ -1133,9 +1145,14 @@ pub enum EngineCommand {
         scope: Option<String>,
     },
     /// Approve the workspace server `name` (status `needs_approval`) as it is configured
-    /// now, as `/mcp approve` does. A notice and a fresh [`UiEvent::Extensions`] follow,
-    /// or an error.
-    ApproveMcpServer { name: String },
+    /// now, as `/mcp approve` does. With `fingerprint` (from [`McpServerPreview`]), only
+    /// if it is still configured as that preview showed it: else an error, and it keeps
+    /// waiting. A notice and a fresh [`UiEvent::Extensions`] follow, or an error.
+    ApproveMcpServer {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fingerprint: Option<String>,
+    },
     /// Ask what trusting the workspace would turn on ([`UiEvent::TrustPreview`]).
     TrustPreview,
     /// Read the account's plan and usage again ([`UiEvent::Account`]).
@@ -1469,6 +1486,14 @@ mod tests {
                 r#"{"kind":"command","type":"approve_mcp_server","name":"docs"}"#,
                 EngineCommand::ApproveMcpServer {
                     name: "docs".into(),
+                    fingerprint: None,
+                },
+            ),
+            (
+                r#"{"kind":"command","type":"approve_mcp_server","name":"docs","fingerprint":"ab12"}"#,
+                EngineCommand::ApproveMcpServer {
+                    name: "docs".into(),
+                    fingerprint: Some("ab12".into()),
                 },
             ),
         ] {
@@ -1725,7 +1750,15 @@ mod tests {
         let preview = serde_json::to_value(crate::fake_engine::samples::trust_preview()).unwrap();
         assert_eq!(preview["type"], "trust_preview");
         assert_eq!(preview["mcp_servers"][0]["target"], "uvx");
+        assert_eq!(preview["mcp_servers"][0]["fingerprint"], "4f1c0de5");
         assert_eq!(preview["permission_rules"][0]["effect"], "allow");
+
+        // A preview from an engine before `command` and `fingerprint` still reads.
+        let older: McpServerPreview = serde_json::from_str(
+            r#"{"name":"docs","transport":"stdio","target":"npx","source":"/w/.mcp.json"}"#,
+        )
+        .unwrap();
+        assert_eq!((older.command, older.fingerprint), (None, None));
     }
 
     /// Fields protocol v2 added to protocol 1 events read as their defaults from older

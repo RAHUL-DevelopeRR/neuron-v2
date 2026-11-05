@@ -201,6 +201,18 @@ pub struct McpApprovalOutcome {
 /// server that is not configured, and for one the workspace does not bring (bundled
 /// and user servers need no approval).
 pub fn approve_mcp_server(loader: &ConfigLoader, name: &str) -> Result<McpApprovalOutcome, String> {
+    approve_mcp_server_as_shown(loader, name, None)
+}
+
+/// [`approve_mcp_server`], given the [`mcp_launch_fingerprint`] of the config the user
+/// was shown (the trust screen's [`crate::PreviewMcpServer::fingerprint`]): refused when
+/// the server is configured differently now, so what is approved is what was seen.
+/// `None` approves the server as it is configured now.
+pub fn approve_mcp_server_as_shown(
+    loader: &ConfigLoader,
+    name: &str,
+    shown: Option<&str>,
+) -> Result<McpApprovalOutcome, String> {
     let name = name.trim();
     if name.is_empty() {
         return Err("name an MCP server".to_string());
@@ -214,7 +226,16 @@ pub fn approve_mcp_server(loader: &ConfigLoader, name: &str) -> Result<McpApprov
         disabled,
         approvals_path: approvals.path().to_path_buf(),
     };
+    let unchanged = |config: &McpServerConfig| {
+        match shown {
+        Some(shown) if mcp_launch_fingerprint(config) != shown => Err(format!(
+            "`{name}` is configured differently from what was shown, so it was not approved; review it in /mcp and approve it there"
+        )),
+        _ => Ok(()),
+    }
+    };
     if let Some(server) = config.mcp().needs_approval().get(name) {
+        unchanged(&server.config)?;
         approvals.approve(&workspace, name, &server.config)?;
         return Ok(outcome(false, false));
     }
@@ -229,6 +250,7 @@ pub fn approve_mcp_server(loader: &ConfigLoader, name: &str) -> Result<McpApprov
     };
     match known {
         Some(server) if mcp_scope_needs_approval(server.scope) => {
+            unchanged(&server.config)?;
             if approvals.is_approved(&workspace, name, &server.config) {
                 return Ok(outcome(true, disabled));
             }
@@ -571,5 +593,102 @@ mod tests {
         approvals.approve(&repo, "other", &server).expect("approve");
         assert!(approvals.is_approved(&repo, "docs", &server));
         let _ = fs::remove_dir_all(&home);
+    }
+}
+
+#[cfg(test)]
+mod shown_tests {
+    use std::fs;
+
+    use super::approve_mcp_server_as_shown;
+    use crate::config::{mcp_preview_command, ConfigLoader, McpServerConfig, ProjectTrust};
+
+    /// The trust screen shows what runs, and an approval given there holds only for the
+    /// config it showed: one changed in between (a `git pull`, an edit) is refused.
+    #[test]
+    fn an_approval_from_the_trust_screen_holds_for_what_it_showed() {
+        let root =
+            std::env::temp_dir().join(format!("neuron-mcp-approvals-shown-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("repo").join(".neuron")).expect("workspace");
+        fs::create_dir_all(root.join("home")).expect("config home");
+        fs::write(
+            root.join("home").join("settings.json"),
+            r#"{"defaultMcpServers":false}"#,
+        )
+        .expect("user settings");
+        let settings = root.join("repo").join(".neuron").join("settings.json");
+        let write = |args: &str| {
+            fs::write(
+                &settings,
+                format!(r#"{{"mcpServers":{{"docs":{{"command":"npx","args":{args}}},"web":{{"type":"http","url":"https://me:pw@mcp.example.com/mcp?key=abc"}}}}}}"#),
+            )
+            .expect("settings");
+        };
+        write(r#"["-y","docs-server@1.2.0","--token","abc123def456","API_KEY=xyz"]"#);
+        let loader = ConfigLoader::new(root.join("repo"), root.join("home"))
+            .with_project_trust(ProjectTrust::Trusted)
+            .with_mcp_approvals(true);
+
+        let preview = loader.workspace_trust_preview();
+        let docs = preview
+            .mcp_servers
+            .iter()
+            .find(|server| server.name == "docs")
+            .expect("docs");
+        // The package that runs is shown; the token and the key are not.
+        assert_eq!(
+            docs.command.as_deref(),
+            Some("npx -y docs-server@1.2.0 --token [REDACTED] API_KEY=[REDACTED]")
+        );
+        let web = preview
+            .mcp_servers
+            .iter()
+            .find(|server| server.name == "web")
+            .expect("web");
+        assert_eq!(
+            web.command.as_deref(),
+            Some("https://mcp.example.com/mcp?[REDACTED]")
+        );
+        let shown = docs.fingerprint.clone();
+
+        // Changed after it was shown: refused, and still waiting.
+        write(r#"["-y","docs-server@6.6.6"]"#);
+        let refused = approve_mcp_server_as_shown(&loader, "docs", Some(&shown))
+            .expect_err("a changed server is not approved");
+        assert!(refused.contains("configured differently"), "{refused}");
+        assert!(loader
+            .load()
+            .unwrap()
+            .mcp()
+            .needs_approval()
+            .contains_key("docs"));
+
+        // As shown: approved, and it starts.
+        write(r#"["-y","docs-server@1.2.0","--token","abc123def456","API_KEY=xyz"]"#);
+        approve_mcp_server_as_shown(&loader, "docs", Some(&shown)).expect("approve");
+        assert!(loader.load().unwrap().mcp().get("docs").is_some());
+        // The fingerprint the preview shows is the one approvals use.
+        let web_shown = web.fingerprint.clone();
+        approve_mcp_server_as_shown(&loader, "web", Some(&web_shown)).expect("approve web");
+
+        // A quoted argument, and a known token format anywhere.
+        let quoted = McpServerConfig::Stdio(crate::config::McpStdioServerConfig {
+            command: "node".to_string(),
+            args: vec![
+                "my server.js".to_string(),
+                "--header=ghp_0123456789abcdefghijklmnopqrstuvwxyzAB".to_string(),
+            ],
+            env: std::collections::BTreeMap::new(),
+            tool_call_timeout_ms: None,
+            sandbox: None,
+        });
+        let shown = mcp_preview_command(&quoted).expect("command");
+        assert!(
+            shown.starts_with("node \"my server.js\" --header="),
+            "{shown}"
+        );
+        assert!(!shown.contains("ghp_0123456789"), "{shown}");
+        let _ = fs::remove_dir_all(&root);
     }
 }

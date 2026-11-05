@@ -213,6 +213,16 @@ export interface McpServerPreview {
   /** The program it starts or the host it connects to; never arguments or headers. */
   target: string | null
   source: string
+  /**
+   * What runs, with secret-looking values shown as `[REDACTED]`; never
+   * environment or headers. Older engines leave it out.
+   */
+  command?: string
+  /**
+   * The launch spec's digest as previewed: an `approve_mcp_server` that sends
+   * it back is refused if the config changed since. Older engines leave it out.
+   */
+  fingerprint?: string
 }
 
 /** A permission rule a workspace's settings would add. */

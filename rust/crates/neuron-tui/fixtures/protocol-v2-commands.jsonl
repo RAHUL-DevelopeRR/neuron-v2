@@ -14,4 +14,4 @@
 {"kind":"command","type":"list_connector_catalog","query":"git"}
 {"kind":"command","type":"add_mcp_server","id":"github","name":null,"scope":"user","secrets":{"GITHUB_PERSONAL_ACCESS_TOKEN":"example-not-a-token"}}
 {"kind":"command","type":"remove_mcp_server","name":"docs","scope":null}
-{"kind":"command","type":"approve_mcp_server","name":"postgres-tools"}
+{"kind":"command","type":"approve_mcp_server","name":"postgres-tools","fingerprint":"4f1c0de5"}

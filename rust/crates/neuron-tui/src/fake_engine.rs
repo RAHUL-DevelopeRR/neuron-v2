@@ -164,7 +164,7 @@ pub mod samples {
             // A change says what it did, then lists the servers again.
             EngineCommand::SetMcpServerEnabled { name, .. }
             | EngineCommand::RemoveMcpServer { name, .. }
-            | EngineCommand::ApproveMcpServer { name } => vec![
+            | EngineCommand::ApproveMcpServer { name, .. } => vec![
                 UiEvent::Notice {
                     message: format!("MCP server {name} changed."),
                     kind: None,
@@ -309,6 +309,7 @@ pub mod samples {
             },
             EngineCommand::ApproveMcpServer {
                 name: "postgres-tools".into(),
+                fingerprint: Some("4f1c0de5".into()),
             },
         ]
         .into_iter()
@@ -719,6 +720,8 @@ pub mod samples {
                 transport: "stdio".into(),
                 target: Some("uvx".into()),
                 source: settings.clone(),
+                command: Some("uvx postgres-mcp --dsn [REDACTED]".into()),
+                fingerprint: Some("4f1c0de5".into()),
             }],
             permission_rules: vec![
                 PermissionRulePreview {
@@ -829,6 +832,7 @@ mod tests {
         for command in [
             EngineCommand::ApproveMcpServer {
                 name: "postgres-tools".into(),
+                fingerprint: None,
             },
             EngineCommand::AddMcpServer {
                 id: "github".into(),

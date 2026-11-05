@@ -217,8 +217,9 @@ fn mcp_change_notice(
                 notice(message)
             }
         },
-        EngineCommand::ApproveMcpServer { name } => {
-            match runtime::approve_mcp_server(loader, &name) {
+        // With a fingerprint (the trust screen's), only as that preview showed it.
+        EngineCommand::ApproveMcpServer { name, fingerprint } => {
+            match runtime::approve_mcp_server_as_shown(loader, &name, fingerprint.as_deref()) {
                 Err(error) => {
                     UiEvent::error(format!("could not approve MCP server {name}: {error}"))
                 }
@@ -339,6 +340,7 @@ mod tests {
             &loader,
             EngineCommand::ApproveMcpServer {
                 name: "gh-engine".into(),
+                fingerprint: None,
             },
         )
         .unwrap()
@@ -346,6 +348,20 @@ mod tests {
         assert!(
             message(&not_waiting).contains("approved"),
             "{not_waiting:?}"
+        );
+        // From a preview of another config (the trust screen's): refused.
+        let changed = mcp_change_notice(
+            &loader,
+            EngineCommand::ApproveMcpServer {
+                name: "gh-engine".into(),
+                fingerprint: Some("0".repeat(64)),
+            },
+        )
+        .unwrap()
+        .0;
+        assert!(
+            matches!(&changed, UiEvent::Error { message, .. } if message.contains("configured differently")),
+            "{changed:?}"
         );
 
         let removed = mcp_change_notice(

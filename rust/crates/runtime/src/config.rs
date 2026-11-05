@@ -418,6 +418,14 @@ pub struct PreviewMcpServer {
     /// The program it starts or the host it connects to: never arguments, environment,
     /// headers or credentials in the URL.
     pub target: Option<String>,
+    /// What runs: the program and its arguments, or the URL without credentials or
+    /// query, with secret-looking values redacted ([`mcp_preview_command`]). The user
+    /// sees this before approving the server.
+    pub command: Option<String>,
+    /// [`crate::mcp_approvals::mcp_launch_fingerprint`] of this config: an approval
+    /// given from the preview carries it, and is refused once the config no longer
+    /// matches it.
+    pub fingerprint: String,
     pub source: PathBuf,
 }
 
@@ -451,6 +459,89 @@ fn mcp_preview_target(config: &McpServerConfig) -> Option<String> {
         McpServerConfig::Ws(socket) => host(&socket.url),
         McpServerConfig::Sdk(sdk) => Some(sdk.name.clone()),
         McpServerConfig::ManagedProxy(proxy) => host(&proxy.endpoint()),
+    }
+}
+
+/// What a preview shows of what runs: a stdio server's program and arguments, or a
+/// remote server's URL without credentials, query or fragment. An argument that is a
+/// known secret format, the value of a `--token`-like flag, or the value in a
+/// `TOKEN=...`-like argument is shown as `[REDACTED]`. Environment and headers are
+/// never shown.
+#[must_use]
+pub fn mcp_preview_command(config: &McpServerConfig) -> Option<String> {
+    let url = |url: &str| {
+        let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+        let cut = rest.find(['?', '#']).unwrap_or(rest.len());
+        let (address, tail) = rest.split_at(cut);
+        let (authority, path) = address.split_at(address.find('/').unwrap_or(address.len()));
+        // Never credentials written into the URL.
+        let host = authority.rsplit('@').next().unwrap_or_default();
+        if host.is_empty() {
+            return None;
+        }
+        let scheme = if scheme.is_empty() {
+            String::new()
+        } else {
+            format!("{scheme}://")
+        };
+        // A query can hold a key: that there is one is shown, not what it says.
+        let query = if tail.starts_with('?') {
+            "?[REDACTED]"
+        } else {
+            ""
+        };
+        Some(format!("{scheme}{host}{path}{query}"))
+    };
+    match config {
+        McpServerConfig::Stdio(stdio) => {
+            let command = stdio.command.trim();
+            if command.is_empty() {
+                return None;
+            }
+            let mut shown = vec![preview_word(command)];
+            let mut previous: Option<&str> = None;
+            for arg in &stdio.args {
+                shown.push(preview_word(&preview_arg(previous, arg)));
+                previous = Some(arg);
+            }
+            Some(shown.join(" "))
+        }
+        McpServerConfig::Sse(remote) | McpServerConfig::Http(remote) => url(&remote.url),
+        McpServerConfig::Ws(socket) => url(&socket.url),
+        McpServerConfig::Sdk(sdk) => Some(sdk.name.clone()),
+        McpServerConfig::ManagedProxy(proxy) => url(&proxy.endpoint()),
+    }
+}
+
+/// A flag or `NAME=` whose value is a credential: `--token`, `--api-key`, `PASSWORD=`.
+fn names_a_secret(name: &str) -> bool {
+    let name = name.trim_start_matches('-').replace('-', "_");
+    !name.is_empty() && redact::is_credential_env_name(&name)
+}
+
+/// One argument as a preview shows it, `previous` being the argument before it.
+fn preview_arg(previous: Option<&str>, arg: &str) -> String {
+    const HIDDEN: &str = "[REDACTED]";
+    if let Some((name, _)) = arg.split_once('=') {
+        if names_a_secret(name) {
+            return format!("{name}={HIDDEN}");
+        }
+    }
+    if previous
+        .is_some_and(|flag| flag.starts_with('-') && !flag.contains('=') && names_a_secret(flag))
+    {
+        return HIDDEN.to_string();
+    }
+    // Known token formats wherever they are (`ghp_...`, `sk-...`, a URL's password).
+    redact::redact_with(arg, &[]).into_owned()
+}
+
+/// A word of a shown command line, quoted when it holds a space or is empty.
+fn preview_word(word: &str) -> String {
+    if word.is_empty() || word.contains(char::is_whitespace) {
+        format!("\"{}\"", word.replace('"', "\\\""))
+    } else {
+        word.to_string()
     }
 }
 
@@ -916,6 +1007,8 @@ impl ConfigLoader {
                             name: name.clone(),
                             transport: config.transport(),
                             target: mcp_preview_target(&config),
+                            command: mcp_preview_command(&config),
+                            fingerprint: crate::mcp_approvals::mcp_launch_fingerprint(&config),
                             source: entry.path.clone(),
                         },
                     );
@@ -963,6 +1056,8 @@ impl ConfigLoader {
                             name: name.clone(),
                             transport: config.transport(),
                             target: mcp_preview_target(&config),
+                            command: mcp_preview_command(&config),
+                            fingerprint: crate::mcp_approvals::mcp_launch_fingerprint(&config),
                             source: mcp_json.clone(),
                         });
                 }

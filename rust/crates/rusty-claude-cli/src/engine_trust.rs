@@ -7,7 +7,7 @@ use std::path::Path;
 use neuron_tui::protocol::{HookPreview, McpServerPreview, PermissionRulePreview, UiEvent};
 use runtime::ConfigLoader;
 
-/// How long a hook command shown on the trust screen gets, in characters.
+/// How long a hook or MCP server command shown on the trust screen gets, in characters.
 const HOOK_COMMAND_CHARS: usize = 200;
 
 /// What trusting `cwd` would turn on, and where the trust would be recorded.
@@ -44,6 +44,8 @@ pub(crate) fn trust_preview_event(cwd: &Path) -> UiEvent {
                 transport: crate::engine::mcp_transport_id(server.transport).to_string(),
                 target: server.target.clone(),
                 source: shown(&server.source),
+                command: server.command.as_deref().map(shorten),
+                fingerprint: Some(server.fingerprint.clone()),
             })
             .collect(),
         permission_rules: preview
@@ -116,6 +118,12 @@ mod tests {
                 assert_eq!(hooks[1].command.chars().count(), HOOK_COMMAND_CHARS);
                 assert_eq!(mcp_servers[0].transport, "stdio");
                 assert_eq!(mcp_servers[0].target.as_deref(), Some("uvx"));
+                // What runs is shown, and the approval is bound to it.
+                assert_eq!(mcp_servers[0].command.as_deref(), Some("uvx pg-mcp"));
+                assert_eq!(
+                    mcp_servers[0].fingerprint.as_ref().map(String::len),
+                    Some(64)
+                );
                 assert_eq!(permission_rules[0].effect, "allow");
             }
             other => panic!("a trust preview, got {other:?}"),

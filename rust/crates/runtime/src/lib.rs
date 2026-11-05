@@ -148,7 +148,9 @@ pub use mcp::{
     mcp_server_signature, mcp_tool_name, mcp_tool_prefix, normalize_name_for_mcp,
     scoped_mcp_config_hash, unwrap_ccr_proxy_url,
 };
-pub use mcp_approvals::{approve_mcp_server, McpApprovalOutcome, McpApprovals};
+pub use mcp_approvals::{
+    approve_mcp_server, approve_mcp_server_as_shown, McpApprovalOutcome, McpApprovals,
+};
 pub use mcp_audit::{McpAuditCall, McpAuditLog};
 pub use mcp_catalog::{
     verify_mcp_catalog_update, McpCatalog, McpCatalogEntry, McpCatalogVariable, McpToolTier,
