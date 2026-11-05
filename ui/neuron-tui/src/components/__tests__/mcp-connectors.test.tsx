@@ -26,7 +26,7 @@ import {
   type ExtensionsEvent,
   type McpServerInfo,
 } from '../../engine/protocol'
-import { initializeThemeStore } from '../../hooks/use-theme'
+import { initializeThemeStore, useThemeStore } from '../../hooks/use-theme'
 import { useChatStore } from '../../state/chat-store'
 import { useEngineStore } from '../../state/engine-store'
 import { connectorsChip, useMcpPanelStore } from '../../state/mcp-panel-store'
@@ -47,6 +47,8 @@ import { approveTrustedMcpServers, trustWorkspace } from '../../engine/engine-se
 import { useStartGate } from '../../state/start-gate'
 import { McpPanel, installedHints, resolveMcpKey, serverMark } from '../mcp-panel'
 import { trustScreenKeyAction } from '../trust-screen'
+import { ToolBranch } from '../blocks/tool-branch'
+import { createMarkdownPalette } from '../../utils/theme-system'
 
 const SECRET = 'example-secret-value-123'
 
@@ -380,6 +382,50 @@ describe('MCP tool cells', () => {
     })
     expect(mcpToolCallLabel('read_file', {}, servers)).toBeNull()
     expect(mcpToolCallLabel('MCPTool', {}, servers)).toBeNull()
+  })
+
+  // OSC 52 (write the clipboard), OSC 8 (a link) and CSI (clear the screen).
+  const HOSTILE = 'mcp__evil\x1b]52;c;aGk=\x07__steal\x1b]8;;https://x.test\x07me\x1b[2J\nnow'
+
+  test('a name the model wrote is cleaned of escape sequences', () => {
+    const label = mcpToolCallLabel('MCPTool', { qualifiedName: HOSTILE }, null)
+    expect(label).toEqual({ server: 'evil', tool: 'stealme now', tier: null })
+    expect(mcpToolTitle(label!)).toBe('evil · stealme now')
+    // A configured server's name is cleaned too.
+    const odd = [{ ...byName('github'), name: 'gh\x1b[31m', tool_tiers: {} }]
+    expect(mcpToolCallLabel('mcp__gh\x1b[31m__go', {}, odd)?.server).toBe('gh')
+  })
+
+  test('the tool cell draws the cleaned name', async () => {
+    const setup = await createTestRenderer({ width: 90, height: 8 })
+    const root = createRoot(setup.renderer)
+    flushSync(() =>
+      root.render(
+        <ToolBranch
+          toolBlock={{
+            type: 'tool',
+            toolCallId: 'call-1',
+            toolName: 'MCPTool' as never,
+            input: { qualifiedName: HOSTILE, arguments: {} },
+          }}
+          keyPrefix="test"
+          availableWidth={90}
+          onToggleCollapsed={() => {}}
+          markdownPalette={createMarkdownPalette(useThemeStore.getState().theme)}
+        />,
+      ),
+    )
+    try {
+      await setup.renderOnce()
+      const frame = setup.captureCharFrame()
+      expect(frame).toContain('evil · stealme now')
+      expect(frame).not.toContain('\x1b')
+      expect(frame).not.toContain('52;c;')
+      expect(frame).not.toContain('https://x.test')
+    } finally {
+      flushSync(() => root.unmount())
+      setup.renderer.destroy()
+    }
   })
 })
 

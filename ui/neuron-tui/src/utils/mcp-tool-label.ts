@@ -4,7 +4,13 @@
  * `qualifiedName`) is drawn as "github · merge_pull_request" with the tier the
  * connector catalog pins for that tool (`destructive`), when the engine sent
  * one (`McpServerInfo.tool_tiers`).
+ *
+ * `qualifiedName` is text the model wrote, and a name after `mcp__` that
+ * matches no known server is too, so both parts of a label are cleaned of
+ * escape sequences and line breaks before they are drawn.
  */
+
+import { sanitizeTerminalText } from '@neuron-tui/common/util/terminal-safe-text'
 
 import type { McpServerInfo } from '../engine/protocol'
 
@@ -20,6 +26,11 @@ export interface McpToolCallLabel {
 /** A name as the engine writes it into tool names (`normalize_name_for_mcp`). */
 export function normalizeMcpName(name: string): string {
   return name.replace(/[^A-Za-z0-9_-]/g, '_')
+}
+
+/** A server or tool name, safe to draw on one line of the terminal. */
+function cleanLabelPart(name: string): string {
+  return sanitizeTerminalText(name).replace(/\n/g, ' ')
 }
 
 /**
@@ -52,11 +63,15 @@ export function mcpToolCallLabel(
       tiers[tool] ??
       Object.entries(tiers).find(([name]) => normalizeMcpName(name) === tool)?.[1] ??
       null
-    return { server: match.server.name, tool, tier }
+    return { server: cleanLabelPart(match.server.name), tool: cleanLabelPart(tool), tier }
   }
   const split = rest.indexOf('__')
   if (split <= 0 || split + 2 >= rest.length) return null
-  return { server: rest.slice(0, split), tool: rest.slice(split + 2), tier: null }
+  return {
+    server: cleanLabelPart(rest.slice(0, split)),
+    tool: cleanLabelPart(rest.slice(split + 2)),
+    tier: null,
+  }
 }
 
 /** The cell's title: "github · merge_pull_request". */
