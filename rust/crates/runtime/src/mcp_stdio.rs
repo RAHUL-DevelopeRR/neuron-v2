@@ -4186,13 +4186,30 @@ mod tests {
     }
 
     /// Starts the bundled Playwright and Codebase memory servers as the settings loader
-    /// configures them (the installed entry scripts when `NEURON_*_MCP_ENTRY` points at
-    /// them, else `npx`), each in its catalog sandbox, and lists their tools. Needs Node
-    /// and the packages, so it is run by hand: `cargo test -p runtime -- --ignored
-    /// bundled_servers_start`.
+    /// configures them, each from its verified install (downloaded from the npm registry
+    /// and GitHub on first use, about 300 MB) in its catalog sandbox, and lists their
+    /// tools. Needs Node and the network, so it is run by hand: `cargo test -p runtime --
+    /// --ignored bundled_servers_start`. The installs go to a temporary config home,
+    /// removed afterwards, unless `NEURON_CONFIG_HOME` names one.
     #[test]
-    #[ignore = "needs node and the bundled MCP packages"]
+    #[ignore = "needs node and the network"]
     fn bundled_servers_start_in_their_declared_sandboxes() {
+        /// Removes the temporary config home, also when the test fails.
+        struct TemporaryHome(Option<std::path::PathBuf>);
+        impl Drop for TemporaryHome {
+            fn drop(&mut self) {
+                if let Some(home) = self.0.take() {
+                    std::env::remove_var("NEURON_CONFIG_HOME");
+                    let _ = std::fs::remove_dir_all(home);
+                }
+            }
+        }
+        let _home = TemporaryHome(std::env::var_os("NEURON_CONFIG_HOME").is_none().then(|| {
+            let home =
+                std::env::temp_dir().join(format!("neuron-mcp-bundled-{}", std::process::id()));
+            std::env::set_var("NEURON_CONFIG_HOME", &home);
+            home
+        }));
         let servers = ["playwright", "codebase-memory"]
             .into_iter()
             .map(|name| {
