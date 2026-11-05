@@ -14,6 +14,17 @@ The release workflow copies a version's section into its GitHub release notes.
   `node.exe` is left behind; macOS enforces the profile with `sandbox-exec` and Linux
   with bubblewrap when installed. Workspace settings cannot turn the sandbox off, a
   changed `sandbox` setting needs approval again, and `/mcp show` prints the profile.
+- MCP sandbox fixes: on Linux a server is no longer killed when the thread that
+  started it ends (bubblewrap's `--die-with-parent` is gone), gets a private `/tmp`,
+  and no longer sees `/run/user`, `/run/dbus` or `XDG_RUNTIME_DIR`; the shared npm and
+  uv caches are writable only by a server that may reach that registry, others get a
+  cache of their own; only a server's command and the script its interpreter runs are
+  readable beyond its profile (listed in `/mcp show`), not every path in its
+  arguments; Codebase memory may write its package's `bin` folder (catalog
+  `2026-11-05.2`); Node servers follow the sandbox proxy in `fetch`
+  (`NODE_USE_ENV_PROXY`); on Windows a server that could not be put in its job object
+  is stopped with `taskkill /T`; and the managed settings' `mcpPolicy.requireSandbox`
+  ignores `"sandbox": false` outside them.
 - Connector policy: machine-wide managed settings (`managed-settings.json` in
   `C:\Program Files\Neuron`, `/Library/Application Support/Neuron` or `/etc/neuron`,
   read only when no one but an administrator can have written the file or its folders)

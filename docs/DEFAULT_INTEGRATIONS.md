@@ -184,13 +184,18 @@ until its settings say otherwise:
 | `sandbox` key | Meaning |
 | --- | --- |
 | `fsRead` | Paths it may read: `.` or a relative path in the workspace, `~/...` in your home folder, `${cache}/...` in the OS cache folder (`%LOCALAPPDATA%`, `~/Library/Caches` or `~/.cache`), `${temp}`, or an absolute path |
-| `fsWrite` | Paths it may write (and read), in the same forms. The temp folder and the npm and uv caches are always writable |
+| `fsWrite` | Paths it may write (and read), in the same forms. The temp folder is always writable. The shared npm and uv caches are writable only when `network` reaches that registry (`registry.npmjs.org`; `pypi.org` or `files.pythonhosted.org`); otherwise, where file limits are enforced (macOS, Linux with bubblewrap), `npx` and `uvx` get a cache of the server's own under `<OS cache folder>/neuron-mcp/`, so a server cannot plant code that your own `npx` runs later |
 | `network` | `"none"` (the default), `"any"`, or a list of hosts as in `sandbox.network.allow` (`github.com`, `*.npmjs.org`, `localhost:8080`) |
 | `envAllow` | Inherited variables it sees besides the default set (`PATH`, `HOME`, temp, locale, terminal, proxy and certificate settings, toolchain locations and the Windows system variables). Its own `env` block always applies. Zero-X and provider credentials never pass; another secret-looking variable (`GITHUB_TOKEN`) passes only when listed here |
 
 `"sandbox": false` runs a server without one (its inherited environment minus
 credentials, as before); only your user settings can say so, and a workspace's
-`"sandbox": false` is ignored with a warning. An object with no keys reads nothing in
+`"sandbox": false` is ignored with a warning, as is a user's when the managed settings
+set `mcpPolicy.requireSandbox`. Besides its profile a server may read its program: the
+command's folder when the command is a file, and, for `node`, `python`, `uv` and the
+like, the folder of the script it runs (for an npm package, its `node_modules`).
+Other arguments are data and never become readable; `/mcp show` lists these program
+roots. An object with no keys reads nothing in
 the workspace and reaches nothing. Remember that `npx -y` and `uvx` fetch packages: an
 unvetted server started that way needs `registry.npmjs.org` (or `pypi.org` and
 `files.pythonhosted.org`) in its `network` until the package is cached.
@@ -202,7 +207,10 @@ it came from and what applies here:
   object, so stopping the server, or Neuron ending in any way, ends the whole tree
   (no orphan `node.exe`). The environment is the allowlist. Network limits are proxy
   variables for a local proxy that reaches only the listed hosts (or none), which a
-  program may ignore. File limits are not enforced.
+  program may ignore (Node 22.21 and 24.5 or later follow them in `fetch` too, through
+  `NODE_USE_ENV_PROXY`; older Node and native programs may not). File limits are not
+  enforced, so a server can read your home folder, `~/.ssh` included: on Windows add
+  only servers you trust.
 - **macOS:** the server runs under `sandbox-exec`: file contents in your home folder
   are unreadable except the read and write roots, the toolchain folders (npm, nvm,
   volta, uv, pyenv, ...) and git's settings (`~/.gitconfig`, `~/.config/git`; not
@@ -211,9 +219,13 @@ it came from and what applies here:
   (`"none"`).
 - **Linux:** with bubblewrap (`bwrap`) installed, the server sees a read-only system,
   an empty home folder with the read roots and toolchain folders put back, writable
-  write roots and temp, no network for `"none"`, and it ends with Neuron. Without
-  `bwrap` only the environment allowlist and the proxy variables apply, and the server
-  log says so.
+  write roots, a `/tmp` of its own, no `/run/user` or `/run/dbus` (the session bus and
+  agent sockets there stay reachable without a network, so they are hidden; `DISPLAY`
+  in `envAllow` puts the X server's socket folder back, and `XDG_RUNTIME_DIR` the
+  runtime folder), and no network for `"none"`. A host list is the proxy variables
+  only, as on Windows. The server ends when Neuron stops it or its input closes.
+  Without `bwrap` only the environment allowlist and the proxy variables apply, and the
+  server log says so.
 
 Each server's section of the server log (`~/.neuroncli/logs/mcp-servers.log`, under
 `NEURON_HOME` if set) starts with its profile and anything not enforced.
