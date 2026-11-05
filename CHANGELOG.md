@@ -5,6 +5,20 @@ The release workflow copies a version's section into its GitHub release notes.
 
 ## 7.0.0-alpha.4 (unreleased)
 
+- Full-screen UI: the plan's usage stays current in a session left open. The UI reads
+  the account again just after each reset time it knows (the 5-hour window, the day, a
+  quota error's) and every 10 minutes while idle, backing off to an hour while nothing
+  changes. A turn stopped by a usage or rate limit gets a card that counts down to the
+  reset ("Resets in 2h 14m (18:49)") with an "Auto-continue when limits reset" toggle
+  (saved as `autoContinueAfterReset`): when it is on, the UI sends "continue" just
+  after the reset and shows "Continuing in 4m 12s · Esc to cancel" until then. No
+  other error continues by itself. Once the limit has reset, the card and older error
+  banners say so instead of standing as a live error.
+- A new session (and `/clear`) starts from a short recap of the workspace's previous
+  session in its system prompt: the last requests, the files the agent wrote, the
+  todos left open and how it ended (answered, a failed request, a stop or a tool
+  error), with no file contents. The full-screen UI shows a line naming that session
+  and `/resume <id>` to reopen it. `NEURON_SESSION_RECAP=0` turns it off.
 - Full-screen UI, MCP: a connectors chip in the status bar (`⧉ 5/6`, amber when a
   server needs you, a lock for a policy-required one; click opens the panel). The MCP
   panel gains an Installed tab (approve, connect, sign in, remove) and an Add tab

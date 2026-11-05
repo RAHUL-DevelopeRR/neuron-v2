@@ -139,7 +139,14 @@ window Neuron:
   it current from the quota headers of each reply, and warns once when 90% of it is
   used. Once the
   window's reset time has passed, what is left is shown as unknown (`Free ?/1M`) until
-  the account is read again, which Neuron does in the background;
+  the account is read again, which Neuron does in the background. The full-screen UI
+  reads it again a few seconds after each reset and every 10 minutes while idle
+  (backing off to an hour while nothing changes);
+- when a turn is stopped by the window (or a rate limit), the full-screen UI's error
+  card counts down to the reset and offers **Auto-continue when limits reset**. With it
+  on (it is remembered as `autoContinueAfterReset` in the UI's `settings.json`), the UI
+  sends `continue` just after the reset; Esc or a click on the countdown cancels it.
+  Other errors never continue by themselves, and it stops after three limits in a row;
 - keeps a smaller working set: about 40,000 tokens of conversation (system prompt and
   tool definitions not counted). Once the conversation reaches half of it, tool results
   older than the last four become short stubs that name the tool and keep the start of
@@ -389,6 +396,14 @@ not a session is refused before it is locked.
 
 Inside a session: `/session list`, `/session switch <id>`, `/resume <path>`,
 `/compact` to shrink history, `/clear` to start over.
+
+A new session, and `/clear`, starts with a short recap of the newest earlier session in
+the same workspace (from the last two weeks) in its system prompt: your last requests,
+the files the agent wrote or edited, todos left open, the start of its last answer and
+how it ended (answered, a failed request such as a used-up token window, a stop, or a
+tool error). File contents and tool output are left out; an error line is shortened
+and redacted. The full-screen UI shows one line naming that session and the
+`/resume <id>` that reopens it. `NEURON_SESSION_RECAP=0` turns this off.
 
 ## Common slash commands
 
@@ -648,6 +663,7 @@ such a call is not run. Turn one off like any other server (`/mcp disable <serve
 | `NEURON_AUTO_CHECKS` | neuron | `0` stops the completion check from running the project's checks (`cargo check`, the typecheck script, `go vet`, `py_compile`, or `.neuron/checks.json`) itself; they run only when your permission settings allow them without asking |
 | `NEURON_REVIEW` | neuron | `1` adds a reviewer to the completion check: a read-only sub-agent that compares the turn's diff with the request and reports problems |
 | `NEURON_REVIEW_MODEL` | neuron | Model for the reviewer (default: the session's model) |
+| `NEURON_SESSION_RECAP` | neuron | `0` leaves the previous session's recap out of a new session's system prompt |
 | `NEURON_EXPERIENCE` | neuron | `0` turns off the experience library (`experience.json` in the settings directory): per-model counts of repaired tool calls, missed edits and similar, which add notes to that model's system prompt once they recur |
 | `NEURON_CONFIG_HOME` | neuron | Settings directory (default `~/.neuron`) |
 | `NEURON_HOME` | neuron | Directory for the login file and caches (default `~/.neuroncli`); setting it also keeps the login out of the OS credential store |
