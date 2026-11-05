@@ -111,9 +111,9 @@ as `needs approval` and nothing is spawned. `/mcp approve <server>` (or
 saved in `~/.neuron/mcp-approvals.json` for that workspace (its git root), keyed by
 the server's name and a sha256 of its launch spec: transport, command, arguments, its
 environment variables and headers (names and values as written, such as `${VAR}`;
-only the hash is stored, never a value), its headers helper, its URL and its `oauth`
-settings. When a `git pull` changes any of these, the server waits for approval
-again. A disabled server can be approved too; it then starts once you enable it.
+only the hash is stored, never a value), its headers helper, its URL, its `oauth`
+settings and its `sandbox` setting. When a `git pull` changes any of these, the server
+waits for approval again. A disabled server can be approved too; it then starts once you enable it.
 Bundled servers and the ones in your user settings need no approval.
 The workspace's own settings files win over `.mcp.json` for a server of the same name.
 
@@ -155,6 +155,66 @@ cut there; the whole of it, inside the same envelope, is written to a file in
 so the model can read the rest. The tool descriptions and input schemas of servers
 Neuron does not ship are cleaned the same way, and each text in them is capped at
 2,000 characters.
+
+**Sandbox.** Every stdio server runs in a sandbox: the paths it may read and write,
+the hosts it may reach and the inherited environment variables it sees. A catalog
+connector gets its entry's profile (a bundled server the entry of its name: Playwright
+reaches any host and writes its browser cache, Codebase memory reads the workspace,
+writes its index in `~/.cache/codebase-memory-mcp` and reaches npm and GitHub). Any
+other server gets the workspace read-only, no network and the default environment,
+until its settings say otherwise:
+
+```json
+{
+  "mcpServers": {
+    "notes": {
+      "command": "npx",
+      "args": ["-y", "notes-mcp@1.2.0"],
+      "sandbox": {
+        "fsRead": [".", "~/notes"],
+        "fsWrite": ["${cache}/notes-mcp"],
+        "network": ["registry.npmjs.org", "api.notes.example"],
+        "envAllow": ["NOTES_PROFILE"]
+      }
+    }
+  }
+}
+```
+
+| `sandbox` key | Meaning |
+| --- | --- |
+| `fsRead` | Paths it may read: `.` or a relative path in the workspace, `~/...` in your home folder, `${cache}/...` in the OS cache folder (`%LOCALAPPDATA%`, `~/Library/Caches` or `~/.cache`), `${temp}`, or an absolute path |
+| `fsWrite` | Paths it may write (and read), in the same forms. The temp folder and the npm and uv caches are always writable |
+| `network` | `"none"` (the default), `"any"`, or a list of hosts as in `sandbox.network.allow` (`github.com`, `*.npmjs.org`, `localhost:8080`) |
+| `envAllow` | Inherited variables it sees besides the default set (`PATH`, `HOME`, temp, locale, terminal, proxy and certificate settings, toolchain locations and the Windows system variables). Its own `env` block always applies. Zero-X and provider credentials never pass; another secret-looking variable (`GITHUB_TOKEN`) passes only when listed here |
+
+`"sandbox": false` runs a server without one (its inherited environment minus
+credentials, as before); only your user settings can say so, and a workspace's
+`"sandbox": false` is ignored with a warning. An object with no keys reads nothing in
+the workspace and reaches nothing. Remember that `npx -y` and `uvx` fetch packages: an
+unvetted server started that way needs `registry.npmjs.org` (or `pypi.org` and
+`files.pythonhosted.org`) in its `network` until the package is cached.
+
+What is enforced depends on the platform; `/mcp show <server>` prints the profile, where
+it came from and what applies here:
+
+- **Windows:** the server and every process it starts are held in a kill-on-close job
+  object, so stopping the server, or Neuron ending in any way, ends the whole tree
+  (no orphan `node.exe`). The environment is the allowlist. Network limits are proxy
+  variables for a local proxy that reaches only the listed hosts (or none), which a
+  program may ignore. File limits are not enforced.
+- **macOS:** the server runs under `sandbox-exec`: file contents in your home folder
+  are unreadable except the read and write roots and the toolchain folders (npm, nvm,
+  volta, uv, pyenv, ...), writes go only to the write roots and temp, and outbound
+  connections go only to the local proxy (a host list) or nowhere (`"none"`).
+- **Linux:** with bubblewrap (`bwrap`) installed, the server sees a read-only system,
+  an empty home folder with the read roots and toolchain folders put back, writable
+  write roots and temp, no network for `"none"`, and it ends with Neuron. Without
+  `bwrap` only the environment allowlist and the proxy variables apply, and the server
+  log says so.
+
+Each server's section of the server log (`~/.neuroncli/logs/mcp-servers.log`, under
+`NEURON_HOME` if set) starts with its profile and anything not enforced.
 
 ### Connector catalog
 

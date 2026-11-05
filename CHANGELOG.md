@@ -5,6 +5,15 @@ The release workflow copies a version's section into its GitHub release notes.
 
 ## 7.0.0-alpha.4 (unreleased)
 
+- MCP sandbox: every stdio MCP server runs with a sandbox profile from its
+  `mcpServers.<name>.sandbox` setting (`fsRead`, `fsWrite`, `network`, `envAllow`), its
+  catalog entry, or the default for unvetted servers (the workspace read-only, no
+  network). Its environment is an allowlist that never passes Zero-X or provider
+  credentials, and its network goes through a local proxy for its own host list. On
+  Windows a kill-on-close job object ends the server's whole process tree with it, so no
+  `node.exe` is left behind; macOS enforces the profile with `sandbox-exec` and Linux
+  with bubblewrap when installed. Workspace settings cannot turn the sandbox off, a
+  changed `sandbox` setting needs approval again, and `/mcp show` prints the profile.
 - Connector policy: machine-wide managed settings (`managed-settings.json` in
   `C:\Program Files\Neuron`, `/Library/Application Support/Neuron` or `/etc/neuron`,
   read only when no one but an administrator can have written the file or its folders)

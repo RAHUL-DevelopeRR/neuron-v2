@@ -456,6 +456,7 @@ names the file, the line and the closest known key. Commonly used keys:
 | `workingSetTokens` | Conversation tokens to keep before older tool results become stubs and history is compacted (default 40000 on a plan with a token window, such as Free; none on other plans); `0` turns it off, and `NEURON_WORKING_SET_TOKENS` overrides it. See [The Free token window](#the-free-token-window) |
 | `hooks` | Commands run before and after tool calls |
 | `mcpServers`, `defaultMcpServers`, `disabledMcpServers` | MCP servers |
+| `mcpServers.<name>.sandbox` | What a stdio MCP server may read, write and reach, and the inherited variables it sees (`fsRead`, `fsWrite`, `network`, `envAllow`); without it a catalog connector uses its entry's profile and any other server gets the workspace read-only with no network. See [the MCP sandbox](docs/DEFAULT_INTEGRATIONS.md#workspace-servers-permissions-and-output) |
 | `mcpPolicy` | Which MCP servers may start, must start, and extra tool rules; read only from the managed settings (see [Connector policy](#connector-policy)) |
 | `defaultSkills` | `false` leaves the bundled skills out of the system prompt |
 | `toolCapableModels`, `autoToolModel`, `subagentModel`, `summaryModel`, `reviewerModel`, `providerFallbacks` | Models for particular jobs (see [Models](#models)) |
