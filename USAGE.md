@@ -594,10 +594,10 @@ other address is refused, so your Zero-X sign-in never goes elsewhere. Its tools
 tier the connector's catalog entry pins (read tools run without asking; others need
 full access or your approval), and tools the catalog does not list need full access.
 For destructive tools (deleting, merging, running workflows) the gateway also wants to
-know that you approved the call: Neuron tells it so only for a call you approved in the
-permission prompt, so one that a rule or the permission mode allowed is refused by the
-gateway with an error asking for your confirmation. Turn one off like any other server
-(`/mcp disable <server>`).
+know that you approved the call, so Neuron asks you about every call of one, even in
+full access, with an allow rule, or after "allow for this session", and tells the
+gateway only about the call you approved. Where nobody can be asked (`-p` in a script)
+such a call is not run. Turn one off like any other server (`/mcp disable <server>`).
 
 ## Environment variables
 

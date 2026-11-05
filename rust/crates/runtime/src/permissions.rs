@@ -670,6 +670,8 @@ pub struct PermissionPolicy {
     shell_dialect: Option<ShellDialect>,
     session: SessionApprovals,
     grants: PendingGrants,
+    /// Tools whose every call the user approves ([`Self::with_confirmed_tools`]).
+    confirmed_tools: BTreeSet<String>,
 }
 
 impl PermissionPolicy {
@@ -677,6 +679,7 @@ impl PermissionPolicy {
     pub fn new(active_mode: PermissionMode) -> Self {
         Self {
             active_mode,
+            confirmed_tools: BTreeSet::new(),
             tool_requirements: BTreeMap::new(),
             allow_rules: Vec::new(),
             deny_rules: Vec::new(),
@@ -735,6 +738,17 @@ impl PermissionPolicy {
     }
 
     /// Uses `approvals` instead of the process-wide session store.
+    /// Tools that run only on the user's approval of each call: a hosted connector's
+    /// destructive tools, which the gateway refuses unless told the user approved that
+    /// call. An allow rule, the permission mode or a hook that would let one run unasked
+    /// asks instead, and with nobody to ask the call is refused. Deny rules, a decline
+    /// for the session and a mode that refuses it apply as for any tool.
+    #[must_use]
+    pub fn with_confirmed_tools(mut self, tools: impl IntoIterator<Item = String>) -> Self {
+        self.confirmed_tools.extend(tools);
+        self
+    }
+
     #[must_use]
     pub fn with_session_approvals(mut self, approvals: SessionApprovals) -> Self {
         self.session = approvals;
@@ -1146,6 +1160,16 @@ impl PermissionPolicy {
                     );
                 }
                 if allowed_by_rule || mode_allows(current_mode, required_mode) {
+                    if self.confirmed_tools.contains(tool_name) {
+                        return self.confirm_call(
+                            tool_name,
+                            input,
+                            current_mode,
+                            &assessment,
+                            prompter,
+                            PermissionDecider::Hook,
+                        );
+                    }
                     return (PermissionOutcome::Allow, PermissionDecider::Hook);
                 }
             }
@@ -1169,15 +1193,27 @@ impl PermissionPolicy {
             );
         }
 
-        if allowed_by_rule {
-            return (PermissionOutcome::Allow, PermissionDecider::Rule);
-        }
-        if mode_allows(current_mode, required_mode) {
-            return (PermissionOutcome::Allow, PermissionDecider::Mode);
-        }
-
-        if assessment.session_approved && current_mode != PermissionMode::ReadOnly {
-            return (PermissionOutcome::Allow, PermissionDecider::Session);
+        let unasked = if allowed_by_rule {
+            Some(PermissionDecider::Rule)
+        } else if mode_allows(current_mode, required_mode) {
+            Some(PermissionDecider::Mode)
+        } else if assessment.session_approved && current_mode != PermissionMode::ReadOnly {
+            Some(PermissionDecider::Session)
+        } else {
+            None
+        };
+        if let Some(decider) = unasked {
+            if self.confirmed_tools.contains(tool_name) {
+                return self.confirm_call(
+                    tool_name,
+                    input,
+                    current_mode,
+                    &assessment,
+                    prompter,
+                    decider,
+                );
+            }
+            return (PermissionOutcome::Allow, decider);
         }
 
         if current_mode == PermissionMode::Prompt
@@ -1215,6 +1251,37 @@ impl PermissionPolicy {
             reason.push(')');
         }
         (PermissionOutcome::Deny { reason }, PermissionDecider::Mode)
+    }
+
+    /// A call of a [`Self::with_confirmed_tools`] tool that `unasked` would have let
+    /// run: the user is asked to approve it, and with nobody to ask it is refused.
+    fn confirm_call(
+        &self,
+        tool_name: &str,
+        input: &str,
+        current_mode: PermissionMode,
+        assessment: &ToolCallAssessment,
+        prompter: Option<&mut dyn PermissionPrompter>,
+        unasked: PermissionDecider,
+    ) -> (PermissionOutcome, PermissionDecider) {
+        let reason = ApprovalReason {
+            asked: format!(
+                "Allow {tool_name}? This hosted connector tool can change or delete data, and Zero-X runs each call only after you approve it."
+            ),
+            refused: format!(
+                "tool '{tool_name}' was not run: Zero-X runs each call of this hosted connector tool only after the user approves it"
+            ),
+        };
+        self.prompt_or_deny(
+            tool_name,
+            input,
+            current_mode,
+            assessment,
+            Some(reason),
+            PermissionRemedy::default(),
+            prompter,
+            unasked,
+        )
     }
 
     /// Asks the prompter; with none, a call the user approved earlier runs and any other

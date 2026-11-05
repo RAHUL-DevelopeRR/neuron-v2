@@ -11,8 +11,9 @@ The release workflow copies a version's section into its GitHub release notes.
   lists appears as a `managed` server. One that is not linked yet shows
   `needs_connect` (`McpServerInfo.connect_url`, engine feature `mcp_hosted`);
   `/mcp connect <server>` and `c` in the MCP panel open the page that links it.
-  Destructive tool calls tell the gateway they were confirmed only when you approved
-  them in the permission prompt. Older settings for these servers keep working;
+  Neuron asks you about every call of a hosted connector's destructive tool, even in
+  full access or with an allow rule, and tells the gateway only about the call you
+  approved (`-p` in a script does not run them). Older settings for these servers keep working;
   `/mcp` and the protocol call the transport `zerox`.
 - MCP supply chain: catalog connectors and the default MCP servers no longer start
   through `npx -y` or `uvx`. The catalog (`2026-11-05.3`) pins each local entry's whole

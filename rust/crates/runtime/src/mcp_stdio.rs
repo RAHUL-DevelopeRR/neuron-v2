@@ -1147,6 +1147,20 @@ impl McpServerManager {
         Ok(())
     }
 
+    /// The discovered tools whose user-approved calls are confirmed to their server
+    /// ([`Self::call_tool_approved`]), as `mcp__<server>__<tool>`: a hosted connector's
+    /// destructive-tier tools. The gateway refuses their calls unless confirmed, so the
+    /// permission check asks the user for each one
+    /// ([`crate::PermissionPolicy::with_confirmed_tools`]).
+    #[must_use]
+    pub fn confirmed_tools(&self) -> Vec<String> {
+        self.tool_index
+            .iter()
+            .filter(|(_, route)| self.confirms(route))
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     /// Whether a user-approved call of `route` is confirmed to its server: a hosted
     /// connector's tool in the destructive tier, or one whose tier is not known (no
     /// catalog entry, or the entry does not list it).

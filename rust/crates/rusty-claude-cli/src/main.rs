@@ -2146,6 +2146,12 @@ impl RuntimeMcpState {
         Some(discovery)
     }
 
+    /// The tools that ask the user for every call: a hosted connector's destructive
+    /// tools, which the gateway runs only when told the user approved that call.
+    fn confirmed_tools(&self) -> Vec<String> {
+        self.manager.confirmed_tools()
+    }
+
     /// The error for a call that came before the servers joined.
     fn still_starting(&self) -> Result<(), ToolError> {
         if !self.starting {

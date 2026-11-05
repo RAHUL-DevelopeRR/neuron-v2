@@ -453,8 +453,19 @@ fn assemble_conversation_runtime(
         plugin_registry: _,
         mcp_state,
     } = runtime_plugin_state;
+    // A hosted connector's destructive tools ask for every call: the gateway runs one
+    // only when told the user approved it.
+    let confirmed_tools = mcp_state
+        .as_ref()
+        .map(|mcp| {
+            mcp.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .confirmed_tools()
+        })
+        .unwrap_or_default();
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
-        .map_err(std::io::Error::other)?;
+        .map_err(std::io::Error::other)?
+        .with_confirmed_tools(confirmed_tools);
     tool_registry.set_enforcer(runtime::permission_enforcer::PermissionEnforcer::new(
         policy.clone(),
     ));

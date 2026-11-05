@@ -373,7 +373,8 @@ Sync the copy in `neuron-v2`; nothing here changes what the CLI sends or must ha
   "https://zero-x.live/dashboard#connectors"}`: the user has not linked that connector
   (the CLI opens `connect_url` only when it is on the gateway's origin). A call of a
   destructive-tier tool must carry `x-neuron-confirmed: 1`, which the CLI sends only on
-  a call the user approved in its permission prompt; without it the proxy answers a
+  the `tools/call` POST of a call the user approved in its permission prompt (it asks for
+  every such call, whatever the mode or rules); without it the proxy answers a
   JSON-RPC error asking for confirmation. The CLI lists each id in
   `policy.connectors.hosted` as a server (settings type `"zerox"`) and calls the
   endpoint only while `NEURON_HOSTED_CONNECTORS=1`; nothing is deployed yet.

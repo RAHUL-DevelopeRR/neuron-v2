@@ -4411,6 +4411,124 @@ mod resilience_tests {
         );
     }
 
+    /// A hosted connector's destructive tool runs only on the user's approval of that
+    /// call, which is what the gateway is told: full access, an allow rule and an
+    /// "allow for this session" answer all still ask, and with nobody to ask the call is
+    /// refused.
+    #[test]
+    fn a_confirmed_tool_asks_for_every_call_whatever_would_allow_it() {
+        type Decided = Rc<RefCell<Vec<crate::permissions::PermissionDecider>>>;
+        struct Recording {
+            inner: StaticToolExecutor,
+            decided: Decided,
+        }
+        impl ToolExecutor for Recording {
+            fn execute(
+                &mut self,
+                tool_name: &str,
+                input: &str,
+            ) -> Result<String, super::ToolError> {
+                self.inner.execute(tool_name, input)
+            }
+            fn tool_permission_decided(
+                &mut self,
+                _tool_name: &str,
+                decided_by: crate::permissions::PermissionDecider,
+            ) {
+                self.decided.borrow_mut().push(decided_by);
+            }
+        }
+        /// Allows every call for the session; counts the questions.
+        struct AllowForSession(usize);
+        impl PermissionPrompter for AllowForSession {
+            fn decide(&mut self, _request: &PermissionRequest) -> PermissionPromptDecision {
+                self.0 += 1;
+                PermissionPromptDecision::AllowForSession
+            }
+        }
+
+        const TOOL: &str = "mcp__github__delete_repository";
+        let run = |policy: PermissionPolicy, prompter: Option<&mut AllowForSession>| {
+            let api = ScriptedApi::new(vec![
+                Ok(vec![
+                    tool_call("1", TOOL, "{}"),
+                    tool_call("2", TOOL, "{}"),
+                    AssistantEvent::MessageStop,
+                ]),
+                Ok(vec![text("done"), AssistantEvent::MessageStop]),
+            ]);
+            let decided = Decided::default();
+            let ran = Rc::new(RefCell::new(0));
+            let counter = Rc::clone(&ran);
+            let tools = Recording {
+                inner: StaticToolExecutor::new().register(TOOL, move |_| {
+                    *counter.borrow_mut() += 1;
+                    Ok("deleted".to_string())
+                }),
+                decided: Rc::clone(&decided),
+            };
+            let policy = policy
+                .with_tool_requirement(TOOL, PermissionMode::DangerFullAccess)
+                .with_confirmed_tools([TOOL.to_string()])
+                .with_session_approvals(crate::permissions::SessionApprovals::isolated());
+            let mut runtime = ConversationRuntime::new(
+                Session::new(),
+                api,
+                tools,
+                policy,
+                vec!["system".to_string()],
+            );
+            let prompter = prompter.map(|prompter| prompter as &mut dyn PermissionPrompter);
+            runtime.run_turn("go", prompter).expect("turn runs");
+            (decided.take(), ran.take())
+        };
+        let user = crate::permissions::PermissionDecider::User;
+
+        // Full access would run it unasked.
+        let mut prompter = AllowForSession(0);
+        let (decided, ran) = run(
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            Some(&mut prompter),
+        );
+        assert_eq!((prompter.0, ran), (2, 2), "asked for each call");
+        assert_eq!(decided, vec![user, user]);
+
+        // So would an allow rule.
+        let mut prompter = AllowForSession(0);
+        let rules = crate::config::RuntimePermissionRuleConfig::new(
+            vec![TOOL.to_string()],
+            Vec::new(),
+            Vec::new(),
+        );
+        let (decided, ran) = run(
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite).with_permission_rules(&rules),
+            Some(&mut prompter),
+        );
+        assert_eq!((prompter.0, ran), (2, 2));
+        assert_eq!(decided, vec![user, user]);
+
+        // Nobody to ask: refused, even in full access.
+        let (decided, ran) = run(
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            None,
+        );
+        assert_eq!(ran, 0);
+        assert!(decided.is_empty());
+
+        // A deny rule still refuses without asking.
+        let mut prompter = AllowForSession(0);
+        let rules = crate::config::RuntimePermissionRuleConfig::new(
+            Vec::new(),
+            vec![TOOL.to_string()],
+            Vec::new(),
+        );
+        let (_, ran) = run(
+            PermissionPolicy::new(PermissionMode::DangerFullAccess).with_permission_rules(&rules),
+            Some(&mut prompter),
+        );
+        assert_eq!((prompter.0, ran), (0, 0));
+    }
+
     #[test]
     fn cancellation_during_model_call_returns_to_prompt_and_next_turn_works() {
         let token = CancellationToken::new();
