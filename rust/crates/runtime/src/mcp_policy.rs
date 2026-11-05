@@ -46,6 +46,10 @@ pub const GATEWAY_POLICY_CACHE_FILE: &str = "policy-cache.json";
 /// with a warning, unless the managed settings fail closed.
 pub const GATEWAY_POLICY_TTL_SECS: u64 = 24 * 60 * 60;
 
+/// How far ahead of this computer's clock a cache's `fetchedAt` may be and still count
+/// as current (five minutes); further ahead, the clock or the file is wrong.
+pub const GATEWAY_POLICY_CLOCK_SKEW_SECS: u64 = 5 * 60;
+
 /// The system folder that holds the managed settings' own folder: Program Files on
 /// Windows (as Windows reports it, not the `ProgramFiles` environment variable),
 /// `/Library/Application Support` on macOS, `/etc` elsewhere. By default only an
@@ -336,14 +340,19 @@ pub fn read_gateway_policy(config_home: &Path, now: u64) -> GatewayPolicyCache {
     let Some(fetched_at) = object.get("fetchedAt").and_then(Value::as_u64) else {
         return GatewayPolicyCache::Unreadable(format!("{} has no fetchedAt", path.display()));
     };
+    // Never current for longer than a day after the read, whatever `expiresAt` says,
+    // and not at all when the read is dated in the future: a hand-edited file or a
+    // clock that ran ahead must not keep a policy current for good.
+    let latest = fetched_at.saturating_add(GATEWAY_POLICY_TTL_SECS);
     let expires_at = object
         .get("expiresAt")
         .and_then(Value::as_u64)
-        .unwrap_or_else(|| fetched_at.saturating_add(GATEWAY_POLICY_TTL_SECS));
+        .map_or(latest, |expires_at| expires_at.min(latest));
+    let from_the_future = fetched_at > now.saturating_add(GATEWAY_POLICY_CLOCK_SKEW_SECS);
     let policy = object
         .get("policy")
         .and_then(GatewayConnectorPolicy::from_account_policy);
-    if now < expires_at {
+    if now < expires_at && !from_the_future {
         GatewayPolicyCache::Current { policy, fetched_at }
     } else {
         GatewayPolicyCache::Stale { policy, fetched_at }
@@ -501,8 +510,8 @@ pub(crate) fn apply_mcp_policy(
         match inputs.gateway {
             GatewayPolicyCache::Stale { fetched_at, policy } if policy.is_some() => {
                 applied.warnings.push(format!(
-                    "your Zero-X plan's connector policy was last read {} ago; Neuron uses it until it can reach Zero-X again",
-                    describe_age(inputs.now.saturating_sub(*fetched_at))
+                    "your Zero-X plan's connector policy {}; Neuron uses it until it can reach Zero-X again",
+                    describe_read(inputs.now, *fetched_at)
                 ));
             }
             GatewayPolicyCache::Unreadable(error) => applied.warnings.push(format!(
@@ -601,10 +610,9 @@ fn policy_status(inputs: &McpPolicyInputs<'_>) -> McpPolicyStatus {
             format!(
                 "refused because the managed settings fail closed (mcpPolicy.failClosed) and your Zero-X plan's connector policy {}",
                 match inputs.gateway {
-                    GatewayPolicyCache::Stale { fetched_at, .. } => format!(
-                        "was last read {} ago",
-                        describe_age(inputs.now.saturating_sub(*fetched_at))
-                    ),
+                    GatewayPolicyCache::Stale { fetched_at, .. } => {
+                        describe_read(inputs.now, *fetched_at)
+                    }
                     _ => "has not been read; sign in to Zero-X, or run neuron usage once online"
                         .to_string(),
                 }
@@ -890,6 +898,16 @@ fn host_matches(allowed: &str, host: &str) -> bool {
     match allowed.strip_prefix("*.") {
         Some(domain) => host.ends_with(&format!(".{domain}")),
         None => host == allowed,
+    }
+}
+
+/// When a cached policy was read, as `now` sees it: `was last read 3 days ago`, or that
+/// the read is dated in the future.
+fn describe_read(now: u64, fetched_at: u64) -> String {
+    if fetched_at > now {
+        "is dated in the future (check this computer's clock)".to_string()
+    } else {
+        format!("was last read {} ago", describe_age(now - fetched_at))
     }
 }
 
@@ -1268,6 +1286,25 @@ mod tests {
     }
 
     #[test]
+    fn a_cache_that_claims_to_last_forever_still_fails_closed_after_a_day() {
+        let fixture = Fixture::new("forever");
+        fixture
+            .user(r#"{"defaultMcpServers":false,"mcpServers":{"own":{"command":"own"}}}"#)
+            .managed(r#"{"mcpPolicy":{"failClosed":true}}"#)
+            .gateway(&json!({"denied": []}), now() - GATEWAY_POLICY_TTL_SECS - 60);
+        let path = super::gateway_policy_cache_path(&fixture.home);
+        let mut cached: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("cache")).expect("json");
+        cached["expiresAt"] = json!(u64::MAX);
+        fs::write(&path, cached.to_string()).expect("edit cache");
+
+        let config = fixture.loader().load().expect("config loads");
+
+        assert!(config.mcp().policy().closed.is_some());
+        assert_eq!(config.mcp().blocked()["own"].rule, "mcpPolicy.failClosed");
+    }
+
+    #[test]
     fn fail_closed_without_any_cache_blocks_all_but_managed_servers() {
         let fixture = Fixture::new("closed-missing");
         fixture
@@ -1377,6 +1414,26 @@ mod tests {
                 fetched_at: 1_000
             }
         );
+
+        // A far-future `expiresAt` is capped at a day after the read, and a read dated
+        // in the future (beyond a little clock skew) is stale.
+        let path = super::gateway_policy_cache_path(&root);
+        let cached = fs::read_to_string(&path).expect("cache");
+        let mut cached: serde_json::Value = serde_json::from_str(&cached).expect("json");
+        cached["expiresAt"] = json!(u64::MAX);
+        fs::write(&path, cached.to_string()).expect("edit cache");
+        assert!(matches!(
+            read_gateway_policy(&root, 1_000 + GATEWAY_POLICY_TTL_SECS),
+            GatewayPolicyCache::Stale { .. }
+        ));
+        assert!(matches!(
+            read_gateway_policy(&root, 1_000 - super::GATEWAY_POLICY_CLOCK_SKEW_SECS),
+            GatewayPolicyCache::Current { .. }
+        ));
+        assert!(matches!(
+            read_gateway_policy(&root, 1_000 - super::GATEWAY_POLICY_CLOCK_SKEW_SECS - 1),
+            GatewayPolicyCache::Stale { .. }
+        ));
 
         // An account without a policy block replaces the old one.
         store_gateway_policy(&root, None, 2_000).expect("cache");
