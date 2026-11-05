@@ -7,9 +7,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use plugins::{PluginError, PluginLoadFailure, PluginManager, PluginSummary};
+use runtime::mcp_sandbox::{
+    describe_mcp_sandbox, mcp_sandbox_enforcement, resolve_mcp_sandbox, McpSandboxOrigin,
+};
 use runtime::{
-    compact_session, CompactionConfig, ConfigLoader, ConfigSource, McpOAuthConfig, McpServerConfig,
-    ScopedMcpServerConfig, Session,
+    compact_session, CompactionConfig, ConfigLoader, ConfigSource, McpOAuthConfig,
+    McpSandboxNetwork, McpServerConfig, ScopedMcpServerConfig, Session,
 };
 use serde_json::{json, Value};
 
@@ -3988,6 +3991,17 @@ fn render_mcp_server_report(
                     .tool_call_timeout_ms
                     .map_or_else(|| "<default>".to_string(), |value| format!("{value} ms"))
             ));
+            let (profile, origin) =
+                resolve_mcp_sandbox(server_name, Some(server.scope), &server.config);
+            lines.push(format!(
+                "  Sandbox           {} ({})",
+                describe_mcp_sandbox(&profile),
+                origin.label()
+            ));
+            lines.push(format!(
+                "  Enforcement       {}",
+                mcp_sandbox_enforcement(&profile)
+            ));
         }
         McpServerConfig::Sse(config) | McpServerConfig::Http(config) => {
             lines.push(format!("  URL               {}", config.url));
@@ -4858,13 +4872,42 @@ fn mcp_server_details_json(config: &McpServerConfig) -> Value {
     }
 }
 
+/// A stdio server's sandbox profile, where it came from and what this platform enforces.
+fn mcp_sandbox_json(name: &str, server: &ScopedMcpServerConfig) -> Value {
+    let (profile, origin) = resolve_mcp_sandbox(name, Some(server.scope), &server.config);
+    let (origin_id, catalog_id) = match &origin {
+        McpSandboxOrigin::Settings => ("settings", None),
+        McpSandboxOrigin::Catalog(id) => ("catalog", Some(id.clone())),
+        McpSandboxOrigin::Unvetted => ("unvetted", None),
+    };
+    let network = match &profile.network {
+        McpSandboxNetwork::None => json!("none"),
+        McpSandboxNetwork::Any => json!("any"),
+        McpSandboxNetwork::Hosts(hosts) => json!(hosts),
+    };
+    json!({
+        "origin": origin_id,
+        "catalog_id": catalog_id,
+        "off": profile.off,
+        "fs_read": &profile.fs_read,
+        "fs_write": &profile.fs_write,
+        "network": network,
+        "env_allow": &profile.env_allow,
+        "enforcement": mcp_sandbox_enforcement(&profile),
+    })
+}
+
 fn mcp_server_json(name: &str, server: &ScopedMcpServerConfig) -> Value {
+    let mut details = mcp_server_details_json(&server.config);
+    if matches!(server.config, McpServerConfig::Stdio(_)) {
+        details["sandbox"] = mcp_sandbox_json(name, server);
+    }
     json!({
         "name": name,
         "scope": config_source_json(server.scope),
         "transport": mcp_transport_json(&server.config),
         "summary": mcp_server_summary(&server.config),
-        "details": mcp_server_details_json(&server.config),
+        "details": details,
     })
 }
 
@@ -6359,6 +6402,13 @@ mod tests {
         assert!(show.contains("Args              alpha-server"));
         assert!(show.contains("Env keys          ALPHA_TOKEN"));
         assert!(show.contains("Tool timeout      1200 ms"));
+        assert!(
+            show.contains(
+                "Sandbox           read .; write nothing; network none (unvetted default)"
+            ),
+            "{show}"
+        );
+        assert!(show.contains("Enforcement       "), "{show}");
 
         let remote = super::render_mcp_report_for(&loader, &workspace, Some("show remote"))
             .expect("mcp show remote report should render");
@@ -6799,6 +6849,17 @@ mod tests {
         assert_eq!(show["server"]["name"], "alpha");
         assert_eq!(show["server"]["details"]["env_keys"][0], "ALPHA_TOKEN");
         assert_eq!(show["server"]["details"]["tool_call_timeout_ms"], 1200);
+        assert_eq!(show["server"]["details"]["sandbox"]["origin"], "unvetted");
+        assert_eq!(show["server"]["details"]["sandbox"]["network"], "none");
+        assert_eq!(show["server"]["details"]["sandbox"]["fs_read"][0], ".");
+        let bundled = render_mcp_report_json_for(&loader, &workspace, Some("show playwright"))
+            .expect("mcp show playwright json render");
+        assert_eq!(bundled["server"]["details"]["sandbox"]["origin"], "catalog");
+        assert_eq!(
+            bundled["server"]["details"]["sandbox"]["catalog_id"],
+            "playwright"
+        );
+        assert_eq!(bundled["server"]["details"]["sandbox"]["network"], "any");
 
         let missing = render_mcp_report_json_for(&loader, &workspace, Some("show missing"))
             .expect("mcp missing json render");
