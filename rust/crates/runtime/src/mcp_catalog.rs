@@ -142,6 +142,9 @@ pub struct McpCatalogSandbox {
     /// Hosts it reaches; `*` for any.
     #[serde(default)]
     pub network: Vec<String>,
+    /// Inherited environment variables it needs besides the default set.
+    #[serde(default)]
+    pub env_allow: Vec<String>,
 }
 
 /// One vetted connector.
@@ -786,6 +789,7 @@ mod tests {
                     .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
                     .collect(),
                 tool_call_timeout_ms: None,
+                sandbox: None,
             })
         };
         let package = "@modelcontextprotocol/server-filesystem@2.1.0";
@@ -925,7 +929,7 @@ mod tests {
 
         // A validly signed catalog that is not newer is a rollback.
         let current = McpCatalog::builtin().version.as_str();
-        for in_use in [current, "2026-11-04.2", "2027-01-01.1"] {
+        for in_use in [current, "2026-11-05.2", "2027-01-01.1"] {
             let error = verify_mcp_catalog_update_with(Some(&public), body, &signature, in_use)
                 .unwrap_err();
             assert!(error.contains("is not newer"), "{in_use}: {error}");

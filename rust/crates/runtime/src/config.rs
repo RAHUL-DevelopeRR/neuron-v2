@@ -214,6 +214,87 @@ pub struct McpStdioServerConfig {
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub tool_call_timeout_ms: Option<u64>,
+    /// The server's own `sandbox` setting; `None` leaves it to the catalog entry, or
+    /// the default for an unvetted server ([`crate::mcp_sandbox`]).
+    pub sandbox: Option<McpSandboxProfile>,
+}
+
+/// Where a stdio MCP server may read, write and connect, and which inherited
+/// environment variables it sees (settings key `sandbox` on a stdio server).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpSandboxProfile {
+    /// `"sandbox": false`: no sandbox, only the inherited-credential scrub and, on
+    /// Windows, the job object that ends the server's processes with it.
+    pub off: bool,
+    /// Paths it may read: `.` (or a relative path) in the workspace, `~/...` in the home
+    /// folder, `${cache}/...` in the OS cache folder, `${temp}`, or absolute.
+    pub fs_read: Vec<String>,
+    /// Paths it may write (and read), in the same forms.
+    pub fs_write: Vec<String>,
+    pub network: McpSandboxNetwork,
+    /// Inherited variables it sees besides the default set (`PATH`, `HOME`, temp, locale
+    /// and the system variables programs need). Its own `env` block always applies.
+    pub env_allow: Vec<String>,
+}
+
+/// What a sandboxed stdio MCP server may connect to.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum McpSandboxNetwork {
+    /// Nothing (`"none"`).
+    #[default]
+    None,
+    /// Any host (`"any"`, or a list holding `*`).
+    Any,
+    /// Only these hosts, through the allowlist proxy (`["github.com", "*.npmjs.org"]`).
+    Hosts(Vec<String>),
+}
+
+impl Default for McpSandboxProfile {
+    /// An unvetted server's profile: the workspace read-only, no network, the default
+    /// environment only.
+    fn default() -> Self {
+        Self {
+            off: false,
+            fs_read: vec![".".to_string()],
+            fs_write: Vec::new(),
+            network: McpSandboxNetwork::None,
+            env_allow: Vec::new(),
+        }
+    }
+}
+
+impl McpSandboxProfile {
+    /// `"sandbox": false`.
+    #[must_use]
+    pub fn unsandboxed() -> Self {
+        Self {
+            off: true,
+            fs_read: Vec::new(),
+            fs_write: Vec::new(),
+            network: McpSandboxNetwork::Any,
+            env_allow: Vec::new(),
+        }
+    }
+}
+
+impl McpSandboxNetwork {
+    /// A host list as settings and the catalog write it: empty is none, `*` is any.
+    #[must_use]
+    pub fn from_hosts(hosts: &[String]) -> Self {
+        let hosts = hosts
+            .iter()
+            .map(|host| host.trim())
+            .filter(|host| !host.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if hosts.is_empty() {
+            Self::None
+        } else if hosts.iter().any(|host| host == "*") {
+            Self::Any
+        } else {
+            Self::Hosts(hosts)
+        }
+    }
 }
 
 /// Configuration for an MCP server reached over HTTP or SSE.
@@ -1158,7 +1239,7 @@ const BUNDLED_MCP_SERVERS: [(&str, &str, &str); 2] = [
 ];
 
 /// How the bundled server `name` starts; `None` for any other name.
-fn bundled_mcp_server_config(name: &str) -> Option<McpServerConfig> {
+pub(crate) fn bundled_mcp_server_config(name: &str) -> Option<McpServerConfig> {
     BUNDLED_MCP_SERVERS
         .iter()
         .find(|(bundled, _, _)| *bundled == name)
@@ -1208,6 +1289,7 @@ fn default_mcp_stdio_config(package: &str, entry_variable: &str) -> McpStdioServ
         args,
         env: BTreeMap::new(),
         tool_call_timeout_ms: Some(120_000),
+        sandbox: None,
     }
 }
 
@@ -2070,6 +2152,7 @@ fn parse_mcp_server_config(
                 .collect(),
             env: optional_string_map(object, "env", context)?.unwrap_or_default(),
             tool_call_timeout_ms: optional_u64(object, "toolCallTimeoutMs", context)?,
+            sandbox: parse_optional_mcp_sandbox(object, context)?,
         })),
         "sse" => Ok(McpServerConfig::Sse(parse_mcp_remote_server_config(
             object, context,
@@ -2093,6 +2176,53 @@ fn parse_mcp_server_config(
             "{context}: unsupported MCP server type for {server_name}: {other}"
         ))),
     }
+}
+
+/// A stdio server's `sandbox`: `false` (none), `true` or absent (the catalog's or the
+/// default profile), or `{fsRead, fsWrite, network, envAllow}` where `network` is
+/// `"none"`, `"any"` or a host list.
+fn parse_optional_mcp_sandbox(
+    object: &BTreeMap<String, JsonValue>,
+    context: &str,
+) -> Result<Option<McpSandboxProfile>, ConfigError> {
+    let context = format!("{context}.sandbox");
+    let sandbox = match object.get("sandbox") {
+        None | Some(JsonValue::Bool(true)) => return Ok(None),
+        Some(JsonValue::Bool(false)) => return Ok(Some(McpSandboxProfile::unsandboxed())),
+        Some(JsonValue::Object(sandbox)) => sandbox,
+        Some(_) => {
+            return Err(ConfigError::Parse(format!(
+                "{context}: must be false, true or an object"
+            )))
+        }
+    };
+    let network = match sandbox.get("network") {
+        None => McpSandboxNetwork::None,
+        Some(JsonValue::String(text)) => match text.trim().to_ascii_lowercase().as_str() {
+            "none" => McpSandboxNetwork::None,
+            "any" | "*" => McpSandboxNetwork::Any,
+            other => {
+                return Err(ConfigError::Parse(format!(
+                "{context}: network must be \"none\", \"any\" or a list of hosts, not \"{other}\""
+            )))
+            }
+        },
+        Some(JsonValue::Array(_)) => McpSandboxNetwork::from_hosts(
+            &optional_string_array(sandbox, "network", &context)?.unwrap_or_default(),
+        ),
+        Some(_) => {
+            return Err(ConfigError::Parse(format!(
+                "{context}: network must be \"none\", \"any\" or a list of hosts"
+            )))
+        }
+    };
+    Ok(Some(McpSandboxProfile {
+        off: false,
+        fs_read: optional_string_array(sandbox, "fsRead", &context)?.unwrap_or_default(),
+        fs_write: optional_string_array(sandbox, "fsWrite", &context)?.unwrap_or_default(),
+        network,
+        env_allow: optional_string_array(sandbox, "envAllow", &context)?.unwrap_or_default(),
+    }))
 }
 
 fn infer_mcp_server_type(object: &BTreeMap<String, JsonValue>) -> &'static str {
@@ -2356,6 +2486,64 @@ mod tests {
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
+
+    #[test]
+    fn parses_a_stdio_server_sandbox() {
+        use super::{parse_mcp_server_json, McpSandboxNetwork, McpSandboxProfile};
+        let sandbox = |text: &str| match parse_mcp_server_json("s", text).expect("parses") {
+            McpServerConfig::Stdio(stdio) => stdio.sandbox,
+            other => panic!("expected stdio, got {other:?}"),
+        };
+        assert_eq!(sandbox(r#"{"command": "node"}"#), None);
+        assert_eq!(sandbox(r#"{"command": "node", "sandbox": true}"#), None);
+        assert_eq!(
+            sandbox(r#"{"command": "node", "sandbox": false}"#),
+            Some(McpSandboxProfile::unsandboxed())
+        );
+        let profile = sandbox(
+            r#"{"command": "node", "sandbox": {"fsRead": [".", "~/notes"], "fsWrite": ["out"],
+                "network": ["api.example.com", "*.cdn.example"], "envAllow": ["DISPLAY"]}}"#,
+        )
+        .expect("a profile");
+        assert!(!profile.off);
+        assert_eq!(profile.fs_read, vec![".", "~/notes"]);
+        assert_eq!(profile.fs_write, vec!["out"]);
+        assert_eq!(
+            profile.network,
+            McpSandboxNetwork::Hosts(vec![
+                "api.example.com".to_string(),
+                "*.cdn.example".to_string()
+            ])
+        );
+        assert_eq!(profile.env_allow, vec!["DISPLAY"]);
+        for (network, expected) in [
+            (r#""none""#, McpSandboxNetwork::None),
+            (r#""any""#, McpSandboxNetwork::Any),
+            ("[]", McpSandboxNetwork::None),
+            (r#"["*"]"#, McpSandboxNetwork::Any),
+        ] {
+            let text = format!(r#"{{"command": "node", "sandbox": {{"network": {network}}}}}"#);
+            assert_eq!(
+                sandbox(&text).expect("a profile").network,
+                expected,
+                "{network}"
+            );
+        }
+        // An object with no keys reads nothing, writes nothing, reaches nothing.
+        let empty = sandbox(r#"{"command": "node", "sandbox": {}}"#).expect("a profile");
+        assert!(empty.fs_read.is_empty() && empty.fs_write.is_empty());
+        assert_eq!(empty.network, McpSandboxNetwork::None);
+
+        for bad in [
+            r#"{"command": "node", "sandbox": "on"}"#,
+            r#"{"command": "node", "sandbox": {"network": "some"}}"#,
+            r#"{"command": "node", "sandbox": {"network": 3}}"#,
+            r#"{"command": "node", "sandbox": {"fsRead": "."}}"#,
+        ] {
+            let error = parse_mcp_server_json("s", bad).expect_err(bad).to_string();
+            assert!(error.contains("mcpServers.s.sandbox"), "{bad}: {error}");
+        }
+    }
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 

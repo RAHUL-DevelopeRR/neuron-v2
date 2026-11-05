@@ -61,3 +61,19 @@ entry cannot bound. An entry marked `writes_outside_workspace` (Memory, whose gr
 lives in its package folder or at `MEMORY_FILE_PATH`, and Codebase memory, whose index
 lives in the user's cache folder) has its `write` tools ask for full access, as a remote
 server's do. See `docs/DEFAULT_INTEGRATIONS.md` for how a tier becomes a permission.
+
+## Sandbox profiles
+
+Each entry's `sandbox` is what its stdio server may read (`fs_read`), write
+(`fs_write`), reach (`network`, `*` for any) and inherit (`env_allow`); see
+`runtime/src/mcp_sandbox.rs`. Version `2026-11-05.1` changed two entries, checked on
+5 November 2026 against the npm packages in the local npx cache:
+
+- Playwright (`@playwright/mcp@0.0.83`) keeps its browsers and the browser profile it
+  creates in Playwright's cache folder (`ms-playwright` under `%LOCALAPPDATA%`,
+  `~/Library/Caches` or `~/.cache`), reads files the user names in the workspace, and
+  needs the display variables on Linux.
+- Codebase memory (`codebase-memory-mcp@0.11.0`) keeps its index in
+  `~/.cache/codebase-memory-mcp` on every platform. Its `bin.js` downloads the release
+  binary from GitHub when the install script did not run, and GitHub release downloads
+  redirect to `*.githubusercontent.com`.

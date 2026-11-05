@@ -10,9 +10,10 @@
 //! root (its git root, or the folder outside git), the server name and the sha256
 //! of its launch spec: transport, command, arguments, its environment variables and
 //! headers (names and values as written, so `${VAR}` templates; only the digest is
-//! stored), the headers helper, the URL and the OAuth settings. Changing any of
-//! these asks again: a pulled `NODE_OPTIONS`, or a header that now expands another
-//! secret, is a new launch spec. Bundled and User servers need no approval.
+//! stored), the headers helper, the URL, the OAuth settings and a stdio server's
+//! `sandbox` setting. Changing any of these asks again: a pulled `NODE_OPTIONS`, a
+//! header that now expands another secret, or a sandbox that now reaches more, is a
+//! new launch spec. Bundled and User servers need no approval.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -21,7 +22,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::config::{ConfigLoader, ConfigSource, McpServerConfig};
+use crate::config::{
+    ConfigLoader, ConfigSource, McpSandboxNetwork, McpSandboxProfile, McpServerConfig,
+};
 use crate::mcp_toggle::{read_object, write_object};
 
 /// The approvals file in the config home.
@@ -33,17 +36,41 @@ pub fn mcp_scope_needs_approval(scope: ConfigSource) -> bool {
     matches!(scope, ConfigSource::Project | ConfigSource::Local)
 }
 
+/// A server's `sandbox` setting as the fingerprint covers it: widening what it may
+/// reach is a new launch spec.
+fn sandbox_spec(sandbox: &McpSandboxProfile) -> Value {
+    let network = match &sandbox.network {
+        McpSandboxNetwork::None => json!("none"),
+        McpSandboxNetwork::Any => json!("any"),
+        McpSandboxNetwork::Hosts(hosts) => json!(hosts),
+    };
+    json!({
+        "off": sandbox.off,
+        "fsRead": sandbox.fs_read,
+        "fsWrite": sandbox.fs_write,
+        "network": network,
+        "envAllow": sandbox.env_allow,
+    })
+}
+
 /// The sha256 (hex) of what starts or reaches the server, environment and header
 /// values included: only the digest is stored, never a value.
 #[must_use]
 pub fn mcp_launch_fingerprint(config: &McpServerConfig) -> String {
     let spec = match config {
-        McpServerConfig::Stdio(stdio) => json!({
-            "type": "stdio",
-            "command": stdio.command,
-            "args": stdio.args,
-            "env": stdio.env,
-        }),
+        McpServerConfig::Stdio(stdio) => {
+            let mut spec = json!({
+                "type": "stdio",
+                "command": stdio.command,
+                "args": stdio.args,
+                "env": stdio.env,
+            });
+            // Only when set, so approvals of servers without one stay valid.
+            if let Some(sandbox) = &stdio.sandbox {
+                spec["sandbox"] = sandbox_spec(sandbox);
+            }
+            spec
+        }
         McpServerConfig::Sse(remote) | McpServerConfig::Http(remote) => json!({
             "type": if matches!(config, McpServerConfig::Sse(_)) { "sse" } else { "http" },
             "url": remote.url,
@@ -226,8 +253,8 @@ mod tests {
 
     use super::{approve_mcp_server, mcp_launch_fingerprint, McpApprovals};
     use crate::config::{
-        ConfigLoader, ConfigSource, McpOAuthConfig, McpRemoteServerConfig, McpServerConfig,
-        McpStdioServerConfig, ProjectTrust,
+        ConfigLoader, ConfigSource, McpOAuthConfig, McpRemoteServerConfig, McpSandboxNetwork,
+        McpSandboxProfile, McpServerConfig, McpStdioServerConfig, ProjectTrust,
     };
 
     fn temp_root(label: &str) -> PathBuf {
@@ -388,6 +415,7 @@ mod tests {
                 .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
                 .collect::<BTreeMap<_, _>>(),
             tool_call_timeout_ms: None,
+            sandbox: None,
         })
     }
 
@@ -438,6 +466,27 @@ mod tests {
         ] {
             assert_ne!(base, mcp_launch_fingerprint(&changed), "{changed:?}");
         }
+
+        // A sandbox setting is part of the spec: widening it asks again.
+        let sandboxed = |network| {
+            let McpServerConfig::Stdio(mut config) =
+                stdio("node", &["server.js"], &[("TOKEN", "${CI}")])
+            else {
+                unreachable!()
+            };
+            config.sandbox = Some(McpSandboxProfile {
+                network,
+                ..McpSandboxProfile::default()
+            });
+            mcp_launch_fingerprint(&McpServerConfig::Stdio(config))
+        };
+        let closed = sandboxed(McpSandboxNetwork::None);
+        assert_ne!(base, closed);
+        assert_ne!(closed, sandboxed(McpSandboxNetwork::Any));
+        assert_ne!(
+            sandboxed(McpSandboxNetwork::Hosts(vec!["a.example".to_string()])),
+            sandboxed(McpSandboxNetwork::Hosts(vec!["b.example".to_string()]))
+        );
 
         let remote = mcp_launch_fingerprint(&http(&[("X-Trace", "${CI}")], None));
         let signed_in = http(

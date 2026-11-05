@@ -363,7 +363,7 @@ pub enum SeatbeltNetwork {
     ProxyOnly(u16),
 }
 
-fn sbpl_string(path: &str) -> String {
+pub(crate) fn sbpl_string(path: &str) -> String {
     format!("\"{}\"", path.replace('\\', "\\\\").replace('"', "\\\""))
 }
 

@@ -23,6 +23,7 @@ use crate::mcp_http::McpConnection;
 use crate::mcp_lifecycle_hardened::{
     McpDegradedReport, McpErrorSurface, McpFailedServer, McpLifecyclePhase,
 };
+use crate::mcp_sandbox::{prepare_mcp_launch, McpSandboxLaunch};
 
 #[cfg(test)]
 const MCP_INITIALIZE_TIMEOUT_MS: u64 = 3_000;
@@ -1354,6 +1355,10 @@ pub struct McpStdioProcess {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     newline_delimited: bool,
+    /// The kill-on-close job object holding the server's process tree (Windows):
+    /// dropping it, or this process ending, ends every process the server started.
+    #[cfg(windows)]
+    job: Option<winjob::Job>,
 }
 
 /// Where stdio MCP servers write their stderr: `None` (the default) leaves it on the
@@ -1377,8 +1382,9 @@ fn mcp_server_log() -> Option<PathBuf> {
 }
 
 /// The stderr of a server started with `command`: appended to `log` after a header line
-/// naming the command (not its arguments, which may hold secrets), or the terminal.
-fn server_stderr(log: Option<&Path>, command: &str) -> Stdio {
+/// naming the command (not its arguments, which may hold secrets) and a line for each
+/// of `notes` (its sandbox), or the terminal.
+fn server_stderr(log: Option<&Path>, command: &str, notes: &[String]) -> Stdio {
     let Some(log) = log else {
         return Stdio::inherit();
     };
@@ -1397,56 +1403,137 @@ fn server_stderr(log: Option<&Path>, command: &str) -> Stdio {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
         writeln!(file, "--- {started} (unix time) starting {command} ---")?;
+        for note in notes {
+            writeln!(file, "{note}")?;
+        }
         Ok(file)
     };
     open().map_or_else(|_| Stdio::null(), Stdio::from)
 }
 
-/// Builds the command that starts a stdio MCP server.
-///
-/// Inherited Zero-X credentials never reach MCP servers; variables the user
-/// configured for this server are applied afterwards and win.
-fn stdio_server_command(transport: &McpStdioTransport) -> Command {
-    let mut command = Command::new(&transport.command);
+/// Builds the command that starts a stdio MCP server as `launch` says
+/// ([`crate::mcp_sandbox`]): a sandboxed server gets exactly the environment the launch
+/// lists; an unsandboxed one inherits this process's, minus Zero-X credentials, plus
+/// the variables configured for it (which win). `suspended` starts it suspended so it
+/// can be put in its job object before it runs (Windows).
+#[cfg_attr(not(windows), allow(unused_variables))]
+fn stdio_server_command(
+    transport: &McpStdioTransport,
+    launch: &McpSandboxLaunch,
+    suspended: bool,
+) -> Command {
+    let mut command = Command::new(&launch.program);
     command
-        .args(&transport.args)
+        .args(&launch.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(server_stderr(
             mcp_server_log().as_deref(),
             &transport.command,
+            &launch.notes,
         ));
-    for key in plugins::subprocess::credential_env_keys() {
-        command.env_remove(key);
+    if let Some(env) = &launch.env {
+        command.env_clear();
+        command.envs(env.iter().map(|(key, value)| (key, value)));
+    } else {
+        for key in plugins::subprocess::credential_env_keys() {
+            command.env_remove(key);
+        }
+        apply_env(&mut command, &transport.env);
     }
-    apply_env(&mut command, &transport.env);
     // Not in the user's console: `cmd.exe /c npx …` and npm retitle the console they
     // run in, which is the terminal of the UI or the REPL.
     #[cfg(windows)]
-    command.creation_flags(plugins::subprocess::CREATE_NO_WINDOW);
+    command.creation_flags(if suspended {
+        plugins::subprocess::CREATE_NO_WINDOW | winjob::CREATE_SUSPENDED
+    } else {
+        plugins::subprocess::CREATE_NO_WINDOW
+    });
     command
 }
 
-/// Ends a server and, on Windows, the processes it started. A server launched as
-/// `cmd.exe /c npx …` runs in node grandchildren in their own console, which killing
-/// `cmd.exe` would leave running.
+/// A kill-on-close job object for a server's process tree, or `None` (with a note in
+/// the server log) when Windows will not make one.
+#[cfg(windows)]
+fn new_server_job(launch: &mut McpSandboxLaunch) -> Option<winjob::Job> {
+    if !launch.contain {
+        return None;
+    }
+    let limits = winjob::JobLimits {
+        max_processes: Some(crate::sandbox::DEFAULT_MAX_PROCESSES),
+        memory_limit_bytes: None,
+    };
+    match winjob::Job::new(&limits) {
+        Ok(job) => Some(job),
+        Err(error) => {
+            launch
+                .notes
+                .push(format!("sandbox: process containment unavailable: {error}"));
+            None
+        }
+    }
+}
+
+/// The job object type a server's tree is held in; nothing outside Windows.
+#[cfg(windows)]
+type ServerJob = winjob::Job;
+#[cfg(not(windows))]
+type ServerJob = ();
+
+/// Ends a server and the processes it started. With a job object (Windows) the job
+/// ends the whole tree at once. Without one, a server launched as `cmd.exe /c npx …`
+/// runs in node grandchildren in their own console, which killing `cmd.exe` would leave
+/// running, so `taskkill /T` ends them.
 ///
 /// Never waits long: `taskkill` gets [`plugins::subprocess::TREE_KILL_WAIT`] (it hangs
 /// while the WMI service is stuck), and so does the server's own exit.
-async fn kill_server_tree(child: &mut Child) -> io::Result<()> {
+#[cfg_attr(not(windows), allow(clippy::unused_async))]
+async fn kill_server_tree(child: &mut Child, job: Option<&ServerJob>) -> io::Result<()> {
     #[cfg(windows)]
-    if let (Some(pid), Ok(None)) = (child.id(), child.try_wait()) {
-        let _ = tokio::task::spawn_blocking(move || plugins::subprocess::kill_tree_of(pid)).await;
+    {
+        let contained = job.is_some_and(|job| job.terminate(1).is_ok());
+        if let (false, Some(pid), Ok(None)) = (contained, child.id(), child.try_wait()) {
+            let _ =
+                tokio::task::spawn_blocking(move || plugins::subprocess::kill_tree_of(pid)).await;
+        }
     }
+    #[cfg(not(windows))]
+    let _ = job;
     child.start_kill()?;
     let _ = timeout(plugins::subprocess::TREE_KILL_WAIT, child.wait()).await;
     Ok(())
 }
 
 impl McpStdioProcess {
+    /// Starts the server in its sandbox ([`crate::mcp_sandbox`]).
     pub fn spawn(transport: &McpStdioTransport) -> io::Result<Self> {
-        let mut command = stdio_server_command(transport);
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut launch = prepare_mcp_launch(transport)?;
+        #[cfg(windows)]
+        let job = new_server_job(&mut launch);
+        #[cfg(windows)]
+        let suspended = job.is_some();
+        #[cfg(not(windows))]
+        let suspended = false;
+        let mut command = stdio_server_command(transport, &launch, suspended);
         let mut child = command.spawn()?;
+        #[cfg(windows)]
+        if let Some(job) = &job {
+            // A failed assignment leaves the server running uncontained (taskkill still
+            // ends its tree); a failed resume leaves it suspended, so it is killed.
+            if let Some(handle) = child.raw_handle() {
+                let _ = job.assign_raw(handle);
+            }
+            let resumed = child
+                .id()
+                .ok_or_else(|| io::Error::other("the MCP server exited before it started"))
+                .and_then(winjob::resume_process);
+            if let Err(error) = resumed {
+                let _ = job.terminate(1);
+                let _ = child.start_kill();
+                return Err(error);
+            }
+        }
         let stdin = child
             .stdin
             .take()
@@ -1464,6 +1551,8 @@ impl McpStdioProcess {
                 .env
                 .get("NEURON_MCP_FRAMING")
                 .is_some_and(|framing| framing.eq_ignore_ascii_case("content-length")),
+            #[cfg(windows)]
+            job,
         })
     }
 
@@ -1663,7 +1752,11 @@ impl McpStdioProcess {
     }
 
     pub async fn terminate(&mut self) -> io::Result<()> {
-        kill_server_tree(&mut self.child).await
+        #[cfg(windows)]
+        let job = self.job.as_ref();
+        #[cfg(not(windows))]
+        let job: Option<&ServerJob> = None;
+        kill_server_tree(&mut self.child, job).await
     }
 
     pub async fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
@@ -1674,14 +1767,22 @@ impl McpStdioProcess {
         Ok(self.child.try_wait()?.is_some())
     }
 
-    /// Kills the server process without waiting for it.
+    /// Kills the server process (and, with a job object, its tree) without waiting.
     pub(crate) fn start_kill(&mut self) {
+        #[cfg(windows)]
+        if let Some(job) = &self.job {
+            let _ = job.terminate(1);
+        }
         let _ = self.child.start_kill();
     }
 
     pub(crate) async fn shutdown(&mut self) -> io::Result<()> {
         if self.child.try_wait()?.is_none() {
-            match kill_server_tree(&mut self.child).await {
+            #[cfg(windows)]
+            let job = self.job.as_ref();
+            #[cfg(not(windows))]
+            let job: Option<&ServerJob> = None;
+            match kill_server_tree(&mut self.child, job).await {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::InvalidInput => {}
                 Err(error) => return Err(error),
@@ -2133,6 +2234,7 @@ mod tests {
                 args: vec![script_path.to_string_lossy().into_owned()],
                 env: BTreeMap::from([("MCP_TEST_TOKEN".to_string(), "secret-value".to_string())]),
                 tool_call_timeout_ms: None,
+                sandbox: None,
             }),
         };
         McpClientBootstrap::from_scoped_config("stdio server", &config)
@@ -2156,6 +2258,7 @@ mod tests {
             args: python_script_args(script_path),
             env,
             tool_call_timeout_ms: None,
+            sandbox: crate::config::McpSandboxProfile::default(),
         }
     }
 
@@ -2209,6 +2312,7 @@ mod tests {
                 args: python_script_args(script_path),
                 env,
                 tool_call_timeout_ms: None,
+                sandbox: None,
             }),
         }
     }
@@ -2263,6 +2367,7 @@ mod tests {
                 ],
                 env: BTreeMap::new(),
                 tool_call_timeout_ms: None,
+                sandbox: crate::config::McpSandboxProfile::default(),
             };
             let mut process = McpStdioProcess::spawn(&echo).expect("spawn cmd.exe");
             process.write_line("ping").await.expect("write line");
@@ -2279,6 +2384,7 @@ mod tests {
                 ],
                 env: BTreeMap::new(),
                 tool_call_timeout_ms: None,
+                sandbox: crate::config::McpSandboxProfile::default(),
             };
             let mut process = McpStdioProcess::spawn(&long_running).expect("spawn cmd.exe");
             process.terminate().await.expect("terminate");
@@ -2473,6 +2579,7 @@ mod tests {
                 args: vec![script_path.to_string_lossy().into_owned()],
                 env: BTreeMap::from([("MCP_TEST_TOKEN".to_string(), "direct-secret".to_string())]),
                 tool_call_timeout_ms: None,
+                sandbox: crate::config::McpSandboxProfile::default(),
             };
             let mut process = McpStdioProcess::spawn(&transport).expect("spawn transport directly");
             let ready = process.read_available().await.expect("read ready");
@@ -2788,6 +2895,7 @@ mod tests {
                             ),
                         ]),
                         tool_call_timeout_ms: Some(25),
+                        sandbox: None,
                     }),
                 },
             )]);
@@ -2848,6 +2956,7 @@ mod tests {
                             ),
                         ]),
                         tool_call_timeout_ms: Some(1_000),
+                        sandbox: None,
                     }),
                 },
             )]);
@@ -3186,6 +3295,7 @@ mod tests {
                             args: Vec::new(),
                             env: BTreeMap::new(),
                             tool_call_timeout_ms: None,
+                            sandbox: None,
                         }),
                     },
                 ),
@@ -3417,6 +3527,7 @@ mod tests {
                 args: Vec::new(),
                 env: BTreeMap::new(),
                 tool_call_timeout_ms: timeout,
+                sandbox: None,
             }),
         };
         let servers = BTreeMap::from([
@@ -3440,25 +3551,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn stdio_servers_do_not_inherit_zero_x_credentials() {
-        let _guard = crate::test_env_lock();
-        std::env::set_var("NEURON_SESSION_TOKEN", "ses_mcp_scrub_session");
-        std::env::set_var("MCP_SCRUB_TEST_API_KEY", "nzx_mcp_scrub_key");
-        std::env::set_var("MCP_SCRUB_TEST_KEEP", "keep-me");
-        let transport = crate::mcp_client::McpStdioTransport {
-            command: "unused".to_string(),
-            args: Vec::new(),
-            // A credential the user configured for this server explicitly.
-            env: BTreeMap::from([("NEURON_TOKEN".to_string(), "nzx_configured".to_string())]),
-            tool_call_timeout_ms: None,
-        };
-        let command = super::stdio_server_command(&transport);
-        std::env::remove_var("NEURON_SESSION_TOKEN");
-        std::env::remove_var("MCP_SCRUB_TEST_API_KEY");
-        std::env::remove_var("MCP_SCRUB_TEST_KEEP");
-
-        let envs = command
+    fn command_envs(command: &tokio::process::Command) -> BTreeMap<String, Option<String>> {
+        command
             .as_std()
             .get_envs()
             .map(|(key, value)| {
@@ -3467,7 +3561,55 @@ mod tests {
                     value.map(|value| value.to_string_lossy().into_owned()),
                 )
             })
-            .collect::<BTreeMap<_, _>>();
+            .collect()
+    }
+
+    #[test]
+    fn stdio_servers_do_not_inherit_zero_x_credentials() {
+        let _guard = crate::test_env_lock();
+        std::env::set_var("NEURON_SESSION_TOKEN", "ses_mcp_scrub_session");
+        std::env::set_var("MCP_SCRUB_TEST_API_KEY", "nzx_mcp_scrub_key");
+        std::env::set_var("MCP_SCRUB_TEST_KEEP", "keep-me");
+        let transport = |sandbox| crate::mcp_client::McpStdioTransport {
+            command: "unused".to_string(),
+            args: Vec::new(),
+            // A credential the user configured for this server explicitly.
+            env: BTreeMap::from([("NEURON_TOKEN".to_string(), "nzx_configured".to_string())]),
+            tool_call_timeout_ms: None,
+            sandbox,
+        };
+        let command_for = |transport: &crate::mcp_client::McpStdioTransport| {
+            let launch = crate::mcp_sandbox::prepare_mcp_launch(transport).expect("launch");
+            super::stdio_server_command(transport, &launch, false)
+        };
+        let sandboxed = command_for(&transport(crate::config::McpSandboxProfile::default()));
+        let unsandboxed = command_for(&transport(crate::config::McpSandboxProfile::unsandboxed()));
+        std::env::remove_var("NEURON_SESSION_TOKEN");
+        std::env::remove_var("MCP_SCRUB_TEST_API_KEY");
+        std::env::remove_var("MCP_SCRUB_TEST_KEEP");
+
+        // Sandboxed: the environment is an allowlist, so neither the credentials nor
+        // other inherited variables are there at all.
+        let envs = command_envs(&sandboxed);
+        for absent in [
+            "NEURON_SESSION_TOKEN",
+            "MCP_SCRUB_TEST_API_KEY",
+            "MCP_SCRUB_TEST_KEEP",
+        ] {
+            assert!(!envs.contains_key(absent), "{absent}: {envs:?}");
+        }
+        assert_eq!(
+            envs.get("NEURON_TOKEN"),
+            Some(&Some("nzx_configured".to_string())),
+            "explicitly configured server env wins: {envs:?}"
+        );
+        assert!(
+            envs.keys().any(|key| key.eq_ignore_ascii_case("PATH")),
+            "{envs:?}"
+        );
+
+        // Unsandboxed: inherited, minus credentials, plus the configured variables.
+        let envs = command_envs(&unsandboxed);
         assert_eq!(envs.get("NEURON_SESSION_TOKEN"), Some(&None), "{envs:?}");
         assert_eq!(envs.get("MCP_SCRUB_TEST_API_KEY"), Some(&None), "{envs:?}");
         assert_eq!(
@@ -3534,6 +3676,7 @@ mod tests {
             args,
             env: BTreeMap::new(),
             tool_call_timeout_ms: None,
+            sandbox: None,
         }
     }
 
@@ -3589,7 +3732,7 @@ mod tests {
         };
         let status = std::process::Command::new(program)
             .args(args)
-            .stderr(super::server_stderr(Some(&log), program))
+            .stderr(super::server_stderr(Some(&log), program, &[]))
             .status()
             .expect("the command runs");
         assert!(status.success());
@@ -3601,5 +3744,384 @@ mod tests {
         );
         assert!(written.contains("server warning"), "{written}");
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// Runs `program args` as a sandboxed stdio server and returns all it printed.
+    fn run_sandboxed(
+        program: &str,
+        args: &[String],
+        env: BTreeMap<String, String>,
+        sandbox: crate::config::McpSandboxProfile,
+    ) -> String {
+        let transport = crate::mcp_client::McpStdioTransport {
+            command: program.to_string(),
+            args: args.to_vec(),
+            env,
+            tool_call_timeout_ms: None,
+            sandbox,
+        };
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let mut process = McpStdioProcess::spawn(&transport).expect("the server starts");
+            let mut output = Vec::new();
+            let reading = async {
+                loop {
+                    let chunk = process.read_available().await.expect("read stdout");
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    output.extend(chunk);
+                }
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(60), reading)
+                .await
+                .expect("the server finishes");
+            let _ = process.shutdown().await;
+            String::from_utf8_lossy(&output).into_owned()
+        })
+    }
+
+    /// `curl`, when this machine has it.
+    fn curl() -> Option<String> {
+        let program = if cfg!(windows) { "curl.exe" } else { "curl" };
+        std::process::Command::new(program)
+            .arg("--version")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|_| program.to_string())
+    }
+
+    /// A loopback HTTP server answering every request with `200 ok`.
+    fn serve_ok() -> u16 {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut buffer = [0_u8; 4096];
+                let _ = stream.read(&mut buffer);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+            }
+        });
+        port
+    }
+
+    fn curl_status(curl: &str, url: &str, sandbox: crate::config::McpSandboxProfile) -> String {
+        let sink = temp_dir();
+        let args = [
+            "-s".to_string(),
+            "-o".to_string(),
+            sink.to_string_lossy().into_owned(),
+            "-w".to_string(),
+            "%{http_code}".to_string(),
+            "--max-time".to_string(),
+            "10".to_string(),
+            url.to_string(),
+        ];
+        let status = run_sandboxed(curl, &args, BTreeMap::new(), sandbox);
+        let _ = fs::remove_file(sink);
+        status.trim().to_string()
+    }
+
+    #[test]
+    fn a_sandboxed_server_reaches_only_the_hosts_on_its_allowlist() {
+        let Some(curl) = curl() else {
+            eprintln!("skipped: curl is not installed");
+            return;
+        };
+        let allowed = serve_ok();
+        let other = serve_ok();
+        let sandbox = crate::config::McpSandboxProfile {
+            network: crate::config::McpSandboxNetwork::Hosts(vec![format!("127.0.0.1:{allowed}")]),
+            ..crate::config::McpSandboxProfile::default()
+        };
+        assert_eq!(
+            curl_status(
+                &curl,
+                &format!("http://127.0.0.1:{allowed}/"),
+                sandbox.clone()
+            ),
+            "200",
+            "a host on the list is reached through the proxy"
+        );
+        assert_eq!(
+            curl_status(&curl, &format!("http://127.0.0.1:{other}/"), sandbox),
+            "403",
+            "the proxy refuses a host that is not on the list"
+        );
+    }
+
+    #[test]
+    fn an_unvetted_server_has_no_network_by_default() {
+        let Some(curl) = curl() else {
+            eprintln!("skipped: curl is not installed");
+            return;
+        };
+        let port = serve_ok();
+        let status = curl_status(
+            &curl,
+            &format!("http://127.0.0.1:{port}/"),
+            crate::config::McpSandboxProfile::default(),
+        );
+        assert_ne!(status, "200", "no host is reachable: {status}");
+    }
+
+    #[test]
+    fn a_sandboxed_server_sees_only_allowlisted_and_configured_variables() {
+        let _guard = crate::test_env_lock();
+        std::env::set_var("MCP_SANDBOX_TEST_HIDDEN", "hidden-value");
+        std::env::set_var("MCP_SANDBOX_TEST_ALLOWED", "allowed-value");
+        let (program, args) = if cfg!(windows) {
+            (
+                "cmd.exe",
+                vec!["/d".to_string(), "/c".to_string(), "set".to_string()],
+            )
+        } else {
+            ("env", Vec::new())
+        };
+        let sandbox = crate::config::McpSandboxProfile {
+            env_allow: vec!["MCP_SANDBOX_TEST_ALLOWED".to_string()],
+            ..crate::config::McpSandboxProfile::default()
+        };
+        let output = run_sandboxed(
+            program,
+            &args,
+            BTreeMap::from([("MCP_SANDBOX_TEST_CONFIGURED".to_string(), "1".to_string())]),
+            sandbox,
+        );
+        std::env::remove_var("MCP_SANDBOX_TEST_HIDDEN");
+        std::env::remove_var("MCP_SANDBOX_TEST_ALLOWED");
+        assert!(!output.contains("hidden-value"), "{output}");
+        assert!(
+            output.contains("MCP_SANDBOX_TEST_ALLOWED=allowed-value"),
+            "{output}"
+        );
+        assert!(output.contains("MCP_SANDBOX_TEST_CONFIGURED=1"), "{output}");
+    }
+
+    /// A sandboxed server that tries to read a key in `~/.ssh` gets nothing (macOS
+    /// seatbelt, Linux bubblewrap). Windows does not limit file access.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_sandboxed_server_cannot_read_ssh_keys() {
+        if crate::mcp_sandbox::McpSandboxPlatform::detect()
+            == (crate::mcp_sandbox::McpSandboxPlatform::Linux { bwrap: None })
+        {
+            eprintln!("skipped: bubblewrap is not installed");
+            return;
+        }
+        let home = PathBuf::from(std::env::var("HOME").expect("HOME"));
+        let ssh = home.join(".ssh");
+        let created = !ssh.exists();
+        fs::create_dir_all(&ssh).unwrap();
+        let key = ssh.join(format!("id_neuron_sandbox_test_{}", std::process::id()));
+        fs::write(&key, "sandbox-test-secret").unwrap();
+        let output = run_sandboxed(
+            "sh",
+            &[
+                "-c".to_string(),
+                format!("cat '{}' 2>&1; echo done", key.display()),
+            ],
+            BTreeMap::new(),
+            crate::config::McpSandboxProfile::default(),
+        );
+        let _ = fs::remove_file(&key);
+        if created {
+            let _ = fs::remove_dir(&ssh);
+        }
+        assert!(output.contains("done"), "{output}");
+        assert!(!output.contains("sandbox-test-secret"), "{output}");
+    }
+
+    /// Whether process `pid` is running.
+    #[cfg(windows)]
+    fn process_alive(pid: u32) -> bool {
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .output()
+            .expect("tasklist runs");
+        String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+    }
+
+    /// The server tree of [`killing_the_engine_ends_the_sandboxed_server_tree`]:
+    /// `cmd.exe` running `ping`, as `cmd.exe /c npx` runs node.
+    #[cfg(windows)]
+    fn pinging_server() -> crate::mcp_client::McpStdioTransport {
+        crate::mcp_client::McpStdioTransport {
+            command: "cmd.exe".to_string(),
+            args: vec![
+                "/d".to_string(),
+                "/c".to_string(),
+                "ping -n 120 127.0.0.1 >NUL".to_string(),
+            ],
+            env: BTreeMap::new(),
+            tool_call_timeout_ms: None,
+            sandbox: crate::config::McpSandboxProfile::default(),
+        }
+    }
+
+    /// The pids in `process`'s job once its server has started a child.
+    #[cfg(windows)]
+    fn job_pids(process: &McpStdioProcess) -> Vec<u32> {
+        let job = process.job.as_ref().expect("the server is in a job object");
+        let started = std::time::Instant::now();
+        loop {
+            let pids = job.process_ids().expect("list the job");
+            if pids.len() >= 2 || started.elapsed() > std::time::Duration::from_secs(10) {
+                return pids;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// Run by [`killing_the_engine_ends_the_sandboxed_server_tree`] in a child test
+    /// process (the "engine"): starts the server, writes its tree's pids to the file
+    /// `NEURON_MCP_SANDBOX_HELPER` names, then waits to be killed.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "run by killing_the_engine_ends_the_sandboxed_server_tree"]
+    fn mcp_sandbox_engine_helper() {
+        let Some(pid_file) = std::env::var_os("NEURON_MCP_SANDBOX_HELPER") else {
+            return;
+        };
+        let process = McpStdioProcess::spawn(&pinging_server()).expect("the server starts");
+        let pids = job_pids(&process);
+        let text = pids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        fs::write(PathBuf::from(&pid_file).with_extension("tmp"), text).unwrap();
+        fs::rename(PathBuf::from(&pid_file).with_extension("tmp"), &pid_file).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(120));
+        drop(process);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn killing_the_engine_ends_the_sandboxed_server_tree() {
+        let pid_file = temp_dir().with_extension("pids");
+        let mut engine = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "mcp_stdio::tests::mcp_sandbox_engine_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("NEURON_MCP_SANDBOX_HELPER", &pid_file)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start the engine");
+        let started = std::time::Instant::now();
+        while !pid_file.exists() && started.elapsed() < std::time::Duration::from_secs(60) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let pids = fs::read_to_string(&pid_file)
+            .expect("the engine started its server")
+            .split(',')
+            .filter_map(|pid| pid.parse::<u32>().ok())
+            .collect::<Vec<_>>();
+        let _ = fs::remove_file(&pid_file);
+        assert!(pids.len() >= 2, "cmd.exe and its ping: {pids:?}");
+        assert!(pids.iter().all(|pid| process_alive(*pid)), "{pids:?}");
+
+        // TerminateProcess: the engine gets no chance to stop its server.
+        engine.kill().expect("kill the engine");
+        let _ = engine.wait();
+        let started = std::time::Instant::now();
+        while pids.iter().any(|pid| process_alive(*pid))
+            && started.elapsed() < std::time::Duration::from_secs(10)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let orphans = pids
+            .iter()
+            .filter(|pid| process_alive(**pid))
+            .collect::<Vec<_>>();
+        assert!(orphans.is_empty(), "orphaned server processes: {orphans:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dropping_a_server_ends_its_whole_tree() {
+        let process = McpStdioProcess::spawn(&pinging_server()).expect("the server starts");
+        let pids = job_pids(&process);
+        assert!(pids.len() >= 2, "{pids:?}");
+        drop(process);
+        let started = std::time::Instant::now();
+        while pids.iter().any(|pid| process_alive(*pid))
+            && started.elapsed() < std::time::Duration::from_secs(10)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            pids.iter().all(|pid| !process_alive(*pid)),
+            "the job ends the tree: {pids:?}"
+        );
+    }
+
+    /// Starts the bundled Playwright and Codebase memory servers as the settings loader
+    /// configures them (the installed entry scripts when `NEURON_*_MCP_ENTRY` points at
+    /// them, else `npx`), each in its catalog sandbox, and lists their tools. Needs Node
+    /// and the packages, so it is run by hand: `cargo test -p runtime -- --ignored
+    /// bundled_servers_start`.
+    #[test]
+    #[ignore = "needs node and the bundled MCP packages"]
+    fn bundled_servers_start_in_their_declared_sandboxes() {
+        let servers = ["playwright", "codebase-memory"]
+            .into_iter()
+            .map(|name| {
+                let config = crate::config::bundled_mcp_server_config(name).expect("bundled");
+                (
+                    name.to_string(),
+                    ScopedMcpServerConfig {
+                        scope: ConfigSource::Bundled,
+                        config,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for (name, server) in &servers {
+            let bootstrap = McpClientBootstrap::from_scoped_config(name, server);
+            let crate::mcp_client::McpClientTransport::Stdio(transport) = &bootstrap.transport
+            else {
+                panic!("stdio");
+            };
+            let catalog = crate::mcp_catalog::McpCatalog::builtin().get(name).unwrap();
+            assert_eq!(
+                transport.sandbox,
+                crate::config::McpSandboxProfile::from(&catalog.sandbox),
+                "{name} runs with its declared profile"
+            );
+        }
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let mut manager = McpServerManager::from_servers(&servers);
+            let report = manager.discover_tools_best_effort().await;
+            manager.shutdown().await.expect("shutdown");
+            for name in ["playwright", "codebase-memory"] {
+                let count = report
+                    .tools
+                    .iter()
+                    .filter(|tool| tool.server_name == name)
+                    .count();
+                eprintln!("{name}: {count} tools");
+            }
+            assert!(
+                report.failed_servers.is_empty(),
+                "{:?}",
+                report.failed_servers
+            );
+            for name in ["playwright", "codebase-memory"] {
+                assert!(
+                    report.tools.iter().any(|tool| tool.server_name == name),
+                    "{name} lists its tools"
+                );
+            }
+        });
     }
 }

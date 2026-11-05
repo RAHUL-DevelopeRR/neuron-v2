@@ -9043,6 +9043,7 @@ UU conflicted.rs",
                 args: Vec::new(),
                 env: std::collections::BTreeMap::new(),
                 tool_call_timeout_ms: None,
+                sandbox: None,
             }),
         };
         let servers = std::collections::BTreeMap::from([
@@ -9082,6 +9083,7 @@ UU conflicted.rs",
                 args: Vec::new(),
                 env: std::collections::BTreeMap::new(),
                 tool_call_timeout_ms: None,
+                sandbox: None,
             })
         };
         let remote = || {
@@ -9188,6 +9190,7 @@ UU conflicted.rs",
                     .collect(),
                 env: std::collections::BTreeMap::new(),
                 tool_call_timeout_ms: None,
+                sandbox: None,
             }),
         };
         assert_eq!(
@@ -9222,6 +9225,7 @@ UU conflicted.rs",
                     "/etc/elsewhere.jsonl".to_string(),
                 )]),
                 tool_call_timeout_ms: None,
+                sandbox: None,
             }),
         };
         assert_eq!(

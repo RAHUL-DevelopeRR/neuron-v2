@@ -84,13 +84,18 @@ pub fn mcp_server_signature(config: &McpServerConfig) -> Option<String> {
 pub fn scoped_mcp_config_hash(config: &ScopedMcpServerConfig) -> String {
     let rendered = match &config.config {
         McpServerConfig::Stdio(stdio) => format!(
-            "stdio|{}|{}|{}|{}",
+            "stdio|{}|{}|{}|{}{}",
             stdio.command,
             render_command_signature(&stdio.args),
             render_env_signature(&stdio.env),
             stdio
                 .tool_call_timeout_ms
-                .map_or_else(String::new, |timeout_ms| timeout_ms.to_string())
+                .map_or_else(String::new, |timeout_ms| timeout_ms.to_string()),
+            // Only when set, so the hash of a server without one is unchanged.
+            stdio
+                .sandbox
+                .as_ref()
+                .map_or_else(String::new, |sandbox| format!("|sandbox:{sandbox:?}"))
         ),
         McpServerConfig::Sse(remote) => format!(
             "sse|{}|{}|{}|{}",
@@ -249,6 +254,7 @@ mod tests {
             args: vec!["mcp-server".to_string()],
             env: BTreeMap::from([("TOKEN".to_string(), "secret".to_string())]),
             tool_call_timeout_ms: None,
+            sandbox: None,
         });
         assert_eq!(
             mcp_server_signature(&stdio),

@@ -1,5 +1,5 @@
 {
-  "version": "2026-11-04.1",
+  "version": "2026-11-05.1",
   "connectors": [
     {
       "id": "github",
@@ -276,7 +276,10 @@
       },
       "default_tier": "external",
       "sandbox": {
-        "network": ["*"]
+        "fs_read": ["."],
+        "fs_write": ["${cache}/ms-playwright"],
+        "network": ["*"],
+        "env_allow": ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "PLAYWRIGHT_BROWSERS_PATH"]
       },
       "default_scope": "user"
     },
@@ -308,7 +311,8 @@
       "default_tier": "write",
       "sandbox": {
         "fs_read": ["."],
-        "network": ["registry.npmjs.org", "github.com"]
+        "fs_write": ["~/.cache/codebase-memory-mcp"],
+        "network": ["registry.npmjs.org", "github.com", "*.githubusercontent.com"]
       },
       "writes_outside_workspace": true,
       "default_scope": "user"

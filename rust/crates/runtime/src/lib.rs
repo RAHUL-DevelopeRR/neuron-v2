@@ -42,6 +42,7 @@ pub mod mcp_lifecycle_hardened;
 mod mcp_oauth;
 pub mod mcp_output;
 pub mod mcp_policy;
+pub mod mcp_sandbox;
 pub mod mcp_server;
 mod mcp_stdio;
 #[cfg(test)]
@@ -104,12 +105,12 @@ pub use compact::{
 pub use config::{
     default_config_home, BlockedMcpServer, ConfigEntry, ConfigError, ConfigLoader, ConfigSource,
     IgnoredProjectSettings, McpConfigCollection, McpManagedProxyServerConfig, McpOAuthConfig,
-    McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
-    McpWebSocketServerConfig, OAuthConfig, PreviewHook, PreviewMcpServer, PreviewPermissionRule,
-    ProjectSettingsAction, ProjectTrust, ProviderFallbackConfig, ResolvedPermissionMode,
-    RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig, RuntimePermissionRuleConfig,
-    RuntimePluginConfig, ScopedMcpServerConfig, WorkspaceTrustPreview, CLAW_SETTINGS_SCHEMA_NAME,
-    UNTRUSTED_WORKSPACE_KEYS,
+    McpRemoteServerConfig, McpSandboxNetwork, McpSandboxProfile, McpSdkServerConfig,
+    McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
+    PreviewHook, PreviewMcpServer, PreviewPermissionRule, ProjectSettingsAction, ProjectTrust,
+    ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
+    RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
+    WorkspaceTrustPreview, CLAW_SETTINGS_SCHEMA_NAME, UNTRUSTED_WORKSPACE_KEYS,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,

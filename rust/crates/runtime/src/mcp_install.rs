@@ -881,6 +881,7 @@ mod tests {
             args: Vec::new(),
             env,
             tool_call_timeout_ms: None,
+            sandbox: crate::config::McpSandboxProfile::default(),
         };
         let resolved = super::stdio_transport_with_secrets("header-test", &transport).unwrap();
         assert_eq!(resolved.env["API_KEY"], "s-1");
