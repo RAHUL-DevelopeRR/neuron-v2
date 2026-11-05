@@ -248,6 +248,7 @@
       "sandbox": {
         "network": ["registry.npmjs.org"]
       },
+      "writes_outside_workspace": true,
       "default_scope": "user"
     },
     {
@@ -309,6 +310,7 @@
         "fs_read": ["."],
         "network": ["registry.npmjs.org", "github.com"]
       },
+      "writes_outside_workspace": true,
       "default_scope": "user"
     },
     {

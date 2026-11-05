@@ -133,8 +133,10 @@ comma, a code fence) are checked as the repaired call, which is what runs.
 needs only for the bundled servers. A server added from the
 [connector catalog](#connector-catalog) gets the tier its catalog entry pins for each
 tool instead, whatever the server claims: `read` runs in `read-only`, `write` needs
-`workspace-write` for a local server and full access for a remote one (it changes
-something outside your workspace), and `destructive` and `external` need full access.
+`workspace-write` for a local server that keeps its data in your workspace and full
+access for a remote one or a local one that writes elsewhere (Memory keeps its graph
+in its package folder or wherever `MEMORY_FILE_PATH` points, Codebase memory its index
+in your cache folder), and `destructive` and `external` need full access.
 A tool the entry does not list gets the entry's default tier, never less than the
 rule below. For any other server a tool needs at least `workspace-write`, and full
 access when the server is remote or the tool says it reaches the open world; an allow

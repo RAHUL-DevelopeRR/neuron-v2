@@ -2661,7 +2661,7 @@ fn permission_mode_for_mcp_tool(
     let catalog_entry = server.and_then(|server| runtime::mcp_catalog_entry_for(&server.config));
     if let Some(entry) = catalog_entry {
         if let Some(tier) = entry.pinned_tier(&tool.name) {
-            return tier.permission_mode(entry.is_remote());
+            return entry.permission_mode(tier);
         }
     }
     let remote = server.is_none_or(|server| server.transport() != runtime::McpTransport::Stdio);
@@ -2671,7 +2671,7 @@ fn permission_mode_for_mcp_tool(
         PermissionMode::WorkspaceWrite
     };
     let unlisted = catalog_entry.map_or(PermissionMode::ReadOnly, |entry| {
-        entry.default_tier.permission_mode(entry.is_remote())
+        entry.permission_mode(entry.default_tier)
     });
     claimed.max(floor).max(unlisted)
 }
@@ -9206,6 +9206,32 @@ UU conflicted.rs",
         assert_eq!(
             mode("unlisted", json!({"readOnlyHint": true}), &filesystem),
             PermissionMode::WorkspaceWrite
+        );
+
+        // Memory writes its graph outside the workspace (its package folder, or any
+        // MEMORY_FILE_PATH), so its writes ask as full access does.
+        let memory = runtime::ScopedMcpServerConfig {
+            scope: runtime::ConfigSource::User,
+            config: runtime::McpServerConfig::Stdio(runtime::McpStdioServerConfig {
+                command: "npx".to_string(),
+                args: ["-y", "@modelcontextprotocol/server-memory@2.0.1"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                env: std::collections::BTreeMap::from([(
+                    "MEMORY_FILE_PATH".to_string(),
+                    "/etc/elsewhere.jsonl".to_string(),
+                )]),
+                tool_call_timeout_ms: None,
+            }),
+        };
+        assert_eq!(
+            mode("create_entities", json!({}), &memory),
+            PermissionMode::DangerFullAccess
+        );
+        assert_eq!(
+            mode("read_graph", json!({}), &memory),
+            PermissionMode::ReadOnly
         );
     }
 

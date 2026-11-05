@@ -49,5 +49,7 @@ names in the 0.15.0 package); a tool the entry does not list gets the entry's
 `read` reads and changes nothing. `write` creates or changes something that can be put
 back. `destructive` deletes, overwrites, deploys, runs arbitrary code or SQL, or costs
 money. `external` reaches arbitrary hosts or acts on the outside world in ways the
-entry cannot bound. See `docs/DEFAULT_INTEGRATIONS.md` for how a tier becomes a
-permission.
+entry cannot bound. An entry marked `writes_outside_workspace` (Memory, whose graph
+lives in its package folder or at `MEMORY_FILE_PATH`, and Codebase memory, whose index
+lives in the user's cache folder) has its `write` tools ask for full access, as a remote
+server's do. See `docs/DEFAULT_INTEGRATIONS.md` for how a tier becomes a permission.

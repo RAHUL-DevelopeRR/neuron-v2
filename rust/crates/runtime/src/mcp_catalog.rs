@@ -42,13 +42,14 @@ pub enum McpToolTier {
 
 impl McpToolTier {
     /// The permission a call of a tool in this tier needs. `write` changes the workspace
-    /// for a local (stdio) server, and something outside it for a remote one, which asks
-    /// as full access does.
+    /// for a local (stdio) server that keeps its data there, and something outside it
+    /// (`outside`: a remote server, or a local one that writes elsewhere), which asks as
+    /// full access does.
     #[must_use]
-    pub fn permission_mode(self, remote: bool) -> PermissionMode {
+    pub fn permission_mode(self, outside: bool) -> PermissionMode {
         match self {
             Self::Read => PermissionMode::ReadOnly,
-            Self::Write if !remote => PermissionMode::WorkspaceWrite,
+            Self::Write if !outside => PermissionMode::WorkspaceWrite,
             Self::Write | Self::Destructive | Self::External => PermissionMode::DangerFullAccess,
         }
     }
@@ -164,6 +165,11 @@ pub struct McpCatalogEntry {
     pub default_tier: McpToolTier,
     #[serde(default)]
     pub sandbox: McpCatalogSandbox,
+    /// A local server whose `write` tools change files outside the workspace (its own
+    /// data in a package or cache folder, or a path the user names), so they need full
+    /// access as a remote server's do.
+    #[serde(default)]
+    pub writes_outside_workspace: bool,
     /// `user`, `project` or `local`.
     #[serde(default = "default_scope")]
     pub default_scope: String,
@@ -323,6 +329,12 @@ impl McpCatalogEntry {
     #[must_use]
     pub fn is_remote(&self) -> bool {
         self.transport == McpCatalogTransport::Http
+    }
+
+    /// The permission a call of a tool in `tier` needs on this entry's server.
+    #[must_use]
+    pub fn permission_mode(&self, tier: McpToolTier) -> PermissionMode {
+        tier.permission_mode(self.is_remote() || self.writes_outside_workspace)
     }
 
     /// The tier the entry pins for `tool`, or `None` when it does not list it.
@@ -719,7 +731,29 @@ mod tests {
             McpToolTier::Destructive.permission_mode(false),
             PermissionMode::DangerFullAccess
         );
-        let github = McpCatalog::builtin().get("github").unwrap();
+        let catalog = McpCatalog::builtin();
+        // Memory keeps its graph in its package folder (or MEMORY_FILE_PATH), and
+        // codebase-memory its index in the user's cache: outside the workspace.
+        for (id, tool) in [
+            ("memory", "create_entities"),
+            ("memory", "unlisted_tool"),
+            ("codebase-memory", "index_repository"),
+        ] {
+            let entry = catalog.get(id).unwrap();
+            let tier = entry.pinned_tier(tool).unwrap_or(entry.default_tier);
+            assert_eq!(tier, McpToolTier::Write, "{id} {tool}");
+            assert_eq!(
+                entry.permission_mode(tier),
+                PermissionMode::DangerFullAccess,
+                "{id} {tool}"
+            );
+        }
+        let git = catalog.get("git").unwrap();
+        assert_eq!(
+            git.permission_mode(git.pinned_tier("git_commit").unwrap()),
+            PermissionMode::WorkspaceWrite
+        );
+        let github = catalog.get("github").unwrap();
         assert_eq!(github.pinned_tier("get_me"), Some(McpToolTier::Read));
         assert_eq!(
             github.pinned_tier("merge_pull_request"),
