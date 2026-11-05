@@ -112,9 +112,13 @@ const DEFAULT_ENV: &[&str] = &[
 /// Inherited variables with these prefixes pass too (`LC_ALL`, `LC_CTYPE`, ...).
 const DEFAULT_ENV_PREFIXES: &[&str] = &["LC_"];
 
-/// Folders under the home folder that hold toolchains a server is started with (npm,
-/// nvm, uv, ...): readable by every sandboxed server.
+/// Folders and files under the home folder that hold toolchains a server is started
+/// with (npm, nvm, uv, ...) and git's own settings (git stops when it cannot read
+/// them): readable by every sandboxed server. `.npmrc`, which can hold registry
+/// tokens, is not: npm carries on without it.
 const TOOLCHAIN_READ: &[&str] = &[
+    ".gitconfig",
+    ".config/git",
     ".npm",
     ".npm-global",
     ".npm-packages",
@@ -257,7 +261,9 @@ pub fn mcp_sandbox_enforcement(profile: &McpSandboxProfile) -> &'static str {
             "Windows: process tree contained and environment allowlisted; file limits not enforced, network limits advisory"
         }
         McpSandboxPlatform::MacOs { seatbelt: true } => "macOS: enforced by sandbox-exec",
-        McpSandboxPlatform::Linux { bwrap: Some(_) } => "Linux: enforced by bubblewrap",
+        McpSandboxPlatform::Linux { bwrap: Some(_) } => {
+            "Linux: files and no-network enforced by bubblewrap; host lists advisory"
+        }
         McpSandboxPlatform::Linux { bwrap: None } => {
             "Linux: install bubblewrap (bwrap) to enforce file and network limits; environment allowlisted"
         }
@@ -687,7 +693,8 @@ pub fn mcp_seatbelt_profile(
 
 /// The bubblewrap arguments before `--` and the server's command: a read-only root,
 /// devices, an empty home with the read roots bound back read-only, the write roots
-/// writable, and no network namespace when `network` is none.
+/// writable, and no network namespace when `network` is none. The server starts in the
+/// workspace, or in `/` when the workspace is in the hidden home folder.
 #[must_use]
 pub fn mcp_bwrap_args(
     read_roots: &[PathBuf],
@@ -722,8 +729,17 @@ pub fn mcp_bwrap_args(
     if no_network {
         args.push("--unshare-net".to_string());
     }
+    let visible = home.is_none_or(|home| !workspace.starts_with(home))
+        || read_roots
+            .iter()
+            .chain(write_roots)
+            .any(|root| workspace.starts_with(root));
     args.push("--chdir".to_string());
-    args.push(workspace.to_string_lossy().into_owned());
+    args.push(if visible {
+        workspace.to_string_lossy().into_owned()
+    } else {
+        "/".to_string()
+    });
     args
 }
 
@@ -1248,6 +1264,17 @@ mod tests {
         assert!(joined.ends_with("--chdir /home/ada/repo"));
         assert!(!joined.contains("--unshare-net"));
         assert!(!joined.contains(".ssh"));
+
+        // A server that may not read the workspace does not start in it.
+        let args = mcp_bwrap_args(
+            &[],
+            &write,
+            Some(Path::new("/home/ada")),
+            Path::new("/home/ada/repo"),
+            true,
+        );
+        let joined = args.join(" ");
+        assert!(joined.ends_with("--unshare-net --chdir /"), "{joined}");
     }
 
     #[test]

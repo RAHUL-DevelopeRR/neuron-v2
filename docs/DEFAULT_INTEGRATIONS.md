@@ -204,9 +204,11 @@ it came from and what applies here:
   variables for a local proxy that reaches only the listed hosts (or none), which a
   program may ignore. File limits are not enforced.
 - **macOS:** the server runs under `sandbox-exec`: file contents in your home folder
-  are unreadable except the read and write roots and the toolchain folders (npm, nvm,
-  volta, uv, pyenv, ...), writes go only to the write roots and temp, and outbound
-  connections go only to the local proxy (a host list) or nowhere (`"none"`).
+  are unreadable except the read and write roots, the toolchain folders (npm, nvm,
+  volta, uv, pyenv, ...) and git's settings (`~/.gitconfig`, `~/.config/git`; not
+  `~/.npmrc`, which can hold registry tokens), writes go only to the write roots and
+  temp, and outbound connections go only to the local proxy (a host list) or nowhere
+  (`"none"`).
 - **Linux:** with bubblewrap (`bwrap`) installed, the server sees a read-only system,
   an empty home folder with the read roots and toolchain folders put back, writable
   write roots and temp, no network for `"none"`, and it ends with Neuron. Without
