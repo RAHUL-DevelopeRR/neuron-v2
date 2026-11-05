@@ -118,9 +118,8 @@ use api_client::*;
 use args::*;
 use commands::{
     classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
-    handle_mcp_slash_command, handle_mcp_slash_command_json,
-    handle_mcp_slash_command_with_json, handle_plugins_slash_command,
-    handle_skills_slash_command, handle_skills_slash_command_json,
+    handle_mcp_slash_command, handle_mcp_slash_command_json, handle_mcp_slash_command_with_json,
+    handle_plugins_slash_command, handle_skills_slash_command, handle_skills_slash_command_json,
     handle_skills_slash_command_with_json, render_slash_command_help,
     render_slash_command_help_filtered, resolve_skill_invocation, resume_supported_slash_commands,
     slash_command_specs, validate_slash_command_input, SkillSlashDispatch, SlashCommand,
