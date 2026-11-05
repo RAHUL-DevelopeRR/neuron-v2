@@ -61,10 +61,7 @@ impl McpConnection {
     pub(crate) fn spawn(bootstrap: &McpClientBootstrap) -> io::Result<Self> {
         match &bootstrap.transport {
             McpClientTransport::Stdio(transport) => Ok(Self::Stdio(McpStdioProcess::spawn(
-                &crate::mcp_install::stdio_transport_with_secrets(
-                    &bootstrap.server_name,
-                    transport,
-                )?,
+                &crate::mcp_install::prepare_stdio_transport(&bootstrap.server_name, transport)?,
             )?)),
             McpClientTransport::Http(transport) => Ok(Self::Remote(Box::new(
                 McpRemoteConnection::new(&bootstrap.server_name, transport, Flavor::Streamable)?,

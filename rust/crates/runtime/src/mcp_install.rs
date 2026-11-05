@@ -10,6 +10,17 @@
 //! that later points a server of the same name somewhere else, or starts it with other
 //! environment such as `NODE_OPTIONS` (a pulled project file, say), does not get the
 //! secret.
+//!
+//! A catalog connector's stdio server starts from a verified install
+//! ([`prepare_stdio_transport`], see `verified`), never through `npx` or `uvx`.
+
+mod archive;
+mod verified;
+
+pub use verified::{
+    mcp_requirements_text, McpFetch, McpHttpFetch, McpInstallState, McpInstallStore,
+    McpVerifiedLaunch, McpVerifiedSource, McpVerifiedSpec,
+};
 
 use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
@@ -149,6 +160,65 @@ pub(crate) fn stdio_transport_with_secrets(
     for value in resolved.env.values_mut() {
         *value = resolve_mcp_secret_references(server, &target, value)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::NotFound, error))?;
+    }
+    Ok(resolved)
+}
+
+/// The verified install `transport` starts from: a catalog connector's, when its launch
+/// spec is exactly that entry's. `None` for any other server.
+pub fn mcp_verified_spec_for(
+    transport: &crate::mcp_client::McpStdioTransport,
+) -> Result<Option<McpVerifiedSpec>, String> {
+    let config = McpServerConfig::Stdio(crate::config::McpStdioServerConfig {
+        command: transport.command.clone(),
+        args: transport.args.clone(),
+        env: transport.env.clone(),
+        tool_call_timeout_ms: None,
+        sandbox: None,
+    });
+    match McpCatalog::builtin().entry_for_config(&config) {
+        Some(entry) => McpVerifiedSpec::for_entry(entry),
+        None => Ok(None),
+    }
+}
+
+/// `transport` ready to start: its secrets resolved, and a catalog connector switched
+/// from the `npx`/`uvx`/program it names in settings to its verified install (installed
+/// on first use, checked on every start). The install folder becomes readable in its
+/// sandbox, as its program.
+pub(crate) fn prepare_stdio_transport(
+    server: &str,
+    transport: &crate::mcp_client::McpStdioTransport,
+) -> std::io::Result<crate::mcp_client::McpStdioTransport> {
+    prepare_stdio_transport_in(
+        server,
+        transport,
+        &McpInstallStore::in_config_home(&crate::config::default_config_home()),
+        &McpHttpFetch,
+    )
+}
+
+fn prepare_stdio_transport_in(
+    server: &str,
+    transport: &crate::mcp_client::McpStdioTransport,
+    store: &McpInstallStore,
+    fetch: &dyn McpFetch,
+) -> std::io::Result<crate::mcp_client::McpStdioTransport> {
+    let mut resolved = stdio_transport_with_secrets(server, transport)?;
+    let refused = |error: String| {
+        std::io::Error::other(format!("MCP server `{server}` was not started: {error}"))
+    };
+    let Some(spec) = mcp_verified_spec_for(transport).map_err(refused)? else {
+        return Ok(resolved);
+    };
+    let launch = store.ensure(&spec, fetch).map_err(refused)?;
+    resolved.command = launch.command;
+    resolved.args = launch.args;
+    if let Some(dir) = launch.dir {
+        resolved
+            .sandbox
+            .fs_read
+            .push(dir.to_string_lossy().into_owned());
     }
     Ok(resolved)
 }
@@ -1201,5 +1271,98 @@ mod tests {
         let text = format!("{:?}", github("x", "ghp_hidden_value", None));
         assert!(!text.contains("ghp_hidden_value"), "{text}");
         assert!(text.contains("GITHUB_PERSONAL_ACCESS_TOKEN"));
+    }
+
+    /// Fails every download, as a computer with no network does.
+    struct Offline(std::sync::Mutex<Vec<String>>);
+
+    impl super::McpFetch for Offline {
+        fn fetch_to(&self, url: &str, _dest: &Path) -> Result<(), String> {
+            self.0.lock().unwrap().push(url.to_string());
+            Err(format!("offline: {url}"))
+        }
+    }
+
+    fn bundled_transport(name: &str) -> crate::mcp_client::McpStdioTransport {
+        let config = crate::config::bundled_mcp_server_config(name).expect("bundled");
+        match crate::mcp_client::McpClientTransport::from_named_config(
+            name,
+            Some(crate::config::ConfigSource::Bundled),
+            &config,
+        ) {
+            crate::mcp_client::McpClientTransport::Stdio(transport) => transport,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn with_no_network_the_bundled_servers_start_from_their_verified_installs() {
+        if std::env::var_os("NEURON_PLAYWRIGHT_MCP_ENTRY").is_some() {
+            return; // the npm launcher's own install is used instead
+        }
+        let root = temp_root("offline-bundled");
+        let store = super::McpInstallStore::in_config_home(&root.join("home"));
+        let offline = Offline(std::sync::Mutex::new(Vec::new()));
+
+        // Before the first install there is nothing to start, and `npx` is never run.
+        let codebase = bundled_transport("codebase-memory");
+        let error =
+            super::prepare_stdio_transport_in("codebase-memory", &codebase, &store, &offline)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            error.contains("offline: https://github.com/DeusData/"),
+            "{error}"
+        );
+
+        // Installed earlier (here: recorded as an install leaves it), both start offline.
+        let codebase_spec = super::mcp_verified_spec_for(&codebase).unwrap().unwrap();
+        let program = if cfg!(windows) {
+            "codebase-memory-mcp.exe"
+        } else {
+            "codebase-memory-mcp"
+        };
+        let codebase_dir =
+            super::verified::record_install(&store, &codebase_spec, &[(program, b"binary")]);
+        let started =
+            super::prepare_stdio_transport_in("codebase-memory", &codebase, &store, &offline)
+                .unwrap();
+        assert_eq!(
+            started.command,
+            codebase_dir.join(program).to_string_lossy()
+        );
+        assert!(started.args.is_empty());
+        assert!(started
+            .sandbox
+            .fs_read
+            .contains(&codebase_dir.to_string_lossy().into_owned()));
+
+        let playwright = bundled_transport("playwright");
+        let playwright_spec = super::mcp_verified_spec_for(&playwright).unwrap().unwrap();
+        let cli = "node_modules/@playwright/mcp/cli.js";
+        let playwright_dir =
+            super::verified::record_install(&store, &playwright_spec, &[(cli, b"// cli")]);
+        let started =
+            super::prepare_stdio_transport_in("playwright", &playwright, &store, &offline).unwrap();
+        assert_ne!(started.command, "npx");
+        assert_ne!(started.command, "cmd.exe");
+        assert_eq!(started.args.len(), 1);
+        assert_eq!(Path::new(&started.args[0]), playwright_dir.join(cli));
+        assert_eq!(
+            offline.0.lock().unwrap().len(),
+            1,
+            "only the first try fetched"
+        );
+
+        // A server that is not a catalog connector starts as written.
+        let mut custom = playwright.clone();
+        custom.args.push("--headless".to_string());
+        let started =
+            super::prepare_stdio_transport_in("custom", &custom, &store, &offline).unwrap();
+        assert_eq!(
+            (started.command, started.args),
+            (custom.command, custom.args)
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }

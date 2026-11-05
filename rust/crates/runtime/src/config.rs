@@ -1224,17 +1224,18 @@ fn warn_ignored_project_settings(ignored: &[IgnoredProjectSettings]) {
 }
 
 /// The MCP servers Neuron ships and starts unless `"defaultMcpServers": false`: name,
-/// pinned package, and the variable that points at a locally installed entry script.
-const BUNDLED_MCP_SERVERS: [(&str, &str, &str); 2] = [
-    (
-        "codebase-memory",
-        "codebase-memory-mcp@0.11.0",
-        "NEURON_CODEBASE_MCP_ENTRY",
-    ),
+/// pinned package, and the variable that points at an entry script the npm package
+/// installed. Without one, the settings name the package as its catalog entry does
+/// (`npx -y <package>`), and the server starts from its verified install
+/// (`mcp_install::prepare_stdio_transport`), never through `npx`. Codebase memory has no
+/// such variable: its npm package only downloads a release binary in an install script,
+/// so it always runs the release binary Neuron fetched and hash-checked itself.
+const BUNDLED_MCP_SERVERS: [(&str, &str, Option<&str>); 2] = [
+    ("codebase-memory", "codebase-memory-mcp@0.11.0", None),
     (
         "playwright",
         "@playwright/mcp@0.0.83",
-        "NEURON_PLAYWRIGHT_MCP_ENTRY",
+        Some("NEURON_PLAYWRIGHT_MCP_ENTRY"),
     ),
 ];
 
@@ -1244,7 +1245,7 @@ pub(crate) fn bundled_mcp_server_config(name: &str) -> Option<McpServerConfig> {
         .iter()
         .find(|(bundled, _, _)| *bundled == name)
         .map(|(_, package, entry_variable)| {
-            McpServerConfig::Stdio(default_mcp_stdio_config(package, entry_variable))
+            McpServerConfig::Stdio(default_mcp_stdio_config(package, *entry_variable))
         })
 }
 
@@ -1261,8 +1262,9 @@ fn warn_once(message: &str) {
     }
 }
 
-fn default_mcp_stdio_config(package: &str, entry_variable: &str) -> McpStdioServerConfig {
-    let entry = std::env::var_os(entry_variable)
+fn default_mcp_stdio_config(package: &str, entry_variable: Option<&str>) -> McpStdioServerConfig {
+    let entry = entry_variable
+        .and_then(std::env::var_os)
         .map(PathBuf::from)
         .filter(|path| path.is_file());
     let (command, args) = if let Some(entry) = entry {
@@ -3012,10 +3014,40 @@ mod tests {
         let entry = root.join("cli.js");
         fs::write(&entry, "// package entry\n").unwrap();
         std::env::set_var("NEURON_TEST_MCP_ENTRY", &entry);
-        let config = super::default_mcp_stdio_config("unused@1.0.0", "NEURON_TEST_MCP_ENTRY");
+        let config = super::default_mcp_stdio_config("unused@1.0.0", Some("NEURON_TEST_MCP_ENTRY"));
         std::env::remove_var("NEURON_TEST_MCP_ENTRY");
         assert_eq!(config.args, vec![entry.to_string_lossy().into_owned()]);
         assert_ne!(config.command, "npx");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bundled_servers_are_their_catalog_entries_and_codebase_memory_ignores_the_npm_shim() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).unwrap();
+        // An older npm launcher points at the package's `bin.js`, which would run its
+        // install script; Codebase memory runs its verified release binary instead.
+        let shim = root.join("bin.js");
+        fs::write(&shim, "// shim\n").unwrap();
+        std::env::set_var("NEURON_CODEBASE_MCP_ENTRY", &shim);
+        let config = super::bundled_mcp_server_config("codebase-memory").unwrap();
+        std::env::remove_var("NEURON_CODEBASE_MCP_ENTRY");
+        let catalog = crate::mcp_catalog::McpCatalog::builtin();
+        assert_eq!(
+            catalog
+                .entry_for_config(&config)
+                .map(|entry| entry.id.as_str()),
+            Some("codebase-memory")
+        );
+        if std::env::var_os("NEURON_PLAYWRIGHT_MCP_ENTRY").is_none() {
+            let playwright = super::bundled_mcp_server_config("playwright").unwrap();
+            assert_eq!(
+                catalog
+                    .entry_for_config(&playwright)
+                    .map(|entry| entry.id.as_str()),
+                Some("playwright")
+            );
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

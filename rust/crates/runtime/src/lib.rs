@@ -160,8 +160,10 @@ pub use mcp_http::expand_env_refs as expand_mcp_header_value;
 pub use mcp_install::{
     delete_mcp_secret, expand_mcp_header, install_mcp_server, load_mcp_secret,
     mcp_catalog_entry_for, mcp_catalog_servers, mcp_secret_key, mcp_secret_target,
-    missing_mcp_variables, remove_mcp_server, resolve_mcp_secret_references, save_mcp_secret,
-    McpInstallOutcome, McpInstallRequest, McpInstallScope, McpRemoveOutcome,
+    mcp_verified_spec_for, missing_mcp_variables, remove_mcp_server, resolve_mcp_secret_references,
+    save_mcp_secret, McpFetch, McpHttpFetch, McpInstallOutcome, McpInstallRequest, McpInstallScope,
+    McpInstallState, McpInstallStore, McpRemoveOutcome, McpVerifiedLaunch, McpVerifiedSource,
+    McpVerifiedSpec,
 };
 pub use mcp_lifecycle_hardened::{
     McpDegradedReport, McpErrorSurface, McpFailedServer, McpLifecyclePhase, McpLifecycleState,

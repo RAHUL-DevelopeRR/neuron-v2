@@ -1776,6 +1776,8 @@ dependencies = [
 name = "runtime"
 version = "7.0.0-alpha.3"
 dependencies = [
+ "base64",
+ "flate2",
  "glob",
  "plugins",
  "rand 0.8.6",

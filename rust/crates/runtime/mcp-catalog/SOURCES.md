@@ -36,11 +36,11 @@ contributions whose authors have not agreed to relicense stay MIT. Both licences
 apply, each to its part.
 
 The npm `sha512` integrity and the wheel `sha256` of each pinned package are recorded in
-the entry's `install.integrity` for P4 (verified installs). P1 starts packages with
-`npx -y <package>@<version>` or `uvx <package>@<version>`, so only the version is
-pinned today. Tool names come from each server's README (or, for Supabase, the tool
-names in the 0.15.0 package); a tool the entry does not list gets the entry's
-`default_tier`.
+the entry's `install.integrity`. Settings name a local entry as `npx -y
+<package>@<version>` or `uvx <package>@<version>`, but the server starts from a verified
+install of what the entry pins (see "Verified installs" below), never through `npx` or
+`uvx`. Tool names come from each server's README (or, for Supabase, the tool names in
+the 0.15.0 package); a tool the entry does not list gets the entry's `default_tier`.
 
 ## Left out
 
@@ -85,3 +85,51 @@ whose install script failed, writes it there on first start. The entry's `fs_wri
 adds `${package}/bin`: the `bin` folder of the npm package whose script the server
 runs (skipped when Neuron cannot see that script, as with `npx`, whose cache the entry
 may write because it reaches `registry.npmjs.org`).
+
+## Verified installs
+
+Version `2026-11-05.3` (5 November 2026) adds what each local entry installs, so the
+catalog signature covers it and `runtime/src/mcp_install/verified.rs` checks every
+download against it:
+
+- npm entries (`filesystem`, `memory`, `playwright`): `lock` is the dependency tree
+  from `npm install --package-lock-only --ignore-scripts --save-exact
+  <package>@<version>` (npm 11.6.2) in an empty folder, with each tarball's registry URL
+  and `sha512` integrity; `bin` is the package's program from its `bin` field. The
+  locked package's own integrity equals `install.integrity`. None of the locked packages
+  declares an install script.
+- Python entries (`git`, `fetch`, `aws-docs`): `requirements` is the output of `uv pip
+  compile --universal --generate-hashes --python-version 3.10` (uv 0.13.6) for
+  `<package>==<version>`: every requirement with its environment marker and the
+  `sha256` of each wheel and sdist PyPI lists for it. The server's own wheel hash equals
+  `install.integrity`. Neuron installs wheels only (`--only-binary :all:`), so no build
+  script runs.
+- `codebase-memory`: the npm package (`bin.js`, `install.js`, read on 5 November 2026)
+  holds no server code. `install.js`, its `postinstall` script, downloads
+  `codebase-memory-mcp-<os>-<arch>[-portable].<zip|tar.gz>` from the GitHub release
+  `v0.11.0`, checks it against the release's own `checksums.txt` (from the same release,
+  so it is not pinned anywhere), and unpacks the one executable into the package's `bin`
+  folder; `bin.js` reruns `install.js` when that executable is missing (as after
+  `--ignore-scripts`) and then runs it. The script is therefore required to get the
+  server, but its download is not pinned. The entry's `release` instead pins each
+  platform's archive by the `sha256` in
+  https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.11.0/checksums.txt
+  (read on 5 November 2026; Linux uses the `-portable` build as `install.js` does), and
+  Neuron downloads the archive, checks it, and unpacks only the executable. Neither
+  `install.js` nor `bin.js` runs, and the npm package is never fetched.
+
+Release asset sha256 for v0.11.0:
+
+| Platform | Asset | sha256 |
+| --- | --- | --- |
+| windows-x86_64 | `codebase-memory-mcp-windows-amd64.zip` | `6eb6beaf261b19e419766e78baf93cbc3cf1c6338cff8fb7c0234859f96d1685` |
+| windows-aarch64 | `codebase-memory-mcp-windows-arm64.zip` | `52b29881214fce47d529e098308b1de77c40f6812e20a34d588ee4c25b84fd1a` |
+| macos-x86_64 | `codebase-memory-mcp-darwin-amd64.tar.gz` | `dbf1c73bfcbde64e7dde4cd1320da7afc02e2c972ee1789ae039521411f5132e` |
+| macos-aarch64 | `codebase-memory-mcp-darwin-arm64.tar.gz` | `4dee7f38b63740e6751d7a7ed7eb10291c1f2a3ea2415f599dc68370ca0a2d18` |
+| linux-x86_64 | `codebase-memory-mcp-linux-amd64-portable.tar.gz` | `1f9e8293eb2bc5c05cfa27a7e8fc033da6d729ffad525ccfcdaa3fd606306683` |
+| linux-aarch64 | `codebase-memory-mcp-linux-arm64-portable.tar.gz` | `d62eeb224d5ee3eba3070938ec62cf1033f10b041ec1c4b2fb67f7aef390cc7b` |
+
+To update an entry, regenerate its `lock` or `requirements` the same way for the new
+version, update `install.integrity` and `release`, and bump the catalog `version`;
+`McpCatalog::parse` refuses an entry whose own package is missing from its lock or
+requirements, or whose downloads lack a hash.

@@ -6,6 +6,12 @@
 //! version newer than the catalog in use ([`verify_mcp_catalog_update`]). Nothing
 //! fetches updates yet: the gateway serves them with hosted connectors (P5).
 //!
+//! A local entry also pins what it installs, so the signature covers it: an npm
+//! package's whole dependency tree with each tarball's `sha512` integrity, a Python
+//! package's requirements with their wheel and sdist `sha256` hashes, a release
+//! binary's `sha256`, or a container image's digest. `mcp_install` installs from these
+//! and checks every hash before a server starts.
+//!
 //! A configured server counts as a catalog server only when its launch spec is exactly
 //! what the catalog entry writes ([`McpCatalog::entry_for_config`]), so a settings file
 //! cannot borrow an entry's tiers by naming it.
@@ -78,12 +84,81 @@ pub enum McpCatalogTransport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum McpInstallKind {
-    /// An npm package, started with `npx -y <package>@<version>`.
+    /// An npm package, written in settings as `npx -y <package>@<version>` and run from
+    /// a verified install of its `lock` (or of its `release` binary).
     Npm,
-    /// A Python package, started with `uvx <package>@<version>`.
+    /// A Python package, written as `uvx <package>@<version>` and run from a virtual
+    /// environment installed from its hashed `requirements`.
     Uv,
+    /// A release binary, written as its `package` name and run from a verified copy of
+    /// the `release` asset for this platform.
+    Binary,
+    /// A container image, run with `docker run` by its digest.
+    Docker,
     /// A remote server the vendor runs.
     Remote,
+}
+
+/// One package of an npm entry's dependency tree, as `package-lock.json` (v3) lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpNpmLockEntry {
+    /// Where it goes, `node_modules/<name>` (nested for a second copy).
+    pub path: String,
+    pub version: String,
+    /// The registry tarball.
+    pub resolved: String,
+    /// `sha512-<base64>` of the tarball.
+    pub integrity: String,
+    /// The platforms it is for (`win32`, `darwin`, `linux`); every one when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub os: Vec<String>,
+    /// The CPUs it is for (`x64`, `arm64`); every one when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cpu: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub optional: bool,
+}
+
+/// One pinned Python requirement with the hashes of its wheels and sdist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpPythonRequirement {
+    pub name: String,
+    pub version: String,
+    /// An environment marker (`sys_platform == 'win32'`), when it is not always needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker: Option<String>,
+    /// `sha256:<hex>` of each file it may install from.
+    pub hashes: Vec<String>,
+}
+
+/// How a release asset holds its program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum McpReleaseArchive {
+    #[serde(rename = "zip")]
+    Zip,
+    #[serde(rename = "tar.gz")]
+    TarGz,
+    /// The asset is the program itself.
+    #[serde(rename = "none")]
+    None,
+}
+
+/// A release download for one platform.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpReleaseAsset {
+    pub url: String,
+    /// The sha256 (hex) of the download.
+    pub sha256: String,
+    pub archive: McpReleaseArchive,
+    /// The program's path in the archive (its file name for `none`).
+    pub member: String,
+}
+
+/// The `release` key of this platform: `<os>-<arch>` as Rust names them
+/// (`windows-x86_64`, `macos-aarch64`, `linux-x86_64`, ...).
+#[must_use]
+pub fn mcp_release_platform() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
 /// What an entry installs and how it starts.
@@ -94,10 +169,25 @@ pub struct McpCatalogInstall {
     pub package: Option<String>,
     #[serde(default)]
     pub version: Option<String>,
-    /// The package's npm `sha512-...` integrity or wheel `sha256:...`, for verified
-    /// installs.
+    /// The package's npm `sha512-...` integrity, its wheel `sha256:...`, or an image's
+    /// `sha256:...` digest.
     #[serde(default)]
     pub integrity: Option<String>,
+    /// An npm entry's program: its path in the package (`cli.js`); a Python entry's
+    /// console script when it is not named after the package.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bin: Option<String>,
+    /// An npm entry's dependency tree, the package itself included.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lock: Vec<McpNpmLockEntry>,
+    /// A Python entry's requirements, the package itself included.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requirements: Vec<McpPythonRequirement>,
+    /// Release downloads by platform ([`mcp_release_platform`]): a binary entry's
+    /// program, or the program an npm package's install script would download (the
+    /// script never runs; Neuron fetches and checks the binary itself).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub release: BTreeMap<String, McpReleaseAsset>,
     /// Arguments after the package.
     #[serde(default)]
     pub args: Vec<String>,
@@ -285,6 +375,27 @@ impl McpCatalog {
     }
 }
 
+/// Where npm entries' tarballs come from.
+pub(crate) const NPM_REGISTRY: &str = "https://registry.npmjs.org/";
+
+/// 64 lower-case hex digits.
+pub(crate) fn is_sha256_hex(text: &str) -> bool {
+    text.len() == 64
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// A relative path that stays in its folder: no `..`, no root, no drive, no backslash.
+pub(crate) fn relative_member(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && !path.contains(['\\', ':'])
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
 /// A package name as npm or Python tools compare it: lower case, with `_` and `.` as
 /// `-` (so `mcp_server_git` and the module `awslabs.aws_documentation_mcp_server` name
 /// their packages).
@@ -354,7 +465,13 @@ impl McpCatalogEntry {
     fn check(&self) -> Result<(), String> {
         let missing = |what: &str| format!("MCP catalog entry `{}` has no {what}", self.id);
         match (self.transport, self.install.kind) {
-            (McpCatalogTransport::Stdio, McpInstallKind::Npm | McpInstallKind::Uv) => {
+            (
+                McpCatalogTransport::Stdio,
+                McpInstallKind::Npm
+                | McpInstallKind::Uv
+                | McpInstallKind::Binary
+                | McpInstallKind::Docker,
+            ) => {
                 if self
                     .install
                     .package
@@ -373,6 +490,7 @@ impl McpCatalogEntry {
                 {
                     return Err(missing("pinned version"));
                 }
+                self.check_verified_install()?;
             }
             (McpCatalogTransport::Http, McpInstallKind::Remote) => {
                 if self.install.url.as_deref().unwrap_or_default().is_empty() {
@@ -405,6 +523,119 @@ impl McpCatalogEntry {
             }
         }
         Ok(())
+    }
+
+    /// Checks that a local entry pins everything it installs: the package in its own
+    /// lock or requirements with the entry's integrity, a hash on every download, and
+    /// downloads only from the package registry or over HTTPS.
+    #[allow(clippy::too_many_lines)]
+    fn check_verified_install(&self) -> Result<(), String> {
+        let id = &self.id;
+        let install = &self.install;
+        let package = install.package.as_deref().unwrap_or_default();
+        let version = install.version.as_deref().unwrap_or_default();
+        for (platform, asset) in &install.release {
+            if !asset.url.starts_with("https://") || !is_sha256_hex(&asset.sha256) {
+                return Err(format!(
+                    "MCP catalog entry `{id}` has a {platform} release asset without an https URL and a sha256"
+                ));
+            }
+            if !relative_member(&asset.member) {
+                return Err(format!(
+                    "MCP catalog entry `{id}` names the {platform} release member `{}`, which leaves its folder",
+                    asset.member
+                ));
+            }
+        }
+        match install.kind {
+            McpInstallKind::Npm if install.lock.is_empty() && install.release.is_empty() => Err(
+                format!("MCP catalog entry `{id}` has neither a lock nor a release binary"),
+            ),
+            McpInstallKind::Npm if install.lock.is_empty() => Ok(()),
+            McpInstallKind::Npm => {
+                if install
+                    .bin
+                    .as_deref()
+                    .is_none_or(|bin| !relative_member(bin))
+                {
+                    return Err(format!("MCP catalog entry `{id}` has no program (`bin`)"));
+                }
+                for entry in &install.lock {
+                    let in_tree = entry
+                        .path
+                        .strip_prefix("node_modules/")
+                        .is_some_and(relative_member);
+                    if !in_tree
+                        || !entry.resolved.starts_with(NPM_REGISTRY)
+                        || !entry.integrity.starts_with("sha512-")
+                    {
+                        return Err(format!(
+                            "MCP catalog entry `{id}` locks `{}` without a registry tarball and a sha512 integrity",
+                            entry.path
+                        ));
+                    }
+                }
+                let own = install
+                    .lock
+                    .iter()
+                    .find(|entry| entry.path == format!("node_modules/{package}"));
+                match own {
+                    Some(entry)
+                        if entry.version == version
+                            && Some(entry.integrity.as_str()) == install.integrity.as_deref() =>
+                    {
+                        Ok(())
+                    }
+                    _ => Err(format!(
+                        "MCP catalog entry `{id}` does not lock {package}@{version} with its integrity"
+                    )),
+                }
+            }
+            McpInstallKind::Uv => {
+                for requirement in &install.requirements {
+                    let hashed = !requirement.hashes.is_empty()
+                        && requirement
+                            .hashes
+                            .iter()
+                            .all(|hash| hash.strip_prefix("sha256:").is_some_and(is_sha256_hex));
+                    if !hashed {
+                        return Err(format!(
+                            "MCP catalog entry `{id}` requires {} without sha256 hashes",
+                            requirement.name
+                        ));
+                    }
+                }
+                let own = install.requirements.iter().find(|requirement| {
+                    normalize_package(&requirement.name) == normalize_package(package)
+                });
+                match (own, install.integrity.as_deref()) {
+                    (Some(requirement), Some(integrity))
+                        if requirement.version == version
+                            && requirement.hashes.iter().any(|hash| hash == integrity) =>
+                    {
+                        Ok(())
+                    }
+                    _ => Err(format!(
+                        "MCP catalog entry `{id}` does not require {package}=={version} with its hash"
+                    )),
+                }
+            }
+            McpInstallKind::Binary if install.release.is_empty() => {
+                Err(format!("MCP catalog entry `{id}` has no release binary"))
+            }
+            McpInstallKind::Docker
+                if !install
+                    .integrity
+                    .as_deref()
+                    .and_then(|digest| digest.strip_prefix("sha256:"))
+                    .is_some_and(is_sha256_hex) =>
+            {
+                Err(format!(
+                    "MCP catalog entry `{id}` has no image digest (`sha256:<hex>`)"
+                ))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// A remote server (its `write` tools change something outside the workspace).
@@ -462,6 +693,21 @@ impl McpCatalogEntry {
             ),
             McpInstallKind::Npm => ("npx".to_string(), vec!["-y".to_string(), package]),
             McpInstallKind::Uv => ("uvx".to_string(), vec![package]),
+            // The settings name the program; it starts from the verified copy.
+            McpInstallKind::Binary => (self.install.package.clone()?, Vec::new()),
+            McpInstallKind::Docker => (
+                "docker".to_string(),
+                vec![
+                    "run".to_string(),
+                    "-i".to_string(),
+                    "--rm".to_string(),
+                    format!(
+                        "{}@{}",
+                        self.install.package.as_deref()?,
+                        self.install.integrity.as_deref()?
+                    ),
+                ],
+            ),
             McpInstallKind::Remote => return None,
         };
         args.extend(self.install.args.iter().cloned());
@@ -893,6 +1139,104 @@ mod tests {
         assert!(McpCatalog::parse(unpinned).unwrap_err().contains("version"));
     }
 
+    /// A local entry as JSON with `install` replaced, to check what installs need.
+    fn with_install(install: &serde_json::Value) -> String {
+        json!({"version": "t", "connectors": [{
+            "id": "x", "name": "X", "description": "", "publisher": "p", "licence": "MIT",
+            "source": "https://example.com", "transport": "stdio", "install": install,
+            "default_tier": "write"
+        }]})
+        .to_string()
+    }
+
+    #[test]
+    fn a_local_entry_must_pin_every_download_it_installs() {
+        let sha = "a".repeat(64);
+        let integrity = "sha512-AAAA";
+        let lock = |path: &str, resolved: &str, integrity: &str| json!([{"path": path, "version": "1.0.0", "resolved": resolved, "integrity": integrity}]);
+        let npm = |lock: serde_json::Value| {
+            with_install(&json!({"kind": "npm", "package": "x", "version": "1.0.0",
+                "integrity": integrity, "bin": "cli.js", "lock": lock}))
+        };
+        let registry = "https://registry.npmjs.org/x/-/x-1.0.0.tgz";
+        assert!(McpCatalog::parse(&npm(lock("node_modules/x", registry, integrity))).is_ok());
+        for (bad, why) in [
+            (json!([]), "neither a lock"),
+            (
+                lock("node_modules/y", registry, integrity),
+                "does not lock x@1.0.0",
+            ),
+            (
+                lock("node_modules/x", registry, "sha512-BBBB"),
+                "does not lock x@1.0.0",
+            ),
+            (
+                lock("node_modules/x", "https://evil.example/x.tgz", integrity),
+                "registry tarball",
+            ),
+            (
+                lock("node_modules/../x", registry, integrity),
+                "registry tarball",
+            ),
+            (lock("node_modules/x", registry, "sha1-AAAA"), "sha512"),
+        ] {
+            let error = McpCatalog::parse(&npm(bad)).unwrap_err();
+            assert!(error.contains(why), "{why}: {error}");
+        }
+
+        let uv = |hashes: serde_json::Value| {
+            with_install(&json!({"kind": "uv", "package": "x_server", "version": "2",
+                "integrity": format!("sha256:{sha}"),
+                "requirements": [{"name": "x-server", "version": "2", "hashes": hashes}]}))
+        };
+        assert!(McpCatalog::parse(&uv(json!([format!("sha256:{sha}")]))).is_ok());
+        assert!(McpCatalog::parse(&uv(json!([])))
+            .unwrap_err()
+            .contains("without sha256"));
+        assert!(
+            McpCatalog::parse(&uv(json!([format!("sha256:{}", "b".repeat(64))])))
+                .unwrap_err()
+                .contains("with its hash")
+        );
+
+        let binary = |member: &str, digest: &str| {
+            with_install(&json!({"kind": "binary", "package": "x", "version": "1",
+                "release": {"linux-x86_64": {"url": "https://example.com/x.tar.gz",
+                    "sha256": digest, "archive": "tar.gz", "member": member}}}))
+        };
+        assert!(McpCatalog::parse(&binary("x", &sha)).is_ok());
+        assert!(McpCatalog::parse(&binary("../x", &sha))
+            .unwrap_err()
+            .contains("leaves its folder"));
+        assert!(McpCatalog::parse(&binary("x", "nothex"))
+            .unwrap_err()
+            .contains("sha256"));
+        let no_release = with_install(&json!({"kind": "binary", "package": "x", "version": "1"}));
+        assert!(McpCatalog::parse(&no_release)
+            .unwrap_err()
+            .contains("no release"));
+
+        let docker = |digest: &str| {
+            with_install(&json!({"kind": "docker", "package": "ghcr.io/example/x",
+                "version": "1.0", "integrity": digest}))
+        };
+        assert!(McpCatalog::parse(&docker("latest"))
+            .unwrap_err()
+            .contains("image digest"));
+        let catalog = McpCatalog::parse(&docker(&format!("sha256:{sha}"))).unwrap();
+        let (command, args) = catalog.connectors[0].stdio_command().unwrap();
+        assert_eq!(command, "docker");
+        assert_eq!(
+            args,
+            vec![
+                "run".to_string(),
+                "-i".to_string(),
+                "--rm".to_string(),
+                format!("ghcr.io/example/x@sha256:{sha}")
+            ]
+        );
+    }
+
     #[test]
     fn secret_references_are_found_in_order() {
         assert_eq!(
@@ -929,7 +1273,7 @@ mod tests {
 
         // A validly signed catalog that is not newer is a rollback.
         let current = McpCatalog::builtin().version.as_str();
-        for in_use in [current, "2026-11-05.2", "2027-01-01.1"] {
+        for in_use in [current, "2026-11-06.1", "2027-01-01.1"] {
             let error = verify_mcp_catalog_update_with(Some(&public), body, &signature, in_use)
                 .unwrap_err();
             assert!(error.contains("is not newer"), "{in_use}: {error}");
