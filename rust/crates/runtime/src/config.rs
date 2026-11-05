@@ -551,8 +551,11 @@ impl ConfigLoader {
         let mut disabled_mcp_servers = BTreeSet::new();
         let mut managed_policy = None;
         let mut managed_path = None;
+        // The managed settings' own deny rules: only these refuse a required server.
+        let mut managed_deny_rules = Vec::new();
         for (entry, mut object) in parsed_entries {
             if entry.source == ConfigSource::Managed {
+                managed_deny_rules.extend(permission_rule_list(&object, "deny"));
                 // Managed rules join everyone's instead of replacing them: a user's own
                 // deny rules stay, and a managed deny wins over any allow rule.
                 union_permission_rules(&mut merged, &mut object);
@@ -618,7 +621,7 @@ impl ConfigLoader {
 
         let now = crate::mcp_policy::unix_now();
         let gateway_policy = crate::mcp_policy::read_gateway_policy(&self.config_home, now);
-        let policy = crate::mcp_policy::apply_mcp_policy(
+        let mut policy = crate::mcp_policy::apply_mcp_policy(
             &mut mcp_servers,
             &mut disabled_servers,
             &crate::mcp_policy::McpPolicyInputs {
@@ -637,8 +640,18 @@ impl ConfigLoader {
         let mut permission_rules = parse_optional_permission_rules(&merged_value)?;
         if let Some(managed) = &managed_policy {
             permission_rules.extend(&managed.tool_rules);
+            managed_deny_rules.extend(managed.tool_rules.deny().iter().cloned());
         }
-        let mut blocked_servers = take_blocked_mcp_servers(&mut mcp_servers, &permission_rules);
+        let mut blocked_servers = take_blocked_mcp_servers(
+            &mut mcp_servers,
+            &permission_rules,
+            &policy.required,
+            &managed_deny_rules,
+        );
+        // A required server the managed settings themselves refuse is not required.
+        policy
+            .required
+            .retain(|name, _| !blocked_servers.contains_key(name));
         blocked_servers.extend(policy.blocked);
         let unapproved_servers = if self.mcp_approvals {
             self.take_unapproved_mcp_servers(&mut mcp_servers)
@@ -1000,6 +1013,20 @@ fn retain_untrusted_workspace_keys(object: &mut BTreeMap<String, JsonValue>) -> 
     }
     dropped.sort();
     dropped
+}
+
+/// The strings in `object`'s `permissions.<list>`.
+fn permission_rule_list(object: &BTreeMap<String, JsonValue>, list: &str) -> Vec<String> {
+    object
+        .get("permissions")
+        .and_then(JsonValue::as_object)
+        .and_then(|permissions| permissions.get(list))
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(JsonValue::as_str)
+        .map(str::to_string)
+        .collect()
 }
 
 /// Moves an untrusted workspace's `permissions.deny` rules into the merged
@@ -1653,17 +1680,25 @@ fn read_optional_json_object(path: &Path) -> Result<Option<ParsedConfigFile>, Co
 }
 
 /// Removes and returns the servers a `permissions.deny` rule refuses whole
-/// (`mcp__<server>` or `mcp__<server>__*`): none of their tools could run.
+/// (`mcp__<server>` or `mcp__<server>__*`): none of their tools could run. A server a
+/// policy requires is refused only by the managed settings' own rules (`managed_deny`:
+/// `permissions.deny` and `mcpPolicy.toolRules.deny`), so a user's or a workspace's
+/// rule cannot turn it off; their rules still refuse its tools when they are called.
 fn take_blocked_mcp_servers(
     servers: &mut BTreeMap<String, ScopedMcpServerConfig>,
     rules: &RuntimePermissionRuleConfig,
+    required: &BTreeMap<String, McpRequirement>,
+    managed_deny: &[String],
 ) -> BTreeMap<String, BlockedMcpServer> {
     let blocked = servers
         .keys()
         .filter_map(|name| {
-            rules
-                .deny()
-                .iter()
+            let deny = if required.contains_key(name) {
+                managed_deny
+            } else {
+                rules.deny()
+            };
+            deny.iter()
                 .find(|rule| crate::permissions::rule_covers_mcp_server(rule, name))
                 .map(|rule| (name.clone(), rule.clone()))
         })

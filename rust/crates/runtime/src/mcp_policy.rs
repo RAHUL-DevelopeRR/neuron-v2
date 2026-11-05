@@ -1078,6 +1078,52 @@ mod tests {
     }
 
     #[test]
+    fn only_a_managed_deny_rule_blocks_a_required_server() {
+        let fixture = Fixture::new("required-deny");
+        fs::create_dir_all(fixture.cwd.join(".neuron")).expect("project folder");
+        fs::write(
+            fixture.cwd.join(".neuron").join("settings.json"),
+            r#"{"permissions":{"deny":["mcp__codebase-memory__*"]}}"#,
+        )
+        .expect("project settings");
+        fixture
+            .user(r#"{"defaultMcpServers":false,"permissions":{"deny":["mcp__codebase-memory"]}}"#)
+            .managed(r#"{"mcpPolicy":{"required":["codebase-memory"]}}"#);
+
+        // Neither the user's rule nor an untrusted workspace's turns it off.
+        for trust in [crate::ProjectTrust::Trusted, crate::ProjectTrust::Untrusted] {
+            let config = fixture
+                .loader()
+                .with_project_trust(trust)
+                .load()
+                .expect("config loads");
+            assert!(config.mcp().get("codebase-memory").is_some(), "{trust:?}");
+            assert!(!config.mcp().blocked().contains_key("codebase-memory"));
+            assert!(config.mcp().required().contains_key("codebase-memory"));
+            // Their rules still refuse its tools when called.
+            let policy = crate::PermissionPolicy::new(crate::PermissionMode::DangerFullAccess)
+                .with_permission_rules(config.permission_rules());
+            assert!(matches!(
+                policy.authorize("mcp__codebase-memory__search_graph", "{}", None),
+                crate::PermissionOutcome::Deny { .. }
+            ));
+        }
+
+        // The managed settings' own deny rule does block it, and it is no longer
+        // listed as required.
+        for managed in [
+            r#"{"permissions":{"deny":["mcp__codebase-memory"]},"mcpPolicy":{"required":["codebase-memory"]}}"#,
+            r#"{"mcpPolicy":{"required":["codebase-memory"],"toolRules":{"deny":["mcp__codebase-memory__*"]}}}"#,
+        ] {
+            fixture.managed(managed);
+            let config = fixture.loader().load().expect("config loads");
+            assert!(config.mcp().get("codebase-memory").is_none(), "{managed}");
+            assert!(config.mcp().blocked().contains_key("codebase-memory"));
+            assert!(!config.mcp().required().contains_key("codebase-memory"));
+        }
+    }
+
+    #[test]
     fn a_required_catalog_connector_is_written_from_its_entry_not_the_workspace() {
         let fixture = Fixture::new("required-catalog");
         fs::create_dir_all(fixture.cwd.join(".neuron")).expect("project folder");
