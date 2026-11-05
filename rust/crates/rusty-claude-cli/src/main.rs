@@ -9059,6 +9059,10 @@ UU conflicted.rs",
 
     #[test]
     fn build_runtime_plugin_state_merges_plugin_hooks_into_runtime_features() {
+        // Installing the plugin writes the deprecated `enabledPlugins` key, and loading
+        // the settings then warns through the process-wide notice handler: held off
+        // while an engine test, which installs that handler, reads its events.
+        let _guard = env_lock();
         let config_home = temp_dir();
         let workspace = temp_dir();
         let source_root = temp_dir();
