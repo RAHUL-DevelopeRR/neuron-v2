@@ -1,8 +1,9 @@
-import { beforeAll, describe, expect, test } from 'bun:test'
+import { afterEach, beforeAll, describe, expect, test } from 'bun:test'
 import { createTestRenderer } from '@opentui/core/testing'
 import { createRoot, flushSync } from '@opentui/react'
 import React from 'react'
 
+import { setNeuronEngineClientForTesting } from '../../engine/neuron-engine-client'
 import { initializeThemeStore } from '../../hooks/use-theme'
 import { cutToDisplayWidth, displayWidth, padToDisplayWidth } from '../../utils/display-width'
 import { fitParts, type FooterPart } from '../engine-footer'
@@ -11,12 +12,19 @@ import {
   MIN_TERMINAL_ROWS,
   MinimumSizeGate,
   isTerminalTooSmall,
+  passesTooSmallScreen,
   tooSmallLines,
 } from '../minimum-size-gate'
+import { PERMISSION_KEY_GUARD_MS, PermissionPrompt } from '../permission-prompt'
+
+import type { NeuronEngineClient } from '../../engine/neuron-engine-client'
+import type { PermissionRequestedEvent } from '../../engine/protocol'
 
 beforeAll(() => {
   initializeThemeStore()
 })
+
+afterEach(() => setNeuronEngineClientForTesting(null))
 
 async function draw(width: number, height: number): Promise<string> {
   const setup = await createTestRenderer({ width, height })
@@ -97,5 +105,78 @@ describe('the minimum terminal size', () => {
     const big = await draw(80, 24)
     expect(big).toContain('the chat')
     expect(big).not.toContain('Terminal too small')
+  })
+})
+
+describe('keys while the terminal is too small', () => {
+  const request: PermissionRequestedEvent = {
+    type: 'permission_requested',
+    id: 7,
+    request: {
+      tool: 'bash',
+      current_mode: 'workspace-write',
+      required_mode: 'danger-full-access',
+      reason: null,
+      input: JSON.stringify({ command: 'rm -rf build' }),
+      session_prefixes: [],
+    },
+  }
+
+  /** A permission prompt behind the gate, with the engine's replies recorded. */
+  async function mountPrompt(width: number, height: number) {
+    const replies: unknown[] = []
+    setNeuronEngineClientForTesting({
+      replyToPermission: (reply: unknown) => replies.push(reply),
+      interrupt: () => {},
+    } as unknown as NeuronEngineClient)
+    const setup = await createTestRenderer({ width, height })
+    const root = createRoot(setup.renderer)
+    flushSync(() =>
+      root.render(
+        <MinimumSizeGate>
+          <PermissionPrompt request={request} width={56} />
+        </MinimumSizeGate>,
+      ),
+    )
+    await setup.renderOnce()
+    // Past the prompt's own key guard, so only the gate can stop a key.
+    await new Promise((resolve) => setTimeout(resolve, PERMISSION_KEY_GUARD_MS + 50))
+    await setup.renderOnce()
+    const cleanup = () => {
+      flushSync(() => root.unmount())
+      setup.renderer.destroy()
+    }
+    return { setup, replies, cleanup }
+  }
+
+  test('only Ctrl-C passes the too-small screen', () => {
+    expect(passesTooSmallScreen({ name: 'c', ctrl: true })).toBe(true)
+    expect(passesTooSmallScreen({ name: 'y' })).toBe(false)
+    expect(passesTooSmallScreen({ name: 'return' })).toBe(false)
+    expect(passesTooSmallScreen({ name: 'c', ctrl: true, meta: true })).toBe(false)
+  })
+
+  test('a permission key pressed on the too-small screen sends no reply', async () => {
+    const { setup, replies, cleanup } = await mountPrompt(40, 10)
+    try {
+      expect(setup.captureCharFrame()).toContain('Terminal too small')
+      setup.mockInput.pressKey('y')
+      setup.mockInput.pressKey('n')
+      setup.mockInput.pressEnter()
+      await setup.renderOnce()
+      expect(replies).toEqual([])
+
+      // Big enough again: the prompt shows and answers as before.
+      setup.resize(80, 24)
+      await setup.renderOnce()
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      await setup.renderOnce()
+      expect(setup.captureCharFrame()).toContain('Permission needed')
+      setup.mockInput.pressKey('y')
+      await setup.renderOnce()
+      expect(replies).toEqual([{ id: 7, decision: { kind: 'allow_once' } }])
+    } finally {
+      cleanup()
+    }
   })
 })
