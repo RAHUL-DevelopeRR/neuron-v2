@@ -45,10 +45,9 @@ mod imp {
         AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation,
         JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
         SetInformationJobObject, TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-        JOBOBJECT_BASIC_PROCESS_ID_LIST,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
-        JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_JOB_MEMORY,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
+        JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
     use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
 
@@ -139,8 +138,8 @@ mod imp {
             const MAX_IDS: usize = 1024;
             // A `usize` buffer keeps the list aligned: two `u32` counts, then the ids.
             let mut buffer = vec![0_usize; MAX_IDS + 2];
-            let size = u32::try_from(buffer.len() * size_of::<usize>())
-                .expect("buffer size fits u32");
+            let size =
+                u32::try_from(buffer.len() * size_of::<usize>()).expect("buffer size fits u32");
             let list = buffer
                 .as_mut_ptr()
                 .cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>();
