@@ -12,7 +12,12 @@
 //!   inherited environment minus credentials, and Zero-X or provider credentials never
 //!   pass it. A server limited to some hosts gets proxy variables for a loopback proxy
 //!   ([`crate::net_proxy`]) that reaches only those hosts; one with no network gets a
-//!   proxy that reaches none.
+//!   proxy that reaches none. `NODE_USE_ENV_PROXY` makes Node's own `fetch` use it too
+//!   (Node 22.21 and 24.5 or later).
+//! - Every platform that enforces file limits: the shared `npx` and `uvx` caches are
+//!   writable only by a server that may reach that registry (it could fetch whatever it
+//!   would plant there anyway); any other server gets a cache of its own, so it cannot
+//!   plant code that the user's own `npx`, or another server, runs later.
 //! - Windows: a kill-on-close job object (`winjob`) holds the server and every process
 //!   it starts, so stopping the server or ending the engine ends the whole tree (no
 //!   orphan `node.exe`). File limits are not enforced (there is no restricted-token spawn
@@ -22,10 +27,14 @@
 //!   allowed only to the write roots and temp, and outbound connections go only to the
 //!   proxy (a host list) or nowhere (no network).
 //! - Linux: bubblewrap (`bwrap`) when it is installed: a read-only root, an empty home
-//!   with the declared roots and toolchain folders bound back, the write roots and temp
-//!   writable, no network namespace for no network, and `--die-with-parent`. Without
-//!   `bwrap` only the environment allowlist and the proxy apply, and the server log says
-//!   so.
+//!   with the declared roots and toolchain folders bound back, the write roots writable,
+//!   a private `/tmp`, and `/run/user` and `/run/dbus` hidden (a path socket there, such
+//!   as the session bus or an ssh agent, stays reachable without a network namespace),
+//!   and no network namespace for no network. Not `--die-with-parent`: its signal fires
+//!   when the *thread* that started the server ends, and servers are started from
+//!   short-lived threads; the server ends with the engine through its closed stdin and
+//!   the engine's shutdown instead. Without `bwrap` only the environment allowlist and
+//!   the proxy apply, and the server log says so.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -57,7 +66,8 @@ const DEFAULT_ENV: &[&str] = &[
     "TMPDIR",
     "TMP",
     "TEMP",
-    "XDG_RUNTIME_DIR",
+    // Not `XDG_RUNTIME_DIR`: it holds the session bus and agent sockets (Linux hides it
+    // under bubblewrap unless `envAllow` names it).
     "XDG_CACHE_HOME",
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
@@ -137,8 +147,46 @@ const TOOLCHAIN_READ: &[&str] = &[
     "Library/pnpm",
 ];
 
-/// Toolchain folders a server's launcher writes (`npx` and `uvx` caches).
-const TOOLCHAIN_WRITE: &[&str] = &[".npm", ".local/share/uv"];
+/// A cache a server's launcher writes (`npx`, `uvx`) and the user's own runs share.
+struct LauncherCache {
+    /// Its folders under the home folder.
+    home: &'static [&'static str],
+    /// Its folders under the OS cache folder.
+    cache: &'static [&'static str],
+    /// The registry hosts whose reach makes the shared cache writable.
+    registries: &'static [&'static str],
+    /// The variable that points the launcher at another cache.
+    variable: &'static str,
+    /// The folder of a server's own cache for it.
+    private: &'static str,
+}
+
+const LAUNCHER_CACHES: &[LauncherCache] = &[
+    LauncherCache {
+        home: &[".npm"],
+        cache: &[],
+        registries: &["registry.npmjs.org"],
+        variable: "npm_config_cache",
+        private: "npm",
+    },
+    LauncherCache {
+        home: &[".local/share/uv", ".cache/uv"],
+        cache: &["uv"],
+        registries: &["pypi.org", "files.pythonhosted.org"],
+        variable: "UV_CACHE_DIR",
+        private: "uv",
+    },
+];
+
+/// Commands that run a script named in their arguments: that script's folder is
+/// readable (it is the server's program), and `${package}` in a profile path is its
+/// npm package.
+const INTERPRETERS: &[&str] = &[
+    "node", "nodejs", "bun", "deno", "tsx", "ts-node", "python", "python3", "pythonw", "py", "uv",
+];
+
+/// The file extensions of a script an interpreter runs.
+const SCRIPT_EXTENSIONS: &[&str] = &["js", "mjs", "cjs", "ts", "mts", "cts", "py", "pyz"];
 
 /// Where a server's profile came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -554,6 +602,15 @@ pub struct McpSandboxLaunch {
 struct Roots {
     read: Vec<PathBuf>,
     write: Vec<PathBuf>,
+    /// The temp folders: writable under seatbelt; bubblewrap gives a private `/tmp`.
+    temp: Vec<PathBuf>,
+    /// The server's own launcher caches, as (variable, folder), when file limits are
+    /// enforced and it may not write the shared ones.
+    private_caches: Vec<(&'static str, PathBuf)>,
+    /// The folders of the program it runs, readable beyond its profile.
+    program: Vec<PathBuf>,
+    /// Write roots to create when missing (a bound folder must exist).
+    create: Vec<PathBuf>,
 }
 
 /// The folder that holds a launched file: the outermost `node_modules` above it (a
@@ -579,40 +636,197 @@ fn program_root(path: &Path) -> Option<PathBuf> {
     })
 }
 
-fn sandbox_roots(transport: &McpStdioTransport, host: &McpSandboxHost) -> Roots {
-    let profile = &transport.sandbox;
-    let mut write = profile
-        .fs_write
-        .iter()
-        .filter_map(|entry| host.expand(entry))
+fn is_interpreter(command: &str) -> bool {
+    Path::new(command)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| INTERPRETERS.contains(&stem.to_ascii_lowercase().as_str()))
+}
+
+/// The script an interpreter command runs: its first argument that is an existing file
+/// with a script extension. Any other argument is data, not the program: a folder or a
+/// key file named there must not become readable.
+fn launched_script(command: &str, args: &[String]) -> Option<PathBuf> {
+    if !is_interpreter(command) {
+        return None;
+    }
+    args.iter()
+        .map(Path::new)
+        .find(|path| {
+            path.is_absolute()
+                && path.is_file()
+                && path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| {
+                        SCRIPT_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+                    })
+        })
+        .map(Path::to_path_buf)
+}
+
+/// The installed npm package that holds `script`: the nearest folder above it with a
+/// `package.json`, inside a `node_modules` folder.
+fn package_dir(script: &Path) -> Option<PathBuf> {
+    script
+        .ancestors()
+        .skip(1)
+        .take_while(|dir| dir.file_name().is_some_and(|name| name != "node_modules"))
+        .find(|dir| dir.join("package.json").is_file())
+        .filter(|dir| {
+            dir.components()
+                .any(|component| component.as_os_str() == "node_modules")
+        })
+        .map(Path::to_path_buf)
+}
+
+/// The folders a stdio server's program is read from beyond its profile: the command's
+/// folder when it names a file, and the folder of the script an interpreter runs (for a
+/// package, the `node_modules` folder its dependencies sit in).
+#[must_use]
+pub fn mcp_program_roots(command: &str, args: &[String]) -> Vec<PathBuf> {
+    let mut roots = program_root(Path::new(command))
+        .into_iter()
+        .chain(
+            launched_script(command, args)
+                .as_deref()
+                .and_then(program_root),
+        )
+        .map(|root| normalize(&root))
         .collect::<Vec<_>>();
-    write.push(normalize(&host.temp));
+    roots.dedup();
+    roots
+}
+
+/// A profile path, where `${package}` is the npm package of the script the server
+/// runs (no such package: the entry is skipped).
+fn expand_profile_path(
+    host: &McpSandboxHost,
+    entry: &str,
+    package: Option<&Path>,
+) -> Option<PathBuf> {
+    let entry = entry.trim();
+    match entry.strip_prefix("${package}") {
+        Some(rest) if rest.is_empty() || rest.starts_with(['/', '\\']) => {
+            let rest = rest.trim_start_matches(['/', '\\']);
+            // Resolved before the join: the folder named may not exist yet.
+            let package = normalize(package?);
+            Some(if rest.is_empty() {
+                package
+            } else {
+                normalize(&package.join(rest))
+            })
+        }
+        _ => host.expand(entry),
+    }
+}
+
+/// Whether `network` reaches any of `hosts` over HTTPS.
+fn network_reaches(network: &McpSandboxNetwork, hosts: &[&str]) -> bool {
+    match network {
+        McpSandboxNetwork::None => false,
+        McpSandboxNetwork::Any => true,
+        McpSandboxNetwork::Hosts(list) => {
+            let allowlist = NetworkAllowlist::new(list);
+            hosts.iter().any(|host| allowlist.allows(host, Some(443)))
+        }
+    }
+}
+
+/// The folder of a server's own launcher caches: under the OS cache folder (else temp),
+/// named after its program and a hash of its command line, so it stays the same from
+/// one start to the next.
+fn private_cache_dir(transport: &McpStdioTransport, host: &McpSandboxHost) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let mut hasher = Sha256::new();
+    hasher.update(transport.command.as_bytes());
+    for arg in &transport.args {
+        hasher.update([0]);
+        hasher.update(arg.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut name = launched_script(&transport.command, &transport.args)
+        .as_deref()
+        .unwrap_or_else(|| Path::new(&transport.command))
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .chars()
+        .filter(|char| char.is_ascii_alphanumeric() || matches!(char, '-' | '_' | '.'))
+        .take(32)
+        .collect::<String>();
+    if name.is_empty() {
+        name.push_str("server");
+    }
+    name.push('-');
+    for byte in &digest[..6] {
+        let _ = write!(name, "{byte:02x}");
+    }
+    let base = host.cache.as_deref().unwrap_or(&host.temp);
+    normalize(&base.join("neuron-mcp").join(name))
+}
+
+/// The roots of `transport`'s sandbox. `private_caches`: file limits are enforced, so a
+/// server that may not reach a registry gets its own launcher cache instead of write
+/// access to the shared one.
+fn sandbox_roots(
+    transport: &McpStdioTransport,
+    host: &McpSandboxHost,
+    private_caches: bool,
+) -> Roots {
+    let profile = &transport.sandbox;
+    let script = launched_script(&transport.command, &transport.args);
+    let package = script.as_deref().and_then(package_dir);
+    let mut create = Vec::new();
+    let mut write = Vec::new();
+    for entry in &profile.fs_write {
+        let Some(path) = expand_profile_path(host, entry, package.as_deref()) else {
+            continue;
+        };
+        let in_home = host
+            .home
+            .as_ref()
+            .is_some_and(|home| path.starts_with(home));
+        if in_home || entry.trim().starts_with("${package}") {
+            create.push(path.clone());
+        }
+        write.push(path);
+    }
+    let mut temp = vec![normalize(&host.temp)];
     if cfg!(target_os = "macos") {
-        write.push(PathBuf::from("/private/tmp"));
-        write.push(PathBuf::from("/private/var/folders"));
+        temp.push(PathBuf::from("/private/tmp"));
+        temp.push(PathBuf::from("/private/var/folders"));
     }
     if cfg!(not(windows)) {
-        write.push(PathBuf::from("/tmp"));
+        temp.push(PathBuf::from("/tmp"));
     }
-    if let Some(home) = &host.home {
-        write.extend(TOOLCHAIN_WRITE.iter().map(|dir| home.join(dir)));
-    }
-    if let Some(cache) = &host.cache {
-        write.push(cache.join("uv"));
+    let mut private = Vec::new();
+    for cache in LAUNCHER_CACHES {
+        if private_caches && !network_reaches(&profile.network, cache.registries) {
+            let dir = private_cache_dir(transport, host).join(cache.private);
+            create.push(dir.clone());
+            write.push(dir.clone());
+            private.push((cache.variable, dir));
+            continue;
+        }
+        if let Some(home) = &host.home {
+            write.extend(cache.home.iter().map(|dir| home.join(dir)));
+        }
+        if let Some(cache_dir) = &host.cache {
+            write.extend(cache.cache.iter().map(|dir| cache_dir.join(dir)));
+        }
     }
     let mut read = profile
         .fs_read
         .iter()
-        .filter_map(|entry| host.expand(entry))
+        .filter_map(|entry| expand_profile_path(host, entry, package.as_deref()))
         .collect::<Vec<_>>();
     if let Some(home) = &host.home {
         read.extend(TOOLCHAIN_READ.iter().map(|dir| home.join(dir)));
     }
-    read.extend(
-        std::iter::once(&transport.command)
-            .chain(&transport.args)
-            .filter_map(|word| program_root(Path::new(word))),
-    );
+    let program = mcp_program_roots(&transport.command, &transport.args);
+    read.extend(program.iter().cloned());
     let tidy = |paths: &mut Vec<PathBuf>| {
         paths.sort_by(|left, right| {
             left.components()
@@ -623,9 +837,91 @@ fn sandbox_roots(transport: &McpStdioTransport, host: &McpSandboxHost) -> Roots 
         paths.dedup();
     };
     tidy(&mut write);
-    read.retain(|path| !write.contains(path));
+    tidy(&mut temp);
+    read.retain(|path| !write.contains(path) && !temp.contains(path));
     tidy(&mut read);
-    Roots { read, write }
+    Roots {
+        read,
+        write,
+        temp,
+        private_caches: private,
+        program,
+        create,
+    }
+}
+
+impl Roots {
+    /// The server-log lines for what these roots add to the profile.
+    fn notes(&self) -> Vec<String> {
+        let mut notes = Vec::new();
+        if let Some((_, dir)) = self.private_caches.first() {
+            notes.push(format!(
+                "sandbox: its own launcher cache in {} (it may not reach the registry, so it may not write the shared one)",
+                dir.parent().unwrap_or(dir).display()
+            ));
+        }
+        if !self.program.is_empty() {
+            notes.push(format!(
+                "sandbox: also readable as its program: {}",
+                self.program
+                    .iter()
+                    .map(|root| root.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        notes
+    }
+}
+
+/// Whether file limits are enforced on `platform` (so a private launcher cache helps).
+fn enforces_files(platform: &McpSandboxPlatform) -> bool {
+    matches!(
+        platform,
+        McpSandboxPlatform::MacOs { seatbelt: true } | McpSandboxPlatform::Linux { bwrap: Some(_) }
+    )
+}
+
+/// The folders bubblewrap replaces with an empty one: `/tmp` (the server gets a private
+/// one), and `/run/user`, `/run/dbus` and the runtime folder `runtime_dir` when they
+/// exist. A path socket in them (the session and system bus, an ssh or gpg agent) is
+/// reachable without a network namespace, and the session bus can start an unsandboxed
+/// program (`systemd-run --user`).
+fn bwrap_hidden_dirs(runtime_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut hidden = vec![PathBuf::from("/tmp")];
+    let candidates = [Path::new("/run/user"), Path::new("/run/dbus")]
+        .into_iter()
+        .map(Path::to_path_buf)
+        .chain(runtime_dir.map(Path::to_path_buf));
+    for dir in candidates {
+        if dir.is_absolute() && dir.is_dir() && !hidden.iter().any(|outer| dir.starts_with(outer)) {
+            hidden.push(dir);
+        }
+    }
+    hidden
+}
+
+/// The sockets a server's environment grants it under bubblewrap, bound back read-only
+/// (a read-only bind still lets it connect): the X server's folder for `DISPLAY`, the
+/// `XAUTHORITY` file and the runtime folder when `envAllow` passes `XDG_RUNTIME_DIR`.
+fn granted_socket_roots(env: &[(OsString, OsString)]) -> Vec<PathBuf> {
+    let value = |name: &str| {
+        env.iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| PathBuf::from(value))
+            .filter(|path| !path.as_os_str().is_empty())
+    };
+    let mut roots = Vec::new();
+    if value("DISPLAY").is_some() {
+        roots.push(PathBuf::from("/tmp/.X11-unix"));
+    }
+    roots.extend(
+        ["XAUTHORITY", "XDG_RUNTIME_DIR"]
+            .into_iter()
+            .filter_map(value)
+            .filter(|path| path.is_absolute()),
+    );
+    roots
 }
 
 /// A seatbelt profile for an MCP server: file contents in `home` unreadable except under
@@ -692,19 +988,23 @@ pub fn mcp_seatbelt_profile(
 }
 
 /// The bubblewrap arguments before `--` and the server's command: a read-only root,
-/// devices, an empty home with the read roots bound back read-only, the write roots
+/// devices, an empty home and an empty folder over each of `hidden`
+/// ([`bwrap_hidden_dirs`]), the read roots bound back read-only, the write roots
 /// writable, and no network namespace when `network` is none. The server starts in the
-/// workspace, or in `/` when the workspace is in the hidden home folder.
+/// workspace, or in `/` when the workspace is in a hidden folder.
+///
+/// No `--die-with-parent`: its signal (`PR_SET_PDEATHSIG`) fires when the thread that
+/// started bubblewrap ends, and MCP servers are started from short-lived threads.
 #[must_use]
 pub fn mcp_bwrap_args(
     read_roots: &[PathBuf],
     write_roots: &[PathBuf],
+    hidden: &[PathBuf],
     home: Option<&Path>,
     workspace: &Path,
     no_network: bool,
 ) -> Vec<String> {
     let mut args = [
-        "--die-with-parent",
         "--new-session",
         "--ro-bind",
         "/",
@@ -716,9 +1016,9 @@ pub fn mcp_bwrap_args(
     .into_iter()
     .map(str::to_string)
     .collect::<Vec<_>>();
-    if let Some(home) = home {
+    for dir in home.into_iter().chain(hidden.iter().map(PathBuf::as_path)) {
         args.push("--tmpfs".to_string());
-        args.push(home.to_string_lossy().into_owned());
+        args.push(dir.to_string_lossy().into_owned());
     }
     for (flag, roots) in [("--ro-bind-try", read_roots), ("--bind-try", write_roots)] {
         for root in roots {
@@ -729,7 +1029,10 @@ pub fn mcp_bwrap_args(
     if no_network {
         args.push("--unshare-net".to_string());
     }
-    let visible = home.is_none_or(|home| !workspace.starts_with(home))
+    let visible = !home
+        .into_iter()
+        .chain(hidden.iter().map(PathBuf::as_path))
+        .any(|dir| workspace.starts_with(dir))
         || read_roots
             .iter()
             .chain(write_roots)
@@ -764,14 +1067,24 @@ pub fn plan_mcp_launch(
         };
     }
     let windows = *platform == McpSandboxPlatform::Windows;
+    let inherited = inherited.into_iter().collect::<Vec<_>>();
+    let runtime_dir = inherited
+        .iter()
+        .find(|(key, _)| key == "XDG_RUNTIME_DIR")
+        .map(|(_, value)| PathBuf::from(value));
     let mut env = mcp_sandbox_env(profile, &transport.env, inherited, windows);
     if let Some(proxy) = proxy {
         for (name, value) in proxy_env(proxy) {
             set_env(&mut env, &name, &value, windows);
         }
+        set_env(&mut env, "NODE_USE_ENV_PROXY", "1", windows);
     }
     let mut notes = vec![format!("sandbox: {}", describe_mcp_sandbox(profile))];
-    let roots = sandbox_roots(transport, host);
+    let roots = sandbox_roots(transport, host, enforces_files(platform));
+    for (variable, dir) in &roots.private_caches {
+        set_env(&mut env, variable, &dir.to_string_lossy(), windows);
+    }
+    notes.extend(roots.notes());
     let no_network = profile.network == McpSandboxNetwork::None;
     let wrapped = |program: String, mut args: Vec<String>| {
         args.push(transport.command.clone());
@@ -787,14 +1100,20 @@ pub fn plan_mcp_launch(
                 }
                 _ => SeatbeltNetwork::Deny,
             };
-            let text =
-                mcp_seatbelt_profile(&roots.read, &roots.write, host.home.as_deref(), network);
+            let mut write = roots.write.clone();
+            write.extend(roots.temp.iter().cloned());
+            let text = mcp_seatbelt_profile(&roots.read, &write, host.home.as_deref(), network);
             wrapped(SANDBOX_EXEC.to_string(), vec!["-p".to_string(), text])
         }
         McpSandboxPlatform::Linux { bwrap: Some(bwrap) } => {
+            let mut read = roots.read.clone();
+            read.extend(granted_socket_roots(&env));
+            // Its own `/tmp`: the inherited TMPDIR may be a folder it cannot see.
+            set_env(&mut env, "TMPDIR", "/tmp", windows);
             let mut args = mcp_bwrap_args(
-                &roots.read,
+                &read,
                 &roots.write,
+                &bwrap_hidden_dirs(runtime_dir.as_deref()),
                 host.home.as_deref(),
                 &host.workspace,
                 no_network,
@@ -838,7 +1157,8 @@ pub fn plan_mcp_launch(
 }
 
 /// [`plan_mcp_launch`] for this machine: starts the proxy the profile needs and creates
-/// missing write roots in the home folder (a bound folder must exist).
+/// missing write roots in the home folder, its own launcher caches and `${package}`
+/// folders (a bound folder must exist).
 pub fn prepare_mcp_launch(transport: &McpStdioTransport) -> io::Result<McpSandboxLaunch> {
     let platform = McpSandboxPlatform::detect();
     let host = McpSandboxHost::current();
@@ -852,11 +1172,20 @@ pub fn prepare_mcp_launch(transport: &McpStdioTransport) -> io::Result<McpSandbo
         None => None,
     };
     if !transport.sandbox.off && platform != McpSandboxPlatform::Windows {
-        if let Some(home) = &host.home {
-            for root in sandbox_roots(transport, &host).write {
-                if root.starts_with(home) && !root.exists() {
-                    let _ = std::fs::create_dir_all(&root);
-                }
+        let roots = sandbox_roots(transport, &host, enforces_files(&platform));
+        let in_home = |root: &Path| {
+            host.home
+                .as_ref()
+                .is_some_and(|home| root.starts_with(home))
+        };
+        for root in roots
+            .write
+            .iter()
+            .filter(|root| in_home(root))
+            .chain(&roots.create)
+        {
+            if !root.exists() {
+                let _ = std::fs::create_dir_all(root);
             }
         }
     }
@@ -1230,7 +1559,16 @@ mod tests {
         assert_eq!(&launch.args[separator + 1..], ["node", "server.js"]);
         let before = &launch.args[..separator];
         assert!(before.contains(&"--unshare-net".to_string()));
-        assert!(before.contains(&"--die-with-parent".to_string()));
+        // Its signal would fire when the thread that started the server ends.
+        assert!(!before.contains(&"--die-with-parent".to_string()));
+        let joined = before.join(" ");
+        assert!(joined.contains("--tmpfs /tmp"), "a private /tmp: {joined}");
+        assert!(
+            !joined.contains("--bind-try /tmp "),
+            "the shared /tmp is not bound back: {joined}"
+        );
+        let env = env_map(launch.env.as_deref().unwrap());
+        assert_eq!(env.get("TMPDIR").map(String::as_str), Some("/tmp"));
 
         let missing = plan_mcp_launch(
             &transport(McpSandboxProfile::default()),
@@ -1249,16 +1587,28 @@ mod tests {
             PathBuf::from("/home/ada/repo"),
             PathBuf::from("/home/ada/.nvm"),
         ];
-        let write = [PathBuf::from("/tmp"), PathBuf::from("/home/ada/.npm")];
+        let write = [PathBuf::from("/home/ada/.npm")];
+        let hidden = [
+            PathBuf::from("/tmp"),
+            PathBuf::from("/run/user"),
+            PathBuf::from("/run/dbus"),
+        ];
         let args = mcp_bwrap_args(
             &read,
             &write,
+            &hidden,
             Some(Path::new("/home/ada")),
             Path::new("/home/ada/repo"),
             false,
         );
         let joined = args.join(" ");
-        assert!(joined.starts_with("--die-with-parent --new-session --ro-bind / / --dev-bind /dev /dev --tmpfs /home/ada"), "{joined}");
+        assert!(
+            joined.starts_with(
+                "--new-session --ro-bind / / --dev-bind /dev /dev --tmpfs /home/ada --tmpfs /tmp --tmpfs /run/user --tmpfs /run/dbus --ro-bind-try"
+            ),
+            "the hidden folders come before the roots bound back: {joined}"
+        );
+        assert!(!joined.contains("--die-with-parent"));
         assert!(joined.contains("--ro-bind-try /home/ada/repo /home/ada/repo"));
         assert!(joined.contains("--bind-try /home/ada/.npm /home/ada/.npm"));
         assert!(joined.ends_with("--chdir /home/ada/repo"));
@@ -1269,12 +1619,232 @@ mod tests {
         let args = mcp_bwrap_args(
             &[],
             &write,
+            &hidden,
             Some(Path::new("/home/ada")),
             Path::new("/home/ada/repo"),
             true,
         );
         let joined = args.join(" ");
         assert!(joined.ends_with("--unshare-net --chdir /"), "{joined}");
+
+        // Nor in a workspace under the private /tmp it cannot read.
+        let args = mcp_bwrap_args(&[], &write, &hidden, None, Path::new("/tmp/repo"), true);
+        assert!(args.join(" ").ends_with("--chdir /"));
+    }
+
+    #[test]
+    fn bubblewrap_hides_the_runtime_folder_and_binds_back_only_granted_sockets() {
+        // The runtime folder (the session bus, agent sockets) is not a default variable.
+        let env = env_map(&mcp_sandbox_env(
+            &McpSandboxProfile::default(),
+            &BTreeMap::new(),
+            env_pairs(&[("XDG_RUNTIME_DIR", "/run/user/1000"), ("PATH", "/bin")]),
+            false,
+        ));
+        assert!(!env.contains_key("XDG_RUNTIME_DIR"), "{env:?}");
+
+        let hidden = super::bwrap_hidden_dirs(None);
+        assert_eq!(hidden[0], PathBuf::from("/tmp"));
+        for dir in &hidden[1..] {
+            assert!(dir.is_dir(), "only existing folders are hidden: {dir:?}");
+        }
+
+        assert!(super::granted_socket_roots(&env_pairs(&[("PATH", "/bin")])).is_empty());
+        let granted = super::granted_socket_roots(&env_pairs(&[
+            ("DISPLAY", ":0"),
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+        ]));
+        assert!(granted.contains(&PathBuf::from("/tmp/.X11-unix")));
+        if cfg!(not(windows)) {
+            assert!(granted.contains(&PathBuf::from("/run/user/1000")));
+        }
+    }
+
+    fn unique_dir(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time should be after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("neuron-mcp-sandbox-{label}-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("create the test folder");
+        dir
+    }
+
+    #[test]
+    fn an_unvetted_server_gets_its_own_launcher_cache_where_files_are_enforced() {
+        let roots = super::sandbox_roots(&transport(McpSandboxProfile::default()), &host(), true);
+        let home = PathBuf::from("/home/ada");
+        for shared in [".npm", ".local/share/uv", ".cache/uv"] {
+            assert!(
+                !roots.write.contains(&home.join(shared)),
+                "{shared} must not be writable: {:?}",
+                roots.write
+            );
+        }
+        assert!(!roots.write.contains(&home.join(".cache").join("uv")));
+        let variables = roots
+            .private_caches
+            .iter()
+            .map(|(variable, _)| *variable)
+            .collect::<Vec<_>>();
+        assert_eq!(variables, ["npm_config_cache", "UV_CACHE_DIR"]);
+        for (_, dir) in &roots.private_caches {
+            assert!(
+                dir.starts_with(home.join(".cache").join("neuron-mcp")),
+                "{dir:?}"
+            );
+            assert!(roots.write.contains(dir) && roots.create.contains(dir));
+        }
+
+        // The launch points npm and uv at those caches, on macOS and Linux.
+        for platform in [
+            McpSandboxPlatform::MacOs { seatbelt: true },
+            McpSandboxPlatform::Linux {
+                bwrap: Some(PathBuf::from("/usr/bin/bwrap")),
+            },
+        ] {
+            let launch = plan_mcp_launch(
+                &transport(McpSandboxProfile::default()),
+                &host(),
+                &platform,
+                env_pairs(&[("npm_config_cache", "/home/ada/.npm")]),
+                None,
+            );
+            let env = env_map(launch.env.as_deref().unwrap());
+            assert_eq!(
+                env.get("npm_config_cache").map(PathBuf::from),
+                Some(roots.private_caches[0].1.clone()),
+                "{platform:?}"
+            );
+            let writable_npm = launch.args.windows(2).any(|pair| {
+                (pair[0] == "--bind-try" && Path::new(&pair[1]).ends_with(".npm"))
+                    || pair[1]
+                        .lines()
+                        .any(|line| line.starts_with("(deny file-write*") && line.contains(".npm"))
+            });
+            assert!(!writable_npm, "{:?}", launch.args);
+            assert!(launch
+                .notes
+                .iter()
+                .any(|note| note.contains("launcher cache")));
+        }
+
+        // A server that may reach npm writes the shared npm cache, not the uv one.
+        let npm = McpSandboxProfile {
+            network: McpSandboxNetwork::Hosts(vec!["registry.npmjs.org".to_string()]),
+            ..McpSandboxProfile::default()
+        };
+        let roots = super::sandbox_roots(&transport(npm), &host(), true);
+        assert!(roots.write.contains(&home.join(".npm")));
+        assert!(!roots.write.contains(&home.join(".local/share/uv")));
+        assert_eq!(roots.private_caches.len(), 1);
+        assert_eq!(roots.private_caches[0].0, "UV_CACHE_DIR");
+
+        // Where file limits are not enforced nothing changes.
+        let roots = super::sandbox_roots(&transport(McpSandboxProfile::default()), &host(), false);
+        assert!(roots.private_caches.is_empty());
+    }
+
+    #[test]
+    fn only_the_program_and_its_script_are_readable_beyond_the_profile() {
+        let dir = unique_dir("program");
+        let package = dir.join("node_modules").join("notes-mcp");
+        std::fs::create_dir_all(package.join("dist")).unwrap();
+        std::fs::write(package.join("package.json"), "{}").unwrap();
+        let script = package.join("dist").join("index.js");
+        std::fs::write(&script, "").unwrap();
+        let secrets = dir.join("secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+        let key = secrets.join("id_ed25519");
+        std::fs::write(&key, "").unwrap();
+
+        let args = vec![
+            "--key".to_string(),
+            key.to_string_lossy().into_owned(),
+            script.to_string_lossy().into_owned(),
+            dir.to_string_lossy().into_owned(),
+        ];
+        let roots = super::mcp_program_roots("node", &args);
+        assert_eq!(roots, vec![super::normalize(&dir.join("node_modules"))]);
+
+        // Not an interpreter: its arguments are data.
+        assert!(super::mcp_program_roots("my-server", &args).is_empty());
+
+        let mut server = transport(McpSandboxProfile::default());
+        server.args = args;
+        let launch = plan_mcp_launch(
+            &server,
+            &host(),
+            &McpSandboxPlatform::Windows,
+            Vec::new(),
+            None,
+        );
+        assert!(
+            launch
+                .notes
+                .iter()
+                .any(|note| note.contains("readable as its program")
+                    && note.contains("node_modules")),
+            "{:?}",
+            launch.notes
+        );
+        let roots = super::sandbox_roots(&server, &host(), true);
+        assert!(!roots.read.iter().any(|root| root.ends_with("secrets")));
+        assert!(!roots.read.contains(&super::normalize(&dir)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_package_path_names_the_package_of_the_script_the_server_runs() {
+        let dir = unique_dir("package");
+        let package = dir.join("node_modules").join("codebase-memory-mcp");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("package.json"), "{}").unwrap();
+        let script = package.join("bin.js");
+        std::fs::write(&script, "").unwrap();
+        let profile = McpSandboxProfile {
+            fs_write: vec!["${package}/bin".to_string()],
+            ..McpSandboxProfile::default()
+        };
+        let mut server = transport(profile.clone());
+        server.args = vec![script.to_string_lossy().into_owned()];
+        let roots = super::sandbox_roots(&server, &host(), true);
+        let bin = super::normalize(&package).join("bin");
+        assert!(roots.write.contains(&bin), "{:?}", roots.write);
+        assert!(roots.create.contains(&bin));
+
+        // `npx` runs no script Neuron can see: the entry is skipped, not the workspace.
+        let mut npx = transport(profile);
+        npx.command = "npx".to_string();
+        npx.args = vec!["-y".to_string(), "codebase-memory-mcp@0.11.0".to_string()];
+        let roots = super::sandbox_roots(&npx, &host(), true);
+        assert!(!roots
+            .write
+            .iter()
+            .any(|root| root.to_string_lossy().contains("package")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_proxied_server_has_node_use_the_proxy() {
+        let proxy: SocketAddr = "127.0.0.1:4100".parse().unwrap();
+        let launch = plan_mcp_launch(
+            &transport(McpSandboxProfile::default()),
+            &host(),
+            &McpSandboxPlatform::Windows,
+            Vec::new(),
+            Some(proxy),
+        );
+        let env = env_map(launch.env.as_deref().unwrap());
+        assert_eq!(env.get("NODE_USE_ENV_PROXY").map(String::as_str), Some("1"));
+        let launch = plan_mcp_launch(
+            &transport(McpSandboxProfile::default()),
+            &host(),
+            &McpSandboxPlatform::Windows,
+            Vec::new(),
+            None,
+        );
+        assert!(!env_map(launch.env.as_deref().unwrap()).contains_key("NODE_USE_ENV_PROXY"));
     }
 
     #[test]
@@ -1338,6 +1908,10 @@ mod tests {
             .fs_write
             .iter()
             .any(|path| path.contains("codebase-memory-mcp")));
+        assert!(
+            memory.fs_write.iter().any(|path| path == "${package}/bin"),
+            "its bin.js installs the binary into its package's bin folder"
+        );
         let McpSandboxNetwork::Hosts(hosts) = memory.network else {
             panic!("codebase-memory reaches listed hosts only");
         };

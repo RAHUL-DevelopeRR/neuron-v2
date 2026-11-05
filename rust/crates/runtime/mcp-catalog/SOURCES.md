@@ -77,3 +77,11 @@ Each entry's `sandbox` is what its stdio server may read (`fs_read`), write
   `~/.cache/codebase-memory-mcp` on every platform. Its `bin.js` downloads the release
   binary from GitHub when the install script did not run, and GitHub release downloads
   redirect to `*.githubusercontent.com`.
+
+Version `2026-11-05.2`, checked the same day against `codebase-memory-mcp@0.11.0`
+(`bin.js`, `install.js`): `install.js` writes the binary into the package's own `bin`
+folder (`path.join(__dirname, 'bin')`), so a copy installed with `--ignore-scripts`, or
+whose install script failed, writes it there on first start. The entry's `fs_write`
+adds `${package}/bin`: the `bin` folder of the npm package whose script the server
+runs (skipped when Neuron cannot see that script, as with `npx`, whose cache the entry
+may write because it reaches `registry.npmjs.org`).

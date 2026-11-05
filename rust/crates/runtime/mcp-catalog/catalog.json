@@ -1,5 +1,5 @@
 {
-  "version": "2026-11-05.1",
+  "version": "2026-11-05.2",
   "connectors": [
     {
       "id": "github",
@@ -311,7 +311,7 @@
       "default_tier": "write",
       "sandbox": {
         "fs_read": ["."],
-        "fs_write": ["~/.cache/codebase-memory-mcp"],
+        "fs_write": ["~/.cache/codebase-memory-mcp", "${package}/bin"],
         "network": ["registry.npmjs.org", "github.com", "*.githubusercontent.com"]
       },
       "writes_outside_workspace": true,

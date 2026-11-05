@@ -1451,7 +1451,7 @@ fn stdio_server_command(
         }
         apply_env(&mut command, &transport.env);
     }
-    // Not in the user's console: `cmd.exe /c npx …` and npm retitle the console they
+    // Not in the user's console: `cmd.exe /c npx â€¦` and npm retitle the console they
     // run in, which is the terminal of the UI or the REPL.
     #[cfg(windows)]
     command.creation_flags(if suspended {
@@ -1502,7 +1502,7 @@ type ServerJob = winjob::Job;
 type ServerJob = ();
 
 /// Ends a server and the processes it started. With a job object (Windows) the job
-/// ends the whole tree at once. Without one, a server launched as `cmd.exe /c npx …`
+/// ends the whole tree at once. Without one, a server launched as `cmd.exe /c npx â€¦`
 /// runs in node grandchildren in their own console, which killing `cmd.exe` would leave
 /// running, so `taskkill /T` ends them.
 ///
@@ -4128,6 +4128,61 @@ mod tests {
         drop(contained);
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// bubblewrap must not tie a server to the thread that started it: servers start
+    /// on short-lived threads (the UI's background MCP start), and `--die-with-parent`
+    /// killed them as soon as that thread ended.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_server_started_from_a_short_lived_thread_outlives_it() {
+        if crate::mcp_sandbox::McpSandboxPlatform::detect()
+            == (crate::mcp_sandbox::McpSandboxPlatform::Linux { bwrap: None })
+        {
+            eprintln!("skipped: bubblewrap is not installed");
+            return;
+        }
+        let usable = std::process::Command::new("bwrap")
+            .args(["--ro-bind", "/", "/", "--unshare-net", "true"])
+            .status()
+            .is_ok_and(|status| status.success());
+        if !usable {
+            eprintln!("skipped: bubblewrap cannot make a sandbox here (no user namespaces)");
+            return;
+        }
+        let transport = crate::mcp_client::McpStdioTransport {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), "echo started; sleep 30".to_string()],
+            env: BTreeMap::new(),
+            tool_call_timeout_ms: None,
+            sandbox: crate::config::McpSandboxProfile::default(),
+        };
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = runtime.handle().clone();
+        let mut process = std::thread::spawn(move || {
+            let _entered = handle.enter();
+            McpStdioProcess::spawn(&transport).expect("the server starts")
+        })
+        .join()
+        .expect("the starting thread ends");
+        runtime.block_on(async {
+            let line =
+                tokio::time::timeout(std::time::Duration::from_secs(30), process.read_line())
+                    .await
+                    .expect("the server answers")
+                    .expect("read its output");
+            assert_eq!(line.trim(), "started", "bubblewrap could not start it");
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            assert!(
+                !process.has_exited().unwrap(),
+                "the server died with the thread that started it"
+            );
+            let _ = process.shutdown().await;
+        });
     }
 
     /// Starts the bundled Playwright and Codebase memory servers as the settings loader
