@@ -525,7 +525,8 @@ pub fn key_provider_for(id: crate::provider::ProviderId) -> Option<KeyProvider> 
 
 /// The active BYO-key provider's models (fetched once per process).
 pub fn active_provider_models() -> Option<(KeyProvider, Vec<String>)> {
-    static CACHE: OnceLock<std::sync::Mutex<Option<(KeyProvider, Vec<String>)>>> = OnceLock::new();
+    type ModelCache = std::sync::Mutex<Option<(KeyProvider, Vec<String>)>>;
+    static CACHE: OnceLock<ModelCache> = OnceLock::new();
     let active = crate::provider::active_provider()?;
     let provider = key_provider_for(active.id)?;
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
@@ -722,7 +723,7 @@ pub fn run(args: &[String], json: bool) -> Result<(), Box<dyn std::error::Error>
             } else {
                 read_line(&mut stdin.lock())?
             };
-            set_key(&store, provider, &key, check.then_some(None), json)?;
+            set_key(&store, provider, &key, check, json)?;
         }
         ["remove", provider] => {
             let provider = parse_provider(provider)?;
@@ -752,25 +753,25 @@ pub fn run(args: &[String], json: bool) -> Result<(), Box<dyn std::error::Error>
         ["login", "openrouter", flags @ ..] => {
             let open_browser = !flags.contains(&"--no-browser");
             let key = crate::openrouter_oauth::login(open_browser)?;
-            set_key(&store, KeyProvider::OpenRouter, &key, None, json)?;
+            set_key(&store, KeyProvider::OpenRouter, &key, false, json)?;
         }
         _ => return Err(PROVIDER_AUTH_USAGE.into()),
     }
     Ok(())
 }
 
-/// Validates, optionally checks (`check = Some(base)`), and stores `key`.
+/// Validates, optionally checks with a live call (`--check`), and stores `key`.
 fn set_key(
     store: &ProviderKeyStore,
     provider: KeyProvider,
     key: &str,
-    check: Option<Option<&str>>,
+    check: bool,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let key = key.trim();
     validate_key(provider, key)?;
-    if let Some(base) = check {
-        check_key(provider, key, base)?;
+    if check {
+        check_key(provider, key, None)?;
         eprintln!("{} accepted the key.", provider.display_name());
     }
     let source = store.set(provider, key)?;
