@@ -404,58 +404,6 @@ impl McpInstallStore {
             .join(format!("{}.tgz", hex(&digest))))
     }
 
-    /// Takes the install lock of the folder `dir` (`.<version>.lock` beside it), waiting
-    /// while another session holds it. A lock older than [`INSTALL_LOCK_STALE`] is taken
-    /// over.
-    pub(crate) fn lock_install(&self, dir: &Path) -> Result<McpInstallLock, String> {
-        let parent = dir
-            .parent()
-            .ok_or_else(|| "the install folder has no parent".to_string())?;
-        fs::create_dir_all(parent).map_err(|error| io_text(&error))?;
-        let name = dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("x");
-        let path = parent.join(format!(".{name}.lock"));
-        let waiting = Instant::now();
-        loop {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut file) => {
-                    let _ = write!(file, "{}", std::process::id());
-                    return Ok(McpInstallLock { path });
-                }
-                // Held, or (on Windows) being removed by the session that held it.
-                Err(error)
-                    if error.kind() == io::ErrorKind::AlreadyExists
-                        || (error.kind() == io::ErrorKind::PermissionDenied && path.exists()) =>
-                {
-                    let stale = fs::metadata(&path)
-                        .and_then(|metadata| metadata.modified())
-                        .ok()
-                        .and_then(|modified| modified.elapsed().ok())
-                        .is_some_and(|age| age > INSTALL_LOCK_STALE);
-                    if stale {
-                        let _ = fs::remove_file(&path);
-                        continue;
-                    }
-                    if waiting.elapsed() > INSTALL_LOCK_STALE {
-                        return Err(format!(
-                            "another session has been installing into {} for 15 minutes; remove {} if no session is",
-                            dir.display(),
-                            path.display()
-                        ));
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                Err(error) => return Err(io_text(&error)),
-            }
-        }
-    }
-
     /// Whether `spec` is installed (without checking its files).
     pub fn state(&self, spec: &McpVerifiedSpec) -> Result<McpInstallState, String> {
         if matches!(spec.source, McpVerifiedSource::Docker { .. }) {
@@ -503,7 +451,7 @@ impl McpInstallStore {
         }
         // Installing or removing: one session at a time, and what another session
         // finished while this one waited is used.
-        let _lock = self.lock_install(&dir)?;
+        let _lock = lock_install(&dir)?;
         match read_manifest(&dir) {
             Some(manifest) if manifest["spec"].as_str() == Some(digest.as_str()) => {
                 if let Err(problem) = check_files(&dir, &manifest) {
@@ -702,6 +650,58 @@ impl McpInstallStore {
         // The archive is not kept: the program is, with its hash in the install record.
         let _ = fs::remove_file(&download);
         result
+    }
+}
+
+/// Takes the install lock of the folder `dir` (`.<version>.lock` beside it), waiting
+/// while another session holds it. A lock older than [`INSTALL_LOCK_STALE`] is taken
+/// over.
+pub(crate) fn lock_install(dir: &Path) -> Result<McpInstallLock, String> {
+    let parent = dir
+        .parent()
+        .ok_or_else(|| "the install folder has no parent".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| io_text(&error))?;
+    let name = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("x");
+    let path = parent.join(format!(".{name}.lock"));
+    let waiting = Instant::now();
+    loop {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                let _ = write!(file, "{}", std::process::id());
+                return Ok(McpInstallLock { path });
+            }
+            // Held, or (on Windows) being removed by the session that held it.
+            Err(error)
+                if error.kind() == io::ErrorKind::AlreadyExists
+                    || (error.kind() == io::ErrorKind::PermissionDenied && path.exists()) =>
+            {
+                let stale = fs::metadata(&path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age > INSTALL_LOCK_STALE);
+                if stale {
+                    let _ = fs::remove_file(&path);
+                    continue;
+                }
+                if waiting.elapsed() > INSTALL_LOCK_STALE {
+                    return Err(format!(
+                        "another session has been installing into {} for 15 minutes; remove {} if no session is",
+                        dir.display(),
+                        path.display()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(io_text(&error)),
+        }
     }
 }
 
@@ -1204,7 +1204,7 @@ mod tests {
         let spec = python_spec();
         let dir = store.install_dir(&spec).unwrap();
         // Another session builds the virtual environment in place and records it last.
-        let lock = store.lock_install(&dir).unwrap();
+        let lock = super::lock_install(&dir).unwrap();
         fs::create_dir_all(dir.join("venv")).unwrap();
         fs::write(dir.join("venv").join("half-built"), "building").unwrap();
         let other = std::thread::spawn({

@@ -1241,10 +1241,39 @@ mod tests {
         assert!(McpCatalog::parse(&no_release)
             .unwrap_err()
             .contains("no release"));
-        // A data file is named by one of the entry's plain variables, in its data folder.
+
+        let docker = |digest: &str| {
+            with_install(&json!({"kind": "docker", "package": "ghcr.io/example/x",
+                "version": "1.0", "integrity": digest}))
+        };
+        assert!(McpCatalog::parse(&docker("latest"))
+            .unwrap_err()
+            .contains("image digest"));
+        let catalog = McpCatalog::parse(&docker(&format!("sha256:{sha}"))).unwrap();
+        let (command, args) = catalog.connectors[0].stdio_command().unwrap();
+        assert_eq!(command, "docker");
+        assert_eq!(
+            args,
+            vec![
+                "run".to_string(),
+                "-i".to_string(),
+                "--rm".to_string(),
+                format!("ghcr.io/example/x@sha256:{sha}")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_data_file_is_named_by_a_plain_variable_and_kept_in_its_data_folder() {
+        let sha = "a".repeat(64);
         let with_data = |data: serde_json::Value| {
-            let mut value: serde_json::Value = serde_json::from_str(&binary("x", &sha)).unwrap();
-            value["connectors"][0]["install"]["data"] = data;
+            let mut value: serde_json::Value = serde_json::from_str(&with_install(&json!({
+                "kind": "binary", "package": "x", "version": "1",
+                "release": {"linux-x86_64": {"url": "https://example.com/x.tar.gz",
+                    "sha256": sha, "archive": "tar.gz", "member": "x"}},
+                "data": data
+            })))
+            .unwrap();
             value["connectors"][0]["env"] =
                 json!([{"name": "X_FILE", "label": "", "secret": false, "required": false}]);
             value.to_string()
@@ -1269,26 +1298,6 @@ mod tests {
                 .as_ref()
                 .map(|data| data.variable.as_str()),
             Some("MEMORY_FILE_PATH")
-        );
-
-        let docker = |digest: &str| {
-            with_install(&json!({"kind": "docker", "package": "ghcr.io/example/x",
-                "version": "1.0", "integrity": digest}))
-        };
-        assert!(McpCatalog::parse(&docker("latest"))
-            .unwrap_err()
-            .contains("image digest"));
-        let catalog = McpCatalog::parse(&docker(&format!("sha256:{sha}"))).unwrap();
-        let (command, args) = catalog.connectors[0].stdio_command().unwrap();
-        assert_eq!(command, "docker");
-        assert_eq!(
-            args,
-            vec![
-                "run".to_string(),
-                "-i".to_string(),
-                "--rm".to_string(),
-                format!("ghcr.io/example/x@sha256:{sha}")
-            ]
         );
     }
 
