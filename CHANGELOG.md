@@ -20,6 +20,8 @@ The release workflow copies a version's section into its GitHub release notes.
 - Verified MCP installs take a lock file per server folder, so a second session that
   starts the same server waits for the first install instead of deleting a Python
   virtual environment that is still being built.
+- A verified Python MCP install now records every file of its virtual environment, so a
+  changed module stops the start with an integrity error, as a changed npm file does.
 - `/mcp pin` of a program (not `npx` or `uvx`) holds only for the files it was pinned
   with: the same relative launch (`node server.js`) in another workspace is unpinned
   there, instead of borrowing the first workspace's pin.

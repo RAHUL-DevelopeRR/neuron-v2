@@ -315,7 +315,10 @@ install record: a file
 whose size or modification time changed is hashed again, and one that no longer
 matches stops the start with an integrity error and removes the install, so the next
 start installs it again. A cached tarball that does not match its integrity is removed
-the same way. The Python and container checks are uv's and Docker's at install time.
+the same way. A Python install records every file of its virtual environment the same
+way (not the `__pycache__` folders Python rewrites as it runs). A container image is
+run by its digest, which Docker checks when it pulls it; Neuron does not check the
+image again on each start.
 
 A server's own data is never kept in its install folder, since a reinstall replaces
 that folder. Memory would keep its graph there (`dist/memory.jsonl` of its package), so

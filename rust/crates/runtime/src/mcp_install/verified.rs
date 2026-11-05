@@ -7,7 +7,8 @@
 //!   (`preinstall`, `postinstall`) ever runs. The server starts as `node <bin>`.
 //! - Python: `uv pip install --require-hashes --no-deps --only-binary :all:` into a
 //!   virtual environment of its own from the entry's hashed requirements (wheels only,
-//!   so no build script runs either).
+//!   so no build script runs either). Every file of the environment is recorded, as an
+//!   npm tree's are, except the `__pycache__` folders Python writes as it runs.
 //! - Release binary: the asset for this platform is fetched, checked against its
 //!   `sha256`, and its program unpacked. An npm package that only downloads a release
 //!   binary in its install script (Codebase memory) is installed this way, and its
@@ -255,6 +256,8 @@ pub enum McpInstallState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpInstallStore {
     root: PathBuf,
+    /// The `uv` that builds Python installs: `NEURON_MCP_UV`, else `uv` from the path.
+    uv: Option<PathBuf>,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -357,7 +360,15 @@ impl McpInstallStore {
     pub fn in_config_home(config_home: &Path) -> Self {
         Self {
             root: config_home.join("mcp"),
+            uv: None,
         }
+    }
+
+    /// This store, building Python installs with the `uv` at `uv` (tests use a fake).
+    #[cfg(test)]
+    pub(crate) fn with_uv(mut self, uv: &Path) -> Self {
+        self.uv = Some(uv.to_path_buf());
+        self
     }
 
     #[must_use]
@@ -540,7 +551,7 @@ impl McpInstallStore {
             McpVerifiedSource::Npm { lock, .. } => self.install_npm(lock, &staging, fetch),
             McpVerifiedSource::Release(asset) => self.install_release(asset, &staging, fetch),
             McpVerifiedSource::Python { requirements, .. } => {
-                install_python(requirements, &staging).map(|()| Vec::new())
+                install_python(requirements, &staging, self.uv.as_deref())
             }
             McpVerifiedSource::Docker { .. } => Ok(Vec::new()),
         };
@@ -846,13 +857,48 @@ fn python_steps(dir: &Path) -> [Vec<String>; 2] {
     ]
 }
 
-fn install_python(requirements: &[McpPythonRequirement], dir: &Path) -> Result<(), String> {
+/// The files under `dir` as `/`-separated paths from it, sorted, without following
+/// links and without `__pycache__` folders (Python rewrites those as it runs).
+fn files_under(dir: &Path) -> io::Result<Vec<String>> {
+    let mut files = Vec::new();
+    let mut pending = vec![String::new()];
+    while let Some(folder) = pending.pop() {
+        for entry in fs::read_dir(dir.join(&folder))? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = if folder.is_empty() {
+                name.clone()
+            } else {
+                format!("{folder}/{name}")
+            };
+            let kind = entry.file_type()?;
+            if kind.is_dir() && name != "__pycache__" {
+                pending.push(path);
+            } else if kind.is_file() {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// Builds the virtual environment in `dir` with `uv` (see [`McpInstallStore`]) and
+/// returns its files, to record.
+fn install_python(
+    requirements: &[McpPythonRequirement],
+    dir: &Path,
+    uv: Option<&Path>,
+) -> Result<Vec<String>, String> {
     fs::write(
         dir.join("requirements.txt"),
         mcp_requirements_text(requirements),
     )
     .map_err(|error| io_text(&error))?;
-    let uv = std::env::var("NEURON_MCP_UV").unwrap_or_else(|_| "uv".to_string());
+    let uv = uv.map_or_else(
+        || std::env::var("NEURON_MCP_UV").unwrap_or_else(|_| "uv".to_string()),
+        |uv| uv.to_string_lossy().into_owned(),
+    );
     for step in python_steps(dir) {
         let output = Command::new(&uv)
             .args(&step)
@@ -871,7 +917,7 @@ fn install_python(requirements: &[McpPythonRequirement], dir: &Path) -> Result<(
             ));
         }
     }
-    Ok(())
+    files_under(dir).map_err(|error| io_text(&error))
 }
 
 /// Pulls `image` (`name@sha256:...`) unless Docker has it already.
@@ -1182,6 +1228,72 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().ends_with(".lock"))
             .count();
         assert_eq!(locks, 0, "the lock is gone");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    /// A fake `uv` that builds a small virtual environment: its console script, a
+    /// module, and a `__pycache__` file as Python leaves one.
+    fn fake_uv(folder: &Path) -> PathBuf {
+        if cfg!(windows) {
+            let uv = folder.join("fake-uv.cmd");
+            fs::write(
+                &uv,
+                "@echo off\r\n\
+                 if \"%~1\"==\"venv\" (\r\n\
+                 mkdir \"%~2\\Scripts\"\r\n\
+                 echo exe> \"%~2\\Scripts\\demo.exe\"\r\n\
+                 exit /b 0\r\n\
+                 )\r\n\
+                 mkdir \"%~4\\Lib\\site-packages\\demo\\__pycache__\"\r\n\
+                 echo code> \"%~4\\Lib\\site-packages\\demo\\__init__.py\"\r\n\
+                 echo cache> \"%~4\\Lib\\site-packages\\demo\\__pycache__\\x.pyc\"\r\n",
+            )
+            .unwrap();
+            uv
+        } else {
+            let uv = folder.join("fake-uv");
+            fs::write(
+                &uv,
+                "#!/bin/sh\n\
+                 if [ \"$1\" = venv ]; then mkdir -p \"$2/bin\" && echo exe > \"$2/bin/demo\"; exit 0; fi\n\
+                 site=\"$4/lib/python3/site-packages/demo\"\n\
+                 mkdir -p \"$site/__pycache__\" && echo code > \"$site/__init__.py\" && echo cache > \"$site/__pycache__/x.pyc\"\n",
+            )
+            .unwrap();
+            super::set_mode(&uv, 0o755).unwrap();
+            uv
+        }
+    }
+
+    #[test]
+    fn a_python_install_records_its_files_so_a_changed_module_blocks_the_start() {
+        let home = temp("python-files");
+        let store = McpInstallStore::in_config_home(&home).with_uv(&fake_uv(&home));
+        let spec = python_spec();
+        let launch = store.ensure(&spec, &Offline).unwrap();
+        let dir = launch.dir.clone().unwrap();
+        let manifest = super::read_manifest(&dir).unwrap();
+        let files = manifest["files"].as_object().unwrap();
+        let module = if cfg!(windows) {
+            "venv/Lib/site-packages/demo/__init__.py"
+        } else {
+            "venv/lib/python3/site-packages/demo/__init__.py"
+        };
+        assert!(files.contains_key(module), "{files:?}");
+        assert!(files.contains_key("requirements.txt"), "{files:?}");
+        assert!(
+            !files.keys().any(|file| file.contains("__pycache__")),
+            "{files:?}"
+        );
+
+        // Python rewriting its cache does not matter; a changed module does.
+        let cache = dir.join(module).with_file_name("__pycache__").join("x.pyc");
+        fs::write(&cache, "rewritten").unwrap();
+        assert_eq!(store.ensure(&spec, &Offline).unwrap(), launch);
+        fs::write(dir.join(module), "import os; os.system('evil')").unwrap();
+        let error = store.ensure(&spec, &Offline).unwrap_err();
+        assert!(error.contains("integrity check failed"), "{error}");
+        assert!(error.contains("__init__.py"), "{error}");
         let _ = fs::remove_dir_all(home);
     }
 
