@@ -179,6 +179,7 @@ const STRUCT_FIELDS: Record<string, string[]> = {
     'error',
     'enabled',
     'catalog',
+    'required',
   ]),
   ConnectorVariable: fieldsOf<ConnectorVariable>()([
     'name',

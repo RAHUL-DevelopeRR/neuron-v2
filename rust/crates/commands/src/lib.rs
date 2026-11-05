@@ -2786,11 +2786,25 @@ fn render_mcp_report_for(
                 );
             }
             for (name, blocked) in runtime_config.mcp().blocked() {
+                if blocked.policy.is_some() {
+                    let _ = write!(report, "\n  {name:<16} blocked: {}", blocked.reason);
+                } else {
+                    let _ = write!(
+                        report,
+                        "\n  {name:<16} blocked by permissions.deny rule '{}'",
+                        blocked.rule
+                    );
+                }
+            }
+            for (name, required) in runtime_config.mcp().required() {
                 let _ = write!(
                     report,
-                    "\n  {name:<16} blocked by permissions.deny rule '{}'",
-                    blocked.rule
+                    "\n  {name:<16} required by {} (cannot be turned off)",
+                    required.by.describe()
                 );
+            }
+            if let Some(line) = mcp_policy_line(runtime_config.mcp().policy()) {
+                let _ = write!(report, "\n\n  {line}");
             }
             Ok(report)
         }
@@ -2872,8 +2886,38 @@ fn render_mcp_report_json_for(
                 .mcp()
                 .blocked()
                 .iter()
-                .map(|(name, blocked)| json!({"name": name, "rule": blocked.rule}))
+                .map(|(name, blocked)| {
+                    json!({
+                        "name": name,
+                        "rule": blocked.rule,
+                        "reason": blocked.reason,
+                        "policy": blocked.policy.map(mcp_policy_source_id),
+                    })
+                })
                 .collect::<Vec<_>>());
+            report["required_servers"] = json!(runtime_config
+                .mcp()
+                .required()
+                .iter()
+                .map(|(name, required)| {
+                    json!({
+                        "name": name,
+                        "by": mcp_policy_source_id(required.by),
+                        "catalog": required.catalog_id,
+                    })
+                })
+                .collect::<Vec<_>>());
+            let policy = runtime_config.mcp().policy();
+            report["policy"] = json!({
+                "managed_settings": policy.managed.as_ref().map(|path| path.display().to_string()),
+                "gateway": match policy.gateway {
+                    runtime::McpGatewayPolicyStatus::None => "none",
+                    runtime::McpGatewayPolicyStatus::Current => "current",
+                    runtime::McpGatewayPolicyStatus::Stale => "stale",
+                    runtime::McpGatewayPolicyStatus::Unreadable => "unreadable",
+                },
+                "closed": policy.closed,
+            });
             Ok(report)
         }
         Some(args) if is_help_arg(args) => Ok(render_mcp_usage_json(None)),
@@ -4574,6 +4618,41 @@ fn render_mcp_usage_json(unexpected: Option<&str>) -> Value {
         },
         "unexpected": unexpected,
     })
+}
+
+/// `managed` or `gateway`.
+fn mcp_policy_source_id(source: runtime::McpPolicySource) -> &'static str {
+    match source {
+        runtime::McpPolicySource::Managed => "managed",
+        runtime::McpPolicySource::Gateway => "gateway",
+    }
+}
+
+/// `Connector policy: managed settings (<path>); your Zero-X plan`, when any policy
+/// applies.
+fn mcp_policy_line(policy: &runtime::McpPolicyStatus) -> Option<String> {
+    if !policy.is_active() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if let Some(path) = &policy.managed {
+        parts.push(format!("managed settings ({})", path.display()));
+    }
+    match policy.gateway {
+        runtime::McpGatewayPolicyStatus::None => {}
+        runtime::McpGatewayPolicyStatus::Current => parts.push("your Zero-X plan".to_string()),
+        runtime::McpGatewayPolicyStatus::Stale => parts.push(
+            "your Zero-X plan (out of date: Neuron could not read it in the last day)".to_string(),
+        ),
+        runtime::McpGatewayPolicyStatus::Unreadable => {
+            parts.push("your Zero-X plan (its cache cannot be read)".to_string());
+        }
+    }
+    let mut line = format!("Connector policy: {}", parts.join("; "));
+    if policy.closed.is_some() {
+        line.push_str(". The managed settings fail closed: only the servers they configure or require start until the plan's policy is read again.");
+    }
+    Some(line)
 }
 
 fn config_source_label(source: ConfigSource) -> &'static str {
@@ -6533,6 +6612,60 @@ mod tests {
         let parsed = super::parse_mcp_add_args(&["github", "--scope=local", "--name=gh"]).unwrap();
         assert_eq!(parsed.scope, Some(runtime::McpInstallScope::Local));
         assert_eq!(parsed.name.as_deref(), Some("gh"));
+    }
+
+    #[test]
+    fn mcp_list_shows_the_connector_policy_and_disable_refuses_a_required_server() {
+        let workspace = temp_dir("mcp-policy-workspace");
+        let config_home = temp_dir("mcp-policy-home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{"defaultMcpServers":false,"mcpServers":{"slack":{"command":"slack-mcp"}}}"#,
+        )
+        .expect("user settings");
+        let managed = config_home.join("managed-settings.json");
+        fs::write(
+            &managed,
+            r#"{"mcpPolicy":{"deny":["slack"],"required":["codebase-memory"]}}"#,
+        )
+        .expect("managed settings");
+        let loader =
+            ConfigLoader::new(&workspace, &config_home).with_managed_settings(Some(managed));
+
+        let list = super::render_mcp_report_for(&loader, &workspace, None).expect("list");
+        assert!(
+            list.contains(
+                "slack            blocked: refused by managed settings: mcpPolicy.deny lists \"slack\""
+            ),
+            "{list}"
+        );
+        assert!(
+            list.contains("codebase-memory  required by managed settings (cannot be turned off)"),
+            "{list}"
+        );
+        assert!(
+            list.contains("Connector policy: managed settings ("),
+            "{list}"
+        );
+        let json = super::render_mcp_report_json_for(&loader, &workspace, None).expect("json");
+        assert_eq!(json["blocked_servers"][0]["policy"], "managed");
+        assert_eq!(json["required_servers"][0]["name"], "codebase-memory");
+        assert_eq!(json["required_servers"][0]["by"], "managed");
+        assert_eq!(json["policy"]["gateway"], "none");
+
+        let refused =
+            super::render_mcp_report_for(&loader, &workspace, Some("disable codebase-memory"))
+                .expect("disable");
+        assert!(
+            refused.contains("required by managed settings"),
+            "{refused}"
+        );
+        let config = loader.load().expect("config");
+        assert!(config.mcp().get("codebase-memory").is_some(), "still on");
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(config_home);
     }
 
     #[test]

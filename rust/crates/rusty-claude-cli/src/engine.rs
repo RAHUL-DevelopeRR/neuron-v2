@@ -769,6 +769,7 @@ pub(crate) fn extensions_event() -> UiEvent {
                     .iter()
                     .map(|(name, server)| {
                         let (status, tools, error) = mcp_server_status(name, live);
+                        let required = config.mcp().required().get(name);
                         McpServerInfo {
                             name: name.clone(),
                             scope: config_scope_id(server.scope).to_string(),
@@ -777,7 +778,10 @@ pub(crate) fn extensions_event() -> UiEvent {
                             tools,
                             error,
                             enabled: true,
-                            catalog: catalog_id(server),
+                            catalog: catalog_id(server).or_else(|| {
+                                required.and_then(|required| required.catalog_id.clone())
+                            }),
+                            required: required.is_some(),
                         }
                     })
                     .collect();
@@ -791,10 +795,11 @@ pub(crate) fn extensions_event() -> UiEvent {
                         error: None,
                         enabled: false,
                         catalog: catalog_id(server),
+                        required: false,
                     }
                 }));
                 // Configured and switched on, but not started: waiting for approval, or
-                // refused whole by a deny rule.
+                // refused by a deny rule or the connector policy.
                 let not_started = config
                     .mcp()
                     .needs_approval()
@@ -808,12 +813,7 @@ pub(crate) fn extensions_event() -> UiEvent {
                         )
                     })
                     .chain(config.mcp().blocked().iter().map(|(name, blocked)| {
-                        (
-                            name,
-                            &blocked.server,
-                            "blocked",
-                            format!("refused by the permissions.deny rule '{}'", blocked.rule),
-                        )
+                        (name, &blocked.server, "blocked", blocked.reason.clone())
                     }));
                 servers.extend(
                     not_started.map(|(name, server, status, why)| McpServerInfo {
@@ -825,6 +825,7 @@ pub(crate) fn extensions_event() -> UiEvent {
                         error: Some(why),
                         enabled: true,
                         catalog: catalog_id(server),
+                        required: false,
                     }),
                 );
                 servers.sort_by(|left, right| left.name.cmp(&right.name));

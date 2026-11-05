@@ -69,6 +69,12 @@ export const FEATURE_MCP_TOGGLE = 'mcp_toggle'
  * event, or an error), and `catalog` on MCP servers.
  */
 export const FEATURE_MCP_CATALOG = 'mcp_catalog'
+/**
+ * The connector policy (managed settings and the Zero-X plan): MCP servers
+ * with scope `managed`, status `blocked` with the policy's reason in `error`,
+ * and `required` on servers that cannot be turned off.
+ */
+export const FEATURE_MCP_POLICY = 'mcp_policy'
 
 /** A UI capability: questions come as `question` events, not "Question:" notices. */
 export const CAPABILITY_QUESTIONS = 'questions'
@@ -227,15 +233,19 @@ export interface TodoItem {
 /** One configured MCP server and what it is doing now. */
 export interface McpServerInfo {
   name: string
-  /** `bundled`, `user`, `project` or `local`. */
+  /**
+   * `bundled`, `user`, `project`, `local` or `managed` (the machine's managed
+   * settings, or a server the connector policy requires).
+   */
   scope: string
   /** `stdio`, `http`, `sse`, `ws`, `sdk` or `managed_proxy`. */
   transport: string
   /**
    * `starting`, `ready`, `failed`, `pending`, `unsupported`, `not_started`,
    * `disabled`, `needs_approval` (a new or changed workspace server, started once
-   * approved with `/mcp approve <name>`) or `blocked` (a deny rule refuses all its
-   * tools). `error` says why for the last two; older engines send neither.
+   * approved with `/mcp approve <name>`) or `blocked` (a deny rule or the
+   * connector policy refuses it). `error` says why for the last two; older
+   * engines send neither.
    */
   status: string
   /** Its tools, without the `mcp__<server>__` prefix. */
@@ -249,6 +259,11 @@ export interface McpServerInfo {
    * that entry's (feature `mcp_catalog`); left out otherwise.
    */
   catalog?: string
+  /**
+   * The connector policy requires it (feature `mcp_policy`): it is on and
+   * cannot be turned off. Older engines leave it out.
+   */
+  required?: boolean
 }
 
 /** A variable a catalog connector needs. */

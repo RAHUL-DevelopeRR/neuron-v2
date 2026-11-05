@@ -131,6 +131,11 @@ pub const FEATURE_MCP_TOGGLE: &str = "mcp_toggle";
 /// [`McpServerInfo::catalog`].
 pub const FEATURE_MCP_CATALOG: &str = "mcp_catalog";
 
+/// The connector policy (managed settings and the Zero-X plan): [`McpServerInfo`] rows
+/// with scope `managed`, status `blocked` with the policy's reason in `error`, and
+/// [`McpServerInfo::required`].
+pub const FEATURE_MCP_POLICY: &str = "mcp_policy";
+
 /// What this engine can do beyond protocol 1, in [`UiEvent::Ready`]. A UI sends the
 /// commands a feature adds only when the engine lists it: an older engine would skip
 /// them with a notice.
@@ -157,6 +162,7 @@ pub const ENGINE_FEATURES: &[&str] = &[
     FEATURE_CHECKPOINTS,
     FEATURE_MCP_TOGGLE,
     FEATURE_MCP_CATALOG,
+    FEATURE_MCP_POLICY,
 ];
 
 /// `report` events for the commands that show a report (`/usage`, `/init`, `/memory`,
@@ -179,7 +185,8 @@ pub const FEATURE_MODEL_IMAGES: &str = "model_images";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpServerInfo {
     pub name: String,
-    /// Where it is configured: `bundled`, `user`, `project` or `local`.
+    /// Where it is configured: `bundled`, `user`, `project`, `local` or `managed` (the
+    /// machine's managed settings, or a server the connector policy requires).
     pub scope: String,
     /// `stdio`, `http`, `sse`, `ws`, `sdk` or `managed_proxy`.
     pub transport: String,
@@ -187,7 +194,8 @@ pub struct McpServerInfo {
     /// `unsupported` (a transport Neuron does not speak yet), `not_started`,
     /// `disabled` (turned off in the settings), `needs_approval` (a workspace server
     /// that is new or changed: it starts once the user approves it) or `blocked`
-    /// (a deny rule refuses all its tools); `error` says why for the last two.
+    /// (a deny rule or the connector policy refuses it); `error` says why for the last
+    /// two.
     /// Older engines send none of the last two; a UI shows an unknown status as is.
     pub status: String,
     /// Its tools, without the `mcp__<server>__` prefix.
@@ -201,6 +209,15 @@ pub struct McpServerInfo {
     /// entry's ([`FEATURE_MCP_CATALOG`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog: Option<String>,
+    /// The connector policy requires it ([`FEATURE_MCP_POLICY`]): it is on, and a UI
+    /// shows it locked instead of offering to turn it off. Older engines leave it out.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub required: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// What the user typed for a connector's variables, secrets included
@@ -1726,5 +1743,38 @@ mod tests {
         assert_eq!(row.catalog, None);
         assert!(serde_json::to_value(&row).unwrap().get("catalog").is_none());
         assert!(ENGINE_FEATURES.contains(&FEATURE_MCP_CATALOG));
+    }
+
+    #[test]
+    fn a_required_server_row_says_so_and_older_rows_are_not_required() {
+        let older: McpServerInfo = serde_json::from_str(
+            r#"{"name":"docs","scope":"user","transport":"stdio","status":"ready","tools":[],"error":null}"#,
+        )
+        .unwrap();
+        assert!(!older.required);
+        assert!(serde_json::to_value(&older)
+            .unwrap()
+            .get("required")
+            .is_none());
+
+        let required = McpServerInfo {
+            name: "codebase-memory".into(),
+            scope: "managed".into(),
+            transport: "stdio".into(),
+            status: "ready".into(),
+            tools: Vec::new(),
+            error: None,
+            enabled: true,
+            catalog: Some("codebase-memory".into()),
+            required: true,
+        };
+        let json = serde_json::to_value(&required).unwrap();
+        assert_eq!(json["required"], true);
+        assert_eq!(json["scope"], "managed");
+        assert_eq!(
+            serde_json::from_value::<McpServerInfo>(json).unwrap(),
+            required
+        );
+        assert!(ENGINE_FEATURES.contains(&FEATURE_MCP_POLICY));
     }
 }
