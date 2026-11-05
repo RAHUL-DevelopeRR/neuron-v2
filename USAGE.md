@@ -462,7 +462,10 @@ names the file, the line and the closest known key. Commonly used keys:
 | `sandbox.maxProcesses`, `sandbox.memoryLimitMb` | Windows: the most processes a shell command may run at once (default 512) and its memory limit in MB (default none) |
 
 Default skills and MCP servers are described in
-[default integrations](docs/DEFAULT_INTEGRATIONS.md).
+[default integrations](docs/DEFAULT_INTEGRATIONS.md). `/mcp catalog` lists vetted
+connectors and `/mcp add <id>` (or `neuron mcp add <id>`, which asks for secrets with
+the input hidden) adds one; its secrets go to the OS keychain and the settings hold
+`${secret:NAME}` (see [connector catalog](docs/DEFAULT_INTEGRATIONS.md#connector-catalog)).
 
 ### Workspace trust
 

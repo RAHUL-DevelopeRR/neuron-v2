@@ -5,6 +5,15 @@ The release workflow copies a version's section into its GitHub release notes.
 
 ## 7.0.0-alpha.4 (unreleased)
 
+- Connector catalog: `/mcp catalog`, `/mcp add <id> [--scope user|project|local]` and
+  `/mcp remove <server>` (and `neuron mcp catalog|add|remove`) list and add vetted MCP
+  servers (GitHub, Filesystem, Git, Fetch, Memory, Playwright, Codebase memory,
+  Supabase, Context7, Cloudflare docs, AWS documentation) at pinned versions.
+  `neuron mcp add` asks for secrets with the input hidden; secrets go to the OS
+  keychain and settings hold `${secret:NAME}`. Catalog connectors get the permission
+  tier their entry pins per tool. The engine protocol adds `list_connector_catalog`,
+  `add_mcp_server`, `remove_mcp_server`, `approve_mcp_server` and the
+  `connector_catalog` event (feature `mcp_catalog`).
 - MCP hardening: a call through `MCPTool` is checked as the tool it names, so a deny
   or ask rule on `mcp__<server>__<tool>` can no longer be stepped around, and rules can
   name a whole server (`mcp__<server>`, `mcp__<server>__*`); a server a deny rule
