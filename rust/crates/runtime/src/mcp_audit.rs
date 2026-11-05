@@ -1,5 +1,8 @@
-//! The MCP audit log: one JSON line per MCP tool call, refused calls included, in
-//! `<config home>/audit/mcp-YYYY-MM-DD.jsonl` (the UTC day of the call).
+//! The MCP audit log: one JSON line per MCP call, refused calls included, in
+//! `<config home>/audit/mcp-YYYY-MM-DD.jsonl` (the UTC day of the call). Tool calls
+//! (`mcp__<server>__<tool>` and the `MCPTool` and `MCP` wrappers) and resource requests
+//! (`ListMcpResourcesTool` as `resources/list`, `ReadMcpResourceTool` as
+//! `resources/read`) are recorded.
 //!
 //! Metadata only, as Neuron's alpha logging is: when, the session, the server, the
 //! tool, its catalog connector and the catalog version, whether the call was allowed
@@ -13,7 +16,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::config::McpConfigCollection;
@@ -42,11 +45,60 @@ pub struct McpAuditLog {
     catalog_version: String,
 }
 
+/// What an MCP call reaches.
+enum AuditTarget {
+    /// A tool: `mcp__<server>__<tool>`, and the arguments it is sent.
+    Tool {
+        qualified: String,
+        arguments: String,
+    },
+    /// A resource request to `server` (`None`: every connected server); `label` is
+    /// the MCP method, `arguments` what identifies the request (the URI of a read).
+    Resource {
+        server: Option<String>,
+        label: &'static str,
+        arguments: String,
+    },
+}
+
+/// The resource request a `ListMcpResourcesTool` or `ReadMcpResourceTool` call makes,
+/// read the way the executor reads it; `None` for other tools.
+fn resource_target(tool_name: &str, input: &str) -> Option<AuditTarget> {
+    let label = match tool_name {
+        "ListMcpResourcesTool" => "resources/list",
+        "ReadMcpResourceTool" => "resources/read",
+        _ => return None,
+    };
+    let value = crate::tool_input::parse_tool_input(input)
+        .map(|parsed| parsed.value)
+        .unwrap_or(Value::Null);
+    let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_string);
+    let arguments = if label == "resources/read" {
+        text("uri").unwrap_or_default()
+    } else {
+        input.to_string()
+    };
+    Some(AuditTarget::Resource {
+        server: text("server").filter(|server| !server.trim().is_empty()),
+        label,
+        arguments,
+    })
+}
+
+fn audit_target(tool_name: &str, input: &str) -> Option<AuditTarget> {
+    crate::permissions::mcp_call_target(tool_name, input)
+        .map(|(qualified, arguments)| AuditTarget::Tool {
+            qualified,
+            arguments,
+        })
+        .or_else(|| resource_target(tool_name, input))
+}
+
 /// An MCP call to record.
 #[derive(Debug, Clone, Copy)]
 pub struct McpAuditCall<'a> {
-    /// The tool as the model called it: `mcp__<server>__<tool>`, or a wrapper
-    /// (`MCPTool`) naming one.
+    /// The tool as the model called it: `mcp__<server>__<tool>`, a wrapper (`MCPTool`)
+    /// naming one, or a resource tool (`ListMcpResourcesTool`, `ReadMcpResourceTool`).
     pub tool_name: &'a str,
     /// The call's input as the model sent it.
     pub input: &'a str,
@@ -95,32 +147,54 @@ impl McpAuditLog {
     /// Whether `tool_name` with `input` is an MCP call (and so is recorded).
     #[must_use]
     pub fn is_mcp_call(tool_name: &str, input: &str) -> bool {
-        crate::permissions::mcp_call_target(tool_name, input).is_some()
+        audit_target(tool_name, input).is_some()
     }
 
     /// Appends the line for `call`; does nothing for a call that is not an MCP call.
     pub fn record(&self, call: &McpAuditCall<'_>) -> std::io::Result<()> {
-        let Some((qualified, arguments)) =
-            crate::permissions::mcp_call_target(call.tool_name, call.input)
-        else {
+        let Some(target) = audit_target(call.tool_name, call.input) else {
             return Ok(());
         };
-        let server = self
-            .servers
-            .iter()
-            .find(|server| qualified.starts_with(&server.prefix));
-        let (server_name, tool) = if let Some(server) = server {
-            (
-                server.name.clone(),
-                qualified[server.prefix.len()..].to_string(),
-            )
-        } else {
-            // A server this session does not configure: split at the first `__`.
-            let rest = qualified.trim_start_matches("mcp__");
-            match rest.split_once("__") {
-                Some((server, tool)) => (server.to_string(), tool.to_string()),
-                None => (rest.to_string(), String::new()),
+        let (server, server_name, tool, arguments) = match target {
+            AuditTarget::Tool {
+                qualified,
+                arguments,
+            } => {
+                let server = self
+                    .servers
+                    .iter()
+                    .find(|server| qualified.starts_with(&server.prefix));
+                let (name, tool) = if let Some(server) = server {
+                    (
+                        server.name.clone(),
+                        qualified[server.prefix.len()..].to_string(),
+                    )
+                } else {
+                    // A server this session does not configure: split at the first `__`.
+                    let rest = qualified.trim_start_matches("mcp__");
+                    match rest.split_once("__") {
+                        Some((server, tool)) => (server.to_string(), tool.to_string()),
+                        None => (rest.to_string(), String::new()),
+                    }
+                };
+                (server, name, tool, arguments)
             }
+            AuditTarget::Resource {
+                server: Some(name),
+                label,
+                arguments,
+            } => (
+                self.servers.iter().find(|server| server.name == name),
+                name,
+                label.to_string(),
+                arguments,
+            ),
+            // Every connected server is asked.
+            AuditTarget::Resource {
+                server: None,
+                label,
+                arguments,
+            } => (None, "*".to_string(), label.to_string(), arguments),
         };
         let catalog_id = server.and_then(|server| server.catalog_id.clone());
         let now = SystemTime::now()
@@ -240,7 +314,27 @@ mod tests {
             error_class: Some("denied"),
         })
         .unwrap();
+        // Resource requests reach MCP servers too.
+        let read = format!(r#"{{"server":"alpha","uri":"file:///{sentinel}"}}"#);
+        for (tool_name, input) in [
+            ("ReadMcpResourceTool", read.as_str()),
+            ("ListMcpResourcesTool", r#"{"server":"alpha"}"#),
+            ("ListMcpResourcesTool", "{}"),
+        ] {
+            assert!(McpAuditLog::is_mcp_call(tool_name, input));
+            log.record(&McpAuditCall {
+                tool_name,
+                input,
+                allowed: true,
+                decided_by: PermissionDecider::Mode,
+                duration: Duration::from_millis(3),
+                output_bytes: 10,
+                error_class: None,
+            })
+            .unwrap();
+        }
         // Not an MCP call: nothing is written.
+        assert!(!McpAuditLog::is_mcp_call("bash", &input));
         log.record(&McpAuditCall {
             tool_name: "bash",
             input: &input,
@@ -271,7 +365,7 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 5);
         assert_eq!(lines[0]["server"], "alpha");
         assert_eq!(lines[0]["tool"], "echo");
         assert_eq!(lines[0]["session"], "session-1");
@@ -288,6 +382,20 @@ mod tests {
         assert_eq!(lines[1]["decided_by"], "rule");
         assert_eq!(lines[1]["error_class"], "denied");
         assert_eq!(lines[1]["args_sha256"], lines[0]["args_sha256"]);
+        // A resource read names its server and hashes the URI.
+        assert_eq!(lines[2]["server"], "alpha");
+        assert_eq!(lines[2]["tool"], "resources/read");
+        assert_eq!(
+            lines[2]["bytes_in"],
+            format!("file:///{sentinel}").len(),
+            "the URI is what is measured and hashed"
+        );
+        assert_eq!(lines[3]["server"], "alpha");
+        assert_eq!(lines[3]["tool"], "resources/list");
+        // Without a server every connected server is asked.
+        assert_eq!(lines[4]["server"], "*");
+        assert_eq!(lines[4]["tool"], "resources/list");
+        assert!(lines[4]["catalog_id"].is_null());
         let _ = fs::remove_dir_all(&root);
     }
 }

@@ -545,8 +545,10 @@ server shows as `blocked` in `/mcp` and the MCP panel, with the reason, and does
 start; `/mcp add` refuses a connector a policy would block. `/mcp` ends with the
 policies in force.
 
-Every MCP tool call, refused calls included, adds a line to
-`~/.neuron/audit/mcp-YYYY-MM-DD.jsonl` (UTC day): the time, session, server, tool,
+Every MCP call, refused calls included, adds a line to
+`~/.neuron/audit/mcp-YYYY-MM-DD.jsonl` (UTC day): tool calls, and resource requests
+as the tools `resources/list` and `resources/read` (server `*` when a list asks every
+server; a read hashes its URI). Each line has the time, session, server, tool,
 catalog connector and catalog version, whether it was allowed and what decided it
 (`rule`, `mode`, `user`, `session` or `hook`), how long it ran, the bytes in and out,
 the sha256 of the arguments and an error class. Never the arguments or the output
