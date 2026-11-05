@@ -2628,10 +2628,12 @@ fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
 }
 
 /// The permission a call of `tool` needs. Its annotations are the server's own claims,
-/// so they decide alone only for servers Neuron ships (bundled scope; vetted catalog
-/// connectors join them later). Any other server cannot lower a tool below
-/// workspace-write, and a remote server's tools, or a tool that reaches the open world,
-/// need full access. An allow rule still lets a tool run with less.
+/// so they decide alone only for servers Neuron ships (bundled scope). A server whose
+/// launch spec is exactly a catalog entry's gets the tier the entry pins for the tool
+/// (`runtime::McpToolTier`). Any other server, or a tool the entry does not list, cannot
+/// lower a tool below workspace-write, and a remote server's tools, or a tool that
+/// reaches the open world, need full access. An allow rule still lets a tool run with
+/// less.
 fn permission_mode_for_mcp_tool(
     tool: &McpTool,
     server: Option<&runtime::ScopedMcpServerConfig>,
@@ -2650,13 +2652,22 @@ fn permission_mode_for_mcp_tool(
     if server.is_some_and(|server| server.scope == ConfigSource::Bundled) {
         return claimed;
     }
+    let catalog_entry = server.and_then(|server| runtime::mcp_catalog_entry_for(&server.config));
+    if let Some(entry) = catalog_entry {
+        if let Some(tier) = entry.pinned_tier(&tool.name) {
+            return tier.permission_mode(entry.is_remote());
+        }
+    }
     let remote = server.is_none_or(|server| server.transport() != runtime::McpTransport::Stdio);
     let floor = if remote || open_world {
         PermissionMode::DangerFullAccess
     } else {
         PermissionMode::WorkspaceWrite
     };
-    claimed.max(floor)
+    let unlisted = catalog_entry.map_or(PermissionMode::ReadOnly, |entry| {
+        entry.default_tier.permission_mode(entry.is_remote())
+    });
+    claimed.max(floor).max(unlisted)
 }
 
 fn mcp_annotation_flag(tool: &McpTool, key: &str) -> bool {
@@ -9088,6 +9099,88 @@ UU conflicted.rs",
         assert_eq!(
             permission_mode_for_mcp_tool(&read_only, None),
             PermissionMode::DangerFullAccess
+        );
+    }
+
+    #[test]
+    fn catalog_servers_get_the_tier_their_entry_pins_and_impostors_do_not() {
+        let tool = |name: &str, annotations: serde_json::Value| runtime::McpTool {
+            name: name.to_string(),
+            description: None,
+            input_schema: None,
+            annotations: Some(annotations),
+            meta: None,
+        };
+        let github = |headers: &[(&str, &str)]| runtime::ScopedMcpServerConfig {
+            scope: runtime::ConfigSource::Project,
+            config: runtime::McpServerConfig::Http(runtime::McpRemoteServerConfig {
+                url: "https://api.githubcopilot.com/mcp/".to_string(),
+                headers: headers
+                    .iter()
+                    .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                    .collect(),
+                headers_helper: None,
+                oauth: None,
+            }),
+        };
+        let auth = (
+            "Authorization",
+            "Bearer ${secret:GITHUB_PERSONAL_ACCESS_TOKEN}",
+        );
+        let vetted = github(&[auth]);
+        let mode = |name: &str, annotations: serde_json::Value, server| {
+            permission_mode_for_mcp_tool(&tool(name, annotations), Some(server))
+        };
+        // The entry decides, whatever the server claims.
+        assert_eq!(mode("get_me", json!({}), &vetted), PermissionMode::ReadOnly);
+        assert_eq!(
+            mode("merge_pull_request", json!({"readOnlyHint": true}), &vetted),
+            PermissionMode::DangerFullAccess
+        );
+        // A remote write changes something outside the workspace.
+        assert_eq!(
+            mode("issue_write", json!({}), &vetted),
+            PermissionMode::DangerFullAccess
+        );
+        // A tool the entry does not list gets the default tier, never less.
+        assert_eq!(
+            mode("brand_new", json!({"readOnlyHint": true}), &vetted),
+            PermissionMode::DangerFullAccess
+        );
+        // The same URL with a header the entry does not write is not the vetted server.
+        let impostor = github(&[auth, ("X-Extra", "1")]);
+        assert_eq!(
+            mode("get_me", json!({"readOnlyHint": true}), &impostor),
+            PermissionMode::DangerFullAccess
+        );
+
+        let filesystem = runtime::ScopedMcpServerConfig {
+            scope: runtime::ConfigSource::User,
+            config: runtime::McpServerConfig::Stdio(runtime::McpStdioServerConfig {
+                command: "npx".to_string(),
+                args: ["-y", "@modelcontextprotocol/server-filesystem@2.1.0", "."]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                env: std::collections::BTreeMap::new(),
+                tool_call_timeout_ms: None,
+            }),
+        };
+        assert_eq!(
+            mode("read_text_file", json!({}), &filesystem),
+            PermissionMode::ReadOnly
+        );
+        assert_eq!(
+            mode("create_directory", json!({}), &filesystem),
+            PermissionMode::WorkspaceWrite
+        );
+        assert_eq!(
+            mode("write_file", json!({"readOnlyHint": true}), &filesystem),
+            PermissionMode::DangerFullAccess
+        );
+        assert_eq!(
+            mode("unlisted", json!({"readOnlyHint": true}), &filesystem),
+            PermissionMode::WorkspaceWrite
         );
     }
 
