@@ -5,6 +5,9 @@ The release workflow copies a version's section into its GitHub release notes.
 
 ## 7.0.0-alpha.4 (unreleased)
 
+- Full-screen UI, MCP panel: a server that waits for you carries a badge after its
+  name (`[blocked]`, `[needs approval]`, `[needs connect]`, `[unpinned]`), and its
+  summary no longer repeats it.
 - Full-screen UI, MCP: a connectors chip in the status bar (`⧉ 5/6`, amber when a
   server needs you, a lock for a policy-required one; click opens the panel). The MCP
   panel gains an Installed tab (approve, connect, sign in, remove) and an Add tab

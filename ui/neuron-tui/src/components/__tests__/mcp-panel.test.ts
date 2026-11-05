@@ -7,6 +7,7 @@ import { useChatStore } from '../../state/chat-store'
 import {
   serverConnectUrl,
   serverEnabled,
+  serverBadges,
   serverLocked,
   serverSummary,
   useMcpPanelStore,
@@ -56,22 +57,39 @@ describe('the MCP servers panel', () => {
           error: 'a workspace server: run /mcp approve docs to start it',
         }),
       ),
-    ).toBe('needs approval: a workspace server: run /mcp approve docs to start it')
+    ).toBe('a workspace server: run /mcp approve docs to start it')
     expect(
       serverSummary(
         server({ status: 'blocked', tools: [], error: "refused by the permissions.deny rule 'mcp__docs'" }),
       ),
-    ).toBe("blocked: refused by the permissions.deny rule 'mcp__docs'")
+    ).toBe("refused by the permissions.deny rule 'mcp__docs'")
     // Older engines leave `enabled` out: the server is on.
     const { enabled: _enabled, ...legacy } = server()
     expect(serverEnabled(legacy)).toBe(true)
   })
 
+  test('blocked, needs approval, needs connect and unpinned are badges of their own', () => {
+    expect(serverBadges(server({ status: 'needs_approval', error: 'a workspace server' }))).toEqual([
+      'needs approval',
+    ])
+    expect(serverBadges(server({ status: 'blocked', error: 'denied' }))).toEqual(['blocked'])
+    expect(
+      serverBadges(server({ status: 'needs_approval', transport: 'stdio', unpinned: true })),
+    ).toEqual(['needs approval', 'unpinned'])
+    // A server that is off says only that; a ready or failed one has none.
+    expect(serverBadges(server({ enabled: false, status: 'blocked' }))).toEqual([])
+    expect(serverBadges(server())).toEqual([])
+    expect(serverBadges(server({ status: 'failed', error: 'x' }))).toEqual([])
+    // Without an error, the rest of the summary still shows.
+    expect(serverSummary(server({ status: 'needs_approval' }))).toBe('2 tools')
+  })
+
   test('a server whose version and hashes are not recorded says unpinned', () => {
     const unpinned = server({ transport: 'stdio', unpinned: true })
-    expect(serverSummary(unpinned)).toBe('ready · 2 tools · unpinned')
+    expect(serverSummary(unpinned)).toBe('ready · 2 tools')
+    expect(serverBadges(unpinned)).toEqual(['unpinned'])
     // Older engines leave it out, and so does a pinned or catalog server.
-    expect(serverSummary(server({ transport: 'stdio' }))).toBe('ready · 2 tools')
+    expect(serverBadges(server({ transport: 'stdio' }))).toEqual([])
   })
 
   test('a server the connector policy requires is locked on', () => {
@@ -87,7 +105,7 @@ describe('the MCP servers panel', () => {
           error: 'refused by managed settings: mcpPolicy.deny lists "docs"',
         }),
       ),
-    ).toBe('blocked: refused by managed settings: mcpPolicy.deny lists "docs"')
+    ).toBe('refused by managed settings: mcpPolicy.deny lists "docs"')
 
     // Its switch sends nothing and says why.
     const before = useChatStore.getState().messages.length
@@ -130,7 +148,8 @@ describe('the MCP servers panel', () => {
       connect_url: connectUrl,
     })
     expect(serverConnectUrl(hosted)).toBe(connectUrl)
-    expect(serverSummary(hosted)).toStartWith('needs connect: not linked to your Zero-X account')
+    expect(serverSummary(hosted)).toStartWith('not linked to your Zero-X account')
+    expect(serverBadges(hosted)).toEqual(['needs connect'])
     // Linked (or an older engine): nothing to connect.
     expect(serverConnectUrl(server({ transport: 'zerox' }))).toBeNull()
     expect(serverConnectUrl({ ...hosted, connect_url: undefined })).toBeNull()

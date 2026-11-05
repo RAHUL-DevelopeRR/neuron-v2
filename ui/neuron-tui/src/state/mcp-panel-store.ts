@@ -91,19 +91,41 @@ export function serverNeedsAttention(server: McpServerInfo): boolean {
   )
 }
 
-/** `ready · 4 tools`, `off`, `failed: why`, ... for a row. */
+/** Statuses a row shows as a badge of their own, by the badge's words. */
+const BADGE_STATUSES: Readonly<Record<string, string>> = {
+  blocked: 'blocked',
+  needs_approval: 'needs approval',
+  needs_connect: 'needs connect',
+}
+
+/**
+ * The badges on a row, drawn apart from its summary so they stand out:
+ * `blocked`, `needs approval`, `needs connect` (a server that is on) and
+ * `unpinned`.
+ */
+export function serverBadges(server: McpServerInfo): string[] {
+  const badges: string[] = []
+  const status = serverEnabled(server) ? BADGE_STATUSES[server.status] : undefined
+  if (status) badges.push(status)
+  if (server.unpinned) badges.push('unpinned')
+  return badges
+}
+
+/**
+ * `ready · 4 tools`, `off`, `failed: why`, ... for a row, less what its
+ * badges say ({@link serverBadges}): a `needs approval` row says only why.
+ */
 export function serverSummary(server: McpServerInfo): string {
   if (!serverEnabled(server)) return 'off'
   const tools =
     server.tools.length > 0
       ? ` · ${server.tools.length} ${server.tools.length === 1 ? 'tool' : 'tools'}`
       : ''
-  const status = server.status.replace('_', ' ')
+  const badged = BADGE_STATUSES[server.status] !== undefined
+  const status = badged ? '' : server.status.replace('_', ' ')
   const required = serverLocked(server) ? ' · required' : ''
-  const unpinned = server.unpinned ? ' · unpinned' : ''
-  return server.error
-    ? `${status}: ${server.error}`
-    : `${status}${tools}${required}${unpinned}`
+  if (server.error) return badged ? server.error : `${status}: ${server.error}`
+  return `${status}${tools}${required}`.replace(/^ · /, '')
 }
 
 /** What the status bar's connectors chip says about the servers. */

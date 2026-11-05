@@ -494,7 +494,9 @@ starts from that from then on (see
 In the full-screen UI, `/mcp` (or a click on the status bar's connectors chip,
 `⧉ 5/6`: servers up of those turned on, amber when one needs you, a lock when the
 connector policy requires one) opens the MCP panel. Its **Installed** tab lists each
-server with its transport, scope and state: space turns it on or off (not a required
+server with its transport, scope and state, and a badge after the name of one that
+waits for you: `[blocked]`, `[needs approval]`, `[needs connect]` or `[unpinned]`.
+Space turns a server on or off (not a required
 one, marked with a lock), `a` approves a workspace server waiting for approval, `c`
 opens the page that links a hosted connector, `l` signs in to a remote server that
 needs it (`/mcp login <server>`), and `x` twice removes a server with its secrets.

@@ -3,7 +3,8 @@
  * feature `mcp_toggle`), in two tabs.
  *
  * Installed: each server with its switch, transport, scope and what it is
- * doing.
+ * doing. A server that waits for the user carries a badge after its name:
+ * `[blocked]`, `[needs approval]`, `[needs connect]`, `[unpinned]`.
  *
  *   ↑/↓ move   space/enter on/off   a approve   c connect   l sign in   x remove   tab Add   esc close
  *
@@ -52,6 +53,7 @@ import {
   serverLocked,
   serverNeedsApproval,
   serverNeedsSignIn,
+  serverBadges,
   serverSummary,
   useMcpPanelStore,
 } from '../state/mcp-panel-store'
@@ -206,6 +208,7 @@ const InstalledTab = ({
           Math.max(6, Math.floor(rowWidth / 2)),
         )
         const removing = confirmRemove === server.name
+        const badges = removing ? '' : serverBadges(server).map((badge) => ` [${badge}]`).join('')
         const summary = removing ? '  remove? press x again' : `  ${serverSummary(server)}`
         const attention = removing || server.error !== null || serverNeedsApproval(server)
         return (
@@ -215,8 +218,16 @@ const InstalledTab = ({
             <span fg={theme.foreground} attributes={focused ? TextAttributes.BOLD : undefined}>
               {label}
             </span>
+            {badges ? (
+              <span fg={theme.warning} attributes={TextAttributes.BOLD}>
+                {badges}
+              </span>
+            ) : null}
             <span fg={attention ? theme.warning : theme.muted}>
-              {truncateToWidth(summary, Math.max(4, rowWidth - 8 - displayWidth(label)))}
+              {truncateToWidth(
+                summary,
+                Math.max(4, rowWidth - 8 - displayWidth(label) - displayWidth(badges)),
+              )}
             </span>
           </text>
         )

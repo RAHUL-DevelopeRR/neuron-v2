@@ -309,6 +309,30 @@ describe('the Add tab', () => {
     }
   })
 
+  test('the Installed tab draws a badge for each server that waits for the user', async () => {
+    useEngineStore.getState().setReady('test', [FEATURE_MCP_TOGGLE, FEATURE_MCP_CATALOG])
+    useMcpPanelStore.getState().openPanel('installed')
+    const setup = await createTestRenderer({ width: 140, height: 16 })
+    const root = createRoot(setup.renderer)
+    flushSync(() =>
+      root.render(<McpPanel servers={EXTENSIONS.mcp_servers} pending={null} width={140} glyphMode="console" />),
+    )
+    try {
+      await setup.renderOnce()
+      const frame = setup.captureCharFrame()
+      const row = (name: string) => frame.split('\n').find((line) => line.includes(`${name}  `)) ?? ''
+      expect(row('postgres-tools')).toContain('[needs approval]')
+      expect(row('linear')).toContain('[needs connect]')
+      expect(row('notes')).toContain('[unpinned]')
+      // Said once, as the badge, not again in the summary.
+      expect(row('postgres-tools')).not.toContain('needs approval:')
+      expect(row('github')).not.toMatch(/\[(blocked|needs|unpinned)/)
+    } finally {
+      flushSync(() => root.unmount())
+      setup.renderer.destroy()
+    }
+  })
+
   test('Add sends add_mcp_server with the secrets, and nothing logs them', () => {
     const sent = recordingEngine()
     const logged: unknown[] = []
