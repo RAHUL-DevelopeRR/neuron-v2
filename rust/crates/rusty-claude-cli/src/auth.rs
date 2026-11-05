@@ -434,6 +434,10 @@ fn sign_out() -> bool {
         runtime::ui_hooks::notice(&format!("warning: {warning}"));
     }
     crate::gateway_catalog::invalidate_cache();
+    // The plan's connector policy belongs to the account that signed out.
+    if let Err(error) = runtime::clear_gateway_policy(&runtime::default_config_home()) {
+        runtime::ui_hooks::notice(&format!("warning: {error}"));
+    }
     revoked
 }
 

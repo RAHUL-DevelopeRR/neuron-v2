@@ -101,9 +101,9 @@ pub use compact::{
     DEFAULT_MAX_SUMMARY_TOKENS, DERIVED_CONTEXT_NOTE,
 };
 pub use config::{
-    BlockedMcpServer, ConfigEntry, ConfigError, ConfigLoader, ConfigSource, IgnoredProjectSettings,
-    McpConfigCollection, McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig,
-    McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
+    default_config_home, BlockedMcpServer, ConfigEntry, ConfigError, ConfigLoader, ConfigSource,
+    IgnoredProjectSettings, McpConfigCollection, McpManagedProxyServerConfig, McpOAuthConfig,
+    McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
     McpWebSocketServerConfig, OAuthConfig, PreviewHook, PreviewMcpServer, PreviewPermissionRule,
     ProjectSettingsAction, ProjectTrust, ProviderFallbackConfig, ResolvedPermissionMode,
     RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig, RuntimePermissionRuleConfig,

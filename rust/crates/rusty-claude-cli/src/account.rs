@@ -282,7 +282,23 @@ pub fn fetch_account(
     let account = parse_account(&value);
     // Every read keeps the plan window current for the status lines and the guard.
     crate::plan_window::remember(&account);
+    remember_connector_policy(&runtime::default_config_home(), &value);
     Ok(account)
+}
+
+/// Caches the account's connector policy (`policy`, contract v1.3) in `config_home`,
+/// where every later settings load reads it, after a restart and offline too. An
+/// answer without one clears the plan policy.
+fn remember_connector_policy(config_home: &std::path::Path, account: &Value) {
+    if let Err(error) = runtime::store_gateway_policy(
+        config_home,
+        account.get("policy"),
+        runtime::mcp_policy::unix_now(),
+    ) {
+        runtime::ui_hooks::notice(&format!(
+            "warning: could not keep your plan's connector policy: {error}"
+        ));
+    }
 }
 
 /// `1234567` -> `1,234,567`.
@@ -526,6 +542,46 @@ mod tests {
             "subscription": {"status": "active", "current_period_end": "2026-11-01T00:00:00Z", "cancel_at_period_end": false},
             "flags": {"suspended": false}
         })
+    }
+
+    #[test]
+    fn an_account_read_keeps_the_plan_connector_policy_for_later_loads() {
+        let root = std::env::temp_dir().join(format!(
+            "neuron-account-policy-{}-{}",
+            std::process::id(),
+            runtime::mcp_policy::unix_now()
+        ));
+        let (cwd, home) = (root.join("project"), root.join("config"));
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("settings.json"),
+            r#"{"defaultMcpServers":false,"mcpServers":{"github":{"command":"github-mcp"},"docs":{"command":"docs-mcp"}}}"#,
+        )
+        .unwrap();
+        let mut body = sample();
+        body["policy"] = serde_json::json!({
+            "connectors": {"allowed": ["catalog:*"], "denied": ["github"], "required": [],
+                "hosted": [], "allow_unvetted": true, "catalog_version": "2026-11-04.1"}
+        });
+
+        // After `/login` reads the account, and again in a new process (a restart).
+        remember_connector_policy(&home, &body);
+        for _ in 0..2 {
+            let config = runtime::ConfigLoader::new(&cwd, &home).load().unwrap();
+            assert!(config.mcp().get("github").is_none());
+            assert_eq!(
+                config.mcp().blocked()["github"].rule,
+                "policy.connectors.denied: github"
+            );
+            assert!(config.mcp().get("docs").is_some());
+        }
+
+        // An account without a policy block lifts it.
+        remember_connector_policy(&home, &sample());
+        let config = runtime::ConfigLoader::new(&cwd, &home).load().unwrap();
+        assert!(config.mcp().get("github").is_some());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
