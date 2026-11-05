@@ -189,9 +189,10 @@ terminal get them (`GITHUB_PERSONAL_ACCESS_TOKEN=... neuron mcp add github`). Se
 go to the OS keychain as `mcp-secret:<server>:<NAME>` (or an owner-only file under
 `~/.neuroncli/mcp-secrets` when there is no keychain); the settings file only holds
 the reference `${secret:NAME}`, which Neuron resolves when it starts the server, in
-its environment or its headers. A secret is bound to the URL, or the command and
-arguments, it was added for: a settings file that later points a server of the same
-name somewhere else does not get it. `remove` deletes the server's keychain secrets and, for a remote server,
+its environment or its headers. A secret is bound to the URL, or the command,
+arguments and environment, it was added for: a settings file that later points a
+server of the same name somewhere else, or starts it with other environment variables
+(`NODE_OPTIONS`, say), does not get it. `remove` deletes the server's keychain secrets and, for a remote server,
 its sign-in. A connector added again with the same settings stores its secrets again,
 which is how you replace a token. Secrets and sign-ins are kept per server name, so a
 name can be added in one scope only (use `--name` for a second copy); if a settings

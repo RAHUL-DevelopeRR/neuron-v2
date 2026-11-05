@@ -6,9 +6,10 @@
 //! read-modify-write as the on/off switches (`mcp_toggle`).
 //!
 //! A secret is bound to what it was added for: a remote server's URL, or a stdio
-//! server's command and arguments ([`mcp_secret_target`]). A settings file that later
-//! points a server of the same name somewhere else (a pulled project file, say) does
-//! not get the secret.
+//! server's command, arguments and environment ([`mcp_secret_target`]). A settings file
+//! that later points a server of the same name somewhere else, or starts it with other
+//! environment such as `NODE_OPTIONS` (a pulled project file, say), does not get the
+//! secret.
 
 use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
@@ -28,12 +29,16 @@ pub fn mcp_secret_key(server: &str, name: &str) -> String {
     format!("mcp-secret:{server}:{name}")
 }
 
-/// What a secret is bound to: `url:<url>` for a remote server, `cmd:<command and
-/// arguments as JSON>` for a stdio one. `None` for other transports.
+/// What a secret is bound to: `url:<url>` for a remote server, `cmd:<command, arguments
+/// and environment as written, as JSON>` for a stdio one, since another environment
+/// (`NODE_OPTIONS`, a package registry) can run another program. `None` for other
+/// transports.
 #[must_use]
 pub fn mcp_secret_target(config: &McpServerConfig) -> Option<String> {
     match config {
-        McpServerConfig::Stdio(stdio) => Some(stdio_target(&stdio.command, &stdio.args)),
+        McpServerConfig::Stdio(stdio) => {
+            Some(stdio_target(&stdio.command, &stdio.args, &stdio.env))
+        }
         McpServerConfig::Http(remote) | McpServerConfig::Sse(remote) => {
             Some(remote_target(&remote.url))
         }
@@ -41,8 +46,8 @@ pub fn mcp_secret_target(config: &McpServerConfig) -> Option<String> {
     }
 }
 
-fn stdio_target(command: &str, args: &[String]) -> String {
-    format!("cmd:{}", json!([command, args]))
+fn stdio_target(command: &str, args: &[String], env: &BTreeMap<String, String>) -> String {
+    format!("cmd:{}", json!([command, args, env]))
 }
 
 fn remote_target(url: &str) -> String {
@@ -113,7 +118,7 @@ pub fn resolve_mcp_secret_references(
             Ok(Some((secret, bound))) if bound == target => output.push_str(&secret),
             Ok(Some(_)) => {
                 return Err(format!(
-                    "the secret {name} of MCP server `{server}` was added for another command or URL, so it is not sent here; add the server again with `neuron mcp add`"
+                    "the secret {name} of MCP server `{server}` was added for another command, environment or URL, so it is not sent here; add the server again with `neuron mcp add`"
                 ))
             }
             Ok(None) => {
@@ -139,7 +144,7 @@ pub(crate) fn stdio_transport_with_secrets(
     server: &str,
     transport: &crate::mcp_client::McpStdioTransport,
 ) -> std::io::Result<crate::mcp_client::McpStdioTransport> {
-    let target = stdio_target(&transport.command, &transport.args);
+    let target = stdio_target(&transport.command, &transport.args, &transport.env);
     let mut resolved = transport.clone();
     for value in resolved.env.values_mut() {
         *value = resolve_mcp_secret_references(server, &target, value)
@@ -713,7 +718,10 @@ mod tests {
             "Bearer ${secret:GITHUB_PERSONAL_ACCESS_TOKEN}",
         )
         .unwrap_err();
-        assert!(elsewhere.contains("another command or URL"), "{elsewhere}");
+        assert!(
+            elsewhere.contains("another command, environment or URL"),
+            "{elsewhere}"
+        );
         assert!(!elsewhere.contains(sentinel));
 
         let config = loader.load().unwrap();
@@ -791,20 +799,21 @@ mod tests {
         )
         .is_err());
 
+        let env = BTreeMap::from([
+            ("API_KEY".to_string(), "${secret:STDIO_KEY}".to_string()),
+            ("PLAIN".to_string(), "${HOME}".to_string()),
+        ]);
         save_mcp_secret(
             "header-test",
             "STDIO_KEY",
             "s-1",
-            &super::stdio_target("server", &[]),
+            &super::stdio_target("server", &[], &env),
         )
         .unwrap();
         let transport = crate::mcp_client::McpStdioTransport {
             command: "server".to_string(),
             args: Vec::new(),
-            env: BTreeMap::from([
-                ("API_KEY".to_string(), "${secret:STDIO_KEY}".to_string()),
-                ("PLAIN".to_string(), "${HOME}".to_string()),
-            ]),
+            env,
             tool_call_timeout_ms: None,
         };
         let resolved = super::stdio_transport_with_secrets("header-test", &transport).unwrap();
@@ -817,6 +826,22 @@ mod tests {
         let mut moved = transport.clone();
         moved.args.push("--other".to_string());
         assert!(super::stdio_transport_with_secrets("header-test", &moved).is_err());
+        // Extra environment can run another program with the same command line.
+        for (name, value) in [
+            ("NODE_OPTIONS", "--require ./x.js"),
+            ("npm_config_registry", "https://registry.example.com"),
+        ] {
+            let mut injected = transport.clone();
+            injected.env.insert(name.to_string(), value.to_string());
+            let error = super::stdio_transport_with_secrets("header-test", &injected)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("another command, environment or URL"),
+                "{error}"
+            );
+            assert!(!error.contains("s-1"), "{error}");
+        }
     }
 
     #[test]
@@ -888,7 +913,10 @@ mod tests {
             &github("gh-both", "ghp_project_2", Some(McpInstallScope::Project)),
         )
         .unwrap_err();
-        assert!(refused.contains("already in the user settings"), "{refused}");
+        assert!(
+            refused.contains("already in the user settings"),
+            "{refused}"
+        );
         assert!(refused.contains("--name"), "{refused}");
         assert_eq!(
             load_mcp_secret("gh-both", "GITHUB_PERSONAL_ACCESS_TOKEN").unwrap(),
