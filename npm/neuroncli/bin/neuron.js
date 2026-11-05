@@ -52,12 +52,10 @@ async function resolveUi(argv) {
 function childEnvironment() {
   const require = createRequire(import.meta.url);
   const env = {...process.env, NEURON_MCP_NODE: process.execPath};
-  // Default MCP integrations installed with this package; skip any that failed to install.
-  try {
-    env.NEURON_CODEBASE_MCP_ENTRY = require.resolve('codebase-memory-mcp/bin.js');
-  } catch {
-    // not installed
-  }
+  // Playwright MCP is installed with this package (npm checks its lockfile integrity);
+  // skip it if it failed to install. Codebase memory is not an npm dependency: its
+  // package only downloads a release binary in an install script, so Neuron fetches
+  // that binary itself and checks its pinned sha256 on first use.
   try {
     env.NEURON_PLAYWRIGHT_MCP_ENTRY = path.join(path.dirname(require.resolve('@playwright/mcp/package.json')), 'cli.js');
   } catch {

@@ -40,7 +40,6 @@
     "arm64"
   ],
   "dependencies": {
-    "codebase-memory-mcp": "0.11.0",
     "@playwright/mcp": "0.0.83"
   },
   "repository": {

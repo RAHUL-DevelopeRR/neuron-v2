@@ -86,8 +86,10 @@ npm package dependencies
 ------------------------
 
 The npm package @zero-x.live/neuron installs, but does not bundle,
-codebase-memory-mcp (MIT License) and @playwright/mcp (Apache License 2.0).
-npm installs them with their own license files.
+@playwright/mcp (Apache License 2.0); npm installs it with its own license
+file. The codebase-memory-mcp server (MIT License) is not bundled either:
+Neuron downloads its release binary from the project's GitHub release on
+first use and checks it against a pinned sha256.
 
 Trademarks and affiliation
 --------------------------
