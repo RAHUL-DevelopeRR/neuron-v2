@@ -841,21 +841,25 @@ impl McpServerManager {
         let mut managed_servers = BTreeMap::new();
         let mut unsupported_servers = Vec::new();
 
+        let hosted = crate::mcp_zerox::hosted_connectors_enabled();
         for (server_name, server_config) in servers {
+            let transport = server_config.transport();
             if matches!(
-                server_config.transport(),
+                transport,
                 McpTransport::Stdio | McpTransport::Http | McpTransport::Sse
-            ) {
+            ) || (hosted && transport == McpTransport::ManagedProxy)
+            {
                 let bootstrap = McpClientBootstrap::from_scoped_config(server_name, server_config);
                 managed_servers.insert(server_name.clone(), ManagedMcpServer::new(bootstrap));
             } else {
                 unsupported_servers.push(UnsupportedMcpServer {
                     server_name: server_name.clone(),
-                    transport: server_config.transport(),
-                    reason: format!(
-                        "transport {:?} is not supported by McpServerManager",
-                        server_config.transport()
-                    ),
+                    transport,
+                    reason: if transport == McpTransport::ManagedProxy {
+                        crate::mcp_zerox::hosted_connectors_off_reason()
+                    } else {
+                        format!("transport {transport:?} is not supported by McpServerManager")
+                    },
                 });
             }
         }
@@ -988,6 +992,20 @@ impl McpServerManager {
         qualified_tool_name: &str,
         arguments: Option<JsonValue>,
     ) -> Result<JsonRpcResponse<McpToolCallResult>, McpServerManagerError> {
+        self.call_tool_approved(qualified_tool_name, arguments, false)
+            .await
+    }
+
+    /// [`Self::call_tool`] for a call the permission check allowed; `approved`: the
+    /// user approved it in the permission prompt. A hosted connector is told so
+    /// (`x-neuron-confirmed`) when the tool is in its catalog entry's destructive tier,
+    /// or its tier is not known; no other server ever is.
+    pub async fn call_tool_approved(
+        &mut self,
+        qualified_tool_name: &str,
+        arguments: Option<JsonValue>,
+        approved: bool,
+    ) -> Result<JsonRpcResponse<McpToolCallResult>, McpServerManagerError> {
         let route = self
             .tool_index
             .get(qualified_tool_name)
@@ -997,6 +1015,7 @@ impl McpServerManager {
             })?;
 
         let timeout_ms = self.tool_call_timeout_ms(&route.server_name)?;
+        let confirmed = approved && self.confirms(&route);
 
         self.ensure_server_ready(&route.server_name).await?;
         let request_id = self.take_request_id();
@@ -1021,6 +1040,7 @@ impl McpServerManager {
                             arguments,
                             meta: None,
                         },
+                        confirmed,
                     ),
                 )
                 .await
@@ -1043,6 +1063,7 @@ impl McpServerManager {
         &mut self,
         qualified_tool_name: &str,
         arguments: Option<JsonValue>,
+        approved: bool,
         cancel: &CancellationToken,
     ) -> Result<Option<JsonRpcResponse<McpToolCallResult>>, McpServerManagerError> {
         if cancel.is_cancelled() {
@@ -1050,7 +1071,7 @@ impl McpServerManager {
         }
         let finished = tokio::select! {
             biased;
-            response = self.call_tool(qualified_tool_name, arguments) => Some(response),
+            response = self.call_tool_approved(qualified_tool_name, arguments, approved) => Some(response),
             () = cancel.cancelled() => None,
         };
         if let Some(response) = finished {
@@ -1126,6 +1147,23 @@ impl McpServerManager {
         Ok(())
     }
 
+    /// Whether a user-approved call of `route` is confirmed to its server: a hosted
+    /// connector's tool in the destructive tier, or one whose tier is not known (no
+    /// catalog entry, or the entry does not list it).
+    fn confirms(&self, route: &ToolRoute) -> bool {
+        let Some(McpClientTransport::ManagedProxy(proxy)) = self
+            .servers
+            .get(&route.server_name)
+            .map(|server| &server.bootstrap.transport)
+        else {
+            return false;
+        };
+        crate::mcp_catalog::McpCatalog::builtin()
+            .get(&proxy.id)
+            .and_then(|entry| entry.pinned_tier(&route.raw_name))
+            .is_none_or(|tier| tier == crate::mcp_catalog::McpToolTier::Destructive)
+    }
+
     fn clear_routes_for_server(&mut self, server_name: &str) {
         self.tool_index
             .retain(|_, route| route.server_name != server_name);
@@ -1157,9 +1195,9 @@ impl McpServerManager {
             McpClientTransport::Stdio(transport) => Ok(transport
                 .tool_call_timeout_ms
                 .unwrap_or(MCP_TOOL_CALL_TIMEOUT_MS)),
-            McpClientTransport::Http(_) | McpClientTransport::Sse(_) => {
-                Ok(MCP_TOOL_CALL_TIMEOUT_MS)
-            }
+            McpClientTransport::Http(_)
+            | McpClientTransport::Sse(_)
+            | McpClientTransport::ManagedProxy(_) => Ok(MCP_TOOL_CALL_TIMEOUT_MS),
             other => Err(McpServerManagerError::InvalidResponse {
                 server_name: server_name.to_string(),
                 method: "tools/call",

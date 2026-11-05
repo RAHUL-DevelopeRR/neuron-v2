@@ -906,11 +906,12 @@ fn glob_matches(pattern: &str, text: &str) -> bool {
 /// The host a remote server reaches; `None` for a local one.
 fn remote_host(config: &McpServerConfig) -> Option<String> {
     let url = match config {
-        McpServerConfig::Sse(remote) | McpServerConfig::Http(remote) => &remote.url,
-        McpServerConfig::Ws(socket) => &socket.url,
-        McpServerConfig::ManagedProxy(proxy) => &proxy.url,
+        McpServerConfig::Sse(remote) | McpServerConfig::Http(remote) => remote.url.clone(),
+        McpServerConfig::Ws(socket) => socket.url.clone(),
+        McpServerConfig::ManagedProxy(proxy) => proxy.endpoint(),
         McpServerConfig::Stdio(_) | McpServerConfig::Sdk(_) => return None,
     };
+    let url = &url;
     // `url_host` reads http(s) URLs; a WebSocket URL has the same authority.
     let web = url
         .strip_prefix("wss://")

@@ -74,7 +74,7 @@ pub fn mcp_server_signature(config: &McpServerConfig) -> Option<String> {
         }
         McpServerConfig::Ws(config) => Some(format!("url:{}", unwrap_ccr_proxy_url(&config.url))),
         McpServerConfig::ManagedProxy(config) => {
-            Some(format!("url:{}", unwrap_ccr_proxy_url(&config.url)))
+            Some(format!("url:{}", unwrap_ccr_proxy_url(&config.endpoint())))
         }
         McpServerConfig::Sdk(_) => None,
     }

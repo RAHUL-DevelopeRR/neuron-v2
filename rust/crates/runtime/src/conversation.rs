@@ -292,6 +292,12 @@ pub trait ToolExecutor {
     /// nothing.
     fn tool_started(&mut self, _tool_use_id: &str, _tool_name: &str, _input: &str) {}
 
+    /// Who allowed the tool call about to run (`decided_by`), just before
+    /// [`Self::tool_started`]; it holds for the next execute call only. An executor
+    /// tells a hosted connector when the user approved the call in the prompt
+    /// ([`PermissionDecider::User`]). The default does nothing.
+    fn tool_permission_decided(&mut self, _tool_name: &str, _decided_by: PermissionDecider) {}
+
     /// Every tool call's final result, as the model will see it: one that ran, one that
     /// was denied or blocked by a hook, and one that never started (interrupted, cut off
     /// at the output limit, stopped by the loop guard). The default does nothing.
@@ -1300,6 +1306,8 @@ where
             PermissionOutcome::Allow if interrupted => (INTERRUPTED_TOOL_RESULT.to_string(), true),
             PermissionOutcome::Allow => {
                 self.record_tool_started(iteration, tool_name);
+                self.tool_executor
+                    .tool_permission_decided(tool_name, decided_by);
                 self.tool_executor
                     .tool_started(tool_use_id, tool_name, &effective_input);
                 let (mut output, mut is_error) = match self.tool_executor.execute_with_cancellation(
@@ -4311,6 +4319,94 @@ mod resilience_tests {
             vec![
                 ("1".to_string(), "ran".to_string()),
                 ("3".to_string(), "stops".to_string())
+            ]
+        );
+    }
+
+    /// A hosted connector is told only of calls the user approved in the prompt: the
+    /// executor hears who allowed each call that runs, and nothing for a denied one.
+    #[test]
+    fn the_executor_hears_who_allowed_each_call() {
+        type Decided = Rc<RefCell<Vec<(String, crate::permissions::PermissionDecider)>>>;
+        struct Recording {
+            inner: StaticToolExecutor,
+            decided: Decided,
+        }
+        impl ToolExecutor for Recording {
+            fn execute(
+                &mut self,
+                tool_name: &str,
+                input: &str,
+            ) -> Result<String, super::ToolError> {
+                self.inner.execute(tool_name, input)
+            }
+            fn tool_permission_decided(
+                &mut self,
+                tool_name: &str,
+                decided_by: crate::permissions::PermissionDecider,
+            ) {
+                self.decided
+                    .borrow_mut()
+                    .push((tool_name.to_string(), decided_by));
+            }
+        }
+        struct AllowAsked;
+        impl PermissionPrompter for AllowAsked {
+            fn decide(&mut self, request: &PermissionRequest) -> PermissionPromptDecision {
+                if request.tool_name == "refused" {
+                    PermissionPromptDecision::Deny {
+                        reason: "no".to_string(),
+                    }
+                } else {
+                    PermissionPromptDecision::Allow
+                }
+            }
+        }
+
+        let api = ScriptedApi::new(vec![
+            Ok(vec![
+                tool_call("1", "read", "{}"),
+                tool_call("2", "delete", "{}"),
+                tool_call("3", "refused", "{}"),
+                AssistantEvent::MessageStop,
+            ]),
+            Ok(vec![text("done"), AssistantEvent::MessageStop]),
+        ]);
+        let decided = Decided::default();
+        let tools = Recording {
+            inner: StaticToolExecutor::new()
+                .register("read", |_| Ok("read".to_string()))
+                .register("delete", |_| Ok("deleted".to_string()))
+                .register("refused", |_| panic!("a denied call must not run")),
+            decided: Rc::clone(&decided),
+        };
+        let policy = PermissionPolicy::new(PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("read", PermissionMode::ReadOnly)
+            .with_tool_requirement("delete", PermissionMode::DangerFullAccess)
+            .with_tool_requirement("refused", PermissionMode::DangerFullAccess);
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            api,
+            tools,
+            policy,
+            vec!["system".to_string()],
+        );
+
+        runtime
+            .run_turn("go", Some(&mut AllowAsked))
+            .expect("turn runs");
+
+        assert_eq!(
+            *decided.borrow(),
+            vec![
+                (
+                    "read".to_string(),
+                    crate::permissions::PermissionDecider::Mode
+                ),
+                (
+                    "delete".to_string(),
+                    crate::permissions::PermissionDecider::User
+                ),
             ]
         );
     }

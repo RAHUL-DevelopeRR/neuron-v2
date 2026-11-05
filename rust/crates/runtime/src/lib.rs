@@ -50,6 +50,7 @@ mod mcp_stdio;
 mod mcp_test_http;
 mod mcp_toggle;
 pub mod mcp_tool_bridge;
+pub mod mcp_zerox;
 pub mod model_registry;
 pub mod model_routing;
 pub mod net_allow;
@@ -199,6 +200,11 @@ pub use mcp_stdio::{
     McpToolCallResult, McpToolDiscoveryReport, UnsupportedMcpServer,
 };
 pub use mcp_toggle::{set_mcp_server_enabled, McpToggleOutcome};
+pub use mcp_zerox::{
+    hosted_connectors_enabled, set_zerox_token_provider, valid_connector_id, zerox_connect_url,
+    zerox_endpoint, zerox_needs_connect, zerox_origin, ZeroxTokenProvider,
+    ZEROX_HOSTED_CONNECTORS_ENV,
+};
 pub use model_routing::{ModelRouting, ModelRoutingSettings};
 pub use oauth::{
     clear_oauth_credentials, code_challenge_s256, credentials_path, generate_pkce_pair,

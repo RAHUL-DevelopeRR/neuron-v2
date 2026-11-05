@@ -320,11 +320,26 @@ pub struct McpSdkServerConfig {
     pub name: String,
 }
 
-/// Configuration for an MCP managed-proxy endpoint.
+/// A hosted connector through Zero-X (`"type": "zerox"`, see `mcp_zerox`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpManagedProxyServerConfig {
+    /// Empty: the gateway's `/mcp/<id>`, the only endpoint it may name.
     pub url: String,
+    /// The connector id (`github`).
     pub id: String,
+}
+
+impl McpManagedProxyServerConfig {
+    /// The URL it reaches: its `url`, else the gateway's `/mcp/<id>`.
+    #[must_use]
+    pub fn endpoint(&self) -> String {
+        if !self.url.trim().is_empty() {
+            return self.url.clone();
+        }
+        let origin = crate::mcp_zerox::zerox_origin()
+            .unwrap_or_else(|_| crate::mcp_zerox::ZEROX_DEFAULT_ORIGIN.to_string());
+        crate::mcp_zerox::zerox_endpoint(&origin, &self.id)
+    }
 }
 
 /// OAuth overrides associated with a remote MCP server.
@@ -435,7 +450,7 @@ fn mcp_preview_target(config: &McpServerConfig) -> Option<String> {
         McpServerConfig::Sse(remote) | McpServerConfig::Http(remote) => host(&remote.url),
         McpServerConfig::Ws(socket) => host(&socket.url),
         McpServerConfig::Sdk(sdk) => Some(sdk.name.clone()),
-        McpServerConfig::ManagedProxy(proxy) => host(&proxy.url),
+        McpServerConfig::ManagedProxy(proxy) => host(&proxy.endpoint()),
     }
 }
 
@@ -2156,10 +2171,21 @@ fn parse_mcp_server_config(
         "sdk" => Ok(McpServerConfig::Sdk(McpSdkServerConfig {
             name: expect_string(object, "name", context)?.to_string(),
         })),
-        "claudeai-proxy" => Ok(McpServerConfig::ManagedProxy(McpManagedProxyServerConfig {
-            url: expect_string(object, "url", context)?.to_string(),
-            id: expect_string(object, "id", context)?.to_string(),
-        })),
+        // A hosted connector through Zero-X; the inherited spelling still parses.
+        "zerox" | "claudeai-proxy" => {
+            let id = expect_string(object, "id", context)?.trim().to_string();
+            if !crate::mcp_zerox::valid_connector_id(&id) {
+                return Err(ConfigError::Parse(format!(
+                    "{context}: id must be a connector id (lowercase letters, digits, - and _), not \"{id}\""
+                )));
+            }
+            Ok(McpServerConfig::ManagedProxy(McpManagedProxyServerConfig {
+                url: optional_string(object, "url", context)?
+                    .unwrap_or_default()
+                    .to_string(),
+                id,
+            }))
+        }
         other => Err(ConfigError::Parse(format!(
             "{context}: unsupported MCP server type for {server_name}: {other}"
         ))),
@@ -2474,6 +2500,39 @@ mod tests {
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
+
+    #[test]
+    fn parses_a_hosted_zerox_connector_and_the_inherited_spelling() {
+        use super::{parse_mcp_server_json, McpManagedProxyServerConfig};
+        let proxy = |text: &str| match parse_mcp_server_json("s", text).expect(text) {
+            McpServerConfig::ManagedProxy(proxy) => proxy,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            proxy(r#"{"type":"zerox","id":"github"}"#),
+            McpManagedProxyServerConfig {
+                url: String::new(),
+                id: "github".to_string(),
+            }
+        );
+        // The inherited type string still parses, as the same server.
+        assert_eq!(
+            proxy(
+                r#"{"type":"claudeai-proxy","id":"linear","url":"https://zero-x.live/mcp/linear"}"#
+            ),
+            McpManagedProxyServerConfig {
+                url: "https://zero-x.live/mcp/linear".to_string(),
+                id: "linear".to_string(),
+            }
+        );
+        for bad in [
+            r#"{"type":"zerox"}"#,
+            r#"{"type":"zerox","id":"../admin"}"#,
+            r#"{"type":"zerox","id":"GitHub"}"#,
+        ] {
+            assert!(parse_mcp_server_json("s", bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn parses_a_stdio_server_sandbox() {
