@@ -1451,7 +1451,7 @@ fn stdio_server_command(
         }
         apply_env(&mut command, &transport.env);
     }
-    // Not in the user's console: `cmd.exe /c npx â€¦` and npm retitle the console they
+    // Not in the user's console: `cmd.exe /c npx …` and npm retitle the console they
     // run in, which is the terminal of the UI or the REPL.
     #[cfg(windows)]
     command.creation_flags(if suspended {
@@ -1484,6 +1484,17 @@ fn new_server_job(launch: &mut McpSandboxLaunch) -> Option<winjob::Job> {
     }
 }
 
+/// `job` once the process `handle` is in it, else `None`: an empty job would end
+/// nothing, yet terminating it succeeds, so [`kill_server_tree`] would skip the
+/// `taskkill /T` that ends the tree of an uncontained server.
+#[cfg(windows)]
+fn assigned_job(
+    job: winjob::Job,
+    handle: Option<std::os::windows::io::RawHandle>,
+) -> Option<winjob::Job> {
+    job.assign_raw(handle?).ok().map(|()| job)
+}
+
 /// The job object type a server's tree is held in; nothing outside Windows.
 #[cfg(windows)]
 type ServerJob = winjob::Job;
@@ -1491,7 +1502,7 @@ type ServerJob = winjob::Job;
 type ServerJob = ();
 
 /// Ends a server and the processes it started. With a job object (Windows) the job
-/// ends the whole tree at once. Without one, a server launched as `cmd.exe /c npx â€¦`
+/// ends the whole tree at once. Without one, a server launched as `cmd.exe /c npx …`
 /// runs in node grandchildren in their own console, which killing `cmd.exe` would leave
 /// running, so `taskkill /T` ends them.
 ///
@@ -1528,22 +1539,27 @@ impl McpStdioProcess {
         let mut command = stdio_server_command(transport, &launch, suspended);
         let mut child = command.spawn()?;
         #[cfg(windows)]
-        if let Some(job) = &job {
-            // A failed assignment leaves the server running uncontained (taskkill still
-            // ends its tree); a failed resume leaves it suspended, so it is killed.
-            if let Some(handle) = child.raw_handle() {
-                let _ = job.assign_raw(handle);
+        let job = match job {
+            Some(job) => {
+                // A failed assignment drops the job, so stopping the server falls back to
+                // `taskkill /T` for its tree; a failed resume leaves it suspended, so it
+                // is killed.
+                let job = assigned_job(job, child.raw_handle());
+                let resumed = child
+                    .id()
+                    .ok_or_else(|| io::Error::other("the MCP server exited before it started"))
+                    .and_then(winjob::resume_process);
+                if let Err(error) = resumed {
+                    if let Some(job) = &job {
+                        let _ = job.terminate(1);
+                    }
+                    let _ = child.start_kill();
+                    return Err(error);
+                }
+                job
             }
-            let resumed = child
-                .id()
-                .ok_or_else(|| io::Error::other("the MCP server exited before it started"))
-                .and_then(winjob::resume_process);
-            if let Err(error) = resumed {
-                let _ = job.terminate(1);
-                let _ = child.start_kill();
-                return Err(error);
-            }
-        }
+            None => None,
+        };
         let stdin = child
             .stdin
             .take()
@@ -4079,6 +4095,39 @@ mod tests {
             pids.iter().all(|pid| !process_alive(*pid)),
             "the job ends the tree: {pids:?}"
         );
+    }
+
+    /// A job the server could not be put in is dropped, so stopping the server falls
+    /// back to `taskkill /T` instead of terminating an empty job.
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_job_assignment_leaves_no_job() {
+        use std::os::windows::io::AsRawHandle;
+        let job = || winjob::Job::new(&winjob::JobLimits::default()).expect("a job");
+        assert!(
+            super::assigned_job(job(), None).is_none(),
+            "no process handle"
+        );
+        assert!(
+            super::assigned_job(job(), Some(std::ptr::null_mut())).is_none(),
+            "a handle that is not a process"
+        );
+
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "ping -n 30 127.0.0.1 >NUL"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("start cmd.exe");
+        let contained = super::assigned_job(job(), Some(child.as_raw_handle()));
+        let pids = contained
+            .as_ref()
+            .expect("a live process goes in the job")
+            .process_ids()
+            .expect("list the job");
+        assert!(pids.contains(&child.id()), "{pids:?}");
+        drop(contained);
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     /// Starts the bundled Playwright and Codebase memory servers as the settings loader
