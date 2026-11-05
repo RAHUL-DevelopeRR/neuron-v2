@@ -191,7 +191,10 @@ its environment or its headers. A secret is bound to the URL, or the command and
 arguments, it was added for: a settings file that later points a server of the same
 name somewhere else does not get it. `remove` deletes the server's keychain secrets and, for a remote server,
 its sign-in. A connector added again with the same settings stores its secrets again,
-which is how you replace a token.
+which is how you replace a token. Secrets and sign-ins are kept per server name, so a
+name can be added in one scope only (use `--name` for a second copy); if a settings
+file already holds the same name in another scope, `remove` keeps what that server
+still uses.
 
 A stdio entry is written with the launch command for the system you add it on
 (`cmd.exe /d /s /c npx ...` on Windows, `npx ...` elsewhere); both count as the

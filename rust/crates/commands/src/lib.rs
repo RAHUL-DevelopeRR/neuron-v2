@@ -4204,6 +4204,12 @@ impl McpChange {
                 if outcome.signed_out {
                     lines.push("  Signed out       its sign-in was forgotten".to_string());
                 }
+                if let Some(scope) = outcome.still_used_by {
+                    lines.push(format!(
+                        "  Kept             the secrets and sign-in the {} server of that name still uses",
+                        scope.as_str()
+                    ));
+                }
                 lines.push("  Takes effect     from the next turn".to_string());
                 lines.join("\n")
             }
@@ -4265,6 +4271,7 @@ impl McpChange {
                     "settings_path": outcome.settings_path.display().to_string(),
                     "secrets_deleted": outcome.secrets_deleted,
                     "signed_out": outcome.signed_out,
+                    "still_used_by": outcome.still_used_by.map(runtime::McpInstallScope::as_str),
                 }),
             },
         }

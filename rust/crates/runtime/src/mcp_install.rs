@@ -221,6 +221,9 @@ impl McpInstallScope {
         }
     }
 
+    /// The scopes Neuron writes, in the order `remove` looks for a server.
+    const ALL: [Self; 3] = [Self::Local, Self::Project, Self::User];
+
     fn of(source: ConfigSource) -> Option<Self> {
         match source {
             ConfigSource::User => Some(Self::User),
@@ -366,6 +369,17 @@ fn install_from_catalog(
             ))
         }
     };
+    // Secrets and sign-ins are kept per server name, not per scope: a second server of
+    // the same name in another scope would replace this one's, and removing either
+    // would sign the other out.
+    if let Some((other, _)) = entries_in_other_scopes(loader, &name, scope).first() {
+        return Err(format!(
+            "an MCP server named `{name}` is already in the {} settings ({}); remove it there first (/mcp remove {name} --scope {}) or choose another name with --name",
+            other.as_str(),
+            other.settings_path(loader).display(),
+            other.as_str()
+        ));
+    }
     let already = match servers.get(&name) {
         Some(existing) if *existing == written => true,
         Some(_) => {
@@ -452,6 +466,9 @@ pub struct McpRemoveOutcome {
     pub secrets_deleted: Vec<String>,
     /// A remote server: its OAuth tokens were forgotten too.
     pub signed_out: bool,
+    /// Another scope still configures a server of this name, so the secrets and the
+    /// sign-in it uses were kept.
+    pub still_used_by: Option<McpInstallScope>,
 }
 
 /// Removes the server `name` from a settings file Neuron writes (the one for `scope`, or
@@ -469,11 +486,7 @@ pub fn remove_mcp_server(
     }
     let scopes = match scope {
         Some(scope) => vec![scope],
-        None => vec![
-            McpInstallScope::Local,
-            McpInstallScope::Project,
-            McpInstallScope::User,
-        ],
+        None => McpInstallScope::ALL.to_vec(),
     };
     for scope in scopes.iter().copied() {
         let path = scope.settings_path(loader);
@@ -490,15 +503,35 @@ pub fn remove_mcp_server(
             object.insert("mcpServers".to_string(), Value::Object(servers));
         }
         write_object(&path, &object)?;
-        return Ok(forget_credentials(name, &removed, path));
+        let remaining = entries_in_other_scopes(loader, name, scope);
+        return Ok(forget_credentials(name, &removed, &remaining, path));
     }
     Err(remove_refusal(loader, name, scope))
 }
 
-fn forget_credentials(name: &str, removed: &Value, settings_path: PathBuf) -> McpRemoveOutcome {
+/// The servers named `name` in the settings of the scopes other than `except`, which
+/// share its keychain entries. An unreadable file counts as not configuring it.
+fn entries_in_other_scopes(
+    loader: &ConfigLoader,
+    name: &str,
+    except: McpInstallScope,
+) -> Vec<(McpInstallScope, Value)> {
+    McpInstallScope::ALL
+        .into_iter()
+        .filter(|scope| *scope != except)
+        .filter_map(|scope| {
+            let object = read_object(&scope.settings_path(loader)).ok()?;
+            let entry = object.get("mcpServers")?.get(name)?.clone();
+            Some((scope, entry))
+        })
+        .collect()
+}
+
+/// The `${secret:NAME}` references in a settings entry's environment and headers.
+fn entry_secret_references(entry: &Value) -> Vec<String> {
     let mut secrets = Vec::new();
     for key in ["env", "headers"] {
-        if let Some(Value::Object(values)) = removed.get(key) {
+        if let Some(Value::Object(values)) = entry.get(key) {
             for value in values.values().filter_map(Value::as_str) {
                 for secret in mcp_secret_references(value) {
                     if !secrets.contains(&secret) {
@@ -508,17 +541,36 @@ fn forget_credentials(name: &str, removed: &Value, settings_path: PathBuf) -> Mc
             }
         }
     }
-    let secrets_deleted = secrets
+    secrets
+}
+
+/// Deletes the secrets `removed` referred to and, for a remote server, its sign-in,
+/// except what a server of the same name in another scope (`remaining`) still uses.
+fn forget_credentials(
+    name: &str,
+    removed: &Value,
+    remaining: &[(McpInstallScope, Value)],
+    settings_path: PathBuf,
+) -> McpRemoveOutcome {
+    let still_used = remaining
+        .iter()
+        .flat_map(|(_, entry)| entry_secret_references(entry))
+        .collect::<Vec<_>>();
+    let secrets_deleted = entry_secret_references(removed)
         .into_iter()
+        .filter(|secret| !still_used.contains(secret))
         .filter(|secret| delete_mcp_secret(name, secret).is_ok())
         .collect();
-    let remote = removed.get("url").is_some();
-    let signed_out = remote && crate::mcp_oauth::clear_mcp_tokens(name).is_ok();
+    let remote = |entry: &Value| entry.get("url").is_some();
+    let signed_out = remote(removed)
+        && !remaining.iter().any(|(_, entry)| remote(entry))
+        && crate::mcp_oauth::clear_mcp_tokens(name).is_ok();
     McpRemoveOutcome {
         name: name.to_string(),
         settings_path,
         secrets_deleted,
         signed_out,
+        still_used_by: remaining.first().map(|(scope, _)| *scope),
     }
 }
 
@@ -813,6 +865,89 @@ mod tests {
             "approved, so it loads"
         );
         assert!(config.mcp().needs_approval().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Secrets and sign-ins are kept per name: one name in two scopes would share them.
+    /// Adding it in a second scope is refused, and removing one of two that the settings
+    /// already hold keeps what the other still uses.
+    #[test]
+    fn a_name_in_two_scopes_is_refused_and_removing_one_keeps_the_others_secret() {
+        use crate::mcp_oauth::{mcp_token_key, save_mcp_tokens, token_store, McpOAuthTokens};
+
+        install_memory_store();
+        let root = temp_root("two-scopes");
+        let loader = loader(&root, ProjectTrust::Trusted);
+        let user = install_mcp_server(
+            &loader,
+            &github("gh-both", "ghp_user_1", Some(McpInstallScope::User)),
+        )
+        .expect("user add");
+        let refused = install_mcp_server(
+            &loader,
+            &github("gh-both", "ghp_project_2", Some(McpInstallScope::Project)),
+        )
+        .unwrap_err();
+        assert!(refused.contains("already in the user settings"), "{refused}");
+        assert!(refused.contains("--name"), "{refused}");
+        assert_eq!(
+            load_mcp_secret("gh-both", "GITHUB_PERSONAL_ACCESS_TOKEN").unwrap(),
+            Some("ghp_user_1".to_string()),
+            "the user server's token is not replaced"
+        );
+        assert!(!root.join("repo").join(".neuron").exists());
+
+        // The same entry in the project settings too, written by hand or an older build.
+        let project_settings = root.join("repo").join(".neuron").join("settings.json");
+        fs::create_dir_all(project_settings.parent().unwrap()).unwrap();
+        fs::write(
+            &project_settings,
+            fs::read_to_string(&user.settings_path).unwrap(),
+        )
+        .unwrap();
+        save_mcp_tokens(
+            "gh-both",
+            &McpOAuthTokens {
+                access_token: "oauth-access".to_string(),
+                refresh_token: None,
+                expires_at: None,
+                token_endpoint: "https://example.com/token".to_string(),
+                client_id: "client".to_string(),
+                client_secret: None,
+                resource: "https://api.githubcopilot.com/mcp".to_string(),
+                scope: None,
+            },
+        )
+        .unwrap();
+        let signed_in = || {
+            token_store()
+                .unwrap()
+                .load(&mcp_token_key("gh-both"))
+                .unwrap()
+                .is_some()
+        };
+
+        let removed = remove_mcp_server(&loader, "gh-both", Some(McpInstallScope::Project))
+            .expect("remove the project one");
+        assert!(removed.secrets_deleted.is_empty(), "{removed:?}");
+        assert!(!removed.signed_out);
+        assert_eq!(removed.still_used_by, Some(McpInstallScope::User));
+        assert_eq!(
+            load_mcp_secret("gh-both", "GITHUB_PERSONAL_ACCESS_TOKEN").unwrap(),
+            Some("ghp_user_1".to_string()),
+            "the user server still starts"
+        );
+        assert!(signed_in());
+
+        let last = remove_mcp_server(&loader, "gh-both", None).expect("remove the user one");
+        assert_eq!(last.secrets_deleted, vec!["GITHUB_PERSONAL_ACCESS_TOKEN"]);
+        assert!(last.signed_out);
+        assert_eq!(last.still_used_by, None);
+        assert_eq!(
+            load_mcp_secret("gh-both", "GITHUB_PERSONAL_ACCESS_TOKEN").unwrap(),
+            None
+        );
+        assert!(!signed_in());
         let _ = fs::remove_dir_all(root);
     }
 

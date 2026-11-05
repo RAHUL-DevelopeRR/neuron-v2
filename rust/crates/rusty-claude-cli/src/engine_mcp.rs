@@ -140,6 +140,12 @@ fn mcp_change_notice(loader: &ConfigLoader, command: EngineCommand) -> Option<Ui
                         outcome.secrets_deleted.join(", ")
                     ));
                 }
+                if let Some(scope) = outcome.still_used_by {
+                    message.push_str(&format!(
+                        "; kept the secrets and sign-in the {} server of that name still uses",
+                        scope.as_str()
+                    ));
+                }
                 message.push('.');
                 notice(message)
             }
