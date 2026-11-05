@@ -4477,6 +4477,86 @@ mod tests {
         assert_eq!(mcp_start_watch(true, false), (false, true));
     }
 
+    /// The engine itself: while an MCP server starts in the background, the idle engine
+    /// looks every `MCP_START_POLL` and sends the extensions once the start ended, with
+    /// no `ListExtensions` asked.
+    #[test]
+    fn an_idle_engine_sends_the_extensions_once_a_background_mcp_start_ends() {
+        /// Puts the process's MCP startup back to the default on drop.
+        struct WaitAgain;
+        impl Drop for WaitAgain {
+            fn drop(&mut self) {
+                crate::progress::set_mcp_startup(crate::progress::McpStartup::Wait);
+            }
+        }
+
+        let _env = env_lock();
+        let workspace = unique_dir("mcp-watch");
+        let config_home = unique_dir("mcp-watch-config");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::create_dir_all(&config_home).expect("config home");
+        // A server that says nothing for a few seconds, then exits: its start ends,
+        // failed, after the engine is serving.
+        let (command, args) = if cfg!(windows) {
+            ("cmd", vec!["/c", "ping -n 4 127.0.0.1 >nul"])
+        } else {
+            ("sh", vec!["-c", "sleep 3"])
+        };
+        fs::write(
+            config_home.join("settings.json"),
+            serde_json::json!({
+                "defaultMcpServers": false,
+                "mcpServers": {"slow": {"command": command, "args": args}}
+            })
+            .to_string(),
+        )
+        .expect("settings");
+        let vars = EnvVars::set(&[
+            ("ANTHROPIC_API_KEY", Some(OsStr::new("test-engine-key"))),
+            ("ANTHROPIC_AUTH_TOKEN", None),
+            // No turn runs: nothing is sent here.
+            ("ANTHROPIC_BASE_URL", Some(OsStr::new("http://127.0.0.1:9"))),
+            ("NEURON_CONFIG_HOME", Some(config_home.as_os_str())),
+            ("NEURON_HOME", Some(config_home.as_os_str())),
+            ("NEURON_CREDENTIAL_STORE", Some(OsStr::new("file"))),
+            ("NEURON_TOKEN", None),
+        ]);
+        // As `neuron engine` starts them (engine_stdio.rs).
+        crate::progress::set_mcp_startup(crate::progress::McpStartup::Background);
+        let wait_again = WaitAgain;
+
+        with_current_dir(&workspace, || {
+            let engine = spawn(EngineOptions {
+                model: "claude-sonnet-4-6".to_string(),
+                allowed_tools: None,
+                permission_mode: PermissionMode::WorkspaceWrite,
+                reasoning_effort: None,
+                resume: None,
+                signed_out: None,
+            })
+            .expect("the engine starts");
+            // No command is sent: the server list arrives on its own once the start ended.
+            let slow_status = |event: &UiEvent| match event {
+                UiEvent::Extensions { mcp_servers, .. } => mcp_servers
+                    .iter()
+                    .find(|server| server.name == "slow")
+                    .map(|server| server.status.clone()),
+                _ => None,
+            };
+            let seen = events_until(&engine.events, |event| {
+                slow_status(event).is_some_and(|status| status != "starting")
+            });
+            let ended = slow_status(seen.last().expect("an event")).expect("the slow server");
+            assert_eq!(ended, "failed", "{seen:?}");
+            assert_eq!(engine.finish(), EngineExit::Shutdown);
+        });
+
+        drop(wait_again);
+        drop(vars);
+        let _ = fs::remove_dir_all(&workspace);
+        let _ = fs::remove_dir_all(&config_home);
+    }
+
     #[test]
     fn a_hosted_connector_needs_connect_while_the_gateway_says_it_is_not_linked() {
         let hosted = runtime::ScopedMcpServerConfig {
