@@ -2,8 +2,9 @@
 //! start each, the variables and secrets it needs, and the permission tier of each of
 //! its tools. The catalog is compiled in (`mcp-catalog/catalog.json`; what was checked
 //! is in `mcp-catalog/SOURCES.md`) and trusted because it ships in the binary. An
-//! update the gateway serves is accepted only with a valid ed25519 signature
-//! ([`verify_mcp_catalog_update`]).
+//! update the gateway serves is accepted only with a valid ed25519 signature and a
+//! version newer than the catalog in use ([`verify_mcp_catalog_update`]). Nothing
+//! fetches updates yet: the gateway serves them with hosted connectors (P5).
 //!
 //! A configured server counts as a catalog server only when its launch spec is exactly
 //! what the catalog entry writes ([`McpCatalog::entry_for_config`]), so a settings file
@@ -485,16 +486,42 @@ impl McpCatalogEntry {
 }
 
 /// Verifies a catalog update the gateway serves: `signature_hex` is the ed25519
-/// signature (hex) of exactly `body`, by [`MCP_CATALOG_UPDATE_PUBLIC_KEY`]. Refused while
-/// that key is unset.
-pub fn verify_mcp_catalog_update(body: &[u8], signature_hex: &str) -> Result<McpCatalog, String> {
-    verify_mcp_catalog_update_with(MCP_CATALOG_UPDATE_PUBLIC_KEY.as_ref(), body, signature_hex)
+/// signature (hex) of exactly `body`, by [`MCP_CATALOG_UPDATE_PUBLIC_KEY`], and the
+/// catalog's version is newer than `current_version` (the catalog in use), so an older
+/// signed catalog cannot be served again to roll entries back. Refused while the key is
+/// unset.
+pub fn verify_mcp_catalog_update(
+    body: &[u8],
+    signature_hex: &str,
+    current_version: &str,
+) -> Result<McpCatalog, String> {
+    verify_mcp_catalog_update_with(
+        MCP_CATALOG_UPDATE_PUBLIC_KEY.as_ref(),
+        body,
+        signature_hex,
+        current_version,
+    )
+}
+
+/// A catalog version, `YYYY-MM-DD.N`, as something to compare: the date, then `N`.
+fn catalog_version_order(version: &str) -> Option<(&str, u32)> {
+    let (date, serial) = version.split_once('.')?;
+    let well_formed = date.len() == 10
+        && date.char_indices().all(|(index, c)| match index {
+            4 | 7 => c == '-',
+            _ => c.is_ascii_digit(),
+        });
+    if !well_formed || serial.is_empty() || !serial.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((date, serial.parse().ok()?))
 }
 
 fn verify_mcp_catalog_update_with(
     public_key: Option<&[u8; 32]>,
     body: &[u8],
     signature_hex: &str,
+    current_version: &str,
 ) -> Result<McpCatalog, String> {
     let Some(public_key) = public_key else {
         return Err(
@@ -508,7 +535,21 @@ fn verify_mcp_catalog_update_with(
         .verify(body, &signature)
         .map_err(|_| "the catalog signature does not match".to_string())?;
     let text = std::str::from_utf8(body).map_err(|_| "the catalog is not UTF-8".to_string())?;
-    McpCatalog::parse(text)
+    let catalog = McpCatalog::parse(text)?;
+    let current = catalog_version_order(current_version).ok_or_else(|| {
+        format!("the catalog in use has no comparable version ({current_version})")
+    })?;
+    match catalog_version_order(&catalog.version) {
+        Some(update) if update > current => Ok(catalog),
+        Some(_) => Err(format!(
+            "the catalog update {} is not newer than the catalog in use ({current_version})",
+            catalog.version
+        )),
+        None => Err(format!(
+            "the catalog update's version {} is not YYYY-MM-DD.N",
+            catalog.version
+        )),
+    }
 }
 
 fn decode_hex(text: &str) -> Option<Vec<u8>> {
@@ -786,20 +827,46 @@ mod tests {
         let public: [u8; 32] = pair.public_key().as_ref().try_into().unwrap();
         let body = BUILTIN_CATALOG_JSON.as_bytes();
         let signature = encode_hex(pair.sign(body).as_ref());
+        let older = "2026-01-01.1";
 
-        let catalog = verify_mcp_catalog_update_with(Some(&public), body, &signature).unwrap();
+        let catalog =
+            verify_mcp_catalog_update_with(Some(&public), body, &signature, older).unwrap();
         assert_eq!(&catalog, McpCatalog::builtin());
 
         let mut altered = body.to_vec();
         altered[10] ^= 1;
         assert!(
-            verify_mcp_catalog_update_with(Some(&public), &altered, &signature)
+            verify_mcp_catalog_update_with(Some(&public), &altered, &signature, older)
                 .unwrap_err()
                 .contains("does not match")
         );
-        assert!(verify_mcp_catalog_update_with(Some(&public), body, "abcd").is_err());
-        assert!(verify_mcp_catalog_update(body, &signature)
+        assert!(verify_mcp_catalog_update_with(Some(&public), body, "abcd", older).is_err());
+        assert!(verify_mcp_catalog_update(body, &signature, older)
             .unwrap_err()
             .contains("no catalog signing key"));
+
+        // A validly signed catalog that is not newer is a rollback.
+        let current = McpCatalog::builtin().version.as_str();
+        for in_use in [current, "2026-11-04.2", "2027-01-01.1"] {
+            let error = verify_mcp_catalog_update_with(Some(&public), body, &signature, in_use)
+                .unwrap_err();
+            assert!(error.contains("is not newer"), "{in_use}: {error}");
+        }
+        let unversioned = McpCatalog {
+            version: "latest".to_string(),
+            ..McpCatalog::builtin().clone()
+        };
+        let unversioned = serde_json::to_vec(&unversioned).unwrap();
+        let signed = encode_hex(pair.sign(&unversioned).as_ref());
+        assert!(
+            verify_mcp_catalog_update_with(Some(&public), &unversioned, &signed, older)
+                .unwrap_err()
+                .contains("YYYY-MM-DD.N")
+        );
+        assert!(
+            super::catalog_version_order("2026-11-04.10")
+                > super::catalog_version_order("2026-11-04.9")
+        );
+        assert!(super::catalog_version_order("2026-11-4.1").is_none());
     }
 }

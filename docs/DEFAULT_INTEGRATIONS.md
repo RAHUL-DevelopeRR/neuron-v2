@@ -210,9 +210,11 @@ pinned for now. A settings entry counts as a catalog connector, with its pinned 
 only when its command and arguments (or URL and headers) are exactly what the catalog
 writes and it sets no other environment variable or header.
 
-Catalog updates served by the gateway must carry an ed25519 signature; until this
-build has the signing key, every update is refused and the compiled-in catalog is
-used.
+Catalog updates served by the gateway must carry an ed25519 signature and a version
+(`YYYY-MM-DD.N`) newer than the catalog in use, so an older signed catalog cannot be
+served again; until this build has the signing key, every update is refused and the
+compiled-in catalog is used. This build does not fetch updates yet: the gateway will
+serve them with hosted connectors.
 
 ### Serving Neuron's tools over MCP
 
