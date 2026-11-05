@@ -6401,6 +6401,51 @@ mod tests {
             );
         }
 
+        // `/mcp add github --scope user` with the token in the environment, then
+        // `/mcp list`: github is configured and ready (a user server waits for no
+        // approval), and the settings hold only the reference.
+        let earlier_token = std::env::var_os("GITHUB_PERSONAL_ACCESS_TOKEN");
+        let github_sentinel = "ghp_SENTINEL_commands_list";
+        std::env::set_var("GITHUB_PERSONAL_ACCESS_TOKEN", github_sentinel);
+        let added =
+            super::render_mcp_report_for(&loader, &workspace, Some("add github --scope user"))
+                .expect("add github");
+        match earlier_token {
+            Some(token) => std::env::set_var("GITHUB_PERSONAL_ACCESS_TOKEN", token),
+            None => std::env::remove_var("GITHUB_PERSONAL_ACCESS_TOKEN"),
+        }
+        assert!(
+            added.contains("Added            github (https://api.githubcopilot.com/mcp/)"),
+            "{added}"
+        );
+        let settings = fs::read_to_string(config_home.join("settings.json")).expect("settings");
+        assert!(!settings.contains(github_sentinel), "{settings}");
+        let list = super::render_mcp_report_for(&loader, &workspace, Some("list")).expect("list");
+        assert!(
+            list.lines()
+                .any(|line| line.trim_start().starts_with("github ")
+                    && line.contains("https://api.githubcopilot.com/mcp/")),
+            "{list}"
+        );
+        assert!(!list.contains("needs approval"), "{list}");
+        let list_json =
+            super::render_mcp_report_json_for(&loader, &workspace, None).expect("list json");
+        assert!(
+            list_json["servers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|server| server["name"] == "github"),
+            "{list_json}"
+        );
+        assert_eq!(list_json["needs_approval_servers"], serde_json::json!([]));
+        assert_eq!(
+            runtime::load_mcp_secret("github", "GITHUB_PERSONAL_ACCESS_TOKEN").unwrap(),
+            Some(github_sentinel.to_string())
+        );
+        super::render_mcp_report_for(&loader, &workspace, Some("remove github"))
+            .expect("remove github");
+
         let removed =
             super::render_mcp_report_json_for(&loader, &workspace, Some("remove context7"))
                 .expect("remove");
@@ -6440,12 +6485,9 @@ mod tests {
         assert_eq!(json["ok"], true, "{json}");
         assert_eq!(json["already"], false, "{json}");
 
-        let (text, json) = super::render_mcp_report_with_json_for(
-            &loader,
-            &workspace,
-            Some("disable fetch"),
-        )
-        .expect("disable");
+        let (text, json) =
+            super::render_mcp_report_with_json_for(&loader, &workspace, Some("disable fetch"))
+                .expect("disable");
         assert!(text.contains("fetch is now disabled"), "{text}");
         assert_eq!(json["changed"], true, "{json}");
 

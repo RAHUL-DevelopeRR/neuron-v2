@@ -1021,11 +1021,13 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// The acceptance flow on a fake remote server: add with a token, the server starts
-    /// with its tools and gets the token as a header, the settings file never holds it,
-    /// and removing the server deletes the keychain entry.
+    /// The acceptance flow with the shipped `github` entry, its URL pointed at a fake
+    /// server (the only change): `add github --scope user` stores the token in the
+    /// keychain and only a reference in settings, the server is ready (no approval to
+    /// wait for) and starts with its tools, gets the token as a header, and removing it
+    /// deletes the keychain entry.
     #[test]
-    fn an_added_connector_starts_with_its_tools_using_the_keychain_secret() {
+    fn an_added_github_connector_starts_with_its_tools_using_the_keychain_secret() {
         use std::sync::Arc;
 
         use crate::mcp_catalog::McpCatalog;
@@ -1037,57 +1039,60 @@ mod tests {
             if request.method != "POST" {
                 return FakeResponse::status(405);
             }
-            match mcp_reply(&request.json()) {
+            let message = request.json();
+            if message.get("method").and_then(serde_json::Value::as_str) == Some("tools/list") {
+                return FakeResponse::json(
+                    200,
+                    &serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": message["id"],
+                        "result": {"tools": [
+                            {"name": "get_me", "inputSchema": {"type": "object"}},
+                            {"name": "merge_pull_request", "inputSchema": {"type": "object"}}
+                        ]}
+                    }),
+                );
+            }
+            match mcp_reply(&message) {
                 None => FakeResponse::status(202),
                 Some(reply) => FakeResponse::json(200, &reply),
             }
         }));
-        let catalog = McpCatalog::parse(
-            &serde_json::json!({
-                "version": "test",
-                "connectors": [{
-                    "id": "fakehub",
-                    "name": "Fake hub",
-                    "description": "test",
-                    "publisher": "test",
-                    "licence": "MIT",
-                    "source": "https://example.com",
-                    "transport": "http",
-                    "install": {
-                        "kind": "remote",
-                        "url": format!("{}/mcp", server.url),
-                        "headers": {"Authorization": "Bearer ${secret:FAKEHUB_TOKEN}"}
-                    },
-                    "env": [{"name": "FAKEHUB_TOKEN", "label": "token", "secret": true, "required": true}],
-                    "tools": {"echo": "read"},
-                    "default_tier": "external"
-                }]
-            })
-            .to_string(),
-        )
-        .unwrap();
+        let mut entry = McpCatalog::builtin().get("github").unwrap().clone();
+        entry.install.url = Some(format!("{}/mcp/", server.url));
+        let catalog = McpCatalog {
+            version: "test".to_string(),
+            connectors: vec![entry],
+        };
         let root = temp_root("e2e");
         let loader = loader(&root, ProjectTrust::Trusted);
-        let sentinel = "fakehub_SENTINEL_e2e_3";
-        let request = McpInstallRequest {
-            id: "fakehub".to_string(),
-            name: None,
-            scope: Some(McpInstallScope::User),
-            values: BTreeMap::from([("FAKEHUB_TOKEN".to_string(), sentinel.to_string())]),
-        };
+        let sentinel = "ghp_SENTINEL_e2e_3";
+        let mut request = github("github", sentinel, Some(McpInstallScope::User));
+        request.name = None;
         let outcome = super::install_from_catalog(&loader, &catalog, &request).expect("add");
-        assert!(!fs::read_to_string(&outcome.settings_path)
-            .unwrap()
-            .contains(sentinel));
+        assert_eq!(outcome.name, "github");
+        assert_eq!(
+            outcome.settings_path,
+            root.join("home").join("settings.json")
+        );
+        let written = fs::read_to_string(&outcome.settings_path).unwrap();
+        assert!(!written.contains(sentinel), "{written}");
+        assert!(written.contains("${secret:GITHUB_PERSONAL_ACCESS_TOKEN}"));
+        assert_eq!(
+            load_mcp_secret("github", "GITHUB_PERSONAL_ACCESS_TOKEN").unwrap(),
+            Some(sentinel.to_string())
+        );
 
         let config = loader.load().unwrap();
+        assert!(config.mcp().needs_approval().is_empty());
         let servers = config
             .mcp()
             .servers()
             .iter()
-            .filter(|(name, _)| *name == "fakehub")
+            .filter(|(name, _)| *name == "github")
             .map(|(name, server)| (name.clone(), server.clone()))
-            .collect();
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(servers.len(), 1, "github is ready");
         let mut manager = McpServerManager::from_servers(&servers);
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let report = runtime.block_on(manager.discover_tools_best_effort());
@@ -1102,7 +1107,7 @@ mod tests {
                 .iter()
                 .map(|tool| tool.qualified_name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["mcp__fakehub__echo"]
+            vec!["mcp__github__get_me", "mcp__github__merge_pull_request"]
         );
         runtime.block_on(manager.shutdown()).unwrap();
         let expected = format!("Bearer {sentinel}");
@@ -1116,8 +1121,11 @@ mod tests {
             .iter()
             .all(|request| request.header("authorization") == Some(expected.as_str())));
 
-        remove_mcp_server(&loader, "fakehub", None).expect("remove");
-        assert_eq!(load_mcp_secret("fakehub", "FAKEHUB_TOKEN").unwrap(), None);
+        remove_mcp_server(&loader, "github", None).expect("remove");
+        assert_eq!(
+            load_mcp_secret("github", "GITHUB_PERSONAL_ACCESS_TOKEN").unwrap(),
+            None
+        );
         let _ = fs::remove_dir_all(root);
     }
 
