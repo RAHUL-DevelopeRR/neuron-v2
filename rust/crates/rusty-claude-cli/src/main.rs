@@ -53,6 +53,7 @@ mod device_login;
 mod doctor;
 mod engine;
 mod engine_account;
+mod engine_mcp;
 mod engine_reports;
 mod engine_stdio;
 mod engine_trust;

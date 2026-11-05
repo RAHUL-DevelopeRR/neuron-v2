@@ -413,6 +413,16 @@ impl SignedOut<'_> {
                         self.send(event);
                     }
                 }
+                EngineCommand::ListConnectorCatalog { query } => {
+                    self.send(crate::engine_mcp::connector_catalog_event(&query));
+                }
+                command @ (EngineCommand::AddMcpServer { .. }
+                | EngineCommand::RemoveMcpServer { .. }
+                | EngineCommand::ApproveMcpServer { .. }) => {
+                    for event in crate::engine_mcp::mcp_change_events(command) {
+                        self.send(event);
+                    }
+                }
                 EngineCommand::RefreshAccount => self.send_account(),
                 EngineCommand::TrustPreview => self.send(engine_trust::trust_preview_event(
                     &env::current_dir().unwrap_or_default(),
@@ -740,7 +750,7 @@ fn trust_workspace_events() -> Vec<UiEvent> {
 /// `ListExtensions`: the configured MCP servers with what each is doing now, the
 /// plugins, and the skills and agent definitions this workspace sees. A server's
 /// command, arguments, environment and headers are left out: they can hold secrets.
-fn extensions_event() -> UiEvent {
+pub(crate) fn extensions_event() -> UiEvent {
     let cwd = env::current_dir().unwrap_or_default();
     let loader = ConfigLoader::default_for(&cwd);
     let config = loader.load();
@@ -763,6 +773,7 @@ fn extensions_event() -> UiEvent {
                             tools,
                             error,
                             enabled: true,
+                            catalog: catalog_id(server),
                         }
                     })
                     .collect();
@@ -775,6 +786,7 @@ fn extensions_event() -> UiEvent {
                         tools: Vec::new(),
                         error: None,
                         enabled: false,
+                        catalog: catalog_id(server),
                     }
                 }));
                 // Configured and switched on, but not started: waiting for approval, or
@@ -808,6 +820,7 @@ fn extensions_event() -> UiEvent {
                         tools: Vec::new(),
                         error: Some(why),
                         enabled: true,
+                        catalog: catalog_id(server),
                     }),
                 );
                 servers.sort_by(|left, right| left.name.cmp(&right.name));
@@ -850,6 +863,15 @@ fn extensions_event() -> UiEvent {
             "agents",
         ),
     }
+}
+
+/// The catalog connector a configured server was added from (see
+/// `runtime::mcp_catalog_entry_for`); bundled servers are Neuron's own.
+fn catalog_id(server: &runtime::ScopedMcpServerConfig) -> Option<String> {
+    if server.scope == runtime::ConfigSource::Bundled {
+        return None;
+    }
+    runtime::mcp_catalog_entry_for(&server.config).map(|entry| entry.id.clone())
 }
 
 /// `SetMcpServerEnabled`: switches the server in the user settings (see
@@ -1631,6 +1653,16 @@ impl Engine {
             EngineCommand::ListExtensions => self.send(extensions_event()),
             EngineCommand::SetMcpServerEnabled { name, enabled } => {
                 for event in mcp_toggle_events(&name, enabled) {
+                    self.send(event);
+                }
+            }
+            EngineCommand::ListConnectorCatalog { query } => {
+                self.send(crate::engine_mcp::connector_catalog_event(&query));
+            }
+            command @ (EngineCommand::AddMcpServer { .. }
+            | EngineCommand::RemoveMcpServer { .. }
+            | EngineCommand::ApproveMcpServer { .. }) => {
+                for event in crate::engine_mcp::mcp_change_events(command) {
                     self.send(event);
                 }
             }

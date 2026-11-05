@@ -111,6 +111,10 @@ fn run(
             | EngineCommand::TrustWorkspace
             | EngineCommand::ListExtensions
             | EngineCommand::SetMcpServerEnabled { .. }
+            | EngineCommand::ListConnectorCatalog { .. }
+            | EngineCommand::AddMcpServer { .. }
+            | EngineCommand::RemoveMcpServer { .. }
+            | EngineCommand::ApproveMcpServer { .. }
             | EngineCommand::TrustPreview
             | EngineCommand::RefreshAccount
             | EngineCommand::Commit { .. }
@@ -130,10 +134,10 @@ fn run(
 /// answer function that plays them.
 pub mod samples {
     use crate::protocol::{
-        AccountDetails, ClientMessage, EngineCommand, ErrorDetail, GitStatus, HookPreview,
-        McpServerPreview, ModelInfo, PermissionRulePreview, ReportLink, ReportSection,
-        SessionRunStatus, SessionScope, SessionSummary, UiEvent, UsageAmounts, UsageWindow,
-        CAPABILITY_QUESTIONS, CAPABILITY_REPORTS,
+        AccountDetails, ClientMessage, ConnectorInfo, ConnectorVariable, EngineCommand,
+        ErrorDetail, GitStatus, HookPreview, McpServerPreview, ModelInfo, PermissionRulePreview,
+        ReportLink, ReportSection, SessionRunStatus, SessionScope, SessionSummary, UiEvent,
+        UsageAmounts, UsageWindow, CAPABILITY_QUESTIONS, CAPABILITY_REPORTS,
     };
 
     /// The workspace the samples run in.
@@ -149,6 +153,7 @@ pub mod samples {
             EngineCommand::TrustWorkspace => vec![workspace_trusted(), status(true)],
             EngineCommand::RefreshAccount => vec![account()],
             EngineCommand::ListModels => vec![models()],
+            EngineCommand::ListConnectorCatalog { .. } => vec![connector_catalog()],
             EngineCommand::Slash { command, .. } => {
                 let name = command.trim().trim_start_matches('/');
                 let first = match name {
@@ -170,6 +175,9 @@ pub mod samples {
             | EngineCommand::Resume { .. }
             | EngineCommand::ListExtensions
             | EngineCommand::SetMcpServerEnabled { .. }
+            | EngineCommand::AddMcpServer { .. }
+            | EngineCommand::RemoveMcpServer { .. }
+            | EngineCommand::ApproveMcpServer { .. }
             | EngineCommand::Commit { .. }
             | EngineCommand::Rewind { .. } => Vec::new(),
         }
@@ -281,6 +289,37 @@ pub mod samples {
                 model("glm-5.2", "GLM 5.2", false),
                 model("gemini-flash", "Gemini Flash", true),
             ],
+        }
+    }
+
+    /// The connector catalog with one remote connector that needs a token.
+    #[must_use]
+    pub fn connector_catalog() -> UiEvent {
+        UiEvent::ConnectorCatalog {
+            version: "2026-11-04.1".into(),
+            connectors: vec![ConnectorInfo {
+                id: "github".into(),
+                name: "GitHub".into(),
+                description:
+                    "Repositories, issues, pull requests, Actions and code search on GitHub.".into(),
+                publisher: "GitHub".into(),
+                official: true,
+                licence: "MIT".into(),
+                source: "https://github.com/github/github-mcp-server".into(),
+                transport: "http".into(),
+                pinned: "https://api.githubcopilot.com/mcp/".into(),
+                oauth: false,
+                default_scope: "user".into(),
+                variables: vec![ConnectorVariable {
+                    name: "GITHUB_PERSONAL_ACCESS_TOKEN".into(),
+                    label: "GitHub personal access token".into(),
+                    secret: true,
+                    required: true,
+                    default: None,
+                    help_url: Some("https://github.com/settings/personal-access-tokens/new".into()),
+                }],
+                added: Vec::new(),
+            }],
         }
     }
 
@@ -569,6 +608,23 @@ mod tests {
         for line in samples::json_lines(&samples::v2_commands()).lines() {
             serde_json::from_str::<ClientMessage>(line).expect("a command line parses");
         }
+    }
+
+    /// The catalog commands: the list gets the sample catalog; the changes are the real
+    /// engine's to answer (the fake sends nothing).
+    #[test]
+    fn answers_the_connector_catalog_command() {
+        assert!(matches!(
+            samples::answer(&EngineCommand::ListConnectorCatalog {
+                query: String::new()
+            })
+            .as_slice(),
+            [UiEvent::ConnectorCatalog { connectors, .. }] if connectors[0].variables[0].secret
+        ));
+        assert!(samples::answer(&EngineCommand::ApproveMcpServer {
+            name: "docs".into()
+        })
+        .is_empty());
     }
 
     /// Driven with the samples' answers, every protocol v2 command gets its events.

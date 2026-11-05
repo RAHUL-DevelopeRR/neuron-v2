@@ -12,6 +12,9 @@
 //! screens need: [`FEATURE_REPORTS`], [`FEATURE_ACCOUNT`], [`FEATURE_ERROR_DETAILS`],
 //! [`FEATURE_SESSION_SCOPE`], [`FEATURE_TRUST_PREVIEW`] and [`FEATURE_MODEL_IMAGES`].
 
+use std::collections::BTreeMap;
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 /// The contract's version, sent in [`UiEvent::Ready`]. Bumped when a change would break a
@@ -121,6 +124,13 @@ pub const FEATURE_CHECKPOINTS: &str = "checkpoints";
 /// disabled servers are listed with status `disabled`.
 pub const FEATURE_MCP_TOGGLE: &str = "mcp_toggle";
 
+/// The connector catalog: [`EngineCommand::ListConnectorCatalog`] (answered with
+/// [`UiEvent::ConnectorCatalog`]), [`EngineCommand::AddMcpServer`],
+/// [`EngineCommand::RemoveMcpServer`] and [`EngineCommand::ApproveMcpServer`] (each
+/// answered with a notice and a fresh [`UiEvent::Extensions`], or an error), and
+/// [`McpServerInfo::catalog`].
+pub const FEATURE_MCP_CATALOG: &str = "mcp_catalog";
+
 /// What this engine can do beyond protocol 1, in [`UiEvent::Ready`]. A UI sends the
 /// commands a feature adds only when the engine lists it: an older engine would skip
 /// them with a notice.
@@ -146,6 +156,7 @@ pub const ENGINE_FEATURES: &[&str] = &[
     FEATURE_GIT_VIEWS,
     FEATURE_CHECKPOINTS,
     FEATURE_MCP_TOGGLE,
+    FEATURE_MCP_CATALOG,
 ];
 
 /// `report` events for the commands that show a report (`/usage`, `/init`, `/memory`,
@@ -186,6 +197,64 @@ pub struct McpServerInfo {
     /// Turned on ([`FEATURE_MCP_TOGGLE`]); older engines leave it out, meaning on.
     #[serde(default = "enabled_by_default")]
     pub enabled: bool,
+    /// The catalog connector it was added from, when its launch spec is exactly that
+    /// entry's ([`FEATURE_MCP_CATALOG`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<String>,
+}
+
+/// What the user typed for a connector's variables, secrets included
+/// ([`EngineCommand::AddMcpServer`]). Its debug output names the variables and never
+/// shows a value, so logging a command cannot leak one.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretValues(pub BTreeMap<String, String>);
+
+impl fmt::Debug for SecretValues {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_set().entries(self.0.keys()).finish()
+    }
+}
+
+/// A variable a catalog connector needs ([`ConnectorInfo::variables`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectorVariable {
+    /// The environment variable or `${secret:NAME}` name.
+    pub name: String,
+    pub label: String,
+    /// Kept in the OS keychain; a UI masks its field.
+    pub secret: bool,
+    pub required: bool,
+    #[serde(default)]
+    pub default: Option<String>,
+    /// Where to get it (a token page).
+    #[serde(default)]
+    pub help_url: Option<String>,
+}
+
+/// One connector of the catalog ([`UiEvent::ConnectorCatalog`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectorInfo {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub publisher: String,
+    /// Published by the service's vendor or the MCP project.
+    pub official: bool,
+    pub licence: String,
+    /// Its source repository.
+    pub source: String,
+    /// `stdio` (runs locally) or `http` (a remote server).
+    pub transport: String,
+    /// `<package>@<version>`, or the URL of a remote server.
+    pub pinned: String,
+    /// Signs in with OAuth once added (`neuron mcp login <server>`).
+    pub oauth: bool,
+    /// `user`, `project` or `local`.
+    pub default_scope: String,
+    pub variables: Vec<ConnectorVariable>,
+    /// The configured servers added from it.
+    pub added: Vec<String>,
 }
 
 fn enabled_by_default() -> bool {
@@ -702,6 +771,12 @@ pub enum UiEvent {
         skills: Vec<DefinitionInfo>,
         agents: Vec<DefinitionInfo>,
     },
+    /// Answer to [`EngineCommand::ListConnectorCatalog`] ([`FEATURE_MCP_CATALOG`]): the
+    /// catalog's version and the connectors that match the query.
+    ConnectorCatalog {
+        version: String,
+        connectors: Vec<ConnectorInfo>,
+    },
     /// What a report command (`/usage`, `/init`, `/memory`, `/doctor`) found, for a
     /// scrollable panel, with [`CAPABILITY_REPORTS`] on; `TurnFinished` follows, as after
     /// any slash command. `command` is the command's name without the slash.
@@ -904,6 +979,39 @@ pub enum EngineCommand {
     /// fresh [`UiEvent::Extensions`] follow, or an error. Servers restart from the next
     /// turn.
     SetMcpServerEnabled { name: String, enabled: bool },
+    /// Ask for the catalog connectors whose id, name, publisher or description contain
+    /// every word of `query` (all of them when empty): [`UiEvent::ConnectorCatalog`]
+    /// ([`FEATURE_MCP_CATALOG`]).
+    ListConnectorCatalog {
+        #[serde(default)]
+        query: String,
+    },
+    /// Add the catalog connector `id` as the server `name` (the id when `None`) to the
+    /// settings of `scope` (`user`, `project` or `local`; the connector's default when
+    /// `None`). `secrets` holds what the user typed for its variables: secrets go to the
+    /// OS keychain and never into a settings file. A notice and a fresh
+    /// [`UiEvent::Extensions`] follow, or an error.
+    AddMcpServer {
+        id: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        scope: Option<String>,
+        #[serde(default)]
+        secrets: SecretValues,
+    },
+    /// Remove the server `name` from the settings Neuron writes (those of `scope` when
+    /// given), with its keychain secrets and sign-in. A notice and a fresh
+    /// [`UiEvent::Extensions`] follow, or an error.
+    RemoveMcpServer {
+        name: String,
+        #[serde(default)]
+        scope: Option<String>,
+    },
+    /// Approve the workspace server `name` (status `needs_approval`) as it is configured
+    /// now, as `/mcp approve` does. A notice and a fresh [`UiEvent::Extensions`] follow,
+    /// or an error.
+    ApproveMcpServer { name: String },
     /// Ask what trusting the workspace would turn on ([`UiEvent::TrustPreview`]).
     TrustPreview,
     /// Read the account's plan and usage again ([`UiEvent::Account`]).
@@ -1118,6 +1226,7 @@ mod tests {
     /// Protocol 1 additions: engine features (absent from older engines), the commands
     /// they add, and their events, as JSON lines.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn features_sessions_questions_and_tasks_as_json() {
         let old: UiEvent =
             serde_json::from_str(r#"{"type":"ready","protocol":1,"version":"6.3.0"}"#).unwrap();
@@ -1171,6 +1280,46 @@ mod tests {
                 EngineCommand::SetMcpServerEnabled {
                     name: "docs".into(),
                     enabled: false,
+                },
+            ),
+            (
+                r#"{"kind":"command","type":"list_connector_catalog"}"#,
+                EngineCommand::ListConnectorCatalog {
+                    query: String::new(),
+                },
+            ),
+            (
+                r#"{"kind":"command","type":"add_mcp_server","id":"github","scope":"user","secrets":{"GITHUB_PERSONAL_ACCESS_TOKEN":"ghp_x"}}"#,
+                EngineCommand::AddMcpServer {
+                    id: "github".into(),
+                    name: None,
+                    scope: Some("user".into()),
+                    secrets: SecretValues(BTreeMap::from([(
+                        "GITHUB_PERSONAL_ACCESS_TOKEN".to_string(),
+                        "ghp_x".to_string(),
+                    )])),
+                },
+            ),
+            (
+                r#"{"kind":"command","type":"add_mcp_server","id":"fetch"}"#,
+                EngineCommand::AddMcpServer {
+                    id: "fetch".into(),
+                    name: None,
+                    scope: None,
+                    secrets: SecretValues::default(),
+                },
+            ),
+            (
+                r#"{"kind":"command","type":"remove_mcp_server","name":"github"}"#,
+                EngineCommand::RemoveMcpServer {
+                    name: "github".into(),
+                    scope: None,
+                },
+            ),
+            (
+                r#"{"kind":"command","type":"approve_mcp_server","name":"docs"}"#,
+                EngineCommand::ApproveMcpServer {
+                    name: "docs".into(),
                 },
             ),
         ] {
@@ -1512,5 +1661,68 @@ mod tests {
         older.as_object_mut().unwrap().remove("usage_window");
         let older: AccountDetails = serde_json::from_value(older).unwrap();
         assert_eq!(older.usage_window, None, "an older engine sends none");
+    }
+
+    #[test]
+    fn connector_catalog_messages_round_trip_and_secrets_never_reach_debug_output() {
+        let command = EngineCommand::AddMcpServer {
+            id: "github".into(),
+            name: Some("gh".into()),
+            scope: Some("project".into()),
+            secrets: SecretValues(BTreeMap::from([(
+                "GITHUB_PERSONAL_ACCESS_TOKEN".to_string(),
+                "ghp_SENTINEL_protocol".to_string(),
+            )])),
+        };
+        let debug = format!("{command:?}");
+        assert!(!debug.contains("ghp_SENTINEL_protocol"), "{debug}");
+        assert!(debug.contains("GITHUB_PERSONAL_ACCESS_TOKEN"), "{debug}");
+        let json = serde_json::to_value(&command).unwrap();
+        assert_eq!(
+            json["secrets"]["GITHUB_PERSONAL_ACCESS_TOKEN"],
+            "ghp_SENTINEL_protocol"
+        );
+        assert_eq!(
+            serde_json::from_value::<EngineCommand>(json).unwrap(),
+            command
+        );
+
+        let event = UiEvent::ConnectorCatalog {
+            version: "2026-11-04.1".into(),
+            connectors: vec![ConnectorInfo {
+                id: "github".into(),
+                name: "GitHub".into(),
+                description: "Repositories".into(),
+                publisher: "GitHub".into(),
+                official: true,
+                licence: "MIT".into(),
+                source: "https://github.com/github/github-mcp-server".into(),
+                transport: "http".into(),
+                pinned: "https://api.githubcopilot.com/mcp/".into(),
+                oauth: false,
+                default_scope: "user".into(),
+                variables: vec![ConnectorVariable {
+                    name: "GITHUB_PERSONAL_ACCESS_TOKEN".into(),
+                    label: "GitHub personal access token".into(),
+                    secret: true,
+                    required: true,
+                    default: None,
+                    help_url: None,
+                }],
+                added: vec!["gh".into()],
+            }],
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "connector_catalog");
+        assert_eq!(serde_json::from_value::<UiEvent>(json).unwrap(), event);
+
+        // An older engine's server rows have no `catalog`, and a row without one sends none.
+        let row: McpServerInfo = serde_json::from_str(
+            r#"{"name":"docs","scope":"user","transport":"stdio","status":"ready","tools":[],"error":null}"#,
+        )
+        .unwrap();
+        assert_eq!(row.catalog, None);
+        assert!(serde_json::to_value(&row).unwrap().get("catalog").is_none());
+        assert!(ENGINE_FEATURES.contains(&FEATURE_MCP_CATALOG));
     }
 }

@@ -62,6 +62,13 @@ export const FEATURE_CHECKPOINTS = 'checkpoints'
  * servers listed with status `disabled`.
  */
 export const FEATURE_MCP_TOGGLE = 'mcp_toggle'
+/**
+ * The connector catalog: the `list_connector_catalog` command (answered with a
+ * `connector_catalog` event), `add_mcp_server`, `remove_mcp_server` and
+ * `approve_mcp_server` (each answered with a notice and a fresh `extensions`
+ * event, or an error), and `catalog` on MCP servers.
+ */
+export const FEATURE_MCP_CATALOG = 'mcp_catalog'
 
 /** A UI capability: questions come as `question` events, not "Question:" notices. */
 export const CAPABILITY_QUESTIONS = 'questions'
@@ -237,6 +244,48 @@ export interface McpServerInfo {
   error: string | null
   /** Turned on (feature `mcp_toggle`); an older engine leaves it out: on. */
   enabled?: boolean
+  /**
+   * The catalog connector it was added from, when its launch spec is exactly
+   * that entry's (feature `mcp_catalog`); left out otherwise.
+   */
+  catalog?: string
+}
+
+/** A variable a catalog connector needs. */
+export interface ConnectorVariable {
+  /** The environment variable or `${secret:NAME}` name. */
+  name: string
+  label: string
+  /** Kept in the OS keychain: mask its field, never log it. */
+  secret: boolean
+  required: boolean
+  default: string | null
+  /** Where to get it (a token page). */
+  help_url: string | null
+}
+
+/** One connector of the catalog (`connector_catalog` event). */
+export interface ConnectorInfo {
+  id: string
+  name: string
+  description: string
+  publisher: string
+  /** Published by the service's vendor or the MCP project. */
+  official: boolean
+  licence: string
+  /** Its source repository. */
+  source: string
+  /** `stdio` (runs locally) or `http` (a remote server). */
+  transport: string
+  /** `<package>@<version>`, or the URL of a remote server. */
+  pinned: string
+  /** Signs in with OAuth once added (`neuron mcp login <server>`). */
+  oauth: boolean
+  /** `user`, `project` or `local`. */
+  default_scope: string
+  variables: ConnectorVariable[]
+  /** The configured servers added from it. */
+  added: string[]
 }
 
 /** One installed plugin. */
@@ -712,6 +761,16 @@ export interface ExtensionsEvent {
 }
 
 /**
+ * Answer to `list_connector_catalog` (feature `mcp_catalog`): the catalog's
+ * version and the connectors that match the query.
+ */
+export interface ConnectorCatalogEvent {
+  type: 'connector_catalog'
+  version: string
+  connectors: ConnectorInfo[]
+}
+
+/**
  * What a report command (`/usage`, `/init`, `/memory`, `/doctor`) found, for
  * a scrollable panel, with the `reports` capability; `turn_finished` follows.
  */
@@ -903,6 +962,7 @@ export type UiEvent =
   | SubagentStartedEvent
   | SubagentFinishedEvent
   | ExtensionsEvent
+  | ConnectorCatalogEvent
   | ReportEvent
   | AccountEvent
   | TrustPreviewEvent
@@ -944,6 +1004,7 @@ export const UI_EVENT_TYPES: readonly UiEventType[] = [
   'subagent_started',
   'subagent_finished',
   'extensions',
+  'connector_catalog',
   'report',
   'account',
   'trust_preview',
@@ -996,6 +1057,36 @@ export type EngineCommand =
    * settings: a notice and a fresh `extensions` event follow.
    */
   | { type: 'set_mcp_server_enabled'; name: string; enabled: boolean }
+  /**
+   * The catalog connectors whose id, name, publisher or description contain
+   * every word of `query` (all when empty), as a `connector_catalog` event
+   * (feature `mcp_catalog`).
+   */
+  | { type: 'list_connector_catalog'; query?: string }
+  /**
+   * Add the catalog connector `id` as the server `name` (the id when null) to
+   * the settings of `scope` (`user`, `project` or `local`; the connector's
+   * default when null). `secrets` holds what the user typed for its variables:
+   * secrets go to the OS keychain, never into a settings file, and must never be
+   * logged. A notice and a fresh `extensions` event follow, or an error.
+   */
+  | {
+      type: 'add_mcp_server'
+      id: string
+      name?: string | null
+      scope?: string | null
+      secrets?: Record<string, string>
+    }
+  /**
+   * Remove the server `name` (from the settings of `scope` when given), with its
+   * keychain secrets and sign-in. A notice and a fresh `extensions` event follow.
+   */
+  | { type: 'remove_mcp_server'; name: string; scope?: string | null }
+  /**
+   * Approve the workspace server `name` (status `needs_approval`) as configured
+   * now. A notice and a fresh `extensions` event follow, or an error.
+   */
+  | { type: 'approve_mcp_server'; name: string }
   /** What trusting the workspace would turn on (feature `trust_preview`). */
   | { type: 'trust_preview' }
   /** Read the plan and usage again, as an `account` event (feature `account`). */
@@ -1020,6 +1111,10 @@ export const ENGINE_COMMAND_TYPES: readonly EngineCommand['type'][] = [
   'trust_workspace',
   'list_extensions',
   'set_mcp_server_enabled',
+  'list_connector_catalog',
+  'add_mcp_server',
+  'remove_mcp_server',
+  'approve_mcp_server',
   'trust_preview',
   'refresh_account',
   'commit',

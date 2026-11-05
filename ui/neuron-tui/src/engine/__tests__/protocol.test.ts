@@ -20,6 +20,8 @@ import {
   type AccountInfo,
   type ChangedFile,
   type CheckpointInfo,
+  type ConnectorInfo,
+  type ConnectorVariable,
   type DefinitionInfo,
   type DiffFile,
   type ErrorDetail,
@@ -176,6 +178,30 @@ const STRUCT_FIELDS: Record<string, string[]> = {
     'tools',
     'error',
     'enabled',
+    'catalog',
+  ]),
+  ConnectorVariable: fieldsOf<ConnectorVariable>()([
+    'name',
+    'label',
+    'secret',
+    'required',
+    'default',
+    'help_url',
+  ]),
+  ConnectorInfo: fieldsOf<ConnectorInfo>()([
+    'id',
+    'name',
+    'description',
+    'publisher',
+    'official',
+    'licence',
+    'source',
+    'transport',
+    'pinned',
+    'oauth',
+    'default_scope',
+    'variables',
+    'added',
   ]),
   PluginInfo: fieldsOf<PluginInfo>()([
     'id',
@@ -359,6 +385,7 @@ const EVENT_FIELDS: { [T in UiEventType]: string[] } = {
     'skills',
     'agents',
   ]),
+  connector_catalog: eventFields('connector_catalog')(['version', 'connectors']),
   report: eventFields('report')(['command', 'title', 'sections', 'links']),
   account: eventFields('account')(['signed_in', 'account']),
   trust_preview: eventFields('trust_preview')([
@@ -507,6 +534,35 @@ describe('client messages (UI -> engine)', () => {
     )
   })
 
+  test('connector catalog commands are the lines the engine reads', () => {
+    // Copied from the serde test in protocol.rs.
+    expect(
+      encodeClientMessage(
+        commandMessage({
+          type: 'add_mcp_server',
+          id: 'github',
+          scope: 'user',
+          secrets: { GITHUB_PERSONAL_ACCESS_TOKEN: 'ghp_x' },
+        }),
+      ),
+    ).toBe(
+      '{"kind":"command","type":"add_mcp_server","id":"github","scope":"user","secrets":{"GITHUB_PERSONAL_ACCESS_TOKEN":"ghp_x"}}\n',
+    )
+    expect(
+      encodeClientMessage(commandMessage({ type: 'list_connector_catalog' })),
+    ).toBe('{"kind":"command","type":"list_connector_catalog"}\n')
+    expect(
+      encodeClientMessage(
+        commandMessage({ type: 'remove_mcp_server', name: 'github' }),
+      ),
+    ).toBe('{"kind":"command","type":"remove_mcp_server","name":"github"}\n')
+    expect(
+      encodeClientMessage(
+        commandMessage({ type: 'approve_mcp_server', name: 'docs' }),
+      ),
+    ).toBe('{"kind":"command","type":"approve_mcp_server","name":"docs"}\n')
+  })
+
   test('attachments are tagged by kind', () => {
     const line = encodeClientMessage(
       commandMessage({
@@ -650,6 +706,7 @@ describe('UI events (engine -> UI)', () => {
       workspace_trusted: true,
       question: true,
       extensions: true,
+      connector_catalog: true,
       report: true,
       account: true,
       trust_preview: true,
