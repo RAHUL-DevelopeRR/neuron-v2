@@ -440,6 +440,7 @@ with Neuron's own environment, including any keys you exported.
 | `~/.neuron/settings.json` | Your defaults (the directory moves with `NEURON_CONFIG_HOME`) |
 | `.neuron/settings.json` | Project settings, safe to commit |
 | `.neuron/settings.local.json` | Your overrides for this project; keep it out of version control |
+| `managed-settings.json` in `%ProgramData%\Neuron` (Windows), `/Library/Application Support/Neuron` (macOS) or `/etc/neuron` (Linux) | Managed settings an administrator sets for the whole computer; nothing overrides them (see [Connector policy](#connector-policy)) |
 
 Later files override earlier ones. `/config` shows the merged result. Settings are
 checked when they load: an unknown key or a value of the wrong type is an error that
@@ -455,6 +456,7 @@ names the file, the line and the closest known key. Commonly used keys:
 | `workingSetTokens` | Conversation tokens to keep before older tool results become stubs and history is compacted (default 40000 on a plan with a token window, such as Free; none on other plans); `0` turns it off, and `NEURON_WORKING_SET_TOKENS` overrides it. See [The Free token window](#the-free-token-window) |
 | `hooks` | Commands run before and after tool calls |
 | `mcpServers`, `defaultMcpServers`, `disabledMcpServers` | MCP servers |
+| `mcpPolicy` | Which MCP servers may start, must start, and extra tool rules; read only from the managed settings (see [Connector policy](#connector-policy)) |
 | `defaultSkills` | `false` leaves the bundled skills out of the system prompt |
 | `toolCapableModels`, `autoToolModel`, `subagentModel`, `summaryModel`, `reviewerModel`, `providerFallbacks` | Models for particular jobs (see [Models](#models)) |
 | `redactSecrets` | `false` stops replacing token-shaped secrets (API keys, tokens, private keys, passwords in URLs) with `[REDACTED:<kind>]` in tool output, the session file and telemetry; on by default, and the settings of a folder you have not trusted cannot turn it off |
@@ -489,6 +491,61 @@ headers or URL change.
 Even in a trusted directory, settings files
 cannot set a full-access permission mode; pass `--permission-mode danger-full-access`
 or put it in your user settings.
+
+### Connector policy
+
+Two policies decide which MCP servers may start, the first one winning:
+
+- **Managed settings**, `managed-settings.json` in a folder only an administrator can
+  write (the paths are in the table above). It loads after every other settings file,
+  so nothing overrides it. Its `permissions` rules are added to everyone's rather than
+  replacing them, and only there is `mcpPolicy` read (anywhere else it is ignored, with
+  a warning).
+- **Your Zero-X plan.** Each time Neuron reads your account (`/login`, `/usage`, the
+  full-screen UI's account line) it keeps the plan's connector policy in
+  `~/.neuron/policy-cache.json`, so the policy also applies after a restart and offline.
+  A policy more than a day old is still used, with a warning. Signing out removes it.
+
+```json
+{
+  "mcpPolicy": {
+    "allow": ["catalog:*", "corp-*"],
+    "deny": ["slack"],
+    "required": ["codebase-memory"],
+    "allowUnvetted": false,
+    "allowStdio": true,
+    "allowedRemoteHosts": ["*.corp.example"],
+    "toolRules": {
+      "deny": ["mcp__github__delete_repository"],
+      "ask": ["mcp__github"]
+    },
+    "failClosed": false
+  }
+}
+```
+
+| `mcpPolicy` key | Meaning |
+| --- | --- |
+| `allow` | Only these may start: catalog ids (`github`), `catalog:*` (any catalog connector) or server-name patterns (`corp-*`). A catalog id matches only that connector as the catalog writes it, never a server that merely has that name |
+| `deny` | Never start: the same forms; a catalog id also refuses a server of that name |
+| `required` | Always configured and on: catalog ids, or servers the managed settings define. A required server cannot be turned off (`/mcp disable`, the panel shows `[req]`) or removed, needs no workspace approval, and also starts in `neuron prompt` runs |
+| `allowUnvetted` | `false`: only catalog connectors may start |
+| `allowStdio` | `false`: no local (stdio) servers |
+| `allowedRemoteHosts` | Remote servers may reach only these hosts (`example.com`, `*.example.com`) |
+| `toolRules` | `deny`, `ask` and `allow` rules added to everyone's permission rules; a deny rule always wins over an allow rule |
+| `failClosed` | `true`: while the plan's policy has not been read in the last day (offline, signed out), only the servers the managed settings define or require start |
+
+A server the managed settings define is never refused by either policy. A refused
+server shows as `blocked` in `/mcp` and the MCP panel, with the reason, and does not
+start; `/mcp add` refuses a connector a policy would block. `/mcp` ends with the
+policies in force.
+
+Every MCP tool call, refused calls included, adds a line to
+`~/.neuron/audit/mcp-YYYY-MM-DD.jsonl` (UTC day): the time, session, server, tool,
+catalog connector and catalog version, whether it was allowed and what decided it
+(`rule`, `mode`, `user`, `session` or `hook`), how long it ran, the bytes in and out,
+the sha256 of the arguments and an error class. Never the arguments or the output
+themselves. The log stays on your computer.
 
 ## Environment variables
 

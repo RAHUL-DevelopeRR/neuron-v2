@@ -1,6 +1,6 @@
 # Neuron × Zero-X platform contract
 
-Status: v1.2 (2026-10-16; v1.1 amendments in section 6, v1.2 amendments in section 7). This document is the source of truth shared by the Neuron CLI
+Status: v1.3 (2026-11-05; v1.1 amendments in section 6, v1.2 amendments in section 7, v1.3 amendments in section 8). This document is the source of truth shared by the Neuron CLI
 (`RAHUL-DevelopeRR/neuron-v2`) and the Zero-X gateway + website
 (`RAHUL-DevelopeRR/zero-x.live`, `neuroncli/auth-server`). A copy lives in both repos;
 change both together.
@@ -351,3 +351,15 @@ Sync the copy in `neuron-v2`; nothing here changes what the CLI sends or must ha
   the session id (32 hex characters), never the id itself, the same for every request of a
   session. The gateway passes it upstream to providers that accept it and strips it
   otherwise; quota accounting is unchanged. Other OpenAI-compatible providers never get it.
+- **Connector policy (§3.4, 2026-11-05).** `GET /api/account` may add `policy:
+  {connectors: {allowed, denied, required, hosted, allow_unvetted, catalog_version}}`, set
+  per plan (`zerox_plan_policy.connector_policy`, JSON; no organisations yet). `allowed`:
+  catalog ids or `"catalog:*"` the plan allows; missing or `null` means no allow list, and
+  it never restricts servers outside the catalog. `denied`: ids the CLI refuses (it also
+  refuses a server of that name). `required`: catalog ids the CLI adds and keeps on.
+  `hosted`: hosted connectors the plan includes (Free: none). `allow_unvetted`: `false`
+  lets only catalog connectors start (default `true`). `catalog_version`: the catalog the
+  policy was written for. A missing `policy` block (or one without `connectors`) means no
+  plan policy. The CLI caches the block for a day and keeps using an older one offline;
+  machine-wide managed settings outrank it. Only ids and flags are sent, nothing about
+  the user's own servers is reported back.

@@ -5,6 +5,16 @@ The release workflow copies a version's section into its GitHub release notes.
 
 ## 7.0.0-alpha.4 (unreleased)
 
+- Connector policy: machine-wide managed settings (`managed-settings.json` in
+  `%ProgramData%\Neuron`, `/Library/Application Support/Neuron` or `/etc/neuron`) load
+  last and cannot be overridden; their `mcpPolicy` allows, denies and requires MCP
+  servers, limits stdio servers, unvetted servers and remote hosts, adds tool rules
+  (deny always wins) and can fail closed. The Zero-X plan's `policy.connectors` from
+  `/api/account` (contract v1.3) is cached in `~/.neuron/policy-cache.json` and applies
+  after a restart and offline. Refused servers show as `blocked` with the reason;
+  required ones cannot be turned off or removed. Every MCP call, refused ones too, is
+  logged metadata-only to `~/.neuron/audit/mcp-YYYY-MM-DD.jsonl`. The engine protocol
+  adds the `managed` scope and `McpServerInfo.required` (feature `mcp_policy`).
 - Connector catalog: `/mcp catalog`, `/mcp add <id> [--scope user|project|local]` and
   `/mcp remove <server>` (and `neuron mcp catalog|add|remove`) list and add vetted MCP
   servers (GitHub, Filesystem, Git, Fetch, Memory, Playwright, Codebase memory,
