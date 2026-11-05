@@ -5,6 +5,19 @@ The release workflow copies a version's section into its GitHub release notes.
 
 ## 7.0.0-alpha.4 (unreleased)
 
+- MCP supply chain: catalog connectors and the default MCP servers no longer start
+  through `npx -y` or `uvx`. The catalog (`2026-11-05.3`) pins each local entry's whole
+  npm dependency tree with `sha512` integrity, its Python requirements with wheel
+  hashes, or its release binary's `sha256`; the first start installs into
+  `~/.neuron/mcp/<id>/<version>` and checks every hash (npm packages are unpacked by
+  Neuron, so no install script runs; Python installs are wheels only with
+  `--require-hashes`), later starts are offline, and a changed installed file or cached
+  tarball stops the start with an integrity error. Codebase memory runs its
+  hash-checked release binary; the npm package no longer installs `codebase-memory-mcp`,
+  whose install script downloaded that binary without a pinned hash. `/mcp list`, its
+  JSON and the MCP panel mark other stdio servers `unpinned` (`McpServerInfo.unpinned`),
+  and `/mcp pin <server>` records their version and hashes.
+
 - MCP sandbox: every stdio MCP server runs with a sandbox profile from its
   `mcpServers.<name>.sandbox` setting (`fsRead`, `fsWrite`, `network`, `envAllow`), its
   catalog entry, or the default for unvetted servers (the workspace read-only, no

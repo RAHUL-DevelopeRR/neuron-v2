@@ -469,6 +469,13 @@ Default skills and MCP servers are described in
 connectors and `/mcp add <id>` (or `neuron mcp add <id>`, which asks for secrets with
 the input hidden) adds one; its secrets go to the OS keychain and the settings hold
 `${secret:NAME}` (see [connector catalog](docs/DEFAULT_INTEGRATIONS.md#connector-catalog)).
+Catalog connectors and the default servers start from verified installs in
+`~/.neuron/mcp`, never through `npx` or `uvx`
+(see [verified installs](docs/DEFAULT_INTEGRATIONS.md#verified-installs)). `/mcp list`
+marks any other stdio server `unpinned`; `/mcp pin <server>` (or `neuron mcp pin
+<server>`) records its package version and hashes, or its program's sha256, and it
+starts from that from then on (see
+[pinning other servers](docs/DEFAULT_INTEGRATIONS.md#pinning-other-servers)).
 
 ### Workspace trust
 

@@ -36,12 +36,16 @@ their skill directories with `/skills install` instead.
 
 ## MCP and browser control
 
-CodebaseMap (`DeusData/codebase-memory-mcp`, npm version `0.11.0`) and Microsoft's
-Playwright MCP (`0.0.83`) are configured by default. npm installs their actual
-dependencies alongside Neuron; the launcher passes absolute installed entry paths
-to avoid downloading packages while a chat initializes. Standalone/PyPI binaries
-use pinned `npx -y` commands, requiring Node.js and npm. On Windows, this fallback
-runs through `cmd.exe` so `npx.cmd` resolves correctly.
+CodebaseMap (`DeusData/codebase-memory-mcp` `0.11.0`) and Microsoft's Playwright MCP
+(`0.0.83`) are configured by default, as their catalog entries (see [verified
+installs](#verified-installs)). Neither starts through `npx`: the first start installs
+it into `~/.neuron/mcp/<id>/<version>` from the downloads the catalog pins and checks
+every hash, and later starts are offline. Codebase memory runs the release binary for
+your platform, checked against a pinned sha256; its npm package, whose install script
+would download that binary without a pinned hash, is never installed. Playwright runs
+with Node.js (`node` on the path, or `NEURON_MCP_NODE`); the npm package installs it
+alongside Neuron from its lockfile, and the launcher passes that installed entry
+instead.
 
 `mcpServers` in `settings.json` overrides any default by server name and configures
 additional processes or remote endpoints. Stdio servers use MCP's newline-delimited
@@ -278,11 +282,55 @@ still uses.
 
 A stdio entry is written with the launch command for the system you add it on
 (`cmd.exe /d /s /c npx ...` on Windows, `npx ...` elsewhere); both count as the
-catalog entry. Packages start with `npx -y <package>@<version>` or
-`uvx <package>@<version>`, so Node.js or uv must be installed; only the version is
-pinned for now. A settings entry counts as a catalog connector, with its pinned tiers,
-only when its command and arguments (or URL and headers) are exactly what the catalog
-writes and it sets no other environment variable or header.
+catalog entry. That command names the package; the server itself starts from its
+verified install (below), never through `npx` or `uvx`. A settings entry counts as a
+catalog connector, with its pinned tiers and its verified install, only when its
+command and arguments (or URL and headers) are exactly what the catalog writes and it
+sets no other environment variable or header.
+
+#### Verified installs
+
+Each local catalog entry pins what it installs, and the catalog signature covers it:
+
+- **npm** (Filesystem, Memory, Playwright): the whole dependency tree, each tarball
+  with its registry URL and `sha512` integrity. Neuron downloads and checks every
+  tarball and unpacks it itself, so no package's install script runs. The server
+  starts as `node <its program>`, so Node.js is needed.
+- **Python** (Git, Fetch, AWS documentation): every requirement with the `sha256` of
+  its wheels. Neuron runs `uv pip install --require-hashes --no-deps --only-binary
+  :all:` into a virtual environment of the server's own, so uv is needed and no build
+  script runs.
+- **Release binary** (Codebase memory): the archive for each platform with its
+  `sha256`; only the program is unpacked.
+- **Container image**: run with `docker run --pull=never` by its `sha256` digest after
+  one `docker pull` of that digest.
+
+Installs live in `~/.neuron/mcp/<id>/<version>`, with downloaded npm tarballs in
+`~/.neuron/mcp/cache`. The first start of a server installs it (and needs the
+network); later starts are offline. Every start checks the install record: a file
+whose size or modification time changed is hashed again, and one that no longer
+matches stops the start with an integrity error and removes the install, so the next
+start installs it again. A cached tarball that does not match its integrity is removed
+the same way. The Python and container checks are uv's and Docker's at install time.
+
+#### Pinning other servers
+
+A stdio server you configured yourself, which is not a catalog connector, runs
+whatever its command resolves to on each start, so `/mcp list` and the MCP panel mark
+it `unpinned`. `/mcp pin <server>` (or `neuron mcp pin <server>`) records what it runs,
+for its exact command, arguments and environment:
+
+- `npx [-y] <package>[@version] ...`: npm resolves the package and its dependencies
+  once (`--package-lock-only --ignore-scripts`); Neuron installs that tree as it does
+  a catalog npm entry, and the server starts from it, at that version, from then on.
+- `uvx <package>[@version] ...`: uv resolves it with hashes once; it installs and
+  starts as a catalog Python entry does.
+- Any other command: the sha256 of the program file and of each file its arguments
+  name. A start where one of them changed is refused until you pin it again.
+
+Pins are kept in `~/.neuron/mcp/pins.json`. Changing the server's command, arguments
+or environment makes it unpinned again. Remote servers run what their host serves, so
+they are never marked unpinned and cannot be pinned.
 
 Catalog updates served by the gateway must carry an ed25519 signature and a version
 (`YYYY-MM-DD.N`) newer than the catalog in use, so an older signed catalog cannot be
@@ -321,9 +369,9 @@ stdio MCP process unless a separately identified server implements that protocol
 
 CodebaseMap's default implementation is the official
 [Codebase Memory MCP](https://github.com/DeusData/codebase-memory-mcp). Its mapping
-and graph tools are available after successful MCP initialization. Configure a
-native `codebase-memory-mcp` executable under that server name to avoid the npm
-wrapper when using a standalone binary.
+and graph tools are available after successful MCP initialization. Neuron runs the
+project's release binary directly (see [verified installs](#verified-installs)), not
+its npm wrapper.
 
 A loaded skill stays in the conversation like any other tool result (until the
 history is compacted). The gstack adapter preserves investigation and validation
