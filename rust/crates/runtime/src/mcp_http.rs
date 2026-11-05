@@ -10,7 +10,8 @@
 //! ends it on shutdown. HTTP+SSE: a GET opens an event stream whose first `endpoint`
 //! event names the URL to POST to; responses come back on the stream.
 //!
-//! Static `headers` may reference environment variables as `${NAME}`. Header values
+//! Static `headers` may reference environment variables as `${NAME}` and secrets kept
+//! in the keychain as `${secret:NAME}` (see `mcp_install`). Header values
 //! and tokens never appear in errors or debug output.
 
 use std::collections::VecDeque;
@@ -59,9 +60,12 @@ pub(crate) enum McpConnection {
 impl McpConnection {
     pub(crate) fn spawn(bootstrap: &McpClientBootstrap) -> io::Result<Self> {
         match &bootstrap.transport {
-            McpClientTransport::Stdio(transport) => {
-                Ok(Self::Stdio(McpStdioProcess::spawn(transport)?))
-            }
+            McpClientTransport::Stdio(transport) => Ok(Self::Stdio(McpStdioProcess::spawn(
+                &crate::mcp_install::stdio_transport_with_secrets(
+                    &bootstrap.server_name,
+                    transport,
+                )?,
+            )?)),
             McpClientTransport::Http(transport) => Ok(Self::Remote(Box::new(
                 McpRemoteConnection::new(&bootstrap.server_name, transport, Flavor::Streamable)?,
             ))),
@@ -402,8 +406,12 @@ impl McpRemoteConnection {
             headers: transport
                 .headers
                 .iter()
-                .map(|(name, value)| (name.clone(), expand_env_refs(value)))
-                .collect(),
+                .map(|(name, value)| {
+                    crate::mcp_install::expand_mcp_header(server_name, &transport.url, value)
+                        .map(|value| (name.clone(), value))
+                        .map_err(|error| io::Error::new(io::ErrorKind::NotFound, error))
+                })
+                .collect::<io::Result<_>>()?,
             session_id: None,
             protocol_version: None,
             legacy: None,

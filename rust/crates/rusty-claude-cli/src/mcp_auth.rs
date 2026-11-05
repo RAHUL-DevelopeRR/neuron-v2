@@ -1,7 +1,8 @@
 //! Sign-in for remote MCP servers: `neuron mcp login <server>` and
-//! `neuron mcp logout <server>`, and the token store the runtime reads remote
-//! servers' tokens from (the OS keychain, entry `mcp-oauth:<server>` of the
-//! `neuron-cli` service, or an owner-only file under `~/.neuroncli/mcp-oauth`).
+//! `neuron mcp logout <server>`, and the store the runtime reads remote servers'
+//! tokens (entry `mcp-oauth:<server>`) and connector secrets (entry
+//! `mcp-secret:<server>:<NAME>`) from: the OS keychain (`neuron-cli` service), or an
+//! owner-only file under `~/.neuroncli/mcp-oauth` or `~/.neuroncli/mcp-secrets`.
 
 use std::env;
 use std::path::PathBuf;
@@ -29,7 +30,12 @@ fn file_for(key: &str) -> FileBackend {
             }
         })
         .collect();
-    FileBackend::new(neuron_home().join("mcp-oauth").join(format!("{safe}.json")))
+    let folder = if key.starts_with("mcp-secret:") {
+        "mcp-secrets"
+    } else {
+        "mcp-oauth"
+    };
+    FileBackend::new(neuron_home().join(folder).join(format!("{safe}.json")))
 }
 
 impl McpTokenStore for KeychainTokenStore {
@@ -103,7 +109,7 @@ fn find_server(name: &str) -> Result<ScopedMcpServerConfig, String> {
         .ok_or_else(|| format!("no MCP server named `{name}` is configured"))
 }
 
-fn login(name: &str) -> Result<String, Box<dyn std::error::Error>> {
+pub(crate) fn login(name: &str) -> Result<String, Box<dyn std::error::Error>> {
     let server = find_server(name)?;
     let remote = match &server.config {
         McpServerConfig::Http(remote) | McpServerConfig::Sse(remote) => remote,
@@ -120,8 +126,11 @@ fn login(name: &str) -> Result<String, Box<dyn std::error::Error>> {
         headers: remote
             .headers
             .iter()
-            .map(|(key, value)| (key.clone(), runtime::expand_mcp_header_value(value)))
-            .collect(),
+            .map(|(key, value)| {
+                runtime::expand_mcp_header(name, &remote.url, value)
+                    .map(|value| (key.clone(), value))
+            })
+            .collect::<Result<_, _>>()?,
         client_id: remote
             .oauth
             .as_ref()
@@ -173,5 +182,14 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert_eq!(name, "mcp-oauth_______evil.json");
+        let secret = file_for("mcp-secret:github:GITHUB_TOKEN");
+        assert_eq!(
+            secret.path().parent().unwrap().file_name().unwrap(),
+            "mcp-secrets"
+        );
+        assert_eq!(
+            secret.path().file_name().unwrap(),
+            "mcp-secret_github_GITHUB_TOKEN.json"
+        );
     }
 }

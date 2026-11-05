@@ -1800,6 +1800,16 @@ fn expand_mcp_config_value_with(value: &str, lookup: impl Fn(&str) -> Option<Str
     result
 }
 
+/// One `mcpServers` entry, given as JSON text, as the settings loader reads it.
+pub(crate) fn parse_mcp_server_json(
+    server_name: &str,
+    text: &str,
+) -> Result<McpServerConfig, ConfigError> {
+    let value = JsonValue::parse(text)
+        .map_err(|error| ConfigError::Parse(format!("mcpServers.{server_name}: {error}")))?;
+    parse_mcp_server_config(server_name, &value, &format!("mcpServers.{server_name}"))
+}
+
 fn parse_mcp_server_config(
     server_name: &str,
     value: &JsonValue,

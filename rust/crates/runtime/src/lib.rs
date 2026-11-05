@@ -33,8 +33,10 @@ mod lane_events;
 pub mod lsp_client;
 mod mcp;
 pub mod mcp_approvals;
+pub mod mcp_catalog;
 mod mcp_client;
 mod mcp_http;
+pub mod mcp_install;
 pub mod mcp_lifecycle_hardened;
 mod mcp_oauth;
 pub mod mcp_output;
@@ -142,11 +144,21 @@ pub use mcp::{
     scoped_mcp_config_hash, unwrap_ccr_proxy_url,
 };
 pub use mcp_approvals::{approve_mcp_server, McpApprovalOutcome, McpApprovals};
+pub use mcp_catalog::{
+    verify_mcp_catalog_update, McpCatalog, McpCatalogEntry, McpCatalogVariable, McpToolTier,
+    MCP_CATALOG_UPDATE_PUBLIC_KEY,
+};
 pub use mcp_client::{
     McpClientAuth, McpClientBootstrap, McpClientTransport, McpManagedProxyTransport,
     McpRemoteTransport, McpSdkTransport, McpStdioTransport,
 };
 pub use mcp_http::expand_env_refs as expand_mcp_header_value;
+pub use mcp_install::{
+    delete_mcp_secret, expand_mcp_header, install_mcp_server, load_mcp_secret,
+    mcp_catalog_entry_for, mcp_catalog_servers, mcp_secret_key, mcp_secret_target,
+    missing_mcp_variables, remove_mcp_server, resolve_mcp_secret_references, save_mcp_secret,
+    McpInstallOutcome, McpInstallRequest, McpInstallScope, McpRemoveOutcome,
+};
 pub use mcp_lifecycle_hardened::{
     McpDegradedReport, McpErrorSurface, McpFailedServer, McpLifecyclePhase, McpLifecycleState,
     McpLifecycleValidator, McpPhaseResult,

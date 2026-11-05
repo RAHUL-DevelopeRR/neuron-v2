@@ -476,7 +476,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .join("logs")
             .join("mcp-servers.log"),
     ));
-    // Remote MCP servers' OAuth tokens: the OS keychain (or a 0600 file).
+    // Remote MCP servers' OAuth tokens and connector secrets: the OS keychain (or a
+    // 0600 file).
     mcp_auth::install_token_store();
     let args: Vec<String> = env::args().skip(1).collect();
     let (args, provider_choice) = extract_provider_flag(&args).map_err(UsageError)?;

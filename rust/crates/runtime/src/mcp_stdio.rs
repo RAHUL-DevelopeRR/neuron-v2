@@ -1697,7 +1697,9 @@ impl McpStdioProcess {
 
 pub fn spawn_mcp_stdio_process(bootstrap: &McpClientBootstrap) -> io::Result<McpStdioProcess> {
     match &bootstrap.transport {
-        McpClientTransport::Stdio(transport) => McpStdioProcess::spawn(transport),
+        McpClientTransport::Stdio(transport) => McpStdioProcess::spawn(
+            &crate::mcp_install::stdio_transport_with_secrets(&bootstrap.server_name, transport)?,
+        ),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(

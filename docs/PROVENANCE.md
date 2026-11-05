@@ -15,6 +15,7 @@ summary, not legal advice.
 | `ui/neuron-tui/` (the `neuron-tui` binaries), including `src/vendor/common/` | Freebuff's `cli/` and 31 files of its `common/src`, [CodebuffAI/freebuff](https://github.com/CodebuffAI/freebuff) commit `545e04d`, modified since | Apache-2.0, "Copyright 2025 Codebuff" (`ui/neuron-tui/LICENSE`, `NOTICE`, kept unchanged) | Codebuff services, ads, billing and telemetry removed; see `ui/neuron-tui/PORTING.md`. Changed files carry a derivation header. The binary bundles Bun and npm packages (OpenTUI, React), listed in `THIRD_PARTY_NOTICES.md`. |
 | Rust crate dependencies | crates.io | Per crate; see `THIRD_PARTY_NOTICES.md` on each release | See [crate licenses](#crate-licenses). |
 | npm dependencies `codebase-memory-mcp`, `@playwright/mcp` | npm registry | MIT; Apache-2.0 | Installed next to the npm package, not bundled into it. |
+| `rust/crates/runtime/mcp-catalog/` (connector catalog) | Written for Neuron; names, versions, launch commands and tool names of third-party MCP servers, checked against their repositories and registries on 2026-11-04 (`SOURCES.md`) | MIT (as Neuron) | No server code is copied or bundled; each server is fetched from its own registry under its own licence when a user adds it. |
 | `assets/` | Claw Code | Not covered by the MIT grant | See [assets](#assets). |
 | Launchers, installers, release pipeline, `docs/GATEWAY_CONTRACT.md` | Written for Neuron | MIT, "Copyright (c) 2026 RAHUL S / Zero-X" | |
 

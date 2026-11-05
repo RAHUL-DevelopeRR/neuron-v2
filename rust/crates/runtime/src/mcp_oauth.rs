@@ -79,7 +79,7 @@ pub fn set_mcp_token_store(store: Option<Arc<dyn McpTokenStore>>) {
     *TOKEN_STORE.write().unwrap_or_else(PoisonError::into_inner) = store;
 }
 
-fn token_store() -> Option<Arc<dyn McpTokenStore>> {
+pub(crate) fn token_store() -> Option<Arc<dyn McpTokenStore>> {
     TOKEN_STORE
         .read()
         .unwrap_or_else(PoisonError::into_inner)

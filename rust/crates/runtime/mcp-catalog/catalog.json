@@ -1,0 +1,468 @@
+{
+  "version": "2026-11-04.1",
+  "connectors": [
+    {
+      "id": "github",
+      "name": "GitHub",
+      "description": "Repositories, issues, pull requests, Actions and code search on GitHub.",
+      "publisher": "GitHub",
+      "official": true,
+      "licence": "MIT",
+      "source": "https://github.com/github/github-mcp-server",
+      "transport": "http",
+      "install": {
+        "kind": "remote",
+        "url": "https://api.githubcopilot.com/mcp/",
+        "headers": {
+          "Authorization": "Bearer ${secret:GITHUB_PERSONAL_ACCESS_TOKEN}"
+        }
+      },
+      "env": [
+        {
+          "name": "GITHUB_PERSONAL_ACCESS_TOKEN",
+          "label": "GitHub personal access token",
+          "secret": true,
+          "required": true,
+          "help_url": "https://github.com/settings/personal-access-tokens/new"
+        }
+      ],
+      "tools": {
+        "actions_get": "read",
+        "actions_list": "read",
+        "actions_run_trigger": "destructive",
+        "add_comment_to_pending_review": "write",
+        "add_issue_comment": "write",
+        "add_reply_to_pull_request_comment": "write",
+        "create_branch": "write",
+        "create_gist": "write",
+        "create_or_update_file": "write",
+        "create_pull_request": "write",
+        "create_repository": "write",
+        "delete_file": "destructive",
+        "delete_repository": "destructive",
+        "discussion_comment_write": "write",
+        "dismiss_notification": "write",
+        "fork_repository": "write",
+        "get_code_scanning_alert": "read",
+        "get_commit": "read",
+        "get_dependabot_alert": "read",
+        "get_discussion": "read",
+        "get_discussion_comments": "read",
+        "get_file_contents": "read",
+        "get_gist": "read",
+        "get_global_security_advisory": "read",
+        "get_job_logs": "read",
+        "get_label": "read",
+        "get_latest_release": "read",
+        "get_me": "read",
+        "get_notification_details": "read",
+        "get_release_by_tag": "read",
+        "get_repository_tree": "read",
+        "get_secret_scanning_alert": "read",
+        "get_tag": "read",
+        "get_team_members": "read",
+        "get_teams": "read",
+        "github_support_docs_search": "read",
+        "issue_read": "read",
+        "issue_write": "write",
+        "label_write": "write",
+        "list_branches": "read",
+        "list_code_scanning_alerts": "read",
+        "list_commits": "read",
+        "list_dependabot_alerts": "read",
+        "list_discussion_categories": "read",
+        "list_discussions": "read",
+        "list_gists": "read",
+        "list_global_security_advisories": "read",
+        "list_issue_types": "read",
+        "list_issues": "read",
+        "list_label": "read",
+        "list_notifications": "read",
+        "list_pull_requests": "read",
+        "list_releases": "read",
+        "list_secret_scanning_alerts": "read",
+        "list_starred_repositories": "read",
+        "list_tags": "read",
+        "mark_all_notifications_read": "write",
+        "merge_pull_request": "destructive",
+        "pull_request_read": "read",
+        "pull_request_review_write": "write",
+        "push_files": "write",
+        "search_code": "read",
+        "search_commits": "read",
+        "search_issues": "read",
+        "search_orgs": "read",
+        "search_pull_requests": "read",
+        "search_repositories": "read",
+        "search_users": "read",
+        "star_repository": "write",
+        "sub_issue_write": "write",
+        "unstar_repository": "write",
+        "update_gist": "write",
+        "update_issue_comment": "write",
+        "update_pull_request": "write",
+        "update_pull_request_branch": "write"
+      },
+      "default_tier": "external",
+      "sandbox": {
+        "network": ["api.githubcopilot.com"]
+      },
+      "default_scope": "user"
+    },
+    {
+      "id": "filesystem",
+      "name": "Filesystem",
+      "description": "Read, write and search files in the folder Neuron runs in.",
+      "publisher": "Model Context Protocol project",
+      "official": true,
+      "licence": "MIT OR Apache-2.0",
+      "source": "https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem",
+      "transport": "stdio",
+      "install": {
+        "kind": "npm",
+        "package": "@modelcontextprotocol/server-filesystem",
+        "version": "2.1.0",
+        "integrity": "sha512-BMihuyTNi975iQTQDsZ6x+JVg99CAiX83jBV0wGMyc/0DcBO55ulCQqEzwx7lbG5U9/97XiPP9n0sK/iUtSsEg==",
+        "args": ["."]
+      },
+      "tools": {
+        "create_directory": "write",
+        "directory_tree": "read",
+        "edit_file": "write",
+        "get_file_info": "read",
+        "list_allowed_directories": "read",
+        "list_directory": "read",
+        "list_directory_with_sizes": "read",
+        "move_file": "destructive",
+        "read_media_file": "read",
+        "read_multiple_files": "read",
+        "read_text_file": "read",
+        "search_files": "read",
+        "write_file": "destructive"
+      },
+      "default_tier": "write",
+      "sandbox": {
+        "fs_read": ["."],
+        "fs_write": ["."],
+        "network": ["registry.npmjs.org"]
+      },
+      "default_scope": "user"
+    },
+    {
+      "id": "git",
+      "name": "Git",
+      "description": "Status, diffs, history, staging and commits in the repository Neuron runs in.",
+      "publisher": "Model Context Protocol project",
+      "official": true,
+      "licence": "MIT",
+      "source": "https://github.com/modelcontextprotocol/servers/tree/main/src/git",
+      "transport": "stdio",
+      "install": {
+        "kind": "uv",
+        "package": "mcp-server-git",
+        "version": "2026.10.28",
+        "integrity": "sha256:3c4a908d0f13731229bccd52b640147747413461d171297e9cdbc855783a9119",
+        "args": ["--repository", "."]
+      },
+      "tools": {
+        "git_add": "write",
+        "git_branch": "read",
+        "git_checkout": "write",
+        "git_commit": "write",
+        "git_create_branch": "write",
+        "git_diff": "read",
+        "git_diff_staged": "read",
+        "git_diff_unstaged": "read",
+        "git_log": "read",
+        "git_reset": "destructive",
+        "git_show": "read",
+        "git_status": "read"
+      },
+      "default_tier": "write",
+      "sandbox": {
+        "fs_read": ["."],
+        "fs_write": ["."],
+        "network": ["pypi.org", "files.pythonhosted.org"]
+      },
+      "default_scope": "user"
+    },
+    {
+      "id": "fetch",
+      "name": "Fetch",
+      "description": "Fetch a web page and hand it to the model as Markdown.",
+      "publisher": "Model Context Protocol project",
+      "official": true,
+      "licence": "MIT",
+      "source": "https://github.com/modelcontextprotocol/servers/tree/main/src/fetch",
+      "transport": "stdio",
+      "install": {
+        "kind": "uv",
+        "package": "mcp-server-fetch",
+        "version": "2026.10.28",
+        "integrity": "sha256:b339038f5942ce9a2b067f8e9466447c88433296ba2589321bec20d533a4d2c5"
+      },
+      "tools": {
+        "fetch": "external"
+      },
+      "default_tier": "external",
+      "sandbox": {
+        "network": ["*"]
+      },
+      "default_scope": "user"
+    },
+    {
+      "id": "memory",
+      "name": "Memory",
+      "description": "A local knowledge graph the agent keeps across sessions.",
+      "publisher": "Model Context Protocol project",
+      "official": true,
+      "licence": "MIT OR Apache-2.0",
+      "source": "https://github.com/modelcontextprotocol/servers/tree/main/src/memory",
+      "transport": "stdio",
+      "install": {
+        "kind": "npm",
+        "package": "@modelcontextprotocol/server-memory",
+        "version": "2.0.1",
+        "integrity": "sha512-RbX5cm/OUbvBguVzHhJIqvG15b5K/bLODtQhHeQTkuM6XrijDtCFLl2THgLDg9JnS6pUBomNWq9n5G2bQwxD3A=="
+      },
+      "env": [
+        {
+          "name": "MEMORY_FILE_PATH",
+          "label": "Where to keep the memory file (optional)",
+          "secret": false,
+          "required": false
+        }
+      ],
+      "tools": {
+        "add_observations": "write",
+        "create_entities": "write",
+        "create_relations": "write",
+        "delete_entities": "destructive",
+        "delete_observations": "destructive",
+        "delete_relations": "destructive",
+        "open_nodes": "read",
+        "read_graph": "read",
+        "search_nodes": "read"
+      },
+      "default_tier": "write",
+      "sandbox": {
+        "network": ["registry.npmjs.org"]
+      },
+      "default_scope": "user"
+    },
+    {
+      "id": "playwright",
+      "name": "Playwright",
+      "description": "Drive a browser: open pages, click, type, read and screenshot them.",
+      "publisher": "Microsoft",
+      "official": true,
+      "licence": "Apache-2.0",
+      "source": "https://github.com/microsoft/playwright-mcp",
+      "transport": "stdio",
+      "install": {
+        "kind": "npm",
+        "package": "@playwright/mcp",
+        "version": "0.0.83",
+        "integrity": "sha512-oNcl+Ae2/IAjhfPeP46BfIkSakfmprY+aOtkv5MjrQ4lPav4/yNtPhL0iq8SlIM90oApWgBDUxaNKvktazUKOg=="
+      },
+      "tools": {
+        "browser_console_messages": "read",
+        "browser_network_requests": "read",
+        "browser_snapshot": "read",
+        "browser_tabs": "read",
+        "browser_take_screenshot": "read",
+        "browser_wait_for": "read"
+      },
+      "default_tier": "external",
+      "sandbox": {
+        "network": ["*"]
+      },
+      "default_scope": "user"
+    },
+    {
+      "id": "codebase-memory",
+      "name": "Codebase memory",
+      "description": "A code graph of the repository for fast symbol, call-path and architecture questions.",
+      "publisher": "DeusData",
+      "official": true,
+      "licence": "MIT",
+      "source": "https://github.com/DeusData/codebase-memory-mcp",
+      "transport": "stdio",
+      "install": {
+        "kind": "npm",
+        "package": "codebase-memory-mcp",
+        "version": "0.11.0",
+        "integrity": "sha512-BXPeAIQQOH2iKPYMcNOiRezj1BeBGkIfAAQ99GWSRMsvHxMUrGiuJqhJH1uTdN4hs6kRkqPnmpjCfy05hANKIg=="
+      },
+      "tools": {
+        "detect_changes": "read",
+        "index_repository": "write",
+        "index_status": "read",
+        "list_projects": "read",
+        "query_graph": "read",
+        "search_code": "read",
+        "search_graph": "read",
+        "trace_path": "read"
+      },
+      "default_tier": "write",
+      "sandbox": {
+        "fs_read": ["."],
+        "network": ["registry.npmjs.org", "github.com"]
+      },
+      "default_scope": "user"
+    },
+    {
+      "id": "supabase",
+      "name": "Supabase",
+      "description": "Supabase projects: tables, migrations, SQL, logs, edge functions and branches.",
+      "publisher": "Supabase",
+      "official": true,
+      "licence": "Apache-2.0",
+      "source": "https://github.com/supabase/mcp",
+      "transport": "http",
+      "install": {
+        "kind": "remote",
+        "url": "https://mcp.supabase.com/mcp",
+        "oauth": true
+      },
+      "tools": {
+        "apply_migration": "destructive",
+        "confirm_cost": "write",
+        "create_branch": "destructive",
+        "create_project": "destructive",
+        "delete_branch": "destructive",
+        "deploy_edge_function": "destructive",
+        "execute_sql": "destructive",
+        "generate_typescript_types": "read",
+        "get_advisors": "read",
+        "get_cost": "read",
+        "get_edge_function": "read",
+        "get_logs": "read",
+        "get_organization": "read",
+        "get_project": "read",
+        "get_project_url": "read",
+        "get_publishable_keys": "read",
+        "get_storage_config": "read",
+        "list_branches": "read",
+        "list_edge_functions": "read",
+        "list_extensions": "read",
+        "list_migrations": "read",
+        "list_organizations": "read",
+        "list_projects": "read",
+        "list_storage_buckets": "read",
+        "list_tables": "read",
+        "merge_branch": "destructive",
+        "pause_project": "destructive",
+        "rebase_branch": "destructive",
+        "reset_branch": "destructive",
+        "restore_project": "destructive",
+        "search_docs": "read",
+        "update_storage_config": "destructive"
+      },
+      "default_tier": "external",
+      "sandbox": {
+        "network": ["mcp.supabase.com"]
+      },
+      "default_scope": "user"
+    },
+    {
+      "id": "context7",
+      "name": "Context7",
+      "description": "Current documentation and code examples for libraries and frameworks.",
+      "publisher": "Upstash",
+      "official": true,
+      "licence": "MIT",
+      "source": "https://github.com/upstash/context7",
+      "transport": "http",
+      "install": {
+        "kind": "remote",
+        "url": "https://mcp.context7.com/mcp",
+        "headers": {
+          "Authorization": "Bearer ${secret:CONTEXT7_API_KEY}"
+        }
+      },
+      "env": [
+        {
+          "name": "CONTEXT7_API_KEY",
+          "label": "Context7 API key (optional, raises the rate limit)",
+          "secret": true,
+          "required": false,
+          "help_url": "https://context7.com/dashboard"
+        }
+      ],
+      "tools": {
+        "query-docs": "read",
+        "resolve-library-id": "read"
+      },
+      "default_tier": "external",
+      "sandbox": {
+        "network": ["mcp.context7.com"]
+      },
+      "default_scope": "user"
+    },
+    {
+      "id": "cloudflare-docs",
+      "name": "Cloudflare docs",
+      "description": "Search Cloudflare's developer documentation.",
+      "publisher": "Cloudflare",
+      "official": true,
+      "licence": "Apache-2.0",
+      "source": "https://github.com/cloudflare/mcp-server-cloudflare",
+      "transport": "http",
+      "install": {
+        "kind": "remote",
+        "url": "https://docs.mcp.cloudflare.com/mcp"
+      },
+      "tools": {
+        "migrate_pages_to_workers_guide": "read",
+        "search_cloudflare_documentation": "read"
+      },
+      "default_tier": "external",
+      "sandbox": {
+        "network": ["docs.mcp.cloudflare.com"]
+      },
+      "default_scope": "user"
+    },
+    {
+      "id": "aws-docs",
+      "name": "AWS documentation",
+      "description": "Search and read AWS documentation and get related pages.",
+      "publisher": "AWS Labs",
+      "official": true,
+      "licence": "Apache-2.0",
+      "source": "https://github.com/awslabs/mcp/tree/main/src/aws-documentation-mcp-server",
+      "transport": "stdio",
+      "install": {
+        "kind": "uv",
+        "package": "awslabs.aws-documentation-mcp-server",
+        "version": "1.2.4",
+        "integrity": "sha256:f9101573807df4b852201c108ea38bc02c6724d1e51e0de354a38e0779cee0b6",
+        "env": {
+          "FASTMCP_LOG_LEVEL": "ERROR"
+        }
+      },
+      "env": [
+        {
+          "name": "AWS_DOCUMENTATION_PARTITION",
+          "label": "AWS partition: aws, or aws-cn for the China documentation",
+          "secret": false,
+          "required": false,
+          "default": "aws"
+        }
+      ],
+      "tools": {
+        "get_available_services": "read",
+        "read_documentation": "read",
+        "read_sections": "read",
+        "recommend": "read",
+        "search_documentation": "read",
+        "search_table": "read"
+      },
+      "default_tier": "external",
+      "sandbox": {
+        "network": ["docs.aws.amazon.com", "proxy.search.docs.aws.amazon.com", "pypi.org", "files.pythonhosted.org"]
+      },
+      "default_scope": "user"
+    }
+  ]
+}
