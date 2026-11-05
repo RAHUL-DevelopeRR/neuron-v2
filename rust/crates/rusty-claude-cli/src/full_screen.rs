@@ -149,16 +149,39 @@ pub(crate) fn fits_full_screen(size: Option<(u16, u16)>) -> bool {
     }
 }
 
-/// Why the line REPL runs in place of the UI in a small terminal.
-fn too_small_note(columns: u16, rows: u16) -> String {
-    format!(
-        "The terminal is {columns}x{rows}; the full-screen UI needs {MIN_UI_COLUMNS}x{MIN_UI_ROWS}, so the line REPL runs. Make the window bigger and start neuron again to use the UI."
-    )
+/// What a caller of [`ui_binary`] does when the terminal is too small for the UI, so
+/// the note on stderr says what happens next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SmallTerminalFallback {
+    /// The line REPL runs (`neuron`, an interactive `--resume`).
+    LineRepl,
+    /// The prompt runs as plain text (`neuron "prompt"`).
+    PlainText,
+    /// Nothing can run without the UI (`--continue`).
+    None,
 }
 
-/// The UI to start instead of the line REPL, or `None`: turned off, not on a
-/// terminal, a terminal too small for it (with a note on stderr), or not installed.
-pub(crate) fn ui_binary(no_tui_flag: bool) -> Option<PathBuf> {
+/// Why the UI does not start in a small terminal, and what happens instead.
+fn too_small_note(columns: u16, rows: u16, fallback: SmallTerminalFallback) -> String {
+    let size = format!(
+        "The terminal is {columns}x{rows}; the full-screen UI needs {MIN_UI_COLUMNS}x{MIN_UI_ROWS}"
+    );
+    match fallback {
+        SmallTerminalFallback::LineRepl => format!(
+            "{size}, so the line REPL runs. Make the window bigger and start neuron again to use the UI."
+        ),
+        SmallTerminalFallback::PlainText => format!(
+            "{size}, so the prompt runs here as plain text. Make the window bigger to use the UI."
+        ),
+        SmallTerminalFallback::None => {
+            format!("{size}. Make the window bigger and run the command again.")
+        }
+    }
+}
+
+/// The UI to start, or `None`: turned off, not on a terminal, a terminal too small for
+/// it (with a note on stderr saying what runs instead, `fallback`), or not installed.
+pub(crate) fn ui_binary(no_tui_flag: bool, fallback: SmallTerminalFallback) -> Option<PathBuf> {
     if no_tui_flag || env_truthy("NEURON_NO_TUI") {
         return None;
     }
@@ -170,7 +193,7 @@ pub(crate) fn ui_binary(no_tui_flag: bool) -> Option<PathBuf> {
     let size = crossterm::terminal::size().ok();
     if !fits_full_screen(size) {
         if let Some((columns, rows)) = size {
-            eprintln!("{}", too_small_note(columns, rows));
+            eprintln!("{}", too_small_note(columns, rows, fallback));
         }
         return None;
     }
@@ -547,10 +570,26 @@ mod tests {
         // Unknown, or reported as zero before the first resize: the UI checks itself.
         assert!(fits_full_screen(None));
         assert!(fits_full_screen(Some((0, 0))));
-        let note = too_small_note(40, 10);
+        let note = too_small_note(40, 10, SmallTerminalFallback::LineRepl);
         assert!(note.contains("40x10"), "{note}");
         assert!(note.contains("60x16"), "{note}");
+        assert!(note.contains("line REPL runs"), "{note}");
         assert!(!note.to_ascii_lowercase().contains("claude"), "{note}");
+    }
+
+    /// The note says what each caller does next: `neuron "prompt"` answers as plain
+    /// text, and `--continue` has nothing to fall back to.
+    #[test]
+    fn the_too_small_note_says_what_runs_instead() {
+        let prompt = too_small_note(40, 10, SmallTerminalFallback::PlainText);
+        assert!(prompt.contains("plain text"), "{prompt}");
+        assert!(!prompt.contains("REPL"), "{prompt}");
+        let resume = too_small_note(40, 10, SmallTerminalFallback::None);
+        assert!(resume.contains("Make the window bigger and run the command again"), "{resume}");
+        assert!(!resume.contains("REPL") && !resume.contains("plain text"), "{resume}");
+        for note in [prompt, resume] {
+            assert!(note.contains("40x10") && note.contains("60x16"), "{note}");
+        }
     }
 
     #[test]

@@ -13,7 +13,8 @@
  * the user can stop a turn or quit.
  *
  * The launcher (`neuron`, rust full_screen.rs) checks the same size before it
- * starts this UI and runs the line REPL in a smaller terminal.
+ * starts this UI; in a smaller terminal it runs the line REPL (or answers a
+ * `neuron "prompt"` as plain text) and says so.
  */
 
 import { useAppContext } from '@opentui/react'

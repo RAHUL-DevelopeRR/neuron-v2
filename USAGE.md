@@ -31,9 +31,11 @@ settings, hooks and MCP servers are not loaded, and `/status` says how to trust 
 (see [Workspace trust](#workspace-trust)).
 
 The UI needs a terminal of at least 60 columns by 16 rows. In a smaller one `neuron`
-starts the line REPL instead and says why; a terminal made smaller while the UI runs
-shows "Terminal too small" until it is big enough again (the chat and a running turn
-carry on underneath). In a terminal set up for Chinese, Japanese or Korean, where the
+starts the line REPL instead and says why (`neuron "prompt"` answers it as plain text,
+and `neuron --continue` asks you to make the window bigger); a terminal made smaller
+while the UI runs shows "Terminal too small" until it is big enough again (the chat
+and a running turn carry on underneath; keys are ignored until the chat is back, but
+Ctrl+C still stops a turn). In a terminal set up for Chinese, Japanese or Korean, where the
 status bar's `│ ● ○` glyphs take two columns each, the bar measures them that way
 (from `LC_ALL`, `LC_CTYPE` or `LANG`; `NEURON_AMBIGUOUS_WIDE=1` or `0` says so
 explicitly).

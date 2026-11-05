@@ -590,7 +590,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // `neuron "fix the bug"` on a terminal: the full-screen UI, which sends the
             // prompt first. `-p` and `neuron prompt` stay plain text for scripts.
             if prompt_opens_ui(crate::args::bare_prompt_given(), output_format, compact) {
-                if let Some(ui) = full_screen::ui_binary(no_tui) {
+                if let Some(ui) =
+                    full_screen::ui_binary(no_tui, full_screen::SmallTerminalFallback::PlainText)
+                {
                     let launch = full_screen::UiLaunch {
                         model: crate::args::typed_model_arg(),
                         provider: provider::provider_flag(),
@@ -643,7 +645,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             // On a terminal with the full-screen UI installed, it takes the
             // REPL's place (`--no-tui` or NEURON_NO_TUI keeps the REPL).
-            if let Some(ui) = full_screen::ui_binary(no_tui) {
+            // `--continue` has no line REPL to fall back to.
+            let fallback = if continue_chat.is_some() {
+                full_screen::SmallTerminalFallback::None
+            } else {
+                full_screen::SmallTerminalFallback::LineRepl
+            };
+            if let Some(ui) = full_screen::ui_binary(no_tui, fallback) {
                 let launch = full_screen::UiLaunch {
                     model: crate::args::typed_model_arg(),
                     provider: provider::provider_flag(),
@@ -1015,8 +1023,16 @@ fn resume_session(
             && io::stdout().is_terminal()
         {
             // The full-screen UI when it is installed: its engine continues the session.
-            let ui = full_screen::ui_binary(crate::args::no_tui_flag_given())
-                .filter(|_| resume_opens_ui(detect_broad_cwd().is_some(), launch.allow_broad_cwd));
+            // Asked only when the UI would open, so a terminal that is too small is
+            // mentioned only then; the line REPL runs otherwise.
+            let ui = resume_opens_ui(detect_broad_cwd().is_some(), launch.allow_broad_cwd)
+                .then(|| {
+                    full_screen::ui_binary(
+                        crate::args::no_tui_flag_given(),
+                        full_screen::SmallTerminalFallback::LineRepl,
+                    )
+                })
+                .flatten();
             if let Some(ui) = ui {
                 let resume = resolved_path.display().to_string();
                 let options =

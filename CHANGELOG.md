@@ -5,6 +5,11 @@ The release workflow copies a version's section into its GitHub release notes.
 
 ## 7.0.0-alpha.4 (unreleased)
 
+- Full-screen UI: in a terminal too small for it, the note on stderr says what runs
+  instead (the line REPL, or a plain-text answer for `neuron "prompt"`), and for
+  `--continue` asks for a bigger window. While "Terminal too small" shows, keys and
+  pastes are dropped (Ctrl+C still works), so a hidden permission prompt or the
+  composer is never answered unseen.
 - Full-screen UI: in a terminal that draws East Asian ambiguous-width characters two
   columns wide (a Chinese, Japanese or Korean locale, or `NEURON_AMBIGUOUS_WIDE=1`),
   the status bar measures its `│ ● ○ ◑` glyphs as two columns, so it still fits its row.
