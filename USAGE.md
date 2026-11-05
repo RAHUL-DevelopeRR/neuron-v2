@@ -491,6 +491,20 @@ marks any other stdio server `unpinned`; `/mcp pin <server>` (or `neuron mcp pin
 starts from that from then on (see
 [pinning other servers](docs/DEFAULT_INTEGRATIONS.md#pinning-other-servers)).
 
+In the full-screen UI, `/mcp` (or a click on the status bar's connectors chip,
+`⧉ 5/6`: servers up of those turned on, amber when one needs you, a lock when the
+connector policy requires one) opens the MCP panel. Its **Installed** tab lists each
+server with its transport, scope and state: space turns it on or off (not a required
+one, marked with a lock), `a` approves a workspace server waiting for approval, `c`
+opens the page that links a hosted connector, `l` signs in to a remote server that
+needs it (`/mcp login <server>`), and `x` twice removes a server with its secrets.
+Tab opens the **Add** tab: type to search the catalog, Enter picks a connector, then
+fill its variables (secret ones are masked, and pasting works), name it, pick its
+scope (`user`: every folder; `project`: this repository, shared; `local`: this folder,
+not committed) with ←/→, and Enter adds it. A call of an MCP tool in the transcript
+names its connector and, for catalog and hosted connectors, the tool's tier
+(`github · merge_pull_request [destructive]`).
+
 ### Workspace trust
 
 A cloned repository's own settings files (`.neuron.json`, `.neuron/settings*.json`
@@ -509,7 +523,9 @@ Hooks, MCP servers, allow and ask rules, model, aliases, provider and the other 
 are ignored, with a warning naming them. Once a directory is trusted, each MCP server
 its settings (or its `.mcp.json`) add still waits for your approval
 (`/mcp approve <server>`), and asks again when its command, arguments, environment,
-headers or URL change.
+headers or URL change. The full-screen UI's trust screen lists those servers with a
+checkbox each (↑/↓ and space); the ones you tick are approved as soon as the folder is
+trusted, and the others wait in `/mcp`.
 Even in a trusted directory, settings files
 cannot set a full-access permission mode; pass `--permission-mode danger-full-access`
 or put it in your user settings.
@@ -556,7 +572,7 @@ Two policies decide which MCP servers may start, the first one winning:
 | --- | --- |
 | `allow` | Only these may start: catalog ids (`github`), `catalog:*` (any catalog connector) or server-name patterns (`corp-*`). A catalog id matches only that connector as the catalog writes it, never a server that merely has that name |
 | `deny` | Never start: the same forms; a catalog id also refuses a server of that name, one that runs the connector's package at another version (`npx -y @playwright/mcp@latest`, `python -m mcp_server_git`) and one on its remote host. A deny list is still a best effort, since a server can run the same code some other way: to be sure only approved servers run, use `allow` or `"allowUnvetted": false` |
-| `required` | Always configured and on: catalog ids, or servers the managed settings define. A required server cannot be turned off (`/mcp disable`, the panel shows `[req]`) or removed, needs no workspace approval, and also starts in `neuron prompt` runs. A `permissions.deny` rule in your or a workspace's settings does not keep it from starting (it still refuses the tools it covers); only the managed settings' own deny rules block it |
+| `required` | Always configured and on: catalog ids, or servers the managed settings define. A required server cannot be turned off (`/mcp disable`, the panel shows a lock, or `[req]` in a classic console) or removed, needs no workspace approval, and also starts in `neuron prompt` runs. A `permissions.deny` rule in your or a workspace's settings does not keep it from starting (it still refuses the tools it covers); only the managed settings' own deny rules block it |
 | `allowUnvetted` | `false`: only catalog connectors may start |
 | `allowStdio` | `false`: no local (stdio) servers |
 | `allowedRemoteHosts` | Remote servers may reach only these hosts (`example.com`, `*.example.com`) |

@@ -1,35 +1,59 @@
 /**
  * The MCP servers panel (`/mcp` while the engine lists the `mcp_toggle`
- * feature): open or not, the servers of the last `extensions` event, and the
- * server whose switch was just sent. engine/mcp-panel.ts feeds it.
+ * feature) and what the rest of the UI knows about the servers.
+ *
+ * `known` is the last `extensions` event, kept whether the panel is open or
+ * not: the status bar's connectors chip and the tool cells of `mcp__` calls
+ * read it. While the panel is open, `servers` is what it lists (`null` until
+ * the engine answered), `tab` which of its tabs shows (the servers, or the
+ * connector catalog to add one from), and `pending` the server whose change
+ * was just sent. engine/mcp-panel.ts feeds it.
  */
 
 import { create } from 'zustand'
 
-import type { McpServerInfo } from '../engine/protocol'
+import type { ConnectorInfo, McpServerInfo } from '../engine/protocol'
+
+export type McpPanelTab = 'installed' | 'add'
 
 export interface McpPanelState {
   open: boolean
+  tab: McpPanelTab
   /** `null` until the engine answered `list_extensions`. */
   servers: McpServerInfo[] | null
-  /** The server whose switch was sent and not answered yet. */
+  /** The servers of the last `extensions` event, panel open or not. */
+  known: McpServerInfo[] | null
+  /** The server whose change was sent and not answered yet. */
   pending: string | null
-  openPanel: () => void
+  /** The catalog's connectors for the Add tab; `null` until the engine answered. */
+  catalog: { version: string; connectors: ConnectorInfo[] } | null
+  openPanel: (tab?: McpPanelTab) => void
   close: () => void
+  setTab: (tab: McpPanelTab) => void
   setServers: (servers: McpServerInfo[]) => void
+  setKnown: (servers: McpServerInfo[]) => void
   setPending: (name: string | null) => void
+  setCatalog: (catalog: { version: string; connectors: ConnectorInfo[] } | null) => void
   reset: () => void
 }
 
 export const useMcpPanelStore = create<McpPanelState>()((set) => ({
   open: false,
+  tab: 'installed',
   servers: null,
+  known: null,
   pending: null,
-  openPanel: () => set({ open: true, servers: null, pending: null }),
+  catalog: null,
+  openPanel: (tab = 'installed') =>
+    set({ open: true, tab, servers: null, pending: null, catalog: null }),
   close: () => set({ open: false, pending: null }),
-  setServers: (servers) => set({ servers, pending: null }),
+  setTab: (tab) => set({ tab }),
+  setServers: (servers) => set({ servers, known: servers, pending: null }),
+  setKnown: (known) => set({ known }),
   setPending: (pending) => set({ pending }),
-  reset: () => set({ open: false, servers: null, pending: null }),
+  setCatalog: (catalog) => set({ catalog }),
+  reset: () =>
+    set({ open: false, tab: 'installed', servers: null, known: null, pending: null, catalog: null }),
 }))
 
 /** A server is on unless the engine says otherwise (older engines leave it out). */
@@ -38,12 +62,33 @@ export const serverEnabled = (server: McpServerInfo): boolean => server.enabled 
 /** The connector policy requires the server: its switch is locked on. */
 export const serverLocked = (server: McpServerInfo): boolean => server.required === true
 
+/** A new or changed workspace server, waiting for the user to approve it. */
+export const serverNeedsApproval = (server: McpServerInfo): boolean =>
+  server.status === 'needs_approval'
+
+/**
+ * A remote server that needs a sign-in: its error names `neuron mcp login`
+ * (or says it needs signing in).
+ */
+export function serverNeedsSignIn(server: McpServerInfo): boolean {
+  if (server.transport !== 'http' && server.transport !== 'sse') return false
+  return /mcp login|sign[ -]?in/i.test(server.error ?? '')
+}
+
 /**
  * The page that links a hosted connector the Zero-X account has not linked yet
  * (status `needs_connect`); `null` for any other server.
  */
 export function serverConnectUrl(server: McpServerInfo): string | null {
   return server.status === 'needs_connect' && server.connect_url ? server.connect_url : null
+}
+
+/** A server in a state that needs the user (failed, blocked, waiting for approval or a link). */
+export function serverNeedsAttention(server: McpServerInfo): boolean {
+  if (!serverEnabled(server)) return false
+  return ['failed', 'blocked', 'needs_approval', 'needs_connect', 'unsupported'].includes(
+    server.status,
+  )
 }
 
 /** `ready · 4 tools`, `off`, `failed: why`, ... for a row. */
@@ -59,4 +104,29 @@ export function serverSummary(server: McpServerInfo): string {
   return server.error
     ? `${status}: ${server.error}`
     : `${status}${tools}${required}${unpinned}`
+}
+
+/** What the status bar's connectors chip says about the servers. */
+export interface ConnectorsChip {
+  /** Servers that are up. */
+  ready: number
+  /** Servers that are turned on. */
+  total: number
+  /** One needs the user (failed, blocked, waiting for approval or a link). */
+  warning: boolean
+  /** The connector policy requires one of them. */
+  locked: boolean
+}
+
+/** The chip for the known servers; `null` before any are known or with none turned on. */
+export function connectorsChip(servers: McpServerInfo[] | null): ConnectorsChip | null {
+  if (!servers) return null
+  const on = servers.filter(serverEnabled)
+  if (on.length === 0) return null
+  return {
+    ready: on.filter((server) => server.status === 'ready').length,
+    total: on.length,
+    warning: on.some(serverNeedsAttention),
+    locked: on.some(serverLocked),
+  }
 }

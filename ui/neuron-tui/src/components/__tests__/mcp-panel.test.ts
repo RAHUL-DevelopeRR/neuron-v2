@@ -36,7 +36,7 @@ describe('the MCP servers panel', () => {
     expect(resolveMcpKey({ name: 'return', ctrl: false, meta: false })).toEqual({ type: 'toggle' })
     expect(resolveMcpKey({ name: 'escape', ctrl: false, meta: false })).toEqual({ type: 'close' })
     expect(resolveMcpKey({ name: 'c', ctrl: true, meta: false })).toEqual({ type: 'close' })
-    expect(resolveMcpKey({ name: 'x', ctrl: false, meta: false })).toEqual({ type: 'none' })
+    expect(resolveMcpKey({ name: 'z', ctrl: false, meta: false })).toEqual({ type: 'none' })
     expect(resolveMcpKey({ name: 'c', ctrl: false, meta: false })).toEqual({ type: 'connect' })
   })
 
@@ -100,7 +100,7 @@ describe('the MCP servers panel', () => {
     )
   })
 
-  test('extensions fill the panel only while it is open', () => {
+  test('extensions fill the panel only while it is open; the chip keeps them either way', () => {
     const event = {
       type: 'extensions' as const,
       mcp_servers: [server()],
@@ -108,7 +108,9 @@ describe('the MCP servers panel', () => {
       skills: [],
       agents: [],
     }
-    expect(handleMcpPanelEvent(event)).toBe(false)
+    expect(handleMcpPanelEvent(event)).toBe(true)
+    expect(useMcpPanelStore.getState().servers).toBeNull()
+    expect(useMcpPanelStore.getState().known).toEqual([server()])
     useMcpPanelStore.getState().openPanel()
     useMcpPanelStore.getState().setPending('docs')
     expect(handleMcpPanelEvent(event)).toBe(true)

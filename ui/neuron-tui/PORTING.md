@@ -489,7 +489,7 @@ The one-line engine footer under the input became a status bar of five
 clickable segments and the Zero-X account (`components/prompt-status-bar.tsx`,
 text and fitting in `utils/status-bar-parts.ts`):
 
-    G Gemini 2.5 Flash ▾ │ ● think high │ ⌂ neuron-v2 ⎇ main +1 ~2 │ ✎ Edit workspace │ ●●●◑○○○○○○ 35% ctx      Free · 5h 12% · 37/100 req
+    G Gemini 2.5 Flash ▾ │ ● think high │ ⌂ neuron-v2 ⎇ main +1 ~2 │ ✎ Edit workspace │ ⧉ 5/6 mcp │ ●●●◑○○○○○○ 35% ctx      Free · 5h 640K/1M · resets 14:20 · 37/100 req
 
 - **Model.** A provider monogram (`utils/provider-badge.ts`: plain letters,
   never a logo, brand colour or provider name) and the model's name; `auto`
@@ -513,10 +513,20 @@ text and fitting in `utils/status-bar-parts.ts`):
   the breakdown (system prompt, tools, project instructions, conversation, tool
   outputs, free), the session's tokens, and the account's 5-hour window and
   today's requests, read again every minute while it is open.
+- **Connectors.** `⧉ 5/6`: MCP servers up of those turned on, amber when one
+  needs the user (failed, blocked, waiting for approval or a link), a lock when
+  the connector policy requires one. Click opens the MCP panel.
+- **Account.** The plan, the Free token window as used/limit with its reset
+  time (`5h 640K/1M · resets 14:20`, amber from 80%, red from 95%, left out once
+  the reset time has passed) and today's requests.
 - **Narrow terminals.** Parts give way in a fixed order (the account group
-  shortens, labels go, then git counts, the folder, half the circles, the
-  account, the branch is cut, the thinking level and the circles go, the model
-  name is cut). The monogram, the permission mode and the percentage stay.
+  shortens to the window, labels go, then the reset time, git counts, the
+  folder, half the circles, the connectors chip, the branch is cut, the account
+  goes, the thinking level and the circles go, the model name is cut). The
+  monogram, the permission mode and the percentage stay. Every part is measured
+  in terminal columns (`utils/display-width.ts`), so wide characters count
+  twice; below 60x16 the UI shows "Terminal too small" instead
+  (`components/minimum-size-gate.tsx`).
 - **Engines.** The engine side is feature `status_bar` (protocol 1, additive
   fields only). Older engines still get a bar: no thinking segment, the old
   `context_percent` clamped to 100 and marked `~`, and the permission cycle runs
@@ -535,6 +545,23 @@ derivation header:
 Not ported: the rest of `freebuff-model-selector.tsx` (Freebucks, the session
 queue, referrals), `freebuff-chat-controls.tsx` (the admission queue) and the
 SDK run-state context source of Freebuff's status bar.
+
+## Agent questions and the MCP panel (alpha.4)
+
+- **Questions.** The UI declares the `questions` capability. A `question`
+  event is drawn in the turn's message as before (`engine/questions.ts`) and,
+  when it offers choices, opens Freebuff's question form
+  (`components/ask-user`, through its `AskUserBridge`), unchanged; the wiring is
+  Neuron's (`engine/question-form.ts`). The answer goes back as `answer` with
+  the event's id; Esc leaves the question to the input.
+- **MCP panel.** `components/mcp-panel.tsx` (Neuron's, from lane/mcp) has an
+  Installed tab and an Add tab; the Add tab's search, form and masked secret
+  fields are `utils/mcp-add-form.ts`. It does not use Freebuff's
+  `selectable-list.tsx` component: its rows follow the panel's own one-line
+  layout, with the same ↑/↓ and Enter keys.
+- **MCP tool cells.** `components/blocks/tool-branch.tsx` (Freebuff's, already
+  modified) titles an `mcp__` call with its connector and tool and shows the
+  catalog tier as the title suffix (`utils/mcp-tool-label.ts`).
 
 ## Left for later
 

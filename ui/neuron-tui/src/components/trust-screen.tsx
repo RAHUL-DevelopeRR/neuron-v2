@@ -8,6 +8,12 @@
  *
  * The words are the shared trust copy (`@neuron/client/copy/trust`), which the
  * desktop's trust dialog uses too.
+ *
+ * The project's MCP servers are listed with a checkbox each (↑/↓ and space):
+ * the ones ticked are approved as soon as the engine restarts with the
+ * folder's settings (`approve_mcp_server`, engine feature `mcp_catalog`); the
+ * others wait as `needs approval` until `/mcp` approves them. None is ticked
+ * at first.
  */
 
 import { TextAttributes, type KeyEvent } from '@opentui/core'
@@ -23,6 +29,7 @@ import {
   type TrustChoice,
 } from '@neuron/client/copy/trust'
 
+import { truncateToWidth } from './model-picker'
 import { TerminalLink } from './terminal-link'
 import { useTheme } from '../hooks/use-theme'
 import { getGlyphMode, type GlyphMode } from '../utils/glyphs'
@@ -41,6 +48,12 @@ export function trustKeysHint(glyphMode: GlyphMode): string {
   return glyphMode === 'console'
     ? trustCopy.terminalKeys.replace('↑↓', 'Up/Down')
     : trustCopy.terminalKeys
+}
+
+/** Above the project's MCP servers, ticked to approve at once. */
+export function trustMcpHeading(glyphMode: GlyphMode): string {
+  const keys = glyphMode === 'console' ? 'Up/Down and space' : '↑↓ and space'
+  return `Approve its MCP servers now (${keys}); the others wait in /mcp:`
 }
 
 /** What a key does on the trust screen, with `selected` the highlighted choice. */
@@ -65,6 +78,31 @@ export function trustKeyAction(key: Pick<KeyEvent, 'name' | 'ctrl' | 'sequence'>
   return { type: 'none' }
 }
 
+/** What a key does with the project's MCP servers listed above the choices. */
+export type TrustScreenKeyAction = TrustKeyAction | { type: 'toggle'; index: number }
+
+/**
+ * The trust screen's keys with `serverCount` MCP server rows above the two
+ * choices: `selected` counts the rows first. Space or Enter on a row ticks
+ * it; the digits, Esc and Enter on a choice work as {@link trustKeyAction}.
+ */
+export function trustScreenKeyAction(
+  key: Pick<KeyEvent, 'name' | 'ctrl' | 'sequence'>,
+  selected: number,
+  serverCount: number,
+): TrustScreenKeyAction {
+  if (serverCount === 0) return trustKeyAction(key, selected)
+  const onServer = selected < serverCount
+  if (onServer && (key.name === 'space' || key.name === 'return' || key.name === 'enter')) {
+    return { type: 'toggle', index: selected }
+  }
+  const last = serverCount + CHOICES.length - 1
+  if (key.name === 'up') return { type: 'select', index: Math.max(0, selected - 1) }
+  if (key.name === 'down') return { type: 'select', index: Math.min(last, selected + 1) }
+  const action = trustKeyAction(key, Math.max(0, selected - serverCount))
+  return action.type === 'select' ? { type: 'none' } : action
+}
+
 export interface TrustScreenProps {
   /** The folder Neuron runs in. */
   cwd: string
@@ -74,7 +112,8 @@ export interface TrustScreenProps {
   previewPending?: boolean
   step: TrustStep
   width: number
-  onAllow: () => void
+  /** Allow, with the MCP servers ticked to approve. */
+  onAllow: (approvedMcpServers: string[]) => void
   onQuit: () => void
   /** Test seam: the console glyph set marks the choice with `>`. */
   glyphMode?: GlyphMode
@@ -91,22 +130,39 @@ export const TrustScreen = ({
   glyphMode = getGlyphMode(),
 }: TrustScreenProps) => {
   const theme = useTheme()
-  const [selected, setSelected] = useState(0)
+  const servers = preview?.mcp_servers ?? []
+  // The Allow choice is selected first, below the server rows.
+  const [selected, setSelected] = useState<number | null>(null)
+  const current = selected ?? servers.length
+  const [approved, setApproved] = useState<ReadonlySet<string>>(() => new Set())
   const busy = step.kind === 'saving' || step.kind === 'restarting'
 
   useKeyboard(
     useCallback(
       (key: KeyEvent) => {
-        const action = trustKeyAction(key, selected)
+        const action = trustScreenKeyAction(key, current, servers.length)
         if (action.type === 'none') return
         key.preventDefault?.()
         // Quitting is always possible; nothing else while trust is saved.
         if (action.type === 'choose' && action.choice === 'quit') return onQuit()
         if (busy) return
         if (action.type === 'select') return setSelected(action.index)
-        if (action.choice === 'allow') onAllow()
+        if (action.type === 'toggle') {
+          const name = servers[action.index]?.name
+          if (!name) return
+          setApproved((names) => {
+            const next = new Set(names)
+            if (next.has(name)) next.delete(name)
+            else next.add(name)
+            return next
+          })
+          return
+        }
+        if (action.choice === 'allow') {
+          onAllow(servers.map((server) => server.name).filter((name) => approved.has(name)))
+        }
       },
-      [busy, onAllow, onQuit, selected],
+      [approved, busy, current, onAllow, onQuit, servers],
     ),
   )
 
@@ -146,6 +202,28 @@ export const TrustScreen = ({
           </box>
         </>
       )}
+      {servers.length > 0 ? (
+        <>
+          <text style={{ wrapMode: 'word', fg: theme.foreground, paddingTop: 1, width: textWidth }}>
+            {trustMcpHeading(glyphMode)}
+          </text>
+          <box style={{ flexDirection: 'column', paddingLeft: 2 }}>
+            {servers.map((server, index) => {
+              const isSelected = index === current
+              const box = approved.has(server.name) ? '[x]' : '[ ]'
+              const target = server.target ? ` · ${server.target}` : ''
+              return (
+                <text key={server.name} style={{ wrapMode: 'none', fg: isSelected ? theme.primary : theme.foreground }}>
+                  <span>{isSelected ? `${marker} ` : '  '}</span>
+                  <span attributes={isSelected ? TextAttributes.BOLD : undefined}>
+                    {truncateToWidth(`${box} ${server.name}  ${server.transport}${target}`, textWidth - 4)}
+                  </span>
+                </text>
+              )
+            })}
+          </box>
+        </>
+      ) : null}
       <text style={{ wrapMode: 'word', fg: theme.warning, width: textWidth }}>{trustCopy.caution}</text>
       <box style={{ flexDirection: 'row' }}>
         <text style={{ fg: theme.foreground, flexShrink: 0, marginRight: 1 }}>{trustCopy.whyLabel}</text>
@@ -153,7 +231,7 @@ export const TrustScreen = ({
       </box>
       <box style={{ flexDirection: 'column', paddingTop: 1 }}>
         {CHOICES.map((choice, index) => {
-          const isSelected = index === selected
+          const isSelected = servers.length + index === current
           return (
             <text key={choice.id} style={{ fg: isSelected ? theme.primary : theme.foreground }}>
               <span>{isSelected ? `${marker} ` : '  '}</span>

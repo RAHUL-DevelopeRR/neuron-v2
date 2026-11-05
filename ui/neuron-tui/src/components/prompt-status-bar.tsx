@@ -21,6 +21,7 @@ import React, { useEffect, useState } from 'react'
 import { Button } from './button'
 import { useTheme } from '../hooks/use-theme'
 import { useEngineStore } from '../state/engine-store'
+import { connectorsChip, useMcpPanelStore } from '../state/mcp-panel-store'
 import { getGlyphMode, type GlyphMode } from '../utils/glyphs'
 import {
   RIGHT_GAP,
@@ -95,6 +96,7 @@ export const PromptStatusBar = ({
   const account = useEngineStore((state) => state.account)
   const models = useEngineStore((state) => state.models)
   const pendingPermission = useEngineStore((state) => state.pendingPermission)
+  const mcpServers = useMcpPanelStore((state) => state.known)
   const line = statusBarLine(
     {
       status,
@@ -104,6 +106,7 @@ export const PromptStatusBar = ({
       pendingPermission,
       now: fixedNow ?? clock,
       timeZone,
+      connectors: connectorsChip(mcpServers),
     },
     Math.max(0, width - 2),
   )

@@ -6,16 +6,17 @@
  *   G Gemini 2.5 Flash ▾ │ ◑ think high │ ⌂ neuron-v2 ⎇ main +1 ~2 │ ✎ Edit workspace │ ●●●◑○○○○○○ 35% ctx      Free · 5h 640K/1M · resets 14:20 · 37/100 req
  *
  * Segments, left to right: the model (provider monogram and name), the
- * thinking level, the workspace folder and git branch, the permission mode
- * and the context meter; on the right, the Zero-X plan and its usage: the
+ * thinking level, the workspace folder and git branch, the permission mode,
+ * the MCP connectors (`⧉ 5/6`: up of turned on, amber when one needs the
+ * user, a lock when the connector policy requires one) and the context meter; on the right, the Zero-X plan and its usage: the
  * plan's rolling token window (Free: 1M tokens per 5 hours) as used/limit with
  * the time it resets, and today's requests. Each segment opens its picker when
  * clicked (`target`).
  *
  * When the line is too wide it gives way one step at a time
  * ({@link COLLAPSE_STEPS}): the account group shortens to the window, labels
- * go, then the window's reset time, the git counts, the folder name and half
- * the meter's circles; then the branch is cut, the account group goes, the
+ * go, then the window's reset time, the git counts, the folder name, half
+ * the meter's circles and the connectors chip; then the branch is cut, the account group goes, the
  * thinking level and the circles go, and last the model name is cut. The provider monogram, the permission mode and the
  * context percentage are never dropped.
  */
@@ -28,6 +29,7 @@ import { cutToDisplayWidth, displayWidth as stringWidth } from './display-width'
 import { inferProvider, providerBadge } from './provider-badge'
 
 import type { GlyphMode } from './glyphs'
+import type { ConnectorsChip } from '../state/mcp-panel-store'
 import type {
   AccountDetails,
   ModelInfo,
@@ -52,6 +54,7 @@ export type StatusTarget =
   | 'branch'
   | 'permission'
   | 'context'
+  | 'connectors'
   | 'account'
 
 export interface StatusSpan {
@@ -104,6 +107,9 @@ interface Glyphs {
   thinkDefault: string
   /** Between the permission mode and the one coming next. */
   arrow: string
+  /** The MCP connectors chip, and its mark for a server the connector policy requires. */
+  connectors: string
+  lock: string
 }
 
 const UNICODE: Glyphs = {
@@ -119,6 +125,8 @@ const UNICODE: Glyphs = {
   thinkLevels: ['◔', '◑', '◕', '●'],
   thinkDefault: '◑',
   arrow: '→',
+  connectors: '⧉',
+  lock: '🔒',
 }
 
 /** What the classic console fonts (WGL4/CP437) can draw. */
@@ -135,6 +143,8 @@ const CONSOLE: Glyphs = {
   thinkLevels: ['●', '●', '●', '●'],
   thinkDefault: '●',
   arrow: '>',
+  connectors: '≡',
+  lock: '§',
 }
 
 export function statusGlyphs(mode: GlyphMode): Glyphs {
@@ -154,6 +164,8 @@ export interface StatusBarInput {
   now?: number
   /** The time zone the reset time is shown in; the system's when unset. */
   timeZone?: string
+  /** The MCP servers' chip (state/mcp-panel-store.ts `connectorsChip`); none before they are known. */
+  connectors?: ConnectorsChip | null
 }
 
 /** One segment's possible texts, before they are fitted. */
@@ -178,6 +190,7 @@ export interface StatusView {
   /** The permission choice coming next (sent, not in effect yet): `✎ Edit → ◇ Plan`. */
   permissionNext: StatusView['permission'] | null
   context: { percent: number; estimated: boolean; thresholdPercent: number } | null
+  connectors: ConnectorsChip | null
   account:
     | {
         kind: 'usage'
@@ -355,6 +368,7 @@ export function statusView({
   pendingPermission = null,
   now = Date.now(),
   timeZone,
+  connectors = null,
 }: StatusBarInput): StatusView | null {
   if (!status) return null
   const glyphs = statusGlyphs(mode)
@@ -421,6 +435,7 @@ export function statusView({
     context: usage
       ? { percent: usage.percent, estimated: usage.estimated, thresholdPercent: usage.thresholdPercent }
       : null,
+    connectors,
     account: accountView,
     glyphs,
     mode,
@@ -441,6 +456,8 @@ export interface Compaction {
   gitCounts: boolean
   folder: boolean
   cells: 0 | 5 | 10
+  /** The MCP connectors chip. */
+  connectors: boolean
   think: boolean
   /** The branch cut to this many columns, with "…". */
   branchMax: number | null
@@ -460,6 +477,7 @@ export const FULL: Compaction = {
   gitCounts: true,
   folder: true,
   cells: 10,
+  connectors: true,
   think: true,
   branchMax: null,
   modelMax: null,
@@ -477,6 +495,7 @@ export const COLLAPSE_STEPS: readonly Step[] = [
   { gitCounts: false },
   { folder: false },
   { cells: 5 },
+  { connectors: false },
   // The token window stays before a whole branch name (it is what refuses requests).
   'cut-branch',
   { accountShown: false },
@@ -554,6 +573,17 @@ export function buildLine(view: StatusView, c: Compaction): StatusLine {
     if (c.labels) permissionSpans.push({ text: ' next', tone: 'muted' })
   }
   left.push({ target: 'permission', spans: permissionSpans })
+
+  const chip = view.connectors
+  if (chip && c.connectors) {
+    // `⧉ 5/6`: servers up of those turned on, amber when one needs the user.
+    const spans: StatusSpan[] = [
+      { text: `${glyphs.connectors} ${chip.ready}/${chip.total}`, tone: chip.warning ? 'warning' : 'muted' },
+    ]
+    if (chip.locked) spans.push({ text: ` ${glyphs.lock}`, tone: 'muted' })
+    if (c.labels) spans.push({ text: ' mcp', tone: 'muted' })
+    left.push({ target: 'connectors', spans })
+  }
 
   if (view.context) {
     const ctx = view.context

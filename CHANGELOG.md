@@ -5,6 +5,13 @@ The release workflow copies a version's section into its GitHub release notes.
 
 ## 7.0.0-alpha.4 (unreleased)
 
+- Full-screen UI, MCP: a connectors chip in the status bar (`⧉ 5/6`, amber when a
+  server needs you, a lock for a policy-required one; click opens the panel). The MCP
+  panel gains an Installed tab (approve, connect, sign in, remove) and an Add tab
+  (search the catalog, masked secret fields, user/project/local scope). The trust
+  screen lists the project's MCP servers to approve at once. MCP tool calls name their
+  connector and the tool's catalog tier. The engine sends the servers again once its
+  background start finishes, and `McpServerInfo.tool_tiers` carries the tiers.
 - Full-screen UI: the agent's questions open a question form (pick a choice with ↑/↓
   and Enter, or write your own answer) instead of a plain notice. The UI declares the
   `questions` capability and answers with the `answer` command; Esc leaves the question

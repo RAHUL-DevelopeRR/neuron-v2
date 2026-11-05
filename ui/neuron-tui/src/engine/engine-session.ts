@@ -32,8 +32,8 @@ import {
   type TurnOutcome,
 } from './neuron-engine-client'
 import { handleGitViewsEvent, resetGitViews } from './git-views'
-import { handleMcpPanelEvent, resetMcpPanel } from './mcp-panel'
-import { FEATURE_TRUST_PREVIEW } from './protocol'
+import { handleMcpPanelEvent, requestExtensions, resetMcpPanel } from './mcp-panel'
+import { FEATURE_MCP_CATALOG, FEATURE_TRUST_PREVIEW } from './protocol'
 import { closeQuestionForm, openQuestionForm } from './question-form'
 import { QUESTION_PREFIX, questionNoticeText } from './questions'
 import { engineSessionOf, withEngineSession } from './session-run-state'
@@ -268,6 +268,10 @@ export function handleEngineEvent(event: UiEvent): void {
       engine.setReady(event.version, event.features ?? [])
       // What this UI draws, for engines that ask (./capabilities.ts).
       declareUiCapabilities(getNeuronEngineClient(), event)
+      // The MCP servers ticked on the trust screen, then all of them for the
+      // status bar's connectors chip (./mcp-panel.ts).
+      approveTrustedMcpServers(getNeuronEngineClient(), event.features ?? [])
+      requestExtensions(getNeuronEngineClient(), event)
       noteEngineFeatures(event.features ?? [])
       return
     case 'status':
@@ -338,6 +342,7 @@ export function handleEngineEvent(event: UiEvent): void {
       if (!turnActive) engine.setPendingPermission(null)
       // `trust_workspace` failed: the trust screen shows why.
       if (useStartGate.getState().trustStep.kind === 'saving') {
+        approveAfterTrust = []
         useStartGate.getState().setTrustStep({ kind: 'failed', error: inUiWording(event.message) })
         return
       }
@@ -418,12 +423,41 @@ function requestTrustPreview(status: StatusEvent): void {
  * git root), or for this session only in the home folder, and answers with
  * `workspace_trusted` ({@link restartWithTrust}) or an `error`.
  */
-export function trustWorkspace(): void {
+/**
+ * The project's MCP servers ticked on the trust screen: approved once the
+ * engine restarted with the folder's settings (they are only known to it
+ * then), by the next `ready`.
+ */
+let approveAfterTrust: string[] = []
+
+/**
+ * Sends `approve_mcp_server` for the servers ticked on the trust screen, once
+ * an engine with the catalog commands is ready. `true` when any were sent.
+ */
+export function approveTrustedMcpServers(
+  engine: Pick<NeuronEngineClient, 'send'>,
+  features: readonly string[],
+): boolean {
+  const names = approveAfterTrust
+  approveAfterTrust = []
+  if (names.length === 0 || !features.includes(FEATURE_MCP_CATALOG)) return false
+  try {
+    for (const name of names) engine.send({ type: 'approve_mcp_server', name })
+    return true
+  } catch (error) {
+    logger.debug({ error }, '[engine] MCP approvals not sent')
+    return false
+  }
+}
+
+export function trustWorkspace(approvedMcpServers: string[] = []): void {
   const gate = useStartGate.getState()
   gate.setTrustStep({ kind: 'saving' })
+  approveAfterTrust = [...approvedMcpServers]
   try {
     getNeuronEngineClient().send({ type: 'trust_workspace' })
   } catch (error) {
+    approveAfterTrust = []
     gate.setTrustStep({
       kind: 'failed',
       error: error instanceof Error ? error.message : String(error),
@@ -447,6 +481,8 @@ async function restartWithTrust(event: WorkspaceTrustedEvent): Promise<void> {
   const gate = useStartGate.getState()
   if (!event.restart_required || !lastLaunch) {
     gate.setTrustStep({ kind: 'asking' })
+    // No restart: this engine has the folder's servers now.
+    approveTrustedMcpServers(getNeuronEngineClient(), useEngineStore.getState().features)
     return
   }
   gate.setTrustStep({ kind: 'restarting' })
