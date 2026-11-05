@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 
 use plugins::{PluginError, PluginLoadFailure, PluginManager, PluginSummary};
 use runtime::mcp_sandbox::{
-    describe_mcp_sandbox, mcp_sandbox_enforcement, resolve_mcp_sandbox, McpSandboxOrigin,
+    describe_mcp_sandbox, mcp_program_roots, mcp_sandbox_enforcement, resolve_mcp_sandbox,
+    McpSandboxOrigin,
 };
 use runtime::{
     compact_session, CompactionConfig, ConfigLoader, ConfigSource, McpOAuthConfig,
@@ -3998,6 +3999,19 @@ fn render_mcp_server_report(
                 describe_mcp_sandbox(&profile),
                 origin.label()
             ));
+            if !profile.off {
+                let program = mcp_program_roots(&config.command, &config.args);
+                if !program.is_empty() {
+                    lines.push(format!(
+                        "  Program roots     {} (readable: the server's program)",
+                        program
+                            .iter()
+                            .map(|root| root.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+            }
             lines.push(format!(
                 "  Enforcement       {}",
                 mcp_sandbox_enforcement(&profile)
@@ -4885,6 +4899,15 @@ fn mcp_sandbox_json(name: &str, server: &ScopedMcpServerConfig) -> Value {
         McpSandboxNetwork::Any => json!("any"),
         McpSandboxNetwork::Hosts(hosts) => json!(hosts),
     };
+    let program_roots = match &server.config {
+        McpServerConfig::Stdio(stdio) if !profile.off => {
+            mcp_program_roots(&stdio.command, &stdio.args)
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect::<Vec<_>>()
+        }
+        _ => Vec::new(),
+    };
     json!({
         "origin": origin_id,
         "catalog_id": catalog_id,
@@ -4893,6 +4916,7 @@ fn mcp_sandbox_json(name: &str, server: &ScopedMcpServerConfig) -> Value {
         "fs_write": &profile.fs_write,
         "network": network,
         "env_allow": &profile.env_allow,
+        "program_roots": program_roots,
         "enforcement": mcp_sandbox_enforcement(&profile),
     })
 }
@@ -6418,6 +6442,38 @@ mod tests {
         let missing = super::render_mcp_report_for(&loader, &workspace, Some("show missing"))
             .expect("missing report should render");
         assert!(missing.contains("server `missing` is not configured"));
+
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(config_home);
+    }
+
+    #[test]
+    fn mcp_show_lists_the_program_roots_a_sandboxed_server_can_read() {
+        let workspace = temp_dir("mcp-program-workspace");
+        let config_home = temp_dir("mcp-program-home");
+        let package = workspace.join("node_modules").join("notes-mcp");
+        fs::create_dir_all(&package).expect("package folder");
+        fs::create_dir_all(&config_home).expect("config home");
+        let script = package.join("index.js");
+        fs::write(&script, "").expect("script");
+        let settings = serde_json::json!({
+            "mcpServers": {
+                "notes": {
+                    "command": "node",
+                    "args": [script.to_string_lossy(), workspace.to_string_lossy()]
+                }
+            }
+        });
+        fs::write(config_home.join("settings.json"), settings.to_string()).expect("settings");
+
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let show = super::render_mcp_report_for(&loader, &workspace, Some("show notes"))
+            .expect("mcp show report should render");
+        let line = show
+            .lines()
+            .find(|line| line.trim_start().starts_with("Program roots"))
+            .unwrap_or_else(|| panic!("no program roots: {show}"));
+        assert!(line.contains("node_modules"), "{line}");
 
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(config_home);
