@@ -307,7 +307,11 @@ Each local catalog entry pins what it installs, and the catalog signature covers
 
 Installs live in `~/.neuron/mcp/<id>/<version>`, with downloaded npm tarballs in
 `~/.neuron/mcp/cache`. The first start of a server installs it (and needs the
-network); later starts are offline. Every start checks the install record: a file
+network); later starts are offline. Two sessions that start the same server at once
+do not both install it: one holds a lock file beside the install
+(`~/.neuron/mcp/<id>/.<version>.lock`) and the other waits for it, up to 15 minutes, and
+then uses that install; a lock older than that is taken over. Every start checks the
+install record: a file
 whose size or modification time changed is hashed again, and one that no longer
 matches stops the start with an integrity error and removes the install, so the next
 start installs it again. A cached tarball that does not match its integrity is removed

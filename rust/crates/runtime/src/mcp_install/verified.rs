@@ -15,6 +15,8 @@
 //! - Docker: the image is pulled by its digest and run with `--pull=never`.
 //!
 //! The first start installs (the network is needed once); later starts are offline.
+//! A session installs (or removes) a server only while it holds that folder's lock
+//! file, so a second session waits and then uses the finished install.
 //! Each start checks the install record: a file whose size or modification time
 //! changed is hashed again, and one that no longer matches blocks the start. A cached
 //! npm tarball is checked before it is unpacked; one that does not match its integrity
@@ -26,7 +28,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use serde_json::{json, Value};
@@ -42,6 +44,23 @@ use crate::mcp_catalog::{
 const MANIFEST: &str = ".neuron-install.json";
 /// The largest download accepted (a release binary archive is ~100 MB).
 const MAX_DOWNLOAD_BYTES: u64 = 1 << 30;
+/// How long a session waits for another session's install of the same server, and the
+/// age at which a lock counts as left behind by a session that stopped (a Python
+/// install can take minutes).
+const INSTALL_LOCK_STALE: Duration = Duration::from_secs(15 * 60);
+
+/// The lock a session holds while it installs into one folder, so two sessions never
+/// build (or remove) the same install at once. Removed when dropped.
+#[derive(Debug)]
+pub(crate) struct McpInstallLock {
+    path: PathBuf,
+}
+
+impl Drop for McpInstallLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
 
 /// Fetches a URL into a file. The CLI fetches over HTTPS; tests serve fixtures.
 pub trait McpFetch: Sync {
@@ -374,6 +393,58 @@ impl McpInstallStore {
             .join(format!("{}.tgz", hex(&digest))))
     }
 
+    /// Takes the install lock of the folder `dir` (`.<version>.lock` beside it), waiting
+    /// while another session holds it. A lock older than [`INSTALL_LOCK_STALE`] is taken
+    /// over.
+    pub(crate) fn lock_install(&self, dir: &Path) -> Result<McpInstallLock, String> {
+        let parent = dir
+            .parent()
+            .ok_or_else(|| "the install folder has no parent".to_string())?;
+        fs::create_dir_all(parent).map_err(|error| io_text(&error))?;
+        let name = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("x");
+        let path = parent.join(format!(".{name}.lock"));
+        let waiting = Instant::now();
+        loop {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    let _ = write!(file, "{}", std::process::id());
+                    return Ok(McpInstallLock { path });
+                }
+                // Held, or (on Windows) being removed by the session that held it.
+                Err(error)
+                    if error.kind() == io::ErrorKind::AlreadyExists
+                        || (error.kind() == io::ErrorKind::PermissionDenied && path.exists()) =>
+                {
+                    let stale = fs::metadata(&path)
+                        .and_then(|metadata| metadata.modified())
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age > INSTALL_LOCK_STALE);
+                    if stale {
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
+                    if waiting.elapsed() > INSTALL_LOCK_STALE {
+                        return Err(format!(
+                            "another session has been installing into {} for 15 minutes; remove {} if no session is",
+                            dir.display(),
+                            path.display()
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(error) => return Err(io_text(&error)),
+            }
+        }
+    }
+
     /// Whether `spec` is installed (without checking its files).
     pub fn state(&self, spec: &McpVerifiedSpec) -> Result<McpInstallState, String> {
         if matches!(spec.source, McpVerifiedSource::Docker { .. }) {
@@ -412,6 +483,16 @@ impl McpInstallStore {
         }
         let dir = self.install_dir(spec)?;
         let digest = spec.digest();
+        let current = read_manifest(&dir).filter(|manifest| {
+            manifest["spec"].as_str() == Some(digest.as_str())
+                && check_files(&dir, manifest).is_ok()
+        });
+        if current.is_some() {
+            return Ok(launch_of(spec, &dir));
+        }
+        // Installing or removing: one session at a time, and what another session
+        // finished while this one waited is used.
+        let _lock = self.lock_install(&dir)?;
         match read_manifest(&dir) {
             Some(manifest) if manifest["spec"].as_str() == Some(digest.as_str()) => {
                 if let Err(problem) = check_files(&dir, &manifest) {
@@ -441,7 +522,8 @@ impl McpInstallStore {
         let _ = fs::remove_dir_all(dir);
         // npm trees and binaries are unpacked beside the folder and renamed into place,
         // so a start never sees half an install. A virtual environment records its own
-        // path, so it is built in place and recorded last.
+        // path, so it is built in place and recorded last; the caller holds the install
+        // lock, so no other session removes it meanwhile.
         let staging = match spec.source {
             McpVerifiedSource::Python { .. } => dir.to_path_buf(),
             _ => parent.join(format!(
@@ -1054,6 +1136,72 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
             .count();
         assert_eq!(leftovers, 0);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    fn python_spec() -> McpVerifiedSpec {
+        McpVerifiedSpec {
+            name: "py".to_string(),
+            version: "1.0".to_string(),
+            source: McpVerifiedSource::Python {
+                script: "demo".to_string(),
+                requirements: Vec::new(),
+            },
+            args: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_python_install_another_session_is_building_is_waited_for_not_removed() {
+        let home = temp("python-race");
+        let store = McpInstallStore::in_config_home(&home);
+        let spec = python_spec();
+        let dir = store.install_dir(&spec).unwrap();
+        // Another session builds the virtual environment in place and records it last.
+        let lock = store.lock_install(&dir).unwrap();
+        fs::create_dir_all(dir.join("venv")).unwrap();
+        fs::write(dir.join("venv").join("half-built"), "building").unwrap();
+        let other = std::thread::spawn({
+            let (store, spec) = (store.clone(), spec.clone());
+            move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                super::record_install(&store, &spec, &[("venv/half-built", b"done")]);
+                drop(lock);
+            }
+        });
+        let launch = store.ensure(&spec, &Offline).unwrap();
+        other.join().unwrap();
+        assert_eq!(launch.dir.as_deref(), Some(dir.as_path()));
+        assert_eq!(
+            fs::read_to_string(dir.join("venv").join("half-built")).unwrap(),
+            "done"
+        );
+        let locks = fs::read_dir(home.join("mcp").join("py"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".lock"))
+            .count();
+        assert_eq!(locks, 0, "the lock is gone");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_lock_left_by_a_session_that_stopped_is_taken_over() {
+        let home = temp("stale-lock");
+        let store = McpInstallStore::in_config_home(&home);
+        let (spec, fixtures) = npm_fixture();
+        let dir = store.install_dir(&spec).unwrap();
+        fs::create_dir_all(dir.parent().unwrap()).unwrap();
+        let lock = dir.parent().unwrap().join(".1.0.0.lock");
+        fs::write(&lock, "4242").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&lock)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .unwrap();
+        store.ensure(&spec, &fixtures).unwrap();
+        assert!(!lock.exists());
         let _ = fs::remove_dir_all(home);
     }
 

@@ -17,6 +17,9 @@ The release workflow copies a version's section into its GitHub release notes.
   whose install script downloaded that binary without a pinned hash. `/mcp list`, its
   JSON and the MCP panel mark other stdio servers `unpinned` (`McpServerInfo.unpinned`),
   and `/mcp pin <server>` records their version and hashes.
+- Verified MCP installs take a lock file per server folder, so a second session that
+  starts the same server waits for the first install instead of deleting a Python
+  virtual environment that is still being built.
 - `/mcp pin` of a program (not `npx` or `uvx`) holds only for the files it was pinned
   with: the same relative launch (`node server.js`) in another workspace is unpinned
   there, instead of borrowing the first workspace's pin.
