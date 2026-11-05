@@ -469,10 +469,18 @@ impl McpInstallStore {
         )
         .map_err(|error| io_text(&error))?;
         if staging != dir {
-            fs::rename(&staging, dir).map_err(|error| {
+            if let Err(error) = fs::rename(&staging, dir) {
                 let _ = fs::remove_dir_all(&staging);
-                format!("cannot move the install into {}: {error}", dir.display())
-            })?;
+                // Another session installed the same server meanwhile: use its copy.
+                let theirs = read_manifest(dir)
+                    .is_some_and(|manifest| manifest["spec"].as_str() == Some(digest));
+                if !theirs {
+                    return Err(format!(
+                        "cannot move the install into {}: {error}",
+                        dir.display()
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -997,6 +1005,49 @@ mod tests {
             .any(|_| true));
         let _ = fs::remove_dir_all(home);
         let _ = fs::remove_dir_all(other);
+    }
+
+    /// Serves the fixtures, but another session finishes the same install during the
+    /// first download.
+    struct RacedBy<'a> {
+        fixtures: Fixtures,
+        store: &'a McpInstallStore,
+        spec: McpVerifiedSpec,
+        raced: Mutex<bool>,
+    }
+
+    impl McpFetch for RacedBy<'_> {
+        fn fetch_to(&self, url: &str, dest: &Path) -> Result<(), String> {
+            let mut raced = self.raced.lock().unwrap();
+            if !*raced {
+                *raced = true;
+                super::record_install(self.store, &self.spec, &[("theirs.txt", b"theirs")]);
+            }
+            self.fixtures.fetch_to(url, dest)
+        }
+    }
+
+    #[test]
+    fn an_install_another_session_finished_first_is_used() {
+        let home = temp("race");
+        let store = McpInstallStore::in_config_home(&home);
+        let (spec, fixtures) = npm_fixture();
+        let raced = RacedBy {
+            fixtures,
+            store: &store,
+            spec: spec.clone(),
+            raced: Mutex::new(false),
+        };
+        store.ensure(&spec, &raced).unwrap();
+        let dir = home.join("mcp").join("demo").join("1.0.0");
+        assert!(dir.join("theirs.txt").is_file());
+        let leftovers = fs::read_dir(home.join("mcp").join("demo"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0);
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
