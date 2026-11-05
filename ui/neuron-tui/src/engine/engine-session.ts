@@ -342,7 +342,7 @@ export function handleEngineEvent(event: UiEvent): void {
       if (!turnActive) engine.setPendingPermission(null)
       // `trust_workspace` failed: the trust screen shows why.
       if (useStartGate.getState().trustStep.kind === 'saving') {
-        approveAfterTrust = []
+        approveAfterTrust = null
         useStartGate.getState().setTrustStep({ kind: 'failed', error: inUiWording(event.message) })
         return
       }
@@ -418,31 +418,61 @@ function requestTrustPreview(status: StatusEvent): void {
   }
 }
 
+/** An MCP server ticked on the trust screen, with the preview's fingerprint. */
+export interface TrustedMcpApproval {
+  name: string
+  /** From the trust preview: the engine refuses the approval if the config changed since. */
+  fingerprint?: string
+}
+
 /**
- * "Allow Neuron in this folder": the engine records trust for the folder (its
- * git root), or for this session only in the home folder, and answers with
- * `workspace_trusted` ({@link restartWithTrust}) or an `error`.
+ * The project's MCP servers ticked on the trust screen, with the folder they
+ * were shown for: approved once the engine restarted with the folder's
+ * settings (they are only known to it then), by the next `ready` of an engine
+ * in that folder. A failed restart, or a start in another folder, drops them.
  */
-/**
- * The project's MCP servers ticked on the trust screen: approved once the
- * engine restarted with the folder's settings (they are only known to it
- * then), by the next `ready`.
- */
-let approveAfterTrust: string[] = []
+let approveAfterTrust: { cwd: string; servers: TrustedMcpApproval[] } | null = null
+
+/** The folder an engine of `launch` runs in. */
+function launchFolder(launch: EngineLaunchOptions | null): string {
+  return launch?.cwd ?? process.cwd()
+}
+
+/** Said when the ticked servers could not be approved from the trust screen. */
+export function trustApprovalsNotSentNotice(names: readonly string[]): string {
+  return (
+    `Not approved yet: ${names.join(', ')}. This engine cannot approve MCP servers from the ` +
+    `trust screen; they wait for approval (/mcp approve ${names[0]}).`
+  )
+}
 
 /**
  * Sends `approve_mcp_server` for the servers ticked on the trust screen, once
- * an engine with the catalog commands is ready. `true` when any were sent.
+ * an engine with the catalog commands is ready in the folder they were shown
+ * for. `true` when any were sent; an engine without the commands gets none,
+ * and the chat says the servers still wait.
  */
 export function approveTrustedMcpServers(
   engine: Pick<NeuronEngineClient, 'send'>,
   features: readonly string[],
 ): boolean {
-  const names = approveAfterTrust
-  approveAfterTrust = []
-  if (names.length === 0 || !features.includes(FEATURE_MCP_CATALOG)) return false
+  const pending = approveAfterTrust
+  approveAfterTrust = null
+  if (!pending || pending.servers.length === 0) return false
+  // Same-named servers in another folder were never shown to the user.
+  if (pending.cwd !== launchFolder(lastLaunch)) return false
+  if (!features.includes(FEATURE_MCP_CATALOG)) {
+    showSystemMessage(trustApprovalsNotSentNotice(pending.servers.map((server) => server.name)))
+    return false
+  }
   try {
-    for (const name of names) engine.send({ type: 'approve_mcp_server', name })
+    for (const { name, fingerprint } of pending.servers) {
+      engine.send(
+        fingerprint
+          ? { type: 'approve_mcp_server', name, fingerprint }
+          : { type: 'approve_mcp_server', name },
+      )
+    }
     return true
   } catch (error) {
     logger.debug({ error }, '[engine] MCP approvals not sent')
@@ -450,14 +480,19 @@ export function approveTrustedMcpServers(
   }
 }
 
-export function trustWorkspace(approvedMcpServers: string[] = []): void {
+/**
+ * "Allow Neuron in this folder": the engine records trust for the folder (its
+ * git root), or for this session only in the home folder, and answers with
+ * `workspace_trusted` ({@link restartWithTrust}) or an `error`.
+ */
+export function trustWorkspace(approvedMcpServers: readonly TrustedMcpApproval[] = []): void {
   const gate = useStartGate.getState()
   gate.setTrustStep({ kind: 'saving' })
-  approveAfterTrust = [...approvedMcpServers]
+  approveAfterTrust = { cwd: launchFolder(lastLaunch), servers: [...approvedMcpServers] }
   try {
     getNeuronEngineClient().send({ type: 'trust_workspace' })
   } catch (error) {
-    approveAfterTrust = []
+    approveAfterTrust = null
     gate.setTrustStep({
       kind: 'failed',
       error: error instanceof Error ? error.message : String(error),
@@ -494,6 +529,9 @@ async function restartWithTrust(event: WorkspaceTrustedEvent): Promise<void> {
     ? { ...launch.env, NEURON_TRUST_WORKSPACE: '1' }
     : launch.env
   await startEngineSession({ ...launch, resume, env })
+  // A restarted engine took them at its `ready`; one that failed to start
+  // never will, and a later engine must not get them.
+  approveAfterTrust = null
   useStartGate.getState().setTrustStep({ kind: 'asking' })
 }
 
@@ -521,6 +559,7 @@ let clientOptionsForTesting: StdioEngineClientOptions = {}
 export function setEngineClientOptionsForTesting(options: StdioEngineClientOptions): void {
   clientOptionsForTesting = options
   lastLaunch = null
+  approveAfterTrust = null
 }
 
 /**
@@ -528,6 +567,8 @@ export function setEngineClientOptionsForTesting(options: StdioEngineClientOptio
  * start is recorded in the engine store and shown in the chat.
  */
 export function startEngineSession(launch: EngineLaunchOptions): Promise<void> {
+  // Servers ticked for one folder are never approved in another.
+  if (approveAfterTrust && approveAfterTrust.cwd !== launchFolder(launch)) approveAfterTrust = null
   lastLaunch = launch
   const start = launchEngineSession(launch)
   pendingStart = start

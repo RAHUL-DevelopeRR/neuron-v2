@@ -531,8 +531,12 @@ are ignored, with a warning naming them. Once a directory is trusted, each MCP s
 its settings (or its `.mcp.json`) add still waits for your approval
 (`/mcp approve <server>`), and asks again when its command, arguments, environment,
 headers or URL change. The full-screen UI's trust screen lists those servers with a
-checkbox each (↑/↓ and space); the ones you tick are approved as soon as the folder is
-trusted, and the others wait in `/mcp`.
+checkbox each (↑/↓ and space) and what each one runs: its command and arguments, or
+its URL, with secret-looking values shown as `[REDACTED]` (environment and headers are
+never shown). The ones you tick are approved as soon as the folder is trusted, but
+only as shown: a server whose settings changed in between is not approved and waits
+in `/mcp`, like the ones you did not tick. An engine too old to approve them from the
+trust screen says so in the chat.
 Even in a trusted directory, settings files
 cannot set a full-access permission mode; pass `--permission-mode danger-full-access`
 or put it in your user settings.

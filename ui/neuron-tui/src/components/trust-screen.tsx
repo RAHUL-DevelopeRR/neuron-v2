@@ -13,7 +13,9 @@
  * the ones ticked are approved as soon as the engine restarts with the
  * folder's settings (`approve_mcp_server`, engine feature `mcp_catalog`); the
  * others wait as `needs approval` until `/mcp` approves them. None is ticked
- * at first.
+ * at first. Each row shows what would run (the command line, secrets
+ * redacted by the engine), and the approval carries the preview's
+ * fingerprint, so a config that changed before the restart is not approved.
  */
 
 import { TextAttributes, type KeyEvent } from '@opentui/core'
@@ -28,6 +30,7 @@ import {
   trustRootNote,
   type TrustChoice,
 } from '@neuron/client/copy/trust'
+import { sanitizeTerminalText } from '@neuron-tui/common/util/terminal-safe-text'
 
 import { truncateToWidth } from './model-picker'
 import { TerminalLink } from './terminal-link'
@@ -35,7 +38,8 @@ import { useTheme } from '../hooks/use-theme'
 import { getGlyphMode, type GlyphMode } from '../utils/glyphs'
 import { safeOpen } from '../utils/open-url'
 
-import type { TrustPreviewEvent } from '../engine/protocol'
+import type { TrustedMcpApproval } from '../engine/engine-session'
+import type { McpServerPreview, TrustPreviewEvent } from '../engine/protocol'
 import type { TrustStep } from '../state/start-gate'
 
 const CHOICES = trustChoices('terminal')
@@ -54,6 +58,26 @@ export function trustKeysHint(glyphMode: GlyphMode): string {
 export function trustMcpHeading(glyphMode: GlyphMode): string {
   const keys = glyphMode === 'console' ? 'Up/Down and space' : '↑↓ and space'
   return `Approve its MCP servers now (${keys}); the others wait in /mcp:`
+}
+
+/**
+ * What a server row says will run: the command line or URL (engines before it
+ * send only the program or host). The workspace wrote it, so it is cleaned of
+ * escape sequences and kept on one line.
+ */
+export function trustMcpRunsLine(server: McpServerPreview): string {
+  const runs = server.command ?? server.target ?? ''
+  return sanitizeTerminalText(runs).replace(/\n/g, ' ')
+}
+
+/** The ticked servers, in the preview's order, with what the user was shown. */
+export function trustMcpApprovals(
+  servers: readonly McpServerPreview[],
+  ticked: ReadonlySet<string>,
+): TrustedMcpApproval[] {
+  return servers
+    .filter((server) => ticked.has(server.name))
+    .map(({ name, fingerprint }) => (fingerprint ? { name, fingerprint } : { name }))
 }
 
 /** What a key does on the trust screen, with `selected` the highlighted choice. */
@@ -113,7 +137,7 @@ export interface TrustScreenProps {
   step: TrustStep
   width: number
   /** Allow, with the MCP servers ticked to approve. */
-  onAllow: (approvedMcpServers: string[]) => void
+  onAllow: (approvedMcpServers: TrustedMcpApproval[]) => void
   onQuit: () => void
   /** Test seam: the console glyph set marks the choice with `>`. */
   glyphMode?: GlyphMode
@@ -159,7 +183,7 @@ export const TrustScreen = ({
           return
         }
         if (action.choice === 'allow') {
-          onAllow(servers.map((server) => server.name).filter((name) => approved.has(name)))
+          onAllow(trustMcpApprovals(servers, approved))
         }
       },
       [approved, busy, current, onAllow, onQuit, servers],
@@ -211,14 +235,25 @@ export const TrustScreen = ({
             {servers.map((server, index) => {
               const isSelected = index === current
               const box = approved.has(server.name) ? '[x]' : '[ ]'
-              const target = server.target ? ` · ${server.target}` : ''
+              const name = sanitizeTerminalText(server.name).replace(/\n/g, ' ')
+              const runs = trustMcpRunsLine(server)
               return (
-                <text key={server.name} style={{ wrapMode: 'none', fg: isSelected ? theme.primary : theme.foreground }}>
-                  <span>{isSelected ? `${marker} ` : '  '}</span>
-                  <span attributes={isSelected ? TextAttributes.BOLD : undefined}>
-                    {truncateToWidth(`${box} ${server.name}  ${server.transport}${target}`, textWidth - 4)}
-                  </span>
-                </text>
+                <box key={server.name} style={{ flexDirection: 'column' }}>
+                  <text style={{ wrapMode: 'none', fg: isSelected ? theme.primary : theme.foreground }}>
+                    <span>{isSelected ? `${marker} ` : '  '}</span>
+                    <span attributes={isSelected ? TextAttributes.BOLD : undefined}>
+                      {truncateToWidth(`${box} ${name}  ${server.transport}`, textWidth - 4)}
+                    </span>
+                  </text>
+                  {runs ? (
+                    // The whole command line, wrapped: what is approved is what was read.
+                    <box style={{ paddingLeft: 6 }}>
+                      <text style={{ wrapMode: 'char', fg: theme.muted, width: Math.max(10, textWidth - 8) }}>
+                        {`runs ${runs}`}
+                      </text>
+                    </box>
+                  ) : null}
+                </box>
               )
             })}
           </box>

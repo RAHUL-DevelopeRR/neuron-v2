@@ -25,6 +25,7 @@ import {
   type EngineCommand,
   type ExtensionsEvent,
   type McpServerInfo,
+  type TrustPreviewEvent,
 } from '../../engine/protocol'
 import { initializeThemeStore, useThemeStore } from '../../hooks/use-theme'
 import { useChatStore } from '../../state/chat-store'
@@ -46,7 +47,12 @@ import { STATUS_BAR_STATUS } from '../../testing/status-bar-fixtures'
 import { approveTrustedMcpServers, trustWorkspace } from '../../engine/engine-session'
 import { useStartGate } from '../../state/start-gate'
 import { McpPanel, installedHints, resolveMcpKey, serverMark } from '../mcp-panel'
-import { trustScreenKeyAction } from '../trust-screen'
+import {
+  TrustScreen,
+  trustMcpApprovals,
+  trustMcpRunsLine,
+  trustScreenKeyAction,
+} from '../trust-screen'
 import { ToolBranch } from '../blocks/tool-branch'
 import { createMarkdownPalette } from '../../utils/theme-system'
 
@@ -472,17 +478,72 @@ describe('approving MCP servers on the trust screen', () => {
 
   test('the ticked servers are approved once the restarted engine is ready', () => {
     const sent = recordingEngine()
-    trustWorkspace(['postgres-tools'])
+    trustWorkspace([{ name: 'postgres-tools', fingerprint: '4f1c0de5' }, { name: 'docs' }])
     expect(sent).toEqual([{ type: 'trust_workspace' }])
     expect(useStartGate.getState().trustStep.kind).toBe('saving')
     sent.length = 0
-    // An engine without the catalog commands gets none, and they are forgotten.
+    // Each with the fingerprint of what the trust screen showed, when it had one.
     expect(approveTrustedMcpServers({ send: (command) => void sent.push(command) }, [FEATURE_MCP_CATALOG])).toBe(true)
-    expect(sent).toEqual([{ type: 'approve_mcp_server', name: 'postgres-tools' }])
+    expect(sent).toEqual([
+      { type: 'approve_mcp_server', name: 'postgres-tools', fingerprint: '4f1c0de5' },
+      { type: 'approve_mcp_server', name: 'docs' },
+    ])
     expect(approveTrustedMcpServers({ send: (command) => void sent.push(command) }, [FEATURE_MCP_CATALOG])).toBe(false)
-    trustWorkspace(['docs'])
-    expect(approveTrustedMcpServers({ send: (command) => void sent.push(command) }, [])).toBe(false)
-    expect(sent).toHaveLength(2)
     useStartGate.getState().setTrustStep({ kind: 'asking' })
+  })
+
+  test('an engine without the catalog commands gets none, and the chat says they wait', () => {
+    const sent = recordingEngine()
+    useChatStore.getState().reset()
+    trustWorkspace([{ name: 'docs' }, { name: 'notes' }])
+    sent.length = 0
+    expect(approveTrustedMcpServers({ send: (command) => void sent.push(command) }, [])).toBe(false)
+    expect(sent).toEqual([])
+    const said = JSON.stringify(useChatStore.getState().messages)
+    expect(said).toContain('Not approved yet: docs, notes')
+    expect(said).toContain('/mcp approve docs')
+    // Forgotten: a later engine gets nothing.
+    expect(approveTrustedMcpServers({ send: (command) => void sent.push(command) }, [FEATURE_MCP_CATALOG])).toBe(false)
+    useStartGate.getState().setTrustStep({ kind: 'asking' })
+    useChatStore.getState().reset()
+  })
+
+  test('a server row shows what runs, cleaned, and the approval carries what was shown', async () => {
+    const preview = fixtureEvent('trust_preview') as TrustPreviewEvent
+    const server = preview.mcp_servers[0]!
+    expect(server.command).toBe('uvx postgres-mcp --dsn [REDACTED]')
+    expect(trustMcpRunsLine(server)).toBe('uvx postgres-mcp --dsn [REDACTED]')
+    // An engine before `command` shows the program; a hostile one is cleaned.
+    expect(trustMcpRunsLine({ ...server, command: undefined })).toBe('uvx')
+    expect(trustMcpRunsLine({ ...server, command: 'npx \x1b]52;c;aGk=\x07evil\npkg' })).toBe('npx evil pkg')
+    expect(trustMcpApprovals(preview.mcp_servers, new Set(['postgres-tools']))).toEqual([
+      { name: 'postgres-tools', fingerprint: server.fingerprint! },
+    ])
+    expect(trustMcpApprovals(preview.mcp_servers, new Set())).toEqual([])
+
+    const setup = await createTestRenderer({ width: 100, height: 40 })
+    const root = createRoot(setup.renderer)
+    flushSync(() =>
+      root.render(
+        <TrustScreen
+          cwd={preview.cwd}
+          preview={preview}
+          step={{ kind: 'asking' }}
+          width={100}
+          onAllow={() => {}}
+          onQuit={() => {}}
+          glyphMode="console"
+        />,
+      ),
+    )
+    try {
+      await setup.renderOnce()
+      const frame = setup.captureCharFrame()
+      expect(frame).toContain('[ ] postgres-tools  stdio')
+      expect(frame).toContain('runs uvx postgres-mcp --dsn [REDACTED]')
+    } finally {
+      flushSync(() => root.unmount())
+      setup.renderer.destroy()
+    }
   })
 })

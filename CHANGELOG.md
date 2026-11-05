@@ -5,6 +5,13 @@ The release workflow copies a version's section into its GitHub release notes.
 
 ## 7.0.0-alpha.4 (unreleased)
 
+- Trust screen, MCP: each project server shows what it runs (command line or URL,
+  secret-looking values redacted) before you tick it, and the approval is bound to
+  what was shown: `trust_preview` servers carry `command` and `fingerprint`, and
+  `approve_mcp_server` takes the `fingerprint` back and is refused if the config
+  changed since. Ticked servers are approved only by an engine in the folder they were
+  shown for; a failed restart or a switch to another folder drops them, and an engine
+  that cannot approve them says they still wait.
 - Full-screen UI: in a terminal too small for it, the note on stderr says what runs
   instead (the line REPL, or a plain-text answer for `neuron "prompt"`), and for
   `--continue` asks for a bigger window. While "Terminal too small" shows, keys and
