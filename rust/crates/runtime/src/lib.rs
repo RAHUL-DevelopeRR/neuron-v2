@@ -33,6 +33,7 @@ mod lane_events;
 pub mod lsp_client;
 mod mcp;
 pub mod mcp_approvals;
+pub mod mcp_audit;
 pub mod mcp_catalog;
 mod mcp_client;
 mod mcp_http;
@@ -145,6 +146,7 @@ pub use mcp::{
     scoped_mcp_config_hash, unwrap_ccr_proxy_url,
 };
 pub use mcp_approvals::{approve_mcp_server, McpApprovalOutcome, McpApprovals};
+pub use mcp_audit::{McpAuditCall, McpAuditLog};
 pub use mcp_catalog::{
     verify_mcp_catalog_update, McpCatalog, McpCatalogEntry, McpCatalogVariable, McpToolTier,
     MCP_CATALOG_UPDATE_PUBLIC_KEY,
@@ -200,9 +202,9 @@ pub use oauth::{
 pub use permissions::{
     deny_for_session_label, non_interactive_hint, parse_permission_response, quote_allow_rules,
     render_permission_prompt, rule_covers_mcp_server, url_host, user_declined_message,
-    ConsolePermissionPrompter, PermissionContext, PermissionMode, PermissionOutcome,
-    PermissionOverride, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
-    PermissionRemedy, PermissionRequest, SessionApprovals, ToolCallAssessment,
+    ConsolePermissionPrompter, PermissionContext, PermissionDecider, PermissionMode,
+    PermissionOutcome, PermissionOverride, PermissionPolicy, PermissionPromptDecision,
+    PermissionPrompter, PermissionRemedy, PermissionRequest, SessionApprovals, ToolCallAssessment,
     NON_INTERACTIVE_PERMISSION_HINT,
 };
 pub use plugin_lifecycle::{

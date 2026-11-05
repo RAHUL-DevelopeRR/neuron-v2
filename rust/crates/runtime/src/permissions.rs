@@ -213,6 +213,35 @@ pub enum PermissionOutcome {
     Deny { reason: String },
 }
 
+/// What decided a call ([`PermissionPolicy::authorize_with_context_decided`]), as the
+/// MCP audit log records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionDecider {
+    /// An allow, ask or deny rule (with no one to ask, for an ask rule).
+    Rule,
+    /// The permission mode allowed it, or refused it with no one to ask.
+    Mode,
+    /// The user, in a prompt or by an earlier approval of the same call.
+    User,
+    /// A choice made earlier in this session (approved or declined for the session).
+    Session,
+    /// A `PreToolUse` hook.
+    Hook,
+}
+
+impl PermissionDecider {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rule => "rule",
+            Self::Mode => "mode",
+            Self::User => "user",
+            Self::Session => "session",
+            Self::Hook => "hook",
+        }
+    }
+}
+
 /// Hint appended when escalation is needed but nobody can be asked, in its general
 /// form ([`non_interactive_hint`] names the call's own rules). It names an allow rule,
 /// which is checked before the mode; full access stays opt-in, and `--allowedTools`
@@ -532,6 +561,17 @@ struct McpWrapperTarget {
     /// `MCP` calls the built-in registry, whose tools have no tier: the call keeps
     /// the wrapper's own requirement. `MCPTool` takes the named tool's.
     keeps_wrapper_requirement: bool,
+}
+
+/// The MCP tool a call runs (`mcp__<server>__<tool>`, called directly or through a
+/// wrapper) and the arguments it passes; `None` for any other call.
+pub(crate) fn mcp_call_target(tool_name: &str, input: &str) -> Option<(String, String)> {
+    if tool_name.starts_with("mcp__") {
+        return Some((tool_name.to_string(), input.to_string()));
+    }
+    mcp_wrapper_target(tool_name, input)
+        .filter(|target| target.qualified_name.starts_with("mcp__"))
+        .map(|target| (target.qualified_name, target.input))
 }
 
 /// The MCP tool an `MCPTool` (`qualifiedName`, or `tool`) or `MCP` (`server` and
@@ -894,6 +934,18 @@ impl PermissionPolicy {
         self.authorize_with_floor(tool_name, input, context, None, prompter)
     }
 
+    /// [`Self::authorize_with_context`], and what decided it.
+    #[must_use]
+    pub fn authorize_with_context_decided(
+        &self,
+        tool_name: &str,
+        input: &str,
+        context: &PermissionContext,
+        prompter: Option<&mut dyn PermissionPrompter>,
+    ) -> (PermissionOutcome, PermissionDecider) {
+        self.decide_with_floor(tool_name, input, context, None, prompter)
+    }
+
     /// Like [`Self::authorize_with_context`], but the call needs at least
     /// `floor` (used by the enforcer when a tool classified its input).
     ///
@@ -914,6 +966,19 @@ impl PermissionPolicy {
         floor: Option<PermissionMode>,
         prompter: Option<&mut dyn PermissionPrompter>,
     ) -> PermissionOutcome {
+        self.decide_with_floor(tool_name, input, context, floor, prompter)
+            .0
+    }
+
+    /// [`Self::authorize_with_floor`], and what decided it.
+    fn decide_with_floor(
+        &self,
+        tool_name: &str,
+        input: &str,
+        context: &PermissionContext,
+        floor: Option<PermissionMode>,
+        prompter: Option<&mut dyn PermissionPrompter>,
+    ) -> (PermissionOutcome, PermissionDecider) {
         let repaired = repaired_tool_input(input);
         let input = repaired.as_deref().unwrap_or(input);
         let Some(target) = mcp_wrapper_target(tool_name, input) else {
@@ -927,12 +992,15 @@ impl PermissionPolicy {
                 .or_else(|| self.find_matching_rule(rules, kind, tool_name, input))
         };
         if let Some(rule) = wrapper_rule(&self.deny_rules, RuleKind::Deny) {
-            return PermissionOutcome::Deny {
-                reason: format!(
-                    "Permission to use {tool_name} has been denied by rule '{}'",
-                    rule.raw
-                ),
-            };
+            return (
+                PermissionOutcome::Deny {
+                    reason: format!(
+                        "Permission to use {tool_name} has been denied by rule '{}'",
+                        rule.raw
+                    ),
+                },
+                PermissionDecider::Rule,
+            );
         }
         let session_rules = self
             .session
@@ -981,23 +1049,29 @@ impl PermissionPolicy {
         floor: Option<PermissionMode>,
         wrapper: Option<&WrapperRules<'_>>,
         prompter: Option<&mut dyn PermissionPrompter>,
-    ) -> PermissionOutcome {
+    ) -> (PermissionOutcome, PermissionDecider) {
         if let Some(rule) =
             self.find_matching_rule(&self.deny_rules, RuleKind::Deny, tool_name, input)
         {
-            return PermissionOutcome::Deny {
-                reason: format!(
-                    "Permission to use {tool_name} has been denied by rule '{}'",
-                    rule.raw
-                ),
-            };
+            return (
+                PermissionOutcome::Deny {
+                    reason: format!(
+                        "Permission to use {tool_name} has been denied by rule '{}'",
+                        rule.raw
+                    ),
+                },
+                PermissionDecider::Rule,
+            );
         }
         // Declined for the rest of the session: refused without asking again, over
         // modes and allow rules alike.
         if let Some(declined) = self.session_denial(tool_name, input) {
-            return PermissionOutcome::Deny {
-                reason: declined_text(&declined, true),
-            };
+            return (
+                PermissionOutcome::Deny {
+                    reason: declined_text(&declined, true),
+                },
+                PermissionDecider::Session,
+            );
         }
 
         let current_mode = self.active_mode();
@@ -1028,12 +1102,15 @@ impl PermissionPolicy {
 
         match context.override_decision() {
             Some(PermissionOverride::Deny) => {
-                return PermissionOutcome::Deny {
-                    reason: context.override_reason().map_or_else(
-                        || format!("tool '{tool_name}' denied by hook"),
-                        ToOwned::to_owned,
-                    ),
-                };
+                return (
+                    PermissionOutcome::Deny {
+                        reason: context.override_reason().map_or_else(
+                            || format!("tool '{tool_name}' denied by hook"),
+                            ToOwned::to_owned,
+                        ),
+                    },
+                    PermissionDecider::Hook,
+                );
             }
             Some(PermissionOverride::Ask) => {
                 let reason = context.override_reason().map_or_else(
@@ -1048,6 +1125,7 @@ impl PermissionPolicy {
                     Some(reason.into()),
                     PermissionRemedy::default(),
                     prompter,
+                    PermissionDecider::Hook,
                 );
             }
             Some(PermissionOverride::Allow) => {
@@ -1064,10 +1142,11 @@ impl PermissionPolicy {
                         Some(reason.into()),
                         PermissionRemedy::default(),
                         prompter,
+                        PermissionDecider::Rule,
                     );
                 }
                 if allowed_by_rule || mode_allows(current_mode, required_mode) {
-                    return PermissionOutcome::Allow;
+                    return (PermissionOutcome::Allow, PermissionDecider::Hook);
                 }
             }
             None => {}
@@ -1086,15 +1165,19 @@ impl PermissionPolicy {
                 Some(reason.into()),
                 PermissionRemedy::default(),
                 prompter,
+                PermissionDecider::Rule,
             );
         }
 
-        if allowed_by_rule || mode_allows(current_mode, required_mode) {
-            return PermissionOutcome::Allow;
+        if allowed_by_rule {
+            return (PermissionOutcome::Allow, PermissionDecider::Rule);
+        }
+        if mode_allows(current_mode, required_mode) {
+            return (PermissionOutcome::Allow, PermissionDecider::Mode);
         }
 
         if assessment.session_approved && current_mode != PermissionMode::ReadOnly {
-            return PermissionOutcome::Allow;
+            return (PermissionOutcome::Allow, PermissionDecider::Session);
         }
 
         if current_mode == PermissionMode::Prompt
@@ -1117,6 +1200,7 @@ impl PermissionPolicy {
                 Some(reason),
                 remedy,
                 prompter,
+                PermissionDecider::Mode,
             );
         }
 
@@ -1130,11 +1214,43 @@ impl PermissionPolicy {
             reason.push_str(detail);
             reason.push(')');
         }
-        PermissionOutcome::Deny { reason }
+        (PermissionOutcome::Deny { reason }, PermissionDecider::Mode)
+    }
+
+    /// Asks the prompter; with none, a call the user approved earlier runs and any other
+    /// is refused, decided by `unasked` (what sent it to be asked).
+    #[allow(clippy::too_many_arguments)]
+    fn prompt_or_deny(
+        &self,
+        tool_name: &str,
+        input: &str,
+        current_mode: PermissionMode,
+        assessment: &ToolCallAssessment,
+        reason: Option<ApprovalReason>,
+        remedy: PermissionRemedy,
+        prompter: Option<&mut dyn PermissionPrompter>,
+        unasked: PermissionDecider,
+    ) -> (PermissionOutcome, PermissionDecider) {
+        let asked = prompter.is_some();
+        let outcome = self.ask_or_deny(
+            tool_name,
+            input,
+            current_mode,
+            assessment,
+            reason,
+            remedy,
+            prompter,
+        );
+        let decider = if asked || outcome == PermissionOutcome::Allow {
+            PermissionDecider::User
+        } else {
+            unasked
+        };
+        (outcome, decider)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn prompt_or_deny(
+    fn ask_or_deny(
         &self,
         tool_name: &str,
         input: &str,

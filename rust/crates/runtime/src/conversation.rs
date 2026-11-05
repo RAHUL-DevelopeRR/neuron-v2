@@ -18,10 +18,12 @@ use crate::context_manager::{
 };
 use crate::experience::{self, ExperienceStore, HarnessStats};
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
+use crate::mcp_audit::{McpAuditCall, McpAuditLog};
 use crate::model_registry;
 use crate::model_routing::{self, ModelRouting};
 use crate::permissions::{
-    PermissionContext, PermissionMode, PermissionOutcome, PermissionPolicy, PermissionPrompter,
+    PermissionContext, PermissionDecider, PermissionMode, PermissionOutcome, PermissionPolicy,
+    PermissionPrompter,
 };
 use crate::project_checks::{detect_checks, ProjectCheck};
 use crate::refusal::neutral_refusal_note;
@@ -562,6 +564,8 @@ pub struct ConversationRuntime<C, T> {
     model_override: Option<String>,
     /// Looks at each model request before it is sent (see [`RequestGuard`]).
     request_guard: Option<Box<dyn RequestGuard>>,
+    /// Records every MCP call, refused ones too (see [`crate::mcp_audit`]).
+    mcp_audit: Option<McpAuditLog>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -625,7 +629,15 @@ where
             routing: ModelRouting::default(),
             model_override: None,
             request_guard: None,
+            mcp_audit: None,
         }
+    }
+
+    /// Records every MCP tool call this runtime decides in `audit`.
+    #[must_use]
+    pub fn with_mcp_audit(mut self, audit: McpAuditLog) -> Self {
+        self.mcp_audit = Some(audit);
+        self
     }
 
     /// Has `guard` look at every model request before it is sent (see
@@ -1239,6 +1251,7 @@ where
     /// The pre-hook and the permission prompt can block for a while, so the
     /// cancellation token is checked again once they return: a call the user
     /// interrupted meanwhile is never started.
+    #[allow(clippy::too_many_lines)]
     fn execute_tool_use(
         &mut self,
         iteration: usize,
@@ -1256,37 +1269,33 @@ where
             pre_hook_result.permission_reason().map(ToOwned::to_owned),
         );
 
-        let permission_outcome = if pre_hook_result.is_cancelled() {
-            PermissionOutcome::Deny {
-                reason: format_hook_message(
-                    &pre_hook_result,
-                    &format!("PreToolUse hook cancelled tool `{tool_name}`"),
-                ),
-            }
+        let hook_refusal = if pre_hook_result.is_cancelled() {
+            Some(format!("PreToolUse hook cancelled tool `{tool_name}`"))
         } else if pre_hook_result.is_failed() {
-            PermissionOutcome::Deny {
-                reason: format_hook_message(
-                    &pre_hook_result,
-                    &format!("PreToolUse hook failed for tool `{tool_name}`"),
-                ),
-            }
+            Some(format!("PreToolUse hook failed for tool `{tool_name}`"))
         } else if pre_hook_result.is_denied() {
-            PermissionOutcome::Deny {
-                reason: format_hook_message(
-                    &pre_hook_result,
-                    &format!("PreToolUse hook denied tool `{tool_name}`"),
-                ),
-            }
+            Some(format!("PreToolUse hook denied tool `{tool_name}`"))
         } else {
-            self.permission_policy.authorize_with_context(
+            None
+        };
+        let (permission_outcome, decided_by) = match hook_refusal {
+            Some(fallback) => (
+                PermissionOutcome::Deny {
+                    reason: format_hook_message(&pre_hook_result, &fallback),
+                },
+                PermissionDecider::Hook,
+            ),
+            None => self.permission_policy.authorize_with_context_decided(
                 tool_name,
                 &effective_input,
                 &permission_context,
                 prompter,
-            )
+            ),
         };
 
         let interrupted = self.cancel.is_cancelled();
+        let allowed = permission_outcome == PermissionOutcome::Allow;
+        let started = Instant::now();
         let (output, is_error) = match permission_outcome {
             PermissionOutcome::Allow if interrupted => (INTERRUPTED_TOOL_RESULT.to_string(), true),
             PermissionOutcome::Allow => {
@@ -1323,6 +1332,35 @@ where
                 true,
             ),
         };
+        if let Some(audit) = &self.mcp_audit {
+            let error_class = if !allowed {
+                Some("denied")
+            } else if interrupted {
+                Some("interrupted")
+            } else if is_error {
+                Some("tool_error")
+            } else {
+                None
+            };
+            let recorded = audit.record(&McpAuditCall {
+                tool_name,
+                input: &effective_input,
+                allowed,
+                decided_by,
+                duration: if allowed && !interrupted {
+                    started.elapsed()
+                } else {
+                    std::time::Duration::ZERO
+                },
+                output_bytes: output.len(),
+                error_class,
+            });
+            if let Err(error) = recorded {
+                crate::ui_hooks::notice(&format!(
+                    "warning: could not write the MCP audit log: {error}"
+                ));
+            }
+        }
         ExecutedToolCall {
             message: ConversationMessage::tool_result(
                 tool_use_id,
@@ -3977,6 +4015,98 @@ mod resilience_tests {
             assert!(!self.responses.is_empty(), "unexpected extra model call");
             self.responses.remove(0)
         }
+    }
+
+    #[test]
+    fn every_mcp_call_is_audited_refused_ones_too_without_its_arguments() {
+        let root = std::env::temp_dir().join(format!(
+            "neuron-conversation-audit-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let home = root.join("home");
+        std::fs::create_dir_all(root.join("repo")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("settings.json"),
+            r#"{"defaultMcpServers":false,"mcpServers":{"alpha":{"command":"alpha-mcp"}},"permissions":{"deny":["mcp__alpha__delete"]}}"#,
+        )
+        .unwrap();
+        let config = crate::ConfigLoader::new(root.join("repo"), &home)
+            .load()
+            .unwrap();
+        let sentinel = "SENTINEL-conversation-audit-91c3";
+        let input = format!(r#"{{"text":"{sentinel}"}}"#);
+        let wrapped = format!(
+            r#"{{"qualifiedName":"mcp__alpha__delete","arguments":{{"id":"{sentinel}"}}}}"#
+        );
+        let api = ScriptedApi::new(vec![
+            Ok(vec![
+                tool_call("a", "mcp__alpha__echo", &input),
+                tool_call("b", "mcp__alpha__delete", &input),
+                tool_call("c", "MCPTool", &wrapped),
+                tool_call("d", "read_file", &input),
+                AssistantEvent::MessageStop,
+            ]),
+            Ok(vec![text("done"), AssistantEvent::MessageStop]),
+        ]);
+        let tools = StaticToolExecutor::new()
+            .register("mcp__alpha__echo", |_| Ok(format!("echo {}", "x")))
+            .register("mcp__alpha__delete", |_| {
+                panic!("a denied call must not run")
+            })
+            .register("MCPTool", |_| panic!("a denied call must not run"))
+            .register("read_file", |_| Ok("file".to_string()));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            api,
+            tools,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess)
+                .with_permission_rules(config.permission_rules()),
+            vec!["system".to_string()],
+        )
+        .with_mcp_audit(crate::McpAuditLog::new(&home, "s-audit", config.mcp()));
+
+        runtime.run_turn("go", None).expect("turn runs");
+
+        let audit = home.join("audit");
+        let text = std::fs::read_dir(&audit)
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<String>();
+        assert!(!text.contains(sentinel), "{text}");
+        let lines = text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        // The three MCP calls, the refused ones included; not the built-in tool.
+        assert_eq!(lines.len(), 3, "{text}");
+        let summary = lines
+            .iter()
+            .map(|line| {
+                (
+                    line["tool"].as_str().unwrap().to_string(),
+                    line["decision"].as_str().unwrap().to_string(),
+                    line["decided_by"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            [
+                ("echo".to_string(), "allow".to_string(), "mode".to_string()),
+                ("delete".to_string(), "deny".to_string(), "rule".to_string()),
+                ("delete".to_string(), "deny".to_string(), "rule".to_string()),
+            ]
+        );
+        assert!(lines.iter().all(|line| line["session"] == "s-audit"));
+        assert!(lines.iter().all(|line| line["server"] == "alpha"));
+        assert!(lines[0]["error_class"].is_null());
+        assert_eq!(lines[1]["error_class"], "denied");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn tool_call(id: &str, name: &str, input: &str) -> AssistantEvent {

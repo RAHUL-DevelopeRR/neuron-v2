@@ -527,7 +527,13 @@ fn assemble_conversation_runtime(
     .with_max_iterations(runtime::resolve_max_iterations(max_iterations_setting))
     .with_harness_config(harness)
     .with_model_routing(routing)
-    .with_request_guard(Box::new(request_guard));
+    .with_request_guard(Box::new(request_guard))
+    // Every MCP call, refused ones too, is recorded (metadata only) in the config home.
+    .with_mcp_audit(runtime::McpAuditLog::new(
+        &runtime::default_config_home(),
+        session_id,
+        feature_config.mcp(),
+    ));
     if let Some(reviewer) = reviewer {
         runtime = runtime.with_change_reviewer(Box::new(reviewer));
     }
