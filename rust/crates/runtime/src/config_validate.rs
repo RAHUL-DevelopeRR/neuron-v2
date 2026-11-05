@@ -346,6 +346,10 @@ const MCP_POLICY_FIELDS: &[FieldSpec] = &[
         name: "failClosed",
         expected: FieldType::Bool,
     },
+    FieldSpec {
+        name: "requireSandbox",
+        expected: FieldType::Bool,
+    },
 ];
 
 /// `mcpPolicy.toolRules`.

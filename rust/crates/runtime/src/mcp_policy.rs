@@ -148,6 +148,8 @@ fn admin_only(_path: &Path) -> Result<(), String> {
 }
 
 /// `mcpPolicy` in the managed settings.
+// Each flag is its own settings key.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedMcpPolicy {
     /// Only these may start: catalog ids (`github`), `catalog:*` (any catalog
@@ -170,6 +172,9 @@ pub struct ManagedMcpPolicy {
     /// Block every server the managed settings neither configure nor require while the
     /// plan's policy cannot be read or is out of date.
     pub fail_closed: bool,
+    /// Every stdio server runs in its sandbox: a `"sandbox": false` outside the managed
+    /// settings is ignored (default false).
+    pub require_sandbox: bool,
 }
 
 impl ManagedMcpPolicy {
@@ -197,6 +202,7 @@ impl ManagedMcpPolicy {
             allowed_remote_hosts: list("allowedRemoteHosts")?,
             tool_rules,
             fail_closed: optional_bool(object, "failClosed", context)?.unwrap_or(false),
+            require_sandbox: optional_bool(object, "requireSandbox", context)?.unwrap_or(false),
         })
     }
 }
@@ -521,6 +527,10 @@ pub(crate) fn apply_mcp_policy(
         }
     }
 
+    if inputs.managed.is_some_and(|policy| policy.require_sandbox) {
+        require_sandboxes(servers, disabled, &mut applied.warnings);
+    }
+
     let mut wanted: Vec<(String, McpPolicySource)> = Vec::new();
     for (ids, by) in [
         (
@@ -591,6 +601,29 @@ pub(crate) fn apply_mcp_policy(
         }
     }
     applied
+}
+
+/// `mcpPolicy.requireSandbox`: drops `"sandbox": false` from every stdio server the
+/// managed settings do not define, so it runs with its catalog or unvetted profile.
+fn require_sandboxes(
+    servers: &mut BTreeMap<String, ScopedMcpServerConfig>,
+    disabled: &mut BTreeMap<String, ScopedMcpServerConfig>,
+    warnings: &mut Vec<String>,
+) {
+    for (name, server) in servers.iter_mut().chain(disabled.iter_mut()) {
+        if server.scope == ConfigSource::Managed {
+            continue;
+        }
+        let McpServerConfig::Stdio(stdio) = &mut server.config else {
+            continue;
+        };
+        if stdio.sandbox.as_ref().is_some_and(|sandbox| sandbox.off) {
+            stdio.sandbox = None;
+            warnings.push(format!(
+                "ignoring \"sandbox\": false for the MCP server `{name}`: the managed settings require every stdio server to run in its sandbox (mcpPolicy.requireSandbox)"
+            ));
+        }
+    }
 }
 
 /// Which policies apply, given the managed policy and the plan policy cache.
@@ -1319,6 +1352,50 @@ mod tests {
             config.mcp().get("playwright").is_some(),
             "required by managed"
         );
+    }
+
+    #[test]
+    fn require_sandbox_ignores_sandbox_false_outside_the_managed_settings() {
+        let sandbox_off = |config: &crate::config::RuntimeConfig, name: &str| match &config
+            .mcp()
+            .get(name)
+            .expect("the server is configured")
+            .config
+        {
+            McpServerConfig::Stdio(stdio) => stdio.sandbox.as_ref().map(|sandbox| sandbox.off),
+            other => panic!("not stdio: {other:?}"),
+        };
+        let fixture = Fixture::new("require-sandbox");
+        fixture
+            .user(r#"{"defaultMcpServers":false,"mcpServers":{"own":{"command":"own","sandbox":false}}}"#)
+            .managed(r#"{"mcpServers":{"corp":{"command":"corp","sandbox":false}}}"#);
+        let config = fixture.loader().load().expect("config loads");
+        assert_eq!(
+            sandbox_off(&config, "own"),
+            Some(true),
+            "allowed by default"
+        );
+
+        fixture.managed(
+            r#"{"mcpServers":{"corp":{"command":"corp","sandbox":false}},"mcpPolicy":{"requireSandbox":true}}"#,
+        );
+        let config = fixture.loader().load().expect("config loads");
+        assert_eq!(
+            sandbox_off(&config, "own"),
+            None,
+            "the user's false is dropped"
+        );
+        assert_eq!(
+            sandbox_off(&config, "corp"),
+            Some(true),
+            "the managed settings may still turn it off"
+        );
+        let (profile, _) = crate::mcp_sandbox::resolve_mcp_sandbox(
+            "own",
+            Some(ConfigSource::User),
+            &config.mcp().get("own").unwrap().config,
+        );
+        assert!(!profile.off);
     }
 
     #[test]

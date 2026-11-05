@@ -525,7 +525,8 @@ Two policies decide which MCP servers may start, the first one winning:
       "deny": ["mcp__github__delete_repository"],
       "ask": ["mcp__github"]
     },
-    "failClosed": false
+    "failClosed": false,
+    "requireSandbox": true
   }
 }
 ```
@@ -540,6 +541,7 @@ Two policies decide which MCP servers may start, the first one winning:
 | `allowedRemoteHosts` | Remote servers may reach only these hosts (`example.com`, `*.example.com`) |
 | `toolRules` | `deny`, `ask` and `allow` rules added to everyone's permission rules; a deny rule always wins over an allow rule |
 | `failClosed` | `true`: while the plan's policy has not been read in the last day (offline, signed out), only the servers the managed settings define or require start |
+| `requireSandbox` | `true`: every stdio server runs in its sandbox; a `"sandbox": false` in user or workspace settings is ignored with a warning (the managed settings' own servers may still turn it off) |
 
 A server the managed settings define is never refused by either policy. A refused
 server shows as `blocked` in `/mcp` and the MCP panel, with the reason, and does not
