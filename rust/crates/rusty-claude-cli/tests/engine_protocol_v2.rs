@@ -21,7 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 const SESSION_TOKEN: &str = "ses_v2protocol0123456789abcdefghij";
-const EVENT_TIMEOUT: Duration = Duration::from_secs(60);
+const EVENT_TIMEOUT: Duration = Duration::from_mins(1);
 const MODEL: &str = "gemini/gemini-2.5-flash";
 
 /// A gateway answering the routes the engine uses. The first chat request is refused

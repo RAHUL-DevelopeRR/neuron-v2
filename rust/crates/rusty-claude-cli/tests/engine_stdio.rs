@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 /// Generous: a turn talks to the mock service over HTTP and may start a shell, and a
 /// device sign-in polls every five seconds.
-const EVENT_TIMEOUT: Duration = Duration::from_secs(60);
+const EVENT_TIMEOUT: Duration = Duration::from_mins(1);
 
 fn unique_dir(label: &str) -> PathBuf {
     let nanos = SystemTime::now()

@@ -226,9 +226,15 @@ fn run_engine(
         return match started {
             Ok((mut engine, resumed)) => {
                 engine.announce();
+                let source = if resumed.is_some() {
+                    "resume"
+                } else {
+                    "startup"
+                };
                 if let Some(report) = resumed {
                     engine.notice(&report);
                 }
+                engine.cli.run_session_start_hooks(source);
                 let _ = ready.send(Ok(()));
                 let exit = engine.serve(queue);
                 engine.close();
@@ -282,6 +288,13 @@ fn run_engine(
                 }),
             }
         }
+        engine
+            .cli
+            .run_session_start_hooks(if signed_out.options.resume.is_some() {
+                "resume"
+            } else {
+                "startup"
+            });
         // The end of the `/login` that got here.
         engine.finish_turn();
         let exit = engine.serve(queue);
@@ -1863,6 +1876,10 @@ impl Engine {
                 self.notice(&format_cost_report(usage));
             }
             SlashCommand::Compact => self.compact()?,
+            SlashCommand::Hooks { args } => {
+                let report = self.cli.hooks_report(args.as_deref());
+                self.notice(&report);
+            }
             SlashCommand::Model { model: None } => self.model_report(),
             SlashCommand::Model { model: Some(model) } => {
                 self.switch_model(&model)?;
@@ -1882,6 +1899,7 @@ impl Engine {
                 self.resume(&reference)?;
                 self.persist();
                 self.send_transcript();
+                self.cli.run_session_start_hooks("resume");
             }
             SlashCommand::Plan { mode } => self.plan(mode.as_deref())?,
             SlashCommand::Login => self.login()?,
@@ -2108,6 +2126,7 @@ impl Engine {
     }
 
     fn compact(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.cli.run_manual_pre_compact_hooks();
         let result = self.cli.runtime.compact(CompactionConfig::default());
         let removed = result.removed_message_count;
         let kept = result.compacted_session.messages.len();
@@ -2115,6 +2134,9 @@ impl Engine {
         self.rebuild_runtime(result.compacted_session, &session_id)?;
         self.cli.persist_session()?;
         self.notice(&format_compact_report(removed, kept, removed == 0));
+        if removed > 0 {
+            self.cli.run_session_start_hooks("compact");
+        }
         Ok(())
     }
 
@@ -2138,6 +2160,7 @@ impl Engine {
         let report = self.cli.session_cleared_report(&previous);
         self.notice(&report);
         self.persist();
+        self.cli.run_session_start_hooks("clear");
         Ok(())
     }
 

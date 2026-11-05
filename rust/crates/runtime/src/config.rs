@@ -6,6 +6,8 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::hook_matcher::{parse_hook_list, HookCommand, HookSource};
+use crate::hooks::HookEvent;
 use crate::json::JsonValue;
 use crate::model_routing::ModelRoutingSettings;
 use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
@@ -127,12 +129,10 @@ pub struct ProviderFallbackConfig {
     fallbacks: Vec<String>,
 }
 
-/// Hook command lists grouped by lifecycle stage.
+/// Hook commands by event, in the order they run, each with its matcher and source.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeHookConfig {
-    pre_tool_use: Vec<String>,
-    post_tool_use: Vec<String>,
-    post_tool_use_failure: Vec<String>,
+    entries: Vec<(HookEvent, HookCommand)>,
 }
 
 /// Raw permission rule lists grouped by allow, deny, and ask behavior.
@@ -281,7 +281,7 @@ pub struct WorkspaceTrustPreview {
 /// A hook command a workspace file would run around tool calls.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreviewHook {
-    /// `PreToolUse`, `PostToolUse` or `PostToolUseFailure`.
+    /// The event's settings name, such as `PreToolUse` or `SessionStart`.
     pub event: &'static str,
     pub command: String,
     pub source: PathBuf,
@@ -306,9 +306,6 @@ pub struct PreviewPermissionRule {
     pub rule: String,
     pub source: PathBuf,
 }
-
-/// Hook events a settings file can name.
-const HOOK_EVENTS: [&str; 3] = ["PreToolUse", "PostToolUse", "PostToolUseFailure"];
 
 /// What a preview shows of an MCP server's address: the program, or the URL's host.
 fn mcp_preview_target(config: &McpServerConfig) -> Option<String> {
@@ -431,12 +428,14 @@ impl ConfigLoader {
             .map_or_else(|| PathBuf::from(".claw"), |parent| parent.join(".claw"))
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn load(&self) -> Result<RuntimeConfig, ConfigError> {
         let mut merged = BTreeMap::new();
         let mut loaded_entries = Vec::new();
         let mut mcp_servers = BTreeMap::new();
         let mut all_warnings = Vec::new();
         let mut parsed_entries = Vec::new();
+        let mut hooks_by_event: BTreeMap<HookEvent, Vec<HookCommand>> = BTreeMap::new();
 
         for entry in self.discover() {
             crate::config_validate::check_unsupported_format(&entry.path)?;
@@ -471,7 +470,13 @@ impl ConfigLoader {
                     union_workspace_deny_rules(&mut merged, &mut object);
                 }
             }
-            validate_optional_hooks_config(&object, &entry.path)?;
+            for (event, commands) in parse_optional_hooks_config_object(
+                &object,
+                hook_source(entry.source),
+                &format!("{}: hooks", entry.path.display()),
+            )? {
+                hooks_by_event.insert(event, commands);
+            }
             disabled_mcp_servers.extend(
                 optional_string_array(&object, "disabledMcpServers", "settings")?
                     .unwrap_or_default(),
@@ -520,7 +525,15 @@ impl ConfigLoader {
         let merged_value = JsonValue::Object(merged.clone());
 
         let feature_config = RuntimeFeatureConfig {
-            hooks: parse_optional_hooks_config(&merged_value)?,
+            hooks: hooks_by_event.into_iter().fold(
+                RuntimeHookConfig::default(),
+                |mut hooks, (event, commands)| {
+                    for command in commands {
+                        hooks.push(event, command);
+                    }
+                    hooks
+                },
+            ),
             plugins: parse_optional_plugin_config(&merged_value)?,
             mcp: McpConfigCollection {
                 servers: mcp_servers,
@@ -563,12 +576,17 @@ impl ConfigLoader {
             };
             let object = parsed.object;
             if let Some(hooks) = object.get("hooks").and_then(JsonValue::as_object) {
-                for event in HOOK_EVENTS {
-                    let commands = hooks.get(event).and_then(JsonValue::as_array);
-                    for command in commands.into_iter().flatten().filter_map(JsonValue::as_str) {
+                for event in HookEvent::ALL {
+                    let Some(list) = hooks.get(event.as_str()) else {
+                        continue;
+                    };
+                    let commands =
+                        parse_hook_list(list, hook_source(entry.source), "trust preview")
+                            .unwrap_or_default();
+                    for command in commands {
                         preview.hooks.push(PreviewHook {
-                            event,
-                            command: command.to_string(),
+                            event: event.as_str(),
+                            command: command.command,
                             source: entry.path.clone(),
                         });
                     }
@@ -1173,27 +1191,123 @@ pub fn default_config_home() -> PathBuf {
 }
 
 impl RuntimeHookConfig {
+    /// Tool hooks that run for every tool, declared in code.
     #[must_use]
     pub fn new(
         pre_tool_use: Vec<String>,
         post_tool_use: Vec<String>,
         post_tool_use_failure: Vec<String>,
     ) -> Self {
+        Self::from_event_lists(
+            HookSource::Builtin,
+            [
+                (HookEvent::PreToolUse, pre_tool_use),
+                (HookEvent::PostToolUse, post_tool_use),
+                (HookEvent::PostToolUseFailure, post_tool_use_failure),
+            ],
+        )
+    }
+
+    /// Plain command lists (no matchers) from one source, such as plugins.
+    #[must_use]
+    pub fn from_event_lists(
+        source: HookSource,
+        lists: impl IntoIterator<Item = (HookEvent, Vec<String>)>,
+    ) -> Self {
+        let mut config = Self::default();
+        for (event, commands) in lists {
+            for command in commands {
+                config.push(event, HookCommand::new(command, source));
+            }
+        }
+        config
+    }
+
+    /// Adds a hook after the event's others.
+    pub fn push(&mut self, event: HookEvent, command: HookCommand) {
+        self.entries.push((event, command));
+    }
+
+    #[must_use]
+    pub fn with(mut self, event: HookEvent, command: HookCommand) -> Self {
+        self.push(event, command);
+        self
+    }
+
+    /// Every hook, by event in [`HookEvent::ALL`] order, then in declaration order.
+    #[must_use]
+    pub fn entries(&self) -> Vec<(HookEvent, &HookCommand)> {
+        HookEvent::ALL
+            .into_iter()
+            .flat_map(|event| {
+                self.commands(event)
+                    .into_iter()
+                    .map(move |command| (event, command))
+            })
+            .collect()
+    }
+
+    /// The event's hooks, in the order they run.
+    #[must_use]
+    pub fn commands(&self, event: HookEvent) -> Vec<&HookCommand> {
+        self.entries
+            .iter()
+            .filter(|(entry_event, _)| *entry_event == event)
+            .map(|(_, command)| command)
+            .collect()
+    }
+
+    /// Only the tool hooks (`PreToolUse`, `PostToolUse`, `PostToolUseFailure`): what a
+    /// sub-agent inherits, so session and turn hooks run once, for the main agent.
+    #[must_use]
+    pub fn tool_hooks(&self) -> Self {
         Self {
-            pre_tool_use,
-            post_tool_use,
-            post_tool_use_failure,
+            entries: self
+                .entries
+                .iter()
+                .filter(|(event, _)| {
+                    matches!(
+                        event,
+                        HookEvent::PreToolUse
+                            | HookEvent::PostToolUse
+                            | HookEvent::PostToolUseFailure
+                    )
+                })
+                .cloned()
+                .collect(),
         }
     }
 
     #[must_use]
-    pub fn pre_tool_use(&self) -> &[String] {
-        &self.pre_tool_use
+    pub fn has(&self, event: HookEvent) -> bool {
+        self.entries.iter().any(|(entry, _)| *entry == event)
     }
 
     #[must_use]
-    pub fn post_tool_use(&self) -> &[String] {
-        &self.post_tool_use
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn command_strings(&self, event: HookEvent) -> Vec<String> {
+        self.commands(event)
+            .into_iter()
+            .map(|command| command.command.clone())
+            .collect()
+    }
+
+    #[must_use]
+    pub fn pre_tool_use(&self) -> Vec<String> {
+        self.command_strings(HookEvent::PreToolUse)
+    }
+
+    #[must_use]
+    pub fn post_tool_use(&self) -> Vec<String> {
+        self.command_strings(HookEvent::PostToolUse)
+    }
+
+    #[must_use]
+    pub fn post_tool_use_failure(&self) -> Vec<String> {
+        self.command_strings(HookEvent::PostToolUseFailure)
     }
 
     #[must_use]
@@ -1203,18 +1317,19 @@ impl RuntimeHookConfig {
         merged
     }
 
+    /// Adds `other`'s hooks, skipping ones already here (same event, command and
+    /// matcher).
     pub fn extend(&mut self, other: &Self) {
-        extend_unique(&mut self.pre_tool_use, other.pre_tool_use());
-        extend_unique(&mut self.post_tool_use, other.post_tool_use());
-        extend_unique(
-            &mut self.post_tool_use_failure,
-            other.post_tool_use_failure(),
-        );
-    }
-
-    #[must_use]
-    pub fn post_tool_use_failure(&self) -> &[String] {
-        &self.post_tool_use_failure
+        for (event, command) in &other.entries {
+            let duplicate = self.entries.iter().any(|(existing_event, existing)| {
+                existing_event == event
+                    && existing.command == command.command
+                    && existing.matcher == command.matcher
+            });
+            if !duplicate {
+                self.entries.push((*event, command.clone()));
+            }
+        }
     }
 }
 
@@ -1361,34 +1476,35 @@ fn parse_optional_aliases(root: &JsonValue) -> Result<BTreeMap<String, String>, 
     Ok(optional_string_map(object, "aliases", "merged settings")?.unwrap_or_default())
 }
 
-fn parse_optional_hooks_config(root: &JsonValue) -> Result<RuntimeHookConfig, ConfigError> {
-    let Some(object) = root.as_object() else {
-        return Ok(RuntimeHookConfig::default());
-    };
-    parse_optional_hooks_config_object(object, "merged settings.hooks")
-}
-
+/// One settings file's hooks, by event. A later file's list for an event replaces an
+/// earlier file's, as the merged settings do.
 fn parse_optional_hooks_config_object(
     object: &BTreeMap<String, JsonValue>,
+    source: HookSource,
     context: &str,
-) -> Result<RuntimeHookConfig, ConfigError> {
+) -> Result<Vec<(HookEvent, Vec<HookCommand>)>, ConfigError> {
     let Some(hooks_value) = object.get("hooks") else {
-        return Ok(RuntimeHookConfig::default());
+        return Ok(Vec::new());
     };
     let hooks = expect_object(hooks_value, context)?;
-    Ok(RuntimeHookConfig {
-        pre_tool_use: optional_string_array(hooks, "PreToolUse", context)?.unwrap_or_default(),
-        post_tool_use: optional_string_array(hooks, "PostToolUse", context)?.unwrap_or_default(),
-        post_tool_use_failure: optional_string_array(hooks, "PostToolUseFailure", context)?
-            .unwrap_or_default(),
-    })
+    let mut parsed = Vec::new();
+    for event in HookEvent::ALL {
+        if let Some(list) = hooks.get(event.as_str()) {
+            let commands = parse_hook_list(list, source, &format!("{context}.{}", event.as_str()))
+                .map_err(ConfigError::Parse)?;
+            parsed.push((event, commands));
+        }
+    }
+    Ok(parsed)
 }
 
-fn validate_optional_hooks_config(
-    root: &BTreeMap<String, JsonValue>,
-    path: &Path,
-) -> Result<(), ConfigError> {
-    parse_optional_hooks_config_object(root, &format!("{}: hooks", path.display())).map(|_| ())
+fn hook_source(source: ConfigSource) -> HookSource {
+    match source {
+        ConfigSource::User => HookSource::User,
+        ConfigSource::Project => HookSource::Project,
+        ConfigSource::Local => HookSource::Local,
+        ConfigSource::Bundled => HookSource::Builtin,
+    }
 }
 
 fn parse_optional_permission_rules(
@@ -1875,18 +1991,6 @@ fn deep_merge_objects(
                 target.insert(key.clone(), value.clone());
             }
         }
-    }
-}
-
-fn extend_unique(target: &mut Vec<String>, values: &[String]) {
-    for value in values {
-        push_unique(target, value.clone());
-    }
-}
-
-fn push_unique(target: &mut Vec<String>, value: String) {
-    if !target.iter().any(|existing| existing == &value) {
-        target.push(value);
     }
 }
 
@@ -2998,7 +3102,7 @@ mod tests {
         let rendered = error.to_string();
         assert!(
             rendered.contains("hooks.PreToolUse")
-                && rendered.contains("must be an array of strings"),
+                && rendered.contains("must be an array of hook commands"),
             "expected validation error for hooks.PreToolUse, got: {rendered}"
         );
         assert!(!rendered.contains("merged settings.hooks"));
@@ -3021,6 +3125,104 @@ mod tests {
             parse_permission_mode_label("dontAsk", "test").expect("dontAsk should resolve"),
             ResolvedPermissionMode::DangerFullAccess
         );
+    }
+
+    #[test]
+    fn hooks_keep_matchers_and_sources_and_a_later_file_replaces_an_event() {
+        use crate::hook_matcher::HookSource;
+        use crate::hooks::HookEvent;
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".neuron");
+        fs::create_dir_all(cwd.join(".neuron")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"hooks":{"PreToolUse":["user-pre"],"Stop":[{"command":"user-stop"}],"SessionStart":[{"matcher":"startup|resume","command":"greet"}]}}"#,
+        )
+        .expect("write user settings");
+        fs::write(
+            cwd.join(".neuron").join("settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"bash","hooks":[{"type":"command","command":"guard"}]}],"UserPromptSubmit":["ctx"]}}"#,
+        )
+        .expect("write project settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+        let hooks = loaded.hooks();
+        let listed: Vec<(HookEvent, &str, Option<&str>, HookSource)> = hooks
+            .entries()
+            .into_iter()
+            .map(|(event, hook)| {
+                (
+                    event,
+                    hook.command.as_str(),
+                    hook.matcher.as_deref(),
+                    hook.source,
+                )
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                (
+                    HookEvent::PreToolUse,
+                    "guard",
+                    Some("bash"),
+                    HookSource::Project
+                ),
+                (
+                    HookEvent::SessionStart,
+                    "greet",
+                    Some("startup|resume"),
+                    HookSource::User
+                ),
+                (
+                    HookEvent::UserPromptSubmit,
+                    "ctx",
+                    None,
+                    HookSource::Project
+                ),
+                (HookEvent::Stop, "user-stop", None, HookSource::User),
+            ]
+        );
+
+        // Untrusted, the workspace's hooks are dropped and the user's stay.
+        let untrusted = ConfigLoader::new(&cwd, &home)
+            .with_project_trust(ProjectTrust::Untrusted)
+            .load()
+            .expect("config should load");
+        assert_eq!(untrusted.hooks().pre_tool_use(), ["user-pre"]);
+        assert!(!untrusted.hooks().has(HookEvent::UserPromptSubmit));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rejects_hook_matchers_that_are_not_valid_regexes() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".neuron");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"mcp__(","command":"x"}]}}"#,
+        )
+        .expect("write user settings");
+
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("invalid matcher");
+        let rendered = error.to_string();
+        assert!(rendered.contains("hooks.PreToolUse[0]"), "{rendered}");
+        assert!(
+            rendered.contains("not a valid regular expression"),
+            "{rendered}"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]

@@ -64,6 +64,8 @@ export const FEATURE_CHECKPOINTS = 'checkpoints'
 export const FEATURE_MCP_TOGGLE = 'mcp_toggle'
 /** `tool_output_delta` events: a running shell command's output. */
 export const FEATURE_LIVE_OUTPUT = 'live_output'
+/** `hook_started` and `hook_finished` events while hook commands run. */
+export const FEATURE_HOOK_PROGRESS = 'hook_progress'
 
 /** A UI capability: questions come as `question` events, not "Question:" notices. */
 export const CAPABILITY_QUESTIONS = 'questions'
@@ -85,6 +87,12 @@ export const CAPABILITY_GIT_VIEWS = 'git_views'
  * `tool_output_delta` events. Without it the output comes only with the result.
  */
 export const CAPABILITY_LIVE_OUTPUT = 'live_output'
+
+/**
+ * A UI capability: `hook_started` and `hook_finished` events. Without it the
+ * engine sends neither.
+ */
+export const CAPABILITY_HOOK_PROGRESS = 'hook_progress'
 
 /** Token counts as the provider reported them (or estimated before it did). */
 export interface TokenCounts {
@@ -785,6 +793,34 @@ export interface ToolOutputDeltaEvent {
 }
 
 /**
+ * A hook command started. `event` is its settings name (`PreToolUse`, `Stop`,
+ * ...); `command` is shortened, with anything that looks like a secret hidden;
+ * `tool_use_id` is the tool call it runs for.
+ */
+export interface HookStartedEvent {
+  type: 'hook_started'
+  event: string
+  matcher?: string | null
+  command: string
+  tool_use_id?: string | null
+}
+
+/** How a hook command ended. */
+export type HookOutcome = 'ok' | 'blocked' | 'error' | 'cancelled'
+
+/** A hook command ended; `message` is the start of what it said. */
+export interface HookFinishedEvent {
+  type: 'hook_finished'
+  event: string
+  matcher?: string | null
+  command: string
+  tool_use_id?: string | null
+  outcome: HookOutcome
+  duration_ms: number
+  message?: string | null
+}
+
+/**
  * Every file the agent created, changed or deleted in this session, with lines
  * added and removed since the session first touched it.
  */
@@ -871,6 +907,8 @@ export type UiEvent =
   | OutputProgressEvent
   | RequestUsageEvent
   | ToolOutputDeltaEvent
+  | HookStartedEvent
+  | HookFinishedEvent
   | ChangesEvent
   | DiffEvent
   | CommitProposalEvent
@@ -913,6 +951,8 @@ export const UI_EVENT_TYPES: readonly UiEventType[] = [
   'output_progress',
   'request_usage',
   'tool_output_delta',
+  'hook_started',
+  'hook_finished',
   'changes',
   'diff',
   'commit_proposal',

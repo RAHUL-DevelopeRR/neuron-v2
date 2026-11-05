@@ -531,8 +531,8 @@ fn assemble_conversation_runtime(
             runtime = runtime.with_artifact_store(store);
         }
     }
-    if output.is_visible() {
-        runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
+    if let Some(reporter) = output.hook_reporter() {
+        runtime = runtime.with_hook_progress_reporter(reporter);
     }
     Ok(runtime)
 }
@@ -944,6 +944,7 @@ impl runtime::HookProgressReporter for CliHookProgressReporter {
                 event,
                 tool_name,
                 command,
+                ..
             } => runtime::ui_hooks::notice(&format!(
                 "[hook {event_name}] {tool_name}: {command}",
                 event_name = event.as_str()
@@ -952,6 +953,7 @@ impl runtime::HookProgressReporter for CliHookProgressReporter {
                 event,
                 tool_name,
                 command,
+                ..
             } => runtime::ui_hooks::notice(&format!(
                 "[hook done {event_name}] {tool_name}: {command}",
                 event_name = event.as_str()
@@ -960,6 +962,7 @@ impl runtime::HookProgressReporter for CliHookProgressReporter {
                 event,
                 tool_name,
                 command,
+                ..
             } => runtime::ui_hooks::notice(&format!(
                 "[hook cancelled {event_name}] {tool_name}: {command}",
                 event_name = event.as_str()

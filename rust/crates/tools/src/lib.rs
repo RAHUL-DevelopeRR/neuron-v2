@@ -4403,9 +4403,29 @@ fn run_agent_job(job: &AgentJob, cancel: &runtime::CancellationToken) -> Result<
     let mut runtime = build_agent_runtime(job)?
         .with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS)
         .with_cancellation_token(cancel.clone());
-    let summary = runtime
+    let mut summary = runtime
         .run_turn(job.prompt.clone(), None)
         .map_err(|error| error.to_string())?;
+    // The parent's SubagentStop hooks may ask the sub-agent to keep going, a few times.
+    let mut continuations = 0;
+    while matches!(
+        summary.outcome,
+        runtime::TurnOutcome::Completed | runtime::TurnOutcome::OutputTruncated
+    ) && continuations < runtime::lifecycle_hooks::MAX_STOP_HOOK_CONTINUATIONS
+    {
+        let Some(reason) = subagent_stop_hook_reason(
+            &job.manifest.agent_id,
+            job.manifest.subagent_type.as_deref(),
+            &final_assistant_text(&summary),
+            continuations > 0,
+        ) else {
+            break;
+        };
+        continuations += 1;
+        summary = runtime
+            .run_turn(reason, None)
+            .map_err(|error| error.to_string())?;
+    }
     let final_text = final_assistant_text(&summary);
     match &summary.outcome {
         runtime::TurnOutcome::Cancelled { .. } => Err(AGENT_CANCELLED.to_string()),
@@ -4426,6 +4446,40 @@ fn run_agent_job(job: &AgentJob, cancel: &runtime::CancellationToken) -> Result<
             Ok(final_text)
         }
     }
+}
+
+/// Runs the parent's `SubagentStop` hooks for a sub-agent that finished; the message
+/// that keeps it going when one blocked.
+fn subagent_stop_hook_reason(
+    agent_id: &str,
+    agent_type: Option<&str>,
+    final_text: &str,
+    active: bool,
+) -> Option<String> {
+    let hooks = subagent_parent_context().map(|context| context.hooks)?;
+    let runner = runtime::HookRunner::new(hooks);
+    if !runner.has_hooks(runtime::HookEvent::SubagentStop) {
+        return None;
+    }
+    let result = runner.run_lifecycle(
+        runtime::HookEvent::SubagentStop,
+        runtime::LifecycleHookInput::subagent_stop(
+            agent_id,
+            agent_type.unwrap_or("general-purpose"),
+            "completed",
+            final_text,
+        )
+        .field("stop_hook_active", active),
+        None,
+        None,
+    );
+    result.is_denied().then(|| {
+        runtime::lifecycle_hooks::stop_continuation_message(result.messages()).replacen(
+            "A Stop hook",
+            "A SubagentStop hook",
+            1,
+        )
+    })
 }
 
 fn build_agent_runtime(
@@ -4621,7 +4675,7 @@ fn review_findings(answer: &str) -> Result<Option<String>, String> {
 fn subagent_feature_config() -> runtime::RuntimeFeatureConfig {
     runtime::RuntimeFeatureConfig::default().with_hooks(
         subagent_parent_context()
-            .map(|context| context.hooks)
+            .map(|context| context.hooks.tool_hooks())
             .unwrap_or_default(),
     )
 }
@@ -5110,6 +5164,45 @@ mod subagent_inheritance_tests {
     }
 
     #[test]
+    fn subagents_inherit_only_tool_hooks_and_subagent_stop_can_ask_for_more() {
+        let _guard = parent_context_lock();
+        let block = if cfg!(windows) {
+            "echo cite your sources& exit /b 2"
+        } else {
+            "echo 'cite your sources'; exit 2"
+        };
+        let hooks = RuntimeHookConfig::new(vec!["guard".to_string()], Vec::new(), Vec::new())
+            .with(
+                runtime::HookEvent::Stop,
+                runtime::HookCommand::new("main-only", runtime::HookSource::User),
+            )
+            .with(
+                runtime::HookEvent::SubagentStop,
+                runtime::HookCommand::new(block, runtime::HookSource::User),
+            );
+        set_subagent_parent_context(SubagentParentContext {
+            hooks,
+            ..SubagentParentContext::new("openai/auto", PermissionMode::DangerFullAccess)
+        });
+        let inherited = subagent_feature_config();
+        let reason = crate::subagent_stop_hook_reason("agent-1", Some("Explore"), "done", false);
+        clear_subagent_parent_context();
+
+        assert_eq!(inherited.hooks().pre_tool_use(), ["guard"]);
+        assert!(!inherited.hooks().has(runtime::HookEvent::Stop));
+        assert!(!inherited.hooks().has(runtime::HookEvent::SubagentStop));
+        assert_eq!(
+            reason.as_deref(),
+            Some("A SubagentStop hook asked you to continue: cite your sources")
+        );
+        assert_eq!(
+            crate::subagent_stop_hook_reason("agent-1", None, "done", false),
+            None,
+            "no parent, no hooks"
+        );
+    }
+
+    #[test]
     fn parent_hooks_run_for_subagent_tool_calls() {
         let _guard = parent_context_lock();
         let hooks = RuntimeHookConfig::new(vec!["exit 2".to_string()], Vec::new(), Vec::new());
@@ -5440,7 +5533,7 @@ mod subagent_inheritance_tests {
         let result = wait_for_agent(
             running,
             &done_rx,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             Some(&parent),
             &child,
         );

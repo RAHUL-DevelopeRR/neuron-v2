@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 static STDOUT_AFTER_TOOL_RESULT: AtomicBool = AtomicBool::new(false);
 
 use neuron_tui::protocol::{
-    OutputStream, TodoItem, TokenCounts, UiEvent, CAPABILITY_GIT_VIEWS, CAPABILITY_LIVE_OUTPUT,
-    CAPABILITY_LIVE_PROGRESS,
+    OutputStream, TodoItem, TokenCounts, UiEvent, CAPABILITY_GIT_VIEWS, CAPABILITY_HOOK_PROGRESS,
+    CAPABILITY_LIVE_OUTPUT, CAPABILITY_LIVE_PROGRESS,
 };
 use runtime::context_manager::TextTokenEstimate;
 use runtime::tool_output::{OutputObserver, OutputPipe};
@@ -194,6 +194,7 @@ pub(crate) struct UiCapabilities {
     live_progress: AtomicBool,
     git_views: AtomicBool,
     live_output: AtomicBool,
+    hook_progress: AtomicBool,
 }
 
 impl UiCapabilities {
@@ -206,11 +207,18 @@ impl UiCapabilities {
             .store(has(CAPABILITY_GIT_VIEWS), Ordering::SeqCst);
         self.live_output
             .store(has(CAPABILITY_LIVE_OUTPUT), Ordering::SeqCst);
+        self.hook_progress
+            .store(has(CAPABILITY_HOOK_PROGRESS), Ordering::SeqCst);
     }
 
     /// A running shell command's output as it prints it.
     pub(crate) fn live_output(&self) -> bool {
         self.live_output.load(Ordering::SeqCst)
+    }
+
+    /// `hook_started` and `hook_finished` events.
+    pub(crate) fn hook_progress(&self) -> bool {
+        self.hook_progress.load(Ordering::SeqCst)
     }
 
     /// Tool-input progress, output estimates and per-request usage.
@@ -257,6 +265,21 @@ impl TurnOutput {
 
     pub(crate) fn is_visible(&self) -> bool {
         !matches!(self, Self::Silent)
+    }
+
+    /// Where hook progress goes: the UI's channel, the terminal (with `NEURON_DEBUG`),
+    /// or nowhere.
+    pub(crate) fn hook_reporter(&self) -> Option<Box<dyn runtime::HookProgressReporter>> {
+        match self {
+            Self::Silent => None,
+            Self::Channel(channel) => Some(Box::new(crate::hook_events::ChannelHookReporter::new(
+                Sender::clone(&channel.events),
+                Arc::clone(&channel.capabilities),
+            ))),
+            Self::Ansi => Some(Box::new(crate::progress::CliHookProgressReporter)),
+            #[cfg(test)]
+            Self::Captured(_) => Some(Box::new(crate::progress::CliHookProgressReporter)),
+        }
     }
 
     /// A sink for one model response. The terminal one renders through a synchronized

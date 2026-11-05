@@ -32,6 +32,7 @@ import {
 } from './neuron-engine-client'
 import { handleGitViewsEvent, resetGitViews } from './git-views'
 import { handleMcpPanelEvent, resetMcpPanel } from './mcp-panel'
+import { hookFinishedLine } from './hook-progress'
 import { FEATURE_TRUST_PREVIEW } from './protocol'
 import { QUESTION_PREFIX } from './questions'
 import { engineSessionOf, withEngineSession } from './session-run-state'
@@ -304,6 +305,12 @@ export function handleEngineEvent(event: UiEvent): void {
     case 'workspace_trusted':
       void restartWithTrust(event)
       return
+    case 'hook_finished': {
+      // A hook that blocked or failed gets a line; one that passed stays quiet.
+      const line = hookFinishedLine(event)
+      if (line) showNotice({ kind: 'show', text: consoleSafeText(line), untilTurnEnd: false })
+      return
+    }
     case 'report':
       // A scrollable panel above the input, closed with Esc (report-panel.tsx).
       engine.setReport(event)

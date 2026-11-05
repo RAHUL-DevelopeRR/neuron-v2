@@ -119,6 +119,10 @@ pub const FEATURE_CHECKPOINTS: &str = "checkpoints";
 /// `disabledMcpServers` in the user settings); [`McpServerInfo::enabled`] is set and
 /// disabled servers are listed with status `disabled`.
 pub const FEATURE_MCP_TOGGLE: &str = "mcp_toggle";
+/// The engine reports hook commands as they run ([`UiEvent::HookStarted`] and
+/// [`UiEvent::HookFinished`]). Sent only to a UI that declared
+/// [`CAPABILITY_HOOK_PROGRESS`].
+pub const FEATURE_HOOK_PROGRESS: &str = "hook_progress";
 
 /// What this engine can do beyond protocol 1, in [`UiEvent::Ready`]. A UI sends the
 /// commands a feature adds only when the engine lists it: an older engine would skip
@@ -146,6 +150,7 @@ pub const ENGINE_FEATURES: &[&str] = &[
     FEATURE_CHECKPOINTS,
     FEATURE_MCP_TOGGLE,
     FEATURE_LIVE_OUTPUT,
+    FEATURE_HOOK_PROGRESS,
 ];
 
 /// `report` events for the commands that show a report (`/usage`, `/init`, `/memory`,
@@ -237,6 +242,9 @@ pub enum OutputStream {
     Stdout,
     Stderr,
 }
+
+/// A UI capability: send the hook events of [`FEATURE_HOOK_PROGRESS`].
+pub const CAPABILITY_HOOK_PROGRESS: &str = "hook_progress";
 
 /// Which saved chats [`EngineCommand::ListSessions`] lists.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -759,6 +767,32 @@ pub enum UiEvent {
         tool_use_id: String,
         stream: OutputStream,
         chunk: String,
+    },
+    /// A hook command started. `event` is its settings name (`PreToolUse`, `Stop`, ...),
+    /// `command` the command shortened with anything that looks like a secret hidden,
+    /// `tool_use_id` the tool call it runs for. With [`CAPABILITY_HOOK_PROGRESS`] only.
+    HookStarted {
+        event: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        matcher: Option<String>,
+        command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_use_id: Option<String>,
+    },
+    /// A hook command ended: `outcome` is `ok`, `blocked` (exit 2 or a block decision),
+    /// `error` or `cancelled`; `message` is the start of what it said, when it said
+    /// something. With [`CAPABILITY_HOOK_PROGRESS`] only.
+    HookFinished {
+        event: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        matcher: Option<String>,
+        command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_use_id: Option<String>,
+        outcome: String,
+        duration_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
     },
     /// Every file the agent created, changed or deleted in this session, with lines
     /// added and removed since the session first touched it. Sent when the list changes
@@ -1426,5 +1460,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(model.supports_images, None);
+    }
+
+    #[test]
+    fn hook_events_have_a_stable_shape_and_omit_absent_fields() {
+        let started = UiEvent::HookStarted {
+            event: "PreToolUse".into(),
+            matcher: Some("bash".into()),
+            command: "guard.sh".into(),
+            tool_use_id: Some("call-1".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&started).unwrap(),
+            serde_json::json!({"type":"hook_started","event":"PreToolUse","matcher":"bash","command":"guard.sh","tool_use_id":"call-1"})
+        );
+        let finished = UiEvent::HookFinished {
+            event: "Stop".into(),
+            matcher: None,
+            command: "check.sh".into(),
+            tool_use_id: None,
+            outcome: "blocked".into(),
+            duration_ms: 12,
+            message: Some("tests fail".into()),
+        };
+        let value = serde_json::to_value(&finished).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"type":"hook_finished","event":"Stop","command":"check.sh","outcome":"blocked","duration_ms":12,"message":"tests fail"})
+        );
+        assert_eq!(serde_json::from_value::<UiEvent>(value).unwrap(), finished);
+        assert!(ENGINE_FEATURES.contains(&FEATURE_HOOK_PROGRESS));
+        assert_eq!(CAPABILITY_HOOK_PROGRESS, "hook_progress");
     }
 }

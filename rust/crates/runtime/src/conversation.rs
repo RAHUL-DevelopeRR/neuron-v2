@@ -17,7 +17,10 @@ use crate::context_manager::{
     ContextBudget, ContextManager, ContextPolicy, ContextPreparation, ContextSnapshot,
 };
 use crate::experience::{self, ExperienceStore, HarnessStats};
-use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
+use crate::hooks::{
+    HookAbortSignal, HookEvent, HookProgressReporter, HookRunResult, HookRunner,
+    LifecycleHookInput, ToolUseIdReporter,
+};
 use crate::model_registry;
 use crate::model_routing::{self, ModelRouting};
 use crate::parallel_tools::ConcurrentToolCall;
@@ -370,6 +373,8 @@ pub enum RuntimeErrorKind {
     /// own retries (capacity, overload, 5xx): another model may (see
     /// [`crate::model_routing`]).
     ProviderUnavailable,
+    /// A `UserPromptSubmit` hook blocked the prompt; it was not sent.
+    BlockedByHook,
 }
 
 /// Error returned when a conversation turn cannot be completed.
@@ -516,6 +521,10 @@ struct TurnProgress {
     tool_retried: bool,
     /// Models the turn fell over to after provider failures, in order.
     fallen_over_to: Vec<String>,
+    /// How often a Stop hook kept this turn going.
+    stop_hook_continuations: usize,
+    /// Whether `PreCompact` hooks ran for automatic compaction this turn.
+    pre_compact_hooks_ran: bool,
     /// Harness events this turn, for the experience library.
     stats: HarnessStats,
 }
@@ -546,6 +555,8 @@ pub struct ConversationRuntime<C, T> {
     model_override: Option<String>,
     /// Where tool outputs too large for the conversation are kept whole.
     artifacts: Option<crate::artifacts::ArtifactStore>,
+    /// What `SessionStart` hooks printed, added to the next prompt.
+    pending_hook_context: Vec<String>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -582,6 +593,8 @@ where
         feature_config: &RuntimeFeatureConfig,
     ) -> Self {
         let usage_tracker = UsageTracker::from_session(&session);
+        let mut hook_runner = HookRunner::from_feature_config(feature_config);
+        hook_runner.set_session_id(session.session_id.clone());
         let mut context_manager =
             ContextManager::new(ContextBudget::default(), ContextPolicy::from_env());
         context_manager.set_threshold_override(
@@ -595,7 +608,7 @@ where
             system_prompt,
             max_iterations: DEFAULT_MAX_ITERATIONS,
             usage_tracker,
-            hook_runner: HookRunner::from_feature_config(feature_config),
+            hook_runner,
             context_manager,
             cancel: CancellationToken::new(),
             hook_abort_signal: HookAbortSignal::default(),
@@ -609,6 +622,7 @@ where
             routing: ModelRouting::default(),
             model_override: None,
             artifacts: None,
+            pending_hook_context: Vec::new(),
         }
     }
 
@@ -775,78 +789,126 @@ where
         }
     }
 
-    fn run_pre_tool_use_hook(&mut self, tool_name: &str, input: &str) -> HookRunResult {
+    fn run_pre_tool_use_hook(
+        &mut self,
+        tool_use_id: Option<&str>,
+        tool_name: &str,
+        input: &str,
+    ) -> HookRunResult {
         self.sync_hook_abort();
-        if let Some(reporter) = self.hook_progress_reporter.as_mut() {
-            self.hook_runner.run_pre_tool_use_with_context(
+        let runner = &self.hook_runner;
+        let abort = Some(&self.hook_abort_signal);
+        match self.hook_progress_reporter.as_mut() {
+            Some(reporter) => runner.run_pre_tool_use_with_context(
                 tool_name,
                 input,
-                Some(&self.hook_abort_signal),
-                Some(reporter.as_mut()),
-            )
-        } else {
-            self.hook_runner.run_pre_tool_use_with_context(
-                tool_name,
-                input,
-                Some(&self.hook_abort_signal),
-                None,
-            )
+                abort,
+                Some(&mut ToolUseIdReporter::new(reporter.as_mut(), tool_use_id)),
+            ),
+            None => runner.run_pre_tool_use_with_context(tool_name, input, abort, None),
         }
     }
 
     fn run_post_tool_use_hook(
         &mut self,
+        tool_use_id: &str,
         tool_name: &str,
         input: &str,
         output: &str,
         is_error: bool,
     ) -> HookRunResult {
         self.sync_hook_abort();
-        if let Some(reporter) = self.hook_progress_reporter.as_mut() {
-            self.hook_runner.run_post_tool_use_with_context(
+        let runner = &self.hook_runner;
+        let abort = Some(&self.hook_abort_signal);
+        match self.hook_progress_reporter.as_mut() {
+            Some(reporter) => runner.run_post_tool_use_with_context(
                 tool_name,
                 input,
                 output,
                 is_error,
-                Some(&self.hook_abort_signal),
-                Some(reporter.as_mut()),
-            )
-        } else {
-            self.hook_runner.run_post_tool_use_with_context(
-                tool_name,
-                input,
-                output,
-                is_error,
-                Some(&self.hook_abort_signal),
-                None,
-            )
+                abort,
+                Some(&mut ToolUseIdReporter::new(
+                    reporter.as_mut(),
+                    Some(tool_use_id),
+                )),
+            ),
+            None => runner
+                .run_post_tool_use_with_context(tool_name, input, output, is_error, abort, None),
         }
     }
 
     fn run_post_tool_use_failure_hook(
         &mut self,
+        tool_use_id: &str,
         tool_name: &str,
         input: &str,
         output: &str,
     ) -> HookRunResult {
         self.sync_hook_abort();
-        if let Some(reporter) = self.hook_progress_reporter.as_mut() {
-            self.hook_runner.run_post_tool_use_failure_with_context(
+        let runner = &self.hook_runner;
+        let abort = Some(&self.hook_abort_signal);
+        match self.hook_progress_reporter.as_mut() {
+            Some(reporter) => runner.run_post_tool_use_failure_with_context(
                 tool_name,
                 input,
                 output,
-                Some(&self.hook_abort_signal),
-                Some(reporter.as_mut()),
-            )
-        } else {
-            self.hook_runner.run_post_tool_use_failure_with_context(
-                tool_name,
-                input,
-                output,
-                Some(&self.hook_abort_signal),
-                None,
-            )
+                abort,
+                Some(&mut ToolUseIdReporter::new(
+                    reporter.as_mut(),
+                    Some(tool_use_id),
+                )),
+            ),
+            None => {
+                runner.run_post_tool_use_failure_with_context(tool_name, input, output, abort, None)
+            }
         }
+    }
+
+    /// Runs a lifecycle event's hooks, reporting their progress.
+    fn run_lifecycle_hook(&mut self, event: HookEvent, input: LifecycleHookInput) -> HookRunResult {
+        if !self.hook_runner.has_hooks(event) {
+            return HookRunResult::allow(Vec::new());
+        }
+        self.sync_hook_abort();
+        let runner = &self.hook_runner;
+        let abort = Some(&self.hook_abort_signal);
+        match self.hook_progress_reporter.as_mut() {
+            Some(reporter) => runner.run_lifecycle(event, input, abort, Some(reporter.as_mut())),
+            None => runner.run_lifecycle(event, input, abort, None),
+        }
+    }
+
+    /// The hooks this runtime runs, for `/hooks`.
+    #[must_use]
+    pub fn hook_config(&self) -> &crate::config::RuntimeHookConfig {
+        self.hook_runner.config()
+    }
+
+    /// Runs the `SessionStart` hooks (`source`: `startup`, `resume`, `clear` or
+    /// `compact`). What they print is added to the next prompt as context; the
+    /// result is returned for the caller to show.
+    pub fn run_session_start_hooks(&mut self, source: &str) -> HookRunResult {
+        self.hook_runner
+            .set_session_id(self.session.session_id.clone());
+        let result = self.run_lifecycle_hook(
+            HookEvent::SessionStart,
+            LifecycleHookInput::session_start(source),
+        );
+        if !result.is_failed() && !result.is_cancelled() {
+            self.pending_hook_context
+                .extend(result.messages().iter().cloned());
+        }
+        result
+    }
+
+    /// Runs the `PreCompact` hooks before `/compact` (`trigger` `manual`) or automatic
+    /// compaction (`auto`). They cannot stop compaction; the result is returned for
+    /// the caller to show.
+    pub fn run_pre_compact_hooks(&mut self, trigger: &str) -> HookRunResult {
+        self.run_lifecycle_hook(
+            HookEvent::PreCompact,
+            LifecycleHookInput::pre_compact(trigger),
+        )
     }
 
     /// Runs one user turn: model call, tool execution, repeat until the model
@@ -874,11 +936,29 @@ where
             self.session.persist_snapshot().map_err(session_error)?;
         }
 
+        let prompt_hooks = self.run_lifecycle_hook(
+            HookEvent::UserPromptSubmit,
+            LifecycleHookInput::user_prompt_submit(&user_input),
+        );
+        if prompt_hooks.is_denied() {
+            // The prompt never reaches the session or the model.
+            return Err(RuntimeError::with_kind(
+                RuntimeErrorKind::BlockedByHook,
+                crate::lifecycle_hooks::blocked_prompt_message(prompt_hooks.messages()),
+            ));
+        }
+        let mut context = std::mem::take(&mut self.pending_hook_context);
+        if !prompt_hooks.is_failed() && !prompt_hooks.is_cancelled() {
+            context.extend(prompt_hooks.messages().iter().cloned());
+        }
+
         self.record_turn_started(&user_input);
         self.turn_request.clone_from(&user_input);
         self.refresh_model_notes();
         self.session
-            .push_user_text(user_input)
+            .push_user_text(crate::lifecycle_hooks::with_hook_context(
+                user_input, &context,
+            ))
             .map_err(session_error)?;
 
         let result = self.run_turn_loop(prompter);
@@ -1237,7 +1317,7 @@ where
         input: &str,
         prompter: Option<&mut dyn PermissionPrompter>,
     ) -> ExecutedToolCall {
-        let pre_hook_result = self.run_pre_tool_use_hook(tool_name, input);
+        let pre_hook_result = self.run_pre_tool_use_hook(Some(tool_use_id), tool_name, input);
         let effective_input = pre_hook_result
             .updated_input()
             .map_or_else(|| input.to_string(), ToOwned::to_owned);
@@ -1289,6 +1369,7 @@ where
                     &self.cancel,
                 );
                 self.after_tool_ran(
+                    tool_use_id,
                     tool_name,
                     &effective_input,
                     pre_hook_result.messages(),
@@ -1407,6 +1488,15 @@ where
     /// Checks the context budget before a model call and prunes or compacts
     /// the session when needed.
     fn prepare_context(&mut self, progress: &mut TurnProgress) -> Result<(), RuntimeError> {
+        if !progress.pre_compact_hooks_ran && self.hook_runner.has_hooks(HookEvent::PreCompact) {
+            let snapshot = self
+                .context_manager
+                .snapshot(&self.session.messages, &self.system_prompt);
+            if snapshot.estimated_tokens >= snapshot.threshold_tokens {
+                progress.pre_compact_hooks_ran = true;
+                let _ = self.run_pre_compact_hooks("auto");
+            }
+        }
         let preparation = self
             .context_manager
             .prepare_session(&mut self.session, &self.system_prompt);
@@ -1502,6 +1592,18 @@ where
             return Some(
                 self.completion_check_message(&progress.edited_paths, &mut progress.stats),
             );
+        }
+        if progress.stop_hook_continuations < crate::lifecycle_hooks::MAX_STOP_HOOK_CONTINUATIONS {
+            let stop = self.run_lifecycle_hook(
+                HookEvent::Stop,
+                LifecycleHookInput::stop(progress.stop_hook_continuations > 0, final_text),
+            );
+            if stop.is_denied() && !self.cancel.is_cancelled() {
+                progress.stop_hook_continuations += 1;
+                return Some(crate::lifecycle_hooks::stop_continuation_message(
+                    stop.messages(),
+                ));
+            }
         }
         None
     }
@@ -1727,7 +1829,7 @@ where
         // Same gates as a model's bash call, minus the prompt: hooks that block or
         // rewrite the call, or a policy (or hook override) that would ask, leave the
         // check to the model.
-        let hook = self.run_pre_tool_use_hook("bash", &input);
+        let hook = self.run_pre_tool_use_hook(None, "bash", &input);
         if hook.is_denied()
             || hook.is_failed()
             || hook.is_cancelled()

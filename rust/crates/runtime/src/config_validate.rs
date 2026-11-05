@@ -93,6 +93,8 @@ enum FieldType {
     Object,
     StringArray,
     Number,
+    /// Hook commands: strings or `{"command", "matcher"}` objects.
+    HookList,
 }
 
 impl FieldType {
@@ -103,6 +105,7 @@ impl FieldType {
             Self::Object => "an object",
             Self::StringArray => "an array of strings",
             Self::Number => "a number",
+            Self::HookList => "an array of hook commands (strings or objects with \"command\")",
         }
     }
 
@@ -115,6 +118,7 @@ impl FieldType {
                 .as_array()
                 .is_some_and(|arr| arr.iter().all(|v| v.as_str().is_some())),
             Self::Number => value.as_i64().is_some(),
+            Self::HookList => crate::hook_matcher::is_hook_list(value),
         }
     }
 }
@@ -246,15 +250,35 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
 const HOOKS_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         name: "PreToolUse",
-        expected: FieldType::StringArray,
+        expected: FieldType::HookList,
     },
     FieldSpec {
         name: "PostToolUse",
-        expected: FieldType::StringArray,
+        expected: FieldType::HookList,
     },
     FieldSpec {
         name: "PostToolUseFailure",
-        expected: FieldType::StringArray,
+        expected: FieldType::HookList,
+    },
+    FieldSpec {
+        name: "SessionStart",
+        expected: FieldType::HookList,
+    },
+    FieldSpec {
+        name: "UserPromptSubmit",
+        expected: FieldType::HookList,
+    },
+    FieldSpec {
+        name: "Stop",
+        expected: FieldType::HookList,
+    },
+    FieldSpec {
+        name: "PreCompact",
+        expected: FieldType::HookList,
+    },
+    FieldSpec {
+        name: "SubagentStop",
+        expected: FieldType::HookList,
     },
 ];
 
