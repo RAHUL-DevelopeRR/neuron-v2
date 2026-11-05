@@ -532,7 +532,7 @@ Two policies decide which MCP servers may start, the first one winning:
 | `mcpPolicy` key | Meaning |
 | --- | --- |
 | `allow` | Only these may start: catalog ids (`github`), `catalog:*` (any catalog connector) or server-name patterns (`corp-*`). A catalog id matches only that connector as the catalog writes it, never a server that merely has that name |
-| `deny` | Never start: the same forms; a catalog id also refuses a server of that name |
+| `deny` | Never start: the same forms; a catalog id also refuses a server of that name, one that runs the connector's package at another version (`npx -y @playwright/mcp@latest`, `python -m mcp_server_git`) and one on its remote host. A deny list is still a best effort, since a server can run the same code some other way: to be sure only approved servers run, use `allow` or `"allowUnvetted": false` |
 | `required` | Always configured and on: catalog ids, or servers the managed settings define. A required server cannot be turned off (`/mcp disable`, the panel shows `[req]`) or removed, needs no workspace approval, and also starts in `neuron prompt` runs. A `permissions.deny` rule in your or a workspace's settings does not keep it from starting (it still refuses the tools it covers); only the managed settings' own deny rules block it |
 | `allowUnvetted` | `false`: only catalog connectors may start |
 | `allowStdio` | `false`: no local (stdio) servers |

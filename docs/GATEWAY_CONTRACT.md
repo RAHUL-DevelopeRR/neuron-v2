@@ -356,7 +356,10 @@ Sync the copy in `neuron-v2`; nothing here changes what the CLI sends or must ha
   per plan (`zerox_plan_policy.connector_policy`, JSON; no organisations yet). `allowed`:
   catalog ids or `"catalog:*"` the plan allows; missing or `null` means no allow list, and
   it never restricts servers outside the catalog. `denied`: ids the CLI refuses (it also
-  refuses a server of that name). `required`: catalog ids the CLI adds and keeps on.
+  refuses a server of that name, one that runs the connector's package at another version
+  and one on its remote host). A deny list is a best effort, since a server can run the
+  same code some other way; only `allowed` or `allow_unvetted: false` keeps every other
+  server out. `required`: catalog ids the CLI adds and keeps on.
   `hosted`: hosted connectors the plan includes (Free: none). `allow_unvetted`: `false`
   lets only catalog connectors start (default `true`). `catalog_version`: the catalog the
   policy was written for. A missing `policy` block (or one without `connectors`) means no

@@ -267,9 +267,87 @@ impl McpCatalog {
     pub fn entry_for_config(&self, config: &McpServerConfig) -> Option<&McpCatalogEntry> {
         self.connectors.iter().find(|entry| entry.matches(config))
     }
+
+    /// The entries `config` runs the same server as, launched any way: a local server
+    /// whose command or an argument names the entry's package at any version (or none),
+    /// a remote one on the entry's host, or the hosted connector of that id. Unlike
+    /// [`McpCatalog::entry_for_config`] this vouches for nothing; a deny list uses it so
+    /// that renaming a server or changing its version does not get past it.
+    #[must_use]
+    pub fn entries_resembling(&self, config: &McpServerConfig) -> Vec<&McpCatalogEntry> {
+        self.connectors
+            .iter()
+            .filter(|entry| entry.matches(config) || entry.resembles(config))
+            .collect()
+    }
+}
+
+/// A package name as npm or Python tools compare it: lower case, with `_` and `.` as
+/// `-` (so `mcp_server_git` and the module `awslabs.aws_documentation_mcp_server` name
+/// their packages).
+fn normalize_package(name: &str) -> String {
+    name.trim().to_ascii_lowercase().replace(['_', '.'], "-")
+}
+
+/// Drops a version after the last `@` that does not start the word: `pkg@1.2` and
+/// `@scope/pkg@latest` name `pkg` and `@scope/pkg`.
+fn without_npm_version(word: &str) -> &str {
+    match word.rfind('@') {
+        Some(at) if at > 0 => &word[..at],
+        _ => word,
+    }
+}
+
+/// Whether a command-line word names `package` (normalized) at any version or none:
+/// `pkg`, `pkg@1.2`, `@scope/pkg@latest`, `pkg==1.2`, `pkg>=1`, or a path whose last
+/// part is `pkg` or `pkg.exe`. A scoped npm package is matched only whole.
+fn names_package(word: &str, package: &str) -> bool {
+    let word = word.trim().trim_matches(['"', '\'']);
+    if normalize_package(without_npm_version(word)) == package {
+        return true;
+    }
+    if package.starts_with('@') {
+        return false;
+    }
+    let last = word.rsplit(['/', '\\']).next().unwrap_or(word);
+    let name = last
+        .split(['=', '>', '<', '~', '!', '['])
+        .next()
+        .unwrap_or(last);
+    let name = without_npm_version(name);
+    let name = [".exe", ".cmd", ".bat", ".js", ".py"]
+        .into_iter()
+        .find_map(|suffix| name.strip_suffix(suffix))
+        .unwrap_or(name);
+    normalize_package(name) == package
 }
 
 impl McpCatalogEntry {
+    /// Whether `config` runs this entry's package or reaches its host, launched any way
+    /// (see [`McpCatalog::entries_resembling`]).
+    fn resembles(&self, config: &McpServerConfig) -> bool {
+        match config {
+            McpServerConfig::Stdio(stdio) => {
+                let Some(package) = self.install.package.as_deref() else {
+                    return false;
+                };
+                let package = normalize_package(package);
+                std::iter::once(&stdio.command)
+                    .chain(&stdio.args)
+                    .any(|word| names_package(word, &package))
+            }
+            McpServerConfig::Http(remote) | McpServerConfig::Sse(remote) => {
+                let host = |url: &str| {
+                    crate::permissions::url_host(url).map(|host| host.to_ascii_lowercase())
+                };
+                let ours = self.install.url.as_deref().and_then(host);
+                ours.is_some() && ours == host(&remote.url)
+            }
+            McpServerConfig::ManagedProxy(proxy) => proxy.id == self.id,
+            McpServerConfig::Ws(_) | McpServerConfig::Sdk(_) => false,
+        }
+    }
+
     fn check(&self) -> Result<(), String> {
         let missing = |what: &str| format!("MCP catalog entry `{}` has no {what}", self.id);
         match (self.transport, self.install.kind) {

@@ -700,10 +700,11 @@ fn managed_refusal(
             by: McpPolicySource::Managed,
         })
     };
+    let resembling = resembling_ids(config);
     if let Some(entry) = policy
         .deny
         .iter()
-        .find(|entry| denies(entry, name, catalog_id))
+        .find(|entry| denies(entry, name, catalog_id, &resembling))
     {
         return refuse(
             &format!("mcpPolicy.deny: {entry}"),
@@ -757,7 +758,12 @@ fn gateway_refusal(
             by: McpPolicySource::Gateway,
         })
     };
-    if let Some(id) = policy.denied.iter().find(|id| denies(id, name, catalog_id)) {
+    let resembling = resembling_ids(config);
+    if let Some(id) = policy
+        .denied
+        .iter()
+        .find(|id| denies(id, name, catalog_id, &resembling))
+    {
         return refuse(
             &format!("denied: {id}"),
             format!("its connector policy denies \"{id}\""),
@@ -807,9 +813,29 @@ fn allows(entry: &str, name: &str, catalog_id: Option<&str>) -> bool {
     glob_matches(entry, name)
 }
 
-/// A deny entry: as [`allows`], but a catalog id also refuses a server of that name.
-fn denies(entry: &str, name: &str, catalog_id: Option<&str>) -> bool {
-    allows(entry, name, catalog_id) || glob_matches(entry, name)
+/// A deny entry: as [`allows`], but a catalog id also refuses a server of that name and
+/// one that runs the connector's package at another version or reaches its host
+/// (`resembling`, from [`resembling_ids`]), and `catalog:*` refuses those too. Still a
+/// best effort: a server can run the same code some other way, so only an allow list
+/// or `allowUnvetted: false` keeps everything else out.
+fn denies(entry: &str, name: &str, catalog_id: Option<&str>, resembling: &[String]) -> bool {
+    if allows(entry, name, catalog_id) || glob_matches(entry, name) {
+        return true;
+    }
+    if entry == "catalog:*" {
+        return !resembling.is_empty();
+    }
+    let id = entry.strip_prefix("catalog:").unwrap_or(entry);
+    resembling.iter().any(|resembled| resembled == id)
+}
+
+/// The catalog connectors `config` runs the same server as, however it is launched.
+fn resembling_ids(config: &McpServerConfig) -> Vec<String> {
+    McpCatalog::builtin()
+        .entries_resembling(config)
+        .into_iter()
+        .map(|entry| entry.id.clone())
+        .collect()
 }
 
 /// `pattern` matches all of `text`; `*` matches any run of characters.
@@ -1007,6 +1033,48 @@ mod tests {
         // The bundled servers are catalog connectors.
         assert!(config.mcp().get("codebase-memory").is_some());
         assert!(config.mcp().get("playwright").is_some());
+    }
+
+    #[test]
+    fn a_deny_naming_a_connector_also_refuses_its_package_and_host_under_other_names() {
+        let fixture = Fixture::new("deny-lookalike");
+        fixture
+            .user(
+                r#"{"defaultMcpServers":false,"mcpServers":{
+                "gh":{"type":"http","url":"https://API.githubcopilot.com/mcp/x"},
+                "pw":{"command":"npx","args":["-y","@playwright/mcp@latest","--headless"]},
+                "git2":{"command":"uvx","args":["mcp-server-git==1.0"]},
+                "gitmod":{"command":"python","args":["-m","mcp_server_git"]},
+                "mine":{"command":"npx","args":["-y","@someone/mcp@1.0"]}}}"#,
+            )
+            .managed(r#"{"mcpPolicy":{"deny":["github","playwright","git"]}}"#);
+
+        let config = fixture.loader().load().expect("config loads");
+
+        for name in ["gh", "pw", "git2", "gitmod"] {
+            assert!(config.mcp().get(name).is_none(), "{name} starts");
+            assert!(
+                config.mcp().blocked()[name]
+                    .rule
+                    .starts_with("mcpPolicy.deny"),
+                "{name}"
+            );
+        }
+        assert!(
+            config.mcp().get("mine").is_some(),
+            "another scope's `mcp` package is not Playwright's"
+        );
+
+        // The plan's `denied` list matches the same way.
+        fixture
+            .managed("{}")
+            .gateway(&json!({"denied": ["playwright"]}), now());
+        let config = fixture.loader().load().expect("config loads");
+        assert_eq!(
+            config.mcp().blocked()["pw"].rule,
+            "policy.connectors.denied: playwright"
+        );
+        assert!(config.mcp().get("gh").is_some());
     }
 
     #[test]
