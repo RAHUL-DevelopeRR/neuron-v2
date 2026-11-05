@@ -35,6 +35,9 @@ export const useMcpPanelStore = create<McpPanelState>()((set) => ({
 /** A server is on unless the engine says otherwise (older engines leave it out). */
 export const serverEnabled = (server: McpServerInfo): boolean => server.enabled !== false
 
+/** The connector policy requires the server: its switch is locked on. */
+export const serverLocked = (server: McpServerInfo): boolean => server.required === true
+
 /** `ready · 4 tools`, `off`, `failed: why`, ... for a row. */
 export function serverSummary(server: McpServerInfo): string {
   if (!serverEnabled(server)) return 'off'
@@ -43,5 +46,6 @@ export function serverSummary(server: McpServerInfo): string {
       ? ` · ${server.tools.length} ${server.tools.length === 1 ? 'tool' : 'tools'}`
       : ''
   const status = server.status.replace('_', ' ')
-  return server.error ? `${status}: ${server.error}` : `${status}${tools}`
+  const required = serverLocked(server) ? ' · required' : ''
+  return server.error ? `${status}: ${server.error}` : `${status}${tools}${required}`
 }

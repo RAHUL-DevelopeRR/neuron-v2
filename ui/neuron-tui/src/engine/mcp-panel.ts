@@ -8,7 +8,7 @@
 
 import { getNeuronEngineClient, runExchange } from './neuron-engine-client'
 import { useChatStore } from '../state/chat-store'
-import { serverEnabled, useMcpPanelStore } from '../state/mcp-panel-store'
+import { serverEnabled, serverLocked, useMcpPanelStore } from '../state/mcp-panel-store'
 import { getSystemMessage } from '../utils/message-history'
 
 import type { McpServerInfo, UiEvent } from './protocol'
@@ -46,10 +46,17 @@ export function openMcpPanel(): void {
   }
 }
 
-/** Space or Enter on a row: turns the server off when it is on, on when it is off. */
+/**
+ * Space or Enter on a row: turns the server off when it is on, on when it is
+ * off. A server the connector policy requires stays on.
+ */
 export function toggleMcpServer(server: McpServerInfo): void {
   const store = useMcpPanelStore.getState()
   if (store.pending) return
+  if (serverLocked(server)) {
+    showLine(`${server.name} is required by the connector policy and cannot be turned off.`)
+    return
+  }
   const engine = getNeuronEngineClient()
   if (engine.connection !== 'ready') {
     showLine('The Neuron engine is not running.')

@@ -5,7 +5,8 @@
  *   ↑/↓ move   space/enter turn on or off   esc close
  *
  * A switch is saved in the user settings (`disabledMcpServers`); the servers
- * restart from the next turn. Remote servers that need a sign-in say so in
+ * restart from the next turn. A server the connector policy requires shows
+ * `[req]` and its switch does nothing. Remote servers that need a sign-in say so in
  * their error (`neuron mcp login <server>` in a terminal).
  */
 
@@ -16,7 +17,12 @@ import React, { useCallback, useEffect, useState } from 'react'
 import { truncateToWidth, visibleWindow } from './model-picker'
 import { toggleMcpServer } from '../engine/mcp-panel'
 import { useTheme } from '../hooks/use-theme'
-import { serverEnabled, serverSummary, useMcpPanelStore } from '../state/mcp-panel-store'
+import {
+  serverEnabled,
+  serverLocked,
+  serverSummary,
+  useMcpPanelStore,
+} from '../state/mcp-panel-store'
 import { BORDER_CHARS } from '../utils/ui-constants'
 
 import type { McpServerInfo } from '../engine/protocol'
@@ -105,7 +111,7 @@ export const McpPanel = ({
       const focused = start + offset === focus
       const on = serverEnabled(server)
       const busy = pending === server.name
-      const mark = busy ? '[…]' : on ? '[on] ' : '[off]'
+      const mark = busy ? '[…]' : serverLocked(server) ? '[req]' : on ? '[on] ' : '[off]'
       const label = `${server.name}  ${server.transport}`
       const summary = `  ${serverSummary(server)}`
       return (
