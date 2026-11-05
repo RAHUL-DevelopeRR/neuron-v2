@@ -1688,10 +1688,10 @@ fn parse_session_command(args: &[&str]) -> Result<SlashCommand, SlashCommandPars
 }
 
 /// The arguments `/mcp` takes.
-const MCP_SLASH_ARGUMENTS: &str = "[list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|pin <server>|help]";
+const MCP_SLASH_ARGUMENTS: &str = "[list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|pin <server>|connect <server>|help]";
 
 /// The arguments `neuron mcp` takes.
-const MCP_CLI_ARGUMENTS: &str = "[list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|pin <server>|login <server>|logout <server>|serve|help]";
+const MCP_CLI_ARGUMENTS: &str = "[list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|pin <server>|connect <server>|login <server>|logout <server>|serve|help]";
 
 /// `add <id> [--scope user|project|local] [--name <name>]`, parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1818,21 +1818,21 @@ fn parse_mcp_command(args: &[&str]) -> Result<SlashCommand, SlashCommandParseErr
                 "/mcp remove <server> [--scope user|project|local]",
             )),
         },
-        [action @ ("enable" | "disable" | "approve" | "pin")] => {
+        [action @ ("enable" | "disable" | "approve" | "pin" | "connect")] => {
             Err(usage_error(&format!("mcp {action}"), "<server>"))
         }
-        [action @ ("enable" | "disable" | "approve" | "pin"), target] => Ok(SlashCommand::Mcp {
+        [action @ ("enable" | "disable" | "approve" | "pin" | "connect"), target] => Ok(SlashCommand::Mcp {
             action: Some((*action).to_string()),
             target: Some((*target).to_string()),
         }),
-        [action @ ("enable" | "disable" | "approve" | "pin"), ..] => Err(command_error(
+        [action @ ("enable" | "disable" | "approve" | "pin" | "connect"), ..] => Err(command_error(
             &format!("Unexpected arguments for /mcp {action}."),
             "mcp",
             &format!("/mcp {action} <server>"),
         )),
         [action, ..] => Err(command_error(
             &format!(
-                "Unknown /mcp action '{action}'. Use list, show <server>, catalog [query], add <id>, remove <server>, enable <server>, disable <server>, approve <server>, pin <server>, or help."
+                "Unknown /mcp action '{action}'. Use list, show <server>, catalog [query], add <id>, remove <server>, enable <server>, disable <server>, approve <server>, pin <server>, connect <server>, or help."
             ),
             "mcp",
             &format!("/mcp {MCP_SLASH_ARGUMENTS}"),
@@ -2552,6 +2552,13 @@ fn render_mcp_report_with_json_for(
                 render_mcp_approval_json(&outcome, name),
             ));
         }
+        if let Some(name) = mcp_connect_arg(args) {
+            let outcome = mcp_hosted_connect_url(loader, name);
+            return Ok((
+                render_mcp_connect(&outcome, name),
+                render_mcp_connect_json(&outcome, name),
+            ));
+        }
         if let Some(change) = McpChange::run(loader, args) {
             return Ok((change.render(), change.render_json()));
         }
@@ -2807,6 +2814,12 @@ fn render_mcp_report_for(
                     required.by.describe()
                 );
             }
+            for name in hosted_needing_connect(runtime_config.mcp()) {
+                let _ = write!(
+                    report,
+                    "\n  {name:<16} needs connect (not linked to your Zero-X account): /mcp connect {name}"
+                );
+            }
             let store = runtime::McpInstallStore::in_config_home(loader.config_home());
             for name in runtime::mcp_unpinned_servers(&store, runtime_config.mcp(), loader.cwd()) {
                 let _ = write!(
@@ -2829,6 +2842,13 @@ fn render_mcp_report_for(
             let name = mcp_approve_arg(args).unwrap_or_default();
             Ok(render_mcp_approval(
                 &runtime::approve_mcp_server(loader, name),
+                name,
+            ))
+        }
+        Some(args) if mcp_connect_arg(args).is_some() => {
+            let name = mcp_connect_arg(args).unwrap_or_default();
+            Ok(render_mcp_connect(
+                &mcp_hosted_connect_url(loader, name),
                 name,
             ))
         }
@@ -4059,8 +4079,14 @@ fn render_mcp_server_report(
             lines.push(format!("  SDK name          {}", config.name));
         }
         McpServerConfig::ManagedProxy(config) => {
-            lines.push(format!("  URL               {}", config.url));
-            lines.push(format!("  Proxy id          {}", config.id));
+            lines.push(format!(
+                "  Connector         {} (hosted by Zero-X)",
+                config.id
+            ));
+            lines.push(format!("  URL               {}", config.endpoint()));
+            if let Some(url) = runtime::zerox_needs_connect(server_name) {
+                lines.push(format!("  Connect           not linked yet: {url}"));
+            }
         }
     }
 
@@ -4190,6 +4216,66 @@ fn mcp_approve_arg(args: &str) -> Option<&str> {
     match args.split_whitespace().collect::<Vec<_>>().as_slice() {
         ["approve", name] => Some(name),
         _ => None,
+    }
+}
+
+/// `connect <server>`: the hosted connector to link on the Zero-X dashboard.
+fn mcp_connect_arg(args: &str) -> Option<&str> {
+    match args.split_whitespace().collect::<Vec<_>>().as_slice() {
+        ["connect", name] => Some(name),
+        _ => None,
+    }
+}
+
+/// The page where the user links the hosted connector `name` (a `zerox` server) to
+/// their Zero-X account: the one the gateway named when it said the connector is not
+/// linked, else the dashboard's connectors page.
+pub fn mcp_hosted_connect_url(loader: &ConfigLoader, name: &str) -> Result<String, String> {
+    let config = loader.load().map_err(|error| error.to_string())?;
+    let mcp = config.mcp();
+    let server = mcp
+        .get(name)
+        .or_else(|| mcp.disabled().get(name))
+        .or_else(|| mcp.blocked().get(name).map(|blocked| &blocked.server));
+    match server.map(|server| &server.config) {
+        Some(McpServerConfig::ManagedProxy(_)) => match runtime::zerox_needs_connect(name) {
+            Some(url) => Ok(url),
+            None => runtime::zerox_origin().map(|origin| runtime::zerox_connect_url(&origin)),
+        },
+        Some(_) => Err(format!(
+            "{name} is not a hosted connector; only zerox servers are linked on the Zero-X dashboard"
+        )),
+        None => Err(format!("no MCP server named {name}")),
+    }
+}
+
+/// The hosted connectors the gateway said are not linked to the account.
+fn hosted_needing_connect(mcp: &runtime::McpConfigCollection) -> Vec<String> {
+    mcp.servers()
+        .iter()
+        .filter(|(_, server)| matches!(server.config, McpServerConfig::ManagedProxy(_)))
+        .filter(|(name, _)| runtime::zerox_needs_connect(name).is_some())
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+fn render_mcp_connect(outcome: &Result<String, String>, name: &str) -> String {
+    match outcome {
+        Err(error) => format!("MCP\n  Error            {error}"),
+        Ok(url) => [
+            "MCP".to_string(),
+            format!("  Connect          {name} (hosted by Zero-X)"),
+            format!("  Page             {url}"),
+            "  Next             link it there; it is ready from the next turn".to_string(),
+        ]
+        .join("\n"),
+    }
+}
+
+fn render_mcp_connect_json(outcome: &Result<String, String>, name: &str) -> Value {
+    match outcome {
+        Ok(url) => json!({"kind": "mcp", "action": "connect", "server": name, "url": url}),
+        Err(error) => json!({"kind": "mcp", "action": "connect", "server": name, "error": error}),
     }
 }
 
@@ -4781,7 +4867,7 @@ fn mcp_transport_label(config: &McpServerConfig) -> &'static str {
         McpServerConfig::Http(_) => "http",
         McpServerConfig::Ws(_) => "ws",
         McpServerConfig::Sdk(_) => "sdk",
-        McpServerConfig::ManagedProxy(_) => "managed-proxy",
+        McpServerConfig::ManagedProxy(_) => "zerox",
     }
 }
 
@@ -4797,7 +4883,7 @@ fn mcp_server_summary(config: &McpServerConfig) -> String {
         McpServerConfig::Sse(config) | McpServerConfig::Http(config) => config.url.clone(),
         McpServerConfig::Ws(config) => config.url.clone(),
         McpServerConfig::Sdk(config) => config.name.clone(),
-        McpServerConfig::ManagedProxy(config) => format!("{} ({})", config.id, config.url),
+        McpServerConfig::ManagedProxy(config) => format!("{} (hosted by Zero-X)", config.id),
     }
 }
 
@@ -4961,8 +5047,9 @@ fn mcp_server_details_json(config: &McpServerConfig) -> Value {
             "name": &config.name,
         }),
         McpServerConfig::ManagedProxy(config) => json!({
-            "url": &config.url,
+            "url": config.endpoint(),
             "id": &config.id,
+            "hosted": true,
         }),
     }
 }
@@ -5638,9 +5725,9 @@ mod tests {
 
         let action_error = parse_error_message("/mcp inspect alpha");
         assert!(action_error
-            .contains("Unknown /mcp action 'inspect'. Use list, show <server>, catalog [query], add <id>, remove <server>, enable <server>, disable <server>, approve <server>, pin <server>, or help."));
+            .contains("Unknown /mcp action 'inspect'. Use list, show <server>, catalog [query], add <id>, remove <server>, enable <server>, disable <server>, approve <server>, pin <server>, connect <server>, or help."));
         assert!(action_error.contains(
-            "  Usage            /mcp [list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|pin <server>|help]"
+            "  Usage            /mcp [list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|pin <server>|connect <server>|help]"
         ));
     }
 
@@ -5690,7 +5777,7 @@ mod tests {
         assert!(help.contains("/resume <session-path>"));
         assert!(help.contains("/config [env|hooks|model|plugins]"));
         assert!(help.contains(
-            "/mcp [list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|pin <server>|help]"
+            "/mcp [list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|pin <server>|connect <server>|help]"
         ));
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
@@ -6394,10 +6481,10 @@ mod tests {
 
         let help = super::handle_mcp_slash_command(Some("help"), &cwd).expect("mcp help");
         assert!(help.contains(
-            "Usage            /mcp [list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|pin <server>|help]"
+            "Usage            /mcp [list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|pin <server>|connect <server>|help]"
         ));
         assert!(help.contains(
-            "Direct CLI       neuron mcp [list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|pin <server>|login <server>|logout <server>|serve|help]"
+            "Direct CLI       neuron mcp [list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|pin <server>|connect <server>|login <server>|logout <server>|serve|help]"
         ));
 
         let unexpected =
@@ -6407,14 +6494,14 @@ mod tests {
         let nested_help =
             super::handle_mcp_slash_command(Some("show --help"), &cwd).expect("mcp help");
         assert!(nested_help.contains(
-            "Usage            /mcp [list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|pin <server>|help]"
+            "Usage            /mcp [list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|pin <server>|connect <server>|help]"
         ));
         assert!(nested_help.contains("Unexpected       show"));
 
         let unknown_help =
             super::handle_mcp_slash_command(Some("inspect --help"), &cwd).expect("mcp usage");
         assert!(unknown_help.contains(
-            "Usage            /mcp [list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|pin <server>|help]"
+            "Usage            /mcp [list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|pin <server>|connect <server>|help]"
         ));
         assert!(unknown_help.contains("Unexpected       inspect"));
 
@@ -6860,6 +6947,54 @@ mod tests {
         );
         let config = loader.load().expect("config");
         assert!(config.mcp().get("codebase-memory").is_some(), "still on");
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(config_home);
+    }
+
+    #[test]
+    fn mcp_connect_names_the_page_that_links_a_hosted_connector() {
+        let workspace = temp_dir("mcp-connect-workspace");
+        let config_home = temp_dir("mcp-connect-home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{"defaultMcpServers":false,"mcpServers":{"gh":{"type":"zerox","id":"github"},"notes":{"command":"notes-mcp"}}}"#,
+        )
+        .expect("user settings");
+        let loader = ConfigLoader::new(&workspace, &config_home);
+
+        assert_eq!(
+            SlashCommand::parse("/mcp connect gh"),
+            Ok(Some(SlashCommand::Mcp {
+                action: Some("connect".to_string()),
+                target: Some("gh".to_string()),
+            }))
+        );
+        let (text, json) =
+            super::render_mcp_report_with_json_for(&loader, &workspace, Some("connect gh"))
+                .expect("connect");
+        assert!(
+            text.contains("Connect          gh (hosted by Zero-X)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Page             https://zero-x.live/dashboard#connectors"),
+            "{text}"
+        );
+        assert_eq!(json["url"], "https://zero-x.live/dashboard#connectors");
+
+        let refused = super::render_mcp_report_for(&loader, &workspace, Some("connect notes"))
+            .expect("connect");
+        assert!(
+            refused.contains("notes is not a hosted connector"),
+            "{refused}"
+        );
+
+        let list = super::render_mcp_report_for(&loader, &workspace, None).expect("list");
+        assert!(list.contains("zerox"), "{list}");
+        assert!(list.contains("github (hosted by Zero-X)"), "{list}");
+        assert!(!list.contains("claudeai"), "{list}");
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(config_home);
     }

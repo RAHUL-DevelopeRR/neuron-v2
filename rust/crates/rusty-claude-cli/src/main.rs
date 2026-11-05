@@ -4173,6 +4173,18 @@ impl LiveCli {
                 serde_json::to_string_pretty(&handle_mcp_slash_command_json(args, &cwd)?)?
             ),
         }
+        // `connect <server>` in a terminal also opens the page that links it.
+        if let Some(["connect", name]) = args
+            .map(|args| args.split_whitespace().collect::<Vec<_>>())
+            .as_deref()
+        {
+            if output_format == CliOutputFormat::Text {
+                let loader = ConfigLoader::default_for(&cwd);
+                if let Ok(url) = commands::mcp_hosted_connect_url(&loader, name) {
+                    crate::mcp_auth::open_connect_page(&url);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -7428,7 +7440,7 @@ mod tests {
         assert!(help.contains("/resume <session-path>"));
         assert!(help.contains("/config [env|hooks|model|plugins]"));
         assert!(help.contains(
-            "/mcp [list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|pin <server>|help]"
+            "/mcp [list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|pin <server>|connect <server>|help]"
         ));
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));

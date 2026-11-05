@@ -105,6 +105,18 @@ fn zerox_bearer(
     }
 }
 
+/// Opens the page that links a hosted connector (`/mcp connect`), when this is a
+/// terminal where a browser can open; the page was printed either way.
+pub(crate) fn open_connect_page(url: &str) -> bool {
+    use std::io::IsTerminal;
+    let allowed = crate::device_login::browser_allowed(
+        io::stdout().is_terminal(),
+        &|name| env::var(name).ok(),
+        &|path| std::path::Path::new(path).exists(),
+    );
+    allowed && url.starts_with("http") && webbrowser::open(url).is_ok()
+}
+
 /// `login <server>` / `logout <server>`: what it did, or `None` for other `mcp`
 /// arguments.
 pub(crate) fn handle_mcp_auth_command(
