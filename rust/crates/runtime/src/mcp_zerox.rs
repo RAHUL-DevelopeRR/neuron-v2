@@ -223,14 +223,16 @@ pub fn zerox_needs_connect(server_name: &str) -> Option<String> {
         .cloned()
 }
 
-pub(crate) fn note_needs_connect(server_name: &str, connect_url: &str) {
+/// Marks the hosted server `server_name` as not linked, with where to link it.
+pub fn note_needs_connect(server_name: &str, connect_url: &str) {
     NEEDS_CONNECT
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .insert(server_name.to_string(), connect_url.to_string());
 }
 
-pub(crate) fn note_connected(server_name: &str) {
+/// Clears that mark: the gateway answered for `server_name`.
+pub fn note_connected(server_name: &str) {
     NEEDS_CONNECT
         .lock()
         .unwrap_or_else(PoisonError::into_inner)

@@ -774,6 +774,11 @@ pub(crate) fn extensions_event() -> UiEvent {
                     .map(|(name, server)| {
                         let (status, tools, error) = mcp_server_status(name, live);
                         let required = config.mcp().required().get(name);
+                        let (status, error, connect_url) = match hosted_needs_connect(name, server)
+                        {
+                            Some((why, url)) => ("needs_connect", Some(why), Some(url)),
+                            None => (status, error, None),
+                        };
                         McpServerInfo {
                             name: name.clone(),
                             scope: config_scope_id(server.scope).to_string(),
@@ -787,6 +792,7 @@ pub(crate) fn extensions_event() -> UiEvent {
                             }),
                             required: required.is_some(),
                             unpinned: unpinned(server),
+                            connect_url,
                         }
                     })
                     .collect();
@@ -802,6 +808,7 @@ pub(crate) fn extensions_event() -> UiEvent {
                         catalog: catalog_id(server),
                         required: false,
                         unpinned: unpinned(server),
+                        connect_url: None,
                     }
                 }));
                 // Configured and switched on, but not started: waiting for approval, or
@@ -833,6 +840,7 @@ pub(crate) fn extensions_event() -> UiEvent {
                         catalog: catalog_id(server),
                         required: false,
                         unpinned: unpinned(server),
+                        connect_url: None,
                     }),
                 );
                 servers.sort_by(|left, right| left.name.cmp(&right.name));
@@ -875,6 +883,22 @@ pub(crate) fn extensions_event() -> UiEvent {
             "agents",
         ),
     }
+}
+
+/// A hosted connector the gateway said is not linked to the account: why, and the
+/// page to link it on. It stays so until the gateway answers it again.
+fn hosted_needs_connect(
+    name: &str,
+    server: &runtime::ScopedMcpServerConfig,
+) -> Option<(String, String)> {
+    if server.transport() != runtime::McpTransport::ManagedProxy {
+        return None;
+    }
+    let url = runtime::zerox_needs_connect(name)?;
+    Some((
+        format!("not linked to your Zero-X account; connect it at {url} (/mcp connect {name})"),
+        url,
+    ))
 }
 
 /// The catalog connector a configured server was added from (see
@@ -972,7 +996,7 @@ pub(crate) fn mcp_transport_id(transport: runtime::McpTransport) -> &'static str
         runtime::McpTransport::Http => "http",
         runtime::McpTransport::Ws => "ws",
         runtime::McpTransport::Sdk => "sdk",
-        runtime::McpTransport::ManagedProxy => "managed_proxy",
+        runtime::McpTransport::ManagedProxy => "zerox",
     }
 }
 
@@ -2688,9 +2712,10 @@ fn parse_rewind_mode(mode: &str) -> Result<RewindMode, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        definitions, forward_commands, git_status, mcp_server_status, plain_notice,
-        question_notice, shorten, shorten_json_strings, spawn, transcript_event, EngineExit,
-        EngineHandle, EngineOptions, McpRuntimeView, RunningTurn, Shared,
+        definitions, forward_commands, git_status, hosted_needs_connect, mcp_server_status,
+        mcp_transport_id, plain_notice, question_notice, shorten, shorten_json_strings, spawn,
+        transcript_event, EngineExit, EngineHandle, EngineOptions, McpRuntimeView, RunningTurn,
+        Shared,
     };
     use crate::repl_loop::InterruptPresses;
     use crate::tests::{env_lock, with_current_dir};
@@ -4005,6 +4030,42 @@ mod tests {
             mcp_server_status("docs", None),
             ("not_started", Vec::new(), None)
         );
+    }
+
+    #[test]
+    fn a_hosted_connector_needs_connect_while_the_gateway_says_it_is_not_linked() {
+        let hosted = runtime::ScopedMcpServerConfig {
+            scope: runtime::ConfigSource::Managed,
+            config: runtime::McpServerConfig::ManagedProxy(runtime::McpManagedProxyServerConfig {
+                url: String::new(),
+                id: "github".to_string(),
+            }),
+        };
+        let local = runtime::ScopedMcpServerConfig {
+            scope: runtime::ConfigSource::User,
+            config: runtime::McpServerConfig::Stdio(runtime::McpStdioServerConfig {
+                command: "notes".to_string(),
+                args: Vec::new(),
+                env: std::collections::BTreeMap::new(),
+                tool_call_timeout_ms: None,
+                sandbox: None,
+            }),
+        };
+        let url = "https://zero-x.live/dashboard#connectors";
+        assert_eq!(hosted_needs_connect("engine-hosted", &hosted), None);
+        runtime::mcp_zerox::note_needs_connect("engine-hosted", url);
+        runtime::mcp_zerox::note_needs_connect("engine-local", url);
+        let (why, connect_url) = hosted_needs_connect("engine-hosted", &hosted).expect("waiting");
+        assert_eq!(connect_url, url);
+        assert!(why.contains("/mcp connect engine-hosted"), "{why}");
+        assert_eq!(
+            hosted_needs_connect("engine-local", &local),
+            None,
+            "not hosted"
+        );
+        runtime::mcp_zerox::note_connected("engine-hosted");
+        assert_eq!(hosted_needs_connect("engine-hosted", &hosted), None);
+        assert_eq!(mcp_transport_id(hosted.transport()), "zerox");
     }
 
     #[test]
