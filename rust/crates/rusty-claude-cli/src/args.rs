@@ -893,11 +893,19 @@ pub(crate) fn classify_subcommand_words(rest: &[String]) -> SubcommandWords {
                 words.len() == 2,
             )
         }
+        "mcp" if words.first() == Some(&"add") => changes(
+            "neuron mcp add <id> [--scope user|project|local] [--name <name>]",
+            commands::parse_mcp_add_args(&words[1..]).is_ok(),
+        ),
+        "mcp" if words.first() == Some(&"remove") => changes(
+            "neuron mcp remove <server> [--scope user|project|local]",
+            commands::parse_mcp_remove_args(&words[1..]).is_ok(),
+        ),
         "mcp" => shows(
-            "neuron mcp [list|show <server>|enable <server>|disable <server>|approve <server>|login <server>|logout <server>|serve|help]",
+            "neuron mcp [list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|login <server>|logout <server>|serve|help]",
             matches!(
                 without_help_word(&words),
-                [] | ["list" | "show" | "serve"] | ["show", _]
+                [] | ["list" | "show" | "serve" | "catalog"] | ["show", _] | ["catalog", ..]
             ),
         ),
         "acp" => shows(

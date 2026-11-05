@@ -66,6 +66,7 @@ mod headless;
 mod init;
 mod input;
 mod line_diff;
+mod mcp_add;
 mod mcp_auth;
 mod model_routing;
 mod orchestrator;
@@ -4139,6 +4140,12 @@ impl LiveCli {
             println!("{}", outcome?);
             return Ok(());
         }
+        if output_format == CliOutputFormat::Text {
+            if let Some(outcome) = crate::mcp_add::handle_interactive_mcp_add(args) {
+                println!("{}", outcome?);
+                return Ok(());
+            }
+        }
         let cwd = env::current_dir()?;
         match output_format {
             CliOutputFormat::Text => println!("{}", handle_mcp_slash_command(args, &cwd)?),
@@ -6955,6 +6962,11 @@ mod tests {
             vec!["mcp", "show", "github", "help"],
             vec!["mcp", "serve"],
             vec!["mcp", "-h"],
+            vec!["mcp", "catalog"],
+            vec!["mcp", "catalog", "web", "docs"],
+            vec!["mcp", "add", "github"],
+            vec!["mcp", "add", "github", "--scope", "project", "--name", "gh"],
+            vec!["mcp", "remove", "gh", "--scope=user"],
             vec!["acp", "serve"],
             vec!["skills", "list"],
             vec!["skills", "--help"],
@@ -6987,6 +6999,14 @@ mod tests {
                 output_format: CliOutputFormat::Json,
             }
         );
+        // Adding and removing change settings: words they do not take are refused.
+        for command in [
+            vec!["mcp", "add"],
+            vec!["mcp", "add", "github", "and", "fetch"],
+            vec!["mcp", "remove", "gh", "--scope", "team"],
+        ] {
+            assert!(parse_args(&words(&command)).is_err(), "{command:?}");
+        }
         // A slash command's alias gets the same guidance as its name.
         let error = parse_args(&words(&["plugins"])).unwrap_err();
         assert!(error.contains("/plugins"), "{error}");
@@ -7389,7 +7409,7 @@ mod tests {
         assert!(help.contains("/resume <session-path>"));
         assert!(help.contains("/config [env|hooks|model|plugins]"));
         assert!(help.contains(
-            "/mcp [list|show <server>|enable <server>|disable <server>|approve <server>|help]"
+            "/mcp [list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|help]"
         ));
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
@@ -10128,6 +10148,7 @@ UU conflicted.rs",
         let mut skills_written = 0;
         let mut fill = |word: &str| match word {
             "<server>" => "codebase-memory".to_string(),
+            "<id>" => "fetch".to_string(),
             "<path>" => {
                 skills_written += 1;
                 let name = format!("resume-skill-{skills_written}");
