@@ -62,6 +62,14 @@ function fakeEngine() {
 const READY = { type: 'ready', protocol: 1, version: '6.3.0' }
 const tick = () => new Promise((resolve) => setTimeout(resolve, 5))
 
+const RATE_LIMITED = {
+  code: 'rate_limited',
+  status: 429,
+  upgrade_url: null,
+  resets_at: null,
+  retry_after_seconds: 30,
+}
+
 describe('StdioEngineClient', () => {
   test('starts the engine with the launch flags and resolves at ready', async () => {
     const engine = fakeEngine()
@@ -236,17 +244,18 @@ describe('runExchange', () => {
     expect(engine.written().map((m) => m.type)).toEqual(['slash'])
 
     engine.emit({ type: 'notice', message: 'Compacted.' }, { type: 'turn_finished' })
-    expect(await slash).toEqual({ error: null })
+    expect(await slash).toEqual({ error: null, detail: null })
     await tick()
     expect(engine.written().map((m) => m.type)).toEqual(['slash', 'submit'])
     expect(turnEvents).toEqual([])
 
     engine.emit(
       { type: 'text_delta', text: 'done' },
-      { type: 'error', message: 'rate limited' },
+      { type: 'error', message: 'rate limited', detail: RATE_LIMITED },
       { type: 'turn_finished' },
     )
-    expect(await turn).toEqual({ error: 'rate limited' })
+    // The detail rides along, for the quota card and auto-continue.
+    expect(await turn).toEqual({ error: 'rate limited', detail: RATE_LIMITED })
     expect(turnEvents).toEqual(['text_delta', 'error', 'turn_finished'])
   })
 })

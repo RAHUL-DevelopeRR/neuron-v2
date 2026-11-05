@@ -3,7 +3,9 @@
 import { sanitizeTerminalText } from '@neuron-tui/common/util/terminal-safe-text'
 import React from 'react'
 
+import { useNow } from './quota-error-card'
 import { useTheme } from '../hooks/use-theme'
+import { staleLimitNote } from '../utils/quota-card'
 import { BORDER_CHARS } from '../utils/ui-constants'
 
 interface UserErrorBannerProps {
@@ -17,6 +19,9 @@ export const UserErrorBanner = React.memo(function UserErrorBanner({
   title,
 }: UserErrorBannerProps) {
   const theme = useTheme()
+  // A quota error left on screen says so once its limit has reset.
+  const now = useNow(60_000)
+  const resetNote = staleLimitNote(error, now)
 
   // Error text is often a server's (or a provider's) own words, passed
   // through: strip escape sequences before the terminal sees them.
@@ -53,9 +58,12 @@ export const UserErrorBanner = React.memo(function UserErrorBanner({
         <text style={{ fg: theme.error, wrapMode: 'word' }}>
           {title === undefined ? 'Error' : sanitizeTerminalText(title)}
         </text>
-        <text style={{ fg: theme.foreground, wrapMode: 'word' }}>
+        <text style={{ fg: resetNote ? theme.muted : theme.foreground, wrapMode: 'word' }}>
           {safeError}
         </text>
+        {resetNote && (
+          <text style={{ fg: theme.foreground, wrapMode: 'word' }}>{resetNote}</text>
+        )}
       </box>
     </box>
   )

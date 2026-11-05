@@ -27,6 +27,9 @@ export interface Settings {
    *  first-time onboarding suggested prompts so they only show to brand-new
    *  users and quietly retire afterwards. */
   hasSubmittedFirstPrompt?: boolean
+  /** Send "continue" by itself once a usage limit that stopped a turn resets
+   *  (the quota error card's toggle). Off unless turned on. */
+  autoContinueAfterReset?: boolean
 }
 
 /**
@@ -97,6 +100,10 @@ const validateSettings = (parsed: unknown): Settings => {
   // Validate hasSubmittedFirstPrompt
   if (typeof obj.hasSubmittedFirstPrompt === 'boolean') {
     settings.hasSubmittedFirstPrompt = obj.hasSubmittedFirstPrompt
+  }
+
+  if (typeof obj.autoContinueAfterReset === 'boolean') {
+    settings.autoContinueAfterReset = obj.autoContinueAfterReset
   }
 
   // The loader is an ALLOWLIST: a key not copied here is dropped on every

@@ -23,6 +23,7 @@ import { getNeuronEngineClient } from '../engine/neuron-engine-client'
 import { clearEngineConversation } from '../engine/engine-session'
 import { useThemeStore } from '../hooks/use-theme'
 import { startNewChat } from '../project-files'
+import { useQuotaStore } from '../state/quota-store'
 import { useChatStore } from '../state/chat-store'
 import { stopActiveRun } from '../utils/active-run'
 import { AGENT_MODES, AGENT_MODES_AVAILABLE } from '../utils/constants'
@@ -247,6 +248,8 @@ const ALL_COMMANDS: CommandDefinition[] = [
       // late checkpoints/final save would persist the old conversation's
       // state under the new chat (or vice versa).
       stopActiveRun('new-chat')
+      // A usage limit of the old chat no longer continues anything.
+      useQuotaStore.getState().clear()
 
       // Clear the conversation and rotate to a fresh chat directory, so the
       // next message doesn't overwrite the previous conversation's history

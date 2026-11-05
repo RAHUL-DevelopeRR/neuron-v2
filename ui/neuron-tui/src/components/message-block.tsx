@@ -11,7 +11,9 @@ import { ImageCard } from './image-card'
 import { MessageFooter } from './message-footer'
 import { TextAttachmentCard } from './text-attachment-card'
 import { RefusalBanner } from './refusal-banner'
+import { QuotaErrorCard } from './quota-error-card'
 import { UserErrorBanner } from './user-error-banner'
+import { useQuotaStore } from '../state/quota-store'
 import { ValidationErrorPopover } from './validation-error-popover'
 import { useTheme } from '../hooks/use-theme'
 import { useWhyDidYouUpdateById } from '../hooks/use-why-did-you-update'
@@ -137,6 +139,10 @@ export const MessageBlock = memo(({
   isLastMessage,
 }: MessageBlockProps) => {
   const [showValidationPopover, setShowValidationPopover] = useState(false)
+  // The usage limit that stopped this message's turn, while it is the latest.
+  const quotaBlock = useQuotaStore((state) =>
+    state.block?.messageId === messageId ? state.block : null,
+  )
 
   const bashCwd = metadata?.bashCwd ? formatCwd(metadata.bashCwd) : undefined
 
@@ -316,7 +322,11 @@ export const MessageBlock = memo(({
       {isAi && refusal && <RefusalBanner message={refusal} />}
 
       {/* Display runtime error banner for AI messages */}
-      {isAi && userError && <UserErrorBanner error={userError} />}
+      {isAi && userError && (quotaBlock ? (
+        <QuotaErrorCard block={quotaBlock} error={userError} />
+      ) : (
+        <UserErrorBanner error={userError} />
+      ))}
 
       {isAi && (
         <MessageFooter

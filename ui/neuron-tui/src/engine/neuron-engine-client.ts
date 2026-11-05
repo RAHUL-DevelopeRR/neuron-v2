@@ -12,6 +12,7 @@ import { StdioEngineClient } from './stdio-engine-client'
 import type {
   Attachment,
   EngineCommand,
+  ErrorDetail,
   PermissionReply,
   ReadyEvent,
   UiEvent,
@@ -104,6 +105,8 @@ export class EngineNotConnectedError extends Error {
 /** How a turn ended: `error` carries the engine's `error` message, if any. */
 export interface TurnOutcome {
   error: string | null
+  /** What the error needs from the user (a quota's reset time, ...), when the engine said. */
+  detail?: ErrorDetail | null
 }
 
 export class EngineExitedError extends Error {
@@ -139,16 +142,20 @@ export function runExchange(
     () =>
       new Promise<TurnOutcome>((resolve, reject) => {
         let error: string | null = null
+        let detail: ErrorDetail | null = null
         const cleanup = () => {
           unsubscribe()
           unsubscribeExit()
         }
         const unsubscribe = engine.subscribe((event) => {
           onEvent(event)
-          if (event.type === 'error') error = event.message
+          if (event.type === 'error') {
+            error = event.message
+            detail = event.detail ?? null
+          }
           if (event.type === 'turn_finished') {
             cleanup()
-            resolve({ error })
+            resolve({ error, detail })
           }
         })
         const unsubscribeExit = engine.onExit((exit) => {

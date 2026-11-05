@@ -28,6 +28,7 @@ import {
   type NeuronEngineClient,
 } from '../engine/neuron-engine-client'
 import { putAwayGitPanelsForTurn } from '../engine/git-views'
+import { recordTurnOutcome } from '../engine/quota-scheduler'
 import { withCurrentEngineSession } from '../engine/session-run-state'
 import { createTurnEventSink } from '../engine/turn-events'
 import { setCurrentChatId } from '../project-files'
@@ -536,6 +537,10 @@ export const useSendMessage = ({
           },
         )
         sink.finish()
+        // A usage limit's card and auto-continue (engine/quota-scheduler.ts).
+        if (!abortController.signal.aborted && runChatIsCurrent()) {
+          recordTurnOutcome(aiMessageId, outcome)
+        }
 
         // The engine's session, so `--continue` can resume it.
         const runState: RunState = withCurrentEngineSession({

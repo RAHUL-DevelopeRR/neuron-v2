@@ -72,10 +72,14 @@ import { useEvent } from './hooks/use-event'
 import { useInputHistory } from './hooks/use-input-history'
 import { useSuggestionEngine } from './hooks/use-suggestion-engine'
 import { getProjectRoot } from './project-files'
-import { cyclePermissionChoice } from './engine/status-bar-actions'
+import { cyclePermissionChoice, refreshAccount } from './engine/status-bar-actions'
 import { useChatHistoryStore } from './state/chat-history-store'
 import { useChatStore } from './state/chat-store'
 import { useEngineStore } from './state/engine-store'
+import { loadAutoContinueSetting, useQuotaStore } from './state/quota-store'
+import { isEngineTurnActive } from './engine/engine-session'
+import { startQuotaScheduler } from './engine/quota-scheduler'
+import { AUTO_CONTINUE_PROMPT } from './utils/quota-schedule'
 import { isGitPanelOpen, useGitViewsStore } from './state/git-views-store'
 import { useQueuePanelStore } from './state/queue-panel-store'
 import { useReviewStore } from './state/review-store'
@@ -113,6 +117,7 @@ import type { CommandResult } from './commands/command-registry'
 import type { MultilineInputHandle } from './components/multiline-input'
 import type { MatchedSlashCommand } from './hooks/use-suggestion-engine'
 import type { AgentMode } from './utils/constants'
+import { hasUsableZeroXLogin } from './utils/status-bar-parts'
 import type { StatusTarget } from './utils/status-bar-parts'
 import type { FileTreeNode } from '@neuron-tui/common/util/file'
 import type { BoxRenderable, ScrollBoxRenderable } from '@opentui/core'
@@ -627,6 +632,36 @@ export const Chat = ({
       )
     }
   }, [onSubmitPrompt, agentMode])
+
+  // Keeps the plan's usage current while the TUI stays open, and sends
+  // "continue" once a usage limit that stopped a turn resets, when the user
+  // turned that on (engine/quota-scheduler.ts).
+  const agentModeRef = useRef(agentMode)
+  agentModeRef.current = agentMode
+  useEffect(() => {
+    loadAutoContinueSetting()
+    return startQuotaScheduler({
+      refreshAccount,
+      continueTurn: () => {
+        // Only into the chat whose turn the limit stopped (not after /history).
+        const blocked = useQuotaStore.getState().block?.messageId
+        if (!useChatStore.getState().messages.some((message) => message.id === blocked)) {
+          return
+        }
+        onSubmitPrompt(AUTO_CONTINUE_PROMPT, agentModeRef.current, {
+          preserveInputValue: true,
+        }).catch((error) => {
+          logger.error({ error }, '[auto-continue] Failed to send continue')
+        })
+      },
+      isBusy: isEngineTurnActive,
+      isSignedIn: () => {
+        const status = useEngineStore.getState().status
+        return status ? hasUsableZeroXLogin(status) : false
+      },
+      getAccount: () => useEngineStore.getState().account,
+    })
+  }, [onSubmitPrompt])
 
   // handleSlashItemClick is defined later, after the panel stores
 

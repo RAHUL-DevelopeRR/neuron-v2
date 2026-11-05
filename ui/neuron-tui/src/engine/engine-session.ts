@@ -34,6 +34,7 @@ import {
 import { handleGitViewsEvent, resetGitViews } from './git-views'
 import { handleMcpPanelEvent, requestExtensions, resetMcpPanel } from './mcp-panel'
 import { FEATURE_MCP_CATALOG, FEATURE_TRUST_PREVIEW } from './protocol'
+import { noteAccountArrived } from './quota-scheduler'
 import { closeQuestionForm, openQuestionForm } from './question-form'
 import { QUESTION_PREFIX, questionNoticeText } from './questions'
 import { engineSessionOf, withEngineSession } from './session-run-state'
@@ -60,6 +61,11 @@ let turnMessageId: string | null = null
  * While a turn runs, its own error is shown on its message instead, its
  * retry notices go above that message, and its questions into it.
  */
+/** Whether a prompt's turn is running now. */
+export function isEngineTurnActive(): boolean {
+  return turnActive
+}
+
 export function setEngineTurnActive(active: boolean, messageId?: string): void {
   turnActive = active
   turnMessageId = active ? (messageId ?? null) : null
@@ -391,6 +397,7 @@ export function handleEngineEvent(event: UiEvent): void {
     case 'account':
       // The plan, limits and usage for the status bar and its context popover.
       engine.setAccount(event.account)
+      noteAccountArrived(event.account)
       return
     case 'branches':
       engine.setBranches(event)
