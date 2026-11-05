@@ -15,12 +15,17 @@ import {
   statusBarLine,
   statusLineText,
   usageWindowPercent,
+  usageWindowText,
+  windowResetClock,
   type StatusBarInput,
   type StatusLine,
 } from '../status-bar-parts'
 
 import type { GlyphMode } from '../glyphs'
-import type { StatusEvent } from '../../engine/protocol'
+import type { AccountDetails, StatusEvent } from '../../engine/protocol'
+
+/** Three hours before the fixture's window resets (14:32 UTC). */
+const NOW = Date.parse('2026-11-03T11:22:00Z')
 
 const input = (
   overrides: Partial<StatusEvent> = {},
@@ -31,6 +36,8 @@ const input = (
   account: STATUS_BAR_ACCOUNT,
   models: STATUS_BAR_MODELS,
   mode,
+  now: NOW,
+  timeZone: 'UTC',
   ...rest,
 })
 
@@ -48,9 +55,11 @@ describe('the status bar at each width', () => {
       expect(text.startsWith(
         'G Gemini 2.5 Flash ▾ │ ● think high │ ⌂ neuron-v2 ⎇ feat/tui-status-bar +1 ~2 │ ✎ Edit workspace │ ●●●◑○○○○○○ 35% ctx',
       )).toBe(true)
-      expect(text.endsWith('Free · 5h 12% · 37/100 req')).toBe(true)
       expect(stringWidth(text)).toBe(width)
     }
+    // The Free token window as used/limit with its reset time, then today's requests.
+    expect(render(input(), 200).endsWith('Free · 5h 120K/1M · resets 14:32 · 37/100 req')).toBe(true)
+    expect(render(input(), 160).endsWith('   120K/1M · resets 14:32')).toBe(true)
   })
 
   test('120 columns drop the labels and shorten the account group', () => {
@@ -58,13 +67,14 @@ describe('the status bar at each width', () => {
     expect(text.startsWith(
       'G Gemini 2.5 Flash │ ● high │ ⌂ neuron-v2 ⎇ feat/tui-status-bar +1 ~2 │ ✎ Edit │ ●●●◑○○○○○○ 35%',
     )).toBe(true)
-    expect(text.endsWith('5h 12%')).toBe(true)
+    expect(text.endsWith('120K/1M · resets 14:32')).toBe(true)
     expect(stringWidth(text)).toBe(120)
   })
 
   test('80 columns drop the folder and git counts and halve the meter', () => {
+    // The token window stays: the branch gives up a column for it.
     expect(render(input(), 80)).toBe(
-      'G Gemini 2.5 Flash │ ● high │ ⎇ feat/tui-status-bar │ ✎ Edit │ ●◕○○○ 35%  5h 12%',
+      'G Gemini 2.5 Flash │ ● high │ ⎇ feat/tui-status-b… │ ✎ Edit │ ●◕○○○ 35%  120K/1M',
     )
   })
 
@@ -90,6 +100,53 @@ describe('the status bar at each width', () => {
     const text = render(input({}, 'console'), 160)
     expect(text).toContain('G Gemini 2.5 Flash ▼ │ ● think high │ ⌂ neuron-v2 ± feat/tui-status-bar +1 ~2 │ + Edit workspace │ ●●●●○○○○○○ 35% ctx')
     expect(text).not.toMatch(/[◔◑◕⎇✎◌▾]/)
+  })
+})
+
+describe('the token window', () => {
+  const account = (window: Partial<NonNullable<AccountDetails['usage_window']>>): AccountDetails => ({
+    ...STATUS_BAR_ACCOUNT,
+    usage_window: { ...STATUS_BAR_ACCOUNT.usage_window!, ...window },
+  })
+  const right = (value: StatusBarInput) =>
+    line(value, 200).right.flatMap((segment) => segment.spans)
+
+  test('used/limit is toned by how full it is', () => {
+    expect(usageWindowText(STATUS_BAR_ACCOUNT, NOW)).toBe('120K/1M')
+    const full = right(input({}, 'unicode', { account: account({ tokens: 640_000, remaining_tokens: 360_000 }) }))
+    expect(full.find((span) => span.text === '5h 640K/1M')).toEqual({ text: '5h 640K/1M', tone: 'muted' })
+    const near = right(input({}, 'unicode', { account: account({ tokens: 850_000 }) }))
+    expect(near.find((span) => span.text === '5h 850K/1M')!.tone).toBe('warning')
+    const spent = right(input({}, 'unicode', { account: account({ tokens: 990_000 }) }))
+    expect(spent.find((span) => span.text === '5h 990K/1M')!.tone).toBe('error')
+  })
+
+  test('the used tokens come from the remaining ones when only those are sent', () => {
+    expect(usageWindowText(account({ tokens: null, remaining_tokens: 360_000 }), NOW)).toBe('640K/1M')
+    expect(usageWindowText(account({ tokens: null, remaining_tokens: null }), NOW)).toBeNull()
+    expect(usageWindowText(account({ limit_tokens: null }), NOW)).toBeNull()
+    expect(usageWindowText(null, NOW)).toBeNull()
+  })
+
+  test('past its reset the figures are stale: the plan and requests show instead', () => {
+    const later = Date.parse('2026-11-03T15:00:00Z')
+    expect(usageWindowText(STATUS_BAR_ACCOUNT, later)).toBeNull()
+    expect(render(input({}, 'unicode', { now: later }), 200).endsWith('Free · 37/100 req')).toBe(true)
+  })
+
+  test('the reset is a time within a day and a date after', () => {
+    expect(windowResetClock('2026-11-03T14:32:00Z', NOW, 'UTC')).toBe('14:32')
+    expect(windowResetClock('2026-11-03T14:32:00Z', NOW, 'Asia/Kolkata')).toBe('20:02')
+    expect(windowResetClock('2026-11-05T09:00:00Z', NOW, 'UTC')).toBe('Nov 5')
+    expect(windowResetClock('2026-11-03T10:00:00Z', NOW, 'UTC')).toBeNull()
+    expect(windowResetClock(null, NOW, 'UTC')).toBeNull()
+    expect(windowResetClock('not a date', NOW, 'UTC')).toBeNull()
+  })
+
+  test('without a reset time the window shows alone', () => {
+    expect(render(input({}, 'unicode', { account: account({ resets_at: null }) }), 200)).toMatch(
+      /Free · 5h 120K\/1M · 37\/100 req$/,
+    )
   })
 })
 

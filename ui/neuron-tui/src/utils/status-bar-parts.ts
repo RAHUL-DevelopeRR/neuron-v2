@@ -3,24 +3,27 @@
  * tones, and how it gives way in a narrow terminal. Pure, so it is tested
  * without a renderer (components/prompt-status-bar.tsx draws it).
  *
- *   G Gemini 2.5 Flash ▾ │ ◑ think high │ ⌂ neuron-v2 ⎇ main +1 ~2 │ ✎ Edit workspace │ ●●●◑○○○○○○ 35% ctx      Free · 5h 12% · 37/100 req
+ *   G Gemini 2.5 Flash ▾ │ ◑ think high │ ⌂ neuron-v2 ⎇ main +1 ~2 │ ✎ Edit workspace │ ●●●◑○○○○○○ 35% ctx      Free · 5h 640K/1M · resets 14:20 · 37/100 req
  *
  * Segments, left to right: the model (provider monogram and name), the
  * thinking level, the workspace folder and git branch, the permission mode
- * and the context meter; on the right, the Zero-X plan and its usage. Each
- * segment opens its picker when clicked (`target`).
+ * and the context meter; on the right, the Zero-X plan and its usage: the
+ * plan's rolling token window (Free: 1M tokens per 5 hours) as used/limit with
+ * the time it resets, and today's requests. Each segment opens its picker when
+ * clicked (`target`).
  *
  * When the line is too wide it gives way one step at a time
- * ({@link COLLAPSE_STEPS}): the account group shortens, labels go, then the
- * git counts, the folder name, half the meter's circles, the account group,
- * then the branch is cut, the thinking level and the circles go, and last the
- * model name is cut. The provider monogram, the permission mode and the
+ * ({@link COLLAPSE_STEPS}): the account group shortens to the window, labels
+ * go, then the window's reset time, the git counts, the folder name and half
+ * the meter's circles; then the branch is cut, the account group goes, the
+ * thinking level and the circles go, and last the model name is cut. The provider monogram, the permission mode and the
  * context percentage are never dropped.
  */
 
 import { meterCells, meterTone, displayPercent } from '../components/context-meter'
 import { needsSignIn } from '../state/engine-store'
 import { contextUsage } from './context-breakdown'
+import { formatTokenCount } from './format-token-count'
 import { cutToDisplayWidth, displayWidth as stringWidth } from './display-width'
 import { inferProvider, providerBadge } from './provider-badge'
 
@@ -147,6 +150,10 @@ export interface StatusBarInput {
   mode: GlyphMode
   /** A permission choice sent that no status shows yet (engine-store's `pendingPermission`). */
   pendingPermission?: string | null
+  /** Now (ms), for the token window's reset time; tests pass a fixed one. */
+  now?: number
+  /** The time zone the reset time is shown in; the system's when unset. */
+  timeZone?: string
 }
 
 /** One segment's possible texts, before they are fitted. */
@@ -172,7 +179,17 @@ export interface StatusView {
   permissionNext: StatusView['permission'] | null
   context: { percent: number; estimated: boolean; thresholdPercent: number } | null
   account:
-    | { kind: 'usage'; plan: string; window: number | null; requests: string | null }
+    | {
+        kind: 'usage'
+        plan: string
+        /** The token window's used share (0–100), for its tone. */
+        window: number | null
+        /** "640K/1M": tokens used in the window and its limit. */
+        windowUsage: string | null
+        /** "14:20" today or within a day, else "Nov 4"; `null` once it has passed. */
+        windowResets: string | null
+        requests: string | null
+      }
     | { kind: 'signed-out' }
     | null
   glyphs: Glyphs
@@ -281,6 +298,49 @@ export function usageWindowPercent(account: AccountDetails | null): number | nul
   return Math.max(0, Math.min(100, (used / limit) * 100))
 }
 
+/**
+ * When the token window frees up, short: "14:20" within a day (24-hour clock),
+ * else "Nov 4". `null` without a time, and once it has passed: the window's
+ * figures are not known again until the account is read.
+ */
+export function windowResetClock(
+  iso: string | null | undefined,
+  now: number,
+  timeZone?: string,
+): string | null {
+  if (!iso) return null
+  const at = Date.parse(iso)
+  if (Number.isNaN(at) || at <= now) return null
+  const date = new Date(at)
+  if (at - now < 24 * 3_600_000) {
+    return date.toLocaleTimeString('en-US', {
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+      timeZone,
+    })
+  }
+  return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone })
+}
+
+/**
+ * "640K/1M": the token window's used tokens and limit, when both are known
+ * and the window has not reset since (its figures are stale after `resets_at`).
+ */
+export function usageWindowText(account: AccountDetails | null, now: number): string | null {
+  const window = account?.usage_window
+  if (!window?.limit_tokens || window.limit_tokens <= 0) return null
+  const resetsAt = window.resets_at ? Date.parse(window.resets_at) : Number.NaN
+  if (!Number.isNaN(resetsAt) && resetsAt <= now) return null
+  const used =
+    window.tokens ??
+    (window.remaining_tokens !== null && window.remaining_tokens !== undefined
+      ? window.limit_tokens - window.remaining_tokens
+      : null)
+  if (used === null || !Number.isFinite(used)) return null
+  return `${formatTokenCount(Math.max(0, used))}/${formatTokenCount(window.limit_tokens)}`
+}
+
 /** A usable Zero-X login: signed in, and the engine does not wait for a sign-in. */
 export function hasUsableZeroXLogin(status: StatusEvent): boolean {
   return status.signed_in === true && !needsSignIn(status)
@@ -293,6 +353,8 @@ export function statusView({
   models,
   mode,
   pendingPermission = null,
+  now = Date.now(),
+  timeZone,
 }: StatusBarInput): StatusView | null {
   if (!status) return null
   const glyphs = statusGlyphs(mode)
@@ -314,10 +376,13 @@ export function statusView({
     const plan = account?.plan_name ?? (planId ? titleCase(planId) : 'Zero-X')
     const used = account?.usage_today?.requests
     const limit = account?.limits?.requests
+    const windowUsage = usageWindowText(account, now)
     accountView = {
       kind: 'usage',
       plan,
-      window: usageWindowPercent(account),
+      window: windowUsage ? usageWindowPercent(account) : null,
+      windowUsage,
+      windowResets: windowUsage ? windowResetClock(account?.usage_window?.resets_at, now, timeZone) : null,
       requests:
         limit !== null && limit !== undefined && limit > 0
           ? `${used ?? 0}/${limit} req`
@@ -367,6 +432,8 @@ export function statusView({
 /** How far the line has given way. */
 export interface Compaction {
   accountShort: boolean
+  /** The token window's reset time. */
+  accountResets: boolean
   accountShown: boolean
   /** The signed-out warning stays longer than the usage. */
   warningShown: boolean
@@ -386,6 +453,7 @@ export interface Compaction {
 
 export const FULL: Compaction = {
   accountShort: false,
+  accountResets: true,
   accountShown: true,
   warningShown: true,
   labels: true,
@@ -405,11 +473,13 @@ type Step = Partial<Compaction> | 'cut-branch' | 'cut-model'
 export const COLLAPSE_STEPS: readonly Step[] = [
   { accountShort: true },
   { labels: false },
+  { accountResets: false },
   { gitCounts: false },
   { folder: false },
   { cells: 5 },
-  { accountShown: false },
+  // The token window stays before a whole branch name (it is what refuses requests).
   'cut-branch',
+  { accountShown: false },
   { think: false },
   { cells: 0, warningShown: false },
   'cut-model',
@@ -501,18 +571,23 @@ export function buildLine(view: StatusView, c: Compaction): StatusLine {
   if (account?.kind === 'signed-out' && c.warningShown) {
     right.push({ target: 'account', spans: [{ text: 'Signed out: /login', tone: 'warning' }] })
   } else if (account?.kind === 'usage' && c.accountShown) {
-    const windowSpan: StatusSpan | null =
-      account.window !== null
-        ? { text: `5h ${displayPercent(account.window)}%`, tone: windowTone(account.window) }
+    const tone = account.window !== null ? windowTone(account.window) : 'muted'
+    const windowSpan: StatusSpan | null = account.windowUsage
+      ? { text: c.accountShort ? account.windowUsage : `5h ${account.windowUsage}`, tone }
+      : null
+    const resetsSpan: StatusSpan | null =
+      windowSpan && account.windowResets && c.accountResets
+        ? { text: ` · resets ${account.windowResets}`, tone: 'muted' }
         : null
     const spans: StatusSpan[] = []
     if (c.accountShort) {
-      if (windowSpan) spans.push(windowSpan)
+      if (windowSpan) spans.push(windowSpan, ...(resetsSpan ? [resetsSpan] : []))
       else if (account.requests) spans.push({ text: account.requests, tone: 'muted' })
       else spans.push({ text: account.plan, tone: 'muted' })
     } else {
       spans.push({ text: account.plan, tone: 'muted' })
       if (windowSpan) spans.push({ text: ' · ', tone: 'muted' }, windowSpan)
+      if (resetsSpan) spans.push(resetsSpan)
       if (account.requests) spans.push({ text: ` · ${account.requests}`, tone: 'muted' })
     }
     right.push({ target: 'account', spans })

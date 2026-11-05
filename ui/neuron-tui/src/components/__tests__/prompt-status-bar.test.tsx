@@ -51,11 +51,18 @@ async function draw(element: React.ReactNode, width: number, height: number): Pr
   }
 }
 
+/** Three hours before the fixture's token window resets. */
+const NOW = Date.parse('2026-11-03T11:22:00Z')
+
 describe('PromptStatusBar', () => {
   for (const mode of ['unicode', 'console'] as GlyphMode[]) {
     for (const width of [80, 120, 160]) {
       test(`${width} columns, ${mode} glyphs`, async () => {
-        const frame = await draw(<PromptStatusBar width={width} glyphMode={mode} />, width, 1)
+        const frame = await draw(
+          <PromptStatusBar width={width} glyphMode={mode} now={NOW} timeZone="UTC" />,
+          width,
+          1,
+        )
         expect(frame).toMatchSnapshot()
         expect(frame).toContain(mode === 'unicode' ? '✎ Edit' : '+ Edit')
         expect(frame).toContain('35%')

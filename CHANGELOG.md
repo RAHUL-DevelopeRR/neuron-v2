@@ -5,6 +5,9 @@ The release workflow copies a version's section into its GitHub release notes.
 
 ## 7.0.0-alpha.4 (unreleased)
 
+- Full-screen UI: the status bar shows the Free token window as used/limit with its
+  reset time (`Free · 5h 640K/1M · resets 14:20 · 37/100 req`; `640K/1M` when narrow),
+  amber from 80% and red from 95%. Past its reset time the stale figures are left out.
 - Full-screen UI: a terminal smaller than 60x16 gets a "Terminal too small" screen
   (the chat stays open underneath), and `neuron` starts the line REPL in one with a
   note. The status bar, the MCP panel and the model picker measure text in terminal

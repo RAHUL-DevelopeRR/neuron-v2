@@ -7,7 +7,7 @@
 /**
  * The line under the input:
  *
- *   G Gemini 2.5 Flash ▾ │ ◑ think high │ ⌂ neuron-v2 ⎇ main +1 │ ✎ Edit workspace │ ●●●◑○○○○○○ 35% ctx     Free · 5h 12% · 37/100 req
+ *   G Gemini 2.5 Flash ▾ │ ◑ think high │ ⌂ neuron-v2 ⎇ main +1 │ ✎ Edit workspace │ ●●●◑○○○○○○ 35% ctx     Free · 5h 640K/1M · resets 14:20 · 37/100 req
  *
  * Each segment opens its picker when clicked (`onActivate`); the same pickers
  * have keys (Alt+M/T/W/P/C, Shift+Tab for the permission mode) and slash
@@ -16,7 +16,7 @@
  */
 
 import { TextAttributes } from '@opentui/core'
-import React, { useState } from 'react'
+import React, { useEffect, useState } from 'react'
 
 import { Button } from './button'
 import { useTheme } from '../hooks/use-theme'
@@ -64,24 +64,47 @@ const Segment = ({
   )
 }
 
+/** How often the bar looks whether the token window's reset time has passed. */
+const RESET_CHECK_MS = 60_000
+
 export const PromptStatusBar = ({
   width,
   onActivate,
   glyphMode = getGlyphMode(),
+  now: fixedNow,
+  timeZone,
 }: {
   /** The columns the bar may use, padding included. */
   width: number
   onActivate?: (target: StatusTarget) => void
   /** The terminal's glyph set (tests draw both). */
   glyphMode?: GlyphMode
+  /** A fixed now (ms) for tests; the clock, checked each minute, otherwise. */
+  now?: number
+  /** The time zone of the reset time (tests); the system's when unset. */
+  timeZone?: string
 }) => {
   const theme = useTheme()
+  const [clock, setClock] = useState(() => Date.now())
+  useEffect(() => {
+    if (fixedNow !== undefined) return
+    const timer = setInterval(() => setClock(Date.now()), RESET_CHECK_MS)
+    return () => clearInterval(timer)
+  }, [fixedNow])
   const status = useEngineStore((state) => state.status)
   const account = useEngineStore((state) => state.account)
   const models = useEngineStore((state) => state.models)
   const pendingPermission = useEngineStore((state) => state.pendingPermission)
   const line = statusBarLine(
-    { status, account, models, mode: glyphMode, pendingPermission },
+    {
+      status,
+      account,
+      models,
+      mode: glyphMode,
+      pendingPermission,
+      now: fixedNow ?? clock,
+      timeZone,
+    },
     Math.max(0, width - 2),
   )
   if (!line || line.left.length === 0) return null

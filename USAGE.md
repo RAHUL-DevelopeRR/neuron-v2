@@ -127,8 +127,11 @@ not the daily figure, is what refuses requests. Every step of an agent turn send
 whole conversation again, so a long task can use the window quickly. On a plan with a
 window Neuron:
 
-- shows the window in `/usage`, `neuron usage` and `/status`, keeps it current from
-  the quota headers of each reply, and warns once when 90% of it is used. Once the
+- shows the window in `/usage`, `neuron usage` and `/status`, and on the right of the
+  full-screen UI's status bar (`Free · 5h 640K/1M · resets 14:20 · 37/100 req`, in your
+  local time; a narrow terminal keeps `640K/1M`, amber from 80% and red from 95%), keeps
+  it current from the quota headers of each reply, and warns once when 90% of it is
+  used. Once the
   window's reset time has passed, what is left is shown as unknown (`Free ?/1M`) until
   the account is read again, which Neuron does in the background;
 - keeps a smaller working set: about 40,000 tokens of conversation (system prompt and
