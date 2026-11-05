@@ -111,8 +111,7 @@ pub fn set_mcp_server_enabled(
             .filter(|path| *path != settings_path)
             .filter(|path| {
                 read_object(path)
-                    .map(|object| disabled_names(&object).iter().any(|other| other == name))
-                    .unwrap_or(false)
+                    .is_ok_and(|object| disabled_names(&object).iter().any(|other| other == name))
             })
             .collect()
     } else {

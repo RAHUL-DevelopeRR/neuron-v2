@@ -221,7 +221,7 @@ pub fn protected_resource_metadata_urls(server_url: &str) -> Result<Vec<String>,
 }
 
 /// Where the metadata of the authorization server `issuer` may be: RFC 8414 with the
-/// path inserted, then OpenID Connect discovery (inserted, then appended).
+/// path inserted, then `OpenID` Connect discovery (inserted, then appended).
 pub fn authorization_server_metadata_urls(issuer: &str) -> Result<Vec<String>, String> {
     let url = Url::parse(issuer).map_err(|error| error.to_string())?;
     let origin = origin_of(&url);

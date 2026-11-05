@@ -180,12 +180,15 @@ fn serve(stream: TcpStream, handler: &Handler, seen: &Mutex<Vec<FakeRequest>>) {
             let mut stream = stream;
             let mut head = format!("HTTP/1.1 {status} X\r\n");
             for (name, value) in headers {
-                head.push_str(&format!("{name}: {value}\r\n"));
+                let _ = std::fmt::Write::write_fmt(&mut head, format_args!("{name}: {value}\r\n"));
             }
-            head.push_str(&format!(
-                "Content-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            ));
+            let _ = std::fmt::Write::write_fmt(
+                &mut head,
+                format_args!(
+                    "Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                ),
+            );
             let _ = stream.write_all(head.as_bytes());
             let _ = stream.write_all(body.as_bytes());
             let _ = stream.flush();

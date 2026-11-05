@@ -773,7 +773,7 @@ async fn a_stalled_stream_ends_at_the_idle_deadline_with_a_clear_error() {
     let idle = Duration::from_millis(300);
     let client = trickle_client(
         server.base_url(),
-        short_timeouts(idle, Duration::from_secs(60)),
+        short_timeouts(idle, Duration::from_mins(1)),
     );
 
     let started = Instant::now();
@@ -816,7 +816,7 @@ async fn a_stalled_anthropic_stream_ends_at_the_idle_deadline_too() {
     let client = ProviderClient::Anthropic(
         AnthropicClient::new("test-key")
             .with_base_url(server.base_url())
-            .with_http_timeouts(short_timeouts(idle, Duration::from_secs(60))),
+            .with_http_timeouts(short_timeouts(idle, Duration::from_mins(1))),
     );
     let request = MessageRequest {
         model: "test-model".to_string(),

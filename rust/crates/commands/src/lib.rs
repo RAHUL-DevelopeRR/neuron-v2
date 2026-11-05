@@ -2648,7 +2648,10 @@ fn render_mcp_report_for(
             let runtime_config = loader.load()?;
             let mut report = render_mcp_summary_report(cwd, runtime_config.mcp().servers());
             for name in runtime_config.mcp().disabled().keys() {
-                report.push_str(&format!("\n  {name:<16} disabled"));
+                let _ = std::fmt::Write::write_fmt(
+                    &mut report,
+                    format_args!("\n  {name:<16} disabled"),
+                );
             }
             Ok(report)
         }
