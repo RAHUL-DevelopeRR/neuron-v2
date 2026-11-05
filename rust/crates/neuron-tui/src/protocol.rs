@@ -990,7 +990,9 @@ pub enum EngineCommand {
     /// settings of `scope` (`user`, `project` or `local`; the connector's default when
     /// `None`). `secrets` holds what the user typed for its variables: secrets go to the
     /// OS keychain and never into a settings file. A notice and a fresh
-    /// [`UiEvent::Extensions`] follow, or an error.
+    /// [`UiEvent::Extensions`] follow, or an error. A connector that signs in with OAuth
+    /// ([`ConnectorInfo::oauth`]) then opens the browser: a notice with the sign-in link,
+    /// later one with the result (and, once signed in, another [`UiEvent::Extensions`]).
     AddMcpServer {
         id: String,
         #[serde(default)]

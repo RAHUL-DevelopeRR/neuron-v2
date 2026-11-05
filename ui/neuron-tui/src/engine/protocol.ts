@@ -1068,7 +1068,10 @@ export type EngineCommand =
    * the settings of `scope` (`user`, `project` or `local`; the connector's
    * default when null). `secrets` holds what the user typed for its variables:
    * secrets go to the OS keychain, never into a settings file, and must never be
-   * logged. A notice and a fresh `extensions` event follow, or an error.
+   * logged. A notice and a fresh `extensions` event follow, or an error. A
+   * connector that signs in with OAuth (`oauth`) then opens the browser: a notice
+   * with the sign-in link, later one with the result (and, once signed in,
+   * another `extensions` event).
    */
   | {
       type: 'add_mcp_server'
