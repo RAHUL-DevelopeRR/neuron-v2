@@ -585,8 +585,14 @@ mod tests {
         assert!(prompt.contains("plain text"), "{prompt}");
         assert!(!prompt.contains("REPL"), "{prompt}");
         let resume = too_small_note(40, 10, SmallTerminalFallback::None);
-        assert!(resume.contains("Make the window bigger and run the command again"), "{resume}");
-        assert!(!resume.contains("REPL") && !resume.contains("plain text"), "{resume}");
+        assert!(
+            resume.contains("Make the window bigger and run the command again"),
+            "{resume}"
+        );
+        assert!(
+            !resume.contains("REPL") && !resume.contains("plain text"),
+            "{resume}"
+        );
         for note in [prompt, resume] {
             assert!(note.contains("40x10") && note.contains("60x16"), "{note}");
         }
