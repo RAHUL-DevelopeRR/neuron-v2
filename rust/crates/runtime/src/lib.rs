@@ -71,6 +71,7 @@ pub mod sandbox;
 pub mod sensitive_paths;
 mod session;
 pub mod session_control;
+pub mod session_recap;
 pub use session_control::SessionStore;
 pub mod experience;
 pub mod project_checks;

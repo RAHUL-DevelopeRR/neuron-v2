@@ -282,6 +282,9 @@ fn run_engine(
         engine.account_email = signed_out.email.take();
         engine.refresh_account();
         engine.announce_account();
+        if signed_out.options.resume.is_none() {
+            engine.announce_session_recap();
+        }
         if let Some(reference) = &signed_out.options.resume {
             match engine.continue_saved_session(reference) {
                 Ok(report) => {
@@ -2286,6 +2289,7 @@ impl Engine {
                 self.clear(confirm)?;
                 if confirm {
                     self.send_transcript();
+                    self.announce_session_recap();
                 }
             }
             SlashCommand::Resume { session_path: None } => self.notice(&render_resume_usage()),
@@ -2341,8 +2345,19 @@ impl Engine {
         self.send(ready_event());
         self.send_status();
         self.announce_account();
-        if !self.cli.runtime.session().messages.is_empty() {
+        if self.cli.runtime.session().messages.is_empty() {
+            self.announce_session_recap();
+        } else {
             self.send_transcript();
+        }
+    }
+
+    /// A new, empty session: one line on the workspace's previous session, which the
+    /// agent was told about ([`runtime::session_recap`]), and how to reopen it.
+    fn announce_session_recap(&mut self) {
+        if let Some(recap) = self.cli.session_recap() {
+            let message = recap.notice(crate::now_unix_ms());
+            self.notice(&message);
         }
     }
 

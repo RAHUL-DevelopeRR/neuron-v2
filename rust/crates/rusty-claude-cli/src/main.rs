@@ -1893,6 +1893,9 @@ struct LiveCli {
     /// Held while `session` is this CLI's, so no other run writes it meanwhile.
     session_lock: SessionLock,
     prompt_history: Vec<PromptHistoryEntry>,
+    /// The workspace's previous session, recapped in `system_prompt` while this
+    /// session started empty ([`runtime::session_recap`]).
+    session_recap: Option<runtime::session_recap::SessionRecap>,
 }
 
 #[derive(Debug, Clone)]
@@ -2917,12 +2920,13 @@ impl LiveCli {
         output: TurnOutput,
         opened: OpenSession,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let system_prompt = build_system_prompt()?;
+        let mut system_prompt = build_system_prompt()?;
         let OpenSession {
             handle,
             session,
             lock,
         } = opened;
+        let session_recap = apply_session_recap(&mut system_prompt, &session);
         let runtime = build_runtime(
             session,
             &handle.id,
@@ -2946,7 +2950,13 @@ impl LiveCli {
             session: handle,
             session_lock: lock,
             prompt_history: Vec::new(),
+            session_recap,
         })
+    }
+
+    /// The previous session this one started from, when it started empty.
+    fn session_recap(&self) -> Option<&runtime::session_recap::SessionRecap> {
+        self.session_recap.as_ref()
     }
 
     fn set_reasoning_effort(&mut self, effort: Option<String>) {
@@ -4038,6 +4048,7 @@ impl LiveCli {
         } = new_open_session()?;
         self.session = handle;
         self.session_lock = lock;
+        self.session_recap = apply_session_recap(&mut self.system_prompt, &session);
         let runtime = build_runtime(
             session,
             &self.session.id,
@@ -4098,6 +4109,7 @@ impl LiveCli {
         let (handle, session, lock) = self.open_saved_session(session_ref)?;
         let message_count = session.messages.len();
         let session_id = session.session_id.clone();
+        self.session_recap = apply_session_recap(&mut self.system_prompt, &session);
         // The effort the run asked for goes on, whatever session it continues.
         let reasoning_effort = self
             .runtime
@@ -4341,6 +4353,7 @@ impl LiveCli {
                     .and_then(|fork| fork.branch_name.clone());
                 let forked = forked.with_persistence_path(handle.path.clone());
                 let message_count = forked.messages.len();
+                self.session_recap = apply_session_recap(&mut self.system_prompt, &forked);
                 forked.save_to_path(&handle.path)?;
                 let runtime = build_runtime(
                     forked,
@@ -5289,6 +5302,34 @@ fn short_tool_id(id: &str) -> String {
     }
     let prefix: String = id.chars().take(12).collect();
     format!("{prefix}…")
+}
+
+/// Puts the recap of the workspace's previous session in `prompt` when `session` has
+/// no messages yet, and takes any earlier recap out otherwise: a resumed or forked
+/// session carries its own history. Returns the recap that went in.
+fn apply_session_recap(
+    prompt: &mut Vec<String>,
+    session: &Session,
+) -> Option<runtime::session_recap::SessionRecap> {
+    use runtime::session_recap::{latest_recap, recap_enabled, RECAP_SECTION_HEADING};
+    prompt.retain(|section| !section.starts_with(RECAP_SECTION_HEADING));
+    if !session.messages.is_empty() || !recap_enabled() {
+        return None;
+    }
+    let dir = sessions_dir().ok()?;
+    let workspace = env::current_dir().ok();
+    let now_ms = now_unix_ms();
+    let recap = latest_recap(&dir, &session.session_id, workspace.as_deref(), now_ms)?;
+    prompt.push(recap.prompt_section(now_ms));
+    Some(recap)
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {

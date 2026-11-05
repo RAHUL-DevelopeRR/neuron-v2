@@ -184,6 +184,36 @@ mod tests {
         ))
     }
 
+    /// The 5-hour window refusal Rahul hit on the Free plan: the UI's quota card and
+    /// auto-continue need its exact reset time (milliseconds included).
+    #[test]
+    fn a_five_hour_window_refusal_keeps_its_reset_time() {
+        let refusal = gateway(
+            429,
+            r#"{"error":{"message":"This request needs 84,937 tokens but only 74,329 of your 1,000,000 tokens for this 5-hour window are left; enough frees up at 18:49 UTC.","type":"insufficient_quota","code":"insufficient_quota","resets_at":"2026-11-04T18:48:59.950Z","upgrade_url":"https://zero-x.live/pricing","request_id":"req_6bb9df00250b4ba3b69384ff231cf2e6"}}"#,
+        );
+        record_model_call_failure(&refusal);
+        let detail = take_model_call_failure().expect("a detail");
+        assert_eq!(detail.code, "insufficient_quota");
+        assert_eq!(detail.status, Some(429));
+        assert_eq!(
+            detail.resets_at.as_deref(),
+            Some("2026-11-04T18:48:59.950Z")
+        );
+        assert_eq!(detail.retry_after_seconds, None);
+        assert_eq!(take_model_call_failure(), None, "taken once");
+
+        // Retried out, it still carries the reset time.
+        let retried = api::ApiError::RetriesExhausted {
+            attempts: 2,
+            last_error: Box::new(refusal),
+        };
+        assert_eq!(
+            from_api_error(&retried).and_then(|detail| detail.resets_at),
+            Some("2026-11-04T18:48:59.950Z".to_string())
+        );
+    }
+
     #[test]
     fn gateway_envelopes_keep_their_code_and_hints() {
         let quota = gateway(
