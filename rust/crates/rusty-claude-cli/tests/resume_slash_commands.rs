@@ -675,6 +675,54 @@ fn resumed_skills_install_installs_once() {
     }
 }
 
+/// `/mcp add` and `/mcp remove` under `--resume` run once for the text and the JSON:
+/// the JSON used to come from a second run, so `add` reported "already" added and
+/// `remove` failed on the server the first run had removed.
+#[test]
+fn resumed_mcp_add_and_remove_run_once() {
+    let temp_dir = unique_temp_dir("resume-mcp-once");
+    let config_home = temp_dir.join("config-home");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    let session_path = temp_dir.join("session.jsonl");
+    workspace_session(&temp_dir)
+        .save_to_path(&session_path)
+        .expect("persist ok");
+    let session_arg = session_path.to_str().expect("utf8 path");
+    let envs = [(
+        "NEURON_CONFIG_HOME",
+        config_home.to_str().expect("utf8 path"),
+    )];
+    let run_json = |command: &str| -> Value {
+        let output = run_claw_with_env(
+            &temp_dir,
+            &["--output-format", "json", "--resume", session_arg, command],
+            &envs,
+        );
+        assert!(
+            output.status.success(),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_str(String::from_utf8(output.stdout).expect("utf8").trim())
+            .expect("should be json")
+    };
+
+    let added = run_json("/mcp add fetch --scope user");
+    assert_eq!(added["action"], "add", "{added}");
+    assert_eq!(added["ok"], true, "{added}");
+    assert_eq!(added["already"], false, "{added}");
+    let settings = fs::read_to_string(config_home.join("settings.json")).expect("settings");
+    assert!(settings.contains("mcp-server-fetch"), "{settings}");
+
+    let removed = run_json("/mcp remove fetch");
+    assert_eq!(removed["action"], "remove", "{removed}");
+    assert_eq!(removed["ok"], true, "{removed}");
+    assert_eq!(removed["server"], "fetch", "{removed}");
+    let settings = fs::read_to_string(config_home.join("settings.json")).expect("settings");
+    assert!(!settings.contains("mcp-server-fetch"), "{settings}");
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
 #[test]
 fn resume_tolerates_a_session_file_with_a_truncated_record() {
     let temp_dir = unique_temp_dir("resume-truncated-record");

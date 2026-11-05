@@ -2516,6 +2516,49 @@ pub fn handle_mcp_slash_command_json(
     render_mcp_report_json_for(&loader, cwd, args)
 }
 
+/// `/mcp` as text and as JSON from a single run, so `/mcp add` adds once and
+/// `/mcp remove` does not fail on the server it just removed.
+pub fn handle_mcp_slash_command_with_json(
+    args: Option<&str>,
+    cwd: &Path,
+) -> Result<(String, Value), runtime::ConfigError> {
+    let loader = ConfigLoader::default_for(cwd);
+    render_mcp_report_with_json_for(&loader, cwd, args)
+}
+
+fn render_mcp_report_with_json_for(
+    loader: &ConfigLoader,
+    cwd: &Path,
+    args: Option<&str>,
+) -> Result<(String, Value), runtime::ConfigError> {
+    if let Some(args) = normalize_optional_args(args)
+        .filter(|args| help_path_from_args(args).is_none() && !is_help_arg(args))
+    {
+        if let Some((name, enabled)) = mcp_toggle_args(args) {
+            let outcome = runtime::set_mcp_server_enabled(loader, name, enabled);
+            return Ok((
+                render_mcp_toggle(&outcome, name, enabled),
+                render_mcp_toggle_json(&outcome, name, enabled),
+            ));
+        }
+        if let Some(name) = mcp_approve_arg(args) {
+            let outcome = runtime::approve_mcp_server(loader, name);
+            return Ok((
+                render_mcp_approval(&outcome, name),
+                render_mcp_approval_json(&outcome, name),
+            ));
+        }
+        if let Some(change) = McpChange::run(loader, args) {
+            return Ok((change.render(), change.render_json()));
+        }
+    }
+    // Everything else only reads the settings.
+    Ok((
+        render_mcp_report_for(loader, cwd, args)?,
+        render_mcp_report_json_for(loader, cwd, args)?,
+    ))
+}
+
 /// What a local `/skills` command did, before it is shown as text or JSON.
 enum SkillsCommandOutcome {
     /// Usage, naming the unexpected argument if there was one.
@@ -6364,6 +6407,52 @@ mod tests {
             None
         );
         std::env::remove_var("CONTEXT7_API_KEY");
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(config_home);
+    }
+
+    /// A resumed `/mcp` shows one run as text and as JSON: `add` adds once (the JSON
+    /// does not see it "already" added) and `remove` reports the removal it made.
+    #[test]
+    fn mcp_changes_run_once_for_both_outputs() {
+        let workspace = temp_dir("mcp-once-workspace");
+        let config_home = temp_dir("mcp-once-home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::create_dir_all(&config_home).expect("config home");
+        let loader = ConfigLoader::new(&workspace, &config_home)
+            .with_project_trust(runtime::ProjectTrust::Trusted)
+            .with_mcp_approvals(true);
+
+        let (text, json) = super::render_mcp_report_with_json_for(
+            &loader,
+            &workspace,
+            Some("add fetch --scope user"),
+        )
+        .expect("add");
+        assert!(text.contains("Added            fetch"), "{text}");
+        assert_eq!(json["ok"], true, "{json}");
+        assert_eq!(json["already"], false, "{json}");
+
+        let (text, json) = super::render_mcp_report_with_json_for(
+            &loader,
+            &workspace,
+            Some("disable fetch"),
+        )
+        .expect("disable");
+        assert!(text.contains("fetch is now disabled"), "{text}");
+        assert_eq!(json["changed"], true, "{json}");
+
+        let (text, json) =
+            super::render_mcp_report_with_json_for(&loader, &workspace, Some("remove fetch"))
+                .expect("remove");
+        assert!(text.contains("Removed          fetch"), "{text}");
+        assert_eq!(json["ok"], true, "{json}");
+        assert_eq!(json["server"], "fetch");
+
+        let (text, json) =
+            super::render_mcp_report_with_json_for(&loader, &workspace, None).expect("list");
+        assert!(text.contains("Configured servers"), "{text}");
+        assert_eq!(json["action"], "list");
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(config_home);
     }
