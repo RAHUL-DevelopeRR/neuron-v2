@@ -468,11 +468,14 @@ pub struct ConfigLoader {
     /// can have written them or the folders above them up to this one
     /// ([`crate::mcp_policy::check_managed_settings_owner`]).
     managed_settings_root: Option<PathBuf>,
+    /// Hosted connectors on or off; `None`: as `NEURON_HOSTED_CONNECTORS` says.
+    hosted_connectors: Option<bool>,
 }
 
 impl ConfigLoader {
     /// Loader with explicit paths that applies workspace settings in full,
-    /// starts workspace MCP servers without approval and reads no managed settings.
+    /// starts workspace MCP servers without approval, reads no managed settings and
+    /// lists no hosted connectors ([`ConfigLoader::with_hosted_connectors`]).
     /// Production code uses [`ConfigLoader::default_for`], which checks workspace trust
     /// and approvals and reads the machine's managed settings; call
     /// [`ConfigLoader::with_project_trust`], [`ConfigLoader::with_mcp_approvals`] and
@@ -486,6 +489,7 @@ impl ConfigLoader {
             mcp_approvals: false,
             managed_settings: None,
             managed_settings_root: None,
+            hosted_connectors: Some(false),
         }
     }
 
@@ -502,6 +506,7 @@ impl ConfigLoader {
             mcp_approvals: true,
             managed_settings: crate::mcp_policy::managed_settings_path(),
             managed_settings_root: Some(crate::mcp_policy::managed_settings_root()),
+            hosted_connectors: None,
         }
     }
 
@@ -516,6 +521,15 @@ impl ConfigLoader {
     #[must_use]
     pub fn with_mcp_approvals(mut self, required: bool) -> Self {
         self.mcp_approvals = required;
+        self
+    }
+
+    /// Turns hosted connectors on or off for this loader, whatever
+    /// `NEURON_HOSTED_CONNECTORS` says: on, the plan's hosted connectors are listed as
+    /// `Managed` servers.
+    #[must_use]
+    pub fn with_hosted_connectors(mut self, enabled: bool) -> Self {
+        self.hosted_connectors = Some(enabled);
         self
     }
 
@@ -709,9 +723,9 @@ impl ConfigLoader {
             }
         }
         let mut disabled_servers = BTreeMap::new();
-        for name in disabled_mcp_servers {
-            if let Some(server) = mcp_servers.remove(&name) {
-                disabled_servers.insert(name, server);
+        for name in &disabled_mcp_servers {
+            if let Some(server) = mcp_servers.remove(name) {
+                disabled_servers.insert(name.clone(), server);
             }
         }
 
@@ -726,6 +740,10 @@ impl ConfigLoader {
                 gateway: &gateway_policy,
                 bundled: &bundled_mcp_server_config,
                 now,
+                hosted_connectors: self
+                    .hosted_connectors
+                    .unwrap_or_else(crate::mcp_zerox::hosted_connectors_enabled),
+                disabled_names: &disabled_mcp_servers,
             },
         );
         for warning in &policy.warnings {

@@ -21,7 +21,7 @@
 //! connector is added with [`ConfigSource::Managed`] scope: it needs no workspace
 //! approval, starts in one-shot runs too, and cannot be turned off or removed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -29,8 +29,8 @@ use serde_json::{json, Map, Value};
 
 use crate::config::{
     expect_object, optional_bool, optional_string_array, parse_mcp_server_json, BlockedMcpServer,
-    ConfigError, ConfigSource, McpServerConfig, McpTransport, RuntimePermissionRuleConfig,
-    ScopedMcpServerConfig,
+    ConfigError, ConfigSource, McpManagedProxyServerConfig, McpServerConfig, McpTransport,
+    RuntimePermissionRuleConfig, ScopedMcpServerConfig,
 };
 use crate::json::JsonValue;
 use crate::mcp_catalog::McpCatalog;
@@ -498,6 +498,10 @@ pub(crate) struct McpPolicyInputs<'a> {
     pub(crate) bundled: &'a dyn Fn(&str) -> Option<McpServerConfig>,
     /// When the policy is applied (to describe a stale cache).
     pub(crate) now: u64,
+    /// Hosted connectors are on (`mcp_zerox`): the plan's are listed as servers.
+    pub(crate) hosted_connectors: bool,
+    /// The servers the settings turn off (`disabledMcpServers`), configured or not.
+    pub(crate) disabled_names: &'a BTreeSet<String>,
 }
 
 /// Applies the managed and plan policies to the configured servers: adds and switches on
@@ -600,7 +604,57 @@ pub(crate) fn apply_mcp_policy(
             applied.blocked.insert(name, refusal.block(server));
         }
     }
+    if inputs.hosted_connectors {
+        add_hosted_connectors(servers, disabled, &mut applied, inputs.disabled_names);
+    }
     applied
+}
+
+/// Lists each hosted connector the plan includes (`policy.connectors.hosted`) as a
+/// `Managed` server of that name reaching the gateway's `/mcp/<id>`, unless a server
+/// of that name is configured already. One the user turned off stays off; one the
+/// managed settings refuse is blocked. Whether the user linked it shows once it starts
+/// (`needs_connect` until then, see `mcp_zerox`).
+fn add_hosted_connectors(
+    servers: &mut BTreeMap<String, ScopedMcpServerConfig>,
+    disabled: &mut BTreeMap<String, ScopedMcpServerConfig>,
+    applied: &mut AppliedMcpPolicy,
+    disabled_names: &BTreeSet<String>,
+) {
+    let Some(policy) = applied.status.gateway_policy.clone() else {
+        return;
+    };
+    for id in &policy.hosted {
+        if !crate::mcp_zerox::valid_connector_id(id) {
+            applied.warnings.push(format!(
+                "your Zero-X plan lists the hosted connector \"{id}\", which is not a valid connector id; it is left out"
+            ));
+            continue;
+        }
+        if servers.contains_key(id) || disabled.contains_key(id) || applied.blocked.contains_key(id)
+        {
+            continue;
+        }
+        let server = ScopedMcpServerConfig {
+            scope: ConfigSource::Managed,
+            config: McpServerConfig::ManagedProxy(McpManagedProxyServerConfig {
+                url: String::new(),
+                id: id.clone(),
+            }),
+        };
+        let refusal = applied
+            .status
+            .managed_policy
+            .as_ref()
+            .and_then(|managed| managed_refusal(managed, id, &server.config, Some(id)));
+        if let Some(refusal) = refusal {
+            applied.blocked.insert(id.clone(), refusal.block(server));
+        } else if disabled_names.contains(id) {
+            disabled.insert(id.clone(), server);
+        } else {
+            servers.insert(id.clone(), server);
+        }
+    }
 }
 
 /// `mcpPolicy.requireSandbox`: drops `"sandbox": false` from every stdio server the
@@ -1268,6 +1322,70 @@ mod tests {
             crate::mcp_policy::server_catalog_id("fetch", server).as_deref(),
             Some("fetch")
         );
+    }
+
+    #[test]
+    fn the_plans_hosted_connectors_are_listed_as_managed_servers_when_switched_on() {
+        let fixture = Fixture::new("hosted");
+        fixture
+            .user(r#"{"defaultMcpServers":false,"disabledMcpServers":["linear"],"mcpServers":{"notion":{"command":"own-notion"}}}"#)
+            .managed(r#"{"mcpPolicy":{"deny":["slack"]}}"#)
+            .gateway(
+                &json!({"hosted": ["github", "linear", "notion", "slack", "Bad/Id"]}),
+                now(),
+            );
+
+        let off = fixture.loader().load().expect("config loads");
+        assert!(off.mcp().get("github").is_none(), "off unless switched on");
+
+        let config = fixture
+            .loader()
+            .with_hosted_connectors(true)
+            .load()
+            .expect("config loads");
+        let github = config.mcp().get("github").expect("listed");
+        assert_eq!(github.scope, ConfigSource::Managed);
+        assert!(matches!(
+            &github.config,
+            McpServerConfig::ManagedProxy(proxy) if proxy.id == "github" && proxy.url.is_empty()
+        ));
+        assert!(
+            config.mcp().disabled().contains_key("linear"),
+            "a hosted connector the user turned off stays off"
+        );
+        assert!(
+            matches!(
+                config.mcp().get("notion").map(|server| &server.config),
+                Some(McpServerConfig::Stdio(_))
+            ),
+            "a configured server of that name wins"
+        );
+        assert_eq!(
+            config.mcp().blocked()["slack"].rule,
+            "mcpPolicy.deny: slack"
+        );
+        assert!(config.mcp().get("Bad/Id").is_none());
+        assert!(config.mcp().required().is_empty(), "hosted is not required");
+    }
+
+    #[test]
+    fn a_zerox_server_the_plan_does_not_host_is_blocked() {
+        let fixture = Fixture::new("hosted-refused");
+        fixture
+            .user(r#"{"defaultMcpServers":false,"mcpServers":{"jira":{"type":"zerox","id":"jira"},"gh":{"type":"zerox","id":"github"}}}"#)
+            .gateway(&json!({"hosted": ["github"]}), now());
+
+        let config = fixture
+            .loader()
+            .with_hosted_connectors(true)
+            .load()
+            .expect("config loads");
+
+        assert_eq!(
+            config.mcp().blocked()["jira"].rule,
+            "policy.connectors.hosted"
+        );
+        assert!(config.mcp().get("gh").is_some());
     }
 
     #[test]
