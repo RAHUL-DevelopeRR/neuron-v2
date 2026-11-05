@@ -1927,6 +1927,9 @@ struct BuiltRuntime {
     plugins_active: bool,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     mcp_active: bool,
+    /// The generation of the shared state it was built on (`0` when it owns its
+    /// state): a newer one has tools this runtime does not offer.
+    shared_generation: u64,
 }
 
 impl BuiltRuntime {
@@ -1941,6 +1944,7 @@ impl BuiltRuntime {
             plugins_active: true,
             mcp_state,
             mcp_active: true,
+            shared_generation: 0,
         }
     }
 
@@ -2144,6 +2148,43 @@ impl RuntimeMcpState {
         });
         self.failed_servers = failed_server_list;
         Some(discovery)
+    }
+
+    /// Starts again each hosted connector the gateway said is not linked, and returns
+    /// the tools of those that answer now (the user linked them since): they join the
+    /// next turn. One still not linked costs one refused request.
+    fn retry_unlinked_hosted(&mut self) -> Vec<runtime::ManagedMcpTool> {
+        if self.starting {
+            return Vec::new();
+        }
+        let mut tools = Vec::new();
+        for server in self.manager.unlinked_hosted_servers() {
+            let Ok(found) = self
+                .runtime
+                .block_on(self.manager.rediscover_server(&server))
+            else {
+                continue;
+            };
+            self.failed_servers.retain(|failed| *failed != server);
+            if let Some(report) = &mut self.degraded_report {
+                report
+                    .failed_servers
+                    .retain(|failed| failed.server_name != server);
+                report.working_servers.push(server.clone());
+                report
+                    .available_tools
+                    .extend(found.iter().map(|tool| tool.qualified_name.clone()));
+            }
+            tools.extend(found);
+        }
+        if self
+            .degraded_report
+            .as_ref()
+            .is_some_and(|report| report.failed_servers.is_empty())
+        {
+            self.degraded_report = None;
+        }
+        tools
     }
 
     /// The tools that ask the user for every call: a hosted connector's destructive

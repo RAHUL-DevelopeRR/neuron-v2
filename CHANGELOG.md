@@ -10,7 +10,8 @@ The release workflow copies a version's section into its GitHub release notes.
   `/mcp/<id>` with your Zero-X sign-in, and each hosted connector the plan's policy
   lists appears as a `managed` server. One that is not linked yet shows
   `needs_connect` (`McpServerInfo.connect_url`, engine feature `mcp_hosted`);
-  `/mcp connect <server>` and `c` in the MCP panel open the page that links it.
+  `/mcp connect <server>` and `c` in the MCP panel open the page that links it; once
+  linked, it joins the next turn (or the MCP panel when it opens) without a restart.
   Neuron asks you about every call of a hosted connector's destructive tool, even in
   full access or with an allow rule, and tells the gateway only about the call you
   approved (`-p` in a script does not run them). Older settings for these servers keep working;

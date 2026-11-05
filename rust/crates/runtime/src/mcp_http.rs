@@ -891,7 +891,7 @@ impl McpRemoteConnection {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
 
     use serde_json::json;
@@ -1214,14 +1214,21 @@ mod tests {
     /// other sign-in is refused. A tool call is answered on an SSE stream that pings the
     /// client before the result.
     fn gateway() -> FakeServer {
+        gateway_linking(&Arc::new(AtomicBool::new(false)))
+    }
+
+    /// [`gateway`], where `ses_unlinked` has linked the connector once `linked` is set.
+    fn gateway_linking(linked: &Arc<AtomicBool>) -> FakeServer {
         let origin = Arc::new(Mutex::new(String::new()));
         let server_origin = Arc::clone(&origin);
+        let linked = Arc::clone(linked);
         let server = FakeServer::spawn(Arc::new(move |request: &FakeRequest| {
             if !request.path().starts_with("/mcp/") {
                 return FakeResponse::status(404);
             }
             match request.header("authorization") {
                 Some("Bearer ses_linked") => {}
+                Some("Bearer ses_unlinked") if linked.load(Ordering::SeqCst) => {}
                 Some("Bearer ses_unlinked") => {
                     let connect_url =
                         format!("{}/dashboard#connectors", server_origin.lock().unwrap());
@@ -1313,6 +1320,40 @@ mod tests {
         let report = runtime.block_on(linked.discover_tools_best_effort());
         assert!(report.failed_servers.is_empty());
         assert_eq!(zerox_needs_connect("hosted-unlinked"), None);
+    }
+
+    #[test]
+    fn a_hosted_connector_linked_while_running_starts_again() {
+        let linked = Arc::new(AtomicBool::new(false));
+        let server = gateway_linking(&linked);
+        let _gateway = ZeroxTestGateway::new(&server.url, Some("ses_unlinked"));
+        let mut manager = manager("hosted-later", hosted("github"));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let report = runtime.block_on(manager.discover_tools_best_effort());
+        assert_eq!(report.failed_servers.len(), 1);
+        assert_eq!(manager.unlinked_hosted_servers(), vec!["hosted-later"]);
+        assert!(manager.confirmed_tools().is_empty());
+
+        // Still not linked: it stays unlinked, with no tools.
+        assert!(runtime
+            .block_on(manager.rediscover_server("hosted-later"))
+            .is_err());
+        assert_eq!(manager.unlinked_hosted_servers(), vec!["hosted-later"]);
+
+        linked.store(true, Ordering::SeqCst);
+        let tools = runtime
+            .block_on(manager.rediscover_server("hosted-later"))
+            .expect("linked now");
+        assert_eq!(tools.len(), 2);
+        assert!(manager.unlinked_hosted_servers().is_empty());
+        assert_eq!(zerox_needs_connect("hosted-later"), None);
+        assert_eq!(
+            manager.confirmed_tools(),
+            vec!["mcp__hosted-later__delete_repository"]
+        );
+        runtime
+            .block_on(manager.call_tool("mcp__hosted-later__get_me", Some(json!({}))))
+            .expect("its tools are routed");
     }
 
     #[test]

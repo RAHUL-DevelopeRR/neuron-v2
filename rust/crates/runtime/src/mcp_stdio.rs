@@ -1161,6 +1161,45 @@ impl McpServerManager {
             .collect()
     }
 
+    /// The hosted connectors the gateway said are not linked yet
+    /// ([`crate::zerox_needs_connect`]): [`Self::rediscover_server`] starts one again
+    /// once the user linked it.
+    #[must_use]
+    pub fn unlinked_hosted_servers(&self) -> Vec<String> {
+        self.servers
+            .iter()
+            .filter(|(name, server)| {
+                matches!(
+                    server.bootstrap.transport,
+                    McpClientTransport::ManagedProxy(_)
+                ) && crate::mcp_zerox::zerox_needs_connect(name).is_some()
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// Starts `server_name` again and lists its tools, which replace its earlier ones
+    /// (none when it failed): a hosted connector the user linked after it failed with
+    /// `needs_connect`. A failure clears its tools.
+    pub async fn rediscover_server(
+        &mut self,
+        server_name: &str,
+    ) -> Result<Vec<ManagedMcpTool>, McpServerManagerError> {
+        let discovered = self.discover_tools_for_server(server_name).await;
+        self.clear_routes_for_server(server_name);
+        let tools = discovered?;
+        for tool in &tools {
+            self.tool_index.insert(
+                tool.qualified_name.clone(),
+                ToolRoute {
+                    server_name: tool.server_name.clone(),
+                    raw_name: tool.raw_name.clone(),
+                },
+            );
+        }
+        Ok(tools)
+    }
+
     /// Whether a user-approved call of `route` is confirmed to its server: a hosted
     /// connector's tool in the destructive tier, or one whose tier is not known (no
     /// catalog entry, or the entry does not list it).

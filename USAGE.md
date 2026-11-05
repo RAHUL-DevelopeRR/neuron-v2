@@ -578,7 +578,9 @@ With them on, each hosted connector your plan includes appears in `/mcp` as a
 answers that it is not linked and the server shows `needs connect`:
 `/mcp connect <server>` (or `neuron mcp connect <server>`) prints the page that links
 it and opens it in a browser, and `c` on its row in the MCP panel does the same. It is
-ready from the next turn after you link it. If the gateway refuses your sign-in, run
+ready from the next turn after you link it: Neuron asks the gateway again at the start
+of each turn and when the MCP panel opens, without a restart. If the gateway refuses
+your sign-in, run
 `neuron login` again. You can also add one yourself:
 
 ```json

@@ -349,6 +349,12 @@ impl GlobalToolRegistry {
         self.runtime_tools.iter().any(|tool| tool.name == name)
     }
 
+    /// The runtime tools' definitions, as [`Self::with_runtime_tools`] took them.
+    #[must_use]
+    pub fn runtime_tools(&self) -> &[RuntimeToolDefinition] {
+        &self.runtime_tools
+    }
+
     /// The names of the runtime tools (MCP servers' `mcp__<server>__<tool>`).
     #[must_use]
     pub fn runtime_tool_names(&self) -> Vec<String> {
