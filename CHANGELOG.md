@@ -5,6 +5,9 @@ The release workflow copies a version's section into its GitHub release notes.
 
 ## 7.0.0-alpha.4 (unreleased)
 
+- Full-screen UI: in a terminal that draws East Asian ambiguous-width characters two
+  columns wide (a Chinese, Japanese or Korean locale, or `NEURON_AMBIGUOUS_WIDE=1`),
+  the status bar measures its `│ ● ○ ◑` glyphs as two columns, so it still fits its row.
 - Full-screen UI, MCP panel: a server that waits for you carries a badge after its
   name (`[blocked]`, `[needs approval]`, `[needs connect]`, `[unpinned]`), and its
   summary no longer repeats it.

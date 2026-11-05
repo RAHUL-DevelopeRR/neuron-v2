@@ -5,7 +5,13 @@ import React from 'react'
 
 import { setNeuronEngineClientForTesting } from '../../engine/neuron-engine-client'
 import { initializeThemeStore } from '../../hooks/use-theme'
-import { cutToDisplayWidth, displayWidth, padToDisplayWidth } from '../../utils/display-width'
+import {
+  ambiguousIsWide,
+  cutToDisplayWidth,
+  displayWidth,
+  padToDisplayWidth,
+  setAmbiguousWideForTesting,
+} from '../../utils/display-width'
 import { fitParts, type FooterPart } from '../engine-footer'
 import {
   MIN_TERMINAL_COLUMNS,
@@ -61,6 +67,40 @@ describe('display width', () => {
     expect(cutToDisplayWidth('main', 1)).toBe('…')
     expect(cutToDisplayWidth('main', 0)).toBe('')
     expect(padToDisplayWidth('功', 4)).toBe('功  ')
+  })
+
+  test('a CJK locale, or NEURON_AMBIGUOUS_WIDE, measures the bar glyphs two columns wide', () => {
+    expect(ambiguousIsWide({ LANG: 'zh_CN.UTF-8' })).toBe(true)
+    expect(ambiguousIsWide({ LC_ALL: 'ja_JP.UTF-8', LANG: 'en_US.UTF-8' })).toBe(true)
+    expect(ambiguousIsWide({ LC_CTYPE: 'ko' })).toBe(true)
+    expect(ambiguousIsWide({ LANG: 'en_US.UTF-8' })).toBe(false)
+    expect(ambiguousIsWide({})).toBe(false)
+    expect(ambiguousIsWide({ LANG: 'zh_CN.UTF-8', NEURON_AMBIGUOUS_WIDE: '0' })).toBe(false)
+    expect(ambiguousIsWide({ NEURON_AMBIGUOUS_WIDE: '1' })).toBe(true)
+
+    const bar = 'auto ▾ │ ◑ think high │ ●●●○○ 35% ctx'
+    setAmbiguousWideForTesting(false)
+    try {
+      expect(displayWidth('│●')).toBe(2)
+      const narrow = displayWidth(bar)
+      setAmbiguousWideForTesting(true)
+      expect(displayWidth('│●')).toBe(4)
+      // Each ambiguous glyph (│ ◑ │ ●●● ○○; not ▾) counts one more column.
+      expect(displayWidth(bar)).toBe(narrow + 8)
+      // A cut leaves room for them, and its "…" is measured the same way.
+      const cut = cutToDisplayWidth(bar, 20)
+      expect(displayWidth(cut)).toBeLessThanOrEqual(20)
+      const fitted = fitParts(
+        [
+          { text: 'auto ▾', tone: 'normal', priority: 0 },
+          { text: '●●●○○ 35% ctx', tone: 'muted', priority: 1 },
+        ],
+        20,
+      )
+      expect(displayWidth(fitted.map((part) => part.text).join(' · '))).toBeLessThanOrEqual(20)
+    } finally {
+      setAmbiguousWideForTesting(null)
+    }
   })
 
   test('footer parts with wide characters are fitted by their columns', () => {

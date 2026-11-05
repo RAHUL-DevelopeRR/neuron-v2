@@ -33,7 +33,10 @@ settings, hooks and MCP servers are not loaded, and `/status` says how to trust 
 The UI needs a terminal of at least 60 columns by 16 rows. In a smaller one `neuron`
 starts the line REPL instead and says why; a terminal made smaller while the UI runs
 shows "Terminal too small" until it is big enough again (the chat and a running turn
-carry on underneath).
+carry on underneath). In a terminal set up for Chinese, Japanese or Korean, where the
+status bar's `│ ● ○` glyphs take two columns each, the bar measures them that way
+(from `LC_ALL`, `LC_CTYPE` or `LANG`; `NEURON_AMBIGUOUS_WIDE=1` or `0` says so
+explicitly).
 
 `neuron --no-tui` (or `NEURON_NO_TUI=1`) keeps the line REPL, which also runs when the
 UI is missing. The first time you run it in a directory it asks whether you trust it;
@@ -658,6 +661,7 @@ such a call is not run. Turn one off like any other server (`/mcp disable <serve
 | `NEURON_HOSTED_CONNECTORS=1` | neuron | Turn on hosted connectors (off by default; see [Hosted connectors](#hosted-connectors)) |
 | `NEURON_NO_TUI=1` | neuron | Use the line REPL instead of the full-screen UI |
 | `NEURON_TUI_ASCII` | neuron-tui | `1` draws with the classic-console character set everywhere, `0` with the Unicode one |
+| `NEURON_AMBIGUOUS_WIDE` | neuron-tui | `1`: the terminal draws East Asian ambiguous-width characters (`│ ● ○`) two columns wide, so the status bar measures them so; `0`: one column. Unset, a Chinese, Japanese or Korean locale counts as `1` |
 | `NEURON_VERSION` | install.sh, install.ps1 | Release to install (default: the latest release; a prerelease such as `7.0.0-alpha.3` must be named) |
 | `NEURON_INSTALL_DIR` | install.sh, install.ps1 | Install directory |
 | `NEURON_BINARY_PATH` | npm and pip launchers | Run this binary instead of the downloaded one |
