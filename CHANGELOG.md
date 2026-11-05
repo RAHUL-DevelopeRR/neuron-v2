@@ -14,6 +14,13 @@ The release workflow copies a version's section into its GitHub release notes.
   tier their entry pins per tool. The engine protocol adds `list_connector_catalog`,
   `add_mcp_server`, `remove_mcp_server`, `approve_mcp_server` and the
   `connector_catalog` event (feature `mcp_catalog`).
+- Connector catalog fixes: a resumed `/mcp add` or `/mcp remove` runs once for its text
+  and JSON; a server name can be added in one settings scope only, and removing one
+  keeps the secrets and sign-in another scope's server of that name uses; Memory and
+  Codebase memory writes need full access (they write outside the workspace); a stdio
+  secret is bound to the server's environment too; an OAuth connector added through
+  the engine signs in from there; a signed catalog update must be newer than the
+  catalog in use; Filesystem and Memory are listed as `Apache-2.0 AND MIT`.
 - MCP hardening: a call through `MCPTool` is checked as the tool it names, so a deny
   or ask rule on `mcp__<server>__<tool>` can no longer be stepped around, and rules can
   name a whole server (`mcp__<server>`, `mcp__<server>__*`); a server a deny rule
