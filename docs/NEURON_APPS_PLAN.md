@@ -54,7 +54,7 @@ Paths are relative to `rust/crates/`. This comes from reading the code on 2026-1
 - **Config:** `mcpServers` in user, project and local `settings.json` (also the `.claw*` and
   `.neuron*` variants). Untrusted workspaces drop project servers.
 - **Parsed server types:** stdio, sse/http (with headers, headersHelper and OAuth fields), ws,
-  sdk and claudeai-proxy.
+  sdk and zerox (hosted connectors through the Zero-X gateway).
 - **Implemented transport: stdio only.** `McpServerManager::from_servers` marks every other type
   "not supported" (`mcp_stdio.rs:806-832`).
 - **Methods:** initialize, tools/list, tools/call, resources/list and resources/read. There are

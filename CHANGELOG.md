@@ -5,6 +5,15 @@ The release workflow copies a version's section into its GitHub release notes.
 
 ## 7.0.0-alpha.4 (unreleased)
 
+- Hosted connectors (off until `NEURON_HOSTED_CONNECTORS=1`): `"type": "zerox"` MCP
+  servers reach a connector linked on the Zero-X dashboard through the gateway's
+  `/mcp/<id>` with your Zero-X sign-in, and each hosted connector the plan's policy
+  lists appears as a `managed` server. One that is not linked yet shows
+  `needs_connect` (`McpServerInfo.connect_url`, engine feature `mcp_hosted`);
+  `/mcp connect <server>` and `c` in the MCP panel open the page that links it.
+  Destructive tool calls tell the gateway they were confirmed only when you approved
+  them in the permission prompt. The inherited `claudeai-proxy` type still parses as
+  the same server; `/mcp` and the protocol call the transport `zerox`.
 - MCP supply chain: catalog connectors and the default MCP servers no longer start
   through `npx -y` or `uvx`. The catalog (`2026-11-05.3`) pins each local entry's whole
   npm dependency tree with `sha512` integrity, its Python requirements with wheel

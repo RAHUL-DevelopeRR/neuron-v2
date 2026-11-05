@@ -455,7 +455,7 @@ names the file, the line and the closest known key. Commonly used keys:
 | `maxIterations` | Model calls allowed in one turn (default 50); `NEURON_MAX_ITERATIONS` overrides it |
 | `workingSetTokens` | Conversation tokens to keep before older tool results become stubs and history is compacted (default 40000 on a plan with a token window, such as Free; none on other plans); `0` turns it off, and `NEURON_WORKING_SET_TOKENS` overrides it. See [The Free token window](#the-free-token-window) |
 | `hooks` | Commands run before and after tool calls |
-| `mcpServers`, `defaultMcpServers`, `disabledMcpServers` | MCP servers |
+| `mcpServers`, `defaultMcpServers`, `disabledMcpServers` | MCP servers (`"type": "zerox"` is a [hosted connector](#hosted-connectors)) |
 | `mcpServers.<name>.sandbox` | What a stdio MCP server may read, write and reach, and the inherited variables it sees (`fsRead`, `fsWrite`, `network`, `envAllow`); without it a catalog connector uses its entry's profile and any other server gets the workspace read-only with no network. See [the MCP sandbox](docs/DEFAULT_INTEGRATIONS.md#workspace-servers-permissions-and-output) |
 | `mcpPolicy` | Which MCP servers may start, must start, and extra tool rules; read only from the managed settings (see [Connector policy](#connector-policy)) |
 | `defaultSkills` | `false` leaves the bundled skills out of the system prompt |
@@ -564,6 +564,41 @@ catalog connector and catalog version, whether it was allowed and what decided i
 the sha256 of the arguments and an error class. Never the arguments or the output
 themselves. The log stays on your computer.
 
+### Hosted connectors
+
+Hosted connectors are SaaS connectors (GitHub, Linear, Notion and others) that you link
+once on the Zero-X dashboard (Connectors). Zero-X keeps their sign-in, so no token for
+them sits on your computer; Neuron reaches them through the gateway with your Zero-X
+sign-in (`neuron login`, or `NEURON_TOKEN` with an `nzx_` key in CI). They are off in
+this release: set `NEURON_HOSTED_CONNECTORS=1` to try them. Free plans include none;
+Pro and Max plans list theirs in the plan's connector policy.
+
+With them on, each hosted connector your plan includes appears in `/mcp` as a
+`managed` server of that name with transport `zerox`. Until you link it, the gateway
+answers that it is not linked and the server shows `needs connect`:
+`/mcp connect <server>` (or `neuron mcp connect <server>`) prints the page that links
+it and opens it in a browser, and `c` on its row in the MCP panel does the same. It is
+ready from the next turn after you link it. If the gateway refuses your sign-in, run
+`neuron login` again. You can also add one yourself:
+
+```json
+{
+  "mcpServers": {
+    "github": { "type": "zerox", "id": "github" }
+  }
+}
+```
+
+A hosted connector only ever reaches the gateway's own `/mcp/<id>`; a `url` naming any
+other address is refused, so your Zero-X sign-in never goes elsewhere. Its tools get the
+tier the connector's catalog entry pins (read tools run without asking; others need
+full access or your approval), and tools the catalog does not list need full access.
+For destructive tools (deleting, merging, running workflows) the gateway also wants to
+know that you approved the call: Neuron tells it so only for a call you approved in the
+permission prompt, so one that a rule or the permission mode allowed is refused by the
+gateway with an error asking for your confirmation. Turn one off like any other server
+(`/mcp disable <server>`).
+
 ## Environment variables
 
 | Variable | Used by | Purpose |
@@ -586,6 +621,7 @@ themselves. The log stays on your computer.
 | `NEURON_HOME` | neuron | Directory for the login file and caches (default `~/.neuroncli`); setting it also keeps the login out of the OS credential store |
 | `NEURON_CREDENTIAL_STORE` | neuron | `file` or `keychain`: force where the login is kept |
 | `NEURON_TRUST_WORKSPACE=1` | neuron | Trust the current directory in a headless run (only for checkouts you trust) |
+| `NEURON_HOSTED_CONNECTORS=1` | neuron | Turn on hosted connectors (off by default; see [Hosted connectors](#hosted-connectors)) |
 | `NEURON_NO_TUI=1` | neuron | Use the line REPL instead of the full-screen UI |
 | `NEURON_TUI_ASCII` | neuron-tui | `1` draws with the classic-console character set everywhere, `0` with the Unicode one |
 | `NEURON_VERSION` | install.sh, install.ps1 | Release to install (default: the latest release; a prerelease such as `7.0.0-alpha.3` must be named) |

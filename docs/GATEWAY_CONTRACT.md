@@ -366,3 +366,14 @@ Sync the copy in `neuron-v2`; nothing here changes what the CLI sends or must ha
   plan policy. The CLI caches the block for a day and keeps using an older one offline;
   machine-wide managed settings outrank it. Only ids and flags are sent, nothing about
   the user's own servers is reported back.
+- **Hosted connectors (2026-11-05).** `https://zero-x.live/mcp/<connector_id>` is a
+  Streamable HTTP MCP endpoint (MCP 2025-06-18) for each connector the user linked on
+  the dashboard, with `Authorization: Bearer <ses_ session or nzx_ key>`. `401`: sign
+  in again. `403` with `{"error": "needs_connect", "connect_url":
+  "https://zero-x.live/dashboard#connectors"}`: the user has not linked that connector
+  (the CLI opens `connect_url` only when it is on the gateway's origin). A call of a
+  destructive-tier tool must carry `x-neuron-confirmed: 1`, which the CLI sends only on
+  a call the user approved in its permission prompt; without it the proxy answers a
+  JSON-RPC error asking for confirmation. The CLI lists each id in
+  `policy.connectors.hosted` as a server (settings type `"zerox"`) and calls the
+  endpoint only while `NEURON_HOSTED_CONNECTORS=1`; nothing is deployed yet.

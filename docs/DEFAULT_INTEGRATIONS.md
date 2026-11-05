@@ -104,6 +104,10 @@ only ever sent to the server it was issued for. `neuron mcp logout <server>` rem
 it. When the server does not register clients itself, give its client under `oauth`:
 `clientId`, and optionally `callbackPort` and `authServerMetadataUrl`.
 
+A hosted connector (`"type": "zerox"`, `"id": "<connector>"`) is a remote server too,
+reached through the Zero-X gateway with your Zero-X sign-in instead of a sign-in of its
+own; see [hosted connectors](../USAGE.md#hosted-connectors).
+
 ### Workspace servers, permissions and output
 
 **Approval.** A server a workspace brings (from `.neuron/settings.json`,
