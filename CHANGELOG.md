@@ -5,6 +5,10 @@ The release workflow copies a version's section into its GitHub release notes.
 
 ## 7.0.0-alpha.4 (unreleased)
 
+- Full-screen UI: the agent's questions open a question form (pick a choice with ↑/↓
+  and Enter, or write your own answer) instead of a plain notice. The UI declares the
+  `questions` capability and answers with the `answer` command; Esc leaves the question
+  to the input, as before.
 - Full-screen UI: the status bar shows the Free token window as used/limit with its
   reset time (`Free · 5h 640K/1M · resets 14:20 · 37/100 req`; `640K/1M` when narrow),
   amber from 80% and red from 95%. Past its reset time the stale figures are left out.

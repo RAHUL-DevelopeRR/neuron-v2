@@ -34,7 +34,8 @@ import {
 import { handleGitViewsEvent, resetGitViews } from './git-views'
 import { handleMcpPanelEvent, resetMcpPanel } from './mcp-panel'
 import { FEATURE_TRUST_PREVIEW } from './protocol'
-import { QUESTION_PREFIX } from './questions'
+import { closeQuestionForm, openQuestionForm } from './question-form'
+import { QUESTION_PREFIX, questionNoticeText } from './questions'
 import { engineSessionOf, withEngineSession } from './session-run-state'
 import { StdioEngineClient } from './stdio-engine-client'
 
@@ -319,6 +320,17 @@ export function handleEngineEvent(event: UiEvent): void {
       }
       showNotice(engineNotice(event.message))
       return
+    case 'question':
+      // With the `questions` capability: answered with `answer` and this id.
+      engine.setPendingQuestion(event.question, event.id)
+      // A turn's question goes into its message (turn-events.ts); anywhere
+      // else it is a chat line.
+      if (!(turnActive && turnMessageId)) showSystemMessage(questionNoticeText(event))
+      // Options are picked in the question form (./question-form.ts).
+      openQuestionForm(event, (error) =>
+        showSystemMessage(error instanceof Error ? error.message : String(error)),
+      )
+      return
     case 'error':
       // A refused permission choice leaves nothing pending: the next
       // Shift+Tab cycles from what the status shows. A turn's own error is
@@ -348,6 +360,7 @@ export function handleEngineEvent(event: UiEvent): void {
       afterConsoleCommand()
       engine.clearPermissions()
       engine.setPendingQuestion(null)
+      closeQuestionForm()
       engine.setSignIn(null)
       dropTurnScopedNotices()
       forgetTurnRetries()
@@ -578,6 +591,7 @@ export function handleEngineExit(
   if (unexpected && exit.code !== FORCED_QUIT_EXIT_CODE) engineCrashed = true
   const shownInChat = unexpected && !turnShowsIt
   engine.setConnection('exited', reason, unexpected)
+  closeQuestionForm()
   if (shownInChat) showSystemMessage(reason)
 }
 

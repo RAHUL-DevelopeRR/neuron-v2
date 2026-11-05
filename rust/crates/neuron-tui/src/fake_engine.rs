@@ -231,6 +231,7 @@ pub mod samples {
             sessions(SessionScope::All),
             trust_preview(),
             workspace_trusted(),
+            question(),
         ]
     }
 
@@ -264,6 +265,10 @@ pub mod samples {
             EngineCommand::Slash {
                 command: "usage".into(),
                 args: String::new(),
+            },
+            EngineCommand::Answer {
+                id: 7,
+                text: "main".into(),
             },
         ]
         .into_iter()
@@ -369,6 +374,16 @@ pub mod samples {
                 model("glm-5.2", "GLM 5.2", false),
                 model("gemini-flash", "Gemini Flash", true),
             ],
+        }
+    }
+
+    /// The agent's AskUserQuestion, as a UI with [`CAPABILITY_QUESTIONS`] gets it.
+    #[must_use]
+    pub fn question() -> UiEvent {
+        UiEvent::Question {
+            id: 7,
+            question: "Which branch should the release go out from?".into(),
+            options: vec!["main".into(), "release/7.0".into()],
         }
     }
 

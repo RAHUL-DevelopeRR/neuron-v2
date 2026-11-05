@@ -8,3 +8,4 @@
 {"kind":"command","type":"switch_branch","name":"feat/tui-status-bar","create":false}
 {"kind":"command","type":"capabilities","features":["questions","reports"],"client":"terminal"}
 {"kind":"command","type":"slash","command":"usage","args":""}
+{"kind":"command","type":"answer","id":7,"text":"main"}

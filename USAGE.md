@@ -20,6 +20,12 @@ failing test"` opens the UI and sends that prompt first, and `neuron --resume SE
 opens it on a saved session, showing its conversation. Shell commands typed in the UI
 (`!cmd`, `/bash`) are not available yet.
 
+When the agent asks you something (its `AskUserQuestion` tool), the question appears
+where it was asked. If it offers choices, a form takes the input's place: ↑/↓ and
+Enter pick one, or write your own answer in its last field; Esc closes the form and
+the next thing you type answers instead. A question without choices is answered by
+typing in the input.
+
 The UI does not ask whether you trust the folder: until you do, the folder's own
 settings, hooks and MCP servers are not loaded, and `/status` says how to trust it
 (see [Workspace trust](#workspace-trust)).
