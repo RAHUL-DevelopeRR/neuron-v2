@@ -28,6 +28,7 @@ import {
   serverSummary,
   useMcpPanelStore,
 } from '../state/mcp-panel-store'
+import { displayWidth } from '../utils/display-width'
 import { BORDER_CHARS } from '../utils/ui-constants'
 
 import type { McpServerInfo } from '../engine/protocol'
@@ -135,7 +136,7 @@ export const McpPanel = ({
             {truncateToWidth(label, Math.max(6, Math.floor(rowWidth / 2)))}
           </span>
           <span fg={server.error ? theme.warning : theme.muted}>
-            {truncateToWidth(summary, Math.max(4, rowWidth - label.length))}
+            {truncateToWidth(summary, Math.max(4, rowWidth - displayWidth(label)))}
           </span>
         </text>
       )

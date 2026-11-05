@@ -18,11 +18,10 @@
  * context percentage are never dropped.
  */
 
-import stringWidth from 'string-width'
-
 import { meterCells, meterTone, displayPercent } from '../components/context-meter'
 import { needsSignIn } from '../state/engine-store'
 import { contextUsage } from './context-breakdown'
+import { cutToDisplayWidth, displayWidth as stringWidth } from './display-width'
 import { inferProvider, providerBadge } from './provider-badge'
 
 import type { GlyphMode } from './glyphs'
@@ -79,7 +78,6 @@ export const RIGHT_GAP = 2
 /** A branch name is not cut below this, nor a model name below {@link MODEL_MIN_COLUMNS}. */
 export const BRANCH_MIN_COLUMNS = 8
 export const MODEL_MIN_COLUMNS = 12
-const ELLIPSIS = '…'
 
 /** Levels the engine accepts from engines that report none per model. */
 export const DEFAULT_REASONING_EFFORTS = ['low', 'medium', 'high'] as const
@@ -420,16 +418,7 @@ export const COLLAPSE_STEPS: readonly Step[] = [
 ]
 
 /** `text` in `columns` columns, ending in "…" when it was cut. */
-export function cutToWidth(text: string, columns: number): string {
-  if (columns <= 0) return ''
-  if (stringWidth(text) <= columns) return text
-  let kept = ''
-  for (const char of text) {
-    if (stringWidth(kept + char) > columns - 1) break
-    kept += char
-  }
-  return kept + ELLIPSIS
-}
+export const cutToWidth = cutToDisplayWidth
 
 /** The segments for `view` at compaction `c`. */
 export function buildLine(view: StatusView, c: Compaction): StatusLine {
@@ -540,7 +529,7 @@ function windowTone(percent: number): StatusTone {
 function segmentsWidth(segments: StatusSegment[]): number {
   let width = 0
   segments.forEach((segment, index) => {
-    if (index > 0) width += segment.glue ? 1 : SEGMENT_SEPARATOR.length
+    if (index > 0) width += segment.glue ? 1 : stringWidth(SEGMENT_SEPARATOR)
     for (const span of segment.spans) width += stringWidth(span.text)
   })
   return width

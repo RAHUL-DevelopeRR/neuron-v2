@@ -25,6 +25,7 @@ import {
 import React from 'react'
 
 import { App } from './app'
+import { MinimumSizeGate } from './components/minimum-size-gate'
 import { parseArgs } from './cli-args'
 import {
   showConversationOfResumedSession,
@@ -289,7 +290,9 @@ async function main(): Promise<void> {
 
   createRoot(renderer).render(
     <QueryClientProvider client={queryClient}>
-      <AppRoot />
+      <MinimumSizeGate>
+        <AppRoot />
+      </MinimumSizeGate>
     </QueryClientProvider>,
   )
 }

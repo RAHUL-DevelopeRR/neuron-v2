@@ -5,6 +5,11 @@ The release workflow copies a version's section into its GitHub release notes.
 
 ## 7.0.0-alpha.4 (unreleased)
 
+- Full-screen UI: a terminal smaller than 60x16 gets a "Terminal too small" screen
+  (the chat stays open underneath), and `neuron` starts the line REPL in one with a
+  note. The status bar, the MCP panel and the model picker measure text in terminal
+  columns, so wide characters in a branch, email or model name no longer push the line
+  onto the next row.
 - Hosted connectors (off until `NEURON_HOSTED_CONNECTORS=1`): `"type": "zerox"` MCP
   servers reach a connector linked on the Zero-X dashboard through the gateway's
   `/mcp/<id>` with your Zero-X sign-in, and each hosted connector the plan's policy

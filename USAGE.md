@@ -24,6 +24,11 @@ The UI does not ask whether you trust the folder: until you do, the folder's own
 settings, hooks and MCP servers are not loaded, and `/status` says how to trust it
 (see [Workspace trust](#workspace-trust)).
 
+The UI needs a terminal of at least 60 columns by 16 rows. In a smaller one `neuron`
+starts the line REPL instead and says why; a terminal made smaller while the UI runs
+shows "Terminal too small" until it is big enough again (the chat and a running turn
+carry on underneath).
+
 `neuron --no-tui` (or `NEURON_NO_TUI=1`) keeps the line REPL, which also runs when the
 UI is missing. The first time you run it in a directory it asks whether you trust it;
 Neuron reads, writes and runs commands only after you agree. Press Ctrl+C to interrupt

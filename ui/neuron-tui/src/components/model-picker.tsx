@@ -28,6 +28,7 @@ import { getNeuronEngineClient } from '../engine/neuron-engine-client'
 import { setReasoningEffort } from '../engine/status-bar-actions'
 import { useTheme } from '../hooks/use-theme'
 import { useEngineStore } from '../state/engine-store'
+import { cutToDisplayWidth } from '../utils/display-width'
 import { formatElapsedTime } from '../utils/format-elapsed-time'
 import { formatTokenCount } from '../utils/format-token-count'
 import { logger } from '../utils/logger'
@@ -127,14 +128,7 @@ export function modelRows(models: ModelsEvent | null, now: number = Date.now()):
 
 /** `text` cut to `width` columns, ending in "…" when it was cut. */
 export function truncateToWidth(text: string, width: number): string {
-  if (width <= 0) return ''
-  if (stringWidth(text) <= width) return text
-  let kept = ''
-  for (const char of text) {
-    if (stringWidth(kept + char) > width - 1) break
-    kept += char
-  }
-  return `${kept}…`
+  return cutToDisplayWidth(text, width)
 }
 
 /** A row's parts as drawn: `current`, `marker` and `detail` keep their leading spaces. */

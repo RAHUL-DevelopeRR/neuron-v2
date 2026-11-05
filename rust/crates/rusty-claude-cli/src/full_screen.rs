@@ -6,7 +6,8 @@
 //! (`neuron engine --stdio`, found through `NEURON_BIN`). The line REPL stays
 //! one flag away: `--no-tui`, or `NEURON_NO_TUI=1`. Without the UI, or off a
 //! terminal, nothing changes. `--continue [chat-id]`, which the UI's exit hint
-//! names, is the UI's own flag: it is passed on to it.
+//! names, is the UI's own flag: it is passed on to it. A terminal smaller than the
+//! UI can draw in (60x16) keeps the line REPL, with a note saying so.
 
 use std::env;
 use std::ffi::OsString;
@@ -130,8 +131,33 @@ pub(crate) fn locate_ui(explicit: Option<OsString>, exe: &Path) -> Option<PathBu
     sibling.is_file().then_some(sibling)
 }
 
+/// The fewest columns and rows the full-screen UI draws in (`MIN_TERMINAL_COLUMNS` and
+/// `MIN_TERMINAL_ROWS` in ui/neuron-tui/src/components/minimum-size-gate.tsx): below it
+/// the prompt, the status bar and the panels overlap.
+pub(crate) const MIN_UI_COLUMNS: u16 = 60;
+pub(crate) const MIN_UI_ROWS: u16 = 16;
+
+/// Whether a terminal of `size` (columns, rows) is big enough for the UI. An unknown
+/// size, or a zero one (some embedded panes report that before their first resize),
+/// counts as big enough: the UI checks again itself and says when it is too small.
+pub(crate) fn fits_full_screen(size: Option<(u16, u16)>) -> bool {
+    match size {
+        Some((columns, rows)) if columns > 0 && rows > 0 => {
+            columns >= MIN_UI_COLUMNS && rows >= MIN_UI_ROWS
+        }
+        _ => true,
+    }
+}
+
+/// Why the line REPL runs in place of the UI in a small terminal.
+fn too_small_note(columns: u16, rows: u16) -> String {
+    format!(
+        "The terminal is {columns}x{rows}; the full-screen UI needs {MIN_UI_COLUMNS}x{MIN_UI_ROWS}, so the line REPL runs. Make the window bigger and start neuron again to use the UI."
+    )
+}
+
 /// The UI to start instead of the line REPL, or `None`: turned off, not on a
-/// terminal, or not installed.
+/// terminal, a terminal too small for it (with a note on stderr), or not installed.
 pub(crate) fn ui_binary(no_tui_flag: bool) -> Option<PathBuf> {
     if no_tui_flag || env_truthy("NEURON_NO_TUI") {
         return None;
@@ -140,7 +166,15 @@ pub(crate) fn ui_binary(no_tui_flag: bool) -> Option<PathBuf> {
         return None;
     }
     let exe = env::current_exe().ok()?;
-    locate_ui(env::var_os("NEURON_TUI_BIN"), &exe)
+    let ui = locate_ui(env::var_os("NEURON_TUI_BIN"), &exe)?;
+    let size = crossterm::terminal::size().ok();
+    if !fits_full_screen(size) {
+        if let Some((columns, rows)) = size {
+            eprintln!("{}", too_small_note(columns, rows));
+        }
+        return None;
+    }
+    Some(ui)
 }
 
 /// The UI's arguments for a REPL launch, or `None` when it can't carry one of
@@ -502,6 +536,21 @@ mod tests {
                 "--explain the build",
             ]))
         );
+    }
+
+    #[test]
+    fn a_terminal_smaller_than_the_ui_needs_keeps_the_line_repl() {
+        assert!(fits_full_screen(Some((MIN_UI_COLUMNS, MIN_UI_ROWS))));
+        assert!(fits_full_screen(Some((200, 50))));
+        assert!(!fits_full_screen(Some((MIN_UI_COLUMNS - 1, 50))));
+        assert!(!fits_full_screen(Some((200, MIN_UI_ROWS - 1))));
+        // Unknown, or reported as zero before the first resize: the UI checks itself.
+        assert!(fits_full_screen(None));
+        assert!(fits_full_screen(Some((0, 0))));
+        let note = too_small_note(40, 10);
+        assert!(note.contains("40x10"), "{note}");
+        assert!(note.contains("60x16"), "{note}");
+        assert!(!note.to_ascii_lowercase().contains("claude"), "{note}");
     }
 
     #[test]
