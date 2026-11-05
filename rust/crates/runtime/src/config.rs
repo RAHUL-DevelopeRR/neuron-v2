@@ -7,6 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::json::JsonValue;
+use crate::mcp_policy::{ManagedMcpPolicy, McpPolicyStatus, McpRequirement};
 use crate::model_routing::ModelRoutingSettings;
 use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
 
@@ -20,6 +21,9 @@ pub enum ConfigSource {
     User,
     Project,
     Local,
+    /// The machine-wide managed settings ([`crate::mcp_policy::managed_settings_path`]):
+    /// loaded last, so nothing overrides them.
+    Managed,
 }
 
 /// Effective permission mode after decoding config values.
@@ -152,17 +156,26 @@ pub struct McpConfigCollection {
     /// Workspace servers that are new or changed since the user approved them (see
     /// [`crate::mcp_approvals`]); they do not start.
     needs_approval: BTreeMap<String, ScopedMcpServerConfig>,
-    /// Servers a `permissions.deny` rule refuses whole (`mcp__<server>`); they do not
-    /// start.
+    /// Servers a `permissions.deny` rule refuses whole (`mcp__<server>`), or the
+    /// connector policy refuses ([`crate::mcp_policy`]); they do not start.
     blocked: BTreeMap<String, BlockedMcpServer>,
+    /// Servers the connector policy requires: on, and they cannot be turned off.
+    required: BTreeMap<String, McpRequirement>,
+    /// Which connector policies applied.
+    policy: McpPolicyStatus,
 }
 
-/// A configured MCP server that does not start because a rule refuses all its tools.
+/// A configured MCP server that does not start because a rule or the connector policy
+/// refuses it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockedMcpServer {
     pub server: ScopedMcpServerConfig,
-    /// The `permissions.deny` rule.
+    /// The `permissions.deny` rule, or the policy entry (`mcpPolicy.deny: slack`).
     pub rule: String,
+    /// Why, as `/mcp` shows it.
+    pub reason: String,
+    /// The connector policy that refuses it; `None` for a `permissions.deny` rule.
+    pub policy: Option<crate::mcp_policy::McpPolicySource>,
 }
 
 /// MCP server config paired with the scope that defined it.
@@ -353,14 +366,17 @@ pub struct ConfigLoader {
     project_trust: ProjectTrust,
     /// Workspace MCP servers start only once approved ([`crate::mcp_approvals`]).
     mcp_approvals: bool,
+    /// The machine-wide managed settings file, loaded last ([`ConfigSource::Managed`]).
+    managed_settings: Option<PathBuf>,
 }
 
 impl ConfigLoader {
-    /// Loader with explicit paths that applies workspace settings in full and
-    /// starts workspace MCP servers without approval. Production code uses
-    /// [`ConfigLoader::default_for`], which checks workspace trust and approvals;
-    /// call [`ConfigLoader::with_project_trust`] and
-    /// [`ConfigLoader::with_mcp_approvals`] to change them.
+    /// Loader with explicit paths that applies workspace settings in full,
+    /// starts workspace MCP servers without approval and reads no managed settings.
+    /// Production code uses [`ConfigLoader::default_for`], which checks workspace trust
+    /// and approvals and reads the machine's managed settings; call
+    /// [`ConfigLoader::with_project_trust`], [`ConfigLoader::with_mcp_approvals`] and
+    /// [`ConfigLoader::with_managed_settings`] to change them.
     #[must_use]
     pub fn new(cwd: impl Into<PathBuf>, config_home: impl Into<PathBuf>) -> Self {
         Self {
@@ -368,6 +384,7 @@ impl ConfigLoader {
             config_home: config_home.into(),
             project_trust: ProjectTrust::Trusted,
             mcp_approvals: false,
+            managed_settings: None,
         }
     }
 
@@ -382,6 +399,7 @@ impl ConfigLoader {
             config_home,
             project_trust: ProjectTrust::FromWorkspaceTrust,
             mcp_approvals: true,
+            managed_settings: crate::mcp_policy::managed_settings_path(),
         }
     }
 
@@ -397,6 +415,19 @@ impl ConfigLoader {
     pub fn with_mcp_approvals(mut self, required: bool) -> Self {
         self.mcp_approvals = required;
         self
+    }
+
+    /// Reads `path` as the managed settings (`None`: none).
+    #[must_use]
+    pub fn with_managed_settings(mut self, path: Option<PathBuf>) -> Self {
+        self.managed_settings = path;
+        self
+    }
+
+    /// The managed settings file this loader reads, if any.
+    #[must_use]
+    pub fn managed_settings_path(&self) -> Option<&Path> {
+        self.managed_settings.as_deref()
     }
 
     #[must_use]
@@ -453,6 +484,12 @@ impl ConfigLoader {
                 path: self.cwd.join(".neuron").join("settings.local.json"),
             },
         ];
+        if let Some(path) = &self.managed_settings {
+            entries.push(ConfigEntry {
+                source: ConfigSource::Managed,
+                path: path.clone(),
+            });
+        }
         let mut seen = BTreeSet::new();
         entries.retain(|entry| seen.insert((entry.source, entry.path.clone())));
         entries
@@ -494,7 +531,26 @@ impl ConfigLoader {
         let mut ignored_project_settings = Vec::new();
         // `disabledMcpServers` adds up across files: a server off anywhere stays off.
         let mut disabled_mcp_servers = BTreeSet::new();
+        let mut managed_policy = None;
+        let mut managed_path = None;
         for (entry, mut object) in parsed_entries {
+            if entry.source == ConfigSource::Managed {
+                // Managed rules join everyone's instead of replacing them: a user's own
+                // deny rules stay, and a managed deny wins over any allow rule.
+                union_permission_rules(&mut merged, &mut object);
+                if let Some(policy) = object.remove("mcpPolicy") {
+                    managed_policy = Some(ManagedMcpPolicy::parse(
+                        &policy,
+                        &format!("{}: mcpPolicy", entry.path.display()),
+                    )?);
+                    managed_path = Some(entry.path.clone());
+                }
+            } else if object.remove("mcpPolicy").is_some() {
+                warn_once(&format!(
+                    "warning: ignoring mcpPolicy in {}: only the managed settings set the connector policy",
+                    entry.path.display()
+                ));
+            }
             if is_workspace_entry(&entry) {
                 ignored_project_settings.extend(apply_workspace_policy(
                     &entry.path,
@@ -524,27 +580,15 @@ impl ConfigLoader {
         warn_ignored_project_settings(&ignored_project_settings);
 
         if optional_bool(&merged, "defaultMcpServers", "merged settings")? != Some(false) {
-            for (name, package, entry_variable) in [
-                (
-                    "codebase-memory",
-                    "codebase-memory-mcp@0.11.0",
-                    "NEURON_CODEBASE_MCP_ENTRY",
-                ),
-                (
-                    "playwright",
-                    "@playwright/mcp@0.0.83",
-                    "NEURON_PLAYWRIGHT_MCP_ENTRY",
-                ),
-            ] {
-                mcp_servers
-                    .entry(name.to_string())
-                    .or_insert_with(|| ScopedMcpServerConfig {
-                        scope: ConfigSource::Bundled,
-                        config: McpServerConfig::Stdio(default_mcp_stdio_config(
-                            package,
-                            entry_variable,
-                        )),
-                    });
+            for (name, _, _) in BUNDLED_MCP_SERVERS {
+                if let Some(config) = bundled_mcp_server_config(name) {
+                    mcp_servers
+                        .entry(name.to_string())
+                        .or_insert_with(|| ScopedMcpServerConfig {
+                            scope: ConfigSource::Bundled,
+                            config,
+                        });
+                }
             }
         }
         let mut disabled_servers = BTreeMap::new();
@@ -554,9 +598,30 @@ impl ConfigLoader {
             }
         }
 
+        let now = crate::mcp_policy::unix_now();
+        let gateway_policy = crate::mcp_policy::read_gateway_policy(&self.config_home, now);
+        let policy = crate::mcp_policy::apply_mcp_policy(
+            &mut mcp_servers,
+            &mut disabled_servers,
+            &crate::mcp_policy::McpPolicyInputs {
+                managed: managed_policy.as_ref(),
+                managed_path: managed_path.as_deref(),
+                gateway: &gateway_policy,
+                bundled: &bundled_mcp_server_config,
+                now,
+            },
+        );
+        for warning in &policy.warnings {
+            warn_once(&format!("warning: {warning}"));
+        }
+
         let merged_value = JsonValue::Object(merged.clone());
-        let permission_rules = parse_optional_permission_rules(&merged_value)?;
-        let blocked_servers = take_blocked_mcp_servers(&mut mcp_servers, &permission_rules);
+        let mut permission_rules = parse_optional_permission_rules(&merged_value)?;
+        if let Some(managed) = &managed_policy {
+            permission_rules.extend(&managed.tool_rules);
+        }
+        let mut blocked_servers = take_blocked_mcp_servers(&mut mcp_servers, &permission_rules);
+        blocked_servers.extend(policy.blocked);
         let unapproved_servers = if self.mcp_approvals {
             self.take_unapproved_mcp_servers(&mut mcp_servers)
         } else {
@@ -571,6 +636,8 @@ impl ConfigLoader {
                 disabled: disabled_servers,
                 needs_approval: unapproved_servers,
                 blocked: blocked_servers,
+                required: policy.required,
+                policy: policy.status,
             },
             oauth: parse_optional_oauth_config(&merged_value, "merged settings.oauth")?,
             model: parse_optional_model(&merged_value),
@@ -903,14 +970,39 @@ fn union_workspace_deny_rules(
     merged: &mut BTreeMap<String, JsonValue>,
     object: &mut BTreeMap<String, JsonValue>,
 ) {
+    union_rule_lists(merged, object, &["deny"]);
+}
+
+/// Moves the managed settings' `permissions.allow`, `deny` and `ask` rules into the
+/// merged settings as unions, so they add to everyone else's rules.
+fn union_permission_rules(
+    merged: &mut BTreeMap<String, JsonValue>,
+    object: &mut BTreeMap<String, JsonValue>,
+) {
+    union_rule_lists(merged, object, &["allow", "deny", "ask"]);
+}
+
+/// Moves the rule `lists` of `object`'s `permissions` into `merged` as unions.
+fn union_rule_lists(
+    merged: &mut BTreeMap<String, JsonValue>,
+    object: &mut BTreeMap<String, JsonValue>,
+    lists: &[&str],
+) {
     let Some(JsonValue::Object(permissions)) = object.get_mut("permissions") else {
         return;
     };
-    let Some(JsonValue::Array(rules)) = permissions.remove("deny") else {
-        return;
-    };
+    let mut taken = Vec::new();
+    for list in lists {
+        if let Some(JsonValue::Array(rules)) = permissions.get(*list) {
+            taken.push((*list, rules.clone()));
+            permissions.remove(*list);
+        }
+    }
     if permissions.is_empty() {
         object.remove("permissions");
+    }
+    if taken.is_empty() {
+        return;
     }
     let merged_permissions = merged
         .entry("permissions".to_string())
@@ -918,13 +1010,15 @@ fn union_workspace_deny_rules(
     let JsonValue::Object(merged_permissions) = merged_permissions else {
         return;
     };
-    let deny = merged_permissions
-        .entry("deny".to_string())
-        .or_insert_with(|| JsonValue::Array(Vec::new()));
-    if let JsonValue::Array(existing) = deny {
-        for rule in rules {
-            if !existing.contains(&rule) {
-                existing.push(rule);
+    for (list, rules) in taken {
+        let existing = merged_permissions
+            .entry(list.to_string())
+            .or_insert_with(|| JsonValue::Array(Vec::new()));
+        if let JsonValue::Array(existing) = existing {
+            for rule in rules {
+                if !existing.contains(&rule) {
+                    existing.push(rule);
+                }
             }
         }
     }
@@ -979,6 +1073,44 @@ fn warn_ignored_project_settings(ignored: &[IgnoredProjectSettings]) {
         if warned.insert(message.clone()) {
             crate::ui_hooks::notice(&format!("warning: {message}"));
         }
+    }
+}
+
+/// The MCP servers Neuron ships and starts unless `"defaultMcpServers": false`: name,
+/// pinned package, and the variable that points at a locally installed entry script.
+const BUNDLED_MCP_SERVERS: [(&str, &str, &str); 2] = [
+    (
+        "codebase-memory",
+        "codebase-memory-mcp@0.11.0",
+        "NEURON_CODEBASE_MCP_ENTRY",
+    ),
+    (
+        "playwright",
+        "@playwright/mcp@0.0.83",
+        "NEURON_PLAYWRIGHT_MCP_ENTRY",
+    ),
+];
+
+/// How the bundled server `name` starts; `None` for any other name.
+fn bundled_mcp_server_config(name: &str) -> Option<McpServerConfig> {
+    BUNDLED_MCP_SERVERS
+        .iter()
+        .find(|(bundled, _, _)| *bundled == name)
+        .map(|(_, package, entry_variable)| {
+            McpServerConfig::Stdio(default_mcp_stdio_config(package, entry_variable))
+        })
+}
+
+/// Shows `message` once per process; the loader runs many times per session.
+fn warn_once(message: &str) {
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<BTreeSet<String>>> =
+        std::sync::OnceLock::new();
+    let warned = WARNED.get_or_init(|| std::sync::Mutex::new(BTreeSet::new()));
+    let Ok(mut warned) = warned.lock() else {
+        return;
+    };
+    if warned.insert(message.to_string()) {
+        crate::ui_hooks::notice(message);
     }
 }
 
@@ -1360,6 +1492,21 @@ impl RuntimePermissionRuleConfig {
     pub fn ask(&self) -> &[String] {
         &self.ask
     }
+
+    /// Adds `other`'s rules that are not here yet.
+    pub fn extend(&mut self, other: &Self) {
+        for (mine, theirs) in [
+            (&mut self.allow, &other.allow),
+            (&mut self.deny, &other.deny),
+            (&mut self.ask, &other.ask),
+        ] {
+            for rule in theirs {
+                if !mine.contains(rule) {
+                    mine.push(rule.clone());
+                }
+            }
+        }
+    }
 }
 
 impl McpConfigCollection {
@@ -1385,10 +1532,22 @@ impl McpConfigCollection {
         &self.needs_approval
     }
 
-    /// Servers a deny rule refuses whole; they do not start.
+    /// Servers a deny rule or the connector policy refuses; they do not start.
     #[must_use]
     pub fn blocked(&self) -> &BTreeMap<String, BlockedMcpServer> {
         &self.blocked
+    }
+
+    /// Servers the connector policy requires; they cannot be turned off or removed.
+    #[must_use]
+    pub fn required(&self) -> &BTreeMap<String, McpRequirement> {
+        &self.required
+    }
+
+    /// Which connector policies applied while loading.
+    #[must_use]
+    pub fn policy(&self) -> &McpPolicyStatus {
+        &self.policy
     }
 }
 
@@ -1474,7 +1633,16 @@ fn take_blocked_mcp_servers(
         .into_iter()
         .filter_map(|(name, rule)| {
             let server = servers.remove(&name)?;
-            Some((name, BlockedMcpServer { server, rule }))
+            let reason = format!("refused by the permissions.deny rule '{rule}'");
+            Some((
+                name,
+                BlockedMcpServer {
+                    server,
+                    rule,
+                    reason,
+                    policy: None,
+                },
+            ))
         })
         .collect()
 }
@@ -1890,7 +2058,7 @@ fn parse_optional_mcp_oauth_config(
     }))
 }
 
-fn expect_object<'a>(
+pub(crate) fn expect_object<'a>(
     value: &'a JsonValue,
     context: &str,
 ) -> Result<&'a BTreeMap<String, JsonValue>, ConfigError> {
@@ -1924,7 +2092,7 @@ fn optional_string<'a>(
     }
 }
 
-fn optional_bool(
+pub(crate) fn optional_bool(
     object: &BTreeMap<String, JsonValue>,
     key: &str,
     context: &str,
@@ -2019,7 +2187,7 @@ fn parse_bool_map(value: &JsonValue, context: &str) -> Result<BTreeMap<String, b
         .collect()
 }
 
-fn optional_string_array(
+pub(crate) fn optional_string_array(
     object: &BTreeMap<String, JsonValue>,
     key: &str,
     context: &str,

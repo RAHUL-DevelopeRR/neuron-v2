@@ -40,6 +40,7 @@ pub mod mcp_install;
 pub mod mcp_lifecycle_hardened;
 mod mcp_oauth;
 pub mod mcp_output;
+pub mod mcp_policy;
 pub mod mcp_server;
 mod mcp_stdio;
 #[cfg(test)]
@@ -171,6 +172,11 @@ pub use mcp_oauth::{
 };
 pub use mcp_output::{
     default_mcp_spill_dir, format_mcp_tool_output, McpToolOutput, MCP_OUTPUT_MAX_CHARS,
+};
+pub use mcp_policy::{
+    clear_gateway_policy, managed_settings_path, read_gateway_policy, store_gateway_policy,
+    GatewayConnectorPolicy, GatewayPolicyCache, ManagedMcpPolicy, McpGatewayPolicyStatus,
+    McpPolicySource, McpPolicyStatus, McpRequirement,
 };
 pub use mcp_server::{McpServer, McpServerSpec, ToolCallHandler, MCP_SERVER_PROTOCOL_VERSION};
 pub use mcp_stdio::{

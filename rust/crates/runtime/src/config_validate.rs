@@ -210,6 +210,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         expected: FieldType::StringArray,
     },
     FieldSpec {
+        name: "mcpPolicy",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
         name: "provider",
         expected: FieldType::String,
     },
@@ -305,6 +309,58 @@ const PLUGINS_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         name: "maxOutputTokens",
         expected: FieldType::Number,
+    },
+];
+
+/// `mcpPolicy` (read only from the managed settings; see `crate::mcp_policy`).
+const MCP_POLICY_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "allow",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "deny",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "required",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "allowUnvetted",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "allowStdio",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "allowedRemoteHosts",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "toolRules",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "failClosed",
+        expected: FieldType::Bool,
+    },
+];
+
+/// `mcpPolicy.toolRules`.
+const MCP_TOOL_RULES_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "allow",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "deny",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "ask",
+        expected: FieldType::StringArray,
     },
 ];
 
@@ -551,6 +607,24 @@ pub fn validate_config_file(
             source,
             &path_display,
         ));
+    }
+    if let Some(policy) = object.get("mcpPolicy").and_then(JsonValue::as_object) {
+        result.merge(validate_object_keys(
+            policy,
+            MCP_POLICY_FIELDS,
+            "mcpPolicy",
+            source,
+            &path_display,
+        ));
+        if let Some(rules) = policy.get("toolRules").and_then(JsonValue::as_object) {
+            result.merge(validate_object_keys(
+                rules,
+                MCP_TOOL_RULES_FIELDS,
+                "mcpPolicy.toolRules",
+                source,
+                &path_display,
+            ));
+        }
     }
     if let Some(oauth) = object.get("oauth").and_then(JsonValue::as_object) {
         result.merge(validate_object_keys(

@@ -77,6 +77,12 @@ pub fn set_mcp_server_enabled(
     if !enabled {
         let config = loader.load().map_err(|error| error.to_string())?;
         let mcp = config.mcp();
+        if let Some(requirement) = mcp.required().get(name) {
+            return Err(format!(
+                "`{name}` is required by {} and cannot be turned off",
+                requirement.by.describe()
+            ));
+        }
         let configured = mcp.get(name).is_some()
             || mcp.disabled().contains_key(name)
             || mcp.needs_approval().contains_key(name)

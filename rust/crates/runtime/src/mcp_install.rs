@@ -234,7 +234,7 @@ impl McpInstallScope {
             ConfigSource::User => Some(Self::User),
             ConfigSource::Project => Some(Self::Project),
             ConfigSource::Local => Some(Self::Local),
-            ConfigSource::Bundled => None,
+            ConfigSource::Bundled | ConfigSource::Managed => None,
         }
     }
 }
@@ -361,6 +361,17 @@ fn install_from_catalog(
     let written = entry.settings_entry(&values);
     let config =
         parse_mcp_server_json(&name, &written.to_string()).map_err(|error| error.to_string())?;
+    // A server the connector policy refuses would never start: say so instead of
+    // writing it.
+    if let Ok(loaded) = loader.load() {
+        let candidate = crate::config::ScopedMcpServerConfig {
+            scope: ConfigSource::User,
+            config: config.clone(),
+        };
+        if let Some(reason) = loaded.mcp().policy().refusal(&name, &candidate) {
+            return Err(format!("`{id}` cannot be added: {reason}"));
+        }
+    }
 
     let settings_path = scope.settings_path(loader);
     let mut object = read_object(&settings_path)?;
@@ -489,6 +500,19 @@ pub fn remove_mcp_server(
     if name.is_empty() {
         return Err("name an MCP server".to_string());
     }
+    let required = loader.load().ok().and_then(|config| {
+        config
+            .mcp()
+            .required()
+            .get(name)
+            .map(|required| required.by)
+    });
+    if let Some(by) = required {
+        return Err(format!(
+            "`{name}` is required by {} and cannot be removed",
+            by.describe()
+        ));
+    }
     let scopes = match scope {
         Some(scope) => vec![scope],
         None => McpInstallScope::ALL.to_vec(),
@@ -589,6 +613,9 @@ fn remove_refusal(loader: &ConfigLoader, name: &str, scope: Option<McpInstallSco
             .map(|server| server.scope)
     });
     match (configured, scope) {
+        (Some(ConfigSource::Managed), _) => format!(
+            "`{name}` is set by the managed settings; ask the administrator of this computer to change them"
+        ),
         (Some(ConfigSource::Bundled), _) => format!(
             "`{name}` ships with Neuron; turn it off with /mcp disable {name}, or set \"defaultMcpServers\": false"
         ),
@@ -680,6 +707,45 @@ mod tests {
                 token.to_string(),
             )]),
         }
+    }
+
+    #[test]
+    fn the_connector_policy_refuses_adding_a_denied_connector_and_removing_a_required_one() {
+        install_memory_store();
+        let root = temp_root("policy");
+        let managed = root.join("managed-settings.json");
+        fs::write(
+            &managed,
+            r#"{"mcpPolicy":{"deny":["github"],"required":["fetch"]}}"#,
+        )
+        .unwrap();
+        let loader =
+            loader(&root, ProjectTrust::Trusted).with_managed_settings(Some(managed.clone()));
+
+        let refused = install_mcp_server(&loader, &github("gh-denied", "ghp_x", None))
+            .expect_err("a denied connector is not added");
+        assert!(refused.contains("mcpPolicy.deny"), "{refused}");
+        let user_settings = root.join("home").join("settings.json");
+        assert!(
+            !user_settings.exists()
+                || !fs::read_to_string(&user_settings)
+                    .unwrap()
+                    .contains("gh-denied"),
+            "nothing is written"
+        );
+        assert_eq!(
+            super::load_mcp_secret("gh-denied", "GITHUB_PERSONAL_ACCESS_TOKEN").unwrap(),
+            None,
+            "nor kept in the keychain"
+        );
+
+        let refused = remove_mcp_server(&loader, "fetch", None)
+            .expect_err("a required connector is not removed");
+        assert!(
+            refused.contains("required by managed settings"),
+            "{refused}"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

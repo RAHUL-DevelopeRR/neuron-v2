@@ -4582,6 +4582,7 @@ fn config_source_label(source: ConfigSource) -> &'static str {
         ConfigSource::User => "user",
         ConfigSource::Project => "project",
         ConfigSource::Local => "local",
+        ConfigSource::Managed => "managed",
     }
 }
 
@@ -4718,6 +4719,7 @@ fn config_source_id(source: ConfigSource) -> &'static str {
         ConfigSource::User => "user",
         ConfigSource::Project => "project",
         ConfigSource::Local => "local",
+        ConfigSource::Managed => "managed",
     }
 }
 

@@ -192,10 +192,7 @@ pub fn approve_mcp_server(loader: &ConfigLoader, name: &str) -> Result<McpApprov
         return Ok(outcome(false, false));
     }
     if let Some(blocked) = config.mcp().blocked().get(name) {
-        return Err(format!(
-            "`{name}` is refused by the permissions.deny rule '{}', so it does not start",
-            blocked.rule
-        ));
+        return Err(format!("`{name}` does not start: {}", blocked.reason));
     }
     // A disabled server is set aside before approvals are checked, so whether it is
     // approved is looked up here; approving it now saves a step once it is enabled.

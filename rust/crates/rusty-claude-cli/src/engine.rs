@@ -953,6 +953,7 @@ fn config_scope_id(scope: ConfigSource) -> &'static str {
         ConfigSource::User => "user",
         ConfigSource::Project => "project",
         ConfigSource::Local => "local",
+        ConfigSource::Managed => "managed",
     }
 }
 
