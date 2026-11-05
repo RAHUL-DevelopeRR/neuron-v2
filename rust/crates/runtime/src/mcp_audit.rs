@@ -69,9 +69,8 @@ fn resource_target(tool_name: &str, input: &str) -> Option<AuditTarget> {
         "ReadMcpResourceTool" => "resources/read",
         _ => return None,
     };
-    let value = crate::tool_input::parse_tool_input(input)
-        .map(|parsed| parsed.value)
-        .unwrap_or(Value::Null);
+    let value =
+        crate::tool_input::parse_tool_input(input).map_or(Value::Null, |parsed| parsed.value);
     let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_string);
     let arguments = if label == "resources/read" {
         text("uri").unwrap_or_default()
@@ -272,6 +271,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn a_line_names_the_call_and_never_its_text() {
         let root = std::env::temp_dir().join(format!(
             "neuron-mcp-audit-{}-{}",
