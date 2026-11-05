@@ -440,7 +440,7 @@ with Neuron's own environment, including any keys you exported.
 | `~/.neuron/settings.json` | Your defaults (the directory moves with `NEURON_CONFIG_HOME`) |
 | `.neuron/settings.json` | Project settings, safe to commit |
 | `.neuron/settings.local.json` | Your overrides for this project; keep it out of version control |
-| `managed-settings.json` in `%ProgramData%\Neuron` (Windows), `/Library/Application Support/Neuron` (macOS) or `/etc/neuron` (Linux) | Managed settings an administrator sets for the whole computer; nothing overrides them (see [Connector policy](#connector-policy)) |
+| `managed-settings.json` in `C:\Program Files\Neuron` (Windows: the Program Files folder Windows reports), `/Library/Application Support/Neuron` (macOS) or `/etc/neuron` (Linux) | Managed settings an administrator sets for the whole computer; nothing overrides them (see [Connector policy](#connector-policy)) |
 
 Later files override earlier ones. `/config` shows the merged result. Settings are
 checked when they load: an unknown key or a value of the wrong type is an error that
@@ -496,8 +496,13 @@ or put it in your user settings.
 
 Two policies decide which MCP servers may start, the first one winning:
 
-- **Managed settings**, `managed-settings.json` in a folder only an administrator can
-  write (the paths are in the table above). It loads after every other settings file,
+- **Managed settings**, `managed-settings.json` in a system folder (the paths are in
+  the table above). Neuron reads it only when no one but an administrator can have
+  written it: the file, its folder and the system folder above must be owned by SYSTEM,
+  Administrators or TrustedInstaller on Windows (root on macOS and Linux) and no other
+  account may change them. Otherwise the file is ignored, with a warning, so an
+  administrator who creates the folder should keep its default permissions. No
+  environment variable moves the file. It loads after every other settings file,
   so nothing overrides it. Its `permissions` rules are added to everyone's rather than
   replacing them, and only there is `mcpPolicy` read (anywhere else it is ignored, with
   a warning).

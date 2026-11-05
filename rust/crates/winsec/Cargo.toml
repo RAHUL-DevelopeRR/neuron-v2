@@ -1,0 +1,33 @@
+[package]
+name = "winsec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Who may change a file on Windows (its owner and access control list), and where
+# Windows keeps Program Files. Like `winjob`, it may use `unsafe` because Win32
+# calls need FFI: the unsafe surface is a single module (`imp`) of thin wrappers,
+# and everything it exports is safe. On other platforms the crate is empty.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Com",
+    "Win32_System_SystemServices",
+    "Win32_UI_Shell",
+] }
+
+# The workspace lints, except that `unsafe_code` is `deny` (not `forbid`) so
+# the FFI module alone can opt in.
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_panics_doc = "allow"
+missing_errors_doc = "allow"

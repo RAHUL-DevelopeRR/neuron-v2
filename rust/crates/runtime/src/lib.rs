@@ -176,9 +176,10 @@ pub use mcp_output::{
     default_mcp_spill_dir, format_mcp_tool_output, McpToolOutput, MCP_OUTPUT_MAX_CHARS,
 };
 pub use mcp_policy::{
-    clear_gateway_policy, managed_settings_path, read_gateway_policy, store_gateway_policy,
-    GatewayConnectorPolicy, GatewayPolicyCache, ManagedMcpPolicy, McpGatewayPolicyStatus,
-    McpPolicySource, McpPolicyStatus, McpRequirement,
+    check_managed_settings_owner, clear_gateway_policy, managed_settings_path,
+    managed_settings_root, read_gateway_policy, store_gateway_policy, GatewayConnectorPolicy,
+    GatewayPolicyCache, ManagedMcpPolicy, McpGatewayPolicyStatus, McpPolicySource, McpPolicyStatus,
+    McpRequirement,
 };
 pub use mcp_server::{McpServer, McpServerSpec, ToolCallHandler, MCP_SERVER_PROTOCOL_VERSION};
 pub use mcp_stdio::{

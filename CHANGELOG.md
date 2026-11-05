@@ -6,8 +6,9 @@ The release workflow copies a version's section into its GitHub release notes.
 ## 7.0.0-alpha.4 (unreleased)
 
 - Connector policy: machine-wide managed settings (`managed-settings.json` in
-  `%ProgramData%\Neuron`, `/Library/Application Support/Neuron` or `/etc/neuron`) load
-  last and cannot be overridden; their `mcpPolicy` allows, denies and requires MCP
+  `C:\Program Files\Neuron`, `/Library/Application Support/Neuron` or `/etc/neuron`,
+  read only when no one but an administrator can have written the file or its folders)
+  load last and cannot be overridden; their `mcpPolicy` allows, denies and requires MCP
   servers, limits stdio servers, unvetted servers and remote hosts, adds tool rules
   (deny always wins) and can fail closed. The Zero-X plan's `policy.connectors` from
   `/api/account` (contract v1.3) is cached in `~/.neuron/policy-cache.json` and applies

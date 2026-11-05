@@ -4,8 +4,9 @@
 //! before the deny rules and workspace approvals.
 //!
 //! Two sources, the first one winning:
-//! - **Managed settings**: `managed-settings.json` in a machine-wide folder only an
-//!   administrator can write ([`managed_settings_path`]). It loads last
+//! - **Managed settings**: `managed-settings.json` in a machine-wide folder
+//!   ([`managed_settings_path`]), read only when no one but an administrator can have
+//!   written it or its folders ([`check_managed_settings_owner`]). It loads last
 //!   ([`ConfigSource::Managed`]), so no other settings file overrides it, and only there
 //!   is `mcpPolicy` read ([`ManagedMcpPolicy`]).
 //! - **The Zero-X plan**: `policy.connectors` in `GET /api/account` (contract v1.3),
@@ -45,23 +46,101 @@ pub const GATEWAY_POLICY_CACHE_FILE: &str = "policy-cache.json";
 /// with a warning, unless the managed settings fail closed.
 pub const GATEWAY_POLICY_TTL_SECS: u64 = 24 * 60 * 60;
 
-/// The machine-wide managed settings file: `%ProgramData%\Neuron\managed-settings.json`
+/// The system folder that holds the managed settings' own folder: Program Files on
+/// Windows (as Windows reports it, not the `ProgramFiles` environment variable),
+/// `/Library/Application Support` on macOS, `/etc` elsewhere. By default only an
+/// administrator can add to it; [`check_managed_settings_owner`] verifies that before
+/// the file is trusted.
+#[must_use]
+pub fn managed_settings_root() -> PathBuf {
+    #[cfg(windows)]
+    {
+        winsec::program_files_dir().unwrap_or_else(|| PathBuf::from(r"C:\Program Files"))
+    }
+    #[cfg(not(windows))]
+    {
+        if cfg!(target_os = "macos") {
+            PathBuf::from("/Library/Application Support")
+        } else {
+            PathBuf::from("/etc")
+        }
+    }
+}
+
+/// The machine-wide managed settings file: `C:\Program Files\Neuron\managed-settings.json`
 /// on Windows, `/Library/Application Support/Neuron/managed-settings.json` on macOS,
 /// `/etc/neuron/managed-settings.json` elsewhere. No environment variable or settings
 /// file can move it.
 #[must_use]
 pub fn managed_settings_path() -> Option<PathBuf> {
-    if cfg!(windows) {
-        let program_data = std::env::var_os("ProgramData")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-        Some(program_data.join("Neuron").join(MANAGED_SETTINGS_FILE))
-    } else if cfg!(target_os = "macos") {
-        Some(PathBuf::from("/Library/Application Support/Neuron").join(MANAGED_SETTINGS_FILE))
+    let folder = if cfg!(any(windows, target_os = "macos")) {
+        "Neuron"
     } else {
-        Some(PathBuf::from("/etc/neuron").join(MANAGED_SETTINGS_FILE))
+        "neuron"
+    };
+    Some(
+        managed_settings_root()
+            .join(folder)
+            .join(MANAGED_SETTINGS_FILE),
+    )
+}
+
+/// Fails, saying why, unless only an administrator can have written `path`: it and
+/// every folder above it up to `root` must be owned by an administrator (SYSTEM,
+/// Administrators or `TrustedInstaller` on Windows, root elsewhere), and no one else
+/// may change them. Otherwise any user could put settings there that apply to every
+/// account on the computer.
+pub fn check_managed_settings_owner(path: &Path, root: &Path) -> Result<(), String> {
+    if !path.starts_with(root) {
+        return Err(format!(
+            "{} is not under {}",
+            path.display(),
+            root.display()
+        ));
     }
+    for current in path.ancestors() {
+        admin_only(current)?;
+        if current == root {
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn admin_only(path: &Path) -> Result<(), String> {
+    winsec::check_admin_only(path)
+}
+
+/// Owned by root, and writable by no one else: not by others, and by the group only
+/// when it is root's (gid 0).
+#[cfg(unix)]
+fn admin_only(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| format!("cannot read who may change {}: {error}", path.display()))?;
+    if metadata.uid() != 0 {
+        return Err(format!(
+            "{} is owned by uid {}, not by root",
+            path.display(),
+            metadata.uid()
+        ));
+    }
+    let mode = metadata.mode();
+    if mode & 0o002 != 0 || (mode & 0o020 != 0 && metadata.gid() != 0) {
+        return Err(format!(
+            "{} can be changed by users other than root (mode {:o})",
+            path.display(),
+            mode & 0o7777
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(windows, unix)))]
+fn admin_only(_path: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 /// `mcpPolicy` in the managed settings.
@@ -1220,5 +1299,58 @@ mod tests {
         let path = super::managed_settings_path().expect("a path on every platform");
         assert!(path.ends_with(Path::new("managed-settings.json")));
         assert!(path.is_absolute());
+        assert!(path.starts_with(super::managed_settings_root()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_managed_settings_folder_ignores_the_environment() {
+        let _env = crate::test_env_lock();
+        let names = ["ProgramFiles", "ProgramData"];
+        let before = names.map(std::env::var_os);
+        let elsewhere = temp_dir("program-files");
+        for name in names {
+            std::env::set_var(name, &elsewhere);
+        }
+        let path = super::managed_settings_path().expect("a path");
+        for (name, value) in names.into_iter().zip(before) {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        assert!(!path.starts_with(&elsewhere), "{}", path.display());
+    }
+
+    /// A file a user could write: refused with the reason. As root (on Unix), the file
+    /// is made writable by everyone so the check still has something to refuse.
+    #[test]
+    fn a_managed_settings_file_a_user_can_write_is_refused() {
+        let fixture = Fixture::new("owner");
+        fixture.managed(r#"{"mcpPolicy":{"deny":["own"]}}"#);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&fixture.managed, fs::Permissions::from_mode(0o666))
+                .expect("chmod");
+        }
+        let root = fixture.root.join("machine");
+
+        let refused = super::check_managed_settings_owner(&fixture.managed, &root)
+            .expect_err("a user's file is not trusted");
+        assert!(refused.contains("managed-settings.json"), "{refused}");
+        assert!(super::check_managed_settings_owner(&fixture.managed, &fixture.cwd).is_err());
+
+        // A loader that checks the owner ignores the file; one that does not reads it.
+        fixture.user(r#"{"defaultMcpServers":false,"mcpServers":{"own":{"command":"own"}}}"#);
+        let config = fixture
+            .loader()
+            .with_managed_settings_root(Some(root))
+            .load()
+            .expect("config loads");
+        assert!(config.mcp().get("own").is_some());
+        assert!(!config.mcp().policy().is_active());
+        let config = fixture.loader().load().expect("config loads");
+        assert!(config.mcp().get("own").is_none());
     }
 }

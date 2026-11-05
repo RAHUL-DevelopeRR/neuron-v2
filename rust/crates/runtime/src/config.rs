@@ -368,6 +368,10 @@ pub struct ConfigLoader {
     mcp_approvals: bool,
     /// The machine-wide managed settings file, loaded last ([`ConfigSource::Managed`]).
     managed_settings: Option<PathBuf>,
+    /// When set, the managed settings are read only when no one but an administrator
+    /// can have written them or the folders above them up to this one
+    /// ([`crate::mcp_policy::check_managed_settings_owner`]).
+    managed_settings_root: Option<PathBuf>,
 }
 
 impl ConfigLoader {
@@ -385,6 +389,7 @@ impl ConfigLoader {
             project_trust: ProjectTrust::Trusted,
             mcp_approvals: false,
             managed_settings: None,
+            managed_settings_root: None,
         }
     }
 
@@ -400,6 +405,7 @@ impl ConfigLoader {
             project_trust: ProjectTrust::FromWorkspaceTrust,
             mcp_approvals: true,
             managed_settings: crate::mcp_policy::managed_settings_path(),
+            managed_settings_root: Some(crate::mcp_policy::managed_settings_root()),
         }
     }
 
@@ -421,6 +427,14 @@ impl ConfigLoader {
     #[must_use]
     pub fn with_managed_settings(mut self, path: Option<PathBuf>) -> Self {
         self.managed_settings = path;
+        self
+    }
+
+    /// Reads the managed settings only when no one but an administrator can have written
+    /// them or the folders above them up to `root` (`None`: no check).
+    #[must_use]
+    pub fn with_managed_settings_root(mut self, root: Option<PathBuf>) -> Self {
+        self.managed_settings_root = root;
         self
     }
 
@@ -510,6 +524,10 @@ impl ConfigLoader {
         let mut parsed_entries = Vec::new();
 
         for entry in self.discover() {
+            if entry.source == ConfigSource::Managed && !self.managed_settings_trusted(&entry.path)
+            {
+                continue;
+            }
             crate::config_validate::check_unsupported_format(&entry.path)?;
             let Some(parsed) = read_optional_json_object(&entry.path)? else {
                 continue;
@@ -656,6 +674,27 @@ impl ConfigLoader {
             feature_config,
             ignored_project_settings,
         })
+    }
+
+    /// Whether the managed settings at `path` may be read: no file, no check, or only an
+    /// administrator can have written it. Otherwise it is ignored with a warning.
+    fn managed_settings_trusted(&self, path: &Path) -> bool {
+        let Some(root) = &self.managed_settings_root else {
+            return true;
+        };
+        if !path.exists() {
+            return true;
+        }
+        match crate::mcp_policy::check_managed_settings_owner(path, root) {
+            Ok(()) => true,
+            Err(why) => {
+                warn_once(&format!(
+                    "warning: ignoring the managed settings {}: {why}; only an administrator may be able to change that file and its folders",
+                    path.display()
+                ));
+                false
+            }
+        }
     }
 
     /// The workspace's `.mcp.json` (the file other agents read): its `mcpServers` join
