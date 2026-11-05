@@ -612,9 +612,10 @@ pub(crate) fn apply_mcp_policy(
 
 /// Lists each hosted connector the plan includes (`policy.connectors.hosted`) as a
 /// `Managed` server of that name reaching the gateway's `/mcp/<id>`, unless a server
-/// of that name is configured already. One the user turned off stays off; one the
-/// managed settings refuse is blocked. Whether the user linked it shows once it starts
-/// (`needs_connect` until then, see `mcp_zerox`).
+/// of that name is configured already, or a `zerox` server under another name reaches
+/// that connector (its tools would be listed twice). One the user turned off stays off;
+/// one the managed settings refuse is blocked. Whether the user linked it shows once it
+/// starts (`needs_connect` until then, see `mcp_zerox`).
 fn add_hosted_connectors(
     servers: &mut BTreeMap<String, ScopedMcpServerConfig>,
     disabled: &mut BTreeMap<String, ScopedMcpServerConfig>,
@@ -632,6 +633,21 @@ fn add_hosted_connectors(
             continue;
         }
         if servers.contains_key(id) || disabled.contains_key(id) || applied.blocked.contains_key(id)
+        {
+            continue;
+        }
+        let reaches_it = |server: &ScopedMcpServerConfig| {
+            let McpServerConfig::ManagedProxy(proxy) = &server.config else {
+                return false;
+            };
+            proxy.id == *id
+        };
+        if servers.values().any(reaches_it)
+            || disabled.values().any(reaches_it)
+            || applied
+                .blocked
+                .values()
+                .any(|blocked| reaches_it(&blocked.server))
         {
             continue;
         }
@@ -1386,6 +1402,27 @@ mod tests {
             "policy.connectors.hosted"
         );
         assert!(config.mcp().get("gh").is_some());
+        // `gh` reaches the hosted `github` already: it is not listed a second time.
+        assert!(config.mcp().get("github").is_none());
+        assert!(!config.mcp().disabled().contains_key("github"));
+    }
+
+    #[test]
+    fn a_hosted_connector_turned_off_under_another_name_is_not_listed_again() {
+        let fixture = Fixture::new("hosted-renamed-off");
+        fixture
+            .user(r#"{"defaultMcpServers":false,"disabledMcpServers":["gh"],"mcpServers":{"gh":{"type":"zerox","id":"github"}}}"#)
+            .gateway(&json!({"hosted": ["github", "linear"]}), now());
+
+        let config = fixture
+            .loader()
+            .with_hosted_connectors(true)
+            .load()
+            .expect("config loads");
+
+        assert!(config.mcp().disabled().contains_key("gh"));
+        assert!(config.mcp().get("github").is_none());
+        assert!(config.mcp().get("linear").is_some());
     }
 
     #[test]
