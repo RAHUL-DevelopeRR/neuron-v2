@@ -2236,19 +2236,24 @@ impl RuntimeMcpState {
     /// Calls an MCP tool. An interrupt or the session's end (`cancel`) abandons the call
     /// instead of waiting for the server: the server is stopped, and starts again on its
     /// next call.
+    /// `approved`: the user approved the call in the permission prompt (a hosted
+    /// connector is told so for its destructive tools).
     fn call_tool(
         &mut self,
         qualified_tool_name: &str,
         arguments: Option<serde_json::Value>,
+        approved: bool,
         cancel: &runtime::CancellationToken,
     ) -> Result<String, ToolError> {
         self.still_starting()?;
         let response = self
             .runtime
-            .block_on(
-                self.manager
-                    .call_tool_unless_cancelled(qualified_tool_name, arguments, cancel),
-            )
+            .block_on(self.manager.call_tool_unless_cancelled(
+                qualified_tool_name,
+                arguments,
+                approved,
+                cancel,
+            ))
             .map_err(|error| ToolError::new(error.to_string()))?
             .ok_or_else(|| {
                 ToolError::new(format!(
@@ -2635,10 +2640,11 @@ fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
 /// The permission a call of `tool` needs. Its annotations are the server's own claims,
 /// so they decide alone only for servers Neuron ships (bundled scope). A server whose
 /// launch spec is exactly a catalog entry's gets the tier the entry pins for the tool
-/// (`runtime::McpToolTier`). Any other server, or a tool the entry does not list, cannot
-/// lower a tool below workspace-write, and a remote server's tools, or a tool that
-/// reaches the open world, need full access. An allow rule still lets a tool run with
-/// less.
+/// (`runtime::McpToolTier`), and so does a hosted connector (`zerox`) for the entry of
+/// its id, as a remote server. Any other server, or a tool the entry does not list,
+/// cannot lower a tool below workspace-write, and a remote server's tools, or a tool
+/// that reaches the open world, need full access. An allow rule still lets a tool run
+/// with less.
 fn permission_mode_for_mcp_tool(
     tool: &McpTool,
     server: Option<&runtime::ScopedMcpServerConfig>,
@@ -2656,6 +2662,15 @@ fn permission_mode_for_mcp_tool(
     };
     if server.is_some_and(|server| server.scope == ConfigSource::Bundled) {
         return claimed;
+    }
+    if let Some(runtime::McpServerConfig::ManagedProxy(proxy)) = server.map(|server| &server.config)
+    {
+        let tier = runtime::McpCatalog::builtin()
+            .get(&proxy.id)
+            .map_or(runtime::McpToolTier::External, |entry| {
+                entry.pinned_tier(&tool.name).unwrap_or(entry.default_tier)
+            });
+        return tier.permission_mode(true);
     }
     let catalog_entry = server.and_then(|server| runtime::mcp_catalog_entry_for(&server.config));
     if let Some(entry) = catalog_entry {
@@ -9126,6 +9141,41 @@ UU conflicted.rs",
             permission_mode_for_mcp_tool(&read_only, None),
             PermissionMode::DangerFullAccess
         );
+    }
+
+    #[test]
+    fn hosted_connectors_get_the_tier_of_their_catalog_entry_as_remote_servers() {
+        let tool = |name: &str| runtime::McpTool {
+            name: name.to_string(),
+            description: None,
+            input_schema: None,
+            annotations: Some(json!({"readOnlyHint": true})),
+            meta: None,
+        };
+        let hosted = |id: &str| runtime::ScopedMcpServerConfig {
+            scope: runtime::ConfigSource::Managed,
+            config: runtime::McpServerConfig::ManagedProxy(runtime::McpManagedProxyServerConfig {
+                url: String::new(),
+                id: id.to_string(),
+            }),
+        };
+        let mode =
+            |name: &str, id: &str| permission_mode_for_mcp_tool(&tool(name), Some(&hosted(id)));
+        assert_eq!(mode("get_me", "github"), PermissionMode::ReadOnly);
+        assert_eq!(
+            mode("issue_write", "github"),
+            PermissionMode::DangerFullAccess
+        );
+        assert_eq!(
+            mode("delete_repository", "github"),
+            PermissionMode::DangerFullAccess
+        );
+        // Unlisted, or a connector the catalog does not know: never what it claims.
+        assert_eq!(
+            mode("brand_new", "github"),
+            PermissionMode::DangerFullAccess
+        );
+        assert_eq!(mode("search", "jira"), PermissionMode::DangerFullAccess);
     }
 
     #[test]

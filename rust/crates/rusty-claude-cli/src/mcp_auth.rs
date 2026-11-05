@@ -3,8 +3,10 @@
 //! tokens (entry `mcp-oauth:<server>`) and connector secrets (entry
 //! `mcp-secret:<server>:<NAME>`) from: the OS keychain (`neuron-cli` service), or an
 //! owner-only file under `~/.neuroncli/mcp-oauth` or `~/.neuroncli/mcp-secrets`.
+//! Hosted connectors (`zerox` servers) use the Zero-X sign-in instead.
 
 use std::env;
+use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -12,6 +14,7 @@ use runtime::{
     ConfigLoader, McpLoginOptions, McpServerConfig, McpTokenStore, ScopedMcpServerConfig,
 };
 
+use crate::auth::GatewayCredential;
 use crate::credentials::{
     keychain_entry_for, neuron_home, BackendError, FileBackend, SecretBackend,
 };
@@ -75,9 +78,31 @@ impl McpTokenStore for KeychainTokenStore {
     }
 }
 
-/// Lets remote MCP servers find their tokens.
+/// Lets remote MCP servers find their tokens, and hosted connectors the Zero-X
+/// sign-in (`NEURON_TOKEN`, else the stored login; read on each new connection).
 pub(crate) fn install_token_store() {
     runtime::set_mcp_token_store(Some(Arc::new(KeychainTokenStore)));
+    runtime::set_zerox_token_provider(Some(Arc::new(|| {
+        zerox_bearer(crate::auth::current_credential(), crate::clock::now_unix())
+    })));
+}
+
+/// The bearer a hosted connector sends, or why there is none (never the token).
+fn zerox_bearer(
+    credential: io::Result<Option<GatewayCredential>>,
+    now: u64,
+) -> Result<String, String> {
+    match credential {
+        Ok(Some(credential)) if credential.is_expired(now) => Err(
+            "your Zero-X sign-in has expired; run `neuron login` to sign in again".to_string(),
+        ),
+        Ok(Some(credential)) => Ok(credential.token.expose().to_string()),
+        Ok(None) => Err(
+            "not signed in to Zero-X; run `neuron login` (or set NEURON_TOKEN) to use hosted connectors"
+                .to_string(),
+        ),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 /// `login <server>` / `logout <server>`: what it did, or `None` for other `mcp`
@@ -171,7 +196,41 @@ fn logout(name: &str) -> Result<String, Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{file_for, handle_mcp_auth_command};
+    use super::{file_for, handle_mcp_auth_command, zerox_bearer};
+    use crate::auth::{CredentialSource, GatewayCredential};
+    use crate::credentials::TokenKind;
+    use crate::vault::SecureString;
+
+    #[test]
+    fn hosted_connectors_get_the_zerox_sign_in_while_it_is_good() {
+        let credential = |expires_at| GatewayCredential {
+            token: SecureString::new("ses_hosted_connector".to_string()),
+            kind: TokenKind::Session,
+            source: CredentialSource::EnvToken,
+            expires_at,
+            plan: None,
+            email: None,
+            name: None,
+        };
+        assert_eq!(
+            zerox_bearer(Ok(Some(credential(None))), 100).as_deref(),
+            Ok("ses_hosted_connector")
+        );
+        let expired = zerox_bearer(Ok(Some(credential(Some(50)))), 100).unwrap_err();
+        assert!(expired.contains("neuron login"), "{expired}");
+        assert!(!expired.contains("ses_hosted_connector"));
+        let signed_out = zerox_bearer(Ok(None), 100).unwrap_err();
+        assert!(
+            signed_out.contains("not signed in to Zero-X"),
+            "{signed_out}"
+        );
+        let invalid = zerox_bearer(
+            Err(std::io::Error::other("NEURON_TOKEN: unknown token kind")),
+            100,
+        )
+        .unwrap_err();
+        assert!(invalid.starts_with("NEURON_TOKEN"), "{invalid}");
+    }
 
     #[test]
     fn only_login_and_logout_are_handled_here() {

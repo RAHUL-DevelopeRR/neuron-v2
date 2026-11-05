@@ -203,7 +203,7 @@ fn transport_label(transport: &McpClientTransport) -> &'static str {
         McpClientTransport::Http(_) => "http",
         McpClientTransport::WebSocket(_) => "ws",
         McpClientTransport::Sdk(_) => "sdk",
-        McpClientTransport::ManagedProxy(_) => "managed_proxy",
+        McpClientTransport::ManagedProxy(_) => "zerox",
     }
 }
 

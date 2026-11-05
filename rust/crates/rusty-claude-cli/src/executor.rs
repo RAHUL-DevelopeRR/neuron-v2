@@ -255,6 +255,9 @@ pub(crate) struct CliToolExecutor {
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+    /// The user approved the call about to run in the permission prompt (taken by
+    /// the next execute call): a hosted connector is told so.
+    user_approved: bool,
 }
 
 impl CliToolExecutor {
@@ -269,6 +272,7 @@ impl CliToolExecutor {
             allowed_tools,
             tool_registry,
             mcp_state,
+            user_approved: false,
         }
     }
 
@@ -320,10 +324,12 @@ impl CliToolExecutor {
     }
 
     /// Runs an MCP tool or wrapper; `cancel` abandons a tool call that is still running.
+    /// `approved`: the user approved this call in the permission prompt.
     pub fn execute_runtime_tool(
         &self,
         tool_name: &str,
         value: serde_json::Value,
+        approved: bool,
         cancel: &runtime::CancellationToken,
     ) -> Result<String, ToolError> {
         let Some(mcp_state) = &self.mcp_state else {
@@ -346,7 +352,7 @@ impl CliToolExecutor {
                 // Models send the object as JSON text too; servers want the object.
                 let arguments = tools::mcp_call_arguments(input.arguments)
                     .map_err(|error| ToolError::new(format!("invalid MCPTool input: {error}")))?;
-                mcp_state.call_tool(&qualified_name, arguments, cancel)
+                mcp_state.call_tool(&qualified_name, arguments, approved, cancel)
             }
             "ListMcpResourcesTool" => {
                 let input: ListMcpResourcesRequest = serde_json::from_value(value)
@@ -361,7 +367,7 @@ impl CliToolExecutor {
                     .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
                 mcp_state.read_resource(&input.server, &input.uri)
             }
-            _ => mcp_state.call_tool(tool_name, Some(value), cancel),
+            _ => mcp_state.call_tool(tool_name, Some(value), approved, cancel),
         }
     }
 }
@@ -379,6 +385,7 @@ impl ToolExecutor for CliToolExecutor {
         input: &str,
         cancel: &runtime::CancellationToken,
     ) -> Result<String, ToolError> {
+        let approved = std::mem::take(&mut self.user_approved);
         if self
             .allowed_tools
             .as_ref()
@@ -408,7 +415,7 @@ impl ToolExecutor for CliToolExecutor {
         let result = if tool_name == "ToolSearch" {
             self.execute_search_tool(value)
         } else if self.tool_registry.has_runtime_tool(tool_name) {
-            self.execute_runtime_tool(tool_name, value, cancel)
+            self.execute_runtime_tool(tool_name, value, approved, cancel)
         } else {
             self.tool_registry
                 .execute_with_cancel(tool_name, &value, cancel)
@@ -433,6 +440,14 @@ impl ToolExecutor for CliToolExecutor {
                 Err(error)
             }
         }
+    }
+
+    fn tool_permission_decided(
+        &mut self,
+        _tool_name: &str,
+        decided_by: runtime::PermissionDecider,
+    ) {
+        self.user_approved = decided_by == runtime::PermissionDecider::User;
     }
 
     fn tool_started(&mut self, id: &str, name: &str, input: &str) {
