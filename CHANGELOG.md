@@ -16,6 +16,11 @@ The release workflow copies a version's section into its GitHub release notes.
   required ones cannot be turned off or removed. Every MCP call, refused ones too, is
   logged metadata-only to `~/.neuron/audit/mcp-YYYY-MM-DD.jsonl`. The engine protocol
   adds the `managed` scope and `McpServerInfo.required` (feature `mcp_policy`).
+- Connector policy fixes: a deny rule in user or workspace settings no longer blocks a
+  required server (only the managed settings' own rules do); deny lists also match a
+  connector's package at another version and its remote host; a cached plan policy is
+  never current for more than a day after it was read; MCP resource list and read
+  requests are audited too.
 - Connector catalog: `/mcp catalog`, `/mcp add <id> [--scope user|project|local]` and
   `/mcp remove <server>` (and `neuron mcp catalog|add|remove`) list and add vetted MCP
   servers (GitHub, Filesystem, Git, Fetch, Memory, Playwright, Codebase memory,
