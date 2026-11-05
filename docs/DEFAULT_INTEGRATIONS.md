@@ -179,8 +179,11 @@ with the repository) or `local` (`.neuron/settings.local.json`). A project or lo
 server is approved for this workspace as written, since you added it yourself; in a
 folder you have not trusted, `add --scope project|local` is refused, because those
 settings would not load. A connector that signs in with OAuth (Supabase) opens the
-browser after `neuron mcp add`; in a session, run `neuron mcp login <server>` in a
-terminal.
+browser to sign in once it is added with `neuron mcp add`, `/mcp add` in a terminal
+session, or the engine's `add_mcp_server` command (the full-screen UI keeps working
+while the browser is open, and shows the sign-in link in case it does not open).
+Under `--resume`, outside a terminal, or when the connector was already added, run
+`neuron mcp login <server>` in a terminal instead.
 
 **Secrets.** `neuron mcp add <id>` in a terminal asks for the connector's variables;
 a secret's input stays hidden. A variable already set in the environment is taken

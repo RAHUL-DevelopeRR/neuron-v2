@@ -419,8 +419,12 @@ impl SignedOut<'_> {
                 command @ (EngineCommand::AddMcpServer { .. }
                 | EngineCommand::RemoveMcpServer { .. }
                 | EngineCommand::ApproveMcpServer { .. }) => {
-                    for event in crate::engine_mcp::mcp_change_events(command) {
+                    let change = crate::engine_mcp::mcp_change_events(command);
+                    for event in change.events {
                         self.send(event);
+                    }
+                    if let Some(name) = change.sign_in {
+                        crate::engine_mcp::sign_in_in_background(name, self.events.clone());
                     }
                 }
                 EngineCommand::RefreshAccount => self.send_account(),
@@ -1662,8 +1666,12 @@ impl Engine {
             command @ (EngineCommand::AddMcpServer { .. }
             | EngineCommand::RemoveMcpServer { .. }
             | EngineCommand::ApproveMcpServer { .. }) => {
-                for event in crate::engine_mcp::mcp_change_events(command) {
+                let change = crate::engine_mcp::mcp_change_events(command);
+                for event in change.events {
                     self.send(event);
+                }
+                if let Some(name) = change.sign_in {
+                    crate::engine_mcp::sign_in_in_background(name, self.events.clone());
                 }
             }
             EngineCommand::RefreshAccount => {

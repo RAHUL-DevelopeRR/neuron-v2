@@ -96,11 +96,8 @@ pub(crate) fn handle_mcp_auth_command(
     }
 }
 
-fn find_server(name: &str) -> Result<ScopedMcpServerConfig, String> {
-    let cwd: PathBuf = env::current_dir().map_err(|error| error.to_string())?;
-    let config = ConfigLoader::default_for(&cwd)
-        .load()
-        .map_err(|error| error.to_string())?;
+fn find_server(loader: &ConfigLoader, name: &str) -> Result<ScopedMcpServerConfig, String> {
+    let config = loader.load().map_err(|error| error.to_string())?;
     config
         .mcp()
         .get(name)
@@ -110,14 +107,28 @@ fn find_server(name: &str) -> Result<ScopedMcpServerConfig, String> {
 }
 
 pub(crate) fn login(name: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let server = find_server(name)?;
+    let cwd: PathBuf = env::current_dir()?;
+    Ok(login_with(&ConfigLoader::default_for(&cwd), name, |url| {
+        eprintln!("Opening your browser to sign in to the MCP server `{name}`.");
+        eprintln!("If it does not open, visit:\n  {url}");
+        let _ = webbrowser::open(url);
+    })?)
+}
+
+/// Signs in to the remote MCP server `name` that `loader` configures and stores its
+/// tokens; `open_browser` gets the sign-in URL.
+pub(crate) fn login_with(
+    loader: &ConfigLoader,
+    name: &str,
+    open_browser: impl FnOnce(&str),
+) -> Result<String, String> {
+    let server = find_server(loader, name)?;
     let remote = match &server.config {
         McpServerConfig::Http(remote) | McpServerConfig::Sse(remote) => remote,
         _ => {
             return Err(format!(
                 "`{name}` is not a remote (http or sse) MCP server; only those sign in"
-            )
-            .into())
+            ))
         }
     };
     let options = McpLoginOptions {
@@ -144,12 +155,9 @@ pub(crate) fn login(name: &str) -> Result<String, Box<dyn std::error::Error>> {
     };
     let tokio = tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()?;
-    let tokens = tokio.block_on(runtime::login_mcp_server(&options, |url| {
-        eprintln!("Opening your browser to sign in to the MCP server `{name}`.");
-        eprintln!("If it does not open, visit:\n  {url}");
-        let _ = webbrowser::open(url);
-    }))?;
+        .build()
+        .map_err(|error| error.to_string())?;
+    let tokens = tokio.block_on(runtime::login_mcp_server(&options, open_browser))?;
     runtime::save_mcp_tokens(name, &tokens)?;
     Ok(format!(
         "Signed in to the MCP server `{name}`. Its tokens are stored in your OS keychain (or ~/.neuroncli/mcp-oauth)."

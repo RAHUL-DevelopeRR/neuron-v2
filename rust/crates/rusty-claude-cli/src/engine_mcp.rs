@@ -1,10 +1,14 @@
 //! The connector catalog in the engine: [`EngineCommand::ListConnectorCatalog`],
 //! [`EngineCommand::AddMcpServer`], [`EngineCommand::RemoveMcpServer`] and
 //! [`EngineCommand::ApproveMcpServer`]. Each change says what it did and lists the
-//! extensions again; servers restart from the next turn, as after `/mcp enable`.
+//! extensions again; servers restart from the next turn, as after `/mcp enable`. A
+//! connector added that signs in with OAuth then signs in on a thread of its own
+//! ([`sign_in_in_background`]).
 
 use std::env;
 use std::path::Path;
+use std::sync::mpsc::Sender;
+use std::thread;
 
 use neuron_tui::protocol::{ConnectorInfo, ConnectorVariable, EngineCommand, UiEvent};
 use runtime::{ConfigLoader, McpCatalog, McpInstallRequest, McpInstallScope};
@@ -56,24 +60,84 @@ fn connector_catalog_event_in(cwd: &Path, query: &str) -> UiEvent {
     }
 }
 
+/// What an MCP change answers: its events, and the server to sign in to once they are
+/// sent (a connector just added that signs in with OAuth).
+pub(crate) struct McpChangeEvents {
+    pub(crate) events: Vec<UiEvent>,
+    pub(crate) sign_in: Option<String>,
+}
+
 /// `AddMcpServer`, `RemoveMcpServer` or `ApproveMcpServer`: a notice (or an error), then
 /// the extensions again. Other commands answer nothing.
-pub(crate) fn mcp_change_events(command: EngineCommand) -> Vec<UiEvent> {
+pub(crate) fn mcp_change_events(command: EngineCommand) -> McpChangeEvents {
     let cwd = env::current_dir().unwrap_or_default();
-    let first = mcp_change_notice(&ConfigLoader::default_for(&cwd), command);
-    match first {
-        Some(first) => vec![first, crate::engine::extensions_event()],
-        None => Vec::new(),
+    match mcp_change_notice(&ConfigLoader::default_for(&cwd), command) {
+        Some((first, sign_in)) => McpChangeEvents {
+            events: vec![first, crate::engine::extensions_event()],
+            sign_in,
+        },
+        None => McpChangeEvents {
+            events: Vec::new(),
+            sign_in: None,
+        },
     }
 }
 
-fn mcp_change_notice(loader: &ConfigLoader, command: EngineCommand) -> Option<UiEvent> {
+/// Signs in to the remote MCP server `name` without holding up the engine (the browser
+/// and its redirect can take minutes): a notice with the sign-in URL, then one with the
+/// result and, once signed in, the extensions again.
+pub(crate) fn sign_in_in_background(name: String, events: Sender<UiEvent>) {
+    let cwd = env::current_dir().unwrap_or_default();
+    spawn_sign_in(ConfigLoader::default_for(&cwd), name, events, |url| {
+        let _ = webbrowser::open(url);
+    });
+}
+
+fn spawn_sign_in(
+    loader: ConfigLoader,
+    name: String,
+    events: Sender<UiEvent>,
+    open_browser: fn(&str),
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let result = crate::mcp_auth::login_with(&loader, &name, |url| {
+            let _ = events.send(UiEvent::Notice {
+                message: format!(
+                    "Opening your browser to sign in to MCP server {name}. If it does not open, visit {url}"
+                ),
+                kind: None,
+            });
+            open_browser(url);
+        });
+        match result {
+            Ok(message) => {
+                let _ = events.send(UiEvent::Notice {
+                    message,
+                    kind: None,
+                });
+                let _ = events.send(crate::engine::extensions_event());
+            }
+            Err(error) => {
+                let _ = events.send(UiEvent::error(format!(
+                    "sign-in to MCP server {name} did not finish: {error}. Run `neuron mcp login {name}` in a terminal to try again."
+                )));
+            }
+        }
+    })
+}
+
+/// The answer to an MCP change, and the server to sign in to after it.
+fn mcp_change_notice(
+    loader: &ConfigLoader,
+    command: EngineCommand,
+) -> Option<(UiEvent, Option<String>)> {
     let notice = |message: String| UiEvent::Notice {
         message,
         kind: None,
     };
     let scope = |scope: Option<String>| scope.as_deref().map(McpInstallScope::parse).transpose();
-    Some(match command {
+    let mut sign_in = None;
+    let event = match command {
         EngineCommand::AddMcpServer {
             id,
             name,
@@ -110,9 +174,12 @@ fn mcp_change_notice(loader: &ConfigLoader, command: EngineCommand) -> Option<Ui
                             outcome.secrets_stored.join(", ")
                         ));
                     }
-                    if outcome.needs_login {
+                    if outcome.needs_login && !outcome.already {
+                        message.push_str(". Opening your browser to sign in");
+                        sign_in = Some(outcome.name.clone());
+                    } else if outcome.needs_login {
                         message.push_str(&format!(
-                            ". Sign in with `neuron mcp login {}` in a terminal",
+                            ". To sign in again, run `neuron mcp login {}` in a terminal",
                             outcome.name
                         ));
                     }
@@ -164,7 +231,8 @@ fn mcp_change_notice(loader: &ConfigLoader, command: EngineCommand) -> Option<Ui
             }
         }
         _ => return None,
-    })
+    };
+    Some((event, sign_in))
 }
 
 #[cfg(test)]
@@ -176,7 +244,7 @@ mod tests {
     use neuron_tui::protocol::{EngineCommand, SecretValues, UiEvent};
     use runtime::{ConfigLoader, McpTokenStore, ProjectTrust};
 
-    use super::{connector_catalog_event_in, mcp_change_notice};
+    use super::{connector_catalog_event_in, mcp_change_notice, spawn_sign_in};
 
     #[derive(Default)]
     struct MemorySecrets(Mutex<BTreeMap<String, String>>);
@@ -198,6 +266,14 @@ mod tests {
         }
     }
 
+    /// One in-memory secret store for every test here, installed once.
+    fn install_store() {
+        static STORE: OnceLock<()> = OnceLock::new();
+        STORE.get_or_init(|| {
+            runtime::set_mcp_token_store(Some(Arc::new(MemorySecrets::default())));
+        });
+    }
+
     fn message(event: &UiEvent) -> String {
         match event {
             UiEvent::Notice { message, .. } | UiEvent::Error { message, .. } => message.clone(),
@@ -207,10 +283,7 @@ mod tests {
 
     #[test]
     fn add_remove_and_approve_commands_change_the_settings_and_never_echo_a_secret() {
-        static STORE: OnceLock<()> = OnceLock::new();
-        STORE.get_or_init(|| {
-            runtime::set_mcp_token_store(Some(Arc::new(MemorySecrets::default())));
-        });
+        install_store();
         let root = std::env::temp_dir().join(format!("neuron-engine-mcp-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let (cwd, home) = (root.join("repo"), root.join("home"));
@@ -234,7 +307,8 @@ mod tests {
                 )])),
             },
         )
-        .unwrap();
+        .unwrap()
+        .0;
         let text = message(&added);
         assert!(text.starts_with("Added MCP server gh-engine"), "{text}");
         assert!(!text.contains(sentinel));
@@ -256,7 +330,8 @@ mod tests {
                 secrets: SecretValues::default(),
             },
         )
-        .unwrap();
+        .unwrap()
+        .0;
         assert!(matches!(refused, UiEvent::Error { .. }));
         assert!(message(&refused).contains("unknown scope"));
 
@@ -266,7 +341,8 @@ mod tests {
                 name: "gh-engine".into(),
             },
         )
-        .unwrap();
+        .unwrap()
+        .0;
         assert!(
             message(&not_waiting).contains("approved"),
             "{not_waiting:?}"
@@ -279,7 +355,8 @@ mod tests {
                 scope: None,
             },
         )
-        .unwrap();
+        .unwrap()
+        .0;
         assert!(
             message(&removed).contains("deleted GITHUB_PERSONAL_ACCESS_TOKEN"),
             "{removed:?}"
@@ -289,6 +366,63 @@ mod tests {
             None
         );
         assert!(mcp_change_notice(&loader, EngineCommand::ListExtensions).is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// An OAuth connector added from the UI signs in after the notice; adding it again
+    /// does not open a second browser. The sign-in runs on its own thread and reports a
+    /// failure with the terminal command to try again.
+    #[test]
+    fn an_oauth_connector_added_from_the_ui_signs_in_once() {
+        install_store();
+        let root =
+            std::env::temp_dir().join(format!("neuron-engine-mcp-oauth-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (cwd, home) = (root.join("repo"), root.join("home"));
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let loader = ConfigLoader::new(&cwd, &home)
+            .with_project_trust(ProjectTrust::Trusted)
+            .with_mcp_approvals(true);
+        let add = |id: &str| EngineCommand::AddMcpServer {
+            id: id.into(),
+            name: None,
+            scope: Some("user".into()),
+            secrets: SecretValues::default(),
+        };
+
+        let (added, sign_in) = mcp_change_notice(&loader, add("supabase")).unwrap();
+        assert!(
+            message(&added).contains("Opening your browser to sign in"),
+            "{added:?}"
+        );
+        assert_eq!(sign_in.as_deref(), Some("supabase"));
+        let (again, sign_in) = mcp_change_notice(&loader, add("supabase")).unwrap();
+        assert!(
+            message(&again).contains("neuron mcp login supabase"),
+            "{again:?}"
+        );
+        assert_eq!(sign_in, None, "added before, so no second browser");
+        let (_, sign_in) = mcp_change_notice(&loader, add("cloudflare-docs")).unwrap();
+        assert_eq!(sign_in, None, "no OAuth");
+
+        // A server the settings do not have fails before any browser opens.
+        let (events, received) = std::sync::mpsc::channel();
+        spawn_sign_in(loader.clone(), "not-configured".into(), events, |url| {
+            panic!("no browser for {url}")
+        })
+        .join()
+        .unwrap();
+        let reported = received.try_iter().collect::<Vec<_>>();
+        assert_eq!(reported.len(), 1, "{reported:?}");
+        assert!(matches!(reported[0], UiEvent::Error { .. }));
+        let text = message(&reported[0]);
+        assert!(text.contains("did not finish"), "{text}");
+        assert!(
+            text.contains("no MCP server named `not-configured`"),
+            "{text}"
+        );
+        assert!(text.contains("neuron mcp login not-configured"), "{text}");
         let _ = fs::remove_dir_all(root);
     }
 
