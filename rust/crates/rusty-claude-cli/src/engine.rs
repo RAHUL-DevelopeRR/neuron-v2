@@ -956,8 +956,6 @@ fn hosted_needs_connect(
     ))
 }
 
-/// The catalog connector a configured server was added from (see
-/// `runtime::mcp_catalog_entry_for`); bundled servers are Neuron's own.
 /// The catalog's tier of each of `tools` on `server` (a hosted connector's entry by its
 /// id, a catalog connector's by its launch spec), as permission prompts use it: a tool the
 /// entry does not list gets its default tier. Empty for any other server.
@@ -984,6 +982,8 @@ fn mcp_tool_tiers(
         .collect()
 }
 
+/// The catalog connector a configured server was added from (see
+/// `runtime::mcp_catalog_entry_for`); bundled servers are Neuron's own.
 fn catalog_id(server: &runtime::ScopedMcpServerConfig) -> Option<String> {
     if server.scope == runtime::ConfigSource::Bundled {
         return None;
