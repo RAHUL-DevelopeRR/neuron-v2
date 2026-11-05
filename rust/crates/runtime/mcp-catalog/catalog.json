@@ -115,7 +115,7 @@
       "description": "Read, write and search files in the folder Neuron runs in.",
       "publisher": "Model Context Protocol project",
       "official": true,
-      "licence": "MIT OR Apache-2.0",
+      "licence": "Apache-2.0 AND MIT",
       "source": "https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem",
       "transport": "stdio",
       "install": {
@@ -216,7 +216,7 @@
       "description": "A local knowledge graph the agent keeps across sessions.",
       "publisher": "Model Context Protocol project",
       "official": true,
-      "licence": "MIT OR Apache-2.0",
+      "licence": "Apache-2.0 AND MIT",
       "source": "https://github.com/modelcontextprotocol/servers/tree/main/src/memory",
       "transport": "stdio",
       "install": {

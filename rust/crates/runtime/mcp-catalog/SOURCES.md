@@ -16,16 +16,24 @@ wheel sha256). Remote endpoints were probed with an MCP `initialize` POST.
 | Id | Server | Licence | Pinned | Maintenance on 2026-11-04 | Checked at |
 | --- | --- | --- | --- | --- | --- |
 | `github` | GitHub's remote GitHub MCP Server | MIT | remote (vendor-hosted; source v2.1.0 released 2026-11-03) | last push 2026-11-04 | https://github.com/github/github-mcp-server ; `POST https://api.githubcopilot.com/mcp/` answered 401 without a token |
-| `filesystem` | `@modelcontextprotocol/server-filesystem` | MIT, moving to Apache-2.0 (repo `LICENSE`, npm "SEE LICENSE IN LICENSE") | 2.1.0 (2026-10-28) | last push 2026-11-04 | https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem , https://registry.npmjs.org/@modelcontextprotocol/server-filesystem |
+| `filesystem` | `@modelcontextprotocol/server-filesystem` | Apache-2.0 AND MIT (see below) | 2.1.0 (2026-10-28) | last push 2026-11-04 | https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem , https://registry.npmjs.org/@modelcontextprotocol/server-filesystem |
 | `git` | `mcp-server-git` (PyPI) | MIT | 2026.10.28 | last push 2026-11-04 | https://github.com/modelcontextprotocol/servers/tree/main/src/git , https://pypi.org/project/mcp-server-git/ |
 | `fetch` | `mcp-server-fetch` (PyPI) | MIT | 2026.10.28 | last push 2026-11-04 | https://github.com/modelcontextprotocol/servers/tree/main/src/fetch , https://pypi.org/project/mcp-server-fetch/ |
-| `memory` | `@modelcontextprotocol/server-memory` | MIT, moving to Apache-2.0 (as filesystem) | 2.0.1 (2026-10-28) | last push 2026-11-04 | https://github.com/modelcontextprotocol/servers/tree/main/src/memory , https://registry.npmjs.org/@modelcontextprotocol/server-memory |
+| `memory` | `@modelcontextprotocol/server-memory` | Apache-2.0 AND MIT (as filesystem) | 2.0.1 (2026-10-28) | last push 2026-11-04 | https://github.com/modelcontextprotocol/servers/tree/main/src/memory , https://registry.npmjs.org/@modelcontextprotocol/server-memory |
 | `playwright` | `@playwright/mcp` (Microsoft) | Apache-2.0 | 0.0.83 (2026-09-28), the version Neuron bundles; 0.0.84 is latest | last push 2026-11-03 | https://github.com/microsoft/playwright-mcp , https://registry.npmjs.org/@playwright/mcp |
 | `codebase-memory` | `codebase-memory-mcp` (DeusData) | MIT | 0.11.0 (2026-09-15), the version Neuron bundles; 0.12.1 is latest | last push 2026-11-03; the package runs `node install.js` on install (P4 checks it) | https://github.com/DeusData/codebase-memory-mcp , https://registry.npmjs.org/codebase-memory-mcp |
 | `supabase` | Supabase's remote MCP server (`supabase/mcp`) | Apache-2.0 | remote (vendor-hosted; package 0.15.0 of 2026-10-29) | last push 2026-11-04 | https://github.com/supabase/mcp ; `POST https://mcp.supabase.com/mcp` answered 401 (OAuth) |
 | `context7` | Upstash's remote Context7 server | MIT | remote (vendor-hosted; package 4.5.0 of 2026-11-03) | last push 2026-11-04 | https://github.com/upstash/context7 ; `POST https://mcp.context7.com/mcp` answered 200 without a key |
 | `cloudflare-docs` | Cloudflare's documentation server | Apache-2.0 | remote (vendor-hosted; server reports `docs-ai-search` 0.5.0) | last push 2026-10-22 | https://github.com/cloudflare/mcp-server-cloudflare ; `initialize` and `tools/list` answered without auth |
 | `aws-docs` | `awslabs.aws-documentation-mcp-server` (PyPI) | Apache-2.0 | 1.2.4 (2026-10-30) | last push 2026-11-04 | https://github.com/awslabs/mcp/tree/main/src/aws-documentation-mcp-server , https://pypi.org/project/awslabs.aws-documentation-mcp-server/ |
+
+`filesystem` and `memory` are recorded as `Apache-2.0 AND MIT`, not as a choice of
+either: rechecked on 5 November 2026, the npm metadata of 2.1.0 and 2.0.1 says "SEE
+LICENSE IN LICENSE", neither tarball ships a licence file, the GitHub API reports the
+repository licence as `NOASSERTION`, and the repository `LICENSE` says the project is
+moving from MIT to Apache-2.0: new and relicensed contributions are Apache-2.0, and
+contributions whose authors have not agreed to relicense stay MIT. Both licences
+apply, each to its part.
 
 The npm `sha512` integrity and the wheel `sha256` of each pinned package are recorded in
 the entry's `install.integrity` for P4 (verified installs). P1 starts packages with
