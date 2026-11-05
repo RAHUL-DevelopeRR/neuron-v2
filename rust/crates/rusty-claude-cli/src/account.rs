@@ -301,6 +301,14 @@ fn remember_connector_policy(config_home: &std::path::Path, account: &Value) {
     }
 }
 
+/// Forgets the cached connector policy (on sign-out): it belongs to the account that
+/// signed out.
+pub(crate) fn forget_connector_policy() {
+    if let Err(error) = runtime::clear_gateway_policy(&runtime::default_config_home()) {
+        runtime::ui_hooks::notice(&format!("warning: {error}"));
+    }
+}
+
 /// `1234567` -> `1,234,567`.
 pub fn group_digits(value: u64) -> String {
     let digits = value.to_string();
@@ -582,6 +590,78 @@ mod tests {
         let config = runtime::ConfigLoader::new(&cwd, &home).load().unwrap();
         assert!(config.mcp().get("github").is_some());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Answers one `GET /api/account` with `body`.
+    fn account_server(body: String) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 && !line.trim().is_empty() {
+                line.clear();
+            }
+            let _ = write!(
+                reader.get_mut(),
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        });
+        base
+    }
+
+    #[test]
+    fn reading_the_account_caches_the_policy_in_the_config_home_and_sign_out_drops_it() {
+        let _env = crate::tests::env_lock();
+        let root = std::env::temp_dir().join(format!(
+            "neuron-account-fetch-policy-{}-{}",
+            std::process::id(),
+            runtime::mcp_policy::unix_now()
+        ));
+        let (cwd, home) = (root.join("project"), root.join("config"));
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("settings.json"),
+            r#"{"defaultMcpServers":false,"mcpServers":{"github":{"command":"github-mcp"}}}"#,
+        )
+        .unwrap();
+        let before = std::env::var_os("NEURON_CONFIG_HOME");
+        std::env::set_var("NEURON_CONFIG_HOME", &home);
+        let mut body = sample();
+        body["policy"] = serde_json::json!({"connectors": {"denied": ["github"]}});
+
+        let fetched = fetch_account(
+            &account_server(body.to_string()),
+            &SecureString::new("ses_test".to_string()),
+        );
+        let cached = home
+            .join(runtime::mcp_policy::GATEWAY_POLICY_CACHE_FILE)
+            .is_file();
+        let config = runtime::ConfigLoader::new(&cwd, &home).load().unwrap();
+        forget_connector_policy();
+        let forgotten = !home
+            .join(runtime::mcp_policy::GATEWAY_POLICY_CACHE_FILE)
+            .exists();
+        match before {
+            Some(value) => std::env::set_var("NEURON_CONFIG_HOME", value),
+            None => std::env::remove_var("NEURON_CONFIG_HOME"),
+        }
+        crate::plan_window::forget();
+        let _ = std::fs::remove_dir_all(&root);
+
+        fetched.expect("the fake gateway answers");
+        assert!(cached, "fetch_account caches the policy in the config home");
+        assert_eq!(
+            config.mcp().blocked()["github"].rule,
+            "policy.connectors.denied: github"
+        );
+        assert!(forgotten, "sign-out removes the cached policy");
     }
 
     #[test]
