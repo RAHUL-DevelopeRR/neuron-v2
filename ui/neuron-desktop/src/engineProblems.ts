@@ -49,8 +49,13 @@ export function engineProblemFor(raw: string | null | undefined, options: { rest
 /** Takes emails and key-like strings out of free text (an engine error can quote them). */
 export function scrub(text: string): string {
   return text
-    .replace(/[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g, '[email]')
+    .replace(/[A-Za-z]:[\\/]Users[\\/][^\\/\s"']+/gi, '~')
+    .replace(/(?<![\w.-])\/(?:Users|home)\/[^/\s"']+/g, '~')
+    .replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+(?::[^\s/@]*)?@/gi, '$1[removed]@')
     .replace(/\bBearer\s+[\w.~+/=-]{8,}/gi, 'Bearer [removed]')
+    .replace(/\b([\w-]*(?:key|token|secret|password|passwd|authorization))(\s*[=:]\s*)("[^"]*"|'[^']*'|\S+)/gi, '$1$2[removed]')
+    .replace(/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, '[removed]')
+    .replace(/[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g, '[email]')
     .replace(/\b(?:sk|pk|acct)[-_][\w-]{4,}/gi, '[removed]')
     .replace(/\b[A-Za-z0-9_-]{32,}\b/g, '[removed]')
 }
@@ -78,8 +83,9 @@ export function buildDiagnostics(input: DiagnosticsInput): string {
     `Engine protocol: ${input.engine.protocol ?? 'unknown'}`,
     `Engine features: ${input.engine.features.join(', ') || 'none'}`,
     `Connection: ${input.connection}`,
-    `Last engine error: ${input.lastError ? scrub(input.lastError) : 'none'}`,
+    `Last engine error: ${input.lastError || 'none'}`,
     `Updates: ${input.updates}`,
   )
-  return lines.join('\n')
+  // The whole report, the host's lines included, can quote a path, a URL or a key.
+  return scrub(lines.join('\n'))
 }

@@ -153,11 +153,11 @@ describe('Neuron Desktop: approvals, questions, tasks, sub-agents', () => {
         request: { tool: 'bash', current_mode: 'workspace-write', required_mode: 'danger-full-access', reason: '`rm` is not a known read-only command', input, session_prefixes: ['rm'] },
       },
     )
-    const dialog = screen.getByRole('dialog')
+    const dialog = screen.getByRole('alertdialog')
     expect(within(dialog).getByText('$ rm -rf target')).toBeTruthy()
     fireEvent.click(within(dialog).getByRole('button', { name: /allow once/i }))
     expect(engine.sent.at(-1)).toEqual({ kind: 'permission_reply', id: 4, decision: { kind: 'allow_once' } })
-    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(screen.queryByRole('alertdialog')).toBeNull()
   })
 
   test('n denies from the keyboard, but not in the first moment', async () => {
@@ -169,10 +169,10 @@ describe('Neuron Desktop: approvals, questions, tasks, sub-agents', () => {
       id: 9,
       request: { tool: 'bash', current_mode: 'workspace-write', required_mode: 'danger-full-access', reason: null, input, session_prefixes: [] },
     })
-    fireEvent.keyDown(window, { key: 'n' })
-    expect(screen.getByRole('dialog')).toBeTruthy()
-    await new Promise((resolve) => setTimeout(resolve, 350))
-    fireEvent.keyDown(window, { key: 'n' })
+    fireEvent.keyDown(document.activeElement ?? window, { key: 'n' })
+    expect(screen.getByRole('alertdialog')).toBeTruthy()
+    await new Promise((resolve) => setTimeout(resolve, 750))
+    fireEvent.keyDown(document.activeElement ?? window, { key: 'n' })
     expect(engine.sent.at(-1)).toEqual({ kind: 'permission_reply', id: 9, decision: { kind: 'deny', note: null } })
   })
 

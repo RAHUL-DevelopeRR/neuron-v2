@@ -6,6 +6,7 @@ import {
   additionDiff,
   hasFeature,
   parseUnifiedDiff,
+  type CommitProposalEvent,
   type Diff,
   type SessionController,
   type SessionState,
@@ -190,8 +191,20 @@ function ChangesPanel({
   const [bump, setBump] = useState(0)
   const [reverting, setReverting] = useState<string | null>(null)
   const [rewinding, setRewinding] = useState(false)
-  /** How many transcript items there were when the commit went out; what the engine says after it is the outcome. */
-  const [commitMark, setCommitMark] = useState<number | null>(null)
+  /**
+   * The commit in progress, kept here: the session forgets the proposal once the commit is sent, and a failed
+   * commit must not lose the message the user wrote. `mark` is how many transcript items there were when it
+   * went out; what the engine says after that is its outcome.
+   */
+  const [commit, setCommit] = useState<{
+    proposal: CommitProposalEvent
+    message: string
+    phase: 'editing' | 'sending' | 'failed'
+    error: string | null
+    mark: number
+  } | null>(null)
+  /** What the engine said about the last commit that went through; it belongs to that commit only. */
+  const [commitOutcome, setCommitOutcome] = useState<string | null>(null)
   /** The `diff` answer there was when the open chat file's diff was last asked for. */
   const [diffBefore, setDiffBefore] = useState<SessionState['diff']>(null)
 
@@ -211,6 +224,27 @@ function ChangesPanel({
       cancelled = true
     }
   }, [platform, refreshKey, bump])
+
+  // A new draft replaces whatever the last commit left, its outcome included.
+  const proposal = state?.commitProposal ?? null
+  useEffect(() => {
+    if (!proposal) return
+    setCommit({ proposal, message: proposal.message, phase: 'editing', error: null, mark: 0 })
+    setCommitOutcome(null)
+  }, [proposal])
+
+  // After the commit went out, the engine's next error or notice is its answer.
+  const items = state?.items
+  useEffect(() => {
+    if (!commit || commit.phase !== 'sending' || !items) return
+    const answer = items.slice(commit.mark).reverse().find((item) => item.kind === 'error' || item.kind === 'notice')
+    if (!answer) return
+    if (answer.kind === 'error') setCommit({ ...commit, phase: 'failed', error: answer.text })
+    else if (answer.kind === 'notice') {
+      setCommit(null)
+      setCommitOutcome(answer.text)
+    }
+  }, [commit, items])
 
   // This folder: the file's diff, read from git here.
   useEffect(() => {
@@ -277,8 +311,6 @@ function ChangesPanel({
   }
 
   const folderChange = (path: string) => status?.changes.find((entry) => entry.path === path)
-  const outcome =
-    commitMark !== null && state ? state.items.slice(commitMark).reverse().find((item) => item.kind === 'error' || item.kind === 'notice') : undefined
 
   const chatDiff = (path: string) => {
     if (busy) return <div className="muted pad">The diff loads when the agent is idle</div>
@@ -309,7 +341,7 @@ function ChangesPanel({
               disabled={busy}
               title={busy ? 'Wait until the agent is idle' : 'Draft a commit message for these changes'}
               onClick={() => {
-                setCommitMark(null)
+                setCommitOutcome(null)
                 controller?.proposeCommit()
               }}
             >
@@ -325,20 +357,27 @@ function ChangesPanel({
           {actionError}
         </div>
       )}
-      {outcome && (
-        <div className={outcome.kind === 'error' ? 'error-line small' : 'commit-outcome'} role={outcome.kind === 'error' ? 'alert' : 'status'}>
-          {outcome.text}
+      {commitOutcome && (
+        <div className="commit-outcome" role="status">
+          {commitOutcome}
         </div>
       )}
-      {state?.commitProposal && (
+      {commit && (
         <CommitCard
-          proposal={state.commitProposal}
+          proposal={commit.proposal}
+          message={commit.message}
+          sending={commit.phase === 'sending'}
+          error={commit.phase === 'failed' ? commit.error : null}
           busy={busy}
+          onMessage={(message) => setCommit({ ...commit, message })}
           onCommit={(message) => {
-            setCommitMark(state.items.length)
+            setCommit({ ...commit, message, phase: 'sending', error: null, mark: state?.items.length ?? 0 })
             controller?.commit(message)
           }}
-          onCancel={() => controller?.dismissCommit()}
+          onCancel={() => {
+            if (state?.commitProposal) controller?.dismissCommit()
+            setCommit(null)
+          }}
         />
       )}
 

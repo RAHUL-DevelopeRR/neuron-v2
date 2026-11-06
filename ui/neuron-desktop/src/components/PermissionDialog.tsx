@@ -2,14 +2,25 @@ import { useEffect, useRef, useState } from 'react'
 
 import { diffLines, additionDiff, toolView, type PendingPermission, type PermissionDecision } from '@neuron/client'
 
-import { useKeys } from '../hooks'
+import { useFocusTrap } from '../a11y'
 import { DiffView } from './DiffView'
 
+/** The dialog must have had focus this long before a key can answer it. */
+const FOCUS_GUARD_MS = 700
+
+/** Whether the user is typing something that a stray key would break into. */
+function typingText(element: Element | null): boolean {
+  return (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) && element.value.trim() !== ''
+}
+
 /**
- * A tool call waits for the user. Keys: Enter (or y) allows once, a allows for the
- * session (when the engine offers it), Esc (or n) denies, e denies with a note.
- * Keys are ignored for the first 300 ms, so typing in the composer can't answer
- * it. Focus moves into the dialog, stays inside it, and goes back to where it was.
+ * A tool call waits for the user. Keys: Enter allows once, Esc denies; while focus is
+ * inside the dialog, y allows once, a allows for the session (when the engine offers it),
+ * n denies and e denies with a note. No key answers with ctrl, meta or alt held, while it
+ * repeats, or in the first 700 ms after the dialog got focus, so typing meant for the
+ * composer can't answer it. Focus moves to the dialog's title, unless the composer holds
+ * text: then the dialog stays visible and announced, and Tab or a click moves into it.
+ * Inside, Tab stays, and focus goes back to where it was on close.
  */
 export function PermissionDialog({
   pending,
@@ -26,57 +37,73 @@ export function PermissionDialog({
   const view = toolView(request.tool, request.input, cwd)
   const sessionAllowed = request.session_prefixes.length > 0
   const dialog = useRef<HTMLDivElement>(null)
+  const title = useRef<HTMLHeadingElement>(null)
+  // The composer holds text: do not take focus away from it.
+  const [deferred, setDeferred] = useState(() => typingText(document.activeElement))
+  const readyAt = useRef(Date.now() + FOCUS_GUARD_MS)
 
-  // Focus goes to the dialog itself (not a button, so a held Enter can't answer it), and back after.
+  // Focus goes to the title (not a button, so a held Enter can't answer it), is kept inside, and goes back after.
+  useFocusTrap(dialog, !deferred)
+
+  const answer = useRef(onAnswer)
+  answer.current = onAnswer
+  const state = useRef({ noting, sessionAllowed, deferred })
+  state.current = { noting, sessionAllowed, deferred }
+
   useEffect(() => {
-    const before = document.activeElement instanceof HTMLElement ? document.activeElement : null
-    dialog.current?.focus()
-    return () => {
-      if (before?.isConnected) before.focus()
-    }
-  }, [])
-
-  useKeys(!noting, (event) => {
-    if (event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLInputElement) return
-    // A focused button takes Enter itself.
-    if (event.key === 'Enter' && event.target instanceof HTMLButtonElement) return
-    const key = event.key.toLowerCase()
-    if (key === 'y' || key === 'enter') onAnswer({ kind: 'allow_once' })
-    else if (key === 'a' && sessionAllowed) onAnswer({ kind: 'allow_for_session' })
-    else if (key === 'n' || key === 'escape') onAnswer({ kind: 'deny', note: null })
-    else if (key === 'e') {
+    const onKey = (event: KeyboardEvent) => {
+      const current = state.current
+      const root = dialog.current
+      if (!root) return
+      const inside = event.target instanceof Node && root.contains(event.target)
+      // Still holding the composer's text: Tab is the way in.
+      if (event.key === 'Tab' && current.deferred && !inside) {
+        event.preventDefault()
+        setDeferred(false)
+        return
+      }
+      if (current.noting || event.ctrlKey || event.metaKey || event.altKey || event.repeat) return
+      if (event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLInputElement) return
+      if (Date.now() < readyAt.current) return
+      // A focused button takes Enter itself.
+      if (event.key === 'Enter' && event.target instanceof HTMLButtonElement) return
+      const key = event.key.toLowerCase()
+      const bare = key === 'y' || key === 'a' || key === 'n' || key === 'e'
+      if (bare && !inside) return
+      if ((key === 'enter' || key === 'escape') && current.deferred) return
+      if (key === 'y' || key === 'enter') answer.current({ kind: 'allow_once' })
+      else if (key === 'a' && current.sessionAllowed) answer.current({ kind: 'allow_for_session' })
+      else if (key === 'n' || key === 'escape') answer.current({ kind: 'deny', note: null })
+      else if (key === 'e') setNoting(true)
+      else return
       event.preventDefault()
-      setNoting(true)
-    } else return
-    event.preventDefault()
-  })
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
 
   return (
     <div className="dialog-backdrop">
       <div
         ref={dialog}
-        tabIndex={-1}
         className="dialog permission"
-        role="dialog"
+        role="alertdialog"
         aria-modal="true"
         aria-labelledby="permission-title"
-        onKeyDown={(event) => {
-          if (event.key !== 'Tab') return
-          const items = [...event.currentTarget.querySelectorAll<HTMLElement>('button, textarea, input, [href]')].filter((item) => !item.hasAttribute('disabled'))
-          if (items.length === 0) return
-          const first = items[0]
-          const last = items[items.length - 1]
-          const at = document.activeElement
-          if (event.shiftKey && (at === first || at === event.currentTarget)) {
-            event.preventDefault()
-            last.focus()
-          } else if (!event.shiftKey && at === last) {
-            event.preventDefault()
-            first.focus()
-          }
+        onFocus={() => {
+          // Focus is in the dialog now: its keys count from this moment.
+          readyAt.current = Date.now() + FOCUS_GUARD_MS
+        }}
+        onMouseDown={() => setDeferred(false)}
+        onBlur={(event) => {
+          if (event.relatedTarget || deferred) return
+          // Focus fell to the page (a button went away): bring it back.
+          setTimeout(() => {
+            if (dialog.current && (document.activeElement === document.body || document.activeElement === null)) title.current?.focus()
+          }, 0)
         }}
       >
-        <h2 id="permission-title">
+        <h2 id="permission-title" ref={title} tabIndex={-1} data-autofocus>
           Allow <code>{request.tool}</code>?
         </h2>
         {request.reason && <p className="permission-reason">{request.reason}</p>}

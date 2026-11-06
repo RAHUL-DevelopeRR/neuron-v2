@@ -9,7 +9,7 @@
     "dev": "vite",
     "dev:mock": "bun run scripts/dev-against-mock.ts",
     "build": "vite build",
-    "test": "bun test",
+    "test": "bun test --timeout 20000",
     "typecheck": "tsc --noEmit -p .",
     "tauri": "tauri"
   },

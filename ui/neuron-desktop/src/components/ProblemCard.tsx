@@ -136,14 +136,16 @@ const ENGINE_HINT: Partial<Record<EngineProblemCode, string>> = {
 /** L5: an engine problem as a card: what happened, and what to do about it. */
 export function EngineProblemCard({ problem, actions }: { problem: EngineProblem; actions: EngineProblemActions }) {
   const [copied, setCopied] = useState(false)
+  const [copyFailed, setCopyFailed] = useState(false)
   const title = ENGINE_TITLE[problem.code]
   const copy = () => {
+    setCopyFailed(false)
     void actions.onCopyDiagnostics().then(
       () => {
         setCopied(true)
         setTimeout(() => setCopied(false), 1500)
       },
-      () => {},
+      () => setCopyFailed(true),
     )
   }
   return (
@@ -171,7 +173,7 @@ export function EngineProblemCard({ problem, actions }: { problem: EngineProblem
         <button onClick={copy}>Copy diagnostics</button>
         <External label="Open help" url={LINKS.help} onOpen={actions.onOpenLink} />
         <span className="muted small" role="status">
-          {copied ? 'Copied' : ''}
+          {copied ? 'Copied' : copyFailed ? 'Could not copy' : ''}
         </span>
       </div>
     </section>

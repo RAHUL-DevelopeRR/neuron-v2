@@ -301,9 +301,44 @@ describe('the commit card', () => {
     fireEvent.change(box, { target: { value: 'My own words' } })
     fireEvent.click(within(pane()).getByRole('button', { name: 'Commit changes' }))
     expect(commands()).toEqual([{ kind: 'command', type: 'commit', message: 'My own words' }])
-    // The controller reports the proposal as done with.
-    rerender(reduceSession(proposed, { type: 'local/commit_sent', message: 'My own words' }))
+    // The controller reports the proposal as done with: the card stays, committing, until the engine answers.
+    const sentState = reduceSession(proposed, { type: 'local/commit_sent', message: 'My own words' })
+    rerender(sentState)
+    expect(within(pane()).getByRole('button', { name: 'Committing…' })).toBeTruthy()
+    expect((within(pane()).getByRole('textbox', { name: 'Commit message' }) as HTMLTextAreaElement).value).toBe('My own words')
+    rerender(reduceSession(sentState, { type: 'notice', message: 'Committed 1a2b3c4 on main' }))
     expect(within(pane()).queryByRole('form', { name: 'Commit' })).toBeNull()
+    expect(within(pane()).getByRole('status').textContent).toContain('Committed 1a2b3c4 on main')
+  })
+
+  test('a failed commit shows the card again with the message and the error, and can be retried', () => {
+    const { controller, commands } = recorder()
+    const proposed = build(ready(), PROPOSAL)
+    const { rerender } = mount(proposed, undefined, controller)
+    fireEvent.change(within(pane()).getByRole('textbox', { name: 'Commit message' }), { target: { value: 'My own words' } })
+    fireEvent.click(within(pane()).getByRole('button', { name: 'Commit changes' }))
+    const sentState = reduceSession(proposed, { type: 'local/commit_sent', message: 'My own words' })
+    rerender(reduceSession(sentState, { type: 'error', message: 'git commit failed: hook rejected it' }))
+    const card = within(pane()).getByRole('form', { name: 'Commit' })
+    expect((within(card).getByRole('textbox', { name: 'Commit message' }) as HTMLTextAreaElement).value).toBe('My own words')
+    expect(within(card).getByRole('alert').textContent).toContain('hook rejected it')
+    fireEvent.click(within(card).getByRole('button', { name: 'Commit changes' }))
+    expect(commands().at(-1)).toEqual({ kind: 'command', type: 'commit', message: 'My own words' })
+    // The old error does not count for the retry.
+    expect(within(pane()).queryByRole('alert')).toBeNull()
+  })
+
+  test('the outcome belongs to one commit and goes when the next draft arrives', () => {
+    const proposed = build(ready(), PROPOSAL)
+    const { rerender } = mount(proposed, undefined, recorder().controller)
+    fireEvent.click(within(pane()).getByRole('button', { name: 'Commit changes' }))
+    const sentState = reduceSession(proposed, { type: 'local/commit_sent', message: 'x' })
+    const done = reduceSession(sentState, { type: 'notice', message: 'Committed 1a2b3c4 on main' })
+    rerender(done)
+    expect(within(pane()).getByRole('status').textContent).toContain('Committed')
+    rerender(reduceSession(done, { ...(PROPOSAL as object), message: 'Second draft' } as UiEvent))
+    expect(within(pane()).queryByText(/Committed 1a2b3c4/)).toBeNull()
+    expect((within(pane()).getByRole('textbox', { name: 'Commit message' }) as HTMLTextAreaElement).value).toBe('Second draft')
   })
 
   test('commit is off for an empty message', () => {
@@ -320,7 +355,7 @@ describe('the commit card', () => {
     expect(controller.getState().commitProposal).toBeNull()
   })
 
-  test('an engine error after the commit shows next to the card, a notice shows too', () => {
+  test('an engine error after the commit shows in the card', () => {
     const { controller } = recorder()
     const proposed = build(ready(), PROPOSAL)
     const { rerender } = mount(proposed, undefined, controller)
@@ -328,8 +363,6 @@ describe('the commit card', () => {
     const sentState = reduceSession(proposed, { type: 'local/commit_sent', message: 'x' })
     rerender(reduceSession(sentState, { type: 'error', message: 'git commit failed: hook rejected it' }))
     expect(within(pane()).getByRole('alert').textContent).toContain('git commit failed: hook rejected it')
-    rerender(reduceSession(sentState, { type: 'notice', message: 'Committed 1a2b3c4 on main' }))
-    expect(within(pane()).getByRole('status').textContent).toContain('Committed 1a2b3c4 on main')
   })
 
   test('the card passes axe', async () => {
@@ -453,6 +486,21 @@ describe('the restore-point picker', () => {
     expect(summary.textContent).toContain('back in the message box')
     fireEvent.click(screen.getByRole('button', { name: 'Close' }))
     expect(screen.queryByRole('dialog')).toBeNull()
+  })
+
+  test('the status region is there before its text arrives', () => {
+    const base = build(ready(), CHECKPOINTS)
+    const { rerender } = openPicker(base)
+    fireEvent.click(screen.getByRole('radio', { name: /Add the greeting/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Preview' }))
+    const previewed = reduceSession(base, dryRun())
+    rerender(previewed)
+    fireEvent.click(screen.getByRole('button', { name: 'Restore' }))
+    const region = screen.getByRole('status')
+    expect(region.textContent).toBe('')
+    rerender(reduceSession(previewed, dryRun({ dry_run: false })))
+    expect(screen.getByRole('status')).toBe(region)
+    expect(region.textContent).toContain('Put back')
   })
 
   test('busy: the picker says to wait and offers no preview', () => {

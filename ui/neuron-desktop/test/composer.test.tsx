@@ -5,6 +5,7 @@ import axe from 'axe-core'
 import type { ClientMessage } from '@neuron/client'
 
 import { App } from '../src/App'
+import { Composer, nextMode } from '../src/components/Composer'
 import { availableCommands, transcriptJson, transcriptMarkdown } from '../src/commands'
 import { ALL_FEATURES, FakeEngine, fakePlatform, type FakePlatform } from './fake-platform'
 
@@ -121,7 +122,7 @@ describe('Composer: the slash registry', () => {
     type('/help')
     const help = await screen.findByRole('region', { name: 'Commands' })
     expect(within(help).getByText('/status')).toBeTruthy()
-    expect(within(help).getByText(/Shift\+Tab/)).toBeTruthy()
+    expect(within(help).getByText(/Ctrl\+Shift\+M/)).toBeTruthy()
   })
 })
 
@@ -290,33 +291,186 @@ describe('Composer: the queue', () => {
   })
 })
 
+const cycle = (target: Element) => fireEvent.keyDown(target, { key: 'M', ctrlKey: true, shiftKey: true })
+
 describe('Composer: permission mode', () => {
-  test('Shift+Tab cycles read only, edit, full access and plan', async () => {
+  test('Shift+Tab is left to the browser', async () => {
+    const { engine } = await start()
+    const before = sent(engine, 'slash').length
+    const allowed = fireEvent.keyDown(box(), { key: 'Tab', shiftKey: true })
+    expect(allowed).toBe(true)
+    expect(sent(engine, 'slash').length).toBe(before)
+  })
+
+  test('Ctrl+Shift+M cycles edit, plan and read only, and never full access', async () => {
     const { engine } = await start()
     const last = () => sent(engine, 'slash').at(-1)
-    fireEvent.keyDown(box(), { key: 'Tab', shiftKey: true })
-    expect(last()).toEqual({ kind: 'command', type: 'slash', command: 'permissions', args: 'danger-full-access' })
-    await emit(engine, engine.status({ permission_mode: 'danger-full-access' }))
-    expect(screen.getByRole('button', { name: 'Permission mode' }).className).toContain('risky')
-    fireEvent.keyDown(box(), { key: 'Tab', shiftKey: true })
+    cycle(box())
     expect(last()).toEqual({ kind: 'command', type: 'slash', command: 'plan', args: 'on' })
-    await emit(engine, engine.status({ permission_mode: 'danger-full-access', plan_mode: true }))
-    fireEvent.keyDown(box(), { key: 'Tab', shiftKey: true })
+    await emit(engine, engine.status({ permission_mode: 'workspace-write', plan_mode: true }))
+    cycle(box())
     expect(sent(engine, 'slash').slice(-2)).toEqual([
       { kind: 'command', type: 'slash', command: 'plan', args: 'off' },
       { kind: 'command', type: 'slash', command: 'permissions', args: 'read-only' },
     ])
     await emit(engine, engine.status({ permission_mode: 'read-only', plan_mode: false }))
-    fireEvent.keyDown(box(), { key: 'Tab', shiftKey: true })
+    cycle(box())
     expect(last()).toEqual({ kind: 'command', type: 'slash', command: 'permissions', args: 'workspace-write' })
   })
 
-  test('Shift+Tab does nothing while a turn runs', async () => {
+  test('the cycle leaves full access for read only, and nothing leads into it', () => {
+    expect(nextMode('danger-full-access', false)).toEqual({ mode: 'read-only', plan: false })
+    for (const mode of ['read-only', 'workspace-write']) {
+      let at = { mode, plan: false }
+      for (let i = 0; i < 8; i++) {
+        at = nextMode(at.mode, at.plan)
+        expect(at.mode).not.toBe('danger-full-access')
+      }
+    }
+  })
+
+  test('Ctrl+Shift+M does nothing while a turn runs, and the hints name it', async () => {
     const { engine } = await start()
     type('go')
     const before = sent(engine, 'slash').length
-    fireEvent.keyDown(box(), { key: 'Tab', shiftKey: true })
+    cycle(box())
     expect(sent(engine, 'slash').length).toBe(before)
+    expect(screen.getByRole('button', { name: 'Permission mode' }).getAttribute('title')).toContain('Ctrl+Shift+M')
+  })
+})
+
+describe('Composer: keys and menus', () => {
+  test('Enter while an IME composes a word does not send', async () => {
+    const { engine } = await start()
+    fireEvent.change(box(), { target: { value: 'konnichi', selectionStart: 8 } })
+    fireEvent.keyDown(box(), { key: 'Enter', isComposing: true })
+    fireEvent.keyDown(box(), { key: 'Enter', keyCode: 229 })
+    expect(sent(engine, 'submit').length).toBe(0)
+    fireEvent.keyDown(box(), { key: 'Enter' })
+    expect(sent(engine, 'submit').length).toBe(1)
+  })
+
+  test('Esc closes the open menu first, and stops the turn only when none is open', async () => {
+    const { engine } = await start()
+    type('go')
+    fireEvent.change(box(), { target: { value: '/st', selectionStart: 3 } })
+    expect(screen.getByRole('listbox', { name: 'Commands' })).toBeTruthy()
+    fireEvent.keyDown(box(), { key: 'Escape' })
+    expect(screen.queryByRole('listbox', { name: 'Commands' })).toBeNull()
+    expect(sent(engine, 'interrupt').length).toBe(0)
+    fireEvent.keyDown(box(), { key: 'Escape' })
+    expect(sent(engine, 'interrupt').length).toBe(1)
+  })
+
+  test('the box is a combobox that names its list and the active option', async () => {
+    await start()
+    fireEvent.change(box(), { target: { value: '/', selectionStart: 1 } })
+    const field = screen.getByRole('combobox', { name: 'Message Neuron' })
+    expect(field.getAttribute('aria-expanded')).toBe('true')
+    const list = screen.getByRole('listbox', { name: 'Commands' })
+    expect(field.getAttribute('aria-controls')).toBe(list.id)
+    const options = within(list).getAllByRole('option')
+    expect(field.getAttribute('aria-activedescendant')).toBe(options[0].id)
+    fireEvent.keyDown(box(), { key: 'ArrowDown' })
+    expect(field.getAttribute('aria-activedescendant')).toBe(options[1].id)
+    expect(new Set(options.map((option) => option.id)).size).toBe(options.length)
+    fireEvent.change(box(), { target: { value: 'plain', selectionStart: 5 } })
+    expect(field.getAttribute('aria-expanded')).toBe('false')
+    expect(field.getAttribute('aria-activedescendant')).toBeNull()
+  })
+
+  test('while a question is open, images and @ attach nothing and a hint says why', async () => {
+    const { engine, platform } = await start({ supports_images: true })
+    type('go')
+    await emit(engine, { type: 'question', id: 2, question: 'Which?', options: [] })
+    paste(pngFile())
+    expect(await screen.findByText(/Answer the question first/)).toBeTruthy()
+    expect(platform.staged).toEqual([])
+    expect(screen.queryByRole('button', { name: 'Remove image shot.png' })).toBeNull()
+    fireEvent.change(box(), { target: { value: 'see @src', selectionStart: 8 } })
+    expect(screen.getByText(/Files cannot go with an answer/)).toBeTruthy()
+    expect(screen.queryByRole('listbox', { name: 'Files' })).toBeNull()
+  })
+
+  test('attachments staged before a question stay for the next message', async () => {
+    const { engine } = await start({ supports_images: true })
+    type('go')
+    paste(pngFile())
+    await screen.findByRole('button', { name: 'Remove image shot.png' })
+    await emit(engine, { type: 'question', id: 2, question: 'Which?', options: [] })
+    type('the answer')
+    expect(sent(engine, 'answer').at(-1)).toEqual({ kind: 'command', type: 'answer', id: 2, text: 'the answer' })
+    expect(screen.getByRole('button', { name: 'Remove image shot.png' })).toBeTruthy()
+  })
+})
+
+describe('Composer: the queue pauses', () => {
+  test('Stop pauses the queue; Resume sends it', async () => {
+    const { engine } = await start()
+    type('first')
+    type('second')
+    fireEvent.click(screen.getByRole('button', { name: /stop/i }))
+    await finishTurn(engine)
+    expect(await screen.findByText(/Queue paused/)).toBeTruthy()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(sent(engine, 'submit').map((message) => message.text)).toEqual(['first'])
+    fireEvent.click(screen.getByRole('button', { name: 'Resume' }))
+    await waitFor(() => expect(sent(engine, 'submit').map((message) => message.text)).toEqual(['first', 'second']))
+    expect(screen.queryByText(/Queue paused/)).toBeNull()
+  })
+
+  test('Esc pauses it too', async () => {
+    const { engine } = await start()
+    type('first')
+    type('second')
+    fireEvent.keyDown(box(), { key: 'Escape' })
+    await finishTurn(engine)
+    expect(await screen.findByText(/Queue paused/)).toBeTruthy()
+    expect(sent(engine, 'submit').length).toBe(1)
+  })
+
+  function renderBare(props: Partial<React.ComponentProps<typeof Composer>> = {}) {
+    const sentTexts: string[] = []
+    const base = {
+      busy: false,
+      disabled: false,
+      questionWaiting: false,
+      enterSends: true,
+      searchFiles: async () => [],
+      onSend: (text: string) => sentTexts.push(text),
+      onInterrupt: () => {},
+      sessionId: 'a',
+    }
+    const view = render(<Composer {...base} {...props} />)
+    const again = (next: Partial<React.ComponentProps<typeof Composer>>) => view.rerender(<Composer {...base} {...props} {...next} />)
+    const field = () => screen.getByLabelText('Message Neuron') as HTMLTextAreaElement
+    const enter = (value: string) => {
+      fireEvent.change(field(), { target: { value, selectionStart: value.length } })
+      fireEvent.keyDown(field(), { key: 'Enter' })
+    }
+    return { sentTexts, again, enter }
+  }
+
+  test('a failed turn holds the queue', async () => {
+    const { sentTexts, again, enter } = renderBare({ busy: true })
+    enter('queued')
+    again({ busy: true, turnFailed: true })
+    again({ busy: false, turnFailed: true })
+    expect(await screen.findByText(/Queue paused/)).toBeTruthy()
+    expect(sentTexts).toEqual([])
+    fireEvent.click(screen.getByRole('button', { name: 'Resume' }))
+    await waitFor(() => expect(sentTexts).toEqual(['queued']))
+  })
+
+  test('a new session id clears the queue', async () => {
+    const { sentTexts, again, enter } = renderBare({ busy: true })
+    enter('queued')
+    expect(screen.getByRole('list', { name: 'Queued messages' })).toBeTruthy()
+    again({ busy: true, sessionId: 'b' })
+    await waitFor(() => expect(screen.queryByRole('list', { name: 'Queued messages' })).toBeNull())
+    again({ busy: false, sessionId: 'b' })
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(sentTexts).toEqual([])
   })
 })
 
@@ -351,14 +505,14 @@ describe('Approvals', () => {
       { type: 'tool_call_started', id: 't', name: 'bash', input, cut_off: false },
       { type: 'permission_requested', id: 7, request: { tool: 'bash', current_mode: 'workspace-write', required_mode: 'danger-full-access', reason: null, input, session_prefixes } },
     )
-    await new Promise((resolve) => setTimeout(resolve, 350))
+    await new Promise((resolve) => setTimeout(resolve, 750))
   }
   const reply = (engine: FakeEngine) => engine.sent.at(-1)
 
   test('focus moves into the dialog, and Enter allows once', async () => {
     const { engine } = await start()
     await ask(engine)
-    const dialog = screen.getByRole('dialog')
+    const dialog = screen.getByRole('alertdialog')
     expect(dialog.contains(document.activeElement)).toBe(true)
     fireEvent.keyDown(document.activeElement ?? window, { key: 'Enter' })
     expect(reply(engine)).toEqual({ kind: 'permission_reply', id: 7, decision: { kind: 'allow_once' } })
@@ -371,10 +525,86 @@ describe('Approvals', () => {
     expect(reply(engine)).toEqual({ kind: 'permission_reply', id: 7, decision: { kind: 'deny', note: null } })
   })
 
+  test('keys meant for something else never answer', async () => {
+    const { engine } = await start()
+    await ask(engine, ['git'])
+    const target = document.activeElement ?? window
+    const before = engine.sent.length
+    for (const init of [
+      { key: 'Enter', ctrlKey: true },
+      { key: 'Enter', metaKey: true },
+      { key: 'y', altKey: true },
+      { key: 'Enter', repeat: true },
+      { key: 'Escape', repeat: true },
+      { key: 'n', ctrlKey: true },
+    ]) {
+      fireEvent.keyDown(target, init)
+    }
+    expect(engine.sent.length).toBe(before)
+    expect(screen.getByRole('alertdialog')).toBeTruthy()
+  })
+
+  test('bare letters work only while focus is inside the dialog', async () => {
+    const { engine } = await start()
+    await ask(engine)
+    const before = engine.sent.length
+    fireEvent.keyDown(document.body, { key: 'y' })
+    fireEvent.keyDown(window, { key: 'n' })
+    expect(engine.sent.length).toBe(before)
+    fireEvent.keyDown(document.activeElement ?? window, { key: 'y' })
+    expect(reply(engine)).toEqual({ kind: 'permission_reply', id: 7, decision: { kind: 'allow_once' } })
+  })
+
+  test('refocusing the dialog restarts the guard', async () => {
+    const { engine } = await start()
+    await ask(engine)
+    const dialog = screen.getByRole('alertdialog')
+    const button = within(dialog).getAllByRole('button')[0]
+    act(() => button.focus())
+    fireEvent.keyDown(dialog, { key: 'Escape' })
+    expect(screen.getByRole('alertdialog')).toBeTruthy()
+    await new Promise((resolve) => setTimeout(resolve, 750))
+    fireEvent.keyDown(dialog, { key: 'Escape' })
+    expect(reply(engine)).toEqual({ kind: 'permission_reply', id: 7, decision: { kind: 'deny', note: null } })
+  })
+
+  test('a composer that holds text keeps focus; Tab moves into the dialog', async () => {
+    const { engine } = await start()
+    type('first')
+    box().focus()
+    fireEvent.change(box(), { target: { value: 'half a sentence', selectionStart: 15 } })
+    const input = '{"command":"git push"}'
+    await emit(
+      engine,
+      { type: 'tool_call_started', id: 't', name: 'bash', input, cut_off: false },
+      { type: 'permission_requested', id: 7, request: { tool: 'bash', current_mode: 'workspace-write', required_mode: 'danger-full-access', reason: null, input, session_prefixes: [] } },
+    )
+    await new Promise((resolve) => setTimeout(resolve, 750))
+    const dialog = screen.getByRole('alertdialog')
+    expect(document.activeElement).toBe(box())
+    // Keys typed into the composer never answer.
+    const before = engine.sent.length
+    fireEvent.keyDown(box(), { key: 'Enter' })
+    fireEvent.keyDown(box(), { key: 'y' })
+    expect(engine.sent.filter((m) => m.kind === 'permission_reply')).toEqual([])
+    expect(engine.sent.length).toBe(before)
+    fireEvent.keyDown(box(), { key: 'Tab' })
+    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true))
+  })
+
+  test('focus that falls to the page goes back into the dialog', async () => {
+    const { engine } = await start()
+    await ask(engine)
+    const dialog = screen.getByRole('alertdialog')
+    act(() => within(dialog).getAllByRole('button')[0].focus())
+    act(() => (document.activeElement as HTMLElement | null)?.blur())
+    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true))
+  })
+
   test('the buttons show their keys', async () => {
     const { engine } = await start()
     await ask(engine)
-    const dialog = screen.getByRole('dialog')
+    const dialog = screen.getByRole('alertdialog')
     expect(within(dialog).getByRole('button', { name: /allow once/i }).textContent).toContain('Enter')
     expect(within(dialog).getByRole('button', { name: /^deny esc/i }).textContent).toContain('Esc')
   })
@@ -382,11 +612,11 @@ describe('Approvals', () => {
   test('deny with a note sends the note, and Esc in the note goes back instead of denying', async () => {
     const { engine } = await start()
     await ask(engine)
-    const dialog = screen.getByRole('dialog')
+    const dialog = screen.getByRole('alertdialog')
     fireEvent.click(within(dialog).getByRole('button', { name: /deny with a note/i }))
     const note = within(dialog).getByPlaceholderText('Tell Neuron what to do instead')
     fireEvent.keyDown(note, { key: 'Escape' })
-    expect(screen.getByRole('dialog')).toBeTruthy()
+    expect(screen.getByRole('alertdialog')).toBeTruthy()
     expect(within(dialog).queryByPlaceholderText('Tell Neuron what to do instead')).toBeNull()
     fireEvent.click(within(dialog).getByRole('button', { name: /deny with a note/i }))
     const again = within(dialog).getByPlaceholderText('Tell Neuron what to do instead')
@@ -398,7 +628,7 @@ describe('Approvals', () => {
   test('Tab stays inside the dialog', async () => {
     const { engine } = await start()
     await ask(engine, ['git'])
-    const dialog = screen.getByRole('dialog')
+    const dialog = screen.getByRole('alertdialog')
     const buttons = within(dialog).getAllByRole('button')
     buttons.at(-1)!.focus()
     fireEvent.keyDown(buttons.at(-1)!, { key: 'Tab' })
@@ -416,8 +646,8 @@ describe('Approvals', () => {
     type('queued')
     await expectAccessible(document.querySelector('.composer')!)
     await ask(engine, ['git'])
-    await expectAccessible(screen.getByRole('dialog'))
-  })
+    await expectAccessible(screen.getByRole('alertdialog'))
+  }, 30_000)
 })
 
 describe('/copy and /export', () => {

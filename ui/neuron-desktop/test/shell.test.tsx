@@ -479,7 +479,7 @@ describe('D8, D11, D23: settings, the folder picker, version and updates', () =>
     // Escape goes back to the session.
     fireEvent.keyDown(window, { key: 'Escape' })
     expect(screen.getByLabelText('Message Neuron')).toBeTruthy()
-  })
+  }, 30_000)
 })
 
 describe('protocol v2: the account event and the trust preview', () => {

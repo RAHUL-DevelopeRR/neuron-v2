@@ -75,6 +75,14 @@ const MAX_READ_BYTES = 512 * 1024
 const MAX_LIST_ENTRIES = 2_000
 const MAX_TERMINALS_PER_CLIENT = 4
 
+/** Slash commands that only read; remote peers may send nothing else. */
+const REMOTE_SLASH = new Set(['help', 'status', 'cost', 'context', 'usage', 'doctor', 'changes', 'diff', 'stats', 'memory', 'model'])
+const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+const LOOPBACK_HOST = /^(localhost|127\.0\.0\.1|\[::1\])(:\d{1,5})?$/i
+
+/** A session id or `latest`, never a path. */
+const isSessionRef = (value: unknown): boolean => typeof value === 'string' && (value === 'latest' || SESSION_ID.test(value))
+
 const isLoopback = (address: string) => address === '::1' || address.startsWith('127.') || address === '::ffff:127.0.0.1'
 
 /** The user's shell, as a terminal pane runs it. */
@@ -204,7 +212,8 @@ export class NeuronHost {
     try {
       const { hostname, host } = new URL(origin)
       if (['localhost', '127.0.0.1', '[::1]', 'tauri.localhost'].includes(hostname)) return true
-      return host === hostHeader
+      // A page served by this host itself: its Host header must still be a loopback name.
+      return hostHeader !== null && host === hostHeader && LOOPBACK_HOST.test(hostHeader)
     } catch {
       return false
     }
@@ -285,6 +294,17 @@ export class NeuronHost {
     // These change the workspace, the history or the user's settings, and the phone app has no screen for them yet.
     if (message.type === 'commit' || message.type === 'set_mcp_server_enabled' || (message.type === 'rewind' && message.dry_run !== true)) {
       return refuse('Only the Neuron desktop app can change your files, history or settings.')
+    }
+    if (!socket.data.local) {
+      if (message.type === 'slash') {
+        const name = message.command.trim().toLowerCase()
+        const allowed =
+          REMOTE_SLASH.has(name) || (name === 'resume' && isSessionRef(typeof message.args === 'string' ? message.args.trim() : ''))
+        if (!allowed) return refuse('Only the Neuron desktop app can change your files, history or settings.')
+      }
+      if (message.type === 'resume' && !isSessionRef(message.session)) {
+        return refuse('A remote client can only resume a session by its id.')
+      }
     }
     if (message.type === 'trust_workspace' && !socket.data.local) {
       return refuse('Only the machine running Neuron can trust its workspace.')
