@@ -126,9 +126,15 @@ struct Run {
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<Run, String> {
+    git_with(dir, &[], args)
+}
+
+/// [`git`] with more `-c name=value` settings in front of the subcommand.
+fn git_with(dir: &Path, config: &[String], args: &[&str]) -> Result<Run, String> {
     let mut command = Command::new("git");
     command
         .args(["-c", "core.longpaths=true", "-c", "core.fsmonitor=false"])
+        .args(config.iter().flat_map(|setting| ["-c", setting.as_str()]))
         .args(args)
         .current_dir(dir)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -259,8 +265,19 @@ pub fn create(
     }
     let branch = format!("neuron/{slug}");
     let path = root.join(&slug);
-    let made = git(
+    // The repository's own hooks (post-checkout) must not run when the copy is
+    // made: git looks for hooks in an empty folder instead.
+    let hooks = app_data.join("no-hooks");
+    fs::create_dir_all(&hooks)
+        .map_err(|error| format!("could not make {}: {error}", hooks.display()))?;
+    let hooks = fs::canonicalize(&hooks).map_err(|error| error.to_string())?;
+    let config = [format!(
+        "core.hooksPath={}",
+        plain(&hooks).to_string_lossy().replace('\\', "/")
+    )];
+    let made = git_with(
         &top,
+        &config,
         &[
             "worktree",
             "add",
@@ -534,6 +551,37 @@ mod tests {
         let second = create(&sandbox.data(), &sandbox.repo(), Some("Fix Login!")).unwrap();
         assert_eq!(second.slug, "fix-login-2");
         assert_eq!(second.branch, "neuron/fix-login-2");
+    }
+
+    #[test]
+    fn a_repository_hook_does_not_run_when_the_copy_is_made() {
+        let sandbox = Sandbox::new("hooks");
+        let marker = sandbox.dir.join("hook-ran");
+        let hook = sandbox.repo().join(".git/hooks/post-checkout");
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\necho ran > \"{}\"\n",
+                marker.to_string_lossy().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // The hook works when git is asked to run it (the test's own check).
+        sandbox.git(
+            &sandbox.repo(),
+            &["worktree", "add", "-q", "--detach", "../probe", "HEAD"],
+        );
+        assert!(marker.exists(), "the hook should run for a plain git call");
+        fs::remove_file(&marker).unwrap();
+
+        let record = create(&sandbox.data(), &sandbox.repo(), Some("hooked")).unwrap();
+        assert!(record.path.join("a.txt").is_file());
+        assert!(!marker.exists(), "the repository's hook ran");
     }
 
     #[test]
