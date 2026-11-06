@@ -15,10 +15,10 @@ name = "neuron_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2.5", features = [] }
+tauri-build = { version = "~2.7", features = [] }
 
 [dependencies]
-tauri = { version = "2.9", features = [] }
+tauri = { version = "~2.12", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 portable-pty = "0.9"
