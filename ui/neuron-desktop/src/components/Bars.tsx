@@ -1,4 +1,23 @@
-import { formatTokens, sessionAccount, type SessionState } from '@neuron/client'
+import { formatTokens, sessionAccount, type ModelInfo, type SessionState } from '@neuron/client'
+
+/** The last part of a model or route id: `nvidia/nvidia/nemotron-3` is `nemotron-3`. */
+function modelPart(id: string): string {
+  return id.split('/').filter(Boolean).pop() ?? id
+}
+
+/**
+ * A model as people read it: its catalog name, or its id without the routing
+ * prefix, which names the upstream provider and is never shown.
+ */
+export function modelLabel(id: string, models: readonly ModelInfo[]): string {
+  const known = models.find((model) => model.id === id)
+  return known?.display_name || modelPart(id)
+}
+
+/** The same model, whichever route served it (`groq/openai/gpt-oss-120b` serves `openai/gpt-oss-120b`). */
+function sameModel(a: string, b: string): boolean {
+  return a === b || modelPart(a).toLowerCase() === modelPart(b).toLowerCase()
+}
 
 /** Above the chat: its title, the project and branch, and the engine. */
 export function ChatHeader({
@@ -118,12 +137,12 @@ export function StatusBar({ state, onPane }: { state: SessionState; onPane: (pan
       )}
       <div className="spacer" />
       {state.busy && <span className="busy-label">working…</span>}
-      {served && served !== model && (
+      {served && !sameModel(served, model) && (
         <span className="served-model status-low" title="The model that answered, when it is not the one you picked">
-          answered by {served}
+          answered by {modelLabel(served, state.models)}
         </span>
       )}
-      <span className="model-tag">{model}</span>
+      <span className="model-tag">{modelLabel(model, state.models)}</span>
     </footer>
   )
 }

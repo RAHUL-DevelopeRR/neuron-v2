@@ -391,6 +391,24 @@ describe('status-bar meter', () => {
     expect(other.container.textContent).not.toContain('answered by')
   })
 
+  test('names models as people read them, never by a provider route', () => {
+    const models = {
+      type: 'models',
+      current: 'auto',
+      models: [{ id: 'openai/gpt-oss-120b', display_name: 'GPT-OSS 120B', available: true, unavailable_reason: null, context_window: null, tiers: [] }],
+    } as SessionAction
+    // A gateway route id carries the upstream provider first: show the model, not the provider.
+    const routed = bar(run([models, status({ model: 'auto', served_model: 'nvidia/nvidia/nemotron-3-ultra-550b-a55b' })]))
+    expect(routed.container.textContent).toContain('answered by nemotron-3-ultra-550b-a55b')
+    expect(routed.container.textContent).not.toMatch(/nvidia/i)
+    routed.unmount()
+    // A catalog model shows its display name; a route serving that same model is not news.
+    const picked = bar(run([models, status({ model: 'openai/gpt-oss-120b', served_model: 'groq/openai/gpt-oss-120b' })]))
+    expect(picked.container.textContent).toContain('GPT-OSS 120B')
+    expect(picked.container.textContent).not.toContain('answered by')
+    expect(picked.container.textContent).not.toMatch(/groq/i)
+  })
+
   test('no quota line below 80%', () => {
     const { container } = bar(withAccount())
     expect(container.querySelector('.quota')).toBeNull()

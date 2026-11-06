@@ -7,7 +7,8 @@ import type { KeyValueStore, Platform } from '../platform'
 
 /** The permission modes, as the mode menu offers them. */
 export const MODES: Array<{ id: string; label: string; help: string }> = [
-  { id: 'read-only', label: 'Read only', help: 'Reads and searches; asks before any change' },
+  // The engine refuses a change in read-only mode instead of asking (runtime permissions).
+  { id: 'read-only', label: 'Read only', help: 'Reads and searches; refuses any change' },
   { id: 'workspace-write', label: 'Edit files', help: 'Edits in this project; asks before commands that reach further' },
   { id: 'danger-full-access', label: 'Full access', help: 'Runs anything without asking. Use with care' },
 ]
