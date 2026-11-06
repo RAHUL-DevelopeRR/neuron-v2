@@ -33,15 +33,51 @@ pub const CREDENTIAL_ENV_VARS: &[&str] = &[
     "GROK_API_KEY",
     "DASHSCOPE_API_KEY",
     "OPENROUTER_API_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "DATABASE_URL",
+    "REDIS_URL",
+    "PGPASSWORD",
+    "MYSQL_PWD",
+    "KUBECONFIG",
 ];
 
 /// Name suffixes that mark any other variable as a secret (`GITHUB_TOKEN`,
 /// `STRIPE_SECRET`, `MISTRAL_API_KEY`); matched after a `_` or as the whole
 /// name, ignoring case.
-pub const CREDENTIAL_ENV_SUFFIXES: &[&str] = &["API_KEY", "TOKEN", "SECRET"];
+pub const CREDENTIAL_ENV_SUFFIXES: &[&str] = &[
+    "API_KEY",
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIALS",
+    "SECRET_KEY",
+    "ACCESS_KEY",
+    "PRIVATE_KEY",
+    "SECRET_ACCESS_KEY",
+    "CONNECTION_STRING",
+    "DSN",
+    "URI",
+];
 
 /// Value prefixes of Zero-X credentials (`ses_` CLI sessions, `nzx_` API keys).
 pub const CREDENTIAL_VALUE_PREFIXES: &[&str] = &["ses_", "nzx_"];
+
+/// Value prefixes of common provider keys (`sk-`, GitHub `ghp_`/`gho_`/`ghs_`/
+/// `github_pat_`, AWS `AKIA`/`ASIA`, Slack `xox`). They mark an inherited variable
+/// as a secret for the scrubber; a variable an MCP profile names on purpose is
+/// still passed on.
+pub const PROVIDER_SECRET_VALUE_PREFIXES: &[&str] = &[
+    "sk-",
+    "ghp_",
+    "gho_",
+    "ghs_",
+    "github_pat_",
+    "AKIA",
+    "ASIA",
+    "xoxb-",
+    "xoxp-",
+];
 
 /// Default timeout for hook commands.
 pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_mins(1);
@@ -106,6 +142,7 @@ pub fn is_credential_env(key: &OsStr, value: &OsStr) -> bool {
     let value = value.to_string_lossy();
     CREDENTIAL_VALUE_PREFIXES
         .iter()
+        .chain(PROVIDER_SECRET_VALUE_PREFIXES)
         .any(|prefix| value.starts_with(prefix))
 }
 
@@ -738,6 +775,76 @@ mod tests {
             OsStr::new("SESSION_NAME"),
             OsStr::new("my-ses_name")
         ));
+    }
+
+    #[test]
+    fn detects_more_secret_names_and_provider_value_prefixes() {
+        for key in [
+            "DB_PASSWORD",
+            "POSTGRES_PASSWD",
+            "GOOGLE_CREDENTIALS",
+            "DJANGO_SECRET_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_ACCESS_KEY_ID",
+            "SIGNING_PRIVATE_KEY",
+            "DATABASE_URL",
+            "AZURE_STORAGE_CONNECTION_STRING",
+        ] {
+            assert!(
+                is_credential_env(OsStr::new(key), OsStr::new("plain-value")),
+                "{key}"
+            );
+        }
+        for value in [
+            "sk-live-abc",
+            "ghp_abc",
+            "github_pat_abc",
+            "AKIAABCDEFG",
+            "xoxb-1-2",
+        ] {
+            assert!(
+                is_credential_env(OsStr::new("SOME_VAR"), OsStr::new(value)),
+                "{value}"
+            );
+        }
+        assert!(!is_credential_env(
+            OsStr::new("PASSWORD_POLICY"),
+            OsStr::new("strict")
+        ));
+    }
+
+    #[test]
+    fn detects_database_and_cluster_credentials_by_name() {
+        for key in [
+            "PGPASSWORD",
+            "MYSQL_PWD",
+            "MONGO_URI",
+            "SENTRY_DSN",
+            "REDIS_URL",
+            "KUBECONFIG",
+            "pgpassword",
+            "ANALYTICS_DSN",
+            "CACHE_URI",
+            "DSN",
+            "REDIS_URL",
+        ] {
+            assert!(
+                is_credential_env(OsStr::new(key), OsStr::new("plain-value")),
+                "{key}"
+            );
+        }
+        for key in [
+            "DSNAME",
+            "MYURI",
+            "PURI",
+            "CURL_CA_BUNDLE",
+            "REDIS_URL_FILE_NOT",
+        ] {
+            assert!(
+                !is_credential_env(OsStr::new(key), OsStr::new("plain-value")),
+                "{key}"
+            );
+        }
     }
 
     #[test]

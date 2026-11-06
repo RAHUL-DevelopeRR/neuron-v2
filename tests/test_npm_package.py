@@ -78,7 +78,7 @@ class NpmTarballTests(unittest.TestCase):
         self.cache = self.work / "cache"
 
     def neuron_env(self, base: str, **extra: str) -> Dict[str, str]:
-        return self.base_env(NEURON_DOWNLOAD_BASE=base, NEURON_CACHE_DIR=str(self.cache), **extra)
+        return self.base_env(NEURON_DOWNLOAD_BASE=base, NEURON_CHECKSUMS_BASE=base, NEURON_CACHE_DIR=str(self.cache), **extra)
 
     def install(self, *flags: str) -> Path:
         result = npm("install", "--global", "--prefix", str(self.prefix), *flags, str(self.tarball), cwd=self.work, env=self.base_env())
@@ -105,7 +105,7 @@ class NpmTarballTests(unittest.TestCase):
         self.assertIn(f"neuron-dummy {VERSION}", first.stdout)
         self.assertIn("Downloading Neuron", first.stderr)
         asset = fake_release.current_asset()
-        self.assertEqual(self.server.paths(), [f"/v{VERSION}/{asset}.sha256", f"/v{VERSION}/{asset}"])
+        self.assertEqual(self.server.paths(), [f"/v{VERSION}/SHA256SUMS", f"/v{VERSION}/{asset}.sha256", f"/v{VERSION}/{asset}"])
 
         offline = self.run_neuron(["prompt", "two words"], self.neuron_env(fake_release.unused_loopback_url(), NEURON_DUMMY_EXIT="7"))
         self.assertEqual(offline.returncode, 7, offline.stdout + offline.stderr)

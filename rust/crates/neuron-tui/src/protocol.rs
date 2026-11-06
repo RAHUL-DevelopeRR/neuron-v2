@@ -577,10 +577,13 @@ pub struct ErrorDetail {
 pub struct HookPreview {
     /// `PreToolUse`, `PostToolUse` or `PostToolUseFailure`.
     pub event: String,
-    /// The command it runs (shortened when long).
+    /// The command it runs, in full (cut only past a very long length).
     pub command: String,
     /// The settings file it comes from.
     pub source: String,
+    /// The tool name the hook is limited to; absent when it runs for every tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matcher: Option<String>,
 }
 
 /// An MCP server a workspace's settings would start.
@@ -972,6 +975,16 @@ pub enum UiEvent {
         session_only: bool,
         /// The workspace is trusted already.
         trusted: bool,
+        /// The workspace was trusted before, but its hooks, MCP servers or allow rules
+        /// changed since: the screen says so and lists them again. Added after
+        /// protocol 1: older engines leave it out.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        changed_since_trust: bool,
+        /// With `changed_since_trust`: the settings keys (`env`, `model`, `hooks`, ...)
+        /// that differ from what was trusted, sorted. Empty when the trust record has
+        /// nothing to compare. Added after protocol 1: older engines leave it out.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        changed_settings: Vec<String>,
         /// The workspace's settings files.
         settings_files: Vec<String>,
         hooks: Vec<HookPreview>,

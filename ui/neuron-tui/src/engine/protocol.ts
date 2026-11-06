@@ -515,10 +515,12 @@ export interface ErrorDetail {
 export interface HookPreview {
   /** `PreToolUse`, `PostToolUse` or `PostToolUseFailure`. */
   event: string
-  /** The command it runs (shortened when long). */
+  /** The command it runs, in full (cut only past a very long length). */
   command: string
   /** The settings file it comes from. */
   source: string
+  /** The tool name the hook is limited to; absent when it runs for every tool. */
+  matcher?: string
 }
 
 /** An MCP server a workspace's settings would start. */
@@ -949,6 +951,17 @@ export interface TrustPreviewEvent {
   session_only: boolean
   /** The workspace is trusted already. */
   trusted: boolean
+  /**
+   * The workspace was trusted before, but its hooks, MCP servers or allow
+   * rules changed since: the screen says so and lists them again.
+   */
+  changed_since_trust?: boolean
+  /**
+   * With `changed_since_trust`: the settings keys (`env`, `model`, `hooks`, ...)
+   * that differ from what was trusted, sorted. Empty when there was nothing to
+   * compare. Engines before it leave it out.
+   */
+  changed_settings?: string[]
   /** The workspace's settings files. */
   settings_files: string[]
   hooks: HookPreview[]

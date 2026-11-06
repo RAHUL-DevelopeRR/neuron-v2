@@ -295,7 +295,7 @@ const STRUCT_FIELDS: Record<string, string[]> = {
     'resets_at',
     'retry_after_seconds',
   ]),
-  HookPreview: fieldsOf<HookPreview>()(['event', 'command', 'source']),
+  HookPreview: fieldsOf<HookPreview>()(['event', 'command', 'source', 'matcher']),
   McpServerPreview: fieldsOf<McpServerPreview>()([
     'name',
     'transport',
@@ -433,6 +433,8 @@ const EVENT_FIELDS: { [T in UiEventType]: string[] } = {
     'is_git_root',
     'session_only',
     'trusted',
+    'changed_since_trust',
+    'changed_settings',
     'settings_files',
     'hooks',
     'mcp_servers',

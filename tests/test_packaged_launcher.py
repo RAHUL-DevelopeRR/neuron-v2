@@ -189,11 +189,16 @@ class PackagedLauncherTests(unittest.TestCase):
             launcher, "PACKAGE_VERSION", version
         ), patch.dict(
             os.environ,
-            {"NEURON_BINARY_PATH": "", "NEURON_CACHE_DIR": str(self.cache), "NEURON_DOWNLOAD_BASE": server.base_url},
+            {
+                "NEURON_BINARY_PATH": "",
+                "NEURON_CACHE_DIR": str(self.cache),
+                "NEURON_DOWNLOAD_BASE": server.base_url,
+                "NEURON_CHECKSUMS_BASE": server.base_url,
+            },
         ):
             binary = launcher._find_binary()
             requested = server.paths()
-        self.assertEqual(requested, [f"/v{version}/{asset}.sha256", f"/v{version}/{asset}"])
+        self.assertEqual(requested, [f"/v{version}/SHA256SUMS", f"/v{version}/{asset}.sha256", f"/v{version}/{asset}"])
         self.assertEqual(binary, self.cache / version / asset)
         self.assertEqual(binary.read_bytes(), b"prerelease neuron")
 
@@ -241,8 +246,9 @@ class LauncherReleaseServerTests(unittest.TestCase):
             PYTHONPATH=str(self.site),
             NEURON_CACHE_DIR=str(self.cache),
             NEURON_DOWNLOAD_BASE=base,
-            **extra_env,
         )
+        environment.setdefault("NEURON_CHECKSUMS_BASE", base)
+        environment.update(extra_env)
         return environment
 
     def run_launcher(self, base: str, *args: str, **extra_env: str) -> subprocess.CompletedProcess:
@@ -268,8 +274,8 @@ class LauncherReleaseServerTests(unittest.TestCase):
         self.assertIn(f"neuron-dummy {self.version}", result.stdout)
         self.assertIn("Downloading Neuron", result.stderr)
         prefix = f"/v{self.version}/{self.asset}"
-        self.assertEqual(requested, [f"{prefix}.sha256", prefix])
-        self.assertEqual(self.cached_files(), [self.asset, f"{self.asset}.sha256"])
+        self.assertEqual(requested, [f"/v{self.version}/SHA256SUMS", f"{prefix}.sha256", prefix])
+        self.assertEqual(self.cached_files(), [self.asset, f"{self.asset}.sha256", f"{self.asset}.verified"])
         digest = hashlib.sha256(staged.read_bytes()).hexdigest()
         sidecar = (self.cache / self.version / f"{self.asset}.sha256").read_text(encoding="ascii")
         self.assertEqual(sidecar, f"{digest}  {self.asset}\n")
@@ -321,9 +327,96 @@ class LauncherReleaseServerTests(unittest.TestCase):
         fake_release.write_executable(stale, b"partial download")
         with fake_release.FakeReleaseServer(self.releases) as server:
             result = self.run_launcher(server.base_url, "--version")
-            self.assertEqual(len(server.paths()), 2)
+            self.assertEqual(len(server.paths()), 3)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.cached_files(), [self.asset, f"{self.asset}.sha256"])
+        self.assertEqual(self.cached_files(), [self.asset, f"{self.asset}.sha256", f"{self.asset}.verified"])
+
+    def test_release_sha256sums_must_list_the_asset_with_the_same_hash(self) -> None:
+        data = fake_release.dummy_binary_bytes(self.version)
+        digest = hashlib.sha256(data).hexdigest()
+        cases = {
+            "an empty SHA256SUMS": "",
+            "a SHA256SUMS without the asset": f"{digest}  something-else\n",
+            "a SHA256SUMS with another hash": f"{'1' * 64}  {self.asset}\n",
+        }
+        for name, sums in cases.items():
+            with self.subTest(name):
+                shutil.rmtree(self.releases, ignore_errors=True)
+                shutil.rmtree(self.cache, ignore_errors=True)
+                fake_release.stage_release(self.releases, self.version, self.asset, sums=sums)
+                with fake_release.FakeReleaseServer(self.releases) as server:
+                    result = self.run_launcher(server.base_url, "--version")
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("SHA256SUMS", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(self.cached_files(), [])
+        # No SHA256SUMS at all (HTTP 404).
+        shutil.rmtree(self.releases, ignore_errors=True)
+        fake_release.stage_release(self.releases, self.version, self.asset)
+        (self.releases / f"v{self.version}" / "SHA256SUMS").unlink()
+        with fake_release.FakeReleaseServer(self.releases) as server:
+            absent = self.run_launcher(server.base_url, "--version")
+        self.assertEqual(absent.returncode, 1)
+        self.assertIn("SHA256SUMS", absent.stderr)
+        self.assertEqual(self.cached_files(), [])
+        # A checksums server that is down fails closed as well, and must be HTTPS or loopback.
+        fake_release.stage_release(self.releases, self.version, self.asset)
+        with fake_release.FakeReleaseServer(self.releases) as server:
+            down = self.run_launcher(server.base_url, "--version", NEURON_CHECKSUMS_BASE=fake_release.unused_loopback_url())
+            insecure = self.run_launcher(server.base_url, "--version", NEURON_CHECKSUMS_BASE="http://downloads.example.com")
+        self.assertEqual(down.returncode, 1)
+        self.assertIn("SHA256SUMS", down.stderr)
+        self.assertEqual(insecure.returncode, 1)
+        self.assertIn("NEURON_CHECKSUMS_BASE must be an HTTPS URL", insecure.stderr)
+        self.assertEqual(self.cached_files(), [])
+
+    def test_sha256sums_comes_from_github_by_default_even_with_a_mirror(self) -> None:
+        launcher = load_launcher(self.site)
+        with patch.dict(os.environ, {"NEURON_DOWNLOAD_BASE": "https://mirror.example.com/neuron"}):
+            os.environ.pop("NEURON_CHECKSUMS_BASE", None)
+            self.assertEqual(launcher._checksums_base(), launcher.DEFAULT_DOWNLOAD_BASE)
+        with patch.dict(os.environ, {"NEURON_CHECKSUMS_BASE": "http://127.0.0.1:8/"}):
+            self.assertEqual(launcher._checksums_base(), "http://127.0.0.1:8")
+        with patch.dict(os.environ, {"NEURON_CHECKSUMS_BASE": "http://downloads.example.com"}):
+            with self.assertRaises(launcher.LauncherError):
+                launcher._checksums_base()
+        self.assertEqual(launcher._parse_sums(f"{'AB' * 32}  neuron-linux-x64\n{'c' * 64} *other\n", "neuron-linux-x64"), "ab" * 32)
+        self.assertEqual(launcher._parse_sums(f"{'c' * 64} *other\n", "other"), "c" * 64)
+        self.assertIsNone(launcher._parse_sums(f"{'c' * 64}  neuron-linux-x64-extra\n", "neuron-linux-x64"))
+        self.assertIsNone(launcher._parse_sums("", "neuron-linux-x64"))
+
+    def test_a_cached_binary_that_changed_after_it_was_verified_is_refused(self) -> None:
+        fake_release.stage_release(self.releases, self.version, self.asset)
+        with fake_release.FakeReleaseServer(self.releases) as server:
+            first = self.run_launcher(server.base_url, "--version")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        offline_url = fake_release.unused_loopback_url()
+        binary = self.cache / self.version / self.asset
+        self.assertTrue(binary.with_name(binary.name + ".verified").is_file())
+        warm = self.run_launcher(offline_url, "--version")
+        self.assertEqual(warm.returncode, 0, warm.stderr)
+
+        # Same size, different bytes, new mtime.
+        original = binary.read_bytes()
+        tampered = bytearray(original)
+        tampered[-2] ^= 0x01
+        binary.write_bytes(bytes(tampered))
+        later = binary.stat().st_mtime + 5
+        os.utime(binary, (later, later))
+        refused = self.run_launcher(offline_url, "--version")
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("does not match its recorded SHA-256", refused.stderr)
+        self.assertNotIn("neuron-dummy", refused.stdout)
+        self.assertNotIn("Traceback", refused.stderr)
+
+        # A forged stamp does not excuse a changed file.
+        binary.with_name(binary.name + ".verified").write_text("garbage\n", encoding="ascii")
+        self.assertEqual(self.run_launcher(offline_url, "--version").returncode, 1)
+
+        # Restoring the verified bytes makes it run again.
+        binary.write_bytes(original)
+        restored = self.run_launcher(offline_url, "--version")
+        self.assertEqual(restored.returncode, 0, restored.stderr)
 
     def test_arguments_and_exit_code_are_forwarded(self) -> None:
         fake_release.stage_release(self.releases, self.version, self.asset)

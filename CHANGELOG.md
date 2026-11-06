@@ -5,6 +5,24 @@ The release workflow copies a version's section into its GitHub release notes.
 
 ## 7.0.0-alpha.5 (unreleased)
 
+- Trust hardening: the npm and PyPI launchers now check the downloaded binary against the
+  release `SHA256SUMS` (from the GitHub release even when `NEURON_DOWNLOAD_BASE` is a
+  mirror; `NEURON_CHECKSUMS_BASE` overrides, HTTPS or loopback only) and fail closed when it
+  is missing, empty, does not list the file or disagrees. A cached binary whose size or
+  modification time changed since it was verified is hashed again and not run on a mismatch.
+  `install.sh` refuses redirects away from HTTPS.
+- Trust hardening: folder trust now covers every project setting that applies once trusted
+  (`env`, `model`, plugins, `apiKeyHelper`, a non-restrictive permission mode, ...), not only
+  hooks, MCP servers and allow rules. Changing one asks again, and the trust screen names the
+  keys that changed; settings that only restrict do not ask. What is trusted is what the
+  screen showed: files changed while it was open are not trusted, and it is shown again. A
+  command longer than 2000 characters is cut with a note giving its length and the file that
+  holds all of it. Folders trusted before this release ask once more.
+- Trust hardening: a session approval of `pwsh`, `powershell` or `cmd` no longer covers other
+  calls (`-Command`, `-EncodedCommand`, `/c` and `/k` ask every time; `-File x.ps1` covers
+  that script), the same for `pypy`, `npx`, `bunx`, `uv run` and `npm exec`;
+  `jq -n -- env` is not read-only; the plugin and MCP child environment drops `PGPASSWORD`,
+  `MYSQL_PWD`, `REDIS_URL`, `KUBECONFIG` and names ending in `_DSN` or `_URI`.
 - Trust screen, MCP: each project server shows what it runs (command line or URL,
   secret-looking values redacted) before you tick it, and the approval is bound to
   what was shown: `trust_preview` servers carry `command` and `fingerprint`, and

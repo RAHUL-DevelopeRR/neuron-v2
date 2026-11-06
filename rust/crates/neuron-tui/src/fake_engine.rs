@@ -703,17 +703,21 @@ pub mod samples {
             is_git_root: true,
             session_only: false,
             trusted: false,
+            changed_since_trust: false,
+            changed_settings: Vec::new(),
             settings_files: vec![settings.clone()],
             hooks: vec![
                 HookPreview {
                     event: "PreToolUse".into(),
                     command: "./scripts/check-paths.sh".into(),
                     source: settings.clone(),
+                    matcher: None,
                 },
                 HookPreview {
                     event: "PostToolUse".into(),
                     command: "npm run lint --silent".into(),
                     source: settings.clone(),
+                    matcher: None,
                 },
             ],
             mcp_servers: vec![McpServerPreview {

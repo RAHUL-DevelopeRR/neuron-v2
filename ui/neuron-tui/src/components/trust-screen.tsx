@@ -25,7 +25,9 @@ import React, { useCallback, useState } from 'react'
 import {
   TRUST_DOCS_URL,
   trustChoices,
+  trustChangedKeysLine,
   trustCopy,
+  trustDetailLines,
   trustPreviewLines,
   trustRootNote,
   type TrustChoice,
@@ -34,6 +36,7 @@ import { sanitizeTerminalText } from '@neuron-tui/common/util/terminal-safe-text
 
 import { truncateToWidth } from './model-picker'
 import { TerminalLink } from './terminal-link'
+import { useTerminalDimensions } from '../hooks/use-terminal-dimensions'
 import { useTheme } from '../hooks/use-theme'
 import { getGlyphMode, type GlyphMode } from '../utils/glyphs'
 import { safeOpen } from '../utils/open-url'
@@ -154,6 +157,7 @@ export const TrustScreen = ({
   glyphMode = getGlyphMode(),
 }: TrustScreenProps) => {
   const theme = useTheme()
+  const { terminalHeight } = useTerminalDimensions()
   const servers = preview?.mcp_servers ?? []
   // The Allow choice is selected first, below the server rows.
   const [selected, setSelected] = useState<number | null>(null)
@@ -193,7 +197,26 @@ export const TrustScreen = ({
   const marker = glyphMode === 'console' ? '>' : '›'
   const textWidth = Math.max(20, width - 4)
   const note = preview ? trustRootNote(preview) : ''
-  const turnsOn = preview ? trustPreviewLines(preview) : null
+  // Every hook command and rule in full (the MCP servers show theirs below), cleaned
+  // of control characters. They stand in for the one-line hook and rule counts. The
+  // rows are capped to the terminal so the choices stay on screen; what is left out
+  // is counted and the settings file named.
+  const allDetails = preview
+    ? trustDetailLines(preview, { mcp: false }).map((line) => sanitizeTerminalText(line).replace(/\n/g, ' '))
+    : []
+  const detailRows = Math.max(3, terminalHeight - 20)
+  const shown = allDetails.length > detailRows ? allDetails.slice(0, detailRows - 1) : allDetails
+  const hidden = allDetails.length - shown.length
+  const details =
+    hidden > 0
+      ? [...shown, `+${hidden} more not shown: read ${preview?.settings_files.join(', ') || 'the settings files'} before you allow`]
+      : shown
+  const changedKeys = preview ? sanitizeTerminalText(trustChangedKeysLine(preview)).replace(/\n/g, ' ') : ''
+  const turnsOn = preview
+    ? trustPreviewLines(preview).filter(
+        (line) => allDetails.length === 0 || !/^\d+ hooks? that |^\d+ permission rules? from /.test(line),
+      )
+    : null
 
   return (
     <box style={{ flexDirection: 'column', paddingLeft: 2, paddingRight: 2, paddingTop: 1 }}>
@@ -212,7 +235,7 @@ export const TrustScreen = ({
         previewPending ? (
           <text style={{ fg: theme.muted }}>Checking what this project would turn on…</text>
         ) : null
-      ) : turnsOn.length === 0 ? (
+      ) : turnsOn.length === 0 && details.length === 0 ? (
         <text style={{ wrapMode: 'word', fg: theme.foreground, width: textWidth }}>{trustCopy.turnsOnNothing}</text>
       ) : (
         <>
@@ -223,9 +246,20 @@ export const TrustScreen = ({
                 {`• ${line}`}
               </text>
             ))}
+            {details.map((line, index) => (
+              <text key={`${index}:${line}`} style={{ wrapMode: 'char', fg: theme.foreground, width: textWidth - 2 }}>
+                {`• ${line}`}
+              </text>
+            ))}
           </box>
         </>
       )}
+      {preview?.changed_since_trust ? (
+        <text style={{ wrapMode: 'word', fg: theme.warning, width: textWidth }}>{trustCopy.changed}</text>
+      ) : null}
+      {changedKeys ? (
+        <text style={{ wrapMode: 'word', fg: theme.warning, width: textWidth }}>{changedKeys}</text>
+      ) : null}
       {servers.length > 0 ? (
         <>
           <text style={{ wrapMode: 'word', fg: theme.foreground, paddingTop: 1, width: textWidth }}>

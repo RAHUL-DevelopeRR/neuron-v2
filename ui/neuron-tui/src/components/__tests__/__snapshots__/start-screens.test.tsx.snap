@@ -5,9 +5,12 @@ exports[`the screens before the chat render plainly the trust screen at 80x24 1`
   C:\\RAHUL\\PROJECTS _OF_Rahul\\zero-x.live   (git root: this folder)
   Neuron will be able to open, change and run files in this folder.
   This project also wants to turn on:
-    • 2 hooks that run commands around tool calls
     • 1 MCP server: postgres-tools
-    • 3 permission rules from .neuron/settings.json
+    • hook PreToolUse: npm run lint
+    • hook PostToolUse: npm test
+    • allow rule: Bash(npm test)
+    • +2 more not shown: read C:\\RAHUL\\PROJECTS _OF_Rahul\\zero-x.live\\.neuron\\
+    settings.json before you allow
   Approve its MCP servers now (↑↓ and space); the others wait in /mcp:
       [ ] postgres-tools  stdio
           runs postgres-mcp
@@ -47,9 +50,12 @@ exports[`the screens before the chat render plainly the trust screen at 200x50 1
   C:\\RAHUL\\PROJECTS _OF_Rahul\\zero-x.live   (git root: this folder)
   Neuron will be able to open, change and run files in this folder.
   This project also wants to turn on:
-    • 2 hooks that run commands around tool calls
     • 1 MCP server: postgres-tools
-    • 3 permission rules from .neuron/settings.json
+    • hook PreToolUse: npm run lint
+    • hook PostToolUse: npm test
+    • allow rule: Bash(npm test)
+    • allow rule: Bash(npm run lint)
+    • ask rule: Bash(git push)
   Approve its MCP servers now (↑↓ and space); the others wait in /mcp:
       [ ] postgres-tools  stdio
           runs postgres-mcp
@@ -90,9 +96,12 @@ exports[`the screens before the chat render plainly in a classic console (ASCII 
   C:\\RAHUL\\PROJECTS _OF_Rahul\\zero-x.live   (git root: this folder)
   Neuron will be able to open, change and run files in this folder.
   This project also wants to turn on:
-    • 2 hooks that run commands around tool calls
     • 1 MCP server: postgres-tools
-    • 3 permission rules from .neuron/settings.json
+    • hook PreToolUse: npm run lint
+    • hook PostToolUse: npm test
+    • allow rule: Bash(npm test)
+    • +2 more not shown: read C:\\RAHUL\\PROJECTS _OF_Rahul\\zero-x.live\\.neuron\\
+    settings.json before you allow
   Approve its MCP servers now (Up/Down and space); the others wait in /mcp:
       [ ] postgres-tools  stdio
           runs postgres-mcp

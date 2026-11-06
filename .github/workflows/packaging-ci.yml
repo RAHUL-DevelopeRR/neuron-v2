@@ -153,7 +153,7 @@ jobs:
           for _ in $(seq 100); do [ -s "$RUNNER_TEMP/port" ] && break; sleep 0.1; done
           base="http://127.0.0.1:$(cat "$RUNNER_TEMP/port")"
           curl -fsSL "$base/install.sh" \
-            | NEURON_DOWNLOAD_BASE="$base" NEURON_RELEASES_API="$base/repos/neuron/releases/latest" \
+            | NEURON_DOWNLOAD_BASE="$base" NEURON_CHECKSUMS_BASE="$base" NEURON_RELEASES_API="$base/repos/neuron/releases/latest" \
               NEURON_INSTALL_DIR="$RUNNER_TEMP/bin" sh
           "$RUNNER_TEMP/bin/neuron" --version | tee /dev/stderr | grep -Fx "neuron-dummy $SMOKE_VERSION"
 
@@ -170,6 +170,7 @@ jobs:
             for ($i = 0; $i -lt 100 -and -not ((Test-Path $portFile) -and (Get-Content $portFile))) { Start-Sleep -Milliseconds 100 }
             $base = "http://127.0.0.1:$(Get-Content $portFile)"
             $env:NEURON_DOWNLOAD_BASE = $base
+            $env:NEURON_CHECKSUMS_BASE = $base
             $env:NEURON_RELEASES_API = "$base/repos/neuron/releases/latest"
             foreach ($powershell in 'powershell', 'pwsh') {
               $env:NEURON_INSTALL_DIR = Join-Path $env:RUNNER_TEMP "bin-$powershell"
