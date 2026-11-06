@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-use crate::engine::{status_session, EngineExit, EngineHandle, Launch};
+use crate::engine::{
+    resolve_binary, status_session, EngineExit, EngineHandle, EngineProcess, Env, Launch,
+};
 use crate::worktree::{self, WorktreeRecord};
 
 pub type ChatId = String;
@@ -72,6 +74,40 @@ pub trait Spawner: Send + Sync {
         on_line: LineFn,
         on_exit: ExitFn,
     ) -> Result<Arc<dyn EngineHandle>, String>;
+}
+
+/// Runs the real engine: `neuron engine --stdio` in the chat's folder.
+#[derive(Default)]
+pub struct ProcessSpawner {
+    /// The binary to run; found at each start (`NEURON_BIN`, beside the app, the
+    /// PATH) when `None`.
+    pub binary: Option<PathBuf>,
+    /// The engine's environment; this process's own when `None`.
+    pub env: Option<Env>,
+}
+
+impl Spawner for ProcessSpawner {
+    fn spawn(
+        &self,
+        request: &SpawnRequest<'_>,
+        on_line: LineFn,
+        on_exit: ExitFn,
+    ) -> Result<Arc<dyn EngineHandle>, String> {
+        let binary = self.binary.clone().or_else(resolve_binary).ok_or(
+            "Could not find the `neuron` binary. Install Neuron, or set NEURON_BIN to its path.",
+        )?;
+        let env = self.env.clone().unwrap_or_else(|| {
+            // The home folder is trusted for this engine only, and never recorded.
+            Env::Inherit(if request.trust_once {
+                vec![("NEURON_TRUST_WORKSPACE".to_string(), "1".to_string())]
+            } else {
+                Vec::new()
+            })
+        });
+        let process =
+            EngineProcess::spawn(&binary, request.cwd, request.launch, &env, on_line, on_exit)?;
+        Ok(Arc::new(process))
+    }
 }
 
 /// Where a chat's lines and exits go: the window.
@@ -385,7 +421,9 @@ impl EngineRegistry {
     fn on_line(&self, id: &str, generation: u64, line: String) {
         {
             let mut chats = lock(&self.chats);
-            let Some(chat) = chats.get_mut(id).filter(|chat| chat.generation == generation)
+            let Some(chat) = chats
+                .get_mut(id)
+                .filter(|chat| chat.generation == generation)
             else {
                 return;
             };
@@ -647,6 +685,7 @@ impl EngineRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::Env;
     use std::sync::atomic::AtomicBool;
 
     struct FakeEngine {
@@ -767,7 +806,8 @@ mod tests {
             Self::with(name, false, MAX_RUNNING, MAX_CHATS)
         }
         fn with(name: &str, obeys: bool, cap: usize, max_chats: usize) -> Self {
-            let dir = std::env::temp_dir().join(format!("neuron-reg-{}-{name}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("neuron-reg-{}-{name}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             let spawner = Arc::new(FakeSpawner {
                 obeys,
@@ -821,10 +861,7 @@ mod tests {
         let spawned = fixture.spawner.last();
         assert_eq!(spawned.chat, chat.chat);
         assert_eq!(spawned.args, ["engine", "--stdio"]);
-        assert_eq!(
-            spawned.cwd,
-            std::fs::canonicalize(&fixture.dir).unwrap()
-        );
+        assert_eq!(spawned.cwd, std::fs::canonicalize(&fixture.dir).unwrap());
         let second = fixture.open();
         assert_ne!(second.chat, chat.chat);
     }
@@ -855,10 +892,19 @@ mod tests {
         let chats: Vec<_> = (0..4).map(|_| fixture.open()).collect();
         // Chat 1 is the oldest, but working; chat 2 is next-oldest, and idle.
         fixture.registry.set_last_activity(&chats[0].chat, base);
-        fixture.registry.set_last_activity(&chats[1].chat, base + Duration::from_secs(1));
-        fixture.registry.set_last_activity(&chats[2].chat, base + Duration::from_secs(2));
-        fixture.registry.set_last_activity(&chats[3].chat, base + Duration::from_secs(3));
-        fixture.registry.activity(&chats[0].chat, true, false).unwrap();
+        fixture
+            .registry
+            .set_last_activity(&chats[1].chat, base + Duration::from_secs(1));
+        fixture
+            .registry
+            .set_last_activity(&chats[2].chat, base + Duration::from_secs(2));
+        fixture
+            .registry
+            .set_last_activity(&chats[3].chat, base + Duration::from_secs(3));
+        fixture
+            .registry
+            .activity(&chats[0].chat, true, false)
+            .unwrap();
         fixture.registry.set_last_activity(&chats[0].chat, base);
         let fifth = fixture.open();
         assert!(fifth.running);
@@ -876,8 +922,14 @@ mod tests {
     fn busy_waiting_and_active_chats_are_never_evicted() {
         let fixture = Fixture::new("keep");
         let chats: Vec<_> = (0..4).map(|_| fixture.open()).collect();
-        fixture.registry.activity(&chats[0].chat, true, false).unwrap();
-        fixture.registry.activity(&chats[1].chat, false, true).unwrap();
+        fixture
+            .registry
+            .activity(&chats[0].chat, true, false)
+            .unwrap();
+        fixture
+            .registry
+            .activity(&chats[1].chat, false, true)
+            .unwrap();
         fixture.registry.activate(Some(&chats[2].chat)).unwrap();
         // Chat 3 is the only one that can go.
         let fifth = fixture.open();
@@ -912,12 +964,14 @@ mod tests {
         let (old, fresh, active) = (fixture.open(), fixture.open(), fixture.open());
         let base = Instant::now();
         fixture.registry.set_last_activity(&old.chat, base);
-        fixture.registry.set_last_activity(&fresh.chat, base + Duration::from_secs(15 * 60));
+        fixture
+            .registry
+            .set_last_activity(&fresh.chat, base + Duration::from_secs(15 * 60));
         fixture.registry.set_last_activity(&active.chat, base);
         fixture.registry.activate(Some(&active.chat)).unwrap();
 
         let reaped = fixture.registry.reap(base + Duration::from_secs(21 * 60));
-        assert_eq!(reaped, [old.chat.clone()]);
+        assert_eq!(reaped, std::slice::from_ref(&old.chat));
         assert_eq!(fixture.exits(), [(old.chat.clone(), 1, ExitReason::Idle)]);
         assert!(fixture.registry.summary(&fresh.chat).unwrap().running);
         assert!(fixture.registry.summary(&active.chat).unwrap().running);
@@ -929,10 +983,16 @@ mod tests {
         let (busy, waiting) = (fixture.open(), fixture.open());
         let base = Instant::now();
         fixture.registry.activity(&busy.chat, true, false).unwrap();
-        fixture.registry.activity(&waiting.chat, false, true).unwrap();
+        fixture
+            .registry
+            .activity(&waiting.chat, false, true)
+            .unwrap();
         fixture.registry.set_last_activity(&busy.chat, base);
         fixture.registry.set_last_activity(&waiting.chat, base);
-        assert!(fixture.registry.reap(base + Duration::from_secs(3600)).is_empty());
+        assert!(fixture
+            .registry
+            .reap(base + Duration::from_secs(3600))
+            .is_empty());
     }
 
     #[test]
@@ -945,7 +1005,10 @@ mod tests {
 
         let spawned = fixture.spawner.all();
         (spawned[0].line)(r#"{"type":"text_delta","text":"hi"}"#.into());
-        fixture.registry.send(&sending.chat, r#"{"kind":"command"}"#).unwrap();
+        fixture
+            .registry
+            .send(&sending.chat, r#"{"kind":"command"}"#)
+            .unwrap();
 
         assert!(fixture.registry.reap(Instant::now()).is_empty());
     }
@@ -962,7 +1025,10 @@ mod tests {
             error: None,
         });
         assert!(!fixture.registry.summary(&chat.chat).unwrap().running);
-        assert_eq!(fixture.exits(), [(chat.chat.clone(), 1, ExitReason::Exited)]);
+        assert_eq!(
+            fixture.exits(),
+            [(chat.chat.clone(), 1, ExitReason::Exited)]
+        );
 
         let again = fixture
             .registry
@@ -1026,7 +1092,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             fixture.spawner.last().args,
-            ["engine", "--stdio", "--model", "sonnet", "--permission-mode", "read-only"]
+            [
+                "engine",
+                "--stdio",
+                "--model",
+                "sonnet",
+                "--permission-mode",
+                "read-only"
+            ]
         );
     }
 
@@ -1067,7 +1140,16 @@ mod tests {
     fn malformed_and_unknown_ids_are_refused() {
         let fixture = Fixture::new("ids");
         let registry = &fixture.registry;
-        for id in ["", "c", "x1234", "C1234", "c12", "c../etc", "c1234 5", &format!("c{}", "a".repeat(40))] {
+        for id in [
+            "",
+            "c",
+            "x1234",
+            "C1234",
+            "c12",
+            "c../etc",
+            "c1234 5",
+            &format!("c{}", "a".repeat(40)),
+        ] {
             assert!(!valid_chat_id(id), "{id:?}");
             assert!(registry.send(id, "{}").is_err());
             assert!(registry.stop(id).is_err());
@@ -1138,11 +1220,16 @@ mod tests {
         let chat = fixture.open();
         let registry = &fixture.registry;
         assert!(registry.send(&chat.chat, "{\"a\":1}\n{\"b\":2}").is_err());
-        assert!(registry.send(&chat.chat, &"x".repeat(MAX_LINE + 1)).is_err());
+        assert!(registry
+            .send(&chat.chat, &"x".repeat(MAX_LINE + 1))
+            .is_err());
         registry.send(&chat.chat, "{\"a\":1}").unwrap();
         assert_eq!(*lock(&fixture.spawner.last().engine.sent), ["{\"a\":1}"]);
         // A stopped chat has no engine to send to.
-        fixture.registry.halt(&chat.chat, ExitReason::Discarded).unwrap();
+        fixture
+            .registry
+            .halt(&chat.chat, ExitReason::Discarded)
+            .unwrap();
         assert!(registry.send(&chat.chat, "{}").is_err());
     }
 
@@ -1152,7 +1239,10 @@ mod tests {
         let chat = fixture.open();
         fixture.registry.activate(Some(&chat.chat)).unwrap();
         fixture.registry.close(&chat.chat).unwrap();
-        assert_eq!(fixture.spawner.last().engine.stops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture.spawner.last().engine.stops.load(Ordering::SeqCst),
+            1
+        );
         assert!(fixture.registry.list().is_empty());
         assert!(fixture.registry.send(&chat.chat, "{}").is_err());
     }
@@ -1163,7 +1253,10 @@ mod tests {
         let chat = fixture.open();
         // This engine ignores stop, so halt has to end it itself.
         let started = Instant::now();
-        fixture.registry.halt(&chat.chat, ExitReason::Discarded).unwrap();
+        fixture
+            .registry
+            .halt(&chat.chat, ExitReason::Discarded)
+            .unwrap();
         let engine = fixture.spawner.last().engine.clone();
         assert!(!engine.running());
         assert_eq!(engine.kills.load(Ordering::SeqCst), 1);
@@ -1198,5 +1291,187 @@ mod tests {
             listed[0].project.name,
             fixture.dir.file_name().unwrap().to_string_lossy()
         );
+    }
+
+    /// Sends lines and exits to channels, for the real-engine test.
+    struct Channels {
+        lines: Mutex<std::sync::mpsc::Sender<String>>,
+        exits: Mutex<std::sync::mpsc::Sender<(EngineExit, ExitReason)>>,
+    }
+
+    impl ChatEvents for Channels {
+        fn line(&self, _chat: &str, _generation: u64, line: String) {
+            let _ = lock(&self.lines).send(line);
+        }
+        fn exit(&self, _chat: &str, _generation: u64, exit: EngineExit, reason: ExitReason) {
+            let _ = lock(&self.exits).send((exit, reason));
+        }
+    }
+
+    fn debug_binary(name: &str) -> PathBuf {
+        let exe = if cfg!(windows) {
+            format!("{name}.exe")
+        } else {
+            name.to_string()
+        };
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../rust/target/debug")
+            .join(exe)
+    }
+
+    /// The real engine against the mock service, through a one-chat registry: a
+    /// turn whose bash call needs approval. Skipped unless `cargo build -p
+    /// rusty-claude-cli -p mock-anthropic-service` ran in rust/.
+    #[test]
+    fn runs_a_turn_with_an_approval_against_the_mock_service() {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        use std::sync::mpsc;
+
+        let (neuron, mock) = (
+            debug_binary("neuron"),
+            debug_binary("mock-anthropic-service"),
+        );
+        if !neuron.is_file() || !mock.is_file() {
+            eprintln!("skipped: build the engine and the mock service in rust/ first");
+            return;
+        }
+        let mut service = Command::new(&mock)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("mock");
+        let mut first = String::new();
+        let mut out = BufReader::new(service.stdout.take().unwrap());
+        while !first.contains("MOCK_ANTHROPIC_BASE_URL=") {
+            first.clear();
+            assert!(out.read_line(&mut first).unwrap() > 0, "the mock exited");
+        }
+        let base_url = first.trim().split_once('=').unwrap().1.to_string();
+
+        let home =
+            std::env::temp_dir().join(format!("neuron-desktop-bridge-{}", std::process::id()));
+        let workspace = home.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(home.join("config")).unwrap();
+        // npx would download the bundled MCP servers into this fresh home.
+        std::fs::write(
+            home.join("config/settings.json"),
+            r#"{"defaultMcpServers":false}"#,
+        )
+        .unwrap();
+        let home_str = home.to_string_lossy().to_string();
+        let mut vars: Vec<(String, String)> = [
+            "PATH",
+            "SystemRoot",
+            "SystemDrive",
+            "TEMP",
+            "TMP",
+            "PATHEXT",
+            "ComSpec",
+        ]
+        .iter()
+        .filter_map(|name| {
+            std::env::var(name)
+                .ok()
+                .map(|value| (name.to_string(), value))
+        })
+        .collect();
+        vars.extend([
+            ("HOME".into(), home_str.clone()),
+            ("USERPROFILE".into(), home_str.clone()),
+            ("NEURON_CONFIG_HOME".into(), format!("{home_str}/config")),
+            ("NEURON_HOME".into(), format!("{home_str}/neuron")),
+            ("NEURON_CREDENTIAL_STORE".into(), "file".into()),
+            ("NEURON_NO_BROWSER".into(), "1".into()),
+            ("ANTHROPIC_API_KEY".into(), "mock-service-key".into()),
+            ("ANTHROPIC_BASE_URL".into(), base_url),
+        ]);
+
+        let (lines_tx, lines) = mpsc::channel::<String>();
+        let (exit_tx, exit) = mpsc::channel();
+        let registry = EngineRegistry::new(
+            Arc::new(ProcessSpawner {
+                binary: Some(neuron),
+                env: Some(Env::Only(vars)),
+            }),
+            Arc::new(Channels {
+                lines: Mutex::new(lines_tx),
+                exits: Mutex::new(exit_tx),
+            }),
+        );
+        let launch = Launch {
+            model: Some("sonnet".into()),
+            permission_mode: Some("workspace-write".into()),
+            resume: None,
+        };
+        let chat = registry
+            .open(
+                OpenRequest {
+                    path: workspace.clone(),
+                    resume: None,
+                    worktree: None,
+                },
+                &launch,
+            )
+            .expect("open");
+
+        let next = || {
+            let line = lines
+                .recv_timeout(Duration::from_secs(60))
+                .expect("an event");
+            serde_json::from_str::<serde_json::Value>(&line).expect("a JSON line")
+        };
+        assert_eq!(next()["type"], "ready");
+        registry
+            .send(
+                &chat.chat,
+                r#"{"kind":"command","type":"submit","text":"PARITY_SCENARIO:bash_permission_prompt_approved","attachments":[]}"#,
+            )
+            .unwrap();
+        let mut seen = Vec::new();
+        loop {
+            let event = next();
+            let kind = event["type"].as_str().unwrap().to_string();
+            if kind == "permission_requested" {
+                let reply = format!(
+                    r#"{{"kind":"permission_reply","id":{},"decision":{{"kind":"allow_once"}}}}"#,
+                    event["id"]
+                );
+                registry.send(&chat.chat, &reply).unwrap();
+            }
+            if kind == "tool_result" {
+                assert_eq!(event["is_error"], false);
+            }
+            seen.push(kind.clone());
+            if kind == "turn_finished" {
+                break;
+            }
+        }
+        assert!(
+            seen.contains(&"permission_requested".to_string()),
+            "{seen:?}"
+        );
+        assert!(seen.contains(&"tool_result".to_string()), "{seen:?}");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("approved.txt")).unwrap(),
+            "approved via prompt"
+        );
+
+        registry.stop(&chat.chat).unwrap();
+        let (end, reason) = exit
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the engine exits");
+        assert_eq!(reason, ExitReason::Exited);
+        assert_eq!(
+            end,
+            EngineExit {
+                code: Some(0),
+                error: None
+            }
+        );
+        let _ = service.kill();
+        let _ = service.wait();
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

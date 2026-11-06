@@ -189,7 +189,12 @@ pub fn current_branch(dir: &Path) -> Option<String> {
 fn branch_exists(repo: &Path, branch: &str) -> bool {
     git(
         repo,
-        &["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")],
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
     )
     .is_ok_and(|run| run.ok)
 }
@@ -198,7 +203,9 @@ fn branch_exists(repo: &Path, branch: &str) -> bool {
 fn default_slug() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.subsec_nanos() ^ (elapsed.as_secs() as u32));
+        .map_or(0, |elapsed| {
+            elapsed.subsec_nanos() ^ (elapsed.as_secs() as u32)
+        });
     format!("chat-{:06x}", nanos & 0x00ff_ffff)
 }
 
@@ -209,10 +216,13 @@ pub fn create(
     project: &Path,
     name: Option<&str>,
 ) -> Result<WorktreeRecord, String> {
-    let project = fs::canonicalize(project).map_err(|error| format!("{}: {error}", project.display()))?;
+    let project =
+        fs::canonicalize(project).map_err(|error| format!("{}: {error}", project.display()))?;
     let top = git(&project, &["rev-parse", "--show-toplevel"])?;
     if !top.ok {
-        return Err("This folder is not in a git repository, so it cannot get its own copy.".into());
+        return Err(
+            "This folder is not in a git repository, so it cannot get its own copy.".into(),
+        );
     }
     let top = fs::canonicalize(first_line(&top.stdout))
         .map_err(|error| format!("could not read the repository folder: {error}"))?;
@@ -234,7 +244,8 @@ pub fn create(
         None => default_slug(),
     };
     let root = worktree_root(app_data, &top);
-    fs::create_dir_all(&root).map_err(|error| format!("could not make {}: {error}", root.display()))?;
+    fs::create_dir_all(&root)
+        .map_err(|error| format!("could not make {}: {error}", root.display()))?;
     let root = fs::canonicalize(&root).map_err(|error| error.to_string())?;
 
     let mut slug = wanted.clone();
@@ -280,9 +291,16 @@ pub fn create(
 pub fn status(record: &WorktreeRecord) -> Result<WorktreeStatus, String> {
     let changes = git(&record.path, &["status", "--porcelain"])?;
     if !changes.ok {
-        return Err(format!("Could not read the copy: {}", first_line(&changes.stderr)));
+        return Err(format!(
+            "Could not read the copy: {}",
+            first_line(&changes.stderr)
+        ));
     }
-    let dirty = changes.stdout.lines().filter(|line| !line.trim().is_empty()).count();
+    let dirty = changes
+        .stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
     Ok(WorktreeStatus {
         branch: record.branch.clone(),
         path: plain(&record.path).to_string_lossy().into_owned(),
@@ -295,7 +313,10 @@ fn unmerged(record: &WorktreeRecord) -> Result<usize, String> {
     let range = format!("HEAD..{}", record.branch);
     let count = git(&record.repo, &["rev-list", "--count", &range])?;
     if !count.ok {
-        return Err(format!("Could not read the branch: {}", first_line(&count.stderr)));
+        return Err(format!(
+            "Could not read the branch: {}",
+            first_line(&count.stderr)
+        ));
     }
     Ok(first_line(&count.stdout).parse().unwrap_or(0))
 }
@@ -348,7 +369,11 @@ pub fn check_discard(
     }
     if !force {
         let changes = git(&path, &["status", "--porcelain"])?;
-        let dirty = changes.stdout.lines().filter(|line| !line.trim().is_empty()).count();
+        let dirty = changes
+            .stdout
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count();
         if dirty > 0 {
             return Err(format!("dirty:{dirty}"));
         }
@@ -413,7 +438,9 @@ mod tests {
 
     #[test]
     fn unusable_names_are_refused() {
-        for name in ["", "   ", "---", "!!!", "con", "NUL", "com1", "../x", "a/b", "a\\b", "x\n"] {
+        for name in [
+            "", "   ", "---", "!!!", "con", "NUL", "com1", "../x", "a/b", "a\\b", "x\n",
+        ] {
             assert!(slugify(name).is_err(), "{name:?} should be refused");
         }
     }
@@ -422,7 +449,10 @@ mod tests {
     fn the_worktree_root_is_short_and_stable() {
         let a = worktree_root(Path::new("/data"), Path::new("/work/app"));
         assert_eq!(a, worktree_root(Path::new("/data"), Path::new("/work/app")));
-        assert_ne!(a, worktree_root(Path::new("/data"), Path::new("/work/other")));
+        assert_ne!(
+            a,
+            worktree_root(Path::new("/data"), Path::new("/work/other"))
+        );
         assert_eq!(a.parent().unwrap(), Path::new("/data").join("wt"));
         let name = a.file_name().unwrap().to_string_lossy().into_owned();
         assert_eq!(name.len(), 8);
@@ -494,8 +524,13 @@ mod tests {
         assert_eq!(record.base, "main");
         assert!(record.path.join("a.txt").is_file());
         assert!(record.path.starts_with(&record.root));
-        assert!(record.root.starts_with(fs::canonicalize(sandbox.data()).unwrap()));
-        assert_eq!(current_branch(&record.path).as_deref(), Some("neuron/fix-login"));
+        assert!(record
+            .root
+            .starts_with(fs::canonicalize(sandbox.data()).unwrap()));
+        assert_eq!(
+            current_branch(&record.path).as_deref(),
+            Some("neuron/fix-login")
+        );
         // The same name again gets a number.
         let second = create(&sandbox.data(), &sandbox.repo(), Some("Fix Login!")).unwrap();
         assert_eq!(second.slug, "fix-login-2");
@@ -508,7 +543,10 @@ mod tests {
         let plain_dir = sandbox.dir.join("plain");
         fs::create_dir_all(&plain_dir).unwrap();
         // A temp folder sits in no repository, unless the machine keeps one at its root.
-        if git(&plain_dir, &["rev-parse", "--show-toplevel"]).unwrap().ok {
+        if git(&plain_dir, &["rev-parse", "--show-toplevel"])
+            .unwrap()
+            .ok
+        {
             return;
         }
         assert!(create(&sandbox.data(), &plain_dir, None).is_err());

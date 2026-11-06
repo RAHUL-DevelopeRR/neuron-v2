@@ -4,6 +4,7 @@
 //! panes, and remembers recent projects. The agent lives in the engine; the
 //! window is the React app in `../src`.
 
+pub mod chats;
 pub mod engine;
 pub mod git;
 pub mod projects;
@@ -13,44 +14,24 @@ pub mod workspace;
 pub mod worktree;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use engine::{EngineExit, EngineProcess, Env, Launch};
+use engine::Launch;
 use projects::Project;
+use registry::{EngineRegistry, ProcessSpawner};
 use terminal::Terminals;
 use workspace::{DirListing, FileContent, Workspace};
 
-/// The open project and the engine running in it. Every engine gets a new
-/// generation; its lines and its exit carry it, so the window ignores an engine
-/// it already replaced.
-struct AppState {
+/// The folder the app opened first (what a command without a chat reads), and
+/// what the window last asked engines to start with. Engines and chats live in
+/// the registry (`registry.rs`).
+pub struct AppState {
     workspace: Mutex<Workspace>,
-    engine: Mutex<Option<(u64, EngineProcess)>>,
-    generation: AtomicU64,
     /// What the window last asked engines to start with (its Settings).
     options: Mutex<LaunchOptions>,
-    /// The session the running engine last reported, so a reloaded window continues it.
-    session: Mutex<Option<String>>,
-}
-
-/// The session id in a `status` line, if it is one.
-fn status_session(line: &str) -> Option<String> {
-    if !line.contains("\"status\"") {
-        return None;
-    }
-    let value: serde_json::Value = serde_json::from_str(line).ok()?;
-    if value.get("type")?.as_str()? != "status" {
-        return None;
-    }
-    value
-        .get("session_id")?
-        .as_str()
-        .filter(|id| !id.is_empty())
-        .map(str::to_string)
 }
 
 /// The window's defaults for new engines: Settings › Sessions.
@@ -81,25 +62,22 @@ impl LaunchOptions {
             permission_mode,
         }
     }
-}
 
-#[derive(Clone, Serialize)]
-struct EngineLine {
-    generation: u64,
-    line: String,
-}
-
-#[derive(Clone, Serialize)]
-struct EngineExitEvent {
-    generation: u64,
-    code: Option<i32>,
-    error: Option<String>,
-}
-
-#[derive(Clone, Serialize)]
-struct Started {
-    generation: u64,
-    project: Project,
+    /// What an engine starts with: these options first; the environment is for
+    /// development. The one place the options become launch flags.
+    fn to_launch(&self) -> Launch {
+        Launch {
+            model: self
+                .model
+                .clone()
+                .or_else(|| std::env::var("NEURON_DESKTOP_MODEL").ok()),
+            permission_mode: self
+                .permission_mode
+                .clone()
+                .or_else(|| std::env::var("NEURON_DESKTOP_PERMISSION_MODE").ok()),
+            resume: None,
+        }
+    }
 }
 
 /// The folder the app opens first: `NEURON_WORKSPACE`, the first argument, the
@@ -123,148 +101,10 @@ fn first_workspace(app: &AppHandle) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Starts an engine in the open project (continuing `resume`), replacing any that
-/// runs. `trust_once` trusts the workspace for this engine only (the home folder,
-/// which is never recorded). Returns its generation.
-fn launch(
-    app: &AppHandle,
-    state: &AppState,
-    resume: Option<String>,
-    trust_once: bool,
-) -> Result<Started, String> {
-    if let Some((_, old)) = lock(&state.engine).take() {
-        old.stop();
-    }
-    let workspace = lock(&state.workspace).clone();
-    let binary = engine::resolve_binary().ok_or(
-        "Could not find the `neuron` binary. Install Neuron, or set NEURON_BIN to its path.",
-    )?;
-    let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
-    // Settings first; the environment is for development.
-    let options = lock(&state.options).clone();
-    let launch = Launch {
-        model: options
-            .model
-            .or_else(|| std::env::var("NEURON_DESKTOP_MODEL").ok()),
-        permission_mode: options
-            .permission_mode
-            .or_else(|| std::env::var("NEURON_DESKTOP_PERMISSION_MODE").ok()),
-        resume: resume.filter(|id| !id.is_empty()),
-    };
-    let lines = app.clone();
-    let exits = app.clone();
-    let process = EngineProcess::spawn(
-        &binary,
-        workspace.root(),
-        &launch,
-        &Env::Inherit(if trust_once {
-            vec![("NEURON_TRUST_WORKSPACE".to_string(), "1".to_string())]
-        } else {
-            Vec::new()
-        }),
-        move |line| {
-            if let Some(session) = status_session(&line) {
-                if let Some(state) = lines.try_state::<AppState>() {
-                    if lock(&state.engine)
-                        .as_ref()
-                        .is_none_or(|(current, _)| *current == generation)
-                    {
-                        *lock(&state.session) = Some(session);
-                    }
-                }
-            }
-            let _ = lines.emit("neuron://engine", EngineLine { generation, line });
-        },
-        move |exit: EngineExit| {
-            if let Some(state) = exits.try_state::<AppState>() {
-                let mut running = lock(&state.engine);
-                if running
-                    .as_ref()
-                    .is_some_and(|(current, _)| *current == generation)
-                {
-                    running.take();
-                }
-            }
-            let _ = exits.emit(
-                "neuron://engine-exit",
-                EngineExitEvent {
-                    generation,
-                    code: exit.code,
-                    error: exit.error,
-                },
-            );
-        },
-    )?;
-    *lock(&state.engine) = Some((generation, process));
-    let project = Project::of(&workspace);
-    projects::remember(app, &project);
-    Ok(Started {
-        generation,
-        project,
-    })
-}
-
-/// Keeps the window's launch options for this and later engines.
-fn remember_options(state: &AppState, options: Option<LaunchOptions>) {
-    if let Some(options) = options {
-        *lock(&state.options) = options.checked();
-    }
-}
-
-#[tauri::command]
-fn engine_start(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    options: Option<LaunchOptions>,
-) -> Result<Started, String> {
-    remember_options(&state, options);
-    // A running engine means the window was reloaded: its `ready` is gone, so a fresh
-    // engine continues the session it was on.
-    let resume = lock(&state.engine)
-        .is_some()
-        .then(|| lock(&state.session).clone())
-        .flatten();
-    launch(&app, &state, resume, false)
-}
-
-#[tauri::command]
-fn engine_restart(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    resume: Option<String>,
-    options: Option<LaunchOptions>,
-    trust_once: Option<bool>,
-) -> Result<Started, String> {
-    remember_options(&state, options);
-    launch(&app, &state, resume, trust_once.unwrap_or(false))
-}
-
-/// Opens another folder: a new engine there, on a fresh chat or continuing
-/// `resume` (a chat of that folder).
-#[tauri::command]
-fn project_open(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    terminals: State<'_, Terminals>,
-    path: String,
-    resume: Option<String>,
-    options: Option<LaunchOptions>,
-) -> Result<Started, String> {
-    remember_options(&state, options);
-    let workspace = Workspace::new(path.trim())?;
-    if !workspace.root().is_dir() {
-        return Err(format!("{} is not a folder.", workspace.display_root()));
-    }
-    // Terminals belong to the old folder.
-    terminals.close_all();
-    *lock(&state.workspace) = workspace;
-    launch(&app, &state, resume, false)
 }
 
 #[tauri::command]
@@ -272,49 +112,57 @@ fn projects_recent(app: AppHandle) -> Vec<Project> {
     projects::recent(&app)
 }
 
+/// The commands below read the chat's folder, or the default workspace without a chat.
 #[tauri::command]
-fn engine_send(state: State<'_, AppState>, line: String) -> Result<(), String> {
-    let running = lock(&state.engine);
-    running
-        .as_ref()
-        .ok_or("The Neuron engine is not running.")?
-        .1
-        .send(&line)
+fn fs_list(
+    state: State<'_, AppState>,
+    registry: State<'_, Arc<EngineRegistry>>,
+    path: String,
+    chat: Option<String>,
+) -> Result<DirListing, String> {
+    chats::workspace_for(&state, &registry, chat.as_deref())?.list(&path)
 }
 
 #[tauri::command]
-fn engine_stop(state: State<'_, AppState>) {
-    if let Some((_, process)) = lock(&state.engine).as_ref() {
-        process.stop();
-    }
+fn fs_read(
+    state: State<'_, AppState>,
+    registry: State<'_, Arc<EngineRegistry>>,
+    path: String,
+    chat: Option<String>,
+) -> Result<FileContent, String> {
+    chats::workspace_for(&state, &registry, chat.as_deref())?.read(&path)
 }
 
 #[tauri::command]
-fn fs_list(state: State<'_, AppState>, path: String) -> Result<DirListing, String> {
-    lock(&state.workspace).list(&path)
-}
-
-#[tauri::command]
-fn fs_read(state: State<'_, AppState>, path: String) -> Result<FileContent, String> {
-    lock(&state.workspace).read(&path)
-}
-
-#[tauri::command]
-async fn fs_search(state: State<'_, AppState>, query: String) -> Result<Vec<String>, String> {
-    let workspace = lock(&state.workspace).clone();
+async fn fs_search(
+    state: State<'_, AppState>,
+    registry: State<'_, Arc<EngineRegistry>>,
+    query: String,
+    chat: Option<String>,
+) -> Result<Vec<String>, String> {
+    let workspace = chats::workspace_for(&state, &registry, chat.as_deref())?;
     Ok(workspace.search(&query, 50))
 }
 
 #[tauri::command]
-async fn git_status(state: State<'_, AppState>) -> Result<Option<git::GitStatusView>, String> {
-    let root = lock(&state.workspace).root().to_path_buf();
-    git::status(&root)
+async fn git_status(
+    state: State<'_, AppState>,
+    registry: State<'_, Arc<EngineRegistry>>,
+    chat: Option<String>,
+) -> Result<Option<git::GitStatusView>, String> {
+    let workspace = chats::workspace_for(&state, &registry, chat.as_deref())?;
+    git::status(workspace.root())
 }
 
 #[tauri::command]
-async fn git_diff(state: State<'_, AppState>, path: String) -> Result<String, String> {
-    let root = lock(&state.workspace).root().to_path_buf();
-    git::diff(&root, &path)
+async fn git_diff(
+    state: State<'_, AppState>,
+    registry: State<'_, Arc<EngineRegistry>>,
+    path: String,
+    chat: Option<String>,
+) -> Result<String, String> {
+    let workspace = chats::workspace_for(&state, &registry, chat.as_deref())?;
+    git::diff(workspace.root(), &path)
 }
 
 #[derive(Clone, Serialize)]
@@ -334,10 +182,14 @@ fn term_open(
     app: AppHandle,
     terminals: State<'_, Terminals>,
     state: State<'_, AppState>,
+    registry: State<'_, Arc<EngineRegistry>>,
     cols: u16,
     rows: u16,
+    chat: Option<String>,
 ) -> Result<u32, String> {
-    let root = lock(&state.workspace).root().to_path_buf();
+    let root = chats::workspace_for(&state, &registry, chat.as_deref())?
+        .root()
+        .to_path_buf();
     let output = app.clone();
     terminals.open(
         &root,
@@ -403,6 +255,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let handle = app.handle().clone();
             let workspace = Workspace::new(first_workspace(&handle))
@@ -410,20 +263,19 @@ pub fn run() {
                 .map_err(Box::<dyn std::error::Error>::from)?;
             app.manage(AppState {
                 workspace: Mutex::new(workspace),
-                engine: Mutex::new(None),
-                generation: AtomicU64::new(0),
                 options: Mutex::new(LaunchOptions::default()),
-                session: Mutex::new(None),
             });
+            let registry = EngineRegistry::new(
+                Arc::new(ProcessSpawner::default()),
+                Arc::new(chats::WindowEvents(handle)),
+            );
+            chats::start_reaper(Arc::clone(&registry));
+            app.manage(registry);
             Ok(())
         })
         .manage(Terminals::default())
+        .manage(chats::AttentionState::default())
         .invoke_handler(tauri::generate_handler![
-            engine_start,
-            engine_restart,
-            engine_send,
-            engine_stop,
-            project_open,
             projects_recent,
             fs_list,
             fs_read,
@@ -434,14 +286,24 @@ pub fn run() {
             term_write,
             term_resize,
             term_close,
-            open_external
+            open_external,
+            // L4: multi-chat
+            chats::chat_open,
+            chats::chat_resume,
+            chats::chat_send,
+            chats::chat_stop,
+            chats::chat_close,
+            chats::chat_activate,
+            chats::chat_activity,
+            chats::chat_list,
+            chats::worktree_status,
+            chats::worktree_discard,
+            chats::attention_set
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
-                if let Some(state) = window.try_state::<AppState>() {
-                    if let Some((_, process)) = lock(&state.engine).take() {
-                        process.stop();
-                    }
+                if let Some(registry) = window.try_state::<Arc<EngineRegistry>>() {
+                    registry.shutdown_all();
                 }
                 window.state::<Terminals>().close_all();
             }
@@ -451,7 +313,8 @@ pub fn run() {
 }
 #[cfg(test)]
 mod tests {
-    use super::{status_session, LaunchOptions};
+    use super::LaunchOptions;
+    use crate::engine::status_session;
 
     #[test]
     fn status_lines_name_the_session() {
