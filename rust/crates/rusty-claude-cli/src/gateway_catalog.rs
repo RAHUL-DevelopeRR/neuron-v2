@@ -195,11 +195,67 @@ pub fn credential_key(token: Option<&str>) -> String {
 
 impl Catalog {
     /// Finds a model by id, ignoring case and the `openai/` transport prefix.
+    ///
+    /// The gateway lists one entry per model family (`openai/gpt-oss-120b`, contract
+    /// section 14), while the engine strips `openai/` before it asks (`gpt-oss-120b`)
+    /// and a saved session or setting can hold a route id
+    /// (`groq/openai/gpt-oss-120b`, `nvidia/nvidia/nemotron-3-ultra-550b-a55b`). All of
+    /// them find the family's entry: the id as asked, the id behind the transport
+    /// prefix (`openai/` or `xai/` put back), then the id with its leading provider
+    /// segments dropped, either as it is or as a variant of a family
+    /// (`...-a55b`, `...:free`).
     pub fn find(&self, model: &str) -> Option<&CatalogModel> {
         let wanted = model_registry::normalize_model_id(model);
+        let by_id = |id: &str| {
+            self.models
+                .iter()
+                .find(|candidate| model_registry::normalize_model_id(&candidate.id) == id)
+        };
+        if let Some(found) = by_id(&wanted) {
+            return Some(found);
+        }
+        let bare = wanted
+            .strip_prefix("openai/")
+            .or_else(|| wanted.strip_prefix("xai/"))
+            .unwrap_or(&wanted);
+        if let Some(found) = by_id(bare) {
+            return Some(found);
+        }
+        for transport in ["openai", "xai"] {
+            if let Some(found) = by_id(&format!("{transport}/{bare}")) {
+                return Some(found);
+            }
+        }
+        // `provider/maker/name`: try each tail that is still `maker/name` or longer.
+        let mut tail = wanted.as_str();
+        while let Some((_, rest)) = tail.split_once('/') {
+            tail = rest;
+            if !tail.contains('/') {
+                break;
+            }
+            if let Some(found) = by_id(tail).or_else(|| self.family_of_variant(tail)) {
+                return Some(found);
+            }
+        }
+        self.family_of_variant(tail)
+    }
+
+    /// The entry whose id is `variant` less a quantization or tag suffix
+    /// (`nvidia/nemotron-3-ultra-550b-a55b`, `cohere/north-mini-code:free`).
+    fn family_of_variant(&self, variant: &str) -> Option<&CatalogModel> {
+        if !variant.contains('/') {
+            return None;
+        }
         self.models
             .iter()
-            .find(|candidate| model_registry::normalize_model_id(&candidate.id) == wanted)
+            .filter(|candidate| {
+                let id = model_registry::normalize_model_id(&candidate.id);
+                id.contains('/')
+                    && variant
+                        .strip_prefix(id.as_str())
+                        .is_some_and(|rest| rest.starts_with(['-', ':']))
+            })
+            .max_by_key(|candidate| candidate.id.len())
     }
 
     /// Available models first, keeping the gateway's order within each group.
@@ -312,6 +368,15 @@ pub fn model_name(model: &str) -> String {
             .and_then(|entry| entry.display_name.as_deref()),
         entry.as_ref().and_then(|entry| entry.provider.as_deref()),
     )
+}
+
+/// How a person reads the model that answered (the JSON output's additive
+/// `served_model_display_name`; `served_model` keeps the route id for scripts).
+pub fn served_model_display_name(served: Option<&str>) -> Option<String> {
+    served
+        .map(str::trim)
+        .filter(|served| !served.is_empty())
+        .map(model_name)
 }
 
 /// How the system prompt names `model`: the catalog's display name with the id, or the
@@ -1291,6 +1356,76 @@ mod tests {
         );
         let one_shot = model_choice_warning(&catalog, "claude-opus-4-6", now, true).unwrap();
         assert!(!one_shot.contains("Run /model"), "{one_shot}");
+    }
+
+    /// The gateway lists one entry per model family (`openai/gpt-oss-120b`); an older
+    /// session or setting may hold a route id (`groq/openai/gpt-oss-120b`) and the
+    /// engine strips `openai/` before it looks a model up. All of them are the same
+    /// model: none warns, and all are named by the catalog's name.
+    #[test]
+    fn family_ids_and_route_ids_find_the_same_catalog_entry() {
+        let models = parse_catalog(&serde_json::json!({"data": [
+            {"id": "openai/gpt-oss-120b", "available": true, "display_name": "GPT-OSS 120B", "owned_by": "openai"},
+            {"id": "openai/gpt-oss-20b", "available": true, "display_name": "GPT-OSS 20B", "owned_by": "openai"},
+            {"id": "nvidia/nemotron-3-ultra-550b", "available": true, "display_name": "Nemotron 3 Ultra 550B", "owned_by": "nvidia"},
+            {"id": "cohere/north-mini-code", "available": true, "display_name": "North Mini Code", "owned_by": "cohere"},
+        ]}))
+        .unwrap();
+        let catalog = Catalog {
+            models,
+            ..sample_catalog()
+        };
+        let now = crate::clock::now_unix();
+        for (asked, wanted) in [
+            ("openai/gpt-oss-120b", "openai/gpt-oss-120b"),
+            ("gpt-oss-120b", "openai/gpt-oss-120b"),
+            ("GPT-OSS-120B", "openai/gpt-oss-120b"),
+            ("groq/openai/gpt-oss-120b", "openai/gpt-oss-120b"),
+            ("openai/groq/openai/gpt-oss-120b", "openai/gpt-oss-120b"),
+            ("workers-ai/openai/gpt-oss-20b", "openai/gpt-oss-20b"),
+            (
+                "nvidia/nvidia/nemotron-3-ultra-550b-a55b",
+                "nvidia/nemotron-3-ultra-550b",
+            ),
+            (
+                "openrouter/cohere/north-mini-code:free",
+                "cohere/north-mini-code",
+            ),
+        ] {
+            let found = catalog.find(crate::provider::shown_model(asked));
+            assert_eq!(
+                found.map(|entry| entry.id.as_str()),
+                Some(wanted),
+                "{asked}"
+            );
+            assert_eq!(
+                check_model(&catalog, asked, now),
+                ModelCheck::Available,
+                "{asked}"
+            );
+            assert!(
+                model_choice_warning(&catalog, asked, now, false).is_none(),
+                "{asked}"
+            );
+        }
+        // Models the catalog lacks stay unknown, and a longer name is not a prefix match.
+        for asked in [
+            "acme/made-up-model",
+            "groq/openai/gpt-oss-1200b",
+            "groq/openai/gpt-oss-12",
+            "nvidia/nemotron-3-ultra",
+        ] {
+            assert!(catalog.find(asked).is_none(), "{asked}");
+        }
+    }
+
+    #[test]
+    fn the_served_model_gets_a_display_name_beside_its_route_id() {
+        assert_eq!(served_model_display_name(None), None);
+        assert_eq!(served_model_display_name(Some(" ")), None);
+        let name = served_model_display_name(Some("groq/openai/gpt-oss-120b")).unwrap();
+        assert_eq!(name, "gpt-oss-120b", "no catalog: the model part of the id");
+        assert!(!name.contains("groq"), "{name}");
     }
 
     #[test]

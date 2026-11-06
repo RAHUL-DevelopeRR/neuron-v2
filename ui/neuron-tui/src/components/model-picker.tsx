@@ -32,7 +32,7 @@ import { cutToDisplayWidth } from '../utils/display-width'
 import { formatElapsedTime } from '../utils/format-elapsed-time'
 import { formatTokenCount } from '../utils/format-token-count'
 import { logger } from '../utils/logger'
-import { cleanModelName, distinctModelName } from '../utils/model-name'
+import { cleanModelName, distinctModelName, findCatalogModel } from '../utils/model-name'
 import { DEFAULT_REASONING_EFFORTS, effortLabel } from '../utils/status-bar-parts'
 import { BORDER_CHARS } from '../utils/ui-constants'
 
@@ -75,8 +75,8 @@ export function backInLabel(availableAgainAt: string | null | undefined, now: nu
  * The engine sends `current` as the wire model, which can carry the
  * provider's `openai/` prefix the catalog ids do not have.
  */
-const isCurrentModel = (id: string, current: string): boolean =>
-  id === current || current === `openai/${id}`
+const isCurrentModel = (models: ModelsEvent, id: string): boolean =>
+  findCatalogModel(models.models, models.current)?.id === id
 
 /**
  * The picker's rows: name, then context window, plans, the gateway's health,
@@ -124,7 +124,7 @@ export function modelRows(models: ModelsEvent | null, now: number = Date.now()):
       ),
       detail: details.join(' · '),
       available: model.available && !blurred,
-      current: isCurrentModel(model.id, models.current),
+      current: isCurrentModel(models, model.id),
       marker,
       unavailableReason,
       efforts,

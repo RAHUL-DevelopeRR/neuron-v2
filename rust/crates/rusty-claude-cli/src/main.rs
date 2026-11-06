@@ -3598,6 +3598,9 @@ impl LiveCli {
                 "session_id": self.session.id,
                 // The model that answered last (`auto` and failover can differ).
                 "served_model": summary.served_model,
+                // How a person reads it (no route); `served_model` stays the route id.
+                "served_model_display_name":
+                    crate::gateway_catalog::served_model_display_name(summary.served_model.as_deref()),
                 "iterations": summary.iterations,
                 "outcome": repl_loop::turn_outcome_label(&summary.outcome),
                 "stop_reason": summary.stop_reason,

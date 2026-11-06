@@ -9,6 +9,7 @@ import {
 import { modelMaker } from '../model-name'
 import { providerBadge } from '../provider-badge'
 import {
+  catalogModel,
   effortLabel,
   folderName,
   lineWidth,
@@ -23,7 +24,7 @@ import {
 } from '../status-bar-parts'
 
 import type { GlyphMode } from '../glyphs'
-import type { AccountDetails, StatusEvent } from '../../engine/protocol'
+import type { AccountDetails, ModelsEvent, StatusEvent } from '../../engine/protocol'
 
 /** Three hours before the fixture's window resets (14:32 UTC). */
 const NOW = Date.parse('2026-11-03T11:22:00Z')
@@ -355,5 +356,54 @@ describe('helpers', () => {
     expect(folderName('C:\\RAHUL\\neuron-v2')).toBe('neuron-v2')
     expect(folderName('/home/dev/app/')).toBe('app')
     expect(folderName('')).toBeNull()
+  })
+})
+
+describe('the gateway lists model families; sessions may hold route ids', () => {
+  const family = (id: string, display_name: string) => ({
+    id,
+    display_name,
+    available: true,
+    unavailable_reason: null,
+    context_window: 131_072,
+    tiers: ['free'],
+    provider: id.split('/')[0],
+  })
+  const models: ModelsEvent = {
+    type: 'models',
+    current: 'auto',
+    models: [
+      family('openai/gpt-oss-120b', 'GPT-OSS 120B'),
+      family('nvidia/nemotron-3-ultra-550b', 'Nemotron 3 Ultra 550B'),
+      family('cohere/north-mini-code', 'North Mini Code'),
+    ],
+  }
+
+  test('a family id, its bare form and a route id find the same catalog entry', () => {
+    const wanted: Array<[string, string]> = [
+      ['openai/gpt-oss-120b', 'openai/gpt-oss-120b'],
+      ['gpt-oss-120b', 'openai/gpt-oss-120b'],
+      ['groq/openai/gpt-oss-120b', 'openai/gpt-oss-120b'],
+      ['nvidia/nvidia/nemotron-3-ultra-550b-a55b', 'nvidia/nemotron-3-ultra-550b'],
+      ['openrouter/cohere/north-mini-code:free', 'cohere/north-mini-code'],
+    ]
+    for (const [asked, id] of wanted) expect(catalogModel(models, asked)?.id).toBe(id)
+    for (const asked of ['acme/made-up', 'groq/openai/gpt-oss-1200b', 'nvidia/nemotron-3-ultra'])
+      expect(catalogModel(models, asked)).toBeNull()
+  })
+
+  test('the bar names a route id by the catalog name, not the id', () => {
+    for (const [asked, name] of [
+      ['groq/openai/gpt-oss-120b', 'GPT-OSS 120B'],
+      ['nvidia/nvidia/nemotron-3-ultra-550b-a55b', 'Nemotron 3 Ultra 550B'],
+    ]) {
+      const text = render(
+        input({ model: asked, model_display_name: null, provider: null }, 'unicode', { models }),
+        200,
+      )
+      expect(text).toContain(name)
+      expect(text).not.toContain('nvidia/nvidia')
+      expect(text).not.toContain('groq/')
+    }
   })
 })

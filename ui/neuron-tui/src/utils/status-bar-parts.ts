@@ -27,7 +27,13 @@ import { needsSignIn } from '../state/engine-store'
 import { contextUsage } from './context-breakdown'
 import { formatTokenCount } from './format-token-count'
 import { cutToDisplayWidth, displayWidth as stringWidth } from './display-width'
-import { cleanModelName, distinctModelName, isAutoModel, modelMaker } from './model-name'
+import {
+  cleanModelName,
+  distinctModelName,
+  findCatalogModel,
+  isAutoModel,
+  modelMaker,
+} from './model-name'
 import { providerBadge } from './provider-badge'
 
 import type { GlyphMode } from './glyphs'
@@ -211,14 +217,12 @@ export interface StatusView {
   mode: GlyphMode
 }
 
-/** The engine names the model with the provider's `openai/` prefix the catalog lacks. */
-function isCurrentModel(id: string, current: string): boolean {
-  return id === current || current === `openai/${id}` || `openai/${current}` === id
-}
-
+/**
+ * The catalog entry for the engine's model id: the family the gateway lists, found
+ * from its bare form (`openai/` stripped by the engine) or a route id.
+ */
 export function catalogModel(models: ModelsEvent | null, id: string): ModelInfo | null {
-  if (!models) return null
-  return models.models.find((model) => isCurrentModel(model.id, id)) ?? null
+  return findCatalogModel(models?.models, id)
 }
 
 /** "free" → "Free". */

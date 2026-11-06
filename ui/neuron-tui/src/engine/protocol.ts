@@ -657,6 +657,7 @@ export interface StatusEvent {
    * is `AccountDetails.usage_window`.
    */
   request_tokens_estimate?: number | null
+  /**
    * How a person reads `served_model`: its catalog name without the
    * gateway's route to it (`GLM-4.7 Flash`, not `GLM-4.7 Flash (OpenRouter,
    * free)` or the id). Sent with `served_model`; absent from older engines.

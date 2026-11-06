@@ -202,3 +202,51 @@ export function modelMaker(id: string, provider?: string | null): string | null 
   const own = provider?.trim().toLowerCase()
   return own && !ROUTE_PROVIDERS.has(own) && own !== 'nvidia' ? own : null
 }
+
+/** The id as the gateway lists it: lower case, `openai/` stripped only when a provider id follows. */
+const normalizedId = (id: string): string => {
+  const lowered = id.trim().toLowerCase()
+  const rest = lowered.startsWith('openai/') ? lowered.slice('openai/'.length) : null
+  return rest !== null && (rest.includes('/') || rest === 'auto' || rest === 'default') ? rest : lowered
+}
+
+/**
+ * The catalog entry for `asked`. The gateway lists one entry per model family
+ * (`openai/gpt-oss-120b`), but the engine strips `openai/` (`gpt-oss-120b`) and
+ * a saved session or setting can hold a route id (`groq/openai/gpt-oss-120b`,
+ * `nvidia/nvidia/nemotron-3-ultra-550b-a55b`): each finds its family. Mirrors
+ * `Catalog::find` in rust/crates/rusty-claude-cli/src/gateway_catalog.rs.
+ */
+export function findCatalogModel<T extends { id: string }>(
+  models: ReadonlyArray<T> | null | undefined,
+  asked: string,
+): T | null {
+  if (!models || !asked.trim()) return null
+  const wanted = normalizedId(asked)
+  const byId = (id: string): T | undefined => models.find((model) => normalizedId(model.id) === id)
+  const variantOf = (variant: string): T | undefined => {
+    if (!variant.includes('/')) return undefined
+    let best: T | undefined
+    for (const model of models) {
+      const id = normalizedId(model.id)
+      if (!id.includes('/') || !variant.startsWith(id)) continue
+      const next = variant[id.length]
+      if ((next === '-' || next === ':') && (!best || model.id.length > best.id.length)) best = model
+    }
+    return best
+  }
+  const bare = wanted.replace(/^(openai|xai)\//, '')
+  const exact = byId(wanted) ?? byId(bare) ?? byId(`openai/${bare}`) ?? byId(`xai/${bare}`)
+  if (exact) return exact
+  // `provider/maker/name`: each tail that is still `maker/name` or longer.
+  let tail = wanted
+  for (;;) {
+    const slash = tail.indexOf('/')
+    if (slash < 0) break
+    tail = tail.slice(slash + 1)
+    if (!tail.includes('/')) break
+    const found = byId(tail) ?? variantOf(tail)
+    if (found) return found
+  }
+  return variantOf(tail) ?? null
+}
