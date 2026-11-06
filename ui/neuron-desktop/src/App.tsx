@@ -571,6 +571,8 @@ export function App({ platform }: { platform: Platform }) {
           todos={state.todos}
           subagents={runningSubagents(state)}
           terminalOpened={terminalOpened}
+          state={state}
+          controller={controller}
         />
       )}
       <StatusBar state={state} onPane={openPane} />

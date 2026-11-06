@@ -91,5 +91,8 @@ export function hostPlatform(options: HostPlatformOptions): Platform {
       }
     },
     openExternal: (url) => window.open(url, '_blank', 'noopener,noreferrer'),
+    // L2: review and git: the browser build has no way to change or open files on the host.
+    gitRevert: () => Promise.reject(new Error('Reverting a file needs the desktop app.')),
+    openInEditor: () => Promise.reject(new Error('Opening a file in an editor needs the desktop app.')),
   }
 }

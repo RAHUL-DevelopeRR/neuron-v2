@@ -102,6 +102,11 @@ export interface FakePlatform extends Platform {
   /** How many times the updater was asked. */
   checks: number
   saved: Map<string, unknown>
+  // L2: review and git
+  /** Paths `gitRevert` was asked for. */
+  reverted: string[]
+  /** Paths `openInEditor` was asked for. */
+  editorOpens: string[]
 }
 
 export interface FakePlatformOptions {
@@ -132,6 +137,8 @@ export function fakePlatform(engine: FakeEngine, options: FakePlatformOptions = 
     checks: 0,
     manualUpdates: options.manualUpdates ?? false,
     saved,
+    reverted: [],
+    editorOpens: [],
     store: {
       get: async <T,>(key: string) => saved.get(key) as T | undefined,
       set: async (key, value) => void saved.set(key, value),
@@ -197,6 +204,14 @@ export function fakePlatform(engine: FakeEngine, options: FakePlatformOptions = 
     },
     openExternal(url: string) {
       platform.opened.push(url)
+    },
+    // L2: review and git
+    async gitRevert(path) {
+      platform.reverted.push(path)
+      if (platform.git) platform.git = { ...platform.git, changes: platform.git.changes.filter((change) => change.path !== path) }
+    },
+    async openInEditor(path) {
+      platform.editorOpens.push(path)
     },
   }
   return platform

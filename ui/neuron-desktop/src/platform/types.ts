@@ -112,4 +112,7 @@ export interface Platform {
   /** A shell in the workspace; rejects where there is none. */
   openTerminal(cols: number, rows: number): Promise<TerminalSession>
   openExternal(url: string): void
+  // L2: review and git
+  gitRevert(path: string): Promise<void>
+  openInEditor(path: string): Promise<void>
 }

@@ -227,5 +227,8 @@ export function tauriPlatform(): Platform {
       }
     },
     openExternal: (url) => void invoke('open_external', { url }),
+    // L2: review and git
+    gitRevert: (path) => invoke<void>('git_revert', { path }),
+    openInEditor: (path) => invoke<void>('open_in_editor', { path }),
   }
 }
