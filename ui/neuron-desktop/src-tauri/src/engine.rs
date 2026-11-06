@@ -44,6 +44,8 @@ pub struct Launch {
     pub model: Option<String>,
     pub permission_mode: Option<String>,
     pub resume: Option<String>,
+    /// L3: `low`, `medium` or `high`; the engine's own default when `None`.
+    pub reasoning_effort: Option<String>,
 }
 
 pub fn engine_args(launch: &Launch) -> Vec<String> {
@@ -52,6 +54,7 @@ pub fn engine_args(launch: &Launch) -> Vec<String> {
         ("--model", &launch.model),
         ("--permission-mode", &launch.permission_mode),
         ("--resume", &launch.resume),
+        ("--reasoning-effort", &launch.reasoning_effort),
     ] {
         if let Some(value) = value {
             args.push(flag.to_string());
@@ -229,12 +232,25 @@ mod tests {
     }
 
     #[test]
+    fn launch_flags_carry_the_reasoning_effort() {
+        let launch = Launch {
+            reasoning_effort: Some("high".into()),
+            ..Launch::default()
+        };
+        assert_eq!(
+            engine_args(&launch),
+            ["engine", "--stdio", "--reasoning-effort", "high"]
+        );
+    }
+
+    #[test]
     fn launch_flags() {
         assert_eq!(engine_args(&Launch::default()), ["engine", "--stdio"]);
         let launch = Launch {
             model: Some("sonnet".into()),
             permission_mode: Some("read-only".into()),
             resume: None,
+            ..Launch::default()
         };
         assert_eq!(
             engine_args(&launch),
@@ -321,6 +337,7 @@ mod tests {
             model: Some("sonnet".into()),
             permission_mode: Some("workspace-write".into()),
             resume: None,
+            ..Launch::default()
         };
         let engine = EngineProcess::spawn(
             &neuron,
