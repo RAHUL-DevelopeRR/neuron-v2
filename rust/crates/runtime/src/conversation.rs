@@ -3886,7 +3886,10 @@ mod tests {
         let submit = prompt.find("prompt-marker").expect("prompt context");
         assert!(start < submit, "{prompt}");
         // Consumed by the turn: the next one does not repeat it.
-        assert!(runtime.take_pending_hook_context().is_empty());
+        assert_eq!(
+            runtime.take_pending_hook_context(),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -4833,7 +4836,7 @@ mod resilience_tests {
             None,
         );
         assert_eq!(ran, 0);
-        assert!(decided.is_empty());
+        assert_eq!(decided, [] as [crate::permissions::PermissionDecider; 0]);
 
         // A deny rule still refuses without asking.
         let mut prompter = AllowForSession(0);

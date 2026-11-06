@@ -1262,7 +1262,7 @@ mod tests {
         );
         assert_eq!(origin, McpSandboxOrigin::Unvetted);
         assert_eq!(profile.fs_read, vec!["."]);
-        assert!(profile.fs_write.is_empty());
+        assert_eq!(profile.fs_write, [] as [std::string::String; 0]);
         assert_eq!(profile.network, McpSandboxNetwork::None);
         assert!(!profile.off);
     }
@@ -1649,7 +1649,10 @@ mod tests {
             assert!(dir.is_dir(), "only existing folders are hidden: {dir:?}");
         }
 
-        assert!(super::granted_socket_roots(&env_pairs(&[("PATH", "/bin")])).is_empty());
+        assert_eq!(
+            super::granted_socket_roots(&env_pairs(&[("PATH", "/bin")])),
+            [] as [std::path::PathBuf; 0]
+        );
         let granted = super::granted_socket_roots(&env_pairs(&[
             ("DISPLAY", ":0"),
             ("XDG_RUNTIME_DIR", "/run/user/1000"),
@@ -1742,7 +1745,7 @@ mod tests {
 
         // Where file limits are not enforced nothing changes.
         let roots = super::sandbox_roots(&transport(McpSandboxProfile::default()), &host(), false);
-        assert!(roots.private_caches.is_empty());
+        assert_eq!(roots.private_caches, [] as [(&str, std::path::PathBuf); 0]);
     }
 
     #[test]
@@ -1768,7 +1771,10 @@ mod tests {
         assert_eq!(roots, vec![super::normalize(&dir.join("node_modules"))]);
 
         // Not an interpreter: its arguments are data.
-        assert!(super::mcp_program_roots("my-server", &args).is_empty());
+        assert_eq!(
+            super::mcp_program_roots("my-server", &args),
+            [] as [std::path::PathBuf; 0]
+        );
 
         let mut server = transport(McpSandboxProfile::default());
         server.args = args;

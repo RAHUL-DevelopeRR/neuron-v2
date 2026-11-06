@@ -214,10 +214,10 @@ mod tests {
                     .with_matcher(Some("resume".into())),
             );
             let mut runtime = runtime(hooks, client);
-            assert!(runtime
-                .run_session_start_hooks("startup")
-                .messages()
-                .is_empty());
+            assert_eq!(
+                runtime.run_session_start_hooks("startup").messages(),
+                [] as [String; 0]
+            );
             assert_eq!(
                 runtime.run_session_start_hooks("resume").messages(),
                 ["resumed"]
@@ -262,7 +262,10 @@ mod tests {
                 runtime.run_pre_compact_hooks("manual").messages(),
                 ["saving notes"]
             );
-            assert!(runtime.run_pre_compact_hooks("auto").messages().is_empty());
+            assert_eq!(
+                runtime.run_pre_compact_hooks("auto").messages(),
+                [] as [String; 0]
+            );
         }
     }
 }

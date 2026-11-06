@@ -384,20 +384,29 @@ mod tests {
                 call("c", "read_file"),
             ],
         );
-        assert!(runtime.tool_executor.batches.is_empty());
+        assert_eq!(
+            runtime.tool_executor.batches,
+            [] as [std::vec::Vec<std::string::String>; 0]
+        );
         assert_eq!(runtime.tool_executor.peak.load(Ordering::SeqCst), 1);
 
         let runtime = run(
             MockTools::new(true),
             vec![call("a", "read_file"), call("w", "write_file")],
         );
-        assert!(runtime.tool_executor.batches.is_empty());
+        assert_eq!(
+            runtime.tool_executor.batches,
+            [] as [std::vec::Vec<std::string::String>; 0]
+        );
 
         let runtime = run(
             MockTools::new(false),
             vec![call("a", "read_file"), call("b", "read_file")],
         );
-        assert!(runtime.tool_executor.batches.is_empty());
+        assert_eq!(
+            runtime.tool_executor.batches,
+            [] as [std::vec::Vec<std::string::String>; 0]
+        );
         assert_eq!(runtime.tool_executor.peak.load(Ordering::SeqCst), 1);
         assert_eq!(result_ids(&runtime), vec!["a=result a", "b=result b"]);
     }

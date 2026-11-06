@@ -1415,10 +1415,13 @@ mod tests {
                     "written by hand
 "
                 );
-                assert!(cli.runtime.session().messages.is_empty());
+                assert_eq!(
+                    cli.runtime.session().messages,
+                    [] as [runtime::ConversationMessage; 0]
+                );
                 // The cut-back chat is what was saved.
                 let saved = runtime::Session::load_from_path(&cli.session.path).expect("saved");
-                assert!(saved.messages.is_empty());
+                assert_eq!(saved.messages, [] as [runtime::ConversationMessage; 0]);
             });
         });
         // As `launch` does when the REPL ends: no other test inherits its servers.

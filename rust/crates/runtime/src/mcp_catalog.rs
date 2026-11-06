@@ -981,7 +981,7 @@ mod tests {
         };
         assert_eq!(ids("GITHUB"), vec!["github"]);
         assert!(ids("documentation").contains(&"aws-docs"));
-        assert!(ids("nothing-like-this").is_empty());
+        assert_eq!(ids("nothing-like-this"), [] as [&str; 0]);
     }
 
     #[test]
@@ -1307,7 +1307,10 @@ mod tests {
             mcp_secret_references("Bearer ${secret:A} ${HOME} ${secret:B}"),
             vec!["A", "B"]
         );
-        assert!(mcp_secret_references("${secret:}${secret:open").is_empty());
+        assert_eq!(
+            mcp_secret_references("${secret:}${secret:open"),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]

@@ -1079,7 +1079,10 @@ mod tests {
             assert!(error.contains(why), "{name}: {error}");
         }
         let config = loader.load().unwrap();
-        assert!(super::mcp_unpinned_servers(&store, config.mcp(), loader.cwd()).is_empty());
+        assert_eq!(
+            super::mcp_unpinned_servers(&store, config.mcp(), loader.cwd()),
+            [] as [std::string::String; 0]
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

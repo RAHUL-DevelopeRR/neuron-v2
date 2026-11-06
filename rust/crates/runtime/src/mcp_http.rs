@@ -975,7 +975,10 @@ mod tests {
             "{:?}",
             report.failed_servers
         );
-        assert!(report.unsupported_servers.is_empty());
+        assert_eq!(
+            report.unsupported_servers,
+            [] as [crate::mcp_stdio::UnsupportedMcpServer; 0]
+        );
         let names: Vec<_> = report
             .tools
             .iter()
@@ -1279,7 +1282,10 @@ mod tests {
             "{:?}",
             report.failed_servers
         );
-        assert!(report.unsupported_servers.is_empty());
+        assert_eq!(
+            report.unsupported_servers,
+            [] as [crate::mcp_stdio::UnsupportedMcpServer; 0]
+        );
         assert_eq!(report.tools.len(), 2);
         assert_eq!(zerox_needs_connect("github"), None);
         runtime.block_on(manager.shutdown()).unwrap();
@@ -1318,7 +1324,10 @@ mod tests {
         let _linked = ZeroxTestGateway::new(&server.url, Some("ses_linked"));
         let mut linked = self::manager("hosted-unlinked", hosted("github"));
         let report = runtime.block_on(linked.discover_tools_best_effort());
-        assert!(report.failed_servers.is_empty());
+        assert_eq!(
+            report.failed_servers,
+            [] as [crate::mcp_stdio::McpDiscoveryFailure; 0]
+        );
         assert_eq!(zerox_needs_connect("hosted-unlinked"), None);
     }
 
@@ -1332,7 +1341,7 @@ mod tests {
         let report = runtime.block_on(manager.discover_tools_best_effort());
         assert_eq!(report.failed_servers.len(), 1);
         assert_eq!(manager.unlinked_hosted_servers(), vec!["hosted-later"]);
-        assert!(manager.confirmed_tools().is_empty());
+        assert_eq!(manager.confirmed_tools(), [] as [std::string::String; 0]);
 
         // Still not linked: it stays unlinked, with no tools.
         assert!(runtime
@@ -1345,7 +1354,10 @@ mod tests {
             .block_on(manager.rediscover_server("hosted-later"))
             .expect("linked now");
         assert_eq!(tools.len(), 2);
-        assert!(manager.unlinked_hosted_servers().is_empty());
+        assert_eq!(
+            manager.unlinked_hosted_servers(),
+            [] as [std::string::String; 0]
+        );
         assert_eq!(zerox_needs_connect("hosted-later"), None);
         assert_eq!(
             manager.confirmed_tools(),
