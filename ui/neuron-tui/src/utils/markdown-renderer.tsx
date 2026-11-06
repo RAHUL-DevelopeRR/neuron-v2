@@ -1216,3 +1216,108 @@ export function renderStreamingMarkdown(
 
   return mergeStreamingSegments(segments)
 }
+
+/** A line that starts a list item or a blockquote, or continues a block (indented). */
+const CONTINUES_OR_JOINS = /^(?:[ \t]|[-*+](?:[ \t]|$)|\d{1,9}[.)](?:[ \t]|$)|>|<)/
+
+/**
+ * Where streaming `content` can be cut so that its two parts parse into the
+ * same blocks apart as together: the start of the last block after a blank
+ * line outside code fences, when that block is a plain one (a paragraph, a
+ * heading, a fence, a rule) that cannot belong to a list, a quote, an
+ * indented block or HTML above it, and does not change how the paragraph
+ * before it ends (one before a list or a quote ends tighter). -1 when there
+ * is no such place.
+ *
+ * Everything before it is finished: the model only appends. A streaming
+ * message draws it once ({@link renderMarkdownHead}) and parses only the
+ * part after it for each update, instead of the whole message every time.
+ */
+export function streamingMarkdownSplit(content: string): number {
+  // Inside an HTML comment or `<pre>`-like block, blank lines do not end it.
+  if (/<!--|<(?:pre|script|style|textarea)\b/i.test(content)) return -1
+  // A fence still open is drawn as typed from its ``` on
+  // (renderStreamingMarkdown): the cut comes before it, with text between.
+  const openFence = hasIncompleteCodeFence(content) ? content.lastIndexOf('```') : -1
+  const fits = (split: number) =>
+    openFence < 0 || (split < openFence && content.slice(split, openFence).trim() !== '')
+  let inFence: string | null = null
+  let lastSplit = -1
+  let lineStart = 0
+  let previousBlank = false
+  while (lineStart <= content.length) {
+    const end = content.indexOf('\n', lineStart)
+    const lineEnd = end < 0 ? content.length : end
+    const line = content.slice(lineStart, lineEnd)
+    const fence = /^ {0,3}(`{3,}|~{3,})/.exec(line)
+    if (inFence) {
+      if (fence && fence[1]![0] === inFence[0] && fence[1]!.length >= inFence.length && line.trim() === fence[1]) {
+        inFence = null
+      }
+      previousBlank = false
+    } else {
+      const blank = line.trim() === ''
+      // Only a complete line: the start of one still streaming can turn
+      // into a list item or an indented line.
+      if (!blank && previousBlank && end >= 0 && !CONTINUES_OR_JOINS.test(line) && fits(lineStart)) {
+        lastSplit = lineStart
+      }
+      if (fence) inFence = fence[1]!
+      previousBlank = blank
+    }
+    if (end < 0) break
+    lineStart = end + 1
+  }
+  return lastSplit
+}
+
+/**
+ * The finished blocks of a streaming message ({@link streamingMarkdownSplit}),
+ * drawn as {@link renderMarkdown} draws them inside the whole text: with the
+ * blank line after the last one, which only the end of a message drops.
+ */
+export function renderMarkdownHead(
+  markdown: string,
+  options: MarkdownRenderOptions = {},
+): ReactNode {
+  try {
+    const palette = resolvePalette(options.palette)
+    const state = createRenderState(palette, options.codeBlockWidth ?? 80)
+    let ast = parseMarkdown(markdown)
+    const protectedMarkdown = protectPathBackslashes(markdown, ast)
+    if (protectedMarkdown !== null) ast = parseMarkdown(protectedMarkdown)
+    const nodes = renderNode(ast, state, ast.type, undefined)
+    return (
+      <>
+        {nodes.map((node, idx) => (
+          <KeyedFragment key={`markdown-head-${idx}`}>{node}</KeyedFragment>
+        ))}
+      </>
+    )
+  } catch (error) {
+    logger.error(error, 'Failed to parse markdown')
+    return markdown
+  }
+}
+
+/**
+ * The part of a streaming message after its finished blocks, drawn as the
+ * whole message would draw it there ({@link renderStreamingMarkdown}): as
+ * Markdown, and from the last ``` on as typed when the whole message has a
+ * code fence still open (`openFence`).
+ */
+export function renderMarkdownTail(
+  tail: string,
+  openFence: boolean,
+  options: MarkdownRenderOptions = {},
+): ReactNode {
+  if (!openFence) return renderMarkdown(tail, options)
+  const lastFenceIndex = tail.lastIndexOf('```')
+  if (lastFenceIndex < 0) return renderMarkdown(tail, options)
+  const completeSection = tail.slice(0, lastFenceIndex)
+  const pendingSection = tail.slice(lastFenceIndex)
+  const segments: ReactNode[] = []
+  if (completeSection.length > 0) segments.push(renderMarkdown(completeSection, options))
+  if (pendingSection.length > 0) segments.push(pendingSection)
+  return mergeStreamingSegments(segments)
+}

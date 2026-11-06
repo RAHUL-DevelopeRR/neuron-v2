@@ -1323,7 +1323,14 @@ fn parse_git_status_branch(status: Option<&str>) -> Option<String> {
     if line.starts_with("HEAD") {
         return Some("detached HEAD".to_string());
     }
-    let branch = line.split(['.', ' ']).next().unwrap_or_default().trim();
+    // `## <branch>...<upstream> [ahead 1]`: a branch name may itself contain
+    // dots (`release/7.0.0-alpha.4`), so cut at the `...` and then at the
+    // first space, never at a single dot.
+    let branch = line
+        .split("...")
+        .next()
+        .and_then(|head| head.split_whitespace().next())
+        .unwrap_or_default();
     if branch.is_empty() {
         None
     } else {
@@ -3042,7 +3049,8 @@ impl LiveCli {
                 .collect::<String>();
             format!("{kept}...")
         };
-        let model_short = self.model.split('/').last().unwrap_or(&self.model);
+        // The model's name, without the gateway's route to it (`/status` has the id).
+        let model_short = crate::gateway_catalog::model_name(&self.model);
         let active = provider::active_provider();
         let provider = active.as_ref().map_or_else(
             || provider::active_provider_name(&self.model),
@@ -3186,7 +3194,7 @@ impl LiveCli {
         let inner = w_left - 2;
         let model_info = format!(
             "{g}{ms}{r} {d}.{r} {b}{prov}{r} {d}. Plan: {qs}{r}",
-            ms = model_short,
+            ms = model_short.as_str(),
             prov = provider,
             qs = quota_str
         );
@@ -3195,7 +3203,7 @@ impl LiveCli {
         } else {
             let rest = format!("{provider} . Plan: {quota_str}");
             vec![
-                format!("{g}{}{r}", fit(model_short, inner)),
+                format!("{g}{}{r}", fit(&model_short, inner)),
                 if rest.chars().count() <= inner {
                     format!("{b}{provider}{r} {d}. Plan: {quota_str}{r}")
                 } else {
@@ -5708,6 +5716,31 @@ mod tests {
     }
 
     #[test]
+    fn context_window_preflight_errors_name_the_model_without_its_route() {
+        let error = ApiError::ContextWindowExceeded {
+            model: "openai/cohere/north-mini-code:free".to_string(),
+            estimated_input_tokens: 120_000,
+            requested_output_tokens: 16_000,
+            estimated_total_tokens: 136_000,
+            context_window_tokens: 128_000,
+        };
+
+        let rendered = format_user_visible_api_error("session-issue-ctx", &error);
+        let model_line = rendered
+            .lines()
+            .find(|line| line.trim_start().starts_with("Model "))
+            .expect("a Model line");
+        // With the gateway's catalog loaded its name, without it the model part of the id.
+        assert!(
+            model_line.ends_with("north-mini-code") || model_line.ends_with("North Mini Code"),
+            "{rendered}"
+        );
+        for route in ["cohere/", ":free", "openai/", "OpenRouter"] {
+            assert!(!rendered.contains(route), "{route} in {rendered}");
+        }
+    }
+
+    #[test]
     fn provider_context_window_errors_are_reframed_with_same_guidance() {
         let error = ApiError::Api {
             status: "400".parse().expect("status"),
@@ -8065,6 +8098,20 @@ mod tests {
         assert!(report.contains("Current model    claude-sonnet"));
         assert!(report.contains("Session messages 12"));
         assert!(report.contains("Switch models with /model <name>"));
+
+        // The model by name, not the gateway's route to it (`/status` has the id).
+        let routed = format_model_report("openai/cohere/north-mini-code:free", 0, 0);
+        let line = routed
+            .lines()
+            .find(|line| line.trim_start().starts_with("Current model"))
+            .expect("a Current model line");
+        assert!(
+            line.ends_with("north-mini-code") || line.ends_with("North Mini Code"),
+            "{routed}"
+        );
+        for route in ["cohere/", ":free", "openai/", "OpenRouter"] {
+            assert!(!routed.contains(route), "{route} in {routed}");
+        }
     }
 
     #[test]
@@ -8074,6 +8121,19 @@ mod tests {
         assert!(report.contains("Previous         claude-sonnet"));
         assert!(report.contains("Current          claude-opus"));
         assert!(report.contains("Preserved msgs   9"));
+
+        // Gateway models by name, never by the route to them.
+        let report =
+            format_model_switch_report("openai/auto", "openai/unit-maker/unit-flash:free", 2);
+        assert!(report.contains("Previous         Auto\n"), "{report}");
+        assert!(report.contains("Current          unit-flash\n"), "{report}");
+        assert!(!report.contains(":free"), "{report}");
+        let line = format_connected_line("openai/unit-maker/unit-flash:free");
+        assert!(line.contains("unit-flash"), "{line}");
+        assert!(
+            !line.contains("unit-maker/") && !line.contains(":free"),
+            "{line}"
+        );
     }
 
     #[test]
@@ -8232,6 +8292,25 @@ mod tests {
         );
         let _ = project_root;
         fs::remove_dir_all(temp_root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn keeps_dots_in_branch_names_from_status_snapshot() {
+        assert_eq!(
+            parse_git_status_branch(Some(
+                "## release/7.0.0-alpha.4...origin/release/7.0.0-alpha.4 [ahead 2]\n M CHANGELOG.md"
+            ))
+            .as_deref(),
+            Some("release/7.0.0-alpha.4")
+        );
+        assert_eq!(
+            parse_git_status_branch(Some("## release/7.0.0-alpha.4\n?? notes.md")).as_deref(),
+            Some("release/7.0.0-alpha.4")
+        );
+        assert_eq!(
+            parse_git_status_branch(Some("## v1.2 [gone]")).as_deref(),
+            Some("v1.2")
+        );
     }
 
     #[test]

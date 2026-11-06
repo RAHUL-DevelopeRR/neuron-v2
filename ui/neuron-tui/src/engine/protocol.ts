@@ -657,9 +657,17 @@ export interface StatusEvent {
    * is `AccountDetails.usage_window`.
    */
   request_tokens_estimate?: number | null
+   * How a person reads `served_model`: its catalog name without the
+   * gateway's route to it (`GLM-4.7 Flash`, not `GLM-4.7 Flash (OpenRouter,
+   * free)` or the id). Sent with `served_model`; absent from older engines.
+   */
+  served_model_display_name?: string | null
   /** Who serves the model (feature `status_bar`), as on {@link ModelInfo}. */
   provider?: string | null
-  /** The catalog's name for the model (feature `status_bar`). */
+  /**
+   * The catalog's name for the model (feature `status_bar`), without the
+   * gateway's route to it from engines after 7.0.0-alpha.4.
+   */
   model_display_name?: string | null
   /** The thinking level the next turn asks for; `null` for the model's default. */
   reasoning_effort?: string | null

@@ -12,6 +12,7 @@ import { MessageBlock } from './message-block'
 import { ModeDivider } from './mode-divider'
 import { useChatStore } from '../state/chat-store'
 import { useMessageBlockStore } from '../state/message-block-store'
+import { renderProbe } from '../utils/render-probe'
 import { splitByAgentSize } from '../utils/block-processor'
 import { getCliEnv } from '../utils/env'
 import { GLYPHS } from '../utils/glyphs'
@@ -104,6 +105,7 @@ interface MessageWithAgentsProps {
 
 export const MessageWithAgents = memo(
   ({ message, depth, isLastMessage, availableWidth }: MessageWithAgentsProps): ReactNode => {
+    renderProbe.onRender?.('MessageWithAgents', message.id)
     const SIDE_GUTTER = 1
     const isAgent = message.variant === 'agent'
 

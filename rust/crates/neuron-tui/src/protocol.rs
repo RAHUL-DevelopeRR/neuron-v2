@@ -758,10 +758,16 @@ pub enum UiEvent {
         /// [`AccountDetails::usage_window`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_tokens_estimate: Option<u64>,
+        /// How a person reads `served_model`: its catalog name without the gateway's
+        /// route to it (`GLM-4.7 Flash`, not `GLM-4.7 Flash (OpenRouter, free)` or the
+        /// id). Sent with `served_model`; `None` from older engines.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        served_model_display_name: Option<String>,
         /// Who serves the model ([`FEATURE_STATUS_BAR`]), as on [`ModelInfo`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
-        /// The catalog's name for the model ([`FEATURE_STATUS_BAR`]).
+        /// The catalog's name for the model ([`FEATURE_STATUS_BAR`]), without the
+        /// gateway's route to it (`(OpenRouter, free)`) from engines after 7.0.0-alpha.4.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model_display_name: Option<String>,
         /// The thinking level the next turn asks for; `None` for the model's default.
@@ -1441,6 +1447,7 @@ mod tests {
                 account: None,
                 served_model: None,
                 request_tokens_estimate: None,
+                served_model_display_name: None,
                 provider: None,
                 reasoning_effort: None,
                 reasoning_efforts: None,

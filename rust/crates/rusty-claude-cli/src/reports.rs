@@ -26,8 +26,10 @@ pub fn format_unknown_slash_command_message(name: &str) -> String {
     message
 }
 
+/// `/model`'s report: the model by name, without the gateway's route to it (`/status`
+/// has the id).
 pub fn format_model_report(model: &str, message_count: usize, turns: u32) -> String {
-    let model = crate::provider::shown_model(model);
+    let model = crate::gateway_catalog::model_name(model);
     format!(
         "Model
   Current model    {model}
@@ -40,10 +42,12 @@ Usage
     )
 }
 
+/// `/model <id>`'s report: the models by name, without the gateway's route to them
+/// (`/status` has the id).
 pub fn format_model_switch_report(previous: &str, next: &str, message_count: usize) -> String {
     let (previous, next) = (
-        crate::provider::shown_model(previous),
-        crate::provider::shown_model(next),
+        crate::gateway_catalog::model_name(previous),
+        crate::gateway_catalog::model_name(next),
     );
     format!(
         "Model updated

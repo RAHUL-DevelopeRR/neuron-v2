@@ -224,6 +224,96 @@ pub fn model_entry(model: &str) -> Option<CatalogModel> {
     current().and_then(|catalog| catalog.find(crate::provider::shown_model(model)).cloned())
 }
 
+/// What a catalog display name's last parenthesis holds when it names the way the
+/// gateway reaches the model, not the model: `North Mini Code (OpenRouter, free)`,
+/// `GPT-OSS 120B (Groq)`, `Llama 3.3 70B (Workers AI)`. Lower case. Mirrored in
+/// `ui/neuron-tui/src/utils/model-name.ts`.
+const ROUTE_WORDS: &[&str] = &[
+    "openrouter",
+    "groq",
+    "nvidia",
+    "nvidia nim",
+    "nim",
+    "workers ai",
+    "cloudflare",
+    "cloudflare workers ai",
+    "google ai studio",
+    "vertex",
+    "vertex ai",
+    "cerebras",
+    "together",
+    "together ai",
+    "fireworks",
+    "deepinfra",
+    "sambanova",
+    "hugging face",
+    "huggingface",
+    "azure",
+    "zero-x",
+    "free",
+    "paid",
+    "free tier",
+    "paid tier",
+];
+
+/// `name` without the trailing parentheses that only name its route (see [`ROUTE_WORDS`],
+/// and `provider`, the catalog's `owned_by`).
+fn without_route(name: &str, provider: Option<&str>) -> String {
+    let mut kept = name.trim();
+    while let Some(open) = kept.rfind(" (").filter(|_| kept.ends_with(')')) {
+        let inside = &kept[open + 2..kept.len() - 1];
+        let only_route = inside.split(',').map(str::trim).all(|part| {
+            !part.is_empty()
+                && (ROUTE_WORDS.contains(&part.to_ascii_lowercase().as_str())
+                    || provider.is_some_and(|provider| provider.eq_ignore_ascii_case(part)))
+        });
+        if !only_route {
+            break;
+        }
+        kept = kept[..open].trim_end();
+    }
+    if kept.is_empty() {
+        name.trim().to_string()
+    } else {
+        kept.to_string()
+    }
+}
+
+/// How the UIs name model `id` to a person: its catalog `display_name` without the route
+/// the gateway takes to it (`GLM-4.7 Flash`, not `GLM-4.7 Flash (OpenRouter, free)`);
+/// without one, the model part of the id (`north-mini-code`, not
+/// `cohere/north-mini-code:free`). `Auto` for `auto`. The raw id stays in `/status`, the
+/// line REPL's `/model` list and JSON output. Mirrored in
+/// `ui/neuron-tui/src/utils/model-name.ts` (`cleanModelName`).
+pub fn clean_model_name(id: &str, display_name: Option<&str>, provider: Option<&str>) -> String {
+    let id = crate::provider::shown_model(id).trim();
+    if id.eq_ignore_ascii_case(crate::provider::AUTO_MODEL) {
+        return "Auto".to_string();
+    }
+    if let Some(name) = display_name.map(str::trim).filter(|name| !name.is_empty()) {
+        return without_route(name, provider);
+    }
+    let leaf = id.rsplit('/').next().unwrap_or(id);
+    let leaf = leaf.split(':').next().unwrap_or(leaf);
+    if leaf.is_empty() {
+        id.to_string()
+    } else {
+        leaf.to_string()
+    }
+}
+
+/// [`clean_model_name`] of `model` with what the loaded catalog says about it.
+pub fn model_name(model: &str) -> String {
+    let entry = model_entry(model);
+    clean_model_name(
+        model,
+        entry
+            .as_ref()
+            .and_then(|entry| entry.display_name.as_deref()),
+        entry.as_ref().and_then(|entry| entry.provider.as_deref()),
+    )
+}
+
 /// How the system prompt names `model`: the catalog's display name with the id, or the
 /// id alone. `None` for `auto`, which picks a model per request, so the prompt names
 /// none rather than a wrong one.
@@ -741,7 +831,18 @@ pub fn model_choice_warning(
     one_shot: bool,
 ) -> Option<String> {
     let check = check_model(catalog, model, now_unix);
-    let model = crate::provider::shown_model(model);
+    // A model in the catalog by its name, not the gateway's route to it
+    // (`cohere/north-mini-code:free`); one it lacks as typed.
+    let model = match (&check, catalog.find(crate::provider::shown_model(model))) {
+        (ModelCheck::Unknown { .. }, _) | (_, None) => {
+            crate::provider::shown_model(model).to_string()
+        }
+        (_, Some(entry)) => clean_model_name(
+            model,
+            entry.display_name.as_deref(),
+            entry.provider.as_deref(),
+        ),
+    };
     // A `neuron prompt` run has no REPL to type `/model` into.
     let pick = if one_shot { "--model" } else { "/model" };
     match check {
@@ -1107,9 +1208,9 @@ mod tests {
         .unwrap();
         assert!(
             warning.starts_with(
-                "warning: gemini/gemini-2.5-flash is out of capacity until 07:00 UTC (back in 13h 48m)"
+                "warning: gemini-2.5-flash is out of capacity until 07:00 UTC (back in 13h 48m)"
             ),
-            "{warning}"
+            "the model by name, without its route: {warning}"
         );
         assert!(warning.contains("auto routes around it"), "{warning}");
         assert!(warning.contains("/model auto"), "{warning}");
@@ -1193,6 +1294,46 @@ mod tests {
     }
 
     #[test]
+    fn model_choice_warnings_name_the_model_without_its_route() {
+        let models = parse_catalog(&serde_json::json!({"data": [
+            {"id": "cohere/north-mini-code:free", "available": true, "tiers": ["free"],
+             "display_name": "North Mini Code (OpenRouter, free)", "owned_by": "openrouter",
+             "status": "blurred"},
+        ]}))
+        .unwrap();
+        let catalog = Catalog {
+            models,
+            ..sample_catalog()
+        };
+        let warning = model_choice_warning(
+            &catalog,
+            "openai/cohere/north-mini-code:free",
+            crate::clock::now_unix(),
+            false,
+        )
+        .unwrap();
+        assert!(
+            warning.starts_with("warning: North Mini Code is out of capacity"),
+            "{warning}"
+        );
+        for route in ["cohere/", ":free", "openai/", "OpenRouter"] {
+            assert!(!warning.contains(route), "{route} in {warning}");
+        }
+        // A model the catalog lacks is named as typed.
+        let unknown = model_choice_warning(
+            &catalog,
+            "acme/made-up-model",
+            crate::clock::now_unix(),
+            false,
+        )
+        .unwrap();
+        assert!(
+            unknown.starts_with("warning: acme/made-up-model is not in the Zero-X catalog"),
+            "{unknown}"
+        );
+    }
+
+    #[test]
     fn model_status_is_kept_and_unconfigured_models_are_not_a_plan_matter() {
         let models = parse_catalog(&serde_json::json!({"data": [
             {"id": "gemini/gemini-2.5-flash", "available": true, "status": "blurred",
@@ -1222,7 +1363,7 @@ mod tests {
         );
         assert!(!warning.contains("upgrade"), "{warning}");
         assert!(
-            warning.starts_with("warning: openai/gpt-5 "),
+            warning.starts_with("warning: gpt-5 "),
             "no routing prefix: {warning}"
         );
     }
@@ -1370,6 +1511,75 @@ mod tests {
         let mut live = LiveStatus::default();
         let shown = live.apply(&catalog, None, Instant::now(), crate::clock::now_unix());
         assert_eq!(shown, catalog);
+    }
+
+    #[test]
+    fn model_names_leave_out_the_route_to_the_model() {
+        let name = |id: &str, display: Option<&str>, provider: Option<&str>| {
+            clean_model_name(id, display, provider)
+        };
+        assert_eq!(
+            name(
+                "cohere/north-mini-code:free",
+                Some("North Mini Code (OpenRouter, free)"),
+                Some("openrouter")
+            ),
+            "North Mini Code"
+        );
+        assert_eq!(
+            name(
+                "groq/openai/gpt-oss-120b",
+                Some("GPT-OSS 120B (Groq)"),
+                Some("groq")
+            ),
+            "GPT-OSS 120B"
+        );
+        assert_eq!(
+            name(
+                "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+                Some("Llama 3.3 70B (Workers AI)"),
+                Some("cloudflare")
+            ),
+            "Llama 3.3 70B"
+        );
+        assert_eq!(
+            name(
+                "nvidia/stepfun-ai/step-5-preview",
+                Some("Step 5 Preview (NVIDIA)"),
+                None
+            ),
+            "Step 5 Preview"
+        );
+        // A parenthesis about the model itself stays.
+        assert_eq!(name("x/qwen", Some("Qwen3 (32B)"), None), "Qwen3 (32B)");
+        assert_eq!(
+            name("x/m", Some("Model (Preview, Groq)"), None),
+            "Model (Preview, Groq)"
+        );
+        // The provider the catalog names counts as a route too.
+        assert_eq!(name("x/m", Some("Fast (Acme)"), Some("acme")), "Fast");
+        assert_eq!(
+            name(
+                "gemini/gemini-2.5-flash",
+                Some("Gemini 2.5 Flash"),
+                Some("gemini")
+            ),
+            "Gemini 2.5 Flash"
+        );
+        // Auto, whatever its catalog entry says.
+        assert_eq!(
+            name("auto", Some("Auto (best available model)"), Some("zero-x")),
+            "Auto"
+        );
+        assert_eq!(name("openai/auto", None, None), "Auto");
+        // Without a display name: the model part of the id.
+        assert_eq!(
+            name("openai/cohere/north-mini-code:free", None, None),
+            "north-mini-code"
+        );
+        assert_eq!(name("claude-sonnet-4-6", None, None), "claude-sonnet-4-6");
+        assert_eq!(name("x", Some("  "), None), "x");
+        assert_eq!(name("x", Some("(Groq)"), None), "(Groq)");
     }
 
     #[test]

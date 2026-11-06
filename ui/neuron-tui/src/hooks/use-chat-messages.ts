@@ -12,7 +12,7 @@ import {
   setAllBlocksCollapsedState,
   hasAnyExpandedBlocks,
 } from '../utils/collapse-helpers'
-import { buildMessageTree } from '../utils/message-tree-utils'
+import { buildMessageTree, reuseMessageTree } from '../utils/message-tree-utils'
 
 import type { ChatMessage, ContentBlock } from '../types/chat'
 
@@ -232,11 +232,16 @@ export function useChatMessages({
     }, 0)
   }, [setMessages])
 
-  // Build message tree from flat messages array.
-  const { tree: messageTree, topLevelMessages } = useMemo(
-    () => buildMessageTree(messages),
-    [messages],
-  )
+  // Build message tree from flat messages array. A streamed update changes
+  // one message; the tree stays the same object unless a sub-agent's
+  // messages changed, so the transcript's other messages are not drawn again.
+  const previousTreeRef = useRef<Map<string, ChatMessage[]> | null>(null)
+  const { tree: messageTree, topLevelMessages } = useMemo(() => {
+    const built = buildMessageTree(messages)
+    const tree = reuseMessageTree(previousTreeRef.current, built.tree)
+    previousTreeRef.current = tree
+    return { tree, topLevelMessages: built.topLevelMessages }
+  }, [messages])
 
   // Compute visible messages slice (from the end)
   const visibleTopLevelMessages = useMemo(() => {

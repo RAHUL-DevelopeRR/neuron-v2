@@ -362,6 +362,7 @@ const EVENT_FIELDS: { [T in UiEventType]: string[] } = {
     'supports_images',
     'served_model',
     'request_tokens_estimate',
+    'served_model_display_name',
     'provider',
     'model_display_name',
     'reasoning_effort',

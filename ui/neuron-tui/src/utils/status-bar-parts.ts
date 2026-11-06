@@ -5,13 +5,14 @@
  *
  *   G Gemini 2.5 Flash ▾ │ ◑ think high │ ⌂ neuron-v2 ⎇ main +1 ~2 │ ✎ Edit workspace │ ●●●◑○○○○○○ 35% ctx      Free · 5h 640K/1M · resets 14:20 · 37/100 req
  *
- * Segments, left to right: the model (provider monogram and name), the
+ * Segments, left to right: the model (its maker's monogram and its name,
+ * never the route the gateway takes to it: utils/model-name.ts), the
  * thinking level, the workspace folder and git branch, the permission mode,
  * the MCP connectors (`⧉ 5/6`: up of turned on, amber when one needs the
- * user, a lock when the connector policy requires one) and the context meter; on the right, the Zero-X plan and its usage: the
- * plan's rolling token window (Free: 1M tokens per 5 hours) as used/limit with
- * the time it resets, and today's requests. Each segment opens its picker when
- * clicked (`target`).
+ * user, a lock when the connector policy requires one) and the context meter;
+ * on the right, the Zero-X plan and its usage: the plan's rolling token window
+ * (Free: 1M tokens per 5 hours) as used/limit with the time it resets, and
+ * today's requests. Each segment opens its picker when clicked (`target`).
  *
  * When the line is too wide it gives way one step at a time
  * ({@link COLLAPSE_STEPS}): the account group shortens to the window, labels
@@ -26,7 +27,8 @@ import { needsSignIn } from '../state/engine-store'
 import { contextUsage } from './context-breakdown'
 import { formatTokenCount } from './format-token-count'
 import { cutToDisplayWidth, displayWidth as stringWidth } from './display-width'
-import { inferProvider, providerBadge } from './provider-badge'
+import { cleanModelName, distinctModelName, isAutoModel, modelMaker } from './model-name'
+import { providerBadge } from './provider-badge'
 
 import type { GlyphMode } from './glyphs'
 import type { ConnectorsChip } from '../state/mcp-panel-store'
@@ -373,13 +375,29 @@ export function statusView({
   if (!status) return null
   const glyphs = statusGlyphs(mode)
   const model = catalogModel(models, status.model)
-  const provider = status.provider ?? model?.provider ?? inferProvider(status.model)
-  const name = status.model_display_name ?? model?.display_name ?? status.model
+  const provider = status.provider ?? model?.provider ?? null
+  // Numbered as in the picker when another catalog model has the same name.
+  const name = distinctModelName(
+    models?.models,
+    model?.id,
+    cleanModelName(status.model, status.model_display_name ?? model?.display_name, provider),
+  )
   const served = status.served_model
+  const servedModel = served ? catalogModel(models, served) : null
   const servedName =
     served && served !== status.model
-      ? (catalogModel(models, served)?.display_name ?? served)
+      ? distinctModelName(
+          models?.models,
+          servedModel?.id,
+          cleanModelName(
+            served,
+            status.served_model_display_name ?? servedModel?.display_name,
+            servedModel?.provider,
+          ),
+        )
       : null
+  // `auto` is Zero-X's router: its mark, whichever model answered.
+  const maker = isAutoModel(status.model) ? 'zero-x' : modelMaker(status.model, provider)
   const health = model?.status
   const efforts = reasoningEffortsOf(status, model)
   const usage = contextUsage(status)
@@ -408,7 +426,7 @@ export function statusView({
 
   return {
     model: {
-      badge: providerBadge(provider, mode),
+      badge: providerBadge(maker, mode),
       badgeTone: health === 'degraded' || health === 'busy' ? 'warning' : 'primary',
       name: servedName ? `${name} → ${servedName}` : name,
       pickable: (models?.models.length ?? 0) > 0,

@@ -26,9 +26,17 @@ Enter pick one, or write your own answer in its last field; Esc closes the form 
 the next thing you type answers instead. A question without choices is answered by
 typing in the input.
 
-The UI does not ask whether you trust the folder: until you do, the folder's own
-settings, hooks and MCP servers are not loaded, and `/status` says how to trust it
-(see [Workspace trust](#workspace-trust)).
+The first time you open the UI in a folder it shows "Before Neuron works here" and
+asks you to allow Neuron in the folder or quit; until you allow it, the folder's own
+settings, hooks and MCP servers are not loaded (see [Workspace trust](#workspace-trust)).
+
+The status bar under the input shows the model, the thinking level, the folder and
+branch, the permission mode and the context meter. Click a part, or press Alt+M, Alt+T,
+Alt+W, Alt+P or Alt+C, to open its picker (on macOS, Option+M and so on once the
+terminal uses Option as Meta). Shift+Tab cycles the permission mode. `/effort <level>`
+sets the thinking level for the next turn and `/effort default` goes back to the
+model's own; `/branch` lists the local branches, `/branch <name>` switches and
+`/branch new <name>` creates one and switches to it.
 
 The UI needs a terminal of at least 60 columns by 16 rows. In a smaller one `neuron`
 starts the line REPL instead and says why (`neuron "prompt"` answers it as plain text,
@@ -668,7 +676,7 @@ such a call is not run. Turn one off like any other server (`/mcp disable <serve
 | `NEURON_NO_TUI=1` | neuron | Use the line REPL instead of the full-screen UI |
 | `NEURON_TUI_ASCII` | neuron-tui | `1` draws with the classic-console character set everywhere, `0` with the Unicode one |
 | `NEURON_AMBIGUOUS_WIDE` | neuron-tui | `1`: the terminal draws East Asian ambiguous-width characters (`│ ● ○`) two columns wide, so the status bar measures them so; `0`: one column. Unset, a Chinese, Japanese or Korean locale counts as `1` |
-| `NEURON_VERSION` | install.sh, install.ps1 | Release to install (default: the latest release; a prerelease such as `7.0.0-alpha.3` must be named) |
+| `NEURON_VERSION` | install.sh, install.ps1 | Release to install (default: the latest release; a prerelease such as `7.0.0-alpha.4` must be named) |
 | `NEURON_INSTALL_DIR` | install.sh, install.ps1 | Install directory |
 | `NEURON_BINARY_PATH` | npm and pip launchers | Run this binary instead of the downloaded one |
 | `NEURON_CACHE_DIR` | npm and pip launchers | Where downloaded binaries are cached |

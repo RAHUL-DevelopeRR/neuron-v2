@@ -1,11 +1,15 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: completion
 // metadata no longer carries credits. See ui/neuron-tui/PORTING.md.
-import { describe, expect, test, beforeEach, afterEach } from 'bun:test'
+import { describe, expect, test, beforeEach, afterEach, setSystemTime } from 'bun:test'
 
 import {
   createMessageUpdater,
   createBatchedMessageUpdater,
   DEFAULT_FLUSH_INTERVAL_MS,
+  LONG_REPARSE_CHARS,
+  LONG_REPARSE_FLUSH_INTERVAL_MS,
+  reparsedChars,
+  streamingFlushIntervalMs,
 } from '../message-updater'
 
 import type { ChatMessage, ContentBlock, TextContentBlock } from '../../types/chat'
@@ -643,5 +647,142 @@ describe('createBatchedMessageUpdater timer behavior', () => {
     // All 3 intervals should be cleared
     expect(clearedIntervals).toHaveLength(3)
     expect(intervalCallbacks.size).toBe(0)
+  })
+})
+
+/** A list with no blank line in it, about `chars` long: parsed whole on each update. */
+const longList = (chars: number) => {
+  let text = ''
+  for (let item = 0; text.length < chars; item++) text += `- item ${item} of the **list**
+`
+  return text
+}
+
+/** As long, but in paragraphs: each update parses only the last one. */
+const longParagraphs = (chars: number) => {
+  let text = ''
+  for (let item = 0; text.length < chars; item++) text += `Paragraph ${item} of the **answer**.
+
+`
+  return `${text}The last one`
+}
+
+const aiWithText = (content: string): ChatMessage => ({
+  id: 'ai-1',
+  variant: 'ai',
+  content: '',
+  blocks: [{ type: 'text', content }],
+  timestamp: 'now',
+})
+
+describe('the streaming flush interval', () => {
+  test('counts the text an update parses again: the last text block after its finished blocks', () => {
+    expect(reparsedChars(undefined)).toBe(0)
+    expect(reparsedChars(aiWithText(longList(4000)))).toBeGreaterThanOrEqual(4000)
+    expect(reparsedChars(aiWithText(longParagraphs(4000)))).toBeLessThan(100)
+    // Plain text is drawn as it is.
+    expect(reparsedChars(aiWithText('plain words '.repeat(400)))).toBe(0)
+    // Only the last text block streams.
+    const message = aiWithText(longList(4000))
+    message.blocks!.push({ type: 'text', content: '- short' })
+    expect(reparsedChars(message)).toBe(7)
+    // A message with no blocks streams into its content.
+    expect(reparsedChars({ ...aiWithText(''), blocks: [], content: longList(3000) })).toBeGreaterThanOrEqual(3000)
+    // Once a tool call follows the text, the text is not drawn again.
+    const withTool = aiWithText(longList(4000))
+    withTool.blocks!.push({ type: 'tool', toolCallId: 'call_1', toolName: 'read_files', input: {} } as ContentBlock)
+    expect(reparsedChars(withTool)).toBe(0)
+    // A code fence still open is drawn as typed, not parsed.
+    const code = 'Here it is:\n\n```ts\n' + 'const total = items.reduce((sum, item) => sum + item.price, 0)\n'.repeat(80)
+    expect(reparsedChars(aiWithText(code))).toBe('Here it is:\n\n'.length)
+    expect(reparsedChars(aiWithText('- one\n- two\n```ts\n' + 'x\n'.repeat(2000)))).toBe(12)
+  })
+
+  test('is short until an update parses about 1 KB again', () => {
+    expect(streamingFlushIntervalMs(aiWithText(longList(LONG_REPARSE_CHARS - 100)))).toBe(DEFAULT_FLUSH_INTERVAL_MS)
+    expect(streamingFlushIntervalMs(aiWithText(longList(LONG_REPARSE_CHARS)))).toBe(LONG_REPARSE_FLUSH_INTERVAL_MS)
+    expect(streamingFlushIntervalMs(aiWithText(longParagraphs(20_000)))).toBe(DEFAULT_FLUSH_INTERVAL_MS)
+    // A long code block streams at the short interval: it is drawn as typed.
+    expect(
+      streamingFlushIntervalMs(aiWithText('Code:\n\n```ts\n' + 'let x = 1\n'.repeat(1000))),
+    ).toBe(DEFAULT_FLUSH_INTERVAL_MS)
+  })
+})
+
+describe('createBatchedMessageUpdater adaptive interval', () => {
+  const originalSetInterval = globalThis.setInterval
+  const originalClearInterval = globalThis.clearInterval
+  let tick: (() => void) | undefined
+  let tickMs: number | undefined
+  let now = 1_000_000
+
+  beforeEach(() => {
+    tick = undefined
+    tickMs = undefined
+    now = 1_000_000
+    setSystemTime(new Date(now))
+    globalThis.setInterval = ((callback: () => void, ms: number) => {
+      tick = callback
+      tickMs = ms
+      return 1 as unknown as ReturnType<typeof setInterval>
+    }) as typeof setInterval
+    globalThis.clearInterval = (() => {}) as typeof clearInterval
+  })
+
+  afterEach(() => {
+    setSystemTime()
+    globalThis.setInterval = originalSetInterval
+    globalThis.clearInterval = originalClearInterval
+  })
+
+  /** Streams `text` in steps, ticking once per step; returns how many ticks flushed. */
+  const streamTicks = (text: string, steps: number) => {
+    let state: ChatMessage[] = [aiWithText('')]
+    let flushes = 0
+    const updater = createBatchedMessageUpdater('ai-1', (fn) => {
+      flushes++
+      state = fn(state)
+    })
+    for (let step = 1; step <= steps; step++) {
+      const upTo = Math.round((text.length * step) / steps)
+      updater.updateAiMessageBlocks(() => [{ type: 'text', content: text.slice(0, upTo) }])
+      now += DEFAULT_FLUSH_INTERVAL_MS
+      setSystemTime(new Date(now))
+      tick!()
+    }
+    updater.markComplete()
+    expect((state[0]!.blocks![0] as TextContentBlock).content).toBe(text)
+    return flushes - 1
+  }
+
+  test('ticks at the short interval', () => {
+    const updater = createBatchedMessageUpdater('ai-1', () => {})
+    expect(tickMs).toBe(DEFAULT_FLUSH_INTERVAL_MS)
+    updater.dispose()
+  })
+
+  test('flushes on every tick while the text parsed again is short', () => {
+    expect(streamTicks(longParagraphs(8000), 60)).toBe(60)
+    expect(streamTicks(longList(LONG_REPARSE_CHARS - 200), 60)).toBe(60)
+  })
+
+  test('flushes about every 100 ms once a long list is parsed whole each time', () => {
+    const flushes = streamTicks(longList(8000), 90)
+    // The first eighth (under 1 KB) on every tick, the rest on every third:
+    // 12 + 78 / 3, where a fixed short interval flushes 90 times.
+    expect(flushes).toBeGreaterThanOrEqual(36)
+    expect(flushes).toBeLessThanOrEqual(40)
+  })
+
+  test('a fixed interval does not adapt', () => {
+    let flushes = 0
+    const updater = createBatchedMessageUpdater('ai-1', () => flushes++, 50)
+    expect(tickMs).toBe(50)
+    for (let step = 0; step < 10; step++) {
+      updater.updateAiMessageBlocks(() => [{ type: 'text', content: longList(4000) }])
+      tick!()
+    }
+    expect(flushes).toBe(10)
+    updater.dispose()
   })
 })

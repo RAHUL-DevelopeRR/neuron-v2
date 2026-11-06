@@ -341,6 +341,7 @@ pub mod samples {
             supports_images: Some(false),
             served_model: None,
             request_tokens_estimate: Some(6_200),
+            served_model_display_name: None,
             provider: Some("cloudflare".into()),
             model_display_name: Some("GLM 5.2".into()),
             reasoning_effort: Some("high".into()),

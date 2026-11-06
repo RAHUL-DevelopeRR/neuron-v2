@@ -815,7 +815,8 @@ pub fn active_provider_name(model: &str) -> String {
 
 pub fn format_connected_line(model: &str) -> String {
     let provider = active_provider_name(model);
-    let model = shown_model(model);
+    // The model's name, without the gateway's route to it (`/status` has the id).
+    let model = crate::gateway_catalog::model_name(model);
     format!("{GREEN}{BOLD}\u{2713}{R} {DIM}Connected:{R} {BLUE}{BOLD}{model}{R} {DIM}via{R} {ORANGE}{provider}{R}")
 }
 

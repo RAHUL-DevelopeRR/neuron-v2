@@ -16,13 +16,14 @@
  */
 
 import { TextAttributes } from '@opentui/core'
-import React, { useEffect, useState } from 'react'
+import React, { memo, useEffect, useMemo, useState } from 'react'
 
 import { Button } from './button'
 import { useTheme } from '../hooks/use-theme'
 import { useEngineStore } from '../state/engine-store'
 import { connectorsChip, useMcpPanelStore } from '../state/mcp-panel-store'
 import { getGlyphMode, type GlyphMode } from '../utils/glyphs'
+import { renderProbe } from '../utils/render-probe'
 import {
   RIGHT_GAP,
   SEGMENT_SEPARATOR,
@@ -68,7 +69,12 @@ const Segment = ({
 /** How often the bar looks whether the token window's reset time has passed. */
 const RESET_CHECK_MS = 60_000
 
-export const PromptStatusBar = ({
+/**
+ * Drawn again when what it shows changes (the engine's status, account,
+ * models, connectors, the clock minute or a pending permission choice) or its
+ * width does: not for each streamed update of the chat around it.
+ */
+export const PromptStatusBar = memo(function PromptStatusBar({
   width,
   onActivate,
   glyphMode = getGlyphMode(),
@@ -84,7 +90,8 @@ export const PromptStatusBar = ({
   now?: number
   /** The time zone of the reset time (tests); the system's when unset. */
   timeZone?: string
-}) => {
+}) {
+  renderProbe.onRender?.('PromptStatusBar')
   const theme = useTheme()
   const [clock, setClock] = useState(() => Date.now())
   useEffect(() => {
@@ -97,18 +104,23 @@ export const PromptStatusBar = ({
   const models = useEngineStore((state) => state.models)
   const pendingPermission = useEngineStore((state) => state.pendingPermission)
   const mcpServers = useMcpPanelStore((state) => state.known)
-  const line = statusBarLine(
-    {
-      status,
-      account,
-      models,
-      mode: glyphMode,
-      pendingPermission,
-      now: fixedNow ?? clock,
-      timeZone,
-      connectors: connectorsChip(mcpServers),
-    },
-    Math.max(0, width - 2),
+  const effectiveNow = fixedNow ?? clock
+  const line = useMemo(
+    () =>
+      statusBarLine(
+        {
+          status,
+          account,
+          models,
+          mode: glyphMode,
+          pendingPermission,
+          now: effectiveNow,
+          timeZone,
+          connectors: connectorsChip(mcpServers),
+        },
+        Math.max(0, width - 2),
+      ),
+    [status, account, models, glyphMode, pendingPermission, effectiveNow, timeZone, mcpServers, width],
   )
   if (!line || line.left.length === 0) return null
 
@@ -143,4 +155,4 @@ export const PromptStatusBar = ({
       ) : null}
     </box>
   )
-}
+})
