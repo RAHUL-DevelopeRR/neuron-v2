@@ -18,11 +18,12 @@
         "height": 900,
         "minWidth": 960,
         "minHeight": 600,
-        "backgroundColor": "#1a1a2e"
+        "backgroundColor": "#1a1a2e",
+        "dragDropEnabled": false
       }
     ],
     "security": {
-      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost"
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src ipc: http://ipc.localhost"
     }
   },
   "plugins": {

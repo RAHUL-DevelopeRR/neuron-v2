@@ -312,6 +312,32 @@ describe('copy diagnostics', () => {
     expect(await screen.findByText('Copied')).toBeTruthy()
   })
 
+  test('the whole report is scrubbed, the host part included', () => {
+    const secrets = ['hunter2', 'user:pass', 'AKIAABCDEFGHIJKLMNOP', 'rahul', 'topsecretvalue', 'abc123tok']
+    const text = buildDiagnostics({
+      appVersion: '1.0.0',
+      hostReport: [
+        'Engine path: C:\\Users\\rahul\\AppData\\neuron.exe',
+        'Other: /Users/rahul/bin/neuron and /home/rahul/.local/neuron',
+        'password: hunter2',
+        'Proxy: https://user:pass@proxy.example.com/x',
+        'aws=AKIAABCDEFGHIJKLMNOP',
+        'api_key=topsecretvalue',
+        'Authorization: Bearer abc123tokenvalue',
+        'token=abc123tok',
+      ].join('\n'),
+      engine: { version: '6.3.0', protocol: 2, features: [] },
+      connection: 'ready',
+      lastError: 'secret: topsecretvalue at /home/rahul/work',
+      updates: 'none',
+    })
+    for (const secret of secrets) expect(text).not.toContain(secret)
+    expect(text).toContain('~\\AppData\\neuron.exe')
+    expect(text).toContain('~/bin/neuron')
+    expect(text).toContain('proxy.example.com/x')
+    expect(text).toContain('Engine version: 6.3.0')
+  })
+
   test('building the report scrubs emails and token-like strings and never takes an account', () => {
     const text = buildDiagnostics({
       appVersion: '1.0.0',
