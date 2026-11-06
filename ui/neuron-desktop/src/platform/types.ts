@@ -91,6 +91,8 @@ export interface Platform {
   pickFolder(): Promise<string | null>
   /** This app's version; `null` in a browser build. */
   appVersion(): Promise<string | null>
+  /** True when this build cannot install updates: new versions are on the releases page. */
+  manualUpdates?: boolean
   /** A newer release, if the update manifest names one. */
   checkForUpdate(): Promise<UpdateInfo | null>
   /**

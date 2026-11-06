@@ -27,7 +27,7 @@
   },
   "plugins": {
     "updater": {
-      "endpoints": ["https://zero-x.live/releases/desktop/latest.json"],
+      "endpoints": ["https://zero-x.live/releases/desktop/updater.json"],
       "pubkey": ""
     }
   },
