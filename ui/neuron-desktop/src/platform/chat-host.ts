@@ -49,8 +49,19 @@ interface Summary {
   session: string | null
 }
 
-/** Lines that arrive before the chat is registered (the host emits while `chat_open` still returns) wait this long. */
-const BUFFER_MS = 2000
+/**
+ * Lines that arrive before the chat is registered (the host emits while
+ * `chat_open` still returns) wait for it, up to this many per chat; past that
+ * the oldest go. A chat nobody registers is forgotten after PENDING_TTL_MS.
+ */
+const BUFFER_LINES = 1000
+const PENDING_TTL_MS = 60_000
+const PRUNE_EVERY_MS = 30_000
+
+/** An engine that has not said `ready` by then has failed to start. */
+const START_TIMEOUT_MS = 30_000
+
+const startTimeout = (ms: number) => `The Neuron engine did not start within ${ms >= 1000 ? Math.round(ms / 1000) : ms / 1000} seconds.`
 
 const infoOf = (summary: Summary): ChatInfo => ({
   id: summary.chat,
@@ -67,6 +78,7 @@ export function chatError(raw: unknown): ChatError {
   const count = (prefix: string) => Number(text.slice(prefix.length)) || 0
   if (text === 'cap_reached') return new ChatError('4 chats are working. Stop one to open another.', 'cap_reached')
   if (text === 'too_many_chats') return new ChatError('Too many chats are open. Close one to open another.', 'too_many_chats')
+  if (text === 'has_worktree') return new ChatError('This chat works in its own copy of the project. Discard the copy to close the chat, or keep it.', 'has_worktree')
   if (text.startsWith('unmerged:')) return new ChatError('This copy has saved changes that the main folder lacks.', 'unmerged', count('unmerged:'))
   if (text.startsWith('dirty:')) return new ChatError('This copy has unsaved changes.', 'dirty', count('dirty:'))
   return new ChatError(text)
@@ -86,6 +98,7 @@ class ChatBus {
   private handlers = new Map<string, Handler>()
   private pending = new Map<string, Buffered[]>()
   private stopped = new Set<(id: string, reason: string) => void>()
+  private closed = new Set<string>()
   private listening: Promise<void> | null = null
 
   constructor(
@@ -95,8 +108,11 @@ class ChatBus {
 
   init(): Promise<void> {
     this.listening ??= (async () => {
+      const timer = setInterval(() => this.prune(), PRUNE_EVERY_MS) as unknown as { unref?: () => void }
+      timer.unref?.()
       await this.ipc.listen<ChatLine>('neuron://chat-line', (payload) => this.route(payload.chat, { at: this.now(), run: (handler) => handler.line(payload) }))
       await this.ipc.listen<ChatExit>('neuron://chat-exit', (payload) => {
+        if (this.closed.has(payload.chat)) return
         this.route(payload.chat, { at: this.now(), run: (handler) => handler.exit(payload) })
         for (const listener of [...this.stopped]) listener(payload.chat, payload.reason)
       })
@@ -105,23 +121,37 @@ class ChatBus {
   }
 
   private route(chat: string, item: Buffered): void {
+    // A closed chat's engine may still talk for a moment; nobody is listening.
+    if (this.closed.has(chat)) return
     const handler = this.handlers.get(chat)
     if (handler) return item.run(handler)
-    const waiting = (this.pending.get(chat) ?? []).filter((entry) => item.at - entry.at <= BUFFER_MS)
+    this.prune()
+    const waiting = this.pending.get(chat) ?? []
     waiting.push(item)
+    if (waiting.length > BUFFER_LINES) waiting.splice(0, waiting.length - BUFFER_LINES)
     this.pending.set(chat, waiting)
   }
 
+  /** Forgets what waits for chats that never came. */
+  prune(): void {
+    const now = this.now()
+    for (const [chat, waiting] of this.pending) {
+      if (now - (waiting.at(-1)?.at ?? 0) > PENDING_TTL_MS) this.pending.delete(chat)
+    }
+  }
+
   register(chat: string, handler: Handler): void {
+    this.closed.delete(chat)
     this.handlers.set(chat, handler)
     const waiting = this.pending.get(chat) ?? []
     this.pending.delete(chat)
-    for (const item of waiting) if (this.now() - item.at <= BUFFER_MS) item.run(handler)
+    for (const item of waiting) item.run(handler)
   }
 
   unregister(chat: string): void {
     this.handlers.delete(chat)
     this.pending.delete(chat)
+    this.closed.add(chat)
   }
 
   onStopped(listener: (id: string, reason: string) => void): () => void {
@@ -147,6 +177,7 @@ class ChatTransport implements EngineTransport, Handler {
     private readonly ipc: Ipc,
     readonly chat: string,
     private generation: number,
+    private readonly timeoutMs: number,
   ) {}
 
   /** Whether an event is this transport's engine's; a newer one is adopted while a launch runs. */
@@ -184,7 +215,20 @@ class ChatTransport implements EngineTransport, Handler {
     if (this.ready) return Promise.resolve()
     if (this.failure) return Promise.reject(new Error(this.failure))
     return new Promise<void>((resolve, reject) => {
-      this.waiting = { resolve, reject }
+      const timer = setTimeout(() => {
+        this.waiting = null
+        reject(new Error(startTimeout(this.timeoutMs)))
+      }, this.timeoutMs)
+      this.waiting = {
+        resolve: () => {
+          clearTimeout(timer)
+          resolve()
+        },
+        reject: (error) => {
+          clearTimeout(timer)
+          reject(error)
+        },
+      }
     })
   }
 
@@ -198,12 +242,19 @@ class ChatTransport implements EngineTransport, Handler {
       this.waiting = { resolve, reject }
     })
     readyOrFailed.catch(() => {})
+    // The host call and the engine's `ready` together have this long.
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(startTimeout(this.timeoutMs))), this.timeoutMs)
+    })
+    deadline.catch(() => {})
     try {
-      const summary = await launch()
+      const summary = await Promise.race([launch(), deadline])
       this.generation = summary.generation
-      await readyOrFailed
+      await Promise.race([readyOrFailed, deadline])
       return summary
     } finally {
+      clearTimeout(timer)
       this.launching = false
       this.waiting = null
     }
@@ -211,7 +262,15 @@ class ChatTransport implements EngineTransport, Handler {
 
   send(message: ClientMessage): void {
     if (!this.ready) throw new Error('The Neuron engine is not running.')
-    void this.ipc.invoke('chat_send', { chat: this.chat, line: JSON.stringify(message) }).catch(() => {})
+    void this.ipc.invoke('chat_send', { chat: this.chat, line: JSON.stringify(message) }).catch((failure: unknown) => this.sendFailed(failure))
+  }
+
+  /** The host could not hand a message to the engine: this chat is no longer connected. */
+  private sendFailed(failure: unknown): void {
+    if (!this.ready) return
+    this.ready = false
+    const error = chatError(failure).message
+    for (const listener of [...this.closeListeners]) listener({ code: null, error })
   }
 
   subscribe(listener: (action: SessionAction) => void): () => void {
@@ -242,6 +301,8 @@ export function createChatHost(
     /** What new engines start with (Settings). */
     launchOptions: () => LaunchOptions
     now?: () => number
+    /** How long an engine has to say `ready` (default 30 s). */
+    startTimeoutMs?: number
   },
 ): TauriChats {
   const bus = new ChatBus(ipc, options.now ?? Date.now)
@@ -259,7 +320,7 @@ export function createChatHost(
   }
 
   const attach = (summary: Summary) => {
-    const transport = new ChatTransport(ipc, summary.chat, summary.generation)
+    const transport = new ChatTransport(ipc, summary.chat, summary.generation, options.startTimeoutMs ?? START_TIMEOUT_MS)
     const controller = new SessionController(transport, { client: 'desktop', capabilities: options.capabilities })
     transports.set(summary.chat, transport)
     controllers.set(summary.chat, controller)
@@ -304,16 +365,20 @@ export function createChatHost(
       await bus.init()
       const summaries = await call<Summary[]>('chat_list')
       const attached = summaries.map((summary) => ({ ...attach(summary), summary }))
-      await Promise.all(
-        attached.map(async ({ controller, transport, summary }) => {
-          controller.apply({ type: 'local/connecting' })
-          bus.register(summary.chat, transport)
-          // The window's own `ready` is gone: a new engine continues the session.
-          await transport
-            .relaunch(() => call<Summary>('chat_resume', { chat: summary.chat, resume: null, options: options.launchOptions(), trustOnce: false }))
-            .catch((failure: unknown) => controller.apply({ type: 'local/disconnected', error: failure instanceof Error ? failure.message : String(failure) }))
-        }),
-      )
+      for (const { controller, transport, summary } of attached) {
+        bus.register(summary.chat, transport)
+        // A chat the host stopped (idle, evicted) stays stopped until it is looked at.
+        if (!summary.running) {
+          controller.apply({ type: 'local/disconnected', error: null })
+          continue
+        }
+        controller.apply({ type: 'local/connecting' })
+        // The window's own `ready` is gone: a new engine continues the session. The
+        // chats are listed now; each shows its engine starting, none holds the others up.
+        void transport
+          .relaunch(() => call<Summary>('chat_resume', { chat: summary.chat, resume: null, options: options.launchOptions(), trustOnce: false }))
+          .catch((failure: unknown) => controller.apply({ type: 'local/disconnected', error: failure instanceof Error ? failure.message : String(failure) }))
+      }
       return attached.map(({ info, controller }) => ({ info, controller }))
     },
     async resume(id, resumeOptions = {}) {
@@ -338,8 +403,13 @@ export function createChatHost(
     },
     stop: (id) => call<void>('chat_stop', { chat: id }),
     async close(id) {
+      // A chat with a copy of its own is not closed: the caller asks what to do with the copy.
+      try {
+        await call<void>('chat_close', { chat: id })
+      } catch (failure) {
+        if (failure instanceof ChatError && failure.code === 'has_worktree') throw failure
+      }
       forget(id)
-      await call<void>('chat_close', { chat: id }).catch(() => {})
     },
     activate(id) {
       active = id
