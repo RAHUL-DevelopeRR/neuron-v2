@@ -17,10 +17,14 @@ use crate::context_manager::{
     ContextBudget, ContextManager, ContextPolicy, ContextPreparation, ContextSnapshot,
 };
 use crate::experience::{self, ExperienceStore, HarnessStats};
-use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
+use crate::hooks::{
+    HookAbortSignal, HookEvent, HookProgressReporter, HookRunResult, HookRunner,
+    LifecycleHookInput, ToolUseIdReporter,
+};
 use crate::mcp_audit::{McpAuditCall, McpAuditLog};
 use crate::model_registry;
 use crate::model_routing::{self, ModelRouting};
+use crate::parallel_tools::ConcurrentToolCall;
 use crate::permissions::{
     PermissionContext, PermissionDecider, PermissionMode, PermissionOutcome, PermissionPolicy,
     PermissionPrompter,
@@ -30,6 +34,8 @@ use crate::refusal::neutral_refusal_note;
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 use crate::transcript::{normalize_messages, normalized_messages};
 use crate::usage::{TokenUsage, UsageTracker};
+
+mod tool_batch;
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 /// Environment variable setting the automatic compaction threshold.
@@ -168,7 +174,7 @@ impl HarnessConfig {
             completion_check: enabled(COMPLETION_CHECK_ENV_VAR),
             auto_checks: enabled(AUTO_CHECKS_ENV_VAR),
             action_nudge: true,
-            workspace_root: std::env::current_dir().ok(),
+            workspace_root: crate::workdir::current_dir().ok(),
             model: None,
             experience: ExperienceStore::from_env(),
         }
@@ -309,6 +315,26 @@ pub trait ToolExecutor {
         _is_error: bool,
     ) {
     }
+
+    /// Whether [`Self::execute_concurrently`] really runs calls at the same time. Only
+    /// then does the runtime batch read-only calls (`crate::parallel_tools`).
+    fn supports_concurrent_calls(&self) -> bool {
+        false
+    }
+
+    /// Runs read-only calls that were all allowed already ([`Self::tool_started`] was
+    /// called for each, in order) and returns their results in the order of `calls`.
+    /// The default runs them one after another.
+    fn execute_concurrently(
+        &mut self,
+        calls: &[ConcurrentToolCall],
+        cancel: &CancellationToken,
+    ) -> Vec<Result<String, ToolError>> {
+        calls
+            .iter()
+            .map(|call| self.execute_with_cancellation(&call.tool_name, &call.input, cancel))
+            .collect()
+    }
 }
 
 /// Error returned when a tool invocation fails locally.
@@ -358,6 +384,8 @@ pub enum RuntimeErrorKind {
     /// own retries (capacity, overload, 5xx): another model may (see
     /// [`crate::model_routing`]).
     ProviderUnavailable,
+    /// A `UserPromptSubmit` hook blocked the prompt; it was not sent.
+    BlockedByHook,
 }
 
 /// Error returned when a conversation turn cannot be completed.
@@ -540,6 +568,10 @@ struct TurnProgress {
     tool_retried: bool,
     /// Models the turn fell over to after provider failures, in order.
     fallen_over_to: Vec<String>,
+    /// How often a Stop hook kept this turn going.
+    stop_hook_continuations: usize,
+    /// Whether `PreCompact` hooks ran for automatic compaction this turn.
+    pre_compact_hooks_ran: bool,
     /// Harness events this turn, for the experience library.
     stats: HarnessStats,
 }
@@ -568,6 +600,10 @@ pub struct ConversationRuntime<C, T> {
     routing: ModelRouting,
     /// A model the client was switched to for the current turn.
     model_override: Option<String>,
+    /// Where tool outputs too large for the conversation are kept whole.
+    artifacts: Option<crate::artifacts::ArtifactStore>,
+    /// What `SessionStart` hooks printed, added to the next prompt.
+    pending_hook_context: Vec<String>,
     /// Looks at each model request before it is sent (see [`RequestGuard`]).
     request_guard: Option<Box<dyn RequestGuard>>,
     /// Records every MCP call, refused ones too (see [`crate::mcp_audit`]).
@@ -608,6 +644,8 @@ where
         feature_config: &RuntimeFeatureConfig,
     ) -> Self {
         let usage_tracker = UsageTracker::from_session(&session);
+        let mut hook_runner = HookRunner::from_feature_config(feature_config);
+        hook_runner.set_session_id(session.session_id.clone());
         let mut context_manager =
             ContextManager::new(ContextBudget::default(), ContextPolicy::from_env());
         context_manager.set_threshold_override(
@@ -621,7 +659,7 @@ where
             system_prompt,
             max_iterations: DEFAULT_MAX_ITERATIONS,
             usage_tracker,
-            hook_runner: HookRunner::from_feature_config(feature_config),
+            hook_runner,
             context_manager,
             cancel: CancellationToken::new(),
             hook_abort_signal: HookAbortSignal::default(),
@@ -634,6 +672,8 @@ where
             turn_request: String::new(),
             routing: ModelRouting::default(),
             model_override: None,
+            artifacts: None,
+            pending_hook_context: Vec::new(),
             request_guard: None,
             mcp_audit: None,
         }
@@ -676,6 +716,19 @@ where
     #[must_use]
     pub fn model_routing(&self) -> &ModelRouting {
         &self.routing
+    }
+
+    /// Keeps tool outputs longer than the tool-result cap whole in `store`; the model
+    /// gets the capped preview and the artifact's id (see [`crate::artifacts`]).
+    #[must_use]
+    pub fn with_artifact_store(mut self, store: crate::artifacts::ArtifactStore) -> Self {
+        self.artifacts = Some(store);
+        self
+    }
+
+    #[must_use]
+    pub fn artifact_store(&self) -> Option<&crate::artifacts::ArtifactStore> {
+        self.artifacts.as_ref()
     }
 
     /// Has the completion check ask `reviewer` for a second opinion on the turn's
@@ -815,78 +868,146 @@ where
         }
     }
 
-    fn run_pre_tool_use_hook(&mut self, tool_name: &str, input: &str) -> HookRunResult {
+    fn run_pre_tool_use_hook(
+        &mut self,
+        tool_use_id: Option<&str>,
+        tool_name: &str,
+        input: &str,
+    ) -> HookRunResult {
         self.sync_hook_abort();
-        if let Some(reporter) = self.hook_progress_reporter.as_mut() {
-            self.hook_runner.run_pre_tool_use_with_context(
+        let runner = &self.hook_runner;
+        let abort = Some(&self.hook_abort_signal);
+        match self.hook_progress_reporter.as_mut() {
+            Some(reporter) => runner.run_pre_tool_use_with_context(
                 tool_name,
                 input,
-                Some(&self.hook_abort_signal),
-                Some(reporter.as_mut()),
-            )
-        } else {
-            self.hook_runner.run_pre_tool_use_with_context(
-                tool_name,
-                input,
-                Some(&self.hook_abort_signal),
-                None,
-            )
+                abort,
+                Some(&mut ToolUseIdReporter::new(reporter.as_mut(), tool_use_id)),
+            ),
+            None => runner.run_pre_tool_use_with_context(tool_name, input, abort, None),
         }
     }
 
     fn run_post_tool_use_hook(
         &mut self,
+        tool_use_id: &str,
         tool_name: &str,
         input: &str,
         output: &str,
         is_error: bool,
     ) -> HookRunResult {
         self.sync_hook_abort();
-        if let Some(reporter) = self.hook_progress_reporter.as_mut() {
-            self.hook_runner.run_post_tool_use_with_context(
+        let runner = &self.hook_runner;
+        let abort = Some(&self.hook_abort_signal);
+        match self.hook_progress_reporter.as_mut() {
+            Some(reporter) => runner.run_post_tool_use_with_context(
                 tool_name,
                 input,
                 output,
                 is_error,
-                Some(&self.hook_abort_signal),
-                Some(reporter.as_mut()),
-            )
-        } else {
-            self.hook_runner.run_post_tool_use_with_context(
-                tool_name,
-                input,
-                output,
-                is_error,
-                Some(&self.hook_abort_signal),
-                None,
-            )
+                abort,
+                Some(&mut ToolUseIdReporter::new(
+                    reporter.as_mut(),
+                    Some(tool_use_id),
+                )),
+            ),
+            None => runner
+                .run_post_tool_use_with_context(tool_name, input, output, is_error, abort, None),
         }
     }
 
     fn run_post_tool_use_failure_hook(
         &mut self,
+        tool_use_id: &str,
         tool_name: &str,
         input: &str,
         output: &str,
     ) -> HookRunResult {
         self.sync_hook_abort();
-        if let Some(reporter) = self.hook_progress_reporter.as_mut() {
-            self.hook_runner.run_post_tool_use_failure_with_context(
+        let runner = &self.hook_runner;
+        let abort = Some(&self.hook_abort_signal);
+        match self.hook_progress_reporter.as_mut() {
+            Some(reporter) => runner.run_post_tool_use_failure_with_context(
                 tool_name,
                 input,
                 output,
-                Some(&self.hook_abort_signal),
-                Some(reporter.as_mut()),
-            )
-        } else {
-            self.hook_runner.run_post_tool_use_failure_with_context(
-                tool_name,
-                input,
-                output,
-                Some(&self.hook_abort_signal),
-                None,
-            )
+                abort,
+                Some(&mut ToolUseIdReporter::new(
+                    reporter.as_mut(),
+                    Some(tool_use_id),
+                )),
+            ),
+            None => {
+                runner.run_post_tool_use_failure_with_context(tool_name, input, output, abort, None)
+            }
         }
+    }
+
+    /// Runs a lifecycle event's hooks, reporting their progress.
+    fn run_lifecycle_hook(&mut self, event: HookEvent, input: LifecycleHookInput) -> HookRunResult {
+        if !self.hook_runner.has_hooks(event) {
+            return HookRunResult::allow(Vec::new());
+        }
+        self.sync_hook_abort();
+        let runner = &self.hook_runner;
+        let abort = Some(&self.hook_abort_signal);
+        match self.hook_progress_reporter.as_mut() {
+            Some(reporter) => runner.run_lifecycle(event, input, abort, Some(reporter.as_mut())),
+            None => runner.run_lifecycle(event, input, abort, None),
+        }
+    }
+
+    /// The hooks this runtime runs, for `/hooks`.
+    #[must_use]
+    pub fn hook_config(&self) -> &crate::config::RuntimeHookConfig {
+        self.hook_runner.config()
+    }
+
+    /// Runs the `SessionStart` hooks (`source`: `startup`, `resume`, `clear` or
+    /// `compact`). What they print is added to the next prompt as context; the
+    /// result is returned for the caller to show.
+    pub fn run_session_start_hooks(&mut self, source: &str) -> HookRunResult {
+        // `/clear` and `/resume` begin another session: what an earlier start left
+        // unsent (and a rebuild carried over) belongs to the old one.
+        if matches!(source, "clear" | "resume") {
+            self.pending_hook_context.clear();
+        }
+        self.hook_runner
+            .set_session_id(self.session.session_id.clone());
+        let result = self.run_lifecycle_hook(
+            HookEvent::SessionStart,
+            LifecycleHookInput::session_start(source),
+        );
+        if !result.is_failed() && !result.is_cancelled() {
+            self.pending_hook_context
+                .extend(result.messages().iter().cloned());
+        }
+        result
+    }
+
+    /// Takes what `SessionStart` hooks printed and no turn has sent yet. A caller
+    /// that replaces this runtime with a rebuilt one hands it on through
+    /// [`Self::set_pending_hook_context`], so the rebuild does not lose it.
+    #[must_use]
+    pub fn take_pending_hook_context(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_hook_context)
+    }
+
+    /// Sets the hook context the next turn sends (see
+    /// [`Self::take_pending_hook_context`]); what is already pending stays after it.
+    pub fn set_pending_hook_context(&mut self, mut context: Vec<String>) {
+        context.append(&mut self.pending_hook_context);
+        self.pending_hook_context = context;
+    }
+
+    /// Runs the `PreCompact` hooks before `/compact` (`trigger` `manual`) or automatic
+    /// compaction (`auto`). They cannot stop compaction; the result is returned for
+    /// the caller to show.
+    pub fn run_pre_compact_hooks(&mut self, trigger: &str) -> HookRunResult {
+        self.run_lifecycle_hook(
+            HookEvent::PreCompact,
+            LifecycleHookInput::pre_compact(trigger),
+        )
     }
 
     /// Runs one user turn: model call, tool execution, repeat until the model
@@ -914,11 +1035,29 @@ where
             self.session.persist_snapshot().map_err(session_error)?;
         }
 
+        let prompt_hooks = self.run_lifecycle_hook(
+            HookEvent::UserPromptSubmit,
+            LifecycleHookInput::user_prompt_submit(&user_input),
+        );
+        if prompt_hooks.is_denied() {
+            // The prompt never reaches the session or the model.
+            return Err(RuntimeError::with_kind(
+                RuntimeErrorKind::BlockedByHook,
+                crate::lifecycle_hooks::blocked_prompt_message(prompt_hooks.messages()),
+            ));
+        }
+        let mut context = std::mem::take(&mut self.pending_hook_context);
+        if !prompt_hooks.is_failed() && !prompt_hooks.is_cancelled() {
+            context.extend(prompt_hooks.messages().iter().cloned());
+        }
+
         self.record_turn_started(&user_input);
         self.turn_request.clone_from(&user_input);
         self.refresh_model_notes();
         self.session
-            .push_user_text(user_input)
+            .push_user_text(crate::lifecycle_hooks::with_hook_context(
+                user_input, &context,
+            ))
             .map_err(session_error)?;
 
         let result = self.run_turn_loop(prompter);
@@ -967,6 +1106,7 @@ where
                     self.finish_turn(progress, TurnOutcome::BudgetStopped { estimated_tokens })
                 );
             }
+            self.record_model_request_started(progress.iterations);
 
             let request = ApiRequest {
                 system_prompt: self.system_prompt.clone(),
@@ -1126,7 +1266,12 @@ where
                 return Ok(self.finish_turn(progress, outcome));
             }
 
+            // Calls up to here already ran together with an earlier one.
+            let mut batched_until = 0;
             for (index, (tool_use_id, tool_name, input)) in pending_tool_uses.iter().enumerate() {
+                if index < batched_until {
+                    continue;
+                }
                 if self.cancel.is_cancelled() {
                     let interrupted = self.push_synthetic_results(
                         progress.iterations,
@@ -1158,6 +1303,17 @@ where
                         true,
                     );
                     self.record_tool_result(progress.iterations, result, &mut progress)?;
+                    continue;
+                }
+
+                // A run of read-only calls that need nobody's approval runs at once.
+                let batched = self.run_read_only_batch(
+                    &pending_tool_uses[index..],
+                    &mut loop_guard,
+                    &mut progress,
+                )?;
+                if batched > 0 {
+                    batched_until = index + batched;
                     continue;
                 }
 
@@ -1266,7 +1422,7 @@ where
         input: &str,
         prompter: Option<&mut dyn PermissionPrompter>,
     ) -> ExecutedToolCall {
-        let pre_hook_result = self.run_pre_tool_use_hook(tool_name, input);
+        let pre_hook_result = self.run_pre_tool_use_hook(Some(tool_use_id), tool_name, input);
         let effective_input = pre_hook_result
             .updated_input()
             .map_or_else(|| input.to_string(), ToOwned::to_owned);
@@ -1310,30 +1466,18 @@ where
                     .tool_permission_decided(tool_name, decided_by);
                 self.tool_executor
                     .tool_started(tool_use_id, tool_name, &effective_input);
-                let (mut output, mut is_error) = match self.tool_executor.execute_with_cancellation(
+                let result = self.tool_executor.execute_with_cancellation(
                     tool_name,
                     &effective_input,
                     &self.cancel,
-                ) {
-                    Ok(output) => (output, false),
-                    Err(error) => (error.to_string(), true),
-                };
-                output = merge_hook_feedback(pre_hook_result.messages(), output, false);
-
-                let post_hook_result = if is_error {
-                    self.run_post_tool_use_failure_hook(tool_name, &effective_input, &output)
-                } else {
-                    self.run_post_tool_use_hook(tool_name, &effective_input, &output, false)
-                };
-                let post_hook_blocked = post_hook_result.is_denied()
-                    || post_hook_result.is_failed()
-                    || post_hook_result.is_cancelled();
-                if post_hook_blocked {
-                    is_error = true;
-                }
-                output =
-                    merge_hook_feedback(post_hook_result.messages(), output, post_hook_blocked);
-                (output, is_error)
+                );
+                self.after_tool_ran(
+                    tool_use_id,
+                    tool_name,
+                    &effective_input,
+                    pre_hook_result.messages(),
+                    result,
+                )
             }
             PermissionOutcome::Deny { reason } => (
                 merge_hook_feedback(pre_hook_result.messages(), reason, true),
@@ -1369,13 +1513,17 @@ where
                 ));
             }
         }
+        let limit = self.context_manager.policy().max_tool_result_chars;
+        let context_manager = &self.context_manager;
+        let output = crate::artifacts::offload_tool_result(
+            self.artifacts.as_mut(),
+            tool_name,
+            output,
+            limit,
+            |output| context_manager.cap_tool_result(output),
+        );
         ExecutedToolCall {
-            message: ConversationMessage::tool_result(
-                tool_use_id,
-                tool_name,
-                self.context_manager.cap_tool_result(output),
-                is_error,
-            ),
+            message: ConversationMessage::tool_result(tool_use_id, tool_name, output, is_error),
             interrupted,
         }
     }
@@ -1475,6 +1623,15 @@ where
         if let Some(guard) = &self.request_guard {
             self.context_manager
                 .set_working_set_tokens(guard.working_set_tokens());
+        }
+        if !progress.pre_compact_hooks_ran && self.hook_runner.has_hooks(HookEvent::PreCompact) {
+            let snapshot = self
+                .context_manager
+                .snapshot(&self.session.messages, &self.system_prompt);
+            if snapshot.estimated_tokens >= snapshot.threshold_tokens {
+                progress.pre_compact_hooks_ran = true;
+                let _ = self.run_pre_compact_hooks("auto");
+            }
         }
         let preparation = self
             .context_manager
@@ -1586,6 +1743,18 @@ where
                 self.completion_check_message(&progress.edited_paths, &mut progress.stats),
             );
         }
+        if progress.stop_hook_continuations < crate::lifecycle_hooks::MAX_STOP_HOOK_CONTINUATIONS {
+            let stop = self.run_lifecycle_hook(
+                HookEvent::Stop,
+                LifecycleHookInput::stop(progress.stop_hook_continuations > 0, final_text),
+            );
+            if stop.is_denied() && !self.cancel.is_cancelled() {
+                progress.stop_hook_continuations += 1;
+                return Some(crate::lifecycle_hooks::stop_continuation_message(
+                    stop.messages(),
+                ));
+            }
+        }
         None
     }
 
@@ -1687,7 +1856,7 @@ where
             .harness
             .workspace_root
             .clone()
-            .or_else(|| std::env::current_dir().ok());
+            .or_else(|| crate::workdir::current_dir().ok());
         let checks = root
             .as_deref()
             .map(|root| detect_checks(root, edited))
@@ -1810,7 +1979,7 @@ where
         // Same gates as a model's bash call, minus the prompt: hooks that block or
         // rewrite the call, or a policy (or hook override) that would ask, leave the
         // check to the model.
-        let hook = self.run_pre_tool_use_hook("bash", &input);
+        let hook = self.run_pre_tool_use_hook(None, "bash", &input);
         if hook.is_denied()
             || hook.is_failed()
             || hook.is_cancelled()
@@ -2059,7 +2228,32 @@ where
             "pending_tool_use_count".to_string(),
             Value::from(pending_tool_use_count as u64),
         );
+        if let Some(usage) = assistant_message.usage {
+            for (key, tokens) in [
+                ("input_tokens", usage.input_tokens),
+                ("output_tokens", usage.output_tokens),
+                ("cache_read_input_tokens", usage.cache_read_input_tokens),
+                (
+                    "cache_creation_input_tokens",
+                    usage.cache_creation_input_tokens,
+                ),
+            ] {
+                attributes.insert(key.to_string(), Value::from(tokens));
+            }
+        }
+        if let Some(model) = &self.served_model {
+            attributes.insert("served_model".to_string(), Value::String(model.clone()));
+        }
         session_tracer.record("assistant_iteration_completed", attributes);
+    }
+
+    fn record_model_request_started(&self, iteration: usize) {
+        let Some(session_tracer) = &self.session_tracer else {
+            return;
+        };
+        let mut attributes = Map::new();
+        attributes.insert("iteration".to_string(), Value::from(iteration as u64));
+        session_tracer.record("model_request_started", attributes);
     }
 
     fn record_tool_started(&self, iteration: usize, tool_name: &str) {
@@ -2426,6 +2620,7 @@ fn append_to_tool_result(message: &mut ConversationMessage, note: &str) {
 
 /// Signature-based detector for a model calling the same tool with the same
 /// arguments over and over.
+#[derive(Clone)]
 struct LoopGuard {
     threshold: usize,
     last_signature: Option<String>,
@@ -3567,6 +3762,131 @@ mod tests {
     #[cfg(not(windows))]
     fn shell_snippet(script: &str) -> String {
         script.to_string()
+    }
+
+    /// An API client that records the text of every user message it is sent.
+    struct RecordingApiClient {
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl ApiClient for RecordingApiClient {
+        fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            let mut seen = self.seen.lock().expect("seen lock");
+            for message in &request.messages {
+                for block in &message.blocks {
+                    if let (MessageRole::User, ContentBlock::Text { text }) = (&message.role, block)
+                    {
+                        seen.push(text.clone());
+                    }
+                }
+            }
+            Ok(vec![
+                AssistantEvent::TextDelta("ok".to_string()),
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+
+    fn recording_runtime(
+        hooks: RuntimeHookConfig,
+    ) -> (
+        ConversationRuntime<RecordingApiClient, StaticToolExecutor>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runtime = ConversationRuntime::new_with_features(
+            Session::new(),
+            RecordingApiClient {
+                seen: Arc::clone(&seen),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+            &RuntimeFeatureConfig::default().with_hooks(hooks),
+        );
+        (runtime, seen)
+    }
+
+    #[test]
+    fn session_start_context_survives_a_runtime_rebuild() {
+        use crate::hook_matcher::{HookCommand, HookSource};
+        use crate::hooks::HookEvent;
+        let hooks = RuntimeHookConfig::default().with(
+            HookEvent::SessionStart,
+            HookCommand::new("echo release-codename-marker", HookSource::Project),
+        );
+        let (mut first, _) = recording_runtime(hooks);
+        let result = first.run_session_start_hooks("startup");
+        assert!(!result.is_failed(), "{result:?}");
+
+        // The CLI rebuilds the runtime before the first turn: the new one starts
+        // empty, so the context is handed across.
+        let (mut rebuilt, seen) = recording_runtime(RuntimeHookConfig::default());
+        let context = first.take_pending_hook_context();
+        assert!(first.take_pending_hook_context().is_empty(), "taken once");
+        rebuilt.set_pending_hook_context(context);
+        rebuilt
+            .run_turn("what is the codename?", None)
+            .expect("turn");
+
+        let seen = seen.lock().expect("seen lock");
+        let prompt = seen.last().expect("a user message");
+        assert!(prompt.starts_with("what is the codename?"), "{prompt}");
+        assert!(prompt.contains("[Context from hooks]"), "{prompt}");
+        assert!(prompt.contains("release-codename-marker"), "{prompt}");
+    }
+
+    #[test]
+    fn rebuilt_runtime_without_the_handover_loses_session_start_context() {
+        // Documents the bug the handover fixes: nothing carries over by itself.
+        use crate::hook_matcher::{HookCommand, HookSource};
+        use crate::hooks::HookEvent;
+        let hooks = RuntimeHookConfig::default().with(
+            HookEvent::SessionStart,
+            HookCommand::new("echo release-codename-marker", HookSource::Project),
+        );
+        let (mut first, _) = recording_runtime(hooks);
+        first.run_session_start_hooks("startup");
+        let (mut rebuilt, seen) = recording_runtime(RuntimeHookConfig::default());
+        rebuilt.run_turn("hello", None).expect("turn");
+        let seen = seen.lock().expect("seen lock");
+        assert_eq!(seen.last().map(String::as_str), Some("hello"));
+    }
+
+    #[test]
+    fn clear_and_resume_drop_context_left_by_an_earlier_session() {
+        for source in ["clear", "resume"] {
+            let (mut runtime, _) = recording_runtime(RuntimeHookConfig::default());
+            runtime.set_pending_hook_context(vec!["old-session".to_string()]);
+            runtime.run_session_start_hooks(source);
+            assert!(runtime.take_pending_hook_context().is_empty(), "{source}");
+        }
+        for source in ["startup", "compact"] {
+            let (mut runtime, _) = recording_runtime(RuntimeHookConfig::default());
+            runtime.set_pending_hook_context(vec!["kept".to_string()]);
+            runtime.run_session_start_hooks(source);
+            assert_eq!(runtime.take_pending_hook_context(), ["kept"], "{source}");
+        }
+    }
+
+    #[test]
+    fn handed_over_context_comes_before_user_prompt_submit_context() {
+        use crate::hook_matcher::{HookCommand, HookSource};
+        use crate::hooks::HookEvent;
+        let hooks = RuntimeHookConfig::default().with(
+            HookEvent::UserPromptSubmit,
+            HookCommand::new("echo prompt-marker", HookSource::Project),
+        );
+        let (mut runtime, seen) = recording_runtime(hooks);
+        runtime.set_pending_hook_context(vec!["start-marker".to_string()]);
+        runtime.run_turn("go", None).expect("turn");
+        let seen = seen.lock().expect("seen lock");
+        let prompt = seen.last().expect("a user message");
+        let start = prompt.find("start-marker").expect("start context");
+        let submit = prompt.find("prompt-marker").expect("prompt context");
+        assert!(start < submit, "{prompt}");
+        // Consumed by the turn: the next one does not repeat it.
+        assert!(runtime.take_pending_hook_context().is_empty());
     }
 
     #[test]

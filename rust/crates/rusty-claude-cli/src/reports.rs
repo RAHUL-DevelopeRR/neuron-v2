@@ -183,27 +183,6 @@ pub fn format_ultraplan_report(task: Option<&str>) -> String {
     )
 }
 
-pub fn format_pr_report(branch: &str, context: Option<&str>) -> String {
-    format!(
-        "PR
-  Branch           {branch}
-  Context          {}
-  Action           draft or create a pull request for the current branch
-  Output           title and markdown body suitable for GitHub",
-        context.unwrap_or("none")
-    )
-}
-
-pub fn format_issue_report(context: Option<&str>) -> String {
-    format!(
-        "Issue
-  Context          {}
-  Action           draft or create a GitHub issue from the current context
-  Output           title and markdown body suitable for GitHub",
-        context.unwrap_or("none")
-    )
-}
-
 pub fn format_history_timestamp(timestamp_ms: u64) -> String {
     let secs = timestamp_ms / 1_000;
     let subsec_ms = timestamp_ms % 1_000;

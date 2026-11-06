@@ -165,6 +165,30 @@ describe('a command', () => {
   })
 })
 
+describe('a command that prints while it runs', () => {
+  test('shows its last lines and Running…, then the whole result', async () => {
+    const running: ToolContentBlock = {
+      type: 'tool',
+      toolCallId: 'b2',
+      toolName: 'run_terminal_command',
+      input: { command: 'cargo build' },
+      liveOutput: Array.from({ length: 12 }, (_, i) => `line ${i + 1}`).join('\n') + '\n',
+    }
+    const shown = await frame(running, true, 14)
+    expect(shown).toContain('$ cargo build')
+    expect(shown).toContain('line 12')
+    expect(shown).toContain('line 8')
+    expect(shown).not.toMatch(/line 7\b/)
+    expect(shown).toContain('Running…')
+
+    const done = withResult(running, 'bash', JSON.stringify({ stdout: 'Finished dev\n', stderr: '' }))
+    const final = await frame(done, false, 14)
+    expect(final).toContain('Finished dev')
+    expect(final).not.toContain('line 12')
+    expect(final).not.toContain('Running…')
+  })
+})
+
 describe('a sub-agent', () => {
   const agent: ToolContentBlock = {
     type: 'tool',

@@ -45,6 +45,7 @@ mod console;
 mod account;
 mod api_client;
 mod args;
+mod artifacts_view;
 mod auth;
 mod brand;
 mod clock;
@@ -64,18 +65,24 @@ mod full_screen;
 mod gateway_catalog;
 mod gateway_http;
 mod gateway_repl;
+mod github_actions;
 mod headless;
+mod hook_events;
+mod hooks_ui;
 mod init;
 mod input;
 mod line_diff;
 mod mcp_add;
 mod mcp_auth;
 mod model_routing;
+mod openrouter_oauth;
 mod orchestrator;
+mod otel_export;
 mod plan_mode;
 mod plan_window;
 mod progress;
 mod provider;
+mod provider_auth;
 mod quota;
 mod render;
 mod repl_loop;
@@ -87,6 +94,7 @@ mod shell_pty;
 mod source_control;
 mod status_ui;
 mod stream_buffer;
+mod stream_json;
 mod token_budget;
 mod tool_input_preview;
 mod tool_ui;
@@ -766,6 +774,11 @@ prompt after -p, or pipe it: `echo \"...\" | neuron -p`."
         )?,
     };
     cli.set_reasoning_effort(options.reasoning_effort);
+    cli.run_session_start_hooks(if cli.runtime.session().messages.is_empty() {
+        "startup"
+    } else {
+        "resume"
+    });
     // Nobody to answer (stdin not a terminal): approvals and questions are refused.
     headless::start(headless::stdin_is_unattended(), output_format);
     // The plan's token window, for the guard and the near-limit warning of this run.
@@ -776,6 +789,8 @@ prompt after -p, or pipe it: `echo \"...\" | neuron -p`."
         eprintln!("{}", cli.one_shot_status_line());
     }
     let result = cli.run_turn_with_output(&effective_prompt, output_format, compact);
+    // The run's spans go to the collector before the process exits.
+    otel_export::shutdown();
     // Tool calls denied for lack of a prompt: named once more, and exit code 2.
     let denied_exit = headless::report(output_format);
     result?;
@@ -1638,6 +1653,11 @@ fn run_resume_command(
                 json: Some(json),
             })
         }
+        SlashCommand::Providers => Ok(ResumeCommandOutcome {
+            session: session.clone(),
+            message: Some(provider_auth::providers_report()),
+            json: None,
+        }),
         SlashCommand::Doctor => {
             let report = render_doctor_report()?;
             Ok(ResumeCommandOutcome {
@@ -1763,6 +1783,7 @@ fn run_resume_command(
         | SlashCommand::Effort { .. }
         | SlashCommand::Branch { .. }
         | SlashCommand::Rewind { .. }
+        | SlashCommand::Artifacts
         | SlashCommand::Ide { .. }
         | SlashCommand::Tag { .. }
         | SlashCommand::OutputStyle { .. }
@@ -3295,8 +3316,15 @@ impl LiveCli {
         })
     }
 
-    fn replace_runtime(&mut self, runtime: BuiltRuntime) -> Result<(), Box<dyn std::error::Error>> {
+    fn replace_runtime(
+        &mut self,
+        mut runtime: BuiltRuntime,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         self.runtime.shutdown_plugins()?;
+        // What SessionStart hooks printed and no turn has sent yet belongs to the
+        // session, not to the runtime object: carry it to the rebuilt one.
+        let pending_hook_context = self.runtime.take_pending_hook_context();
+        runtime.set_pending_hook_context(pending_hook_context);
         self.runtime = runtime;
         Ok(())
     }
@@ -3436,6 +3464,7 @@ impl LiveCli {
         let result = match output_format {
             CliOutputFormat::Text if compact => self.run_prompt_compact(input),
             CliOutputFormat::Text => self.run_turn(input),
+            CliOutputFormat::Json if stream_json::requested() => self.run_prompt_stream_json(input),
             CliOutputFormat::Json => self.run_prompt_json(input),
         };
         // One-shot mode: the shared MCP servers and plugins end with the turn.
@@ -3449,7 +3478,16 @@ impl LiveCli {
         &mut self,
         input: &str,
     ) -> Result<runtime::TurnSummary, Box<dyn std::error::Error>> {
-        let hook_abort_monitor = self.prepare_turn_runtime(false)?;
+        self.run_one_shot_turn_on(input, TurnOutput::Silent)
+    }
+
+    /// [`Self::run_one_shot_turn`] showing the turn on `output`.
+    fn run_one_shot_turn_on(
+        &mut self,
+        input: &str,
+        output: TurnOutput,
+    ) -> Result<runtime::TurnSummary, Box<dyn std::error::Error>> {
+        let hook_abort_monitor = self.prepare_turn_runtime(output)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode)
             .stopping(self.runtime.cancellation_token().clone());
         let result = self.runtime.run_turn(input, Some(&mut permission_prompter));
@@ -3474,11 +3512,52 @@ impl LiveCli {
     }
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let (answer, result) = self.one_shot_answer(input, TurnOutput::Silent);
+        println!("{answer}");
+        result
+    }
+
+    /// `--output-format stream-json`: an `init` line, the turn's events as they happen,
+    /// then a `result` line with the `json` answer ([`stream_json`]).
+    fn run_prompt_stream_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let cwd = env::current_dir()
+            .map(|cwd| cwd.display().to_string())
+            .unwrap_or_default();
+        let tools = tools::GlobalToolRegistry::builtin()
+            .definitions(self.allowed_tools.as_ref())
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        let init = stream_json::init_event(
+            &self.session.id,
+            shown_model(&self.model),
+            &cwd,
+            self.permission_mode.as_str(),
+            &tools,
+        );
+        stream_json::write_line(&mut io::stdout(), &init)?;
+        let writer = stream_json::EventWriter::start(io::stdout());
+        let capabilities = Arc::new(turn_sink::UiCapabilities::default());
+        capabilities.set(&stream_json::capabilities());
+        let output = TurnOutput::channel_with_capabilities(writer.sender(), capabilities);
+        let (answer, result) = self.one_shot_answer(input, output);
+        writer.finish();
+        stream_json::write_line(&mut io::stdout(), &stream_json::result_event(answer))?;
+        result
+    }
+
+    /// Runs one turn on `output` and builds the answer `--output-format json` prints:
+    /// the result, or the failure with what the turn did before it.
+    fn one_shot_answer(
+        &mut self,
+        input: &str,
+        output: TurnOutput,
+    ) -> (Value, Result<(), Box<dyn std::error::Error>>) {
         let before = self.runtime.session().messages.len();
         // The tracker starts from a resumed session's saved totals: this run's usage is
         // what it added to them.
         let usage_before = self.runtime.usage().cumulative_usage();
-        let summary = match self.run_one_shot_turn(input) {
+        let summary = match self.run_one_shot_turn_on(input, output) {
             Ok(summary) => summary,
             Err(error) => {
                 // What the turn did before it failed: a script must not mistake a
@@ -3487,8 +3566,7 @@ impl LiveCli {
                 let mut answer =
                     failed_turn_json(&error.to_string(), shown_model(&self.model), messages);
                 answer["session_id"] = json!(self.session.id);
-                println!("{answer}");
-                return Err(error);
+                return (answer, Err(error));
             }
         };
         if let Some(stop) = headless::stop_message() {
@@ -3497,16 +3575,14 @@ impl LiveCli {
             let messages = self.runtime.session().messages.get(before..).unwrap_or(&[]);
             let mut answer = failed_turn_json(&stop, shown_model(&self.model), messages);
             answer["session_id"] = json!(self.session.id);
-            println!("{answer}");
-            return Ok(());
+            return (answer, Ok(()));
         }
         // On stderr, as a JSON notice line (`headless::start`).
         if let Some(warning) = crate::plan_window::near_limit_notice() {
             runtime::ui_hooks::notice(&warning);
         }
         let usage = engine::usage_since(usage_before, summary.usage);
-        println!(
-            "{}",
+        (
             json!({
                 "message": final_assistant_text(&summary),
                 "model": shown_model(&self.model),
@@ -3548,9 +3624,9 @@ impl LiveCli {
                         .map_or(0.0, runtime::UsageCostEstimate::total_cost_usd)
                 ),
                 "estimated_cost_known": pricing_for_model(&self.model).is_some()
-            })
-        );
-        Ok(())
+            }),
+            Ok(()),
+        )
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3576,11 +3652,11 @@ impl LiveCli {
                 false
             }
             SlashCommand::Pr { context } => {
-                self.run_pr(context.as_deref())?;
+                self.run_github(github_actions::GithubKind::PullRequest, context.as_deref())?;
                 false
             }
             SlashCommand::Issue { context } => {
-                self.run_issue(context.as_deref())?;
+                self.run_github(github_actions::GithubKind::Issue, context.as_deref())?;
                 false
             }
             SlashCommand::Ultraplan { task } => {
@@ -3603,11 +3679,19 @@ impl LiveCli {
                 self.compact()?;
                 false
             }
+            SlashCommand::Hooks { args } => {
+                println!("{}", self.hooks_report(args.as_deref()));
+                false
+            }
             SlashCommand::Model { model } => self.set_model(model)?,
             SlashCommand::Permissions { mode } => self.set_permissions(mode)?,
             SlashCommand::Clear { confirm } => self.clear_session(confirm)?,
             SlashCommand::Cost => {
                 self.print_cost();
+                false
+            }
+            SlashCommand::Artifacts => {
+                println!("{}", artifacts_view::artifacts_report(&self.session.id));
                 false
             }
             SlashCommand::Resume { session_path } => self.resume_session(session_path)?,
@@ -3668,6 +3752,10 @@ impl LiveCli {
                 println!("{}", render_doctor_report()?.render());
                 false
             }
+            SlashCommand::Providers => {
+                println!("{}", provider_auth::providers_report());
+                false
+            }
             SlashCommand::History { count } => {
                 self.print_prompt_history(count.as_deref());
                 false
@@ -3704,7 +3792,6 @@ impl LiveCli {
             | SlashCommand::Voice { .. }
             | SlashCommand::Rename { .. }
             | SlashCommand::Copy { .. }
-            | SlashCommand::Hooks { .. }
             | SlashCommand::Context { .. }
             | SlashCommand::Color { .. }
             | SlashCommand::Effort { .. }
@@ -4067,6 +4154,7 @@ impl LiveCli {
         )?;
         self.replace_runtime(runtime)?;
         println!("{}", self.session_cleared_report(&previous_session));
+        self.run_session_start_hooks("clear");
         Ok(true)
     }
 
@@ -4097,6 +4185,7 @@ impl LiveCli {
         };
 
         let message_count = self.switch_session(&session_ref)?;
+        self.run_session_start_hooks("resume");
         println!(
             "{}",
             format_resume_report(
@@ -4470,6 +4559,7 @@ impl LiveCli {
     }
 
     fn compact(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.run_manual_pre_compact_hooks();
         let result = self.runtime.compact(CompactionConfig::default());
         let removed = result.removed_message_count;
         let kept = result.compacted_session.messages.len();
@@ -4488,6 +4578,9 @@ impl LiveCli {
         self.replace_runtime(runtime)?;
         self.persist_session()?;
         println!("{}", format_compact_report(removed, kept, skipped));
+        if !skipped {
+            self.run_session_start_hooks("compact");
+        }
         Ok(())
     }
 
@@ -4567,15 +4660,19 @@ impl LiveCli {
         Ok(())
     }
 
-    fn run_pr(&self, context: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-        let branch =
-            resolve_git_branch_for(&env::current_dir()?).unwrap_or_else(|| "unknown".to_string());
-        println!("{}", format_pr_report(&branch, context));
-        Ok(())
-    }
-
-    fn run_issue(&self, context: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-        println!("{}", format_issue_report(context));
+    /// `/pr …` and `/issue …`: drafts, or opens the shown draft with `gh`
+    /// (`github_actions`).
+    fn run_github(
+        &self,
+        kind: github_actions::GithubKind,
+        args: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let text = self.github_command(
+            kind,
+            args.unwrap_or_default(),
+            &runtime::CancellationToken::new(),
+        )?;
+        println!("{text}");
         Ok(())
     }
 }
@@ -5439,10 +5536,11 @@ fn resolve_plugin_path(cwd: &Path, config_home: &Path, value: &str) -> PathBuf {
 }
 
 fn runtime_hook_config_from_plugin_hooks(hooks: PluginHooks) -> runtime::RuntimeHookConfig {
-    runtime::RuntimeHookConfig::new(
-        hooks.pre_tool_use,
-        hooks.post_tool_use,
-        hooks.post_tool_use_failure,
+    runtime::RuntimeHookConfig::from_event_lists(
+        runtime::HookSource::Plugin,
+        hooks.by_event().into_iter().filter_map(|(name, commands)| {
+            runtime::HookEvent::from_name(name).map(|event| (event, commands.clone()))
+        }),
     )
 }
 
@@ -5457,16 +5555,15 @@ mod tests {
         create_managed_session_handle, describe_tool_progress, filter_tool_specs,
         format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
         format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
-        format_internal_prompt_progress_line, format_issue_report, format_model_report,
-        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
-        format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
-        format_tool_result, format_ultraplan_report, format_unknown_slash_command,
-        format_unknown_slash_command_message, format_user_visible_api_error,
-        mcp_servers_without_bundled, merge_prompt_with_stdin, normalize_permission_mode,
-        parse_args, parse_export_args, parse_git_status_branch, parse_git_status_metadata_for,
-        parse_git_workspace_summary, parse_history_count, permission_mode_for_mcp_tool,
-        permission_policy, print_help_to, push_output_block, render_config_report,
-        render_diff_report, render_diff_report_for, render_memory_report,
+        format_internal_prompt_progress_line, format_model_report, format_model_switch_report,
+        format_permissions_report, format_permissions_switch_report, format_resume_report,
+        format_status_report, format_tool_call_start, format_tool_result, format_ultraplan_report,
+        format_unknown_slash_command, format_unknown_slash_command_message,
+        format_user_visible_api_error, mcp_servers_without_bundled, merge_prompt_with_stdin,
+        normalize_permission_mode, parse_args, parse_export_args, parse_git_status_branch,
+        parse_git_status_metadata_for, parse_git_workspace_summary, parse_history_count,
+        permission_mode_for_mcp_tool, permission_policy, print_help_to, push_output_block,
+        render_config_report, render_diff_report, render_diff_report_for, render_memory_report,
         render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, render_version_report, resolve_model_alias,
         resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
@@ -8078,14 +8175,6 @@ mod tests {
         let ultraplan = format_ultraplan_report(Some("ship the release"));
         assert!(ultraplan.contains("Task             ship the release"));
         assert!(ultraplan.contains("break work into a multi-step execution plan"));
-
-        let pr = format_pr_report("feature/ux", Some("ready for review"));
-        assert!(pr.contains("Branch           feature/ux"));
-        assert!(pr.contains("draft or create a pull request"));
-
-        let issue = format_issue_report(Some("flaky test"));
-        assert!(issue.contains("Context          flaky test"));
-        assert!(issue.contains("draft or create a GitHub issue"));
     }
 
     #[test]

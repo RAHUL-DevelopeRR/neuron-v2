@@ -32,6 +32,7 @@ import {
   withCompleteToolInput,
   withSubagent,
   withToolInputSoFar,
+  withToolOutputDelta,
   withoutToolBlocks,
 } from './live-tool-blocks'
 import { startLiveTurn } from './live-turn'
@@ -307,6 +308,14 @@ export function createTurnEventSink(
           updater.updateAiMessageBlocks((blocks) =>
             withToolInputSoFar(blocks, event.id, { bytes, lines, target, preview }),
           )
+          return
+        }
+        case 'tool_output_delta': {
+          if (!drawing()) return
+          const { tool_use_id: id, chunk } = event
+          // Only a call that is open: a late delta never reopens a finished row.
+          if (!open.some((call) => call.id === id)) return
+          updater.updateAiMessageBlocks((blocks) => withToolOutputDelta(blocks, id, chunk))
           return
         }
         case 'tool_call_started': {

@@ -62,6 +62,10 @@ export const FEATURE_CHECKPOINTS = 'checkpoints'
  * servers listed with status `disabled`.
  */
 export const FEATURE_MCP_TOGGLE = 'mcp_toggle'
+/** `tool_output_delta` events: a running shell command's output. */
+export const FEATURE_LIVE_OUTPUT = 'live_output'
+/** `hook_started` and `hook_finished` events while hook commands run. */
+export const FEATURE_HOOK_PROGRESS = 'hook_progress'
 /**
  * The connector catalog: the `list_connector_catalog` command (answered with a
  * `connector_catalog` event), `add_mcp_server`, `remove_mcp_server` and
@@ -106,6 +110,17 @@ export const CAPABILITY_LIVE_PROGRESS = 'live_progress'
  * `/rewind` with notices.
  */
 export const CAPABILITY_GIT_VIEWS = 'git_views'
+/**
+ * A UI capability: a running `bash` or `PowerShell` call's output as
+ * `tool_output_delta` events. Without it the output comes only with the result.
+ */
+export const CAPABILITY_LIVE_OUTPUT = 'live_output'
+
+/**
+ * A UI capability: `hook_started` and `hook_finished` events. Without it the
+ * engine sends neither.
+ */
+export const CAPABILITY_HOOK_PROGRESS = 'hook_progress'
 
 /** Token counts as the provider reported them (or estimated before it did). */
 export interface TokenCounts {
@@ -978,6 +993,49 @@ export interface RequestUsageEvent {
   usage: TokenCounts
 }
 
+/** Which stream of a command a `tool_output_delta` carries. */
+export type OutputStream = 'stdout' | 'stderr'
+
+/**
+ * More of what a running shell call printed: the text since the last delta of
+ * that stream, at most every 100 ms or so and at most 8 KB (the tail of what
+ * it printed meanwhile). The call's `tool_result` still has all of it.
+ */
+export interface ToolOutputDeltaEvent {
+  type: 'tool_output_delta'
+  tool_use_id: string
+  stream: OutputStream
+  chunk: string
+}
+
+/**
+ * A hook command started. `event` is its settings name (`PreToolUse`, `Stop`,
+ * ...); `command` is shortened, with anything that looks like a secret hidden;
+ * `tool_use_id` is the tool call it runs for.
+ */
+export interface HookStartedEvent {
+  type: 'hook_started'
+  event: string
+  matcher?: string | null
+  command: string
+  tool_use_id?: string | null
+}
+
+/** How a hook command ended. */
+export type HookOutcome = 'ok' | 'blocked' | 'error' | 'cancelled'
+
+/** A hook command ended; `message` is the start of what it said. */
+export interface HookFinishedEvent {
+  type: 'hook_finished'
+  event: string
+  matcher?: string | null
+  command: string
+  tool_use_id?: string | null
+  outcome: HookOutcome
+  duration_ms: number
+  message?: string | null
+}
+
 /**
  * Every file the agent created, changed or deleted in this session, with lines
  * added and removed since the session first touched it.
@@ -1086,6 +1144,9 @@ export type UiEvent =
   | ToolInputProgressEvent
   | OutputProgressEvent
   | RequestUsageEvent
+  | ToolOutputDeltaEvent
+  | HookStartedEvent
+  | HookFinishedEvent
   | ChangesEvent
   | DiffEvent
   | CommitProposalEvent
@@ -1129,6 +1190,9 @@ export const UI_EVENT_TYPES: readonly UiEventType[] = [
   'tool_input_progress',
   'output_progress',
   'request_usage',
+  'tool_output_delta',
+  'hook_started',
+  'hook_finished',
   'changes',
   'diff',
   'commit_proposal',

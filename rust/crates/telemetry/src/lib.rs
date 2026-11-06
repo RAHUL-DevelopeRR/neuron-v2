@@ -9,6 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+pub mod otel;
+
 pub const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 /// The client name requests carry by default (`user-agent: neuron/<version>`).
 pub const DEFAULT_APP_NAME: &str = "neuron";

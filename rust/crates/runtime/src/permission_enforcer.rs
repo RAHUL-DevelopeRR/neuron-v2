@@ -257,7 +257,7 @@ fn lexically_normalize(path: &str) -> String {
 /// Whether a bash command line is read-only, judged over every simple
 /// command in it (see [`classify_shell_command`]).
 fn is_read_only_command(command: &str) -> bool {
-    let workspace = std::env::current_dir().ok();
+    let workspace = crate::workdir::current_dir().ok();
     classify_shell_command(command, ShellDialect::host(), workspace.as_deref()).is_read_only()
 }
 

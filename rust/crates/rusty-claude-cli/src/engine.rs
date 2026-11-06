@@ -28,7 +28,7 @@
 //!   and, for a UI that declared `git_views`, the agent's changes ([`UiEvent::Changes`]);
 //! - `/diff [path]`, `/commit [message]`, [`EngineCommand::Commit`], `/rewind [id [mode]]`,
 //!   [`EngineCommand::Rewind`] and `/changes`: their events with `git_views`, else notices,
-//!   then `TurnFinished`. Each prompt gets a checkpoint ([`SessionCheckpoints`]) that
+//!   then `TurnFinished`. `/pr` and `/issue` answer with notices (`github_actions`). Each prompt gets a checkpoint ([`SessionCheckpoints`]) that
 //!   `/rewind` goes back to.
 //!
 //! When the engine stops, the event channel closes.
@@ -238,9 +238,15 @@ fn run_engine(
         return match started {
             Ok((mut engine, resumed)) => {
                 engine.announce();
+                let source = if resumed.is_some() {
+                    "resume"
+                } else {
+                    "startup"
+                };
                 if let Some(report) = resumed {
                     engine.notice(&report);
                 }
+                engine.cli.run_session_start_hooks(source);
                 let _ = ready.send(Ok(()));
                 let exit = engine.serve(queue);
                 engine.close();
@@ -294,6 +300,13 @@ fn run_engine(
                 }),
             }
         }
+        engine
+            .cli
+            .run_session_start_hooks(if signed_out.options.resume.is_some() {
+                "resume"
+            } else {
+                "startup"
+            });
         // The end of the `/login` that got here.
         engine.finish_turn();
         let exit = engine.serve(queue);
@@ -1457,7 +1470,7 @@ fn models_event(current_model: &str) -> UiEvent {
                 })
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_else(crate::provider_auth::active_provider_model_infos);
     UiEvent::Models {
         current: shown_model(current_model).to_string(),
         models,
@@ -2227,6 +2240,12 @@ impl Engine {
             "commit" if args.is_empty() => self.propose_commit().map_err(Into::into),
             "commit" => self.commit(args).map_err(Into::into),
             "rewind" => self.rewind_command(args).map_err(Into::into),
+            "pr" => self
+                .github(crate::github_actions::GithubKind::PullRequest, args)
+                .map_err(Into::into),
+            "issue" => self
+                .github(crate::github_actions::GithubKind::Issue, args)
+                .map_err(Into::into),
             "changes" => {
                 self.show_changes();
                 Ok(())
@@ -2270,12 +2289,20 @@ impl Engine {
                 let usage = self.cli.runtime.usage().cumulative_usage();
                 self.notice(&format_cost_report(usage));
             }
+            SlashCommand::Artifacts => {
+                let report = crate::artifacts_view::artifacts_report(&self.cli.session.id);
+                self.notice(&report);
+            }
             SlashCommand::Stats => {
                 let usage =
                     UsageTracker::from_session(self.cli.runtime.session()).cumulative_usage();
                 self.notice(&format_cost_report(usage));
             }
             SlashCommand::Compact => self.compact()?,
+            SlashCommand::Hooks { args } => {
+                let report = self.cli.hooks_report(args.as_deref());
+                self.notice(&report);
+            }
             SlashCommand::Model { model: None } => self.model_report(),
             SlashCommand::Model { model: Some(model) } => {
                 self.switch_model(&model)?;
@@ -2295,6 +2322,7 @@ impl Engine {
                 self.resume(&reference)?;
                 self.persist();
                 self.send_transcript();
+                self.cli.run_session_start_hooks("resume");
             }
             SlashCommand::Plan { mode } => self.plan(mode.as_deref())?,
             SlashCommand::Login => self.login()?,
@@ -2320,6 +2348,7 @@ impl Engine {
                 let report = engine_reports::doctor(&render_doctor_report()?);
                 self.show_report(report);
             }
+            SlashCommand::Providers => self.notice(&crate::provider_auth::providers_report()),
             SlashCommand::Unknown(name) => return Err(format_unknown_slash_command(&name).into()),
             other => {
                 return Err(format!(
@@ -2563,6 +2592,7 @@ impl Engine {
     }
 
     fn compact(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.cli.run_manual_pre_compact_hooks();
         let result = self.cli.runtime.compact(CompactionConfig::default());
         let removed = result.removed_message_count;
         let kept = result.compacted_session.messages.len();
@@ -2570,6 +2600,9 @@ impl Engine {
         self.rebuild_runtime(result.compacted_session, &session_id)?;
         self.cli.persist_session()?;
         self.notice(&format_compact_report(removed, kept, removed == 0));
+        if removed > 0 {
+            self.cli.run_session_start_hooks("compact");
+        }
         Ok(())
     }
 
@@ -2593,6 +2626,7 @@ impl Engine {
         let report = self.cli.session_cleared_report(&previous);
         self.notice(&report);
         self.persist();
+        self.cli.run_session_start_hooks("clear");
         Ok(())
     }
 
@@ -2943,6 +2977,24 @@ impl Engine {
         self.notice(&committed.notice(&plan.left_out));
         self.send_status();
         self.send_changes();
+        Ok(())
+    }
+
+    /// `/pr …` and `/issue …` (`github_actions`): a draft as a notice, or, on
+    /// `create` after a draft was shown, the pull request or issue opened with `gh`. An
+    /// interrupt stops the draft.
+    fn github(
+        &mut self,
+        kind: crate::github_actions::GithubKind,
+        args: &str,
+    ) -> Result<(), String> {
+        let cancel = CancellationToken::new();
+        let shared = Arc::clone(&self.shared);
+        let running = RunningTurn::start(&shared);
+        running.watch(cancel.clone(), HookAbortSignal::new());
+        let result = self.cli.github_command(kind, args, &cancel);
+        drop(running);
+        self.notice(&result?);
         Ok(())
     }
 

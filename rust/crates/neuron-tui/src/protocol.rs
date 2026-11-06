@@ -124,6 +124,11 @@ pub const FEATURE_LIVE_PROGRESS: &str = "live_progress";
 /// [`UiEvent::CommitProposal`]. Without [`CAPABILITY_GIT_VIEWS`] it answers with notices.
 pub const FEATURE_GIT_VIEWS: &str = "git_views";
 
+/// The engine reports a shell command's output while it runs
+/// ([`UiEvent::ToolOutputDelta`]). Sent only to a UI that declared
+/// [`CAPABILITY_LIVE_OUTPUT`].
+pub const FEATURE_LIVE_OUTPUT: &str = "live_output";
+
 /// The engine keeps a checkpoint per prompt: `/rewind` lists them
 /// ([`UiEvent::Checkpoints`]) and [`EngineCommand::Rewind`] goes back to one
 /// ([`UiEvent::Rewound`]). Without [`CAPABILITY_GIT_VIEWS`] it answers with notices.
@@ -133,6 +138,10 @@ pub const FEATURE_CHECKPOINTS: &str = "checkpoints";
 /// `disabledMcpServers` in the user settings); [`McpServerInfo::enabled`] is set and
 /// disabled servers are listed with status `disabled`.
 pub const FEATURE_MCP_TOGGLE: &str = "mcp_toggle";
+/// The engine reports hook commands as they run ([`UiEvent::HookStarted`] and
+/// [`UiEvent::HookFinished`]). Sent only to a UI that declared
+/// [`CAPABILITY_HOOK_PROGRESS`].
+pub const FEATURE_HOOK_PROGRESS: &str = "hook_progress";
 
 /// The connector catalog: [`EngineCommand::ListConnectorCatalog`] (answered with
 /// [`UiEvent::ConnectorCatalog`]), [`EngineCommand::AddMcpServer`],
@@ -183,6 +192,8 @@ pub const ENGINE_FEATURES: &[&str] = &[
     FEATURE_GIT_VIEWS,
     FEATURE_CHECKPOINTS,
     FEATURE_MCP_TOGGLE,
+    FEATURE_LIVE_OUTPUT,
+    FEATURE_HOOK_PROGRESS,
     FEATURE_MCP_CATALOG,
     FEATURE_MCP_POLICY,
     FEATURE_MCP_HOSTED,
@@ -355,6 +366,21 @@ pub const CAPABILITY_LIVE_PROGRESS: &str = "live_progress";
 /// A UI capability: send changes, diffs, commit proposals, checkpoints and rewinds as
 /// their own events instead of notices.
 pub const CAPABILITY_GIT_VIEWS: &str = "git_views";
+
+/// A UI capability: send the output of a running shell command as
+/// [`UiEvent::ToolOutputDelta`] ([`FEATURE_LIVE_OUTPUT`]).
+pub const CAPABILITY_LIVE_OUTPUT: &str = "live_output";
+
+/// Which stream of a command a [`UiEvent::ToolOutputDelta`] carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+/// A UI capability: send the hook events of [`FEATURE_HOOK_PROGRESS`].
+pub const CAPABILITY_HOOK_PROGRESS: &str = "hook_progress";
 
 /// Which saved chats [`EngineCommand::ListSessions`] lists.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -979,6 +1005,42 @@ pub enum UiEvent {
     /// [`UiEvent::Usage`] still closes the turn with its totals. With
     /// [`CAPABILITY_LIVE_PROGRESS`] only.
     RequestUsage { usage: TokenCounts },
+    /// More of what a running `bash` or `PowerShell` call printed: the text since the
+    /// last delta of that stream, at most every 100 ms or so per call and at most
+    /// 8 KB (a command that printed more is reported by the tail). The call's
+    /// [`UiEvent::ToolResult`] still carries the whole output when it ends. With
+    /// [`CAPABILITY_LIVE_OUTPUT`] only.
+    ToolOutputDelta {
+        tool_use_id: String,
+        stream: OutputStream,
+        chunk: String,
+    },
+    /// A hook command started. `event` is its settings name (`PreToolUse`, `Stop`, ...),
+    /// `command` the command shortened with anything that looks like a secret hidden,
+    /// `tool_use_id` the tool call it runs for. With [`CAPABILITY_HOOK_PROGRESS`] only.
+    HookStarted {
+        event: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        matcher: Option<String>,
+        command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_use_id: Option<String>,
+    },
+    /// A hook command ended: `outcome` is `ok`, `blocked` (exit 2 or a block decision),
+    /// `error` or `cancelled`; `message` is the start of what it said, when it said
+    /// something. With [`CAPABILITY_HOOK_PROGRESS`] only.
+    HookFinished {
+        event: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        matcher: Option<String>,
+        command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_use_id: Option<String>,
+        outcome: String,
+        duration_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
     /// Every file the agent created, changed or deleted in this session, with lines
     /// added and removed since the session first touched it. Sent when the list changes
     /// (after a tool call, after a rewind) and after [`EngineCommand::Capabilities`] when
@@ -1573,6 +1635,29 @@ mod tests {
 
     /// Live progress, todos, sub-agents, changes and checkpoints: the tags and field
     /// names the UIs read, and `ready` from an engine before `features`.
+    /// A running command's output, as the UI reads it.
+    #[test]
+    fn tool_output_delta_as_json() {
+        let delta = UiEvent::ToolOutputDelta {
+            tool_use_id: "call_7".into(),
+            stream: OutputStream::Stderr,
+            chunk: "warning: unused\n".into(),
+        };
+        let json = serde_json::to_value(&delta).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "tool_output_delta",
+                "tool_use_id": "call_7",
+                "stream": "stderr",
+                "chunk": "warning: unused\n",
+            })
+        );
+        assert_eq!(serde_json::from_value::<UiEvent>(json).unwrap(), delta);
+        assert!(ENGINE_FEATURES.contains(&FEATURE_LIVE_OUTPUT));
+        assert_eq!(CAPABILITY_LIVE_OUTPUT, FEATURE_LIVE_OUTPUT);
+    }
+
     #[test]
     fn live_progress_and_git_view_events_as_json() {
         let ready: UiEvent =
@@ -1802,6 +1887,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(model.supports_images, None);
+    }
+
+    #[test]
+    fn hook_events_have_a_stable_shape_and_omit_absent_fields() {
+        let started = UiEvent::HookStarted {
+            event: "PreToolUse".into(),
+            matcher: Some("bash".into()),
+            command: "guard.sh".into(),
+            tool_use_id: Some("call-1".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&started).unwrap(),
+            serde_json::json!({"type":"hook_started","event":"PreToolUse","matcher":"bash","command":"guard.sh","tool_use_id":"call-1"})
+        );
+        let finished = UiEvent::HookFinished {
+            event: "Stop".into(),
+            matcher: None,
+            command: "check.sh".into(),
+            tool_use_id: None,
+            outcome: "blocked".into(),
+            duration_ms: 12,
+            message: Some("tests fail".into()),
+        };
+        let value = serde_json::to_value(&finished).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"type":"hook_finished","event":"Stop","command":"check.sh","outcome":"blocked","duration_ms":12,"message":"tests fail"})
+        );
+        assert_eq!(serde_json::from_value::<UiEvent>(value).unwrap(), finished);
+        assert!(ENGINE_FEATURES.contains(&FEATURE_HOOK_PROGRESS));
+        assert_eq!(CAPABILITY_HOOK_PROGRESS, "hook_progress");
     }
 
     /// The token window is `AccountDetails.usage_window`, every part optional, in the

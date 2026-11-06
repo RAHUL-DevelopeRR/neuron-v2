@@ -821,7 +821,7 @@ fn now_unix_timestamp() -> u64 {
 fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
     match std::env::var(key) {
         Ok(value) if !value.is_empty() => Ok(Some(value)),
-        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(super::dotenv_value(key)),
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(super::fallback_credential(key)),
         Err(error) => Err(ApiError::from(error)),
     }
 }
@@ -1185,6 +1185,21 @@ mod tests {
             error,
             crate::error::ApiError::MissingCredentials { .. }
         ));
+    }
+
+    #[test]
+    fn stored_user_key_is_used_only_when_the_environment_has_none() {
+        let _guard = env_lock();
+        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        crate::providers::user_keys::install_user_key("ANTHROPIC_API_KEY", "sk-ant-stored");
+        let stored = resolve_startup_auth_source(|| Ok(None)).expect("stored key");
+        assert_eq!(stored, AuthSource::ApiKey("sk-ant-stored".to_string()));
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-env");
+        let from_env = resolve_startup_auth_source(|| Ok(None)).expect("env key");
+        assert_eq!(from_env, AuthSource::ApiKey("sk-ant-env".to_string()));
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        crate::providers::user_keys::install_user_key("ANTHROPIC_API_KEY", "");
     }
 
     #[test]
