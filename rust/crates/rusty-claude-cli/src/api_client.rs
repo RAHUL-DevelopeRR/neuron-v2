@@ -2320,8 +2320,11 @@ mod stream_resilience_tests {
             .expect("the second request answers");
 
         let gaps = gateway.gaps();
-        // The 300 ms first-token deadline, then the wait.
-        assert!(gaps[0] >= Duration::from_millis(700), "{gaps:?}");
+        // The 300 ms first-token deadline, then the 400 ms wait. Gaps are measured
+        // between accepted connections and Windows timers are coarse (observed
+        // 688 ms), so the lower bound leaves slack while still proving the wait
+        // ran: the deadline alone would be about 300 ms.
+        assert!(gaps[0] >= Duration::from_millis(600), "{gaps:?}");
         assert!(gaps[0] < Duration::from_secs(10), "{gaps:?}");
     }
 

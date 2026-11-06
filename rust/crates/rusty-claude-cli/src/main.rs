@@ -8448,7 +8448,11 @@ UU conflicted.rs",
         assert!(message.contains("Unstaged Changes"));
         assert!(message.contains("tracked.txt"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        // The process cwd was briefly this directory, so a child process another
+        // test spawned in that window can still hold it open; Windows then refuses
+        // the delete (os error 32). The directory is unique and under the OS temp
+        // dir, so leaking it is harmless; the assertions above are what matter.
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
