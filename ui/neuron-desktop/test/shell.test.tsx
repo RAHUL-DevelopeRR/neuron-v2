@@ -187,9 +187,12 @@ describe('D1–D4, D12: the sidebar', () => {
     expect(within(sidebar()).queryByLabelText('Search sessions')).toBeNull()
     fireEvent.keyDown(window, { key: 'B', ctrlKey: true, shiftKey: true })
     expect(within(sidebar()).getByLabelText('Search sessions')).toBeTruthy()
-    // Ctrl+K goes to the search box.
+    // Ctrl+K opens the command palette; searching sessions is one of its commands.
     fireEvent.keyDown(window, { key: 'b', ctrlKey: true, shiftKey: true })
     fireEvent.keyDown(window, { key: 'k', ctrlKey: true })
+    const palette = await screen.findByRole('dialog', { name: 'Command palette' })
+    fireEvent.change(within(palette).getByRole('combobox'), { target: { value: 'search sessions' } })
+    fireEvent.keyDown(within(palette).getByRole('combobox'), { key: 'Enter' })
     await waitFor(() => expect(document.activeElement?.getAttribute('aria-label')).toBe('Search sessions'))
   })
 })

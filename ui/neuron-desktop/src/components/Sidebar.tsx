@@ -1,6 +1,7 @@
 import { forwardRef, useState, type ReactNode } from 'react'
 
 import { ago, filterRows, groupRows, type Badge, type GroupBy, type SessionRow } from '../sessions'
+import { triage, type Activity, type ChatRow } from '../chats'
 import type { Project } from '../platform'
 import { PixelLogo } from './PixelLogo'
 
@@ -64,6 +65,70 @@ function SessionButton({ row, disabled, onOpen }: { row: SessionRow; disabled: b
   )
 }
 
+const ACTIVITY_MARK: Record<Activity, string> = { needs_you: '!', running: '●', idle: '○', stopped: '■' }
+const ACTIVITY_LABEL: Record<Activity, string> = { needs_you: 'needs you', running: 'working', idle: 'idle', stopped: 'stopped' }
+
+/** What a chat's row says to a screen reader beyond its title. */
+function chatStatus(row: ChatRow): string {
+  if (row.activity === 'idle' && row.unread) return 'finished, not seen yet'
+  return row.stopNote ? `${ACTIVITY_LABEL[row.activity]}: ${row.stopNote}` : ACTIVITY_LABEL[row.activity]
+}
+
+function ChatButton({ row, active, rail, onOpen }: { row: ChatRow; active: boolean; rail: boolean; onOpen: (id: string) => void }) {
+  const status = chatStatus(row)
+  return (
+    <button
+      data-chat-id={row.id}
+      className={`chat-row activity-${row.activity}${active ? ' current' : ''}${row.unread ? ' unread' : ''}`}
+      aria-current={active ? 'true' : undefined}
+      aria-label={rail ? `${row.title}, ${status}` : undefined}
+      title={rail ? `${row.title} (${status})` : row.stopNote ?? row.title}
+      onClick={() => onOpen(row.id)}
+    >
+      <span className="chat-dot" aria-hidden>
+        {row.unread && row.activity !== 'needs_you' && row.activity !== 'running' ? '•' : ACTIVITY_MARK[row.activity]}
+      </span>
+      {!rail && (
+        <>
+          <span className="session-title">{row.title}</span>
+          {row.worktree && row.branch && <span className="chat-tag muted small">{row.branch.replace(/^neuron\//, '')}</span>}
+          <span className="sr-only">, {status}</span>
+        </>
+      )}
+    </button>
+  )
+}
+
+const CHAT_GROUPS: Array<['needsYou' | 'running' | 'doneUnread' | 'idle', string]> = [
+  ['needsYou', 'Needs you'],
+  ['running', 'Working'],
+  ['doneUnread', 'Finished'],
+  ['idle', 'Idle'],
+]
+
+/** The open chats in four groups: waiting for the user, working, finished out of view, and the rest. */
+function ChatGroups({ chats, active, rail, onOpen }: { chats: ChatRow[]; active: string | null; rail: boolean; onOpen: (id: string) => void }) {
+  const groups = triage(chats)
+  return (
+    <div className="chat-groups">
+      {CHAT_GROUPS.map(([key, label]) =>
+        groups[key].length === 0 ? null : (
+          <section key={key} className={`chat-group group-${key}`} aria-label={`${label}, ${groups[key].length}`}>
+            {!rail && <h2 className="chat-group-head">{label}</h2>}
+            <ul>
+              {groups[key].map((row) => (
+                <li key={row.id}>
+                  <ChatButton row={row} active={row.id === active} rail={rail} onOpen={onOpen} />
+                </li>
+              ))}
+            </ul>
+          </section>
+        ),
+      )}
+    </div>
+  )
+}
+
 /** The group-by menu next to "On this device". */
 function GroupMenu({ value, onChange }: { value: GroupBy; onChange: (value: GroupBy) => void }) {
   return (
@@ -102,8 +167,15 @@ export const Sidebar = forwardRef<HTMLInputElement, {
   onSearch: () => void
   /** The account row, and the update notice above it. */
   footer: ReactNode
+  // L4: multi-chat. With `chats`, the open chats are listed in groups above the history.
+  chats?: ChatRow[]
+  activeChat?: string | null
+  onOpenChat?: (id: string) => void
+  needsYouCount?: number
+  onJumpWaiting?: () => void
+  onNewWorktreeChat?: () => void
 }>(function Sidebar(
-  { rail, onToggleRail, rows, open, groupBy, onGroupBy, busy, historyAvailable, page, onNewSession, onOpenSession, onOpenProject, onNavigate, onSettings, onSearch, footer },
+  { rail, onToggleRail, rows, open, groupBy, onGroupBy, busy, historyAvailable, page, onNewSession, onOpenSession, onOpenProject, onNavigate, onSettings, onSearch, footer, chats, activeChat = null, onOpenChat, needsYouCount = 0, onJumpWaiting, onNewWorktreeChat },
   searchRef,
 ) {
   const [query, setQuery] = useState('')
@@ -115,6 +187,16 @@ export const Sidebar = forwardRef<HTMLInputElement, {
     <nav className={`sidebar${rail ? ' rail' : ''}`} aria-label="Neuron">
       <div className="sidebar-head">
         {rail ? <PixelLogo pixel={4} mark /> : <PixelLogo pixel={3} />}
+        {needsYouCount > 0 && onJumpWaiting && (
+          <button
+            className="needs-badge"
+            onClick={onJumpWaiting}
+            aria-label={`${needsYouCount} ${needsYouCount === 1 ? 'chat needs' : 'chats need'} you. Go to the first`}
+            title="Go to the chat that needs you (Ctrl+J)"
+          >
+            {needsYouCount}
+          </button>
+        )}
         {!rail && (
           <button className="icon-button" aria-label="Settings" title="Settings (Ctrl+,)" onClick={onSettings}>
             ⚙
@@ -132,11 +214,13 @@ export const Sidebar = forwardRef<HTMLInputElement, {
       </div>
       <div className="nav" role="group" aria-label="Go to">
         <NavButton icon="＋" label="New session" shortcut="Ctrl+N" rail={rail} onClick={onNewSession} disabled={busy} />
-        <NavButton icon="⌕" label="Search" shortcut="Ctrl+K" rail={rail} onClick={onSearch} />
+        {onNewWorktreeChat && <NavButton icon="⎇" label="New chat in a copy" shortcut="Ctrl+Shift+N" rail={rail} onClick={onNewWorktreeChat} />}
+        <NavButton icon="⌕" label="Search" rail={rail} onClick={onSearch} />
         <NavButton icon="▣" label="Projects" rail={rail} active={page === 'projects'} onClick={() => onNavigate('projects')} />
         <NavButton icon="⧉" label="Extensions" rail={rail} active={page === 'extensions'} onClick={() => onNavigate('extensions')} />
         {rail && <NavButton icon="⚙" label="Settings" shortcut="Ctrl+," rail onClick={onSettings} active={page === 'settings'} />}
       </div>
+      {chats && chats.length > 0 && <ChatGroups chats={chats} active={activeChat} rail={rail} onOpen={onOpenChat ?? (() => {})} />}
       {!rail && (
         <>
           <input

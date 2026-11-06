@@ -183,6 +183,7 @@ export function SidePane({
   todos,
   subagents,
   terminalOpened,
+  chatKey,
 }: {
   platform: Platform
   tab: PaneTab
@@ -193,6 +194,8 @@ export function SidePane({
   todos: TodoItem[]
   subagents: ToolItem[]
   terminalOpened: boolean
+  /** L4: the chat in view; the terminal opens in its folder. */
+  chatKey?: string | null
 }) {
   const tabs: Array<[PaneTab, string]> = [
     ['changes', 'Changes'],
@@ -216,7 +219,7 @@ export function SidePane({
       {terminalOpened && (
         <div className="terminal-tab" hidden={tab !== 'terminal'}>
           <Suspense fallback={<div className="muted pad">Loading the terminal…</div>}>
-            <TerminalPane platform={platform} />
+            <TerminalPane platform={platform} folder={chatKey ?? undefined} />
           </Suspense>
         </div>
       )}
