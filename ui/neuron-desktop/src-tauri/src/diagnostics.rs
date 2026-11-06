@@ -243,18 +243,12 @@ pub fn missing_problem() -> EngineProblem {
 
 /// How an engine that ended is reported: `None` for a clean exit. `code` is
 /// `None` when the process was killed; on macOS, one killed with nothing said
-/// is how Gatekeeper and code-signing checks stop a binary at launch.
+/// can be Gatekeeper or a code-signing check, so it is a `crashed` with a hint.
 pub fn classify_exit(code: Option<i32>, last_error: Option<&str>, os: Os) -> Option<EngineProblem> {
     if code == Some(0) {
         return None;
     }
     let last = last_error.map(str::trim).filter(|line| !line.is_empty());
-    if os == Os::Mac && code.is_none() && last.is_none() {
-        return Some(EngineProblem::new(
-            ProblemCode::Quarantined,
-            blocked_text(os),
-        ));
-    }
     let mut message = format!(
         "The Neuron engine stopped unexpectedly (exit code {}).",
         code.map_or("unknown".to_string(), |code| code.to_string())
@@ -262,6 +256,11 @@ pub fn classify_exit(code: Option<i32>, last_error: Option<&str>, os: Os) -> Opt
     if let Some(line) = last {
         message.push_str(" Last message: ");
         message.push_str(line);
+    }
+    // A signal exit with nothing said is how macOS stops an unapproved binary,
+    // but it is also how an ordinary crash looks: say it as a hint, not a verdict.
+    if os == Os::Mac && code.is_none() {
+        message.push_str(" If this happens every time right at launch, macOS may be blocking it: see Privacy & Security in System Settings.");
     }
     Some(EngineProblem::new(ProblemCode::Crashed, message))
 }
@@ -364,10 +363,20 @@ mod tests {
     }
 
     #[test]
-    fn mac_names_gatekeeper_not_windows() {
+    fn a_silent_signal_exit_on_mac_is_a_crash_with_a_hint() {
         let problem = classify_exit(None, None, Os::Mac).unwrap();
-        assert_eq!(problem.code, ProblemCode::Quarantined);
+        assert_eq!(problem.code, ProblemCode::Crashed);
+        assert!(problem.message.contains("Privacy & Security"));
         assert!(problem.message.contains("macOS") && !problem.message.contains("Windows"));
+        // Other systems get no macOS hint; a plain exit code gets none either.
+        assert!(!classify_exit(None, None, Os::Other)
+            .unwrap()
+            .message
+            .contains("macOS"));
+        assert!(!classify_exit(Some(9), None, Os::Mac)
+            .unwrap()
+            .message
+            .contains("macOS"));
     }
 
     #[test]

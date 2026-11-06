@@ -69,6 +69,23 @@ fn vscode_program() -> Option<PathBuf> {
     }
 }
 
+/// Variables that change how an Electron program runs. VS Code is Electron: with
+/// `ELECTRON_RUN_AS_NODE` set it would run as plain Node and take the file it is
+/// asked to open as a script.
+pub fn is_electron_variable(name: &str) -> bool {
+    name.to_ascii_uppercase().starts_with("ELECTRON_")
+}
+
+/// Takes every `ELECTRON_*` variable out of what the child inherits.
+fn clean_electron_env(command: &mut Command) {
+    for (name, _) in std::env::vars_os() {
+        if name.to_str().is_some_and(is_electron_variable) {
+            command.env_remove(&name);
+        }
+    }
+    command.env_remove("ELECTRON_RUN_AS_NODE");
+}
+
 fn spawn(command: &mut Command) -> Result<(), String> {
     command
         .stdin(Stdio::null())
@@ -79,10 +96,12 @@ fn spawn(command: &mut Command) -> Result<(), String> {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000);
     }
-    command
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    // Reaped on a thread, so no zombie is left behind on unix.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 fn reveal(file: &Path) -> Result<(), String> {
@@ -110,7 +129,9 @@ pub fn open(root: &Path, file: &str) -> Result<(), String> {
     let real = resolve(root, file)?;
     if let Some(program) = vscode_program() {
         // `--` so a path can never be read as an option.
-        if spawn(Command::new(program).arg("--").arg(plain(&real))).is_ok() {
+        let mut command = Command::new(program);
+        clean_electron_env(&mut command);
+        if spawn(command.arg("--").arg(plain(&real))).is_ok() {
             return Ok(());
         }
     }
@@ -198,6 +219,37 @@ mod tests {
         fs::write(install.join("Code.exe"), "").unwrap();
         assert_eq!(vscode_exe_from_shim(&shim), Some(install.join("Code.exe")));
         let _ = fs::remove_dir_all(install);
+    }
+
+    #[test]
+    fn electron_variables_are_recognised() {
+        for name in [
+            "ELECTRON_RUN_AS_NODE",
+            "ELECTRON_NO_ATTACH_CONSOLE",
+            "electron_run_as_node",
+        ] {
+            assert!(is_electron_variable(name), "{name}");
+        }
+        for name in ["PATH", "NOT_ELECTRON_X", "ELECTRON"] {
+            assert!(!is_electron_variable(name), "{name}");
+        }
+    }
+
+    /// The child must not see `ELECTRON_*` variables the app itself was given.
+    #[test]
+    fn a_spawned_program_does_not_inherit_electron_variables() {
+        let mut command = if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            c.args(["/C", "set"]);
+            c
+        } else {
+            Command::new("env")
+        };
+        command.env("ELECTRON_RUN_AS_NODE", "1");
+        clean_electron_env(&mut command);
+        let output = command.output().unwrap();
+        let text = String::from_utf8_lossy(&output.stdout).to_ascii_uppercase();
+        assert!(!text.contains("ELECTRON_RUN_AS_NODE"), "{text}");
     }
 
     #[test]

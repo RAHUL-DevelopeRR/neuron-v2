@@ -180,16 +180,14 @@ pub fn status(root: &Path) -> Result<Option<GitStatusView>, String> {
 
 /// One file's change against HEAD (staged and unstaged), as a unified diff.
 pub fn diff(root: &Path, file: &str) -> Result<String, String> {
-    if file.starts_with('-')
-        || Path::new(file).is_absolute()
-        || file.split(['/', '\\']).any(|part| part == "..")
-    {
-        return Err("That path is outside the workspace.".into());
+    if let Some(problem) = path_problem(file) {
+        return Err(problem.into());
     }
     assert_safe(root)?;
     let head = git(
         root,
         &[
+            "--literal-pathspecs",
             "diff",
             "HEAD",
             "--no-ext-diff",
@@ -206,6 +204,7 @@ pub fn diff(root: &Path, file: &str) -> Result<String, String> {
     let cached = git(
         root,
         &[
+            "--literal-pathspecs",
             "diff",
             "--cached",
             "--no-ext-diff",
@@ -241,6 +240,16 @@ pub fn path_problem(file: &str) -> Option<&'static str> {
     None
 }
 
+/// Git's unmerged status pairs: `DD`, `AU`, `UD`, `UA`, `DU`, `AA`, `UU`, and
+/// anything with a `U` in either column.
+fn is_unmerged(index: &str, worktree: &str) -> bool {
+    matches!(
+        (index, worktree),
+        ("D", "D") | ("A", "U") | ("U", "D") | ("U", "A") | ("D", "U") | ("A", "A") | ("U", "U")
+    ) || index == "U"
+        || worktree == "U"
+}
+
 /// L2: review and git. Puts one changed file back as HEAD has it. A new
 /// (untracked) file is deleted. The path must be one of the files `git status`
 /// lists right now, and must stay inside the open folder.
@@ -262,6 +271,13 @@ pub fn revert(root: &Path, file: &str) -> Result<(), String> {
         .iter()
         .find(|change| change.path == file)
         .ok_or("That file has no changes to revert.")?;
+    let (index, worktree) = (change.index.as_str(), change.worktree.as_str());
+    // A conflicted file is never touched: `git rm -f` would delete it.
+    if is_unmerged(index, worktree) {
+        return Err(
+            "Neuron can't revert a renamed or conflicted file. Use git for this one.".into(),
+        );
+    }
     let target = root.join(file);
     let inside = match std::fs::canonicalize(&target) {
         Ok(real) => real.starts_with(root),
@@ -274,7 +290,6 @@ pub fn revert(root: &Path, file: &str) -> Result<(), String> {
     if !inside {
         return Err("That path is outside the workspace.".into());
     }
-    let (index, worktree) = (change.index.as_str(), change.worktree.as_str());
     if index == "?" {
         // `std::fs` removes the file itself (or a link, never what it points at).
         let meta = std::fs::symlink_metadata(&target).map_err(|error| error.to_string())?;
@@ -283,7 +298,7 @@ pub fn revert(root: &Path, file: &str) -> Result<(), String> {
         }
         return std::fs::remove_file(&target).map_err(|error| error.to_string());
     }
-    if matches!(index, "R" | "C" | "U") || worktree == "U" {
+    if matches!(index, "R" | "C") {
         return Err(
             "Neuron can't revert a renamed or conflicted file. Use git for this one.".into(),
         );
@@ -414,6 +429,103 @@ mod tests {
         let root = fs::canonicalize(&repo).unwrap();
         assert!(revert(&root, "fresh/").is_err());
         assert!(repo.join("fresh/x.txt").exists());
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    /// Two branches that both add `clash.txt` (AA), or both rename `b.txt` apart (DD).
+    fn conflicted(label: &str, rename: bool) -> std::path::PathBuf {
+        let repo = repo_with_changes(label);
+        run(&repo, &["checkout", "-q", "-b", "other"]);
+        if rename {
+            run(&repo, &["mv", "b.txt", "b-other.txt"]);
+        } else {
+            fs::write(
+                repo.join("clash.txt"),
+                "other
+",
+            )
+            .unwrap();
+            run(&repo, &["add", "clash.txt"]);
+        }
+        run(&repo, &["commit", "-q", "-m", "other"]);
+        run(&repo, &["checkout", "-q", "main"]);
+        if rename {
+            run(&repo, &["mv", "b.txt", "b-main.txt"]);
+        } else {
+            fs::write(
+                repo.join("clash.txt"),
+                "main
+",
+            )
+            .unwrap();
+            run(&repo, &["add", "clash.txt"]);
+        }
+        run(&repo, &["commit", "-q", "-m", "main"]);
+        // The merge stops on a conflict: the command itself reports failure.
+        let _ = Command::new("git")
+            .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
+            .args(["merge", "other", "-q", "-m", "merge"])
+            .current_dir(&repo)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        repo
+    }
+
+    #[test]
+    fn revert_refuses_a_both_added_conflict_and_keeps_the_file() {
+        let repo = conflicted("revert-aa", false);
+        let root = fs::canonicalize(&repo).unwrap();
+        let view = status(&root).unwrap().unwrap();
+        let change = view.changes.iter().find(|c| c.path == "clash.txt").unwrap();
+        assert_eq!(
+            (change.index.as_str(), change.worktree.as_str()),
+            ("A", "A")
+        );
+        assert!(revert(&root, "clash.txt")
+            .unwrap_err()
+            .contains("conflicted"));
+        assert!(repo.join("clash.txt").exists());
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn revert_refuses_a_both_deleted_conflict() {
+        let repo = conflicted("revert-dd", true);
+        let root = fs::canonicalize(&repo).unwrap();
+        let view = status(&root).unwrap().unwrap();
+        let change = view.changes.iter().find(|c| c.path == "b.txt").unwrap();
+        assert_eq!(
+            (change.index.as_str(), change.worktree.as_str()),
+            ("D", "D")
+        );
+        assert!(revert(&root, "b.txt").unwrap_err().contains("conflicted"));
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn every_unmerged_pair_is_recognised() {
+        for pair in ["DD", "AU", "UD", "UA", "DU", "AA", "UU", "UM", "MU"] {
+            assert!(is_unmerged(&pair[0..1], &pair[1..2]), "{pair}");
+        }
+        for pair in ["MM", " M", "A ", "??", "D ", " D", "R "] {
+            assert!(!is_unmerged(&pair[0..1], &pair[1..2]), "{pair}");
+        }
+    }
+
+    #[test]
+    fn diff_refuses_pathspec_magic_and_odd_paths() {
+        let repo = repo_with_changes("diff-magic");
+        let root = fs::canonicalize(&repo).unwrap();
+        for bad in [":(top)b.txt", ":/b.txt", "", "/abs", "-x", "a/../b"] {
+            let result = diff(&root, bad);
+            if bad.starts_with(':') {
+                // Not path_problem material, but literal: it matches no file.
+                assert_eq!(result.unwrap(), "", "{bad}");
+            } else {
+                assert!(result.is_err(), "{bad}");
+            }
+        }
         let _ = fs::remove_dir_all(repo);
     }
 

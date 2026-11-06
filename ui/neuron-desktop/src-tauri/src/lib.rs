@@ -73,18 +73,27 @@ impl LaunchOptions {
         }
     }
 
+    /// The `NEURON_DESKTOP_*` development variables, held to the same checks as
+    /// options from the window.
+    fn from_env_values(model: Option<String>, permission_mode: Option<String>) -> Self {
+        Self {
+            model,
+            permission_mode,
+            reasoning_effort: None,
+        }
+        .checked()
+    }
+
     /// What an engine starts with: these options first; the environment is for
     /// development. The one place the options become launch flags.
     fn to_launch(&self) -> Launch {
+        let from_env = Self::from_env_values(
+            std::env::var("NEURON_DESKTOP_MODEL").ok(),
+            std::env::var("NEURON_DESKTOP_PERMISSION_MODE").ok(),
+        );
         Launch {
-            model: self
-                .model
-                .clone()
-                .or_else(|| std::env::var("NEURON_DESKTOP_MODEL").ok()),
-            permission_mode: self
-                .permission_mode
-                .clone()
-                .or_else(|| std::env::var("NEURON_DESKTOP_PERMISSION_MODE").ok()),
+            model: self.model.clone().or(from_env.model),
+            permission_mode: self.permission_mode.clone().or(from_env.permission_mode),
             resume: None,
             reasoning_effort: self.reasoning_effort.clone(), // L3: composer
         }
@@ -116,6 +125,18 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Runs blocking work (git, files, launching programs) off the async command
+/// threads, so one slow call never stalls the others.
+pub(crate) async fn blocking<T, F>(work: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -152,7 +173,7 @@ async fn fs_search(
     chat: Option<String>,
 ) -> Result<Vec<String>, String> {
     let workspace = chats::workspace_for(&state, &registry, chat.as_deref())?;
-    Ok(workspace.search(&query, 50))
+    blocking(move || Ok(workspace.search(&query, 50))).await
 }
 
 /// L3: composer. Copies a pasted or dropped image into the app's staging folder. The
@@ -181,7 +202,8 @@ async fn attachment_stage(
         .app_data_dir()
         .map_err(|error| error.to_string())?
         .join("attachments");
-    workspace::stage_attachment(&dir, &name, &media_type, bytes)
+    let bytes = bytes.to_vec();
+    blocking(move || workspace::stage_attachment(&dir, &name, &media_type, &bytes)).await
 }
 
 /// L3: composer. Saves a chat export where the user says, in the system's save
@@ -210,8 +232,11 @@ async fn export_save(
         return Ok(None);
     };
     let path = picked.into_path().map_err(|error| error.to_string())?;
-    workspace::write_export(&path, &content)?;
-    Ok(Some(path.display().to_string()))
+    blocking(move || {
+        workspace::write_export(&path, &content)?;
+        Ok(Some(path.display().to_string()))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -221,7 +246,7 @@ async fn git_status(
     chat: Option<String>,
 ) -> Result<Option<git::GitStatusView>, String> {
     let workspace = chats::workspace_for(&state, &registry, chat.as_deref())?;
-    git::status(workspace.root())
+    blocking(move || git::status(workspace.root())).await
 }
 
 #[tauri::command]
@@ -232,7 +257,7 @@ async fn git_diff(
     chat: Option<String>,
 ) -> Result<String, String> {
     let workspace = chats::workspace_for(&state, &registry, chat.as_deref())?;
-    git::diff(workspace.root(), &path)
+    blocking(move || git::diff(workspace.root(), &path)).await
 }
 
 #[derive(Clone, Serialize)]
@@ -342,7 +367,7 @@ async fn git_revert(
     chat: Option<String>,
 ) -> Result<(), String> {
     let workspace = chats::workspace_for(&state, &registry, chat.as_deref())?;
-    git::revert(workspace.root(), &path)
+    blocking(move || git::revert(workspace.root(), &path)).await
 }
 
 /// L2: review and git. Opens a file of the chat's folder in VS Code, or shows it in
@@ -355,7 +380,7 @@ async fn open_in_editor(
     chat: Option<String>,
 ) -> Result<(), String> {
     let workspace = chats::workspace_for(&state, &registry, chat.as_deref())?;
-    editor::open(workspace.root(), &path)
+    blocking(move || editor::open(workspace.root(), &path)).await
 }
 
 pub fn run() {
@@ -377,6 +402,17 @@ pub fn run() {
                 Arc::new(ProcessSpawner::default()),
                 Arc::new(chats::WindowEvents(handle)),
             );
+            // Staged images older than a week go (only from the staging folder).
+            if let Ok(data) = app.path().app_data_dir() {
+                let staging = data.join("attachments");
+                std::thread::spawn(move || {
+                    workspace::prune_staged(
+                        &staging,
+                        std::time::SystemTime::now(),
+                        workspace::STAGED_MAX_AGE,
+                    );
+                });
+            }
             chats::start_reaper(Arc::clone(&registry));
             app.manage(registry);
             Ok(())
@@ -529,6 +565,19 @@ mod tests {
         .checked()
         .to_launch();
         assert!(!crate::engine::engine_args(&refused).contains(&"--reasoning-effort".to_string()));
+    }
+
+    #[test]
+    fn launch_options_from_the_environment_are_checked_too() {
+        let refused = LaunchOptions::from_env_values(
+            Some("--dangerously-skip-permissions".into()),
+            Some("bypass".into()),
+        );
+        assert_eq!(refused, LaunchOptions::default());
+        let kept =
+            LaunchOptions::from_env_values(Some(" sonnet ".into()), Some("read-only".into()));
+        assert_eq!(kept.model.as_deref(), Some("sonnet"));
+        assert_eq!(kept.permission_mode.as_deref(), Some("read-only"));
     }
 
     #[test]

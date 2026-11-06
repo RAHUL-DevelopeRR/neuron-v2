@@ -197,10 +197,56 @@ pub fn write_export(path: &Path, content: &str) -> Result<(), String> {
     if content.len() > MAX_EXPORT_BYTES {
         return Err("That chat is too large to save.".to_string());
     }
-    if path.is_dir() {
-        return Err("Pick a file, not a folder.".to_string());
+    let name = path
+        .file_name()
+        .ok_or_else(|| "Pick a file, not a folder.".to_string())?
+        .to_string_lossy()
+        .into_owned();
+    // Written beside the target and renamed over it, so a failed or cut-short
+    // write never leaves half a file where the user's file was.
+    let temp = path.with_file_name(format!(".{name}.neuron-{}.tmp", std::process::id()));
+    if let Err(error) = fs::write(&temp, content) {
+        let _ = fs::remove_file(&temp);
+        return Err(error.to_string());
     }
-    fs::write(path, content).map_err(|error| error.to_string())
+    fs::rename(&temp, path).map_err(|error| {
+        let _ = fs::remove_file(&temp);
+        if path.is_dir() {
+            "Pick a file, not a folder.".to_string()
+        } else {
+            error.to_string()
+        }
+    })
+}
+
+/// How long a staged image stays in the app's staging folder.
+pub const STAGED_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Deletes files in the staging folder `dir` last changed more than `max_age`
+/// before `now`. Only plain files directly inside `dir`: folders and links are
+/// left alone, and nothing outside `dir` is ever touched. Returns how many went.
+pub fn prune_staged(dir: &Path, now: std::time::SystemTime, max_age: std::time::Duration) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let Ok(meta) = fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > max_age);
+        if old && fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 #[derive(Debug, Clone)]
@@ -561,7 +607,51 @@ mod tests {
         assert_eq!(fs::read_to_string(&file).unwrap(), "second");
         assert!(write_export(&file, &"x".repeat(MAX_EXPORT_BYTES + 1)).is_err());
         assert!(write_export(&dir, "x").is_err());
+        // Nothing but the file is left behind, not even on a refused write.
+        let names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 1, "{names:?}");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn staged_images_older_than_a_week_are_pruned_and_nothing_else() {
+        use std::time::{Duration, SystemTime};
+        let base = staging_dir();
+        let staging = base.join("attachments");
+        fs::create_dir_all(staging.join("sub")).unwrap();
+        let outside = base.join("outside.png");
+        fs::write(&outside, "keep").unwrap();
+        let age = |path: &Path, days: u64| {
+            let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+            file.set_modified(SystemTime::now() - Duration::from_secs(days * 86_400))
+                .unwrap();
+        };
+        for (name, days) in [("old.png", 8), ("older.png", 30), ("fresh.png", 1)] {
+            fs::write(staging.join(name), "x").unwrap();
+            age(&staging.join(name), days);
+        }
+        fs::write(staging.join("sub/inner.png"), "x").unwrap();
+        age(&staging.join("sub/inner.png"), 30);
+        age(&outside, 30);
+
+        let removed = prune_staged(&staging, SystemTime::now(), STAGED_MAX_AGE);
+        assert_eq!(removed, 2);
+        assert!(!staging.join("old.png").exists());
+        assert!(!staging.join("older.png").exists());
+        assert!(staging.join("fresh.png").exists());
+        assert!(
+            staging.join("sub/inner.png").exists(),
+            "folders are left alone"
+        );
+        assert!(outside.exists(), "nothing outside the staging folder");
+        assert_eq!(
+            prune_staged(&base.join("missing"), SystemTime::now(), STAGED_MAX_AGE),
+            0
+        );
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
