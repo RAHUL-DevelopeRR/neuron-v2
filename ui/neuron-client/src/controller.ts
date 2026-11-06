@@ -8,6 +8,7 @@ import {
   CAPABILITY_QUESTIONS,
   FEATURE_CAPABILITIES,
   type Attachment,
+  type RewindMode,
   type SessionScope,
   type ClientMessage,
   type PermissionDecision,
@@ -44,17 +45,24 @@ export interface EngineTransport {
 export interface ControllerOptions {
   /** This UI's name for the engine (`desktop`, `mobile`): other Neuron UIs see which one has a session open. */
   client?: string
+  /** What this UI renders, sent as its `capabilities`. Default: `questions` only, as the mobile app and remote host need. */
+  capabilities?: readonly string[]
+  /** The clock that stamps events as they are received (ms). Default `Date.now`. */
+  now?: () => number
 }
 
 export class SessionController {
   private state: SessionState = initialSession()
   private listeners = new Set<() => void>()
   private unsubscribers: Array<() => void> = []
+  private readonly now: () => number
 
   constructor(
     readonly transport: EngineTransport,
     options: ControllerOptions = {},
   ) {
+    this.now = options.now ?? Date.now
+    const capabilities = [...(options.capabilities ?? [CAPABILITY_QUESTIONS])]
     this.unsubscribers.push(
       transport.subscribe((action) => {
         this.apply(action)
@@ -64,8 +72,8 @@ export class SessionController {
           transport.send(
             commandMessage(
               options.client
-                ? { type: 'capabilities', features: [CAPABILITY_QUESTIONS], client: options.client }
-                : { type: 'capabilities', features: [CAPABILITY_QUESTIONS] },
+                ? { type: 'capabilities', features: capabilities, client: options.client }
+                : { type: 'capabilities', features: capabilities },
             ),
           )
         }
@@ -89,7 +97,7 @@ export class SessionController {
 
   /** Applies an action to the state and tells the subscribers. */
   apply(action: SessionAction): void {
-    const next = reduceSession(this.state, action)
+    const next = reduceSession(this.state, action, this.now())
     if (next === this.state) return
     this.state = next
     for (const listener of [...this.listeners]) listener()
@@ -171,6 +179,48 @@ export class SessionController {
    */
   command(name: string, args = ''): void {
     this.transport.send(commandMessage({ type: 'slash', command: name.replace(/^\//, ''), args }))
+  }
+
+  /**
+   * `/diff [path]`, not shown as a message (feature `git_views`): the `diff` event
+   * follows, in `state.diff`.
+   */
+  requestDiff(path?: string): void {
+    this.command('diff', path ?? '')
+  }
+
+  /** `/rewind`, not shown as a message (feature `checkpoints`): `state.checkpoints` follows. */
+  requestCheckpoints(): void {
+    this.command('rewind')
+  }
+
+  /** `/commit` with no message, not shown as a message (feature `git_views`): `state.commitProposal` follows. */
+  proposeCommit(): void {
+    this.command('commit')
+  }
+
+  /** Commits with this message (feature `git_views`): what is staged, or everything when nothing is. The proposal is done with. */
+  commit(message: string): void {
+    this.transport.send(commandMessage({ type: 'commit', message }))
+    this.local({ type: 'local/commit_sent', message })
+  }
+
+  /** Closes the commit proposal without committing. */
+  dismissCommit(): void {
+    this.local({ type: 'local/commit_dismissed' })
+  }
+
+  /**
+   * Goes back to a checkpoint from `state.checkpoints` (feature `checkpoints`);
+   * `state.rewound` follows. With `dryRun` it reports what it would do and changes nothing.
+   */
+  rewind(checkpoint: number, mode: RewindMode, dryRun = false): void {
+    this.transport.send(commandMessage({ type: 'rewind', checkpoint, mode, dry_run: dryRun }))
+  }
+
+  /** Turns an MCP server on or off (feature `mcp_toggle`); a fresh `state.extensions` follows. */
+  setMcpServerEnabled(name: string, enabled: boolean): void {
+    this.transport.send(commandMessage({ type: 'set_mcp_server_enabled', name, enabled }))
   }
 
   /** A fresh chat in the same engine. */

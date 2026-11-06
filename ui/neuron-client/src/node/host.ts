@@ -222,7 +222,7 @@ export class NeuronHost {
   /** Applies an action to the host's session and sends it to every client. */
   private record(action: SessionAction): void {
     this.seq += 1
-    this.state = reduceSession(this.state, action)
+    this.state = reduceSession(this.state, action, Date.now())
     this.broadcast({ t: 'action', seq: this.seq, action })
   }
 
