@@ -115,7 +115,7 @@ jobs:
               dict(name='windows-x64', runner='windows-2022', test_runner='windows-2022',
                    target='x86_64-pc-windows-msvc', rust_targets='x86_64-pc-windows-msvc', sidecar='x86_64-pc-windows-msvc',
                    bundles='nsis,msi' if platforms == 'all' else 'nsis', updater='windows-x86_64'),
-              dict(name='macos-universal', runner='macos-14', test_runner='macos-14',
+              dict(name='macos-universal', runner='macos-15', test_runner='macos-15',
                    target='universal-apple-darwin', rust_targets='aarch64-apple-darwin,x86_64-apple-darwin', sidecar='universal-apple-darwin',
                    bundles='app,dmg', updater='darwin-aarch64,darwin-x86_64'),
               # Built on 22.04 for an older glibc floor, installed on 24.04.
