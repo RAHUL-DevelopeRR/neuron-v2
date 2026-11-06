@@ -19,6 +19,10 @@ export const trustCopy = {
   access: 'Neuron will be able to open, change and run files in this folder.',
   turnsOnHeading: 'This project also wants to turn on:',
   turnsOnNothing: 'This project does not turn on any hooks, MCP servers or permission rules.',
+  /** Shown when the folder was trusted before and its hooks, MCP servers or rules changed. */
+  changed: 'Its hooks, MCP servers or permission rules changed since you trusted this folder.',
+  /** Above the exact commands and rules the folder asks about. */
+  exactHeading: 'Exactly what it would run or allow:',
   caution: 'Continue only if you created this project or trust where it came from.',
   whyLabel: 'Why this matters:',
   /** `TRUST_DOCS_URL` as it is shown. */
@@ -108,6 +112,32 @@ export function trustPreviewLines(preview: TrustPreviewEvent): string[] {
   }
   if (preview.other_settings.length > 0) {
     lines.push(`Other settings: ${preview.other_settings.join(', ')}`)
+  }
+  return lines
+}
+
+/**
+ * What the folder would run or allow, one line each and in full: every hook
+ * command, MCP server command line and allow or ask rule, so Allow is not
+ * given blind. The text comes from the project's own files: a surface that
+ * draws it to a terminal cleans it of control characters first.
+ */
+export function trustDetailLines(
+  preview: TrustPreviewEvent,
+  options: { mcp?: boolean } = {},
+): string[] {
+  const lines: string[] = []
+  for (const hook of preview.hooks) {
+    const matcher = hook.matcher ? ` [${hook.matcher}]` : ''
+    lines.push(`hook ${hook.event}${matcher}: ${hook.command}`)
+  }
+  if (options.mcp !== false) {
+    for (const server of preview.mcp_servers) {
+      lines.push(`MCP server ${server.name}: ${server.command ?? server.target ?? ''}`)
+    }
+  }
+  for (const rule of preview.permission_rules) {
+    lines.push(`${rule.effect} rule: ${rule.rule}`)
   }
   return lines
 }
