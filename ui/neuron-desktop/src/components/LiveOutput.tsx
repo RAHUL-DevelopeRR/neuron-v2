@@ -30,6 +30,7 @@ export const LiveOutput = memo(function LiveOutput({ live }: { live: Live | null
       className="live-output"
       role="region"
       aria-label="Live output"
+      aria-live="off"
       tabIndex={0}
       onScroll={(event) => {
         const el = event.currentTarget
