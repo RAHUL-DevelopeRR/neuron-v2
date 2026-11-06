@@ -7,7 +7,7 @@ import {
   type UiEvent,
 } from '@neuron/client'
 
-import type { DirListing, FileContent, GitStatusView, LaunchOptions, Platform, Project, TerminalSession, UpdateInfo } from '../src/platform'
+import type { DirListing, EngineInfo, FileContent, GitStatusView, LaunchOptions, Platform, Project, TerminalSession, UpdateInfo } from '../src/platform'
 import type { Settings } from '../src/settings'
 
 export const ALL_FEATURES = [
@@ -102,6 +102,11 @@ export interface FakePlatform extends Platform {
   /** How many times the updater was asked. */
   checks: number
   saved: Map<string, unknown>
+  // L5: extensions and resilience
+  /** What `engineInfo()` returns; `null` is a browser build. */
+  engine: EngineInfo | null
+  /** What `hostDiagnostics()` returns. */
+  hostReport: string | null
 }
 
 export interface FakePlatformOptions {
@@ -110,6 +115,9 @@ export interface FakePlatformOptions {
   update?: UpdateInfo | null
   /** A build without an updater key: updates come from the releases page. */
   manualUpdates?: boolean
+  // L5: extensions and resilience
+  engine?: EngineInfo | null
+  hostReport?: string | null
 }
 
 /** A platform over a {@link FakeEngine} and a small in-memory workspace with git. */
@@ -132,6 +140,8 @@ export function fakePlatform(engine: FakeEngine, options: FakePlatformOptions = 
     checks: 0,
     manualUpdates: options.manualUpdates ?? false,
     saved,
+    engine: options.engine === undefined ? { source: 'bundled', path: '/app/neuron', bundledPath: '/app/neuron', bundledPresent: true } : options.engine,
+    hostReport: options.hostReport === undefined ? ['App version: 0.2.0', 'OS: windows x86_64'].join('\n') : options.hostReport,
     store: {
       get: async <T,>(key: string) => saved.get(key) as T | undefined,
       set: async (key, value) => void saved.set(key, value),
@@ -198,6 +208,9 @@ export function fakePlatform(engine: FakeEngine, options: FakePlatformOptions = 
     openExternal(url: string) {
       platform.opened.push(url)
     },
+    // L5: extensions and resilience
+    engineInfo: async () => platform.engine,
+    hostDiagnostics: async () => platform.hostReport,
   }
   return platform
 }

@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 
 import type { GatewayProblem } from '@neuron/client'
 
+import type { EngineProblem, EngineProblemCode } from '../engineProblems'
 import { LINKS } from '../links'
 
 export interface ProblemActions {
@@ -104,6 +105,75 @@ export function ProblemCard({ problem, actions }: { problem: GatewayProblem; act
         <code>{problem.message}</code>
       </details>
       {buttons && <div className="dialog-buttons">{buttons}</div>}
+    </section>
+  )
+}
+
+export interface EngineProblemActions {
+  /** Starts the engine again; absent where the app cannot. */
+  onRestart?: () => void
+  /** Puts the support report on the clipboard. */
+  onCopyDiagnostics: () => Promise<void>
+  onOpenLink: (url: string) => void
+}
+
+const ENGINE_TITLE: Record<EngineProblemCode, string> = {
+  missing: "Neuron's engine is missing",
+  quarantined: 'Security software blocked the engine',
+  denied: 'The engine is not allowed to run',
+  crashed: 'The engine stopped unexpectedly',
+  failed: 'The engine could not start',
+  restart_failed: 'The engine did not restart',
+}
+
+/** What to do, for the cases whose message does not already say. */
+const ENGINE_HINT: Partial<Record<EngineProblemCode, string>> = {
+  crashed: 'Try again. If it keeps happening, copy the diagnostics and send them with your report.',
+  failed: 'Try again, or reinstall Neuron if it keeps happening.',
+  restart_failed: 'Try again, or reinstall Neuron if it keeps happening.',
+}
+
+/** L5: an engine problem as a card: what happened, and what to do about it. */
+export function EngineProblemCard({ problem, actions }: { problem: EngineProblem; actions: EngineProblemActions }) {
+  const [copied, setCopied] = useState(false)
+  const title = ENGINE_TITLE[problem.code]
+  const copy = () => {
+    void actions.onCopyDiagnostics().then(
+      () => {
+        setCopied(true)
+        setTimeout(() => setCopied(false), 1500)
+      },
+      () => {},
+    )
+  }
+  return (
+    <section className={`problem-card problem-${problem.code}`} role="alert" aria-label={title}>
+      <h3>{title}</h3>
+      {problem.code === 'crashed' ? (
+        <>
+          <p>The Neuron engine stopped on its own{problem.exitCode ? ` (exit code ${problem.exitCode})` : ''}.</p>
+          {problem.lastMessage && (
+            <p className="muted small">
+              Its last message: <code>{problem.lastMessage}</code>
+            </p>
+          )}
+        </>
+      ) : (
+        <p>{problem.message}</p>
+      )}
+      {ENGINE_HINT[problem.code] && <p>{ENGINE_HINT[problem.code]}</p>}
+      <div className="dialog-buttons">
+        {actions.onRestart && (
+          <button className="primary" onClick={actions.onRestart}>
+            Try again
+          </button>
+        )}
+        <button onClick={copy}>Copy diagnostics</button>
+        <External label="Open help" url={LINKS.help} onOpen={actions.onOpenLink} />
+        <span className="muted small" role="status">
+          {copied ? 'Copied' : ''}
+        </span>
+      </div>
     </section>
   )
 }

@@ -4,6 +4,7 @@
 //! panes, and remembers recent projects. The agent lives in the engine; the
 //! window is the React app in `../src`.
 
+pub mod diagnostics; // L5: extensions and resilience
 pub mod engine;
 pub mod git;
 pub mod projects;
@@ -140,9 +141,7 @@ fn launch(
         old.stop();
     }
     let workspace = lock(&state.workspace).clone();
-    let binary = engine::resolve_binary().ok_or(
-        "Could not find the `neuron` binary. Install Neuron, or set NEURON_BIN to its path.",
-    )?;
+    let binary = engine::resolve_binary().ok_or_else(|| diagnostics::missing_problem().render())?;
     let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
     // Settings first; the environment is for development.
     let options = lock(&state.options).clone();
@@ -396,6 +395,18 @@ fn open_external(url: String) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+/// L5: which engine would run (`env`, `bundled`, `path` or `missing`).
+#[tauri::command]
+fn engine_info() -> diagnostics::EngineInfo {
+    diagnostics::current_engine_info()
+}
+
+/// L5: the host's part of the support report (no account data, no environment).
+#[tauri::command]
+fn diagnostics(app: AppHandle) -> String {
+    diagnostics::current_diagnostics(&app.package_info().version.to_string())
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -432,7 +443,9 @@ pub fn run() {
             term_write,
             term_resize,
             term_close,
-            open_external
+            open_external,
+            engine_info, // L5: extensions and resilience
+            diagnostics
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {

@@ -9,24 +9,54 @@ const STATUS_LABEL: Record<string, string> = {
   pending: 'no tools',
   unsupported: 'unsupported',
   not_started: 'not started',
+  disabled: 'off',
 }
 
 /** How often the panel asks again while a server is still starting. */
 const STARTING_REFRESH_MS = 2_000
 
-function McpServerRow({ server }: { server: McpServerInfo }) {
+/** Whether the engine reports this server as turned off. */
+const isOff = (server: McpServerInfo) => server.enabled === false || server.status === 'disabled'
+
+/** How long a switch waits for the engine's fresh list before it shows what the list says. */
+const PENDING_MS = 6_000
+
+interface Toggle {
+  /** The state asked for while the engine has not confirmed it; `undefined` when idle. */
+  pending: boolean | undefined
+  onToggle: (enabled: boolean) => void
+}
+
+function McpServerRow({ server, toggle }: { server: McpServerInfo; toggle: Toggle | null }) {
   const [open, setOpen] = useState(false)
+  const off = isOff(server)
   const detail = server.error ?? (server.tools.length ? server.tools.join(', ') : null)
   return (
     <li className="extension-row">
       <button className="tree-row extension-head" onClick={() => detail && setOpen(!open)} aria-expanded={detail ? open : undefined}>
-        <span className={`extension-status status-${server.status}`}>{STATUS_LABEL[server.status] ?? server.status}</span>
+        <span className={`extension-status status-${off ? 'disabled' : server.status}`}>{off ? 'off' : (STATUS_LABEL[server.status] ?? server.status)}</span>
         <span className="extension-name">{server.name}</span>
         <span className="muted small">
           {server.scope} · {server.transport}
-          {server.status === 'ready' && ` · ${server.tools.length} tool${server.tools.length === 1 ? '' : 's'}`}
+          {server.status === 'ready' && !off && ` · ${server.tools.length} tool${server.tools.length === 1 ? '' : 's'}`}
         </span>
       </button>
+      {toggle && (
+        <button
+          role="switch"
+          className="extension-toggle"
+          aria-label={server.name}
+          aria-checked={toggle.pending === undefined ? !off : toggle.pending}
+          aria-busy={toggle.pending !== undefined || undefined}
+          disabled={toggle.pending !== undefined}
+          onClick={() => toggle.onToggle(off)}
+        >
+          <span className="switch-track" aria-hidden>
+            <span className="switch-thumb" />
+          </span>
+          <span className="muted small">{toggle.pending === undefined ? (off ? 'Off' : 'On') : toggle.pending ? 'Turning on…' : 'Turning off…'}</span>
+        </button>
+      )}
       {open && detail && <div className={server.error ? 'error-line small extension-detail' : 'muted small extension-detail'}>{detail}</div>}
     </li>
   )
@@ -66,8 +96,38 @@ function Definitions({ title, items, empty, query }: { title: string; items: Def
  * plugins, skills and agent definitions. Read-only; settings.json and the skill and
  * agent folders are where they are added.
  */
-export function ExtensionsPanel({ extensions, onRefresh }: { extensions: Extensions | null; onRefresh: () => void }) {
+export function ExtensionsPanel({
+  extensions,
+  onRefresh,
+  onSetEnabled,
+}: {
+  extensions: Extensions | null
+  onRefresh: () => void
+  /** Turns a server on or off (feature `mcp_toggle`); absent means no switches. */
+  onSetEnabled?: (name: string, enabled: boolean) => void
+}) {
   const [filter, setFilter] = useState('')
+  // Servers just switched, with the state asked for, until the fresh list shows it.
+  const [pending, setPending] = useState<Record<string, boolean>>({})
+  const [toggled, setToggled] = useState(false)
+  useEffect(() => {
+    if (!extensions) return
+    const settled = Object.keys(pending).filter((name) => {
+      const server = extensions.mcpServers.find((candidate) => candidate.name === name)
+      return !server || !isOff(server) === pending[name]
+    })
+    if (settled.length) setPending((current) => Object.fromEntries(Object.entries(current).filter(([name]) => !settled.includes(name))))
+  }, [extensions, pending])
+  useEffect(() => {
+    if (!Object.keys(pending).length) return
+    const timer = setTimeout(() => setPending({}), PENDING_MS)
+    return () => clearTimeout(timer)
+  }, [pending])
+  const setEnabled = (name: string, enabled: boolean) => {
+    setPending((current) => ({ ...current, [name]: enabled }))
+    setToggled(true)
+    onSetEnabled?.(name, enabled)
+  }
   useEffect(() => {
     onRefresh()
   }, [onRefresh])
@@ -100,6 +160,11 @@ export function ExtensionsPanel({ extensions, onRefresh }: { extensions: Extensi
           Refresh
         </button>
       </div>
+      {onSetEnabled && mcpServers.length > 0 && (
+        <div className="muted small pad" role="status">
+          {toggled ? 'A change applies from your next message.' : 'Turn a server off to stop the engine using it. A change applies from your next message.'}
+        </div>
+      )}
       {mcpServers.length === 0 ? (
         <div className="muted pad">
           None configured. Add servers under <code>mcpServers</code> in your Neuron settings.json.
@@ -109,7 +174,11 @@ export function ExtensionsPanel({ extensions, onRefresh }: { extensions: Extensi
       ) : (
         <ul className="extensions" aria-label="MCP servers">
           {servers.map((server) => (
-            <McpServerRow key={server.name} server={server} />
+            <McpServerRow
+              key={server.name}
+              server={server}
+              toggle={onSetEnabled ? { pending: pending[server.name], onToggle: (enabled) => setEnabled(server.name, enabled) } : null}
+            />
           ))}
         </ul>
       )}
