@@ -39,6 +39,7 @@ import { buildDiagnostics, engineProblemFor, parseEngineProblem } from './engine
 import { useSession } from './hooks'
 import { LINKS } from './links'
 import type { EngineInfo, LaunchOptions, Platform, Project, UpdateInfo } from './platform'
+import { safeExternalUrl } from './platform/links'
 import { noteSeen, sessionRows, type SessionRow } from './sessions'
 import { useSeen, useSettings, type Settings } from './settings'
 
@@ -335,7 +336,10 @@ export function App({ platform }: { platform: Platform }) {
     (state.items.find((item) => item.kind === 'user') as Extract<TranscriptItem, { kind: 'user' }> | undefined)?.text.split('\n')[0] ??
     'New session'
 
-  const openLink = (url: string) => platform.openExternal(url)
+  const openLink = (url: string) => {
+    const safe = safeExternalUrl(url)
+    if (safe) platform.openExternal(safe)
+  }
   const signInNow = () => {
     setView('chat')
     controller?.slash('login')

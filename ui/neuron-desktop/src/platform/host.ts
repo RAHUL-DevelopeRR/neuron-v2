@@ -3,6 +3,7 @@
 import { DESKTOP_CAPABILITIES, SessionController, WebSocketTransport, type SocketLike } from '@neuron/client'
 
 import { browserStore } from './store'
+import { safeExternalUrl } from './links'
 import type { DirListing, FileContent, GitStatusView, Platform, Project, TerminalSession } from './types'
 
 export interface HostPlatformOptions {
@@ -90,7 +91,10 @@ export function hostPlatform(options: HostPlatformOptions): Platform {
         },
       }
     },
-    openExternal: (url) => window.open(url, '_blank', 'noopener,noreferrer'),
+    openExternal: (url) => {
+      const safe = safeExternalUrl(url)
+      if (safe) window.open(safe, '_blank', 'noopener,noreferrer')
+    },
     // L5: extensions and resilience. The engine is behind a host here; the app does not choose it.
     engineInfo: async () => null,
     hostDiagnostics: async () => null,
