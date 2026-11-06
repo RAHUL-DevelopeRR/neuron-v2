@@ -387,3 +387,41 @@ describe('NeuronHost', () => {
     fs.rmSync(parent, { recursive: true, force: true })
   })
 })
+
+describe('NeuronHost policy for peers', () => {
+  async function sendRaw(messages: unknown[]) {
+    const errors: string[] = []
+    const socket = new WebSocket(host!.url)
+    socket.onopen = () => {
+      socket.send(JSON.stringify({ t: 'hello', protocol: 1, token: TOKEN, client: { name: 'raw', kind: 'cli' } }))
+      for (const message of messages) socket.send(JSON.stringify({ t: 'send', message }))
+    }
+    socket.onmessage = (event) => {
+      const frame = JSON.parse(String(event.data)) as HostFrame
+      if (frame.t === 'error') errors.push(frame.message)
+    }
+    await until('the refusals', () => errors.length >= messages.length)
+    socket.close()
+    return errors
+  }
+
+  test('peers cannot commit, rewind for real or switch MCP servers', async () => {
+    await startHost()
+    const errors = await sendRaw([
+      { kind: 'command', type: 'commit', message: 'x' },
+      { kind: 'command', type: 'rewind', checkpoint: 1, mode: 'code_only' },
+      { kind: 'command', type: 'rewind', checkpoint: 1, mode: 'code_only', dry_run: false },
+      { kind: 'command', type: 'set_mcp_server_enabled', name: 'fs', enabled: false },
+    ])
+    expect(errors).toHaveLength(4)
+    expect(engine.sent).toEqual([])
+  })
+
+  test('peers may preview a rewind', async () => {
+    await startHost()
+    const peer = await attach('mobile')
+    peer.transport.send({ kind: 'command', type: 'rewind', checkpoint: 1, mode: 'code_only', dry_run: true })
+    await until('the preview', () => engine.sent.length === 1)
+    expect(engine.sent[0]).toEqual({ kind: 'command', type: 'rewind', checkpoint: 1, mode: 'code_only', dry_run: true })
+  })
+})
