@@ -9,12 +9,21 @@ import type {
   AccountDetails,
   AccountInfo,
   Attachment,
+  ChangedFile,
+  CheckpointInfo,
+  CommitProposalEvent,
   DefinitionInfo,
+  DiffEvent,
   McpServerInfo,
   ModelInfo,
+  NoticeKind,
+  OutputStream,
   PermissionDecision,
   PermissionView,
   PluginInfo,
+  ReportLink,
+  ReportSection,
+  RewoundEvent,
   SessionSummary,
   SignInCodeEvent,
   StatusEvent,
@@ -25,9 +34,28 @@ import type {
   UiEvent,
 } from './protocol'
 import { gatewayProblem, type GatewayProblem } from './gateway'
-import { toolView, withResult, type ToolView } from './tools'
+import { relativeTo, toolView, withResult, type ToolView } from './tools'
 
-export type ToolState = 'running' | 'awaiting_permission' | 'done' | 'error' | 'denied' | 'cut_off'
+/** `writing`: the model is still writing the call's input (`tool_input_started`). */
+export type ToolState = 'writing' | 'running' | 'awaiting_permission' | 'done' | 'error' | 'denied' | 'cut_off'
+
+/** The most characters of a running command's output a tool item keeps. */
+export const LIVE_OUTPUT_LIMIT = 64 * 1024
+
+/** What a running command printed so far, from `tool_output_delta` events. */
+export interface LiveOutput {
+  chunks: Array<{ stream: OutputStream; text: string }>
+  /** Characters dropped from the front to stay within {@link LIVE_OUTPUT_LIMIT}. */
+  dropped: number
+}
+
+/** How far the model got writing a call's input (`tool_input_progress`). */
+export interface ToolInputProgress {
+  bytes: number
+  lines: number
+  target: string | null
+  preview: string | null
+}
 
 /** The sub-agent an `Agent` call runs. */
 export interface Subagent {
@@ -41,7 +69,14 @@ export interface Subagent {
 }
 
 export type TranscriptItem =
-  | { kind: 'user'; key: string; text: string; attachments: Attachment[] }
+  | {
+      kind: 'user'
+      key: string
+      text: string
+      attachments: Attachment[]
+      /** Sent as a prompt that started a turn (not a slash command or an answer). Absent from items built before the flag. */
+      prompt?: boolean
+    }
   | { kind: 'assistant'; key: string; text: string; streaming: boolean }
   | { kind: 'reasoning'; key: string; text: string; chars: number | null; redacted: boolean; streaming: boolean }
   | {
@@ -56,8 +91,17 @@ export type TranscriptItem =
       output: string | null
       permissionId: number | null
       subagent?: Subagent
+      /** While the model writes the input (state `writing`), and after. */
+      progress?: ToolInputProgress | null
+      /** What a running shell command printed so far. */
+      live?: LiveOutput | null
+      /** When the call appeared (ms, the time its first event was received); null when unknown. */
+      startedAt?: number | null
+      /** When its result arrived (ms); null while it has none. */
+      endedAt?: number | null
     }
-  | { kind: 'notice'; key: string; text: string }
+  | { kind: 'notice'; key: string; text: string; noticeKind?: NoticeKind }
+  | { kind: 'report'; key: string; command: string; title: string; sections: ReportSection[]; links: ReportLink[] }
   | {
       kind: 'question'
       key: string
@@ -121,6 +165,18 @@ export interface SessionState {
   items: TranscriptItem[]
   permissions: PendingPermission[]
   usage: { turn: TokenCounts; cumulative: TokenCounts; estimated: boolean } | null
+  /** The turn as it streams (feature `live_progress`); kept after the turn ends, reset by the next one. */
+  turnProgress: { outputTokens: number; requests: TokenCounts[] } | null
+  /** Every file the agent changed this session; null until a `changes` event. */
+  changes: ChangedFile[] | null
+  /** The last `/diff` answer. */
+  diff: DiffEvent | null
+  /** A drafted commit, until it is sent or dismissed. */
+  commitProposal: CommitProposalEvent | null
+  /** The "go back to" list, once asked for (`/rewind`). */
+  checkpoints: CheckpointInfo[] | null
+  /** The last rewind answer: a dry-run preview or a real rewind. */
+  rewound: RewoundEvent | null
   /** The latest gateway failure, until the next prompt or sign-in. */
   problem: GatewayProblem | null
   /**
@@ -151,6 +207,12 @@ export const initialSession = (): SessionState => ({
   items: [],
   permissions: [],
   usage: null,
+  turnProgress: null,
+  changes: null,
+  diff: null,
+  commitProposal: null,
+  checkpoints: null,
+  rewound: null,
   problem: null,
   unsent: null,
   nextKey: 1,
@@ -167,6 +229,10 @@ export type LocalAction =
   | { type: 'local/permission_resolved'; id: number }
   /** The structured question with this id was answered. */
   | { type: 'local/answered'; id: number; text: string }
+  /** The commit command was sent: the proposal is done with. */
+  | { type: 'local/commit_sent'; message: string }
+  /** The user closed the commit proposal without committing. */
+  | { type: 'local/commit_dismissed' }
   /** Another project: nothing of the old session carries over. */
   | { type: 'local/reset' }
 
@@ -210,7 +276,66 @@ function closeStreams(items: TranscriptItem[]): TranscriptItem[] {
   return items
 }
 
-export function reduceSession(state: SessionState, action: SessionAction): SessionState {
+type ToolItem = Extract<TranscriptItem, { kind: 'tool' }>
+
+/** The views the engine's git and checkpoint answers fill; a new session or engine starts without them. */
+const NO_GIT_VIEWS = { changes: null, diff: null, commitProposal: null, checkpoints: null, rewound: null } as const
+
+const isPrompt = (item: TranscriptItem): boolean =>
+  item.kind === 'user' && (item.prompt ?? !item.text.startsWith('/'))
+
+/** The transcript after a real rewind: the last `removedTurns` prompts are gone, with everything after them. */
+function dropRewoundTurns(items: TranscriptItem[], removedTurns: number): TranscriptItem[] {
+  if (removedTurns <= 0) return items
+  const prompts: number[] = []
+  items.forEach((item, index) => {
+    if (isPrompt(item)) prompts.push(index)
+  })
+  if (prompts.length === 0) return items
+  return items.slice(0, prompts[Math.max(0, prompts.length - removedTurns)])
+}
+
+/** `live` with one more chunk, kept within {@link LIVE_OUTPUT_LIMIT} by dropping from the front. */
+function appendLive(live: LiveOutput | null | undefined, stream: OutputStream, text: string): LiveOutput {
+  const chunks = live ? live.chunks.slice() : []
+  let dropped = live?.dropped ?? 0
+  const tail = chunks[chunks.length - 1]
+  if (tail && tail.stream === stream) chunks[chunks.length - 1] = { stream, text: tail.text + text }
+  else chunks.push({ stream, text })
+  let excess = chunks.reduce((sum, chunk) => sum + chunk.text.length, 0) - LIVE_OUTPUT_LIMIT
+  while (excess > 0 && chunks.length > 0) {
+    const head = chunks[0]
+    if (head.text.length <= excess) {
+      chunks.shift()
+      excess -= head.text.length
+      dropped += head.text.length
+    } else {
+      chunks[0] = { stream: head.stream, text: head.text.slice(excess) }
+      dropped += excess
+      excess = 0
+    }
+  }
+  return { chunks, dropped }
+}
+
+/** The tool call this id names, with its index. */
+function findTool(items: readonly TranscriptItem[], id: string): { index: number; item: ToolItem } | null {
+  const index = findLastIndex(items, (item) => item.kind === 'tool' && item.id === id)
+  return index < 0 ? null : { index, item: items[index] as ToolItem }
+}
+
+const closeOpenTools = (items: TranscriptItem[]): TranscriptItem[] =>
+  items.map((item) =>
+    item.kind === 'tool' && (item.state === 'writing' || item.state === 'running' || item.state === 'awaiting_permission')
+      ? { ...item, state: 'error' as const }
+      : item,
+  )
+
+/**
+ * `now` is the time (ms) the action was received: it stamps tool calls. The
+ * reducer reads no clock itself, so the same actions and times give the same state.
+ */
+export function reduceSession(state: SessionState, action: SessionAction, now?: number): SessionState {
   switch (action.type) {
     // -------------------------------------------------------------- local
     case 'local/connecting':
@@ -219,7 +344,7 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
       return { ...initialSession(), nextKey: state.nextKey }
     case 'local/disconnected': {
       const items = closeStreams(state.items).map((item) =>
-        item.kind === 'tool' && (item.state === 'running' || item.state === 'awaiting_permission')
+        item.kind === 'tool' && (item.state === 'writing' || item.state === 'running' || item.state === 'awaiting_permission')
           ? { ...item, state: 'error' as const, output: item.output ?? 'The engine stopped before this call finished.' }
           : item,
       )
@@ -233,13 +358,20 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
         const question = state.items[unanswered] as Extract<TranscriptItem, { kind: 'question' }>
         next = { ...state, items: replaceAt(state.items, unanswered, { ...question, answered: true }) }
       }
-      next = push({ ...next, problem: null, unsent: null }, { kind: 'user', text: action.text, attachments: action.attachments ?? [] })
-      return unanswered >= 0 ? next : { ...next, busy: true }
+      next = push(
+        { ...next, problem: null, unsent: null },
+        { kind: 'user', text: action.text, attachments: action.attachments ?? [], prompt: unanswered < 0 },
+      )
+      return unanswered >= 0 ? next : { ...next, busy: true, turnProgress: null }
     }
     case 'local/slash':
       return {
-        ...push({ ...state, problem: null }, { kind: 'user', text: `/${action.command}${action.args ? ` ${action.args}` : ''}`, attachments: [] }),
+        ...push(
+          { ...state, problem: null },
+          { kind: 'user', text: `/${action.command}${action.args ? ` ${action.args}` : ''}`, attachments: [], prompt: false },
+        ),
         busy: true,
+        turnProgress: null,
       }
     case 'local/permission_answered':
     case 'local/permission_resolved': {
@@ -261,8 +393,11 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
       if (index < 0) return state
       const question = state.items[index] as Extract<TranscriptItem, { kind: 'question' }>
       const answered = { ...state, items: replaceAt(state.items, index, { ...question, answered: true }) }
-      return push(answered, { kind: 'user', text: action.text, attachments: [] })
+      return push(answered, { kind: 'user', text: action.text, attachments: [], prompt: false })
     }
+    case 'local/commit_sent':
+    case 'local/commit_dismissed':
+      return state.commitProposal ? { ...state, commitProposal: null } : state
 
     // -------------------------------------------------------------- engine
     case 'ready':
@@ -277,6 +412,8 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
         // A restarted engine may load other servers and plugins, in another folder.
         extensions: null,
         trustPreview: null,
+        turnProgress: null,
+        ...NO_GIT_VIEWS,
         problem: null,
       }
     case 'status': {
@@ -318,7 +455,64 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
         { kind: 'reasoning', text: action.text, chars: null, redacted: false, streaming: true },
       )
     }
-    case 'tool_call_started':
+    case 'tool_input_started': {
+      if (action.id && findTool(state.items, action.id)) return state
+      return push(
+        { ...state, items: closeStreams(state.items) },
+        {
+          kind: 'tool',
+          id: action.id,
+          name: action.name,
+          input: '',
+          state: 'writing',
+          view: toolView(action.name, '{}', state.status?.cwd),
+          output: null,
+          permissionId: null,
+          progress: null,
+          live: null,
+          startedAt: now ?? null,
+          endedAt: null,
+        },
+      )
+    }
+    case 'tool_input_progress': {
+      const found = findTool(state.items, action.id)
+      if (!found) return state
+      const { item, index } = found
+      const progress = { bytes: action.bytes, lines: action.lines, target: action.target, preview: action.preview }
+      let view = item.view
+      if (action.target && item.state === 'writing') {
+        const fileCall = view.kind === 'read' || view.kind === 'write' || view.kind === 'edit'
+        view = { ...view, target: fileCall ? relativeTo(state.status?.cwd, action.target) : action.target }
+      }
+      return { ...state, items: replaceAt(state.items, index, { ...item, progress, view }) }
+    }
+    case 'output_progress':
+      return { ...state, turnProgress: { outputTokens: action.output_tokens, requests: state.turnProgress?.requests ?? [] } }
+    case 'request_usage':
+      return { ...state, turnProgress: { outputTokens: 0, requests: [...(state.turnProgress?.requests ?? []), action.usage] } }
+    case 'tool_output_delta': {
+      if (!action.chunk) return state
+      const found = findTool(state.items, action.tool_use_id)
+      if (!found) return state
+      const live = appendLive(found.item.live, action.stream, action.chunk)
+      return { ...state, items: replaceAt(state.items, found.index, { ...found.item, live }) }
+    }
+    case 'tool_call_started': {
+      const view = toolView(action.name, action.input, state.status?.cwd)
+      const found = action.id ? findTool(state.items, action.id) : null
+      if (found) {
+        // The call the model was writing: the input is complete now.
+        if (found.item.state !== 'writing') return state
+        const item: ToolItem = {
+          ...found.item,
+          input: action.input,
+          view,
+          state: action.cut_off ? 'cut_off' : 'running',
+          startedAt: found.item.startedAt ?? now ?? null,
+        }
+        return { ...state, items: replaceAt(state.items, found.index, item) }
+      }
       return push(
         { ...state, items: closeStreams(state.items) },
         {
@@ -327,11 +521,16 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
           name: action.name,
           input: action.input,
           state: action.cut_off ? 'cut_off' : 'running',
-          view: toolView(action.name, action.input, state.status?.cwd),
+          view,
           output: null,
           permissionId: null,
+          progress: null,
+          live: null,
+          startedAt: now ?? null,
+          endedAt: null,
         },
       )
+    }
     case 'tool_result': {
       // By id; engines before ids match the oldest open call with the name.
       const open = (item: TranscriptItem) =>
@@ -341,14 +540,12 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
         : state.items.findIndex((item) => open(item) && item.kind === 'tool' && item.name === action.name)
       if (index < 0) {
         // A result for a call this client never saw (it attached late).
-        const started = reduceSession(state, {
-          type: 'tool_call_started',
-          id: action.id ?? '',
-          name: action.name,
-          input: '{}',
-          cut_off: false,
-        })
-        return reduceSession(started, action)
+        const started = reduceSession(
+          state,
+          { type: 'tool_call_started', id: action.id ?? '', name: action.name, input: '{}', cut_off: false },
+          now,
+        )
+        return reduceSession(started, action, now)
       }
       const item = state.items[index] as Extract<TranscriptItem, { kind: 'tool' }>
       const denied = item.state === 'denied' || (action.is_error && /denied by (the )?user/.test(action.output))
@@ -357,6 +554,7 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
         state: denied ? 'denied' : action.is_error ? (item.state === 'cut_off' ? 'cut_off' : 'error') : 'done',
         output: action.output,
         view: withResult(item.view, item.name, action.output, action.is_error),
+        endedAt: now ?? null,
       }
       // Its permission request is moot once it has a result.
       const permissions = state.permissions.filter((permission) => permission.toolKey !== item.key)
@@ -388,13 +586,17 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
       if (action.message.startsWith(QUESTION_PREFIX)) {
         return push(state, { kind: 'question', text: action.message.slice(QUESTION_PREFIX.length).trim(), answered: false })
       }
-      return push(state, { kind: 'notice', text: action.message })
-    case 'turn_finished': {
-      const items = closeStreams(state.items).map((item) =>
-        item.kind === 'tool' && (item.state === 'running' || item.state === 'awaiting_permission')
-          ? { ...item, state: 'error' as const }
-          : item,
+      return push(
+        state,
+        action.kind ? { kind: 'notice', text: action.message, noticeKind: action.kind } : { kind: 'notice', text: action.message },
       )
+    case 'report':
+      return push(
+        { ...state, items: closeStreams(state.items) },
+        { kind: 'report', command: action.command, title: action.title, sections: action.sections, links: action.links },
+      )
+    case 'turn_finished': {
+      const items = closeOpenTools(closeStreams(state.items))
       return { ...state, items, busy: false, sessionStarting: false, signInCode: null, permissions: [] }
     }
     case 'error': {
@@ -405,6 +607,25 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
         return push({ ...next, connectionError: action.message }, item)
       }
       return push({ ...next, items: closeStreams(next.items) }, item)
+    }
+    case 'changes':
+      return { ...state, changes: action.files }
+    case 'diff':
+      return { ...state, diff: action }
+    case 'commit_proposal':
+      return { ...state, commitProposal: action }
+    case 'checkpoints':
+      return { ...state, checkpoints: action.items }
+    case 'rewound': {
+      if (action.dry_run) return { ...state, rewound: action }
+      return {
+        ...state,
+        rewound: action,
+        items: dropRewoundTurns(state.items, action.removed_turns),
+        unsent: action.prompt ? { text: action.prompt, attachments: [] } : state.unsent,
+        // The list changed: the UI asks again.
+        checkpoints: null,
+      }
     }
     case 'sessions':
       return { ...state, sessions: action.sessions }
@@ -464,13 +685,14 @@ function restoreTranscript(state: SessionState, sessionId: string, entries: Tran
     items: [],
     permissions: [],
     todos: [],
+    ...NO_GIT_VIEWS,
     status: state.status ? { ...state.status, session_id: sessionId } : state.status,
   }
   if (truncated) next = push(next, { kind: 'notice', text: 'Earlier messages of this chat are not shown.' })
   for (const entry of entries) {
     switch (entry.kind) {
       case 'user':
-        next = push(next, { kind: 'user', text: entry.text, attachments: [] })
+        next = push(next, { kind: 'user', text: entry.text, attachments: [], prompt: true })
         break
       case 'assistant':
         next = push(next, { kind: 'assistant', text: entry.text, streaming: false })
@@ -486,6 +708,10 @@ function restoreTranscript(state: SessionState, sessionId: string, entries: Tran
           view: toolView(entry.name, entry.input, state.status?.cwd),
           output: null,
           permissionId: null,
+          progress: null,
+          live: null,
+          startedAt: null,
+          endedAt: null,
         })
         break
       case 'tool_result': {
@@ -552,6 +778,23 @@ export function openQuestion(state: SessionState): string | null {
 export function openQuestionItem(state: SessionState): Extract<TranscriptItem, { kind: 'question' }> | null {
   const item = findLastIndex(state.items, (entry) => entry.kind === 'question' && !entry.answered)
   return item >= 0 ? (state.items[item] as Extract<TranscriptItem, { kind: 'question' }>) : null
+}
+
+/**
+ * What a chat needs from the person looking at it: `needs_you` (a permission or
+ * a question waits), `running` (a turn is going), `stopped` (the engine is gone)
+ * or `idle`. A stopped engine is `stopped` even when a question is still open:
+ * nothing can answer it.
+ */
+export function chatActivity(state: SessionState): 'needs_you' | 'running' | 'idle' | 'stopped' {
+  if (state.connection === 'exited') return 'stopped'
+  if (state.permissions.length > 0 || openQuestionItem(state)) return 'needs_you'
+  return state.busy ? 'running' : 'idle'
+}
+
+/** What a running command printed so far, as one text (stdout and stderr in the order they came). */
+export function liveText(live: LiveOutput | null | undefined): string {
+  return live ? live.chunks.map((chunk) => chunk.text).join('') : ''
 }
 
 /** The engine lists this feature on `ready`. */
