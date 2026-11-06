@@ -3,7 +3,30 @@ import fs from 'fs'
 import path from 'path'
 
 import {
+  CAPABILITY_GIT_VIEWS,
+  CAPABILITY_LIVE_OUTPUT,
+  CAPABILITY_LIVE_PROGRESS,
+  CAPABILITY_QUESTIONS,
+  CAPABILITY_REPORTS,
+  DESKTOP_CAPABILITIES,
   ENGINE_COMMAND_TYPES,
+  FEATURE_ACCOUNT,
+  FEATURE_CAPABILITIES,
+  FEATURE_CHECKPOINTS,
+  FEATURE_ERROR_DETAILS,
+  FEATURE_EXTENSIONS,
+  FEATURE_GIT_VIEWS,
+  FEATURE_LIVE_OUTPUT,
+  FEATURE_LIVE_PROGRESS,
+  FEATURE_MCP_TOGGLE,
+  FEATURE_MODEL_IMAGES,
+  FEATURE_REPORTS,
+  FEATURE_SESSIONS,
+  FEATURE_SESSION_SCOPE,
+  FEATURE_SUBAGENTS,
+  FEATURE_TODOS,
+  FEATURE_TRUST_PREVIEW,
+  FEATURE_TRUST_WORKSPACE,
   JsonLineSplitter,
   UI_EVENT_TYPES,
   commandMessage,
@@ -13,7 +36,17 @@ import {
   permissionReplyMessage,
   type AccountDetails,
   type AccountInfo,
+  type ChangedFile,
+  type CheckpointInfo,
   type DefinitionInfo,
+  type DiffFile,
+  type EngineCommand,
+  type NotRestoredFile,
+  type NoticeKind,
+  type OutputStream,
+  type RewindMode,
+  type SessionRunStatus,
+  type SessionScope,
   type ErrorDetail,
   type GitStatus,
   type HookPreview,
@@ -38,6 +71,10 @@ const rustCrate = path.resolve(import.meta.dir, '../../../rust/crates/neuron-tui
 const protocolRs = fs.readFileSync(path.join(rustCrate, 'src/protocol.rs'), 'utf8').replace(/\r\n/g, '\n')
 const fixtureLines = (name: string) =>
   fs.readFileSync(path.join(rustCrate, 'fixtures', name), 'utf8').split(/\r?\n/).filter(Boolean)
+const liveLines = fs
+  .readFileSync(path.join(import.meta.dir, 'fixtures/protocol-v2-live.jsonl'), 'utf8')
+  .split(/\r?\n/)
+  .filter(Boolean)
 
 /** The `{ ... }` body that follows `header` in protocol.rs. */
 function body(header: string): string {
@@ -117,7 +154,7 @@ const STRUCT_FIELDS: Record<string, string[]> = {
     'supports_images',
   ]),
   AccountInfo: fieldsOf<AccountInfo>()(['email', 'plan', 'source', 'expires_at']),
-  McpServerInfo: fieldsOf<McpServerInfo>()(['name', 'scope', 'transport', 'status', 'tools', 'error']),
+  McpServerInfo: fieldsOf<McpServerInfo>()(['name', 'scope', 'transport', 'status', 'tools', 'error', 'enabled']),
   PluginInfo: fieldsOf<PluginInfo>()(['id', 'name', 'version', 'description', 'kind', 'enabled']),
   DefinitionInfo: fieldsOf<DefinitionInfo>()(['name', 'description', 'source', 'active']),
   SessionSummary: fieldsOf<SessionSummary>()([
@@ -160,6 +197,17 @@ const STRUCT_FIELDS: Record<string, string[]> = {
   PermissionRulePreview: fieldsOf<PermissionRulePreview>()(['effect', 'rule', 'source']),
   TodoItem: fieldsOf<TodoItem>()(['content', 'status', 'active_form']),
   PermissionReply: fieldsOf<PermissionReply>()(['id', 'decision']),
+  ChangedFile: fieldsOf<ChangedFile>()(['path', 'status', 'added', 'removed']),
+  DiffFile: fieldsOf<DiffFile>()(['path', 'status', 'added', 'removed', 'patch', 'binary']),
+  CheckpointInfo: fieldsOf<CheckpointInfo>()([
+    'id',
+    'created_at_ms',
+    'prompt_preview',
+    'files',
+    'shell_commands',
+    'before_rewind_to',
+  ]),
+  NotRestoredFile: fieldsOf<NotRestoredFile>()(['path', 'reason']),
 }
 
 type EventFields<T extends UiEventType> = Exclude<keyof Extract<UiEvent, { type: T }>, 'type'>
@@ -185,6 +233,7 @@ const EVENT_FIELDS: { [T in UiEventType]: string[] } = {
     'sign_in_required',
     'account',
     'supports_images',
+    'served_model',
   ]),
   session_starting: eventFields('session_starting')([]),
   sign_in_code: eventFields('sign_in_code')(['url', 'url_complete', 'user_code', 'expires_in_secs', 'browser_opened']),
@@ -197,7 +246,7 @@ const EVENT_FIELDS: { [T in UiEventType]: string[] } = {
   tool_result: eventFields('tool_result')(['id', 'name', 'output', 'is_error']),
   usage: eventFields('usage')(['turn', 'cumulative', 'estimated']),
   permission_requested: eventFields('permission_requested')(['id', 'request']),
-  notice: eventFields('notice')(['message']),
+  notice: eventFields('notice')(['message', 'kind']),
   turn_finished: eventFields('turn_finished')([]),
   error: eventFields('error')(['message', 'detail']),
   sessions: eventFields('sessions')(['current', 'sessions', 'scope']),
@@ -222,6 +271,102 @@ const EVENT_FIELDS: { [T in UiEventType]: string[] } = {
     'permission_rules',
     'other_settings',
   ]),
+  tool_input_started: eventFields('tool_input_started')(['id', 'name']),
+  tool_input_progress: eventFields('tool_input_progress')(['id', 'name', 'bytes', 'lines', 'target', 'preview']),
+  output_progress: eventFields('output_progress')(['output_tokens']),
+  request_usage: eventFields('request_usage')(['usage']),
+  tool_output_delta: eventFields('tool_output_delta')(['tool_use_id', 'stream', 'chunk']),
+  changes: eventFields('changes')(['files']),
+  diff: eventFields('diff')(['title', 'files', 'truncated']),
+  commit_proposal: eventFields('commit_proposal')(['message', 'branch', 'files', 'stage_all']),
+  checkpoints: eventFields('checkpoints')(['items']),
+  rewound: eventFields('rewound')([
+    'checkpoint',
+    'mode',
+    'dry_run',
+    'restored',
+    'removed',
+    'not_restored',
+    'shell_commands',
+    'removed_turns',
+    'prompt',
+  ]),
+}
+
+type CommandFields<T extends EngineCommand['type']> = Exclude<keyof Extract<EngineCommand, { type: T }>, 'type'>
+const commandFields =
+  <T extends EngineCommand['type']>(_type: T) =>
+  <const K extends readonly CommandFields<T>[]>(
+    keys: K & (Exclude<CommandFields<T>, K[number]> extends never ? unknown : 'lists every field'),
+  ): string[] => [...(keys as readonly string[])]
+
+/** Every command's fields, as protocol.rs names them. */
+const COMMAND_FIELDS: { [T in EngineCommand['type']]: string[] } = {
+  submit: commandFields('submit')(['text', 'attachments']),
+  slash: commandFields('slash')(['command', 'args']),
+  set_model: commandFields('set_model')(['model']),
+  list_models: commandFields('list_models')([]),
+  interrupt: commandFields('interrupt')([]),
+  shutdown: commandFields('shutdown')([]),
+  capabilities: commandFields('capabilities')(['features', 'client']),
+  answer: commandFields('answer')(['id', 'text']),
+  list_sessions: commandFields('list_sessions')(['scope']),
+  resume: commandFields('resume')(['session']),
+  trust_workspace: commandFields('trust_workspace')([]),
+  list_extensions: commandFields('list_extensions')([]),
+  set_mcp_server_enabled: commandFields('set_mcp_server_enabled')(['name', 'enabled']),
+  trust_preview: commandFields('trust_preview')([]),
+  refresh_account: commandFields('refresh_account')([]),
+  commit: commandFields('commit')(['message']),
+  rewind: commandFields('rewind')(['checkpoint', 'mode', 'dry_run']),
+}
+
+/** A typed list of a union's members: a missing member fails typecheck. */
+const membersOf =
+  <T extends string>() =>
+  <const K extends readonly T[]>(
+    values: K & (Exclude<T, K[number]> extends never ? unknown : 'lists every member'),
+  ): string[] => [...values]
+
+const UNIT_ENUMS: Record<string, string[]> = {
+  OutputStream: membersOf<OutputStream>()(['stdout', 'stderr']),
+  NoticeKind: membersOf<NoticeKind>()(['refusal']),
+  SessionScope: membersOf<SessionScope>()(['project', 'all']),
+  SessionRunStatus: membersOf<SessionRunStatus>()(['idle', 'open', 'running']),
+}
+
+/** The snake_case values of `pub enum <name>` (unit variants only). */
+function unitVariants(enumName: string): string[] {
+  return body(`pub enum ${enumName} {`)
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => /^[A-Z]\w*,?$/.test(line))
+    .map((line) => snake(line.replace(',', '')))
+}
+
+const TS_FEATURE_CONSTANTS: Record<string, string> = {
+  FEATURE_CAPABILITIES,
+  FEATURE_SESSIONS,
+  FEATURE_TRUST_WORKSPACE,
+  FEATURE_TODOS,
+  FEATURE_SUBAGENTS,
+  FEATURE_EXTENSIONS,
+  FEATURE_ERROR_DETAILS,
+  FEATURE_ACCOUNT,
+  FEATURE_REPORTS,
+  FEATURE_SESSION_SCOPE,
+  FEATURE_TRUST_PREVIEW,
+  FEATURE_MODEL_IMAGES,
+  FEATURE_LIVE_PROGRESS,
+  FEATURE_GIT_VIEWS,
+  FEATURE_CHECKPOINTS,
+  FEATURE_MCP_TOGGLE,
+  FEATURE_LIVE_OUTPUT,
+  CAPABILITY_QUESTIONS,
+  CAPABILITY_REPORTS,
+  CAPABILITY_LIVE_PROGRESS,
+  CAPABILITY_GIT_VIEWS,
+  CAPABILITY_LIVE_OUTPUT,
 }
 
 const sorted = (values: Iterable<string>) => [...values].sort()
@@ -250,6 +395,47 @@ describe('the protocol mirrors protocol.rs', () => {
     }
   })
 
+  test('every EngineCommand variant has the fields listed here', () => {
+    const rust = variants('EngineCommand')
+    for (const type of ENGINE_COMMAND_TYPES) {
+      expect({ type, fields: sorted(rust.get(type) ?? []) }).toEqual({ type, fields: sorted(COMMAND_FIELDS[type]) })
+    }
+  })
+
+  test('every FEATURE_* and CAPABILITY_* constant of protocol.rs is exported here with the same value', () => {
+    const consts = [...protocolRs.matchAll(/^pub const ((?:FEATURE|CAPABILITY)_\w+): &str = "([^"]+)";/gm)]
+    expect(consts.length).toBeGreaterThan(15)
+    for (const [, name, value] of consts) {
+      expect({ name, value: TS_FEATURE_CONSTANTS[name] }).toEqual({ name, value })
+    }
+  })
+
+  test('every feature string of ENGINE_FEATURES has a constant here', () => {
+    const start = protocolRs.indexOf('pub const ENGINE_FEATURES: &[&str] = &[')
+    expect(start).toBeGreaterThan(-1)
+    const list = protocolRs.slice(start, protocolRs.indexOf('];', start))
+    const literals = [...list.matchAll(/^\s*"(\w+)",/gm)].map((match) => match[1])
+    expect(literals.sort()).toEqual(['extensions', 'sessions', 'subagents', 'todos', 'trust_workspace'])
+    const known = new Set(Object.values(TS_FEATURE_CONSTANTS))
+    for (const literal of literals) expect(known.has(literal)).toBe(true)
+    for (const name of list.matchAll(/^\s*(FEATURE_\w+),/gm)) expect(name[1] in TS_FEATURE_CONSTANTS).toBe(true)
+  })
+
+  test('the unit enums have the same snake_case values as the TypeScript unions', () => {
+    for (const [name, values] of Object.entries(UNIT_ENUMS)) {
+      expect({ name, values: sorted(unitVariants(name)) }).toEqual({ name, values: sorted(values) })
+    }
+  })
+
+  test('the rewind modes are the three the engine documents', () => {
+    const modes: RewindMode[] = ['code_and_chat', 'chat_only', 'code_only']
+    for (const mode of modes) expect(protocolRs).toContain('`' + mode + '`')
+  })
+
+  test('the desktop declares what it renders', () => {
+    expect([...DESKTOP_CAPABILITIES].sort()).toEqual(['git_views', 'live_output', 'live_progress', 'questions', 'reports'])
+  })
+
   test('the protocol version matches', () => {
     expect(protocolRs).toContain('pub const PROTOCOL_VERSION: u32 = 1;')
   })
@@ -276,6 +462,42 @@ describe('the fake engine samples (rust/crates/neuron-tui/fixtures)', () => {
     for (const line of fixtureLines('protocol-v2-commands.jsonl')) {
       expect(parseClientMessage(JSON.parse(line))).toEqual(JSON.parse(line))
     }
+  })
+})
+
+describe('the live protocol samples (test/fixtures/protocol-v2-live.jsonl)', () => {
+  const eventLines = liveLines.filter((line) => JSON.parse(line).kind !== 'command')
+  const commandLines = liveLines.filter((line) => JSON.parse(line).kind === 'command')
+
+  test('every event line parses, with only the fields known here, and every new event appears', () => {
+    for (const line of eventLines) {
+      const parsed = parseUiEventLine(line)
+      expect(parsed.ok).toBe(true)
+      if (!parsed.ok) continue
+      const known = new Set(['type', ...EVENT_FIELDS[parsed.event.type]])
+      expect(Object.keys(parsed.event).filter((key) => !known.has(key))).toEqual([])
+    }
+    const types = new Set(eventLines.map((line) => JSON.parse(line).type))
+    for (const type of [
+      'tool_input_started',
+      'tool_input_progress',
+      'output_progress',
+      'request_usage',
+      'tool_output_delta',
+      'changes',
+      'diff',
+      'commit_proposal',
+      'checkpoints',
+      'rewound',
+    ]) {
+      expect(types.has(type)).toBe(true)
+    }
+  })
+
+  test('every command line passes the untrusted-peer check unchanged, and every new command appears', () => {
+    for (const line of commandLines) expect(parseClientMessage(JSON.parse(line))).toEqual(JSON.parse(line))
+    const types = new Set(commandLines.map((line) => JSON.parse(line).type))
+    for (const type of ['set_mcp_server_enabled', 'commit', 'rewind']) expect(types.has(type)).toBe(true)
   })
 })
 
@@ -339,6 +561,30 @@ describe('client messages from untrusted peers', () => {
     })
     expect(parseClientMessage({ kind: 'command', type: 'trust_preview' })).toEqual({ kind: 'command', type: 'trust_preview' })
     expect(parseClientMessage({ kind: 'command', type: 'refresh_account', force: true })).toEqual({ kind: 'command', type: 'refresh_account' })
+    expect(parseClientMessage({ kind: 'command', type: 'set_mcp_server_enabled', name: 'gh', enabled: false, x: 1 })).toEqual({
+      kind: 'command',
+      type: 'set_mcp_server_enabled',
+      name: 'gh',
+      enabled: false,
+    })
+    expect(parseClientMessage({ kind: 'command', type: 'commit', message: 'fix: it', x: 1 })).toEqual({
+      kind: 'command',
+      type: 'commit',
+      message: 'fix: it',
+    })
+    expect(parseClientMessage({ kind: 'command', type: 'rewind', checkpoint: 0, mode: 'chat_only', x: 1 })).toEqual({
+      kind: 'command',
+      type: 'rewind',
+      checkpoint: 0,
+      mode: 'chat_only',
+    })
+    expect(parseClientMessage({ kind: 'command', type: 'rewind', checkpoint: 2, mode: 'code_only', dry_run: true })).toEqual({
+      kind: 'command',
+      type: 'rewind',
+      checkpoint: 2,
+      mode: 'code_only',
+      dry_run: true,
+    })
     expect(parseClientMessage({ kind: 'permission_reply', id: 4, decision: { kind: 'deny', note: 'no' } })).toEqual({
       kind: 'permission_reply',
       id: 4,
@@ -355,6 +601,18 @@ describe('client messages from untrusted peers', () => {
       { kind: 'command', type: 'format_disk' },
       { kind: 'command', type: 'list_sessions', scope: 'galaxy' },
       { kind: 'command', type: 'capabilities', features: [1] },
+      { kind: 'command', type: 'set_mcp_server_enabled', name: '', enabled: true },
+      { kind: 'command', type: 'set_mcp_server_enabled', name: 'gh', enabled: 'yes' },
+      { kind: 'command', type: 'set_mcp_server_enabled', name: 'gh' },
+      { kind: 'command', type: 'commit', message: '   ' },
+      { kind: 'command', type: 'commit' },
+      { kind: 'command', type: 'rewind', checkpoint: -1, mode: 'chat_only' },
+      { kind: 'command', type: 'rewind', checkpoint: 1.5, mode: 'chat_only' },
+      { kind: 'command', type: 'rewind', checkpoint: 2 ** 60, mode: 'chat_only' },
+      { kind: 'command', type: 'rewind', checkpoint: '1', mode: 'chat_only' },
+      { kind: 'command', type: 'rewind', checkpoint: 1, mode: 'everything' },
+      { kind: 'command', type: 'rewind', checkpoint: 1 },
+      { kind: 'command', type: 'rewind', checkpoint: 1, mode: 'chat_only', dry_run: 'true' },
       { kind: 'permission_reply', id: 'one', decision: { kind: 'allow_once' } },
       { kind: 'permission_reply', id: 1, decision: { kind: 'allow_forever' } },
       { kind: 'other' },

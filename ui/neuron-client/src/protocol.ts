@@ -12,8 +12,10 @@
  * engines leave them out.
  *
  * Protocol v2 is a set of engine features (`ready.features`): `reports`,
- * `account`, `error_details`, `session_scope`, `trust_preview` and
- * `model_images`. Send the commands a feature adds only when the engine lists it.
+ * `account`, `error_details`, `session_scope`, `trust_preview`,
+ * `model_images`, `live_progress`, `live_output`, `git_views`,
+ * `checkpoints` and `mcp_toggle`. Send the commands a feature adds only when
+ * the engine lists it.
  */
 
 /** `PROTOCOL_VERSION` in protocol.rs, sent in {@link ReadyEvent}. */
@@ -91,10 +93,50 @@ export const FEATURE_TRUST_PREVIEW = 'trust_preview'
 /** `supports_images` on models and on `status`. */
 export const FEATURE_MODEL_IMAGES = 'model_images'
 
+/** The engine reports a turn while the model writes it: `tool_input_started`, `tool_input_progress`, `output_progress` and `request_usage` (with the `live_progress` capability). */
+export const FEATURE_LIVE_PROGRESS = 'live_progress'
+/** `changes`, `diff` and `commit_proposal` events and the `commit` command (with the `git_views` capability; otherwise notices). */
+export const FEATURE_GIT_VIEWS = 'git_views'
+/** `tool_output_delta` events: what a running shell command prints (with the `live_output` capability). */
+export const FEATURE_LIVE_OUTPUT = 'live_output'
+/** A checkpoint per prompt: `/rewind` lists them (`checkpoints`), the `rewind` command goes back to one (`rewound`). Needs the `git_views` capability; otherwise notices. */
+export const FEATURE_CHECKPOINTS = 'checkpoints'
+/** The `set_mcp_server_enabled` command; `McpServerInfo.enabled` is set and turned-off servers have status `disabled`. */
+export const FEATURE_MCP_TOGGLE = 'mcp_toggle'
+/** `todos` events. */
+export const FEATURE_TODOS = 'todos'
+/** `subagent_started` and `subagent_finished` events. */
+export const FEATURE_SUBAGENTS = 'subagents'
+
 /** A UI capability: questions come as `question` events instead of a "Question:" notice. */
 export const CAPABILITY_QUESTIONS = 'questions'
 /** A UI capability: reports come as `report` events instead of a notice. */
 export const CAPABILITY_REPORTS = 'reports'
+/** A UI capability: send the live-progress events of {@link FEATURE_LIVE_PROGRESS}. */
+export const CAPABILITY_LIVE_PROGRESS = 'live_progress'
+/** A UI capability: send changes, diffs, commit proposals, checkpoints and rewinds as their own events instead of notices. */
+export const CAPABILITY_GIT_VIEWS = 'git_views'
+/** A UI capability: send the output of a running shell command as `tool_output_delta` events. */
+export const CAPABILITY_LIVE_OUTPUT = 'live_output'
+
+/** What the desktop app renders and so declares in its `capabilities` command. */
+export const DESKTOP_CAPABILITIES: readonly string[] = [
+  CAPABILITY_QUESTIONS,
+  CAPABILITY_REPORTS,
+  CAPABILITY_LIVE_PROGRESS,
+  CAPABILITY_LIVE_OUTPUT,
+  CAPABILITY_GIT_VIEWS,
+]
+
+/** Which stream of a command a `tool_output_delta` carries. */
+export type OutputStream = 'stdout' | 'stderr'
+
+/** What a notice is about: `refusal`, the model declined to continue the request. */
+export type NoticeKind = 'refusal'
+
+/** What a rewind puts back: the files and the chat, only the chat, or only the files. */
+export type RewindMode = 'code_and_chat' | 'chat_only' | 'code_only'
+export const REWIND_MODES: readonly RewindMode[] = ['code_and_chat', 'chat_only', 'code_only']
 
 /** Which saved chats `list_sessions` lists: this workspace's, or every workspace's on this device. */
 export type SessionScope = 'project' | 'all'
@@ -124,6 +166,51 @@ export interface SessionSummary {
   failed?: boolean
   /** The Neuron that last ran it (`terminal`, `desktop`), when known. */
   client?: string | null
+}
+
+/** A file and how it changed, with line counts. */
+export interface ChangedFile {
+  /** Relative to the workspace root, with `/`; absolute for files outside it. */
+  path: string
+  /** `created`, `modified`, `deleted` or `renamed`. */
+  status: 'created' | 'modified' | 'deleted' | 'renamed' | string
+  /** Lines added and removed (0 for binary files). */
+  added: number
+  removed: number
+}
+
+/** One file of a `diff` event. */
+export interface DiffFile {
+  /** Relative to the workspace root, with `/`. */
+  path: string
+  /** `created`, `modified`, `deleted` or `renamed`. */
+  status: 'created' | 'modified' | 'deleted' | 'renamed' | string
+  added: number
+  removed: number
+  /** The unified diff's hunks (from the first `@@` line on); empty for binary files and files left out to keep the event small. */
+  patch: string
+  binary: boolean
+}
+
+/** One entry of the "go back to" list (`checkpoints` event). */
+export interface CheckpointInfo {
+  id: number
+  /** When the prompt was sent (Unix milliseconds). */
+  created_at_ms: number
+  /** The prompt, shortened to one line. */
+  prompt_preview: string
+  /** Files the agent's file tools changed in that turn (workspace-relative, with `/`). */
+  files: string[]
+  /** Shell commands that turn ran; a rewind cannot undo what they did. */
+  shell_commands: string[]
+  /** Set on the checkpoint a code-only rewind saves first: the checkpoint that rewind went back to, so the rewind itself can be undone. */
+  before_rewind_to?: number | null
+}
+
+/** A file a rewind could not put back, and why (as people read it). */
+export interface NotRestoredFile {
+  path: string
+  reason: string
 }
 
 /** One part of a `report` event. */
@@ -231,13 +318,16 @@ export interface McpServerInfo {
   transport: string
   /**
    * `starting`, `ready`, `failed`, `pending` (started, tools not found),
-   * `unsupported` (a transport Neuron does not speak yet) or `not_started`.
+   * `unsupported` (a transport Neuron does not speak yet), `not_started` or
+   * `disabled` (turned off in the settings).
    */
-  status: 'starting' | 'ready' | 'failed' | 'pending' | 'unsupported' | 'not_started' | string
+  status: 'starting' | 'ready' | 'failed' | 'pending' | 'unsupported' | 'not_started' | 'disabled' | string
   /** Its tools, without the `mcp__<server>__` prefix. */
   tools: string[]
   /** Why it failed or is unsupported. */
   error: string | null
+  /** Turned on (feature `mcp_toggle`); absent from older engines, meaning on. */
+  enabled?: boolean
 }
 
 /** One installed plugin. */
@@ -286,6 +376,12 @@ export interface StatusEvent {
   account?: AccountInfo | null
   /** The catalog says the current model reads images; hide the image-paste hint unless true. */
   supports_images?: boolean | null
+  /**
+   * The model that answered the last request, when it is not `model` (`auto` picks
+   * one per request; a failover can switch). Absent or null before the first answer,
+   * from providers that do not name the model, and from older engines.
+   */
+  served_model?: string | null
 }
 
 export interface SessionStartingEvent {
@@ -363,6 +459,8 @@ export interface PermissionRequestedEvent {
 export interface NoticeEvent {
   type: 'notice'
   message: string
+  /** What the notice is about, when it should be drawn apart from status lines; absent from plain notices and older engines. */
+  kind?: NoticeKind | null
 }
 
 export interface TurnFinishedEvent {
@@ -485,6 +583,99 @@ export interface TrustPreviewEvent {
   other_settings: string[]
 }
 
+/** The model started a tool call and is still writing its input: show the call now. `tool_input_progress` follows while the input grows, then `tool_call_started` with the same `id` and the complete input. With the `live_progress` capability only. */
+export interface ToolInputStartedEvent {
+  type: 'tool_input_started'
+  id: string
+  name: string
+}
+
+/** How far the model got writing a tool call's input; at most every 100 ms or so per call, and once more when the input is complete. */
+export interface ToolInputProgressEvent {
+  type: 'tool_input_progress'
+  id: string
+  name: string
+  /** Bytes of input (JSON text) so far. */
+  bytes: number
+  /** Lines of the call's main text so far (a written file's content, an edit's new text, a command); 0 before it starts. */
+  lines: number
+  /** What the call is about, once the model has written it: a path, a command, a search pattern, a URL. */
+  target: string | null
+  /** The last lines of the main text so far (a few lines, at most about 1 KB), unescaped. */
+  preview: string | null
+}
+
+/** Output tokens of the model response now streaming (text, reasoning and tool input), estimated from its length. Starts again from 0 with each model request of a turn. */
+export interface OutputProgressEvent {
+  type: 'output_progress'
+  output_tokens: number
+}
+
+/** One model request of the turn ended: its tokens as the provider reported them. `usage` still closes the turn with its totals. */
+export interface RequestUsageEvent {
+  type: 'request_usage'
+  usage: TokenCounts
+}
+
+/** More of what a running `bash` or `PowerShell` call printed: the text since the last delta of that stream, at most 8 KB each. The call's `tool_result` still carries the whole output. With the `live_output` capability only. */
+export interface ToolOutputDeltaEvent {
+  type: 'tool_output_delta'
+  tool_use_id: string
+  stream: OutputStream
+  chunk: string
+}
+
+/** Every file the agent created, changed or deleted in this session, with lines added and removed. Sent when the list changes. With the `git_views` capability only. */
+export interface ChangesEvent {
+  type: 'changes'
+  files: ChangedFile[]
+}
+
+/** Answer to `/diff [path]`: the workspace's changes against `HEAD`, or outside git the agent's changes this session. */
+export interface DiffEvent {
+  type: 'diff'
+  /** What was compared, as a heading (`Changes against HEAD on main`). */
+  title: string
+  files: DiffFile[]
+  /** Files or hunks were left out to keep the event small. */
+  truncated: boolean
+}
+
+/** Answer to `/commit` without a message: a drafted message and what a commit would take. Nothing is committed until the `commit` command. */
+export interface CommitProposalEvent {
+  type: 'commit_proposal'
+  message: string
+  branch: string | null
+  files: ChangedFile[]
+  /** Nothing is staged, so the commit takes every change (`git add -A`); otherwise only what is staged. */
+  stage_all: boolean
+}
+
+/** Answer to `/rewind`: the session's checkpoints, newest first. */
+export interface CheckpointsEvent {
+  type: 'checkpoints'
+  items: CheckpointInfo[]
+}
+
+/** Answer to the `rewind` command: what it put back (or, for a dry run, would). */
+export interface RewoundEvent {
+  type: 'rewound'
+  checkpoint: number
+  mode: RewindMode
+  dry_run: boolean
+  /** Files written back. */
+  restored: string[]
+  /** Files removed because they did not exist then. */
+  removed: string[]
+  not_restored: NotRestoredFile[]
+  /** Shell commands run since the checkpoint; what they did was not undone. */
+  shell_commands: string[]
+  /** Prompts taken out of the conversation: drop the last `removed_turns` prompts with everything after them. 0 when the chat was kept. */
+  removed_turns: number
+  /** The checkpoint's prompt, for the input box ("edit and send again"); null when the chat was kept. */
+  prompt: string | null
+}
+
 export type UiEvent =
   | ReadyEvent
   | StatusEvent
@@ -513,6 +704,16 @@ export type UiEvent =
   | ReportEvent
   | AccountEvent
   | TrustPreviewEvent
+  | ToolInputStartedEvent
+  | ToolInputProgressEvent
+  | OutputProgressEvent
+  | RequestUsageEvent
+  | ToolOutputDeltaEvent
+  | ChangesEvent
+  | DiffEvent
+  | CommitProposalEvent
+  | CheckpointsEvent
+  | RewoundEvent
 
 export type UiEventType = UiEvent['type']
 
@@ -545,6 +746,16 @@ export const UI_EVENT_TYPES: readonly UiEventType[] = [
   'report',
   'account',
   'trust_preview',
+  'tool_input_started',
+  'tool_input_progress',
+  'output_progress',
+  'request_usage',
+  'tool_output_delta',
+  'changes',
+  'diff',
+  'commit_proposal',
+  'checkpoints',
+  'rewound',
 ]
 
 // ---------------------------------------------------------------- client → engine
@@ -579,6 +790,12 @@ export type EngineCommand =
   | { type: 'trust_preview' }
   /** Feature `account`: read the plan and usage again, as an `account` event. */
   | { type: 'refresh_account' }
+  /** Feature `mcp_toggle`: turn an MCP server on or off; a notice and a fresh `extensions` event follow. */
+  | { type: 'set_mcp_server_enabled'; name: string; enabled: boolean }
+  /** Feature `git_views`: commit what is staged (everything when nothing is) with this message. */
+  | { type: 'commit'; message: string }
+  /** Feature `checkpoints`: go back to a checkpoint; `dry_run` reports what it would do and changes nothing. Answered with `rewound`. */
+  | { type: 'rewind'; checkpoint: number; mode: RewindMode; dry_run?: boolean }
 
 export const ENGINE_COMMAND_TYPES: readonly EngineCommand['type'][] = [
   'submit',
@@ -595,6 +812,9 @@ export const ENGINE_COMMAND_TYPES: readonly EngineCommand['type'][] = [
   'list_extensions',
   'trust_preview',
   'refresh_account',
+  'set_mcp_server_enabled',
+  'commit',
+  'rewind',
 ]
 
 export type PermissionDecision =
@@ -718,6 +938,25 @@ export function parseClientMessage(value: unknown): ClientMessage | null {
       return typeof message.session === 'string' && message.session.trim()
         ? { kind: 'command', type: 'resume', session: message.session }
         : null
+    case 'set_mcp_server_enabled':
+      return typeof message.name === 'string' && message.name && typeof message.enabled === 'boolean'
+        ? { kind: 'command', type: 'set_mcp_server_enabled', name: message.name, enabled: message.enabled }
+        : null
+    case 'commit':
+      return typeof message.message === 'string' && message.message.trim()
+        ? { kind: 'command', type: 'commit', message: message.message }
+        : null
+    case 'rewind': {
+      const mode = message.mode
+      if (!Number.isSafeInteger(message.checkpoint) || (message.checkpoint as number) < 0) return null
+      if (typeof mode !== 'string' || !(REWIND_MODES as readonly string[]).includes(mode)) return null
+      if (message.dry_run === undefined) {
+        return { kind: 'command', type: 'rewind', checkpoint: message.checkpoint as number, mode: mode as RewindMode }
+      }
+      return typeof message.dry_run === 'boolean'
+        ? { kind: 'command', type: 'rewind', checkpoint: message.checkpoint as number, mode: mode as RewindMode, dry_run: message.dry_run }
+        : null
+    }
     default:
       return null
   }
