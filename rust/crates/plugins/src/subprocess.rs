@@ -54,12 +54,14 @@ pub const CREDENTIAL_ENV_SUFFIXES: &[&str] = &[
     "CONNECTION_STRING",
 ];
 
-/// Value prefixes of Zero-X credentials (`ses_` CLI sessions, `nzx_` API keys)
-/// and of common provider keys (`sk-`, GitHub `ghp_`/`gho_`/`ghs_`/`github_pat_`,
-/// AWS `AKIA`/`ASIA`, Slack `xox`).
-pub const CREDENTIAL_VALUE_PREFIXES: &[&str] = &[
-    "ses_",
-    "nzx_",
+/// Value prefixes of Zero-X credentials (`ses_` CLI sessions, `nzx_` API keys).
+pub const CREDENTIAL_VALUE_PREFIXES: &[&str] = &["ses_", "nzx_"];
+
+/// Value prefixes of common provider keys (`sk-`, GitHub `ghp_`/`gho_`/`ghs_`/
+/// `github_pat_`, AWS `AKIA`/`ASIA`, Slack `xox`). They mark an inherited variable
+/// as a secret for the scrubber; a variable an MCP profile names on purpose is
+/// still passed on.
+pub const PROVIDER_SECRET_VALUE_PREFIXES: &[&str] = &[
     "sk-",
     "ghp_",
     "gho_",
@@ -134,6 +136,7 @@ pub fn is_credential_env(key: &OsStr, value: &OsStr) -> bool {
     let value = value.to_string_lossy();
     CREDENTIAL_VALUE_PREFIXES
         .iter()
+        .chain(PROVIDER_SECRET_VALUE_PREFIXES)
         .any(|prefix| value.starts_with(prefix))
 }
 

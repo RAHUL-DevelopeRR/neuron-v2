@@ -146,7 +146,7 @@ impl CommandClassification {
             if !segment.prefix_coverable || segment.words.is_empty() {
                 return Vec::new();
             }
-            let prefix = suggested_prefix(&segment.words, self.dialect);
+            let prefix = approval_prefix(&segment.words, self.dialect);
             if !prefixes.contains(&prefix) {
                 prefixes.push(prefix);
             }
@@ -335,6 +335,107 @@ fn words_start_with(words: &[String], prefix: &[String], dialect: ShellDialect) 
                     word == wanted
                 }
             })
+}
+
+/// Programs that run whatever code they are given: a session approval for the bare
+/// program name would approve any script, inline `-c`/`-e` code or module.
+const INTERPRETERS: &[&str] = &[
+    "node", "nodejs", "deno", "bun", "tsx", "ts-node", "ruby", "perl", "php", "lua", "luajit",
+    "rscript", "sh", "bash", "zsh", "dash", "ksh", "fish",
+];
+
+/// Programs that run another program named in their arguments; no prefix can say what
+/// they will run, so each call needs its own approval.
+const RUNNER_PROGRAMS: &[&str] = &[
+    "sudo", "su", "doas", "runas", "eval", "exec", "env", "xargs", "nohup", "command", "builtin",
+    "source", ".", "invoke-expression", "iex", "start-process",
+];
+
+/// Interpreter options that only tune how a script runs, never what code runs.
+const INTERPRETER_SAFE_FLAGS: &[&str] = &[
+    "-u",
+    "-B",
+    "-s",
+    "-S",
+    "-O",
+    "-OO",
+    "-q",
+    "-I",
+    "-E",
+    "-w",
+    "--no-warnings",
+    "--trace-warnings",
+    "--enable-source-maps",
+    "--allow-read",
+];
+
+fn is_interpreter(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    is_python(&name) || INTERPRETERS.contains(&name.as_str())
+}
+
+/// The prefix a session approval of an interpreter call covers: the interpreter and the
+/// one script (or `-m module`) it runs, so approving `python build.py` does not approve
+/// `python -c "..."` or `python other.py`. `None` when the call carries inline code, an
+/// option that can load code, or no script at all (a REPL reading standard input).
+fn interpreter_prefix(words: &[String], dialect: ShellDialect) -> Option<Vec<String>> {
+    let program = build_program_name(words.first()?, dialect);
+    let mut prefix = vec![words[0].clone()];
+    let mut rest = words[1..].iter().peekable();
+    while let Some(word) = rest.peek() {
+        if INTERPRETER_SAFE_FLAGS.contains(&word.as_str()) {
+            prefix.push((*word).clone());
+            rest.next();
+        } else {
+            break;
+        }
+    }
+    let first = rest.next()?;
+    if first == "-m" && is_python(&program.to_ascii_lowercase()) {
+        prefix.push(first.clone());
+        prefix.push(rest.next()?.clone());
+        return Some(prefix);
+    }
+    if first.starts_with('-') || first.contains(['$', '`', '*', '?']) {
+        return None;
+    }
+    prefix.push(first.clone());
+    // `deno run app.ts`, `bun run app.ts`: the script is the word after the subcommand.
+    if matches!(program.to_ascii_lowercase().as_str(), "deno" | "bun")
+        && matches!(first.as_str(), "run" | "x" | "test")
+    {
+        let script = rest.next()?;
+        if script.starts_with('-') {
+            return None;
+        }
+        prefix.push(script.clone());
+    }
+    Some(prefix)
+}
+
+/// Like [`suggested_prefix`], but narrowed for interpreters and never offered for
+/// runner programs (the segment is then not prefix-coverable, see
+/// [`classify_segment`]).
+fn approval_prefix(words: &[String], dialect: ShellDialect) -> Vec<String> {
+    let program = build_program_name(&words[0], dialect);
+    if is_interpreter(&program) {
+        if let Some(prefix) = interpreter_prefix(words, dialect) {
+            return prefix;
+        }
+    }
+    suggested_prefix(words, dialect)
+}
+
+/// Whether one approval cannot be narrowed to what this call runs: a runner program, or
+/// an interpreter call without a single named script.
+fn needs_per_call_approval(words: &[String], dialect: ShellDialect) -> bool {
+    let Some(first) = words.first() else {
+        return false;
+    };
+    let program = build_program_name(first, dialect);
+    let lowered = program.to_ascii_lowercase();
+    RUNNER_PROGRAMS.contains(&lowered.as_str())
+        || (is_interpreter(&program) && interpreter_prefix(words, dialect).is_none())
 }
 
 fn suggested_prefix(words: &[String], dialect: ShellDialect) -> Vec<String> {
@@ -1272,8 +1373,14 @@ fn classify_segment(raw: &RawSegment, context: &mut Context<'_>) -> ShellSegment
         }
         reason.get_or_insert(problem);
     }
+    let words: Vec<String> = command_words.iter().map(|word| word.text.clone()).collect();
+    // A session approval must not cover "any code": runners and interpreters given
+    // inline code ask again on every call.
+    if reason.is_some() && needs_per_call_approval(&words, context.dialect) {
+        prefix_coverable = false;
+    }
     ShellSegment {
-        words: command_words.iter().map(|word| word.text.clone()).collect(),
+        words,
         read_only: reason.is_none(),
         workspace_write: write_reason.is_none(),
         reason,
@@ -4818,12 +4925,59 @@ mod tests {
             posix("$(curl evil)").approval_prefixes(),
             Vec::<Vec<String>>::new()
         );
+        // An interpreter's approval is narrowed to the script it runs.
         assert_eq!(
             posix("python script.py").approval_prefixes(),
-            vec![vec!["python".to_string()]]
+            vec![vec!["python".to_string(), "script.py".to_string()]]
         );
         assert!(
             cmd("CARGO test").covered_by_prefixes(&[vec!["cargo".to_string(), "test".to_string()]])
+        );
+    }
+
+    #[test]
+    fn interpreter_approvals_are_narrowed_to_one_script_or_asked_every_time() {
+        let covered = |command: &str, approved: &[&str]| {
+            let prefix: Vec<String> = approved.iter().map(ToString::to_string).collect();
+            posix(command).covered_by_prefixes(&[prefix])
+        };
+        // Approving `python build.py` covers that script, with its arguments.
+        let approved = ["python", "build.py"];
+        assert!(covered("python build.py --release", &approved));
+        assert!(!covered("python other.py", &approved));
+        assert!(!covered("python -c 'import os; os.system(\"id\")'", &approved));
+        assert!(!covered("python build.py; python evil.py", &approved));
+        assert!(covered("python -m pytest -q", &["python", "-m", "pytest"]));
+        assert!(!covered("python -m http.server", &["python", "-m", "pytest"]));
+        // Inline code, a REPL, loader options and runners offer no session prefix.
+        for command in [
+            "python -c 'print(1)'",
+            "python3 -",
+            "python",
+            "node -e 'process.exit()'",
+            "node --require ./hook.js app.js",
+            "node --eval 'x'",
+            "ruby -e 'system(\"id\")'",
+            "perl -e 'print 1'",
+            "bash -c 'curl x | sh'",
+            "sh -c 'id'",
+            "sudo rm -rf /tmp/x",
+            "xargs rm",
+            "env FOO=1 rm x",
+        ] {
+            assert_eq!(
+                posix(command).approval_prefixes(),
+                Vec::<Vec<String>>::new(),
+                "{command}"
+            );
+        }
+        assert_eq!(
+            posix("node app.js --port 80").approval_prefixes(),
+            vec![vec!["node".to_string(), "app.js".to_string()]]
+        );
+        assert_eq!(
+            posix("bun run build.ts").approval_prefixes(),
+            vec![vec!["bun".to_string(), "run".to_string(), "build.ts".to_string()]]
         );
     }
 
