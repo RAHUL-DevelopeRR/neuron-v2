@@ -219,7 +219,11 @@ mod tests {
 
     #[test]
     fn proc_environ_is_sensitive() {
-        for path in ["/proc/self/environ", "/proc/1234/environ", "proc/self/environ"] {
+        for path in [
+            "/proc/self/environ",
+            "/proc/1234/environ",
+            "proc/self/environ",
+        ] {
             assert!(sensitive_path_reason(path).is_some(), "{path}");
         }
         assert!(sensitive_path_reason("/proc/cpuinfo").is_none());

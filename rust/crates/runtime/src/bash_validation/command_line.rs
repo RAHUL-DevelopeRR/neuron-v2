@@ -347,8 +347,22 @@ const INTERPRETERS: &[&str] = &[
 /// Programs that run another program named in their arguments; no prefix can say what
 /// they will run, so each call needs its own approval.
 const RUNNER_PROGRAMS: &[&str] = &[
-    "sudo", "su", "doas", "runas", "eval", "exec", "env", "xargs", "nohup", "command", "builtin",
-    "source", ".", "invoke-expression", "iex", "start-process",
+    "sudo",
+    "su",
+    "doas",
+    "runas",
+    "eval",
+    "exec",
+    "env",
+    "xargs",
+    "nohup",
+    "command",
+    "builtin",
+    "source",
+    ".",
+    "invoke-expression",
+    "iex",
+    "start-process",
 ];
 
 /// Interpreter options that only tune how a script runs, never what code runs.
@@ -4945,10 +4959,16 @@ mod tests {
         let approved = ["python", "build.py"];
         assert!(covered("python build.py --release", &approved));
         assert!(!covered("python other.py", &approved));
-        assert!(!covered("python -c 'import os; os.system(\"id\")'", &approved));
+        assert!(!covered(
+            "python -c 'import os; os.system(\"id\")'",
+            &approved
+        ));
         assert!(!covered("python build.py; python evil.py", &approved));
         assert!(covered("python -m pytest -q", &["python", "-m", "pytest"]));
-        assert!(!covered("python -m http.server", &["python", "-m", "pytest"]));
+        assert!(!covered(
+            "python -m http.server",
+            &["python", "-m", "pytest"]
+        ));
         // Inline code, a REPL, loader options and runners offer no session prefix.
         for command in [
             "python -c 'print(1)'",
@@ -4977,7 +4997,11 @@ mod tests {
         );
         assert_eq!(
             posix("bun run build.ts").approval_prefixes(),
-            vec![vec!["bun".to_string(), "run".to_string(), "build.ts".to_string()]]
+            vec![vec![
+                "bun".to_string(),
+                "run".to_string(),
+                "build.ts".to_string()
+            ]]
         );
     }
 
