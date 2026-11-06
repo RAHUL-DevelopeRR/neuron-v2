@@ -1,4 +1,4 @@
-import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react'
+import { forwardRef, useEffect, useId, useImperativeHandle, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react'
 
 import type { Attachment } from '@neuron/client'
 
@@ -12,10 +12,15 @@ export const MODES: Array<{ id: string; label: string; help: string }> = [
   { id: 'danger-full-access', label: 'Full access', help: 'Runs anything without asking. Use with care' },
 ]
 
-/** The order Shift+Tab goes through: the modes the menu offers, then plan mode. */
+/** The order Ctrl+Shift+M goes through: read only, edit files, then plan mode. Full access is never in it; only the menu picks it. */
 export function nextMode(mode: string, planMode: boolean): { mode: string; plan: boolean } {
-  const steps = [...MODES.map((entry) => ({ mode: entry.id, plan: false })), { mode, plan: true }]
-  const at = planMode ? steps.length - 1 : Math.max(0, MODES.findIndex((entry) => entry.id === mode))
+  const steps = [
+    { mode: 'read-only', plan: false },
+    { mode: 'workspace-write', plan: false },
+    { mode, plan: true },
+  ]
+  const at = planMode ? steps.length - 1 : steps.findIndex((step) => step.mode === mode)
+  // From full access (not in the cycle) the first step is the safest one.
   return steps[(at + 1) % steps.length]
 }
 
@@ -95,8 +100,12 @@ interface ComposerProps {
   permissionWaiting?: boolean
   /** A command this window runs; what it returns is shown under the box. */
   onCommand?: (name: DesktopCommand, args: string) => string | void | Promise<string | void>
-  /** Shift+Tab. */
+  /** Ctrl+Shift+M (Cmd+Shift+M). */
   onCycleMode?: () => void
+  /** The chat's session id: queued prompts belong to one session and are dropped when it changes. */
+  sessionId?: string | null
+  /** The last turn failed: queued prompts wait for the user instead of running into the same failure. */
+  turnFailed?: boolean
 }
 
 export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Composer(
@@ -119,6 +128,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     permissionWaiting = false,
     onCommand,
     onCycleMode,
+    sessionId = null,
+    turnFailed = false,
   },
   ref,
 ) {
@@ -132,6 +143,13 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   const [helpOpen, setHelpOpen] = useState(false)
   const [queue, setQueue] = useState<Queued[]>([])
   const [editing, setEditing] = useState<{ id: number; text: string } | null>(null)
+  // The queue waits after an interrupt, a stop or a failed turn, until the user resumes it.
+  const [paused, setPaused] = useState(false)
+  // Esc closed the open suggestion menu; typing opens it again.
+  const [menuClosed, setMenuClosed] = useState(false)
+  const listId = useId()
+  const queueRef = useRef<Queued[]>([])
+  queueRef.current = queue
   const box = useRef<HTMLTextAreaElement>(null)
   const nextId = useRef(0)
   const lastSent = useRef(-1)
@@ -140,7 +158,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   const draft = useRef('')
   const imagesRef = useRef<StagedImage[]>([])
   imagesRef.current = images
-  const mention = mentionAt(text, caret)
+  // An answer to the agent's question carries no attachments, so `@` offers none.
+  const mention = questionWaiting ? null : mentionAt(text, caret)
   const historyKey = projectPath ? `composer.history.${projectPath}` : null
 
   // Nothing typed is lost: a prompt the gateway refused comes back, unless something new is being typed.
@@ -207,6 +226,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   )
 
   const suggestions = useMemo<Suggestion[]>(() => {
+    if (menuClosed) return []
     if (mention) return found.map((value): Suggestion => (value.endsWith('/') ? { kind: 'folder', value } : { kind: 'file', value }))
     const command = /^\/(\S*)$/.exec(text)
     if (!command || questionWaiting) return []
@@ -219,7 +239,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
         names: [spec.name, ...(spec.aliases ?? [])],
       }),
     )
-  }, [mention, found, text, questionWaiting, features])
+  }, [mention, found, text, questionWaiting, features, menuClosed])
 
   const choose = (suggestion: Suggestion) => {
     if (suggestion.kind === 'command') {
@@ -268,17 +288,21 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   const send = () => {
     const value = text.trim()
     if (!value || disabled) return
-    // Only the files still mentioned in the text go along.
-    const attachments: Attachment[] = [
+    // Only the files still mentioned in the text go along. An answer to a question carries none: they stay for the next message.
+    const attachments: Attachment[] = questionWaiting
+      ? []
+      : [
       ...mentions.filter((item) => value.includes(`@${shown(item)}`)).map((item): Attachment => ({ kind: item.kind, path: item.path })),
       ...images.map((image): Attachment => ({ kind: 'image', path: image.path, media_type: image.media_type })),
-    ]
+        ]
     const item = { id: ++nextId.current, text: value, attachments }
     remember(value)
-    for (const image of images) if (image.url) URL.revokeObjectURL?.(image.url)
+    if (!questionWaiting) {
+      for (const image of images) if (image.url) URL.revokeObjectURL?.(image.url)
+      setMentions([])
+      setImages([])
+    }
     setText('')
-    setMentions([])
-    setImages([])
     setCaret(0)
     setPick(0)
     setHint(null)
@@ -290,7 +314,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
 
   // The turn is over (and nothing waits for an answer): the next queued prompt goes.
   useEffect(() => {
-    if (busy || disabled || questionWaiting || permissionWaiting || queue.length === 0) return
+    if (busy || disabled || questionWaiting || permissionWaiting || paused || queue.length === 0) return
     const next = queue[0]
     if (lastSent.current === next.id) return
     lastSent.current = next.id
@@ -298,11 +322,39 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     run(next)
     // `run` follows the props above.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [busy, disabled, questionWaiting, permissionWaiting, queue])
+  }, [busy, disabled, questionWaiting, permissionWaiting, paused, queue])
+
+  // Nothing waits any more: nothing is paused.
+  useEffect(() => {
+    if (queue.length === 0) setPaused(false)
+  }, [queue.length])
+
+  // Another session: its queue is not this one's.
+  const lastSession = useRef(sessionId)
+  useEffect(() => {
+    if (lastSession.current === sessionId) return
+    lastSession.current = sessionId
+    setQueue([])
+    setPaused(false)
+  }, [sessionId])
+
+  // A failed turn (or a prompt put back after one) holds the queue.
+  useEffect(() => {
+    if ((turnFailed || restore) && queueRef.current.length > 0) setPaused(true)
+  }, [turnFailed, restore])
+
+  const interrupt = () => {
+    if (queueRef.current.length > 0) setPaused(true)
+    onInterrupt()
+  }
 
   useImperativeHandle(ref, () => ({ submit: send, focus: () => box.current?.focus() }))
 
   const addImages = async (files: File[]) => {
+    if (questionWaiting) {
+      setHint('Answer the question first; images and files can go with your next message.')
+      return
+    }
     if (!supportsImages) {
       setHint("This model can't read images, so the image was not attached.")
       return
@@ -369,10 +421,11 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   return (
     <div className="composer">
       {suggestions.length > 0 && (
-        <ul className="suggestions" role="listbox" aria-label={mention ? 'Files' : 'Commands'}>
+        <ul id={listId} className="suggestions" role="listbox" aria-label={mention ? 'Files' : 'Commands'}>
           {suggestions.map((suggestion, index) => (
             <li
               key={`${suggestion.kind}:${suggestion.value}`}
+              id={`${listId}-${index}`}
               role="option"
               aria-selected={index === pick}
               className={index === pick ? 'active' : ''}
@@ -410,9 +463,17 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
             ))}
           </ul>
           <p className="muted small">
-            Enter sends · Shift+Enter adds a line · Shift+Tab changes the permission mode · Up and Down bring back earlier prompts · Esc stops a turn
+            Enter sends · Shift+Enter adds a line · Ctrl+Shift+M changes the permission mode · Up and Down bring back earlier prompts · Esc stops a turn
           </p>
         </section>
+      )}
+      {paused && queue.length > 0 && (
+        <div className="composer-hint" role="status">
+          Queue paused{' '}
+          <button type="button" className="link-button" onClick={() => setPaused(false)}>
+            Resume
+          </button>
+        </div>
       )}
       {queue.length > 0 && (
         <ul className="queue" aria-label="Queued messages">
@@ -479,6 +540,12 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
         <textarea
           ref={box}
           aria-label="Message Neuron"
+          role="combobox"
+          aria-autocomplete="list"
+          aria-haspopup="listbox"
+          aria-expanded={suggestions.length > 0}
+          aria-controls={suggestions.length > 0 ? listId : undefined}
+          aria-activedescendant={suggestions.length > 0 ? `${listId}-${pick}` : undefined}
           placeholder={
             disabled
               ? (disabledReason ?? 'Neuron is not connected')
@@ -495,7 +562,12 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
             setText(event.target.value)
             setCaret(event.target.selectionStart ?? event.target.value.length)
             setPick(0)
-            setHint(null)
+            setMenuClosed(false)
+            setHint(
+              questionWaiting && mentionAt(event.target.value, event.target.selectionStart ?? event.target.value.length)
+                ? 'Files cannot go with an answer; attach them to your next message.'
+                : null,
+            )
             historyAt.current = null
           }}
           onSelect={(event) => setCaret(event.currentTarget.selectionStart ?? 0)}
@@ -506,9 +578,17 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
             void addImages(pasted)
           }}
           onKeyDown={(event) => {
-            if (event.key === 'Tab' && event.shiftKey && onCycleMode) {
+            // A word being composed (an IME) is not a key press: Enter confirms the word.
+            if (event.nativeEvent.isComposing || event.keyCode === 229) return
+            if (event.key.toLowerCase() === 'm' && event.shiftKey && (event.ctrlKey || event.metaKey) && !event.altKey && onCycleMode) {
               event.preventDefault()
               onCycleMode()
+              return
+            }
+            // Esc closes an open menu first; it stops the turn only when none is open.
+            if (event.key === 'Escape' && suggestions.length > 0) {
+              event.preventDefault()
+              setMenuClosed(true)
               return
             }
             if (suggestions.length > 0 && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
@@ -536,7 +616,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
               event.preventDefault()
               send()
             } else if (event.key === 'Escape' && busy) {
-              onInterrupt()
+              interrupt()
             }
           }}
         />
@@ -586,7 +666,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
           {toolbar}
           <div className="spacer" />
           {busy && (
-            <button className="stop" onClick={onInterrupt} title="Interrupt (Esc)">
+            <button className="stop" onClick={interrupt} title="Interrupt (Esc)">
               ■ Stop
             </button>
           )}
@@ -662,7 +742,7 @@ export function ModeMenu({
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-label="Permission mode"
-        title="Permission mode (Shift+Tab changes it)"
+        title="Permission mode (Ctrl+Shift+M changes it)"
         disabled={disabled}
         onClick={() => setOpen(!open)}
       >
