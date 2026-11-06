@@ -872,6 +872,33 @@ export function parseUiEvent(value: unknown): ParsedLine {
   return { ok: true, event: value as UiEvent }
 }
 
+const MAX_TEXT = 256 * 1024
+const MAX_ATTACHMENTS = 20
+const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp']
+
+/** A string no longer than `max` UTF-16 units. */
+function isText(value: unknown, max: number): value is string {
+  return typeof value === 'string' && value.length <= max
+}
+
+/** Remote peers may only name paths inside the workspace: relative, no `..`, no NUL. */
+function isWorkspaceRelative(path: unknown): path is string {
+  if (typeof path !== 'string' || path === '' || path.length > 4096 || path.includes('\0')) return false
+  if (/^[\\/]/.test(path) || /^[A-Za-z]:/.test(path)) return false
+  return !path.split(/[\\/]/).includes('..')
+}
+
+function parseRemoteAttachment(entry: unknown): Attachment | null {
+  if (typeof entry !== 'object' || entry === null) return null
+  const a = entry as Record<string, unknown>
+  if (!isWorkspaceRelative(a.path)) return null
+  if (a.kind === 'file' || a.kind === 'folder') return { kind: a.kind, path: a.path }
+  if (a.kind === 'image' && typeof a.media_type === 'string' && IMAGE_TYPES.includes(a.media_type)) {
+    return { kind: 'image', path: a.path, media_type: a.media_type }
+  }
+  return null
+}
+
 /** Validates a client message from an untrusted peer (a remote client). */
 export function parseClientMessage(value: unknown): ClientMessage | null {
   if (typeof value !== 'object' || value === null) return null
@@ -891,23 +918,23 @@ export function parseClientMessage(value: unknown): ClientMessage | null {
   if (message.kind !== 'command') return null
   switch (message.type) {
     case 'submit': {
-      if (typeof message.text !== 'string') return null
-      const attachments = Array.isArray(message.attachments) ? message.attachments : []
-      const valid = attachments.every(
-        (a) =>
-          typeof a === 'object' &&
-          a !== null &&
-          typeof (a as { path?: unknown }).path === 'string' &&
-          ['file', 'folder', 'image'].includes((a as { kind?: string }).kind ?? ''),
-      )
-      return valid ? { kind: 'command', type: 'submit', text: message.text, attachments: attachments as Attachment[] } : null
+      if (!isText(message.text, MAX_TEXT)) return null
+      const raw = message.attachments === undefined ? [] : message.attachments
+      if (!Array.isArray(raw) || raw.length > MAX_ATTACHMENTS) return null
+      const attachments: Attachment[] = []
+      for (const entry of raw) {
+        const attachment = parseRemoteAttachment(entry)
+        if (!attachment) return null
+        attachments.push(attachment)
+      }
+      return { kind: 'command', type: 'submit', text: message.text, attachments }
     }
     case 'slash':
-      return typeof message.command === 'string'
+      return isText(message.command, 64) && (message.args === undefined || isText(message.args, 64 * 1024))
         ? { kind: 'command', type: 'slash', command: message.command, args: typeof message.args === 'string' ? message.args : '' }
         : null
     case 'set_model':
-      return typeof message.model === 'string' ? { kind: 'command', type: 'set_model', model: message.model } : null
+      return isText(message.model, 256) ? { kind: 'command', type: 'set_model', model: message.model } : null
     case 'list_models':
     case 'interrupt':
     case 'shutdown':
@@ -922,28 +949,33 @@ export function parseClientMessage(value: unknown): ClientMessage | null {
         ? { kind: 'command', type: 'list_sessions', scope: message.scope }
         : null
     case 'capabilities': {
-      if (!Array.isArray(message.features) || !message.features.every((feature) => typeof feature === 'string')) {
+      if (
+        !Array.isArray(message.features) ||
+        message.features.length > 32 ||
+        !message.features.every((feature) => isText(feature, 64))
+      ) {
         return null
       }
       const features = message.features as string[]
+      if (message.client !== undefined && !isText(message.client, 64)) return null
       return typeof message.client === 'string'
         ? { kind: 'command', type: 'capabilities', features, client: message.client }
         : { kind: 'command', type: 'capabilities', features }
     }
     case 'answer':
-      return Number.isSafeInteger(message.id) && typeof message.text === 'string'
+      return Number.isSafeInteger(message.id) && isText(message.text, MAX_TEXT)
         ? { kind: 'command', type: 'answer', id: message.id as number, text: message.text }
         : null
     case 'resume':
-      return typeof message.session === 'string' && message.session.trim()
+      return isText(message.session, 512) && message.session.trim()
         ? { kind: 'command', type: 'resume', session: message.session }
         : null
     case 'set_mcp_server_enabled':
-      return typeof message.name === 'string' && message.name && typeof message.enabled === 'boolean'
+      return isText(message.name, 256) && message.name && typeof message.enabled === 'boolean'
         ? { kind: 'command', type: 'set_mcp_server_enabled', name: message.name, enabled: message.enabled }
         : null
     case 'commit':
-      return typeof message.message === 'string' && message.message.trim()
+      return isText(message.message, 16 * 1024) && message.message.trim()
         ? { kind: 'command', type: 'commit', message: message.message }
         : null
     case 'rewind': {

@@ -621,3 +621,74 @@ describe('client messages from untrusted peers', () => {
     }
   })
 })
+
+describe('untrusted peers: attachments and length caps', () => {
+  const submit = (extra: Record<string, unknown>) => parseClientMessage({ kind: 'command', type: 'submit', text: 'go', ...extra })
+
+  test('attachments are rebuilt from their known fields only', () => {
+    expect(
+      submit({
+        attachments: [
+          { kind: 'file', path: 'a.rs', evil: 1 },
+          { kind: 'folder', path: 'src/lib' },
+          { kind: 'image', path: 'shot.png', media_type: 'image/png', extra: true },
+        ],
+      }),
+    ).toEqual({
+      kind: 'command',
+      type: 'submit',
+      text: 'go',
+      attachments: [
+        { kind: 'file', path: 'a.rs' },
+        { kind: 'folder', path: 'src/lib' },
+        { kind: 'image', path: 'shot.png', media_type: 'image/png' },
+      ],
+    })
+  })
+
+  test('images need an allowed media type', () => {
+    for (const media_type of ['image/png', 'image/jpeg', 'image/gif', 'image/webp']) {
+      expect(submit({ attachments: [{ kind: 'image', path: 'a', media_type }] })).not.toBeNull()
+    }
+    expect(submit({ attachments: [{ kind: 'image', path: 'a', media_type: 'image/svg+xml' }] })).toBeNull()
+    expect(submit({ attachments: [{ kind: 'image', path: 'a' }] })).toBeNull()
+    expect(submit({ attachments: [{ kind: 'video', path: 'a' }] })).toBeNull()
+  })
+
+  test('paths must be non-empty, relative, without .. or NUL', () => {
+    for (const path of ['', '/x', '\\x', 'C:\\x', 'C:x', 'c:/x', '\\\\server\\share', '../x', 'a/../b', 'a\\..\\b', '..', 'a\0b']) {
+      expect(submit({ attachments: [{ kind: 'file', path }] })).toBeNull()
+    }
+    expect(submit({ attachments: [{ kind: 'file', path: 'a..b/c.rs' }] })).not.toBeNull()
+  })
+
+  test('at most 20 attachments and 256 KiB of text', () => {
+    const one = { kind: 'file', path: 'a' }
+    expect(submit({ attachments: Array(20).fill(one) })).not.toBeNull()
+    expect(submit({ attachments: Array(21).fill(one) })).toBeNull()
+    expect(parseClientMessage({ kind: 'command', type: 'submit', text: 'x'.repeat(256 * 1024) })).not.toBeNull()
+    expect(parseClientMessage({ kind: 'command', type: 'submit', text: 'x'.repeat(256 * 1024 + 1) })).toBeNull()
+  })
+
+  test('other fields are capped', () => {
+    const cmd = (type: string, rest: Record<string, unknown>) => parseClientMessage({ kind: 'command', type, ...rest })
+    const cases: Array<[string, (n: number) => Record<string, unknown>, number]> = [
+      ['commit', (n) => ({ message: 'x'.repeat(n) }), 16 * 1024],
+      ['set_mcp_server_enabled', (n) => ({ name: 'x'.repeat(n), enabled: true }), 256],
+      ['capabilities', (n) => ({ features: ['f'], client: 'x'.repeat(n) }), 64],
+      ['answer', (n) => ({ id: 1, text: 'x'.repeat(n) }), 256 * 1024],
+      ['slash', (n) => ({ command: 'x'.repeat(n) }), 64],
+      ['slash', (n) => ({ command: 'm', args: 'x'.repeat(n) }), 64 * 1024],
+      ['set_model', (n) => ({ model: 'x'.repeat(n) }), 256],
+      ['resume', (n) => ({ session: 'x'.repeat(n) }), 512],
+    ]
+    for (const [type, make, cap] of cases) {
+      expect(cmd(type, make(cap))).not.toBeNull()
+      expect(cmd(type, make(cap + 1))).toBeNull()
+    }
+    expect(cmd('capabilities', { features: Array(32).fill('f') })).not.toBeNull()
+    expect(cmd('capabilities', { features: Array(33).fill('f') })).toBeNull()
+    expect(cmd('capabilities', { features: ['x'.repeat(64)] })).not.toBeNull()
+    expect(cmd('capabilities', { features: ['x'.repeat(65)] })).toBeNull()
+  })
+})
