@@ -967,6 +967,11 @@ where
     /// `compact`). What they print is added to the next prompt as context; the
     /// result is returned for the caller to show.
     pub fn run_session_start_hooks(&mut self, source: &str) -> HookRunResult {
+        // `/clear` and `/resume` begin another session: what an earlier start left
+        // unsent (and a rebuild carried over) belongs to the old one.
+        if matches!(source, "clear" | "resume") {
+            self.pending_hook_context.clear();
+        }
         self.hook_runner
             .set_session_id(self.session.session_id.clone());
         let result = self.run_lifecycle_hook(
@@ -978,6 +983,21 @@ where
                 .extend(result.messages().iter().cloned());
         }
         result
+    }
+
+    /// Takes what `SessionStart` hooks printed and no turn has sent yet. A caller
+    /// that replaces this runtime with a rebuilt one hands it on through
+    /// [`Self::set_pending_hook_context`], so the rebuild does not lose it.
+    #[must_use]
+    pub fn take_pending_hook_context(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_hook_context)
+    }
+
+    /// Sets the hook context the next turn sends (see
+    /// [`Self::take_pending_hook_context`]); what is already pending stays after it.
+    pub fn set_pending_hook_context(&mut self, mut context: Vec<String>) {
+        context.append(&mut self.pending_hook_context);
+        self.pending_hook_context = context;
     }
 
     /// Runs the `PreCompact` hooks before `/compact` (`trigger` `manual`) or automatic
@@ -3742,6 +3762,131 @@ mod tests {
     #[cfg(not(windows))]
     fn shell_snippet(script: &str) -> String {
         script.to_string()
+    }
+
+    /// An API client that records the text of every user message it is sent.
+    struct RecordingApiClient {
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl ApiClient for RecordingApiClient {
+        fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            let mut seen = self.seen.lock().expect("seen lock");
+            for message in &request.messages {
+                for block in &message.blocks {
+                    if let (MessageRole::User, ContentBlock::Text { text }) = (&message.role, block)
+                    {
+                        seen.push(text.clone());
+                    }
+                }
+            }
+            Ok(vec![
+                AssistantEvent::TextDelta("ok".to_string()),
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+
+    fn recording_runtime(
+        hooks: RuntimeHookConfig,
+    ) -> (
+        ConversationRuntime<RecordingApiClient, StaticToolExecutor>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runtime = ConversationRuntime::new_with_features(
+            Session::new(),
+            RecordingApiClient {
+                seen: Arc::clone(&seen),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+            &RuntimeFeatureConfig::default().with_hooks(hooks),
+        );
+        (runtime, seen)
+    }
+
+    #[test]
+    fn session_start_context_survives_a_runtime_rebuild() {
+        use crate::hook_matcher::{HookCommand, HookSource};
+        use crate::hooks::HookEvent;
+        let hooks = RuntimeHookConfig::default().with(
+            HookEvent::SessionStart,
+            HookCommand::new("echo release-codename-marker", HookSource::Project),
+        );
+        let (mut first, _) = recording_runtime(hooks);
+        let result = first.run_session_start_hooks("startup");
+        assert!(!result.is_failed(), "{result:?}");
+
+        // The CLI rebuilds the runtime before the first turn: the new one starts
+        // empty, so the context is handed across.
+        let (mut rebuilt, seen) = recording_runtime(RuntimeHookConfig::default());
+        let context = first.take_pending_hook_context();
+        assert!(first.take_pending_hook_context().is_empty(), "taken once");
+        rebuilt.set_pending_hook_context(context);
+        rebuilt
+            .run_turn("what is the codename?", None)
+            .expect("turn");
+
+        let seen = seen.lock().expect("seen lock");
+        let prompt = seen.last().expect("a user message");
+        assert!(prompt.starts_with("what is the codename?"), "{prompt}");
+        assert!(prompt.contains("[Context from hooks]"), "{prompt}");
+        assert!(prompt.contains("release-codename-marker"), "{prompt}");
+    }
+
+    #[test]
+    fn rebuilt_runtime_without_the_handover_loses_session_start_context() {
+        // Documents the bug the handover fixes: nothing carries over by itself.
+        use crate::hook_matcher::{HookCommand, HookSource};
+        use crate::hooks::HookEvent;
+        let hooks = RuntimeHookConfig::default().with(
+            HookEvent::SessionStart,
+            HookCommand::new("echo release-codename-marker", HookSource::Project),
+        );
+        let (mut first, _) = recording_runtime(hooks);
+        first.run_session_start_hooks("startup");
+        let (mut rebuilt, seen) = recording_runtime(RuntimeHookConfig::default());
+        rebuilt.run_turn("hello", None).expect("turn");
+        let seen = seen.lock().expect("seen lock");
+        assert_eq!(seen.last().map(String::as_str), Some("hello"));
+    }
+
+    #[test]
+    fn clear_and_resume_drop_context_left_by_an_earlier_session() {
+        for source in ["clear", "resume"] {
+            let (mut runtime, _) = recording_runtime(RuntimeHookConfig::default());
+            runtime.set_pending_hook_context(vec!["old-session".to_string()]);
+            runtime.run_session_start_hooks(source);
+            assert!(runtime.take_pending_hook_context().is_empty(), "{source}");
+        }
+        for source in ["startup", "compact"] {
+            let (mut runtime, _) = recording_runtime(RuntimeHookConfig::default());
+            runtime.set_pending_hook_context(vec!["kept".to_string()]);
+            runtime.run_session_start_hooks(source);
+            assert_eq!(runtime.take_pending_hook_context(), ["kept"], "{source}");
+        }
+    }
+
+    #[test]
+    fn handed_over_context_comes_before_user_prompt_submit_context() {
+        use crate::hook_matcher::{HookCommand, HookSource};
+        use crate::hooks::HookEvent;
+        let hooks = RuntimeHookConfig::default().with(
+            HookEvent::UserPromptSubmit,
+            HookCommand::new("echo prompt-marker", HookSource::Project),
+        );
+        let (mut runtime, seen) = recording_runtime(hooks);
+        runtime.set_pending_hook_context(vec!["start-marker".to_string()]);
+        runtime.run_turn("go", None).expect("turn");
+        let seen = seen.lock().expect("seen lock");
+        let prompt = seen.last().expect("a user message");
+        let start = prompt.find("start-marker").expect("start context");
+        let submit = prompt.find("prompt-marker").expect("prompt context");
+        assert!(start < submit, "{prompt}");
+        // Consumed by the turn: the next one does not repeat it.
+        assert!(runtime.take_pending_hook_context().is_empty());
     }
 
     #[test]

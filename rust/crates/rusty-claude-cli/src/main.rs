@@ -3316,8 +3316,15 @@ impl LiveCli {
         })
     }
 
-    fn replace_runtime(&mut self, runtime: BuiltRuntime) -> Result<(), Box<dyn std::error::Error>> {
+    fn replace_runtime(
+        &mut self,
+        mut runtime: BuiltRuntime,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         self.runtime.shutdown_plugins()?;
+        // What SessionStart hooks printed and no turn has sent yet belongs to the
+        // session, not to the runtime object: carry it to the rebuilt one.
+        let pending_hook_context = self.runtime.take_pending_hook_context();
+        runtime.set_pending_hook_context(pending_hook_context);
         self.runtime = runtime;
         Ok(())
     }

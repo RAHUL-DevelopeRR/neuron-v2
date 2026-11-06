@@ -276,6 +276,49 @@ fn piped_stdin_reaches_the_model_after_the_prompt() {
     workspace.remove();
 }
 
+/// What a `SessionStart` hook prints reaches the model with the first prompt of a
+/// one-shot run, although the runtime is rebuilt before that turn.
+#[test]
+fn session_start_hook_output_reaches_the_model() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let workspace = Workspace::new("session-start-hook");
+    fs::write(
+        workspace.config_home.join("settings.json"),
+        r#"{"defaultMcpServers":false,"hooks":{"SessionStart":[{"matcher":"startup|resume","command":"echo release-codename-marker"}]}}"#,
+    )
+    .expect("settings");
+
+    let output = run(
+        &workspace,
+        &server.base_url(),
+        &["--output-format=json"],
+        "streaming_text",
+        Stdin::Null,
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    let requests = runtime.block_on(server.captured_requests());
+    let request = requests
+        .iter()
+        .find(|request| request.path == "/v1/messages")
+        .expect("a model call");
+    let body: Value = serde_json::from_str(&request.raw_body).expect("JSON body");
+    let prompt = body["messages"][0]["content"][0]["text"]
+        .as_str()
+        .expect("prompt text");
+    assert!(
+        prompt.starts_with(&format!("{SCENARIO_PREFIX}streaming_text")),
+        "{prompt}"
+    );
+    assert!(prompt.contains("[Context from hooks]"), "{prompt}");
+    assert!(prompt.contains("release-codename-marker"), "{prompt}");
+    workspace.remove();
+}
+
 /// A harness that leaves stdin open and never writes: the run goes on without it.
 #[test]
 fn a_silent_stdin_pipe_does_not_hang_the_run() {
