@@ -350,3 +350,57 @@ describe('the chat host: resilience', () => {
     expect(host.info('c1aaaaaa')).toBeNull()
   })
 })
+
+describe('the chat host: the host\'s newer refusals', () => {
+  const opened = (ipc: FakeIpc) =>
+    ipc.on('chat_open', () => {
+      ipc.emit('neuron://chat-line', { chat: 'c1aaaaaa', generation: 1, line: ready })
+      return summary('c1aaaaaa', 1)
+    })
+
+  test('discarding and starting are coded, in plain words', async () => {
+    const ipc = new FakeIpc()
+    opened(ipc)
+    const host = chatChatsHost(ipc)
+    await host.open({})
+    ipc.on('chat_resume', () => Promise.reject('discarding'))
+    const gone = (await host.resume('c1aaaaaa').catch((failure: unknown) => failure)) as ChatError
+    expect(gone.code).toBe('discarding')
+    expect(gone.message).toBe("This chat's copy is being removed.")
+    ipc.on('worktree_discard', () => Promise.reject('starting'))
+    const early = (await host.discardWorktree('c1aaaaaa', { force: false, deleteUnmerged: false }).catch((failure: unknown) => failure)) as ChatError
+    expect(early.code).toBe('starting')
+    expect(early.message).toBe('This chat is still starting. Try again in a moment.')
+  })
+
+  test('a full input queue is an error line, and the chat stays connected', async () => {
+    const ipc = new FakeIpc()
+    opened(ipc)
+    ipc.on('chat_send', () => Promise.reject('The Neuron engine is not keeping up. Try again in a moment.'))
+    const host = chatChatsHost(ipc)
+    const { controller } = await host.open({})
+    controller.submit('hello')
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    const state = controller.getState()
+    expect(state.connection).toBe('ready')
+    const last = state.items.at(-1)
+    expect(last).toMatchObject({ kind: 'error', text: 'The Neuron engine is not keeping up. Try again in a moment.' })
+  })
+
+  test('a failed discard that leaves the chat stopped can be resumed', async () => {
+    const ipc = new FakeIpc()
+    opened(ipc)
+    ipc.on('worktree_discard', () => Promise.reject('boom'))
+    ipc.on('chat_resume', () => {
+      ipc.emit('neuron://chat-line', { chat: 'c1aaaaaa', generation: 2, line: ready })
+      return summary('c1aaaaaa', 2)
+    })
+    const host = chatChatsHost(ipc)
+    const { controller } = await host.open({})
+    await expect(host.discardWorktree('c1aaaaaa', { force: true, deleteUnmerged: false })).rejects.toThrow('boom')
+    ipc.emit('neuron://chat-exit', { chat: 'c1aaaaaa', generation: 1, code: 0, error: null, reason: 'exited' })
+    expect(controller.getState().connection).toBe('exited')
+    await host.resume('c1aaaaaa')
+    expect(controller.getState().connection).toBe('ready')
+  })
+})

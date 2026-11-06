@@ -61,6 +61,8 @@ const PRUNE_EVERY_MS = 30_000
 /** An engine that has not said `ready` by then has failed to start. */
 const START_TIMEOUT_MS = 30_000
 
+export const NOT_KEEPING_UP = 'The Neuron engine is not keeping up. Try again in a moment.'
+
 const startTimeout = (ms: number) => `The Neuron engine did not start within ${ms >= 1000 ? Math.round(ms / 1000) : ms / 1000} seconds.`
 
 const infoOf = (summary: Summary): ChatInfo => ({
@@ -78,6 +80,8 @@ export function chatError(raw: unknown): ChatError {
   const count = (prefix: string) => Number(text.slice(prefix.length)) || 0
   if (text === 'cap_reached') return new ChatError('4 chats are working. Stop one to open another.', 'cap_reached')
   if (text === 'too_many_chats') return new ChatError('Too many chats are open. Close one to open another.', 'too_many_chats')
+  if (text === 'discarding') return new ChatError("This chat's copy is being removed.", 'discarding')
+  if (text === 'starting') return new ChatError('This chat is still starting. Try again in a moment.', 'starting')
   if (text === 'has_worktree') return new ChatError('This chat works in its own copy of the project. Discard the copy to close the chat, or keep it.', 'has_worktree')
   if (text.startsWith('unmerged:')) return new ChatError('This copy has saved changes that the main folder lacks.', 'unmerged', count('unmerged:'))
   if (text.startsWith('dirty:')) return new ChatError('This copy has unsaved changes.', 'dirty', count('dirty:'))
@@ -267,9 +271,14 @@ class ChatTransport implements EngineTransport, Handler {
 
   /** The host could not hand a message to the engine: this chat is no longer connected. */
   private sendFailed(failure: unknown): void {
+    const error = chatError(failure).message
+    // A full input queue is a refusal of this message, not the end of the engine.
+    if (error === NOT_KEEPING_UP) {
+      for (const listener of [...this.listeners]) listener({ type: 'error', message: error })
+      return
+    }
     if (!this.ready) return
     this.ready = false
-    const error = chatError(failure).message
     for (const listener of [...this.closeListeners]) listener({ code: null, error })
   }
 

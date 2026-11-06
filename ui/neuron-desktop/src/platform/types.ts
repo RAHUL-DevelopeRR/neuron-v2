@@ -175,7 +175,7 @@ export interface ChatInfo {
 }
 
 /** Why a refused host call was refused, for the few the UI answers itself. */
-export type ChatErrorCode = 'cap_reached' | 'too_many_chats' | 'unmerged' | 'dirty' | 'has_worktree'
+export type ChatErrorCode = 'cap_reached' | 'too_many_chats' | 'unmerged' | 'dirty' | 'has_worktree' | 'discarding' | 'starting'
 
 export class ChatError extends Error {
   constructor(
