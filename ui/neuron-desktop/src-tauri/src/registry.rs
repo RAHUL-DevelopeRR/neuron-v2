@@ -37,6 +37,13 @@ const HALT_WAIT: Duration = if cfg!(test) {
 } else {
     Duration::from_secs(4)
 };
+/// How long a same-chat restart (or a start that needs the room) waits for a
+/// stopping engine to exit before ending it: the engine's own shutdown grace.
+const STOP_WAIT: Duration = if cfg!(test) {
+    Duration::from_millis(200)
+} else {
+    Duration::from_secs(5)
+};
 /// How long the app's shutdown waits for engines to save before ending them.
 const SHUTDOWN_WAIT: Duration = if cfg!(test) {
     Duration::from_millis(200)
@@ -130,6 +137,13 @@ struct Chat {
     busy: bool,
     waiting: bool,
     last_activity: Instant,
+    /// An engine is being started: the slot and the generation are reserved,
+    /// but the handle is not there yet.
+    starting: bool,
+    /// The engine ended while it was still starting; reported once it is stored.
+    pending_exit: Option<EngineExit>,
+    /// The copy is being removed: nothing may start or send meanwhile.
+    discarding: bool,
 }
 
 impl Chat {
@@ -173,6 +187,9 @@ pub struct OpenRequest {
 
 pub struct EngineRegistry {
     chats: Mutex<HashMap<ChatId, Chat>>,
+    /// Engines told to stop that have not exited yet. They still count toward
+    /// the cap. Lock order: `chats`, then this.
+    lingering: Mutex<Vec<Arc<dyn EngineHandle>>>,
     active: Mutex<Option<ChatId>>,
     spawner: Arc<dyn Spawner>,
     events: Arc<dyn ChatEvents>,
@@ -201,6 +218,44 @@ pub fn valid_session(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
+/// What the window is told when an engine was ended by the registry.
+fn ended() -> EngineExit {
+    EngineExit {
+        code: None,
+        error: None,
+    }
+}
+
+/// Waits until none of `handles` runs, or `limit` passes; then ends what is left.
+fn wait_for_exit(handles: &[Arc<dyn EngineHandle>], limit: Duration) {
+    let deadline = Instant::now() + limit;
+    while handles.iter().any(|handle| handle.running()) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    for handle in handles.iter().filter(|handle| handle.running()) {
+        handle.kill_tree();
+    }
+}
+
+/// What `reserve` decided.
+enum Reserved {
+    /// An engine is running (or starting); nothing to do.
+    Already(u64),
+    Go(Box<Plan>),
+}
+
+struct Plan {
+    generation: u64,
+    previous_generation: u64,
+    cwd: PathBuf,
+    launch: Launch,
+    /// Engines to ask to stop.
+    stop: Vec<Arc<dyn EngineHandle>>,
+    /// Engines to wait for before the new one starts.
+    wait: Vec<Arc<dyn EngineHandle>>,
+    evicted: Option<(ChatId, u64)>,
+}
+
 fn display_path(path: &Path) -> String {
     worktree::plain(path).to_string_lossy().into_owned()
 }
@@ -225,6 +280,7 @@ impl EngineRegistry {
     ) -> Arc<Self> {
         Arc::new(Self {
             chats: Mutex::new(HashMap::new()),
+            lingering: Mutex::new(Vec::new()),
             active: Mutex::new(None),
             spawner,
             events,
@@ -280,6 +336,9 @@ impl EngineRegistry {
                     busy: false,
                     waiting: false,
                     last_activity: Instant::now(),
+                    starting: false,
+                    pending_exit: None,
+                    discarding: false,
                 },
             );
         }
@@ -329,96 +388,172 @@ impl EngineRegistry {
                 return Err("That session id is not valid.".into());
             }
         }
-        let mut evicted = None;
-        let started = self.start_locked(id, launch, resume, trust_once, replace, &mut evicted);
-        if let Some((victim, generation)) = evicted {
-            self.events.exit(
-                &victim,
-                generation,
-                EngineExit {
-                    code: None,
-                    error: None,
-                },
-                ExitReason::Evicted,
-            );
+        // Under the lock: only bookkeeping. The slot and the generation are
+        // reserved, and the engines to stop are taken out.
+        let plan = match self.reserve(id, launch, resume, replace)? {
+            Reserved::Already(generation) => return Ok(generation),
+            Reserved::Go(plan) => plan,
+        };
+        // Without the lock: stop, wait, spawn.
+        for handle in &plan.stop {
+            handle.stop();
         }
-        started
+        wait_for_exit(&plan.wait, STOP_WAIT);
+        if let Some((victim, generation)) = &plan.evicted {
+            self.events
+                .exit(victim, *generation, ended(), ExitReason::Evicted);
+        }
+        let request = SpawnRequest {
+            chat: id,
+            generation: plan.generation,
+            cwd: &plan.cwd,
+            launch: &plan.launch,
+            trust_once,
+        };
+        let generation = plan.generation;
+        let lines = Arc::clone(self);
+        let exits = Arc::clone(self);
+        let (line_chat, exit_chat) = (id.to_string(), id.to_string());
+        let spawned = self.spawner.spawn(
+            &request,
+            Box::new(move |line| lines.on_line(&line_chat, generation, line)),
+            Box::new(move |exit| exits.on_exit(&exit_chat, generation, exit)),
+        );
+        let mut chats = lock(&self.chats);
+        let handle = match spawned {
+            Ok(handle) => handle,
+            Err(error) => {
+                if let Some(chat) = chats.get_mut(id) {
+                    chat.starting = false;
+                    chat.pending_exit = None;
+                    chat.generation = plan.previous_generation;
+                }
+                return Err(error);
+            }
+        };
+        let Some(chat) = chats.get_mut(id) else {
+            // Closed while it was starting.
+            drop(chats);
+            handle.kill_tree();
+            return Err("No such chat.".into());
+        };
+        chat.handle = Some(handle);
+        chat.starting = false;
+        chat.last_activity = Instant::now();
+        let early_exit = chat.pending_exit.take();
+        if early_exit.is_some() {
+            chat.handle = None;
+        }
+        drop(chats);
+        if let Some(exit) = early_exit {
+            self.events.exit(id, generation, exit, ExitReason::Exited);
+        }
+        Ok(generation)
     }
 
-    fn start_locked(
-        self: &Arc<Self>,
+    /// The part of a start that holds the lock: no stopping, no spawning.
+    fn reserve(
+        &self,
         id: &str,
         launch: &Launch,
         resume: Option<&str>,
-        trust_once: bool,
         replace: bool,
-        evicted: &mut Option<(ChatId, u64)>,
-    ) -> Result<u64, String> {
+    ) -> Result<Reserved, String> {
         let mut chats = lock(&self.chats);
-        if !chats.contains_key(id) {
-            return Err("No such chat.".into());
+        let chat = chats.get(id).ok_or("No such chat.")?;
+        if chat.discarding {
+            return Err("discarding".into());
         }
-        if chats[id].running() && !replace {
-            return Ok(chats[id].generation);
+        if chat.starting {
+            return if replace {
+                Err("starting".into())
+            } else {
+                Ok(Reserved::Already(chat.generation))
+            };
         }
-        // The engine this one replaces; its exit is not news to the window.
-        if let Some(old) = chats.get_mut(id).and_then(|chat| chat.handle.take()) {
-            old.stop();
+        if chat.running() && !replace {
+            return Ok(Reserved::Already(chat.generation));
         }
         let active = lock(&self.active).clone();
-        let running = chats.values().filter(|chat| chat.running()).count();
-        if running >= self.cap {
-            let victim = chats
+        // The engines other chats hold (this chat's own is being replaced).
+        let others = chats
+            .iter()
+            .filter(|(other, chat)| other.as_str() != id && (chat.running() || chat.starting))
+            .count();
+        let mut victim = None;
+        if others >= self.cap {
+            victim = chats
                 .iter()
                 .filter(|(other, chat)| {
                     other.as_str() != id
                         && chat.running()
                         && !chat.busy
                         && !chat.waiting
+                        && !chat.discarding
                         && active.as_deref() != Some(other.as_str())
                 })
                 .min_by_key(|(_, chat)| chat.last_activity)
                 .map(|(other, _)| other.clone());
-            let Some(victim) = victim else {
+            if victim.is_none() {
                 return Err("cap_reached".into());
-            };
+            }
+        }
+
+        let mut stop = Vec::new();
+        let mut evicted = None;
+        let mut lingering = lock(&self.lingering);
+        lingering.retain(|handle| handle.running());
+        // The engine this one replaces; its exit is not news to the window.
+        let old = chats
+            .get_mut(id)
+            .and_then(|chat| chat.handle.take())
+            .filter(|handle| handle.running());
+        if let Some(old) = &old {
+            lingering.push(Arc::clone(old));
+            stop.push(Arc::clone(old));
+        }
+        let mut others_after = others;
+        if let Some(victim) = victim {
             let chat = chats.get_mut(&victim).expect("the victim is listed");
             if let Some(handle) = chat.handle.take() {
-                handle.stop();
+                lingering.push(Arc::clone(&handle));
+                stop.push(handle);
             }
-            *evicted = Some((victim, chat.generation));
+            evicted = Some((victim, chat.generation));
+            others_after -= 1;
         }
+        // Over the cap while stopping engines still run: wait for them.
+        let wait = if others_after + 1 + lingering.len() > self.cap {
+            lingering.clone()
+        } else {
+            old.into_iter().collect()
+        };
+        drop(lingering);
 
         let generation = self.next_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let chat = chats.get_mut(id).expect("checked above");
         if let Some(resume) = resume {
             chat.session = Some(resume.to_string()).filter(|resume| !resume.is_empty());
         }
-        let launch = Launch {
-            resume: chat.session.clone(),
-            ..launch.clone()
-        };
-        let request = SpawnRequest {
-            chat: id,
-            generation,
-            cwd: &chat.cwd,
-            launch: &launch,
-            trust_once,
-        };
-        let lines = Arc::clone(self);
-        let exits = Arc::clone(self);
-        let (line_chat, exit_chat) = (id.to_string(), id.to_string());
-        let handle = self.spawner.spawn(
-            &request,
-            Box::new(move |line| lines.on_line(&line_chat, generation, line)),
-            Box::new(move |exit| exits.on_exit(&exit_chat, generation, exit)),
-        )?;
+        let previous_generation = chat.generation;
         chat.generation = generation;
-        chat.handle = Some(handle);
+        chat.starting = true;
+        chat.pending_exit = None;
         chat.busy = false;
         chat.waiting = false;
         chat.last_activity = Instant::now();
-        Ok(generation)
+        Ok(Reserved::Go(Box::new(Plan {
+            generation,
+            previous_generation,
+            cwd: chat.cwd.clone(),
+            launch: Launch {
+                resume: chat.session.clone(),
+                ..launch.clone()
+            },
+            stop,
+            wait,
+            evicted,
+        })))
     }
 
     fn on_line(&self, id: &str, generation: u64, line: String) {
@@ -431,7 +566,8 @@ impl EngineRegistry {
                 return;
             };
             chat.last_activity = Instant::now();
-            if let Some(session) = status_session(&line) {
+            // A session id is kept only if it could be passed to `--resume`.
+            if let Some(session) = status_session(&line).filter(|session| valid_session(session)) {
                 chat.session = Some(session);
             }
         }
@@ -444,8 +580,16 @@ impl EngineRegistry {
             let Some(chat) = chats.get_mut(id) else {
                 return;
             };
+            if chat.generation != generation {
+                return;
+            }
+            // Ended before the registry stored it: reported when it is.
+            if chat.starting {
+                chat.pending_exit = Some(exit);
+                return;
+            }
             // An engine the registry already replaced or stopped said why then.
-            if chat.generation != generation || chat.handle.is_none() {
+            if chat.handle.is_none() {
                 return;
             }
             chat.handle = None;
@@ -455,7 +599,8 @@ impl EngineRegistry {
         self.events.exit(id, generation, exit, ExitReason::Exited);
     }
 
-    /// Writes one client message to the chat's engine.
+    /// Writes one client message to the chat's engine. It only queues the
+    /// message (the engine's writer thread does the writing), so it never waits.
     pub fn send(&self, id: &str, line: &str) -> Result<(), String> {
         if line.len() > MAX_LINE {
             return Err("That message is too large to send.".into());
@@ -466,6 +611,9 @@ impl EngineRegistry {
         let handle = {
             let mut chats = lock(&self.chats);
             let chat = chats.get_mut(id).ok_or("No such chat.")?;
+            if chat.discarding {
+                return Err("discarding".into());
+            }
             chat.last_activity = Instant::now();
             chat.handle.clone()
         };
@@ -488,10 +636,23 @@ impl EngineRegistry {
         Ok(())
     }
 
-    /// Forgets the chat, stopping its engine.
+    /// Forgets the chat, stopping its engine. A chat with a copy of its own
+    /// (a worktree) is not closed: `has_worktree`, and nothing changes. The
+    /// discard flow removes the copy and the chat together.
     pub fn close(&self, id: &str) -> Result<(), String> {
-        let chat = lock(&self.chats).remove(id).ok_or("No such chat.")?;
-        if let Some(handle) = chat.handle {
+        let handle = {
+            let mut chats = lock(&self.chats);
+            let chat = chats.get(id).ok_or("No such chat.")?;
+            if chat.worktree.is_some() {
+                return Err("has_worktree".into());
+            }
+            let chat = chats.remove(id).expect("checked above");
+            if let Some(handle) = &chat.handle {
+                lock(&self.lingering).push(Arc::clone(handle));
+            }
+            chat.handle
+        };
+        if let Some(handle) = handle {
             handle.stop();
         }
         let mut active = lock(&self.active);
@@ -501,35 +662,98 @@ impl EngineRegistry {
         Ok(())
     }
 
-    /// Stops the chat's engine and waits for it to be gone (ending it after a
-    /// few seconds), so its folder can be removed.
-    pub fn halt(&self, id: &str, reason: ExitReason) -> Result<(), String> {
+    /// Takes the chat's engine, stops it and waits for it to be gone (ending it
+    /// after a few seconds), so its folder can be removed. Says nothing to the
+    /// window; returns the generation of the engine that was there.
+    fn halt_engine(&self, id: &str) -> Result<Option<u64>, String> {
         let (handle, generation) = {
             let mut chats = lock(&self.chats);
             let chat = chats.get_mut(id).ok_or("No such chat.")?;
             chat.busy = false;
             chat.waiting = false;
-            (chat.handle.take(), chat.generation)
+            let handle = chat.handle.take();
+            if let Some(handle) = &handle {
+                lock(&self.lingering).push(Arc::clone(handle));
+            }
+            (handle, chat.generation)
         };
         let Some(handle) = handle else {
-            return Ok(());
+            return Ok(None);
         };
         handle.stop();
-        let deadline = Instant::now() + HALT_WAIT;
-        while handle.running() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(25));
+        wait_for_exit(std::slice::from_ref(&handle), HALT_WAIT);
+        Ok(Some(generation))
+    }
+
+    /// Stops the chat's engine and waits for it to be gone, then tells the
+    /// window why it ended.
+    pub fn halt(&self, id: &str, reason: ExitReason) -> Result<(), String> {
+        if let Some(generation) = self.halt_engine(id)? {
+            self.events.exit(id, generation, ended(), reason);
         }
-        handle.kill_tree();
-        self.events.exit(
-            id,
-            generation,
-            EngineExit {
-                code: None,
-                error: None,
-            },
-            reason,
-        );
         Ok(())
+    }
+
+    /// Removes a chat's copy. While it runs, the chat refuses to start or take
+    /// messages. `check` runs first (nothing is stopped if it refuses), then the
+    /// engine is halted, `before_remove` runs (close terminals), and `remove`
+    /// removes the copy. Only when the removal worked is the chat forgotten and
+    /// the `discarded` exit sent; if it failed the chat is usable again (its
+    /// engine, already stopped, is reported as exited).
+    pub fn discard_worktree(
+        &self,
+        id: &str,
+        check: impl FnOnce(&WorktreeRecord) -> Result<(), String>,
+        before_remove: impl FnOnce(&WorktreeRecord),
+        remove: impl FnOnce(&WorktreeRecord) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let record = {
+            let mut chats = lock(&self.chats);
+            let chat = chats.get_mut(id).ok_or("No such chat.")?;
+            let record = chat
+                .worktree
+                .clone()
+                .ok_or("This chat has no copy of its own.")?;
+            if chat.discarding {
+                return Err("discarding".into());
+            }
+            if chat.starting {
+                return Err("starting".into());
+            }
+            chat.discarding = true;
+            record
+        };
+        let mut halted = None;
+        let result = check(&record).and_then(|()| {
+            halted = self.halt_engine(id)?;
+            before_remove(&record);
+            remove(&record)
+        });
+        match result {
+            Ok(()) => {
+                lock(&self.chats).remove(id);
+                let mut active = lock(&self.active);
+                if active.as_deref() == Some(id) {
+                    *active = None;
+                }
+                drop(active);
+                if let Some(generation) = halted {
+                    self.events
+                        .exit(id, generation, ended(), ExitReason::Discarded);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if let Some(chat) = lock(&self.chats).get_mut(id) {
+                    chat.discarding = false;
+                }
+                if let Some(generation) = halted {
+                    self.events
+                        .exit(id, generation, ended(), ExitReason::Exited);
+                }
+                Err(error)
+            }
+        }
     }
 
     /// The chat in view; it is never stopped for being idle or to make room.
@@ -558,32 +782,31 @@ impl EngineRegistry {
     pub fn reap(&self, now: Instant) -> Vec<ChatId> {
         let active = lock(&self.active).clone();
         let mut reaped = Vec::new();
+        let mut handles = Vec::new();
         {
             let mut chats = lock(&self.chats);
             for (id, chat) in chats.iter_mut() {
                 if chat.running()
                     && !chat.busy
                     && !chat.waiting
+                    && !chat.discarding
                     && active.as_deref() != Some(id.as_str())
                     && now.saturating_duration_since(chat.last_activity) > self.idle_after
                 {
                     if let Some(handle) = chat.handle.take() {
-                        handle.stop();
+                        lock(&self.lingering).push(Arc::clone(&handle));
+                        handles.push(handle);
                     }
                     reaped.push((id.clone(), chat.generation));
                 }
             }
         }
+        // Stopped with the lock released.
+        for handle in &handles {
+            handle.stop();
+        }
         for (id, generation) in &reaped {
-            self.events.exit(
-                id,
-                *generation,
-                EngineExit {
-                    code: None,
-                    error: None,
-                },
-                ExitReason::Idle,
-            );
+            self.events.exit(id, *generation, ended(), ExitReason::Idle);
         }
         reaped.into_iter().map(|(id, _)| id).collect()
     }
@@ -698,10 +921,15 @@ mod tests {
         alive: AtomicBool,
         /// A stop ends the engine at once, like a well-behaved one.
         obeys: bool,
+        /// `send` waits while this is set, like a pipe nobody reads.
+        stalled: AtomicBool,
     }
 
     impl EngineHandle for FakeEngine {
         fn send(&self, line: &str) -> Result<(), String> {
+            while self.stalled.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
             lock(&self.sent).push(line.to_string());
             Ok(())
         }
@@ -726,6 +954,8 @@ mod tests {
         cwd: PathBuf,
         args: Vec<String>,
         trust_once: bool,
+        /// Engines started before this one that still ran when it started.
+        alive_at_spawn: usize,
         engine: Arc<FakeEngine>,
         line: Arc<dyn Fn(String) + Send + Sync>,
         exit: Mutex<Option<ExitFn>>,
@@ -736,6 +966,8 @@ mod tests {
         spawned: Mutex<Vec<Arc<Spawned>>>,
         refuse: Mutex<Option<String>>,
         obeys: bool,
+        /// The engine ends before `spawn` has returned.
+        exits_while_starting: AtomicBool,
     }
 
     impl FakeSpawner {
@@ -763,7 +995,21 @@ mod tests {
                 kills: AtomicU64::new(0),
                 alive: AtomicBool::new(true),
                 obeys: self.obeys,
+                stalled: AtomicBool::new(false),
             });
+            let alive_at_spawn = lock(&self.spawned)
+                .iter()
+                .filter(|spawned| spawned.engine.running())
+                .count();
+            if self.exits_while_starting.load(Ordering::SeqCst) {
+                engine.alive.store(false, Ordering::SeqCst);
+                on_exit(EngineExit {
+                    code: Some(1),
+                    error: None,
+                });
+                let spawned_engine: Arc<dyn EngineHandle> = engine.clone();
+                return Ok(spawned_engine);
+            }
             let on_line = Mutex::new(on_line);
             lock(&self.spawned).push(Arc::new(Spawned {
                 chat: request.chat.to_string(),
@@ -771,6 +1017,7 @@ mod tests {
                 cwd: request.cwd.to_path_buf(),
                 args: crate::engine::engine_args(request.launch),
                 trust_once: request.trust_once,
+                alive_at_spawn,
                 engine: Arc::clone(&engine),
                 line: Arc::new(move |line| {
                     let call = lock(&on_line);
@@ -1435,6 +1682,297 @@ mod tests {
             listed[0].project.name,
             fixture.dir.file_name().unwrap().to_string_lossy()
         );
+    }
+
+    fn worktree_record(path: &Path) -> WorktreeRecord {
+        WorktreeRecord {
+            repo: path.to_path_buf(),
+            root: path.to_path_buf(),
+            path: path.to_path_buf(),
+            subdir: PathBuf::new(),
+            slug: "copy".into(),
+            branch: "neuron/copy".into(),
+            base: "main".into(),
+        }
+    }
+
+    impl Fixture {
+        fn open_copy(&self) -> ChatSummary {
+            self.registry
+                .open(
+                    OpenRequest {
+                        path: self.dir.clone(),
+                        resume: None,
+                        worktree: Some(worktree_record(&self.dir)),
+                    },
+                    &Launch::default(),
+                )
+                .expect("a chat opens")
+        }
+    }
+
+    /// An engine that stops reading its input stalls its own `send`, and nothing
+    /// else: another chat still sends, stops and closes.
+    #[test]
+    fn a_stalled_engine_does_not_block_another_chat() {
+        let fixture = Fixture::new("stalled");
+        let (slow, other) = (fixture.open(), fixture.open());
+        let slow_engine = fixture.spawner.all()[0].engine.clone();
+        slow_engine.stalled.store(true, Ordering::SeqCst);
+
+        let registry = Arc::clone(&fixture.registry);
+        let slow_id = slow.chat.clone();
+        let stuck = std::thread::spawn(move || registry.send(&slow_id, r#"{"kind":"command"}"#));
+        std::thread::sleep(Duration::from_millis(100));
+
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let registry = Arc::clone(&fixture.registry);
+        let other_id = other.chat.clone();
+        let slow_id = slow.chat.clone();
+        std::thread::spawn(move || {
+            let sent = registry.send(&other_id, r#"{"kind":"command"}"#);
+            let summary = registry.summary(&slow_id);
+            let stopped = registry.stop(&other_id);
+            let closed = registry.close(&other_id);
+            let _ = done_tx.send((sent, summary.is_ok(), stopped, closed));
+        });
+        let (sent, summary, stopped, closed) = done
+            .recv_timeout(Duration::from_secs(3))
+            .expect("another chat must not wait for the stalled one");
+        assert!(sent.is_ok() && summary && stopped.is_ok() && closed.is_ok());
+        assert!(!stuck.is_finished(), "the stalled send is still waiting");
+        slow_engine.stalled.store(false, Ordering::SeqCst);
+        stuck.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn a_session_id_from_a_status_line_must_be_a_valid_one() {
+        let fixture = Fixture::new("sniff");
+        let chat = fixture.open();
+        let engine = fixture.spawner.last();
+        (engine.line)(r#"{"type":"status","session_id":"good-1.a_b"}"#.into());
+        for bad in ["--model", "a b", "x/../y", "-rf"] {
+            (engine.line)(format!(r#"{{"type":"status","session_id":"{bad}"}}"#));
+            assert_eq!(
+                fixture
+                    .registry
+                    .summary(&chat.chat)
+                    .unwrap()
+                    .session
+                    .as_deref(),
+                Some("good-1.a_b"),
+                "{bad}"
+            );
+        }
+        let long = "a".repeat(129);
+        (engine.line)(format!(r#"{{"type":"status","session_id":"{long}"}}"#));
+        assert_eq!(
+            fixture
+                .registry
+                .summary(&chat.chat)
+                .unwrap()
+                .session
+                .as_deref(),
+            Some("good-1.a_b")
+        );
+        // The line itself still reaches the window.
+        assert_eq!(lock(&fixture.events.lines).len(), 6);
+    }
+
+    #[test]
+    fn a_restart_waits_for_the_old_engine_to_exit() {
+        // This engine ignores stop: the restart waits, then ends it, then spawns.
+        let fixture = Fixture::with("restart-wait", false, MAX_RUNNING, MAX_CHATS);
+        let chat = fixture.open();
+        let old = fixture.spawner.last();
+        (old.line)(r#"{"type":"status","session_id":"s-keep"}"#.into());
+        let started = Instant::now();
+        fixture
+            .registry
+            .restart(&chat.chat, &Launch::default(), None, false)
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert_eq!(old.engine.stops.load(Ordering::SeqCst), 1);
+        assert_eq!(old.engine.kills.load(Ordering::SeqCst), 1);
+        let new = fixture.spawner.last();
+        assert_eq!(new.alive_at_spawn, 0, "the old engine was gone first");
+        assert_eq!(new.args, ["engine", "--stdio", "--resume", "s-keep"]);
+
+        // One that obeys is not waited for any longer than it takes to exit.
+        let fixture = Fixture::with("restart-fast", true, MAX_RUNNING, MAX_CHATS);
+        let chat = fixture.open();
+        let started = Instant::now();
+        fixture
+            .registry
+            .restart(&chat.chat, &Launch::default(), None, false)
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(150));
+        assert_eq!(fixture.spawner.last().alive_at_spawn, 0);
+    }
+
+    #[test]
+    fn stopping_engines_still_count_toward_the_cap() {
+        // Never obeys: the evicted engine lingers until it is ended.
+        let fixture = Fixture::with("linger", false, 2, MAX_CHATS);
+        let (a, _b) = (fixture.open(), fixture.open());
+        fixture
+            .registry
+            .set_last_activity(&a.chat, Instant::now() - Duration::from_secs(60));
+        let started = Instant::now();
+        let third = fixture.open();
+        assert!(third.running);
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        let engines = fixture.spawner.all();
+        assert_eq!(engines.len(), 3);
+        assert!(
+            engines[2].alive_at_spawn < 2,
+            "the evicted engine was still running when the third started: {}",
+            engines[2].alive_at_spawn
+        );
+        assert_eq!(fixture.exits(), [(a.chat, 1, ExitReason::Evicted)]);
+    }
+
+    #[test]
+    fn an_engine_that_ends_while_it_starts_is_still_reported() {
+        let fixture = Fixture::new("early-exit");
+        fixture
+            .spawner
+            .exits_while_starting
+            .store(true, Ordering::SeqCst);
+        let chat = fixture.open();
+        assert!(!fixture.registry.summary(&chat.chat).unwrap().running);
+        assert_eq!(
+            fixture.exits(),
+            [(chat.chat.clone(), 1, ExitReason::Exited)]
+        );
+        // It can be started again.
+        fixture
+            .spawner
+            .exits_while_starting
+            .store(false, Ordering::SeqCst);
+        assert!(
+            fixture
+                .registry
+                .ensure_running(&chat.chat, &Launch::default())
+                .unwrap()
+                .running
+        );
+    }
+
+    #[test]
+    fn closing_a_chat_with_a_copy_changes_nothing() {
+        let fixture = Fixture::new("close-copy");
+        let chat = fixture.open_copy();
+        assert_eq!(
+            fixture.registry.close(&chat.chat).unwrap_err(),
+            "has_worktree"
+        );
+        assert_eq!(fixture.registry.list().len(), 1);
+        assert!(fixture.registry.summary(&chat.chat).unwrap().running);
+        assert_eq!(
+            fixture.spawner.last().engine.stops.load(Ordering::SeqCst),
+            0
+        );
+        assert!(fixture.exits().is_empty());
+        fixture.registry.send(&chat.chat, "{}").unwrap();
+    }
+
+    #[test]
+    fn a_chat_being_discarded_refuses_to_start_or_send_until_the_copy_is_gone() {
+        let fixture = Fixture::with("discard", true, MAX_RUNNING, MAX_CHATS);
+        let chat = fixture.open_copy();
+        let id = chat.chat.clone();
+        let registry = Arc::clone(&fixture.registry);
+        let exits_seen_during_removal = Mutex::new(None);
+        fixture
+            .registry
+            .discard_worktree(
+                &id,
+                |_| Ok(()),
+                |_| {},
+                |_| {
+                    assert_eq!(registry.send(&id, "{}").unwrap_err(), "discarding");
+                    assert_eq!(
+                        registry
+                            .restart(&id, &Launch::default(), None, false)
+                            .unwrap_err(),
+                        "discarding"
+                    );
+                    assert_eq!(
+                        registry
+                            .ensure_running(&id, &Launch::default())
+                            .unwrap_err(),
+                        "discarding"
+                    );
+                    // The exit is not told before the copy is gone.
+                    *lock(&exits_seen_during_removal) = Some(fixture.exits());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(lock(&exits_seen_during_removal).clone(), Some(vec![]));
+        assert_eq!(
+            fixture.exits(),
+            [(chat.chat.clone(), 1, ExitReason::Discarded)]
+        );
+        assert!(fixture.registry.list().is_empty());
+        assert_eq!(fixture.spawner.all().len(), 1, "nothing was restarted");
+    }
+
+    #[test]
+    fn a_failed_removal_leaves_the_chat_usable_and_says_no_discarded() {
+        let fixture = Fixture::with("discard-fails", true, MAX_RUNNING, MAX_CHATS);
+        let chat = fixture.open_copy();
+        let error = fixture
+            .registry
+            .discard_worktree(&chat.chat, |_| Ok(()), |_| {}, |_| Err("locked".into()))
+            .unwrap_err();
+        assert_eq!(error, "locked");
+        assert_eq!(
+            fixture.exits(),
+            [(chat.chat.clone(), 1, ExitReason::Exited)]
+        );
+        // The chat is still there, and starts, sends and discards again.
+        assert_eq!(fixture.registry.list().len(), 1);
+        let again = fixture
+            .registry
+            .ensure_running(&chat.chat, &Launch::default())
+            .unwrap();
+        assert!(again.running);
+        fixture.registry.send(&chat.chat, "{}").unwrap();
+        fixture
+            .registry
+            .discard_worktree(&chat.chat, |_| Ok(()), |_| {}, |_| Ok(()))
+            .unwrap();
+        assert!(fixture.registry.list().is_empty());
+    }
+
+    #[test]
+    fn a_refused_check_stops_nothing() {
+        let fixture = Fixture::new("discard-dirty");
+        let chat = fixture.open_copy();
+        let error = fixture
+            .registry
+            .discard_worktree(
+                &chat.chat,
+                |_| Err("dirty:2".into()),
+                |_| panic!("nothing is closed"),
+                |_| panic!("nothing is removed"),
+            )
+            .unwrap_err();
+        assert_eq!(error, "dirty:2");
+        assert_eq!(
+            fixture.spawner.last().engine.stops.load(Ordering::SeqCst),
+            0
+        );
+        assert!(fixture.exits().is_empty());
+        fixture.registry.send(&chat.chat, "{}").unwrap();
+        // A chat with no copy has nothing to discard.
+        let plain = fixture.open();
+        assert!(fixture
+            .registry
+            .discard_worktree(&plain.chat, |_| Ok(()), |_| {}, |_| Ok(()))
+            .is_err());
     }
 
     /// Sends lines and exits to channels, for the real-engine test.

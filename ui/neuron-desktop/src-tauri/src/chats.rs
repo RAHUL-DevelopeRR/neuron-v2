@@ -183,8 +183,8 @@ pub fn chat_open(
 
 /// A new engine for the chat, which also starts a stopped one. `resume`
 /// continues that session (`""` starts a fresh one); without it, the chat's own.
-#[tauri::command(async)]
-pub fn chat_resume(
+#[tauri::command]
+pub async fn chat_resume(
     state: State<'_, AppState>,
     registry: Registry<'_>,
     chat: String,
@@ -194,29 +194,40 @@ pub fn chat_resume(
 ) -> Result<ChatSummary, String> {
     remember_options(&state, options);
     let launch = lock(&state.options).to_launch();
-    registry.restart(
-        chat_id(&chat)?,
-        &launch,
-        resume.as_deref(),
-        trust_once.unwrap_or(false),
-    )
+    let registry = Arc::clone(&registry);
+    // Waits for the old engine to exit (up to its grace period): off the async threads.
+    crate::blocking(move || {
+        registry.restart(
+            chat_id(&chat)?,
+            &launch,
+            resume.as_deref(),
+            trust_once.unwrap_or(false),
+        )
+    })
+    .await
 }
 
+/// Queues one client message for the chat's engine. Errors: `discarding` while
+/// the chat's copy is being removed.
 #[tauri::command]
-pub fn chat_send(registry: Registry<'_>, chat: String, line: String) -> Result<(), String> {
-    registry.send(chat_id(&chat)?, &line)
+pub async fn chat_send(registry: Registry<'_>, chat: String, line: String) -> Result<(), String> {
+    let registry = Arc::clone(&registry);
+    crate::blocking(move || registry.send(chat_id(&chat)?, &line)).await
 }
 
 /// Stops the chat's engine; the chat stays, with its session.
 #[tauri::command]
-pub fn chat_stop(registry: Registry<'_>, chat: String) -> Result<(), String> {
-    registry.stop(chat_id(&chat)?)
+pub async fn chat_stop(registry: Registry<'_>, chat: String) -> Result<(), String> {
+    let registry = Arc::clone(&registry);
+    crate::blocking(move || registry.stop(chat_id(&chat)?)).await
 }
 
-/// Forgets the chat.
+/// Forgets the chat. A chat with a copy of its own is not closed: the error is
+/// `has_worktree` and nothing changes; the window offers the discard flow.
 #[tauri::command]
-pub fn chat_close(registry: Registry<'_>, chat: String) -> Result<(), String> {
-    registry.close(chat_id(&chat)?)
+pub async fn chat_close(registry: Registry<'_>, chat: String) -> Result<(), String> {
+    let registry = Arc::clone(&registry);
+    crate::blocking(move || registry.close(chat_id(&chat)?)).await
 }
 
 /// The chat in view, which is never stopped to make room or for being idle.
@@ -251,6 +262,9 @@ pub fn worktree_status(registry: Registry<'_>, chat: String) -> Result<WorktreeS
 /// stopped or removed unless every check passes first. Errors the window
 /// answers: `unmerged:<n>` (commits the main folder lacks; confirm with
 /// `deleteUnmerged`) and `dirty:<n>` (changed files; confirm with `force`).
+/// While it runs the chat refuses to start or take messages (`discarding`).
+/// The `discarded` exit is sent only after the copy is gone; if removing it
+/// fails, the chat stays and works again.
 #[tauri::command(async)]
 pub fn worktree_discard(
     registry: Registry<'_>,
@@ -260,13 +274,14 @@ pub fn worktree_discard(
     delete_unmerged: bool,
 ) -> Result<(), String> {
     let chat = chat_id(&chat)?;
-    let record = registry.worktree(chat)?;
-    worktree::check_discard(&record, force, delete_unmerged)?;
-    registry.halt(chat, ExitReason::Discarded)?;
-    // Shells inside the folder would keep it locked.
-    terminals.close_under(&record.path);
-    worktree::discard(&record, force, delete_unmerged)?;
-    registry.close(chat)
+    registry.discard_worktree(
+        chat,
+        // Looked at before anything is stopped, and again by `discard` itself.
+        |record| worktree::check_discard(record, force, delete_unmerged).map(|_| ()),
+        // Shells inside the folder would keep it locked.
+        |record| terminals.close_under(&record.path),
+        |record| worktree::discard(record, force, delete_unmerged),
+    )
 }
 
 /// A red dot for the Windows taskbar button, 16 by 16 pixels of RGBA.
