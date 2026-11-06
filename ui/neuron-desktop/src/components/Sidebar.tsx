@@ -107,7 +107,19 @@ const CHAT_GROUPS: Array<['needsYou' | 'running' | 'doneUnread' | 'idle', string
 ]
 
 /** The open chats in four groups: waiting for the user, working, finished out of view, and the rest. */
-function ChatGroups({ chats, active, rail, onOpen }: { chats: ChatRow[]; active: string | null; rail: boolean; onOpen: (id: string) => void }) {
+function ChatGroups({
+  chats,
+  active,
+  rail,
+  onOpen,
+  onClose,
+}: {
+  chats: ChatRow[]
+  active: string | null
+  rail: boolean
+  onOpen: (id: string) => void
+  onClose?: (id: string) => void
+}) {
   const groups = triage(chats)
   return (
     <div className="chat-groups">
@@ -117,8 +129,13 @@ function ChatGroups({ chats, active, rail, onOpen }: { chats: ChatRow[]; active:
             {!rail && <h2 className="chat-group-head">{label}</h2>}
             <ul>
               {groups[key].map((row) => (
-                <li key={row.id}>
+                <li key={row.id} className="chat-item">
                   <ChatButton row={row} active={row.id === active} rail={rail} onOpen={onOpen} />
+                  {onClose && !rail && (
+                    <button className="icon-button chat-close" aria-label={`Close chat: ${row.title}`} title="Close this chat" onClick={() => onClose(row.id)}>
+                      ✕
+                    </button>
+                  )}
                 </li>
               ))}
             </ul>
@@ -174,8 +191,10 @@ export const Sidebar = forwardRef<HTMLInputElement, {
   needsYouCount?: number
   onJumpWaiting?: () => void
   onNewWorktreeChat?: () => void
+  /** Closes a chat from its row (a chat with a copy of its own asks first). */
+  onCloseChat?: (id: string) => void
 }>(function Sidebar(
-  { rail, onToggleRail, rows, open, groupBy, onGroupBy, busy, historyAvailable, page, onNewSession, onOpenSession, onOpenProject, onNavigate, onSettings, onSearch, footer, chats, activeChat = null, onOpenChat, needsYouCount = 0, onJumpWaiting, onNewWorktreeChat },
+  { rail, onToggleRail, rows, open, groupBy, onGroupBy, busy, historyAvailable, page, onNewSession, onOpenSession, onOpenProject, onNavigate, onSettings, onSearch, footer, chats, activeChat = null, onOpenChat, needsYouCount = 0, onJumpWaiting, onNewWorktreeChat, onCloseChat },
   searchRef,
 ) {
   const [query, setQuery] = useState('')
@@ -220,7 +239,7 @@ export const Sidebar = forwardRef<HTMLInputElement, {
         <NavButton icon="⧉" label="Extensions" rail={rail} active={page === 'extensions'} onClick={() => onNavigate('extensions')} />
         {rail && <NavButton icon="⚙" label="Settings" shortcut="Ctrl+," rail onClick={onSettings} active={page === 'settings'} />}
       </div>
-      {chats && chats.length > 0 && <ChatGroups chats={chats} active={activeChat} rail={rail} onOpen={onOpenChat ?? (() => {})} />}
+      {chats && chats.length > 0 && <ChatGroups chats={chats} active={activeChat} rail={rail} onOpen={onOpenChat ?? (() => {})} onClose={onCloseChat} />}
       {!rail && (
         <>
           <input

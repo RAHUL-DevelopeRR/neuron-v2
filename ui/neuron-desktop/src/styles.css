@@ -2435,3 +2435,21 @@ h2 {
   border-radius: 8px;
   box-shadow: var(--shadow);
 }
+
+/* Desk fixes: closing a chat from its row */
+.chat-item {
+  display: flex;
+  align-items: center;
+}
+.chat-item .chat-row {
+  flex: 1;
+  min-width: 0;
+}
+.chat-close {
+  flex: none;
+  opacity: 0;
+}
+.chat-item:hover .chat-close,
+.chat-item:focus-within .chat-close {
+  opacity: 1;
+}

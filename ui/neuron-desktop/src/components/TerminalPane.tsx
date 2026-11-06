@@ -32,15 +32,15 @@ export function TerminalPane({ platform, folder }: { platform: Platform; /** The
       (opened) => {
         if (disposed) return opened.close()
         session = opened
-        setStatus(null)
+        if (!disposed) setStatus(null)
         cleanups.push(
           opened.onData((data) => term.write(data)),
-          opened.onExit((code) => setStatus(`The shell exited${code === null ? '' : ` (code ${code})`}.`)),
+          opened.onExit((code) => !disposed && setStatus(`The shell exited${code === null ? '' : ` (code ${code})`}.`)),
         )
         const input = term.onData((data) => opened.write(data))
         cleanups.push(() => input.dispose())
       },
-      (error: Error) => setStatus(error.message),
+      (error: Error) => !disposed && setStatus(error.message),
     )
     const observer = new ResizeObserver(() => {
       fit.fit()
@@ -52,6 +52,7 @@ export function TerminalPane({ platform, folder }: { platform: Platform; /** The
       observer.disconnect()
       for (const cleanup of cleanups) cleanup()
       session?.close()
+      session = null
       term.dispose()
     }
   }, [platform, folder])
