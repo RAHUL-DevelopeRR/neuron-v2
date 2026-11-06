@@ -5,10 +5,10 @@ import http from 'node:http';
 import path from 'node:path';
 import {test} from 'node:test';
 import {setTimeout as delay} from 'node:timers/promises';
-import {LauncherError, assetFor, binaryLocations, cacheRoot, downloadBase, downloadBinary, parseChecksum} from '../lib/binary.js';
+import {LauncherError, assetFor, binaryLocations, cacheRoot, checksumsBase, downloadBase, downloadBinary, parseChecksum, parseSums} from '../lib/binary.js';
 import {wantsFullScreenUi} from '../lib/full-screen.js';
 import {exitCodeForSignal, listenedSignals, shouldForwardSignal} from '../lib/signals.js';
-import {PACKAGE_ROOT, REPO_ROOT, sha256, tempDir} from './helpers.js';
+import {PACKAGE_ROOT, REPO_ROOT, sha256, startServer, tempDir, unusedUrl} from './helpers.js';
 
 const ASSET = 'neuron-linux-x64';
 
@@ -26,7 +26,14 @@ async function slowServer(t, handler) {
 function download(t, base, idleTimeoutMs) {
   const directory = tempDir(t);
   const destination = path.join(directory, 'neuron');
-  const done = downloadBinary({destination, url: `${base}/v1.0.0/${ASSET}`, version: '1.0.0', asset: ASSET, idleTimeoutMs});
+  const done = downloadBinary({
+    destination,
+    url: `${base}/v1.0.0/${ASSET}`,
+    sumsUrl: `${base}/v1.0.0/SHA256SUMS`,
+    version: '1.0.0',
+    asset: ASSET,
+    idleTimeoutMs,
+  });
   return {directory, destination, done};
 }
 
@@ -154,6 +161,10 @@ test('a slow download succeeds while data keeps arriving', async (t) => {
   const chunks = Array.from({length: 8}, (_, index) => Buffer.alloc(1024, index));
   const data = Buffer.concat(chunks);
   const base = await slowServer(t, async (request, response) => {
+    if (request.url.endsWith('/SHA256SUMS')) {
+      response.end(`${sha256(data)}  ${ASSET}\n`);
+      return;
+    }
     if (request.url.endsWith('.sha256')) {
       response.end(`${sha256(data)}  ${ASSET}
 `);
@@ -175,7 +186,7 @@ test('a slow download succeeds while data keeps arriving', async (t) => {
 
 test('a download that stops sending data fails as a network error and leaves nothing behind', async (t) => {
   const base = await slowServer(t, (request, response) => {
-    if (request.url.endsWith('.sha256')) {
+    if (request.url.endsWith('/SHA256SUMS') || request.url.endsWith('.sha256')) {
       response.end(`${'a'.repeat(64)}  ${ASSET}
 `);
       return;
@@ -203,4 +214,57 @@ test('a server that never answers times out with an actionable message', async (
     assert.match(error.message, /NEURON_BINARY_PATH/);
     return true;
   });
+});
+
+test('SHA256SUMS comes from the GitHub release unless NEURON_CHECKSUMS_BASE says otherwise, and must be HTTPS or loopback', () => {
+  // A mirror for the binary does not move the checksum source.
+  assert.equal(checksumsBase({NEURON_DOWNLOAD_BASE: 'https://mirror.example.com/neuron'}), 'https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download');
+  assert.equal(checksumsBase({NEURON_DOWNLOAD_BASE: 'http://127.0.0.1:9', NEURON_CHECKSUMS_BASE: 'http://127.0.0.1:8/'}), 'http://127.0.0.1:8');
+  for (const base of ['http://downloads.example.com', 'ftp://example.com', 'not a url']) {
+    assert.throws(() => checksumsBase({NEURON_CHECKSUMS_BASE: base}), LauncherError, base);
+  }
+});
+
+test('SHA256SUMS lines are matched by exact file name, case-insensitively on the hash', () => {
+  const digest = 'ab'.repeat(32);
+  const text = `${digest.toUpperCase()}  neuron-linux-x64\n${'c'.repeat(64)} *neuron-linux-arm64\n`;
+  assert.equal(parseSums(text, 'neuron-linux-x64'), digest);
+  assert.equal(parseSums(text, 'neuron-linux-arm64'), 'c'.repeat(64));
+  assert.equal(parseSums(text, 'neuron-linux'), null);
+  assert.equal(parseSums('', 'neuron-linux-x64'), null);
+});
+
+test('a download fails closed without a usable SHA256SUMS entry and leaves nothing behind', async (t) => {
+  const data = Buffer.from('payload');
+  const cases = {
+    'a missing file': {status: 404, body: 'Not Found', kind: 'missing'},
+    'an empty file': {body: '', kind: 'integrity'},
+    'an unlisted asset': {body: `${sha256(data)}  some-other-asset\n`, kind: 'integrity'},
+    'a different hash': {body: `${'0'.repeat(64)}  ${ASSET}\n`, kind: 'integrity'},
+  };
+  for (const [name, expected] of Object.entries(cases)) {
+    const routes = new Map([
+      [`/v1.0.0/${ASSET}`, {body: data}],
+      [`/v1.0.0/${ASSET}.sha256`, {body: `${sha256(data)}  ${ASSET}\n`}],
+      ['/v1.0.0/SHA256SUMS', {status: expected.status, body: expected.body}],
+    ]);
+    const server = await startServer(t, routes);
+    const {directory, done} = download(t, server.url);
+    await assert.rejects(done, (error) => {
+      assert.ok(error instanceof LauncherError, `${name}: ${error}`);
+      assert.equal(error.kind, expected.kind, name);
+      return true;
+    });
+    assert.deepEqual(readdirSync(directory), [], name);
+  }
+  // A checksums server that is down is also a failure, not a skipped check.
+  const mirror = await startServer(t, new Map([[`/v1.0.0/${ASSET}`, {body: data}], [`/v1.0.0/${ASSET}.sha256`, {body: `${sha256(data)}  ${ASSET}\n`}]]));
+  const directory = tempDir(t);
+  await assert.rejects(
+    downloadBinary({destination: path.join(directory, 'neuron'), url: `${mirror.url}/v1.0.0/${ASSET}`, sumsUrl: `${await unusedUrl()}/v1.0.0/SHA256SUMS`, version: '1.0.0', asset: ASSET}),
+    (error) => error instanceof LauncherError && error.kind === 'network',
+  );
+  assert.deepEqual(readdirSync(directory), []);
+  // And calling it without any checksums source is refused rather than skipping the check.
+  await assert.rejects(downloadBinary({destination: path.join(directory, 'neuron'), url: `${mirror.url}/v1.0.0/${ASSET}`, version: '1.0.0', asset: ASSET}), LauncherError);
 });
