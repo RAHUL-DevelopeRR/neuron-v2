@@ -12,10 +12,14 @@
 //! would resolve against the (possibly hostile) working directory.
 //!
 //! Trust also binds to what the folder asked for. When the folder is trusted, a
-//! fingerprint of its hook commands, MCP launch specs and allow or ask rules is stored
-//! next to the trust record (`trusted_config.json`, per folder). A later start whose
-//! fingerprint differs (a `git pull` or an edit added a hook) is untrusted again until
-//! the user accepts the folder trust screen, which lists those exact commands.
+//! fingerprint of every project setting that applies once trusted (hooks, MCP servers,
+//! allow or ask rules, `env`, `model`, plugins, `apiKeyHelper`, a non-restrictive
+//! permission mode, ...; settings that only restrict are left out) is stored next to the
+//! trust record (`trusted_config.json`, per folder), with a digest per key. A later start
+//! whose fingerprint differs (a `git pull` or an edit added a hook or changed `env`) is
+//! untrusted again until the user accepts the folder trust screen, which lists those exact
+//! commands and the keys that changed. The screen's accept records what the screen showed
+//! ([`trust_workspace_root_shown`]): files that changed in between are not trusted.
 //!
 //! The folder trust screen trusts a whole repository: [`trust_workspace_root`] records the
 //! git root, and a folder inside a recorded git root is trusted too. A nested repository
@@ -44,6 +48,10 @@ static TRUSTED_THIS_PROCESS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
 /// home folder is trusted for the process only, and a failed write must not leave the
 /// prompt and the loader disagreeing.
 static FINGERPRINTS_THIS_PROCESS: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
+
+/// Per-key setting digests of trusted folders, like [`FINGERPRINTS_THIS_PROCESS`].
+type SettingDigests = BTreeMap<String, String>;
+static DIGESTS_THIS_PROCESS: OnceLock<Mutex<BTreeMap<String, SettingDigests>>> = OnceLock::new();
 
 /// Pins the trust store location for this process. The CLI calls this at
 /// startup so the loader and the trust prompt read the same file; later calls
@@ -103,8 +111,41 @@ pub fn recorded_config_fingerprint(cwd: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The per-key digests of what `cwd` asked for when the user trusted it, for naming the
+/// keys that changed since; `None` for a record made without them.
+#[must_use]
+pub fn recorded_setting_digests(cwd: &Path) -> Option<SettingDigests> {
+    let key = fingerprint_key(cwd);
+    if let Some(found) = DIGESTS_THIS_PROCESS.get().and_then(|map| {
+        map.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+            .cloned()
+    }) {
+        return Some(found);
+    }
+    let content = fs::read_to_string(fingerprint_store_path()?).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let digests = parsed.get("settings")?.get(&key)?.as_object()?;
+    Some(
+        digests
+            .iter()
+            .filter_map(|(name, digest)| Some((name.clone(), digest.as_str()?.to_string())))
+            .collect(),
+    )
+}
+
 /// Records what `cwd` asks for (`None`: nothing) as what the user just trusted.
 pub fn record_config_fingerprint(cwd: &Path, fingerprint: Option<&str>) -> io::Result<()> {
+    record_config_state(cwd, fingerprint, None)
+}
+
+/// [`record_config_fingerprint`], with the per-key digests behind it (`None`: keep none).
+fn record_config_state(
+    cwd: &Path,
+    fingerprint: Option<&str>,
+    digests: Option<&SettingDigests>,
+) -> io::Result<()> {
     let key = fingerprint_key(cwd);
     let value = fingerprint.unwrap_or("").to_string();
     FINGERPRINTS_THIS_PROCESS
@@ -112,22 +153,46 @@ pub fn record_config_fingerprint(cwd: &Path, fingerprint: Option<&str>) -> io::R
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .insert(key.clone(), value.clone());
+    {
+        let mut recorded = DIGESTS_THIS_PROCESS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match digests {
+            Some(digests) => recorded.insert(key.clone(), digests.clone()),
+            None => recorded.remove(&key),
+        };
+    }
     let path = fingerprint_store_path().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "no home directory to keep the trust store in",
         )
     })?;
-    let mut folders = fs::read_to_string(&path)
+    let existing = fs::read_to_string(&path)
         .ok()
-        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-        .and_then(|parsed| parsed.get("folders").and_then(|f| f.as_object().cloned()))
-        .unwrap_or_default();
-    folders.insert(key, serde_json::Value::String(value));
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok());
+    let section = |name: &str| {
+        existing
+            .as_ref()
+            .and_then(|parsed| {
+                parsed
+                    .get(name)
+                    .and_then(|found| found.as_object().cloned())
+            })
+            .unwrap_or_default()
+    };
+    let mut folders = section("folders");
+    let mut settings = section("settings");
+    folders.insert(key.clone(), serde_json::Value::String(value));
+    match digests {
+        Some(digests) => settings.insert(key, serde_json::json!(digests)),
+        None => settings.remove(&key),
+    };
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let body = serde_json::json!({ "folders": folders }).to_string();
+    let body = serde_json::json!({ "folders": folders, "settings": settings }).to_string();
     let temp = path.with_extension("json.tmp");
     fs::write(&temp, body)?;
     fs::rename(&temp, &path)
@@ -219,13 +284,72 @@ pub fn trust_root(cwd: &Path) -> TrustRoot {
     }
 }
 
+/// Why trusting a folder was refused.
+#[derive(Debug)]
+pub enum TrustWorkspaceError {
+    /// The folder's settings are not what the trust screen showed: they changed after it
+    /// was drawn, so nothing was trusted and the screen must be shown again.
+    ChangedSinceShown,
+    Io(io::Error),
+}
+
+impl std::fmt::Display for TrustWorkspaceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ChangedSinceShown => write!(
+                f,
+                "the project's settings changed after the trust screen was shown"
+            ),
+            Self::Io(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for TrustWorkspaceError {}
+
+impl From<io::Error> for TrustWorkspaceError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
 /// Trusts `cwd` as the folder trust screen does: records its [`trust_root`] (so a whole
-/// repository), or, for the home folder, trusts it for this process only.
+/// repository), or, for the home folder, trusts it for this process only. What is recorded
+/// is what the folder asks for now; use [`trust_workspace_root_shown`] when a screen listed
+/// it first.
 pub fn trust_workspace_root(cwd: &Path) -> io::Result<TrustRoot> {
+    trust_workspace_root_checked(cwd, None).map_err(|error| match error {
+        TrustWorkspaceError::Io(error) => error,
+        TrustWorkspaceError::ChangedSinceShown => {
+            io::Error::new(io::ErrorKind::Other, error.to_string())
+        }
+    })
+}
+
+/// [`trust_workspace_root`] for a trust screen that listed the folder's settings: `shown` is
+/// the fingerprint it was drawn from (`ConfigLoader::workspace_config_fingerprint`, `None`
+/// when the folder asked for nothing). When the files now give a different fingerprint,
+/// nothing is trusted ([`TrustWorkspaceError::ChangedSinceShown`]).
+pub fn trust_workspace_root_shown(
+    cwd: &Path,
+    shown: Option<&str>,
+) -> Result<TrustRoot, TrustWorkspaceError> {
+    trust_workspace_root_checked(cwd, Some(shown))
+}
+
+fn trust_workspace_root_checked(
+    cwd: &Path,
+    shown: Option<Option<&str>>,
+) -> Result<TrustRoot, TrustWorkspaceError> {
     let root = trust_root(cwd);
-    // What the folder asks for now is what the user was just shown.
-    let fingerprint = crate::ConfigLoader::default_for(cwd).workspace_config_fingerprint();
-    let fingerprint_result = record_config_fingerprint(cwd, fingerprint.as_deref());
+    // One read of the files decides both the comparison and what is recorded.
+    let preview = crate::ConfigLoader::default_for(cwd).workspace_trust_preview();
+    let fingerprint = preview.config_fingerprint();
+    if shown.is_some_and(|shown| shown != fingerprint.as_deref()) {
+        return Err(TrustWorkspaceError::ChangedSinceShown);
+    }
+    let fingerprint_result =
+        record_config_state(cwd, fingerprint.as_deref(), Some(&preview.setting_digests));
     if root.session_only {
         let cwd = absolute_cwd(cwd)?;
         TRUSTED_THIS_PROCESS
