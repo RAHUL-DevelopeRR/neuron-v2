@@ -135,12 +135,14 @@ describe('a chat that needs you', () => {
     expect(platform.attention.at(-1)).toBe(1)
     expect(chats.activities.get(second)).toEqual({ busy: false, waiting: true })
     expect(screen.queryByRole('dialog', { name: /./ })).toBeNull()
+    // The approval prompt is an alert dialog; the chat in the background shows none.
+    expect(screen.queryByRole('alertdialog')).toBeNull()
 
     const needsYou = within(sidebar()).getByRole('region', { name: 'Needs you, 1' })
     expect(needsYou).toBeTruthy()
     fireEvent.click(within(sidebar()).getByRole('button', { name: '1 chat needs you. Go to the first' }))
     await waitFor(() => expect(chats.activated.at(-1)).toBe(second))
-    const dialog = await screen.findByRole('dialog')
+    const dialog = await screen.findByRole('alertdialog')
     expect(within(dialog).getByText('$ rm -rf target')).toBeTruthy()
 
     // Answering clears the count.
@@ -151,7 +153,7 @@ describe('a chat that needs you', () => {
   test('the chat in view does not notify', async () => {
     const { platform, chats } = await start()
     await emitTo(chats, chats.ids()[0], permission(1))
-    await screen.findByRole('dialog')
+    await screen.findByRole('alertdialog')
     expect(platform.notifications).toEqual([])
     expect(platform.attention.at(-1)).toBe(1)
   })
