@@ -956,6 +956,12 @@ export interface TrustPreviewEvent {
    * rules changed since: the screen says so and lists them again.
    */
   changed_since_trust?: boolean
+  /**
+   * With `changed_since_trust`: the settings keys (`env`, `model`, `hooks`, ...)
+   * that differ from what was trusted, sorted. Empty when there was nothing to
+   * compare. Engines before it leave it out.
+   */
+  changed_settings?: string[]
   /** The workspace's settings files. */
   settings_files: string[]
   hooks: HookPreview[]

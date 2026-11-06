@@ -936,27 +936,44 @@ Run neuron in a terminal to trust this directory, or add it to `trustedRoots` in
         );
         return TrustDecision::NoAnswer;
     };
-    let screen = crate::trust_menu::TrustScreen::for_folder(cwd);
-    // The caller exits unless trusted; say why when nobody chose to quit.
-    match crate::trust_menu::ask(stream, &screen) {
-        Answer::Allow => {
-            // As the full-screen UI's trust screen: the git root is recorded, and the
-            // home folder is trusted for this run only, so it is asked about again.
-            if let Err(error) = runtime::workspace_trust::trust_workspace_root(cwd) {
-                eprintln!("warning: could not save trust for {}: {error}", screen.root);
+    let mut screen = crate::trust_menu::TrustScreen::for_folder(cwd);
+    loop {
+        // The caller exits unless trusted; say why when nobody chose to quit.
+        match crate::trust_menu::ask(stream, &screen) {
+            Answer::Allow => {
+                // As the full-screen UI's trust screen: the git root is recorded, and the
+                // home folder is trusted for this run only, so it is asked about again.
+                // What is recorded is what the screen showed: settings that changed while
+                // it was open are not trusted unseen, the screen is shown again.
+                match runtime::workspace_trust::trust_workspace_root_shown(
+                    cwd,
+                    screen.shown_fingerprint.as_deref(),
+                ) {
+                    Ok(_) => {}
+                    Err(runtime::workspace_trust::TrustWorkspaceError::ChangedSinceShown) => {
+                        eprintln!(
+                            "The project's settings changed while this question was open, so nothing was trusted. Read what it asks for now."
+                        );
+                        screen = crate::trust_menu::TrustScreen::for_folder(cwd);
+                        continue;
+                    }
+                    Err(runtime::workspace_trust::TrustWorkspaceError::Io(error)) => {
+                        eprintln!("warning: could not save trust for {}: {error}", screen.root);
+                    }
+                }
+                return TrustDecision::Trusted {
+                    session_only: screen.session_only,
+                };
             }
-            TrustDecision::Trusted {
-                session_only: screen.session_only,
+            Answer::Quit => return TrustDecision::Quit,
+            Answer::Declined => {
+                eprintln!("{}", untrusted_reason(false));
+                return TrustDecision::NoAnswer;
             }
-        }
-        Answer::Quit => TrustDecision::Quit,
-        Answer::Declined => {
-            eprintln!("{}", untrusted_reason(false));
-            TrustDecision::NoAnswer
-        }
-        Answer::NoInput => {
-            eprintln!("{}", untrusted_reason(true));
-            TrustDecision::NoAnswer
+            Answer::NoInput => {
+                eprintln!("{}", untrusted_reason(true));
+                return TrustDecision::NoAnswer;
+            }
         }
     }
 }

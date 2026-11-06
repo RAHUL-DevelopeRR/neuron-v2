@@ -704,6 +704,7 @@ pub mod samples {
             session_only: false,
             trusted: false,
             changed_since_trust: false,
+            changed_settings: Vec::new(),
             settings_files: vec![settings.clone()],
             hooks: vec![
                 HookPreview {

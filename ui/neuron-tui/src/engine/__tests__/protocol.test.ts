@@ -434,6 +434,7 @@ const EVENT_FIELDS: { [T in UiEventType]: string[] } = {
     'session_only',
     'trusted',
     'changed_since_trust',
+    'changed_settings',
     'settings_files',
     'hooks',
     'mcp_servers',

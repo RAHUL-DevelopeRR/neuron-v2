@@ -25,6 +25,7 @@ import React, { useCallback, useState } from 'react'
 import {
   TRUST_DOCS_URL,
   trustChoices,
+  trustChangedKeysLine,
   trustCopy,
   trustDetailLines,
   trustPreviewLines,
@@ -210,6 +211,7 @@ export const TrustScreen = ({
     hidden > 0
       ? [...shown, `+${hidden} more not shown: read ${preview?.settings_files.join(', ') || 'the settings files'} before you allow`]
       : shown
+  const changedKeys = preview ? sanitizeTerminalText(trustChangedKeysLine(preview)).replace(/\n/g, ' ') : ''
   const turnsOn = preview
     ? trustPreviewLines(preview).filter(
         (line) => allDetails.length === 0 || !/^\d+ hooks? that |^\d+ permission rules? from /.test(line),
@@ -254,6 +256,9 @@ export const TrustScreen = ({
       )}
       {preview?.changed_since_trust ? (
         <text style={{ wrapMode: 'word', fg: theme.warning, width: textWidth }}>{trustCopy.changed}</text>
+      ) : null}
+      {changedKeys ? (
+        <text style={{ wrapMode: 'word', fg: theme.warning, width: textWidth }}>{changedKeys}</text>
       ) : null}
       {servers.length > 0 ? (
         <>

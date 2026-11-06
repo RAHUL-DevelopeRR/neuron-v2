@@ -980,6 +980,11 @@ pub enum UiEvent {
         /// protocol 1: older engines leave it out.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         changed_since_trust: bool,
+        /// With `changed_since_trust`: the settings keys (`env`, `model`, `hooks`, ...)
+        /// that differ from what was trusted, sorted. Empty when the trust record has
+        /// nothing to compare. Added after protocol 1: older engines leave it out.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        changed_settings: Vec<String>,
         /// The workspace's settings files.
         settings_files: Vec<String>,
         hooks: Vec<HookPreview>,

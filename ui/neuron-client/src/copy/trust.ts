@@ -19,8 +19,10 @@ export const trustCopy = {
   access: 'Neuron will be able to open, change and run files in this folder.',
   turnsOnHeading: 'This project also wants to turn on:',
   turnsOnNothing: 'This project does not turn on any hooks, MCP servers or permission rules.',
-  /** Shown when the folder was trusted before and its hooks, MCP servers or rules changed. */
-  changed: 'Its hooks, MCP servers or permission rules changed since you trusted this folder.',
+  /** Shown when the folder was trusted before and what it asks for changed. */
+  changed: 'Its hooks, MCP servers, permission rules or settings changed since you trusted this folder.',
+  /** Before the settings keys that changed (`env`, `model`, ...). */
+  changedKeys: 'Changed since you trusted it:',
   /** Above the exact commands and rules the folder asks about. */
   exactHeading: 'Exactly what it would run or allow:',
   caution: 'Continue only if you created this project or trust where it came from.',
@@ -114,6 +116,16 @@ export function trustPreviewLines(preview: TrustPreviewEvent): string[] {
     lines.push(`Other settings: ${preview.other_settings.join(', ')}`)
   }
   return lines
+}
+
+/**
+ * The settings keys that changed since the folder was trusted, as one line
+ * (`Changed since you trusted it: env, model`); empty when the engine named none.
+ */
+export function trustChangedKeysLine(preview: Pick<TrustPreviewEvent, 'changed_since_trust' | 'changed_settings'>): string {
+  const keys = preview.changed_settings ?? []
+  if (!preview.changed_since_trust || keys.length === 0) return ''
+  return `${trustCopy.changedKeys} ${keys.join(', ')}`
 }
 
 /**

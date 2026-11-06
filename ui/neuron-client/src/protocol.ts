@@ -508,6 +508,8 @@ export interface TrustPreviewEvent {
   trusted: boolean
   /** Trusted before, but its hooks, MCP servers or allow rules changed since. */
   changed_since_trust?: boolean
+  /** With `changed_since_trust`: the settings keys (`env`, `model`, `hooks`, ...) that differ from what was trusted. */
+  changed_settings?: string[]
   settings_files: string[]
   hooks: HookPreview[]
   mcp_servers: McpServerPreview[]

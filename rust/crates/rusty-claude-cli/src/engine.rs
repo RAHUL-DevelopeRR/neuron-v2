@@ -780,40 +780,9 @@ fn shorten_json_strings(input: &str, limit: usize) -> String {
     }
 }
 
-/// `TrustWorkspace`: records trust for the working directory's git root (the folder itself
-/// outside git) in the trust store; the home folder is trusted for this engine only. The
-/// workspace's own settings, hooks and MCP servers load when a session starts, so the UI
-/// restarts the engine to use them.
+/// `TrustWorkspace` for the working directory ([`engine_trust::trust_workspace_events`]).
 fn trust_workspace_events() -> Vec<UiEvent> {
-    let cwd = env::current_dir().unwrap_or_default();
-    match runtime::workspace_trust::trust_workspace_root(&cwd) {
-        Ok(trusted) => vec![
-            UiEvent::WorkspaceTrusted {
-                cwd: cwd.display().to_string(),
-                restart_required: true,
-                root: Some(trusted.root.display().to_string()),
-                session_only: trusted.session_only,
-            },
-            UiEvent::Notice {
-                message: if trusted.session_only {
-                    format!(
-                        "Trusted {} for this session only. Its settings, hooks and MCP servers load when the session restarts.",
-                        cwd.display()
-                    )
-                } else {
-                    format!(
-                        "Trusted {}. Its settings, hooks and MCP servers load when the session restarts.",
-                        trusted.root.display()
-                    )
-                },
-                kind: None,
-            },
-        ],
-        Err(error) => vec![UiEvent::error(format!(
-            "could not trust {}: {error}",
-            cwd.display()
-        ))],
-    }
+    engine_trust::trust_workspace_events(&env::current_dir().unwrap_or_default())
 }
 
 /// `ListExtensions`: the configured MCP servers with what each is doing now, the
@@ -4060,7 +4029,13 @@ mod tests {
         }
         fs::remove_file(&settings).expect("settings removed");
 
-        // Trust the workspace: recorded, and the footer says so; settings load on restart.
+        // Trust the workspace after its screen is drawn again from the files as they are now
+        // (what was shown is what is trusted): recorded, and the footer says so; settings
+        // load on restart.
+        engine.commands.send(EngineCommand::TrustPreview).unwrap();
+        events_until(&engine.events, |event| {
+            matches!(event, UiEvent::TrustPreview { .. })
+        });
         engine.commands.send(EngineCommand::TrustWorkspace).unwrap();
         let trusted = events_until(&engine.events, |event| {
             matches!(event, UiEvent::Status { .. })
