@@ -35,6 +35,10 @@ pub const CREDENTIAL_ENV_VARS: &[&str] = &[
     "OPENROUTER_API_KEY",
     "AWS_ACCESS_KEY_ID",
     "DATABASE_URL",
+    "REDIS_URL",
+    "PGPASSWORD",
+    "MYSQL_PWD",
+    "KUBECONFIG",
 ];
 
 /// Name suffixes that mark any other variable as a secret (`GITHUB_TOKEN`,
@@ -52,6 +56,8 @@ pub const CREDENTIAL_ENV_SUFFIXES: &[&str] = &[
     "PRIVATE_KEY",
     "SECRET_ACCESS_KEY",
     "CONNECTION_STRING",
+    "DSN",
+    "URI",
 ];
 
 /// Value prefixes of Zero-X credentials (`ses_` CLI sessions, `nzx_` API keys).
@@ -805,6 +811,34 @@ mod tests {
             OsStr::new("PASSWORD_POLICY"),
             OsStr::new("strict")
         ));
+    }
+
+    #[test]
+    fn detects_database_and_cluster_credentials_by_name() {
+        for key in [
+            "PGPASSWORD",
+            "MYSQL_PWD",
+            "MONGO_URI",
+            "SENTRY_DSN",
+            "REDIS_URL",
+            "KUBECONFIG",
+            "pgpassword",
+            "ANALYTICS_DSN",
+            "CACHE_URI",
+            "DSN",
+            "REDIS_URL",
+        ] {
+            assert!(
+                is_credential_env(OsStr::new(key), OsStr::new("plain-value")),
+                "{key}"
+            );
+        }
+        for key in ["DSNAME", "MYURI", "PURI", "CURL_CA_BUNDLE", "REDIS_URL_FILE_NOT"] {
+            assert!(
+                !is_credential_env(OsStr::new(key), OsStr::new("plain-value")),
+                "{key}"
+            );
+        }
     }
 
     #[test]
