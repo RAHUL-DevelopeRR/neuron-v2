@@ -1,13 +1,13 @@
 /**
  * Every lane in the multi-chat model (L4): review and git (L2) act in the chat
- * in view, the composer's effort (L3) restarts the chat in view, engine
+ * in view, the composer's effort and queue (L3) stay with their chat, engine
  * problems and Try again (L5) restart the chat in view, and the live
  * transcript's todo strip (L1) sits above the composer.
  */
 import { afterEach, describe, expect, test } from 'bun:test'
 import { act, cleanup, configure, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 
-import type { UiEvent } from '@neuron/client'
+import type { ClientMessage, UiEvent } from '@neuron/client'
 
 import { App } from '../src/App'
 import { FakeEngine, fakePlatform, type FakePlatform, type FakePlatformOptions } from './fake-platform'
@@ -25,6 +25,7 @@ afterEach(() => {
 })
 
 const sidebar = () => screen.getByRole('navigation', { name: 'Neuron' })
+const box = () => screen.getByLabelText('Message Neuron') as HTMLTextAreaElement
 
 async function start(options: FakePlatformOptions = {}) {
   const engine = new FakeEngine()
@@ -51,6 +52,14 @@ const emitTo = (platform: FakePlatform, id: string, ...events: UiEvent[]) =>
   act(() => {
     for (const event of events) platform.fakeChats!.engines.get(id)!.emit(event)
   })
+
+const submits = (engine: FakeEngine) =>
+  engine.commands().flatMap((message: ClientMessage) => (message.kind === 'command' && message.type === 'submit' ? [message.text] : []))
+
+const type = (text: string) => {
+  fireEvent.change(box(), { target: { value: text, selectionStart: text.length } })
+  fireEvent.keyDown(box(), { key: 'Enter' })
+}
 
 /** The row of a changed file in the Changes pane. */
 const changeRow = (path: string) => within(screen.getByRole('complementary', { name: 'Details' })).getByText(path).closest('li') as HTMLElement
@@ -89,6 +98,16 @@ describe('L2, review and git, in the chat in view', () => {
       { call: 'gitRevert', path: 'src/main.rs', chat: second },
     ])
   })
+
+  test("the Changes pane reads the new chat's folder when the chat changes", async () => {
+    const { platform } = await start()
+    await screen.findByText('src/main.rs')
+    // The next chat's folder has other changes.
+    platform.git = { branch: 'neuron/fix-login', changes: [{ path: 'src/login.rs', index: ' ', worktree: 'M' }] }
+    await openAnother(platform)
+    expect(await screen.findByText('src/login.rs')).toBeTruthy()
+    expect(screen.queryByText('src/main.rs')).toBeNull()
+  })
 })
 
 describe('L3, the composer, with several chats', () => {
@@ -100,6 +119,18 @@ describe('L3, the composer, with several chats', () => {
     // Idle and nothing said yet: a fresh engine for this chat only.
     await waitFor(() => expect(chats.resumed).toEqual([{ id: second, options: { resume: null, trustOnce: false } }]))
     expect(platform.restarts).toEqual([null])
+  })
+
+  test("a prompt queued in a working chat is never sent to the next chat", async () => {
+    const { engine, platform, chats } = await start()
+    type('first')
+    type('second')
+    expect(within(screen.getByRole('list', { name: 'Queued messages' })).getAllByRole('listitem').length).toBe(1)
+    const next = await openAnother(platform)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(submits(chats.engines.get(next)!)).toEqual([])
+    expect(submits(engine)).toEqual(['first'])
+    expect(screen.queryByRole('list', { name: 'Queued messages' })).toBeNull()
   })
 })
 

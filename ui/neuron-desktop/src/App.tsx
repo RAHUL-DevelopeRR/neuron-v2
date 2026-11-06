@@ -756,6 +756,7 @@ export function App({ platform }: { platform: Platform }) {
             )}
             {!signIn && <TodoStrip todos={state.todos} />} {/* L1: live transcript */}
             <Composer
+              key={active?.id} // L4: a chat switch never sends one chat's draft or queue to another
               ref={composer}
               busy={state.busy}
               disabled={!ready || untrusted}

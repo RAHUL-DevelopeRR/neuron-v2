@@ -508,7 +508,7 @@ export function SidePane({
   /** The session, for the engine's changes, commit card and restore points (L2). */
   state?: SessionState | null
   controller?: ReviewController | null
-  /** L4: the chat in view; the terminal opens in its folder. */
+  /** L4: the chat in view; the Changes and Files panels and the terminal follow its folder. */
   chatKey?: string | null
 }) {
   const tabs: Array<[PaneTab, string]> = [
@@ -526,8 +526,11 @@ export function SidePane({
           </button>
         ))}
       </div>
-      {tab === 'changes' && <ChangesPanel platform={platform} refreshKey={refreshKey} tool={tool} state={state} controller={controller} />}
-      {tab === 'files' && <FilesPanel platform={platform} refreshKey={refreshKey} changed={changed} />}
+      {/* L4: each chat has its own folder, so a chat switch starts these panels afresh. */}
+      {tab === 'changes' && (
+        <ChangesPanel key={chatKey ?? undefined} platform={platform} refreshKey={refreshKey} tool={tool} state={state} controller={controller} />
+      )}
+      {tab === 'files' && <FilesPanel key={chatKey ?? undefined} platform={platform} refreshKey={refreshKey} changed={changed} />}
       {tab === 'tasks' && <TasksPanel todos={todos} subagents={subagents} />}
       {/* The terminal stays mounted once opened, so its shell lives on across tabs. */}
       {terminalOpened && (
