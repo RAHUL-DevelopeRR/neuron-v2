@@ -4,6 +4,7 @@
 //! panes, and remembers recent projects. The agent lives in the engine; the
 //! window is the React app in `../src`.
 
+pub mod editor;
 pub mod engine;
 pub mod git;
 pub mod projects;
@@ -396,6 +397,20 @@ fn open_external(url: String) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+/// L2: review and git. Puts one changed file back as HEAD has it (a new file is deleted).
+#[tauri::command]
+async fn git_revert(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let root = lock(&state.workspace).root().to_path_buf();
+    git::revert(&root, &path)
+}
+
+/// L2: review and git. Opens a workspace file in VS Code, or shows it in the file manager.
+#[tauri::command]
+async fn open_in_editor(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let root = lock(&state.workspace).root().to_path_buf();
+    editor::open(&root, &path)
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -432,7 +447,9 @@ pub fn run() {
             term_write,
             term_resize,
             term_close,
-            open_external
+            open_external,
+            git_revert,
+            open_in_editor // L2: review and git
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
