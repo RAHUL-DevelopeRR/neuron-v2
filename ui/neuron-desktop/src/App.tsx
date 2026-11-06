@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   FEATURE_ACCOUNT,
   FEATURE_EXTENSIONS,
+  FEATURE_MCP_TOGGLE,
   FEATURE_SESSION_SCOPE,
   FEATURE_SESSIONS,
   FEATURE_TRUST_PREVIEW,
@@ -26,15 +27,17 @@ import { ModelPicker } from './components/ModelPicker'
 import { AllSessionsPage, ExtensionsPage, ProjectsPage, UpdateNotice } from './components/Pages'
 import { PermissionDialog } from './components/PermissionDialog'
 import { PixelLogo } from './components/PixelLogo'
+import { EngineProblemCard } from './components/ProblemCard'
 import { SettingsPage, type SettingsSection, type UpdateCheck } from './components/SettingsPage'
 import { SidePane, type PaneTab } from './components/SidePane'
 import { Sidebar, type NavTarget } from './components/Sidebar'
 import { SignInPanel } from './components/SignIn'
 import { TrustModal } from './components/TrustModal'
 import { Transcript } from './components/Transcript'
+import { buildDiagnostics, engineProblemFor, parseEngineProblem } from './engineProblems'
 import { useSession } from './hooks'
 import { LINKS } from './links'
-import type { LaunchOptions, Platform, Project, UpdateInfo } from './platform'
+import type { EngineInfo, LaunchOptions, Platform, Project, UpdateInfo } from './platform'
 import { noteSeen, sessionRows, type SessionRow } from './sessions'
 import { useSeen, useSettings, type Settings } from './settings'
 
@@ -93,6 +96,7 @@ export function App({ platform }: { platform: Platform }) {
   const [update, setUpdate] = useState<UpdateInfo | null>(null)
   const [updateDismissed, setUpdateDismissed] = useState(false)
   const [updateCheck, setUpdateCheck] = useState<UpdateCheck>({ state: 'idle' })
+  const [engineInfo, setEngineInfo] = useState<EngineInfo | null>(null) // L5
   const search = useRef<HTMLInputElement>(null)
   const composer = useRef<ComposerHandle>(null)
   const narrow = useNarrow()
@@ -117,6 +121,11 @@ export function App({ platform }: { platform: Platform }) {
   useEffect(() => {
     void platform.appVersion().then(setAppVersion, () => {})
     if (platform.can.updates && !platform.manualUpdates) void platform.checkForUpdate().then(setUpdate, () => {})
+  }, [platform])
+
+  // L5: which engine runs (bundled, NEURON_BIN or PATH).
+  useEffect(() => {
+    void platform.engineInfo().then(setEngineInfo, () => {})
   }, [platform])
 
   const refreshRecent = useCallback(() => {
@@ -348,14 +357,43 @@ export function App({ platform }: { platform: Platform }) {
     )
   }
 
+  // L5: the support report, and restarting the engine with a card when that fails.
+  const copyDiagnostics = async () => {
+    const hostReport = await platform.hostDiagnostics().catch(() => null)
+    const lastItem = [...state.items].reverse().find((item) => item.kind === 'error')
+    const text = buildDiagnostics({
+      appVersion,
+      hostReport,
+      engine: { version: state.version, protocol: state.protocol, features: state.features },
+      connection: state.connection,
+      lastError: state.connectionError ?? launchError ?? (lastItem && 'text' in lastItem ? lastItem.text : null),
+      updates: platform.manualUpdates ? 'manual' : platform.can.updates ? 'signed' : 'none',
+    })
+    await navigator.clipboard.writeText(text)
+  }
+  const restartEngine = () => {
+    void platform.restart(sessionId).catch((error: Error) => {
+      const problem = engineProblemFor(error.message, { restart: true })
+      controller?.apply({ type: 'local/disconnected', error: problem ? `[engine:${problem.code}] ${problem.message}` : error.message })
+    })
+  }
+  const exitedProblem = state.connection === 'exited' ? parseEngineProblem(state.connectionError) : null
+
   if (!controller) {
     return (
       <div className="splash">
         <PixelLogo pixel={10} />
         {launchError ? (
-          <div className="error-line" role="alert">
-            {launchError}
-          </div>
+          parseEngineProblem(launchError) ? (
+            <EngineProblemCard
+              problem={parseEngineProblem(launchError)!}
+              actions={{ onRestart: () => window.location.reload(), onCopyDiagnostics: copyDiagnostics, onOpenLink: openLink }}
+            />
+          ) : (
+            <div className="error-line" role="alert">
+              {launchError}
+            </div>
+          )
         ) : (
           <div className="muted" role="status">
             Starting the Neuron engine…
@@ -429,6 +467,9 @@ export function App({ platform }: { platform: Platform }) {
             onSignIn={signInNow}
             onSignOut={() => setSigningOut('confirm')}
             onClose={() => setView('chat')}
+            engineInfo={engineInfo} // L5
+            engineDetails={{ protocol: state.protocol, features: state.features }}
+            onCopyDiagnostics={copyDiagnostics}
           />
         )}
         {view === 'projects' && (
@@ -451,7 +492,11 @@ export function App({ platform }: { platform: Platform }) {
         {view === 'extensions' && (
           <ExtensionsPage onClose={() => setView('chat')}>
             {hasFeature(state, FEATURE_EXTENSIONS) ? (
-              <ExtensionsPanel extensions={state.extensions} onRefresh={refreshExtensions} />
+              <ExtensionsPanel
+                extensions={state.extensions}
+                onRefresh={refreshExtensions}
+                onSetEnabled={hasFeature(state, FEATURE_MCP_TOGGLE) ? (name, enabled) => controller.setMcpServerEnabled(name, enabled) : undefined}
+              />
             ) : (
               <p className="muted">This engine does not report its extensions; update Neuron for this page.</p>
             )}
@@ -470,7 +515,7 @@ export function App({ platform }: { platform: Platform }) {
             <RestartBanner
               state={state}
               canRestart={platform.can.restart}
-              onRestart={() => void platform.restart(sessionId).catch((error: Error) => setLaunchError(error.message))}
+              onRestart={restartEngine}
             />
             {signIn ? (
               signInPanel
@@ -544,11 +589,17 @@ export function App({ platform }: { platform: Platform }) {
                 </>
               }
             />
-            {state.connection === 'exited' && (
+            {exitedProblem && (
+              <EngineProblemCard
+                problem={exitedProblem}
+                actions={{ onRestart: platform.can.restart ? restartEngine : undefined, onCopyDiagnostics: copyDiagnostics, onOpenLink: openLink }}
+              />
+            )}
+            {state.connection === 'exited' && !exitedProblem && (
               <div className="error-line" role="alert">
                 {state.connectionError ?? 'The Neuron engine stopped.'}
                 {platform.can.restart && (
-                  <button className="link-button" onClick={() => void platform.restart(sessionId).catch(() => {})}>
+                  <button className="link-button" onClick={restartEngine}>
                     Restart it
                   </button>
                 )}

@@ -70,6 +70,14 @@ export interface UpdateInfo {
   notes: string | null
 }
 
+/** Which engine the app runs (L5): `NEURON_BIN`, the one bundled beside the app, one on the PATH, or none. */
+export interface EngineInfo {
+  source: 'env' | 'bundled' | 'path' | 'missing'
+  path: string | null
+  bundledPath: string | null
+  bundledPresent: boolean
+}
+
 export interface Platform {
   kind: 'tauri' | 'host'
   /** Where the engine runs, for the title bar. */
@@ -112,4 +120,9 @@ export interface Platform {
   /** A shell in the workspace; rejects where there is none. */
   openTerminal(cols: number, rows: number): Promise<TerminalSession>
   openExternal(url: string): void
+  // L5: extensions and resilience
+  /** Which engine runs; `null` where the app does not start it (a browser). */
+  engineInfo(): Promise<EngineInfo | null>
+  /** The host's part of the support report (app version, OS, engine); `null` in a browser. Never holds account data. */
+  hostDiagnostics(): Promise<string | null>
 }

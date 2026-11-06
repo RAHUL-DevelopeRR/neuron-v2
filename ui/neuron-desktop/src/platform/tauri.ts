@@ -23,7 +23,7 @@ import {
 } from '@neuron/client'
 
 import { createUpdateChecker } from './updates'
-import type { DirListing, FileContent, GitStatusView, KeyValueStore, LaunchOptions, Platform, Project, TerminalSession } from './types'
+import type { DirListing, EngineInfo, FileContent, GitStatusView, KeyValueStore, LaunchOptions, Platform, Project, TerminalSession } from './types'
 
 interface EngineLine {
   generation: number
@@ -227,5 +227,8 @@ export function tauriPlatform(): Platform {
       }
     },
     openExternal: (url) => void invoke('open_external', { url }),
+    // L5: extensions and resilience
+    engineInfo: () => invoke<EngineInfo>('engine_info'),
+    hostDiagnostics: () => invoke<string>('diagnostics'),
   }
 }

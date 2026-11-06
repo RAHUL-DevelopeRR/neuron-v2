@@ -4,6 +4,7 @@ import type { Platform } from './types'
 export type {
   DirEntry,
   DirListing,
+  EngineInfo,
   FileContent,
   GitChange,
   GitStatusView,

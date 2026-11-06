@@ -91,5 +91,8 @@ export function hostPlatform(options: HostPlatformOptions): Platform {
       }
     },
     openExternal: (url) => window.open(url, '_blank', 'noopener,noreferrer'),
+    // L5: extensions and resilience. The engine is behind a host here; the app does not choose it.
+    engineInfo: async () => null,
+    hostDiagnostics: async () => null,
   }
 }

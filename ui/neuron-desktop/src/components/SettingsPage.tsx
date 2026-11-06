@@ -3,11 +3,11 @@ import { useState } from 'react'
 import { type AccountView, type ModelInfo } from '@neuron/client'
 
 import { LINKS } from '../links'
-import type { UpdateInfo } from '../platform'
+import type { EngineInfo, UpdateInfo } from '../platform'
 import type { Settings } from '../settings'
 import { MODES } from './Composer'
 
-export type SettingsSection = 'account' | 'usage' | 'appearance' | 'sessions' | 'about'
+export type SettingsSection = 'account' | 'usage' | 'appearance' | 'sessions' | 'about' | 'diagnostics'
 
 const SECTIONS: Array<[SettingsSection, string]> = [
   ['account', 'Account'],
@@ -15,7 +15,94 @@ const SECTIONS: Array<[SettingsSection, string]> = [
   ['appearance', 'Appearance'],
   ['sessions', 'Sessions'],
   ['about', 'About'],
+  ['diagnostics', 'Diagnostics'], // L5: extensions and resilience
 ]
+
+/** L5: what the engine reports about itself (`ready`), for Settings › Diagnostics. */
+export interface EngineDetails {
+  protocol: number | null
+  features: string[]
+}
+
+const SOURCE_LABEL: Record<EngineInfo['source'], string> = {
+  bundled: 'Bundled with Neuron',
+  env: 'From NEURON_BIN',
+  path: 'Found on your PATH',
+  missing: 'Not found',
+}
+
+/** The warning for an engine that is not the bundled one; `null` when all is as shipped. */
+export function engineWarning(info: EngineInfo | null): string | null {
+  if (!info) return null
+  if (info.source === 'env') return `Using the engine from NEURON_BIN: ${info.path ?? 'unknown'}`
+  if (info.source === 'path') return `Using the engine found on your PATH: ${info.path ?? 'unknown'}`
+  if (info.source === 'missing') return 'No Neuron engine was found. Reinstall Neuron, or set NEURON_BIN to its path.'
+  return null
+}
+
+/** L5: which engine runs, its version, protocol and features, and a copyable support report. */
+function DiagnosticsPanel({
+  info,
+  engineVersion,
+  details,
+  where,
+  onCopy,
+}: {
+  info: EngineInfo | null
+  engineVersion: string | null
+  details: EngineDetails
+  where: string
+  onCopy: () => Promise<void>
+}) {
+  const [copied, setCopied] = useState(false)
+  const warning = engineWarning(info)
+  const copy = () =>
+    void onCopy().then(
+      () => {
+        setCopied(true)
+        setTimeout(() => setCopied(false), 1500)
+      },
+      () => {},
+    )
+  return (
+    <section aria-labelledby="diagnostics-title">
+      <h2 id="diagnostics-title">Diagnostics</h2>
+      {warning && (
+        <p className="error-line" role="alert">
+          {warning}
+        </p>
+      )}
+      {!info && <p className="muted small">The engine runs on {where}.</p>}
+      <dl className="diagnostics-list">
+        {info && (
+          <>
+            <dt>Engine</dt>
+            <dd>{SOURCE_LABEL[info.source]}</dd>
+            {info.path && (
+              <>
+                <dt>Engine file</dt>
+                <dd className="mono">{info.path}</dd>
+              </>
+            )}
+          </>
+        )}
+        <dt>Version</dt>
+        <dd>{engineVersion ?? 'not connected'}</dd>
+        <dt>Protocol</dt>
+        <dd>{details.protocol ?? 'unknown'}</dd>
+        <dt>Features</dt>
+        <dd>{details.features.join(', ') || 'none'}</dd>
+      </dl>
+      <div className="dialog-buttons start">
+        <button onClick={copy}>Copy diagnostics</button>
+        <span className="muted small" role="status">
+          {copied ? 'Copied' : ''}
+        </span>
+      </div>
+      <p className="muted small">The report holds versions, your system and the engine's state. It never holds your account, keys or files.</p>
+    </section>
+  )
+}
 
 export type UpdateCheck = { state: 'idle' } | { state: 'checking' } | { state: 'latest' } | { state: 'manual' } | { state: 'available'; update: UpdateInfo }
 
@@ -104,6 +191,9 @@ export function SettingsPage({
   onSignIn,
   onSignOut,
   onClose,
+  engineInfo = null,
+  engineDetails = { protocol: null, features: [] },
+  onCopyDiagnostics = async () => {},
 }: {
   section: SettingsSection
   onSection: (section: SettingsSection) => void
@@ -121,6 +211,10 @@ export function SettingsPage({
   onSignIn: () => void
   onSignOut: () => void
   onClose: () => void
+  // L5: extensions and resilience
+  engineInfo?: EngineInfo | null
+  engineDetails?: EngineDetails
+  onCopyDiagnostics?: () => Promise<void>
 }) {
   const [copied, setCopied] = useState(false)
   const versionText = `Neuron Desktop ${appVersion ?? 'dev'} · engine ${engineVersion ?? 'not connected'}`
@@ -258,6 +352,9 @@ export function SettingsPage({
                 Start each folder in the mode it was last left in
               </label>
             </section>
+          )}
+          {section === 'diagnostics' && (
+            <DiagnosticsPanel info={engineInfo} engineVersion={engineVersion} details={engineDetails} where={where} onCopy={onCopyDiagnostics} />
           )}
           {section === 'about' && (
             <section aria-labelledby="about-title">

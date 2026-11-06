@@ -16,27 +16,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// Where the `neuron` binary is: `NEURON_BIN`, beside the app's executable,
 /// then the PATH.
 pub fn resolve_binary() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("NEURON_BIN").filter(|value| !value.is_empty()) {
-        return Some(PathBuf::from(path));
-    }
-    let name = if cfg!(windows) {
-        "neuron.exe"
-    } else {
-        "neuron"
-    };
-    if let Some(sibling) = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(name)))
-    {
-        if sibling.is_file() {
-            return Some(sibling);
-        }
-    }
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|dir| dir.join(name))
-            .find(|candidate| candidate.is_file())
-    })
+    crate::diagnostics::resolve_from_environment().1 // L5: one lookup, with its source
 }
 
 #[derive(Debug, Clone, Default)]
@@ -117,7 +97,7 @@ impl EngineProcess {
         }
         let mut child = command
             .spawn()
-            .map_err(|error| format!("Could not start {}: {error}", binary.display()))?;
+            .map_err(|error| crate::diagnostics::classify_spawn_error(&error, binary).render())?; // L5
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().ok_or("the engine has no stdout")?;
         let stderr = child.stderr.take().ok_or("the engine has no stderr")?;
@@ -160,14 +140,7 @@ impl EngineProcess {
                 }
                 thread::sleep(Duration::from_millis(25));
             }
-            let error = lock(&last_error).clone().or_else(|| {
-                (code != Some(0)).then(|| {
-                    format!(
-                        "The Neuron engine stopped (exit code {}).",
-                        code.map_or("unknown".into(), |c| c.to_string())
-                    )
-                })
-            });
+            let error = crate::diagnostics::exit_error(code, lock(&last_error).as_deref()); // L5
             on_exit(EngineExit { code, error });
         });
 
@@ -398,7 +371,7 @@ mod tests {
             |_| {},
             move |end| drop(tx.send(end)),
         );
-        assert!(result.err().unwrap().starts_with("Could not start"));
+        assert!(result.err().unwrap().starts_with("[engine:missing] "));
         assert!(rx.try_recv().is_err());
     }
 }
