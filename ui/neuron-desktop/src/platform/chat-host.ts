@@ -274,7 +274,10 @@ class ChatTransport implements EngineTransport, Handler {
     const error = chatError(failure).message
     // A full input queue is a refusal of this message, not the end of the engine.
     if (error === NOT_KEEPING_UP) {
-      for (const listener of [...this.listeners]) listener({ type: 'error', message: error })
+      for (const listener of [...this.listeners]) {
+        listener({ type: 'error', message: error })
+        listener({ type: 'turn_finished' })
+      }
       return
     }
     if (!this.ready) return

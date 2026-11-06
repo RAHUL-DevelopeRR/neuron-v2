@@ -402,6 +402,10 @@ function startChats(platform: Platform): { store: ChatsStore; ready: Promise<voi
     })()
     entry = { store, ready }
     started.set(platform, entry)
+    // A start that failed is not remembered: Retry starts again.
+    ready.catch(() => {
+      if (started.get(platform) === entry) started.delete(platform)
+    })
   }
   return entry
 }
@@ -410,6 +414,11 @@ function startChats(platform: Platform): { store: ChatsStore; ready: Promise<voi
 export function useChats(platform: Platform, ready: boolean, onToast: (message: string) => void) {
   const [store, setStore] = useState<ChatsStore | null>(null)
   const [launchError, setLaunchError] = useState<string | null>(null)
+  const [attempt, setAttempt] = useState(0)
+  const retry = useCallback(() => {
+    setLaunchError(null)
+    setAttempt((count) => count + 1)
+  }, [])
 
   useEffect(() => {
     if (!ready) return
@@ -425,7 +434,7 @@ export function useChats(platform: Platform, ready: boolean, onToast: (message: 
     }
     // The settings were read once; later changes apply to the next engine.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [platform, ready])
+  }, [platform, ready, attempt])
   useEffect(() => {
     if (store) store.toast = onToast
   }, [store, onToast])
@@ -435,14 +444,18 @@ export function useChats(platform: Platform, ready: boolean, onToast: (message: 
     store?.getSnapshot ?? (() => EMPTY),
     store?.getSnapshot ?? (() => EMPTY),
   )
-  const focus = useCallback(() => store?.onWindowFocus(), [store])
+  // With a dialog open (a question the person is answering) the window does not jump away.
+  const focus = useCallback(() => {
+    if (document.querySelector('[aria-modal="true"]')) return
+    store?.onWindowFocus()
+  }, [store])
   useEffect(() => {
     window.addEventListener('focus', focus)
     return () => window.removeEventListener('focus', focus)
   }, [focus])
 
   const active = snapshot.items.find((item) => item.id === snapshot.activeId) ?? null
-  return { store, snapshot, active, launchError }
+  return { store, snapshot, active, launchError, retry }
 }
 
 const EMPTY: ChatsSnapshot = { items: [], activeId: null, needsYouCount: 0 }

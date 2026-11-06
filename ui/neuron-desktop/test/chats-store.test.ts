@@ -46,7 +46,7 @@ describe('notifications', () => {
     await settle()
     expect(notes).toHaveLength(1)
     // Answered, and later a new request that happens to have the same number.
-    host.controllers.get(second.id)!.answerPermission(5, 'allow')
+    host.controllers.get(second.id)!.answerPermission(5, { kind: 'allow_once' })
     await settle()
     host.engines.get(second.id)!.emit(permission(5))
     await settle()

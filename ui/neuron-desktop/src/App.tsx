@@ -38,11 +38,12 @@ import { TrustModal } from './components/TrustModal'
 import { Transcript } from './components/Transcript'
 import { TodoStrip } from './components/TodoStrip' // L1: live transcript
 import { useChats } from './chats'
+import { NOT_KEEPING_UP } from './platform/chat-host'
 import { buildDiagnostics, engineProblemFor, parseEngineProblem } from './engineProblems'
 import { exportName, transcriptJson, transcriptMarkdown, type DesktopCommand } from './commands'
 import { useSession } from './hooks'
 import { LINKS } from './links'
-import type { EngineInfo, LaunchOptions, Platform, Project, UpdateInfo } from './platform'
+import { ChatError, type EngineInfo, type LaunchOptions, type Platform, type Project, type UpdateInfo } from './platform'
 import { safeExternalUrl } from './platform/links'
 import type { PaletteCommand } from './palette'
 import { noteSeen, sessionRows, type SessionRow } from './sessions'
@@ -91,7 +92,18 @@ export function App({ platform }: { platform: Platform }) {
   const [restartError, setLaunchError] = useState<string | null>(null)
   const [palette, setPalette] = useState(false)
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
-  const [discarding, setDiscarding] = useState(false)
+  // The chat whose copy the discard dialog is about, and whether the person got there by closing it.
+  const [discarding, setDiscarding] = useState<string | null>(null)
+  const [discardFromClose, setDiscardFromClose] = useState(false)
+  // Why a chat could not replace the one just closed (the last one).
+  const [replaceError, setReplaceError] = useState<string | null>(null)
+  const switchingRef = useRef(false)
+  const paletteOpen = useRef(false)
+  paletteOpen.current = palette
+  const lastPath = useRef<string | undefined>(undefined)
+  const cycleModeRef = useRef<() => void>(() => {})
+  // The mode a cycling press leaves behind, until the engine's own status says so.
+  const cycled = useRef<{ from: unknown; mode: string; plan: boolean } | null>(null)
   // L3: composer. The reasoning effort new engines start with, and a change waiting for the turn to end.
   const [effort, setEffort] = useState<LaunchOptions['reasoningEffort']>(undefined)
   const [effortPending, setEffortPending] = useState(false)
@@ -102,7 +114,7 @@ export function App({ platform }: { platform: Platform }) {
     // Settings changed later apply to the next engine, not this one.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [platform, settingsLoaded])
-  const { store: chats, snapshot, active, launchError } = useChats(platform, settingsLoaded, setToast)
+  const { store: chats, snapshot, active, launchError, retry: retryFirstChat } = useChats(platform, settingsLoaded, setToast)
   const multi = platform.can.multiChat && chats !== null
   const controller: SessionController | null = active?.controller ?? null
   const state = useSession(controller)
@@ -152,6 +164,7 @@ export function App({ platform }: { platform: Platform }) {
   const sessionId = state.status?.session_id || null
   const project = multi ? (active?.info.project ?? null) : platform.project()
   const folder = state.status?.cwd ?? project?.path ?? null
+  if (project?.path) lastPath.current = project.path
 
   // The session list follows the engine: after it starts, after every turn, and on a switch.
   // Engines that can list every project's sessions do.
@@ -166,9 +179,11 @@ export function App({ platform }: { platform: Platform }) {
   }, [state.sessions, sessionId, updateSeen])
 
   // A turn that ended in an error marks its session failed; a good one clears it.
-  const wasBusy = useRef(false)
+  // Per chat: switching from a working chat to an idle one is not a turn ending.
+  const wasBusy = useRef(new Map<string, boolean>())
+  const chatKey = active?.id ?? ''
   useEffect(() => {
-    if (wasBusy.current && !state.busy && sessionId) {
+    if (wasBusy.current.get(chatKey) && !state.busy && sessionId) {
       const lastUser = state.items.map((item) => item.kind).lastIndexOf('user')
       const failed = state.items.slice(lastUser + 1).some((item) => item.kind === 'error')
       updateSeen((current) => {
@@ -179,8 +194,8 @@ export function App({ platform }: { platform: Platform }) {
         return { ...current, failed: next }
       })
     }
-    wasBusy.current = state.busy
-  }, [state.busy, state.items, sessionId, updateSeen])
+    wasBusy.current.set(chatKey, state.busy)
+  }, [state.busy, state.items, sessionId, updateSeen, chatKey])
 
   // A folder remembered in another mode starts in it.
   const modeApplied = useRef<string | null>(null)
@@ -221,7 +236,8 @@ export function App({ platform }: { platform: Platform }) {
   // L4: a chat in its own folder or copy; a refusal (the 4 working chats) is told, not thrown.
   const openChat = useCallback(
     async (request: { path?: string; resume?: string | null; worktree?: { name?: string } }) => {
-      if (!chats) return
+      if (!chats || switchingRef.current) return
+      switchingRef.current = true
       setSwitching(true)
       try {
         await chats.open(request)
@@ -231,6 +247,7 @@ export function App({ platform }: { platform: Platform }) {
         setToast(failure instanceof Error ? failure.message : String(failure))
         throw failure
       } finally {
+        switchingRef.current = false
         setSwitching(false)
       }
     },
@@ -254,6 +271,8 @@ export function App({ platform }: { platform: Platform }) {
 
   const openFolder = useCallback(
     async (path: string, resume: string | null = null) => {
+      if (switchingRef.current) return
+      switchingRef.current = true
       setSwitching(true)
       setProjectError(null)
       try {
@@ -276,6 +295,7 @@ export function App({ platform }: { platform: Platform }) {
         if (multi) setToast(message)
         throw failure
       } finally {
+        switchingRef.current = false
         setSwitching(false)
       }
     },
@@ -318,6 +338,7 @@ export function App({ platform }: { platform: Platform }) {
       else if (id === 'nextWaiting') chats?.jumpToWaiting()
       else if (id === 'previousChat') chats?.step(-1)
       else if (id === 'nextChat') chats?.step(1)
+      else if (id === 'cycleMode') cycleModeRef.current()
       else setShortcutsOpen(true)
     },
     [newSession, newWorktreeChat, chats],
@@ -329,6 +350,8 @@ export function App({ platform }: { platform: Platform }) {
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
+      // A held key is one press.
+      if (event.repeat) return
       if (event.key === 'Escape' && view !== 'chat' && !document.querySelector('[aria-modal="true"], [role="menu"]')) {
         setView('chat')
         return
@@ -336,8 +359,14 @@ export function App({ platform }: { platform: Platform }) {
       if (!(event.ctrlKey || event.metaKey)) return
       const shortcut = shortcutFor(event)
       if (shortcut) {
+        // The composer already cycled the mode for its own key press.
+        const handled = event.defaultPrevented
         event.preventDefault()
-        shortcutAction.current(shortcut)
+        // The palette's own key closes it; any other dialog keeps the keys to itself.
+        if (shortcut === 'palette' && paletteOpen.current) setPalette(false)
+        else if (document.querySelector('[aria-modal="true"]')) return
+        else if (shortcut === 'cycleMode' && handled) return
+        else shortcutAction.current(shortcut)
         return
       }
       const key = event.key.toLowerCase()
@@ -361,14 +390,32 @@ export function App({ platform }: { platform: Platform }) {
   }, [paneOpen, paneTab, openPane, openSettings, rail, view])
 
   // L4: what the palette lists. Other lanes append their own commands here.
+  const replaceChat = useCallback(async () => {
+    setReplaceError(null)
+    try {
+      await openChat({ path: lastPath.current })
+    } catch (failure) {
+      setReplaceError(failure instanceof Error ? failure.message : String(failure))
+    }
+  }, [openChat])
   const closeChat = useCallback(
     async (id: string) => {
       if (!chats) return
-      await chats.close(id)
+      try {
+        await chats.close(id)
+      } catch (failure) {
+        const info = chats.getSnapshot().items.find((item) => item.id === id)?.info
+        // A chat with a copy of its own is closed by deciding what happens to the copy.
+        if (failure instanceof ChatError && failure.code === 'has_worktree' && info?.worktree) {
+          setDiscardFromClose(true)
+          setDiscarding(id)
+        } else setToast(failure instanceof Error ? failure.message : String(failure))
+        return
+      }
       // A window always has a chat: closing the last one opens a fresh one.
-      if (chats.getSnapshot().items.length === 0) await openChat({ path: project?.path }).catch(() => {})
+      if (chats.getSnapshot().items.length === 0) await replaceChat()
     },
-    [chats, openChat, project],
+    [chats, replaceChat],
   )
   const paletteCommands = useMemo<PaletteCommand[]>(() => {
     const actions: PaletteCommand[] = [
@@ -439,15 +486,33 @@ export function App({ platform }: { platform: Platform }) {
   const account = sessionAccount(state)
   const untrusted =
     hasFeature(state, FEATURE_TRUST_WORKSPACE) && state.status !== null && !state.status.workspace_trusted && !state.restartRequired
+  // The discard dialog is about the chat it was opened for, whichever chat is in view later.
+  const discardItem = discarding ? snapshot.items.find((item) => item.id === discarding) : null
+  // A message the engine's queue refused comes back to the composer.
+  const refusedPrompt = useMemo(() => {
+    const [prev, last] = state.items.slice(-2)
+    return last?.kind === 'error' && last.text === NOT_KEEPING_UP && prev?.kind === 'user' ? { text: prev.text, attachments: prev.attachments } : null
+  }, [state.items])
   const firstRun = settingsLoaded && !settings.firstRunDone && controller !== null
 
   // L3: a new reasoning effort applies in a fresh engine on this chat, once the turn is over.
+  // It reads the controller as it is when the effect fires, not this render's snapshot, and never
+  // restarts under an open question or approval. The queue holds (`effortPending`) until the restart is over.
+  const restartingEffort = useRef(false)
   useEffect(() => {
-    if (!effortPending || !ready || state.busy || permission) return
-    setEffortPending(false)
-    const keep = state.items.some((item) => item.kind === 'user') ? sessionId : null
-    void platform.restart(keep).catch((error: Error) => setLaunchError(error.message))
-  }, [effortPending, ready, state.busy, permission, state.items, platform, sessionId])
+    if (!effortPending || restartingEffort.current || !controller) return
+    const latest = controller.getState()
+    if (latest.connection !== 'ready' || latest.busy || latest.permissions.length > 0 || openQuestionItem(latest) !== null) return
+    restartingEffort.current = true
+    const keep = latest.items.some((item) => item.kind === 'user') ? latest.status?.session_id || null : null
+    void platform
+      .restart(keep)
+      .catch((error: Error) => setLaunchError(error.message))
+      .finally(() => {
+        restartingEffort.current = false
+        setEffortPending(false)
+      })
+  }, [effortPending, ready, state.busy, permission, question, state.items, controller, platform])
 
   // What allowing the folder would turn on, asked for once per folder.
   const canPreview = hasFeature(state, FEATURE_TRUST_PREVIEW)
@@ -519,20 +584,30 @@ export function App({ platform }: { platform: Platform }) {
   const exitedProblem = state.connection === 'exited' ? parseEngineProblem(state.connectionError) : null
 
   if (!controller) {
+    const shownError = startError ?? replaceError
+    const problem = shownError ? parseEngineProblem(shownError) : null
+    // Starts again: the first chat of the window, or the one that replaces a chat just closed.
+    const retryStart = () => {
+      setLaunchError(null)
+      if (chats) void replaceChat()
+      else retryFirstChat()
+    }
     return (
       <div className="splash">
         <PixelLogo pixel={10} />
-        {startError ? (
-          parseEngineProblem(startError) ? (
-            <EngineProblemCard
-              problem={parseEngineProblem(startError)!}
-              actions={{ onRestart: () => window.location.reload(), onCopyDiagnostics: copyDiagnostics, onOpenLink: openLink }}
-            />
-          ) : (
-            <div className="error-line" role="alert">
-              {startError}
-            </div>
-          )
+        {shownError && !switching ? (
+          <>
+            {problem ? (
+              <EngineProblemCard problem={problem} actions={{ onCopyDiagnostics: copyDiagnostics, onOpenLink: openLink }} />
+            ) : (
+              <div className="error-line" role="alert">
+                {shownError}
+              </div>
+            )}
+            <button className="primary" onClick={retryStart}>
+              Retry
+            </button>
+          </>
         ) : (
           <div className="muted" role="status">
             Starting the Neuron engine…
@@ -542,21 +617,26 @@ export function App({ platform }: { platform: Platform }) {
     )
   }
 
-  // L3: composer. The permission mode as the mode menu applies it, and Shift+Tab through them.
+  // L3: composer. The permission mode as the mode menu applies it, and Ctrl+Shift+M (Cmd+Shift+M) through them.
   const applyMode = (mode: string) => {
     controller.command('permissions', mode)
     if (settings.rememberModePerFolder && folder) updateSettings({ modeByFolder: { ...settings.modeByFolder, [folder]: mode } })
   }
   const applyPlan = (on: boolean) => controller.command('plan', on ? 'on' : 'off')
+  // The mode a press leaves behind, until the engine's own status says so: two quick presses advance twice.
   const cycleMode = () => {
-    if (!ready || state.busy) return
-    const mode = state.status?.permission_mode ?? 'workspace-write'
-    const plan = state.status?.plan_mode ?? false
+    const latest = controller.getState()
+    if (latest.connection !== 'ready' || latest.busy) return
+    const pending = cycled.current?.from === latest.status ? cycled.current : null
+    const mode = pending?.mode ?? latest.status?.permission_mode ?? 'workspace-write'
+    const plan = pending?.plan ?? latest.status?.plan_mode ?? false
     const next = nextMode(mode, plan)
+    cycled.current = { from: latest.status, mode: next.mode, plan: next.plan }
     if (next.plan) return applyPlan(true)
     if (plan) applyPlan(false)
     if (next.mode !== mode) applyMode(next.mode)
   }
+  cycleModeRef.current = cycleMode
   const changeEffort = (value: LaunchOptions['reasoningEffort']) => {
     effortRef.current = value
     setEffort(value)
@@ -644,6 +724,7 @@ export function App({ platform }: { platform: Platform }) {
         needsYouCount={multi ? snapshot.needsYouCount : 0}
         onJumpWaiting={() => chats?.jumpToWaiting()}
         onNewWorktreeChat={multi ? newWorktreeChat : undefined}
+        onCloseChat={multi ? (id) => void closeChat(id) : undefined}
       />
       <main className="chat" aria-label={view === 'chat' ? 'Session' : undefined}>
         {view === 'settings' && (
@@ -711,7 +792,10 @@ export function App({ platform }: { platform: Platform }) {
             />
             {/* L4: the copy this chat works in */}
             {multi && active && (
-              <ChatContextBar info={active.info} onDiscard={() => setDiscarding(true)} onOpenInEditor={openInEditor} />
+              <ChatContextBar info={active.info} onDiscard={() => {
+                  setDiscardFromClose(false)
+                  setDiscarding(active.id)
+                }} onOpenInEditor={openInEditor} />
             )}
             <RestartBanner
               state={state}
@@ -764,7 +848,10 @@ export function App({ platform }: { platform: Platform }) {
               questionWaiting={question !== null}
               enterSends={settings.enterSends}
               searchFiles={platform.searchFiles}
-              restore={state.unsent}
+              restore={state.unsent ?? refusedPrompt}
+              sessionId={state.status?.session_id}
+              turnFailed={state.items.at(-1)?.kind === 'error'}
+              effortPending={effortPending}
               features={state.features}
               supportsImages={state.status?.supports_images === true}
               stageAttachment={platform.stageAttachment}
@@ -787,7 +874,8 @@ export function App({ platform }: { platform: Platform }) {
                     onMode={applyMode}
                     onPlan={applyPlan}
                   />
-                  <EffortPicker value={effort} pending={effortPending} disabled={!ready} onChange={changeEffort} />
+                  {/* The browser build does not apply launch options. */}
+                  {platform.kind !== 'host' && <EffortPicker value={effort} pending={effortPending} disabled={!ready} onChange={changeEffort} />}
                   <ModelPicker
                     current={state.status?.model ?? ''}
                     models={state.models}
@@ -887,15 +975,17 @@ export function App({ platform }: { platform: Platform }) {
       {/* L4: multi-chat */}
       <CommandPalette open={palette} onClose={() => setPalette(false)} commands={paletteCommands} />
       <ShortcutsSheet open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
-      {discarding && multi && active?.info.worktree && platform.chats && (
+      {discarding && multi && platform.chats && discardItem?.info.worktree && (
         <DiscardDialog
-          info={active.info}
-          loadStatus={() => platform.chats!.worktreeStatus(active.id)}
+          key={discarding}
+          info={discardItem.info}
+          notice={discardFromClose ? 'This chat works in its own copy. Discard the copy to close the chat, or keep it.' : undefined}
+          loadStatus={() => platform.chats!.worktreeStatus(discarding)}
           discard={async (options) => {
-            await platform.chats!.discardWorktree(active.id, options)
-            await closeChat(active.id)
+            await platform.chats!.discardWorktree(discarding, options)
+            await closeChat(discarding)
           }}
-          onClose={() => setDiscarding(false)}
+          onClose={() => setDiscarding(null)}
         />
       )}
       {toast && (

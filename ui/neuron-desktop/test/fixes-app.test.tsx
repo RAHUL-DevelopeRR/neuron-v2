@@ -11,6 +11,7 @@ import axe from 'axe-core'
 import type { ClientMessage, UiEvent } from '@neuron/client'
 
 import { App } from '../src/App'
+import { DiscardDialog } from '../src/components/ChatHeader'
 import { ChatError } from '../src/platform'
 import { SHORTCUTS, keysOf, shortcutFor } from '../src/shortcuts'
 import { FakeEngine, fakePlatform, type FakePlatform, type FakePlatformOptions } from './fake-platform'
@@ -174,14 +175,24 @@ describe('the effort restart', () => {
 
   test('the queue holds while a restart is pending, and the restart comes first', async () => {
     const { engine, platform } = await start()
+    let release = () => {}
+    const restarting = new Promise<void>((resolve) => (release = resolve))
+    const record = platform.restart
+    platform.restart = async (resume, options) => {
+      await record(resume, options)
+      await restarting
+    }
     type('first')
     type('second')
     effort('high')
     expect(platform.restarts).toEqual([])
     await finishTurn(engine)
     await waitFor(() => expect(platform.restarts).toEqual(['session-1']))
-    // The queued prompt did not run into the old engine in between.
+    // The queued prompt does not run into the old engine while the restart is under way.
+    await pause(80)
     expect(submits(engine)).toEqual(['first'])
+    await act(async () => release())
+    await waitFor(() => expect(submits(engine)).toEqual(['first', 'second']))
   })
 
   test('with an open question it does not restart; it waits for the answer', async () => {
@@ -203,7 +214,7 @@ describe('the effort restart', () => {
     await emit(engine, permission(7))
     await pause(80)
     expect(platform.restarts).toEqual([])
-    fireEvent.click(await screen.findByRole('button', { name: /^Allow/ }))
+    fireEvent.click(await screen.findByRole('button', { name: /^Allow once/ }))
     await finishTurn(engine)
     await waitFor(() => expect(platform.restarts).toEqual(['session-1']))
   })
@@ -279,5 +290,241 @@ describe('the command palette', () => {
     await openPalette()
     fireEvent.keyDown(window, { key: 'k', ctrlKey: true })
     expect(screen.queryByRole('dialog', { name: 'Command palette' })).toBeNull()
+  })
+})
+
+const MISSING = "[engine:missing] The Neuron engine was not found. Reinstall Neuron, or set NEURON_BIN to the engine's path."
+const COPY_NOTICE = 'This chat works in its own copy. Discard the copy to close the chat, or keep it.'
+
+describe('the discard dialog', () => {
+  const status = { branch: 'neuron/x', path: '/wt/x', dirty: 1, unmerged: 2 }
+  const mount = (discard: (options: { force: boolean; deleteUnmerged: boolean }) => Promise<void>, loadStatus = async () => status) =>
+    render(
+      <DiscardDialog
+        info={{ id: 'c1', project: { name: 'app', path: '/work/app' }, cwd: '/wt/x', branch: 'neuron/x', worktree: { path: '/wt/x', branch: 'neuron/x', base: 'main' } }}
+        loadStatus={loadStatus}
+        discard={discard}
+        onClose={() => {}}
+      />,
+    )
+
+  test('a double click on Continue does not answer the second question', async () => {
+    const calls: Array<{ force: boolean; deleteUnmerged: boolean }> = []
+    mount(async (options) => void calls.push(options))
+    const dialog = await screen.findByRole('alertdialog')
+    const first = await within(dialog).findByRole('button', { name: 'Continue' })
+    await waitFor(() => expect((first as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(first)
+    fireEvent.click(within(dialog).getByRole('button', { name: /Delete them and discard|Continue/ }))
+    fireEvent.click(within(dialog).getByRole('button', { name: /Delete them and discard|Continue/ }))
+    expect(within(dialog).getByRole('heading', { name: 'Delete its saved changes too?' })).toBeTruthy()
+    expect(calls).toEqual([])
+    // Focus is on the safe answer, and the confirm button is a new element.
+    expect(document.activeElement).toBe(within(dialog).getByRole('button', { name: 'Cancel' }))
+    expect(within(dialog).getByRole('button', { name: 'Delete them and discard' })).not.toBe(first)
+    // After a moment the person can answer.
+    await pause(450)
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Delete them and discard' }))
+    await waitFor(() => expect(calls).toEqual([{ force: true, deleteUnmerged: true }]))
+  })
+
+  test('a changed copy (dirty or unmerged answer) reloads the status and asks from the start', async () => {
+    let loads = 0
+    mount(
+      async () => {
+        throw new ChatError('This copy has unsaved changes.', 'dirty', 3)
+      },
+      async () => ({ ...status, dirty: ++loads === 1 ? 0 : 3, unmerged: 0 }),
+    )
+    const dialog = await screen.findByRole('alertdialog')
+    await within(dialog).findByText('Nothing in it would be lost.')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Discard the copy' }))
+    await within(dialog).findByText(/3 files have changes/)
+    expect(loads).toBe(2)
+    expect(within(dialog).getByRole('heading', { name: 'Discard this copy?' })).toBeTruthy()
+  })
+})
+
+describe('keys while a dialog is open', () => {
+  async function inACopyWithDialog() {
+    const started = await start({ multiChat: true })
+    const copy = await openAnother(started.platform, true)
+    fireEvent.click(await screen.findByRole('button', { name: 'Discard' }))
+    await screen.findByRole('alertdialog')
+    return { ...started, copy, first: started.chats.ids()[0] }
+  }
+
+  test('the dialog stays about the chat it was opened for', async () => {
+    const { chats, copy, first } = await inACopyWithDialog()
+    fireEvent.click(rowOf(first))
+    await waitFor(() => expect(chats.activated.at(-1)).toBe(first))
+    const dialog = screen.getByRole('alertdialog')
+    fireEvent.click(await within(dialog).findByRole('button', { name: 'Discard the copy' }))
+    await waitFor(() => expect(chats.discards.map((discard) => discard.id)).toEqual([copy]))
+  })
+
+  test('global shortcuts and the focus jump do nothing', async () => {
+    const { platform, chats, copy, first } = await inACopyWithDialog()
+    const before = chats.ids().length
+    const active = chats.activated.length
+    for (const init of [
+      { key: 'n', ctrlKey: true },
+      { key: 'N', ctrlKey: true, shiftKey: true },
+      { key: 'j', ctrlKey: true },
+      { key: 'ArrowUp', ctrlKey: true, altKey: true },
+      { key: 'ArrowDown', ctrlKey: true, altKey: true },
+      { key: '/', ctrlKey: true },
+      { key: 'k', ctrlKey: true },
+    ]) {
+      fireEvent.keyDown(window, init)
+    }
+    await pause()
+    expect(chats.ids().length).toBe(before)
+    expect(chats.activated.length).toBe(active)
+    expect(screen.queryByRole('dialog', { name: 'Keyboard shortcuts' })).toBeNull()
+    expect(screen.queryByRole('dialog', { name: 'Command palette' })).toBeNull()
+    // A chat in the background asks for the user; coming back to the window stays where it is.
+    await emit(chats.engines.get(first)!, permission(3))
+    await waitFor(() => expect(platform.notifications.length).toBe(1))
+    fireEvent(window, new Event('focus'))
+    await pause()
+    expect(chats.activated.at(-1)).toBe(copy)
+  })
+})
+
+describe('global keys', () => {
+  test('a held key is one press', async () => {
+    const { platform, chats } = await start({ multiChat: true })
+    for (let i = 0; i < 6; i++) fireEvent.keyDown(window, { key: 'n', ctrlKey: true, repeat: true })
+    await pause()
+    expect(chats.ids()).toHaveLength(1)
+    await openAnother(platform)
+    expect(chats.ids()).toHaveLength(2)
+  })
+
+  test('a second press while a chat is starting opens nothing more', async () => {
+    const { chats } = await start({ multiChat: true })
+    fireEvent.keyDown(window, { key: 'n', ctrlKey: true })
+    fireEvent.keyDown(window, { key: 'n', ctrlKey: true })
+    fireEvent.keyDown(window, { key: 'N', ctrlKey: true, shiftKey: true })
+    await waitFor(() => expect(chats.ids()).toHaveLength(2))
+    await pause(80)
+    expect(chats.ids()).toHaveLength(2)
+  })
+})
+
+describe('closing chats', () => {
+  async function closeFromPalette() {
+    fireEvent.keyDown(window, { key: 'k', ctrlKey: true })
+    const palette = await screen.findByRole('dialog', { name: 'Command palette' })
+    const input = within(palette).getByRole('combobox')
+    fireEvent.change(input, { target: { value: 'close this chat' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+  }
+
+  test('the last chat is replaced; when that fails the splash says why and Retry opens one', async () => {
+    const { chats } = await start({ multiChat: true })
+    chats.failNext = 'cap_reached'
+    await closeFromPalette()
+    expect(await screen.findByText('4 chats are working. Stop one to open another.')).toBeTruthy()
+    expect(screen.queryByText(/Starting the Neuron engine/)).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(await screen.findByLabelText('Message Neuron')).toBeTruthy()
+    expect(chats.ids()).toHaveLength(1)
+  })
+
+  test('a missing engine is the problem card, with a Retry', async () => {
+    const { chats } = await start({ multiChat: true })
+    chats.failNext = MISSING
+    await closeFromPalette()
+    expect(await screen.findByRole('alert', { name: /engine/i })).toBeTruthy()
+    chats.failNext = MISSING
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    await screen.findByRole('alert', { name: /engine/i })
+    expect(screen.queryByText(/Starting the Neuron engine/)).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(await screen.findByLabelText('Message Neuron')).toBeTruthy()
+  })
+
+  test('a first chat that failed to start is tried again by Retry, not remembered as failed', async () => {
+    const platform = fakePlatform(new FakeEngine(), { multiChat: true })
+    platform.fakeChats!.failNext = MISSING
+    render(<App platform={platform} />)
+    await screen.findByRole('alert', { name: /engine/i })
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(await screen.findByLabelText('Message Neuron')).toBeTruthy()
+    expect(platform.fakeChats!.opened).toHaveLength(2)
+  })
+
+  test('a chat with a copy of its own: closing it opens the discard dialog for that chat, from the palette', async () => {
+    const { platform, chats } = await start({ multiChat: true })
+    const copy = await openAnother(platform, true)
+    chats.closeNeedsDiscard.add(copy)
+    await closeFromPalette()
+    const dialog = await screen.findByRole('alertdialog')
+    expect(within(dialog).getByText(COPY_NOTICE)).toBeTruthy()
+    fireEvent.click(await within(dialog).findByRole('button', { name: 'Discard the copy' }))
+    await waitFor(() => expect(chats.discards.map((discard) => discard.id)).toEqual([copy]))
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull())
+    expect(chats.ids()).not.toContain(copy)
+  })
+
+  test('the sidebar row has a close button named for its row; a chat with a copy asks first', async () => {
+    const { platform, chats } = await start({ multiChat: true })
+    const copy = await openAnother(platform, true)
+    const first = chats.ids()[0]
+    chats.closeNeedsDiscard.add(copy)
+    const closeOf = (id: string) => within(rowOf(id).closest('li')!).getByRole('button', { name: /^Close chat: / })
+    fireEvent.click(closeOf(copy))
+    const dialog = await screen.findByRole('alertdialog')
+    expect(within(dialog).getByText(COPY_NOTICE)).toBeTruthy()
+    fireEvent.keyDown(dialog, { key: 'Escape' })
+    expect(chats.ids()).toContain(copy)
+    // An ordinary chat just closes.
+    fireEvent.click(closeOf(first))
+    await waitFor(() => expect(chats.closed).toEqual([first]))
+    await waitFor(() => expect(rowOf(first)).toBeNull())
+  })
+})
+
+describe('turns that end', () => {
+  test('switching from a working chat to an idle one is not a turn ending', async () => {
+    const engine = new FakeEngine()
+    const platform = fakePlatform(engine, { multiChat: true })
+    platform.saved.set('seen', { seen: {}, failed: { 'session-1': true } })
+    render(<App platform={platform} />)
+    await screen.findByLabelText('Message Neuron')
+    await within(sidebar()).findByRole('region', { name: /, 1$/ })
+    type('work')
+    await openAnother(platform)
+    await pause(100)
+    expect((platform.saved.get('seen') as { failed: Record<string, boolean> }).failed['session-1']).toBe(true)
+  })
+})
+
+describe('the host refusals in the UI', () => {
+  test('a discard refused because the chat is still starting says so and stays open', async () => {
+    render(
+      <DiscardDialog
+        info={{ id: 'c1', project: { name: 'app', path: '/work/app' }, cwd: '/wt/x', branch: 'neuron/x', worktree: { path: '/wt/x', branch: 'neuron/x', base: 'main' } }}
+        loadStatus={async () => ({ branch: 'neuron/x', path: '/wt/x', dirty: 0, unmerged: 0 })}
+        discard={async () => {
+          throw new ChatError('This chat is still starting. Try again in a moment.', 'starting')
+        }}
+        onClose={() => {}}
+      />,
+    )
+    const dialog = await screen.findByRole('alertdialog')
+    fireEvent.click(await within(dialog).findByRole('button', { name: 'Discard the copy' }))
+    expect((await within(dialog).findByRole('alert')).textContent).toBe('This chat is still starting. Try again in a moment.')
+    expect(within(dialog).getByRole('heading', { name: 'Discard this copy?' })).toBeTruthy()
+  })
+
+  test('a message the engine queue refused is an error line and comes back to the composer', async () => {
+    const { engine } = await start()
+    type('please refactor')
+    await emit(engine, { type: 'error', message: 'The Neuron engine is not keeping up. Try again in a moment.' }, { type: 'turn_finished' })
+    expect(screen.getByText('The Neuron engine is not keeping up. Try again in a moment.')).toBeTruthy()
+    await waitFor(() => expect(box().value).toBe('please refactor'))
   })
 })

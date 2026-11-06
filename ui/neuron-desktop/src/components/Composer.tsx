@@ -106,6 +106,8 @@ interface ComposerProps {
   sessionId?: string | null
   /** The last turn failed: queued prompts wait for the user instead of running into the same failure. */
   turnFailed?: boolean
+  /** An effort change waits to restart the engine: queued prompts wait for the new engine. */
+  effortPending?: boolean
 }
 
 export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Composer(
@@ -130,6 +132,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     onCycleMode,
     sessionId = null,
     turnFailed = false,
+    effortPending = false,
   },
   ref,
 ) {
@@ -314,7 +317,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
 
   // The turn is over (and nothing waits for an answer): the next queued prompt goes.
   useEffect(() => {
-    if (busy || disabled || questionWaiting || permissionWaiting || paused || queue.length === 0) return
+    if (busy || disabled || questionWaiting || permissionWaiting || effortPending || paused || queue.length === 0) return
     const next = queue[0]
     if (lastSent.current === next.id) return
     lastSent.current = next.id
@@ -322,7 +325,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     run(next)
     // `run` follows the props above.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [busy, disabled, questionWaiting, permissionWaiting, paused, queue])
+  }, [busy, disabled, questionWaiting, permissionWaiting, effortPending, paused, queue])
 
   // Nothing waits any more: nothing is paused.
   useEffect(() => {
@@ -339,9 +342,12 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   }, [sessionId])
 
   // A failed turn (or a prompt put back after one) holds the queue.
-  useEffect(() => {
-    if ((turnFailed || restore) && queueRef.current.length > 0) setPaused(true)
-  }, [turnFailed, restore])
+  // Held while rendering, so the queue cannot send in the same commit that the failure shows in.
+  const [failureSeen, setFailureSeen] = useState<{ turnFailed: boolean; restore: unknown }>({ turnFailed, restore })
+  if (failureSeen.turnFailed !== turnFailed || failureSeen.restore !== restore) {
+    setFailureSeen({ turnFailed, restore })
+    if ((turnFailed || restore) && queue.length > 0) setPaused(true)
+  }
 
   const interrupt = () => {
     if (queueRef.current.length > 0) setPaused(true)

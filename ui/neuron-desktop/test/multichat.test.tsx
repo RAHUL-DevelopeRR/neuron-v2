@@ -214,7 +214,7 @@ describe('chats that finish out of view', () => {
     expect(done.textContent).toContain('refactor the parser')
     expect(done.textContent).toContain('finished, not seen yet')
 
-    fireEvent.click(within(done).getByRole('button'))
+    fireEvent.click(rowOf(second))
     await waitFor(() => expect(chats.activated.at(-1)).toBe(second))
     await waitFor(() => expect(within(sidebar()).queryByRole('region', { name: /Finished/ })).toBeNull())
     expect(platform.attention).not.toContain(1)
@@ -323,6 +323,8 @@ describe('discarding a copy', () => {
     // Step one only moves on; nothing is removed.
     fireEvent.click(within(dialog).getByRole('button', { name: 'Continue' }))
     expect(chats.discards).toEqual([])
+    // The second question is not answered by the click that moved here.
+    await new Promise((resolve) => setTimeout(resolve, 450))
     expect(within(dialog).getByText(/3 saved changes/)).toBeTruthy()
     expect(within(dialog).getByRole('heading', { name: 'Delete its saved changes too?' })).toBeTruthy()
     expect(document.activeElement).toBeTruthy()
