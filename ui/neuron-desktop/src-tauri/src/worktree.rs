@@ -71,8 +71,7 @@ pub struct WorktreeStatus {
 /// dashes, 1 to 40 characters. Anything that looks like a path, and the names
 /// Windows reserves, are refused rather than cleaned.
 pub fn slugify(name: &str) -> Result<String, String> {
-    let name = name.trim();
-    if name.contains(['/', '\\']) || name.contains("..") || name.chars().any(char::is_control) {
+    if name.chars().any(char::is_control) || name.contains(['/', '\\']) || name.contains("..") {
         return Err("A name cannot contain slashes or dots in a row.".into());
     }
     let mut slug = String::new();
