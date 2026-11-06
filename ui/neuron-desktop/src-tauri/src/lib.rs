@@ -17,6 +17,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_dialog::DialogExt;
 
 use engine::{EngineExit, EngineProcess, Env, Launch};
 use projects::Project;
@@ -58,8 +59,11 @@ fn status_session(line: &str) -> Option<String> {
 pub struct LaunchOptions {
     pub model: Option<String>,
     pub permission_mode: Option<String>,
+    /// L3: composer. `low`, `medium` or `high`.
+    pub reasoning_effort: Option<String>,
 }
 
+const REASONING_EFFORTS: [&str; 3] = ["low", "medium", "high"];
 const PERMISSION_MODES: [&str; 3] = ["read-only", "workspace-write", "danger-full-access"];
 
 impl LaunchOptions {
@@ -75,9 +79,13 @@ impl LaunchOptions {
         let permission_mode = self
             .permission_mode
             .filter(|mode| PERMISSION_MODES.contains(&mode.as_str()));
+        let reasoning_effort = self
+            .reasoning_effort
+            .filter(|effort| REASONING_EFFORTS.contains(&effort.as_str()));
         Self {
             model,
             permission_mode,
+            reasoning_effort,
         }
     }
 }
@@ -153,6 +161,7 @@ fn launch(
             .permission_mode
             .or_else(|| std::env::var("NEURON_DESKTOP_PERMISSION_MODE").ok()),
         resume: resume.filter(|id| !id.is_empty()),
+        reasoning_effort: options.reasoning_effort,
     };
     let lines = app.clone();
     let exits = app.clone();
@@ -302,6 +311,65 @@ async fn fs_search(state: State<'_, AppState>, query: String) -> Result<Vec<Stri
     Ok(workspace.search(&query, 50))
 }
 
+/// L3: composer. Copies a pasted or dropped image into the app's staging folder. The
+/// bytes are the raw request body; `x-attachment-name` (percent-encoded) and
+/// `x-media-type` are headers.
+#[tauri::command]
+async fn attachment_stage(
+    app: AppHandle,
+    request: tauri::ipc::Request<'_>,
+) -> Result<workspace::StagedAttachment, String> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("The image did not arrive.".to_string());
+    };
+    let header = |name: &str| {
+        request
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    };
+    let name = workspace::percent_decode(&header("x-attachment-name"));
+    let media_type = header("x-media-type");
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?
+        .join("attachments");
+    workspace::stage_attachment(&dir, &name, &media_type, bytes)
+}
+
+/// L3: composer. Saves a chat export where the user says, in the system's save
+/// dialog: the window never names the path. Returns the saved path, or `None` when
+/// the dialog was cancelled.
+#[tauri::command]
+async fn export_save(
+    app: AppHandle,
+    suggested_name: String,
+    content: String,
+) -> Result<Option<String>, String> {
+    if content.len() > workspace::MAX_EXPORT_BYTES {
+        return Err("That chat is too large to save.".to_string());
+    }
+    let name = workspace::export_file_name(&suggested_name);
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_file_name(name)
+            .add_filter("Chat", &["md", "json"])
+            .blocking_save_file()
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    let Some(picked) = picked else {
+        return Ok(None);
+    };
+    let path = picked.into_path().map_err(|error| error.to_string())?;
+    workspace::write_export(&path, &content)?;
+    Ok(Some(path.display().to_string()))
+}
+
 #[tauri::command]
 async fn git_status(state: State<'_, AppState>) -> Result<Option<git::GitStatusView>, String> {
     let root = lock(&state.workspace).root().to_path_buf();
@@ -445,7 +513,9 @@ pub fn run() {
             term_close,
             open_external,
             engine_info, // L5: extensions and resilience
-            diagnostics
+            diagnostics,
+            attachment_stage, // L3: composer
+            export_save       // L3: composer
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
@@ -484,6 +554,7 @@ mod tests {
         let options = LaunchOptions {
             model: Some("  sonnet ".into()),
             permission_mode: Some("workspace-write".into()),
+            ..LaunchOptions::default()
         }
         .checked();
         assert_eq!(options.model.as_deref(), Some("sonnet"));
@@ -492,15 +563,39 @@ mod tests {
         let refused = LaunchOptions {
             model: Some("--dangerously-skip-permissions".into()),
             permission_mode: Some("bypass".into()),
+            ..LaunchOptions::default()
         }
         .checked();
         assert_eq!(refused, LaunchOptions::default());
         let control = LaunchOptions {
             model: Some("gpt\n--x".into()),
             permission_mode: None,
+            ..LaunchOptions::default()
         }
         .checked();
         assert_eq!(control.model, None);
+    }
+
+    #[test]
+    fn launch_options_keep_a_known_reasoning_effort() {
+        for effort in ["low", "medium", "high"] {
+            let options = LaunchOptions {
+                reasoning_effort: Some(effort.into()),
+                ..LaunchOptions::default()
+            }
+            .checked();
+            assert_eq!(options.reasoning_effort.as_deref(), Some(effort));
+        }
+        for refused in ["max", "--model", "HIGH", "", "high\n"] {
+            let options = LaunchOptions {
+                reasoning_effort: Some(refused.into()),
+                ..LaunchOptions::default()
+            }
+            .checked();
+            assert_eq!(options.reasoning_effort, None, "{refused:?}");
+        }
+        let read: LaunchOptions = serde_json::from_str(r#"{"reasoningEffort":"low"}"#).unwrap();
+        assert_eq!(read.reasoning_effort.as_deref(), Some("low"));
     }
 
     #[test]

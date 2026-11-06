@@ -230,5 +230,11 @@ export function tauriPlatform(): Platform {
     // L5: extensions and resilience
     engineInfo: () => invoke<EngineInfo>('engine_info'),
     hostDiagnostics: () => invoke<string>('diagnostics'),
+    // L3: composer
+    stageAttachment: (name, data, mediaType) =>
+      invoke<{ path: string; media_type: string }>('attachment_stage', data, {
+        headers: { 'x-attachment-name': encodeURIComponent(name), 'x-media-type': mediaType },
+      }),
+    exportSave: (suggestedName, content) => invoke<string | null>('export_save', { suggestedName, content }),
   }
 }

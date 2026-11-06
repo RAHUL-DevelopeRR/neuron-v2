@@ -2013,3 +2013,91 @@ h2 {
   margin: 0;
   word-break: break-all;
 }
+
+/* L3: composer */
+.queue,
+.composer-help ul {
+  list-style: none;
+  margin: 0 0 6px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.queue li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+.queue .queue-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.queue li textarea {
+  flex: 1;
+  min-height: 0;
+}
+.queue button {
+  padding: 0 6px;
+}
+.composer-help {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  font-size: 12px;
+}
+.composer-help-head {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+.thumbs {
+  list-style: none;
+  margin: 0;
+  padding: 0 10px 4px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.thumb {
+  position: relative;
+  display: inline-flex;
+}
+.thumb img {
+  height: 56px;
+  max-width: 96px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+}
+.thumb button {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  border-radius: 50%;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  line-height: 1;
+}
+.effort {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.effort select {
+  font-size: 12px;
+}
+.permission kbd {
+  margin-left: 4px;
+}

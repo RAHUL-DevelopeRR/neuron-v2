@@ -20,7 +20,7 @@ import {
 
 import { AccountRow, SignOutDialog, type AccountAction } from './components/AccountMenu'
 import { ChatHeader, RestartBanner, StatusBar } from './components/Bars'
-import { Composer, ModeMenu, type ComposerHandle } from './components/Composer'
+import { Composer, EffortPicker, ModeMenu, nextMode, type ComposerHandle } from './components/Composer'
 import { ExtensionsPanel } from './components/ExtensionsPanel'
 import { FirstRun } from './components/FirstRun'
 import { ModelPicker } from './components/ModelPicker'
@@ -36,6 +36,7 @@ import { TrustModal } from './components/TrustModal'
 import { Transcript } from './components/Transcript'
 import { TodoStrip } from './components/TodoStrip' // L1: live transcript
 import { buildDiagnostics, engineProblemFor, parseEngineProblem } from './engineProblems'
+import { exportName, transcriptJson, transcriptMarkdown, type DesktopCommand } from './commands'
 import { useSession } from './hooks'
 import { LINKS } from './links'
 import type { EngineInfo, LaunchOptions, Platform, Project, UpdateInfo } from './platform'
@@ -67,11 +68,12 @@ function useNarrow(): boolean {
 }
 
 /** What a new engine in `folder` starts with. */
-function launchOptions(settings: Settings, folder: string | null): LaunchOptions {
+function launchOptions(settings: Settings, folder: string | null, reasoningEffort?: LaunchOptions['reasoningEffort']): LaunchOptions {
   const remembered = settings.rememberModePerFolder && folder ? settings.modeByFolder[folder] : undefined
   return {
     model: settings.defaultModel.trim() || undefined,
     permissionMode: remembered ?? settings.defaultPermissionMode,
+    reasoningEffort, // L3: composer
   }
 }
 
@@ -100,13 +102,18 @@ export function App({ platform }: { platform: Platform }) {
   const [engineInfo, setEngineInfo] = useState<EngineInfo | null>(null) // L5
   const search = useRef<HTMLInputElement>(null)
   const composer = useRef<ComposerHandle>(null)
+  // L3: composer. The reasoning effort new engines start with, and a change waiting for the turn to end.
+  const [effort, setEffort] = useState<LaunchOptions['reasoningEffort']>(undefined)
+  const [effortPending, setEffortPending] = useState(false)
+  const effortRef = useRef<LaunchOptions['reasoningEffort']>(undefined)
+  const [modelSignal, setModelSignal] = useState(0)
   const narrow = useNarrow()
 
   // The engine starts once the settings say how.
   useEffect(() => {
     if (!settingsLoaded) return
     let cancelled = false
-    platform.setLaunchOptions(launchOptions(settings, null))
+    platform.setLaunchOptions(launchOptions(settings, null, effortRef.current))
     platform.connect().then(
       (connected) => !cancelled && setController(connected),
       (error: Error) => !cancelled && setLaunchError(error.message),
@@ -206,7 +213,7 @@ export function App({ platform }: { platform: Platform }) {
       setSwitching(true)
       setProjectError(null)
       try {
-        platform.setLaunchOptions(launchOptions(settings, path))
+        platform.setLaunchOptions(launchOptions(settings, path, effortRef.current))
         modeApplied.current = path
         await platform.openProject(path, resume)
         setToolKey(null)
@@ -316,6 +323,14 @@ export function App({ platform }: { platform: Platform }) {
     hasFeature(state, FEATURE_TRUST_WORKSPACE) && state.status !== null && !state.status.workspace_trusted && !state.restartRequired
   const firstRun = settingsLoaded && !settings.firstRunDone && controller !== null
 
+  // L3: a new reasoning effort applies in a fresh engine on this chat, once the turn is over.
+  useEffect(() => {
+    if (!effortPending || !ready || state.busy || permission) return
+    setEffortPending(false)
+    const keep = state.items.some((item) => item.kind === 'user') ? sessionId : null
+    void platform.restart(keep).catch((error: Error) => setLaunchError(error.message))
+  }, [effortPending, ready, state.busy, permission, state.items, platform, sessionId])
+
   // What allowing the folder would turn on, asked for once per folder.
   const canPreview = hasFeature(state, FEATURE_TRUST_PREVIEW)
   const previewAsked = useRef<string | null>(null)
@@ -402,6 +417,57 @@ export function App({ platform }: { platform: Platform }) {
         )}
       </div>
     )
+  }
+
+  // L3: composer. The permission mode as the mode menu applies it, and Shift+Tab through them.
+  const applyMode = (mode: string) => {
+    controller.command('permissions', mode)
+    if (settings.rememberModePerFolder && folder) updateSettings({ modeByFolder: { ...settings.modeByFolder, [folder]: mode } })
+  }
+  const applyPlan = (on: boolean) => controller.command('plan', on ? 'on' : 'off')
+  const cycleMode = () => {
+    if (!ready || state.busy) return
+    const mode = state.status?.permission_mode ?? 'workspace-write'
+    const plan = state.status?.plan_mode ?? false
+    const next = nextMode(mode, plan)
+    if (next.plan) return applyPlan(true)
+    if (plan) applyPlan(false)
+    if (next.mode !== mode) applyMode(next.mode)
+  }
+  const changeEffort = (value: LaunchOptions['reasoningEffort']) => {
+    effortRef.current = value
+    setEffort(value)
+    platform.setLaunchOptions(launchOptions(settings, folder, value))
+    if (platform.can.restart) setEffortPending(true)
+  }
+  const runCommand = async (name: DesktopCommand, args: string): Promise<string | void> => {
+    switch (name) {
+      case 'new':
+        return newSession()
+      case 'plan':
+        return applyPlan(!(state.status?.plan_mode ?? false))
+      case 'history':
+        return setView('sessions')
+      case 'model':
+        if (args) controller.setModel(args)
+        else setModelSignal((count) => count + 1)
+        return
+      case 'copy':
+        try {
+          await navigator.clipboard.writeText(transcriptMarkdown(state.items, title))
+          return 'Copied the chat as Markdown.'
+        } catch {
+          return 'Could not copy the chat.'
+        }
+      case 'export': {
+        const format = args.toLowerCase().startsWith('json') ? 'json' : 'md'
+        const content = format === 'json' ? transcriptJson(state.items) : transcriptMarkdown(state.items, title)
+        const saved = await platform.exportSave(exportName(title, format), content)
+        return saved ? `Saved to ${saved}` : 'Not saved.'
+      }
+      case 'help':
+        return
+    }
   }
 
   const signInPanel = (
@@ -564,6 +630,14 @@ export function App({ platform }: { platform: Platform }) {
               enterSends={settings.enterSends}
               searchFiles={platform.searchFiles}
               restore={state.unsent}
+              features={state.features}
+              supportsImages={state.status?.supports_images === true}
+              stageAttachment={platform.stageAttachment}
+              store={platform.store}
+              projectPath={folder}
+              permissionWaiting={permission !== null}
+              onCommand={runCommand}
+              onCycleMode={cycleMode}
               onSend={(text, attachments) => {
                 setToolKey(null)
                 controller.send(text, attachments)
@@ -575,16 +649,15 @@ export function App({ platform }: { platform: Platform }) {
                     mode={state.status?.permission_mode ?? 'workspace-write'}
                     planMode={state.status?.plan_mode ?? false}
                     disabled={!ready || state.busy}
-                    onMode={(mode) => {
-                      controller.command('permissions', mode)
-                      if (settings.rememberModePerFolder && folder) updateSettings({ modeByFolder: { ...settings.modeByFolder, [folder]: mode } })
-                    }}
-                    onPlan={(on) => controller.command('plan', on ? 'on' : 'off')}
+                    onMode={applyMode}
+                    onPlan={applyPlan}
                   />
+                  <EffortPicker value={effort} pending={effortPending} disabled={!ready} onChange={changeEffort} />
                   <ModelPicker
                     current={state.status?.model ?? ''}
                     models={state.models}
                     disabled={!ready || state.busy}
+                    openSignal={modelSignal}
                     onOpen={() => controller.listModels()}
                     onPick={(model) => controller.setModel(model)}
                   />

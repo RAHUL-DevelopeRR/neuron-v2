@@ -107,6 +107,12 @@ export interface FakePlatform extends Platform {
   engine: EngineInfo | null
   /** What `hostDiagnostics()` returns. */
   hostReport: string | null
+  /** L3: images staged, as `[name, byte length, media type]`. */
+  staged: Array<[string, number, string]>
+  /** L3: chats saved: the suggested name and the content. */
+  exports: Array<{ name: string; content: string }>
+  /** L3: what the save dialog returns next; `null` is a cancel. */
+  exportPath: string | null
 }
 
 export interface FakePlatformOptions {
@@ -142,6 +148,9 @@ export function fakePlatform(engine: FakeEngine, options: FakePlatformOptions = 
     saved,
     engine: options.engine === undefined ? { source: 'bundled', path: '/app/neuron', bundledPath: '/app/neuron', bundledPresent: true } : options.engine,
     hostReport: options.hostReport === undefined ? ['App version: 0.2.0', 'OS: windows x86_64'].join('\n') : options.hostReport,
+    staged: [],
+    exports: [],
+    exportPath: '/saved/chat.md',
     store: {
       get: async <T,>(key: string) => saved.get(key) as T | undefined,
       set: async (key, value) => void saved.set(key, value),
@@ -198,7 +207,11 @@ export function fakePlatform(engine: FakeEngine, options: FakePlatformOptions = 
       if (content === undefined) throw new Error(`No such file or folder: ${path}`)
       return { path, content, truncated: false, binary: false, size: content.length }
     },
-    searchFiles: async (query) => Object.keys(FILES).filter((file) => file.includes(query)),
+    // L3: folders come back with a trailing slash, as the host's search lists them.
+    searchFiles: async (query) => {
+      const folders = [...new Set(Object.keys(FILES).filter((file) => file.includes('/')).map((file) => `${file.split('/')[0]}/`))]
+      return [...folders.filter((folder) => query !== '' && folder.includes(query)), ...Object.keys(FILES).filter((file) => file.includes(query))]
+    },
     gitStatus: async () => platform.git,
     gitDiff: async (path) =>
       path === 'src/main.rs' ? '@@ -1,3 +1,3 @@\n fn main() {\n-    println!("hi");\n+    println!("hello");\n }\n' : '',
@@ -211,6 +224,15 @@ export function fakePlatform(engine: FakeEngine, options: FakePlatformOptions = 
     // L5: extensions and resilience
     engineInfo: async () => platform.engine,
     hostDiagnostics: async () => platform.hostReport,
+    // L3: composer
+    async stageAttachment(name, data, mediaType) {
+      platform.staged.push([name, data.length, mediaType])
+      return { path: `/stage/${platform.staged.length}-${name}`, media_type: mediaType }
+    },
+    async exportSave(name, content) {
+      platform.exports.push({ name, content })
+      return platform.exportPath
+    },
   }
   return platform
 }

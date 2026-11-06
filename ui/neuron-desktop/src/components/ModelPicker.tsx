@@ -12,12 +12,15 @@ export function ModelPicker({
   disabled,
   onOpen,
   onPick,
+  openSignal = 0,
 }: {
   current: string
   models: ModelInfo[]
   disabled: boolean
   onOpen: () => void
   onPick: (model: string) => void
+  /** L3: counts up each time `/model` asks for the menu. */
+  openSignal?: number
 }) {
   const [open, setOpen] = useState(false)
   const [typed, setTyped] = useState('')
@@ -30,6 +33,13 @@ export function ModelPicker({
     window.addEventListener('mousedown', close)
     return () => window.removeEventListener('mousedown', close)
   }, [open])
+  useEffect(() => {
+    if (openSignal === 0) return
+    onOpen()
+    setOpen(true)
+    // Only a new signal opens it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openSignal])
   const shown = models.find((model) => model.id === current)?.display_name ?? current
 
   return (

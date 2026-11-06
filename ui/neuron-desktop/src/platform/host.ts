@@ -94,5 +94,8 @@ export function hostPlatform(options: HostPlatformOptions): Platform {
     // L5: extensions and resilience. The engine is behind a host here; the app does not choose it.
     engineInfo: async () => null,
     hostDiagnostics: async () => null,
+    // L3: composer. A Neuron host has no staging folder or save dialog on this side.
+    stageAttachment: () => Promise.reject(new Error('Images can only be attached in the Neuron desktop app.')),
+    exportSave: () => Promise.reject(new Error('Saving a chat is only available in the Neuron desktop app.')),
   }
 }
