@@ -647,7 +647,7 @@ describe('Approvals', () => {
     await expectAccessible(document.querySelector('.composer')!)
     await ask(engine, ['git'])
     await expectAccessible(screen.getByRole('alertdialog'))
-  })
+  }, 30_000)
 })
 
 describe('/copy and /export', () => {

@@ -55,15 +55,18 @@ function DiagnosticsPanel({
   onCopy: () => Promise<void>
 }) {
   const [copied, setCopied] = useState(false)
+  const [copyFailed, setCopyFailed] = useState(false)
   const warning = engineWarning(info)
-  const copy = () =>
+  const copy = () => {
+    setCopyFailed(false)
     void onCopy().then(
       () => {
         setCopied(true)
         setTimeout(() => setCopied(false), 1500)
       },
-      () => {},
+      () => setCopyFailed(true),
     )
+  }
   return (
     <section aria-labelledby="diagnostics-title">
       <h2 id="diagnostics-title">Diagnostics</h2>
@@ -96,7 +99,7 @@ function DiagnosticsPanel({
       <div className="dialog-buttons start">
         <button onClick={copy}>Copy diagnostics</button>
         <span className="muted small" role="status">
-          {copied ? 'Copied' : ''}
+          {copied ? 'Copied' : copyFailed ? 'Could not copy' : ''}
         </span>
       </div>
       <p className="muted small">The report holds versions, your system and the engine's state. It never holds your account, keys or files.</p>

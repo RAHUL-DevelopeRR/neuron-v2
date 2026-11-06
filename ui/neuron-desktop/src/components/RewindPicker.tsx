@@ -118,14 +118,17 @@ export function RewindPicker({ state, controller, onClose }: { state: SessionSta
         }}
       >
         <h2 id="rewind-title">Restore point</h2>
+        {/* Always there, so a screen reader hears the text when it arrives. */}
+        <div role="status" className={done ? 'rewind-summary' : 'sr-only'}>
+          {done && (
+            <p>
+              Done. Put back {plural(done.restored.length, 'file')}, removed {done.removed.length}.
+              {done.prompt ? ' Your message is back in the message box, ready to edit and send again.' : ''}
+            </p>
+          )}
+        </div>
         {done ? (
           <>
-            <div role="status" className="rewind-summary">
-              <p>
-                Done. Put back {plural(done.restored.length, 'file')}, removed {done.removed.length}.
-                {done.prompt ? ' Your message is back in the message box, ready to edit and send again.' : ''}
-              </p>
-            </div>
             <Outcome result={done} />
             <div className="dialog-buttons">
               <button className="primary" data-autofocus onClick={onClose}>

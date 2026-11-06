@@ -488,6 +488,21 @@ describe('the restore-point picker', () => {
     expect(screen.queryByRole('dialog')).toBeNull()
   })
 
+  test('the status region is there before its text arrives', () => {
+    const base = build(ready(), CHECKPOINTS)
+    const { rerender } = openPicker(base)
+    fireEvent.click(screen.getByRole('radio', { name: /Add the greeting/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Preview' }))
+    const previewed = reduceSession(base, dryRun())
+    rerender(previewed)
+    fireEvent.click(screen.getByRole('button', { name: 'Restore' }))
+    const region = screen.getByRole('status')
+    expect(region.textContent).toBe('')
+    rerender(reduceSession(previewed, dryRun({ dry_run: false })))
+    expect(screen.getByRole('status')).toBe(region)
+    expect(region.textContent).toContain('Put back')
+  })
+
   test('busy: the picker says to wait and offers no preview', () => {
     openPicker(busy(build(ready(), CHECKPOINTS)))
     expect(screen.getByRole('dialog').textContent).toContain('agent is idle')

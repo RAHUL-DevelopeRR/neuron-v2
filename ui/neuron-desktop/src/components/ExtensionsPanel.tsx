@@ -25,6 +25,8 @@ interface Toggle {
   /** The state asked for while the engine has not confirmed it; `undefined` when idle. */
   pending: boolean | undefined
   onToggle: (enabled: boolean) => void
+  /** Why the last switch did not go through (the engine is down), shown inline. */
+  error?: string | null
 }
 
 function McpServerRow({ server, toggle }: { server: McpServerInfo; toggle: Toggle | null }) {
@@ -48,14 +50,22 @@ function McpServerRow({ server, toggle }: { server: McpServerInfo; toggle: Toggl
           aria-label={server.name}
           aria-checked={toggle.pending === undefined ? !off : toggle.pending}
           aria-busy={toggle.pending !== undefined || undefined}
-          disabled={toggle.pending !== undefined}
-          onClick={() => toggle.onToggle(off)}
+          // Not `disabled`: keyboard focus stays on the switch while it waits, and clicks are ignored.
+          aria-disabled={toggle.pending !== undefined || undefined}
+          onClick={() => {
+            if (toggle.pending === undefined) toggle.onToggle(off)
+          }}
         >
           <span className="switch-track" aria-hidden>
             <span className="switch-thumb" />
           </span>
           <span className="muted small">{toggle.pending === undefined ? (off ? 'Off' : 'On') : toggle.pending ? 'Turning on…' : 'Turning off…'}</span>
         </button>
+      )}
+      {toggle?.error && (
+        <div className="error-line small extension-detail" role="alert">
+          {toggle.error}
+        </div>
       )}
       {open && detail && <div className={server.error ? 'error-line small extension-detail' : 'muted small extension-detail'}>{detail}</div>}
     </li>
@@ -104,12 +114,14 @@ export function ExtensionsPanel({
   extensions: Extensions | null
   onRefresh: () => void
   /** Turns a server on or off (feature `mcp_toggle`); absent means no switches. */
-  onSetEnabled?: (name: string, enabled: boolean) => void
+  onSetEnabled?: (name: string, enabled: boolean) => void | Promise<void>
 }) {
   const [filter, setFilter] = useState('')
   // Servers just switched, with the state asked for, until the fresh list shows it.
   const [pending, setPending] = useState<Record<string, boolean>>({})
   const [toggled, setToggled] = useState(false)
+  // Servers whose last switch could not be sent, with the reason.
+  const [failed, setFailed] = useState<Record<string, string>>({})
   useEffect(() => {
     if (!extensions) return
     const settled = Object.keys(pending).filter((name) => {
@@ -124,9 +136,19 @@ export function ExtensionsPanel({
     return () => clearTimeout(timer)
   }, [pending])
   const setEnabled = (name: string, enabled: boolean) => {
+    setFailed(({ [name]: _gone, ...rest }) => rest)
     setPending((current) => ({ ...current, [name]: enabled }))
     setToggled(true)
-    onSetEnabled?.(name, enabled)
+    // The engine may be down: a throw (or a rejection) ends the wait with a reason instead of leaving the switch pending.
+    const fail = (error: unknown) => {
+      setPending(({ [name]: _gone, ...rest }) => rest)
+      setFailed((current) => ({ ...current, [name]: `Could not switch ${name}: ${error instanceof Error ? error.message : typeof error === 'string' ? error : 'the engine is not running.'}` }))
+    }
+    try {
+      void Promise.resolve(onSetEnabled?.(name, enabled)).catch(fail)
+    } catch (error) {
+      fail(error)
+    }
   }
   useEffect(() => {
     onRefresh()
@@ -177,7 +199,7 @@ export function ExtensionsPanel({
             <McpServerRow
               key={server.name}
               server={server}
-              toggle={onSetEnabled ? { pending: pending[server.name], onToggle: (enabled) => setEnabled(server.name, enabled) } : null}
+              toggle={onSetEnabled ? { pending: pending[server.name], error: failed[server.name], onToggle: (enabled) => setEnabled(server.name, enabled) } : null}
             />
           ))}
         </ul>

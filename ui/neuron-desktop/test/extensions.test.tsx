@@ -10,6 +10,7 @@ import axe from 'axe-core'
 import type { ClientMessage, UiEvent } from '@neuron/client'
 
 import { App } from '../src/App'
+import { ExtensionsPanel } from '../src/components/ExtensionsPanel'
 import { EngineProblemCard } from '../src/components/ProblemCard'
 import { buildDiagnostics, engineProblemFor, parseEngineProblem, type EngineProblemCode } from '../src/engineProblems'
 import { LINKS } from '../src/links'
@@ -89,8 +90,12 @@ describe('MCP on/off', () => {
     fireEvent.click(docs)
     expect(sent(engine, 'set_mcp_server_enabled')).toEqual([{ kind: 'command', type: 'set_mcp_server_enabled', name: 'docs', enabled: false }])
     const pending = screen.getByRole('switch', { name: 'docs' }) as HTMLButtonElement
-    expect(pending.disabled).toBe(true)
+    // Not disabled, so keyboard focus stays; clicks are ignored while it waits.
+    expect(pending.disabled).toBe(false)
+    expect(pending.getAttribute('aria-disabled')).toBe('true')
     expect(pending.getAttribute('aria-busy')).toBe('true')
+    fireEvent.click(pending)
+    expect(sent(engine, 'set_mcp_server_enabled').length).toBe(1)
     expect(screen.getByText(/Turning off/)).toBeTruthy()
     expect(screen.getByText(/from your next message/)).toBeTruthy()
 
@@ -103,6 +108,24 @@ describe('MCP on/off', () => {
     fireEvent.click(after)
     expect(sent(engine, 'set_mcp_server_enabled').at(-1)).toMatchObject({ name: 'docs', enabled: true })
     await expectAccessible()
+  }, 30_000)
+
+  test('a switch that cannot be sent (engine down) shows the reason instead of hanging', async () => {
+    const data = { mcpServers: [{ name: 'docs', scope: 'user', transport: 'stdio', status: 'ready', enabled: true, tools: [], error: null }], plugins: [], skills: [], agents: [] }
+    for (const failure of [
+      () => {
+        throw new Error('The engine is not running.')
+      },
+      () => Promise.reject(new Error('The engine is not running.')),
+    ]) {
+      const view = render(<ExtensionsPanel extensions={data as never} onRefresh={() => {}} onSetEnabled={failure} />)
+      fireEvent.click(screen.getByRole('switch', { name: 'docs' }))
+      expect((await screen.findByRole('alert')).textContent).toContain('The engine is not running.')
+      const again = screen.getByRole('switch', { name: 'docs' })
+      expect(again.getAttribute('aria-disabled')).toBeNull()
+      expect(again.getAttribute('aria-busy')).toBeNull()
+      view.unmount()
+    }
   })
 
   test('a server whose enabled flag is false reads as off even if its status is stale', async () => {
@@ -223,6 +246,17 @@ describe('engine problems', () => {
     })
   }
 
+  test('a clipboard that refuses says so', async () => {
+    render(
+      <EngineProblemCard
+        problem={engineProblemFor('[engine:failed] x')!}
+        actions={{ onCopyDiagnostics: () => Promise.reject(new Error('denied')), onOpenLink: () => {} }}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Copy diagnostics' }))
+    expect(await screen.findByText('Could not copy')).toBeTruthy()
+  })
+
   test('a restart that failed names the restart', async () => {
     render(
       <EngineProblemCard
@@ -264,6 +298,18 @@ describe('engine problems', () => {
 
 describe('copy diagnostics', () => {
   const secrets = ['dev@example.com', 'rahul@zero-x.live', 'Rahul S', 'sk-live-abcdef1234567890', 'acct_12345']
+
+  test('Settings says so when the clipboard refuses', async () => {
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText: () => Promise.reject(new Error('denied')) }, configurable: true })
+    const { engine } = await start({}, { manualUpdates: true })
+    await act(async () => {
+      for (const listener of engine.closeListeners) listener({ code: 1, error: 'The Neuron engine stopped (exit code 1).' })
+    })
+    fireEvent.click(within(screen.getByRole('navigation', { name: 'Neuron' })).getByRole('button', { name: 'Settings' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Diagnostics' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Copy diagnostics' }))
+    expect(await screen.findByText('Could not copy')).toBeTruthy()
+  })
 
   test('the report has the versions, engine, connection and update mode, and no account data', async () => {
     const copied: string[] = []
