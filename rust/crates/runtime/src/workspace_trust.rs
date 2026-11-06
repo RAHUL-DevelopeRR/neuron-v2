@@ -11,11 +11,18 @@
 //! Only absolute paths count: a relative store location, store line or root
 //! would resolve against the (possibly hostile) working directory.
 //!
+//! Trust also binds to what the folder asked for. When the folder is trusted, a
+//! fingerprint of its hook commands, MCP launch specs and allow or ask rules is stored
+//! next to the trust record (`trusted_config.json`, per folder). A later start whose
+//! fingerprint differs (a `git pull` or an edit added a hook) is untrusted again until
+//! the user accepts the folder trust screen, which lists those exact commands.
+//!
 //! The folder trust screen trusts a whole repository: [`trust_workspace_root`] records the
 //! git root, and a folder inside a recorded git root is trusted too. A nested repository
 //! has its own root. The home folder (or a folder above it) is trusted for this process
 //! only, so it is asked about at every start.
 
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -25,12 +32,18 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 pub const TRUST_WORKSPACE_ENV_VAR: &str = "NEURON_TRUST_WORKSPACE";
 
 const TRUST_STORE_FILE: &str = "trusted_dirs.txt";
+const TRUST_FINGERPRINT_FILE: &str = "trusted_config.json";
 
 static TRUST_STORE_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 /// Directories trusted during this process, so a failed write to the store
 /// does not leave the prompt and the loader disagreeing.
 static TRUSTED_THIS_PROCESS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+
+/// Fingerprints of what trusted folders asked for, recorded during this process: the
+/// home folder is trusted for the process only, and a failed write must not leave the
+/// prompt and the loader disagreeing.
+static FINGERPRINTS_THIS_PROCESS: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
 
 /// Pins the trust store location for this process. The CLI calls this at
 /// startup so the loader and the trust prompt read the same file; later calls
@@ -48,6 +61,91 @@ pub fn trust_store_path() -> Option<PathBuf> {
         .cloned()
         .or_else(|| default_neuron_home().map(|home| home.join(TRUST_STORE_FILE)))
         .filter(|path| path.is_absolute())
+}
+
+/// Where the per-folder fingerprints live: next to the trust store.
+fn fingerprint_store_path() -> Option<PathBuf> {
+    trust_store_path().map(|store| store.with_file_name(TRUST_FINGERPRINT_FILE))
+}
+
+/// The key a folder's fingerprint is stored under: the folder as the filesystem names
+/// it, lower-cased on Windows where paths ignore case.
+fn fingerprint_key(cwd: &Path) -> String {
+    let path = canonical(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    let key = path.display().to_string();
+    if cfg!(windows) {
+        key.to_ascii_lowercase()
+    } else {
+        key
+    }
+}
+
+/// What the folder asked for when the user trusted it (see [`config_fingerprint_matches`]):
+/// the empty string when it asked for nothing, `None` for a record made before
+/// fingerprints existed.
+#[must_use]
+pub fn recorded_config_fingerprint(cwd: &Path) -> Option<String> {
+    let key = fingerprint_key(cwd);
+    if let Some(found) = FINGERPRINTS_THIS_PROCESS.get().and_then(|map| {
+        map.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+            .cloned()
+    }) {
+        return Some(found);
+    }
+    let content = fs::read_to_string(fingerprint_store_path()?).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
+    parsed
+        .get("folders")?
+        .get(&key)?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Records what `cwd` asks for (`None`: nothing) as what the user just trusted.
+pub fn record_config_fingerprint(cwd: &Path, fingerprint: Option<&str>) -> io::Result<()> {
+    let key = fingerprint_key(cwd);
+    let value = fingerprint.unwrap_or("").to_string();
+    FINGERPRINTS_THIS_PROCESS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(key.clone(), value.clone());
+    let path = fingerprint_store_path().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "no home directory to keep the trust store in",
+        )
+    })?;
+    let mut folders = fs::read_to_string(&path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        .and_then(|parsed| parsed.get("folders").and_then(|f| f.as_object().cloned()))
+        .unwrap_or_default();
+    folders.insert(key, serde_json::Value::String(value));
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::json!({ "folders": folders }).to_string();
+    let temp = path.with_extension("json.tmp");
+    fs::write(&temp, body)?;
+    fs::rename(&temp, &path)
+}
+
+/// Whether a trust record made earlier still covers what `cwd` asks for now.
+/// `current` is the fingerprint of the folder's hooks, MCP servers and rules (`None`:
+/// it asks for nothing, which needs no approval). A folder trusted by the environment
+/// override is not checked.
+#[must_use]
+pub fn config_fingerprint_matches(cwd: &Path, current: Option<&str>) -> bool {
+    if trust_env_override() {
+        return true;
+    }
+    let Some(current) = current else {
+        return true;
+    };
+    recorded_config_fingerprint(cwd).as_deref() == Some(current)
 }
 
 /// Whether `NEURON_TRUST_WORKSPACE` asks to trust the current workspace.
@@ -125,6 +223,9 @@ pub fn trust_root(cwd: &Path) -> TrustRoot {
 /// repository), or, for the home folder, trusts it for this process only.
 pub fn trust_workspace_root(cwd: &Path) -> io::Result<TrustRoot> {
     let root = trust_root(cwd);
+    // What the folder asks for now is what the user was just shown.
+    let fingerprint = crate::ConfigLoader::default_for(cwd).workspace_config_fingerprint();
+    let fingerprint_result = record_config_fingerprint(cwd, fingerprint.as_deref());
     if root.session_only {
         let cwd = absolute_cwd(cwd)?;
         TRUSTED_THIS_PROCESS
@@ -135,6 +236,7 @@ pub fn trust_workspace_root(cwd: &Path) -> io::Result<TrustRoot> {
         return Ok(root);
     }
     record_trusted_workspace(&root.root)?;
+    fingerprint_result?;
     Ok(root)
 }
 

@@ -613,7 +613,11 @@ fn render_config_section(config: &RuntimeConfig) -> String {
         .map(|entry| {
             let restricted = config.ignored_project_settings().iter().any(|ignored| {
                 ignored.path == entry.path
-                    && ignored.action == ProjectSettingsAction::DroppedUntrusted
+                    && matches!(
+                        ignored.action,
+                        ProjectSettingsAction::DroppedUntrusted
+                            | ProjectSettingsAction::DroppedChanged
+                    )
             });
             format!(
                 "Loaded {:?}{}: {}",

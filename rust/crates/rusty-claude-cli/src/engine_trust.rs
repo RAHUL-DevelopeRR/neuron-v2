@@ -7,8 +7,9 @@ use std::path::Path;
 use neuron_tui::protocol::{HookPreview, McpServerPreview, PermissionRulePreview, UiEvent};
 use runtime::ConfigLoader;
 
-/// How long a hook or MCP server command shown on the trust screen gets, in characters.
-const HOOK_COMMAND_CHARS: usize = 200;
+/// How long a hook or MCP server command shown on the trust screen gets, in characters:
+/// long enough to read the whole command, short enough to bound a hostile file.
+const HOOK_COMMAND_CHARS: usize = 2000;
 
 /// What trusting `cwd` would turn on, and where the trust would be recorded.
 pub(crate) fn trust_preview_event(cwd: &Path) -> UiEvent {
@@ -22,6 +23,7 @@ pub(crate) fn trust_preview_event(cwd: &Path) -> UiEvent {
         is_git_root: root.is_git_root,
         session_only: root.session_only,
         trusted: loader.workspace_is_trusted(),
+        changed_since_trust: loader.workspace_changed_since_trust(),
         settings_files: preview
             .settings_files
             .iter()
@@ -34,6 +36,7 @@ pub(crate) fn trust_preview_event(cwd: &Path) -> UiEvent {
                 event: hook.event.to_string(),
                 command: shorten(&hook.command),
                 source: shown(&hook.source),
+                matcher: hook.matcher.clone(),
             })
             .collect(),
         mcp_servers: preview
@@ -89,7 +92,7 @@ mod tests {
         fs::write(
             cwd.join(".neuron").join("settings.json"),
             serde_json::json!({
-                "hooks": {"PreToolUse": [format!("echo ran > {}", marker.display()), "x".repeat(300)]},
+                "hooks": {"PreToolUse": [format!("echo ran > {}", marker.display()), "x".repeat(3000)]},
                 "mcpServers": {"postgres-tools": {"command": "uvx", "args": ["pg-mcp"]}},
                 "permissions": {"allow": ["bash(npm test)"]}
             })
