@@ -1,6 +1,23 @@
 # Zero-X / Neuron Engineering Progress
 
-Updated: 2026-10-07
+Updated: 2026-11-06
+
+## 0. In progress: Neuron Desktop v1 (2026-11-06)
+
+- **Branch `feat/desktop-app`** combines the desktop shell (PR #16) and the release work (PR #14)
+  with the current engine.
+- **Plan and research:** `docs/DESKTOP_APP_PLAN.md`. Section 11 covers progress, environment and
+  how to resume.
+- **Done:**
+  - the TUI parity audit
+  - the competitive analysis (Codex, Claude Code, OpenCode, Cursor, Windsurf, Zed)
+  - the release pipeline audit
+  - the Android assessment
+- **Next:**
+  1. Plan approval (Gate 1).
+  2. Seven test-first build lanes.
+  3. Unsigned installers for Windows, macOS and Linux from `desktop-release.yml`.
+  4. Android as the Expo remote-control app.
 
 ## 1. Completed
 
