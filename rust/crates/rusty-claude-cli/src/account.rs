@@ -32,6 +32,15 @@ pub struct AccountSummary {
     pub requests_today: Option<u64>,
     pub tokens_today: Option<u64>,
     pub resets_at: Option<String>,
+    /// The plan's rolling token window (Free: 1,000,000 tokens every 5 hours), when it
+    /// has one. With a window, the daily token figures refuse nothing.
+    pub window_tokens_limit: Option<u64>,
+    pub window_seconds: Option<u64>,
+    /// Tokens counted in the window now, and what it still allows.
+    pub window_tokens_used: Option<u64>,
+    pub window_tokens_remaining: Option<u64>,
+    /// When enough of the window frees up (ISO 8601); `None` while nothing counts in it.
+    pub window_resets_at: Option<String>,
     pub credit_balance_usd: Option<f64>,
     pub monthly_grant_usd: Option<f64>,
     pub subscription_status: Option<String>,
@@ -40,20 +49,170 @@ pub struct AccountSummary {
     pub suspended: bool,
 }
 
+/// A plan's rolling token window as `GET /api/account` reports it (`limits.window_*`
+/// and `usage_window`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlanWindow {
+    /// The plan as people read it ("Free"), when known.
+    pub plan_name: Option<String>,
+    pub limit_tokens: u64,
+    pub window_seconds: Option<u64>,
+    pub used_tokens: Option<u64>,
+    pub remaining_tokens: Option<u64>,
+    /// When enough of the window frees up (ISO 8601).
+    pub resets_at: Option<String>,
+}
+
+impl PlanWindow {
+    /// Tokens counted in the window: as reported, else what the remaining ones leave.
+    #[must_use]
+    pub fn used(&self) -> Option<u64> {
+        self.used_tokens.or_else(|| {
+            self.remaining_tokens
+                .map(|remaining| self.limit_tokens.saturating_sub(remaining))
+        })
+    }
+
+    /// What the window still allows: as reported, else the limit less what is used.
+    #[must_use]
+    pub fn remaining(&self) -> Option<u64> {
+        self.remaining_tokens.or_else(|| {
+            self.used_tokens
+                .map(|used| self.limit_tokens.saturating_sub(used))
+        })
+    }
+
+    /// `resets_at` has passed by `now`: some of what was used has left the window since
+    /// it was read, so how much is left is not known until the next read.
+    #[must_use]
+    pub fn is_past_reset(&self, now: u64) -> bool {
+        self.resets_at
+            .as_deref()
+            .and_then(crate::clock::parse_timestamp)
+            .is_some_and(|at| at <= now)
+    }
+
+    /// The window as it stands at `now`: once [`Self::is_past_reset`], what is used and
+    /// left is unknown (and when it frees up next too) until the account is read again.
+    #[must_use]
+    pub fn as_of(&self, now: u64) -> Self {
+        if !self.is_past_reset(now) {
+            return self.clone();
+        }
+        Self {
+            used_tokens: None,
+            remaining_tokens: None,
+            resets_at: None,
+            ..self.clone()
+        }
+    }
+
+    /// 90% of the window or more is used.
+    #[must_use]
+    pub fn is_near_limit(&self) -> bool {
+        near_limit(self.used(), Some(self.limit_tokens))
+    }
+
+    /// `Free 640K/1M, resets 14:20 UTC`: the plan, what is used of the window (`?` when
+    /// not known), and when it frees up.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let mut line = String::new();
+        if let Some(plan) = &self.plan_name {
+            line.push_str(plan);
+            line.push(' ');
+        }
+        line.push_str(&format!(
+            "{}/{}",
+            self.used().map_or_else(|| "?".to_string(), short_tokens),
+            short_tokens(self.limit_tokens)
+        ));
+        if let Some(at) = self
+            .resets_at
+            .as_deref()
+            .and_then(crate::clock::parse_timestamp)
+        {
+            line.push_str(&format!(", resets {}", clock_time(at)));
+        }
+        line
+    }
+
+    /// How long the window is, as people read it: `5-hour`.
+    #[must_use]
+    pub fn length(&self) -> Option<String> {
+        let seconds = self.window_seconds.filter(|seconds| *seconds > 0)?;
+        Some(if seconds.is_multiple_of(3_600) {
+            format!("{}-hour", seconds / 3_600)
+        } else {
+            format!("{}-minute", seconds.div_ceil(60))
+        })
+    }
+}
+
+/// `used` is at least 90% of `limit`.
+fn near_limit(used: Option<u64>, limit: Option<u64>) -> bool {
+    match (used, limit) {
+        (Some(used), Some(limit)) if limit > 0 => {
+            used.saturating_mul(10) >= limit.saturating_mul(9)
+        }
+        _ => false,
+    }
+}
+
+/// `14:20 UTC` for Unix seconds.
+fn clock_time(unix: u64) -> String {
+    let stamp = crate::clock::format_utc(unix);
+    // `2026-10-17 14:20 UTC`: the time and the zone.
+    stamp
+        .split_once(' ')
+        .map_or_else(|| stamp.clone(), |(_, time)| time.to_string())
+}
+
+/// A token count in a few characters: `999`, `12K`, `640K`, `1M`, `1.5M`.
+#[must_use]
+pub fn short_tokens(value: u64) -> String {
+    if value >= 1_000_000 {
+        let tenths = value / 100_000;
+        if tenths.is_multiple_of(10) || value >= 10_000_000 {
+            format!("{}M", value / 1_000_000)
+        } else {
+            format!("{}.{}M", tenths / 10, tenths % 10)
+        }
+    } else if value >= 1_000 {
+        format!("{}K", value / 1_000)
+    } else {
+        value.to_string()
+    }
+}
+
 impl AccountSummary {
     fn is_free(&self) -> bool {
         self.plan_id.as_deref().is_none_or(|plan| plan == "free")
     }
 
-    fn near_daily_limit(&self) -> bool {
-        let near = |used: Option<u64>, limit: Option<u64>| match (used, limit) {
-            (Some(used), Some(limit)) if limit > 0 => {
-                used.saturating_mul(10) >= limit.saturating_mul(9)
-            }
-            _ => false,
+    /// The plan's rolling token window, when it has one.
+    #[must_use]
+    pub fn window(&self) -> Option<PlanWindow> {
+        let limit_tokens = self.window_tokens_limit.filter(|limit| *limit > 0)?;
+        Some(PlanWindow {
+            plan_name: self.plan_name.clone().or_else(|| self.plan_id.clone()),
+            limit_tokens,
+            window_seconds: self.window_seconds,
+            used_tokens: self.window_tokens_used,
+            remaining_tokens: self.window_tokens_remaining,
+            resets_at: self.window_resets_at.clone(),
+        })
+    }
+
+    /// Close to what refuses requests: the token window when the plan has one (its
+    /// daily token figure then refuses nothing), else today's tokens; and today's
+    /// requests.
+    fn near_limit(&self) -> bool {
+        let tokens = match self.window() {
+            Some(window) => window.is_near_limit(),
+            None => near_limit(self.tokens_today, self.daily_tokens_limit),
         };
-        near(self.requests_today, self.daily_requests_limit)
-            || near(self.tokens_today, self.daily_tokens_limit)
+        tokens || near_limit(self.requests_today, self.daily_requests_limit)
     }
 }
 
@@ -72,6 +231,8 @@ pub fn parse_account(value: &Value) -> AccountSummary {
     let plan = section("plan");
     let limits = section("limits");
     let usage = section("usage_today");
+    // `null` on plans without a window.
+    let window = section("usage_window");
     let credits = section("credits");
     let subscription = section("subscription");
     AccountSummary {
@@ -84,6 +245,15 @@ pub fn parse_account(value: &Value) -> AccountSummary {
         requests_today: usage.and_then(|usage| u64_field(usage, "requests")),
         tokens_today: usage.and_then(|usage| u64_field(usage, "tokens")),
         resets_at: usage.and_then(|usage| string_field(usage, "resets_at")),
+        window_tokens_limit: window
+            .and_then(|window| u64_field(window, "limit_tokens"))
+            .or_else(|| limits.and_then(|limits| u64_field(limits, "window_tokens"))),
+        window_seconds: window
+            .and_then(|window| u64_field(window, "window_seconds"))
+            .or_else(|| limits.and_then(|limits| u64_field(limits, "window_seconds"))),
+        window_tokens_used: window.and_then(|window| u64_field(window, "tokens")),
+        window_tokens_remaining: window.and_then(|window| u64_field(window, "remaining_tokens")),
+        window_resets_at: window.and_then(|window| string_field(window, "resets_at")),
         credit_balance_usd: credits.and_then(|credits| f64_field(credits, "balance_usd")),
         monthly_grant_usd: credits.and_then(|credits| f64_field(credits, "monthly_grant_usd")),
         subscription_status: subscription.and_then(|sub| string_field(sub, "status")),
@@ -109,7 +279,34 @@ pub fn fetch_account(
         Some(token.expose()),
         ACCOUNT_TIMEOUT,
     )?;
-    Ok(parse_account(&value))
+    let account = parse_account(&value);
+    // Every read keeps the plan window current for the status lines and the guard.
+    crate::plan_window::remember(&account);
+    remember_connector_policy(&runtime::default_config_home(), &value);
+    Ok(account)
+}
+
+/// Caches the account's connector policy (`policy`, contract v1.3) in `config_home`,
+/// where every later settings load reads it, after a restart and offline too. An
+/// answer without one clears the plan policy.
+fn remember_connector_policy(config_home: &std::path::Path, account: &Value) {
+    if let Err(error) = runtime::store_gateway_policy(
+        config_home,
+        account.get("policy"),
+        runtime::mcp_policy::unix_now(),
+    ) {
+        runtime::ui_hooks::notice(&format!(
+            "warning: could not keep your plan's connector policy: {error}"
+        ));
+    }
+}
+
+/// Forgets the cached connector policy (on sign-out): it belongs to the account that
+/// signed out.
+pub(crate) fn forget_connector_policy() {
+    if let Err(error) = runtime::clear_gateway_policy(&runtime::default_config_home()) {
+        runtime::ui_hooks::notice(&format!("warning: {error}"));
+    }
 }
 
 /// `1234567` -> `1,234,567`.
@@ -177,6 +374,9 @@ pub fn usage_lines(account: &AccountSummary, now: u64) -> Vec<String> {
             describe_time(resets_at, now)
         ));
     }
+    if let Some(window) = account.window() {
+        lines.extend(window_lines(&window.as_of(now), now));
+    }
     if let Some(balance) = account.credit_balance_usd {
         let grant = account
             .monthly_grant_usd
@@ -199,8 +399,42 @@ pub fn usage_lines(account: &AccountSummary, now: u64) -> Vec<String> {
             });
         lines.push(format!("  Subscription     {status}{renewal}"));
     }
-    if account.is_free() || account.near_daily_limit() {
+    if account.is_free() || account.near_limit() {
         lines.push(format!("  Upgrade          {} (/upgrade)", pricing_url()));
+    }
+    lines
+}
+
+/// The token window's lines of the usage report: what is used of it, when it frees up,
+/// and a warning near its limit.
+fn window_lines(window: &PlanWindow, now: u64) -> Vec<String> {
+    let mut lines = vec![format!("  Token window     {}", window.summary())];
+    lines.push(format!(
+        "  Window tokens    {}{}",
+        window.used().map_or_else(
+            || format!("? / {}", group_digits(window.limit_tokens)),
+            |used| format!(
+                "{} / {}",
+                group_digits(used),
+                group_digits(window.limit_tokens)
+            )
+        ),
+        window
+            .length()
+            .map(|length| format!(" ({length} window)"))
+            .unwrap_or_default()
+    ));
+    if let Some(resets_at) = &window.resets_at {
+        lines.push(format!(
+            "  Window resets    {}",
+            describe_time(resets_at, now)
+        ));
+    }
+    if window.is_near_limit() {
+        lines.push(format!(
+            "  Warning          {} window tokens left: requests are refused once they are used",
+            group_digits(window.remaining().unwrap_or(0))
+        ));
     }
     lines
 }
@@ -319,6 +553,118 @@ mod tests {
     }
 
     #[test]
+    fn an_account_read_keeps_the_plan_connector_policy_for_later_loads() {
+        let root = std::env::temp_dir().join(format!(
+            "neuron-account-policy-{}-{}",
+            std::process::id(),
+            runtime::mcp_policy::unix_now()
+        ));
+        let (cwd, home) = (root.join("project"), root.join("config"));
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("settings.json"),
+            r#"{"defaultMcpServers":false,"mcpServers":{"github":{"command":"github-mcp"},"docs":{"command":"docs-mcp"}}}"#,
+        )
+        .unwrap();
+        let mut body = sample();
+        body["policy"] = serde_json::json!({
+            "connectors": {"allowed": ["catalog:*"], "denied": ["github"], "required": [],
+                "hosted": [], "allow_unvetted": true, "catalog_version": "2026-11-04.1"}
+        });
+
+        // After `/login` reads the account, and again in a new process (a restart).
+        remember_connector_policy(&home, &body);
+        for _ in 0..2 {
+            let config = runtime::ConfigLoader::new(&cwd, &home).load().unwrap();
+            assert!(config.mcp().get("github").is_none());
+            assert_eq!(
+                config.mcp().blocked()["github"].rule,
+                "policy.connectors.denied: github"
+            );
+            assert!(config.mcp().get("docs").is_some());
+        }
+
+        // An account without a policy block lifts it.
+        remember_connector_policy(&home, &sample());
+        let config = runtime::ConfigLoader::new(&cwd, &home).load().unwrap();
+        assert!(config.mcp().get("github").is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Answers one `GET /api/account` with `body`.
+    fn account_server(body: String) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 && !line.trim().is_empty() {
+                line.clear();
+            }
+            let _ = write!(
+                reader.get_mut(),
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        });
+        base
+    }
+
+    #[test]
+    fn reading_the_account_caches_the_policy_in_the_config_home_and_sign_out_drops_it() {
+        let _env = crate::tests::env_lock();
+        let root = std::env::temp_dir().join(format!(
+            "neuron-account-fetch-policy-{}-{}",
+            std::process::id(),
+            runtime::mcp_policy::unix_now()
+        ));
+        let (cwd, home) = (root.join("project"), root.join("config"));
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("settings.json"),
+            r#"{"defaultMcpServers":false,"mcpServers":{"github":{"command":"github-mcp"}}}"#,
+        )
+        .unwrap();
+        let before = std::env::var_os("NEURON_CONFIG_HOME");
+        std::env::set_var("NEURON_CONFIG_HOME", &home);
+        let mut body = sample();
+        body["policy"] = serde_json::json!({"connectors": {"denied": ["github"]}});
+
+        let fetched = fetch_account(
+            &account_server(body.to_string()),
+            &SecureString::new("ses_test".to_string()),
+        );
+        let cached = home
+            .join(runtime::mcp_policy::GATEWAY_POLICY_CACHE_FILE)
+            .is_file();
+        let config = runtime::ConfigLoader::new(&cwd, &home).load().unwrap();
+        forget_connector_policy();
+        let forgotten = !home
+            .join(runtime::mcp_policy::GATEWAY_POLICY_CACHE_FILE)
+            .exists();
+        match before {
+            Some(value) => std::env::set_var("NEURON_CONFIG_HOME", value),
+            None => std::env::remove_var("NEURON_CONFIG_HOME"),
+        }
+        crate::plan_window::forget();
+        let _ = std::fs::remove_dir_all(&root);
+
+        fetched.expect("the fake gateway answers");
+        assert!(cached, "fetch_account caches the policy in the config home");
+        assert_eq!(
+            config.mcp().blocked()["github"].rule,
+            "policy.connectors.denied: github"
+        );
+        assert!(forgotten, "sign-out removes the cached policy");
+    }
+
+    #[test]
     fn parses_the_contract_account_shape() {
         let account = parse_account(&sample());
         assert_eq!(account.email.as_deref(), Some("dev@example.com"));
@@ -354,6 +700,100 @@ mod tests {
         let mut busy = sample();
         busy["usage_today"]["requests"] = serde_json::json!(1950);
         assert!(render_usage(&parse_account(&busy), 0).contains("Upgrade"));
+    }
+
+    /// Free with its rolling window, as `GET /api/account` reports it.
+    fn free_with_window(used: u64) -> Value {
+        let mut value = sample();
+        value["plan"] = serde_json::json!({"id": "free", "name": "Free"});
+        value["limits"] = serde_json::json!({
+            "daily_requests": 100, "daily_tokens": 5_000_000,
+            "window_tokens": 1_000_000, "window_seconds": 18_000, "rpm": 10, "concurrency": 2
+        });
+        value["usage_window"] = serde_json::json!({
+            "tokens": used, "limit_tokens": 1_000_000, "remaining_tokens": 1_000_000 - used,
+            "window_seconds": 18_000, "resets_at": "2026-10-17T14:20:00Z"
+        });
+        value
+    }
+
+    #[test]
+    fn parses_the_plans_token_window() {
+        let account = parse_account(&free_with_window(640_000));
+        assert_eq!(account.window_tokens_limit, Some(1_000_000));
+        assert_eq!(account.window_seconds, Some(18_000));
+        assert_eq!(account.window_tokens_used, Some(640_000));
+        assert_eq!(account.window_tokens_remaining, Some(360_000));
+        let window = account.window().expect("a window");
+        assert_eq!(window.summary(), "Free 640K/1M, resets 14:20 UTC");
+        assert_eq!(window.length().as_deref(), Some("5-hour"));
+        assert!(!window.is_near_limit());
+
+        // `usage_window` is null without a window; the limits alone still say there is one.
+        let mut limits_only = free_with_window(0);
+        limits_only["usage_window"] = Value::Null;
+        let window = parse_account(&limits_only).window().expect("a window");
+        assert_eq!((window.limit_tokens, window.used()), (1_000_000, None));
+        assert_eq!(window.summary(), "Free ?/1M");
+
+        assert_eq!(parse_account(&sample()).window(), None, "Pro has no window");
+    }
+
+    #[test]
+    fn the_window_decides_the_near_limit_warning() {
+        let report = render_usage(&parse_account(&free_with_window(640_000)), 1_792_195_200);
+        assert!(
+            report.contains("Token window     Free 640K/1M, resets 14:20 UTC\n"),
+            "the compact form: {report}"
+        );
+        assert!(
+            report.contains("Window tokens    640,000 / 1,000,000 (5-hour window)"),
+            "{report}"
+        );
+        assert!(
+            report.contains("Window resets    2026-10-17 14:20 UTC"),
+            "{report}"
+        );
+        assert!(!report.contains("Warning"), "{report}");
+
+        let near = parse_account(&free_with_window(950_000));
+        assert!(near.near_limit());
+        let report = render_usage(&near, 0);
+        assert!(
+            report.contains("Warning          50,000 window tokens left"),
+            "{report}"
+        );
+
+        // Past `resets_at` what is left is not known until the next read: no figure, no
+        // reset time and no warning from the old read.
+        let after_reset = 1_792_246_800 + 60;
+        let report = render_usage(&near, after_reset);
+        assert!(report.contains("Token window     Free ?/1M\n"), "{report}");
+        assert!(
+            report.contains("Window tokens    ? / 1,000,000"),
+            "{report}"
+        );
+        assert!(!report.contains("Window resets"), "{report}");
+        assert!(!report.contains("Warning"), "{report}");
+        let window = near.window().expect("a window");
+        assert!(!window.is_past_reset(after_reset - 120));
+        assert_eq!(window.as_of(after_reset - 120), window);
+        assert!(window.is_past_reset(after_reset));
+
+        // Under a window the daily token figure refuses nothing: no warning from it.
+        let mut daily = free_with_window(10_000);
+        daily["usage_today"]["tokens"] = serde_json::json!(4_900_000);
+        assert!(!parse_account(&daily).near_limit());
+    }
+
+    #[test]
+    fn token_counts_shorten_for_a_status_line() {
+        assert_eq!(short_tokens(999), "999");
+        assert_eq!(short_tokens(12_345), "12K");
+        assert_eq!(short_tokens(640_000), "640K");
+        assert_eq!(short_tokens(1_000_000), "1M");
+        assert_eq!(short_tokens(1_500_000), "1.5M");
+        assert_eq!(short_tokens(12_400_000), "12M");
     }
 
     #[test]

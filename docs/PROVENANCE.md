@@ -14,7 +14,7 @@ summary, not legal advice.
 | `rust/crates/runtime/bundled-skills/` | Four third-party skill projects, pinned in `SOURCES.json` | MIT each; texts in `licenses/` and embedded in the binary | See [bundled skills](#bundled-skills). |
 | `ui/neuron-tui/` (the `neuron-tui` binaries), including `src/vendor/common/` | Freebuff's `cli/` and 31 files of its `common/src`, [CodebuffAI/freebuff](https://github.com/CodebuffAI/freebuff) commit `545e04d`, modified since | Apache-2.0, "Copyright 2025 Codebuff" (`ui/neuron-tui/LICENSE`, `NOTICE`, kept unchanged) | Codebuff services, ads, billing and telemetry removed; see `ui/neuron-tui/PORTING.md`. Changed files carry a derivation header. The binary bundles Bun and npm packages (OpenTUI, React), listed in `THIRD_PARTY_NOTICES.md`. |
 | Rust crate dependencies | crates.io | Per crate; see `THIRD_PARTY_NOTICES.md` on each release | See [crate licenses](#crate-licenses). |
-| npm dependencies `codebase-memory-mcp`, `@playwright/mcp` | npm registry | MIT; Apache-2.0 | Installed next to the npm package, not bundled into it. |
+| `rust/crates/runtime/mcp-catalog/` (connector catalog) | Written for Neuron; names, versions, launch commands, tool names, dependency locks and download hashes of third-party MCP servers, checked against their repositories and registries on 2026-11-04 and 2026-11-05 (`SOURCES.md`) | MIT (as Neuron) | No server code is copied or bundled; each server (the default Playwright MCP, Apache-2.0, and Codebase memory release binary, MIT, included) is fetched from its own registry or release under its own licence on first use, and checked against the hashes the catalog pins. |
 | `assets/` | Claw Code | Not covered by the MIT grant | See [assets](#assets). |
 | Launchers, installers, release pipeline, `docs/GATEWAY_CONTRACT.md` | Written for Neuron | MIT, "Copyright (c) 2026 RAHUL S / Zero-X" | |
 
@@ -76,6 +76,26 @@ license metadata.
 `omx/`. No current Neuron document references them. A screenshot of a news feature, a
 screenshot of a social media post and a photo of a person are owned by their authors
 or subjects, and the MIT license of the code does not cover them.
+
+## Later ports from Claw Code
+
+Neuron's `rust/` workspace forked from Claw Code at about upstream commit `00d0eb6`
+(2026-04-17): the last upstream commit whose `ROADMAP.md` matches Neuron's first
+commit, with 83 of the first commit's 103 `rust/crates` files byte-identical. Fixes
+ported from Claw Code since then (reviewed at upstream `main` `51cfca1`, release
+`v0.1.10`) are listed here with the upstream commit each comes from. They are under
+Claw Code's MIT license (copyright notice in `LICENSE`), and each ported function or
+test says so in a comment. Only code was ported; no prompt or tool-description text.
+
+| Area | Neuron files | Upstream commits | What it does |
+| --- | --- | --- | --- |
+| Tools | `rust/crates/tools/src/lib.rs` | `a289024` | `RemoteTrigger` cuts a long response body on a char boundary instead of panicking. |
+| Tools | `rust/crates/tools/src/lib.rs` | `fd8527f` | `WebSearch` reports a non-200 search page (rate limit, HTTP 202 bot challenge) as an error, and the generic-link fallback drops links back to the search engine. |
+| Runtime environment | `rust/crates/runtime/src/remote.rs`, `sandbox.rs` | `c55c7e4` | Reading the environment skips non-UTF-8 entries instead of panicking at startup. |
+| File boundary | `rust/crates/runtime/src/file_ops.rs` | `9e7fd60`, `dc34649` | Workspace boundary checks accept `\\?\UNC\` and `\\.\` spellings of a path and fall back to its canonical form. |
+| Permissions | `rust/crates/runtime/src/permission_enforcer.rs`, `permissions.rs` | `e8c8ef1`, `aca6584` | `..` is resolved before the enforcer's workspace prefix check; permission rules match tool names without regard to case; upstream's read-only bypass cases kept as regression tests for Neuron's own shell classifier. |
+| MCP config | `rust/crates/runtime/src/config.rs` | `7c4bcd9` | A stdio MCP server's `command` and `args` expand `${VAR}` and a leading `~`; unset variables stay as written. |
+| API errors | `rust/crates/api/src/error.rs` | `6ac13ff`, `1d516be` | OpenAI "input tokens exceed the configured limit" and llama.cpp context-overflow errors count as context-window failures. |
 
 ## Other branches and leftovers
 

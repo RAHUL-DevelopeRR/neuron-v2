@@ -572,6 +572,11 @@ pub fn active_provider_model_infos() -> Vec<neuron_tui::protocol::ModelInfo> {
             status: None,
             available_again_at: None,
             supports_images: None,
+            // The key's provider draws the monogram; a key's model list says nothing
+            // about thinking levels.
+            provider: Some(provider.as_str().to_string()),
+            reasoning_efforts: None,
+            supports_reasoning: None,
         })
         .collect()
 }

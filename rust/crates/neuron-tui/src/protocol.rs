@@ -12,6 +12,9 @@
 //! screens need: [`FEATURE_REPORTS`], [`FEATURE_ACCOUNT`], [`FEATURE_ERROR_DETAILS`],
 //! [`FEATURE_SESSION_SCOPE`], [`FEATURE_TRUST_PREVIEW`] and [`FEATURE_MODEL_IMAGES`].
 
+use std::collections::BTreeMap;
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 /// The contract's version, sent in [`UiEvent::Ready`]. Bumped when a change would break a
@@ -40,6 +43,12 @@ pub struct PermissionView {
     /// What "allow for this session" would approve from now on (command prefixes such as
     /// `cargo test`, or a web domain). Empty when only a one-time approval is possible.
     pub session_prefixes: Vec<String>,
+    /// The `permissions.allow` rules "always allow in this project"
+    /// ([`PermissionDecision::AllowForProject`]) would save to the project's
+    /// `.neuron/settings.local.json`. Added after protocol 1: older engines leave it
+    /// out, and a UI offers the choice only when it is not empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub project_rules: Vec<String>,
 }
 
 /// The workspace's git state, for the footer.
@@ -77,6 +86,16 @@ pub struct ModelInfo {
     /// it does not say.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_images: Option<bool>,
+    /// Who serves it ([`FEATURE_STATUS_BAR`]): the gateway's `owned_by` or `provider`
+    /// (`gemini`, `groq`, `zero-x` for `auto`, ...). A UI draws it as a monogram.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// The thinking levels it takes, lowest first ([`FEATURE_STATUS_BAR`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_efforts: Option<Vec<String>>,
+    /// The catalog says it reasons ([`FEATURE_STATUS_BAR`]); `None` when it does not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_reasoning: Option<bool>,
 }
 
 /// The Zero-X login, as the UI may show it. Never carries the token.
@@ -124,6 +143,30 @@ pub const FEATURE_MCP_TOGGLE: &str = "mcp_toggle";
 /// [`CAPABILITY_HOOK_PROGRESS`].
 pub const FEATURE_HOOK_PROGRESS: &str = "hook_progress";
 
+/// The connector catalog: [`EngineCommand::ListConnectorCatalog`] (answered with
+/// [`UiEvent::ConnectorCatalog`]), [`EngineCommand::AddMcpServer`],
+/// [`EngineCommand::RemoveMcpServer`] and [`EngineCommand::ApproveMcpServer`] (each
+/// answered with a notice and a fresh [`UiEvent::Extensions`], or an error), and
+/// [`McpServerInfo::catalog`].
+pub const FEATURE_MCP_CATALOG: &str = "mcp_catalog";
+
+/// The connector policy (managed settings and the Zero-X plan): [`McpServerInfo`] rows
+/// with scope `managed`, status `blocked` with the policy's reason in `error`, and
+/// [`McpServerInfo::required`].
+pub const FEATURE_MCP_POLICY: &str = "mcp_policy";
+
+/// Hosted connectors through Zero-X: [`McpServerInfo`] rows with transport `zerox`,
+/// status `needs_connect` while the user has not linked the connector on the Zero-X
+/// dashboard, and [`McpServerInfo::connect_url`], the page to link it on (a UI opens it).
+pub const FEATURE_MCP_HOSTED: &str = "mcp_hosted";
+/// The prompt status bar's engine side: `provider`, `model_display_name`,
+/// `reasoning_effort(s)`, `full_access_allowed` and `context` on [`UiEvent::Status`];
+/// `provider`, `reasoning_efforts` and `supports_reasoning` on [`ModelInfo`];
+/// [`EngineCommand::SetReasoningEffort`], [`EngineCommand::SetPermissionMode`],
+/// [`EngineCommand::ListBranches`] (answered by [`UiEvent::Branches`]) and
+/// [`EngineCommand::SwitchBranch`]; `/effort`, and `/context` as a report.
+pub const FEATURE_STATUS_BAR: &str = "status_bar";
+
 /// What this engine can do beyond protocol 1, in [`UiEvent::Ready`]. A UI sends the
 /// commands a feature adds only when the engine lists it: an older engine would skip
 /// them with a notice.
@@ -151,6 +194,10 @@ pub const ENGINE_FEATURES: &[&str] = &[
     FEATURE_MCP_TOGGLE,
     FEATURE_LIVE_OUTPUT,
     FEATURE_HOOK_PROGRESS,
+    FEATURE_MCP_CATALOG,
+    FEATURE_MCP_POLICY,
+    FEATURE_MCP_HOSTED,
+    FEATURE_STATUS_BAR,
 ];
 
 /// `report` events for the commands that show a report (`/usage`, `/init`, `/memory`,
@@ -173,13 +220,20 @@ pub const FEATURE_MODEL_IMAGES: &str = "model_images";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpServerInfo {
     pub name: String,
-    /// Where it is configured: `bundled`, `user`, `project` or `local`.
+    /// Where it is configured: `bundled`, `user`, `project`, `local` or `managed` (the
+    /// machine's managed settings, or a server the connector policy requires).
     pub scope: String,
-    /// `stdio`, `http`, `sse`, `ws`, `sdk` or `managed_proxy`.
+    /// `stdio`, `http`, `sse`, `ws`, `sdk` or `zerox` (a hosted connector through
+    /// Zero-X; older engines said `managed_proxy`).
     pub transport: String,
     /// `starting`, `ready`, `failed`, `pending` (started, tools not found),
-    /// `unsupported` (a transport Neuron does not speak yet), `not_started` or
-    /// `disabled` (turned off in the settings).
+    /// `unsupported` (a transport Neuron does not speak yet), `not_started`,
+    /// `disabled` (turned off in the settings), `needs_approval` (a workspace server
+    /// that is new or changed: it starts once the user approves it), `blocked`
+    /// (a deny rule or the connector policy refuses it) or `needs_connect` (a hosted
+    /// connector not linked to the Zero-X account yet, see [`Self::connect_url`]);
+    /// `error` says why for the last three.
+    /// Older engines send none of the last three; a UI shows an unknown status as is.
     pub status: String,
     /// Its tools, without the `mcp__<server>__` prefix.
     pub tools: Vec<String>,
@@ -188,6 +242,88 @@ pub struct McpServerInfo {
     /// Turned on ([`FEATURE_MCP_TOGGLE`]); older engines leave it out, meaning on.
     #[serde(default = "enabled_by_default")]
     pub enabled: bool,
+    /// The catalog connector it was added from, when its launch spec is exactly that
+    /// entry's ([`FEATURE_MCP_CATALOG`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<String>,
+    /// The connector policy requires it ([`FEATURE_MCP_POLICY`]): it is on, and a UI
+    /// shows it locked instead of offering to turn it off. Older engines leave it out.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub required: bool,
+    /// A stdio server that is not a catalog connector and whose version and hashes are
+    /// not recorded (`/mcp pin <name>` records them). A UI shows an `unpinned` badge.
+    /// Older engines leave it out.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unpinned: bool,
+    /// Where the user links this hosted connector, while its status is `needs_connect`
+    /// ([`FEATURE_MCP_HOSTED`]): a page on the Zero-X gateway. Older engines leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_url: Option<String>,
+    /// The permission tier of each of its tools (`read`, `write`, `destructive` or
+    /// `external`) as the connector catalog pins it, for a catalog or hosted connector
+    /// ([`FEATURE_MCP_CATALOG`]): a UI shows it on the tool's calls. Other servers, and
+    /// older engines, leave it out.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_tiers: BTreeMap<String, String>,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// What the user typed for a connector's variables, secrets included
+/// ([`EngineCommand::AddMcpServer`]). Its debug output names the variables and never
+/// shows a value, so logging a command cannot leak one.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretValues(pub BTreeMap<String, String>);
+
+impl fmt::Debug for SecretValues {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_set().entries(self.0.keys()).finish()
+    }
+}
+
+/// A variable a catalog connector needs ([`ConnectorInfo::variables`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectorVariable {
+    /// The environment variable or `${secret:NAME}` name.
+    pub name: String,
+    pub label: String,
+    /// Kept in the OS keychain; a UI masks its field.
+    pub secret: bool,
+    pub required: bool,
+    #[serde(default)]
+    pub default: Option<String>,
+    /// Where to get it (a token page).
+    #[serde(default)]
+    pub help_url: Option<String>,
+}
+
+/// One connector of the catalog ([`UiEvent::ConnectorCatalog`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectorInfo {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub publisher: String,
+    /// Published by the service's vendor or the MCP project.
+    pub official: bool,
+    pub licence: String,
+    /// Its source repository.
+    pub source: String,
+    /// `stdio` (runs locally) or `http` (a remote server).
+    pub transport: String,
+    /// `<package>@<version>`, or the URL of a remote server.
+    pub pinned: String,
+    /// Signs in with OAuth once added (`neuron mcp login <server>`).
+    pub oauth: bool,
+    /// `user`, `project` or `local`.
+    pub default_scope: String,
+    pub variables: Vec<ConnectorVariable>,
+    /// The configured servers added from it.
+    pub added: Vec<String>,
 }
 
 fn enabled_by_default() -> bool {
@@ -358,6 +494,64 @@ pub struct AccountDetails {
     pub usage_updated_at: Option<u64>,
     /// Why the plan and usage could not be read, when they could not.
     pub usage_error: Option<String>,
+    /// The plan's rolling token window (Zero-X Free: 1M tokens per 5 hours), which
+    /// refuses requests before the daily figures do, kept current from the quota headers
+    /// of each reply; `None` for a plan without one, before the account is read, and from
+    /// older engines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_window: Option<UsageWindow>,
+}
+
+/// A rolling usage window (`usage_window` in the gateway's account). Every part may be
+/// missing; `tokens` and `remaining_tokens` are `None` while not known (also once
+/// `resets_at` has passed, until the account is read again).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageWindow {
+    /// Tokens used in the window.
+    pub tokens: Option<u64>,
+    pub limit_tokens: Option<u64>,
+    pub remaining_tokens: Option<u64>,
+    /// When the oldest usage leaves the window (ISO 8601, UTC).
+    pub resets_at: Option<String>,
+    /// The window's length: 18000 for five hours.
+    pub window_seconds: Option<u64>,
+}
+
+/// What fills the context window ([`FEATURE_STATUS_BAR`]), as estimated tokens.
+/// `used_tokens` is what each request sends (system prompt, tool schemas, instructions
+/// and the conversation); `context_window - output_reserve` is what it may use.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextBreakdown {
+    pub context_window: u64,
+    /// Kept free for the reply (`max_tokens`).
+    pub output_reserve: u64,
+    /// The system prompt without the project instructions.
+    pub system_tokens: u64,
+    pub tool_schema_tokens: u64,
+    pub tool_count: u64,
+    /// `NEURON.md` and the other instruction files and memory.
+    pub instruction_tokens: u64,
+    pub instruction_files: Vec<String>,
+    /// Prompts, replies and tool calls.
+    pub conversation_tokens: u64,
+    /// Tool results.
+    pub tool_output_tokens: u64,
+    pub used_tokens: u64,
+    /// Auto-compaction starts when `used_tokens` reaches this.
+    pub threshold_tokens: u64,
+}
+
+/// One local branch, for the branch picker ([`UiEvent::Branches`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchInfo {
+    pub name: String,
+    /// Its upstream (`origin/main`), when it has one.
+    pub upstream: Option<String>,
+    /// Commits ahead of and behind the upstream; `None` without one.
+    pub ahead: Option<u64>,
+    pub behind: Option<u64>,
+    /// Its last commit (Unix milliseconds).
+    pub last_commit_ms: Option<u64>,
 }
 
 /// What a failed request needs from the user, for a UI to offer the way out: sign in
@@ -393,12 +587,24 @@ pub struct HookPreview {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpServerPreview {
     pub name: String,
-    /// `stdio`, `http`, `sse`, `ws`, `sdk` or `managed_proxy`.
+    /// `stdio`, `http`, `sse`, `ws`, `sdk` or `zerox`.
     pub transport: String,
     /// The program it starts, or the host it connects to; never arguments, environment
     /// or headers, which can hold secrets.
     pub target: Option<String>,
     pub source: String,
+    /// What runs, for the user to read before approving: the program and its
+    /// arguments, or the URL without credentials or query, with secret-looking values
+    /// shown as `[REDACTED]`; never environment or headers. Added after protocol 1:
+    /// older engines leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// The digest of the server's launch spec as previewed. A UI that approves the
+    /// server from this preview sends it back in [`EngineCommand::ApproveMcpServer`],
+    /// and the engine refuses the approval if the config changed since. Added after
+    /// protocol 1: older engines leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
 }
 
 /// A permission rule a workspace's settings would add.
@@ -544,6 +750,33 @@ pub enum UiEvent {
         /// answer, from providers that do not name the model, and from older engines.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         served_model: Option<String>,
+        /// Estimated input tokens of each model request the next turn sends (system
+        /// prompt, tool definitions and the conversation): the same figure as
+        /// `ContextBreakdown.used_tokens` where an engine sends both. A turn sends one
+        /// request per step, so a long agent task spends this many times over. `None`
+        /// from older engines. The plan's token window is on
+        /// [`AccountDetails::usage_window`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_tokens_estimate: Option<u64>,
+        /// Who serves the model ([`FEATURE_STATUS_BAR`]), as on [`ModelInfo`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        /// The catalog's name for the model ([`FEATURE_STATUS_BAR`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_display_name: Option<String>,
+        /// The thinking level the next turn asks for; `None` for the model's default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
+        /// The levels the model takes; `None` when unknown, empty when it does not reason.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_efforts: Option<Vec<String>>,
+        /// Full access may be picked: the engine started with it, or with
+        /// `--dangerously-skip-permissions`.
+        #[serde(default)]
+        full_access_allowed: bool,
+        /// What fills the context window ([`FEATURE_STATUS_BAR`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context: Option<ContextBreakdown>,
     },
     /// After a sign-in from the signed-out start: the engine is opening the session
     /// (plugins, MCP servers), which can take a while. `TurnFinished` and a `Status` with
@@ -690,6 +923,12 @@ pub enum UiEvent {
         skills: Vec<DefinitionInfo>,
         agents: Vec<DefinitionInfo>,
     },
+    /// Answer to [`EngineCommand::ListConnectorCatalog`] ([`FEATURE_MCP_CATALOG`]): the
+    /// catalog's version and the connectors that match the query.
+    ConnectorCatalog {
+        version: String,
+        connectors: Vec<ConnectorInfo>,
+    },
     /// What a report command (`/usage`, `/init`, `/memory`, `/doctor`) found, for a
     /// scrollable panel, with [`CAPABILITY_REPORTS`] on; `TurnFinished` follows, as after
     /// any slash command. `command` is the command's name without the slash.
@@ -706,6 +945,14 @@ pub enum UiEvent {
     Account {
         signed_in: bool,
         account: Option<AccountDetails>,
+    },
+    /// Answer to [`EngineCommand::ListBranches`]: the local branches, newest commit first.
+    Branches {
+        /// The checked-out branch; `None` on a detached HEAD.
+        current: Option<String>,
+        branches: Vec<BranchInfo>,
+        /// The working tree has uncommitted changes (switching is refused then).
+        dirty: bool,
     },
     /// Answer to [`EngineCommand::TrustPreview`]: what trusting the workspace would turn
     /// on. Reading it starts nothing.
@@ -928,6 +1175,46 @@ pub enum EngineCommand {
     /// fresh [`UiEvent::Extensions`] follow, or an error. Servers restart from the next
     /// turn.
     SetMcpServerEnabled { name: String, enabled: bool },
+    /// Ask for the catalog connectors whose id, name, publisher or description contain
+    /// every word of `query` (all of them when empty): [`UiEvent::ConnectorCatalog`]
+    /// ([`FEATURE_MCP_CATALOG`]).
+    ListConnectorCatalog {
+        #[serde(default)]
+        query: String,
+    },
+    /// Add the catalog connector `id` as the server `name` (the id when `None`) to the
+    /// settings of `scope` (`user`, `project` or `local`; the connector's default when
+    /// `None`). `secrets` holds what the user typed for its variables: secrets go to the
+    /// OS keychain and never into a settings file. A notice and a fresh
+    /// [`UiEvent::Extensions`] follow, or an error. A connector that signs in with OAuth
+    /// ([`ConnectorInfo::oauth`]) then opens the browser: a notice with the sign-in link,
+    /// later one with the result (and, once signed in, another [`UiEvent::Extensions`]).
+    AddMcpServer {
+        id: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        scope: Option<String>,
+        #[serde(default)]
+        secrets: SecretValues,
+    },
+    /// Remove the server `name` from the settings Neuron writes (those of `scope` when
+    /// given), with its keychain secrets and sign-in. A notice and a fresh
+    /// [`UiEvent::Extensions`] follow, or an error.
+    RemoveMcpServer {
+        name: String,
+        #[serde(default)]
+        scope: Option<String>,
+    },
+    /// Approve the workspace server `name` (status `needs_approval`) as it is configured
+    /// now, as `/mcp approve` does. With `fingerprint` (from [`McpServerPreview`]), only
+    /// if it is still configured as that preview showed it: else an error, and it keeps
+    /// waiting. A notice and a fresh [`UiEvent::Extensions`] follow, or an error.
+    ApproveMcpServer {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fingerprint: Option<String>,
+    },
     /// Ask what trusting the workspace would turn on ([`UiEvent::TrustPreview`]).
     TrustPreview,
     /// Read the account's plan and usage again ([`UiEvent::Account`]).
@@ -945,6 +1232,26 @@ pub enum EngineCommand {
         #[serde(default)]
         dry_run: bool,
     },
+    /// The thinking level of the next turns ([`FEATURE_STATUS_BAR`]); `None` for the
+    /// model's default. A `Status` follows, or an `Error`.
+    SetReasoningEffort {
+        #[serde(default)]
+        effort: Option<String>,
+    },
+    /// `read-only`, `workspace-write`, `danger-full-access` (only when the status says
+    /// `full_access_allowed`), or `plan` / `plan-off` for plan mode
+    /// ([`FEATURE_STATUS_BAR`]). No notice and no `TurnFinished`: a `Status` follows, or
+    /// an `Error`.
+    SetPermissionMode { mode: String },
+    /// Ask for the local branches ([`UiEvent::Branches`]).
+    ListBranches,
+    /// Check out `name` (`create`: a new branch from HEAD). Refused while a turn runs or
+    /// the working tree has changes. A notice and a `Status` follow, or an `Error`.
+    SwitchBranch {
+        name: String,
+        #[serde(default)]
+        create: bool,
+    },
 }
 
 /// The user's answer to a permission request.
@@ -955,8 +1262,19 @@ pub enum PermissionDecision {
     AllowOnce,
     /// Run this call and similar ones for the rest of the session.
     AllowForSession,
-    /// Do not run it; `note` is passed to the model.
-    Deny { note: Option<String> },
+    /// Run this call, and save [`PermissionView::project_rules`] so matching calls run
+    /// in this project from now on. Sent only when the request offered project rules
+    /// (so only to engines that know it).
+    AllowForProject,
+    /// Do not run it; `note` is passed to the model. With `session`, matching calls
+    /// (ones whose asking part starts with the same command prefix, such as `git push`,
+    /// or this exact call) are refused for the rest of the session without asking. Added after protocol 1: an older engine ignores
+    /// `session` and denies this call only.
+    Deny {
+        note: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        session: bool,
+    },
 }
 
 /// Answer to [`UiEvent::PermissionRequested`] with the same `id`.
@@ -1011,14 +1329,63 @@ mod tests {
             id: 7,
             decision: PermissionDecision::Deny {
                 note: Some("use a dry run".into()),
+                session: false,
             },
         };
         let json = serde_json::to_value(&reply).unwrap();
         assert_eq!(json["decision"]["kind"], "deny");
+        assert!(json["decision"].get("session").is_none(), "{json}");
         assert_eq!(
             serde_json::from_value::<PermissionReply>(json).unwrap(),
             reply
         );
+    }
+
+    /// "Deny for this session" and "always allow in this project" are additive: an
+    /// older UI's deny has no `session`, and `project_rules` is left out when empty.
+    #[test]
+    fn session_denials_and_project_rules_are_additive() {
+        let deny: PermissionDecision =
+            serde_json::from_value(serde_json::json!({ "kind": "deny", "note": null })).unwrap();
+        assert_eq!(
+            deny,
+            PermissionDecision::Deny {
+                note: None,
+                session: false
+            }
+        );
+        let for_session = PermissionDecision::Deny {
+            note: None,
+            session: true,
+        };
+        let json = serde_json::to_value(&for_session).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "kind": "deny", "note": null, "session": true })
+        );
+        assert_eq!(
+            serde_json::to_value(PermissionDecision::AllowForProject).unwrap(),
+            serde_json::json!({ "kind": "allow_for_project" })
+        );
+
+        let mut view = PermissionView {
+            tool: "bash".into(),
+            current_mode: "workspace-write".into(),
+            required_mode: "danger-full-access".into(),
+            reason: None,
+            input: r#"{"command":"docker ps"}"#.into(),
+            session_prefixes: vec!["docker ps".into()],
+            project_rules: Vec::new(),
+        };
+        let json = serde_json::to_value(&view).unwrap();
+        assert!(json.get("project_rules").is_none(), "{json}");
+        assert_eq!(
+            serde_json::from_value::<PermissionView>(json).unwrap(),
+            view
+        );
+        view.project_rules = vec!["bash(docker:*)".into()];
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["project_rules"], serde_json::json!(["bash(docker:*)"]));
     }
 
     /// A refusal is a notice with a kind; a plain notice is written as before.
@@ -1073,6 +1440,12 @@ mod tests {
                 sign_in_required: false,
                 account: None,
                 served_model: None,
+                request_tokens_estimate: None,
+                provider: None,
+                reasoning_effort: None,
+                reasoning_efforts: None,
+                full_access_allowed: false,
+                context: None,
                 ..
             }
         ));
@@ -1081,6 +1454,7 @@ mod tests {
     /// Protocol 1 additions: engine features (absent from older engines), the commands
     /// they add, and their events, as JSON lines.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn features_sessions_questions_and_tasks_as_json() {
         let old: UiEvent =
             serde_json::from_str(r#"{"type":"ready","protocol":1,"version":"6.3.0"}"#).unwrap();
@@ -1134,6 +1508,54 @@ mod tests {
                 EngineCommand::SetMcpServerEnabled {
                     name: "docs".into(),
                     enabled: false,
+                },
+            ),
+            (
+                r#"{"kind":"command","type":"list_connector_catalog"}"#,
+                EngineCommand::ListConnectorCatalog {
+                    query: String::new(),
+                },
+            ),
+            (
+                r#"{"kind":"command","type":"add_mcp_server","id":"github","scope":"user","secrets":{"GITHUB_PERSONAL_ACCESS_TOKEN":"ghp_x"}}"#,
+                EngineCommand::AddMcpServer {
+                    id: "github".into(),
+                    name: None,
+                    scope: Some("user".into()),
+                    secrets: SecretValues(BTreeMap::from([(
+                        "GITHUB_PERSONAL_ACCESS_TOKEN".to_string(),
+                        "ghp_x".to_string(),
+                    )])),
+                },
+            ),
+            (
+                r#"{"kind":"command","type":"add_mcp_server","id":"fetch"}"#,
+                EngineCommand::AddMcpServer {
+                    id: "fetch".into(),
+                    name: None,
+                    scope: None,
+                    secrets: SecretValues::default(),
+                },
+            ),
+            (
+                r#"{"kind":"command","type":"remove_mcp_server","name":"github"}"#,
+                EngineCommand::RemoveMcpServer {
+                    name: "github".into(),
+                    scope: None,
+                },
+            ),
+            (
+                r#"{"kind":"command","type":"approve_mcp_server","name":"docs"}"#,
+                EngineCommand::ApproveMcpServer {
+                    name: "docs".into(),
+                    fingerprint: None,
+                },
+            ),
+            (
+                r#"{"kind":"command","type":"approve_mcp_server","name":"docs","fingerprint":"ab12"}"#,
+                EngineCommand::ApproveMcpServer {
+                    name: "docs".into(),
+                    fingerprint: Some("ab12".into()),
                 },
             ),
         ] {
@@ -1413,7 +1835,15 @@ mod tests {
         let preview = serde_json::to_value(crate::fake_engine::samples::trust_preview()).unwrap();
         assert_eq!(preview["type"], "trust_preview");
         assert_eq!(preview["mcp_servers"][0]["target"], "uvx");
+        assert_eq!(preview["mcp_servers"][0]["fingerprint"], "4f1c0de5");
         assert_eq!(preview["permission_rules"][0]["effect"], "allow");
+
+        // A preview from an engine before `command` and `fingerprint` still reads.
+        let older: McpServerPreview = serde_json::from_str(
+            r#"{"name":"docs","transport":"stdio","target":"npx","source":"/w/.mcp.json"}"#,
+        )
+        .unwrap();
+        assert_eq!((older.command, older.fingerprint), (None, None));
     }
 
     /// Fields protocol v2 added to protocol 1 events read as their defaults from older
@@ -1488,5 +1918,321 @@ mod tests {
         assert_eq!(serde_json::from_value::<UiEvent>(value).unwrap(), finished);
         assert!(ENGINE_FEATURES.contains(&FEATURE_HOOK_PROGRESS));
         assert_eq!(CAPABILITY_HOOK_PROGRESS, "hook_progress");
+    }
+
+    /// The token window is `AccountDetails.usage_window`, every part optional, in the
+    /// gateway's field order: the shape the full-screen footer reads.
+    #[test]
+    fn the_usage_window_rides_on_the_account_with_every_part_optional() {
+        let window: UsageWindow = serde_json::from_str(
+            r#"{"tokens":5,"limit_tokens":null,"remaining_tokens":null,"resets_at":null,"window_seconds":18000}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            window,
+            UsageWindow {
+                tokens: Some(5),
+                window_seconds: Some(18_000),
+                ..UsageWindow::default()
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<UsageWindow>("{}").unwrap(),
+            UsageWindow::default()
+        );
+        assert_eq!(
+            serde_json::to_string(&UsageWindow::default()).unwrap(),
+            r#"{"tokens":null,"limit_tokens":null,"remaining_tokens":null,"resets_at":null,"window_seconds":null}"#
+        );
+
+        let UiEvent::Account {
+            account: Some(free),
+            ..
+        } = crate::fake_engine::samples::free_account()
+        else {
+            panic!("a signed-in account");
+        };
+        let json = serde_json::to_value(&free).unwrap();
+        assert_eq!(json["usage_window"]["limit_tokens"], 1_000_000);
+        assert!(json.get("window").is_none());
+        let mut older = json.clone();
+        older.as_object_mut().unwrap().remove("usage_window");
+        let older: AccountDetails = serde_json::from_value(older).unwrap();
+        assert_eq!(older.usage_window, None, "an older engine sends none");
+    }
+
+    #[test]
+    fn connector_catalog_messages_round_trip_and_secrets_never_reach_debug_output() {
+        let command = EngineCommand::AddMcpServer {
+            id: "github".into(),
+            name: Some("gh".into()),
+            scope: Some("project".into()),
+            secrets: SecretValues(BTreeMap::from([(
+                "GITHUB_PERSONAL_ACCESS_TOKEN".to_string(),
+                "ghp_SENTINEL_protocol".to_string(),
+            )])),
+        };
+        let debug = format!("{command:?}");
+        assert!(!debug.contains("ghp_SENTINEL_protocol"), "{debug}");
+        assert!(debug.contains("GITHUB_PERSONAL_ACCESS_TOKEN"), "{debug}");
+        let json = serde_json::to_value(&command).unwrap();
+        assert_eq!(
+            json["secrets"]["GITHUB_PERSONAL_ACCESS_TOKEN"],
+            "ghp_SENTINEL_protocol"
+        );
+        assert_eq!(
+            serde_json::from_value::<EngineCommand>(json).unwrap(),
+            command
+        );
+
+        let event = UiEvent::ConnectorCatalog {
+            version: "2026-11-04.1".into(),
+            connectors: vec![ConnectorInfo {
+                id: "github".into(),
+                name: "GitHub".into(),
+                description: "Repositories".into(),
+                publisher: "GitHub".into(),
+                official: true,
+                licence: "MIT".into(),
+                source: "https://github.com/github/github-mcp-server".into(),
+                transport: "http".into(),
+                pinned: "https://api.githubcopilot.com/mcp/".into(),
+                oauth: false,
+                default_scope: "user".into(),
+                variables: vec![ConnectorVariable {
+                    name: "GITHUB_PERSONAL_ACCESS_TOKEN".into(),
+                    label: "GitHub personal access token".into(),
+                    secret: true,
+                    required: true,
+                    default: None,
+                    help_url: None,
+                }],
+                added: vec!["gh".into()],
+            }],
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "connector_catalog");
+        assert_eq!(serde_json::from_value::<UiEvent>(json).unwrap(), event);
+
+        // An older engine's server rows have no `catalog`, and a row without one sends none.
+        let row: McpServerInfo = serde_json::from_str(
+            r#"{"name":"docs","scope":"user","transport":"stdio","status":"ready","tools":[],"error":null}"#,
+        )
+        .unwrap();
+        assert_eq!(row.catalog, None);
+        assert!(serde_json::to_value(&row).unwrap().get("catalog").is_none());
+        assert!(ENGINE_FEATURES.contains(&FEATURE_MCP_CATALOG));
+    }
+
+    #[test]
+    fn a_required_server_row_says_so_and_older_rows_are_not_required() {
+        let older: McpServerInfo = serde_json::from_str(
+            r#"{"name":"docs","scope":"user","transport":"stdio","status":"ready","tools":[],"error":null}"#,
+        )
+        .unwrap();
+        assert!(!older.required);
+        assert!(serde_json::to_value(&older)
+            .unwrap()
+            .get("required")
+            .is_none());
+
+        let required = McpServerInfo {
+            name: "codebase-memory".into(),
+            scope: "managed".into(),
+            transport: "stdio".into(),
+            status: "ready".into(),
+            tools: Vec::new(),
+            error: None,
+            enabled: true,
+            catalog: Some("codebase-memory".into()),
+            required: true,
+            unpinned: false,
+            connect_url: None,
+            tool_tiers: BTreeMap::new(),
+        };
+        let json = serde_json::to_value(&required).unwrap();
+        assert_eq!(json["required"], true);
+        assert_eq!(json["scope"], "managed");
+        assert!(json.get("unpinned").is_none());
+        assert_eq!(
+            serde_json::from_value::<McpServerInfo>(json).unwrap(),
+            required
+        );
+        assert!(ENGINE_FEATURES.contains(&FEATURE_MCP_POLICY));
+    }
+
+    #[test]
+    fn an_unpinned_server_row_says_so_and_older_rows_are_not_unpinned() {
+        let older: McpServerInfo = serde_json::from_str(
+            r#"{"name":"notes","scope":"user","transport":"stdio","status":"ready","tools":[],"error":null}"#,
+        )
+        .unwrap();
+        assert!(!older.unpinned);
+        let unpinned = McpServerInfo {
+            unpinned: true,
+            ..older
+        };
+        let json = serde_json::to_value(&unpinned).unwrap();
+        assert_eq!(json["unpinned"], true);
+        assert_eq!(
+            serde_json::from_value::<McpServerInfo>(json).unwrap(),
+            unpinned
+        );
+    }
+
+    #[test]
+    fn a_catalog_row_carries_its_tool_tiers_and_older_rows_none() {
+        let older: McpServerInfo = serde_json::from_str(
+            r#"{"name":"github","scope":"user","transport":"http","status":"ready","tools":["get_me"],"error":null}"#,
+        )
+        .unwrap();
+        assert!(older.tool_tiers.is_empty());
+        assert!(serde_json::to_value(&older)
+            .unwrap()
+            .get("tool_tiers")
+            .is_none());
+        let tiered = McpServerInfo {
+            catalog: Some("github".into()),
+            tool_tiers: BTreeMap::from([
+                ("get_me".to_string(), "read".to_string()),
+                ("merge_pull_request".to_string(), "destructive".to_string()),
+            ]),
+            ..older
+        };
+        let json = serde_json::to_value(&tiered).unwrap();
+        assert_eq!(json["tool_tiers"]["merge_pull_request"], "destructive");
+        assert_eq!(
+            serde_json::from_value::<McpServerInfo>(json).unwrap(),
+            tiered
+        );
+    }
+
+    #[test]
+    fn a_hosted_connector_row_carries_its_connect_page_and_older_rows_none() {
+        let older: McpServerInfo = serde_json::from_str(
+            r#"{"name":"github","scope":"managed","transport":"managed_proxy","status":"failed","tools":[],"error":null}"#,
+        )
+        .unwrap();
+        assert_eq!(older.connect_url, None);
+        assert!(serde_json::to_value(&older)
+            .unwrap()
+            .get("connect_url")
+            .is_none());
+        let waiting = McpServerInfo {
+            transport: "zerox".into(),
+            status: "needs_connect".into(),
+            error: Some("not linked".into()),
+            connect_url: Some("https://zero-x.live/dashboard#connectors".into()),
+            ..older
+        };
+        let json = serde_json::to_value(&waiting).unwrap();
+        assert_eq!(
+            json["connect_url"],
+            "https://zero-x.live/dashboard#connectors"
+        );
+        assert_eq!(
+            serde_json::from_value::<McpServerInfo>(json).unwrap(),
+            waiting
+        );
+        assert!(ENGINE_FEATURES.contains(&FEATURE_MCP_HOSTED));
+    }
+    /// The status bar's fields and commands ([`FEATURE_STATUS_BAR`]): they round-trip, and
+    /// an older engine's JSON without them reads as their defaults.
+    #[test]
+    fn status_bar_fields_and_commands_round_trip() {
+        assert!(ENGINE_FEATURES.contains(&FEATURE_STATUS_BAR));
+        for (line, command) in [
+            (
+                r#"{"kind":"command","type":"set_reasoning_effort","effort":"high"}"#,
+                EngineCommand::SetReasoningEffort {
+                    effort: Some("high".into()),
+                },
+            ),
+            (
+                r#"{"kind":"command","type":"set_reasoning_effort"}"#,
+                EngineCommand::SetReasoningEffort { effort: None },
+            ),
+            (
+                r#"{"kind":"command","type":"set_permission_mode","mode":"plan"}"#,
+                EngineCommand::SetPermissionMode {
+                    mode: "plan".into(),
+                },
+            ),
+            (
+                r#"{"kind":"command","type":"list_branches"}"#,
+                EngineCommand::ListBranches,
+            ),
+            (
+                r#"{"kind":"command","type":"switch_branch","name":"main"}"#,
+                EngineCommand::SwitchBranch {
+                    name: "main".into(),
+                    create: false,
+                },
+            ),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<ClientMessage>(line).unwrap(),
+                ClientMessage::Command(command.clone())
+            );
+            let back = serde_json::to_string(&ClientMessage::Command(command.clone())).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ClientMessage>(&back).unwrap(),
+                ClientMessage::Command(command)
+            );
+        }
+
+        let status: UiEvent = serde_json::from_str(
+            r#"{"type":"status","model":"gemini-2.5-flash","permission_mode":"workspace-write","session_id":"s","cwd":".","workspace_trusted":true,"plan_mode":false,"context_percent":4,"git":null,"provider":"gemini","model_display_name":"Gemini 2.5 Flash","reasoning_effort":"high","reasoning_efforts":["none","low","medium","high"],"full_access_allowed":true,"context":{"context_window":1000,"output_reserve":100,"system_tokens":10,"tool_schema_tokens":20,"tool_count":3,"instruction_tokens":5,"instruction_files":["NEURON.md"],"conversation_tokens":40,"tool_output_tokens":25,"used_tokens":100,"threshold_tokens":720}}"#,
+        )
+        .unwrap();
+        let UiEvent::Status {
+            provider,
+            reasoning_efforts,
+            full_access_allowed,
+            context,
+            ..
+        } = &status
+        else {
+            panic!("a status");
+        };
+        assert_eq!(provider.as_deref(), Some("gemini"));
+        assert_eq!(reasoning_efforts.as_ref().map(Vec::len), Some(4));
+        assert!(*full_access_allowed);
+        assert_eq!(
+            context.as_ref().map(|context| context.used_tokens),
+            Some(100)
+        );
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(serde_json::from_value::<UiEvent>(json).unwrap(), status);
+
+        let branches = UiEvent::Branches {
+            current: None,
+            branches: vec![BranchInfo {
+                name: "main".into(),
+                upstream: Some("origin/main".into()),
+                ahead: Some(1),
+                behind: Some(0),
+                last_commit_ms: Some(1),
+            }],
+            dirty: true,
+        };
+        let json = serde_json::to_value(&branches).unwrap();
+        assert_eq!(json["type"], "branches");
+        assert_eq!(serde_json::from_value::<UiEvent>(json).unwrap(), branches);
+
+        let window: UsageWindow = serde_json::from_str(r#"{"tokens":5,"limit_tokens":null,"remaining_tokens":null,"resets_at":null,"window_seconds":18000}"#).unwrap();
+        assert_eq!(window.window_seconds, Some(18_000));
+        let model: ModelInfo = serde_json::from_str(
+            r#"{"id":"m","display_name":null,"available":true,"unavailable_reason":null,"context_window":null,"tiers":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                model.provider,
+                model.reasoning_efforts,
+                model.supports_reasoning
+            ),
+            (None, None, None)
+        );
     }
 }

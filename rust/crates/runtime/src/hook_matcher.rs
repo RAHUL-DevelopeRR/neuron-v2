@@ -24,6 +24,8 @@ pub enum HookSource {
     Project,
     /// The workspace's machine-local settings (`.neuron/settings.local.json`).
     Local,
+    /// The machine-wide managed settings, set by an administrator.
+    Managed,
     /// An enabled plugin.
     Plugin,
     /// Built in code (tests, embedders).
@@ -37,6 +39,7 @@ impl HookSource {
             Self::User => "user",
             Self::Project => "project",
             Self::Local => "local",
+            Self::Managed => "managed",
             Self::Plugin => "plugin",
             Self::Builtin => "built-in",
         }

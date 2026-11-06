@@ -1,0 +1,42 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`PromptStatusBar 80 columns, unicode glyphs 1`] = `" G Gemini 2.5 Flash │ ● high │ ⎇ feat/tui-status… │ ✎ Edit │ ●◕○○○ 35%  120K/1M"`;
+
+exports[`PromptStatusBar 120 columns, unicode glyphs 1`] = `" G Gemini 2.5 Flash │ ● high │ ⌂ neuron-v2 ⎇ feat/tui-status-bar +1 ~2 │ ✎ Edit │ ●●●◑○○○○○○ 35%                120K/1M"`;
+
+exports[`PromptStatusBar 160 columns, unicode glyphs 1`] = `" G Gemini 2.5 Flash ▾ │ ● think high │ ⌂ neuron-v2 ⎇ feat/tui-status-bar +1 ~2 │ ✎ Edit workspace │ ●●●◑○○○○○○ 35% ctx                   120K/1M · resets 14:32"`;
+
+exports[`PromptStatusBar 80 columns, console glyphs 1`] = `" G Gemini 2.5 Flash │ ● high │ ± feat/tui-status… │ + Edit │ ●●○○○ 35%  120K/1M"`;
+
+exports[`PromptStatusBar 120 columns, console glyphs 1`] = `" G Gemini 2.5 Flash │ ● high │ ⌂ neuron-v2 ± feat/tui-status-bar +1 ~2 │ + Edit │ ●●●●○○○○○○ 35%                120K/1M"`;
+
+exports[`PromptStatusBar 160 columns, console glyphs 1`] = `" G Gemini 2.5 Flash ▼ │ ● think high │ ⌂ neuron-v2 ± feat/tui-status-bar +1 ~2 │ + Edit workspace │ ●●●●○○○○○○ 35% ctx                   120K/1M · resets 14:32"`;
+
+exports[`ContextPopover the breakdown and the account 1`] = `
+"╭──────────────────────────────────────────── Context ─────────────────────────────────────────────╮
+│ Context · Gemini 2.5 Flash · 1M window                                                           │
+│ ●●●◑○○○○○○ 35%  of 983K usable · 65.5K kept for the reply                                        │
+│   System prompt                    4.1K    0.4%                                                  │
+│   Tools (23)                      11.8K    1.2%                                                  │
+│   Project instructions & memory    2.3K    0.2%   neuron-v2/NEURON.md, .neuron/memory.md         │
+│   Conversation                     180K   18.3%                                                  │
+│   Tool outputs                     146K   14.9%                                                  │
+│   Free                           638.8K   65.0%                                                  │
+│   Auto-compacts at 80% (786.4K) · /compact now                                                   │
+│ Account · Free (dev@example.com) · Updated 3d ago                                                │
+│   5-hour window   120K / 1M tokens      ●◔○○○○○○○○ 12%  resets …
+│   Today           37 / 100 requests                     resets …
+│   /usage details · /upgrade                                                                      │
+│ esc close                                                                                        │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯"
+`;
+
+exports[`ContextPopover without an account or a breakdown 1`] = `
+"╭───────────────────────────── Context ──────────────────────────────╮
+│ Context · Gemini 2.5 Flash                                         │
+│ ◑○○○○○○○○○ ~4%  estimate from an older engine                      │
+│   Conversation                             4.0%                    │
+│   Auto-compacts at 80% · /compact now                              │
+│ esc close                                                          │
+╰────────────────────────────────────────────────────────────────────╯"
+`;

@@ -131,6 +131,7 @@ describe('model picker', () => {
         current: true,
         marker: null,
         unavailableReason: null,
+        efforts: null,
       },
       {
         id: 'zx-big',
@@ -140,6 +141,7 @@ describe('model picker', () => {
         current: false,
         marker: null,
         unavailableReason: 'Pro plan only',
+        efforts: null,
       },
     ])
     expect(modelRows(null)).toEqual([])

@@ -23,6 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -464,14 +465,7 @@ fn a_session_in_use_is_refused_and_left_as_it_was() {
     assert_eq!(sessions.len(), 1, "{sessions:?}");
     let saved = fs::read(&sessions[0]).expect("session file");
 
-    let mut lock_name = sessions[0].file_name().expect("file name").to_os_string();
-    lock_name.push(".lock");
-    let held = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(sessions[0].with_file_name(lock_name))
-        .expect("lock file");
+    let held = session_lock_file(&workspace, &sessions[0]);
     held.try_lock().expect("the test holds the session");
 
     let prompt = format!("second-turn {SCENARIO_PREFIX}streaming_text");
@@ -549,6 +543,8 @@ fn a_session_in_use_is_refused_and_left_as_it_was() {
         String::from_utf8_lossy(&next.stderr)
     );
     assert_eq!(session_files(&workspace.root), sessions);
+    // No lock file beside the session, as releases before 7.0.0-alpha.4 left.
+    assert!(!sessions[0].with_extension("jsonl.lock").exists());
     workspace.remove();
 }
 
@@ -890,6 +886,21 @@ fn neuron(workspace: &Workspace, base_url: &str) -> Command {
         command.env("PATH", path);
     }
     command
+}
+
+/// The lock file of the session at `session`, opened (and made) as a run makes it:
+/// `<NEURON_HOME>/locks/<sha256 of its canonical path>.lock`.
+fn session_lock_file(workspace: &Workspace, session: &Path) -> fs::File {
+    let canonical = fs::canonicalize(session).expect("session file");
+    let locks = workspace.home.join(".neuroncli").join("locks");
+    fs::create_dir_all(&locks).expect("locks dir");
+    let name = hex::encode(Sha256::digest(canonical.to_string_lossy().as_bytes()));
+    fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(locks.join(format!("{name}.lock")))
+        .expect("lock file")
 }
 
 /// The saved sessions of the workspace at `root`.

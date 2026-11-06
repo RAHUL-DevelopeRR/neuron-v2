@@ -349,6 +349,12 @@ impl GlobalToolRegistry {
         self.runtime_tools.iter().any(|tool| tool.name == name)
     }
 
+    /// The runtime tools' definitions, as [`Self::with_runtime_tools`] took them.
+    #[must_use]
+    pub fn runtime_tools(&self) -> &[RuntimeToolDefinition] {
+        &self.runtime_tools
+    }
+
     /// The names of the runtime tools (MCP servers' `mcp__<server>__<tool>`).
     #[must_use]
     pub fn runtime_tool_names(&self) -> Vec<String> {
@@ -463,9 +469,9 @@ fn permission_mode_from_plugin(value: &str) -> Result<PermissionMode, String> {
 
 /// Description of the `bash` tool, naming the shell that actually runs.
 #[cfg(windows)]
-const BASH_TOOL_DESCRIPTION: &str = "Execute a command in the current workspace with Windows cmd.exe (`cmd.exe /D /S /C`): use cmd syntax (`dir`, `type`, `set`, `%VAR%`, `&&`); POSIX tools work only if they are on PATH, and the PowerShell tool runs PowerShell syntax. Read-only commands run directly; anything else (writes, builds, installs, network) asks the user for approval in workspace-write mode, is denied in read-only mode, and runs directly in danger-full-access mode. stdin is empty. Default timeout 120000 ms (max 600000); on timeout the whole process tree is killed.";
+const BASH_TOOL_DESCRIPTION: &str = "Execute a command in the current workspace with Windows cmd.exe (`cmd.exe /D /S /C`): use cmd syntax (`dir`, `type`, `set`, `%VAR%`, `&&`); POSIX tools work only if they are on PATH, and the PowerShell tool runs PowerShell syntax. Read-only commands run directly. In workspace-write mode, build, test, run and package-install commands that stay inside the workspace (npm/pnpm/yarn/bun, npx, node, cargo, python, pip/uv, go, make) also run directly; anything else (sudo, global installs, writes outside the workspace, network tools, git push) asks the user for approval. Read-only mode denies everything but read-only commands; danger-full-access runs everything directly. stdin is empty. Default timeout 120000 ms (max 600000); on timeout the whole process tree is killed.";
 #[cfg(not(windows))]
-const BASH_TOOL_DESCRIPTION: &str = "Execute a command in the current workspace with POSIX sh (`sh -lc`). Read-only commands run directly; anything else (writes, builds, installs, network) asks the user for approval in workspace-write mode, is denied in read-only mode, and runs directly in danger-full-access mode. stdin is empty. Default timeout 120000 ms (max 600000); on timeout the whole process tree is killed.";
+const BASH_TOOL_DESCRIPTION: &str = "Execute a command in the current workspace with POSIX sh (`sh -lc`). Read-only commands run directly. In workspace-write mode, build, test, run and package-install commands that stay inside the workspace (npm/pnpm/yarn/bun, npx, node, cargo, python, pip/uv, go, make) also run directly; anything else (sudo, global installs, writes outside the workspace, network tools, git push) asks the user for approval. Read-only mode denies everything but read-only commands; danger-full-access runs everything directly. stdin is empty. Default timeout 120000 ms (max 600000); on timeout the whole process tree is killed.";
 
 /// Tools that exist but are not advertised to the model by default: they
 /// only keep in-memory bookkeeping (tasks, teams, crons, workers), are
@@ -999,7 +1005,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "PowerShell",
-            description: "Execute a PowerShell command (pwsh when installed, otherwise Windows PowerShell; -NoProfile -NonInteractive). Read-only cmdlets such as Get-Content, Get-ChildItem and Select-String run directly; anything else asks the user for approval in workspace-write mode and is denied in read-only mode. Default timeout 120000 ms (max 600000); on timeout the process tree is killed.",
+            description: "Execute a PowerShell command (pwsh when installed, otherwise Windows PowerShell; -NoProfile -NonInteractive). Read-only cmdlets such as Get-Content, Get-ChildItem and Select-String run directly, and so do in-workspace build, test and package commands (npm, node, cargo, python, pip, go, make) in workspace-write mode; anything else asks the user for approval in workspace-write mode and is denied in read-only mode. Default timeout 120000 ms (max 600000); on timeout the process tree is killed.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -2151,6 +2157,29 @@ fn run_mcp_auth(input: McpAuthInput) -> Result<String, String> {
     }
 }
 
+/// Longest `RemoteTrigger` response body, in bytes, returned to the model.
+const REMOTE_TRIGGER_MAX_BODY_BYTES: usize = 8192;
+
+/// Cut a `RemoteTrigger` response body to [`REMOTE_TRIGGER_MAX_BODY_BYTES`],
+/// backing off to the previous char boundary so a multi-byte character that
+/// straddles the limit cannot panic the slice.
+///
+/// Ported from Claw Code (MIT), upstream commit a289024.
+fn truncate_remote_trigger_body(body: String) -> String {
+    if body.len() <= REMOTE_TRIGGER_MAX_BODY_BYTES {
+        return body;
+    }
+    let mut end = REMOTE_TRIGGER_MAX_BODY_BYTES;
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n\n[response truncated — {} bytes total]",
+        &body[..end],
+        body.len()
+    )
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
     let method = input.method.unwrap_or_else(|| "GET".to_string());
@@ -2189,15 +2218,7 @@ fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
         Ok(response) => {
             let status = response.status().as_u16();
             let body = response.text().unwrap_or_default();
-            let truncated_body = if body.len() > 8192 {
-                format!(
-                    "{}\n\n[response truncated — {} bytes total]",
-                    &body[..8192],
-                    body.len()
-                )
-            } else {
-                body
-            };
+            let truncated_body = truncate_remote_trigger_body(body);
             to_pretty_json(json!({
                 "url": input.url,
                 "method": method,
@@ -2318,8 +2339,10 @@ fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> 
 
 /// Permission a `bash` command line needs, judged over every simple command
 /// it contains: `ReadOnly` only when each one is an allowlisted read-only
-/// program with safe arguments that stays inside the workspace, otherwise
-/// `DangerFullAccess` (which prompts in workspace-write mode).
+/// program with safe arguments that stays inside the workspace,
+/// `WorkspaceWrite` when the others are in-workspace build, test, run or
+/// package commands, otherwise `DangerFullAccess` (which prompts in
+/// workspace-write mode).
 fn classify_bash_permission(command: &str) -> PermissionMode {
     let workspace = runtime::workdir::current_dir().ok();
     classify_shell_command(command, ShellDialect::host(), workspace.as_deref()).required_mode()
@@ -3165,16 +3188,27 @@ fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String>
     let client = build_http_client()?;
     let search_url = build_search_url(&input.query)?;
     let response = client
-        .get(search_url)
+        .get(search_url.as_str())
         .send()
         .map_err(|error| error.to_string())?;
+
+    // DuckDuckGo answers its bot challenge with HTTP 202 and a page without
+    // results, so anything but 200 is an unusable results page (ported from
+    // Claw Code, upstream commit fd8527f).
+    let status = response.status();
+    if status != reqwest::StatusCode::OK {
+        return Err(format!(
+            "Web search unavailable (HTTP {}) - the search provider is blocked or unreachable",
+            status.as_u16()
+        ));
+    }
 
     let final_url = response.url().clone();
     let html = response.text().map_err(|error| error.to_string())?;
     let mut hits = extract_search_hits(&html);
 
     if hits.is_empty() && final_url.host_str().is_some() {
-        hits = extract_search_hits_from_generic_links(&html);
+        hits = extract_search_hits_from_generic_links(&html, search_url.host_str());
     }
 
     if let Some(allowed) = input.allowed_domains.as_ref() {
@@ -3416,7 +3450,7 @@ fn extract_search_hits(html: &str) -> Vec<SearchHit> {
     hits
 }
 
-fn extract_search_hits_from_generic_links(html: &str) -> Vec<SearchHit> {
+fn extract_search_hits_from_generic_links(html: &str, search_host: Option<&str>) -> Vec<SearchHit> {
     let mut hits = Vec::new();
     let mut remaining = html;
 
@@ -3446,7 +3480,9 @@ fn extract_search_hits_from_generic_links(html: &str) -> Vec<SearchHit> {
             continue;
         }
         let decoded_url = decode_duckduckgo_redirect(&url).unwrap_or(url);
-        if decoded_url.starts_with("http://") || decoded_url.starts_with("https://") {
+        if (decoded_url.starts_with("http://") || decoded_url.starts_with("https://"))
+            && !is_search_engine_link(&decoded_url, search_host)
+        {
             hits.push(SearchHit {
                 title: title.trim().to_string(),
                 url: decoded_url,
@@ -3456,6 +3492,22 @@ fn extract_search_hits_from_generic_links(html: &str) -> Vec<SearchHit> {
     }
 
     hits
+}
+
+/// A generic-fallback link that points back at `DuckDuckGo` or at the configured
+/// search host is page chrome (home, settings, challenge), never a result.
+///
+/// Ported from Claw Code (MIT), upstream commit fd8527f.
+fn is_search_engine_link(url: &str, search_host: Option<&str>) -> bool {
+    let Some(host) = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+    else {
+        return false;
+    };
+    host == "duckduckgo.com"
+        || host.ends_with(".duckduckgo.com")
+        || search_host.is_some_and(|search_host| host.eq_ignore_ascii_case(search_host))
 }
 
 fn extract_quoted_value(input: &str) -> Option<(String, &str)> {
@@ -3556,6 +3608,11 @@ fn execute_todo_write(input: TodoWriteInput) -> Result<TodoWriteOutput, String> 
         serde_json::to_string_pretty(&persisted).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
+    // The store holds the list now, so the one an earlier release left in the
+    // workspace has done its job.
+    if let Some(legacy) = legacy_path.as_deref() {
+        remove_legacy_todos(legacy);
+    }
 
     let verification_nudge_needed = (all_done
         && input.todos.len() >= 3
@@ -3640,6 +3697,48 @@ fn previous_todos(store: &Path, legacy: Option<&Path>) -> Result<Vec<TodoItem>, 
         .and_then(|path| std::fs::read_to_string(path).ok())
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default())
+}
+
+/// Removes the task list an earlier release left in the workspace at `legacy`, unless git
+/// tracks it: someone committed it, and deleting it would be a change to commit. An
+/// untracked or ignored one goes, as does one outside a repository; when git can't be
+/// run to ask, or fails inside a repository (a corrupt index, a folder git refuses as
+/// of dubious ownership), it stays.
+fn remove_legacy_todos(legacy: &Path) {
+    let (Some(folder), Some(name)) = (legacy.parent(), legacy.file_name()) else {
+        return;
+    };
+    if !legacy.is_file() {
+        return;
+    }
+    let tracked = Command::new("git")
+        .args(["ls-files", "--error-unmatch", "--"])
+        .arg(name)
+        .current_dir(folder)
+        .output();
+    let Ok(output) = tracked else {
+        return;
+    };
+    if legacy_todos_removable(output.status.code(), || inside_repository(folder)) {
+        let _ = std::fs::remove_file(legacy);
+    }
+}
+
+/// Whether `git ls-files --error-unmatch` exiting with `code` lets the legacy task list
+/// go: 1 is git's answer "not tracked"; any other failure (128, "fatal") says so too
+/// only when `in_repository` says the folder is not in one.
+fn legacy_todos_removable(code: Option<i32>, in_repository: impl FnOnce() -> bool) -> bool {
+    match code {
+        Some(0) => false,
+        Some(1) => true,
+        _ => !in_repository(),
+    }
+}
+
+/// Whether `folder` or a folder above it has a `.git`: git's own failure there is not
+/// "not a git repository".
+fn inside_repository(folder: &Path) -> bool {
+    folder.ancestors().any(|dir| dir.join(".git").exists())
 }
 
 fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
@@ -3923,6 +4022,12 @@ const SUBAGENT_UNKNOWN_MODEL_OUTPUT: u32 = 8_192;
 pub type SubagentClientFactory =
     std::sync::Arc<dyn Fn(&str) -> Result<ProviderClient, String> + Send + Sync>;
 
+/// Builds a sub-agent's [`runtime::RequestGuard`] for the client its requests go to
+/// first (the plan's token window: a working set, and a stop before a request the
+/// window does not cover); `None` for no guard.
+pub type SubagentGuardFactory =
+    std::sync::Arc<dyn Fn(&ProviderClient) -> Option<Box<dyn runtime::RequestGuard>> + Send + Sync>;
+
 /// What a sub-agent inherits from the session that spawned it. A sub-agent
 /// never runs with more than its parent: the same permission mode, the same
 /// allow/deny/ask rules, the same tool hooks, and at most the parent's tools.
@@ -3948,6 +4053,8 @@ pub struct SubagentParentContext {
     /// The model sub-agents run on when the `Agent` call names none
     /// (`subagentModel`); the parent's model when `None`.
     pub subagent_model: Option<String>,
+    /// Gives each sub-agent the parent's request guard; `None` for none.
+    pub request_guard: Option<SubagentGuardFactory>,
 }
 
 impl SubagentParentContext {
@@ -3964,6 +4071,7 @@ impl SubagentParentContext {
             client_factory: None,
             context_sections: Vec::new(),
             subagent_model: None,
+            request_guard: None,
         }
     }
 }
@@ -3979,6 +4087,7 @@ impl std::fmt::Debug for SubagentParentContext {
             .field("client_factory", &self.client_factory.is_some())
             .field("context_sections", &self.context_sections.len())
             .field("subagent_model", &self.subagent_model)
+            .field("request_guard", &self.request_guard.is_some())
             .finish()
     }
 }
@@ -4436,6 +4545,10 @@ fn run_agent_job(job: &AgentJob, cancel: &runtime::CancellationToken) -> Result<
             "sub-agent stopped: {}",
             runtime::refusal_line(note.as_deref())
         )),
+        runtime::TurnOutcome::BudgetStopped { .. } => Err(
+            "sub-agent stopped: the plan's token window does not cover its next request"
+                .to_string(),
+        ),
         runtime::TurnOutcome::Completed | runtime::TurnOutcome::OutputTruncated => {
             persist_agent_terminal_state(
                 &job.manifest,
@@ -4487,21 +4600,30 @@ fn build_agent_runtime(
 ) -> Result<ConversationRuntime<SubagentApiClient, SubagentToolExecutor>, String> {
     let model = job.model.clone();
     let api_client = SubagentApiClient::new(&model, job.allowed_tools.clone())?;
+    let request_guard = subagent_request_guard(&api_client);
     Ok(assemble_agent_runtime(
         api_client,
         &model,
         job.allowed_tools.clone(),
         job.system_prompt.clone(),
+        request_guard,
     ))
 }
 
+/// The parent's request guard for a sub-agent whose requests go to `client` first.
+fn subagent_request_guard(client: &SubagentApiClient) -> Option<Box<dyn runtime::RequestGuard>> {
+    let factory = subagent_parent_context()?.request_guard?;
+    factory(&client.inner.chain.first()?.client)
+}
+
 /// Wires a sub-agent runtime around `api_client` with the inherited
-/// permission policy, hooks and tool set.
+/// permission policy, hooks, tool set and request guard.
 fn assemble_agent_runtime<C: ApiClient>(
     api_client: C,
     model: &str,
     allowed_tools: BTreeSet<String>,
     system_prompt: Vec<String>,
+    request_guard: Option<Box<dyn runtime::RequestGuard>>,
 ) -> ConversationRuntime<C, SubagentToolExecutor> {
     let tool_schema_tokens = subagent_tool_schema_tokens(&allowed_tools);
     let writes_files = ["write_file", "edit_file", "NotebookEdit"]
@@ -4518,7 +4640,7 @@ fn assemble_agent_runtime<C: ApiClient>(
         ),
         runtime::context_manager::ContextPolicy::from_env(),
     );
-    ConversationRuntime::new_with_features(
+    let mut runtime = ConversationRuntime::new_with_features(
         Session::new(),
         api_client,
         tool_executor,
@@ -4533,7 +4655,9 @@ fn assemble_agent_runtime<C: ApiClient>(
         // files in chat; its client follows `providerFallbacks` itself.
         agent_mode: writes_files,
         ..runtime::ModelRouting::default()
-    })
+    });
+    runtime.set_request_guard(request_guard);
+    runtime
 }
 
 /// `1` turns on the completion check's reviewer (see [`SubagentReviewer`]).
@@ -4625,10 +4749,16 @@ impl runtime::ChangeReviewer for SubagentReviewer {
         );
         system_prompt.push(REVIEWER_INSTRUCTIONS.to_string());
         let api_client = SubagentApiClient::new(&self.model, allowed_tools.clone())?;
-        let mut reviewer =
-            assemble_agent_runtime(api_client, &self.model, allowed_tools, system_prompt)
-                .with_max_iterations(REVIEW_MAX_ITERATIONS)
-                .with_cancellation_token(cancel.clone());
+        let request_guard = subagent_request_guard(&api_client);
+        let mut reviewer = assemble_agent_runtime(
+            api_client,
+            &self.model,
+            allowed_tools,
+            system_prompt,
+            request_guard,
+        )
+        .with_max_iterations(REVIEW_MAX_ITERATIONS)
+        .with_cancellation_token(cancel.clone());
         let summary = reviewer
             .run_turn(review_prompt(request), None)
             .map_err(|error| error.to_string())?;
@@ -5092,6 +5222,7 @@ mod subagent_inheritance_tests {
             "openai/auto",
             tools(&[tool]),
             vec!["system".to_string()],
+            None,
         );
         let summary = runtime.run_turn("delegated", None).expect("child turn");
         let ContentBlock::ToolResult {
@@ -5101,6 +5232,81 @@ mod subagent_inheritance_tests {
             panic!("expected a tool result");
         };
         (output.clone(), *is_error)
+    }
+
+    /// The plan's token window as a sub-agent's guard sees it: a working set, and only
+    /// requests of at most `window_left` input tokens go out.
+    struct WindowGuard {
+        working_set: Option<usize>,
+        window_left: usize,
+    }
+
+    impl runtime::RequestGuard for WindowGuard {
+        fn working_set_tokens(&self) -> Option<usize> {
+            self.working_set
+        }
+
+        fn allow_request(&mut self, request: &runtime::RequestEstimate) -> bool {
+            request.input_tokens <= self.window_left
+        }
+    }
+
+    /// Counts the requests that reached the provider.
+    struct CountingApi(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl ApiClient for CountingApi {
+        fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![
+                AssistantEvent::TextDelta("done".to_string()),
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+
+    #[test]
+    fn a_subagent_keeps_the_parents_working_set_and_stops_at_the_window() {
+        let sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut child = assemble_agent_runtime(
+            CountingApi(sent.clone()),
+            "openai/auto",
+            tools(&["read_file"]),
+            vec!["system".to_string()],
+            Some(Box::new(WindowGuard {
+                working_set: Some(2_000),
+                window_left: 0,
+            })),
+        );
+        let summary = child.run_turn("delegated", None).expect("child turn");
+        assert!(
+            matches!(summary.outcome, runtime::TurnOutcome::BudgetStopped { .. }),
+            "{:?}",
+            summary.outcome
+        );
+        assert_eq!(
+            sent.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "nothing sent"
+        );
+        assert_eq!(
+            child.context_manager().policy().working_set_tokens,
+            Some(2_000)
+        );
+
+        // A window that covers the request: it goes out as before.
+        let mut child = assemble_agent_runtime(
+            CountingApi(sent.clone()),
+            "openai/auto",
+            tools(&["read_file"]),
+            vec!["system".to_string()],
+            Some(Box::new(WindowGuard {
+                working_set: None,
+                window_left: usize::MAX,
+            })),
+        );
+        let summary = child.run_turn("delegated", None).expect("child turn");
+        assert_eq!(summary.outcome, runtime::TurnOutcome::Completed);
+        assert_eq!(sent.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -9134,6 +9340,155 @@ mod tests {
         assert!(error.contains("relative URL without a base") || error.contains("empty host"));
     }
 
+    // Ported from Claw Code (MIT), upstream commit fd8527f.
+    #[test]
+    fn web_search_returns_error_on_non_2xx_response() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(request_line.contains("GET /search?q=test"));
+            HttpResponse::html(
+                429,
+                "Too Many Requests",
+                "<html><body><p>Too many requests.</p></body></html>",
+            )
+        }));
+
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/search", server.addr()),
+        );
+        let error = execute_tool("WebSearch", &json!({ "query": "test" }))
+            .expect_err("non-2xx response should fail");
+        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+
+        assert!(error.contains("Web search unavailable"), "{error}");
+        assert!(error.contains("429"), "{error}");
+    }
+
+    // Ported from Claw Code (MIT), upstream commit fd8527f.
+    #[test]
+    fn web_search_rejects_duckduckgo_202_challenge_page() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(request_line.contains("GET /html/?q=challenge "));
+            HttpResponse::html(
+                202,
+                "Accepted",
+                r#"
+                <html><body>
+                  <a href="/html/">DuckDuckGo</a>
+                  <a href="https://duckduckgo.com/">Home</a>
+                  <p>Please verify you are not a bot.</p>
+                </body></html>
+                "#,
+            )
+        }));
+
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/html/", server.addr()),
+        );
+        let error = execute_tool("WebSearch", &json!({ "query": "challenge" }))
+            .expect_err("a 202 challenge page must not produce results");
+        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+
+        assert!(
+            error.contains("Web search unavailable (HTTP 202)"),
+            "{error}"
+        );
+    }
+
+    // Ported from Claw Code (MIT), upstream commit fd8527f.
+    #[test]
+    fn web_search_generic_fallback_drops_search_engine_links() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(request_line.contains("GET /search?q=chrome+links "));
+            HttpResponse::html(
+                200,
+                "OK",
+                r#"
+                <html><body>
+                  <a href="/html/">DuckDuckGo</a>
+                  <a href="https://html.duckduckgo.com/html/?q=x">Next page</a>
+                  <a href="https://duckduckgo.com/settings">Settings</a>
+                  <a href="https://docs.rs/serde">Serde Docs</a>
+                  <a href="https://tokio.rs/">Tokio</a>
+                </body></html>
+                "#,
+            )
+        }));
+
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/search", server.addr()),
+        );
+        let result = execute_tool("WebSearch", &json!({ "query": "chrome links" }))
+            .expect("WebSearch fallback parsing should succeed");
+        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        let content = output["results"]
+            .as_array()
+            .expect("results array")
+            .iter()
+            .find_map(|item| item.get("content"))
+            .and_then(serde_json::Value::as_array)
+            .expect("search result block present");
+        let urls: Vec<&str> = content
+            .iter()
+            .map(|hit| hit["url"].as_str().expect("url"))
+            .collect();
+        assert_eq!(urls, ["https://docs.rs/serde", "https://tokio.rs/"]);
+    }
+
+    // Ported from Claw Code (MIT), upstream commit a289024.
+    #[test]
+    fn remote_trigger_body_truncates_on_a_char_boundary() {
+        // 8189 ASCII bytes, then a 4-byte character spanning byte 8192.
+        let mut body = "a".repeat(8189);
+        body.push('\u{1F980}');
+        body.push_str("tail_after_the_limit");
+        let total = body.len();
+
+        let truncated = super::truncate_remote_trigger_body(body);
+
+        assert!(truncated.starts_with(&"a".repeat(8189)));
+        assert!(!truncated.contains('\u{1F980}'));
+        assert!(!truncated.contains("tail_after_the_limit"));
+        assert!(truncated.contains(&format!("[response truncated — {total} bytes total]")));
+
+        let short = "short body".to_string();
+        assert_eq!(super::truncate_remote_trigger_body(short.clone()), short);
+    }
+
+    // Ported from Claw Code (MIT), upstream commit a289024.
+    #[test]
+    fn remote_trigger_truncates_a_multibyte_body_end_to_end() {
+        let server = TestServer::spawn(Arc::new(|_request_line: &str| {
+            let mut body = "a".repeat(8189);
+            body.push('\u{1F980}');
+            body.push_str("extra_content_after_boundary");
+            HttpResponse::text(200, "OK", &body)
+        }));
+
+        let result = execute_tool(
+            "RemoteTrigger",
+            &json!({ "url": format!("http://{}/test", server.addr()), "method": "GET" }),
+        )
+        .expect("RemoteTrigger should succeed");
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        let body = output["body"].as_str().expect("body string");
+        assert!(body.contains("[response truncated"));
+        assert!(!body.contains("extra_content_after_boundary"));
+    }
+
     #[test]
     fn pending_tools_preserve_multiple_streaming_tool_calls_by_index() {
         let mut events = Vec::new();
@@ -9273,9 +9628,8 @@ mod tests {
         assert!(store.starts_with(home.join("todos")), "{}", store.display());
         assert!(store.exists(), "{}", store.display());
         assert!(!store.starts_with(&cwd));
-        assert_eq!(
-            legacy.exists(),
-            legacy_existed,
+        assert!(
+            legacy_existed || !legacy.exists(),
             "nothing written to the workspace"
         );
         let _ = fs::remove_dir_all(&home);
@@ -9310,6 +9664,69 @@ mod tests {
             Vec::<super::TodoItem>::new()
         );
         let _ = fs::remove_dir_all(&workspace);
+    }
+
+    /// Once the store has the list, the one an earlier release left in the workspace is
+    /// removed when git does not track it, and kept when it does.
+    #[test]
+    fn the_legacy_todo_list_is_removed_unless_git_tracks_it() {
+        let list = r#"[{"content":"Old","activeForm":"Doing old","status":"pending"}]"#;
+
+        // Outside a repository.
+        let plain = temp_path("todo-legacy-plain");
+        fs::create_dir_all(&plain).expect("workspace");
+        let old = plain.join(super::LEGACY_TODO_FILE);
+        fs::write(&old, list).expect("legacy list");
+        super::remove_legacy_todos(&old);
+        assert!(!old.exists());
+        let _ = fs::remove_dir_all(&plain);
+
+        // In a repository: untracked, then ignored, then committed.
+        let repo = temp_path("todo-legacy-repo");
+        init_git_repo(&repo);
+        let old = repo.join(super::LEGACY_TODO_FILE);
+        fs::write(&old, list).expect("legacy list");
+        super::remove_legacy_todos(&old);
+        assert!(!old.exists(), "untracked");
+
+        fs::write(
+            repo.join(".gitignore"),
+            ".clawd-todos.json
+",
+        )
+        .expect("ignore");
+        fs::write(&old, list).expect("legacy list");
+        super::remove_legacy_todos(&old);
+        assert!(!old.exists(), "ignored");
+
+        fs::write(repo.join(".gitignore"), "").expect("ignore");
+        fs::write(&old, list).expect("legacy list");
+        run_git(&repo, &["add", super::LEGACY_TODO_FILE]);
+        run_git(&repo, &["commit", "--quiet", "-m", "todos"]);
+        super::remove_legacy_todos(&old);
+        assert!(old.exists(), "committed");
+
+        // Git fails inside the repository (exit 128): the committed list stays.
+        fs::write(repo.join(".git").join("index"), "garbage").expect("corrupt index");
+        let status = Command::new("git")
+            .args(["ls-files", "--error-unmatch", "--", super::LEGACY_TODO_FILE])
+            .current_dir(&repo)
+            .output()
+            .expect("git runs")
+            .status;
+        assert_eq!(status.code(), Some(128), "a corrupt index is a fatal error");
+        super::remove_legacy_todos(&old);
+        assert!(old.exists(), "git failed in a repository");
+        assert!(super::inside_repository(&repo.join("sub")));
+        let _ = fs::remove_dir_all(&repo);
+
+        // "Not a git repository" (128) outside one still lets it go; git's answers
+        // stand on their own.
+        assert!(super::legacy_todos_removable(Some(128), || false));
+        assert!(!super::legacy_todos_removable(Some(128), || true));
+        assert!(!super::legacy_todos_removable(None, || true));
+        assert!(super::legacy_todos_removable(Some(1), || true));
+        assert!(!super::legacy_todos_removable(Some(0), || false));
     }
 
     #[test]

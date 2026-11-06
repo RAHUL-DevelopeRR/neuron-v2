@@ -21,11 +21,13 @@ use crate::hooks::{
     HookAbortSignal, HookEvent, HookProgressReporter, HookRunResult, HookRunner,
     LifecycleHookInput, ToolUseIdReporter,
 };
+use crate::mcp_audit::{McpAuditCall, McpAuditLog};
 use crate::model_registry;
 use crate::model_routing::{self, ModelRouting};
 use crate::parallel_tools::ConcurrentToolCall;
 use crate::permissions::{
-    PermissionContext, PermissionMode, PermissionOutcome, PermissionPolicy, PermissionPrompter,
+    PermissionContext, PermissionDecider, PermissionMode, PermissionOutcome, PermissionPolicy,
+    PermissionPrompter,
 };
 use crate::project_checks::{detect_checks, ProjectCheck};
 use crate::refusal::neutral_refusal_note;
@@ -36,7 +38,10 @@ use crate::usage::{TokenUsage, UsageTracker};
 mod tool_batch;
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
-const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
+/// Environment variable setting the automatic compaction threshold.
+const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "NEURON_AUTO_COMPACT_INPUT_TOKENS";
+/// The name claw-code gave it, still read when the new one is unset.
+const LEGACY_AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
 /// Default cap on model calls per turn.
 pub const DEFAULT_MAX_ITERATIONS: usize = 50;
 /// Environment variable overriding the per-turn model-call cap.
@@ -293,6 +298,12 @@ pub trait ToolExecutor {
     /// nothing.
     fn tool_started(&mut self, _tool_use_id: &str, _tool_name: &str, _input: &str) {}
 
+    /// Who allowed the tool call about to run (`decided_by`), just before
+    /// [`Self::tool_started`]; it holds for the next execute call only. An executor
+    /// tells a hosted connector when the user approved the call in the prompt
+    /// ([`PermissionDecider::User`]). The default does nothing.
+    fn tool_permission_decided(&mut self, _tool_name: &str, _decided_by: PermissionDecider) {}
+
     /// Every tool call's final result, as the model will see it: one that ran, one that
     /// was denied or blocked by a hook, and one that never started (interrupted, cut off
     /// at the output limit, stopped by the loop guard). The default does nothing.
@@ -471,7 +482,43 @@ pub enum TurnOutcome {
         note: Option<String>,
         skipped_tool_calls: usize,
     },
+    /// The [`RequestGuard`] stopped the turn before a model request of about
+    /// `estimated_tokens` input tokens (the plan's token window would not cover
+    /// it, and the user chose to stop). Nothing was sent.
+    BudgetStopped { estimated_tokens: usize },
 }
+
+/// A model request about to be sent, as a [`RequestGuard`] sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestEstimate {
+    /// Estimated input tokens: the system prompt, the tool definitions and the
+    /// conversation.
+    pub input_tokens: usize,
+    /// Output tokens the request asks for (`max_tokens`).
+    pub output_reserve: usize,
+    /// The request's step in the turn, from 1.
+    pub iteration: usize,
+}
+
+/// Looks at every model request before it is sent: the plan's token allowance as
+/// the conversation sees it. A plan with a small rolling token window (Free) keeps
+/// a smaller working set ([`ContextPolicy::working_set_tokens`]) and is asked
+/// before a request would spend more than the window has left.
+pub trait RequestGuard: Send {
+    /// The transcript budget the plan calls for now, in place of the model's own
+    /// when smaller; `None` for the model's own.
+    fn working_set_tokens(&self) -> Option<usize> {
+        None
+    }
+
+    /// Whether to send `request`; `false` stops the turn with
+    /// [`TurnOutcome::BudgetStopped`]. The guard may ask the user first.
+    fn allow_request(&mut self, request: &RequestEstimate) -> bool;
+}
+
+/// The assistant note that closes a turn the [`RequestGuard`] stopped.
+pub const BUDGET_STOPPED_NOTE: &str =
+    "[Stopped before the next model request: it would have needed more tokens than the plan's token window had left, and the user chose to stop.]";
 
 /// Summary of one completed runtime turn, including tool results and usage.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -557,6 +604,10 @@ pub struct ConversationRuntime<C, T> {
     artifacts: Option<crate::artifacts::ArtifactStore>,
     /// What `SessionStart` hooks printed, added to the next prompt.
     pending_hook_context: Vec<String>,
+    /// Looks at each model request before it is sent (see [`RequestGuard`]).
+    request_guard: Option<Box<dyn RequestGuard>>,
+    /// Records every MCP call, refused ones too (see [`crate::mcp_audit`]).
+    mcp_audit: Option<McpAuditLog>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -623,7 +674,35 @@ where
             model_override: None,
             artifacts: None,
             pending_hook_context: Vec::new(),
+            request_guard: None,
+            mcp_audit: None,
         }
+    }
+
+    /// Records every MCP tool call this runtime decides in `audit`.
+    #[must_use]
+    pub fn with_mcp_audit(mut self, audit: McpAuditLog) -> Self {
+        self.mcp_audit = Some(audit);
+        self
+    }
+
+    /// Has `guard` look at every model request before it is sent (see
+    /// [`RequestGuard`]).
+    #[must_use]
+    pub fn with_request_guard(mut self, guard: Box<dyn RequestGuard>) -> Self {
+        self.request_guard = Some(guard);
+        self
+    }
+
+    pub fn set_request_guard(&mut self, guard: Option<Box<dyn RequestGuard>>) {
+        self.request_guard = guard;
+    }
+
+    /// Estimated input tokens of the next model request: the system prompt, the
+    /// tool definitions and the conversation.
+    #[must_use]
+    pub fn request_tokens_estimate(&self) -> usize {
+        self.context_snapshot().request_input_tokens()
     }
 
     /// How the conversation may move between models within a turn (see
@@ -1002,6 +1081,11 @@ where
             }
 
             self.prepare_context(&mut progress)?;
+            if let Some(estimated_tokens) = self.guard_stops_request(progress.iterations) {
+                return Ok(
+                    self.finish_turn(progress, TurnOutcome::BudgetStopped { estimated_tokens })
+                );
+            }
             self.record_model_request_started(progress.iterations);
 
             let request = ApiRequest {
@@ -1309,6 +1393,7 @@ where
     /// The pre-hook and the permission prompt can block for a while, so the
     /// cancellation token is checked again once they return: a call the user
     /// interrupted meanwhile is never started.
+    #[allow(clippy::too_many_lines)]
     fn execute_tool_use(
         &mut self,
         iteration: usize,
@@ -1326,41 +1411,39 @@ where
             pre_hook_result.permission_reason().map(ToOwned::to_owned),
         );
 
-        let permission_outcome = if pre_hook_result.is_cancelled() {
-            PermissionOutcome::Deny {
-                reason: format_hook_message(
-                    &pre_hook_result,
-                    &format!("PreToolUse hook cancelled tool `{tool_name}`"),
-                ),
-            }
+        let hook_refusal = if pre_hook_result.is_cancelled() {
+            Some(format!("PreToolUse hook cancelled tool `{tool_name}`"))
         } else if pre_hook_result.is_failed() {
-            PermissionOutcome::Deny {
-                reason: format_hook_message(
-                    &pre_hook_result,
-                    &format!("PreToolUse hook failed for tool `{tool_name}`"),
-                ),
-            }
+            Some(format!("PreToolUse hook failed for tool `{tool_name}`"))
         } else if pre_hook_result.is_denied() {
-            PermissionOutcome::Deny {
-                reason: format_hook_message(
-                    &pre_hook_result,
-                    &format!("PreToolUse hook denied tool `{tool_name}`"),
-                ),
-            }
+            Some(format!("PreToolUse hook denied tool `{tool_name}`"))
         } else {
-            self.permission_policy.authorize_with_context(
+            None
+        };
+        let (permission_outcome, decided_by) = match hook_refusal {
+            Some(fallback) => (
+                PermissionOutcome::Deny {
+                    reason: format_hook_message(&pre_hook_result, &fallback),
+                },
+                PermissionDecider::Hook,
+            ),
+            None => self.permission_policy.authorize_with_context_decided(
                 tool_name,
                 &effective_input,
                 &permission_context,
                 prompter,
-            )
+            ),
         };
 
         let interrupted = self.cancel.is_cancelled();
+        let allowed = permission_outcome == PermissionOutcome::Allow;
+        let started = Instant::now();
         let (output, is_error) = match permission_outcome {
             PermissionOutcome::Allow if interrupted => (INTERRUPTED_TOOL_RESULT.to_string(), true),
             PermissionOutcome::Allow => {
                 self.record_tool_started(iteration, tool_name);
+                self.tool_executor
+                    .tool_permission_decided(tool_name, decided_by);
                 self.tool_executor
                     .tool_started(tool_use_id, tool_name, &effective_input);
                 let result = self.tool_executor.execute_with_cancellation(
@@ -1381,6 +1464,35 @@ where
                 true,
             ),
         };
+        if let Some(audit) = &self.mcp_audit {
+            let error_class = if !allowed {
+                Some("denied")
+            } else if interrupted {
+                Some("interrupted")
+            } else if is_error {
+                Some("tool_error")
+            } else {
+                None
+            };
+            let recorded = audit.record(&McpAuditCall {
+                tool_name,
+                input: &effective_input,
+                allowed,
+                decided_by,
+                duration: if allowed && !interrupted {
+                    started.elapsed()
+                } else {
+                    std::time::Duration::ZERO
+                },
+                output_bytes: output.len(),
+                error_class,
+            });
+            if let Err(error) = recorded {
+                crate::ui_hooks::notice(&format!(
+                    "warning: could not write the MCP audit log: {error}"
+                ));
+            }
+        }
         let limit = self.context_manager.policy().max_tool_result_chars;
         let context_manager = &self.context_manager;
         let output = crate::artifacts::offload_tool_result(
@@ -1486,8 +1598,12 @@ where
     }
 
     /// Checks the context budget before a model call and prunes or compacts
-    /// the session when needed.
+    /// the session when needed. The [`RequestGuard`]'s working set applies.
     fn prepare_context(&mut self, progress: &mut TurnProgress) -> Result<(), RuntimeError> {
+        if let Some(guard) = &self.request_guard {
+            self.context_manager
+                .set_working_set_tokens(guard.working_set_tokens());
+        }
         if !progress.pre_compact_hooks_ran && self.hook_runner.has_hooks(HookEvent::PreCompact) {
             let snapshot = self
                 .context_manager
@@ -1508,6 +1624,20 @@ where
         progress.compacted_messages += preparation.compacted_messages;
         self.record_context_prepared(progress.iterations, &preparation);
         self.session.persist_snapshot().map_err(session_error)
+    }
+
+    /// Asks the [`RequestGuard`] about the request step `iteration` is about to
+    /// send; `Some` with its estimated input tokens when the guard stops it.
+    fn guard_stops_request(&mut self, iteration: usize) -> Option<usize> {
+        self.request_guard.as_ref()?;
+        let snapshot = self.context_snapshot();
+        let request = RequestEstimate {
+            input_tokens: snapshot.request_input_tokens(),
+            output_reserve: snapshot.budget.output_reserve,
+            iteration,
+        };
+        let guard = self.request_guard.as_mut()?;
+        (!guard.allow_request(&request)).then_some(request.input_tokens)
     }
 
     /// Shrinks the session after the provider reported a context overflow.
@@ -1871,8 +2001,14 @@ where
             // Best effort: a read-only or full disk must not fail the turn.
             let _ = store.record(&model, &progress.stats);
         }
-        if matches!(outcome, TurnOutcome::Cancelled { .. }) {
-            self.close_turn_with_note(INTERRUPTED_RESPONSE_NOTE.to_string(), None);
+        match outcome {
+            TurnOutcome::Cancelled { .. } => {
+                self.close_turn_with_note(INTERRUPTED_RESPONSE_NOTE.to_string(), None);
+            }
+            TurnOutcome::BudgetStopped { .. } => {
+                self.close_turn_with_note(BUDGET_STOPPED_NOTE.to_string(), None);
+            }
+            _ => {}
         }
         let summary = TurnSummary {
             assistant_messages: progress.assistant_messages,
@@ -2219,21 +2355,24 @@ fn parse_max_iterations(env_value: Option<&str>, configured: Option<usize>) -> u
 #[must_use]
 pub fn auto_compaction_threshold_from_env() -> u32 {
     parse_auto_compaction_threshold(
-        std::env::var(AUTO_COMPACTION_THRESHOLD_ENV_VAR)
-            .ok()
-            .as_deref(),
+        auto_compaction_threshold_env(|name| std::env::var(name).ok()).as_deref(),
     )
 }
 
 /// Explicit compaction threshold (estimated context tokens) from
-/// `CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS`, or `None` when unset or invalid so
+/// `NEURON_AUTO_COMPACT_INPUT_TOKENS`, or `None` when unset or invalid so
 /// the model-aware budget applies.
 #[must_use]
 pub fn auto_compaction_threshold_override_from_env() -> Option<u32> {
-    std::env::var(AUTO_COMPACTION_THRESHOLD_ENV_VAR)
-        .ok()
+    auto_compaction_threshold_env(|name| std::env::var(name).ok())
         .and_then(|raw| raw.trim().parse::<u32>().ok())
         .filter(|threshold| *threshold > 0)
+}
+
+/// The compaction threshold variable `var` gives: [`AUTO_COMPACTION_THRESHOLD_ENV_VAR`],
+/// else the legacy name, which is kept as a silent alias.
+fn auto_compaction_threshold_env(var: impl Fn(&str) -> Option<String>) -> Option<String> {
+    var(AUTO_COMPACTION_THRESHOLD_ENV_VAR).or_else(|| var(LEGACY_AUTO_COMPACTION_THRESHOLD_ENV_VAR))
 }
 
 #[must_use]
@@ -2266,11 +2405,12 @@ pub fn is_refusal_stop_reason(stop_reason: Option<&str>) -> bool {
     })
 }
 
-/// Whether `text` is a note the runtime wrote to close an interrupted or failed
-/// turn, not model output.
+/// Whether `text` is a note the runtime wrote to close an interrupted, stopped or
+/// failed turn, not model output.
 #[must_use]
 pub fn is_turn_end_note(text: &str) -> bool {
     text == INTERRUPTED_RESPONSE_NOTE
+        || text == BUDGET_STOPPED_NOTE
         || (text.starts_with(FAILED_RESPONSE_NOTE_PREFIX) && text.ends_with(']'))
 }
 
@@ -2875,9 +3015,10 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
-        AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        auto_compaction_threshold_env, build_assistant_message, parse_auto_compaction_threshold,
+        ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime,
+        PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolExecutor,
+        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -3778,6 +3919,38 @@ mod tests {
     }
 
     #[test]
+    fn auto_compaction_threshold_reads_the_neuron_name_then_the_old_one() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                vars.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_string())
+            }
+        };
+        assert_eq!(
+            auto_compaction_threshold_env(env(&[("NEURON_AUTO_COMPACT_INPUT_TOKENS", "4000")])),
+            Some("4000".to_string())
+        );
+        // The inherited name still works on its own...
+        assert_eq!(
+            auto_compaction_threshold_env(env(&[(
+                "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS",
+                "5000"
+            )])),
+            Some("5000".to_string())
+        );
+        // ...and the new one wins over it.
+        assert_eq!(
+            auto_compaction_threshold_env(env(&[
+                ("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS", "5000"),
+                ("NEURON_AUTO_COMPACT_INPUT_TOKENS", "4000"),
+            ])),
+            Some("4000".to_string())
+        );
+        assert_eq!(auto_compaction_threshold_env(env(&[])), None);
+    }
+
+    #[test]
     fn compacted_session_runs_without_a_health_probe_tool_call() {
         struct SimpleApi;
         impl ApiClient for SimpleApi {
@@ -3977,10 +4150,10 @@ mod tests {
 mod resilience_tests {
     use super::{
         is_turn_end_note, parse_max_iterations, ApiClient, ApiRequest, AssistantEvent,
-        AutoCompactionEvent, ConversationRuntime, RuntimeError, RuntimeErrorKind,
-        StaticToolExecutor, ToolExecutor, TurnOutcome, DEFAULT_MAX_ITERATIONS,
-        FAILED_RESPONSE_NOTE_PREFIX, INTERRUPTED_RESPONSE_NOTE, INTERRUPTED_TOOL_RESULT,
-        MAX_ITERATIONS_ENV_VAR, REFUSAL_STOP_REASON,
+        AutoCompactionEvent, ConversationRuntime, RequestEstimate, RequestGuard, RuntimeError,
+        RuntimeErrorKind, StaticToolExecutor, ToolExecutor, TurnOutcome, BUDGET_STOPPED_NOTE,
+        DEFAULT_MAX_ITERATIONS, FAILED_RESPONSE_NOTE_PREFIX, INTERRUPTED_RESPONSE_NOTE,
+        INTERRUPTED_TOOL_RESULT, MAX_ITERATIONS_ENV_VAR, REFUSAL_STOP_REASON,
     };
     use crate::cancel::CancellationToken;
     use crate::compact::AUTO_CONTINUE_PREFIX;
@@ -4025,6 +4198,98 @@ mod resilience_tests {
             assert!(!self.responses.is_empty(), "unexpected extra model call");
             self.responses.remove(0)
         }
+    }
+
+    #[test]
+    fn every_mcp_call_is_audited_refused_ones_too_without_its_arguments() {
+        let root = std::env::temp_dir().join(format!(
+            "neuron-conversation-audit-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let home = root.join("home");
+        std::fs::create_dir_all(root.join("repo")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("settings.json"),
+            r#"{"defaultMcpServers":false,"mcpServers":{"alpha":{"command":"alpha-mcp"}},"permissions":{"deny":["mcp__alpha__delete"]}}"#,
+        )
+        .unwrap();
+        let config = crate::ConfigLoader::new(root.join("repo"), &home)
+            .load()
+            .unwrap();
+        let sentinel = "SENTINEL-conversation-audit-91c3";
+        let input = format!(r#"{{"text":"{sentinel}"}}"#);
+        let wrapped = format!(
+            r#"{{"qualifiedName":"mcp__alpha__delete","arguments":{{"id":"{sentinel}"}}}}"#
+        );
+        let api = ScriptedApi::new(vec![
+            Ok(vec![
+                tool_call("a", "mcp__alpha__echo", &input),
+                tool_call("b", "mcp__alpha__delete", &input),
+                tool_call("c", "MCPTool", &wrapped),
+                tool_call("d", "read_file", &input),
+                AssistantEvent::MessageStop,
+            ]),
+            Ok(vec![text("done"), AssistantEvent::MessageStop]),
+        ]);
+        let tools = StaticToolExecutor::new()
+            .register("mcp__alpha__echo", |_| Ok(format!("echo {}", "x")))
+            .register("mcp__alpha__delete", |_| {
+                panic!("a denied call must not run")
+            })
+            .register("MCPTool", |_| panic!("a denied call must not run"))
+            .register("read_file", |_| Ok("file".to_string()));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            api,
+            tools,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess)
+                .with_permission_rules(config.permission_rules()),
+            vec!["system".to_string()],
+        )
+        .with_mcp_audit(crate::McpAuditLog::new(&home, "s-audit", config.mcp()));
+
+        runtime.run_turn("go", None).expect("turn runs");
+
+        let audit = home.join("audit");
+        let text = std::fs::read_dir(&audit)
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<String>();
+        assert!(!text.contains(sentinel), "{text}");
+        let lines = text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        // The three MCP calls, the refused ones included; not the built-in tool.
+        assert_eq!(lines.len(), 3, "{text}");
+        let summary = lines
+            .iter()
+            .map(|line| {
+                (
+                    line["tool"].as_str().unwrap().to_string(),
+                    line["decision"].as_str().unwrap().to_string(),
+                    line["decided_by"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            [
+                ("echo".to_string(), "allow".to_string(), "mode".to_string()),
+                ("delete".to_string(), "deny".to_string(), "rule".to_string()),
+                ("delete".to_string(), "deny".to_string(), "rule".to_string()),
+            ]
+        );
+        assert!(lines.iter().all(|line| line["session"] == "s-audit"));
+        assert!(lines.iter().all(|line| line["server"] == "alpha"));
+        assert!(lines[0]["error_class"].is_null());
+        assert_eq!(lines[1]["error_class"], "denied");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn tool_call(id: &str, name: &str, input: &str) -> AssistantEvent {
@@ -4231,6 +4496,212 @@ mod resilience_tests {
                 ("3".to_string(), "stops".to_string())
             ]
         );
+    }
+
+    /// A hosted connector is told only of calls the user approved in the prompt: the
+    /// executor hears who allowed each call that runs, and nothing for a denied one.
+    #[test]
+    fn the_executor_hears_who_allowed_each_call() {
+        type Decided = Rc<RefCell<Vec<(String, crate::permissions::PermissionDecider)>>>;
+        struct Recording {
+            inner: StaticToolExecutor,
+            decided: Decided,
+        }
+        impl ToolExecutor for Recording {
+            fn execute(
+                &mut self,
+                tool_name: &str,
+                input: &str,
+            ) -> Result<String, super::ToolError> {
+                self.inner.execute(tool_name, input)
+            }
+            fn tool_permission_decided(
+                &mut self,
+                tool_name: &str,
+                decided_by: crate::permissions::PermissionDecider,
+            ) {
+                self.decided
+                    .borrow_mut()
+                    .push((tool_name.to_string(), decided_by));
+            }
+        }
+        struct AllowAsked;
+        impl PermissionPrompter for AllowAsked {
+            fn decide(&mut self, request: &PermissionRequest) -> PermissionPromptDecision {
+                if request.tool_name == "refused" {
+                    PermissionPromptDecision::Deny {
+                        reason: "no".to_string(),
+                    }
+                } else {
+                    PermissionPromptDecision::Allow
+                }
+            }
+        }
+
+        let api = ScriptedApi::new(vec![
+            Ok(vec![
+                tool_call("1", "read", "{}"),
+                tool_call("2", "delete", "{}"),
+                tool_call("3", "refused", "{}"),
+                AssistantEvent::MessageStop,
+            ]),
+            Ok(vec![text("done"), AssistantEvent::MessageStop]),
+        ]);
+        let decided = Decided::default();
+        let tools = Recording {
+            inner: StaticToolExecutor::new()
+                .register("read", |_| Ok("read".to_string()))
+                .register("delete", |_| Ok("deleted".to_string()))
+                .register("refused", |_| panic!("a denied call must not run")),
+            decided: Rc::clone(&decided),
+        };
+        let policy = PermissionPolicy::new(PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("read", PermissionMode::ReadOnly)
+            .with_tool_requirement("delete", PermissionMode::DangerFullAccess)
+            .with_tool_requirement("refused", PermissionMode::DangerFullAccess);
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            api,
+            tools,
+            policy,
+            vec!["system".to_string()],
+        );
+
+        runtime
+            .run_turn("go", Some(&mut AllowAsked))
+            .expect("turn runs");
+
+        assert_eq!(
+            *decided.borrow(),
+            vec![
+                (
+                    "read".to_string(),
+                    crate::permissions::PermissionDecider::Mode
+                ),
+                (
+                    "delete".to_string(),
+                    crate::permissions::PermissionDecider::User
+                ),
+            ]
+        );
+    }
+
+    /// A hosted connector's destructive tool runs only on the user's approval of that
+    /// call, which is what the gateway is told: full access, an allow rule and an
+    /// "allow for this session" answer all still ask, and with nobody to ask the call is
+    /// refused.
+    #[test]
+    fn a_confirmed_tool_asks_for_every_call_whatever_would_allow_it() {
+        type Decided = Rc<RefCell<Vec<crate::permissions::PermissionDecider>>>;
+        struct Recording {
+            inner: StaticToolExecutor,
+            decided: Decided,
+        }
+        impl ToolExecutor for Recording {
+            fn execute(
+                &mut self,
+                tool_name: &str,
+                input: &str,
+            ) -> Result<String, super::ToolError> {
+                self.inner.execute(tool_name, input)
+            }
+            fn tool_permission_decided(
+                &mut self,
+                _tool_name: &str,
+                decided_by: crate::permissions::PermissionDecider,
+            ) {
+                self.decided.borrow_mut().push(decided_by);
+            }
+        }
+        /// Allows every call for the session; counts the questions.
+        struct AllowForSession(usize);
+        impl PermissionPrompter for AllowForSession {
+            fn decide(&mut self, _request: &PermissionRequest) -> PermissionPromptDecision {
+                self.0 += 1;
+                PermissionPromptDecision::AllowForSession
+            }
+        }
+
+        const TOOL: &str = "mcp__github__delete_repository";
+        let run = |policy: PermissionPolicy, prompter: Option<&mut AllowForSession>| {
+            let api = ScriptedApi::new(vec![
+                Ok(vec![
+                    tool_call("1", TOOL, "{}"),
+                    tool_call("2", TOOL, "{}"),
+                    AssistantEvent::MessageStop,
+                ]),
+                Ok(vec![text("done"), AssistantEvent::MessageStop]),
+            ]);
+            let decided = Decided::default();
+            let ran = Rc::new(RefCell::new(0));
+            let counter = Rc::clone(&ran);
+            let tools = Recording {
+                inner: StaticToolExecutor::new().register(TOOL, move |_| {
+                    *counter.borrow_mut() += 1;
+                    Ok("deleted".to_string())
+                }),
+                decided: Rc::clone(&decided),
+            };
+            let policy = policy
+                .with_tool_requirement(TOOL, PermissionMode::DangerFullAccess)
+                .with_confirmed_tools([TOOL.to_string()])
+                .with_session_approvals(crate::permissions::SessionApprovals::isolated());
+            let mut runtime = ConversationRuntime::new(
+                Session::new(),
+                api,
+                tools,
+                policy,
+                vec!["system".to_string()],
+            );
+            let prompter = prompter.map(|prompter| prompter as &mut dyn PermissionPrompter);
+            runtime.run_turn("go", prompter).expect("turn runs");
+            (decided.take(), ran.take())
+        };
+        let user = crate::permissions::PermissionDecider::User;
+
+        // Full access would run it unasked.
+        let mut prompter = AllowForSession(0);
+        let (decided, ran) = run(
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            Some(&mut prompter),
+        );
+        assert_eq!((prompter.0, ran), (2, 2), "asked for each call");
+        assert_eq!(decided, vec![user, user]);
+
+        // So would an allow rule.
+        let mut prompter = AllowForSession(0);
+        let rules = crate::config::RuntimePermissionRuleConfig::new(
+            vec![TOOL.to_string()],
+            Vec::new(),
+            Vec::new(),
+        );
+        let (decided, ran) = run(
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite).with_permission_rules(&rules),
+            Some(&mut prompter),
+        );
+        assert_eq!((prompter.0, ran), (2, 2));
+        assert_eq!(decided, vec![user, user]);
+
+        // Nobody to ask: refused, even in full access.
+        let (decided, ran) = run(
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            None,
+        );
+        assert_eq!(ran, 0);
+        assert!(decided.is_empty());
+
+        // A deny rule still refuses without asking.
+        let mut prompter = AllowForSession(0);
+        let rules = crate::config::RuntimePermissionRuleConfig::new(
+            Vec::new(),
+            vec![TOOL.to_string()],
+            Vec::new(),
+        );
+        let (_, ran) = run(
+            PermissionPolicy::new(PermissionMode::DangerFullAccess).with_permission_rules(&rules),
+            Some(&mut prompter),
+        );
+        assert_eq!((prompter.0, ran), (0, 0));
     }
 
     #[test]
@@ -5509,6 +5980,137 @@ mod resilience_tests {
         assert!(output.chars().count() <= 40_000);
         assert!(output.starts_with("start") && output.ends_with("end"));
         assert!(output.contains("chars omitted"));
+    }
+
+    /// A [`RequestGuard`] for tests: a fixed working set, and the requests it saw;
+    /// it stops the request of step `stop_at`.
+    struct TestGuard {
+        working_set: Option<usize>,
+        stop_at: Option<usize>,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<RequestEstimate>>>,
+    }
+
+    impl RequestGuard for TestGuard {
+        fn working_set_tokens(&self) -> Option<usize> {
+            self.working_set
+        }
+
+        fn allow_request(&mut self, request: &RequestEstimate) -> bool {
+            self.seen.lock().expect("seen").push(*request);
+            self.stop_at != Some(request.iteration)
+        }
+    }
+
+    fn read_twice_then_answer() -> ScriptedApi {
+        ScriptedApi::new(vec![
+            Ok(vec![
+                tool_call("a", "read_file", r#"{"path":"a"}"#),
+                AssistantEvent::MessageStop,
+            ]),
+            Ok(vec![
+                tool_call("b", "read_file", r#"{"path":"b"}"#),
+                AssistantEvent::MessageStop,
+            ]),
+            Ok(vec![text("done"), AssistantEvent::MessageStop]),
+        ])
+    }
+
+    #[test]
+    fn a_guard_working_set_stubs_older_tool_results_early() {
+        let tools = StaticToolExecutor::new().register("read_file", |_| Ok("z".repeat(3_000)));
+        let manager = ContextManager::new(
+            ContextBudget::default(),
+            ContextPolicy {
+                keep_recent_tool_results: 1,
+                ..ContextPolicy::default()
+            },
+        );
+        let seen = std::sync::Arc::default();
+        let mut runtime = runtime_with(Session::new(), read_twice_then_answer(), tools)
+            .with_context_manager(manager)
+            .with_request_guard(Box::new(TestGuard {
+                working_set: Some(2_000),
+                stop_at: None,
+                seen: std::sync::Arc::clone(&seen),
+            }));
+
+        let summary = runtime.run_turn("read both", None).expect("turn completes");
+
+        assert_eq!(summary.outcome, TurnOutcome::Completed);
+        assert_eq!(summary.pruned_tool_results, 1);
+        assert_eq!(summary.auto_compaction, None::<AutoCompactionEvent>);
+        let outputs = runtime.api_client().requests[2]
+            .messages
+            .iter()
+            .flat_map(|message| message.blocks.iter())
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { output, .. } => Some(output.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            outputs[0]
+                .starts_with("[Earlier output of read_file removed to save tokens (3000 chars)"),
+            "{}",
+            outputs[0]
+        );
+        assert_eq!(
+            outputs[1].len(),
+            3_000,
+            "the most recent result stays whole"
+        );
+        // Without the working set the model budget (100K+) would leave both alone.
+        assert_eq!(
+            runtime.context_manager().policy().working_set_tokens,
+            Some(2_000)
+        );
+        assert!(runtime.context_snapshot().input_budget <= 2_000);
+        let seen = seen.lock().expect("seen");
+        assert_eq!(
+            seen.iter()
+                .map(|request| request.iteration)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert!(seen[1].input_tokens > seen[0].input_tokens);
+    }
+
+    #[test]
+    fn a_guard_that_stops_a_request_ends_the_turn_before_it_is_sent() {
+        let tools = StaticToolExecutor::new().register("read_file", |_| Ok("z".repeat(3_000)));
+        let seen = std::sync::Arc::default();
+        let mut runtime = runtime_with(Session::new(), read_twice_then_answer(), tools)
+            .with_request_guard(Box::new(TestGuard {
+                working_set: None,
+                stop_at: Some(2),
+                seen: std::sync::Arc::clone(&seen),
+            }));
+
+        let summary = runtime
+            .run_turn("read both", None)
+            .expect("a stop is no error");
+
+        let TurnOutcome::BudgetStopped { estimated_tokens } = summary.outcome else {
+            panic!("stopped by the guard, got {:?}", summary.outcome);
+        };
+        assert_eq!(estimated_tokens, seen.lock().expect("seen")[1].input_tokens);
+        assert!(estimated_tokens > 1_000, "the read result counts");
+        assert_eq!(
+            runtime.api_client().requests.len(),
+            1,
+            "nothing more was sent"
+        );
+        let last = runtime.session().messages.last().expect("a message");
+        assert_eq!(last.role, MessageRole::Assistant);
+        assert!(matches!(
+            &last.blocks[..],
+            [ContentBlock::Text { text }] if text == BUDGET_STOPPED_NOTE
+        ));
+        assert!(is_turn_end_note(BUDGET_STOPPED_NOTE));
+        assert_eq!(
+            runtime.request_tokens_estimate(),
+            runtime.context_snapshot().request_input_tokens()
+        );
     }
 
     #[test]

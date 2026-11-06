@@ -11,7 +11,6 @@
 
 import {spawn} from 'node:child_process';
 import {existsSync, statSync} from 'node:fs';
-import {createRequire} from 'node:module';
 import path from 'node:path';
 import {LauncherError, ensureBinary} from '../lib/binary.js';
 import {wantsFullScreenUi} from '../lib/full-screen.js';
@@ -50,20 +49,10 @@ async function resolveUi(argv) {
 }
 
 function childEnvironment() {
-  const require = createRequire(import.meta.url);
-  const env = {...process.env, NEURON_MCP_NODE: process.execPath};
-  // Default MCP integrations installed with this package; skip any that failed to install.
-  try {
-    env.NEURON_CODEBASE_MCP_ENTRY = require.resolve('codebase-memory-mcp/bin.js');
-  } catch {
-    // not installed
-  }
-  try {
-    env.NEURON_PLAYWRIGHT_MCP_ENTRY = path.join(path.dirname(require.resolve('@playwright/mcp/package.json')), 'cli.js');
-  } catch {
-    // not installed
-  }
-  return env;
+  // The default MCP servers are not npm dependencies of this package: Neuron installs
+  // each from the downloads its catalog pins and checks every hash (npm would honour no
+  // lockfile of a published package). Playwright runs with this Node.js.
+  return {...process.env, NEURON_MCP_NODE: process.execPath};
 }
 
 async function main() {

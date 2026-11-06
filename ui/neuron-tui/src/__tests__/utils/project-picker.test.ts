@@ -37,6 +37,16 @@ describe('cli/utils/project-picker', () => {
     expect(shouldShowProjectPicker(siblingDir, homeDir)).toBe(false)
   })
 
+  test('a resumed session starts in its own folder, without the picker', () => {
+    // `neuron --resume X` from home: the picker restarted the engine in the
+    // chosen folder without the session, which was then silently not continued.
+    const root = path.parse(process.cwd()).root
+    const homeDir = path.join(root, 'home', 'test-user')
+    expect(shouldShowProjectPicker(homeDir, homeDir, true)).toBe(false)
+    expect(shouldShowProjectPicker(root, homeDir, true)).toBe(false)
+    expect(shouldShowProjectPicker(homeDir, homeDir, false)).toBe(true)
+  })
+
   test('the git-root banner never offers the home folder or a folder above it', () => {
     // A home folder that is itself a git repo (dotfiles) made the banner offer
     // it, and the engine then refused it as too broad.

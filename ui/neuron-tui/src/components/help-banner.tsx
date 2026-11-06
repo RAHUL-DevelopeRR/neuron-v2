@@ -1,7 +1,8 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: Neuron's
 // shortcuts and commands; the new-line key is "Alt+Enter" outside macOS
-// ("Opt+Enter" there), and /bash is not listed while shell commands are not
-// implemented (USER_SHELL_AVAILABLE). See ui/neuron-tui/PORTING.md.
+// ("Opt+Enter" there), /bash is not listed while shell commands are not
+// implemented (USER_SHELL_AVAILABLE), and the status bar's keys have a group.
+// See ui/neuron-tui/PORTING.md.
 import React from 'react'
 import { TextAttributes } from '@opentui/core'
 
@@ -19,6 +20,8 @@ export function helpSections(
   platform: NodeJS.Platform = process.platform,
   shellAvailable: boolean = USER_SHELL_AVAILABLE,
 ): HelpSection[] {
+  // Option is a Mac key; Windows and Linux keyboards say Alt.
+  const alt = platform === 'darwin' ? 'Opt' : 'Alt'
   return [
     {
       title: 'Compose',
@@ -53,6 +56,18 @@ export function helpSections(
         ['/copy', 'Copy chat'],
         ['/export', 'Export chat'],
         ['Drag', 'Select and copy text'],
+      ],
+    },
+    {
+      // The status bar under the input; a click on a part opens the same picker.
+      title: 'Status bar',
+      rows: [
+        ['Shift+Tab', 'Cycle permission mode'],
+        [`${alt}+M`, 'Model (Tab: thinking)'],
+        [`${alt}+T`, 'Thinking level'],
+        [`${alt}+W`, 'Workspace'],
+        [`${alt}+P`, 'Permissions'],
+        [`${alt}+C`, 'Context and usage'],
       ],
     },
   ]

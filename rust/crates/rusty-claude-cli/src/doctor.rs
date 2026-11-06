@@ -263,23 +263,32 @@ pub(crate) fn run_worker_state(
 }
 
 /// the same surface the in-process agent loop uses.
-pub(crate) fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
-    let tools = mvp_tool_specs()
-        .into_iter()
-        .map(|spec| McpTool {
-            name: spec.name.to_string(),
-            description: Some(spec.description.to_string()),
-            input_schema: Some(spec.input_schema),
-            annotations: None,
-            meta: None,
-        })
-        .collect();
+///
+/// Every call passes the user's permission rules and `permission_mode` (read-only
+/// unless `--permission-mode` says otherwise). Nobody can answer a prompt over MCP, so
+/// a call that would ask is refused with the reason. An untrusted folder is refused
+/// outright: its settings could not apply, and its files are the tools' reach.
+pub(crate) fn run_mcp_serve(
+    permission_mode: Option<PermissionMode>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    if !loader.workspace_is_trusted() {
+        return Err(mcp_serve_untrusted_message(&cwd).into());
+    }
+    let config = loader.load()?;
+    let policy = mcp_serve_policy(
+        permission_mode.unwrap_or(PermissionMode::ReadOnly),
+        &config,
+        &cwd,
+    );
+    let tools = mvp_tool_specs().iter().map(mcp_serve_tool).collect();
 
     let spec = McpServerSpec {
         server_name: "neuron".to_string(),
         server_version: VERSION.to_string(),
         tools,
-        tool_handler: Box::new(execute_tool),
+        tool_handler: Box::new(move |name, input| mcp_serve_call(&policy, name, input)),
     };
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -290,6 +299,73 @@ pub(crate) fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
         server.run().await
     })?;
     Ok(())
+}
+
+fn mcp_serve_untrusted_message(cwd: &Path) -> String {
+    format!(
+        "neuron mcp serve: {} is not trusted, so its tools are not served. Run neuron here and trust the folder, or add it to `trustedRoots` in your user settings.",
+        cwd.display()
+    )
+}
+
+/// The policy `neuron mcp serve` checks every call against: the built-in tools'
+/// requirements, the user's permission rules and `mode`, in `cwd`.
+fn mcp_serve_policy(
+    mode: PermissionMode,
+    config: &runtime::RuntimeConfig,
+    cwd: &Path,
+) -> PermissionPolicy {
+    mvp_tool_specs().into_iter().fold(
+        PermissionPolicy::new(mode)
+            .with_permission_rules(config.permission_rules())
+            .with_workspace_root(cwd)
+            .with_session_approvals(runtime::SessionApprovals::isolated()),
+        |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
+    )
+}
+
+/// Runs a served call if `policy` lets it run with nobody asked; otherwise the refusal
+/// is the call's error.
+fn mcp_serve_call(policy: &PermissionPolicy, name: &str, input: &Value) -> Result<String, String> {
+    match policy.authorize(name, &input.to_string(), None) {
+        runtime::PermissionOutcome::Allow => execute_tool(name, input),
+        runtime::PermissionOutcome::Deny { reason } => Err(reason),
+    }
+}
+
+/// A built-in tool as `neuron mcp serve` lists it, with annotations a client can
+/// plan by. The shells' static requirement is read-only (each command is classified
+/// when it runs), so they are listed as what they can do: write, delete, reach out.
+fn mcp_serve_tool(spec: &tools::ToolSpec) -> McpTool {
+    let shell = matches!(spec.name, "bash" | "PowerShell" | "REPL");
+    let read_only = !shell && spec.required_permission == PermissionMode::ReadOnly;
+    let destructive = !read_only
+        && (shell
+            || spec.required_permission == PermissionMode::DangerFullAccess
+            || matches!(spec.name, "write_file" | "edit_file" | "NotebookEdit"));
+    let open_world = shell
+        || matches!(
+            spec.name,
+            "WebFetch"
+                | "WebSearch"
+                | "Agent"
+                | "RemoteTrigger"
+                | "McpAuth"
+                | "MCP"
+                | "ListMcpResources"
+                | "ReadMcpResource"
+        );
+    McpTool {
+        name: spec.name.to_string(),
+        description: Some(spec.description.to_string()),
+        input_schema: Some(spec.input_schema.clone()),
+        annotations: Some(json!({
+            "readOnlyHint": read_only,
+            "destructiveHint": destructive,
+            "openWorldHint": open_world,
+        })),
+        meta: None,
+    }
 }
 
 /// Source repository and install channels shown by `neuron doctor`.

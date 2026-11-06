@@ -18,8 +18,12 @@ import {
   permissionReplyMessage,
   type AccountDetails,
   type AccountInfo,
+  type BranchInfo,
+  type ContextBreakdown,
   type ChangedFile,
   type CheckpointInfo,
+  type ConnectorInfo,
+  type ConnectorVariable,
   type DefinitionInfo,
   type DiffFile,
   type ErrorDetail,
@@ -41,6 +45,7 @@ import {
   type UiEvent,
   type UiEventType,
   type UsageAmounts,
+  type UsageWindow,
 } from '../protocol'
 
 const rustCrate = path.resolve(
@@ -145,6 +150,7 @@ const STRUCT_FIELDS: Record<string, string[]> = {
     'reason',
     'input',
     'session_prefixes',
+    'project_rules',
   ]),
   GitStatus: fieldsOf<GitStatus>()([
     'branch',
@@ -164,6 +170,9 @@ const STRUCT_FIELDS: Record<string, string[]> = {
     'status',
     'available_again_at',
     'supports_images',
+    'provider',
+    'reasoning_efforts',
+    'supports_reasoning',
   ]),
   AccountInfo: fieldsOf<AccountInfo>()(['email', 'plan', 'source', 'expires_at']),
   McpServerInfo: fieldsOf<McpServerInfo>()([
@@ -174,6 +183,34 @@ const STRUCT_FIELDS: Record<string, string[]> = {
     'tools',
     'error',
     'enabled',
+    'catalog',
+    'required',
+    'unpinned',
+    'connect_url',
+    'tool_tiers',
+  ]),
+  ConnectorVariable: fieldsOf<ConnectorVariable>()([
+    'name',
+    'label',
+    'secret',
+    'required',
+    'default',
+    'help_url',
+  ]),
+  ConnectorInfo: fieldsOf<ConnectorInfo>()([
+    'id',
+    'name',
+    'description',
+    'publisher',
+    'official',
+    'licence',
+    'source',
+    'transport',
+    'pinned',
+    'oauth',
+    'default_scope',
+    'variables',
+    'added',
   ]),
   PluginInfo: fieldsOf<PluginInfo>()([
     'id',
@@ -222,6 +259,34 @@ const STRUCT_FIELDS: Record<string, string[]> = {
     'pricing_url',
     'usage_updated_at',
     'usage_error',
+    'usage_window',
+  ]),
+  UsageWindow: fieldsOf<UsageWindow>()([
+    'tokens',
+    'limit_tokens',
+    'remaining_tokens',
+    'resets_at',
+    'window_seconds',
+  ]),
+  ContextBreakdown: fieldsOf<ContextBreakdown>()([
+    'context_window',
+    'output_reserve',
+    'system_tokens',
+    'tool_schema_tokens',
+    'tool_count',
+    'instruction_tokens',
+    'instruction_files',
+    'conversation_tokens',
+    'tool_output_tokens',
+    'used_tokens',
+    'threshold_tokens',
+  ]),
+  BranchInfo: fieldsOf<BranchInfo>()([
+    'name',
+    'upstream',
+    'ahead',
+    'behind',
+    'last_commit_ms',
   ]),
   ErrorDetail: fieldsOf<ErrorDetail>()([
     'code',
@@ -236,6 +301,8 @@ const STRUCT_FIELDS: Record<string, string[]> = {
     'transport',
     'target',
     'source',
+    'command',
+    'fingerprint',
   ]),
   PermissionRulePreview: fieldsOf<PermissionRulePreview>()([
     'effect',
@@ -294,6 +361,13 @@ const EVENT_FIELDS: { [T in UiEventType]: string[] } = {
     'account',
     'supports_images',
     'served_model',
+    'request_tokens_estimate',
+    'provider',
+    'model_display_name',
+    'reasoning_effort',
+    'reasoning_efforts',
+    'full_access_allowed',
+    'context',
   ]),
   sign_in_code: eventFields('sign_in_code')([
     'url',
@@ -348,8 +422,10 @@ const EVENT_FIELDS: { [T in UiEventType]: string[] } = {
     'skills',
     'agents',
   ]),
+  connector_catalog: eventFields('connector_catalog')(['version', 'connectors']),
   report: eventFields('report')(['command', 'title', 'sections', 'links']),
   account: eventFields('account')(['signed_in', 'account']),
+  branches: eventFields('branches')(['current', 'branches', 'dirty']),
   trust_preview: eventFields('trust_preview')([
     'cwd',
     'root',
@@ -507,6 +583,41 @@ describe('client messages (UI -> engine)', () => {
     )
   })
 
+  test('connector catalog commands are the lines the engine reads', () => {
+    // Copied from the serde test in protocol.rs.
+    expect(
+      encodeClientMessage(
+        commandMessage({
+          type: 'add_mcp_server',
+          id: 'github',
+          scope: 'user',
+          secrets: { GITHUB_PERSONAL_ACCESS_TOKEN: 'ghp_x' },
+        }),
+      ),
+    ).toBe(
+      '{"kind":"command","type":"add_mcp_server","id":"github","scope":"user","secrets":{"GITHUB_PERSONAL_ACCESS_TOKEN":"ghp_x"}}\n',
+    )
+    expect(
+      encodeClientMessage(commandMessage({ type: 'list_connector_catalog' })),
+    ).toBe('{"kind":"command","type":"list_connector_catalog"}\n')
+    expect(
+      encodeClientMessage(
+        commandMessage({ type: 'remove_mcp_server', name: 'github' }),
+      ),
+    ).toBe('{"kind":"command","type":"remove_mcp_server","name":"github"}\n')
+    expect(
+      encodeClientMessage(
+        commandMessage({ type: 'approve_mcp_server', name: 'docs' }),
+      ),
+    ).toBe('{"kind":"command","type":"approve_mcp_server","name":"docs"}\n')
+    // From the trust screen, bound to what its preview showed.
+    expect(
+      encodeClientMessage(
+        commandMessage({ type: 'approve_mcp_server', name: 'docs', fingerprint: 'ab12' }),
+      ),
+    ).toBe('{"kind":"command","type":"approve_mcp_server","name":"docs","fingerprint":"ab12"}\n')
+  })
+
   test('attachments are tagged by kind', () => {
     const line = encodeClientMessage(
       commandMessage({
@@ -542,6 +653,23 @@ describe('client messages (UI -> engine)', () => {
         ),
       ).decision,
     ).toEqual({ kind: 'deny', note: 'use a dry run' })
+    expect(
+      encodeClientMessage(
+        permissionReplyMessage({
+          id: 8,
+          decision: { kind: 'deny', note: null, session: true },
+        }),
+      ),
+    ).toBe(
+      '{"kind":"permission_reply","id":8,"decision":{"kind":"deny","note":null,"session":true}}\n',
+    )
+    expect(
+      encodeClientMessage(
+        permissionReplyMessage({ id: 9, decision: { kind: 'allow_for_project' } }),
+      ),
+    ).toBe(
+      '{"kind":"permission_reply","id":9,"decision":{"kind":"allow_for_project"}}\n',
+    )
   })
 })
 
@@ -636,9 +764,11 @@ describe('UI events (engine -> UI)', () => {
       workspace_trusted: true,
       question: true,
       extensions: true,
+      connector_catalog: true,
       report: true,
       account: true,
       trust_preview: true,
+      branches: true,
     }
     expect([...UI_EVENT_TYPES].sort() as string[]).toEqual(
       Object.keys(all).sort(),

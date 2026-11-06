@@ -11,7 +11,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use neuron_tui::protocol::{ChangedFile, DiffFile};
+use neuron_tui::protocol::{BranchInfo, ChangedFile, DiffFile};
 use runtime::sensitive_paths::sensitive_path_reason;
 
 use crate::line_diff::{diff_lines, is_binary, line_breaks};
@@ -409,6 +409,57 @@ impl Repo {
         file
     }
 
+    /// The local branches, newest commit first, with their upstream and how far they are
+    /// ahead of and behind it.
+    pub(crate) fn branches(&self) -> Result<Vec<BranchInfo>, String> {
+        let output = self.run(&[
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(refname:short)%00%(upstream:short)%00%(upstream:track,nobracket)%00%(committerdate:unix)",
+            "refs/heads",
+        ])?;
+        Ok(String::from_utf8_lossy(&output)
+            .lines()
+            .filter_map(parse_branch_line)
+            .collect())
+    }
+
+    /// The working tree has changes to tracked files (staged, unstaged or conflicted).
+    /// Untracked files do not count: a branch switch carries them, and git refuses one
+    /// that would overwrite them.
+    pub(crate) fn has_tracked_changes(&self) -> Result<bool, String> {
+        Ok(self
+            .status()?
+            .iter()
+            .any(|entry| entry.index != '?' && entry.index != '!'))
+    }
+
+    /// Checks out branch `name`, or (`create`) a new branch `name` from `HEAD`. Refused
+    /// when tracked files have changes, so nothing is carried over or lost by surprise.
+    pub(crate) fn switch_branch(&self, name: &str, create: bool) -> Result<String, String> {
+        let name = name.trim();
+        if name.is_empty() || name.starts_with('-') {
+            return Err(format!("`{name}` is not a branch name."));
+        }
+        self.run(&["check-ref-format", "--branch", name])
+            .map_err(|_| format!("`{name}` is not a valid branch name."))?;
+        if self.branch().as_deref() == Some(name) && !create {
+            return Ok(format!("Already on {name}."));
+        }
+        if self.has_tracked_changes()? {
+            return Err(format!(
+                "Commit or stash your changes before switching to {name}: the working tree has uncommitted changes."
+            ));
+        }
+        if create {
+            self.run(&["switch", "--quiet", "--create", name])?;
+            Ok(format!("Created and switched to {name}."))
+        } else {
+            self.run(&["switch", "--quiet", name])?;
+            Ok(format!("Switched to {name}."))
+        }
+    }
+
     fn command(&self) -> Result<Command, String> {
         let mut command = runtime::workspace_git_command(&self.top).ok_or_else(untrusted)?;
         command
@@ -495,6 +546,47 @@ fn untrusted() -> String {
 
 /// `git <args>` failed: its trimmed output, stdout and stderr together (a hook may
 /// write to either).
+/// One `for-each-ref` line of [`Repo::branches`]: name, upstream, track (`ahead 1,
+/// behind 2`, `gone`, or empty) and commit time, separated by NULs.
+fn parse_branch_line(line: &str) -> Option<BranchInfo> {
+    let mut fields = line.split('\0');
+    let name = fields.next()?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let upstream = fields
+        .next()
+        .map(str::trim)
+        .filter(|upstream| !upstream.is_empty());
+    let track = fields.next().unwrap_or("").trim();
+    let committed = fields
+        .next()
+        .and_then(|time| time.trim().parse::<u64>().ok());
+    let (mut ahead, mut behind) = (None, None);
+    if upstream.is_some() && track != "gone" {
+        ahead = Some(0);
+        behind = Some(0);
+        for part in track.split(',') {
+            let mut words = part.split_whitespace();
+            match (
+                words.next(),
+                words.next().and_then(|count| count.parse().ok()),
+            ) {
+                (Some("ahead"), Some(count)) => ahead = Some(count),
+                (Some("behind"), Some(count)) => behind = Some(count),
+                _ => {}
+            }
+        }
+    }
+    Some(BranchInfo {
+        name: name.to_string(),
+        upstream: upstream.map(str::to_string),
+        ahead,
+        behind,
+        last_commit_ms: committed.map(|seconds| seconds.saturating_mul(1000)),
+    })
+}
+
 fn git_failure(args: &[&str], output: &Output) -> String {
     let mut text = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -978,8 +1070,8 @@ fn plural(count: usize) -> &'static str {
 mod tests {
     use super::{
         cap_diff, clean_draft, draft_request, heuristic_message, nothing_to_commit,
-        parse_name_status, parse_numstat, render_diff_text, DiffScope, Repo, RepoDiff,
-        MAX_DIFF_FILES, MAX_DRAFT_DIFF_BYTES, MAX_PATCH_BYTES,
+        parse_branch_line, parse_name_status, parse_numstat, render_diff_text, DiffScope, Repo,
+        RepoDiff, MAX_DIFF_FILES, MAX_DRAFT_DIFF_BYTES, MAX_PATCH_BYTES,
     };
     use neuron_tui::protocol::{ChangedFile, DiffFile};
     use std::fs;
@@ -1072,6 +1164,64 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn branch_lines_parse_upstream_tracking_and_commit_time() {
+        let line = "feat/x\x00origin/feat/x\x00ahead 2, behind 1\x001700000000";
+        let branch = parse_branch_line(line).expect("a branch");
+        assert_eq!(branch.name, "feat/x");
+        assert_eq!(branch.upstream.as_deref(), Some("origin/feat/x"));
+        assert_eq!((branch.ahead, branch.behind), (Some(2), Some(1)));
+        assert_eq!(branch.last_commit_ms, Some(1_700_000_000_000));
+        let local = parse_branch_line("main\x00\x00\x001700000001").expect("a branch");
+        assert_eq!(
+            (local.upstream, local.ahead, local.behind),
+            (None, None, None)
+        );
+        let gone = parse_branch_line("old\x00origin/old\x00gone\x001").expect("a branch");
+        assert_eq!((gone.ahead, gone.behind), (None, None));
+        let even = parse_branch_line("dev\x00origin/dev\x00\x001").expect("a branch");
+        assert_eq!((even.ahead, even.behind), (Some(0), Some(0)));
+        assert!(parse_branch_line("").is_none());
+    }
+
+    #[test]
+    fn branches_are_listed_and_switching_is_refused_with_tracked_changes() {
+        let temp = TempRepo::new("branches");
+        git(&["branch", "feature"], temp.path());
+        let repo = temp.repo();
+        let names: Vec<String> = repo
+            .branches()
+            .expect("branches")
+            .into_iter()
+            .map(|branch| branch.name)
+            .collect();
+        assert!(names.contains(&"main".to_string()), "{names:?}");
+        assert!(names.contains(&"feature".to_string()), "{names:?}");
+
+        // An untracked file is carried over.
+        temp.write("scratch.txt", "notes\n");
+        assert_eq!(
+            repo.switch_branch("feature", false).unwrap(),
+            "Switched to feature."
+        );
+        assert_eq!(repo.branch().as_deref(), Some("feature"));
+
+        // A tracked change is not.
+        temp.write("tracked.txt", "changed\n");
+        let refused = repo.switch_branch("main", false).unwrap_err();
+        assert!(refused.contains("uncommitted changes"), "{refused}");
+        assert_eq!(repo.branch().as_deref(), Some("feature"));
+
+        git(&["checkout", "--", "tracked.txt"], temp.path());
+        assert_eq!(
+            repo.switch_branch("topic", true).unwrap(),
+            "Created and switched to topic."
+        );
+        assert_eq!(repo.branch().as_deref(), Some("topic"));
+        assert!(repo.switch_branch("-x", false).is_err());
+        assert!(repo.switch_branch("bad..name", false).is_err());
     }
 
     #[test]

@@ -1,7 +1,8 @@
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -674,6 +675,54 @@ fn resumed_skills_install_installs_once() {
     }
 }
 
+/// `/mcp add` and `/mcp remove` under `--resume` run once for the text and the JSON:
+/// the JSON used to come from a second run, so `add` reported "already" added and
+/// `remove` failed on the server the first run had removed.
+#[test]
+fn resumed_mcp_add_and_remove_run_once() {
+    let temp_dir = unique_temp_dir("resume-mcp-once");
+    let config_home = temp_dir.join("config-home");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    let session_path = temp_dir.join("session.jsonl");
+    workspace_session(&temp_dir)
+        .save_to_path(&session_path)
+        .expect("persist ok");
+    let session_arg = session_path.to_str().expect("utf8 path");
+    let envs = [(
+        "NEURON_CONFIG_HOME",
+        config_home.to_str().expect("utf8 path"),
+    )];
+    let run_json = |command: &str| -> Value {
+        let output = run_claw_with_env(
+            &temp_dir,
+            &["--output-format", "json", "--resume", session_arg, command],
+            &envs,
+        );
+        assert!(
+            output.status.success(),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_str(String::from_utf8(output.stdout).expect("utf8").trim())
+            .expect("should be json")
+    };
+
+    let added = run_json("/mcp add fetch --scope user");
+    assert_eq!(added["action"], "add", "{added}");
+    assert_eq!(added["ok"], true, "{added}");
+    assert_eq!(added["already"], false, "{added}");
+    let settings = fs::read_to_string(config_home.join("settings.json")).expect("settings");
+    assert!(settings.contains("mcp-server-fetch"), "{settings}");
+
+    let removed = run_json("/mcp remove fetch");
+    assert_eq!(removed["action"], "remove", "{removed}");
+    assert_eq!(removed["ok"], true, "{removed}");
+    assert_eq!(removed["server"], "fetch", "{removed}");
+    let settings = fs::read_to_string(config_home.join("settings.json")).expect("settings");
+    assert!(!settings.contains("mcp-server-fetch"), "{settings}");
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
 #[test]
 fn resume_tolerates_a_session_file_with_a_truncated_record() {
     let temp_dir = unique_temp_dir("resume-truncated-record");
@@ -746,8 +795,112 @@ fn resumed_stub_command_emits_not_implemented_json() {
     );
 }
 
+/// `echo /status | neuron --resume SESSION -p`: the piped slash command runs as
+/// `--resume SESSION /status` does instead of reaching the model as a prompt.
+#[test]
+fn piped_slash_commands_under_resume_p_run_as_resume_commands() {
+    // given a saved session, and a model endpoint nothing listens on
+    let temp_dir = unique_temp_dir("resume-piped-status");
+    fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+    let session_path = temp_dir.join("session.jsonl");
+    let mut session = workspace_session(&temp_dir);
+    session
+        .push_user_text("piped status fixture")
+        .expect("session write should succeed");
+    session
+        .save_to_path(&session_path)
+        .expect("session should persist");
+    let session_arg = session_path.to_str().expect("utf8 path");
+    let unreachable = [
+        ("ANTHROPIC_API_KEY", "test-key"),
+        ("ANTHROPIC_BASE_URL", "http://127.0.0.1:9"),
+    ];
+
+    // when /status is piped
+    let output = run_claw_with_stdin(
+        &temp_dir,
+        &["--output-format", "json", "--resume", session_arg, "-p"],
+        &unreachable,
+        "\u{feff}/status\n",
+    );
+
+    // then it reports the session, as `--resume SESSION /status` does
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    let parsed: Value = serde_json::from_str(stdout.trim()).expect("status JSON");
+    assert_eq!(parsed["kind"], "status");
+    assert_eq!(parsed["usage"]["messages"], 1);
+
+    // and a prompt after the commands is refused, not sent
+    let mixed = run_claw_with_stdin(
+        &temp_dir,
+        &["--resume", session_arg, "-p"],
+        &unreachable,
+        "/status\nnow add tests\n",
+    );
+    assert!(!mixed.status.success());
+    let stderr = String::from_utf8_lossy(&mixed.stderr);
+    assert!(stderr.contains("`now add tests` is not one"), "{stderr}");
+    let saved = Session::load_from_path(&session_path).expect("session should load");
+    assert_eq!(saved.messages.len(), 1);
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+/// `echo /status | neuron -p` (no session): refused as piped slash commands are for a
+/// bare `neuron`, before anything reaches the model.
+#[test]
+fn piped_slash_commands_under_p_are_refused() {
+    let temp_dir = unique_temp_dir("piped-status");
+    fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+
+    let output = run_claw_with_stdin(
+        &temp_dir,
+        &["--model", "sonnet", "-p"],
+        &[
+            ("ANTHROPIC_API_KEY", "test-key"),
+            ("ANTHROPIC_BASE_URL", "http://127.0.0.1:9"),
+        ],
+        "/status\n",
+    );
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("slash commands can't be piped"), "{stderr}");
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
 fn run_claw(current_dir: &Path, args: &[&str]) -> Output {
     run_claw_with_env(current_dir, args, &[])
+}
+
+/// [`run_claw_with_env`] with `stdin` piped to the run.
+fn run_claw_with_stdin(
+    current_dir: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    stdin: &str,
+) -> Output {
+    let (mut command, home) = isolated_claw(current_dir, args, envs);
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("claw should launch");
+    child
+        .stdin
+        .take()
+        .expect("stdin is piped")
+        .write_all(stdin.as_bytes())
+        .expect("stdin written");
+    let output = child.wait_with_output().expect("claw should finish");
+    let _ = fs::remove_dir_all(&home);
+    output
 }
 
 fn workspace_session(root: &Path) -> Session {
@@ -759,6 +912,14 @@ fn workspace_session(root: &Path) -> Session {
 /// model overrides on the developer's machine cannot leak into assertions.
 /// Explicit `envs` override the isolated defaults.
 fn run_claw_with_env(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
+    let (mut command, home) = isolated_claw(current_dir, args, envs);
+    let output = command.output().expect("claw should launch");
+    let _ = fs::remove_dir_all(&home);
+    output
+}
+
+/// The command [`run_claw_with_env`] runs, and the isolated home to remove after it.
+fn isolated_claw(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> (Command, PathBuf) {
     let home = unique_temp_dir("isolated-home");
     let config_home = home.join(".neuron");
     fs::create_dir_all(&config_home).expect("isolated config home should exist");
@@ -785,9 +946,7 @@ fn run_claw_with_env(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -
     for (key, value) in envs {
         command.env(key, value);
     }
-    let output = command.output().expect("claw should launch");
-    let _ = fs::remove_dir_all(&home);
-    output
+    (command, home)
 }
 
 fn unique_temp_dir(label: &str) -> PathBuf {

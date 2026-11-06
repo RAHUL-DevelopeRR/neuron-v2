@@ -66,7 +66,7 @@ pub struct UpstreamProxyState {
 impl RemoteSessionContext {
     #[must_use]
     pub fn from_env() -> Self {
-        Self::from_env_map(&env::vars().collect())
+        Self::from_env_map(&utf8_env_vars().collect())
     }
 
     #[must_use]
@@ -89,7 +89,7 @@ impl RemoteSessionContext {
 impl UpstreamProxyBootstrap {
     #[must_use]
     pub fn from_env() -> Self {
-        Self::from_env_map(&env::vars().collect())
+        Self::from_env_map(&utf8_env_vars().collect())
     }
 
     #[must_use]
@@ -232,6 +232,18 @@ pub fn inherited_upstream_proxy_env(
                 .map(|value| ((*key).to_string(), value.clone()))
         })
         .collect()
+}
+
+/// The process environment, skipping entries whose name or value is not
+/// valid UTF-8.
+///
+/// `env::vars()` panics on such an entry (zsh, for one, exports a metafied
+/// `$_` when the command path contains non-ASCII characters), which would
+/// crash Neuron at startup. Ported from Claw Code (MIT), upstream commit
+/// c55c7e4.
+pub(crate) fn utf8_env_vars() -> impl Iterator<Item = (String, String)> {
+    env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
 }
 
 fn default_ca_bundle_path() -> PathBuf {
@@ -397,5 +409,33 @@ mod tests {
         );
         assert!(no_proxy_list().contains("anthropic.com"));
         assert!(no_proxy_list().contains("github.com"));
+    }
+
+    /// A non-UTF-8 environment entry must be skipped, not panic. Ported from
+    /// Claw Code (MIT), upstream commit c55c7e4.
+    #[test]
+    fn utf8_env_vars_skips_entries_that_are_not_unicode() {
+        let key = "NEURON_TEST_NON_UTF8_ENV_VALUE";
+        #[cfg(unix)]
+        let value = {
+            use std::os::unix::ffi::OsStringExt;
+            std::ffi::OsString::from_vec(vec![0x66, 0x6f, 0xff, 0x6f])
+        };
+        #[cfg(windows)]
+        let value = {
+            use std::os::windows::ffi::OsStringExt;
+            // An unpaired surrogate is not valid Unicode.
+            std::ffi::OsString::from_wide(&[0x0066, 0xD800, 0x006f])
+        };
+        std::env::set_var(key, &value);
+
+        let vars: BTreeMap<String, String> = super::utf8_env_vars().collect();
+        // Both constructors read the whole environment; neither may panic.
+        let _ = RemoteSessionContext::from_env();
+        let _ = UpstreamProxyBootstrap::from_env();
+        let _ = crate::sandbox::detect_container_environment();
+        std::env::remove_var(key);
+
+        assert!(!vars.contains_key(key));
     }
 }

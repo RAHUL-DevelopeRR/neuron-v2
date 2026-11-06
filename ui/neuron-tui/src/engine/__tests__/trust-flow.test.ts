@@ -1,3 +1,5 @@
+import path from 'path'
+
 import { afterEach, describe, expect, test } from 'bun:test'
 
 import { UI_CAPABILITIES, UI_CLIENT } from '../capabilities'
@@ -50,7 +52,17 @@ const PREVIEW = {
  * environment has NEURON_TRUST_WORKSPACE=1, or that is started after trust was
  * recorded (`trusted`), reports the folder trusted.
  */
-function fakeEngines(options: { sessionOnly?: boolean; trustFails?: boolean } = {}) {
+function fakeEngines(
+  options: {
+    sessionOnly?: boolean
+    trustFails?: boolean
+    /** Leave `trust_workspace` unanswered. */
+    trustSilent?: boolean
+    features?: string[]
+    /** The engines (by start, from 0) that fail to start. */
+    failStarts?: number[]
+  } = {},
+) {
   const encoder = new TextEncoder()
   let trusted = false
   const started: {
@@ -73,13 +85,14 @@ function fakeEngines(options: { sessionOnly?: boolean; trustFails?: boolean } = 
     }
     const record = { argv, env: spawnOptions.env, sent: [] as Array<Record<string, unknown>> }
     started.push(record)
+    if (options.failStarts?.includes(started.length - 1)) throw new Error('spawn failed')
     const isTrusted = () => trusted || spawnOptions.env.NEURON_TRUST_WORKSPACE === '1'
     const emit = (event: object) => out.enqueue(encoder.encode(JSON.stringify(event) + '\n'))
     const stdout = new ReadableStream<Uint8Array>({
       start: (controller) => {
         out = controller
         queueMicrotask(() => {
-          emit({ type: 'ready', protocol: 1, version: 'test', features: FEATURES })
+          emit({ type: 'ready', protocol: 1, version: 'test', features: options.features ?? FEATURES })
           emit(status(isTrusted()))
         })
       },
@@ -93,6 +106,7 @@ function fakeEngines(options: { sessionOnly?: boolean; trustFails?: boolean } = 
             queueMicrotask(() => {
               if (message.type === 'trust_preview') emit(PREVIEW)
               if (message.type === 'trust_workspace') {
+                if (options.trustSilent) return
                 if (options.trustFails) {
                   emit({ type: 'error', message: 'could not trust /work/repo: access denied' })
                   return
@@ -224,6 +238,57 @@ describe('the folder trust flow against the engine', () => {
     expect(screenNow()).toBe('trust')
     expect(engines.started).toHaveLength(1)
     expect(useChatStore.getState().messages).toHaveLength(0)
+  })
+
+  const approvals = (sent: Array<Record<string, unknown>>) =>
+    sent.filter((message) => message.type === 'approve_mcp_server')
+  const CATALOG = [...FEATURES, 'mcp_catalog']
+
+  test('the ticked servers go to the restarted engine, with what was shown', async () => {
+    const engines = fakeEngines({ features: CATALOG })
+    setEngineClientOptionsForTesting({ spawn: engines.spawn, resolveBinary: () => 'neuron' })
+    await startEngineSession({ cwd: process.cwd() })
+    await waitUntil(() => screenNow() === 'trust')
+
+    trustWorkspace([{ name: 'postgres-tools', fingerprint: 'ab12' }])
+    await waitUntil(() => engines.started.length === 2)
+    await waitUntil(() => approvals(engines.started[1]!.sent).length === 1)
+    expect(approvals(engines.started[1]!.sent)).toEqual([
+      { kind: 'command', type: 'approve_mcp_server', name: 'postgres-tools', fingerprint: 'ab12' },
+    ])
+    expect(approvals(engines.started[0]!.sent)).toEqual([])
+  })
+
+  test('a restart that fails drops the ticked servers: a later engine gets none', async () => {
+    const engines = fakeEngines({ features: CATALOG, failStarts: [1] })
+    setEngineClientOptionsForTesting({ spawn: engines.spawn, resolveBinary: () => 'neuron' })
+    await startEngineSession({ cwd: process.cwd() })
+    await waitUntil(() => screenNow() === 'trust')
+
+    trustWorkspace([{ name: 'postgres-tools' }])
+    await waitUntil(() => engines.started.length === 2)
+    await waitUntil(() => useEngineStore.getState().connection === 'exited')
+    await waitUntil(() => useStartGate.getState().trustStep.kind === 'asking')
+
+    // Started again (the same folder, or another from the workspace picker).
+    await startEngineSession({ cwd: process.cwd() })
+    await waitUntil(() => useEngineStore.getState().connection === 'ready')
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(approvals(engines.started[2]!.sent)).toEqual([])
+  })
+
+  test('servers ticked for one folder are not approved in another', async () => {
+    const engines = fakeEngines({ features: CATALOG, trustSilent: true })
+    setEngineClientOptionsForTesting({ spawn: engines.spawn, resolveBinary: () => 'neuron' })
+    await startEngineSession({ cwd: process.cwd() })
+    await waitUntil(() => screenNow() === 'trust')
+
+    trustWorkspace([{ name: 'postgres-tools' }])
+    // Another project, before this one's trust came back.
+    await startEngineSession({ cwd: path.join(process.cwd(), 'src') })
+    await waitUntil(() => useEngineStore.getState().connection === 'ready')
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(approvals(engines.started[1]!.sent)).toEqual([])
   })
 
   test('a report opens the report panel', () => {

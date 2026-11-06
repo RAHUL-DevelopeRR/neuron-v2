@@ -25,8 +25,12 @@ import {
 import React from 'react'
 
 import { App } from './app'
+import { MinimumSizeGate } from './components/minimum-size-gate'
 import { parseArgs } from './cli-args'
-import { startEngineSession } from './engine/engine-session'
+import {
+  showConversationOfResumedSession,
+  startEngineSession,
+} from './engine/engine-session'
 import { initializeApp } from './init/init-app'
 import { getProjectRoot, setProjectRoot } from './project-files'
 import { getConfigDir } from './utils/config-dir'
@@ -102,6 +106,7 @@ async function main(): Promise<void> {
     clearLogs,
     continue: continueChat,
     continueId,
+    resume,
     cwd,
     initialMode,
     engine: engineFlags,
@@ -118,11 +123,16 @@ async function main(): Promise<void> {
     continueChat: continueChat ? { chatId: continueId ?? null } : null,
   })
 
-  // Show project picker only when user starts at the home directory or an ancestor
+  // Show project picker only when user starts at the home directory or an
+  // ancestor, and not for `--resume`: the session is this folder's.
   const projectRoot = getProjectRoot()
   const homeDir = os.homedir()
   const startCwd = process.cwd()
-  const showProjectPicker = shouldShowProjectPicker(startCwd, homeDir)
+  const showProjectPicker = shouldShowProjectPicker(
+    startCwd,
+    homeDir,
+    Boolean(resume),
+  )
 
   if (clearLogs) {
     clearLogFile()
@@ -138,9 +148,11 @@ async function main(): Promise<void> {
   // The engine runs in the project folder, so it starts once one is chosen.
   // `--continue` resumes the engine session the chat was saved with (saved
   // as soon as the engine reported it, so also after an interrupted turn).
-  const resumeSession = continueChat
-    ? resumeSessionFor(continueId ?? undefined)
-    : undefined
+  // `--resume <session>` (from `neuron --resume`) names the engine session
+  // itself; the chat starts empty and shows that session's conversation.
+  const resumeSession =
+    resume ?? (continueChat ? resumeSessionFor(continueId ?? undefined) : undefined)
+  if (resume) showConversationOfResumedSession()
   if (!showProjectPicker) {
     void startEngineSession({
       ...engineFlags,
@@ -278,7 +290,9 @@ async function main(): Promise<void> {
 
   createRoot(renderer).render(
     <QueryClientProvider client={queryClient}>
-      <AppRoot />
+      <MinimumSizeGate>
+        <AppRoot />
+      </MinimumSizeGate>
     </QueryClientProvider>,
   )
 }

@@ -196,6 +196,18 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
     description: 'What fills the context window',
   },
   {
+    id: 'effort',
+    label: 'effort',
+    engineCommand: true,
+    description: 'Thinking level (/effort <level>, or default)',
+  },
+  {
+    id: 'branch',
+    label: 'branch',
+    engineCommand: true,
+    description: 'Git branches (/branch <name> switches, /branch new <name> creates)',
+  },
+  {
     id: 'compact',
     label: 'compact',
     engineCommand: true,

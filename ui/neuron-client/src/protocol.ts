@@ -167,6 +167,20 @@ export interface AccountDetails {
   usage_updated_at: number | null
   /** Why the plan and usage could not be read. */
   usage_error: string | null
+  /** The plan's rolling token window (Zero-X Free: 1M tokens per 5 hours); absent for a plan without one and from older engines. */
+  usage_window?: UsageWindow | null
+}
+
+/** A rolling usage window (`usage_window` in `/api/account`). Every part may be missing. */
+export interface UsageWindow {
+  /** Tokens used in the window. */
+  tokens: number | null
+  limit_tokens: number | null
+  remaining_tokens: number | null
+  /** When the oldest usage leaves the window (ISO 8601, UTC). */
+  resets_at: string | null
+  /** The window's length: 18000 for five hours. */
+  window_seconds: number | null
 }
 
 /**
@@ -199,6 +213,16 @@ export interface McpServerPreview {
   /** The program it starts or the host it connects to; never arguments or headers. */
   target: string | null
   source: string
+  /**
+   * What runs, with secret-looking values shown as `[REDACTED]`; never
+   * environment or headers. Older engines leave it out.
+   */
+  command?: string
+  /**
+   * The launch spec's digest as previewed: an `approve_mcp_server` that sends
+   * it back is refused if the config changed since. Older engines leave it out.
+   */
+  fingerprint?: string
 }
 
 /** A permission rule a workspace's settings would add. */
@@ -227,7 +251,7 @@ export interface McpServerInfo {
   name: string
   /** `bundled`, `user`, `project` or `local`. */
   scope: string
-  /** `stdio`, `http`, `sse`, `ws`, `sdk` or `managed_proxy`. */
+  /** `stdio`, `http`, `sse`, `ws`, `sdk` or `zerox` (older engines: `managed_proxy`). */
   transport: string
   /**
    * `starting`, `ready`, `failed`, `pending` (started, tools not found),
@@ -286,6 +310,8 @@ export interface StatusEvent {
   account?: AccountInfo | null
   /** The catalog says the current model reads images; hide the image-paste hint unless true. */
   supports_images?: boolean | null
+  /** Estimated input tokens of each model request the next turn sends; absent from older engines. */
+  request_tokens_estimate?: number | null
 }
 
 export interface SessionStartingEvent {

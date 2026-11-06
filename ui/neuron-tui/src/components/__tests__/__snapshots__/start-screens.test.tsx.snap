@@ -8,6 +8,9 @@ exports[`the screens before the chat render plainly the trust screen at 80x24 1`
     • 2 hooks that run commands around tool calls
     • 1 MCP server: postgres-tools
     • 3 permission rules from .neuron/settings.json
+  Approve its MCP servers now (↑↓ and space); the others wait in /mcp:
+      [ ] postgres-tools  stdio
+          runs postgres-mcp
   Continue only if you created this project or trust where it came from.
   Why this matters: zero-x.live/docs/trust
   › 1  Allow Neuron in this folder
@@ -47,6 +50,9 @@ exports[`the screens before the chat render plainly the trust screen at 200x50 1
     • 2 hooks that run commands around tool calls
     • 1 MCP server: postgres-tools
     • 3 permission rules from .neuron/settings.json
+  Approve its MCP servers now (↑↓ and space); the others wait in /mcp:
+      [ ] postgres-tools  stdio
+          runs postgres-mcp
   Continue only if you created this project or trust where it came from.
   Why this matters: zero-x.live/docs/trust
   › 1  Allow Neuron in this folder
@@ -87,6 +93,9 @@ exports[`the screens before the chat render plainly in a classic console (ASCII 
     • 2 hooks that run commands around tool calls
     • 1 MCP server: postgres-tools
     • 3 permission rules from .neuron/settings.json
+  Approve its MCP servers now (Up/Down and space); the others wait in /mcp:
+      [ ] postgres-tools  stdio
+          runs postgres-mcp
   Continue only if you created this project or trust where it came from.
   Why this matters: zero-x.live/docs/trust
   > 1  Allow Neuron in this folder

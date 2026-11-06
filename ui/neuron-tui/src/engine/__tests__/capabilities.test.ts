@@ -31,8 +31,8 @@ afterEach(() => {
 })
 
 describe('capabilities', () => {
-  test('declares reports, live progress, git views, live output and hook progress, as the protocol spells them', () => {
-    expect(UI_CAPABILITIES).toEqual(['reports', 'live_progress', 'git_views', 'live_output', 'hook_progress'])
+  test('declares reports, live progress, git views, live output, hook progress and questions, as the protocol spells them', () => {
+    expect(UI_CAPABILITIES).toEqual(['reports', 'live_progress', 'git_views', 'live_output', 'hook_progress', 'questions'])
     const { sent, client } = recordingClient()
     expect(
       declareUiCapabilities(client, ready(['capabilities', 'live_progress', 'git_views'])),
@@ -40,12 +40,12 @@ describe('capabilities', () => {
     expect(sent).toEqual([
       {
         type: 'capabilities',
-        features: ['reports', 'live_progress', 'git_views', 'live_output', 'hook_progress'],
+        features: ['reports', 'live_progress', 'git_views', 'live_output', 'hook_progress', 'questions'],
         client: 'terminal',
       },
     ])
     expect(encodeClientMessage(commandMessage(sent[0]!))).toBe(
-      '{"kind":"command","type":"capabilities","features":["reports","live_progress","git_views","live_output","hook_progress"],"client":"terminal"}\n',
+      '{"kind":"command","type":"capabilities","features":["reports","live_progress","git_views","live_output","hook_progress","questions"],"client":"terminal"}\n',
     )
   })
 

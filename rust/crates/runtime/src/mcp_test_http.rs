@@ -2,6 +2,7 @@
 //! Each connection is answered once and closed; a handler may instead take the
 //! connection over (an SSE stream that stays open).
 
+use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -180,14 +181,12 @@ fn serve(stream: TcpStream, handler: &Handler, seen: &Mutex<Vec<FakeRequest>>) {
             let mut stream = stream;
             let mut head = format!("HTTP/1.1 {status} X\r\n");
             for (name, value) in headers {
-                let _ = std::fmt::Write::write_fmt(&mut head, format_args!("{name}: {value}\r\n"));
+                let _ = write!(head, "{name}: {value}\r\n");
             }
-            let _ = std::fmt::Write::write_fmt(
-                &mut head,
-                format_args!(
-                    "Content-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                ),
+            let _ = write!(
+                head,
+                "Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
             );
             let _ = stream.write_all(head.as_bytes());
             let _ = stream.write_all(body.as_bytes());

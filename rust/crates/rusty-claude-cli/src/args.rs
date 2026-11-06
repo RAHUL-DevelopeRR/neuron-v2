@@ -23,6 +23,9 @@ pub(crate) enum CliAction {
     Mcp {
         args: Option<String>,
         output_format: CliOutputFormat,
+        /// `--permission-mode` (or `--dangerously-skip-permissions`) when given: the
+        /// mode `neuron mcp serve` runs tools in (read-only otherwise).
+        permission_mode: Option<PermissionMode>,
     },
     Skills {
         args: Option<String>,
@@ -176,6 +179,24 @@ pub(crate) fn record_no_tui_flag(given: bool) {
     NO_TUI_FLAG.store(given, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether this run had `--no-tui` ([`record_no_tui_flag`]).
+pub(crate) fn no_tui_flag_given() -> bool {
+    NO_TUI_FLAG.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+thread_local! {
+    /// The prompt was the command line's own words (`neuron "fix the bug"`), not `-p`,
+    /// `prompt` or piped input: on a terminal it opens the full-screen UI. Per thread, as
+    /// the thread that parses the arguments acts on them.
+    static BARE_PROMPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread's last parse took its prompt from the command line's own words
+/// ([`BARE_PROMPT`]).
+pub(crate) fn bare_prompt_given() -> bool {
+    BARE_PROMPT.with(std::cell::Cell::get)
+}
+
 /// Piped text goes to the model as one prompt, so `/model` and `/exit` on their own
 /// lines would be a question for the model, not commands.
 const PIPED_SLASH_COMMANDS: &str = "piped input is sent to the model as one prompt, so slash \
@@ -278,6 +299,7 @@ pub(crate) fn parse_args_with_stdin(
 ) -> Result<CliAction, String> {
     *MODEL_ARG.lock().unwrap_or_else(PoisonError::into_inner) = None;
     crate::stream_json::set_requested(false);
+    BARE_PROMPT.with(|bare| bare.set(false));
     let mut model = DEFAULT_MODEL.to_string();
     // Only an explicit --model; `model` falls back to the default.
     let mut model_flag: Option<String> = None;
@@ -577,6 +599,7 @@ pub(crate) fn parse_args_with_stdin(
         "mcp" => Ok(CliAction::Mcp {
             args: join_optional_args(&rest[1..]),
             output_format,
+            permission_mode: permission_mode_override,
         }),
         "skills" => {
             let args = join_optional_args(&rest[1..]);
@@ -648,17 +671,20 @@ pub(crate) fn parse_args_with_stdin(
             reasoning_effort,
             allow_broad_cwd,
         ),
-        _other => Ok(CliAction::Prompt {
-            prompt: rest.join(" "),
-            model,
-            output_format,
-            allowed_tools,
-            permission_mode,
-            compact,
-            base_commit,
-            reasoning_effort: reasoning_effort.clone(),
-            allow_broad_cwd,
-        }),
+        _other => {
+            BARE_PROMPT.with(|bare| bare.set(true));
+            Ok(CliAction::Prompt {
+                prompt: rest.join(" "),
+                model,
+                output_format,
+                allowed_tools,
+                permission_mode,
+                compact,
+                base_commit,
+                reasoning_effort: reasoning_effort.clone(),
+                allow_broad_cwd,
+            })
+        }
     }
 }
 
@@ -866,19 +892,27 @@ pub(crate) fn classify_subcommand_words(rest: &[String]) -> SubcommandWords {
         // Signing in or out and switching a server change something: never a guess.
         "mcp" if matches!(
             words.first(),
-            Some(&("login" | "logout" | "enable" | "disable"))
+            Some(&("login" | "logout" | "enable" | "disable" | "approve" | "pin" | "connect"))
         ) =>
         {
             changes(
-                "neuron mcp [login|logout|enable|disable] <server>",
+                "neuron mcp [login|logout|enable|disable|approve|pin|connect] <server>",
                 words.len() == 2,
             )
         }
+        "mcp" if words.first() == Some(&"add") => changes(
+            "neuron mcp add <id> [--scope user|project|local] [--name <name>]",
+            commands::parse_mcp_add_args(&words[1..]).is_ok(),
+        ),
+        "mcp" if words.first() == Some(&"remove") => changes(
+            "neuron mcp remove <server> [--scope user|project|local]",
+            commands::parse_mcp_remove_args(&words[1..]).is_ok(),
+        ),
         "mcp" => shows(
-            "neuron mcp [list|show <server>|enable <server>|disable <server>|login <server>|logout <server>|serve|help]",
+            "neuron mcp [list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|pin <server>|connect <server>|login <server>|logout <server>|serve|help]",
             matches!(
                 without_help_word(&words),
-                [] | ["list" | "show" | "serve"] | ["show", _]
+                [] | ["list" | "show" | "serve" | "catalog"] | ["show", _] | ["catalog", ..]
             ),
         ),
         "acp" => shows(
@@ -1061,6 +1095,7 @@ pub(crate) fn parse_direct_slash_cli_action(
                 (None, Some(target)) => Some(target),
             },
             output_format,
+            permission_mode: None,
         }),
         Ok(Some(SlashCommand::Skills { args })) => {
             match classify_skills_slash_command(args.as_deref()) {
