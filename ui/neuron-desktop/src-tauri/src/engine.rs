@@ -5,7 +5,8 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -77,10 +78,115 @@ pub struct EngineExit {
     pub error: Option<String>,
 }
 
+/// What the registry needs of a running engine, so tests can swap in a fake.
+pub trait EngineHandle: Send + Sync {
+    /// Writes one client message (a JSON line).
+    fn send(&self, line: &str) -> Result<(), String>;
+    /// Asks the engine to save and stop; it is ended after a grace period.
+    fn stop(&self);
+    /// Ends the engine and every process it started.
+    fn kill_tree(&self);
+    /// Whether the engine process is still there.
+    fn running(&self) -> bool;
+}
+
+/// The session id in a `status` line, if it is one.
+pub fn status_session(line: &str) -> Option<String> {
+    if !line.contains("\"status\"") {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if value.get("type")?.as_str()? != "status" {
+        return None;
+    }
+    value
+        .get("session_id")?
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+/// Ends the process `pid` and everything it started. On Windows `taskkill /T`
+/// walks the tree; elsewhere the engine leads its own process group, which is
+/// signalled as a whole. No shell is involved.
+pub fn kill_tree_pid(pid: u32) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .creation_flags(0x0800_0000)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{pid}")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// One Windows Job Object for the whole app, set to kill its processes when the
+/// app's last handle closes: an app that crashes takes its engines (and their
+/// children) with it.
+#[cfg(windows)]
+mod job {
+    use std::os::windows::io::RawHandle;
+    use std::sync::OnceLock;
+
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    // A HANDLE is a raw pointer; it is only ever passed back to the OS.
+    struct Job(isize);
+
+    fn job() -> Option<&'static Job> {
+        static JOB: OnceLock<Option<Job>> = OnceLock::new();
+        JOB.get_or_init(|| unsafe {
+            let handle: HANDLE = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if handle.is_null() {
+                return None;
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let set = SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                std::ptr::addr_of!(info).cast(),
+                u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+                    .unwrap_or(0),
+            );
+            (set != 0).then_some(Job(handle as isize))
+        })
+        .as_ref()
+    }
+
+    /// Puts the process into the app's job. A failure only loses the cleanup
+    /// after a crash.
+    pub fn assign(process: RawHandle) {
+        if let Some(job) = job() {
+            unsafe {
+                AssignProcessToJobObject(job.0 as HANDLE, process as HANDLE);
+            }
+        }
+    }
+}
+
 /// A running engine.
 pub struct EngineProcess {
     stdin: Mutex<Option<ChildStdin>>,
-    child: Arc<Mutex<Child>>,
+    pid: u32,
+    exited: Arc<AtomicBool>,
 }
 
 impl EngineProcess {
@@ -115,13 +221,25 @@ impl EngineProcess {
             // No console window for the engine.
             command.creation_flags(0x0800_0000);
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // Its own process group, so the whole tree can be signalled.
+            command.process_group(0);
+        }
         let mut child = command
             .spawn()
             .map_err(|error| format!("Could not start {}: {error}", binary.display()))?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            job::assign(child.as_raw_handle());
+        }
+        let pid = child.id();
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().ok_or("the engine has no stdout")?;
         let stderr = child.stderr.take().ok_or("the engine has no stderr")?;
-        let child = Arc::new(Mutex::new(child));
+        let exited = Arc::new(AtomicBool::new(false));
 
         // Some launch checks print `error: ...` on stderr and exit without an event.
         let last_error = Arc::new(Mutex::new(None::<String>));
@@ -134,7 +252,7 @@ impl EngineProcess {
             }
         });
 
-        let waited = Arc::clone(&child);
+        let done = Arc::clone(&exited);
         thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             let mut line = String::new();
@@ -152,7 +270,8 @@ impl EngineProcess {
             }
             // Drain whatever is left so the child never blocks on a full pipe.
             let _ = reader.read_to_end(&mut Vec::new());
-            let code = lock(&waited).wait().ok().and_then(|status| status.code());
+            let code = child.wait().ok().and_then(|status| status.code());
+            done.store(true, Ordering::SeqCst);
             // An MCP server the engine started can keep stderr open; don't wait for it.
             for _ in 0..10 {
                 if stderr_thread.is_finished() {
@@ -173,8 +292,13 @@ impl EngineProcess {
 
         Ok(Self {
             stdin: Mutex::new(stdin),
-            child,
+            pid,
+            exited,
         })
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.pid
     }
 
     /// Writes one client message (a JSON line) to the engine.
@@ -191,18 +315,44 @@ impl EngineProcess {
     }
 
     /// Asks the engine to save and stop (a shutdown and the end of its input),
-    /// and kills it if it hasn't exited after a grace period.
+    /// and ends it, with what it started, if it hasn't exited after a grace period.
     pub fn stop(&self) {
         let _ = self.send(r#"{"kind":"command","type":"shutdown"}"#);
         lock(&self.stdin).take();
-        let child = Arc::clone(&self.child);
+        let (pid, exited) = (self.pid, Arc::clone(&self.exited));
         thread::spawn(move || {
             thread::sleep(SHUTDOWN_GRACE);
-            let mut child = lock(&child);
-            if matches!(child.try_wait(), Ok(None)) {
-                let _ = child.kill();
+            if !exited.load(Ordering::SeqCst) {
+                kill_tree_pid(pid);
             }
         });
+    }
+
+    /// Ends the engine and its whole process tree at once.
+    pub fn kill_tree(&self) {
+        lock(&self.stdin).take();
+        if !self.exited.load(Ordering::SeqCst) {
+            kill_tree_pid(self.pid);
+        }
+    }
+
+    pub fn running(&self) -> bool {
+        !self.exited.load(Ordering::SeqCst)
+    }
+}
+
+impl EngineHandle for EngineProcess {
+    fn send(&self, line: &str) -> Result<(), String> {
+        Self::send(self, line)
+    }
+    fn stop(&self) {
+        Self::stop(self);
+    }
+    fn kill_tree(&self) {
+        Self::kill_tree(self);
+    }
+    fn running(&self) -> bool {
+        Self::running(self)
     }
 }
 
@@ -385,6 +535,72 @@ mod tests {
         let _ = service.kill();
         let _ = service.wait();
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    fn process_alive(pid: u32) -> bool {
+        #[cfg(windows)]
+        {
+            let out = Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+                .output()
+                .expect("tasklist");
+            String::from_utf8_lossy(&out.stdout).contains(&format!(",\"{pid}\","))
+        }
+        #[cfg(unix)]
+        {
+            Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        }
+    }
+
+    /// A process that starts a child of its own: ending the parent's tree ends
+    /// the child too (a plain `Child::kill` would leave it running).
+    #[test]
+    fn kill_tree_ends_the_children_too() {
+        #[cfg(windows)]
+        let mut parent = Command::new("powershell.exe");
+        #[cfg(windows)]
+        parent.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$p = Start-Process ping -ArgumentList '-n','120','127.0.0.1' -PassThru -WindowStyle Hidden; [Console]::Out.WriteLine($p.Id); [Console]::Out.Flush(); Start-Sleep 120",
+        ]);
+        #[cfg(unix)]
+        let mut parent = Command::new("sh");
+        #[cfg(unix)]
+        parent.args(["-c", "sleep 120 & echo $!; wait"]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            parent.process_group(0);
+        }
+        let mut parent = parent
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("a parent process");
+        let mut first = String::new();
+        BufReader::new(parent.stdout.take().unwrap())
+            .read_line(&mut first)
+            .unwrap();
+        let child: u32 = first.trim().parse().expect("the child's pid");
+        assert!(process_alive(child), "the child should be running");
+
+        kill_tree_pid(parent.id());
+        let _ = parent.wait();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while process_alive(child) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child survived kill_tree"
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
     }
 
     #[test]

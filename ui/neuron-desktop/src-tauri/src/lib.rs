@@ -7,8 +7,10 @@
 pub mod engine;
 pub mod git;
 pub mod projects;
+pub mod registry;
 pub mod terminal;
 pub mod workspace;
+pub mod worktree;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
