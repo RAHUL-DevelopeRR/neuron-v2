@@ -425,3 +425,95 @@ describe('NeuronHost policy for peers', () => {
     expect(engine.sent[0]).toEqual({ kind: 'command', type: 'rewind', checkpoint: 1, mode: 'code_only', dry_run: true })
   })
 })
+
+describe('NeuronHost slash policy for remote peers', () => {
+  /** Sends messages as a non-local peer, then waits until each was either forwarded or refused. */
+  async function remote(messages: unknown[]) {
+    const errors: string[] = []
+    const socket = new WebSocket(host!.url)
+    socket.onopen = () => {
+      socket.send(JSON.stringify({ t: 'hello', protocol: 1, token: TOKEN, client: { name: 'raw', kind: 'cli' } }))
+      for (const message of messages) socket.send(JSON.stringify({ t: 'send', message }))
+    }
+    socket.onmessage = (event) => {
+      const frame = JSON.parse(String(event.data)) as HostFrame
+      if (frame.t === 'error') errors.push(frame.message)
+    }
+    await until('every message handled', () => errors.length + engine.sent.length >= messages.length)
+    socket.close()
+    return errors
+  }
+  const slash = (command: string, args = '') => ({ kind: 'command', type: 'slash', command, args })
+
+  test('read-only slash commands pass', async () => {
+    await startHost({ remoteOnly: true })
+    const names = ['help', 'status', 'cost', 'context', 'usage', 'doctor', 'changes', 'diff', 'stats', 'memory', 'model']
+    const errors = await remote(names.map((name) => slash(name)))
+    expect(errors).toEqual([])
+    expect(engine.sent).toHaveLength(names.length)
+  })
+
+  test('every other slash command is refused, whatever the case or spacing', async () => {
+    await startHost({ remoteOnly: true })
+    const names = ['commit', 'Commit', ' commit', 'commit ', 'COMMIT\n', '/commit', 'rewind', 'permissions', 'logout', 'login', 'pr', 'issue', 'init', 'clear', 'plan', 'status commit', '']
+    const errors = await remote(names.map((name) => slash(name, 'danger-full-access')))
+    expect(errors).toHaveLength(names.length)
+    expect(errors[0]).toContain('Only the Neuron desktop app')
+    expect(engine.sent).toEqual([])
+  })
+
+  test('a local peer may still use any slash command', async () => {
+    await startHost()
+    const peer = await attach('desktop')
+    peer.transport.send(slash('commit', 'msg') as ClientMessage)
+    await until('forwarded', () => engine.sent.length === 1)
+  })
+
+  test('remote resume names a session id or latest, never a path', async () => {
+    await startHost({ remoteOnly: true })
+    const bad = [
+      { kind: 'command', type: 'resume', session: '../../etc/passwd' },
+      { kind: 'command', type: 'resume', session: 'C:\\Users\\x\\s.json' },
+      { kind: 'command', type: 'resume', session: '/tmp/s' },
+      { kind: 'command', type: 'resume', session: '-x' },
+      { kind: 'command', type: 'resume', session: '.hidden' },
+      { kind: 'command', type: 'resume', session: 'a'.repeat(129) },
+      slash('resume', '../x'),
+      slash('Resume', '/abs/path'),
+      slash('resume', ''),
+    ]
+    expect(await remote(bad)).toHaveLength(bad.length)
+    expect(engine.sent).toEqual([])
+  })
+
+  test('remote resume with a valid id or latest is forwarded', async () => {
+    await startHost({ remoteOnly: true })
+    const errors = await remote([
+      { kind: 'command', type: 'resume', session: 'session-2026.11_07' },
+      { kind: 'command', type: 'resume', session: 'latest' },
+      slash('resume', 'abc123'),
+    ])
+    expect(errors).toEqual([])
+    expect(engine.sent).toHaveLength(3)
+  })
+})
+
+describe('NeuronHost origin check', () => {
+  const allowed = (origin: string | null, hostHeader: string | null) =>
+    (host as unknown as { originAllowed(o: string | null, h: string | null): boolean }).originAllowed(origin, hostHeader)
+
+  test('a same-host origin needs a loopback Host header', async () => {
+    await startHost()
+    expect(allowed('http://192.168.1.5:3000', '192.168.1.5:3000')).toBe(false)
+    expect(allowed('https://evil.example', 'evil.example')).toBe(false)
+    expect(allowed('http://evil.example:80', 'localhost:7777')).toBe(false)
+  })
+
+  test('local pages and native clients still connect', async () => {
+    await startHost()
+    expect(allowed(null, 'anything')).toBe(true)
+    expect(allowed('http://localhost:5173', 'localhost:7777')).toBe(true)
+    expect(allowed('http://127.0.0.1:5173', '127.0.0.1')).toBe(true)
+  })
+})
+
