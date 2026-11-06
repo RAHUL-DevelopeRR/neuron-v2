@@ -5,6 +5,7 @@
 //! window is the React app in `../src`.
 
 pub mod diagnostics; // L5: extensions and resilience
+pub mod editor;
 pub mod engine;
 pub mod git;
 pub mod projects;
@@ -475,6 +476,20 @@ fn diagnostics(app: AppHandle) -> String {
     diagnostics::current_diagnostics(&app.package_info().version.to_string())
 }
 
+/// L2: review and git. Puts one changed file back as HEAD has it (a new file is deleted).
+#[tauri::command]
+async fn git_revert(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let root = lock(&state.workspace).root().to_path_buf();
+    git::revert(&root, &path)
+}
+
+/// L2: review and git. Opens a workspace file in VS Code, or shows it in the file manager.
+#[tauri::command]
+async fn open_in_editor(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let root = lock(&state.workspace).root().to_path_buf();
+    editor::open(&root, &path)
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -515,7 +530,9 @@ pub fn run() {
             engine_info, // L5: extensions and resilience
             diagnostics,
             attachment_stage, // L3: composer
-            export_save       // L3: composer
+            export_save,      // L3: composer
+            git_revert,
+            open_in_editor // L2: review and git
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {

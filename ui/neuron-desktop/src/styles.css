@@ -2101,3 +2101,151 @@ h2 {
 .permission kbd {
   margin-left: 4px;
 }
+
+/* L2: review and git */
+.changes-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px;
+}
+.scope-toggle {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.scope-toggle button {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-muted);
+}
+.scope-toggle button[aria-pressed='true'] {
+  background: var(--selected);
+  color: var(--text);
+}
+.changes-actions {
+  display: flex;
+  gap: 6px;
+}
+.change-line {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.change-line .change-row {
+  flex: 1;
+  min-width: 0;
+}
+.change-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  text-align: left;
+}
+.change-counts {
+  font-size: 11px;
+  white-space: nowrap;
+}
+.row-action {
+  font-size: 11px;
+  padding: 2px 6px;
+  white-space: nowrap;
+}
+.commit-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-2);
+}
+.commit-message {
+  width: 100%;
+  resize: vertical;
+  background: var(--sunken);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-family: var(--ui);
+}
+.commit-note,
+.commit-outcome {
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 0 8px;
+}
+.commit-files {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.commit-files li {
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+}
+.commit-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rewind-dialog {
+  width: min(640px, 92vw);
+}
+.rewind-points {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px 0;
+}
+.rewind-point {
+  display: flex;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+}
+.rewind-point.selected {
+  border-color: var(--blue);
+  background: var(--hover);
+}
+.rewind-point-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.rewind-prompt {
+  font-weight: 600;
+}
+.rewind-modes {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin: 8px 0;
+}
+.rewind-mode {
+  display: flex;
+  gap: 8px;
+  padding: 3px 0;
+}
+.rewind-block h4 {
+  margin: 10px 0 4px;
+}
+.rewind-block ul {
+  margin: 0;
+  padding-left: 18px;
+}
+.rewind-summary {
+  margin: 8px 0;
+}

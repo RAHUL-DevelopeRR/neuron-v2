@@ -97,5 +97,8 @@ export function hostPlatform(options: HostPlatformOptions): Platform {
     // L3: composer. A Neuron host has no staging folder or save dialog on this side.
     stageAttachment: () => Promise.reject(new Error('Images can only be attached in the Neuron desktop app.')),
     exportSave: () => Promise.reject(new Error('Saving a chat is only available in the Neuron desktop app.')),
+    // L2: review and git: the browser build has no way to change or open files on the host.
+    gitRevert: () => Promise.reject(new Error('Reverting a file needs the desktop app.')),
+    openInEditor: () => Promise.reject(new Error('Opening a file in an editor needs the desktop app.')),
   }
 }

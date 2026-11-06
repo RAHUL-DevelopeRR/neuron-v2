@@ -236,5 +236,8 @@ export function tauriPlatform(): Platform {
         headers: { 'x-attachment-name': encodeURIComponent(name), 'x-media-type': mediaType },
       }),
     exportSave: (suggestedName, content) => invoke<string | null>('export_save', { suggestedName, content }),
+    // L2: review and git
+    gitRevert: (path) => invoke<void>('git_revert', { path }),
+    openInEditor: (path) => invoke<void>('open_in_editor', { path }),
   }
 }

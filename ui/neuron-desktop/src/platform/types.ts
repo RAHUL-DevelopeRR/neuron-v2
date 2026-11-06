@@ -137,4 +137,7 @@ export interface Platform {
    * names the path); returns the saved path, or `null` when cancelled.
    */
   exportSave(suggestedName: string, content: string): Promise<string | null>
+  // L2: review and git
+  gitRevert(path: string): Promise<void>
+  openInEditor(path: string): Promise<void>
 }

@@ -113,6 +113,11 @@ export interface FakePlatform extends Platform {
   exports: Array<{ name: string; content: string }>
   /** L3: what the save dialog returns next; `null` is a cancel. */
   exportPath: string | null
+  // L2: review and git
+  /** Paths `gitRevert` was asked for. */
+  reverted: string[]
+  /** Paths `openInEditor` was asked for. */
+  editorOpens: string[]
 }
 
 export interface FakePlatformOptions {
@@ -151,6 +156,8 @@ export function fakePlatform(engine: FakeEngine, options: FakePlatformOptions = 
     staged: [],
     exports: [],
     exportPath: '/saved/chat.md',
+    reverted: [],
+    editorOpens: [],
     store: {
       get: async <T,>(key: string) => saved.get(key) as T | undefined,
       set: async (key, value) => void saved.set(key, value),
@@ -232,6 +239,14 @@ export function fakePlatform(engine: FakeEngine, options: FakePlatformOptions = 
     async exportSave(name, content) {
       platform.exports.push({ name, content })
       return platform.exportPath
+    },
+    // L2: review and git
+    async gitRevert(path) {
+      platform.reverted.push(path)
+      if (platform.git) platform.git = { ...platform.git, changes: platform.git.changes.filter((change) => change.path !== path) }
+    },
+    async openInEditor(path) {
+      platform.editorOpens.push(path)
     },
   }
   return platform
