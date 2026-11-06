@@ -5039,14 +5039,20 @@ mod tests {
         };
         // Assignments and redirections do not hide the prefix, unlike approvals.
         let publish = posix("CI=1 npm publish > publish.log");
-        assert!(publish.approval_prefixes().is_empty());
+        assert_eq!(
+            publish.approval_prefixes(),
+            [] as [std::vec::Vec<std::string::String>; 0]
+        );
         assert_eq!(rendered(&publish), vec!["npm publish"]);
         assert_eq!(
             rendered(&posix("sudo npm i -g x 2> err.log")),
             vec!["sudo npm"]
         );
         // Only the parts that ask; a `cd` is never a prefix.
-        assert!(rendered(&posix("cd /tmp && npm install")).is_empty());
+        assert_eq!(
+            rendered(&posix("cd /tmp && npm install")),
+            [] as [std::string::String; 0]
+        );
         assert_eq!(
             rendered(&posix("cargo test && git push origin main")),
             vec!["git push"]

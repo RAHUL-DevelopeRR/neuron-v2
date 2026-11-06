@@ -1404,7 +1404,7 @@ mod tests {
             started.command,
             codebase_dir.join(program).to_string_lossy()
         );
-        assert!(started.args.is_empty());
+        assert_eq!(started.args, [] as [std::string::String; 0]);
         assert!(started
             .sandbox
             .fs_read

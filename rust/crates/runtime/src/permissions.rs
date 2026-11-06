@@ -3390,7 +3390,10 @@ mod tests {
             &serde_json::json!({ "path": ".neuron/settings.json", "content": "{}" }).to_string(),
             Some(&mut prompter),
         );
-        assert!(prompter.seen[0].project_rules.is_empty());
+        assert_eq!(
+            prompter.seen[0].project_rules,
+            [] as [std::string::String; 0]
+        );
         std::fs::remove_dir_all(workspace).ok();
     }
 

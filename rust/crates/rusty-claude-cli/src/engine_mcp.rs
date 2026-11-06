@@ -452,7 +452,7 @@ mod tests {
         else {
             panic!("a catalog event");
         };
-        assert!(!version.is_empty());
+        assert_ne!(version, "");
         assert_eq!(connectors.len(), 1);
         assert_eq!(connectors[0].transport, "http");
         assert!(connectors[0].variables[0].secret);

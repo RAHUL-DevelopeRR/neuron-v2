@@ -1160,7 +1160,7 @@ mod tests {
         let long = "x".repeat(100);
         let (title, body) = split_pr_draft(&long).expect("title");
         assert_eq!(title.chars().count(), 72);
-        assert!(body.is_empty());
+        assert_eq!(body, "");
     }
 
     struct TempDir(PathBuf);
