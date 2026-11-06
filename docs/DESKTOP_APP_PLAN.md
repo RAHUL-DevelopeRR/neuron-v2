@@ -1,6 +1,6 @@
 # Neuron Desktop v1: analysis and build plan
 
-Status: draft for approval (Gate 1), 2026-11-06. Branch `feat/desktop-app`.
+Status: Gate 1 approved 2026-11-06; v1 built and at Gate 2 on 2026-11-07 (section 11.5). Branch `feat/desktop-app`.
 Supersedes the desktop parts of `docs/NEURON_APPS_PLAN.md` (that file stays the engine audit).
 
 ## 0. Summary
@@ -471,7 +471,12 @@ bun run tauri build --config src-tauri/tauri.release.conf.json --bundles nsis --
 | **WebKitGTK differences on Linux** | The Linux CI job builds; a Linux smoke test comes after v1 |
 | **Protocol drift between Rust and TS** | The L0 drift test parses `protocol.rs` for every event and command variant |
 
-## 10. Decisions for Gate 1 (open)
+## 10. Decisions for Gate 1 (answered 2026-11-06)
+
+The owner chose all lanes including L4, approved deleting the cache (done), and approved the early
+CI run (run 42259399488: Windows x64, Windows arm64 and Linux x64 built and passed the install
+test; macOS was cancelled because `macos-14` runners no longer run, so the desktop jobs moved to
+`macos-15`).
 
 1. **The plan.** Approve it and start all lanes, or approve without L4 (multi-chat) to finish
    sooner.
@@ -573,3 +578,34 @@ bun run tauri build --config src-tauri/tauri.release.conf.json --bundles nsis --
   - release, publish and manifest at `:806-931`
 - **Engine sidecar staging:** `desktop-release.yml:248-275`, plus the release overlay
   `src-tauri/tauri.release.conf.json`.
+
+### 11.5 Status at Gate 2 (2026-11-07)
+
+- **Built.** Lanes L0 to L6 were built test-first in `neuron-desk-<lane>` worktrees and merged in
+  `lane/desk-integration`, which fast-forwards `feat/desktop-app`. L4 follows a blueprint (engine
+  registry in `src-tauri/src/registry.rs`, chat commands in `chats.rs`, worktree copies in
+  `worktree.rs`, the chats store in `src/chats.ts`, per-chat IPC in `src/platform/chat-host.ts`).
+  No engine (`rust/`) changes.
+- **Checks.** `ui/neuron-client` 168 pass; `ui/neuron-desktop` 342 pass (3 real-engine e2e
+  skips), typecheck and vite build clean; `src-tauri` fmt, clippy and 100 tests clean; brand lint
+  clean. The test scripts run `bun test --timeout 20000`, because axe-heavy UI tests pass 5 s on a
+  loaded machine.
+- **Reviews.** TypeScript, Rust and security reviewers in three rounds, then a verification pass:
+  no CRITICAL; every HIGH fixed and verified in the code.
+- **Local installer and smoke test.** The debug NSIS installer (plan 7.6, 11.4 MB) installed per
+  user and passed a smoke test against a real `neuron engine --stdio`: the sign-in screen (an
+  engine with `NEURON_CREDENTIAL_STORE=file` and temporary `NEURON_HOME`/`NEURON_CONFIG_HOME`
+  starts signed out without touching the keychain login), the trust gate, a chat that runs tools,
+  an approval, both Changes scopes, two chats at once, and a clean shutdown of every engine. Drive
+  the installed app through WebView2's DevTools port
+  (`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=<port>`); `NEURON_WORKSPACE`
+  picks the folder it opens. Do not install into `%LOCALAPPDATA%\Neuron`: another program uses it.
+- **Known issues for v1.1.**
+  - The engine lists image attachments by path; it does not send images to the model yet.
+  - A failed chat restart emits no exit for the old engine.
+  - Quitting while a chat starts can orphan an engine on macOS and Linux.
+  - A full engine input queue can drop an approval reply.
+  - Read-only mode refuses changes instead of asking (the UI now says so).
+- **Next (owner).** Fast-forward and push `feat/desktop-app`, dispatch the artifacts-only CI to
+  verify `macos-15`, the rpm bundle and Windows arm64, and decide on cleanup of the lane worktrees
+  and branches.
